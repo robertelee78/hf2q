@@ -1454,6 +1454,10 @@ fn resolve_api_template_kwargs(
 /// resolver response (e.g. to prove `PoolRefused` survives end-to-end
 /// without loading a real model — ADR-005 wave-1.5 Codex fix T1.1) call
 /// `prepare_chat_generation_core` directly with a closure.
+fn effective_parallel_tool_calls(requested: Option<bool>) -> bool {
+    requested.unwrap_or(false)
+}
+
 async fn prepare_chat_generation(
     state: &AppState,
     req: &ChatCompletionRequest,
@@ -2014,7 +2018,7 @@ where
         logit_bias,
         logprobs: req.logprobs.unwrap_or(false),
         top_logprobs: req.top_logprobs.unwrap_or(0),
-        parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
+        parallel_tool_calls: effective_parallel_tool_calls(req.parallel_tool_calls),
         grammar: effective_grammar,
         token_bytes: grammar_token_bytes,
         grammar_kind: effective_grammar_kind,
@@ -4607,7 +4611,7 @@ fn compile_tool_grammar_with_registration(
     // call. Matching llama.cpp's default is principled and conservative;
     // operators wanting parallel calls opt in explicitly via
     // `parallel_tool_calls: true` in the request body.
-    let parallel = req.parallel_tool_calls.unwrap_or(false);
+    let parallel = effective_parallel_tool_calls(req.parallel_tool_calls);
 
     // Emit per-function GBNF strings and combine into one grammar via
     // alternation. If only one function matches, no alternation is needed.
@@ -4780,6 +4784,14 @@ mod compile_tool_grammar_precondition_tests {
                 })),
             },
         }]
+    }
+
+    #[test]
+    fn omitted_parallel_tool_calls_matches_explicit_false() {
+        assert!(!effective_parallel_tool_calls(None));
+        assert!(!effective_parallel_tool_calls(Some(false)));
+        assert!(effective_parallel_tool_calls(Some(true)));
+        assert!(!SamplingParams::default().parallel_tool_calls);
     }
 
     /// Required + no tools → hard 400 (was silent Ok(None) before W-θ).

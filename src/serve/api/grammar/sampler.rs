@@ -709,8 +709,8 @@ impl GrammarRuntime {
     /// normally.
     ///
     /// llama.cpp does NOT reset this flag back to `true` on the close
-    /// marker — single-call termination is delivered by the grammar
-    /// SHAPE exhausting after the close (`body close space` for hf2q's
+    /// marker — the bounded grammar SHAPE reaches an accepted state after the
+    /// close (`body close space` for hf2q's
     /// `OneOrMoreCallsBodyOnly { parallel: false }` emission, mirroring
     /// llama.cpp's `p.repeat(call, min, max=1)` at
     /// `/opt/llama.cpp/common/chat.cpp:1399-1416`). Multi-tool support
@@ -729,9 +729,10 @@ impl GrammarRuntime {
     /// flips the default to `false` (matches
     /// `/opt/llama.cpp/docs/function-calling.md:24`'s "disabled by
     /// default") so the typical request gets the bounded `body close
-    /// space` shape that exhausts naturally after the first close →
-    /// `is_dead` → engine halts via the unconditional grammar-driven
-    /// termination check.
+    /// space` shape that accepts naturally after the first close. DeepSeek's
+    /// single-call paths stop at that accepted boundary without evaluating an
+    /// unused next-token forward; engines that continue rely on the existing
+    /// grammar-driven exhaustion check.
     pub fn trigger(&mut self) {
         self.awaiting_trigger = false;
         self.lazy_trigger_tail.clear();

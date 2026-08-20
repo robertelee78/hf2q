@@ -21,7 +21,8 @@ use crate::serve::sampler_pure;
 
 use super::progress::RequestProgress;
 use super::sampling::{
-    decode_token_limit, grammar_runtime, sample, sampler_config, split_reasoning,
+    accepted_single_tool_call_is_terminal, decode_token_limit, grammar_runtime, sample,
+    sampler_config, split_reasoning,
 };
 use super::stream::StreamRouter;
 use super::{
@@ -496,6 +497,14 @@ impl Deepseek4SlotState {
             self.finished = true;
         } else if self.generated.len() >= self.max_tokens {
             self.finished = true;
+        } else if accepted_single_tool_call_is_terminal(&self.params, self.runtime.as_ref()) {
+            self.finish_reason = "stop";
+            self.finished = true;
+            tracing::info!(
+                target: "hf2q::serve::api::engine_deepseek4::progress",
+                request_id = self.progress.id(),
+                "DeepSeek-V4 single-tool terminal commit skipped"
+            );
         }
 
         if self.finished {

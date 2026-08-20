@@ -2,7 +2,7 @@
 
 - **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
   cache growth revalidated 2026-08-08
-- **Updated:** 2026-08-19 — the four-agent workload is bound to an immutable
+- **Updated:** 2026-08-20 — the four-agent workload is bound to an immutable
   insertion-ordered prompt contract and historical tool-result payload;
   `mlx-native =0.10.12` fixes non-aligned D512 tail loads; warm compatible
   suffixes cooperate through FFN/MoE; and an exact four-lane decode transaction
@@ -11,7 +11,10 @@
   reuse it for every sample, preserving the strict cadence contract without a
   Swift compiler launch in the measurement loop. Earlier real-model
   structured-tool, prefix-reuse, scheduling, and thermal evidence remains as
-  recorded below. The 2026-08-19 hf2q candidate requires exact-SHA CI and
+  recorded below. DeepSeek single-tool completion now also honors the existing
+  non-parallel default end to end and stops when its constrained grammar is
+  accepted instead of evaluating an unused final token. The 2026-08-20 hf2q
+  candidate requires exact-SHA CI and
   protected packed-artifact hardware receipts before publication.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
@@ -2107,6 +2110,64 @@ and repository-context SHA-256 is
 Publication still requires the packed exact-SHA binary to reproduce the B=4
 parity/positive-median gate and both continuously monitored four-agent waves.
 No 60/15/35-second ceiling is widened by this decision.
+
+### Accepted single-tool terminal forward (2026-08-20 candidate)
+
+Exact-main protected workflow `32350542331` reproduced a narrow release
+regression after the four-agent handoff work above. All four 6,684-token cold
+requests returned the exact required `read_file` call, but client response
+times were 61.245–61.255 seconds and therefore failed the unchanged 60-second
+product ceiling. The server spent 47.716–53.448 seconds in cold prefill and
+then held the completed calls for synchronized publication; there was no cache
+miss, GPU stall, malformed tool payload, or widened prompt.
+
+The terminal path had two inconsistent contracts. Tool grammar compilation
+already treated an omitted `parallel_tool_calls` field as `false`, matching
+ADR-005's accepted single-call default, while `SamplingParams` treated the
+same omission as `true`. After the single constrained DeepSeek tool body became
+accepted, unary, slot-aware, and SSE decode also evaluated one more complete
+model forward even though no later token could consume its logits. Stop
+strings and the maximum-token boundary already avoid that final cache
+mutation. The correction uses one effective default in grammar compilation and
+sampling, preserves explicit `true`, and treats an accepted non-parallel
+DeepSeek `ToolCallBodyAuto` or `ToolCallBodyRequired` runtime as terminal. It
+never truncates an unaccepted, dead, trigger-waiting, response-format, or
+parallel-call grammar.
+
+The smallest tests pin both halves: omitted and explicit-false parallel calls
+resolve identically while explicit-true remains enabled; and an accepted
+single-tool grammar is terminal only under the constrained non-parallel
+conditions above. The realistic product gate then proves that response parsing
+still yields one exact tool call rather than accepting merely valid JSON.
+
+Several adjacent hypotheses were measured before accepting this change and do
+not remain in the implementation:
+
+- ragged exact B=4 arithmetic was bit-exact, but scheduler variants with
+  32-, 16-, and 8-token cold quanta still measured maximum cold response times
+  of about 60.78, 60.57, and 63.22 seconds;
+- exact B=3 arithmetic reduced 69 command buffers and three synchronizations
+  to 23 and one, but its eight-pair median was only 1.0416x, below the
+  predeclared 1.05x acceptance threshold and too small to own the failure;
+- cross-slot cache forking was rejected by a tokenizer-only spike: the four
+  6,684-token prompts share only 319 leading tokens. Their large common text is
+  a suffix after the agent identity diverges and is therefore not a reusable
+  transformer prefix.
+
+After a continuously Nominal 60-second unloaded settle, the release binary
+built from this candidate passed the unchanged complete four-agent contract.
+Maximum cold semantic response was 59.360 seconds, cohort wall was 59.736
+seconds, and maximum cold TTFT was 49.597 seconds. Cached turns retained 6,676
+of 6,684 prompt tokens; maximum cached TTFT was 0.707 seconds, cached unary was
+12.631 seconds, automatic tool calling was 12.854 seconds, SSE was 13.030
+seconds, and tool-result continuation was 30.933 seconds. Every required and
+automatic tool name, exact argument, SSE terminal, source-syntax check, and
+tool-result continuation passed. The evidence directory is
+`hf2q-terminal-forward-nominal.XXXXXX.AndTpexqvZ`, and the source-bound server
+log is `/var/tmp/hf2q-terminal-forward-server.log`. This candidate evidence
+reuses the previously recorded immutable model digest; it does not reread the
+107 GB model merely to repeat that identity. Packed exact-SHA release gates
+remain required before publication.
 
 ## Historical agentic revalidation (superseded, 2026-08-05)
 
