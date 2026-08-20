@@ -415,7 +415,9 @@ jobs:
           /usr/bin/tar -xzf "$crate" -C "$packed_build_root"
           package_root=$(cd "$packed_build_root/hf2q-${EXPECTED_VERSION}" && pwd -P)
           dependency_provenance_dir="$build_root/dependency-provenance"
-          bash "$package_root/scripts/verify_release_dependency_provenance.sh" verify \
+          trusted_verifier="$GITHUB_WORKSPACE/scripts/verify_release_dependency_provenance.sh"
+          test -f "$trusted_verifier"
+          bash "$trusted_verifier" verify \
             "$dependency_provenance_dir" "$package_root/Cargo.lock"
 
           release_evidence="$RUNNER_TEMP/cache-lifecycle/standalone"

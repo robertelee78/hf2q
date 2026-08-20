@@ -33,7 +33,7 @@ for required in \
     fail "signing script is missing required contract: $required"
 done
 
-if rg -n 'stapler[[:space:]]+staple' "$SIGN_SCRIPT"; then
+if grep -En 'stapler[[:space:]]+staple' "$SIGN_SCRIPT"; then
   fail "standalone Mach-O must not claim an unsupported stapled ticket"
 fi
 grep -Fq 'environment: apple-release' "$CACHE_WORKFLOW" || \
@@ -47,7 +47,7 @@ grep -Fq 'standalone_proof="$standalone_dir/proof.json"' "$RELEASE_WORKFLOW" || 
   fail "release workflow does not consume the signed proof receipt"
 grep -Fq 'hf2q-aarch64-apple-darwin' "$RELEASE_WORKFLOW" || \
   fail "release workflow does not publish the native standalone asset"
-if rg -n 'gh release upload.*--clobber|--clobber.*hf2q-aarch64-apple-darwin' \
+if grep -En 'gh release upload.*--clobber|--clobber.*hf2q-aarch64-apple-darwin' \
   "$RELEASE_WORKFLOW"; then
   fail "immutable standalone assets must never be clobbered"
 fi
