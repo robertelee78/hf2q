@@ -26,6 +26,7 @@ use crate::inference::models::qwen35::source_precision::upload_plan::QwenSourceM
 mod assemble;
 mod layers;
 mod preflight;
+mod run_inputs;
 
 #[cfg(test)]
 mod tests;
@@ -36,6 +37,10 @@ pub(crate) use preflight::Qwen35SourceTeacherLimitsV1;
 use preflight::{
     runtime_envelope, validate_combined_capacity, validate_incremental_capacity,
     Qwen35SourceTeacherRuntimeEnvelopeV1,
+};
+pub(crate) use run_inputs::{
+    prepare_qwen35_source_teacher_run_inputs, PreparedQwen35SourceTeacherRunInputsV1,
+    Qwen35SourceTeacherPreparationPolicyV1,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -166,6 +171,7 @@ pub(crate) struct PreparedQwen35SourceTeacherV1 {
     output_norm: mlx_native::MlxBuffer,
     output: mlx_native::MlxBuffer,
     layers: Vec<PreparedQwen35SourceLayerV1>,
+    upload_limits: QwenSourceMetalUploadLimits,
     receipt: PreparedQwen35SourceTeacherReceiptV1,
 }
 

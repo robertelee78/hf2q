@@ -11,8 +11,12 @@ mod types;
 
 pub(crate) use target_artifact::{
     preflight_structural_teacher_target, write_structural_teacher_target_artifact,
+    UnpublishedStructuralTeacherTargetReservation,
 };
 pub use types::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reservation_tests;

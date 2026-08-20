@@ -1,8 +1,7 @@
 //! Checked, base-text-only cache preparation for the source-BF16 teacher.
 //!
-//! This module deliberately stops before graph execution. It plans and owns
-//! one fresh F32 cache with one sequence, no MTP slot, no TQ buffers, and no
-//! speculative DeltaNet capture. No raw cache or Metal buffer escapes.
+//! It owns one fresh F32 cache with one sequence, no MTP, TQ, capture, raw
+//! cache accessor, or graph-execution claim.
 
 use anyhow::{ensure, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
@@ -75,6 +74,10 @@ impl Qwen35BaseTextCachePlanV1 {
     pub(in crate::inference::models::qwen35) fn base_linear_attention_state_bytes(&self) -> u64 {
         self.base_linear_attention_state_bytes
     }
+
+    pub(in crate::inference::models::qwen35) fn layout_sha256(&self) -> &str {
+        &self.layout_sha256
+    }
 }
 
 #[derive(Serialize)]
@@ -101,6 +104,24 @@ pub(in crate::inference::models::qwen35) struct Qwen35BaseTextCacheReceiptV1 {
     receipt_sha256: String,
 }
 
+impl Qwen35BaseTextCacheReceiptV1 {
+    pub(in crate::inference::models::qwen35) fn plan(&self) -> &Qwen35BaseTextCachePlanV1 {
+        &self.plan
+    }
+
+    pub(in crate::inference::models::qwen35) fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    pub(in crate::inference::models::qwen35) fn device_registry_id(&self) -> u64 {
+        self.device_registry_id
+    }
+
+    pub(in crate::inference::models::qwen35) fn receipt_sha256(&self) -> &str {
+        &self.receipt_sha256
+    }
+}
+
 /// Opaque owner of the fresh cache. A later runner slice will add the only
 /// consuming execution transition; this slice exposes no cache or buffer.
 pub(in crate::inference::models::qwen35) struct PreparedQwen35BaseTextCacheV1 {
@@ -109,7 +130,6 @@ pub(in crate::inference::models::qwen35) struct PreparedQwen35BaseTextCacheV1 {
 }
 
 impl PreparedQwen35BaseTextCacheV1 {
-    #[allow(dead_code)] // consumed by the source-teacher runner slice
     pub(in crate::inference::models::qwen35) fn receipt(&self) -> &Qwen35BaseTextCacheReceiptV1 {
         &self.receipt
     }

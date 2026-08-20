@@ -1095,6 +1095,41 @@ authority, residency, graph
 dispatch, completion, logits, peak memory, performance, persisted replay,
 sensitivity, Dynamic, selector, or DWQ authority.
 
+The fourth B3b prerequisite makes those structural capabilities one ordered,
+opaque set of future run inputs. Its sole production constructor consumes the
+source-bound work proof, derives the exact cache-token and target-row bounds
+from that proof, and creates an empty descriptor-retained target reservation
+before invoking the B2b/B3a weight transition. The reservation writes only the
+target magic under a private name and hash-binds the prediction-plan identity,
+vocabulary, limits, row/trajectory counts, and exact final byte length. It
+owns no logits and cannot finish or publish; the later runner must consume it
+and rebind the unchanged opaque prediction plan to obtain the row stream. This
+avoids cloning token material or constructing a self-referential plan/stream.
+The reservation is revalidated after weight preparation, after cache
+preparation, and again at plan rebind: the canonical parent and private inode,
+exact magic bytes, receipt hash, and continued absence of the final name must
+all reproduce. A same-length in-place mutation or destination created during
+the expensive preparation window therefore rejects before execution.
+After the weights are prepared, capacity is observed again with the exact
+upload reserves retained by B3a, and the cache is allocated only from B3a's
+private authenticated config and exact `MlxDevice`. Sealing checks the work,
+topology, projected config, prepared graph, device, cache layout/bytes, target
+reservation, and expected counters, then owns the plan, reservation, weights,
+and cache inseparably. Failure at any point drops the private target and all
+partial Metal ownership; the final destination remains absent. Stable catalog
+identity excludes the pathname and volatile capacity/device receipts, while a
+separate process receipt binds the B3a preparation, cache allocation, and
+device. That process receipt also binds the fresh post-weight host/Metal
+capacity observation, exact accounted runtime payload and unmeasured-runtime
+allowance, retained upload reserves, checked host/Metal requirements, and
+available Metal bytes; the stable catalog deliberately excludes those
+volatile observations. This is a successful admission observation, not a
+reservation or a runtime-liveness/peak proof. This run-input object remains
+inert: it exposes no model, buffer,
+cache, target writer, or forward method and proves no encoding, submission,
+completion, logits, finished/published target, runtime liveness, peak memory,
+performance, sensitivity, Dynamic, selector, autoquant, or DWQ authority.
+
 Completing D3a requires a family-owned, bounded source-precision dense-Qwen
 runner that consumes authenticated source tensors without the production
 Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps

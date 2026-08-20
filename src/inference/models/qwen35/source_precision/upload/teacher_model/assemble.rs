@@ -37,6 +37,7 @@ pub(super) fn assemble(
         records,
         catalog_sha256: upload_catalog_sha256,
         receipt_sha256: upload_receipt_sha256,
+        limits: upload_limits,
         preflight,
         ..
     } = receipt;
@@ -330,6 +331,7 @@ pub(super) fn assemble(
         output_norm,
         output,
         layers,
+        upload_limits,
         receipt,
     })
 }

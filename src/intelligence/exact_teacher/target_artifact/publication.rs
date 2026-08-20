@@ -97,6 +97,19 @@ impl RetainedTargetTemp {
             .expect("retained teacher target file must be present")
     }
 
+    pub(super) fn verify_private(&self, expected_len: u64) -> Result<(), ExactTeacherTargetError> {
+        self.require_parent_rebound()?;
+        self.verify_temporary(expected_len, 1)
+    }
+
+    pub(super) fn verify_private_and_absent(
+        &self,
+        expected_len: u64,
+    ) -> Result<(), ExactTeacherTargetError> {
+        self.verify_private(expected_len)?;
+        require_absent(&self.parent, &self.final_name, &self.output)
+    }
+
     pub(super) fn publish_noclobber(
         self,
         expected_len: u64,
