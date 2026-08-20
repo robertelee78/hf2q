@@ -1,9 +1,10 @@
 //! Authenticated source-precision Qwen teacher substrate.
 //!
-//! This module deliberately stops at a retained, structurally verified source
+//! Production deliberately stops at a retained, structurally verified source
 //! snapshot, opaque host-populated shared-Metal upload, and an exact
-//! family-owned prepared text graph. It does not execute that graph or mint
-//! completion, exact-teacher, sensitivity, performance, or allocator
+//! family-owned prepared text graph. A `cfg(test)`-only parity harness executes
+//! that graph without exposing a production forward transition. Neither path
+//! mints completion, exact-teacher, sensitivity, performance, or allocator
 //! authority.
 
 mod header;
