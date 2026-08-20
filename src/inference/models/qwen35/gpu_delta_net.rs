@@ -429,9 +429,9 @@ pub struct DeltaNetWeightsGpu {
     pub ssm_a: MlxBuffer,
     /// Log-decay base `[nv]` — CPU copy, avoids GPU download on hot path.
     pub ssm_a_cpu: Vec<f32>,
-    /// Output per-head RMSNorm `[nv*dv]`.
+    /// Output per-head RMSNorm `[dv]`, broadcast across value heads.
     pub ssm_norm: MlxBuffer,
-    /// Output per-head RMSNorm `[nv*dv]` — CPU copy for apply_ssm_norm_and_gate.
+    /// Output per-head RMSNorm `[dv]` — CPU copy for apply_ssm_norm_and_gate.
     pub ssm_norm_cpu: Vec<f32>,
     /// Output projection `[hidden_size, nv*dv]`.
     pub ssm_out: MlxBuffer,
