@@ -1125,7 +1125,8 @@ pub fn canonical_frontier_bytes(
 
 /// Independently reproduce the exact frontier and reject any mutated or
 /// stale policy/search receipt.
-pub fn validate_policy_frontier(
+#[cfg(test)]
+pub(super) fn validate_policy_frontier(
     problem: &DynamicAllocationProblem,
     frontier: &PolicyFrontier,
 ) -> Result<(), DynamicAllocationError> {

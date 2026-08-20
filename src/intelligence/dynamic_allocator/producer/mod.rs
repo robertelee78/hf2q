@@ -14,8 +14,7 @@ mod partition;
 mod types;
 
 pub use bindings::{
-    allocate_verified_dynamic_frontier, validate_dynamic_allocation_bindings,
-    VerifiedDynamicAllocationProblem,
+    validate_structural_dynamic_allocation_bindings, StructurallyBoundDynamicAllocationProblem,
 };
 pub use coverage::{
     build_coverage_contract, validate_coverage_contract, verify_collector_topology,

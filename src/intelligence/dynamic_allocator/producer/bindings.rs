@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::super::{
-    allocate_dynamic_frontier, DynamicAllocationError, DynamicAllocationProblem, PolicyFrontier,
-};
+use super::super::{allocation_problem_sha256, DynamicAllocationProblem};
 use super::{
     validate_coverage_contract, validate_tensor_partition, verify_coverage_receipt,
     CoverageContract, CoverageReceipt, DynamicProducerError, TensorPartitionManifest,
@@ -49,24 +47,31 @@ fn validate_identity_links(
     Ok(())
 }
 
-/// Type-state admission proof for the raw additive Pareto proposer. The raw
-/// problem remains inspectable, but only this type is accepted by the public
-/// producer entrypoint.
+/// Structurally cross-bound proposal input.
+///
+/// This type does not authenticate family-owned activation materializations,
+/// loaded/executed tensor bytes, mlx-native capability decisions, dispatch
+/// traces, or timing receipts. It deliberately has no public allocation
+/// entrypoint. A later runtime-evidence admission layer must consume it before
+/// a production Dynamic frontier can be proposed.
 #[derive(Debug, Clone)]
-pub struct VerifiedDynamicAllocationProblem {
-    problem: DynamicAllocationProblem,
+pub struct StructurallyBoundDynamicAllocationProblem {
+    problem_sha256: String,
 }
 
-pub fn allocate_verified_dynamic_frontier(
-    verified: &VerifiedDynamicAllocationProblem,
-) -> Result<PolicyFrontier, DynamicAllocationError> {
-    allocate_dynamic_frontier(&verified.problem)
+impl StructurallyBoundDynamicAllocationProblem {
+    pub fn problem_sha256(&self) -> &str {
+        &self.problem_sha256
+    }
 }
 
-/// Validate the complete model-free producer chain before admitting a problem
-/// to the Pareto solver. SHA-shaped strings alone are never sufficient.
+/// Validate the complete model-free structural producer chain.
+///
+/// SHA-shaped strings alone are insufficient for the D1/D2a relationships
+/// checked here. This function does not authenticate runtime or measurement
+/// evidence and therefore cannot authorize the Pareto solver.
 #[allow(clippy::too_many_arguments)]
-pub fn validate_dynamic_allocation_bindings(
+pub fn validate_structural_dynamic_allocation_bindings(
     problem: &DynamicAllocationProblem,
     dataset_partition: &DatasetPartitionManifest,
     calibration: &RenderedDataset,
@@ -77,7 +82,7 @@ pub fn validate_dynamic_allocation_bindings(
     topology: &VerifiedCollectorTopology,
     coverage_contract: &CoverageContract,
     coverage_receipt: &CoverageReceipt,
-) -> Result<VerifiedDynamicAllocationProblem, DynamicProducerError> {
+) -> Result<StructurallyBoundDynamicAllocationProblem, DynamicProducerError> {
     let rebuilt_dataset_partition =
         verify_dataset_partition(calibration, policy_validation, acceptance_holdout)
             .map_err(|error| DynamicProducerError::InvalidBinding(error.to_string()))?;
@@ -214,11 +219,9 @@ pub fn validate_dynamic_allocation_bindings(
             }
         }
     }
-    super::super::allocation_problem_sha256(problem)
+    let problem_sha256 = allocation_problem_sha256(problem)
         .map_err(|error| DynamicProducerError::InvalidBinding(error.to_string()))?;
-    Ok(VerifiedDynamicAllocationProblem {
-        problem: problem.clone(),
-    })
+    Ok(StructurallyBoundDynamicAllocationProblem { problem_sha256 })
 }
 
 #[cfg(test)]

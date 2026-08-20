@@ -9,9 +9,87 @@ use std::io::Read;
 
 use super::*;
 use crate::convert::tensor_lineage::{
-    MAX_STORED_TENSOR_CONVERSION_RECEIPT_BYTES, StoredTensorConversionReceipt,
     tensor_conversion_receipt_path, validate_stored_tensor_conversion_receipt,
+    StoredTensorConversionReceipt, MAX_STORED_TENSOR_CONVERSION_RECEIPT_BYTES,
 };
+
+/// Non-cloneable capability over the exact GGUF inode admitted by D2b.
+///
+/// The conversion receipt alone is not runtime authority: a pathname can be
+/// replaced after replay. D2c loaders must consume this retained GGUF handle,
+/// then rehash `artifact` after loading before they may mint loaded/executed
+/// evidence. Non-tensor GGUF metadata remains outside the D2b claim and must
+/// be cross-checked against authenticated source configuration by that loader.
+#[allow(dead_code)] // consumed by the loaded/executed Qwen producer slice
+pub(crate) struct VerifiedStoredQwenArtifact {
+    conversion: VerifiedSourceToStoredConversion,
+    artifact: File,
+    gguf: mlx_native::GgufFile,
+    source_config: serde_json::Value,
+}
+
+/// Result of one load through the retained GGUF parser followed by automatic
+/// same-inode reconciliation. This proves artifact continuity only; D2c must
+/// separately authenticate the loaded value and its executed buffers.
+#[allow(dead_code)] // consumed by the loaded/executed Qwen producer slice
+pub(crate) struct RetainedQwenArtifactLoad<T> {
+    value: T,
+    conversion: VerifiedSourceToStoredConversion,
+}
+
+#[allow(dead_code)] // consumed by the loaded/executed Qwen producer slice
+impl<T> RetainedQwenArtifactLoad<T> {
+    pub(crate) fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub(crate) fn conversion(&self) -> &VerifiedSourceToStoredConversion {
+        &self.conversion
+    }
+
+    pub(crate) fn try_map<U, E>(
+        self,
+        map: impl FnOnce(T, &VerifiedSourceToStoredConversion) -> Result<U, E>,
+    ) -> Result<RetainedQwenArtifactLoad<U>, E> {
+        let value = map(self.value, &self.conversion)?;
+        Ok(RetainedQwenArtifactLoad {
+            value,
+            conversion: self.conversion,
+        })
+    }
+}
+
+#[allow(dead_code)] // consumed by the loaded/executed Qwen producer slice
+impl VerifiedStoredQwenArtifact {
+    /// Consume this capability, load through its exact verified parser, then
+    /// rehash the retained inode. The mandatory final hash detects persistent
+    /// mutation; independently verifying the loaded values remains necessary
+    /// to reject a transient mutate-and-restore race.
+    pub(crate) fn load_and_reconcile<T>(
+        self,
+        load: impl FnOnce(
+            &mlx_native::GgufFile,
+            &serde_json::Value,
+            &VerifiedSourceToStoredConversion,
+        ) -> anyhow::Result<T>,
+    ) -> Result<RetainedQwenArtifactLoad<T>, ConvertError> {
+        let value = load(&self.gguf, &self.source_config, &self.conversion).map_err(|error| {
+            ConvertError::Source(SourceError::Safetensors(format!(
+                "load retained Qwen GGUF: {error}"
+            )))
+        })?;
+        verify_open_artifact_identity(&self.artifact, &self.conversion.receipt().gguf_container)
+            .map_err(|error| {
+                ConvertError::Source(SourceError::Safetensors(format!(
+                    "verified stored artifact changed after replay: {error}"
+                )))
+            })?;
+        Ok(RetainedQwenArtifactLoad {
+            value,
+            conversion: self.conversion,
+        })
+    }
+}
 
 /// Run the same production conversion loop while producing authoritative
 /// source-to-stored evidence. This remains crate-private until the canonical
@@ -93,12 +171,25 @@ pub(crate) fn run_convert_with_stored_evidence(
 /// exact promoted GGUF inode. A self-consistent JSON sidecar is never enough
 /// to recover the opaque authority used by Dynamic admission.
 #[allow(dead_code)] // consumed by the next Dynamic materializer/admission slice
+#[cfg(test)]
 pub(crate) fn verify_persisted_stored_evidence(
     model_dir: &Path,
     output: &Path,
     verified_source: &VerifiedSourceManifest,
     context: &VerifiedConversionEvidenceContext,
 ) -> Result<VerifiedSourceToStoredConversion, ConvertError> {
+    verify_persisted_stored_artifact(model_dir, output, verified_source, context)
+        .map(|artifact| artifact.conversion)
+}
+
+/// Replay D2b and retain the exact authenticated GGUF inode for D2c loading.
+#[allow(dead_code)] // consumed by the loaded/executed Qwen producer slice
+pub(crate) fn verify_persisted_stored_artifact(
+    model_dir: &Path,
+    output: &Path,
+    verified_source: &VerifiedSourceManifest,
+    context: &VerifiedConversionEvidenceContext,
+) -> Result<VerifiedStoredQwenArtifact, ConvertError> {
     let receipt_path = tensor_conversion_receipt_path(output);
     let persisted_bytes = read_bounded_stored_conversion_receipt(&receipt_path)?;
     let persisted: StoredTensorConversionReceipt = serde_json::from_slice(&persisted_bytes)
@@ -218,11 +309,12 @@ pub(crate) fn verify_persisted_stored_evidence(
         drop(evidence.data);
     }
 
-    let stored = verify_written_tensor_evidence_file(&artifact, &writes).map_err(|error| {
-        ConvertError::Source(SourceError::Safetensors(format!(
-            "verify persisted GGUF bytes: {error}"
-        )))
-    })?;
+    let stored =
+        verify_written_tensor_evidence_open(&artifact, &gguf, &writes).map_err(|error| {
+            ConvertError::Source(SourceError::Safetensors(format!(
+                "verify persisted GGUF bytes: {error}"
+            )))
+        })?;
     verify_source_to_stored_continuity(&materialized, &writes, &stored).map_err(|error| {
         ConvertError::Source(SourceError::Safetensors(format!(
             "verify persisted source-to-stored continuity: {error}"
@@ -265,7 +357,19 @@ pub(crate) fn verify_persisted_stored_evidence(
                 .into(),
         )));
     }
-    Ok(verified)
+    verify_open_artifact_identity(&artifact, &verified.receipt().gguf_container).map_err(
+        |error| {
+            ConvertError::Source(SourceError::Safetensors(format!(
+                "final persisted GGUF identity verification failed: {error}"
+            )))
+        },
+    )?;
+    Ok(VerifiedStoredQwenArtifact {
+        conversion: verified,
+        artifact,
+        gguf,
+        source_config: source.config.clone(),
+    })
 }
 
 fn read_bounded_stored_conversion_receipt(path: &Path) -> Result<Vec<u8>, ConvertError> {

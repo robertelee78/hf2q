@@ -2234,18 +2234,20 @@ dependencies = [
 
 [[package]]
 name = "mlx-native"
-version = "0.10.15"
+version = "0.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7586db96aa57ce6f5d33f0b65c6d892cafe6bede94fb0756ecaa275309545259"
+checksum = "9236b563fc45c861ec772cb0b29aafc1144bc49b92b229790c7e1b57844fc83b"
 dependencies = [
  "bytemuck",
  "half",
+ "hex",
  "memmap2",
  "metal",
  "objc",
  "safetensors",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

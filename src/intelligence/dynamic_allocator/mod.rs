@@ -11,12 +11,12 @@ mod types;
 
 pub mod producer;
 
-use solver::allocate_dynamic_frontier;
+#[cfg(test)]
+use solver::{allocate_dynamic_frontier, validate_policy_frontier};
 pub use solver::{
     allocation_problem_sha256, canonical_frontier_bytes, canonical_policy_bytes,
     execution_manifest_catalog_sha256, final_executed_tensor_bundle_sha256,
-    precision_policy_sha256, stored_payload_bytes, tensor_catalog_sha256, validate_policy_frontier,
-    DynamicAllocationError,
+    precision_policy_sha256, stored_payload_bytes, tensor_catalog_sha256, DynamicAllocationError,
 };
 pub use types::*;
 

@@ -898,7 +898,7 @@ fn coverage_binds_exact_taps_and_packed_experts() {
 }
 
 #[test]
-fn verified_dynamic_binding_chain_accepts_exact_evidence_and_rejects_substitution() {
+fn structural_dynamic_binding_chain_accepts_exact_evidence_and_rejects_substitution() {
     let fixture = source_fixture();
     let calibration = rendered_split(&fixture, DatasetSplit::Calibration, "cal", "cal");
     let validation = rendered_split(&fixture, DatasetSplit::PolicyValidation, "val", "val");
@@ -999,7 +999,7 @@ fn verified_dynamic_binding_chain_accepts_exact_evidence_and_rejects_substitutio
     let admit = |problem: &DynamicAllocationProblem,
                  contract: &CoverageContract,
                  receipt: &CoverageReceipt| {
-        validate_dynamic_allocation_bindings(
+        validate_structural_dynamic_allocation_bindings(
             problem,
             &dataset_partition,
             &calibration,
@@ -1012,13 +1012,10 @@ fn verified_dynamic_binding_chain_accepts_exact_evidence_and_rejects_substitutio
             receipt,
         )
     };
-    let verified = admit(&problem, &contract, &receipt).unwrap();
+    let structurally_bound = admit(&problem, &contract, &receipt).unwrap();
     assert_eq!(
-        allocate_verified_dynamic_frontier(&verified)
-            .unwrap()
-            .policies
-            .len(),
-        1
+        structurally_bound.problem_sha256(),
+        allocation_problem_sha256(&problem).unwrap()
     );
 
     let mut wrong_source = problem.clone();

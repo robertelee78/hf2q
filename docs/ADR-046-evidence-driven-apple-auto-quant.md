@@ -3,8 +3,11 @@
 - Status: Accepted; measured-selector foundation implemented, artifact
   generation and CLI activation remain gated by the phases below
 - Date: 2026-08-18
-- Updated: 2026-08-19 — source-to-stored evidence requires the exact published
-  `mlx-native = 0.10.15` host-GGUF and routing/capability surface
+- Updated: 2026-08-20 — source-to-stored evidence and the bounded
+  loaded/executed/encoded producer use exact published
+  `mlx-native = 0.10.16`; model-free allocation binding remains structural and
+  cannot invoke the proposer without authenticated completion, measurement,
+  and quality evidence
 - Owners: hf2q product pipeline; mlx-native model-agnostic execution primitives
 - Supersedes: ADR-020's proposed DWQ architecture and performance claims
 
@@ -448,7 +451,8 @@ This phase changes no conversion format and makes no new speed claim.
 
 ### Phase A.1 — close current Gate-0/Gate-1 seams
 
-- Pin and consume `mlx-native 0.10.15`'s published capability surface from
+- Pin and consume `mlx-native 0.10.16`'s published capability and resolved
+  dispatch-trace surface from
   hf2q as a machine-readable converter/runtime tensor-type contract. Its
   `GgufFile::from_file`, exact host raw/F32 tensor reads, unified routing
   policy, and GGML capability schema are the current source-to-stored/runtime
@@ -608,10 +612,12 @@ measure Dynamic sensitivity:
 - allocation schema v3 originally recorded both the three-way dataset
   partition and the full tensor partition. The solver still treats these as
   opaque identities;
-  admission therefore requires `validate_dynamic_allocation_bindings`, which
+  structural binding therefore requires
+  `validate_structural_dynamic_allocation_bindings`, which
   regenerates the dataset partition and coverage receipt, validates the source
-  tensor partition, and cross-checks every child hash before invoking the
-  solver. SHA-shaped substitutions are rejected.
+  tensor partition, and cross-checks every child hash. SHA-shaped substitutions
+  are rejected. The returned opaque structural type has no allocation
+  entrypoint; authenticated family/runtime evidence remains a separate gate.
 
 This is a **model-free producer substrate**, not a completed calibration run.
 It does not yet contain the real Qwen3.8 variable-unit/tap catalog. The exact
@@ -676,12 +682,12 @@ Metal uploads, or mlx-native request/decision semantics. The capability
 envelope is only opaque canonical JSON plus a digest in D2a; it makes no typed
 mlx-native ABI claim, regardless of the version string recorded by a fixture.
 
-D2b must instrument the real hf2q converter, Qwen loader, load-time amax/7
-packer, direct FFN block path, output head, and production dispatches; rehash
-the actual source/GGUF/loaded/executed bytes; deserialize and recompute typed
-mlx-native capability decisions under the exact routing policy; and pass the
-real Qwen3.8 Apple gate. Until then schema v4 cannot authorize a Dynamic cost,
-candidate artifact, or production `--quant auto` choice.
+D2b and D2c must instrument the real hf2q converter and Qwen execution path,
+rehash actual source/GGUF/loaded/executed bytes, and recompute typed
+mlx-native capability decisions under the exact routing policy. Even after
+the bounded D2c producer below, schema v4 cannot authorize a Dynamic cost,
+candidate artifact, or production `--quant auto` choice without completed
+runtime, measurement, quality, and materialization receipts.
 
 #### 2026-08-19 — dense-Qwen source-to-stored evidence producer
 
@@ -715,17 +721,71 @@ runtime-cost, sensitivity, or mixed-policy result:
   non-tensor GGUF metadata such as model-card, tokenizer, generation, or chat
   template fields. Serving admission must validate those inputs separately;
   this receipt cannot be cited as whole-GGUF metadata provenance;
-- the slice admits only standard Q4_K_M and Q8_0 with no imatrix,
+- the source-to-stored receipt admits only standard Q4_K_M and Q8_0 with no imatrix,
   calibration, learned affine state, or DWQ overlay. It does not splice a
   mixed candidate artifact, connect receipts to schema-v4 allocator options,
-  observe loaded/executed Qwen buffers, validate typed mlx-native capability
-  decisions, or authorize any Apple performance comparison.
+  or authorize any Apple performance comparison. Loaded/executed observations
+  are owned separately by the subsequent D2c producer and do not retroactively
+  widen this receipt's metadata or runtime claims.
 
-The next D2b slice must join this verified stored catalog to the actual Qwen
-loader, amax/7 repacks, direct packed FFN buffers, output-head upload, and
-same-policy production dispatch. Only after that physical path is complete may
-D3 produce exact-teacher Dynamic sensitivity and materialize candidate
-policies. DWQ remains outside the authorized program.
+#### 2026-08-20 — bounded dense-Qwen loaded/executed/encoded producer
+
+The D2c producer joins the verified stored catalog to one deliberately bounded
+dense-Qwen text execution. It closes byte and host-command-encoding lineage;
+it does **not** complete or time Metal work and therefore does not authorize a
+cost or a Dynamic proposal:
+
+- persisted source-to-stored replay retains one already-open GGUF identity.
+  The copied Qwen loader consumes that parser, checks the authenticated source
+  configuration before and after load, rejects legacy synthetic vocabulary
+  extension, and rehashes the same file identity after the load closure. The
+  opaque candidate exposes neither the raw model nor mutable weight buffers;
+- every stored tensor loaded by the production path is observed with its exact
+  source name, D1 disposition, shape, codec, physical byte hash, decoded F32
+  hash, and materialization count. Repeated shared-head loads are accepted only
+  when every physical field is identical. Fixed/protected MTP weights remain
+  explicit authenticated loaded tensors but are marked non-executed by the
+  base autoregressive profile; variable MTP is rejected;
+- cache construction rehashes the actual CPU/GPU values. It proves retained
+  embedding and norm values, byte-identical direct packed dense-FFN blocks,
+  DeltaNet's two conv transposes and five amax/7 projection packs, the fused-Q
+  parent split into role-distinct q/gate branches followed by two production
+  amax/7 Q4_0 packs, and the output-head pack. Ordinary sources have exactly
+  one executed terminal; fused Q has exactly the two declared terminals;
+- one canonical execution configuration resolves the full typed
+  `GgmlRoutingPolicy` once. The evidence scope passes that exact policy to
+  explicit-policy production entrypoints and fixes its graph choices: dense
+  prefill keeps separate gate/up projections, decode may use the supported
+  fused pair, fused QKVG and diagnostic split/chunk routes are disabled, and
+  the standard vector paths cannot be changed by later environment mutation;
+- an evidence session is bounded to one prompt and one single-token decode.
+  Each weight projection yields a typed mlx-native 0.10.16 resolved-dispatch
+  trace with exact operation id and executed-node ids. The verifier recomputes
+  the capability decision, checks request dimensions/codec/byte minima,
+  routing policy, device, resolved dispatch count, both workload coverages,
+  and exact one- or two-weight topology. Duplicate operation/workload evidence,
+  a missing regime, or a node substitution fails closed;
+- the Apple model fixture uses the production converter, copied loader, cache,
+  M=9 prompt, and M=1 decode for both Q8_0 and heterogeneous Q4_K_M. It contains
+  one DeltaNet layer and one full-attention layer and exercises the typed
+  Delta projections, conv roundtrip, fused-Q fanout, separate/fused FFNs, and
+  output head. This is a small exact-path falsifier, not the required official
+  Qwen3.8 quality or performance gate.
+
+`GgmlResolvedDispatchTrace` proves host-side command encoding only. It does not
+prove command-buffer submission or completion, numerical correctness, latency,
+energy, peak memory, or a cross-process hardware identity. The generic
+hardware profile still lacks the Metal registry/OS/runtime binding required by
+a performance receipt. Non-tensor GGUF metadata derivation, full official
+Qwen3.8 coverage, persisted D2c replay, schema-v4 manifest materialization,
+mixed-artifact writing, exact-teacher sensitivity, matched Apple measurement,
+and production `--quant auto` remain later gates. The allocator has no public
+entrypoint from structural or D2c evidence. No DWQ overlay, learned affine
+state, training, or candidate is admitted.
+
+Only after completed runtime and quality/measurement authority is joined to
+this physical path may D3 produce exact-teacher Dynamic sensitivity and
+materialize candidate policies. DWQ remains outside the authorized program.
 
 ### Phase E — production `--quant auto`
 

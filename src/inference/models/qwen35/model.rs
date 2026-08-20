@@ -122,6 +122,16 @@ pub struct Qwen35Model {
     /// Optional MTP draft block. Executed only by speculative decoding, never
     /// by the verifier's main layer loop.
     pub mtp: Option<MtpWeights>,
+    /// Present only on the evidence-bearing copied-load path. Ordinary Qwen
+    /// loading remains behaviorally unchanged until it opts into that path.
+    pub(super) loaded_candidate_identity: Option<Qwen35LoadedCandidateIdentity>,
+}
+
+pub(super) struct Qwen35LoadedCandidateIdentity {
+    configuration: std::sync::Arc<super::execution_config::Qwen35ExecutionConfiguration>,
+    conversion_receipt_sha256: String,
+    loaded_catalog:
+        std::sync::Arc<super::execution_observation::VerifiedLoadedTensorCatalog>,
 }
 
 impl Qwen35Model {
@@ -162,8 +172,56 @@ impl Qwen35Model {
             output_weight: vec![0.0f32; h * vocab],
             output_norm: vec![1.0f32; h],
             mtp: None,
+            loaded_candidate_identity: None,
             cfg,
         }
+    }
+
+    /// Bind cache invalidation metadata after the opaque D2b load chain has
+    /// reconciled the same artifact inode. This is not runtime authority: the
+    /// stored policy is not authoritative until every admitted dispatch
+    /// consumes it and produces a typed trace.
+    pub(super) fn bind_loaded_candidate_identity(
+        &mut self,
+        reconciled: super::execution_evidence::ReconciledLoadedCandidateIdentity,
+    ) -> Result<()> {
+        let (configuration, conversion_receipt_sha256, loaded_catalog) =
+            reconciled.into_parts();
+        configuration.validate()?;
+        if conversion_receipt_sha256.len() != 64
+            || !conversion_receipt_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            anyhow::bail!("Qwen loaded-candidate identity requires a lowercase receipt SHA-256");
+        }
+        if self.loaded_candidate_identity.is_some() {
+            anyhow::bail!("Qwen loaded-candidate identity is already bound");
+        }
+        self.loaded_candidate_identity = Some(Qwen35LoadedCandidateIdentity {
+            configuration: std::sync::Arc::new(configuration),
+            conversion_receipt_sha256,
+            loaded_catalog,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn loaded_candidate_cache_identity(&self) -> Option<(&str, &str, &str)> {
+        let identity = self.loaded_candidate_identity.as_ref()?;
+        let configuration = identity.configuration.as_ref();
+        Some((
+            &identity.conversion_receipt_sha256,
+            configuration.graph_configuration_sha256(),
+            configuration.routing_policy_sha256(),
+        ))
+    }
+
+    pub(super) fn loaded_candidate_tensor_catalog(
+        &self,
+    ) -> Option<&super::execution_observation::VerifiedLoadedTensorCatalog> {
+        self.loaded_candidate_identity
+            .as_ref()
+            .map(|identity| identity.loaded_catalog.as_ref())
     }
 
     /// Load a complete model from a GGUF file.
@@ -356,6 +414,7 @@ impl Qwen35Model {
             output_weight,
             output_norm,
             mtp,
+            loaded_candidate_identity: None,
         })
     }
 
