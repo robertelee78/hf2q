@@ -2,11 +2,18 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
 
+use hf_hub::{Repo, RepoType};
 use thiserror::Error;
 
-use super::{validate_repo_inventory, DownloadError};
+use super::{
+    build_hub_api, fetch_expected_file_metadata, resolve_hf_cache_dir, validate_repo_inventory,
+    DownloadError,
+};
+use crate::core::integrity::ShardIntegrity;
 use crate::input::hf_reference::{HfModelReference, ResolvedHfModelReference};
-use crate::input::model_recipe::{ModelPreparationError, ModelPreparationPlan, RecipeArtifactRole};
+use crate::input::model_recipe::{
+    ModelPreparationError, ModelPreparationPlan, RecipeArtifactRole, RecipeSourceFile,
+};
 
 /// One bounded repository inventory resolved by the pinned in-process Hub
 /// client before any model payload is transferred.
@@ -123,6 +130,149 @@ impl ResolvedModelPreparationPlan {
 
     pub fn profile_path(&self) -> &Path {
         self.plan.profile_path()
+    }
+
+    pub(super) fn expected_source_files(&self) -> &[RecipeSourceFile] {
+        self.plan.expected_source_files()
+    }
+}
+
+/// Exact recipe-owned Hub metadata authorized before any model payload is
+/// transferred.
+///
+/// This token consumes the resolved preparation plan, retains only the 29
+/// canonical recipe records, and is deliberately non-Clone. It grants no
+/// payload-transfer, conversion, filesystem-mutation, deletion, registration,
+/// calibration, or serving authority.
+pub struct AuthorizedModelPreparationTransfer {
+    resolved: ResolvedModelPreparationPlan,
+    records: Vec<ShardIntegrity>,
+}
+
+impl fmt::Debug for AuthorizedModelPreparationTransfer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizedModelPreparationTransfer")
+            .field("recipe_id", &self.resolved.recipe_id())
+            .field(
+                "repository_id",
+                &self.resolved.resolved_reference().repo_id(),
+            )
+            .field("revision", &self.resolved.resolved_reference().revision())
+            .field("authorized_file_count", &self.records.len())
+            .field("records", &"[redacted]")
+            .finish()
+    }
+}
+
+impl AuthorizedModelPreparationTransfer {
+    pub fn recipe_id(&self) -> &str {
+        self.resolved.recipe_id()
+    }
+
+    pub fn resolved_reference(&self) -> &ResolvedHfModelReference {
+        self.resolved.resolved_reference()
+    }
+
+    pub fn authorized_file_count(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn model_root(&self) -> &Path {
+        self.resolved.model_root()
+    }
+
+    pub fn source_root(&self) -> &Path {
+        self.resolved.source_root()
+    }
+}
+
+pub(super) fn bind_transfer_authorization(
+    resolved: ResolvedModelPreparationPlan,
+    records: Vec<ShardIntegrity>,
+) -> Result<AuthorizedModelPreparationTransfer, ModelPreparationError> {
+    let expected = resolved.expected_source_files();
+    if records.len() != expected.len() {
+        return Err(preparation_error(format!(
+            "Hub metadata authorized {} files; recipe requires {}",
+            records.len(),
+            expected.len()
+        )));
+    }
+
+    let mut canonical = Vec::with_capacity(expected.len());
+    for (actual, expected) in records.iter().zip(expected) {
+        let expected_lfs = expected.hf_lfs_sha256();
+        let same = actual.filename == expected.path()
+            && actual.bytes == expected.size()
+            && actual.hf_etag.eq_ignore_ascii_case(expected.hub_etag())
+            && actual.is_lfs == expected_lfs.is_some()
+            && match (actual.sha256.as_deref(), expected_lfs) {
+                (Some(actual), Some(expected)) => actual.eq_ignore_ascii_case(expected),
+                (None, None) => true,
+                _ => false,
+            };
+        if !same {
+            return Err(preparation_error(format!(
+                "Hub metadata does not match recipe source `{}`",
+                expected.path()
+            )));
+        }
+        canonical.push(ShardIntegrity {
+            filename: expected.path().to_owned(),
+            bytes: expected.size(),
+            sha256: expected_lfs.map(str::to_owned),
+            hf_etag: expected.hub_etag().to_owned(),
+            is_lfs: expected_lfs.is_some(),
+        });
+    }
+
+    Ok(AuthorizedModelPreparationTransfer {
+        resolved,
+        records: canonical,
+    })
+}
+
+/// Authenticate the exact recipe-owned remote metadata before any model
+/// payload is transferred.
+///
+/// This transition intentionally lives beside the sealed resolution and
+/// authorization types. CI forbids payload-transfer and filesystem-mutation
+/// authority in this module.
+pub fn authorize_model_preparation_transfer(
+    resolved: ResolvedModelPreparationPlan,
+) -> Result<AuthorizedModelPreparationTransfer, ModelPreparationResolutionError> {
+    let cache_dir = resolve_hf_cache_dir();
+    let api = build_hub_api(&cache_dir, false)?;
+    let reference = resolved.resolved_reference();
+    let repo = api.repo(Repo::with_revision(
+        reference.repo_id().to_owned(),
+        RepoType::Model,
+        reference.revision().to_owned(),
+    ));
+    let mut records = Vec::with_capacity(resolved.expected_source_files().len());
+    for expected in resolved.expected_source_files() {
+        records.push(fetch_expected_file_metadata(
+            &api,
+            &repo,
+            reference,
+            expected.path(),
+        )?);
+    }
+    Ok(bind_transfer_authorization(resolved, records)?)
+}
+
+#[cfg(test)]
+pub(in crate::input) fn bind_transfer_authorization_for_test(
+    resolved: ResolvedModelPreparationPlan,
+    records: Vec<ShardIntegrity>,
+) -> Result<AuthorizedModelPreparationTransfer, ModelPreparationError> {
+    bind_transfer_authorization(resolved, records)
+}
+
+fn preparation_error(reason: impl Into<String>) -> ModelPreparationError {
+    ModelPreparationError::PlanInvalid {
+        reason: reason.into(),
     }
 }
 

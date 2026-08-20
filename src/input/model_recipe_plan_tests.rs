@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use crate::core::integrity::ShardIntegrity;
+
 use super::hf_download::{
-    bind_model_preparation_resolution_for_test, resolve_model_preparation_plan,
-    ResolvedModelRepository,
+    authorize_model_preparation_transfer, bind_model_preparation_resolution_for_test,
+    bind_transfer_authorization_for_test, resolve_model_preparation_plan,
+    ResolvedModelPreparationPlan, ResolvedModelRepository,
 };
 use super::hf_reference::HfModelReference;
 use super::model_recipe::{
@@ -36,6 +39,31 @@ fn resolution(
         .filter(|file| Some(file.as_str()) != omitted_file)
         .chain(["unrelated-repository-entry.txt".to_owned()]);
     ResolvedModelRepository::for_test(reference.resolve(revision).unwrap(), inventory)
+}
+
+fn resolved_plan(root: &Path) -> ResolvedModelPreparationPlan {
+    let reference = HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap();
+    bind_model_preparation_resolution_for_test(
+        plan(reference.clone(), root),
+        resolution(reference, QWEN38_ACCEPTED_REVISION, None),
+    )
+    .unwrap()
+}
+
+fn exact_transfer_records() -> Vec<ShardIntegrity> {
+    embedded_qwen38_recipe()
+        .unwrap()
+        .source()
+        .files()
+        .iter()
+        .map(|file| ShardIntegrity {
+            filename: file.path().to_owned(),
+            bytes: file.size(),
+            sha256: file.hf_lfs_sha256().map(str::to_owned),
+            hf_etag: file.hub_etag().to_owned(),
+            is_lfs: file.hf_lfs_sha256().is_some(),
+        })
+        .collect()
 }
 
 #[test]
@@ -135,6 +163,71 @@ fn exact_hub_resolution_consumes_the_plan_and_preserves_its_layout() {
 }
 
 #[test]
+fn exact_recipe_metadata_mints_only_an_inert_transfer_authorization() {
+    let temp = tempfile::tempdir().unwrap();
+    let authorized =
+        bind_transfer_authorization_for_test(resolved_plan(temp.path()), exact_transfer_records())
+            .unwrap();
+    assert_eq!(authorized.recipe_id(), "qwen38-27b-official-v1");
+    assert_eq!(
+        authorized.resolved_reference().revision(),
+        QWEN38_ACCEPTED_REVISION
+    );
+    assert_eq!(authorized.authorized_file_count(), 29);
+    assert!(authorized.source_root().ends_with("source"));
+    assert!(!authorized.model_root().exists());
+    let debug = format!("{authorized:?}");
+    assert!(debug.contains("authorized_file_count: 29"));
+    assert!(debug.contains("records: \"[redacted]\""));
+    assert!(!debug.contains("model-00001-of-00018.safetensors"));
+}
+
+#[test]
+fn transfer_authorization_rejects_every_metadata_cross_binding() {
+    let temp = tempfile::tempdir().unwrap();
+    let rejects = |records| {
+        bind_transfer_authorization_for_test(resolved_plan(temp.path()), records).is_err()
+    };
+
+    let mut missing = exact_transfer_records();
+    missing.pop();
+    assert!(rejects(missing));
+
+    let mut extra = exact_transfer_records();
+    extra.push(extra[0].clone());
+    assert!(rejects(extra));
+
+    let mut reordered = exact_transfer_records();
+    reordered.swap(0, 1);
+    assert!(rejects(reordered));
+
+    let mut wrong_name = exact_transfer_records();
+    wrong_name[0].filename.push_str(".other");
+    assert!(rejects(wrong_name));
+
+    let mut wrong_size = exact_transfer_records();
+    wrong_size[0].bytes += 1;
+    assert!(rejects(wrong_size));
+
+    let mut wrong_etag = exact_transfer_records();
+    wrong_etag[0].hf_etag = "0".repeat(40);
+    assert!(rejects(wrong_etag));
+
+    let mut wrong_kind = exact_transfer_records();
+    wrong_kind[0].is_lfs = true;
+    wrong_kind[0].sha256 = Some("0".repeat(64));
+    assert!(rejects(wrong_kind));
+
+    let lfs = exact_transfer_records()
+        .iter()
+        .position(|record| record.is_lfs)
+        .unwrap();
+    let mut wrong_sha = exact_transfer_records();
+    wrong_sha[lfs].sha256 = Some("0".repeat(64));
+    assert!(rejects(wrong_sha));
+}
+
+#[test]
 fn resolution_must_match_the_original_plan_revision_and_complete_recipe_inventory() {
     let temp = tempfile::tempdir().unwrap();
     let bare = || HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap();
@@ -199,6 +292,27 @@ fn current_plan_resolves_through_the_exact_production_hub_boundary() {
     );
     assert!(resolved.repository_inventory_len() >= 29);
     assert!(!resolved.model_root().exists());
+}
+
+#[test]
+fn current_plan_authorizes_all_recipe_metadata_before_payload_transfer() {
+    if std::env::var_os("HF2Q_TEST_QWEN38_TRANSFER_AUTH").is_none() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let planned = plan_current_model_preparation(
+        HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap(),
+        &temp.path().join("models"),
+    )
+    .unwrap();
+    let resolved = resolve_model_preparation_plan(planned).unwrap();
+    let authorized = authorize_model_preparation_transfer(resolved).unwrap();
+    assert_eq!(authorized.authorized_file_count(), 29);
+    assert_eq!(
+        authorized.resolved_reference().revision(),
+        QWEN38_ACCEPTED_REVISION
+    );
+    assert!(!authorized.model_root().exists());
 }
 
 #[test]

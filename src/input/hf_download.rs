@@ -41,7 +41,9 @@
 //! The preparation-resolution seam performs only the repository-info lookup:
 //! it consumes the host-checked plan, binds its exact original reference to an
 //! immutable commit and bounded name inventory, and returns an inert sealed
-//! plan before any payload transfer.
+//! plan before any payload transfer. A second metadata-only transition queries
+//! all 29 recipe-owned names at that exact commit and seals only records that
+//! match the checked-in size, Git/LFS identity, and canonical order.
 //!
 //! Manual test protocol: `Ctrl+C` mid-download → observe partial shard
 //! in `~/.cache/huggingface/hub/models--*/snapshots/*/` → re-invoke
@@ -63,13 +65,15 @@ use crate::progress::ProgressReporter;
 
 mod resolution;
 
+pub use resolution::{
+    authorize_model_preparation_transfer, AuthorizedModelPreparationTransfer,
+    ModelPreparationResolutionError, ResolvedModelPreparationPlan, ResolvedModelRepository,
+};
 use resolution::{bind_model_preparation_resolution, resolve_repository_info};
 #[cfg(test)]
 pub(in crate::input) use resolution::{
-    bind_model_preparation_resolution_for_test, resolve_repository_info_for_test,
-};
-pub use resolution::{
-    ModelPreparationResolutionError, ResolvedModelPreparationPlan, ResolvedModelRepository,
+    bind_model_preparation_resolution_for_test, bind_transfer_authorization_for_test,
+    resolve_repository_info_for_test,
 };
 
 const CANONICAL_HF_ENDPOINT: &str = "https://huggingface.co";

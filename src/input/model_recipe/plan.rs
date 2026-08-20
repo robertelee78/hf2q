@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
-    recipe_for_reference, ModelPreparationError, ModelRecipe, RecipeArtifactRole,
+    recipe_for_reference, ModelPreparationError, ModelRecipe, RecipeArtifactRole, RecipeSourceFile,
     SourceRetentionChoice, VerifiedRecipeHost,
 };
 use crate::input::hf_reference::{HfModelReference, ResolvedHfModelReference};
@@ -200,6 +200,10 @@ impl ModelPreparationPlan {
             )));
         }
         Ok(())
+    }
+
+    pub(in crate::input) fn expected_source_files(&self) -> &[RecipeSourceFile] {
+        self.recipe.source().files()
     }
 
     #[cfg(test)]
