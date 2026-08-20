@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a canonical, text-only getting-started guide for the exact
+  `jenerallee78/Qwen3.8-27B-Abliterated-SFT` source revision. The guide uses
+  the existing native convert, Q4_K_M quantization, serve, OpenAI-compatible
+  API, and optional OpenCode surfaces without adding onboarding orchestration.
 - Add `hf2q setup`, a no-download Apple-Silicon inventory and bounded
   session-cache policy producer with deterministic TOML, explicit
   non-interactive flags, descriptor-relative crash recovery, and a custom

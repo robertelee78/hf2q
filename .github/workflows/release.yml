@@ -1170,12 +1170,14 @@ jobs:
               docs/ADR-033-unified-quant-convert-pipeline.md \
               docs/ARCHITECTURE.md \
               docs/setup.md \
-              docs/converting-a-model.md
+              docs/converting-a-model.md \
+              docs/getting-started.md
             do
               test -f "$required"
             done
             hf_source_tests="$(cargo test --locked --bin hf2q --all-features -- --list)"
             for required_test in \
+              cli::tests::getting_started_qwen38_commands_parse_exactly \
               setup::tests::config_v1_golden_is_exact_and_hostile_input_is_rejected \
               setup::tests::matching_existing_installation_identity_is_read_only_and_accepted \
               setup::tests::lock_contention_is_busy_and_mints_no_config \

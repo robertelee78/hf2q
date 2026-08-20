@@ -1138,4 +1138,55 @@ mod tests {
         assert_eq!(args.revision.as_deref(), Some("main"));
         assert_eq!(args.hf_dir, Some(PathBuf::from("Qwen/Qwen3.8-27B")));
     }
+
+    #[test]
+    fn getting_started_qwen38_commands_parse_exactly() {
+        let revision = "08c2f075b43bc06456382db6b918a3dcabdcf4dd";
+        let model = "/tmp/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf";
+        let cli = Cli::parse_from([
+            "hf2q",
+            "convert",
+            "jenerallee78/Qwen3.8-27B-Abliterated-SFT",
+            "--revision",
+            revision,
+            "--quant",
+            "q4_k_m",
+            "--output",
+            model,
+        ]);
+        let Command::Convert(args) = cli.command else {
+            panic!("expected Convert");
+        };
+        assert_eq!(
+            args.hf_dir,
+            Some(PathBuf::from("jenerallee78/Qwen3.8-27B-Abliterated-SFT"))
+        );
+        assert_eq!(args.revision.as_deref(), Some(revision));
+        assert_eq!(args.quant, "q4_k_m");
+        assert_eq!(args.output, PathBuf::from(model));
+
+        let cli = Cli::parse_from([
+            "hf2q",
+            "serve",
+            "--model",
+            model,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8081",
+            "--scheduler",
+            "inflight-batched",
+            "--max-slots",
+            "1",
+        ]);
+        let Command::Serve(args) = cli.command else {
+            panic!("expected Serve");
+        };
+        assert_eq!(args.model, Some(PathBuf::from(model)));
+        assert_eq!(args.host, "127.0.0.1");
+        assert_eq!(args.port, 8081);
+        assert_eq!(args.scheduler, Some(SchedulerArg::InflightBatched));
+        assert_eq!(args.max_slots, Some(1));
+        assert!(args.mmproj.is_none());
+    }
 }

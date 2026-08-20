@@ -751,6 +751,7 @@ forward rather than deleted.
 
 | If you want to … | Start at |
 |---|---|
+| Follow the supported first-run journey | `docs/getting-started.md` |
 | Read the public CLI surface | `src/cli.rs` |
 | Trace a `convert` request | `src/serve/mod.rs` → `cmd_generate` is the wrong one; `src/main.rs` dispatches `Command::Convert` into `quantize::cmd_convert`. |
 | Trace a serve chat request | `src/serve/api/handlers.rs::chat_completions` → `engine*.rs` → `inference/models/<arch>/forward.rs` |
