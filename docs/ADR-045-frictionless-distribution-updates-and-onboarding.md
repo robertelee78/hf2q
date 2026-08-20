@@ -29,8 +29,8 @@
   reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
-  public update/install/onboarding
-  implementation, and exact-artifact proof remain pending
+  public update/install and remaining onboarding composition, and exact-artifact
+  proof remain pending
 - Date: 2026-08-17
 - Updated: 2026-08-20
 - Owners: hf2q release engineering and operator experience
@@ -49,7 +49,8 @@ workflow:
 - the README starts with a Rust checkout and release build;
 - the GitHub release workflow publishes the crate and checksum, but no
   end-user Apple Silicon bundle;
-- the CLI has no self-update or first-run setup command;
+- the CLI now has the bounded first-run setup producer specified below, but
+  still has no public self-update command or setup-to-runtime cache bridge;
 - remote conversion now has a native immutable-reference/download boundary,
   a checked-in exact Qwen3.8 preparation recipe, the recipe-owned paired
   conversion, and a durable calibration-pending prepared-profile commit, but
@@ -120,7 +121,8 @@ the requested command. `hf2q update` is the universal user-facing update
 command: it self-updates standalone installs atomically and delegates through
 the detected package owner when the executable is package-managed.
 
-Every normal release-binary invocation also best-effort reconciles hf2q-owned
+Except for `hf2q setup` (including its help and malformed-input exits), every
+normal release-binary invocation also best-effort reconciles hf2q-owned
 static clap completion scripts in the standard per-user Bash, Zsh, and Fish
 locations. The preferred Bash or Zsh startup file receives one bounded managed
 source block, so a newly started shell has Tab completion without a manual
@@ -131,7 +133,8 @@ debug/test binaries require explicit isolated destinations and never discover
 live user paths. `hf2q completions --shell <shell>` remains the packaging and
 manual-generation surface. A child process cannot modify the already-running
 parent shell, so the zero-config guarantee begins with the next shell after the
-first normal hf2q invocation.
+first normal non-setup hf2q invocation. Setup is excluded so its closed
+inventory/configuration boundary cannot mutate shell integration.
 
 ## Domain model
 
@@ -185,14 +188,16 @@ state from PATH aliases or filenames:
 - **Verified external GGUF**: an explicitly requested upstream-prequantized
   artifact plus repository revision, filename, size, digest, projector binding,
   embedded metadata, and honest external provenance.
-- **Hardware profile**: measured hardware, unified memory, disk state, and the
-  candidate-selection inputs produced by `hf2q setup`.
+- **Hardware profile**: stable measured target, Apple chip and Metal-device
+  identity, unified memory, and Metal recommended working-set size produced by
+  `hf2q setup`; volatile disk state remains live preflight evidence rather than
+  durable profile identity.
 - **Artifact calibration receipt**: bounded runtime measurements for one exact
   artifact/hardware/hf2q combination, including memory residency, context,
   slots, shared KV budget, prefill batch, TTFT, prefill, and decode results.
-- **Session restore policy**: setup-recorded consent, storage root, byte limit,
-  permissions, eviction rules, and eligible family/scheduler combinations for
-  persisted prefix/KV checkpoints.
+- **Session restore policy**: setup-recorded consent, storage-root location,
+  and byte limit plus fixed governing permissions, eviction rules, and eligible
+  family/scheduler combinations for persisted prefix/KV checkpoints.
 
 Model and session data are not stored below the versioned installation root
 and are never removed, replaced, or migrated by `hf2q update`.
@@ -533,6 +538,7 @@ hf2q-owned state below one root, except for the user PATH entry point:
 │               ├── timestamp.json
 │               ├── snapshot.json
 │               └── targets.json
+├── .config.toml.lock
 └── config.toml
 ~/.local/bin/hf2q
 ```
@@ -1505,11 +1511,34 @@ every launch.
 ### 5. Configure hf2q with one small setup command
 
 `hf2q setup` is an idempotent hf2q-only host configuration step. It inventories
-Apple Silicon generation/GPU shape, unified memory, filesystem capacity and
-free space, active shell, existing hf2q configuration, and safe system limits,
-then writes `~/.hf2q/config.toml` atomically. It downloads no model, performs no
-conversion, starts no server, installs no integration, and does not edit
-OpenCode.
+the exact `aarch64-apple-darwin` target, Apple chip, Metal device name and
+nonzero `recommendedMaxWorkingSetSize`, unified memory, containing-filesystem
+capacity and free space, configured login shell, existing hf2q configuration, the two
+OS-named performance-level logical-core counts, macOS version, and the
+`RLIMIT_NOFILE` soft limit. The shell, filesystem snapshot, macOS version,
+core topology, and rlimit are
+display-only diagnostics. Setup persists only the stable hardware identity and
+policy below, then writes `<state-root>/config.toml` atomically. It downloads no
+model, performs no conversion, starts no server, installs no integration, does
+not calibrate a model, and does not edit OpenCode or any installation identity.
+
+The default state root is `$HOME/.hf2q`. `--state-root <ABSOLUTE_PATH>` selects
+a custom standalone state root; setup never infers ownership from the running
+binary or current directory and never falls back to `/tmp`. Until the verified
+owner/root resolver is public, a custom standalone installer invocation must
+pass the same state root explicitly. Setup performs the existing read-only,
+double-snapshot installation-identity check when installation-owned state is
+present. It retains that optional exact identity capability across the prompt,
+config lock, commit, and endpoint; an identity appearance, disappearance, or
+replacement fails the transaction. A config-only root may predate installation
+identity, and malformed or extra installation-identity namespace state fails
+before config mutation. This slice does not claim to certify the full
+versions/activations/current layout, and setup never bootstraps identity.
+
+Setup also retains the exact opened state-root and config identity observed
+before prompting. Publication requires that same root and config snapshot under
+the config lock; if the root was absent, this transaction must be the one that
+creates it. A concurrent root/config change fails and requires a fresh prompt.
 
 Setup asks one simple session-persistence question:
 
@@ -1528,13 +1557,77 @@ exact limit are recorded. Non-interactive setup requires either
 `--session-cache on --session-cache-limit <SIZE>` and never guesses consent.
 For the stored policy, zero means persistence is disabled; it never means
 unlimited, and `--session-cache on` rejects a zero limit. Re-running setup
-merges the current configuration without duplicate keys or stale managed
-fragments.
+uses the current policy as the interactive default: enabled uses `[Y/n]` and
+the current positive limit, while disabled uses `[y/N]`. A positive explicit
+override above the recommendation is accepted with a warning; runtime
+free-space enforcement remains authoritative. Sizes use canonical unsigned
+integers with optional `B`, `KiB`, `MiB`, `GiB`, or `TiB`, with no sign,
+decimal, whitespace, leading-zero alias, or ambiguous decimal unit.
 
-Setup records a hardware profile used to rank accepted model candidates, but
-does not pretend to calibrate inference before a model exists. Exact runtime
+The v1 managed TOML is UTF-8 capped at 16 KiB, rejects duplicate and unknown
+fields and unsupported schemas, and is produced deterministically with one
+final LF:
+
+```toml
+kind = "hf2q.config"
+schema_version = 1
+state_layout_schema = 1
+package = "hf2q"
+
+[hardware]
+target = "aarch64-apple-darwin"
+chip_model = "Apple M5 Max"
+unified_memory_bytes = 137438953472
+metal_device_name = "Apple M5 Max"
+metal_recommended_working_set_bytes = 103079215104
+
+[session_cache]
+limit_bytes = 34359738368
+```
+
+File location and an optional installation identity bind the state root, so
+the document repeats no path. It records no timestamp, shell, macOS version,
+core count, filesystem free/capacity snapshot, or rlimit. `limit_bytes = 0` is
+the sole disabled encoding; every positive value means enabled. A valid
+noncanonical document may be read, but a successful semantic change rewrites
+canonical bytes. An exact canonical rerun preserves the config inode and
+mtime. Malformed, future, wrongly typed, oversized, or unsafe existing config
+is retained byte-for-byte and setup creates no lock, partial, cache directory,
+or replacement.
+
+The state root and `cache/sessions` directories are current-user mode `0700`.
+`config.toml`, persistent `.config.toml.lock`, and fixed
+`.config.toml.partial` are regular current-user, single-link, same-device mode
+`0600` files opened without following links. Existing ancestors must exist;
+setup may create only the final selected root. It probes and prompts completely
+before mutation, acquires the lock exclusively without blocking, bounds and
+rebinds exact reads to the post-read named inode, and resumes only an exact
+canonical partial prefix. Publication is a descriptor-relative rename followed
+by root sync, exact reopen/reparse, file full-sync, private session-directory
+sync, a second exact root/file rebind, and lock full-sync endpoint. A returned
+error before rename leaves retryable inert residue; any returned error after
+rename is typed durability-unknown and exact retry repeats every barrier. EOF
+or interrupted input is cancelled success and creates nothing. Input, host,
+and config-shape errors use exit 3; lock, I/O, and durability errors use exit 1.
+
+Setup records stable hardware facts for the future coordinator to rank
+accepted model candidates, but does not pretend to calibrate inference before
+a model exists. Exact runtime
 calibration occurs only after conversion or a requested published GGUF has
-been acquired.
+been acquired. This landed setup slice is deliberately an inert config
+producer: the server does not consume this policy yet. The later session bridge
+must map zero to no persistor and positive values to the fixed
+`<state-root>/cache/sessions` budget; the current legacy zero/unset path means
+unlimited and therefore must not be wired directly.
+
+Directory creation uses a bounded parent-relative `mkdirat`/`statat`/`chmodat`
+normalization only because macOS cannot descriptor-open a mode-`0000`
+directory produced under a restrictive process umask. The created name must
+be a directory owned by the effective user on the parent device before chmod;
+the nofollow-opened directory must retain that exact inode/owner/link identity
+and mode `0700` afterward. A different-EUID substitution fails, while a process
+already controlled by the same effective user is outside the local authority
+boundary; all later mutation remains on retained descriptors.
 
 ### 6. Treat Hugging Face identities as the public model interface
 
@@ -2259,16 +2352,21 @@ before public self-update ships.
    destructive recipe-owned source retention, external-artifact provenance,
    calibration receipt, and session policy. Retained-source durable
    preparation-receipt and prepared-profile publication have landed with
-   `profile.json` as the commit point. Every schema lands with bounded hostile
-   input and
+   `profile.json` as the commit point. The public `hf2q setup` config producer
+   has also landed: it inventories the selected Apple-Silicon host and state-
+   root filesystem, records the bounded zero-disabled session policy, and
+   crash-durably publishes the inert canonical TOML without creating
+   installation identity or granting persistence authority. Every schema lands
+   with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated
    or ownership-verified capability.
    Before uninstall implementation, freeze and adversarially test its separate
    bounded journal schema and recovery state machine; activation receipts stay
    immutable.
-2. Implement `hf2q setup`, the unified `~/.hf2q` state layout, idempotent
-   Bash/zsh PATH ownership, hardware inventory, and the one-question bounded
-   session policy.
+2. Compose the standalone installer with the unified `~/.hf2q` state layout
+   and idempotent Bash/zsh PATH ownership, then bridge the already-landed setup
+   policy into session persistence only after zero is proven to construct no
+   persistor and invalid input cannot become unlimited.
 3. Converge conversion on the exact-revision native downloader, add positional
    canonical model references, the accepted Qwen3.8 quantization/profile
    matrix, source-retention transaction, and receipt-bound text/projector

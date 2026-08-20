@@ -330,6 +330,11 @@ impl DurableInstallationIdentity {
         self.record.state_root()
     }
 
+    pub(in crate::distribution) fn revalidate(&self) -> Result<(), InstallStateError> {
+        let _live = self.reopen()?;
+        Ok(())
+    }
+
     pub(super) fn authorization(&self) -> &ExplicitRootAuthorization {
         &self.authorization
     }

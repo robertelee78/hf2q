@@ -85,7 +85,24 @@ git clone git@github.com:robertelee78/hf2q.git
 cd hf2q
 cargo build --release
 ./target/release/hf2q --help
+./target/release/hf2q setup
 ```
+
+`hf2q setup` inventories the selected Apple-Silicon host and records one
+bounded inactive-session policy in `~/.hf2q/config.toml`. It downloads,
+converts, loads, and serves nothing. Complete automation is non-interactive:
+
+```bash
+hf2q setup --session-cache off
+hf2q setup --session-cache on --session-cache-limit 32GiB
+```
+
+Use `--state-root /absolute/path` for a custom standalone state root. The
+config producer is landed ahead of the runtime persistence bridge; current
+serving does not consume this policy yet, and zero is reserved to mean
+disabled rather than the legacy unlimited setting. See
+[`docs/setup.md`](docs/setup.md) for the exact prompt, schema, filesystem, and
+failure contract.
 
 The exact `mlx-native` declaration in `Cargo.toml` resolves from `crates.io`.
 For local mlx-native development place a path
@@ -107,7 +124,9 @@ space, optional RuVector backend); run it after `cargo install` if
 anything misbehaves.
 
 Release builds also provision tab completion automatically on the first normal
-invocation. Bash, Zsh, and Fish registrations stay synchronized with the
+non-setup invocation. `hf2q setup`, including its help and malformed-input
+paths, is excluded so its closed configuration step cannot edit shell
+integration. Bash, Zsh, and Fish registrations stay synchronized with the
 installed clap grammar; start a new shell after the first run. Existing
 non-hf2q completion files are left untouched. Set
 `HF2Q_NO_COMPLETION_INSTALL=1` to disable this behavior. The
@@ -118,6 +137,7 @@ manual setup.
 
 | Command | What it does |
 |---|---|
+| `hf2q setup` | Inventory Apple Silicon and record a bounded, currently inert session-cache policy. |
 | `hf2q convert` | HuggingFace safetensors → GGUF (streaming convert, ADR-033 unified pipeline). |
 | `hf2q gguf-patch` | Rewrite a GGUF's metadata in place (e.g. inject a chat template). |
 | `hf2q info` | Inspect a GGUF model without loading weights. |
