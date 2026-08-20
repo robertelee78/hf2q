@@ -98,6 +98,9 @@ pub enum Command {
     /// Run text generation from a GGUF model
     Generate(GenerateArgs),
 
+    /// Chat with a served model using a diagnostic scrollback interface
+    Chat(ChatArgs),
+
     /// Serve a GGUF model via OpenAI-compatible HTTP API
     Serve(ServeArgs),
 
@@ -783,6 +786,47 @@ pub struct GenerateArgs {
     // The mlx-native backend handles all dispatch internally.
 }
 
+#[derive(clap::Args, Debug, Clone)]
+pub struct ChatArgs {
+    /// OpenAI-compatible server base URL. Without this flag, the automatic
+    /// local discovery integration selects a registered hf2q server.
+    #[arg(long, value_name = "URL")]
+    pub url: Option<String>,
+
+    /// Model id to request. If omitted, chat selects from the endpoint's
+    /// advertised models.
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// System message kept for this TUI session only.
+    #[arg(long)]
+    pub system: Option<String>,
+
+    /// Sampling temperature. Omitted from requests unless explicitly set.
+    #[arg(long)]
+    pub temperature: Option<f32>,
+
+    /// Nucleus-sampling probability. Omitted unless explicitly set.
+    #[arg(long)]
+    pub top_p: Option<f32>,
+
+    /// Maximum completion tokens. Omitted unless explicitly set.
+    #[arg(long)]
+    pub max_tokens: Option<usize>,
+
+    /// Sampling seed. Omitted unless explicitly set.
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    /// Reasoning effort for endpoints that support it.
+    #[arg(long, value_parser = ["low", "high", "max"])]
+    pub reasoning_effort: Option<String>,
+
+    /// Leave a server started by this chat session running on exit.
+    #[arg(long, default_value_t = false)]
+    pub keep_serving: bool,
+}
+
 #[derive(clap::Args, Debug)]
 pub struct ServeArgs {
     /// Path to GGUF model file. Optional in the iter-2 backbone which only
@@ -1132,6 +1176,59 @@ mod tests {
             panic!("expected Serve");
         };
         assert!(!args.no_integrity);
+    }
+
+    #[test]
+    fn chat_defaults_preserve_zero_hidden_request_policy() {
+        let cli = Cli::parse_from(["hf2q", "chat", "--url", "http://127.0.0.1:9123"]);
+        let Command::Chat(args) = cli.command else {
+            panic!("expected Chat");
+        };
+        assert_eq!(args.url.as_deref(), Some("http://127.0.0.1:9123"));
+        assert!(args.model.is_none());
+        assert!(args.system.is_none());
+        assert!(args.temperature.is_none());
+        assert!(args.top_p.is_none());
+        assert!(args.max_tokens.is_none());
+        assert!(args.seed.is_none());
+        assert!(args.reasoning_effort.is_none());
+        assert!(!args.keep_serving);
+    }
+
+    #[test]
+    fn chat_accepts_explicit_diagnostic_controls() {
+        let cli = Cli::parse_from([
+            "hf2q",
+            "chat",
+            "--url",
+            "https://localhost:9443",
+            "--model",
+            "model-a",
+            "--system",
+            "diagnose only",
+            "--temperature",
+            "0.2",
+            "--top-p",
+            "0.8",
+            "--max-tokens",
+            "512",
+            "--seed",
+            "7",
+            "--reasoning-effort",
+            "high",
+            "--keep-serving",
+        ]);
+        let Command::Chat(args) = cli.command else {
+            panic!("expected Chat");
+        };
+        assert_eq!(args.model.as_deref(), Some("model-a"));
+        assert_eq!(args.system.as_deref(), Some("diagnose only"));
+        assert_eq!(args.temperature, Some(0.2));
+        assert_eq!(args.top_p, Some(0.8));
+        assert_eq!(args.max_tokens, Some(512));
+        assert_eq!(args.seed, Some(7));
+        assert_eq!(args.reasoning_effort.as_deref(), Some("high"));
+        assert!(args.keep_serving);
     }
 
     #[test]

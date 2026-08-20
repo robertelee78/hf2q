@@ -905,6 +905,41 @@ pub struct TimingInfo {
     pub gpu_dispatch_count: u64,
 }
 
+/// Timing attached to the final streaming chunk. Streaming producers are
+/// incrementally instrumented, so every counter is independently optional.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamingTimingInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_time_secs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_time_secs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_time_secs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_first_token_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_tokens_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_tokens_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_sync_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_dispatch_count: Option<u64>,
+}
+
+impl StreamingTimingInfo {
+    pub fn is_empty(&self) -> bool {
+        self.prefill_time_secs.is_none()
+            && self.decode_time_secs.is_none()
+            && self.total_time_secs.is_none()
+            && self.time_to_first_token_ms.is_none()
+            && self.prefill_tokens_per_sec.is_none()
+            && self.decode_tokens_per_sec.is_none()
+            && self.gpu_sync_count.is_none()
+            && self.gpu_dispatch_count.is_none()
+    }
+}
+
 /// Full chat completion response (non-streaming).
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionResponse {
@@ -1010,6 +1045,10 @@ pub struct ChatCompletionChunk {
     /// `stream_options.include_usage: true` (Tier 2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageStats>,
+    /// hf2q diagnostic timing. Included only on the final chunk and only
+    /// when the generation producer populated at least one timing counter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_hf2q_timing: Option<StreamingTimingInfo>,
 }
 
 /// A single choice in a streaming chunk.
@@ -1636,6 +1675,7 @@ mod tests {
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
             }),
+            x_hf2q_timing: None,
         };
         let json = serde_json::to_value(&chunk).unwrap();
         assert_eq!(json["choices"][0]["finish_reason"], "stop");

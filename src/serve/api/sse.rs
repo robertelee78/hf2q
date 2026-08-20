@@ -86,7 +86,7 @@ use tokio::sync::mpsc;
 
 use super::schema::{
     ChatCompletionChunk, ChoiceLogprobs, ChunkChoice, ChunkDelta, CompletionTokensDetails,
-    PromptTokensDetails, UsageStats,
+    PromptTokensDetails, StreamingTimingInfo, UsageStats,
 };
 use super::state::ServerMetrics;
 
@@ -233,6 +233,7 @@ fn generation_events_stream_with_metrics(
                 logprobs: None,
             }],
             usage: None,
+            x_hf2q_timing: None,
         };
         yield Ok(Event::default().data(serde_json::to_string(&role_chunk).unwrap_or_default()));
 
@@ -266,6 +267,7 @@ fn generation_events_stream_with_metrics(
                             logprobs: pending_logprobs.take(),
                         }],
                         usage: None,
+                        x_hf2q_timing: None,
                     };
                     yield Ok(Event::default()
                         .data(serde_json::to_string(&chunk).unwrap_or_default()));
@@ -306,6 +308,7 @@ fn generation_events_stream_with_metrics(
                             logprobs: None,
                         }],
                         usage: None,
+                        x_hf2q_timing: None,
                     };
                     yield Ok(Event::default()
                         .data(serde_json::to_string(&chunk).unwrap_or_default()));
@@ -339,6 +342,17 @@ fn generation_events_stream_with_metrics(
                     } else {
                         None
                     };
+                    let timing = StreamingTimingInfo {
+                        prefill_time_secs: stats.prefill_time_secs,
+                        decode_time_secs: stats.decode_time_secs,
+                        total_time_secs: stats.total_time_secs,
+                        time_to_first_token_ms: stats.time_to_first_token_ms,
+                        prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+                        decode_tokens_per_sec: stats.decode_tokens_per_sec,
+                        gpu_sync_count: stats.gpu_sync_count,
+                        gpu_dispatch_count: stats.gpu_dispatch_count,
+                    };
+                    let timing = (!timing.is_empty()).then_some(timing);
                     let final_chunk = ChatCompletionChunk {
                         id: request_id.clone(),
                         object: "chat.completion.chunk",
@@ -357,6 +371,7 @@ fn generation_events_stream_with_metrics(
                             logprobs: pending_logprobs.take(),
                         }],
                         usage,
+                        x_hf2q_timing: timing,
                     };
                     yield Ok(Event::default()
                         .data(serde_json::to_string(&final_chunk).unwrap_or_default()));
@@ -394,6 +409,7 @@ fn generation_events_stream_with_metrics(
                             logprobs: None,
                         }],
                         usage: None,
+                        x_hf2q_timing: None,
                     };
                     yield Ok(Event::default()
                         .data(serde_json::to_string(&message_chunk).unwrap_or_default()));
@@ -415,6 +431,7 @@ fn generation_events_stream_with_metrics(
                             logprobs: None,
                         }],
                         usage: None,
+                        x_hf2q_timing: None,
                     };
                     yield Ok(Event::default()
                         .data(serde_json::to_string(&error_chunk).unwrap_or_default()));
@@ -446,6 +463,7 @@ fn generation_events_stream_with_metrics(
                 logprobs: None,
             }],
             usage: None,
+            x_hf2q_timing: None,
         };
         yield Ok(Event::default().data(serde_json::to_string(&error_chunk).unwrap_or_default()));
         yield Ok(Event::default().data("[DONE]"));
@@ -957,6 +975,30 @@ mod tests {
             1
         );
         assert_eq!(done["system_fingerprint"], "hf2q-test-mlx-native");
+        assert!(done.get("x_hf2q_timing").is_none());
+    }
+
+    #[tokio::test]
+    async fn final_chunk_serializes_only_available_timing_fields() {
+        let (tx, rx) = mpsc::channel(4);
+        let events = vec![GenerationEvent::Done {
+            finish_reason: "stop",
+            prompt_tokens: 7,
+            completion_tokens: 5,
+            stats: StreamStats {
+                time_to_first_token_ms: Some(42.5),
+                decode_tokens_per_sec: Some(18.25),
+                ..Default::default()
+            },
+        }];
+        let sse = make_sse(rx, SseStreamOptions::default());
+        tokio::spawn(spawn_feeder(tx, events));
+        let payloads = drain_sse(sse).await;
+        let done: serde_json::Value = serde_json::from_str(&payloads[payloads.len() - 2]).unwrap();
+        assert_eq!(done["x_hf2q_timing"]["time_to_first_token_ms"], 42.5);
+        assert_eq!(done["x_hf2q_timing"]["decode_tokens_per_sec"], 18.25);
+        assert!(done["x_hf2q_timing"].get("gpu_sync_count").is_none());
+        assert!(done.get("usage").is_none());
     }
 
     #[tokio::test]

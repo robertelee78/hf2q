@@ -10,6 +10,7 @@
 
 pub mod arch;
 pub mod backends;
+mod chat;
 pub mod cli;
 // `core` is the in-place precursor to the planned `hf2q-core` crate
 // (workspace v0.1.0 split). See `src/core/mod.rs` for the boundary
@@ -209,6 +210,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
         Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
         Command::Generate(args) => serve::cmd_generate(args).map_err(AppError::Conversion),
+        Command::Chat(args) => chat::cmd_chat(args).map_err(AppError::Conversion),
         Command::Serve(args) => {
             let operator_config = load_operator_config(state_root.as_deref())?;
             serve::cmd_serve(
