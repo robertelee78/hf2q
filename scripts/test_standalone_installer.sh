@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR=$(cd "$(dirname "$0")/.." && pwd -P)
+HF2Q_BIN=${HF2Q_BIN:-"$ROOT_DIR/target/debug/hf2q"}
+TEMPLATE="$ROOT_DIR/scripts/install.sh.in"
+RENDER="$ROOT_DIR/scripts/render_standalone_installer.sh"
+RECORD_RENDER="$ROOT_DIR/scripts/render_standalone_release_record.sh"
+
+[[ -x "$HF2Q_BIN" ]] || {
+  echo "build hf2q first or set HF2Q_BIN" >&2
+  exit 2
+}
+
+workspace=$(mktemp -d "${TMPDIR:-/tmp}/hf2q-installer-test.XXXXXX")
+trap 'rm -rf "$workspace"' EXIT
+fixture="$workspace/release"
+home="$workspace/home"
+install_dir="$home/.local/bin"
+state_root="$home/.hf2q"
+asset="$fixture/hf2q-aarch64-apple-darwin"
+installer="$workspace/install.sh"
+release_record="$workspace/stable-aarch64-apple-darwin.json"
+mkdir -p "$fixture" "$state_root/models"
+cp "$HF2Q_BIN" "$asset"
+chmod 0555 "$asset"
+size=$(stat -f '%z' "$asset")
+sha256=$(shasum -a 256 "$asset" | awk '{print $1}')
+version=$($HF2Q_BIN --version | awk '{print $2}')
+printf 'operator config\n' >"$state_root/config.toml"
+printf 'converted model\n' >"$state_root/models/model.gguf"
+
+"$RECORD_RENDER" "$release_record" "$version" "$size" "$sha256" >/dev/null
+expected_record=$(printf '{"kind":"hf2q.standalone-release","schema_version":1,"package":"hf2q","channel":"stable","target":"aarch64-apple-darwin","version":"%s","size":%s,"sha256":"%s"}' "$version" "$size" "$sha256")
+[[ $(cat "$release_record") == "$expected_record" ]]
+[[ $(stat -f '%Lp' "$release_record") == 444 ]]
+
+"$RENDER" "$TEMPLATE" "$installer" "$version" "$size" "$sha256" ABCDE12345 us.hf2q.cli >/dev/null
+
+trust_home="$workspace/trust-home"
+trust_install="$trust_home/.local/bin"
+if curl -fsSL "file://$installer" | \
+  HOME="$trust_home" \
+  HF2Q_INSTALL_DIR="$trust_install" \
+  HF2Q_RELEASE_BASE_URL="file://$fixture" \
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+  sh >/dev/null 2>&1; then
+  echo "unsigned local fixture unexpectedly passed Apple release trust" >&2
+  exit 1
+fi
+[[ ! -e "$trust_install/hf2q" ]]
+[[ ! -e "$trust_install/.hf2q-standalone.json" ]]
+
+curl -fsSL "file://$installer" | \
+  HOME="$home" \
+  HF2Q_INSTALL_DIR="$install_dir" \
+  HF2Q_RELEASE_BASE_URL="file://$fixture" \
+  HF2Q_INSTALL_TEST_MODE=1 \
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+  sh
+
+[[ -x "$install_dir/hf2q" ]]
+[[ $(shasum -a 256 "$install_dir/hf2q" | awk '{print $1}') == "$sha256" ]]
+[[ $("$install_dir/hf2q" --version) == "hf2q $version" ]]
+[[ -f "$install_dir/.hf2q-standalone.json" ]]
+[[ -f "$install_dir/.hf2q-standalone.lock" ]]
+[[ -f "$state_root/config.toml" ]]
+[[ -f "$state_root/models/model.gguf" ]]
+
+chmod 0755 "$asset"
+printf 'corruption\n' >>"$asset"
+if curl -fsSL "file://$installer" | \
+  HOME="$home" \
+  HF2Q_INSTALL_DIR="$install_dir" \
+  HF2Q_RELEASE_BASE_URL="file://$fixture" \
+  HF2Q_INSTALL_TEST_MODE=1 \
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+  sh >/dev/null 2>&1; then
+  echo "corrupt immutable asset unexpectedly replaced the installation" >&2
+  exit 1
+fi
+[[ $(shasum -a 256 "$install_dir/hf2q" | awk '{print $1}') == "$sha256" ]]
+
+if "$install_dir/hf2q" uninstall >/dev/null 2>&1; then
+  echo "uninstall without confirmation unexpectedly succeeded" >&2
+  exit 1
+fi
+[[ $(shasum -a 256 "$install_dir/hf2q" | awk '{print $1}') == "$sha256" ]]
+"$install_dir/hf2q" uninstall --yes >/dev/null
+[[ ! -e "$install_dir/hf2q" ]]
+[[ ! -e "$install_dir/.hf2q-standalone.json" ]]
+[[ ! -e "$install_dir/.hf2q-standalone.lock" ]]
+[[ -f "$state_root/config.toml" ]]
+[[ -f "$state_root/models/model.gguf" ]]
+
+printf 'standalone installer fixture passed: %s (%s bytes)\n' "$sha256" "$size"

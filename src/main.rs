@@ -91,10 +91,11 @@ fn main() -> ExitCode {
     // hf2q-owned Bash, Zsh, and Fish registrations in their per-user loader
     // locations; debug/test builds require explicit isolated destinations.
     // This normally precedes clap parsing so --help/--version and parse errors
-    // can complete first-run registration. `setup` is the closed exception:
-    // even help or malformed setup input must not mutate shell integration.
+    // can complete first-run registration. `setup` and the standalone
+    // installer/updater/uninstaller are closed exceptions: even help or malformed
+    // input must not mutate shell integration.
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if !invocation_mentions_setup(&raw_args) {
+    if !invocation_suppresses_completion_reconciliation(&raw_args) {
         cli::completion_install::reconcile();
     }
 
@@ -160,16 +161,19 @@ fn main() -> ExitCode {
     }
 }
 
-fn invocation_mentions_setup(args: &[std::ffi::OsString]) -> bool {
+fn invocation_suppresses_completion_reconciliation(args: &[std::ffi::OsString]) -> bool {
     let mut arguments = args.iter().skip(1);
     while let Some(argument) = arguments.next() {
         let Some(argument) = argument.to_str() else {
             continue;
         };
         if argument == "--" {
-            return arguments
-                .next()
-                .is_some_and(|value| value == std::ffi::OsStr::new("setup"));
+            return arguments.next().is_some_and(|value| {
+                matches!(
+                    value.to_str(),
+                    Some("setup" | "__standalone-install" | "update" | "uninstall")
+                )
+            });
         }
         if matches!(argument, "--log-format" | "--log-level" | "--state-root") {
             let _ = arguments.next();
@@ -178,7 +182,10 @@ fn invocation_mentions_setup(args: &[std::ffi::OsString]) -> bool {
         if argument.starts_with('-') {
             continue;
         }
-        return argument == "setup";
+        return matches!(
+            argument,
+            "setup" | "__standalone-install" | "update" | "uninstall"
+        );
     }
     false
 }
@@ -187,6 +194,9 @@ fn run(cli: Cli) -> Result<(), AppError> {
     let log_format = cli.log_format;
     let state_root = cli.state_root;
     match cli.command {
+        Command::StandaloneInstall(args) => cmd_standalone_install(args),
+        Command::Update(args) => cmd_update(args),
+        Command::Uninstall(args) => cmd_uninstall(args),
         Command::Setup(args) => setup::run(args, state_root.as_deref()).map_err(|error| {
             if error.is_input() {
                 AppError::Input(anyhow::Error::from(error))
@@ -222,6 +232,86 @@ fn run(cli: Cli) -> Result<(), AppError> {
         }
         Command::Tokenizer(args) => cmd_tokenizer(args),
     }
+}
+
+fn running_executable() -> Result<std::path::PathBuf, AppError> {
+    std::env::current_exe()
+        .context("resolve the running hf2q executable")
+        .and_then(|path| {
+            std::fs::canonicalize(path).context("canonicalize the running hf2q executable")
+        })
+        .map_err(AppError::Conversion)
+}
+
+fn cmd_update(args: cli::UpdateArgs) -> Result<(), AppError> {
+    let executable = running_executable()?;
+    if args.rollback {
+        let install_dir = distribution::standalone::verify_running_installation(&executable)
+            .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+        distribution::standalone::rollback(&install_dir)
+            .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+        println!(
+            "Restored the previous standalone hf2q in {}. Run `hf2q --version` to inspect it.",
+            install_dir.display()
+        );
+        return Ok(());
+    }
+    let outcome = distribution::standalone::run_update(&executable, args.check)
+        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+    match outcome {
+        distribution::standalone::UpdateOutcome::Current { version } => {
+            println!("hf2q {version} is already the current stable standalone release.");
+        }
+        distribution::standalone::UpdateOutcome::Available { current, latest } => {
+            println!("Standalone update available: {current} -> {latest}.");
+        }
+        distribution::standalone::UpdateOutcome::Updated { previous, current } => {
+            println!(
+                "Updated standalone hf2q {previous} -> {current}. Roll back with `hf2q update --rollback`."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_uninstall(args: cli::UninstallArgs) -> Result<(), AppError> {
+    let executable = running_executable()?;
+    let install_dir = distribution::standalone::verify_running_installation(&executable)
+        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+    if !args.yes {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "standalone uninstall would remove only {}, .hf2q-standalone.json, .hf2q-previous, and .hf2q-standalone.lock; configuration and models are preserved. Rerun `hf2q uninstall --yes` to confirm",
+            executable.display()
+        )));
+    }
+    distribution::standalone::uninstall(&install_dir)
+        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+    println!(
+        "Removed standalone hf2q from {}. Configuration and models were preserved.",
+        install_dir.display()
+    );
+    Ok(())
+}
+
+fn cmd_standalone_install(args: cli::StandaloneInstallArgs) -> Result<(), AppError> {
+    let expectation =
+        distribution::standalone::CandidateExpectation::from_hex(args.size, &args.sha256)
+            .map_err(|error| AppError::Input(anyhow::Error::from(error)))?;
+    let outcome = distribution::standalone::publish_verified_candidate(
+        &args.install_dir,
+        &args.candidate,
+        &expectation,
+    )
+    .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+    let action = match outcome {
+        distribution::standalone::PublishOutcome::Installed => "Installed",
+        distribution::standalone::PublishOutcome::Updated => "Updated",
+    };
+    println!(
+        "{action} hf2q at {}",
+        args.install_dir.join("hf2q").display()
+    );
+    Ok(())
 }
 
 fn load_operator_config(

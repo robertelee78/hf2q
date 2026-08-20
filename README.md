@@ -92,6 +92,13 @@ The explicit commit identity is required for immutable remote-conversion
 receipts when building from a checkout. Published packages and future native
 release artifacts embed their own source identity.
 
+The source tree now contains the reviewed standalone installer, updater,
+rollback, and data-preserving uninstaller implementation. It is not advertised
+as an install method yet: `https://hf2q.us/install.sh` remains unavailable
+until an exact Developer-ID-signed, notarized binary and its stable release
+record pass the installed-artifact gates. Source/Cargo installs remain
+unmanaged by `hf2q update`.
+
 `hf2q setup` inventories the selected Apple-Silicon host and records defaults
 that the existing `convert` and `serve` commands consume. It downloads,
 converts, loads, and serves nothing. Complete automation is non-interactive:
@@ -150,6 +157,8 @@ manual setup.
 | Command | What it does |
 |---|---|
 | `hf2q setup` | Learn the Apple-Silicon host and record defaults consumed by `convert` and `serve`. |
+| `hf2q update` | Update a standalone installation; `--check` is read-only and `--rollback` restores one retained version. |
+| `hf2q uninstall` | Remove standalone-owned release files with `--yes` while preserving configuration and models. |
 | `hf2q convert` | HuggingFace safetensors → GGUF (streaming convert, ADR-033 unified pipeline). |
 | `hf2q gguf-patch` | Rewrite a GGUF's metadata in place (e.g. inject a chat template). |
 | `hf2q info` | Inspect a GGUF model without loading weights. |

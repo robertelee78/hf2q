@@ -166,6 +166,38 @@ replacement behavior to install and update safely. Those mechanisms are
 supporting implementation, not additional user-facing product scope. Prefer
 the smallest design that proves the observable contract.
 
+The first standalone layout is intentionally small. By default it owns only
+these data names in `$HOME/.local/bin`:
+
+- `hf2q`, the active executable and the sole activation point;
+- `.hf2q-standalone.json`, a bounded marker that records only that the
+  standalone channel owns this executable path; and
+- `.hf2q-previous`, the one retained executable used by explicit rollback.
+
+A fourth persistent empty file, `.hf2q-standalone.lock`, serializes install,
+update, rollback, and uninstall. Fixed hidden partial names may exist only
+while that lock is held or as recognized crash residue.
+
+The install directory may be overridden explicitly. The marker does not
+duplicate active-version, digest, transition-history, model, or configuration
+state. The running executable reports its own version, and the exact file
+bytes provide its digest. A stale auxiliary document must therefore never be
+required to decide which executable is active.
+
+The mutable stable-channel document is a locator, not executable authority.
+Before activation, the standalone installer/updater verifies the bounded
+download, exact checksum and size, Apple-Silicon target, pinned Developer ID
+team and executable identifier, and the version reported by the candidate.
+Normal update rejects a downgrade. The release workflow separately proves
+notarization and Gatekeeper acceptance for the exact published bytes. This is
+the smallest trust chain for the first Apple-only channel; the dormant custom
+TUF client and multi-role local journal are not part of it.
+
+The installer never owns `$HOME/.hf2q`, model directories, Hugging Face
+caches, or another application. If `$HOME/.local/bin` is not on `PATH`, it
+prints one exact shell instruction instead of silently rewriting unrelated
+shell files.
+
 ### 3. Make `hf2q setup` configure hf2q, not perform the workflow
 
 `hf2q setup` is the system-learning and operator-configuration step. It must:
@@ -294,6 +326,17 @@ The standalone channel retains the previous known-good hf2q version until the
 new version passes validation and activation. Package-manager rollback follows
 the guarantees of that package manager and must be documented truthfully.
 
+For standalone update, the new executable is downloaded to an OS-managed
+temporary file, bounded and fully verified, then copied to the fixed private
+sibling `.hf2q-candidate.partial` before any active-path mutation. The current
+executable is first retained as `.hf2q-previous`; one same-directory atomic
+rename of that verified candidate over `hf2q` is the activation point. Offline,
+malformed, corrupt, unsigned, wrong-identity, wrong-target, and interrupted
+pre-activation attempts leave `hf2q` unchanged. An error after the rename is
+reported as activation-possibly-complete and reconciled from the executable
+bytes, not guessed from a transition ledger. `hf2q update --rollback` swaps
+only the two exact standalone-owned executable files.
+
 ### 6. Make uninstall channel-aware and preserve operator data
 
 `hf2q uninstall` removes hf2q through the installation channel that owns it.
@@ -304,6 +347,12 @@ Destructive data removal requires a separate explicit purge request, an exact
 preview of the owned paths, and confirmation. hf2q must never recursively
 delete a broad home, state, cache, or model directory based only on a guessed
 path.
+
+The first standalone uninstall removes only `hf2q`,
+`.hf2q-standalone.json`, `.hf2q-previous`, and an exact in-progress temporary
+or lock name owned by the same installation. Missing or inconsistent channel
+ownership fails closed. Configuration and model data are not even inputs to
+the default uninstall implementation.
 
 ### 7. Keep hf2q.us truthful and product-led
 
@@ -469,11 +518,13 @@ durability barriers already proven by setup's filesystem tests.
 
 ### Slice D: publish the standalone Apple-Silicon channel
 
-1. Produce the exact signed, notarized, immutable release artifact.
-2. Prove the installer from a clean Mac and a user-owned prefix.
-3. Publish the reviewed versioned script and then enable
+1. Freeze the three-name standalone layout from the local lifecycle spike and
+   implement its focused install/update/rollback/uninstall tests.
+2. Produce the exact signed, notarized, immutable release artifact.
+3. Prove the installer from a clean Mac and a user-owned prefix.
+4. Publish the reviewed versioned script and then enable
    `https://hf2q.us/install.sh`.
-4. Add the method to the website only after the live bytes pass post-publication
+5. Add the method to the website only after the live bytes pass post-publication
    verification.
 
 ### Slice E: add package-manager channels one at a time
@@ -562,9 +613,28 @@ What exists:
   direct API use, and optional OpenCode;
 - partial dormant distribution/update security infrastructure;
 - a `setup` command that records conversion and serving defaults consumed by
-  the existing commands through a selected state root; and
+  the existing commands through a selected state root;
+- a local standalone installer template, hidden exact-byte bootstrap, public
+  `hf2q update`/`hf2q update --rollback`, and marker-gated
+  `hf2q uninstall --yes` implementation; and
 - dormant model-preparation components created under the prior over-broad ADR
   wording.
+
+The first Slice-D filesystem hypothesis was tested locally on 2026-08-20 with
+two distinct real arm64 hf2q executables. Their SHA-256 values were
+`e1affca950361961c58cb886cbd0d5307366c188d4214776ac354bfcc43c3d10`
+and
+`f2e87911234790e615df3e244f55681f5a858a4f2dfbf22e764982e3546d9e52`.
+The spike proved clean install, exact-byte update, explicit rollback, offline
+failure, corrupt-download failure, interruption before activation, and
+default uninstall preservation of a separate `config.toml` and model file.
+It showed that the active executable plus one channel marker, one persistent
+lock, and one retained executable are sufficient for the observable
+standalone lifecycle. The subsequent local implementation adds a canonical
+bounded stable-release record, exact size/SHA verification, same-Developer-ID
+continuity, Gatekeeper assessment, stable-version checks, and the same atomic
+publisher for install and update. It has not yet proved a real signed/notarized
+hf2q artifact or public transport, so the channel remains unavailable.
 
 The unreachable second managed-session store, its runtime authorization, and
 the provisional session-cache setup field have been removed. `hf2q setup` does
@@ -574,7 +644,8 @@ What is not yet the corrected product:
 
 - the live standalone installer at hf2q.us;
 - verified Homebrew/npm/direct user channels;
-- public channel-aware `hf2q update` and `hf2q uninstall`; and
+- published-byte proof for the standalone `update`/`uninstall` commands and
+  package-manager adapters for later channels; and
 - the clean-account installed-artifact acceptance proof.
 
 The remaining dormant components listed above do not become ADR-045
