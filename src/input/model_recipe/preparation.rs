@@ -32,6 +32,8 @@ pub enum ModelPreparationError {
     PairMismatch { reason: String },
     #[error("model preparation host preflight failed: {reason}")]
     HostProbe { reason: String },
+    #[error("model preparation plan is invalid: {reason}")]
+    PlanInvalid { reason: String },
     #[error("model recipe: {0}")]
     Recipe(#[from] ModelRecipeError),
 }

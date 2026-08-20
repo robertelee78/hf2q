@@ -21,7 +21,7 @@
   verification, conversion receipt v3, and the closed checked-in Qwen3.8
   source/artifact/hardware/disk recipe, bounded canonical preparation-pair
   receipt, OS-bound host/disk preflight, and sealed host/conversion/pair proofs
-  are also reconciled;
+  plus the canonical inert no-options preparation layout are also reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install/onboarding
@@ -1667,6 +1667,28 @@ and both exact conversion-receipt SHA-256 values. Its only state is
 recreate the non-cloneable sealed value; neither form grants serving,
 registration, retention deletion, or filesystem-mutation authority.
 
+**Landed no-options preparation-plan boundary (2026-08-19).** A bare official
+reference or its exact accepted-revision URL can now mint one non-cloneable
+`ModelPreparationPlan`. Construction selects only the embedded recipe, derives
+the accepted revision without pretending that Hub resolution has already
+occurred, and owns the OS-bound host proof for the exact future model location.
+It canonicalizes the absolute models root through existing directory symlinks,
+accepts only UTF-8 paths capped at 4,096 bytes, 64 components, and 255 bytes per
+component, and rejects dot/parent traversal, file ancestors, over-cap paths,
+file-specific Hub references, other repositories, and unaccepted revisions.
+Planning creates no directories or files.
+
+The exact planned tree is
+`<models-root>/huggingface/Qwen/Qwen3.8-27B/<accepted-revision>/` with
+`source/`, `artifacts/`, `receipts/`, and `profile.json`. Artifact names remain
+the two recipe names. Their final conversion receipts are named
+`<artifact>.receipt.json` under `receipts/`, and the pair receipt is
+`receipts/model-preparation.json`. The plan exposes only read-only typed paths
+and policy facts; it grants no download, conversion, source deletion,
+registration, calibration, serving, or filesystem-mutation authority. A later
+coordinator must consume it, resolve Hub metadata to the same exact revision,
+and revalidate the namespace before mutation.
+
 The no-options coordinator, conversion invocation, source-retention mutation,
 prepared-model registry, and calibration receipt remain pending and must
 consume these proofs rather than reconstructing policy from strings.
@@ -1997,7 +2019,9 @@ before public self-update ships.
    consumes the exact source, host/disk, artifact, and conversion-receipt
    proofs; its production host proof is minted only from fixed in-process
    macOS sysctl reads plus the selected target filesystem's observed free
-   space, and remains explicitly calibration-pending and inert. Next, embed
+   space. The canonical no-options preparation plan now owns that proof and
+   derives the bounded source/artifact/receipt/profile layout without creating
+   it; both remain explicitly calibration-pending and inert. Next, embed
    the real stable root, compile the real
    public Team ID, pass the protected positive signing fixture, and compose
    that recipe into the no-options paired conversion, source-retention

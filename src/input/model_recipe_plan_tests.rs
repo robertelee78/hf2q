@@ -1,0 +1,257 @@
+use std::path::{Path, PathBuf};
+
+use super::hf_reference::HfModelReference;
+use super::model_recipe::{
+    plan_current_model_preparation, ModelPreparationError, ModelPreparationPlan,
+    RecipeArtifactRole, SourceRetentionChoice, QWEN38_ACCEPTED_REVISION,
+};
+
+fn plan(reference: HfModelReference, root: &Path) -> ModelPreparationPlan {
+    ModelPreparationPlan::for_test(
+        reference,
+        root,
+        "aarch64-apple-darwin",
+        "Apple M5 Max",
+        128 * 1024 * 1024 * 1024,
+        100 * 1024 * 1024 * 1024,
+    )
+    .unwrap()
+}
+
+#[test]
+fn canonical_no_options_layout_is_exact_and_inert() {
+    let temp = tempfile::tempdir().unwrap();
+    let models = temp.path().join("models");
+    let canonical_models = temp.path().canonicalize().unwrap().join("models");
+    let planned = plan(
+        HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap(),
+        &models,
+    );
+    let root = canonical_models
+        .join("huggingface/Qwen/Qwen3.8-27B")
+        .join(QWEN38_ACCEPTED_REVISION);
+    assert_eq!(planned.models_root(), canonical_models);
+    assert_eq!(planned.model_root(), root);
+    assert_eq!(planned.source_root(), root.join("source"));
+    assert_eq!(planned.artifacts_root(), root.join("artifacts"));
+    assert_eq!(planned.receipts_root(), root.join("receipts"));
+    assert_eq!(
+        planned.artifact_path(RecipeArtifactRole::Text),
+        root.join("artifacts/Qwen3.8-27B-Q4_K_M.gguf")
+    );
+    assert_eq!(
+        planned.artifact_path(RecipeArtifactRole::VisionProjector),
+        root.join("artifacts/Qwen3.8-27B-mmproj-F16.gguf")
+    );
+    assert_eq!(
+        planned.conversion_receipt_path(RecipeArtifactRole::Text),
+        root.join("receipts/Qwen3.8-27B-Q4_K_M.gguf.receipt.json")
+    );
+    assert_eq!(
+        planned.conversion_receipt_path(RecipeArtifactRole::VisionProjector),
+        root.join("receipts/Qwen3.8-27B-mmproj-F16.gguf.receipt.json")
+    );
+    assert_eq!(
+        planned.preparation_receipt_path(),
+        root.join("receipts/model-preparation.json")
+    );
+    assert_eq!(planned.profile_path(), root.join("profile.json"));
+    assert_eq!(planned.recipe_id(), "qwen38-27b-official-v1");
+    assert_eq!(planned.accepted_revision(), QWEN38_ACCEPTED_REVISION);
+    assert_eq!(
+        planned.source_retention_default(),
+        SourceRetentionChoice::Keep
+    );
+    assert!(planned.minimum_free_bytes() > 0);
+    assert!(!models.exists(), "planning must not create the layout");
+    assert!(format!("{planned:?}").contains("paths: \"[redacted]\""));
+    let _ = planned.host_for_test();
+}
+
+#[test]
+fn equivalent_reference_spellings_select_one_plan_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let bare = plan(
+        HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap(),
+        temp.path(),
+    );
+    let url = plan(
+        HfModelReference::parse(
+            &format!("https://huggingface.co/Qwen/Qwen3.8-27B/tree/{QWEN38_ACCEPTED_REVISION}"),
+            None,
+        )
+        .unwrap(),
+        temp.path(),
+    );
+    assert_eq!(bare.model_root(), url.model_root());
+    assert_eq!(bare.accepted_revision(), url.accepted_revision());
+    assert_eq!(bare.reference().repo_id(), url.reference().repo_id());
+}
+
+#[test]
+fn current_no_options_plan_passes_on_the_explicit_proof_machine() {
+    if std::env::var_os("HF2Q_TEST_QWEN38_HOST_PREFLIGHT").is_none() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let planned = plan_current_model_preparation(
+        HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap(),
+        &temp.path().join("models"),
+    )
+    .unwrap();
+    assert_eq!(planned.accepted_revision(), QWEN38_ACCEPTED_REVISION);
+    assert!(!planned.model_root().exists());
+}
+
+#[test]
+fn unaccepted_or_file_specific_references_cannot_mint_a_plan() {
+    let temp = tempfile::tempdir().unwrap();
+    let other = HfModelReference::parse("other/model", None).unwrap();
+    assert!(matches!(
+        ModelPreparationPlan::for_test(
+            other,
+            temp.path(),
+            "aarch64-apple-darwin",
+            "Apple M5 Max",
+            128 * 1024 * 1024 * 1024,
+            u64::MAX,
+        ),
+        Err(ModelPreparationError::PlanInvalid { .. })
+    ));
+
+    let file = HfModelReference::parse(
+        &format!(
+            "https://huggingface.co/Qwen/Qwen3.8-27B/resolve/{QWEN38_ACCEPTED_REVISION}/config.json"
+        ),
+        None,
+    )
+    .unwrap();
+    assert!(ModelPreparationPlan::for_test(
+        file,
+        temp.path(),
+        "aarch64-apple-darwin",
+        "Apple M5 Max",
+        128 * 1024 * 1024 * 1024,
+        u64::MAX,
+    )
+    .is_err());
+
+    let wrong_revision =
+        HfModelReference::parse("Qwen/Qwen3.8-27B", Some(&"b".repeat(40))).unwrap();
+    assert!(ModelPreparationPlan::for_test(
+        wrong_revision,
+        temp.path(),
+        "aarch64-apple-darwin",
+        "Apple M5 Max",
+        128 * 1024 * 1024 * 1024,
+        u64::MAX,
+    )
+    .is_err());
+}
+
+#[test]
+fn preparation_root_is_absolute_canonical_bounded_and_directory_backed() {
+    let reference = || HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap();
+    for invalid in [
+        PathBuf::from("relative"),
+        PathBuf::from("/tmp/../tmp/models"),
+    ] {
+        assert!(ModelPreparationPlan::for_test(
+            reference(),
+            &invalid,
+            "aarch64-apple-darwin",
+            "Apple M5 Max",
+            128 * 1024 * 1024 * 1024,
+            u64::MAX,
+        )
+        .is_err());
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("file");
+    std::fs::write(&file, b"occupied").unwrap();
+    assert!(ModelPreparationPlan::for_test(
+        reference(),
+        &file.join("models"),
+        "aarch64-apple-darwin",
+        "Apple M5 Max",
+        128 * 1024 * 1024 * 1024,
+        u64::MAX,
+    )
+    .is_err());
+
+    let oversized = temp.path().join("a".repeat(256));
+    assert!(ModelPreparationPlan::for_test(
+        reference(),
+        &oversized,
+        "aarch64-apple-darwin",
+        "Apple M5 Max",
+        128 * 1024 * 1024 * 1024,
+        u64::MAX,
+    )
+    .is_err());
+
+    let over_total_cap = temp.path().join("a".repeat(240)).join("b".repeat(240));
+    let over_total_cap = (0..16).fold(over_total_cap, |path, index| {
+        path.join(format!("{index:02}{}", "c".repeat(238)))
+    });
+    assert!(ModelPreparationPlan::for_test(
+        reference(),
+        &over_total_cap,
+        "aarch64-apple-darwin",
+        "Apple M5 Max",
+        128 * 1024 * 1024 * 1024,
+        u64::MAX,
+    )
+    .is_err());
+
+    let over_component_cap = (0..65).fold(temp.path().to_path_buf(), |path, index| {
+        path.join(format!("c{index}"))
+    });
+    assert!(ModelPreparationPlan::for_test(
+        reference(),
+        &over_component_cap,
+        "aarch64-apple-darwin",
+        "Apple M5 Max",
+        128 * 1024 * 1024 * 1024,
+        u64::MAX,
+    )
+    .is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn preparation_root_rejects_non_utf8_components() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let invalid = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(vec![b'm', 0xff]));
+    assert!(ModelPreparationPlan::for_test(
+        HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap(),
+        &invalid,
+        "aarch64-apple-darwin",
+        "Apple M5 Max",
+        128 * 1024 * 1024 * 1024,
+        u64::MAX,
+    )
+    .is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn preparation_root_symlink_is_bound_to_its_canonical_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("destination");
+    std::fs::create_dir(&destination).unwrap();
+    let link = temp.path().join("models-link");
+    std::os::unix::fs::symlink(&destination, &link).unwrap();
+    let planned = plan(
+        HfModelReference::parse("Qwen/Qwen3.8-27B", None).unwrap(),
+        &link,
+    );
+    let canonical_destination = destination.canonicalize().unwrap();
+    assert_eq!(planned.models_root(), canonical_destination);
+    assert!(planned.model_root().starts_with(&canonical_destination));
+}
