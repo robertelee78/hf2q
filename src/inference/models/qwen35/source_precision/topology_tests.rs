@@ -1,3 +1,4 @@
+use half::bf16;
 use safetensors::tensor::TensorView;
 use safetensors::Dtype;
 use sha1::Sha1;
@@ -159,6 +160,25 @@ pub(super) fn fixture(
     dtype: Dtype,
     mutate: impl FnOnce(&mut serde_json::Value, &mut Vec<TensorSpec>),
 ) -> TopologyFixture {
+    fixture_with_payload(dtype, mutate, |tensor_index, element_index| {
+        (tensor_index + element_index) as u16
+    })
+}
+
+pub(super) fn finite_bf16_fixture(
+    mutate: impl FnOnce(&mut serde_json::Value, &mut Vec<TensorSpec>),
+) -> TopologyFixture {
+    fixture_with_payload(Dtype::BF16, mutate, |tensor_index, element_index| {
+        let integer = ((tensor_index * 31 + element_index * 17) % 31) as i32 - 15;
+        bf16::from_f32(integer as f32 / 1024.0).to_bits()
+    })
+}
+
+fn fixture_with_payload(
+    dtype: Dtype,
+    mutate: impl FnOnce(&mut serde_json::Value, &mut Vec<TensorSpec>),
+    payload_word: impl Fn(usize, usize) -> u16,
+) -> TopologyFixture {
     let temp = tempfile::tempdir().unwrap();
     let mut config_value = config();
     let mut tensor_specs = specs();
@@ -172,7 +192,7 @@ pub(super) fn fixture(
         .map(|(index, tensor)| {
             let numel = tensor.shape.iter().product::<usize>();
             (0..numel)
-                .flat_map(|offset| ((index + offset) as u16).to_le_bytes())
+                .flat_map(|offset| payload_word(index, offset).to_le_bytes())
                 .collect()
         })
         .collect();
