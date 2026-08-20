@@ -1,4 +1,5 @@
 use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::{symlink, MetadataExt};
 
 use super::*;
 use crate::inference::models::qwen35::{
@@ -52,7 +53,12 @@ fn full_logit_rows_are_framed_reread_and_summarized_deterministically() {
         artifact.receipt().greedy_trajectories[0].token_ids.len(),
         32
     );
-    assert_eq!(artifact.path(), output);
+    assert_eq!(
+        artifact.path(),
+        std::fs::canonicalize(output.parent().unwrap())
+            .unwrap()
+            .join(output.file_name().unwrap())
+    );
     target_artifact::verify_for_test(&mut artifact).unwrap();
 }
 
@@ -189,7 +195,18 @@ fn streaming_writer_matches_callback_writer_and_rejects_incomplete_or_reordered_
     for prompt in &plan.manifest().greedy_prompts {
         stream.write_trajectory(prompt, &trajectory).unwrap();
     }
-    let streaming = stream.finish().unwrap();
+    let unpublished = stream.finish_unpublished().unwrap();
+    assert_eq!(unpublished.receipt().prediction_point_count, 3);
+    assert!(
+        !streaming_path.exists(),
+        "a sealed target must remain unpublished until the consuming transition"
+    );
+    let streaming = unpublished.publish_noclobber().unwrap();
+    assert!(streaming_path.exists());
+    let named_metadata = std::fs::metadata(&streaming_path).unwrap();
+    let retained_metadata = streaming.file.metadata().unwrap();
+    assert_eq!(named_metadata.dev(), retained_metadata.dev());
+    assert_eq!(named_metadata.ino(), retained_metadata.ino());
 
     let callback_path = temp.path().join("callback.bin");
     let callback = write_structural_teacher_target_artifact(
@@ -223,6 +240,156 @@ fn streaming_writer_matches_callback_writer_and_rejects_incomplete_or_reordered_
         incomplete.finish(),
         Err(ExactTeacherTargetError::Invalid(_))
     ));
+
+    let unpublished_path = temp.path().join("drop-unpublished.bin");
+    let mut unpublished = target_artifact::preflight_structural_teacher_target(&plan, 4, limits())
+        .unwrap()
+        .begin(&unpublished_path)
+        .unwrap();
+    for point in &plan.manifest().prediction_points {
+        unpublished
+            .write_row(point, &[-0.0, 0.0, -1.0, -2.0])
+            .unwrap();
+    }
+    for prompt in &plan.manifest().greedy_prompts {
+        unpublished.write_trajectory(prompt, &trajectory).unwrap();
+    }
+    drop(unpublished.finish_unpublished().unwrap());
+    assert!(!unpublished_path.exists());
+
+    let tampered_path = temp.path().join("tampered-before-publish.bin");
+    let mut tampered = target_artifact::preflight_structural_teacher_target(&plan, 4, limits())
+        .unwrap()
+        .begin(&tampered_path)
+        .unwrap();
+    for point in &plan.manifest().prediction_points {
+        tampered.write_row(point, &[-0.0, 0.0, -1.0, -2.0]).unwrap();
+    }
+    for prompt in &plan.manifest().greedy_prompts {
+        tampered.write_trajectory(prompt, &trajectory).unwrap();
+    }
+    let mut tampered = tampered.finish_unpublished().unwrap();
+    let payload_offset = tampered.receipt().rows[0].payload_offset;
+    tampered
+        .retained_file_for_test()
+        .seek(SeekFrom::Start(payload_offset))
+        .unwrap();
+    tampered
+        .retained_file_for_test()
+        .write_all(&1.0f32.to_le_bytes())
+        .unwrap();
+    tampered.retained_file_for_test().sync_all().unwrap();
+    assert!(tampered.publish_noclobber().is_err());
+    assert!(!tampered_path.exists());
+
+    let collision_path = temp.path().join("collision.bin");
+    std::fs::write(&collision_path, b"existing").unwrap();
+    assert!(
+        target_artifact::preflight_structural_teacher_target(&plan, 4, limits())
+            .unwrap()
+            .begin(&collision_path)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&collision_path).unwrap(), b"existing");
+
+    let late_collision_path = temp.path().join("late-collision.bin");
+    let mut collision = target_artifact::preflight_structural_teacher_target(&plan, 4, limits())
+        .unwrap()
+        .begin(&late_collision_path)
+        .unwrap();
+    for point in &plan.manifest().prediction_points {
+        collision
+            .write_row(point, &[-0.0, 0.0, -1.0, -2.0])
+            .unwrap();
+    }
+    for prompt in &plan.manifest().greedy_prompts {
+        collision.write_trajectory(prompt, &trajectory).unwrap();
+    }
+    std::fs::write(&late_collision_path, b"late-existing").unwrap();
+    assert!(collision
+        .finish_unpublished()
+        .unwrap()
+        .publish_noclobber()
+        .is_err());
+    assert_eq!(
+        std::fs::read(late_collision_path).unwrap(),
+        b"late-existing"
+    );
+
+    let original_parent = temp.path().join("parent");
+    std::fs::create_dir(&original_parent).unwrap();
+    let parent_swap_path = original_parent.join("parent-swap.bin");
+    let mut parent_swap = target_artifact::preflight_structural_teacher_target(&plan, 4, limits())
+        .unwrap()
+        .begin(&parent_swap_path)
+        .unwrap();
+    for point in &plan.manifest().prediction_points {
+        parent_swap
+            .write_row(point, &[-0.0, 0.0, -1.0, -2.0])
+            .unwrap();
+    }
+    for prompt in &plan.manifest().greedy_prompts {
+        parent_swap.write_trajectory(prompt, &trajectory).unwrap();
+    }
+    let parent_swap = parent_swap.finish_unpublished().unwrap();
+    let moved_parent = temp.path().join("moved-parent");
+    std::fs::rename(&original_parent, &moved_parent).unwrap();
+    std::fs::create_dir(&original_parent).unwrap();
+    assert!(parent_swap.publish_noclobber().is_err());
+    assert!(!parent_swap_path.exists());
+    assert_eq!(std::fs::read_dir(moved_parent).unwrap().count(), 0);
+
+    let alias_a = temp.path().join("alias-a");
+    let alias_b = temp.path().join("alias-b");
+    let alias = temp.path().join("alias");
+    std::fs::create_dir(&alias_a).unwrap();
+    std::fs::create_dir(&alias_b).unwrap();
+    symlink(&alias_a, &alias).unwrap();
+    let alias_output = alias.join("canonical-target.bin");
+    let canonical_output = std::fs::canonicalize(&alias_a)
+        .unwrap()
+        .join("canonical-target.bin");
+    let mut alias_stream = target_artifact::preflight_structural_teacher_target(&plan, 4, limits())
+        .unwrap()
+        .begin(&alias_output)
+        .unwrap();
+    for point in &plan.manifest().prediction_points {
+        alias_stream
+            .write_row(point, &[-0.0, 0.0, -1.0, -2.0])
+            .unwrap();
+    }
+    for prompt in &plan.manifest().greedy_prompts {
+        alias_stream.write_trajectory(prompt, &trajectory).unwrap();
+    }
+    let alias_stream = alias_stream.finish_unpublished().unwrap();
+    std::fs::remove_file(&alias).unwrap();
+    symlink(&alias_b, &alias).unwrap();
+    let alias_artifact = alias_stream.publish_noclobber().unwrap();
+    assert_eq!(alias_artifact.path(), canonical_output);
+    assert!(canonical_output.exists());
+    assert!(!alias_output.exists());
+}
+
+#[test]
+fn retained_target_file_is_not_redirected_by_final_path_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let plan = prediction_plan_for_test();
+    let output = temp.path().join("retained.bin");
+    let mut artifact = write_structural_teacher_target_artifact(
+        &plan,
+        &output,
+        4,
+        limits(),
+        |_request| Ok(vec![0.0, 1.0, 2.0, 3.0]),
+        |_request| Ok(vec![0; 32]),
+    )
+    .unwrap();
+    let retained_metadata = artifact.file.metadata().unwrap();
+    std::fs::rename(&output, temp.path().join("moved.bin")).unwrap();
+    std::fs::write(&output, b"replacement").unwrap();
+    let replacement_metadata = std::fs::metadata(&output).unwrap();
+    assert_ne!(retained_metadata.ino(), replacement_metadata.ino());
+    target_artifact::verify_for_test(&mut artifact).unwrap();
 }
 
 fn tiny_f32_oracle() -> Qwen35Model {

@@ -10,12 +10,14 @@ use crate::intelligence::calibration::VerifiedCalibrationPredictionPlan;
 
 use super::types::*;
 
+mod publication;
 mod stream;
 mod verify;
 
+#[allow(unused_imports)] // consumed by the family-owned runner slice
 pub(crate) use stream::{
     preflight_structural_teacher_target, StructuralTeacherTargetPreflight,
-    StructuralTeacherTargetStream,
+    StructuralTeacherTargetStream, UnpublishedStructuralTeacherTargetArtifact,
 };
 
 #[cfg(test)]

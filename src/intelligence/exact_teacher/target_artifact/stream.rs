@@ -1,11 +1,12 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::core::provenance::tensor_execution::ArtifactEvidence;
 use crate::intelligence::calibration::{
     TeacherGreedyPromptReceipt, TeacherPredictionPointReceipt, VerifiedCalibrationPredictionPlan,
 };
 
+use super::publication::RetainedTargetTemp;
 use super::*;
 
 /// Checked target dimensions and token vocabulary closure. This remains a
@@ -73,8 +74,7 @@ pub(crate) fn preflight_structural_teacher_target(
 /// promote its result into execution or allocator authority.
 pub(crate) struct StructuralTeacherTargetStream<'a> {
     plan: &'a VerifiedCalibrationPredictionPlan,
-    output: PathBuf,
-    temporary: tempfile::NamedTempFile,
+    temporary: RetainedTargetTemp,
     vocabulary_size: usize,
     limits: TeacherTargetArtifactLimits,
     preflight_bytes: u64,
@@ -99,13 +99,7 @@ impl<'a> StructuralTeacherTargetPreflight<'a> {
             preflight_bytes,
         } = self;
 
-        let parent = output.parent().ok_or_else(|| {
-            ExactTeacherTargetError::Invalid("teacher target path has no parent".into())
-        })?;
-        std::fs::create_dir_all(parent)
-            .map_err(|error| ExactTeacherTargetError::io(parent, error))?;
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|error| ExactTeacherTargetError::io(parent, error))?;
+        let mut temporary = RetainedTargetTemp::create(output)?;
         temporary
             .as_file_mut()
             .write_all(TARGET_MAGIC)
@@ -113,7 +107,6 @@ impl<'a> StructuralTeacherTargetPreflight<'a> {
 
         Ok(StructuralTeacherTargetStream {
             plan,
-            output: output.to_owned(),
             temporary,
             vocabulary_size,
             limits,
@@ -190,7 +183,7 @@ impl StructuralTeacherTargetStream<'_> {
                     .write_all(&payload_bytes.to_le_bytes())
             })
             .and_then(|_| self.temporary.as_file_mut().write_all(&payload))
-            .map_err(|error| ExactTeacherTargetError::io(&self.output, error))?;
+            .map_err(|error| ExactTeacherTargetError::io(self.temporary.output(), error))?;
         self.offset = payload_offset
             .checked_add(payload_bytes)
             .ok_or_else(|| ExactTeacherTargetError::Invalid("row end overflow".into()))?;
@@ -252,9 +245,11 @@ impl StructuralTeacherTargetStream<'_> {
         Ok(())
     }
 
-    pub(crate) fn finish(
+    /// Seal and independently verify the exact temporary inode without
+    /// publishing it at the requested destination.
+    pub(crate) fn finish_unpublished(
         mut self,
-    ) -> Result<StructurallyVerifiedTeacherTargetArtifact, ExactTeacherTargetError> {
+    ) -> Result<UnpublishedStructuralTeacherTargetArtifact, ExactTeacherTargetError> {
         if self.rows.len() != self.plan.prediction_point_count()
             || self.trajectories.len() != self.plan.manifest().greedy_prompts.len()
         {
@@ -271,7 +266,7 @@ impl StructuralTeacherTargetStream<'_> {
             .as_file_mut()
             .flush()
             .and_then(|_| self.temporary.as_file().sync_all())
-            .map_err(|error| ExactTeacherTargetError::io(&self.output, error))?;
+            .map_err(|error| ExactTeacherTargetError::io(self.temporary.output(), error))?;
         let artifact_sha256 =
             hash_open_file_bounded(self.temporary.as_file_mut(), self.preflight_bytes)?;
         let mut receipt = ExactTeacherTargetReceipt {
@@ -294,14 +289,57 @@ impl StructuralTeacherTargetStream<'_> {
         };
         receipt.receipt_sha256 = receipt_sha256(&receipt)?;
         verify::verify_structural_teacher_target_artifact(self.temporary.as_file_mut(), &receipt)?;
-        let file = self
-            .temporary
-            .persist_noclobber(&self.output)
-            .map_err(|error| ExactTeacherTargetError::io(&self.output, error.error))?;
+        Ok(UnpublishedStructuralTeacherTargetArtifact {
+            receipt,
+            temporary: self.temporary,
+        })
+    }
+
+    /// Compatibility transition for structural-only callers. Family-owned
+    /// execution builds its completion receipt between `finish_unpublished`
+    /// and `publish_noclobber` instead.
+    pub(crate) fn finish(
+        self,
+    ) -> Result<StructurallyVerifiedTeacherTargetArtifact, ExactTeacherTargetError> {
+        self.finish_unpublished()?.publish_noclobber()
+    }
+}
+
+impl UnpublishedStructuralTeacherTargetArtifact {
+    /// Reverify the retained temporary inode and publish it without replacing
+    /// an existing destination. This is the final fallible transition: after
+    /// successful publication no additional receipt construction is needed.
+    pub(crate) fn publish_noclobber(
+        self,
+    ) -> Result<StructurallyVerifiedTeacherTargetArtifact, ExactTeacherTargetError> {
+        let receipt = self.receipt;
+        let output = self.temporary.output().to_owned();
+        let expected_len = receipt.target_artifact.byte_len;
+        let file = self.temporary.publish_noclobber(expected_len, |file| {
+            verify::verify_structural_teacher_target_artifact(file, &receipt)
+        })?;
         Ok(StructurallyVerifiedTeacherTargetArtifact {
             receipt,
             file,
-            path: self.output,
+            path: output,
         })
+    }
+}
+
+/// A byte-verified target retained under a private temporary name until a
+/// family-owned completion receipt is ready.
+pub(crate) struct UnpublishedStructuralTeacherTargetArtifact {
+    receipt: ExactTeacherTargetReceipt,
+    temporary: RetainedTargetTemp,
+}
+
+impl UnpublishedStructuralTeacherTargetArtifact {
+    pub(crate) fn receipt(&self) -> &ExactTeacherTargetReceipt {
+        &self.receipt
+    }
+
+    #[cfg(test)]
+    pub(in crate::intelligence::exact_teacher) fn retained_file_for_test(&mut self) -> &mut File {
+        self.temporary.as_file_mut()
     }
 }
