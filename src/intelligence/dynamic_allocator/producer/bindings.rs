@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::super::{
     allocate_dynamic_frontier, DynamicAllocationError, DynamicAllocationProblem, PolicyFrontier,
 };
@@ -5,6 +7,10 @@ use super::{
     validate_coverage_contract, validate_tensor_partition, verify_coverage_receipt,
     CoverageContract, CoverageReceipt, DynamicProducerError, TensorPartitionManifest,
     VerifiedCollectorTopology, VerifiedSourceTensorInventory,
+};
+use crate::core::provenance::tensor_execution::{
+    verify_tensor_execution_manifest, PhysicalTensorCodec, SourceTensorDispositionKind,
+    TensorScalarDType, TensorStateStage,
 };
 use crate::intelligence::calibration::{
     verify_dataset_partition, DatasetPartitionManifest, RenderedDataset,
@@ -110,6 +116,104 @@ pub fn validate_dynamic_allocation_bindings(
         coverage_contract,
         coverage_receipt,
     )?;
+    let mut expected_dispositions = BTreeMap::new();
+    for descriptor in &tensor_partition.variable_units {
+        for member in &descriptor.members {
+            expected_dispositions
+                .insert(member.name.as_str(), SourceTensorDispositionKind::Variable);
+        }
+    }
+    for tensor in &tensor_partition.non_variable_tensors {
+        let disposition = match tensor.disposition {
+            super::NonVariableDisposition::Fixed => SourceTensorDispositionKind::Fixed,
+            super::NonVariableDisposition::Protected => SourceTensorDispositionKind::Protected,
+            super::NonVariableDisposition::Excluded => SourceTensorDispositionKind::Excluded,
+        };
+        expected_dispositions.insert(tensor.source.name.as_str(), disposition);
+    }
+    for raw_manifest in &problem.execution_manifest_catalog {
+        let validated = verify_tensor_execution_manifest(raw_manifest)
+            .map_err(|error| DynamicProducerError::InvalidBinding(error.to_string()))?;
+        let manifest = validated.manifest();
+        if manifest.source_manifest_sha256 != inventory.manifest().verified_source_manifest_sha256
+            || manifest.source_tensor_inventory_sha256 != inventory.manifest().manifest_sha256
+            || manifest.tensor_partition_manifest_sha256 != tensor_partition.manifest_sha256
+            || manifest.runtime != problem.tensor_runtime
+            || {
+                let mut manifest_paths = manifest.scope.included_paths.clone();
+                let mut problem_paths = problem.execution_scope.included_paths.clone();
+                manifest_paths.sort();
+                problem_paths.sort();
+                manifest.scope.model_family != problem.execution_scope.model_family
+                    || manifest.scope.profile != problem.execution_scope.profile
+                    || manifest_paths != problem_paths
+                    || manifest.scope.excluded_paths != problem.execution_scope.excluded_paths
+            }
+        {
+            return Err(DynamicProducerError::InvalidBinding(
+                "execution manifest does not bind the admitted source inventory, tensor partition, or runtime"
+                    .into(),
+            ));
+        }
+        for node in manifest
+            .nodes
+            .iter()
+            .filter(|node| node.stage == TensorStateStage::Source)
+        {
+            let record = inventory
+                .manifest()
+                .tensors
+                .iter()
+                .find(|record| record.name == node.semantic_name)
+                .ok_or_else(|| {
+                    DynamicProducerError::InvalidBinding(format!(
+                        "execution manifest source `{}` is absent from inventory",
+                        node.semantic_name
+                    ))
+                })?;
+            let dtype_matches = matches!(
+                (&node.codec, record.source_dtype.as_str()),
+                (
+                    PhysicalTensorCodec::Dense {
+                        dtype: TensorScalarDType::F16
+                    },
+                    "F16"
+                ) | (
+                    PhysicalTensorCodec::Dense {
+                        dtype: TensorScalarDType::Bf16
+                    },
+                    "BF16"
+                ) | (
+                    PhysicalTensorCodec::Dense {
+                        dtype: TensorScalarDType::F32
+                    },
+                    "F32"
+                )
+            );
+            let actual_disposition = manifest
+                .dispositions
+                .iter()
+                .find(|disposition| disposition.source_node_id == node.node_id)
+                .map(|disposition| disposition.disposition);
+            let expected_disposition = expected_dispositions.get(node.semantic_name.as_str());
+            if node.shape
+                != record
+                    .source_shape
+                    .iter()
+                    .map(|dimension| *dimension as u64)
+                    .collect::<Vec<_>>()
+                || node.byte_len != record.source_byte_len
+                || node.byte_sha256 != record.source_tensor_sha256
+                || !dtype_matches
+                || actual_disposition.as_ref() != expected_disposition
+            {
+                return Err(DynamicProducerError::InvalidBinding(format!(
+                    "execution manifest source `{}` does not match the authenticated tensor record",
+                    node.semantic_name
+                )));
+            }
+        }
+    }
     super::super::allocation_problem_sha256(problem)
         .map_err(|error| DynamicProducerError::InvalidBinding(error.to_string()))?;
     Ok(VerifiedDynamicAllocationProblem {
@@ -204,10 +308,28 @@ mod tests {
                 hardware_id: "hardware".into(),
                 os_build: "os".into(),
             },
+            tensor_runtime: crate::core::provenance::tensor_execution::TensorRuntimeBinding {
+                hf2q_revision: "0".repeat(40),
+                mlx_native_version: "version".into(),
+                mlx_native_capability_schema_version: 1,
+                routing_policy_sha256: digest("routing"),
+                graph_configuration_sha256: digest("graph"),
+                capability_profile_sha256: digest("capability"),
+                hardware_profile_sha256: digest("hardware-profile"),
+                dwq_overlay_sha256: None,
+            },
+            execution_scope: crate::core::provenance::tensor_execution::TensorExecutionScope {
+                model_family: "test".into(),
+                profile: "test".into(),
+                included_paths: vec!["test".into()],
+                excluded_paths: BTreeMap::new(),
+            },
             tensor_catalog_sha256: tensor.tensor_catalog_sha256.clone(),
             expected_tensor_count: 0,
             dataset_partition_manifest_sha256: dataset.manifest_sha256.clone(),
             tensor_partition_manifest_sha256: tensor.manifest_sha256.clone(),
+            execution_manifest_catalog: Vec::new(),
+            execution_manifest_catalog_sha256: digest("execution-manifests"),
             calibration_manifest_sha256: dataset.calibration_manifest_sha256.clone(),
             sensitivity_model: SensitivityModelIdentity {
                 method: "method".into(),
@@ -220,7 +342,7 @@ mod tests {
             capability_profile_sha256: digest("capability"),
             proposal_workload_profile_sha256: digest("workload"),
             required_regimes: Vec::new(),
-            payload_budget_bytes: 1,
+            variable_payload_budget_bytes: 1,
             minimum_expert_activation_rows: 1,
             search: SearchContract::ExactPareto { max_states: 1 },
             units: Vec::new(),
