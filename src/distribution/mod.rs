@@ -43,6 +43,16 @@ impl SetupStateRootBinding {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn retained_regular_files_are_read_only_for_test(
+        &self,
+    ) -> Result<bool, install_state::InstallStateError> {
+        match &self.identity {
+            Some(identity) => identity.retained_regular_files_are_read_only_for_test(),
+            None => Ok(true),
+        }
+    }
 }
 
 pub(crate) fn verify_setup_state_root(

@@ -98,8 +98,10 @@ hf2q setup --session-cache on --session-cache-limit 32GiB
 ```
 
 Use `--state-root /absolute/path` for a custom standalone state root. The
-config producer is landed ahead of the runtime persistence bridge; current
-serving does not consume this policy yet, and zero is reserved to mean
+config producer now has a read-only typed authorization that keeps absence and
+zero out of every persistor and wraps a positive value as a retained nonzero
+proof. Current serving does not consume that proof yet: the managed aggregate
+cache and free-space guard remain pending, and zero is reserved to mean
 disabled rather than the legacy unlimited setting. See
 [`docs/setup.md`](docs/setup.md) for the exact prompt, schema, filesystem, and
 failure contract.

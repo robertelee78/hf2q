@@ -1,14 +1,15 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustix::fs::{self, AtFlags};
 
 use self::unix::{
     acquire_lock, create_private_file, ensure_directory, entry_identity, full_sync, full_sync_lock,
-    io_error, open_or_create_root, open_private_file, private_identity, reopen_root,
-    sync_directory, verify_directory, verify_lock, verify_named, verify_root, Directory, Identity,
+    io_error, open_existing_directory, open_or_create_root, open_private_file, private_identity,
+    reopen_root, sync_directory, verify_directory, verify_lock, verify_named, verify_root,
+    Directory, Identity,
 };
 use super::schema::{ConfigV1, MAX_CONFIG_BYTES};
 use super::SetupError;
@@ -71,6 +72,88 @@ impl ExistingConfig {
 struct SessionDirectories {
     cache: Directory,
     sessions: Directory,
+}
+
+#[allow(dead_code)]
+pub(super) struct RuntimeConfigBinding {
+    root_path: PathBuf,
+    root: Directory,
+    config_bytes: Vec<u8>,
+    config_identity: Identity,
+    directories: SessionDirectories,
+    state_binding: crate::distribution::SetupStateRootBinding,
+}
+
+#[allow(dead_code)]
+impl RuntimeConfigBinding {
+    pub(super) fn revalidate(&self) -> Result<(), SetupError> {
+        self.state_binding
+            .revalidate()
+            .map_err(|error| SetupError::Filesystem(error.to_string()))?;
+        verify_root(&self.root_path, &self.root)?;
+        let observed =
+            read_optional_snapshot_with_hook(&self.root, CONFIG_NAME, MAX_CONFIG_BYTES, || {})?
+                .ok_or(SetupError::Missing)?;
+        if observed.0 != self.config_bytes || observed.1 != self.config_identity {
+            return Err(SetupError::Filesystem(
+                "runtime config.toml changed after authorization".to_owned(),
+            ));
+        }
+        verify_session_directories(&self.root, &self.directories)?;
+        verify_root(&self.root_path, &self.root)?;
+        self.state_binding
+            .revalidate()
+            .map_err(|error| SetupError::Filesystem(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_regular_files_are_read_only_for_test(&self) -> Result<bool, SetupError> {
+        self.state_binding
+            .retained_regular_files_are_read_only_for_test()
+            .map_err(|error| SetupError::Filesystem(error.to_string()))
+    }
+}
+
+#[allow(dead_code)]
+pub(super) fn authorize_runtime_config(
+    root_path: &Path,
+) -> Result<Option<(ConfigV1, RuntimeConfigBinding)>, SetupError> {
+    let state_binding = crate::distribution::verify_setup_state_root(root_path)
+        .map_err(|error| SetupError::Filesystem(error.to_string()))?;
+    let root = match reopen_root(root_path) {
+        Ok(root) => root,
+        Err(SetupError::Missing) => {
+            state_binding
+                .revalidate()
+                .map_err(|error| SetupError::Filesystem(error.to_string()))?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let observed =
+        match read_optional_snapshot_with_hook(&root, CONFIG_NAME, MAX_CONFIG_BYTES, || {})? {
+            Some(observed) => observed,
+            None => {
+                verify_root(root_path, &root)?;
+                state_binding
+                    .revalidate()
+                    .map_err(|error| SetupError::Filesystem(error.to_string()))?;
+                return Ok(None);
+            }
+        };
+    let config = ConfigV1::parse(&observed.0)?;
+    let cache = open_existing_directory(&root, "cache")?;
+    let sessions = open_existing_directory(&cache, "sessions")?;
+    let binding = RuntimeConfigBinding {
+        root_path: root_path.to_owned(),
+        root,
+        config_bytes: observed.0,
+        config_identity: observed.1,
+        directories: SessionDirectories { cache, sessions },
+        state_binding,
+    };
+    binding.revalidate()?;
+    Ok(Some((config, binding)))
 }
 
 pub(super) fn observe_existing_config(root_path: &Path) -> Result<ExistingConfig, SetupError> {
@@ -429,7 +512,7 @@ fn read_optional_snapshot_with_hook(
     cap: usize,
     hook: impl FnOnce(),
 ) -> Result<Option<(Vec<u8>, Identity)>, SetupError> {
-    match open_private_file(root, name, true) {
+    match open_private_file(root, name, false) {
         Ok(mut file) => {
             let before = private_identity(&file, root)?;
             let bytes = read_open_file(&mut file, cap)?;

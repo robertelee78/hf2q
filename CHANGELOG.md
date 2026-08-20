@@ -12,8 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `hf2q setup`, a no-download Apple-Silicon inventory and bounded
   session-cache policy producer with deterministic TOML, explicit
   non-interactive flags, descriptor-relative crash recovery, and a custom
-  absolute state-root option. The recorded policy remains inert until the
-  separately gated runtime persistence bridge lands.
+  absolute state-root option. Add a dormant read-only authorization that maps
+  absent/zero to no persistor and positive bytes to a retained descriptor-bound
+  nonzero proof; serving remains unchanged until the separately gated managed
+  persistence store lands.
 - Accept canonical Hugging Face model IDs and official model/tree/blob/resolve
   URLs at `hf2q convert`, resolving mutable names to an exact commit before
   transfer and recording the normalized identity in conversion receipt v3.
