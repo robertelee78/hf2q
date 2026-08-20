@@ -1,15 +1,14 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rustix::fs::{self, AtFlags};
 
 use self::unix::{
-    acquire_lock, create_private_file, ensure_directory, entry_identity, full_sync, full_sync_lock,
-    io_error, open_existing_directory, open_or_create_root, open_private_file, private_identity,
-    reopen_root, sync_directory, verify_directory, verify_lock, verify_named, verify_root,
-    Directory, Identity,
+    acquire_lock, create_private_file, entry_identity, full_sync, full_sync_lock, io_error,
+    open_or_create_root, open_private_file, private_identity, reopen_root, sync_directory,
+    verify_lock, verify_named, verify_root, Directory, Identity,
 };
 use super::schema::{ConfigV1, MAX_CONFIG_BYTES};
 use super::SetupError;
@@ -30,7 +29,6 @@ pub(super) enum SetupBarrier {
     ConfigRenamed,
     RootSynced,
     ConfigFullSynced,
-    SessionDirectoriesSynced,
     EndpointFullSynced,
 }
 
@@ -46,7 +44,6 @@ impl SetupBarrier {
             Self::ConfigRenamed => "config-renamed",
             Self::RootSynced => "root-synced",
             Self::ConfigFullSynced => "config-full-synced",
-            Self::SessionDirectoriesSynced => "session-directories-synced",
             Self::EndpointFullSynced => "endpoint-full-synced",
         }
     }
@@ -67,97 +64,6 @@ impl ExistingConfig {
     fn matches(&self, other: &Self) -> bool {
         self.config == other.config && self.bytes == other.bytes && self.identity == other.identity
     }
-}
-
-struct SessionDirectories {
-    cache: Directory,
-    sessions: Directory,
-}
-
-#[allow(dead_code)]
-pub(super) struct RuntimeConfigBinding {
-    root_path: PathBuf,
-    root: Directory,
-    config_bytes: Vec<u8>,
-    config_identity: Identity,
-    directories: SessionDirectories,
-    state_binding: crate::distribution::SetupStateRootBinding,
-}
-
-#[allow(dead_code)]
-impl RuntimeConfigBinding {
-    pub(super) fn revalidate(&self) -> Result<(), SetupError> {
-        self.state_binding
-            .revalidate()
-            .map_err(|error| SetupError::Filesystem(error.to_string()))?;
-        verify_root(&self.root_path, &self.root)?;
-        let observed =
-            read_optional_snapshot_with_hook(&self.root, CONFIG_NAME, MAX_CONFIG_BYTES, || {})?
-                .ok_or(SetupError::Missing)?;
-        if observed.0 != self.config_bytes || observed.1 != self.config_identity {
-            return Err(SetupError::Filesystem(
-                "runtime config.toml changed after authorization".to_owned(),
-            ));
-        }
-        verify_session_directories(&self.root, &self.directories)?;
-        verify_root(&self.root_path, &self.root)?;
-        self.state_binding
-            .revalidate()
-            .map_err(|error| SetupError::Filesystem(error.to_string()))
-    }
-
-    pub(in crate::setup) fn session_directory_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.directories.sessions.fd.as_fd()
-    }
-
-    #[cfg(test)]
-    pub(super) fn retained_regular_files_are_read_only_for_test(&self) -> Result<bool, SetupError> {
-        self.state_binding
-            .retained_regular_files_are_read_only_for_test()
-            .map_err(|error| SetupError::Filesystem(error.to_string()))
-    }
-}
-
-#[allow(dead_code)]
-pub(super) fn authorize_runtime_config(
-    root_path: &Path,
-) -> Result<Option<(ConfigV1, RuntimeConfigBinding)>, SetupError> {
-    let state_binding = crate::distribution::verify_setup_state_root(root_path)
-        .map_err(|error| SetupError::Filesystem(error.to_string()))?;
-    let root = match reopen_root(root_path) {
-        Ok(root) => root,
-        Err(SetupError::Missing) => {
-            state_binding
-                .revalidate()
-                .map_err(|error| SetupError::Filesystem(error.to_string()))?;
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let observed =
-        match read_optional_snapshot_with_hook(&root, CONFIG_NAME, MAX_CONFIG_BYTES, || {})? {
-            Some(observed) => observed,
-            None => {
-                verify_root(root_path, &root)?;
-                state_binding
-                    .revalidate()
-                    .map_err(|error| SetupError::Filesystem(error.to_string()))?;
-                return Ok(None);
-            }
-        };
-    let config = ConfigV1::parse(&observed.0)?;
-    let cache = open_existing_directory(&root, "cache")?;
-    let sessions = open_existing_directory(&cache, "sessions")?;
-    let binding = RuntimeConfigBinding {
-        root_path: root_path.to_owned(),
-        root,
-        config_bytes: observed.0,
-        config_identity: observed.1,
-        directories: SessionDirectories { cache, sessions },
-        state_binding,
-    };
-    binding.revalidate()?;
-    Ok(Some((config, binding)))
 }
 
 pub(super) fn observe_existing_config(root_path: &Path) -> Result<ExistingConfig, SetupError> {
@@ -268,11 +174,8 @@ fn persist_with_hook(
     if let Some(bytes) = live_observed.bytes.as_deref() {
         if bytes == expected {
             remove_partial_if_private(&root)?;
-            let directories = ensure_session_directories(&root)?;
-            hook(SetupBarrier::SessionDirectoriesSynced)?;
             verify_root(root_path, &root)?;
             verify_committed_config(&root, config, expected, live_observed.identity)?;
-            verify_session_directories(&root, &directories)?;
             verify_lock(&root, LOCK_NAME, &lock)?;
             full_sync_lock(&lock)?;
             hook(SetupBarrier::EndpointFullSynced)?;
@@ -281,7 +184,6 @@ fn persist_with_hook(
                 .revalidate()
                 .map_err(|error| SetupError::Filesystem(error.to_string()))?;
             verify_committed_config(&root, config, expected, live_observed.identity)?;
-            verify_session_directories(&root, &directories)?;
             verify_lock(&root, LOCK_NAME, &lock)?;
             return Ok(false);
         }
@@ -326,15 +228,12 @@ fn persist_with_hook(
         verify_root(root_path, &root)?;
         verify_committed_config(&root, config, expected, Some(partial_identity))?;
         hook(SetupBarrier::ConfigFullSynced)?;
-        let directories = ensure_session_directories(&root)?;
-        hook(SetupBarrier::SessionDirectoriesSynced)?;
         sync_directory(&root)?;
         verify_root(root_path, &root)?;
         state_binding
             .revalidate()
             .map_err(|error| SetupError::Filesystem(error.to_string()))?;
         verify_committed_config(&root, config, expected, Some(partial_identity))?;
-        verify_session_directories(&root, &directories)?;
         verify_lock(&root, LOCK_NAME, &lock)?;
         full_sync_lock(&lock)?;
         hook(SetupBarrier::EndpointFullSynced)?;
@@ -343,7 +242,6 @@ fn persist_with_hook(
             .revalidate()
             .map_err(|error| SetupError::Filesystem(error.to_string()))?;
         verify_committed_config(&root, config, expected, Some(partial_identity))?;
-        verify_session_directories(&root, &directories)?;
         verify_lock(&root, LOCK_NAME, &lock)
     })();
     committed.map_err(|error| SetupError::DurabilityUnknown(error.to_string()))?;
@@ -383,25 +281,6 @@ fn abort_at_test_barrier(barrier: SetupBarrier) {
 
 #[cfg(not(test))]
 fn abort_at_test_barrier(_barrier: SetupBarrier) {}
-
-fn ensure_session_directories(root: &Directory) -> Result<SessionDirectories, SetupError> {
-    let cache = ensure_directory(root, "cache")?;
-    let sessions = ensure_directory(&cache, "sessions")?;
-    sync_directory(&sessions)?;
-    sync_directory(&cache)?;
-    sync_directory(root)?;
-    let directories = SessionDirectories { cache, sessions };
-    verify_session_directories(root, &directories)?;
-    Ok(directories)
-}
-
-fn verify_session_directories(
-    root: &Directory,
-    directories: &SessionDirectories,
-) -> Result<(), SetupError> {
-    verify_directory(&directories.cache, "sessions", &directories.sessions)?;
-    verify_directory(root, "cache", &directories.cache)
-}
 
 fn verify_committed_config(
     root: &Directory,

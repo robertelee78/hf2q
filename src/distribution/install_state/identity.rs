@@ -335,21 +335,6 @@ impl DurableInstallationIdentity {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(in crate::distribution) fn retained_regular_files_are_read_only_for_test(
-        &self,
-    ) -> Result<bool, InstallStateError> {
-        for file in [&self.lock_file, &self.file] {
-            let flags = rustix::fs::fcntl_getfl(file).map_err(|error| {
-                InstallStateError::io("inspect retained installation-identity descriptor", error)
-            })?;
-            if flags.intersects(rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::RDWR) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     pub(super) fn authorization(&self) -> &ExplicitRootAuthorization {
         &self.authorization
     }

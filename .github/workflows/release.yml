@@ -979,7 +979,7 @@ jobs:
             unexpected_setup_authority="$(
               grep -nE \
                 'hf_hub|reqwest|hyper|tokio::net|std::net|std::process|Command::new|crate::(models|convert|quantize|serve)|calibration|bootstrap_installation_identity|update_auth|update_transport|remove_dir|remove_file' \
-                src/setup/mod.rs src/setup/schema.rs src/setup/host.rs src/setup/policy.rs src/setup/runtime_policy.rs || true
+                src/setup/mod.rs src/setup/schema.rs src/setup/host.rs src/setup/policy.rs || true
             )"
             test -z "$unexpected_setup_authority"
             unexpected_setup_file_authority="$(
@@ -991,7 +991,7 @@ jobs:
             setup_file_modules=(src/setup/fs.rs src/setup/fs/unix.rs)
             test "$(grep -Fhc 'fs::renameat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
             test "$(grep -Fhc 'fs::unlinkat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 2
-            test "$(grep -Fhc 'fs::mkdirat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 2
+            test "$(grep -Fhc 'fs::mkdirat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
             test "$(grep -Fhc 'OFlags::CREATE' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
             test "$(grep -Fhc 'fs::fchmod(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
             test "$(grep -Fhc 'fs::chmodat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
@@ -1004,58 +1004,6 @@ jobs:
             setup_golden=src/setup/testdata/config_v1.toml
             test "$(shasum -a 256 "$setup_golden" | awk '{print $1}')" = \
               7f225b8cd184bf070c981116f8a1926d6830c081f6a6c2f52694ad6f6e40ff16
-            managed_cache_logic=(
-              src/setup/managed_session_cache.rs
-              src/setup/managed_session_cache/catalog.rs
-              src/setup/managed_session_cache/transaction.rs
-              src/setup/managed_session_cache/transaction/catalog_state.rs
-              src/setup/managed_session_cache/transaction/commit.rs
-              src/setup/managed_session_cache/transaction/inventory.rs
-              src/setup/managed_session_cache/transaction/io.rs
-              src/setup/managed_session_cache/transaction/maintenance.rs
-              src/setup/managed_session_cache/transaction/quota.rs
-            )
-            unexpected_managed_cache_authority="$(
-              grep -nE \
-                'std::fs|PathBuf|std::env|hf_hub|reqwest|hyper|tokio::net|std::net|std::process|Command::new|clap::|crate::(models|convert|quantize|serve)|calibration|Qwen35DiskPersistor|DiskBlockStore|HF2Q_KV_PERSIST' \
-                "${managed_cache_logic[@]}" || true
-            )"
-            test -z "$unexpected_managed_cache_authority"
-            managed_cache_unix=(
-              src/setup/managed_session_cache/unix.rs
-              src/setup/managed_session_cache/unix/private.rs
-            )
-            unexpected_managed_cache_file_authority="$(
-              grep -nE \
-                'std::fs::(write|copy|create_dir|remove_dir|remove_file|rename|hard_link|set_permissions)|File::create|OpenOptions|hf_hub|reqwest|hyper|tokio::net|std::net|std::process|Command::new|clap::|crate::(models|convert|quantize|serve)|calibration' \
-                "${managed_cache_unix[@]}" || true
-            )"
-            test -z "$unexpected_managed_cache_file_authority"
-            test "$(grep -Fhc 'fs::mkdirat(' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 1
-            test "$(grep -Fhc 'fs::chmodat(' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 3
-            test "$(grep -Fhc 'fs::flock(' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 1
-            test "$(grep -Fhc 'fs::openat(' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 3
-            test "$(grep -Fhc 'fs::fchmod(' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 1
-            test "$(grep -Fhc 'fs::renameat_with(' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 1
-            test "$(grep -Fhc 'fs::unlinkat(' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 1
-            test "$(grep -Fhc 'fs::fsync(' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 2
-            test "$(grep -Fhc 'fs::fcntl_fullfsync(' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 1
-            test "$(grep -Fhc 'fs::fstatvfs(' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 1
-            test "$(grep -Fhc 'OFlags::CREATE' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 1
-            test "$(grep -Fhc 'OFlags::EXCL' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 1
-            test "$(grep -Fhc 'OFlags::NOFOLLOW' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 3
-            test "$(grep -Fhc 'OFlags::NONBLOCK' "${managed_cache_unix[@]}" | awk '{ total += $1 } END { print total }')" = 2
-            test "$(grep -Fhc 'ManagedSessionCache::open(' src/setup/runtime_policy.rs)" = 1
-            unexpected_managed_cache_consumer="$(
-              grep -RnE 'managed_session_cache|into_managed_store' \
-                src/serve src/models src/cli.rs src/main.rs || true
-            )"
-            test -z "$unexpected_managed_cache_consumer"
-            test "$(grep -Fhc 'b"HF2QMSC1"' src/setup/managed_session_cache.rs)" = 1
-            test "$(grep -Fhc 'hf2q.managed-session-cache.catalog' src/setup/managed_session_cache/catalog.rs)" = 1
-            managed_cache_golden=src/setup/testdata/managed_session_catalog_v1.json
-            test "$(shasum -a 256 "$managed_cache_golden" | awk '{print $1}')" = \
-              629d13bb3f66e8535f77b58e55c8d7e4a5e37d8c39736c01bde7df6fe37e9e44
             recipe=data/model-recipes/qwen38-27b-official-v1.json
             test "$(shasum -a 256 "$recipe" | awk '{print $1}')" = \
               e3b60772d2abf33f14e215ba949bca22d16c0f1d8f985cd172b83b422e205126
@@ -1187,28 +1135,10 @@ jobs:
               src/setup/schema.rs \
               src/setup/host.rs \
               src/setup/policy.rs \
-              src/setup/runtime_policy.rs \
               src/setup/fs.rs \
               src/setup/fs/unix.rs \
               src/setup/tests.rs \
               src/setup/testdata/config_v1.toml \
-              src/setup/managed_session_cache.rs \
-              src/setup/managed_session_cache/catalog.rs \
-              src/setup/managed_session_cache/transaction.rs \
-              src/setup/managed_session_cache/transaction/catalog_state.rs \
-              src/setup/managed_session_cache/transaction/commit.rs \
-              src/setup/managed_session_cache/transaction/inventory.rs \
-              src/setup/managed_session_cache/transaction/io.rs \
-              src/setup/managed_session_cache/transaction/maintenance.rs \
-              src/setup/managed_session_cache/transaction/quota.rs \
-              src/setup/managed_session_cache/unix.rs \
-              src/setup/managed_session_cache/unix/private.rs \
-              src/setup/managed_session_cache/tests.rs \
-              src/setup/managed_session_cache/tests/basic.rs \
-              src/setup/managed_session_cache/tests/hostile.rs \
-              src/setup/managed_session_cache/tests/storage.rs \
-              src/setup/managed_session_cache/tests/crash.rs \
-              src/setup/testdata/managed_session_catalog_v1.json \
               src/distribution/mod.rs \
               src/distribution/install_state/identity.rs \
               Cargo.toml \
@@ -1236,26 +1166,10 @@ jobs:
               setup::tests::lock_contention_is_busy_and_mints_no_config \
               setup::tests::exact_read_rejects_leaf_replacement_after_reading_the_open_inode \
               setup::tests::partial_leaf_replacement_before_rename_is_rejected_without_publication \
-              setup::tests::config_lock_partial_and_session_leaf_replacements_never_return_success \
+              setup::tests::config_lock_and_partial_leaf_replacements_never_return_success \
               setup::tests::stale_prompt_snapshot_and_partial_prefix_replacement_fail_closed \
               setup::tests::installation_identity_appearance_or_replacement_during_setup_is_rejected \
               setup::tests::sigabrt_at_every_publication_barrier_recovers_in_a_fresh_process \
-              setup::tests::runtime_session_policy_is_closed_zero_safe_and_read_only \
-              setup::tests::runtime_session_policy_fails_closed_on_hostile_or_changed_state \
-              setup::tests::runtime_session_policy_retains_no_writable_regular_file_descriptors \
-              setup::managed_session_cache::tests::managed_session_catalog_v1_golden_is_canonical_and_pinned \
-              setup::managed_session_cache::tests::managed_session_policy_absent_or_disabled_creates_no_managed_state \
-              setup::managed_session_cache::tests::managed_session_store_tiny_positive_limit_creates_no_managed_state \
-              setup::managed_session_cache::tests::managed_session_store_existing_layout_tiny_limit_is_read_only \
-              setup::managed_session_cache::tests::managed_session_store_enforces_one_aggregate_cap_across_logical_namespaces \
-              setup::managed_session_cache::tests::managed_session_store_evicts_before_crossing_the_free_space_floor \
-              setup::managed_session_cache::tests::managed_session_store_preserves_hostile_reserved_mode_and_link_residue \
-              setup::managed_session_cache::tests::managed_session_store_rejects_object_and_shard_swaps_before_catalog_commit \
-              setup::managed_session_cache::tests::managed_session_store_possible_commit_poison_requires_reopen \
-              setup::managed_session_cache::tests::managed_session_store_storage_full_equivalence_classes_recover_exactly \
-              setup::managed_session_cache::tests::managed_session_store_sigabrt_at_every_commit_barrier_recovers \
-              setup::managed_session_cache::tests::managed_session_store_sigabrt_at_destructive_barriers_recovers \
-              setup::managed_session_cache::tests::managed_session_store_real_apfs_enospc_cleans_and_retries \
               input::hf_reference_tests::equivalent_model_references_share_one_canonical_identity \
               input::hf_download_plan_tests::file_specific_resolution_fails_before_any_hub_lookup \
               input::hf_download_plan_tests::repository_info_seals_a_mutable_request_to_the_returned_exact_commit \

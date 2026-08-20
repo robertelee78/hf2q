@@ -143,40 +143,6 @@ fn checked_directory(directory: Directory, require_private: bool) -> Result<Dire
     Ok(directory)
 }
 
-pub(super) fn ensure_directory(parent: &Directory, name: &str) -> Result<Directory, SetupError> {
-    let directory = match open_directory(parent, name, true) {
-        Ok(directory) => directory,
-        Err(SetupError::Missing) => {
-            match fs::mkdirat(parent.fd.as_fd(), name, Mode::from_raw_mode(0o700)) {
-                Ok(()) => finish_created_directory(parent, name),
-                Err(rustix::io::Errno::EXIST) => open_directory(parent, name, true),
-                Err(error) => Err(io_error("create private directory", error)),
-            }?
-        }
-        Err(error) => return Err(error),
-    };
-    if directory.stat.st_dev != parent.stat.st_dev {
-        return Err(SetupError::Filesystem(
-            "setup directory crosses the state-root filesystem".to_owned(),
-        ));
-    }
-    Ok(directory)
-}
-
-#[allow(dead_code)]
-pub(super) fn open_existing_directory(
-    parent: &Directory,
-    name: &str,
-) -> Result<Directory, SetupError> {
-    let directory = open_directory(parent, name, true)?;
-    if directory.stat.st_dev != parent.stat.st_dev {
-        return Err(SetupError::Filesystem(
-            "setup directory crosses the state-root filesystem".to_owned(),
-        ));
-    }
-    Ok(directory)
-}
-
 fn finish_created_directory(parent: &Directory, name: &str) -> Result<Directory, SetupError> {
     let created = fs::statat(parent.fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| io_error("inspect newly created setup directory", error))?;
@@ -213,7 +179,7 @@ fn finish_created_directory(parent: &Directory, name: &str) -> Result<Directory,
     Ok(directory)
 }
 
-pub(super) fn verify_directory(
+fn verify_directory(
     parent: &Directory,
     name: &str,
     expected: &Directory,

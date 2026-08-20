@@ -12,7 +12,6 @@ use super::host::{
     nearest_existing_directory, require_supported_macos, HostObservation, HostProbe,
 };
 use super::policy::{parse_byte_size, recommended_limit};
-use super::runtime_policy::{authorize_session_cache_policy, SessionCachePolicyAuthorization};
 use super::schema::{
     ConfigV1, ConfiguredShell, HardwareProfileV1, SessionCachePolicyV1, MAX_CONFIG_BYTES,
 };
@@ -269,10 +268,7 @@ fn fresh_and_repeated_noninteractive_setup_are_idempotent() {
     assert_eq!(metadata.mode() & 0o777, 0o600);
     assert_eq!(metadata.nlink(), 1);
     assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
-    assert_eq!(
-        fs::metadata(root.join("cache/sessions")).unwrap().mode() & 0o777,
-        0o700
-    );
+    assert!(!root.join("cache").exists());
     assert!(!root.join(".config.toml.partial").exists());
     assert!(!root.join("update").exists());
 
@@ -570,7 +566,7 @@ fn installation_identity_appearance_or_replacement_during_setup_is_rejected() {
     execute_fake(args(&root, Some(SessionCacheChoice::Off), None), false, "").unwrap();
     let (config, bytes) = fixture_config(0);
     let error = setup_fs::persist_with_test_hook(&root, &config, &bytes, |barrier| {
-        if barrier == setup_fs::SetupBarrier::SessionDirectoriesSynced {
+        if barrier == setup_fs::SetupBarrier::EndpointFullSynced {
             fs::rename(root.join("update"), &retained).unwrap();
             fs::rename(alternate.join("update"), root.join("update")).unwrap();
         }
@@ -696,7 +692,7 @@ fn partial_leaf_replacement_before_rename_is_rejected_without_publication() {
 }
 
 #[test]
-fn config_lock_partial_and_session_leaf_replacements_never_return_success() {
+fn config_lock_and_partial_leaf_replacements_never_return_success() {
     use setup_fs::SetupBarrier::*;
 
     for barrier in [PartialSynced, BeforeRename] {
@@ -745,34 +741,12 @@ fn config_lock_partial_and_session_leaf_replacements_never_return_success() {
     }
 
     let temp = TempDir::new().unwrap();
-    let root = test_root(&temp, "session-directory");
-    let detached = test_root(&temp, "detached-cache");
-    let (config, bytes) = fixture_config(0);
-    let error = setup_fs::persist_with_test_hook(&root, &config, &bytes, |barrier| {
-        if barrier == SessionDirectoriesSynced {
-            fs::rename(root.join("cache"), &detached).unwrap();
-            fs::create_dir(root.join("cache")).unwrap();
-            fs::set_permissions(root.join("cache"), fs::Permissions::from_mode(0o700)).unwrap();
-            fs::create_dir(root.join("cache/sessions")).unwrap();
-            fs::set_permissions(
-                root.join("cache/sessions"),
-                fs::Permissions::from_mode(0o700),
-            )
-            .unwrap();
-        }
-        Ok(())
-    })
-    .unwrap_err();
-    assert!(matches!(error, SetupError::DurabilityUnknown(_)));
-    assert!(detached.join("sessions").is_dir());
-
-    let temp = TempDir::new().unwrap();
     let root = test_root(&temp, "idempotent-config");
     execute_fake(args(&root, Some(SessionCacheChoice::Off), None), false, "").unwrap();
     let (config, bytes) = fixture_config(0);
     let retained = test_root(&temp, "idempotent-retained");
     let error = setup_fs::persist_with_test_hook(&root, &config, &bytes, |barrier| {
-        if barrier == SessionDirectoriesSynced {
+        if barrier == EndpointFullSynced {
             fs::rename(root.join("config.toml"), &retained).unwrap();
             fs::write(root.join("config.toml"), &bytes).unwrap();
             fs::set_permissions(root.join("config.toml"), fs::Permissions::from_mode(0o600))
@@ -890,7 +864,6 @@ fn precommit_faults_are_retryable_and_postcommit_faults_are_typed_unknown() {
         ConfigRenamed,
         RootSynced,
         ConfigFullSynced,
-        SessionDirectoriesSynced,
         EndpointFullSynced,
     ] {
         let temp = TempDir::new().unwrap();
@@ -906,11 +879,7 @@ fn precommit_faults_are_retryable_and_postcommit_faults_are_typed_unknown() {
         .unwrap_err();
         if matches!(
             barrier,
-            ConfigRenamed
-                | RootSynced
-                | ConfigFullSynced
-                | SessionDirectoriesSynced
-                | EndpointFullSynced
+            ConfigRenamed | RootSynced | ConfigFullSynced | EndpointFullSynced
         ) {
             assert!(matches!(error, SetupError::DurabilityUnknown(_)));
         } else {
@@ -946,7 +915,6 @@ fn sigabrt_at_every_publication_barrier_recovers_in_a_fresh_process() {
         ConfigRenamed,
         RootSynced,
         ConfigFullSynced,
-        SessionDirectoriesSynced,
         EndpointFullSynced,
     ] {
         let temp = TempDir::new().unwrap();
@@ -976,7 +944,7 @@ fn sigabrt_at_every_publication_barrier_recovers_in_a_fresh_process() {
 }
 
 #[test]
-fn hostile_root_config_lock_partial_and_cache_nodes_fail_closed() {
+fn hostile_root_config_lock_and_partial_nodes_fail_closed() {
     let temp = TempDir::new().unwrap();
     let parent = temp.path().canonicalize().unwrap();
 
@@ -1087,23 +1055,6 @@ fn hostile_root_config_lock_partial_and_cache_nodes_fail_closed() {
         ""
     )
     .is_err());
-
-    let cache_root = parent.join("cache-symlink");
-    execute_fake(
-        args(&cache_root, Some(SessionCacheChoice::Off), None),
-        false,
-        "",
-    )
-    .unwrap();
-    fs::remove_dir(cache_root.join("cache/sessions")).unwrap();
-    fs::remove_dir(cache_root.join("cache")).unwrap();
-    std::os::unix::fs::symlink(&real, cache_root.join("cache")).unwrap();
-    assert!(execute_fake(
-        args(&cache_root, Some(SessionCacheChoice::Off), None),
-        false,
-        ""
-    )
-    .is_err());
 }
 
 #[test]
@@ -1169,134 +1120,4 @@ fn restrictive_umask_cannot_change_owned_file_or_directory_modes() {
     for name in ["config.toml", ".config.toml.lock"] {
         assert_eq!(fs::metadata(root.join(name)).unwrap().mode() & 0o777, 0o600);
     }
-}
-
-#[test]
-fn runtime_session_policy_is_closed_zero_safe_and_read_only() {
-    let temp = TempDir::new().unwrap();
-
-    let absent = test_root(&temp, "absent-runtime-policy");
-    assert!(matches!(
-        authorize_session_cache_policy(&absent).unwrap(),
-        SessionCachePolicyAuthorization::Absent
-    ));
-    assert!(!absent.exists());
-
-    let disabled_root = test_root(&temp, "disabled-runtime-policy");
-    execute_fake(
-        args(&disabled_root, Some(SessionCacheChoice::Off), None),
-        false,
-        "",
-    )
-    .unwrap();
-    let disabled = authorize_session_cache_policy(&disabled_root).unwrap();
-    let SessionCachePolicyAuthorization::Disabled(disabled) = disabled else {
-        panic!("zero must authorize no persistor");
-    };
-    disabled.revalidate().unwrap();
-
-    let enabled_root = test_root(&temp, "enabled-runtime-policy");
-    execute_fake(
-        args(&enabled_root, Some(SessionCacheChoice::On), Some("32GiB")),
-        false,
-        "",
-    )
-    .unwrap();
-    let enabled = authorize_session_cache_policy(&enabled_root).unwrap();
-    let SessionCachePolicyAuthorization::Enabled(enabled) = enabled else {
-        panic!("positive config must mint an enabled authorization");
-    };
-    assert_eq!(enabled.limit_bytes().get(), 32 * GIB);
-    enabled.revalidate().unwrap();
-    let debug = format!("{enabled:?}");
-    assert!(!debug.contains(enabled_root.to_str().unwrap()));
-    assert!(!debug.contains("config.toml"));
-    assert!(!debug.contains(&(32 * GIB).to_string()));
-}
-
-#[test]
-fn runtime_session_policy_fails_closed_on_hostile_or_changed_state() {
-    let temp = TempDir::new().unwrap();
-    let malformed = test_root(&temp, "malformed-runtime-policy");
-    fs::create_dir(&malformed).unwrap();
-    fs::set_permissions(&malformed, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(malformed.join("config.toml"), b"not = [toml\n").unwrap();
-    fs::set_permissions(
-        malformed.join("config.toml"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
-    assert!(authorize_session_cache_policy(&malformed).is_err());
-    assert!(!malformed.join("cache").exists());
-
-    let root = test_root(&temp, "changed-runtime-policy");
-    execute_fake(
-        args(&root, Some(SessionCacheChoice::On), Some("1GiB")),
-        false,
-        "",
-    )
-    .unwrap();
-    let authorization = authorize_session_cache_policy(&root).unwrap();
-    let SessionCachePolicyAuthorization::Enabled(authorization) = authorization else {
-        panic!("positive config must mint an enabled authorization");
-    };
-    let replacement = root.join("replacement.toml");
-    fs::copy(root.join("config.toml"), &replacement).unwrap();
-    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
-    fs::rename(&replacement, root.join("config.toml")).unwrap();
-    assert!(authorization.revalidate().is_err());
-
-    let root = test_root(&temp, "changed-runtime-session-directory");
-    execute_fake(
-        args(&root, Some(SessionCacheChoice::On), Some("1GiB")),
-        false,
-        "",
-    )
-    .unwrap();
-    let authorization = authorize_session_cache_policy(&root).unwrap();
-    let SessionCachePolicyAuthorization::Enabled(authorization) = authorization else {
-        panic!("positive config must mint an enabled authorization");
-    };
-    fs::rename(root.join("cache/sessions"), root.join("retained-sessions")).unwrap();
-    fs::create_dir(root.join("cache/sessions")).unwrap();
-    fs::set_permissions(
-        root.join("cache/sessions"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
-    assert!(authorization.revalidate().is_err());
-
-    let root = test_root(&temp, "changed-runtime-installation-identity");
-    crate::distribution::bootstrap_setup_test_identity(&root).unwrap();
-    execute_fake(args(&root, Some(SessionCacheChoice::Off), None), false, "").unwrap();
-    let authorization = authorize_session_cache_policy(&root).unwrap();
-    let SessionCachePolicyAuthorization::Disabled(authorization) = authorization else {
-        panic!("zero must mint only a disabled authorization");
-    };
-    let identity = root.join("update/installation-identity.json");
-    let replacement = root.join("update/replacement-identity.json");
-    fs::copy(&identity, &replacement).unwrap();
-    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
-    fs::rename(&replacement, &identity).unwrap();
-    assert!(authorization.revalidate().is_err());
-}
-
-#[test]
-fn runtime_session_policy_retains_no_writable_regular_file_descriptors() {
-    let temp = TempDir::new().unwrap();
-    let root = test_root(&temp, "read-only-runtime-policy");
-    crate::distribution::bootstrap_setup_test_identity(&root).unwrap();
-    execute_fake(
-        args(&root, Some(SessionCacheChoice::On), Some("1GiB")),
-        false,
-        "",
-    )
-    .unwrap();
-    let authorization = authorize_session_cache_policy(&root).unwrap();
-    let SessionCachePolicyAuthorization::Enabled(authorization) = authorization else {
-        panic!("positive config must mint an enabled authorization");
-    };
-    assert!(authorization
-        .retained_regular_files_are_read_only_for_test()
-        .unwrap());
 }
