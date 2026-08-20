@@ -39,29 +39,69 @@ printf '%s\n' \
   'test inference::models::deepseek4::real_artifact_decode_cohort_tests::official_artifact_b4_decode_body_is_exact_and_measured ... ok' \
   'DeepSeek-V4 B=4 decode spike: exact_state_logits_cache_recurrent=true' >"$test_log"
 printf '2000\tnominal\tdecode-cohort-measurement-start\n' >"$measurement"
-printf '2002\tnominal\tdecode-cohort-measurement-end\n' >>"$measurement"
+printf '2002\tfair\tdecode-cohort-measurement\n' >>"$measurement"
+printf '2004\tfair\tdecode-cohort-measurement-end\n' >>"$measurement"
 for timestamp in $(seq 1000 5 1060); do
   printf '%s\tnominal\tdecode-cohort-settle\n' "$timestamp" >>"$settle"
 done
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
-jq --arg source_sha "$source_sha" --arg model_sha256 "$model_sha" \
-  --arg raw_sha256 "$(sha256_file "$raw")" \
-  --arg test_log_sha256 "$(sha256_file "$test_log")" \
-  --arg measurement_log_sha256 "$(sha256_file "$measurement")" \
-  --arg settle_log_sha256 "$(sha256_file "$settle")" '
-  . + {source_sha:$source_sha,model_sha256:$model_sha256,
-    mlx_native_version:"0.10.12",raw_sha256:$raw_sha256,
-    test_log_sha256:$test_log_sha256,thermal_status:"nominal",
-    measurement_log_sha256:$measurement_log_sha256,
-    settle_log_sha256:$settle_log_sha256,settle_seconds:60,
-    settle_samples:13,settle_duration_seconds:60,
-    settle_sample_interval_seconds:5,maximum_settle_sample_gap_seconds:8,
-    settle_telemetry_gaps:0,measurement_samples:2,
-    measurement_duration_seconds:2,sample_interval_seconds:2,
-    maximum_sample_gap_seconds:5,non_nominal_measurement_samples:0,
-    telemetry_gaps:0}
-' "$raw" >"$summary"
+write_summary() {
+  local output=$1
+  local measurement_path=${2:-$measurement}
+  local settle_path=${3:-$settle}
+  local measurement_samples measurement_duration_seconds
+  local non_nominal_measurement_samples fair_measurement_samples
+  local over_limit_measurement_samples telemetry_gaps
+  IFS=$'\t' read -r measurement_samples measurement_duration_seconds \
+    non_nominal_measurement_samples fair_measurement_samples \
+    over_limit_measurement_samples telemetry_gaps <<<"$(awk -F '\t' '
+      BEGIN { non_nominal = 0; fair = 0; over = 0; gaps = 0 }
+      {
+        samples++
+        if ($2 != "nominal") non_nominal++
+        if ($2 == "fair") fair++
+        if ($2 == "serious" || $2 == "critical") over++
+        if (samples == 1) first = $1
+        if (samples > 1 && ($1 < previous || $1 - previous > 5)) gaps++
+        previous = $1
+        last = $1
+      }
+      END { print samples "\t" last-first "\t" non_nominal "\t" fair \
+        "\t" over "\t" gaps }
+    ' "$measurement_path")"
+  jq --arg source_sha "$source_sha" --arg model_sha256 "$model_sha" \
+    --arg raw_sha256 "$(sha256_file "$raw")" \
+    --arg test_log_sha256 "$(sha256_file "$test_log")" \
+    --arg measurement_log_sha256 "$(sha256_file "$measurement_path")" \
+    --arg settle_log_sha256 "$(sha256_file "$settle_path")" \
+    --argjson measurement_samples "$measurement_samples" \
+    --argjson measurement_duration_seconds "$measurement_duration_seconds" \
+    --argjson non_nominal_measurement_samples \
+      "$non_nominal_measurement_samples" \
+    --argjson fair_measurement_samples "$fair_measurement_samples" \
+    --argjson over_limit_measurement_samples \
+      "$over_limit_measurement_samples" \
+    --argjson telemetry_gaps "$telemetry_gaps" '
+    . + {source_sha:$source_sha,model_sha256:$model_sha256,
+      mlx_native_version:"0.10.12",raw_sha256:$raw_sha256,
+      test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
+      required_start_state:"nominal",maximum_measurement_state:"fair",
+      measurement_log_sha256:$measurement_log_sha256,
+      settle_log_sha256:$settle_log_sha256,settle_seconds:60,
+      settle_samples:13,settle_duration_seconds:60,
+      settle_sample_interval_seconds:5,maximum_settle_sample_gap_seconds:8,
+      settle_telemetry_gaps:0,measurement_samples:$measurement_samples,
+      measurement_duration_seconds:$measurement_duration_seconds,
+      sample_interval_seconds:2,maximum_sample_gap_seconds:5,
+      non_nominal_measurement_samples:$non_nominal_measurement_samples,
+      fair_measurement_samples:$fair_measurement_samples,
+      over_limit_measurement_samples:$over_limit_measurement_samples,
+      telemetry_gaps:$telemetry_gaps}
+  ' "$raw" >"$output"
+}
+
+write_summary "$summary"
 
 bash "$VERIFY" "$summary" "$raw" "$test_log" "$measurement" "$settle" \
   "$source_sha" "$model_sha"
@@ -69,7 +109,10 @@ bash "$VERIFY" "$summary" "$raw" "$test_log" "$measurement" "$settle" \
 expect_reject() {
   local label=$1
   local mutated=$2
-  if bash "$VERIFY" "$mutated" "$raw" "$test_log" "$measurement" "$settle" \
+  local measurement_path=${3:-$measurement}
+  local settle_path=${4:-$settle}
+  if bash "$VERIFY" "$mutated" "$raw" "$test_log" "$measurement_path" \
+      "$settle_path" \
       "$source_sha" "$model_sha" >/dev/null 2>&1; then
     echo "decode-cohort verifier accepted invalid case: $label" >&2
     exit 1
@@ -84,7 +127,58 @@ expect_reject bad-topology "$tmp_dir/bad-topology.json"
 jq '.raw_sha256 = ("0" * 64)' "$summary" >"$tmp_dir/bad-hash.json"
 expect_reject bad-hash "$tmp_dir/bad-hash.json"
 jq '.non_nominal_measurement_samples = 1' "$summary" \
-  >"$tmp_dir/bad-thermal.json"
-expect_reject bad-thermal "$tmp_dir/bad-thermal.json"
+  >"$tmp_dir/bad-non-nominal-count.json"
+expect_reject bad-non-nominal-count "$tmp_dir/bad-non-nominal-count.json"
+jq '.fair_measurement_samples = 1' "$summary" \
+  >"$tmp_dir/bad-fair-count.json"
+expect_reject bad-fair-count "$tmp_dir/bad-fair-count.json"
+jq '.over_limit_measurement_samples = 1' "$summary" \
+  >"$tmp_dir/bad-over-limit-count.json"
+expect_reject bad-over-limit-count "$tmp_dir/bad-over-limit-count.json"
+jq '.required_start_state = "fair"' "$summary" \
+  >"$tmp_dir/bad-required-start.json"
+expect_reject bad-required-start "$tmp_dir/bad-required-start.json"
+jq '.maximum_measurement_state = "nominal"' "$summary" \
+  >"$tmp_dir/bad-maximum-state.json"
+expect_reject bad-maximum-state "$tmp_dir/bad-maximum-state.json"
+
+printf '2000\tnominal\tdecode-cohort-measurement-start\n' \
+  >"$tmp_dir/gapped-measurement.log"
+printf '2010\tnominal\tdecode-cohort-measurement-end\n' \
+  >>"$tmp_dir/gapped-measurement.log"
+write_summary "$tmp_dir/gapped-summary.json" "$tmp_dir/gapped-measurement.log"
+expect_reject measurement-gap "$tmp_dir/gapped-summary.json" \
+  "$tmp_dir/gapped-measurement.log"
+
+for over_limit_state in serious critical; do
+  printf '2000\tnominal\tdecode-cohort-measurement-start\n' \
+    >"$tmp_dir/$over_limit_state-measurement.log"
+  printf '2002\t%s\tdecode-cohort-measurement\n' "$over_limit_state" \
+    >>"$tmp_dir/$over_limit_state-measurement.log"
+  printf '2004\tfair\tdecode-cohort-measurement-end\n' \
+    >>"$tmp_dir/$over_limit_state-measurement.log"
+  write_summary "$tmp_dir/$over_limit_state-summary.json" \
+    "$tmp_dir/$over_limit_state-measurement.log"
+  expect_reject "$over_limit_state-state" \
+    "$tmp_dir/$over_limit_state-summary.json" \
+    "$tmp_dir/$over_limit_state-measurement.log"
+done
+
+printf '2000\tfair\tdecode-cohort-measurement-start\n' \
+  >"$tmp_dir/fair-start-measurement.log"
+printf '2002\tfair\tdecode-cohort-measurement-end\n' \
+  >>"$tmp_dir/fair-start-measurement.log"
+write_summary "$tmp_dir/fair-start-summary.json" \
+  "$tmp_dir/fair-start-measurement.log"
+expect_reject non-nominal-start "$tmp_dir/fair-start-summary.json" \
+  "$tmp_dir/fair-start-measurement.log"
+
+cp "$settle" "$tmp_dir/non-nominal-settle.log"
+printf '1065\tfair\tdecode-cohort-settle\n' \
+  >>"$tmp_dir/non-nominal-settle.log"
+write_summary "$tmp_dir/non-nominal-settle-summary.json" "$measurement" \
+  "$tmp_dir/non-nominal-settle.log"
+expect_reject non-nominal-settle "$tmp_dir/non-nominal-settle-summary.json" \
+  "$measurement" "$tmp_dir/non-nominal-settle.log"
 
 echo "DeepSeek-V4 decode-cohort receipt contract: pass"

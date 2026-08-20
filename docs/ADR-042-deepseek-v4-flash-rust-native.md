@@ -1937,8 +1937,10 @@ or loss of exact parity remains fail-closed. The receipt records and the
 independent verifier recomputes Nominal/Fair/over-limit counts and checks the
 first and last phase labels. This changes neither the benchmark's positive
 speedup requirement nor any DeepSeek cold, cached, SSE, automatic-tool, or
-tool-result latency ceiling. Those product waves and the exact B=4 decode gate
-retain their separately calibrated Nominal-only contracts.
+tool-result latency ceiling. Those product waves retain their separately
+calibrated Nominal-only contracts. The exact B=4 decode gate remains exact and
+requires a positive median, but later evidence below moved its sustained
+measurement to the same Nominal-start, Fair-or-better contract.
 
 ### Four-agent cold handoff and exact warm B=4 decode (2026-08-19 candidate)
 
@@ -1982,6 +1984,27 @@ synchronization. The isolated alternating benchmark measured a serial median
 of 273.361 ms and B=4 median of 230.208 ms, or 1.1875x. A later noisier run was
 still positive at 1.0732x; the protected exact-artifact gate therefore requires
 a positive median rather than claiming the best sample as a universal gain.
+
+Protected run `32332231049` on exact source
+`5eb47c7851c448314f12826a414d599d98d409b7` then falsified the decode gate's
+remaining all-Nominal assumption. The 208.74-second exact-artifact test passed
+all 132 state/logit/cache/recurrent parity steps and preserved the 92-to-23
+command-buffer and four-to-one synchronization topology. Ten alternating pairs
+measured serial and cohort medians of `512.3692495` and `490.7976045` ms, or
+`1.0439522214497687x`. After a separate 60-second Nominal settle, its
+measurement recorded 54 Nominal samples before Fair. The old monitor stopped
+at that first Fair sample, leaving 63 seconds before the terminal Fair sample;
+it recorded no Serious or Critical sample but cannot be promoted into a
+continuous revised-contract receipt.
+
+The decode gate therefore now uses the same narrow sustained-load policy as
+cooperative prefill and Qwen3.8 long decode: its own uninterrupted 60-second
+Nominal settle, a Nominal first measurement, continuous two-second sampling
+through Nominal or Fair, and fail-closed rejection of Serious, Critical, a gap
+over five seconds, a test failure, parity drift, topology drift, or a
+non-positive median. Its receipt and independent verifier recompute all state
+counts and phase boundaries. This changes no agentic product-wave SLO or
+thermal calibration.
 
 Several plausible alternatives were measured and rejected, and none remains
 in the landing diff:
