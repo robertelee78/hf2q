@@ -58,7 +58,7 @@ The implementation disposition is therefore:
 | Existing block and Qwen persistence implementations | **Keep outside ADR-045** under ADR-017 and ADR-027 | Setup and onboarding do not create a second cache implementation. |
 | Stable Mac/Metal/memory/storage probes and reusable private atomic config-file mechanics | **Keep and simplify** for the corrected setup schema | These directly support system learning and safe config publication. |
 | Exact release revision/tag/checksum lineage and the existing Cargo source-package channel | **Keep** | They are useful release evidence and an advanced install channel, but are not proof of the standalone native channel. |
-| Session-cache-only setup policy, dormant runtime authorization, and the second generic managed-session store | **Remove** | They are unused, duplicate already-governed cache work, and are not part of this ADR's product requirement. |
+| Session-cache-only setup policy, dormant runtime authorization, and the second generic managed-session store | **Remove** | The runtime authorization and second store are removed in this slice. The temporary inert setup field remains only until the consumed convert/serve setup schema replaces it. |
 | No-options model recipes, prepared-model profiles/registry/publication, source-retention orchestration, and post-conversion calibration state | **Remove** | They have no production caller and replace guide steps with an unrequested orchestration system. Any useful exact model evidence moves to the relevant model/conversion ADR or guide proof. |
 | Custom TUF client/spike, transport sealed to it, TUF metadata journal, first-activation graph, and their structural CI sentinels | **Remove** | The current code cannot install, update, or uninstall hf2q and does not shorten the path to the first real channel. |
 | Release manifest/receipt and installation-identity concepts, archive/signature validation, and atomic publication mechanics | **Keep, then simplify behind the reachable standalone channel** | The first channel needs a signed/notarized native artifact, a small manifest and channel receipt, atomic replacement with one known-good fallback, and observable behavior tests. The artifact spike decides which existing validators remain necessary. |
@@ -503,8 +503,12 @@ What exists:
 - partial dormant distribution/update security infrastructure;
 - a `setup` command whose current schema primarily records an inert future
   session-cache policy; and
-- dormant model-preparation and managed-session components created under the
-  prior over-broad ADR wording.
+- dormant model-preparation components created under the prior over-broad ADR
+  wording.
+
+The unreachable second managed-session store and its runtime authorization
+have been removed. `hf2q setup` no longer creates or authorizes a separate
+`cache/sessions` hierarchy.
 
 What is not yet the corrected product:
 
@@ -516,8 +520,9 @@ What is not yet the corrected product:
 - public channel-aware `hf2q update` and `hf2q uninstall`; and
 - the clean-account installed-artifact acceptance proof.
 
-The dormant components listed above do not become ADR-045 requirements. Slice
-A must classify them before more onboarding code is added.
+The remaining dormant components listed above do not become ADR-045
+requirements. The scope audit has classified them for removal or retention
+under their actual governing decisions before more onboarding code is added.
 
 ## Consequences
 

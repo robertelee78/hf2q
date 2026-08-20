@@ -49,11 +49,12 @@ hf2q setup --state-root /Volumes/Private/hf2q --session-cache off
 ```
 
 Existing ancestors must already exist. Setup may create only the final state
-root and its private `cache/sessions` directories. It never creates
-installation identity, versions, activations, or `current`. If installation
-identity already exists, its exact descriptor-bound capability must remain the
-same across prompting and publication. Setup validates that identity namespace;
-this slice does not certify the full versions/activations/current layout.
+root and its private config transaction files. It never creates cache
+directories, installation identity, versions, activations, or `current`. If
+installation identity already exists, its exact descriptor-bound capability
+must remain the same across prompting and publication. Setup validates that
+identity namespace; this slice does not certify the full
+versions/activations/current layout.
 
 ## Managed state
 
@@ -63,8 +64,8 @@ Metal device and recommended working-set size, and `session_cache.limit_bytes`.
 Volatile free-space, shell, macOS, core, rlimit, and timestamp facts are never
 persisted.
 
-The state root and session directories are mode `0700`; `config.toml`, the
-persistent `.config.toml.lock`, and transaction `.config.toml.partial` are
+The state root is mode `0700`; `config.toml`, the persistent
+`.config.toml.lock`, and transaction `.config.toml.partial` are
 owned, single-link, same-device regular files at mode `0600`. Exact canonical
 reruns preserve config inode and mtime. Malformed or future config is retained
 unchanged. Precommit interruption leaves a resumable exact prefix; a returned
@@ -73,24 +74,8 @@ barriers.
 
 ## Current boundary
 
-The setup-owned read boundary can now reopen this policy without mutation. It
-returns an explicit absent decision when no config exists, a disabled proof for
-zero, or a descriptor-bound nonzero proof for a positive limit. The proof
-retains and can revalidate the exact state root, optional installation identity,
-config bytes/inode, and private `cache/sessions` directories; malformed or
-changed state is an error, never a fallback to unlimited.
-Every retained regular-file descriptor is read-only, including the optional
-installation-identity and lock inodes; this boundary acquires no lock and
-retains no write authority.
-
-The positive proof has one consuming transition into a setup-private dormant
-managed store; absent and disabled proofs cannot create it. The store uses the
-fixed `<state-root>/cache/sessions` descriptor authority, one aggregate hard
-cap, a pre-admission volume reserve, immutable checksummed object/catalog
-publication, bounded hostile inventories, and exact crash recovery. It remains
-inaccessible to serving, models, CLI dispatch, and the legacy zero-unlimited
-persistors. A family-specific Qwen/SerialFifo compatibility adapter, bounded
-restore, request pinning, access-LRU, and safe replay fallback must land before
-this recorded policy becomes active. Corrupt selected dormant-store evidence
-currently fails closed and is preserved; it is not yet converted to a cache
-miss or quarantine action.
+The stored session policy remains inert: serving does not read it and setup
+does not create a cache directory or a second persistence engine. Existing
+cache implementations remain governed by ADR-017 and ADR-027. The corrected
+ADR-045 setup slice will replace this provisional schema with the smallest
+conversion and serving defaults that have immediate production consumers.

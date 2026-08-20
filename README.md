@@ -98,14 +98,10 @@ hf2q setup --session-cache on --session-cache-limit 32GiB
 ```
 
 Use `--state-root /absolute/path` for a custom standalone state root. The
-config producer now has a typed authorization that keeps absence and zero out
-of every persistor and wraps a positive value as a retained nonzero proof. That
-proof can be consumed only into a setup-private dormant managed store, which
-proves one descriptor-relative aggregate hard cap, a volume free-space floor,
-immutable catalog/object recovery, and real APFS ENOSPC cleanup. Current
-serving does not consume the store: Qwen/SerialFifo compatibility, bounded
-restore, request pinning, access-LRU, and safe replay fallback remain gated.
-Zero is reserved to mean disabled rather than the legacy unlimited setting. See
+recorded session policy is currently inert and is not wired into serving.
+Zero is reserved to mean disabled rather than the legacy unlimited setting.
+ADR-045 will replace this provisional schema with conversion and serving
+defaults that have real production consumers. See
 [`docs/setup.md`](docs/setup.md) for the exact prompt, schema, filesystem, and
 failure contract.
 
