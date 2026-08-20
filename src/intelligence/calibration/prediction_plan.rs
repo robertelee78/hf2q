@@ -1,0 +1,341 @@
+//! Opaque, bounded prediction plans derived from the verified Calibration split.
+
+use sha2::{Digest, Sha256};
+
+use super::render::validate_rendered_dataset;
+use super::types::*;
+
+mod verify;
+
+use verify::prediction_plan_sha256;
+pub(super) use verify::validate_prediction_plan_limits;
+pub use verify::validate_teacher_prediction_plan;
+
+fn prefix_token_sha256(tokens: &[u32]) -> Result<String, CalibrationInputError> {
+    let count = u64::try_from(tokens.len()).map_err(|_| {
+        CalibrationInputError::InvalidDataset("prediction prefix token count overflow".into())
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"hf2q-teacher-prefix-token-ids-v1");
+    hasher.update(count.to_le_bytes());
+    for token in tokens {
+        hasher.update(token.to_le_bytes());
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Reverify the three-way split, then derive every teacher-forced and
+/// generation-next point from the opaque Calibration token stream.
+/// Policy-validation and acceptance-holdout token ids are never retained in
+/// the returned capability.
+pub(crate) fn build_teacher_prediction_plan(
+    expected_partition: &DatasetPartitionManifest,
+    calibration_corpus: &VerifiedCalibrationCorpus,
+    calibration: &RenderedDataset,
+    policy_validation: &RenderedDataset,
+    acceptance_holdout: &RenderedDataset,
+    limits: TeacherPredictionPlanLimits,
+) -> Result<VerifiedCalibrationPredictionPlan, CalibrationInputError> {
+    validate_prediction_plan_limits(limits)?;
+    let actual_partition = super::partition::verify_dataset_partition(
+        calibration,
+        policy_validation,
+        acceptance_holdout,
+    )?;
+    if &actual_partition != expected_partition {
+        return Err(CalibrationInputError::SplitMismatch);
+    }
+    let rendered_structured = serde_json::to_vec(&calibration.structured)
+        .map_err(|error| CalibrationInputError::Serialization(error.to_string()))?;
+    let corpus_structured = serde_json::to_vec(&calibration_corpus.manifest)
+        .map_err(|error| CalibrationInputError::Serialization(error.to_string()))?;
+    if rendered_structured != corpus_structured {
+        return Err(CalibrationInputError::InvalidDataset(
+            "rendered Calibration split differs from its owned corpus artifact".into(),
+        ));
+    }
+    validate_rendered_dataset(calibration)?;
+    if calibration.manifest.split != DatasetSplit::Calibration
+        || calibration.manifest.examples.len() > limits.max_examples
+    {
+        return Err(CalibrationInputError::InvalidDataset(
+            "teacher prediction plan admits only a bounded Calibration split".into(),
+        ));
+    }
+
+    let mut total_token_count = 0usize;
+    let mut total_rendered_utf8_bytes = 0u64;
+    let mut points = Vec::new();
+    let mut greedy_prompts = Vec::new();
+    let mut example_receipts = Vec::with_capacity(calibration.manifest.examples.len());
+    let mut retained = Vec::with_capacity(calibration.manifest.examples.len());
+    for (receipt, structured) in calibration
+        .manifest
+        .examples
+        .iter()
+        .zip(&calibration.structured.examples)
+    {
+        let tokens = calibration
+            .token_ids
+            .get(&receipt.stable_id)
+            .ok_or_else(|| {
+                CalibrationInputError::InvalidDataset(format!(
+                    "prediction plan is missing tokens for {}",
+                    receipt.stable_id
+                ))
+            })?;
+        if tokens.is_empty() || tokens.len() > limits.max_prefix_tokens {
+            return Err(CalibrationInputError::InvalidDataset(format!(
+                "prediction prefix for {} is empty or exceeds its bound",
+                receipt.stable_id
+            )));
+        }
+        total_token_count = total_token_count.checked_add(tokens.len()).ok_or_else(|| {
+            CalibrationInputError::InvalidDataset(
+                "teacher prediction total-token count overflow".into(),
+            )
+        })?;
+        if total_token_count > limits.max_total_tokens {
+            return Err(CalibrationInputError::InvalidDataset(
+                "teacher prediction total-token bound exceeded".into(),
+            ));
+        }
+        let rendered_len = calibration
+            .rendered_utf8
+            .get(&receipt.stable_id)
+            .ok_or_else(|| {
+                CalibrationInputError::InvalidDataset(format!(
+                    "prediction plan is missing rendered bytes for {}",
+                    receipt.stable_id
+                ))
+            })?
+            .len();
+        total_rendered_utf8_bytes = total_rendered_utf8_bytes
+            .checked_add(u64::try_from(rendered_len).map_err(|_| {
+                CalibrationInputError::InvalidDataset(
+                    "rendered Calibration byte count is not representable".into(),
+                )
+            })?)
+            .ok_or_else(|| {
+                CalibrationInputError::InvalidDataset(
+                    "rendered Calibration byte count overflow".into(),
+                )
+            })?;
+        if total_rendered_utf8_bytes > limits.max_rendered_utf8_bytes {
+            return Err(CalibrationInputError::InvalidDataset(
+                "rendered Calibration byte bound exceeded".into(),
+            ));
+        }
+
+        let mut point_ordinals = Vec::new();
+        let mut greedy_prompt_ordinal = None;
+        match structured.render_mode {
+            RenderMode::CompletedAssistantTranscript => {
+                for range in &receipt.scoring_ranges {
+                    for target_token_index in range.start..range.end {
+                        if target_token_index == 0 || target_token_index >= tokens.len() {
+                            return Err(CalibrationInputError::InvalidDataset(format!(
+                                "teacher-forced alignment is invalid for {}",
+                                receipt.stable_id
+                            )));
+                        }
+                        let point_ordinal = points.len();
+                        if point_ordinal >= limits.max_prediction_points {
+                            return Err(CalibrationInputError::InvalidDataset(
+                                "teacher prediction point bound exceeded".into(),
+                            ));
+                        }
+                        points.push(TeacherPredictionPointReceipt {
+                            point_ordinal,
+                            stable_id: receipt.stable_id.clone(),
+                            kind: TeacherPredictionPointKind::TeacherForced {
+                                target_token_index,
+                                target_token_id: tokens[target_token_index],
+                            },
+                            prefix_token_count: target_token_index,
+                            prefix_token_ids_sha256: prefix_token_sha256(
+                                &tokens[..target_token_index],
+                            )?,
+                        });
+                        point_ordinals.push(point_ordinal);
+                    }
+                }
+            }
+            RenderMode::GenerationPrompt => {
+                let point_ordinal = points.len();
+                if point_ordinal >= limits.max_prediction_points
+                    || greedy_prompts.len() >= limits.max_generation_prompts
+                {
+                    return Err(CalibrationInputError::InvalidDataset(
+                        "teacher prediction point or greedy-prompt bound exceeded".into(),
+                    ));
+                }
+                let prefix_token_ids_sha256 = prefix_token_sha256(tokens)?;
+                points.push(TeacherPredictionPointReceipt {
+                    point_ordinal,
+                    stable_id: receipt.stable_id.clone(),
+                    kind: TeacherPredictionPointKind::GenerationNext,
+                    prefix_token_count: tokens.len(),
+                    prefix_token_ids_sha256: prefix_token_ids_sha256.clone(),
+                });
+                point_ordinals.push(point_ordinal);
+                greedy_prompt_ordinal = Some(greedy_prompts.len());
+                greedy_prompts.push(TeacherGreedyPromptReceipt {
+                    stable_id: receipt.stable_id.clone(),
+                    prefix_token_count: tokens.len(),
+                    prefix_token_ids_sha256,
+                });
+            }
+        }
+        if points.len() > limits.max_prediction_points
+            || greedy_prompts.len() > limits.max_generation_prompts
+        {
+            return Err(CalibrationInputError::InvalidDataset(
+                "teacher prediction point or greedy-prompt bound exceeded".into(),
+            ));
+        }
+        example_receipts.push(TeacherPredictionExampleReceipt {
+            stable_id: receipt.stable_id.clone(),
+            render_mode: structured.render_mode,
+            token_count: tokens.len(),
+            token_ids_sha256: receipt.token_ids_sha256.clone(),
+        });
+        retained.push(TeacherPredictionExample {
+            token_ids: tokens.clone(),
+            point_ordinals,
+            greedy_prompt_ordinal,
+        });
+    }
+    if points.is_empty() || greedy_prompts.is_empty() {
+        return Err(CalibrationInputError::InvalidDataset(
+            "teacher prediction plan requires scored transcript points and a generation prompt"
+                .into(),
+        ));
+    }
+
+    let mut manifest = TeacherPredictionPlanManifest {
+        schema_version: TEACHER_PREDICTION_PLAN_SCHEMA_VERSION,
+        dataset_partition_manifest_sha256: actual_partition.manifest_sha256,
+        calibration_corpus_artifact_sha256: calibration_corpus.artifact.sha256.clone(),
+        calibration_manifest_sha256: calibration.manifest.manifest_sha256.clone(),
+        rendered_token_stream_sha256: calibration.manifest.token_id_stream_sha256.clone(),
+        limits,
+        total_example_count: retained.len(),
+        total_token_count,
+        total_rendered_utf8_bytes,
+        examples: example_receipts,
+        prediction_points: points,
+        greedy_prompts,
+        manifest_sha256: String::new(),
+    };
+    manifest.manifest_sha256 = prediction_plan_sha256(&manifest)?;
+    validate_teacher_prediction_plan(&manifest)?;
+    Ok(VerifiedCalibrationPredictionPlan {
+        manifest,
+        examples: retained,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn prefix_token_sha256_for_test(tokens: &[u32]) -> String {
+    prefix_token_sha256(tokens).expect("small token prefix is representable")
+}
+
+#[cfg(test)]
+pub(super) fn resign_prediction_plan_for_test(manifest: &mut TeacherPredictionPlanManifest) {
+    manifest.manifest_sha256 = prediction_plan_sha256(manifest).unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn prediction_plan_for_test() -> VerifiedCalibrationPredictionPlan {
+    let limits = TeacherPredictionPlanLimits {
+        max_examples: 2,
+        max_total_tokens: 16,
+        max_rendered_utf8_bytes: 1_024,
+        max_prediction_points: 3,
+        max_prefix_tokens: 8,
+        max_generation_prompts: 1,
+    };
+    let transcript_tokens = vec![0, 1, 2];
+    let prompt_tokens = vec![2, 3];
+    let points = vec![
+        TeacherPredictionPointReceipt {
+            point_ordinal: 0,
+            stable_id: "completed".into(),
+            kind: TeacherPredictionPointKind::TeacherForced {
+                target_token_index: 1,
+                target_token_id: 1,
+            },
+            prefix_token_count: 1,
+            prefix_token_ids_sha256: prefix_token_sha256(&transcript_tokens[..1]).unwrap(),
+        },
+        TeacherPredictionPointReceipt {
+            point_ordinal: 1,
+            stable_id: "completed".into(),
+            kind: TeacherPredictionPointKind::TeacherForced {
+                target_token_index: 2,
+                target_token_id: 2,
+            },
+            prefix_token_count: 2,
+            prefix_token_ids_sha256: prefix_token_sha256(&transcript_tokens[..2]).unwrap(),
+        },
+        TeacherPredictionPointReceipt {
+            point_ordinal: 2,
+            stable_id: "generation".into(),
+            kind: TeacherPredictionPointKind::GenerationNext,
+            prefix_token_count: prompt_tokens.len(),
+            prefix_token_ids_sha256: prefix_token_sha256(&prompt_tokens).unwrap(),
+        },
+    ];
+    let greedy_prompts = vec![TeacherGreedyPromptReceipt {
+        stable_id: "generation".into(),
+        prefix_token_count: prompt_tokens.len(),
+        prefix_token_ids_sha256: prefix_token_sha256(&prompt_tokens).unwrap(),
+    }];
+    let examples = vec![
+        TeacherPredictionExampleReceipt {
+            stable_id: "completed".into(),
+            render_mode: RenderMode::CompletedAssistantTranscript,
+            token_count: transcript_tokens.len(),
+            token_ids_sha256: "d".repeat(64),
+        },
+        TeacherPredictionExampleReceipt {
+            stable_id: "generation".into(),
+            render_mode: RenderMode::GenerationPrompt,
+            token_count: prompt_tokens.len(),
+            token_ids_sha256: "e".repeat(64),
+        },
+    ];
+    let mut manifest = TeacherPredictionPlanManifest {
+        schema_version: TEACHER_PREDICTION_PLAN_SCHEMA_VERSION,
+        dataset_partition_manifest_sha256: "a".repeat(64),
+        calibration_corpus_artifact_sha256: "f".repeat(64),
+        calibration_manifest_sha256: "b".repeat(64),
+        rendered_token_stream_sha256: "c".repeat(64),
+        limits,
+        total_example_count: 2,
+        total_token_count: 5,
+        total_rendered_utf8_bytes: 32,
+        examples,
+        prediction_points: points,
+        greedy_prompts,
+        manifest_sha256: String::new(),
+    };
+    manifest.manifest_sha256 = prediction_plan_sha256(&manifest).unwrap();
+    validate_teacher_prediction_plan(&manifest).unwrap();
+    VerifiedCalibrationPredictionPlan {
+        manifest,
+        examples: vec![
+            TeacherPredictionExample {
+                token_ids: transcript_tokens,
+                point_ordinals: vec![0, 1],
+                greedy_prompt_ordinal: None,
+            },
+            TeacherPredictionExample {
+                token_ids: prompt_tokens,
+                point_ordinals: vec![2],
+                greedy_prompt_ordinal: Some(0),
+            },
+        ],
+    }
+}

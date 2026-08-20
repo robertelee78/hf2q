@@ -11,6 +11,7 @@
 pub mod auto_quant;
 pub mod calibration;
 pub mod dynamic_allocator;
+pub mod exact_teacher;
 pub mod fingerprint;
 // B1.4 — hardware migrated to `crate::core::hardware`; all callers
 // updated in the same sweep so no re-export is needed here.

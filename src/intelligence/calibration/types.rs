@@ -8,6 +8,7 @@ use crate::intelligence::measured_auto_quant::SourceIdentity;
 use crate::serve::api::schema::{ChatMessage, Tool};
 
 pub const CALIBRATION_INPUT_SCHEMA_VERSION: u32 = 1;
+pub const TEACHER_PREDICTION_PLAN_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +62,45 @@ pub struct StructuredDatasetManifest {
     pub source_record_sha256: BTreeMap<String, String>,
     pub raw_example_sha256: BTreeMap<String, String>,
     pub manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalibrationCorpusArtifactLimits {
+    pub max_artifact_bytes: u64,
+    pub max_examples: usize,
+    pub max_messages: usize,
+    pub max_tools: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifyCalibrationCorpusRequest {
+    pub path: PathBuf,
+    pub expected_sha256: String,
+    pub expected_dataset_id: String,
+    pub expected_revision: String,
+    pub expected_declared_license: String,
+    pub expected_split: DatasetSplit,
+    pub limits: CalibrationCorpusArtifactLimits,
+}
+
+/// Owned, path-swap-resistant structured corpus authority. The artifact hash
+/// authenticates the exact JSON bytes; the license is explicitly a declaration
+/// bound into those bytes, not an independently adjudicated legal conclusion.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedCalibrationCorpus {
+    pub(super) artifact: crate::core::provenance::tensor_execution::ArtifactEvidence,
+    pub(super) manifest: StructuredDatasetManifest,
+}
+
+impl VerifiedCalibrationCorpus {
+    pub fn artifact(&self) -> &crate::core::provenance::tensor_execution::ArtifactEvidence {
+        &self.artifact
+    }
+
+    pub fn manifest(&self) -> &StructuredDatasetManifest {
+        &self.manifest
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +201,127 @@ pub struct DatasetPartitionManifest {
     pub overlap_policy: OverlapPolicy,
     pub overlap_receipt: DatasetOverlapReceipt,
     pub manifest_sha256: String,
+}
+
+/// Global bounds applied before exact-teacher target collection can begin.
+/// These limits complement the renderer's per-example token bound and make
+/// the total work and target artifact size preflightable with checked math.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeacherPredictionPlanLimits {
+    pub max_examples: usize,
+    pub max_total_tokens: usize,
+    pub max_rendered_utf8_bytes: u64,
+    pub max_prediction_points: usize,
+    pub max_prefix_tokens: usize,
+    pub max_generation_prompts: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TeacherPredictionPointKind {
+    /// Logits from `tokens[..target_token_index]` predict the exact token at
+    /// `target_token_index` in a completed assistant transcript.
+    TeacherForced {
+        target_token_index: usize,
+        target_token_id: u32,
+    },
+    /// Logits from the complete generation prompt predict the next token.
+    GenerationNext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeacherPredictionPointReceipt {
+    pub point_ordinal: usize,
+    pub stable_id: String,
+    pub kind: TeacherPredictionPointKind,
+    pub prefix_token_count: usize,
+    pub prefix_token_ids_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeacherGreedyPromptReceipt {
+    pub stable_id: String,
+    pub prefix_token_count: usize,
+    pub prefix_token_ids_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeacherPredictionExampleReceipt {
+    pub stable_id: String,
+    pub render_mode: RenderMode,
+    pub token_count: usize,
+    pub token_ids_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeacherPredictionPlanManifest {
+    pub schema_version: u32,
+    pub dataset_partition_manifest_sha256: String,
+    pub calibration_corpus_artifact_sha256: String,
+    pub calibration_manifest_sha256: String,
+    pub rendered_token_stream_sha256: String,
+    pub limits: TeacherPredictionPlanLimits,
+    pub total_example_count: usize,
+    pub total_token_count: usize,
+    pub total_rendered_utf8_bytes: u64,
+    pub examples: Vec<TeacherPredictionExampleReceipt>,
+    pub prediction_points: Vec<TeacherPredictionPointReceipt>,
+    pub greedy_prompts: Vec<TeacherGreedyPromptReceipt>,
+    pub manifest_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedCalibrationPredictionPlan {
+    pub(super) manifest: TeacherPredictionPlanManifest,
+    pub(super) examples: Vec<TeacherPredictionExample>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct TeacherPredictionExample {
+    pub token_ids: Vec<u32>,
+    pub point_ordinals: Vec<usize>,
+    pub greedy_prompt_ordinal: Option<usize>,
+}
+
+impl VerifiedCalibrationPredictionPlan {
+    pub(crate) fn manifest(&self) -> &TeacherPredictionPlanManifest {
+        &self.manifest
+    }
+
+    pub(crate) fn prediction_point_count(&self) -> usize {
+        self.manifest.prediction_points.len()
+    }
+
+    pub(crate) fn visit_prediction_points<E>(
+        &self,
+        mut visit: impl FnMut(&TeacherPredictionPointReceipt, &[u32]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for example in &self.examples {
+            for ordinal in &example.point_ordinals {
+                let receipt = &self.manifest.prediction_points[*ordinal];
+                visit(receipt, &example.token_ids[..receipt.prefix_token_count])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn visit_greedy_prompts<E>(
+        &self,
+        mut visit: impl FnMut(&TeacherGreedyPromptReceipt, &[u32]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for example in &self.examples {
+            if let Some(ordinal) = example.greedy_prompt_ordinal {
+                let receipt = &self.manifest.greedy_prompts[ordinal];
+                visit(receipt, &example.token_ids)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
