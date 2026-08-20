@@ -2036,6 +2036,31 @@ schema version 2; the underlying Rust benchmark receipt remains schema version
 1 and is compared after removing only the summary's version and envelope
 fields.
 
+Exact-main hardware run `32344447013` proved that correction under the original
+failure load: cooperative prefill retained exact B=2/3/4 parity and measured
+`4757.599792` versus `3794.979875` ms (`1.2536561322344297x`) with 65
+measurement samples and zero gaps. Four-lane decode retained all 132 exact
+steps, the 92-to-23 command-buffer and four-to-one synchronization topology,
+and measured `510.182875` versus `347.0996665` ms
+(`1.4698454773652168x`) with 95 samples, 28 Fair samples, no Serious or
+Critical sample, and zero gaps.
+
+That run then exposed a receipt-verifier defect rather than a hardware defect.
+The verifier required the literal substring
+`official_artifact_b4_decode_body_is_exact_and_measured ... ok`, but Rust's
+`--nocapture` output inserted the benchmark diagnostics between the test name
+and libtest's later standalone `ok`. The synthetic contract had modeled the
+unrealistic one-line shape. The corrected contract separately requires the
+exact named test invocation, exactly one libtest result line, and an anchored
+result proving one pass and zero failures. Its fixture now mirrors the real
+interleaved log and rejects a missing test name, a failed final result, or
+concatenated contradictory results. Every receipt-contract fixture now emits
+the producer's schema-2 summary before testing its named failure condition, so
+thermal negatives cannot pass merely by failing an earlier schema check. No
+parity, topology, performance, thermal-state, sampling-cadence, or gap threshold
+changes. A new exact-main hardware run remains required before release
+authority is restored.
+
 Several plausible alternatives were measured and rejected, and none remains
 in the landing diff:
 

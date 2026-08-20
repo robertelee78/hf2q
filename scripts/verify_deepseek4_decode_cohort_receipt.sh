@@ -131,7 +131,24 @@ if [[ "$(sha256_file "$ROOT_DIR/scripts/macos_thermal_probe.swift")" != \
   exit 1
 fi
 
-grep -Fq 'official_artifact_b4_decode_body_is_exact_and_measured ... ok' "$test_log"
+if ! grep -Fq \
+    'test inference::models::deepseek4::real_artifact_decode_cohort_tests::official_artifact_b4_decode_body_is_exact_and_measured ... ' \
+    "$test_log"; then
+  echo "decode-cohort test log is missing the exact named test" >&2
+  exit 1
+fi
+test_result_lines=$(awk '/^test result: / { count++ } END { print count + 0 }' \
+  "$test_log")
+if [[ "$test_result_lines" != 1 ]]; then
+  echo "decode-cohort test log must contain exactly one libtest result line" >&2
+  exit 1
+fi
+if ! grep -Eq \
+    '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+(\.[0-9]+)?s$' \
+    "$test_log"; then
+  echo "decode-cohort named test did not finish with one pass and zero failures" >&2
+  exit 1
+fi
 grep -Fq 'exact_state_logits_cache_recurrent=true' "$test_log"
 
 thermal_validate_fair_or_better_measurement_log "$measurement_log" 5

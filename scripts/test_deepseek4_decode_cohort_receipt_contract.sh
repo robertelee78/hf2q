@@ -36,8 +36,11 @@ jq -n '
   }
 ' >"$raw"
 printf '%s\n' \
-  'test inference::models::deepseek4::real_artifact_decode_cohort_tests::official_artifact_b4_decode_body_is_exact_and_measured ... ok' \
-  'DeepSeek-V4 B=4 decode spike: exact_state_logits_cache_recurrent=true' >"$test_log"
+  'test inference::models::deepseek4::real_artifact_decode_cohort_tests::official_artifact_b4_decode_body_is_exact_and_measured ... DeepSeek-V4 B=4 benchmark loaded-idle settle: position=6676 logical_capacity=131072 seconds=45' \
+  'DeepSeek-V4 B=4 decode spike: exact_state_logits_cache_recurrent=true' \
+  'ok' \
+  '' \
+  'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4653 filtered out; finished in 202.59s' >"$test_log"
 printf '2000\tnominal\tdecode-cohort-measurement-start\n' >"$measurement"
 printf '2002\tfair\tdecode-cohort-measurement\n' >>"$measurement"
 printf '2004\tfair\tdecode-cohort-measurement-end\n' >>"$measurement"
@@ -53,6 +56,7 @@ write_summary() {
   local output=$1
   local measurement_path=${2:-$measurement}
   local settle_path=${3:-$settle}
+  local test_log_path=${4:-$test_log}
   local measurement_samples measurement_duration_seconds
   local non_nominal_measurement_samples fair_measurement_samples
   local over_limit_measurement_samples telemetry_gaps
@@ -75,7 +79,7 @@ write_summary() {
     ' "$measurement_path")"
   jq --arg source_sha "$source_sha" --arg model_sha256 "$model_sha" \
     --arg raw_sha256 "$(sha256_file "$raw")" \
-    --arg test_log_sha256 "$(sha256_file "$test_log")" \
+    --arg test_log_sha256 "$(sha256_file "$test_log_path")" \
     --arg measurement_log_sha256 "$(sha256_file "$measurement_path")" \
     --arg settle_log_sha256 "$(sha256_file "$settle_path")" \
     --arg thermal_probe_source_sha256 "$thermal_probe_source_sha" \
@@ -89,7 +93,7 @@ write_summary() {
     --argjson over_limit_measurement_samples \
       "$over_limit_measurement_samples" \
     --argjson telemetry_gaps "$telemetry_gaps" '
-    . + {source_sha:$source_sha,model_sha256:$model_sha256,
+    . + {schema_version:2,source_sha:$source_sha,model_sha256:$model_sha256,
       mlx_native_version:"0.10.12",raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
       required_start_state:"nominal",maximum_measurement_state:"fair",
@@ -115,8 +119,6 @@ write_summary() {
 }
 
 write_summary "$summary"
-jq '.schema_version = 2' "$summary" >"$tmp_dir/schema-v2.json"
-mv "$tmp_dir/schema-v2.json" "$summary"
 
 bash "$VERIFY" "$summary" "$raw" "$test_log" "$measurement" "$settle" \
   "$source_sha" "$model_sha"
@@ -126,7 +128,8 @@ expect_reject() {
   local mutated=$2
   local measurement_path=${3:-$measurement}
   local settle_path=${4:-$settle}
-  if bash "$VERIFY" "$mutated" "$raw" "$test_log" "$measurement_path" \
+  local test_log_path=${5:-$test_log}
+  if bash "$VERIFY" "$mutated" "$raw" "$test_log_path" "$measurement_path" \
       "$settle_path" \
       "$source_sha" "$model_sha" >/dev/null 2>&1; then
     echo "decode-cohort verifier accepted invalid case: $label" >&2
@@ -164,6 +167,44 @@ expect_reject stale-summary-schema "$tmp_dir/stale-summary-schema.json"
 jq 'del(.thermal_probe.binary_sha256)' "$summary" \
   >"$tmp_dir/missing-probe-binary.json"
 expect_reject missing-probe-binary "$tmp_dir/missing-probe-binary.json"
+
+printf '%s\n' \
+  'DeepSeek-V4 B=4 decode spike: exact_state_logits_cache_recurrent=true' \
+  'ok' \
+  '' \
+  'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4653 filtered out; finished in 202.59s' \
+  >"$tmp_dir/missing-test-name.log"
+write_summary "$tmp_dir/missing-test-name-summary.json" "$measurement" \
+  "$settle" "$tmp_dir/missing-test-name.log"
+expect_reject missing-test-name "$tmp_dir/missing-test-name-summary.json" \
+  "$measurement" "$settle" "$tmp_dir/missing-test-name.log"
+
+printf '%s\n' \
+  'test inference::models::deepseek4::real_artifact_decode_cohort_tests::official_artifact_b4_decode_body_is_exact_and_measured ... DeepSeek-V4 B=4 benchmark loaded-idle settle: position=6676 logical_capacity=131072 seconds=45' \
+  'DeepSeek-V4 B=4 decode spike: exact_state_logits_cache_recurrent=true' \
+  'FAILED' \
+  '' \
+  'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4653 filtered out; finished in 202.59s' \
+  >"$tmp_dir/failed-test-result.log"
+write_summary "$tmp_dir/failed-test-result-summary.json" "$measurement" \
+  "$settle" "$tmp_dir/failed-test-result.log"
+expect_reject failed-test-result "$tmp_dir/failed-test-result-summary.json" \
+  "$measurement" "$settle" "$tmp_dir/failed-test-result.log"
+
+printf '%s\n' \
+  'test inference::models::deepseek4::real_artifact_decode_cohort_tests::official_artifact_b4_decode_body_is_exact_and_measured ... DeepSeek-V4 B=4 benchmark loaded-idle settle: position=6676 logical_capacity=131072 seconds=45' \
+  'DeepSeek-V4 B=4 decode spike: exact_state_logits_cache_recurrent=true' \
+  'FAILED' \
+  '' \
+  'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4653 filtered out; finished in 202.59s' \
+  'test unrelated_test ... ok' \
+  '' \
+  'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4653 filtered out; finished in 0.01s' \
+  >"$tmp_dir/concatenated-results.log"
+write_summary "$tmp_dir/concatenated-results-summary.json" "$measurement" \
+  "$settle" "$tmp_dir/concatenated-results.log"
+expect_reject concatenated-results "$tmp_dir/concatenated-results-summary.json" \
+  "$measurement" "$settle" "$tmp_dir/concatenated-results.log"
 
 printf '2000\tnominal\tdecode-cohort-measurement-start\n' \
   >"$tmp_dir/gapped-measurement.log"
