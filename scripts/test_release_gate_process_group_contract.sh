@@ -3,10 +3,16 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 supervisor="$script_dir/run_release_gate_process_group.sh"
+release_gate="$script_dir/run_agentic_cache_release_gate.sh"
+decode_gate="$script_dir/run_deepseek4_decode_cohort_gate.sh"
+thermal_guard="$script_dir/macos_thermal_guard.sh"
+release_workflow="$script_dir/../.github/workflows/release.yml"
 test_dir=$(mktemp -d -t hf2q-release-process-group.XXXXXX)
 wrapper_pid=""
 root_pid=""
 leaf_pid=""
+root_pgid=""
+leaf_pgid=""
 
 cleanup() {
   for pid in "$wrapper_pid" "$root_pid" "$leaf_pid"; do
@@ -49,6 +55,10 @@ while [[ ! -s "$test_dir/root.pid" || ! -s "$test_dir/leaf.pid" ]]; do
 done
 root_pid=$(cat "$test_dir/root.pid")
 leaf_pid=$(cat "$test_dir/leaf.pid")
+root_pgid=$(/bin/ps -p "$root_pid" -o pgid= | tr -d '[:space:]')
+leaf_pgid=$(/bin/ps -p "$leaf_pid" -o pgid= | tr -d '[:space:]')
+test "$root_pgid" = "$root_pid"
+test "$leaf_pgid" = "$root_pgid"
 kill -TERM "$wrapper_pid"
 if wait "$wrapper_pid"; then
   echo "canceled process-group supervisor returned success" >&2
@@ -64,5 +74,37 @@ for pid in "$root_pid" "$leaf_pid"; do
 done
 root_pid=""
 leaf_pid=""
+
+# All calibrated DeepSeek producers must carry the same process-group evidence
+# through settle, measurement, and offline receipt verification.
+grep -F 'cooperative_settle_contention_log=' "$release_gate" >/dev/null
+# Literal source contracts; the variable names must not expand here.
+# shellcheck disable=SC2016
+grep -F 'contention_settle_log="$thermal_dir/settle-contention.log"' \
+  "$release_gate" >/dev/null
+grep -F 'host_contention_validate_thermal_alignment' "$release_gate" >/dev/null
+# shellcheck disable=SC2016
+grep -F 'contention_settle_log="$out_dir/settle-contention.log"' \
+  "$decode_gate" >/dev/null
+grep -F 'host_contention_validate_thermal_alignment' "$decode_gate" >/dev/null
+# Literal jq source contracts; the `$d` variable must not expand in this shell.
+# shellcheck disable=SC2016
+grep -F '$d.cooperative_prefill.schema_version == 2' \
+  "$release_workflow" >/dev/null
+# shellcheck disable=SC2016
+grep -F '$d.decode_cohort.schema_version == 3' "$release_workflow" >/dev/null
+grep -F '.thermal.schema_version == 2' "$release_workflow" >/dev/null
+test "$(grep -Fc 'host_contention.policy == "process-group-v1"' \
+  "$release_workflow")" -ge 3
+grep -F 'name ~ /^hf2q(-|$)/ && pgid[i] != owner_pgid' \
+  "$thermal_guard" >/dev/null
+if awk '
+  /^host_contention_process_snapshot\(\)/ { in_guard=1 }
+  /^thermal_validate_state\(\)/ { in_guard=0 }
+  in_guard { print }
+' "$thermal_guard" | grep -Eq '(^|[[:space:]])kill([[:space:]]|$)'; then
+  echo "host contention guard attempts to signal a process" >&2
+  exit 1
+fi
 
 printf '%s\n' "release process-group contract: pass"

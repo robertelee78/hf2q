@@ -13,6 +13,8 @@ summary="$tmp_dir/summary.json"
 test_log="$tmp_dir/test.log"
 measurement="$tmp_dir/measurement.log"
 settle="$tmp_dir/settle.log"
+contention_measurement="$tmp_dir/measurement-contention.log"
+contention_settle="$tmp_dir/settle-contention.log"
 
 jq -n '
   def counter($cb;$sync):
@@ -44,8 +46,16 @@ printf '%s\n' \
 printf '2000\tnominal\tdecode-cohort-measurement-start\n' >"$measurement"
 printf '2002\tfair\tdecode-cohort-measurement\n' >>"$measurement"
 printf '2004\tfair\tdecode-cohort-measurement-end\n' >>"$measurement"
+printf '2000\tquiet\tdecode-cohort-measurement-start\t100\t-\n' \
+  >"$contention_measurement"
+printf '2002\tquiet\tdecode-cohort-measurement\t100\t-\n' \
+  >>"$contention_measurement"
+printf '2004\tquiet\tdecode-cohort-measurement-end\t100\t-\n' \
+  >>"$contention_measurement"
 for timestamp in $(seq 1000 5 1060); do
   printf '%s\tnominal\tdecode-cohort-settle\n' "$timestamp" >>"$settle"
+  printf '%s\tquiet\tdecode-cohort-settle\t100\t-\n' "$timestamp" \
+    >>"$contention_settle"
 done
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
@@ -82,6 +92,10 @@ write_summary() {
     --arg test_log_sha256 "$(sha256_file "$test_log_path")" \
     --arg measurement_log_sha256 "$(sha256_file "$measurement_path")" \
     --arg settle_log_sha256 "$(sha256_file "$settle_path")" \
+    --arg contention_measurement_log_sha256 \
+      "$(sha256_file "$contention_measurement")" \
+    --arg contention_settle_log_sha256 \
+      "$(sha256_file "$contention_settle")" \
     --arg thermal_probe_source_sha256 "$thermal_probe_source_sha" \
     --arg thermal_probe_compiler_sha256 "$thermal_probe_compiler_sha" \
     --arg thermal_probe_binary_sha256 "$thermal_probe_binary_sha" \
@@ -93,7 +107,7 @@ write_summary() {
     --argjson over_limit_measurement_samples \
       "$over_limit_measurement_samples" \
     --argjson telemetry_gaps "$telemetry_gaps" '
-    . + {schema_version:2,source_sha:$source_sha,model_sha256:$model_sha256,
+    . + {schema_version:3,source_sha:$source_sha,model_sha256:$model_sha256,
       mlx_native_version:"0.10.12",raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
       required_start_state:"nominal",maximum_measurement_state:"fair",
@@ -114,14 +128,19 @@ write_summary() {
       non_nominal_measurement_samples:$non_nominal_measurement_samples,
       fair_measurement_samples:$fair_measurement_samples,
       over_limit_measurement_samples:$over_limit_measurement_samples,
-      telemetry_gaps:$telemetry_gaps}
+      telemetry_gaps:$telemetry_gaps,
+      host_contention:{policy:"process-group-v1",
+        settle:{log_sha256:$contention_settle_log_sha256,samples:13,
+          duration_seconds:60,contended_samples:0,telemetry_gaps:0},
+        measurement:{log_sha256:$contention_measurement_log_sha256,samples:3,
+          duration_seconds:4,contended_samples:0,telemetry_gaps:0}}}
   ' "$raw" >"$output"
 }
 
 write_summary "$summary"
 
 bash "$VERIFY" "$summary" "$raw" "$test_log" "$measurement" "$settle" \
-  "$source_sha" "$model_sha"
+  "$source_sha" "$model_sha" "$contention_measurement" "$contention_settle"
 
 expect_reject() {
   local label=$1
@@ -131,7 +150,8 @@ expect_reject() {
   local test_log_path=${5:-$test_log}
   if bash "$VERIFY" "$mutated" "$raw" "$test_log_path" "$measurement_path" \
       "$settle_path" \
-      "$source_sha" "$model_sha" >/dev/null 2>&1; then
+      "$source_sha" "$model_sha" "$contention_measurement" \
+      "$contention_settle" >/dev/null 2>&1; then
     echo "decode-cohort verifier accepted invalid case: $label" >&2
     exit 1
   fi
@@ -162,7 +182,7 @@ expect_reject bad-maximum-state "$tmp_dir/bad-maximum-state.json"
 jq '.thermal_probe.source_sha256 = ("0" * 64)' "$summary" \
   >"$tmp_dir/bad-probe-source.json"
 expect_reject bad-probe-source "$tmp_dir/bad-probe-source.json"
-jq '.schema_version = 1' "$summary" >"$tmp_dir/stale-summary-schema.json"
+jq '.schema_version = 2' "$summary" >"$tmp_dir/stale-summary-schema.json"
 expect_reject stale-summary-schema "$tmp_dir/stale-summary-schema.json"
 jq 'del(.thermal_probe.binary_sha256)' "$summary" \
   >"$tmp_dir/missing-probe-binary.json"
@@ -244,5 +264,20 @@ write_summary "$tmp_dir/non-nominal-settle-summary.json" "$measurement" \
   "$tmp_dir/non-nominal-settle.log"
 expect_reject non-nominal-settle "$tmp_dir/non-nominal-settle-summary.json" \
   "$measurement" "$tmp_dir/non-nominal-settle.log"
+
+awk -F '\t' 'BEGIN { OFS="\t" }
+  NR == 2 { $2="contended"; $5="200:200:rustc" }
+  { print }
+' "$contention_measurement" >"$tmp_dir/contended-host.log"
+jq --arg sha "$(sha256_file "$tmp_dir/contended-host.log")" \
+  '.host_contention.measurement.log_sha256 = $sha
+   | .host_contention.measurement.contended_samples = 1' \
+  "$summary" >"$tmp_dir/contended-host-summary.json"
+if bash "$VERIFY" "$tmp_dir/contended-host-summary.json" "$raw" "$test_log" \
+    "$measurement" "$settle" "$source_sha" "$model_sha" \
+    "$tmp_dir/contended-host.log" "$contention_settle" >/dev/null 2>&1; then
+  echo "decode-cohort verifier accepted host contention" >&2
+  exit 1
+fi
 
 echo "DeepSeek-V4 decode-cohort receipt contract: pass"

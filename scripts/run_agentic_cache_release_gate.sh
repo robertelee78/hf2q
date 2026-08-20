@@ -454,6 +454,8 @@ cooperative_raw="$cooperative_dir/raw.json"
 cooperative_log="$cooperative_dir/test.log"
 cooperative_thermal_log="$cooperative_dir/thermal.log"
 cooperative_settle_log="$cooperative_dir/settle.log"
+cooperative_contention_log="$cooperative_dir/measurement-contention.log"
+cooperative_settle_contention_log="$cooperative_dir/settle-contention.log"
 cooperative_build_log="$cooperative_dir/build.jsonl"
 mkdir -p "$cooperative_dir"
 cargo test --release --locked --bin hf2q --no-run --message-format=json \
@@ -471,11 +473,16 @@ cooperative_test_binary=$(jq -rs '
 }
 require_no_model_runtime
 thermal_wait_for_nominal "$cooperative_settle_log" \
-  cooperative-prefill-settle 60 900 5
+  cooperative-prefill-settle 60 900 5 \
+  "$cooperative_settle_contention_log" "$parent_pid"
 : >"$cooperative_thermal_log"
+: >"$cooperative_contention_log"
 thermal_sample "$cooperative_thermal_log" \
   cooperative-prefill-measurement-start
 test "$THERMAL_STATE" = nominal
+host_contention_sample "$cooperative_contention_log" \
+  cooperative-prefill-measurement-start "$parent_pid" "$THERMAL_SAMPLED_AT"
+host_contention_require_quiet cooperative-prefill-measurement-start
 env -i \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   TMPDIR="${TMPDIR:-/tmp}" \
@@ -490,7 +497,8 @@ wave_harness_pid=$!
 set +e
 cooperative_thermal_rc=0
 thermal_monitor_fair_or_better_while_pid "$cooperative_thermal_log" \
-  cooperative-prefill-measurement "$wave_harness_pid" 2
+  cooperative-prefill-measurement "$wave_harness_pid" 2 \
+  "$cooperative_contention_log" "$parent_pid"
 cooperative_thermal_rc=$?
 if ((cooperative_thermal_rc != 0)); then
   kill -TERM "$wave_harness_pid" 2>/dev/null || true
@@ -506,6 +514,9 @@ ensure_guard_health
 thermal_sample "$cooperative_thermal_log" \
   cooperative-prefill-measurement-end
 [[ "$THERMAL_STATE" == nominal || "$THERMAL_STATE" == fair ]]
+host_contention_sample "$cooperative_contention_log" \
+  cooperative-prefill-measurement-end "$parent_pid" "$THERMAL_SAMPLED_AT"
+host_contention_require_quiet cooperative-prefill-measurement-end
 thermal_validate_fair_or_better_measurement_log "$cooperative_thermal_log" 5
 cooperative_measurement_samples=$THERMAL_LOG_SAMPLES
 cooperative_measurement_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
@@ -517,6 +528,20 @@ thermal_validate_settle_log "$cooperative_settle_log" 60 8
 cooperative_settle_samples=$THERMAL_LOG_SAMPLES
 cooperative_settle_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
 cooperative_settle_gaps=$THERMAL_LOG_GAPS
+host_contention_validate_measurement_log "$cooperative_contention_log" 5
+cooperative_contention_samples=$HOST_CONTENTION_LOG_SAMPLES
+cooperative_contention_duration_seconds=$HOST_CONTENTION_LOG_DURATION_SECONDS
+cooperative_contention_contended_samples=$HOST_CONTENTION_LOG_CONTENDED_SAMPLES
+cooperative_contention_gaps=$HOST_CONTENTION_LOG_GAPS
+host_contention_validate_settle_log "$cooperative_settle_contention_log" 60 8
+cooperative_settle_contention_samples=$HOST_CONTENTION_LOG_SAMPLES
+cooperative_settle_contention_duration_seconds=$HOST_CONTENTION_LOG_DURATION_SECONDS
+cooperative_settle_contention_contended_samples=$HOST_CONTENTION_LOG_CONTENDED_SAMPLES
+cooperative_settle_contention_gaps=$HOST_CONTENTION_LOG_GAPS
+host_contention_validate_thermal_alignment "$cooperative_thermal_log" \
+  "$cooperative_contention_log"
+host_contention_validate_thermal_alignment "$cooperative_settle_log" \
+  "$cooperative_settle_contention_log"
 jq -e '
   .schema_version == 1 and .status == "pass"
   and .artifact_bytes == 107431343168 and .layers == 43
@@ -541,6 +566,11 @@ jq --arg source_sha "$EXPECTED_SHA" \
   --arg test_log_sha256 "$(sha256_file "$cooperative_log")" \
   --arg measurement_log_sha256 "$(sha256_file "$cooperative_thermal_log")" \
   --arg settle_log_sha256 "$(sha256_file "$cooperative_settle_log")" \
+  --arg contention_policy "$HOST_CONTENTION_POLICY" \
+  --arg contention_measurement_log_sha256 \
+    "$(sha256_file "$cooperative_contention_log")" \
+  --arg contention_settle_log_sha256 \
+    "$(sha256_file "$cooperative_settle_contention_log")" \
   --argjson settle_seconds 60 \
   --argjson settle_samples "$cooperative_settle_samples" \
   --argjson settle_duration_seconds "$cooperative_settle_duration_seconds" \
@@ -555,7 +585,19 @@ jq --arg source_sha "$EXPECTED_SHA" \
   --argjson fair_measurement_samples "$cooperative_fair_samples" \
   --argjson over_limit_measurement_samples "$cooperative_over_limit_samples" \
   --argjson telemetry_gaps "$cooperative_measurement_gaps" \
-  '. + {source_sha:$source_sha,model_sha256:$model_sha256,
+  --argjson contention_measurement_samples "$cooperative_contention_samples" \
+  --argjson contention_measurement_duration_seconds \
+    "$cooperative_contention_duration_seconds" \
+  --argjson contention_measurement_contended_samples \
+    "$cooperative_contention_contended_samples" \
+  --argjson contention_measurement_gaps "$cooperative_contention_gaps" \
+  --argjson contention_settle_samples "$cooperative_settle_contention_samples" \
+  --argjson contention_settle_duration_seconds \
+    "$cooperative_settle_contention_duration_seconds" \
+  --argjson contention_settle_contended_samples \
+    "$cooperative_settle_contention_contended_samples" \
+  --argjson contention_settle_gaps "$cooperative_settle_contention_gaps" \
+  '. + {schema_version:2,source_sha:$source_sha,model_sha256:$model_sha256,
     mlx_native_version:$mlx_native_version,raw_sha256:$raw_sha256,
     test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
     required_start_state:"nominal",maximum_measurement_state:"fair",
@@ -573,12 +615,24 @@ jq --arg source_sha "$EXPECTED_SHA" \
     non_nominal_measurement_samples:$non_nominal_measurement_samples,
     fair_measurement_samples:$fair_measurement_samples,
     over_limit_measurement_samples:$over_limit_measurement_samples,
-    telemetry_gaps:$telemetry_gaps}' \
+    telemetry_gaps:$telemetry_gaps,
+    host_contention:{policy:$contention_policy,
+      settle:{log_sha256:$contention_settle_log_sha256,
+        samples:$contention_settle_samples,
+        duration_seconds:$contention_settle_duration_seconds,
+        contended_samples:$contention_settle_contended_samples,
+        telemetry_gaps:$contention_settle_gaps},
+      measurement:{log_sha256:$contention_measurement_log_sha256,
+        samples:$contention_measurement_samples,
+        duration_seconds:$contention_measurement_duration_seconds,
+        contended_samples:$contention_measurement_contended_samples,
+        telemetry_gaps:$contention_measurement_gaps}}}' \
   "$cooperative_raw" >"$cooperative_dir/summary.json"
 bash scripts/verify_deepseek4_cooperative_prefill_receipt.sh \
   "$cooperative_dir/summary.json" "$cooperative_raw" "$cooperative_log" \
   "$cooperative_thermal_log" "$cooperative_settle_log" \
-  "$EXPECTED_SHA" "$DEEPSEEK_MODEL_SHA256"
+  "$EXPECTED_SHA" "$DEEPSEEK_MODEL_SHA256" \
+  "$cooperative_contention_log" "$cooperative_settle_contention_log"
 sha256_file "$cooperative_dir/summary.json" \
   >"$cooperative_dir/summary.json.sha256"
 ensure_guard_health
@@ -632,6 +686,8 @@ run_deepseek_wave() {
   local thermal_dir="$out/thermal"
   local thermal_measurement_log="$thermal_dir/measurement.log"
   local thermal_settle_log="$thermal_dir/settle.log"
+  local contention_measurement_log="$thermal_dir/measurement-contention.log"
+  local contention_settle_log="$thermal_dir/settle-contention.log"
   local thermal_summary="$thermal_dir/summary.json"
   local cold_receipts_json
   local cooperative_prefill_transactions
@@ -643,6 +699,14 @@ run_deepseek_wave() {
   local settle_duration_seconds
   local settle_telemetry_gaps
   local telemetry_gaps
+  local contention_measurement_samples
+  local contention_measurement_duration_seconds
+  local contention_measurement_contended_samples
+  local contention_measurement_gaps
+  local contention_settle_samples
+  local contention_settle_duration_seconds
+  local contention_settle_contended_samples
+  local contention_settle_gaps
   local sample_interval_seconds=2
   local maximum_sample_gap_seconds=5
   local settle_sample_interval_seconds=5
@@ -651,13 +715,19 @@ run_deepseek_wave() {
   thermal_prepare_cold_receipt_dir "$out/agents"
   require_no_model_runtime
   thermal_wait_for_nominal "$thermal_settle_log" "deepseek-wave-${wave}-settle" \
-    60 900 "$settle_sample_interval_seconds"
+    60 900 "$settle_sample_interval_seconds" "$contention_settle_log" \
+    "$parent_pid"
   start_server deepseek "process-wave-$wave" scripts/serve_deepseek4_opencode.sh \
     "$DEEPSEEK_MODEL" 18080 4 524288 8589934592
   : >"$thermal_measurement_log"
+  : >"$contention_measurement_log"
   thermal_sample "$thermal_measurement_log" \
     "deepseek-wave-${wave}-measurement-start"
   test "$THERMAL_STATE" = nominal
+  host_contention_sample "$contention_measurement_log" \
+    "deepseek-wave-${wave}-measurement-start" "$parent_pid" \
+    "$THERMAL_SAMPLED_AT"
+  host_contention_require_quiet "deepseek-wave-${wave}-measurement-start"
   # Preserve the prompt-visible historical path while feeding the immutable
   # bytes that actually lived there at the calibrated source revision.
   BASE_URL="$current_url" FAMILY=deepseek4 AGENTS=4 \
@@ -679,7 +749,8 @@ run_deepseek_wave() {
   set +e
   thermal_monitor_nominal_until_cold_receipts "$thermal_measurement_log" \
     "deepseek-wave-${wave}-measurement" "$out/agents" 4 \
-    "$sample_interval_seconds" 120 "$wave_harness_pid"
+    "$sample_interval_seconds" 120 "$wave_harness_pid" \
+    "$contention_measurement_log" "$parent_pid"
   thermal_rc=$?
   if ((thermal_rc != 0)); then
     kill -TERM "$wave_harness_pid" 2>/dev/null || true
@@ -705,6 +776,22 @@ run_deepseek_wave() {
   settle_samples=$THERMAL_LOG_SAMPLES
   settle_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
   settle_telemetry_gaps=$THERMAL_LOG_GAPS
+  host_contention_validate_measurement_log "$contention_measurement_log" \
+    "$maximum_sample_gap_seconds"
+  contention_measurement_samples=$HOST_CONTENTION_LOG_SAMPLES
+  contention_measurement_duration_seconds=$HOST_CONTENTION_LOG_DURATION_SECONDS
+  contention_measurement_contended_samples=$HOST_CONTENTION_LOG_CONTENDED_SAMPLES
+  contention_measurement_gaps=$HOST_CONTENTION_LOG_GAPS
+  host_contention_validate_settle_log "$contention_settle_log" 60 \
+    "$maximum_settle_sample_gap_seconds"
+  contention_settle_samples=$HOST_CONTENTION_LOG_SAMPLES
+  contention_settle_duration_seconds=$HOST_CONTENTION_LOG_DURATION_SECONDS
+  contention_settle_contended_samples=$HOST_CONTENTION_LOG_CONTENDED_SAMPLES
+  contention_settle_gaps=$HOST_CONTENTION_LOG_GAPS
+  host_contention_validate_thermal_alignment "$thermal_measurement_log" \
+    "$contention_measurement_log"
+  host_contention_validate_thermal_alignment "$thermal_settle_log" \
+    "$contention_settle_log"
   cold_receipts_json=$(
     for receipt in "$out"/agents/agent-*.cold.json; do
       [[ -s "$receipt" ]] || {
@@ -726,6 +813,11 @@ run_deepseek_wave() {
   jq -n --arg status pass --arg phase "deepseek-wave-$wave" \
     --arg settle_log_sha256 "$(sha256_file "$thermal_settle_log")" \
     --arg measurement_log_sha256 "$(sha256_file "$thermal_measurement_log")" \
+    --arg contention_policy "$HOST_CONTENTION_POLICY" \
+    --arg contention_settle_log_sha256 \
+      "$(sha256_file "$contention_settle_log")" \
+    --arg contention_measurement_log_sha256 \
+      "$(sha256_file "$contention_measurement_log")" \
     --argjson settle_seconds 60 \
     --argjson settle_duration_seconds "$settle_duration_seconds" \
     --argjson settle_samples "$settle_samples" \
@@ -738,8 +830,20 @@ run_deepseek_wave() {
     --argjson non_nominal_measurement_samples "$non_nominal_measurement_samples" \
     --argjson settle_telemetry_gaps "$settle_telemetry_gaps" \
     --argjson telemetry_gaps "$telemetry_gaps" \
+    --argjson contention_settle_samples "$contention_settle_samples" \
+    --argjson contention_settle_duration_seconds \
+      "$contention_settle_duration_seconds" \
+    --argjson contention_settle_contended_samples \
+      "$contention_settle_contended_samples" \
+    --argjson contention_settle_gaps "$contention_settle_gaps" \
+    --argjson contention_measurement_samples "$contention_measurement_samples" \
+    --argjson contention_measurement_duration_seconds \
+      "$contention_measurement_duration_seconds" \
+    --argjson contention_measurement_contended_samples \
+      "$contention_measurement_contended_samples" \
+    --argjson contention_measurement_gaps "$contention_measurement_gaps" \
     --argjson cold_receipts "$cold_receipts_json" \
-    '{status:$status,phase:$phase,required_state:"nominal",runtime_preflight:"pass",
+    '{schema_version:2,status:$status,phase:$phase,required_state:"nominal",runtime_preflight:"pass",
       measurement_scope:"cold-cohort",cold_receipts:$cold_receipts,
       settle_seconds:$settle_seconds,settle_duration_seconds:$settle_duration_seconds,
       settle_samples:$settle_samples,measurement_samples:$measurement_samples,
@@ -751,7 +855,18 @@ run_deepseek_wave() {
       non_nominal_measurement_samples:$non_nominal_measurement_samples,
       settle_telemetry_gaps:$settle_telemetry_gaps,
       telemetry_gaps:$telemetry_gaps,settle_log_sha256:$settle_log_sha256,
-      measurement_log_sha256:$measurement_log_sha256}' >"$thermal_summary"
+      measurement_log_sha256:$measurement_log_sha256,
+      host_contention:{policy:$contention_policy,
+        settle:{log_sha256:$contention_settle_log_sha256,
+          samples:$contention_settle_samples,
+          duration_seconds:$contention_settle_duration_seconds,
+          contended_samples:$contention_settle_contended_samples,
+          telemetry_gaps:$contention_settle_gaps},
+        measurement:{log_sha256:$contention_measurement_log_sha256,
+          samples:$contention_measurement_samples,
+          duration_seconds:$contention_measurement_duration_seconds,
+          contended_samples:$contention_measurement_contended_samples,
+          telemetry_gaps:$contention_measurement_gaps}}}' >"$thermal_summary"
   jq -e --slurpfile contract "$agentic_prompt_contract" \
     --arg prompt_contract_sha256 "$agentic_prompt_contract_sha" \
     --arg prompt_provenance_sha256 "$agentic_prompt_provenance_sha" \
@@ -801,7 +916,7 @@ run_deepseek_wave() {
   mv "$out/envelope.json.tmp" "$out/envelope.json"
   scripts/verify_macos_thermal_receipt.sh "$wave" "$out/envelope.json" \
     "$thermal_summary" "$thermal_measurement_log" "$thermal_settle_log" \
-    "$out/agents"
+    "$out/agents" "$contention_measurement_log" "$contention_settle_log"
 }
 
 run_deepseek_release_gates() {

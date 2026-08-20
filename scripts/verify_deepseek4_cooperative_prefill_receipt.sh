@@ -8,6 +8,8 @@ measurement_log=${4:?measurement log path is required}
 settle_log=${5:?settle log path is required}
 expected_source_sha=${6:?expected source SHA is required}
 expected_model_sha=${7:?expected model SHA-256 is required}
+contention_measurement_log=${8:?contention measurement log is required}
+contention_settle_log=${9:?contention settle log is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -15,7 +17,8 @@ source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 
-for path in "$summary" "$raw" "$test_log" "$measurement_log" "$settle_log"; do
+for path in "$summary" "$raw" "$test_log" "$measurement_log" "$settle_log" \
+  "$contention_measurement_log" "$contention_settle_log"; do
   [[ -s "$path" ]] || {
     echo "cooperative prefill receipt input is missing or empty: $path" >&2
     exit 1
@@ -36,6 +39,10 @@ test "$(sha256_file "$measurement_log")" = \
   "$(jq -er .measurement_log_sha256 "$summary")"
 test "$(sha256_file "$settle_log")" = \
   "$(jq -er .settle_log_sha256 "$summary")"
+test "$(sha256_file "$contention_measurement_log")" = \
+  "$(jq -er .host_contention.measurement.log_sha256 "$summary")"
+test "$(sha256_file "$contention_settle_log")" = \
+  "$(jq -er .host_contention.settle.log_sha256 "$summary")"
 jq -s -e 'length == 1' "$summary" >/dev/null
 
 jq -e --slurpfile raw "$raw" \
@@ -48,6 +55,7 @@ jq -e --slurpfile raw "$raw" \
   | ($raw_receipt.benchmark.cohort_ms | sort | .[2]) as $cohort_median
   | ($raw | length) == 1
     and ($summary | del(
+      .schema_version,
       .source_sha,
       .model_sha256,
       .mlx_native_version,
@@ -71,9 +79,11 @@ jq -e --slurpfile raw "$raw" \
       .non_nominal_measurement_samples,
       .fair_measurement_samples,
       .over_limit_measurement_samples,
-      .telemetry_gaps
-    )) == $raw_receipt
-    and .schema_version == 1 and .status == "pass"
+      .telemetry_gaps,
+      .host_contention
+    )) == ($raw_receipt | del(.schema_version))
+    and $raw_receipt.schema_version == 1
+    and .schema_version == 2 and .status == "pass"
     and .source_sha == $source_sha and .model_sha256 == $model_sha256
     and .mlx_native_version == "0.10.12"
     and .artifact_bytes == 107431343168 and .layers == 43
@@ -121,6 +131,22 @@ jq -e --slurpfile raw "$raw" \
     and .over_limit_measurement_samples == 0
     and .non_nominal_measurement_samples == .fair_measurement_samples
     and .settle_telemetry_gaps == 0 and .telemetry_gaps == 0
+    and .host_contention.policy == "process-group-v1"
+    and (.host_contention.settle.log_sha256 | test("^[0-9a-f]{64}$"))
+    and (.host_contention.settle.samples | type) == "number"
+    and .host_contention.settle.samples > 0
+    and (.host_contention.settle.duration_seconds | type) == "number"
+    and .host_contention.settle.duration_seconds >= 60
+    and (.host_contention.settle.contended_samples | type) == "number"
+    and .host_contention.settle.contended_samples >= 0
+    and .host_contention.settle.telemetry_gaps == 0
+    and (.host_contention.measurement.log_sha256 | test("^[0-9a-f]{64}$"))
+    and (.host_contention.measurement.samples | type) == "number"
+    and .host_contention.measurement.samples >= 2
+    and (.host_contention.measurement.duration_seconds | type) == "number"
+    and .host_contention.measurement.duration_seconds > 0
+    and .host_contention.measurement.contended_samples == 0
+    and .host_contention.measurement.telemetry_gaps == 0
   ' "$summary" >/dev/null
 
 thermal_validate_fair_or_better_measurement_log "$measurement_log" 5
@@ -152,5 +178,34 @@ test "$THERMAL_LOG_DURATION_SECONDS" = \
   "$(jq -er .settle_duration_seconds "$summary")"
 test "$THERMAL_LOG_GAPS" = "$(jq -er .settle_telemetry_gaps "$summary")"
 awk -F '\t' '$3 != "cooperative-prefill-settle" { exit 1 }' "$settle_log"
+
+host_contention_validate_measurement_log "$contention_measurement_log" 5
+test "$HOST_CONTENTION_LOG_SAMPLES" = \
+  "$(jq -er .host_contention.measurement.samples "$summary")"
+test "$HOST_CONTENTION_LOG_DURATION_SECONDS" = \
+  "$(jq -er .host_contention.measurement.duration_seconds "$summary")"
+test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = \
+  "$(jq -er .host_contention.measurement.contended_samples "$summary")"
+test "$HOST_CONTENTION_LOG_GAPS" = \
+  "$(jq -er .host_contention.measurement.telemetry_gaps "$summary")"
+host_contention_validate_settle_log "$contention_settle_log" 60 8
+test "$HOST_CONTENTION_LOG_SAMPLES" = \
+  "$(jq -er .host_contention.settle.samples "$summary")"
+test "$HOST_CONTENTION_LOG_DURATION_SECONDS" = \
+  "$(jq -er .host_contention.settle.duration_seconds "$summary")"
+test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = \
+  "$(jq -er .host_contention.settle.contended_samples "$summary")"
+test "$HOST_CONTENTION_LOG_GAPS" = \
+  "$(jq -er .host_contention.settle.telemetry_gaps "$summary")"
+host_contention_validate_thermal_alignment "$measurement_log" \
+  "$contention_measurement_log"
+host_contention_validate_thermal_alignment "$settle_log" \
+  "$contention_settle_log"
+awk -F '\t' 'NR == 1 && $3 != "cooperative-prefill-measurement-start" { exit 1 }
+  NR > 1 && $3 != "cooperative-prefill-measurement" && \
+    $3 != "cooperative-prefill-measurement-end" { exit 1 }' \
+  "$contention_measurement_log"
+awk -F '\t' '$3 != "cooperative-prefill-settle" { exit 1 }' \
+  "$contention_settle_log"
 
 echo "DeepSeek-V4 cooperative prefill receipt verified" >&2

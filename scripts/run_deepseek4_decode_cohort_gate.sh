@@ -33,7 +33,10 @@ raw="$out_dir/raw.json"
 test_log="$out_dir/test.log"
 measurement_log="$out_dir/thermal.log"
 settle_log="$out_dir/settle.log"
-rm -f "$raw" "$test_log" "$measurement_log" "$settle_log"
+contention_measurement_log="$out_dir/measurement-contention.log"
+contention_settle_log="$out_dir/settle-contention.log"
+rm -f "$raw" "$test_log" "$measurement_log" "$settle_log" \
+  "$contention_measurement_log" "$contention_settle_log"
 
 test_pid=""
 cleanup() {
@@ -60,10 +63,15 @@ thermal_prepare_probe
 thermal_probe_source_sha=$(sha256_file "$THERMAL_PROBE_SOURCE")
 thermal_probe_compiler_sha=$(sha256_file "$THERMAL_PROBE_COMPILER")
 thermal_probe_binary_sha=$(sha256_file "$THERMAL_PROBE_BIN")
-thermal_wait_for_nominal "$settle_log" decode-cohort-settle 60 900 5
+thermal_wait_for_nominal "$settle_log" decode-cohort-settle 60 900 5 \
+  "$contention_settle_log" "$$"
 : >"$measurement_log"
+: >"$contention_measurement_log"
 thermal_sample "$measurement_log" decode-cohort-measurement-start
 test "$THERMAL_STATE" = nominal
+host_contention_sample "$contention_measurement_log" \
+  decode-cohort-measurement-start "$$" "$THERMAL_SAMPLED_AT"
+host_contention_require_quiet decode-cohort-measurement-start
 
 env -i \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin \
@@ -76,7 +84,8 @@ test_pid=$!
 set +e
 thermal_rc=0
 thermal_monitor_fair_or_better_while_pid "$measurement_log" \
-  decode-cohort-measurement "$test_pid" 2
+  decode-cohort-measurement "$test_pid" 2 \
+  "$contention_measurement_log" "$$"
 thermal_rc=$?
 if ((thermal_rc != 0)); then
   kill -TERM "$test_pid" 2>/dev/null || true
@@ -89,6 +98,9 @@ test "$test_rc" = 0
 test "$thermal_rc" = 0
 thermal_sample "$measurement_log" decode-cohort-measurement-end
 [[ "$THERMAL_STATE" == nominal || "$THERMAL_STATE" == fair ]]
+host_contention_sample "$contention_measurement_log" \
+  decode-cohort-measurement-end "$$" "$THERMAL_SAMPLED_AT"
+host_contention_require_quiet decode-cohort-measurement-end
 
 thermal_validate_fair_or_better_measurement_log "$measurement_log" 5
 measurement_samples=$THERMAL_LOG_SAMPLES
@@ -101,6 +113,20 @@ thermal_validate_settle_log "$settle_log" 60 8
 settle_samples=$THERMAL_LOG_SAMPLES
 settle_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
 settle_gaps=$THERMAL_LOG_GAPS
+host_contention_validate_measurement_log "$contention_measurement_log" 5
+contention_measurement_samples=$HOST_CONTENTION_LOG_SAMPLES
+contention_measurement_duration_seconds=$HOST_CONTENTION_LOG_DURATION_SECONDS
+contention_measurement_contended_samples=$HOST_CONTENTION_LOG_CONTENDED_SAMPLES
+contention_measurement_gaps=$HOST_CONTENTION_LOG_GAPS
+host_contention_validate_settle_log "$contention_settle_log" 60 8
+contention_settle_samples=$HOST_CONTENTION_LOG_SAMPLES
+contention_settle_duration_seconds=$HOST_CONTENTION_LOG_DURATION_SECONDS
+contention_settle_contended_samples=$HOST_CONTENTION_LOG_CONTENDED_SAMPLES
+contention_settle_gaps=$HOST_CONTENTION_LOG_GAPS
+host_contention_validate_thermal_alignment "$measurement_log" \
+  "$contention_measurement_log"
+host_contention_validate_thermal_alignment "$settle_log" \
+  "$contention_settle_log"
 
 jq --arg source_sha "$expected_source_sha" \
   --arg model_sha256 "$expected_model_sha" \
@@ -108,6 +134,11 @@ jq --arg source_sha "$expected_source_sha" \
   --arg test_log_sha256 "$(sha256_file "$test_log")" \
   --arg measurement_log_sha256 "$(sha256_file "$measurement_log")" \
   --arg settle_log_sha256 "$(sha256_file "$settle_log")" \
+  --arg contention_policy "$HOST_CONTENTION_POLICY" \
+  --arg contention_measurement_log_sha256 \
+    "$(sha256_file "$contention_measurement_log")" \
+  --arg contention_settle_log_sha256 \
+    "$(sha256_file "$contention_settle_log")" \
   --arg thermal_probe_source_sha256 "$thermal_probe_source_sha" \
   --arg thermal_probe_compiler_path "$THERMAL_PROBE_COMPILER" \
   --arg thermal_probe_compiler_sha256 "$thermal_probe_compiler_sha" \
@@ -121,8 +152,20 @@ jq --arg source_sha "$expected_source_sha" \
   --argjson non_nominal_measurement_samples "$non_nominal_measurement_samples" \
   --argjson fair_measurement_samples "$fair_measurement_samples" \
   --argjson over_limit_measurement_samples "$over_limit_measurement_samples" \
-  --argjson telemetry_gaps "$measurement_gaps" '
-  . + {schema_version:2,source_sha:$source_sha,model_sha256:$model_sha256,
+  --argjson telemetry_gaps "$measurement_gaps" \
+  --argjson contention_settle_samples "$contention_settle_samples" \
+  --argjson contention_settle_duration_seconds \
+    "$contention_settle_duration_seconds" \
+  --argjson contention_settle_contended_samples \
+    "$contention_settle_contended_samples" \
+  --argjson contention_settle_gaps "$contention_settle_gaps" \
+  --argjson contention_measurement_samples "$contention_measurement_samples" \
+  --argjson contention_measurement_duration_seconds \
+    "$contention_measurement_duration_seconds" \
+  --argjson contention_measurement_contended_samples \
+    "$contention_measurement_contended_samples" \
+  --argjson contention_measurement_gaps "$contention_measurement_gaps" '
+  . + {schema_version:3,source_sha:$source_sha,model_sha256:$model_sha256,
     mlx_native_version:"0.10.12",raw_sha256:$raw_sha256,
     test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
     required_start_state:"nominal",maximum_measurement_state:"fair",
@@ -145,10 +188,22 @@ jq --arg source_sha "$expected_source_sha" \
     non_nominal_measurement_samples:$non_nominal_measurement_samples,
     fair_measurement_samples:$fair_measurement_samples,
     over_limit_measurement_samples:$over_limit_measurement_samples,
-    telemetry_gaps:$telemetry_gaps}
+    telemetry_gaps:$telemetry_gaps,
+    host_contention:{policy:$contention_policy,
+      settle:{log_sha256:$contention_settle_log_sha256,
+        samples:$contention_settle_samples,
+        duration_seconds:$contention_settle_duration_seconds,
+        contended_samples:$contention_settle_contended_samples,
+        telemetry_gaps:$contention_settle_gaps},
+      measurement:{log_sha256:$contention_measurement_log_sha256,
+        samples:$contention_measurement_samples,
+        duration_seconds:$contention_measurement_duration_seconds,
+        contended_samples:$contention_measurement_contended_samples,
+        telemetry_gaps:$contention_measurement_gaps}}}
 ' "$raw" >"$out_dir/summary.json.tmp"
 mv "$out_dir/summary.json.tmp" "$out_dir/summary.json"
 bash "$ROOT_DIR/scripts/verify_deepseek4_decode_cohort_receipt.sh" \
   "$out_dir/summary.json" "$raw" "$test_log" "$measurement_log" \
-  "$settle_log" "$expected_source_sha" "$expected_model_sha"
+  "$settle_log" "$expected_source_sha" "$expected_model_sha" \
+  "$contention_measurement_log" "$contention_settle_log"
 sha256_file "$out_dir/summary.json" >"$out_dir/summary.json.sha256"

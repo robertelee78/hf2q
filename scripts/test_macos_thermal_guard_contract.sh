@@ -131,6 +131,144 @@ read_sequence_state() {
   sequence_index=$((sequence_index + 1))
 }
 
+# Calibrated host measurements distinguish the release gate's existing process
+# group from foreign compiler and hf2q work. The snapshot seam keeps this
+# contract deterministic without launching or killing any foreign process.
+contention_snapshot='100\t100\tbash
+101\t100\thf2q
+102\t100\thf2q-abcdef
+200\t200\tlaunchd'
+host_contention_process_snapshot() {
+  printf '%b\n' "$contention_snapshot"
+}
+contention_log="$tmp_dir/contention.log"
+host_contention_sample "$contention_log" owned-baseline 100 5000
+test "$HOST_CONTENTION_STATE" = quiet
+test "$HOST_CONTENTION_OWNER_PGID" = 100
+test "$(tail -1 "$contention_log")" = $'5000\tquiet\towned-baseline\t100\t-'
+
+for foreign_name in cargo rustc llama-cli llama-server hf2q hf2q-deadbeef; do
+  contention_snapshot="100\\t100\\tbash
+101\\t100\\thf2q
+200\\t200\\t${foreign_name}"
+  host_contention_sample "$contention_log" "foreign-$foreign_name" 100 5001
+  test "$HOST_CONTENTION_STATE" = contended
+  test "$HOST_CONTENTION_OFFENDERS" = "200:200:$foreign_name"
+done
+
+# A compiler is never part of a calibrated interval, even if a future harness
+# accidentally launches one inside the owned process group.
+contention_snapshot='100\t100\tbash
+201\t100\tcargo'
+host_contention_sample "$contention_log" owned-cargo 100 5002
+test "$HOST_CONTENTION_STATE" = contended
+test "$HOST_CONTENTION_OFFENDERS" = '201:100:cargo'
+
+contention_snapshot='100\t100\tbash
+200\t200\tpython3'
+host_contention_sample "$contention_log" unrelated-process 100 5003
+test "$HOST_CONTENTION_STATE" = quiet
+
+contention_snapshot='200\t200\thf2q'
+if host_contention_sample "$contention_log" missing-owner 100 5004; then
+  echo "host contention guard accepted a snapshot without its owner" >&2
+  exit 1
+fi
+contention_snapshot='not-a-pid\t100\thf2q'
+if host_contention_sample "$contention_log" malformed-snapshot 100 5005; then
+  echo "host contention guard accepted a malformed process snapshot" >&2
+  exit 1
+fi
+
+# Settle requires a trailing continuous quiet window. A contended sample
+# resets the same monotonic window instead of producing a magic delay or
+# killing the foreign process.
+contention_sequence=(quiet contended quiet quiet quiet)
+contention_index_file="$tmp_dir/contention-sequence-index"
+printf '0\n' >"$contention_index_file"
+host_contention_process_snapshot() {
+  local contention_index
+  local state
+  contention_index=$(<"$contention_index_file")
+  state=${contention_sequence[$contention_index]}
+  printf '%s\n' "$((contention_index + 1))" >"$contention_index_file"
+  printf '100\t100\tbash\n'
+  [[ "$state" == quiet ]] || printf '200\t200\tcargo\n'
+}
+sequence=(nominal nominal nominal nominal nominal)
+sequence_index=0
+thermal_read_state() {
+  read_sequence_state
+  SECONDS=$((SECONDS + 1))
+}
+thermal_wait_for_nominal "$tmp_dir/contention-reset-thermal.log" \
+  contention-reset 2 10 0 "$tmp_dir/contention-reset-host.log" 100
+test "$(wc -l <"$tmp_dir/contention-reset-host.log" | tr -d '[:space:]')" = 5
+test "$(awk -F '\t' '$2 == "contended" { count++ } END { print count+0 }' \
+  "$tmp_dir/contention-reset-host.log")" = 1
+
+# Once measurement begins, the first contention sample invalidates the wave.
+contention_sequence=(quiet contended)
+printf '0\n' >"$contention_index_file"
+thermal_read_state() { THERMAL_STATE=nominal; }
+(sleep 5) &
+supervised_pid=$!
+if thermal_monitor_nominal_while_pid \
+  "$tmp_dir/contention-measurement-thermal.log" contention-measurement \
+  "$supervised_pid" 0 "$tmp_dir/contention-measurement-host.log" 100; then
+  echo "measurement monitor accepted host contention" >&2
+  kill -TERM "$supervised_pid" 2>/dev/null || true
+  wait "$supervised_pid" 2>/dev/null || true
+  exit 1
+fi
+kill -TERM "$supervised_pid" 2>/dev/null || true
+wait "$supervised_pid" 2>/dev/null || true
+
+# Host receipt validators reject contention, cadence gaps, and malformed rows,
+# while a settle receipt may contain an earlier rejected sample if its trailing
+# quiet window is long enough.
+printf '%s\n' \
+  $'100\tquiet\tphase\t100\t-' \
+  $'102\tquiet\tphase\t100\t-' \
+  $'104\tquiet\tphase\t100\t-' >"$tmp_dir/valid-contention.log"
+host_contention_validate_measurement_log "$tmp_dir/valid-contention.log" 5
+test "$HOST_CONTENTION_LOG_SAMPLES" = 3
+test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = 0
+
+printf '%s\n' \
+  $'100\tquiet\tsettle\t100\t-' \
+  $'105\tcontended\tsettle\t100\t200:200:cargo' \
+  $'110\tquiet\tsettle\t100\t-' \
+  $'115\tquiet\tsettle\t100\t-' \
+  $'120\tquiet\tsettle\t100\t-' >"$tmp_dir/valid-contention-settle.log"
+host_contention_validate_settle_log "$tmp_dir/valid-contention-settle.log" 10 8
+test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = 1
+test "$HOST_CONTENTION_LOG_DURATION_SECONDS" = 10
+
+printf '%s\n' \
+  $'100\tquiet\tphase\t100\t-' \
+  $'102\tcontended\tphase\t100\t200:200:rustc' \
+  >"$tmp_dir/contended-measurement.log"
+if host_contention_validate_measurement_log \
+  "$tmp_dir/contended-measurement.log" 5; then
+  echo "host validator accepted a contended measurement" >&2
+  exit 1
+fi
+printf '%s\n' \
+  $'100\tquiet\tphase\t100\t-' \
+  $'106\tquiet\tphase\t100\t-' >"$tmp_dir/gapped-contention.log"
+if host_contention_validate_measurement_log "$tmp_dir/gapped-contention.log" 5; then
+  echo "host validator accepted a contention telemetry gap" >&2
+  exit 1
+fi
+printf '100\tquiet\tphase\tnot-a-pgid\t-\n' \
+  >"$tmp_dir/malformed-contention.log"
+if host_contention_validate_measurement_log \
+  "$tmp_dir/malformed-contention.log" 5; then
+  echo "host validator accepted malformed contention telemetry" >&2
+  exit 1
+fi
+
 # A non-nominal host must wait until the probe reports Nominal.
 sequence=(serious fair nominal)
 sequence_index=0
@@ -405,14 +543,27 @@ done
 for epoch in $(seq 100 5 160); do
   printf '%s\tnominal\tdeepseek-wave-1-settle\n' "$epoch"
 done >"$receipt_dir/settle.log"
+for epoch in $(seq 100 5 160); do
+  printf '%s\tquiet\tdeepseek-wave-1-settle\t100\t-\n' "$epoch"
+done >"$receipt_dir/settle-contention.log"
 printf '200\tnominal\tdeepseek-wave-1-measurement-start\n' \
   >"$receipt_dir/measurement.log"
 printf '202\tnominal\tdeepseek-wave-1-measurement\n' \
   >>"$receipt_dir/measurement.log"
 printf '204\tnominal\tdeepseek-wave-1-measurement-end\n' \
   >>"$receipt_dir/measurement.log"
+printf '200\tquiet\tdeepseek-wave-1-measurement-start\t100\t-\n' \
+  >"$receipt_dir/measurement-contention.log"
+printf '202\tquiet\tdeepseek-wave-1-measurement\t100\t-\n' \
+  >>"$receipt_dir/measurement-contention.log"
+printf '204\tquiet\tdeepseek-wave-1-measurement-end\t100\t-\n' \
+  >>"$receipt_dir/measurement-contention.log"
 settle_sha=$(shasum -a 256 "$receipt_dir/settle.log" | awk '{print $1}')
 measurement_sha=$(shasum -a 256 "$receipt_dir/measurement.log" | awk '{print $1}')
+contention_settle_sha=$(shasum -a 256 \
+  "$receipt_dir/settle-contention.log" | awk '{print $1}')
+contention_measurement_sha=$(shasum -a 256 \
+  "$receipt_dir/measurement-contention.log" | awk '{print $1}')
 cold_receipts=$(
   for receipt in "$receipt_dir"/agents/agent-*.cold.json; do
     jq -n --arg name "$(basename "$receipt")" \
@@ -421,9 +572,11 @@ cold_receipts=$(
   done | jq -s 'sort_by(.name)'
 )
 jq -n --arg settle_sha "$settle_sha" --arg measurement_sha "$measurement_sha" \
+  --arg contention_settle_sha "$contention_settle_sha" \
+  --arg contention_measurement_sha "$contention_measurement_sha" \
   --argjson cold_receipts "$cold_receipts" '
   {
-    status:"pass", phase:"deepseek-wave-1", required_state:"nominal",
+    schema_version:2,status:"pass", phase:"deepseek-wave-1", required_state:"nominal",
     runtime_preflight:"pass", measurement_scope:"cold-cohort",
     cold_receipts:$cold_receipts,
     settle_seconds:60, settle_duration_seconds:60, settle_samples:13,
@@ -432,7 +585,12 @@ jq -n --arg settle_sha "$settle_sha" --arg measurement_sha "$measurement_sha" \
     settle_sample_interval_seconds:5, maximum_settle_sample_gap_seconds:8,
     non_nominal_measurement_samples:0, settle_telemetry_gaps:0,
     telemetry_gaps:0, settle_log_sha256:$settle_sha,
-    measurement_log_sha256:$measurement_sha
+    measurement_log_sha256:$measurement_sha,
+    host_contention:{policy:"process-group-v1",
+      settle:{log_sha256:$contention_settle_sha,samples:13,
+        duration_seconds:60,contended_samples:0,telemetry_gaps:0},
+      measurement:{log_sha256:$contention_measurement_sha,samples:3,
+        duration_seconds:4,contended_samples:0,telemetry_gaps:0}}
   }
 ' >"$receipt_dir/summary.json"
 jq -n --argjson wave 1 --slurpfile thermal "$receipt_dir/summary.json" \
@@ -440,13 +598,15 @@ jq -n --argjson wave 1 --slurpfile thermal "$receipt_dir/summary.json" \
 bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   "$receipt_dir/envelope.json" "$receipt_dir/summary.json" \
   "$receipt_dir/measurement.log" "$receipt_dir/settle.log" \
-  "$receipt_dir/agents" >/dev/null
+  "$receipt_dir/agents" "$receipt_dir/measurement-contention.log" \
+  "$receipt_dir/settle-contention.log" >/dev/null
 
 jq '.wave = 2' "$receipt_dir/envelope.json" >"$receipt_dir/wrong-wave.json"
 if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   "$receipt_dir/wrong-wave.json" "$receipt_dir/summary.json" \
   "$receipt_dir/measurement.log" "$receipt_dir/settle.log" \
-  "$receipt_dir/agents" >/dev/null 2>&1; then
+  "$receipt_dir/agents" "$receipt_dir/measurement-contention.log" \
+  "$receipt_dir/settle-contention.log" >/dev/null 2>&1; then
   echo "thermal receipt accepted the wrong wave" >&2
   exit 1
 fi
@@ -458,7 +618,8 @@ jq --slurpfile thermal "$receipt_dir/stale-summary.json" \
 if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   "$receipt_dir/stale-envelope.json" "$receipt_dir/stale-summary.json" \
   "$receipt_dir/measurement.log" "$receipt_dir/settle.log" \
-  "$receipt_dir/agents" >/dev/null 2>&1; then
+  "$receipt_dir/agents" "$receipt_dir/measurement-contention.log" \
+  "$receipt_dir/settle-contention.log" >/dev/null 2>&1; then
   echo "thermal receipt accepted a stale schema" >&2
   exit 1
 fi
@@ -470,7 +631,8 @@ jq --slurpfile thermal "$receipt_dir/no-scope-summary.json" \
 if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   "$receipt_dir/no-scope-envelope.json" "$receipt_dir/no-scope-summary.json" \
   "$receipt_dir/measurement.log" "$receipt_dir/settle.log" \
-  "$receipt_dir/agents" >/dev/null 2>&1; then
+  "$receipt_dir/agents" "$receipt_dir/measurement-contention.log" \
+  "$receipt_dir/settle-contention.log" >/dev/null 2>&1; then
   echo "thermal receipt accepted a missing cold-cohort scope" >&2
   exit 1
 fi
@@ -479,7 +641,8 @@ printf '{"agent":1,"status":"mutated"}\n' \
 if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   "$receipt_dir/envelope.json" "$receipt_dir/summary.json" \
   "$receipt_dir/measurement.log" "$receipt_dir/settle.log" \
-  "$receipt_dir/agents" >/dev/null 2>&1; then
+  "$receipt_dir/agents" "$receipt_dir/measurement-contention.log" \
+  "$receipt_dir/settle-contention.log" >/dev/null 2>&1; then
   echo "thermal receipt accepted mutated cold evidence" >&2
   exit 1
 fi
@@ -497,8 +660,58 @@ jq --slurpfile thermal "$receipt_dir/wrong-phase-summary.json" \
 if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   "$receipt_dir/wrong-phase-envelope.json" "$receipt_dir/wrong-phase-summary.json" \
   "$receipt_dir/wrong-phase.log" "$receipt_dir/settle.log" \
-  "$receipt_dir/agents" >/dev/null 2>&1; then
+  "$receipt_dir/agents" "$receipt_dir/measurement-contention.log" \
+  "$receipt_dir/settle-contention.log" >/dev/null 2>&1; then
   echo "thermal receipt accepted a cross-wave log phase" >&2
+  exit 1
+fi
+
+awk -F '\t' 'BEGIN { OFS="\t" }
+  NR == 2 { $2="contended"; $5="200:200:hf2q" }
+  { print }
+' "$receipt_dir/measurement-contention.log" \
+  >"$receipt_dir/contended-host.log"
+contended_host_sha=$(shasum -a 256 "$receipt_dir/contended-host.log" \
+  | awk '{print $1}')
+jq --arg sha "$contended_host_sha" \
+  '.host_contention.measurement.log_sha256 = $sha
+   | .host_contention.measurement.contended_samples = 1' \
+  "$receipt_dir/summary.json" >"$receipt_dir/contended-host-summary.json"
+jq --slurpfile thermal "$receipt_dir/contended-host-summary.json" \
+  '.thermal = $thermal[0]' "$receipt_dir/envelope.json" \
+  >"$receipt_dir/contended-host-envelope.json"
+if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
+  "$receipt_dir/contended-host-envelope.json" \
+  "$receipt_dir/contended-host-summary.json" "$receipt_dir/measurement.log" \
+  "$receipt_dir/settle.log" "$receipt_dir/agents" \
+  "$receipt_dir/contended-host.log" "$receipt_dir/settle-contention.log" \
+  >/dev/null 2>&1; then
+  echo "thermal receipt accepted host contention" >&2
+  exit 1
+fi
+
+# Even an otherwise quiet, correctly rehashed log must retain exact
+# timestamp/phase alignment with the thermal evidence.
+awk -F '\t' 'BEGIN { OFS="\t" }
+  NR == 2 { $1=203 }
+  { print }
+' "$receipt_dir/measurement-contention.log" \
+  >"$receipt_dir/misaligned-host.log"
+misaligned_host_sha=$(shasum -a 256 "$receipt_dir/misaligned-host.log" \
+  | awk '{print $1}')
+jq --arg sha "$misaligned_host_sha" \
+  '.host_contention.measurement.log_sha256 = $sha' \
+  "$receipt_dir/summary.json" >"$receipt_dir/misaligned-host-summary.json"
+jq --slurpfile thermal "$receipt_dir/misaligned-host-summary.json" \
+  '.thermal = $thermal[0]' "$receipt_dir/envelope.json" \
+  >"$receipt_dir/misaligned-host-envelope.json"
+if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
+  "$receipt_dir/misaligned-host-envelope.json" \
+  "$receipt_dir/misaligned-host-summary.json" "$receipt_dir/measurement.log" \
+  "$receipt_dir/settle.log" "$receipt_dir/agents" \
+  "$receipt_dir/misaligned-host.log" "$receipt_dir/settle-contention.log" \
+  >/dev/null 2>&1; then
+  echo "thermal receipt accepted misaligned host evidence" >&2
   exit 1
 fi
 
