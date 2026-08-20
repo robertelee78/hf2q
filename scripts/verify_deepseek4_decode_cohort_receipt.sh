@@ -8,6 +8,8 @@ measurement_log=${4:?measurement log path is required}
 settle_log=${5:?settle log path is required}
 expected_source_sha=${6:?expected source SHA is required}
 expected_model_sha=${7:?expected model SHA-256 is required}
+contention_measurement_log=${8:?contention measurement log is required}
+contention_settle_log=${9:?contention settle log is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -15,7 +17,8 @@ source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 
-for path in "$summary" "$raw" "$test_log" "$measurement_log" "$settle_log"; do
+for path in "$summary" "$raw" "$test_log" "$measurement_log" "$settle_log" \
+  "$contention_measurement_log" "$contention_settle_log"; do
   [[ -s "$path" ]] || {
     echo "decode-cohort receipt input is missing or empty: $path" >&2
     exit 1
@@ -30,6 +33,10 @@ test "$(sha256_file "$measurement_log")" = \
   "$(jq -er .measurement_log_sha256 "$summary")"
 test "$(sha256_file "$settle_log")" = \
   "$(jq -er .settle_log_sha256 "$summary")"
+test "$(sha256_file "$contention_measurement_log")" = \
+  "$(jq -er .host_contention.measurement.log_sha256 "$summary")"
+test "$(sha256_file "$contention_settle_log")" = \
+  "$(jq -er .host_contention.settle.log_sha256 "$summary")"
 jq -s -e 'length == 1' "$summary" >/dev/null
 
 jq -e --slurpfile raw "$raw" \
@@ -53,10 +60,10 @@ jq -e --slurpfile raw "$raw" \
       .measurement_samples,.measurement_duration_seconds,
       .sample_interval_seconds,.maximum_sample_gap_seconds,
       .non_nominal_measurement_samples,.fair_measurement_samples,
-      .over_limit_measurement_samples,.telemetry_gaps
+      .over_limit_measurement_samples,.telemetry_gaps,.host_contention
     )) == ($receipt | del(.schema_version))
     and $receipt.schema_version == 1
-    and .schema_version == 2 and .status == "pass"
+    and .schema_version == 3 and .status == "pass"
     and .source_sha == $source_sha and .model_sha256 == $model_sha256
     and .mlx_native_version == "0.10.12"
     and .thermal_probe.implementation == "compiled-foundation-helper"
@@ -123,6 +130,22 @@ jq -e --slurpfile raw "$raw" \
     and .over_limit_measurement_samples == 0
     and .non_nominal_measurement_samples == .fair_measurement_samples
     and .settle_telemetry_gaps == 0 and .telemetry_gaps == 0
+    and .host_contention.policy == "process-group-v1"
+    and (.host_contention.settle.log_sha256 | test("^[0-9a-f]{64}$"))
+    and (.host_contention.settle.samples | type) == "number"
+    and .host_contention.settle.samples > 0
+    and (.host_contention.settle.duration_seconds | type) == "number"
+    and .host_contention.settle.duration_seconds >= 60
+    and (.host_contention.settle.contended_samples | type) == "number"
+    and .host_contention.settle.contended_samples >= 0
+    and .host_contention.settle.telemetry_gaps == 0
+    and (.host_contention.measurement.log_sha256 | test("^[0-9a-f]{64}$"))
+    and (.host_contention.measurement.samples | type) == "number"
+    and .host_contention.measurement.samples >= 2
+    and (.host_contention.measurement.duration_seconds | type) == "number"
+    and .host_contention.measurement.duration_seconds > 0
+    and .host_contention.measurement.contended_samples == 0
+    and .host_contention.measurement.telemetry_gaps == 0
   ' "$summary" >/dev/null
 
 if [[ "$(sha256_file "$ROOT_DIR/scripts/macos_thermal_probe.swift")" != \
@@ -180,5 +203,34 @@ test "$THERMAL_LOG_DURATION_SECONDS" = \
   "$(jq -er .settle_duration_seconds "$summary")"
 test "$THERMAL_LOG_GAPS" = "$(jq -er .settle_telemetry_gaps "$summary")"
 awk -F '\t' '$3 != "decode-cohort-settle" { exit 1 }' "$settle_log"
+
+host_contention_validate_measurement_log "$contention_measurement_log" 5
+test "$HOST_CONTENTION_LOG_SAMPLES" = \
+  "$(jq -er .host_contention.measurement.samples "$summary")"
+test "$HOST_CONTENTION_LOG_DURATION_SECONDS" = \
+  "$(jq -er .host_contention.measurement.duration_seconds "$summary")"
+test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = \
+  "$(jq -er .host_contention.measurement.contended_samples "$summary")"
+test "$HOST_CONTENTION_LOG_GAPS" = \
+  "$(jq -er .host_contention.measurement.telemetry_gaps "$summary")"
+host_contention_validate_settle_log "$contention_settle_log" 60 8
+test "$HOST_CONTENTION_LOG_SAMPLES" = \
+  "$(jq -er .host_contention.settle.samples "$summary")"
+test "$HOST_CONTENTION_LOG_DURATION_SECONDS" = \
+  "$(jq -er .host_contention.settle.duration_seconds "$summary")"
+test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = \
+  "$(jq -er .host_contention.settle.contended_samples "$summary")"
+test "$HOST_CONTENTION_LOG_GAPS" = \
+  "$(jq -er .host_contention.settle.telemetry_gaps "$summary")"
+host_contention_validate_thermal_alignment "$measurement_log" \
+  "$contention_measurement_log"
+host_contention_validate_thermal_alignment "$settle_log" \
+  "$contention_settle_log"
+awk -F '\t' 'NR == 1 && $3 != "decode-cohort-measurement-start" { exit 1 }
+  NR > 1 && $3 != "decode-cohort-measurement" && \
+    $3 != "decode-cohort-measurement-end" { exit 1 }' \
+  "$contention_measurement_log"
+awk -F '\t' '$3 != "decode-cohort-settle" { exit 1 }' \
+  "$contention_settle_log"
 
 echo "DeepSeek-V4 decode-cohort receipt verified" >&2

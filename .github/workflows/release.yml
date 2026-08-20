@@ -155,13 +155,17 @@ jobs:
             "$cooperative_dir/summary.json" "$cooperative_dir/raw.json" \
             "$cooperative_dir/test.log" "$cooperative_dir/thermal.log" \
             "$cooperative_dir/settle.log" "$EXPECTED_SHA" \
-            "$EXPECTED_DEEPSEEK_MODEL_SHA256"
+            "$EXPECTED_DEEPSEEK_MODEL_SHA256" \
+            "$cooperative_dir/measurement-contention.log" \
+            "$cooperative_dir/settle-contention.log"
           decode_cohort_dir="$gate_dir/deepseek/decode-cohort"
           bash scripts/verify_deepseek4_decode_cohort_receipt.sh \
             "$decode_cohort_dir/summary.json" "$decode_cohort_dir/raw.json" \
             "$decode_cohort_dir/test.log" "$decode_cohort_dir/thermal.log" \
             "$decode_cohort_dir/settle.log" "$EXPECTED_SHA" \
-            "$EXPECTED_DEEPSEEK_MODEL_SHA256"
+            "$EXPECTED_DEEPSEEK_MODEL_SHA256" \
+            "$decode_cohort_dir/measurement-contention.log" \
+            "$decode_cohort_dir/settle-contention.log"
           for wave in 1 2; do
             wave_dir="$gate_dir/deepseek/full-context-$wave"
             summary_sha=$(shasum -a 256 "$wave_dir/summary.json" | awk '{print $1}')
@@ -174,9 +178,12 @@ jobs:
             thermal_summary="$wave_dir/thermal/summary.json"
             thermal_log="$wave_dir/thermal/measurement.log"
             thermal_settle_log="$wave_dir/thermal/settle.log"
+            contention_log="$wave_dir/thermal/measurement-contention.log"
+            contention_settle_log="$wave_dir/thermal/settle-contention.log"
             bash scripts/verify_macos_thermal_receipt.sh "$wave" \
               "$wave_dir/envelope.json" "$thermal_summary" \
-              "$thermal_log" "$thermal_settle_log" "$wave_dir/agents"
+              "$thermal_log" "$thermal_settle_log" "$wave_dir/agents" \
+              "$contention_log" "$contention_settle_log"
             server_log="$gate_dir/deepseek/process-wave-$wave/server.log"
             test -s "$server_log"
             test "$(shasum -a 256 "$server_log" | awk '{print $1}')" = \
@@ -263,6 +270,7 @@ jobs:
              and .fixtures.deepseek_agentic.prompt_provenance_sha256 == $prompt_provenance_sha256
              and (.families.deepseek as $d
                | $d.status == "pass"
+               and $d.cooperative_prefill.schema_version == 2
                and $d.cooperative_prefill.status == "pass"
                and $d.cooperative_prefill.source_sha == $source_sha
                and $d.cooperative_prefill.model_sha256 == $deepseek_sha
@@ -275,6 +283,8 @@ jobs:
                and $d.cooperative_prefill.over_limit_measurement_samples == 0
                and $d.cooperative_prefill.non_nominal_measurement_samples
                  == $d.cooperative_prefill.fair_measurement_samples
+               and $d.cooperative_prefill.host_contention.policy == "process-group-v1"
+               and $d.cooperative_prefill.host_contention.measurement.contended_samples == 0
                and $d.prompt_provenance.status == "pass"
                and $d.prompt_provenance.prompt_contract_sha256 == $prompt_contract_sha256
                and $d.prompt_provenance.model_sha256 == $deepseek_sha
@@ -326,7 +336,7 @@ jobs:
                and $d.cached_suffix.cancellation_during_decode.post_cancel_cached_tokens == $d.cached_suffix.cancellation_during_decode.expected_anchor_tokens
                and $d.cached_suffix.ready_before == true and $d.cached_suffix.ready_after == true
                and $d.cached_suffix.fatal_log_signatures == 0
-               and $d.decode_cohort.schema_version == 2
+               and $d.decode_cohort.schema_version == 3
                and $d.decode_cohort.status == "pass"
                and $d.decode_cohort.source_sha == $root.source_sha
                and $d.decode_cohort.model_sha256 == $deepseek_sha
@@ -338,6 +348,8 @@ jobs:
                and $d.decode_cohort.over_limit_measurement_samples == 0
                and $d.decode_cohort.non_nominal_measurement_samples
                  == $d.decode_cohort.fair_measurement_samples
+               and $d.decode_cohort.host_contention.policy == "process-group-v1"
+               and $d.decode_cohort.host_contention.measurement.contended_samples == 0
                and ($d.full_context_waves | length) == 2
                and ([$d.full_context_waves[].wave] | sort) == [1, 2]
                and all($d.full_context_waves[];
@@ -352,6 +364,7 @@ jobs:
                  and .receipt.prompt_contract_sha256 == $prompt_contract_sha256
                  and .receipt.prompt_provenance_sha256 == $prompt_provenance_sha256
                  and .receipt.serialization_policy == $pc.serialization.policy
+                 and .thermal.schema_version == 2
                  and .thermal.status == "pass"
                  and .thermal.required_state == "nominal"
                  and .thermal.runtime_preflight == "pass"
@@ -390,6 +403,8 @@ jobs:
                  and .thermal.telemetry_gaps == 0
                  and (.thermal.settle_log_sha256 | test("^[0-9a-f]{64}$"))
                  and (.thermal.measurement_log_sha256 | test("^[0-9a-f]{64}$"))
+                 and .thermal.host_contention.policy == "process-group-v1"
+                 and .thermal.host_contention.measurement.contended_samples == 0
                  and (.cold_prefill_tokens_per_second | type) == "array"
                  and (.cold_prefill_tokens_per_second | length) == 4
                  and all(.cold_prefill_tokens_per_second[]; type == "number" and . > 0)

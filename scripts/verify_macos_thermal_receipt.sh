@@ -7,6 +7,8 @@ summary=${3:?thermal summary path is required}
 measurement_log=${4:?measurement log path is required}
 settle_log=${5:?settle log path is required}
 cold_receipt_dir=${6:?cold receipt directory is required}
+contention_measurement_log=${7:?contention measurement log is required}
+contention_settle_log=${8:?contention settle log is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -16,7 +18,8 @@ source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
   echo "thermal receipt wave must be 1 or 2" >&2
   exit 2
 }
-for path in "$envelope" "$summary" "$measurement_log" "$settle_log"; do
+for path in "$envelope" "$summary" "$measurement_log" "$settle_log" \
+  "$contention_measurement_log" "$contention_settle_log"; do
   [[ -s "$path" ]] || {
     echo "thermal receipt input is missing or empty: $path" >&2
     exit 1
@@ -35,7 +38,8 @@ test "$(jq -er .phase "$summary")" = "$phase"
 jq -e --slurpfile thermal "$summary" '.thermal == $thermal[0]' \
   "$envelope" >/dev/null
 jq -e --arg phase "$phase" '
-  .status == "pass"
+  .schema_version == 2
+  and .status == "pass"
   and .phase == $phase
   and .required_state == "nominal"
   and .runtime_preflight == "pass"
@@ -71,12 +75,32 @@ jq -e --arg phase "$phase" '
   and (.settle_log_sha256 | test("^[0-9a-f]{64}$"))
   and (.measurement_log_sha256 | type) == "string"
   and (.measurement_log_sha256 | test("^[0-9a-f]{64}$"))
+  and .host_contention.policy == "process-group-v1"
+  and (.host_contention.settle.log_sha256 | test("^[0-9a-f]{64}$"))
+  and (.host_contention.settle.samples | type) == "number"
+  and .host_contention.settle.samples > 0
+  and (.host_contention.settle.duration_seconds | type) == "number"
+  and .host_contention.settle.duration_seconds >= 60
+  and (.host_contention.settle.contended_samples | type) == "number"
+  and .host_contention.settle.contended_samples >= 0
+  and .host_contention.settle.telemetry_gaps == 0
+  and (.host_contention.measurement.log_sha256 | test("^[0-9a-f]{64}$"))
+  and (.host_contention.measurement.samples | type) == "number"
+  and .host_contention.measurement.samples >= 2
+  and (.host_contention.measurement.duration_seconds | type) == "number"
+  and .host_contention.measurement.duration_seconds > 0
+  and .host_contention.measurement.contended_samples == 0
+  and .host_contention.measurement.telemetry_gaps == 0
 ' "$summary" >/dev/null
 
 test "$(sha256_file "$measurement_log")" = \
   "$(jq -er .measurement_log_sha256 "$summary")"
 test "$(sha256_file "$settle_log")" = \
   "$(jq -er .settle_log_sha256 "$summary")"
+test "$(sha256_file "$contention_measurement_log")" = \
+  "$(jq -er .host_contention.measurement.log_sha256 "$summary")"
+test "$(sha256_file "$contention_settle_log")" = \
+  "$(jq -er .host_contention.settle.log_sha256 "$summary")"
 while IFS=$'\t' read -r name expected_sha; do
   [[ "$name" =~ ^agent-[1-4]\.cold\.json$ ]]
   test "$(sha256_file "$cold_receipt_dir/$name")" = "$expected_sha"
@@ -103,5 +127,34 @@ test "$THERMAL_LOG_DURATION_SECONDS" = \
   "$(jq -er .settle_duration_seconds "$summary")"
 test "$THERMAL_LOG_GAPS" = "$(jq -er .settle_telemetry_gaps "$summary")"
 awk -F '\t' -v phase="$phase-settle" '$3 != phase { exit 1 }' "$settle_log"
+
+host_contention_validate_measurement_log "$contention_measurement_log" 5
+test "$HOST_CONTENTION_LOG_SAMPLES" = \
+  "$(jq -er .host_contention.measurement.samples "$summary")"
+test "$HOST_CONTENTION_LOG_DURATION_SECONDS" = \
+  "$(jq -er .host_contention.measurement.duration_seconds "$summary")"
+test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = \
+  "$(jq -er .host_contention.measurement.contended_samples "$summary")"
+test "$HOST_CONTENTION_LOG_GAPS" = \
+  "$(jq -er .host_contention.measurement.telemetry_gaps "$summary")"
+host_contention_validate_settle_log "$contention_settle_log" 60 8
+test "$HOST_CONTENTION_LOG_SAMPLES" = \
+  "$(jq -er .host_contention.settle.samples "$summary")"
+test "$HOST_CONTENTION_LOG_DURATION_SECONDS" = \
+  "$(jq -er .host_contention.settle.duration_seconds "$summary")"
+test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = \
+  "$(jq -er .host_contention.settle.contended_samples "$summary")"
+test "$HOST_CONTENTION_LOG_GAPS" = \
+  "$(jq -er .host_contention.settle.telemetry_gaps "$summary")"
+host_contention_validate_thermal_alignment "$measurement_log" \
+  "$contention_measurement_log"
+host_contention_validate_thermal_alignment "$settle_log" \
+  "$contention_settle_log"
+awk -F '\t' -v phase="$phase-measurement" '
+  NR == 1 && $3 != phase "-start" { exit 1 }
+  NR > 1 && $3 != phase && $3 != phase "-end" { exit 1 }
+' "$contention_measurement_log"
+awk -F '\t' -v phase="$phase-settle" '$3 != phase { exit 1 }' \
+  "$contention_settle_log"
 
 echo "macOS thermal receipt verified: wave $wave" >&2

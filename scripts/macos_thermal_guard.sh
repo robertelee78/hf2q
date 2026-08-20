@@ -9,6 +9,122 @@ THERMAL_PROBE_OWNED_DIR=""
 THERMAL_PROBE_SOURCE=""
 THERMAL_PROBE_COMPILER=""
 THERMAL_PROBE_COMPILER_VERSION=""
+THERMAL_SAMPLED_AT=""
+# This sourced global is consumed by receipt producers.
+# shellcheck disable=SC2034
+HOST_CONTENTION_POLICY="process-group-v1"
+HOST_CONTENTION_STATE=""
+HOST_CONTENTION_OWNER_PGID=""
+HOST_CONTENTION_OFFENDERS=""
+
+# Emit a normalized process snapshot for the calibrated host-contention guard.
+# Process-group ownership is already established by the release workflow's
+# process-group supervisor; no foreign process is ever signaled by this helper.
+host_contention_process_snapshot() {
+  local snapshot
+
+  snapshot=$(/bin/ps -axo pid=,pgid=,comm= 2>/dev/null | awk '
+    {
+      pid = $1
+      pgid = $2
+      $1 = ""
+      $2 = ""
+      sub(/^[[:space:]]+/, "", $0)
+      if (pid !~ /^[1-9][0-9]*$/ || pgid !~ /^[1-9][0-9]*$/ \
+          || length($0) == 0) {
+        exit 2
+      }
+      gsub(/\t/, " ", $0)
+      printf "%s\t%s\t%s\n", pid, pgid, $0
+    }
+  ') || {
+    echo "failed to read a normalized host process snapshot" >&2
+    return 1
+  }
+  [[ -n "$snapshot" ]] || {
+    echo "host process snapshot was empty" >&2
+    return 1
+  }
+  printf '%s\n' "$snapshot"
+}
+
+host_contention_sample() {
+  local log_file=$1
+  local phase=$2
+  local owner_pid=$3
+  local sampled_at=${4:-}
+  local snapshot
+  local classification
+
+  [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || {
+    echo "host contention owner pid must be a positive integer" >&2
+    return 2
+  }
+  if [[ -z "$sampled_at" ]]; then
+    sampled_at=$(date +%s) || return 1
+  fi
+  [[ "$sampled_at" =~ ^[0-9]+$ ]] || {
+    echo "host contention sample timestamp must be a non-negative integer" >&2
+    return 2
+  }
+  snapshot=$(host_contention_process_snapshot) || return 1
+  classification=$(awk -F '\t' -v owner="$owner_pid" '
+    BEGIN { invalid = 0; count = 0 }
+    {
+      if (NF != 3 || $1 !~ /^[1-9][0-9]*$/ \
+          || $2 !~ /^[1-9][0-9]*$/ || length($3) == 0 \
+          || seen[$1]++) {
+        invalid = 1
+        next
+      }
+      count++
+      pid[count] = $1
+      pgid[count] = $2
+      pgid_by_pid[$1] = $2
+      command[count] = $3
+    }
+    END {
+      if (invalid || count == 0 || !(owner in pgid_by_pid)) exit 2
+      owner_pgid = pgid_by_pid[owner]
+      offenders = ""
+      for (i = 1; i <= count; i++) {
+        name = command[i]
+        sub(/^.*\//, "", name)
+        forbidden = (name ~ /^(cargo|rustc|llama-cli|llama-server)(-|$)/) \
+          || (name ~ /^hf2q(-|$)/ && pgid[i] != owner_pgid)
+        if (forbidden) {
+          gsub(/[^A-Za-z0-9._+-]/, "_", name)
+          item = pid[i] ":" pgid[i] ":" name
+          offenders = offenders == "" ? item : offenders "," item
+        }
+      }
+      printf "%s\t%s\n", owner_pgid, \
+        (offenders == "" ? "-" : offenders)
+    }
+  ' <<<"$snapshot") || {
+    echo "host contention snapshot was malformed or omitted owner pid $owner_pid" >&2
+    return 1
+  }
+  IFS=$'\t' read -r HOST_CONTENTION_OWNER_PGID HOST_CONTENTION_OFFENDERS \
+    <<<"$classification"
+  if [[ "$HOST_CONTENTION_OFFENDERS" == - ]]; then
+    HOST_CONTENTION_STATE=quiet
+  else
+    HOST_CONTENTION_STATE=contended
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$sampled_at" \
+    "$HOST_CONTENTION_STATE" "$phase" "$HOST_CONTENTION_OWNER_PGID" \
+    "$HOST_CONTENTION_OFFENDERS" >>"$log_file"
+}
+
+host_contention_require_quiet() {
+  local phase=$1
+
+  [[ "$HOST_CONTENTION_STATE" == quiet ]] || {
+    echo "calibrated phase $phase observed forbidden host work: ${HOST_CONTENTION_OFFENDERS:-<unknown>}" >&2
+    return 1
+  }
+}
 
 thermal_validate_state() {
   local state=$1
@@ -151,6 +267,7 @@ thermal_sample() {
   }
   printf '%s\t%s\t%s\n' "$sampled_at" "$THERMAL_STATE" "$phase" \
     >>"$log_file"
+  THERMAL_SAMPLED_AT=$sampled_at
 }
 
 thermal_wait_for_nominal() {
@@ -159,6 +276,8 @@ thermal_wait_for_nominal() {
   local settle_seconds=$3
   local timeout_seconds=$4
   local sample_seconds=$5
+  local contention_log=${6:-}
+  local contention_owner_pid=${7:-}
   local deadline
   local nominal_since
 
@@ -171,9 +290,23 @@ thermal_wait_for_nominal() {
   deadline=$((SECONDS + timeout_seconds))
   nominal_since=-1
   : >"$log_file"
+  if [[ -n "$contention_log" || -n "$contention_owner_pid" ]]; then
+    [[ -n "$contention_log" && -n "$contention_owner_pid" ]] || {
+      echo "thermal settle requires both contention log and owner pid" >&2
+      return 2
+    }
+    : >"$contention_log"
+  fi
   while :; do
     thermal_sample "$log_file" "$phase" || return 1
-    if [[ "$THERMAL_STATE" == nominal ]]; then
+    if [[ -n "$contention_log" ]]; then
+      host_contention_sample "$contention_log" "$phase" \
+        "$contention_owner_pid" "$THERMAL_SAMPLED_AT" || return 1
+    else
+      HOST_CONTENTION_STATE=quiet
+    fi
+    if [[ "$THERMAL_STATE" == nominal \
+      && "$HOST_CONTENTION_STATE" == quiet ]]; then
       if ((nominal_since < 0)); then
         nominal_since=$SECONDS
       fi
@@ -184,7 +317,7 @@ thermal_wait_for_nominal() {
       nominal_since=-1
     fi
     if ((SECONDS >= deadline)); then
-      echo "thermal state did not remain nominal for ${settle_seconds}s within ${timeout_seconds}s" >&2
+      echo "thermal state and host work did not remain calibrated for ${settle_seconds}s within ${timeout_seconds}s" >&2
       return 1
     fi
     sleep "$sample_seconds"
@@ -196,6 +329,8 @@ thermal_monitor_nominal() {
   local phase=$2
   local stop_file=$3
   local sample_seconds=$4
+  local contention_log=${5:-}
+  local contention_owner_pid=${6:-}
 
   [[ "$sample_seconds" =~ ^[0-9]+$ ]] || {
     echo "thermal sample interval must be a non-negative integer" >&2
@@ -203,6 +338,12 @@ thermal_monitor_nominal() {
   }
   while [[ ! -e "$stop_file" ]]; do
     thermal_sample "$log_file" "$phase" || return 1
+    if [[ -n "$contention_log" ]]; then
+      [[ -n "$contention_owner_pid" ]] || return 2
+      host_contention_sample "$contention_log" "$phase" \
+        "$contention_owner_pid" "$THERMAL_SAMPLED_AT" || return 1
+      host_contention_require_quiet "$phase" || return 1
+    fi
     if [[ "$THERMAL_STATE" != nominal ]]; then
       echo "calibrated phase $phase observed non-nominal thermal state: $THERMAL_STATE" >&2
       return 1
@@ -236,6 +377,8 @@ thermal_monitor_nominal_while_pid() {
   local phase=$2
   local producer_pid=$3
   local sample_seconds=$4
+  local contention_log=${5:-}
+  local contention_owner_pid=${6:-}
 
   [[ "$producer_pid" =~ ^[1-9][0-9]*$ ]] || {
     echo "thermal producer pid must be a positive integer" >&2
@@ -251,6 +394,12 @@ thermal_monitor_nominal_while_pid() {
       return 0
     fi
     thermal_sample "$log_file" "$phase" || return 1
+    if [[ -n "$contention_log" ]]; then
+      [[ -n "$contention_owner_pid" ]] || return 2
+      host_contention_sample "$contention_log" "$phase" \
+        "$contention_owner_pid" "$THERMAL_SAMPLED_AT" || return 1
+      host_contention_require_quiet "$phase" || return 1
+    fi
     if [[ "$THERMAL_STATE" != nominal ]]; then
       echo "calibrated phase $phase observed non-nominal thermal state: $THERMAL_STATE" >&2
       return 1
@@ -264,6 +413,8 @@ thermal_monitor_fair_or_better_while_pid() {
   local phase=$2
   local producer_pid=$3
   local sample_seconds=$4
+  local contention_log=${5:-}
+  local contention_owner_pid=${6:-}
 
   [[ "$producer_pid" =~ ^[1-9][0-9]*$ ]] || {
     echo "thermal producer pid must be a positive integer" >&2
@@ -279,6 +430,12 @@ thermal_monitor_fair_or_better_while_pid() {
       return 0
     fi
     thermal_sample "$log_file" "$phase" || return 1
+    if [[ -n "$contention_log" ]]; then
+      [[ -n "$contention_owner_pid" ]] || return 2
+      host_contention_sample "$contention_log" "$phase" \
+        "$contention_owner_pid" "$THERMAL_SAMPLED_AT" || return 1
+      host_contention_require_quiet "$phase" || return 1
+    fi
     case "$THERMAL_STATE" in
       nominal|fair) ;;
       serious|critical)
@@ -315,6 +472,8 @@ thermal_monitor_nominal_until_cold_receipts() {
   local sample_seconds=$5
   local timeout_seconds=$6
   local producer_pid=${7:-}
+  local contention_log=${8:-}
+  local contention_owner_pid=${9:-}
   local deadline
   local producer_state
   local receipt_index
@@ -347,6 +506,12 @@ thermal_monitor_nominal_until_cold_receipts() {
       fi
     fi
     thermal_sample "$log_file" "$phase" || return 1
+    if [[ -n "$contention_log" ]]; then
+      [[ -n "$contention_owner_pid" ]] || return 2
+      host_contention_sample "$contention_log" "$phase" \
+        "$contention_owner_pid" "$THERMAL_SAMPLED_AT" || return 1
+      host_contention_require_quiet "$phase" || return 1
+    fi
     if [[ "$THERMAL_STATE" != nominal ]]; then
       echo "calibrated phase $phase observed non-nominal thermal state: $THERMAL_STATE" >&2
       return 1
@@ -370,6 +535,11 @@ thermal_monitor_nominal_until_cold_receipts() {
     fi
     if ((receipt_count == expected_receipts && receipt_set_complete == 1)); then
       thermal_sample "$log_file" "$phase-end" || return 1
+      if [[ -n "$contention_log" ]]; then
+        host_contention_sample "$contention_log" "$phase-end" \
+          "$contention_owner_pid" "$THERMAL_SAMPLED_AT" || return 1
+        host_contention_require_quiet "$phase-end" || return 1
+      fi
       [[ "$THERMAL_STATE" == nominal ]] || {
         echo "calibrated phase $phase ended in non-nominal thermal state: $THERMAL_STATE" >&2
         return 1
@@ -386,6 +556,109 @@ thermal_monitor_nominal_until_cold_receipts() {
     fi
     sleep "$sample_seconds"
   done
+}
+
+host_contention_validate_measurement_log() {
+  local log_file=$1
+  local maximum_gap_seconds=$2
+  local stats
+
+  [[ "$maximum_gap_seconds" =~ ^[0-9]+$ ]] || return 2
+  stats=$(awk -F '\t' -v maximum="$maximum_gap_seconds" '
+    BEGIN { invalid = 0; gaps = 0; contended = 0; owner_pgid = "" }
+    {
+      if (NF != 5 || $1 !~ /^[0-9]+$/ \
+          || $2 !~ /^(quiet|contended)$/ || length($3) == 0 \
+          || $4 !~ /^[1-9][0-9]*$/ \
+          || ($2 == "quiet" && $5 != "-") \
+          || ($2 == "contended" \
+            && $5 !~ /^[0-9]+:[0-9]+:[A-Za-z0-9._+-]+(,[0-9]+:[0-9]+:[A-Za-z0-9._+-]+)*$/)) {
+        invalid++
+        next
+      }
+      samples++
+      if (owner_pgid == "") owner_pgid = $4
+      if ($4 != owner_pgid) invalid++
+      if ($2 == "contended") contended++
+      if (samples == 1) first = $1
+      if (samples > 1 && ($1 < previous || $1 - previous > maximum)) gaps++
+      previous = $1
+      last = $1
+    }
+    END {
+      duration = samples > 0 ? last - first : -1
+      printf "%d\t%d\t%d\t%d\t%d\n", samples, duration, \
+        contended, gaps, invalid
+    }
+  ' "$log_file") || return 1
+  IFS=$'\t' read -r HOST_CONTENTION_LOG_SAMPLES \
+    HOST_CONTENTION_LOG_DURATION_SECONDS HOST_CONTENTION_LOG_CONTENDED_SAMPLES \
+    HOST_CONTENTION_LOG_GAPS HOST_CONTENTION_LOG_INVALID_ROWS <<<"$stats"
+  ((HOST_CONTENTION_LOG_SAMPLES >= 2)) \
+    && ((HOST_CONTENTION_LOG_DURATION_SECONDS > 0)) \
+    && ((HOST_CONTENTION_LOG_CONTENDED_SAMPLES == 0)) \
+    && ((HOST_CONTENTION_LOG_GAPS == 0)) \
+    && ((HOST_CONTENTION_LOG_INVALID_ROWS == 0))
+}
+
+host_contention_validate_settle_log() {
+  local log_file=$1
+  local required_seconds=$2
+  local maximum_gap_seconds=$3
+  local stats
+
+  [[ "$required_seconds" =~ ^[0-9]+$ ]] || return 2
+  [[ "$maximum_gap_seconds" =~ ^[0-9]+$ ]] || return 2
+  stats=$(awk -F '\t' -v maximum="$maximum_gap_seconds" '
+    BEGIN {
+      invalid = 0; gaps = 0; contended = 0; quiet_since = -1
+      owner_pgid = ""
+    }
+    {
+      if (NF != 5 || $1 !~ /^[0-9]+$/ \
+          || $2 !~ /^(quiet|contended)$/ || length($3) == 0 \
+          || $4 !~ /^[1-9][0-9]*$/ \
+          || ($2 == "quiet" && $5 != "-") \
+          || ($2 == "contended" \
+            && $5 !~ /^[0-9]+:[0-9]+:[A-Za-z0-9._+-]+(,[0-9]+:[0-9]+:[A-Za-z0-9._+-]+)*$/)) {
+        invalid++
+        next
+      }
+      samples++
+      if (owner_pgid == "") owner_pgid = $4
+      if ($4 != owner_pgid) invalid++
+      if (samples > 1 && ($1 < previous || $1 - previous > maximum)) gaps++
+      previous = $1
+      if ($2 == "contended") {
+        contended++
+        quiet_since = -1
+      } else if (quiet_since < 0) {
+        quiet_since = $1
+      }
+      last = $1
+    }
+    END {
+      duration = quiet_since >= 0 ? last - quiet_since : -1
+      printf "%d\t%d\t%d\t%d\t%d\n", samples, duration, \
+        contended, gaps, invalid
+    }
+  ' "$log_file") || return 1
+  IFS=$'\t' read -r HOST_CONTENTION_LOG_SAMPLES \
+    HOST_CONTENTION_LOG_DURATION_SECONDS HOST_CONTENTION_LOG_CONTENDED_SAMPLES \
+    HOST_CONTENTION_LOG_GAPS HOST_CONTENTION_LOG_INVALID_ROWS <<<"$stats"
+  ((HOST_CONTENTION_LOG_SAMPLES > 0)) \
+    && ((HOST_CONTENTION_LOG_DURATION_SECONDS >= required_seconds)) \
+    && ((HOST_CONTENTION_LOG_GAPS == 0)) \
+    && ((HOST_CONTENTION_LOG_INVALID_ROWS == 0))
+}
+
+host_contention_validate_thermal_alignment() {
+  local thermal_log=$1
+  local contention_log=$2
+
+  cmp -s \
+    <(awk -F '\t' 'NF == 3 { print $1 "\t" $3 }' "$thermal_log") \
+    <(awk -F '\t' 'NF == 5 { print $1 "\t" $3 }' "$contention_log")
 }
 
 thermal_validate_measurement_log() {

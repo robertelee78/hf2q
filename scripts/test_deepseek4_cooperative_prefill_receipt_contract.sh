@@ -34,6 +34,8 @@ raw="$tmp_dir/raw.json"
 test_log="$tmp_dir/test.log"
 measurement="$tmp_dir/thermal.log"
 settle="$tmp_dir/settle.log"
+contention_measurement="$tmp_dir/measurement-contention.log"
+contention_settle="$tmp_dir/settle-contention.log"
 summary="$tmp_dir/summary.json"
 
 jq -n '{
@@ -55,8 +57,16 @@ printf 'cooperative hardware test passed\n' >"$test_log"
 printf '2000\tnominal\tcooperative-prefill-measurement-start\n' >"$measurement"
 printf '2002\tfair\tcooperative-prefill-measurement\n' >>"$measurement"
 printf '2004\tfair\tcooperative-prefill-measurement-end\n' >>"$measurement"
+printf '2000\tquiet\tcooperative-prefill-measurement-start\t100\t-\n' \
+  >"$contention_measurement"
+printf '2002\tquiet\tcooperative-prefill-measurement\t100\t-\n' \
+  >>"$contention_measurement"
+printf '2004\tquiet\tcooperative-prefill-measurement-end\t100\t-\n' \
+  >>"$contention_measurement"
 for timestamp in 1000 1005 1010 1015 1020 1025 1030 1035 1040 1045 1050 1055 1060; do
   printf '%s\tnominal\tcooperative-prefill-settle\n' "$timestamp" >>"$settle"
+  printf '%s\tquiet\tcooperative-prefill-settle\t100\t-\n' "$timestamp" \
+    >>"$contention_settle"
 done
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
@@ -89,6 +99,10 @@ write_summary() {
     --arg test_log_sha256 "$(sha256_file "$test_log")" \
     --arg measurement_log_sha256 "$(sha256_file "$measurement_path")" \
     --arg settle_log_sha256 "$(sha256_file "$settle_path")" \
+    --arg contention_measurement_log_sha256 \
+      "$(sha256_file "$contention_measurement")" \
+    --arg contention_settle_log_sha256 \
+      "$(sha256_file "$contention_settle")" \
     --argjson measurement_samples "$measurement_samples" \
     --argjson measurement_duration_seconds "$measurement_duration_seconds" \
     --argjson non_nominal_measurement_samples \
@@ -97,7 +111,7 @@ write_summary() {
     --argjson over_limit_measurement_samples \
       "$over_limit_measurement_samples" \
     --argjson telemetry_gaps "$telemetry_gaps" '
-    . + {source_sha:$source_sha,model_sha256:$model_sha256,
+    . + {schema_version:2,source_sha:$source_sha,model_sha256:$model_sha256,
       mlx_native_version:"0.10.12",raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
       required_start_state:"nominal",maximum_measurement_state:"fair",
@@ -111,18 +125,25 @@ write_summary() {
       non_nominal_measurement_samples:$non_nominal_measurement_samples,
       fair_measurement_samples:$fair_measurement_samples,
       over_limit_measurement_samples:$over_limit_measurement_samples,
-      telemetry_gaps:$telemetry_gaps}
+      telemetry_gaps:$telemetry_gaps,
+      host_contention:{policy:"process-group-v1",
+        settle:{log_sha256:$contention_settle_log_sha256,samples:13,
+          duration_seconds:60,contended_samples:0,telemetry_gaps:0},
+        measurement:{log_sha256:$contention_measurement_log_sha256,samples:3,
+          duration_seconds:4,contended_samples:0,telemetry_gaps:0}}}
   ' "$raw" >"$output"
 }
 
 write_summary "$summary"
 bash "$VERIFY" "$summary" "$raw" "$test_log" "$measurement" "$settle" \
-  "$SOURCE_SHA" "$MODEL_SHA" >/dev/null
+  "$SOURCE_SHA" "$MODEL_SHA" "$contention_measurement" \
+  "$contention_settle" >/dev/null
 
 expect_rejected() {
   local label=$1
   shift
-  if bash "$VERIFY" "$@" >/dev/null 2>&1; then
+  if bash "$VERIFY" "$@" "$contention_measurement" \
+      "$contention_settle" >/dev/null 2>&1; then
     echo "cooperative receipt verifier accepted invalid case: $label" >&2
     exit 1
   fi
@@ -217,5 +238,20 @@ jq '.settle_samples = 14 | .settle_duration_seconds = 60' \
   "$tmp_dir/mutated-settle-summary.json" >"$tmp_dir/bad-settle-summary.json"
 expect_rejected settle-state "$tmp_dir/bad-settle-summary.json" "$raw" "$test_log" \
   "$measurement" "$tmp_dir/mutated-settle.log" "$SOURCE_SHA" "$MODEL_SHA"
+
+cp "$contention_measurement" "$tmp_dir/contended-host.log"
+sed -i.bak '2s/quiet/contended/;2s/-$/200:200:cargo/' \
+  "$tmp_dir/contended-host.log"
+rm -f "$tmp_dir/contended-host.log.bak"
+jq --arg sha "$(sha256_file "$tmp_dir/contended-host.log")" \
+  '.host_contention.measurement.log_sha256 = $sha
+   | .host_contention.measurement.contended_samples = 1' \
+  "$summary" >"$tmp_dir/contended-host-summary.json"
+if bash "$VERIFY" "$tmp_dir/contended-host-summary.json" "$raw" "$test_log" \
+    "$measurement" "$settle" "$SOURCE_SHA" "$MODEL_SHA" \
+    "$tmp_dir/contended-host.log" "$contention_settle" >/dev/null 2>&1; then
+  echo "cooperative receipt verifier accepted host contention" >&2
+  exit 1
+fi
 
 echo "DeepSeek-V4 cooperative prefill receipt contract: pass"
