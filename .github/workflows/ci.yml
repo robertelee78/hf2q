@@ -374,12 +374,46 @@ jobs:
               src/input/model_recipe/plan.rs || true
           )"
           test -z "$unexpected_recipe_plan_authority"
+          unexpected_prepared_profile_authority="$(
+            grep -nE \
+              'std::fs|File::|OpenOptions|hf_hub|std::process|Command::new|reqwest|hyper|tokio::net|clap::|serve::|calibration::' \
+              src/input/model_recipe/profile.rs || true
+          )"
+          test -z "$unexpected_prepared_profile_authority"
+          unexpected_model_publication_authority="$(
+            grep -nE \
+              'std::fs::(create_dir|hard_link|remove_dir|remove_file|rename|copy|write|set_permissions)|File::create|OpenOptions|hf_hub|std::process::Command|Command::new|reqwest|hyper|tokio::net|clap::|serve::|calibration::' \
+              src/input/hf_download/resolution/payload/source/conversion/publication.rs \
+              src/input/hf_download/resolution/payload/source/conversion/publication/authentication.rs || true
+          )"
+          test -z "$unexpected_model_publication_authority"
+          unexpected_model_record_file_authority="$(
+            grep -nE \
+              'std::fs::(create_dir|remove_dir|remove_file|rename|copy|write|set_permissions|hard_link)|File::create|OpenOptions|hf_hub|std::process::Command|Command::new|reqwest|hyper|tokio::net|clap::|serve::|calibration::' \
+              src/input/hf_download/resolution/payload/source/conversion/publication/file.rs \
+              src/input/hf_download/resolution/payload/source/conversion/publication/file/unix.rs || true
+          )"
+          test -z "$unexpected_model_record_file_authority"
+          model_record_files=(
+            src/input/hf_download/resolution/payload/source/conversion/publication/file.rs
+            src/input/hf_download/resolution/payload/source/conversion/publication/file/unix.rs
+          )
+          test "$(grep -Fhc 'fs::linkat(' "${model_record_files[@]}" | awk '{ total += $1 } END { print total }')" = 1
+          test "$(grep -Fhc 'fs::unlinkat(' "${model_record_files[@]}" | awk '{ total += $1 } END { print total }')" = 1
+          test "$(grep -Fhc 'fs::fchmod(' "${model_record_files[@]}" | awk '{ total += $1 } END { print total }')" = 1
+          test "$(grep -Fhc 'OFlags::CREATE' "${model_record_files[@]}" | awk '{ total += $1 } END { print total }')" = 1
           recipe=data/model-recipes/qwen38-27b-official-v1.json
           test "$(shasum -a 256 "$recipe" | awk '{print $1}')" = \
             e3b60772d2abf33f14e215ba949bca22d16c0f1d8f985cd172b83b422e205126
-          preparation_golden=data/model-recipes/qwen38-27b-preparation-receipt-v1.json
-          test "$(shasum -a 256 "$preparation_golden" | awk '{print $1}')" = \
+          preparation_v1_golden=data/model-recipes/qwen38-27b-preparation-receipt-v1.json
+          test "$(shasum -a 256 "$preparation_v1_golden" | awk '{print $1}')" = \
             1f6d98b7269c1754d22248136c2793081dd33ed002a13935bde680fa694dffef
+          preparation_golden=data/model-recipes/qwen38-27b-preparation-receipt-v2.json
+          test "$(shasum -a 256 "$preparation_golden" | awk '{print $1}')" = \
+            b947550f429b7035a97b75a01dc430ba13ff0e83cfbb561d1dab89e926649f36
+          prepared_profile_golden=data/model-recipes/qwen38-27b-prepared-profile-v1.json
+          test "$(shasum -a 256 "$prepared_profile_golden" | awk '{print $1}')" = \
+            bc34868c014b2cd7de650bb2185c79d8a4389f71f68d7611ca6dd6de6c6dd9b0
           fixture=src/distribution/update_auth/testdata/python-tuf-v1
           (cd "$fixture" && shasum -a 256 -c SHA256SUMS)
           expected_generator="$(jq -er .generator_sha256 "$fixture/PROVENANCE.json")"
@@ -476,6 +510,12 @@ jobs:
             src/input/hf_download/resolution/payload/source/tests.rs \
             src/input/hf_download/resolution/payload/source/conversion.rs \
             src/input/hf_download/resolution/payload/source/conversion/tests.rs \
+            src/input/hf_download/resolution/payload/source/conversion/publication.rs \
+            src/input/hf_download/resolution/payload/source/conversion/publication/authentication.rs \
+            src/input/hf_download/resolution/payload/source/conversion/publication/file.rs \
+            src/input/hf_download/resolution/payload/source/conversion/publication/file/unix.rs \
+            src/input/hf_download/resolution/payload/source/conversion/publication/tests.rs \
+            src/input/hf_download/resolution/payload/source/conversion/publication/file/tests.rs \
             src/input/hf_download_plan_tests.rs \
             src/input/integrity.rs \
             src/input/model_recipe.rs \
@@ -485,11 +525,15 @@ jobs:
             src/input/model_recipe/preparation/host.rs \
             src/input/model_recipe/preparation/validation.rs \
             src/input/model_recipe/plan.rs \
+            src/input/model_recipe/profile.rs \
             src/input/model_recipe_tests.rs \
             src/input/model_recipe_preparation_tests.rs \
             src/input/model_recipe_plan_tests.rs \
+            src/input/model_recipe_profile_tests.rs \
             data/model-recipes/qwen38-27b-official-v1.json \
             data/model-recipes/qwen38-27b-preparation-receipt-v1.json \
+            data/model-recipes/qwen38-27b-preparation-receipt-v2.json \
+            data/model-recipes/qwen38-27b-prepared-profile-v1.json \
             src/main.rs \
             src/cli.rs \
             src/core/integrity.rs \
@@ -534,6 +578,8 @@ jobs:
             input::model_recipe_tests::embedded_recipe_is_exact_canonical_and_binds_accepted_outputs \
             input::model_recipe_tests::semantic_cross_bindings_fail_closed \
             input::model_recipe_preparation_tests::exact_pair_receipt_is_canonical_and_structurally_reparseable \
+            input::model_recipe_preparation_tests::volatile_available_space_does_not_change_the_durable_v2_receipt \
+            input::model_recipe_preparation_tests::prepublication_v1_receipt_is_retained_as_exact_unsupported_evidence \
             input::model_recipe_preparation_tests::every_conversion_cross_binding_fails_closed \
             input::model_recipe_preparation_tests::os_bound_disk_probe_uses_the_target_filesystem_and_rejects_file_ancestors \
             input::model_recipe_preparation_tests::os_bound_host_preflight_rejects_a_file_as_the_preparation_root \
@@ -547,6 +593,8 @@ jobs:
             input::model_recipe_plan_tests::current_plan_authorizes_all_recipe_metadata_before_payload_transfer \
             input::model_recipe_plan_tests::current_no_options_plan_passes_on_the_explicit_proof_machine \
             input::model_recipe_plan_tests::preparation_root_is_absolute_canonical_bounded_and_directory_backed \
+            input::model_recipe_profile_tests::prepared_profile_golden_is_exact_and_cross_binds_the_pair_receipt \
+            input::model_recipe_profile_tests::parser_rejects_size_duplicate_unknown_trailing_and_noncanonical_bytes \
             input::hf_download::resolution::payload::tests::payload_transfer_consumes_the_exact_recipe_order_and_stays_inert \
             input::hf_download::resolution::payload::tests::failed_or_cross_cache_transfer_mints_no_payload \
             input::hf_download::resolution::payload::tests::namespace_change_is_rejected_before_hub_or_payload_authority \
@@ -563,6 +611,15 @@ jobs:
             input::hf_download::resolution::payload::source::conversion::tests::restart_shape_adopts_only_complete_pairs_and_rejects_orphan_receipts \
             input::hf_download::resolution::payload::source::conversion::tests::dangling_symlink_is_retained_as_hostile_evidence_instead_of_absence \
             input::hf_download::resolution::payload::source::conversion::tests::current_recipe_converts_and_reopens_the_exact_pair_when_explicitly_requested \
+            input::hf_download::resolution::payload::source::conversion::publication::tests::publication_reauthenticates_before_and_after_each_durable_record \
+            input::hf_download::resolution::payload::source::conversion::publication::tests::restart_order_accepts_only_write_order_prefixes_and_exact_hardlink_residue \
+            input::hf_download::resolution::payload::source::conversion::publication::file::tests::exact_prefix_and_published_hardlink_crash_states_are_resumed \
+            input::hf_download::resolution::payload::source::conversion::publication::file::tests::hostile_partial_final_and_symlink_evidence_is_retained \
+            input::hf_download::resolution::payload::source::conversion::publication::file::tests::every_publication_barrier_is_exactly_retryable \
+            input::hf_download::resolution::payload::source::conversion::publication::file::tests::concurrent_publishers_cannot_append_after_a_measured_partial_prefix \
+            input::hf_download::resolution::payload::source::conversion::publication::file::tests::exact_read_rejects_leaf_replacement_after_the_open_fd_was_read \
+            input::hf_download::resolution::payload::source::conversion::publication::file::tests::retained_parent_descriptor_prevents_namespace_redirection \
+            input::hf_download::resolution::payload::source::conversion::publication::file::tests::restrictive_umask_cannot_strand_an_unusable_partial \
             input::model_recipe_plan_tests::completed_conversion_files_must_be_canonical_single_link_regular_files \
             convert::cli_driver::tests::deepseek_tiny_official_layout_converts_to_q2_k_s_end_to_end \
             convert::cli_driver::tests::explicit_receipt_path_cannot_alias_the_conversion_output \
@@ -579,9 +636,11 @@ jobs:
           cargo test --locked --bin hf2q --all-features input::model_recipe_tests::
           cargo test --locked --bin hf2q --all-features input::model_recipe_preparation_tests::
           cargo test --locked --bin hf2q --all-features input::model_recipe_plan_tests::
+          cargo test --locked --bin hf2q --all-features input::model_recipe_profile_tests::
           cargo test --locked --bin hf2q --all-features input::hf_download::resolution::payload::tests:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features input::hf_download::resolution::payload::source::tests:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features input::hf_download::resolution::payload::source::conversion::tests:: -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features input::hf_download::resolution::payload::source::conversion::publication:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features input::integrity::tests:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features convert::cli_driver::tests::deepseek_tiny_official_layout_converts_to_q2_k_s_end_to_end -- --exact
           cargo test --locked --bin hf2q --all-features convert::cli_driver::tests::explicit_receipt_path_cannot_alias_the_conversion_output -- --exact

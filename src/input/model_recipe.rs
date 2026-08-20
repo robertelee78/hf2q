@@ -7,11 +7,15 @@
 //! floor used by ADR-045's future no-options preparation coordinator. The
 //! sibling preparation boundary additionally seals accepted host/disk facts
 //! and both canonical conversion receipts into one inert text/projector pair.
+//! Prepared-profile v1 structurally binds the durable pair receipt and exact
+//! artifact/receipt descriptors while recording retained source and a
+//! calibration-pending state; parsing it grants no model authority.
 //! The plan boundary derives the canonical no-options layout while retaining
 //! the host proof, then accepts only a sealed exact Hub resolution from the
 //! download module. The download module separately authenticates the complete
-//! recipe-owned remote metadata set before transfer. None of these transitions
-//! can transfer payloads or mutate that layout.
+//! recipe-owned remote metadata set before transfer. The download-owned
+//! coordinator alone later consumes the sealed conversion pair to publish the
+//! receipt and profile; recipe parsing itself cannot mutate the layout.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,19 +25,24 @@ use crate::input::hf_reference::HfModelReference;
 
 mod plan;
 mod preparation;
+mod profile;
 mod validation;
 mod verification;
 
-pub(in crate::input) use plan::canonical_future_directory;
 #[cfg(test)]
 pub(in crate::input) use plan::require_exact_regular_file_for_test;
+pub(in crate::input) use plan::{canonical_future_directory, require_exact_regular_file};
 pub use plan::{
     plan_current_model_preparation, ModelPreparationPlan, MAX_MODEL_PREPARATION_PATH_BYTES,
 };
+pub(in crate::input) use preparation::MAX_CONVERSION_RECEIPT_BYTES;
 pub use preparation::{
-    ModelPreparationError, ModelPreparationReceiptV1, VerifiedModelPreparation,
+    ModelPreparationError, ModelPreparationReceiptV2, VerifiedModelPreparation,
     VerifiedRecipeConversion, VerifiedRecipeHost, MAX_MODEL_PREPARATION_RECEIPT_BYTES,
     MODEL_PREPARATION_RECEIPT_SCHEMA_VERSION,
+};
+pub use profile::{
+    PreparedModelProfileV1, MAX_PREPARED_MODEL_PROFILE_BYTES, PREPARED_MODEL_PROFILE_SCHEMA_VERSION,
 };
 pub use verification::{VerifiedRecipeArtifact, VerifiedRecipeSource};
 

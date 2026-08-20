@@ -24,7 +24,9 @@
   plus the canonical inert no-options preparation layout, exact Hub resolution,
   complete recipe-metadata transfer authorization, and recipe-owned resumable
   payload transfer plus offline recipe-bound source reauthentication and the
-  recipe-owned paired text/projector conversion boundary are also reconciled;
+  recipe-owned paired text/projector conversion boundary plus crash-durable
+  retained-source pair-receipt and prepared-profile registration are also
+  reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install/onboarding
@@ -49,9 +51,10 @@ workflow:
   end-user Apple Silicon bundle;
 - the CLI has no self-update or first-run setup command;
 - remote conversion now has a native immutable-reference/download boundary,
-  and a checked-in exact Qwen3.8 preparation recipe, but does not yet compose
-  those boundaries into the complete no-options paired text/projector
-  preparation, retention, registration, and calibration transaction;
+  a checked-in exact Qwen3.8 preparation recipe, the recipe-owned paired
+  conversion, and a durable calibration-pending prepared-profile commit, but
+  does not yet expose the public no-options invocation, destructive source
+  retention, or runtime calibration transaction;
 - the canonical `scripts/serve_*_opencode.sh` launchers assume paths under
   `/opt/hf2q`, so copying them out of the checkout is not sufficient; and
 - OpenCode and Agentic Kit setup is scattered outside one tested guide.
@@ -1592,10 +1595,13 @@ hf2q convert Qwen/Qwen3.8-27B
 That no-options command remains the target contract, not a claim about the
 current CLI. The landed immutable-source slice still requires explicit
 `--quant` and `--output`; it does not guess either. The checked-in recipe now
-provides the exact source/artifact/hardware/disk decision input, but the next
-preparation slice must consume that sealed evidence in one source-matched
-text/projector conversion, retention, registration, prepared-profile, and
-bounded-runtime-calibration transaction before removing those requirements.
+provides the exact source/artifact/hardware/disk decision input. The private
+native path already consumes that evidence through source-matched
+text/projector conversion and retained-source durable registration. The
+remaining public slice must compose the no-options command with that landed
+boundary, add a separately authorized destructive-retention journal, and
+complete bounded runtime calibration before removing the explicit
+requirements.
 
 **Landed recipe boundary (2026-08-19).**
 `data/model-recipes/qwen38-27b-official-v1.json` is a canonical compact JSON
@@ -1674,10 +1680,12 @@ cannot be paired with a projector artifact or with another recipe.
 
 Only the sealed source proof, the sealed host proof, and one text plus one
 projector conversion from the same converter identity can mint
-`VerifiedModelPreparation`. Its canonical 1,334-byte v1 receipt has SHA-256
-`1f6d98b7269c1754d22248136c2793081dd33ed002a13935bde680fa694dffef` and
-binds the recipe/source/profile/converter identities, both accepted artifacts,
-and both exact conversion-receipt SHA-256 values. Its only state is
+`VerifiedModelPreparation`. Its canonical 1,333-byte v2 golden has SHA-256
+`b947550f429b7035a97b75a01dc430ba13ff0e83cfbb561d1dab89e926649f36` and
+binds the recipe/source/profile/converter identities, the stable recipe-owned
+free-space requirement, both accepted artifacts, and both exact
+conversion-receipt SHA-256 values. The live available-space observation stays
+inside the consumed host proof and is not durable wire data. Its only state is
 `awaiting_runtime_calibration`. Parsing those bytes is structural and cannot
 recreate the non-cloneable sealed value; neither form grants serving,
 registration, retention deletion, or filesystem-mutation authority.
@@ -1842,10 +1850,70 @@ empty-output protected run produced and reopened both ADR-044 digests in
 An immediate fresh-process retry exact-adopted the same four final
 artifact/receipt files in 458.87 seconds without changing any file mtime.
 
-The public no-options conversion invocation, source-retention mutation,
-durable pair receipt/prepared-model registry, and calibration receipt remain
-pending and must consume these proofs rather than reconstructing policy from
-strings.
+**Landed retained-source prepared-model registration boundary (2026-08-20).**
+The next one-use transition consumes `ConvertedModelPreparation`, reopens the
+same canonical model/source/artifact/receipt namespaces, and repeats complete
+recipe/Hub source authentication plus exact artifact and conversion-receipt
+verification before any durable record, after the pair receipt, and after the
+profile commit. Root, source, artifact, and receipt entries must remain owned,
+same-device, canonical, and single-link where applicable; the bounded
+top-level, artifact, and receipt inventories reject unrelated or non-UTF-8
+entries.
+
+The canonical `receipts/model-preparation.json` bytes are published first and
+`profile.json` is the sole registration commit. Each record is at most 64 KiB,
+is written or exact-prefix-resumed through a fixed private `0600` partial,
+full-synced, published without replacement through an exact same-inode hard
+link, directory-synced, and stripped of only that verified partial name. Every
+ancestor is opened without following symlinks and every create, link, unlink,
+read, and sync is relative to a retained authenticated directory descriptor;
+the canonical parent identity is reopened after the mutation boundary. Exact
+reads also recheck the open file descriptor and rebind the named leaf to that
+same inode after the read.
+Recovery accepts only the write-order prefix, the exact two-name hard-link
+window, or both final records; symlinks, unrelated hard links, wrong modes,
+non-prefix residue, profile-before-receipt state, and different final bytes
+remain untouched and fail closed. Concurrent legitimate publishers recheck the
+measured partial inode, length, and name before writing at that exact offset;
+one may finish while the other returns an ordinary retryable error, but neither
+can append beyond or replace the authenticated record.
+
+Preparation-receipt v2 replaces the prepublication v1 receipt's volatile live
+`preflight_available_bytes` observation with the stable recipe-owned
+`preflight_required_bytes`. The live observation remains mandatory inside the
+one-use host proof and must meet that floor, but it cannot perturb durable
+bytes across a crash or ordinary retry. V1 had no public writer or production
+entry point, is retained byte-exact as unsupported evidence, and is rejected
+rather than migrated or reinterpreted.
+
+Prepared-profile v1 is a compact canonical record with kind
+`hf2q.prepared-model-profile`. It binds the exact repository/revision,
+recipe ID/SHA-256, pair-receipt path/SHA-256, both canonical artifact and
+conversion-receipt descriptors, `source_retention: "keep"`, and the sole state
+`awaiting_runtime_calibration`. Its preparation-receipt descriptor explicitly
+binds schema v2. The 1,240-byte golden has SHA-256
+`bc34868c014b2cd7de650bb2185c79d8a4389f71f68d7611ca6dd6de6c6dd9b0`.
+Parsing profile or receipt bytes is structural and creates no registration,
+calibration, preference, loading, serving, or deletion authority. Only the
+non-cloneable `RegisteredModelPreparation` returned after the final exact
+reopen represents this inert durable registration.
+
+The protected real-artifact gate on the Apple M5 Max published the v2 pair
+receipt and v1 profile from the existing ADR-044-accepted source/artifact pair
+in 849.67 seconds, then a fresh process exact-adopted both records in 815.80
+seconds. The 1,333-byte real receipt had SHA-256
+`afdaba5985ee44b5b8dc0c5013ee086b6eb284b35c54c25aaff30b6a0ce3083f`;
+the 1,240-byte real profile had SHA-256
+`7a6bfce553887fb9dae87c08673661c8e07c338a33322746c133d3eacbc8c87b`.
+Both inode, mtime, size, and digest tuples were byte-identical before and after
+the retry, and neither fixed partial name remained.
+
+V1 deliberately lands the recipe's safe interactive default, `keep`, without
+deletion authority. Destructive `--source-retention delete` requires its own
+durable exact-inventory journal so a crash cannot turn partial cache removal
+into generic cleanup authority. The public no-options conversion invocation,
+that deletion transaction, and the calibration receipt remain pending and
+must consume these proofs rather than reconstructing policy from strings.
 
 It executes an hf2q-only resumable plan:
 
@@ -2188,9 +2256,11 @@ before public self-update ships.
    roles, and returns a non-cloneable inert pair. The pair remains explicitly
    calibration-pending. Next, embed the real stable root, compile the real
    public Team ID, pass the protected positive signing fixture, and compose
-   source retention, durable preparation-receipt and prepared-model registry
-   publication, external-artifact provenance, calibration receipt, and session
-   policy. Every schema lands with bounded hostile input and
+   destructive recipe-owned source retention, external-artifact provenance,
+   calibration receipt, and session policy. Retained-source durable
+   preparation-receipt and prepared-profile publication have landed with
+   `profile.json` as the commit point. Every schema lands with bounded hostile
+   input and
    golden-byte fixtures; schema parsing alone never creates an authenticated
    or ownership-verified capability.
    Before uninstall implementation, freeze and adversarially test its separate

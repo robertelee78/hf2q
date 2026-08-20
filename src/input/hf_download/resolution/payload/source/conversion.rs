@@ -16,6 +16,13 @@ use crate::input::model_recipe::{
 };
 use crate::quantize::ggml_quants::LlamaFtype;
 
+mod publication;
+
+pub use publication::{
+    publish_converted_model_preparation_keep, ModelPreparationPublicationError,
+    RegisteredModelPreparation,
+};
+
 /// Recipe-authenticated text/projector output pair produced or adopted at the
 /// plan-owned paths.
 ///

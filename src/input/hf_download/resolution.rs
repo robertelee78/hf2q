@@ -19,9 +19,11 @@ mod payload;
 
 pub use payload::{
     authenticate_transferred_model_preparation, convert_authenticated_model_preparation,
-    transfer_authorized_model_preparation, AuthenticatedModelPreparationSource,
-    ConvertedModelPreparation, ModelPreparationConversionError, ModelPreparationPayloadError,
-    ModelPreparationSourceAuthenticationError, TransferredModelPreparationPayload,
+    publish_converted_model_preparation_keep, transfer_authorized_model_preparation,
+    AuthenticatedModelPreparationSource, ConvertedModelPreparation,
+    ModelPreparationConversionError, ModelPreparationPayloadError,
+    ModelPreparationPublicationError, ModelPreparationSourceAuthenticationError,
+    RegisteredModelPreparation, TransferredModelPreparationPayload,
 };
 
 /// One bounded repository inventory resolved by the pinned in-process Hub

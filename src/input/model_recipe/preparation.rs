@@ -14,7 +14,7 @@ mod validation;
 
 const PREPARATION_KIND: &str = "hf2q.model-preparation-receipt";
 const PREPARATION_PACKAGE: &str = "hf2q";
-pub const MODEL_PREPARATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const MODEL_PREPARATION_RECEIPT_SCHEMA_VERSION: u32 = 2;
 pub const MAX_MODEL_PREPARATION_RECEIPT_BYTES: usize = 64 * 1024;
 pub(in crate::input) const MAX_CONVERSION_RECEIPT_BYTES: usize = 64 * 1024;
 
@@ -53,6 +53,8 @@ pub struct VerifiedRecipeConversion {
 /// Exact recipe policy selected from in-process OS host and free-space reads.
 /// It is preparation policy evidence, not a serving or filesystem capability.
 /// Production construction accepts no caller-provided hardware facts.
+/// The live available-space observation is deliberately ephemeral: receipt v2
+/// records only the stable recipe-owned required floor after this proof passes.
 #[derive(Debug)]
 pub struct VerifiedRecipeHost {
     recipe_id: String,
@@ -83,7 +85,7 @@ impl VerifiedRecipeConversion {
 /// Parsing this record is structural only and never creates a capability.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ModelPreparationReceiptV1 {
+pub struct ModelPreparationReceiptV2 {
     kind: String,
     schema_version: u32,
     package: String,
@@ -118,7 +120,7 @@ struct PreparationHardwareProfile {
     chip_model: String,
     minimum_unified_memory_bytes: u64,
     observed_unified_memory_bytes: u64,
-    preflight_available_bytes: u64,
+    preflight_required_bytes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -146,7 +148,7 @@ struct PreparationArtifact {
     conversion_receipt_sha256: String,
 }
 
-impl ModelPreparationReceiptV1 {
+impl ModelPreparationReceiptV2 {
     pub fn parse(bytes: &[u8]) -> Result<Self, ModelPreparationError> {
         require_bound(bytes, MAX_MODEL_PREPARATION_RECEIPT_BYTES)?;
         let receipt: Self = serde_json::from_slice(bytes)?;
@@ -222,7 +224,7 @@ impl ModelPreparationReceiptV1 {
                     == profile.minimum_unified_memory_bytes()
                 && self.hardware_profile.observed_unified_memory_bytes
                     >= profile.minimum_unified_memory_bytes()
-                && self.hardware_profile.preflight_available_bytes >= recipe.minimum_free_bytes(),
+                && self.hardware_profile.preflight_required_bytes == recipe.minimum_free_bytes(),
             "wrong hardware profile",
         )?;
         pair_require(
@@ -263,7 +265,7 @@ impl ModelPreparationReceiptV1 {
 /// this exact value; receipt parsing alone cannot recreate it.
 #[derive(Debug)]
 pub struct VerifiedModelPreparation {
-    receipt: ModelPreparationReceiptV1,
+    receipt: ModelPreparationReceiptV2,
     receipt_bytes: Vec<u8>,
     source: VerifiedRecipeSource,
     text: VerifiedRecipeConversion,
@@ -271,7 +273,7 @@ pub struct VerifiedModelPreparation {
 }
 
 impl VerifiedModelPreparation {
-    pub fn receipt(&self) -> &ModelPreparationReceiptV1 {
+    pub fn receipt(&self) -> &ModelPreparationReceiptV2 {
         &self.receipt
     }
 
@@ -454,7 +456,7 @@ impl ModelRecipe {
             "host proof belongs to another recipe or is below policy floors",
         )?;
 
-        let receipt = ModelPreparationReceiptV1 {
+        let receipt = ModelPreparationReceiptV2 {
             kind: PREPARATION_KIND.to_owned(),
             schema_version: MODEL_PREPARATION_RECEIPT_SCHEMA_VERSION,
             package: PREPARATION_PACKAGE.to_owned(),
@@ -473,7 +475,7 @@ impl ModelRecipe {
                 chip_model: host.chip_model,
                 minimum_unified_memory_bytes: host.minimum_unified_memory_bytes,
                 observed_unified_memory_bytes: host.observed_unified_memory_bytes,
-                preflight_available_bytes: host.preflight_available_bytes,
+                preflight_required_bytes: self.minimum_free_bytes(),
             },
             converter: PreparationConverter {
                 package: text.receipt.converter.package.clone(),
