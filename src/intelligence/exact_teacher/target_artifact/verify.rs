@@ -1,5 +1,7 @@
 //! Independent retained-file verification for structural teacher targets.
 
+use std::io::BufReader;
+
 use super::*;
 
 fn read_u64(reader: &mut impl Read) -> Result<u64, ExactTeacherTargetError> {
