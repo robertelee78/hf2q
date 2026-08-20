@@ -9,7 +9,6 @@
 
 use anyhow::{bail, Context, Result};
 use mlx_native::GgmlWorkloadClass;
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -29,7 +28,8 @@ use super::execution_observation::{
 use super::execution_trace::{verify_encoded_dispatch_catalog, VerifiedEncodedDispatchCatalog};
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
-use super::{default_layer_types, Qwen35Config, Qwen35Variant};
+use super::source_config::qwen35_config_from_authenticated_source;
+use super::Qwen35Config;
 
 const MAX_SESSION_ENCODED_DISPATCHES: usize = 8_192;
 
@@ -329,193 +329,10 @@ fn validate_loaded_global_geometry(model: &Qwen35Model, expected: &Qwen35Config)
     Ok(())
 }
 
-fn required_u32(config: &Value, key: &str) -> Result<u32> {
-    u32::try_from(
-        config
-            .get(key)
-            .and_then(Value::as_u64)
-            .with_context(|| format!("authenticated Qwen config is missing {key}"))?,
-    )
-    .with_context(|| format!("authenticated Qwen config {key} exceeds u32"))
-}
-
-fn qwen35_config_from_authenticated_source(config: &Value) -> Result<Qwen35Config> {
-    let text = config.get("text_config").unwrap_or(config);
-    let hidden_size = required_u32(text, "hidden_size")?;
-    let num_hidden_layers = required_u32(text, "num_hidden_layers")?;
-    let num_attention_heads = required_u32(text, "num_attention_heads")?;
-    let num_key_value_heads = text
-        .get("num_key_value_heads")
-        .and_then(Value::as_u64)
-        .map(u32::try_from)
-        .transpose()?
-        .unwrap_or(num_attention_heads);
-    if num_attention_heads == 0 || hidden_size == 0 {
-        bail!("authenticated Qwen dimensions must be positive");
-    }
-    let head_dim = text
-        .get("head_dim")
-        .and_then(Value::as_u64)
-        .map(u32::try_from)
-        .transpose()?
-        .unwrap_or(hidden_size / num_attention_heads);
-    let linear_num_key_heads = required_u32(text, "linear_num_key_heads")?;
-    let linear_num_value_heads = required_u32(text, "linear_num_value_heads")?;
-    let linear_key_head_dim = required_u32(text, "linear_key_head_dim")?;
-    let linear_value_head_dim = required_u32(text, "linear_value_head_dim")?;
-    if linear_key_head_dim != linear_value_head_dim {
-        bail!("dense Qwen evidence requires equal linear key/value head dimensions");
-    }
-    let full_attention_interval = text
-        .get("full_attention_interval")
-        .and_then(Value::as_u64)
-        .map(u32::try_from)
-        .transpose()?
-        .unwrap_or(4);
-    let partial_rotary_factor = text
-        .get("partial_rotary_factor")
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            text.get("rope_parameters")
-                .and_then(|rope| rope.get("partial_rotary_factor"))
-                .and_then(Value::as_f64)
-        })
-        .unwrap_or(0.25) as f32;
-    let rope_theta = text
-        .get("rope_parameters")
-        .and_then(|rope| rope.get("rope_theta"))
-        .and_then(Value::as_f64)
-        .or_else(|| text.get("rope_theta").and_then(Value::as_f64))
-        .unwrap_or(10_000.0) as f32 as f64;
-    let mrope_interleaved = text
-        .get("rope_parameters")
-        .and_then(|rope| rope.get("mrope_interleaved"))
-        .or_else(|| text.get("mrope_interleaved"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let rotary_dim = (f64::from(head_dim) * f64::from(partial_rotary_factor)) as u32;
-    let mut mrope = text
-        .get("rope_parameters")
-        .and_then(|rope| rope.get("mrope_section"))
-        .or_else(|| text.get("mrope_section"))
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| {
-                    u32::try_from(value.as_u64().context("negative mrope section")?)
-                        .context("mrope section exceeds u32")
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_else(|| vec![11, 11, 10]);
-    while mrope.len() < 4 {
-        mrope.push(0);
-    }
-    if mrope.len() != 4 {
-        bail!("authenticated Qwen mrope section must contain at most four values");
-    }
-    let mtp_num_hidden_layers = text
-        .get("mtp_num_hidden_layers")
-        .and_then(Value::as_u64)
-        .map(u32::try_from)
-        .transpose()?
-        .unwrap_or(0);
-    let mtp_use_dedicated_embeddings = if mtp_num_hidden_layers == 0 {
-        true
-    } else {
-        text.get("mtp_use_dedicated_embeddings")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    };
-    let rms_norm_eps = text
-        .get("rms_norm_eps")
-        .and_then(Value::as_f64)
-        .unwrap_or(1e-6) as f32;
-
-    Ok(Qwen35Config {
-        variant: Qwen35Variant::Dense,
-        hidden_size,
-        num_hidden_layers,
-        num_attention_heads,
-        num_key_value_heads,
-        head_dim,
-        linear_num_key_heads,
-        linear_num_value_heads,
-        linear_key_head_dim,
-        linear_value_head_dim,
-        linear_conv_kernel_dim: required_u32(text, "linear_conv_kernel_dim")?,
-        full_attention_interval,
-        layer_types: default_layer_types(num_hidden_layers, full_attention_interval),
-        partial_rotary_factor,
-        rope_theta,
-        rotary_dim,
-        mrope_section: [mrope[0], mrope[1], mrope[2], mrope[3]],
-        mrope_interleaved,
-        rms_norm_eps,
-        max_position_embeddings: required_u32(text, "max_position_embeddings")?,
-        vocab_size: required_u32(text, "vocab_size")?,
-        attn_output_gate: text
-            .get("attn_output_gate")
-            .or_else(|| text.get("attention_output_gate"))
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-        mtp_num_hidden_layers,
-        mtp_use_dedicated_embeddings,
-        intermediate_size: Some(required_u32(text, "intermediate_size")?),
-        moe: None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn authenticated_source_projection_matches_converter_defaults() {
-        let config = json!({
-            "hidden_size": 256,
-            "num_hidden_layers": 4,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 1,
-            "head_dim": 64,
-            "linear_num_key_heads": 1,
-            "linear_num_value_heads": 2,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "intermediate_size": 512,
-            "max_position_embeddings": 4096,
-            "vocab_size": 32
-        });
-        let projected = qwen35_config_from_authenticated_source(&config).unwrap();
-        assert_eq!(projected.variant, Qwen35Variant::Dense);
-        assert_eq!(projected.full_attention_interval, 4);
-        assert_eq!(projected.rotary_dim, 16);
-        assert_eq!(projected.mrope_section, [11, 11, 10, 0]);
-        assert_eq!(projected.intermediate_size, Some(512));
-        assert!(projected.moe.is_none());
-    }
-
-    #[test]
-    fn authenticated_source_projection_rejects_runtime_geometry_drift() {
-        let config = json!({
-            "hidden_size": 256,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 4,
-            "linear_num_key_heads": 1,
-            "linear_num_value_heads": 2,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 64,
-            "linear_conv_kernel_dim": 4,
-            "intermediate_size": 512,
-            "max_position_embeddings": 4096,
-            "vocab_size": 32
-        });
-        assert!(qwen35_config_from_authenticated_source(&config).is_err());
-    }
 
     #[test]
     fn loaded_candidate_identity_is_atomic_and_synthetic_vocab_is_rejected() {

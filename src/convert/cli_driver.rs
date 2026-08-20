@@ -35,7 +35,7 @@ use crate::convert::arch::gemma4::MappedTensor as Gemma4Mapped;
 use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
 use crate::convert::arch::qwen35_dense::Qwen35DenseCtx;
 use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
-use crate::convert::arch::qwen35moe_full::{Qwen35LinearAttentionCtx, Qwen35MoeFullCtx};
+use crate::convert::arch::qwen35moe_full::Qwen35MoeFullCtx;
 use crate::convert::arch::{
     bake, bert, deepseek4, deepseek4_metadata, gemma4, gemma4_mmproj, llama3, minimax_m2,
     nomic_bert, qwen3vl_text, qwen35_dense, qwen35moe, qwen35moe_full,
@@ -2197,59 +2197,7 @@ fn build_qwen35moe_full_ctx(config: &serde_json::Value) -> Option<Qwen35MoeFullC
 }
 
 fn build_qwen35_dense_ctx(config: &serde_json::Value) -> Option<Qwen35DenseCtx> {
-    let text = effective_config(config);
-    let num_hidden_layers = text.get("num_hidden_layers")?.as_u64()? as usize;
-    let full_attention_interval = text
-        .get("full_attention_interval")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(4) as usize;
-    let linear_num_key_heads = text.get("linear_num_key_heads")?.as_u64()? as usize;
-    let linear_num_value_heads = text.get("linear_num_value_heads")?.as_u64()? as usize;
-    let linear_key_head_dim = text.get("linear_key_head_dim")?.as_u64()? as usize;
-    let linear_value_head_dim = text.get("linear_value_head_dim")?.as_u64()? as usize;
-    if num_hidden_layers == 0
-        || full_attention_interval == 0
-        || linear_num_key_heads == 0
-        || linear_num_value_heads == 0
-        || linear_key_head_dim == 0
-        || linear_value_head_dim == 0
-        || linear_num_value_heads % linear_num_key_heads != 0
-    {
-        return None;
-    }
-    if let Some(layer_types) = text.get("layer_types").and_then(|value| value.as_array()) {
-        if layer_types.len() != num_hidden_layers
-            || layer_types.iter().enumerate().any(|(layer, value)| {
-                let expected = if (layer + 1) % full_attention_interval == 0 {
-                    "full_attention"
-                } else {
-                    "linear_attention"
-                };
-                value.as_str() != Some(expected)
-            })
-        {
-            return None;
-        }
-    }
-    let multimodal_wrapping = config
-        .get("architectures")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .any(|name| name.ends_with("ForConditionalGeneration"))
-        })
-        .unwrap_or(false);
-    Some(Qwen35DenseCtx {
-        num_hidden_layers,
-        linear: Qwen35LinearAttentionCtx {
-            linear_num_key_heads,
-            linear_num_value_heads,
-            linear_key_head_dim,
-            linear_value_head_dim,
-        },
-        multimodal_wrapping,
-    })
+    crate::convert::arch::qwen35_dense::context_from_config(config)
 }
 
 /// Adapt the Gemma 4 mapper's `MappedTensor` shape (`Direct` /
@@ -3379,6 +3327,9 @@ mod tests {
                 .expect("official Qwen3.8 config fixture");
         config["text_config"]["linear_key_head_dim"] = serde_json::json!(0);
         assert!(build_qwen35_dense_ctx(&config).is_none());
+        config["text_config"]["linear_key_head_dim"] = serde_json::json!(128);
+        config["text_config"]["linear_num_key_heads"] = serde_json::json!(0);
+        assert!(build_qwen35_dense_ctx(&config).is_none());
     }
 
     #[test]
@@ -3388,6 +3339,12 @@ mod tests {
                 .expect("official Qwen3.8 config fixture");
         config["text_config"]["layer_types"] =
             serde_json::Value::Array(vec![serde_json::json!("full_attention"); 64]);
+        assert!(build_qwen35_dense_ctx(&config).is_none());
+
+        config["text_config"]["layer_types"] = serde_json::json!("linear_attention");
+        assert!(build_qwen35_dense_ctx(&config).is_none());
+        config["text_config"].as_object_mut().unwrap().remove("layer_types");
+        config["text_config"]["full_attention_interval"] = serde_json::json!("4");
         assert!(build_qwen35_dense_ctx(&config).is_none());
     }
 
