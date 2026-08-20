@@ -13,6 +13,13 @@ use crate::input::hf_download::{
 use crate::input::model_recipe::{canonical_future_directory, ModelPreparationError};
 use crate::progress::ProgressReporter;
 
+mod source;
+
+pub use source::{
+    authenticate_transferred_model_preparation, AuthenticatedModelPreparationSource,
+    ModelPreparationSourceAuthenticationError,
+};
+
 /// Recipe-owned payload bytes fetched and individually authenticated at the
 /// exact accepted Hub commit.
 ///
@@ -225,6 +232,19 @@ fn require_exact_directory(path: &Path) -> Result<(), ModelPreparationPayloadErr
 fn preparation_error(reason: impl Into<String>) -> ModelPreparationError {
     ModelPreparationError::PlanInvalid {
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+pub(in crate::input) fn transferred_payload_for_test(
+    authorized: AuthorizedModelPreparationTransfer,
+    snapshot_dir: PathBuf,
+) -> TransferredModelPreparationPayload {
+    let AuthorizedModelPreparationTransfer { resolved, records } = authorized;
+    TransferredModelPreparationPayload {
+        resolved,
+        records,
+        _snapshot_dir: snapshot_dir,
     }
 }
 

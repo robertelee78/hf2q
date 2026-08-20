@@ -18,8 +18,9 @@ use crate::input::model_recipe::{
 mod payload;
 
 pub use payload::{
-    transfer_authorized_model_preparation, ModelPreparationPayloadError,
-    TransferredModelPreparationPayload,
+    authenticate_transferred_model_preparation, transfer_authorized_model_preparation,
+    AuthenticatedModelPreparationSource, ModelPreparationPayloadError,
+    ModelPreparationSourceAuthenticationError, TransferredModelPreparationPayload,
 };
 
 /// One bounded repository inventory resolved by the pinned in-process Hub

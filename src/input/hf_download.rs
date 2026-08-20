@@ -69,10 +69,11 @@ use crate::progress::ProgressReporter;
 mod resolution;
 
 pub use resolution::{
-    authorize_model_preparation_transfer, transfer_authorized_model_preparation,
+    authenticate_transferred_model_preparation, authorize_model_preparation_transfer,
+    transfer_authorized_model_preparation, AuthenticatedModelPreparationSource,
     AuthorizedModelPreparationTransfer, ModelPreparationPayloadError,
-    ModelPreparationResolutionError, ResolvedModelPreparationPlan, ResolvedModelRepository,
-    TransferredModelPreparationPayload,
+    ModelPreparationResolutionError, ModelPreparationSourceAuthenticationError,
+    ResolvedModelPreparationPlan, ResolvedModelRepository, TransferredModelPreparationPayload,
 };
 use resolution::{bind_model_preparation_resolution, resolve_repository_info};
 #[cfg(test)]
