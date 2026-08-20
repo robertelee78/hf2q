@@ -27,8 +27,8 @@ use super::sampling::{
 use super::stream::StreamRouter;
 use super::{
     plan_resumable_prefill_chunk, release_completed_prefill_scratch, Deepseek4LoadedModel,
-    Deepseek4PrefillOrigin, Deepseek4ResumablePrefill, Deepseek4ResumablePrefillAdvance,
-    RequestScratchGuard, ResumablePrefillChunk,
+    Deepseek4ResumablePrefill, Deepseek4ResumablePrefillAdvance, RequestScratchGuard,
+    ResumablePrefillChunk,
 };
 
 pub(crate) struct Deepseek4SlotCompletion {
@@ -63,6 +63,7 @@ pub(crate) struct Deepseek4PrefillState {
 pub(crate) struct Deepseek4CooperativePrefillPlan {
     start: usize,
     token_count: usize,
+    capture_anchor_after: bool,
 }
 
 impl Deepseek4CooperativePrefillPlan {
@@ -76,6 +77,10 @@ impl Deepseek4CooperativePrefillPlan {
 
     pub(crate) fn end(self) -> usize {
         self.start + self.token_count
+    }
+
+    pub(crate) fn captures_anchor(self) -> bool {
+        self.capture_anchor_after
     }
 }
 
@@ -162,10 +167,18 @@ impl Deepseek4PrefillState {
             .saturating_sub(self.plan.initial_cached_tokens())
     }
 
+    /// True only while this request owns the bounded incremental suffix after
+    /// its rollback anchor. The tail is at most `RECOVERY_TAIL_TOKENS`; a
+    /// completed prefill is no longer active tail work.
+    pub(crate) fn is_recovery_tail(&self) -> bool {
+        self.plan.cursor >= self.plan.recovery_position
+            && self.plan.cursor < self.prompt_tokens.len()
+    }
+
     /// Plan a cooperative FFN chunk without changing request, cache, or
-    /// scheduler state. Only a warm matrix slice strictly before the recovery
-    /// checkpoint is eligible; anchor capture, incremental replay, and final
-    /// head publication stay on the established serial path.
+    /// scheduler state. Aligned matrix work through the recovery anchor is
+    /// eligible; incremental replay and final head publication stay on the
+    /// established serial path.
     pub(crate) fn plan_cooperative_prefill(
         &self,
         cache_position: usize,
@@ -180,10 +193,7 @@ impl Deepseek4PrefillState {
             cache_position,
             committed_tokens
         );
-        if self.plan.origin != Deepseek4PrefillOrigin::Cached
-            || self.plan.cursor >= self.plan.recovery_position
-            || max_rows < sliding_window
-        {
+        if self.plan.cursor >= self.plan.recovery_position || max_rows < sliding_window {
             return Ok(None);
         }
         let remaining = self.plan.recovery_position - self.plan.cursor;
@@ -201,11 +211,9 @@ impl Deepseek4PrefillState {
         let plan = Deepseek4CooperativePrefillPlan {
             start: self.plan.cursor,
             token_count,
+            capture_anchor_after: slice.capture_anchor_after,
         };
-        if slice.capture_anchor_after
-            || token_count > max_rows
-            || plan.end() >= self.plan.recovery_position
-        {
+        if token_count > max_rows || plan.end() > self.plan.recovery_position {
             return Ok(None);
         }
         Ok(Some(plan))
@@ -227,17 +235,37 @@ impl Deepseek4PrefillState {
         plan: Deepseek4CooperativePrefillPlan,
     ) -> Result<()> {
         anyhow::ensure!(
-            plan.start == self.plan.cursor && plan.end() < self.plan.recovery_position,
+            plan.start == self.plan.cursor
+                && plan.end() <= self.plan.recovery_position
+                && plan.captures_anchor() == (plan.end() == self.plan.recovery_position),
             "DeepSeek-V4 cooperative publication crossed a recovery checkpoint"
         );
         Ok(())
     }
 
+    pub(crate) fn cooperative_anchor_tokens(
+        &self,
+        plan: Deepseek4CooperativePrefillPlan,
+    ) -> Result<Option<&[u32]>> {
+        if !plan.captures_anchor() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            plan.start == self.plan.cursor && plan.end() == self.plan.recovery_position,
+            "DeepSeek-V4 cooperative anchor plan no longer matches the recovery checkpoint"
+        );
+        Ok(Some(&self.prompt_tokens[..self.plan.recovery_position]))
+    }
+
     pub(crate) fn publish_cooperative_prefill(&mut self, plan: Deepseek4CooperativePrefillPlan) {
         debug_assert_eq!(plan.start, self.plan.cursor);
-        debug_assert!(plan.end() < self.plan.recovery_position);
+        debug_assert!(plan.end() <= self.plan.recovery_position);
         self.plan.cursor = plan.end();
         self.progress.advance_prefill(plan.token_count);
+        if plan.captures_anchor() {
+            self.progress
+                .recovery_anchor_captured(self.plan.recovery_position);
+        }
     }
 
     pub(crate) fn advance(
@@ -601,6 +629,7 @@ impl Deepseek4SlotState {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Deepseek4PrefillOrigin;
     use super::*;
 
     fn cached_prefill_state(cursor: usize, recovery_position: usize) -> Deepseek4PrefillState {
@@ -647,22 +676,57 @@ mod tests {
         let mut state = cached_prefill_state(6_676, 6_676);
         state.prompt_tokens.truncate(6_684);
         assert_eq!(state.uncached_tokens(), 8);
+        assert!(state.is_recovery_tail());
+
+        let mut cold = cached_prefill_state(0, 6_676);
+        cold.plan.origin = super::super::Deepseek4PrefillOrigin::Cold;
+        cold.prompt_tokens.truncate(6_684);
+        assert!(!cold.is_recovery_tail());
+        cold.plan.cursor = cold.plan.recovery_position;
+        assert!(cold.is_recovery_tail());
+        cold.plan.cursor = cold.prompt_tokens.len();
+        assert!(!cold.is_recovery_tail());
     }
 
     #[test]
-    fn cooperative_prefill_excludes_cold_anchor_and_incremental_work() {
-        let mut cold = cached_prefill_state(0, 8_000);
-        cold.plan.origin = Deepseek4PrefillOrigin::Cold;
-        assert!(cold
-            .plan_cooperative_prefill(0, 0, 128, 512)
+    fn cooperative_prefill_accepts_aligned_cold_matrix_and_anchor_but_excludes_tail() {
+        let mut cold = cached_prefill_state(0, 6_676);
+        cold.plan.origin = super::super::Deepseek4PrefillOrigin::Cold;
+        cold.prompt_tokens.truncate(6_684);
+        let mut transactions = 0;
+        let mut cooperative_rows = 0;
+        let mut anchors = 0;
+        while let Some(plan) = cold
+            .plan_cooperative_prefill(cold.plan.cursor, cold.plan.cursor, 128, 512)
             .unwrap()
-            .is_none());
+        {
+            assert!((1..=512).contains(&plan.token_count()));
+            assert!(plan.end() <= cold.plan.recovery_position);
+            anchors += plan.captures_anchor() as usize;
+            if plan.captures_anchor() {
+                assert_eq!(
+                    cold.cooperative_anchor_tokens(plan).unwrap().unwrap().len(),
+                    cold.plan.recovery_position
+                );
+            }
+            cold.validate_cooperative_prefill_commit(plan).unwrap();
+            cold.publish_cooperative_prefill(plan);
+            transactions += 1;
+            cooperative_rows += plan.token_count();
+        }
+        assert_eq!(transactions, 14);
+        assert_eq!(anchors, 1);
+        assert_eq!(cooperative_rows, cold.plan.cursor);
+        assert_eq!(cold.plan.cursor, cold.plan.recovery_position);
+        assert_eq!(cold.prompt_tokens.len() - cold.plan.recovery_position, 8);
 
         let anchor = cached_prefill_state(7_488, 8_000);
-        assert!(anchor
+        let anchor_plan = anchor
             .plan_cooperative_prefill(7_488, 7_488, 128, 512)
             .unwrap()
-            .is_none());
+            .expect("aligned final matrix slice should capture the recovery anchor");
+        assert!(anchor_plan.captures_anchor());
+        assert_eq!(anchor_plan.end(), 8_000);
 
         let incremental = cached_prefill_state(7_968, 8_000);
         assert!(incremental
