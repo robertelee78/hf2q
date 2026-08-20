@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SHA-256 and Git blob SHA-1 identities, and records every selected local
   SHA-256 without granting authority to unrelated cache files.
 
+### Fixed
+
+- Keep the OpenAI `parallel_tool_calls` omission consistent with hf2q's
+  established single-call default, and stop DeepSeek generation as soon as a
+  constrained non-parallel tool body is accepted. This removes an unused final
+  full-model forward while preserving explicit parallel calls and exact tool
+  semantics.
+
 ## [0.1.7] — 2026-08-18
 
 ### Added

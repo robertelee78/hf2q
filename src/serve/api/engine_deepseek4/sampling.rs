@@ -5,7 +5,7 @@ use mlx_native::MlxBuffer;
 
 use crate::serve::api::engine::{
     effective_repetition_penalty, grammar_runtime_for_request, sample_logits_with_grammar,
-    GenerationResult, SamplingParams,
+    GenerationResult, GrammarKind, SamplingParams,
 };
 use crate::serve::api::engine_supervisor::EngineSupervisor;
 use crate::serve::api::grammar::GrammarRuntime;
@@ -50,6 +50,25 @@ pub(super) fn grammar_runtime(
     registration: Option<&ModelRegistration>,
 ) -> Result<Option<GrammarRuntime>> {
     grammar_runtime_for_request(params, registration)
+}
+
+/// A non-parallel DeepSeek tool grammar has no semantically useful next-token
+/// forward once the closing token makes the runtime accepting. The final token
+/// is already part of the response; like stop-string and max-token termination,
+/// it need not be appended to KV unless another decode step will consume it.
+pub(super) fn accepted_single_tool_call_is_terminal(
+    params: &SamplingParams,
+    runtime: Option<&GrammarRuntime>,
+) -> bool {
+    !params.parallel_tool_calls
+        && matches!(
+            params.grammar_kind,
+            GrammarKind::ToolCallBodyAuto | GrammarKind::ToolCallBodyRequired
+        )
+        && params.tool_call_policy.enforces_body_grammar()
+        && runtime.is_some_and(|runtime| {
+            !runtime.is_awaiting_trigger() && !runtime.is_dead() && runtime.is_accepted()
+        })
 }
 
 fn sample_cpu_logits(
@@ -212,6 +231,11 @@ pub(in crate::serve::api) fn generate_once(
             finish_reason = "stop";
             break;
         }
+        if step + 1 < max_tokens && accepted_single_tool_call_is_terminal(params, runtime.as_ref())
+        {
+            finish_reason = "stop";
+            break;
+        }
         if step + 1 < max_tokens {
             logits = loaded.commit_generated_token(token, supervisor)?;
         }
@@ -240,8 +264,11 @@ pub(in crate::serve::api) fn generate_once(
 mod tests {
     use std::sync::Arc;
 
-    use super::{decode_token_limit, grammar_runtime, sample_cpu_logits, sampler_config};
-    use crate::serve::api::engine::SamplingParams;
+    use super::{
+        accepted_single_tool_call_is_terminal, decode_token_limit, grammar_runtime,
+        sample_cpu_logits, sampler_config,
+    };
+    use crate::serve::api::engine::{GrammarKind, SamplingParams, ToolCallPolicy};
 
     #[test]
     fn agentic_grammar_contract_deepseek_requires_exactly_one_authoritative_table() {
@@ -318,5 +345,67 @@ mod tests {
         assert_eq!(decode_token_limit(128, 128, 128), 1);
         assert_eq!(decode_token_limit(0, 64, 128), 1);
         assert_eq!(decode_token_limit(4, 64, 128), 4);
+    }
+
+    #[test]
+    fn accepted_single_tool_grammar_skips_only_the_terminal_forward() {
+        let grammar = crate::serve::api::grammar::parse("root ::= \"b\"\n").expect("parse grammar");
+        let mut runtime = crate::serve::api::grammar::GrammarRuntime::new(
+            grammar.clone(),
+            grammar.rule_id("root").expect("root rule"),
+        )
+        .expect("runtime");
+        let mut params = SamplingParams {
+            parallel_tool_calls: false,
+            grammar_kind: GrammarKind::ToolCallBodyRequired,
+            tool_call_policy: ToolCallPolicy::Constrained,
+            ..SamplingParams::default()
+        };
+
+        assert!(!accepted_single_tool_call_is_terminal(&params, None));
+        assert!(!accepted_single_tool_call_is_terminal(
+            &params,
+            Some(&runtime)
+        ));
+        runtime.accept_bytes(b"b");
+        assert!(accepted_single_tool_call_is_terminal(
+            &params,
+            Some(&runtime)
+        ));
+
+        params.parallel_tool_calls = true;
+        assert!(!accepted_single_tool_call_is_terminal(
+            &params,
+            Some(&runtime)
+        ));
+        params.parallel_tool_calls = false;
+        params.grammar_kind = GrammarKind::ResponseFormat;
+        assert!(!accepted_single_tool_call_is_terminal(
+            &params,
+            Some(&runtime)
+        ));
+        params.grammar_kind = GrammarKind::ToolCallBodyAuto;
+        params.tool_call_policy = ToolCallPolicy::Auto;
+        assert!(!accepted_single_tool_call_is_terminal(
+            &params,
+            Some(&runtime)
+        ));
+        params.tool_call_policy = ToolCallPolicy::AutoLazyGrammar;
+        runtime.set_awaiting_trigger(true);
+        assert!(!accepted_single_tool_call_is_terminal(
+            &params,
+            Some(&runtime)
+        ));
+        runtime.set_awaiting_trigger(false);
+        assert!(accepted_single_tool_call_is_terminal(
+            &params,
+            Some(&runtime)
+        ));
+        runtime.accept_bytes(b"x");
+        assert!(runtime.is_dead());
+        assert!(!accepted_single_tool_call_is_terminal(
+            &params,
+            Some(&runtime)
+        ));
     }
 }

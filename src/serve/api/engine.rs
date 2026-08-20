@@ -448,7 +448,7 @@ impl Default for SamplingParams {
             logit_bias: std::collections::HashMap::new(),
             logprobs: false,
             top_logprobs: 0,
-            parallel_tool_calls: true,
+            parallel_tool_calls: false,
             grammar: None,
             token_bytes: None,
             grammar_kind: GrammarKind::default(),

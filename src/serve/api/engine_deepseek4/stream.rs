@@ -15,7 +15,10 @@ use crate::serve::api::registry::{
 use crate::serve::api::sse::{DeltaKind, GenerationEvent, StreamStats};
 
 use super::progress::RequestProgress;
-use super::sampling::{decode_token_limit, grammar_runtime, sample, sampler_config};
+use super::sampling::{
+    accepted_single_tool_call_is_terminal, decode_token_limit, grammar_runtime, sample,
+    sampler_config,
+};
 use super::{release_completed_prefill_scratch, Deepseek4LoadedModel, RequestScratchGuard};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -524,6 +527,12 @@ pub(in crate::serve::api) fn generate_stream(
                 .stop_strings
                 .iter()
                 .any(|stop| !stop.is_empty() && decoded_running.contains(stop))
+            {
+                finish_reason = "stop";
+                break;
+            }
+            if step + 1 < max_tokens
+                && accepted_single_tool_call_is_terminal(params, runtime.as_ref())
             {
                 finish_reason = "stop";
                 break;
