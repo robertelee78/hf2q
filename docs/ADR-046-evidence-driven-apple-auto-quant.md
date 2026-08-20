@@ -320,26 +320,32 @@ group may improve approximation while increasing scale/bias traffic and
 slowing Metal execution. A two-bit artifact may be smaller and still be slower
 than four-bit for prompt or batched shapes.
 
-### 7. Learned quantization is staged on one affine ABI
+### 7. Learned quantization methods share one candidate boundary
 
-After the full-model affine baseline is correct, candidate producers land in
-measured order:
+After the full-model affine baseline is correct, the active implementation
+order is:
 
 1. affine RTN control;
 2. dynamic mixed-precision allocation;
-3. AWQ and GPTQ candidates;
-4. DWQ scale/bias distillation, optionally initialized from a preceding method.
+3. AWQ and GPTQ candidates only when separately measured evidence justifies
+   them.
+
+Per the owner decision on 2026-08-19, DWQ is not part of the current
+implementation program, dependency set, release claim, or acceptance
+requirement. Dynamic allocation, ordinary PTQ materialization, held-out repair,
+and Apple selection must be complete without it. The common candidate boundary
+may accommodate a future separately authorized DWQ experiment, but no DWQ
+trainer or scale/bias-distillation work is implied by this ADR phase.
 
 All production implementation remains Rust plus `mlx-native`. External tools
 may be reference oracles in benchmark harnesses only. Each algorithm consumes
 the exact source and emits the same manifest/receipt schema, so the selector is
 agnostic to how the codes/scales were produced.
 
-For 27B-class DWQ on 128 GiB unified memory, the implementation must stream
-teacher targets to sharded storage, release teacher state before student
-training where possible, bound calibration batches, and prove peak memory.
-The default corpus cannot be assumed behavior-complete; owner/family regression
-suites supplement source-logit distillation.
+If DWQ is authorized later for a 27B-class model on 128 GiB unified memory, its
+own amendment must bind teacher-target storage, teacher/student residency,
+calibration bounds, optimizer state, peak memory, and owner/family behavior
+suites before implementation begins.
 
 ### 8. Existing heuristic auto remains planning-only
 
@@ -358,7 +364,8 @@ hf2q owns:
 
 - Hugging Face source identity, safetensors ingestion, architecture and tensor
   mapping;
-- calibration corpus handling, RTN/imatrix/dynamic/AWQ/GPTQ/DWQ algorithms,
+- calibration corpus handling and authorized RTN/imatrix/dynamic/AWQ/GPTQ
+  candidate producers,
   per-tensor policy, and bounded-memory artifact production;
 - the model-family graph, tensor-to-operation routing, candidate manifests,
   source-quality/performance evidence, auto selection, and serving behavior.
@@ -496,8 +503,9 @@ capability and must independently beat eligible candidates.
   a distinct candidate and prove it against the exact source. An unrecorded
   proxy is not teacher evidence.
 - Add AWQ and GPTQ only behind the common candidate/evidence contract.
-- Add native DWQ with teacher-target sharding, trainable affine scale/bias
-  parameters, optimizer state bounds, checkpoints, and source-teacher gates.
+- Do not add DWQ in this program. A future DWQ candidate requires explicit
+  owner authorization plus a separate exact-teacher, memory, and behavior
+  evidence amendment; production Dynamic autoquant cannot depend on it.
 - Compare algorithms at identical encoding, group size, artifact/runtime,
   corpus, and workload wherever the question is algorithmic quality.
 - Report KL, one-step top-1, the schema-v2 fixed-horizon greedy trajectory
@@ -639,9 +647,10 @@ Real-model Apple-Silicon gates:
 
 "Optimal" now means fastest measured inference for an explicit Apple-Silicon
 workload profile after hard coherence gates, not smallest artifact, highest
-nominal compression, or best theoretical bandwidth. DWQ becomes a quality
-optimization that can make a lower-precision affine candidate eligible; it is
-not a speed feature by itself.
+nominal compression, or best theoretical bandwidth. The current completion
+contract does not include DWQ; future learned-affine candidates, if separately
+authorized, would compete under the same quality-before-speed gates rather than
+becoming an assumed speed feature.
 
 The design applies unchanged to vanilla and weight-modified checkpoints. An
 intentional source behavior is preserved because the exact source is the
