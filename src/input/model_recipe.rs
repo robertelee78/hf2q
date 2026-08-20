@@ -8,7 +8,9 @@
 //! sibling preparation boundary additionally seals accepted host/disk facts
 //! and both canonical conversion receipts into one inert text/projector pair.
 //! The plan boundary derives the canonical no-options layout while retaining
-//! the host proof, but deliberately cannot mutate that layout.
+//! the host proof, then accepts only a sealed exact Hub resolution from the
+//! download module. Neither transition can transfer payloads or mutate that
+//! layout.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

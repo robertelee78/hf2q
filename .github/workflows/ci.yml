@@ -328,6 +328,7 @@ jobs:
               'std::process|Command::new|(^|[^[:alnum:]_])reqwest(::|[[:space:]])|(^|[^[:alnum:]_])hyper(::|[[:space:]])' \
               src/input/hf_reference.rs \
               src/input/hf_download.rs \
+              src/input/hf_download/resolution.rs \
               src/input/integrity.rs \
               src/convert/receipt.rs \
               src/main.rs || true
@@ -339,7 +340,7 @@ jobs:
           test -z "$unexpected_hf_external_authority"
           unexpected_recipe_external_authority="$(
             grep -RInE --include='*.rs' \
-              'hf_hub|std::process|Command::new|reqwest|hyper|tokio::net|clap::' \
+              'hf_hub|resolve_model_reference|resolve_model_preparation_plan|std::process|Command::new|reqwest|hyper|tokio::net|clap::' \
               src/input/model_recipe.rs src/input/model_recipe || true
           )"
           test -z "$unexpected_recipe_external_authority"
@@ -444,6 +445,7 @@ jobs:
             src/input/hf_reference.rs \
             src/input/hf_reference_tests.rs \
             src/input/hf_download.rs \
+            src/input/hf_download/resolution.rs \
             src/input/hf_download_plan_tests.rs \
             src/input/integrity.rs \
             src/input/model_recipe.rs \
@@ -495,6 +497,8 @@ jobs:
           hf_source_tests="$(cargo test --locked --bin hf2q --all-features -- --list)"
           for required_test in \
             input::hf_reference_tests::equivalent_model_references_share_one_canonical_identity \
+            input::hf_download_plan_tests::file_specific_resolution_fails_before_any_hub_lookup \
+            input::hf_download_plan_tests::repository_info_seals_a_mutable_request_to_the_returned_exact_commit \
             input::hf_download_plan_tests::immutable_file_metadata_is_checked_before_transfer \
             input::hf_download_plan_tests::metadata_transfer_caps_are_explicit_and_exact \
             input::model_recipe_tests::embedded_recipe_is_exact_canonical_and_binds_accepted_outputs \
@@ -505,6 +509,9 @@ jobs:
             input::model_recipe_preparation_tests::os_bound_host_preflight_rejects_a_file_as_the_preparation_root \
             input::model_recipe_preparation_tests::current_recipe_host_preflight_passes_on_the_explicit_proof_machine \
             input::model_recipe_plan_tests::canonical_no_options_layout_is_exact_and_inert \
+            input::model_recipe_plan_tests::exact_hub_resolution_consumes_the_plan_and_preserves_its_layout \
+            input::model_recipe_plan_tests::resolution_must_match_the_original_plan_revision_and_complete_recipe_inventory \
+            input::model_recipe_plan_tests::current_plan_resolves_through_the_exact_production_hub_boundary \
             input::model_recipe_plan_tests::current_no_options_plan_passes_on_the_explicit_proof_machine \
             input::model_recipe_plan_tests::preparation_root_is_absolute_canonical_bounded_and_directory_backed \
             input::integrity::tests::safetensors_index_entry_cap_is_exact \

@@ -21,7 +21,8 @@
   verification, conversion receipt v3, and the closed checked-in Qwen3.8
   source/artifact/hardware/disk recipe, bounded canonical preparation-pair
   receipt, OS-bound host/disk preflight, and sealed host/conversion/pair proofs
-  plus the canonical inert no-options preparation layout are also reconciled;
+  plus the canonical inert no-options preparation layout and exact Hub
+  resolution transition are also reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install/onboarding
@@ -1689,9 +1690,25 @@ registration, calibration, serving, or filesystem-mutation authority. A later
 coordinator must consume it, resolve Hub metadata to the same exact revision,
 and revalidate the namespace before mutation.
 
-The no-options coordinator, conversion invocation, source-retention mutation,
-prepared-model registry, and calibration receipt remain pending and must
-consume these proofs rather than reconstructing policy from strings.
+**Landed exact-resolution boundary (2026-08-19).** The pinned in-process Hub
+client can now resolve the plan's exact original reference without transferring
+model payloads. `ResolvedModelRepository` is a private-field, non-cloneable
+token containing the normalized immutable 40-hex reference and a bounded,
+validated repository-name inventory. The model-recipe module retains no Hub,
+HTTP, subprocess, or filesystem-write authority: the download module alone
+consumes the host-checked plan, performs the pinned lookup, and passes the
+sealed result back to the plan's narrow binder. Binding requires the exact
+original input, normalized repository and canonical URL, accepted immutable
+revision, no file route, and the presence of all 29 recipe-owned source names.
+Unrelated repository entries remain inert and private. The returned
+`ResolvedModelPreparationPlan` retains the sealed resolution and planned
+layout but still grants no payload transfer, conversion, deletion,
+registration, calibration, serving, or filesystem-mutation authority.
+
+The resolved-plan payload transfer, no-options conversion invocation,
+source-retention mutation, prepared-model registry, and calibration receipt
+remain pending and must consume these proofs rather than reconstructing policy
+from strings.
 
 It executes an hf2q-only resumable plan:
 
@@ -2021,7 +2038,10 @@ before public self-update ships.
    macOS sysctl reads plus the selected target filesystem's observed free
    space. The canonical no-options preparation plan now owns that proof and
    derives the bounded source/artifact/receipt/profile layout without creating
-   it; both remain explicitly calibration-pending and inert. Next, embed
+   it; its exact original reference is now consumed by the pinned Hub resolver
+   and bound to the accepted commit plus complete recipe-owned name inventory
+   before any payload transfer. All remain explicitly calibration-pending and
+   inert. Next, embed
    the real stable root, compile the real
    public Team ID, pass the protected positive signing fixture, and compose
    that recipe into the no-options paired conversion, source-retention
