@@ -3,12 +3,14 @@ use std::num::NonZeroU64;
 use std::path::Path;
 
 use super::fs::{self, RuntimeConfigBinding};
+use super::managed_session_cache::{ManagedSessionCache, ManagedSessionCacheError};
 use super::SetupError;
 
 /// A read-only, setup-authenticated session-cache policy decision.
 ///
-/// This type deliberately cannot construct a cache persistor. It prevents the
-/// setup wire's zero-disabled value from reaching legacy zero-unlimited APIs.
+/// This type can only construct the dormant descriptor-authorized managed
+/// store. It prevents the setup wire's zero-disabled value from reaching
+/// legacy zero-unlimited APIs or any serving/model sibling.
 pub(crate) enum SessionCachePolicyAuthorization {
     Absent,
     Disabled(DisabledSessionCacheAuthorization),
@@ -50,6 +52,17 @@ impl DisabledSessionCacheAuthorization {
 }
 
 impl EnabledSessionCacheAuthorization {
+    /// Consume the setup-authenticated policy into the only managed writer.
+    ///
+    /// Keeping this transition here prevents the zero-disabled setup wire,
+    /// raw byte limit, state-root path, and retained descriptors from being
+    /// independently paired by a serving sibling.
+    pub(in crate::setup) fn into_managed_store(
+        self,
+    ) -> Result<ManagedSessionCache, ManagedSessionCacheError> {
+        ManagedSessionCache::open(self.limit_bytes, self.binding)
+    }
+
     #[cfg(test)]
     pub(super) const fn limit_bytes(&self) -> NonZeroU64 {
         self.limit_bytes
