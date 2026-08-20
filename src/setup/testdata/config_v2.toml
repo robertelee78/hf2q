@@ -1,0 +1,12 @@
+kind = "hf2q.config"
+schema_version = 2
+package = "hf2q"
+
+[convert]
+quant = "q4_k_m"
+
+[serve]
+host = "127.0.0.1"
+port = 8081
+scheduler = "inflight_batched"
+max_slots = 1

@@ -55,11 +55,11 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │                        for tests under `tests/`)
 ├── src/cli.rs           clap derive — every subcommand + arg
 ├── src/doctor.rs        `hf2q doctor` runtime diagnostic
-├── src/setup/           `hf2q setup` host inventory, canonical bounded TOML,
-│                        disk-aware zero-disabled session policy, and private
-│                        descriptor-relative crash-durable publication; the
-│                        provisional session policy remains inert pending its
-│                        replacement by consumed convert/serve defaults
+├── src/setup/           `hf2q setup` host inventory, strict operator-default
+│                        schema/loader, interactive policy, and private
+│                        descriptor-relative crash-durable publication;
+│                        `main` feeds its convert and serve defaults into the
+│                        existing command resolvers
 ├── src/preflight.rs     ADR-012 preflight checks (disk, token, …)
 ├── src/progress.rs      indicatif-based progress reporting
 ├── src/gguf_patch.rs    metadata-only GGUF rewriter (no tensor I/O)

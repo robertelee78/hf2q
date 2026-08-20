@@ -55,7 +55,20 @@ The explicit `GIT_COMMIT_SHA` gives remote-conversion receipts the immutable
 converter identity they require. A future published binary installer will
 provide that identity as part of the release artifact instead.
 
-## 2. Convert and quantize the model
+## 2. Configure defaults for this Mac
+
+Record the defaults proven by this guide:
+
+```bash
+hf2q setup --accept-defaults
+```
+
+Setup reports the Mac, Metal device, memory, OS, cores, and storage it found,
+then records Q4_K_M conversion plus localhost port 8081 and inflight-batched
+serving with one active slot. It does not download or load the guide model.
+Run `hf2q setup` without the flag to review each choice interactively.
+
+## 3. Convert and quantize the model
 
 Choose a durable destination outside the source checkout, then let hf2q
 resolve, download, verify, convert, and quantize the exact model revision:
@@ -68,9 +81,11 @@ mkdir -p "$MODEL_DIR"
 
 hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT \
   --revision 08c2f075b43bc06456382db6b918a3dcabdcf4dd \
-  --quant q4_k_m \
   --output "$MODEL"
 ```
+
+The omitted `--quant` comes from setup. An explicit `--quant` always wins;
+without either setup config or the flag, convert fails and asks for a choice.
 
 hf2q uses its in-process Hugging Face client; Python, `huggingface-cli`,
 llama.cpp, and an external converter are not involved. The command writes the
@@ -80,24 +95,21 @@ Keep the receipt with the model. It records the resolved source revision,
 converter revision, selected quantization, output identity, and bounded
 conversion evidence.
 
-## 3. Serve the GGUF
+## 4. Serve the GGUF
 
 Start a localhost-only server:
 
 ```bash
 hf2q serve \
-  --model "$MODEL" \
-  --host 127.0.0.1 \
-  --port 8081 \
-  --scheduler inflight-batched \
-  --max-slots 1
+  --model "$MODEL"
 ```
 
-The one-slot SlotAware scheduler is deliberate. Small direct requests also
-fit the default SerialFifo path, but OpenCode's measured agent prompt is about
-7,100 tokens and exceeds SerialFifo's 2,048-token bounded prefill transaction.
-SlotAware keeps the model's full declared context and lets the same server
-support both the direct examples and OpenCode.
+Setup supplies localhost port 8081 and the one-slot SlotAware scheduler.
+Small direct requests also fit the built-in SerialFifo path, but OpenCode's
+measured agent prompt is about 7,100 tokens and exceeds SerialFifo's
+2,048-token bounded prefill transaction. SlotAware keeps the model's full
+declared context and lets the same server support both the direct examples and
+OpenCode.
 
 Leave that terminal running. In a second terminal, verify readiness and ask
 the server for its actual model ID:
@@ -114,7 +126,7 @@ printf 'Model ID: %s\n' "$MODEL_ID"
 
 Do not guess the ID from the filename; use the server response.
 
-## 4. Send a chat request
+## 5. Send a chat request
 
 The selected model card recommends non-thinking operation. State that choice
 explicitly in requests because the embedded Qwen template otherwise defaults
@@ -138,7 +150,7 @@ curl -fsS http://127.0.0.1:8081/v1/chat/completions \
 For a streaming response, add `stream: true` to the JSON body and consume the
 SSE stream until the terminal `[DONE]` event.
 
-## 5. Connect OpenCode (optional)
+## 6. Connect OpenCode (optional)
 
 OpenCode can use hf2q as a custom OpenAI-compatible provider. Put the model ID
 returned above into your OpenCode configuration rather than assuming a fixed
@@ -182,9 +194,6 @@ cached tokens.
 
 ## What this guide does not do
 
-- It does not use `hf2q setup` yet. The current setup schema is provisional;
-  ADR-045's next setup slice will replace it with defaults that `convert` and
-  `serve` actually consume.
 - It does not install or configure OpenCode for you.
 - It does not enable Qwen3.8 vision or speculative MTP decoding.
 - It does not add a second model-preparation, model-registry, or session-cache

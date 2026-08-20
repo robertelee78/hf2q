@@ -171,7 +171,7 @@ fn invocation_mentions_setup(args: &[std::ffi::OsString]) -> bool {
                 .next()
                 .is_some_and(|value| value == std::ffi::OsStr::new("setup"));
         }
-        if matches!(argument, "--log-format" | "--log-level") {
+        if matches!(argument, "--log-format" | "--log-level" | "--state-root") {
             let _ = arguments.next();
             continue;
         }
@@ -185,8 +185,9 @@ fn invocation_mentions_setup(args: &[std::ffi::OsString]) -> bool {
 
 fn run(cli: Cli) -> Result<(), AppError> {
     let log_format = cli.log_format;
+    let state_root = cli.state_root;
     match cli.command {
-        Command::Setup(args) => setup::run(args).map_err(|error| {
+        Command::Setup(args) => setup::run(args, state_root.as_deref()).map_err(|error| {
             if error.is_input() {
                 AppError::Input(anyhow::Error::from(error))
             } else {
@@ -198,7 +199,15 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
         Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
         Command::Generate(args) => serve::cmd_generate(args).map_err(AppError::Conversion),
-        Command::Serve(args) => serve::cmd_serve(args, log_format).map_err(AppError::Conversion),
+        Command::Serve(args) => {
+            let operator_config = load_operator_config(state_root.as_deref())?;
+            serve::cmd_serve(
+                args,
+                log_format,
+                operator_config.as_ref().map(|config| &config.serve),
+            )
+            .map_err(AppError::Conversion)
+        }
         Command::Parity(args) => serve::cmd_parity(args).map_err(AppError::Conversion),
         Command::Smoke(args) => cmd_smoke(args),
         // ADR-005 Phase 3 iter-205 (AC line 5351): operator-facing
@@ -207,9 +216,24 @@ fn run(cli: Cli) -> Result<(), AppError> {
         // --yes, mutually-exclusive-flags) is a user-input mistake;
         // exit-3 is the documented signal.
         Command::Cache(args) => serve::cmd_cache(args).map_err(AppError::Input),
-        Command::Convert(args) => cmd_convert(args),
+        Command::Convert(args) => {
+            let operator_config = load_operator_config(state_root.as_deref())?;
+            cmd_convert(args, operator_config.as_ref())
+        }
         Command::Tokenizer(args) => cmd_tokenizer(args),
     }
+}
+
+fn load_operator_config(
+    state_root: Option<&std::path::Path>,
+) -> Result<Option<setup::OperatorConfigV2>, AppError> {
+    setup::load_operator_config(state_root).map_err(|error| {
+        if error.is_input() {
+            AppError::Input(anyhow::Error::from(error))
+        } else {
+            AppError::Conversion(anyhow::Error::from(error))
+        }
+    })
 }
 
 /// ADR-038 G4-CFA-5e — operator-facing tokenizer.json patching.
@@ -281,7 +305,10 @@ fn cmd_tokenizer(args: cli::TokenizerArgs) -> Result<(), AppError> {
 /// onto `AppError::Input` (parse / arch / missing tensor — operator-input
 /// issues) vs `AppError::Conversion` (source read, orchestrator, IO —
 /// pipeline-internal issues).
-fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
+fn cmd_convert(
+    args: cli::ConvertCliArgs,
+    operator_config: Option<&setup::OperatorConfigV2>,
+) -> Result<(), AppError> {
     use crate::convert::{
         run_convert, ConvertArgs, ConvertError, QuantSelector, RemoteConversionSource,
     };
@@ -290,8 +317,9 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
     // and Apex tiers (`apex-balanced`, `apex-i-quality`, ...). Reserved
     // names (`dwq`, bare `apex`, `tq1_0`, `tq2_0`) surface as typed
     // errors per ADR §6 reserved-name stubs.
-    let selector = QuantSelector::from_name(&args.quant)
-        .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
+    let quant = resolve_convert_quant(args.quant.as_deref(), operator_config)?;
+    let selector =
+        QuantSelector::from_name(quant).map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
     let source_repo = args.source_repo.clone();
     let source_revision = args.source_revision.clone();
 
@@ -385,6 +413,19 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
         | ConvertError::Vision(_)
         | ConvertError::HfDownload(_) => AppError::Conversion(anyhow::anyhow!("{e}")),
     })
+}
+
+fn resolve_convert_quant<'a>(
+    explicit: Option<&'a str>,
+    operator_config: Option<&'a setup::OperatorConfigV2>,
+) -> Result<&'a str, AppError> {
+    explicit
+        .or_else(|| operator_config.map(|config| config.convert.quant.as_str()))
+        .ok_or_else(|| {
+            AppError::Input(anyhow::anyhow!(
+                "convert requires --quant unless a default was recorded by `hf2q setup`"
+            ))
+        })
 }
 
 #[derive(Debug)]
@@ -558,6 +599,8 @@ fn cmd_completions(args: cli::CompletionsArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn convert_source_classifier_preserves_explicit_local_paths() {
@@ -616,5 +659,61 @@ mod tests {
             ),
             Err(crate::convert::ConvertError::RepoAndDirMutuallyExclusive)
         ));
+    }
+
+    #[test]
+    fn convert_config_quant_is_used_and_explicit_quant_wins() {
+        let config = setup::OperatorConfigV2::guide_defaults().unwrap();
+        assert_eq!(
+            resolve_convert_quant(None, Some(&config)).unwrap(),
+            "q4_k_m"
+        );
+        assert_eq!(
+            resolve_convert_quant(Some("q5_k_m"), Some(&config)).unwrap(),
+            "q5_k_m"
+        );
+        assert!(resolve_convert_quant(None, None).is_err());
+    }
+
+    #[test]
+    fn invalid_operator_config_fails_before_convert_source_or_serve_bind() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("state");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(root.join("config.toml"), b"not = [valid").unwrap();
+        std::fs::set_permissions(
+            root.join("config.toml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let output = temp.path().join("never-created-by-invalid-config.gguf");
+        let convert = Cli::try_parse_from([
+            "hf2q",
+            "--state-root",
+            root.to_str().unwrap(),
+            "convert",
+            "definitely-not-contacted/remote-model",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(run(convert), Err(AppError::Input(_))));
+        assert!(!output.exists());
+
+        let model = temp.path().join("definitely-not-opened.gguf");
+        let serve = Cli::try_parse_from([
+            "hf2q",
+            "--state-root",
+            root.to_str().unwrap(),
+            "serve",
+            "--model",
+            model.to_str().unwrap(),
+            "--port",
+            "65534",
+        ])
+        .unwrap();
+        assert!(matches!(run(serve), Err(AppError::Input(_))));
     }
 }

@@ -10,7 +10,7 @@ use self::unix::{
     open_or_create_root, open_private_file, private_identity, reopen_root, sync_directory,
     verify_lock, verify_named, verify_root, Directory, Identity,
 };
-use super::schema::{ConfigV1, MAX_CONFIG_BYTES};
+use super::schema::{OperatorConfigV2, MAX_CONFIG_BYTES};
 use super::SetupError;
 
 mod unix;
@@ -51,13 +51,13 @@ impl SetupBarrier {
 
 pub(super) struct ExistingConfig {
     root: Option<Directory>,
-    config: Option<ConfigV1>,
+    config: Option<OperatorConfigV2>,
     bytes: Option<Vec<u8>>,
     identity: Option<Identity>,
 }
 
 impl ExistingConfig {
-    pub(super) fn config(&self) -> Option<&ConfigV1> {
+    pub(super) fn config(&self) -> Option<&OperatorConfigV2> {
         self.config.as_ref()
     }
 
@@ -68,6 +68,22 @@ impl ExistingConfig {
 
 pub(super) fn observe_existing_config(root_path: &Path) -> Result<ExistingConfig, SetupError> {
     observe_existing_config_with_hook(root_path, || {})
+}
+
+pub(super) fn load_config_if_present(
+    root_path: &Path,
+) -> Result<Option<OperatorConfigV2>, SetupError> {
+    match std::fs::symlink_metadata(root_path.join(CONFIG_NAME)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(SetupError::Filesystem(format!(
+                "cannot inspect {}: {error}",
+                root_path.join(CONFIG_NAME).display()
+            )))
+        }
+        Ok(_) => {}
+    }
+    Ok(observe_existing_config(root_path)?.config().cloned())
 }
 
 fn observe_existing_config_with_hook(
@@ -91,7 +107,7 @@ fn observe_existing_config_with_hook(
         Some((bytes, identity)) => (Some(bytes), Some(identity)),
         None => (None, None),
     };
-    let config = bytes.as_deref().map(ConfigV1::parse).transpose()?;
+    let config = bytes.as_deref().map(OperatorConfigV2::parse).transpose()?;
     verify_root(root_path, &root)?;
     Ok(ExistingConfig {
         root: Some(root),
@@ -105,13 +121,13 @@ fn observe_existing_config_with_hook(
 pub(super) fn read_existing_config_with_test_hook(
     root_path: &Path,
     hook: impl FnOnce(),
-) -> Result<Option<ConfigV1>, SetupError> {
+) -> Result<Option<OperatorConfigV2>, SetupError> {
     Ok(observe_existing_config_with_hook(root_path, hook)?.config)
 }
 
 pub(super) fn persist(
     root_path: &Path,
-    config: &ConfigV1,
+    config: &OperatorConfigV2,
     expected: &[u8],
     observed: &ExistingConfig,
     state_binding: &crate::distribution::SetupStateRootBinding,
@@ -131,7 +147,7 @@ pub(super) fn persist(
 
 fn persist_with_hook(
     root_path: &Path,
-    config: &ConfigV1,
+    config: &OperatorConfigV2,
     expected: &[u8],
     observed: &ExistingConfig,
     state_binding: &crate::distribution::SetupStateRootBinding,
@@ -251,7 +267,7 @@ fn persist_with_hook(
 #[cfg(test)]
 pub(super) fn persist_with_test_hook(
     root_path: &Path,
-    config: &ConfigV1,
+    config: &OperatorConfigV2,
     expected: &[u8],
     hook: impl FnMut(SetupBarrier) -> Result<(), SetupError>,
 ) -> Result<bool, SetupError> {
@@ -264,7 +280,7 @@ pub(super) fn persist_with_test_hook(
 #[cfg(test)]
 pub(super) fn persist_observed_with_test_hook(
     root_path: &Path,
-    config: &ConfigV1,
+    config: &OperatorConfigV2,
     expected: &[u8],
     observed: &ExistingConfig,
     hook: impl FnMut(SetupBarrier) -> Result<(), SetupError>,
@@ -284,12 +300,12 @@ fn abort_at_test_barrier(_barrier: SetupBarrier) {}
 
 fn verify_committed_config(
     root: &Directory,
-    config: &ConfigV1,
+    config: &OperatorConfigV2,
     expected: &[u8],
     expected_identity: Option<Identity>,
 ) -> Result<(), SetupError> {
     let bytes = read_required(root, CONFIG_NAME, MAX_CONFIG_BYTES)?;
-    if bytes != expected || ConfigV1::parse(&bytes)? != *config {
+    if bytes != expected || OperatorConfigV2::parse(&bytes)? != *config {
         return Err(SetupError::Filesystem(
             "committed config.toml does not match the requested config".to_owned(),
         ));
@@ -420,7 +436,7 @@ fn observe_existing_config_from_root(root: &Directory) -> Result<ExistingConfig,
         Some((bytes, identity)) => (Some(bytes), Some(identity)),
         None => (None, None),
     };
-    let config = bytes.as_deref().map(ConfigV1::parse).transpose()?;
+    let config = bytes.as_deref().map(OperatorConfigV2::parse).transpose()?;
     Ok(ExistingConfig {
         root: None,
         config,

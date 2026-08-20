@@ -422,9 +422,11 @@ jobs:
           unexpected_setup_authority="$(
             grep -nE \
               'hf_hub|reqwest|hyper|tokio::net|std::net|std::process|Command::new|crate::(models|convert|quantize|serve)|calibration|bootstrap_installation_identity|update_auth|update_transport|remove_dir|remove_file' \
-              src/setup/mod.rs src/setup/schema.rs src/setup/host.rs src/setup/policy.rs || true
+              src/setup/mod.rs src/setup/schema.rs src/setup/host.rs src/setup/policy.rs \
+              | grep -vE '^src/setup/schema.rs:[0-9]+:[[:space:]]*crate::convert::QuantSelector::from_name\(&self\.quant\)$' || true
           )"
           test -z "$unexpected_setup_authority"
+          test "$(grep -Fhc 'QuantSelector::from_name' src/setup/schema.rs)" = 1
           unexpected_setup_file_authority="$(
             grep -nE \
               'std::fs::(write|copy|create_dir|remove_dir|remove_file|rename|hard_link|set_permissions)|File::create|OpenOptions|hf_hub|reqwest|hyper|tokio::net|std::net|std::process|Command::new|crate::(models|convert|quantize|serve)|calibration|bootstrap_installation_identity|update_auth|update_transport' \
@@ -444,9 +446,9 @@ jobs:
           test "$(grep -Fhc 'fs::flock(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
           test "$(grep -Fhc 'fs::fsync(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 2
           test "$(grep -Fhc 'fs::fcntl_fullfsync(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          setup_golden=src/setup/testdata/config_v1.toml
+          setup_golden=src/setup/testdata/config_v2.toml
           test "$(shasum -a 256 "$setup_golden" | awk '{print $1}')" = \
-            7f225b8cd184bf070c981116f8a1926d6830c081f6a6c2f52694ad6f6e40ff16
+            ff9f5d3ba200f2ccc107fc6142d9752c87a8429697a6a19f5c67702b82731c17
           recipe=data/model-recipes/qwen38-27b-official-v1.json
           test "$(shasum -a 256 "$recipe" | awk '{print $1}')" = \
             e3b60772d2abf33f14e215ba949bca22d16c0f1d8f985cd172b83b422e205126
@@ -586,13 +588,15 @@ jobs:
             src/setup/fs.rs \
             src/setup/fs/unix.rs \
             src/setup/tests.rs \
-            src/setup/testdata/config_v1.toml \
+            src/setup/defaults_contract_tests.rs \
+            src/setup/testdata/config_v2.toml \
             src/distribution/mod.rs \
             src/distribution/install_state/identity.rs \
             Cargo.toml \
             Cargo.lock \
             src/main.rs \
             src/cli.rs \
+            src/serve/mod.rs \
             src/core/integrity.rs \
             src/core/provenance/source_shard.rs \
             src/convert/cli_driver.rs \
@@ -628,10 +632,30 @@ jobs:
           cargo test --locked --bin hf2q --all-features distribution::update_transport:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features distribution::prepared_release:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features setup:: -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features tests::convert_config_quant_is_used_and_explicit_quant_wins -- --exact
+          cargo test --locked --bin hf2q --all-features tests::invalid_operator_config_fails_before_convert_source_or_serve_bind -- --exact
+          cargo test --locked --bin hf2q --all-features serve::tests::serve_config_defaults_are_used_and_cli_env_override_them -- --exact
+          cargo test --locked --bin hf2q --all-features serve::tests::configured_lan_requires_runtime_auth -- --exact
+          cargo test --locked --bin hf2q --all-features serve::tests::c4_scheduler_cli_wins_over_env -- --exact
+          cargo test --locked --bin hf2q --all-features serve::tests::c4_max_slots_cli_wins_over_env -- --exact
           hf_source_tests="$(cargo test --locked --bin hf2q --all-features -- --list)"
           for required_test in \
             cli::tests::getting_started_qwen38_commands_parse_exactly \
-            setup::tests::config_v1_golden_is_exact_and_hostile_input_is_rejected \
+            setup::defaults_contract_tests::operator_config_v2_is_canonical_strict_and_uses_the_guide_defaults \
+            setup::defaults_contract_tests::operator_config_v2_rejects_incoherent_fifo_slots_and_invalid_quant \
+            setup::defaults_contract_tests::absent_operator_config_preserves_existing_command_behavior_without_claiming_root_authority \
+            setup::defaults_contract_tests::selected_state_root_loads_the_exact_operator_config \
+            setup::tests::cli_parses_the_closed_noninteractive_surface \
+            setup::tests::fresh_and_repeated_noninteractive_setup_are_idempotent \
+            setup::tests::interactive_setup_uses_current_values_and_records_explicit_operator_choices \
+            setup::tests::cancelled_or_interrupted_interactive_setup_creates_nothing \
+            setup::tests::noninteractive_setup_requires_complete_choices_or_accept_defaults \
+            tests::convert_config_quant_is_used_and_explicit_quant_wins \
+            tests::invalid_operator_config_fails_before_convert_source_or_serve_bind \
+            serve::tests::serve_config_defaults_are_used_and_cli_env_override_them \
+            serve::tests::configured_lan_requires_runtime_auth \
+            serve::tests::c4_scheduler_cli_wins_over_env \
+            serve::tests::c4_max_slots_cli_wins_over_env \
             setup::tests::matching_existing_installation_identity_is_read_only_and_accepted \
             setup::tests::lock_contention_is_busy_and_mints_no_config \
             setup::tests::exact_read_rejects_leaf_replacement_after_reading_the_open_inode \

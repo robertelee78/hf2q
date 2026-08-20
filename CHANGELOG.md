@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Replace the provisional session-cache-only setup schema with canonical
+  operator defaults for conversion quantization and serving host, port,
+  scheduler, and active slots. `hf2q convert` and `hf2q serve` now consume
+  those defaults through the global `--state-root`, while explicit CLI and
+  existing serving environment overrides retain precedence. Provisional
+  schema-1 config is preserved and rejected with instructions to rerun setup.
+
 ## [0.1.7] — 2026-08-20
 
 ### Added
