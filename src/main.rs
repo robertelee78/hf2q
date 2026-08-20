@@ -28,6 +28,7 @@ pub mod models;
 pub mod progress;
 pub mod quantize;
 mod serve;
+mod setup;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -89,9 +90,13 @@ fn main() -> ExitCode {
     // Best-effort zero-config tab completion. Release builds reconcile
     // hf2q-owned Bash, Zsh, and Fish registrations in their per-user loader
     // locations; debug/test builds require explicit isolated destinations.
-    // This must precede clap parsing so even --help/--version and parse errors
-    // can complete first-run setup. Failures never block the requested command.
-    cli::completion_install::reconcile();
+    // This normally precedes clap parsing so --help/--version and parse errors
+    // can complete first-run registration. `setup` is the closed exception:
+    // even help or malformed setup input must not mutate shell integration.
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if !invocation_mentions_setup(&raw_args) {
+        cli::completion_install::reconcile();
+    }
 
     // Emit one-shot warning / ack-gate summary for any investigation-only
     // env vars that are set. Uses direct eprintln! (not tracing), so it
@@ -100,7 +105,7 @@ fn main() -> ExitCode {
     // --help or --version.
     debug::INVESTIGATION_ENV.activate();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(raw_args);
 
     // Logging subscriber init. Priority:
     //   1. --log-level (explicit) overrides everything.
@@ -155,9 +160,39 @@ fn main() -> ExitCode {
     }
 }
 
+fn invocation_mentions_setup(args: &[std::ffi::OsString]) -> bool {
+    let mut arguments = args.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        let Some(argument) = argument.to_str() else {
+            continue;
+        };
+        if argument == "--" {
+            return arguments
+                .next()
+                .is_some_and(|value| value == std::ffi::OsStr::new("setup"));
+        }
+        if matches!(argument, "--log-format" | "--log-level") {
+            let _ = arguments.next();
+            continue;
+        }
+        if argument.starts_with('-') {
+            continue;
+        }
+        return argument == "setup";
+    }
+    false
+}
+
 fn run(cli: Cli) -> Result<(), AppError> {
     let log_format = cli.log_format;
     match cli.command {
+        Command::Setup(args) => setup::run(args).map_err(|error| {
+            if error.is_input() {
+                AppError::Input(anyhow::Error::from(error))
+            } else {
+                AppError::Conversion(anyhow::Error::from(error))
+            }
+        }),
         Command::GgufPatch(args) => cmd_gguf_patch(args),
         Command::Info(args) => cmd_info(args).map_err(AppError::Input),
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),

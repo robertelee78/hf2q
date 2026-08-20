@@ -65,6 +65,9 @@ impl LogLevel {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Record host facts and an inert bounded future session-cache policy.
+    Setup(SetupArgs),
+
     /// Patch an existing GGUF file's metadata without changing tensor bytes
     GgufPatch(GgufPatchArgs),
 
@@ -118,6 +121,29 @@ pub enum Command {
     /// surface is a belt-and-suspenders option for operators who feed
     /// hf2q's bundled `tokenizer.json` files to other tools.
     Tokenizer(TokenizerArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct SetupArgs {
+    /// Record whether future inactive-session persistence may be enabled.
+    /// Omit only for an interactive terminal prompt.
+    #[arg(long, value_enum)]
+    pub session_cache: Option<SessionCacheChoice>,
+
+    /// Recorded future persistence byte limit. Accepts an integer with an optional
+    /// B, KiB, MiB, GiB, or TiB suffix. Required with non-interactive `on`.
+    #[arg(long, value_name = "SIZE")]
+    pub session_cache_limit: Option<String>,
+
+    /// Absolute hf2q state root. Defaults to `$HOME/.hf2q`.
+    #[arg(long, value_name = "ABSOLUTE_PATH")]
+    pub state_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SessionCacheChoice {
+    On,
+    Off,
 }
 
 #[derive(clap::Args, Debug)]

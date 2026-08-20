@@ -1,0 +1,14 @@
+kind = "hf2q.config"
+schema_version = 1
+state_layout_schema = 1
+package = "hf2q"
+
+[hardware]
+target = "aarch64-apple-darwin"
+chip_model = "Apple M5 Max"
+unified_memory_bytes = 137438953472
+metal_device_name = "Apple M5 Max"
+metal_recommended_working_set_bytes = 103079215104
+
+[session_cache]
+limit_bytes = 34359738368

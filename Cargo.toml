@@ -117,6 +117,10 @@ console = "0.15"
 serde = { version = "1", features = ["derive"] }
 # Chat templates consume client JSON object order as part of their wire format.
 serde_json = { version = "1", features = ["preserve_order"] }
+# ADR-045 setup owns a closed, bounded TOML configuration document. Pin the
+# parser/serializer so canonical producer bytes and hostile-input behavior do
+# not drift under an otherwise unrelated dependency update.
+toml = { version = "=1.1.4", default-features = false, features = ["parse", "display", "serde"] }
 # Release manifests use strict SemVer parsing at their untrusted wire boundary.
 # Keep this direct instead of relying on a transitive crate.
 semver = "1"
