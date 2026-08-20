@@ -5,6 +5,8 @@
 - Updated: 2026-08-20
 - Owners: hf2q release engineering and operator experience
 - Related: `docs/shipping-contract.md`,
+  `docs/ADR-005-inference-server.md`,
+  `docs/ADR-033-unified-quant-convert-pipeline.md`,
   `docs/ADR-017-persistent-block-prefix-cache.md`,
   `docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`
 
@@ -36,6 +38,34 @@ the ADR that actually owns it, simplified, or removed. In particular,
 session persistence belongs to ADR-017/ADR-027 if pursued. Model-family,
 conversion, quantization, inference, and cache correctness remain governed by
 their existing decisions and shipping gates.
+
+### Audited disposition of the earlier implementation
+
+The Slice A audit at exact main commit
+`8eecbf720ac991cbc49aba34454c1e4097c9593f` found approximately 35,500 lines
+under `src/distribution`, 7,700 under `src/setup`, and 13,000 more in dormant
+model-preparation, recipe, payload, and TUF-spike code and tests. Despite that
+surface, the public CLI has no `update` or `uninstall` command, the release
+workflow publishes source crates rather than a signed native installer
+artifact, and the dormant preparation and managed-session paths have no
+production caller.
+
+The implementation disposition is therefore:
+
+| Existing subsystem | Disposition | Governing reason |
+|---|---|---|
+| Public `convert`, `serve`, generic Hugging Face resolution/download, integrity receipts, and explicit imatrix support | **Keep and relabel** under the existing input/conversion/inference decisions, especially ADR-005 and ADR-033 | These are reachable product capabilities used by the guide; ADR-045 does not wrap or replace them. |
+| Existing block and Qwen persistence implementations | **Keep outside ADR-045** under ADR-017 and ADR-027 | Setup and onboarding do not create a second cache implementation. |
+| Stable Mac/Metal/memory/storage probes and reusable private atomic config-file mechanics | **Keep and simplify** for the corrected setup schema | These directly support system learning and safe config publication. |
+| Exact release revision/tag/checksum lineage and the existing Cargo source-package channel | **Keep** | They are useful release evidence and an advanced install channel, but are not proof of the standalone native channel. |
+| Session-cache-only setup policy, dormant runtime authorization, and the second generic managed-session store | **Remove** | They are unused, duplicate already-governed cache work, and are not part of this ADR's product requirement. |
+| No-options model recipes, prepared-model profiles/registry/publication, source-retention orchestration, and post-conversion calibration state | **Remove** | They have no production caller and replace guide steps with an unrequested orchestration system. Any useful exact model evidence moves to the relevant model/conversion ADR or guide proof. |
+| Custom TUF client/spike, transport sealed to it, first-activation graph, custom archive/Mach-O validation, and their structural CI sentinels | **Remove or replace with the smallest reachable implementation** | The current code cannot install, update, or uninstall hf2q. The first standalone channel needs a signed/notarized native artifact, a small manifest and channel receipt, atomic replacement with one known-good fallback, and observable behavior tests. |
+| Automatic shell-completion mutation on ordinary CLI startup | **Remove** | Completion installation belongs to an explicit setup choice or the owning package/installer, not an unrelated command invocation. Explicit completion generation remains useful. |
+
+Removing dormant code does not erase its history. Git and the project decision
+ledger retain the experiments and their evidence. Main should carry the
+smallest implementation that serves the accepted product contract.
 
 ## Context
 
@@ -359,8 +389,10 @@ the next slice begins.
 ### Slice B: freeze and prove the guide against today's product
 
 1. Write the canonical getting-started guide using current commands.
-2. Select one small supported text-model path for the fast hosted/doc gate and
-   one exact Apple-Silicon artifact for the protected end-to-end gate.
+2. Use bounded synthetic fixtures to prove command syntax and conversion
+   behavior in the fast hosted gate, without claiming that a synthetic model
+   proves chat serving. Use one exact supported Apple-Silicon model artifact
+   for the protected end-to-end conversion and serving gate.
 3. Prove conversion, quantization, serving, direct API use, and the optional
    OpenCode instructions without adding orchestration code.
 4. Feed any actual usability gaps into the setup schema rather than inventing
