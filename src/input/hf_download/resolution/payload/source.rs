@@ -9,13 +9,20 @@ use crate::core::integrity::{IntegrityError, ShardIntegrity};
 use crate::input::integrity::verify_conversion_manifest;
 use crate::input::model_recipe::{ModelPreparationError, VerifiedRecipeSource};
 
+mod conversion;
+
+pub use conversion::{
+    convert_authenticated_model_preparation, ConvertedModelPreparation,
+    ModelPreparationConversionError,
+};
+
 /// Exact recipe source bytes re-opened from the sealed payload cache and
 /// authenticated against both Hub identity and hf2q's checked-in recipe.
 ///
-/// This non-cloneable value remains inert. It grants no conversion invocation,
-/// source deletion, artifact publication, registration, calibration, or
-/// serving authority. Its source proof and paths remain private until a later
-/// consuming conversion coordinator lands.
+/// This non-cloneable value remains inert until it is consumed by the one
+/// recipe-owned conversion coordinator. It grants no source deletion,
+/// registration, calibration, or serving authority, and its source proof and
+/// paths remain private.
 pub struct AuthenticatedModelPreparationSource {
     resolved: super::super::ResolvedModelPreparationPlan,
     source: VerifiedRecipeSource,

@@ -16,8 +16,9 @@ use crate::progress::ProgressReporter;
 mod source;
 
 pub use source::{
-    authenticate_transferred_model_preparation, AuthenticatedModelPreparationSource,
-    ModelPreparationSourceAuthenticationError,
+    authenticate_transferred_model_preparation, convert_authenticated_model_preparation,
+    AuthenticatedModelPreparationSource, ConvertedModelPreparation,
+    ModelPreparationConversionError, ModelPreparationSourceAuthenticationError,
 };
 
 /// Recipe-owned payload bytes fetched and individually authenticated at the

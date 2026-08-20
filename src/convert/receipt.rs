@@ -22,6 +22,8 @@ pub enum ReceiptError {
     Json(#[from] serde_json::Error),
     #[error("verified source manifest has no canonical LFS bundle SHA-256")]
     SourceBundleUnavailable,
+    #[error("conversion receipt destination must differ from the artifact output")]
+    InvalidDestination,
     #[error(
         "remote conversion requires an exact 40-hex converter commit; use the crates.io package or rebuild hf2q with GIT_COMMIT_SHA set"
     )]
@@ -194,7 +196,11 @@ pub fn receipt_path(output: &Path) -> PathBuf {
 }
 
 pub fn clear_stale_receipt(output: &Path) -> Result<(), ReceiptError> {
-    match fs::remove_file(receipt_path(output)) {
+    clear_stale_receipt_at(&receipt_path(output))
+}
+
+pub(crate) fn clear_stale_receipt_at(path: &Path) -> Result<(), ReceiptError> {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -219,6 +225,31 @@ pub fn prepare_success_receipt(
     excluded_dspark_count: usize,
     peak_chunk_bound: PeakChunkBoundReceipt,
 ) -> Result<PreparedSuccessReceipt, ReceiptError> {
+    prepare_success_receipt_at(
+        artifact,
+        output,
+        &receipt_path(output),
+        remote,
+        converter_git_commit,
+        quant_selector,
+        excluded_dspark_count,
+        peak_chunk_bound,
+    )
+}
+
+pub(crate) fn prepare_success_receipt_at(
+    artifact: &Path,
+    output: &Path,
+    destination: &Path,
+    remote: &RemoteConversionSource,
+    converter_git_commit: &str,
+    quant_selector: &str,
+    excluded_dspark_count: usize,
+    peak_chunk_bound: PeakChunkBoundReceipt,
+) -> Result<PreparedSuccessReceipt, ReceiptError> {
+    if destination == output || destination == artifact {
+        return Err(ReceiptError::InvalidDestination);
+    }
     if converter_git_commit.len() != 40
         || !converter_git_commit
             .chars()
@@ -261,7 +292,7 @@ pub fn prepare_success_receipt(
         peak_chunk_bound,
     };
 
-    let path = receipt_path(output);
+    let path = destination.to_path_buf();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
@@ -441,6 +472,27 @@ mod tests {
         .err()
         .expect("malformed converter commit must fail closed");
         assert!(matches!(error, ReceiptError::ConverterCommitUnavailable));
+    }
+
+    #[test]
+    fn explicit_receipt_destination_cannot_replace_the_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("model.gguf");
+        fs::write(&output, b"GGUFfixture").unwrap();
+        let error = prepare_success_receipt_at(
+            &output,
+            &output,
+            &output,
+            &remote(),
+            &"d".repeat(40),
+            "q4_k_m",
+            0,
+            PeakChunkBoundReceipt::default(),
+        )
+        .err()
+        .expect("artifact path must not be accepted as a receipt destination");
+        assert!(matches!(error, ReceiptError::InvalidDestination));
+        assert_eq!(fs::read(output).unwrap(), b"GGUFfixture");
     }
 
     #[test]

@@ -16,7 +16,7 @@ const PREPARATION_KIND: &str = "hf2q.model-preparation-receipt";
 const PREPARATION_PACKAGE: &str = "hf2q";
 pub const MODEL_PREPARATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_MODEL_PREPARATION_RECEIPT_BYTES: usize = 64 * 1024;
-const MAX_CONVERSION_RECEIPT_BYTES: usize = 64 * 1024;
+pub(in crate::input) const MAX_CONVERSION_RECEIPT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ModelPreparationError {
@@ -346,6 +346,76 @@ impl ModelRecipe {
             receipt,
             receipt_sha256: hex::encode(Sha256::digest(receipt_bytes)),
         })
+    }
+
+    #[cfg(test)]
+    pub(in crate::input) fn verified_conversion_at_for_test(
+        &self,
+        role: RecipeArtifactRole,
+        artifact_path: &std::path::Path,
+        converter_git_commit: &str,
+    ) -> VerifiedRecipeConversion {
+        use crate::convert::receipt::{
+            ConverterReceipt, ExcludedDsparkReceipt, OutputReceipt, SourceFileReceipt,
+            SourceReceipt,
+        };
+
+        let expected = self.artifact(role).expect("recipe artifact role");
+        let (strategy, scope) = match role {
+            RecipeArtifactRole::Text => ("row_aligned_tensor_chunks", "all_streamed_tensors"),
+            RecipeArtifactRole::VisionProjector => (
+                "lazy_source_index_projector_only",
+                "multimodal_projector_tensors",
+            ),
+        };
+        let receipt = ConversionReceipt {
+            schema_version: CONVERSION_RECEIPT_SCHEMA_VERSION,
+            source: SourceReceipt {
+                original_reference: self.source().repository_id().to_owned(),
+                repository_id: self.source().repository_id().to_owned(),
+                repository_type: "model".to_owned(),
+                canonical_url: format!("https://huggingface.co/{}", self.source().repository_id()),
+                revision: self.source().revision().to_owned(),
+                filename: None,
+                bundle_sha256: self.source().bundle_sha256().to_owned(),
+                files: self
+                    .source()
+                    .files()
+                    .iter()
+                    .map(|file| SourceFileReceipt {
+                        path: file.path().to_owned(),
+                        size: file.size(),
+                        sha256: file.sha256().to_owned(),
+                        hf_lfs_sha256: file.hf_lfs_sha256().map(str::to_owned),
+                    })
+                    .collect(),
+            },
+            converter: ConverterReceipt {
+                package: "hf2q".to_owned(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                git_commit: converter_git_commit.to_owned(),
+            },
+            quant_selector: expected.quantization().as_str().to_owned(),
+            output: OutputReceipt {
+                path: artifact_path.display().to_string(),
+                size: expected.size(),
+                sha256: expected.sha256().to_owned(),
+            },
+            excluded_dspark: ExcludedDsparkReceipt {
+                tensor_count: 0,
+                status: "none_detected".to_owned(),
+            },
+            peak_chunk_bound: crate::convert::receipt::PeakChunkBoundReceipt {
+                strategy: strategy.to_owned(),
+                scope: scope.to_owned(),
+                ..Default::default()
+            },
+        };
+        let mut receipt_bytes = serde_json::to_vec_pretty(&receipt).expect("test receipt JSON");
+        receipt_bytes.push(b'\n');
+        let artifact = self.verified_artifact_for_test(role, artifact_path.to_path_buf());
+        self.verify_conversion_receipt(role, artifact, &receipt_bytes)
+            .expect("test conversion proof")
     }
 
     pub fn bind_prepared_pair(

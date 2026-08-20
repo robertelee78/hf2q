@@ -25,6 +25,8 @@ mod validation;
 mod verification;
 
 pub(in crate::input) use plan::canonical_future_directory;
+#[cfg(test)]
+pub(in crate::input) use plan::require_exact_regular_file_for_test;
 pub use plan::{
     plan_current_model_preparation, ModelPreparationPlan, MAX_MODEL_PREPARATION_PATH_BYTES,
 };
@@ -95,12 +97,19 @@ pub struct ModelRecipe {
     schema_version: u32,
     recipe_id: String,
     status: RecipeStatus,
+    conversion: RecipeConversion,
     acceptance: RecipeAcceptance,
     source: RecipeSource,
     artifacts: Vec<RecipeArtifact>,
     hardware_profiles: Vec<RecipeHardwareProfile>,
     disk: RecipeDisk,
     source_retention: RecipeSourceRetention,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RecipeConversion {
+    producer_version: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -231,6 +240,10 @@ impl ModelRecipe {
 
     pub fn source(&self) -> &RecipeSource {
         &self.source
+    }
+
+    pub(in crate::input) fn producer_version(&self) -> &str {
+        &self.conversion.producer_version
     }
 
     pub fn artifacts(&self) -> &[RecipeArtifact] {

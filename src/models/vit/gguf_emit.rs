@@ -78,6 +78,22 @@ pub fn write_mmproj_gguf_with_provenance(
     tensors: &HashMap<String, VitTensor>,
     source_sha256: Option<&str>,
 ) -> Result<(), VitConvertError> {
+    write_mmproj_gguf_with_provenance_and_producer_version(
+        output,
+        vision_config,
+        tensors,
+        source_sha256,
+        None,
+    )
+}
+
+pub(crate) fn write_mmproj_gguf_with_provenance_and_producer_version(
+    output: &Path,
+    vision_config: &VisionConfig,
+    tensors: &HashMap<String, VitTensor>,
+    source_sha256: Option<&str>,
+    producer_version: Option<&str>,
+) -> Result<(), VitConvertError> {
     let file = File::create(output)
         .map_err(|e| VitConvertError::GgufEmit(format!("create {:?}: {}", output, e)))?;
     let mut w = BufWriter::new(file);
@@ -92,7 +108,11 @@ pub fn write_mmproj_gguf_with_provenance(
     if let Some(source_sha256) = source_sha256 {
         metadata.push((
             KEY_PRODUCER_VERSION.to_owned(),
-            MetaValue::String(format!("hf2q {}", env!("CARGO_PKG_VERSION"))),
+            MetaValue::String(
+                producer_version
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("hf2q {}", env!("CARGO_PKG_VERSION"))),
+            ),
         ));
         metadata.push((
             KEY_SOURCE_SHA256.to_owned(),
@@ -702,6 +722,34 @@ mod tests {
             crate::core::provenance::detect(&gguf),
             crate::core::provenance::Provenance::Hf2q {
                 producer_version: format!("hf2q {}", env!("CARGO_PKG_VERSION")),
+                source_sha256: source.to_string(),
+                mmproj_sha256: None,
+            }
+        );
+    }
+
+    #[test]
+    fn projector_can_reproduce_a_recipe_frozen_producer_banner() {
+        let root: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/qwen38/config.json"))
+                .expect("official Qwen3.8 config fixture");
+        let cfg = VisionConfig::from_hf_config(&root).expect("vision config");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("projector-recipe-provenance.gguf");
+        let source = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        write_mmproj_gguf_with_provenance_and_producer_version(
+            &path,
+            &cfg,
+            &tiny_tensors(),
+            Some(source),
+            Some("hf2q 0.1.6"),
+        )
+        .expect("write projector");
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open projector");
+        assert_eq!(
+            crate::core::provenance::detect(&gguf),
+            crate::core::provenance::Provenance::Hf2q {
+                producer_version: "hf2q 0.1.6".into(),
                 source_sha256: source.to_string(),
                 mmproj_sha256: None,
             }

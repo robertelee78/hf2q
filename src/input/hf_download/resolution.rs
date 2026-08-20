@@ -18,8 +18,9 @@ use crate::input::model_recipe::{
 mod payload;
 
 pub use payload::{
-    authenticate_transferred_model_preparation, transfer_authorized_model_preparation,
-    AuthenticatedModelPreparationSource, ModelPreparationPayloadError,
+    authenticate_transferred_model_preparation, convert_authenticated_model_preparation,
+    transfer_authorized_model_preparation, AuthenticatedModelPreparationSource,
+    ConvertedModelPreparation, ModelPreparationConversionError, ModelPreparationPayloadError,
     ModelPreparationSourceAuthenticationError, TransferredModelPreparationPayload,
 };
 

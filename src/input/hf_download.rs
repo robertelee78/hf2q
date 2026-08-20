@@ -46,7 +46,10 @@
 //! match the checked-in size, Git/LFS identity, and canonical order. The
 //! payload transition consumes that authorization, confines hf-hub's resumable
 //! cache to the planned `source/` tree, verifies every fetched file, and still
-//! returns no conversion or deletion authority.
+//! returns no conversion or deletion authority. A final private preparation
+//! transition reauthenticates that cache around hf2q-owned text/projector
+//! conversion, exact-adopts only complete role outputs, and returns an inert
+//! pair without opening retention, registration, calibration, or serving.
 //!
 //! Manual test protocol: `Ctrl+C` mid-download → observe partial shard
 //! in `~/.cache/huggingface/hub/models--*/snapshots/*/` → re-invoke
@@ -70,8 +73,9 @@ mod resolution;
 
 pub use resolution::{
     authenticate_transferred_model_preparation, authorize_model_preparation_transfer,
-    transfer_authorized_model_preparation, AuthenticatedModelPreparationSource,
-    AuthorizedModelPreparationTransfer, ModelPreparationPayloadError,
+    convert_authenticated_model_preparation, transfer_authorized_model_preparation,
+    AuthenticatedModelPreparationSource, AuthorizedModelPreparationTransfer,
+    ConvertedModelPreparation, ModelPreparationConversionError, ModelPreparationPayloadError,
     ModelPreparationResolutionError, ModelPreparationSourceAuthenticationError,
     ResolvedModelPreparationPlan, ResolvedModelRepository, TransferredModelPreparationPayload,
 };
