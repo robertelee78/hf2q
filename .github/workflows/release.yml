@@ -114,6 +114,25 @@ jobs:
             actual=$(shasum -a 256 "$gate_dir/$path" | awk '{print $1}')
             test "$actual" = "$expected"
           }
+          dependency_provenance_dir="$gate_dir/dependency-provenance"
+          dependency_receipt="$dependency_provenance_dir/receipt.json"
+          check_receipt dependency-provenance/receipt.json \
+            '.receipt_sha256.provenance.dependency'
+          bash scripts/verify_release_dependency_provenance.sh verify \
+            "$dependency_provenance_dir" Cargo.lock
+          jq -e --slurpfile dependency "$dependency_receipt" '
+            .dependency_provenance == $dependency[0]
+            and .dependency_provenance.package.crate_sha256 == .crate_sha256
+            and .dependency_provenance.dependency.name == "mlx-native"
+            and .dependency_provenance.dependency.version == "0.10.16"
+            and .dependency_provenance.dependency.requirement == "=0.10.16"
+            and .dependency_provenance.dependency.source
+              == "registry+https://github.com/rust-lang/crates.io-index"
+            and .dependency_provenance.dependency.checksum
+              == "9236b563fc45c861ec772cb0b29aafc1144bc49b92b229790c7e1b57844fc83b"
+          ' "$manifest" >/dev/null
+          echo "DEPENDENCY_PROVENANCE_DIR=$dependency_provenance_dir" \
+            >> "$GITHUB_ENV"
           check_receipt deepseek/lifecycle/summary.json '.receipt_sha256.deepseek.lifecycle'
           check_receipt deepseek/interactive/summary.json '.receipt_sha256.deepseek.interactive'
           check_receipt deepseek/cached-suffix/summary.json '.receipt_sha256.deepseek.cached_suffix'
@@ -262,6 +281,21 @@ jobs:
              and .power_guarded_ac == true
              and (.power_event_snapshots_sha256 | test("^[0-9a-f]{64}$"))
              and (.binary_sha256 | test("^[0-9a-f]{64}$"))
+             and .dependency_provenance.schema_version == 1
+             and .dependency_provenance.status == "pass"
+             and .dependency_provenance.package.source == "packed-crate"
+             and .dependency_provenance.package.crate_sha256 == $root.crate_sha256
+             and .dependency_provenance.build.workspace_ancestry_disjoint == true
+             and .dependency_provenance.build.cargo_target_checkout_disjoint == true
+             and .dependency_provenance.build.cargo_home_was_fresh_before_resolution == true
+             and .dependency_provenance.build.rust_build_override_env_cleared == true
+             and .dependency_provenance.dependency.name == "mlx-native"
+             and .dependency_provenance.dependency.version == "0.10.16"
+             and .dependency_provenance.dependency.requirement == "=0.10.16"
+             and .dependency_provenance.dependency.source
+               == "registry+https://github.com/rust-lang/crates.io-index"
+             and .dependency_provenance.dependency.checksum
+               == "9236b563fc45c861ec772cb0b29aafc1144bc49b92b229790c7e1b57844fc83b"
              and .models.deepseek.sha256 == $deepseek_sha
              and .models.gemma.sha256 == $gemma_sha
              and .models.qwen.sha256 == $qwen_sha
@@ -274,7 +308,7 @@ jobs:
                and $d.cooperative_prefill.status == "pass"
                and $d.cooperative_prefill.source_sha == $source_sha
                and $d.cooperative_prefill.model_sha256 == $deepseek_sha
-               and $d.cooperative_prefill.mlx_native_version == "0.10.12"
+               and $d.cooperative_prefill.mlx_native_version == "0.10.16"
                and $d.cooperative_prefill.prefix_rows == 148
                and $d.cooperative_prefill.benchmark.speedup > 1
                and $d.cooperative_prefill.thermal_status == "fair_or_better"
@@ -666,11 +700,22 @@ jobs:
             echo "MLX_NATIVE_SKIP_METALLIB is forbidden for release builds" >&2
             exit 1
           fi
-          cargo package --locked
+          cargo package --locked --no-verify
           crate="target/package/hf2q-${EXPECTED_VERSION}.crate"
           test -s "$crate"
           actual_crate_sha=$(shasum -a 256 "$crate" | awk '{print $1}')
           test "$actual_crate_sha" = "$EXPECTED_CRATE_SHA256"
+          release_package_stage=$(mktemp -d \
+            "$RUNNER_TEMP/hf2q-release-package.XXXXXX")
+          /usr/bin/tar -xzf "$crate" -C "$release_package_stage"
+          package_root=$(cd \
+            "$release_package_stage/hf2q-${EXPECTED_VERSION}" && pwd -P)
+          packed_lock="$package_root/Cargo.lock"
+          bash scripts/verify_release_dependency_provenance.sh \
+            check-package-root "$package_root"
+          bash scripts/verify_release_dependency_provenance.sh verify \
+            "$DEPENDENCY_PROVENANCE_DIR" "$packed_lock"
+          echo "RELEASE_PACKAGE_ROOT=$package_root" >> "$GITHUB_ENV"
           printf '%s  %s\n' "$actual_crate_sha" "$crate" \
             | tee "$RUNNER_TEMP/release-crate.sha256"
 
@@ -678,7 +723,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          package_root="target/package/hf2q-${EXPECTED_VERSION}"
+          package_root=${RELEASE_PACKAGE_ROOT:?RELEASE_PACKAGE_ROOT is required}
           (
             cd "$package_root"
             cargo check --locked --all-targets --all-features
@@ -1315,6 +1360,8 @@ jobs:
               scripts/test_macos_thermal_guard_contract.sh \
               scripts/test_gemma4_wave_thermal_contract.sh \
               scripts/test_gemma4_eight_slot_receipt_contract.sh \
+              scripts/verify_release_dependency_provenance.sh \
+              scripts/test_release_dependency_provenance_contract.sh \
               scripts/seal_release_binary.sh \
               scripts/test_release_binary_seal_contract.sh \
               scripts/run_release_gate_process_group.sh \
@@ -1337,6 +1384,7 @@ jobs:
             bash scripts/test_gemma4_wave_thermal_contract.sh
             bash scripts/test_gemma4_eight_slot_receipt_contract.sh
             bash scripts/test_qwen38_long_decode_receipt_contract.sh
+            bash scripts/test_release_dependency_provenance_contract.sh
             bash scripts/test_release_binary_seal_contract.sh
             bash scripts/test_release_gate_process_group_contract.sh
             bash scripts/test_release_tag_recovery_contract.sh

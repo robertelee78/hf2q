@@ -15,6 +15,7 @@ trap cleanup EXIT
 if MLX_NATIVE_SKIP_METALLIB=1 \
   EXPECTED_SHA="$SOURCE_SHA" \
   CRATE_SHA256="$MODEL_SHA" \
+  DEPENDENCY_PROVENANCE_DIR="$tmp_dir/dummy-dependency-provenance" \
   HF2Q_BIN=/bin/true \
   EXPECTED_BINARY_SHA256="$MODEL_SHA" \
   DEEPSEEK_MODEL=/dev/null GEMMA_MODEL=/dev/null \
@@ -112,7 +113,7 @@ write_summary() {
       "$over_limit_measurement_samples" \
     --argjson telemetry_gaps "$telemetry_gaps" '
     . + {schema_version:2,source_sha:$source_sha,model_sha256:$model_sha256,
-      mlx_native_version:"0.10.12",raw_sha256:$raw_sha256,
+      mlx_native_version:"0.10.16",raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
       required_start_state:"nominal",maximum_measurement_state:"fair",
       measurement_log_sha256:$measurement_log_sha256,

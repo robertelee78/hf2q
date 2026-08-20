@@ -86,16 +86,60 @@ jobs:
           fi
           actual_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$actual_version" = "$EXPECTED_VERSION"
-          cargo package --locked
+          checkout_root=$(pwd -P)
+          cargo package --locked --no-verify
           crate="$GITHUB_WORKSPACE/target/package/hf2q-${EXPECTED_VERSION}.crate"
-          package_root="$GITHUB_WORKSPACE/target/package/hf2q-${EXPECTED_VERSION}"
           test -s "$crate"
           crate_sha=$(shasum -a 256 "$crate" | awk '{print $1}')
+
+          packed_build_root=$(mktemp -d "/private/var/tmp/hf2q-packed-build.XXXXXX")
+          printf 'PACKED_BUILD_ROOT=%s\n' "$packed_build_root" >> "$GITHUB_ENV"
+          cargo_home=$(mktemp -d "$RUNNER_TEMP/hf2q-packed-cargo-home.XXXXXX")
+          cargo_target=$(mktemp -d "$RUNNER_TEMP/hf2q-packed-target.XXXXXX")
+          provenance_stage=$(mktemp -d "$RUNNER_TEMP/hf2q-dependency-provenance.XXXXXX")
+          metadata_stage=$(mktemp -d "$RUNNER_TEMP/hf2q-metadata-stage.XXXXXX")
+          test -z "$(find "$cargo_home" -mindepth 1 -print -quit)"
+          /usr/bin/tar -xzf "$crate" -C "$packed_build_root"
+          package_root=$(cd "$packed_build_root/hf2q-${EXPECTED_VERSION}" && pwd -P)
+          trusted_verifier="$checkout_root/scripts/verify_release_dependency_provenance.sh"
+          cargo_env=(env)
+          while IFS='=' read -r variable_name _; do
+            case "$variable_name" in
+              RUSTUP_TOOLCHAIN|RUSTC|RUSTDOC|RUSTFLAGS|RUSTDOCFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_ENCODED_RUSTDOCFLAGS|RUSTC_*|RUSTDOC_*|CARGO_BUILD_*|CARGO_PROFILE_*|CARGO_TARGET_*)
+                cargo_env+=(-u "$variable_name")
+                ;;
+            esac
+          done < <(env)
+          cargo_env+=(CARGO_HOME="$cargo_home" CARGO_TARGET_DIR="$cargo_target")
+          bash "$trusted_verifier" \
+            check-build-root "$package_root" "$checkout_root" \
+            "$cargo_home" "$cargo_target"
+          "${cargo_env[@]}" bash "$trusted_verifier" \
+            check-build-env "$cargo_home" "$cargo_target"
+          case "$package_root/" in
+            "$checkout_root/"*)
+              echo "packed build root must be outside checkout ancestry" >&2
+              exit 1
+              ;;
+          esac
+
           (
             cd "$package_root"
-            cargo build --release --locked
+            "${cargo_env[@]}" cargo metadata --locked --format-version 1 \
+              > "$metadata_stage/cargo-metadata.json"
+            bash "$trusted_verifier" capture \
+              "$package_root" "$metadata_stage/cargo-metadata.json" \
+              "$provenance_stage" "$checkout_root" "$cargo_home" \
+              "$cargo_target" true true "$crate_sha"
+            "${cargo_env[@]}" bash "$trusted_verifier" \
+              check-build-env "$cargo_home" "$cargo_target"
+            bash "$trusted_verifier" check-build-root \
+              "$package_root" "$checkout_root" "$cargo_home" "$cargo_target"
+            "${cargo_env[@]}" cargo build --release --locked
+            bash "$trusted_verifier" check-build-root \
+              "$package_root" "$checkout_root" "$cargo_home" "$cargo_target"
           )
-          built_binary="$package_root/target/release/hf2q"
+          built_binary="$cargo_target/release/hf2q"
           test -x "$built_binary"
           built_sha=$(shasum -a 256 "$built_binary" | awk '{print $1}')
           sealed_binary="$RUNNER_TEMP/cache-lifecycle-sealed-$EXPECTED_SHA/hf2q"
@@ -107,6 +151,7 @@ jobs:
             printf 'HF2Q_BIN=%s\n' "$sealed_binary"
             printf 'EXPECTED_BINARY_SHA256=%s\n' "$built_sha"
             printf 'CRATE_SHA256=%s\n' "$crate_sha"
+            printf 'DEPENDENCY_PROVENANCE_DIR=%s\n' "$provenance_stage"
           } >> "$GITHUB_ENV"
 
       - name: Run guarded cross-family cache lifecycle gate
@@ -119,6 +164,7 @@ jobs:
           exec scripts/run_release_gate_process_group.sh env \
             EXPECTED_SHA="$EXPECTED_SHA" \
             CRATE_SHA256="$CRATE_SHA256" \
+            DEPENDENCY_PROVENANCE_DIR="$DEPENDENCY_PROVENANCE_DIR" \
             HF2Q_BIN="$HF2Q_BIN" \
             EXPECTED_BINARY_SHA256="$EXPECTED_BINARY_SHA256" \
             DEEPSEEK_MODEL="$DEEPSEEK_MODEL" \
@@ -141,3 +187,23 @@ jobs:
           path: ${{ runner.temp }}/cache-lifecycle
           if-no-files-found: error
           retention-days: 30
+
+      - name: Clean external packed build root
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed_build_root=${PACKED_BUILD_ROOT:-}
+          [[ -n "$packed_build_root" ]] || exit 0
+          case "$packed_build_root" in
+            /private/var/tmp/hf2q-packed-build.*)
+              suffix=${packed_build_root#/private/var/tmp/hf2q-packed-build.}
+              [[ -n "$suffix" && "$suffix" != */* ]] || exit 1
+              ;;
+            *)
+              echo "refusing unsafe packed-build cleanup: $packed_build_root" >&2
+              exit 1
+              ;;
+          esac
+          [[ -d "$packed_build_root" && ! -L "$packed_build_root" ]] || exit 0
+          rm -rf -- "$packed_build_root"

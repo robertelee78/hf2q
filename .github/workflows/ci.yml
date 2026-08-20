@@ -778,6 +778,8 @@ jobs:
             scripts/test_gemma4_eight_slot_receipt_contract.sh \
             scripts/seal_release_binary.sh \
             scripts/test_release_binary_seal_contract.sh \
+            scripts/verify_release_dependency_provenance.sh \
+            scripts/test_release_dependency_provenance_contract.sh \
             scripts/run_release_gate_process_group.sh \
             scripts/test_release_gate_process_group_contract.sh \
             scripts/ensure_github_release_tag.sh \
@@ -800,6 +802,7 @@ jobs:
           bash scripts/test_gemma4_eight_slot_receipt_contract.sh
           bash scripts/test_qwen38_long_decode_receipt_contract.sh
           bash scripts/test_release_binary_seal_contract.sh
+          bash scripts/test_release_dependency_provenance_contract.sh
           bash scripts/test_release_gate_process_group_contract.sh
           bash scripts/test_release_tag_recovery_contract.sh
           bash scripts/test_gemma4_long_short_overlap_contract.sh

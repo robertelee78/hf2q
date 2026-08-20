@@ -9,6 +9,7 @@ set -euo pipefail
 
 EXPECTED_SHA=${EXPECTED_SHA:?EXPECTED_SHA is required}
 CRATE_SHA256=${CRATE_SHA256:?CRATE_SHA256 is required}
+DEPENDENCY_PROVENANCE_DIR=${DEPENDENCY_PROVENANCE_DIR:?DEPENDENCY_PROVENANCE_DIR is required}
 HF2Q_BIN=${HF2Q_BIN:?HF2Q_BIN is required}
 EXPECTED_BINARY_SHA256=${EXPECTED_BINARY_SHA256:?EXPECTED_BINARY_SHA256 is required}
 DEEPSEEK_MODEL=${DEEPSEEK_MODEL:?DEEPSEEK_MODEL is required}
@@ -76,6 +77,22 @@ for digest in "$DEEPSEEK_MODEL_SHA256" "$GEMMA_MODEL_SHA256" \
 done
 
 mkdir -p "$OUT_ROOT"
+dependency_provenance_evidence="$OUT_ROOT/dependency-provenance"
+mkdir -p "$dependency_provenance_evidence"
+for evidence_name in Cargo.lock cargo-metadata.json receipt.json; do
+  [[ -s "$DEPENDENCY_PROVENANCE_DIR/$evidence_name" \
+    && ! -L "$DEPENDENCY_PROVENANCE_DIR/$evidence_name" ]] || {
+    echo "dependency provenance input is missing or linked: $evidence_name" >&2
+    exit 2
+  }
+  cp "$DEPENDENCY_PROVENANCE_DIR/$evidence_name" \
+    "$dependency_provenance_evidence/$evidence_name"
+done
+bash "$script_dir/verify_release_dependency_provenance.sh" verify \
+  "$dependency_provenance_evidence" "$script_dir/../Cargo.lock"
+dependency_provenance_receipt="$dependency_provenance_evidence/receipt.json"
+dependency_provenance_receipt_sha=$(shasum -a 256 \
+  "$dependency_provenance_receipt" | awk '{print $1}')
 parent_pid=$$
 server_pid=""
 power_pid=""
@@ -561,7 +578,7 @@ jq -e '
 ' "$cooperative_raw" >/dev/null
 jq --arg source_sha "$EXPECTED_SHA" \
   --arg model_sha256 "$DEEPSEEK_MODEL_SHA256" \
-  --arg mlx_native_version "0.10.12" \
+  --arg mlx_native_version "0.10.16" \
   --arg raw_sha256 "$(sha256_file "$cooperative_raw")" \
   --arg test_log_sha256 "$(sha256_file "$cooperative_log")" \
   --arg measurement_log_sha256 "$(sha256_file "$cooperative_thermal_log")" \
@@ -1523,6 +1540,7 @@ jq -n \
   --arg source_sha "$EXPECTED_SHA" \
   --arg crate_sha256 "$CRATE_SHA256" \
   --arg binary_sha256 "$binary_sha" \
+  --arg dependency_provenance_receipt_sha "$dependency_provenance_receipt_sha" \
   --arg power_event_snapshots_sha256 "$power_snapshot_manifest_sha" \
   --arg deepseek_path "$DEEPSEEK_MODEL" \
   --arg gemma_path "$GEMMA_MODEL" \
@@ -1587,6 +1605,7 @@ jq -n \
   --slurpfile qwen_cumulative "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json" \
   --slurpfile qwen_cancellation "$OUT_ROOT/qwen/cancellation/cancellation-summary.json" \
   --slurpfile qwen38_long_decode "$OUT_ROOT/qwen38/long-decode/receipt.json" \
+  --slurpfile dependency_provenance "$dependency_provenance_receipt" \
   'if ($qwen_cancellation | length) != 1 then
     error("Qwen cancellation receipt must contain exactly one JSON document")
   else {
@@ -1594,6 +1613,7 @@ jq -n \
     source_sha: $source_sha,
     crate_sha256: $crate_sha256,
     binary_sha256: $binary_sha256,
+    dependency_provenance: $dependency_provenance[0],
     power_guarded_ac: $power_guarded_ac,
     power_event_snapshots_sha256: $power_event_snapshots_sha256,
     models: {
@@ -1614,7 +1634,8 @@ jq -n \
       deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,cooperative_prefill:$deepseek_cooperative_sha,decode_cohort:$deepseek_decode_cohort_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha,wave1_thermal:$deepseek_wave1_thermal_sha,wave2_thermal:$deepseek_wave2_thermal_sha,prompt_provenance:$deepseek_prompt_provenance_sha},
       gemma:{lifecycle:$gemma_lifecycle_sha,overlap:$gemma_overlap_sha,wave1:$gemma_wave1_sha,wave2:$gemma_wave2_sha,wave1_thermal:$gemma_wave1_thermal_sha,wave2_thermal:$gemma_wave2_thermal_sha,eight_slots:$gemma_wave8_sha,eight_slots_thermal:$gemma_wave8_thermal_sha,transactions4:$gemma_transactions4_sha,transactions8:$gemma_transactions8_sha,parity:$gemma_parity_sha,heap:$gemma_heap_sha},
       qwen:{lifecycle:$qwen_lifecycle_sha,cumulative:$qwen_cumulative_sha,cancellation:$qwen_cancellation_sha},
-      qwen38:{long_decode:$qwen38_long_decode_sha}
+      qwen38:{long_decode:$qwen38_long_decode_sha},
+      provenance:{dependency:$dependency_provenance_receipt_sha}
     },
     families: {
       deepseek: {status:"pass",prompt_provenance:$deepseek_prompt_provenance[0],cooperative_prefill:$deepseek_cooperative[0],decode_cohort:$deepseek_decode_cohort[0],lifecycle:$deepseek_lifecycle[0],interactive_overlap:$deepseek_interactive[0],cached_suffix:$deepseek_cached[0],full_context_waves:[$deepseek_wave1[0],$deepseek_wave2[0]]},
@@ -1628,5 +1649,17 @@ shasum -a 256 "$OUT_ROOT/manifest.json" >"$OUT_ROOT/manifest.json.sha256"
 jq -e '
   (.power_event_snapshots_sha256 | test("^[0-9a-f]{64}$"))
   and all(.receipt_sha256[][]; test("^[0-9a-f]{64}$"))
+  and .dependency_provenance.schema_version == 1
+  and .dependency_provenance.status == "pass"
+  and .dependency_provenance.package.source == "packed-crate"
+  and .dependency_provenance.package.crate_sha256 == .crate_sha256
+  and .dependency_provenance.build.cargo_target_checkout_disjoint == true
+  and .dependency_provenance.build.rust_build_override_env_cleared == true
+  and .dependency_provenance.dependency.name == "mlx-native"
+  and .dependency_provenance.dependency.version == "0.10.16"
+  and .dependency_provenance.dependency.source
+    == "registry+https://github.com/rust-lang/crates.io-index"
+  and .dependency_provenance.dependency.checksum
+    == "9236b563fc45c861ec772cb0b29aafc1144bc49b92b229790c7e1b57844fc83b"
 ' "$OUT_ROOT/manifest.json" >/dev/null
 jq . "$OUT_ROOT/manifest.json"
