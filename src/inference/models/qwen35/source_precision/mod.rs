@@ -1,9 +1,10 @@
 //! Authenticated source-precision Qwen teacher substrate.
 //!
 //! This module deliberately stops at a retained, structurally verified source
-//! snapshot and opaque, host-populated shared-Metal upload. It does not
-//! construct a model, execute a graph, or mint completion, exact-teacher,
-//! sensitivity, performance, or allocator authority.
+//! snapshot, opaque host-populated shared-Metal upload, and an exact
+//! family-owned prepared text graph. It does not execute that graph or mint
+//! completion, exact-teacher, sensitivity, performance, or allocator
+//! authority.
 
 mod header;
 mod retained_io;
@@ -21,6 +22,11 @@ pub(crate) use snapshot::{open_verified_qwen_source_snapshot, VerifiedQwenSource
 #[allow(unused_imports)] // opaque B2a seam consumed by the subsequent Metal-upload slice
 pub(crate) use topology::{admit_qwen35_bf16_topology, VerifiedQwen35Bf16TopologyV1};
 pub(crate) use types::QwenSourceSnapshotLimits;
+#[allow(unused_imports)] // opaque B3a seam consumed by the subsequent completed runner
+pub(crate) use upload::{
+    prepare_qwen35_source_teacher, prepare_uploaded_qwen35_source_teacher,
+    PreparedQwen35SourceTeacherV1, Qwen35SourceTeacherLimitsV1,
+};
 #[allow(unused_imports)] // opaque B2b seam consumed by the subsequent teacher runner
 pub(crate) use upload::{upload_qwen35_bf16_topology_to_metal, VerifiedQwen35Bf16MetalUploadV1};
 #[allow(unused_imports)] // configured by the subsequent teacher runner

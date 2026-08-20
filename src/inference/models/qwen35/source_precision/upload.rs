@@ -15,6 +15,13 @@ use super::upload_plan::{
 };
 use super::upload_transform::{upload_source, UploadedTensorBuffer};
 
+mod teacher_model;
+
+pub(crate) use teacher_model::{
+    prepare_qwen35_source_teacher, prepare_uploaded_qwen35_source_teacher,
+    PreparedQwen35SourceTeacherV1, Qwen35SourceTeacherLimitsV1,
+};
+
 const UPLOAD_SCHEMA_VERSION: u32 = 1;
 const UPLOAD_PROFILE: &str = "dense_qwen35_source_bf16_host_verified_metal_upload_v1";
 
@@ -94,6 +101,7 @@ pub(crate) struct VerifiedQwen35Bf16MetalUploadV1 {
     _snapshot: VerifiedQwenSourceSnapshot,
     _device: MlxDevice,
     _buffers: BTreeMap<String, MlxBuffer>,
+    _buffer_addresses: BTreeMap<String, usize>,
     receipt: QwenSourceMetalUploadReceiptV1,
 }
 
@@ -175,9 +183,17 @@ impl VerifiedQwen35Bf16MetalUploadV1 {
         }
         ensure!(
             output_count == self.receipt.preflight.output_tensor_count
-                && self._buffers.len() == output_count,
+                && self._buffers.len() == output_count
+                && self._buffer_addresses.len() == output_count,
             "source Metal upload output cardinality does not reproduce"
         );
+        for (node_id, buffer) in &self._buffers {
+            ensure!(
+                self._buffer_addresses.get(node_id).copied()
+                    == Some(buffer.contents_ptr() as usize),
+                "source Metal upload output {node_id} changed allocation identity"
+            );
+        }
         Ok(())
     }
 
@@ -245,6 +261,7 @@ where
 
     let mut scratch = Vec::new();
     let mut buffers = BTreeMap::new();
+    let mut buffer_addresses = BTreeMap::new();
     let mut allocation_addresses = std::collections::BTreeSet::new();
     let mut checked_allocate = |bytes, dtype, shape| {
         let buffer = allocate(bytes, dtype, shape)?;
@@ -288,6 +305,12 @@ where
                     buffer_byte_sha256,
                     buffer,
                 } = actual;
+                ensure!(
+                    buffer_addresses
+                        .insert(node_id.clone(), buffer.contents_ptr() as usize)
+                        .is_none(),
+                    "uploaded output node {node_id} has duplicated allocation identity"
+                );
                 ensure!(
                     buffers.insert(node_id.clone(), buffer).is_none(),
                     "uploaded output node {node_id} is duplicated"
@@ -359,6 +382,7 @@ where
         _snapshot: snapshot,
         _device: device.clone(),
         _buffers: buffers,
+        _buffer_addresses: buffer_addresses,
         receipt,
     })
 }

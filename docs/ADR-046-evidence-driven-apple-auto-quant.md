@@ -965,6 +965,62 @@ the largest single buffer is 2,542,796,800 bytes. A full official-artifact load
 time/RSS/Metal benchmark and the later execution-liveness reserve remain B3
 gates. This slice introduces no DWQ, overlay, learned affine, or training path.
 
+#### 2026-08-20 — B3a inert source-teacher graph preparation
+
+B3a consumes either the B2a topology directly through the preferred combined
+B2b+B3a transition or an already-created B2b upload through a narrower
+promotion seam. The combined transition derives the authenticated dense-Qwen
+config, checked future weight bytes, and a caller-bounded runtime envelope
+before the first Metal weight allocation. An already-uploaded B2b catalog can
+only be checked for the incremental runtime envelope because its weight
+allocation has already happened. Both paths return an opaque, non-cloneable
+`PreparedQwen35SourceTeacherV1` with no buffer, model, session, or forward
+accessor.
+
+Preparation destructively drains every B2b output exactly once into a closed
+family-owned graph: BF16 token embedding and untied output head, F32 output
+norm, exact LinearAttention or FullAttention plus dense-FFN slots for every
+base layer, and the small authenticated F32 Delta controls needed by the later
+runner. It rehashes each actual CPU-writable Metal buffer while checking its
+node, source, transform, dtype, shape, byte length, zero offset, backing,
+device, and B2b content hash. Missing, extra, duplicated, swapped, mutated, or
+leftover nodes reject the whole consuming transition. No `Qwen35Model`, global
+GPU cache, CPU-to-GPU constructor, Q4 repack, TQ path, or MTP execution is used.
+The 15 config-declared MTP sources remain authenticated and non-executed; vision
+remains authenticated and excluded.
+
+The stable prepared-graph catalog hash binds the B1 snapshot, device-free B2a
+topology, exact projected execution config (including floating-point bit
+patterns), ordered role-to-node/content bindings, tensor counts and bytes, and
+the fixed source-BF16/F32, no-Q4, no-DWQ, no-TQ, base-text scope. It excludes
+volatile device and capacity observations. A separate preparation-receipt hash
+binds that graph catalog to the B2b upload catalog and receipt, device identity,
+and requested runtime envelope. This distinction permits identical source,
+config, and graph content to have a stable identity across different devices
+or capacity observations without losing the process-local preparation
+evidence.
+
+The v1 runtime envelope is deliberately narrow: at most 4,096 sequence tokens,
+16,384 target rows, a 16 GiB target-artifact payload declaration, and 256 MiB
+of Delta CPU control mirrors. It accounts for base full-attention cache
+payload, base DeltaNet ping-pong state, the maximum input activation, one F32
+vocabulary row, the control mirrors, and a caller-selected allowance for
+unmeasured builder, arena, allocator, and residency costs. These are checked
+logical lower bounds, not a reservation, measured peak, exact liveness proof,
+or claim that the current 4,105-token validation workload is admitted by this
+version. The target-artifact payload is not counted as resident memory, and
+B3a does not prove how a later runner writes it.
+
+B3a is an inert assembly authority. It proves no graph encoding, dispatch,
+submission, completion, numerical result, streaming behavior, teacher target,
+latency, energy, runtime fit, sensitivity, policy quality, Dynamic admission,
+selector behavior, or `--quant auto`. B3b must first join and preflight the
+opaque calibration prediction plan and target limits before the approximately
+53.8 GB upload, then add a fixed source-specific base-text graph, fresh
+base-only cache/state, exact-prefix teacher forcing, one-row output-head
+materialization, and terminal Metal completion before any teacher authority is
+minted. This slice introduces no DWQ, overlay, learned affine, or training path.
+
 Completing D3a requires a family-owned, bounded source-precision dense-Qwen
 runner that consumes authenticated source tensors without the production
 Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps

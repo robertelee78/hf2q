@@ -169,6 +169,27 @@ impl VerifiedQwen35Bf16TopologyV1 {
         self.future_f32_tensors
     }
 
+    pub(super) fn projected_config_for_teacher(&self) -> Result<super::super::Qwen35Config> {
+        qwen35_config_from_authenticated_source(self._snapshot.config())
+    }
+
+    pub(super) fn planned_output_bytes(&self) -> Result<u64> {
+        self.records
+            .iter()
+            .flat_map(|record| &record.outputs)
+            .try_fold(0_u64, |total, output| {
+                let elements = output.shape.iter().try_fold(1_u64, |product, dimension| {
+                    product.checked_mul(u64::try_from(*dimension).ok()?)
+                })?;
+                let element_bytes = match output.dtype {
+                    Qwen35FutureDType::Bf16 => 2,
+                    Qwen35FutureDType::F32 => 4,
+                };
+                total.checked_add(elements.checked_mul(element_bytes)?)
+            })
+            .context("dense-Qwen planned output bytes overflow")
+    }
+
     pub(super) fn into_upload_parts(
         self,
     ) -> (
