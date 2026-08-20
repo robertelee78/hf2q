@@ -297,6 +297,49 @@ impl VerifiedCalibrationPredictionPlan {
         self.manifest.prediction_points.len()
     }
 
+    /// Visit each retained Calibration example exactly once in canonical
+    /// manifest order. Completed transcripts expose all of their scored points
+    /// as one contiguous slice; generation prompts expose their single
+    /// next-token point plus the matching greedy prompt. This is the bounded
+    /// family-runner seam: a source teacher can prefill the first exact prefix
+    /// once, then teacher-force only the suffix through the same per-example
+    /// cache instead of rebuilding every scored prefix from scratch. A single
+    /// full-transcript pass is not implied because its execution topology can
+    /// differ from the exact-prefix contract.
+    pub(crate) fn visit_examples<E>(
+        &self,
+        mut visit: impl FnMut(
+            &TeacherPredictionExampleReceipt,
+            &[u32],
+            &[TeacherPredictionPointReceipt],
+            Option<&TeacherGreedyPromptReceipt>,
+        ) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for (receipt, example) in self.manifest.examples.iter().zip(&self.examples) {
+            let points = match (
+                example.point_ordinals.first().copied(),
+                example.point_ordinals.last().copied(),
+            ) {
+                (Some(first), Some(last)) => &self.manifest.prediction_points[first..=last],
+                (None, None) => &[],
+                _ => unreachable!("a prediction example cannot have a half-empty point range"),
+            };
+            debug_assert!(
+                example
+                    .point_ordinals
+                    .iter()
+                    .copied()
+                    .eq(points.iter().map(|point| point.point_ordinal)),
+                "verified prediction points must remain contiguous"
+            );
+            let greedy = example
+                .greedy_prompt_ordinal
+                .map(|ordinal| &self.manifest.greedy_prompts[ordinal]);
+            visit(receipt, &example.token_ids, points, greedy)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn visit_prediction_points<E>(
         &self,
         mut visit: impl FnMut(&TeacherPredictionPointReceipt, &[u32]) -> Result<(), E>,

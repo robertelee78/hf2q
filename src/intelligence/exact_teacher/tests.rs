@@ -168,6 +168,63 @@ fn retained_artifact_rejects_payload_mutation_and_wrong_greedy_horizon() {
     assert!(target_artifact::verify_for_test(&mut artifact).is_err());
 }
 
+#[test]
+fn streaming_writer_matches_callback_writer_and_rejects_incomplete_or_reordered_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let plan = prediction_plan_for_test();
+    let streaming_path = temp.path().join("streaming.bin");
+    let preflight =
+        target_artifact::preflight_structural_teacher_target(&plan, 4, limits()).unwrap();
+    assert!(
+        !streaming_path.exists(),
+        "preflight must not publish or allocate the target file"
+    );
+    let mut stream = preflight.begin(&streaming_path).unwrap();
+    for point in &plan.manifest().prediction_points {
+        stream.write_row(point, &[-0.0, 0.0, -1.0, -2.0]).unwrap();
+    }
+    let trajectory = (0..EXACT_TEACHER_GREEDY_TOKEN_COUNT as u32)
+        .map(|token| token % 4)
+        .collect::<Vec<_>>();
+    for prompt in &plan.manifest().greedy_prompts {
+        stream.write_trajectory(prompt, &trajectory).unwrap();
+    }
+    let streaming = stream.finish().unwrap();
+
+    let callback_path = temp.path().join("callback.bin");
+    let callback = write_structural_teacher_target_artifact(
+        &plan,
+        &callback_path,
+        4,
+        limits(),
+        |_request| Ok(vec![-0.0, 0.0, -1.0, -2.0]),
+        |_request| Ok(trajectory.clone()),
+    )
+    .unwrap();
+    assert_eq!(streaming.receipt(), callback.receipt());
+    assert_eq!(
+        std::fs::read(&streaming_path).unwrap(),
+        std::fs::read(&callback_path).unwrap()
+    );
+
+    let mut reordered = target_artifact::preflight_structural_teacher_target(&plan, 4, limits())
+        .unwrap()
+        .begin(&temp.path().join("reordered.bin"))
+        .unwrap();
+    assert!(reordered
+        .write_row(&plan.manifest().prediction_points[1], &[0.0, 1.0, 2.0, 3.0],)
+        .is_err());
+
+    let incomplete = target_artifact::preflight_structural_teacher_target(&plan, 4, limits())
+        .unwrap()
+        .begin(&temp.path().join("incomplete.bin"))
+        .unwrap();
+    assert!(matches!(
+        incomplete.finish(),
+        Err(ExactTeacherTargetError::Invalid(_))
+    ));
+}
+
 fn tiny_f32_oracle() -> Qwen35Model {
     let config = Qwen35Config {
         variant: Qwen35Variant::Dense,

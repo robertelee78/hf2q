@@ -369,6 +369,31 @@ fn prediction_plan_uses_only_calibration_tokens_and_binds_next_token_alignment()
     .unwrap();
     assert!(seen_generation && seen_teacher_forced);
 
+    let mut grouped_ids = Vec::new();
+    plan.visit_examples::<std::convert::Infallible>(
+        |example_receipt, token_ids, points, greedy_prompt| {
+            grouped_ids.push(example_receipt.stable_id.clone());
+            assert_eq!(example_receipt.token_count, token_ids.len());
+            assert!(!points.is_empty());
+            assert!(points
+                .iter()
+                .all(|point| point.stable_id == example_receipt.stable_id));
+            assert!(points
+                .windows(2)
+                .all(|pair| pair[1].point_ordinal == pair[0].point_ordinal + 1));
+            match example_receipt.render_mode {
+                RenderMode::CompletedAssistantTranscript => assert!(greedy_prompt.is_none()),
+                RenderMode::GenerationPrompt => {
+                    assert_eq!(points.len(), 1);
+                    assert_eq!(greedy_prompt.unwrap().stable_id, example_receipt.stable_id);
+                }
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(grouped_ids, vec!["cal", "gen"]);
+
     let mut wrong_partition = partition.clone();
     wrong_partition.manifest_sha256 = "0".repeat(64);
     assert!(matches!(

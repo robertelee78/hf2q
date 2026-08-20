@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use serde::Serialize;
@@ -10,7 +10,13 @@ use crate::intelligence::calibration::VerifiedCalibrationPredictionPlan;
 
 use super::types::*;
 
+mod stream;
 mod verify;
+
+pub(crate) use stream::{
+    preflight_structural_teacher_target, StructuralTeacherTargetPreflight,
+    StructuralTeacherTargetStream,
+};
 
 #[cfg(test)]
 pub(super) use verify::verify_for_test;
@@ -224,210 +230,22 @@ where
     LF: FnMut(TeacherTargetLogitRequest<'_>) -> Result<Vec<f32>, ExactTeacherTargetError>,
     GF: FnMut(TeacherGreedyRequest<'_>) -> Result<Vec<u32>, ExactTeacherTargetError>,
 {
-    if vocabulary_size == 0
-        || vocabulary_size > limits.max_vocabulary_size
-        || plan.prediction_point_count() == 0
-        || plan.prediction_point_count() > limits.max_prediction_rows
-        || limits.top_k == 0
-        || limits.top_k > vocabulary_size
-        || limits.max_vocabulary_size > MAX_TARGET_VOCABULARY_SIZE
-        || limits.max_prediction_rows > MAX_TARGET_PREDICTION_ROWS
-        || limits.max_target_bytes > MAX_TARGET_ARTIFACT_BYTES
-        || limits.top_k > MAX_TARGET_TOP_K
-        || plan
-            .prediction_point_count()
-            .checked_mul(limits.top_k)
-            .is_none_or(|entries| entries > MAX_TARGET_SUMMARY_ENTRIES)
-    {
-        return Err(ExactTeacherTargetError::Invalid(
-            "teacher target dimensions exceed their declared bounds".into(),
-        ));
-    }
-    let preflight_bytes = checked_target_bytes(plan.prediction_point_count(), vocabulary_size)?;
-    if preflight_bytes > limits.max_target_bytes {
-        return Err(ExactTeacherTargetError::Invalid(
-            "teacher target artifact exceeds its preflight byte bound".into(),
-        ));
-    }
+    let preflight: StructuralTeacherTargetPreflight<'_> =
+        preflight_structural_teacher_target(plan, vocabulary_size, limits)?;
+    let mut stream: StructuralTeacherTargetStream<'_> = preflight.begin(output)?;
     plan.visit_prediction_points(|point, prefix_token_ids| {
-        if prefix_token_ids
-            .iter()
-            .any(|token_id| usize::try_from(*token_id).unwrap_or(usize::MAX) >= vocabulary_size)
-            || matches!(
-                point.kind,
-                crate::intelligence::calibration::TeacherPredictionPointKind::TeacherForced {
-                    target_token_id,
-                    ..
-                } if usize::try_from(target_token_id).unwrap_or(usize::MAX) >= vocabulary_size
-            )
-        {
-            return Err(ExactTeacherTargetError::Invalid(
-                "teacher prediction point contains a token outside the declared vocabulary".into(),
-            ));
-        }
-        Ok(())
-    })?;
-    plan.visit_greedy_prompts(|_prompt, prompt_token_ids| {
-        if prompt_token_ids
-            .iter()
-            .any(|token_id| usize::try_from(*token_id).unwrap_or(usize::MAX) >= vocabulary_size)
-        {
-            return Err(ExactTeacherTargetError::Invalid(
-                "teacher greedy prompt contains a token outside the declared vocabulary".into(),
-            ));
-        }
-        Ok(())
-    })?;
-    let parent = output.parent().ok_or_else(|| {
-        ExactTeacherTargetError::Invalid("teacher target path has no parent".into())
-    })?;
-    std::fs::create_dir_all(parent).map_err(|error| ExactTeacherTargetError::io(parent, error))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| ExactTeacherTargetError::io(parent, error))?;
-    let mut writer = BufWriter::new(temporary.as_file());
-    writer
-        .write_all(TARGET_MAGIC)
-        .map_err(|error| ExactTeacherTargetError::io(output, error))?;
-    let mut offset = u64::try_from(TARGET_MAGIC.len()).unwrap();
-    let mut rows = Vec::with_capacity(plan.prediction_point_count());
-    plan.visit_prediction_points(|point, prefix_token_ids| {
-        if matches!(
-            point.kind,
-            crate::intelligence::calibration::TeacherPredictionPointKind::TeacherForced {
-                target_token_id,
-                ..
-            } if usize::try_from(target_token_id).unwrap_or(usize::MAX) >= vocabulary_size
-        ) {
-            return Err(ExactTeacherTargetError::Invalid(
-                "teacher-forced target token is outside the declared vocabulary".into(),
-            ));
-        }
         let logits = logits_for(TeacherTargetLogitRequest {
             point,
             prefix_token_ids,
         })?;
-        if logits.len() != vocabulary_size {
-            return Err(ExactTeacherTargetError::Invalid(format!(
-                "teacher row {} has vocabulary {}, expected {}",
-                point.point_ordinal,
-                logits.len(),
-                vocabulary_size
-            )));
-        }
-        let payload = row_bytes(&logits)?;
-        let (argmax_token_id, top_k, logsumexp_f64_bits) = row_summary(&logits, limits.top_k)?;
-        let payload_offset = offset
-            .checked_add(ROW_FRAME_BYTES)
-            .ok_or_else(|| ExactTeacherTargetError::Invalid("row offset overflow".into()))?;
-        let prefix_digest = digest_to_array(&point.prefix_token_ids_sha256)?;
-        let point_ordinal = u64::try_from(point.point_ordinal).map_err(|_| {
-            ExactTeacherTargetError::Invalid("prediction point ordinal overflow".into())
-        })?;
-        let vocabulary_size_u64 = u64::try_from(vocabulary_size).map_err(|_| {
-            ExactTeacherTargetError::Invalid("target vocabulary size overflow".into())
-        })?;
-        let payload_size = u64::try_from(payload.len()).map_err(|_| {
-            ExactTeacherTargetError::Invalid("target row byte length overflow".into())
-        })?;
-        writer
-            .write_all(ROW_MAGIC)
-            .and_then(|_| writer.write_all(&point_ordinal.to_le_bytes()))
-            .and_then(|_| writer.write_all(&vocabulary_size_u64.to_le_bytes()))
-            .and_then(|_| writer.write_all(&prefix_digest))
-            .and_then(|_| writer.write_all(&payload_size.to_le_bytes()))
-            .and_then(|_| writer.write_all(&payload))
-            .map_err(|error| ExactTeacherTargetError::io(output, error))?;
-        let payload_bytes = payload_size;
-        offset = payload_offset
-            .checked_add(payload_bytes)
-            .ok_or_else(|| ExactTeacherTargetError::Invalid("row end overflow".into()))?;
-        rows.push(TeacherTargetRowReceipt {
-            point_ordinal: point.point_ordinal,
-            stable_id: point.stable_id.clone(),
-            point_kind: point.kind,
-            prefix_token_count: point.prefix_token_count,
-            prefix_token_ids_sha256: point.prefix_token_ids_sha256.clone(),
-            vocabulary_size,
-            payload_offset,
-            payload_bytes,
-            payload_sha256: hash_bytes(&payload),
-            argmax_token_id,
-            top_k,
-            logsumexp_f64_bits,
-        });
-        Ok(())
+        stream.write_row(point, &logits)
     })?;
-    writer
-        .flush()
-        .map_err(|error| ExactTeacherTargetError::io(output, error))?;
-    drop(writer);
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| ExactTeacherTargetError::io(output, error))?;
-    if offset != preflight_bytes {
-        return Err(ExactTeacherTargetError::Invalid(
-            "written teacher target size differs from preflight".into(),
-        ));
-    }
-
-    let mut trajectories = Vec::with_capacity(plan.manifest().greedy_prompts.len());
     plan.visit_greedy_prompts(|prompt, prompt_token_ids| {
         let token_ids = greedy_for(TeacherGreedyRequest {
             prompt,
             prompt_token_ids,
         })?;
-        if token_ids.len() != EXACT_TEACHER_GREEDY_TOKEN_COUNT {
-            return Err(ExactTeacherTargetError::Invalid(
-                "teacher greedy trajectory must contain exactly 32 tokens".into(),
-            ));
-        }
-        if token_ids
-            .iter()
-            .any(|token_id| usize::try_from(*token_id).unwrap_or(usize::MAX) >= vocabulary_size)
-        {
-            return Err(ExactTeacherTargetError::Invalid(
-                "teacher greedy trajectory contains a token outside the declared vocabulary".into(),
-            ));
-        }
-        let token_ids_sha256 = trajectory_sha256(&token_ids)?;
-        trajectories.push(TeacherGreedyTrajectoryReceipt {
-            stable_id: prompt.stable_id.clone(),
-            prompt_token_ids_sha256: prompt.prefix_token_ids_sha256.clone(),
-            token_ids,
-            token_ids_sha256,
-        });
-        Ok(())
+        stream.write_trajectory(prompt, &token_ids)
     })?;
-
-    let artifact_sha256 = hash_open_file_bounded(temporary.as_file_mut(), preflight_bytes)?;
-    let artifact_bytes = preflight_bytes;
-    let mut receipt = ExactTeacherTargetReceipt {
-        schema_version: EXACT_TEACHER_TARGET_SCHEMA_VERSION,
-        semantics: TARGET_SEMANTICS.into(),
-        prediction_plan_sha256: plan.manifest().manifest_sha256.clone(),
-        limits,
-        vocabulary_size,
-        prediction_point_count: plan.prediction_point_count(),
-        generation_prompt_count: plan.manifest().greedy_prompts.len(),
-        target_artifact: ArtifactEvidence {
-            artifact_id: "exact_teacher_logits".into(),
-            role: "structural_full_vocabulary_f32_target_rows".into(),
-            byte_len: artifact_bytes,
-            sha256: artifact_sha256,
-        },
-        rows,
-        greedy_trajectories: trajectories,
-        receipt_sha256: String::new(),
-    };
-    receipt.receipt_sha256 = receipt_sha256(&receipt)?;
-    verify::verify_structural_teacher_target_artifact(temporary.as_file_mut(), &receipt)?;
-    let file = temporary
-        .persist_noclobber(output)
-        .map_err(|error| ExactTeacherTargetError::io(output, error.error))?;
-    Ok(StructurallyVerifiedTeacherTargetArtifact {
-        receipt,
-        file,
-        path: output.to_owned(),
-    })
+    stream.finish()
 }

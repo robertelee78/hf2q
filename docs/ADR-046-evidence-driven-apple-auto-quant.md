@@ -826,6 +826,27 @@ authoritative source teacher exists yet:
   27B BF16 source to whole-model F32 would consume about 110 GB before
   activations and output rows and is not a safe fallback on the 128 GiB target.
 
+The structural target seam now admits a canonical row-at-a-time producer. A
+separate preflight validates vocabulary closure, row and summary cardinality,
+checked artifact bytes, and every retained plan token before a future family
+runner allocates model weights or Metal buffers. The preflight creates no
+output. Its consumed stream accepts only the next canonical prediction point
+or greedy prompt, writes and hashes one full-vocabulary row at a time, and
+requires exact plan closure before it can return the same structural artifact
+type. The compatibility callback writer delegates to this stream, and the two
+paths are byte-for-byte and receipt-identical in the focused gate.
+
+The prediction plan also exposes each Calibration example once with its
+contiguous scored points. That seam does not authorize a full-transcript
+shortcut: an authoritative source teacher must prefill the first exact prefix
+for an example, then advance the same fresh per-example cache with the
+ground-truth suffix and emit a row at each scored point. Running the complete
+transcript as one wider causal pass, or batching output-head rows, can select a
+different Metal route and remains inadmissible until separately parity-proven
+and bound. These additions are allocation and streaming prerequisites only;
+they still establish no execution, completion, sensitivity, policy, or
+allocator authority.
+
 Completing D3a requires a family-owned, bounded source-precision dense-Qwen
 runner that consumes authenticated source tensors without the production
 Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps
