@@ -1071,6 +1071,30 @@ uses the same two transitions and still returns structural-only authority. This
 is process-local publication continuity, not a persisted sidecar/replay, graph,
 completion, numerical, sensitivity, Dynamic, selector, or DWQ authority.
 
+The third B3b prerequisite closes the base-text cache allocation boundary.
+One checked, device-independent layout plan is now shared by B3a runtime
+preflight and the actual cache constructor, so the two byte formulas cannot
+drift. B3a derives that plan from its authenticated config; the cache
+constructor does not clone or change the config it is given, including its
+declared MTP fields, but allocates exactly one F32 base-text sequence: the
+scheduled full-attention K/V slots plus the DeltaNet conv and recurrent
+ping-pong state. It allocates no MTP slot, TQ buffers, speculative capture, or
+auxiliary sequence. A fallible per-slot reset establishes zero Delta state and
+canonical ping-pong parity before an opaque owner can be returned. Sealing then
+checks the exact layer-to-slot schedule, every buffer's shape, dtype, logical
+extent, backing, CPU writability, and Metal device,
+plus zero cursors, absent MTP/TQ/capture state, checked payload totals, and
+canonical layout/receipt hashes. The official dense 64-layer, 4,096-token
+profile is pinned at 16 full-attention slots, 48 linear-attention slots,
+536,870,912 full-attention bytes, 313,786,368 linear-state bytes, and
+850,657,280 total bytes. The opaque prepared cache exposes no cache or buffer;
+a later consuming runner transition must join it to the opaque prepared
+teacher and remains required. The cache object alone proves a fresh,
+config-relative, process-local host-visible Metal layout only—not source
+authority, residency, graph
+dispatch, completion, logits, peak memory, performance, persisted replay,
+sensitivity, Dynamic, selector, or DWQ authority.
+
 Completing D3a requires a family-owned, bounded source-precision dense-Qwen
 runner that consumes authenticated source tensors without the production
 Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps
