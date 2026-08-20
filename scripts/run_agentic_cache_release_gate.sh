@@ -692,6 +692,9 @@ run_deepseek_wave() {
   local cold_receipts_json
   local cooperative_prefill_transactions
   local decode_cohort_transactions
+  local required_tool_budget_resolutions
+  local required_tool_forced_closes
+  local staggered_alignment_catchups
   local measurement_samples
   local measurement_duration_seconds
   local non_nominal_measurement_samples
@@ -889,6 +892,37 @@ run_deepseek_wave() {
     echo "DeepSeek wave $wave observed no exact warm B=4 decode transaction" >&2
     return 1
   }
+  required_tool_budget_resolutions=$(rg -c \
+    'DeepSeek-V4 required-tool thinking budget policy resolved effective_default_thinking_budget=8' \
+    "$current_log" || true)
+  [[ "$required_tool_budget_resolutions" =~ ^[0-9]+$ ]]
+  ((required_tool_budget_resolutions == 16)) || {
+    echo "DeepSeek wave $wave did not exercise the canonical 8-token required-tool budget exactly 16 times" >&2
+    return 1
+  }
+  required_tool_forced_closes=$(rg -c \
+    'DeepSeek-V4 required-tool thinking budget reached; forcing reasoning close .*budget=8 ' \
+    "$current_log" || true)
+  [[ "$required_tool_forced_closes" =~ ^[0-9]+$ ]]
+  ((required_tool_forced_closes == 16)) || {
+    echo "DeepSeek wave $wave did not force all 16 bounded required-tool reasoning phases" >&2
+    return 1
+  }
+  staggered_alignment_catchups=$(rg -c \
+    'DeepSeek-V4 staggered warm prefill alignment catch-up' "$current_log" || true)
+  [[ "$staggered_alignment_catchups" =~ ^[0-9]+$ ]]
+  ((staggered_alignment_catchups > 0)) || {
+    echo "DeepSeek wave $wave observed no staggered warm-prefill alignment catch-up" >&2
+    return 1
+  }
+  awk '
+    /DeepSeek-V4 staggered warm prefill alignment catch-up/ { catchup = 1; next }
+    catchup && /DeepSeek-V4 cooperative prefill complete lanes=4 / { resumed = 1; exit }
+    END { exit(resumed ? 0 : 1) }
+  ' "$current_log" || {
+    echo "DeepSeek wave $wave did not resume a four-lane cooperative prefill after catch-up" >&2
+    return 1
+  }
   cold_prefill_rates_json=$(
     for request_id in 1 2 3 4; do
       rate=$(rg "DeepSeek-V4 prefill complete request_id=${request_id}( |$)" "$current_log" \
@@ -908,10 +942,13 @@ run_deepseek_wave() {
     --arg server_log_sha256 "$(cat "$current_dir/server.log.sha256")" \
     --argjson cooperative_prefill_transactions "$cooperative_prefill_transactions" \
     --argjson decode_cohort_transactions "$decode_cohort_transactions" \
+    --argjson required_tool_budget_resolutions "$required_tool_budget_resolutions" \
+    --argjson required_tool_forced_closes "$required_tool_forced_closes" \
+    --argjson staggered_alignment_catchups "$staggered_alignment_catchups" \
     --argjson cold_prefill_tokens_per_second "$cold_prefill_rates_json" \
     --slurpfile thermal "$thermal_summary" \
     --slurpfile receipt "$out/summary.json" \
-    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,cooperative_prefill_transactions:$cooperative_prefill_transactions,decode_cohort_transactions:$decode_cohort_transactions,cold_prefill_tokens_per_second:$cold_prefill_tokens_per_second,thermal:$thermal[0],receipt:$receipt[0]}' \
+    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,cooperative_prefill_transactions:$cooperative_prefill_transactions,decode_cohort_transactions:$decode_cohort_transactions,required_tool_budget_resolutions:$required_tool_budget_resolutions,required_tool_forced_closes:$required_tool_forced_closes,staggered_alignment_catchups:$staggered_alignment_catchups,cold_prefill_tokens_per_second:$cold_prefill_tokens_per_second,thermal:$thermal[0],receipt:$receipt[0]}' \
     >"$out/envelope.json.tmp"
   mv "$out/envelope.json.tmp" "$out/envelope.json"
   scripts/verify_macos_thermal_receipt.sh "$wave" "$out/envelope.json" \

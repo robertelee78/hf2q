@@ -8392,6 +8392,59 @@ fn deepseek4_should_redrain_admission(
     admission_open && has_free_slot && receiver_has_pending
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Deepseek4PrefillAlignmentCatchup {
+    handle: SlotHandle,
+    cursor: usize,
+    target_cursor: usize,
+    window_cap: usize,
+}
+
+/// Select one lagging warm matrix lane and advance it only as far as the
+/// current leading cursor. A request that arrives just after a cooperative
+/// transaction can then join the widest cohort on the next scheduler step,
+/// without an admission timer or sleep.
+fn deepseek4_prefill_alignment_catchup(
+    lanes: impl IntoIterator<Item = (SlotHandle, Option<(usize, usize, usize)>)>,
+    sliding_window: usize,
+) -> Option<Deepseek4PrefillAlignmentCatchup> {
+    if sliding_window == 0 {
+        return None;
+    }
+    let lanes = lanes
+        .into_iter()
+        .map(|(handle, state)| state.map(|state| (handle, state)))
+        .collect::<Option<Vec<_>>>()?;
+    if lanes.len() < 2 {
+        return None;
+    }
+    let (_, (_, recovery_position, _)) = lanes.first()?;
+    let recovery_position = *recovery_position;
+    if lanes
+        .iter()
+        .any(|(_, (_, recovery, _))| *recovery != recovery_position)
+    {
+        return None;
+    }
+    let target_cursor = lanes.iter().map(|(_, (cursor, _, _))| *cursor).max()?;
+    let (handle, (cursor, _, window_multiplier)) = lanes
+        .iter()
+        .filter(|(_, (cursor, _, _))| *cursor < target_cursor)
+        .min_by_key(|(_, (cursor, _, _))| *cursor)
+        .copied()?;
+    let delta = target_cursor.checked_sub(cursor)?;
+    if delta == 0 || delta % sliding_window != 0 {
+        return None;
+    }
+    let window_cap = (delta / sliding_window).min(window_multiplier);
+    (window_cap > 0).then_some(Deepseek4PrefillAlignmentCatchup {
+        handle,
+        cursor,
+        target_cursor,
+        window_cap,
+    })
+}
+
 fn deepseek4_cooperative_prefill_widths(
     maximum_width: usize,
     cold_wave: bool,
@@ -8902,18 +8955,88 @@ fn run_slot_aware_deepseek4(
                 // and mixed work retain the proven serial transaction path.
                 let serial_fallback =
                     next_deepseek4_prefill_handle(&slots, last_prefill_slot).unwrap_or(handle);
-                let (fatal, used_serial_fallback) = advance_deepseek4_prefill_quantum(
-                    &mut model,
-                    &mut sessions,
-                    &mut slots,
-                    &mut scheduler,
-                    registration.as_ref(),
-                    handle,
-                    serial_fallback,
-                    kv_bytes_per_token,
-                    None,
-                    &supervisor,
-                );
+                let sliding_window = model.model.cfg.sliding_window as usize;
+                let alignment = deepseek4_prefill_alignment_catchup(
+                    scheduler
+                        .prefill_handles_fifo()
+                        .into_iter()
+                        .map(|candidate| {
+                            let state = slots
+                                .get(candidate.slot_id.0 as usize)
+                                .and_then(Option::as_ref)
+                                .and_then(|(work, _, installed)| {
+                                    if *installed != candidate {
+                                        return None;
+                                    }
+                                    match work {
+                                        Deepseek4SlotWork::Prefill(state) => {
+                                            state.warm_matrix_alignment_state()
+                                        }
+                                        _ => None,
+                                    }
+                                });
+                            (candidate, state)
+                        }),
+                    sliding_window,
+                )
+                .and_then(|mut alignment| {
+                    let state = slots
+                        .get(alignment.handle.slot_id.0 as usize)
+                        .and_then(Option::as_ref)
+                        .and_then(|(work, _, installed)| {
+                            if *installed != alignment.handle {
+                                return None;
+                            }
+                            match work {
+                                Deepseek4SlotWork::Prefill(state) => Some(state),
+                                _ => None,
+                            }
+                        })?;
+                    alignment.window_cap = state.exact_warm_matrix_alignment_window_cap(
+                        alignment.target_cursor,
+                        sliding_window,
+                    )?;
+                    Some(alignment)
+                });
+                let (fatal, used_serial_fallback, serial_fallback) =
+                    if let Some(alignment) = alignment {
+                        tracing::info!(
+                            slot = alignment.handle.slot_id.0,
+                            cursor = alignment.cursor,
+                            target_cursor = alignment.target_cursor,
+                            window_cap = alignment.window_cap,
+                            "DeepSeek-V4 staggered warm prefill alignment catch-up"
+                        );
+                        (
+                            advance_deepseek4_prefill(
+                                &mut model,
+                                &mut sessions,
+                                &mut slots,
+                                &mut scheduler,
+                                registration.as_ref(),
+                                alignment.handle,
+                                kv_bytes_per_token,
+                                Some(alignment.window_cap),
+                                &supervisor,
+                            ),
+                            true,
+                            alignment.handle,
+                        )
+                    } else {
+                        let (fatal, used_serial_fallback) = advance_deepseek4_prefill_quantum(
+                            &mut model,
+                            &mut sessions,
+                            &mut slots,
+                            &mut scheduler,
+                            registration.as_ref(),
+                            handle,
+                            serial_fallback,
+                            kv_bytes_per_token,
+                            None,
+                            &supervisor,
+                        );
+                        (fatal, used_serial_fallback, serial_fallback)
+                    };
                 record_deepseek4_serial_prefill_fallback(
                     &mut last_prefill_slot,
                     serial_fallback,
@@ -29380,6 +29503,84 @@ mod tests {
         assert_eq!(deepseek4_cooperative_prefill_widths(4, false), Some(2..=4));
         assert_eq!(deepseek4_cooperative_prefill_widths(3, true), None);
         assert_eq!(deepseek4_cooperative_prefill_widths(4, true), Some(4..=4));
+    }
+
+    #[test]
+    fn deepseek_staggered_warm_prefill_catches_lagging_lane_to_aligned_cursor() {
+        let handles = (0..4)
+            .map(|slot| SlotHandle {
+                slot_id: SlotId(slot),
+                generation: 1,
+            })
+            .collect::<Vec<_>>();
+        let plan = deepseek4_prefill_alignment_catchup(
+            [
+                (handles[0], Some((7_316, 9_466, 8))),
+                (handles[1], Some((7_316, 9_466, 8))),
+                (handles[2], Some((7_316, 9_466, 8))),
+                (handles[3], Some((6_676, 9_466, 8))),
+            ],
+            128,
+        )
+        .expect("the fourth lane is five native windows behind");
+        assert_eq!(plan.handle, handles[3]);
+        assert_eq!(plan.cursor, 6_676);
+        assert_eq!(plan.target_cursor, 7_316);
+        assert_eq!(plan.window_cap, 5);
+
+        assert!(deepseek4_prefill_alignment_catchup(
+            handles
+                .iter()
+                .copied()
+                .map(|handle| (handle, Some((7_316, 9_466, 8)))),
+            128,
+        )
+        .is_none());
+
+        let multi_laggard = deepseek4_prefill_alignment_catchup(
+            [
+                (handles[0], Some((6_676, 12_000, 2))),
+                (handles[1], Some((6_932, 12_000, 8))),
+                (handles[2], Some((7_316, 12_000, 8))),
+            ],
+            128,
+        )
+        .expect("the lowest cursor advances first");
+        assert_eq!(multi_laggard.handle, handles[0]);
+        assert_eq!(multi_laggard.target_cursor, 7_316);
+        assert_eq!(
+            multi_laggard.window_cap, 2,
+            "the catch-up remains bounded by the lagging lane's native window multiplier"
+        );
+    }
+
+    #[test]
+    fn deepseek_prefill_alignment_rejects_incompatible_or_non_matrix_lanes() {
+        let handle = |slot| SlotHandle {
+            slot_id: SlotId(slot),
+            generation: 1,
+        };
+        assert!(deepseek4_prefill_alignment_catchup(
+            [
+                (handle(0), Some((6_676, 9_466, 8))),
+                (handle(1), Some((7_316, 9_594, 8))),
+            ],
+            128,
+        )
+        .is_none());
+        assert!(deepseek4_prefill_alignment_catchup(
+            [
+                (handle(0), Some((6_700, 9_466, 8))),
+                (handle(1), Some((7_316, 9_466, 8))),
+            ],
+            128,
+        )
+        .is_none());
+        assert!(deepseek4_prefill_alignment_catchup(
+            [(handle(0), Some((6_676, 9_466, 8))), (handle(1), None)],
+            128,
+        )
+        .is_none());
     }
 
     #[test]

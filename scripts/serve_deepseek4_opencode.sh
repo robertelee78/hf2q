@@ -21,6 +21,13 @@
 #                           not prevent client-side action loops. Operators may
 #                           set REP_PENALTY only for a measured workload;
 #                           non-default request values still win.
+#   HF2Q_DEEPSEEK4_REQUIRED_TOOL_THINKING_TOKEN_BUDGET=8
+#                           Bounds forced-open reasoning for the narrow
+#                           single-tool required/named-tool path before the
+#                           constrained DSML tool call. Set
+#                           REQUIRED_TOOL_THINKING_TOKEN_BUDGET=0 to disable
+#                           the operator default; explicit request budgets are
+#                           not accepted for DeepSeek-V4.
 #   HF2Q_DEEPSEEK_PREFILL_WINDOWS=adaptive
 #                           Uses the measured 2,048-token transaction while
 #                           the live cache is 131K, balances a cold prompt that
@@ -70,6 +77,7 @@ HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
 KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-8589934592}" # 8 GiB shared
+REQUIRED_TOOL_THINKING_TOKEN_BUDGET="${REQUIRED_TOOL_THINKING_TOKEN_BUDGET:-8}"
 
 # A ~100 GiB resident model leaves little margin on a 128 GiB host. Refuse a
 # load when prior inference has left the compressor/swap saturated or one
@@ -97,7 +105,7 @@ if ! [[ "$CONTEXT_LEN" =~ ^[0-9]+$ ]] || (( CONTEXT_LEN < 128 )); then
 fi
 for SETTING in CHECK_ONLY MAX_SWAP_USED_GIB MAX_COMPRESSOR_USED_GIB \
     MAX_OTHER_PROCESS_RSS_GIB UNSAFE_MEMORY_OVERRIDE MAX_SLOTS \
-    KV_CACHE_BUDGET_BYTES; do
+    KV_CACHE_BUDGET_BYTES REQUIRED_TOOL_THINKING_TOKEN_BUDGET; do
     VALUE=${!SETTING}
     if ! [[ "$VALUE" =~ ^[0-9]+$ ]]; then
         echo "$SETTING must be a non-negative integer (got: $VALUE)" >&2
@@ -236,6 +244,7 @@ fi
 exec env \
     HF2Q_DEEPSEEK_MAX_SEQ_LEN="$CONTEXT_LEN" \
     HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.0}" \
+    HF2Q_DEEPSEEK4_REQUIRED_TOOL_THINKING_TOKEN_BUDGET="$REQUIRED_TOOL_THINKING_TOKEN_BUDGET" \
     "$HF2Q_BIN" -v serve \
         --model "$MODEL" \
         --host "$HOST" \
