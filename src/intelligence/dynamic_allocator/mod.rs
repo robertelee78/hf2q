@@ -14,8 +14,9 @@ pub mod producer;
 use solver::allocate_dynamic_frontier;
 pub use solver::{
     allocation_problem_sha256, canonical_frontier_bytes, canonical_policy_bytes,
-    final_executed_tensor_bundle_sha256, precision_policy_sha256, tensor_catalog_sha256,
-    validate_policy_frontier, DynamicAllocationError,
+    execution_manifest_catalog_sha256, final_executed_tensor_bundle_sha256,
+    precision_policy_sha256, stored_payload_bytes, tensor_catalog_sha256, validate_policy_frontier,
+    DynamicAllocationError,
 };
 pub use types::*;
 

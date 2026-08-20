@@ -526,22 +526,25 @@ and evidence boundary needed before either can be truthful:
 - each option binds the exact source, calibration/sensitivity definition,
   Apple execution identity, workload profile, runtime capability profile, and
   sufficient dense or per-expert activation coverage;
-- storage and execution are separate. Every tensor carries an ordered
-  stored-to-executed transform chain, final executed-tensor hash, and the
-  operation evidence that consumes it. A load-time Q6-to-Q4 conversion without
-  an explicit lossy transformation receipt is rejected;
+- storage and execution are separate. Allocation schema v4 embeds canonical
+  source -> converted -> stored -> loaded -> executed physical manifests and
+  lets tensor options reference verifier-derived lineage slices only. Payload,
+  terminal tensors, source closure, and runtime-operation bindings are derived
+  from those manifests rather than repeated in caller-authored shadow fields;
 - fused operations such as gate+up carry one operation receipt and contribute
   their measured cost once, while still covering every member tensor;
 - proposal search is a bounded exact multi-choice Pareto dynamic program over
-  payload bytes, fixed-point local loss, and every required Apple workload
-  regime. Exact dominance and exact metric-equivalence collapse are the only
-  reductions. One deterministic tensor assignment represents each equal proxy-metric vector, with collapsed
-  equivalents counted for later diversity repair. Exceeding the configured
+  variable-option payload bytes, fixed-point local loss, and every required
+  Apple workload regime. Exact dominance and exact metric-equivalence collapse
+  are the only reductions. One deterministic tensor assignment represents each
+  equal proxy-metric vector, with collapsed equivalents counted for later
+  diversity repair. Exceeding the configured
   live-state bound returns `FrontierLimitExceeded`; it never silently becomes
   greedy or truncates the frontier;
-- every selected option retains its complete transform, route, measurement,
-  and sensitivity evidence in the policy hash. A verifier independently
-  regenerates the frontier from the allocation problem and rejects mutation.
+- every selected option retains the physical-manifest and lineage-slice
+  identities plus complete route, measurement, and sensitivity evidence in the
+  policy hash. A verifier independently regenerates the frontier from the
+  allocation problem and rejects mutation.
 
 This closes only the **proposal substrate**. By itself it does not produce
 structured calibration evidence, imatrices, KL gradients, quantized artifacts,
@@ -596,8 +599,9 @@ measure Dynamic sensitivity:
   declared topology is the family graph. A family-owned Qwen collector plus an
   opaque materialization verifier remains mandatory before these records are
   accepted as measured attention or DeltaNet coverage;
-- allocation schema v3 records both the three-way dataset partition and the
-  full tensor partition. The solver still treats these as opaque identities;
+- allocation schema v3 originally recorded both the three-way dataset
+  partition and the full tensor partition. The solver still treats these as
+  opaque identities;
   admission therefore requires `validate_dynamic_allocation_bindings`, which
   regenerates the dataset partition and coverage receipt, validates the source
   tensor partition, and cross-checks every child hash before invoking the
@@ -611,6 +615,67 @@ results, typed execution manifest, and matched Apple measurements remain
 mandatory later gates. In particular, the current Qwen inference loader's
 hidden stored-to-Q4_0 conversions must be made explicit before Apple cost can
 guide allocation.
+
+#### 2026-08-19 — physical execution-lineage schema v4 substrate
+
+The next model-free slice replaces schema v3's flat per-source transform
+claims with a structurally validated physical execution graph. This is the
+minimum truthful representation needed before Apple runtime costs can guide a
+Dynamic policy. Its first family scope is Qwen3.8 dense autoregressive text;
+MoE expert stack/split layouts remain unadmitted until equally typed transforms
+and exact runtime evidence exist:
+
+- each candidate embeds one canonical manifest for an atomic allocation unit.
+  Stage-tagged nodes record source, converted, stored, loaded, and executed
+  representations; named transform ports record the physical DAG; stable
+  logical operations have separate typed prefill/decode regime bindings;
+- source tensors are rebound to the authenticated D1 inventory by exact name,
+  source-order shape, dtype, byte length, and byte hash. Every represented
+  candidate source must be a D1 variable tensor with the matching disposition.
+  Fixed, protected, and excluded physical lineage plus their base artifact
+  bytes/costs remain a D2b materializer responsibility and are not silently
+  included in this frontier;
+- every option contains one lineage-slice reference per source member. The
+  verifier derives the complete stored and executed node sets, exact source
+  closure, runtime operation bindings, capability-binding bundle, and variable
+  payload bytes from the embedded manifest. Every stored/executed node must be
+  covered, every manifest is used by exactly one candidate option, and fused
+  multi-source storage is counted once by physical node identity;
+- physical sizes are checked from a single canonical
+  `row-major-outermost-first-v1` shape order. GGML block sizes are computed per
+  row, artifact byte regions must be in-bounds and non-overlapping, and float
+  GGML wire tensors remain representable alongside quantized blocks. Qwen
+  DeltaNet conv1d rank changes use an exact singleton-axis `Squeeze` transform;
+  the generic architecture-bake tag cannot hide a shape change;
+- Qwen's fused-Q load path is represented as stored dequantization, explicit
+  q/gate splitting, and two distinct `Qwen35LoadQ4Amax7V1` requantizations.
+  The amax/7 transform is deliberately not mislabeled as canonical converter
+  Q4_0. Direct packed FFN block loads remain byte-identical edges;
+- the graph is acyclic and stage-monotonic, runtime source closure and terminal
+  consumption are exact, and workload regimes are typed. Every catalog entry
+  must share the exact routing policy, graph configuration, capability schema,
+  capability profile, hardware profile, and execution scope declared by the
+  allocation problem. Each regime cost names the exact physical binding ids
+  and hashes their full binding bundle; caller-authored route, shape, or
+  invocation-count shadows are not accepted. Hardware and measurement hashes
+  remain structural identities rather than authenticated benchmark evidence.
+  Malformed transform arity, roles, geometry, codec, or layout fail closed;
+- schema v4 rejects MLX-affine execution and any DWQ overlay. This work contains
+  no DWQ training, artifact, runtime, or acceptance path.
+
+The result is named `ValidatedTensorExecutionManifest`, not `Verified`, on
+purpose. D2a validates structure, canonical hashes, and cross-object bindings;
+it does not yet authenticate converter payload bytes, loader materializations,
+Metal uploads, or mlx-native request/decision semantics. The capability
+envelope is only opaque canonical JSON plus a digest in D2a; it makes no typed
+mlx-native ABI claim, regardless of the version string recorded by a fixture.
+
+D2b must instrument the real hf2q converter, Qwen loader, load-time amax/7
+packer, direct FFN block path, output head, and production dispatches; rehash
+the actual source/GGUF/loaded/executed bytes; deserialize and recompute typed
+mlx-native capability decisions under the exact routing policy; and pass the
+real Qwen3.8 Apple gate. Until then schema v4 cannot authorize a Dynamic cost,
+candidate artifact, or production `--quant auto` choice.
 
 ### Phase E — production `--quant auto`
 

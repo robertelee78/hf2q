@@ -6,6 +6,12 @@ use thiserror::Error;
 
 use super::super::measured_auto_quant::{InferenceRegime, SourceIdentity};
 use super::types::*;
+use crate::core::provenance::tensor_execution::{
+    canonicalized_tensor_execution_manifest, runtime_capability_binding_bundle_sha256,
+    runtime_regime_binding_bundle_sha256, tensor_lineage_slice, verify_tensor_execution_manifest,
+    RuntimeOperationBinding, TensorExecutionManifest, TensorExecutionRegime, TensorExecutionScope,
+    TensorStateNode, TensorStateStage, ValidatedTensorExecutionManifest,
+};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DynamicAllocationError {
@@ -53,62 +59,38 @@ fn hash_serialized<T: Serialize>(value: &T) -> Result<String, DynamicAllocationE
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
-fn codec_valid(codec: &TensorCodec) -> bool {
-    match codec {
-        TensorCodec::Gguf { .. } | TensorCodec::Dense { .. } => true,
-        TensorCodec::MlxAffine {
-            bits,
-            group_size,
-            layout_abi,
-            ..
-        } => matches!(bits, 4 | 6 | 8) && matches!(group_size, 32 | 64) && !layout_abi.is_empty(),
-    }
-}
-
-fn lossless_repack_compatible(from: &TensorCodec, to: &TensorCodec) -> bool {
-    match (from, to) {
-        (TensorCodec::Gguf { codec: left }, TensorCodec::Gguf { codec: right }) => left == right,
-        (
-            TensorCodec::MlxAffine {
-                bits: left_bits,
-                group_size: left_group,
-                scale_dtype: left_scale,
-                bias_dtype: left_bias,
-                ..
-            },
-            TensorCodec::MlxAffine {
-                bits: right_bits,
-                group_size: right_group,
-                scale_dtype: right_scale,
-                bias_dtype: right_bias,
-                ..
-            },
-        ) => {
-            left_bits == right_bits
-                && left_group == right_group
-                && left_scale == right_scale
-                && left_bias == right_bias
-        }
-        (TensorCodec::Dense { dtype: left }, TensorCodec::Dense { dtype: right }) => left == right,
-        _ => false,
-    }
-}
-
 fn normalize_option(option: &mut TensorOption) {
     option
         .execution_plans
-        .sort_by(|left, right| left.tensor_name.cmp(&right.tensor_name));
+        .sort_by(|left, right| left.source_tensor_name.cmp(&right.source_tensor_name));
     option
         .operations
         .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
     for operation in &mut option.operations {
-        operation.tensor_names.sort();
+        operation.source_tensor_names.sort();
+        operation.executed_tensor_node_ids.sort();
+        for cost in operation.regime_costs.values_mut() {
+            cost.runtime_binding_ids.sort();
+        }
     }
+}
+
+fn normalize_execution_scope(scope: &TensorExecutionScope) -> TensorExecutionScope {
+    let mut normalized = scope.clone();
+    normalized.included_paths.sort();
+    normalized
 }
 
 fn normalize_problem(problem: &DynamicAllocationProblem) -> DynamicAllocationProblem {
     let mut normalized = problem.clone();
     normalized.required_regimes.sort();
+    normalized.execution_scope = normalize_execution_scope(&normalized.execution_scope);
+    for manifest in &mut normalized.execution_manifest_catalog {
+        *manifest = canonicalized_tensor_execution_manifest(manifest);
+    }
+    normalized
+        .execution_manifest_catalog
+        .sort_by(|left, right| left.manifest_sha256.cmp(&right.manifest_sha256));
     normalized
         .units
         .sort_by(|left, right| left.unit_id.cmp(&right.unit_id));
@@ -141,107 +123,190 @@ pub fn tensor_catalog_sha256(
     hash_serialized(&members)
 }
 
-pub fn final_executed_tensor_bundle_sha256(
-    plans: &[TensorExecutionPlan],
+pub fn execution_manifest_catalog_sha256(
+    manifests: &[TensorExecutionManifest],
 ) -> Result<String, DynamicAllocationError> {
-    let mut entries: Vec<_> = plans
-        .iter()
-        .map(|plan| {
-            (
-                plan.tensor_name.clone(),
-                plan.executed_codec.clone(),
-                plan.final_executed_tensor_sha256.clone(),
-            )
-        })
-        .collect();
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    hash_serialized(&entries)
-}
-
-fn validate_transform(plan: &TensorExecutionPlan) -> Result<(), String> {
-    if plan.tensor_name.is_empty()
-        || plan.operation_id.is_empty()
-        || !codec_valid(&plan.stored_codec)
-        || !is_sha256(&plan.stored_tensor_sha256)
-        || plan.stored_payload_bytes == 0
-        || !codec_valid(&plan.executed_codec)
-        || !is_sha256(&plan.final_executed_tensor_sha256)
-        || plan.transformations.is_empty()
-    {
-        return Err(format!(
-            "tensor `{}` has an incomplete execution plan",
-            plan.tensor_name
-        ));
-    }
-    let mut expected_codec = &plan.stored_codec;
-    let mut expected_tensor_hash = plan.stored_tensor_sha256.as_str();
-    let mut expected_logical_hash: Option<&str> = None;
-    for step in &plan.transformations {
-        if &step.from != expected_codec
-            || !codec_valid(&step.from)
-            || !codec_valid(&step.to)
-            || step.input_tensor_sha256 != expected_tensor_hash
-            || !is_sha256(&step.input_tensor_sha256)
-            || !is_sha256(&step.transform_receipt_sha256)
-            || !is_sha256(&step.output_tensor_sha256)
-            || !is_sha256(&step.input_logical_tensor_sha256)
-            || !is_sha256(&step.output_logical_tensor_sha256)
-            || expected_logical_hash
-                .is_some_and(|expected| step.input_logical_tensor_sha256 != expected)
-        {
-            return Err(format!(
-                "tensor `{}` has a broken transform chain",
-                plan.tensor_name
+    let mut digests = Vec::with_capacity(manifests.len());
+    let mut unique = BTreeSet::new();
+    for manifest in manifests {
+        let validated = verify_tensor_execution_manifest(manifest).map_err(|error| {
+            DynamicAllocationError::InvalidProblem(format!(
+                "execution manifest is not structurally valid: {error}"
+            ))
+        })?;
+        let digest = validated.manifest().manifest_sha256.clone();
+        if !unique.insert(digest.clone()) {
+            return Err(DynamicAllocationError::InvalidProblem(
+                "execution manifest catalog contains duplicate manifests".into(),
             ));
         }
-        match step.kind {
-            ExecutionTransformKind::Identity
-                if step.from != step.to
-                    || step.input_tensor_sha256 != step.output_tensor_sha256
-                    || step.input_logical_tensor_sha256 != step.output_logical_tensor_sha256 =>
-            {
-                return Err(format!(
-                    "tensor `{}` has a non-identity identity step",
-                    plan.tensor_name
-                ));
-            }
-            ExecutionTransformKind::Identity => {}
-            ExecutionTransformKind::LosslessRepack
-                if !lossless_repack_compatible(&step.from, &step.to)
-                    || step.input_logical_tensor_sha256 != step.output_logical_tensor_sha256 =>
-            {
-                return Err(format!(
-                    "tensor `{}` has an unproved lossless repack",
-                    plan.tensor_name
-                ));
-            }
-            ExecutionTransformKind::LosslessRepack => {}
-            ExecutionTransformKind::LossyRequantize => {}
-            ExecutionTransformKind::DequantizeExpand => {
-                if !matches!(step.to, TensorCodec::Dense { .. })
-                    || step.input_logical_tensor_sha256 != step.output_logical_tensor_sha256
+        digests.push(digest);
+    }
+    digests.sort();
+    hash_serialized(&digests)
+}
+
+fn validated_manifest_catalog(
+    problem: &DynamicAllocationProblem,
+) -> Result<BTreeMap<String, ValidatedTensorExecutionManifest>, DynamicAllocationError> {
+    let mut catalog = BTreeMap::new();
+    for manifest in &problem.execution_manifest_catalog {
+        let validated = verify_tensor_execution_manifest(manifest).map_err(|error| {
+            DynamicAllocationError::InvalidProblem(format!(
+                "execution manifest is not structurally valid: {error}"
+            ))
+        })?;
+        let digest = validated.manifest().manifest_sha256.clone();
+        if catalog.insert(digest, validated).is_some() {
+            return Err(DynamicAllocationError::InvalidProblem(
+                "execution manifest catalog contains duplicate manifests".into(),
+            ));
+        }
+    }
+    Ok(catalog)
+}
+
+struct ValidationContext {
+    catalog: BTreeMap<String, ValidatedTensorExecutionManifest>,
+}
+
+impl ValidationContext {
+    fn new(problem: &DynamicAllocationProblem) -> Result<Self, DynamicAllocationError> {
+        Ok(Self {
+            catalog: validated_manifest_catalog(problem)?,
+        })
+    }
+
+    fn catalog_sha256(&self) -> Result<String, DynamicAllocationError> {
+        hash_serialized(&self.catalog.keys().collect::<Vec<_>>())
+    }
+}
+
+#[derive(Debug)]
+struct DerivedOptionEvidence<'a> {
+    manifest: &'a ValidatedTensorExecutionManifest,
+    stored_nodes: BTreeMap<String, TensorStateNode>,
+    executed_nodes: BTreeMap<String, TensorStateNode>,
+    operations: BTreeMap<String, RuntimeOperationBinding>,
+}
+
+fn derive_option_evidence<'a>(
+    context: &'a ValidationContext,
+    option: &TensorOption,
+) -> Result<DerivedOptionEvidence<'a>, DynamicAllocationError> {
+    let manifests: BTreeSet<_> = option
+        .execution_plans
+        .iter()
+        .map(|plan| plan.execution_manifest_sha256.as_str())
+        .collect();
+    if manifests.len() != 1 {
+        return Err(DynamicAllocationError::InvalidProblem(format!(
+            "option `{}` must bind exactly one physical execution manifest",
+            option.option_id
+        )));
+    }
+    let manifest_sha256 = *manifests
+        .iter()
+        .next()
+        .ok_or_else(|| DynamicAllocationError::InvalidProblem("option has no plans".into()))?;
+    let manifest = context.catalog.get(manifest_sha256).ok_or_else(|| {
+        DynamicAllocationError::InvalidProblem(format!(
+            "option `{}` references an absent execution manifest",
+            option.option_id
+        ))
+    })?;
+    let mut stored_nodes = BTreeMap::new();
+    let mut executed_nodes = BTreeMap::new();
+    let mut operations = BTreeMap::new();
+    for plan in &option.execution_plans {
+        if plan.source_tensor_name.is_empty()
+            || !is_sha256(&plan.execution_manifest_sha256)
+            || !is_sha256(&plan.lineage_slice_sha256)
+        {
+            return Err(DynamicAllocationError::InvalidProblem(format!(
+                "option `{}` has an incomplete execution plan",
+                option.option_id
+            )));
+        }
+        let slice = tensor_lineage_slice(&manifest, &plan.source_tensor_name).map_err(|error| {
+            DynamicAllocationError::InvalidProblem(format!(
+                "option `{}` has an invalid lineage slice: {error}",
+                option.option_id
+            ))
+        })?;
+        if slice.slice_sha256 != plan.lineage_slice_sha256
+            || slice.execution_manifest_sha256 != plan.execution_manifest_sha256
+        {
+            return Err(DynamicAllocationError::InvalidProblem(format!(
+                "option `{}` has a stale lineage slice",
+                option.option_id
+            )));
+        }
+        for node in &slice.nodes {
+            let target = match node.stage {
+                TensorStateStage::Stored => Some(&mut stored_nodes),
+                TensorStateStage::Executed => Some(&mut executed_nodes),
+                _ => None,
+            };
+            if let Some(target) = target {
+                if target
+                    .insert(node.node_id.clone(), node.clone())
+                    .is_some_and(|existing| existing != *node)
                 {
-                    return Err(format!(
-                        "tensor `{}` expands into a non-dense codec",
-                        plan.tensor_name
-                    ));
+                    return Err(DynamicAllocationError::InvalidProblem(format!(
+                        "option `{}` has conflicting physical node aliases",
+                        option.option_id
+                    )));
                 }
             }
         }
-        expected_codec = &step.to;
-        expected_tensor_hash = &step.output_tensor_sha256;
-        expected_logical_hash = Some(&step.output_logical_tensor_sha256);
+        for binding in &slice.operations {
+            if operations
+                .insert(binding.binding_id.clone(), binding.clone())
+                .is_some_and(|existing| existing != *binding)
+            {
+                return Err(DynamicAllocationError::InvalidProblem(format!(
+                    "option `{}` has conflicting runtime binding aliases",
+                    option.option_id
+                )));
+            }
+        }
     }
-    let last = plan.transformations.last().expect("checked non-empty");
-    if expected_codec != &plan.executed_codec
-        || last.output_tensor_sha256 != plan.final_executed_tensor_sha256
-    {
-        return Err(format!(
-            "tensor `{}` does not bind its final executed bytes",
-            plan.tensor_name
-        ));
+    if stored_nodes.is_empty() || executed_nodes.is_empty() || operations.is_empty() {
+        return Err(DynamicAllocationError::InvalidProblem(format!(
+            "option `{}` has no physical stored, executed, or operation evidence",
+            option.option_id
+        )));
     }
-    Ok(())
+    Ok(DerivedOptionEvidence {
+        manifest,
+        stored_nodes,
+        executed_nodes,
+        operations,
+    })
+}
+
+pub fn stored_payload_bytes(
+    problem: &DynamicAllocationProblem,
+    option: &TensorOption,
+) -> Result<u64, DynamicAllocationError> {
+    let context = ValidationContext::new(problem)?;
+    derive_option_evidence(&context, option)?
+        .stored_nodes
+        .values()
+        .try_fold(0u64, |total, node| {
+            total
+                .checked_add(node.byte_len)
+                .ok_or(DynamicAllocationError::Overflow)
+        })
+}
+
+pub fn final_executed_tensor_bundle_sha256(
+    problem: &DynamicAllocationProblem,
+    option: &TensorOption,
+) -> Result<String, DynamicAllocationError> {
+    let context = ValidationContext::new(problem)?;
+    hash_serialized(&derive_option_evidence(&context, option)?.executed_nodes)
 }
 
 fn operation_costs(
@@ -252,21 +317,28 @@ fn operation_costs(
     for operation in &option.operations {
         for regime in required {
             let cost = &operation.regime_costs[regime];
-            let weighted = cost
-                .median_nanoseconds
-                .checked_mul(cost.invocation_count)
-                .ok_or(DynamicAllocationError::Overflow)?;
             let total = totals.entry(*regime).or_insert(0u64);
             *total = total
-                .checked_add(weighted)
+                .checked_add(cost.median_nanoseconds)
                 .ok_or(DynamicAllocationError::Overflow)?;
         }
     }
     Ok(totals)
 }
 
+fn physical_regime(regime: InferenceRegime) -> TensorExecutionRegime {
+    match regime {
+        InferenceRegime::TextPrefill => TensorExecutionRegime::TextPrefill,
+        InferenceRegime::TextDecodeM1 => TensorExecutionRegime::TextDecodeM1,
+        InferenceRegime::TextDecodeWidthN => TensorExecutionRegime::TextDecodeWidthN,
+        InferenceRegime::LongContextDecode => TensorExecutionRegime::LongContextDecode,
+        InferenceRegime::MultimodalPrefill => TensorExecutionRegime::MultimodalPrefill,
+    }
+}
+
 fn validate_option(
     problem: &DynamicAllocationProblem,
+    context: &ValidationContext,
     unit: &TensorAllocationUnit,
     option: &TensorOption,
     required: &BTreeSet<InferenceRegime>,
@@ -293,7 +365,7 @@ fn validate_option(
     let plans: BTreeSet<_> = option
         .execution_plans
         .iter()
-        .map(|plan| plan.tensor_name.as_str())
+        .map(|plan| plan.source_tensor_name.as_str())
         .collect();
     if plans != members || option.execution_plans.len() != unit.members.len() {
         return Err(invalid(format!(
@@ -301,25 +373,102 @@ fn validate_option(
             option.option_id
         )));
     }
-    for plan in &option.execution_plans {
-        validate_transform(plan).map_err(invalid)?;
+    let derived = derive_option_evidence(context, option)?;
+    let manifest_sources: BTreeSet<_> = derived
+        .manifest
+        .manifest()
+        .nodes
+        .iter()
+        .filter(|node| node.stage == TensorStateStage::Source)
+        .map(|node| node.semantic_name.as_str())
+        .collect();
+    if manifest_sources != members {
+        return Err(invalid(format!(
+            "option `{}` execution manifest does not exactly match its atomic unit sources",
+            option.option_id
+        )));
     }
-    let planned_payload =
-        option
-            .execution_plans
+    for member in &unit.members {
+        let source_node = derived
+            .manifest
+            .manifest()
+            .nodes
             .iter()
-            .try_fold(option.shared_metadata_bytes, |total, plan| {
-                total
-                    .checked_add(plan.stored_payload_bytes)
-                    .ok_or(DynamicAllocationError::Overflow)
-            })?;
+            .find(|node| {
+                node.stage == TensorStateStage::Source && node.semantic_name == member.name
+            })
+            .expect("exact source-name equality was checked above");
+        if source_node.shape
+            != member
+                .shape
+                .iter()
+                .map(|dimension| *dimension as u64)
+                .collect::<Vec<_>>()
+            || source_node.byte_sha256 != member.source_tensor_sha256
+        {
+            return Err(invalid(format!(
+                "option `{}` source node does not match the tensor catalog",
+                option.option_id
+            )));
+        }
+    }
+    let all_stored: BTreeSet<_> = derived
+        .manifest
+        .manifest()
+        .nodes
+        .iter()
+        .filter(|node| node.stage == TensorStateStage::Stored)
+        .map(|node| node.node_id.as_str())
+        .collect();
+    let all_executed: BTreeSet<_> = derived
+        .manifest
+        .manifest()
+        .nodes
+        .iter()
+        .filter(|node| node.stage == TensorStateStage::Executed)
+        .map(|node| node.node_id.as_str())
+        .collect();
+    if all_stored
+        != derived
+            .stored_nodes
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+        || all_executed
+            != derived
+                .executed_nodes
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+    {
+        return Err(invalid(format!(
+            "option `{}` does not cover every physical stored and executed node",
+            option.option_id
+        )));
+    }
+    if option.storage_manifest_receipt_sha256
+        != derived.manifest.manifest().conversion_receipt_sha256
+    {
+        return Err(invalid(format!(
+            "option `{}` does not bind the selected manifest's storage receipt",
+            option.option_id
+        )));
+    }
+    let planned_payload = derived
+        .stored_nodes
+        .values()
+        .try_fold(0u64, |total, node| {
+            total
+                .checked_add(node.byte_len)
+                .ok_or(DynamicAllocationError::Overflow)
+        })?;
     if planned_payload != option.payload_bytes {
         return Err(invalid(format!(
             "option `{}` payload breakdown does not match its total",
             option.option_id
         )));
     }
-    if final_executed_tensor_bundle_sha256(&option.execution_plans)?
+    if hash_serialized(&derived.executed_nodes)?
         != option.sensitivity.final_executed_tensor_bundle_sha256
     {
         return Err(invalid(format!(
@@ -328,29 +477,86 @@ fn validate_option(
         )));
     }
 
+    let mut derived_operations: BTreeMap<&str, Vec<&RuntimeOperationBinding>> = BTreeMap::new();
+    for binding in derived.operations.values() {
+        derived_operations
+            .entry(binding.operation_id.as_str())
+            .or_default()
+            .push(binding);
+    }
     let mut operation_ids = BTreeSet::new();
     for operation in &option.operations {
         if operation.operation_id.is_empty()
             || operation.graph_path.is_empty()
             || !operation_ids.insert(operation.operation_id.as_str())
-            || !is_sha256(&operation.capability_decision_sha256)
+            || !is_sha256(&operation.capability_binding_bundle_sha256)
         {
             return Err(invalid(format!(
                 "option `{}` has malformed operation evidence",
                 option.option_id
             )));
         }
-        let expected: BTreeSet<_> = option
-            .execution_plans
+        let bindings = derived_operations
+            .get(operation.operation_id.as_str())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "operation `{}` is absent from the selected physical manifest",
+                    operation.operation_id
+                ))
+            })?;
+        let physical_regimes: BTreeSet<_> = bindings
             .iter()
-            .filter(|plan| plan.operation_id == operation.operation_id)
-            .map(|plan| plan.tensor_name.as_str())
+            .map(|binding| match binding.workload_regime {
+                crate::core::provenance::tensor_execution::TensorExecutionRegime::TextPrefill => {
+                    InferenceRegime::TextPrefill
+                }
+                crate::core::provenance::tensor_execution::TensorExecutionRegime::TextDecodeM1 => {
+                    InferenceRegime::TextDecodeM1
+                }
+                crate::core::provenance::tensor_execution::TensorExecutionRegime::TextDecodeWidthN => {
+                    InferenceRegime::TextDecodeWidthN
+                }
+                crate::core::provenance::tensor_execution::TensorExecutionRegime::LongContextDecode => {
+                    InferenceRegime::LongContextDecode
+                }
+                crate::core::provenance::tensor_execution::TensorExecutionRegime::MultimodalPrefill => {
+                    InferenceRegime::MultimodalPrefill
+                }
+            })
             .collect();
-        let actual: BTreeSet<_> = operation.tensor_names.iter().map(String::as_str).collect();
-        if expected.is_empty() || expected != actual || actual.len() != operation.tensor_names.len()
+        let expected_sources: BTreeSet<_> = bindings
+            .iter()
+            .flat_map(|binding| binding.source_tensor_names.iter().map(String::as_str))
+            .collect();
+        let actual_sources: BTreeSet<_> = operation
+            .source_tensor_names
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let expected_executed: BTreeSet<_> = bindings
+            .iter()
+            .flat_map(|binding| binding.inputs.iter().map(|input| input.node_id.as_str()))
+            .collect();
+        let actual_executed: BTreeSet<_> = operation
+            .executed_tensor_node_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if expected_sources.is_empty()
+            || expected_sources != actual_sources
+            || actual_sources.len() != operation.source_tensor_names.len()
+            || expected_executed != actual_executed
+            || actual_executed.len() != operation.executed_tensor_node_ids.len()
+            || bindings
+                .iter()
+                .any(|binding| binding.graph_path != operation.graph_path)
+            || physical_regimes != *required
+            || runtime_capability_binding_bundle_sha256(&derived.manifest, &operation.operation_id)
+                .map_err(|error| invalid(error.to_string()))?
+                != operation.capability_binding_bundle_sha256
         {
             return Err(invalid(format!(
-                "operation `{}` does not exactly cover its tensor plans",
+                "operation `{}` does not exactly cover its source and executed tensors",
                 operation.operation_id
             )));
         }
@@ -362,15 +568,33 @@ fn validate_option(
             )));
         }
         for (regime, cost) in &operation.regime_costs {
+            let expected_binding_ids: BTreeSet<_> = bindings
+                .iter()
+                .filter(|binding| binding.workload_regime == physical_regime(*regime))
+                .map(|binding| binding.binding_id.as_str())
+                .collect();
+            let actual_binding_ids: BTreeSet<_> = cost
+                .runtime_binding_ids
+                .iter()
+                .map(String::as_str)
+                .collect();
             if cost.regime != *regime
                 || !cost.executable
-                || cost.route.is_empty()
-                || cost.invocation_count == 0
+                || expected_binding_ids.is_empty()
+                || expected_binding_ids != actual_binding_ids
+                || actual_binding_ids.len() != cost.runtime_binding_ids.len()
+                || runtime_regime_binding_bundle_sha256(
+                    &derived.manifest,
+                    &operation.operation_id,
+                    physical_regime(*regime),
+                )
+                .map_err(|error| invalid(error.to_string()))?
+                    != cost.runtime_binding_bundle_sha256
                 || cost.median_nanoseconds == 0
                 || cost.p95_nanoseconds < cost.median_nanoseconds
                 || cost.warmup_runs == 0
                 || cost.measured_runs < 3
-                || !is_sha256(&cost.workload_shape_sha256)
+                || !is_sha256(&cost.runtime_binding_bundle_sha256)
                 || !is_sha256(&cost.measurement_receipt_sha256)
             {
                 return Err(invalid(format!(
@@ -381,10 +605,9 @@ fn validate_option(
         }
     }
     if option.operations.len() != operation_ids.len()
-        || option
-            .execution_plans
-            .iter()
-            .any(|plan| !operation_ids.contains(plan.operation_id.as_str()))
+        || derived_operations
+            .keys()
+            .any(|operation_id| !operation_ids.contains(operation_id))
     {
         return Err(invalid(format!(
             "option `{}` has an unbound operation",
@@ -424,9 +647,18 @@ fn validate_problem(problem: &DynamicAllocationProblem) -> Result<(), DynamicAll
         || problem.execution.mlx_native_version.is_empty()
         || problem.execution.hardware_id.is_empty()
         || problem.execution.os_build.is_empty()
+        || problem.tensor_runtime.hf2q_revision != problem.execution.hf2q_revision
+        || problem.tensor_runtime.mlx_native_version != problem.execution.mlx_native_version
+        || problem.tensor_runtime.capability_profile_sha256 != problem.capability_profile_sha256
+        || problem.tensor_runtime.mlx_native_capability_schema_version != 1
+        || problem.tensor_runtime.dwq_overlay_sha256.is_some()
+        || problem.execution_scope.model_family.is_empty()
+        || problem.execution_scope.profile.is_empty()
+        || problem.execution_scope.included_paths.is_empty()
         || !is_sha256(&problem.tensor_catalog_sha256)
         || !is_sha256(&problem.dataset_partition_manifest_sha256)
         || !is_sha256(&problem.tensor_partition_manifest_sha256)
+        || !is_sha256(&problem.execution_manifest_catalog_sha256)
         || !is_sha256(&problem.calibration_manifest_sha256)
         || !is_sha256(&problem.capability_profile_sha256)
         || !is_sha256(&problem.proposal_workload_profile_sha256)
@@ -441,8 +673,28 @@ fn validate_problem(problem: &DynamicAllocationProblem) -> Result<(), DynamicAll
             "source, calibration, runtime, or workload identity is incomplete",
         ));
     }
+    let context = ValidationContext::new(problem)?;
+    let execution_manifests = &context.catalog;
+    if execution_manifests.is_empty()
+        || context.catalog_sha256()? != problem.execution_manifest_catalog_sha256
+    {
+        return Err(invalid(
+            "execution manifest catalog is empty, duplicated, or stale",
+        ));
+    }
+    if execution_manifests.values().any(|validated| {
+        let manifest = validated.manifest();
+        manifest.tensor_partition_manifest_sha256 != problem.tensor_partition_manifest_sha256
+            || manifest.runtime != problem.tensor_runtime
+            || normalize_execution_scope(&manifest.scope)
+                != normalize_execution_scope(&problem.execution_scope)
+    }) {
+        return Err(invalid(
+            "execution manifests do not match the allocation partition or runtime identity",
+        ));
+    }
     let SearchContract::ExactPareto { max_states } = problem.search;
-    if max_states == 0 || problem.payload_budget_bytes == 0 || problem.units.is_empty() {
+    if max_states == 0 || problem.variable_payload_budget_bytes == 0 || problem.units.is_empty() {
         return Err(invalid("search bound, budget, and units must be non-zero"));
     }
     let required: BTreeSet<_> = problem.required_regimes.iter().copied().collect();
@@ -453,6 +705,7 @@ fn validate_problem(problem: &DynamicAllocationProblem) -> Result<(), DynamicAll
     let mut unit_ids = BTreeSet::new();
     let mut tensor_names = BTreeSet::new();
     let mut global_operation_ids = BTreeSet::new();
+    let mut referenced_execution_manifests = BTreeMap::new();
     let mut tensor_count = 0usize;
     for unit in &problem.units {
         if unit.unit_id.is_empty()
@@ -527,7 +780,11 @@ fn validate_problem(problem: &DynamicAllocationProblem) -> Result<(), DynamicAll
             if !option_ids.insert(option.option_id.as_str()) {
                 return Err(invalid("allocation unit has duplicate option ids"));
             }
-            validate_option(problem, unit, option, &required)?;
+            validate_option(problem, &context, unit, option, &required)?;
+            let manifest_sha256 = option.execution_plans[0].execution_manifest_sha256.as_str();
+            *referenced_execution_manifests
+                .entry(manifest_sha256)
+                .or_insert(0usize) += 1;
             let topology: BTreeMap<_, _> = option
                 .operations
                 .iter()
@@ -536,7 +793,11 @@ fn validate_problem(problem: &DynamicAllocationProblem) -> Result<(), DynamicAll
                         operation.operation_id.as_str(),
                         (
                             operation.graph_path.as_str(),
-                            operation.tensor_names.iter().map(String::as_str).collect(),
+                            operation
+                                .source_tensor_names
+                                .iter()
+                                .map(String::as_str)
+                                .collect(),
                         ),
                     )
                 })
@@ -552,6 +813,22 @@ fn validate_problem(problem: &DynamicAllocationProblem) -> Result<(), DynamicAll
         || tensor_catalog_sha256(&problem.units)? != problem.tensor_catalog_sha256
     {
         return Err(invalid("tensor catalog count or canonical hash mismatch"));
+    }
+    if referenced_execution_manifests
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        != execution_manifests
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+        || referenced_execution_manifests
+            .values()
+            .any(|count| *count != 1)
+    {
+        return Err(invalid(
+            "every execution manifest must be referenced and no option may reference an extra manifest",
+        ));
     }
     Ok(())
 }
@@ -641,10 +918,10 @@ pub(super) fn allocate_dynamic_frontier(
             .checked_add(bytes)
             .ok_or(DynamicAllocationError::Overflow)
     })?;
-    if minimum > normalized.payload_budget_bytes {
+    if minimum > normalized.variable_payload_budget_bytes {
         return Err(DynamicAllocationError::BudgetTooSmall {
             required: minimum,
-            budget: normalized.payload_budget_bytes,
+            budget: normalized.variable_payload_budget_bytes,
         });
     }
 
@@ -669,7 +946,7 @@ pub(super) fn allocate_dynamic_frontier(
                     .bytes
                     .checked_add(option.payload_bytes)
                     .ok_or(DynamicAllocationError::Overflow)?;
-                if bytes > normalized.payload_budget_bytes {
+                if bytes > normalized.variable_payload_budget_bytes {
                     continue;
                 }
                 let option_costs = operation_costs(option, &required)?;
@@ -735,14 +1012,17 @@ pub(super) fn allocate_dynamic_frontier(
             allocation_problem_sha256: problem_sha256.clone(),
             source: normalized.source.clone(),
             execution: normalized.execution.clone(),
+            tensor_runtime: normalized.tensor_runtime.clone(),
+            execution_scope: normalized.execution_scope.clone(),
             tensor_catalog_sha256: normalized.tensor_catalog_sha256.clone(),
             dataset_partition_manifest_sha256: normalized.dataset_partition_manifest_sha256.clone(),
             tensor_partition_manifest_sha256: normalized.tensor_partition_manifest_sha256.clone(),
+            execution_manifest_catalog_sha256: normalized.execution_manifest_catalog_sha256.clone(),
             calibration_manifest_sha256: normalized.calibration_manifest_sha256.clone(),
             capability_profile_sha256: normalized.capability_profile_sha256.clone(),
             proposal_workload_profile_sha256: normalized.proposal_workload_profile_sha256.clone(),
-            payload_budget_bytes: normalized.payload_budget_bytes,
-            total_payload_bytes: state.bytes,
+            variable_payload_budget_bytes: normalized.variable_payload_budget_bytes,
+            total_variable_payload_bytes: state.bytes,
             total_loss_units: state.loss,
             total_regime_cost_nanoseconds: regimes
                 .iter()
@@ -753,8 +1033,8 @@ pub(super) fn allocate_dynamic_frontier(
         });
     }
     policies.sort_by(|left, right| {
-        left.total_payload_bytes
-            .cmp(&right.total_payload_bytes)
+        left.total_variable_payload_bytes
+            .cmp(&right.total_variable_payload_bytes)
             .then_with(|| left.total_loss_units.cmp(&right.total_loss_units))
             .then_with(|| {
                 left.total_regime_cost_nanoseconds
@@ -787,6 +1067,7 @@ pub fn canonical_policy_bytes(
     policy: &PrecisionPolicyManifest,
 ) -> Result<Vec<u8>, DynamicAllocationError> {
     let mut normalized = policy.clone();
+    normalized.execution_scope = normalize_execution_scope(&normalized.execution_scope);
     normalized
         .decisions
         .sort_by(|left, right| left.unit_id.cmp(&right.unit_id));
@@ -808,6 +1089,7 @@ pub fn canonical_frontier_bytes(
 ) -> Result<Vec<u8>, DynamicAllocationError> {
     let mut normalized = frontier.clone();
     for policy in &mut normalized.policies {
+        policy.execution_scope = normalize_execution_scope(&policy.execution_scope);
         policy
             .decisions
             .sort_by(|left, right| left.unit_id.cmp(&right.unit_id));
@@ -816,8 +1098,8 @@ pub fn canonical_frontier_bytes(
         }
     }
     normalized.policies.sort_by(|left, right| {
-        left.total_payload_bytes
-            .cmp(&right.total_payload_bytes)
+        left.total_variable_payload_bytes
+            .cmp(&right.total_variable_payload_bytes)
             .then_with(|| left.total_loss_units.cmp(&right.total_loss_units))
             .then_with(|| {
                 left.total_regime_cost_nanoseconds
