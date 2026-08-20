@@ -24,19 +24,20 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$script_dir/macos_thermal_guard.sh"
 
-if [[ ${HF2Q_THERMAL_SWIFT_BIN+x} ]]; then
-  echo "HF2Q_THERMAL_SWIFT_BIN is reserved for isolated contract tests" >&2
+if [[ ${HF2Q_THERMAL_SWIFTC_BIN+x} || ${HF2Q_THERMAL_PROBE_BIN+x} \
+  || ${HF2Q_THERMAL_PROBE_SOURCE+x} ]]; then
+  echo "thermal probe overrides are reserved for isolated contract tests" >&2
   exit 2
 fi
-readonly HF2Q_THERMAL_SWIFT_BIN=/usr/bin/swift
+readonly HF2Q_THERMAL_SWIFTC_BIN=/usr/bin/swiftc
 for command in awk caffeinate curl jq lsof pmset rg shasum stat; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
   }
 done
-[[ -x /usr/bin/pgrep && -x "$HF2Q_THERMAL_SWIFT_BIN" ]] || {
-  echo "required system process or thermal probe is unavailable" >&2
+[[ -x /usr/bin/pgrep && -x "$HF2Q_THERMAL_SWIFTC_BIN" ]] || {
+  echo "required system process probe or Swift compiler is unavailable" >&2
   exit 2
 }
 [[ -x "$LLAMA_SERVER_BIN" ]] || {
@@ -136,12 +137,13 @@ stop_server() {
   server_pid=""
 }
 cleanup() {
+  local cleanup_rc=0
   if [[ -n "$thermal_stop_file" ]]; then : >"$thermal_stop_file"; fi
   if [[ -n "$thermal_pid" ]]; then
     kill -TERM "$thermal_pid" 2>/dev/null || true
     wait "$thermal_pid" 2>/dev/null || true
   fi
-  stop_server || true
+  stop_server || cleanup_rc=1
   if [[ -n "$power_pid" ]]; then
     kill -TERM "$power_pid" 2>/dev/null || true
     wait "$power_pid" 2>/dev/null || true
@@ -150,9 +152,21 @@ cleanup() {
     kill -TERM "$caffeinate_pid" 2>/dev/null || true
     wait "$caffeinate_pid" 2>/dev/null || true
   fi
+  thermal_cleanup_probe || cleanup_rc=1
+  return "$cleanup_rc"
 }
-trap cleanup EXIT
+on_exit() {
+  local original_rc=$?
+  trap - EXIT
+  if ! cleanup && ((original_rc == 0)); then
+    original_rc=1
+  fi
+  exit "$original_rc"
+}
+trap on_exit EXIT
 trap 'exit 1' INT TERM
+
+thermal_prepare_probe
 
 actual_binary_sha=$(sha256_file "$LLAMA_SERVER_BIN")
 [[ "$actual_binary_sha" == "$LLAMA_SERVER_SHA256" ]] || {

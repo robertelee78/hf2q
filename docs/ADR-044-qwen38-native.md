@@ -3,6 +3,9 @@
 - Status: Accepted for native text conversion and serving; vision candidate
   is under exact-artifact acceptance
 - Date: 2026-08-16
+- Updated: 2026-08-19 — the short/long release receipt binds a compiled-once
+  Foundation thermal helper, removing per-sample Swift compilation without
+  changing its continuous fair-or-better envelope or cadence limits.
 - Owners: hf2q conversion, quantization, inference, and serving
 
 ## Context
@@ -361,6 +364,17 @@ finalized result, and a continuous fair-or-better thermal envelope. The short
 log snapshot must prove `auto` retained the scalar route before the long AUTO
 request proves Q2 selection. Isolated mlx-native numbers are dependency
 evidence, not hf2q release authority.
+
+The thermal producer compiles `scripts/macos_thermal_probe.swift` once before
+the benchmark and reuses the resulting private executable for every sample.
+The receipt binds the checked-in source digest, `/usr/bin/swiftc` digest, and
+compiled binary digest; the independent verifier rehashes the checked-in
+source. This identity-shape change advances the benchmark summary schema from
+one to two; the enclosing release envelope remains schema one. This replaces
+the prior per-sample `swift -e` launch after protected run `32336641261`
+demonstrated an eight-second telemetry hole under load. It does not widen the
+two-second sampling target, five-second maximum gap, Nominal-start requirement,
+or Fair-only sustained allowance.
 
 Test-ownership RCA (2026-08-18): commit `57d33b92` added three CPU-only GQA-Q2
 policy tests directly to the Metal-owning `kv_cache.rs`. The cross-module GPU

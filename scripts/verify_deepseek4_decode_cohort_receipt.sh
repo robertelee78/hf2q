@@ -42,20 +42,31 @@ jq -e --slurpfile raw "$raw" \
   | ($receipt.benchmark.cohort_ms | sort | ((.[4] + .[5]) / 2)) as $cohort_median
   | ($raw | length) == 1
     and ($summary | del(
+      .schema_version,
       .source_sha,.model_sha256,.mlx_native_version,.raw_sha256,
       .test_log_sha256,.thermal_status,.required_start_state,
       .maximum_measurement_state,.measurement_log_sha256,
       .settle_log_sha256,.settle_seconds,.settle_samples,
+      .thermal_probe,
       .settle_duration_seconds,.settle_sample_interval_seconds,
       .maximum_settle_sample_gap_seconds,.settle_telemetry_gaps,
       .measurement_samples,.measurement_duration_seconds,
       .sample_interval_seconds,.maximum_sample_gap_seconds,
       .non_nominal_measurement_samples,.fair_measurement_samples,
       .over_limit_measurement_samples,.telemetry_gaps
-    )) == $receipt
-    and .schema_version == 1 and .status == "pass"
+    )) == ($receipt | del(.schema_version))
+    and $receipt.schema_version == 1
+    and .schema_version == 2 and .status == "pass"
     and .source_sha == $source_sha and .model_sha256 == $model_sha256
     and .mlx_native_version == "0.10.12"
+    and .thermal_probe.implementation == "compiled-foundation-helper"
+    and .thermal_probe.source_path == "scripts/macos_thermal_probe.swift"
+    and (.thermal_probe.source_sha256 | test("^[0-9a-f]{64}$"))
+    and .thermal_probe.compiler_path == "/usr/bin/swiftc"
+    and (.thermal_probe.compiler_sha256 | test("^[0-9a-f]{64}$"))
+    and (.thermal_probe.compiler_version | type) == "string"
+    and (.thermal_probe.compiler_version | length) > 0
+    and (.thermal_probe.binary_sha256 | test("^[0-9a-f]{64}$"))
     and .artifact_bytes == 107431343168 and .layers == 43 and .lanes == 4
     and .parity == {
       prefix_rows:148,steps:132,final_position:280,final_mod_4:0,
@@ -113,6 +124,12 @@ jq -e --slurpfile raw "$raw" \
     and .non_nominal_measurement_samples == .fair_measurement_samples
     and .settle_telemetry_gaps == 0 and .telemetry_gaps == 0
   ' "$summary" >/dev/null
+
+if [[ "$(sha256_file "$ROOT_DIR/scripts/macos_thermal_probe.swift")" != \
+  "$(jq -er .thermal_probe.source_sha256 "$summary")" ]]; then
+  echo "decode-cohort receipt thermal-probe source digest mismatch" >&2
+  exit 1
+fi
 
 grep -Fq 'official_artifact_b4_decode_body_is_exact_and_measured ... ok' "$test_log"
 grep -Fq 'exact_state_logits_cache_recurrent=true' "$test_log"

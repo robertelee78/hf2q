@@ -3,29 +3,16 @@
 # Shared macOS thermal-state helpers for calibrated hardware gates. This file
 # is sourced by release scripts and intentionally performs no work on import.
 
-thermal_read_state() {
-  local swift_bin=${HF2Q_THERMAL_SWIFT_BIN:-/usr/bin/swift}
-  local state
+_HF2Q_THERMAL_GUARD_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+THERMAL_PROBE_BIN=""
+THERMAL_PROBE_OWNED_DIR=""
+THERMAL_PROBE_SOURCE=""
+THERMAL_PROBE_COMPILER=""
+THERMAL_PROBE_COMPILER_VERSION=""
 
-  [[ -x "$swift_bin" ]] || {
-    echo "thermal-state probe is not executable: $swift_bin" >&2
-    return 1
-  }
-  state=$(
-    "$swift_bin" -e '
-      import Foundation
-      switch ProcessInfo.processInfo.thermalState {
-      case .nominal: print("nominal")
-      case .fair: print("fair")
-      case .serious: print("serious")
-      case .critical: print("critical")
-      @unknown default: print("unknown")
-      }
-    ' 2>/dev/null
-  ) || {
-    echo "failed to read macOS thermal state" >&2
-    return 1
-  }
+thermal_validate_state() {
+  local state=$1
+
   case "$state" in
     nominal|fair|serious|critical) ;;
     *)
@@ -33,6 +20,121 @@ thermal_read_state() {
       return 1
       ;;
   esac
+}
+
+thermal_prepare_probe() {
+  local swiftc_bin=${HF2Q_THERMAL_SWIFTC_BIN:-/usr/bin/swiftc}
+  local probe_source=${HF2Q_THERMAL_PROBE_SOURCE:-$_HF2Q_THERMAL_GUARD_DIR/macos_thermal_probe.swift}
+  local probe_dir
+  local probe_bin
+  local compiler_version
+  local compile_error
+  local state
+
+  if [[ -n "$THERMAL_PROBE_BIN" ]]; then
+    [[ -x "$THERMAL_PROBE_BIN" ]] || {
+      echo "prepared thermal-state probe is not executable: $THERMAL_PROBE_BIN" >&2
+      return 1
+    }
+    return 0
+  fi
+  if [[ -n ${HF2Q_THERMAL_PROBE_BIN:-} ]]; then
+    [[ -x "$HF2Q_THERMAL_PROBE_BIN" ]] || {
+      echo "thermal-state probe is not executable: $HF2Q_THERMAL_PROBE_BIN" >&2
+      return 1
+    }
+    probe_bin=$HF2Q_THERMAL_PROBE_BIN
+    probe_source=""
+    swiftc_bin=""
+  else
+    [[ -x "$swiftc_bin" ]] || {
+      echo "thermal-state compiler is not executable: $swiftc_bin" >&2
+      return 1
+    }
+    [[ -f "$probe_source" ]] || {
+      echo "thermal-state probe source is missing: $probe_source" >&2
+      return 1
+    }
+    compiler_version=$("$swiftc_bin" --version 2>&1) || {
+      echo "failed to identify macOS thermal-state compiler" >&2
+      return 1
+    }
+    [[ -n "$compiler_version" ]] || {
+      echo "macOS thermal-state compiler returned an empty version" >&2
+      return 1
+    }
+    probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/hf2q-thermal-probe.XXXXXX") || {
+      echo "failed to create private thermal-state probe directory" >&2
+      return 1
+    }
+    probe_bin="$probe_dir/macos-thermal-probe"
+    if ! compile_error=$("$swiftc_bin" -O -whole-module-optimization \
+      -o "$probe_bin" "$probe_source" 2>&1); then
+      rm -f -- "$probe_bin"
+      rmdir -- "$probe_dir" 2>/dev/null || true
+      echo "failed to compile macOS thermal-state probe" >&2
+      [[ -z "$compile_error" ]] || printf '%s\n' "$compile_error" >&2
+      return 1
+    fi
+    [[ -x "$probe_bin" ]] || {
+      rm -f -- "$probe_bin"
+      rmdir -- "$probe_dir" 2>/dev/null || true
+      echo "compiled thermal-state probe is not executable: $probe_bin" >&2
+      return 1
+    }
+  fi
+  state=$("$probe_bin" 2>/dev/null) || {
+    if [[ -n ${probe_dir:-} ]]; then
+      rm -f -- "$probe_bin"
+      rmdir -- "$probe_dir" 2>/dev/null || true
+    fi
+    echo "failed to read macOS thermal state" >&2
+    return 1
+  }
+  if ! thermal_validate_state "$state"; then
+    if [[ -n ${probe_dir:-} ]]; then
+      rm -f -- "$probe_bin"
+      rmdir -- "$probe_dir" 2>/dev/null || true
+    fi
+    return 1
+  fi
+  THERMAL_PROBE_BIN=$probe_bin
+  THERMAL_PROBE_OWNED_DIR=${probe_dir:-}
+  THERMAL_PROBE_SOURCE=${probe_source:-}
+  THERMAL_PROBE_COMPILER=${swiftc_bin:-}
+  THERMAL_PROBE_COMPILER_VERSION=${compiler_version:-}
+}
+
+thermal_cleanup_probe() {
+  if [[ -n "$THERMAL_PROBE_OWNED_DIR" ]]; then
+    [[ "$THERMAL_PROBE_BIN" == "$THERMAL_PROBE_OWNED_DIR/macos-thermal-probe" ]] || {
+      echo "refusing to clean mismatched thermal-state probe path" >&2
+      return 1
+    }
+    rm -f -- "$THERMAL_PROBE_BIN" || return 1
+    rmdir -- "$THERMAL_PROBE_OWNED_DIR" || return 1
+  fi
+  THERMAL_PROBE_BIN=""
+  THERMAL_PROBE_OWNED_DIR=""
+  # These exported-by-source globals are consumed by receipt producers after
+  # prepare and deliberately cleared here; this helper cannot see those reads.
+  # shellcheck disable=SC2034
+  THERMAL_PROBE_SOURCE=""
+  # shellcheck disable=SC2034
+  THERMAL_PROBE_COMPILER=""
+  # shellcheck disable=SC2034
+  THERMAL_PROBE_COMPILER_VERSION=""
+}
+
+thermal_read_state() {
+  local state
+
+  thermal_prepare_probe || return 1
+  state=$("$THERMAL_PROBE_BIN" 2>/dev/null) || {
+    echo "failed to read macOS thermal state" >&2
+    return 1
+  }
+  thermal_validate_state "$state" || return 1
   THERMAL_STATE=$state
 }
 

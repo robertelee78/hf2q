@@ -25,8 +25,11 @@ crate_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 binary_sha=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 model_sha=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 thermal_probe_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+thermal_probe_compiler_sha=abababababababababababababababababababababababababababababababab
+thermal_probe_compiler_version='Apple Swift version 6.2 (synthetic)'
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+thermal_probe_source_sha=$(sha256_file "$root_dir/scripts/macos_thermal_probe.swift")
 
 build_fixture() {
   local destination=$1
@@ -283,7 +286,10 @@ build_fixture() {
     --arg request_sha256 "$request_sha" --arg semantic_sha256 "$semantic_sha" \
     --arg short_request_sha256 "$short_request_sha" \
     --arg short_semantic_sha256 "$short_semantic_sha" \
-    --arg thermal_probe_sha256 "$thermal_probe_sha" \
+    --arg thermal_probe_binary_sha256 "$thermal_probe_sha" \
+    --arg thermal_probe_source_sha256 "$thermal_probe_source_sha" \
+    --arg thermal_probe_compiler_sha256 "$thermal_probe_compiler_sha" \
+    --arg thermal_probe_compiler_version "$thermal_probe_compiler_version" \
     --argjson off_mean "$off_mean" --argjson auto_mean "$auto_mean" \
     --argjson off_spread_percent "$off_spread_percent" \
     --argjson auto_spread_percent "$auto_spread_percent" \
@@ -299,7 +305,7 @@ build_fixture() {
     --slurpfile trial2 "$benchmark_dir/trial-2-auto/trial.json" \
     --slurpfile trial3 "$benchmark_dir/trial-3-auto/trial.json" \
     --slurpfile trial4 "$benchmark_dir/trial-4-off/trial.json" '
-    {schema_version:1,status:"pass",benchmark:"qwen38-long-decode-gqa-q2",
+    {schema_version:2,status:"pass",benchmark:"qwen38-long-decode-gqa-q2",
      identity:{source_sha:$source_sha,crate_sha256:$crate_sha256,
        binary:{path:"/sealed/hf2q",sha256:$binary_sha256,file_identity:"1:2"},
        model:{id:"Qwen3.8 27B",path:"/models/qwen38.gguf",
@@ -313,7 +319,13 @@ build_fixture() {
        short_request:{path:"short-request.json",sha256:$short_request_sha256},
        hardware:{model:"Mac16,1",chip:"Apple M5 Max",arch:"arm64",
          memory_bytes:137438953472,os_version:"26.0",
-         thermal_probe:{path:"/usr/bin/swift",sha256:$thermal_probe_sha256}}},
+         thermal_probe:{implementation:"compiled-foundation-helper",
+           source_path:"scripts/macos_thermal_probe.swift",
+           source_sha256:$thermal_probe_source_sha256,
+           compiler_path:"/usr/bin/swiftc",
+           compiler_sha256:$thermal_probe_compiler_sha256,
+           compiler_version:$thermal_probe_compiler_version,
+           binary_sha256:$thermal_probe_binary_sha256}}},
      settings:{temperature:0,max_tokens:512,short_max_tokens:512,
        stream:false,thinking:false,
        repetition_penalty:1.0,min_prompt_tokens:100000,max_prompt_tokens:120000,
@@ -421,6 +433,57 @@ valid="$tmp/valid"
 build_fixture "$valid"
 bash "$verifier" release "$valid" "$source_sha" "$crate_sha" \
   "$binary_sha" "$model_sha"
+
+wrong_probe_source="$tmp/wrong-probe-source"
+cp -R "$valid" "$wrong_probe_source"
+jq '.identity.hardware.thermal_probe.source_sha256 =
+  "0000000000000000000000000000000000000000000000000000000000000000"' \
+  "$wrong_probe_source/benchmark/summary.json" \
+  >"$wrong_probe_source/benchmark/summary.tmp"
+mv "$wrong_probe_source/benchmark/summary.tmp" \
+  "$wrong_probe_source/benchmark/summary.json"
+printf '%s  summary.json\n' \
+  "$(sha256_file "$wrong_probe_source/benchmark/summary.json")" \
+  >"$wrong_probe_source/benchmark/summary.json.sha256"
+expect_benchmark_rejected "$wrong_probe_source" wrong-thermal-probe-source
+
+wrong_probe_compiler="$tmp/wrong-probe-compiler"
+cp -R "$valid" "$wrong_probe_compiler"
+jq '.identity.hardware.thermal_probe.compiler_path = "/tmp/swiftc"' \
+  "$wrong_probe_compiler/benchmark/summary.json" \
+  >"$wrong_probe_compiler/benchmark/summary.tmp"
+mv "$wrong_probe_compiler/benchmark/summary.tmp" \
+  "$wrong_probe_compiler/benchmark/summary.json"
+printf '%s  summary.json\n' \
+  "$(sha256_file "$wrong_probe_compiler/benchmark/summary.json")" \
+  >"$wrong_probe_compiler/benchmark/summary.json.sha256"
+expect_benchmark_rejected "$wrong_probe_compiler" wrong-thermal-probe-compiler
+
+missing_probe_binary="$tmp/missing-probe-binary"
+cp -R "$valid" "$missing_probe_binary"
+jq 'del(.identity.hardware.thermal_probe.binary_sha256)' \
+  "$missing_probe_binary/benchmark/summary.json" \
+  >"$missing_probe_binary/benchmark/summary.tmp"
+mv "$missing_probe_binary/benchmark/summary.tmp" \
+  "$missing_probe_binary/benchmark/summary.json"
+printf '%s  summary.json\n' \
+  "$(sha256_file "$missing_probe_binary/benchmark/summary.json")" \
+  >"$missing_probe_binary/benchmark/summary.json.sha256"
+expect_benchmark_rejected "$missing_probe_binary" missing-thermal-probe-binary
+
+stale_probe_shape="$tmp/stale-probe-shape"
+cp -R "$valid" "$stale_probe_shape"
+jq '.schema_version = 1 | .identity.hardware.thermal_probe =
+  {path:"/usr/bin/swift",sha256:
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}' \
+  "$stale_probe_shape/benchmark/summary.json" \
+  >"$stale_probe_shape/benchmark/summary.tmp"
+mv "$stale_probe_shape/benchmark/summary.tmp" \
+  "$stale_probe_shape/benchmark/summary.json"
+printf '%s  summary.json\n' \
+  "$(sha256_file "$stale_probe_shape/benchmark/summary.json")" \
+  >"$stale_probe_shape/benchmark/summary.json.sha256"
+expect_benchmark_rejected "$stale_probe_shape" stale-thermal-probe-schema
 
 seeded="$tmp/seeded"
 build_fixture "$seeded" 1

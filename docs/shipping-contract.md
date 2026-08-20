@@ -116,6 +116,15 @@ starting the hardware gate. Cancellation terminates that scoped group, so an
 in-flight compiler, model runtime, and power helpers cannot survive a canceled
 job as orphan processes.
 
+Calibrated macOS gates compile the checked-in Foundation thermal-state helper
+once before any model load and reuse that executable for every observation.
+They must not launch the Swift interpreter/compiler inside the sampling loop.
+The helper source, compiler, executable result, and returned state are
+validated fail-closed; cleanup may remove only the exact private probe path.
+This implementation rule preserves the existing two-second measurement
+cadence, five-second maximum gap, and eight-second settle-gap limit. It does
+not authorize a wider thermal envelope or a product-latency SLO change.
+
 | Family | Candidate artifact gate |
 |---|---|
 | Gemma 4 | Fresh-versus-reused bounded output parity at the 4,096 boundary and the non-aligned 8,193-token tail; aggregate cross-slot and installed-state transaction rows remain <=4,096 at both four and eight configured slots; short-SSE/long-prefill overlap; transaction cancellation; existing agentic/cache gate; bounded native object populations. The two four-slot calibrated waves retain the default latency limits, run before the destructive 175K/120K soak, and each require a trailing 60 seconds of Nominal state plus fail-closed two-second sampling through the complete cold/cached/tool-result sequence. The experimental eight-slot correctness/aggregate-cap wave is not a latency SLO, but its 40-second TTFT, 60-second whole-response, and 30-second tool-result functional ceilings are accepted only after the already-loaded eight-slot process receives its own trailing 60-second Nominal settle and continuous full-wave thermal receipt binding all eight cold requests. The transaction cap is not accepted until this passes. |
