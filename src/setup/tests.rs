@@ -12,6 +12,7 @@ use super::host::{
     nearest_existing_directory, require_supported_macos, HostObservation, HostProbe,
 };
 use super::policy::{parse_byte_size, recommended_limit};
+use super::runtime_policy::{authorize_session_cache_policy, SessionCachePolicyAuthorization};
 use super::schema::{
     ConfigV1, ConfiguredShell, HardwareProfileV1, SessionCachePolicyV1, MAX_CONFIG_BYTES,
 };
@@ -1168,4 +1169,134 @@ fn restrictive_umask_cannot_change_owned_file_or_directory_modes() {
     for name in ["config.toml", ".config.toml.lock"] {
         assert_eq!(fs::metadata(root.join(name)).unwrap().mode() & 0o777, 0o600);
     }
+}
+
+#[test]
+fn runtime_session_policy_is_closed_zero_safe_and_read_only() {
+    let temp = TempDir::new().unwrap();
+
+    let absent = test_root(&temp, "absent-runtime-policy");
+    assert!(matches!(
+        authorize_session_cache_policy(&absent).unwrap(),
+        SessionCachePolicyAuthorization::Absent
+    ));
+    assert!(!absent.exists());
+
+    let disabled_root = test_root(&temp, "disabled-runtime-policy");
+    execute_fake(
+        args(&disabled_root, Some(SessionCacheChoice::Off), None),
+        false,
+        "",
+    )
+    .unwrap();
+    let disabled = authorize_session_cache_policy(&disabled_root).unwrap();
+    let SessionCachePolicyAuthorization::Disabled(disabled) = disabled else {
+        panic!("zero must authorize no persistor");
+    };
+    disabled.revalidate().unwrap();
+
+    let enabled_root = test_root(&temp, "enabled-runtime-policy");
+    execute_fake(
+        args(&enabled_root, Some(SessionCacheChoice::On), Some("32GiB")),
+        false,
+        "",
+    )
+    .unwrap();
+    let enabled = authorize_session_cache_policy(&enabled_root).unwrap();
+    let SessionCachePolicyAuthorization::Enabled(enabled) = enabled else {
+        panic!("positive config must mint an enabled authorization");
+    };
+    assert_eq!(enabled.limit_bytes().get(), 32 * GIB);
+    enabled.revalidate().unwrap();
+    let debug = format!("{enabled:?}");
+    assert!(!debug.contains(enabled_root.to_str().unwrap()));
+    assert!(!debug.contains("config.toml"));
+    assert!(!debug.contains(&(32 * GIB).to_string()));
+}
+
+#[test]
+fn runtime_session_policy_fails_closed_on_hostile_or_changed_state() {
+    let temp = TempDir::new().unwrap();
+    let malformed = test_root(&temp, "malformed-runtime-policy");
+    fs::create_dir(&malformed).unwrap();
+    fs::set_permissions(&malformed, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(malformed.join("config.toml"), b"not = [toml\n").unwrap();
+    fs::set_permissions(
+        malformed.join("config.toml"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    assert!(authorize_session_cache_policy(&malformed).is_err());
+    assert!(!malformed.join("cache").exists());
+
+    let root = test_root(&temp, "changed-runtime-policy");
+    execute_fake(
+        args(&root, Some(SessionCacheChoice::On), Some("1GiB")),
+        false,
+        "",
+    )
+    .unwrap();
+    let authorization = authorize_session_cache_policy(&root).unwrap();
+    let SessionCachePolicyAuthorization::Enabled(authorization) = authorization else {
+        panic!("positive config must mint an enabled authorization");
+    };
+    let replacement = root.join("replacement.toml");
+    fs::copy(root.join("config.toml"), &replacement).unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::rename(&replacement, root.join("config.toml")).unwrap();
+    assert!(authorization.revalidate().is_err());
+
+    let root = test_root(&temp, "changed-runtime-session-directory");
+    execute_fake(
+        args(&root, Some(SessionCacheChoice::On), Some("1GiB")),
+        false,
+        "",
+    )
+    .unwrap();
+    let authorization = authorize_session_cache_policy(&root).unwrap();
+    let SessionCachePolicyAuthorization::Enabled(authorization) = authorization else {
+        panic!("positive config must mint an enabled authorization");
+    };
+    fs::rename(root.join("cache/sessions"), root.join("retained-sessions")).unwrap();
+    fs::create_dir(root.join("cache/sessions")).unwrap();
+    fs::set_permissions(
+        root.join("cache/sessions"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert!(authorization.revalidate().is_err());
+
+    let root = test_root(&temp, "changed-runtime-installation-identity");
+    crate::distribution::bootstrap_setup_test_identity(&root).unwrap();
+    execute_fake(args(&root, Some(SessionCacheChoice::Off), None), false, "").unwrap();
+    let authorization = authorize_session_cache_policy(&root).unwrap();
+    let SessionCachePolicyAuthorization::Disabled(authorization) = authorization else {
+        panic!("zero must mint only a disabled authorization");
+    };
+    let identity = root.join("update/installation-identity.json");
+    let replacement = root.join("update/replacement-identity.json");
+    fs::copy(&identity, &replacement).unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::rename(&replacement, &identity).unwrap();
+    assert!(authorization.revalidate().is_err());
+}
+
+#[test]
+fn runtime_session_policy_retains_no_writable_regular_file_descriptors() {
+    let temp = TempDir::new().unwrap();
+    let root = test_root(&temp, "read-only-runtime-policy");
+    crate::distribution::bootstrap_setup_test_identity(&root).unwrap();
+    execute_fake(
+        args(&root, Some(SessionCacheChoice::On), Some("1GiB")),
+        false,
+        "",
+    )
+    .unwrap();
+    let authorization = authorize_session_cache_policy(&root).unwrap();
+    let SessionCachePolicyAuthorization::Enabled(authorization) = authorization else {
+        panic!("positive config must mint an enabled authorization");
+    };
+    assert!(authorization
+        .retained_regular_files_are_read_only_for_test()
+        .unwrap());
 }

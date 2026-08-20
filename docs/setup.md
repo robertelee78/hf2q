@@ -73,8 +73,19 @@ barriers.
 
 ## Current boundary
 
-This release records policy but does not yet connect it to the serving cache.
-That is intentional: the existing legacy persistence implementation interprets
-zero as unlimited, while this config reserves zero exclusively for disabled.
-The later bridge must construct no persistor for zero and use the fixed
-`<state-root>/cache/sessions` path plus the positive configured byte limit.
+The setup-owned read boundary can now reopen this policy without mutation. It
+returns an explicit absent decision when no config exists, a disabled proof for
+zero, or a descriptor-bound nonzero proof for a positive limit. The proof
+retains and can revalidate the exact state root, optional installation identity,
+config bytes/inode, and private `cache/sessions` directories; malformed or
+changed state is an error, never a fallback to unlimited.
+Every retained regular-file descriptor is read-only, including the optional
+installation-identity and lock inodes; this boundary acquires no lock and
+retains no write authority.
+
+Serving does not consume that proof yet. The existing legacy persistence
+implementations interpret zero as unlimited and enforce only per-store soft
+budgets, so they are intentionally not wired to it. The later managed store
+must use the fixed `<state-root>/cache/sessions` authority, one aggregate hard
+cap, and a pre-write free-space guard before this recorded policy becomes
+active.

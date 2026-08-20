@@ -1,6 +1,8 @@
 mod fs;
 mod host;
 mod policy;
+#[allow(dead_code)]
+pub(crate) mod runtime_policy;
 mod schema;
 
 use std::io::{BufRead, IsTerminal, Write};
@@ -15,7 +17,7 @@ use self::policy::{format_bytes, recommended_limit, resolve_policy, PolicyResolu
 use self::schema::ConfigV1;
 
 #[derive(Debug, Error)]
-pub(super) enum SetupError {
+pub(crate) enum SetupError {
     #[error("setup input: {0}")]
     Input(String),
     #[error("setup host inventory: {0}")]

@@ -405,10 +405,26 @@ pub(super) fn open_private_regular_file(
     open_regular_file_with_mode(parent, name, 0o600)
 }
 
+pub(super) fn open_private_regular_file_read_only(
+    parent: &Directory,
+    name: &str,
+) -> Result<(File, EntryIdentity), InstallStateError> {
+    open_regular_file_with_mode_and_access(parent, name, 0o600, OFlags::RDONLY)
+}
+
 pub(super) fn open_regular_file_with_mode(
     parent: &Directory,
     name: &str,
     expected_mode: u32,
+) -> Result<(File, EntryIdentity), InstallStateError> {
+    open_regular_file_with_mode_and_access(parent, name, expected_mode, OFlags::RDWR)
+}
+
+fn open_regular_file_with_mode_and_access(
+    parent: &Directory,
+    name: &str,
+    expected_mode: u32,
+    access: OFlags,
 ) -> Result<(File, EntryIdentity), InstallStateError> {
     validate_component(name)?;
     let named = fs::statat(parent.fd(), name, AtFlags::SYMLINK_NOFOLLOW)
@@ -417,7 +433,7 @@ pub(super) fn open_regular_file_with_mode(
     let fd = fs::openat(
         parent.fd(),
         name,
-        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|error| InstallStateError::io("open private regular file", error))?;

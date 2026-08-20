@@ -163,6 +163,20 @@ pub(super) fn ensure_directory(parent: &Directory, name: &str) -> Result<Directo
     Ok(directory)
 }
 
+#[allow(dead_code)]
+pub(super) fn open_existing_directory(
+    parent: &Directory,
+    name: &str,
+) -> Result<Directory, SetupError> {
+    let directory = open_directory(parent, name, true)?;
+    if directory.stat.st_dev != parent.stat.st_dev {
+        return Err(SetupError::Filesystem(
+            "setup directory crosses the state-root filesystem".to_owned(),
+        ));
+    }
+    Ok(directory)
+}
+
 fn finish_created_directory(parent: &Directory, name: &str) -> Result<Directory, SetupError> {
     let created = fs::statat(parent.fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| io_error("inspect newly created setup directory", error))?;

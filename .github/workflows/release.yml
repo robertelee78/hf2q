@@ -889,6 +889,8 @@ jobs:
                 src/distribution/install_state/identity || true
             )"
             test -z "$unexpected_identity_deletion"
+            test "$(grep -Fc 'open_private_regular_file_read_only(&update, LOCK_FILE)' src/distribution/install_state/identity.rs)" = 1
+            test "$(grep -Fc 'pub(super) fn open_private_regular_file_read_only' src/distribution/install_state/unix.rs)" = 1
             unexpected_transport_extraction="$(
               grep -RInE --include='*.rs' --exclude='tests.rs' \
                 'ReleaseExtractionStage|PostReplayExtraction|ExtractedRelease|extract_release|with_locked_extraction' \
@@ -977,7 +979,7 @@ jobs:
             unexpected_setup_authority="$(
               grep -nE \
                 'hf_hub|reqwest|hyper|tokio::net|std::net|std::process|Command::new|crate::(models|convert|quantize|serve)|calibration|bootstrap_installation_identity|update_auth|update_transport|remove_dir|remove_file' \
-                src/setup/mod.rs src/setup/schema.rs src/setup/host.rs src/setup/policy.rs || true
+                src/setup/mod.rs src/setup/schema.rs src/setup/host.rs src/setup/policy.rs src/setup/runtime_policy.rs || true
             )"
             test -z "$unexpected_setup_authority"
             unexpected_setup_file_authority="$(
@@ -1133,6 +1135,7 @@ jobs:
               src/setup/schema.rs \
               src/setup/host.rs \
               src/setup/policy.rs \
+              src/setup/runtime_policy.rs \
               src/setup/fs.rs \
               src/setup/fs/unix.rs \
               src/setup/tests.rs \
@@ -1168,6 +1171,9 @@ jobs:
               setup::tests::stale_prompt_snapshot_and_partial_prefix_replacement_fail_closed \
               setup::tests::installation_identity_appearance_or_replacement_during_setup_is_rejected \
               setup::tests::sigabrt_at_every_publication_barrier_recovers_in_a_fresh_process \
+              setup::tests::runtime_session_policy_is_closed_zero_safe_and_read_only \
+              setup::tests::runtime_session_policy_fails_closed_on_hostile_or_changed_state \
+              setup::tests::runtime_session_policy_retains_no_writable_regular_file_descriptors \
               input::hf_reference_tests::equivalent_model_references_share_one_canonical_identity \
               input::hf_download_plan_tests::file_specific_resolution_fails_before_any_hub_lookup \
               input::hf_download_plan_tests::repository_info_seals_a_mutable_request_to_the_returned_exact_commit \

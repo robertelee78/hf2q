@@ -335,6 +335,21 @@ impl DurableInstallationIdentity {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(in crate::distribution) fn retained_regular_files_are_read_only_for_test(
+        &self,
+    ) -> Result<bool, InstallStateError> {
+        for file in [&self.lock_file, &self.file] {
+            let flags = rustix::fs::fcntl_getfl(file).map_err(|error| {
+                InstallStateError::io("inspect retained installation-identity descriptor", error)
+            })?;
+            if flags.intersects(rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::RDWR) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) fn authorization(&self) -> &ExplicitRootAuthorization {
         &self.authorization
     }
@@ -533,7 +548,7 @@ fn open_bound(
     )?;
     let record = InstallationIdentityV1::parse_and_validate(&bytes)?;
     require_record_binding(&record, &authorization, expected_id)?;
-    let (lock_file, lock_identity) = unix::open_private_regular_file(&update, LOCK_FILE)?;
+    let (lock_file, lock_identity) = unix::open_private_regular_file_read_only(&update, LOCK_FILE)?;
     Ok(DurableInstallationIdentity {
         authorization,
         root,

@@ -26,7 +26,10 @@
   payload transfer plus offline recipe-bound source reauthentication and the
   recipe-owned paired text/projector conversion boundary plus crash-durable
   retained-source pair-receipt and prepared-profile registration are also
-  reconciled;
+  reconciled; the setup-owned read-only session-policy authorization maps an
+  absent config to no policy, zero only to disabled, and positive bytes only
+  to a retained descriptor-bound `NonZeroU64` proof without constructing a
+  persistor;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install and remaining onboarding composition, and exact-artifact
@@ -49,8 +52,9 @@ workflow:
 - the README starts with a Rust checkout and release build;
 - the GitHub release workflow publishes the crate and checksum, but no
   end-user Apple Silicon bundle;
-- the CLI now has the bounded first-run setup producer specified below, but
-  still has no public self-update command or setup-to-runtime cache bridge;
+- the CLI now has the bounded first-run setup producer and a dormant read-only
+  typed session-policy authorization, but still has no public self-update
+  command or serving-cache consumer;
 - remote conversion now has a native immutable-reference/download boundary,
   a checked-in exact Qwen3.8 preparation recipe, the recipe-owned paired
   conversion, and a durable calibration-pending prepared-profile commit, but
@@ -1614,11 +1618,26 @@ Setup records stable hardware facts for the future coordinator to rank
 accepted model candidates, but does not pretend to calibrate inference before
 a model exists. Exact runtime
 calibration occurs only after conversion or a requested published GGUF has
-been acquired. This landed setup slice is deliberately an inert config
-producer: the server does not consume this policy yet. The later session bridge
-must map zero to no persistor and positive values to the fixed
-`<state-root>/cache/sessions` budget; the current legacy zero/unset path means
-unlimited and therefore must not be wired directly.
+been acquired. The landed setup-owned read boundary reopens the selected root,
+optional installation identity, exact `config.toml` inode and bytes, and the
+private `cache/sessions` directories without creating or mutating anything.
+Missing config returns an explicit absent decision; zero returns only a
+disabled authorization; a positive value is converted immediately to
+`NonZeroU64` and returned only inside a non-cloneable, Debug-redacted
+authorization that retains those exact filesystem and identity proofs. Every
+revalidation repeats the root, identity, config-byte/inode, and session-
+directory bindings. Malformed, future, unsafe, or changed state is an error and
+can never become disabled or unlimited by fallback.
+Every regular file retained by this dormant authorization, including the
+installation-identity file and its namespace-binding lock inode, is opened
+read-only. It retains no writable file descriptor or lock ownership.
+
+This remains deliberately inert: the server does not call this authorization
+and it cannot construct a persistor or expose a cache path/descriptor. The
+later serving bridge must consume it into one fixed
+`<state-root>/cache/sessions` aggregate budget with pre-admission free-space
+enforcement; the current legacy zero/unset path means unlimited and therefore
+must not be wired directly.
 
 Directory creation uses a bounded parent-relative `mkdirat`/`statat`/`chmodat`
 normalization only because macOS cannot descriptor-open a mode-`0000`
@@ -2356,17 +2375,21 @@ before public self-update ships.
    has also landed: it inventories the selected Apple-Silicon host and state-
    root filesystem, records the bounded zero-disabled session policy, and
    crash-durably publishes the inert canonical TOML without creating
-   installation identity or granting persistence authority. Every schema lands
-   with bounded hostile input and
+   installation identity or granting persistence authority. Its read-only
+   runtime-policy authorization has also landed: absent and zero remain closed
+   no-persistor states, while a positive limit mints only a retained
+   descriptor-bound `NonZeroU64` proof. It is still dormant and grants no
+   cache-construction authority. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated
    or ownership-verified capability.
    Before uninstall implementation, freeze and adversarially test its separate
    bounded journal schema and recovery state machine; activation receipts stay
    immutable.
 2. Compose the standalone installer with the unified `~/.hf2q` state layout
-   and idempotent Bash/zsh PATH ownership, then bridge the already-landed setup
-   policy into session persistence only after zero is proven to construct no
-   persistor and invalid input cannot become unlimited.
+   and idempotent Bash/zsh PATH ownership, then consume the already-landed
+   typed setup authorization into session persistence only after the managed
+   store proves one aggregate hard cap, pre-write free-space enforcement,
+   crash-safe descriptor-relative mutation, and exact SerialFifo replay.
 3. Converge conversion on the exact-revision native downloader, add positional
    canonical model references, the accepted Qwen3.8 quantization/profile
    matrix, source-retention transaction, and receipt-bound text/projector
