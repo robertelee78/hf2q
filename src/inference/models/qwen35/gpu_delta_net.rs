@@ -88,9 +88,7 @@ use mlx_native::ops::gated_delta_net::{
 use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode;
 use mlx_native::ops::l2_norm::dispatch_l2_norm;
 use mlx_native::ops::qkv_split::{dispatch_qkv_split_f32, QkvSplitParams};
-use mlx_native::ops::quantized_matmul_ggml::{
-    quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
-};
+use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::repeat_tiled::{dispatch_repeat_tiled_f32, RepeatTiledParams};
 use mlx_native::ops::rms_norm;
 use mlx_native::ops::ssm_conv::{dispatch_ssm_conv, dispatch_ssm_conv_with_capture, SsmConvParams};
@@ -101,6 +99,7 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
 use super::encoder_stage::LayerEncoder;
+use super::execution_dispatch::quantized_matmul_ggml;
 use super::gpu_full_attn::{download_f32, upload_f32, upload_f32_weight, upload_q4_0_from_f32};
 use crate::debug::INVESTIGATION_ENV;
 use crate::serve::multi_seq_kv::SlotId;
@@ -133,7 +132,7 @@ pub const CHUNK_THRESHOLD: u32 = 64;
 ///
 /// All four must hold; any single failure routes to the autoregressive path.
 fn chunk_path_eligible(seq_len: u32, d_k: u32) -> bool {
-    INVESTIGATION_ENV.chunk_scan_prefill
+    super::execution_dispatch::chunk_scan_prefill_enabled(INVESTIGATION_ENV.chunk_scan_prefill)
         && seq_len > CHUNK_THRESHOLD
         && seq_len % mlx_native::ops::chunk_gated_delta_rule::FIXED_BT == 0
         && (d_k == mlx_native::ops::chunk_gated_delta_rule::MAX_K // 128

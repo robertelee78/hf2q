@@ -65,9 +65,7 @@ use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F3
 use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
-use mlx_native::ops::quantized_matmul_ggml::{
-    quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
-};
+use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::quantized_matmul_id_ggml::{
     quantized_matmul_id_ggml_pooled, GgmlQuantizedMatmulIdParams,
 };
@@ -75,6 +73,13 @@ use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use crate::serve::forward_mlx_shared::MlxAffineMoeStack;
+
+use super::execution_dispatch::{
+    dense_gate_up_fusion_enabled, dense_q_arena_reset_enabled,
+    dispatch_fused_gate_up_silu_iq4_nl, dispatch_fused_gate_up_silu_q4_k,
+    dispatch_fused_gate_up_silu_q5_k, dispatch_fused_gate_up_silu_q6_k,
+    dispatch_fused_gate_up_silu_q8_0, quantized_matmul_ggml,
+};
 
 /// ADR-020 AC#5 Iter C2.4 #4 — single-call dispatch wrapper that routes
 /// per-MoE-role expert matmuls between the legacy GGML pooled path
@@ -1107,7 +1112,7 @@ pub fn build_dense_ffn_layer_gpu_q_into(
     // default path the pooled variant captures the W-5b.13 audit's projected
     // ~30–40% allocation-churn savings at prefill (closed by the per-layer
     // `decode_pool::reset_for_prefill_chunk()` call site in forward_gpu_impl).
-    if std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() == Ok("0") {
+    if !dense_q_arena_reset_enabled() {
         let h = weights.hidden_size;
         let seq_len = (x.element_count() / h as usize) as u32;
         if seq_len == 1 {
@@ -1259,10 +1264,6 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     // across mv calls; the mv kernel's higher occupancy outweighs
     // explicit mat-mat shmem tile reuse. Default-ON correctly stays
     // at all seq lengths for this kernel.
-    let fused_off = matches!(
-        std::env::var("HF2Q_FUSED_GATE_UP_SILU").as_deref(),
-        Ok("0") | Ok("false") | Ok("off"),
-    );
     // ADR-034 task #93 cont. 25 (2026-05-21) — Q4_K added to fused dispatch.
     // Parity tests (mlx-native adr_034_task93_fused_gate_up_silu_q4_K_parity)
     // 3/3 PASS at m∈{1,2,4} — byte-identical to unfused at 1e-5 F32 tolerance.
@@ -1289,13 +1290,14 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         mlx_native::ops::quantized_matmul_ggml::GgmlType::Q6_K
     );
     let fused_eligible =
-        (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q5_k || fused_q6_k) && !fused_off;
+        (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q5_k || fused_q6_k)
+            && dense_gate_up_fusion_enabled();
     if fused_eligible {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,
         );
         if fused_iq4_nl {
-            mlx_native::ops::fused_gate_up_silu_iq4_nl::dispatch_fused_gate_up_silu_iq4_nl(
+            dispatch_fused_gate_up_silu_iq4_nl(
                 enc,
                 registry,
                 device,
@@ -1311,7 +1313,7 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
             )
             .context("dense_q fused gate_up_silu_mul IQ4_NL")?;
         } else if fused_q5_k {
-            mlx_native::ops::fused_gate_up_silu_q5_K::dispatch_fused_gate_up_silu_q5_K(
+            dispatch_fused_gate_up_silu_q5_k(
                 enc,
                 registry,
                 device,
@@ -1327,7 +1329,7 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
             )
             .context("dense_q fused gate_up_silu_mul Q5_K")?;
         } else if fused_q6_k {
-            mlx_native::ops::fused_gate_up_silu_q6_K::dispatch_fused_gate_up_silu_q6_K(
+            dispatch_fused_gate_up_silu_q6_k(
                 enc,
                 registry,
                 device,
@@ -1343,7 +1345,7 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
             )
             .context("dense_q fused gate_up_silu_mul Q6_K")?;
         } else if fused_q4_k {
-            mlx_native::ops::fused_gate_up_silu_q4_K::dispatch_fused_gate_up_silu_q4_K(
+            dispatch_fused_gate_up_silu_q4_k(
                 enc,
                 registry,
                 device,
@@ -1359,7 +1361,7 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
             )
             .context("dense_q fused gate_up_silu_mul Q4_K")?;
         } else {
-            mlx_native::ops::fused_gate_up_silu_q8_0::dispatch_fused_gate_up_silu_q8_0(
+            dispatch_fused_gate_up_silu_q8_0(
                 enc,
                 registry,
                 device,

@@ -126,6 +126,7 @@ pub fn load_f32_tensor(gguf: &GgufFile, name: &str, device: &MlxDevice) -> Resul
     let slice: &[f32] = buf
         .as_slice()
         .map_err(|e| anyhow!("as_slice({name}): {e}"))?;
+    super::execution_observation::observe_loaded_f32(name, slice)?;
     Ok(slice.to_vec())
 }
 
@@ -150,6 +151,7 @@ fn load_tensor_with_residency(
         .map_err(|e| anyhow!("load_tensor({name}): {e}"))?;
     super::weight_pool::register_weight_buffer(device, &buf)
         .map_err(|e| anyhow!("register_weight_buffer({name}): {e}"))?;
+    super::execution_observation::observe_loaded_ggml(name, &buf)?;
     Ok(buf)
 }
 
@@ -747,6 +749,7 @@ impl Qwen35Model {
             output_weight,
             output_norm,
             mtp: None,
+            loaded_candidate_identity: None,
         })
     }
 }

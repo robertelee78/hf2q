@@ -40,6 +40,7 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::metal::foreign_types::ForeignType;
 use std::sync::OnceLock;
 
 use super::delta_net::DeltaNetLayerShape;
@@ -311,12 +312,28 @@ struct DecodeBuffers {
 /// Cached GPU state for a single forward session (one generate call).
 ///
 /// Weights are uploaded once at session start and reused across all decode
-/// tokens.  The cache is keyed by the raw pointer of the `Qwen35Model`
-/// to detect model swaps.  Since the serve loop runs single-threaded, a
-/// `thread_local` RefCell is safe and avoids making `MlxBuffer` `Send`.
+/// tokens. The ordinary path is keyed by the raw pointer of the
+/// `Qwen35Model`. Evidence-bearing models additionally bind the exact D2b
+/// conversion receipt plus graph/routing configuration so address reuse or
+/// an authority change cannot retain stale uploaded bytes. Since the serve
+/// loop runs single-threaded, a `thread_local` RefCell is safe and avoids
+/// making `MlxBuffer` `Send`.
 struct ForwardGpuCache {
     /// Raw pointer of the model whose weights are cached.
     model_ptr: *const (),
+    /// Exact evidence authority whose weights/configuration produced this
+    /// cache. `None` preserves the legacy non-evidence path.
+    loaded_candidate_identity: Option<(String, String, String)>,
+    /// Exact loaded→cache buffer observations for the evidence-bearing
+    /// candidate. This is byte authority only, not dispatch/cost authority.
+    executed_catalog:
+        Option<std::sync::Arc<super::execution_observation::VerifiedExecutedTensorCatalog>>,
+    trace_weight_slots: Option<
+        std::collections::BTreeMap<
+            usize,
+            super::execution_dispatch::Qwen35TraceWeightSlot,
+        >,
+    >,
     device: MlxDevice,
     registry: KernelRegistry,
     layer_weights: Vec<LayerWeightsGpu>,
@@ -328,6 +345,21 @@ struct ForwardGpuCache {
 // SAFETY: the thread_local cache is only accessed on the thread that owns it.
 // MlxBuffer is not Send but we never move the cache across thread boundaries.
 unsafe impl Send for ForwardGpuCache {}
+
+fn gpu_cache_matches_model(cache: &ForwardGpuCache, model: &Qwen35Model) -> bool {
+    let model_ptr = model as *const _ as *const ();
+    let authority_matches = match (
+        cache.loaded_candidate_identity.as_ref(),
+        model.loaded_candidate_cache_identity(),
+    ) {
+        (None, None) => true,
+        (Some((cached_receipt, cached_graph, cached_routing)), Some((receipt, graph, routing))) => {
+            cached_receipt == receipt && cached_graph == graph && cached_routing == routing
+        }
+        _ => false,
+    };
+    cache.model_ptr == model_ptr && authority_matches
+}
 
 thread_local! {
     static GPU_CACHE: std::cell::RefCell<Option<ForwardGpuCache>> =
@@ -358,6 +390,44 @@ enum FfnWeightsGpu {
     Moe(MoeFfnWeightsGpu),
     /// Quantized MoE (production GGUF load path — no OOM).
     MoeQ(MoeFfnWeightsGpuQ),
+}
+
+fn observe_dense_ffn_cache(
+    builder: &mut super::execution_observation::ExecutedTensorCatalogBuilder<'_>,
+    prefix: &str,
+    loaded: &Qwen35FfnWeights,
+    executed: &FfnWeightsGpu,
+) -> Result<()> {
+    let (Qwen35FfnWeights::DenseQ(loaded), FfnWeightsGpu::DenseQ(executed)) =
+        (loaded, executed)
+    else {
+        anyhow::bail!(
+            "evidence profile requires native-GGML dense FFN weights in every layer"
+        );
+    };
+    builder.add_direct_ggml(
+        &format!("{prefix}.ffn_gate.weight"),
+        &format!("{prefix}.ffn_gate.weight"),
+        &executed.gate_q,
+    )?;
+    builder.add_direct_ggml(
+        &format!("{prefix}.ffn_up.weight"),
+        &format!("{prefix}.ffn_up.weight"),
+        &executed.up_q,
+    )?;
+    builder.add_direct_ggml(
+        &format!("{prefix}.ffn_down.weight"),
+        &format!("{prefix}.ffn_down.weight"),
+        &executed.down_q,
+    )?;
+    anyhow::ensure!(
+        loaded.ggml_type_gate_up == executed.ggml_type_gate_up
+            && loaded.ggml_type_down == executed.ggml_type_down
+            && loaded.hidden_size == executed.hidden_size
+            && loaded.intermediate_size == executed.intermediate_size,
+        "loaded and executed dense FFN metadata differs"
+    );
+    Ok(())
 }
 
 // ================================================================
@@ -1571,6 +1641,268 @@ fn residual_add_gpu(
 // ================================================================
 
 impl Qwen35Model {
+    fn loaded_candidate_trace_weight_slots(
+        &self,
+        layer_weights: &[LayerWeightsGpu],
+        output_head: &OutputHeadGpu,
+    ) -> Result<
+        Option<
+            std::collections::BTreeMap<
+                usize,
+                super::execution_dispatch::Qwen35TraceWeightSlot,
+            >,
+        >,
+    > {
+        if self.loaded_candidate_tensor_catalog().is_none() {
+            return Ok(None);
+        }
+        let mut slots = std::collections::BTreeMap::new();
+        let mut insert = |buffer: &MlxBuffer, operation_id: String| -> Result<()> {
+            let key = buffer.metal_buffer().as_ptr() as usize;
+            let executed_tensor_node_id = format!("executed:{operation_id}");
+            if slots
+                .insert(
+                    key,
+                    super::execution_dispatch::Qwen35TraceWeightSlot {
+                        operation_id,
+                        executed_tensor_node_id,
+                    },
+                )
+                .is_some()
+            {
+                anyhow::bail!("Qwen trace weight buffer is aliased by multiple operation slots");
+            }
+            Ok(())
+        };
+        insert(&output_head.lm_head_q4, "output.weight".into())?;
+        for (layer_index, layer) in layer_weights.iter().enumerate() {
+            let prefix = format!("blk.{layer_index}");
+            let ffn = match layer {
+                LayerWeightsGpu::FullAttn { attn, ffn } => {
+                    insert(&attn.wq, format!("{prefix}.attn_q.q"))?;
+                    insert(&attn.w_gate, format!("{prefix}.attn_q.gate"))?;
+                    insert(&attn.wk, format!("{prefix}.attn_k.weight"))?;
+                    insert(&attn.wv, format!("{prefix}.attn_v.weight"))?;
+                    insert(&attn.wo, format!("{prefix}.attn_output.weight"))?;
+                    ffn
+                }
+                LayerWeightsGpu::LinearAttn { attn, ffn } => {
+                    insert(&attn.attn_qkv, format!("{prefix}.attn_qkv.weight"))?;
+                    insert(&attn.attn_gate, format!("{prefix}.attn_gate.weight"))?;
+                    insert(&attn.ssm_alpha, format!("{prefix}.ssm_alpha.weight"))?;
+                    insert(&attn.ssm_beta, format!("{prefix}.ssm_beta.weight"))?;
+                    insert(&attn.ssm_out, format!("{prefix}.ssm_out.weight"))?;
+                    ffn
+                }
+            };
+            let FfnWeightsGpu::DenseQ(ffn) = ffn else {
+                anyhow::bail!("Qwen evidence profile encountered a non-dense FFN cache");
+            };
+            insert(&ffn.gate_q, format!("{prefix}.ffn_gate.weight"))?;
+            insert(&ffn.up_q, format!("{prefix}.ffn_up.weight"))?;
+            insert(&ffn.down_q, format!("{prefix}.ffn_down.weight"))?;
+        }
+        Ok(Some(slots))
+    }
+
+    fn observe_loaded_candidate_cache(
+        &self,
+        layer_weights: &[LayerWeightsGpu],
+        output_head: &OutputHeadGpu,
+    ) -> Result<
+        Option<std::sync::Arc<super::execution_observation::VerifiedExecutedTensorCatalog>>,
+    > {
+        let Some(loaded) = self.loaded_candidate_tensor_catalog() else {
+            return Ok(None);
+        };
+        let mut builder =
+            super::execution_observation::ExecutedTensorCatalogBuilder::new(loaded);
+        builder.add_cpu_f32("token_embd.weight", "token_embd.weight", &self.token_embd)?;
+        builder.add_gpu_f32(
+            "output_norm.weight",
+            "output_norm.weight",
+            &self.output_norm,
+            &output_head.norm_w,
+        )?;
+        builder.add_amax7_q4(
+            "output.weight",
+            "output.weight",
+            &self.output_weight,
+            &output_head.lm_head_q4,
+        )?;
+        anyhow::ensure!(
+            self.layers.len() == layer_weights.len(),
+            "loaded/cached Qwen layer count differs"
+        );
+        for (layer_index, (loaded_layer, executed_layer)) in self
+            .layers
+            .iter()
+            .zip(layer_weights.iter())
+            .enumerate()
+        {
+            let prefix = format!("blk.{layer_index}");
+            match (loaded_layer, executed_layer) {
+                (
+                    Qwen35LayerWeights::FullAttn { attn, ffn },
+                    LayerWeightsGpu::FullAttn {
+                        attn: executed,
+                        ffn: executed_ffn,
+                    },
+                ) => {
+                    builder.add_gpu_f32(
+                        &format!("{prefix}.attn_norm.weight"),
+                        &format!("{prefix}.attn_norm.weight"),
+                        &attn.attn_norm,
+                        &executed.attn_norm,
+                    )?;
+                    builder.add_gpu_f32(
+                        &format!("{prefix}.post_attention_norm.weight"),
+                        &format!("{prefix}.post_attention_norm.weight"),
+                        &attn.post_attn_norm,
+                        &executed.post_attn_norm,
+                    )?;
+                    builder.add_interleaved_q_gate_amax7(
+                        &format!("{prefix}.attn_q.weight"),
+                        &format!("{prefix}.attn_q.q"),
+                        &format!("{prefix}.attn_q.gate"),
+                        &attn.wq,
+                        &attn.w_gate,
+                        &executed.wq,
+                        &executed.w_gate,
+                        self.cfg.num_attention_heads,
+                        self.cfg.head_dim,
+                        self.cfg.hidden_size,
+                    )?;
+                    builder.add_amax7_q4(
+                        &format!("{prefix}.attn_k.weight"),
+                        &format!("{prefix}.attn_k.weight"),
+                        &attn.wk,
+                        &executed.wk,
+                    )?;
+                    builder.add_amax7_q4(
+                        &format!("{prefix}.attn_v.weight"),
+                        &format!("{prefix}.attn_v.weight"),
+                        &attn.wv,
+                        &executed.wv,
+                    )?;
+                    builder.add_gpu_f32(
+                        &format!("{prefix}.attn_q_norm.weight"),
+                        &format!("{prefix}.attn_q_norm.weight"),
+                        &attn.attn_q_norm,
+                        &executed.attn_q_norm,
+                    )?;
+                    builder.add_gpu_f32(
+                        &format!("{prefix}.attn_k_norm.weight"),
+                        &format!("{prefix}.attn_k_norm.weight"),
+                        &attn.attn_k_norm,
+                        &executed.attn_k_norm,
+                    )?;
+                    builder.add_amax7_q4(
+                        &format!("{prefix}.attn_output.weight"),
+                        &format!("{prefix}.attn_output.weight"),
+                        &attn.wo,
+                        &executed.wo,
+                    )?;
+                    observe_dense_ffn_cache(
+                        &mut builder,
+                        &prefix,
+                        ffn,
+                        executed_ffn,
+                    )?;
+                }
+                (
+                    Qwen35LayerWeights::LinearAttn { attn, ffn },
+                    LayerWeightsGpu::LinearAttn {
+                        attn: executed,
+                        ffn: executed_ffn,
+                    },
+                ) => {
+                    builder.add_gpu_f32(
+                        &format!("{prefix}.attn_norm.weight"),
+                        &format!("{prefix}.attn_norm.weight"),
+                        &attn.attn_norm,
+                        &executed.attn_norm,
+                    )?;
+                    builder.add_gpu_f32(
+                        &format!("{prefix}.post_attention_norm.weight"),
+                        &format!("{prefix}.post_attention_norm.weight"),
+                        &attn.post_attn_norm,
+                        &executed.post_attn_norm,
+                    )?;
+                    builder.add_amax7_q4(
+                        &format!("{prefix}.attn_qkv.weight"),
+                        &format!("{prefix}.attn_qkv.weight"),
+                        &attn.attn_qkv,
+                        &executed.attn_qkv,
+                    )?;
+                    builder.add_amax7_q4(
+                        &format!("{prefix}.attn_gate.weight"),
+                        &format!("{prefix}.attn_gate.weight"),
+                        &attn.attn_gate,
+                        &executed.attn_gate,
+                    )?;
+                    let qkv_channels = 2 * self.cfg.linear_num_key_heads
+                        * self.cfg.linear_key_head_dim
+                        + self.cfg.linear_num_value_heads * self.cfg.linear_value_head_dim;
+                    builder.add_delta_conv_roundtrip(
+                        &format!("{prefix}.ssm_conv1d.weight"),
+                        &format!("{prefix}.ssm_conv1d.weight"),
+                        &attn.ssm_conv1d,
+                        &executed.ssm_conv1d,
+                        qkv_channels,
+                        self.cfg.linear_conv_kernel_dim,
+                    )?;
+                    builder.add_amax7_q4(
+                        &format!("{prefix}.ssm_alpha.weight"),
+                        &format!("{prefix}.ssm_alpha.weight"),
+                        &attn.ssm_alpha,
+                        &executed.ssm_alpha,
+                    )?;
+                    builder.add_gpu_f32(
+                        &format!("{prefix}.ssm_dt.bias"),
+                        &format!("{prefix}.ssm_dt.bias"),
+                        &attn.ssm_dt_bias,
+                        &executed.ssm_dt_bias,
+                    )?;
+                    builder.add_amax7_q4(
+                        &format!("{prefix}.ssm_beta.weight"),
+                        &format!("{prefix}.ssm_beta.weight"),
+                        &attn.ssm_beta,
+                        &executed.ssm_beta,
+                    )?;
+                    builder.add_gpu_f32(
+                        &format!("{prefix}.ssm_a"),
+                        &format!("{prefix}.ssm_a"),
+                        &attn.ssm_a,
+                        &executed.ssm_a,
+                    )?;
+                    builder.add_gpu_f32(
+                        &format!("{prefix}.ssm_norm.weight"),
+                        &format!("{prefix}.ssm_norm.weight"),
+                        &attn.ssm_norm,
+                        &executed.ssm_norm,
+                    )?;
+                    builder.add_amax7_q4(
+                        &format!("{prefix}.ssm_out.weight"),
+                        &format!("{prefix}.ssm_out.weight"),
+                        &attn.ssm_out,
+                        &executed.ssm_out,
+                    )?;
+                    observe_dense_ffn_cache(
+                        &mut builder,
+                        &prefix,
+                        ffn,
+                        executed_ffn,
+                    )?;
+                }
+                _ => anyhow::bail!(
+                    "loaded and cached Qwen layer topology differs from the evidence profile"
+                ),
+            }
+        }
+        Ok(Some(std::sync::Arc::new(builder.finalize()?)))
+    }
+
     /// End-to-end GPU forward pass (prefill or single-token decode, stateful).
     ///
     /// # Arguments
@@ -2276,7 +2608,6 @@ impl Qwen35Model {
         // thread-local cache. The borrow is scoped to the closure so
         // it's released before any subsequent forward call would
         // need it.
-        let self_ptr = self as *const _ as *const ();
         let logits_f32 = GPU_CACHE.with(|cell| -> Result<Vec<f32>> {
             let mut guard = cell.borrow_mut();
             let cache = guard.as_mut().ok_or_else(|| {
@@ -2285,7 +2616,7 @@ impl Qwen35Model {
                 )
             })?;
             ensure!(
-                cache.model_ptr == self_ptr,
+                gpu_cache_matches_model(cache, self),
                 "per_position_argmax_from_normed_hidden: GPU_CACHE belongs to a different Qwen35Model"
             );
             let device = &cache.device;
@@ -2357,9 +2688,17 @@ impl Qwen35Model {
     /// `forward_gpu_impl` does on its first call.
     pub fn ensure_gpu_cache_primed(&self) -> Result<()> {
         let self_ptr = self as *const _ as *const ();
+        let loaded_candidate_identity = self
+            .loaded_candidate_cache_identity()
+            .map(|(receipt, graph, routing)| {
+                (receipt.to_owned(), graph.to_owned(), routing.to_owned())
+            });
         GPU_CACHE.with(|cell| -> Result<()> {
             let mut cache = cell.borrow_mut();
-            if cache.as_ref().map_or(true, |c| c.model_ptr != self_ptr) {
+            if cache
+                .as_ref()
+                .map_or(true, |cache| !gpu_cache_matches_model(cache, self))
+            {
                 let device = MlxDevice::new().context("ensure_gpu_cache_primed: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
@@ -2541,8 +2880,15 @@ impl Qwen35Model {
                     }
                 }
 
+                let executed_catalog =
+                    self.observe_loaded_candidate_cache(&layer_weights, &output_head)?;
+                let trace_weight_slots =
+                    self.loaded_candidate_trace_weight_slots(&layer_weights, &output_head)?;
                 *cache = Some(ForwardGpuCache {
                     model_ptr: self_ptr,
+                    loaded_candidate_identity,
+                    executed_catalog,
+                    trace_weight_slots,
                     device,
                     registry,
                     layer_weights,
@@ -2567,17 +2913,57 @@ impl Qwen35Model {
         &self,
         f: impl FnOnce(&MlxDevice, &mut KernelRegistry) -> Result<R>,
     ) -> Result<R> {
-        let self_ptr = self as *const _ as *const ();
         GPU_CACHE.with(|cell| -> Result<R> {
             let mut guard = cell.borrow_mut();
             let cache = guard
                 .as_mut()
                 .ok_or_else(|| anyhow!("with_gpu_cache_mut: GPU_CACHE not initialized; call ensure_gpu_cache_primed first"))?;
             ensure!(
-                cache.model_ptr == self_ptr,
+                gpu_cache_matches_model(cache, self),
                 "with_gpu_cache_mut: GPU_CACHE belongs to a different Qwen35Model"
             );
             f(&cache.device, &mut cache.registry)
+        })
+    }
+
+    pub(super) fn loaded_candidate_executed_catalog(
+        &self,
+    ) -> Result<
+        Option<std::sync::Arc<super::execution_observation::VerifiedExecutedTensorCatalog>>,
+    > {
+        GPU_CACHE.with(|cell| -> Result<_> {
+            let guard = cell.borrow();
+            let cache = guard.as_ref().ok_or_else(|| {
+                anyhow!("executed tensor catalog requested before GPU cache priming")
+            })?;
+            ensure!(
+                gpu_cache_matches_model(cache, self),
+                "executed tensor catalog belongs to a different Qwen model"
+            );
+            Ok(cache.executed_catalog.clone())
+        })
+    }
+
+    pub(super) fn loaded_candidate_trace_slots(
+        &self,
+    ) -> Result<
+        Option<
+            std::collections::BTreeMap<
+                usize,
+                super::execution_dispatch::Qwen35TraceWeightSlot,
+            >,
+        >,
+    > {
+        GPU_CACHE.with(|cell| -> Result<_> {
+            let guard = cell.borrow();
+            let cache = guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("trace slots requested before GPU cache priming"))?;
+            ensure!(
+                gpu_cache_matches_model(cache, self),
+                "trace slots belong to a different Qwen model"
+            );
+            Ok(cache.trace_weight_slots.clone())
         })
     }
 
@@ -4109,7 +4495,7 @@ impl Qwen35Model {
                         )
                     })?;
                     let out = if seq_len > 1
-                        && std::env::var("HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS").as_deref() == Ok("1")
+                        && super::execution_dispatch::dense_q_split_profile_enabled()
                     {
                         // Diagnostic split-profile path takes CommandEncoder by
                         // value (gpu_ffn.rs:1466). Under HF2Q_ENCODER_SESSION=1
@@ -4649,7 +5035,7 @@ impl Qwen35Model {
             if seq_len > 1
                 && is_k_boundary
                 && last_layer_held_enc.is_none()
-                && std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0")
+                && super::execution_dispatch::dense_q_arena_reset_enabled()
             {
                 super::decode_pool::reset_for_prefill_chunk();
             }
@@ -4928,11 +5314,19 @@ impl Qwen35Model {
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
         let self_ptr = self as *const _ as *const ();
+        let loaded_candidate_identity = self
+            .loaded_candidate_cache_identity()
+            .map(|(receipt, graph, routing)| {
+                (receipt.to_owned(), graph.to_owned(), routing.to_owned())
+            });
 
         // Populate GPU cache (same as forward_gpu).
         GPU_CACHE.with(|cell| -> Result<()> {
             let mut cache = cell.borrow_mut();
-            if cache.as_ref().map_or(true, |c| c.model_ptr != self_ptr) {
+            if cache
+                .as_ref()
+                .map_or(true, |cache| !gpu_cache_matches_model(cache, self))
+            {
                 let device = MlxDevice::new().context("forward_gpu_greedy: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
                 // Wave 5b.10: register flash_attn_prefill kernel family for
@@ -4955,8 +5349,15 @@ impl Qwen35Model {
                         .context("upload output_norm")?,
                     lm_head_q4,
                 };
+                let executed_catalog =
+                    self.observe_loaded_candidate_cache(&layer_weights, &output_head)?;
+                let trace_weight_slots =
+                    self.loaded_candidate_trace_weight_slots(&layer_weights, &output_head)?;
                 *cache = Some(ForwardGpuCache {
                     model_ptr: self_ptr,
+                    loaded_candidate_identity,
+                    executed_catalog,
+                    trace_weight_slots,
                     device,
                     registry,
                     layer_weights,
@@ -6307,14 +6708,13 @@ impl Qwen35Model {
         );
         self.ensure_gpu_cache_primed()?;
         hidden_collector.reset();
-        let self_ptr = self as *const _ as *const ();
         GPU_CACHE.with(|cell| -> Result<Vec<f32>> {
             let mut guard = cell.borrow_mut();
             let cache = guard
                 .as_mut()
                 .ok_or_else(|| anyhow!("forward_tree_verify_gpu: GPU_CACHE not initialized"))?;
             ensure!(
-                cache.model_ptr == self_ptr,
+                gpu_cache_matches_model(cache, self),
                 "forward_tree_verify_gpu: GPU_CACHE belongs to a different Qwen35Model"
             );
             let device = &cache.device;

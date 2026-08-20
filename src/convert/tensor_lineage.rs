@@ -699,6 +699,21 @@ fn sha256_file_handle(file: &File) -> Result<String> {
     sha256_reader(reader)
 }
 
+/// Rehash one already-open artifact identity against an evidence record.
+///
+/// Runtime evidence keeps this file identity open so a later pathname swap
+/// cannot redirect the loader to bytes other than those admitted by D2b.
+pub(crate) fn verify_open_artifact_identity(
+    file: &File,
+    expected: &ArtifactEvidence,
+) -> Result<()> {
+    let byte_len = file.metadata()?.len();
+    if byte_len != expected.byte_len || sha256_file_handle(file)? != expected.sha256 {
+        bail!("open artifact identity differs from its evidence record");
+    }
+    Ok(())
+}
+
 /// Reopen `artifact` and compare every physical tensor directory entry and
 /// byte range with the evidence captured during conversion.
 #[cfg(test)]
@@ -717,11 +732,22 @@ pub(crate) fn verify_written_tensor_evidence_file(
     artifact: &File,
     claimed: &[TensorWriteEvidence],
 ) -> Result<VerifiedStoredTensorCatalog> {
+    let gguf = GgufFile::from_file(artifact.try_clone()?)
+        .map_err(|error| anyhow::anyhow!("parse finalized GGUF: {error}"))?;
+    verify_written_tensor_evidence_open(artifact, &gguf, claimed)
+}
+
+/// Verify through the exact parser instance that a later runtime loader will
+/// retain. This avoids authenticating one parse while returning cached
+/// directory metadata from another.
+pub(crate) fn verify_written_tensor_evidence_open(
+    artifact: &File,
+    gguf: &GgufFile,
+    claimed: &[TensorWriteEvidence],
+) -> Result<VerifiedStoredTensorCatalog> {
     if claimed.is_empty() {
         bail!("tensor write evidence is empty");
     }
-    let gguf = GgufFile::from_file(artifact.try_clone()?)
-        .map_err(|error| anyhow::anyhow!("parse finalized GGUF: {error}"))?;
     if gguf.tensor_count() != claimed.len() {
         bail!(
             "finalized GGUF tensor count {} != write evidence count {}",

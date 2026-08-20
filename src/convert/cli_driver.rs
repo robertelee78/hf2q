@@ -55,8 +55,9 @@ use crate::convert::tensor_lineage::{
     apply_qwen35_dense_bake_with_evidence, build_verified_source_to_stored_conversion,
     clear_stale_tensor_conversion_receipt, prepare_tensor_conversion_receipt,
     promote_tensor_conversion_receipt, verify_complete_conversion_source,
-    verify_promoted_stored_catalog, verify_source_to_stored_continuity,
-    verify_source_weight_artifacts, verify_written_tensor_evidence_file,
+    verify_open_artifact_identity, verify_promoted_stored_catalog,
+    verify_source_to_stored_continuity, verify_source_weight_artifacts,
+    verify_written_tensor_evidence_file, verify_written_tensor_evidence_open,
 };
 use crate::convert::tokenizer::TokenizerError;
 use crate::convert::{
@@ -75,8 +76,11 @@ use crate::quantize::ggml_quants::{ArchName, LlamaFtype};
 mod stored_evidence;
 #[allow(unused_imports)] // crate-private seam consumed by the next Dynamic admission slice
 pub(crate) use stored_evidence::{
-    run_convert_with_stored_evidence, verify_persisted_stored_evidence,
+    RetainedQwenArtifactLoad, VerifiedStoredQwenArtifact, run_convert_with_stored_evidence,
+    verify_persisted_stored_artifact,
 };
+#[cfg(test)]
+pub(crate) use stored_evidence::verify_persisted_stored_evidence;
 #[cfg(test)]
 #[path = "cli_driver/stored_evidence_tests.rs"]
 mod stored_evidence_tests;

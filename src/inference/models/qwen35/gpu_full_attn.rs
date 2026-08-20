@@ -58,9 +58,7 @@ use mlx_native::ops::flash_attn_vec::{
     tmp_buffer_bytes_with_qL as flash_attn_vec_tmp_bytes_with_qL, FlashAttnVecParams,
 };
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual;
-use mlx_native::ops::quantized_matmul_ggml::{
-    quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
-};
+use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
 use mlx_native::ops::rms_norm;
 use mlx_native::ops::rope_multi::{dispatch_rope_multi_cached, RopeMultiMode, RopeMultiParams};
 use mlx_native::ops::sdpa::{sdpa, SdpaParams};
@@ -72,6 +70,7 @@ use mlx_native::ops::tree_attention::{self as tree_attn_ops, TreeAttentionParams
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::encoder_stage::LayerEncoder;
+use super::execution_dispatch::{fused_qkvg_enabled, quantized_matmul_ggml};
 use super::full_attn::FullAttnLayerWeights;
 use super::kv_cache::FullAttnKvSlot;
 // ADR-040 Phase B4a-cont (2026-05-23) — multi-seq slot identity routed
@@ -5444,7 +5443,7 @@ pub fn apply_sdpa_with_kv_cache(
             && seq_len <= 8
             && slot.k.is_some()
             && slot.v.is_some()
-            && std::env::var("HF2Q_NO_VEC_SMALL_PATH").as_deref() != Ok("1");
+            && super::execution_dispatch::vec_small_path_enabled();
         if fa_trace {
             eprintln!(
                 "[FA_TRACE] vec_small_path_eligible={} (engages BEFORE resume)",
@@ -5969,8 +5968,7 @@ pub fn build_gated_attn_layer(
     // byte-identical output at qL=2 vs resume path). Env opt-out
     // HF2Q_NO_FUSED_STAGE_AB_VEC=1 disables just the new vec-small
     // branch; the cur_len==0 fused path is unaffected.
-    let allow_vec_small_in_fused =
-        std::env::var("HF2Q_NO_FUSED_STAGE_AB_VEC").as_deref() != Ok("1");
+    let allow_vec_small_in_fused = super::execution_dispatch::fused_stage_ab_vec_enabled();
     let use_fused_stage_ab = use_arena
         && fa_proj_arena.is_some()
         && kv_cache_slot
@@ -6136,7 +6134,7 @@ pub fn build_gated_attn_layer(
             let is_q4_0 = |buf: &MlxBuffer, expected: usize| {
                 buf.dtype() == DType::U8 && buf.byte_len() == expected
             };
-            let use_fused_qkvg = std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
+            let use_fused_qkvg = fused_qkvg_enabled()
                 && hidden_size % Q4_0_BLOCK_VALUES == 0
                 && is_q4_0(&weights_gpu.wq, q_w_bytes_expected)
                 && is_q4_0(&weights_gpu.w_gate, q_w_bytes_expected)
@@ -6652,7 +6650,7 @@ pub fn build_gated_attn_layer(
             let is_q4_0 = |buf: &MlxBuffer, expected: usize| {
                 buf.dtype() == DType::U8 && buf.byte_len() == expected
             };
-            let use_fused_qkvg = std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
+            let use_fused_qkvg = fused_qkvg_enabled()
                 && hidden_size % Q4_0_BLOCK_VALUES == 0
                 && is_q4_0(&weights_gpu.wq, q_w_bytes_expected)
                 && is_q4_0(&weights_gpu.w_gate, q_w_bytes_expected)
