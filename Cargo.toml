@@ -130,9 +130,9 @@ thiserror = "2"
 # long-lived SlotAware Metal lifetime safety plus unlabeled GraphSession
 # command-buffer drop performance, paired MoE prefill scheduling, and the
 # machine-readable packed-affine capability contract and bounded D512
-# prefill-tail reads require mlx-native 0.10.12.
-# Pin the immutable registry release so clean builds cannot drift.
-mlx-native = "=0.10.12"
+# prefill-tail reads plus exact GGML routing/capability and host-side GGUF
+# evidence reads require mlx-native 0.10.15.
+mlx-native = "=0.10.15"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).

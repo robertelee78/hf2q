@@ -38,27 +38,48 @@ use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
 use crate::convert::arch::qwen35moe_full::{Qwen35LinearAttentionCtx, Qwen35MoeFullCtx};
 use crate::convert::arch::{
     bake, bert, deepseek4, deepseek4_metadata, gemma4, gemma4_mmproj, llama3, minimax_m2,
-    nomic_bert, qwen35_dense, qwen35moe, qwen35moe_full, qwen3vl_text,
+    nomic_bert, qwen3vl_text, qwen35_dense, qwen35moe, qwen35moe_full,
 };
+use crate::convert::evidence_source::VerifiedEvidenceSource;
 use crate::convert::orchestrator::PlanEntry;
-use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
+use crate::convert::quant_selector::{QuantSelector, approximate_for_apex};
 use crate::convert::receipt::{
-    clear_stale_receipt, clear_stale_receipt_at, prepare_success_receipt,
-    prepare_success_receipt_at, promote_success_receipt, require_converter_git_commit,
-    PeakChunkBoundReceipt, ReceiptError, RemoteConversionSource,
+    PeakChunkBoundReceipt, ReceiptError, RemoteConversionSource, clear_stale_receipt,
+    clear_stale_receipt_at, prepare_success_receipt, prepare_success_receipt_at,
+    promote_success_receipt, require_converter_git_commit,
 };
-use crate::convert::source_reader::SourceError;
+use crate::convert::source_reader::{SourceError, TensorMeta};
+use crate::convert::tensor_lineage::{
+    MaterializedDirectTensorEvidence, MaterializedDirectTensorRecord,
+    VerifiedConversionEvidenceContext, VerifiedSourceToStoredConversion,
+    apply_qwen35_dense_bake_with_evidence, build_verified_source_to_stored_conversion,
+    clear_stale_tensor_conversion_receipt, prepare_tensor_conversion_receipt,
+    promote_tensor_conversion_receipt, verify_complete_conversion_source,
+    verify_promoted_stored_catalog, verify_source_to_stored_continuity,
+    verify_source_weight_artifacts, verify_written_tensor_evidence_file,
+};
 use crate::convert::tokenizer::TokenizerError;
 use crate::convert::{
-    build_tokenizer_metadata, ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError,
+    ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError, build_tokenizer_metadata,
 };
 use crate::core::provenance::{KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
+use crate::input::integrity::VerifiedSourceManifest;
+use crate::quantize::ggml_quants::SourceDtype;
 use crate::quantize::ggml_quants::apex::{
-    detect_apex_config, load_mudler_config, ApexError, ApexPolicy, FingerprintHParams,
+    ApexError, ApexPolicy, FingerprintHParams, detect_apex_config, load_mudler_config,
 };
 use crate::quantize::ggml_quants::standard_policy::HParams;
-use crate::quantize::ggml_quants::ArchName;
-use crate::quantize::ggml_quants::SourceDtype;
+use crate::quantize::ggml_quants::{ArchName, LlamaFtype};
+
+#[path = "cli_driver/stored_evidence.rs"]
+mod stored_evidence;
+#[allow(unused_imports)] // crate-private seam consumed by the next Dynamic admission slice
+pub(crate) use stored_evidence::{
+    run_convert_with_stored_evidence, verify_persisted_stored_evidence,
+};
+#[cfg(test)]
+#[path = "cli_driver/stored_evidence_tests.rs"]
+mod stored_evidence_tests;
 
 // ============================================================================
 // Public API
@@ -272,10 +293,9 @@ impl std::fmt::Display for ConvertError {
                 "convert: duplicate expert index {expert_index} for \
                  `{gguf_name}` (layer={layer}, kind={kind_label})"
             ),
-            ConvertError::MissingHparam { key } => write!(
-                f,
-                "convert: config.json is missing required hparam `{key}`"
-            ),
+            ConvertError::MissingHparam { key } => {
+                write!(f, "convert: config.json is missing required hparam `{key}`")
+            }
             ConvertError::ApexMissingLayerCount => write!(
                 f,
                 "convert: --quant apex-<tier> requires `num_hidden_layers` in config.json"
@@ -466,12 +486,44 @@ fn run_convert_with_receipt_destination(
     receipt_path: Option<&Path>,
     recipe_producer_version: Option<&str>,
 ) -> Result<(), ConvertError> {
+    run_convert_internal(args, receipt_path, recipe_producer_version, None).map(|_| ())
+}
+
+struct StoredEvidenceRequest {
+    verified_source: VerifiedSourceManifest,
+    context: VerifiedConversionEvidenceContext,
+    source_artifacts: Vec<crate::core::provenance::tensor_execution::ArtifactEvidence>,
+    converter_git_commit: String,
+}
+
+fn run_convert_internal(
+    args: ConvertArgs,
+    receipt_path: Option<&Path>,
+    recipe_producer_version: Option<&str>,
+    evidence_request: Option<StoredEvidenceRequest>,
+) -> Result<Option<VerifiedSourceToStoredConversion>, ConvertError> {
     // ----- 1. Open source (mmap, metadata-only) ---------------------------
     // Per ADR-033 §"Open Issues / Real-Model Findings" 2026-05-18: the
     // source reader does NOT load every safetensors shard into RAM. It
     // mmaps each shard and records a flat tensor index. Payload bytes are
     // read one tensor at a time in the streaming stage below.
     let src = HfModelSource::open(&args.hf_dir)?;
+    let evidence_source = evidence_request
+        .as_ref()
+        .map(|request| {
+            VerifiedEvidenceSource::open(
+                &args.hf_dir,
+                &request.verified_source,
+                &request.context.source().model_id,
+                &request.context.source().revision,
+                &request.context.source().config_sha256,
+            )
+        })
+        .transpose()?;
+    let config = evidence_source
+        .as_ref()
+        .map(|source| &source.config)
+        .unwrap_or(&src.config);
     let excluded_dspark_count = src.excluded_mtp_tensor_count();
     if excluded_dspark_count > 0 {
         tracing::warn!(
@@ -482,14 +534,21 @@ fn run_convert_with_receipt_destination(
     }
 
     // ----- 2. Detect arch ---------------------------------------------------
-    let detected_arch = detect_arch(&src.config)?;
+    let detected_arch = detect_arch(config)?;
+    if evidence_request.is_some() && detected_arch != ArchName::Qwen35 {
+        return Err(ConvertError::UnsupportedArch {
+            arch_name: format!(
+                "stored conversion evidence v1 requires dense Qwen3.8, detected {detected_arch:?}"
+            ),
+        });
+    }
     if args.mmproj
         && matches!(
             detected_arch,
             ArchName::Qwen35 | ArchName::Qwen35MoeFull | ArchName::Qwen3VlText
         )
     {
-        if src.config.get("vision_config").is_none() {
+        if config.get("vision_config").is_none() {
             return Err(ConvertError::UnsupportedArch {
                 arch_name: format!(
                     "{detected_arch:?} (--mmproj requires a vision_config sub-object)"
@@ -504,6 +563,7 @@ fn run_convert_with_receipt_destination(
             });
         }
 
+        clear_stale_conversion_receipts_before_replacement(&args.output, receipt_path)?;
         crate::models::vit::convert_vision_tower_to_path_with_source_and_producer_version(
             &args.hf_dir,
             &args.output,
@@ -545,7 +605,7 @@ fn run_convert_with_receipt_destination(
         } else {
             clear_conversion_receipt(&args.output, receipt_path)?;
         }
-        return Ok(());
+        return Ok(None);
     }
     // `--mmproj` overrides arch routing to the vision-projector sidecar
     // mapper. Mirrors canonical `convert_hf_to_gguf.py:223,229,233` —
@@ -553,7 +613,7 @@ fn run_convert_with_receipt_destination(
     // `MMPROJ_MODEL_MAP`. Requires a `vision_config` sub-object in the
     // root config.json (Gemma 4 / Gemma 3 ForConditionalGeneration).
     let arch = if args.mmproj {
-        if src.config.get("vision_config").is_none() {
+        if config.get("vision_config").is_none() {
             return Err(ConvertError::UnsupportedArch {
                 arch_name: format!(
                     "{detected_arch:?} (--mmproj requires a `vision_config` sub-object in config.json; not present)"
@@ -615,7 +675,7 @@ fn run_convert_with_receipt_destination(
     //     ftype (purely cosmetic — per-tensor ggml_types are recorded
     //     on each tensor info entry).
     //   - ApexCustom(path): out of v1 convert-v2 scope; typed error.
-    let hparams = build_hparams(&src.config)?;
+    let hparams = build_hparams(config)?;
     let (mut orch, ftype_for_metadata) = match &args.selector {
         QuantSelector::Standard(ftype) => {
             let orch = ConvertOrchestrator::new(*ftype, arch, hparams);
@@ -633,8 +693,7 @@ fn run_convert_with_receipt_destination(
             (orch, crate::quantize::ggml_quants::LlamaFtype::MostlyQ2_K)
         }
         QuantSelector::Apex(tier) => {
-            let n_layers =
-                config_n_layers(&src.config).ok_or(ConvertError::ApexMissingLayerCount)?;
+            let n_layers = config_n_layers(config).ok_or(ConvertError::ApexMissingLayerCount)?;
             let n_expert = hparams.n_expert;
 
             // ADR-033 §Pi: resolve the imatrix surface. Two paths:
@@ -706,7 +765,7 @@ fn run_convert_with_receipt_destination(
             // user"), but we log the match to stderr so the operator
             // can audit which config fired — mitigates the
             // "surprising override" risk called out in the ADR.
-            let effective = effective_config(&src.config);
+            let effective = effective_config(config);
             if let Some(fp_hparams) = FingerprintHParams::from_config(effective) {
                 if let Some(entry) = detect_apex_config(&fp_hparams, *tier) {
                     let mudler = load_mudler_config(entry)?;
@@ -753,7 +812,7 @@ fn run_convert_with_receipt_destination(
     // detection: nomic_bert v2-moe uses HF name pattern
     // `mlp.experts.mlp.w` to flag expert tensors (vs the canonical
     // GGUF-side `_exps.` check — equivalent results).
-    let size_label = compute_size_label_for_arch(arch, &src, &src.config);
+    let size_label = compute_size_label_for_arch(arch, &src, config);
     let ftype_u32 = ftype_for_metadata as u32;
     // BERT: resolve pooling type via canonical's `_try_set_pooling_type`
     // path (modules.json → "Pooling" mod's `path` key → 1_Pooling/
@@ -775,7 +834,7 @@ fn run_convert_with_receipt_destination(
             .config
             .get("thinker_config")
             .and_then(|tc| tc.get("vision_config"))
-            .or_else(|| src.config.get("vision_config"));
+            .or_else(|| config.get("vision_config"));
         vc.and_then(|v| v.get("deepstack_visual_indexes"))
             .and_then(|a| a.as_array())
             .map(|a| a.len() as u32)
@@ -784,7 +843,7 @@ fn run_convert_with_receipt_destination(
     };
     let arch_metadata = build_metadata_for_arch(
         arch,
-        &src.config,
+        config,
         ftype_u32,
         model_card.as_ref(),
         size_label.as_deref(),
@@ -882,8 +941,37 @@ fn run_convert_with_receipt_destination(
     // `gemma.py::Gemma4Model::generate_extra_tensors`). We synthesize
     // them here as fully-materialized F32 `HfTensor`s and flow them
     // through the same map/plan/stream path as on-disk tensors.
-    let synthesized: Vec<HfTensor> = synthesized_tensors_for_arch(arch, &src.config);
-    let plan = build_convert_plan(arch, &src, &synthesized)?;
+    let synthesized: Vec<HfTensor> = synthesized_tensors_for_arch(arch, config);
+    let plan = if let Some(source) = evidence_source.as_ref() {
+        build_convert_plan(arch, config, source.tensor_metas(), &synthesized)?
+    } else {
+        build_convert_plan(arch, config, src.tensor_metas(), &synthesized)?
+    };
+    if let Some(request) = evidence_request.as_ref() {
+        if !synthesized.is_empty() {
+            return Err(ConvertError::Source(SourceError::Safetensors(
+                "stored conversion evidence does not admit synthesized tensors".into(),
+            )));
+        }
+        let mapped_source_names: Result<Vec<&str>, ConvertError> = plan
+            .steps
+            .iter()
+            .map(|step| match step {
+                PlanStep::Direct { hf_name, .. } => Ok(hf_name.as_str()),
+                _ => Err(ConvertError::Source(SourceError::Safetensors(
+                    "stored conversion evidence admits only one-to-one dense Qwen mappings".into(),
+                ))),
+            })
+            .collect();
+        request
+            .context
+            .validate_dense_qwen_source_coverage(mapped_source_names?, &plan.dropped_source_names)
+            .map_err(|error| {
+                ConvertError::Source(SourceError::Safetensors(format!(
+                    "dense Qwen source coverage failed: {error}"
+                )))
+            })?;
+    }
 
     // 5a. Orchestrator plan-phase: feed every tensor's metadata, no
     // payload bytes.
@@ -910,14 +998,17 @@ fn run_convert_with_receipt_destination(
                 entry.payload_bytes as f64 / 1024_f64.powi(3),
             );
         }
-        return Ok(());
+        return Ok(None);
     }
 
-    let converter_git_commit = args
-        .remote_source
-        .as_ref()
-        .map(|_| require_converter_git_commit())
-        .transpose()?;
+    let converter_git_commit = if let Some(request) = evidence_request.as_ref() {
+        Some(request.converter_git_commit.clone())
+    } else {
+        args.remote_source
+            .as_ref()
+            .map(|_| require_converter_git_commit())
+            .transpose()?
+    };
 
     // 5b. Begin writing — header + KVs + tensor-info reservations. The
     // canonical output is never opened until the complete temporary GGUF has
@@ -925,7 +1016,11 @@ fn run_convert_with_receipt_destination(
     // overwrite it with a partial tensor stream.
     let mut temporary_output = create_temporary_output(&args.output)?;
     let bw = BufWriter::new(temporary_output.as_file_mut());
-    let mut sw = orch.begin_write(bw)?;
+    let mut sw = if evidence_request.is_some() {
+        orch.begin_write_with_evidence(bw)?
+    } else {
+        orch.begin_write(bw)?
+    };
     let mut peak_chunk_bound = PeakChunkBoundReceipt::default();
 
     // 5c. Stream every tensor's data in plan order. A fused MoE tensor
@@ -933,7 +1028,18 @@ fn run_convert_with_receipt_destination(
     // → exact payload chunk. The expert Vec drops before the next source
     // tensor is opened, so 256-expert models never allocate the 3-D F32
     // stack.
+    let mut materialized_evidence = Vec::new();
     for (idx, step) in plan.steps.iter().enumerate() {
+        if let (Some(source), Some(request)) = (evidence_source.as_ref(), evidence_request.as_ref())
+        {
+            let materialized = step.materialize_with_evidence(idx, source, &request.context)?;
+            let MaterializedDirectTensorEvidence { data, record } = materialized;
+            let stats = sw.stream_tensor(idx, &data)?;
+            peak_chunk_bound.observe(stats);
+            drop(data);
+            materialized_evidence.push(record);
+            continue;
+        }
         match step {
             PlanStep::Fused {
                 gguf_name,
@@ -987,8 +1093,77 @@ fn run_convert_with_receipt_destination(
     // and atomically promote the complete file. Any failure before artifact
     // promotion leaves the previous output intact; restarting deterministically
     // begins from source.
-    sw.finalize()?;
+    let write_evidence = if evidence_request.is_some() {
+        Some(sw.finalize_with_evidence()?)
+    } else {
+        sw.finalize()?;
+        None
+    };
     temporary_output.as_file().sync_all()?;
+    let stored_catalog = write_evidence
+        .as_deref()
+        .map(|evidence| {
+            verify_written_tensor_evidence_file(temporary_output.as_file(), evidence).map_err(
+                |error| {
+                    ConvertError::Source(SourceError::Safetensors(format!(
+                        "finalized GGUF evidence verification failed: {error}"
+                    )))
+                },
+            )
+        })
+        .transpose()?;
+    let mut verified_conversion = None;
+    if let (Some(request), Some(write_evidence), Some(stored_catalog)) = (
+        evidence_request.as_ref(),
+        write_evidence.as_deref(),
+        stored_catalog.as_ref(),
+    ) {
+        verify_source_to_stored_continuity(&materialized_evidence, write_evidence, stored_catalog)
+            .map_err(|error| {
+                ConvertError::Source(SourceError::Safetensors(format!(
+                    "source-to-stored continuity failed: {error}"
+                )))
+            })?;
+        // Rehash all authenticated source artifacts after conversion so an
+        // in-flight replacement cannot survive into a successful receipt.
+        let final_source_artifacts = verify_source_weight_artifacts(
+            &args.hf_dir,
+            &request.verified_source,
+            &request.context,
+        )
+        .map_err(|error| {
+            ConvertError::Source(SourceError::Safetensors(format!(
+                "source artifact changed during evidence conversion: {error}"
+            )))
+        })?;
+        if final_source_artifacts != request.source_artifacts {
+            return Err(ConvertError::Source(SourceError::Safetensors(
+                "source artifact evidence changed during conversion".into(),
+            )));
+        }
+        verify_complete_conversion_source(&args.hf_dir, &request.verified_source, &request.context)
+            .map_err(|error| {
+                ConvertError::Source(SourceError::Safetensors(format!(
+                    "conversion metadata source changed during evidence conversion: {error}"
+                )))
+            })?;
+        verified_conversion = Some(
+            build_verified_source_to_stored_conversion(
+                &request.context,
+                &final_source_artifacts,
+                &materialized_evidence,
+                write_evidence,
+                stored_catalog,
+                &request.converter_git_commit,
+                &args.selector.receipt_name(),
+            )
+            .map_err(|error| {
+                ConvertError::Source(SourceError::Safetensors(format!(
+                    "stored conversion receipt verification failed: {error}"
+                )))
+            })?,
+        );
+    }
     let prepared_receipt = args
         .remote_source
         .as_ref()
@@ -1015,14 +1190,43 @@ fn run_convert_with_receipt_destination(
             ),
         })
         .transpose()?;
+    let prepared_tensor_receipt = verified_conversion
+        .as_ref()
+        .map(|verified| prepare_tensor_conversion_receipt(&args.output, verified))
+        .transpose()
+        .map_err(|error| {
+            ConvertError::Source(SourceError::Safetensors(format!(
+                "prepare stored conversion receipt failed: {error}"
+            )))
+        })?;
+    // Remove older sidecars before replacing the artifact. If either removal
+    // fails, the previous artifact remains untouched; after promotion there
+    // can therefore never be a stale receipt beside new GGUF bytes.
+    clear_stale_conversion_receipts_before_replacement(&args.output, receipt_path)?;
     promote_temporary_output(temporary_output, &args.output)?;
+    if let Some(catalog) = stored_catalog.as_ref() {
+        if let Err(error) = verify_promoted_stored_catalog(&args.output, catalog) {
+            clear_stale_conversion_receipts_before_replacement(&args.output, receipt_path)?;
+            return Err(ConvertError::Source(SourceError::Safetensors(format!(
+                "promoted GGUF evidence verification failed: {error}"
+            ))));
+        }
+    }
+    if let Some(receipt) = prepared_tensor_receipt {
+        if let Err(error) = promote_tensor_conversion_receipt(receipt) {
+            clear_stale_conversion_receipts_before_replacement(&args.output, receipt_path)?;
+            return Err(ConvertError::Source(SourceError::Safetensors(format!(
+                "promote stored conversion receipt failed: {error}"
+            ))));
+        }
+    }
     if let Some(receipt) = prepared_receipt {
         if let Err(error) = promote_success_receipt(receipt) {
             // The GGUF rename has already succeeded. Remove any older sidecar
             // so complete new bytes can never be mistaken for the artifact it
             // described; the caller still receives the promotion failure and
             // must rerun conversion to obtain a provenance-complete result.
-            clear_conversion_receipt(&args.output, receipt_path)?;
+            clear_stale_conversion_receipts_before_replacement(&args.output, receipt_path)?;
             return Err(error.into());
         }
     } else {
@@ -1030,17 +1234,34 @@ fn run_convert_with_receipt_destination(
         // leave a sidecar from an older remote artifact beside new bytes.
         clear_conversion_receipt(&args.output, receipt_path)?;
     }
-    Ok(())
+    Ok(verified_conversion)
+}
+
+fn clear_stale_stored_conversion_receipt(output: &Path) -> Result<(), ConvertError> {
+    clear_stale_tensor_conversion_receipt(output).map_err(|error| {
+        ConvertError::Source(SourceError::Safetensors(format!(
+            "clear stale stored conversion receipt failed: {error}"
+        )))
+    })
+}
+
+fn clear_stale_conversion_receipts_before_replacement(
+    output: &Path,
+    receipt_path: Option<&Path>,
+) -> Result<(), ConvertError> {
+    clear_conversion_receipt(output, receipt_path)?;
+    clear_stale_stored_conversion_receipt(output)
 }
 
 fn clear_conversion_receipt(
     output: &Path,
     receipt_path: Option<&Path>,
 ) -> Result<(), ReceiptError> {
-    match receipt_path {
-        Some(path) => clear_stale_receipt_at(path),
-        None => clear_stale_receipt(output),
+    clear_stale_receipt(output)?;
+    if let Some(path) = receipt_path {
+        clear_stale_receipt_at(path)?;
     }
+    Ok(())
 }
 
 fn conversion_model_basename(args: &ConvertArgs) -> Option<String> {
@@ -1108,7 +1329,7 @@ fn resolve_imatrix_input(
     n_ctx: u32,
 ) -> Result<Option<crate::quantize::imatrix::ImatrixData>, ConvertError> {
     use crate::quantize::imatrix::{
-        compute_imatrix, ComputeImatrixParams, CorpusBytes, CorpusSource, ImatrixData,
+        ComputeImatrixParams, CorpusBytes, CorpusSource, ImatrixData, compute_imatrix,
     };
 
     if let Some(path) = imatrix_path {
@@ -2264,6 +2485,94 @@ impl PlanStep {
             }
         }
     }
+
+    /// Evidence-producing counterpart to [`Self::materialize`]. This is a
+    /// distinct path so normal conversion never pays source hashing or
+    /// intermediate-receipt costs. D2b intentionally admits only direct
+    /// dense-Qwen source mappings; fused, synthesized, FP8, MoE, and vision
+    /// mappings fail closed before writing evidence. MTP tensors are retained
+    /// when D1 classifies them fixed/protected, but remain outside the runtime
+    /// execution scope.
+    fn materialize_with_evidence(
+        &self,
+        plan_index: usize,
+        src: &VerifiedEvidenceSource,
+        context: &VerifiedConversionEvidenceContext,
+    ) -> Result<MaterializedDirectTensorEvidence, ConvertError> {
+        let PlanStep::Direct {
+            hf_name,
+            gguf_name,
+            gguf_shape,
+            bake,
+            ..
+        } = self
+        else {
+            return Err(ConvertError::Source(SourceError::Safetensors(
+                "D2b conversion evidence admits only direct dense-Qwen tensor mappings".into(),
+            )));
+        };
+        let tensor = src.materialize_tensor_with_evidence(hf_name)?;
+        let source = context
+            .verify_materialized_source(&tensor)
+            .map_err(|error| {
+                ConvertError::Source(SourceError::Safetensors(format!(
+                    "source evidence failed on `{hf_name}`: {error}"
+                )))
+            })?;
+        if source.disposition
+            == crate::convert::tensor_lineage::ConversionSourceDisposition::Excluded
+        {
+            return Err(ConvertError::Source(SourceError::Safetensors(format!(
+                "excluded source tensor `{hf_name}` cannot be materialized into GGUF evidence"
+            ))));
+        }
+        let mut output_shape_outermost_first: Vec<u64> = gguf_shape
+            .iter()
+            .rev()
+            .map(|dimension| u64::try_from(*dimension))
+            .collect::<Result<_, _>>()
+            .map_err(|_| {
+                ConvertError::Source(SourceError::Safetensors(format!(
+                    "planned shape for `{hf_name}` is not representable"
+                )))
+            })?;
+        let (data, bake_steps) = match bake {
+            None => {
+                if source.shape_outermost_first != output_shape_outermost_first {
+                    return Err(ConvertError::Source(SourceError::Safetensors(format!(
+                        "direct tensor `{hf_name}` source shape {:?} != planned output {:?}",
+                        source.shape_outermost_first, output_shape_outermost_first
+                    ))));
+                }
+                (tensor.data, Vec::new())
+            }
+            Some(operation) => {
+                let result = apply_qwen35_dense_bake_with_evidence(
+                    tensor.data,
+                    &source.shape_outermost_first,
+                    &output_shape_outermost_first,
+                    operation,
+                )
+                .map_err(|error| {
+                    ConvertError::Source(SourceError::Safetensors(format!(
+                        "bake evidence failed on `{hf_name}`: {error}"
+                    )))
+                })?;
+                output_shape_outermost_first = result.output_shape_outermost_first;
+                (result.data, result.steps)
+            }
+        };
+        Ok(MaterializedDirectTensorEvidence {
+            data,
+            record: MaterializedDirectTensorRecord {
+                plan_index,
+                gguf_tensor_name: gguf_name.clone(),
+                output_shape_outermost_first,
+                source,
+                bake_steps,
+            },
+        })
+    }
 }
 
 /// A complete convert plan: every step in deterministic emission order.
@@ -2274,6 +2583,10 @@ impl PlanStep {
 /// per chunk.
 struct ConvertPlan {
     steps: Vec<PlanStep>,
+    /// Exact authenticated source names the architecture mapper explicitly
+    /// excludes. Evidence conversion reconciles these against the D1 source
+    /// partition instead of allowing mapper drops to disappear.
+    dropped_source_names: Vec<String>,
 }
 
 /// Build the convert plan from the source's tensor metadata + the
@@ -2295,16 +2608,17 @@ struct ConvertPlan {
 /// Per [[feedback-no-loop-suppression-2026-05-17]]: incomplete /
 /// duplicate / non-contiguous expert groups surface as typed errors
 /// here, before any GGUF bytes are written.
-fn build_convert_plan(
+fn build_convert_plan<'a>(
     arch: ArchName,
-    src: &HfModelSource,
+    config: &serde_json::Value,
+    tensor_metas: impl IntoIterator<Item = &'a TensorMeta>,
     synthesized: &[HfTensor],
 ) -> Result<ConvertPlan, ConvertError> {
     // Multimodal-wrapping configs nest the text-decoder hparams under
     // `text_config` (Qwen3_5MoeForConditionalGeneration / Gemma 4 omni).
     // effective_config returns text_config when present, otherwise the
     // root — same convention as build_metadata.
-    let n_experts_cfg = effective_config(&src.config);
+    let n_experts_cfg = effective_config(config);
     let n_experts = n_experts_cfg
         .get("num_experts")
         .or_else(|| n_experts_cfg.get("num_local_experts"))
@@ -2319,26 +2633,27 @@ fn build_convert_plan(
     // and every tensor surfaces as UnmappedTensor — per the
     // no-fallback rule.
     let qwen35_dense_ctx: Option<Qwen35DenseCtx> = match arch {
-        ArchName::Qwen35 => build_qwen35_dense_ctx(&src.config),
+        ArchName::Qwen35 => build_qwen35_dense_ctx(config),
         _ => None,
     };
     let qwen35moe_full_ctx: Option<Qwen35MoeFullCtx> = match arch {
-        ArchName::Qwen35MoeFull => build_qwen35moe_full_ctx(&src.config),
+        ArchName::Qwen35MoeFull => build_qwen35moe_full_ctx(config),
         _ => None,
     };
     let llama3_ctx: Option<Llama3Ctx> = match arch {
-        ArchName::Llama3 => build_llama3_ctx(&src.config),
+        ArchName::Llama3 => build_llama3_ctx(config),
         _ => None,
     };
     let nomic_bert_ctx: nomic_bert::NomicBertCtx = match arch {
-        ArchName::NomicBert => build_nomic_bert_ctx(&src.config),
+        ArchName::NomicBert => build_nomic_bert_ctx(config),
         _ => nomic_bert::NomicBertCtx { num_experts: None },
     };
 
     let mut direct_steps: Vec<PlanStep> = Vec::new();
     let mut moe_accum: HashMap<(usize, ExpertKindKey), MoePlanGroup> = HashMap::new();
+    let mut dropped_source_names = Vec::new();
 
-    for meta in src.tensor_metas() {
+    for meta in tensor_metas {
         match map_tensor(
             arch,
             &meta.name,
@@ -2493,6 +2808,7 @@ fn build_convert_plan(
                     tensor = %meta.name,
                     "convert: explicit drop per arch mapper"
                 );
+                dropped_source_names.push(meta.name.clone());
             }
             MapOutcome::Unmapped => {
                 return Err(ConvertError::UnmappedTensor {
@@ -2700,7 +3016,11 @@ fn build_convert_plan(
             canonical_tensor_name_cmp(a.plan_entry().name.as_str(), b.plan_entry().name.as_str())
         });
     }
-    Ok(ConvertPlan { steps })
+    dropped_source_names.sort();
+    Ok(ConvertPlan {
+        steps,
+        dropped_source_names,
+    })
 }
 
 /// Port of canonical's `weight_name_comparer` at
@@ -2802,8 +3122,8 @@ fn expert_kind_label(k: ExpertKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quantize::ggml_quants::apex::ApexTier;
     use crate::quantize::ggml_quants::LlamaFtype;
+    use crate::quantize::ggml_quants::apex::ApexTier;
     use serde_json::json;
     use std::io::Write;
 
@@ -2914,6 +3234,26 @@ mod tests {
         complete.write_all(b"complete-new-artifact").unwrap();
         promote_temporary_output(complete, &output).unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), b"complete-new-artifact");
+    }
+
+    #[test]
+    fn alternate_artifact_replacement_clears_every_stale_conversion_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("projector.gguf");
+        let success_receipt = crate::convert::receipt::receipt_path(&output);
+        let custom_receipt = dir.path().join("prepared/projector.receipt.json");
+        std::fs::create_dir_all(custom_receipt.parent().unwrap()).unwrap();
+        let tensor_receipt =
+            crate::convert::tensor_lineage::tensor_conversion_receipt_path(&output);
+        std::fs::write(&success_receipt, b"stale-general-receipt").unwrap();
+        std::fs::write(&custom_receipt, b"stale-custom-receipt").unwrap();
+        std::fs::write(&tensor_receipt, b"stale-dense-text-lineage").unwrap();
+
+        clear_stale_conversion_receipts_before_replacement(&output, Some(&custom_receipt)).unwrap();
+
+        assert!(!success_receipt.exists());
+        assert!(!custom_receipt.exists());
+        assert!(!tensor_receipt.exists());
     }
 
     /// model_type=llama → ArchName::Llama3.
@@ -3536,7 +3876,7 @@ mod tests {
     /// regardless of tier (non-I tiers can still consume imatrix data).
     #[test]
     fn imatrix_file_loads_for_any_tier() {
-        use crate::quantize::imatrix::{write_imatrix_to_path, AccumulatorRegistry};
+        use crate::quantize::imatrix::{AccumulatorRegistry, write_imatrix_to_path};
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut reg = AccumulatorRegistry::new();
@@ -3607,7 +3947,12 @@ mod tests {
         )
         .unwrap();
         let source = HfModelSource::open(dir.path()).unwrap();
-        let err = match build_convert_plan(ArchName::Deepseek4, &source, &[]) {
+        let err = match build_convert_plan(
+            ArchName::Deepseek4,
+            &source.config,
+            source.tensor_metas(),
+            &[],
+        ) {
             Ok(_) => panic!("one of two experts must not form a complete group"),
             Err(err) => err,
         };
@@ -3748,18 +4093,24 @@ mod tests {
         .unwrap();
         let bytes = std::fs::read(&output).unwrap();
         assert_eq!(&bytes[..4], b"GGUF");
-        assert!(bytes
-            .windows(b"blk.0.ffn_gate_exps.weight".len())
-            .any(|w| w == b"blk.0.ffn_gate_exps.weight"));
+        assert!(
+            bytes
+                .windows(b"blk.0.ffn_gate_exps.weight".len())
+                .any(|w| w == b"blk.0.ffn_gate_exps.weight")
+        );
         assert!(bytes.len() > 32 * 1024);
         let producer = b"hf2q 0.1.6";
-        assert!(bytes
-            .windows(producer.len())
-            .any(|window| window == producer));
+        assert!(
+            bytes
+                .windows(producer.len())
+                .any(|window| window == producer)
+        );
         let expected_source_sha = "b".repeat(64);
-        assert!(bytes
-            .windows(expected_source_sha.len())
-            .any(|window| window == expected_source_sha.as_bytes()));
+        assert!(
+            bytes
+                .windows(expected_source_sha.len())
+                .any(|window| window == expected_source_sha.as_bytes())
+        );
         let receipt: crate::convert::receipt::ConversionReceipt =
             serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
         assert!(!crate::convert::receipt::receipt_path(&output).exists());

@@ -37,18 +37,20 @@
 use std::collections::HashMap;
 use std::io::{Seek, Write};
 
-use half::f16;
+use half::{bf16, f16};
+use sha2::{Digest, Sha256};
 
 use crate::backends::gguf::types::MetaValue;
 use crate::backends::gguf::writer::{GgufWriter, WriterError};
+use crate::core::provenance::tensor_execution::LogicalF32Hasher;
 use crate::quantize::ggml_quants::apex::{ApexError, ApexPolicy};
 use crate::quantize::ggml_quants::quantizer::Quantizer;
 use crate::quantize::ggml_quants::standard_policy::{
-    tensor_type_fallback, HParams, LlmType, QsState, StandardPolicy, TensorCategory,
+    HParams, LlmType, QsState, StandardPolicy, TensorCategory, tensor_type_fallback,
 };
 use crate::quantize::ggml_quants::{
-    is_audio_tensor_pattern, is_vision_tensor_pattern, quantizer_for, ArchName,
-    Deepseek4AgenticQ2Policy, GgmlType, LlamaFtype, QuantizeError, SourceDtype, TensorRef,
+    ArchName, Deepseek4AgenticQ2Policy, GgmlType, LlamaFtype, QuantizeError, SourceDtype,
+    TensorRef, is_audio_tensor_pattern, is_vision_tensor_pattern, quantizer_for,
 };
 
 /// Errors raised by [`ConvertOrchestrator::plan_tensors`] /
@@ -168,6 +170,65 @@ struct PlannedTensor {
     /// Innermost dim — `quantizer.quantize(..., n_per_row, ..)` consumes
     /// this. Stored to avoid recomputing from dims_gguf at stream time.
     n_per_row: usize,
+}
+
+fn encode_planned_tensor_payload(
+    planned: &PlannedTensor,
+    data: &[f32],
+    imatrix: Option<&[f32]>,
+) -> Result<(Vec<u8>, Option<Vec<f32>>), OrchestratorError> {
+    Ok(match planned.ggml_type {
+        GgmlType::F16 => {
+            let mut payload = Vec::with_capacity(data.len() * 2);
+            for &value in data {
+                payload.extend_from_slice(&f16::from_f32(value).to_le_bytes());
+            }
+            (payload, None)
+        }
+        GgmlType::BF16 => {
+            let mut payload = Vec::with_capacity(data.len() * 2);
+            for &value in data {
+                payload.extend_from_slice(&bf16::from_f32(value).to_le_bytes());
+            }
+            (payload, None)
+        }
+        GgmlType::F32 => {
+            let mut payload = Vec::with_capacity(data.len() * 4);
+            for &value in data {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+            (payload, None)
+        }
+        GgmlType::I32 => {
+            let mut payload = Vec::with_capacity(data.len() * 4);
+            for &value in data {
+                if !value.is_finite()
+                    || value.fract() != 0.0
+                    || value < i32::MIN as f32
+                    || value > i32::MAX as f32
+                {
+                    return Err(OrchestratorError::StreamProtocol(format!(
+                        "tensor `{}` contains non-I32 routing value {value}",
+                        planned.name
+                    )));
+                }
+                payload.extend_from_slice(&(value as i32).to_le_bytes());
+            }
+            (payload, None)
+        }
+        _ => {
+            let quantizer = quantizer_for(planned.ggml_type)?;
+            // Canonical first writes an F16 intermediate and reads it back
+            // before quantizing. This helper is the single byte-authority
+            // used by both the streaming writer and persisted replay.
+            let f16_roundtrip: Vec<f32> = data
+                .iter()
+                .map(|&value| f16::from_f32(value).to_f32())
+                .collect();
+            let payload = quantizer.quantize(&f16_roundtrip, planned.n_per_row, imatrix)?;
+            (payload, Some(f16_roundtrip))
+        }
+    })
 }
 
 /// One GGML storage type's contribution to a metadata-only convert plan.
@@ -550,6 +611,85 @@ impl ConvertOrchestrator {
         self.planned.len()
     }
 
+    /// Re-run the exact planned storage encoder for one complete tensor and
+    /// derive the same evidence that the streaming writer records. Persisted
+    /// receipt verification uses this method so codec selection, the F16
+    /// roundtrip, and payload bytes come from current production policy/code,
+    /// never from the untrusted sidecar.
+    #[allow(dead_code)] // persisted Dynamic evidence replay is staged behind D2b
+    pub(crate) fn reproduce_tensor_write_evidence(
+        &self,
+        tensor_idx: usize,
+        data: &[f32],
+        relative_payload_offset: u64,
+    ) -> Result<TensorWriteEvidence, OrchestratorError> {
+        let planned = self.planned.get(tensor_idx).ok_or_else(|| {
+            OrchestratorError::StreamProtocol(format!(
+                "reproduce_tensor_write_evidence: idx {tensor_idx} out of range"
+            ))
+        })?;
+        if data.len() != planned.expected_numel {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "reproduce_tensor_write_evidence: tensor `{}` data length {} != planned numel {}",
+                planned.name,
+                data.len(),
+                planned.expected_numel
+            )));
+        }
+        if self.imatrix.is_some() {
+            return Err(OrchestratorError::StreamProtocol(
+                "stored-evidence v1 replay does not admit imatrix state".into(),
+            ));
+        }
+        let (payload, f16_roundtrip) = encode_planned_tensor_payload(planned, data, None)?;
+        let mut converted_hasher = Sha256::new();
+        for value in data {
+            converted_hasher.update(value.to_bits().to_le_bytes());
+        }
+        let mut logical_shape = planned.dims_gguf.clone();
+        logical_shape.reverse();
+        let converted_logical_f32_sha256 =
+            crate::core::provenance::tensor_execution::logical_f32_sha256(&logical_shape, data)
+                .map_err(|error| OrchestratorError::StreamProtocol(error.to_string()))?;
+        let (f16_roundtrip_f32_bytes_sha256, f16_roundtrip_logical_f32_sha256) =
+            if let Some(roundtrip) = f16_roundtrip.as_ref() {
+                let mut bytes_hasher = Sha256::new();
+                for value in roundtrip {
+                    bytes_hasher.update(value.to_bits().to_le_bytes());
+                }
+                (
+                    Some(hex::encode(bytes_hasher.finalize())),
+                    Some(
+                        crate::core::provenance::tensor_execution::logical_f32_sha256(
+                            &logical_shape,
+                            roundtrip,
+                        )
+                        .map_err(|error| OrchestratorError::StreamProtocol(error.to_string()))?,
+                    ),
+                )
+            } else {
+                (None, None)
+            };
+        Ok(TensorWriteEvidence {
+            plan_index: tensor_idx,
+            tensor_name: planned.name.clone(),
+            dims_gguf_innermost_first: planned.dims_gguf.clone(),
+            ggml_type: planned.ggml_type,
+            converted_f32_bytes_sha256: hex::encode(converted_hasher.finalize()),
+            converted_logical_f32_sha256,
+            f16_roundtrip_f32_bytes_sha256,
+            f16_roundtrip_logical_f32_sha256,
+            payload_sha256: hex::encode(Sha256::digest(&payload)),
+            payload_bytes: u64::try_from(payload.len()).map_err(|_| {
+                OrchestratorError::StreamProtocol(format!(
+                    "tensor `{}` payload length is not representable",
+                    planned.name
+                ))
+            })?,
+            relative_payload_offset,
+        })
+    }
+
     /// Calculate exact payload bytes for the current metadata-only plan.
     pub fn planned_size_summary(&self) -> Result<PlannedSizeSummary, OrchestratorError> {
         let mut payload_bytes = 0u64;
@@ -628,6 +768,24 @@ impl ConvertOrchestrator {
         self,
         writer: W,
     ) -> Result<StreamingWriter<W>, OrchestratorError> {
+        self.begin_write_internal(writer, false)
+    }
+
+    /// Evidence-producing writer. Ordinary conversion uses [`begin_write`]
+    /// and pays no hashing cost; only the explicit D2b path enables these
+    /// incremental provenance hashes.
+    pub(crate) fn begin_write_with_evidence<W: Write + Seek>(
+        self,
+        writer: W,
+    ) -> Result<StreamingWriter<W>, OrchestratorError> {
+        self.begin_write_internal(writer, true)
+    }
+
+    fn begin_write_internal<W: Write + Seek>(
+        self,
+        writer: W,
+        capture_evidence: bool,
+    ) -> Result<StreamingWriter<W>, OrchestratorError> {
         let Self {
             metadata,
             planned,
@@ -657,6 +815,7 @@ impl ConvertOrchestrator {
             planned,
             next_idx: 0,
             active_chunks: None,
+            completed_tensor_evidence: capture_evidence.then(Vec::new),
             imatrix,
             coverage_quantized: 0,
             coverage_with_imatrix: 0,
@@ -676,6 +835,7 @@ pub struct StreamingWriter<W: Write + Seek> {
     planned: Vec<PlannedTensor>,
     next_idx: usize,
     active_chunks: Option<ActiveTensorChunks>,
+    completed_tensor_evidence: Option<Vec<TensorWriteEvidence>>,
     /// ADR-033 §P4b — optional imatrix data for per-tensor row-importance
     /// weighting at `quantizer.quantize`. Looked up per tensor by name in
     /// `tensor_imatrix`. None for non-i-tier convert runs.
@@ -700,7 +860,36 @@ struct ActiveTensorChunks {
     max_f16_roundtrip_f32_bytes: usize,
     max_quantized_payload_bytes: usize,
     max_working_vec_bytes: usize,
+    converted_f32_bytes_hasher: Option<Sha256>,
+    converted_logical_f32_hasher: Option<LogicalF32Hasher>,
+    f16_roundtrip_f32_bytes_hasher: Option<Sha256>,
+    f16_roundtrip_logical_f32_hasher: Option<LogicalF32Hasher>,
+    payload_hasher: Option<Sha256>,
+    payload_bytes: usize,
     imatrix: Option<Vec<f32>>,
+}
+
+/// Exact byte evidence captured at the authoritative conversion/write seam.
+///
+/// These hashes are accumulated incrementally, preserving the streaming
+/// memory bound. Raw-byte hashes cover the little-endian F32 stream, while
+/// logical hashes additionally frame the exact outermost-first shape.
+/// Quantized tensors bind the canonical F16-to-F32 roundtrip consumed by the
+/// quantizer. The payload hash covers exactly the bytes handed to the GGUF
+/// writer, before alignment padding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TensorWriteEvidence {
+    pub(crate) plan_index: usize,
+    pub(crate) tensor_name: String,
+    pub(crate) dims_gguf_innermost_first: Vec<u64>,
+    pub(crate) ggml_type: GgmlType,
+    pub(crate) converted_f32_bytes_sha256: String,
+    pub(crate) converted_logical_f32_sha256: String,
+    pub(crate) f16_roundtrip_f32_bytes_sha256: Option<String>,
+    pub(crate) f16_roundtrip_logical_f32_sha256: Option<String>,
+    pub(crate) payload_sha256: String,
+    pub(crate) payload_bytes: u64,
+    pub(crate) relative_payload_offset: u64,
 }
 
 /// Observable bound receipt for one chunk-streamed tensor.
@@ -716,6 +905,12 @@ pub struct TensorChunkStats {
 }
 
 impl<W: Write + Seek> StreamingWriter<W> {
+    fn update_f32_hasher(hasher: &mut Sha256, values: &[f32]) {
+        for value in values {
+            hasher.update(value.to_le_bytes());
+        }
+    }
+
     /// ADR-033 §P4b — look up the per-tensor row-importance vector for
     /// `tensor_name` from the attached imatrix.
     ///
@@ -838,7 +1033,31 @@ impl<W: Write + Seek> StreamingWriter<W> {
         }
 
         let p = &self.planned[tensor_idx];
-        let quantized = !matches!(p.ggml_type, GgmlType::F16 | GgmlType::F32 | GgmlType::I32);
+        let quantized = !matches!(
+            p.ggml_type,
+            GgmlType::F16 | GgmlType::BF16 | GgmlType::F32 | GgmlType::I32
+        );
+        let capture_evidence = self.completed_tensor_evidence.is_some();
+        let mut logical_shape = p.dims_gguf.clone();
+        logical_shape.reverse();
+        let converted_logical_f32_hasher = capture_evidence
+            .then(|| LogicalF32Hasher::new(&logical_shape))
+            .transpose()
+            .map_err(|error| {
+                OrchestratorError::StreamProtocol(format!(
+                    "begin_tensor_chunks: tensor `{}` has invalid logical shape: {error}",
+                    p.name
+                ))
+            })?;
+        let f16_roundtrip_logical_f32_hasher = (quantized && capture_evidence)
+            .then(|| LogicalF32Hasher::new(&logical_shape))
+            .transpose()
+            .map_err(|error| {
+                OrchestratorError::StreamProtocol(format!(
+                    "begin_tensor_chunks: tensor `{}` has invalid roundtrip shape: {error}",
+                    p.name
+                ))
+            })?;
         let imatrix = if quantized {
             self.tensor_imatrix(&p.name, p.n_per_row)?
         } else {
@@ -862,6 +1081,12 @@ impl<W: Write + Seek> StreamingWriter<W> {
             max_f16_roundtrip_f32_bytes: 0,
             max_quantized_payload_bytes: 0,
             max_working_vec_bytes: 0,
+            converted_f32_bytes_hasher: capture_evidence.then(Sha256::new),
+            converted_logical_f32_hasher,
+            f16_roundtrip_f32_bytes_hasher: (quantized && capture_evidence).then(Sha256::new),
+            f16_roundtrip_logical_f32_hasher,
+            payload_hasher: capture_evidence.then(Sha256::new),
+            payload_bytes: 0,
             imatrix,
         });
         Ok(())
@@ -918,49 +1143,8 @@ impl<W: Write + Seek> StreamingWriter<W> {
             )));
         }
 
-        let payload: Vec<u8> = match p.ggml_type {
-            GgmlType::F16 => {
-                let mut v = Vec::with_capacity(data.len() * 2);
-                for &x in data {
-                    v.extend_from_slice(&f16::from_f32(x).to_le_bytes());
-                }
-                v
-            }
-            GgmlType::F32 => {
-                let mut v = Vec::with_capacity(data.len() * 4);
-                for &x in data {
-                    v.extend_from_slice(&x.to_le_bytes());
-                }
-                v
-            }
-            GgmlType::I32 => {
-                let mut v = Vec::with_capacity(data.len() * 4);
-                for &x in data {
-                    if !x.is_finite()
-                        || x.fract() != 0.0
-                        || x < i32::MIN as f32
-                        || x > i32::MAX as f32
-                    {
-                        return Err(OrchestratorError::StreamProtocol(format!(
-                            "tensor `{}` contains non-I32 routing value {x}",
-                            p.name
-                        )));
-                    }
-                    v.extend_from_slice(&(x as i32).to_le_bytes());
-                }
-                v
-            }
-            _ => {
-                let quantizer = quantizer_for(p.ggml_type)?;
-                // Canonical first writes an F16 intermediate and reads
-                // it back before quantizing. Apply that exact roundtrip
-                // independently per row-aligned chunk; row-local kernels
-                // therefore produce the same byte concatenation as one
-                // whole-tensor call without the whole-tensor allocation.
-                let f16_rt: Vec<f32> = data.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
-                quantizer.quantize(&f16_rt, p.n_per_row, active.imatrix.as_deref())?
-            }
-        };
+        let (payload, f16_roundtrip) =
+            encode_planned_tensor_payload(p, data, active.imatrix.as_deref())?;
 
         let input_f32_bytes = data
             .len()
@@ -971,7 +1155,10 @@ impl<W: Write + Seek> StreamingWriter<W> {
                     p.name
                 ))
             })?;
-        let quantized = !matches!(p.ggml_type, GgmlType::F16 | GgmlType::F32 | GgmlType::I32);
+        let quantized = !matches!(
+            p.ggml_type,
+            GgmlType::F16 | GgmlType::BF16 | GgmlType::F32 | GgmlType::I32
+        );
         let f16_roundtrip_f32_bytes = if quantized { input_f32_bytes } else { 0 };
         let quantized_payload_bytes = if quantized { payload.len() } else { 0 };
         let working_vec_bytes = input_f32_bytes
@@ -990,6 +1177,43 @@ impl<W: Write + Seek> StreamingWriter<W> {
             .active_chunks
             .as_mut()
             .expect("active tensor validated above");
+        if let Some(hasher) = active.converted_f32_bytes_hasher.as_mut() {
+            Self::update_f32_hasher(hasher, data);
+        }
+        if let Some(hasher) = active.converted_logical_f32_hasher.as_mut() {
+            hasher.update(data).map_err(|error| {
+                OrchestratorError::StreamProtocol(format!(
+                    "stream_tensor_chunk: tensor `{}` logical hash failed: {error}",
+                    p.name
+                ))
+            })?;
+        }
+        if let (Some(raw_hasher), Some(logical_hasher), Some(values)) = (
+            active.f16_roundtrip_f32_bytes_hasher.as_mut(),
+            active.f16_roundtrip_logical_f32_hasher.as_mut(),
+            f16_roundtrip.as_deref(),
+        ) {
+            Self::update_f32_hasher(raw_hasher, values);
+            logical_hasher.update(values).map_err(|error| {
+                OrchestratorError::StreamProtocol(format!(
+                    "stream_tensor_chunk: tensor `{}` roundtrip logical hash failed: {error}",
+                    p.name
+                ))
+            })?;
+        }
+        if let Some(hasher) = active.payload_hasher.as_mut() {
+            hasher.update(&payload);
+        }
+        active.payload_bytes =
+            active
+                .payload_bytes
+                .checked_add(payload.len())
+                .ok_or_else(|| {
+                    OrchestratorError::StreamProtocol(format!(
+                        "stream_tensor_chunk: tensor `{}` payload byte count overflow",
+                        p.name
+                    ))
+                })?;
         active.total_elements = total_elements;
         active.chunk_count += 1;
         active.max_chunk_elements = active.max_chunk_elements.max(data.len());
@@ -1030,7 +1254,75 @@ impl<W: Write + Seek> StreamingWriter<W> {
         }
 
         self.writer.finish_tensor_payload(tensor_idx)?;
-        let active = self.active_chunks.take().expect("validated active tensor");
+        let relative_payload_offset =
+            self.writer
+                .tensor_payload_offset(tensor_idx)
+                .ok_or_else(|| {
+                    OrchestratorError::StreamProtocol(format!(
+                        "finish_tensor_chunks: tensor `{}` has no committed payload offset",
+                        self.planned[tensor_idx].name
+                    ))
+                })?;
+        let mut active = self.active_chunks.take().expect("validated active tensor");
+        let planned = &self.planned[tensor_idx];
+        let payload_bytes = u64::try_from(active.payload_bytes).map_err(|_| {
+            OrchestratorError::StreamProtocol(format!(
+                "finish_tensor_chunks: tensor `{}` payload byte count is not representable",
+                planned.name
+            ))
+        })?;
+        if let Some(completed) = self.completed_tensor_evidence.as_mut() {
+            let converted_raw = active.converted_f32_bytes_hasher.take().ok_or_else(|| {
+                OrchestratorError::StreamProtocol(format!(
+                    "finish_tensor_chunks: tensor `{}` is missing its raw evidence hasher",
+                    planned.name
+                ))
+            })?;
+            let converted_logical =
+                active.converted_logical_f32_hasher.take().ok_or_else(|| {
+                    OrchestratorError::StreamProtocol(format!(
+                        "finish_tensor_chunks: tensor `{}` is missing its logical evidence hasher",
+                        planned.name
+                    ))
+                })?;
+            let payload = active.payload_hasher.take().ok_or_else(|| {
+                OrchestratorError::StreamProtocol(format!(
+                    "finish_tensor_chunks: tensor `{}` is missing its payload evidence hasher",
+                    planned.name
+                ))
+            })?;
+            completed.push(TensorWriteEvidence {
+                plan_index: tensor_idx,
+                tensor_name: planned.name.clone(),
+                dims_gguf_innermost_first: planned.dims_gguf.clone(),
+                ggml_type: planned.ggml_type,
+                converted_f32_bytes_sha256: hex::encode(converted_raw.finalize()),
+                converted_logical_f32_sha256: converted_logical.finalize().map_err(|error| {
+                    OrchestratorError::StreamProtocol(format!(
+                        "finish_tensor_chunks: tensor `{}` logical hash failed: {error}",
+                        planned.name
+                    ))
+                })?,
+                f16_roundtrip_f32_bytes_sha256: active
+                    .f16_roundtrip_f32_bytes_hasher
+                    .take()
+                    .map(|hasher| hex::encode(hasher.finalize())),
+                f16_roundtrip_logical_f32_sha256: active
+                    .f16_roundtrip_logical_f32_hasher
+                    .take()
+                    .map(LogicalF32Hasher::finalize)
+                    .transpose()
+                    .map_err(|error| {
+                        OrchestratorError::StreamProtocol(format!(
+                            "finish_tensor_chunks: tensor `{}` roundtrip logical hash failed: {error}",
+                            planned.name
+                        ))
+                    })?,
+                payload_sha256: hex::encode(payload.finalize()),
+                payload_bytes,
+                relative_payload_offset,
+            });
+        }
         self.next_idx += 1;
         Ok(TensorChunkStats {
             total_elements: active.total_elements,
@@ -1072,7 +1364,23 @@ impl<W: Write + Seek> StreamingWriter<W> {
     /// every planned tensor has been streamed; otherwise the writer
     /// surfaces `WriterError::MissingTensorPayloads` per the existing
     /// `GgufWriter::finalize` contract.
-    pub fn finalize(mut self) -> Result<(), OrchestratorError> {
+    pub fn finalize(self) -> Result<(), OrchestratorError> {
+        self.finalize_inner().map(|_| ())
+    }
+
+    /// Finalize the GGUF and return exact tensor evidence only after every
+    /// directory offset has been committed successfully.
+    pub(crate) fn finalize_with_evidence(
+        self,
+    ) -> Result<Vec<TensorWriteEvidence>, OrchestratorError> {
+        self.finalize_inner()?.ok_or_else(|| {
+            OrchestratorError::StreamProtocol(
+                "finalize_with_evidence called on an ordinary writer".into(),
+            )
+        })
+    }
+
+    fn finalize_inner(mut self) -> Result<Option<Vec<TensorWriteEvidence>>, OrchestratorError> {
         if let Some(active) = self.active_chunks.as_ref() {
             return Err(OrchestratorError::StreamProtocol(format!(
                 "finalize: tensor {} still has an active chunk stream",
@@ -1121,7 +1429,7 @@ impl<W: Write + Seek> StreamingWriter<W> {
             }
         }
 
-        Ok(())
+        Ok(self.completed_tensor_evidence)
     }
 }
 
@@ -1493,6 +1801,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bf16_storage_is_dense_and_has_no_quantizer_roundtrip() {
+        let mut orch =
+            ConvertOrchestrator::new(LlamaFtype::BF16, ArchName::Llama3, default_hparams());
+        orch.add_metadata(
+            "general.architecture".to_string(),
+            MetaValue::String("llama".into()),
+        );
+        let values = vec![1.0_f32, -2.5, 0.25, 7.0];
+        orch.plan_tensors(vec![PlanEntry {
+            name: "blk.0.attn_q.weight".into(),
+            shape: vec![4, 1],
+            source_dtype: SourceDtype::BF16,
+            layer_index: Some(0),
+        }])
+        .unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let evidence;
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut writer = orch.begin_write_with_evidence(file).unwrap();
+            writer.stream_tensor(0, &values).unwrap();
+            evidence = writer.finalize_with_evidence().unwrap();
+        }
+        assert_eq!(evidence[0].ggml_type, GgmlType::BF16);
+        assert_eq!(evidence[0].payload_bytes, 8);
+        assert!(evidence[0].f16_roundtrip_f32_bytes_sha256.is_none());
+        assert!(evidence[0].f16_roundtrip_logical_f32_sha256.is_none());
+    }
+
+    #[test]
+    fn ordinary_writer_does_not_allocate_or_update_evidence_hashers() {
+        let mut orch =
+            ConvertOrchestrator::new(LlamaFtype::AllF32, ArchName::Llama3, default_hparams());
+        orch.plan_tensors(vec![PlanEntry {
+            name: "output_norm.weight".into(),
+            shape: vec![4],
+            source_dtype: SourceDtype::F32,
+            layer_index: None,
+        }])
+        .unwrap();
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = orch.begin_write(&mut cursor).unwrap();
+        assert!(writer.completed_tensor_evidence.is_none());
+        writer.begin_tensor_chunks(0).unwrap();
+        let active = writer.active_chunks.as_ref().unwrap();
+        assert!(active.converted_f32_bytes_hasher.is_none());
+        assert!(active.converted_logical_f32_hasher.is_none());
+        assert!(active.payload_hasher.is_none());
+        writer
+            .stream_tensor_chunk(0, &[1.0, 2.0, 3.0, 4.0])
+            .unwrap();
+        writer.finish_tensor_chunks(0).unwrap();
+        writer.finalize().unwrap();
+    }
+
     /// Acceptance test 3 — no-fallback typed error. A non-vision /
     /// non-audio tensor with `n_per_row = 15` at a K-quant ftype must
     /// surface `QuantizeError::NotBlockAligned` instead of silently
@@ -1522,8 +1886,7 @@ mod tests {
         let err = orch.plan_tensors(entries).expect_err("must error");
         match err {
             OrchestratorError::Quantize(QuantizeError::NotBlockAligned {
-                n_per_row: 15,
-                ..
+                n_per_row: 15, ..
             }) => {}
             other => panic!(
                 "expected OrchestratorError::Quantize(NotBlockAligned {{ n_per_row: 15, .. }}), got {other:?}"
@@ -1707,18 +2070,20 @@ mod tests {
         let data = deterministic_data(per_expert * experts, 0x5eed);
 
         let mut whole = std::io::Cursor::new(Vec::new());
+        let whole_evidence;
         {
             let mut sw = one_deepseek_q2_tensor(vec![n_per_row, rows_per_expert, experts])
-                .begin_write(&mut whole)
+                .begin_write_with_evidence(&mut whole)
                 .unwrap();
             sw.stream_tensor(0, &data).unwrap();
-            sw.finalize().unwrap();
+            whole_evidence = sw.finalize_with_evidence().unwrap();
         }
 
         let mut chunked = std::io::Cursor::new(Vec::new());
+        let chunked_evidence;
         {
             let mut sw = one_deepseek_q2_tensor(vec![n_per_row, rows_per_expert, experts])
-                .begin_write(&mut chunked)
+                .begin_write_with_evidence(&mut chunked)
                 .unwrap();
             sw.begin_tensor_chunks(0).unwrap();
             sw.stream_tensor_chunk(0, &data[..per_expert]).unwrap();
@@ -1738,10 +2103,35 @@ mod tests {
                     + stats.max_f16_roundtrip_f32_bytes
                     + stats.max_quantized_payload_bytes
             );
-            sw.finalize().unwrap();
+            chunked_evidence = sw.finalize_with_evidence().unwrap();
         }
 
         assert_eq!(chunked.into_inner(), whole.into_inner());
+        assert_eq!(chunked_evidence, whole_evidence);
+        let evidence = &chunked_evidence[0];
+        let mut converted = Sha256::new();
+        StreamingWriter::<std::io::Cursor<Vec<u8>>>::update_f32_hasher(&mut converted, &data);
+        assert_eq!(
+            evidence.converted_f32_bytes_sha256,
+            hex::encode(converted.finalize())
+        );
+        let mut logical_shape: Vec<u64> = vec![n_per_row, rows_per_expert, experts]
+            .into_iter()
+            .map(|dimension| dimension as u64)
+            .collect();
+        logical_shape.reverse();
+        assert_eq!(
+            evidence.converted_logical_f32_sha256,
+            crate::core::provenance::tensor_execution::logical_f32_sha256(&logical_shape, &data)
+                .unwrap()
+        );
+        assert!(evidence.f16_roundtrip_f32_bytes_sha256.is_some());
+        assert!(evidence.f16_roundtrip_logical_f32_sha256.is_some());
+        assert_eq!(
+            evidence.payload_bytes,
+            u64::try_from(rows_per_expert * experts * GgmlType::Q2_K.row_size(n_per_row)).unwrap()
+        );
+        assert_eq!(evidence.relative_payload_offset, 0);
     }
 
     #[test]

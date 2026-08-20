@@ -3,6 +3,8 @@
 - Status: Accepted; measured-selector foundation implemented, artifact
   generation and CLI activation remain gated by the phases below
 - Date: 2026-08-18
+- Updated: 2026-08-19 — source-to-stored evidence requires the exact published
+  `mlx-native = 0.10.15` host-GGUF and routing/capability surface
 - Owners: hf2q product pipeline; mlx-native model-agnostic execution primitives
 - Supersedes: ADR-020's proposed DWQ architecture and performance claims
 
@@ -27,8 +29,9 @@ Two prerequisite seams are also open:
   stubs, real quantized Qwen FFN forward is unsupported there, and the DWQ
   smoke route in `src/arch/smoke.rs` returns `Skipped`. Source-text tests pin
   thresholds but do not execute a real statistical quality gate.
-- The converter accepts or can internally select GGUF tensor encodings that
-  `mlx-native 0.10.11` does not read. Confirmed examples are explicit Q4_1 and
+- At the time this ADR was accepted, the converter accepted or could internally
+  select GGUF tensor encodings that the then-pinned `mlx-native 0.10.11` did
+  not read. Confirmed examples were explicit Q4_1 and
   Q5_0, plus the Q4_K shape fallback to Q5_0. A production auto system must
   prove converter-output-to-runtime servability before considering quality or
   speed.
@@ -54,7 +57,7 @@ complete production format:
   linear slots;
 - there is no current Rust DWQ trainer or full-model MLX-affine converter.
 
-The exact `mlx-native = 0.10.11` dependency has affine packed-weight kernels
+The then-exact `mlx-native = 0.10.11` dependency had affine packed-weight kernels
 and QDQ affine primitives, but the existence of a primitive does not prove
 that hf2q's loader, graph routing, prompt QMM, token QMV, width-N, or model
 family is complete or fast.
@@ -380,7 +383,7 @@ mlx-native owns reusable, model-agnostic execution machinery:
 - a machine-readable capability surface describing supported bit widths, group
   sizes, dtypes, shapes, and execution regimes.
 
-The `mlx-native 0.10.11` release contains a generic `QuantizedWeight` and
+The `mlx-native 0.10.11` release originally established a generic `QuantizedWeight` and
 sharded safetensors loader, packed affine 4/6/8-bit execution, optimized
 4/8-bit QMV routes, affine QMM variants, packed 4/6-bit embedding gather, and
 QDQ affine scale/bias gradient primitives. It also publishes the serde-backed
@@ -445,9 +448,12 @@ This phase changes no conversion format and makes no new speed claim.
 
 ### Phase A.1 — close current Gate-0/Gate-1 seams
 
-- Pin and consume `mlx-native 0.10.11`'s published capability surface from
-  hf2q as a machine-readable converter/runtime tensor-type contract. Keep a
-  candidate ineligible unless every required tensor and regime is executable.
+- Pin and consume `mlx-native 0.10.15`'s published capability surface from
+  hf2q as a machine-readable converter/runtime tensor-type contract. Its
+  `GgufFile::from_file`, exact host raw/F32 tensor reads, unified routing
+  policy, and GGML capability schema are the current source-to-stored/runtime
+  seam. Keep a candidate ineligible unless every required tensor and regime is
+  executable.
 - Reject or implement Q4_1, Q5_0, BF16, MXFP4, and every internal shape
   fallback consistently; test every accepted selector through exact-runtime
   GGUF reopen and the regimes it advertises.
@@ -676,6 +682,50 @@ the actual source/GGUF/loaded/executed bytes; deserialize and recompute typed
 mlx-native capability decisions under the exact routing policy; and pass the
 real Qwen3.8 Apple gate. Until then schema v4 cannot authorize a Dynamic cost,
 candidate artifact, or production `--quant auto` choice.
+
+#### 2026-08-19 — dense-Qwen source-to-stored evidence producer
+
+The first D2b implementation slice authenticates only the source-to-stored
+tensor segment of that larger contract. It is deliberately not a loader,
+runtime-cost, sensitivity, or mixed-policy result:
+
+- an opt-in dense-Qwen conversion path consumes the opaque D1 source inventory
+  and partition, reopens authenticated owned safetensors bytes, executes the
+  production mapper and typed bake operations, and streams one tensor at a
+  time through the production writer. Ordinary conversion does not pay the
+  evidence hashing or retention cost;
+- the writer records exact post-bake F32, mandatory quantizer F16-roundtrip,
+  and packed payload hashes. The finalized temporary GGUF is parsed through
+  one already-open file identity; its tensor directory, exact payload region,
+  host-decoded logical F32 values, and whole-container identity are checked
+  before artifact and sidecar promotion. Source payload vectors and quantizer
+  workspaces are dropped per tensor;
+- persisted replay does not trust the self-hashed JSON to name a codec or
+  payload. It reopens the authenticated source, reruns the standard Q4_K_M or
+  Q8_0 policy plus the same production F16/quantizer encoder, and compares the
+  resulting bytes to the promoted GGUF. Replay requires the exact hf2q commit;
+  selector relabeling, commit substitution, sidecar mutation, and GGUF
+  mutation fail closed;
+- Q4_K_M is correctly treated as a heterogeneous policy, not as a claim that
+  every tensor is Q4_K. Each tensor receipt records the actual policy-selected
+  wire type. MTP tensors may be stored only when D1 classifies them fixed or
+  protected; vision/excluded source tensors remain explicit mapper drops;
+- the GGUF-wide hash is a container identity used to bind tensor offsets and
+  payloads. D2b v1 explicitly does **not** authenticate derivation of
+  non-tensor GGUF metadata such as model-card, tokenizer, generation, or chat
+  template fields. Serving admission must validate those inputs separately;
+  this receipt cannot be cited as whole-GGUF metadata provenance;
+- the slice admits only standard Q4_K_M and Q8_0 with no imatrix,
+  calibration, learned affine state, or DWQ overlay. It does not splice a
+  mixed candidate artifact, connect receipts to schema-v4 allocator options,
+  observe loaded/executed Qwen buffers, validate typed mlx-native capability
+  decisions, or authorize any Apple performance comparison.
+
+The next D2b slice must join this verified stored catalog to the actual Qwen
+loader, amax/7 repacks, direct packed FFN buffers, output-head upload, and
+same-policy production dispatch. Only after that physical path is complete may
+D3 produce exact-teacher Dynamic sensitivity and materialize candidate
+policies. DWQ remains outside the authorized program.
 
 ### Phase E — production `--quant auto`
 

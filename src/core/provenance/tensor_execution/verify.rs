@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::logical_hash::LOGICAL_F32_HASH_ENCODING;
 use super::types::*;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -473,7 +474,7 @@ pub fn verify_tensor_execution_manifest(
         || !is_sha256(&manifest.source_tensor_inventory_sha256)
         || !is_sha256(&manifest.tensor_partition_manifest_sha256)
         || !is_sha256(&manifest.conversion_receipt_sha256)
-        || manifest.logical_hash_encoding != "hf2q-framed-f32-le-v1"
+        || manifest.logical_hash_encoding != LOGICAL_F32_HASH_ENCODING
         || !is_sha256(&manifest.runtime.routing_policy_sha256)
         || !is_sha256(&manifest.runtime.graph_configuration_sha256)
         || !is_sha256(&manifest.runtime.capability_profile_sha256)

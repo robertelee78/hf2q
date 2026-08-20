@@ -43,7 +43,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
-use safetensors::{tensor::Dtype, SafeTensors};
+use safetensors::{SafeTensors, tensor::Dtype};
 
 use crate::convert::source_dtype::{fp8, mxfp4};
 use crate::core::mlx_safetensors_loader::{discover_shards, read_floats_to_f32};
@@ -65,6 +65,17 @@ pub struct HfTensor {
     pub source_dtype: SourceDtype,
     /// F32 row-major data, `shape.iter().product()` elements.
     pub data: Vec<f32>,
+    /// Exact safetensors payload evidence. Synthesized tensors have no source
+    /// region and therefore carry `None`.
+    pub(crate) raw_source: Option<RawSourceTensorEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawSourceTensorEvidence {
+    pub(crate) artifact_id: String,
+    pub(crate) absolute_byte_offset: u64,
+    pub(crate) byte_len: u64,
+    pub(crate) sha256: String,
 }
 
 /// Cheap per-tensor metadata recorded at `open` time. Carries the shape
@@ -88,12 +99,12 @@ pub struct TensorMeta {
     pub source_dtype: SourceDtype,
     /// Index into `HfModelSource::shards` — only used internally by the
     /// reader to slice the right mmap during streaming.
-    shard_idx: usize,
+    pub(crate) shard_idx: usize,
     /// safetensors-header `data_offsets.0`: byte offset of the tensor
     /// payload INSIDE the post-header data region of `shard_idx`.
-    data_off_start: usize,
+    pub(crate) data_off_start: usize,
     /// safetensors-header `data_offsets.1`: end byte offset.
-    data_off_end: usize,
+    pub(crate) data_off_end: usize,
 }
 
 impl TensorMeta {
@@ -548,11 +559,11 @@ impl HfModelSource {
                     data_off_start: info.data_offsets.0,
                     data_off_end: info.data_offsets.1,
                 });
-                // If multiple shards declare the same tensor name the
-                // last one wins (mirrors the original buffered impl's
-                // `raw.insert` semantics); safetensors index files do
-                // not normally repeat names so this is just defensive.
-                by_name.insert(name.to_string(), idx);
+                if by_name.insert(name.to_string(), idx).is_some() {
+                    return Err(SourceError::Safetensors(format!(
+                        "tensor `{name}` is duplicated across source shards"
+                    )));
+                }
             }
 
             shards.push(ShardMmap {
@@ -883,6 +894,7 @@ fn materialize_tensor(src: &HfModelSource, m: &TensorMeta) -> Result<HfTensor, S
         shape: m.shape.clone(),
         source_dtype,
         data,
+        raw_source: None,
     })
 }
 
