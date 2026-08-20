@@ -64,6 +64,7 @@ use mlx_native::ops::chunk_gated_delta_rule::{
     ChunkGatedDeltaRuleParams, ChunkInternalArena, FIXED_BT,
 };
 use mlx_native::ops::compute_g_beta::dispatch_compute_g_beta;
+use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, scalar_mul_f32, CastDirection};
 use mlx_native::ops::gated_delta_net::{
@@ -615,12 +616,33 @@ pub fn apply_pre_norm(
     Ok(out)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Bf16ProjectionRoute {
+    Gemv,
+    TensorMm,
+}
+
+/// Select the source-BF16 projection route without inspecting process state.
+///
+/// The published mlx-native v0.10.16 GEMV kernel processes two output rows
+/// per threadgroup and forms both row pointers before guarding the second
+/// write. Until the native odd-width path is hardened, keep odd `N` on the
+/// tensor-MM route. All Qwen3.8 DeltaNet projection widths are even.
+fn bf16_projection_route(seq_len: u32, out_features: u32) -> Bf16ProjectionRoute {
+    if seq_len == 1 && out_features % 2 == 0 {
+        Bf16ProjectionRoute::Gemv
+    } else {
+        Bf16ProjectionRoute::TensorMm
+    }
+}
+
 /// Apply a single linear projection: `output = input @ weight^T`.
 ///
 /// Dispatches based on weight dtype:
 /// - **U8** (Q4_0 GGML blocks): `quantized_matmul_ggml` (dispatch_mv for M=1 decode,
 ///   dispatch_mm for M>8 prefill). 3.56× less bandwidth than BF16; deterministic.
-/// - **BF16**: `dense_matmul_bf16_f32_tensor` (MMA tensor-core tiled GEMM).
+/// - **BF16**: paired-row GEMV for M=1 decode with even output width, otherwise
+///   `dense_matmul_bf16_f32_tensor` (MMA tensor-core tiled GEMM).
 /// - **F32**: inline cast to BF16 then MMA GEMM (legacy path).
 ///
 /// Requires `in_features >= 32`.
@@ -656,6 +678,13 @@ pub fn apply_proj(
                 .context("quantized_matmul_ggml Q4_0")?;
         }
         DType::BF16 => {
+            if input.dtype() != DType::F32 || dst.dtype() != DType::F32 {
+                return Err(anyhow!(
+                    "apply_proj BF16 requires F32 input/output, got input={:?} output={:?}",
+                    input.dtype(),
+                    dst.dtype()
+                ));
+            }
             let params = DenseMmBf16F32Params {
                 m: seq_len,
                 n: out_features,
@@ -663,10 +692,20 @@ pub fn apply_proj(
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            dense_matmul_bf16_f32_tensor(
-                encoder, registry, device, weight, input, &mut dst, &params,
-            )
-            .context("dense_matmul_bf16_f32_tensor proj")?;
+            match bf16_projection_route(seq_len, out_features) {
+                Bf16ProjectionRoute::Gemv => {
+                    dense_gemv_bf16_f32(
+                        encoder, registry, device, weight, input, &mut dst, &params,
+                    )
+                    .context("dense_gemv_bf16_f32 proj M=1")?;
+                }
+                Bf16ProjectionRoute::TensorMm => {
+                    dense_matmul_bf16_f32_tensor(
+                        encoder, registry, device, weight, input, &mut dst, &params,
+                    )
+                    .context("dense_matmul_bf16_f32_tensor proj")?;
+                }
+            }
         }
         DType::F32 => {
             // Legacy inline cast path.
@@ -954,11 +993,12 @@ pub fn apply_pre_norm_into(
 /// Caller-allocated variant of [`apply_proj`].
 ///
 /// Writes `output = input @ weight^T` into `dst`. The branch logic mirrors
-/// [`apply_proj`] verbatim — `U8` (Q4_0 GGML), `BF16` (MMA), or `F32`
-/// (legacy inline cast) — but skips the per-call `pooled_alloc_buffer` for
-/// the destination buffer. The `F32` legacy path still pools its small
-/// inline-cast `weight_bf16` scratch (rare on Qwen3.6 dwq46; kept for
-/// hygiene parity with the original).
+/// [`apply_proj`] verbatim — `U8` (Q4_0 GGML), `BF16` (paired-row GEMV for
+/// M=1 decode with even output width, otherwise MMA), or `F32` (legacy inline
+/// cast) — but skips the per-call `pooled_alloc_buffer` for the destination
+/// buffer. The `F32` legacy path still pools its small inline-cast
+/// `weight_bf16` scratch (rare on Qwen3.6 dwq46; kept for hygiene parity with
+/// the original).
 ///
 /// # Errors
 ///
@@ -988,6 +1028,13 @@ pub fn apply_proj_into(
                 .context("quantized_matmul_ggml Q4_0 (arena)")?;
         }
         DType::BF16 => {
+            if input.dtype() != DType::F32 || dst.dtype() != DType::F32 {
+                return Err(anyhow!(
+                    "apply_proj_into BF16 requires F32 input/output, got input={:?} output={:?}",
+                    input.dtype(),
+                    dst.dtype()
+                ));
+            }
             let params = DenseMmBf16F32Params {
                 m: seq_len,
                 n: out_features,
@@ -995,8 +1042,18 @@ pub fn apply_proj_into(
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            dense_matmul_bf16_f32_tensor(encoder, registry, device, weight, input, dst, &params)
-                .context("dense_matmul_bf16_f32_tensor proj (arena)")?;
+            match bf16_projection_route(seq_len, out_features) {
+                Bf16ProjectionRoute::Gemv => {
+                    dense_gemv_bf16_f32(encoder, registry, device, weight, input, dst, &params)
+                        .context("dense_gemv_bf16_f32 proj (arena M=1)")?;
+                }
+                Bf16ProjectionRoute::TensorMm => {
+                    dense_matmul_bf16_f32_tensor(
+                        encoder, registry, device, weight, input, dst, &params,
+                    )
+                    .context("dense_matmul_bf16_f32_tensor proj (arena)")?;
+                }
+            }
         }
         DType::F32 => {
             // Legacy inline cast path — same as `apply_proj`. The
@@ -4514,6 +4571,10 @@ pub fn build_delta_net_layer_decode_into(
 // ================================================================
 // Tests
 // ================================================================
+
+#[cfg(test)]
+#[path = "gpu_delta_net/bf16_projection_tests.rs"]
+mod bf16_projection_tests;
 
 #[cfg(test)]
 mod tests {

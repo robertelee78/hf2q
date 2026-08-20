@@ -1130,6 +1130,21 @@ cache, target writer, or forward method and proves no encoding, submission,
 completion, logits, finished/published target, runtime liveness, peak memory,
 performance, sensitivity, Dynamic, selector, autoquant, or DWQ authority.
 
+The first execution-route prerequisite aligns DeltaNet source-BF16 decode
+projections with the already-established full-attention and dense-FFN policy.
+For BF16 weights and F32 activations, M=1 projections with an even output width
+use mlx-native 0.10.16's paired-row `dense_gemv_bf16_f32`; M>1 and odd-width
+projections remain on `dense_matmul_bf16_f32_tensor`. The odd-width fallback is
+deliberate because the published GEMV shader forms two source-row pointers per
+threadgroup before guarding the second write. Every official Qwen3.8 DeltaNet
+projection width is even. Both allocating and caller-destination helpers use
+one process-state-independent selector and reject non-F32 activation/output
+buffers before invoking the native BF16 route. U8/GGML and legacy F32-cast
+paths are unchanged. This establishes a safe route prerequisite only: without
+a paired benchmark it makes no speed claim, and it proves no complete graph,
+terminal completion, teacher target, sensitivity, Dynamic, selector,
+autoquant, or DWQ authority.
+
 Completing D3a requires a family-owned, bounded source-precision dense-Qwen
 runner that consumes authenticated source tensors without the production
 Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps

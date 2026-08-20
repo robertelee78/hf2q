@@ -7612,7 +7612,7 @@ mod tests {
         // inflate the counts it asserts.
         let test_attr = format!("#[{}]", "test");
         let lock_call = format!("{}();", "hf2q_gpu_test_lock");
-        let modules: [(&str, &str); 40] = [
+        let modules: [(&str, &str); 41] = [
             (
                 "inference/models/bert/bert_gpu.rs",
                 include_str!("../bert/bert_gpu.rs"),
@@ -7676,6 +7676,10 @@ mod tests {
             (
                 "inference/models/qwen35/gpu_delta_net.rs",
                 include_str!("gpu_delta_net.rs"),
+            ),
+            (
+                "inference/models/qwen35/gpu_delta_net/bf16_projection_tests.rs",
+                include_str!("gpu_delta_net/bf16_projection_tests.rs"),
             ),
             (
                 "inference/models/qwen35/gpu_ffn.rs",
