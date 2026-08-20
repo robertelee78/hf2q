@@ -93,6 +93,9 @@ pub enum SafetensorsError {
         derived_bytes: usize,
     },
 
+    #[error("Tensor '{tensor}' is declared by more than one safetensors shard")]
+    DuplicateTensor { tensor: String },
+
     /// Surfaced when the eager [`read_tensors`] bridge runs the lazy
     /// closures and one of them fails. Should be impossible in practice
     /// (bounds + size are checked at parse time before the closure is
@@ -343,6 +346,11 @@ fn index_shard_lazy(
         // Skip __metadata__ key per safetensors convention.
         if name == "__metadata__" {
             continue;
+        }
+        if lazy_map.contains_key(name) {
+            return Err(SafetensorsError::DuplicateTensor {
+                tensor: name.clone(),
+            });
         }
 
         let dtype_str = info.get("dtype").and_then(|v| v.as_str()).ok_or_else(|| {

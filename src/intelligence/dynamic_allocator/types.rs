@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::measured_auto_quant::{ExecutionIdentity, InferenceRegime, SourceIdentity};
 
-pub const DYNAMIC_ALLOCATION_SCHEMA_VERSION: u32 = 2;
+pub const DYNAMIC_ALLOCATION_SCHEMA_VERSION: u32 = 3;
 
 /// GGUF encodings which can be offered only when the exact runtime capability
 /// catalog says the required operation/shape routes are executable.
@@ -57,7 +57,8 @@ pub enum TensorCodec {
 #[serde(deny_unknown_fields)]
 pub struct TensorMember {
     pub name: String,
-    /// GGUF order: the innermost/input dimension is first.
+    /// Exact Hugging Face/safetensors source order. Stored and executed
+    /// layouts belong to `TensorExecutionPlan`, not the source catalog.
     pub shape: Vec<usize>,
     pub role: String,
     pub source_dtype: ScalarDType,
@@ -131,9 +132,21 @@ pub struct RegimeCost {
 #[serde(deny_unknown_fields)]
 pub struct OperationExecutionEvidence {
     pub operation_id: String,
+    pub graph_path: String,
     pub tensor_names: Vec<String>,
     pub capability_decision_sha256: String,
     pub regime_costs: BTreeMap<InferenceRegime, RegimeCost>,
+}
+
+/// Stable logical graph operation shared by every precision option for one
+/// allocation unit. Storage/runtime routes may differ; tensor coverage and
+/// graph identity may not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TensorOperation {
+    pub operation_id: String,
+    pub graph_path: String,
+    pub tensor_names: Vec<String>,
 }
 
 /// Shared definition and scale for additive proposal loss. Full-model quality
@@ -146,6 +159,9 @@ pub struct SensitivityModelIdentity {
     pub fixed_point_scale: u64,
     pub component_weights_sha256: String,
     pub coverage_contract_sha256: String,
+    /// Structurally admitted D1 observation receipt. A later family-owned
+    /// collector must authenticate the referenced materializations.
+    pub coverage_receipt_sha256: String,
 }
 
 /// Auditable fixed-point local quality evidence for one unit option.
@@ -191,6 +207,7 @@ pub struct TensorAllocationUnit {
     /// Logical routed experts represented by this unit, including packed
     /// rank-3 expert tensors which do not have one physical tensor per expert.
     pub expected_expert_ids: Vec<u32>,
+    pub operations: Vec<TensorOperation>,
     pub options: Vec<TensorOption>,
 }
 
@@ -211,6 +228,13 @@ pub struct DynamicAllocationProblem {
     pub execution: ExecutionIdentity,
     pub tensor_catalog_sha256: String,
     pub expected_tensor_count: usize,
+    /// Three-way calibration, repair-validation, and untouched acceptance
+    /// partition. Sensitivity production may consume only its calibration
+    /// split; later candidate gates consume the other two phases.
+    pub dataset_partition_manifest_sha256: String,
+    /// Complete source inventory partition into variable allocation units and
+    /// explicit fixed/protected/excluded tensors.
+    pub tensor_partition_manifest_sha256: String,
     pub calibration_manifest_sha256: String,
     pub sensitivity_model: SensitivityModelIdentity,
     pub capability_profile_sha256: String,
@@ -241,6 +265,8 @@ pub struct PrecisionPolicyManifest {
     pub source: SourceIdentity,
     pub execution: ExecutionIdentity,
     pub tensor_catalog_sha256: String,
+    pub dataset_partition_manifest_sha256: String,
+    pub tensor_partition_manifest_sha256: String,
     pub calibration_manifest_sha256: String,
     pub capability_profile_sha256: String,
     pub proposal_workload_profile_sha256: String,

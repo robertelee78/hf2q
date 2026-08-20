@@ -320,26 +320,32 @@ group may improve approximation while increasing scale/bias traffic and
 slowing Metal execution. A two-bit artifact may be smaller and still be slower
 than four-bit for prompt or batched shapes.
 
-### 7. Learned quantization is staged on one affine ABI
+### 7. Learned quantization methods share one candidate boundary
 
-After the full-model affine baseline is correct, candidate producers land in
-measured order:
+After the full-model affine baseline is correct, the active implementation
+order is:
 
 1. affine RTN control;
 2. dynamic mixed-precision allocation;
-3. AWQ and GPTQ candidates;
-4. DWQ scale/bias distillation, optionally initialized from a preceding method.
+3. AWQ and GPTQ candidates only when separately measured evidence justifies
+   them.
+
+Per the owner decision on 2026-08-19, DWQ is not part of the current
+implementation program, dependency set, release claim, or acceptance
+requirement. Dynamic allocation, ordinary PTQ materialization, held-out repair,
+and Apple selection must be complete without it. The common candidate boundary
+may accommodate a future separately authorized DWQ experiment, but no DWQ
+trainer or scale/bias-distillation work is implied by this ADR phase.
 
 All production implementation remains Rust plus `mlx-native`. External tools
 may be reference oracles in benchmark harnesses only. Each algorithm consumes
 the exact source and emits the same manifest/receipt schema, so the selector is
 agnostic to how the codes/scales were produced.
 
-For 27B-class DWQ on 128 GiB unified memory, the implementation must stream
-teacher targets to sharded storage, release teacher state before student
-training where possible, bound calibration batches, and prove peak memory.
-The default corpus cannot be assumed behavior-complete; owner/family regression
-suites supplement source-logit distillation.
+If DWQ is authorized later for a 27B-class model on 128 GiB unified memory, its
+own amendment must bind teacher-target storage, teacher/student residency,
+calibration bounds, optimizer state, peak memory, and owner/family behavior
+suites before implementation begins.
 
 ### 8. Existing heuristic auto remains planning-only
 
@@ -358,7 +364,8 @@ hf2q owns:
 
 - Hugging Face source identity, safetensors ingestion, architecture and tensor
   mapping;
-- calibration corpus handling, RTN/imatrix/dynamic/AWQ/GPTQ/DWQ algorithms,
+- calibration corpus handling and authorized RTN/imatrix/dynamic/AWQ/GPTQ
+  candidate producers,
   per-tensor policy, and bounded-memory artifact production;
 - the model-family graph, tensor-to-operation routing, candidate manifests,
   source-quality/performance evidence, auto selection, and serving behavior.
@@ -496,8 +503,9 @@ capability and must independently beat eligible candidates.
   a distinct candidate and prove it against the exact source. An unrecorded
   proxy is not teacher evidence.
 - Add AWQ and GPTQ only behind the common candidate/evidence contract.
-- Add native DWQ with teacher-target sharding, trainable affine scale/bias
-  parameters, optimizer state bounds, checkpoints, and source-teacher gates.
+- Do not add DWQ in this program. A future DWQ candidate requires explicit
+  owner authorization plus a separate exact-teacher, memory, and behavior
+  evidence amendment; production Dynamic autoquant cannot depend on it.
 - Compare algorithms at identical encoding, group size, artifact/runtime,
   corpus, and workload wherever the question is algorithmic quality.
 - Report KL, one-step top-1, the schema-v2 fixed-horizon greedy trajectory
@@ -535,9 +543,10 @@ and evidence boundary needed before either can be truthful:
   and sensitivity evidence in the policy hash. A verifier independently
   regenerates the frontier from the allocation problem and rejects mutation.
 
-This closes only the **proposal substrate**. It does not yet produce structured
-calibration corpora, imatrices, KL gradients, quantized artifacts, repair a
-policy against full-model validation, or authorize a serving candidate.
+This closes only the **proposal substrate**. By itself it does not produce
+structured calibration evidence, imatrices, KL gradients, quantized artifacts,
+repair a policy against full-model validation, or authorize a serving
+candidate.
 Unsloth Dynamic 3 motivates model-specific heterogeneous allocation and
 disjoint calibration/evaluation; its public material does not disclose a
 reproducible selector that hf2q can import. hf2q therefore keeps the exact
@@ -545,6 +554,63 @@ owner-supplied checkpoint—including an abliterated or otherwise modified
 checkpoint—as teacher, generates its own source-bound evidence, and leaves
 final eligibility to held-out quality/behavior gates plus matched whole-model
 Apple measurements.
+
+#### 2026-08-19 — structured calibration and coverage producer substrate
+
+The next Phase-D slice freezes the inputs that later sensitivity, repair, and
+acceptance producers are allowed to consume. It still does not claim to
+measure Dynamic sensitivity:
+
+- structured examples preserve message roles, native tool definitions and
+  results, thinking mode, template arguments, provenance, license, domain, and
+  exact example order. Conversion and calibration share one fail-closed chat
+  template resolver with the authoritative priority sidecar ->
+  `tokenizer_config.json` -> family fallback. The v1 GGUF/runtime metadata
+  surface represents one template string, so Hugging Face named template maps
+  are rejected identically in both paths instead of selecting an implicit
+  `default` or `tool_use` template;
+- every split is rendered through the same production chat renderer used by
+  serving and tokenized from the same bytes used to compute the exact source
+  tokenizer/template bundle. Receipts retain enough ephemeral material to
+  independently rerender and recompute every raw, rendered, token, and stream
+  digest. Nested JSON insertion order is deliberately evidence-significant:
+  production templates expose that order to the model, so this contract does
+  not relabel recursively sorted JSON as semantically equivalent;
+- calibration, policy-repair validation, and final acceptance holdout are
+  hash-bound split identities checked at runtime. Partition verification
+  rejects overlap by upstream source-record identity, content-only message/tool
+  payload, rendered text, or fixed-width token window and rejects any source,
+  template, tokenizer, renderer, token-bound, or window-bound mismatch;
+- the source tensor inventory is constructed only by reading every tensor from
+  an opaque `VerifiedSourceManifest` snapshot and hashing its actual bytes,
+  name, source-order shape, dtype, and size. Partitioning then binds complete
+  atomic unit membership and packed-expert topology alongside explicit fixed,
+  protected, or excluded source dispositions. Execution codec is intentionally
+  absent here; the later source -> stored -> loaded -> executed manifest owns
+  that claim;
+- coverage contracts consume a validated partition plus an explicit structural
+  collector topology. Caller-supplied observation records must match every
+  declared operation id, graph path, tensor mapping, dense row floor, and
+  per-expert row floor exactly. This prevents substitutions within the declared
+  topology, but D1 does not authenticate activation arrays or prove that the
+  declared topology is the family graph. A family-owned Qwen collector plus an
+  opaque materialization verifier remains mandatory before these records are
+  accepted as measured attention or DeltaNet coverage;
+- allocation schema v3 records both the three-way dataset partition and the
+  full tensor partition. The solver still treats these as opaque identities;
+  admission therefore requires `validate_dynamic_allocation_bindings`, which
+  regenerates the dataset partition and coverage receipt, validates the source
+  tensor partition, and cross-checks every child hash before invoking the
+  solver. SHA-shaped substitutions are rejected.
+
+This is a **model-free producer substrate**, not a completed calibration run.
+It does not yet contain the real Qwen3.8 variable-unit/tap catalog. The exact
+Qwen3.8 source-precision teacher, full differentiable QDQ graph, sensitivity
+receipts, materialized mixed policies, repair loop, untouched acceptance
+results, typed execution manifest, and matched Apple measurements remain
+mandatory later gates. In particular, the current Qwen inference loader's
+hidden stored-to-Q4_0 conversions must be made explicit before Apple cost can
+guide allocation.
 
 ### Phase E — production `--quant auto`
 
@@ -581,9 +647,10 @@ Real-model Apple-Silicon gates:
 
 "Optimal" now means fastest measured inference for an explicit Apple-Silicon
 workload profile after hard coherence gates, not smallest artifact, highest
-nominal compression, or best theoretical bandwidth. DWQ becomes a quality
-optimization that can make a lower-precision affine candidate eligible; it is
-not a speed feature by itself.
+nominal compression, or best theoretical bandwidth. The current completion
+contract does not include DWQ; future learned-affine candidates, if separately
+authorized, would compete under the same quality-before-speed gates rather than
+becoming an assumed speed feature.
 
 The design applies unchanged to vanilla and weight-modified checkpoints. An
 intentional source behavior is preserved because the exact source is the

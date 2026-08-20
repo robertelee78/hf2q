@@ -116,6 +116,11 @@ fn normalize_problem(problem: &DynamicAllocationProblem) -> DynamicAllocationPro
         unit.members
             .sort_by(|left, right| left.name.cmp(&right.name));
         unit.expected_expert_ids.sort();
+        unit.operations
+            .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+        for operation in &mut unit.operations {
+            operation.tensor_names.sort();
+        }
         unit.options
             .sort_by(|left, right| left.option_id.cmp(&right.option_id));
         for option in &mut unit.options {
@@ -326,6 +331,7 @@ fn validate_option(
     let mut operation_ids = BTreeSet::new();
     for operation in &option.operations {
         if operation.operation_id.is_empty()
+            || operation.graph_path.is_empty()
             || !operation_ids.insert(operation.operation_id.as_str())
             || !is_sha256(&operation.capability_decision_sha256)
         {
@@ -419,6 +425,8 @@ fn validate_problem(problem: &DynamicAllocationProblem) -> Result<(), DynamicAll
         || problem.execution.hardware_id.is_empty()
         || problem.execution.os_build.is_empty()
         || !is_sha256(&problem.tensor_catalog_sha256)
+        || !is_sha256(&problem.dataset_partition_manifest_sha256)
+        || !is_sha256(&problem.tensor_partition_manifest_sha256)
         || !is_sha256(&problem.calibration_manifest_sha256)
         || !is_sha256(&problem.capability_profile_sha256)
         || !is_sha256(&problem.proposal_workload_profile_sha256)
@@ -427,6 +435,7 @@ fn validate_problem(problem: &DynamicAllocationProblem) -> Result<(), DynamicAll
         || problem.sensitivity_model.fixed_point_scale == 0
         || !is_sha256(&problem.sensitivity_model.component_weights_sha256)
         || !is_sha256(&problem.sensitivity_model.coverage_contract_sha256)
+        || !is_sha256(&problem.sensitivity_model.coverage_receipt_sha256)
     {
         return Err(invalid(
             "source, calibration, runtime, or workload identity is incomplete",
@@ -443,6 +452,7 @@ fn validate_problem(problem: &DynamicAllocationProblem) -> Result<(), DynamicAll
 
     let mut unit_ids = BTreeSet::new();
     let mut tensor_names = BTreeSet::new();
+    let mut global_operation_ids = BTreeSet::new();
     let mut tensor_count = 0usize;
     for unit in &problem.units {
         if unit.unit_id.is_empty()
@@ -483,8 +493,36 @@ fn validate_problem(problem: &DynamicAllocationProblem) -> Result<(), DynamicAll
                 .checked_add(1)
                 .ok_or(DynamicAllocationError::Overflow)?;
         }
+        let mut operation_covered = BTreeSet::new();
+        let mut canonical_topology = BTreeMap::new();
+        for operation in &unit.operations {
+            let operation_tensors: BTreeSet<_> =
+                operation.tensor_names.iter().map(String::as_str).collect();
+            if operation.operation_id.is_empty()
+                || operation.graph_path.is_empty()
+                || !global_operation_ids.insert(operation.operation_id.as_str())
+                || operation_tensors.is_empty()
+                || operation_tensors.len() != operation.tensor_names.len()
+                || operation_tensors
+                    .iter()
+                    .any(|name| !member_names.contains(name))
+            {
+                return Err(invalid(
+                    "logical operations must be unique, non-empty, and cover only unit members",
+                ));
+            }
+            operation_covered.extend(operation_tensors.iter().copied());
+            canonical_topology.insert(
+                operation.operation_id.as_str(),
+                (operation.graph_path.as_str(), operation_tensors),
+            );
+        }
+        if operation_covered != member_names {
+            return Err(invalid(
+                "logical operations must collectively cover every unit member",
+            ));
+        }
         let mut option_ids = BTreeSet::new();
-        let mut operation_topology: Option<BTreeMap<&str, BTreeSet<&str>>> = None;
         for option in &unit.options {
             if !option_ids.insert(option.option_id.as_str()) {
                 return Err(invalid("allocation unit has duplicate option ids"));
@@ -496,19 +534,18 @@ fn validate_problem(problem: &DynamicAllocationProblem) -> Result<(), DynamicAll
                 .map(|operation| {
                     (
                         operation.operation_id.as_str(),
-                        operation.tensor_names.iter().map(String::as_str).collect(),
+                        (
+                            operation.graph_path.as_str(),
+                            operation.tensor_names.iter().map(String::as_str).collect(),
+                        ),
                     )
                 })
                 .collect();
-            if operation_topology
-                .as_ref()
-                .is_some_and(|expected| expected != &topology)
-            {
+            if topology != canonical_topology {
                 return Err(invalid(
-                    "options in one allocation unit must share a stable operation topology",
+                    "every option must match its unit's canonical logical operation topology",
                 ));
             }
-            operation_topology = Some(topology);
         }
     }
     if tensor_count != problem.expected_tensor_count
@@ -583,7 +620,7 @@ fn insert_nondominated(
 /// assignments are counted in the receipt and collapsed; full-model repair is
 /// responsible for exploring interaction effects. The live-state bound is
 /// fail-closed and never an implicit heuristic.
-pub fn allocate_dynamic_frontier(
+pub(super) fn allocate_dynamic_frontier(
     problem: &DynamicAllocationProblem,
 ) -> Result<PolicyFrontier, DynamicAllocationError> {
     validate_problem(problem)?;
@@ -699,6 +736,8 @@ pub fn allocate_dynamic_frontier(
             source: normalized.source.clone(),
             execution: normalized.execution.clone(),
             tensor_catalog_sha256: normalized.tensor_catalog_sha256.clone(),
+            dataset_partition_manifest_sha256: normalized.dataset_partition_manifest_sha256.clone(),
+            tensor_partition_manifest_sha256: normalized.tensor_partition_manifest_sha256.clone(),
             calibration_manifest_sha256: normalized.calibration_manifest_sha256.clone(),
             capability_profile_sha256: normalized.capability_profile_sha256.clone(),
             proposal_workload_profile_sha256: normalized.proposal_workload_profile_sha256.clone(),

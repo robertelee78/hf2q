@@ -103,6 +103,9 @@ pub enum TokenizerError {
     /// would gap-fill the id with `[PAD]` and silently drop the named
     /// special token. Surface here.
     AddedTokenIdOutOfRange { id: u32, vocab_size: usize },
+    /// The authoritative sidecar/config chat template exists but cannot be
+    /// resolved without guessing.
+    ChatTemplate { source: String },
 }
 
 impl std::fmt::Display for TokenizerError {
@@ -148,6 +151,9 @@ impl std::fmt::Display for TokenizerError {
                  token. Either config.json[vocab_size] is too small or \
                  tokenizer.json[added_tokens] has an out-of-range entry."
             ),
+            TokenizerError::ChatTemplate { source } => {
+                write!(f, "tokenizer: chat-template resolution failed: {source}")
+            }
         }
     }
 }
@@ -180,16 +186,8 @@ pub fn build_tokenizer_metadata(
             dir: model_dir.display().to_string(),
         });
     }
-    let tokenizer_json: serde_json::Value = match std::fs::read_to_string(&tokenizer_path) {
-        Ok(s) => match serde_json::from_str(&s) {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(TokenizerError::TokenizerJsonMalformed {
-                    dir: model_dir.display().to_string(),
-                    source: e.to_string(),
-                });
-            }
-        },
+    let tokenizer_bytes = match std::fs::read(&tokenizer_path) {
+        Ok(bytes) => bytes,
         Err(e) => {
             return Err(TokenizerError::TokenizerJsonMalformed {
                 dir: model_dir.display().to_string(),
@@ -197,6 +195,23 @@ pub fn build_tokenizer_metadata(
             });
         }
     };
+    let tokenizer_json: serde_json::Value = match serde_json::from_slice(&tokenizer_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(TokenizerError::TokenizerJsonMalformed {
+                dir: model_dir.display().to_string(),
+                source: e.to_string(),
+            });
+        }
+    };
+    let chat_inputs = crate::core::chat_template_resolver::resolve_chat_render_inputs(
+        model_dir,
+        &tokenizer_bytes,
+        arch.name(),
+    )
+    .map_err(|error| TokenizerError::ChatTemplate {
+        source: error.to_string(),
+    })?;
 
     let model_section =
         tokenizer_json
@@ -271,12 +286,10 @@ pub fn build_tokenizer_metadata(
     // unused on those models).
 
     // ----- 2. Optional tokenizer_config.json (special tokens + flags) ---
-    // Missing or malformed is non-fatal — the BOS/EOS lookup just yields
-    // None and we skip those KV entries.
-    let tokenizer_config: Option<serde_json::Value> =
-        std::fs::read_to_string(model_dir.join("tokenizer_config.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
+    // The shared render-input resolver parsed these exact bytes fail-closed,
+    // so conversion and calibration cannot silently choose different
+    // template inputs from the same source directory.
+    let tokenizer_config = chat_inputs.tokenizer_config.clone();
 
     let added_tokens_arr = tokenizer_json
         .get("added_tokens")
@@ -947,7 +960,10 @@ pub fn build_tokenizer_metadata(
         // This is a deliberate per-arch ordering — the generic
         // chat-template emit at the END of this function is skipped
         // for Gemma 4 (gated on `chat_template_emitted_inline` below).
-        let gemma_chat = resolve_gemma_chat_template(model_dir, &tokenizer_config, arch);
+        let gemma_chat = chat_inputs
+            .template
+            .as_ref()
+            .map(|resolved| resolved.template.clone());
         if let Some(tmpl) = &gemma_chat {
             kv.push((
                 "tokenizer.chat_template".into(),
@@ -1019,7 +1035,10 @@ pub fn build_tokenizer_metadata(
     // add_space_prefix per canonical's dump position. Other arches
     // continue to use the end-of-block position for backward compat.
     if arch != ArchName::Gemma4 {
-        let template = resolve_gemma_chat_template(model_dir, &tokenizer_config, arch);
+        let template = chat_inputs
+            .template
+            .as_ref()
+            .map(|resolved| resolved.template.clone());
         if let Some(tmpl) = template {
             kv.push(("tokenizer.chat_template".into(), MetaValue::String(tmpl)));
         }
@@ -1031,31 +1050,6 @@ pub fn build_tokenizer_metadata(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Resolve the chat template via the canonical priority chain:
-///   1. `chat_template.jinja` sidecar file
-///   2. `tokenizer_config.json[chat_template]`
-///   3. arch-default from `chat_templates::arch_default_chat_template`
-///   4. `None` (graceful skip — runtime loader falls back)
-fn resolve_gemma_chat_template(
-    model_dir: &Path,
-    tokenizer_config: &Option<serde_json::Value>,
-    arch: ArchName,
-) -> Option<String> {
-    let chat_template_path = model_dir.join("chat_template.jinja");
-    if chat_template_path.exists() {
-        return std::fs::read_to_string(&chat_template_path).ok();
-    }
-    if let Some(s) = tokenizer_config
-        .as_ref()
-        .and_then(|c| c.get("chat_template"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-    {
-        return Some(s);
-    }
-    crate::core::chat_templates::arch_default_chat_template(arch.name()).map(|s| s.to_string())
-}
 
 /// Read `type_vocab_size` from `config.json`. Defaults to 1 if absent
 /// (matches canonical `bert.py:233` —
@@ -1647,6 +1641,40 @@ mod tests {
         let kv = build_tokenizer_metadata(tmp.path(), ArchName::Qwen35Moe).unwrap();
         assert_eq!(lookup_str(&kv, "tokenizer.ggml.model"), "gpt2");
         assert_eq!(lookup_str(&kv, "tokenizer.ggml.pre"), "qwen35");
+    }
+
+    #[test]
+    fn malformed_and_named_chat_template_configs_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tokenizer_json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "byte_fallback": false,
+                "vocab": {"a": 0, "b": 1}
+            }
+        });
+        fs::write(
+            tmp.path().join("tokenizer.json"),
+            serde_json::to_vec(&tokenizer_json).unwrap(),
+        )
+        .unwrap();
+        fs::write(tmp.path().join("config.json"), br#"{"vocab_size":2}"#).unwrap();
+
+        fs::write(tmp.path().join("tokenizer_config.json"), b"{").unwrap();
+        assert!(matches!(
+            build_tokenizer_metadata(tmp.path(), ArchName::Qwen35Moe),
+            Err(TokenizerError::ChatTemplate { .. })
+        ));
+
+        fs::write(
+            tmp.path().join("tokenizer_config.json"),
+            br#"{"chat_template":{"default":"a","tool_use":"b"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            build_tokenizer_metadata(tmp.path(), ArchName::Qwen35Moe),
+            Err(TokenizerError::ChatTemplate { .. })
+        ));
     }
 
     #[test]

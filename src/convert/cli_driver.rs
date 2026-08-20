@@ -1136,105 +1136,10 @@ fn config_n_layers(config: &serde_json::Value) -> Option<u32> {
 /// Per ADR-033 the supported arches are a closed set (8 entries); any
 /// other arch surfaces as [`ConvertError::UnsupportedArch`].
 fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
-    let model_type = config.get("model_type").and_then(|v| v.as_str());
-    let architectures: Vec<&str> = config
-        .get("architectures")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
-        .unwrap_or_default();
-
-    // Detect from model_type first.
-    if let Some(mt) = model_type {
-        match mt {
-            "llama" => return Ok(ArchName::Llama3),
-            // gemma3 (Gemma 3 architecture) + gemma4 / gemma4_text (Gemma 4
-            // release strings — operator's google-gemma-4-26b-a4b-it has
-            // model_type="gemma4" with nested text_config.model_type=
-            // "gemma4_text"). Surfaced 2026-05-18 by real-model convert
-            // smoke test against /opt/hf2q/models/google-gemma-4-26b-a4b-it.
-            "gemma3" | "gemma" | "gemma4" | "gemma4_text" => return Ok(ArchName::Gemma4),
-            "bert" => return Ok(ArchName::Bert),
-            "nomic_bert" => return Ok(ArchName::NomicBert),
-            // qwen3_moe (canonical Qwen 3.6 dense MoE). The Qwen 3.5/3.6
-            // linear-attention + MTP variants route to Qwen35MoeFull
-            // (the qwen35moe canonical arch) below.
-            "qwen3_moe" => return Ok(ArchName::Qwen35Moe),
-            // Qwen 3.5/3.6 with linear-attention + MTP. Top-level
-            // `qwen3_5_moe` is the multimodal-VLM
-            // `Qwen3_5MoeForConditionalGeneration` config (operator's
-            // /opt/hf2q/models/Qwen-Qwen3.5-35B-A3B has this at config.json:6).
-            // The `_text` variant is the nested text_config.model_type
-            // that text-only `Qwen3_5MoeForCausalLM` checkpoints expose.
-            // Note: "Qwen 3.6" and "Qwen 3.8" are model version names;
-            // their official configurations continue to use Qwen3_5*
-            // architecture strings.
-            "qwen3_5" | "qwen3_5_text" => return Ok(ArchName::Qwen35),
-            "qwen3_5_moe" | "qwen3_5_moe_text" => return Ok(ArchName::Qwen35MoeFull),
-            "qwen3_vl" | "qwen3_vl_moe" | "qwen3_vl_text" => return Ok(ArchName::Qwen3VlText),
-            "minimax_m2" => return Ok(ArchName::MiniMaxM2),
-            "deepseek_v4" => return Ok(ArchName::Deepseek4),
-            _ => {}
+    crate::core::model_arch::detect_model_arch(config).map_err(|error| {
+        ConvertError::UnsupportedArch {
+            arch_name: error.observed,
         }
-    }
-
-    // Fall back to the architectures[] array — HF's older convention.
-    // We probe the well-known class names mapper.
-    for cls in &architectures {
-        match *cls {
-            "LlamaForCausalLM" => return Ok(ArchName::Llama3),
-            // Both Gemma3*ForCausalLM and Gemma3ForConditionalGeneration
-            // are produced by HF for the same gemma-3 family; we accept
-            // the prefix.
-            // Gemma3*/Gemma2*/GemmaForCausalLM + Gemma4*ForConditionalGeneration
-            // / Gemma4ForCausalLM. The operator's gemma-4-26b release uses
-            // "Gemma4ForConditionalGeneration" (multimodal config wrapping
-            // the text decoder). Prefix-match covers both -ForCausalLM and
-            // -ForConditionalGeneration suffixes.
-            s if s.starts_with("Gemma3")
-                || s.starts_with("Gemma2")
-                || s.starts_with("Gemma4")
-                || s == "GemmaForCausalLM" =>
-            {
-                return Ok(ArchName::Gemma4);
-            }
-            "BertForMaskedLM" | "BertModel" => return Ok(ArchName::Bert),
-            "NomicBertModel" => return Ok(ArchName::NomicBert),
-            // Qwen3MoeForCausalLM (canonical) — older dense MoE.
-            "Qwen3MoeForCausalLM" => return Ok(ArchName::Qwen35Moe),
-            // Qwen 3.5 (and the "3.6" model versions that use the same
-            // arch strings) with linear-attention + MTP. Includes both
-            // text-only ForCausalLM and multimodal-VLM
-            // ForConditionalGeneration releases (the latter is the
-            // operator's locally-downloaded
-            // /opt/hf2q/models/Qwen-Qwen3.5-35B-A3B variant — config
-            // has architectures=["Qwen3_5MoeForConditionalGeneration"]).
-            // Canonical at /opt/llama.cpp/conversion/qwen.py:626 only
-            // registers Qwen3_5MoeFor* (no Qwen3_6Moe* arch exists).
-            "Qwen3_5MoeForCausalLM" | "Qwen3_5MoeForConditionalGeneration" => {
-                return Ok(ArchName::Qwen35MoeFull);
-            }
-            "Qwen3_5ForCausalLM" | "Qwen3_5ForConditionalGeneration" => {
-                return Ok(ArchName::Qwen35);
-            }
-            "Qwen3VLForConditionalGeneration"
-            | "Qwen3VLMoeForConditionalGeneration"
-            | "Qwen3VLTextForCausalLM" => {
-                return Ok(ArchName::Qwen3VlText);
-            }
-            "MiniMaxM2ForCausalLM" => return Ok(ArchName::MiniMaxM2),
-            "DeepseekV4ForCausalLM" => return Ok(ArchName::Deepseek4),
-            _ => {}
-        }
-    }
-
-    // Nothing matched — typed error per the no-fallback rule. We carry
-    // the most-specific name we observed for diagnostics.
-    let observed = model_type
-        .map(|s| s.to_string())
-        .or_else(|| architectures.first().map(|s| s.to_string()))
-        .unwrap_or_else(|| "<missing model_type and architectures>".into());
-    Err(ConvertError::UnsupportedArch {
-        arch_name: observed,
     })
 }
 
