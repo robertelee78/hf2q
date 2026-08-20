@@ -1,5 +1,6 @@
 mod client;
 pub(crate) mod endpoint;
+mod local;
 mod sse;
 mod transcript;
 mod wire;
@@ -12,12 +13,13 @@ use console::style;
 use crate::cli::ChatArgs;
 
 use client::{fetch_models, ChatClient};
-use endpoint::{EndpointResolver, EndpointSession, ExplicitEndpointResolver};
+use endpoint::{EndpointResolver, EndpointSession};
+use local::AutomaticEndpointResolver;
 use sse::{CompletedResponse, StreamUpdate};
 use wire::{Model, RequestOptions, ThinkingMode};
 
 pub(crate) fn cmd_chat(args: ChatArgs) -> Result<()> {
-    let mut resolver = ExplicitEndpointResolver;
+    let mut resolver = AutomaticEndpointResolver;
     cmd_chat_with_resolver(args, &mut resolver)
 }
 

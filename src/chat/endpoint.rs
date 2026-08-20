@@ -171,7 +171,8 @@ impl EndpointSession {
             if wait_for_child(child, signal_timeout).await? {
                 return Ok(());
             }
-            bail!("chat-owned server did not exit after direct SIGTERM");
+            tracing::warn!("chat-owned server ignored SIGTERM; force-stopping the owned child");
+            return force_stop_owned_child(child);
         }
 
         if wait_for_child(child, graceful_timeout).await? {
@@ -184,7 +185,10 @@ impl EndpointSession {
         if wait_for_child(child, signal_timeout).await? {
             return Ok(());
         }
-        bail!("chat-owned server did not exit after graceful shutdown and final SIGTERM")
+        tracing::warn!(
+            "chat-owned server ignored graceful shutdown and SIGTERM; force-stopping the owned child"
+        );
+        force_stop_owned_child(child)
     }
 }
 
@@ -223,22 +227,23 @@ fn signal_owned_child(child: &mut Child) -> Result<()> {
     child.kill().context("stop chat-owned server child")
 }
 
-pub(crate) trait EndpointResolver {
-    fn resolve(&mut self, args: &ChatArgs) -> Result<EndpointSession>;
+fn force_stop_owned_child(child: &mut Child) -> Result<()> {
+    if child
+        .try_wait()
+        .context("check owned server child")?
+        .is_some()
+    {
+        return Ok(());
+    }
+    child.kill().context("force-stop chat-owned server child")?;
+    child
+        .wait()
+        .context("reap force-stopped chat-owned server")?;
+    Ok(())
 }
 
-/// This lane proves generic `--url` operation. The integration owner replaces
-/// the no-URL branch with DNS-SD discovery and optional server launch while
-/// retaining the normalized loopback and owned-Child boundaries above.
-pub(crate) struct ExplicitEndpointResolver;
-
-impl EndpointResolver for ExplicitEndpointResolver {
-    fn resolve(&mut self, args: &ChatArgs) -> Result<EndpointSession> {
-        let url = args.url.as_deref().context(
-            "no --url was supplied; automatic local hf2q discovery is unavailable in this build",
-        )?;
-        Endpoint::explicit(url).map(EndpointSession::external)
-    }
+pub(crate) trait EndpointResolver {
+    fn resolve(&mut self, args: &ChatArgs) -> Result<EndpointSession>;
 }
 
 #[cfg(test)]
