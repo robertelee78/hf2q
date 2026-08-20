@@ -2369,7 +2369,7 @@ support.
 | Wrong text/projector pair | Preparation, startup, `/v1/models`, and image requests fail closed. |
 | Stale or incompatible calibration | Artifact, hardware, ABI, template, scheduler, or settings mismatch invalidates the profile and requires recalibration or a hardware-table profile. |
 | KV checkpoint leakage or corruption | Exact prefix/identity/codec/vision gates reject cross-session reuse; corruption becomes a cache miss and is quarantined. |
-| Session cache fills disk | Setup-recorded byte/free-space guards and LRU eviction stop writes before the boundary; unlimited mode is not accepted. |
+| Session cache fills disk | The dormant store enforces the setup-recorded aggregate cap and descriptor-volume floor with least-recently-committed eviction; activation additionally requires true inactive-session access-LRU and request pins. Unlimited product mode is never accepted. |
 | Existing optional-integration config | Parse/merge validation or no write; never truncate, replace, or silently discard entries. |
 | Port or memory conflict | Calibration/launcher refuses before loading the large model and gives a direct recovery command. |
 
