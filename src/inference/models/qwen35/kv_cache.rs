@@ -49,6 +49,13 @@ pub use mlx_native::ops::gated_delta_net::cpu_reference_f32 as gated_delta_net_c
 use super::gqa_q2_policy::use_gqa_q2_tq_sdpa;
 use super::{Qwen35Config, Qwen35LayerKind};
 
+mod source_teacher;
+
+#[allow(unused_imports)] // consumed by the source-teacher runner slice
+pub(super) use source_teacher::{
+    plan_qwen35_base_text_cache, Qwen35BaseTextCachePlanV1, Qwen35BaseTextCacheReceiptV1,
+};
+
 /// Per-full-attention-layer KV slot.
 pub struct FullAttnKvSlot {
     /// Keys buffer `[head_dim, n_kv_heads, max_seq_len, n_seqs]` f32.
@@ -1773,6 +1780,23 @@ impl HybridKvCache {
         n_seqs: u32,
         tq_kv_active: bool,
     ) -> Result<Self> {
+        let mut cache =
+            Self::allocate_with_profile(cfg, device, max_seq_len, n_seqs, tq_kv_active, true)?;
+        // Full-attention storage is intentionally uninitialized: its cursor
+        // is zero and every readable position is overwritten before the
+        // cursor advances. Recurrent DeltaNet state remains semantic-zero.
+        cache.reset_all_buffers();
+        Ok(cache)
+    }
+
+    fn allocate_with_profile(
+        cfg: &Qwen35Config,
+        device: &MlxDevice,
+        max_seq_len: u32,
+        n_seqs: u32,
+        tq_kv_active: bool,
+        include_mtp: bool,
+    ) -> Result<Self> {
         if max_seq_len == 0 {
             return Err(anyhow!("HybridKvCache: max_seq_len must be > 0"));
         }
@@ -1818,7 +1842,7 @@ impl HybridKvCache {
             }
         }
 
-        let mtp_slot = if cfg.mtp_num_hidden_layers > 0 {
+        let mtp_slot = if include_mtp && cfg.mtp_num_hidden_layers > 0 {
             let mut slot = alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs, tq_kv_active)
                 .context("alloc MTP full-attn slot")?;
             if tq_kv_active {
@@ -1832,7 +1856,7 @@ impl HybridKvCache {
             None
         };
 
-        let mut cache = HybridKvCache {
+        Ok(HybridKvCache {
             full_attn,
             mtp_slot,
             linear_attn,
@@ -1842,12 +1866,7 @@ impl HybridKvCache {
             per_layer_slot,
             tq_kv_active,
             la_capture_active_tokens: None,
-        };
-        // Full-attention storage is intentionally uninitialized: its cursor
-        // is zero and every readable position is overwritten before the
-        // cursor advances. Recurrent DeltaNet state remains semantic-zero.
-        cache.reset_all_buffers();
-        Ok(cache)
+        })
     }
 
     /// Reset semantic state without touching unread full-attention pages.

@@ -3,6 +3,7 @@
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 
+use crate::inference::models::qwen35::kv_cache::plan_qwen35_base_text_cache;
 use crate::inference::models::qwen35::source_precision::upload_plan::{
     QwenSourceMetalCapacityV1, QwenSourceMetalUploadLimits,
 };
@@ -58,52 +59,14 @@ pub(super) fn runtime_envelope(
         "source teacher CPU-control mirror bound exceeds the v1 limit"
     );
 
-    let full_layers = config
+    let cache_plan = plan_qwen35_base_text_cache(config, limits.max_sequence_tokens)?;
+    let base_full_attention_cache_bytes = cache_plan.base_full_attention_cache_bytes();
+    let base_linear_attention_state_bytes = cache_plan.base_linear_attention_state_bytes();
+    let linear_layers = config
         .layer_types
         .iter()
-        .filter(|kind| **kind == Qwen35LayerKind::FullAttention)
+        .filter(|kind| **kind == Qwen35LayerKind::LinearAttention)
         .count() as u64;
-    let linear_layers = config.layer_types.len() as u64 - full_layers;
-    let full_slot = checked_product(&[
-        2,
-        config.num_key_value_heads as u64,
-        limits.max_sequence_tokens as u64,
-        config.head_dim as u64,
-        4,
-    ])?;
-    let base_full_attention_cache_bytes = full_layers
-        .checked_mul(full_slot)
-        .context("source teacher full-attention cache bytes overflow")?;
-    let conv_channels = (2_u64)
-        .checked_mul(config.linear_num_key_heads as u64)
-        .and_then(|value| value.checked_mul(config.linear_key_head_dim as u64))
-        .and_then(|value| {
-            value.checked_add(
-                (config.linear_num_value_heads as u64)
-                    .checked_mul(config.linear_value_head_dim as u64)?,
-            )
-        })
-        .context("source teacher Delta channels overflow")?;
-    let conv_state = checked_product(&[
-        2,
-        conv_channels,
-        u64::from(config.linear_conv_kernel_dim.saturating_sub(1).max(1)),
-        4,
-    ])?;
-    let recurrent_state = checked_product(&[
-        2,
-        config.linear_key_head_dim as u64,
-        config.linear_value_head_dim as u64,
-        config.linear_num_value_heads as u64,
-        4,
-    ])?;
-    let base_linear_attention_state_bytes = linear_layers
-        .checked_mul(
-            conv_state
-                .checked_add(recurrent_state)
-                .context("source teacher Delta state bytes overflow")?,
-        )
-        .context("source teacher Delta state bytes overflow")?;
     let max_input_activation_bytes = checked_product(&[
         limits.max_sequence_tokens as u64,
         config.hidden_size as u64,
