@@ -3,8 +3,10 @@
 //! Preparation consumes the exact B2a topology, performs a combined static
 //! upload plus bounded-runtime capacity check before the first Metal weight
 //! allocation, uploads through B2b, and drains every uploaded node into the
-//! exact dense-Qwen layer slots. The resulting type is intentionally inert:
-//! it has no buffer accessor and no forward/session constructor yet.
+//! exact dense-Qwen layer slots. The resulting production type is
+//! intentionally inert: it has no buffer accessor and no forward/session
+//! constructor. A `cfg(test)`-only child harness borrows its private fields for
+//! the bounded numerical wiring gate.
 
 #[cfg(test)]
 use anyhow::ensure;
@@ -27,6 +29,10 @@ mod assemble;
 mod layers;
 mod preflight;
 mod run_inputs;
+#[cfg(test)]
+mod runner;
+#[cfg(test)]
+mod runner_io;
 
 #[cfg(test)]
 mod tests;
@@ -158,11 +164,12 @@ struct PreparedQwen35SourceLayerV1 {
     ffn: DenseFfnWeightsGpu,
 }
 
-/// Opaque, non-executable family-owned source-teacher graph preparation.
+/// Opaque family-owned source-teacher graph preparation.
 ///
-/// This proves exact config/slot assembly of the B2b buffers. It proves no
-/// command encoding, completion, numerical result, target, sensitivity, cost,
-/// Dynamic admission, or selector authority.
+/// Production exposes no execution method or buffer accessor. This type proves
+/// exact config/slot assembly of the B2b buffers, not command encoding,
+/// completion, numerical result, target, sensitivity, cost, Dynamic admission,
+/// or selector authority.
 pub(crate) struct PreparedQwen35SourceTeacherV1 {
     snapshot: super::super::snapshot::VerifiedQwenSourceSnapshot,
     device: MlxDevice,

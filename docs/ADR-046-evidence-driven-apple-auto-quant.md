@@ -1087,9 +1087,11 @@ plus zero cursors, absent MTP/TQ/capture state, checked payload totals, and
 canonical layout/receipt hashes. The official dense 64-layer, 4,096-token
 profile is pinned at 16 full-attention slots, 48 linear-attention slots,
 536,870,912 full-attention bytes, 313,786,368 linear-state bytes, and
-850,657,280 total bytes. The opaque prepared cache exposes no cache or buffer;
-a later consuming runner transition must join it to the opaque prepared
-teacher and remains required. The cache object alone proves a fresh,
+850,657,280 total bytes. Production exposes no cache or buffer from the opaque
+prepared owner; a `cfg(test)`-only consuming seam supports the private parity
+harness, while the production run-input owner remains inert. A later consuming
+runner transition must join the cache to the opaque prepared teacher and
+remains required. The cache object alone proves a fresh,
 config-relative, process-local host-visible Metal layout only—not source
 authority, residency, graph
 dispatch, completion, logits, peak memory, performance, persisted replay,
@@ -1144,6 +1146,49 @@ paths are unchanged. This establishes a safe route prerequisite only: without
 a paired benchmark it makes no speed claim, and it proves no complete graph,
 terminal completion, teacher target, sensitivity, Dynamic, selector,
 autoquant, or DWQ authority.
+
+The second execution-route prerequisite adds a `cfg(test)`-only,
+non-authoritative source-BF16 parity harness. A distinct tagged thread-local
+graph scope is cross-nonreentrant with the copied-GGML evidence scope and
+rejects every Qwen
+GGML/fused-quantized projection wrapper, and fixes the switches routed through
+the shared Qwen execution-dispatch layer: no chunk scan, fused QKVG, fused
+quantized gate/up, or dense-Q split profile; dense-Q arena reset, the
+small-vector path, and fused full-attention stages A/B remain enabled. Other diagnostic
+switches remain outside this prerequisite. The call substrate itself accepts
+only the prepared base-text graph/cache, so MTP, TQ, and vision remain absent.
+The scope deliberately does
+not claim a complete native route: mlx-native 0.10.16 still resolves internal
+BF16 tensor-MM choices outside this hf2q state.
+
+The test-only call path consumes only the already-prepared BF16 projection and
+F32-control buffers plus the prepared base-text cache. It widens only the
+requested BF16 embedding rows into one checked F32 `[tokens, hidden]`
+activation, never a whole embedding table. It runs the exact configured
+Delta/full-attention and dense-FFN layer schedule, retaining Delta ping-pong and
+full-attention KV state across calls. The output boundary slices only the last
+hidden row, applies the authenticated F32 RMSNorm and untied BF16 output
+weight, materializes one F32 vocabulary row, and terminally waits before host
+readback. No `[sequence, vocabulary]` output is allocated.
+
+The non-skipping Apple gate uses a finite authenticated two-layer fixture with
+hidden size 256, intermediate size 512, vocabulary 32, one Delta layer, one
+full-attention layer, and authenticated-but-nonexecuted shared MTP. On a fresh
+named worker thread it proves finite, nonzero full-vocabulary logits, identical
+top-1, and maximum absolute error at most `5e-3` against `forward_cpu` for both
+a 16-token prefill and the cached one-token continuation at position 16. The
+fixture also requires that independently removing the DeltaNet output, full
+attention output, or dense-FFN outputs changes the CPU-oracle vocabulary row by
+more than the accepted `5e-3` bound, so the parity gate cannot pass merely from
+the residual stream. This is wiring and numerical-parity evidence for a
+test-only call. No production forward or raw-cache transition is compiled by
+this prerequisite. The path does
+not traverse the verified prediction plan, own the one-shot worker/panic
+lifecycle, reconcile complete work counters, finish or publish a target, or
+mint a family teacher capability. Its caller-selected runtime allowance is not
+a peak-memory or liveness proof. Official 27B execution, full one-shot
+completion, route/performance evidence, target authority, sensitivity,
+Dynamic/selector/autoquant admission, and DWQ remain out of scope.
 
 Completing D3a requires a family-owned, bounded source-precision dense-Qwen
 runner that consumes authenticated source tensors without the production
