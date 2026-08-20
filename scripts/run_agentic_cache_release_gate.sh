@@ -31,13 +31,14 @@ if [[ ${MLX_NATIVE_SKIP_METALLIB+x} ]]; then
   echo "MLX_NATIVE_SKIP_METALLIB is forbidden for exact-artifact release builds" >&2
   exit 2
 fi
-if [[ ${HF2Q_THERMAL_SWIFT_BIN+x} ]]; then
-  echo "HF2Q_THERMAL_SWIFT_BIN is reserved for isolated contract tests" >&2
+if [[ ${HF2Q_THERMAL_SWIFTC_BIN+x} || ${HF2Q_THERMAL_PROBE_BIN+x} \
+  || ${HF2Q_THERMAL_PROBE_SOURCE+x} ]]; then
+  echo "thermal probe overrides are reserved for isolated contract tests" >&2
   exit 2
 fi
-readonly HF2Q_THERMAL_SWIFT_BIN=/usr/bin/swift
-[[ -x "$HF2Q_THERMAL_SWIFT_BIN" ]] || {
-  echo "required system Swift probe is unavailable: $HF2Q_THERMAL_SWIFT_BIN" >&2
+readonly HF2Q_THERMAL_SWIFTC_BIN=/usr/bin/swiftc
+[[ -x "$HF2Q_THERMAL_SWIFTC_BIN" ]] || {
+  echo "required system Swift compiler is unavailable: $HF2Q_THERMAL_SWIFTC_BIN" >&2
   exit 2
 }
 [[ -x /usr/bin/pgrep ]] || {
@@ -160,6 +161,7 @@ cleanup() {
     kill -TERM "$caffeinate_pid" 2>/dev/null || true
     wait "$caffeinate_pid" 2>/dev/null || true
   fi
+  thermal_cleanup_probe || cleanup_rc=1
   return "$cleanup_rc"
 }
 on_exit() {
@@ -173,6 +175,7 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 1' INT TERM
 
+thermal_prepare_probe
 require_ac
 pmset -g assertions > "$OUT_ROOT/power-assertions.before.txt"
 caffeinate -dimsu -w "$parent_pid" &

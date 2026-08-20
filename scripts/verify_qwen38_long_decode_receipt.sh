@@ -89,7 +89,7 @@ jq -e \
   --arg crate_sha256 "$expected_crate_sha256" \
   --arg binary_sha256 "$expected_binary_sha256" \
   --arg model_sha256 "$expected_model_sha256" '
-    .schema_version == 1
+    .schema_version == 2
     and .status == "pass"
     and .benchmark == "qwen38-long-decode-gqa-q2"
     and .identity.source_sha == $source_sha
@@ -124,8 +124,14 @@ jq -e \
     and .identity.hardware.memory_bytes > 0
     and (.identity.hardware.os_version | type) == "string"
     and (.identity.hardware.os_version | length) > 0
-    and .identity.hardware.thermal_probe.path == "/usr/bin/swift"
-    and (.identity.hardware.thermal_probe.sha256 | test("^[0-9a-f]{64}$"))
+    and .identity.hardware.thermal_probe.implementation == "compiled-foundation-helper"
+    and .identity.hardware.thermal_probe.source_path == "scripts/macos_thermal_probe.swift"
+    and (.identity.hardware.thermal_probe.source_sha256 | test("^[0-9a-f]{64}$"))
+    and .identity.hardware.thermal_probe.compiler_path == "/usr/bin/swiftc"
+    and (.identity.hardware.thermal_probe.compiler_sha256 | test("^[0-9a-f]{64}$"))
+    and (.identity.hardware.thermal_probe.compiler_version | type) == "string"
+    and (.identity.hardware.thermal_probe.compiler_version | length) > 0
+    and (.identity.hardware.thermal_probe.binary_sha256 | test("^[0-9a-f]{64}$"))
     and .settings.temperature == 0
     and (.settings | has("seed") | not)
     and .settings.max_tokens == 512
@@ -153,6 +159,12 @@ jq -e \
     and (.aggregate.exact_output_sha256 | test("^[0-9a-f]{64}$"))
     and (.aggregate.short_exact_output_sha256 | test("^[0-9a-f]{64}$"))
   ' "$summary" >/dev/null
+
+if [[ "$(sha256_file "$script_dir/macos_thermal_probe.swift")" != \
+  "$(jq -er .identity.hardware.thermal_probe.source_sha256 "$summary")" ]]; then
+  echo "Qwen3.8 receipt thermal-probe source digest mismatch" >&2
+  exit 1
+fi
 
 for root_artifact in prompt.txt request.json short-prompt.txt short-request.json phase.log; do
   [[ -s "$benchmark_dir/$root_artifact" ]] || {

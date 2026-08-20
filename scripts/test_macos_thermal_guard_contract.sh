@@ -7,13 +7,118 @@ source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
 
 tmp_dir=$(mktemp -d -t hf2q-thermal-guard.XXXXXX)
 cleanup() {
+  thermal_cleanup_probe || true
   rm -rf "$tmp_dir"
 }
 trap cleanup EXIT
 
+probe_fixture_dir="$tmp_dir/probe-fixture"
+mkdir -p "$probe_fixture_dir"
+fake_swiftc="$probe_fixture_dir/swiftc"
+compile_count="$probe_fixture_dir/compile-count"
+# The single-quoted fragments are the literal body of the generated fake
+# compiler; expansion must happen only when that fixture executes.
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
+  'if [[ "${1:-}" == --version ]]; then printf "fake swiftc 1.0\\n"; exit 0; fi' \
+  'output=""' \
+  'while (($#)); do' \
+  '  if [[ "$1" == -o ]]; then output=$2; shift 2; else shift; fi' \
+  'done' \
+  '[[ -n "$output" ]]' \
+  'printf "compile\\n" >>"$HF2Q_FAKE_COMPILE_COUNT"' \
+  'printf "%s\\n" "#!/usr/bin/env bash" "printf '\''nominal\\n'\''" >"$output"' \
+  'chmod +x "$output"' >"$fake_swiftc"
+chmod +x "$fake_swiftc"
+
+# The helper is compiled once, reused for every sample, and removed only from
+# its exact private directory. This is the regression contract for the prior
+# per-sample `swift -e` compiler launch.
+HF2Q_THERMAL_SWIFTC_BIN=$fake_swiftc
+HF2Q_FAKE_COMPILE_COUNT=$compile_count
+export HF2Q_FAKE_COMPILE_COUNT
+thermal_prepare_probe
+prepared_probe=$THERMAL_PROBE_BIN
+prepared_probe_dir=$THERMAL_PROBE_OWNED_DIR
+test -x "$prepared_probe"
+thermal_read_state
+test "$THERMAL_STATE" = nominal
+thermal_read_state
+test "$THERMAL_STATE" = nominal
+test "$(wc -l <"$compile_count" | tr -d '[:space:]')" = 1
+test "$THERMAL_PROBE_BIN" = "$prepared_probe"
+thermal_cleanup_probe
+test ! -e "$prepared_probe"
+test ! -e "$prepared_probe_dir"
+unset HF2Q_THERMAL_SWIFTC_BIN HF2Q_FAKE_COMPILE_COUNT
+
+# Every preparation boundary fails closed and removes its private directory.
+if HF2Q_THERMAL_SWIFTC_BIN="$fake_swiftc" \
+  HF2Q_THERMAL_PROBE_SOURCE="$probe_fixture_dir/missing.swift" \
+  thermal_prepare_probe; then
+  echo "thermal guard accepted a missing probe source" >&2
+  exit 1
+fi
+test -z "$THERMAL_PROBE_BIN"
+
+failing_swiftc="$probe_fixture_dir/failing-swiftc"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' \
+  'if [[ "${1:-}" == --version ]]; then printf "fake swiftc 1.0\\n"; exit 0; fi' \
+  'echo "synthetic compiler failure" >&2' 'exit 1' >"$failing_swiftc"
+chmod +x "$failing_swiftc"
+if TMPDIR="$probe_fixture_dir" \
+  HF2Q_THERMAL_SWIFTC_BIN="$failing_swiftc" \
+  thermal_prepare_probe >/dev/null 2>&1; then
+  echo "thermal guard accepted a compiler failure" >&2
+  exit 1
+fi
+test -z "$THERMAL_PROBE_BIN"
+test -z "$(find "$probe_fixture_dir" -maxdepth 1 -type d \
+  -name 'hf2q-thermal-probe.*' -print -quit)"
+
+malformed_probe="$probe_fixture_dir/malformed-probe"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "unknown\\n"' >"$malformed_probe"
+chmod +x "$malformed_probe"
+if HF2Q_THERMAL_PROBE_BIN="$malformed_probe" thermal_prepare_probe; then
+  echo "thermal guard accepted malformed probe output" >&2
+  exit 1
+fi
+test -z "$THERMAL_PROBE_BIN"
+
+failing_probe="$probe_fixture_dir/failing-probe"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$failing_probe"
+chmod +x "$failing_probe"
+if HF2Q_THERMAL_PROBE_BIN="$failing_probe" thermal_prepare_probe; then
+  echo "thermal guard accepted probe execution failure" >&2
+  exit 1
+fi
+test -z "$THERMAL_PROBE_BIN"
+
+external_probe="$probe_fixture_dir/external-probe"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "nominal\\n"' >"$external_probe"
+chmod +x "$external_probe"
+HF2Q_THERMAL_PROBE_BIN="$external_probe" thermal_prepare_probe
+test -z "$THERMAL_PROBE_OWNED_DIR"
+thermal_cleanup_probe
+test -x "$external_probe"
+
+mismatched_owned_dir="$probe_fixture_dir/mismatched-owned"
+mkdir -p "$mismatched_owned_dir"
+THERMAL_PROBE_BIN="$probe_fixture_dir/not-the-owned-probe"
+THERMAL_PROBE_OWNED_DIR=$mismatched_owned_dir
+if thermal_cleanup_probe; then
+  echo "thermal cleanup accepted a mismatched owned path" >&2
+  exit 1
+fi
+test -d "$mismatched_owned_dir"
+THERMAL_PROBE_BIN=""
+THERMAL_PROBE_OWNED_DIR=""
+
 if [[ $(uname -s) == Darwin ]]; then
   thermal_read_state
   [[ "$THERMAL_STATE" =~ ^(nominal|fair|serious|critical)$ ]]
+  thermal_cleanup_probe
 fi
 
 sequence_index=0

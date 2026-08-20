@@ -7,10 +7,12 @@
   `mlx-native =0.10.12` fixes non-aligned D512 tail loads; warm compatible
   suffixes cooperate through FFN/MoE; and an exact four-lane decode transaction
   plus synchronized cold handoff restores every unchanged product latency
-  bound. Earlier real-model structured-tool, prefix-reuse, scheduling, and
-  thermal evidence remains as recorded below. The 2026-08-19 hf2q candidate
-  requires exact-SHA CI and protected packed-artifact hardware receipts before
-  publication.
+  bound. Calibrated gates compile their Foundation thermal probe once and then
+  reuse it for every sample, preserving the strict cadence contract without a
+  Swift compiler launch in the measurement loop. Earlier real-model
+  structured-tool, prefix-reuse, scheduling, and thermal evidence remains as
+  recorded below. The 2026-08-19 hf2q candidate requires exact-SHA CI and
+  protected packed-artifact hardware receipts before publication.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -2005,6 +2007,34 @@ over five seconds, a test failure, parity drift, topology drift, or a
 non-positive median. Its receipt and independent verifier recompute all state
 counts and phase boundaries. This changes no agentic product-wave SLO or
 thermal calibration.
+
+Protected run `32336641261` then proved the arithmetic while exposing a
+measurement-path defect. Cooperative prefill passed exact B=2/3/4 parity and
+measured `5267.199` versus `4199.051666` ms, a `1.2543782308393248x`
+speedup. The four-lane decode proof passed all 132 exact steps, retained the
+92-to-23 command-buffer and four-to-one synchronization topology, and measured
+`438.8917085` versus `344.2250415` ms, a `1.2750138879713084x` speedup. No
+Serious or Critical state occurred. The workflow nevertheless rejected the
+decode receipt because one sample interval was eight seconds, above the
+unchanged five-second maximum.
+
+The RCA was the telemetry implementation, not the model or Metal work. Every
+sample launched `swift -e`, starting the Swift interpreter/compiler inside the
+hot loop. Idle probes took about 111–127 ms, and the exact run recorded one
+multi-second scheduling/compiler outlier under concurrent load. The accepted
+correction compiles the checked-in Foundation helper once before any model
+load, validates its first result, then reuses that executable. Twenty unloaded
+samples measured 7.6–9.5 ms end to end; ten samples under 16 busy CPU workers
+retained 2–3 second timestamp spacing with zero gaps. The helper remains
+fail-closed on a missing compiler/source, compilation failure, non-executable
+output, probe failure, or malformed state. Its exact private executable is
+removed at process cleanup. The two-second target, five-second maximum gap,
+60-second Nominal settle, and Serious/Critical rejection are unchanged.
+Because the independently verified decode-cohort summary now binds the helper
+source, compiler, compiler version, and executable digests, that summary uses
+schema version 2; the underlying Rust benchmark receipt remains schema version
+1 and is compared after removing only the summary's version and envelope
+fields.
 
 Several plausible alternatives were measured and rejected, and none remains
 in the landing diff:

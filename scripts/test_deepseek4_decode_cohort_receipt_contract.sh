@@ -46,6 +46,9 @@ for timestamp in $(seq 1000 5 1060); do
 done
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+thermal_probe_source_sha=$(sha256_file "$ROOT_DIR/scripts/macos_thermal_probe.swift")
+thermal_probe_compiler_sha=abababababababababababababababababababababababababababababababab
+thermal_probe_binary_sha=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
 write_summary() {
   local output=$1
   local measurement_path=${2:-$measurement}
@@ -75,6 +78,9 @@ write_summary() {
     --arg test_log_sha256 "$(sha256_file "$test_log")" \
     --arg measurement_log_sha256 "$(sha256_file "$measurement_path")" \
     --arg settle_log_sha256 "$(sha256_file "$settle_path")" \
+    --arg thermal_probe_source_sha256 "$thermal_probe_source_sha" \
+    --arg thermal_probe_compiler_sha256 "$thermal_probe_compiler_sha" \
+    --arg thermal_probe_binary_sha256 "$thermal_probe_binary_sha" \
     --argjson measurement_samples "$measurement_samples" \
     --argjson measurement_duration_seconds "$measurement_duration_seconds" \
     --argjson non_nominal_measurement_samples \
@@ -89,6 +95,13 @@ write_summary() {
       required_start_state:"nominal",maximum_measurement_state:"fair",
       measurement_log_sha256:$measurement_log_sha256,
       settle_log_sha256:$settle_log_sha256,settle_seconds:60,
+      thermal_probe:{implementation:"compiled-foundation-helper",
+        source_path:"scripts/macos_thermal_probe.swift",
+        source_sha256:$thermal_probe_source_sha256,
+        compiler_path:"/usr/bin/swiftc",
+        compiler_sha256:$thermal_probe_compiler_sha256,
+        compiler_version:"Apple Swift version 6.2 (synthetic)",
+        binary_sha256:$thermal_probe_binary_sha256},
       settle_samples:13,settle_duration_seconds:60,
       settle_sample_interval_seconds:5,maximum_settle_sample_gap_seconds:8,
       settle_telemetry_gaps:0,measurement_samples:$measurement_samples,
@@ -102,6 +115,8 @@ write_summary() {
 }
 
 write_summary "$summary"
+jq '.schema_version = 2' "$summary" >"$tmp_dir/schema-v2.json"
+mv "$tmp_dir/schema-v2.json" "$summary"
 
 bash "$VERIFY" "$summary" "$raw" "$test_log" "$measurement" "$settle" \
   "$source_sha" "$model_sha"
@@ -141,6 +156,14 @@ expect_reject bad-required-start "$tmp_dir/bad-required-start.json"
 jq '.maximum_measurement_state = "nominal"' "$summary" \
   >"$tmp_dir/bad-maximum-state.json"
 expect_reject bad-maximum-state "$tmp_dir/bad-maximum-state.json"
+jq '.thermal_probe.source_sha256 = ("0" * 64)' "$summary" \
+  >"$tmp_dir/bad-probe-source.json"
+expect_reject bad-probe-source "$tmp_dir/bad-probe-source.json"
+jq '.schema_version = 1' "$summary" >"$tmp_dir/stale-summary-schema.json"
+expect_reject stale-summary-schema "$tmp_dir/stale-summary-schema.json"
+jq 'del(.thermal_probe.binary_sha256)' "$summary" \
+  >"$tmp_dir/missing-probe-binary.json"
+expect_reject missing-probe-binary "$tmp_dir/missing-probe-binary.json"
 
 printf '2000\tnominal\tdecode-cohort-measurement-start\n' \
   >"$tmp_dir/gapped-measurement.log"

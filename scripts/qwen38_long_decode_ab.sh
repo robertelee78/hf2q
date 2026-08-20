@@ -32,13 +32,14 @@ readonly TRIAL_SETTLE_SECONDS=30
 readonly TRIAL_ORDER='off auto auto off'
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-if [[ ${HF2Q_THERMAL_SWIFT_BIN+x} ]]; then
-  echo "HF2Q_THERMAL_SWIFT_BIN is reserved for isolated contract tests" >&2
+if [[ ${HF2Q_THERMAL_SWIFTC_BIN+x} || ${HF2Q_THERMAL_PROBE_BIN+x} \
+  || ${HF2Q_THERMAL_PROBE_SOURCE+x} ]]; then
+  echo "thermal probe overrides are reserved for isolated contract tests" >&2
   exit 2
 fi
-readonly HF2Q_THERMAL_SWIFT_BIN=/usr/bin/swift
-[[ -x "$HF2Q_THERMAL_SWIFT_BIN" ]] || {
-  echo "required system Swift probe is unavailable: $HF2Q_THERMAL_SWIFT_BIN" >&2
+readonly HF2Q_THERMAL_SWIFTC_BIN=/usr/bin/swiftc
+[[ -x "$HF2Q_THERMAL_SWIFTC_BIN" ]] || {
+  echo "required system Swift compiler is unavailable: $HF2Q_THERMAL_SWIFTC_BIN" >&2
   exit 2
 }
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -102,7 +103,6 @@ hardware_chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || printf unknown
 hardware_memory_bytes=$(sysctl -n hw.memsize 2>/dev/null || printf 0)
 hardware_arch=$(uname -m)
 hardware_os=$(sw_vers -productVersion 2>/dev/null || uname -r)
-thermal_probe_sha=$(sha256_file "$HF2Q_THERMAL_SWIFT_BIN")
 [[ "$hardware_arch" == arm64 ]] || {
   echo "Qwen3.8 calibrated long-decode gate requires Apple Silicon arm64" >&2
   exit 2
@@ -210,15 +210,32 @@ stop_server() {
   server_pid=''
 }
 cleanup() {
+  local cleanup_rc=0
   if [[ -n "$request_pid" ]] && kill -0 "$request_pid" 2>/dev/null; then
     kill -TERM "$request_pid" 2>/dev/null || true
     wait "$request_pid" 2>/dev/null || true
   fi
   request_pid=''
-  stop_server
+  stop_server || cleanup_rc=1
+  thermal_cleanup_probe || cleanup_rc=1
+  return "$cleanup_rc"
 }
-trap cleanup EXIT
+on_exit() {
+  local original_rc=$?
+  trap - EXIT
+  if ! cleanup && ((original_rc == 0)); then
+    original_rc=1
+  fi
+  exit "$original_rc"
+}
+trap on_exit EXIT
 trap 'exit 1' INT TERM
+
+thermal_prepare_probe
+thermal_probe_binary_sha=$(sha256_file "$THERMAL_PROBE_BIN")
+thermal_probe_source_sha=$(sha256_file "$THERMAL_PROBE_SOURCE")
+thermal_probe_compiler_sha=$(sha256_file "$THERMAL_PROBE_COMPILER")
+thermal_probe_compiler_version=$THERMAL_PROBE_COMPILER_VERSION
 
 wait_ready() {
   local log_path=$1
@@ -600,8 +617,11 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
   --arg short_request_sha256 "$short_request_sha" \
   --arg hardware_chip "$hardware_chip" --arg hardware_arch "$hardware_arch" \
   --arg hardware_os "$hardware_os" --argjson hardware_memory_bytes "$hardware_memory_bytes" \
-  --arg thermal_probe_path "$HF2Q_THERMAL_SWIFT_BIN" \
-  --arg thermal_probe_sha256 "$thermal_probe_sha" \
+  --arg thermal_probe_source_sha256 "$thermal_probe_source_sha" \
+  --arg thermal_probe_compiler_path "$THERMAL_PROBE_COMPILER" \
+  --arg thermal_probe_compiler_sha256 "$thermal_probe_compiler_sha" \
+  --arg thermal_probe_compiler_version "$thermal_probe_compiler_version" \
+  --arg thermal_probe_binary_sha256 "$thermal_probe_binary_sha" \
   --argjson max_tokens "$MAX_TOKENS" \
   --argjson short_max_tokens "$SHORT_MAX_TOKENS" \
   --argjson prompt_padding_tokens "$PROMPT_PADDING_TOKENS" \
@@ -632,7 +652,7 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
   --slurpfile trial2 "$OUT_DIR/trial-2-auto/trial.json" \
   --slurpfile trial3 "$OUT_DIR/trial-3-auto/trial.json" \
   --slurpfile trial4 "$OUT_DIR/trial-4-off/trial.json" \
-  '{schema_version:1,status:$status,benchmark:$benchmark,
+  '{schema_version:2,status:$status,benchmark:$benchmark,
     identity:{source_sha:$source_sha,crate_sha256:$crate_sha256,
       binary:{path:$binary_path,sha256:$binary_sha256,file_identity:$binary_file_identity},
       model:{id:$model_id,path:$model_path,sha256:$model_sha256,
@@ -646,7 +666,13 @@ jq -n --arg status pass --arg benchmark qwen38-long-decode-gqa-q2 \
       short_request:{path:"short-request.json",sha256:$short_request_sha256},
       hardware:{model:$hardware_model,chip:$hardware_chip,arch:$hardware_arch,
         memory_bytes:$hardware_memory_bytes,os_version:$hardware_os,
-        thermal_probe:{path:$thermal_probe_path,sha256:$thermal_probe_sha256}}},
+        thermal_probe:{implementation:"compiled-foundation-helper",
+          source_path:"scripts/macos_thermal_probe.swift",
+          source_sha256:$thermal_probe_source_sha256,
+          compiler_path:$thermal_probe_compiler_path,
+          compiler_sha256:$thermal_probe_compiler_sha256,
+          compiler_version:$thermal_probe_compiler_version,
+          binary_sha256:$thermal_probe_binary_sha256}}},
     settings:{temperature:0,max_tokens:$max_tokens,short_max_tokens:$short_max_tokens,
       stream:false,
       thinking:false,repetition_penalty:1.0,min_prompt_tokens:$min_prompt_tokens,

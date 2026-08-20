@@ -326,6 +326,7 @@ jobs:
                and $d.cached_suffix.cancellation_during_decode.post_cancel_cached_tokens == $d.cached_suffix.cancellation_during_decode.expected_anchor_tokens
                and $d.cached_suffix.ready_before == true and $d.cached_suffix.ready_after == true
                and $d.cached_suffix.fatal_log_signatures == 0
+               and $d.decode_cohort.schema_version == 2
                and $d.decode_cohort.status == "pass"
                and $d.decode_cohort.source_sha == $root.source_sha
                and $d.decode_cohort.model_sha256 == $deepseek_sha
@@ -606,6 +607,7 @@ jobs:
                | $q38.status == "pass"
                and $q38.long_decode.schema_version == 1
                and $q38.long_decode.status == "pass"
+               and $q38.long_decode.benchmark.schema_version == 2
                and $q38.long_decode.benchmark.status == "pass"
                and $q38.long_decode.benchmark.identity.source_sha == $source_sha
                and $q38.long_decode.benchmark.identity.crate_sha256 == $root.crate_sha256
