@@ -1910,6 +1910,36 @@ cooperative median and recorded process peak RSS. Protected agentic waves must
 still pass every unchanged semantic, cache, cancellation, thermal, and latency
 bound before this candidate is accepted.
 
+Two protected exact-artifact attempts then falsified the original requirement
+that this sustained microbenchmark remain Nominal for its entire lifetime. Run
+`32319235539` passed exact parity and the performance test at `1.2296x` before
+the host reached Fair near the end. After removing unrelated host work, run
+`32327823594` on exact source
+`4d14af2cf1a7a76b61996d4428966d253788deca` again passed every B=2/3/4 state,
+logit, and subsequent-token comparison. Its five alternating pairs measured
+serial milliseconds `[4915.009292,5293.279791,5318.741042,5301.899667,
+5333.909916]` and cooperative milliseconds `[4136.835417,4133.733167,
+4107.403,4271.480375,4175.0555]`: medians `5301.899667` versus `4136.835417`,
+or `1.2816317625816729x`. The 144-second test logged 50 consecutive
+Nominal samples before reaching Fair and recorded no Serious or Critical
+sample. The old monitor then stopped at Fair, leaving a 23-second telemetry gap
+before the terminal Fair sample, so that artifact cannot be promoted into a
+revised-contract receipt. Thus the algorithm and product contract passed while
+the all-Nominal measurement policy rejected the sustained load it was intended
+to measure; a fresh protected run must prove continuous Fair-or-better sampling.
+
+The reformulated thermal contract is narrow and matches the already accepted
+Qwen3.8 sustained long-decode gate. Cooperative prefill still requires a
+60-second uninterrupted Nominal settle with no model runtime and a Nominal
+first measurement. It is then sampled every two seconds and may reach Fair;
+any Serious or Critical sample, telemetry gap over five seconds, test failure,
+or loss of exact parity remains fail-closed. The receipt records and the
+independent verifier recomputes Nominal/Fair/over-limit counts and checks the
+first and last phase labels. This changes neither the benchmark's positive
+speedup requirement nor any DeepSeek cold, cached, SSE, automatic-tool, or
+tool-result latency ceiling. Those product waves and the exact B=4 decode gate
+retain their separately calibrated Nominal-only contracts.
+
 ### Four-agent cold handoff and exact warm B=4 decode (2026-08-19 candidate)
 
 The product failure was scheduler latency, not a corrupt cache, stalled GPU, or

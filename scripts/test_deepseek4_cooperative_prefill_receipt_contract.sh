@@ -53,7 +53,8 @@ jq -n '{
 }' >"$raw"
 printf 'cooperative hardware test passed\n' >"$test_log"
 printf '2000\tnominal\tcooperative-prefill-measurement-start\n' >"$measurement"
-printf '2002\tnominal\tcooperative-prefill-measurement-end\n' >>"$measurement"
+printf '2002\tfair\tcooperative-prefill-measurement\n' >>"$measurement"
+printf '2004\tfair\tcooperative-prefill-measurement-end\n' >>"$measurement"
 for timestamp in 1000 1005 1010 1015 1020 1025 1030 1035 1040 1045 1050 1055 1060; do
   printf '%s\tnominal\tcooperative-prefill-settle\n' "$timestamp" >>"$settle"
 done
@@ -63,22 +64,54 @@ write_summary() {
   local output=$1
   local measurement_path=${2:-$measurement}
   local settle_path=${3:-$settle}
+  local measurement_samples measurement_duration_seconds
+  local non_nominal_measurement_samples fair_measurement_samples
+  local over_limit_measurement_samples telemetry_gaps
+  IFS=$'\t' read -r measurement_samples measurement_duration_seconds \
+    non_nominal_measurement_samples fair_measurement_samples \
+    over_limit_measurement_samples telemetry_gaps <<<"$(awk -F '\t' '
+      BEGIN { non_nominal = 0; fair = 0; over = 0; gaps = 0 }
+      {
+        samples++
+        if ($2 != "nominal") non_nominal++
+        if ($2 == "fair") fair++
+        if ($2 == "serious" || $2 == "critical") over++
+        if (samples == 1) first = $1
+        if (samples > 1 && ($1 < previous || $1 - previous > 5)) gaps++
+        previous = $1
+        last = $1
+      }
+      END { print samples "\t" last-first "\t" non_nominal "\t" fair \
+        "\t" over "\t" gaps }
+    ' "$measurement_path")"
   jq --arg source_sha "$SOURCE_SHA" --arg model_sha256 "$MODEL_SHA" \
     --arg raw_sha256 "$(sha256_file "$raw")" \
     --arg test_log_sha256 "$(sha256_file "$test_log")" \
     --arg measurement_log_sha256 "$(sha256_file "$measurement_path")" \
-    --arg settle_log_sha256 "$(sha256_file "$settle_path")" '
+    --arg settle_log_sha256 "$(sha256_file "$settle_path")" \
+    --argjson measurement_samples "$measurement_samples" \
+    --argjson measurement_duration_seconds "$measurement_duration_seconds" \
+    --argjson non_nominal_measurement_samples \
+      "$non_nominal_measurement_samples" \
+    --argjson fair_measurement_samples "$fair_measurement_samples" \
+    --argjson over_limit_measurement_samples \
+      "$over_limit_measurement_samples" \
+    --argjson telemetry_gaps "$telemetry_gaps" '
     . + {source_sha:$source_sha,model_sha256:$model_sha256,
       mlx_native_version:"0.10.12",raw_sha256:$raw_sha256,
-      test_log_sha256:$test_log_sha256,thermal_status:"nominal",
+      test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
+      required_start_state:"nominal",maximum_measurement_state:"fair",
       measurement_log_sha256:$measurement_log_sha256,
       settle_log_sha256:$settle_log_sha256,settle_seconds:60,
       settle_samples:13,settle_duration_seconds:60,
       settle_sample_interval_seconds:5,maximum_settle_sample_gap_seconds:8,
-      settle_telemetry_gaps:0,measurement_samples:2,
-      measurement_duration_seconds:2,sample_interval_seconds:2,
-      maximum_sample_gap_seconds:5,non_nominal_measurement_samples:0,
-      telemetry_gaps:0}
+      settle_telemetry_gaps:0,measurement_samples:$measurement_samples,
+      measurement_duration_seconds:$measurement_duration_seconds,
+      sample_interval_seconds:2,maximum_sample_gap_seconds:5,
+      non_nominal_measurement_samples:$non_nominal_measurement_samples,
+      fair_measurement_samples:$fair_measurement_samples,
+      over_limit_measurement_samples:$over_limit_measurement_samples,
+      telemetry_gaps:$telemetry_gaps}
   ' "$raw" >"$output"
 }
 
@@ -129,10 +162,52 @@ printf '2000\tnominal\tcooperative-prefill-measurement-start\n' \
 printf '2010\tnominal\tcooperative-prefill-measurement-end\n' \
   >>"$tmp_dir/gapped-measurement.log"
 write_summary "$tmp_dir/gapped-summary.json" "$tmp_dir/gapped-measurement.log"
-jq '.measurement_duration_seconds = 10' "$tmp_dir/gapped-summary.json" \
-  >"$tmp_dir/gapped-summary-adjusted.json"
-expect_rejected measurement-gap "$tmp_dir/gapped-summary-adjusted.json" "$raw" \
+expect_rejected measurement-gap "$tmp_dir/gapped-summary.json" "$raw" \
   "$test_log" "$tmp_dir/gapped-measurement.log" "$settle" "$SOURCE_SHA" "$MODEL_SHA"
+
+for over_limit_state in serious critical; do
+  printf '2000\tnominal\tcooperative-prefill-measurement-start\n' \
+    >"$tmp_dir/$over_limit_state-measurement.log"
+  printf '2002\t%s\tcooperative-prefill-measurement\n' "$over_limit_state" \
+    >>"$tmp_dir/$over_limit_state-measurement.log"
+  printf '2004\tfair\tcooperative-prefill-measurement-end\n' \
+    >>"$tmp_dir/$over_limit_state-measurement.log"
+  write_summary "$tmp_dir/$over_limit_state-summary.json" \
+    "$tmp_dir/$over_limit_state-measurement.log"
+  expect_rejected "$over_limit_state-state" \
+    "$tmp_dir/$over_limit_state-summary.json" "$raw" "$test_log" \
+    "$tmp_dir/$over_limit_state-measurement.log" "$settle" \
+    "$SOURCE_SHA" "$MODEL_SHA"
+done
+
+printf '2000\tfair\tcooperative-prefill-measurement-start\n' \
+  >"$tmp_dir/fair-start-measurement.log"
+printf '2002\tfair\tcooperative-prefill-measurement-end\n' \
+  >>"$tmp_dir/fair-start-measurement.log"
+write_summary "$tmp_dir/fair-start-summary.json" \
+  "$tmp_dir/fair-start-measurement.log"
+expect_rejected non-nominal-start "$tmp_dir/fair-start-summary.json" "$raw" \
+  "$test_log" "$tmp_dir/fair-start-measurement.log" "$settle" \
+  "$SOURCE_SHA" "$MODEL_SHA"
+
+jq '.required_start_state = "fair"' "$summary" \
+  >"$tmp_dir/bad-required-start.json"
+expect_rejected required-start-policy "$tmp_dir/bad-required-start.json" "$raw" \
+  "$test_log" "$measurement" "$settle" "$SOURCE_SHA" "$MODEL_SHA"
+
+jq '.maximum_measurement_state = "nominal"' "$summary" \
+  >"$tmp_dir/bad-maximum-state.json"
+expect_rejected maximum-state-policy "$tmp_dir/bad-maximum-state.json" "$raw" \
+  "$test_log" "$measurement" "$settle" "$SOURCE_SHA" "$MODEL_SHA"
+
+jq '.fair_measurement_samples = 1' "$summary" >"$tmp_dir/bad-fair-count.json"
+expect_rejected fair-count "$tmp_dir/bad-fair-count.json" "$raw" "$test_log" \
+  "$measurement" "$settle" "$SOURCE_SHA" "$MODEL_SHA"
+
+jq '.over_limit_measurement_samples = 1' "$summary" \
+  >"$tmp_dir/bad-over-limit-count.json"
+expect_rejected over-limit-count "$tmp_dir/bad-over-limit-count.json" "$raw" \
+  "$test_log" "$measurement" "$settle" "$SOURCE_SHA" "$MODEL_SHA"
 
 cp "$settle" "$tmp_dir/mutated-settle.log"
 printf '1065\tfair\tcooperative-prefill-settle\n' >>"$tmp_dir/mutated-settle.log"

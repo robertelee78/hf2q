@@ -54,6 +54,8 @@ jq -e --slurpfile raw "$raw" \
       .raw_sha256,
       .test_log_sha256,
       .thermal_status,
+      .required_start_state,
+      .maximum_measurement_state,
       .measurement_log_sha256,
       .settle_log_sha256,
       .settle_seconds,
@@ -67,6 +69,8 @@ jq -e --slurpfile raw "$raw" \
       .sample_interval_seconds,
       .maximum_sample_gap_seconds,
       .non_nominal_measurement_samples,
+      .fair_measurement_samples,
+      .over_limit_measurement_samples,
       .telemetry_gaps
     )) == $raw_receipt
     and .schema_version == 1 and .status == "pass"
@@ -95,7 +99,9 @@ jq -e --slurpfile raw "$raw" \
       unexpected_override_variables:[],
       pairs:5
     }
-    and .thermal_status == "nominal"
+    and .thermal_status == "fair_or_better"
+    and .required_start_state == "nominal"
+    and .maximum_measurement_state == "fair"
     and .settle_seconds == 60
     and .settle_sample_interval_seconds == 5
     and .maximum_settle_sample_gap_seconds == 8
@@ -107,21 +113,36 @@ jq -e --slurpfile raw "$raw" \
     and (.measurement_samples | type) == "number" and .measurement_samples >= 2
     and (.measurement_duration_seconds | type) == "number"
     and .measurement_duration_seconds > 0
-    and .non_nominal_measurement_samples == 0
+    and (.non_nominal_measurement_samples | type) == "number"
+    and (.fair_measurement_samples | type) == "number"
+    and (.over_limit_measurement_samples | type) == "number"
+    and .non_nominal_measurement_samples >= 0
+    and .fair_measurement_samples >= 0
+    and .over_limit_measurement_samples == 0
+    and .non_nominal_measurement_samples == .fair_measurement_samples
     and .settle_telemetry_gaps == 0 and .telemetry_gaps == 0
   ' "$summary" >/dev/null
 
-thermal_validate_measurement_log "$measurement_log" 5
+thermal_validate_fair_or_better_measurement_log "$measurement_log" 5
 test "$THERMAL_LOG_SAMPLES" = "$(jq -er .measurement_samples "$summary")"
 test "$THERMAL_LOG_DURATION_SECONDS" = \
   "$(jq -er .measurement_duration_seconds "$summary")"
 test "$THERMAL_LOG_NON_NOMINAL_SAMPLES" = \
   "$(jq -er .non_nominal_measurement_samples "$summary")"
+test "$THERMAL_LOG_FAIR_SAMPLES" = \
+  "$(jq -er .fair_measurement_samples "$summary")"
+test "$THERMAL_LOG_OVER_LIMIT_SAMPLES" = \
+  "$(jq -er .over_limit_measurement_samples "$summary")"
 test "$THERMAL_LOG_GAPS" = "$(jq -er .telemetry_gaps "$summary")"
 test "$(head -1 "$measurement_log" | awk -F '\t' '{print $3}')" = \
   cooperative-prefill-measurement-start
+test "$(head -1 "$measurement_log" | awk -F '\t' '{print $2}')" = nominal
 test "$(tail -1 "$measurement_log" | awk -F '\t' '{print $3}')" = \
   cooperative-prefill-measurement-end
+case "$(tail -1 "$measurement_log" | awk -F '\t' '{print $2}')" in
+  nominal|fair) ;;
+  *) exit 1 ;;
+esac
 awk -F '\t' 'NR > 1 && $3 != "cooperative-prefill-measurement" && \
   $3 != "cooperative-prefill-measurement-end" { exit 1 }' "$measurement_log"
 

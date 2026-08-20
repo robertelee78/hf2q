@@ -80,7 +80,6 @@ server_pid=""
 power_pid=""
 caffeinate_pid=""
 wave_harness_pid=""
-cooperative_thermal_pid=""
 
 require_ac() {
   local state
@@ -144,12 +143,6 @@ stop_server() {
 
 cleanup() {
   local cleanup_rc=0
-  if [[ -n "$cooperative_thermal_pid" ]]; then
-    [[ -z ${cooperative_thermal_stop:-} ]] || touch "$cooperative_thermal_stop"
-    kill -TERM "$cooperative_thermal_pid" 2>/dev/null || true
-    wait "$cooperative_thermal_pid" 2>/dev/null || true
-    cooperative_thermal_pid=""
-  fi
   if [[ -n "$wave_harness_pid" ]]; then
     kill -TERM "$wave_harness_pid" 2>/dev/null || true
     # Closing the server makes any in-flight curl return promptly before the
@@ -457,7 +450,6 @@ cooperative_dir="$OUT_ROOT/deepseek/cooperative-prefill"
 cooperative_raw="$cooperative_dir/raw.json"
 cooperative_log="$cooperative_dir/test.log"
 cooperative_thermal_log="$cooperative_dir/thermal.log"
-cooperative_thermal_stop="$cooperative_dir/thermal.stop"
 cooperative_settle_log="$cooperative_dir/settle.log"
 cooperative_build_log="$cooperative_dir/build.jsonl"
 mkdir -p "$cooperative_dir"
@@ -478,13 +470,9 @@ require_no_model_runtime
 thermal_wait_for_nominal "$cooperative_settle_log" \
   cooperative-prefill-settle 60 900 5
 : >"$cooperative_thermal_log"
-rm -f "$cooperative_thermal_stop"
 thermal_sample "$cooperative_thermal_log" \
   cooperative-prefill-measurement-start
-thermal_monitor_nominal "$cooperative_thermal_log" \
-  cooperative-prefill-measurement "$cooperative_thermal_stop" 2 &
-cooperative_thermal_pid=$!
-cooperative_test_rc=0
+test "$THERMAL_STATE" = nominal
 env -i \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   TMPDIR="${TMPDIR:-/tmp}" \
@@ -494,19 +482,33 @@ env -i \
   "$cooperative_test_binary" \
     official_artifact_cooperative_warm_prefill_is_exact_and_faster \
     --ignored --test-threads=1 --nocapture \
-    >"$cooperative_log" 2>&1 || cooperative_test_rc=$?
-touch "$cooperative_thermal_stop"
+    >"$cooperative_log" 2>&1 &
+wave_harness_pid=$!
+set +e
 cooperative_thermal_rc=0
-wait "$cooperative_thermal_pid" || cooperative_thermal_rc=$?
-cooperative_thermal_pid=""
+thermal_monitor_fair_or_better_while_pid "$cooperative_thermal_log" \
+  cooperative-prefill-measurement "$wave_harness_pid" 2
+cooperative_thermal_rc=$?
+if ((cooperative_thermal_rc != 0)); then
+  kill -TERM "$wave_harness_pid" 2>/dev/null || true
+fi
+wait "$wave_harness_pid"
+cooperative_test_rc=$?
+wave_harness_pid=""
+set -e
+test "$cooperative_thermal_rc" = 0
+test "$cooperative_test_rc" = 0
+require_no_model_runtime
+ensure_guard_health
 thermal_sample "$cooperative_thermal_log" \
   cooperative-prefill-measurement-end
-test "$cooperative_test_rc" = 0
-test "$cooperative_thermal_rc" = 0
-thermal_validate_measurement_log "$cooperative_thermal_log" 5
+[[ "$THERMAL_STATE" == nominal || "$THERMAL_STATE" == fair ]]
+thermal_validate_fair_or_better_measurement_log "$cooperative_thermal_log" 5
 cooperative_measurement_samples=$THERMAL_LOG_SAMPLES
 cooperative_measurement_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
 cooperative_non_nominal_samples=$THERMAL_LOG_NON_NOMINAL_SAMPLES
+cooperative_fair_samples=$THERMAL_LOG_FAIR_SAMPLES
+cooperative_over_limit_samples=$THERMAL_LOG_OVER_LIMIT_SAMPLES
 cooperative_measurement_gaps=$THERMAL_LOG_GAPS
 thermal_validate_settle_log "$cooperative_settle_log" 60 8
 cooperative_settle_samples=$THERMAL_LOG_SAMPLES
@@ -547,10 +549,13 @@ jq --arg source_sha "$EXPECTED_SHA" \
   --argjson sample_interval_seconds 2 \
   --argjson maximum_sample_gap_seconds 5 \
   --argjson non_nominal_measurement_samples "$cooperative_non_nominal_samples" \
+  --argjson fair_measurement_samples "$cooperative_fair_samples" \
+  --argjson over_limit_measurement_samples "$cooperative_over_limit_samples" \
   --argjson telemetry_gaps "$cooperative_measurement_gaps" \
   '. + {source_sha:$source_sha,model_sha256:$model_sha256,
     mlx_native_version:$mlx_native_version,raw_sha256:$raw_sha256,
-    test_log_sha256:$test_log_sha256,thermal_status:"nominal",
+    test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
+    required_start_state:"nominal",maximum_measurement_state:"fair",
     measurement_log_sha256:$measurement_log_sha256,
     settle_log_sha256:$settle_log_sha256,settle_seconds:$settle_seconds,
     settle_samples:$settle_samples,
@@ -563,6 +568,8 @@ jq --arg source_sha "$EXPECTED_SHA" \
     sample_interval_seconds:$sample_interval_seconds,
     maximum_sample_gap_seconds:$maximum_sample_gap_seconds,
     non_nominal_measurement_samples:$non_nominal_measurement_samples,
+    fair_measurement_samples:$fair_measurement_samples,
+    over_limit_measurement_samples:$over_limit_measurement_samples,
     telemetry_gaps:$telemetry_gaps}' \
   "$cooperative_raw" >"$cooperative_dir/summary.json"
 bash scripts/verify_deepseek4_cooperative_prefill_receipt.sh \

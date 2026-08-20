@@ -269,7 +269,12 @@ jobs:
                and $d.cooperative_prefill.mlx_native_version == "0.10.12"
                and $d.cooperative_prefill.prefix_rows == 148
                and $d.cooperative_prefill.benchmark.speedup > 1
-               and $d.cooperative_prefill.thermal_status == "nominal"
+               and $d.cooperative_prefill.thermal_status == "fair_or_better"
+               and $d.cooperative_prefill.required_start_state == "nominal"
+               and $d.cooperative_prefill.maximum_measurement_state == "fair"
+               and $d.cooperative_prefill.over_limit_measurement_samples == 0
+               and $d.cooperative_prefill.non_nominal_measurement_samples
+                 == $d.cooperative_prefill.fair_measurement_samples
                and $d.prompt_provenance.status == "pass"
                and $d.prompt_provenance.prompt_contract_sha256 == $prompt_contract_sha256
                and $d.prompt_provenance.model_sha256 == $deepseek_sha
