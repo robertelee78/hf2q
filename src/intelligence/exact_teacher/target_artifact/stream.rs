@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use crate::core::provenance::tensor_execution::ArtifactEvidence;
@@ -7,7 +8,67 @@ use crate::intelligence::calibration::{
 };
 
 use super::publication::RetainedTargetTemp;
+use super::reservation::{
+    reservation_contract_sha256, StructuralTeacherTargetReservationReceiptV1,
+    UnpublishedStructuralTeacherTargetReservation,
+};
 use super::*;
+
+impl UnpublishedStructuralTeacherTargetReservation {
+    pub(crate) fn validate_private(&self) -> Result<(), ExactTeacherTargetError> {
+        if reservation_contract_sha256(&self.receipt)? != self.receipt.reservation_contract_sha256 {
+            return Err(ExactTeacherTargetError::Invalid(
+                "teacher target reservation receipt does not reproduce".into(),
+            ));
+        }
+        self.temporary
+            .verify_private_and_absent(u64::try_from(TARGET_MAGIC.len()).unwrap())?;
+        let mut magic = vec![0_u8; TARGET_MAGIC.len()];
+        self.temporary
+            .as_file()
+            .read_exact_at(&mut magic, 0)
+            .map_err(|error| ExactTeacherTargetError::io(self.temporary.output(), error))?;
+        if magic != TARGET_MAGIC {
+            return Err(ExactTeacherTargetError::Invalid(
+                "teacher target reservation magic differs".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin<'a>(
+        self,
+        plan: &'a VerifiedCalibrationPredictionPlan,
+    ) -> Result<StructuralTeacherTargetStream<'a>, ExactTeacherTargetError> {
+        self.validate_private()?;
+        let preflight = preflight_structural_teacher_target(
+            plan,
+            self.receipt.vocabulary_size,
+            self.receipt.limits,
+        )?;
+        if plan.manifest().manifest_sha256 != self.receipt.prediction_plan_sha256
+            || plan.prediction_point_count() != self.receipt.prediction_point_count
+            || plan.manifest().greedy_prompts.len() != self.receipt.generation_prompt_count
+            || preflight.preflight_bytes != self.receipt.final_artifact_bytes
+            || reservation_contract_sha256(&self.receipt)?
+                != self.receipt.reservation_contract_sha256
+        {
+            return Err(ExactTeacherTargetError::Invalid(
+                "teacher target reservation differs from its opaque prediction plan".into(),
+            ));
+        }
+        Ok(StructuralTeacherTargetStream {
+            plan,
+            temporary: self.temporary,
+            vocabulary_size: self.receipt.vocabulary_size,
+            limits: self.receipt.limits,
+            preflight_bytes: self.receipt.final_artifact_bytes,
+            offset: u64::try_from(TARGET_MAGIC.len()).unwrap(),
+            rows: Vec::with_capacity(self.receipt.prediction_point_count),
+            trajectories: Vec::with_capacity(self.receipt.generation_prompt_count),
+        })
+    }
+}
 
 /// Checked target dimensions and token vocabulary closure. This remains a
 /// structural capability, but it is intentionally produced before any family
@@ -92,6 +153,14 @@ impl<'a> StructuralTeacherTargetPreflight<'a> {
         self,
         output: &Path,
     ) -> Result<StructuralTeacherTargetStream<'a>, ExactTeacherTargetError> {
+        let plan = self.plan;
+        self.reserve(output)?.begin(plan)
+    }
+
+    pub(crate) fn reserve(
+        self,
+        output: &Path,
+    ) -> Result<UnpublishedStructuralTeacherTargetReservation, ExactTeacherTargetError> {
         let Self {
             plan,
             vocabulary_size,
@@ -105,16 +174,15 @@ impl<'a> StructuralTeacherTargetPreflight<'a> {
             .write_all(TARGET_MAGIC)
             .map_err(|error| ExactTeacherTargetError::io(output, error))?;
 
-        Ok(StructuralTeacherTargetStream {
-            plan,
-            temporary,
-            vocabulary_size,
+        let receipt = StructuralTeacherTargetReservationReceiptV1::new(
+            plan.manifest().manifest_sha256.clone(),
             limits,
+            vocabulary_size,
+            plan.prediction_point_count(),
+            plan.manifest().greedy_prompts.len(),
             preflight_bytes,
-            offset: u64::try_from(TARGET_MAGIC.len()).unwrap(),
-            rows: Vec::with_capacity(plan.prediction_point_count()),
-            trajectories: Vec::with_capacity(plan.manifest().greedy_prompts.len()),
-        })
+        )?;
+        Ok(UnpublishedStructuralTeacherTargetReservation { receipt, temporary })
     }
 }
 

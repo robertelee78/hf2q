@@ -11,9 +11,11 @@ use crate::intelligence::calibration::VerifiedCalibrationPredictionPlan;
 use super::types::*;
 
 mod publication;
+mod reservation;
 mod stream;
 mod verify;
 
+pub(crate) use reservation::UnpublishedStructuralTeacherTargetReservation;
 #[allow(unused_imports)] // consumed by the family-owned runner slice
 pub(crate) use stream::{
     preflight_structural_teacher_target, StructuralTeacherTargetPreflight,

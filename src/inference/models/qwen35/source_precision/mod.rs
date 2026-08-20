@@ -28,10 +28,12 @@ pub(crate) use teacher_execution_plan::{
 #[allow(unused_imports)] // opaque B2a seam consumed by the subsequent Metal-upload slice
 pub(crate) use topology::{admit_qwen35_bf16_topology, VerifiedQwen35Bf16TopologyV1};
 pub(crate) use types::QwenSourceSnapshotLimits;
-#[allow(unused_imports)] // opaque B3a seam consumed by the subsequent completed runner
+#[allow(unused_imports)] // opaque B3 preparation seams consumed by the completed runner
 pub(crate) use upload::{
-    prepare_qwen35_source_teacher, prepare_uploaded_qwen35_source_teacher,
+    prepare_qwen35_source_teacher, prepare_qwen35_source_teacher_run_inputs,
+    prepare_uploaded_qwen35_source_teacher, PreparedQwen35SourceTeacherRunInputsV1,
     PreparedQwen35SourceTeacherV1, Qwen35SourceTeacherLimitsV1,
+    Qwen35SourceTeacherPreparationPolicyV1,
 };
 #[allow(unused_imports)] // opaque B2b seam consumed by the subsequent teacher runner
 pub(crate) use upload::{upload_qwen35_bf16_topology_to_metal, VerifiedQwen35Bf16MetalUploadV1};

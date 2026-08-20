@@ -53,7 +53,8 @@ mod source_teacher;
 
 #[allow(unused_imports)] // consumed by the source-teacher runner slice
 pub(super) use source_teacher::{
-    plan_qwen35_base_text_cache, Qwen35BaseTextCachePlanV1, Qwen35BaseTextCacheReceiptV1,
+    plan_qwen35_base_text_cache, prepare_qwen35_base_text_cache, PreparedQwen35BaseTextCacheV1,
+    Qwen35BaseTextCachePlanV1, Qwen35BaseTextCacheReceiptV1,
 };
 
 /// Per-full-attention-layer KV slot.
