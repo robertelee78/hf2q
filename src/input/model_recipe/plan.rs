@@ -206,6 +206,18 @@ impl ModelPreparationPlan {
         self.recipe.source().files()
     }
 
+    pub(in crate::input) fn revalidate_source_root_before_mutation(
+        &self,
+    ) -> Result<(), ModelPreparationError> {
+        let actual = canonical_future_directory(&self.source_root)?;
+        if actual != self.source_root {
+            return Err(plan_error(
+                "preparation source root changed after the plan was sealed",
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(in crate::input) fn host_for_test(&self) -> &VerifiedRecipeHost {
         &self._host
@@ -291,7 +303,9 @@ impl PreparationLayout {
     }
 }
 
-fn canonical_future_directory(path: &Path) -> Result<PathBuf, ModelPreparationError> {
+pub(in crate::input) fn canonical_future_directory(
+    path: &Path,
+) -> Result<PathBuf, ModelPreparationError> {
     validate_path(path)?;
     if !path.is_absolute() {
         return Err(plan_error("models root is not absolute"));

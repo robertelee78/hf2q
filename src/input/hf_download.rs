@@ -43,7 +43,10 @@
 //! immutable commit and bounded name inventory, and returns an inert sealed
 //! plan before any payload transfer. A second metadata-only transition queries
 //! all 29 recipe-owned names at that exact commit and seals only records that
-//! match the checked-in size, Git/LFS identity, and canonical order.
+//! match the checked-in size, Git/LFS identity, and canonical order. The
+//! payload transition consumes that authorization, confines hf-hub's resumable
+//! cache to the planned `source/` tree, verifies every fetched file, and still
+//! returns no conversion or deletion authority.
 //!
 //! Manual test protocol: `Ctrl+C` mid-download → observe partial shard
 //! in `~/.cache/huggingface/hub/models--*/snapshots/*/` → re-invoke
@@ -66,8 +69,10 @@ use crate::progress::ProgressReporter;
 mod resolution;
 
 pub use resolution::{
-    authorize_model_preparation_transfer, AuthorizedModelPreparationTransfer,
+    authorize_model_preparation_transfer, transfer_authorized_model_preparation,
+    AuthorizedModelPreparationTransfer, ModelPreparationPayloadError,
     ModelPreparationResolutionError, ResolvedModelPreparationPlan, ResolvedModelRepository,
+    TransferredModelPreparationPayload,
 };
 use resolution::{bind_model_preparation_resolution, resolve_repository_info};
 #[cfg(test)]

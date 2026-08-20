@@ -22,7 +22,8 @@
   source/artifact/hardware/disk recipe, bounded canonical preparation-pair
   receipt, OS-bound host/disk preflight, and sealed host/conversion/pair proofs
   plus the canonical inert no-options preparation layout, exact Hub resolution,
-  and complete recipe-metadata transfer authorization are also reconciled;
+  complete recipe-metadata transfer authorization, and recipe-owned resumable
+  payload transfer are also reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install/onboarding
@@ -1721,7 +1722,37 @@ authority. The opt-in live proof is
 `HF2Q_TEST_QWEN38_TRANSFER_AUTH=1 cargo +1.88.0 test --locked --bin hf2q
 --all-features input::model_recipe_plan_tests::current_plan_authorizes_all_recipe_metadata_before_payload_transfer -- --exact --test-threads=1`.
 
-The authorized payload transfer, no-options conversion invocation,
+**Landed inert payload transfer (2026-08-19).** The payload transition consumes
+the metadata authorization and creates only the planned recipe-owned `source/`
+tree. That directory is the root of a dedicated hf-hub cache, so partial and
+complete files use the pinned client's ordinary per-blob lock/resume behavior
+without duplicating the roughly 55.6 GB source into an external shared cache.
+Before mutation, the original canonical future source path and the future
+repository, blob, ref, snapshot, and exact-commit directories are revalidated;
+after transfer, every materialized directory is re-opened through its canonical
+path. A changed or symlink-redirected namespace fails before Hub access.
+
+Only the 29 authorization-owned names are requested, in canonical recipe
+order. Each returned cache path must belong to the planned repository snapshot
+at the accepted commit, and each file is immediately checked against its
+authorized length plus LFS SHA-256 or canonical Git-blob SHA-1. Interrupted
+work leaves a recipe-owned resumable cache but returns no token. Complete work
+mints a non-cloneable `TransferredModelPreparationPayload`; only its recipe ID,
+file count, and model root are observable, while the payload-cache paths and
+records remain private. It is still inert: later code must reopen and
+authenticate every file before conversion, and it grants no conversion,
+source deletion, artifact publication, registration, calibration, or serving
+authority. The persistent opt-in full-source proof is:
+
+```sh
+HF2Q_TEST_QWEN38_PAYLOAD_TRANSFER=1 \
+HF2Q_TEST_QWEN38_MODELS_ROOT="$HOME/.hf2q/models" \
+cargo +1.88.0 test --locked --bin hf2q --all-features \
+  input::hf_download::resolution::payload::tests::current_recipe_payload_transfers_and_verifies_when_explicitly_requested \
+  -- --exact --test-threads=1
+```
+
+The reopened source-authentication boundary, no-options conversion invocation,
 source-retention mutation, prepared-model registry, and calibration receipt
 remain pending and must consume these proofs rather than reconstructing policy
 from strings.
@@ -2057,8 +2088,9 @@ before public self-update ships.
    it; its exact original reference is now consumed by the pinned Hub resolver
    and bound to the accepted commit plus complete recipe-owned name inventory.
    A second metadata-only transition authenticates the size and Git/LFS
-   identity of every recipe file before any payload transfer. All remain
-   explicitly calibration-pending and inert. Next, embed
+   identity of every recipe file before payload transfer; a third consumes it
+   into a recipe-owned resumable source cache and inert transferred-payload
+   token. All remain explicitly calibration-pending and inert. Next, embed
    the real stable root, compile the real
    public Team ID, pass the protected positive signing fixture, and compose
    that recipe into the no-options paired conversion, source-retention
