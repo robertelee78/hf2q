@@ -7,6 +7,7 @@ use super::{
     SourceRetentionChoice, VerifiedRecipeHost,
 };
 use crate::input::hf_reference::{HfModelReference, ResolvedHfModelReference};
+use crate::input::integrity::VerifiedSourceManifest;
 
 pub const MAX_MODEL_PREPARATION_PATH_BYTES: usize = 4096;
 const MAX_MODEL_PREPARATION_PATH_COMPONENTS: usize = 64;
@@ -204,6 +205,23 @@ impl ModelPreparationPlan {
 
     pub(in crate::input) fn expected_source_files(&self) -> &[RecipeSourceFile] {
         self.recipe.source().files()
+    }
+
+    pub(in crate::input) fn authenticate_source(
+        &self,
+        local_dir: &Path,
+        verified: VerifiedSourceManifest,
+    ) -> Result<super::VerifiedRecipeSource, ModelPreparationError> {
+        Ok(self.recipe.verify_source(local_dir, verified)?)
+    }
+
+    #[cfg(test)]
+    pub(in crate::input) fn verified_source_at_for_test(
+        &self,
+        local_dir: &Path,
+        records: Vec<crate::core::integrity::ShardIntegrity>,
+    ) -> super::VerifiedRecipeSource {
+        self.recipe.verified_source_at_for_test(local_dir, records)
     }
 
     pub(in crate::input) fn revalidate_source_root_before_mutation(

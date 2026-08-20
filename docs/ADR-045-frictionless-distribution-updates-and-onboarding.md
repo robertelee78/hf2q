@@ -23,7 +23,8 @@
   receipt, OS-bound host/disk preflight, and sealed host/conversion/pair proofs
   plus the canonical inert no-options preparation layout, exact Hub resolution,
   complete recipe-metadata transfer authorization, and recipe-owned resumable
-  payload transfer are also reconciled;
+  payload transfer plus offline recipe-bound source reauthentication are also
+  reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install/onboarding
@@ -1752,10 +1753,39 @@ cargo +1.88.0 test --locked --bin hf2q --all-features \
   -- --exact --test-threads=1
 ```
 
-The reopened source-authentication boundary, no-options conversion invocation,
-source-retention mutation, prepared-model registry, and calibration receipt
-remain pending and must consume these proofs rather than reconstructing policy
-from strings.
+**Landed offline source reauthentication (2026-08-19).** The next transition
+consumes the transferred-payload token and performs no Hub request or
+filesystem mutation. It reopens the exact recipe-owned repository, snapshots,
+and accepted-commit directories, retains their device/inode identities across
+the complete verification pass, and rejects a canonical-path or identity
+change before returning authority. The existing offline conversion-manifest
+verifier authenticates all 29 files against their exact Git-blob or LFS
+identity, parses the already authenticated safetensors index, and requires
+every selected weight shard to carry a strong LFS SHA-256 identity. The
+checked-in recipe then rebinds the repository, revision, file count, paths,
+lengths, Git/LFS classification, ETags, LFS SHA-256 values, and an independent
+SHA-256 for every Git-managed file.
+
+Success mints a non-cloneable `AuthenticatedModelPreparationSource`; its
+snapshot path and record inventory remain private, and its observable facts
+are limited to the recipe ID, authenticated file count, and planned model
+root. It remains deliberately inert and is not timeless source authority: the
+later consuming conversion coordinator must repeat exact source validation at
+its own mutation boundary. Failure leaves the recipe cache untouched and
+grants no conversion, source deletion, artifact publication, registration,
+calibration, or serving authority. The persistent opt-in proof is:
+
+```sh
+HF2Q_TEST_QWEN38_SOURCE_AUTH=1 \
+HF2Q_TEST_QWEN38_MODELS_ROOT="$HOME/.hf2q/models" \
+cargo +1.88.0 test --locked --bin hf2q --all-features \
+  input::hf_download::resolution::payload::source::tests::current_recipe_cache_reauthenticates_when_explicitly_requested \
+  -- --exact --test-threads=1
+```
+
+The no-options conversion invocation, source-retention mutation,
+prepared-model registry, and calibration receipt remain pending and must
+consume these proofs rather than reconstructing policy from strings.
 
 It executes an hf2q-only resumable plan:
 
@@ -2090,7 +2120,9 @@ before public self-update ships.
    A second metadata-only transition authenticates the size and Git/LFS
    identity of every recipe file before payload transfer; a third consumes it
    into a recipe-owned resumable source cache and inert transferred-payload
-   token. All remain explicitly calibration-pending and inert. Next, embed
+   token; a fourth reopens that exact cache offline and binds every file to
+   both Hub identity and the checked-in recipe in a non-cloneable inert source
+   proof. All remain explicitly calibration-pending and inert. Next, embed
    the real stable root, compile the real
    public Team ID, pass the protected positive signing fixture, and compose
    that recipe into the no-options paired conversion, source-retention

@@ -663,9 +663,14 @@ harness leans on three patterns:
    non-cloneable accepted-commit/recipe-inventory proof, then authenticates all
    29 recipe-owned size and Git/LFS identities into a separate non-cloneable
    metadata-only transfer authorization, then consumes it into a dedicated
-   recipe-owned resumable hf-hub cache and inert transferred-payload token,
-   and consumes two bounded canonical conversion receipts into one inert
-   text/projector preparation proof. Its
+   recipe-owned resumable hf-hub cache and inert transferred-payload token.
+   The next offline transition reopens that exact cache, retains canonical
+   directory device/inode identities across verification, authenticates the
+   selected safetensors index and all 29 file bytes, and binds the result to
+   both Hub Git/LFS identity and the independent checked-in recipe before
+   minting another non-cloneable inert source proof. It then consumes two
+   bounded canonical conversion receipts into one inert text/projector
+   preparation proof. Its
    compact v1 receipt binds the recipe, source, hardware profile, converter,
    both artifacts, and both receipt digests while remaining explicitly
    calibration-pending. Parsing it cannot mint the non-cloneable proof, and it

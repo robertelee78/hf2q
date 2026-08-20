@@ -171,11 +171,24 @@ impl ModelRecipe {
 
     #[cfg(test)]
     pub(in crate::input) fn verified_source_for_test(&self) -> VerifiedRecipeSource {
+        self.verified_source_at_for_test(Path::new("/verified-recipe-source"), Vec::new())
+    }
+
+    #[cfg(test)]
+    pub(in crate::input) fn verified_source_at_for_test(
+        &self,
+        local_dir: &Path,
+        records: Vec<ShardIntegrity>,
+    ) -> VerifiedRecipeSource {
         VerifiedRecipeSource {
             recipe_id: self.recipe_id.clone(),
             recipe_sha256: self.recipe_sha256().expect("recipe sha256"),
-            local_dir: PathBuf::from("/verified-recipe-source"),
-            verified: VerifiedSourceManifest::for_test(Vec::new()),
+            local_dir: local_dir.to_path_buf(),
+            verified: VerifiedSourceManifest::for_test_bound(
+                &self.source.repository_id,
+                &self.source.revision,
+                records,
+            ),
         }
     }
 }
