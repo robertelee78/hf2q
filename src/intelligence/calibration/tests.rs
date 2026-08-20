@@ -261,6 +261,207 @@ fn production_rendering_and_partition_are_source_bound_and_disjoint() {
 }
 
 #[test]
+fn prediction_plan_uses_only_calibration_tokens_and_binds_next_token_alignment() {
+    let (temp, request) = model_dir();
+    let calibration_manifest = build_structured_dataset_manifest(
+        "dataset".into(),
+        "revision".into(),
+        "apache-2.0".into(),
+        DatasetSplit::Calibration,
+        7,
+        vec![
+            example("cal", "calibration", true),
+            example("gen", "calibration", false),
+        ],
+    )
+    .unwrap();
+    let corpus_path = temp.path().join("calibration.json");
+    let corpus_bytes = serde_json::to_vec(&calibration_manifest).unwrap();
+    std::fs::write(&corpus_path, &corpus_bytes).unwrap();
+    let corpus = verify_calibration_corpus_artifact(&VerifyCalibrationCorpusRequest {
+        path: corpus_path,
+        expected_sha256: sha256(&corpus_bytes),
+        expected_dataset_id: "dataset".into(),
+        expected_revision: "revision".into(),
+        expected_declared_license: "apache-2.0".into(),
+        expected_split: DatasetSplit::Calibration,
+        limits: CalibrationCorpusArtifactLimits {
+            max_artifact_bytes: 64 * 1024,
+            max_examples: 4,
+            max_messages: 8,
+            max_tools: 4,
+        },
+    })
+    .unwrap();
+    assert_eq!(corpus.artifact().sha256, sha256(&corpus_bytes));
+    let limits = TeacherPredictionPlanLimits {
+        max_examples: 4,
+        max_total_tokens: 128,
+        max_rendered_utf8_bytes: 8 * 1024,
+        max_prediction_points: 64,
+        max_prefix_tokens: 64,
+        max_generation_prompts: 2,
+    };
+    let mut tiny_render_limits = limits;
+    tiny_render_limits.max_total_tokens = 1;
+    assert!(render_and_tokenize_verified_split(&corpus, &request, tiny_render_limits).is_err());
+    let calibration = render_and_tokenize_verified_split(&corpus, &request, limits).unwrap();
+    let validation = render_and_tokenize_split(
+        &dataset(
+            DatasetSplit::PolicyValidation,
+            example("val", "validation", true),
+        ),
+        &request,
+    )
+    .unwrap();
+    let holdout = render_and_tokenize_split(
+        &dataset(
+            DatasetSplit::AcceptanceHoldout,
+            example("hold", "holdout", true),
+        ),
+        &request,
+    )
+    .unwrap();
+    let partition = verify_dataset_partition(&calibration, &validation, &holdout).unwrap();
+    let plan = build_teacher_prediction_plan(
+        &partition,
+        &corpus,
+        &calibration,
+        &validation,
+        &holdout,
+        limits,
+    )
+    .unwrap();
+
+    validate_teacher_prediction_plan(plan.manifest()).unwrap();
+    assert_eq!(plan.manifest().greedy_prompts.len(), 1);
+    assert_eq!(plan.manifest().greedy_prompts[0].stable_id, "gen");
+    assert!(plan.prediction_point_count() >= 2);
+    let mut seen_generation = false;
+    let mut seen_teacher_forced = false;
+    plan.visit_prediction_points::<std::convert::Infallible>(|point, prefix| {
+        assert_eq!(point.prefix_token_count, prefix.len());
+        assert_eq!(
+            point.prefix_token_ids_sha256,
+            super::prediction_plan::prefix_token_sha256_for_test(prefix)
+        );
+        assert_ne!(point.stable_id, "val");
+        assert_ne!(point.stable_id, "hold");
+        match point.kind {
+            TeacherPredictionPointKind::TeacherForced {
+                target_token_index,
+                target_token_id,
+            } => {
+                seen_teacher_forced = true;
+                assert_eq!(target_token_index, prefix.len());
+                assert_eq!(
+                    calibration.token_ids[&point.stable_id][target_token_index],
+                    target_token_id
+                );
+            }
+            TeacherPredictionPointKind::GenerationNext => {
+                seen_generation = true;
+                assert_eq!(point.stable_id, "gen");
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(seen_generation && seen_teacher_forced);
+
+    let mut wrong_partition = partition.clone();
+    wrong_partition.manifest_sha256 = "0".repeat(64);
+    assert!(matches!(
+        build_teacher_prediction_plan(
+            &wrong_partition,
+            &corpus,
+            &calibration,
+            &validation,
+            &holdout,
+            limits,
+        ),
+        Err(CalibrationInputError::SplitMismatch)
+    ));
+
+    let mut too_small = limits;
+    too_small.max_prediction_points = 1;
+    assert!(matches!(
+        build_teacher_prediction_plan(
+            &partition,
+            &corpus,
+            &calibration,
+            &validation,
+            &holdout,
+            too_small,
+        ),
+        Err(CalibrationInputError::InvalidDataset(_))
+    ));
+}
+
+#[test]
+fn prediction_plan_validator_rejects_rehashed_noncanonical_example_and_greedy_order() {
+    let plan = super::prediction_plan::prediction_plan_for_test();
+
+    let mut reordered_examples = plan.manifest().clone();
+    reordered_examples.examples.swap(0, 1);
+    super::prediction_plan::resign_prediction_plan_for_test(&mut reordered_examples);
+    assert!(validate_teacher_prediction_plan(&reordered_examples).is_err());
+
+    let mut reordered_greedy = plan.manifest().clone();
+    let original = reordered_greedy.greedy_prompts[0].clone();
+    reordered_greedy.greedy_prompts.push(original);
+    super::prediction_plan::resign_prediction_plan_for_test(&mut reordered_greedy);
+    assert!(validate_teacher_prediction_plan(&reordered_greedy).is_err());
+}
+
+#[test]
+fn corpus_artifact_is_owned_bounded_and_hash_authenticated() {
+    let temp = tempfile::tempdir().unwrap();
+    let manifest = dataset(
+        DatasetSplit::Calibration,
+        example("cal", "calibration", true),
+    );
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let path = temp.path().join("corpus.json");
+    std::fs::write(&path, &bytes).unwrap();
+    let base = VerifyCalibrationCorpusRequest {
+        path: path.clone(),
+        expected_sha256: sha256(&bytes),
+        expected_dataset_id: "dataset".into(),
+        expected_revision: "revision".into(),
+        expected_declared_license: "apache-2.0".into(),
+        expected_split: DatasetSplit::Calibration,
+        limits: CalibrationCorpusArtifactLimits {
+            max_artifact_bytes: 64 * 1024,
+            max_examples: 2,
+            max_messages: 4,
+            max_tools: 2,
+        },
+    };
+    let verified = verify_calibration_corpus_artifact(&base).unwrap();
+    assert_eq!(
+        verified.manifest().manifest_sha256,
+        manifest.manifest_sha256
+    );
+
+    std::fs::write(&path, b"replaced").unwrap();
+    assert_eq!(
+        verified.manifest().manifest_sha256,
+        manifest.manifest_sha256,
+        "verified corpus must retain owned authenticated bytes"
+    );
+    assert!(verify_calibration_corpus_artifact(&base).is_err());
+
+    std::fs::write(&path, &bytes).unwrap();
+    let mut too_small = base.clone();
+    too_small.limits.max_artifact_bytes = u64::try_from(bytes.len() - 1).unwrap();
+    assert!(verify_calibration_corpus_artifact(&too_small).is_err());
+    let mut wrong_license = base;
+    wrong_license.expected_declared_license = "different".into();
+    assert!(verify_calibration_corpus_artifact(&wrong_license).is_err());
+}
+
+#[test]
 fn partition_rejects_rendered_and_token_window_overlap() {
     let (_temp, request) = model_dir();
     let calibration = render_and_tokenize_split(

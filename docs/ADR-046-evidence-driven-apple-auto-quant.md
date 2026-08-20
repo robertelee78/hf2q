@@ -5,9 +5,10 @@
 - Date: 2026-08-18
 - Updated: 2026-08-20 — source-to-stored evidence and the bounded
   loaded/executed/encoded producer use exact published
-  `mlx-native = 0.10.16`; model-free allocation binding remains structural and
-  cannot invoke the proposer without authenticated completion, measurement,
-  and quality evidence
+  `mlx-native = 0.10.16`. The backend-independent exact-teacher target storage
+  and model-free allocation binding remain structural and cannot invoke the
+  proposer without authenticated source-precision completion, sensitivity,
+  measurement, and quality evidence
 - Owners: hf2q product pipeline; mlx-native model-agnostic execution primitives
 - Supersedes: ADR-020's proposed DWQ architecture and performance claims
 
@@ -786,6 +787,58 @@ state, training, or candidate is admitted.
 Only after completed runtime and quality/measurement authority is joined to
 this physical path may D3 produce exact-teacher Dynamic sensitivity and
 materialize candidate policies. DWQ remains outside the authorized program.
+
+#### 2026-08-20 — D3a bounded exact-teacher target substrate
+
+The first D3 slice freezes input and target bytes without claiming that an
+authoritative source teacher exists yet:
+
+- a structured Calibration corpus may be admitted only from one opened,
+  bounded JSON artifact whose exact bytes, SHA-256, dataset id, revision,
+  declared license, split, and collection counts reproduce. The license is a
+  declaration authenticated by the artifact, not a separate legal
+  adjudication. Rendering consumes an owned copy, so later pathname replacement
+  cannot change the admitted examples;
+- a prediction plan first reruns the three-way Calibration,
+  policy-validation, and acceptance-holdout overlap proof, then retains token
+  ids from the Calibration split only. Completed assistant token `i` is bound
+  to logits from the exact prefix ending at `i - 1`; generation prompts bind
+  one next-token row. Global retained-rendered-byte, token, prefix, point, and
+  generation-prompt bounds use checked arithmetic before any model work. The
+  current production renderer still constructs and tokenizes one complete
+  example before applying those aggregate bounds, so this is not yet a hard
+  peak-render-memory claim;
+- full-vocabulary logits are stored as finite F32 little-endian rows in a
+  framed binary artifact. The same retained file is independently reread
+  before atomic no-clobber publication; this slice defines no persisted replay
+  authority. The verifier rejects gaps, overlaps, reordering,
+  trailing bytes, mutation, truncation, vocabulary drift, and non-finite
+  values, and recomputes each row hash, deterministic argmax/top-k (ties by
+  ascending token id), and F64 log-sum-exp. Greedy evidence is fixed at exactly
+  32 tokens and bound to the same generation prompts;
+- the artifact returned by a caller-logit writer is named and typed as
+  **structural only**. Self-hashed JSON, a well-framed target file, or the tiny
+  F32 CPU oracle used by tests cannot mint exact-teacher execution authority,
+  sensitivity, a policy, or allocator input;
+- the synthetic zero-layer, all-zero Qwen CPU oracle proves full-logit framing
+  and deterministic target collection only. It does not prove a loaded Qwen
+  graph and is not the Qwen3.8-27B teacher: expanding the roughly
+  27B BF16 source to whole-model F32 would consume about 110 GB before
+  activations and output rows and is not a safe fallback on the 128 GiB target.
+
+Completing D3a requires a family-owned, bounded source-precision dense-Qwen
+runner that consumes authenticated source tensors without the production
+Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps
+the retained target artifact in an opaque authority. The intended real-model
+route is streaming BF16-to-Metal with exact family-defined semantic transforms
+and lossless layout changes; an F32
+GGUF/CPU run remains a tiny-model oracle or an explicitly preflighted small
+model path. D3b then materializes exactly one D1 atomic option at a time and
+computes full-distribution KL, top-1, and trajectory metrics. The transferable
+Unsloth lessons are multi-domain native-template calibration, heterogeneous
+precision, separate tuning/validation/holdout data, and full-distribution plus
+trajectory gates—not an unpublished selector algorithm. No DWQ, learned
+affine overlay, or training path is introduced.
 
 ### Phase E — production `--quant auto`
 

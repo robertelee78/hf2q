@@ -346,6 +346,7 @@ fn verify_source_file_bytes(
 fn render_unverified(
     dataset: &StructuredDatasetManifest,
     request: &RenderDatasetRequest,
+    global_limits: Option<TeacherPredictionPlanLimits>,
 ) -> Result<RenderedDataset, CalibrationInputError> {
     super::manifest::validate_structured_dataset_manifest(dataset)?;
     if request.verified_source.repo() != request.source.model_id
@@ -359,6 +360,14 @@ fn render_unverified(
         return Err(CalibrationInputError::InvalidDataset(
             "token and overlap-window bounds must be positive".into(),
         ));
+    }
+    if let Some(limits) = global_limits {
+        super::prediction_plan::validate_prediction_plan_limits(limits)?;
+        if dataset.examples.len() > limits.max_examples {
+            return Err(CalibrationInputError::InvalidDataset(
+                "rendered Calibration split exceeds its global preflight bounds".into(),
+            ));
+        }
     }
 
     let tokenizer_path = request.model_dir.join("tokenizer.json");
@@ -443,6 +452,8 @@ fn render_unverified(
     let mut receipts = Vec::with_capacity(dataset.examples.len());
     let mut rendered_utf8 = BTreeMap::new();
     let mut token_ids = BTreeMap::new();
+    let mut total_token_count = 0usize;
+    let mut total_rendered_utf8_bytes = 0u64;
     for example in &dataset.examples {
         if example.messages.iter().any(|message| {
             message
@@ -476,6 +487,31 @@ fn render_unverified(
                 tokens: ids.len(),
                 maximum: request.max_tokens_per_example,
             });
+        }
+        if let Some(limits) = global_limits {
+            total_token_count = total_token_count.checked_add(ids.len()).ok_or_else(|| {
+                CalibrationInputError::InvalidDataset(
+                    "rendered Calibration token count overflow".into(),
+                )
+            })?;
+            total_rendered_utf8_bytes = total_rendered_utf8_bytes
+                .checked_add(u64::try_from(rendered.len()).map_err(|_| {
+                    CalibrationInputError::InvalidDataset(
+                        "rendered Calibration byte count is not representable".into(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    CalibrationInputError::InvalidDataset(
+                        "rendered Calibration byte count overflow".into(),
+                    )
+                })?;
+            if total_token_count > limits.max_total_tokens
+                || total_rendered_utf8_bytes > limits.max_rendered_utf8_bytes
+            {
+                return Err(CalibrationInputError::InvalidDataset(
+                    "rendered Calibration split exceeds its global token or byte bound".into(),
+                ));
+            }
         }
 
         let scoring_ranges = if example.render_mode == RenderMode::CompletedAssistantTranscript {
@@ -576,7 +612,20 @@ pub fn render_and_tokenize_split(
     dataset: &StructuredDatasetManifest,
     request: &RenderDatasetRequest,
 ) -> Result<RenderedDataset, CalibrationInputError> {
-    let rendered = render_unverified(dataset, request)?;
+    let rendered = render_unverified(dataset, request, None)?;
+    validate_rendered_dataset(&rendered)?;
+    Ok(rendered)
+}
+
+/// Render an owned, hash-authenticated structured corpus through the exact
+/// source tokenizer/template path. D3 target production uses this entrypoint;
+/// the manifest-only form remains for compatibility and non-authority tools.
+pub(crate) fn render_and_tokenize_verified_split(
+    dataset: &VerifiedCalibrationCorpus,
+    request: &RenderDatasetRequest,
+    limits: TeacherPredictionPlanLimits,
+) -> Result<RenderedDataset, CalibrationInputError> {
+    let rendered = render_unverified(dataset.manifest(), request, Some(limits))?;
     validate_rendered_dataset(&rendered)?;
     Ok(rendered)
 }
@@ -588,7 +637,7 @@ pub fn verify_rendered_dataset_from_source(
     request: &RenderDatasetRequest,
 ) -> Result<(), CalibrationInputError> {
     validate_rendered_dataset(claimed)?;
-    let rebuilt = render_unverified(&claimed.structured, request)?;
+    let rebuilt = render_unverified(&claimed.structured, request, None)?;
     validate_rendered_dataset(&rebuilt)?;
     let claimed_manifest = serde_json::to_vec(&claimed.manifest)
         .map_err(|error| CalibrationInputError::Serialization(error.to_string()))?;
