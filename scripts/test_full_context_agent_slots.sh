@@ -46,9 +46,8 @@ fi
 
 # The single-agent gate's 40-second cold limit is intentionally strict. Four
 # cold DeepSeek requests share one 100 GiB verifier. The checked-in 21,204-byte
-# context fixture preserves the 6,684-token insertion-ordered workload used for
-# the exact matched peer comparison. Two thermally valid llama.cpp np4 waves
-# measured 68.438 s
+# context fixture preserves the accepted 6,684-token hf2q workload used for the exact matched
+# peer comparison. Two thermally valid llama.cpp np4 waves measured 68.438 s
 # and 69.944 s on this M5 Max; the 60 s hf2q ceiling keeps a 9.2 s margin below
 # the peer median. Cached turns remain tightly bounded.
 # Explicit operator values always win.
@@ -131,6 +130,7 @@ for ((agent = 1; agent <= AGENTS; agent++)); do
     request_run_id="full-context-${FAMILY}-${WAVE_ID}-agent-${agent}"
   fi
   RUN_ID="$request_run_id" \
+  AGENT_INDEX="$agent" \
   REQUIRE_COLD_FIRST="$REQUIRE_COLD_FIRST" \
   COLD_RESULT_PATH="$OUT_DIR/agent-${agent}.cold.json" \
   SENTINEL="HF2Q_${FAMILY_TAG}_AGENT_${agent}_OK" \
@@ -199,6 +199,12 @@ jq -s --arg family "$FAMILY" --arg wave_id "$WAVE_ID" \
       concurrent_agents: $agents,
       fixture_id: (map(.fixture_id) | unique
         | if length == 1 then .[0] else error("agentic fixture ids differ") end),
+      prompt_contract_sha256: (map(.prompt_contract_sha256) | unique
+        | if length == 1 then .[0] else error("prompt contract digests differ") end),
+      prompt_provenance_sha256: (map(.prompt_provenance_sha256) | unique
+        | if length == 1 then .[0] else error("prompt provenance digests differ") end),
+      serialization_policy: (map(.serialization_policy) | unique
+        | if length == 1 then .[0] else error("prompt serialization policies differ") end),
       agentic_context_fixture_sha256: (map(.agentic_context_fixture_sha256) | unique
         | if length == 1 then .[0] else error("agentic context fixture digests differ") end),
       agentic_context_fixture_bytes: (map(.agentic_context_fixture_bytes) | unique
@@ -209,6 +215,12 @@ jq -s --arg family "$FAMILY" --arg wave_id "$WAVE_ID" \
         | if length == 1 then .[0] else error("agentic system prompts differ") end),
       tool_result_success_prefix_sha256: (map(.tool_result_success_prefix_sha256) | unique
         | if length == 1 then .[0] else error("tool-result success envelopes differ") end),
+      tool_result_fixture_sha256: (map(.tool_result_fixture_sha256) | unique
+        | if length == 1 then .[0] else error("tool-result fixture digests differ") end),
+      tool_result_fixture_bytes: (map(.tool_result_fixture_bytes) | unique
+        | if length == 1 then .[0] else error("tool-result fixture sizes differ") end),
+      tool_result_payload_sha256: (map(.tool_result_payload_sha256) | unique
+        | if length == 1 then .[0] else error("tool-result payload digests differ") end),
       expected_prompt_tokens: (map(.expected_prompt_tokens) | unique
         | if length == 1 then .[0] else error("expected prompt token counts differ") end),
       prompt_tokens: (map(.prompt_tokens) | unique
@@ -219,7 +231,7 @@ jq -s --arg family "$FAMILY" --arg wave_id "$WAVE_ID" \
       minimum_cached_tokens: (map(.cached_tokens) | min),
       maximum_cached_ttft_ms: (map(.cached_ttft_ms) | max),
       maximum_tool_result_ms: (map(.tool_result_response_ms) | max),
-      agents: .
+      agents: sort_by(.agent)
     }
   end
 ' "${agent_receipts[@]}"

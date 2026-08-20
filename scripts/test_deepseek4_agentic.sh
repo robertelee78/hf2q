@@ -26,6 +26,10 @@ AGENTIC_CONTEXT_FIXTURE=${AGENTIC_CONTEXT_FIXTURE:-$ROOT_DIR/scripts/fixtures/de
 AGENTIC_CONTEXT_FIXTURE_SHA256=${AGENTIC_CONTEXT_FIXTURE_SHA256:-2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef}
 AGENTIC_FIXTURE_ID=${AGENTIC_FIXTURE_ID:-full-context-agentic-v1}
 EXPECTED_PROMPT_TOKENS=${EXPECTED_PROMPT_TOKENS:-0}
+AGENTIC_PROMPT_CONTRACT=${AGENTIC_PROMPT_CONTRACT:-}
+AGENTIC_PROMPT_CONTRACT_SHA256=${AGENTIC_PROMPT_CONTRACT_SHA256:-}
+AGENT_INDEX=${AGENT_INDEX:-0}
+PROMPT_PROVENANCE_SHA256=${PROMPT_PROVENANCE_SHA256:-}
 CURL_CONNECT_TIMEOUT_SECONDS=${CURL_CONNECT_TIMEOUT_SECONDS:-5}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-60}
 MAX_TOKENS=${MAX_TOKENS:-128}
@@ -106,6 +110,105 @@ agentic_context_fixture_bytes=$(wc -c <"$AGENTIC_CONTEXT_FIXTURE" | tr -d '[:spa
 agentic_system_prompt_sha256=$(printf '%s' "$AGENTIC_SYSTEM_PROMPT" | shasum -a 256 | awk '{print $1}')
 tool_result_success_prefix_sha256=$(printf '%s' "$TOOL_RESULT_SUCCESS_PREFIX" | shasum -a 256 | awk '{print $1}')
 
+prompt_contract_sha256=""
+serialization_policy=""
+request_sha256=""
+request_bytes=0
+rendered_prompt_sha256=""
+prompt_token_ids_sha256=""
+tool_result_fixture_sha256=$(shasum -a 256 "$TOOL_RESULT_PATH" | awk '{print $1}')
+tool_result_fixture_bytes=$(wc -c <"$TOOL_RESULT_PATH" | tr -d '[:space:]')
+tool_result_fixture_chars=$(jq -Rs 'length' "$TOOL_RESULT_PATH")
+tool_result_success_prefix_bytes=$(printf '%s' "$TOOL_RESULT_SUCCESS_PREFIX" | wc -c | tr -d '[:space:]')
+tool_result_payload_bytes=$((tool_result_success_prefix_bytes + tool_result_fixture_bytes))
+tool_result_payload_sha256=$(
+  { printf '%s' "$TOOL_RESULT_SUCCESS_PREFIX"; cat "$TOOL_RESULT_PATH"; } |
+    shasum -a 256 | awk '{print $1}'
+)
+
+if [[ -n "$AGENTIC_PROMPT_CONTRACT" ]]; then
+  [[ -r "$AGENTIC_PROMPT_CONTRACT" ]] || {
+    echo "agentic prompt contract is not readable: $AGENTIC_PROMPT_CONTRACT" >&2
+    exit 2
+  }
+  [[ "$AGENT_INDEX" =~ ^[1-4]$ ]] || {
+    echo "AGENT_INDEX must be 1..4 when AGENTIC_PROMPT_CONTRACT is set" >&2
+    exit 2
+  }
+  jq -e -f "$ROOT_DIR/scripts/deepseek4_agentic_prompt_contract.jq" \
+    "$AGENTIC_PROMPT_CONTRACT" >/dev/null
+  prompt_contract_sha256=$(shasum -a 256 "$AGENTIC_PROMPT_CONTRACT" | awk '{print $1}')
+  if [[ -n "$AGENTIC_PROMPT_CONTRACT_SHA256" &&
+        "$prompt_contract_sha256" != "$AGENTIC_PROMPT_CONTRACT_SHA256" ]]; then
+    echo "agentic prompt contract SHA-256 mismatch" >&2
+    exit 2
+  fi
+  AGENTIC_FIXTURE_ID=$(jq -er '.fixture_id' "$AGENTIC_PROMPT_CONTRACT")
+  serialization_policy=$(jq -er '.serialization.policy' "$AGENTIC_PROMPT_CONTRACT")
+  EXPECTED_PROMPT_TOKENS=$(jq -er '.serialization.expected_prompt_tokens' "$AGENTIC_PROMPT_CONTRACT")
+  [[ "$MODEL" == "$(jq -er '.request.model' "$AGENTIC_PROMPT_CONTRACT")" &&
+      "$MAX_TOKENS" == "$(jq -er '.request.max_tokens' "$AGENTIC_PROMPT_CONTRACT")" &&
+      "$agentic_system_prompt_sha256" == "$(jq -er '.request.system_prompt_sha256' "$AGENTIC_PROMPT_CONTRACT")" ]] || {
+    echo "agentic request settings disagree with prompt contract" >&2
+    exit 2
+  }
+  expected_contract_path=$(jq -er '.request.expected_path' "$AGENTIC_PROMPT_CONTRACT")
+  [[ "$EXPECTED_PATH" == "$expected_contract_path" ]] || {
+    echo "agentic expected path disagrees with prompt contract" >&2
+    exit 2
+  }
+  expected_run_id=$(jq -er --argjson agent "$AGENT_INDEX" \
+    '.agents[] | select(.agent == $agent) | .run_id' "$AGENTIC_PROMPT_CONTRACT")
+  expected_sentinel=$(jq -er --argjson agent "$AGENT_INDEX" \
+    '.agents[] | select(.agent == $agent) | .sentinel' "$AGENTIC_PROMPT_CONTRACT")
+  [[ "$RUN_ID" == "$expected_run_id" && "$SENTINEL" == "$expected_sentinel" ]] || {
+    echo "agentic agent identity disagrees with prompt contract" >&2
+    exit 2
+  }
+  expected_context_sha=$(jq -er '.repository_context.sha256' "$AGENTIC_PROMPT_CONTRACT")
+  expected_context_bytes=$(jq -er '.repository_context.bytes' "$AGENTIC_PROMPT_CONTRACT")
+  [[ "$actual_context_fixture_sha256" == "$expected_context_sha" &&
+      "$agentic_context_fixture_bytes" == "$expected_context_bytes" ]] || {
+    echo "agentic context input disagrees with prompt contract" >&2
+    exit 2
+  }
+  expected_tool_sha=$(jq -er '.tool_result.sha256' "$AGENTIC_PROMPT_CONTRACT")
+  expected_tool_bytes=$(jq -er '.tool_result.bytes' "$AGENTIC_PROMPT_CONTRACT")
+  expected_tool_chars=$(jq -er '.tool_result.chars' "$AGENTIC_PROMPT_CONTRACT")
+  expected_prefix_bytes=$(jq -er '.tool_result.success_prefix_bytes' "$AGENTIC_PROMPT_CONTRACT")
+  expected_payload_bytes=$(jq -er '.tool_result.combined_payload_bytes' "$AGENTIC_PROMPT_CONTRACT")
+  expected_payload_sha=$(jq -er '.tool_result.combined_payload_sha256' "$AGENTIC_PROMPT_CONTRACT")
+  [[ "$tool_result_fixture_sha256" == "$expected_tool_sha" &&
+      "$tool_result_fixture_bytes" == "$expected_tool_bytes" &&
+      "$tool_result_fixture_chars" == "$expected_tool_chars" &&
+      "$tool_result_success_prefix_bytes" == "$expected_prefix_bytes" &&
+      "$tool_result_payload_bytes" == "$expected_payload_bytes" &&
+      "$tool_result_payload_sha256" == "$expected_payload_sha" ]] || {
+    echo "agentic tool-result input disagrees with prompt contract" >&2
+    exit 2
+  }
+  [[ "$tool_result_success_prefix_sha256" == \
+      "$(jq -er '.tool_result.success_prefix_sha256' "$AGENTIC_PROMPT_CONTRACT")" ]] || {
+    echo "agentic tool-result prefix disagrees with prompt contract" >&2
+    exit 2
+  }
+  canonical_tool_result="$ROOT_DIR/$(jq -er '.tool_result.path' "$AGENTIC_PROMPT_CONTRACT")"
+  [[ "$TOOL_RESULT_PATH" == "$canonical_tool_result" ]] || {
+    echo "agentic tool-result path is not the contract fixture" >&2
+    exit 2
+  }
+  for input in request_builder chat_template; do
+    input_path=$(jq -er --arg input "$input" '.[$input].path' "$AGENTIC_PROMPT_CONTRACT")
+    input_sha=$(jq -er --arg input "$input" '.[$input].sha256' "$AGENTIC_PROMPT_CONTRACT")
+    input_bytes=$(jq -er --arg input "$input" '.[$input].bytes' "$AGENTIC_PROMPT_CONTRACT")
+    [[ "$(shasum -a 256 "$ROOT_DIR/$input_path" | awk '{print $1}')" == "$input_sha" &&
+        "$(wc -c <"$ROOT_DIR/$input_path" | tr -d '[:space:]')" == "$input_bytes" ]] || {
+      echo "agentic $input input disagrees with prompt contract" >&2
+      exit 2
+    }
+  done
+fi
+
 request_file=$(mktemp -t hf2q-deepseek-agentic-request.XXXXXX)
 first_file=$(mktemp -t hf2q-deepseek-agentic-first.XXXXXX)
 second_file=$(mktemp -t hf2q-deepseek-agentic-second.XXXXXX)
@@ -137,9 +240,31 @@ jq -n --rawfile repo "$AGENTIC_CONTEXT_FIXTURE" \
   --arg model "$MODEL" --arg expected_path "$EXPECTED_PATH" --arg run_id "$RUN_ID" \
   --arg sentinel "$SENTINEL" --arg system_prompt "$AGENTIC_SYSTEM_PROMPT" \
   -f scripts/deepseek4_agentic_request.jq >"$request_file"
+request_sha256=$(shasum -a 256 "$request_file" | awk '{print $1}')
+request_bytes=$(wc -c <"$request_file" | tr -d '[:space:]')
+if [[ -n "$AGENTIC_PROMPT_CONTRACT" ]]; then
+  expected_request_sha=$(jq -er --argjson agent "$AGENT_INDEX" \
+    '.agents[] | select(.agent == $agent) | .request_sha256' "$AGENTIC_PROMPT_CONTRACT")
+  expected_request_bytes=$(jq -er --argjson agent "$AGENT_INDEX" \
+    '.agents[] | select(.agent == $agent) | .request_bytes' "$AGENTIC_PROMPT_CONTRACT")
+  [[ "$request_sha256" == "$expected_request_sha" &&
+      "$request_bytes" == "$expected_request_bytes" ]] || {
+    echo "agentic request bytes disagree with prompt contract" >&2
+    exit 2
+  }
+  rendered_prompt_sha256=$(jq -er --argjson agent "$AGENT_INDEX" \
+    '.agents[] | select(.agent == $agent) | .rendered_prompt_sha256' "$AGENTIC_PROMPT_CONTRACT")
+  prompt_token_ids_sha256=$(jq -er --argjson agent "$AGENT_INDEX" \
+    '.agents[] | select(.agent == $agent) | .prompt_token_ids_sha256' "$AGENTIC_PROMPT_CONTRACT")
+fi
 if [[ -n "$HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT" ]]; then
   cp "$request_file" "$HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT"
   exit 0
+fi
+if [[ -n "$AGENTIC_PROMPT_CONTRACT" &&
+      ! "$PROMPT_PROVENANCE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "PROMPT_PROVENANCE_SHA256 must bind the exact renderer/tokenizer receipt" >&2
+  exit 2
 fi
 
 post_json() {
@@ -210,14 +335,30 @@ fi
 if [[ -n "$COLD_RESULT_PATH" ]]; then
   cold_result_tmp="${COLD_RESULT_PATH}.tmp.$$"
   jq -n \
+    --argjson agent "$AGENT_INDEX" \
+    --arg run_id "$RUN_ID" \
     --arg fixture_id "$AGENTIC_FIXTURE_ID" \
+    --arg prompt_contract_sha256 "$prompt_contract_sha256" \
+    --arg prompt_provenance_sha256 "$PROMPT_PROVENANCE_SHA256" \
+    --arg serialization_policy "$serialization_policy" \
+    --arg request_sha256 "$request_sha256" \
+    --argjson request_bytes "$request_bytes" \
+    --arg rendered_prompt_sha256 "$rendered_prompt_sha256" \
+    --arg prompt_token_ids_sha256 "$prompt_token_ids_sha256" \
     --arg fixture_sha256 "$actual_context_fixture_sha256" \
     --argjson fixture_bytes "$agentic_context_fixture_bytes" \
     --argjson prompt_tokens "$prompt_tokens" \
     --argjson cold_cached_tokens "$cold_cached" \
     --argjson cold_ttft_ms "$cold_ttft" \
     --argjson cold_semantic_response_ms "$cold_response_ms" \
-    '{status:"pass",fixture_id:$fixture_id,fixture_sha256:$fixture_sha256,
+    '{status:"pass",agent:$agent,run_id:$run_id,fixture_id:$fixture_id,
+      prompt_contract_sha256:$prompt_contract_sha256,
+      prompt_provenance_sha256:$prompt_provenance_sha256,
+      serialization_policy:$serialization_policy,
+      request_sha256:$request_sha256,request_bytes:$request_bytes,
+      rendered_prompt_sha256:$rendered_prompt_sha256,
+      prompt_token_ids_sha256:$prompt_token_ids_sha256,
+      fixture_sha256:$fixture_sha256,
       fixture_bytes:$fixture_bytes,prompt_tokens:$prompt_tokens,
       cold_cached_tokens:$cold_cached_tokens,cold_ttft_ms:$cold_ttft_ms,
       cold_semantic_response_ms:$cold_semantic_response_ms}' \
@@ -381,7 +522,9 @@ jq -n --slurpfile base "$request_file" --slurpfile prior "$second_file" \
 
 post_json "$continuation_file" "$continuation_response"
 continuation_response_ms=$POST_JSON_TIME_MS
+continuation_prompt_tokens=$(jq -r '.usage.prompt_tokens' "$continuation_response")
 continuation_cached=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' "$continuation_response")
+continuation_uncached=$((continuation_prompt_tokens - continuation_cached))
 continuation_content=$(jq -r '.choices[0].message.content // empty' "$continuation_response")
 if (( continuation_cached < minimum_cached )); then
   echo "agentic gate failed: tool-result turn reused only $continuation_cached prefix tokens" >&2
@@ -400,6 +543,20 @@ fi
 if (( continuation_response_ms > MAX_TOOL_RESULT_RESPONSE_MS )); then
   echo "agentic gate failed: tool-result response took ${continuation_response_ms}ms; limit is ${MAX_TOOL_RESULT_RESPONSE_MS}ms" >&2
   exit 1
+fi
+if [[ -n "$AGENTIC_PROMPT_CONTRACT" ]]; then
+  expected_anchor=$(jq -er '.prompt.cached_anchor_tokens' "$AGENTIC_PROMPT_CONTRACT")
+  expected_suffix=$(jq -er '.prompt.tool_result_uncached_suffix_tokens' "$AGENTIC_PROMPT_CONTRACT")
+  if (( continuation_cached != expected_anchor || continuation_uncached != expected_suffix )); then
+    echo "agentic gate failed: continuation cache shape ${continuation_cached}+${continuation_uncached} disagrees with contract ${expected_anchor}+${expected_suffix}" >&2
+    exit 1
+  fi
+  if (( cached_tokens != expected_anchor || auto_cached != expected_anchor ||
+        stream_cached != expected_anchor || continuation_cached != expected_anchor ||
+        continuation_prompt_tokens != continuation_cached + continuation_uncached )); then
+    echo "agentic gate failed: cached-turn identities disagree with exact retained-prefix contract" >&2
+    exit 1
+  fi
 fi
 
 # Regression for a real OpenCode failure: the DeepSeek DSML grammar used to
@@ -455,7 +612,19 @@ if ! jq -e --arg expected "$EXPECTED_SOURCE" '
 fi
 
 jq -n \
+  --argjson agent "$AGENT_INDEX" \
+  --arg run_id "$RUN_ID" \
   --arg fixture_id "$AGENTIC_FIXTURE_ID" \
+  --arg prompt_contract_sha256 "$prompt_contract_sha256" \
+  --arg prompt_provenance_sha256 "$PROMPT_PROVENANCE_SHA256" \
+  --arg serialization_policy "$serialization_policy" \
+  --arg request_sha256 "$request_sha256" \
+  --argjson request_bytes "$request_bytes" \
+  --arg rendered_prompt_sha256 "$rendered_prompt_sha256" \
+  --arg prompt_token_ids_sha256 "$prompt_token_ids_sha256" \
+  --arg tool_result_fixture_sha256 "$tool_result_fixture_sha256" \
+  --argjson tool_result_fixture_bytes "$tool_result_fixture_bytes" \
+  --arg tool_result_payload_sha256 "$tool_result_payload_sha256" \
   --arg agentic_context_fixture_sha256 "$actual_context_fixture_sha256" \
   --argjson agentic_context_fixture_bytes "$agentic_context_fixture_bytes" \
   --argjson repository_context_chars "$repository_context_chars" \
@@ -467,8 +636,11 @@ jq -n \
   --argjson require_cold_first "$REQUIRE_COLD_FIRST" \
   --argjson prompt_tokens "$prompt_tokens" \
   --argjson cached_tokens "$cached_tokens" \
+  --argjson continuation_prompt_tokens "$continuation_prompt_tokens" \
   --argjson continuation_cached "$continuation_cached" \
+  --argjson continuation_uncached "$continuation_uncached" \
   --argjson auto_cached "$auto_cached" \
+  --argjson stream_cached "$stream_cached" \
   --argjson cold_ttft_ms "$cold_ttft" \
   --argjson cached_ttft_ms "$cached_ttft" \
   --argjson cold_response_ms "$cold_response_ms" \
@@ -478,7 +650,19 @@ jq -n \
   --argjson continuation_response_ms "$continuation_response_ms" \
   --argjson source_response_ms "$source_response_ms" '{
     status: "pass",
+    agent: $agent,
+    run_id: $run_id,
     fixture_id: $fixture_id,
+    prompt_contract_sha256: $prompt_contract_sha256,
+    prompt_provenance_sha256: $prompt_provenance_sha256,
+    serialization_policy: $serialization_policy,
+    request_sha256: $request_sha256,
+    request_bytes: $request_bytes,
+    rendered_prompt_sha256: $rendered_prompt_sha256,
+    prompt_token_ids_sha256: $prompt_token_ids_sha256,
+    tool_result_fixture_sha256: $tool_result_fixture_sha256,
+    tool_result_fixture_bytes: $tool_result_fixture_bytes,
+    tool_result_payload_sha256: $tool_result_payload_sha256,
     agentic_context_fixture_sha256: $agentic_context_fixture_sha256,
     agentic_context_fixture_bytes: $agentic_context_fixture_bytes,
     repository_context_chars: $repository_context_chars,
@@ -497,7 +681,10 @@ jq -n \
     prompt_tokens: $prompt_tokens,
     cached_tokens: $cached_tokens,
     auto_cached_tokens: $auto_cached,
+    stream_cached_tokens: $stream_cached,
+    continuation_prompt_tokens: $continuation_prompt_tokens,
     continuation_cached_tokens: $continuation_cached,
+    continuation_uncached_tokens: $continuation_uncached,
     cold_ttft_ms: $cold_ttft_ms,
     cached_ttft_ms: $cached_ttft_ms,
     cold_semantic_response_ms: $cold_response_ms,

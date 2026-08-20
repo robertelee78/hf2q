@@ -422,6 +422,15 @@ physical slot is free. Cancelling a
 cached suffix rolls back to a valid, position-consistent pre-request turn
 anchor; poisoned or inconsistent state still resets fully.
 
+When two to four compatible warm cached suffixes are already runnable, their
+sequence-local attention and cache writes remain independent while the
+layer-local FFN/MoE runs once across at most 2,048 aggregate rows. hf2q never
+waits to form this cohort and never skips an older incompatible request. Cold,
+mixed, recovery-tail, final-head, and decode work retain the serial path. The
+release gate requires B=2/3/4 exact state, logits, and subsequent-token parity,
+an alternating-order N=4 median speedup under Nominal thermals, and an observed
+cooperative transaction in both full four-agent waves.
+
 After prefill drains, pure decode advances in 64-token slot quanta to amortize
 session swaps and scheduler publication across a full cohort. This does not
 widen genuinely mixed work: a runnable decoder beside prefill remains clamped
@@ -461,7 +470,8 @@ fresh pinned peer for each wave, disables prompt caching, binds binary/model/
 fixture/request identity, requires exact `read_file` semantics and zero-cache
 usage, and records monotonic response/cohort timing under continuous AC and
 thermal telemetry. The peer renders the byte-identical request as 6,695 prompt
-tokens versus hf2q's 6,684, so both runtime-specific counts remain explicit.
+tokens versus hf2q's insertion-ordered 6,684, so both runtime-specific counts
+remain explicit.
 The script is reference evidence only; it never participates in production
 serving and cannot replace hf2q's exact packed-artifact cache gate.
 

@@ -80,6 +80,14 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features
 
       # --- Blocking compile + test ---
+      - name: Require canonical mlx-native build environment
+        shell: bash
+        run: |
+          if [[ ${MLX_NATIVE_SKIP_METALLIB+x} ]]; then
+            echo "MLX_NATIVE_SKIP_METALLIB is forbidden for release-capable builds" >&2
+            exit 1
+          fi
+
       - name: cargo check
         run: cargo check --locked --all-targets --all-features
 
@@ -554,11 +562,16 @@ jobs:
             scripts/test_deepseek4_agentic.sh \
             scripts/test_deepseek4_structured_tools.sh \
             scripts/test_deepseek4_agentic_fixture_contract.sh \
+            scripts/test_deepseek4_cooperative_prefill_receipt_contract.sh \
+            scripts/test_deepseek4_decode_cohort_receipt_contract.sh \
             scripts/test_deepseek4_peer_cold_wave.sh \
             scripts/test_deepseek4_peer_cold_wave_contract.sh \
             scripts/run_deepseek4_matched_peer.sh \
             scripts/macos_thermal_guard.sh \
             scripts/verify_macos_thermal_receipt.sh \
+            scripts/verify_deepseek4_cooperative_prefill_receipt.sh \
+            scripts/verify_deepseek4_decode_cohort_receipt.sh \
+            scripts/run_deepseek4_decode_cohort_gate.sh \
             scripts/verify_gemma4_wave_thermal_receipt.sh \
             scripts/verify_gemma4_parity_receipt.sh \
             scripts/qwen38_long_decode_ab.sh \
@@ -583,6 +596,8 @@ jobs:
           bash scripts/test_qwen36_watchdog_harness_contract.sh
           bash scripts/test_deepseek4_cached_suffix_contract.sh
           bash scripts/test_deepseek4_agentic_fixture_contract.sh
+          bash scripts/test_deepseek4_cooperative_prefill_receipt_contract.sh
+          bash scripts/test_deepseek4_decode_cohort_receipt_contract.sh
           bash scripts/test_deepseek4_peer_cold_wave_contract.sh
           bash scripts/test_macos_thermal_guard_contract.sh
           bash scripts/test_gemma4_wave_thermal_contract.sh

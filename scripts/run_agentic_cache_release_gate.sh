@@ -27,6 +27,10 @@ source "$script_dir/qwen36_watchdog_validate.sh"
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$script_dir/macos_thermal_guard.sh"
 
+if [[ ${MLX_NATIVE_SKIP_METALLIB+x} ]]; then
+  echo "MLX_NATIVE_SKIP_METALLIB is forbidden for exact-artifact release builds" >&2
+  exit 2
+fi
 if [[ ${HF2Q_THERMAL_SWIFT_BIN+x} ]]; then
   echo "HF2Q_THERMAL_SWIFT_BIN is reserved for isolated contract tests" >&2
   exit 2
@@ -76,6 +80,7 @@ server_pid=""
 power_pid=""
 caffeinate_pid=""
 wave_harness_pid=""
+cooperative_thermal_pid=""
 
 require_ac() {
   local state
@@ -139,6 +144,12 @@ stop_server() {
 
 cleanup() {
   local cleanup_rc=0
+  if [[ -n "$cooperative_thermal_pid" ]]; then
+    [[ -z ${cooperative_thermal_stop:-} ]] || touch "$cooperative_thermal_stop"
+    kill -TERM "$cooperative_thermal_pid" 2>/dev/null || true
+    wait "$cooperative_thermal_pid" 2>/dev/null || true
+    cooperative_thermal_pid=""
+  fi
   if [[ -n "$wave_harness_pid" ]]; then
     kill -TERM "$wave_harness_pid" 2>/dev/null || true
     # Closing the server makes any in-flight curl return promptly before the
@@ -350,17 +361,228 @@ run_lifecycle() {
 
 binary_sha=$EXPECTED_BINARY_SHA256
 assert_exact_binary
-agentic_fixture="$PWD/scripts/fixtures/deepseek4-agentic-repo-context.txt"
-agentic_fixture_sha=2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef
-test -f "$agentic_fixture"
-test "$(sha256_file "$agentic_fixture")" = "$agentic_fixture_sha"
-test "$(stat -f %z "$agentic_fixture")" = 21204
 verify_model deepseek "$DEEPSEEK_MODEL" "$DEEPSEEK_MODEL_SHA256"
 verify_model gemma "$GEMMA_MODEL" "$GEMMA_MODEL_SHA256"
 verify_model qwen "$QWEN_MODEL" "$QWEN_MODEL_SHA256"
 verify_model qwen38 "$QWEN38_MODEL" "$QWEN38_MODEL_SHA256"
 
 mkdir -p "$OUT_ROOT/fixtures"
+agentic_prompt_contract="$PWD/scripts/fixtures/deepseek4-agentic-prompt-contract-v2.json"
+agentic_prompt_contract_sha=$(sha256_file "$agentic_prompt_contract")
+agentic_fixture="$PWD/scripts/fixtures/deepseek4-agentic-repo-context.txt"
+agentic_fixture_sha=$(jq -er '.repository_context.sha256' "$agentic_prompt_contract")
+agentic_tool_result="$PWD/$(jq -er '.tool_result.path' "$agentic_prompt_contract")"
+agentic_fixture_evidence="$OUT_ROOT/fixtures/deepseek4-agentic"
+jq -e -f scripts/deepseek4_agentic_prompt_contract.jq \
+  "$agentic_prompt_contract" >/dev/null
+test "$(jq -er '.model.artifact_sha256' "$agentic_prompt_contract")" = \
+  "$DEEPSEEK_MODEL_SHA256"
+test "$(stat -f %z "$DEEPSEEK_MODEL")" = \
+  "$(jq -er '.model.bytes' "$agentic_prompt_contract")"
+for input in request_builder chat_template repository_context tool_result; do
+  input_path=$(jq -er --arg input "$input" '.[$input].path' "$agentic_prompt_contract")
+  test "$(sha256_file "$PWD/$input_path")" = \
+    "$(jq -er --arg input "$input" '.[$input].sha256' "$agentic_prompt_contract")"
+  test "$(stat -f %z "$PWD/$input_path")" = \
+    "$(jq -er --arg input "$input" '.[$input].bytes' "$agentic_prompt_contract")"
+done
+test "$(jq -Rs 'length' "$agentic_fixture")" = \
+  "$(jq -er '.repository_context.chars' "$agentic_prompt_contract")"
+test "$(jq -Rs 'length' "$agentic_tool_result")" = \
+  "$(jq -er '.tool_result.chars' "$agentic_prompt_contract")"
+agentic_payload_sha=$(
+  { jq -j '.tool_result.success_prefix' "$agentic_prompt_contract"; \
+    cat "$agentic_tool_result"; } | shasum -a 256 | awk '{print $1}'
+)
+test "$agentic_payload_sha" = \
+  "$(jq -er '.tool_result.combined_payload_sha256' "$agentic_prompt_contract")"
+
+mkdir -p "$agentic_fixture_evidence"
+cp "$agentic_prompt_contract" "$agentic_fixture_evidence/"
+cp "$agentic_fixture" "$agentic_fixture_evidence/"
+cp "$agentic_tool_result" "$agentic_fixture_evidence/"
+for agent in 1 2 3 4; do
+  request_path="$agentic_fixture_evidence/request-agent-$agent.json"
+  provenance_path="$agentic_fixture_evidence/provenance-agent-$agent.json"
+  HF2Q_AGENTIC_REQUEST_ONLY_OUTPUT="$request_path" \
+  AGENTIC_PROMPT_CONTRACT="$agentic_prompt_contract" \
+  AGENTIC_PROMPT_CONTRACT_SHA256="$agentic_prompt_contract_sha" \
+  AGENT_INDEX="$agent" \
+  EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
+  TOOL_RESULT_PATH="$agentic_tool_result" \
+  AGENTIC_CONTEXT_FIXTURE="$agentic_fixture" \
+  AGENTIC_CONTEXT_FIXTURE_SHA256="$agentic_fixture_sha" \
+  RUN_ID="full-context-deepseek4-agent-$agent" \
+  SENTINEL="HF2Q_DEEPSEEK4_AGENT_${agent}_OK" \
+    bash scripts/test_deepseek4_agentic.sh
+  HF2Q_DEEPSEEK4_GGUF="$DEEPSEEK_MODEL" \
+  HF2Q_DEEPSEEK4_AGENTIC_REQUEST_JSON="$request_path" \
+  HF2Q_DEEPSEEK4_AGENTIC_PROMPT_CONTRACT="$agentic_prompt_contract" \
+  HF2Q_DEEPSEEK4_AGENTIC_CONTRACT_RECEIPT="$provenance_path" \
+    cargo test --locked --bin hf2q \
+      release_agentic_fixture_preserve_order_contract -- \
+      --ignored --test-threads=1 \
+      >"$agentic_fixture_evidence/provenance-agent-$agent.log" 2>&1
+done
+jq -s --arg contract_sha256 "$agentic_prompt_contract_sha" \
+  --arg model_sha256 "$DEEPSEEK_MODEL_SHA256" '
+  sort_by(.agent) as $agents
+  | if length != 4 or ([.[].agent] != [1,2,3,4])
+      or any(.[]; .status != "pass"
+        or .prompt_contract_sha256 != $contract_sha256
+        or .prompt_tokens != 6684
+        or .legacy_key_sorted_prompt_tokens != 6685
+        or .preserve_order_delta_proven != true)
+    then error("invalid DeepSeek prompt provenance")
+    else {
+      schema_version:2,
+      status:"pass",
+      prompt_contract_sha256:$contract_sha256,
+      model_sha256:$model_sha256,
+      agents:$agents
+    }
+    end
+' "$agentic_fixture_evidence"/provenance-agent-?.json \
+  >"$agentic_fixture_evidence/prompt-provenance.json.tmp"
+agentic_prompt_provenance="$agentic_fixture_evidence/prompt-provenance.json"
+jq -e --slurpfile contract "$agentic_prompt_contract" \
+  --arg prompt_contract_sha256 "$agentic_prompt_contract_sha" \
+  --arg model_sha256 "$DEEPSEEK_MODEL_SHA256" \
+  -f scripts/deepseek4_agentic_prompt_provenance.jq \
+  "$agentic_prompt_provenance.tmp" >/dev/null
+mv "$agentic_prompt_provenance.tmp" "$agentic_prompt_provenance"
+agentic_prompt_provenance_sha=$(sha256_file "$agentic_prompt_provenance")
+
+cooperative_dir="$OUT_ROOT/deepseek/cooperative-prefill"
+cooperative_raw="$cooperative_dir/raw.json"
+cooperative_log="$cooperative_dir/test.log"
+cooperative_thermal_log="$cooperative_dir/thermal.log"
+cooperative_thermal_stop="$cooperative_dir/thermal.stop"
+cooperative_settle_log="$cooperative_dir/settle.log"
+cooperative_build_log="$cooperative_dir/build.jsonl"
+mkdir -p "$cooperative_dir"
+cargo test --release --locked --bin hf2q --no-run --message-format=json \
+  >"$cooperative_build_log"
+cooperative_test_binary=$(jq -rs '
+  [.[] | select(.reason == "compiler-artifact"
+    and .profile.test == true
+    and (.target.kind | index("bin")) != null
+    and .target.name == "hf2q") | .executable]
+  | map(select(type == "string" and length > 0)) | last // empty
+' "$cooperative_build_log")
+[[ -n "$cooperative_test_binary" && -x "$cooperative_test_binary" ]] || {
+  echo "failed to resolve the prebuilt hf2q release test binary" >&2
+  exit 1
+}
+require_no_model_runtime
+thermal_wait_for_nominal "$cooperative_settle_log" \
+  cooperative-prefill-settle 60 900 5
+: >"$cooperative_thermal_log"
+rm -f "$cooperative_thermal_stop"
+thermal_sample "$cooperative_thermal_log" \
+  cooperative-prefill-measurement-start
+thermal_monitor_nominal "$cooperative_thermal_log" \
+  cooperative-prefill-measurement "$cooperative_thermal_stop" 2 &
+cooperative_thermal_pid=$!
+cooperative_test_rc=0
+env -i \
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+  TMPDIR="${TMPDIR:-/tmp}" \
+  HF2Q_DEEPSEEK4_COHORT_BENCH_PAIRS=5 \
+  HF2Q_DEEPSEEK4_GGUF="$DEEPSEEK_MODEL" \
+  HF2Q_DEEPSEEK4_COHORT_RECEIPT="$cooperative_raw" \
+  "$cooperative_test_binary" \
+    official_artifact_cooperative_warm_prefill_is_exact_and_faster \
+    --ignored --test-threads=1 --nocapture \
+    >"$cooperative_log" 2>&1 || cooperative_test_rc=$?
+touch "$cooperative_thermal_stop"
+cooperative_thermal_rc=0
+wait "$cooperative_thermal_pid" || cooperative_thermal_rc=$?
+cooperative_thermal_pid=""
+thermal_sample "$cooperative_thermal_log" \
+  cooperative-prefill-measurement-end
+test "$cooperative_test_rc" = 0
+test "$cooperative_thermal_rc" = 0
+thermal_validate_measurement_log "$cooperative_thermal_log" 5
+cooperative_measurement_samples=$THERMAL_LOG_SAMPLES
+cooperative_measurement_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
+cooperative_non_nominal_samples=$THERMAL_LOG_NON_NOMINAL_SAMPLES
+cooperative_measurement_gaps=$THERMAL_LOG_GAPS
+thermal_validate_settle_log "$cooperative_settle_log" 60 8
+cooperative_settle_samples=$THERMAL_LOG_SAMPLES
+cooperative_settle_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
+cooperative_settle_gaps=$THERMAL_LOG_GAPS
+jq -e '
+  .schema_version == 1 and .status == "pass"
+  and .artifact_bytes == 107431343168 and .layers == 43
+  and .prefix_rows == 148 and .prefix_mod_128 == 20 and .prefix_mod_4 == 0
+  and [.parity_shapes[] | [.sequences,.rows_per_lane,.aggregate_rows]]
+    == [[2,1024,2048],[3,640,1920],[4,512,2048]]
+  and all(.parity_shapes[]; .exact_state_logits_decode == true)
+  and .benchmark.sequences == 4 and .benchmark.rows_per_lane == 512
+  and .benchmark.aggregate_rows == 2048 and .benchmark.pairs >= 5
+  and .benchmark.order == "alternating"
+  and (.benchmark.serial_ms | length) == .benchmark.pairs
+  and (.benchmark.cohort_ms | length) == .benchmark.pairs
+  and all(.benchmark.serial_ms[], .benchmark.cohort_ms[]; type == "number" and . > 0)
+  and .benchmark.serial_median_ms > .benchmark.cohort_median_ms
+  and .benchmark.speedup > 1
+  and .benchmark.process_lifetime_peak_rss_bytes > 0
+' "$cooperative_raw" >/dev/null
+jq --arg source_sha "$EXPECTED_SHA" \
+  --arg model_sha256 "$DEEPSEEK_MODEL_SHA256" \
+  --arg mlx_native_version "0.10.12" \
+  --arg raw_sha256 "$(sha256_file "$cooperative_raw")" \
+  --arg test_log_sha256 "$(sha256_file "$cooperative_log")" \
+  --arg measurement_log_sha256 "$(sha256_file "$cooperative_thermal_log")" \
+  --arg settle_log_sha256 "$(sha256_file "$cooperative_settle_log")" \
+  --argjson settle_seconds 60 \
+  --argjson settle_samples "$cooperative_settle_samples" \
+  --argjson settle_duration_seconds "$cooperative_settle_duration_seconds" \
+  --argjson settle_sample_interval_seconds 5 \
+  --argjson maximum_settle_sample_gap_seconds 8 \
+  --argjson settle_telemetry_gaps "$cooperative_settle_gaps" \
+  --argjson measurement_samples "$cooperative_measurement_samples" \
+  --argjson measurement_duration_seconds "$cooperative_measurement_duration_seconds" \
+  --argjson sample_interval_seconds 2 \
+  --argjson maximum_sample_gap_seconds 5 \
+  --argjson non_nominal_measurement_samples "$cooperative_non_nominal_samples" \
+  --argjson telemetry_gaps "$cooperative_measurement_gaps" \
+  '. + {source_sha:$source_sha,model_sha256:$model_sha256,
+    mlx_native_version:$mlx_native_version,raw_sha256:$raw_sha256,
+    test_log_sha256:$test_log_sha256,thermal_status:"nominal",
+    measurement_log_sha256:$measurement_log_sha256,
+    settle_log_sha256:$settle_log_sha256,settle_seconds:$settle_seconds,
+    settle_samples:$settle_samples,
+    settle_duration_seconds:$settle_duration_seconds,
+    settle_sample_interval_seconds:$settle_sample_interval_seconds,
+    maximum_settle_sample_gap_seconds:$maximum_settle_sample_gap_seconds,
+    settle_telemetry_gaps:$settle_telemetry_gaps,
+    measurement_samples:$measurement_samples,
+    measurement_duration_seconds:$measurement_duration_seconds,
+    sample_interval_seconds:$sample_interval_seconds,
+    maximum_sample_gap_seconds:$maximum_sample_gap_seconds,
+    non_nominal_measurement_samples:$non_nominal_measurement_samples,
+    telemetry_gaps:$telemetry_gaps}' \
+  "$cooperative_raw" >"$cooperative_dir/summary.json"
+bash scripts/verify_deepseek4_cooperative_prefill_receipt.sh \
+  "$cooperative_dir/summary.json" "$cooperative_raw" "$cooperative_log" \
+  "$cooperative_thermal_log" "$cooperative_settle_log" \
+  "$EXPECTED_SHA" "$DEEPSEEK_MODEL_SHA256"
+sha256_file "$cooperative_dir/summary.json" \
+  >"$cooperative_dir/summary.json.sha256"
+ensure_guard_health
+
+# The warm-prefill proof above and the exact decode proof exercise distinct
+# transaction shapes. Reuse the already-built packed test binary and the
+# already-verified model identity; do not rescan the 107 GB artifact.
+require_no_model_runtime
+bash scripts/run_deepseek4_decode_cohort_gate.sh \
+  "$cooperative_test_binary" "$DEEPSEEK_MODEL" \
+  "$OUT_ROOT/deepseek/decode-cohort" "$EXPECTED_SHA" \
+  "$DEEPSEEK_MODEL_SHA256"
+ensure_guard_health
+
 HF2Q_QWEN36_WATCHDOG_FIXTURE_MODEL="$QWEN_MODEL" \
 HF2Q_QWEN36_WATCHDOG_FIXTURE_OUTPUT="$OUT_ROOT/fixtures/public-347.json" \
 HF2Q_QWEN36_WATCHDOG_SHORT_FIXTURE_OUTPUT="$OUT_ROOT/fixtures/public-short.json" \
@@ -402,6 +624,8 @@ run_deepseek_wave() {
   local thermal_settle_log="$thermal_dir/settle.log"
   local thermal_summary="$thermal_dir/summary.json"
   local cold_receipts_json
+  local cooperative_prefill_transactions
+  local decode_cohort_transactions
   local measurement_samples
   local measurement_duration_seconds
   local non_nominal_measurement_samples
@@ -424,13 +648,15 @@ run_deepseek_wave() {
   thermal_sample "$thermal_measurement_log" \
     "deepseek-wave-${wave}-measurement-start"
   test "$THERMAL_STATE" = nominal
-  # Preserve the prompt-visible path used by the exact 863ea423 calibration.
-  # The simulated tool result still comes from the packed candidate below.
+  # Preserve the prompt-visible historical path while feeding the immutable
+  # bytes that actually lived there at the calibrated source revision.
   BASE_URL="$current_url" FAMILY=deepseek4 AGENTS=4 \
   WAVE_ID=default REQUIRE_COLD_FIRST=1 \
   EXPECTED_PATH=/opt/hf2q-worktrees/full-context-slots/Cargo.toml \
-  TOOL_RESULT_PATH="$PWD/Cargo.toml" \
-  AGENTIC_FIXTURE_ID=full-context-agentic-v1 EXPECTED_PROMPT_TOKENS=6684 \
+  TOOL_RESULT_PATH="$agentic_tool_result" \
+  AGENTIC_PROMPT_CONTRACT="$agentic_prompt_contract" \
+  AGENTIC_PROMPT_CONTRACT_SHA256="$agentic_prompt_contract_sha" \
+  PROMPT_PROVENANCE_SHA256="$agentic_prompt_provenance_sha" \
   AGENTIC_CONTEXT_FIXTURE="$agentic_fixture" \
   AGENTIC_CONTEXT_FIXTURE_SHA256="$agentic_fixture_sha" \
   MAX_COLD_TTFT_MS=60000 MAX_COLD_RESPONSE_MS=60000 \
@@ -516,11 +742,28 @@ run_deepseek_wave() {
       settle_telemetry_gaps:$settle_telemetry_gaps,
       telemetry_gaps:$telemetry_gaps,settle_log_sha256:$settle_log_sha256,
       measurement_log_sha256:$measurement_log_sha256}' >"$thermal_summary"
-  jq -e -f scripts/deepseek4_full_context_receipt.jq \
+  jq -e --slurpfile contract "$agentic_prompt_contract" \
+    --arg prompt_contract_sha256 "$agentic_prompt_contract_sha" \
+    --arg prompt_provenance_sha256 "$agentic_prompt_provenance_sha" \
+    -f scripts/deepseek4_full_context_receipt.jq \
     "$out/summary.json.tmp" >/dev/null
   mv "$out/summary.json.tmp" "$out/summary.json"
   sha256_file "$out/summary.json" >"$out/summary.json.sha256"
   finish_server_phase
+  cooperative_prefill_transactions=$(rg -c \
+    'DeepSeek-V4 cooperative prefill complete' "$current_log" || true)
+  [[ "$cooperative_prefill_transactions" =~ ^[0-9]+$ ]]
+  ((cooperative_prefill_transactions > 0)) || {
+    echo "DeepSeek wave $wave observed no cooperative warm-prefill transaction" >&2
+    return 1
+  }
+  decode_cohort_transactions=$(rg -c \
+    'DeepSeek-V4 exact decode cohort selected' "$current_log" || true)
+  [[ "$decode_cohort_transactions" =~ ^[0-9]+$ ]]
+  ((decode_cohort_transactions > 0)) || {
+    echo "DeepSeek wave $wave observed no exact warm B=4 decode transaction" >&2
+    return 1
+  }
   cold_prefill_rates_json=$(
     for request_id in 1 2 3 4; do
       rate=$(rg "DeepSeek-V4 prefill complete request_id=${request_id}( |$)" "$current_log" \
@@ -538,10 +781,12 @@ run_deepseek_wave() {
     --arg model_sha256 "$DEEPSEEK_MODEL_SHA256" \
     --arg summary_sha256 "$(cat "$out/summary.json.sha256")" \
     --arg server_log_sha256 "$(cat "$current_dir/server.log.sha256")" \
+    --argjson cooperative_prefill_transactions "$cooperative_prefill_transactions" \
+    --argjson decode_cohort_transactions "$decode_cohort_transactions" \
     --argjson cold_prefill_tokens_per_second "$cold_prefill_rates_json" \
     --slurpfile thermal "$thermal_summary" \
     --slurpfile receipt "$out/summary.json" \
-    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,cold_prefill_tokens_per_second:$cold_prefill_tokens_per_second,thermal:$thermal[0],receipt:$receipt[0]}' \
+    '{wave:$wave,status:"pass",binary_sha256:$binary_sha256,model_sha256:$model_sha256,ready_http:200,fatal_log_signatures:0,summary_sha256:$summary_sha256,server_log_sha256:$server_log_sha256,cooperative_prefill_transactions:$cooperative_prefill_transactions,decode_cohort_transactions:$decode_cohort_transactions,cold_prefill_tokens_per_second:$cold_prefill_tokens_per_second,thermal:$thermal[0],receipt:$receipt[0]}' \
     >"$out/envelope.json.tmp"
   mv "$out/envelope.json.tmp" "$out/envelope.json"
   scripts/verify_macos_thermal_receipt.sh "$wave" "$out/envelope.json" \
@@ -1128,10 +1373,16 @@ jq -n \
   --arg deepseek_lifecycle_sha "$(sha256_file "$OUT_ROOT/deepseek/lifecycle/summary.json")" \
   --arg deepseek_interactive_sha "$(sha256_file "$OUT_ROOT/deepseek/interactive/summary.json")" \
   --arg deepseek_cached_sha "$(sha256_file "$OUT_ROOT/deepseek/cached-suffix/summary.json")" \
+  --arg deepseek_cooperative_sha "$(sha256_file "$OUT_ROOT/deepseek/cooperative-prefill/summary.json")" \
+  --arg deepseek_decode_cohort_sha "$(sha256_file "$OUT_ROOT/deepseek/decode-cohort/summary.json")" \
   --arg deepseek_wave1_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-1/envelope.json")" \
   --arg deepseek_wave2_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-2/envelope.json")" \
   --arg deepseek_wave1_thermal_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-1/thermal/summary.json")" \
   --arg deepseek_wave2_thermal_sha "$(sha256_file "$OUT_ROOT/deepseek/full-context-2/thermal/summary.json")" \
+  --arg deepseek_prompt_contract_sha "$agentic_prompt_contract_sha" \
+  --arg deepseek_prompt_provenance_sha "$agentic_prompt_provenance_sha" \
+  --arg deepseek_context_fixture_sha "$agentic_fixture_sha" \
+  --arg deepseek_tool_result_sha "$(jq -er '.tool_result.sha256' "$agentic_prompt_contract")" \
   --arg gemma_lifecycle_sha "$(sha256_file "$OUT_ROOT/gemma/lifecycle/summary.json")" \
   --arg gemma_overlap_sha "$(sha256_file "$OUT_ROOT/gemma/overlap/summary.json")" \
   --arg gemma_wave1_sha "$(sha256_file "$OUT_ROOT/gemma/wave1/summary.json")" \
@@ -1156,8 +1407,11 @@ jq -n \
   --slurpfile deepseek_lifecycle "$OUT_ROOT/deepseek/lifecycle/summary.json" \
   --slurpfile deepseek_interactive "$OUT_ROOT/deepseek/interactive/summary.json" \
   --slurpfile deepseek_cached "$OUT_ROOT/deepseek/cached-suffix/summary.json" \
+  --slurpfile deepseek_cooperative "$OUT_ROOT/deepseek/cooperative-prefill/summary.json" \
+  --slurpfile deepseek_decode_cohort "$OUT_ROOT/deepseek/decode-cohort/summary.json" \
   --slurpfile deepseek_wave1 "$OUT_ROOT/deepseek/full-context-1/envelope.json" \
   --slurpfile deepseek_wave2 "$OUT_ROOT/deepseek/full-context-2/envelope.json" \
+  --slurpfile deepseek_prompt_provenance "$agentic_prompt_provenance" \
   --slurpfile gemma_lifecycle "$OUT_ROOT/gemma/lifecycle/summary.json" \
   --slurpfile gemma_overlap "$OUT_ROOT/gemma/overlap/summary.json" \
   --slurpfile gemma_wave1 "$OUT_ROOT/gemma/wave1/summary.json" \
@@ -1186,14 +1440,22 @@ jq -n \
       qwen: {path: $qwen_path, bytes: $qwen_bytes, sha256: $qwen_sha},
       qwen38: {path: $qwen38_path, bytes: $qwen38_bytes, sha256: $qwen38_sha}
     },
+    fixtures: {
+      deepseek_agentic: {
+        contract_sha256:$deepseek_prompt_contract_sha,
+        context_sha256:$deepseek_context_fixture_sha,
+        tool_result_sha256:$deepseek_tool_result_sha,
+        prompt_provenance_sha256:$deepseek_prompt_provenance_sha
+      }
+    },
     receipt_sha256: {
-      deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha,wave1_thermal:$deepseek_wave1_thermal_sha,wave2_thermal:$deepseek_wave2_thermal_sha},
+      deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,cooperative_prefill:$deepseek_cooperative_sha,decode_cohort:$deepseek_decode_cohort_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha,wave1_thermal:$deepseek_wave1_thermal_sha,wave2_thermal:$deepseek_wave2_thermal_sha,prompt_provenance:$deepseek_prompt_provenance_sha},
       gemma:{lifecycle:$gemma_lifecycle_sha,overlap:$gemma_overlap_sha,wave1:$gemma_wave1_sha,wave2:$gemma_wave2_sha,wave1_thermal:$gemma_wave1_thermal_sha,wave2_thermal:$gemma_wave2_thermal_sha,eight_slots:$gemma_wave8_sha,eight_slots_thermal:$gemma_wave8_thermal_sha,transactions4:$gemma_transactions4_sha,transactions8:$gemma_transactions8_sha,parity:$gemma_parity_sha,heap:$gemma_heap_sha},
       qwen:{lifecycle:$qwen_lifecycle_sha,cumulative:$qwen_cumulative_sha,cancellation:$qwen_cancellation_sha},
       qwen38:{long_decode:$qwen38_long_decode_sha}
     },
     families: {
-      deepseek: {status:"pass",lifecycle:$deepseek_lifecycle[0],interactive_overlap:$deepseek_interactive[0],cached_suffix:$deepseek_cached[0],full_context_waves:[$deepseek_wave1[0],$deepseek_wave2[0]]},
+      deepseek: {status:"pass",prompt_provenance:$deepseek_prompt_provenance[0],cooperative_prefill:$deepseek_cooperative[0],decode_cohort:$deepseek_decode_cohort[0],lifecycle:$deepseek_lifecycle[0],interactive_overlap:$deepseek_interactive[0],cached_suffix:$deepseek_cached[0],full_context_waves:[$deepseek_wave1[0],$deepseek_wave2[0]]},
       gemma: {status:"pass",lifecycle:$gemma_lifecycle[0],overlap_and_cancellation:$gemma_overlap[0],agent_waves:[$gemma_wave1[0],$gemma_wave2[0],$gemma_wave8[0]],transactions:[$gemma_transactions4[0],$gemma_transactions8[0]],parity:$gemma_parity[0],heap:$gemma_heap[0]},
       qwen: {status:"pass",lifecycle:$qwen_lifecycle[0],cumulative:$qwen_cumulative[0],cancellation:$qwen_cancellation[0]},
       qwen38: {status:"pass",long_decode:$qwen38_long_decode[0]}

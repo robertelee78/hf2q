@@ -12,13 +12,14 @@ AGENTS=${AGENTS:-4}
 WAVE_ID=${WAVE_ID:-peer-default}
 OUT_DIR=${OUT_DIR:-$(mktemp -d -t hf2q-deepseek-peer-wave.XXXXXX)}
 EXPECTED_PATH=${EXPECTED_PATH:-/opt/hf2q-worktrees/full-context-slots/Cargo.toml}
-TOOL_RESULT_PATH=${TOOL_RESULT_PATH:-$ROOT_DIR/Cargo.toml}
+TOOL_RESULT_PATH=${TOOL_RESULT_PATH:-$ROOT_DIR/scripts/fixtures/deepseek4-agentic-tool-result-863ea423.toml}
+AGENTIC_PROMPT_CONTRACT=${AGENTIC_PROMPT_CONTRACT:-$ROOT_DIR/scripts/fixtures/deepseek4-agentic-prompt-contract-v2.json}
+AGENTIC_PROMPT_CONTRACT_SHA256=${AGENTIC_PROMPT_CONTRACT_SHA256:-$(shasum -a 256 "$AGENTIC_PROMPT_CONTRACT" | awk '{print $1}')}
 AGENTIC_CONTEXT_FIXTURE=${AGENTIC_CONTEXT_FIXTURE:-$ROOT_DIR/scripts/fixtures/deepseek4-agentic-repo-context.txt}
 AGENTIC_CONTEXT_FIXTURE_SHA256=${AGENTIC_CONTEXT_FIXTURE_SHA256:-2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef}
-# The request JSON is byte-bound to hf2q's 6,684-token insertion-ordered
-# fixture. Pinned
+# The request JSON is byte-bound to hf2q's accepted 6,684-token fixture. Pinned
 # llama.cpp build 10326 renders those same bytes as 6,695 prompt tokens; bind
-# that runtime-specific count so a template/tokenizer drift cannot hide.
+# that eleven-token runtime delta so a template/tokenizer drift cannot hide.
 EXPECTED_PROMPT_TOKENS=${EXPECTED_PROMPT_TOKENS:-6695}
 CURL_CONNECT_TIMEOUT_SECONDS=${CURL_CONNECT_TIMEOUT_SECONDS:-5}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-120}
@@ -156,8 +157,11 @@ run_agent() {
 }
 
 for ((agent = 1; agent <= AGENTS; agent++)); do
-  RUN_ID="matched-peer-${WAVE_ID}-agent-${agent}" \
-  SENTINEL="HF2Q_DEEPSEEK4_PEER_${WAVE_ID}_${agent}_OK" \
+  RUN_ID="full-context-deepseek4-agent-${agent}" \
+  SENTINEL="HF2Q_DEEPSEEK4_AGENT_${agent}_OK" \
+  AGENT_INDEX="$agent" \
+  AGENTIC_PROMPT_CONTRACT="$AGENTIC_PROMPT_CONTRACT" \
+  AGENTIC_PROMPT_CONTRACT_SHA256="$AGENTIC_PROMPT_CONTRACT_SHA256" \
   MODEL="$MODEL" EXPECTED_PATH="$EXPECTED_PATH" \
   TOOL_RESULT_PATH="$TOOL_RESULT_PATH" \
   AGENTIC_CONTEXT_FIXTURE="$AGENTIC_CONTEXT_FIXTURE" \
@@ -191,6 +195,7 @@ trap - INT TERM EXIT
 cohort_wall_ms=$(((cohort_finished_us - cohort_started_us + 999) / 1000))
 
 jq -s --arg status pass --arg runtime llama.cpp --arg wave_id "$WAVE_ID" \
+  --arg prompt_contract_sha256 "$AGENTIC_PROMPT_CONTRACT_SHA256" \
   --arg fixture_sha256 "$actual_fixture_sha" \
   --arg expected_path "$EXPECTED_PATH" \
   --argjson concurrent_agents "$AGENTS" \
@@ -201,7 +206,8 @@ jq -s --arg status pass --arg runtime llama.cpp --arg wave_id "$WAVE_ID" \
   else {
     status:$status,runtime:$runtime,wave_id:$wave_id,
     concurrent_agents:$concurrent_agents,
-    fixture_id:"full-context-agentic-v1",
+    fixture_id:"full-context-agentic-v2",
+    prompt_contract_sha256:$prompt_contract_sha256,
     agentic_context_fixture_sha256:$fixture_sha256,
     expected_path:$expected_path,
     expected_prompt_tokens:$expected_prompt_tokens,

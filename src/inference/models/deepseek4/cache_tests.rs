@@ -1,7 +1,10 @@
 use mlx_native::{DType, MlxDevice};
 
 use super::cache::{CacheError, CacheKind, Deepseek4Cache, Deepseek4CachePlan};
-use super::verifier_forward::publish_state_after_gate;
+use super::decode_cohort::publish_verifier_cohort_after_gate;
+use super::verifier_forward::{
+    plan_cooperative_prefill_layout, publish_prefill_cohort_after_gate, publish_state_after_gate,
+};
 use super::Deepseek4Config;
 
 fn config(ratios: Vec<u32>) -> Deepseek4Config {
@@ -357,6 +360,136 @@ fn supervisor_commit_gate_controls_cache_cursor_publication() {
     assert!(error.to_string().contains("publish cache"));
     assert_eq!(cache.position, 4);
     assert!(cache.poisoned);
+}
+
+#[test]
+fn cooperative_prefill_publication_is_atomic_across_caches() {
+    let cfg = config(vec![4, 128]);
+    let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().unwrap();
+    let mut caches = (0..4)
+        .map(|_| Deepseek4Cache::allocate(&plan, device.clone()).unwrap())
+        .collect::<Vec<_>>();
+
+    let spans = caches
+        .iter()
+        .map(|cache| cache.plan_prefill(4).unwrap())
+        .collect::<Vec<_>>();
+    let mut refs = caches.iter_mut().collect::<Vec<_>>();
+    publish_prefill_cohort_after_gate(&mut refs, &spans, || Ok(())).unwrap();
+    assert!(caches
+        .iter()
+        .all(|cache| cache.position() == 4 && !cache.is_poisoned()));
+
+    for cache in &mut caches {
+        cache.reset().unwrap();
+    }
+    let spans = caches
+        .iter()
+        .map(|cache| cache.plan_prefill(4).unwrap())
+        .collect::<Vec<_>>();
+    let mut refs = caches.iter_mut().collect::<Vec<_>>();
+    let error = publish_prefill_cohort_after_gate(&mut refs, &spans, || {
+        anyhow::bail!("synthetic cohort supervisor rejection")
+    })
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("rejected before cache publication"));
+    assert!(caches
+        .iter()
+        .all(|cache| cache.position() == 0 && cache.is_poisoned()));
+
+    for cache in &mut caches {
+        cache.reset().unwrap();
+    }
+    let spans = caches
+        .iter()
+        .map(|cache| cache.plan_prefill(4).unwrap())
+        .collect::<Vec<_>>();
+    caches[2].commit_prefill(0, 1).unwrap();
+    let mut refs = caches.iter_mut().collect::<Vec<_>>();
+    let error = publish_prefill_cohort_after_gate(&mut refs, &spans, || Ok(())).unwrap_err();
+    assert!(error.to_string().contains("prevalidate"));
+    assert_eq!(caches[0].position(), 0);
+    assert_eq!(caches[1].position(), 0);
+    assert_eq!(caches[2].position(), 1);
+    assert_eq!(caches[3].position(), 0);
+    assert!(caches.iter().all(Deepseek4Cache::is_poisoned));
+}
+
+#[test]
+fn cooperative_decode_publication_is_atomic_across_four_caches() {
+    let cfg = config(vec![4, 128]);
+    let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().unwrap();
+    let mut caches = (0..4)
+        .map(|_| Deepseek4Cache::allocate(&plan, device.clone()).unwrap())
+        .collect::<Vec<_>>();
+
+    let [lane0, lane1, lane2, lane3] = caches.as_mut_slice() else {
+        unreachable!()
+    };
+    let mut refs = [lane0, lane1, lane2, lane3];
+    publish_verifier_cohort_after_gate(&mut refs, [0; 4], || Ok(())).unwrap();
+    assert!(caches
+        .iter()
+        .all(|cache| cache.position() == 1 && !cache.is_poisoned()));
+
+    for cache in &mut caches {
+        cache.reset().unwrap();
+    }
+    let [lane0, lane1, lane2, lane3] = caches.as_mut_slice() else {
+        unreachable!()
+    };
+    let mut refs = [lane0, lane1, lane2, lane3];
+    let error = publish_verifier_cohort_after_gate(&mut refs, [0; 4], || {
+        anyhow::bail!("synthetic B=4 supervisor rejection")
+    })
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("rejected before cache publication"));
+    assert!(caches
+        .iter()
+        .all(|cache| cache.position() == 0 && cache.is_poisoned()));
+
+    for cache in &mut caches {
+        cache.reset().unwrap();
+    }
+    caches[2].commit_step(0).unwrap();
+    let [lane0, lane1, lane2, lane3] = caches.as_mut_slice() else {
+        unreachable!()
+    };
+    let mut refs = [lane0, lane1, lane2, lane3];
+    let error = publish_verifier_cohort_after_gate(&mut refs, [0; 4], || Ok(())).unwrap_err();
+    assert!(error.to_string().contains("prevalidate"));
+    assert_eq!(caches[0].position(), 0);
+    assert_eq!(caches[1].position(), 0);
+    assert_eq!(caches[2].position(), 1);
+    assert_eq!(caches[3].position(), 0);
+    assert!(caches.iter().all(Deepseek4Cache::is_poisoned));
+}
+
+#[test]
+fn cooperative_prefill_oversize_preflight_does_not_poison_caches() {
+    let cfg = config(vec![4, 128]);
+    let plan = Deepseek4CachePlan::for_context(&cfg, 4096).unwrap();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let device = MlxDevice::new().unwrap();
+    let caches = (0..2)
+        .map(|_| Deepseek4Cache::allocate(&plan, device.clone()).unwrap())
+        .collect::<Vec<_>>();
+    let first = vec![0_u32; 1025];
+    let second = vec![0_u32; 1024];
+    let error = plan_cooperative_prefill_layout(&[first.as_slice(), second.as_slice()], 4, 4096)
+        .unwrap_err();
+    assert!(error.to_string().contains("maximum is 2048"));
+    assert!(caches
+        .iter()
+        .all(|cache| cache.position() == 0 && !cache.is_poisoned()));
 }
 
 #[test]

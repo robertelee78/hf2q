@@ -304,7 +304,10 @@ if bash "$PARITY_VERIFIER" "$parity_contract_dir/summary.json" "$parity_contract
   echo "Gemma parity verifier accepted a mutated bound log" >&2
   exit 1
 fi
-[[ "$(grep -cF -- '--test-threads=1 --nocapture' "$RELEASE_GATE")" == 4 ]] || {
+# The release script must retain the literal output-root expression.
+# shellcheck disable=SC2016
+[[ "$(grep -cF -- '--test-threads=1 --nocapture >"$OUT_ROOT/gemma/parity/' \
+  "$RELEASE_GATE")" == 4 ]] || {
   echo "Gemma N=8 release logs must retain their non-vacuity and KV-regime banners" >&2
   exit 1
 }
