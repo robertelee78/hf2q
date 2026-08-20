@@ -84,6 +84,10 @@ pub(crate) struct StructuralTeacherTargetStream<'a> {
 }
 
 impl<'a> StructuralTeacherTargetPreflight<'a> {
+    pub(crate) fn preflight_bytes(&self) -> u64 {
+        self.preflight_bytes
+    }
+
     pub(crate) fn begin(
         self,
         output: &Path,

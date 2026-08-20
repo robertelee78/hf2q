@@ -17,6 +17,8 @@ const MAX_PLAN_GENERATION_PROMPTS: usize = 4_096;
 #[derive(Serialize)]
 struct PredictionPlanHashView<'a> {
     schema_version: u32,
+    source: &'a crate::intelligence::measured_auto_quant::SourceIdentity,
+    verified_source_manifest_sha256: &'a str,
     dataset_partition_manifest_sha256: &'a str,
     calibration_corpus_artifact_sha256: &'a str,
     calibration_manifest_sha256: &'a str,
@@ -42,6 +44,8 @@ pub(super) fn prediction_plan_sha256(
 ) -> Result<String, CalibrationInputError> {
     ordered_evidence_json_sha256(&PredictionPlanHashView {
         schema_version: manifest.schema_version,
+        source: &manifest.source,
+        verified_source_manifest_sha256: &manifest.verified_source_manifest_sha256,
         dataset_partition_manifest_sha256: &manifest.dataset_partition_manifest_sha256,
         calibration_corpus_artifact_sha256: &manifest.calibration_corpus_artifact_sha256,
         calibration_manifest_sha256: &manifest.calibration_manifest_sha256,
@@ -84,6 +88,8 @@ pub fn validate_teacher_prediction_plan(
 ) -> Result<(), CalibrationInputError> {
     validate_prediction_plan_limits(manifest.limits)?;
     if manifest.schema_version != TEACHER_PREDICTION_PLAN_SCHEMA_VERSION
+        || !super::super::render::source_valid(&manifest.source)
+        || !is_lower_sha256(&manifest.verified_source_manifest_sha256)
         || !is_lower_sha256(&manifest.dataset_partition_manifest_sha256)
         || !is_lower_sha256(&manifest.calibration_corpus_artifact_sha256)
         || !is_lower_sha256(&manifest.calibration_manifest_sha256)

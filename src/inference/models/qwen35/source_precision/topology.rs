@@ -149,6 +149,14 @@ pub(crate) struct VerifiedQwen35Bf16TopologyV1 {
 }
 
 impl VerifiedQwen35Bf16TopologyV1 {
+    pub(super) fn source(&self) -> &crate::intelligence::measured_auto_quant::SourceIdentity {
+        self._snapshot.source()
+    }
+
+    pub(super) fn verified_source_manifest_sha256(&self) -> &str {
+        self._snapshot.verified_source_manifest_sha256()
+    }
+
     pub(crate) fn topology_sha256(&self) -> &str {
         &self.topology_sha256
     }

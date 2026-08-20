@@ -215,6 +215,11 @@ pub(crate) fn build_teacher_prediction_plan(
 
     let mut manifest = TeacherPredictionPlanManifest {
         schema_version: TEACHER_PREDICTION_PLAN_SCHEMA_VERSION,
+        source: calibration.manifest.source.clone(),
+        verified_source_manifest_sha256: calibration
+            .manifest
+            .verified_source_manifest_sha256
+            .clone(),
         dataset_partition_manifest_sha256: actual_partition.manifest_sha256,
         calibration_corpus_artifact_sha256: calibration_corpus.artifact.sha256.clone(),
         calibration_manifest_sha256: calibration.manifest.manifest_sha256.clone(),
@@ -250,34 +255,34 @@ pub(super) fn resign_prediction_plan_for_test(manifest: &mut TeacherPredictionPl
 pub(crate) fn prediction_plan_for_test() -> VerifiedCalibrationPredictionPlan {
     let limits = TeacherPredictionPlanLimits {
         max_examples: 2,
-        max_total_tokens: 16,
+        max_total_tokens: 64,
         max_rendered_utf8_bytes: 1_024,
         max_prediction_points: 3,
-        max_prefix_tokens: 8,
+        max_prefix_tokens: 32,
         max_generation_prompts: 1,
     };
-    let transcript_tokens = vec![0, 1, 2];
-    let prompt_tokens = vec![2, 3];
+    let transcript_tokens = (0..18).map(|token| token % 4).collect::<Vec<_>>();
+    let prompt_tokens = (0..16).map(|token| (token + 2) % 4).collect::<Vec<_>>();
     let points = vec![
         TeacherPredictionPointReceipt {
             point_ordinal: 0,
             stable_id: "completed".into(),
             kind: TeacherPredictionPointKind::TeacherForced {
-                target_token_index: 1,
-                target_token_id: 1,
+                target_token_index: 16,
+                target_token_id: transcript_tokens[16],
             },
-            prefix_token_count: 1,
-            prefix_token_ids_sha256: prefix_token_sha256(&transcript_tokens[..1]).unwrap(),
+            prefix_token_count: 16,
+            prefix_token_ids_sha256: prefix_token_sha256(&transcript_tokens[..16]).unwrap(),
         },
         TeacherPredictionPointReceipt {
             point_ordinal: 1,
             stable_id: "completed".into(),
             kind: TeacherPredictionPointKind::TeacherForced {
-                target_token_index: 2,
-                target_token_id: 2,
+                target_token_index: 17,
+                target_token_id: transcript_tokens[17],
             },
-            prefix_token_count: 2,
-            prefix_token_ids_sha256: prefix_token_sha256(&transcript_tokens[..2]).unwrap(),
+            prefix_token_count: 17,
+            prefix_token_ids_sha256: prefix_token_sha256(&transcript_tokens[..17]).unwrap(),
         },
         TeacherPredictionPointReceipt {
             point_ordinal: 2,
@@ -308,13 +313,22 @@ pub(crate) fn prediction_plan_for_test() -> VerifiedCalibrationPredictionPlan {
     ];
     let mut manifest = TeacherPredictionPlanManifest {
         schema_version: TEACHER_PREDICTION_PLAN_SCHEMA_VERSION,
+        source: crate::intelligence::measured_auto_quant::SourceIdentity {
+            model_id: "Qwen/Qwen3.8-27B".into(),
+            revision: "test-revision".into(),
+            config_sha256: "1".repeat(64),
+            tensor_bundle_sha256: "2".repeat(64),
+            tokenizer_bundle_sha256: "3".repeat(64),
+            chat_template_sha256: "4".repeat(64),
+        },
+        verified_source_manifest_sha256: "5".repeat(64),
         dataset_partition_manifest_sha256: "a".repeat(64),
         calibration_corpus_artifact_sha256: "f".repeat(64),
         calibration_manifest_sha256: "b".repeat(64),
         rendered_token_stream_sha256: "c".repeat(64),
         limits,
         total_example_count: 2,
-        total_token_count: 5,
+        total_token_count: transcript_tokens.len() + prompt_tokens.len(),
         total_rendered_utf8_bytes: 32,
         examples,
         prediction_points: points,
@@ -338,4 +352,37 @@ pub(crate) fn prediction_plan_for_test() -> VerifiedCalibrationPredictionPlan {
             },
         ],
     }
+}
+
+#[cfg(test)]
+pub(crate) fn prediction_plan_for_test_bound(
+    source: crate::intelligence::measured_auto_quant::SourceIdentity,
+    verified_source_manifest_sha256: String,
+) -> VerifiedCalibrationPredictionPlan {
+    let mut plan = prediction_plan_for_test();
+    plan.manifest.source = source;
+    plan.manifest.verified_source_manifest_sha256 = verified_source_manifest_sha256;
+    plan.manifest.manifest_sha256 = prediction_plan_sha256(&plan.manifest).unwrap();
+    validate_teacher_prediction_plan(&plan.manifest).unwrap();
+    plan
+}
+
+#[cfg(test)]
+pub(crate) fn prediction_plan_for_test_bound_with_first_prefix(
+    source: crate::intelligence::measured_auto_quant::SourceIdentity,
+    verified_source_manifest_sha256: String,
+    first_prefix_token_count: usize,
+) -> VerifiedCalibrationPredictionPlan {
+    let mut plan = prediction_plan_for_test_bound(source, verified_source_manifest_sha256);
+    let tokens = &plan.examples[0].token_ids;
+    plan.manifest.prediction_points[0].kind = TeacherPredictionPointKind::TeacherForced {
+        target_token_index: first_prefix_token_count,
+        target_token_id: tokens[first_prefix_token_count],
+    };
+    plan.manifest.prediction_points[0].prefix_token_count = first_prefix_token_count;
+    plan.manifest.prediction_points[0].prefix_token_ids_sha256 =
+        prefix_token_sha256(&tokens[..first_prefix_token_count]).unwrap();
+    plan.manifest.manifest_sha256 = prediction_plan_sha256(&plan.manifest).unwrap();
+    validate_teacher_prediction_plan(&plan.manifest).unwrap();
+    plan
 }

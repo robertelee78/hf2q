@@ -9,7 +9,9 @@
 mod target_artifact;
 mod types;
 
-pub(crate) use target_artifact::write_structural_teacher_target_artifact;
+pub(crate) use target_artifact::{
+    preflight_structural_teacher_target, write_structural_teacher_target_artifact,
+};
 pub use types::*;
 
 #[cfg(test)]

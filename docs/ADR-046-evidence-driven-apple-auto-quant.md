@@ -1021,6 +1021,31 @@ base-only cache/state, exact-prefix teacher forcing, one-row output-head
 materialization, and terminal Metal completion before any teacher authority is
 minted. This slice introduces no DWQ, overlay, learned affine, or training path.
 
+The first B3b prerequisite makes that pre-upload join structural and explicit.
+Teacher-prediction plan schema v2 retains the exact `SourceIdentity` and
+verified source-manifest hash already authenticated by the rendered
+Calibration split. Rendering now recomputes the tensor-bundle identity from
+that verified manifest before retaining either identity; both participate in
+the plan's canonical hash and public validation. A consuming, opaque Qwen work
+preflight compares those identities to B2a, validates vocabulary and target
+framing, and computes checked counts for examples, forward calls, input tokens,
+output-head evaluations, cache tokens, target bytes, and the fixed 32-token
+greedy horizon. Those exact expectations remain in the consuming capability so
+the later runner can compare observed work without reconstructing the plan.
+V1 rejects a fresh full-attention prefix shorter than 16 tokens because the
+current 256-wide Qwen path has no accepted bulk kernel for lengths 2 through
+15. The work capability owns the exact topology and plan so neither can be
+substituted after validation.
+
+This prerequisite performs no target-file creation, Metal allocation, graph
+preparation, encoding, completion, or publication. Its hash is work identity,
+not teacher, numerical, performance, sensitivity, Dynamic, selector, or
+`--quant auto` authority. The production B3b entrypoint must additionally
+preflight the destination and runtime capacity, begin an unpublished target,
+consume this exact work capability into B2b/B3a, execute with fresh base-only
+state, terminally complete every required row, and publish only after the final
+family receipt is built. No DWQ state or path is introduced.
+
 Completing D3a requires a family-owned, bounded source-precision dense-Qwen
 runner that consumes authenticated source tensors without the production
 Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps
