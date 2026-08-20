@@ -15,6 +15,13 @@ use crate::input::model_recipe::{
     ModelPreparationError, ModelPreparationPlan, RecipeArtifactRole, RecipeSourceFile,
 };
 
+mod payload;
+
+pub use payload::{
+    transfer_authorized_model_preparation, ModelPreparationPayloadError,
+    TransferredModelPreparationPayload,
+};
+
 /// One bounded repository inventory resolved by the pinned in-process Hub
 /// client before any model payload is transferred.
 ///

@@ -662,9 +662,10 @@ harness leans on three patterns:
    exact original reference through the pinned Hub resolver into a
    non-cloneable accepted-commit/recipe-inventory proof, then authenticates all
    29 recipe-owned size and Git/LFS identities into a separate non-cloneable
-   metadata-only transfer authorization before payload transfer, and consumes
-   two bounded canonical conversion receipts into one inert text/projector
-   preparation proof. Its
+   metadata-only transfer authorization, then consumes it into a dedicated
+   recipe-owned resumable hf-hub cache and inert transferred-payload token,
+   and consumes two bounded canonical conversion receipts into one inert
+   text/projector preparation proof. Its
    compact v1 receipt binds the recipe, source, hardware profile, converter,
    both artifacts, and both receipt digests while remaining explicitly
    calibration-pending. Parsing it cannot mint the non-cloneable proof, and it

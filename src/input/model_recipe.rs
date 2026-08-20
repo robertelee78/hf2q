@@ -24,6 +24,7 @@ mod preparation;
 mod validation;
 mod verification;
 
+pub(in crate::input) use plan::canonical_future_directory;
 pub use plan::{
     plan_current_model_preparation, ModelPreparationPlan, MAX_MODEL_PREPARATION_PATH_BYTES,
 };

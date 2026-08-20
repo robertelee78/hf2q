@@ -887,6 +887,12 @@ jobs:
                 src/input/hf_download/resolution.rs || true
             )"
             test -z "$unexpected_pretransfer_authority"
+            unexpected_payload_authority="$(
+              grep -nE \
+                'std::fs::(remove_dir|remove_file|rename|copy|write|set_permissions)|File::create|OpenOptions|verify_conversion_manifest\(|verify_source\(|convert::|quantize|std::process|Command::new|reqwest|hyper|tokio::net|clap::|Serialize|Deserialize' \
+                src/input/hf_download/resolution/payload.rs || true
+            )"
+            test -z "$unexpected_payload_authority"
             unexpected_recipe_external_authority="$(
               grep -RInE --include='*.rs' \
                 'hf_hub|resolve_model_reference|resolve_model_preparation_plan|authorize_model_preparation_transfer|std::process|Command::new|reqwest|hyper|tokio::net|clap::' \
@@ -990,6 +996,8 @@ jobs:
               src/input/hf_reference_tests.rs \
               src/input/hf_download.rs \
               src/input/hf_download/resolution.rs \
+              src/input/hf_download/resolution/payload.rs \
+              src/input/hf_download/resolution/payload/tests.rs \
               src/input/hf_download_plan_tests.rs \
               src/input/integrity.rs \
               src/input/model_recipe.rs \
@@ -1042,6 +1050,10 @@ jobs:
               input::model_recipe_plan_tests::current_plan_authorizes_all_recipe_metadata_before_payload_transfer \
               input::model_recipe_plan_tests::current_no_options_plan_passes_on_the_explicit_proof_machine \
               input::model_recipe_plan_tests::preparation_root_is_absolute_canonical_bounded_and_directory_backed \
+              input::hf_download::resolution::payload::tests::payload_transfer_consumes_the_exact_recipe_order_and_stays_inert \
+              input::hf_download::resolution::payload::tests::failed_or_cross_cache_transfer_mints_no_payload \
+              input::hf_download::resolution::payload::tests::namespace_change_is_rejected_before_hub_or_payload_authority \
+              input::hf_download::resolution::payload::tests::current_recipe_payload_transfers_and_verifies_when_explicitly_requested \
               input::integrity::tests::safetensors_index_entry_cap_is_exact \
               convert::receipt::tests::prepared_success_receipt_binds_output_and_replaces_stale_atomically \
               tests::convert_source_classifier_reconciles_revision_and_rejects_ambiguity
@@ -1053,6 +1065,7 @@ jobs:
             cargo test --locked --bin hf2q --all-features input::model_recipe_tests::
             cargo test --locked --bin hf2q --all-features input::model_recipe_preparation_tests::
             cargo test --locked --bin hf2q --all-features input::model_recipe_plan_tests::
+            cargo test --locked --bin hf2q --all-features input::hf_download::resolution::payload::tests:: -- --test-threads=1
             cargo test --locked --bin hf2q --all-features input::integrity::tests:: -- --test-threads=1
             cargo test --locked --bin hf2q --all-features convert::receipt::tests::
             cargo test --locked --bin hf2q --all-features tests::convert_source_classifier
