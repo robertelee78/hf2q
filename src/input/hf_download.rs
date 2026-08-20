@@ -49,7 +49,10 @@
 //! returns no conversion or deletion authority. A final private preparation
 //! transition reauthenticates that cache around hf2q-owned text/projector
 //! conversion, exact-adopts only complete role outputs, and returns an inert
-//! pair without opening retention, registration, calibration, or serving.
+//! pair. The retained-source publication transition then reauthenticates the
+//! complete pair around a crash-durable pair receipt and `profile.json` commit,
+//! returning only an inert calibration-pending registration. Destructive
+//! retention, calibration, loading, preference, and serving remain closed.
 //!
 //! Manual test protocol: `Ctrl+C` mid-download → observe partial shard
 //! in `~/.cache/huggingface/hub/models--*/snapshots/*/` → re-invoke
@@ -73,11 +76,13 @@ mod resolution;
 
 pub use resolution::{
     authenticate_transferred_model_preparation, authorize_model_preparation_transfer,
-    convert_authenticated_model_preparation, transfer_authorized_model_preparation,
-    AuthenticatedModelPreparationSource, AuthorizedModelPreparationTransfer,
-    ConvertedModelPreparation, ModelPreparationConversionError, ModelPreparationPayloadError,
+    convert_authenticated_model_preparation, publish_converted_model_preparation_keep,
+    transfer_authorized_model_preparation, AuthenticatedModelPreparationSource,
+    AuthorizedModelPreparationTransfer, ConvertedModelPreparation, ModelPreparationConversionError,
+    ModelPreparationPayloadError, ModelPreparationPublicationError,
     ModelPreparationResolutionError, ModelPreparationSourceAuthenticationError,
-    ResolvedModelPreparationPlan, ResolvedModelRepository, TransferredModelPreparationPayload,
+    RegisteredModelPreparation, ResolvedModelPreparationPlan, ResolvedModelRepository,
+    TransferredModelPreparationPayload,
 };
 use resolution::{bind_model_preparation_resolution, resolve_repository_info};
 #[cfg(test)]

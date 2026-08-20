@@ -24,6 +24,8 @@ mod model_recipe_plan_tests;
 #[cfg(test)]
 mod model_recipe_preparation_tests;
 #[cfg(test)]
+mod model_recipe_profile_tests;
+#[cfg(test)]
 mod model_recipe_tests;
 
 use std::path::Path;

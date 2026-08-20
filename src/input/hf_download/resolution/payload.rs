@@ -17,8 +17,9 @@ mod source;
 
 pub use source::{
     authenticate_transferred_model_preparation, convert_authenticated_model_preparation,
-    AuthenticatedModelPreparationSource, ConvertedModelPreparation,
-    ModelPreparationConversionError, ModelPreparationSourceAuthenticationError,
+    publish_converted_model_preparation_keep, AuthenticatedModelPreparationSource,
+    ConvertedModelPreparation, ModelPreparationConversionError, ModelPreparationPublicationError,
+    ModelPreparationSourceAuthenticationError, RegisteredModelPreparation,
 };
 
 /// Recipe-owned payload bytes fetched and individually authenticated at the

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use sha2::Digest;
 
 use crate::convert::receipt::{
     ConversionReceipt, ConverterReceipt, ExcludedDsparkReceipt, OutputReceipt,
@@ -8,12 +9,14 @@ use crate::convert::receipt::{
 };
 
 use super::model_recipe::{
-    embedded_qwen38_recipe, ModelPreparationError, ModelPreparationReceiptV1, RecipeArtifactRole,
+    embedded_qwen38_recipe, ModelPreparationError, ModelPreparationReceiptV2, RecipeArtifactRole,
     MAX_MODEL_PREPARATION_RECEIPT_BYTES,
 };
 
-const PREPARATION_GOLDEN: &[u8] =
+const PREPARATION_V1_PREPUBLICATION: &[u8] =
     include_bytes!("../../data/model-recipes/qwen38-27b-preparation-receipt-v1.json");
+const PREPARATION_GOLDEN: &[u8] =
+    include_bytes!("../../data/model-recipes/qwen38-27b-preparation-receipt-v2.json");
 
 fn conversion_receipt(role: RecipeArtifactRole, artifact_path: &Path, git_commit: &str) -> Vec<u8> {
     let recipe = embedded_qwen38_recipe().unwrap();
@@ -97,14 +100,16 @@ fn verified_conversion(
         .unwrap()
 }
 
-fn prepared_pair() -> super::model_recipe::VerifiedModelPreparation {
+fn prepared_pair_with_available_bytes(
+    available_bytes: u64,
+) -> super::model_recipe::VerifiedModelPreparation {
     let recipe = embedded_qwen38_recipe().unwrap();
     let host = recipe
         .verify_host_and_disk(
             "aarch64-apple-darwin",
             "Apple M5 Max",
             128 * 1024 * 1024 * 1024,
-            recipe.minimum_free_bytes(),
+            available_bytes,
         )
         .unwrap();
     recipe
@@ -115,6 +120,11 @@ fn prepared_pair() -> super::model_recipe::VerifiedModelPreparation {
             verified_conversion(RecipeArtifactRole::VisionProjector, &"a".repeat(40)),
         )
         .unwrap()
+}
+
+fn prepared_pair() -> super::model_recipe::VerifiedModelPreparation {
+    let recipe = embedded_qwen38_recipe().unwrap();
+    prepared_pair_with_available_bytes(recipe.minimum_free_bytes())
 }
 
 #[test]
@@ -133,7 +143,7 @@ fn exact_pair_receipt_is_canonical_and_structurally_reparseable() {
         "qwen38-m5-max-128g-q4-k-m-v1"
     );
     assert_eq!(
-        ModelPreparationReceiptV1::parse(prepared.receipt_bytes()).unwrap(),
+        ModelPreparationReceiptV2::parse(prepared.receipt_bytes()).unwrap(),
         *receipt
     );
     assert_eq!(
@@ -144,6 +154,26 @@ fn exact_pair_receipt_is_canonical_and_structurally_reparseable() {
         prepared.projector_artifact().path(),
         Path::new("/models/Qwen3.8-27B-mmproj-F16.gguf")
     );
+}
+
+#[test]
+fn volatile_available_space_does_not_change_the_durable_v2_receipt() {
+    let recipe = embedded_qwen38_recipe().unwrap();
+    let at_floor = prepared_pair_with_available_bytes(recipe.minimum_free_bytes());
+    let with_more_space =
+        prepared_pair_with_available_bytes(recipe.minimum_free_bytes() + 16 * 1024 * 1024 * 1024);
+
+    assert_eq!(at_floor.receipt_bytes(), with_more_space.receipt_bytes());
+    let value: Value = serde_json::from_slice(at_floor.receipt_bytes()).unwrap();
+    assert_eq!(
+        value["hardware_profile"]["preflight_required_bytes"],
+        Value::from(recipe.minimum_free_bytes())
+    );
+    assert!(value["hardware_profile"]
+        .as_object()
+        .unwrap()
+        .get("preflight_available_bytes")
+        .is_none());
 }
 
 #[test]
@@ -404,40 +434,40 @@ fn pair_rejects_converter_or_role_mix_and_consumes_sealed_proofs() {
 fn structural_pair_parser_rejects_unknown_duplicate_trailing_and_semantic_mutation() {
     let bytes = prepared_pair().receipt_bytes().to_vec();
     assert!(matches!(
-        ModelPreparationReceiptV1::parse(&vec![b' '; MAX_MODEL_PREPARATION_RECEIPT_BYTES + 1]),
+        ModelPreparationReceiptV2::parse(&vec![b' '; MAX_MODEL_PREPARATION_RECEIPT_BYTES + 1]),
         Err(ModelPreparationError::TooLarge { .. })
     ));
     let text = std::str::from_utf8(&bytes).unwrap();
     let duplicate = text.replacen(
-        "\"schema_version\":1,",
-        "\"schema_version\":1,\"schema_version\":1,",
+        "\"schema_version\":2,",
+        "\"schema_version\":2,\"schema_version\":2,",
         1,
     );
-    assert!(ModelPreparationReceiptV1::parse(duplicate.as_bytes()).is_err());
+    assert!(ModelPreparationReceiptV2::parse(duplicate.as_bytes()).is_err());
 
     let mut value: Value = serde_json::from_slice(&bytes).unwrap();
     value
         .as_object_mut()
         .unwrap()
         .insert("extra".into(), Value::Bool(true));
-    assert!(ModelPreparationReceiptV1::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+    assert!(ModelPreparationReceiptV2::parse(&serde_json::to_vec(&value).unwrap()).is_err());
 
     let mut trailing = bytes.clone();
     trailing.extend_from_slice(b"x");
-    assert!(ModelPreparationReceiptV1::parse(&trailing).is_err());
+    assert!(ModelPreparationReceiptV2::parse(&trailing).is_err());
 
     let mut value: Value = serde_json::from_slice(&bytes).unwrap();
     value["artifacts"][0]["conversion_receipt_sha256"] = Value::String("A".repeat(64));
     let mut mutated = serde_json::to_vec(&value).unwrap();
     mutated.push(b'\n');
     assert!(matches!(
-        ModelPreparationReceiptV1::parse(&mutated),
+        ModelPreparationReceiptV2::parse(&mutated),
         Err(ModelPreparationError::PairMismatch { .. })
     ));
 
     let cases: Vec<Box<dyn FnOnce(&mut Value)>> = vec![
         Box::new(|value| value["kind"] = Value::String("other".into())),
-        Box::new(|value| value["schema_version"] = Value::from(2)),
+        Box::new(|value| value["schema_version"] = Value::from(3)),
         Box::new(|value| value["package"] = Value::String("other".into())),
         Box::new(|value| value["recipe"]["id"] = Value::String("other".into())),
         Box::new(|value| value["source"]["revision"] = Value::String("b".repeat(40))),
@@ -447,7 +477,7 @@ fn structural_pair_parser_rejects_unknown_duplicate_trailing_and_semantic_mutati
                 Value::from(128_u64 * 1024 * 1024 * 1024 - 1)
         }),
         Box::new(|value| {
-            value["hardware_profile"]["preflight_available_bytes"] = Value::from(81_914_357_702_u64)
+            value["hardware_profile"]["preflight_required_bytes"] = Value::from(81_914_357_702_u64)
         }),
         Box::new(|value| value["converter"]["version"] = Value::String("v0.1.7".into())),
         Box::new(|value| value["state"] = Value::String("ready".into())),
@@ -462,6 +492,15 @@ fn structural_pair_parser_rejects_unknown_duplicate_trailing_and_semantic_mutati
         mutate(&mut value);
         let mut hostile = serde_json::to_vec(&value).unwrap();
         hostile.push(b'\n');
-        assert!(ModelPreparationReceiptV1::parse(&hostile).is_err());
+        assert!(ModelPreparationReceiptV2::parse(&hostile).is_err());
     }
+}
+
+#[test]
+fn prepublication_v1_receipt_is_retained_as_exact_unsupported_evidence() {
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(PREPARATION_V1_PREPUBLICATION)),
+        "1f6d98b7269c1754d22248136c2793081dd33ed002a13935bde680fa694dffef"
+    );
+    assert!(ModelPreparationReceiptV2::parse(PREPARATION_V1_PREPUBLICATION).is_err());
 }

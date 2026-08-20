@@ -12,8 +12,9 @@ use crate::input::model_recipe::{ModelPreparationError, VerifiedRecipeSource};
 mod conversion;
 
 pub use conversion::{
-    convert_authenticated_model_preparation, ConvertedModelPreparation,
-    ModelPreparationConversionError,
+    convert_authenticated_model_preparation, publish_converted_model_preparation_keep,
+    ConvertedModelPreparation, ModelPreparationConversionError, ModelPreparationPublicationError,
+    RegisteredModelPreparation,
 };
 
 /// Exact recipe source bytes re-opened from the sealed payload cache and

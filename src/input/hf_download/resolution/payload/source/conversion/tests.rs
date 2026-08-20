@@ -129,7 +129,7 @@ fn coordinator_reauthenticates_around_both_roles_and_returns_only_inert_pair() {
     );
     assert_eq!(converted.recipe_id(), "qwen38-27b-official-v1");
     assert_eq!(
-        crate::input::model_recipe::ModelPreparationReceiptV1::parse(
+        crate::input::model_recipe::ModelPreparationReceiptV2::parse(
             converted.preparation_receipt_bytes()
         )
         .unwrap()
@@ -255,11 +255,25 @@ fn current_recipe_converts_and_reopens_the_exact_pair_when_explicitly_requested(
         .expect("exact recipe-owned conversion");
     assert_eq!(converted.recipe_id(), "qwen38-27b-official-v1");
     assert_eq!(
-        crate::input::model_recipe::ModelPreparationReceiptV1::parse(
+        crate::input::model_recipe::ModelPreparationReceiptV2::parse(
             converted.preparation_receipt_bytes()
         )
         .unwrap()
         .recipe_id(),
         converted.recipe_id()
+    );
+    let registered = publish_converted_model_preparation_keep(converted)
+        .expect("durable exact preparation receipt and profile publication");
+    assert_eq!(registered.recipe_id(), "qwen38-27b-official-v1");
+    assert_eq!(
+        registered.profile().source_retention(),
+        crate::input::model_recipe::SourceRetentionChoice::Keep
+    );
+    assert_eq!(
+        crate::input::model_recipe::PreparedModelProfileV1::parse(
+            &std::fs::read(registered.model_root().join("profile.json")).unwrap()
+        )
+        .unwrap(),
+        *registered.profile()
     );
 }

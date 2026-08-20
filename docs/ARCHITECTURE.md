@@ -101,10 +101,12 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   ├── safetensors.rs   streaming mmap shard reader → TensorMap
 │   ├── hf_reference.rs  bounded canonical Hub ID/URL + immutable identity
 │   ├── hf_download.rs   exact-revision native Hub source-plan/download
+│   ├── hf_download/     transfer/source reauthentication, paired native
+│   │                    conversion, and retained-source durable registration
 │   ├── integrity.rs     bounded index + LFS/Git byte verification
 │   ├── model_recipe.rs  embedded closed recipe schema + policy lookup
 │   └── model_recipe/    recipe validation + sealed source/artifact/host,
-│                       conversion, and inert preparation-pair proofs
+│                       conversion/pair proofs, and structural prepared profile
 │
 ├── src/ir/              internal representation crossing modules
 │   ├── mod.rs           ModelMetadata, TensorMap, DType, QuantizedTensor, …
@@ -679,12 +681,22 @@ harness leans on three patterns:
    performs one final reopening of both roles before consuming the source,
    host, artifact, and receipt proofs into one inert text/projector preparation
    proof. Its
-   compact v1 receipt binds the recipe, source, hardware profile, converter,
+   compact v2 receipt binds the recipe, source, stable recipe-owned hardware
+   floors, converter,
    both artifacts, and both receipt digests while remaining explicitly
-   calibration-pending. Parsing it cannot mint the non-cloneable proof, and it
-   grants no model registration, serving, retention deletion, pair-receipt or
-   profile publication authority; the public no-options CLI, retention,
-   registration, and calibration coordinator remain pending.
+   calibration-pending. A final one-use local publication transition repeats
+   source, pair, artifact, and conversion-receipt authentication around two
+   crash-durable records. It publishes the pair receipt first, then commits
+   registration through the exact `profile.json`; fixed private partials are
+   exact-prefix resumable and published by no-replace same-inode hard links
+   through retained descriptor-relative parent directories.
+   Prepared-profile v1 binds that receipt and both artifact/receipt descriptors
+   while recording only retained recipe-owned source and
+   `awaiting_runtime_calibration`. Parsing either record cannot mint the
+   non-cloneable durable registration proof, and the proof grants no loading,
+   preference, serving, source deletion, or calibration authority. The public
+   no-options CLI, destructive-retention journal, and calibration coordinator
+   remain pending.
 
 Benchmarks live in `benches/` and `scripts/`; the latter directory
 also carries every ADR's repro runbook.

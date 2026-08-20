@@ -305,9 +305,12 @@ impl ModelPreparationPlan {
     }
 }
 
-fn require_exact_regular_file(path: &Path) -> Result<(), ModelPreparationError> {
+pub(in crate::input) fn require_exact_regular_file(
+    path: &Path,
+) -> Result<(), ModelPreparationError> {
     let metadata = std::fs::symlink_metadata(path).map_err(ModelRecipeError::from)?;
     if !metadata.file_type().is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.nlink() != 1
         || path.canonicalize().map_err(ModelRecipeError::from)? != path
     {
