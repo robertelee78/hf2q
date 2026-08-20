@@ -847,6 +847,29 @@ and bound. These additions are allocation and streaming prerequisites only;
 they still establish no execution, completion, sensitivity, policy, or
 allocator authority.
 
+The next source-precision prerequisite retains the exact opened dense-Qwen
+source config and safetensors shard inodes instead of reopening tensor paths.
+It applies descriptor-relative no-follow opens, strict duplicate-key
+safetensors header parsing, hard shard/header/tensor/source-byte ceilings, and
+checked BF16/F16 geometry. Every retained tensor name, shape, dtype, byte
+extent, raw SHA-256, and Variable/Fixed/Protected/Excluded disposition must
+match the already verified D1 inventory and partition exactly. Vision tensors
+are authenticated but must be Excluded; MTP tensors are authenticated but must
+be Fixed or Protected; an untied `lm_head.weight` is required. Later Metal
+upload may copy one tensor through a bounded `u16` view while hashing those
+exact copied bytes, and the retained files can be rehashed after the pass.
+
+This retained snapshot is still structural source authority only. It does not
+authenticate tokenizer/template derivation, allocate a Metal buffer, apply a
+Qwen semantic or layout transform, execute or complete a graph, produce
+teacher logits, persist a cross-process receipt, compute sensitivity, or open
+the allocator. Its file-identity and final-rehash checks detect persistent
+mutation; the later loader remains responsible for hashing the exact bytes it
+copies into immutable owned buffers. B1 does not consume or interpret DWQ or
+learned affine state; packed/quantized source dtypes and F32 source fallback
+are rejected. Exact family tensor-topology and semantic-transform admission
+remain B2 work.
+
 Completing D3a requires a family-owned, bounded source-precision dense-Qwen
 runner that consumes authenticated source tensors without the production
 Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps

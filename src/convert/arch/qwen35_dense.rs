@@ -20,6 +20,12 @@ pub struct Qwen35DenseCtx {
     pub multimodal_wrapping: bool,
 }
 
+/// Exact Hugging Face source namespace owned by the multimodal wrapper. This
+/// is deliberately narrower than the generic GGUF-side vision classifier.
+pub fn is_qwen35_dense_vision_source_tensor(name: &str) -> bool {
+    name.starts_with("model.visual.")
+}
+
 /// Map one official HF tensor into the native qwen35 text GGUF.
 ///
 /// Unknown text tensors return `None` and therefore fail conversion. Vision
@@ -33,7 +39,7 @@ pub fn map_tensor_name(
     let canonical = if ctx.multimodal_wrapping {
         if let Some(stripped) = hf_name.strip_prefix("model.language_model.") {
             Some(format!("model.{stripped}"))
-        } else if hf_name.starts_with("model.visual.") {
+        } else if is_qwen35_dense_vision_source_tensor(hf_name) {
             return Some(MappedTensor::Drop);
         } else if hf_name == "lm_head.weight" || hf_name.starts_with("mtp.") {
             None
