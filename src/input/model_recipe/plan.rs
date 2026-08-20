@@ -1,10 +1,12 @@
 use std::ffi::OsString;
 use std::fmt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
-    recipe_for_reference, ModelPreparationError, ModelRecipe, RecipeArtifactRole, RecipeSourceFile,
-    SourceRetentionChoice, VerifiedRecipeHost,
+    recipe_for_reference, ModelPreparationError, ModelRecipe, ModelRecipeError, RecipeArtifactRole,
+    RecipeSourceFile, SourceRetentionChoice, VerifiedModelPreparation, VerifiedRecipeConversion,
+    VerifiedRecipeHost, VerifiedRecipeSource,
 };
 use crate::input::hf_reference::{HfModelReference, ResolvedHfModelReference};
 use crate::input::integrity::VerifiedSourceManifest;
@@ -112,6 +114,10 @@ impl ModelPreparationPlan {
         self.recipe.recipe_id()
     }
 
+    pub(in crate::input) fn producer_version(&self) -> &str {
+        self.recipe.producer_version()
+    }
+
     pub fn reference(&self) -> &HfModelReference {
         &self.reference
     }
@@ -215,6 +221,50 @@ impl ModelPreparationPlan {
         Ok(self.recipe.verify_source(local_dir, verified)?)
     }
 
+    pub(in crate::input) fn verify_completed_conversion(
+        &self,
+        role: RecipeArtifactRole,
+    ) -> Result<VerifiedRecipeConversion, ModelPreparationError> {
+        require_exact_regular_file(self.artifact_path(role))?;
+        let artifact = self
+            .recipe
+            .verify_artifact_path(role, self.artifact_path(role))?;
+        let receipt_path = self.conversion_receipt_path(role);
+        require_exact_regular_file(receipt_path)?;
+        let receipt_size = std::fs::metadata(receipt_path)
+            .map_err(ModelRecipeError::from)?
+            .len();
+        if receipt_size > super::preparation::MAX_CONVERSION_RECEIPT_BYTES as u64 {
+            return Err(ModelPreparationError::TooLarge {
+                actual: usize::try_from(receipt_size).unwrap_or(usize::MAX),
+                limit: super::preparation::MAX_CONVERSION_RECEIPT_BYTES,
+            });
+        }
+        let receipt_bytes = std::fs::read(receipt_path).map_err(ModelRecipeError::from)?;
+        self.recipe
+            .verify_conversion_receipt(role, artifact, &receipt_bytes)
+    }
+
+    pub(in crate::input) fn verify_completed_artifact(
+        &self,
+        role: RecipeArtifactRole,
+    ) -> Result<(), ModelPreparationError> {
+        require_exact_regular_file(self.artifact_path(role))?;
+        self.recipe
+            .verify_artifact_path(role, self.artifact_path(role))?;
+        Ok(())
+    }
+
+    pub(in crate::input) fn bind_prepared_pair(
+        self,
+        source: VerifiedRecipeSource,
+        text: VerifiedRecipeConversion,
+        projector: VerifiedRecipeConversion,
+    ) -> Result<VerifiedModelPreparation, ModelPreparationError> {
+        self.recipe
+            .bind_prepared_pair(source, self._host, text, projector)
+    }
+
     #[cfg(test)]
     pub(in crate::input) fn verified_source_at_for_test(
         &self,
@@ -222,6 +272,19 @@ impl ModelPreparationPlan {
         records: Vec<crate::core::integrity::ShardIntegrity>,
     ) -> super::VerifiedRecipeSource {
         self.recipe.verified_source_at_for_test(local_dir, records)
+    }
+
+    #[cfg(test)]
+    pub(in crate::input) fn verified_conversion_for_test(
+        &self,
+        role: RecipeArtifactRole,
+        converter_git_commit: &str,
+    ) -> VerifiedRecipeConversion {
+        self.recipe.verified_conversion_at_for_test(
+            role,
+            self.artifact_path(role),
+            converter_git_commit,
+        )
     }
 
     pub(in crate::input) fn revalidate_source_root_before_mutation(
@@ -240,6 +303,26 @@ impl ModelPreparationPlan {
     pub(in crate::input) fn host_for_test(&self) -> &VerifiedRecipeHost {
         &self._host
     }
+}
+
+fn require_exact_regular_file(path: &Path) -> Result<(), ModelPreparationError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(ModelRecipeError::from)?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || path.canonicalize().map_err(ModelRecipeError::from)? != path
+    {
+        return Err(plan_error(
+            "conversion artifact or receipt is not a canonical single-link regular file",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(in crate::input) fn require_exact_regular_file_for_test(
+    path: &Path,
+) -> Result<(), ModelPreparationError> {
+    require_exact_regular_file(path)
 }
 
 struct PreparationLayout {

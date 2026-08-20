@@ -356,6 +356,12 @@ jobs:
               src/input/hf_download/resolution/payload/source.rs || true
           )"
           test -z "$unexpected_source_auth_authority"
+          unexpected_recipe_conversion_authority="$(
+            grep -nE \
+              'build_hub_api|download_file|ApiBuilder|repo\.(get|download|download_with_progress)\(|std::fs::(remove_dir|remove_file|rename|copy|write|set_permissions)|std::process|Command::new|reqwest|hyper|tokio::net|clap::|profile_path\(|preparation_receipt_path\(|SourceRetentionChoice|serve::|calibration::' \
+              src/input/hf_download/resolution/payload/source/conversion.rs || true
+          )"
+          test -z "$unexpected_recipe_conversion_authority"
           unexpected_recipe_external_authority="$(
             grep -RInE --include='*.rs' \
               'hf_hub|resolve_model_reference|resolve_model_preparation_plan|authorize_model_preparation_transfer|std::process|Command::new|reqwest|hyper|tokio::net|clap::' \
@@ -370,10 +376,10 @@ jobs:
           test -z "$unexpected_recipe_plan_authority"
           recipe=data/model-recipes/qwen38-27b-official-v1.json
           test "$(shasum -a 256 "$recipe" | awk '{print $1}')" = \
-            47a4cec7eb3b19ad68727f557ff47e83f1ef88c791734a76b5bd052d921c9d9d
+            e3b60772d2abf33f14e215ba949bca22d16c0f1d8f985cd172b83b422e205126
           preparation_golden=data/model-recipes/qwen38-27b-preparation-receipt-v1.json
           test "$(shasum -a 256 "$preparation_golden" | awk '{print $1}')" = \
-            5b20ca00d6757b285927e6f464271143e8820b1126ae85bc5786a532374ed69b
+            1f6d98b7269c1754d22248136c2793081dd33ed002a13935bde680fa694dffef
           fixture=src/distribution/update_auth/testdata/python-tuf-v1
           (cd "$fixture" && shasum -a 256 -c SHA256SUMS)
           expected_generator="$(jq -er .generator_sha256 "$fixture/PROVENANCE.json")"
@@ -468,6 +474,8 @@ jobs:
             src/input/hf_download/resolution/payload/tests.rs \
             src/input/hf_download/resolution/payload/source.rs \
             src/input/hf_download/resolution/payload/source/tests.rs \
+            src/input/hf_download/resolution/payload/source/conversion.rs \
+            src/input/hf_download/resolution/payload/source/conversion/tests.rs \
             src/input/hf_download_plan_tests.rs \
             src/input/integrity.rs \
             src/input/model_recipe.rs \
@@ -548,8 +556,20 @@ jobs:
             input::hf_download::resolution::payload::source::tests::changed_snapshot_namespace_fails_before_any_source_authentication \
             input::hf_download::resolution::payload::source::tests::snapshot_replacement_during_authentication_mints_no_source_capability \
             input::hf_download::resolution::payload::source::tests::current_recipe_cache_reauthenticates_when_explicitly_requested \
+            input::hf_download::resolution::payload::source::conversion::tests::coordinator_reauthenticates_around_both_roles_and_returns_only_inert_pair \
+            input::hf_download::resolution::payload::source::conversion::tests::source_drift_after_text_conversion_prevents_projector_and_pair_authority \
+            input::hf_download::resolution::payload::source::conversion::tests::projector_failure_prevents_final_reauthentication_and_pair_authority \
+            input::hf_download::resolution::payload::source::conversion::tests::final_artifact_drift_prevents_pair_authority_after_both_conversions \
+            input::hf_download::resolution::payload::source::conversion::tests::restart_shape_adopts_only_complete_pairs_and_rejects_orphan_receipts \
+            input::hf_download::resolution::payload::source::conversion::tests::dangling_symlink_is_retained_as_hostile_evidence_instead_of_absence \
+            input::hf_download::resolution::payload::source::conversion::tests::current_recipe_converts_and_reopens_the_exact_pair_when_explicitly_requested \
+            input::model_recipe_plan_tests::completed_conversion_files_must_be_canonical_single_link_regular_files \
+            convert::cli_driver::tests::deepseek_tiny_official_layout_converts_to_q2_k_s_end_to_end \
+            convert::cli_driver::tests::explicit_receipt_path_cannot_alias_the_conversion_output \
+            models::vit::gguf_emit::tests::projector_can_reproduce_a_recipe_frozen_producer_banner \
             input::integrity::tests::safetensors_index_entry_cap_is_exact \
             convert::receipt::tests::prepared_success_receipt_binds_output_and_replaces_stale_atomically \
+            convert::receipt::tests::explicit_receipt_destination_cannot_replace_the_artifact \
             tests::convert_source_classifier_reconciles_revision_and_rejects_ambiguity
           do
             grep -Fq -- "$required_test: test" <<<"$hf_source_tests"
@@ -561,8 +581,12 @@ jobs:
           cargo test --locked --bin hf2q --all-features input::model_recipe_plan_tests::
           cargo test --locked --bin hf2q --all-features input::hf_download::resolution::payload::tests:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features input::hf_download::resolution::payload::source::tests:: -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features input::hf_download::resolution::payload::source::conversion::tests:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features input::integrity::tests:: -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features convert::cli_driver::tests::deepseek_tiny_official_layout_converts_to_q2_k_s_end_to_end -- --exact
+          cargo test --locked --bin hf2q --all-features convert::cli_driver::tests::explicit_receipt_path_cannot_alias_the_conversion_output -- --exact
           cargo test --locked --bin hf2q --all-features convert::receipt::tests::
+          cargo test --locked --bin hf2q --all-features models::vit::gguf_emit::tests::projector_can_reproduce_a_recipe_frozen_producer_banner -- --exact
           cargo test --locked --bin hf2q --all-features tests::convert_source_classifier
           distribution_tests="$(cargo test --locked --bin hf2q --all-features -- --list)"
           for required_test in \

@@ -668,14 +668,23 @@ harness leans on three patterns:
    directory device/inode identities across verification, authenticates the
    selected safetensors index and all 29 file bytes, and binds the result to
    both Hub Git/LFS identity and the independent checked-in recipe before
-   minting another non-cloneable inert source proof. It then consumes two
-   bounded canonical conversion receipts into one inert text/projector
-   preparation proof. Its
+   minting another non-cloneable inert source proof. The recipe-owned
+   conversion transition consumes that proof, repeats all 29 source checks
+   before and between hf2q-native Q4_K_M text and F16 projector conversion,
+   takes the accepted artifact producer banner from the embedded recipe rather
+   than the running package version (while receipts identify the actual
+   converter),
+   writes each canonical receipt under the separate plan-owned `receipts/`
+   directory, and exact-adopts only complete artifact/receipt pairs. It
+   performs one final reopening of both roles before consuming the source,
+   host, artifact, and receipt proofs into one inert text/projector preparation
+   proof. Its
    compact v1 receipt binds the recipe, source, hardware profile, converter,
    both artifacts, and both receipt digests while remaining explicitly
    calibration-pending. Parsing it cannot mint the non-cloneable proof, and it
-   grants no model registration, serving, retention deletion, or filesystem
-   mutation authority; the no-options coordinator remains pending.
+   grants no model registration, serving, retention deletion, pair-receipt or
+   profile publication authority; the public no-options CLI, retention,
+   registration, and calibration coordinator remain pending.
 
 Benchmarks live in `benches/` and `scripts/`; the latter directory
 also carries every ADR's repro runbook.

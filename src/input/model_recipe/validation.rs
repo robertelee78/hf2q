@@ -22,6 +22,10 @@ impl ModelRecipe {
             "recipe is not accepted",
         )?;
         require(
+            self.conversion.producer_version == "hf2q 0.1.6",
+            "invalid accepted artifact producer version",
+        )?;
+        require(
             self.acceptance.decision == "docs/ADR-044-qwen38-native.md"
                 && self.acceptance.accepted_at == "2026-08-17",
             "invalid acceptance evidence",

@@ -67,6 +67,25 @@ fn exact_transfer_records() -> Vec<ShardIntegrity> {
 }
 
 #[test]
+fn completed_conversion_files_must_be_canonical_single_link_regular_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let exact = root.join("exact");
+    std::fs::write(&exact, b"exact").unwrap();
+    super::model_recipe::require_exact_regular_file_for_test(&exact).unwrap();
+
+    let hardlink = root.join("hardlink");
+    std::fs::hard_link(&exact, &hardlink).unwrap();
+    assert!(super::model_recipe::require_exact_regular_file_for_test(&exact).is_err());
+
+    let other = root.join("other");
+    std::fs::write(&other, b"other").unwrap();
+    let symlink = root.join("symlink");
+    std::os::unix::fs::symlink(&other, &symlink).unwrap();
+    assert!(super::model_recipe::require_exact_regular_file_for_test(&symlink).is_err());
+}
+
+#[test]
 fn canonical_no_options_layout_is_exact_and_inert() {
     let temp = tempfile::tempdir().unwrap();
     let models = temp.path().join("models");

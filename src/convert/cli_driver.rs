@@ -43,8 +43,9 @@ use crate::convert::arch::{
 use crate::convert::orchestrator::PlanEntry;
 use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
 use crate::convert::receipt::{
-    clear_stale_receipt, prepare_success_receipt, promote_success_receipt,
-    require_converter_git_commit, PeakChunkBoundReceipt, ReceiptError, RemoteConversionSource,
+    clear_stale_receipt, clear_stale_receipt_at, prepare_success_receipt,
+    prepare_success_receipt_at, promote_success_receipt, require_converter_git_commit,
+    PeakChunkBoundReceipt, ReceiptError, RemoteConversionSource,
 };
 use crate::convert::source_reader::SourceError;
 use crate::convert::tokenizer::TokenizerError;
@@ -427,6 +428,44 @@ impl From<TokenizerError> for ConvertError {
 /// 7. Stream into a same-directory temporary GGUF, sync it, then atomically
 ///    replace the requested output only after successful finalization.
 pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
+    run_convert_with_receipt_destination(args, None, None)
+}
+
+/// Run the existing converter while placing its canonical success receipt at
+/// a caller-sealed path instead of beside the GGUF. Tests retain this ordinary
+/// running-version variant; production recipe conversion uses the sealed
+/// producer-version variant below.
+#[cfg(test)]
+pub(crate) fn run_convert_with_receipt_path(
+    args: ConvertArgs,
+    receipt_path: &Path,
+) -> Result<(), ConvertError> {
+    if receipt_path == args.output {
+        return Err(ReceiptError::InvalidDestination.into());
+    }
+    run_convert_with_receipt_destination(args, Some(receipt_path), None)
+}
+
+/// Run the recipe-owned converter with the producer banner frozen by the
+/// accepted artifact recipe. The ordinary CLI deliberately continues to stamp
+/// the running hf2q version; only the sealed recipe path may reproduce an
+/// earlier accepted artifact identity.
+pub(crate) fn run_convert_with_recipe_producer_version(
+    args: ConvertArgs,
+    receipt_path: &Path,
+    producer_version: &str,
+) -> Result<(), ConvertError> {
+    if receipt_path == args.output {
+        return Err(ReceiptError::InvalidDestination.into());
+    }
+    run_convert_with_receipt_destination(args, Some(receipt_path), Some(producer_version))
+}
+
+fn run_convert_with_receipt_destination(
+    args: ConvertArgs,
+    receipt_path: Option<&Path>,
+    recipe_producer_version: Option<&str>,
+) -> Result<(), ConvertError> {
     // ----- 1. Open source (mmap, metadata-only) ---------------------------
     // Per ADR-033 §"Open Issues / Real-Model Findings" 2026-05-18: the
     // source reader does NOT load every safetensors shard into RAM. It
@@ -465,32 +504,46 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
             });
         }
 
-        crate::models::vit::convert_vision_tower_to_path_with_source(
+        crate::models::vit::convert_vision_tower_to_path_with_source_and_producer_version(
             &args.hf_dir,
             &args.output,
             args.remote_source
                 .as_ref()
                 .map(RemoteConversionSource::source_sha256),
+            recipe_producer_version,
         )?;
 
         if let Some(remote) = args.remote_source.as_ref() {
             let converter_git_commit = require_converter_git_commit()?;
-            let prepared = prepare_success_receipt(
-                &args.output,
-                &args.output,
-                remote,
-                &converter_git_commit,
-                "f16-mmproj",
-                excluded_dspark_count,
-                PeakChunkBoundReceipt {
-                    strategy: "lazy_source_index_projector_only".into(),
-                    scope: "multimodal_projector_tensors".into(),
-                    ..PeakChunkBoundReceipt::default()
-                },
-            )?;
+            let peak = PeakChunkBoundReceipt {
+                strategy: "lazy_source_index_projector_only".into(),
+                scope: "multimodal_projector_tensors".into(),
+                ..PeakChunkBoundReceipt::default()
+            };
+            let prepared = match receipt_path {
+                Some(path) => prepare_success_receipt_at(
+                    &args.output,
+                    &args.output,
+                    path,
+                    remote,
+                    &converter_git_commit,
+                    "f16-mmproj",
+                    excluded_dspark_count,
+                    peak,
+                ),
+                None => prepare_success_receipt(
+                    &args.output,
+                    &args.output,
+                    remote,
+                    &converter_git_commit,
+                    "f16-mmproj",
+                    excluded_dspark_count,
+                    peak,
+                ),
+            }?;
             promote_success_receipt(prepared)?;
         } else {
-            clear_stale_receipt(&args.output)?;
+            clear_conversion_receipt(&args.output, receipt_path)?;
         }
         return Ok(());
     }
@@ -809,7 +862,11 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     if let Some(remote) = args.remote_source.as_ref() {
         orch.add_metadata(
             KEY_PRODUCER_VERSION.to_string(),
-            MetaValue::String(format!("hf2q {}", env!("CARGO_PKG_VERSION"))),
+            MetaValue::String(
+                recipe_producer_version
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("hf2q {}", env!("CARGO_PKG_VERSION"))),
+            ),
         );
         orch.add_metadata(
             KEY_SOURCE_SHA256.to_string(),
@@ -936,8 +993,18 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
         .remote_source
         .as_ref()
         .zip(converter_git_commit.as_deref())
-        .map(|(remote, commit)| {
-            prepare_success_receipt(
+        .map(|(remote, commit)| match receipt_path {
+            Some(path) => prepare_success_receipt_at(
+                temporary_output.path(),
+                &args.output,
+                path,
+                remote,
+                commit,
+                &args.selector.receipt_name(),
+                excluded_dspark_count,
+                peak_chunk_bound,
+            ),
+            None => prepare_success_receipt(
                 temporary_output.path(),
                 &args.output,
                 remote,
@@ -945,7 +1012,7 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
                 &args.selector.receipt_name(),
                 excluded_dspark_count,
                 peak_chunk_bound,
-            )
+            ),
         })
         .transpose()?;
     promote_temporary_output(temporary_output, &args.output)?;
@@ -955,15 +1022,25 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
             // so complete new bytes can never be mistaken for the artifact it
             // described; the caller still receives the promotion failure and
             // must rerun conversion to obtain a provenance-complete result.
-            clear_stale_receipt(&args.output)?;
+            clear_conversion_receipt(&args.output, receipt_path)?;
             return Err(error.into());
         }
     } else {
         // A local conversion has no verified remote-source identity. Never
         // leave a sidecar from an older remote artifact beside new bytes.
-        clear_stale_receipt(&args.output)?;
+        clear_conversion_receipt(&args.output, receipt_path)?;
     }
     Ok(())
+}
+
+fn clear_conversion_receipt(
+    output: &Path,
+    receipt_path: Option<&Path>,
+) -> Result<(), ReceiptError> {
+    match receipt_path {
+        Some(path) => clear_stale_receipt_at(path),
+        None => clear_stale_receipt(output),
+    }
 }
 
 fn conversion_model_basename(args: &ConvertArgs) -> Option<String> {
@@ -2777,6 +2854,16 @@ mod tests {
     }
 
     #[test]
+    fn explicit_receipt_path_cannot_alias_the_conversion_output() {
+        let args = basename_test_args("/does/not/need/to/exist", Some("Qwen/Qwen3.8-27B"));
+        let output = args.output.clone();
+        assert!(matches!(
+            run_convert_with_receipt_path(args, &output),
+            Err(ConvertError::Receipt(ReceiptError::InvalidDestination))
+        ));
+    }
+
+    #[test]
     fn qwen_conditional_metadata_dispatch_preserves_wrapper_vision_contract() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/qwen38/config.json"))
@@ -3641,18 +3728,23 @@ mod tests {
         .unwrap();
 
         let output = dir.path().join("tiny-q2-k-s.gguf");
-        run_convert(ConvertArgs {
-            hf_dir: dir.path().to_path_buf(),
-            selector: QuantSelector::Standard(LlamaFtype::MostlyQ2_K_S),
-            output: output.clone(),
-            dry_run: false,
-            imatrix: None,
-            imatrix_corpus: None,
-            imatrix_out: None,
-            imatrix_n_ctx: None,
-            mmproj: false,
-            remote_source: Some(remote_source("deepseek-ai/DeepSeek-V4-Flash-0731")),
-        })
+        let receipt_path = dir.path().join("receipts/tiny-q2-k-s.gguf.receipt.json");
+        run_convert_with_recipe_producer_version(
+            ConvertArgs {
+                hf_dir: dir.path().to_path_buf(),
+                selector: QuantSelector::Standard(LlamaFtype::MostlyQ2_K_S),
+                output: output.clone(),
+                dry_run: false,
+                imatrix: None,
+                imatrix_corpus: None,
+                imatrix_out: None,
+                imatrix_n_ctx: None,
+                mmproj: false,
+                remote_source: Some(remote_source("deepseek-ai/DeepSeek-V4-Flash-0731")),
+            },
+            &receipt_path,
+            "hf2q 0.1.6",
+        )
         .unwrap();
         let bytes = std::fs::read(&output).unwrap();
         assert_eq!(&bytes[..4], b"GGUF");
@@ -3660,7 +3752,7 @@ mod tests {
             .windows(b"blk.0.ffn_gate_exps.weight".len())
             .any(|w| w == b"blk.0.ffn_gate_exps.weight"));
         assert!(bytes.len() > 32 * 1024);
-        let producer = concat!("hf2q ", env!("CARGO_PKG_VERSION")).as_bytes();
+        let producer = b"hf2q 0.1.6";
         assert!(bytes
             .windows(producer.len())
             .any(|window| window == producer));
@@ -3668,10 +3760,9 @@ mod tests {
         assert!(bytes
             .windows(expected_source_sha.len())
             .any(|window| window == expected_source_sha.as_bytes()));
-        let receipt: crate::convert::receipt::ConversionReceipt = serde_json::from_slice(
-            &std::fs::read(crate::convert::receipt::receipt_path(&output)).unwrap(),
-        )
-        .unwrap();
+        let receipt: crate::convert::receipt::ConversionReceipt =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        assert!(!crate::convert::receipt::receipt_path(&output).exists());
         assert_eq!(receipt.source.revision, "a".repeat(40));
         assert_eq!(receipt.quant_selector, "q2_k_s");
         assert_eq!(receipt.output.size, bytes.len() as u64);

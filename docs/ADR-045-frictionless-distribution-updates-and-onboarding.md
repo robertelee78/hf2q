@@ -23,14 +23,14 @@
   receipt, OS-bound host/disk preflight, and sealed host/conversion/pair proofs
   plus the canonical inert no-options preparation layout, exact Hub resolution,
   complete recipe-metadata transfer authorization, and recipe-owned resumable
-  payload transfer plus offline recipe-bound source reauthentication are also
-  reconciled;
+  payload transfer plus offline recipe-bound source reauthentication and the
+  recipe-owned paired text/projector conversion boundary are also reconciled;
   the real
   release trust root, real compiled Team ID plus protected positive fixture,
   public update/install/onboarding
   implementation, and exact-artifact proof remain pending
 - Date: 2026-08-17
-- Updated: 2026-08-19
+- Updated: 2026-08-20
 - Owners: hf2q release engineering and operator experience
 - Related: `docs/ADR-044-qwen38-native.md`,
   `docs/ADR-017-persistent-block-prefix-cache.md`,
@@ -1601,7 +1601,7 @@ bounded-runtime-calibration transaction before removing those requirements.
 `data/model-recipes/qwen38-27b-official-v1.json` is a canonical compact JSON
 document plus one LF, capped at 64 KiB and embedded into the binary. Its exact
 SHA-256 is
-`47a4cec7eb3b19ad68727f557ff47e83f1ef88c791734a76b5bd052d921c9d9d`.
+`e3b60772d2abf33f14e215ba949bca22d16c0f1d8f985cd172b83b422e205126`.
 The v1 parser denies unknown, duplicate, trailing, over-depth, noncanonical,
 and over-cap input. It admits only the official `Qwen/Qwen3.8-27B` model at
 immutable revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, with 29 sorted
@@ -1615,6 +1615,18 @@ The recipe admits exactly the ADR-044 accepted pair:
   `0fa8acc661d0edc60276c43705619fd848682dbf768ced9fe46cd8a572b8043d`;
 - `Qwen3.8-27B-mmproj-F16.gguf`, 927,606,848 bytes, SHA-256
   `6fa039b75244c0a28a013da30b92b1d221c61029acc19f9efa882b75a495b0d0`.
+
+The accepted files embed the source-bound producer banner `hf2q 0.1.6`.
+That banner is an output-determining recipe input, not the identity of a later
+hf2q binary reproducing the bytes. A protected conversion run under hf2q
+0.1.7 exposed the previously omitted input: it produced the correct text
+length and source provenance but changed the banner by one byte and therefore
+failed the pinned digest. Before any public preparation entry point existed,
+the canonical v1 recipe was rebaselined to carry the exact accepted banner.
+The recipe-owned converter consumes it for both GGUFs; the independent
+conversion receipt still records the actual running hf2q version and Git
+commit. Ordinary explicit CLI conversion continues to stamp its running
+package version.
 
 Automatic selection is deliberately closed to the one independently proven
 profile: `aarch64-apple-darwin`, exact chip model `Apple M5 Max`, at least
@@ -1663,7 +1675,7 @@ cannot be paired with a projector artifact or with another recipe.
 Only the sealed source proof, the sealed host proof, and one text plus one
 projector conversion from the same converter identity can mint
 `VerifiedModelPreparation`. Its canonical 1,334-byte v1 receipt has SHA-256
-`5b20ca00d6757b285927e6f464271143e8820b1126ae85bc5786a532374ed69b` and
+`1f6d98b7269c1754d22248136c2793081dd33ed002a13935bde680fa694dffef` and
 binds the recipe/source/profile/converter identities, both accepted artifacts,
 and both exact conversion-receipt SHA-256 values. Its only state is
 `awaiting_runtime_calibration`. Parsing those bytes is structural and cannot
@@ -1783,9 +1795,57 @@ cargo +1.88.0 test --locked --bin hf2q --all-features \
   -- --exact --test-threads=1
 ```
 
-The no-options conversion invocation, source-retention mutation,
-prepared-model registry, and calibration receipt remain pending and must
-consume these proofs rather than reconstructing policy from strings.
+**Landed recipe-owned paired conversion boundary (2026-08-19).** The only
+conversion transition consumes `AuthenticatedModelPreparationSource` and
+repeats the complete offline 29-file source authentication before creating the
+artifact/receipt directories, after text conversion, and after projector
+conversion. It invokes only hf2q's Rust converter with the embedded recipe's
+Q4_K_M text policy, F16 projector mode, and accepted `hf2q 0.1.6` artifact
+banner so later hf2q versions reproduce the exact accepted pair. The general
+CLI keeps its running-version banner and adjacent
+receipt behavior; a crate-private seam places the identical canonical
+schema-v3 receipts at the plan-owned `receipts/<artifact>.receipt.json` paths.
+
+Each role is independently restartable. No existing output converts normally;
+an exact artifact without a receipt is verified and deterministically
+reconverted because its run-observed receipt cannot be reconstructed; an exact
+artifact plus canonical matching receipt is adopted; a receipt without its
+artifact, a malformed pair, a symlink, or a multiply linked file fails closed
+without overwriting that evidence. After both roles finish, both artifact and
+receipt pairs are reopened again, bounded, and cross-bound to exact planned
+paths, bytes, SHA-256 values, quantization, source inventory, converter, and
+role-specific strategy before the host/source/artifact proofs mint
+`ConvertedModelPreparation`.
+
+That non-cloneable result contains the existing canonical preparation receipt
+only as inert in-memory evidence and remains explicitly
+`awaiting_runtime_calibration`. This slice does not persist the pair receipt,
+mutate source retention, write `profile.json`, register or prefer a model,
+calibrate, serve, or add a CLI entry point. Later local-I/O boundaries must
+reopen the pair and source again rather than treating this proof as timeless.
+
+The persistent exact-source/output proof gate is:
+
+```sh
+HF2Q_TEST_QWEN38_CONVERSION=1 \
+HF2Q_TEST_QWEN38_MODELS_ROOT="$HOME/.hf2q/models" \
+cargo +1.88.0 test --release --locked --bin hf2q --all-features \
+  input::hf_download::resolution::payload::source::conversion::tests::current_recipe_converts_and_reopens_the_exact_pair_when_explicitly_requested \
+  -- --exact --test-threads=1
+```
+
+On the Apple M5 Max proof host, hf2q 0.1.7 first exposed the omitted producer
+banner by correctly rejecting its otherwise matching 0.1.7-stamped text output.
+After freezing the accepted 0.1.6 artifact banner in the recipe, an
+empty-output protected run produced and reopened both ADR-044 digests in
+573.12 seconds.
+An immediate fresh-process retry exact-adopted the same four final
+artifact/receipt files in 458.87 seconds without changing any file mtime.
+
+The public no-options conversion invocation, source-retention mutation,
+durable pair receipt/prepared-model registry, and calibration receipt remain
+pending and must consume these proofs rather than reconstructing policy from
+strings.
 
 It executes an hf2q-only resumable plan:
 
@@ -2122,12 +2182,15 @@ before public self-update ships.
    into a recipe-owned resumable source cache and inert transferred-payload
    token; a fourth reopens that exact cache offline and binds every file to
    both Hub identity and the checked-in recipe in a non-cloneable inert source
-   proof. All remain explicitly calibration-pending and inert. Next, embed
-   the real stable root, compile the real
+   proof. A fifth transition consumes that proof into the recipe-owned paired
+   text/projector conversion, exact-adopts only complete roles, reproduces the
+   recipe-frozen producer metadata, reauthenticates the source around both
+   roles, and returns a non-cloneable inert pair. The pair remains explicitly
+   calibration-pending. Next, embed the real stable root, compile the real
    public Team ID, pass the protected positive signing fixture, and compose
-   that recipe into the no-options paired conversion, source-retention
-   transaction, prepared/external artifact provenance, calibration receipt,
-   and session policy. Every schema lands with bounded hostile input and
+   source retention, durable preparation-receipt and prepared-model registry
+   publication, external-artifact provenance, calibration receipt, and session
+   policy. Every schema lands with bounded hostile input and
    golden-byte fixtures; schema parsing alone never creates an authenticated
    or ownership-verified capability.
    Before uninstall implementation, freeze and adversarially test its separate

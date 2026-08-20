@@ -13,7 +13,7 @@ use super::model_recipe::{
 };
 
 const RECIPE_BYTES: &[u8] = include_bytes!("../../data/model-recipes/qwen38-27b-official-v1.json");
-const RECIPE_SHA256: &str = "47a4cec7eb3b19ad68727f557ff47e83f1ef88c791734a76b5bd052d921c9d9d";
+const RECIPE_SHA256: &str = "e3b60772d2abf33f14e215ba949bca22d16c0f1d8f985cd172b83b422e205126";
 
 fn mutated(mutator: impl FnOnce(&mut Value)) -> Vec<u8> {
     let mut value: Value = serde_json::from_slice(RECIPE_BYTES).unwrap();
@@ -28,6 +28,7 @@ fn embedded_recipe_is_exact_canonical_and_binds_accepted_outputs() {
     let recipe = embedded_qwen38_recipe().expect("embedded recipe");
     assert_eq!(recipe.recipe_id(), QWEN38_RECIPE_ID);
     assert_eq!(recipe.recipe_sha256().unwrap(), RECIPE_SHA256);
+    assert_eq!(recipe.producer_version(), "hf2q 0.1.6");
     assert_eq!(recipe.source().repository_id(), "Qwen/Qwen3.8-27B");
     assert_eq!(recipe.source().revision(), QWEN38_ACCEPTED_REVISION);
     assert_eq!(
@@ -60,6 +61,25 @@ fn embedded_recipe_is_exact_canonical_and_binds_accepted_outputs() {
         SourceRetentionChoice::Keep
     );
     assert!(recipe.non_interactive_retention_requires_explicit());
+}
+
+#[test]
+fn recipe_rejects_a_changed_or_unbounded_output_producer_version() {
+    let changed = mutated(|value| {
+        value["conversion"]["producer_version"] = Value::String("hf2q 0.1.7".into());
+    });
+    assert!(matches!(
+        ModelRecipe::parse(&changed),
+        Err(ModelRecipeError::Invalid { .. })
+    ));
+
+    let unknown = mutated(|value| {
+        value["conversion"]["unexpected"] = Value::Bool(true);
+    });
+    assert!(matches!(
+        ModelRecipe::parse(&unknown),
+        Err(ModelRecipeError::Json(_))
+    ));
 }
 
 #[test]
