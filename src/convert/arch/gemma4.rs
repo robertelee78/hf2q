@@ -944,6 +944,7 @@ pub fn build_synthesized_tensors(config: &serde_json::Value) -> Vec<HfTensor> {
         shape: vec![table_len],
         source_dtype: SourceDtype::F32,
         data: values,
+        raw_source: None,
     }]
 }
 

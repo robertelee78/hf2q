@@ -41,7 +41,7 @@
 use std::io::{Seek, SeekFrom, Write};
 
 use super::types::{
-    align_up, write_gguf_string, write_metadata_kv, MetaValue, ALIGNMENT, GGUF_MAGIC, GGUF_VERSION,
+    ALIGNMENT, GGUF_MAGIC, GGUF_VERSION, MetaValue, align_up, write_gguf_string, write_metadata_kv,
 };
 use crate::quantize::ggml_quants::GgmlType;
 
@@ -101,7 +101,10 @@ impl std::fmt::Display for WriterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WriterError::Io(e) => write!(f, "gguf writer I/O: {e}"),
-            WriterError::UnknownTensorIndex { tensor_idx, reserved } => write!(
+            WriterError::UnknownTensorIndex {
+                tensor_idx,
+                reserved,
+            } => write!(
                 f,
                 "stream_tensor_payload tensor_idx {tensor_idx} >= reserved count {reserved}"
             ),
@@ -113,7 +116,11 @@ impl std::fmt::Display for WriterError {
                 f,
                 "finalize: only {streamed} / {reserved} tensors had payloads streamed"
             ),
-            WriterError::PayloadSizeMismatch { tensor_idx, expected, actual } => write!(
+            WriterError::PayloadSizeMismatch {
+                tensor_idx,
+                expected,
+                actual,
+            } => write!(
                 f,
                 "tensor_idx {tensor_idx}: payload size mismatch (expected {expected} bytes, got {actual})"
             ),
@@ -482,6 +489,12 @@ impl<W: Write + Seek> GgufWriter<W> {
     /// that want flush-and-extract should do `finalize` first).
     pub fn into_inner(self) -> W {
         self.writer
+    }
+
+    /// Relative payload offset committed for one tensor, or `None` when the
+    /// index is unknown or its payload has not finished successfully.
+    pub fn tensor_payload_offset(&self, tensor_idx: usize) -> Option<u64> {
+        self.tensor_offsets.get(tensor_idx).copied().flatten()
     }
 
     /// Read-only view of the recorded fixups, for tests + debugging.
