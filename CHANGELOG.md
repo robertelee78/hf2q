@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-08-20
+
 ### Added
 
 - Add a canonical, text-only getting-started guide for the exact
@@ -22,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Accept canonical Hugging Face model IDs and official model/tree/blob/resolve
   URLs at `hf2q convert`, resolving mutable names to an exact commit before
   transfer and recording the normalized identity in conversion receipt v3.
+- Add native Qwen3.8 conversion and Apple-Silicon inference, including the
+  model's hybrid attention graph, multimodal projector path, OpenAI-compatible
+  reasoning/tools, retained-prefix serving, and exact-artifact agentic gates.
+- Add strict signed distribution, activation-state, and update-journal schemas,
+  plus automatic shell completion for the CLI.
 
 ### Changed
 
@@ -33,31 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before transfer, consumes only index-selected safetensors, verifies LFS
   SHA-256 and Git blob SHA-1 identities, and records every selected local
   SHA-256 without granting authority to unrelated cache files.
-
-### Fixed
-
-- Bound DeepSeek-V4's forced-open reasoning before a narrowly constrained
-  single required tool, and align staggered compatible warm-prefill cursors
-  before resuming four-lane cooperative execution. The protected gate proves
-  both transitions without widening the 60/15/35-second product limits.
-- Keep the OpenAI `parallel_tool_calls` omission consistent with hf2q's
-  established single-call default, and stop DeepSeek generation as soon as a
-  constrained non-parallel tool body is accepted. This removes an unused final
-  full-model forward while preserving explicit parallel calls and exact tool
-  semantics.
-
-## [0.1.7] — 2026-08-18
-
-### Added
-
-- Add native Qwen3.8 conversion and Apple-Silicon inference, including the
-  model's hybrid attention graph, multimodal projector path, OpenAI-compatible
-  reasoning/tools, retained-prefix serving, and exact-artifact agentic gates.
-- Add strict signed distribution, activation-state, and update-journal schemas,
-  plus automatic shell completion for the CLI.
-
-### Changed
-
 - Cooperatively execute compatible DeepSeek-V4 warm matrix suffixes across two
   to four live Apple-Silicon sessions. Attention and cache state remain
   sequence-local while the row-local FFN/MoE shares one bounded layer-major
@@ -65,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serial paths. Exact-artifact acceptance prebuilds before thermal settle,
   clears benchmark overrides, derives medians from sealed timing arrays, and
   independently verifies every benchmark, thermal, and production-trace log.
-- Pin published `mlx-native 0.10.12` and use the register-resident,
+- Pin published `mlx-native 0.10.16` and use the register-resident,
   bit-exact GQA-cooperative Q2 TQ-HB attention path behind a measured
   context-length selector. Publication
   requires an exact-source, thermally guarded OFF/AUTO ABBA receipt with at
@@ -82,6 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bound DeepSeek-V4's forced-open reasoning before a narrowly constrained
+  single required tool, and align staggered compatible warm-prefill cursors
+  before resuming four-lane cooperative execution. The protected gate proves
+  both transitions without widening the 60/15/35-second product limits.
+- Keep the OpenAI `parallel_tool_calls` omission consistent with hf2q's
+  established single-call default, and stop DeepSeek generation as soon as a
+  constrained non-parallel tool body is accepted. This removes an unused final
+  full-model forward while preserving explicit parallel calls and exact tool
+  semantics.
 - Bind the DeepSeek four-agent release workload to the exact insertion-ordered
   request, rendered prompt, token IDs, historical tool-result bytes, recovery
   anchor, and continuation suffix. Artifact download revalidates every
