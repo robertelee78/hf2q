@@ -5,14 +5,15 @@
 //! not authenticate bytes, establish package ownership, or authorize a
 //! filesystem mutation.
 
-// Install/update mutation authority remains unreachable from production
-// dispatch until the real trust root and public authority exist. Setup reaches
-// only the read-only state-root/identity verifier below.
+// The small standalone installer/updater is reachable from production dispatch.
+// The older generalized install-state/update-auth/transport experiment remains
+// dormant; setup reaches only its read-only state-root/identity verifier below.
 #[allow(dead_code)]
 pub(crate) mod install_state;
 #[allow(dead_code)]
 mod prepared_release;
 pub mod schema;
+pub(crate) mod standalone;
 #[allow(dead_code)]
 mod update_auth;
 #[allow(dead_code)]

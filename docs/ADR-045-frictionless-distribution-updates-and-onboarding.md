@@ -167,12 +167,16 @@ supporting implementation, not additional user-facing product scope. Prefer
 the smallest design that proves the observable contract.
 
 The first standalone layout is intentionally small. By default it owns only
-these names in `$HOME/.local/bin`:
+these data names in `$HOME/.local/bin`:
 
 - `hf2q`, the active executable and the sole activation point;
 - `.hf2q-standalone.json`, a bounded marker that records only that the
   standalone channel owns this executable path; and
 - `.hf2q-previous`, the one retained executable used by explicit rollback.
+
+A fourth persistent empty file, `.hf2q-standalone.lock`, serializes install,
+update, rollback, and uninstall. Fixed hidden partial names may exist only
+while that lock is held or as recognized crash residue.
 
 The install directory may be overridden explicitly. The marker does not
 duplicate active-version, digest, transition-history, model, or configuration
@@ -322,10 +326,11 @@ The standalone channel retains the previous known-good hf2q version until the
 new version passes validation and activation. Package-manager rollback follows
 the guarantees of that package manager and must be documented truthfully.
 
-For standalone update, the new executable is downloaded to a unique sibling
-temporary file and fully verified before any active-path mutation. The current
+For standalone update, the new executable is downloaded to an OS-managed
+temporary file, bounded and fully verified, then copied to the fixed private
+sibling `.hf2q-candidate.partial` before any active-path mutation. The current
 executable is first retained as `.hf2q-previous`; one same-directory atomic
-rename of the verified candidate over `hf2q` is the activation point. Offline,
+rename of that verified candidate over `hf2q` is the activation point. Offline,
 malformed, corrupt, unsigned, wrong-identity, wrong-target, and interrupted
 pre-activation attempts leave `hf2q` unchanged. An error after the rename is
 reported as activation-possibly-complete and reconciled from the executable
@@ -608,7 +613,10 @@ What exists:
   direct API use, and optional OpenCode;
 - partial dormant distribution/update security infrastructure;
 - a `setup` command that records conversion and serving defaults consumed by
-  the existing commands through a selected state root; and
+  the existing commands through a selected state root;
+- a local standalone installer template, hidden exact-byte bootstrap, public
+  `hf2q update`/`hf2q update --rollback`, and marker-gated
+  `hf2q uninstall --yes` implementation; and
 - dormant model-preparation components created under the prior over-broad ADR
   wording.
 
@@ -620,10 +628,13 @@ and
 The spike proved clean install, exact-byte update, explicit rollback, offline
 failure, corrupt-download failure, interruption before activation, and
 default uninstall preservation of a separate `config.toml` and model file.
-It showed that the active executable plus one channel marker and one retained
-executable are sufficient for the observable standalone lifecycle. It did
-not prove code signing, notarization, public transport, or production update
-code, so the channel remains unavailable.
+It showed that the active executable plus one channel marker, one persistent
+lock, and one retained executable are sufficient for the observable
+standalone lifecycle. The subsequent local implementation adds a canonical
+bounded stable-release record, exact size/SHA verification, same-Developer-ID
+continuity, Gatekeeper assessment, stable-version checks, and the same atomic
+publisher for install and update. It has not yet proved a real signed/notarized
+hf2q artifact or public transport, so the channel remains unavailable.
 
 The unreachable second managed-session store, its runtime authorization, and
 the provisional session-cache setup field have been removed. `hf2q setup` does
@@ -633,7 +644,8 @@ What is not yet the corrected product:
 
 - the live standalone installer at hf2q.us;
 - verified Homebrew/npm/direct user channels;
-- public channel-aware `hf2q update` and `hf2q uninstall`; and
+- published-byte proof for the standalone `update`/`uninstall` commands and
+  package-manager adapters for later channels; and
 - the clean-account installed-artifact acceptance proof.
 
 The remaining dormant components listed above do not become ADR-045

@@ -143,7 +143,7 @@ fn cli_parses_the_closed_noninteractive_surface() {
         "1",
     ];
     let cli = Cli::try_parse_from(raw).unwrap();
-    assert!(crate::invocation_mentions_setup(
+    assert!(crate::invocation_suppresses_completion_reconciliation(
         &raw.into_iter().map(Into::into).collect::<Vec<_>>()
     ));
     let Command::Setup(args) = cli.command else {
@@ -155,17 +155,32 @@ fn cli_parses_the_closed_noninteractive_surface() {
     assert_eq!(args.serve_port, Some(8081));
     assert_eq!(args.serve_scheduler, Some(SchedulerArg::InflightBatched));
     assert_eq!(args.serve_max_slots, Some(1));
-    assert!(crate::invocation_mentions_setup(&[
+    assert!(crate::invocation_suppresses_completion_reconciliation(&[
         "hf2q".into(),
         "setup".into(),
         "--help".into(),
     ]));
-    assert!(crate::invocation_mentions_setup(&[
+    assert!(crate::invocation_suppresses_completion_reconciliation(&[
         "hf2q".into(),
         "setup".into(),
         "--not-a-real-flag".into(),
     ]));
-    assert!(crate::invocation_mentions_setup(&[
+    assert!(crate::invocation_suppresses_completion_reconciliation(&[
+        "hf2q".into(),
+        "__standalone-install".into(),
+        "--help".into(),
+    ]));
+    assert!(crate::invocation_suppresses_completion_reconciliation(&[
+        "hf2q".into(),
+        "update".into(),
+        "--help".into(),
+    ]));
+    assert!(crate::invocation_suppresses_completion_reconciliation(&[
+        "hf2q".into(),
+        "uninstall".into(),
+        "--help".into(),
+    ]));
+    assert!(crate::invocation_suppresses_completion_reconciliation(&[
         "hf2q".into(),
         "--state-root".into(),
         "/tmp/hf2q-state".into(),
@@ -174,12 +189,12 @@ fn cli_parses_the_closed_noninteractive_surface() {
         "-vv".into(),
         "setup".into(),
     ]));
-    assert!(!crate::invocation_mentions_setup(&[
+    assert!(!crate::invocation_suppresses_completion_reconciliation(&[
         "hf2q".into(),
         "info".into(),
         "setup".into(),
     ]));
-    assert!(!crate::invocation_mentions_setup(&[
+    assert!(!crate::invocation_suppresses_completion_reconciliation(&[
         "hf2q".into(),
         "--log-level".into(),
         "setup".into(),

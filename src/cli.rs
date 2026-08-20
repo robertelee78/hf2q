@@ -70,6 +70,16 @@ impl LogLevel {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Internal bootstrap used only by the reviewed standalone installer.
+    #[command(name = "__standalone-install", hide = true)]
+    StandaloneInstall(StandaloneInstallArgs),
+
+    /// Update a standalone installation, or restore its retained previous version.
+    Update(UpdateArgs),
+
+    /// Remove a standalone hf2q executable while preserving config and models.
+    Uninstall(UninstallArgs),
+
     /// Learn this Mac and record defaults used by convert and serve.
     Setup(SetupArgs),
 
@@ -126,6 +136,43 @@ pub enum Command {
     /// surface is a belt-and-suspenders option for operators who feed
     /// hf2q's bundled `tokenizer.json` files to other tools.
     Tokenizer(TokenizerArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct StandaloneInstallArgs {
+    /// Existing canonical user-owned directory that will contain hf2q.
+    #[arg(long, value_name = "ABSOLUTE_PATH")]
+    pub install_dir: PathBuf,
+
+    /// Downloaded candidate executable already accepted by release policy.
+    #[arg(long, value_name = "ABSOLUTE_PATH")]
+    pub candidate: PathBuf,
+
+    /// Exact candidate byte length from the immutable release record.
+    #[arg(long)]
+    pub size: u64,
+
+    /// Exact lowercase SHA-256 from the immutable release record.
+    #[arg(long, value_name = "LOWERCASE_HEX")]
+    pub sha256: String,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct UninstallArgs {
+    /// Confirm removal of the standalone executable and its channel files.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct UpdateArgs {
+    /// Report whether a newer stable standalone release exists without installing it.
+    #[arg(long, conflicts_with = "rollback")]
+    pub check: bool,
+
+    /// Atomically restore the one previous standalone executable.
+    #[arg(long, conflicts_with = "check")]
+    pub rollback: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]

@@ -1,0 +1,86 @@
+#!/bin/sh
+# Generated per immutable hf2q release. Do not publish this template directly.
+set -eu
+
+release_version='@HF2Q_VERSION@'
+release_sha256='@HF2Q_SHA256@'
+release_size='@HF2Q_SIZE@'
+release_team_id='@HF2Q_TEAM_ID@'
+release_identifier='@HF2Q_IDENTIFIER@'
+asset_name='hf2q-aarch64-apple-darwin'
+default_base_url='https://github.com/robertelee78/hf2q/releases/download/v@HF2Q_VERSION@'
+
+fail() {
+  printf 'hf2q installer: %s\n' "$1" >&2
+  exit 1
+}
+
+[ "$(uname -s)" = Darwin ] || fail 'only macOS is supported by this release'
+[ "$(uname -m)" = arm64 ] || fail 'this release requires Apple Silicon (arm64)'
+[ -n "${HOME:-}" ] || fail 'HOME is unavailable; set HF2Q_INSTALL_DIR explicitly'
+
+install_dir=${HF2Q_INSTALL_DIR:-"$HOME/.local/bin"}
+case "$install_dir" in
+  /*) ;;
+  *) fail 'HF2Q_INSTALL_DIR must be an absolute path' ;;
+esac
+
+umask 077
+mkdir -p "$install_dir"
+install_dir=$(cd "$install_dir" && pwd -P)
+base_url=${HF2Q_RELEASE_BASE_URL:-$default_base_url}
+asset_url="$base_url/$asset_name"
+candidate=$(mktemp "$install_dir/.hf2q-download.XXXXXX")
+cleanup() {
+  rm -f "$candidate"
+}
+trap cleanup EXIT HUP INT TERM
+
+curl -fsSL --proto '=https,file' --proto-redir '=https' --tlsv1.2 "$asset_url" -o "$candidate" \
+  || fail 'download failed; the existing installation was not changed'
+
+actual_size=$(stat -f '%z' "$candidate")
+[ "$actual_size" = "$release_size" ] \
+  || fail 'downloaded byte length does not match the immutable release'
+actual_sha256=$(shasum -a 256 "$candidate" | awk '{print $1}')
+[ "$actual_sha256" = "$release_sha256" ] \
+  || fail 'downloaded SHA-256 does not match the immutable release'
+
+if [ "${HF2Q_INSTALL_TEST_MODE:-0}" = 1 ]; then
+  case "$asset_url" in
+    file://*) ;;
+    *) fail 'test mode is restricted to an exact local file:// fixture' ;;
+  esac
+else
+  /usr/bin/codesign --verify --strict --verbose=2 "$candidate" >/dev/null 2>&1 \
+    || fail 'Apple code-signature verification failed'
+  signing_info=$(/usr/bin/codesign --display --verbose=4 "$candidate" 2>&1) \
+    || fail 'Apple signing identity could not be read'
+  printf '%s\n' "$signing_info" | grep -qx "TeamIdentifier=$release_team_id" \
+    || fail 'Apple Developer ID team does not match this hf2q release'
+  printf '%s\n' "$signing_info" | grep -qx "Identifier=$release_identifier" \
+    || fail 'Apple signing identifier does not match this hf2q release'
+  /usr/sbin/spctl --assess --type execute "$candidate" >/dev/null 2>&1 \
+    || fail 'Gatekeeper did not accept the notarized hf2q release'
+fi
+
+chmod 0555 "$candidate"
+[ "$(HF2Q_NO_COMPLETION_INSTALL=1 "$candidate" --version)" = "hf2q $release_version" ] \
+  || fail 'candidate version does not match the immutable release'
+
+"$candidate" __standalone-install \
+  --install-dir "$install_dir" \
+  --candidate "$candidate" \
+  --size "$release_size" \
+  --sha256 "$release_sha256"
+
+case ":${PATH:-}:" in
+  *:"$install_dir":*) ;;
+  *)
+    # The printed $PATH is an operator command, not installer expansion.
+    # shellcheck disable=SC2016
+    printf '\nAdd hf2q to this shell with:\n  export PATH="%s:$PATH"\n' "$install_dir"
+    ;;
+esac
+
+printf '\nNext: hf2q setup\n'

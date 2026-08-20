@@ -64,6 +64,9 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/progress.rs      indicatif-based progress reporting
 ├── src/gguf_patch.rs    metadata-only GGUF rewriter (no tensor I/O)
 ├── src/distribution/   ADR-045 release/install bounded context
+│   ├── standalone.rs  reachable single-binary lifecycle: channel marker,
+│   │   └── update.rs  stable record, exact download, Apple trust continuity,
+│   │                  Gatekeeper, rollback, and atomic local publication
 │   ├── schema/         strict bounded manifest, receipt, marker schemas;
 │                       marker v2 records exact preparation-role versions and
 │                       deterministically reconstructs first-install receipts

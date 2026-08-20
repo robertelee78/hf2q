@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add the first reachable standalone lifecycle: a generated exact-release
+  installer, canonical channel marker, atomic executable replacement, one
+  retained rollback version, `hf2q update`, and marker-gated
+  `hf2q uninstall --yes`. The public installer stays unavailable until the
+  signed/notarized artifact and live stable record pass release gates.
+
 ### Changed
 
 - Replace the provisional session-cache-only setup schema with canonical

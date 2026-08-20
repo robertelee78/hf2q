@@ -591,7 +591,14 @@ jobs:
             src/setup/defaults_contract_tests.rs \
             src/setup/testdata/config_v2.toml \
             src/distribution/mod.rs \
+            src/distribution/standalone.rs \
+            src/distribution/standalone/update.rs \
+            src/distribution/standalone_tests.rs \
             src/distribution/install_state/identity.rs \
+            scripts/install.sh.in \
+            scripts/render_standalone_installer.sh \
+            scripts/render_standalone_release_record.sh \
+            scripts/test_standalone_installer.sh \
             Cargo.toml \
             Cargo.lock \
             src/main.rs \
@@ -631,6 +638,8 @@ jobs:
           cargo test --locked --bin hf2q --all-features distribution::update_auth:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features distribution::update_transport:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features distribution::prepared_release:: -- --test-threads=1
+          cargo test --locked --bin hf2q --all-features distribution::standalone:: -- --test-threads=1
+          scripts/test_standalone_installer.sh
           cargo test --locked --bin hf2q --all-features setup:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features tests::convert_config_quant_is_used_and_explicit_quant_wins -- --exact
           cargo test --locked --bin hf2q --all-features tests::invalid_operator_config_fails_before_convert_source_or_serve_bind -- --exact
@@ -641,6 +650,9 @@ jobs:
           hf_source_tests="$(cargo test --locked --bin hf2q --all-features -- --list)"
           for required_test in \
             cli::tests::getting_started_qwen38_commands_parse_exactly \
+            distribution::standalone::tests::standalone_lifecycle_installs_updates_rolls_back_and_preserves_operator_state \
+            distribution::standalone::tests::standalone_installer_bootstrap_surface_is_hidden_bounded_and_parseable \
+            distribution::standalone::update::tests::stable_release_record_is_small_canonical_and_exact \
             setup::defaults_contract_tests::operator_config_v2_is_canonical_strict_and_uses_the_guide_defaults \
             setup::defaults_contract_tests::operator_config_v2_rejects_incoherent_fifo_slots_and_invalid_quant \
             setup::defaults_contract_tests::absent_operator_config_preserves_existing_command_behavior_without_claiming_root_authority \
