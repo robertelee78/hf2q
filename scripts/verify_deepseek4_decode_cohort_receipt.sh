@@ -104,8 +104,8 @@ jq -e --slurpfile raw "$raw" \
     and .settle_telemetry_gaps == 0 and .telemetry_gaps == 0
   ' "$summary" >/dev/null
 
-rg -Fq 'official_artifact_b4_decode_body_is_exact_and_measured ... ok' "$test_log"
-rg -Fq 'exact_state_logits_cache_recurrent=true' "$test_log"
+grep -Fq 'official_artifact_b4_decode_body_is_exact_and_measured ... ok' "$test_log"
+grep -Fq 'exact_state_logits_cache_recurrent=true' "$test_log"
 
 thermal_validate_measurement_log "$measurement_log" 5
 test "$THERMAL_LOG_SAMPLES" = "$(jq -er .measurement_samples "$summary")"
