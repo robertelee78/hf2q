@@ -1,7 +1,7 @@
 //! Checked, base-text-only cache preparation for the source-BF16 teacher.
 //!
-//! It owns one fresh F32 cache with one sequence, no MTP, TQ, capture, raw
-//! cache accessor, or graph-execution claim.
+//! It owns one fresh F32 cache with one sequence and no MTP, TQ, or capture;
+//! only the private test parity harness can consume its raw cache.
 
 use anyhow::{ensure, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
@@ -122,8 +122,7 @@ impl Qwen35BaseTextCacheReceiptV1 {
     }
 }
 
-/// Opaque owner of the fresh cache. A later runner slice will add the only
-/// consuming execution transition; this slice exposes no cache or buffer.
+/// Opaque production owner; execution remains a later consuming transition.
 pub(in crate::inference::models::qwen35) struct PreparedQwen35BaseTextCacheV1 {
     cache: HybridKvCache,
     receipt: Qwen35BaseTextCacheReceiptV1,
@@ -132,6 +131,11 @@ pub(in crate::inference::models::qwen35) struct PreparedQwen35BaseTextCacheV1 {
 impl PreparedQwen35BaseTextCacheV1 {
     pub(in crate::inference::models::qwen35) fn receipt(&self) -> &Qwen35BaseTextCacheReceiptV1 {
         &self.receipt
+    }
+
+    #[cfg(test)]
+    pub(in crate::inference::models::qwen35) fn into_cache(self) -> HybridKvCache {
+        self.cache
     }
 }
 

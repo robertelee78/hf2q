@@ -34,6 +34,10 @@ printf 'converted model\n' >"$state_root/models/model.gguf"
 expected_record=$(printf '{"kind":"hf2q.standalone-release","schema_version":1,"package":"hf2q","channel":"stable","target":"aarch64-apple-darwin","version":"%s","size":%s,"sha256":"%s"}' "$version" "$size" "$sha256")
 [[ $(cat "$release_record") == "$expected_record" ]]
 [[ $(stat -f '%Lp' "$release_record") == 444 ]]
+# shellcheck disable=SC2016
+grep -Fq '[ "$(/usr/bin/lipo -archs "$candidate" 2>/dev/null)" = arm64 ]' \
+  "$TEMPLATE"
+grep -Fq "[ \"\$macos_major\" -ge 14 ]" "$TEMPLATE"
 
 "$RENDER" "$TEMPLATE" "$installer" "$version" "$size" "$sha256" ABCDE12345 us.hf2q.cli >/dev/null
 

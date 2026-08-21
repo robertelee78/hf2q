@@ -69,7 +69,8 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/distribution/   ADR-045 release/install bounded context
 │   ├── standalone.rs  reachable single-binary lifecycle: channel marker,
 │   │   └── update.rs  stable record, exact download, Apple trust continuity,
-│   │                  Gatekeeper, rollback, and atomic local publication
+│   │                  thin-arm64 proof, Gatekeeper, rollback, and atomic
+│   │                  local publication
 │   ├── schema/         strict bounded manifest, receipt, marker schemas;
 │                       marker v2 records exact preparation-role versions and
 │                       deterministically reconstructs first-install receipts
@@ -99,6 +100,14 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │                       checked signed-mode normalization and dormant first-
 │                       install publication; no activation, update, or CLI
 │                       authority
+│
+├── .github/workflows/cache-lifecycle.yml
+│                       exact packed build → protected ephemeral Developer ID
+│                       sign/notary → no-secret cross-family hardware proof of
+│                       the exact signed standalone bytes
+├── .github/workflows/release.yml
+│                       exact-SHA proof consumer, complete immutable draft,
+│                       crate publication, public-byte and clean-prefix proof
 │
 ├── src/arch/            ADR-012 arch registry (single source of truth)
 │   ├── catalog.rs       TensorCatalog — expected tensor names + dtypes

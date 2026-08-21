@@ -1,11 +1,12 @@
 //! Runtime consumption of the canonical dense-Qwen execution configuration.
 //!
 //! Ordinary Qwen execution retains the legacy environment-backed mlx-native
-//! entrypoints.  The evidence-bearing candidate enters a scoped configuration
-//! which routes every dense GGML projection through the exact resolved policy
-//! and freezes the graph switches covered by the profile.  The scope is
-//! thread-local because Qwen's Metal cache and forward loop are themselves
-//! thread-local; it never confers runtime or solver authority by itself.
+//! entrypoints. The evidence-bearing copied-GGML candidate enters a scoped
+//! configuration which routes every dense GGML projection through the exact
+//! resolved policy. The private source-BF16 runner instead enters a distinct
+//! fixed graph scope which rejects GGML dispatch. Both scopes are thread-local
+//! because Qwen's Metal cache and forward loop are themselves thread-local;
+//! neither confers runtime or solver authority by itself.
 
 use anyhow::{bail, Result};
 use serde::Serialize;
@@ -24,6 +25,13 @@ use mlx_native::{
 
 use super::execution_config::{Qwen35ExecutionConfiguration, Qwen35GateUpPolicy};
 
+mod source_scope;
+
+#[allow(unused_imports)] // exercised by the cfg(test)-only source parity harness
+pub(super) use source_scope::{
+    source_teacher_graph_policy_sha256, with_source_teacher_graph_scope,
+};
+
 thread_local! {
     static ACTIVE_CONFIGURATION: RefCell<Option<ActiveExecutionState>> =
         const { RefCell::new(None) };
@@ -35,9 +43,12 @@ struct TraceCaptureState {
     observations: Vec<Qwen35EncodedDispatchObservation>,
 }
 
-struct ActiveExecutionState {
-    configuration: Qwen35ExecutionConfiguration,
-    trace_capture: Option<TraceCaptureState>,
+enum ActiveExecutionState {
+    CopiedGgml {
+        configuration: Qwen35ExecutionConfiguration,
+        trace_capture: Option<TraceCaptureState>,
+    },
+    SourceTeacher,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,9 +64,9 @@ pub(crate) struct Qwen35TraceWeightSlot {
     pub executed_tensor_node_id: String,
 }
 
-struct ActiveConfigurationGuard;
+struct ActiveExecutionGuard;
 
-impl Drop for ActiveConfigurationGuard {
+impl Drop for ActiveExecutionGuard {
     fn drop(&mut self) {
         ACTIVE_CONFIGURATION.with(|slot| {
             slot.replace(None);
@@ -72,13 +83,25 @@ pub(super) fn with_execution_configuration<T>(
         if slot.borrow().is_some() {
             bail!("nested Qwen evidence execution configuration is not admitted");
         }
-        slot.replace(Some(ActiveExecutionState {
+        slot.replace(Some(ActiveExecutionState::CopiedGgml {
             configuration: configuration.clone(),
             trace_capture: None,
         }));
         Ok(())
     })?;
-    let _guard = ActiveConfigurationGuard;
+    let _guard = ActiveExecutionGuard;
+    operation()
+}
+
+fn with_source_teacher_graph_scope_inner<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    ACTIVE_CONFIGURATION.with(|slot| -> Result<()> {
+        if slot.borrow().is_some() {
+            bail!("nested Qwen execution scope is not admitted");
+        }
+        slot.replace(Some(ActiveExecutionState::SourceTeacher));
+        Ok(())
+    })?;
+    let _guard = ActiveExecutionGuard;
     operation()
 }
 
@@ -93,7 +116,7 @@ pub(super) fn with_execution_trace_capture<T>(
         if slot.borrow().is_some() {
             bail!("nested Qwen evidence execution configuration is not admitted");
         }
-        slot.replace(Some(ActiveExecutionState {
+        slot.replace(Some(ActiveExecutionState::CopiedGgml {
             configuration: configuration.clone(),
             trace_capture: Some(TraceCaptureState {
                 weight_slots,
@@ -103,12 +126,15 @@ pub(super) fn with_execution_trace_capture<T>(
         }));
         Ok(())
     })?;
-    let guard = ActiveConfigurationGuard;
+    let guard = ActiveExecutionGuard;
     let value = operation()?;
     let state = ACTIVE_CONFIGURATION.with(|slot| slot.replace(None));
     std::mem::forget(guard);
     let observations = state
-        .and_then(|state| state.trace_capture)
+        .and_then(|state| match state {
+            ActiveExecutionState::CopiedGgml { trace_capture, .. } => trace_capture,
+            ActiveExecutionState::SourceTeacher => None,
+        })
         .map(|capture| capture.observations)
         .ok_or_else(|| anyhow::anyhow!("Qwen trace capture state disappeared"))?;
     Ok((value, observations))
@@ -151,6 +177,25 @@ fn fused_gate_up_operation_id(
     ))
 }
 
+fn reject_source_teacher_quantized_dispatch(
+    active: Option<&ActiveExecutionState>,
+    operation: &str,
+) -> mlx_native::Result<()> {
+    if matches!(active, Some(ActiveExecutionState::SourceTeacher)) {
+        Err(MlxError::InvalidArgument(format!(
+            "source-teacher graph scope forbids {operation}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn require_quantized_dispatch_for_test(operation: &str) -> mlx_native::Result<()> {
+    ACTIVE_CONFIGURATION
+        .with(|slot| reject_source_teacher_quantized_dispatch(slot.borrow().as_ref(), operation))
+}
+
 macro_rules! define_fused_gate_up_wrapper {
     ($name:ident, $normal:path, $traced:path, $args:path) => {
         #[allow(clippy::too_many_arguments)]
@@ -166,8 +211,12 @@ macro_rules! define_fused_gate_up_wrapper {
         ) -> mlx_native::Result<()> {
             ACTIVE_CONFIGURATION.with(|slot| {
                 let mut active = slot.borrow_mut();
-                if let Some(active) = active.as_mut() {
-                    if let Some(capture) = active.trace_capture.as_mut() {
+                if let Some(ActiveExecutionState::CopiedGgml {
+                    configuration,
+                    trace_capture,
+                }) = active.as_mut()
+                {
+                    if let Some(capture) = trace_capture.as_mut() {
                         let (operation_id, executed_tensor_node_ids) =
                             fused_gate_up_operation_id(capture, gate, up)?;
                         let workload = capture.workload.clone();
@@ -180,7 +229,7 @@ macro_rules! define_fused_gate_up_wrapper {
                             input,
                             output,
                             args,
-                            active.configuration.ggml_routing_policy(),
+                            configuration.ggml_routing_policy(),
                             workload,
                         )?;
                         capture.observations.push(Qwen35EncodedDispatchObservation {
@@ -193,6 +242,10 @@ macro_rules! define_fused_gate_up_wrapper {
                         $normal(encoder, registry, device, gate, up, input, output, args)
                     }
                 } else {
+                    reject_source_teacher_quantized_dispatch(
+                        active.as_ref(),
+                        "fused quantized gate/up dispatch",
+                    )?;
                     $normal(encoder, registry, device, gate, up, input, output, args)
                 }
             })
@@ -248,8 +301,12 @@ pub(super) fn quantized_matmul_ggml(
 ) -> mlx_native::Result<()> {
     ACTIVE_CONFIGURATION.with(|slot| {
         let mut active = slot.borrow_mut();
-        if let Some(active) = active.as_mut() {
-            if let Some(capture) = active.trace_capture.as_mut() {
+        if let Some(ActiveExecutionState::CopiedGgml {
+            configuration,
+            trace_capture,
+        }) = active.as_mut()
+        {
+            if let Some(capture) = trace_capture.as_mut() {
                 let weight_slot = capture
                     .weight_slots
                     .get(&buffer_key(weight))
@@ -267,7 +324,7 @@ pub(super) fn quantized_matmul_ggml(
                     weight,
                     output,
                     params,
-                    active.configuration.ggml_routing_policy(),
+                    configuration.ggml_routing_policy(),
                     capture.workload.clone(),
                 )?;
                 capture.observations.push(Qwen35EncodedDispatchObservation {
@@ -285,10 +342,11 @@ pub(super) fn quantized_matmul_ggml(
                     weight,
                     output,
                     params,
-                    active.configuration.ggml_routing_policy(),
+                    configuration.ggml_routing_policy(),
                 )
             }
         } else {
+            reject_source_teacher_quantized_dispatch(active.as_ref(), "GGML projection dispatch")?;
             legacy_quantized_matmul_ggml(encoder, registry, device, input, weight, output, params)
         }
     })
@@ -298,9 +356,12 @@ pub(super) fn dense_gate_up_fusion_enabled() -> bool {
     ACTIVE_CONFIGURATION.with(|slot| {
         slot.borrow()
             .as_ref()
-            .map(|active| {
-                active.configuration.dense_ffn_gate_up()
-                    == Qwen35GateUpPolicy::PreferFusedWhenSupported
+            .map(|active| match active {
+                ActiveExecutionState::CopiedGgml { configuration, .. } => {
+                    configuration.dense_ffn_gate_up()
+                        == Qwen35GateUpPolicy::PreferFusedWhenSupported
+                }
+                ActiveExecutionState::SourceTeacher => false,
             })
             .unwrap_or_else(|| {
                 !matches!(

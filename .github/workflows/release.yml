@@ -21,7 +21,9 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ inputs.version }}
+  # The standalone stable locator is global, so stable releases must never
+  # race merely because their version strings differ.
+  group: release-stable
   cancel-in-progress: false
 
 jobs:
@@ -679,7 +681,81 @@ jobs:
             "$manifest" >/dev/null
           expected_crate_sha=$(jq -er '.crate_sha256' "$manifest")
           [[ "$expected_crate_sha" =~ ^[0-9a-f]{64}$ ]]
+          standalone_dir="$gate_dir/standalone"
+          for required in \
+            hf2q-aarch64-apple-darwin \
+            hf2q-aarch64-apple-darwin.sha256 \
+            proof.json \
+            notary-submission.json \
+            notary-wait.json \
+            notary-log.json \
+            codesign.txt \
+            gatekeeper.txt; do
+            test -f "$standalone_dir/$required"
+            test ! -L "$standalone_dir/$required"
+          done
+          test "$(find "$standalone_dir" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 8
+          standalone_proof="$standalone_dir/proof.json"
+          standalone_binary="$standalone_dir/hf2q-aarch64-apple-darwin"
+          chmod 0555 "$standalone_binary"
+          standalone_sha=$(jq -er .asset.sha256 "$standalone_proof")
+          standalone_size=$(jq -er .asset.size "$standalone_proof")
+          standalone_team=$(jq -er .signing.team_id "$standalone_proof")
+          standalone_identifier=$(jq -er .signing.identifier "$standalone_proof")
+          jq -e \
+            --arg source_sha "$EXPECTED_SHA" \
+            --arg version "$EXPECTED_VERSION" \
+            --arg binary_sha "$(jq -er .binary_sha256 "$manifest")" '
+              .kind == "hf2q.standalone-apple-release-proof"
+              and .schema_version == 1
+              and .package == "hf2q"
+              and .source_sha == $source_sha
+              and .version == $version
+              and .target == "aarch64-apple-darwin"
+              and .asset.name == "hf2q-aarch64-apple-darwin"
+              and .asset.sha256 == $binary_sha
+              and (.asset.size | type) == "number"
+              and .asset.size > 0
+              and (.signing.team_id | test("^[A-Z0-9]{10}$"))
+              and .signing.identifier == "us.hf2q.cli"
+              and .signing.hardened_runtime == true
+              and .signing.secure_timestamp == true
+              and .notarization.status == "Accepted"
+              and .notarization.standalone_ticket_stapled == false
+              and .verification.codesign == "accepted"
+              and .verification.gatekeeper == "Notarized Developer ID"
+            ' "$standalone_proof" >/dev/null
+          for pair in \
+            "notary-submission.json:.notarization.submission_sha256" \
+            "notary-wait.json:.notarization.wait_sha256" \
+            "notary-log.json:.notarization.log_sha256" \
+            "codesign.txt:.verification.codesign_log_sha256" \
+            "gatekeeper.txt:.verification.gatekeeper_log_sha256"; do
+            file=${pair%%:*}
+            selector=${pair#*:}
+            test "$(shasum -a 256 "$standalone_dir/$file" | awk '{print $1}')" = \
+              "$(jq -er "$selector" "$standalone_proof")"
+          done
+          test "$(shasum -a 256 "$standalone_binary" | awk '{print $1}')" = "$standalone_sha"
+          test "$(stat -f '%z' "$standalone_binary")" = "$standalone_size"
+          test "$(awk 'NF {print $1}' "$standalone_dir/hf2q-aarch64-apple-darwin.sha256")" = \
+            "$standalone_sha"
+          test "$(awk 'NF {print $2}' "$standalone_dir/hf2q-aarch64-apple-darwin.sha256")" = \
+            hf2q-aarch64-apple-darwin
+          test "$(/usr/bin/lipo -archs "$standalone_binary")" = arm64
+          test "$(/usr/bin/vtool -show-build "$standalone_binary" | awk '$1 == "minos" {print $2}')" = 14.0
+          /usr/bin/codesign --verify --strict --all-architectures "$standalone_binary"
+          /usr/sbin/spctl --assess --type execute "$standalone_binary"
+          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$standalone_binary" --version)" = \
+            "hf2q $EXPECTED_VERSION"
           echo "EXPECTED_CRATE_SHA256=$expected_crate_sha" >> "$GITHUB_ENV"
+          {
+            printf 'STANDALONE_RELEASE_DIR=%s\n' "$standalone_dir"
+            printf 'STANDALONE_BINARY_SHA256=%s\n' "$standalone_sha"
+            printf 'STANDALONE_BINARY_SIZE=%s\n' "$standalone_size"
+            printf 'STANDALONE_TEAM_ID=%s\n' "$standalone_team"
+            printf 'STANDALONE_IDENTIFIER=%s\n' "$standalone_identifier"
+          } >> "$GITHUB_ENV"
 
       - name: Toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -738,6 +814,7 @@ jobs:
             cargo test --locked --bin hf2q --all-features distribution::prepared_release:: -- --test-threads=1
             cargo test --locked --bin hf2q --all-features distribution::standalone:: -- --test-threads=1
             scripts/test_standalone_installer.sh
+            scripts/test_standalone_release_signing_contract.sh
             cargo test --locked --bin hf2q --all-features setup:: -- --test-threads=1
             cargo test --locked --bin hf2q --all-features tests::convert_config_quant_is_used_and_explicit_quant_wins -- --exact
             cargo test --locked --bin hf2q --all-features tests::invalid_operator_config_fails_before_convert_source_or_serve_bind -- --exact
@@ -1218,7 +1295,9 @@ jobs:
               scripts/install.sh.in \
               scripts/render_standalone_installer.sh \
               scripts/render_standalone_release_record.sh \
+              scripts/sign_notarize_standalone_release.sh \
               scripts/test_standalone_installer.sh \
+              scripts/test_standalone_release_signing_contract.sh \
               Cargo.toml \
               Cargo.lock \
               src/main.rs \
@@ -1245,6 +1324,7 @@ jobs:
               distribution::standalone::tests::standalone_lifecycle_installs_updates_rolls_back_and_preserves_operator_state \
               distribution::standalone::tests::standalone_installer_bootstrap_surface_is_hidden_bounded_and_parseable \
               distribution::standalone::update::tests::stable_release_record_is_small_canonical_and_exact \
+              distribution::standalone::update::tests::standalone_candidate_architecture_is_exactly_thin_arm64 \
               setup::defaults_contract_tests::operator_config_v2_is_canonical_strict_and_uses_the_guide_defaults \
               setup::defaults_contract_tests::operator_config_v2_rejects_incoherent_fifo_slots_and_invalid_quant \
               setup::defaults_contract_tests::absent_operator_config_preserves_existing_command_behavior_without_claiming_root_authority \
@@ -1400,6 +1480,8 @@ jobs:
               scripts/test_release_dependency_provenance_contract.sh \
               scripts/seal_release_binary.sh \
               scripts/test_release_binary_seal_contract.sh \
+              scripts/sign_notarize_standalone_release.sh \
+              scripts/test_standalone_release_signing_contract.sh \
               scripts/run_release_gate_process_group.sh \
               scripts/test_release_gate_process_group_contract.sh \
               scripts/ensure_github_release_tag.sh \
@@ -1422,6 +1504,7 @@ jobs:
             bash scripts/test_qwen38_long_decode_receipt_contract.sh
             bash scripts/test_release_dependency_provenance_contract.sh
             bash scripts/test_release_binary_seal_contract.sh
+            bash scripts/test_standalone_release_signing_contract.sh
             bash scripts/test_release_gate_process_group_contract.sh
             bash scripts/test_release_tag_recovery_contract.sh
             bash scripts/test_gemma4_long_short_overlap_contract.sh
@@ -1446,6 +1529,137 @@ jobs:
             --locked \
             --root "$install_root"
           "$install_root/bin/hf2q" --help >/dev/null
+
+      - name: Prepare and locally prove standalone release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          standalone_stage=$(mktemp -d "$RUNNER_TEMP/hf2q-standalone-release.XXXXXX")
+          source_dir=${STANDALONE_RELEASE_DIR:?STANDALONE_RELEASE_DIR is required}
+          binary="$standalone_stage/hf2q-aarch64-apple-darwin"
+          cp "$source_dir/hf2q-aarch64-apple-darwin" "$binary"
+          chmod 0555 "$binary"
+          cp "$source_dir/hf2q-aarch64-apple-darwin.sha256" \
+            "$standalone_stage/hf2q-aarch64-apple-darwin.sha256"
+          cp "$source_dir/proof.json" \
+            "$standalone_stage/hf2q-aarch64-apple-darwin.proof.json"
+          cp "$source_dir/notary-log.json" \
+            "$standalone_stage/hf2q-aarch64-apple-darwin.notary-log.json"
+          test "$(shasum -a 256 "$binary" | awk '{print $1}')" = \
+            "$STANDALONE_BINARY_SHA256"
+          test "$(stat -f '%z' "$binary")" = "$STANDALONE_BINARY_SIZE"
+          test "$(/usr/bin/lipo -archs "$binary")" = arm64
+          test "$(/usr/bin/vtool -show-build "$binary" | awk '$1 == "minos" {print $2}')" = 14.0
+          /usr/bin/codesign --verify --strict --all-architectures "$binary"
+          /usr/sbin/spctl --assess --type execute "$binary"
+          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$binary" --version)" = \
+            "hf2q $EXPECTED_VERSION"
+
+          scripts/render_standalone_release_record.sh \
+            "$standalone_stage/stable-aarch64-apple-darwin.json" \
+            "$EXPECTED_VERSION" "$STANDALONE_BINARY_SIZE" \
+            "$STANDALONE_BINARY_SHA256"
+          scripts/render_standalone_installer.sh \
+            scripts/install.sh.in "$standalone_stage/install.sh" \
+            "$EXPECTED_VERSION" "$STANDALONE_BINARY_SIZE" \
+            "$STANDALONE_BINARY_SHA256" "$STANDALONE_TEAM_ID" \
+            "$STANDALONE_IDENTIFIER"
+
+          proof_home=$(mktemp -d "$RUNNER_TEMP/hf2q-standalone-install-home.XXXXXX")
+          proof_install="$proof_home/.local/bin"
+          proof_state="$proof_home/.hf2q"
+          mkdir -p "$proof_state/models"
+          printf 'operator config\n' > "$proof_state/config.toml"
+          printf 'converted model\n' > "$proof_state/models/model.gguf"
+          curl -fsSL "file://$standalone_stage/install.sh" | \
+            HOME="$proof_home" \
+            HF2Q_INSTALL_DIR="$proof_install" \
+            HF2Q_RELEASE_BASE_URL="file://$standalone_stage" \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            sh >/dev/null
+          test "$(shasum -a 256 "$proof_install/hf2q" | awk '{print $1}')" = \
+            "$STANDALONE_BINARY_SHA256"
+          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$proof_install/hf2q" --version)" = \
+            "hf2q $EXPECTED_VERSION"
+          "$proof_install/hf2q" uninstall --yes >/dev/null
+          test ! -e "$proof_install/hf2q"
+          test -f "$proof_state/config.toml"
+          test -f "$proof_state/models/model.gguf"
+          echo "STANDALONE_STAGE=$standalone_stage" >> "$GITHUB_ENV"
+
+      - name: Create draft release and attach exact assets once
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${EXPECTED_VERSION}"
+          bash scripts/ensure_github_release_tag.sh \
+            "$GITHUB_REPOSITORY" "$tag" "$EXPECTED_SHA"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --target "$EXPECTED_SHA" \
+              --title "hf2q ${EXPECTED_VERSION}" \
+              --generate-notes \
+              --draft \
+              --verify-tag
+          fi
+          release_json=$(gh release view "$tag" --json isDraft,targetCommitish)
+          test "$(jq -r .targetCommitish <<<"$release_json")" = "$EXPECTED_SHA"
+          is_draft=$(jq -r .isDraft <<<"$release_json")
+
+          ensure_exact_asset() {
+            local asset=$1
+            local name directory
+            name=$(basename "$asset")
+            directory=$(mktemp -d "$RUNNER_TEMP/hf2q-existing-asset.XXXXXX")
+            if gh release download "$tag" --pattern "$name" --dir "$directory" \
+              >/dev/null 2>&1; then
+              cmp -s "$asset" "$directory/$name" || {
+                echo "published release asset differs from candidate: $name" >&2
+                return 1
+              }
+            else
+              test "$is_draft" = true || {
+                echo "published release is missing immutable asset: $name" >&2
+                return 1
+              }
+              gh release upload "$tag" "$asset"
+            fi
+          }
+
+          for asset in \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin" \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.sha256" \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.proof.json" \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json" \
+            "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json" \
+            "$STANDALONE_STAGE/install.sh" \
+            "target/package/hf2q-${EXPECTED_VERSION}.crate" \
+            "$RUNNER_TEMP/release-crate.sha256"; do
+            ensure_exact_asset "$asset"
+          done
+
+      - name: Verify every draft release asset from a fresh download
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${EXPECTED_VERSION}"
+          release_dir=$(mktemp -d "$RUNNER_TEMP/hf2q-draft-release.XXXXXX")
+          gh release download "$tag" --dir "$release_dir"
+          for asset in \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin" \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.sha256" \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.proof.json" \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json" \
+            "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json" \
+            "$STANDALONE_STAGE/install.sh" \
+            "target/package/hf2q-${EXPECTED_VERSION}.crate" \
+            "$RUNNER_TEMP/release-crate.sha256"; do
+            cmp -s "$asset" "$release_dir/$(basename "$asset")"
+          done
 
       - name: Publish exact package
         shell: bash
@@ -1499,46 +1713,84 @@ jobs:
             --root "$install_root"
           "$install_root/bin/hf2q" --help >/dev/null
 
-      - name: Tag and create GitHub release
+      - name: Publish the complete GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="v${EXPECTED_VERSION}"
-          bash scripts/ensure_github_release_tag.sh \
-            "$GITHUB_REPOSITORY" "$tag" "$EXPECTED_SHA"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" \
-              --target "$EXPECTED_SHA" \
-              --title "hf2q ${EXPECTED_VERSION}" \
-              --generate-notes \
-              --verify-tag
+          release_json=$(gh release view "$tag" --json isDraft,targetCommitish)
+          test "$(jq -r .targetCommitish <<<"$release_json")" = "$EXPECTED_SHA"
+          if [[ $(jq -r .isDraft <<<"$release_json") == true ]]; then
+            gh release edit "$tag" --draft=false
           fi
-          test "$(gh release view "$tag" --json targetCommitish --jq .targetCommitish)" = "$EXPECTED_SHA"
-          gh release upload "$tag" \
-            "target/package/hf2q-${EXPECTED_VERSION}.crate" \
-            "$RUNNER_TEMP/release-crate.sha256" \
-            --clobber
+          release_json=$(gh release view "$tag" --json isDraft,targetCommitish)
+          test "$(jq -r .targetCommitish <<<"$release_json")" = "$EXPECTED_SHA"
+          test "$(jq -r .isDraft <<<"$release_json")" = false
 
-      - name: Verify GitHub release bytes
+      - name: Verify public GitHub release bytes and clean-prefix install
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="v${EXPECTED_VERSION}"
-          expected=$(awk '{print $1}' "$RUNNER_TEMP/release-crate.sha256")
-          release_dir="$RUNNER_TEMP/github-release"
-          mkdir -p "$release_dir"
-          gh release download "$tag" \
-            --pattern "hf2q-${EXPECTED_VERSION}.crate" \
-            --pattern "release-crate.sha256" \
-            --dir "$release_dir"
-          actual=$(shasum -a 256 "$release_dir/hf2q-${EXPECTED_VERSION}.crate" | awk '{print $1}')
-          test "$actual" = "$expected"
-          checksum="$release_dir/release-crate.sha256"
-          test "$(grep -cve '^[[:space:]]*$' "$checksum")" -eq 1
-          test "$(awk 'NF {print $1}' "$checksum")" = "$expected"
-          test "$(awk 'NF {print $2}' "$checksum")" = \
-            "target/package/hf2q-${EXPECTED_VERSION}.crate"
+          public_base="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag"
+          release_dir=$(mktemp -d "$RUNNER_TEMP/hf2q-public-release.XXXXXX")
+          for name in \
+            hf2q-aarch64-apple-darwin \
+            hf2q-aarch64-apple-darwin.sha256 \
+            hf2q-aarch64-apple-darwin.proof.json \
+            hf2q-aarch64-apple-darwin.notary-log.json \
+            stable-aarch64-apple-darwin.json \
+            install.sh \
+            "hf2q-${EXPECTED_VERSION}.crate" \
+            release-crate.sha256; do
+            downloaded=0
+            for _ in $(seq 1 24); do
+              if curl --fail --location --silent --show-error \
+                "$public_base/$name" --output "$release_dir/$name"; then
+                downloaded=1
+                break
+              fi
+              sleep 5
+            done
+            test "$downloaded" = 1
+          done
+          for asset in \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin" \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.sha256" \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.proof.json" \
+            "$STANDALONE_STAGE/hf2q-aarch64-apple-darwin.notary-log.json" \
+            "$STANDALONE_STAGE/stable-aarch64-apple-darwin.json" \
+            "$STANDALONE_STAGE/install.sh" \
+            "target/package/hf2q-${EXPECTED_VERSION}.crate" \
+            "$RUNNER_TEMP/release-crate.sha256"; do
+            cmp -s "$asset" "$release_dir/$(basename "$asset")"
+          done
+          public_binary="$release_dir/hf2q-aarch64-apple-darwin"
+          chmod 0555 "$public_binary"
+          test "$(shasum -a 256 "$public_binary" | awk '{print $1}')" = \
+            "$STANDALONE_BINARY_SHA256"
+          test "$(/usr/bin/lipo -archs "$public_binary")" = arm64
+          /usr/bin/codesign --verify --strict --all-architectures "$public_binary"
+          /usr/sbin/spctl --assess --type execute "$public_binary"
+          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$public_binary" --version)" = \
+            "hf2q $EXPECTED_VERSION"
+
+          proof_home=$(mktemp -d "$RUNNER_TEMP/hf2q-public-install-home.XXXXXX")
+          proof_install="$proof_home/.local/bin"
+          proof_state="$proof_home/.hf2q"
+          mkdir -p "$proof_state/models"
+          printf 'operator config\n' > "$proof_state/config.toml"
+          printf 'converted model\n' > "$proof_state/models/model.gguf"
+          curl -fsSL "$public_base/install.sh" | \
+            HOME="$proof_home" HF2Q_INSTALL_DIR="$proof_install" \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin sh >/dev/null
+          test "$(shasum -a 256 "$proof_install/hf2q" | awk '{print $1}')" = \
+            "$STANDALONE_BINARY_SHA256"
+          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$proof_install/hf2q" --version)" = \
+            "hf2q $EXPECTED_VERSION"
+          "$proof_install/hf2q" uninstall --yes >/dev/null
+          test ! -e "$proof_install/hf2q"
+          test -f "$proof_state/config.toml"
+          test -f "$proof_state/models/model.gguf"
