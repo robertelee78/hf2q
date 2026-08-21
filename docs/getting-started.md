@@ -262,7 +262,7 @@ hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT \
 
 The omitted `--quant` comes from setup (Q4_K_M). An explicit `--quant` always
 wins; without either setup config or the flag, convert fails and asks for a
-choice. The measured native Q4_K_M output is 16,810,714,848 bytes
+choice. The measured bound native Q4_K_M output is 16,810,714,944 bytes
 (15.66 GiB).
 
 hf2q uses its in-process Hugging Face client; Python, `huggingface-cli`,

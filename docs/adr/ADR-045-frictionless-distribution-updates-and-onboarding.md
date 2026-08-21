@@ -544,6 +544,26 @@ continuation, and warm-versus-cold semantic replay. The warm direct
 continuation reused 297 of 374 prompt tokens and exactly matched the cold
 result.
 
+The automatic multimodal-pair follow-up at converter commit
+`54fd9a089c2d9ebf2ec3ac20b8d24fdc1236c318` reused that exact source revision
+and source-bundle identity. One default conversion command produced a bound
+16,810,714,944-byte text GGUF with SHA-256
+`1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a` and a
+927,606,848-byte F16 projector with SHA-256
+`463b264713f8e081f0fae753c80d8089308e01b1e2ac0948dd9966d0711d8f1b`.
+The two schema-v3 receipts share the exact source and converter identities;
+their selectors are `q4_k_m` and `f16-mmproj`. Runtime startup reopened 866
+text tensors and 496 projector tensors, verified the projector digest embedded
+in the text header, and loaded the Qwen3-VL SigLIP/merger path.
+
+The exact first-image cache gate then used an 86,077-token cold text turn and
+a first-image follow-up with 86,172 prompt tokens. The follow-up reused 86,072
+tokens, performed GPU vision inference, answered that the fixture was red in
+73 completion tokens, stopped normally, and left readiness at HTTP 200. This
+supersedes the earlier text-only artifact as the native self-conversion proof;
+the separately pinned model-author Q5_K_M fast-download path remains a distinct
+text-only guide option.
+
 The guide and its retained evidence bind that accepted digest. A separately
 dispatched model-qualification workflow may require the runner's
 `QWEN38_MODEL_SHA256` setting to match it, but routine CLI publication does not
