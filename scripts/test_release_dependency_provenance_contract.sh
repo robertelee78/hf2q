@@ -32,9 +32,13 @@ expect_failure() {
 }
 
 failure_count=0
+package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' \
+  "$ROOT_DIR/Cargo.toml" | head -1)
+[[ "$package_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || \
+  fail "package version is not canonical stable SemVer"
 
 checkout="$scratch/checkout"
-package_root="$scratch/packed/hf2q-0.1.7"
+package_root="$scratch/packed/hf2q-$package_version"
 cargo_home="$scratch/cargo-home"
 cargo_target="$scratch/cargo-target"
 metadata="$scratch/cargo-metadata.json"
@@ -46,12 +50,12 @@ cargo_home=$(cd "$cargo_home" && pwd -P)
 cargo_target=$(cd "$cargo_target" && pwd -P)
 crate_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
-cat > "$package_root/Cargo.lock" <<'LOCK'
+cat > "$package_root/Cargo.lock" <<LOCK
 version = 4
 
 [[package]]
 name = "hf2q"
-version = "0.1.7"
+version = "$package_version"
 dependencies = [
  "mlx-native",
 ]
@@ -63,12 +67,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9e25280262b20fd2894acc90229a7d2f695a1d818451473f95ef40125962cd8"
 LOCK
 
-jq -n --arg workspace_root "$package_root" '
+jq -n --arg workspace_root "$package_root" \
+  --arg package_version "$package_version" '
   {
     packages: [
       {
         name:"hf2q",
-        version:"0.1.7",
+        version:$package_version,
         dependencies:[{
           name:"mlx-native",
           source:"registry+https://github.com/rust-lang/crates.io-index",
@@ -115,7 +120,7 @@ expect_failure "verifier accepted raw evidence whose receipt hash was stale" \
   "receipt identity or raw hashes mismatch" \
   bash "$VERIFIER" verify "$raw_hash_mismatch"
 
-inside_checkout="$checkout/hf2q-0.1.7"
+inside_checkout="$checkout/hf2q-$package_version"
 mkdir -p "$inside_checkout"
 cp "$package_root/Cargo.lock" "$inside_checkout/Cargo.lock"
 jq --arg workspace_root "$inside_checkout" '.workspace_root = $workspace_root' \
@@ -126,7 +131,7 @@ expect_failure "capture accepted a packed root inside checkout ancestry" \
     "$scratch/inside-evidence" "$checkout" "$cargo_home" "$cargo_target" \
     true true "$crate_sha"
 
-local_config="$scratch/local-config/hf2q-0.1.7"
+local_config="$scratch/local-config/hf2q-$package_version"
 mkdir -p "$local_config/.cargo"
 cp "$package_root/Cargo.lock" "$local_config/Cargo.lock"
 printf '[build]\nrustflags = ["-C", "target-cpu=native"]\n' \
@@ -140,7 +145,7 @@ expect_failure "capture accepted package-local Cargo configuration" \
     true true "$crate_sha"
 
 ancestor_config_root="$scratch/ancestor-config"
-ancestor_package="$ancestor_config_root/nested/hf2q-0.1.7"
+ancestor_package="$ancestor_config_root/nested/hf2q-$package_version"
 mkdir -p "$ancestor_config_root/.cargo" "$ancestor_package"
 cp "$package_root/Cargo.lock" "$ancestor_package/Cargo.lock"
 printf '[build]\nrustflags = ["-C", "target-cpu=native"]\n' \
