@@ -666,9 +666,7 @@ What exists:
   the existing commands through a selected state root;
 - a local standalone installer template, hidden exact-byte bootstrap, public
   `hf2q update`/`hf2q update --rollback`, and marker-gated
-  `hf2q uninstall --yes` implementation; and
-- dormant model-preparation components created under the prior over-broad ADR
-  wording.
+  `hf2q uninstall --yes` implementation.
 
 The first Slice-D filesystem hypothesis was tested locally on 2026-08-20 with
 two distinct real arm64 hf2q executables. Their SHA-256 values were
@@ -732,6 +730,12 @@ the provisional session-cache setup field have been removed. `hf2q setup` does
 not create or authorize a separate `cache/sessions` hierarchy.
 Automatic shell-completion mutation on ordinary startup has also been removed;
 `hf2q completions --shell <shell>` remains the explicit generation surface.
+The dormant no-options model recipe, preparation plan, paired-artifact
+publication, prepared-profile registry, retention, and calibration-pending
+state have been removed as well. Generic remote conversion remains owned by
+ADR-033. The only exact source projection retained is ADR-046's private,
+read-only Qwen source-teacher manifest; it cannot download, convert, register,
+or serve a model.
 
 What is not yet the corrected product:
 
@@ -744,9 +748,9 @@ What is not yet the corrected product:
 - the complete guide/update/uninstall journey from a distinct clean macOS
   account, including the protected real-model acceptance path.
 
-The remaining dormant components listed above do not become ADR-045
-requirements. The scope audit has classified them for removal or retention
-under their actual governing decisions before more onboarding code is added.
+The remaining dormant distribution components listed by the scope audit do not
+become ADR-045 requirements. They must be removed or retained under their
+actual governing decisions before more onboarding code is added.
 
 ## Consequences
 

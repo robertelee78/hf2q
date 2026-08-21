@@ -890,7 +890,8 @@ After the Gemma 4 mapper rewrite shipped (mlx-native `93383cd`, hf2q `46c54876`)
 
 ### 2026-08-04 — Immutable remote-source gate and atomic conversion receipt
 
-This boundary was tightened by ADR-045 on 2026-08-19. `hf2q convert`
+This boundary was tightened under ADR-033's input-provenance contract on
+2026-08-19. `hf2q convert`
 accepts a positional canonical model ID/URL; `--repo` is the compatibility
 spelling for the same path. The product process uses only the pinned official
 `https://huggingface.co` endpoint through `hf-hub`; no `hf`,
@@ -898,8 +899,8 @@ spelling for the same path. The product process uses only the pinned official
 branch, tag, or Qwen3.8 default is resolved through repository information to
 an exact 40-hex commit before any selected file transfer. A URL-embedded and
 explicit revision must agree. File-specific `blob`/`resolve` URLs share the
-structural parser but are rejected by repository conversion pending the
-separately recipe-bound external-GGUF path.
+structural parser but are rejected by repository conversion, which requires a
+complete source repository.
 
 The repository inventory, paths, small metadata, tokenizer assets, index
 bytes, and index entries are bounded before they can expand authority. hf2q

@@ -123,22 +123,6 @@ pub fn convert_vision_tower_to_path_with_source(
     output: &Path,
     source_sha256: Option<&str>,
 ) -> Result<(), VitConvertError> {
-    convert_vision_tower_to_path_with_source_and_producer_version(
-        hf_repo_dir,
-        output,
-        source_sha256,
-        None,
-    )
-}
-
-/// Convert a vision tower while reproducing a recipe-frozen producer banner.
-/// The public conversion entry points retain the running-package banner.
-pub(crate) fn convert_vision_tower_to_path_with_source_and_producer_version(
-    hf_repo_dir: &Path,
-    output: &Path,
-    source_sha256: Option<&str>,
-    producer_version: Option<&str>,
-) -> Result<(), VitConvertError> {
     let config_path = hf_repo_dir.join("config.json");
     let raw = std::fs::read_to_string(&config_path)
         .map_err(|e| VitConvertError::Config(VisionConfigError::Io(e.to_string())))?;
@@ -179,12 +163,11 @@ pub(crate) fn convert_vision_tower_to_path_with_source_and_producer_version(
     let tensors = convert::load_vision_tensors(hf_repo_dir, &vision_config)?;
     let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
     let temporary_path = temporary.into_temp_path();
-    gguf_emit::write_mmproj_gguf_with_provenance_and_producer_version(
+    gguf_emit::write_mmproj_gguf_with_provenance(
         &temporary_path,
         &vision_config,
         &tensors,
         source_sha256,
-        producer_version,
     )?;
     std::fs::File::open(&temporary_path)?.sync_all()?;
     temporary_path

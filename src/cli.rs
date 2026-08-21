@@ -250,7 +250,7 @@ pub struct SetupArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct SourceTeacherArgs {
-    /// Exact local Qwen3.8-27B snapshot selected by the embedded recipe.
+    /// Exact local Qwen3.8-27B snapshot selected by the source manifest.
     #[arg(long, value_name = "DIRECTORY")]
     pub model_dir: PathBuf,
 
@@ -266,7 +266,7 @@ pub struct SourceTeacherArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct SourceTeacherReferenceArgs {
-    /// Exact local Qwen3.8-27B snapshot selected by the embedded recipe.
+    /// Exact local Qwen3.8-27B snapshot selected by the source manifest.
     #[arg(long, value_name = "DIRECTORY")]
     pub model_dir: PathBuf,
 

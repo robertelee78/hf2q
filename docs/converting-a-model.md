@@ -8,7 +8,7 @@ For architecture-specific behavior, also see:
 
 - Qwen3.5/Qwen3.6: `docs/converting-qwen35.md`
 - the conversion architecture and evidence contract: ADR-033
-- frictionless official-source preparation as it lands: ADR-045
+- the end-user installation and setup journey: ADR-045
 
 ## Quick start
 
@@ -68,9 +68,8 @@ https://huggingface.co/owner/repository/resolve/<revision>/<filename>
 ```
 
 File-specific `blob` and `resolve` URLs are structurally recognized for the
-shared ADR-045 identity grammar, but model conversion currently rejects them:
+shared input identity grammar, but model conversion rejects them because
 conversion requires the repository's complete index-selected source set.
-They are reserved for the separately recipe-bound external-GGUF path.
 
 `--revision <REVISION>` may name a branch, tag, or exact commit. It must equal
 any URL-embedded revision. hf2q asks the official Hub endpoint for repository
@@ -155,18 +154,18 @@ source because the plan must be based on authenticated bytes.
 
 `--mmproj` emits the architecture's supported multimodal projector GGUF
 instead of the text decoder. It is not a generic fallback: unsupported
-architectures fail explicitly. ADR-045's future no-options Qwen3.8 recipe will
-coordinate the text/projector pair; today the operator supplies both
-`--quant` and `--output` and invokes projector conversion explicitly.
+architectures fail explicitly. The operator supplies `--quant` and `--output`
+and invokes projector conversion explicitly when the selected family supports
+one.
 
 ## Disk preflight and resumability
 
 Before Hub lookup or a large transfer, the current downloader checks the
 filesystem containing the Hub cache. Existing class floors are 150 GiB for
 Qwen 35B MoE sources, 55 GiB for dense 27B Qwen sources, and 100 GiB for other
-models. These are transfer safeguards, not ADR-045's final device-aware recipe
-selector. The future selector must account for exact source, output, temporary,
-and retained-artifact bytes.
+models. These are conservative transfer safeguards; the operator still chooses
+the model, output path, and quantization explicitly or through `hf2q setup`'s
+consumed default.
 
 `hf-hub` reuses complete cache objects. An interrupted in-flight object is
 retried by the client; already completed objects are not downloaded again.
@@ -175,15 +174,8 @@ hf2q never deletes source data from the shared Hub cache.
 ## Current boundary
 
 The canonical identity parser, immutable resolution, exact selected download,
-integrity checks, and receipt schema v3 have landed. The following ADR-045
-pieces are intentionally not claimed by this command yet:
-
-- the no-options `hf2q convert Qwen/Qwen3.8-27B` recipe (today `--quant` and
-  `--output` remain required);
-- measured device-aware automatic quantization and exact disk planning;
-- coordinated text/projector output registration;
-- source-retention transaction and prepared-model profile; and
-- post-conversion runtime calibration.
-
-Those omissions fail visibly rather than being replaced by an implicit or
-external tool path.
+integrity checks, and receipt schema v3 have landed. Model selection, revision,
+output path, and projector conversion remain explicit operator choices. Setup
+can provide a default quant selector, but it does not download, convert,
+register, retain, or delete model files. Unsupported inputs fail visibly rather
+than being routed through an implicit orchestration or external tool path.

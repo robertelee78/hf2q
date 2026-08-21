@@ -8,10 +8,8 @@ use mlx_native::MlxDevice;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::core::integrity::ShardIntegrity;
 use crate::core::provenance::{compute_source_bundle_sha256, SourceShard};
 use crate::input::integrity::{verify_conversion_manifest, VerifiedSourceManifest};
-use crate::input::model_recipe::{embedded_qwen38_recipe, ModelRecipe};
 use crate::intelligence::dynamic_allocator::producer::{
     build_tensor_partition, derive_source_tensor_inventory, NonVariableDisposition,
     NonVariableTensor, TensorPartitionManifest, VerifiedSourceTensorInventory,
@@ -33,6 +31,7 @@ use super::super::{
 };
 use super::corpus::build_official_prediction_plan;
 use super::profile::{official_profile, OfficialEvidenceProfileV1, PROFILE_SHA256};
+use super::source_manifest::{official_source_manifest, OfficialSourceManifestV1};
 
 const OFFICIAL_TENSOR_COUNT: usize = 1_199;
 const OFFICIAL_WEIGHT_SHARD_COUNT: usize = 18;
@@ -59,8 +58,8 @@ pub(crate) struct OfficialQwen38SourceTeacherSummaryV1 {
     pub(crate) mlx_native_version: &'static str,
     pub(crate) host_os: String,
     pub(crate) host_arch: &'static str,
-    pub(crate) recipe_id: String,
-    pub(crate) recipe_sha256: String,
+    pub(crate) source_manifest_id: String,
+    pub(crate) source_manifest_sha256: String,
     pub(crate) source: SourceIdentity,
     pub(crate) verified_source_manifest_sha256: String,
     pub(crate) source_inventory_sha256: String,
@@ -116,8 +115,8 @@ pub(crate) struct OfficialMetalDeviceSummaryV1 {
 pub(super) struct OfficialSourceV1 {
     _materialized_source: tempfile::TempDir,
     pub(super) model_dir: PathBuf,
-    recipe_id: String,
-    recipe_sha256: String,
+    source_manifest_id: String,
+    source_manifest_sha256: String,
     pub(super) source: SourceIdentity,
     pub(super) verified_source: VerifiedSourceManifest,
     inventory: VerifiedSourceTensorInventory,
@@ -208,8 +207,8 @@ fn build_official_work(request: &OfficialQwen38SourceTeacherRequestV1) -> Result
     let verified_source_manifest_sha256 =
         sha256_json(&source.verified_source).context("hash verified source manifest")?;
     let source_identity = source.source.clone();
-    let recipe_id = source.recipe_id.clone();
-    let recipe_sha256 = source.recipe_sha256.clone();
+    let source_manifest_id = source.source_manifest_id.clone();
+    let source_manifest_sha256 = source.source_manifest_sha256.clone();
     let source_tensor_count = source.inventory.manifest().tensors.len();
     let weight_shard_count = source.verified_source.required_weight_shards().len();
     let prediction_plan_sha256 = prediction.plan.manifest().manifest_sha256.clone();
@@ -247,8 +246,8 @@ fn build_official_work(request: &OfficialQwen38SourceTeacherRequestV1) -> Result
         mlx_native_version: "0.11.0",
         host_os: sysinfo::System::long_os_version().unwrap_or_else(|| std::env::consts::OS.into()),
         host_arch: std::env::consts::ARCH,
-        recipe_id,
-        recipe_sha256,
+        source_manifest_id,
+        source_manifest_sha256,
         source: source_identity,
         verified_source_manifest_sha256,
         source_inventory_sha256,
@@ -325,37 +324,33 @@ pub(super) fn authenticate_official_source(
     model_dir: &Path,
     profile: &OfficialEvidenceProfileV1,
 ) -> Result<OfficialSourceV1> {
-    let recipe = embedded_qwen38_recipe().context("load embedded Qwen3.8 recipe")?;
+    let manifest = official_source_manifest()?;
     ensure!(
-        recipe.recipe_id() == profile.source.recipe_id
-            && recipe.recipe_sha256()? == profile.source.recipe_sha256
-            && recipe.source().repository_id() == profile.source.repository_id
-            && recipe.source().revision() == profile.source.revision
-            && recipe.source().bundle_sha256() == profile.source.bundle_sha256,
-        "embedded source-teacher profile differs from the model recipe"
+        manifest.manifest_id() == profile.source.manifest_id
+            && manifest.manifest_sha256() == profile.source.manifest_sha256
+            && manifest.repository_id() == profile.source.repository_id
+            && manifest.revision() == profile.source.revision
+            && manifest.bundle_sha256() == profile.source.bundle_sha256,
+        "embedded source-teacher profile differs from the source manifest"
     );
-    let materialized_source = materialize_recipe_source(model_dir, &recipe)?;
+    let materialized_source = materialize_manifest_source(model_dir, &manifest)?;
     let model_dir = materialized_source.path().to_path_buf();
-    let records = recipe_records(&recipe);
+    let records = manifest.records();
     let verified_source = verify_conversion_manifest(
-        recipe.source().repository_id(),
-        recipe.source().revision(),
+        manifest.repository_id(),
+        manifest.revision(),
         &model_dir,
         records,
     )
     .context("authenticate official Qwen3.8 source files")?;
-    let verified_recipe = recipe
-        .verify_source(&model_dir, verified_source)
-        .context("join official source to embedded recipe")?;
-    let source = source_identity(
-        verified_recipe.local_dir(),
-        verified_recipe.source_manifest(),
-    )?;
+    manifest
+        .verify_source(&model_dir, &verified_source)
+        .context("join official source to embedded source manifest")?;
+    let source = source_identity(&model_dir, &verified_source)?;
     ensure!(
-        source.tensor_bundle_sha256 == recipe.source().bundle_sha256(),
-        "official source bundle differs from the embedded recipe"
+        source.tensor_bundle_sha256 == manifest.bundle_sha256(),
+        "official source bundle differs from the embedded source manifest"
     );
-    let verified_source = verified_recipe.source_manifest().clone();
     let inventory = derive_source_tensor_inventory(&model_dir, source.clone(), &verified_source)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     ensure!(
@@ -366,8 +361,8 @@ pub(super) fn authenticate_official_source(
     Ok(OfficialSourceV1 {
         _materialized_source: materialized_source,
         model_dir,
-        recipe_id: verified_recipe.recipe_id().to_owned(),
-        recipe_sha256: verified_recipe.recipe_sha256().to_owned(),
+        source_manifest_id: manifest.manifest_id().to_owned(),
+        source_manifest_sha256: manifest.manifest_sha256().to_owned(),
         source,
         verified_source,
         inventory,
@@ -379,7 +374,10 @@ pub(super) fn authenticate_official_source(
 /// Convert an hf-hub symlink snapshot into a private flat regular-file view
 /// without copying payload bytes. Every link is re-authenticated below before
 /// B1 retains its descriptors, so pathname races can only fail closed.
-fn materialize_recipe_source(model_dir: &Path, recipe: &ModelRecipe) -> Result<tempfile::TempDir> {
+fn materialize_manifest_source(
+    model_dir: &Path,
+    manifest: &OfficialSourceManifestV1,
+) -> Result<tempfile::TempDir> {
     let parent = model_dir
         .parent()
         .context("official source directory has no parent for hard-link staging")?;
@@ -387,7 +385,7 @@ fn materialize_recipe_source(model_dir: &Path, recipe: &ModelRecipe) -> Result<t
         .prefix(".hf2q-source-teacher-")
         .tempdir_in(parent)
         .context("create private source-teacher hard-link view")?;
-    for file in recipe.source().files() {
+    for file in manifest.files() {
         hard_link_source_leaf(model_dir, staging.path(), file.path(), file.size())?;
     }
     Ok(staging)
@@ -429,21 +427,6 @@ pub(super) fn hard_link_source_leaf_for_test(
     expected_bytes: u64,
 ) -> Result<()> {
     hard_link_source_leaf(model_dir, staging, filename, expected_bytes)
-}
-
-pub(super) fn recipe_records(recipe: &ModelRecipe) -> Vec<ShardIntegrity> {
-    recipe
-        .source()
-        .files()
-        .iter()
-        .map(|file| ShardIntegrity {
-            filename: file.path().to_owned(),
-            bytes: file.size(),
-            sha256: file.hf_lfs_sha256().map(ToOwned::to_owned),
-            hf_etag: file.hub_etag().to_owned(),
-            is_lfs: file.hf_lfs_sha256().is_some(),
-        })
-        .collect()
 }
 
 fn source_identity(

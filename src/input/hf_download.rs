@@ -38,22 +38,6 @@
 //! followed by re-invoke will re-download only the in-flight shard;
 //! all completed shards are reused.
 //!
-//! The preparation-resolution seam performs only the repository-info lookup:
-//! it consumes the host-checked plan, binds its exact original reference to an
-//! immutable commit and bounded name inventory, and returns an inert sealed
-//! plan before any payload transfer. A second metadata-only transition queries
-//! all 29 recipe-owned names at that exact commit and seals only records that
-//! match the checked-in size, Git/LFS identity, and canonical order. The
-//! payload transition consumes that authorization, confines hf-hub's resumable
-//! cache to the planned `source/` tree, verifies every fetched file, and still
-//! returns no conversion or deletion authority. A final private preparation
-//! transition reauthenticates that cache around hf2q-owned text/projector
-//! conversion, exact-adopts only complete role outputs, and returns an inert
-//! pair. The retained-source publication transition then reauthenticates the
-//! complete pair around a crash-durable pair receipt and `profile.json` commit,
-//! returning only an inert calibration-pending registration. Destructive
-//! retention, calibration, loading, preference, and serving remain closed.
-//!
 //! Manual test protocol: `Ctrl+C` mid-download → observe partial shard
 //! in `~/.cache/huggingface/hub/models--*/snapshots/*/` → re-invoke
 //! `hf2q` → verify only in-flight shard re-downloads, total wall-clock
@@ -67,32 +51,19 @@ use tracing::{debug, info};
 
 use crate::core::integrity::{verify_shard, IntegrityError, ShardIntegrity};
 use crate::input::hf_reference::{HfModelReference, HfReferenceError, ResolvedHfModelReference};
-use crate::input::model_recipe::{
-    ModelPreparationPlan, QWEN38_ACCEPTED_REVISION, QWEN38_REPOSITORY_ID,
-};
 use crate::progress::ProgressReporter;
 
 mod resolution;
 
-pub use resolution::{
-    authenticate_transferred_model_preparation, authorize_model_preparation_transfer,
-    convert_authenticated_model_preparation, publish_converted_model_preparation_keep,
-    transfer_authorized_model_preparation, AuthenticatedModelPreparationSource,
-    AuthorizedModelPreparationTransfer, ConvertedModelPreparation, ModelPreparationConversionError,
-    ModelPreparationPayloadError, ModelPreparationPublicationError,
-    ModelPreparationResolutionError, ModelPreparationSourceAuthenticationError,
-    RegisteredModelPreparation, ResolvedModelPreparationPlan, ResolvedModelRepository,
-    TransferredModelPreparationPayload,
-};
-use resolution::{bind_model_preparation_resolution, resolve_repository_info};
+use resolution::resolve_repository_info;
 #[cfg(test)]
-pub(in crate::input) use resolution::{
-    bind_model_preparation_resolution_for_test, bind_transfer_authorization_for_test,
-    resolve_repository_info_for_test,
-};
+pub(in crate::input) use resolution::resolve_repository_info_for_test;
+pub use resolution::ResolvedModelRepository;
 
 const CANONICAL_HF_ENDPOINT: &str = "https://huggingface.co";
 const DEFAULT_HF_REVISION: &str = "main";
+const QWEN38_REPOSITORY_ID: &str = "Qwen/Qwen3.8-27B";
+const QWEN38_ACCEPTED_REVISION: &str = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0";
 pub(super) const MAX_HF_REPO_FILES: usize = 4096;
 pub(super) const MAX_HF_SMALL_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const MAX_HF_TOKENIZER_BYTES: u64 = 512 * 1024 * 1024;
@@ -623,15 +594,6 @@ fn check_artifact_disk_preflight(
         });
     }
     Ok(())
-}
-
-/// Consume a host-checked preparation plan only after resolving the exact
-/// original reference through the pinned in-process Hub boundary.
-pub fn resolve_model_preparation_plan(
-    plan: ModelPreparationPlan,
-) -> Result<ResolvedModelPreparationPlan, ModelPreparationResolutionError> {
-    let resolution = resolve_model_reference(plan.reference().clone())?;
-    Ok(bind_model_preparation_resolution(plan, resolution)?)
 }
 
 /// Download model files using the hf-hub crate.

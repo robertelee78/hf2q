@@ -158,7 +158,7 @@ fn indexed_plan_is_strict_deterministic_and_downloads_only_required_shards() {
 }
 
 #[test]
-fn model_card_is_selected_when_present_for_recipe_and_license_provenance() {
+fn model_card_is_selected_when_present_for_source_and_license_provenance() {
     let inventory =
         validate_repo_inventory(["README.md", "config.json", "model.safetensors"].into_iter())
             .unwrap();

@@ -150,8 +150,6 @@ pub(crate) fn run_convert_with_stored_evidence(
     let converter_git_commit = require_converter_git_commit()?;
     run_convert_internal(
         args,
-        None,
-        None,
         Some(StoredEvidenceRequest {
             verified_source,
             context,

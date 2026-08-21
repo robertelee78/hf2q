@@ -1,5 +1,3 @@
-use super::source::recipe_records;
-
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::{symlink, MetadataExt};
 
@@ -18,9 +16,15 @@ fn embedded_qwen38_evidence_profile_is_exact_and_canary_scoped() {
 }
 
 #[test]
-fn embedded_qwen38_recipe_projects_exact_offline_manifest() {
-    let recipe = crate::input::model_recipe::embedded_qwen38_recipe().unwrap();
-    let records = recipe_records(&recipe);
+fn embedded_qwen38_source_manifest_projects_exact_offline_inventory() {
+    let manifest = super::source_manifest::official_source_manifest().unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(
+            super::source_manifest::manifest_bytes_for_test()
+        )),
+        super::source_manifest::MANIFEST_SHA256
+    );
+    let records = manifest.records();
     assert_eq!(records.len(), 29);
     assert_eq!(records.iter().filter(|record| record.is_lfs).count(), 19);
     assert_eq!(
