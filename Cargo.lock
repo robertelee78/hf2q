@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "hf2q"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ahash",
  "anyhow",
