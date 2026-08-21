@@ -283,6 +283,7 @@ jobs:
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
       EXPECTED_VERSION: "0.1.7"
+      ACCEPTED_QWEN38_MODEL_SHA256: "d2ea096cf688ebb02a233ee19b66ade4dc48fdff543793c35631bc5e6291aaaf"
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout exact candidate
@@ -320,6 +321,7 @@ jobs:
             "$QWEN_MODEL_SHA256" "$QWEN38_MODEL_SHA256"; do
             [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           done
+          test "$QWEN38_MODEL_SHA256" = "$ACCEPTED_QWEN38_MODEL_SHA256"
           {
             printf 'DEEPSEEK_MODEL=%s\n' "$DEEPSEEK_MODEL_PATH"
             printf 'GEMMA_MODEL=%s\n' "$GEMMA_MODEL_PATH"

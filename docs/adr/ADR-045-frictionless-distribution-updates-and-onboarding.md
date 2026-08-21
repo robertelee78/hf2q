@@ -524,6 +524,12 @@ continuation, and warm-versus-cold semantic replay. The warm direct
 continuation reused 297 of 374 prompt tokens and exactly matched the cold
 result.
 
+The protected cache-lifecycle and release workflows bind that accepted digest
+in source and require the runner's `QWEN38_MODEL_SHA256` setting to match it.
+The filesystem path remains runner-configurable, but a mutable repository
+variable cannot silently substitute the official upstream checkpoint or any
+other Qwen3.8 artifact for the guide's accepted abliterated checkpoint.
+
 The first OpenCode spike also found and corrected one real documentation gap:
 OpenCode 1.18.18 rendered a 7,105-token agent prompt, which the default
 SerialFifo path correctly rejected above its 2,048-token bounded transaction.
