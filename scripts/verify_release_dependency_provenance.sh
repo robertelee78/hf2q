@@ -2,7 +2,16 @@
 set -euo pipefail
 
 readonly EXPECTED_PACKAGE_NAME=hf2q
-readonly EXPECTED_PACKAGE_VERSION=0.1.7
+SCRIPT_DIRECTORY=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+readonly SCRIPT_DIRECTORY
+readonly PACKAGE_MANIFEST="$SCRIPT_DIRECTORY/../Cargo.toml"
+EXPECTED_PACKAGE_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' \
+  "$PACKAGE_MANIFEST" | head -1)
+readonly EXPECTED_PACKAGE_VERSION
+[[ "$EXPECTED_PACKAGE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+  echo "release dependency provenance: package version is not canonical stable SemVer" >&2
+  exit 1
+}
 readonly EXPECTED_DEPENDENCY_NAME=mlx-native
 readonly EXPECTED_DEPENDENCY_VERSION=0.11.0
 readonly EXPECTED_DEPENDENCY_REQUIREMENT='=0.11.0'
