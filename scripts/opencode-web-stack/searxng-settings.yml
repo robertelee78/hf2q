@@ -1,0 +1,269 @@
+# Curated engine set for opencode - quality over quantity
+use_default_settings: true
+
+general:
+  instance_name: "opencode-local"
+  privacypolicy_url: false
+  enable_metrics: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+server:
+  bind_address: "127.0.0.1"
+  port: 8888
+  secret_key: "__SEARXNG_SECRET__"
+  limiter: false
+  image_proxy: false
+  http_protocol_version: "1.1"
+
+outgoing:
+  request_timeout: 8.0
+  pool_connections: 100
+  pool_maxsize: 20
+
+engines:
+  - name: ahmia
+    disabled: true
+  - name: artic
+    disabled: true
+  - name: bandcamp
+    disabled: true
+  - name: bing images
+    disabled: true
+  - name: bing news
+    disabled: true
+  - name: bing videos
+    disabled: true
+  - name: brave
+    disabled: true
+  - name: brave.images
+    disabled: true
+  - name: brave.news
+    disabled: true
+  - name: brave.videos
+    disabled: true
+  - name: bt4g
+    disabled: true
+  - name: chefkoch
+    disabled: true
+  - name: currency
+    disabled: true
+  - name: dailymotion
+    disabled: true
+  - name: deviantart
+    disabled: true
+  - name: devicons
+    disabled: true
+  - name: dictzone
+    disabled: true
+  - name: duckduckgo images
+    disabled: true
+  - name: duckduckgo news
+    disabled: true
+  - name: duckduckgo videos
+    disabled: true
+  - name: etymonline
+    disabled: true
+  - name: flickr
+    disabled: true
+  - name: genius
+    disabled: true
+  - name: google cse
+    disabled: true
+  - name: google cse images
+    disabled: true
+  - name: google news
+    disabled: true
+  - name: kickass
+    disabled: true
+  - name: lemmy comments
+    disabled: true
+  - name: lemmy communities
+    disabled: true
+  - name: lemmy posts
+    disabled: true
+  - name: lemmy users
+    disabled: true
+  - name: lingva
+    disabled: true
+  - name: lucide
+    disabled: true
+  - name: mankier
+    disabled: true
+  - name: mastodon users
+    disabled: true
+  - name: mixcloud
+    disabled: true
+  - name: mymemory translated
+    disabled: true
+  - name: openairedatasets
+    disabled: true
+  - name: openairepublications
+    disabled: true
+  - name: openverse
+    disabled: true
+  - name: pdbe
+    disabled: true
+  - name: pexels
+    disabled: true
+  - name: pinterest
+    disabled: true
+  - name: piratebay
+    disabled: true
+  - name: radio browser
+    disabled: true
+  - name: reuters
+    disabled: true
+  - name: sepiasearch
+    disabled: true
+  - name: solidtorrents
+    disabled: true
+  - name: soundcloud
+    disabled: true
+  - name: startpage
+    disabled: true
+  - name: startpage images
+    disabled: true
+  - name: startpage news
+    disabled: true
+  - name: tootfinder
+    disabled: true
+  - name: torch
+    disabled: true
+  - name: unsplash
+    disabled: true
+  - name: vimeo
+    disabled: true
+  - name: wikicommons.audio
+    disabled: true
+  - name: wikicommons.files
+    disabled: true
+  - name: wikicommons.videos
+    disabled: true
+  - name: wordnik
+    disabled: true
+  - name: wttr.in
+    disabled: true
+  - name: youtube
+    disabled: true
+  - name: google
+    weight: 1.5
+    disabled: false
+    inactive: false
+  - name: bing
+    weight: 0.5
+    disabled: true
+    inactive: false
+  - name: duckduckgo
+    weight: 1.3
+    disabled: false
+    inactive: false
+  - name: yahoo
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: mojeek
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: wikipedia
+    weight: 1.6
+    disabled: false
+    inactive: false
+  - name: wikidata
+    weight: 1.4
+    disabled: false
+    inactive: false
+  - name: wiktionary
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: wikinews
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: github
+    weight: 1.3
+    disabled: false
+    inactive: false
+  - name: stackoverflow
+    weight: 1.3
+    disabled: false
+    inactive: false
+  - name: askubuntu
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: superuser
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: arxiv
+    weight: 1.2
+    disabled: false
+    inactive: false
+  - name: hackernews
+    weight: 1.2
+    disabled: false
+    inactive: false
+  - name: pypi
+    weight: 1.2
+    disabled: false
+    inactive: false
+  - name: mdn
+    weight: 1.2
+    disabled: false
+    inactive: false
+  - name: docker hub
+    weight: 1.2
+    disabled: false
+    inactive: false
+  - name: hoogle
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: gentoo
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: arch linux wiki
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: google scholar
+    weight: 1.2
+    disabled: false
+    inactive: false
+  - name: semantic scholar
+    weight: 1.2
+    disabled: false
+    inactive: false
+  - name: pubmed
+    weight: 1.2
+    disabled: false
+    inactive: false
+  - name: crossref
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: openalex
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: openstreetmap
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: photon
+    weight: 1.0
+    disabled: false
+    inactive: false
+  - name: wikicommons.images
+    weight: 1.0
+    disabled: false
+    inactive: false

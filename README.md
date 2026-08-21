@@ -161,13 +161,21 @@ to a sibling checkout.
   to start below `disk_floor_gb + 10`.
 
 For the complete first-run path, use
-**[Get started with hf2q and Qwen3.8](docs/getting-started.md)**. It installs
-the signed binary, runs setup, and uses hf2q's native pipeline to download,
-verify, convert, and quantize the exact pinned source revision of
-`jenerallee78/Qwen3.8-27B-Abliterated-SFT`. It then walks through foreground
-serving, `hf2q chat`, direct API use, and an optional existing OpenCode
-connection. It does not introduce a second onboarding or model-preparation
+**[hf2q + Qwen3.8 + AK + search/fetch: complete setup](docs/hf2q+qwen3.8+ak+search-fetch-setup.md)**.
+It installs
+the signed binary; downloads hf2q's checksum-pinned Q4_K_M text GGUF and its
+source-matched F16 vision projector for
+`jenerallee78/Qwen3.8-27B-Abliterated-SFT`; proves unary, SSE, and image
+generation; and configures a stock tool-enabled OpenCode Build agent, full
+Agentic Kit, and a durable local search/fetch/crawl/extract stack. Native
+Q4_K_M conversion from the exact pinned source revision remains the optional
+provenance-grade path. It does not introduce a second model-preparation
 workflow around the existing commands.
+
+For the source-first core CLI journey without the optional coding harness,
+use **[Get started with hf2q and Qwen3.8](docs/getting-started.md)**. It runs
+hf2q's native conversion and quantization pipeline against the exact pinned
+source revision before foreground serving, `hf2q chat`, and direct API proof.
 
 `hf2q doctor` enumerates the runtime checks (hardware detection, disk
 space, optional RuVector backend); run it after `cargo install` if
@@ -355,11 +363,11 @@ hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT \
   --output "$HOME/.local/share/hf2q/models/qwen3.8/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf"
 ```
 
-See the [getting-started guide](docs/getting-started.md) for the complete
+See the [complete Qwen3.8 + AK + search/fetch guide](docs/hf2q+qwen3.8+ak+search-fetch-setup.md) for the complete
 convert, serve, API, and OpenCode sequence. Conversion automatically preserves
-both text and vision artifacts from this multimodal source. The first serving
-path remains text-only; pass the generated projector explicitly when running
-the separately gated vision surface.
+both text and vision artifacts from this multimodal source. The qualified guide
+path passes the generated, source-matched projector explicitly and validates a
+real image request before opening OpenCode.
 
 Native text conversion and serving are accepted. Vision is a separate
 candidate surface: hf2q converts the 333-tensor tower into a paired projector,
@@ -843,8 +851,9 @@ catalog + smoke prompt before any forward-pass code lands.
 
 ## Documentation index
 
-- `docs/getting-started.md` — canonical Qwen3.8 convert, serve, API, and
-  optional OpenCode journey.
+- `docs/hf2q+qwen3.8+ak+search-fetch-setup.md` — canonical verified Qwen3.8,
+  OpenCode, full AK, and local research setup.
+- `docs/getting-started.md` — compatibility pointer to the canonical guide.
 - `docs/ARCHITECTURE.md` — source-grounded architecture map.
 - `docs/converting-a-model.md` — generic convert reference.
 - `docs/converting-qwen35.md` — Qwen 3.5/3.6 specifics.
