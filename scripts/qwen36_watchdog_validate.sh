@@ -438,7 +438,7 @@ qwen36_count_matching_lines() {
     echo "Qwen progress log is missing, unreadable, or has an empty pattern" >&2
     return 1
   }
-  if count=$(rg -c -- "$pattern" "$path" 2>/dev/null); then
+  if count=$(grep -Ec -- "$pattern" "$path" 2>/dev/null); then
     status=0
   else
     status=$?
