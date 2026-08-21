@@ -161,16 +161,13 @@ to a sibling checkout.
   to start below `disk_floor_gb + 10`.
 
 For the complete first-run path, use
-**[hf2q + Qwen3.8 + AK + search/fetch: complete setup](docs/hf2q+qwen3.8+ak+search-fetch-setup.md)**.
+**[hf2q + Qwen3.8 + AK + search/fetch: complete setup](docs/getting-started.md)**.
 It installs
 the signed binary; downloads hf2q's checksum-pinned Q4_K_M text GGUF and its
 source-matched F16 vision projector for
 `jenerallee78/Qwen3.8-27B-Abliterated-SFT`; proves unary, SSE, and image
 generation; and configures a stock tool-enabled OpenCode Build agent, full
-Agentic Kit, and a durable local search/fetch/crawl/extract stack. The shorter
-[getting-started entry point](docs/getting-started.md) leads to this same
-qualified journey; it does not define a competing text-only or source-first
-path.
+Agentic Kit, and a durable local search/fetch/crawl/extract stack.
 
 `hf2q doctor` enumerates the runtime checks (hardware detection, disk
 space, optional RuVector backend); run it after `cargo install` if
@@ -349,7 +346,7 @@ rendered prompts and sampling settings reproduce across worker threads.
 The qualified Qwen3.8 onboarding path uses the exact published, checksum-pinned
 text/projector pair for
 `jenerallee78/Qwen3.8-27B-Abliterated-SFT`. Follow the
-[complete Qwen3.8 + AK + search/fetch guide](docs/hf2q+qwen3.8+ak+search-fetch-setup.md)
+[complete Qwen3.8 + AK + search/fetch guide](docs/getting-started.md)
 for download, multimodal serve, API proof, stock OpenCode Build, full Agentic
 Kit, research tools, and cleanup. General source-conversion examples elsewhere
 in this repository are not a substitute for that qualified artifact pair.
@@ -836,9 +833,8 @@ catalog + smoke prompt before any forward-pass code lands.
 
 ## Documentation index
 
-- `docs/hf2q+qwen3.8+ak+search-fetch-setup.md` — canonical verified Qwen3.8,
-  OpenCode, full AK, and local research setup.
-- `docs/getting-started.md` — compatibility pointer to the canonical guide.
+- `docs/getting-started.md` — canonical verified Qwen3.8, OpenCode, full AK,
+  and local research setup.
 - `docs/ARCHITECTURE.md` — source-grounded architecture map.
 - `docs/converting-a-model.md` — generic convert reference.
 - `docs/converting-qwen35.md` — Qwen 3.5/3.6 specifics.

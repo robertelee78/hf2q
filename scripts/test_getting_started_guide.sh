@@ -2,8 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-core_guide="$repo_root/docs/getting-started.md"
-guide="$repo_root/docs/hf2q+qwen3.8+ak+search-fetch-setup.md"
+guide="$repo_root/docs/getting-started.md"
+extra_guide="$repo_root/docs/hf2q+qwen3.8+ak+search-fetch-setup.md"
 readme="$repo_root/README.md"
 installer="$repo_root/scripts/install_opencode_web_stack.sh"
 assets="$repo_root/scripts/opencode-web-stack"
@@ -27,21 +27,8 @@ reject_literal() {
     fi
 }
 
-# The generic entry point must lead to the one complete, qualified journey.
-require_literal "$core_guide" "hf2q+qwen3.8+ak+search-fetch-setup.md"
-require_literal "$core_guide" "There is one supported end-to-end setup"
-require_literal "$core_guide" "exact published hf2q Q4_K_M text GGUF"
-require_literal "$core_guide" "matching F16"
-require_literal "$core_guide" "--mmproj"
-require_literal "$core_guide" "unary, SSE, and real image generation"
-require_literal "$core_guide" "full Agentic Kit"
-require_literal "$core_guide" "stock OpenCode Build"
-require_literal "$core_guide" "search, fetch, crawl, and extraction"
-reject_literal "$core_guide" "hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT"
-reject_literal "$core_guide" "source-first core"
-reject_literal "$core_guide" "serves the text model only"
-reject_literal "$core_guide" "qwen38-abliterated-sft-q5_k_m.gguf"
-reject_literal "$core_guide" "pkill -f"
+# There is exactly one guide. Do not reintroduce a core/complete split.
+[[ ! -e "$extra_guide" ]] || fail "second onboarding guide must not exist"
 
 # Bind the complete issue-146 journey to the exact tested artifact and harness.
 require_literal "$guide" "40d771ee15d826017f297261f5bedcf2c32cf4c2"
@@ -90,6 +77,8 @@ reject_literal "$readme" "downloads the model author's pinned Q5_K_M GGUF"
 reject_literal "$readme" "The first serving path remains text-only"
 reject_literal "$readme" "hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT"
 reject_literal "$readme" "source-first core CLI journey"
+reject_literal "$readme" "hf2q+qwen3.8+ak+search-fetch-setup.md"
+require_literal "$readme" "](docs/getting-started.md)"
 
 for asset in \
     web-search-fetch.js \
@@ -117,11 +106,10 @@ bash "$repo_root/scripts/test_opencode_web_stack_lifecycle.sh"
 bash "$repo_root/scripts/test_web_search_fetch_plugin.sh"
 node --check "$assets/web-search-fetch.js"
 
-core_shell="$(mktemp -t hf2q-core-guide-shell.XXXXXX)"
 guide_shell="$(mktemp -t hf2q-guide-shell.XXXXXX)"
 pycache_dir="$(mktemp -d -t hf2q-guide-pycache.XXXXXX)"
 cleanup() {
-    rm -f "$core_shell" "$guide_shell"
+    rm -f "$guide_shell"
     rm -r "$pycache_dir"
 }
 trap cleanup EXIT
@@ -129,15 +117,11 @@ trap cleanup EXIT
 PYTHONPYCACHEPREFIX="$pycache_dir" python3 -m py_compile \
     "$assets/server.py" "$assets/stealth_fetch.py" "$assets/test_server.py"
 
-for guide_spec in "$core_guide:$core_shell" "$guide:$guide_shell"; do
-    source_path="${guide_spec%%:*}"
-    shell_path="${guide_spec#*:}"
-    awk '
-        /^```bash$/ { in_shell = 1; next }
-        /^```$/ && in_shell { in_shell = 0; print ""; next }
-        in_shell { print }
-    ' "$source_path" > "$shell_path"
-    bash -n "$shell_path"
-done
+awk '
+    /^```bash$/ { in_shell = 1; next }
+    /^```$/ && in_shell { in_shell = 0; print ""; next }
+    in_shell { print }
+' "$guide" > "$guide_shell"
+bash -n "$guide_shell"
 
 echo "single complete getting-started guide contract passed"

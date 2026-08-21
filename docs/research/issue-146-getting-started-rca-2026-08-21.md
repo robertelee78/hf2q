@@ -32,12 +32,13 @@ search/fetch/crawl/extract.
 
 ## Post-landing regression discovered during review
 
-The first landing still left a second, contradictory journey in
-`docs/getting-started.md`. A newer source-first rewrite had reached `main`
-while the issue-146 correction was being prepared. During rebase, that file was
-preserved as the newer side of the conflict instead of being checked against
-the user's stated outcome. The regression was then made worse by changing
-`scripts/test_getting_started_guide.sh` to accept both journeys.
+The first landing incorrectly split one guide into two. A newer source-first
+rewrite of `docs/getting-started.md` had reached `main` while the issue-146
+correction was being prepared. During rebase, that file was preserved as the
+newer side of the conflict and a second guide file was added for the complete
+journey. Neither the split nor the second file was requested. The regression
+was then made worse by changing `scripts/test_getting_started_guide.sh` to
+accept both journeys.
 
 That alternate document told users to run a fresh source conversion, claimed
 the command produced a projector, served only the text model, and reduced
@@ -51,13 +52,13 @@ CI passed because the test encoded the regression as required behavior. This
 was a validation-oracle failure, not evidence that both paths met the same
 contract.
 
-The correction removes the competing executable journey. The generic
-`docs/getting-started.md` page now points to the one complete guide, the README
-describes that same path, and the complete guide no longer offers an unproved
-conversion substitute. The contract test now rejects the source-conversion
-command and text-only wording on every onboarding surface while requiring the
-published pair, `--mmproj`, text/SSE/image proof, full AK, stock Build tools,
-research tools, and cleanup.
+The correction restores the complete journey directly in the one canonical
+`docs/getting-started.md`, removes the extra guide file, and points every
+repository entry to that file. The guide no longer offers an unproved
+conversion substitute. The contract test rejects a second guide, the
+source-conversion command, and text-only wording while requiring the published
+pair, `--mmproj`, text/SSE/image proof, full AK, stock Build tools, research
+tools, and cleanup.
 
 ## User-visible failures
 
