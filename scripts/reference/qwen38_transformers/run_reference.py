@@ -94,6 +94,22 @@ def reference_input_hash_view(reference_input: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def prediction_point_kind(point: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    value = point.get("kind")
+    if not isinstance(value, dict):
+        raise ValueError("prediction point kind is not a tagged object")
+    tag = value.get("kind")
+    if tag == "teacher_forced":
+        expected_keys = {"kind", "target_token_index", "target_token_id"}
+    elif tag == "generation_next":
+        expected_keys = {"kind"}
+    else:
+        raise ValueError("prediction point kind is unsupported")
+    if set(value) != expected_keys:
+        raise ValueError("prediction point kind fields are not canonical")
+    return tag, value
+
+
 def validate_reference_input(reference_input: dict[str, Any]) -> None:
     expected = sha256_bytes(canonical_json(reference_input_hash_view(reference_input)))
     if reference_input.get("reference_input_sha256") != expected:
@@ -127,9 +143,14 @@ def validate_reference_input(reference_input: dict[str, Any]) -> None:
             != point["prefix_token_ids_sha256"]
         ):
             raise ValueError("prediction point prefix differs from retained tokens")
-        if point["kind"] == "teacher_forced":
-            target_index = int(point["target_token_index"])
-            if tokens[target_index] != int(point["target_token_id"]):
+        kind, kind_value = prediction_point_kind(point)
+        if kind == "teacher_forced":
+            target_index = int(kind_value["target_token_index"])
+            if (
+                target_index != prefix_count
+                or target_index >= len(tokens)
+                or tokens[target_index] != int(kind_value["target_token_id"])
+            ):
                 raise ValueError("teacher-forced target differs from retained tokens")
 
 
@@ -263,7 +284,10 @@ def execute_plan(reference_input: dict[str, Any], writer: TargetWriter, model: A
 
         prompt = prompts.get(stable_id)
         if prompt is not None:
-            if len(points) != 1 or points[0]["kind"] != "generation_next":
+            if (
+                len(points) != 1
+                or prediction_point_kind(points[0])[0] != "generation_next"
+            ):
                 raise ValueError("generation example has a non-canonical point schedule")
             generated = [first_token]
             for _ in range(1, GREEDY_TOKEN_COUNT):
@@ -370,6 +394,7 @@ def main() -> int:
         "greedy_trajectories": trajectories,
         "implementation": {
             "name": "huggingface_transformers.Qwen3_5ForConditionalGeneration",
+            "producer_sha256": sha256_file(Path(__file__).resolve())[1],
             "repository_url": TRANSFORMERS_REPOSITORY,
             "repository_commit": TRANSFORMERS_COMMIT,
             "package_version": transformers.__version__,
