@@ -12,7 +12,7 @@ Severity: release-blocking onboarding failure
 The guide promised a working local abliterated Qwen3.8 model inside a working
 OpenCode/Agentic Kit harness. It delivered neither.
 
-The recommended `qwen38-abliterated-sft-q5_k_m.gguf` was a llama.cpp/L40
+The recommended `qwen38-abliterated-sft-q5_k_m.gguf` was a peer/L40
 artifact whose Q5_K embedding tensor is unsupported by hf2q's direct Metal
 embedding gather. hf2q loaded the file and reported ready, but every generation
 failed with HTTP 500. The guide never made a real completion request before
@@ -33,7 +33,7 @@ search/fetch/crawl/extract.
 ## User-visible failures
 
 1. **Wrong GGUF for hf2q.** The guide downloaded the author-hosted Q5_K_M made
-   for llama.cpp/L40. hf2q's runtime cannot directly gather its Q5_K
+   for the peer on L40. hf2q's runtime cannot directly gather its Q5_K
    `token_embd.weight`, so generation returned 500.
 2. **Readiness was treated as generation proof.** `/readyz` returned 200 after
    load even though the first embedding/prefill could not execute. Runtime
@@ -83,7 +83,7 @@ search/fetch/crawl/extract.
 The Q5 file was immutable and checksum-pinned, but those properties prove only
 identity and integrity. They do not prove that hf2q supports every tensor type
 needed for inference. The artifact's own documentation described it as an
-L40/llama.cpp build. The guide substituted “externally produced GGUF validates
+L40 build for the peer. The guide substituted “externally produced GGUF validates
 at serve time” for an execution compatibility test.
 
 The conversion pipeline already produced a native hf2q Q4_K_M text GGUF, but
@@ -158,7 +158,7 @@ A source-matched hf2q pair was published to
 | F16 projector | `gguf/qwen38-abliterated-sft-hf2q-q4_k_m-mmproj.gguf` | 927,606,848 | `463b264713f8e081f0fae753c80d8089308e01b1e2ac0948dd9966d0711d8f1b` |
 
 The root `GGUFs.md`, checksum file, and machine-readable manifest distinguish
-this pair from the existing llama.cpp/L40 artifacts. The text model embeds the
+this pair from the existing peer/L40 artifacts. The text model embeds the
 required projector digest and mixed pairs fail closed.
 
 ### Completed guide correction
