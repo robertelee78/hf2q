@@ -10500,3 +10500,23 @@ Two changes close the "every response reports its cached-token count" gap:
    Header absence = "streaming / unknown", never "zero"; the SSE usage frame
    is the authoritative streaming surface. Pin:
    `cached_tokens_header_stamps_exact_count_including_zero`.
+
+## 2026-08-20 — guarantees tune-up item 5b: TQ memory-savings claim cites its real pin
+
+README's performance section cited `tests/qh35_no_f32_kv_alloc_with_tq_kv.rs`
+as the in-tree regression pin for the 3.94× TQ KV memory-savings claim —
+that file never existed in any branch's history. The claim itself IS pinned,
+just elsewhere: `full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_32k`
+(+ 8K sibling) in `src/inference/models/qwen35/kv_cache.rs` asserts
+`f32_k_v_bytes == 0` with TQ active and the exact 340,787,200-byte vs
+1,342,177,280-byte (3.94×) totals at the 32K shape. A `tests/` integration
+pin is structurally unavailable: the lib target is a deliberate narrow
+facade (kv_persist leaves only) and pulling `inference` in would defeat it —
+which is why the promised file was never written. README now cites the real
+pins + the `cargo test --locked --bin hf2q
+full_attn_bytes_breakdown_tq_on_drops_f32` invocation.
+
+**Open half (queued):** the same README section's throughput claims
+(prefill 1.24×, decode 1.29× vs peer-FA) are operator-driven re-bench with
+no CI gate — re-verification on quiet hardware with documented commands is
+scheduled after the 0.1.7 release window as its own task.
