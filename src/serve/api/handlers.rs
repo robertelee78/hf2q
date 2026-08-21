@@ -823,6 +823,7 @@ async fn chat_completions_with_prepared(
         summarized_messages,
         summary_tokens,
     );
+    apply_cached_tokens_header(&mut response, result.cached_tokens);
     apply_vit_transparency_headers(
         &mut response,
         vit_forward_ms,
@@ -1078,6 +1079,26 @@ fn apply_transparency_headers(
         if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
             headers.insert(HeaderName::from_static("x-hf2q-summary-tokens"), v);
         }
+    }
+}
+
+/// Guarantees tune-up item 5a (2026-08-20): `X-HF2Q-Cached-Tokens`
+/// transparency header (cf. `X-HF2Q-Overflow-Policy`) so orchestrators
+/// read cache effectiveness without parsing the response body.
+///
+/// Stamped on UNARY chat-completion responses only — unary always
+/// knows the exact count because the response is built after
+/// generation. Streaming responses OMIT the header (the count is only
+/// established worker-side after the SSE response headers have left)
+/// and carry it in the final usage frame instead
+/// (`prompt_tokens_details.cached_tokens`, always present when usage
+/// is emitted). Header ABSENCE therefore means "streaming / unknown",
+/// never "zero" — a zero is stamped explicitly as `0`.
+fn apply_cached_tokens_header(resp: &mut Response, cached_tokens: usize) {
+    use axum::http::{header::HeaderName, HeaderValue};
+    if let Ok(v) = HeaderValue::from_str(&cached_tokens.to_string()) {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("x-hf2q-cached-tokens"), v);
     }
 }
 
@@ -12591,6 +12612,38 @@ mod api_thinking_default_tests {
         assert_eq!(
             resolved.get("reasoning_effort"),
             Some(&serde_json::Value::String("high".into()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod cached_tokens_header_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    /// Guarantees tune-up item 5a (2026-08-20): the unary transparency
+    /// header stamps the exact cached-token count — including an
+    /// explicit `0` on a cache miss. Absence of the header is reserved
+    /// for streaming responses (count unknown at header time), so a
+    /// stamped zero and a missing header are distinguishable states.
+    #[test]
+    fn cached_tokens_header_stamps_exact_count_including_zero() {
+        let mut resp = (StatusCode::OK, "x").into_response();
+        apply_cached_tokens_header(&mut resp, 1234);
+        assert_eq!(
+            resp.headers()
+                .get("x-hf2q-cached-tokens")
+                .and_then(|v| v.to_str().ok()),
+            Some("1234")
+        );
+        let mut zero = (StatusCode::OK, "x").into_response();
+        apply_cached_tokens_header(&mut zero, 0);
+        assert_eq!(
+            zero.headers()
+                .get("x-hf2q-cached-tokens")
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+            "a known-zero is stamped explicitly; absence is reserved for streaming"
         );
     }
 }

@@ -6704,11 +6704,10 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
         gpu_dispatch_count: Some(mlx_native::dispatch_count().saturating_sub(pre_dispatches)),
         // Slot-aware mode reports prompt-cache HIT only (LCP/chunked
         // are disabled in slot-aware mode per the iter-LCP deferral).
-        cached_prompt_tokens: if prompt_cache_hit {
-            Some(prompt_len)
-        } else {
-            None
-        },
+        // Item 5a (2026-08-20): a miss is a known zero — report
+        // Some(0), never None (the usage frame always carries an
+        // explicit cached_tokens).
+        cached_prompt_tokens: Some(if prompt_cache_hit { prompt_len } else { 0 }),
         reasoning_tokens: if reasoning_token_count > 0 {
             Some(reasoning_token_count)
         } else {
@@ -8466,7 +8465,9 @@ pub(super) fn generate_stream_qwen35_once_extended(
         }),
         gpu_sync_count: Some(mlx_native::sync_count().saturating_sub(pre_syncs)),
         gpu_dispatch_count: Some(mlx_native::dispatch_count().saturating_sub(pre_dispatches)),
-        cached_prompt_tokens: (cached_tokens > 0).then_some(cached_tokens),
+        // Item 5a (2026-08-20): a known-zero count is Some(0), never
+        // None — the usage frame always carries explicit cached_tokens.
+        cached_prompt_tokens: Some(cached_tokens),
         reasoning_tokens: if reasoning_token_count > 0 {
             Some(reasoning_token_count)
         } else {

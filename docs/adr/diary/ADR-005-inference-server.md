@@ -10475,3 +10475,28 @@ the bail when the real worker dispatch lands — full ADR-041 execution is
 approved and targeted at 0.1.8. Pins:
 `load_engine_refuses_dense_qwen3vl_until_adr041_engine_seam` (+ upstream-arch
 sibling) replace the two iter-228a routing pins.
+
+## 2026-08-20 — guarantees tune-up item 5a: cached-token reporting is never ambiguous
+
+Two changes close the "every response reports its cached-token count" gap:
+
+1. **SSE usage frames always carry `prompt_tokens_details`.** With
+   `stream_options.include_usage` (the OpenAI opt-in, unchanged), the final
+   chunk previously omitted `prompt_tokens_details` whenever the producer
+   reported no cached tokens — indistinguishable from "server doesn't report
+   caching". The central usage build (`sse.rs`) now always emits
+   `prompt_tokens_details.cached_tokens`, with an explicit `0` on a miss;
+   qwen35's two producers report known-zero as `Some(0)` (`None` = "not
+   measured", rendered as 0). Pin:
+   `include_usage_cache_miss_reports_explicit_zero_cached_tokens`.
+
+2. **`X-HF2Q-Cached-Tokens` transparency header on unary responses**
+   (`apply_cached_tokens_header`, cf. `X-HF2Q-Overflow-Policy`). Unary always
+   knows the exact count (response built post-generation), including explicit
+   `0`. **Streaming responses deliberately OMIT the header**: the cache
+   decision (full-equality replay or prefix hit) is made worker-side after
+   the SSE response headers have left, and a probe-time advisory value could
+   drift — under the no-fake-numbers mantra, omission beats approximation.
+   Header absence = "streaming / unknown", never "zero"; the SSE usage frame
+   is the authoritative streaming surface. Pin:
+   `cached_tokens_header_stamps_exact_count_including_zero`.
