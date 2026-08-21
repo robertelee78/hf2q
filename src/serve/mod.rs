@@ -893,6 +893,10 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 );
             }
             if arch == ARCH_QWEN35 || arch == ARCH_QWEN35MOE {
+                anyhow::ensure!(
+                    args.mmproj.is_none() && args.image.is_none(),
+                    "Qwen vision is served through `hf2q serve --model <gguf> --mmproj <projector>`; `hf2q generate` does not load a Qwen projector and refuses to ignore --mmproj/--image"
+                );
                 // Qwen3.6 reuses Qwen3.5's architecture strings and forward
                 // graph. The production autoregressive path is now the
                 // default for both CLI and serving; only the separate unsafe
@@ -924,6 +928,18 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             );
         }
     }
+
+    // Cooperating readers hold a shared pair lock from before the text model
+    // is opened until the projector has been validated/loaded. Conversion
+    // takes the exclusive side only for its short publication transaction.
+    let pair_read_guard = args
+        .mmproj
+        .as_ref()
+        .map(|projector| {
+            crate::core::paired_artifact::PairReadGuard::acquire(model_path, projector)
+                .map_err(|error| anyhow::anyhow!(error))
+        })
+        .transpose()?;
 
     // ADR-018 C3 — unified load path.
     //
@@ -1030,6 +1046,17 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             let mmproj_sha256 = Some(crate::core::sha256::compute_file_sha256(mmp_path).map_err(
                 |error| anyhow::anyhow!("hash mmproj '{}': {error}", mmp_path.display()),
             )?);
+            pair_read_guard
+                .as_ref()
+                .expect("pair guard acquired whenever --mmproj is present")
+                .validate(
+                    &gguf,
+                    &mmp_gguf,
+                    mmproj_sha256
+                        .as_deref()
+                        .expect("projector digest computed before pair validation"),
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
             info.vision_projector = Some(load_info::VisionProjector {
                 mmproj_path: mmp_path.clone(),
                 mmproj_sha256: mmproj_sha256.clone(),
@@ -1097,6 +1124,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         } else {
             None
         };
+    drop(pair_read_guard);
 
     load_info::emit_tracing(&info);
     let mut stdout = std::io::stdout();
@@ -4388,6 +4416,13 @@ pub fn cmd_serve(
         .model
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
+    let pair_read_guard = match (args.model.as_ref(), args.mmproj.as_ref()) {
+        (Some(text), Some(projector)) => Some(
+            crate::core::paired_artifact::PairReadGuard::acquire(text, projector)
+                .map_err(|error| anyhow::anyhow!(error))?,
+        ),
+        _ => None,
+    };
     let local_artifacts =
         api::local_artifacts::LocalArtifactInventory::for_serve(&args.model_dirs)?;
     let mut state = api::AppState::new_for_serve(
@@ -5030,6 +5065,18 @@ pub fn cmd_serve(
             .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
         let mmproj_sha256 = crate::core::sha256::compute_file_sha256(mmp_path)
             .with_context(|| format!("hash vision projector '{}'", mmp_path.display()))?;
+        let text_path = args.model.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--mmproj requires --model so hf2q can lock and validate the complete pair"
+            )
+        })?;
+        let text_gguf = mlx_native::gguf::GgufFile::open(text_path)
+            .map_err(|error| anyhow::anyhow!("text GGUF pair preflight failed: {error}"))?;
+        pair_read_guard
+            .as_ref()
+            .expect("pair guard acquired whenever --model and --mmproj are present")
+            .validate(&text_gguf, &gguf, &mmproj_sha256)
+            .map_err(|error| anyhow::anyhow!(error))?;
         let mmp_config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&gguf)
             .map_err(|e| anyhow::anyhow!("mmproj GGUF config parse failed: {e}"))?;
         // Walk the GGUF's tensor list against the arch-agnostic
@@ -5190,6 +5237,7 @@ pub fn cmd_serve(
     } else {
         (None, None)
     };
+    drop(pair_read_guard);
 
     // --- Build router ---
     // `state` was constructed above (iter-209) with the cache + hardware

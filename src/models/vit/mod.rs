@@ -123,6 +123,16 @@ pub fn convert_vision_tower_to_path_with_source(
     output: &Path,
     source_sha256: Option<&str>,
 ) -> Result<(), VitConvertError> {
+    convert_vision_tower_to_path_with_source_and_pair(hf_repo_dir, output, source_sha256, None)
+}
+
+/// Convert a vision tower with optional source and paired-generation metadata.
+pub fn convert_vision_tower_to_path_with_source_and_pair(
+    hf_repo_dir: &Path,
+    output: &Path,
+    source_sha256: Option<&str>,
+    pair_generation: Option<&str>,
+) -> Result<(), VitConvertError> {
     let config_path = hf_repo_dir.join("config.json");
     let raw = std::fs::read_to_string(&config_path)
         .map_err(|e| VitConvertError::Config(VisionConfigError::Io(e.to_string())))?;
@@ -163,11 +173,12 @@ pub fn convert_vision_tower_to_path_with_source(
     let tensors = convert::load_vision_tensors(hf_repo_dir, &vision_config)?;
     let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
     let temporary_path = temporary.into_temp_path();
-    gguf_emit::write_mmproj_gguf_with_provenance(
+    gguf_emit::write_mmproj_gguf_with_provenance_and_pair(
         &temporary_path,
         &vision_config,
         &tensors,
         source_sha256,
+        pair_generation,
     )?;
     std::fs::File::open(&temporary_path)?.sync_all()?;
     temporary_path

@@ -156,7 +156,7 @@ pub(crate) fn run_convert_with_stored_evidence(
             source_artifacts,
             converter_git_commit,
         }),
-        None,
+        PairBinding::default(),
     )?
     .ok_or_else(|| {
         ConvertError::Source(SourceError::Safetensors(

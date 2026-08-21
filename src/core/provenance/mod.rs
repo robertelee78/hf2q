@@ -164,6 +164,30 @@ pub fn detect<M: MetadataLookup + ?Sized>(metadata: &M) -> Provenance {
     }
 }
 
+/// Read the text GGUF's projector binding independently of provenance.
+///
+/// Local and externally-copied artifacts may intentionally omit the source
+/// receipt keys used by [`detect`], but a present projector digest is still a
+/// serving-time integrity contract and must never be discarded with the
+/// provenance classification.
+pub fn projector_sha256<M: MetadataLookup + ?Sized>(
+    metadata: &M,
+) -> Result<Option<String>, String> {
+    let Some(value) = metadata
+        .get_string(KEY_MMPROJ_SHA256)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{KEY_MMPROJ_SHA256} must be exactly 64 hexadecimal characters"
+        ));
+    }
+    Ok(Some(value.to_ascii_lowercase()))
+}
+
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
@@ -210,6 +234,16 @@ mod tests {
         ]);
         assert_eq!(detect(&m), Provenance::External);
         assert!(!detect(&m).is_hf2q());
+    }
+
+    #[test]
+    fn projector_binding_survives_external_provenance_classification() {
+        let m = meta(&[(KEY_MMPROJ_SHA256, &"B".repeat(64))]);
+        assert_eq!(detect(&m), Provenance::External);
+        assert_eq!(projector_sha256(&m).unwrap(), Some("b".repeat(64)));
+
+        let malformed = meta(&[(KEY_MMPROJ_SHA256, "not-a-digest")]);
+        assert!(projector_sha256(&malformed).is_err());
     }
 
     #[test]

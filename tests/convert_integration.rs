@@ -617,6 +617,37 @@ fn convert_qwen38_default_pair_fails_before_writes_without_processor_config() {
 }
 
 #[test]
+fn convert_qwen38_default_refuses_vision_tensors_without_vision_config() {
+    let model_dir = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_qwen38(model_dir.path());
+    let config_path = model_dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("vision_config");
+    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let text = output_dir.path().join("tiny-qwen38.gguf");
+    let projector = output_dir.path().join("tiny-qwen38-mmproj.gguf");
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("q8_0")
+        .arg("--output")
+        .arg(&text)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "source contains vision tensors but has no vision_config",
+        ));
+
+    assert!(!text.exists());
+    assert!(!projector.exists());
+}
+
+#[test]
 fn convert_qwen38_default_produces_projector_bound_pair() {
     let model_dir = tempfile::tempdir().unwrap();
     let output_dir = tempfile::tempdir().unwrap();
@@ -628,6 +659,10 @@ fn convert_qwen38_default_produces_projector_bound_pair() {
     .unwrap();
     let text = output_dir.path().join("tiny-qwen38.gguf");
     let projector = output_dir.path().join("tiny-qwen38-mmproj.gguf");
+    let stale_tensor_receipt = text.with_extension("gguf.tensor-conversion.json");
+    let stale_projector_tensor_receipt = projector.with_extension("gguf.tensor-conversion.json");
+    fs::write(&stale_tensor_receipt, b"stale").unwrap();
+    fs::write(&stale_projector_tensor_receipt, b"stale").unwrap();
 
     Command::cargo_bin("hf2q")
         .unwrap()
@@ -642,6 +677,8 @@ fn convert_qwen38_default_produces_projector_bound_pair() {
 
     assert!(text.is_file());
     assert!(projector.is_file());
+    assert!(!stale_tensor_receipt.exists());
+    assert!(!stale_projector_tensor_receipt.exists());
     let projector_sha = hex::encode(Sha256::digest(fs::read(&projector).unwrap()));
     let text_gguf = mlx_native::gguf::GgufFile::open(&text).unwrap();
     assert_eq!(
@@ -650,12 +687,29 @@ fn convert_qwen38_default_produces_projector_bound_pair() {
     );
     let projector_gguf =
         mlx_native::gguf::GgufFile::open(&projector).expect("projector must reopen as GGUF");
+    let pair_generation = text_gguf
+        .metadata_string("hf2q.pair_generation")
+        .expect("paired text must carry a generation");
+    assert_eq!(
+        projector_gguf.metadata_string("hf2q.pair_generation"),
+        Some(pair_generation)
+    );
+    assert_eq!(
+        text_gguf.metadata_string("hf2q.pair_schema_version"),
+        Some("1")
+    );
+    assert_eq!(
+        projector_gguf.metadata_string("hf2q.pair_schema_version"),
+        Some("1")
+    );
     assert!(
         projector_gguf
             .tensor_info("v.position_embd.weight")
             .is_some(),
         "the paired projector must contain the fixture's mapped vision tensor"
     );
+    assert!(!text.with_extension("gguf.pair.txn.json").exists());
+    assert!(text.with_extension("gguf.pair.lock").is_file());
 }
 
 /// Sibling test — feeding an unsupported `model_type` surfaces typed
@@ -1397,7 +1451,7 @@ fn convert_q5_1_tiny_qwen35moe_round_trip() {
 ///   - parallel dense FFN (`mlp.{gate,up,down}_proj`) alongside the
 ///     routed experts
 ///   - router projection (`router.proj.weight`)
-///   - one off-path vision-tower tensor (verifies the
+///   - two off-path vision-tower tensors (verify the
 ///     `MappedTensor::Drop` path silently discards rather than erroring)
 ///
 /// Shape choices (all Q8_0 block-aligned at block=32):
@@ -1447,8 +1501,13 @@ fn synthesize_tiny_gemma4_real_arch(dir: &Path) {
     // failure would surface here as a non-zero exit code.
     tensors.push((
         "model.vision_tower.patch_embedder.input_proj.weight".into(),
-        vec![HIDDEN, HIDDEN],
-        mk_f32_bytes(HIDDEN * HIDDEN, 999),
+        vec![HIDDEN, 3 * 2 * 2],
+        mk_f32_bytes(HIDDEN * 3 * 2 * 2, 999),
+    ));
+    tensors.push((
+        "model.vision_tower.encoder.layers.0.input_layernorm.weight".into(),
+        vec![HIDDEN],
+        mk_f32_bytes(HIDDEN, 1000),
     ));
 
     // ---- Per-block -------------------------------------------------------
@@ -1591,6 +1650,7 @@ fn convert_gemma4_real_arch_round_trip() {
         .arg(model_dir.path())
         .arg("--quant")
         .arg("q8_0")
+        .arg("--text-only")
         .arg("-o")
         .arg(out.path())
         .assert()
@@ -1850,6 +1910,52 @@ fn convert_gemma4_real_arch_round_trip() {
         Some(61),
         "eos_token_id = vocab_size - 3 per fixture layout"
     );
+}
+
+#[test]
+fn convert_gemma4_default_produces_projector_bound_pair() {
+    let model_dir = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_gemma4_real_arch(model_dir.path());
+    let config_path = model_dir.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["vision_config"] = serde_json::json!({
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "depth": 1,
+        "num_attention_heads": 4,
+        "layer_norm_eps": 1.0e-6,
+        "image_size": 4,
+        "patch_size": 2
+    });
+    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let text = output_dir.path().join("tiny-gemma4.gguf");
+    let projector = output_dir.path().join("tiny-gemma4-mmproj.gguf");
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("q8_0")
+        .arg("--output")
+        .arg(&text)
+        .assert()
+        .success();
+
+    let text_gguf = mlx_native::gguf::GgufFile::open(&text).unwrap();
+    let projector_gguf = mlx_native::gguf::GgufFile::open(&projector).unwrap();
+    let projector_sha = hex::encode(Sha256::digest(fs::read(&projector).unwrap()));
+    assert_eq!(
+        text_gguf.metadata_string("hf2q.mmproj_sha256"),
+        Some(projector_sha.as_str())
+    );
+    assert_eq!(
+        text_gguf.metadata_string("hf2q.pair_generation"),
+        projector_gguf.metadata_string("hf2q.pair_generation")
+    );
+    assert!(projector_gguf.tensor_info("v.patch_embd.weight").is_some());
 }
 
 // ============================================================================
