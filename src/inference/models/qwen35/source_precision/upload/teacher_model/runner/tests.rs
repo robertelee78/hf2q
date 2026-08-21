@@ -5,6 +5,7 @@ use super::*;
 use crate::inference::models::qwen35::delta_net::DeltaNetLayerWeights;
 use crate::inference::models::qwen35::ffn::DenseFfnWeights;
 use crate::inference::models::qwen35::full_attn::FullAttnLayerWeights;
+use crate::inference::models::qwen35::gpu_full_attn::FullAttnQGateWeightsGpu;
 use crate::inference::models::qwen35::kv_cache::prepare_qwen35_base_text_cache;
 use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
 use crate::inference::models::qwen35::source_precision::topology::admit_qwen35_bf16_topology;
@@ -149,20 +150,25 @@ pub(in crate::inference::models::qwen35::source_precision::upload::teacher_model
                 down: bf16_values(&layer.ffn.down),
             });
             match &layer.attention {
-                PreparedQwen35SourceAttentionV1::Full(weights) => Qwen35LayerWeights::FullAttn {
-                    attn: FullAttnLayerWeights {
-                        attn_norm: f32_values(&weights.attn_norm),
-                        post_attn_norm: f32_values(&weights.post_attn_norm),
-                        wq: bf16_values(&weights.wq),
-                        wk: bf16_values(&weights.wk),
-                        wv: bf16_values(&weights.wv),
-                        w_gate: bf16_values(&weights.w_gate),
-                        attn_q_norm: f32_values(&weights.attn_q_norm),
-                        attn_k_norm: f32_values(&weights.attn_k_norm),
-                        wo: bf16_values(&weights.wo),
-                    },
-                    ffn,
-                },
+                PreparedQwen35SourceAttentionV1::Full(weights) => {
+                    let FullAttnQGateWeightsGpu::Split { wq, w_gate, .. } = &weights.q_gate else {
+                        panic!("source teacher must retain split Q/gate weights");
+                    };
+                    Qwen35LayerWeights::FullAttn {
+                        attn: FullAttnLayerWeights {
+                            attn_norm: f32_values(&weights.attn_norm),
+                            post_attn_norm: f32_values(&weights.post_attn_norm),
+                            wq: bf16_values(wq),
+                            wk: bf16_values(&weights.wk),
+                            wv: bf16_values(&weights.wv),
+                            w_gate: bf16_values(w_gate),
+                            attn_q_norm: f32_values(&weights.attn_q_norm),
+                            attn_k_norm: f32_values(&weights.attn_k_norm),
+                            wo: bf16_values(&weights.wo),
+                        },
+                        ffn,
+                    }
+                }
                 PreparedQwen35SourceAttentionV1::Linear(weights) => {
                     let channels = weights.ssm_conv1d.shape()[0];
                     let width = weights.ssm_conv1d.shape()[1];

@@ -93,10 +93,11 @@ use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType
 use mlx_native::ops::repeat_tiled::{dispatch_repeat_tiled_f32, RepeatTiledParams};
 use mlx_native::ops::rms_norm;
 use mlx_native::ops::ssm_conv::{dispatch_ssm_conv, dispatch_ssm_conv_with_capture, SsmConvParams};
+use mlx_native::ops::transpose::transpose_2d;
 // ADR-015 iter14: `build_ssm_norm_gate_params` lifted inline to
 // `pooled_alloc_buffer` at every call site for unretained-refs ARC anchoring.
 use mlx_native::ops::ssm_norm_gate::dispatch_ssm_norm_gate;
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{metal, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
 use super::encoder_stage::LayerEncoder;
@@ -104,6 +105,57 @@ use super::execution_dispatch::quantized_matmul_ggml;
 use super::gpu_full_attn::{download_f32, upload_f32, upload_f32_weight, upload_q4_0_from_f32};
 use crate::debug::INVESTIGATION_ENV;
 use crate::serve::multi_seq_kv::SlotId;
+
+/// Materialize the final per-token convolution capture into the inactive
+/// ping-pong state buffer before the caller flips it current.
+///
+/// `dispatch_ssm_conv_with_capture` writes every state as
+/// `[token, K-1, channels]`, but deliberately does not write the ordinary
+/// `[channels, K-1]` `conv_state_out`. Speculative verification still flips
+/// the ping-pong pair exactly once, so leaving `conv_state_out` untouched
+/// would make stale state current after a fully accepted block. A view of
+/// the last capture row plus the existing transpose kernel closes that gap in
+/// the same command buffer; no host readback or second convolution is needed.
+#[allow(clippy::too_many_arguments)]
+fn materialize_final_conv_capture(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &metal::DeviceRef,
+    conv_capture: &MlxBuffer,
+    conv_state_out: &MlxBuffer,
+    seq_len: u32,
+    channels: u32,
+    k_width: u32,
+) -> Result<()> {
+    let k_minus_one = k_width
+        .checked_sub(1)
+        .context("captured convolution requires k_width >= 2")? as usize;
+    let channels = channels as usize;
+    let per_token = k_minus_one
+        .checked_mul(channels)
+        .context("captured convolution row size overflow")?;
+    let last_row = (seq_len as usize)
+        .checked_sub(1)
+        .context("captured convolution requires a non-empty token batch")?;
+    let byte_offset = last_row
+        .checked_mul(per_token)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .context("captured convolution byte offset overflow")?;
+    let final_capture = conv_capture.slice_view(byte_offset as u64, per_token);
+    encoder.memory_barrier();
+    transpose_2d(
+        encoder,
+        registry,
+        device,
+        &final_capture,
+        conv_state_out,
+        k_minus_one,
+        channels,
+        DType::F32,
+    )
+    .context("transpose final convolution capture into ping-pong state")?;
+    Ok(())
+}
 
 /// Wave 5b iter 5 — chunk-pipeline prefill threshold.
 ///
@@ -323,6 +375,7 @@ fn narrow_capture_states_to_slot(
     d_v: u32,
     n_v_heads: u32,
     n_seqs_alloc: u32,
+    active_tokens: u32,
 ) -> MlxBuffer {
     // Derive n_tokens_max from the buffer's actual element count so a
     // forward-path mis-sizing surfaces inside the dispatcher's
@@ -343,8 +396,9 @@ fn narrow_capture_states_to_slot(
     } else {
         per_seq_elems / state_elems
     };
-    let (off, n) = slot_capture_states_region(slot_id, d_k, d_v, n_v_heads, n_tokens_max as u32);
-    capture.slice_view(off, n)
+    debug_assert!(active_tokens as usize <= n_tokens_max);
+    let (off, _) = slot_capture_states_region(slot_id, d_k, d_v, n_v_heads, n_tokens_max as u32);
+    capture.slice_view(off, state_elems * active_tokens as usize)
 }
 
 #[inline]
@@ -354,6 +408,7 @@ fn narrow_conv_capture_to_slot(
     conv_channels: u32,
     k_minus_one: u32,
     n_seqs_alloc: u32,
+    active_tokens: u32,
 ) -> MlxBuffer {
     let total = conv_capture.element_count();
     let per_seq_elems = total / (n_seqs_alloc as usize).max(1);
@@ -370,9 +425,10 @@ fn narrow_conv_capture_to_slot(
     } else {
         per_seq_elems / per_token_elems
     };
-    let (off, n) =
+    debug_assert!(active_tokens as usize <= n_tokens_max);
+    let (off, _) =
         slot_conv_capture_region(slot_id, conv_channels, k_minus_one, n_tokens_max as u32);
-    conv_capture.slice_view(off, n)
+    conv_capture.slice_view(off, per_token_elems * active_tokens as usize)
 }
 
 /// `n_seqs` field for the kernel-side `GatedDeltaNetParams` /
@@ -407,6 +463,7 @@ fn qkv_channels_for(n_k_heads: u32, n_v_heads: u32, d_k: u32, d_v: u32) -> u32 {
 /// stay F32 because they are consumed by custom kernels that require F32.
 /// `ssm_conv1d_gpu` is stored transposed relative to the CPU/GGUF format
 /// (see module-level layout notes).
+#[derive(Clone)]
 pub struct DeltaNetWeightsGpu {
     pub attn_norm: MlxBuffer,
     /// Post-attention RMSNorm weight: `[hidden_size]`.
@@ -414,18 +471,22 @@ pub struct DeltaNetWeightsGpu {
     pub post_attn_norm: MlxBuffer,
     /// QKV concat projection `[qkv_channels, hidden_size]` — GGUF row-major.
     pub attn_qkv: MlxBuffer,
+    pub attn_qkv_ggml_type: GgmlType,
     /// Z-gate projection `[nv*dv, hidden_size]`.
     pub attn_gate: MlxBuffer,
+    pub attn_gate_ggml_type: GgmlType,
     /// SSM conv1d kernel, transposed to `[qkv_channels, K]` for the GPU kernel.
     pub ssm_conv1d: MlxBuffer,
     /// Alpha logit projection `[nv, hidden_size]`.
     pub ssm_alpha: MlxBuffer,
+    pub ssm_alpha_ggml_type: GgmlType,
     /// Alpha time-step bias `[nv]` — GPU buffer.
     pub ssm_dt_bias: MlxBuffer,
     /// Alpha time-step bias `[nv]` — CPU copy, avoids GPU download on hot path.
     pub ssm_dt_bias_cpu: Vec<f32>,
     /// Beta logit projection `[nv, hidden_size]`.
     pub ssm_beta: MlxBuffer,
+    pub ssm_beta_ggml_type: GgmlType,
     /// Log-decay base `[nv]` — GPU buffer.
     pub ssm_a: MlxBuffer,
     /// Log-decay base `[nv]` — CPU copy, avoids GPU download on hot path.
@@ -436,6 +497,7 @@ pub struct DeltaNetWeightsGpu {
     pub ssm_norm_cpu: Vec<f32>,
     /// Output projection `[hidden_size, nv*dv]`.
     pub ssm_out: MlxBuffer,
+    pub ssm_out_ggml_type: GgmlType,
 }
 
 impl DeltaNetWeightsGpu {
@@ -470,10 +532,15 @@ impl DeltaNetWeightsGpu {
             // bandwidth reduction vs BF16.  Uses quantized_matmul_ggml dispatch_mv
             // (decode) / dispatch_mm (prefill) — same deterministic kernel as FFN.
             attn_qkv: upload_q4_0_from_f32(&weights.attn_qkv, device)?,
+            attn_qkv_ggml_type: GgmlType::Q4_0,
             attn_gate: upload_q4_0_from_f32(&weights.attn_gate, device)?,
+            attn_gate_ggml_type: GgmlType::Q4_0,
             ssm_alpha: upload_q4_0_from_f32(&weights.ssm_alpha, device)?,
+            ssm_alpha_ggml_type: GgmlType::Q4_0,
             ssm_beta: upload_q4_0_from_f32(&weights.ssm_beta, device)?,
+            ssm_beta_ggml_type: GgmlType::Q4_0,
             ssm_out: upload_q4_0_from_f32(&weights.ssm_out, device)?,
+            ssm_out_ggml_type: GgmlType::Q4_0,
         })
     }
 
@@ -509,10 +576,15 @@ impl DeltaNetWeightsGpu {
             ssm_norm: upload_f32(&weights.ssm_norm, device)?,
             ssm_norm_cpu: weights.ssm_norm.clone(),
             attn_qkv: upload_f32(&weights.attn_qkv, device)?,
+            attn_qkv_ggml_type: GgmlType::F32,
             attn_gate: upload_f32(&weights.attn_gate, device)?,
+            attn_gate_ggml_type: GgmlType::F32,
             ssm_alpha: upload_f32(&weights.ssm_alpha, device)?,
+            ssm_alpha_ggml_type: GgmlType::F32,
             ssm_beta: upload_f32(&weights.ssm_beta, device)?,
+            ssm_beta_ggml_type: GgmlType::F32,
             ssm_out: upload_f32(&weights.ssm_out, device)?,
+            ssm_out_ggml_type: GgmlType::F32,
         })
     }
 }
@@ -656,6 +728,31 @@ pub fn apply_proj(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
+    apply_proj_with_ggml_type(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        GgmlType::Q4_0,
+        seq_len,
+        in_features,
+        out_features,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_proj_with_ggml_type(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ggml_type: GgmlType,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = super::decode_pool::pooled_alloc_buffer(
         device,
@@ -667,15 +764,16 @@ pub fn apply_proj(
 
     match weight.dtype() {
         DType::U8 => {
-            // Q4_0 GGML block path — fast decode (dispatch_mv) + prefill (dispatch_mm).
+            // Native GGML block path — storage type is part of the weight
+            // contract and must never be guessed from DType::U8.
             let params = GgmlQuantizedMatmulParams {
                 m: seq_len,
                 n: out_features,
                 k: in_features,
-                ggml_type: GgmlType::Q4_0,
+                ggml_type,
             };
             quantized_matmul_ggml(encoder, registry, device, input, weight, &mut dst, &params)
-                .context("quantized_matmul_ggml Q4_0")?;
+                .with_context(|| format!("quantized_matmul_ggml {ggml_type:?}"))?;
         }
         DType::BF16 => {
             if input.dtype() != DType::F32 || dst.dtype() != DType::F32 {
@@ -1016,16 +1114,43 @@ pub fn apply_proj_into(
     in_features: u32,
     out_features: u32,
 ) -> Result<()> {
+    apply_proj_into_with_ggml_type(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        GgmlType::Q4_0,
+        dst,
+        seq_len,
+        in_features,
+        out_features,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_proj_into_with_ggml_type(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ggml_type: GgmlType,
+    dst: &mut MlxBuffer,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<()> {
     match weight.dtype() {
         DType::U8 => {
             let params = GgmlQuantizedMatmulParams {
                 m: seq_len,
                 n: out_features,
                 k: in_features,
-                ggml_type: GgmlType::Q4_0,
+                ggml_type,
             };
             quantized_matmul_ggml(encoder, registry, device, input, weight, dst, &params)
-                .context("quantized_matmul_ggml Q4_0 (arena)")?;
+                .with_context(|| format!("quantized_matmul_ggml {ggml_type:?} (arena)"))?;
         }
         DType::BF16 => {
             if input.dtype() != DType::F32 || dst.dtype() != DType::F32 {
@@ -1437,6 +1562,7 @@ pub fn apply_gated_delta_net_chunk(
     // mlx-native cpu_reference_f32 both use `k_head = v_head % n_k_heads`
     // (tiled-style), inherited from the peer's `ggml_repeat` semantics
     // (the row-broadcast convention).
+    // (tiled-style row broadcasting).
     //
     // For Qwen3.6 GGUF tensor layout, **tiled** is the correct mapping —
     // confirmed by Wave 5b.3 pp4096 reproducer (commit c3e88a0): with
@@ -1556,6 +1682,8 @@ pub fn apply_gated_delta_net_chunk(
     // mapping then reduces to `kh = i_h / 1 = i_h`, which (after our tiled
     // pre-expansion) is the tiled GQA convention — matching autoregressive
     // and the peer's ggml_repeat semantics for Qwen3.6.
+    // pre-expansion) is the tiled GQA convention used by autoregressive
+    // Qwen3.6 execution.
     let p = ChunkGatedDeltaRuleParams {
         b: n_seqs,
         t: seq_len,
@@ -2162,6 +2290,7 @@ pub fn apply_gated_delta_net_chunk_with_arena(
 ///
 /// Gate: SiLU(x) = x / (1 + exp(-x)), matching the peer's build_norm_gated
 /// which calls `ggml_silu(ctx0, gate)`.
+/// Gate: `SiLU(x) = x / (1 + exp(-x))`.
 ///
 /// This variant accepts CPU slices directly, avoiding GPU downloads.
 /// Callers must ensure any pending GPU work for `attn_out_cpu` and `z_cpu`
@@ -2202,6 +2331,7 @@ pub fn apply_ssm_norm_and_gate(
                 let normed_val = head_row[d] * inv * ssm_norm_w_cpu[d];
                 let z_val = z_cpu[head_off + d];
                 // SiLU: x / (1 + exp(-x)) — matches the peer's ggml_silu
+                // SiLU: x / (1 + exp(-x)).
                 let z_silu = z_val / (1.0 + (-z_val).exp());
                 gated[head_off + d] = normed_val * z_silu;
             }
@@ -2339,8 +2469,9 @@ pub fn build_delta_net_layer(
     let state_in = &la_view.recurrent_in;
     let state_out = &la_view.recurrent_out;
     // Narrow capture buffers to the per-slot region when active.
-    let state_capture_view = state_capture
-        .map(|b| narrow_capture_states_to_slot(b, slot_id, d_k, d_v, n_v_heads, n_seqs_alloc));
+    let state_capture_view = state_capture.map(|b| {
+        narrow_capture_states_to_slot(b, slot_id, d_k, d_v, n_v_heads, n_seqs_alloc, seq_len)
+    });
     let conv_state_capture_view = conv_state_capture.map(|b| {
         narrow_conv_capture_to_slot(
             b,
@@ -2348,6 +2479,7 @@ pub fn build_delta_net_layer(
             /* conv_channels = */ qkv_channels_for(n_k_heads, n_v_heads, d_k, d_v),
             /* k_minus_one = */ k_width - 1,
             n_seqs_alloc,
+            seq_len,
         )
     });
     let state_capture: Option<&MlxBuffer> = state_capture_view.as_ref();
@@ -2537,22 +2669,24 @@ pub fn build_delta_net_layer(
         )?;
         enc.memory_barrier();
         // Ops 2a+2b+2c: qkv_proj, z_proj (concurrent)
-        let qkv_raw = apply_proj(
+        let qkv_raw = apply_proj_with_ggml_type(
             &mut enc,
             registry,
             device,
             &x_norm,
             &weights.attn_qkv,
+            weights.attn_qkv_ggml_type,
             seq_len,
             hidden_size,
             qkv_channels,
         )?;
-        let z = apply_proj(
+        let z = apply_proj_with_ggml_type(
             &mut enc,
             registry,
             device,
             &x_norm,
             &weights.attn_gate,
+            weights.attn_gate_ggml_type,
             seq_len,
             hidden_size,
             z_channels,
@@ -2577,6 +2711,16 @@ pub fn build_delta_net_layer(
                 ssm_conv_params,
             )
             .context("dispatch_ssm_conv_with_capture ops3 decode (K=N spec)")?;
+            materialize_final_conv_capture(
+                &mut enc,
+                registry,
+                device.metal_device(),
+                conv_capture_buf,
+                conv_state_out,
+                seq_len,
+                qkv_channels,
+                k_width,
+            )?;
         } else {
             dispatch_ssm_conv(
                 &mut enc,
@@ -2614,22 +2758,24 @@ pub fn build_delta_net_layer(
             d_k,
             rms_norm_eps,
         )?;
-        let alpha_logit_buf = apply_proj(
+        let alpha_logit_buf = apply_proj_with_ggml_type(
             &mut enc,
             registry,
             device,
             &x_norm,
             &weights.ssm_alpha,
+            weights.ssm_alpha_ggml_type,
             seq_len,
             hidden_size,
             n_v_heads,
         )?;
-        let beta_logit_buf = apply_proj(
+        let beta_logit_buf = apply_proj_with_ggml_type(
             &mut enc,
             registry,
             device,
             &x_norm,
             &weights.ssm_beta,
+            weights.ssm_beta_ggml_type,
             seq_len,
             hidden_size,
             n_v_heads,
@@ -2767,12 +2913,13 @@ pub fn build_delta_net_layer(
         .context("dispatch_ssm_norm_gate")?;
         enc.memory_barrier();
         // Op 9: out_proj
-        let output = apply_proj(
+        let output = apply_proj_with_ggml_type(
             &mut enc,
             registry,
             device,
             &gated_buf,
             &weights.ssm_out,
+            weights.ssm_out_ggml_type,
             seq_len,
             z_channels,
             hidden_size,
@@ -2809,22 +2956,24 @@ pub fn build_delta_net_layer(
                 rms_norm_eps,
             )?;
             enc.memory_barrier();
-            let qkv_raw = apply_proj(
+            let qkv_raw = apply_proj_with_ggml_type(
                 &mut enc,
                 registry,
                 device,
                 &x_norm,
                 &weights.attn_qkv,
+                weights.attn_qkv_ggml_type,
                 seq_len,
                 hidden_size,
                 qkv_channels,
             )?;
-            let z = apply_proj(
+            let z = apply_proj_with_ggml_type(
                 &mut enc,
                 registry,
                 device,
                 &x_norm,
                 &weights.attn_gate,
+                weights.attn_gate_ggml_type,
                 seq_len,
                 hidden_size,
                 z_channels,
@@ -2847,6 +2996,16 @@ pub fn build_delta_net_layer(
                     ssm_conv_params,
                 )
                 .context("dispatch_ssm_conv_with_capture ops3 prefill (K=N spec)")?;
+                materialize_final_conv_capture(
+                    &mut enc,
+                    registry,
+                    device.metal_device(),
+                    conv_capture_buf,
+                    conv_state_out,
+                    seq_len,
+                    qkv_channels,
+                    k_width,
+                )?;
             } else {
                 dispatch_ssm_conv(
                     &mut enc,
@@ -3034,22 +3193,24 @@ pub fn build_delta_net_layer(
                     d_k,
                     rms_norm_eps,
                 )?;
-                let alpha_logit_buf = apply_proj(
+                let alpha_logit_buf = apply_proj_with_ggml_type(
                     &mut enc,
                     registry,
                     device,
                     &x_norm,
                     &weights.ssm_alpha,
+                    weights.ssm_alpha_ggml_type,
                     seq_len,
                     hidden_size,
                     n_v_heads,
                 )?;
-                let beta_logit_buf = apply_proj(
+                let beta_logit_buf = apply_proj_with_ggml_type(
                     &mut enc,
                     registry,
                     device,
                     &x_norm,
                     &weights.ssm_beta,
+                    weights.ssm_beta_ggml_type,
                     seq_len,
                     hidden_size,
                     n_v_heads,
@@ -3151,12 +3312,13 @@ pub fn build_delta_net_layer(
             )
             .context("dispatch_ssm_norm_gate chunk prefill")?;
             enc.memory_barrier();
-            let output = apply_proj(
+            let output = apply_proj_with_ggml_type(
                 &mut enc,
                 registry,
                 device,
                 &gated_buf,
                 &weights.ssm_out,
+                weights.ssm_out_ggml_type,
                 seq_len,
                 z_channels,
                 hidden_size,
@@ -3190,22 +3352,24 @@ pub fn build_delta_net_layer(
                 d_k,
                 rms_norm_eps,
             )?;
-            let alpha_logit_buf = apply_proj(
+            let alpha_logit_buf = apply_proj_with_ggml_type(
                 &mut enc,
                 registry,
                 device,
                 &x_norm,
                 &weights.ssm_alpha,
+                weights.ssm_alpha_ggml_type,
                 seq_len,
                 hidden_size,
                 n_v_heads,
             )?;
-            let beta_logit_buf = apply_proj(
+            let beta_logit_buf = apply_proj_with_ggml_type(
                 &mut enc,
                 registry,
                 device,
                 &x_norm,
                 &weights.ssm_beta,
+                weights.ssm_beta_ggml_type,
                 seq_len,
                 hidden_size,
                 n_v_heads,
@@ -3241,11 +3405,12 @@ pub fn build_delta_net_layer(
             // rebase reconciliation: autoregressive prefill GDN uses the
             // simd_sum-based decode kernel (mirrors the peer's
             // kernel_gated_delta_net_f32_<NSG>) when D_k is supported.
+            // simd_sum-based decode kernel when D_k is supported.
             // Per-thread register state shrinks from D_k floats to NSG=D_k/32
             // floats (32x lower at D_k=128) and cross-lane reductions become
             // single-cycle simd_sum vs threadgroup_barrier+shared_memory.
-            // Measured at pp726: 2.04x prefill speedup (1010 -> 2061 t/s),
-            // ratio vs the peer 0.37x -> 0.75-1.18x (at peer parity).
+            // Measured at pp726: 2.04x prefill speedup (1010 -> 2061 t/s)
+            // with unchanged output parity.
             //
             // iter66a note: iter59-mtnsg originally added a `seq_len <=
             // NSG_PREFILL_MAX_TOKENS` upper bound (32) here; Stage-4 supersedes
@@ -3343,12 +3508,13 @@ pub fn build_delta_net_layer(
             )
             .context("dispatch_ssm_norm_gate prefill")?;
             enc.memory_barrier();
-            let output = apply_proj(
+            let output = apply_proj_with_ggml_type(
                 &mut enc,
                 registry,
                 device,
                 &gated_buf,
                 &weights.ssm_out,
+                weights.ssm_out_ggml_type,
                 seq_len,
                 z_channels,
                 hidden_size,
@@ -3512,10 +3678,17 @@ pub fn build_delta_net_layer_with_arena(
     let state_in = &la_view.recurrent_in;
     let state_out = &la_view.recurrent_out;
     let state_capture_view = state_capture.map(|buffer| {
-        narrow_capture_states_to_slot(buffer, slot_id, d_k, d_v, n_v_heads, n_seqs_alloc)
+        narrow_capture_states_to_slot(buffer, slot_id, d_k, d_v, n_v_heads, n_seqs_alloc, seq_len)
     });
     let conv_state_capture_view = conv_state_capture.map(|buffer| {
-        narrow_conv_capture_to_slot(buffer, slot_id, qkv_channels, k_width - 1, n_seqs_alloc)
+        narrow_conv_capture_to_slot(
+            buffer,
+            slot_id,
+            qkv_channels,
+            k_width - 1,
+            n_seqs_alloc,
+            seq_len,
+        )
     });
     let state_capture = state_capture_view.as_ref();
     let conv_state_capture = conv_state_capture_view.as_ref();
@@ -3682,23 +3855,25 @@ pub fn build_delta_net_layer_with_arena(
             rms_norm_eps,
         )?;
         enc.encoder().memory_barrier();
-        apply_proj_into(
+        apply_proj_into_with_ggml_type(
             enc.encoder(),
             registry,
             device,
             &arena.x_norm_buf,
             &weights.attn_qkv,
+            weights.attn_qkv_ggml_type,
             &mut arena.qkv_raw_buf,
             seq_len,
             hidden_size,
             qkv_channels,
         )?;
-        apply_proj_into(
+        apply_proj_into_with_ggml_type(
             enc.encoder(),
             registry,
             device,
             &arena.x_norm_buf,
             &weights.attn_gate,
+            weights.attn_gate_ggml_type,
             &mut arena.z_buf,
             seq_len,
             hidden_size,
@@ -3719,6 +3894,16 @@ pub fn build_delta_net_layer_with_arena(
                 ssm_conv_params,
             )
             .context("dispatch_ssm_conv_with_capture ops3 (arena)")?;
+            materialize_final_conv_capture(
+                enc.encoder(),
+                registry,
+                device.metal_device(),
+                capture,
+                conv_state_out,
+                seq_len,
+                qkv_channels,
+                k_width,
+            )?;
         } else {
             dispatch_ssm_conv(
                 enc.encoder(),
@@ -3832,23 +4017,25 @@ pub fn build_delta_net_layer_with_arena(
                 d_k,
                 rms_norm_eps,
             )?;
-            apply_proj_into(
+            apply_proj_into_with_ggml_type(
                 &mut enc,
                 registry,
                 device,
                 &arena.x_norm_buf,
                 &weights.ssm_alpha,
+                weights.ssm_alpha_ggml_type,
                 &mut arena.alpha_logit_buf,
                 seq_len,
                 hidden_size,
                 n_v_heads,
             )?;
-            apply_proj_into(
+            apply_proj_into_with_ggml_type(
                 &mut enc,
                 registry,
                 device,
                 &arena.x_norm_buf,
                 &weights.ssm_beta,
+                weights.ssm_beta_ggml_type,
                 &mut arena.beta_logit_buf,
                 seq_len,
                 hidden_size,
@@ -3976,12 +4163,13 @@ pub fn build_delta_net_layer_with_arena(
         enc.memory_barrier();
         // Final out_proj — output crosses to next layer; pooled_alloc_buffer
         // path keeps existing residency contract (matches non-arena variant).
-        let output = apply_proj(
+        let output = apply_proj_with_ggml_type(
             &mut enc,
             registry,
             device,
             &arena.gated_buf,
             &weights.ssm_out,
+            weights.ssm_out_ggml_type,
             seq_len,
             z_channels,
             hidden_size,
@@ -4027,23 +4215,25 @@ pub fn build_delta_net_layer_with_arena(
             d_k,
             rms_norm_eps,
         )?;
-        apply_proj_into(
+        apply_proj_into_with_ggml_type(
             &mut enc,
             registry,
             device,
             &arena.x_norm_buf,
             &weights.ssm_alpha,
+            weights.ssm_alpha_ggml_type,
             &mut arena.alpha_logit_buf,
             seq_len,
             hidden_size,
             n_v_heads,
         )?;
-        apply_proj_into(
+        apply_proj_into_with_ggml_type(
             &mut enc,
             registry,
             device,
             &arena.x_norm_buf,
             &weights.ssm_beta,
+            weights.ssm_beta_ggml_type,
             &mut arena.beta_logit_buf,
             seq_len,
             hidden_size,
@@ -4155,12 +4345,13 @@ pub fn build_delta_net_layer_with_arena(
         enc.memory_barrier();
         // Final out_proj — output crosses to next layer; pooled path keeps
         // existing residency contract.
-        let output = apply_proj(
+        let output = apply_proj_with_ggml_type(
             &mut enc,
             registry,
             device,
             &arena.gated_buf,
             &weights.ssm_out,
+            weights.ssm_out_ggml_type,
             seq_len,
             z_channels,
             hidden_size,
@@ -4414,22 +4605,24 @@ pub fn build_delta_net_layer_decode_into(
     enc.memory_barrier();
 
     // ---- Ops 2a+2b+2c: qkv_proj, z_proj (concurrent) ----
-    let qkv_raw = apply_proj(
+    let qkv_raw = apply_proj_with_ggml_type(
         enc,
         registry,
         device,
         &x_norm,
         &weights.attn_qkv,
+        weights.attn_qkv_ggml_type,
         seq_len,
         hidden_size,
         qkv_channels,
     )?;
-    let z = apply_proj(
+    let z = apply_proj_with_ggml_type(
         enc,
         registry,
         device,
         &x_norm,
         &weights.attn_gate,
+        weights.attn_gate_ggml_type,
         seq_len,
         hidden_size,
         z_channels,
@@ -4475,22 +4668,24 @@ pub fn build_delta_net_layer_decode_into(
         d_k,
         rms_norm_eps,
     )?;
-    let alpha_logit_buf = apply_proj(
+    let alpha_logit_buf = apply_proj_with_ggml_type(
         enc,
         registry,
         device,
         &x_norm,
         &weights.ssm_alpha,
+        weights.ssm_alpha_ggml_type,
         seq_len,
         hidden_size,
         n_v_heads,
     )?;
-    let beta_logit_buf = apply_proj(
+    let beta_logit_buf = apply_proj_with_ggml_type(
         enc,
         registry,
         device,
         &x_norm,
         &weights.ssm_beta,
+        weights.ssm_beta_ggml_type,
         seq_len,
         hidden_size,
         n_v_heads,
@@ -4531,6 +4726,8 @@ pub fn build_delta_net_layer_decode_into(
     // ADR-015 iter56 — decode path uses the `simd_sum` variant which mirrors
     // the peer's `kernel_gated_delta_net_f32_<NSG>` threading model. Same
     // bit-equivalent math (cpu_reference + unfused-GPU parity tests under
+    // ADR-015 iter56 — decode uses the `simd_sum` threading model. Same
+    // bit-equivalent math (CPU reference + unfused-GPU parity tests under
     // `mlx-native/tests/test_gated_delta_net_decode.rs`; smoke parity
     // verified byte-identical to `dispatch_gated_delta_net` on apex
     // q4_0-flat 4-prompt × 32-token greedy generation) but without the
@@ -4572,12 +4769,13 @@ pub fn build_delta_net_layer_decode_into(
     enc.memory_barrier();
 
     // ---- Op 9: out_proj ----
-    let output = apply_proj(
+    let output = apply_proj_with_ggml_type(
         enc,
         registry,
         device,
         &gated_buf,
         &weights.ssm_out,
+        weights.ssm_out_ggml_type,
         seq_len,
         z_channels,
         hidden_size,
@@ -4622,6 +4820,68 @@ mod tests {
             conv_kernel: 4,
             rms_norm_eps: 1e-6,
         }
+    }
+
+    #[test]
+    fn capture_slot_view_keeps_physical_stride_when_active_depth_shrinks() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let n_seqs = 3u32;
+        let physical_depth = 4u32;
+        let active_depth = 2u32;
+        let slot = SlotId(2);
+        let (d_k, d_v, n_v_heads) = (4u32, 5u32, 2u32);
+        let state_per_token = (d_k * d_v * n_v_heads) as usize;
+        let recurrent_capture = device
+            .alloc_buffer(
+                state_per_token * physical_depth as usize * n_seqs as usize * 4,
+                DType::F32,
+                vec![state_per_token * physical_depth as usize * n_seqs as usize],
+            )
+            .expect("recurrent capture");
+        let recurrent_view = narrow_capture_states_to_slot(
+            &recurrent_capture,
+            slot,
+            d_k,
+            d_v,
+            n_v_heads,
+            n_seqs,
+            active_depth,
+        );
+        assert_eq!(
+            recurrent_view.byte_offset(),
+            (slot.0 as u64) * (physical_depth as u64) * (state_per_token as u64) * 4
+        );
+        assert_eq!(
+            recurrent_view.element_count(),
+            state_per_token * active_depth as usize
+        );
+
+        let (channels, k_minus_one) = (7u32, 3u32);
+        let conv_per_token = (channels * k_minus_one) as usize;
+        let conv_capture = device
+            .alloc_buffer(
+                conv_per_token * physical_depth as usize * n_seqs as usize * 4,
+                DType::F32,
+                vec![conv_per_token * physical_depth as usize * n_seqs as usize],
+            )
+            .expect("convolution capture");
+        let conv_view = narrow_conv_capture_to_slot(
+            &conv_capture,
+            slot,
+            channels,
+            k_minus_one,
+            n_seqs,
+            active_depth,
+        );
+        assert_eq!(
+            conv_view.byte_offset(),
+            (slot.0 as u64) * (physical_depth as u64) * (conv_per_token as u64) * 4
+        );
+        assert_eq!(
+            conv_view.element_count(),
+            conv_per_token * active_depth as usize
+        );
     }
 
     fn synthetic_weights(shape: DeltaNetLayerShape, seed_init: u32) -> DeltaNetLayerWeights {
@@ -5852,6 +6112,7 @@ mod tests {
     /// produces ULP-level (~1e-6 to ~1e-5) accumulation differences.
     /// Those diffs do NOT change observable behavior (greedy decode
     /// tokens, cosine-similarity vs the peer/vllm/mlx-python reference).
+    /// tokens or cosine similarity against independent references).
     /// The byte-identity assertion was over-tight — measuring noise that
     /// would never propagate to user-facing output. The reframed test
     /// measures kernel equivalence within FP tolerance, which is the
@@ -6171,6 +6432,8 @@ mod tests {
     // CPU reference uses the SAME recurrence as our autoregressive Metal
     // kernel and the peer's build_delta_net_autoregressive (post-decay state
     // for `err = v - alpha*S @ k`). FLA's fused_recurrent_gated_delta_rule
+    // CPU reference uses the same recurrence as our autoregressive Metal
+    // kernel (post-decay state for `err = v - alpha*S @ k`). The fused recurrent rule
     // (vllm/.../fused_recurrent.py:134-149) uses the same convention.
     //
     // Expected scaling shapes:
@@ -6215,6 +6478,7 @@ mod tests {
 
     /// FLA-naive recurrence: pre-decay state for err.
     /// S' = alpha*S + beta*outer(v - S@k, k)  (NOT the peer/fused_recurrent form).
+    /// `S' = alpha*S + beta*outer(v - S@k, k)` (pre-decay-error form).
     /// This is the math the chunk_gated_delta_rule_fwd_oracle.py implements.
     /// We compute it here to disambiguate which convention each path matches.
     fn cpu_ref_recurrence_pre_decay(
@@ -6384,6 +6648,7 @@ mod tests {
         let chunk_cpu = download_f32(&chunk_out).expect("dl chunk");
 
         // CPU reference (post-decay-err — the peer / FLA fused_recurrent form).
+        // CPU reference using the post-decay-error fused-recurrent form.
         let cpu_post = cpu_ref_recurrence(
             &q_cpu,
             &k_cpu,
@@ -6684,6 +6949,8 @@ mod tests {
         let capture_out = download_f32(&capture_out_buf).expect("download capture output");
         let capture_state_out =
             download_f32(&state_out_capture).expect("download capture state_out");
+        let capture_conv_out =
+            download_f32(&conv_out_capture).expect("download capture conv_state_out");
         let recurrent_capture_cpu =
             download_f32(&recurrent_capture).expect("download recurrent capture");
         let convolution_capture_cpu =
@@ -7051,6 +7318,11 @@ mod tests {
             "capture state_out vs non-capture state_out",
             &capture_state_out,
             &prod_state_out,
+        );
+        assert_f32_bits_eq(
+            "capture conv_state_out vs non-capture conv_state_out",
+            &capture_conv_out,
+            &prod_conv_out,
         );
         let final_recurrent_capture = &recurrent_capture_cpu[(seq_len as usize - 1) * state_size..];
         assert_f32_bits_eq(

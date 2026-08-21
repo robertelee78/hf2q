@@ -81,6 +81,17 @@ impl Qwen35Model {
                 positions.len()
             ));
         }
+        if self.layers.iter().any(|layer| {
+            matches!(
+                layer,
+                Qwen35LayerWeights::NativeFullAttn { .. }
+                    | Qwen35LayerWeights::NativeLinearAttn { .. }
+            )
+        }) {
+            return Err(anyhow!(
+                "forward_cpu is unavailable for a native-GGUF Qwen model; use the GPU inference path instead of dequantizing production weights"
+            ));
+        }
 
         let _seq = tokens.len();
         let h = self.cfg.hidden_size as usize;
@@ -121,6 +132,10 @@ impl Qwen35Model {
                         delta_net_layer_cpu_ref(&hidden, attn, shape, &state_in, &conv_state);
                     out
                 }
+                Qwen35LayerWeights::NativeFullAttn { .. }
+                | Qwen35LayerWeights::NativeLinearAttn { .. } => {
+                    unreachable!("native layers were rejected before the CPU forward loop")
+                }
             };
 
             // Residual after attention.
@@ -129,6 +144,7 @@ impl Qwen35Model {
             // Post-attention RMSNorm: the normed value is the FFN *input* only.
             // The FFN output is added back to `ffn_residual` (the pre-norm value),
             // matching the peer:
+            // The FFN output is added back to `ffn_residual` (the pre-norm value):
             //   ffn_residual = cur;               // after attn residual, BEFORE norm
             //   attn_post_norm = build_norm(cur); // norm for FFN input
             //   cur = build_layer_ffn(attn_post_norm);
@@ -138,6 +154,10 @@ impl Qwen35Model {
             let post_norm_w = match layer {
                 Qwen35LayerWeights::FullAttn { attn, .. } => &attn.post_attn_norm,
                 Qwen35LayerWeights::LinearAttn { attn, .. } => &attn.post_attn_norm,
+                Qwen35LayerWeights::NativeFullAttn { .. }
+                | Qwen35LayerWeights::NativeLinearAttn { .. } => {
+                    unreachable!("native layers were rejected before the CPU forward loop")
+                }
             };
             rms_norm_rows(&mut ffn_input, post_norm_w, h, eps);
 
@@ -188,6 +208,7 @@ impl Qwen35Model {
 
             // Residual after FFN: add to pre-norm value (ffn_residual), not normed.
             // This matches the peer's `cur = ggml_add(cur, ffn_residual)`.
+            // Residual after FFN: add to pre-norm value, not the normalized input.
             hidden = ffn_residual;
             residual_add(&mut hidden, &ffn_out);
         }

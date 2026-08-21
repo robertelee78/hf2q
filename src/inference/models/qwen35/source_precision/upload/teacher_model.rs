@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::inference::models::qwen35::gpu_delta_net::DeltaNetWeightsGpu;
 use crate::inference::models::qwen35::gpu_ffn::DenseFfnWeightsGpu;
+#[cfg(test)]
+use crate::inference::models::qwen35::gpu_full_attn::FullAttnQGateWeightsGpu;
 use crate::inference::models::qwen35::gpu_full_attn::FullAttnWeightsGpu;
 use crate::inference::models::qwen35::{Qwen35Config, Qwen35LayerKind};
 
@@ -225,7 +227,11 @@ impl PreparedQwen35SourceTeacherV1 {
             ensure!(layer.ffn.gate.dtype() == mlx_native::DType::BF16);
             match &layer.attention {
                 PreparedQwen35SourceAttentionV1::Full(weights) => {
-                    ensure!(weights.wq.dtype() == mlx_native::DType::BF16);
+                    let FullAttnQGateWeightsGpu::Split { wq, w_gate, .. } = &weights.q_gate else {
+                        anyhow::bail!("source teacher must retain split Q/gate weights");
+                    };
+                    ensure!(wq.dtype() == mlx_native::DType::BF16);
+                    ensure!(w_gate.dtype() == mlx_native::DType::BF16);
                 }
                 PreparedQwen35SourceAttentionV1::Linear(weights) => {
                     ensure!(weights.attn_qkv.dtype() == mlx_native::DType::BF16);

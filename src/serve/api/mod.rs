@@ -37,6 +37,7 @@ pub mod handlers;
 pub mod kv_spill_descriptor;
 pub mod lifecycle;
 pub mod middleware;
+pub mod qwen35_speculation;
 pub mod registry;
 pub mod router;
 pub mod schema;

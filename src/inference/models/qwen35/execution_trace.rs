@@ -202,7 +202,14 @@ pub(super) fn verify_encoded_dispatch_catalog(
     let expected_ggml = executed
         .observations()
         .iter()
-        .filter(|observation| matches!(observation.executed_codec, LoadedTensorCodec::Ggml { .. }))
+        .filter(|observation| {
+            matches!(observation.executed_codec, LoadedTensorCodec::Ggml { .. })
+                // Token lookup uses its own typed native gather. This catalog
+                // covers GGML projection dispatches, so the embedding remains
+                // bound in the executed catalog without inventing a matmul
+                // observation for it.
+                && observation.semantic_name != "token_embd.weight"
+        })
         .flat_map(|observation| {
             [
                 (observation.node_id.clone(), "prompt"),

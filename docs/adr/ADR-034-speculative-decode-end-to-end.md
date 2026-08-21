@@ -4,6 +4,12 @@
 - **Date**: 2026-05-19
 - **Deciders**: operator (robert@loveathome.us); claude (deep-research + audit + draft); codex (independent spot-check)
 - **Tags**: `spec-decode`, `mtp`, `dflash`, `apple-metal`, `byte-parity`, `coherence-gated`, `multi-arch`
+
+> **Historical design record.** This document preserves the Qwen3.5/3.6 and
+> DFlash investigation. It is not current Qwen3.8 server authority. For that
+> surface, code is authoritative and ADR-044 records the accepted transaction,
+> policy, exact-artifact gates, and measured receipts.
+
 - **Supersedes**:
   - ADR-013 §15 "MTP tensors and speculative draft execution" + ADR-013 P10 + ADR-013 P14 "MTP speculative-decoding execution (COMPLETE)" — the "COMPLETE" status is **inaccurate at HEAD `eab0220b`**; convert side does not exist, loader/forward have never been validated against a known-good reference, and no acceptance-rate or throughput-improvement number has ever been measured. This ADR documents the actual state and the path to genuine completion.
   - ADR-012 §11 / §15 "MTP tensor round-trip integrity gate" — documented `model.mtp.layers.0.* → blk.{n_layer}.nextn.*` mapping as "shipped 2026-04-24" but current code in `src/convert/arch/qwen35moe.rs::map_tensor_name` has zero MTP arms and `src/convert/arch/qwen35.rs` does not exist. Either the convert code was never landed or was removed in a subsequent refactor. This ADR re-derives the mapping from canonical sources and re-lands it under byte-cmp gates.
@@ -27,6 +33,51 @@
 > **READ THIS FIRST.** §1 and §2 below describe the audit baseline at HEAD `eab0220b`
 > (2026-05-19) — substantial work has landed since. This section is the authoritative
 > hand-off summary for an engineer picking up ADR-034 today.
+
+### Qwen3.8 server addendum (2026-08-20; ADR-044 is authoritative)
+
+This ADR's Qwen3.5/3.6 CLI-era status and `HF2Q_SPEC_DECODE` controls do not
+describe the current Qwen3.8 OpenAI server. The former Qwen3.8 launcher export
+of `HF2Q_SPEC_DECODE=0` was dead configuration because the server worker never
+read that CLI-only variable. It was not a functioning safety gate.
+
+The live SlotAware server now reads `HF2Q_QWEN_SPECULATION=off|auto`. The
+canonical Qwen3.8 launcher selects `auto`; the bare process default remains
+`off`. Qwen3.8 auto owns two exact target-verified proposers:
+
+1. A request-local token-position history index compares the current 6-12
+   token suffix exactly and proposes up to three tokens from the most recent
+   matching continuation. This is not the older generic n-gram CLI path and
+   is not a suffix automaton.
+2. Native fixed-K3 MTP uses target post-output-RMSNorm hidden rows, catches the
+   MTP KV cursor up across the complete prompt, drafts exactly three tokens,
+   verifies `[seed,d0,d1,d2]` in one target forward, reconciles the same target
+   rows through MTP, and commits or rolls target KV, MTP KV, convolution, and
+   recurrent state to the same accepted boundary.
+
+Both proposers first observe ordinary target-token cost and then compare four
+complete speculative rounds with equivalent ordinary output cost. A losing
+proposer disables itself only for that generation. Proposal lookup cost alone
+is never treated as proof that block verification is profitable. Stochastic
+sampling and API semantics not represented in the exact verifier remain on
+ordinary decode.
+
+The real-model gate found a distinct DeltaNet capture bug: the multi-token
+capture kernel populated per-row convolution captures but not the next
+ping-pong convolution state. Full acceptance then flipped to stale state and
+the following verifier block diverged. The production path now materializes
+the captured final convolution row into the next state in the same command
+buffer; partial acceptance still restores the selected row. A second fix uses
+physical capture capacity, not active draft depth, for multi-slot byte
+strides. These corrections are why the current Qwen3.8 result can claim exact
+ordinary/spec output parity where this ADR's older Qwen3.6 K>=2 path could
+not.
+
+Current acceptance receipts, matched external-reference comparison, supported API
+semantics, and remaining one-slot/multi-slot performance gaps are recorded in
+ADR-044 and `scripts/qwen38_speculation_ab.sh`. Historical Qwen3.6 and DFlash
+measurements below remain evidence for those exact commits and artifacts; they
+must not override the Qwen3.8 source contract.
 
 ### Per-cell empirical state
 

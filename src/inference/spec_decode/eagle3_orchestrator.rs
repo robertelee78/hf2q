@@ -203,13 +203,16 @@ impl<'a> Eagle3Orchestrator<'a> {
             let target_aux =
                 upload_f32_device(device, &target_aux_host, vec![1, target_aux_host.len()])
                     .context("upload EAGLE-3 target_aux")?;
-            let mut drafter = GpuDrafter::new(
+            let native_embedding = model.token_embd_native.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Qwen EAGLE-3 requires the model's native target embedding table")
+            })?;
+            let mut drafter = GpuDrafter::new_with_native_embedding(
                 self.drafter_cfg,
                 self.drafter_tensors,
                 device,
                 registry,
                 &target_aux,
-                &model.token_embd,
+                native_embedding,
                 base_pos,
             )
             .context("construct GpuDrafter")?;
@@ -1638,6 +1641,11 @@ mod g4_cfa5_redhatai_smoke {
             // add_bos_token=true). Without it, the bundled tokenizer.json's
             // legacy post_processor template silently drops BOS → 240017 "額"
             // saturation. See src/core/tokenizer_adapter.rs.
+            // ADR-038 G4-CFA-5e: honor GGUF `add_bos_token` metadata through
+            // the shared tokenizer adapter. Without it, the bundled
+            // tokenizer.json post-processor silently drops BOS and saturates
+            // generation on token 240017 ("額"). See
+            // src/core/tokenizer_adapter.rs.
             let tokens = crate::core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf(
                 &gguf,
                 &tokenizer,

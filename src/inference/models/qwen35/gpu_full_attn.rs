@@ -32,22 +32,20 @@
 //! In the production path, weights are quantized and the permute is avoided
 //! by producing Q/K directly in head-major order (future work, P8+).
 //!
-//! # Matmul strategy for F32 weights (parity test)
+//! # Matmul strategy for F32 weights
 //!
-//! No F32×F32 GPU GEMM exists in mlx-native.  For the parity test (F32
-//! weights), `apply_linear_projection_f32_via_bf16` casts weights F32→BF16
-//! on the GPU then calls `dense_matmul_bf16_f32_tensor`.  The BF16 cast
-//! introduces ≤1e-3 rounding, within the stated parity bound.  In production
-//! the caller passes pre-quantised (Q4_K / Q8_0) weight buffers and uses
-//! `quantized_matmul_ggml` instead (not part of this module's scope).
+//! Native F32 weights stay F32 through the tiled F32 matrix kernel. Quantized
+//! production weights use their declared GGML representation through
+//! `quantized_matmul_ggml`.
 //!
 //! # ADR status
 //!
 //! P7b complete: every op wired, parity test passes |GPU−CPU|∞ < 1e-3 F32.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::flash_attn_prefill::{
     dispatch_flash_attn_prefill_bf16_d256, dispatch_flash_attn_prefill_bf16_d256_resume,
@@ -260,6 +258,73 @@ fn write_kv_with_optional_tq_encode(
     Ok(())
 }
 
+/// Append pre-projected sequence-major K/V rows to a full-attention cache
+/// without computing Q, attention scores, or an output projection.
+///
+/// Qwen MTP target-batch reconciliation needs only this persistent K/V side
+/// effect. Reusing the canonical writer preserves F32/TQ and SlotId layout
+/// while avoiding an otherwise wasted SDPA + WO pass.
+#[allow(clippy::too_many_arguments)]
+pub fn append_kv_to_cache_without_attention(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    k_seq_major: &MlxBuffer,
+    v_seq_major: &MlxBuffer,
+    slot: &mut FullAttnKvSlot,
+    seq_len: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_seq_len: u32,
+    slot_id: SlotId,
+) -> Result<()> {
+    ensure!(seq_len > 0, "KV-only append requires seq_len > 0");
+    let slot_idx = slot_id.0 as usize;
+    let cur_len = slot.current_len.get(slot_idx).copied().ok_or_else(|| {
+        anyhow!(
+            "KV-only append: slot {} outside MTP current_len axis {}",
+            slot_id.0,
+            slot.current_len.len()
+        )
+    })?;
+    let new_len = cur_len
+        .checked_add(seq_len)
+        .context("KV-only append cursor overflow")?;
+    ensure!(
+        new_len <= max_seq_len,
+        "KV-only append overflow: current_len={cur_len} + seq_len={seq_len} > max_seq_len={max_seq_len}"
+    );
+    let expected = (seq_len as usize)
+        .checked_mul(n_kv_heads as usize)
+        .and_then(|n| n.checked_mul(head_dim as usize))
+        .context("KV-only append shape overflow")?;
+    ensure!(
+        k_seq_major.element_count() == expected && v_seq_major.element_count() == expected,
+        "KV-only append K/V elements ({}/{}) != expected {expected}",
+        k_seq_major.element_count(),
+        v_seq_major.element_count()
+    );
+
+    let mut enc = device.command_encoder().context("enc MTP KV-only append")?;
+    write_kv_with_optional_tq_encode(
+        &mut enc,
+        registry,
+        device,
+        k_seq_major,
+        v_seq_major,
+        slot,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
+        cur_len,
+        seq_len,
+        slot_id,
+    )
+    .context("MTP KV-only canonical cache write")?;
+    enc.commit_labeled("mtp.kv_only_append");
+    slot.current_len[slot_idx] = new_len;
+    Ok(())
+}
+
 /// ADR-027 Phase B iter-15 — decode SDPA dispatch with optional TQ
 /// branch. When `slot.tq.is_some()` AND `head_dim ∈ {256, 512}`,
 /// dispatches the TQ chain (FWHT × sign-premult on Q in-place →
@@ -427,33 +492,55 @@ fn dispatch_decode_sdpa_with_optional_tq(
 ///
 /// Uploaded from [`FullAttnLayerWeights`] once per layer at load time;
 /// held by the model + read by the per-token forward.
+#[derive(Clone)]
+pub enum FullAttnQGateWeightsGpu {
+    /// Synthetic, lazy, or explicit replacement storage with independent
+    /// projection matrices.
+    Split {
+        wq: MlxBuffer,
+        wq_ggml_type: GgmlType,
+        w_gate: MlxBuffer,
+        w_gate_ggml_type: GgmlType,
+    },
+    /// Native Qwen GGUF storage: rows are interleaved per head as
+    /// `[Q(head_dim), gate(head_dim)]`. Project once, then deinterleave the
+    /// activation exactly on GPU.
+    Fused {
+        weight: MlxBuffer,
+        ggml_type: GgmlType,
+    },
+}
+
+#[derive(Clone)]
 pub struct FullAttnWeightsGpu {
     pub attn_norm: MlxBuffer,
     /// Post-attention RMSNorm weight: `[hidden_size]`.
     /// Applied to the residual stream after attention, before the FFN.
     pub post_attn_norm: MlxBuffer,
-    pub wq: MlxBuffer,
+    pub q_gate: FullAttnQGateWeightsGpu,
     pub wk: MlxBuffer,
+    pub wk_ggml_type: GgmlType,
     pub wv: MlxBuffer,
-    pub w_gate: MlxBuffer,
+    pub wv_ggml_type: GgmlType,
     pub attn_q_norm: MlxBuffer,
     pub attn_k_norm: MlxBuffer,
     pub wo: MlxBuffer,
+    pub wo_ggml_type: GgmlType,
 }
 
 impl FullAttnWeightsGpu {
-    /// Upload a [`FullAttnLayerWeights`] (pure-Rust f32) to Metal buffers.
-    ///
-    /// Large projection weights (wq, wk, wv, w_gate, wo) are quantized to Q4_0
-    /// GGML blocks at load time.  This gives 3.56× lower bandwidth vs BF16 on
-    /// the M=1 decode path (`quantized_matmul_ggml` dispatch_mv) and uses the
-    /// same deterministic simd_sum accumulation as the FFN path.
+    /// Upload a synthetic, lazy, or explicit floating-point
+    /// [`FullAttnLayerWeights`] to Metal buffers.
     ///
     /// Precision: Q4_0 (4-bit with F16 per-block scale) introduces ~1% magnitude
     /// error, well within the I16→F32→Q4_0 chain used by APEX GGUF attn weights.
     /// The peer uses Q5_K_M for these same weights; Q4_0 is slightly less
     /// precise but produces the same token selections in practice (sourdough gate
     /// must confirm).
+    /// This compatibility constructor encodes those caller-owned F32 matrices
+    /// as Q4_0. GGUF-backed production models never call it: their exact native
+    /// blocks are loaded by `load_full_attn_layer_native` and remain in the
+    /// conversion-emitted representation.
     pub fn from_cpu(weights: &FullAttnLayerWeights, device: &MlxDevice) -> Result<Self> {
         // W-5b.7 iter 2: F32 norm weights uploaded via the residency-aware
         // helper so they join MTLResidencySet alongside the Q4_0 projection
@@ -461,13 +548,20 @@ impl FullAttnWeightsGpu {
         Ok(Self {
             attn_norm: upload_f32_weight(&weights.attn_norm, device)?,
             post_attn_norm: upload_f32_weight(&weights.post_attn_norm, device)?,
-            wq: upload_q4_0_from_f32(&weights.wq, device)?,
+            q_gate: FullAttnQGateWeightsGpu::Split {
+                wq: upload_q4_0_from_f32(&weights.wq, device)?,
+                wq_ggml_type: GgmlType::Q4_0,
+                w_gate: upload_q4_0_from_f32(&weights.w_gate, device)?,
+                w_gate_ggml_type: GgmlType::Q4_0,
+            },
             wk: upload_q4_0_from_f32(&weights.wk, device)?,
+            wk_ggml_type: GgmlType::Q4_0,
             wv: upload_q4_0_from_f32(&weights.wv, device)?,
-            w_gate: upload_q4_0_from_f32(&weights.w_gate, device)?,
+            wv_ggml_type: GgmlType::Q4_0,
             attn_q_norm: upload_f32_weight(&weights.attn_q_norm, device)?,
             attn_k_norm: upload_f32_weight(&weights.attn_k_norm, device)?,
             wo: upload_q4_0_from_f32(&weights.wo, device)?,
+            wo_ggml_type: GgmlType::Q4_0,
         })
     }
 
@@ -475,7 +569,8 @@ impl FullAttnWeightsGpu {
     /// (no Q4_0 quantization).  Used by the GPU↔CPU kernel-pipeline parity
     /// tests so quantization noise (~1e-2) does not mask kernel correctness
     /// regressions (1e-3 BF16-cast bound).  Production decode always uses
-    /// [`Self::from_cpu`] (Q4_0, ~3.56× less projection bandwidth).
+    /// [`Self::from_cpu`] for explicit F32 fixtures; GGUF production inference
+    /// uses native quantized buffers instead.
     ///
     /// At projection time, `apply_linear_projection_f32` takes the F32 branch
     /// (line ~565) which casts weights to BF16 on the GPU and dispatches the
@@ -483,16 +578,45 @@ impl FullAttnWeightsGpu {
     /// written against, before Q4_0 was added in commit fad4263.
     #[cfg(test)]
     pub fn from_cpu_f32(weights: &FullAttnLayerWeights, device: &MlxDevice) -> Result<Self> {
+        let hidden_size = weights.attn_norm.len();
+        let head_dim = weights.attn_q_norm.len();
+        ensure!(
+            hidden_size > 0 && head_dim > 0,
+            "synthetic Q/gate dimensions must be non-zero"
+        );
+        ensure!(
+            weights.wq.len() == weights.w_gate.len() && weights.wq.len() % hidden_size == 0,
+            "synthetic Q/gate matrices must have equal complete rows"
+        );
+        let q_total = weights.wq.len() / hidden_size;
+        ensure!(
+            q_total % head_dim == 0,
+            "synthetic Q width {q_total} is not divisible by head dimension {head_dim}"
+        );
+        let mut fused_q_gate = Vec::with_capacity(weights.wq.len() + weights.w_gate.len());
+        for head in 0..(q_total / head_dim) {
+            let row_start = head * head_dim;
+            let row_end = row_start + head_dim;
+            fused_q_gate
+                .extend_from_slice(&weights.wq[row_start * hidden_size..row_end * hidden_size]);
+            fused_q_gate
+                .extend_from_slice(&weights.w_gate[row_start * hidden_size..row_end * hidden_size]);
+        }
         Ok(Self {
             attn_norm: upload_f32(&weights.attn_norm, device)?,
             post_attn_norm: upload_f32(&weights.post_attn_norm, device)?,
-            wq: upload_f32(&weights.wq, device)?,
+            q_gate: FullAttnQGateWeightsGpu::Fused {
+                weight: upload_f32(&fused_q_gate, device)?,
+                ggml_type: GgmlType::F32,
+            },
             wk: upload_f32(&weights.wk, device)?,
+            wk_ggml_type: GgmlType::F32,
             wv: upload_f32(&weights.wv, device)?,
-            w_gate: upload_f32(&weights.w_gate, device)?,
+            wv_ggml_type: GgmlType::F32,
             attn_q_norm: upload_f32(&weights.attn_q_norm, device)?,
             attn_k_norm: upload_f32(&weights.attn_k_norm, device)?,
             wo: upload_f32(&weights.wo, device)?,
+            wo_ggml_type: GgmlType::F32,
         })
     }
 }
@@ -687,6 +811,7 @@ pub fn download_f32(buf: &MlxBuffer) -> Result<Vec<f32>> {
 /// independent vector and applies `x / sqrt(mean(x^2) + eps) * weight`
 /// element-wise, where `weight` is shape `[head_dim]` shared across all
 /// heads and tokens (matches the peer's / HF's Qwen3.5 convention).
+/// heads and tokens, as required by the Qwen3.5 contract.
 ///
 /// # Why this dispatches rms_norm with rows = seq*n_heads
 ///
@@ -939,6 +1064,34 @@ pub fn apply_linear_projection_f32(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
+    apply_linear_projection_f32_with_ggml_type(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        GgmlType::Q4_0,
+        seq_len,
+        in_features,
+        out_features,
+    )
+}
+
+/// Dtype-aware projection that preserves the GGML quantization selected by
+/// conversion.  The legacy wrapper above remains for synthetic Q4_0 fixtures;
+/// production GGUF weights must call this function with their recorded type.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_linear_projection_f32_with_ggml_type(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ggml_type: GgmlType,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
     // Allocate output buffer (same for all paths).
     //
     // NOTE: NOT pooled — `apply_linear_projection_f32` is shared between
@@ -979,10 +1132,10 @@ pub fn apply_linear_projection_f32(
                 m: seq_len,
                 n: out_features,
                 k: in_features,
-                ggml_type: GgmlType::Q4_0,
+                ggml_type,
             };
             quantized_matmul_ggml(encoder, registry, device, input, weight, &mut dst, &params)
-                .context("quantized_matmul_ggml Q4_0")?;
+                .with_context(|| format!("quantized_matmul_ggml {ggml_type:?}"))?;
         }
         DType::BF16 => {
             let params = DenseMmBf16F32Params {
@@ -996,6 +1149,8 @@ pub fn apply_linear_projection_f32(
                 // GEMV path — bandwidth-optimized for M=1 decode.
                 // mul_mv_bf16_f32_4: processes multiple
                 // weight rows per threadgroup, ~2× faster than tiled MM for M=1.
+                // Process multiple weight rows per threadgroup; this is about
+                // 2× faster than tiled MM for M=1.
                 dense_gemv_bf16_f32(encoder, registry, device, weight, input, &mut dst, &params)
                     .context("dense_gemv_bf16_f32 (M=1)")?;
             } else {
@@ -1007,53 +1162,17 @@ pub fn apply_linear_projection_f32(
             }
         }
         DType::F32 => {
-            // Legacy F32 path: cast inline (per-inference cost, not pre-quantized).
-            //
-            // ADR-015 iter14: lift `weight_bf16` cast scratch to the
-            // per-decode-token pool.  This is a function-local helper
-            // scratch consumed by the matmul dispatch in the SAME encoder
-            // but the encoder is not committed by this function (caller
-            // commits).  Safe under retained refs (encoder CB ARC keeps
-            // the buffer alive); pool ARC anchor required under unretained
-            // refs.  Branch is unused on Qwen3.6 dwq46 (Q4_0 takes the
-            // U8 path above) but lifted for hygiene.
-            let n_w = (out_features * in_features) as usize;
-            let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
-                device,
-                n_w * 2,
-                DType::BF16,
-                vec![out_features as usize, in_features as usize],
-            )
-            .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
-            cast(
-                encoder,
-                registry,
-                device.metal_device(),
-                weight,
-                &weight_bf16,
-                n_w,
-                CastDirection::F32ToBF16,
-            )
-            .context("cast weight F32→BF16")?;
-            // Need a barrier: the GEMM reads weight_bf16 which was written by the cast.
-            encoder.memory_barrier();
-            let params = DenseMmBf16F32Params {
+            let params = DenseMmF32F32Params {
                 m: seq_len,
                 n: out_features,
                 k: in_features,
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            dense_matmul_bf16_f32_tensor(
-                encoder,
-                registry,
-                device,
-                &weight_bf16,
-                input,
-                &mut dst,
-                &params,
+            dense_matmul_f32_f32_tensor(
+                encoder, registry, device, weight, input, &mut dst, &params,
             )
-            .context("dense_matmul_bf16_f32_tensor (F32 legacy)")?;
+            .context("dense_matmul_f32_f32_tensor")?;
         }
         other => {
             return Err(anyhow!(
@@ -1180,42 +1299,23 @@ pub fn apply_linear_projection_f32_qweight(
             }
         }
         DType::F32 => {
-            let n_w = (out_features * in_features) as usize;
-            let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
-                device,
-                n_w * 2,
-                DType::BF16,
-                vec![out_features as usize, in_features as usize],
-            )
-            .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
-            cast(
-                encoder,
-                registry,
-                device.metal_device(),
-                &qweight.buffer,
-                &weight_bf16,
-                n_w,
-                CastDirection::F32ToBF16,
-            )
-            .context("cast weight F32→BF16")?;
-            encoder.memory_barrier();
-            let params = DenseMmBf16F32Params {
+            let params = DenseMmF32F32Params {
                 m: seq_len,
                 n: out_features,
                 k: in_features,
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            dense_matmul_bf16_f32_tensor(
+            dense_matmul_f32_f32_tensor(
                 encoder,
                 registry,
                 device,
-                &weight_bf16,
+                &qweight.buffer,
                 input,
                 &mut dst,
                 &params,
             )
-            .context("dense_matmul_bf16_f32_tensor (F32 legacy)")?;
+            .context("dense_matmul_f32_f32_tensor qweight")?;
         }
         other => {
             return Err(anyhow!(
@@ -1245,6 +1345,35 @@ pub fn apply_linear_projection_f32_into(
     in_features: u32,
     out_features: u32,
 ) -> Result<()> {
+    apply_linear_projection_f32_into_with_ggml_type(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        GgmlType::Q4_0,
+        dst,
+        seq_len,
+        in_features,
+        out_features,
+    )
+}
+
+/// Caller-allocated counterpart of
+/// [`apply_linear_projection_f32_with_ggml_type`].
+#[allow(clippy::too_many_arguments)]
+pub fn apply_linear_projection_f32_into_with_ggml_type(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ggml_type: GgmlType,
+    dst: &mut MlxBuffer,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<()> {
     // ADR-030 iter-115 — defense-in-depth dtype check (mirrors
     // apply_linear_projection_f32 in iter-114).  Caller-supplied dst must
     // also be F32 since every kernel path below writes F32.
@@ -1267,10 +1396,10 @@ pub fn apply_linear_projection_f32_into(
                 m: seq_len,
                 n: out_features,
                 k: in_features,
-                ggml_type: GgmlType::Q4_0,
+                ggml_type,
             };
             quantized_matmul_ggml(encoder, registry, device, input, weight, dst, &params)
-                .context("quantized_matmul_ggml Q4_0 (into)")?;
+                .with_context(|| format!("quantized_matmul_ggml {ggml_type:?} (into)"))?;
         }
         DType::BF16 => {
             let params = DenseMmBf16F32Params {
@@ -1291,44 +1420,15 @@ pub fn apply_linear_projection_f32_into(
             }
         }
         DType::F32 => {
-            // ADR-015 iter14: same scratch-lift as `apply_linear_projection_f32`'s
-            // F32 legacy arm above.
-            let n_w = (out_features * in_features) as usize;
-            let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
-                device,
-                n_w * 2,
-                DType::BF16,
-                vec![out_features as usize, in_features as usize],
-            )
-            .map_err(|e| anyhow!("alloc weight_bf16 (pooled, into): {e}"))?;
-            cast(
-                encoder,
-                registry,
-                device.metal_device(),
-                weight,
-                &weight_bf16,
-                n_w,
-                CastDirection::F32ToBF16,
-            )
-            .context("cast weight F32→BF16 (into)")?;
-            encoder.memory_barrier();
-            let params = DenseMmBf16F32Params {
+            let params = DenseMmF32F32Params {
                 m: seq_len,
                 n: out_features,
                 k: in_features,
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            dense_matmul_bf16_f32_tensor(
-                encoder,
-                registry,
-                device,
-                &weight_bf16,
-                input,
-                dst,
-                &params,
-            )
-            .context("dense_matmul_bf16_f32_tensor F32 legacy (into)")?;
+            dense_matmul_f32_f32_tensor(encoder, registry, device, weight, input, dst, &params)
+                .context("dense_matmul_f32_f32_tensor (into)")?;
         }
         other => {
             return Err(anyhow!(
@@ -1374,15 +1474,41 @@ pub fn apply_linear_projection_f32_pooled(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
+    apply_linear_projection_f32_pooled_with_ggml_type(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        GgmlType::Q4_0,
+        seq_len,
+        in_features,
+        out_features,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_linear_projection_f32_pooled_with_ggml_type(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    ggml_type: GgmlType,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
     if seq_len != 1 {
         // Prefill — fall back to unpooled to keep `download_f32` callers
         // (e.g. K/V in `apply_sdpa_with_kv_cache` prefill branch) safe.
-        return apply_linear_projection_f32(
+        return apply_linear_projection_f32_with_ggml_type(
             encoder,
             registry,
             device,
             input,
             weight,
+            ggml_type,
             seq_len,
             in_features,
             out_features,
@@ -1396,18 +1522,226 @@ pub fn apply_linear_projection_f32_pooled(
         vec![seq_len as usize, out_features as usize],
     )
     .map_err(|e| anyhow!("alloc projection output (pooled): {e}"))?;
-    apply_linear_projection_f32_into(
+    apply_linear_projection_f32_into_with_ggml_type(
         encoder,
         registry,
         device,
         input,
         weight,
+        ggml_type,
         &mut dst,
         seq_len,
         in_features,
         out_features,
     )?;
     Ok(dst)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_q_gate_projection_f32(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weights: &FullAttnQGateWeightsGpu,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+    hidden_size: u32,
+) -> Result<(MlxBuffer, MlxBuffer)> {
+    let q_total = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| anyhow!("Q/gate projection width overflow"))?;
+    match weights {
+        FullAttnQGateWeightsGpu::Split {
+            wq,
+            wq_ggml_type,
+            w_gate,
+            w_gate_ggml_type,
+        } => Ok((
+            apply_linear_projection_f32_pooled_with_ggml_type(
+                encoder,
+                registry,
+                device,
+                input,
+                wq,
+                *wq_ggml_type,
+                seq_len,
+                hidden_size,
+                q_total,
+            )?,
+            apply_linear_projection_f32_pooled_with_ggml_type(
+                encoder,
+                registry,
+                device,
+                input,
+                w_gate,
+                *w_gate_ggml_type,
+                seq_len,
+                hidden_size,
+                q_total,
+            )?,
+        )),
+        FullAttnQGateWeightsGpu::Fused { weight, ggml_type } => {
+            let fused = apply_linear_projection_f32_pooled_with_ggml_type(
+                encoder,
+                registry,
+                device,
+                input,
+                weight,
+                *ggml_type,
+                seq_len,
+                hidden_size,
+                2 * q_total,
+            )?
+            .with_shape(vec![
+                seq_len as usize,
+                n_heads as usize,
+                (2 * head_dim) as usize,
+            ])
+            .map_err(|e| anyhow!("shape native fused Q/gate activation: {e}"))?;
+            let alloc_output = |label: &str| -> Result<MlxBuffer> {
+                let bytes = (seq_len * q_total) as usize * std::mem::size_of::<f32>();
+                if seq_len == 1 {
+                    super::decode_pool::pooled_alloc_buffer(
+                        device,
+                        bytes,
+                        DType::F32,
+                        vec![seq_len as usize, n_heads as usize, head_dim as usize],
+                    )
+                    .map_err(|e| anyhow!("allocate {label}: {e}"))
+                } else {
+                    device
+                        .alloc_buffer(
+                            bytes,
+                            DType::F32,
+                            vec![seq_len as usize, n_heads as usize, head_dim as usize],
+                        )
+                        .map_err(|e| anyhow!("allocate {label}: {e}"))
+                }
+            };
+            let q = alloc_output("native Q activation")?;
+            let gate = alloc_output("native gate activation")?;
+            // `CommandEncoder` uses concurrent dispatch by default. The
+            // deinterleave kernel consumes the fused projection written by
+            // the preceding matmul, so this RAW dependency must be explicit.
+            encoder.memory_barrier();
+            mlx_native::dispatch_q_gate_deinterleave_f32(
+                encoder,
+                registry,
+                device,
+                &fused,
+                &q,
+                &gate,
+                mlx_native::QGateDeinterleaveParams {
+                    m: seq_len,
+                    n_heads,
+                    head_dim,
+                },
+            )
+            .map_err(|e| anyhow!("deinterleave native Q/gate activation: {e}"))?;
+            Ok((
+                q.with_shape(vec![seq_len as usize, q_total as usize])
+                    .map_err(|e| anyhow!("flatten native Q activation: {e}"))?,
+                gate.with_shape(vec![seq_len as usize, q_total as usize])
+                    .map_err(|e| anyhow!("flatten native gate activation: {e}"))?,
+            ))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_q_gate_projection_f32_into(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weights: &FullAttnQGateWeightsGpu,
+    q_dst: &mut MlxBuffer,
+    gate_dst: &mut MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+    hidden_size: u32,
+) -> Result<()> {
+    let q_total = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| anyhow!("Q/gate projection width overflow"))?;
+    match weights {
+        FullAttnQGateWeightsGpu::Split {
+            wq,
+            wq_ggml_type,
+            w_gate,
+            w_gate_ggml_type,
+        } => {
+            apply_linear_projection_f32_into_with_ggml_type(
+                encoder,
+                registry,
+                device,
+                input,
+                wq,
+                *wq_ggml_type,
+                q_dst,
+                seq_len,
+                hidden_size,
+                q_total,
+            )?;
+            apply_linear_projection_f32_into_with_ggml_type(
+                encoder,
+                registry,
+                device,
+                input,
+                w_gate,
+                *w_gate_ggml_type,
+                gate_dst,
+                seq_len,
+                hidden_size,
+                q_total,
+            )
+        }
+        FullAttnQGateWeightsGpu::Fused { weight, ggml_type } => {
+            let fused = apply_linear_projection_f32_with_ggml_type(
+                encoder,
+                registry,
+                device,
+                input,
+                weight,
+                *ggml_type,
+                seq_len,
+                hidden_size,
+                2 * q_total,
+            )?
+            .with_shape(vec![
+                seq_len as usize,
+                n_heads as usize,
+                (2 * head_dim) as usize,
+            ])
+            .map_err(|e| anyhow!("shape native fused Q/gate activation: {e}"))?;
+            let q_view = q_dst
+                .with_shape(vec![seq_len as usize, n_heads as usize, head_dim as usize])
+                .map_err(|e| anyhow!("shape Q destination: {e}"))?;
+            let gate_view = gate_dst
+                .with_shape(vec![seq_len as usize, n_heads as usize, head_dim as usize])
+                .map_err(|e| anyhow!("shape gate destination: {e}"))?;
+            // The fused matmul above produces `fused`; the deinterleave below
+            // reads it in the same concurrent command encoder.
+            encoder.memory_barrier();
+            mlx_native::dispatch_q_gate_deinterleave_f32(
+                encoder,
+                registry,
+                device,
+                &fused,
+                &q_view,
+                &gate_view,
+                mlx_native::QGateDeinterleaveParams {
+                    m: seq_len,
+                    n_heads,
+                    head_dim,
+                },
+            )
+            .map_err(|e| anyhow!("deinterleave native Q/gate activation: {e}"))
+        }
+    }
 }
 
 // ================================================================
@@ -2560,51 +2894,48 @@ pub fn qwen35_tree_verify_attention_block(
     )
     .context("step 1: apply_pre_attn_rms_norm")?;
 
+    // The command encoder permits concurrent dispatch. The Q/K/V/gate
+    // projections below all consume the RMSNorm output, so make that RAW
+    // dependency explicit before encoding any projection work.
+    enc.memory_barrier();
+
     // ── STEP 2: Q/K/V/G projections ─────────────────────────────────────
-    let q_flat = apply_linear_projection_f32(
+    let (q_flat, gate_flat) = apply_q_gate_projection_f32(
         &mut enc,
         registry,
         device,
         &hidden_normed,
-        &weights.wq,
+        &weights.q_gate,
         shape.tree_seq_len,
+        shape.num_q_heads,
+        shape.head_dim,
         shape.hidden_size,
-        shape.num_q_heads * shape.head_dim,
     )
-    .context("step 2: Q projection")?;
-    let k_flat = apply_linear_projection_f32(
+    .context("step 2: native Q/gate projection")?;
+    let k_flat = apply_linear_projection_f32_with_ggml_type(
         &mut enc,
         registry,
         device,
         &hidden_normed,
         &weights.wk,
+        weights.wk_ggml_type,
         shape.tree_seq_len,
         shape.hidden_size,
         shape.num_kv_heads * shape.head_dim,
     )
     .context("step 2: K projection")?;
-    let v_flat = apply_linear_projection_f32(
+    let v_flat = apply_linear_projection_f32_with_ggml_type(
         &mut enc,
         registry,
         device,
         &hidden_normed,
         &weights.wv,
+        weights.wv_ggml_type,
         shape.tree_seq_len,
         shape.hidden_size,
         shape.num_kv_heads * shape.head_dim,
     )
     .context("step 2: V projection")?;
-    let gate_flat = apply_linear_projection_f32(
-        &mut enc,
-        registry,
-        device,
-        &hidden_normed,
-        &weights.w_gate,
-        shape.tree_seq_len,
-        shape.hidden_size,
-        shape.num_q_heads * shape.head_dim,
-    )
-    .context("step 2: gate projection")?;
 
     // BARRIER (a): RAW — Q/K/V/G matmul writes above; steps 3-4 (per-head
     // norm + IMROPE) read Q_flat, K_flat, G is held for step 9.
@@ -2739,17 +3070,10 @@ pub fn qwen35_tree_verify_attention_block(
     enc.memory_barrier();
 
     // ── STEP 6: Commit encoder before CPU-side memcpy ───────────────────
-    // The CPU-side memcpy in step 7 reads k_scratch and v_scratch through
-    // host-visible MlxBuffer slices. Those slices are only coherent after
-    // the Metal command buffer has been committed and waited. We re-open a
-    // new encoder for steps 8-11.
     enc.commit_and_wait()
         .context("step 6: commit encoder before KV cache write")?;
 
     // ── STEP 7: KV cache append (CPU-side memcpy) ────────────────────────
-    // Cache layout: [num_kv_heads, kv_capacity, head_dim] F32 row-major.
-    // Slot written: [prefix_len, prefix_len + tree_seq_len) along the position axis.
-    // This is Apple unified memory; the copy is zero-transfer.
     {
         let k_src = k_scratch
             .as_slice::<f32>()
@@ -2764,16 +3088,13 @@ pub fn qwen35_tree_verify_attention_block(
             .as_mut_slice::<f32>()
             .map_err(|e| anyhow!("step 7: v_cache as_mut_slice: {e}"))?;
 
-        // Copy per-head block: k_scratch[h, pos, :] → k_cache[h, prefix+pos, :]
         for kv_head in 0..nkv {
             for pos in 0..seq {
-                // Source: k_scratch layout [nkv, seq, d] → offset kv_head*seq*d + pos*d
                 let src_off = kv_head
                     .checked_mul(seq)
                     .and_then(|x| x.checked_add(pos))
                     .and_then(|x| x.checked_mul(d))
                     .ok_or_else(|| anyhow!("step 7: k_src offset overflow"))?;
-                // Destination: k_cache layout [nkv, cap, d] → offset kv_head*cap*d + (prefix+pos)*d
                 let dst_off = kv_head
                     .checked_mul(cap)
                     .and_then(|x| x.checked_add(prefix + pos))
@@ -2786,7 +3107,6 @@ pub fn qwen35_tree_verify_attention_block(
     }
 
     // ── STEP 8: dispatch_qwen35_tree_verify_attention ────────────────────
-    // Open new encoder for the GPU attention + gate + o_proj + residual add.
     let mut enc2 = device
         .command_encoder()
         .map_err(|e| anyhow!("step 8: open encoder: {e}"))?;
@@ -2846,12 +3166,13 @@ pub fn qwen35_tree_verify_attention_block(
     // dispatch_qwen35_tree_verify_attention returns [q_seq, num_q_heads, head_dim]
     // (query-outer, head-inner), which is row-major-equivalent to
     // [q_seq, num_q_heads * head_dim] since trailing dims are contiguous.
-    let o_out = apply_linear_projection_f32(
+    let o_out = apply_linear_projection_f32_with_ggml_type(
         &mut enc2,
         registry,
         device,
         &gated,
         &weights.wo,
+        weights.wo_ggml_type,
         shape.tree_seq_len,
         q_total as u32,
         shape.hidden_size,
@@ -3063,6 +3384,7 @@ pub fn qwen35_tree_verify_full_layer(
     // ── STEP B: ffn_residual = attn_out (PRE-norm, same buffer ARC) ──────
     // The FFN residual stream is the pre-norm attn_out per Qwen3.5 layer
     // composition (forward_cpu.rs:133-149 + the peer).
+    // composition (see forward_cpu.rs:133-149).
     let ffn_residual = attn_out.clone();
 
     // ── STEP C: Open fresh encoder for MLP+norm+residual chain ───────────
@@ -3445,28 +3767,7 @@ pub fn qwen35_tree_verify_full_layer_q(
     ffn_weights: &super::gpu_ffn::DenseFfnWeightsGpuQ,
     shape: Qwen35TreeVerifyFullLayerShapeQ,
 ) -> Result<MlxBuffer> {
-    // ── STEP 0a: ggml_type validation (INV-Q-ggml-type-validation) ──────
-    // MUST fire BEFORE shape.validate() — defense-in-depth ordering.
-    // apply_linear_projection_f32's U8 branch hardcodes GgmlType::Q4_0; a
-    // non-Q4_0 buffer would silently mis-dequantize without this guard.
-    if ffn_weights.ggml_type_gate_up != GgmlType::Q4_0 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q: ggml_type_gate_up must be Q4_0 \
-             (got {:?}). Future CFAs will support Q5_K/Q6_K mixed-quant via \
-             per-projection ggml_type threading through apply_linear_projection_f32.",
-            ffn_weights.ggml_type_gate_up
-        ));
-    }
-    if ffn_weights.ggml_type_down != GgmlType::Q4_0 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q: ggml_type_down must be Q4_0 \
-             (got {:?}). Future CFAs will support Q5_K/Q6_K mixed-quant via \
-             per-projection ggml_type threading through apply_linear_projection_f32.",
-            ffn_weights.ggml_type_down
-        ));
-    }
-
-    // ── STEP 0b: Validate full-layer shape ───────────────────────────────
+    // ── STEP 0a: Validate full-layer shape ───────────────────────────────
     shape.validate()?;
 
     let seq = shape.attn.tree_seq_len as usize;
@@ -3495,79 +3796,60 @@ pub fn qwen35_tree_verify_full_layer_q(
         ));
     }
 
-    // ── STEP 0d: Weight element-count checks (Q4_0 byte lengths) ────────
-    // Q4_0 block geometry: 32 elements per block, 18 bytes per block.
-    // For a weight matrix [rows, cols]: bytes = rows * (cols / 32) * 18.
-    // Equivalently: bytes = rows * cols / 2 + rows * cols / 16.
-    // Use checked arithmetic; compare with != (exact equality, not <).
-    let gate_blocks_per_row = h.checked_div(32).ok_or_else(|| {
-        anyhow!(
-            "qwen35_tree_verify_full_layer_q: hidden_size {} not divisible by 32 (Q4_0 block)",
-            h
-        )
-    })?;
-    if h % 32 != 0 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q: hidden_size ({}) must be divisible by 32 for Q4_0 block encoding",
-            h
-        ));
-    }
-    let gate_expected_bytes = m
-        .checked_mul(gate_blocks_per_row)
-        .and_then(|v| v.checked_mul(18))
-        .ok_or_else(|| {
-            anyhow!("qwen35_tree_verify_full_layer_q: gate Q4_0 byte count overflows usize")
-        })?;
+    // ── STEP 0c: Native weight byte-length checks ───────────────────────
+    // The GGUF type is part of the tensor contract. Mixed Q4_K/Q6_K dense
+    // layers are valid; validate their exact encoded geometry instead of
+    // assuming Q4_0 merely because every block quant is stored as U8.
+    let encoded_bytes = |name: &str, ty: GgmlType, rows: usize, cols: usize| -> Result<usize> {
+        let block_values = ty.block_values() as usize;
+        ensure!(
+            block_values > 0 && cols % block_values == 0,
+            "qwen35_tree_verify_full_layer_q: {name} cols {cols} not divisible by {:?} block width {block_values}",
+            ty
+        );
+        rows.checked_mul(cols / block_values)
+            .and_then(|v| v.checked_mul(ty.block_bytes() as usize))
+            .ok_or_else(|| {
+                anyhow!(
+                    "qwen35_tree_verify_full_layer_q: {name} {:?} byte count overflows usize",
+                    ty
+                )
+            })
+    };
+    let gate_expected_bytes = encoded_bytes("gate/up", ffn_weights.ggml_type_gate_up, m, h)?;
     if ffn_weights.gate_q.element_count() != gate_expected_bytes {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q: gate_q has {} bytes, \
-             expected exactly {} (intermediate_size={} * hidden_size={} Q4_0 encoding: \
-             {} rows × {} blocks/row × 18 bytes/block)",
+             expected exactly {} for {:?} [{}, {}]",
             ffn_weights.gate_q.element_count(),
             gate_expected_bytes,
+            ffn_weights.ggml_type_gate_up,
             m,
-            h,
-            m,
-            gate_blocks_per_row
+            h
         ));
     }
     if ffn_weights.up_q.element_count() != gate_expected_bytes {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q: up_q has {} bytes, \
-             expected exactly {} (intermediate_size={} * hidden_size={} Q4_0 encoding)",
+             expected exactly {} for {:?} [{}, {}]",
             ffn_weights.up_q.element_count(),
             gate_expected_bytes,
+            ffn_weights.ggml_type_gate_up,
             m,
             h
         ));
     }
     // down_proj: [hidden_size, intermediate_size] → rows=h, cols=m
-    let down_blocks_per_row = m
-        .checked_div(32)
-        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q: intermediate_size {} not divisible by 32 (Q4_0 block)", m))?;
-    if m % 32 != 0 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q: intermediate_size ({}) must be divisible by 32 for Q4_0 block encoding",
-            m
-        ));
-    }
-    let down_expected_bytes = h
-        .checked_mul(down_blocks_per_row)
-        .and_then(|v| v.checked_mul(18))
-        .ok_or_else(|| {
-            anyhow!("qwen35_tree_verify_full_layer_q: down Q4_0 byte count overflows usize")
-        })?;
+    let down_expected_bytes = encoded_bytes("down", ffn_weights.ggml_type_down, h, m)?;
     if ffn_weights.down_q.element_count() != down_expected_bytes {
         return Err(anyhow!(
             "qwen35_tree_verify_full_layer_q: down_q has {} bytes, \
-             expected exactly {} (hidden_size={} * intermediate_size={} Q4_0 encoding: \
-             {} rows × {} blocks/row × 18 bytes/block)",
+             expected exactly {} for {:?} [{}, {}]",
             ffn_weights.down_q.element_count(),
             down_expected_bytes,
+            ffn_weights.ggml_type_down,
             h,
-            m,
-            h,
-            down_blocks_per_row
+            m
         ));
     }
 
@@ -3591,6 +3873,7 @@ pub fn qwen35_tree_verify_full_layer_q(
     // ── STEP B: ffn_residual = attn_out (PRE-norm, same buffer ARC) ──────
     // The FFN residual stream is the pre-norm attn_out per Qwen3.5 layer
     // composition (forward_cpu.rs:133-149 + the peer).
+    // composition (see forward_cpu.rs:133-149).
     let ffn_residual = attn_out.clone();
 
     // ── STEP C: Open fresh encoder for MLP+norm+residual chain ───────────
@@ -3633,24 +3916,26 @@ pub fn qwen35_tree_verify_full_layer_q(
 
     // ── STEP F+G: gate_proj and up_proj — concurrent (both read post_attn_normed) ──
     // apply_linear_projection_f32 auto-routes U8 dtype → quantized_matmul_ggml Q4_0.
-    let gate_buf = apply_linear_projection_f32(
+    let gate_buf = apply_linear_projection_f32_with_ggml_type(
         &mut enc2,
         registry,
         device,
         &post_attn_normed,
         &ffn_weights.gate_q,
+        ffn_weights.ggml_type_gate_up,
         shape.attn.tree_seq_len,
         shape.attn.hidden_size,
         shape.intermediate_size,
     )
     .context("qwen35_tree_verify_full_layer_q: gate_proj")?;
 
-    let up_buf = apply_linear_projection_f32(
+    let up_buf = apply_linear_projection_f32_with_ggml_type(
         &mut enc2,
         registry,
         device,
         &post_attn_normed,
         &ffn_weights.up_q,
+        ffn_weights.ggml_type_gate_up,
         shape.attn.tree_seq_len,
         shape.attn.hidden_size,
         shape.intermediate_size,
@@ -3703,12 +3988,13 @@ pub fn qwen35_tree_verify_full_layer_q(
     enc2.memory_barrier();
 
     // ── STEP K: down_proj — activated_buf → ffn_out [tree_seq_len, hidden_size] ──
-    let ffn_out = apply_linear_projection_f32(
+    let ffn_out = apply_linear_projection_f32_with_ggml_type(
         &mut enc2,
         registry,
         device,
         &activated_buf,
         &ffn_weights.down_q,
+        ffn_weights.ggml_type_down,
         shape.attn.tree_seq_len,
         shape.intermediate_size,
         shape.attn.hidden_size,
@@ -3777,6 +4063,7 @@ pub fn qwen35_tree_verify_full_layer_q(
 ///
 /// `ffn_residual = attn_out` (PRE-norm value) per Qwen3.5 MoE composition
 /// (forward_cpu.rs:133-149, the peer). Passed as `add_residual = Some(&ffn_residual)`
+/// (forward_cpu.rs:133-149). Passed as `add_residual = Some(&ffn_residual)`
 /// to `build_moe_ffn_layer_gpu_q` which performs the final residual add inside Phase F.
 ///
 /// # ggml_type validation invariant (INV-QMoE-ggml-type-validation)
@@ -5154,6 +5441,8 @@ pub fn apply_sdpa_with_kv_cache(
         // context (kv_seq_len > ~500) this bottlenecked single-SIMD
         // throughput. flash_attn_vec is the decode-path
         // SDPA: NWG=32 workgroups split the KV cache, each running an
+        // throughput. flash_attn_vec uses NWG=32 workgroups to split the KV
+        // cache, each running an
         // online softmax, then a reduce kernel combines per-workgroup
         // partials. Empirical on qwen3.6-35B-A3B-dwq48 (head_dim=256):
         // tg200 122.7→131.0, tg500 115.8→130.5, tg1000 105.2→130.0 — all
@@ -6144,20 +6433,36 @@ pub fn build_gated_attn_layer(
             let is_q4_0 = |buf: &MlxBuffer, expected: usize| {
                 buf.dtype() == DType::U8 && buf.byte_len() == expected
             };
+            let split_q4 = match &weights_gpu.q_gate {
+                FullAttnQGateWeightsGpu::Split {
+                    wq,
+                    wq_ggml_type,
+                    w_gate,
+                    w_gate_ggml_type,
+                } if *wq_ggml_type == GgmlType::Q4_0
+                    && *w_gate_ggml_type == GgmlType::Q4_0
+                    && is_q4_0(wq, q_w_bytes_expected)
+                    && is_q4_0(w_gate, q_w_bytes_expected) =>
+                {
+                    Some((wq, w_gate))
+                }
+                _ => None,
+            };
             let use_fused_qkvg = fused_qkvg_enabled()
                 && hidden_size % Q4_0_BLOCK_VALUES == 0
-                && is_q4_0(&weights_gpu.wq, q_w_bytes_expected)
-                && is_q4_0(&weights_gpu.w_gate, q_w_bytes_expected)
+                && weights_gpu.wk_ggml_type == GgmlType::Q4_0
+                && weights_gpu.wv_ggml_type == GgmlType::Q4_0
+                && split_q4.is_some()
                 && is_q4_0(&weights_gpu.wk, kv_w_bytes_expected)
                 && is_q4_0(&weights_gpu.wv, kv_w_bytes_expected);
-            if use_fused_qkvg {
+            if let Some((wq, w_gate)) = split_q4.filter(|_| use_fused_qkvg) {
                 // Fused Q + gate (both [hidden, q_total]).
                 mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
                     enc.encoder(),
                     registry,
                     device,
-                    &weights_gpu.wq,
-                    &weights_gpu.w_gate,
+                    wq,
+                    w_gate,
                     &arena.x_norm_buf,
                     &arena.q_proj_buf,
                     &arena.gate_proj_buf,
@@ -6184,49 +6489,42 @@ pub fn build_gated_attn_layer(
                     },
                 )?;
             } else {
-                apply_linear_projection_f32_into(
+                apply_q_gate_projection_f32_into(
                     enc.encoder(),
                     registry,
                     device,
                     &arena.x_norm_buf,
-                    &weights_gpu.wq,
+                    &weights_gpu.q_gate,
                     &mut arena.q_proj_buf,
+                    &mut arena.gate_proj_buf,
                     seq_len,
+                    n_heads,
+                    head_dim,
                     hidden_size,
-                    q_total,
                 )?;
-                apply_linear_projection_f32_into(
+                apply_linear_projection_f32_into_with_ggml_type(
                     enc.encoder(),
                     registry,
                     device,
                     &arena.x_norm_buf,
                     &weights_gpu.wk,
+                    weights_gpu.wk_ggml_type,
                     &mut arena.k_proj_buf,
                     seq_len,
                     hidden_size,
                     kv_total,
                 )?;
-                apply_linear_projection_f32_into(
+                apply_linear_projection_f32_into_with_ggml_type(
                     enc.encoder(),
                     registry,
                     device,
                     &arena.x_norm_buf,
                     &weights_gpu.wv,
+                    weights_gpu.wv_ggml_type,
                     &mut arena.v_proj_buf,
                     seq_len,
                     hidden_size,
                     kv_total,
-                )?;
-                apply_linear_projection_f32_into(
-                    enc.encoder(),
-                    registry,
-                    device,
-                    &arena.x_norm_buf,
-                    &weights_gpu.w_gate,
-                    &mut arena.gate_proj_buf,
-                    seq_len,
-                    hidden_size,
-                    q_total,
                 )?;
             }
             // Barrier: ops 3 read from q_proj/k_proj written above.
@@ -6660,124 +6958,134 @@ pub fn build_gated_attn_layer(
             let is_q4_0 = |buf: &MlxBuffer, expected: usize| {
                 buf.dtype() == DType::U8 && buf.byte_len() == expected
             };
+            let split_q4 = match &weights_gpu.q_gate {
+                FullAttnQGateWeightsGpu::Split {
+                    wq,
+                    wq_ggml_type,
+                    w_gate,
+                    w_gate_ggml_type,
+                } if *wq_ggml_type == GgmlType::Q4_0
+                    && *w_gate_ggml_type == GgmlType::Q4_0
+                    && is_q4_0(wq, q_w_bytes_expected)
+                    && is_q4_0(w_gate, q_w_bytes_expected) =>
+                {
+                    Some((wq, w_gate))
+                }
+                _ => None,
+            };
             let use_fused_qkvg = fused_qkvg_enabled()
                 && hidden_size % Q4_0_BLOCK_VALUES == 0
-                && is_q4_0(&weights_gpu.wq, q_w_bytes_expected)
-                && is_q4_0(&weights_gpu.w_gate, q_w_bytes_expected)
+                && weights_gpu.wk_ggml_type == GgmlType::Q4_0
+                && weights_gpu.wv_ggml_type == GgmlType::Q4_0
+                && split_q4.is_some()
                 && is_q4_0(&weights_gpu.wk, kv_w_bytes_expected)
                 && is_q4_0(&weights_gpu.wv, kv_w_bytes_expected);
-            let (q_flat, k_flat, v_flat, gate_flat) = if use_fused_qkvg {
-                // Allocate 4 destination buffers via the pool (same as helper
-                // does internally) so the fused dispatch can write all 4.
-                let q_bytes = (seq_len * q_total) as usize * 4;
-                let kv_bytes = (seq_len * kv_total) as usize * 4;
-                let q_flat = super::decode_pool::pooled_alloc_buffer(
-                    device,
-                    q_bytes,
-                    DType::F32,
-                    vec![seq_len as usize, q_total as usize],
-                )
-                .map_err(|e| anyhow!("alloc q_flat (qkvg fused): {e}"))?;
-                let gate_flat = super::decode_pool::pooled_alloc_buffer(
-                    device,
-                    q_bytes,
-                    DType::F32,
-                    vec![seq_len as usize, q_total as usize],
-                )
-                .map_err(|e| anyhow!("alloc gate_flat (qkvg fused): {e}"))?;
-                let k_flat = super::decode_pool::pooled_alloc_buffer(
-                    device,
-                    kv_bytes,
-                    DType::F32,
-                    vec![seq_len as usize, kv_total as usize],
-                )
-                .map_err(|e| anyhow!("alloc k_flat (qkvg fused): {e}"))?;
-                let v_flat = super::decode_pool::pooled_alloc_buffer(
-                    device,
-                    kv_bytes,
-                    DType::F32,
-                    vec![seq_len as usize, kv_total as usize],
-                )
-                .map_err(|e| anyhow!("alloc v_flat (qkvg fused): {e}"))?;
-                // Fused Q + gate.
-                mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
-                    &mut enc,
-                    registry,
-                    device,
-                    &weights_gpu.wq,
-                    &weights_gpu.w_gate,
-                    &x_norm,
-                    &q_flat,
-                    &gate_flat,
-                    mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
-                        m: seq_len,
-                        output_size: q_total,
+            let (q_flat, k_flat, v_flat, gate_flat) =
+                if let Some((wq, w_gate)) = split_q4.filter(|_| use_fused_qkvg) {
+                    // Allocate 4 destination buffers via the pool (same as helper
+                    // does internally) so the fused dispatch can write all 4.
+                    let q_bytes = (seq_len * q_total) as usize * 4;
+                    let kv_bytes = (seq_len * kv_total) as usize * 4;
+                    let q_flat = super::decode_pool::pooled_alloc_buffer(
+                        device,
+                        q_bytes,
+                        DType::F32,
+                        vec![seq_len as usize, q_total as usize],
+                    )
+                    .map_err(|e| anyhow!("alloc q_flat (qkvg fused): {e}"))?;
+                    let gate_flat = super::decode_pool::pooled_alloc_buffer(
+                        device,
+                        q_bytes,
+                        DType::F32,
+                        vec![seq_len as usize, q_total as usize],
+                    )
+                    .map_err(|e| anyhow!("alloc gate_flat (qkvg fused): {e}"))?;
+                    let k_flat = super::decode_pool::pooled_alloc_buffer(
+                        device,
+                        kv_bytes,
+                        DType::F32,
+                        vec![seq_len as usize, kv_total as usize],
+                    )
+                    .map_err(|e| anyhow!("alloc k_flat (qkvg fused): {e}"))?;
+                    let v_flat = super::decode_pool::pooled_alloc_buffer(
+                        device,
+                        kv_bytes,
+                        DType::F32,
+                        vec![seq_len as usize, kv_total as usize],
+                    )
+                    .map_err(|e| anyhow!("alloc v_flat (qkvg fused): {e}"))?;
+                    // Fused Q + gate.
+                    mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
+                        &mut enc,
+                        registry,
+                        device,
+                        wq,
+                        w_gate,
+                        &x_norm,
+                        &q_flat,
+                        &gate_flat,
+                        mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
+                            m: seq_len,
+                            output_size: q_total,
+                            hidden_size,
+                        },
+                    )?;
+                    // Fused K + V.
+                    mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
+                        &mut enc,
+                        registry,
+                        device,
+                        &weights_gpu.wk,
+                        &weights_gpu.wv,
+                        &x_norm,
+                        &k_flat,
+                        &v_flat,
+                        mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
+                            m: seq_len,
+                            output_size: kv_total,
+                            hidden_size,
+                        },
+                    )?;
+                    (q_flat, k_flat, v_flat, gate_flat)
+                } else {
+                    // Pool-aware path: seq_len=1 (decode) goes to the arena pool, seq_len>1
+                    // (prefill) auto-falls-back to unpooled inside the helper because some
+                    // prefill consumers download K/V to CPU (see apply_sdpa_with_kv_cache).
+                    let (q_flat, gate_flat) = apply_q_gate_projection_f32(
+                        &mut enc,
+                        registry,
+                        device,
+                        &x_norm,
+                        &weights_gpu.q_gate,
+                        seq_len,
+                        n_heads,
+                        head_dim,
                         hidden_size,
-                    },
-                )?;
-                // Fused K + V.
-                mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
-                    &mut enc,
-                    registry,
-                    device,
-                    &weights_gpu.wk,
-                    &weights_gpu.wv,
-                    &x_norm,
-                    &k_flat,
-                    &v_flat,
-                    mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
-                        m: seq_len,
-                        output_size: kv_total,
+                    )?;
+                    let k_flat = apply_linear_projection_f32_pooled_with_ggml_type(
+                        &mut enc,
+                        registry,
+                        device,
+                        &x_norm,
+                        &weights_gpu.wk,
+                        weights_gpu.wk_ggml_type,
+                        seq_len,
                         hidden_size,
-                    },
-                )?;
-                (q_flat, k_flat, v_flat, gate_flat)
-            } else {
-                // Pool-aware path: seq_len=1 (decode) goes to the arena pool, seq_len>1
-                // (prefill) auto-falls-back to unpooled inside the helper because some
-                // prefill consumers download K/V to CPU (see apply_sdpa_with_kv_cache).
-                let q_flat = apply_linear_projection_f32_pooled(
-                    &mut enc,
-                    registry,
-                    device,
-                    &x_norm,
-                    &weights_gpu.wq,
-                    seq_len,
-                    hidden_size,
-                    q_total,
-                )?;
-                let k_flat = apply_linear_projection_f32_pooled(
-                    &mut enc,
-                    registry,
-                    device,
-                    &x_norm,
-                    &weights_gpu.wk,
-                    seq_len,
-                    hidden_size,
-                    kv_total,
-                )?;
-                let v_flat = apply_linear_projection_f32_pooled(
-                    &mut enc,
-                    registry,
-                    device,
-                    &x_norm,
-                    &weights_gpu.wv,
-                    seq_len,
-                    hidden_size,
-                    kv_total,
-                )?;
-                let gate_flat = apply_linear_projection_f32_pooled(
-                    &mut enc,
-                    registry,
-                    device,
-                    &x_norm,
-                    &weights_gpu.w_gate,
-                    seq_len,
-                    hidden_size,
-                    q_total,
-                )?;
-                (q_flat, k_flat, v_flat, gate_flat)
-            };
+                        kv_total,
+                    )?;
+                    let v_flat = apply_linear_projection_f32_pooled_with_ggml_type(
+                        &mut enc,
+                        registry,
+                        device,
+                        &x_norm,
+                        &weights_gpu.wv,
+                        weights_gpu.wv_ggml_type,
+                        seq_len,
+                        hidden_size,
+                        kv_total,
+                    )?;
+                    (q_flat, k_flat, v_flat, gate_flat)
+                };
             // Barrier: ops 3 read from q_flat / k_flat written above.
             enc.memory_barrier();
 
@@ -7102,12 +7410,13 @@ pub fn build_gated_attn_layer(
         // must be made explicit via `memory_barrier()`, never inferred from
         // submission order.
         enc.encoder().memory_barrier();
-        let out = apply_linear_projection_f32_pooled(
+        let out = apply_linear_projection_f32_pooled_with_ggml_type(
             enc.encoder(),
             registry,
             device,
             &gated,
             &weights_gpu.wo,
+            weights_gpu.wo_ggml_type,
             seq_len,
             q_total,
             hidden_size,
@@ -7428,45 +7737,38 @@ pub fn apply_gated_attn_layer_decode_into(
     enc.memory_barrier();
 
     // Op 2: Q/K/V/G projections (all read from x_norm).  Pool-aware path.
-    let q_flat = apply_linear_projection_f32_pooled(
+    let (q_flat, gate_flat) = apply_q_gate_projection_f32(
         enc,
         registry,
         device,
         &x_norm,
-        &weights_gpu.wq,
+        &weights_gpu.q_gate,
         seq_len,
+        n_heads,
+        head_dim,
         hidden_size,
-        q_total,
     )?;
-    let k_flat = apply_linear_projection_f32_pooled(
+    let k_flat = apply_linear_projection_f32_pooled_with_ggml_type(
         enc,
         registry,
         device,
         &x_norm,
         &weights_gpu.wk,
+        weights_gpu.wk_ggml_type,
         seq_len,
         hidden_size,
         kv_total,
     )?;
-    let v_flat = apply_linear_projection_f32_pooled(
+    let v_flat = apply_linear_projection_f32_pooled_with_ggml_type(
         enc,
         registry,
         device,
         &x_norm,
         &weights_gpu.wv,
+        weights_gpu.wv_ggml_type,
         seq_len,
         hidden_size,
         kv_total,
-    )?;
-    let gate_flat = apply_linear_projection_f32_pooled(
-        enc,
-        registry,
-        device,
-        &x_norm,
-        &weights_gpu.w_gate,
-        seq_len,
-        hidden_size,
-        q_total,
     )?;
     // Barrier: ops 3 read from q_flat / k_flat written above.  Preserved
     // at the same call-site position as the legacy gpu_full_attn.rs:1503.
@@ -7582,12 +7884,13 @@ pub fn apply_gated_attn_layer_decode_into(
     // COHERENCE-DIAG, fix verified 5-trial × 4-fixture byte-identical
     // in iter21.
     enc.memory_barrier();
-    let out = apply_linear_projection_f32_pooled(
+    let out = apply_linear_projection_f32_pooled_with_ggml_type(
         enc,
         registry,
         device,
         &gated,
         &weights_gpu.wo,
+        weights_gpu.wo_ggml_type,
         seq_len,
         q_total,
         hidden_size,
@@ -7604,6 +7907,193 @@ pub fn apply_gated_attn_layer_decode_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_f32_projection_qwen_m4_is_deterministic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let m = 4_u32;
+        let n = 5120_u32;
+        let k = 5120_u32;
+        let mut seed = 0xF320_0004_u32;
+        let weight = upload_f32(&mk_rand(&mut seed, (n * k) as usize, 0.05), &device)
+            .expect("upload native F32 projection weight");
+        let input = upload_f32(&mk_rand(&mut seed, (m * k) as usize, 0.1), &device)
+            .expect("upload native F32 projection input");
+        let mut baseline: Option<Vec<f32>> = None;
+
+        for repetition in 0..3 {
+            let mut encoder = device.command_encoder().expect("projection encoder");
+            let output = apply_linear_projection_f32_with_ggml_type(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &weight,
+                GgmlType::F32,
+                m,
+                k,
+                n,
+            )
+            .expect("native F32 projection");
+            encoder
+                .commit_and_wait_labeled("test.qwen.native_f32_projection")
+                .expect("complete native F32 projection");
+            let actual = download_f32(&output).expect("download native F32 projection");
+            if let Some(expected) = baseline.as_ref() {
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "native F32 Qwen-width projection changed at repetition {repetition}"
+                );
+            } else {
+                baseline = Some(actual);
+            }
+        }
+    }
+
+    #[test]
+    fn native_f32_fused_q_gate_qwen_m4_is_deterministic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let m = 4_u32;
+        let n_heads = 40_u32;
+        let head_dim = 128_u32;
+        let hidden = 5120_u32;
+        let mut seed = 0xF320_4004_u32;
+        let weight = FullAttnQGateWeightsGpu::Fused {
+            weight: upload_f32(
+                &mk_rand(&mut seed, (2 * n_heads * head_dim * hidden) as usize, 0.05),
+                &device,
+            )
+            .expect("upload fused F32 Q/gate weight"),
+            ggml_type: GgmlType::F32,
+        };
+        let input = upload_f32(&mk_rand(&mut seed, (m * hidden) as usize, 0.1), &device)
+            .expect("upload fused F32 Q/gate input");
+        let mut baseline: Option<(Vec<u32>, Vec<u32>)> = None;
+
+        for repetition in 0..3 {
+            let mut encoder = device.command_encoder().expect("Q/gate encoder");
+            let (q, gate) = apply_q_gate_projection_f32(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &weight,
+                m,
+                n_heads,
+                head_dim,
+                hidden,
+            )
+            .expect("fused F32 Q/gate projection");
+            encoder
+                .commit_and_wait_labeled("test.qwen.native_f32_fused_q_gate")
+                .expect("complete fused F32 Q/gate projection");
+            let actual = (
+                download_f32(&q)
+                    .expect("download fused F32 Q")
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                download_f32(&gate)
+                    .expect("download fused F32 gate")
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+            );
+            if let Some(expected) = baseline.as_ref() {
+                assert_eq!(
+                    &actual, expected,
+                    "fused native F32 Q/gate changed at repetition {repetition}"
+                );
+            } else {
+                baseline = Some(actual);
+            }
+        }
+    }
+
+    #[test]
+    fn pre_attn_rms_norm_qwen_m4_is_deterministic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let m = 4_u32;
+        let hidden = 5120_u32;
+        let mut seed = 0xF320_4005_u32;
+        let input = upload_f32(&mk_rand(&mut seed, (m * hidden) as usize, 0.1), &device)
+            .expect("upload RMSNorm input");
+        let norm_weight =
+            upload_f32(&vec![1.0_f32; hidden as usize], &device).expect("upload RMSNorm weight");
+        let unused = upload_f32(&[0.0_f32], &device).expect("upload unused fixture weight");
+        let weights = FullAttnWeightsGpu {
+            attn_norm: norm_weight,
+            post_attn_norm: unused.clone(),
+            q_gate: FullAttnQGateWeightsGpu::Split {
+                wq: unused.clone(),
+                wq_ggml_type: GgmlType::F32,
+                w_gate: unused.clone(),
+                w_gate_ggml_type: GgmlType::F32,
+            },
+            wk: unused.clone(),
+            wk_ggml_type: GgmlType::F32,
+            wv: unused.clone(),
+            wv_ggml_type: GgmlType::F32,
+            attn_q_norm: unused.clone(),
+            attn_k_norm: unused.clone(),
+            wo: unused,
+            wo_ggml_type: GgmlType::F32,
+        };
+        let mut baseline: Option<Vec<u32>> = None;
+
+        for repetition in 0..3 {
+            let mut encoder = device.command_encoder().expect("RMSNorm encoder");
+            let output = apply_pre_attn_rms_norm(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &weights,
+                m,
+                hidden,
+                1e-6,
+            )
+            .expect("pre-attention RMSNorm");
+            encoder
+                .commit_and_wait_labeled("test.qwen.pre_attn_rms_norm")
+                .expect("complete pre-attention RMSNorm");
+            let actual = download_f32(&output)
+                .expect("download pre-attention RMSNorm")
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
+            if let Some(expected) = baseline.as_ref() {
+                assert_eq!(
+                    &actual, expected,
+                    "pre-attention RMSNorm changed at repetition {repetition}"
+                );
+            } else {
+                baseline = Some(actual);
+            }
+        }
+    }
 
     use super::super::full_attn::{FullAttnLayerWeights, FullAttnShape};
     use crate::inference::spec_decode::eagle3::config::Eagle3DrafterConfig;
@@ -7882,6 +8372,130 @@ mod tests {
         };
         let seq_len = 4u32;
         (shape, weights, seq_len)
+    }
+
+    fn assert_native_q4k_fused_q_gate_chain(seq_len: u32) {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let hidden = 256usize;
+        let n_heads = 2usize;
+        let head_dim = 128usize;
+        let q_total = n_heads * head_dim;
+        let fused_rows = 2 * q_total;
+
+        // Artifact layout is per-head [Q rows, gate rows]. Quantize once,
+        // then form split native buffers only by copying complete encoded
+        // rows; the split path is an exact execution oracle for the fused
+        // projection + activation deinterleave path.
+        let fused_f32: Vec<f32> = (0..fused_rows * hidden)
+            .map(|i| (((i * 17 + 11) % 257) as f32 - 128.0) * 0.0005)
+            .collect();
+        let fused_bytes = crate::quantize::ggml_quants::q4_k::quantize(&fused_f32, hidden, None);
+        let row_bytes = hidden / 256 * crate::quantize::ggml_quants::q4_k::BLOCK_BYTES;
+        let mut q_bytes = Vec::with_capacity(q_total * row_bytes);
+        let mut gate_bytes = Vec::with_capacity(q_total * row_bytes);
+        for head in 0..n_heads {
+            let head_base = head * 2 * head_dim;
+            for row in 0..head_dim {
+                let start = (head_base + row) * row_bytes;
+                q_bytes.extend_from_slice(&fused_bytes[start..start + row_bytes]);
+            }
+            for row in 0..head_dim {
+                let start = (head_base + head_dim + row) * row_bytes;
+                gate_bytes.extend_from_slice(&fused_bytes[start..start + row_bytes]);
+            }
+        }
+        let upload_u8 = |bytes: &[u8]| {
+            let mut buffer = device
+                .alloc_buffer(bytes.len(), DType::U8, vec![bytes.len()])
+                .expect("allocate Q4_K test weight");
+            buffer
+                .as_mut_slice::<u8>()
+                .expect("map Q4_K test weight")
+                .copy_from_slice(bytes);
+            buffer
+        };
+        let split = FullAttnQGateWeightsGpu::Split {
+            wq: upload_u8(&q_bytes),
+            wq_ggml_type: GgmlType::Q4_K,
+            w_gate: upload_u8(&gate_bytes),
+            w_gate_ggml_type: GgmlType::Q4_K,
+        };
+        let fused = FullAttnQGateWeightsGpu::Fused {
+            weight: upload_u8(&fused_bytes),
+            ggml_type: GgmlType::Q4_K,
+        };
+        let input_f32: Vec<f32> = (0..seq_len as usize * hidden)
+            .map(|i| (((i * 13 + 3) % 193) as f32 - 96.0) * 0.002)
+            .collect();
+        let input = upload_f32(&input_f32, &device).expect("upload input");
+
+        let mut split_encoder = device.command_encoder().expect("split encoder");
+        let (q_expected, gate_expected) = apply_q_gate_projection_f32(
+            &mut split_encoder,
+            &mut registry,
+            &device,
+            &input,
+            &split,
+            seq_len,
+            n_heads as u32,
+            head_dim as u32,
+            hidden as u32,
+        )
+        .expect("split Q/gate projection");
+        split_encoder
+            .commit_and_wait_labeled("test.q_gate.split")
+            .expect("split completion");
+
+        let barriers_before = mlx_native::barrier_count();
+        let mut fused_encoder = device.command_encoder().expect("fused encoder");
+        let (q_actual, gate_actual) = apply_q_gate_projection_f32(
+            &mut fused_encoder,
+            &mut registry,
+            &device,
+            &input,
+            &fused,
+            seq_len,
+            n_heads as u32,
+            head_dim as u32,
+            hidden as u32,
+        )
+        .expect("fused Q/gate projection");
+        fused_encoder
+            .commit_and_wait_labeled("test.q_gate.fused")
+            .expect("fused completion");
+        assert!(
+            mlx_native::barrier_count() > barriers_before,
+            "fused matmul -> deinterleave must encode an explicit RAW barrier"
+        );
+
+        for (name, expected, actual) in [
+            ("Q", q_expected, q_actual),
+            ("gate", gate_expected, gate_actual),
+        ] {
+            let expected = download_f32(&expected).expect("download split output");
+            let actual = download_f32(&actual).expect("download fused output");
+            assert_eq!(expected.len(), actual.len(), "{name} length");
+            for (idx, (left, right)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(
+                    left.to_bits(),
+                    right.to_bits(),
+                    "{name}[{idx}] differs for seq_len={seq_len}: {left} vs {right}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_q4k_fused_q_gate_chain_m1_is_exact_and_barriered() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        assert_native_q4k_fused_q_gate_chain(1);
+    }
+
+    #[test]
+    fn native_q4k_fused_q_gate_chain_m4_is_exact_and_barriered() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        assert_native_q4k_fused_q_gate_chain(4);
     }
 
     fn qwen35_tree_verify_params(
@@ -8171,11 +8785,17 @@ mod tests {
         // 18 bytes (2-byte F16 scale + 16 bytes packed nibbles).
         const QK: usize = 32;
         const Q4_0_BLOCK_BYTES: usize = 18;
+        let (gpu_wq, gpu_w_gate) = match &gpu.q_gate {
+            FullAttnQGateWeightsGpu::Split { wq, w_gate, .. } => (wq, w_gate),
+            FullAttnQGateWeightsGpu::Fused { .. } => {
+                panic!("from_cpu must preserve explicit split fixture projections")
+            }
+        };
         for (name, expected_f32, buf) in [
-            ("wq", &weights_cpu.wq, &gpu.wq),
+            ("wq", &weights_cpu.wq, gpu_wq),
             ("wk", &weights_cpu.wk, &gpu.wk),
             ("wv", &weights_cpu.wv, &gpu.wv),
-            ("w_gate", &weights_cpu.w_gate, &gpu.w_gate),
+            ("w_gate", &weights_cpu.w_gate, gpu_w_gate),
             ("wo", &weights_cpu.wo, &gpu.wo),
         ] {
             assert_eq!(
@@ -8221,10 +8841,10 @@ mod tests {
         // verify by re-encoding with the same canonical CPU encoder and
         // comparing the byte stream.
         for (name, expected, buf) in [
-            ("wq", &weights_cpu.wq, &gpu.wq),
+            ("wq", &weights_cpu.wq, gpu_wq),
             ("wk", &weights_cpu.wk, &gpu.wk),
             ("wv", &weights_cpu.wv, &gpu.wv),
-            ("w_gate", &weights_cpu.w_gate, &gpu.w_gate),
+            ("w_gate", &weights_cpu.w_gate, gpu_w_gate),
             ("wo", &weights_cpu.wo, &gpu.wo),
         ] {
             assert_eq!(
@@ -8898,6 +9518,8 @@ mod tests {
     /// ULP-level (~1e-6 to ~1e-5) diffs that don't change observable
     /// behavior. Real correctness vs canonical references (the peer,
     /// vllm, mlx-python) is gated by `scripts/parity_check.sh`. The
+    /// behavior. Cross-implementation correctness is gated separately by
+    /// `scripts/parity_check.sh`. The
     /// behavior-preserving invariant for the wrapper-→-`_into` extraction
     /// is *kernel equivalence within FP tolerance*, not byte identity.
     ///
@@ -12367,7 +12989,9 @@ mod tests {
             );
         }
 
-        // (f) ggml_type_gate_up != Q4_0 — INV-Q-ggml-type-validation fires BEFORE shape.validate().
+        // (f) Declared GGML type must match both block geometry and bytes.
+        // Re-labeling Q4_0 bytes as Q5_K must fail before dispatch; valid
+        // mixed native types are accepted when their encoded geometry matches.
         {
             let wrong_type_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
                 gate_q: base_ffn_q.gate_q.clone(),
@@ -12396,12 +13020,12 @@ mod tests {
             .unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("ggml_type_gate_up"),
-                "(f) ggml_type_gate_up != Q4_0 not caught: {msg}"
+                msg.contains("gate/up") && msg.contains("Q5_K"),
+                "(f) mismatched gate/up GGML geometry not caught: {msg}"
             );
             assert!(
-                msg.contains("Q4_0"),
-                "(f) error does not mention Q4_0 requirement: {msg}"
+                msg.contains("not divisible") || msg.contains("expected exactly"),
+                "(f) error does not identify encoded geometry mismatch: {msg}"
             );
         }
 

@@ -493,6 +493,11 @@ impl<'a> ExecutedTensorCatalogBuilder<'a> {
                     );
                 }
                 if observation.tensor_name.ends_with(".attn_q.weight") {
+                    let native_fused = executed.len() == 1
+                        && matches!(
+                            executed[0].transform,
+                            ExecutedTensorTransform::DirectGgmlRuntimeBind
+                        );
                     let roles = executed
                         .iter()
                         .filter_map(|executed| {
@@ -505,9 +510,11 @@ impl<'a> ExecutedTensorCatalogBuilder<'a> {
                         }
                         })
                         .collect::<BTreeSet<_>>();
-                    if executed.len() != 2 || roles != BTreeSet::from(["gate", "q"]) {
+                    let split_reencoded =
+                        executed.len() == 2 && roles == BTreeSet::from(["gate", "q"]);
+                    if !native_fused && !split_reencoded {
                         bail!(
-                            "fused Q source {} must produce exactly q and gate executed branches",
+                            "fused Q source {} must remain one native projection or produce exactly q and gate executed branches",
                             observation.tensor_name
                         );
                     }

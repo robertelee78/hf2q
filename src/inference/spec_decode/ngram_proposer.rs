@@ -13,11 +13,12 @@
 //! `_find_longest_matched_ngram_and_propose_tokens` (lines 198-285,
 //! commit-pinned 2026-05-09).
 //!
-//! No model, no GPU, no quality loss. Default OFF in production
-//! behind `HF2Q_SPEC_DECODE` env gate; iter-113 lands the algorithm
-//! only — generation-loop integration arrives in ADR-029 Phase 3
-//! after Phase 2's `forward_decode_verify` clears its byte-identity
-//! gate.
+//! No proposal is committed without target verification. The legacy KMP
+//! proposer remains available to CLI speculative decode; the OpenAI Qwen
+//! server uses the request-owned [`HistoryLookupIndex`] under
+//! `HF2Q_QWEN_SPECULATION=auto`, with an independent measured cost gate.
+
+use std::collections::HashMap;
 
 /// Configuration for the n-gram proposer.
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +32,41 @@ pub struct NgramConfig {
     /// Maximum model context length (drafts truncated so we never propose
     /// past `max_model_len`).
     pub max_model_len: usize,
+}
+
+/// Request-history lookup configuration for long-context assistant traffic.
+///
+/// This is deliberately separate from [`NgramConfig`].  The legacy proposer
+/// above reproduces vLLM's short n-gram algorithm, including its historical
+/// tie-breaking.  Lookup drafting has a different contract: match a longer
+/// suffix and copy the continuation from its *most recent* prior occurrence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryLookupConfig {
+    /// Shortest suffix considered useful enough to draft from.
+    pub min_match: usize,
+    /// Longest suffix examined. Longer matches win.
+    pub max_match: usize,
+    /// Maximum continuation length returned to the verifier.
+    pub max_draft_tokens: usize,
+    /// Maximum model context length.
+    pub max_model_len: usize,
+}
+
+impl HistoryLookupConfig {
+    /// Conservative Apple-Silicon starting point.
+    ///
+    /// The 6..=12 match range follows the useful long-context lookup regime.
+    /// Three is the qualified fixed MTP depth and starting verifier-width
+    /// ceiling. Any larger width requires a matched local correctness and
+    /// throughput benchmark.
+    pub fn default_for_decode(max_model_len: usize) -> Self {
+        Self {
+            min_match: 6,
+            max_match: 12,
+            max_draft_tokens: 3,
+            max_model_len,
+        }
+    }
 }
 
 impl NgramConfig {
@@ -143,6 +179,173 @@ pub fn propose(tokens: &[u32], cfg: &NgramConfig) -> Vec<u32> {
         return Vec::new();
     }
     tokens[start..start + n].to_vec()
+}
+
+/// Copy a continuation from the most recent prior occurrence of the longest
+/// matching request-history suffix.
+///
+/// The proposal is only a candidate.  The target model must verify every
+/// returned token before it is committed to output or KV/recurrent state.
+/// Consequently this helper cannot change model quality by itself.
+///
+/// Search order is part of the contract:
+///
+/// 1. longest suffix first (`max_match` down to `min_match`);
+/// 2. for equal-length matches, newest prior occurrence first;
+/// 3. copy at most `max_draft_tokens`, bounded by available history and model
+///    context room.
+///
+/// This stateless implementation is allocation-free on a miss and performs
+/// exact token comparison, so hash collisions cannot corrupt proposals.  A
+/// persistent index may replace the scan after profiling, provided it
+/// preserves the same ordering and exact-comparison contract.
+pub fn propose_recent(tokens: &[u32], cfg: &HistoryLookupConfig) -> Vec<u32> {
+    let total = tokens.len();
+    if cfg.min_match == 0
+        || cfg.max_match < cfg.min_match
+        || cfg.max_draft_tokens == 0
+        || total < cfg.min_match
+    {
+        return Vec::new();
+    }
+
+    let draft_room = cfg
+        .max_draft_tokens
+        .min(cfg.max_model_len.saturating_sub(total));
+    if draft_room == 0 {
+        return Vec::new();
+    }
+
+    let max_match = cfg.max_match.min(total);
+    for match_len in (cfg.min_match..=max_match).rev() {
+        let suffix_start = total - match_len;
+        if suffix_start == 0 {
+            continue;
+        }
+        let suffix = &tokens[suffix_start..];
+
+        // Starts are visited newest-first.  `start < suffix_start` excludes
+        // the suffix itself while still allowing overlapping repetitions.
+        for start in (0..suffix_start).rev() {
+            let end = start + match_len;
+            if end > total || &tokens[start..end] != suffix {
+                continue;
+            }
+            let available = total.saturating_sub(end);
+            let n = draft_room.min(available);
+            if n > 0 {
+                return tokens[end..end + n].to_vec();
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+/// Incremental request-owned index for [`propose_recent`] semantics.
+///
+/// The index records every position for each token ID.  A lookup starts from
+/// occurrences of the suffix's final token, newest first, and then performs
+/// an exact slice comparison.  That reduces the common miss from a complete
+/// history scan to a handful of candidate positions without introducing a
+/// collision-sensitive hash as a correctness dependency.
+///
+/// Only target-verified tokens may be appended.  Draft tokens must remain
+/// outside this state until the verifier commits them; resetting at request
+/// admission or cache invalidation makes the conversation boundary explicit.
+#[derive(Debug, Clone)]
+pub struct HistoryLookupIndex {
+    cfg: HistoryLookupConfig,
+    tokens: Vec<u32>,
+    positions: HashMap<u32, Vec<usize>>,
+}
+
+impl HistoryLookupIndex {
+    pub fn new(cfg: HistoryLookupConfig) -> Self {
+        Self {
+            cfg,
+            tokens: Vec::new(),
+            positions: HashMap::new(),
+        }
+    }
+
+    /// Replace the complete verified request history.
+    pub fn reset(&mut self, tokens: &[u32]) {
+        self.tokens.clear();
+        self.positions.clear();
+        self.tokens.reserve(tokens.len());
+        for &token in tokens {
+            self.push_verified(token);
+        }
+    }
+
+    /// Append target-verified tokens after a successful commit.
+    pub fn extend_verified(&mut self, tokens: &[u32]) {
+        self.tokens.reserve(tokens.len());
+        for &token in tokens {
+            self.push_verified(token);
+        }
+    }
+
+    pub fn verified_len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Return the same proposal ordering as [`propose_recent`] without a full
+    /// request-history scan on ordinary misses.
+    pub fn propose(&self) -> Vec<u32> {
+        let total = self.tokens.len();
+        if self.cfg.min_match == 0
+            || self.cfg.max_match < self.cfg.min_match
+            || self.cfg.max_draft_tokens == 0
+            || total < self.cfg.min_match
+        {
+            return Vec::new();
+        }
+
+        let draft_room = self
+            .cfg
+            .max_draft_tokens
+            .min(self.cfg.max_model_len.saturating_sub(total));
+        if draft_room == 0 {
+            return Vec::new();
+        }
+
+        let Some(candidate_ends) = self.positions.get(&self.tokens[total - 1]) else {
+            return Vec::new();
+        };
+        let max_match = self.cfg.max_match.min(total);
+        for match_len in (self.cfg.min_match..=max_match).rev() {
+            let suffix_start = total - match_len;
+            if suffix_start == 0 {
+                continue;
+            }
+            let suffix = &self.tokens[suffix_start..];
+            for &end in candidate_ends.iter().rev() {
+                // Skip the suffix's own final token and candidates too short
+                // to contain this match length.
+                if end >= total - 1 || end + 1 < match_len {
+                    continue;
+                }
+                let start = end + 1 - match_len;
+                if start >= suffix_start || &self.tokens[start..=end] != suffix {
+                    continue;
+                }
+                let continuation = end + 1;
+                let n = draft_room.min(total - continuation);
+                if n > 0 {
+                    return self.tokens[continuation..continuation + n].to_vec();
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    fn push_verified(&mut self, token: u32) {
+        let position = self.tokens.len();
+        self.tokens.push(token);
+        self.positions.entry(token).or_default().push(position);
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +546,178 @@ mod tests {
             assert!(
                 (p50 as usize) < 100_000,
                 "propose at len={n} took {p50} ns p50 — too slow for hot path (target <100 µs)"
+            );
+        }
+    }
+
+    #[test]
+    fn history_lookup_prefers_longest_suffix() {
+        // A two-token suffix occurs near the end, but the six-token suffix at
+        // the beginning is the stronger lookup key and must win.
+        let tokens = vec![1, 2, 3, 4, 5, 6, 70, 71, 9, 5, 6, 80, 1, 2, 3, 4, 5, 6];
+        let cfg = HistoryLookupConfig {
+            min_match: 2,
+            max_match: 6,
+            max_draft_tokens: 2,
+            max_model_len: 4096,
+        };
+        assert_eq!(propose_recent(&tokens, &cfg), vec![70, 71]);
+    }
+
+    #[test]
+    fn history_lookup_prefers_most_recent_occurrence_on_tie() {
+        let key = [10, 11, 12, 13, 14, 15];
+        let mut tokens = Vec::new();
+        tokens.extend_from_slice(&key);
+        tokens.extend_from_slice(&[100, 101]);
+        tokens.extend_from_slice(&key);
+        tokens.extend_from_slice(&[200, 201]);
+        tokens.extend_from_slice(&key);
+        let cfg = HistoryLookupConfig {
+            max_draft_tokens: 2,
+            ..HistoryLookupConfig::default_for_decode(4096)
+        };
+        assert_eq!(propose_recent(&tokens, &cfg), vec![200, 201]);
+    }
+
+    #[test]
+    fn history_lookup_caps_draft_at_context_room() {
+        let tokens = vec![1, 2, 3, 4, 5, 6, 90, 91, 92, 1, 2, 3, 4, 5, 6];
+        let cfg = HistoryLookupConfig {
+            min_match: 6,
+            max_match: 12,
+            max_draft_tokens: 5,
+            max_model_len: tokens.len() + 2,
+        };
+        assert_eq!(propose_recent(&tokens, &cfg), vec![90, 91]);
+    }
+
+    #[test]
+    fn history_lookup_rejects_invalid_or_unmatched_config() {
+        let tokens = [1, 2, 3, 4, 5, 6];
+        assert!(propose_recent(
+            &tokens,
+            &HistoryLookupConfig {
+                min_match: 0,
+                max_match: 12,
+                max_draft_tokens: 5,
+                max_model_len: 4096,
+            }
+        )
+        .is_empty());
+        assert!(propose_recent(&tokens, &HistoryLookupConfig::default_for_decode(4096)).is_empty());
+    }
+
+    #[test]
+    fn history_lookup_index_matches_scan_and_updates_only_on_commit() {
+        let cfg = HistoryLookupConfig::default_for_decode(4096);
+        let initial = [1, 2, 3, 4, 5, 6, 90, 91, 1, 2, 3, 4, 5, 6];
+        let mut index = HistoryLookupIndex::new(cfg);
+        index.reset(&initial);
+        assert_eq!(index.propose(), propose_recent(&initial, &cfg));
+        assert_eq!(index.propose(), vec![90, 91, 1]);
+
+        // A draft has no effect until the target verifier commits it.
+        let unverified = [90, 91];
+        assert_eq!(index.verified_len(), initial.len());
+        assert_eq!(index.propose(), vec![90, 91, 1]);
+        index.extend_verified(&unverified[..1]);
+        let mut committed = initial.to_vec();
+        committed.push(90);
+        assert_eq!(index.propose(), propose_recent(&committed, &cfg));
+        assert_eq!(index.verified_len(), committed.len());
+    }
+
+    #[test]
+    fn history_lookup_index_matches_scan_across_random_prefixes() {
+        let cfg = HistoryLookupConfig {
+            min_match: 2,
+            max_match: 8,
+            max_draft_tokens: 5,
+            max_model_len: 4096,
+        };
+        let mut tokens = rand_tokens(0xA11C_E5ED, 300, 32);
+        // Plant repeated regions so the property covers hits as well as misses.
+        let repeated = tokens[40..70].to_vec();
+        tokens.extend_from_slice(&repeated);
+        let mut index = HistoryLookupIndex::new(cfg);
+        index.reset(&tokens[..16]);
+        for &token in &tokens[16..] {
+            assert_eq!(index.propose(), propose_recent(&index.tokens, &cfg));
+            index.extend_verified(&[token]);
+        }
+        assert_eq!(index.propose(), propose_recent(&tokens, &cfg));
+    }
+
+    /// Developer microbenchmark for the stateless lookup scan.  Random input
+    /// exercises the full miss cost; copied-tail input exercises the expected
+    /// long-context assistant hit path.  This is evidence, not a hosted gate:
+    /// run it in `--release` and record the exact host/commit with any claim.
+    #[test]
+    #[ignore]
+    fn bench_history_lookup_random_miss_and_recent_hit() {
+        use std::time::Instant;
+
+        for &n in &[8_192usize, 100_000] {
+            let mut random = rand_tokens(0x1385_9420, n, 248_064);
+            let cfg = HistoryLookupConfig::default_for_decode(n + 256);
+            let hit_tail = random[n - 64..n].to_vec();
+
+            let mut miss_ns = Vec::with_capacity(200);
+            for _ in 0..200 {
+                let start = Instant::now();
+                std::hint::black_box(propose_recent(std::hint::black_box(&random), &cfg));
+                miss_ns.push(start.elapsed().as_nanos());
+            }
+
+            random.extend_from_slice(&hit_tail[..12]);
+            let mut hit_ns = Vec::with_capacity(200);
+            for _ in 0..200 {
+                let start = Instant::now();
+                std::hint::black_box(propose_recent(std::hint::black_box(&random), &cfg));
+                hit_ns.push(start.elapsed().as_nanos());
+            }
+
+            miss_ns.sort_unstable();
+            hit_ns.sort_unstable();
+            eprintln!(
+                "history_lookup len={n} miss_p50={}ns miss_p99={}ns hit_p50={}ns hit_p99={}ns",
+                miss_ns[100], miss_ns[198], hit_ns[100], hit_ns[198]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_history_lookup_index_random_miss_and_recent_hit() {
+        use std::time::Instant;
+
+        for &n in &[8_192usize, 100_000] {
+            let random = rand_tokens(0x1385_9420, n, 248_064);
+            let cfg = HistoryLookupConfig::default_for_decode(n + 256);
+            let mut index = HistoryLookupIndex::new(cfg);
+            index.reset(&random);
+
+            let mut miss_ns = Vec::with_capacity(1_000);
+            for _ in 0..1_000 {
+                let start = Instant::now();
+                std::hint::black_box(index.propose());
+                miss_ns.push(start.elapsed().as_nanos());
+            }
+
+            index.extend_verified(&random[n - 64..n - 52]);
+            let mut hit_ns = Vec::with_capacity(1_000);
+            for _ in 0..1_000 {
+                let start = Instant::now();
+                std::hint::black_box(index.propose());
+                hit_ns.push(start.elapsed().as_nanos());
+            }
+
+            miss_ns.sort_unstable();
+            hit_ns.sort_unstable();
+            eprintln!(
+                "history_lookup_index len={n} miss_p50={}ns miss_p99={}ns hit_p50={}ns hit_p99={}ns",
+                miss_ns[500], miss_ns[990], hit_ns[500], hit_ns[990]
             );
         }
     }

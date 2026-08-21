@@ -770,14 +770,10 @@ fn resolve_token_id(
     tokenizer: &tokenizers::Tokenizer,
     metadata_key: &str,
 ) -> Option<u32> {
-    peer_special_token_id(gguf, metadata_key)
-        .and_then(|id| tokenizer.id_to_token(id).map(|_| id))
+    peer_special_token_id(gguf, metadata_key).and_then(|id| tokenizer.id_to_token(id).map(|_| id))
 }
 
-fn peer_special_token_id(
-    gguf: &mlx_native::gguf::GgufFile,
-    metadata_key: &str,
-) -> Option<u32> {
+fn peer_special_token_id(gguf: &mlx_native::gguf::GgufFile, metadata_key: &str) -> Option<u32> {
     if let Some(id) = gguf.metadata_u32(metadata_key) {
         return Some(id);
     }
@@ -1328,6 +1324,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     //   Option C (default, re-prefill from start_pos=0):
     //     28.2 t/s = 0.25× base.
     // Both research-quality; flag is opt-in.
+    ensure_greedy_only_speculative_cli_path(&args, "HF2Q_SPEC_DFLASH", "DFlash")?;
     if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_dflash_spec_decode(
         &mut mlx_w,
         &prompt_tokens,
@@ -1352,6 +1349,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // base autoregressive: depends on drafter training distribution + temp=0
     // greedy argmax sensitivity — measure empirically before relying on
     // upstream numbers.
+    ensure_greedy_only_speculative_cli_path(&args, "HF2Q_SPEC_EAGLE3", "EAGLE-3")?;
     if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_gemma4_eagle3_spec_decode(
         &mut mlx_w,
         &prompt_tokens,
@@ -1393,6 +1391,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // from token 1.
     //
     // Default OFF.
+    ensure_greedy_only_speculative_cli_path(&args, "HF2Q_SPEC_NGRAM", "n-gram lookup")?;
     if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_ngram_spec_decode(
         &mut mlx_w,
         &prompt_tokens,
@@ -2421,20 +2420,60 @@ fn qwen35_generate_uses_sampling(args: &cli::GenerateArgs) -> bool {
     args.temperature > crate::serve::sampler_pure::SAMPLING_EPS || args.repetition_penalty != 1.0
 }
 
-fn sample_qwen35_logits_for_generate(
-    logits: &mut [f32],
+/// Canonical Qwen CLI sampler mapping. Ordinary autoregressive generation and
+/// MTP speculation both consume this exact value so proposal/target sampling
+/// cannot drift from the requested CLI semantics.
+fn qwen35_sampling_params_for_generate(
     args: &cli::GenerateArgs,
-    previous_tokens: &[u32],
-) -> u32 {
-    let params = crate::serve::sampler_pure::SamplingParams {
+) -> crate::serve::sampler_pure::SamplingParams {
+    crate::serve::sampler_pure::SamplingParams {
         temperature: args.temperature,
         top_p: args.top_p,
         top_k: args.top_k,
         min_p: args.min_p,
         repetition_penalty: args.repetition_penalty,
         max_tokens: args.max_tokens,
+        // GenerateArgs currently exposes no seed. Preserve ordinary Qwen
+        // behavior: unseeded requests draw from process-local entropy.
         seed: None,
-    };
+    }
+}
+
+fn ensure_greedy_only_speculative_cli_path(
+    args: &cli::GenerateArgs,
+    env_var: &str,
+    path_name: &str,
+) -> Result<()> {
+    validate_greedy_only_speculative_cli_path(
+        args,
+        std::env::var(env_var).as_deref() == Ok("1"),
+        env_var,
+        path_name,
+    )
+}
+
+fn validate_greedy_only_speculative_cli_path(
+    args: &cli::GenerateArgs,
+    enabled: bool,
+    env_var: &str,
+    path_name: &str,
+) -> Result<()> {
+    if enabled && qwen35_generate_uses_sampling(args) {
+        anyhow::bail!(
+            "{env_var}=1 selected {path_name}, but that speculative path is greedy-only and \
+             cannot preserve the requested temperature/repetition-penalty distribution; \
+             unset {env_var} or use Qwen MTP via HF2Q_SPEC_DECODE=1"
+        );
+    }
+    Ok(())
+}
+
+fn sample_qwen35_logits_for_generate(
+    logits: &mut [f32],
+    args: &cli::GenerateArgs,
+    previous_tokens: &[u32],
+) -> u32 {
+    let params = qwen35_sampling_params_for_generate(args);
     crate::serve::sampler_pure::sample_token(logits, &params, previous_tokens)
 }
 
@@ -2980,6 +3019,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // try_dispatch_qwen35_dflash_spec_decode). Default OFF preserves
     // production perf parity AND faithful base-autoregressive output.
     let mut model = model;
+    ensure_greedy_only_speculative_cli_path(&args, "HF2Q_SPEC_DFLASH", "Qwen DFlash")?;
     if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_qwen35_dflash_spec_decode(
         &mut model,
         &prompt_tokens,
@@ -2991,6 +3031,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         return Ok(());
     }
 
+    ensure_greedy_only_speculative_cli_path(&args, "HF2Q_SPEC_EAGLE3", "Qwen EAGLE-3")?;
     if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_qwen35_eagle3_spec_decode(
         &mut model,
         &prompt_tokens,
@@ -3006,16 +3047,14 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     let mut use_spec_decode = match spec_env.as_deref() {
         Some("0") => false,
         Some("1") => true,
-        _ => !sample_logits && (args.speculative || model.mtp.is_some()),
+        _ => args.speculative || (!sample_logits && model.mtp.is_some()),
     };
     if sample_logits && args.speculative {
-        tracing::warn!(
-            "Speculative decoding requested with sampling parameters; using sampler path"
-        );
+        tracing::info!("Qwen MTP speculative decoding requested with exact sampler transaction");
     }
     if use_spec_decode && model.mtp.is_none() {
         tracing::warn!(
-            "Speculative decoding requested but this GGUF has no MTP weights; using greedy decode"
+            "Speculative decoding requested but this GGUF has no MTP weights; using standard decode"
         );
         use_spec_decode = false;
     }
@@ -3050,12 +3089,8 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             let mut decode_tps_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
             let mut generated_per_run: Vec<usize> = Vec::with_capacity(BENCH_NUM_RUNS);
             let mut accept_pct_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
-            // ADR-034 task #91 (2026-05-21) codex review #2 — benchmark
-            // path was ignoring sampler. Now plumbed through so
-            // `--benchmark --temperature 0.6` exercises MH.
             let bench_sampler = crate::inference::models::qwen35::spec_decode::SpecSampler::new(
-                args.temperature as f32,
-                0,
+                qwen35_sampling_params_for_generate(&args),
             );
             for run_idx in 0..BENCH_NUM_RUNS {
                 let result = SpecDecode::run_with_sampler_eos_set(
@@ -3064,7 +3099,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                     args.max_tokens,
                     eos_token_ids.clone(),
                     max_seq as u32,
-                    bench_sampler,
+                    bench_sampler.clone(),
                 )
                 .context("qwen35 SpecDecode::run_with_sampler_eos_set (benchmark)")?;
                 let prefill_tps = if result.stats.prefill_elapsed.as_secs_f64() > 0.0 {
@@ -3114,14 +3149,11 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         // Previously single-eos let `<|im_end|>` slip past, causing
         // MTP K1 path to run to max_tokens (ADR-028 iter-263..265).
         //
-        // ADR-034 task #91 (2026-05-21): plumb CLI --temperature through
-        // to SpecDecode via SpecSampler. temp == 0.0 keeps greedy path
-        // (byte-identical to pre-#91); temp > 0.0 engages Metropolis-
-        // Hastings stochastic acceptance at K=1 BATCHED. Default seed=0
-        // for reproducibility in stochastic mode.
+        // Ordinary and speculative Qwen generation share the exact same
+        // SamplingParams mapping. Both p and q apply the complete requested
+        // chain against the conditional generated-token history.
         let sampler = crate::inference::models::qwen35::spec_decode::SpecSampler::new(
-            args.temperature as f32,
-            0,
+            qwen35_sampling_params_for_generate(&args),
         );
         // ADR-034 task #90 Step 4 codex audit (2026-05-21) — honor
         // --ignore-eos by passing an EMPTY eos set when ignore_eos=true.
@@ -6133,11 +6165,7 @@ fn cmd_parity_check(
     }
 
     eprintln!();
-    let ref_label = if self_baseline {
-        "frozen hf2q"
-    } else {
-        "peer"
-    };
+    let ref_label = if self_baseline { "frozen hf2q" } else { "peer" };
     println!("Reference: {} bytes ({})", ref_bytes.len(), ref_label);
     println!("hf2q:      {} bytes", hf2q_bytes.len());
     println!("Common:    {} bytes", common);
@@ -6323,13 +6351,13 @@ fn cmd_parity_capture(
 mod tests {
     use super::{
         build_chat_template_env, detect_greedy_repetition_loop,
-        detect_greedy_repetition_loop_with_text, find_special_token_stop,
-        peer_special_token_id_for_model, maybe_print_serve_banner, parse_kv_cache_budget,
-        parse_scheduler_config, parse_scheduler_config_with_defaults, render_jinja_template,
-        resolve_enable_thinking, resolve_serve_endpoint, run_decode_loop, should_enable_kv_persist,
-        validate_configured_endpoint_auth, validate_mmproj_diagnostic_mode,
-        validate_mmproj_text_binding, DecodeStopReason, RaisePolicy,
-        DEFAULT_MAX_SLOTS_UNDER_INFLIGHT, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
+        detect_greedy_repetition_loop_with_text, find_special_token_stop, maybe_print_serve_banner,
+        parse_kv_cache_budget, parse_scheduler_config, parse_scheduler_config_with_defaults,
+        peer_special_token_id_for_model, render_jinja_template, resolve_enable_thinking,
+        resolve_serve_endpoint, run_decode_loop, should_enable_kv_persist,
+        validate_configured_endpoint_auth, validate_greedy_only_speculative_cli_path,
+        validate_mmproj_diagnostic_mode, validate_mmproj_text_binding, DecodeStopReason,
+        RaisePolicy, DEFAULT_MAX_SLOTS_UNDER_INFLIGHT, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
         FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::cli;
@@ -7420,6 +7448,27 @@ mod tests {
             no_thinking: false,
             ignore_eos: false,
         }
+    }
+
+    #[test]
+    fn greedy_only_speculative_cli_paths_fail_closed_for_sampling() {
+        let mut args = test_args_default();
+        args.temperature = 0.7;
+        let err = validate_greedy_only_speculative_cli_path(
+            &args,
+            true,
+            "HF2Q_SPEC_DFLASH",
+            "Qwen DFlash",
+        )
+        .expect_err("sampled DFlash request must fail closed");
+        assert!(err.to_string().contains("greedy-only"), "err={err:#}");
+    }
+
+    #[test]
+    fn greedy_only_speculative_cli_paths_allow_canonical_greedy() {
+        let args = test_args_default();
+        validate_greedy_only_speculative_cli_path(&args, true, "HF2Q_SPEC_DFLASH", "Qwen DFlash")
+            .expect("temperature=0 without repetition penalty is canonical greedy");
     }
 
     // ---- ADR-005 iter-229 AC-parity: shared chat-template env ---------

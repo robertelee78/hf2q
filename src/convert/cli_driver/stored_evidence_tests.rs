@@ -463,7 +463,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                 let mut session = candidate.start_text_session(16).unwrap();
                 assert_eq!(session.executed_catalog_sha256().len(), 64);
                 let executed_catalog_sha256 = session.executed_catalog_sha256().to_owned();
-                assert_eq!(session.executed_tensor_count(), tensor_count + 1);
+                assert_eq!(session.executed_tensor_count(), tensor_count);
                 assert_eq!(
                     session.executed_catalog_loaded_parent_sha256(),
                     candidate.loaded_catalog_sha256()
@@ -483,7 +483,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                 assert_eq!(logits.len(), prompt_tokens.len() * 32);
                 let next = session.forward_greedy(1, [9, 9, 9, 9]).unwrap();
                 assert!(next < 32);
-                assert_eq!(session.encoded_dispatches().len(), 32);
+                assert_eq!(session.encoded_dispatches().len(), 30);
                 let operation_ids = session
                     .encoded_dispatches()
                     .iter()
@@ -493,7 +493,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                 assert!(operation_ids.contains("blk.0.ffn_down.weight"));
                 assert!(operation_ids.contains("blk.0.attn_qkv.weight"));
                 assert!(operation_ids.contains("blk.0.ssm_out.weight"));
-                assert!(operation_ids.contains("blk.1.attn_q.q"));
+                assert!(operation_ids.contains("blk.1.attn_q.weight"));
                 assert!(operation_ids.contains("output.weight"));
                 let observed_bindings = session
                     .encoded_dispatches()
@@ -548,8 +548,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                         "blk.0.ffn_down.weight",
                         node("blk.0.ffn_down.weight"),
                     ),
-                    ("prompt", "blk.1.attn_q.q", node("blk.1.attn_q.q")),
-                    ("prompt", "blk.1.attn_q.gate", node("blk.1.attn_q.gate")),
+                    ("prompt", "blk.1.attn_q.weight", node("blk.1.attn_q.weight")),
                     ("prompt", "blk.1.attn_k.weight", node("blk.1.attn_k.weight")),
                     ("prompt", "blk.1.attn_v.weight", node("blk.1.attn_v.weight")),
                     (
@@ -576,8 +575,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                     "blk.0.ssm_alpha.weight",
                     "blk.0.ssm_beta.weight",
                     "blk.0.ssm_out.weight",
-                    "blk.1.attn_q.q",
-                    "blk.1.attn_q.gate",
+                    "blk.1.attn_q.weight",
                     "blk.1.attn_k.weight",
                     "blk.1.attn_v.weight",
                     "blk.1.attn_output.weight",
@@ -612,7 +610,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                     assert_eq!(observation.trace.mlx_native_version, "0.11.0");
                     assert_eq!(
                         observation.trace.request.workload,
-                        if index < 17 {
+                        if index < 16 {
                             mlx_native::GgmlWorkloadClass::Prompt
                         } else {
                             mlx_native::GgmlWorkloadClass::DecodeSingle
@@ -644,7 +642,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                     "duplicate operation/workload evidence must fail closed"
                 );
                 let encoded_catalog = session.seal_encoded_dispatches().unwrap();
-                assert_eq!(encoded_catalog.observations().len(), 32);
+                assert_eq!(encoded_catalog.observations().len(), 30);
                 assert_eq!(encoded_catalog.catalog_sha256().len(), 64);
                 assert_eq!(
                     encoded_catalog.executed_catalog_sha256(),

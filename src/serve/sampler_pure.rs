@@ -112,6 +112,8 @@ pub fn sample_token(logits: &mut [f32], params: &SamplingParams, previous_tokens
     // temperature each see the original logit space. This mirrors
     // the peer's sampler, where the token-data pair carries both
     // `.logit` and `.p` and only the dist sampler reads `.p`.
+    // temperature each see the original logit space. Only the final
+    // distribution sampler consumes probabilities.
     // ------------------------------------------------------------------
     // Build the indexed-pair Vec in the thread-local scratch buffer.
     // Drop the per-step is_finite() filter from the build path: NaNs are
@@ -136,6 +138,48 @@ pub fn sample_token(logits: &mut [f32], params: &SamplingParams, previous_tokens
         return out;
     }
     sample_greedy(logits)
+}
+
+/// Materialize the exact probability distribution used by [`sample_token`].
+///
+/// This is the transaction boundary for speculative decoding: both the draft
+/// proposal distribution `q` and the target distribution `p` must be derived
+/// from raw logits with the same request parameters and the same token
+/// history. The transform order is shared with [`sample_token_indexed`]:
+/// repetition penalty, greedy degeneration or top-k, top-p, min-p,
+/// temperature, then softmax.
+///
+/// The returned vector has `logits.len()` entries. Candidates removed by a
+/// truncation stage have probability zero. At greedy temperature the result is
+/// one-hot at the repetition-penalized argmax.
+pub fn sampling_distribution(
+    logits: &[f32],
+    params: &SamplingParams,
+    previous_tokens: &[u32],
+) -> Vec<f32> {
+    if logits.is_empty() {
+        return Vec::new();
+    }
+
+    let mut adjusted = logits.to_vec();
+    if params.repetition_penalty != 1.0 && !previous_tokens.is_empty() {
+        apply_repetition_penalty(&mut adjusted, previous_tokens, params.repetition_penalty);
+    }
+
+    if params.temperature < SAMPLING_EPS {
+        let mut probabilities = vec![0.0; adjusted.len()];
+        probabilities[sample_greedy(&adjusted) as usize] = 1.0;
+        return probabilities;
+    }
+
+    let mut indexed: Vec<(usize, f32)> = adjusted.into_iter().enumerate().collect();
+    prepare_sampling_candidates(&mut indexed, params);
+    let candidate_probs = softmax_logits_to_probs(&indexed);
+    let mut probabilities = vec![0.0; logits.len()];
+    for ((token, _), probability) in indexed.into_iter().zip(candidate_probs) {
+        probabilities[token] = probability;
+    }
+    probabilities
 }
 
 /// ADR-020 AC#7 — sample a token AND return its log-probability under
@@ -195,6 +239,7 @@ pub fn sample_token_with_logprob(
 /// Sample a single token from a pre-extracted top-K (indices, values) pair.
 ///
 /// ADR-005 iter-25. Same peer-shape sampling chain as
+/// ADR-005 iter-25. Same canonical sampling chain as
 /// [`sample_token`] (top_p truncate → min_p truncate → temperature
 /// scale → softmax → multinomial sample), but starts from a small
 /// top-K subset rather than rebuilding `Vec<(usize, f32)>` over the
@@ -293,6 +338,7 @@ pub fn sample_token_from_topk_at_step(
     // alloc is trivial — no thread-local scratch needed.
     //
     // `sample_token_indexed` runs the full peer-parity sampling chain on
+    // `sample_token_indexed` runs the full canonical sampling chain on
     // the supplied pairs:
     //   1. If `params.top_k > 0 && params.top_k < indexed.len()`:
     //      `select_nth_unstable_by` partition + sort the top_k subset.
@@ -331,6 +377,33 @@ fn sample_token_indexed(
     params: &SamplingParams,
     sample_index: usize,
 ) -> Option<u32> {
+    prepare_sampling_candidates(indexed, params);
+
+    // ------------------------------------------------------------------
+    // Final softmax + multinomial sample.
+    // ------------------------------------------------------------------
+    let probs = softmax_logits_to_probs(indexed);
+    let sum: f32 = probs.iter().sum();
+    if sum <= 0.0 || !sum.is_finite() {
+        return Some(indexed.first().map(|&(idx, _)| idx as u32).unwrap_or(0));
+    }
+
+    let mut rng_val = rand_f32(params.seed, sample_index);
+    for (i, &p) in probs.iter().enumerate() {
+        let normalized = p / sum;
+        if rng_val < normalized {
+            return Some(indexed[i].0 as u32);
+        }
+        rng_val -= normalized;
+    }
+
+    Some(indexed.last().map(|&(idx, _)| idx as u32).unwrap_or(0))
+}
+
+/// Apply the canonical non-greedy sampling transforms to indexed raw logits.
+/// Kept separate so ordinary sampling and speculative `p`/`q` construction
+/// cannot drift in transform order.
+fn prepare_sampling_candidates(indexed: &mut Vec<(usize, f32)>, params: &SamplingParams) {
     // ------------------------------------------------------------------
     // Top-k truncation on raw logits.
     //
@@ -344,6 +417,8 @@ fn sample_token_indexed(
     // O(K log K) sort of the small top-k subset. Mirrors the peer's
     // top-k sampler, which uses `std::nth_element` for the
     // same reason. The full-sort fallback only fires when top_k is
+    // O(K log K) sort of the small top-k subset. The full-sort fallback only
+    // fires when top_k is
     // disabled or covers the whole vocab — in which case the downstream
     // top_p loop genuinely needs all logits sorted.
     // ------------------------------------------------------------------
@@ -387,6 +462,7 @@ fn sample_token_indexed(
         let max_logit = indexed[0].1;
         let min_logit_threshold = max_logit + (params.min_p as f32).ln();
         // Always keep at least the top token (the peer's min_keep semantics).
+        // Always keep at least the top token (`min_keep = 1`).
         let mut cutoff = 1;
         for (i, &(_, l)) in indexed.iter().enumerate().skip(1) {
             if l >= min_logit_threshold {
@@ -399,37 +475,18 @@ fn sample_token_indexed(
     }
 
     // ------------------------------------------------------------------
-    // Temperature scale of LOGITS (llama-sampler.cpp:285).
+    // Temperature scale of logits before softmax.
     // ------------------------------------------------------------------
     let inv_temp = 1.0 / params.temperature as f32;
     for (_, l) in indexed.iter_mut() {
         *l *= inv_temp;
     }
-
-    // ------------------------------------------------------------------
-    // Final softmax + multinomial sample.
-    // ------------------------------------------------------------------
-    let probs = softmax_logits_to_probs(indexed);
-    let sum: f32 = probs.iter().sum();
-    if sum <= 0.0 || !sum.is_finite() {
-        return Some(indexed.first().map(|&(idx, _)| idx as u32).unwrap_or(0));
-    }
-
-    let mut rng_val = rand_f32(params.seed, sample_index);
-    for (i, &p) in probs.iter().enumerate() {
-        let normalized = p / sum;
-        if rng_val < normalized {
-            return Some(indexed[i].0 as u32);
-        }
-        rng_val -= normalized;
-    }
-
-    Some(indexed.last().map(|&(idx, _)| idx as u32).unwrap_or(0))
 }
 
 /// Compute softmax probabilities from `(idx, logit)` pairs without mutating
 /// the pair values. Returns a parallel `Vec<f32>` of probabilities summing to
 /// ~1.0. Mirrors the peer's softmax sampler.
+/// ~1.0.
 fn softmax_logits_to_probs(indexed: &[(usize, f32)]) -> Vec<f32> {
     if indexed.is_empty() {
         return Vec::new();
@@ -629,6 +686,70 @@ mod tests {
             previous.push(token);
         }
         previous
+    }
+
+    #[test]
+    fn sampling_distribution_reuses_canonical_candidate_chain() {
+        let params = SamplingParams {
+            temperature: 0.73,
+            top_p: 0.82,
+            top_k: 5,
+            min_p: 0.08,
+            repetition_penalty: 1.35,
+            max_tokens: 1,
+            seed: Some(0x5eed_cafe),
+        };
+        let history = [1, 4, 1];
+        let raw_logits = [0.2_f32, 2.4, 0.7, 1.8, 2.1, -0.4, 1.0, 0.1];
+
+        let probabilities = sampling_distribution(&raw_logits, &params, &history);
+        let sum: f32 = probabilities.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "distribution sum={sum}");
+        assert!(
+            probabilities.iter().filter(|&&p| p > 0.0).count() <= params.top_k,
+            "top-k support must be preserved"
+        );
+
+        let support: Vec<usize> = probabilities
+            .iter()
+            .enumerate()
+            .filter_map(|(token, &probability)| (probability > 0.0).then_some(token))
+            .collect();
+        assert_eq!(support, vec![1, 3, 4, 6]);
+
+        // The probability ratio pins temperature scaling after the shared
+        // repetition/top-k/top-p/min-p stages. Token 3 retains logit 1.8;
+        // repeated token 1 is first penalized to 2.4 / 1.35.
+        let expected_ratio = ((1.8_f32 - (2.4_f32 / 1.35)) / 0.73).exp();
+        let actual_ratio = probabilities[3] / probabilities[1];
+        assert!((actual_ratio - expected_ratio).abs() < 1e-5);
+
+        // Ordinary sampling may consume the uniform draw in sorted-candidate
+        // order while speculative rejection sampling stores dense token-id
+        // order. Both must remain inside the exact same support.
+        let mut logits = raw_logits;
+        let sampled = sample_token(&mut logits, &params, &history) as usize;
+        assert!(support.contains(&sampled));
+    }
+
+    #[test]
+    fn sampling_distribution_greedy_matches_repetition_penalized_sampler() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_p: 0.2,
+            top_k: 1,
+            min_p: 0.9,
+            repetition_penalty: 2.0,
+            max_tokens: 1,
+            seed: Some(7),
+        };
+        let history = [0];
+        let raw_logits = [4.0_f32, 3.0, 1.0];
+        let probabilities = sampling_distribution(&raw_logits, &params, &history);
+        assert_eq!(probabilities, vec![0.0, 1.0, 0.0]);
+
+        let mut logits = raw_logits;
+        assert_eq!(sample_token(&mut logits, &params, &history), 1);
     }
 
     #[test]

@@ -1,11 +1,15 @@
 # ADR-044: Qwen3.8 native conversion and inference
 
-- Status: Accepted for native text conversion and serving; vision candidate
+- Status: Accepted for native text conversion and serving; exact server
+  speculation accepted for the measured one-slot workloads; vision candidate
   is under exact-artifact acceptance
 - Date: 2026-08-16
-- Updated: 2026-08-19 — the short/long release receipt binds a compiled-once
-  Foundation thermal helper, removing per-sample Swift compilation without
-  changing its continuous fair-or-better envelope or cadence limits.
+- Updated: 2026-08-20 — the canonical server now owns exact fixed-K3 MTP and
+  request-history speculation with per-proposer measured cost gates. GGUF
+  inference preserves the artifact's declared weight encodings; the qualified
+  width-four verifier substantially narrows the measured one-slot code gap.
+  The remaining single-user gap and true physical multi-slot batching remain
+  performance blockers.
 - Owners: hf2q conversion, quantization, inference, and serving
 
 ## Context
@@ -57,6 +61,12 @@ so the official Qwen3.8 checkpoint correctly failed closed as unsupported.
    implementation may be used only as a developer-side reference oracle.
 6. The first real artifact is produced from the exact official source
    revision with hf2q itself. Pre-quantized downloads do not satisfy this ADR.
+7. Conversion and inference have separate quantization authority. `hf2q
+   convert` may quantize source safetensors into the requested GGUF. Inference
+   must execute each GGUF weight in its declared stored representation; it
+   must not dequantize and silently rebuild that weight as Q4_0, BF16, or any
+   other codec. Explicit learned overlays own their format and fail closed
+   where the native graph cannot execute it.
 
 ## Acceptance gates
 
@@ -106,13 +116,34 @@ so the official Qwen3.8 checkpoint correctly failed closed as unsupported.
 ## Consequences
 
 Qwen3.8 reuses the native dense Qwen execution family without approximate
-architecture routing, while conversion and evidence remain explicit.
-Speculative MTP decode remains outside the accepted surface; the canonical
-launcher selects ordinary autoregressive decode until its separate
-transactional state and parity gates pass. Vision is a separately measured
-candidate surface and does not inherit text-only performance authority.
+architecture routing, while conversion and evidence remain explicit. The
+canonical launcher selects `HF2Q_QWEN_SPECULATION=auto`; the process default
+remains `off` outside that launcher. Auto is a measured candidate, not a
+promise that every request speculates: unsupported semantics, cached state
+without coherent MTP metadata, an unavailable proposer, or a negative
+per-generation cost decision stays on ordinary target decode. Vision is a
+separately measured candidate surface and does not inherit text-only
+performance authority.
 
 ## Acceptance evidence
+
+### Native artifact execution invariant (2026-08-20)
+
+The accepted Q4_K_M artifact has 866 tensors: 360 F32, 439 Q4_K, and 67
+Q6_K. The production loader retains all 506 quantized tensors as native GGUF
+blocks. That includes the Q4_K embedding, Q6_K output head, all 304 target
+attention/DeltaNet projections, all 192 target FFN weights, and all eight
+MTP-local quantized weights. The target and MTP share the same native
+output-head buffer. Runtime activations, norms, and recurrent state remain in
+their declared compute formats; no GGUF weight is dequantized and requantized
+during model load or inference.
+
+This corrects the former loader behavior, which expanded the embedding and
+attention weights and rebuilt several target/MTP weights as Q4_0 or BF16.
+That path both changed the converted model and retained roughly 39 GiB of
+avoidable duplicate unified-memory storage. Synthetic fixtures retain their
+explicit F32 paths. Native DWQ overlays fail closed rather than mutating the
+artifact through the legacy F32-to-Q4_0 route.
 
 The text acceptance gate ran on an Apple M5 Max on AC power. The source was
 the exact revision named above; its configuration SHA-256 was
@@ -156,7 +187,7 @@ and the same required `calculate_sum` call with integer arguments 17 and 25;
 the result continuation completed normally. This closes the original dense
 fallback performance defect without weakening the quality gate.
 
-A later matched long-context peer run used llama.cpp build 10451
+A later matched long-context external-reference run used build 10451
 (`10bf611e5`) with the same Q4_K_M artifact, one 131,072-token slot, Metal
 flash attention, default F16 K/V, temperature zero, and thinking disabled. A
 cold 105,029-token prefill took 493.839 seconds. Five exact-prefix 128-token
@@ -164,7 +195,7 @@ decode runs measured 15.734, 15.266, 15.934, 15.890, and 15.374 tok/s, a
 15.734 tok/s median, with identical output. This is a production-default peer
 comparison rather than cache-format parity because hf2q uses compressed TQ-HB
 K/V. It replaces the former absence of any matched approximately 105K
-llama.cpp evidence; it does not replace the exact hf2q legacy/Q2 release gate.
+external-reference evidence; it does not replace the exact hf2q legacy/Q2 release gate.
 
 The exact native server artifact passed `/readyz`, unary and SSE text,
 required-tool unary and SSE calls, schema-correct arguments, tool-result
@@ -175,13 +206,15 @@ An ordinary three-message follow-up returned the remembered value with 27 of
 54 prompt tokens reused. A separate coding follow-up reused the complete
 96-token stable prefix and returned a valid function plus unit test. The gate
 also found and fixed an invalid cache invariant: verifier KV cursors must agree
-with one another, but the optional MTP cursor is independent until speculative
-decoding runs.
+with one another. Ordinary prefixes may omit speculative metadata, but a
+prefix that advertises reusable MTP state must have equal target and MTP
+cursors at the exact published token count.
 
-These measurements establish functional native text support and sustained
-single-request performance superiority for the measured artifact and workload.
-They do not establish speculative MTP acceptance, cross-family vision
-completion, or multi-slot aggregate superiority. In a four-request cold-prefix
+These earlier measurements establish functional native text support and
+sustained single-request performance superiority for the measured artifact
+and workload. They did not establish speculative MTP acceptance,
+cross-family vision completion, or multi-slot aggregate superiority. In a
+four-request cold-prefix
 run with 256 generated tokens per request, hf2q completed 1,024 tokens in
 30.003 seconds (34.13 aggregate tokens/second). The matched four-slot
 comparison completed in 19.103 seconds (53.60 aggregate tokens/second). Source
@@ -190,6 +223,141 @@ four scalar forwards, while the faster runtime executes one width-four model
 step. A native, state-isolated width-N Qwen body/head is therefore a blocking
 performance follow-up; the single-request result must not be generalized to
 concurrent serving.
+
+### Exact server speculation evidence (2026-08-20)
+
+The launcher previously exported `HF2Q_SPEC_DECODE=0`, but the OpenAI worker
+never read that CLI-only variable. The apparent forced-off policy was dead
+configuration. The live control is now
+`HF2Q_QWEN_SPECULATION=off|auto`; `serve_qwen38_opencode.sh` selects `auto`
+and validates its launcher alias `QWEN38_SPECULATION` before model load.
+
+The accepted Qwen3.8 transaction uses the target's post-output-RMSNorm hidden
+rows and catches the MTP KV cursor up across the complete prompt. Each MTP
+round drafts three tokens, discards draft-only MTP KV, verifies
+`[seed,d0,d1,d2]` in one target forward, processes those target rows back
+through MTP, and commits the accepted target/MTP/DeltaNet boundary. History
+lookup instead uses a request-owned token-position index with exact 6-12-token
+suffix comparison and at most three continuation tokens. Both proposers own
+independent measured four-round cost controllers. A proposer is disabled only
+after two consecutive unprofitable windows; one negative window is retained
+as noise, and a profitable window clears that strike. This keeps the gate
+cost-based without treating acceptance as a profitability proxy.
+
+Real parity testing found that the multi-token DeltaNet capture path wrote
+per-row convolution captures but did not write the next ping-pong convolution
+state. Full acceptance therefore selected stale state and corrupted the next
+block. The corrected path materializes the final captured convolution row
+inside the same command buffer. A second correction computes multi-slot
+capture offsets from physical capacity while slicing only the active depth;
+grow-only K4 storage can no longer address another slot after a shorter
+history block. The focused GPU gates compare the capture path's own final
+convolution state byte-for-byte and exercise the physical-stride case.
+
+A later correctness hardening enlarged cancellation recovery and the first
+rebuilt receipt failed loudly: AUTO regressed code throughput 23.6% while
+ordinary qL1 timing stayed flat and speculative qL4 rounds slowed about 50%.
+Revert/reapply isolation showed LLVM had folded cold cancellation work into
+the hot slot loop. Marking recovery `#[cold] #[inline(never)]` retained the
+strict cursor/error handling and restored the prior speculative timing. The
+final ABBA receipt below is from that rebuilt binary; the failed receipt was
+not averaged into an accepted claim.
+
+A final rustfmt-only wrap inside that cold recovery function changed the
+release digest to
+`7dba0d159cc9a2c9181e63ad00a02cb0dc257fa7a832f419a73243736a275287`.
+Its exact ABBA rerun preserved all choices but failed the code floor at
+-12.695%. That run also showed host-wide drift: ordinary internal decode fell
+from roughly 29 tok/s in the first OFF arm to roughly 20 tok/s in the fourth,
+so it does not by itself isolate code layout from system state. The artifact
+was rejected. Restoring only the original source shape reproduced the
+accepted release binary below byte-for-byte. Rustfmt remains informational
+for this measured line until the hot-path layout is made insensitive to crate
+span changes; the performance receipt, not cosmetic formatting, is the gate.
+
+The reproducible one-slot receipt from
+`scripts/qwen38_speculation_ab.sh` used release binary SHA-256
+`e2b7a3ec831b8b85ddf52728cb7f46cbb6da8401ed06f355c996b029b4a6c190`
+and the 16,810,714,752-byte Q4_K_M artifact SHA-256
+`0fa8acc661d0edc60276c43705619fd848682dbf768ced9fe46cd8a572b8043d`.
+Fresh one-slot servers ran in fixed OFF/AUTO/AUTO/OFF order. All 24
+`choices[0]` values across three 128-token deterministic Rust prompts and
+three repeat-heavy prompts matched byte-for-byte. The code-workload
+six-sample median fell from 4.777795 to 3.886297 seconds, a 22.940%
+throughput improvement. The repeat-workload median fell from 2.485324 to
+1.729047 seconds, a 43.740% improvement. The two AUTO arms recorded 250
+verified proposals and 662 accepted draft tokens. These are fixed-workload
+one-process medians, not a universal speed claim.
+
+The original matched external-reference run used reference commit
+`521a64cd0197`, Metal
+flash attention, one 262,144-token slot, fixed `--spec-draft-n-max 3`,
+temperature zero, repetition penalty 1.05, and the same artifact/prompts.
+Current HEAD has no adaptive-MTP controller. Its first code receipt was 47.02
+tok/s median while the then-current hf2q receipt was 36.42 tok/s, a 22.5%
+gap. That result is retained as the falsifying baseline, not current
+performance authority.
+
+Source profiling localized most of the gap to target width-four verification:
+the exact-tree Q4_K/Q6_K mvN path cost roughly 98-147 ms per K3 target round.
+The qualified Qwen3.8 launcher instead uses `mul_mv_ext` for K-quant widths
+4-8 while leaving the process-wide default unchanged. The real Qwen3.8 gate proves the
+Q4_K and Q6_K width-four routes were dispatched, all four target decisions
+match four independent sequential forwards, all hybrid-cache cursors agree,
+and eight subsequent sequential decisions remain exact. The verifier phase
+then measured roughly 59-63 ms per round.
+
+The final ABBA binary SHA-256
+`c217e128e28a18d6dbe48ec88155a7bab8a0f633b7b691187f9f118fa2f24ce7`
+preserved all 24 OFF/AUTO choices. Its six code samples had a 41.86 tok/s
+internal median and improved wall time 51.66% over ordinary decode; its six
+repeat samples had a 50.28 tok/s internal median and improved wall time
+70.29%. The two AUTO arms recorded 314 verified proposer rounds and 804
+accepted draft tokens, with zero cost-disabled generations. The adjacent
+two-cycle external code receipt had a 45.49 tok/s median, leaving hf2q 7.98%
+behind on this measured code workload. This supersedes both the original
+22.5% gap and the intermediate near-tie receipt. It is not a universal speed
+claim, and true physical multi-slot batching remains open.
+
+A follow-up diagnostic tested whether the 1.05 target repetition penalty was
+lowering MTP acceptance because the fused drafter uses raw argmax. With the
+penalty removed, the three code cases accepted 244 of 300 drafted tokens
+(81.33%), effectively unchanged from the final receipt's 252 of 309 (81.55%).
+The single warm arm was faster, but that isolated run is not performance
+authority. The acceptance hypothesis was rejected, so no penalty-scatter
+kernel or proposal-policy change is included.
+
+The final phase profile on the production route measured target verification
+at roughly 58-61 ms of a 68-75 ms speculative round. Three chained draft
+steps cost roughly 8-10 ms, native embedding 0.2-0.4 ms, MTP catch-up 0.4-0.7
+ms, and partial-reject state recovery 5-7 ms only on rejected rounds. That
+profiled code request reached 47.10 tok/s. Embedding and rollback are therefore
+not credible explanations for the full adjacent-receipt gap; target
+verification remains the dominant optimization surface, and the spread
+between the 41.86 tok/s ABBA median and this warm run requires a better
+interleaved variance-controlled receipt before another kernel change.
+
+The agentic gate under AUTO returned a schema-valid `get_weather` tool call,
+continued from its tool result with 298 cached of 363 prompt tokens, emitted a
+valid 48-event SSE stream plus one `[DONE]`, recovered from client cancellation
+with the verified checkpoint, and served a healthy following request. A
+four-slot wave produced byte-identical choices for all four requests and no
+runtime-unavailable fallback, but generated 450 tokens in 30.77 seconds
+(14.62 aggregate tok/s). That is correctness evidence only. Qwen still
+interleaves scalar slot forwards; true physical width-N batching remains the
+blocking aggregate-throughput item.
+
+The final binary above also passed the shared full-context coding contract with
+a 20,584-character repository fixture and a real 230-byte Rust tool result.
+It proved cold tool selection and arguments, exact cached replay, automatic
+tool choice, SSE tool-call reconstruction, tool-result continuation, source
+syntax preservation, and a cold-to-cached transition from zero to 7,039 reused
+prompt tokens. The continuation added 127 tokens and completed in 1.525
+seconds. The same gate with the 12,973-byte `Cargo.toml` tool result remained a
+performance failure: 7,038 tokens were reused, but the 4,017-token uncached
+suffix plus decode completed in 11.464 seconds against a 10-second limit. Its
+semantics were correct; the latency failure remains open and is not waived by
+the smaller passing fixture.
 
 ### Vision candidate evidence (2026-08-16)
 
@@ -387,8 +555,14 @@ parameter type to preserve its caller contract. Hosted CI runs both the policy
 tests and `iter230_a2_lock_discipline`, closing the coverage gap that let the
 inconsistent module placement merge.
 
-The next exact-output optimization sequence is a two-dimensional H2xP2
-query-head/query-position verifier, then native Qwen3.8 MTP and a dynamic
-suffix-automaton proposer behind measured acceptance/cost routing. Split-K
-retuning and true packed TQ6/TQ5 storage follow only after the cooperative
-kernel and verifier establish their new bandwidth/occupancy regime.
+Native fixed-K3 MTP and request-history lookup now occupy the exact-output
+server path. The history implementation is a request-owned token-position
+index with exact 6-12-token slice comparison and up to three continuation
+tokens; it is not a suffix automaton. The next performance sequence is to
+close the matched single-user throughput gap, then replace scalar interleaving
+with a true width-N Qwen body/head for multi-slot throughput. Adaptive depth
+may follow only after K2/K3 transaction parity and measured cost show a win;
+the current reference uses fixed depth three, and an unmerged adaptive-MTP
+change is not treated as shipped source truth. Split-K retuning and true
+packed TQ6/TQ5 storage remain downstream of the established bandwidth and
+occupancy regime.

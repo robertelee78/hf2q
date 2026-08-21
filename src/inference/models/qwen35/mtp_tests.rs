@@ -1,9 +1,9 @@
-use super::super::gpu_full_attn::upload_f32;
+use super::super::gpu_full_attn::{download_f32, upload_f32};
 use super::super::kv_cache::HybridKvCache;
 use super::super::mtp::MtpFfnKind;
 use super::super::mtp_weights_load::mtp_tensor_names;
 use super::super::{default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
-use super::load_mtp_weights_if_present;
+use super::{load_mtp_weights_if_present, shifted_nextn_copy_plan, upload_i32};
 use mlx_native::gguf::GgufFile;
 use mlx_native::{KernelRegistry, MlxDevice};
 use std::io::Write;
@@ -202,6 +202,23 @@ fn try_device() -> Option<MlxDevice> {
 }
 
 #[test]
+fn prompt_catchup_shifts_target_hidden_right() {
+    let cold = shifted_nextn_copy_plan(4, 8, false).expect("cold plan");
+    assert_eq!(cold.pending, None, "cold row zero remains zero-initialized");
+    let prefix = cold.target_prefix.expect("rows 1..3 copy target rows 0..2");
+    assert_eq!(prefix.src_offset, 0);
+    assert_eq!(prefix.dst_offset, 8);
+    assert_eq!(prefix.count, 24);
+
+    let resumed = shifted_nextn_copy_plan(4, 8, true).expect("resumed plan");
+    let pending = resumed.pending.expect("saved prior target row");
+    assert_eq!(pending.src_offset, 0);
+    assert_eq!(pending.dst_offset, 0);
+    assert_eq!(pending.count, 8);
+    assert_eq!(resumed.target_prefix, cold.target_prefix);
+}
+
+#[test]
 fn mtp_absent_scan_returns_empty() {
     let tmp = std::env::temp_dir().join(format!("mtp_absent_{}.gguf", std::process::id()));
     write_gguf(
@@ -315,11 +332,13 @@ fn mtp_forward_draft_returns_logits() {
     let mut registry = KernelRegistry::new();
     let mut kv = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
     assert!(kv.mtp_slot.is_some());
-    let prev = upload_f32(&vec![0.0; 32], &device).expect("prev");
+    let prev_values: Vec<f32> = (1..=32).map(|value| value as f32).collect();
+    let prev = upload_f32(&prev_values, &device).expect("prev");
     let embed = upload_f32(&vec![0.0; 32], &device).expect("embed");
-    let logits = mtp
-        .forward_draft(
+    let (logits, nextn_hidden) = mtp
+        .forward_draft_for_token(
             &prev,
+            0,
             &embed,
             &mut kv,
             crate::serve::multi_seq_kv::SlotId(0),
@@ -330,6 +349,200 @@ fn mtp_forward_draft_returns_logits() {
         )
         .expect("forward");
     assert_eq!(logits.element_count(), 64);
+    let nextn = download_f32(&nextn_hidden).expect("download normalized MTP hidden");
+    let mean_square = nextn.iter().map(|value| value * value).sum::<f32>() / nextn.len() as f32;
+    assert!(
+        (mean_square - 1.0).abs() < 1e-3,
+        "MTP chained hidden must be post-shared-head RMSNorm; mean_square={mean_square}"
+    );
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn mtp_fused_greedy_head_matches_logits_argmax() {
+    let Some(device) = try_device() else { return };
+    let tmp = std::env::temp_dir().join(format!("mtp_fused_greedy_{}.gguf", std::process::id()));
+    write_gguf(&tmp, &tiny_tensors());
+    let gguf = GgufFile::open(&tmp).expect("open");
+    let cfg = tiny_cfg(1);
+    let mtp = load_mtp_weights_if_present(&gguf, &cfg, &device)
+        .expect("load")
+        .expect("some");
+    let mut registry = KernelRegistry::new();
+    let mut logits_kv = HybridKvCache::new(&cfg, &device, 16, 1).expect("logits cache");
+    let mut fused_kv = HybridKvCache::new(&cfg, &device, 16, 1).expect("fused cache");
+    let prev_values: Vec<f32> = (1..=32).map(|value| value as f32).collect();
+    let prev = upload_f32(&prev_values, &device).expect("prev");
+    let embed = upload_f32(&vec![0.0; 32], &device).expect("embed");
+
+    let (logits, reference_hidden) = mtp
+        .forward_draft_for_token(
+            &prev,
+            0,
+            &embed,
+            &mut logits_kv,
+            crate::serve::multi_seq_kv::SlotId(0),
+            &[0, 0, 0, 0],
+            &device,
+            &mut registry,
+            &cfg,
+        )
+        .expect("logits forward");
+    let logits = download_f32(&logits).expect("download logits");
+    let expected = logits
+        .iter()
+        .enumerate()
+        .fold(
+            (0u32, f32::NEG_INFINITY),
+            |(best_i, best_v), (i, &value)| {
+                if value > best_v {
+                    (i as u32, value)
+                } else {
+                    (best_i, best_v)
+                }
+            },
+        )
+        .0;
+
+    let (actual, fused_hidden) = mtp
+        .forward_draft_greedy_for_token(
+            &prev,
+            0,
+            &embed,
+            &mut fused_kv,
+            crate::serve::multi_seq_kv::SlotId(0),
+            &[0, 0, 0, 0],
+            &device,
+            &mut registry,
+            &cfg,
+        )
+        .expect("fused greedy forward");
+    assert_eq!(actual, expected);
+    assert_eq!(
+        download_f32(&fused_hidden).expect("download fused hidden"),
+        download_f32(&reference_hidden).expect("download reference hidden"),
+        "fusing argmax must not change the normalized hidden carried into the next draft"
+    );
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn prompt_catchup_aligns_target_and_mtp_cursors() {
+    let Some(device) = try_device() else { return };
+    let tmp = std::env::temp_dir().join(format!("mtp_catchup_{}.gguf", std::process::id()));
+    write_gguf(&tmp, &tiny_tensors());
+    let gguf = GgufFile::open(&tmp).expect("open");
+    let cfg = tiny_cfg(1);
+    let mtp = load_mtp_weights_if_present(&gguf, &cfg, &device)
+        .expect("load")
+        .expect("some");
+    let mut registry = KernelRegistry::new();
+    let mut kv = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
+    let target_nextn = upload_f32(&vec![0.25; 3 * 32], &device).expect("target nextn");
+    let shared_embed = upload_f32(&vec![0.0; 3 * 32], &device).expect("shared embed");
+
+    mtp.process_target_batch(
+        &[0, 1, 2],
+        None,
+        &target_nextn,
+        &shared_embed,
+        &mut kv,
+        crate::serve::multi_seq_kv::SlotId(0),
+        &[0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2],
+        &device,
+        &mut registry,
+        &cfg,
+    )
+    .expect("MTP full-prompt catch-up");
+    for full in &mut kv.full_attn {
+        full.current_len[0] = 3;
+    }
+    kv.validate_speculative_cursors_for_slot(crate::serve::multi_seq_kv::SlotId(0), 3)
+        .expect("target/MTP cursor equality after prompt catch-up");
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn mtp_kv_only_append_matches_full_attention_cache_prefix() {
+    let Some(device) = try_device() else { return };
+    let tmp = std::env::temp_dir().join(format!("mtp_kv_only_{}.gguf", std::process::id()));
+    write_gguf(&tmp, &tiny_tensors());
+    let gguf = GgufFile::open(&tmp).expect("open");
+    let cfg = tiny_cfg(1);
+    let mtp = load_mtp_weights_if_present(&gguf, &cfg, &device)
+        .expect("load")
+        .expect("some");
+    let projected_values: Vec<f32> = (0..3 * 32)
+        .map(|index| ((index as f32) * 0.037).sin())
+        .collect();
+    let projected = upload_f32(&projected_values, &device).expect("projected");
+    let positions = upload_i32(&[0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2], &device).expect("positions");
+    let slot = crate::serve::multi_seq_kv::SlotId(0);
+    let mut full_registry = KernelRegistry::new();
+    let mut kv_only_registry = KernelRegistry::new();
+    let mut full_cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("full cache");
+    let mut kv_only_cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("KV-only cache");
+
+    let _ = mtp
+        .forward_full_attention(
+            &projected,
+            &positions,
+            &mut full_cache,
+            slot,
+            3,
+            &device,
+            &mut full_registry,
+            &cfg,
+        )
+        .expect("full attention reference");
+    let mut full_drain = device.command_encoder().expect("full drain encoder");
+    full_drain.commit_and_wait().expect("full drain");
+
+    mtp.append_attention_kv(
+        &projected,
+        &positions,
+        &mut kv_only_cache,
+        slot,
+        3,
+        &device,
+        &mut kv_only_registry,
+        &cfg,
+    )
+    .expect("KV-only append");
+    let mut kv_only_drain = device.command_encoder().expect("KV-only drain encoder");
+    kv_only_drain.commit_and_wait().expect("KV-only drain");
+
+    let full_slot = full_cache.mtp_slot.as_ref().expect("full MTP slot");
+    let kv_only_slot = kv_only_cache.mtp_slot.as_ref().expect("KV-only MTP slot");
+    assert_eq!(full_slot.current_len, kv_only_slot.current_len);
+    assert_eq!(
+        full_slot
+            .k
+            .as_ref()
+            .expect("full K")
+            .as_slice::<f32>()
+            .expect("full K bytes"),
+        kv_only_slot
+            .k
+            .as_ref()
+            .expect("KV-only K")
+            .as_slice::<f32>()
+            .expect("KV-only K bytes")
+    );
+    assert_eq!(
+        full_slot
+            .v
+            .as_ref()
+            .expect("full V")
+            .as_slice::<f32>()
+            .expect("full V bytes"),
+        kv_only_slot
+            .v
+            .as_ref()
+            .expect("KV-only V")
+            .as_slice::<f32>()
+            .expect("KV-only V bytes")
+    );
     std::fs::remove_file(&tmp).ok();
 }
 
@@ -487,7 +700,7 @@ fn mtp_loads_canonical_dense_mtp_q8_0_with_dense_variant_2026_05_21() {
     assert_eq!(
         mtp.ffn_kind(),
         MtpFfnKind::Dense,
-        "canonical Qwen 3.6 27B dense-MTP must load via MtpFfnWeightsGpu::Dense branch"
+        "canonical Qwen 3.6 27B dense-MTP must load via native DenseQ branch"
     );
     assert_eq!(mtp.layer_index, cfg.num_hidden_layers);
     assert!(mtp.has_tensor_suffix("ffn_gate.weight"));

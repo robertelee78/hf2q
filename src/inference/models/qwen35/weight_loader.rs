@@ -13,10 +13,9 @@
 //! a 40-layer MoE, per-layer dequantized memory is ~200 MB-2 GB (varies
 //! by layer kind) — well within a single process's budget.
 //!
-//! For production GPU inference, a separate loader (follow-up iter) will
-//! hold tensors as quantized `MlxBuffer`s and pass them directly to
-//! mlx-native's `quantized_matmul_ggml` kernels, avoiding the dequant
-//! bounce entirely.
+//! Production GPU inference uses the native loaders in this module to retain
+//! quantized `MlxBuffer`s and pass them directly to mlx-native's GGML kernels.
+//! The per-layer F32 loaders remain CPU-reference and synthetic-fixture tools.
 //!
 //! # Layout conversion
 //!
@@ -37,6 +36,8 @@ use crate::ir::{DType as IrDType, TensorRef};
 use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
+use super::gpu_delta_net::DeltaNetWeightsGpu;
+use super::gpu_full_attn::{upload_f32_weight, FullAttnQGateWeightsGpu, FullAttnWeightsGpu};
 use super::in_memory_loader::{
     bf16_bytes_to_f32, f16_bytes_to_f32, f32_bytes_to_f32, quantize_f32_to_q8_0_buffer,
 };
@@ -155,6 +156,237 @@ fn load_tensor_with_residency(
     #[cfg(test)]
     super::execution_observation::observe_loaded_ggml(name, &buf)?;
     Ok(buf)
+}
+
+pub(super) fn load_native_projection(
+    gguf: &GgufFile,
+    name: &str,
+    rows: usize,
+    cols: usize,
+    device: &MlxDevice,
+) -> Result<(MlxBuffer, GgmlType)> {
+    let info = gguf
+        .tensor_info(name)
+        .ok_or_else(|| anyhow!("native Qwen projection '{name}' not found"))?;
+    anyhow::ensure!(
+        info.shape.as_slice() == [rows, cols],
+        "native Qwen projection '{name}' shape {:?} != [{rows}, {cols}]",
+        info.shape
+    );
+    anyhow::ensure!(
+        info.ggml_type != GgmlType::F16,
+        "native Qwen projection '{name}' is F16; the encoder lacks a direct F16 projection and inference refuses to substitute another storage format"
+    );
+    anyhow::ensure!(
+        cols % info.ggml_type.block_values() as usize == 0,
+        "native Qwen projection '{name}' row width {cols} is not aligned to {:?}'s {}-value blocks",
+        info.ggml_type,
+        info.ggml_type.block_values()
+    );
+    let expected = rows
+        .checked_mul(cols / info.ggml_type.block_values() as usize)
+        .and_then(|v| v.checked_mul(info.ggml_type.block_bytes() as usize))
+        .ok_or_else(|| anyhow!("native Qwen projection '{name}' byte length overflow"))?;
+    anyhow::ensure!(
+        info.byte_len == expected,
+        "native Qwen projection '{name}' byte length {} != expected {expected} for {:?}",
+        info.byte_len,
+        info.ggml_type
+    );
+    let buffer = load_tensor_with_residency(gguf, name, device)?;
+    let loaded_bytes = match info.ggml_type {
+        GgmlType::F32 => {
+            anyhow::ensure!(
+                buffer.dtype() == MlxDType::F32,
+                "native Qwen projection '{name}' F32 tensor loaded as {:?}",
+                buffer.dtype()
+            );
+            buffer
+                .as_slice::<f32>()
+                .map_err(|e| anyhow!("map native Qwen projection '{name}': {e}"))?
+                .len()
+                * std::mem::size_of::<f32>()
+        }
+        _ => {
+            anyhow::ensure!(
+                buffer.dtype() == MlxDType::U8,
+                "native Qwen projection '{name}' quantized tensor loaded as {:?}",
+                buffer.dtype()
+            );
+            buffer
+                .as_slice::<u8>()
+                .map_err(|e| anyhow!("map native Qwen projection '{name}': {e}"))?
+                .len()
+        }
+    };
+    anyhow::ensure!(
+        loaded_bytes == expected,
+        "native Qwen projection '{name}' loaded byte length {loaded_bytes} != {expected}"
+    );
+    Ok((buffer, info.ggml_type))
+}
+
+/// Load one full-attention block with the conversion-emitted quantized
+/// representation intact. The fused Q/gate matrix stays fused and native;
+/// inference projects it once and deinterleaves only the F32 activation.
+pub fn load_full_attn_layer_native(
+    gguf: &GgufFile,
+    cfg: &Qwen35Config,
+    layer_idx: u32,
+    device: &MlxDevice,
+) -> Result<FullAttnWeightsGpu> {
+    let p = format!("blk.{layer_idx}");
+    let hidden = cfg.hidden_size as usize;
+    let heads = cfg.num_attention_heads as usize;
+    let kv_heads = cfg.num_key_value_heads as usize;
+    let head_dim = cfg.head_dim as usize;
+    let q_total = heads * head_dim;
+    let kv_total = kv_heads * head_dim;
+
+    let fused_name = format!("{p}.attn_q.weight");
+    let (fused, fused_type) =
+        load_native_projection(gguf, &fused_name, 2 * q_total, hidden, device)?;
+    let (wk, wk_ggml_type) = load_native_projection(
+        gguf,
+        &format!("{p}.attn_k.weight"),
+        kv_total,
+        hidden,
+        device,
+    )?;
+    let (wv, wv_ggml_type) = load_native_projection(
+        gguf,
+        &format!("{p}.attn_v.weight"),
+        kv_total,
+        hidden,
+        device,
+    )?;
+    let (wo, wo_ggml_type) = load_native_projection(
+        gguf,
+        &format!("{p}.attn_output.weight"),
+        hidden,
+        q_total,
+        device,
+    )?;
+
+    Ok(FullAttnWeightsGpu {
+        attn_norm: upload_f32_weight(
+            &load_f32_tensor(gguf, &format!("{p}.attn_norm.weight"), device)?,
+            device,
+        )?,
+        post_attn_norm: upload_f32_weight(
+            &load_f32_tensor(gguf, &format!("{p}.post_attention_norm.weight"), device)?,
+            device,
+        )?,
+        q_gate: FullAttnQGateWeightsGpu::Fused {
+            weight: fused,
+            ggml_type: fused_type,
+        },
+        wk,
+        wk_ggml_type,
+        wv,
+        wv_ggml_type,
+        attn_q_norm: upload_f32_weight(
+            &load_f32_tensor(gguf, &format!("{p}.attn_q_norm.weight"), device)?,
+            device,
+        )?,
+        attn_k_norm: upload_f32_weight(
+            &load_f32_tensor(gguf, &format!("{p}.attn_k_norm.weight"), device)?,
+            device,
+        )?,
+        wo,
+        wo_ggml_type,
+    })
+}
+
+/// Load one DeltaNet block with all five large projections in their native
+/// GGML representation. Small F32 state/norm tensors keep their declared F32
+/// storage; the conv kernel receives the same layout transpose as before.
+pub fn load_delta_net_layer_native(
+    gguf: &GgufFile,
+    cfg: &Qwen35Config,
+    layer_idx: u32,
+    device: &MlxDevice,
+) -> Result<DeltaNetWeightsGpu> {
+    let p = format!("blk.{layer_idx}");
+    let hidden = cfg.hidden_size as usize;
+    let nk = cfg.linear_num_key_heads as usize;
+    let nv = cfg.linear_num_value_heads as usize;
+    let dk = cfg.linear_key_head_dim as usize;
+    let dv = cfg.linear_value_head_dim as usize;
+    let k_width = cfg.linear_conv_kernel_dim as usize;
+    let qkv_channels = 2 * nk * dk + nv * dv;
+    let z_channels = nv * dv;
+
+    let (attn_qkv, attn_qkv_ggml_type) = load_native_projection(
+        gguf,
+        &format!("{p}.attn_qkv.weight"),
+        qkv_channels,
+        hidden,
+        device,
+    )?;
+    let (attn_gate, attn_gate_ggml_type) = load_native_projection(
+        gguf,
+        &format!("{p}.attn_gate.weight"),
+        z_channels,
+        hidden,
+        device,
+    )?;
+    let (ssm_alpha, ssm_alpha_ggml_type) =
+        load_native_projection(gguf, &format!("{p}.ssm_alpha.weight"), nv, hidden, device)?;
+    let (ssm_beta, ssm_beta_ggml_type) =
+        load_native_projection(gguf, &format!("{p}.ssm_beta.weight"), nv, hidden, device)?;
+    let (ssm_out, ssm_out_ggml_type) = load_native_projection(
+        gguf,
+        &format!("{p}.ssm_out.weight"),
+        hidden,
+        z_channels,
+        device,
+    )?;
+
+    let conv_gguf = load_f32_tensor(gguf, &format!("{p}.ssm_conv1d.weight"), device)?;
+    anyhow::ensure!(
+        conv_gguf.len() == qkv_channels * k_width,
+        "layer {layer_idx}: ssm_conv1d length {} != {}",
+        conv_gguf.len(),
+        qkv_channels * k_width
+    );
+    let mut conv_transposed = vec![0.0f32; conv_gguf.len()];
+    for channel in 0..qkv_channels {
+        for ki in 0..k_width {
+            conv_transposed[channel * k_width + ki] = conv_gguf[channel * k_width + ki];
+        }
+    }
+    let ssm_dt_bias = load_f32_tensor(gguf, &format!("{p}.ssm_dt.bias"), device)?;
+    let ssm_a = load_f32_tensor(gguf, &format!("{p}.ssm_a"), device)?;
+    let ssm_norm = load_f32_tensor(gguf, &format!("{p}.ssm_norm.weight"), device)?;
+
+    Ok(DeltaNetWeightsGpu {
+        attn_norm: upload_f32_weight(
+            &load_f32_tensor(gguf, &format!("{p}.attn_norm.weight"), device)?,
+            device,
+        )?,
+        post_attn_norm: upload_f32_weight(
+            &load_f32_tensor(gguf, &format!("{p}.post_attention_norm.weight"), device)?,
+            device,
+        )?,
+        attn_qkv,
+        attn_qkv_ggml_type,
+        attn_gate,
+        attn_gate_ggml_type,
+        ssm_conv1d: upload_f32_weight(&conv_transposed, device)?,
+        ssm_alpha,
+        ssm_alpha_ggml_type,
+        ssm_dt_bias: upload_f32_weight(&ssm_dt_bias, device)?,
+        ssm_dt_bias_cpu: ssm_dt_bias,
+        ssm_beta,
+        ssm_beta_ggml_type,
+        ssm_a: upload_f32_weight(&ssm_a, device)?,
+        ssm_a_cpu: ssm_a,
+        ssm_norm: upload_f32_weight(&ssm_norm, device)?,
+        ssm_norm_cpu: ssm_norm,
+        ssm_out,
+        ssm_out_ggml_type,
+    })
 }
 
 /// Load the global tensors (`token_embd`, `output`, `output_norm`) from
@@ -748,7 +980,9 @@ impl Qwen35Model {
             cfg,
             layers,
             token_embd,
+            token_embd_native: None,
             output_weight,
+            output_weight_native: None,
             output_norm,
             mtp: None,
             #[cfg(test)]
@@ -774,6 +1008,8 @@ pub fn load_full_attn_layer(
     // `wq` convention where `wq` has output dim `2 * head_dim * n_head` with Q
     // in the lower half and gate in the upper half. Our CPU reference keeps wq and
     // w_gate separate, so we split after loading.
+    // not a separate `attn_gate.weight` tensor. Rows are interleaved per head;
+    // the CPU reference keeps Q and gate separate, so we split after loading.
     let q_fused = load_f32_tensor(gguf, &format!("{p}.attn_q.weight"), device)
         .with_context(|| format!("layer {layer_idx} attn_q (fused Q+gate)"))?;
 
@@ -818,6 +1054,7 @@ pub fn load_full_attn_layer(
 
     // De-interleave fused q_fused into wq and w_gate.
     // The peer's layout (confirmed from build_layer_attn): Q and gate are INTERLEAVED
+    // De-interleave fused q_fused into wq and w_gate. Q and gate are interleaved
     // at head granularity. For head h: rows [2*h*d .. (2*h+1)*d-1] = Q[h], rows
     // [(2*h+1)*d .. (2*h+2)*d-1] = gate[h]. Each "row" is h (hidden_size) floats wide.
     // So in the flat vec: head h Q starts at offset (2*h*d)*h, gate starts at (2*h+1)*d*h.
@@ -860,6 +1097,7 @@ pub fn load_full_attn_layer(
 ///
 /// The peer's fused GDN kernel — and now mlx-native's `gated_delta_net_f32`
 /// kernel as of mlx-native 0.4.1 (commit `4f00f6e`) — performs the GQA
+/// mlx-native's `gated_delta_net_f32` kernel performs the GQA
 /// mapping internally as `k_head = v_head % n_k_heads`, which is the
 /// inverse of the GGUF tiling: with `v_head = i_vpk * n_k + i_k`,
 /// `v_head % n_k = i_k`, recovering the correct K-head for any V-head.
@@ -869,6 +1107,7 @@ pub fn load_full_attn_layer(
 /// "grouped" order to compensate for an old (block-style) mlx-native kernel
 /// that used `k_head = v_head / group_ratio`; that kernel was retired in
 /// `4f00f6e` to reach byte-parity with the peer.
+/// `4f00f6e` after the byte-parity gate failed.
 ///
 /// Affected tensors that stay in GGUF tiled V-head order (apex GGUF:
 /// n_k=16, n_vpk=2, d_v=128, hidden=2048):
@@ -1150,12 +1389,12 @@ pub fn load_dense_ffn(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DenseFfnStorage {
+pub(super) enum DenseFfnStorage {
     Float,
     Quantized,
 }
 
-fn dense_ffn_storage(
+pub(super) fn dense_ffn_storage(
     layer_idx: u32,
     gate: GgmlType,
     up: GgmlType,
@@ -1187,7 +1426,7 @@ fn dense_ffn_storage(
     ))
 }
 
-fn dense_ffn_tensor_types(
+pub(super) fn dense_ffn_tensor_types(
     gguf: &GgufFile,
     layer_idx: u32,
 ) -> Result<(GgmlType, GgmlType, GgmlType)> {
@@ -1275,13 +1514,35 @@ pub fn load_layer(
         .copied()
         .ok_or_else(|| anyhow!("layer_idx {layer_idx} out of range"))?;
 
+    let ffn = load_ffn(gguf, cfg, layer_idx, device)?;
+
+    match kind {
+        Qwen35LayerKind::FullAttention => {
+            let attn = load_full_attn_layer(gguf, cfg, layer_idx, device)?;
+            Ok(Qwen35LayerWeights::FullAttn { attn, ffn })
+        }
+        Qwen35LayerKind::LinearAttention => {
+            let attn = load_delta_net_layer(gguf, cfg, layer_idx, device)?;
+            Ok(Qwen35LayerWeights::LinearAttn { attn, ffn })
+        }
+    }
+}
+
+/// Load only the FFN portion of a layer. Production model loading pairs this
+/// with a native attention variant so quantized attention is never expanded.
+pub fn load_ffn(
+    gguf: &GgufFile,
+    cfg: &Qwen35Config,
+    layer_idx: u32,
+    device: &MlxDevice,
+) -> Result<Qwen35FfnWeights> {
     // Dense variant: select the storage class from all three projection
     // tensors. Errors never fall back to F32: doing so can silently expand a
     // quantized dense model by tens of GiB and replace its optimized kernels.
     //
     // MoE variant: always uses quantized MoeFfnWeightsQ (see comment in the
     // MoeQ branch below for rationale).
-    let ffn = match cfg.variant {
+    Ok(match cfg.variant {
         Qwen35Variant::Dense => {
             let (gate, up, down) = dense_ffn_tensor_types(gguf, layer_idx)?;
             match dense_ffn_storage(layer_idx, gate, up, down)? {
@@ -1302,18 +1563,7 @@ pub fn load_layer(
             // F32 inputs (see gpu_ffn.rs::build_moe_ffn_layer_gpu).
             Qwen35FfnWeights::MoeQ(load_moe_ffn_quantized(gguf, layer_idx, device)?)
         }
-    };
-
-    match kind {
-        Qwen35LayerKind::FullAttention => {
-            let attn = load_full_attn_layer(gguf, cfg, layer_idx, device)?;
-            Ok(Qwen35LayerWeights::FullAttn { attn, ffn })
-        }
-        Qwen35LayerKind::LinearAttention => {
-            let attn = load_delta_net_layer(gguf, cfg, layer_idx, device)?;
-            Ok(Qwen35LayerWeights::LinearAttn { attn, ffn })
-        }
-    }
+    })
 }
 
 #[cfg(test)]

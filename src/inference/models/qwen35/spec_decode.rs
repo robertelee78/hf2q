@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 /// we must slice the final row; for the verifier per-step call (seq_len = 1)
 /// this is an identity slice. Mirrors `apply_output_head_gpu_last` which
 /// performs the same slice for the lm_head path.
-fn last_hidden_row(hidden: &MlxBuffer, hidden_size: u32) -> Result<MlxBuffer> {
+pub(crate) fn last_hidden_row(hidden: &MlxBuffer, hidden_size: u32) -> Result<MlxBuffer> {
     let h = hidden_size as usize;
     let total = hidden.element_count();
     ensure!(
@@ -44,7 +44,7 @@ fn last_hidden_row(hidden: &MlxBuffer, hidden_size: u32) -> Result<MlxBuffer> {
 /// residual buffer. `row=0` → first token's hidden state, `row=seq_len-1`
 /// → last (== `last_hidden_row`). Used by K=1 batched-verify to extract
 /// the token-position-specific hidden state for next iter's MTP draft.
-fn nth_hidden_row(hidden: &MlxBuffer, hidden_size: u32, row: u64) -> Result<MlxBuffer> {
+pub(crate) fn nth_hidden_row(hidden: &MlxBuffer, hidden_size: u32, row: u64) -> Result<MlxBuffer> {
     let h = hidden_size as usize;
     let total = hidden.element_count();
     ensure!(
@@ -98,8 +98,8 @@ fn greedy_argmax_slice(logits_row: &[f32]) -> u32 {
 /// and (c) sample replacement on residual-distribution reject.
 ///
 /// Caller must ensure `probs` sums to ~1.0 (we normalize defensively to
-/// guard against accumulated rounding when computed via
-/// `softmax_with_temp`). Empty input or all-zero probs returns 0.
+/// guard against accumulated rounding in the canonical sampling
+/// distribution). Empty input or all-zero probs returns 0.
 fn sample_from_probs(probs: &[f32], rng: &mut rand::rngs::StdRng) -> u32 {
     use rand::Rng;
     if probs.is_empty() {
@@ -120,10 +120,9 @@ fn sample_from_probs(probs: &[f32], rng: &mut rand::rngs::StdRng) -> u32 {
     (probs.len() - 1) as u32
 }
 
-use super::gpu_full_attn::upload_f32;
-use super::io_heads::greedy_argmax_last_token;
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
+use crate::serve::sampler_pure::{self, SamplingParams, SAMPLING_EPS};
 // ADR-040 Phase B4d (2026-05-30): spec-decode entry points now accept
 // a `slot_id: SlotId` (was hard-coded SlotId(0) per B4a / B4d
 // deferral).  `SlotId(0)` preserves pre-B4d single-seq byte-identical
@@ -137,40 +136,61 @@ use super::model::Qwen35Model;
 // `rollback_la_to(slot, ..)`.
 use crate::serve::multi_seq_kv::SlotId;
 
-/// ADR-034 task #91 (2026-05-21) — Sampler configuration for stochastic
-/// (temp > 0) Metropolis-Hastings spec-decode acceptance.
+/// Complete sampler transaction for Qwen MTP speculative decoding.
 ///
-/// At `temperature <= 0.0` the runner uses greedy argmax matching at every
-/// accept site (byte-identical to the legacy behavior shipped at HEAD
-/// `3be36936`). At `temperature > 0.0` the runner uses Leviathan-2023
-/// §2.3 stochastic acceptance via [`super::super::super::spec_decode::dflash::rejection_sampler::leviathan_step`]
-/// — accept probability `min(1, p/q)` with residual-sampling on reject.
-///
-/// `seed` is for reproducibility: same seed + same prompt → same generated
-/// trajectory (in stochastic mode). The runner uses `StdRng::seed_from_u64`.
-#[derive(Debug, Clone, Copy)]
+/// Proposal `q` and target `p` are both produced by
+/// [`sampler_pure::sampling_distribution`] from raw logits, the same request
+/// parameters, and the same generated-token history. This prevents the
+/// speculative path from silently dropping top-k, top-p, min-p, repetition
+/// penalty, or seed semantics that ordinary Qwen generation supports.
+#[derive(Debug, Clone)]
 pub struct SpecSampler {
-    pub temperature: f32,
-    pub seed: u64,
+    params: SamplingParams,
 }
 
 impl SpecSampler {
-    /// Greedy sampler (no MH; argmax at every accept site). Default.
-    pub const fn greedy() -> Self {
+    /// Greedy sampler (no stochastic acceptance). Default.
+    pub fn greedy() -> Self {
         Self {
-            temperature: 0.0,
-            seed: 0,
+            params: SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                min_p: 0.0,
+                repetition_penalty: 1.0,
+                max_tokens: usize::MAX,
+                seed: Some(0),
+            },
         }
     }
 
-    /// Stochastic sampler with the given temperature + seed.
-    pub const fn new(temperature: f32, seed: u64) -> Self {
-        Self { temperature, seed }
+    pub fn new(params: SamplingParams) -> Self {
+        Self { params }
     }
 
-    /// True if MH stochastic acceptance applies (temperature > 0).
+    /// True if Leviathan stochastic acceptance applies.
     pub fn is_stochastic(&self) -> bool {
-        self.temperature > 0.0
+        self.params.temperature >= SAMPLING_EPS
+    }
+
+    fn probabilities(&self, logits: &[f32], history: &[u32]) -> Vec<f32> {
+        sampler_pure::sampling_distribution(logits, &self.params, history)
+    }
+
+    fn greedy_token(&self, logits: &[f32], history: &[u32]) -> u32 {
+        if !self.needs_cpu_greedy() {
+            return sampler_pure::sample_greedy(logits);
+        }
+        let mut adjusted = logits.to_vec();
+        sampler_pure::sample_token(&mut adjusted, &self.params, history)
+    }
+
+    fn needs_cpu_greedy(&self) -> bool {
+        self.params.repetition_penalty != 1.0
+    }
+
+    fn seed(&self) -> Option<u64> {
+        self.params.seed
     }
 }
 
@@ -185,6 +205,9 @@ pub struct SpecDecodeStats {
     pub accepted: usize,
     pub rejected: usize,
     pub proposed: usize,
+    /// Number of target-model forwards used by the decode transaction,
+    /// including prefill and any reject replay.
+    pub target_forwards: usize,
     pub prefill_elapsed: Duration,
     pub decode_elapsed: Duration,
 }
@@ -400,13 +423,13 @@ impl<'a> SpecDecode<'a> {
         let slot_id = self.slot_id;
         let (prefill_logits, prefill_hidden) = self
             .verifier
-            .forward_gpu_with_hidden(prompt, &prefill_positions, &mut self.kv_cache, slot_id)
+            .forward_gpu_with_nextn_hidden(prompt, &prefill_positions, &mut self.kv_cache, slot_id)
             .context("SpecDecode verifier prefill")?;
+        self.stats.target_forwards += 1;
         self.stats.prefill_elapsed = prefill_start.elapsed();
-        // forward_gpu_with_hidden returns the full [seq_len, H] residual; MTP
-        // forward_draft expects only the last row. Use slice_view (zero-copy
-        // view + offset-aware setBuffer:offset:) — same pattern as
-        // apply_output_head_gpu_last.
+        // The verifier returns the post-output-RMSNorm `[seq_len, H]`
+        // h_nextn rows required by Qwen MTP. The drafter needs only the final
+        // row, so retain a zero-copy view into it.
         let mut hidden_t = last_hidden_row(&prefill_hidden, self.verifier.cfg.hidden_size)
             .context("SpecDecode prefill last_hidden_row slice")?;
 
@@ -418,13 +441,15 @@ impl<'a> SpecDecode<'a> {
         // ADR-034 task #91 (2026-05-21) — stochastic MH state. The runner
         // hoists the RNG to function scope so deterministic-seed runs
         // produce byte-identical output across the entire generation.
-        // When `sampler.temperature <= 0` `is_mh` is false and the RNG
+        // When the canonical sampler is greedy `is_mh` is false and the RNG
         // is never read — greedy paths are byte-identical to pre-#91.
         let is_mh = self.sampler.is_stochastic();
-        let sampler_temp = self.sampler.temperature;
         let mut rng = {
             use rand::SeedableRng;
-            rand::rngs::StdRng::seed_from_u64(self.sampler.seed)
+            match self.sampler.seed() {
+                Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
+                None => rand::rngs::StdRng::from_entropy(),
+            }
         };
 
         let decode_start = Instant::now();
@@ -448,14 +473,10 @@ impl<'a> SpecDecode<'a> {
                     .last()
                     .expect("preemitted_argmax implies generated non-empty")
             } else if is_mh {
-                let probs =
-                    crate::inference::spec_decode::dflash::rejection_sampler::softmax_with_temp(
-                        &logits_t,
-                        sampler_temp,
-                    );
+                let probs = self.sampler.probabilities(&logits_t, &generated);
                 sample_from_probs(&probs, &mut rng)
             } else {
-                greedy_argmax_last_token(&logits_t, vocab)
+                self.sampler.greedy_token(&logits_t, &generated)
             };
             if !preemitted_argmax {
                 generated.push(token_next);
@@ -470,7 +491,6 @@ impl<'a> SpecDecode<'a> {
             // it shares the global pool's residency-set owner.
             let cfg = self.verifier.cfg.clone();
             let mtp_vocab = mtp.vocab_size;
-            let token_embd = &self.verifier.token_embd;
             // ADR-028 iter-154: per-step MTP profile gated on HF2Q_MTP_PROFILE=1.
             let mtp_profile = std::env::var("HF2Q_MTP_PROFILE").as_deref() == Ok("1");
 
@@ -498,6 +518,17 @@ impl<'a> SpecDecode<'a> {
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(0);
+
+            // K>=2 previously advanced the batched target and then handed the
+            // next round a hidden row that did not correspond to the emitted
+            // verifier token. That makes an apparently exact decode quietly
+            // diverge. Keep the research implementation unreachable until a
+            // real-model batched-vs-sequential parity gate qualifies its
+            // logits, hidden state, and hybrid cache handoff.
+            ensure!(
+                spec_k < 2,
+                "HF2Q_SPEC_DECODE_K={spec_k} is disabled: Qwen K>=2 target/hidden/cache parity is not qualified; use K=1"
+            );
 
             if spec_k >= 2 {
                 // ADR-034 task #91 Step 4 (2026-05-21) — K=N path supports MH
@@ -578,6 +609,8 @@ impl<'a> SpecDecode<'a> {
                     let hidden_ref = &hidden_t;
                     let kv_cache_ref = &mut self.kv_cache;
                     let rng_ref = &mut rng;
+                    let sampler = &self.sampler;
+                    let initial_draft_history = generated.clone();
                     self.verifier.with_gpu_cache_mut(|device, registry| {
                         let mut out = Vec::with_capacity(spec_k);
                         let mut out_probs: Vec<Vec<f32>> = if is_mh {
@@ -587,18 +620,19 @@ impl<'a> SpecDecode<'a> {
                         };
                         let mut chain_hidden: Option<MlxBuffer> = None;
                         let mut chain_token = token_next;
+                        let mut draft_history = initial_draft_history;
                         for k in 0..=spec_k {
-                            let embed = embed_token_on_device(
-                                token_embd,
-                                chain_token,
-                                cfg.hidden_size,
+                            let embed = self.verifier.embed_tokens_gpu_in_context(
+                                &[chain_token],
                                 device,
+                                registry,
                             )?;
                             let mtp_pos = next_pos + k as i32;
                             let prev_h = chain_hidden.as_ref().unwrap_or(hidden_ref);
                             let (draft_logits, draft_hidden) = mtp
-                                .forward_draft_with_hidden(
+                                .forward_draft_for_token(
                                     prev_h,
+                                    chain_token,
                                     &embed,
                                     kv_cache_ref,
                                     slot_id,
@@ -614,24 +648,25 @@ impl<'a> SpecDecode<'a> {
                                 })?;
                             if k < spec_k {
                                 let tok = if is_mh {
-                                    // MH: download F32 draft_logits, softmax with
-                                    // temp, sample stochastically. Store the
-                                    // probability vector so leviathan_accept_prefix
-                                    // below has q_v at each draft position.
+                                    // Apply the complete canonical sampling
+                                    // transaction to raw drafter logits. Store
+                                    // q so the verifier uses the exact same
+                                    // params/history at this position.
                                     let logits_cpu =
                                         super::gpu_full_attn::download_f32(&draft_logits)?;
-                                    let probs = crate::inference::spec_decode::dflash
-                                        ::rejection_sampler::softmax_with_temp(
-                                            &logits_cpu,
-                                            sampler_temp,
-                                        );
+                                    let probs = sampler.probabilities(&logits_cpu, &draft_history);
                                     let t = sample_from_probs(&probs, rng_ref);
                                     out_probs.push(probs);
                                     t
+                                } else if sampler.needs_cpu_greedy() {
+                                    let logits_cpu =
+                                        super::gpu_full_attn::download_f32(&draft_logits)?;
+                                    sampler.greedy_token(&logits_cpu, &draft_history)
                                 } else {
                                     argmax_logits_gpu(device, registry, &draft_logits, mtp_vocab)?
                                 };
                                 out.push(tok);
+                                draft_history.push(tok);
                                 chain_hidden = Some(draft_hidden);
                                 chain_token = tok;
                             }
@@ -655,7 +690,7 @@ impl<'a> SpecDecode<'a> {
                 let verify_positions = positions_for_range(next_pos, spec_k + 1);
                 let (verify_logits, verify_hidden) = self
                     .verifier
-                    .forward_gpu_with_hidden(
+                    .forward_gpu_with_nextn_hidden(
                         &verify_input,
                         &verify_positions,
                         &mut self.kv_cache,
@@ -667,6 +702,7 @@ impl<'a> SpecDecode<'a> {
                     .with_context(|| {
                         format!("SpecDecode K={spec_k} batched verify pos {next_pos}")
                     })?;
+                self.stats.target_forwards += 1;
                 let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
                 ensure!(
                     verify_logits.len() == (spec_k + 1) * vsz,
@@ -688,16 +724,17 @@ impl<'a> SpecDecode<'a> {
                 let mut next_iter_hidden_row: u64 = 0;
                 let mut hit_eos = false;
                 if is_mh {
-                    // Build target_probs for all spec_k+1 positions (one per
-                    // verify row). leviathan_accept_prefix contract requires
-                    // exactly drafts.len() + 1 target probability vectors.
-                    let target_probs_per_pos: Vec<Vec<f32>> = (0..=spec_k)
-                        .map(|i| {
-                            let row = &verify_logits[i * vsz..(i + 1) * vsz];
-                            crate::inference::spec_decode::dflash
-                                ::rejection_sampler::softmax_with_temp(row, sampler_temp)
-                        })
-                        .collect();
+                    // Build p for every verify row using the same canonical
+                    // params and exact conditional history used for q.
+                    let mut target_history = generated.clone();
+                    let mut target_probs_per_pos = Vec::with_capacity(spec_k + 1);
+                    for i in 0..=spec_k {
+                        let row = &verify_logits[i * vsz..(i + 1) * vsz];
+                        target_probs_per_pos.push(self.sampler.probabilities(row, &target_history));
+                        if i < spec_k {
+                            target_history.push(drafts[i]);
+                        }
+                    }
                     let (accept_count, continuation) =
                         crate::inference::spec_decode::dflash
                             ::rejection_sampler::leviathan_accept_prefix(
@@ -775,7 +812,7 @@ impl<'a> SpecDecode<'a> {
                 } else {
                     for i in 0..spec_k {
                         let row = &verify_logits[i * vsz..(i + 1) * vsz];
-                        let target_pred = greedy_argmax_slice(row);
+                        let target_pred = self.sampler.greedy_token(row, &generated);
                         if target_pred == drafts[i] {
                             generated.push(drafts[i]);
                             self.stats.accepted += 1;
@@ -817,7 +854,7 @@ impl<'a> SpecDecode<'a> {
                     // catch-up step, so both slots are aligned at
                     // (prior_len + spec_k + 1) with no stale tail.
                     let bonus_row = &verify_logits[spec_k * vsz..(spec_k + 1) * vsz];
-                    let bonus = greedy_argmax_slice(bonus_row);
+                    let bonus = self.sampler.greedy_token(bonus_row, &generated);
                     if generated.len() < max_new {
                         generated.push(bonus);
                     }
@@ -948,24 +985,28 @@ impl<'a> SpecDecode<'a> {
             };
             let kv_cache_ref = &mut self.kv_cache;
             let hidden_ref = &hidden_t;
-            // ADR-034 task #91 (2026-05-21): MH path needs the FULL draft
-            // distribution (q_v at the proposed token + residual support
-            // for reject), not just argmax. Greedy path is unchanged.
+            // Stochastic acceptance needs the full proposal distribution q.
+            // Repetition-penalized greedy also needs raw logits on CPU so its
+            // proposal is derived from the same history as target argmax.
             //
             // Return tuple: (proposed_token, optional_draft_probs).
-            //   - Greedy (is_mh=false): (argmax(draft_logits), None)
-            //   - MH (is_mh=true):     (sampled_token, Some(softmax(draft_logits, temp)))
-            // ADR-034 task #91 — closure returns the draft_logits buffer
-            // and (in MH mode) a CPU-downloaded copy of the F32 logits.
-            // Stochastic sampling + softmax happen OUTSIDE the GPU
+            //   - Plain greedy: GPU argmax, no CPU logits.
+            //   - Rep-penalty greedy: CPU canonical greedy, no q vector.
+            //   - Stochastic: CPU canonical distribution + sampled proposal.
+            // Distribution construction happens OUTSIDE the GPU
             // closure to avoid borrowing `rng` across the closure boundary.
+            let needs_cpu_draft = is_mh || self.sampler.needs_cpu_greedy();
             let (draft_token_argmax, draft_logits_cpu_opt): (Option<u32>, Option<Vec<f32>>) =
                 self.verifier.with_gpu_cache_mut(|device, registry| {
-                    let embed_next =
-                        embed_token_on_device(token_embd, token_next, cfg.hidden_size, device)?;
-                    let draft_logits = mtp
-                        .forward_draft(
+                    let embed_next = self.verifier.embed_tokens_gpu_in_context(
+                        &[token_next],
+                        device,
+                        registry,
+                    )?;
+                    let (draft_logits, _draft_hidden) = mtp
+                        .forward_draft_for_token(
                             hidden_ref,
+                            token_next,
                             &embed_next,
                             kv_cache_ref,
                             slot_id,
@@ -975,7 +1016,7 @@ impl<'a> SpecDecode<'a> {
                             &cfg,
                         )
                         .context("SpecDecode MTP forward_draft")?;
-                    if is_mh {
+                    if needs_cpu_draft {
                         let logits_cpu = super::gpu_full_attn::download_f32(&draft_logits)?;
                         Ok::<_, anyhow::Error>((None, Some(logits_cpu)))
                     } else {
@@ -985,13 +1026,13 @@ impl<'a> SpecDecode<'a> {
                 })?;
             let (proposed, draft_probs_opt): (u32, Option<Vec<f32>>) =
                 if let Some(logits_cpu) = draft_logits_cpu_opt {
-                    let draft_probs =
-                        crate::inference::spec_decode::dflash::rejection_sampler::softmax_with_temp(
-                            &logits_cpu,
-                            sampler_temp,
-                        );
-                    let sampled = sample_from_probs(&draft_probs, &mut rng);
-                    (sampled, Some(draft_probs))
+                    if is_mh {
+                        let draft_probs = self.sampler.probabilities(&logits_cpu, &generated);
+                        let sampled = sample_from_probs(&draft_probs, &mut rng);
+                        (sampled, Some(draft_probs))
+                    } else {
+                        (self.sampler.greedy_token(&logits_cpu, &generated), None)
+                    }
                 } else {
                     (
                         draft_token_argmax.expect("argmax token present in greedy mode"),
@@ -1063,26 +1104,20 @@ impl<'a> SpecDecode<'a> {
             };
 
             if two_calls {
-                // ADR-034 task #91 (2026-05-21) codex review #3 —
-                // K1_TWO_CALLS path is greedy-only; MH would require
-                // sampling decisions between forward A and B which the
-                // current "interleaved accept/reject" doesn't support.
-                // Warn once per generation so operators see when their
-                // sampler is silently ignored.
-                if is_mh && self.stats.accepted == 0 && self.stats.rejected == 0 {
-                    eprintln!(
-                        "[hf2q WARN] HF2Q_SPEC_DECODE_K1_TWO_CALLS=1 forces the K=1 two-call \
-                         interleaved path which is GREEDY-ONLY; --temperature {} sampler is \
-                         ignored on this path. Use HF2Q_SPEC_DECODE_K1=1 (without TWO_CALLS) \
-                         for MH stochastic acceptance.",
-                        self.sampler.temperature,
-                    );
-                }
+                // This diagnostic path has no stochastic/residual-sampling
+                // transaction between A and B. Never silently downcast a
+                // sampled or repetition-penalized request to raw argmax.
+                ensure!(
+                    !needs_cpu_draft,
+                    "HF2Q_SPEC_DECODE_K1_TWO_CALLS=1 is raw-greedy-only and cannot preserve \
+                     temperature or repetition-penalty sampling; unset TWO_CALLS to use the \
+                     exact batched speculative sampler"
+                );
                 // --- Step A: forward [token_next] at next_pos ---
                 let pos_a = vec![next_pos; 4];
                 let (logits_a, hidden_a) = self
                     .verifier
-                    .forward_gpu_with_hidden(
+                    .forward_gpu_with_nextn_hidden(
                         // ADR-040 Phase B4d (2026-05-30) — route
                         // through `self.slot_id` (was hard-coded
                         // SlotId(0) per B4d deferral).
@@ -1092,6 +1127,7 @@ impl<'a> SpecDecode<'a> {
                         slot_id,
                     )
                     .with_context(|| format!("K1 TWO_CALLS_PROPER A pos {next_pos}"))?;
+                self.stats.target_forwards += 1;
                 let last_a = last_logits(&logits_a, vocab)?.to_vec();
                 let verified_at_n1 = greedy_argmax_slice(&last_a);
 
@@ -1113,7 +1149,7 @@ impl<'a> SpecDecode<'a> {
                     let pos_b = vec![next_pos + 1; 4];
                     let (logits_b, hidden_b) = self
                         .verifier
-                        .forward_gpu_with_hidden(
+                        .forward_gpu_with_nextn_hidden(
                             // ADR-040 Phase B4d (2026-05-30) — route
                             // through `self.slot_id` (was hard-coded
                             // SlotId(0) per B4d deferral).
@@ -1123,6 +1159,7 @@ impl<'a> SpecDecode<'a> {
                             slot_id,
                         )
                         .with_context(|| format!("K1 TWO_CALLS_PROPER B pos {}", next_pos + 1))?;
+                    self.stats.target_forwards += 1;
                     let last_b = last_logits(&logits_b, vocab)?.to_vec();
                     let next_iter_token_next = greedy_argmax_slice(&last_b);
 
@@ -1179,7 +1216,7 @@ impl<'a> SpecDecode<'a> {
                 let (verify_logits, verify_hidden) = {
                     let verify_positions_2 = positions_for_range(next_pos, 2);
                     self.verifier
-                        .forward_gpu_with_hidden(
+                        .forward_gpu_with_nextn_hidden(
                             &[token_next, proposed],
                             &verify_positions_2,
                             &mut self.kv_cache,
@@ -1190,6 +1227,7 @@ impl<'a> SpecDecode<'a> {
                         )
                         .with_context(|| format!("SpecDecode K1 verifier step pos {next_pos}"))?
                 };
+                self.stats.target_forwards += 1;
                 let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
                 ensure!(
@@ -1215,11 +1253,7 @@ impl<'a> SpecDecode<'a> {
                     let draft_probs = draft_probs_opt
                         .as_ref()
                         .expect("MH mode must have draft_probs from MTP draft sampling");
-                    let target_probs =
-                        crate::inference::spec_decode::dflash::rejection_sampler::softmax_with_temp(
-                            logits_row0,
-                            sampler_temp,
-                        );
+                    let target_probs = self.sampler.probabilities(logits_row0, &generated);
                     let step =
                         crate::inference::spec_decode::dflash::rejection_sampler::leviathan_step(
                             proposed,
@@ -1236,7 +1270,7 @@ impl<'a> SpecDecode<'a> {
                         } => (false, replacement_token),
                     }
                 } else {
-                    let v = greedy_argmax_slice(logits_row0);
+                    let v = self.sampler.greedy_token(logits_row0, &generated);
                     (v == proposed, v)
                 };
                 let verified_at_n1 = k1_replacement_or_verified;
@@ -1277,11 +1311,14 @@ impl<'a> SpecDecode<'a> {
                         std::env::var("HF2Q_SPEC_DECODE_K1_NO_AMORT").as_deref() == Ok("1");
                     // ADR-034 task #91 — stochastic bonus token in MH mode.
                     let next_iter_token_next = if is_mh {
-                        let row1_probs = crate::inference::spec_decode::dflash
-                            ::rejection_sampler::softmax_with_temp(logits_row1, sampler_temp);
+                        let mut bonus_history = generated.clone();
+                        bonus_history.push(proposed);
+                        let row1_probs = self.sampler.probabilities(logits_row1, &bonus_history);
                         sample_from_probs(&row1_probs, &mut rng)
                     } else {
-                        greedy_argmax_slice(logits_row1)
+                        let mut bonus_history = generated.clone();
+                        bonus_history.push(proposed);
+                        self.sampler.greedy_token(logits_row1, &bonus_history)
                     };
                     generated.push(proposed);
                     if !no_amort && generated.len() < max_new && !self.is_eos(proposed) {
@@ -1318,7 +1355,7 @@ impl<'a> SpecDecode<'a> {
                         .context("SpecDecode K1 reject: rewind DeltaNet ping-pong")?;
                     let (replay_logits, replay_hidden) = self
                         .verifier
-                        .forward_gpu_with_hidden(
+                        .forward_gpu_with_nextn_hidden(
                             &[token_next],
                             &[next_pos; 4],
                             &mut self.kv_cache,
@@ -1327,11 +1364,12 @@ impl<'a> SpecDecode<'a> {
                         .with_context(|| {
                             format!("SpecDecode K1 reject replay at pos {next_pos}")
                         })?;
+                    self.stats.target_forwards += 1;
                     let replay_last = last_logits(&replay_logits, vocab)?.to_vec();
                     let corrected = if is_mh {
                         verified_at_n1
                     } else {
-                        greedy_argmax_slice(&replay_last)
+                        self.sampler.greedy_token(&replay_last, &generated)
                     };
                     generated.push(corrected);
                     preemitted_argmax = true;
@@ -1362,7 +1400,7 @@ impl<'a> SpecDecode<'a> {
                 let verify_positions = vec![next_pos; 4];
                 let (verify_logits, verify_hidden) = self
                     .verifier
-                    .forward_gpu_with_hidden(
+                    .forward_gpu_with_nextn_hidden(
                         // ADR-040 Phase B4d (2026-05-30) — route
                         // through `self.slot_id` (was hard-coded
                         // SlotId(0) per B4d deferral).
@@ -1372,6 +1410,7 @@ impl<'a> SpecDecode<'a> {
                         slot_id,
                     )
                     .with_context(|| format!("SpecDecode verifier step pos {next_pos}"))?;
+                self.stats.target_forwards += 1;
                 let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
                 let post_t0 = if mtp_profile {
@@ -1389,11 +1428,7 @@ impl<'a> SpecDecode<'a> {
                     let draft_probs = draft_probs_opt
                         .as_ref()
                         .expect("MH mode must have draft_probs from MTP draft sampling");
-                    let target_probs =
-                        crate::inference::spec_decode::dflash::rejection_sampler::softmax_with_temp(
-                            last_verify_logits,
-                            sampler_temp,
-                        );
+                    let target_probs = self.sampler.probabilities(last_verify_logits, &generated);
                     let step =
                         crate::inference::spec_decode::dflash::rejection_sampler::leviathan_step(
                             proposed,
@@ -1410,7 +1445,10 @@ impl<'a> SpecDecode<'a> {
                         } => (replacement_token, Some(false)),
                     }
                 } else {
-                    (greedy_argmax_last_token(&verify_logits, vocab), None)
+                    (
+                        self.sampler.greedy_token(last_verify_logits, &generated),
+                        None,
+                    )
                 };
                 let argmax_ms = post_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
@@ -1505,7 +1543,7 @@ impl<'a> SpecDecode<'a> {
                 let t0 = Instant::now();
                 let _ = self
                     .verifier
-                    .forward_gpu_with_hidden(
+                    .forward_gpu_with_nextn_hidden(
                         &synth_tokens,
                         &synth_positions,
                         &mut self.kv_cache,
@@ -1535,26 +1573,6 @@ impl<'a> SpecDecode<'a> {
     fn is_eos(&self, token: u32) -> bool {
         self.eos_token_ids.contains(&token)
     }
-}
-
-pub(crate) fn embed_token_on_device(
-    token_embd: &[f32],
-    token: u32,
-    hidden_size: u32,
-    device: &MlxDevice,
-) -> Result<MlxBuffer> {
-    let h = hidden_size as usize;
-    let token = token as usize;
-    let start = token
-        .checked_mul(h)
-        .ok_or_else(|| anyhow!("SpecDecode token index overflow"))?;
-    let end = start + h;
-    ensure!(
-        end <= token_embd.len(),
-        "SpecDecode token {} outside token_embd rows",
-        token
-    );
-    upload_f32(&token_embd[start..end], device).context("SpecDecode upload token embedding")
 }
 
 pub fn positions_for_range(start_pos: i32, seq_len: usize) -> Vec<i32> {
@@ -1614,6 +1632,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_target_and_proposal_share_complete_sampling_transaction() {
+        let sampler = SpecSampler::new(SamplingParams {
+            temperature: 0.61,
+            top_p: 0.9,
+            top_k: 3,
+            min_p: 0.05,
+            repetition_penalty: 2.0,
+            max_tokens: 8,
+            seed: Some(1234),
+        });
+        let history = [0, 5, 0];
+        let raw_cached_target_logits = [3.0_f32, 2.8, 2.6, 2.4, 0.0, -1.0];
+        let raw_proposal_logits = raw_cached_target_logits;
+
+        let target_p = sampler.probabilities(&raw_cached_target_logits, &history);
+        let proposal_q = sampler.probabilities(&raw_proposal_logits, &history);
+        assert_eq!(target_p, proposal_q);
+        assert_eq!(
+            target_p[0], 0.0,
+            "repetition penalty must be applied before top-k in both p and q"
+        );
+        assert!(
+            target_p.iter().filter(|&&p| p > 0.0).count() <= 3,
+            "both distributions must retain the requested top-k support"
+        );
+        let sum: f32 = target_p.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "p sum={sum}");
+    }
+
+    #[test]
+    fn spec_sampler_greedy_matches_canonical_repetition_semantics() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_p: 0.1,
+            top_k: 1,
+            min_p: 0.9,
+            repetition_penalty: 2.0,
+            max_tokens: 1,
+            seed: Some(9),
+        };
+        let sampler = SpecSampler::new(params.clone());
+        let history = [0];
+        let logits = [4.0_f32, 3.0, 1.0];
+
+        let mut canonical_logits = logits;
+        let canonical = sampler_pure::sample_token(&mut canonical_logits, &params, &history);
+        assert_eq!(sampler.greedy_token(&logits, &history), canonical);
+        assert_eq!(canonical, 1);
+    }
+
+    #[test]
+    fn seeded_proposal_draw_is_deterministic() {
+        use rand::SeedableRng;
+
+        let sampler = SpecSampler::new(SamplingParams {
+            temperature: 0.8,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            max_tokens: 1,
+            seed: Some(77),
+        });
+        let probabilities = sampler.probabilities(&[0.1_f32, 0.8, 1.2, -0.4], &[]);
+        let mut first = rand::rngs::StdRng::seed_from_u64(sampler.seed().unwrap());
+        let mut second = rand::rngs::StdRng::seed_from_u64(sampler.seed().unwrap());
+        assert_eq!(
+            sample_from_probs(&probabilities, &mut first),
+            sample_from_probs(&probabilities, &mut second)
+        );
+    }
+
+    #[test]
     fn speculative_output_does_not_expose_terminal_tokens() {
         let mut tokens = vec![7, 8, 248_046, 248_046];
         trim_trailing_eos(&mut tokens, &[248_046, 248_047]);
@@ -1627,6 +1718,328 @@ mod tests {
             positions_for_range(7, 3),
             vec![7, 8, 9, 7, 8, 9, 7, 8, 9, 7, 8, 9]
         );
+    }
+
+    /// Opt-in hardware gate for the production K=3 verifier shape: an
+    /// ordinary four-position target forward must make the same greedy
+    /// decisions as four ordinary single-position forwards from an
+    /// identically-prefilled Qwen3.8 cache. A fifth shared token then checks
+    /// that the batched hybrid-cache handoff remains decision-equivalent.
+    ///
+    /// This loads the accepted 16 GiB artifact and is intentionally excluded
+    /// from hosted tests. Set `HF2Q_TEST_QWEN38_FOUR_POSITION_PARITY=1` and
+    /// `HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN=1` to prove the exact Q4_K mvN
+    /// route, or `HF2Q_TEST_QWEN38_EXPECT_MV_EXT=1` with
+    /// `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1` to prove the same width-four
+    /// qualified weight-amortized width-four route.
+    #[test]
+    fn qwen38_real_four_position_normal_forward_parity() {
+        if std::env::var_os("HF2Q_TEST_QWEN38_FOUR_POSITION_PARITY").is_none() {
+            eprintln!("skipping: set HF2Q_TEST_QWEN38_FOUR_POSITION_PARITY=1");
+            return;
+        }
+        let expect_q4k_mvn = std::env::var_os("HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN").is_some();
+        let expect_mv_ext = std::env::var_os("HF2Q_TEST_QWEN38_EXPECT_MV_EXT").is_some();
+        assert!(
+            !(expect_q4k_mvn && expect_mv_ext),
+            "Qwen3.8 qL4 route proof must select exactly one expected route"
+        );
+        if expect_q4k_mvn || expect_mv_ext {
+            assert_eq!(
+                std::env::var("MLX_DISP_BUCKET").as_deref(),
+                Ok("1"),
+                "Qwen3.8 qL4 route proof requires externally-set MLX_DISP_BUCKET=1"
+            );
+        }
+        if expect_mv_ext {
+            assert_eq!(
+                std::env::var("HF2Q_DECODE_MVN").as_deref(),
+                Ok("0"),
+                "Q4_K mv_ext route proof requires externally-set HF2Q_DECODE_MVN=0"
+            );
+            assert_eq!(
+                std::env::var("HF2Q_DECODE_MV_EXT").as_deref(),
+                Ok("1"),
+                "Q4_K mv_ext route proof requires externally-set HF2Q_DECODE_MV_EXT=1"
+            );
+        }
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let path = std::env::var_os("HF2Q_TEST_QWEN38_GGUF")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from("/opt/hf2q/models/qwen3.8/Qwen3.8-27B-Q4_K_M.gguf")
+            });
+        assert!(
+            path.is_file(),
+            "Qwen3.8 parity artifact is absent at {}",
+            path.display()
+        );
+
+        use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+        use crate::inference::models::qwen35::model::Qwen35Model;
+        use crate::serve::header::LoadProgress;
+        use crate::serve::multi_seq_kv::SlotId;
+        use mlx_native::gguf::GgufFile;
+
+        let gguf = GgufFile::open(&path).expect("open Qwen3.8 GGUF");
+        let mut progress = LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen3.8 model");
+        use crate::inference::models::qwen35::gpu_full_attn::FullAttnQGateWeightsGpu;
+        use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35LayerWeights};
+        use crate::inference::models::qwen35::mtp::MtpFfnWeightsGpu;
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+
+        // Inference consumes the conversion artifact as written. The accepted
+        // GGUF must never fall back to an expanded CPU table or a runtime
+        // re-encoding of its Q4_K/Q6_K weights.
+        assert!(model.token_embd.is_empty(), "native embedding was expanded");
+        assert!(
+            model.output_weight.is_empty(),
+            "native output head was expanded"
+        );
+        assert_eq!(
+            model
+                .token_embd_native
+                .as_ref()
+                .expect("native token embedding")
+                .info
+                .ggml_dtype,
+            GgmlType::Q4_K
+        );
+        assert_eq!(
+            model
+                .output_weight_native
+                .as_ref()
+                .expect("native output head")
+                .info
+                .ggml_dtype,
+            GgmlType::Q6_K
+        );
+        let is_artifact_quant = |kind: GgmlType| matches!(kind, GgmlType::Q4_K | GgmlType::Q6_K);
+        for (layer_index, layer) in model.layers.iter().enumerate() {
+            assert!(
+                matches!(layer.ffn(), Qwen35FfnWeights::DenseQ(_)),
+                "layer {layer_index} FFN did not retain native quantized storage"
+            );
+            match layer {
+                Qwen35LayerWeights::NativeFullAttn { attn, .. } => {
+                    let q_type = match &attn.q_gate {
+                        FullAttnQGateWeightsGpu::Fused { ggml_type, .. } => *ggml_type,
+                        FullAttnQGateWeightsGpu::Split { .. } => {
+                            panic!("layer {layer_index} split/re-encoded native Q+gate")
+                        }
+                    };
+                    assert!(is_artifact_quant(q_type));
+                    assert!(is_artifact_quant(attn.wk_ggml_type));
+                    assert!(is_artifact_quant(attn.wv_ggml_type));
+                    assert!(is_artifact_quant(attn.wo_ggml_type));
+                }
+                Qwen35LayerWeights::NativeLinearAttn { attn, .. } => {
+                    for kind in [
+                        attn.attn_qkv_ggml_type,
+                        attn.attn_gate_ggml_type,
+                        attn.ssm_alpha_ggml_type,
+                        attn.ssm_beta_ggml_type,
+                        attn.ssm_out_ggml_type,
+                    ] {
+                        assert!(
+                            is_artifact_quant(kind),
+                            "layer {layer_index} projection was rewritten as {kind:?}"
+                        );
+                    }
+                }
+                Qwen35LayerWeights::FullAttn { .. } | Qwen35LayerWeights::LinearAttn { .. } => {
+                    panic!("layer {layer_index} used expanded legacy storage")
+                }
+            }
+        }
+        let mtp = model.mtp.as_ref().expect("Qwen3.8 native MTP block");
+        assert!(
+            mtp.embed_tokens.is_none(),
+            "Qwen3.8 MTP must share embeddings"
+        );
+        assert_eq!(mtp.eh_proj_ggml_type, GgmlType::Q4_K);
+        assert_eq!(mtp.shared_head_head_ggml_type, GgmlType::Q6_K);
+        assert!(matches!(&mtp.ffn, MtpFfnWeightsGpu::DenseQ { .. }));
+        assert_eq!(model.cfg.head_dim, 256, "Qwen3.8 parity requires D=256");
+        model
+            .ensure_gpu_cache_primed()
+            .expect("prime Qwen3.8 GPU cache before allocating HybridKvCache");
+
+        // Production TQ-only prefill requires the native head_dim=256 path,
+        // whose short-fixture fallback is intentionally F32-only. Keep this
+        // fixed prefix above that 16-token routing floor.
+        let prefix = [
+            151_643, 9707, 374, 279, 15, 9707, 374, 279, 15, 9707, 374, 279, 15, 9707, 374, 279,
+            15, 9707, 374, 279,
+        ];
+        let mut sequential_cache = model
+            .with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(&model.cfg, device, 64, 1, true)
+            })
+            .expect("allocate sequential Qwen3.8 cache");
+        let mut batched_cache = model
+            .with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(&model.cfg, device, 64, 1, true)
+            })
+            .expect("allocate batched Qwen3.8 cache");
+        let prefix_positions = positions_for_range(0, prefix.len());
+        let (prefill_logits, _) = model
+            .forward_gpu_with_nextn_hidden(
+                &prefix,
+                &prefix_positions,
+                &mut sequential_cache,
+                SlotId(0),
+            )
+            .expect("sequential Qwen3.8 prefill");
+        let (batched_prefill_logits, _) = model
+            .forward_gpu_with_nextn_hidden(
+                &prefix,
+                &prefix_positions,
+                &mut batched_cache,
+                SlotId(0),
+            )
+            .expect("batched Qwen3.8 prefill");
+        assert_eq!(
+            greedy_argmax_slice(
+                last_logits(&batched_prefill_logits, model.cfg.vocab_size)
+                    .expect("batched prefill logits row")
+            ),
+            greedy_argmax_slice(
+                last_logits(&prefill_logits, model.cfg.vocab_size)
+                    .expect("sequential prefill logits row")
+            ),
+            "independent Qwen3.8 prefills must start from the same target decision"
+        );
+
+        let seed = greedy_argmax_slice(
+            last_logits(&prefill_logits, model.cfg.vocab_size).expect("prefill logits row"),
+        );
+        let verifier_tokens = [seed, 279, 15, 9707];
+        let vocab = model.cfg.vocab_size as usize;
+        let mut sequential_choices = Vec::with_capacity(verifier_tokens.len());
+        mlx_native::reset_pipeline_dispatch_buckets();
+        for (offset, token) in verifier_tokens.iter().copied().enumerate() {
+            let positions = positions_for_range((prefix.len() + offset) as i32, 1);
+            let (logits, _) = model
+                .forward_gpu_with_nextn_hidden(
+                    &[token],
+                    &positions,
+                    &mut sequential_cache,
+                    SlotId(0),
+                )
+                .expect("sequential Qwen3.8 target step");
+            sequential_choices.push(greedy_argmax_slice(
+                last_logits(&logits, model.cfg.vocab_size).expect("sequential logits row"),
+            ));
+        }
+        if expect_q4k_mvn || expect_mv_ext {
+            let serial_buckets = mlx_native::pipeline_dispatch_buckets();
+            assert!(
+                serial_buckets.iter().all(|(label, _)| !label
+                    .starts_with("kernel_mul_mv_q4_K_f32_mN_")
+                    && !label.starts_with("kernel_mul_mv_ext_q4_K_f32_")),
+                "serial target unexpectedly used a multi-row Q4_K kernel: {serial_buckets:?}"
+            );
+        }
+
+        let verifier_positions = positions_for_range(prefix.len() as i32, verifier_tokens.len());
+        model
+            .with_gpu_cache_mut(|device, _registry| {
+                batched_cache.ensure_la_capture(&model.cfg, device, verifier_tokens.len() as u32)
+            })
+            .expect("allocate production qL4 DeltaNet capture");
+        mlx_native::reset_pipeline_dispatch_buckets();
+        let (batched_logits, _) = model
+            .forward_gpu_with_nextn_hidden_buffer(
+                &verifier_tokens,
+                &verifier_positions,
+                &mut batched_cache,
+                SlotId(0),
+            )
+            .expect("four-position Qwen3.8 target step");
+        batched_cache.clear_la_capture();
+        if expect_q4k_mvn {
+            let batched_buckets = mlx_native::pipeline_dispatch_buckets();
+            assert!(
+                batched_buckets.iter().any(|(label, count)| {
+                    *count > 0 && label.starts_with("kernel_mul_mv_q4_K_f32_mN_r1_4")
+                }),
+                "qL4 target did not execute the Q4_K mvN r1=4 kernel: {batched_buckets:?}"
+            );
+        }
+        if expect_mv_ext {
+            let batched_buckets = mlx_native::pipeline_dispatch_buckets();
+            for ggml_type in ["q4_K", "q6_K"] {
+                let expected = format!("kernel_mul_mv_ext_{ggml_type}_f32_r1_4");
+                assert!(
+                    batched_buckets
+                        .iter()
+                        .any(|(label, count)| *count > 0 && label.starts_with(&expected)),
+                    "qL4 target did not execute the {ggml_type} mv_ext r1=4 kernel: {batched_buckets:?}"
+                );
+            }
+        }
+        assert_eq!(
+            batched_logits.element_count(),
+            verifier_tokens.len() * vocab,
+            "batched logits shape"
+        );
+        let batched_logits = batched_logits
+            .as_slice::<f32>()
+            .expect("zero-copy batched logits view");
+        let batched_choices: Vec<u32> = batched_logits
+            .chunks_exact(vocab)
+            .map(greedy_argmax_slice)
+            .collect();
+        assert_eq!(
+            batched_choices, sequential_choices,
+            "Qwen3.8 four-position verifier decisions must match sequential target decisions"
+        );
+        let expected_target_len = prefix.len() + verifier_tokens.len();
+        batched_cache
+            .validate_sequence_len_for_slot(SlotId(0), expected_target_len)
+            .expect("all batched target cursors");
+        sequential_cache
+            .validate_sequence_len_for_slot(SlotId(0), expected_target_len)
+            .expect("all sequential target cursors");
+
+        let mut continuation = *sequential_choices.last().expect("four target choices");
+        for continuation_offset in 0..8 {
+            let continuation_position = positions_for_range(
+                (prefix.len() + verifier_tokens.len() + continuation_offset) as i32,
+                1,
+            );
+            let (sequential_continuation_logits, _) = model
+                .forward_gpu_with_nextn_hidden(
+                    &[continuation],
+                    &continuation_position,
+                    &mut sequential_cache,
+                    SlotId(0),
+                )
+                .expect("sequential Qwen3.8 continuation");
+            let (batched_continuation_logits, _) = model
+                .forward_gpu_with_nextn_hidden(
+                    &[continuation],
+                    &continuation_position,
+                    &mut batched_cache,
+                    SlotId(0),
+                )
+                .expect("post-batch Qwen3.8 continuation");
+            let sequential_choice = greedy_argmax_slice(
+                last_logits(&sequential_continuation_logits, model.cfg.vocab_size)
+                    .expect("sequential continuation logits row"),
+            );
+            let batched_choice = greedy_argmax_slice(
+                last_logits(&batched_continuation_logits, model.cfg.vocab_size)
+                    .expect("post-batch continuation logits row"),
+            );
+            assert_eq!(
+                batched_choice, sequential_choice,
+                "Qwen3.8 post-qL4 cache handoff diverged at continuation step {continuation_offset}"
+            );
+            continuation = sequential_choice;
+        }
     }
 
     #[test]

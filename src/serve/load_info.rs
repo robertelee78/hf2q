@@ -1754,6 +1754,9 @@ mod tests {
             // as `None`) to keep struct-literal construction
             // compatible. Production iter-2a path also stores `None`.
             persistent_kv_cache: None,
+            speculation: crate::serve::api::qwen35_speculation::QwenSpeculationController::new(
+                crate::serve::api::qwen35_speculation::QwenSpeculationPolicy::Off,
+            ),
         };
         let info = loaded.build_load_info(
             &gguf,
