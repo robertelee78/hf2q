@@ -128,12 +128,8 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   ├── safetensors.rs   streaming mmap shard reader → TensorMap
 │   ├── hf_reference.rs  bounded canonical Hub ID/URL + immutable identity
 │   ├── hf_download.rs   exact-revision native Hub source-plan/download
-│   ├── hf_download/     transfer/source reauthentication, paired native
-│   │                    conversion, and retained-source durable registration
-│   ├── integrity.rs     bounded index + LFS/Git byte verification
-│   ├── model_recipe.rs  embedded closed recipe schema + policy lookup
-│   └── model_recipe/    recipe validation + sealed source/artifact/host,
-│                       conversion/pair proofs, and structural prepared profile
+│   ├── hf_download/     bounded repository resolution
+│   └── integrity.rs     bounded index + LFS/Git byte verification
 │
 ├── src/ir/              internal representation crossing modules
 │   ├── mod.rs           ModelMetadata, TensorMap, DType, QuantizedTensor, …
@@ -255,7 +251,7 @@ CLI surface (via `assert_cmd`) or to that narrow lib facade.
                                        │
                   ┌────────────────────┴────────────────────┐
                   │ src/input/ parse identity, resolve exact │
-                  │ commit, apply embedded recipe, select/   │
+                  │ commit, select index-owned source,       │
                   │ authenticate bytes, mmap                 │
                   └────────────────────┬────────────────────┘
                                        │ verified source + exact receipt identity
@@ -693,48 +689,14 @@ harness leans on three patterns:
    transition that changes the effective timestamp or snapshot authorization
    may reset only those two floors; the sealed receipt binds the exact prior
    and final roots, while root and targets floors remain monotonic.
-   The external-model input boundary embeds the one accepted Qwen3.8 recipe,
-   verifies exact immutable Hub source and accepted artifact bytes, seals the
-   proven host/memory/free-space selection from fixed in-process macOS sysctl
-   reads plus the selected target filesystem (never caller facts or a
-   subprocess), derives one bounded canonical no-options
-   source/artifact/receipt/profile layout without mutating it, consumes the
-   exact original reference through the pinned Hub resolver into a
-   non-cloneable accepted-commit/recipe-inventory proof, then authenticates all
-   29 recipe-owned size and Git/LFS identities into a separate non-cloneable
-   metadata-only transfer authorization, then consumes it into a dedicated
-   recipe-owned resumable hf-hub cache and inert transferred-payload token.
-   The next offline transition reopens that exact cache, retains canonical
-   directory device/inode identities across verification, authenticates the
-   selected safetensors index and all 29 file bytes, and binds the result to
-   both Hub Git/LFS identity and the independent checked-in recipe before
-   minting another non-cloneable inert source proof. The recipe-owned
-   conversion transition consumes that proof, repeats all 29 source checks
-   before and between hf2q-native Q4_K_M text and F16 projector conversion,
-   takes the accepted artifact producer banner from the embedded recipe rather
-   than the running package version (while receipts identify the actual
-   converter),
-   writes each canonical receipt under the separate plan-owned `receipts/`
-   directory, and exact-adopts only complete artifact/receipt pairs. It
-   performs one final reopening of both roles before consuming the source,
-   host, artifact, and receipt proofs into one inert text/projector preparation
-   proof. Its
-   compact v2 receipt binds the recipe, source, stable recipe-owned hardware
-   floors, converter,
-   both artifacts, and both receipt digests while remaining explicitly
-   calibration-pending. A final one-use local publication transition repeats
-   source, pair, artifact, and conversion-receipt authentication around two
-   crash-durable records. It publishes the pair receipt first, then commits
-   registration through the exact `profile.json`; fixed private partials are
-   exact-prefix resumable and published by no-replace same-inode hard links
-   through retained descriptor-relative parent directories.
-   Prepared-profile v1 binds that receipt and both artifact/receipt descriptors
-   while recording only retained recipe-owned source and
-   `awaiting_runtime_calibration`. Parsing either record cannot mint the
-   non-cloneable durable registration proof, and the proof grants no loading,
-   preference, serving, source deletion, or calibration authority. The public
-   no-options CLI, destructive-retention journal, and calibration coordinator
-   remain pending.
+   The external-model input boundary parses bounded Hugging Face references,
+   resolves them through the official Hub to an immutable commit, downloads
+   only the authenticated index-selected source inventory, and writes an
+   adjacent conversion receipt after hf2q-native conversion succeeds. It does
+   not own model-selection recipes, prepared-model registration, source
+   retention, or calibration orchestration. ADR-046's Qwen source-teacher gate
+   separately embeds a minimal exact source manifest under its own module; that
+   evidence cannot download, convert, register, or serve a model.
 
 Benchmarks live in `benches/` and `scripts/`; the latter directory
 also carries every ADR's repro runbook.

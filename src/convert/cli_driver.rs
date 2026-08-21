@@ -38,49 +38,48 @@ use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
 use crate::convert::arch::qwen35moe_full::Qwen35MoeFullCtx;
 use crate::convert::arch::{
     bake, bert, deepseek4, deepseek4_metadata, gemma4, gemma4_mmproj, llama3, minimax_m2,
-    nomic_bert, qwen3vl_text, qwen35_dense, qwen35moe, qwen35moe_full,
+    nomic_bert, qwen35_dense, qwen35moe, qwen35moe_full, qwen3vl_text,
 };
 use crate::convert::evidence_source::VerifiedEvidenceSource;
 use crate::convert::orchestrator::PlanEntry;
-use crate::convert::quant_selector::{QuantSelector, approximate_for_apex};
+use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
 use crate::convert::receipt::{
-    PeakChunkBoundReceipt, ReceiptError, RemoteConversionSource, clear_stale_receipt,
-    clear_stale_receipt_at, prepare_success_receipt, prepare_success_receipt_at,
-    promote_success_receipt, require_converter_git_commit,
+    clear_stale_receipt, prepare_success_receipt, promote_success_receipt,
+    require_converter_git_commit, PeakChunkBoundReceipt, ReceiptError, RemoteConversionSource,
 };
 use crate::convert::source_reader::{SourceError, TensorMeta};
 use crate::convert::tensor_lineage::{
-    MaterializedDirectTensorEvidence, MaterializedDirectTensorRecord,
-    VerifiedConversionEvidenceContext, VerifiedSourceToStoredConversion,
     apply_qwen35_dense_bake_with_evidence, build_verified_source_to_stored_conversion,
     clear_stale_tensor_conversion_receipt, prepare_tensor_conversion_receipt,
     promote_tensor_conversion_receipt, verify_complete_conversion_source,
     verify_open_artifact_identity, verify_promoted_stored_catalog,
     verify_source_to_stored_continuity, verify_source_weight_artifacts,
     verify_written_tensor_evidence_file, verify_written_tensor_evidence_open,
+    MaterializedDirectTensorEvidence, MaterializedDirectTensorRecord,
+    VerifiedConversionEvidenceContext, VerifiedSourceToStoredConversion,
 };
 use crate::convert::tokenizer::TokenizerError;
 use crate::convert::{
-    ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError, build_tokenizer_metadata,
+    build_tokenizer_metadata, ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError,
 };
 use crate::core::provenance::{KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
 use crate::input::integrity::VerifiedSourceManifest;
-use crate::quantize::ggml_quants::SourceDtype;
 use crate::quantize::ggml_quants::apex::{
-    ApexError, ApexPolicy, FingerprintHParams, detect_apex_config, load_mudler_config,
+    detect_apex_config, load_mudler_config, ApexError, ApexPolicy, FingerprintHParams,
 };
 use crate::quantize::ggml_quants::standard_policy::HParams;
+use crate::quantize::ggml_quants::SourceDtype;
 use crate::quantize::ggml_quants::{ArchName, GgufFtype};
 
 #[path = "cli_driver/stored_evidence.rs"]
 mod stored_evidence;
-#[allow(unused_imports)] // crate-private seam consumed by the next Dynamic admission slice
-pub(crate) use stored_evidence::{
-    RetainedQwenArtifactLoad, VerifiedStoredQwenArtifact, run_convert_with_stored_evidence,
-    verify_persisted_stored_artifact,
-};
 #[cfg(test)]
 pub(crate) use stored_evidence::verify_persisted_stored_evidence;
+#[allow(unused_imports)] // crate-private seam consumed by the next Dynamic admission slice
+pub(crate) use stored_evidence::{
+    run_convert_with_stored_evidence, verify_persisted_stored_artifact, RetainedQwenArtifactLoad,
+    VerifiedStoredQwenArtifact,
+};
 #[cfg(test)]
 #[path = "cli_driver/stored_evidence_tests.rs"]
 mod stored_evidence_tests;
@@ -452,45 +451,7 @@ impl From<TokenizerError> for ConvertError {
 /// 7. Stream into a same-directory temporary GGUF, sync it, then atomically
 ///    replace the requested output only after successful finalization.
 pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
-    run_convert_with_receipt_destination(args, None, None)
-}
-
-/// Run the existing converter while placing its canonical success receipt at
-/// a caller-sealed path instead of beside the GGUF. Tests retain this ordinary
-/// running-version variant; production recipe conversion uses the sealed
-/// producer-version variant below.
-#[cfg(test)]
-pub(crate) fn run_convert_with_receipt_path(
-    args: ConvertArgs,
-    receipt_path: &Path,
-) -> Result<(), ConvertError> {
-    if receipt_path == args.output {
-        return Err(ReceiptError::InvalidDestination.into());
-    }
-    run_convert_with_receipt_destination(args, Some(receipt_path), None)
-}
-
-/// Run the recipe-owned converter with the producer banner frozen by the
-/// accepted artifact recipe. The ordinary CLI deliberately continues to stamp
-/// the running hf2q version; only the sealed recipe path may reproduce an
-/// earlier accepted artifact identity.
-pub(crate) fn run_convert_with_recipe_producer_version(
-    args: ConvertArgs,
-    receipt_path: &Path,
-    producer_version: &str,
-) -> Result<(), ConvertError> {
-    if receipt_path == args.output {
-        return Err(ReceiptError::InvalidDestination.into());
-    }
-    run_convert_with_receipt_destination(args, Some(receipt_path), Some(producer_version))
-}
-
-fn run_convert_with_receipt_destination(
-    args: ConvertArgs,
-    receipt_path: Option<&Path>,
-    recipe_producer_version: Option<&str>,
-) -> Result<(), ConvertError> {
-    run_convert_internal(args, receipt_path, recipe_producer_version, None).map(|_| ())
+    run_convert_internal(args, None).map(|_| ())
 }
 
 struct StoredEvidenceRequest {
@@ -502,8 +463,6 @@ struct StoredEvidenceRequest {
 
 fn run_convert_internal(
     args: ConvertArgs,
-    receipt_path: Option<&Path>,
-    recipe_producer_version: Option<&str>,
     evidence_request: Option<StoredEvidenceRequest>,
 ) -> Result<Option<VerifiedSourceToStoredConversion>, ConvertError> {
     // ----- 1. Open source (mmap, metadata-only) ---------------------------
@@ -567,14 +526,13 @@ fn run_convert_internal(
             });
         }
 
-        clear_stale_conversion_receipts_before_replacement(&args.output, receipt_path)?;
-        crate::models::vit::convert_vision_tower_to_path_with_source_and_producer_version(
+        clear_stale_conversion_receipts_before_replacement(&args.output)?;
+        crate::models::vit::convert_vision_tower_to_path_with_source(
             &args.hf_dir,
             &args.output,
             args.remote_source
                 .as_ref()
                 .map(RemoteConversionSource::source_sha256),
-            recipe_producer_version,
         )?;
 
         if let Some(remote) = args.remote_source.as_ref() {
@@ -584,30 +542,18 @@ fn run_convert_internal(
                 scope: "multimodal_projector_tensors".into(),
                 ..PeakChunkBoundReceipt::default()
             };
-            let prepared = match receipt_path {
-                Some(path) => prepare_success_receipt_at(
-                    &args.output,
-                    &args.output,
-                    path,
-                    remote,
-                    &converter_git_commit,
-                    "f16-mmproj",
-                    excluded_dspark_count,
-                    peak,
-                ),
-                None => prepare_success_receipt(
-                    &args.output,
-                    &args.output,
-                    remote,
-                    &converter_git_commit,
-                    "f16-mmproj",
-                    excluded_dspark_count,
-                    peak,
-                ),
-            }?;
+            let prepared = prepare_success_receipt(
+                &args.output,
+                &args.output,
+                remote,
+                &converter_git_commit,
+                "f16-mmproj",
+                excluded_dspark_count,
+                peak,
+            )?;
             promote_success_receipt(prepared)?;
         } else {
-            clear_conversion_receipt(&args.output, receipt_path)?;
+            clear_conversion_receipt(&args.output)?;
         }
         return Ok(None);
     }
@@ -924,11 +870,7 @@ fn run_convert_internal(
     if let Some(remote) = args.remote_source.as_ref() {
         orch.add_metadata(
             KEY_PRODUCER_VERSION.to_string(),
-            MetaValue::String(
-                recipe_producer_version
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("hf2q {}", env!("CARGO_PKG_VERSION"))),
-            ),
+            MetaValue::String(format!("hf2q {}", env!("CARGO_PKG_VERSION"))),
         );
         orch.add_metadata(
             KEY_SOURCE_SHA256.to_string(),
@@ -1171,18 +1113,8 @@ fn run_convert_internal(
         .remote_source
         .as_ref()
         .zip(converter_git_commit.as_deref())
-        .map(|(remote, commit)| match receipt_path {
-            Some(path) => prepare_success_receipt_at(
-                temporary_output.path(),
-                &args.output,
-                path,
-                remote,
-                commit,
-                &args.selector.receipt_name(),
-                excluded_dspark_count,
-                peak_chunk_bound,
-            ),
-            None => prepare_success_receipt(
+        .map(|(remote, commit)| {
+            prepare_success_receipt(
                 temporary_output.path(),
                 &args.output,
                 remote,
@@ -1190,7 +1122,7 @@ fn run_convert_internal(
                 &args.selector.receipt_name(),
                 excluded_dspark_count,
                 peak_chunk_bound,
-            ),
+            )
         })
         .transpose()?;
     let prepared_tensor_receipt = verified_conversion
@@ -1205,11 +1137,11 @@ fn run_convert_internal(
     // Remove older sidecars before replacing the artifact. If either removal
     // fails, the previous artifact remains untouched; after promotion there
     // can therefore never be a stale receipt beside new GGUF bytes.
-    clear_stale_conversion_receipts_before_replacement(&args.output, receipt_path)?;
+    clear_stale_conversion_receipts_before_replacement(&args.output)?;
     promote_temporary_output(temporary_output, &args.output)?;
     if let Some(catalog) = stored_catalog.as_ref() {
         if let Err(error) = verify_promoted_stored_catalog(&args.output, catalog) {
-            clear_stale_conversion_receipts_before_replacement(&args.output, receipt_path)?;
+            clear_stale_conversion_receipts_before_replacement(&args.output)?;
             return Err(ConvertError::Source(SourceError::Safetensors(format!(
                 "promoted GGUF evidence verification failed: {error}"
             ))));
@@ -1217,7 +1149,7 @@ fn run_convert_internal(
     }
     if let Some(receipt) = prepared_tensor_receipt {
         if let Err(error) = promote_tensor_conversion_receipt(receipt) {
-            clear_stale_conversion_receipts_before_replacement(&args.output, receipt_path)?;
+            clear_stale_conversion_receipts_before_replacement(&args.output)?;
             return Err(ConvertError::Source(SourceError::Safetensors(format!(
                 "promote stored conversion receipt failed: {error}"
             ))));
@@ -1229,13 +1161,13 @@ fn run_convert_internal(
             // so complete new bytes can never be mistaken for the artifact it
             // described; the caller still receives the promotion failure and
             // must rerun conversion to obtain a provenance-complete result.
-            clear_stale_conversion_receipts_before_replacement(&args.output, receipt_path)?;
+            clear_stale_conversion_receipts_before_replacement(&args.output)?;
             return Err(error.into());
         }
     } else {
         // A local conversion has no verified remote-source identity. Never
         // leave a sidecar from an older remote artifact beside new bytes.
-        clear_conversion_receipt(&args.output, receipt_path)?;
+        clear_conversion_receipt(&args.output)?;
     }
     Ok(verified_conversion)
 }
@@ -1248,23 +1180,13 @@ fn clear_stale_stored_conversion_receipt(output: &Path) -> Result<(), ConvertErr
     })
 }
 
-fn clear_stale_conversion_receipts_before_replacement(
-    output: &Path,
-    receipt_path: Option<&Path>,
-) -> Result<(), ConvertError> {
-    clear_conversion_receipt(output, receipt_path)?;
+fn clear_stale_conversion_receipts_before_replacement(output: &Path) -> Result<(), ConvertError> {
+    clear_conversion_receipt(output)?;
     clear_stale_stored_conversion_receipt(output)
 }
 
-fn clear_conversion_receipt(
-    output: &Path,
-    receipt_path: Option<&Path>,
-) -> Result<(), ReceiptError> {
-    clear_stale_receipt(output)?;
-    if let Some(path) = receipt_path {
-        clear_stale_receipt_at(path)?;
-    }
-    Ok(())
+fn clear_conversion_receipt(output: &Path) -> Result<(), ReceiptError> {
+    clear_stale_receipt(output)
 }
 
 fn conversion_model_basename(args: &ConvertArgs) -> Option<String> {
@@ -1332,7 +1254,7 @@ fn resolve_imatrix_input(
     n_ctx: u32,
 ) -> Result<Option<crate::quantize::imatrix::ImatrixData>, ConvertError> {
     use crate::quantize::imatrix::{
-        ComputeImatrixParams, CorpusBytes, CorpusSource, ImatrixData, compute_imatrix,
+        compute_imatrix, ComputeImatrixParams, CorpusBytes, CorpusSource, ImatrixData,
     };
 
     if let Some(path) = imatrix_path {
@@ -3061,8 +2983,8 @@ fn expert_kind_label(k: ExpertKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quantize::ggml_quants::GgufFtype;
     use crate::quantize::ggml_quants::apex::ApexTier;
+    use crate::quantize::ggml_quants::GgufFtype;
     use serde_json::json;
     use std::io::Write;
 
@@ -3110,16 +3032,6 @@ mod tests {
             conversion_model_basename(&args).as_deref(),
             Some("custom-qwen38")
         );
-    }
-
-    #[test]
-    fn explicit_receipt_path_cannot_alias_the_conversion_output() {
-        let args = basename_test_args("/does/not/need/to/exist", Some("Qwen/Qwen3.8-27B"));
-        let output = args.output.clone();
-        assert!(matches!(
-            run_convert_with_receipt_path(args, &output),
-            Err(ConvertError::Receipt(ReceiptError::InvalidDestination))
-        ));
     }
 
     #[test]
@@ -3176,22 +3088,18 @@ mod tests {
     }
 
     #[test]
-    fn alternate_artifact_replacement_clears_every_stale_conversion_sidecar() {
+    fn artifact_replacement_clears_every_stale_conversion_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("projector.gguf");
         let success_receipt = crate::convert::receipt::receipt_path(&output);
-        let custom_receipt = dir.path().join("prepared/projector.receipt.json");
-        std::fs::create_dir_all(custom_receipt.parent().unwrap()).unwrap();
         let tensor_receipt =
             crate::convert::tensor_lineage::tensor_conversion_receipt_path(&output);
         std::fs::write(&success_receipt, b"stale-general-receipt").unwrap();
-        std::fs::write(&custom_receipt, b"stale-custom-receipt").unwrap();
         std::fs::write(&tensor_receipt, b"stale-dense-text-lineage").unwrap();
 
-        clear_stale_conversion_receipts_before_replacement(&output, Some(&custom_receipt)).unwrap();
+        clear_stale_conversion_receipts_before_replacement(&output).unwrap();
 
         assert!(!success_receipt.exists());
-        assert!(!custom_receipt.exists());
         assert!(!tensor_receipt.exists());
     }
 
@@ -3329,7 +3237,10 @@ mod tests {
 
         config["text_config"]["layer_types"] = serde_json::json!("linear_attention");
         assert!(build_qwen35_dense_ctx(&config).is_none());
-        config["text_config"].as_object_mut().unwrap().remove("layer_types");
+        config["text_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("layer_types");
         config["text_config"]["full_attention_interval"] = serde_json::json!("4");
         assert!(build_qwen35_dense_ctx(&config).is_none());
     }
@@ -3823,7 +3734,7 @@ mod tests {
     /// regardless of tier (non-I tiers can still consume imatrix data).
     #[test]
     fn imatrix_file_loads_for_any_tier() {
-        use crate::quantize::imatrix::{AccumulatorRegistry, write_imatrix_to_path};
+        use crate::quantize::imatrix::{write_imatrix_to_path, AccumulatorRegistry};
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut reg = AccumulatorRegistry::new();
@@ -4020,47 +3931,36 @@ mod tests {
         .unwrap();
 
         let output = dir.path().join("tiny-q2-k-s.gguf");
-        let receipt_path = dir.path().join("receipts/tiny-q2-k-s.gguf.receipt.json");
-        run_convert_with_recipe_producer_version(
-            ConvertArgs {
-                hf_dir: dir.path().to_path_buf(),
-                selector: QuantSelector::Standard(GgufFtype::MostlyQ2_K_S),
-                output: output.clone(),
-                dry_run: false,
-                imatrix: None,
-                imatrix_corpus: None,
-                imatrix_out: None,
-                imatrix_n_ctx: None,
-                mmproj: false,
-                remote_source: Some(remote_source("deepseek-ai/DeepSeek-V4-Flash-0731")),
-            },
-            &receipt_path,
-            "hf2q 0.1.6",
-        )
+        run_convert(ConvertArgs {
+            hf_dir: dir.path().to_path_buf(),
+            selector: QuantSelector::Standard(GgufFtype::MostlyQ2_K_S),
+            output: output.clone(),
+            dry_run: false,
+            imatrix: None,
+            imatrix_corpus: None,
+            imatrix_out: None,
+            imatrix_n_ctx: None,
+            mmproj: false,
+            remote_source: Some(remote_source("deepseek-ai/DeepSeek-V4-Flash-0731")),
+        })
         .unwrap();
         let bytes = std::fs::read(&output).unwrap();
         assert_eq!(&bytes[..4], b"GGUF");
-        assert!(
-            bytes
-                .windows(b"blk.0.ffn_gate_exps.weight".len())
-                .any(|w| w == b"blk.0.ffn_gate_exps.weight")
-        );
+        assert!(bytes
+            .windows(b"blk.0.ffn_gate_exps.weight".len())
+            .any(|w| w == b"blk.0.ffn_gate_exps.weight"));
         assert!(bytes.len() > 32 * 1024);
-        let producer = b"hf2q 0.1.6";
-        assert!(
-            bytes
-                .windows(producer.len())
-                .any(|window| window == producer)
-        );
+        let producer = format!("hf2q {}", env!("CARGO_PKG_VERSION"));
+        assert!(bytes
+            .windows(producer.len())
+            .any(|window| window == producer.as_bytes()));
         let expected_source_sha = "b".repeat(64);
-        assert!(
-            bytes
-                .windows(expected_source_sha.len())
-                .any(|window| window == expected_source_sha.as_bytes())
-        );
+        assert!(bytes
+            .windows(expected_source_sha.len())
+            .any(|window| window == expected_source_sha.as_bytes()));
+        let receipt_path = crate::convert::receipt::receipt_path(&output);
         let receipt: crate::convert::receipt::ConversionReceipt =
             serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
-        assert!(!crate::convert::receipt::receipt_path(&output).exists());
         assert_eq!(receipt.source.revision, "a".repeat(40));
         assert_eq!(receipt.quant_selector, "q2_k_s");
         assert_eq!(receipt.output.size, bytes.len() as u64);

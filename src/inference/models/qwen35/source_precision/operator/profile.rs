@@ -14,7 +14,7 @@ const PROFILE_BYTES: &[u8] = include_bytes!(
     "../../../../../../data/calibration/qwen38-source-teacher-canary-v1/profile.json"
 );
 pub(super) const PROFILE_SHA256: &str =
-    "ecbb9a9a6f757fca9984ace998ae8a6ba3219c6d9a052c7727c00ec399749dd1";
+    "58ea26548ba581ec79191e44a59a2fd5b8274693baba69ab7067c7ea825c8c7e";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,8 +37,8 @@ pub(super) struct OfficialEvidenceProfileV1 {
 pub(super) struct ProfileSourceV1 {
     pub(super) repository_id: String,
     pub(super) revision: String,
-    pub(super) recipe_id: String,
-    pub(super) recipe_sha256: String,
+    pub(super) manifest_id: String,
+    pub(super) manifest_sha256: String,
     pub(super) bundle_sha256: String,
 }
 

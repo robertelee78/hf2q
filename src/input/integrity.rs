@@ -74,22 +74,6 @@ impl VerifiedSourceManifest {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(mut records: Vec<ShardIntegrity>) -> Self {
-        records.sort_by(|left, right| left.filename.cmp(&right.filename));
-        let required_weight_shards = records
-            .iter()
-            .filter(|record| record.filename.ends_with(".safetensors"))
-            .map(|record| record.filename.clone())
-            .collect();
-        Self {
-            repo: "test/repo".into(),
-            revision: "test-revision".into(),
-            required_weight_shards,
-            records,
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn for_test_bound(
         repo: impl Into<String>,
         revision: impl Into<String>,

@@ -199,7 +199,7 @@ pub fn clear_stale_receipt(output: &Path) -> Result<(), ReceiptError> {
     clear_stale_receipt_at(&receipt_path(output))
 }
 
-pub(crate) fn clear_stale_receipt_at(path: &Path) -> Result<(), ReceiptError> {
+fn clear_stale_receipt_at(path: &Path) -> Result<(), ReceiptError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -237,7 +237,7 @@ pub fn prepare_success_receipt(
     )
 }
 
-pub(crate) fn prepare_success_receipt_at(
+fn prepare_success_receipt_at(
     artifact: &Path,
     output: &Path,
     destination: &Path,

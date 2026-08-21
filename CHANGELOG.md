@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Remove the unreachable ADR-045 no-options model recipe, preparation plan,
+  paired-artifact publication, prepared-profile registry, retention, and
+  calibration-pending stack. Normal Hugging Face `convert` behavior remains
+  unchanged; ADR-046 now owns a minimal read-only source-teacher manifest.
+
 ## [0.1.7] — 2026-08-21
 
 ### Fixed
