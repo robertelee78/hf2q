@@ -54,7 +54,7 @@ mod tests {
     use super::*;
     use crate::convert::arch::llama3;
     use crate::quantize::ggml_quants::standard_policy::HParams;
-    use crate::quantize::ggml_quants::{ArchName, LlamaFtype};
+    use crate::quantize::ggml_quants::{ArchName, GgufFtype};
     use safetensors::tensor::{Dtype, TensorView};
     use std::collections::HashMap;
     use std::fs;
@@ -293,7 +293,7 @@ mod tests {
         let _ = hidden; // silence warning if HParams ever drops it
 
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ8_0,
+            GgufFtype::MostlyQ8_0,
             ArchName::Llama3,
             HParams {
                 n_expert: 0,

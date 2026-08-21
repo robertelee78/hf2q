@@ -2,10 +2,10 @@
 //! ADR-012 Decision 18 §1 + Layer C (spec-driven layout tests).
 //!
 //! Tensor-name table hand-transcribed from
-//! `/opt/llama.cpp/tools/mtmd/clip-model.h` and `clip.cpp`. Every entry
+//! the peer's clip-model spec headers. Every entry
 //! carries a citation comment to the spec line that motivated it — if
-//! `clip.cpp` changes upstream, the mapping test below fails loudly
-//! (same pattern as ADR-012 P4 used for `llama-arch.cpp`).
+//! the spec changes upstream, the mapping test below fails loudly
+//! (same pattern as ADR-012 P4 used for the arch table).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,7 +33,7 @@ pub struct VitTensor {
 ///
 /// All mappings cite the `clip-model.h` or `clip.cpp` line that pinned
 /// the GGUF naming convention. The constants here are the `v.` /
-/// `mm.` prefixes llama.cpp's mmproj loader keys off.
+/// `mm.` prefixes the peer's mmproj loader keys off.
 pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
     // -- Static (non-layer-indexed) tensors --------------------------------
     //
@@ -81,7 +81,7 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
     //   GGUF: v.{blk.{N}.{...}, patch_embd.*, position_embd.*, mm.{0,2}.*}
     //
     // Tensor name conventions transcribed from
-    // /opt/llama.cpp/tools/mtmd/clip-impl.h:
+    // the peer's clip-impl spec header:
     //   TN_ATTN_QKV   = "%s.blk.%d.attn_qkv.%s"  (fused QKV — no split)
     //   TN_ATTN_OUTPUT = "%s.blk.%d.attn_out.%s"
     //   TN_FFN_UP     = "%s.blk.%d.ffn_up.%s"
@@ -124,13 +124,11 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
     //
     // Wedge-4f (iter-224 row 6): the `merger.norm.{weight,bias}` mapping
     // moved from `mm.input_norm.{weight,bias}` to
-    // `v.post_ln.{weight,bias}` because llama.cpp's
-    // `Qwen3VLVisionModel.modify_tensors` at
-    // `/opt/llama.cpp/convert_hf_to_gguf.py:4948-4949` routes
-    // `visual.merger.norm.*` through `MODEL_TENSOR.V_POST_NORM` —
-    // see `/opt/llama.cpp/gguf-py/gguf/constants.py:1224`
+    // `v.post_ln.{weight,bias}` because the peer's
+    // `Qwen3VLVisionModel.modify_tensors` routes
+    // `visual.merger.norm.*` through `MODEL_TENSOR.V_POST_NORM`
     // (`V_POST_NORM: "v.post_ln"`). The previous `mm.input_norm.*`
-    // mapping was the YOUTUVL projector convention (clip.cpp:1859-1866),
+    // mapping was the YOUTUVL projector convention,
     // not Qwen3-VL — emitting it produced an mmproj that Wedge-4c.5's
     // `compute_vision_embeddings_gpu_qwen3vl` could not load (no
     // `v.post_ln.*` to feed the post-block LayerNorm).
@@ -206,14 +204,14 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
 }
 
 /// ADR-021 iter-11b: classify a GGUF mmproj tensor as F32 vs F16
-/// per the llama.cpp peer's convention. Norms (`*norm.weight`,
+/// per the peer's convention. Norms (`*norm.weight`,
 /// `*norm.bias`, `*ln*.weight`, `*ln*.bias`, `*pre_ln*`, `*post_ln*`)
 /// and ALL biases are stored at F32 — `clip_model_loader::warmup`
-/// asserts `a->type == GGML_TYPE_F32` (ggml.c:4989) on these inputs.
+/// asserts `a->type == GGML_TYPE_F32` on these inputs.
 /// Weights are F16 (or quantized; mmproj's F16 path keeps them as F16).
 ///
 /// Cross-references:
-/// - `/opt/llama.cpp/convert_hf_to_gguf.py:11756-11770` (V_ENC_*norm
+/// - the canonical converter (V_ENC_*norm
 ///   + biases routed via `add_to_f32` cast)
 /// - peer mmproj tensor dump: 113 F32 + 196 Q4_0 + 1 F16 (compare to
 ///   hf2q's prior 1 F32 + 315 F16 — wrong by 210 tensors).
@@ -242,10 +240,10 @@ pub(crate) fn vit_emission_is_f32(gguf_name: &str) -> bool {
     {
         return true;
     }
-    // Position-embedding table is also F32 in peer's mmproj (it's
-    // bilinear-resized at runtime; ggml's interpolate kernel asserts
+    // Position-embedding table is also F32 in the peer's mmproj (it's
+    // bilinear-resized at runtime; the interpolate kernel asserts
     // F32 input). Verified 2026-05-07 by tensor-dtype diff against
-    // /opt/llama.cpp/convert_hf_to_gguf.py output for Qwen3-VL-2B.
+    // the canonical converter's output for Qwen3-VL-2B.
     if gguf_name == "v.position_embd.weight" {
         return true;
     }
@@ -330,10 +328,9 @@ fn ensure_f16_bytes(tensor: &TensorRef) -> Result<Vec<u8>, VitConvertError> {
 /// (the first entry of `[5, 11, 17]`). The runtime mmproj loader
 /// expects the absolute index encoded in the tensor name as
 /// `v.deepstack.5.norm.weight` (per the canonical
-/// `TN_DEEPSTACK_NORM = "v.deepstack.%d.norm.%s"` format string at
-/// `/opt/llama.cpp/tools/mtmd/clip-impl.h:117`).
+/// `TN_DEEPSTACK_NORM = "v.deepstack.%d.norm.%s"` format string).
 ///
-/// Sub-keys per `convert_hf_to_gguf.py:4918-4928`:
+/// Sub-keys per the canonical converter:
 ///   - `norm.{weight,bias}`        → `V_DS_NORM`  / `v.deepstack.{idx}.norm.{w,b}`
 ///   - `linear_fc1.{weight,bias}`  → `V_DS_FC1`   / `v.deepstack.{idx}.fc1.{w,b}`
 ///   - `linear_fc2.{weight,bias}`  → `V_DS_FC2`   / `v.deepstack.{idx}.fc2.{w,b}`
@@ -454,7 +451,7 @@ pub fn load_vision_tensors(
         }
 
         // Special case: Qwen3.6 patch_embed.proj.weight is 5-D
-        // [out, in, T=2, H, W]. llama.cpp's qwen3vl clip graph
+        // [out, in, T=2, H, W]. The peer's qwen3vl clip graph
         // expects two separate 4-D conv weights (one per temporal
         // frame), named `v.patch_embd.weight` and
         // `v.patch_embd.weight.1`. Split here.
@@ -462,8 +459,7 @@ pub fn load_vision_tensors(
         // Wedge-4f also handles the `model.`-stripped form
         // (`visual.patch_embed.proj.weight`) since real Qwen3-VL HF
         // safetensors omit the `model.` prefix on the visual tower
-        // (see `/opt/llama.cpp/convert_hf_to_gguf.py:4908-4909` —
-        // canonical writer also strips). The static map at
+        // (the canonical converter also strips). The static map at
         // `hf_vit_name_to_gguf::QWEN36_GLOBAL_MAP` keeps the
         // `model.visual.*` form for backward-compat with synthetic
         // fixtures that embed the prefix.

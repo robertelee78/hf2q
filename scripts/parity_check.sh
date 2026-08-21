@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # parity_check.sh — ADR-009 Phase 2 + ADR-005 Gates C/E/F.
 #
-# Runs hf2q parity checks against locked llama.cpp reference outputs.
+# Runs hf2q parity checks against locked peer reference outputs.
 # Each prompt is run N times (default 3) at T=0; every run must pass its
 # declared min-prefix threshold. This encodes ADR-005 Gate F (deterministic
 # reproducibility): a single flaky run fails the whole gate. Gate E is
@@ -57,7 +57,7 @@ FAIL=0
 # DENSE decode. TQ is the default decode path post-correction; argmax
 # divergence is ~0.8% by physical design (Lloyd-Max codebook is lossy).
 # Force HF2Q_USE_DENSE=1 explicitly here so the gate keeps asserting
-# "hf2q dense == llama.cpp" byte-identity. Mirrors the precedent in
+# "hf2q dense == peer" byte-identity. Mirrors the precedent in
 # scripts/sourdough_gate.sh:120-123. The `env -u` clears any inherited
 # layer-policy / codebook-bits override that would re-activate TQ.
 # Iter-107 reconciliation: this script previously had zero HF2Q_USE_DENSE
@@ -101,9 +101,9 @@ echo "hf2q: $HF2Q_BIN"
 echo "git:  $GIT_HEAD"
 echo
 
-# --- Gates C/E/F: live llama.cpp-anchored parity ---
+# --- Gates C/E/F: live peer-anchored parity ---
 # Short deterministic — exact byte comparison (full answer)
-run_parity_n_times "short_hello"  16   "Check 1: short_hello (exact vs llama.cpp)"
+run_parity_n_times "short_hello"  16   "Check 1: short_hello (exact vs the peer)"
 # Sourdough — long-prompt regression-detector floor.
 # 2026-05-16 re-anchor: refs re-captured against
 # gemma4-ara-2pass-APEX-Q5_K_M.gguf on hf2q HEAD b4005d9d.  The previous
@@ -124,9 +124,9 @@ run_parity_n_times "short_hello"  16   "Check 1: short_hello (exact vs llama.cpp
 # changes that further reduce divergence point trip the regression
 # gate.  See tests/evals/reference/MANIFEST.json for the model + commit
 # the refs were captured against.
-run_parity_n_times "sourdough"    117  "Check 2: sourdough (long-prompt floor vs llama.cpp)"
+run_parity_n_times "sourdough"    117  "Check 2: sourdough (long-prompt floor vs the peer)"
 # Sliding wrap — same re-anchor; today's measured common_prefix = 129.
-run_parity_n_times "sliding_wrap" 129  "Check 3: sliding_wrap (long-prompt floor vs llama.cpp)"
+run_parity_n_times "sliding_wrap" 129  "Check 3: sliding_wrap (long-prompt floor vs the peer)"
 
 # --- Gate D: frozen hf2q self-baseline (byte-identical required) ---
 # min-prefix is unused under --self-baseline (hf2q passes 0 safely as

@@ -4,7 +4,7 @@
 # Single operator-runnable command that runs ALL the regression gates
 # protecting the iter-64 (forward_prefill_batched.rs leg_hb_encoded fix,
 # 22-29× speedup over per-token default) AND iter-68 (mlx-native one-
-# character typo fix unlocking tensor mm_id, BEATS llama.cpp at pp1024)
+# character typo fix unlocking tensor mm_id, BEATS the peer at pp1024)
 # wins.
 #
 # Sequence:
@@ -71,7 +71,7 @@ echo
 # code path (cmd_generate_qwen35 → forward_gpu.rs) but routes through
 # the same shared mm_id_pooled dispatcher in mlx-native, which means
 # the iter-68 typo fix (preventing fallback to slower simdgroup MMA)
-# applies. Measured 2300 t/s at pp512 = 0.79× of llama.cpp peer (2921).
+# applies. Measured 2300 t/s at pp512 = 0.79× of the peer (2921).
 # Floor 1800 catches >20% regression.
 QWEN_MODEL="${QWEN_MODEL:-/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf}"
 QWEN_PERF_FLOOR="${HF2Q_QWEN_PERF_FLOOR:-1800}"

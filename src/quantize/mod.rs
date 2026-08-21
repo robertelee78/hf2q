@@ -7,7 +7,7 @@
 //!
 //! Callers should import directly from `crate::quantize::ggml_quants`
 //! (e.g. `quantize::ggml_quants::quantizer::Quantizer`,
-//! `quantize::ggml_quants::LlamaFtype`,
+//! `quantize::ggml_quants::GgufFtype`,
 //! `quantize::ggml_quants::apex::ApexPolicy`).
 //!
 //! The `imatrix` submodule implements ADR-033 §Pi — in-tree imatrix

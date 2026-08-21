@@ -1,5 +1,7 @@
 # hf2q Shipping Contract
 
+> Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
+
 This document defines the public hf2q 0.1.6 product surface and the
 **Unreleased next-release candidate** where explicitly marked. It also defines
 the policy each environment variable is classified under. Per-variable
@@ -81,8 +83,8 @@ Every Gemma change that could affect the forward pass or lm_head must pass
 
 | Gate | Floor |
 |---|---|
-| `short_hello` exact-byte match vs locked llama.cpp reference | ≥ 29 bytes |
-| `sourdough` common-byte-prefix with llama.cpp | ≥ 3094 bytes |
+| `short_hello` exact-byte match vs locked peer reference | ≥ 29 bytes |
+| `sourdough` common-byte-prefix with the peer | ≥ 3094 bytes |
 | `sliding_wrap` common-byte-prefix with locked hf2q reference | ≥ 700 bytes |
 | Decode perf sanity on the sourdough prompt | ≥ 95 tok/s |
 
@@ -151,7 +153,7 @@ threshold or a latency rebaseline.
 | Family | Candidate artifact gate |
 |---|---|
 | Gemma 4 | Fresh-versus-reused bounded output parity at the 4,096 boundary and the non-aligned 8,193-token tail; aggregate cross-slot and installed-state transaction rows remain <=4,096 at both four and eight configured slots; short-SSE/long-prefill overlap; transaction cancellation; existing agentic/cache gate; bounded native object populations. The two four-slot calibrated waves retain the default latency limits, run before the destructive 175K/120K soak, and each require a trailing 60 seconds of Nominal state plus fail-closed two-second sampling through the complete cold/cached/tool-result sequence. The experimental eight-slot correctness/aggregate-cap wave is not a latency SLO, but its 40-second TTFT, 60-second whole-response, and 30-second tool-result functional ceilings are accepted only after the already-loaded eight-slot process receives its own trailing 60-second Nominal settle and continuous full-wave thermal receipt binding all eight cold requests. The transaction cap is not accepted until this passes. |
-| DeepSeek-V4 | Cached suffix spanning at least three native transactions with a live decode peer; middle-transaction cancellation and recovery; lopsided cold SSE progress with terminal parking; the four-agent cold/cached/tool gate twice using the immutable `full-context-agentic-v2` prompt contract and its `2c894c9e…b4ef` repository context, exactly 6,684 insertion-ordered prompt tokens per agent, explicit rejection of the 6,685-token legacy key-sorted rendering, zero cold reuse, and the literal 60-second cold bounds. The contract binds all request/render/token hashes, the historical 8,912-byte tool result, the exact 6,676-token recovery anchor, and the 2,798-token continuation suffix. The ceiling remains 9.2 seconds below the current thermally valid matched llama.cpp median. Each calibrated wave starts only after at least 60 seconds of Nominal, process-contention-free samples at five-second cadence with no hf2q/llama model runtime loaded, then remains under fail-closed two-second thermal and host-process sampling until all four atomic cold receipts exist. Four cold prefills may run in one bounded cohort; terminal cold unary lanes publish together, and only a warm 1–8-token recovery suffix may align four compatible decode cursors before cached work. Large tool-result suffixes remain interleavable. The same live caches must finish cached unary/SSE, automatic tool choice, and tool-result continuation under the unchanged 15/15/15/35-second bounds. Before those waves, a prebuilt exact-artifact test binary launched from a minimal clean-environment allowlist must pass B=2/3/4 non-aligned warm-prefix cooperative state/logit/subsequent-token parity and its alternating five-pair N=4 speed benchmark, plus the exact four-lane decode proof across at least 130 steps and ratio-four/ratio-128 boundaries. The sustained cooperative-prefill and decode microbenchmarks each still require their own 60-second Nominal, contention-free settle and a Nominal, contention-free first measurement, but may reach Fair under continuous two-second telemetry; Serious or Critical thermal samples or forbidden host work fail either gate. The decode proof must show bit-identical per-lane state, logits, cache, and recurrent data; 92-to-23 command-buffer and four-to-one synchronization topology; and a positive alternating-order median. Release independently rehashes the raw timing, test, thermal measurement/settle, and host-contention measurement/settle files, recomputes medians and speedups, and replays both validator families. Each wave's rehashed server log must contain positive post-publication warm-prefill transactions and exact warm B=4 decode selections; cold server completion and client publication must remain cohort-synchronized. The thermal receipt binds the four cold-receipt names and hashes; semantic/tool parity and retained-prefix counts remain unchanged. |
+| DeepSeek-V4 | Cached suffix spanning at least three native transactions with a live decode peer; middle-transaction cancellation and recovery; lopsided cold SSE progress with terminal parking; the four-agent cold/cached/tool gate twice using the immutable `full-context-agentic-v2` prompt contract and its `2c894c9e…b4ef` repository context, exactly 6,684 insertion-ordered prompt tokens per agent, explicit rejection of the 6,685-token legacy key-sorted rendering, zero cold reuse, and the literal 60-second cold bounds. The contract binds all request/render/token hashes, the historical 8,912-byte tool result, the exact 6,676-token recovery anchor, and the 2,798-token continuation suffix. The ceiling remains 9.2 seconds below the current thermally valid matched peer median. Each calibrated wave starts only after at least 60 seconds of Nominal, process-contention-free samples at five-second cadence with no hf2q/peer model runtime loaded, then remains under fail-closed two-second thermal and host-process sampling until all four atomic cold receipts exist. Four cold prefills may run in one bounded cohort; terminal cold unary lanes publish together, and only a warm 1–8-token recovery suffix may align four compatible decode cursors before cached work. Large tool-result suffixes remain interleavable. The same live caches must finish cached unary/SSE, automatic tool choice, and tool-result continuation under the unchanged 15/15/15/35-second bounds. Before those waves, a prebuilt exact-artifact test binary launched from a minimal clean-environment whitelist must pass B=2/3/4 non-aligned warm-prefix cooperative state/logit/subsequent-token parity and its alternating five-pair N=4 speed benchmark, plus the exact four-lane decode proof across at least 130 steps and ratio-four/ratio-128 boundaries. The sustained cooperative-prefill and decode microbenchmarks each still require their own 60-second Nominal, contention-free settle and a Nominal, contention-free first measurement, but may reach Fair under continuous two-second telemetry; Serious or Critical thermal samples or forbidden host work fail either gate. The decode proof must show bit-identical per-lane state, logits, cache, and recurrent data; 92-to-23 command-buffer and four-to-one synchronization topology; and a positive alternating-order median. Release independently rehashes the raw timing, test, thermal measurement/settle, and host-contention measurement/settle files, recomputes medians and speedups, and replays both validator families. Each wave's rehashed server log must contain positive post-publication warm-prefill transactions and exact warm B=4 decode selections; cold server completion and client publication must remain cohort-synchronized. The thermal receipt binds the four cold-receipt names and hashes; semantic/tool parity and retained-prefix counts remain unchanged. |
 | All three | The generic fail-stop ownership test covers origin, installed, buffered, and pre-close-permitted replies; synthetic dead workers keep `/health` live while `/readyz` and new generation fail with 503. |
 
 ---
@@ -253,7 +255,7 @@ convert-only.
 | Structural validity | File begins with magic `GGUF`, version 3, tensor_count > 0, kv_count > 0 |
 | Metadata completeness | Every key in the ADR-012 Decision 7 catalog is present |
 | Tensor naming | Every tensor name matches the ADR-012 Decision 8 naming spec |
-| llama.cpp load | `llama-cli --model out.gguf -p "Hello" -n 8` exits 0 |
+| Peer load | `llama-cli --model out.gguf -p "Hello" -n 8` exits 0 |
 | Sidecar set | `tokenizer.json`, `tokenizer_config.json`, `config.json`, `generation_config.json`, `special_tokens_map.json` (and `chat_template.jinja` when present) are byte-identical copies alongside the GGUF |
 | MTP tensors (when `mtp_num_hidden_layers > 0`) | Round-trip integrity gate at `tests/convert_qwen35_mtp_roundtrip.rs` (Decision 19); 4 tensors land at `blk.{num_hidden_layers}.nextn.{enorm,hnorm,embed_tokens,eh_proj}.weight` |
 | mmproj (when `--emit-vision-tower` and `vision_config` present) | Pure-Rust emitter at `src/models/vit/`; produces `mmproj-<slug>-F16.gguf` per Decision 18 with three layers of structural / round-trip / spec-driven test coverage |
@@ -282,7 +284,7 @@ No weight-space fallback for these architectures (Decision 13).
 
 Real-model artifact production for the four end-deliverable GGUFs
 (qwen35/qwen35moe × dwq46/dwq48) is gated only on environment
-(HF_TOKEN + ~150 GB disk + Metal-validated llama.cpp build).
+(HF_TOKEN + ~150 GB disk + Metal-validated peer build).
 
 ### Out-of-scope for ADR-012
 
@@ -415,7 +417,7 @@ Independent of the speed/RSS/PPL parity matrix, ADR-014 P6 ships a
 gate** for the imatrix calibrator:
 `src/calibrate/imatrix_xvalidate.rs::cross_validate_imatrix_gguf`.
 
-Given two GGUF v3 imatrix files (the schema landed by llama.cpp
+Given two GGUF v3 imatrix files (the schema landed by the peer's
 PR #9400 / commit `90083283` / 2025-07-19), the comparator:
 
 1. Loads both via `ImatrixCollector::load_imatrix_gguf` — the same
@@ -441,7 +443,7 @@ The `#[ignore]`-gated cell `xvalidation_vs_llama_imatrix_qwen35_smoke`
 (at `tests/imatrix_xvalidation.rs`) wires this comparator against the
 external `llama-imatrix` binary on a Qwen3.5-0.6B fixture; that cell
 is the pre-P11 close gate proving hf2q's pure-Rust port produces
-per-tensor `in_sum2` + `counts` numerically equivalent to llama.cpp's
+per-tensor `in_sum2` + `counts` numerically equivalent to the peer's
 C++ implementation.
 
 ---
@@ -450,7 +452,7 @@ C++ implementation.
 
 These are deliberately not part of any category:
 
-- Byte-identical batched-prefill parity with llama.cpp at the ~752-byte
+- Byte-identical batched-prefill parity with the peer at the ~752-byte
   `sliding_wrap` level (see `docs/ADR-010-exact-batched-kernel-parity.md`;
   deferred).
 - Qwen SlotAware soft-token, deepstack, and 3D-position generation. Those

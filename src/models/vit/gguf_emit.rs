@@ -2,7 +2,7 @@
 //!
 //! Writes a valid GGUF v3 file with `general.architecture = "clip"`
 //! metadata + F16 vision + projector tensors. The file is consumable
-//! by llama.cpp's mtmd-cli (as a read-only reader per sovereignty)
+//! by the peer's mtmd-cli (as a read-only reader per sovereignty)
 //! and by our own `src/inference/vision/mmproj.rs` loader (Layer B's
 //! round-trip gate).
 //!
@@ -39,8 +39,7 @@ const ALIGNMENT: u64 = 32;
 /// Wedge-4f (iter-224 row 6): added `Bool` + `ArrayBool` so the writer
 /// can emit Qwen3-VL's `clip.use_gelu` (Bool) and
 /// `clip.vision.is_deepstack_layers` (Bool[]) keys at the same byte
-/// shape llama.cpp's `add_vision_is_deepstack_layers` writer at
-/// `/opt/llama.cpp/gguf-py/gguf/gguf_writer.py:1219-1220` produces and
+/// shape the peer's `add_vision_is_deepstack_layers` writer produces and
 /// hf2q's loader at `src/inference/vision/mmproj.rs::read_deepstack_indexes`
 /// consumes.
 #[derive(Debug, Clone)]
@@ -153,8 +152,8 @@ pub(crate) fn write_mmproj_gguf_with_provenance_and_producer_version(
         // ADR-021 iter-11b: honor per-tensor dtype set by the converter
         // (norms + biases are F32; weights are F16). Pre-fix this loop
         // hardcoded F16 + 2-byte size, which produced 210 wrong-dtype
-        // tensors and crashed stock llama.cpp's `clip_model_loader::warmup`
-        // on `GGML_ASSERT(a->type == GGML_TYPE_F32)` at ggml.c:4989.
+        // tensors and crashed the stock peer's `clip_model_loader::warmup`
+        // on `GGML_ASSERT(a->type == GGML_TYPE_F32)`.
         let (gguf_dtype, bytes_per_elem) = match t.dtype {
             crate::ir::DType::F32 => (GGML_TYPE_F32, 4u64),
             crate::ir::DType::F16 => (GGML_TYPE_F16, 2u64),
@@ -303,9 +302,8 @@ fn write_kv<W: Write>(w: &mut W, key: &str, value: &MetaValue) -> std::io::Resul
 ///   - `clip.vision.is_deepstack_layers`    (Bool[block_count])
 ///   - `clip.vision.projection_dim`         (u32; LM hidden_size — when known)
 ///
-/// These keys mirror the canonical writer at
-/// `/opt/llama.cpp/convert_hf_to_gguf.py:4879-4896`
-/// (`Qwen3VLVisionModel.set_gguf_parameters`).
+/// These keys mirror the canonical converter's
+/// `Qwen3VLVisionModel.set_gguf_parameters` writer.
 fn build_metadata(cfg: &VisionConfig) -> Vec<(String, MetaValue)> {
     let mut kvs: Vec<(String, MetaValue)> = vec![
         (
@@ -316,10 +314,10 @@ fn build_metadata(cfg: &VisionConfig) -> Vec<(String, MetaValue)> {
             "general.name".into(),
             MetaValue::String("hf2q-mmproj".into()),
         ),
-        // ADR-021 iter-11b: stock llama.cpp's `clip_model_loader::get_bool`
-        // (clip.cpp:2744) calls `gguf_get_val_bool` which asserts the
+        // ADR-021 iter-11b: the stock peer's `clip_model_loader::get_bool`
+        // calls `gguf_get_val_bool` which asserts the
         // metadata type is Bool, not Uint32. Pre-fix these were emitted
-        // as Uint32(0/1) and crashed `llama-mtmd-cli` on
+        // as Uint32(0/1) and crashed the peer's mtmd-cli on
         // `GGML_ASSERT(type_to_gguf_type<T>::value == type)`. Surfaced
         // 2026-05-07 by the live peer-reference run.
         ("clip.has_vision_encoder".into(), MetaValue::Bool(true)),
@@ -392,19 +390,18 @@ fn build_metadata(cfg: &VisionConfig) -> Vec<(String, MetaValue)> {
     // ---- Qwen3-VL extension keys -------------------------------------
     //
     // Emitted only when `cfg.is_qwen3vl()` returns true. Mirrors the
-    // canonical writer's `Qwen3VLVisionModel.set_gguf_parameters` at
-    // `/opt/llama.cpp/convert_hf_to_gguf.py:4879-4896`. Three keys:
+    // canonical converter's `Qwen3VLVisionModel.set_gguf_parameters`
+    // writer. Three keys:
     //
-    //   * `clip.use_gelu = true` — `add_vision_use_gelu(True)` at
-    //     line 4884; the gguf_writer helper at gguf_writer.py:1181-1182
+    //   * `clip.use_gelu = true` — the canonical `add_vision_use_gelu`
+    //     helper
     //     emits a top-level `clip.use_gelu` (NOT `clip.vision.use_gelu`)
-    //     per `Keys.ClipVision.USE_GELU = "clip.use_gelu"` at
-    //     `/opt/llama.cpp/gguf-py/gguf/constants.py:316`. Selects the
+    //     per `Keys.ClipVision.USE_GELU = "clip.use_gelu"`. Selects the
     //     ViT activation function (Qwen3-VL's MLP uses GELU; Gemma 4
     //     uses approximate-tanh GELU but emits the same Bool key).
     //
     //   * `clip.vision.spatial_merge_size` — the 2×2 patch-merger
-    //     degree per `add_vision_spatial_merge_size` at line 4889.
+    //     degree per the canonical `add_vision_spatial_merge_size` writer.
     //     Required for Qwen3-VL because the merger fuses each 2×2
     //     patch group into a single token (4× token reduction) before
     //     the cross-modal projector. Loader reads via

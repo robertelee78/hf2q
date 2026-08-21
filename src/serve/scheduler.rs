@@ -89,7 +89,7 @@
 //!   existing ADR-005 Phase 2 Decision #2 contract (one in-flight request,
 //!   bounded queue, 429 on overflow).
 //! - Ships the production `InflightBatchedScheduler` with a real `step()`
-//!   FSM body that mirrors llama.cpp's `-cb` (continuous-batching)
+//!   FSM body that mirrors the peer's `-cb` (continuous-batching)
 //!   admission-during-decode semantics per ADR-040 §3.3.
 //! - **iter-2.5 (this commit)** closes 3 CRITICAL + 1 MAJOR adversarial
 //!   findings (cfa-iter2.5 #C1/C2/C3/M2) by:
@@ -135,7 +135,7 @@
 //!     admit allocates no physical slot, and the caller observes
 //!     `handle.is_none()` and skips the drive loop.)
 //! - Pins the prefill chunk-size default at `DEFAULT_PREFILL_CHUNK_TOKENS
-//!   = 512` — matches llama.cpp's `-ub` (ubatch) default.
+//!   = 512` — matches the peer's `-ub` (ubatch) default.
 //!
 //! # What this module does NOT do (iter-2.5 scope)
 //!
@@ -253,7 +253,7 @@ pub enum SchedulerPolicy {
     /// Mirrors `Engine::spawn`'s mpsc-channel + single-worker semantics.
     FifoSerial,
     /// Admission-during-decode with up to `max_slots` concurrent requests.
-    /// Mirrors llama.cpp `-cb` (ADR-040 §3.3 reference choice).
+    /// Mirrors the peer's `-cb` (ADR-040 §3.3 reference choice).
     InflightBatched,
 }
 
@@ -388,12 +388,12 @@ pub enum SchedulerStep {
 }
 
 // ---------------------------------------------------------------------------
-// Prefill chunk size — (ADR-040 §3.3 llama.cpp -cb mirror)
+// Prefill chunk size — (ADR-040 §3.3 peer -cb mirror)
 // ---------------------------------------------------------------------------
 
 /// Default number of prompt tokens consumed per `Prefill` step.
 ///
-/// Pinned at 512 to mirror llama.cpp's `-ub` (ubatch) default.
+/// Pinned at 512 to mirror the peer's `-ub` (ubatch) default.
 pub const DEFAULT_PREFILL_CHUNK_TOKENS: u32 = 512;
 
 // ---------------------------------------------------------------------------

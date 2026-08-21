@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reproducible same-host llama.cpp discriminator for the frozen DeepSeek
+# Reproducible same-host peer discriminator for the frozen DeepSeek
 # four-agent cold workload. Each wave starts from a fresh model process, lets
 # that loaded-but-idle peer return to a continuous Nominal state, and is then
 # monitored fail-closed throughout measurement. This is matched-reference

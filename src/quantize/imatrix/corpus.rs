@@ -185,7 +185,7 @@ fn load_user_file(path: &Path) -> Result<CorpusBytes, ImatrixError> {
 ///
 /// Mirrors `llama-imatrix`'s chunking: `chunk_size = n_ctx / n_parallel`
 /// (with default `n_parallel=1` ⇒ `chunk_size == n_ctx`). Partial trailing
-/// chunks are dropped (matches `imatrix.cpp:960`).
+/// chunks are dropped.
 ///
 /// Phase B uses this for the per-arch tokenized corpus; Phase A exposes it
 /// pre-built for unit tests + future wiring.

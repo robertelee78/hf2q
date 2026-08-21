@@ -1,9 +1,8 @@
-//! ADR-033 P0 — pure-Rust ports of llama.cpp's ggml-quants.c kernels.
+//! ADR-033 P0 — pure-Rust ports of the peer's quantization kernels.
 //!
-//! Each submodule is a byte-identity port of `quantize_row_<T>_ref` and
-//! (where it diverges from `_ref`) `quantize_row_<T>_impl` from
-//! `/opt/llama.cpp/ggml/src/ggml-quants.c` at the SHA recorded in
-//! `data/llama_cpp_pin.txt`.
+//! Each submodule is a byte-identity port of the peer's
+//! `quantize_row_<T>_ref` and
+//! (where it diverges from `_ref`) `quantize_row_<T>_impl`.
 //!
 //! Acceptance gate: each kernel's `#[test]`s load the byte-identity
 //! fixtures at `tests/fixtures/ggml_quants/<type>_<n>_<variant>_{input,expected}.bin`
@@ -21,7 +20,7 @@ pub mod error;
 pub mod ggml_type;
 pub mod iq4_nl;
 pub mod iq4_xs;
-pub mod llama_ftype;
+pub mod ftype;
 pub mod q2_k;
 pub mod q3_k;
 pub mod q4_0;
@@ -43,7 +42,7 @@ pub use deepseek4_agentic::{
 };
 pub use error::QuantizeError;
 pub use ggml_type::GgmlType;
-pub use llama_ftype::LlamaFtype;
+pub use ftype::GgufFtype;
 pub use quantizer::{quantizer_for, GgmlQuantizer, Quantizer};
 pub use standard_policy::{tensor_type_fallback, StandardPolicy, TensorCategory};
 pub use tensor_ref::{ArchName, SourceDtype, TensorRef};

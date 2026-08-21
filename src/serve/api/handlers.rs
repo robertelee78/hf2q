@@ -1885,9 +1885,7 @@ where
     // tools[] non-empty AND a registered family), or EAGERLY for tool
     // calls (`ToolCallBodyRequired`, mask + advance every token starting
     // at byte 0; the grammar root already wraps the body in open/close
-    // markers).  Mirrors llama.cpp `enum common_grammar_type` + `bool
-    // grammar_lazy` selection in `tools/server/server-task.cpp:381-403`
-    // and `common/chat.cpp:898-913, 1177-1200, 1399-1416, 1626-1628`.
+    // markers).  Mirrors the peer's grammar-type + lazy-grammar selection.
     //
     // The tool-grammar kind is derived from `tool_choice` upstream of
     // the grammar-vs-no-grammar decision: under `tool_choice=auto` the
@@ -2233,9 +2231,8 @@ where
     //   * Auto without grammar (no tools[] OR unregistered family) +
     //     None → `Auto` (no enforcement, content fallback preserved).
     //
-    // The Auto branch's grammar-vs-no-grammar split mirrors llama.cpp's
-    // grammar_lazy gate at common/chat.cpp:898-913, 1177-1200,
-    // 1399-1416, 1626-1628 — when llama.cpp compiles an Auto grammar
+    // The Auto branch's grammar-vs-no-grammar split mirrors the peer's
+    // lazy-grammar gate — when the peer compiles an Auto grammar
     // it equally treats body-parse failures as grammar-engine bugs.
     let tc_policy = match &tool_choice {
         super::schema::ToolChoiceValue::Required | super::schema::ToolChoiceValue::Function(_) => {
@@ -2423,8 +2420,7 @@ where
 /// `[total_n_image_tokens, hidden]` GPU buffers, and build the 3D-mRoPE
 /// flat-position buffer covering the full expanded prompt.
 ///
-/// **Round-trip identity invariant**: per peer
-/// `/opt/llama.cpp/src/models/qwen3vl.cpp:96-100`, the augmented embed
+/// **Round-trip identity invariant**: per the peer, the augmented embed
 /// row `r` for image `img` packs `[base_chunk; ds_0_chunk; ...;
 /// ds_{N-1}_chunk]` along the feature axis. The split we do here must
 /// produce chunks that, when concatenated row-by-row in column-order,
@@ -4251,8 +4247,7 @@ fn rewrite_messages_for_vision_placeholders(messages: &[ChatMessage]) -> Vec<Cha
 ///     existing Gemma path).
 ///   - `VisionFamily::Qwen3Vl` →
 ///     `<|vision_start|><|image_pad|><|vision_end|>` triplet (matches
-///     peer at `/opt/llama.cpp/tools/mtmd/mtmd.cpp:317-321` for
-///     `PROJECTOR_TYPE_QWEN3VL`).  The inner `<|image_pad|>` is the
+///     the peer for its QWEN3VL projector type).  The inner `<|image_pad|>` is the
 ///     soft-token expansion target (one tokenized id → N copies);
 ///     `<|vision_start|>` and `<|vision_end|>` remain as single tokens.
 ///   - `VisionFamily::Unknown` → no rewrite (the `process_multimodal_content`
@@ -4471,7 +4466,7 @@ fn compile_response_format(
         ResponseFormat::Text => return Ok(None),
         ResponseFormat::JsonObject => {
             // Unconstrained JSON object grammar — same shape as
-            // llama.cpp's built-in json_object.gbnf.
+            // the peer's built-in json_object.gbnf.
             static JSON_OBJECT_GRAMMAR: &str = r#"root   ::= object
 value  ::= object | array | string | number | ("true" | "false" | "null") ws
 object ::=
@@ -4554,9 +4549,8 @@ ws ::= | " " | "\n" [ \t]{0,20}
 /// a structured JSON response, never both. The tool grammar is the more
 /// specific constraint.
 ///
-/// Mirrors llama.cpp's `enum common_grammar_type` selection at
-/// `/opt/llama.cpp/common/common.h:171-176` — `TOOL_CALLS` wins over
-/// `OUTPUT_FORMAT` wins over `NONE`.
+/// Mirrors the peer's grammar-type selection — tool-calls wins over
+/// output-format wins over none.
 fn select_effective_grammar(
     tool_grammar: Option<grammar::Grammar>,
     tool_grammar_kind: engine::GrammarKind,
@@ -4714,10 +4708,8 @@ fn defensive_no_call_under_constrained(
 /// it to arm `awaiting_trigger=true` for the lazy path.  See
 /// engine.rs:1496-1498 and engine.rs:2724-2726 for the arming sites.
 ///
-/// Mirrors llama.cpp `grammar_lazy = (tool_choice == AUTO)` /
-/// `grammar_lazy = false` for Required at common/chat.cpp:898-913,
-/// 1177-1200, 1399-1416, 1626-1628 and `grammar_triggers` registration
-/// for the per-model open marker.
+/// Mirrors the peer's lazy-for-Auto / eager-for-Required grammar
+/// selection and its per-model open-marker trigger registration.
 #[cfg(test)]
 fn compile_tool_grammar(
     req: &super::schema::ChatCompletionRequest,
@@ -4867,17 +4859,17 @@ fn compile_tool_grammar_with_registration(
         // Required: alternation across ALL declared tools.
         // Auto    : same — under Auto the model picks which tool (or none)
         //           to call, but if it emits the open marker the body must
-        //           match SOME declared tool.  Mirrors llama.cpp's Auto
-        //           grammar shape (common/chat.cpp:898-913 — same per-model
-        //           call alternation as Required, just `lazy=true`).
+        //           match SOME declared tool.  Mirrors the peer's Auto
+        //           grammar shape (same per-model call alternation as
+        //           Required, just lazy).
         ToolChoiceValue::Required | ToolChoiceValue::Auto => tools.iter().collect(),
         _ => unreachable!("None gated above"),
     };
 
-    // iter-218 fix: default `parallel_tool_calls` to FALSE (matches
-    // llama.cpp `/opt/llama.cpp/docs/function-calling.md:24`: "Multiple/
-    // parallel tool calling is supported on some models but **disabled by
-    // default**, enable it by passing `\"parallel_tool_calls\": true`".)
+    // iter-218 fix: default `parallel_tool_calls` to FALSE (matches the
+    // peer: "Multiple/parallel tool calling is supported on some models
+    // but **disabled by default**, enable it by passing
+    // `\"parallel_tool_calls\": true`".)
     //
     // Pre-iter-218 default `unwrap_or(true)` mis-cited "OpenAI default"
     // but coupled to the wave-2.6 lazy grammar lifecycle bug (engine.rs
@@ -4891,7 +4883,7 @@ fn compile_tool_grammar_with_registration(
     // to `parallel=true` is structurally noisier: every well-trained
     // single-tool request would otherwise compile to a `(call)+` shape
     // that the model has no compelling reason to terminate after a single
-    // call. Matching llama.cpp's default is principled and conservative;
+    // call. Matching the peer's default is principled and conservative;
     // operators wanting parallel calls opt in explicitly via
     // `parallel_tool_calls: true` in the request body.
     let parallel = effective_parallel_tool_calls(req.parallel_tool_calls);
@@ -5228,8 +5220,7 @@ mod compile_tool_grammar_precondition_tests {
     /// (under a stale "OpenAI default" comment), which combined with the
     /// wave-2.6 lazy-grammar-no-release lifecycle bug caused
     /// `openwebui_tools_streaming_scenario_2` to loop tool calls until
-    /// max_tokens. Matching llama.cpp's documented default
-    /// (`/opt/llama.cpp/docs/function-calling.md:24`).
+    /// max_tokens. Matching the peer's documented default.
     ///
     /// We probe via the emitted GBNF: with `parallel=false` the Gemma 4
     /// emitter for `OneOrMoreCallsBodyOnly` produces a single-call shape
@@ -6405,8 +6396,7 @@ mod compile_tool_grammar_precondition_tests {
 ///   string for Gemma 4, `"\n"` for Qwen 3.5/3.6 — see chat-template citations
 ///   in `registry::GrammarShape::OneOrMoreCalls`).  When `separator_literal`
 ///   is empty the GBNF reduces to `root ::= alt alt*` — the standard
-///   `alt+` idiom that mirrors llama.cpp's `p.repeat(call, 1, -1)` at
-///   common/chat.cpp:898-902.
+///   `alt+` idiom.
 fn combine_function_grammars(
     gbnfs: Vec<String>,
     parallel: bool,
@@ -7103,9 +7093,7 @@ mod combine_function_grammars_tests {
 //
 // These exercise the SamplingParams.grammar_kind threading that fixes the
 // wave-2.5 audit divergence "A1 / response_format regression" (severity
-// HIGH).  See cfa-20260427-adr005-wave2.6 research-report.md Q1, citing
-// llama.cpp /opt/llama.cpp/common/common.h:171-176 (`enum
-// common_grammar_type { NONE, USER, OUTPUT_FORMAT, TOOL_CALLS }`).
+// HIGH).  See cfa-20260427-adr005-wave2.6 research-report.md Q1.
 //
 // The selection logic under test lives in `prepare_chat_generation_core`
 // at the `(tool_grammar, response_grammar)` match block.  These tests
@@ -7147,7 +7135,7 @@ mod grammar_kind_selection_tests {
     /// on a tool open marker that never fires for non-tool requests).
     /// Wave 2.7 W-η Q-A flipped the tool-grammar branch from `ToolCallBody`
     /// (always lazy) to `ToolCallBodyRequired` (eager): `compile_tool_grammar`
-    /// only fires for Required/Function, and llama.cpp's `grammar_lazy=false`
+    /// only fires for Required/Function, and eager (non-lazy) enforcement
     /// for those modes is what makes the model structurally unable to skip
     /// the tool call.
     #[test]
@@ -7173,7 +7161,7 @@ mod grammar_kind_selection_tests {
             GrammarKind::ToolCallBodyRequired,
             "tool_choice=required/function MUST yield GrammarKind::ToolCallBodyRequired \
              so the runtime is EAGER from token 0 — the grammar root already \
-             wraps the body in open/close markers, mirroring llama.cpp \
+             wraps the body in open/close markers, mirroring the peer \
              grammar_lazy=false at common/chat.cpp:898-913, 1177-1200."
         );
 
@@ -7390,7 +7378,7 @@ mod grammar_kind_selection_tests {
 
     /// Auto + tools[] non-empty + registered family: caller will pass
     /// `tool_grammar_kind_for(&Auto) == ToolCallBodyAuto` so the engine
-    /// arms `awaiting_trigger=true`.  Mirrors llama.cpp `grammar_lazy=true`.
+    /// arms `awaiting_trigger=true`.  Mirrors the peer's `grammar_lazy=true`.
     #[test]
     fn tool_grammar_kind_for_auto_is_lazy() {
         use super::super::schema::ToolChoiceValue;
@@ -7779,10 +7767,10 @@ pub async fn embeddings(
         let mut total_tokens: usize = 0;
 
         for (i, input) in inputs.into_iter().enumerate() {
-            // Tokenize via the llama.cpp-compatible WPM tokenizer.
+            // Tokenize via the peer-compatible WPM tokenizer.
             // `add_special_tokens=true` wraps the output in
             // `[CLS] ... [SEP]` — without that the embedding diverges
-            // from llama-embedding's reference output.
+            // from the peer's reference embedding output.
             let raw_ids: Vec<u32> = tokenizer.encode(input.as_str(), true);
             total_tokens += raw_ids.len();
 

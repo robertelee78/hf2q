@@ -178,7 +178,7 @@ pub(crate) fn read_tq_codebook_bits_env() -> u32 {
 ///
 /// Default-on landed 2026-05-17 per operator directive (see auto-memory
 /// `feedback_tq_default_directive.md` and the 2026-05-17 verification
-/// pass: sourdough_qwen35.sh PASS + tg200 ahead of llama.cpp).
+/// pass: sourdough_qwen35.sh PASS + tg200 ahead of the peer).
 pub fn parse_tq_active_mode(env: Option<&str>) -> bool {
     match env {
         None => true,
@@ -200,7 +200,7 @@ pub fn parse_tq_active_mode(env: Option<&str>) -> bool {
 ///
 /// **Default ON** — operator directive: "TQ is the default path, not an
 /// env-gated opt-in" (2026-04-23).  Verified 2026-05-17 on Qwen3.6 APEX
-/// Q5_K_M: sourdough_qwen35.sh PASS + decode tg200 ahead of llama.cpp
+/// Q5_K_M: sourdough_qwen35.sh PASS + decode tg200 ahead of the peer
 /// with TQ default-on.  Opt-out via `HF2Q_TQ_KV=0` (or `false` / `off`).
 pub fn is_tq_active_mode() -> bool {
     parse_tq_active_mode(std::env::var("HF2Q_TQ_KV").ok().as_deref())

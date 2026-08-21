@@ -6,7 +6,7 @@
 //! by (1) wiring the LM-side `image_token_residual_add` GPU dispatch
 //! at `Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack`,
 //! (2) extending the mmproj loader to accept fused `attn_qkv` tensors
-//! (canonical llama.cpp HF-converter output) via slice-view installation,
+//! (canonical peer HF-converter output) via slice-view installation,
 //! and (3) flipping `ProjectorType::Qwen3VlMerger.is_supported()` /
 //! `ArchProfile::Qwen3VlSiglip.is_supported()` to TRUE so
 //! `serve --mmproj <qwen3vl>` accepts the file at startup. The
@@ -24,8 +24,8 @@
 //! | 4c.2     | **THIS** — input validation, dispatch-site `num_position_embeddings`     |
 //! |          |   real-shape extraction, CPU helpers for dual-conv patch embedding +     |
 //! |          |   bilinear position-embedding resize + 2×2 block-merge reshape (the      |
-//! |          |   `qwen3vl.cpp:27-37` prelude reshape, NOT the spatial-merge=2           |
-//! |          |   reduction at qwen3vl.cpp:177 which is 4c.4 territory)                  |
+//! |          |   prelude reshape, NOT the spatial-merge=2                               |
+//! |          |   reduction which is 4c.4 territory)                                     |
 //! | 4c.3     | Per-block forward: LN → 2D-RoPE Q,K → attn → +residual → LN → GELU MLP   |
 //! |          |   → +residual; reuse `apply_layer_norm_gpu`, `apply_attention_gpu`;      |
 //! |          |   consumes mlx-native `RopeMultiMode::Vision = 24` (LANDED on           |
@@ -57,12 +57,8 @@
 //! identical). The LM splits at runtime via `ggml_view_2d` (offset
 //! `(il+1)*lm_hidden*sizeof(float)`, `nb[1]=lm_hidden*(1+N_deepstack)
 //! *sizeof(float)`) and adds chunk `(il+1)` to the post-FFN-residual at
-//! LM layer `il < N_deepstack`. See:
-//!
-//! - `/opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:1-193` (ViT graph)
-//! - `/opt/llama.cpp/src/models/qwen3vl.cpp:96-100` (LM split-and-add)
-//! - `/opt/llama.cpp/tools/mtmd/clip.cpp:3808-3809`
-//!   (`embed_dim_per_image_token = mm_1_b->ne[0] * (1 + n_deepstack_layers)`)
+//! LM layer `il < N_deepstack`. Per the peer:
+//! `embed_dim_per_image_token = lm_hidden * (1 + n_deepstack_layers)`.
 //!
 //! # Error handling philosophy
 //!
@@ -133,11 +129,9 @@ use super::vit_gpu::{
 ///
 /// # Why `num_position_embeddings` is a separate parameter to `from_mmproj`
 ///
-/// llama.cpp does NOT write `num_position_embeddings` as a metadata
-/// key (verified via `grep -rn "num_position_embeddings" clip.cpp
-/// clip-impl.h` — only the position embedding *tensor* itself
-/// (`v.position_embd.weight`) carries the dimension. Per
-/// `clip.cpp:272-289` (`clip_graph::resize_position_embeddings`),
+/// The peer does NOT write `num_position_embeddings` as a metadata
+/// key — only the position embedding *tensor* itself
+/// (`v.position_embd.weight`) carries the dimension. In the peer,
 /// the position-table count is ggml `pos_embd->ne[1]` and the
 /// per-side trained edge is `sqrt(ne[1])` (the table is square
 /// 2D, e.g. 48×48 for Qwen3-VL-2B at 768×768 / 16×16 → ne[1]=2304).
@@ -155,17 +149,10 @@ use super::vit_gpu::{
 ///
 /// So the dispatch site reads
 /// `mmproj_weights.position_embd_weight()?.shape()[0]` to get
-/// `num_position_embeddings`. The clip.cpp `ne[1]` reference is
-/// the C++/ggml side of the same axis. The 4c.1 doc-comment that
+/// `num_position_embeddings`. The peer's `ne[1]` is
+/// the ggml side of the same axis. The 4c.1 doc-comment that
 /// said `shape()[1]` confused ggml-axis with row-major-axis;
 /// 4c.2 closes that drift trap by passing the real value.
-///
-/// (Citation correction 2026-05-02: an earlier scaffold revision
-/// cited `clip.cpp:3849` and `ne[0]` — that line is actually
-/// `PROJECTOR_TYPE_LFM2A` returning the projection-dim of an
-/// unrelated audio model. Codex Phase-2b review caught it; the
-/// correct reference is `clip.cpp:272-289` with ggml `ne[1]` =
-/// hf2q `shape()[0]` after the mlx-native reverse.)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qwen3VlViTConfig {
     /// ViT encoder layer count (e.g. 24 for Qwen3-VL-2B). Sourced
@@ -188,14 +175,14 @@ pub struct Qwen3VlViTConfig {
     /// `Some(_)` — `from_mmproj` rejects loudly if `None`.
     pub spatial_merge_size: u32,
     /// LM hidden size that the projector targets — i.e., the
-    /// `mm_1_b->ne[0]` in llama.cpp. For Qwen3-VL-2B: 2048
+    /// peer's `mm.1` bias length. For Qwen3-VL-2B: 2048
     /// (matches LM `hidden_size`). `MmprojConfig.projection_dim`
     /// MUST be `Some(_)` — `from_mmproj` rejects loudly if `None`.
     pub out_hidden_size: u32,
     /// Trained-resolution position-table length (e.g. 2304 for
     /// Qwen3-VL-2B at 768×768 / 16×16 = 48² = 2304). Sourced from
     /// the LOADED `v.position_embd.weight` tensor's outer (count)
-    /// axis (per `clip.cpp:272-289` — the table is shaped
+    /// axis (the table is shaped
     /// `(n_embd, count)` in ggml convention; ggml `ne[1] = count`
     /// maps to hf2q row-major `shape()[0] = count` after
     /// mlx-native's reverse). 4c.2 derives this from
@@ -210,10 +197,10 @@ pub struct Qwen3VlViTConfig {
     /// loudly if `None`. May be empty (length 0) if a future
     /// Qwen3-VL variant ships without DeepStack heads, but the
     /// metadata key MUST be present (typed `Some(empty Vec)`)
-    /// because llama.cpp writes `Bool[block_count]` unconditionally
+    /// because the peer writes `Bool[block_count]` unconditionally
     /// for the qwen3vl_merger projector.
     pub deepstack_indexes: Vec<u32>,
-    /// LayerNorm epsilon (NORM_TYPE_NORMAL in llama.cpp's clip
+    /// LayerNorm epsilon (standard LayerNorm in the peer's clip
     /// graph; not RMS). Sourced from `MmprojConfig.layer_norm_eps`.
     pub eps: f32,
 }
@@ -338,7 +325,7 @@ impl Qwen3VlViTConfig {
 
     /// Augmented per-image-token feature dim =
     /// `out_hidden_size * (1 + deepstack_indexes.len())`. Matches
-    /// llama.cpp's `clip.cpp:3808-3809` formula. The LM-side hook
+    /// the peer's formula. The LM-side hook
     /// (sub-iter 4c.5) splits this into `(1 + N_deepstack)` chunks
     /// of `out_hidden_size` each.
     pub fn augmented_embed_dim(&self) -> u32 {
@@ -350,15 +337,14 @@ impl Qwen3VlViTConfig {
 // Wedge-4c.2 prelude helpers (CPU-side; testable in isolation)
 // ---------------------------------------------------------------------------
 //
-// These mirror the prelude block at
-// `/opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:16-58` (everything
+// These mirror the peer's qwen3vl ViT prelude (everything
 // before the per-block loop):
 //
-//   1. dual `ggml_conv_2d` (patch_embeddings_0 + patch_embeddings_1)
+//   1. dual conv-2d (patch_embeddings_0 + patch_embeddings_1)
 //   2. element-wise add of the two conv outputs
 //   3. permute + cont_4d + reshape_4d + permute + cont_3d   (2×2 block-merge)
 //   4. add `patch_bias` if present
-//   5. resize_position_embeddings (siglip2 naflex bilinear, clip.cpp:272-289)
+//   5. resize_position_embeddings (siglip2 naflex bilinear)
 //   6. apply same 2×2 block-merge reshape to the resized pos embed
 //   7. element-wise add of pos embed onto the patch sum
 //
@@ -367,7 +353,7 @@ impl Qwen3VlViTConfig {
 
 /// CPU dual-stem patch embedding for Qwen3-VL.
 ///
-/// Implements `qwen3vl.cpp:17 + 23-25` — two `ggml_conv_2d` calls
+/// Implements the peer's dual-stem prelude — two conv-2d passes
 /// over the same `pixel_values` with two distinct kernels
 /// `patch_embeddings_0` (`v.patch_embd.weight`) and
 /// `patch_embeddings_1` (`v.patch_embd.weight.1`), summed element-
@@ -378,7 +364,7 @@ impl Qwen3VlViTConfig {
 /// [`super::vit::patch_embed_forward`] twice (once with each weight
 /// matrix) and adding the outputs. We do that explicitly here so the
 /// dual-stem code path is its own unit-tested surface and so the
-/// `qwen3vl.cpp:16-58` prelude reads top-to-bottom in the source.
+/// prelude reads top-to-bottom in the source.
 ///
 /// # Output shape
 ///
@@ -398,8 +384,6 @@ impl Qwen3VlViTConfig {
 ///
 /// # Cross-references
 ///
-/// - `/opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:17, 23-25`
-/// - `/opt/llama.cpp/tools/mtmd/clip-impl.h:75` (`TN_PATCH_EMBD_1 = "v.patch_embd.weight.1"`)
 /// - `/opt/hf2q/src/models/vit/convert.rs:228-249` (HF 5-D `[out, in, T=2, H, W]`
 ///   patch_embed split into the two GGUF tensors; T=0 → `v.patch_embd.weight`,
 ///   T=1 → `v.patch_embd.weight.1`)
@@ -451,8 +435,8 @@ pub(crate) fn qwen3vl_dual_conv_patch_embed_cpu_hw(
 ) -> Result<Vec<f32>> {
     use super::vit::patch_embed_forward_hw;
 
-    // Stem 0: bias goes here (matches qwen3vl.cpp ordering — the bias
-    // add at line 41-43 comes AFTER the `inp = inp + inp_1` at line 25,
+    // Stem 0: bias goes here (matches the peer's ordering — its bias
+    // add comes AFTER the two stems are summed,
     // so adding it to either stem before the sum is functionally
     // equivalent to adding it to the sum at the end. We attach it to
     // stem 0 to keep `patch_embed_forward_hw`'s existing behavior intact
@@ -487,7 +471,7 @@ pub(crate) fn qwen3vl_dual_conv_patch_embed_cpu_hw(
         ));
     }
 
-    // Element-wise sum (qwen3vl.cpp:25 `inp = ggml_add(ctx0, inp, inp_1)`).
+    // Element-wise sum of the two stems.
     let mut summed = out_0;
     for (a, b) in summed.iter_mut().zip(out_1.iter()) {
         *a += *b;
@@ -495,13 +479,13 @@ pub(crate) fn qwen3vl_dual_conv_patch_embed_cpu_hw(
     Ok(summed)
 }
 
-/// CPU 2×2 block-merge reshape — the dual-conv prelude rearrange at
-/// `qwen3vl.cpp:27-37`.
+/// CPU 2×2 block-merge reshape — the peer's dual-conv prelude
+/// rearrange.
 ///
 /// **Caveat**: this is the 2×2 PRELUDE rearrange that lives between
 /// the dual conv (which produces `[ny, nx, n_embd]`) and the per-block
-/// loop. It is NOT the `spatial_merge_size=2` reduction at
-/// `qwen3vl.cpp:177` (that 4× token-count drop happens inside the
+/// loop. It is NOT the `spatial_merge_size=2`
+/// reduction (that 4× token-count drop happens inside the
 /// main projector and lands in 4c.4). The prelude rearrange preserves
 /// the total patch count but reorders patches into 2×2-block-major
 /// order so the main projector's later `reshape_3d(n_embd*4,
@@ -523,12 +507,12 @@ pub(crate) fn qwen3vl_dual_conv_patch_embed_cpu_hw(
 ///  output_p_index = block_id * 4 + within_block_offset
 /// ```
 ///
-/// Verified by tracing the ggml chain at `qwen3vl.cpp:27-37` in
+/// Verified by tracing the peer's ggml chain in
 /// column-major coordinates and converting back to hf2q row-major.
-/// See also the corresponding pos-embd chain at
-/// `qwen3vl.cpp:48-57` — which uses the same reshape sequence and
+/// The peer's corresponding pos-embd chain
+/// uses the same reshape sequence and
 /// MUST receive the same rearrange so both inputs to the
-/// `ggml_add` at line 58 land in matching block order.
+/// final add land in matching block order.
 ///
 /// # Errors
 ///
@@ -593,16 +577,16 @@ pub(crate) fn qwen3vl_2x2_block_merge_reshape(
 /// CPU bilinear resize of the trained position-embedding table to a
 /// target patch grid.
 ///
-/// Mirrors the no-op fast-path at `clip.cpp:281-283` (skip when
-/// `width == height == n_per_side`) and the resize chain at
-/// `clip.cpp:285-289` (reshape → permute → ggml_interpolate(BILINEAR)
+/// Mirrors the peer's no-op fast-path (skip when
+/// `width == height == n_per_side`) and its resize chain
+/// (reshape → permute → bilinear interpolate
 /// → permute → cont_2d). Pixel coordinate mapping follows the
 /// PyTorch `F.interpolate(mode='bilinear', align_corners=False)`
-/// convention with `pixel_offset = 0.5`, matching the ggml CPU
-/// implementation at `/opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:7637-7676`.
+/// convention with `pixel_offset = 0.5`, matching the peer's CPU
+/// interpolation.
 ///
-/// **Antialias flag**: clip.cpp's default mode is
-/// `BILINEAR | ANTIALIAS` (per `clip-graph.h:12`). Antialiasing only
+/// **Antialias flag**: the peer's default interpolation mode is
+/// `BILINEAR | ANTIALIAS`. Antialiasing only
 /// affects DOWNSAMPLING (when target < trained, it applies a
 /// Lanczos-style triangle prefilter). For Qwen3-VL the trained
 /// resolution is 768×768 / 16² = 48×48 = 2304; production inference
@@ -631,7 +615,7 @@ pub(crate) fn qwen3vl_2x2_block_merge_reshape(
 /// `Vec<f32>` of length `target_n_y * target_n_x * n_embd`, row-major
 /// `[target_n_y, target_n_x, n_embd]` (y-major then x-major). The
 /// caller MUST run the block-merge reshape on this output to match
-/// the patch embedding's post-prelude layout (qwen3vl.cpp:48-57).
+/// the patch embedding's post-prelude layout.
 ///
 /// # Errors
 ///
@@ -941,7 +925,7 @@ fn qwen3vl_stage_a_dispatch(
     encoder.memory_barrier();
 
     // A4 — K4 2×2 block-merge: [nps_y, nps_x, n_embd] -> [num_patches, n_embd]
-    // in 2×2-block-major order (matches qwen3vl.cpp:27-37).
+    // in 2×2-block-major order (matches the peer's prelude rearrange).
     let merged_buf = device
         .alloc_buffer(num_patches * h * 4, DType::F32, vec![num_patches, h])
         .map_err(|e| anyhow!("alloc merged: {e}"))?;
@@ -976,7 +960,7 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
              ({target_n_x}), target_n_y ({target_n_y}) must all be > 0"
         ));
     }
-    // Per clip.cpp:277 `n_per_side = sqrt(pos_embd->ne[1])` — the
+    // The peer derives `n_per_side = sqrt(pos_embd->ne[1])` — the
     // table MUST be square. Verify by checking `n_per_side² ==
     // num_position_embeddings` exactly (no FP slop).
     let trained_n = (num_position_embeddings as f64).sqrt() as u32;
@@ -999,7 +983,7 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
         ));
     }
 
-    // Fast path (clip.cpp:281-283): trained edge equals BOTH target
+    // Fast path (mirrors the peer's): trained edge equals BOTH target
     // edges (square trained × square target × matching size), pass
     // through unchanged. Byte-exact regardless of mode flags.
     if trained_n == target_n_x && trained_n == target_n_y {
@@ -1042,12 +1026,11 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
     let pixel_offset: f32 = 0.5;
 
     // iter-225 Codex Phase-2c (HIGH finding at vit_gpu_qwen3vl.rs:591):
-    // llama.cpp's `resize_position_embeddings` calls `ggml_interpolate`
-    // with `DEFAULT_INTERPOLATION_MODE = GGML_SCALE_MODE_BILINEAR |
-    // GGML_SCALE_FLAG_ANTIALIAS` (clip-graph.h:12). For Phase-2 variable-
+    // the peer's position-embedding resize interpolates with
+    // `BILINEAR | ANTIALIAS`. For Phase-2 variable-
     // aspect inputs that downsample on at least one axis (e.g. trained
     // 48×48 → target 36×64 for portrait 576×1024 input), the antialias
-    // branch is semantically active per ggml-cpu/ops.cpp:7578-7637.
+    // branch is semantically active.
     //
     // The antialias path uses a triangle filter with support = max(1,
     // 1/sf) and sums weighted contributions from ALL trained-table
@@ -1058,8 +1041,8 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
     // contributing window expands to cover multiple source pixels per
     // target pixel — the load-bearing semantic difference.
     //
-    // Direct Rust port of the C++ at /opt/llama.cpp/ggml/src/ggml-cpu/
-    // ops.cpp:7578-7637, axis-independent for rectangular targets.
+    // Must stay semantics-identical to the peer's antialiased
+    // interpolation, axis-independent for rectangular targets.
     let triangle_filter = |x: f32| -> f32 { (1.0 - x.abs()).max(0.0) };
     let support_x = (1.0 / sf_x).max(1.0);
     let invscale_x = 1.0 / support_x;
@@ -1115,43 +1098,43 @@ pub(crate) fn qwen3vl_resize_position_embeddings_bilinear(
 // ---------------------------------------------------------------------------
 //
 // These helpers are the GPU sibling to the CPU prelude above. Together
-// they implement the qwen3vl.cpp:60-168 per-block loop:
+// they implement the peer's per-block loop:
 //
 //   for il in 0..n_layer:
-//     ln1   = LayerNorm(input, ln1_w, ln1_b, eps)        // qwen3vl.cpp:83
-//     qkv   = Linear(ln1, attn_q/k/v.w) + attn_q/k/v.b   // qwen3vl.cpp:88-89
-//     q,k   = rope_multi(q, k, mode=Vision)              // qwen3vl.cpp:111-116
-//     attn  = bidir_attention(q, k, v, scale)            // qwen3vl.cpp:121-122
-//     attn  = Linear(attn, attn_out.w) + attn_out.b      // qwen3vl.cpp:121-122
-//     post  = input + attn                               // qwen3vl.cpp:127
-//     ln2   = LayerNorm(post, ln2_w, ln2_b, eps)         // qwen3vl.cpp:134
+//     ln1   = LayerNorm(input, ln1_w, ln1_b, eps)
+//     qkv   = Linear(ln1, attn_q/k/v.w) + attn_q/k/v.b
+//     q,k   = rope_multi(q, k, mode=Vision)
+//     attn  = bidir_attention(q, k, v, scale)
+//     attn  = Linear(attn, attn_out.w) + attn_out.b
+//     post  = input + attn
+//     ln2   = LayerNorm(post, ln2_w, ln2_b, eps)
 //     gate  = Linear(ln2, ffn_gate.w) + ffn_gate.b
 //     up    = Linear(ln2, ffn_up.w)   + ffn_up.b
-//     act   = gelu(gate) * up                            // FFN_GELU + gate => geglu_split
-//     down  = Linear(act, ffn_down.w) + ffn_down.b       // qwen3vl.cpp:138-142
-//     output = post + down                               // qwen3vl.cpp:147
+//     act   = gelu(gate) * up                            // gated GELU => geglu_split
+//     down  = Linear(act, ffn_down.w) + ffn_down.b
+//     output = post + down
 //
-// Final post-LN (qwen3vl.cpp:171-173) is applied OUTSIDE the per-block
+// Final post-LN is applied OUTSIDE the per-block
 // loop by the dispatch entry-point.
 //
 // Reused mlx-native primitives:
 //   - mlx_native::ops::rope_multi (RopeMultiMode::Vision = 24,
 //     /opt/mlx-native/src/ops/rope_multi.rs:102 — already LANDED in R3)
 //   - mlx_native::ops::gelu::dispatch_gelu (pytorch_tanh approximation,
-//     same kernel Gemma 4 ViT uses; matches FFN_GELU in clip.cpp:590-597)
+//     same kernel Gemma 4 ViT uses; matches the peer's GELU FFN)
 //   - mlx_native::ops::elementwise::elementwise_mul (geglu split)
 //
 // Reused hf2q ViT primitives (vit_gpu.rs, read-only — no edits per
 // 4c.3 fence):
 //   - vit_linear_gpu (matmul)
-//   - vit_attention_gpu (bidirectional softmax + scores @ V; qwen3vl.cpp's
-//     `build_attn` passes nullptr for kq_mask at line 122 → no causal
+//   - vit_attention_gpu (bidirectional softmax + scores @ V; the peer
+//     passes no attention mask here → no causal
 //     mask → vit_attention_gpu's same-shape mask-free path is correct).
 //   - vit_residual_add_gpu (elementwise residual)
 //
 // Reused hf2q BERT primitives (models/bert/bert_gpu.rs, read-only):
-//   - bert_layer_norm_gpu (LayerNorm with both gamma + beta; qwen3vl.cpp
-//     uses NORM_TYPE_NORMAL at line 12 = LayerNorm-with-bias, NOT
+//   - bert_layer_norm_gpu (LayerNorm with both gamma + beta; the peer
+//     uses LayerNorm-with-bias here, NOT
 //     RMSNorm — vit_rms_norm_gpu would silently drop the beta).
 //   - bert_bias_add_gpu (broadcast `+= bias[col]` over [rows, cols]).
 
@@ -1204,11 +1187,11 @@ fn upload_i32_to_gpu(device: &MlxDevice, data: &[i32], shape: Vec<usize>) -> Res
 ///   * positions[2*n_pos .. 3*n_pos)  → axis 2 (ignored in vision mode)
 ///   * positions[3*n_pos .. 4*n_pos)  → axis 3 (ignored in vision mode)
 ///
-/// llama.cpp's `clip.cpp:3286-3302` callback for the qwen3vl_merger
+/// The peer's position callback for the qwen3vl_merger
 /// projector writes the SAME section-contiguous y/x/y/x layout this
 /// helper emits — per Codex Phase-2b review correction: the original
 /// header comment claimed "per-token interleaved [t,h,w,0]" was the
-/// llama.cpp shape and that we differ from it; that's wrong. llama.cpp
+/// peer's shape and that we differ from it; that's wrong. The peer
 /// allocates `n_pos*4` and writes section 0 = y, section 1 = x, then
 /// duplicates y/x into sections 2/3. Both implementations are
 /// section-contiguous; both rely on mlx-native vision mode reading
@@ -1303,26 +1286,22 @@ fn build_qwen3vl_2d_rope_positions(
 /// 2D-RoPE on a Q or K tensor using `RopeMultiMode::Vision`.
 ///
 /// Wraps `mlx_native::ops::rope_multi::dispatch_rope_multi_cached` for
-/// the qwen3vl.cpp:111-116 call. Per qwen3vl.cpp:14, the per-section
+/// the peer's vision-rope call. The per-section
 /// counts are `[d_head/4; 4]` — only the first two are consumed by
 /// vision-mode (s0=y, s1=x); the last two are required to be present
-/// for binary-layout uniformity with Mrope/Imrope but are ignored
-/// (ggml.h:1843-1846).
+/// for binary-layout uniformity with Mrope/Imrope but are ignored.
 ///
 /// `qkv_buf` is the matmul output `[n_pos, n_heads * head_dim]` row-major
 /// f32; the kernel re-interprets that as `[seq_len=n_pos, n_heads,
 /// head_dim]` via element-count alone. Output is a NEW buffer of the
 /// same shape (rope_multi never mutates input).
 ///
-/// # Citations
+/// # Peer contract
 ///
-/// - `/opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:111-116`
-///   (`ggml_rope_multi(... GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1, 32, 1)`)
-/// - `/opt/llama.cpp/ggml/include/ggml.h:253` (`GGML_ROPE_TYPE_VISION = 24`)
-/// - `/opt/llama.cpp/ggml/include/ggml.h:1840-1846` (per-section
-///   `[yyyyxxxx]` layout — only first two sections used for vision).
-/// - `/opt/llama.cpp/tools/mtmd/clip.cpp:3280-3309` (qwen3vl
-///   `set_input_pos` writes `[t=0, h, w, 0]` per token).
+/// The peer's qwen3vl ViT applies vision-mode rope (rope type 24,
+/// `freq_base = 10000`) with per-section `[yyyyxxxx]` layout — only
+/// the first two sections are used for vision — and per-token
+/// `[t=0, h, w, 0]` positions.
 fn vit_qwen3vl_2d_rope_gpu(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -1341,7 +1320,7 @@ fn vit_qwen3vl_2d_rope_gpu(
         ));
     }
     if head_dim % 4 != 0 {
-        // Per qwen3vl.cpp:14 sections = [d_head/4; 4]. For vision-mode
+        // The peer's sections are [d_head/4; 4]. For vision-mode
         // sections[0]+sections[1] = d_head/2 = head_dim/2. d_head/4
         // is the per-section count; if head_dim isn't a multiple of 4
         // the section counts wouldn't be integers.
@@ -1363,17 +1342,15 @@ fn vit_qwen3vl_2d_rope_gpu(
 
     let params = RopeMultiParams {
         head_dim,
-        // Per qwen3vl.cpp:113 `ggml_rope_multi(... d_head/2, ...)`. The
-        // ggml `n_dims` argument there is the count of pairs to rotate
-        // (d_head/2). That maps to mlx-native's `rope_dim` (the count
+        // The peer passes n_dims = d_head/2 — the count of pairs to
+        // rotate. That maps to mlx-native's `rope_dim` (the count
         // of dims fully covered by the rotation pairs) = head_dim,
         // because vision-rope rotates ALL pairs (no partial-rotary
-        // tail per ggml-cpu/ops.cpp:5860,5866 → see
-        // mlx-native/src/ops/rope_multi.rs:88-93).
+        // tail; see mlx-native/src/ops/rope_multi.rs:88-93).
         rope_dim: head_dim,
         n_heads,
         seq_len: n_pos,
-        // Per qwen3vl.cpp:113 `freq_base = 10000`.
+        // The peer uses `freq_base = 10000`.
         freq_base,
         mode: RopeMultiMode::Vision,
         sections: [
@@ -1392,19 +1369,14 @@ fn vit_qwen3vl_2d_rope_gpu(
 ///
 /// Wraps `mlx_native::ops::gelu::dispatch_gelu` for f32 buffers.
 /// Allocates a fresh f32 output buffer matching the input's shape.
-/// This is the activation used by FFN_GELU at clip.cpp:590-597 (which
-/// for `gate != nullptr` becomes `geglu_split = gelu(gate) * up`,
+/// This is the activation the peer's GELU FFN branch uses (with a
+/// gate present it becomes `gelu(gate) * up`,
 /// computed across two calls — `dispatch_gelu` here, `elementwise_mul`
-/// in the caller).
+/// in the caller). The peer's Qwen3VL converter flags the vision FFN
+/// as GELU.
 ///
-/// # Citation
-///
-/// - `/opt/llama.cpp/tools/mtmd/clip.cpp:590-597` (FFN_GELU branch)
-/// - `/opt/llama.cpp/convert_hf_to_gguf.py:4884` (Qwen3VL emits
-///   `add_vision_use_gelu(True)` → ffn_op = FFN_GELU per
-///   clip.cpp:1144-1153)
-/// - `/opt/mlx-native/src/ops/gelu.rs:5` (kernel: `0.5 * x *
-///   (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`)
+/// Kernel (`/opt/mlx-native/src/ops/gelu.rs:5`): `0.5 * x *
+/// (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
 fn vit_qwen3vl_gelu_gpu(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -1429,8 +1401,8 @@ fn vit_qwen3vl_gelu_gpu(
 
 /// GPU GEGLU split: `out = GELU(gate) * up`.
 ///
-/// Mirrors `ggml_geglu_split(cur=gate, tmp=up)` at clip.cpp:592 for the
-/// FFN_GELU branch when `gate != nullptr`. Equivalent to chaining
+/// Mirrors the peer's geglu-split for the
+/// gated GELU FFN branch. Equivalent to chaining
 /// `dispatch_gelu(gate)` then `elementwise_mul(_, up)`. Allocates two
 /// fresh f32 buffers (gelu output, mul output); the first is freed
 /// when this function returns.
@@ -1472,7 +1444,7 @@ fn vit_qwen3vl_geglu_split_gpu(
 
 /// One Qwen3-VL ViT transformer block on the GPU.
 ///
-/// Mirrors `qwen3vl.cpp:77-168` per-block chain:
+/// Mirrors the peer's per-block chain:
 ///   1.  ln1   = LayerNorm(input, ln1.w, ln1.b, eps)
 ///   2a. q     = Linear(ln1, attn_q.w) + attn_q.b
 ///   2b. k     = Linear(ln1, attn_k.w) + attn_k.b
@@ -1494,7 +1466,7 @@ fn vit_qwen3vl_geglu_split_gpu(
 /// `positions` is the pre-built I32 `[4 * n_pos]` rope positions
 /// tensor (built once per forward via
 /// `build_qwen3vl_2d_rope_positions`). `scale` is the attention
-/// kq_scale `1/sqrt(head_dim)` — qwen3vl.cpp:122 passes it explicitly.
+/// kq_scale `1/sqrt(head_dim)` — the peer passes it explicitly.
 ///
 /// Caller registers the BERT and ViT shader bundles + the mlx-native
 /// softmax/sigmoid_mul/rope_multi/gelu shaders before dispatch.
@@ -1535,7 +1507,7 @@ fn apply_qwen3vl_block_forward_gpu(
     // -----------------------------------------------------------------
     // Stage 1: LayerNorm(input, ln1.w, ln1.b, eps).
     // -----------------------------------------------------------------
-    // Per qwen3vl.cpp:12 `norm_t = NORM_TYPE_NORMAL` → LayerNorm with
+    // The peer's qwen3vl norm type is standard LayerNorm with
     // both gamma + beta. We delegate to bert_layer_norm_gpu (the only
     // hf2q LayerNorm-with-bias GPU primitive; vit_rms_norm_gpu would
     // silently drop the beta — see vit_gpu.rs:254 docstring).
@@ -1554,13 +1526,12 @@ fn apply_qwen3vl_block_forward_gpu(
     encoder.memory_barrier();
 
     // -----------------------------------------------------------------
-    // Stage 2: Q/K/V projection + bias add (qwen3vl.cpp:88-104).
+    // Stage 2: Q/K/V projection + bias add.
     // -----------------------------------------------------------------
-    // qwen3vl.cpp:88 uses a single fused `attn_qkv` weight + bias; our
+    // The peer uses a single fused `attn_qkv` weight + bias; our
     // mmproj validator at src/inference/vision/mmproj.rs accepts EITHER
-    // the fused `attn_qkv.{weight,bias}` (canonical llama.cpp HF
-    // converter output per /opt/llama.cpp/convert_hf_to_gguf.py:4853-4972
-    // → V_ENC_ATTN_QKV per gguf-py/gguf/constants.py:1205) OR the split
+    // the fused `attn_qkv.{weight,bias}` (canonical peer HF
+    // converter output) OR the split
     // `attn_q/k/v.{weight,bias}` (legacy hf2q convert-side form). The
     // 4c.3 consumer path below requests SPLIT names via `block_tensor`
     // — the loader at `LoadedMmprojWeights::install_fused_attn_qkv_slice_views`
@@ -1641,7 +1612,7 @@ fn apply_qwen3vl_block_forward_gpu(
     encoder.memory_barrier();
 
     // -----------------------------------------------------------------
-    // Stage 3: 2D-RoPE on Q and K (qwen3vl.cpp:111-116).
+    // Stage 3: 2D-RoPE on Q and K.
     // -----------------------------------------------------------------
     let q_rot = vit_qwen3vl_2d_rope_gpu(
         encoder, registry, device, &q, positions, n_pos, n_heads, head_dim, freq_base,
@@ -1655,9 +1626,9 @@ fn apply_qwen3vl_block_forward_gpu(
     encoder.memory_barrier();
 
     // -----------------------------------------------------------------
-    // Stage 4: bidirectional attention (qwen3vl.cpp:121-122).
+    // Stage 4: bidirectional attention.
     // -----------------------------------------------------------------
-    // qwen3vl.cpp passes nullptr for kq_mask (no causal mask); CLIP
+    // The peer passes no attention mask (no causal mask); CLIP
     // vision is bidirectional. `vit_attention_gpu` does not accept a
     // mask argument — its softmax pass at vit_gpu.rs:699-700 covers
     // all batch×batch entries, so it IS bidirectional by construction.
@@ -1700,7 +1671,7 @@ fn apply_qwen3vl_block_forward_gpu(
     encoder.memory_barrier();
 
     // -----------------------------------------------------------------
-    // Stage 6: residual add (qwen3vl.cpp:127).
+    // Stage 6: residual add.
     // -----------------------------------------------------------------
     let post_attn = vit_residual_add_gpu(
         encoder,
@@ -1714,7 +1685,7 @@ fn apply_qwen3vl_block_forward_gpu(
     encoder.memory_barrier();
 
     // -----------------------------------------------------------------
-    // Stage 7: LayerNorm(post_attn, ln2.w, ln2.b, eps) (qwen3vl.cpp:134).
+    // Stage 7: LayerNorm(post_attn, ln2.w, ln2.b, eps).
     // -----------------------------------------------------------------
     let ln2 = bert_layer_norm_gpu(
         encoder,
@@ -1731,12 +1702,10 @@ fn apply_qwen3vl_block_forward_gpu(
     encoder.memory_barrier();
 
     // -----------------------------------------------------------------
-    // Stage 8: FFN (qwen3vl.cpp:138-142).
+    // Stage 8: FFN.
     //
-    // The peer at `/opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:138-142`
-    // calls `build_ffn(cur, ff_up, ff_up_b, ff_gate, ff_gate_b,
-    // ff_down, ff_down_b, FFN_GELU, il)`. `clip.cpp::build_ffn` at
-    // line 549-635 dispatches:
+    // The peer's qwen3vl ViT builds a GELU FFN whose dispatch is
+    // presence-conditional on the gate weight:
     //
     //   IF gate weight is non-null:
     //     up_out   = (up @ cur) + up_b           // up branch
@@ -1756,7 +1725,7 @@ fn apply_qwen3vl_block_forward_gpu(
     //   - Larger variants ship a 3-tensor GEGLU layout with a gate
     //     tensor.
     //
-    // We mirror `build_ffn`'s presence-conditional dispatch so both
+    // We follow the same presence-conditional dispatch so both
     // layouts work without per-variant config branching: peek for
     // `ffn_gate.weight`; if present, do GEGLU; if absent, do plain
     // GELU. The synth weight builder
@@ -1828,7 +1797,8 @@ fn apply_qwen3vl_block_forward_gpu(
         act
     } else {
         // Plain-GELU branch — Qwen3-VL-2B and any other variant whose
-        // GGUF lacks `ffn_gate.weight` (mirrors clip.cpp:594-597).
+        // GGUF lacks `ffn_gate.weight` (mirrors the peer's gate-less
+        // GELU branch).
         let act = vit_qwen3vl_gelu_gpu(
             encoder,
             registry,
@@ -1866,7 +1836,7 @@ fn apply_qwen3vl_block_forward_gpu(
     encoder.memory_barrier();
 
     // -----------------------------------------------------------------
-    // Stage 9: residual add (qwen3vl.cpp:147).
+    // Stage 9: residual add.
     // -----------------------------------------------------------------
     let block_out = vit_residual_add_gpu(
         encoder,
@@ -1886,7 +1856,7 @@ fn apply_qwen3vl_block_forward_gpu(
 // ---------------------------------------------------------------------------
 //
 // These helpers are the GPU sibling to the post-block projector +
-// DeepStack-head chain at qwen3vl.cpp:150-187. Together with
+// The peer's DeepStack-head chain. Together with
 // `apply_qwen3vl_block_forward_gpu` above, they implement the full
 // Qwen3-VL ViT forward through to the LM-consumable augmented
 // embedding `[n_image_tokens, lm_hidden * (1 + N_deepstack)]`.
@@ -1897,7 +1867,7 @@ fn apply_qwen3vl_block_forward_gpu(
 //   - bert_layer_norm_gpu — used for the deepstack pre-norm
 //   - vit_qwen3vl_gelu_gpu (above) — FFN_GELU activation
 //
-// **Spatial 2x2 merger semantics** (qwen3vl.cpp:151, 177): the post-
+// **Spatial 2x2 merger semantics**: the post-
 // per-block buffer has shape `[n_pos, n_embd]` row-major (n_pos in
 // 2x2-block-major order from the prelude). The "merger" is a
 // `ggml_reshape_3d(... n_embd*4, n_pos/4, 1)` — i.e. ggml's column-
@@ -1910,7 +1880,7 @@ fn apply_qwen3vl_block_forward_gpu(
 // pure shape-view, NOT a kernel — we just dispatch the next
 // `vit_linear_gpu` with `seq_len = n_pos/4`, `in_features = n_embd*4`.
 //
-// **DeepStack head per qwen3vl.cpp:150-165** (when `is_deepstack_layers[il]`):
+// **DeepStack head, per the peer** (when `is_deepstack_layers[il]`):
 //   feat = reshape(cur, [n_embd*4, n_pos/4, 1])  // implicit, free
 //   feat = LayerNorm(feat, deepstack.{il}.norm.{w,b}, eps)
 //   feat = build_ffn(feat,
@@ -1918,11 +1888,11 @@ fn apply_qwen3vl_block_forward_gpu(
 //     nullptr, nullptr,                     // no gate ⇒ plain GELU not GEGLU
 //     deepstack.{il}.fc2.w, deepstack.{il}.fc2.b,
 //     FFN_GELU, il);
-// The `build_ffn` with `gate=nullptr` + FFN_GELU (clip.cpp:594-597)
+// The gate-less GELU FFN
 // reduces to: cur = up(cur) + up_b → GELU(cur) → down(cur) + down_b.
 // I.e. simple 2-layer MLP with GELU between.
 //
-// **Main projector per qwen3vl.cpp:175-187**:
+// **Main projector, per the peer**:
 //   embeddings = reshape(post_ln_output, [n_embd*4, n_pos/4, 1])
 //   embeddings = build_ffn(embeddings,
 //     mm_0_w, mm_0_b,
@@ -1932,40 +1902,33 @@ fn apply_qwen3vl_block_forward_gpu(
 //   if (deepstack_features) {
 //     embeddings = ggml_concat(ctx0, embeddings, deepstack_features, 0);
 //   }
-// Note clip.cpp:1844-1850 — Qwen3VL's `mm_1_w` is loaded from
-// `TN_LLAVA_PROJ` index 2 (the on-disk name is `mm.2.weight`/`bias`,
+// Note the peer loads Qwen3VL's `mm_1_w` from projector-name
+// index 2 (the on-disk name is `mm.2.weight`/`bias`,
 // matching hf2q's `mm_2_weight()` accessor).
 
 /// Apply one Qwen3-VL DeepStack head on a per-block-output buffer.
 ///
-/// Mirrors qwen3vl.cpp:150-165 for one flagged layer:
+/// Mirrors the peer's head chain for one flagged layer:
 ///   1. Implicit 2x2 merger reshape: `[n_pos, n_embd]` row-major →
 ///      `[n_pos/4, n_embd*4]` row-major (free — contiguous reinterpret).
 ///   2. LayerNorm with bias on innermost axis (n_embd*4):
 ///      `bert_layer_norm_gpu(_, deepstack_norm.w, deepstack_norm.b)`.
 ///   3. fc1 = Linear(_, deepstack.fc1.w) + deepstack.fc1.b
 ///      → `[n_pos/4, fc1_out]` (fc1 expansion dim is whatever
-///      `deepstack.fc1.weight.shape()[0]` says; per the converter
-///      docs at /opt/llama.cpp/convert_hf_to_gguf.py:4905-4932 the
-///      writer copies HF's `linear_fc1` shape unchanged).
-///   4. GELU (pytorch_tanh) — qwen3vl.cpp:594-597's `gate=nullptr`
-///      branch of FFN_GELU.
+///      `deepstack.fc1.weight.shape()[0]` says; the peer's
+///      converter copies HF's `linear_fc1` shape unchanged).
+///   4. GELU (pytorch_tanh) — the gate-less
+///      branch of the peer's GELU FFN.
 ///   5. fc2 = Linear(_, deepstack.fc2.w) + deepstack.fc2.b
 ///      → `[n_pos/4, lm_hidden]`.
 ///
 /// `block_out` is the per-block forward's output `[n_pos, n_embd]` —
 /// the SAME buffer that becomes input to the next block, captured at
-/// the deepstack-flagged block index. Per qwen3vl.cpp:150 the head
-/// taps `cur` AFTER the second residual add (i.e. at the end of the
-/// block, before `inpL = cur` for the next iter).
+/// the deepstack-flagged block index. Per the peer, the head
+/// taps the block output AFTER the second residual add (i.e. at the
+/// end of the block, before it becomes the next block's input).
 ///
 /// Returns a fresh f32 `[n_pos/4, lm_hidden]` row-major buffer.
-///
-/// # Citations
-///
-/// - `/opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:150-165` (head chain)
-/// - `/opt/llama.cpp/tools/mtmd/clip.cpp:594-597` (FFN_GELU gate=nullptr)
-/// - `/opt/llama.cpp/tools/mtmd/clip-impl.h:117-119` (TN_DEEPSTACK_*)
 #[allow(clippy::too_many_arguments)]
 fn apply_qwen3vl_deepstack_head_gpu(
     encoder: &mut CommandEncoder,
@@ -1995,8 +1958,8 @@ fn apply_qwen3vl_deepstack_head_gpu(
     let n_image_tokens = n_pos / merge_factor;
     let merged_hidden = cfg.n_embd * merge_factor; // n_embd * 4 for 2x2 merge
 
-    // DeepStack tensor-name resolver (per
-    // /opt/llama.cpp/tools/mtmd/clip-impl.h:117-119: TN_DEEPSTACK_*).
+    // DeepStack tensor-name resolver
+    // (`v.deepstack.{N}.{norm,fc1,fc2}.*` per the peer's naming).
     let il = deepstack_layer_idx;
     let ds_name = |suffix: &str| format!("v.deepstack.{il}.{suffix}");
 
@@ -2130,16 +2093,17 @@ fn apply_qwen3vl_deepstack_head_gpu(
 /// Apply the Qwen3-VL main `mm.0/mm.2` projector head on the post-LN
 /// output.
 ///
-/// Mirrors qwen3vl.cpp:175-184 — implicit 2x2 merger reshape (free) →
+/// Mirrors the peer's projector chain — implicit 2x2 merger reshape
+/// (free) →
 /// mm.0 → bias → GELU → mm.2 → bias. The chain is structurally
-/// identical to a DeepStack head's fc1/fc2 stage (both are FFN_GELU
-/// with `gate=nullptr`), differing only in (a) no pre-LN (the
-/// per-block post-LN at qwen3vl.cpp:171-173 is the projector's pre-
+/// identical to a DeepStack head's fc1/fc2 stage (both are gate-less
+/// GELU FFNs), differing only in (a) no pre-LN (the
+/// per-block post-LN is the projector's pre-
 /// step) and (b) tensor names.
 ///
-/// Note llama.cpp uses C++ variable names `mm_0_w` and `mm_1_w` for
-/// Qwen3VL but loads them from on-disk `TN_LLAVA_PROJ` indices 0 and
-/// 2 (per clip.cpp:1844-1850). The on-disk names — and hf2q's
+/// Note the peer uses C++ variable names `mm_0_w` and `mm_1_w` for
+/// Qwen3VL but loads them from on-disk projector-name indices 0 and
+/// 2. The on-disk names — and hf2q's
 /// accessors — are `mm.0.weight` and `mm.2.weight`.
 ///
 /// `post_ln_out` carries shape `[n_pos, n_embd]` row-major; the byte
@@ -2147,13 +2111,6 @@ fn apply_qwen3vl_deepstack_head_gpu(
 /// `merged_hidden = n_embd * spatial_merge²`.
 ///
 /// Returns a fresh f32 `[n_image_tokens, lm_hidden]` row-major buffer.
-///
-/// # Citations
-///
-/// - `/opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:175-184` (projector chain)
-/// - `/opt/llama.cpp/tools/mtmd/clip.cpp:594-597` (FFN_GELU gate=nullptr)
-/// - `/opt/llama.cpp/tools/mtmd/clip.cpp:1844-1850` (Qwen3VL mm_0/mm_1 load
-///   from TN_LLAVA_PROJ indices 0/2 = on-disk `mm.0`/`mm.2`)
 fn apply_qwen3vl_main_projector_gpu(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -2294,8 +2251,8 @@ fn apply_qwen3vl_main_projector_gpu(
 
 /// CPU-side feature-dim concat for the augmented embedding.
 ///
-/// Mirrors `ggml_concat(ctx0, embeddings, deepstack_features, 0)` at
-/// qwen3vl.cpp:186 — concatenate the base projector output (chunk 0)
+/// Mirrors the peer's feature-axis concat
+/// — concatenate the base projector output (chunk 0)
 /// with each DeepStack head output (chunks 1..N) along the innermost
 /// (feature) axis. In hf2q row-major terms, given inputs of shape
 /// `[n_image_tokens, lm_hidden]` each, build an output of shape
@@ -2303,8 +2260,8 @@ fn apply_qwen3vl_main_projector_gpu(
 /// `[base[t], ds_0[t], ds_1[t], ..., ds_{N-1}[t]]` consecutive in
 /// memory.
 ///
-/// This row-major layout is the EXACT contract the LM-side split
-/// at /opt/llama.cpp/src/models/qwen3vl.cpp:96-100 reads via
+/// This row-major layout is the EXACT contract the peer's LM-side
+/// split reads via
 /// `ggml_view_2d(... offset (il+1)*n_embd*sizeof(float))` — the
 /// view's `nb[1]` stride is the augmented row width
 /// (`(1+N)*n_embd*4 bytes`), and offset `(il+1)*n_embd*4 bytes`
@@ -2359,7 +2316,7 @@ fn qwen3vl_concat_augmented_embed_cpu(
 ///
 /// # Status (sub-iter 4c.4 LANDED)
 ///
-/// Implements the FULL clip-vision graph at qwen3vl.cpp:1-193:
+/// Implements the peer's FULL qwen3vl clip-vision graph:
 /// CPU prelude (dual conv2d patch embed + bilinear pos-embed resize +
 /// 2x2 block-merge add) → GPU upload → optional pre-LN → N_layer ×
 /// (LayerNorm → 2D-RoPE Q,K → bidir attn → +residual → LayerNorm →
@@ -2369,10 +2326,8 @@ fn qwen3vl_concat_augmented_embed_cpu(
 ///
 /// Returns the augmented `[n_image_tokens, out_hidden_size *
 /// (1 + N_deepstack)]` row-major buffer per image — exactly the
-/// shape sub-iter 4c.5's LM hook splits via
-/// /opt/llama.cpp/src/models/qwen3vl.cpp:96-100's
-/// `ggml_view_2d(... offset (il+1)*n_embd*sizeof(float))` per-LM-layer
-/// chunk read. Each row `t` carries
+/// shape sub-iter 4c.5's LM hook splits via the per-LM-layer
+/// chunk read at offset `(il+1)*n_embd*sizeof(float)`. Each row `t` carries
 /// `[base[t]; ds_0[t]; ds_1[t]; ...; ds_{N-1}[t]]` — base from the
 /// main projector, ds_i from the DeepStack head tap'd at flagged
 /// layer `cfg.deepstack_indexes[i]` (sorted ascending; i-th LM
@@ -2414,8 +2369,8 @@ fn qwen3vl_concat_augmented_embed_cpu(
 ///   `Gemma4v(_)` slipped past dispatch — would mean preprocessing
 ///   chose the wrong family branch)
 /// - per-image `(pixel_h, pixel_w)` not divisible by
-///   `cfg.patch_size * cfg.spatial_merge_size` (per qwen3vl.cpp:19-20
-///   `GGML_ASSERT(img.nx % (patch_size * 2) == 0)`; we additionally
+///   `cfg.patch_size * cfg.spatial_merge_size` (the peer asserts
+///   `img.nx % (patch_size * 2) == 0`; we additionally
 ///   enforce divisibility by the spatial-merge stride so the 4c.4 main
 ///   projector's `reshape_3d(n_embd*4, n_pos/4)` is exact)
 /// - `pixel_values.len() != 3 * pixel_h * pixel_w` (preprocessing
@@ -2477,9 +2432,9 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         ));
     }
     if pixel_w % stride != 0 || pixel_h % stride != 0 {
-        // Mirrors qwen3vl.cpp:19-20:
-        //   GGML_ASSERT(img.nx % (patch_size * 2) == 0);
-        //   GGML_ASSERT(img.ny % (patch_size * 2) == 0);
+        // Mirrors the peer's asserts:
+        //   img.nx % (patch_size * 2) == 0
+        //   img.ny % (patch_size * 2) == 0
         // We use cfg.spatial_merge_size (= 2 for Qwen3-VL) instead of the
         // hard-coded 2 so a future variant with merge_size != 2 still
         // gets the right check. Phase-2: validate per-image (W, H)
@@ -2512,12 +2467,12 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     }
 
     // -----------------------------------------------------------------
-    // 4c.4 — CPU prelude (qwen3vl.cpp:16-58) → GPU per-block forward
-    //         (qwen3vl.cpp:60-168 + DeepStack head tap at flagged
-    //          layers per qwen3vl.cpp:150-165) → final post-LN
-    //         (qwen3vl.cpp:171-173) → main `mm.0/mm.2` 2-layer GELU
-    //         projector (qwen3vl.cpp:175-184) → CPU-side feature-dim
-    //         concat (qwen3vl.cpp:186 — `ggml_concat(_, _, _, 0)`).
+    // 4c.4 — CPU prelude → GPU per-block forward
+    //         (per-block loop + DeepStack head tap at flagged
+    //          layers) → final post-LN
+    //         → main `mm.0/mm.2` 2-layer GELU
+    //         projector → CPU-side feature-dim
+    //         concat.
     //
     // Returns the augmented `[n_image_tokens, lm_hidden*(1+N_deepstack)]`
     // row-major buffer that 4c.5's LM hooks split per-LM-layer.
@@ -2549,11 +2504,10 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     let n_y_merged = n_y_pre;
 
     // -----------------------------------------------------------------
-    // Stage A — CPU prelude (qwen3vl.cpp:16-58).
+    // Stage A — CPU prelude.
     // -----------------------------------------------------------------
 
-    // A1. Dual conv2d patch embed → `[n_pos_pre, n_embd]` row-major
-    //     (qwen3vl.cpp:17 + 23-25).
+    // A1. Dual conv2d patch embed → `[n_pos_pre, n_embd]` row-major.
     let patch_embd_buf = mmproj_weights
         .patch_embd_weight()
         .map_err(|e| anyhow!("compute_vision_embeddings_gpu_qwen3vl: {e}"))?;
@@ -2637,22 +2591,21 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
 
     // B2. Build the I32 `[4 * n_pos]` positions tensor in
     //     block-merged order (matches the post-block-merge tensor
-    //     layout above). qwen3vl.cpp uses freq_base = 10000.
+    //     layout above). The peer uses freq_base = 10000.
     let positions = build_qwen3vl_2d_rope_positions(
         device, n_x_merged, n_y_merged,
         true, // block-merged order — patches are 2x2-block-major
     )
     .context("compute_vision_embeddings_gpu_qwen3vl: build rope positions")?;
 
-    // B3. Per-block forward chain. Attention scale matches qwen3vl.cpp
-    //     graph-builder convention (1/sqrt(head_dim) — see
-    //     /opt/llama.cpp/tools/mtmd/clip-graph.h kq_scale init).
+    // B3. Per-block forward chain. Attention scale matches the peer's
+    //     graph-builder convention (1/sqrt(head_dim)).
     let head_dim = (cfg.n_embd / cfg.n_head) as f32;
     let attn_scale = 1.0_f32 / head_dim.sqrt();
-    // freq_base is fixed at 10000 per qwen3vl.cpp:113.
+    // freq_base is fixed at 10000 per the peer.
     let freq_base = 10000.0_f32;
 
-    // Pre-LN at qwen3vl.cpp:68-70 — `model.pre_ln_w` is conditional;
+    // Pre-LN — the peer's `model.pre_ln_w` is conditional;
     // if the loaded mmproj has `v.pre_ln.weight` (+ bias), apply it
     // before the per-block loop. In every Qwen3-VL fixture observed
     // to date, this tensor is absent (unlike CLIP-classic which
@@ -2686,9 +2639,9 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     // DeepStack head outputs collected across the per-block loop, in
     // ascending block-index order (matches `cfg.deepstack_indexes`
     // which is sorted ascending — see Qwen3VlViTConfig::from_mmproj).
-    // Per /opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:150-165 the
+    // Per the peer, the
     // head is applied to `cur` (the post-FFN-residual block output)
-    // BEFORE that buffer becomes `inpL` for the next block — so we
+    // BEFORE that buffer becomes the next block's input — so we
     // tap the same MlxBuffer that's about to be threaded into the
     // next iteration.
     let mut deepstack_outputs: Vec<MlxBuffer> = Vec::with_capacity(cfg.deepstack_indexes.len());
@@ -2715,8 +2668,8 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         .with_context(|| format!("compute_vision_embeddings_gpu_qwen3vl: block {block_idx}"))?;
         block_session.encoder_mut().memory_barrier();
 
-        // DeepStack head tap (qwen3vl.cpp:150-165). The head is applied
-        // BEFORE `inpL = cur` propagates the buffer to the next block,
+        // DeepStack head tap. The head is applied
+        // BEFORE the buffer propagates to the next block,
         // BUT semantically the input to the head IS the post-residual
         // block output — i.e. the same `block_out` we'll use as next
         // block's input. MlxBuffer is Arc-shared, so we clone the
@@ -2761,8 +2714,8 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
         ));
     }
 
-    // B4. Final post-LN (qwen3vl.cpp:171-173). The `v.post_ln.{weight,
-    //     bias}` pair is required by the qwen3vl.cpp graph but
+    // B4. Final post-LN. The `v.post_ln.{weight,
+    //     bias}` pair is required by the peer's qwen3vl graph but
     //     conditional in the source; we reject loud if it's missing
     //     because every Qwen3-VL mmproj observed to date ships it
     //     and a missing post-LN would produce wrong-magnitude logits
@@ -2797,7 +2750,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     .context("compute_vision_embeddings_gpu_qwen3vl: post-LN")?;
     final_session.encoder_mut().memory_barrier();
 
-    // B5. Main `mm.0/mm.2` 2-layer GELU projector (qwen3vl.cpp:175-184)
+    // B5. Main `mm.0/mm.2` 2-layer GELU projector
     //     consumed the post-LN output via implicit 2x2-merger reshape
     //     `[n_pos, n_embd]` → `[n_image_tokens, n_embd*4]`.
     let main_out = apply_qwen3vl_main_projector_gpu(
@@ -2821,8 +2774,7 @@ pub fn compute_vision_embeddings_gpu_qwen3vl(
     // -----------------------------------------------------------------
     // Stage C — GPU feature-axis concat (ADR-021 iter-4b).
     //
-    // qwen3vl.cpp:186 `ggml_concat(ctx0, embeddings,
-    // deepstack_features, 0)` builds `[n_image_tokens,
+    // The peer's feature-axis concat builds `[n_image_tokens,
     // lm_hidden*(1+N_deepstack)]` row-major where each row carries
     // `[base[t]; ds_0[t]; ...; ds_{N-1}[t]]`. iter-4b runs the concat
     // on the GPU via K5 `feature_concat_f32` BEFORE session.finish(),
@@ -2973,8 +2925,8 @@ mod tests {
         assert_eq!(vit.num_position_embeddings, 2304);
         assert_eq!(vit.deepstack_indexes, vec![5, 11, 17]);
         assert!((vit.eps - 1e-6).abs() < 1e-12);
-        // Augmented embed dim = 2048 * (1 + 3) = 8192 (matches
-        // /opt/llama.cpp/tools/mtmd/clip.cpp:3808-3809 for Qwen3-VL-2B).
+        // Augmented embed dim = 2048 * (1 + 3) = 8192 (matches the
+        // peer's formula for Qwen3-VL-2B).
         assert_eq!(vit.augmented_embed_dim(), 8192);
         // n_image_tokens at 768×768 / (16*2)² = (768/32)² = 24² = 576.
         assert_eq!(vit.n_image_tokens(768).unwrap(), 576);
@@ -3171,7 +3123,7 @@ mod tests {
     /// expected output is byte-equal to the all-ones stem alone (via
     /// `patch_embed_forward`). This pins the contract that
     /// `qwen3vl_dual_conv_patch_embed_cpu` adds the two stems
-    /// element-wise (qwen3vl.cpp:25 `inp = ggml_add(ctx0, inp, inp_1)`).
+    /// element-wise, as the peer does.
     #[test]
     fn qwen3vl_dual_conv_patch_embedding_synthetic() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
@@ -3236,8 +3188,8 @@ mod tests {
     /// Test #2 — position-embedding fast-path (no resize when trained
     /// edge equals target edge).
     ///
-    /// Per clip.cpp:281-283, when `width == height == n_per_side` the
-    /// trained table is returned unchanged. Verified by setting up a
+    /// Per the peer's fast path, when `width == height == n_per_side`
+    /// the trained table is returned unchanged. Verified by setting up a
     /// 4×4 trained grid (16 entries) at hidden=8, calling the resize
     /// helper with `target_n_per_side = 4`, and asserting byte-exact
     /// pass-through.
@@ -3400,9 +3352,9 @@ mod tests {
             "Codex Phase-2c sabotage check: plain bilinear dst(0,0) ≈ 5.5; \
              antialias bilinear MUST diverge measurably (>= 0.05) on this \
              downsample fixture. Got dst(0,0) = {dst_00}; if this is ~5.5, \
-             the antialias semantic was reverted to plain bilinear. \
-             Reference: /opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:7578-7637 \
-             (BILINEAR | ANTIALIAS triangle-filter accumulation)."
+             the antialias semantic was reverted to plain bilinear \
+             (peer reference: BILINEAR | ANTIALIAS triangle-filter \
+             accumulation)."
         );
 
         // Symmetry pin: the source pattern is symmetric under
@@ -3774,7 +3726,7 @@ mod tests {
         // 4c.4 — main projector (`mm.0`, `mm.2`) and per-flagged-layer
         // DeepStack heads (`v.deepstack.{N}.{norm,fc1,fc2}`).
         //
-        // Shapes (matches qwen3vl.cpp:151-184 / clip.cpp:1844-1850):
+        // Shapes (matches the peer's projector + DeepStack loads):
         //   mm.0.weight = [intermediate, n_embd*4]   (fc1 expansion from merged input)
         //   mm.0.bias   = [intermediate]
         //   mm.2.weight = [out_hidden_size, intermediate]
@@ -4894,8 +4846,9 @@ mod tests {
             vit_cfg.deepstack_indexes.len(),
             out.len()
         );
-        // Pins the LM-side row stride contract (qwen3vl.cpp:97 reads
-        // chunks of `n_embd` floats at offset `(il+1)*n_embd*sizeof(f32)`
+        // Pins the LM-side row stride contract (the peer's LM split
+        // reads chunks of `n_embd` floats at offset
+        // `(il+1)*n_embd*sizeof(f32)`
         // with row stride `(1+N_deepstack)*n_embd*sizeof(f32)`).
         let row_stride = (1 + vit_cfg.deepstack_indexes.len()) * vit_cfg.out_hidden_size as usize;
         assert_eq!(
@@ -5142,8 +5095,8 @@ mod tests {
     /// Pin the implicit 2x2-merger reshape semantics: a `[n_pos,
     /// n_embd]` row-major buffer is reinterpreted as `[n_pos/4,
     /// n_embd*4]` row-major when consumed by `vit_linear_gpu`. This
-    /// is byte-identical to `ggml_reshape_3d(_, n_embd*4, n_pos/4, 1)`
-    /// at qwen3vl.cpp:151 and qwen3vl.cpp:177 — both rely on the
+    /// is byte-identical to the peer's `reshape_3d(_, n_embd*4,
+    /// n_pos/4, 1)` at both merger sites — both rely on the
     /// patches being in 2x2-block-major order from the prelude
     /// rearrange so that 4 consecutive patches per group produce the
     /// merged-feature row.
@@ -5582,12 +5535,12 @@ mod tests {
     // Wedge-4c.5's LM-side hooks will additionally cross-check tap-
     // source correctness: if a hf2q-side sabotage tapped block 0 when
     // the LM expected block 2's output, the LM's per-layer residual
-    // add would produce numerical divergence vs the llama.cpp reference
+    // add would produce numerical divergence vs the peer reference
     // in the parity tests Wedge-4c.5 will land.
 
     /// Test 4c.4-E — `qwen3vl_augmented_embed_shape_matches_lm_split_contract`.
     ///
-    /// Pin the EXACT shape contract for /opt/llama.cpp/src/models/qwen3vl.cpp:96-100:
+    /// Pin the EXACT shape contract for the peer's LM-side split:
     ///   `ggml_view_2d(_, n_embd, n_tokens, t_inp_embd->nb[1],
     ///                 (il + 1) * n_embd * sizeof(float))`
     /// The view's `nb[1]` stride is the row stride of `t_inp_embd`,
@@ -6512,7 +6465,7 @@ mod tests {
         //                         to iter-1a.
         //                         fnv1a64=0x7da7f3ad_353c585b
         //   iter-7  2026-05-07 — Real-Qwen3-VL-2B AC-3 surfaced that
-        //                         qwen3vl.cpp's `build_ffn` is
+        //                         the peer's FFN build is
         //                         tensor-presence-conditional: GEGLU
         //                         when the gate weight exists, plain
         //                         GELU when it doesn't. hf2q now

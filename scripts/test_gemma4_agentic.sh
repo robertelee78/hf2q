@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Four full-context Gemma slots process a matched ~24K-token resumed batch in
-# the same 13-14 second envelope as llama.cpp on the target M5 Max. Keep
+# the same 13-14 second envelope as the peer on the target M5 Max. Keep
 # single/cached-turn TTFT strict while giving that peer-bound batch a small
 # thermal/jitter margin.
 exec env \

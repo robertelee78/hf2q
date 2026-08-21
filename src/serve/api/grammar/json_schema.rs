@@ -1,7 +1,6 @@
 //! JSON Schema → GBNF translator.
 //!
-//! Ported (minimal viable subset) from llama.cpp's
-//! `/opt/llama.cpp/common/json-schema-to-grammar.cpp`. The subset covers the
+//! A minimal viable subset: it covers the
 //! common cases actually exercised by OpenAI `response_format: {type:
 //! "json_schema", json_schema: {schema: {...}}}` requests and by tool-call
 //! parameter schemas:
@@ -45,12 +44,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
-// Primitive rule library (ported verbatim from json-schema-to-grammar.cpp's
-// PRIMITIVE_RULES map).
+// Primitive rule library.
 // ---------------------------------------------------------------------------
 
 /// GBNF body for the `space` rule — 0+ whitespace characters. Kept identical
-/// to llama.cpp's `SPACE_RULE` so output grammars are byte-for-byte
+/// to the peer's `SPACE_RULE` so output grammars are byte-for-byte
 /// comparable.
 const SPACE_RULE: &str = r#"| " " | "\n"{1,2} [ \t]{0,20}"#;
 
@@ -98,13 +96,13 @@ fn primitive(name: &str) -> Option<(&'static str, &'static str, &'static [&'stat
     }
 }
 
-// The "object" primitive body above has a subtle issue in llama.cpp: the
-// braces { } are treated as literals in the body but that's not valid GBNF.
-// llama.cpp's version is:
+// The "object" primitive body above has a subtle issue: the braces { } are
+// treated as literals in the body but that's not valid GBNF. The peer's
+// version is:
 //   "\"{\" space ( string \":\" space value (\",\" space string \":\" space value)* )? \"}\" space"
 // Let me use the quoted-brace form.
 
-/// llama.cpp's actual primitives body uses quoted braces for object. This is
+/// The peer's actual primitives body uses quoted braces for object. This is
 /// the string-escape-correct version.
 fn primitive_exact(name: &str) -> Option<(&'static str, &'static str, &'static [&'static str])> {
     match name {
@@ -156,7 +154,7 @@ const _UNUSED_PRIMITIVE: fn(&str) -> Option<(&'static str, &'static str, &'stati
 // ---------------------------------------------------------------------------
 
 /// Escape a string so it can be embedded as a GBNF literal between double
-/// quotes. Mirrors llama.cpp's `format_literal` behavior.
+/// quotes.
 pub fn format_literal(literal: &str) -> String {
     let mut out = String::with_capacity(literal.len() + 2);
     out.push('"');
@@ -348,7 +346,7 @@ impl Converter {
                 }
             }
             // After an enum value we still emit `space` so trailing whitespace
-            // is accepted — matches llama.cpp's convention.
+            // is accepted — matches the peer's convention.
             self.rules
                 .entry("space".to_string())
                 .or_insert_with(|| SPACE_RULE.to_string());
@@ -551,7 +549,7 @@ impl Converter {
         // For N_req > threshold a hard SchemaError (→ HTTP 400) is returned.
         // A sequential-sorted fallback would silently change semantics from
         // "any-position" to "fixed-sorted" — a semantic downgrade prohibited by
-        // the no-shortcuts mantra.  Production engines (llama.cpp, llguidance,
+        // the no-shortcuts mantra.  Production engines (the peer, llguidance,
         // xgrammar, outlines-core) all enforce declaration order for the same
         // reason: Moshier & Rounds ACL 1987 prove CFG-for-permutations is
         // exponential; Barton 1985 proves ID/LP recognition is NP-complete.
@@ -1702,7 +1700,7 @@ mod tests {
     // Q3 — hard 400 at >8 required keys (Wave 2.6 W-β2)
     //
     // Research grounding: Moshier & Rounds ACL 1987 prove CFG-for-permutations
-    // of n required keys is exponential. All production engines (llama.cpp,
+    // of n required keys is exponential. All production engines (the peer,
     // llguidance, xgrammar, outlines-core) enforce declaration order at large N.
     // Sequential-sorted fallback is a semantic downgrade (Wave-2.5 mantra
     // violation). Replaced with hard SchemaError → HTTP 400.

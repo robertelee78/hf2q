@@ -1634,7 +1634,7 @@ mod g4_cfa5_redhatai_smoke {
             });
             let text = "The capital city of France is".to_string();
             // ADR-038 G4-CFA-5e: route through the shared adapter that mirrors
-            // llama.cpp's `common_tokenize` (auto-prepends BOS when GGUF declares
+            // the peer's tokenization (auto-prepends BOS when GGUF declares
             // add_bos_token=true). Without it, the bundled tokenizer.json's
             // legacy post_processor template silently drops BOS → 240017 "額"
             // saturation. See src/core/tokenizer_adapter.rs.

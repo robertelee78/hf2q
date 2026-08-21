@@ -286,7 +286,7 @@ pub struct ConvertCliArgs {
     pub source_revision: Option<String>,
 
     /// File-type to quantize to. Accepts:
-    ///   - Standard llama.cpp ftypes: `f32`, `f16`, `bf16`, `q4_0`,
+    ///   - Standard GGUF ftypes: `f32`, `f16`, `bf16`, `q4_0`,
     ///     `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q2_k`, `q3_k_s/m/l`,
     ///     `q4_k_s/m`, `q5_k_s/m`, `q6_k`, `iq4_nl`.
     ///   - Apex algorithmic tiers (MoE arches only): `apex-quality`,
@@ -392,9 +392,8 @@ pub struct ConvertCliArgs {
     pub imatrix_n_ctx: Option<u32>,
 
     /// Export the multimodal projector (mmproj) sidecar instead of
-    /// the text decoder. Mirrors canonical
-    /// `python3 convert_hf_to_gguf.py --mmproj` at
-    /// `/opt/llama.cpp/convert_hf_to_gguf.py:117-118`.
+    /// the text decoder. Mirrors the canonical converter's
+    /// `--mmproj` mode.
     ///
     /// When set, hf2q routes the input model through the per-arch
     /// mmproj mapper (currently Gemma 4 vision: SigLIP encoder +
@@ -753,10 +752,9 @@ pub struct GenerateArgs {
     /// AND answer). If the bytes are identical (or no template can be
     /// resolved), default is `false` (safe fallback).
     ///
-    /// Mirrors llama.cpp's `--reasoning auto` decision logic at
-    /// `/opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401` (the
-    /// `compare_thinking_enabled` function) and the user-facing decision
-    /// at `/opt/llama.cpp/tools/server/server-context.cpp:1050`.
+    /// Mirrors the peer's `--reasoning auto` decision logic (its
+    /// render-and-diff `compare_thinking_enabled` probe and the
+    /// server-side decision it feeds).
     ///
     /// Pass `--enable-thinking` to override auto-detect ON (e.g. a custom
     /// template that doesn't probe as thinking-capable but you know the
@@ -1075,9 +1073,9 @@ pub enum ParityCommand {
         max_tokens: Option<usize>,
 
         /// Compare against the frozen hf2q self-baseline (*_hf2q.txt)
-        /// instead of the llama.cpp reference (*_llama.txt). Encodes
+        /// instead of the peer reference (*_llama.txt). Encodes
         /// ADR-005 Closeout Amendment Gate D (hf2q-self bisect-safety
-        /// when math deliberately changes and temporary llama.cpp drift
+        /// when math deliberately changes and temporary peer drift
         /// is expected). Pass requires byte-identical match (not a
         /// min-prefix floor).
         #[arg(long)]

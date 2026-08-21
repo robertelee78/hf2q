@@ -2,7 +2,7 @@
 """Extract `tokenizer.chat_template` string from a GGUF file.
 
 2026-05-03 — built per user directive for the coherence harness. Walks the
-GGUF KV header in pure Python (no llama.cpp dep required) and writes the
+GGUF KV header in pure Python (no peer dep required) and writes the
 chat_template value to stdout."""
 import sys
 import struct

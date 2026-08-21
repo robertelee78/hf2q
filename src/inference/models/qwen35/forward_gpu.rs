@@ -466,7 +466,7 @@ enum FfnQuantArm {
 /// **iter45-RESUMED (2026-04-29) Q4_0 MoE arm rationale.**  iter47 surfaced
 /// that DWQ46 / DWQ48 fixtures store expert/projection blocks as Q4_0 —
 /// the previous catch-all `_ => 1` arm caused dwq46 to run at cn=1 (40
-/// layer CBs/decode token), measured 0.9439× vs llama on coherent baseline.
+/// layer CBs/decode token), measured 0.9439× vs the peer on coherent baseline.
 /// iter45-RESUMED 5-trial cold-process N-curve [1,2,4,8,20] × NGEN=256
 /// measured cn=2 wins at 1.0114× (+6.75pp vs cn=1) for dwq46 35B-MoE.
 /// Phase 5 gate PASS: ≥1pp gain on primary fixture, ≥0pp on apex / 27b /
@@ -977,7 +977,7 @@ fn encode_output_head_into_encoder(
     // qwen3.6-35B-A3B-dwq48 (Apple Silicon's Q4 matmul kernel is much
     // faster than BF16). Sampling-mode decode with default --temperature
     // 0.8 was 9.3 ms/step; greedy was 7.85 ms/step. Coherence: greedy
-    // already uses Q4 here and produces output byte-identical to llama.cpp
+    // already uses Q4 here and produces output byte-identical to the peer
     // at temp=0 — so Q4 logits are mathematically correct, not a precision
     // shortcut. Prefill last-row logit and full-prefill rows take the same
     // path here too (apply_output_head_gpu_last and apply_output_head_gpu),
@@ -2162,8 +2162,8 @@ impl Qwen35Model {
     ///      dispatches `image_token_residual_add_gpu` to add chunk `il`
     ///      at the image-token positions.
     ///
-    /// **Caller contract for the augmented-embed split** (see
-    /// `/opt/llama.cpp/src/models/qwen3vl.cpp:96-100`):
+    /// **Caller contract for the augmented-embed split** (per the
+    /// peer's qwen3vl LM graph):
     ///
     ///   * `soft_tokens[i].embeddings` carries the **base** chunk row
     ///     for each image token (i.e. the first `hidden` floats of each
@@ -2690,7 +2690,7 @@ impl Qwen35Model {
                 let mut registry = KernelRegistry::new();
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
                 // 2026-05-03 — register flash_attn_vec for decode-path SDPA.
-                // Closes long-context decode parity gap vs llama.cpp (tg1000:
+                // Closes long-context decode parity gap vs the peer (tg1000:
                 // 105 → ~117 t/s expected). Was previously dispatching
                 // sdpa_decode (single-threadgroup serial) for FA layers.
                 mlx_native::ops::flash_attn_vec::register(&mut registry);
@@ -3166,7 +3166,7 @@ impl Qwen35Model {
         // `ensure_gpu_cache_primed` AFTER `Qwen35Model::load_from_gguf` but
         // BEFORE `prefill_start = Instant::now()`, so the one-shot ~17 GB
         // upload no longer pollutes the prefill timer. Compute is unchanged;
-        // only the timer-span moves to expose llama.cpp-comparable
+        // only the timer-span moves to expose peer-comparable
         // `prompt eval time` semantics. Verified by 3-rep cold bench.
         self.ensure_gpu_cache_primed()?;
 
@@ -4226,7 +4226,7 @@ impl Qwen35Model {
             //   ffn_residual = hidden + attn_out          (write_sum=true path)
             //   ffn_input    = rms_norm(ffn_residual, w)  (normed_output)
             //
-            // Matches llama.cpp:
+            // Matches the peer:
             //   ffn_residual = cur;                // after attn residual, BEFORE norm
             //   attn_post_norm = build_norm(cur);  // norm for FFN input only
             //   cur = build_layer_ffn(attn_post_norm);
@@ -4841,7 +4841,7 @@ impl Qwen35Model {
             // ----------------------------------------------------------
             // Wedge-4c.5: Qwen3-VL DeepStack post-FFN-residual injection.
             //
-            // /opt/llama.cpp/src/models/qwen3vl.cpp:96-100 — at LM layer
+            // Per the peer's qwen3vl LM graph — at LM layer
             // `il < n_deepstack`, add the deepstack chunk for layer il
             // (a `[n_image_tokens, hidden]` F32 tensor) to `hidden` at
             // exactly the image-token positions; non-image positions
@@ -5323,7 +5323,7 @@ impl Qwen35Model {
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
                 // 2026-05-03 — register flash_attn_vec for decode-path SDPA.
                 // See forward_gpu.rs:1504 sister registration; closes
-                // long-context decode parity gap vs llama.cpp.
+                // long-context decode parity gap vs the peer.
                 mlx_native::ops::flash_attn_vec::register(&mut registry);
                 // Wedge-4c.5: register the LM-side image-token residual
                 // add shader (idempotent; gated by deepstack=Some).
@@ -7782,8 +7782,7 @@ mod tests {
     // ADR-005 Phase 4 Wedge-4c.5 (2026-05-02) — DeepStack hooks
     // ============================================================
     //
-    // The Qwen3-VL DeepStack contract per
-    // /opt/llama.cpp/src/models/qwen3vl.cpp:96-100:
+    // The Qwen3-VL DeepStack contract per the peer:
     //
     //   if (il < n_deepstack_layers) {
     //       cur += chunk_(il+1)   /* at image-token rows only */

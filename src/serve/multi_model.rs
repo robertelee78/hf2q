@@ -2670,8 +2670,8 @@ mod tests {
     // system unified memory").  The four tests below close the testing
     // *gap* the W-B1 audit surfaced — production behavior under memory
     // pressure WAS exercised at the pool-primitive level, but four
-    // manager-surface invariants the Wave-2 W-2 llama.cpp reference
-    // (server-models.cpp:498-549) calls out were not asserted through
+    // manager-surface invariants the Wave-2 W-2 peer reference
+    // calls out were not asserted through
     // `HotSwapManager`'s public API:
     //
     //   1. **Multi-evict-in-one-load** (`hotswap_chains_multiple_evictions_in_one_load`):
@@ -2700,8 +2700,8 @@ mod tests {
     //   4. **TOCTOU-safe under shared lock** (`hotswap_concurrent_load_or_get_serializes_under_mutex`):
     //      `HotSwapManager` itself is not internally synchronized
     //      (struct doc lines 676-681 + AppState line 202 wrap it in
-    //      `Arc<RwLock<...>>`).  llama.cpp's
-    //      `server_models.cpp::load` (lines 545-558) re-checks capacity
+    //      `Arc<RwLock<...>>`).  The peer's
+    //      server model-loader re-checks capacity
     //      under the load-lock to defeat the
     //      check-budget → release-lock → load → re-acquire window.
     //      Our wrapper holds a single std::sync RwLock write-guard for
@@ -2715,8 +2715,8 @@ mod tests {
     //      `total_resident_bytes <= memory_budget_bytes` holds at every
     //      observable point post-join (the budget invariant never tears).
     //
-    // Reference:  `/opt/llama.cpp/tools/server/server-models.cpp:498-549`
-    // (the canonical LRU+TOCTOU pattern; our equivalent is the
+    // Reference:  the peer's canonical LRU+TOCTOU pattern (our
+    // equivalent is the
     // single-lock-guard wrapping the entire `load_or_get` call).
     // ─────────────────────────────────────────────────────────────────────
 
@@ -2922,8 +2922,8 @@ mod tests {
     /// wrapper (mirrors `AppState::pool` at `src/serve/api/state.rs:202`,
     /// which uses `Arc<RwLock<...>>` — Mutex is conceptually the same
     /// for the write-only path `load_or_get` exercises) must NOT race
-    /// past the budget gate.  llama.cpp's reference at
-    /// `server-models.cpp:545-558` re-checks capacity under the load-lock
+    /// past the budget gate.  The peer's reference
+    /// re-checks capacity under the load-lock
     /// for the same reason; our defense is structural — a single lock
     /// guard wraps file-stat + loader invocation + pool insert.
     ///

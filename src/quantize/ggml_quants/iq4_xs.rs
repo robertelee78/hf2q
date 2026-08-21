@@ -1,7 +1,5 @@
-//! IQ4_XS quantizer — ADR-033 §Pi pure-Rust port of
-//! `quantize_row_iq4_nl_impl(super_block_size=QK_K=256, block_size=32, ...)`
-//! at `/opt/llama.cpp/ggml/src/ggml-quants.c:4794` (SHA pinned in
-//! `data/llama_cpp_pin.txt`).
+//! IQ4_XS quantizer — ADR-033 §Pi pure-Rust port of the peer's
+//! `quantize_row_iq4_nl_impl(super_block_size=QK_K=256, block_size=32, ...)`.
 //!
 //! IQ4_XS shares the inner kernel with [`super::iq4_nl`]; the only
 //! difference is multi-sub-block scale packing. Where IQ4_NL has one

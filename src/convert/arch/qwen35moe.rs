@@ -1,11 +1,9 @@
 //! Qwen-3.5 / Qwen-3.6 MoE-A3B HF→GGUF tensor-name + metadata mapper.
 //!
-//! Port of `/opt/llama.cpp/conversion/qwen.py::Qwen3MoeModel`
-//! (`@ModelBase.register("Qwen3MoeForCausalLM")`, `model_arch =
-//! gguf.MODEL_ARCH.QWEN3MOE`). Qwen3MoE inherits its tensor-mapping
-//! logic from `Qwen2MoeModel.modify_tensors` (no overrides except
-//! InternS1 vocab handling, which is out of v1 scope here), so this
-//! mapper transitively follows the Qwen2MoE expert-fusion contract.
+//! Canonical Qwen3MoE name mapping. Qwen3MoE shares Qwen2MoE's
+//! tensor mapping (no overrides except InternS1 vocab handling,
+//! which is out of v1 scope here), so this
+//! mapper follows the Qwen2MoE expert-fusion contract.
 //!
 //! Per ADR-033 §P0 "Per-arch convert-side mapping": this is the
 //! convert-side tensor-name + KV mapper for `LLM_ARCH_QWEN3MOE`. The
@@ -272,9 +270,8 @@ pub fn map_tensor_name(hf_name: &str) -> Option<MappedTensor> {
 }
 
 /// Build the GGUF metadata KV pairs for a Qwen3MoE model from its HF
-/// `config.json`. Port of `conversion/qwen.py::Qwen2MoeModel::set_gguf_parameters`
-/// (inherited by `Qwen3MoeModel`) + the `TextModel::set_gguf_parameters`
-/// base it `super()`s into (`/opt/llama.cpp/conversion/base.py:1111-1221`),
+/// `config.json`. Canonical Qwen3MoE metadata plus the common
+/// text-model base keys,
 /// restricted to the keys every Qwen3MoE production release carries.
 ///
 /// `general.architecture` = `"qwen3moe"`. Prefix is `qwen3moe.*`.
@@ -301,7 +298,7 @@ pub fn map_tensor_name(hf_name: &str) -> Option<MappedTensor> {
 ///     KV reads non-optional.
 ///   - `_name_or_path` — defaults to `"model"`.
 ///
-/// `file_type` is the chosen `LlamaFtype` as a `u32` (matches
+/// `file_type` is the chosen `GgufFtype` as a `u32` (matches
 /// `gguf_writer.add_file_type(self.ftype)` at base.py:1220).
 pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String, MetaValue)> {
     let name = config

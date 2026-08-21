@@ -625,9 +625,7 @@ mod tests {
     /// marker) stays at its original logit so the model is free to emit
     /// any text up to the trigger.
     ///
-    /// This is the apply-half of the dual-gate from
-    /// /opt/llama.cpp/src/llama-grammar.cpp:1339-1344
-    /// (`if (grammar.awaiting_trigger) return;`).  Together with
+    /// This is the apply-half of the dual-gate.  Together with
     /// `accept_bytes` self-gating (sampler.rs::runtime_accept_noops_when_awaiting_trigger),
     /// this proves the wave-2.5 audit divergence A1 cannot recur:
     /// there is no split-state window where mask says "off" but

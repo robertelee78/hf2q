@@ -11,8 +11,7 @@
 //!
 //! # Ground-truth peer reference
 //!
-//! `/opt/llama.cpp/src/models/qwen3vl.cpp:53-172` —
-//! `llama_model_qwen3vl::graph::graph(...)`. Per layer:
+//! The peer's qwen3vl text-LM graph. Per layer:
 //!
 //! ```text
 //! inpL → rms_norm(attn_norm)            → cur

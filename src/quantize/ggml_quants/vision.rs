@@ -44,8 +44,8 @@ pub fn is_vision_tensor_pattern(tensor_name: &str) -> bool {
         // trailing dot — e.g. Gemma's `model.embed_vision.weight`.
         // Adding here as the canonical source.
         || tensor_name.contains("embed_vision")
-        // GGUF-side vision namespace: per
-        // /opt/llama.cpp/tools/mtmd/clip-impl.h, vision encoder tensors
+        // GGUF-side vision namespace: per the peer's mmproj
+        // schema, vision encoder tensors
         // are written under the `v.` prefix (`v.blk.<N>.*`,
         // `v.patch_embd.weight`, `v.position_embd.weight`, `v.std_bias`,
         // `v.std_scale`, `v.post_ln.*`). The convert orchestrator uses

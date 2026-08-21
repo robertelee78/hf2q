@@ -60,7 +60,7 @@ la=$(wc -c <"$TA" | tr -d ' ')
 lb=$(wc -c <"$TB" | tr -d ' ')
 
 echo "=== extraction sizes ==="
-echo "  llama.cpp generation block: $la bytes"
+echo "  peer      generation block: $la bytes"
 echo "  hf2q     generation block: $lb bytes"
 echo
 
@@ -72,7 +72,7 @@ sed -E $'s/\\x1b\\[[0-9;]*[A-Za-z]//g' "$TB" > "$TB.clean" && mv "$TB.clean" "$T
 la2=$(wc -c <"$TA" | tr -d ' ')
 lb2=$(wc -c <"$TB" | tr -d ' ')
 echo "=== after ANSI strip ==="
-echo "  llama.cpp: $la2 bytes"
+echo "  peer     : $la2 bytes"
 echo "  hf2q     : $lb2 bytes"
 echo
 
@@ -86,9 +86,9 @@ if [[ -z "$divline" ]]; then
     long=$(( la2 > lb2 ? la2 : lb2 ))
     echo "PREFIX_MATCH: first $short bytes identical; one continues to $long"
     if [[ "$la2" -lt "$lb2" ]]; then
-      echo "  (hf2q is LONGER than llama.cpp — possibly still looping past llama.cpp's natural EOS)"
+      echo "  (hf2q is LONGER than the peer — possibly still looping past the peer's natural EOS)"
     else
-      echo "  (llama.cpp is LONGER than hf2q — hf2q stopped early)"
+      echo "  (the peer is LONGER than hf2q — hf2q stopped early)"
     fi
   fi
   echo "  (no divergent byte found in common prefix)"
@@ -123,7 +123,7 @@ echo
 ctx_a=$(dd if="$TA" bs=1 skip="$pos" count=8 2>/dev/null | xxd -p)
 ctx_b=$(dd if="$TB" bs=1 skip="$pos" count=8 2>/dev/null | xxd -p)
 echo "  8-byte hex window FROM divergence:"
-echo "    llama.cpp: $ctx_a"
+echo "    peer     : $ctx_a"
 echo "    hf2q     : $ctx_b"
 echo
 echo "  files preserved:"

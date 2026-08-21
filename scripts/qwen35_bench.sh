@@ -11,17 +11,17 @@ if (( BASH_VERSINFO[0] < 4 )); then
   exit 127
 fi
 # qwen35_bench.sh — ADR-013 Phase P13 match-or-beat benchmark gate for
-# Qwen3.5 / Qwen3.6 inference vs llama.cpp on the same GGUF.
+# Qwen3.5 / Qwen3.6 inference vs the peer on the same GGUF.
 #
 # Runs both hf2q's internal benchmark and llama-bench across a matrix of
 # prompt lengths (prefill) × decode lengths, reports side-by-side tok/s
-# tables, and asserts hf2q is within `DRIFT_BUDGET_PCT` of llama.cpp at
-# every data point (default: 5% — hf2q ≥ 0.95× llama.cpp).
+# tables, and asserts hf2q is within `DRIFT_BUDGET_PCT` of the peer at
+# every data point (default: 5% — hf2q ≥ 0.95× the peer).
 #
-# Baseline (2026-04-23, M5 Max, llama.cpp build b8914-8bc492ebb, apex.gguf):
+# Baseline (2026-04-23, M5 Max, peer build b8914-8bc492ebb, apex.gguf):
 #   prompt prefill: 364.8 tok/s
 #   decode:          97.3 tok/s
-# Per project_end_gate_reality_check.md: re-measure llama.cpp on the day
+# Per project_end_gate_reality_check.md: re-measure the peer on the day
 # of the gate run — historical numbers are starting hints, not ship gates.
 #
 # Usage:
@@ -32,7 +32,7 @@ fi
 # Exit codes:
 #   0  gate passed (hf2q within drift budget at every point)
 #   1  usage / env error
-#   2  gate failed (hf2q > drift budget slower than llama.cpp)
+#   2  gate failed (hf2q > drift budget slower than the peer)
 #   3  tool invocation failure
 
 set -euo pipefail
@@ -53,7 +53,7 @@ LOG_LLAMA="$OUT_DIR/llama.log"
 PP_LIST=(128 2455 16384)
 DECODE_LIST=(64 256 1024)
 
-# Hf2q must run at least this fraction of llama.cpp's tok/s at every point.
+# Hf2q must run at least this fraction of the peer's tok/s at every point.
 # 0.95 = allow 5% slower without failing the gate. Tighten as we optimize.
 DRIFT_BUDGET_PCT=5
 SKIP_LLAMA=0
@@ -62,7 +62,7 @@ usage() {
   cat <<EOF
 Usage: scripts/qwen35_bench.sh <gguf_path> [--drift-budget PCT] [--skip-llama]
   <gguf_path>          Qwen3.5 / Qwen3.6 GGUF (qwen35 or qwen35moe arch)
-  --drift-budget PCT   Max slowdown vs llama.cpp, in percent (default: 5)
+  --drift-budget PCT   Max slowdown vs the peer, in percent (default: 5)
   --skip-llama         Run only hf2q side (useful mid-development)
 
 Exit codes:
@@ -228,5 +228,5 @@ if [[ $FAIL_ANY -ne 0 ]]; then
   echo "Debug: profile with HF2Q_PROFILE_GPU_TS=1 to identify the bottleneck kernel."
   exit 2
 fi
-echo "PASS: hf2q within ${DRIFT_BUDGET_PCT}% of llama.cpp at every data point."
+echo "PASS: hf2q within ${DRIFT_BUDGET_PCT}% of the peer at every data point."
 exit 0

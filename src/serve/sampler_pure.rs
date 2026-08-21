@@ -110,7 +110,7 @@ pub fn sample_token(logits: &mut [f32], params: &SamplingParams, previous_tokens
     // Build sorted (index, LOGIT) pairs. The pair value is the LOGIT
     // throughout the chain — never a probability — so top-p, min-p, and
     // temperature each see the original logit space. This mirrors
-    // llama.cpp/src/llama-sampler.cpp where `llama_token_data` carries both
+    // the peer's sampler, where the token-data pair carries both
     // `.logit` and `.p` and only the dist sampler reads `.p`.
     // ------------------------------------------------------------------
     // Build the indexed-pair Vec in the thread-local scratch buffer.
@@ -194,7 +194,7 @@ pub fn sample_token_with_logprob(
 
 /// Sample a single token from a pre-extracted top-K (indices, values) pair.
 ///
-/// ADR-005 iter-25. Same llama.cpp-shape sampling chain as
+/// ADR-005 iter-25. Same peer-shape sampling chain as
 /// [`sample_token`] (top_p truncate → min_p truncate → temperature
 /// scale → softmax → multinomial sample), but starts from a small
 /// top-K subset rather than rebuilding `Vec<(usize, f32)>` over the
@@ -292,7 +292,7 @@ pub fn sample_token_from_topk_at_step(
     // Build (idx, logit) pairs from the top-K subset. K <= 128, so this
     // alloc is trivial — no thread-local scratch needed.
     //
-    // `sample_token_indexed` runs the full llama.cpp sampling chain on
+    // `sample_token_indexed` runs the full peer-parity sampling chain on
     // the supplied pairs:
     //   1. If `params.top_k > 0 && params.top_k < indexed.len()`:
     //      `select_nth_unstable_by` partition + sort the top_k subset.
@@ -332,7 +332,7 @@ fn sample_token_indexed(
     sample_index: usize,
 ) -> Option<u32> {
     // ------------------------------------------------------------------
-    // Top-k truncation on raw logits (llama-sampler.cpp:317).
+    // Top-k truncation on raw logits.
     //
     // 2026-05-03 — perf: previously this section did a full O(V log V)
     // descending sort of all ~248K vocab entries before truncating to
@@ -341,8 +341,8 @@ fn sample_token_indexed(
     // path (default --temperature=0.8 → ~74 tok/s vs greedy 122 tok/s
     // on qwen3.6-35B-A3B-dwq48). When `top_k > 0 && top_k < V`, use
     // `select_nth_unstable_by` (O(V) average partition) followed by an
-    // O(K log K) sort of the small top-k subset. Mirrors llama.cpp
-    // `llama_sampler_top_k_impl` which uses `std::nth_element` for the
+    // O(K log K) sort of the small top-k subset. Mirrors the peer's
+    // top-k sampler, which uses `std::nth_element` for the
     // same reason. The full-sort fallback only fires when top_k is
     // disabled or covers the whole vocab — in which case the downstream
     // top_p loop genuinely needs all logits sorted.
@@ -360,7 +360,7 @@ fn sample_token_indexed(
     }
 
     // ------------------------------------------------------------------
-    // Top-p (nucleus) truncation. Mirrors llama-sampler.cpp:1351 — softmax
+    // Top-p (nucleus) truncation. Mirrors the peer — softmax
     // the logits into a side prob buffer, cumsum until p threshold, truncate
     // the (idx, logit) array. The .logit pairs are NOT mutated.
     // ------------------------------------------------------------------
@@ -379,14 +379,14 @@ fn sample_token_indexed(
     }
 
     // ------------------------------------------------------------------
-    // Min-p truncation on raw logits (llama-sampler.cpp:1560). The logit
+    // Min-p truncation on raw logits. The logit
     // threshold equivalent of `p_i >= min_p * p_max` is
     // `logit_i >= max_logit + ln(min_p)`. No softmax needed.
     // ------------------------------------------------------------------
     if params.min_p > 0.0 && indexed.len() > 1 {
         let max_logit = indexed[0].1;
         let min_logit_threshold = max_logit + (params.min_p as f32).ln();
-        // Always keep at least the top token (llama.cpp min_keep semantics).
+        // Always keep at least the top token (the peer's min_keep semantics).
         let mut cutoff = 1;
         for (i, &(_, l)) in indexed.iter().enumerate().skip(1) {
             if l >= min_logit_threshold {
@@ -429,7 +429,7 @@ fn sample_token_indexed(
 
 /// Compute softmax probabilities from `(idx, logit)` pairs without mutating
 /// the pair values. Returns a parallel `Vec<f32>` of probabilities summing to
-/// ~1.0. Mirrors llama.cpp `llama_sampler_softmax_impl`.
+/// ~1.0. Mirrors the peer's softmax sampler.
 fn softmax_logits_to_probs(indexed: &[(usize, f32)]) -> Vec<f32> {
     if indexed.is_empty() {
         return Vec::new();

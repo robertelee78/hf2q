@@ -174,17 +174,15 @@ pub const DEFAULT_N_DEEPSTACK_LAYERS: usize = 3;
 
 /// IMROPE rotary mode index for Qwen3-VL **text-LM** RoPE-multi.
 ///
-/// Matches `GGML_ROPE_TYPE_IMROPE = 40` (`/opt/llama.cpp/ggml/include/ggml.h:254`)
-/// — the same mode Qwen3.5 / Qwen3.6 use. The peer dispatch
-/// (`/opt/llama.cpp/src/llama-model.cpp:2316-2320`) returns
-/// `LLAMA_ROPE_TYPE_IMROPE` for `LLM_ARCH_QWEN3VL`, and the text-LM
-/// graph (`/opt/llama.cpp/src/models/qwen3vl.cpp:95-108`) calls
-/// `ggml_rope_multi(..., rope_type, ...)` with that value.
+/// Matches `GGML_ROPE_TYPE_IMROPE = 40`
+/// — the same mode Qwen3.5 / Qwen3.6 use. The peer's rope-type dispatch
+/// returns `LLAMA_ROPE_TYPE_IMROPE` for `LLM_ARCH_QWEN3VL`, and its
+/// text-LM graph calls `ggml_rope_multi(..., rope_type, ...)` with that
+/// value.
 ///
 /// **Bug-history note** (iter-8a): A pre-iter-8a value of `24`
 /// (`GGML_ROPE_TYPE_VISION`) was a misread of the **mtmd ViT** prelude
-/// `ggml_rope_multi(..., MROPE, ...)` call at
-/// `/opt/llama.cpp/tools/mtmd/models/qwen3vl.cpp:45-58` — that's the
+/// `ggml_rope_multi(..., MROPE, ...)` call — that's the
 /// vision encoder's own RoPE, NOT the text-LM's. The text-LM uses
 /// IMROPE. Wiring `mode=24` would still call `dispatch_rope_multi_cached`
 /// but with the wrong frequency-band layout (Vision uses non-interleaved
@@ -272,7 +270,7 @@ impl Qwen3VlTextConfig {
         // prefix is one of the three known spellings — pick the one
         // that has tensor-side keys actually present. iter-228a's real
         // GGUF uses the underscored `qwen3_vl` form; the upstream
-        // `qwen3vl` form is forward-compat for a future llama.cpp-aligned
+        // `qwen3vl` form is forward-compat for a future peer-aligned
         // converter.
         let arch = gguf
             .metadata_string("general.architecture")
@@ -295,7 +293,7 @@ impl Qwen3VlTextConfig {
         // Try the underscored prefix first (what hf2q's converter
         // actually emits today; matches the real-model GGUF). Fall
         // back to the upstream prefix for forward-compat with a future
-        // llama.cpp-aligned converter.
+        // peer-aligned converter.
         let prefix = if gguf
             .metadata_u32(&format!("{}.block_count", ARCH_QWEN3_VL))
             .is_some()
@@ -772,7 +770,7 @@ mod tests {
     #[test]
     fn from_gguf_parses_upstream_no_underscore_arch() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        // Forward-compat: a future converter that aligns with llama.cpp
+        // Forward-compat: a future converter that aligns with the peer's
         // upstream emits `qwen3vl` (no underscore). Both prefix + arch
         // string forms must work.
         let kvs = standard_2b_kvs("qwen3vl");
@@ -915,8 +913,7 @@ mod tests {
         //   vision_config.deepstack_visual_indexes  = [5, 11, 17]
         //     → n_deepstack_layers = len(...) = 3
         //   LLAMA_ROPE_TYPE_IMROPE                  = 40
-        //     (`/opt/llama.cpp/src/llama-model.cpp:2316-2320` returns
-        //      IMROPE for LLM_ARCH_QWEN3VL)
+        //     (the peer returns IMROPE for LLM_ARCH_QWEN3VL)
         assert!((DEFAULT_ROPE_THETA - 5_000_000.0).abs() < 1.0);
         assert!((DEFAULT_RMS_NORM_EPS - 1.0e-6).abs() < 1e-12);
         assert_eq!(DEFAULT_MROPE_SECTION, [24, 20, 20, 0]);

@@ -3,7 +3,7 @@
 #
 # ADR-015 iter37 — minimal parity matrix for HF2Q_AUTO_BARRIER env-gate.
 #
-# iter37 ports llama.cpp's mem_ranges dataflow check into mlx-native and
+# iter37 ports the peer's mem_ranges dataflow check into mlx-native and
 # exposes it via `CommandEncoder::dispatch_tracked_*` + the
 # `HF2Q_AUTO_BARRIER=1` env gate.  Because no production callsite in
 # hf2q has migrated to the new API yet (iter38+ scope), the env gate is

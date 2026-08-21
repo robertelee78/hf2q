@@ -356,7 +356,7 @@ impl MlxModelWeights {
         // fix (the autoreleased concurrent encoder was being held via a borrowed
         // pointer → its `memoryBarrierWithScope` did not reliably order a slow
         // producer like the Q6_K mvN lm_head before its in-place softcap consumer;
-        // retaining it like llama fixes it engine-wide). The prior local
+        // retaining it like the peer fixes it engine-wide). The prior local
         // commit_wait order-fence here is therefore removed — no per-tick CPU stall,
         // mvN keeps full concurrency. See ADR-040 §0.21c-track2 / the encoder-retain
         // commit; verified ≥20 consecutive green runtime-compile + -O3 with the local

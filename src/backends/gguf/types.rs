@@ -6,10 +6,9 @@
 //! `write_gguf_string` (line 3999) — existing GGUF files produced by
 //! hf2q must round-trip through the new writer.
 //!
-//! GGUF v3 spec at `/opt/llama.cpp/ggml/include/ggml.h` and
-//! `/opt/llama.cpp/gguf-py/gguf/constants.py`. The on-wire integer codes
-//! for metadata-value types and ggml types are part of the spec; they
-//! match llama.cpp at the SHA recorded in `data/llama_cpp_pin.txt`.
+//! The on-wire integer codes
+//! for metadata-value types and ggml types are part of the GGUF v3 spec;
+//! they match the peer at the SHA recorded in `data/llama_cpp_pin.txt`.
 
 use std::io::{Result as IoResult, Write};
 
@@ -20,12 +19,12 @@ use std::io::{Result as IoResult, Write};
 /// GGUF file magic: ASCII "GGUF" little-endian.
 pub const GGUF_MAGIC: [u8; 4] = [0x47, 0x47, 0x55, 0x46];
 
-/// GGUF wire-format version emitted by hf2q (v3 — matches llama.cpp at
+/// GGUF wire-format version emitted by hf2q (v3 — matches the peer at
 /// the pinned SHA).
 pub const GGUF_VERSION: u32 = 3;
 
-/// Tensor-data alignment in bytes. From llama.cpp `gguf_default_alignment`
-/// at `ggml/src/gguf.cpp` (32 bytes). The header may also include an
+/// Tensor-data alignment in bytes. The peer's default alignment is
+/// 32 bytes. The header may also include an
 /// explicit `general.alignment = <u32>` metadata key; v1 hf2q always
 /// uses the default 32-byte alignment and does NOT emit the override.
 pub const ALIGNMENT: u64 = 32;
@@ -34,8 +33,7 @@ pub const ALIGNMENT: u64 = 32;
 // GGUF metadata-value type codes (on the wire, u32 LE)
 // ---------------------------------------------------------------------------
 //
-// Mirror `enum gguf_metadata_value_type` at
-// `/opt/llama.cpp/ggml/include/ggml.h` (search `GGUF_METADATA_VALUE_TYPE_`).
+// Mirror the peer's `gguf_metadata_value_type` wire codes.
 
 pub const GGUF_TYPE_UINT8: u32 = 0;
 pub const GGUF_TYPE_INT8: u32 = 1;

@@ -2,7 +2,7 @@
 # ADR-019 Phase 0a.4 — Metal performance-counter attribution.
 #
 # Purpose: localize the 352 ms in-process prefill delta (hf2q 1538 ms vs
-# llama.cpp 1186 ms) measured by Phase 0a.1 cross-protocol on apex
+# the peer's 1186 ms) measured by Phase 0a.1 cross-protocol on apex
 # Q4_0-flat pp4096. Three competing mechanism hypotheses:
 #
 #   M1 — Per-CB GPU-side dispatch cost (kernel launch overhead, scheduler
@@ -11,7 +11,7 @@
 #   M2 — Per-CB occupancy gap (wavefront ramp-up/drain at CB boundaries).
 #        D3 also captures this.
 #   M3 — Per-DISPATCH overhead (not per-CB). If hf2q has 235× more
-#        *dispatches* than llama.cpp (not just 235× more CBs), CB
+#        *dispatches* than the peer (not just 235× more CBs), CB
 #        consolidation does not help; D3 has no recovery path.
 #
 # H-0a.4-3 (the only directly testable hypothesis from this seat):
@@ -122,7 +122,7 @@ run_hf2q_trial() {
     fi
 }
 
-# (2) llama.cpp under same template — get metal-gpu-execution-points + --perf.
+# (2) the peer under same template — get metal-gpu-execution-points + --perf.
 run_llama_trial() {
     local label="$1"
     local trace_out="$LOGDIR/llama-${label}.trace"
@@ -154,7 +154,7 @@ for i in $(seq 1 "$N_TRIALS"); do
 done
 
 echo
-echo "=== llama.cpp xctrace — $N_TRIALS cold trials ==="
+echo "=== peer xctrace — $N_TRIALS cold trials ==="
 for i in $(seq 1 "$N_TRIALS"); do
     run_llama_trial "trial${i}"
     if [ "$i" -lt "$N_TRIALS" ]; then sleep "$COOLDOWN_S"; fi

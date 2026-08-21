@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cold-only, same-input llama.cpp comparator for the DeepSeek four-agent gate.
+# Cold-only, same-input peer comparator for the DeepSeek four-agent gate.
 # The peer intentionally has no hf2q cache assertions: it proves request shape,
 # tool semantics, prompt-token identity, and precise end-to-end cold timing.
 
@@ -18,7 +18,7 @@ AGENTIC_PROMPT_CONTRACT_SHA256=${AGENTIC_PROMPT_CONTRACT_SHA256:-$(shasum -a 256
 AGENTIC_CONTEXT_FIXTURE=${AGENTIC_CONTEXT_FIXTURE:-$ROOT_DIR/scripts/fixtures/deepseek4-agentic-repo-context.txt}
 AGENTIC_CONTEXT_FIXTURE_SHA256=${AGENTIC_CONTEXT_FIXTURE_SHA256:-2c894c9ed9cf02d5454e9756e6836ffbeed4f256c9e35c544cc451636476b4ef}
 # The request JSON is byte-bound to hf2q's accepted 6,684-token fixture. Pinned
-# llama.cpp build 10326 renders those same bytes as 6,695 prompt tokens; bind
+# Peer build 10326 renders those same bytes as 6,695 prompt tokens; bind
 # that eleven-token runtime delta so a template/tokenizer drift cannot hide.
 EXPECTED_PROMPT_TOKENS=${EXPECTED_PROMPT_TOKENS:-6695}
 CURL_CONNECT_TIMEOUT_SECONDS=${CURL_CONNECT_TIMEOUT_SECONDS:-5}

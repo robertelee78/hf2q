@@ -255,7 +255,7 @@ fn convert_llama3_tiny_round_trip() {
     assert_eq!(gguf.metadata_u32("llama.embedding_length"), Some(32));
     assert_eq!(gguf.metadata_u32("llama.block_count"), Some(2));
     assert_eq!(gguf.metadata_u32("llama.attention.head_count"), Some(2));
-    // file_type round-trips as the LlamaFtype u32 (MostlyQ8_0 = 7).
+    // file_type round-trips as the GgufFtype u32 (MostlyQ8_0 = 7).
     assert_eq!(gguf.metadata_u32("general.file_type"), Some(7));
 
     // Per-tensor name + ggml_type assertions. Compare named variants:
@@ -811,7 +811,7 @@ fn convert_apex_balanced_tiny_qwen35moe_round_trip() {
     assert_eq!(
         gguf.metadata_u32("general.file_type"),
         Some(17),
-        "Balanced tier's approximate LlamaFtype is MostlyQ5_K_M = 17"
+        "Balanced tier's approximate GgufFtype is MostlyQ5_K_M = 17"
     );
 
     // Expected tensor names. ApexPolicy at 2 layers + Balanced tier
@@ -906,7 +906,7 @@ fn convert_q4_k_m_tiny_qwen35moe_round_trip() {
     assert_eq!(
         gguf.metadata_u32("general.file_type"),
         Some(15),
-        "Q4_K_M LlamaFtype is MostlyQ4_K_M = 15"
+        "Q4_K_M GgufFtype is MostlyQ4_K_M = 15"
     );
 
     let expected_names: &[&str] = &[
@@ -983,7 +983,7 @@ fn convert_q5_k_m_tiny_qwen35moe_round_trip() {
     assert_eq!(
         gguf.metadata_u32("general.file_type"),
         Some(17),
-        "Q5_K_M LlamaFtype is MostlyQ5_K_M = 17"
+        "Q5_K_M GgufFtype is MostlyQ5_K_M = 17"
     );
 
     let expected_names: &[&str] = &[
@@ -1562,7 +1562,7 @@ fn convert_gemma4_real_arch_round_trip() {
     // feed_forward_length stays scalar (use_double_wide_mlp=false).
     assert_eq!(gguf.metadata_u32("gemma4.feed_forward_length"), Some(32));
 
-    // file_type round-trips as Q8_0 (= 7 per LlamaFtype::MostlyQ8_0).
+    // file_type round-trips as Q8_0 (= 7 per GgufFtype::MostlyQ8_0).
     assert_eq!(gguf.metadata_u32("general.file_type"), Some(7));
 
     // ---- Synthesized rope_freqs.weight tensor (gemma.py:702-718) ----

@@ -351,7 +351,7 @@ fn print_benchmark_summary(
 /// Gemma 4's thinking-mode — the model emits a full `<|channel>thought\n
 /// ...<channel|>` reasoning block before any answer content. That
 /// triggered the parity-gate divergence the iter-219b release-check
-/// caught: llama.cpp reference says `"The answer to 2 + 2 is **4**."`
+/// caught: the peer reference says `"The answer to 2 + 2 is **4**."`
 /// while hf2q produced `"<|channel>thought\n* Question: \"Hello, what
 /// i..."`. Common-prefix bytes = 0; all 6 parity checks failed (Gates
 /// C/D/E + F).
@@ -360,14 +360,14 @@ fn print_benchmark_summary(
 /// drop the `<|think|>` system marker and append an empty channel block
 /// `<|channel>thought\n<channel|>` after `<|turn>model\n`. The empty
 /// block closes the channel before content begins, so the model emits
-/// the answer directly (matching llama.cpp's behavior with no thinking
+/// the answer directly (matching the peer's behavior with no thinking
 /// hint).
 ///
 /// Probe (built binary, daily-driver Gemma 4 GGUF):
 ///   pre-fix: hf2q output begins `<|channel>thought\n* Question: ...`
-///            (168 bytes; common-prefix=0 vs llama ref).
+///            (168 bytes; common-prefix=0 vs peer ref).
 ///   post-fix: hf2q output begins `The answer to 2 + 2 is **4**.`
-///            (matches llama ref through 29-byte threshold).
+///            (matches peer ref through 29-byte threshold).
 pub(crate) const FALLBACK_GEMMA4_CHAT_TEMPLATE: &str =
     "<bos><|turn>user\n{{PROMPT}}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
 
@@ -421,18 +421,15 @@ pub(crate) const FALLBACK_GEMMA4_API_CHAT_TEMPLATE: &str = concat!(
 /// rendering it twice with synthetic test input — once with
 /// `enable_thinking=true`, once with `enable_thinking=false` — and checking
 /// that the enabled render actually opens a reasoning block. A plain byte
-/// difference is insufficient: llama.cpp's template matrix includes Qwen3
+/// difference is insufficient: the peer's template matrix includes Qwen3
 /// templates where `enable_thinking=false` appends an empty `<think></think>`
 /// suppressor, while `enable_thinking=true` leaves the assistant prompt bare.
 /// Those templates branch on the variable but should still default to
 /// thinking off.
 ///
 /// **This is the canonical signal** per peer audit
-/// `/tmp/cfa-thinking-detect/peer-detection-report.md`. Mirrors llama.cpp's
-/// `compare_thinking_enabled` at `/opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401`,
-/// surfaced via `common_chat_templates_support_enable_thinking` at
-/// `/opt/llama.cpp/common/chat.cpp:244-257`. The user-facing decision in
-/// llama.cpp lives at `/opt/llama.cpp/tools/server/server-context.cpp:1050`:
+/// `/tmp/cfa-thinking-detect/peer-detection-report.md`. The peer's
+/// user-facing decision is
 /// `enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking`.
 ///
 /// Returns `false` if either render fails — a malformed template can't be
@@ -464,8 +461,8 @@ fn rendered_prompt_opens_thinking(enabled: &str, disabled: &str) -> bool {
     if e == d {
         return false;
     }
-    // Canonical signal (mirrors llama.cpp's `compare_thinking_enabled` end-state
-    // for `reasoning_mode::TAG_BASED`): the template TRULY OPENS thinking only
+    // Canonical signal (matches the peer's thinking-detection end-state
+    // for tag-based reasoning): the template TRULY OPENS thinking only
     // when, under `enable_thinking=true`, the rendered prompt ends with at
     // least one UNCLOSED open-marker that the `enable_thinking=false` render
     // does not leave open.  Two falsifier patterns the prior pure-byte-diff
@@ -483,8 +480,7 @@ fn rendered_prompt_opens_thinking(enabled: &str, disabled: &str) -> bool {
     //     produced argmax drift into `서히-own-` repetition loops on
     //     enumerative prompts (operator's chemistry-Format probe 2026-05-17).
     //
-    // Counted markers are the two reasoning-tag conventions documented in
-    // llama.cpp's `chat-diff-analyzer.cpp` workaround list (lines 36-100):
+    // Counted markers are the two established reasoning-tag conventions:
     // `<think></think>` and `<reasoning></reasoning>`.  Model-class-specific
     // section markers (e.g. Gemma 4's `<|channel>...<channel|>`) are NOT
     // open-markers — they're suppressor primers in the FALSE branch and
@@ -518,8 +514,7 @@ fn rendered_prompt_opens_thinking(enabled: &str, disabled: &str) -> bool {
 /// that case the default resolves to `Some(false)` since the fallback path
 /// doesn't go through Jinja at all.
 ///
-/// Mirrors llama.cpp's `--reasoning auto` decision at
-/// `/opt/llama.cpp/tools/server/server-context.cpp:1050`. Clap enforces
+/// Mirrors the peer's `--reasoning auto` decision. Clap enforces
 /// `--enable-thinking` ⊕ `--no-thinking` mutual exclusion via
 /// `conflicts_with`; the (true, true) input is unreachable in practice
 /// but the function remains total.
@@ -574,12 +569,11 @@ fn render_chat_template(
 
     // Step 2: resolve enable_thinking using the resolved template (so the
     // auto-detect render-and-diff probes the SAME template we're about to
-    // render with). This is the canonical signal per
-    // /opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401.
+    // render with).
     let enable_thinking = resolve_enable_thinking(args, Some(template_str.as_str()));
 
     // Step 3: render with the resolved template + flag. Do not post-edit the
-    // rendered chat prompt here: llama.cpp's chat-template path treats the
+    // rendered chat prompt here: the peer's chat-template path treats the
     // template output as authoritative, and Qwen equivalence depends on the
     // same contract. Decode behavior differences belong in the sampler/stop
     // pipeline, not in prompt surgery.
@@ -776,11 +770,11 @@ fn resolve_token_id(
     tokenizer: &tokenizers::Tokenizer,
     metadata_key: &str,
 ) -> Option<u32> {
-    llama_cpp_special_token_id(gguf, metadata_key)
+    peer_special_token_id(gguf, metadata_key)
         .and_then(|id| tokenizer.id_to_token(id).map(|_| id))
 }
 
-fn llama_cpp_special_token_id(
+fn peer_special_token_id(
     gguf: &mlx_native::gguf::GgufFile,
     metadata_key: &str,
 ) -> Option<u32> {
@@ -789,14 +783,13 @@ fn llama_cpp_special_token_id(
     }
 
     let tokenizer_model = gguf.metadata_string("tokenizer.ggml.model")?;
-    llama_cpp_special_token_id_for_model(tokenizer_model, metadata_key)
+    peer_special_token_id_for_model(tokenizer_model, metadata_key)
 }
 
-fn llama_cpp_special_token_id_for_model(tokenizer_model: &str, metadata_key: &str) -> Option<u32> {
+fn peer_special_token_id_for_model(tokenizer_model: &str, metadata_key: &str) -> Option<u32> {
     match (tokenizer_model, metadata_key) {
-        // Mirrors `/opt/llama.cpp/src/llama-vocab.cpp`: for tokenizer model
-        // `gpt2`, llama.cpp initializes both BOS and EOS to token id 11 before
-        // applying GGUF metadata overrides.
+        // For tokenizer model `gpt2`, the peer initializes both BOS and EOS
+        // to token id 11 before applying GGUF metadata overrides.
         ("gpt2", "tokenizer.ggml.bos_token_id") | ("gpt2", "tokenizer.ggml.eos_token_id") => {
             Some(11)
         }
@@ -818,7 +811,7 @@ fn resolve_token_text(
         .unwrap_or_else(|| template_literal_when_unavailable.to_string())
 }
 
-/// Tokenize a rendered prompt with llama.cpp `common_tokenize(...,
+/// Tokenize a rendered prompt with the peer's `common_tokenize(...,
 /// add_special=true, parse_special=true)` semantics.
 ///
 /// Thin shim around [`crate::core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf`]
@@ -826,7 +819,7 @@ fn resolve_token_text(
 /// `inference/spec_decode/eagle3_orchestrator`) can reuse it without
 /// pulling `serve` as a dependency. Retained as a private name in
 /// this module to minimize churn at the existing call sites.
-fn tokenize_rendered_prompt_llama_style(
+fn tokenize_rendered_prompt_peer_style(
     gguf: &mlx_native::gguf::GgufFile,
     tokenizer: &tokenizers::Tokenizer,
     prompt_text: &str,
@@ -1169,12 +1162,12 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         return Ok(());
     }
 
-    // ADR-038 G4-CFA-5e + ADR-015 iter42: `tokenize_rendered_prompt_llama_style`
+    // ADR-038 G4-CFA-5e + ADR-015 iter42: `tokenize_rendered_prompt_peer_style`
     // delegates to `core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf`,
     // which already honors GGUF `tokenizer.ggml.add_bos_token` (and `add_eos_token`).
     // The pre-2026-05-23 defense-in-depth duplicate BOS-prepend at this site
     // is no longer needed.
-    let prompt_tokens = tokenize_rendered_prompt_llama_style(&gguf, &tokenizer, &prompt_text)?;
+    let prompt_tokens = tokenize_rendered_prompt_peer_style(&gguf, &tokenizer, &prompt_text)?;
     // mmproj-on-generate (iter-2) — image pipeline.
     //
     // When `--image <path>` is set (and `--mmproj <path>` is set, validated
@@ -1420,7 +1413,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // Uses dense F32 attention instead of TQ-packed attention during prompt
     // ingestion to eliminate compounding quantization noise.
     // ADR-009 Phase 3A: HF2Q_BATCHED_PREFILL=1 uses the new batched prefill
-    // path (matches llama.cpp default).
+    // path (matches the peer's default).
     //
     // ADR-028 iter-344 status: batched prefill is now the DEFAULT-ON path
     // and is DECOUPLED from the `HF2Q_UNSAFE_EXPERIMENTS` ack (iter-343
@@ -1712,7 +1705,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         generated += 1;
         decoded_tokens.push(next_token);
 
-        // Cumulative decode + delta print (llama.cpp tok_str_pos pattern).
+        // Cumulative decode + delta print.
         let new_full = tokenizer.decode(&decoded_tokens, false).unwrap_or_default();
         if new_full.len() > printed_text.len() && new_full.starts_with(&printed_text) {
             print!("{}", &new_full[printed_text.len()..]);
@@ -1765,7 +1758,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     } else {
         ("", "")
     };
-    // Footer line mirrors llama.cpp's headline format:
+    // Footer line mirrors the peer's headline format:
     //   `[ Prompt: <X> t/s | Generation: <Y> t/s ]`
     // Adds hf2q-specific gen-token-count tail so the legacy
     // "tokens in Xs" data is still in one place for downstream parsers.
@@ -1845,7 +1838,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             barriers_per_decode_tok,
         );
         // ADR-028 iter-284: dump per-pipeline dispatch buckets if MLX_DISP_BUCKET=1.
-        // Mirrors llama.cpp's LLAMA_DISP_COUNT atexit dump for direct compare.
+        // Mirrors the peer's dispatch-count atexit dump for direct compare.
         let buckets = mlx_native::pipeline_dispatch_buckets();
         if !buckets.is_empty() {
             let total: u64 = buckets.iter().map(|(_, c)| *c).sum();
@@ -2356,7 +2349,7 @@ where
 /// fragment matched — it just stops on Some.
 // Text-fragment stop-strings for finetunes that emit special tokens as
 // BPE-decomposed bytes instead of as proper integer ids. Matches the
-// stop-string contract of llama.cpp's CLI (`-r` / `--reverse-prompt`).
+// stop-string contract of the peer's CLI (`-r` / `--reverse-prompt`).
 //
 // 2026-05-03 — switched the leading marker from `<|im_end|>` to
 // `<|im_start|>user`. On thinking-capable Qwen3 finetunes (notably the
@@ -2410,7 +2403,7 @@ fn find_special_token_stop_pos(generated_text: &str) -> Option<(usize, &'static 
 /// (forward_gpu_last_logits + sample_qwen35_logits_for_generate) or can take
 /// the GPU-argmax fast-path (forward_gpu_greedy).
 ///
-/// Mirrors llama.cpp's `--temp 0` semantics: when temperature is at or below
+/// Mirrors the peer's `--temp 0` semantics: when temperature is at or below
 /// the deterministic floor, the argmax of the unwarped logits is the output —
 /// top_k / top_p / min_p truncation is a no-op against an argmax-of-1. The
 /// sampler-path is only needed when temperature scales the distribution OR
@@ -2574,7 +2567,7 @@ where
 
     // Emit step 0 event (the seed token from prefill).
     //
-    // 2026-05-03 — match llama.cpp's libllama philosophy: inference emits
+    // 2026-05-03 — match the peer's library philosophy: inference emits
     // raw decoded tokens. NO output-text scanning, NO visible-prefix
     // surgery, NO special-token-fragment scrubbing. The caller (CLI / SSE
     // server / harness) is the right layer to decide what to display, what
@@ -2655,7 +2648,7 @@ where
 
         // Text-fragment EOS for finetunes that emit `<|im_end|>` (etc.) as
         // BPE-decomposed bytes instead of as their proper integer special-
-        // token id. llama.cpp's CLI handles this via `--reverse-prompt` /
+        // token id. The peer's CLI handles this via `--reverse-prompt` /
         // stop-strings as an application-layer gate; we implement the same
         // contract inline, scanning the cumulative decoded text for any
         // entry in `SPECIAL_TOKEN_STOPS`. This is NOT visible-text surgery
@@ -2853,7 +2846,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
 
         if std::env::var("HF2Q_DEBUG_TOKENIZE_ONLY").as_deref() == Ok("1") {
             let prompt_tokens =
-                tokenize_rendered_prompt_llama_style(&gguf, &tokenizer, &prompt_text)?;
+                tokenize_rendered_prompt_peer_style(&gguf, &tokenizer, &prompt_text)?;
             let id_str: Vec<String> = prompt_tokens.iter().map(|i| i.to_string()).collect();
             println!("TOKENIZE_DEBUG_IDS: {}", id_str.join(" "));
         }
@@ -2947,7 +2940,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     }
 
     // ---- Tokenize ----
-    let prompt_tokens = tokenize_rendered_prompt_llama_style(&gguf, &tokenizer, &prompt_text)?;
+    let prompt_tokens = tokenize_rendered_prompt_peer_style(&gguf, &tokenizer, &prompt_text)?;
     let prompt_len = prompt_tokens.len();
     tracing::info!("Qwen3.5: {} prompt tokens", prompt_len);
 
@@ -3229,7 +3222,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // ~17 GB Q4 weight materialization onto Metal heap + lm_head BF16/Q4_0
     // pre-quant + flash_attn_prefill kernel registration) BEFORE the prefill
     // timer starts. Without this, the ~984 ms upload was charged to
-    // `prefill_tok_s`, producing a 28× apparent gap vs llama.cpp's
+    // `prefill_tok_s`, producing a 28× apparent gap vs the peer's
     // `prompt eval time` (which excludes model load by construction).
     // Compute is unchanged; only the timer-span moves. `wave5b8_profile`'s
     // `UploadWeights` section still tracks the cost — it just lives here now.
@@ -3386,8 +3379,8 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // SYNC_COUNT counts commit_and_wait calls/prefill, DISPATCH_COUNT
     // counts kernel dispatches, BARRIER_COUNT counts memory_barriers.
     // The hypothesis ("hf2q does ~120-160 commit_and_wait/prefill while
-    // llama.cpp does ~1") is TESTABLE by comparing these numbers against
-    // ggml-metal's per-graph submit pattern.  Zero overhead when env
+    // the peer does ~1") is TESTABLE by comparing these numbers against
+    // the peer's per-graph Metal submit pattern.  Zero overhead when env
     // unset (RAII guard does no work).
     let profile_sync = std::env::var("HF2Q_PROFILE_SYNC").is_ok();
     if profile_sync {
@@ -3433,7 +3426,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     .context("print header prefill")?;
 
     // HF2Q_DUMP_LOGITS=1: write the last-token logit vector to /tmp/hf2q_logits_t0.bin
-    // and exit immediately. Used for first-token logit comparison vs llama.cpp.
+    // and exit immediately. Used for first-token logit comparison vs the peer.
     if std::env::var("HF2Q_DUMP_LOGITS").as_deref() == Ok("1") {
         let last_logits = &prefill_logits;
         let bytes: &[u8] = unsafe {
@@ -3453,7 +3446,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     }
 
     // Sample the first token from prefill logits (last token's row). This
-    // mirrors llama.cpp's common_sampler contract: the CLI default sampling
+    // mirrors the peer's sampler contract: the CLI default sampling
     // parameters affect token 0, instead of silently downcasting generation to
     // greedy argmax.
     let last_prefill_logits = &prefill_logits;
@@ -3465,8 +3458,8 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     };
     tracing::info!("Qwen3.5 first decoded token: {}", next_token);
 
-    // 2026-05-02: cumulative-decode + delta-print pattern (mirrors llama.cpp's
-    // `tok_str_pos` discipline). Per-token `tokenizer.decode(&[t], ...)` breaks
+    // 2026-05-02: cumulative-decode + delta-print pattern.
+    // Per-token `tokenizer.decode(&[t], ...)` breaks
     // multi-byte UTF-8 codepoints (emoji, CJK) at token boundaries → garble
     // like `���` in the user's French-Toast output. Decode the full so-far
     // sequence each step and print only the byte-delta. Costs O(generated)
@@ -3662,7 +3655,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             // fired EARLY (within 32-200 tokens), the most likely cause is
             // the empty-`<think>\n\n</think>\n\n` suppressor in the chat
             // template confusing the model into a degenerate attractor on
-            // this specific prompt. Both hf2q and llama.cpp exhibit this
+            // this specific prompt. Both hf2q and the peer exhibit this
             // failure mode with `--no-thinking` on Qwen3.5/3.6 thinking-
             // capable checkpoints (verified ADR-005 morning session). The
             // canonical fix is to drop `--no-thinking` and let the
@@ -3674,7 +3667,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                      after only {} tokens with `--no-thinking`. On this Qwen3.5/3.6 \
                      thinking-capable checkpoint, the empty `<think></think>` \
                      suppressor is a known degenerate attractor for some prompts \
-                     (both hf2q AND llama.cpp produce the same loop). \
+                     (both hf2q AND the peer produce the same loop). \
                      Recommended fix: drop `--no-thinking` and let the auto-\
                      detected thinking-mode handle it (the model will emit a \
                      reasoning trace, then the answer). \
@@ -4895,8 +4888,8 @@ pub fn cmd_serve(
             .to_string();
 
         // Vocab + tokenizer are shared across the BERT family — both
-        // archs serialize their WPM vocab the same way per llama.cpp's
-        // `llm_tokenizer_wpm_session::tokenize`. Iter-79 cross-lane
+        // archs serialize their WPM vocab the same way per the peer's
+        // WPM tokenizer. Iter-79 cross-lane
         // edit added bos→cls / eos→sep fallbacks so nomic GGUFs parse
         // through the BertVocab path unchanged.
         let vocab = crate::inference::models::bert::BertVocab::from_gguf(&gguf)
@@ -6017,9 +6010,9 @@ fn cmd_parity_check(
     );
     let prompt_text = std::fs::read_to_string(&prompt_file)?.trim().to_string();
 
-    // Load reference. Default: llama.cpp-anchored parity (*_llama.txt).
+    // Load reference. Default: peer-anchored parity (*_llama.txt).
     // Gate D (--self-baseline): hf2q frozen self-baseline (*_hf2q.txt),
-    // bisect-safe when math deliberately changes and llama.cpp drift is
+    // bisect-safe when math deliberately changes and peer drift is
     // expected.
     let ref_suffix = if self_baseline { "_hf2q" } else { "_llama" };
     let ref_file = ref_dir.join(format!("{prompt_name}{ref_suffix}.txt"));
@@ -6143,7 +6136,7 @@ fn cmd_parity_check(
     let ref_label = if self_baseline {
         "frozen hf2q"
     } else {
-        "llama.cpp"
+        "peer"
     };
     println!("Reference: {} bytes ({})", ref_bytes.len(), ref_label);
     println!("hf2q:      {} bytes", hf2q_bytes.len());
@@ -6190,8 +6183,8 @@ fn cmd_parity_check(
                     String::from_utf8_lossy(&hf2q_bytes[ctx_start..ctx_end.min(hf2q_bytes.len())]);
                 println!();
                 println!("Divergence at byte {}:", common);
-                println!("  llama: {:?}", ref_snip);
-                println!("  hf2q:  {:?}", hf2q_snip);
+                println!("  peer: {:?}", ref_snip);
+                println!("  hf2q: {:?}", hf2q_snip);
             }
             anyhow::bail!("Parity check failed: {} < {}", common, threshold);
         }
@@ -6331,7 +6324,7 @@ mod tests {
     use super::{
         build_chat_template_env, detect_greedy_repetition_loop,
         detect_greedy_repetition_loop_with_text, find_special_token_stop,
-        llama_cpp_special_token_id_for_model, maybe_print_serve_banner, parse_kv_cache_budget,
+        peer_special_token_id_for_model, maybe_print_serve_banner, parse_kv_cache_budget,
         parse_scheduler_config, parse_scheduler_config_with_defaults, render_jinja_template,
         resolve_enable_thinking, resolve_serve_endpoint, run_decode_loop, should_enable_kv_persist,
         validate_configured_endpoint_auth, validate_mmproj_diagnostic_mode,
@@ -6349,15 +6342,15 @@ mod tests {
     #[test]
     fn llama_cpp_gpt2_special_token_defaults_match_vocab_cpp() {
         assert_eq!(
-            llama_cpp_special_token_id_for_model("gpt2", "tokenizer.ggml.bos_token_id"),
+            peer_special_token_id_for_model("gpt2", "tokenizer.ggml.bos_token_id"),
             Some(11)
         );
         assert_eq!(
-            llama_cpp_special_token_id_for_model("gpt2", "tokenizer.ggml.eos_token_id"),
+            peer_special_token_id_for_model("gpt2", "tokenizer.ggml.eos_token_id"),
             Some(11)
         );
         assert_eq!(
-            llama_cpp_special_token_id_for_model("gpt2", "tokenizer.ggml.padding_token_id"),
+            peer_special_token_id_for_model("gpt2", "tokenizer.ggml.padding_token_id"),
             None
         );
     }
@@ -6475,7 +6468,7 @@ mod tests {
 
     /// iter-219b parity-gate fix (2026-05-01) regression guard. The CLI
     /// fallback chat template MUST NOT activate Gemma 4's thinking-mode
-    /// via `<|think|>` system marker — that diverged from llama.cpp's
+    /// via `<|think|>` system marker — that diverged from the peer's
     /// behavior and broke all 6 parity-suite checks (Gates C/D/E + F)
     /// on HEAD `3cd6ea5`. iter-217 fixed the API path's fallback the
     /// same way; this test ensures the CLI fallback stays aligned.
@@ -6488,7 +6481,7 @@ mod tests {
         assert!(
             !FALLBACK_GEMMA4_CHAT_TEMPLATE.contains("<|think|>"),
             "CLI fallback MUST NOT contain `<|think|>` (activates thinking-mode \
-             that diverges from llama.cpp parity gate). Got: {FALLBACK_GEMMA4_CHAT_TEMPLATE:?}"
+             that diverges from the peer parity gate). Got: {FALLBACK_GEMMA4_CHAT_TEMPLATE:?}"
         );
         assert!(
             FALLBACK_GEMMA4_CHAT_TEMPLATE.contains("<|channel>thought\n<channel|>"),
@@ -6709,7 +6702,7 @@ mod tests {
         );
     }
 
-    /// Symmetric for the upstream llama.cpp arch-string convention
+    /// Symmetric for the peer's arch-string convention
     /// (no underscore — `qwen3vl`). Both arch spellings route through
     /// the iter-228a load path.
     #[test]
@@ -7260,7 +7253,7 @@ mod tests {
     fn special_token_stop_end_marker_before_im_start_stops_at_end() {
         // 2026-05-02 candy-thinking degeneracy: post-`<|end|>` model
         // hallucinates a new `<|im_start|>user` turn and echoes the prompt.
-        // `<|im_start|>` is not a llama.cpp-style stop by itself, but the
+        // `<|im_start|>` is not a peer-style stop by itself, but the
         // preceding end marker is.
         let s = "thinking content<|end|>\n\n<|im_start|>user\necho";
         assert_eq!(find_special_token_stop(s), Some("<|end|>"));
@@ -7299,7 +7292,7 @@ mod tests {
 
     #[test]
     fn special_token_stop_degenerate_im_start_only_does_not_stop() {
-        // llama.cpp does not treat `<|im_start|>` as an implicit reverse
+        // The peer does not treat `<|im_start|>` as an implicit reverse
         // prompt in the normal completion sampler. Stopping here causes the
         // Qwen no-thinking path to terminate before the model can continue
         // after a generated ChatML opener.
@@ -7330,7 +7323,7 @@ mod tests {
     // `qwen35_visible_generated_prefix` — the inference-layer visible-text
     // surgery they implemented was the brittle scaffolding the user called
     // out. run_decode_loop now emits raw decoded tokens; only the 3-string
-    // `SPECIAL_TOKEN_STOPS` list remains (matches llama.cpp's stop-string
+    // `SPECIAL_TOKEN_STOPS` list remains (matches the peer's stop-string
     // contract). The two helpers + their tests are removed alongside.
 
     // ---- enable_thinking plumbing into chat-template render ----------
@@ -7510,13 +7503,11 @@ mod tests {
     //    name. Thinking is determined by the model class and what is
     //    available in the gguf file."
     //
-    // The canonical signal — used by llama.cpp at
-    // /opt/llama.cpp/common/chat-diff-analyzer.cpp:319-401 and
-    // /opt/llama.cpp/common/chat.cpp:244-257 — is to render the
+    // The canonical signal — the one the peer uses too — is to render the
     // resolved chat template TWICE with `enable_thinking=true` then
     // `=false`, then recover whether the enabled render actually opens a
     // reasoning block. Plain byte inequality is too broad for Qwen3:
-    // llama.cpp's own test_template.py expects Qwen-Qwen3-0.6B auto to end
+    // the peer's own template tests expect Qwen-Qwen3-0.6B auto to end
     // at `<|im_start|>assistant\n`, even though `reasoning=off` appends an
     // empty `<think></think>` suppressor.
 
@@ -7549,7 +7540,7 @@ mod tests {
 
     #[test]
     fn template_supports_enable_thinking_false_for_plain_qwen3_suppressor_template() {
-        // Mirrors llama.cpp tools/server/tests/unit/test_template.py:
+        // Mirrors the peer's template tests:
         // Qwen-Qwen3-0.6B with reasoning=auto ends at the bare assistant
         // generation prompt, while reasoning=off appends an empty
         // `<think></think>` suppressor. This is a real byte difference, but
@@ -7853,7 +7844,7 @@ mod tests {
         // removed because it leaked into a 150-LOC web of pattern matches
         // that the user ("VERY brittle patterns / with the stripping")
         // correctly identified as inference/display layer confusion.
-        // llama.cpp's libllama doesn't do that surgery either; the CLI /
+        // The peer's library layer doesn't do that surgery either; the CLI /
         // application layer is responsible for any user-facing formatting.
         let mut deltas: Vec<String> = Vec::new();
         const TARGET: &str = "<|im_start|>user";

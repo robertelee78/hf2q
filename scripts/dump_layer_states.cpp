@@ -1,6 +1,6 @@
 // dump_layer_states.cpp — ADR-009 Phase 3A: dump per-layer hidden states.
 //
-// Uses llama.cpp's eval callback to capture "l_out" tensors (end-of-layer
+// Uses the peer's eval callback to capture "l_out" tensors (end-of-layer
 // hidden states) at a specific decode position.
 //
 // Build:
@@ -43,7 +43,7 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     if (!name) return true;
 
     // We want "l_out", "attn_out", and "kqv_out" tensors
-    // kqv_out is the raw SDPA output before O-proj in llama.cpp
+    // kqv_out is the raw SDPA output before O-proj in the peer
     bool is_l_out = (strncmp(name, "l_out", 5) == 0);
     bool is_attn_out = (strncmp(name, "attn_out", 8) == 0);
     bool is_kqv_out = (strncmp(name, "kqv_out", 7) == 0);

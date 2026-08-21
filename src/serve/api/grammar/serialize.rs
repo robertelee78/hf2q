@@ -6,14 +6,10 @@
 //! count, same `GretElement` sequences modulo synthesized rule renames
 //! that the parser is free to choose at re-parse time).
 //!
-//! # Reference
-//!
-//! Modeled on llama.cpp `llama_grammar_parser::print` +
-//! `print_rule` at `/opt/llama.cpp/src/llama-grammar.cpp:296-371` +
-//! `:721-736`.  The C++ `print_grammar_char` (`:231-238`) is **lossy** by
-//! design ("cop out of encoding UTF-8" — emits `<U+04XX>` literal
-//! placeholders that are NOT valid GBNF input).  The Rust port below
-//! emits proper escapes so the output round-trips through `parse`.
+//! Note the peer's equivalent printer is **lossy** by design (it emits
+//! `<U+04XX>` literal placeholders that are NOT valid GBNF input).  The
+//! serializer below emits proper escapes so the output round-trips
+//! through `parse`.
 //!
 //! # Why this exists
 //!
@@ -29,8 +25,7 @@
 //!
 //! `parse(serialize(parse(s))) == parse(s)` (semantic equivalence at
 //! the AST level).  Strict byte-identity is NOT guaranteed because:
-//!   - Comments are not preserved (llama.cpp's print_rule does not
-//!     preserve comments either; the AST does not carry them).
+//!   - Comments are not preserved (the AST does not carry them).
 //!   - Whitespace is normalized.
 //!   - Rule emission order follows ascending rule-id.
 
@@ -47,9 +42,6 @@ use super::parser::{Grammar, GretElement, GretType};
 /// Symbol-id assignments may differ if the input had been built by
 /// hand (the parser assigns ids in encounter order); for any grammar
 /// produced by `parse(...)`, names → ids round-trip exactly.
-///
-/// Mirrors `llama_grammar_parser::print` at
-/// `/opt/llama.cpp/src/llama-grammar.cpp:721-736`.
 pub fn serialize(grammar: &Grammar) -> String {
     // Build id → name map (inverse of grammar.symbol_ids).
     let id_to_name: HashMap<u32, String> = grammar
@@ -72,8 +64,7 @@ pub fn serialize(grammar: &Grammar) -> String {
     out
 }
 
-/// Serialize a single rule.  Mirrors `print_rule` at
-/// `/opt/llama.cpp/src/llama-grammar.cpp:296-371`.
+/// Serialize a single rule.
 ///
 /// The bracket-close logic (peek at next element to decide whether to
 /// emit `]`) is what makes the serializer character-class-aware
@@ -86,9 +77,9 @@ fn write_rule(
     rule: &[GretElement],
     id_to_name: &HashMap<u32, String>,
 ) {
-    // Sanity: every rule must terminate with End.  We mirror llama.cpp's
-    // `throw runtime_error` by skipping the rule entirely (the parser
-    // enforces this invariant on `parse`, so we should never see it).
+    // Sanity: every rule must terminate with End.  Skip the rule entirely
+    // otherwise (the parser enforces this invariant on `parse`, so we
+    // should never see it).
     if rule.last().map(|e| e.ty) != Some(GretType::End) {
         return;
     }
@@ -109,8 +100,8 @@ fn write_rule(
     // An alternative whose source form is empty (zero atoms) is
     // semantically valid — it matches the empty string — but emitting
     // it as bare whitespace breaks round-trip parsing because the
-    // parser's `parse_alternates` (parser.rs:267-269 / llama.cpp
-    // `:443`) calls `parse_space(.., newline_ok=true)` after `|`,
+    // parser's `parse_alternates` (parser.rs:267-269)
+    // calls `parse_space(.., newline_ok=true)` after `|`,
     // greedily eating the newline and the next rule's name as if it
     // were an alternative continuation.  We emit `""` (which the
     // parser consumes as a zero-element literal — see parser.rs:294
@@ -130,7 +121,7 @@ fn write_rule(
         match elem.ty {
             GretType::End => {
                 // Cannot happen pre-(n-1) for a valid rule; defend by
-                // skipping (mirrors llama.cpp throwing an exception).
+                // skipping.
                 return;
             }
             GretType::Alt => {
@@ -163,7 +154,7 @@ fn write_rule(
             }
             GretType::CharRngUpper => {
                 // The parser enforces that this only follows a char
-                // element; mirror llama.cpp's invariant assert.
+                // element.
                 // CharRngUpper is a continuation of an existing class,
                 // so the alt was already non-empty when we got here.
                 let _ = write!(out, "-");
@@ -179,7 +170,7 @@ fn write_rule(
             }
         }
 
-        // Bracket-close lookahead — mirrors llama.cpp lines 359-368.
+        // Bracket-close lookahead.
         //
         // A char-class run (opened by Char or CharNot) continues only
         // while the NEXT element is CharAlt or CharRngUpper — both of
@@ -225,7 +216,7 @@ fn write_rule(
 ///
 /// `in_class = true` adds escapes for the four characters that are
 /// structural inside a character class (`[`, `]`, `\\`, `-`).  The
-/// `-` escape isn't strictly necessary at every position (llama.cpp's
+/// `-` escape isn't strictly necessary at every position (the
 /// parser only treats `-` as range-introducer between two chars), but
 /// always escaping it is the conservative choice that keeps the
 /// serializer position-agnostic — every char-class element can be
@@ -489,7 +480,7 @@ mod tests {
     #[test]
     fn round_trip_negated_with_quote_and_backslash() {
         // The canonical JSON `string` rule's interior char.  Same
-        // shape as `[^"\\]` in /opt/llama.cpp/grammars/json.gbnf.
+        // shape as `[^"\\]` in the json.gbnf fixture.
         roundtrip("root ::= [^\"\\\\]\n");
     }
 
@@ -552,7 +543,7 @@ mod tests {
 
     #[test]
     fn round_trip_json_grammar_fixture() {
-        // The canonical llama.cpp json grammar.  Stress-tests every
+        // The peer's canonical json grammar.  Stress-tests every
         // GBNF feature we serialize: nested groups, recursion,
         // quoted-literal escapes, negated char class with
         // backslash, ranges, comments (not preserved).

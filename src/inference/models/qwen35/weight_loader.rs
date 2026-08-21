@@ -770,7 +770,7 @@ pub fn load_full_attn_layer(
 
     // APEX LAYOUT DISCOVERY: full-attention layers have a FUSED `attn_q.weight`
     // holding Q + output-gate in sequence (shape `[2 * n_head * head_dim, hidden]`),
-    // not a separate `attn_gate.weight` tensor. This matches llama.cpp's in-memory
+    // not a separate `attn_gate.weight` tensor. This matches the peer's in-memory
     // `wq` convention where `wq` has output dim `2 * head_dim * n_head` with Q
     // in the lower half and gate in the upper half. Our CPU reference keeps wq and
     // w_gate separate, so we split after loading.
@@ -817,7 +817,7 @@ pub fn load_full_attn_layer(
     );
 
     // De-interleave fused q_fused into wq and w_gate.
-    // llama.cpp layout (confirmed from build_layer_attn): Q and gate are INTERLEAVED
+    // The peer's layout (confirmed from build_layer_attn): Q and gate are INTERLEAVED
     // at head granularity. For head h: rows [2*h*d .. (2*h+1)*d-1] = Q[h], rows
     // [(2*h+1)*d .. (2*h+2)*d-1] = gate[h]. Each "row" is h (hidden_size) floats wide.
     // So in the flat vec: head h Q starts at offset (2*h*d)*h, gate starts at (2*h+1)*d*h.
@@ -858,7 +858,7 @@ pub fn load_full_attn_layer(
 /// GDN op is enabled (`fused_gdn_ar` / `fused_gdn_ch` paths in
 /// `qwen35moe.cpp::build_layer_attn_linear`).
 ///
-/// llama.cpp's fused GDN kernel — and now mlx-native's `gated_delta_net_f32`
+/// The peer's fused GDN kernel — and now mlx-native's `gated_delta_net_f32`
 /// kernel as of mlx-native 0.4.1 (commit `4f00f6e`) — performs the GQA
 /// mapping internally as `k_head = v_head % n_k_heads`, which is the
 /// inverse of the GGUF tiling: with `v_head = i_vpk * n_k + i_k`,
@@ -868,7 +868,7 @@ pub fn load_full_attn_layer(
 /// tiled order. No un-reordering. Earlier hf2q snapshots un-reordered to
 /// "grouped" order to compensate for an old (block-style) mlx-native kernel
 /// that used `k_head = v_head / group_ratio`; that kernel was retired in
-/// `4f00f6e` to reach byte-parity with llama.cpp.
+/// `4f00f6e` to reach byte-parity with the peer.
 ///
 /// Affected tensors that stay in GGUF tiled V-head order (apex GGUF:
 /// n_k=16, n_vpk=2, d_v=128, hidden=2048):

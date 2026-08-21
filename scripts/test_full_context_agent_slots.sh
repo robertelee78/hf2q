@@ -47,7 +47,7 @@ fi
 # The single-agent gate's 40-second cold limit is intentionally strict. Four
 # cold DeepSeek requests share one 100 GiB verifier. The checked-in 21,204-byte
 # context fixture preserves the accepted 6,684-token hf2q workload used for the exact matched
-# peer comparison. Two thermally valid llama.cpp np4 waves measured 68.438 s
+# peer comparison. Two thermally valid peer np4 waves measured 68.438 s
 # and 69.944 s on this M5 Max; the 60 s hf2q ceiling keeps a 9.2 s margin below
 # the peer median. Cached turns remain tightly bounded.
 # Explicit operator values always win.

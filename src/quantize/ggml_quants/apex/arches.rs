@@ -2,7 +2,7 @@
 //! returns a `MoeTensorRole` so `ApexPolicy::target_for` can decide
 //! which slot of the per-tier 7-tuple applies.
 //!
-//! Tensor-name conventions come from llama.cpp's GGUF naming (the
+//! Tensor-name conventions come from the peer's GGUF naming (the
 //! convert-side output names hf2q produces), cross-validated against
 //! the vendored `vendor/apex-quant/configs/*.txt` files at pinned
 //! mudler SHA `63c5048b7dc9ff230f2397d7bc445ca28894b769`. The configs
@@ -45,14 +45,14 @@ pub enum MoeTensorRole {
     /// `token_embd.weight`. Mudler's standard is to keep token
     /// embedding at high precision (Q6_K) regardless of tier; this is
     /// implicit in the bash since `generate_config.sh` doesn't list
-    /// `token_embd` (llama.cpp's quantize-tool default applies).
+    /// `token_embd` (stock llama-quantize's default applies).
     TokenEmbd,
     /// `output.weight` / `lm_head.weight`. Same Q6_K-default
     /// rationale.
     Output,
     /// `blk.<i>.ffn_gate_inp.weight` — the per-token expert-router
     /// gate. Mudler standard is to leave it at Q5_0 (small,
-    /// performance-critical, not in the bash config but llama.cpp's
+    /// performance-critical, not in the bash config but the stock
     /// default applies).
     RouterGate,
     /// Norm tensors: `*_norm.weight`, `output_norm.weight`,
@@ -85,7 +85,7 @@ pub const SUPPORTED_APEX_ARCHES: &[&str] = &["qwen3moe", "qwen35moe", "gemma4", 
 ///
 /// Per `vendor/apex-quant/configs/*.txt` the tensor-name suffixes
 /// are arch-agnostic across the three supported arches (Qwen35Moe,
-/// Gemma4-MoE, MiniMax-M2 all use llama.cpp's standard GGUF names).
+/// Gemma4-MoE, MiniMax-M2 all use the standard GGUF names).
 /// The classifier therefore matches on **substring** patterns; the
 /// `arch` parameter is reserved for future per-arch divergence
 /// (and for the up-front "is this arch supported by Apex at all"

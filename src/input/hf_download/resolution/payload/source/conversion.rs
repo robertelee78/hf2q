@@ -14,7 +14,7 @@ use crate::input::model_recipe::{
     ModelPreparationError, ModelRecipeError, RecipeArtifactRole, VerifiedModelPreparation,
     VerifiedRecipeConversion, VerifiedRecipeSource,
 };
-use crate::quantize::ggml_quants::LlamaFtype;
+use crate::quantize::ggml_quants::GgufFtype;
 
 mod publication;
 
@@ -243,7 +243,7 @@ impl ConversionBackend for Hf2qConversionBackend {
         run_convert_with_recipe_producer_version(
             ConvertArgs {
                 hf_dir: source.local_dir().to_path_buf(),
-                selector: QuantSelector::Standard(LlamaFtype::MostlyQ4_K_M),
+                selector: QuantSelector::Standard(GgufFtype::MostlyQ4_K_M),
                 output: artifact.to_path_buf(),
                 dry_run: false,
                 imatrix: None,

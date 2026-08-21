@@ -71,7 +71,7 @@ impl GpuContext {
         //   Flash-attention tiled prefill kernels replace sdpa/sdpa_sliding for
         //   batched prefill. Three registration calls cover (1) the D=256
         //   main kernel (bf16 Q/K/V/O, BQ=32, BK=16), (2) the D=512 NSG=8
-        //   llama.cpp-derived main kernel (bf16, NQPSG=8, NCPSG=64), (3) the
+        //   peer-derived main kernel (bf16, NQPSG=8, NCPSG=64), (3) the
         //   SWA / causal mask builder (Wave 2D, shape [qL, kL] broadcast
         //   across batch + heads), and (4) the tile-skip pre-pass classifier
         //   (Wave 2E, one byte per (qtile, ktile) from the mask). See

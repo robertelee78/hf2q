@@ -7,10 +7,10 @@
 # Why this exists (per ADR-015 §iter8c-prep changelog 2026-04-27):
 #   iter8b reported 14-37x per-kernel ratio gaps to a candle baseline using
 #   HF2Q_MLX_KERNEL_PROFILE=1 mode (242 sessions/token vs 1 in production).
-#   Side-by-side audit showed the kernels are byte-equivalent to llama.cpp's,
+#   Side-by-side audit showed the kernels are byte-equivalent to the peer's,
 #   so the iter8b numbers are kprofile-mode artifacts, not production gaps.
 #   Before launching iter8c shader work (NAX routing per ADR-015 P3c) we
-#   need same-day production-mode per-kernel attribution against llama.cpp.
+#   need same-day production-mode per-kernel attribution against the peer.
 #
 # Methodology:
 #   - Single trial per binary (Metal System Trace overhead is significant;

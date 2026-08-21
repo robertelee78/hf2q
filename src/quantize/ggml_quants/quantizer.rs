@@ -7,7 +7,7 @@
 //!
 //! Wraps:
 //! `q4_0` `q4_1` `q5_0` `q5_1` `q8_0` `iq4_nl` `q2_k` `q3_k` `q4_k`
-//! `q5_k` `q6_k` (11 of llama.cpp's 14 numeric GgmlType values — F32 /
+//! `q5_k` `q6_k` (11 of the peer's 14 numeric GgmlType values — F32 /
 //! F16 / BF16 / Q8_1 / Q8_K are pass-through or internal-only and not
 //! Quantizer-bound here).
 
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn factory_rejects_out_of_v1_types() {
         // F32/F16/BF16 are pass-through, not quantizers.
-        // Q8_1/Q8_K are llama.cpp internals, not on-disk.
+        // Q8_1/Q8_K are peer internals, not on-disk.
         for ty in [
             GgmlType::F32,
             GgmlType::F16,

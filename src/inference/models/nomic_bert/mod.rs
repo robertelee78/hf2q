@@ -10,7 +10,7 @@
 //!    separate `attn_q/k/v` triple. No `cls.*` pooler tensors. New
 //!    per-layer `blk.{i}.ffn_gate.weight`.
 //!
-//! Reference: llama.cpp's `llm_build_bert` (src/models/bert.cpp); the
+//! Reference: the peer's `llm_build_bert`; the
 //! `LLM_ARCH_NOMIC_BERT` branch is the spec we conform to. Day-one
 //! supported model: `nomic-embed-text-v1.5` (137M, hidden=768, layers=12,
 //! head_count=12, n_ff=3072, rope_freq_base=1000.0).
@@ -62,7 +62,6 @@ pub use weights::{
 
 /// GGUF architecture identifier for the nomic-bert family.
 ///
-/// Spelled lowercase with a hyphen to match
-/// `/opt/llama.cpp/src/llama-arch.cpp:25`:
+/// Spelled lowercase with a hyphen to match the peer's arch table:
 ///   `{ LLM_ARCH_NOMIC_BERT, "nomic-bert" }`.
 pub const ARCH_NOMIC_BERT: &str = "nomic-bert";

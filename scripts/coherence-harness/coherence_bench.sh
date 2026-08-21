@@ -1,5 +1,5 @@
 #!/bin/bash
-# coherence_bench.sh — Run hf2q AND llama.cpp on the same prompt, capture both
+# coherence_bench.sh — Run hf2q AND the peer on the same prompt, capture both
 # outputs and tok/s, and report a side-by-side. Used to confirm whether a
 # given symptom (garbage / repetition / abort) is isolated to hf2q or shared.
 #
@@ -48,9 +48,9 @@ echo "=== hf2q (temp=$TEMP, max=$MAX, mode=$MODE) ==="
   2>"$WORKDIR/hf2q.stderr" | tee "$WORKDIR/hf2q.out" \
   | head -50
 
-# llama.cpp decode on the EXACT same rendered prompt.
+# Peer decode on the EXACT same rendered prompt.
 echo ""
-echo "=== llama.cpp on hf2q-rendered prompt (temp=$TEMP, max=$MAX, mode=$MODE) ==="
+echo "=== peer on hf2q-rendered prompt (temp=$TEMP, max=$MAX, mode=$MODE) ==="
 "$LLAMA_COMPLETION" -m "$MODEL" -f "$WORKDIR/rendered.txt" -n $MAX \
   --temp $TEMP --seed $SEED --no-display-prompt --special \
   2>"$WORKDIR/llama.stderr" | tee "$WORKDIR/llama.out" \
@@ -62,4 +62,4 @@ ll_dec=$(grep -oE 'eval time = [0-9.]+ ms /[ ]+[0-9]+ runs.*tokens per second' "
 echo ""
 echo "--- summary ---"
 echo "hf2q     : $hf_dec"
-echo "llama.cpp: $ll_dec"
+echo "peer     : $ll_dec"

@@ -1,5 +1,5 @@
 //! `.imatrix.gguf` writer — produces the exact schema that
-//! `/opt/llama.cpp/tools/imatrix/imatrix.cpp::save_imatrix` emits.
+//! `llama-imatrix` emits.
 //!
 //! Per ADR-033 §Pi the on-disk schema is:
 //!
@@ -15,18 +15,15 @@
 //!     dims are `[n_per_row, n_mat]` literally — see
 //!     [`super::accumulator::Accumulator`]).
 //!   * `<tensor_name>.counts`  — f32 tensor, shape `[1, n_mat]`
-//!     (stored as float per imatrix.cpp:602's `ggml_new_tensor_2d` call).
+//!     (stored as float, matching `llama-imatrix` output).
 //!
-//! ## Wire-format details (cross-validated against imatrix.cpp)
+//! ## Wire-format details (cross-validated against `llama-imatrix` output)
 //!
 //! * `general.type` is written as a STRING KV pair (not part of any
-//!   enum) — see imatrix.cpp:588 `gguf_set_val_str(ctx_gguf,
-//!   "general.type", "imatrix");`.
-//! * `imatrix.datasets` is written as a STRING ARRAY (per
-//!   imatrix.cpp:590 `gguf_set_arr_str(ctx_gguf,
-//!   LLM_KV_IMATRIX_DATASETS, datasets.data(), datasets.size())`).
+//!   enum).
+//! * `imatrix.datasets` is written as a STRING ARRAY.
 //! * `imatrix.chunk_count` and `imatrix.chunk_size` are u32 LE.
-//! * Tensor name order on disk is `std::sort` order (imatrix.cpp:568) —
+//! * Tensor name order on disk is sorted-name order —
 //!   our [`AccumulatorRegistry`] iterates in BTreeMap (sorted) order.
 //!
 //! Per [[feedback-no-loop-suppression-2026-05-17]]: writer failures are
@@ -50,7 +47,7 @@ use crate::quantize::ggml_quants::GgmlType;
 use super::accumulator::{Accumulator, AccumulatorRegistry};
 use super::error::ImatrixError;
 
-/// Canonical KV keys per `tools/imatrix/imatrix.cpp:37-39`.
+/// Canonical KV keys — the names stock imatrix consumers require.
 pub const KV_KEY_TYPE: &str = "general.type";
 pub const KV_KEY_DATASETS: &str = "imatrix.datasets";
 pub const KV_KEY_CHUNK_COUNT: &str = "imatrix.chunk_count";
@@ -85,11 +82,10 @@ pub fn write_imatrix<W: Write + Seek>(
     // imatrix.chunk_size. Plus 2 tensor-info entries per source tensor
     // (the in_sum2 + counts pair).
     //
-    // imatrix.cpp filters out zero-count tensors (line 543-565). We
+    // llama-imatrix filters out zero-count tensors. We
     // mirror that: any accumulator with `!has_data()` is skipped so
     // the file stays consistent with llama-imatrix output (which writes
-    // entries even with partial data, but `save_imatrix` at line 596
-    // iterates `to_store` only). For Phase A we follow the more
+    // entries even with partial data). For Phase A we follow the more
     // conservative rule of skipping completely-empty tensors so that
     // a partial Phase B run produces a valid file.
     let storable: Vec<(&str, &Accumulator)> =
@@ -112,9 +108,9 @@ pub fn write_imatrix<W: Write + Seek>(
 
     // ---- Tensor-info reservations -------------------------------------
     //
-    // Per imatrix.cpp:601-604:
-    //   in_sum2 = ggml_new_tensor_2d(F32, n_per_row, n_mat)
-    //   counts  = ggml_new_tensor_2d(F32, 1, n_mat)
+    // Wire shapes (must match llama-imatrix output):
+    //   in_sum2 = F32 [n_per_row, n_mat]
+    //   counts  = F32 [1, n_mat]
     //
     // GGUF stores dims innermost-first; PyTorch shape [n_per_row, n_mat]
     // → GGUF dims [n_per_row, n_mat] (already innermost-first since
@@ -144,13 +140,9 @@ pub fn write_imatrix<W: Write + Seek>(
 
     // ---- Stream tensor payloads ---------------------------------------
     //
-    // imatrix.cpp:606-611:
-    //   for (j = 0; j < nval; ++j) in_sum2->data[j] = stat.values[j];
-    //   for (j = 0; j < nmat; ++j) counts->data[j]  = (float) stat.counts[j];
-    //
     // Note counts is stored as f32, not i64. This matches llama-imatrix's
     // GGUF schema (legacy DAT format stores int32 ncalls; GGUF promotes
-    // to f32 — see imatrix.cpp:602 ggml_new_tensor_2d(GGML_TYPE_F32,...)).
+    // to f32).
     for ((_, acc), (in_sum2_idx, counts_idx)) in storable.iter().zip(payload_idx.iter()) {
         // in_sum2 payload (f32 LE)
         let mut in_sum2_bytes = Vec::with_capacity(acc.values.len() * 4);
@@ -159,7 +151,7 @@ pub fn write_imatrix<W: Write + Seek>(
         }
         w.stream_tensor_payload(*in_sum2_idx, &in_sum2_bytes)?;
 
-        // counts payload (i64 → f32 LE per imatrix.cpp:610)
+        // counts payload (i64 → f32 LE, matching llama-imatrix)
         let mut counts_bytes = Vec::with_capacity(acc.counts.len() * 4);
         for &c in &acc.counts {
             counts_bytes.extend_from_slice(&(c as f32).to_le_bytes());

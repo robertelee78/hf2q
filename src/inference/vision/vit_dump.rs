@@ -5,7 +5,7 @@
 //! # Why
 //!
 //! Iter-122 fixed the (weight + 1) RMSNorm bug. Iter-123 (W54) audited four
-//! more high-likelihood candidates against `/opt/llama.cpp/tools/mtmd/clip.cpp`
+//! more high-likelihood candidates against the peer's CLIP implementation
 //! and the gemma4v graph builder; all matched byte-for-byte. The hypothesis
 //! tree is exhausted and the smoke (`four_dots_in_corners_128x128.png`) still
 //! diverges from llama-mtmd-cli's caption.

@@ -20,18 +20,18 @@
 //!
 //! `preprocess_gemma4v` is a SIBLING entry point — separate from the
 //! fixed-resolution `preprocess_rgb_chw` path. It implements the
-//! variable-resolution patchifier llama.cpp uses for `PROJECTOR_TYPE_GEMMA4V`
-//! (`tools/mtmd/clip.cpp:1334-1343` + `tools/mtmd/models/gemma4v.cpp:4-15`):
+//! variable-resolution patchifier the peer uses for its gemma4v
+//! projector type:
 //!
 //!   1. Patchify image at native resolution into `patch_size × patch_size`
 //!      tiles. Compute `(n_x, n_y)` such that `n_x * n_y` lies in
 //!      `[token_min, token_max]` (typically `[252, 280]`); downscale
 //!      preserving aspect ratio when the native grid exceeds the cap.
 //!   2. Each pixel is mapped `[0, 1] → [-3, +1]` via `4x − 3`. This is
-//!      the algebraic collapse of llama.cpp's two-step scale-bias chain:
-//!      `img_u8_to_f32` with mean=std=[0.5, 0.5, 0.5] yields `2x − 1`
-//!      (`mtmd-image.cpp:11-21`), and `ggml_scale_bias(2.0, -1.0)` then
-//!      applies `2y − 1` on top of that (`gemma4v.cpp:9`), composing to
+//!      the algebraic collapse of the peer's two-step scale-bias chain:
+//!      u8→f32 conversion with mean=std=[0.5, 0.5, 0.5] yields `2x − 1`,
+//!      and a `(2.0, -1.0)` scale-bias then
+//!      applies `2y − 1` on top of that, composing to
 //!      `4x − 3`. The SigLIP-49 fixed-res path's `GEMMA4_VISION_CONFIG`
 //!      stops at the `2x − 1` step (no scale-bias follow-up) and is
 //!      therefore NOT byte-identical to the gemma4v variable-res path
@@ -39,8 +39,8 @@
 //!      W56).
 //!   3. Returns a `[N_patches, patch_size² × 3]` flat patch buffer plus
 //!      per-patch `pos_x` and `pos_y` index arrays so the dual
-//!      position-embed lookup (`tools/mtmd/models/gemma4v.cpp:18-42`)
-//!      and the per-axis 2D RoPE step (lines 46-91) can reuse them
+//!      position-embed lookup
+//!      and the per-axis 2D RoPE step can reuse them
 //!      downstream without re-deriving the (px, py) → (pos_x, pos_y)
 //!      mapping.
 //!
@@ -51,10 +51,9 @@
 //! Earlier iters used `image::imageops::FilterType::Triangle` for the
 //! gemma4v resize step. That's a separable triangle filter with
 //! pixel-center sampling and round-to-nearest output — which does NOT
-//! match llama.cpp's `mtmd_image_preprocessor_dyn_size` reference. The
+//! match the peer's dynamic-size preprocessor. The
 //! peer's algorithm is corner-aligned bilinear interpolation followed
-//! by truncation-to-uint8 (`/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:200-236`,
-//! `static_cast<uint8_t>(lerp(...))`). For sparse-signal fixtures
+//! by truncation-to-uint8. For sparse-signal fixtures
 //! (e.g. four corner dots on white), the difference between
 //! corner-aligned + truncation and center-aligned + round-to-nearest
 //! is large enough to flip patch-level pixel values and produce a
@@ -181,20 +180,20 @@ pub fn preprocess_rgb_chw(bytes: &[u8], config: &PreprocessConfig) -> Result<Vec
 // Gemma4V variable-resolution preprocessing
 // ---------------------------------------------------------------------------
 
-/// Knobs for the gemma4v patchifier. Defaults to llama.cpp's
-/// `PROJECTOR_TYPE_GEMMA4V` settings:
+/// Knobs for the gemma4v patchifier. Defaults to the peer's
+/// gemma4v projector settings:
 ///   - `patch_size = 16`
 ///   - `n_merge = 3` (pool kernel size; pre-pool patch grid axes must
 ///     be multiples of `n_merge` so the n_merge×n_merge avg-pool
 ///     produces an exact integer post-pool grid)
 ///   - `token_min = 252`, `token_max = 280` — **post-pool** token
-///     bounds per `tools/mtmd/clip.cpp:1341`
-///     `set_limit_image_tokens(252, 280)`. The `set_limit_image_tokens`
-///     helper at `tools/mtmd/clip-model.h:112-118` converts these to
+///     bounds. The peer's token-limit
+///     helper converts these to
 ///     pixel bounds:
 ///       `image_min_pixels = 252 * patch_size² * n_merge² = 580608`
 ///       `image_max_pixels = 280 * patch_size² * n_merge² = 645120`.
-///     These pixel bounds are what `calc_size_preserved_ratio` actually
+///     These pixel bounds are what the ratio-preserving size
+///     computation actually
 ///     consumes when picking the resized image dims; the resulting
 ///     pre-pool patch grid `(n_x, n_y)` is therefore aligned to
 ///     `align_size = patch_size * n_merge = 48` pixels — i.e. each
@@ -208,8 +207,8 @@ pub struct Gemma4vPreprocessConfig {
     pub n_merge: u32,
     /// Lower bound on the **post-pool** token count, i.e.
     /// `(n_x / n_merge) * (n_y / n_merge)` (inclusive). Small images
-    /// are upscaled to meet this floor — llama.cpp does the same
-    /// (the `@ngxson` rationale: small inputs degrade quality without it).
+    /// are upscaled to meet this floor — the peer does the same
+    /// (small inputs degrade quality without it).
     pub token_min: u32,
     /// Upper bound on the **post-pool** token count (inclusive). Large
     /// images are downscaled (preserving aspect ratio) until the
@@ -217,7 +216,7 @@ pub struct Gemma4vPreprocessConfig {
     pub token_max: u32,
 }
 
-/// Default gemma4v config — locked to llama.cpp's reference values so
+/// Default gemma4v config — locked to the peer's reference values so
 /// the hf2q output matches the GGUF tower's expected token budget.
 pub const GEMMA4V_PREPROCESS_DEFAULT: Gemma4vPreprocessConfig = Gemma4vPreprocessConfig {
     patch_size: 16,
@@ -234,12 +233,11 @@ pub struct Gemma4vPreprocessed {
     /// Flat `[N_patches, 3 × patch_size²]` tensor in row-major order.
     /// Within each row, the `3 × patch_size²` inner dim iterates as
     /// `(c, dy, dx)` — channel-major, pixel-minor — matching the
-    /// CHW im2col layout that llama.cpp's `ggml_conv_2d` produces over
-    /// `inp_raw[ne0=W, ne1=H, ne2=C]` (`tools/mtmd/clip.cpp:518` +
-    /// `ggml/src/ggml-cpu/ops.cpp:6391` `iic*(KH*KW) + ikh*KW + ikw`).
+    /// CHW im2col layout the peer's conv-2d produces over
+    /// `inp_raw[ne0=W, ne1=H, ne2=C]`
+    /// (`iic*(KH*KW) + ikh*KW + ikw` flat indexing).
     /// The GGUF-stored `v.patch_embd.weight` is CHW per output row
-    /// (writer applies `permute(0, 3, 1, 2)` matching
-    /// `convert_hf_to_gguf.py:7873-7877`); the linear matmul `out[n][o]
+    /// (writer applies `permute(0, 3, 1, 2)`); the linear matmul `out[n][o]
     /// = Σ_k weight[o][k] · patches[n][k]` requires both sides to share
     /// the same `(c, dy, dx)` flat indexing for `k` to refer to the
     /// same spatial-channel position. ADR-005 Phase 2c iter-126 (W57)
@@ -270,8 +268,7 @@ impl Gemma4vPreprocessed {
 
 /// Decode + variable-resolution patchify for the gemma4v vision tower.
 ///
-/// Implements the `clip_graph_gemma4v::build` input contract from
-/// `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp`:
+/// Implements the peer's gemma4v graph input contract:
 ///
 ///   - Decode image bytes (PNG/JPEG only, same restriction as
 ///     `preprocess_rgb_chw`).
@@ -280,16 +277,16 @@ impl Gemma4vPreprocessed {
 ///     patch count would fall below `token_min`, scale up to the
 ///     smallest size that meets the floor. `W` and `H` are rounded
 ///     down to multiples of `patch_size` so patchification is exact.
-///   - Resize via bilinear (matches llama.cpp's
-///     `RESIZE_ALGO_BILINEAR` for `PROJECTOR_TYPE_GEMMA4V`).
+///   - Resize via bilinear (the peer's resize algorithm for the
+///     gemma4v projector).
 ///   - Patchify into `[N_patches, patch_size² × 3]` with pixel layout
 ///     `(dy, dx, c)` per patch (matches candle's reshape, see
 ///     `Gemma4vPreprocessed::patches` doc).
 ///   - Pixel-scale `4x − 3` so the per-patch values are in `[-3, +1]`.
-///     This is the algebraic collapse of llama.cpp's two-step chain:
-///     `mtmd-image.cpp:11-21` `img_u8_to_f32` with mean=std=[0.5,0.5,0.5]
-///     gives `2x − 1` (range `[-1, +1]`), and `gemma4v.cpp:9`
-///     `ggml_scale_bias(2.0, -1.0)` then applies `2y − 1` on top, yielding
+///     This is the algebraic collapse of the peer's two-step chain:
+///     u8→f32 conversion with mean=std=[0.5,0.5,0.5]
+///     gives `2x − 1` (range `[-1, +1]`), and a
+///     `(2.0, -1.0)` scale-bias then applies `2y − 1` on top, yielding
 ///     `4x − 3`. Folded here into a single CPU pass so the GPU patch-embd
 ///     conv sees byte-faithful inputs (ADR-005 Phase 2c iter-125, W56).
 ///
@@ -345,18 +342,16 @@ pub fn preprocess_gemma4v(
     let target_h = n_y * p;
 
     // ADR-005 Phase 2c iter-121 (W52): byte-faithful match against
-    // `llama-mtmd-cli`'s `mtmd_image_preprocessor_dyn_size::preprocess`
-    // (`/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:859-878`). The peer's
-    // `img_tool::resize` is called with `image_resize_pad = true`
-    // (default in `clip-model.h:54` — gemma4v's projector init at
-    // `clip.cpp:1334-1343` does not override it), so we replicate the
-    // padded-resize branch with a black `pad_color` (`clip-model.h:55`,
-    // `image_pad_color = {0,0,0}`). Bilinear sampling is corner-aligned
+    // `llama-mtmd-cli`'s dynamic-size preprocessor. The peer's
+    // resize runs with padding enabled
+    // (the default — gemma4v's projector init
+    // does not override it), so we replicate the
+    // padded-resize branch with a black pad color ({0,0,0}).
+    // Bilinear sampling is corner-aligned
     // with truncation-to-uint8, NOT the image crate's
-    // `FilterType::Triangle` (center-aligned, round-to-nearest); see
-    // `mtmd-image.cpp:200-236`.
+    // `FilterType::Triangle` (center-aligned, round-to-nearest).
     let src_rgb = img.to_rgb8();
-    let rgb = resize_bilinear_pad_llama_cpp(&src_rgb, target_w, target_h, [0, 0, 0]);
+    let rgb = resize_bilinear_pad_peer(&src_rgb, target_w, target_h, [0, 0, 0]);
 
     let n_patches = (n_x as usize) * (n_y as usize);
     let p_us = p as usize;
@@ -367,9 +362,9 @@ pub fn preprocess_gemma4v(
 
     // Patchify in (py, px, c, dy, dx) order — channel-major within
     // each patch row to match the CHW im2col layout consumed by
-    // llama.cpp's patch_embd conv (see `Gemma4vPreprocessed::patches`
-    // doc) and the CHW-permuted GGUF weight (`gguf.rs:995` +
-    // `convert_hf_to_gguf.py:7873-7877`). ADR-005 Phase 2c iter-126
+    // the peer's patch_embd conv (see `Gemma4vPreprocessed::patches`
+    // doc) and the CHW-permuted GGUF weight (`gguf.rs:995`).
+    // ADR-005 Phase 2c iter-126
     // (W57): prior HWC `(dy, dx, c)` ordering was a mismatch against
     // the GGUF weight's CHW per-output-row layout — uniform-channel
     // patches still produced byte-identical output (Σ over channels
@@ -391,11 +386,11 @@ pub fn preprocess_gemma4v(
                     let pix = rgb.get_pixel(img_x, img_y);
                     let pos_in_plane = (dy as usize) * p_us + (dx as usize);
                     // ADR-005 Phase 2c iter-125 (W56): byte-faithful match
-                    // against llama.cpp's two-step scale-bias chain.
-                    // Step 1 — `mtmd-image.cpp:11-21` `img_u8_to_f32` with
+                    // against the peer's two-step scale-bias chain.
+                    // Step 1 — u8→f32 conversion with
                     // mean=std=[0.5,0.5,0.5]:
                     //     y = (pix/255 - 0.5)/0.5  = 2*pix/255 - 1   ∈ [-1, +1]
-                    // Step 2 — `gemma4v.cpp:9` `ggml_scale_bias(2.0, -1.0)`:
+                    // Step 2 — a `(2.0, -1.0)` scale-bias:
                     //     z = 2*y + (-1)           = 2*(2*pix/255 - 1) - 1
                     //                              = 4*pix/255 - 3    ∈ [-3, +1]
                     // Folded into a single CPU expression: `4x − 3`. Iter-124
@@ -434,14 +429,8 @@ pub fn preprocess_gemma4v(
 /// `(orig_w, orig_h)` image given a patch edge `p`, pool kernel size
 /// `n_merge`, and `[token_min, token_max]` **post-pool** token bounds.
 ///
-/// This is a byte-faithful port of llama.cpp's
-/// `img_tool::calc_size_preserved_ratio(inp, align_size,
-/// min_pixels, max_pixels)`
-/// (`/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:144-168`), called by
-/// `mtmd_image_preprocessor_dyn_size::preprocess` at
-/// `/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:864-873` for
-/// `PROJECTOR_TYPE_GEMMA4V`. The pixel bounds come from
-/// `set_limit_image_tokens` at `clip-model.h:112-118` which converts
+/// This must stay byte-faithful to the peer's ratio-preserving size
+/// computation for the gemma4v projector. The pixel bounds come from
 /// the post-pool token bounds via
 ///   `image_min_pixels = token_min * patch_size² * n_merge²`
 ///   `image_max_pixels = token_max * patch_size² * n_merge²`.
@@ -475,8 +464,7 @@ fn compute_gemma4v_patch_grid(
             "gemma4v patch grid: align_size = patch_size ({p}) * n_merge ({n_merge}) is zero"
         ));
     }
-    // Pixel-area bounds, mirroring `set_limit_image_tokens`
-    // (clip-model.h:112-118): patch_area = p² * n_merge².
+    // Pixel-area bounds: patch_area = p² * n_merge².
     let patch_area: u64 = (p as u64) * (p as u64) * (n_merge as u64) * (n_merge as u64);
     let min_pixels: u64 = (token_min as u64) * patch_area;
     let max_pixels: u64 = (token_max as u64) * patch_area;
@@ -492,7 +480,7 @@ fn compute_gemma4v_patch_grid(
     let width = orig_w as u64;
     let height = orig_h as u64;
 
-    // "Always align up first" — clip-model.h:153-155.
+    // "Always align up first".
     let mut h_bar: u64 = align_size.max(round_by(height as f64));
     let mut w_bar: u64 = align_size.max(round_by(width as f64));
 
@@ -535,12 +523,11 @@ fn compute_gemma4v_patch_grid(
 }
 
 // ---------------------------------------------------------------------------
-// Byte-faithful llama.cpp bilinear resize (ADR-005 Phase 2c iter-121, W52)
+// Byte-faithful peer bilinear resize (ADR-005 Phase 2c iter-121, W52)
 // ---------------------------------------------------------------------------
 
-/// Corner-aligned bilinear resize matching llama.cpp's
-/// `img_tool::resize_bilinear` byte-for-byte (`/opt/llama.cpp/tools/mtmd/
-/// mtmd-image.cpp:200-236`).
+/// Corner-aligned bilinear resize matching the peer's bilinear resize
+/// byte-for-byte.
 ///
 /// Differences vs `image::imageops::FilterType::Triangle`:
 ///   - **Sampling alignment**: uses `x_ratio = (src_w-1)/(target_w-1)`
@@ -554,7 +541,7 @@ fn compute_gemma4v_patch_grid(
 ///   - **u8 cast**: `static_cast<uint8_t>(lerp(top, bottom, yf))` — C++
 ///     truncation-toward-zero of a non-negative float is `floor`, NOT
 ///     round-to-nearest.
-fn resize_bilinear_llama_cpp(src: &RgbImage, target_w: u32, target_h: u32) -> RgbImage {
+fn resize_bilinear_peer(src: &RgbImage, target_w: u32, target_h: u32) -> RgbImage {
     let src_w = src.width();
     let src_h = src.height();
     if target_w == 0 || target_h == 0 || src_w == 0 || src_h == 0 {
@@ -617,25 +604,24 @@ fn resize_bilinear_llama_cpp(src: &RgbImage, target_w: u32, target_h: u32) -> Rg
     dst
 }
 
-/// Resize-with-padding match for `img_tool::resize` with
-/// `add_padding = true` (`/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:68-98`).
+/// Resize-with-padding match for the peer's padded resize.
 ///
 ///   - Compute `scale = min(target_w/src.nx, target_h/src.ny)` —
 ///     fit-inside, aspect-ratio preserving.
 ///   - `new_w = min(ceil(src.nx * scale), target_w)`,
 ///     `new_h = min(ceil(src.ny * scale), target_h)`.
 ///   - Bilinear-resize to `(new_w, new_h)` via
-///     `resize_bilinear_llama_cpp`.
+///     `resize_bilinear_peer`.
 ///   - Allocate `target_w × target_h` filled with `pad_color`, composite
 ///     resized image at `((target_w - new_w)/2, (target_h - new_h)/2)`
 ///     (center).
 ///
 /// For square inputs where target is square (the common gemma4v case
-/// after `calc_size_preserved_ratio`), `new_w == target_w` and
+/// after the ratio-preserving size computation), `new_w == target_w` and
 /// `new_h == target_h`, so the padding is a no-op and behavior reduces
 /// to plain bilinear. For non-square inputs the center-pad is what
-/// llama.cpp emits, and we match it.
-fn resize_bilinear_pad_llama_cpp(
+/// the peer emits, and we match it.
+fn resize_bilinear_pad_peer(
     src: &RgbImage,
     target_w: u32,
     target_h: u32,
@@ -650,7 +636,6 @@ fn resize_bilinear_pad_llama_cpp(
         return ImageBuffer::new(target_w.max(1), target_h.max(1));
     }
 
-    // `mtmd-image.cpp:71-75`.
     let scale_w = (target_w as f32) / (src_w as f32);
     let scale_h = (target_h as f32) / (src_h as f32);
     let scale = scale_w.min(scale_h);
@@ -661,13 +646,12 @@ fn resize_bilinear_pad_llama_cpp(
     let new_w = (new_w_f.ceil() as i64).min(target_w as i64).max(1) as u32;
     let new_h = (new_h_f.ceil() as i64).min(target_h as i64).max(1) as u32;
 
-    let resized = resize_bilinear_llama_cpp(src, new_w, new_h);
+    let resized = resize_bilinear_peer(src, new_w, new_h);
 
-    // Fill dst with pad_color (`mtmd-image.cpp:92` + `fill` lambda
-    // `mtmd-image.cpp:189-196`).
+    // Fill dst with pad_color.
     let mut dst: RgbImage = ImageBuffer::from_pixel(target_w, target_h, Rgb(pad_color));
 
-    // Composite at center (`mtmd-image.cpp:94-97`).
+    // Composite at center.
     let offset_x = ((target_w - new_w) / 2) as i32;
     let offset_y = ((target_h - new_h) / 2) as i32;
     for y in 0..new_h {
@@ -689,9 +673,7 @@ fn resize_bilinear_pad_llama_cpp(
 // ---------------------------------------------------------------------------
 
 /// Knobs for the Qwen3-VL "smart_resize" preprocessor, sourced from
-/// peer's projector init at `/opt/llama.cpp/tools/mtmd/clip.cpp:1352-1369`
-/// and the helper at `/opt/llama.cpp/tools/mtmd/clip-model.h:112-118`
-/// (`set_limit_image_tokens`).
+/// the peer's projector init and token-limit helper.
 ///
 /// For Qwen3-VL the per-token budget defaults to `[8, 4096]`. The
 /// pixel-area bounds are derived as
@@ -1273,7 +1255,7 @@ mod tests {
 
     #[test]
     fn gemma4v_preprocess_default_constants_match_llama_cpp() {
-        // Locks the llama.cpp `set_limit_image_tokens(252, 280)` and
+        // Locks the peer's `(252, 280)` token-limit and
         // `n_merge=3`/`patch_size=16` reference values.
         assert_eq!(GEMMA4V_PREPROCESS_DEFAULT.patch_size, 16);
         assert_eq!(GEMMA4V_PREPROCESS_DEFAULT.n_merge, 3);
@@ -1288,9 +1270,8 @@ mod tests {
         // must land in `[token_min, token_max]` = `[252, 280]`. The
         // pre-pool patch grid axes must each be multiples of
         // `n_merge = 3` so the avg-pool kernel sees an exact integer
-        // grid (matches llama.cpp's
-        // `mtmd_image_preprocessor_dyn_size::preprocess` resize via
-        // `calc_size_preserved_ratio` with align_size = patch * n_merge).
+        // grid (matches the peer's dynamic-size preprocessor resize
+        // with align_size = patch * n_merge).
         let n_merge = GEMMA4V_PREPROCESS_DEFAULT.n_merge;
         for (w, h) in [(64u32, 64), (256, 256), (1024, 1024)] {
             let png = encode_solid_png(w, h, [128, 128, 128]);
@@ -1326,7 +1307,7 @@ mod tests {
     fn gemma4v_preprocess_pixel_scaling_4x_minus_3() {
         // ADR-005 Phase 2c iter-125 (W56): expected values updated from the
         // old single-step `2x − 1` algebra (which produced range [-1, +1])
-        // to the byte-faithful llama.cpp two-step chain folded as `4x − 3`
+        // to the peer's byte-faithful two-step chain folded as `4x − 3`
         // (range [-3, +1]). Solid black (0) → 4*0 - 3 = -3.0. Solid white
         // (255) → 4*1 - 3 = +1.0. Mid-gray (128) → 4*(128/255) - 3 ≈ -0.992.
         for (rgb, expect) in [([0u8, 0, 0], -3.0_f32), ([255, 255, 255], 1.0)] {
@@ -1359,9 +1340,9 @@ mod tests {
     #[test]
     fn gemma4v_preprocess_pixel_range_in_minus_three_plus_one() {
         // ADR-005 Phase 2c iter-125 (W56): expected range updated from
-        // [-1, +1] (old one-step `2x − 1`) to [-3, +1] (byte-faithful
-        // two-step chain `4x − 3`, llama.cpp `gemma4v.cpp:9` +
-        // `mtmd-image.cpp:11-21`). Random-style gradient image — every
+        // [-1, +1] (old one-step `2x − 1`) to [-3, +1] (the peer's
+        // byte-faithful
+        // two-step chain `4x − 3`). Random-style gradient image — every
         // pixel must end up in [-3, +1].
         let img: RgbImage = ImageBuffer::from_fn(128, 128, |x, y| {
             Rgb([
@@ -1419,11 +1400,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // ADR-005 Phase 2c iter-121 (W52) — byte-faithful llama.cpp resize
+    // ADR-005 Phase 2c iter-121 (W52) — byte-faithful peer resize
     // -------------------------------------------------------------------
 
     #[test]
-    fn resize_bilinear_llama_cpp_corner_aligned_identity_2x2_to_3x3() {
+    fn resize_bilinear_peer_corner_aligned_identity_2x2_to_3x3() {
         // 2×2 input with each pixel a unique value; resize to 3×3.
         // Corner-aligned bilinear with x_ratio = (2-1)/(3-1) = 0.5 means
         // output position (0,0) samples src(0,0), (2,2) samples src(1,1)
@@ -1436,7 +1417,7 @@ mod tests {
         src.put_pixel(0, 1, Rgb([200, 200, 200])); // bot-left = 200
         src.put_pixel(1, 1, Rgb([255, 255, 255])); // bot-right = 255
 
-        let dst = resize_bilinear_llama_cpp(&src, 3, 3);
+        let dst = resize_bilinear_peer(&src, 3, 3);
         // Corner (0,0) must be exactly src(0,0) = 0 (not blended).
         assert_eq!(dst.get_pixel(0, 0).0[0], 0, "corner (0,0)");
         // Corner (2,2) must be exactly src(1,1) = 255 (not blended).
@@ -1453,28 +1434,28 @@ mod tests {
     }
 
     #[test]
-    fn resize_bilinear_llama_cpp_truncates_not_rounds() {
+    fn resize_bilinear_peer_truncates_not_rounds() {
         // 1×2 source [0, 1] → resize to 1×3. With x_ratio = (2-1)/(3-1) = 0.5,
         // middle output samples px=0.5 → top=0.5, bottom=0.5, out=0.5.
         // Truncation: 0.5 → 0 (NOT 1 like round-to-nearest).
         let mut src: RgbImage = ImageBuffer::new(1, 2);
         src.put_pixel(0, 0, Rgb([0, 0, 0]));
         src.put_pixel(0, 1, Rgb([1, 1, 1]));
-        let dst = resize_bilinear_llama_cpp(&src, 1, 3);
+        let dst = resize_bilinear_peer(&src, 1, 3);
         assert_eq!(dst.get_pixel(0, 0).0, [0, 0, 0]);
         assert_eq!(dst.get_pixel(0, 1).0, [0, 0, 0], "trunc(0.5)=0");
         assert_eq!(dst.get_pixel(0, 2).0, [1, 1, 1]);
     }
 
     #[test]
-    fn resize_bilinear_pad_llama_cpp_no_pad_for_square_input() {
+    fn resize_bilinear_pad_peer_no_pad_for_square_input() {
         // Square input → square target: padding branch must reduce to
         // plain bilinear (new_w/new_h hit target exactly). Verifies
         // gemma4v's common case (square fixtures) works the same as
         // direct resize.
         let src: RgbImage = ImageBuffer::from_fn(4, 4, |x, _y| Rgb([(x * 50) as u8; 3]));
-        let padded = resize_bilinear_pad_llama_cpp(&src, 8, 8, [0, 0, 0]);
-        let plain = resize_bilinear_llama_cpp(&src, 8, 8);
+        let padded = resize_bilinear_pad_peer(&src, 8, 8, [0, 0, 0]);
+        let plain = resize_bilinear_peer(&src, 8, 8);
         for y in 0..8 {
             for x in 0..8 {
                 assert_eq!(
@@ -1487,13 +1468,13 @@ mod tests {
     }
 
     #[test]
-    fn resize_bilinear_pad_llama_cpp_pads_non_square_input() {
+    fn resize_bilinear_pad_peer_pads_non_square_input() {
         // 4×2 source → 4×4 target. scale = min(4/4, 4/2) = 1.0.
         // new_w = ceil(4*1.0) = 4, new_h = ceil(2*1.0) = 2.
         // Padding adds 1 row of black above and 1 row below the resized
         // image (offset_y = (4-2)/2 = 1).
         let src: RgbImage = ImageBuffer::from_fn(4, 2, |_x, _y| Rgb([200, 100, 50]));
-        let dst = resize_bilinear_pad_llama_cpp(&src, 4, 4, [0, 0, 0]);
+        let dst = resize_bilinear_pad_peer(&src, 4, 4, [0, 0, 0]);
         // Top row must be black pad.
         for x in 0..4 {
             assert_eq!(dst.get_pixel(x, 0).0, [0, 0, 0], "pad top ({x},0)");
@@ -1512,7 +1493,7 @@ mod tests {
     #[test]
     fn gemma4v_preprocess_uses_llama_cpp_resize_for_four_corner_dots() {
         // 8×8 image with four corner pixels = white, rest = black.
-        // After llama.cpp's corner-aligned bilinear resize to a much
+        // After the peer's corner-aligned bilinear resize to a much
         // larger target (e.g. 768×768 from the gemma4v patch grid),
         // the resulting CORNER patches must contain non-zero pixel values
         // (white seeped into the corner via the lerp from the 1-pixel

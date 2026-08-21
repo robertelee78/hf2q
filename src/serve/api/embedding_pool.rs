@@ -79,10 +79,10 @@ pub enum PoolingStrategy {
 impl PoolingStrategy {
     /// Convert from the GGUF `pooling_type` numeric value.
     ///
-    /// Mapping mirrors `llama_pooling_type` in llama.cpp:
+    /// Mapping mirrors the peer's pooling-type enum:
     /// - `1` → [`Mean`](PoolingStrategy::Mean)
     /// - `2` → [`ClsToken`](PoolingStrategy::ClsToken)
-    /// - `3` → [`EosLastToken`](PoolingStrategy::EosLastToken) (llama.cpp `Last`)
+    /// - `3` → [`EosLastToken`](PoolingStrategy::EosLastToken) (the peer's `Last`)
     ///
     /// Returns `None` for unrecognised values (e.g. `0` = None,
     /// `4` = Rank — both unsupported by `/v1/embeddings`).
@@ -209,7 +209,7 @@ pub fn pool_eos_last_token(
 /// unit-norm vectors suitable for cosine-similarity search.
 ///
 /// `eps` prevents division by zero on all-zero inputs; standard value is
-/// `1e-12` (matches llama.cpp + sentence-transformers).
+/// `1e-12` (matches the peer + sentence-transformers).
 pub fn l2_normalize(v: &mut [f32], eps: f32) {
     let norm_sq: f32 = v.iter().map(|x| x * x).sum();
     let inv_norm = 1.0 / (norm_sq + eps).sqrt();

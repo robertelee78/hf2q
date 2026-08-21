@@ -3,10 +3,10 @@
 //! Per ADR-033 Decision §6, `hf2q convert-v2 --quant <name>` accepts three
 //! disjoint name-spaces:
 //!
-//! 1. **Standard llama.cpp ftypes** — `f32`, `f16`, `bf16`, `q4_0`,
+//! 1. **Standard GGUF ftypes** — `f32`, `f16`, `bf16`, `q4_0`,
 //!    `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q2_k`, `q3_k_s/m/l`, `q4_k_s/m`,
 //!    `q5_k_s/m`, `q6_k`, `iq4_nl`, etc. — parsed via
-//!    [`LlamaFtype::from_name`].
+//!    [`GgufFtype::from_name`].
 //! 2. **Apex algorithmic tiers** — `apex-quality`, `apex-i-quality`,
 //!    `apex-balanced`, `apex-i-balanced`, `apex-compact`, `apex-i-compact`,
 //!    `apex-mini`. Resolved to [`ApexTier`]; the driver pairs each tier
@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use crate::quantize::ggml_quants::apex::{ApexTier, SUPPORTED_APEX_TIERS};
-use crate::quantize::ggml_quants::{LlamaFtype, DEEPSEEK4_AGENTIC_Q2_NAME};
+use crate::quantize::ggml_quants::{GgufFtype, DEEPSEEK4_AGENTIC_Q2_NAME};
 
 /// One resolved `--quant <name>` selector.
 ///
@@ -38,16 +38,16 @@ use crate::quantize::ggml_quants::{LlamaFtype, DEEPSEEK4_AGENTIC_Q2_NAME};
 /// vs operator-supplied tensor-type file).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuantSelector {
-    /// Standard llama.cpp file-type. The driver builds the orchestrator
+    /// Standard GGUF file-type. The driver builds the orchestrator
     /// with `StandardPolicy` and emits `general.file_type` = the
-    /// underlying [`LlamaFtype`] discriminant.
-    Standard(LlamaFtype),
+    /// underlying [`GgufFtype`] discriminant.
+    Standard(GgufFtype),
     /// DeepSeek-V4 agent profile: a standard Q2_K expert body with Q3_K
     /// down projections and Q8_0 context-discrimination tensors.
     Deepseek4AgenticQ2,
     /// Apex algorithmic tier. The driver builds an `ApexPolicy { tier,
     /// n_layers, n_expert }` from the source model's `config.json`.
-    /// `general.file_type` carries the closest standard LlamaFtype
+    /// `general.file_type` carries the closest standard GgufFtype
     /// approximation (see [`approximate_for_apex`]).
     Apex(ApexTier),
     /// Operator-supplied `apex-custom --tensor-type-file <path>`. Out of
@@ -64,8 +64,8 @@ pub enum QuantSelector {
 /// falls back to a default.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QuantSelectorError {
-    /// The name didn't match any standard `LlamaFtype` or apex prefix.
-    #[error("unknown --quant value `{name}` (no LlamaFtype / Apex tier mapping)")]
+    /// The name didn't match any standard `GgufFtype` or apex prefix.
+    #[error("unknown --quant value `{name}` (no GgufFtype / Apex tier mapping)")]
     UnknownQuant { name: String },
 
     /// `--quant apex-<X>` where `<X>` isn't in the v1 supported tier
@@ -107,7 +107,7 @@ pub enum QuantSelectorError {
     #[error("--quant apex is unqualified; use one of {supported:?} or `apex-custom`")]
     ApexUnqualified { supported: &'static [&'static str] },
 
-    /// TQ1_0 / TQ2_0 are valid `LlamaFtype` variants but out of v1
+    /// TQ1_0 / TQ2_0 are valid `GgufFtype` variants but out of v1
     /// convert-v2 scope (no quantizer implementation — see
     /// `quantizer.rs`). We surface a more diagnostic error than the
     /// generic UnknownQuant.
@@ -132,7 +132,7 @@ impl QuantSelector {
     /// Parse a `--quant <name>` string into the matching selector.
     ///
     /// Resolution order:
-    /// 1. Try [`LlamaFtype::from_name`] first — the most common case.
+    /// 1. Try [`GgufFtype::from_name`] first — the most common case.
     /// 2. Try the `apex-<tier>` prefix.
     /// 3. Match reserved-name typed errors (`dwq`, bare `apex`,
     ///    `tq1_0`, `tq2_0`).
@@ -145,8 +145,8 @@ impl QuantSelector {
             return Ok(QuantSelector::Deepseek4AgenticQ2);
         }
 
-        // 1. Standard llama.cpp ftypes. TQ1_0 / TQ2_0 are members of
-        //    LlamaFtype but the convert-v2 pipeline has no Quantizer impl
+        // 1. Standard GGUF ftypes. TQ1_0 / TQ2_0 are members of
+        //    GgufFtype but the convert-v2 pipeline has no Quantizer impl
         //    for them today — surface a more diagnostic error rather than
         //    letting them slip through and panic at quantize time.
         match s {
@@ -157,7 +157,7 @@ impl QuantSelector {
             }
             _ => {}
         }
-        if let Some(ftype) = LlamaFtype::from_name(s) {
+        if let Some(ftype) = GgufFtype::from_name(s) {
             return Ok(QuantSelector::Standard(ftype));
         }
 
@@ -204,14 +204,14 @@ impl QuantSelector {
     }
 }
 
-/// Closest standard [`LlamaFtype`] for an [`ApexTier`].
+/// Closest standard [`GgufFtype`] for an [`ApexTier`].
 ///
-/// Apex tiers are mixed-precision recipes — no single LlamaFtype is a
+/// Apex tiers are mixed-precision recipes — no single GgufFtype is a
 /// faithful encoding. We pick the closest "headline" ftype so the GGUF
 /// `general.file_type` byte at least clues operators / inspectors into
 /// the tier's bit-budget class:
 ///
-/// | Apex tier              | Approximate LlamaFtype |
+/// | Apex tier              | Approximate GgufFtype |
 /// |------------------------|------------------------|
 /// | Quality / IQuality     | MostlyQ6_K (18)        |
 /// | Balanced / IBalanced   | MostlyQ5_K_M (17)      |
@@ -225,12 +225,12 @@ impl QuantSelector {
 /// header-metadata pick** — actual per-tensor types are decided by
 /// `ApexPolicy::target_for` and recorded on each tensor's own
 /// `ggml_type` field, not via the file-type byte.
-pub const fn approximate_for_apex(tier: ApexTier) -> LlamaFtype {
+pub const fn approximate_for_apex(tier: ApexTier) -> GgufFtype {
     match tier {
-        ApexTier::Quality | ApexTier::IQuality => LlamaFtype::MostlyQ6_K,
-        ApexTier::Balanced | ApexTier::IBalanced => LlamaFtype::MostlyQ5_K_M,
-        ApexTier::Compact | ApexTier::ICompact => LlamaFtype::MostlyQ4_K_M,
-        ApexTier::Mini => LlamaFtype::MostlyQ3_K_S,
+        ApexTier::Quality | ApexTier::IQuality => GgufFtype::MostlyQ6_K,
+        ApexTier::Balanced | ApexTier::IBalanced => GgufFtype::MostlyQ5_K_M,
+        ApexTier::Compact | ApexTier::ICompact => GgufFtype::MostlyQ4_K_M,
+        ApexTier::Mini => GgufFtype::MostlyQ3_K_S,
     }
 }
 
@@ -241,22 +241,22 @@ mod tests {
     #[test]
     fn parse_quant_selector_standard_round_trip() {
         // Spot-check a handful of standard ftype names — full coverage
-        // lives in `LlamaFtype::name_round_trip` already.
+        // lives in `GgufFtype::name_round_trip` already.
         assert_eq!(
             QuantSelector::from_name("q5_k_m").unwrap(),
-            QuantSelector::Standard(LlamaFtype::MostlyQ5_K_M)
+            QuantSelector::Standard(GgufFtype::MostlyQ5_K_M)
         );
         assert_eq!(
             QuantSelector::from_name("q8_0").unwrap(),
-            QuantSelector::Standard(LlamaFtype::MostlyQ8_0)
+            QuantSelector::Standard(GgufFtype::MostlyQ8_0)
         );
         assert_eq!(
             QuantSelector::from_name("f16").unwrap(),
-            QuantSelector::Standard(LlamaFtype::MostlyF16)
+            QuantSelector::Standard(GgufFtype::MostlyF16)
         );
         assert_eq!(
             QuantSelector::from_name("iq4_nl").unwrap(),
-            QuantSelector::Standard(LlamaFtype::MostlyIQ4_NL)
+            QuantSelector::Standard(GgufFtype::MostlyIQ4_NL)
         );
     }
 
@@ -500,31 +500,31 @@ mod tests {
     fn approximate_for_apex_table() {
         assert_eq!(
             approximate_for_apex(ApexTier::Quality),
-            LlamaFtype::MostlyQ6_K
+            GgufFtype::MostlyQ6_K
         );
         assert_eq!(
             approximate_for_apex(ApexTier::IQuality),
-            LlamaFtype::MostlyQ6_K
+            GgufFtype::MostlyQ6_K
         );
         assert_eq!(
             approximate_for_apex(ApexTier::Balanced),
-            LlamaFtype::MostlyQ5_K_M
+            GgufFtype::MostlyQ5_K_M
         );
         assert_eq!(
             approximate_for_apex(ApexTier::IBalanced),
-            LlamaFtype::MostlyQ5_K_M
+            GgufFtype::MostlyQ5_K_M
         );
         assert_eq!(
             approximate_for_apex(ApexTier::Compact),
-            LlamaFtype::MostlyQ4_K_M
+            GgufFtype::MostlyQ4_K_M
         );
         assert_eq!(
             approximate_for_apex(ApexTier::ICompact),
-            LlamaFtype::MostlyQ4_K_M
+            GgufFtype::MostlyQ4_K_M
         );
         assert_eq!(
             approximate_for_apex(ApexTier::Mini),
-            LlamaFtype::MostlyQ3_K_S
+            GgufFtype::MostlyQ3_K_S
         );
     }
 }

@@ -148,8 +148,7 @@ pub fn extract_n_eval(stderr: &str) -> Option<u32> {
 /// Accepts two formats:
 /// 1. **Real llama-cli**:
 ///    `llama_model_loader: loaded meta data with N key-value pairs
-///    and X tensors from ...` — see `/opt/llama.cpp/src/llama-model-
-///    loader.cpp:704`.
+///    and X tensors from ...`.
 /// 2. **Synthetic test fixture**: `llama_model_load: loaded tensor 0xN`
 ///    (decimal or hex) — emitted by the mock stub in
 ///    tests/smoke_conformance.rs.
@@ -344,7 +343,7 @@ mod tests {
     }
 
     /// Real llama-cli emits `eval time = X ms / N runs` for generated
-    /// tokens (see /opt/llama.cpp docs/multimodal/MobileVLM.md:99). The
+    /// tokens. The
     /// parser must accept this format, NOT just the synthetic
     /// `n_eval = N` form the mock emits. Without this, P8's "real-model
     /// close" is impossible — the parser would silently fail to find
@@ -365,7 +364,6 @@ mod tests {
 
     /// Real llama-cli's tensor count line:
     /// `llama_model_loader: loaded meta data with K key-value pairs and N tensors from ...`.
-    /// (`/opt/llama.cpp/src/llama-model-loader.cpp:704`)
     #[test]
     fn extract_loaded_tensor_count_parses_real_llama_cli_format() {
         let s =

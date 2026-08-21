@@ -37,7 +37,7 @@ pub enum SourceDtype {
 ///    convert pipeline.
 /// 2. **C-fidelity placeholders** — `Falcon` and the rest exist so
 ///    `target_for` can express its arch-keyed branches verbatim against
-///    `llama-quant.cpp`. The convert pipeline doesn't yet support
+///    the peer's. The convert pipeline doesn't yet support
 ///    quantizing models of these architectures; they show up in
 ///    `target_for` only because the C function branches on them.
 ///
@@ -62,8 +62,7 @@ pub enum ArchName {
     /// `model.vision_tower.encoder.layers.<N>.*` (plural `layers`, no
     /// `vision_model` infix), block has SwiGLU FFN + post-attn/post-ffn
     /// norms + per-head q/k_norm. Projector type 'gemma4v'. Canonical
-    /// handler `/opt/llama.cpp/conversion/gemma.py:769-840
-    /// Gemma4VisionAudioModel`.
+    /// handler: the peer's `Gemma4VisionAudioModel`.
     Gemma4VisionMmproj,
     /// Dense Qwen3.5-family hybrid decoder (`qwen35` GGUF), including
     /// Qwen3.8-27B. This is distinct from both Qwen MoE variants.
@@ -79,7 +78,7 @@ pub enum ArchName {
     /// Handles `Qwen3_5MoeForConditionalGeneration` (multimodal-wrapping
     /// `model.language_model.*` + `model.visual.*`) and
     /// `Qwen3_5MoeForCausalLM` (text-only). Canonical handler:
-    /// `/opt/llama.cpp/conversion/qwen.py:626-628 Qwen3_5MoeTextModel`
+    /// the peer's `Qwen3_5MoeTextModel`
     /// (inherits `_Qwen35MtpMixin`, `_Qwen35MRopeMixin`,
     /// `_LinearAttentionVReorderBase`).
     Qwen35MoeFull,
@@ -98,7 +97,7 @@ pub enum ArchName {
 
     // --- C-fidelity placeholders for `target_for` (no convert support yet) ---
     /// Falcon — explicitly checked in 6 places inside
-    /// `llama_tensor_get_type_impl` (L449, L580, L588, L591, L602, L614).
+    /// `llama_tensor_get_type_impl`.
     Falcon,
 }
 

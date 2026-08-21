@@ -121,7 +121,7 @@ pub(crate) fn run_convert_with_stored_evidence(
     }
     if !matches!(
         args.selector,
-        QuantSelector::Standard(LlamaFtype::MostlyQ4_K_M | LlamaFtype::MostlyQ8_0)
+        QuantSelector::Standard(GgufFtype::MostlyQ4_K_M | GgufFtype::MostlyQ8_0)
     ) {
         return Err(ConvertError::Source(SourceError::Safetensors(
             "stored conversion evidence v1 admits only q4_k_m and q8_0 standard selectors".into(),
@@ -264,14 +264,14 @@ pub(crate) fn verify_persisted_stored_artifact(
             )))
         })?;
 
-    let replay_ftype = LlamaFtype::from_name(&persisted.policy.selector).ok_or_else(|| {
+    let replay_ftype = GgufFtype::from_name(&persisted.policy.selector).ok_or_else(|| {
         ConvertError::Source(SourceError::Safetensors(
             "persisted receipt selector is not a standard GGML policy".into(),
         ))
     })?;
     if !matches!(
         replay_ftype,
-        LlamaFtype::MostlyQ4_K_M | LlamaFtype::MostlyQ8_0
+        GgufFtype::MostlyQ4_K_M | GgufFtype::MostlyQ8_0
     ) {
         return Err(ConvertError::Source(SourceError::Safetensors(
             "persisted receipt selector is outside stored-evidence v1".into(),

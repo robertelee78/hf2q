@@ -1,7 +1,7 @@
 //! BERT tokenizer (WordPiece) — load from GGUF metadata.
 //!
 //! GGUF stores WordPiece vocabulary + special-token IDs in metadata keys
-//! following llama.cpp's convention (`tokenizer.ggml.*`). This module:
+//! following the peer's convention (`tokenizer.ggml.*`). This module:
 //!
 //!   - Defines `BertSpecialTokens` + `BertVocab` types holding the
 //!     extracted state.
@@ -29,18 +29,17 @@ use tokenizers::processors::bert::BertProcessing;
 use tokenizers::Tokenizer;
 
 // ---------------------------------------------------------------------------
-// BertWpmTokenizer — llama.cpp-compatible WordPiece (BERT GGUF format)
+// BertWpmTokenizer — peer-compatible WordPiece (BERT GGUF format)
 // ---------------------------------------------------------------------------
 //
-// llama.cpp stores BERT vocabularies with U+2581 (▁) prefixing every
+// The peer stores BERT vocabularies with U+2581 (▁) prefixing every
 // word-starter token; subwords are bare. This is the inverse of the
 // HuggingFace `tokenizers` crate's WordPiece convention (no prefix on
 // word-starters, `##` prefix on subwords). The two conventions are not
 // interchangeable — the bge-small GGUF cannot be loaded into HF's
 // WordPiece without a vocab translation that risks ambiguous mappings.
 //
-// Solution: port llama.cpp's `llm_tokenizer_wpm_session::tokenize` from
-// `/opt/llama.cpp/src/llama-vocab.cpp:727-813` directly to Rust. The
+// Solution: implement the peer's WPM tokenize routine directly in Rust. The
 // algorithm:
 //   1. Normalize + lowercase the input (NFD, then `is_whitespace` /
 //      `is_punctuation` boundaries split words).
@@ -52,9 +51,8 @@ use tokenizers::Tokenizer;
 // applied via a flag on `encode`, so the tokenizer is the canonical
 // hf2q tokenizer for any GGUF whose `tokenizer.ggml.model = "bert"`.
 
-/// llama.cpp-compatible BERT WordPiece tokenizer. Matches the C++
-/// reference in `/opt/llama.cpp/src/llama-vocab.cpp::llm_tokenizer_wpm_session`
-/// byte-for-byte on standard ASCII inputs.
+/// Peer-compatible BERT WordPiece tokenizer. Matches the peer's WPM
+/// reference byte-for-byte on standard ASCII inputs.
 #[derive(Debug, Clone)]
 pub struct BertWpmTokenizer {
     /// Token string → id map (built once at construction).
@@ -96,8 +94,7 @@ impl BertWpmTokenizer {
             if word.is_empty() {
                 continue;
             }
-            // Prepend ▁ (U+2581) to mark word start. Matches
-            // `llama-vocab.cpp:743 const std::string word1 = "\xe2\x96\x81" + word;`.
+            // Prepend ▁ (U+2581) to mark word start, matching the peer.
             let mut word1 = String::with_capacity(word.len() + 3);
             word1.push('\u{2581}');
             word1.push_str(&word);
@@ -131,7 +128,7 @@ impl BertWpmTokenizer {
                     }
                     None => {
                         // No match at this start position → bail out for
-                        // this word; matches llama.cpp's `// discard all`
+                        // this word; matches the peer's discard-all
                         // path.
                         output.truncate(current_tokens);
                         matched_word = false;
@@ -141,7 +138,7 @@ impl BertWpmTokenizer {
             }
 
             // No matches at all for this word → emit a single [UNK]
-            // (matches `output.push_back(vocab.token_unk());` in llama.cpp).
+            // (matches the peer's behavior).
             if !matched_word || output.len() == current_tokens {
                 output.push(self.specials.unk);
             }
@@ -158,7 +155,7 @@ impl BertWpmTokenizer {
     }
 }
 
-/// Mirror of llama.cpp's `llm_tokenizer_wpm_session::preprocess`. Splits
+/// Mirror of the peer's WPM preprocess. Splits
 /// `text` into a `Vec<String>` of words, applying:
 ///   - NFD normalization (best-effort via a small helper since we don't
 ///     pull in unicode-normalization to keep deps light; for ASCII
@@ -168,7 +165,7 @@ impl BertWpmTokenizer {
 ///   - Punctuation split (each punctuation char becomes its own word).
 ///   - Drop control / `\0` / U+FFFD code points.
 ///
-/// For ASCII-only inputs the output matches llama.cpp byte-for-byte. For
+/// For ASCII-only inputs the output matches the peer byte-for-byte. For
 /// non-ASCII inputs (CJK, accented Latin, etc.) the NFD-normalization step
 /// is the only divergence; that's a known iter-65 follow-up.
 fn preprocess_words(text: &str) -> Vec<String> {
@@ -184,10 +181,10 @@ fn preprocess_words(text: &str) -> Vec<String> {
             }
             continue;
         }
-        // Mirror llama.cpp's tolower + the punctuation-isolates-as-its-
+        // Mirror the peer's tolower + the punctuation-isolates-as-its-
         // own-word rule. `is_ascii_punctuation` is conservative — for
         // non-ASCII punctuation a future iter widens via the
-        // `unicode_categories` crate; current matches llama.cpp on every
+        // `unicode_categories` crate; current matches the peer on every
         // ASCII codepoint and on CJK ideographs (which fall through to
         // the append branch).
         let lower: String = c.to_lowercase().collect();
@@ -200,7 +197,7 @@ fn preprocess_words(text: &str) -> Vec<String> {
         {
             // is_ascii_punctuation already covers ., ?, !, etc. The
             // second clause re-checks for ASCII symbols outside
-            // alphanumeric (e.g. `$`, `+`) since llama.cpp also splits
+            // alphanumeric (e.g. `$`, `+`) since the peer also splits
             // those.
             if !words.last().unwrap().is_empty() {
                 words.push(String::new());
@@ -242,7 +239,7 @@ pub struct BertSpecialTokens {
 }
 
 impl BertSpecialTokens {
-    /// Read special-token IDs from GGUF metadata. Uses llama.cpp's
+    /// Read special-token IDs from GGUF metadata. Uses the peer's
     /// `tokenizer.ggml.*_token_id` convention. `mask` falls back to `unk`
     /// when absent (not every BERT GGUF includes it).
     ///
@@ -250,9 +247,8 @@ impl BertSpecialTokens {
     /// are absent (nomic-bert GGUFs ship only `bos_token_id` /
     /// `eos_token_id`), fall back to those — the universal BERT-family
     /// convention is BOS=`[CLS]`=101 and EOS=`[SEP]`=102 in the standard
-    /// `bert-base-uncased` vocab. Per llama.cpp's
-    /// `src/llama-vocab.cpp::llama_vocab::impl::load_with_default_special_tokens`,
-    /// this fallback is how the C++ side handles the same nomic GGUFs.
+    /// `bert-base-uncased` vocab. This fallback matches how the peer
+    /// handles the same nomic GGUFs.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let read = |key: &str| -> Result<u32> {
             gguf.metadata_u32(key)
@@ -573,7 +569,7 @@ mod tests {
 
     /// Iter 64 diagnostic: dump a sample of the bge vocab to see the
     /// prefix-marker convention. `▁` (U+2581) prefixes word-starters in
-    /// llama.cpp's BERT path; subwords might or might not have `##`.
+    /// the peer's BERT path; subwords might or might not have `##`.
     #[test]
     fn bge_small_vocab_format_diagnostic() {
         let path = std::path::Path::new("/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf");
@@ -614,13 +610,13 @@ mod tests {
 
     /// Iter 64 parity test: build the WordPiece tokenizer from the real
     /// bge-small-en-v1.5 GGUF and verify it produces exactly the token
-    /// ids llama.cpp does. Fixture file is gated on existence so CI
+    /// ids the peer does. Fixture file is gated on existence so CI
     /// without the artifact skips cleanly. Expected ids derived from
     /// `llama-embedding -m ... --verbose-prompt`:
     ///   "hello world"  →  [101, 7592, 2088, 102]   (CLS hello world SEP)
     /// Iter 67 diagnostic: tokenize the long prompt that gives cosine
-    /// 0.816 and compare ID-by-ID against llama.cpp's
-    /// `--verbose-prompt` output. Expected from llama.cpp (43 tokens):
+    /// 0.816 and compare ID-by-ID against the peer's
+    /// `--verbose-prompt` output. Expected (43 tokens):
     ///   [101, 1999, 1996, 13950, 2989, 3655, 1997, 1996, 2715, 2088,
     ///    1996, 4610, 9041, 2006, 1996, 8313, 1997, 3404, 2090, 6818,
     ///    2040, 3863, 5350, 2578, 1998, 2592, 2408, 6565, 6125, 7987,

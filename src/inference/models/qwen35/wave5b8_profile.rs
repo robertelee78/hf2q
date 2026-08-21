@@ -6,7 +6,7 @@
 //!
 //! Purpose: capture per-section CPU wall-clock for the chunk-pipeline
 //! prefill body. The original W-5b.8 measurement spike targeted a historical
-//! 8.5× wall-clock gap vs llama.cpp at pp4096; current runs must use the
+//! 8.5× wall-clock gap vs the peer at pp4096; current runs must use the
 //! emitted bucket table because the live gap and owners have changed. Zero
 //! kernel changes; no GPU
 //! timestamping (per memory `project_m5max_no_dispatch_boundary_sampling`,

@@ -66,7 +66,7 @@
 //   blk.{i}.attn_norm.weight              — pre-attention RMSNorm
 //   blk.{i}.attn_q.weight                 — Q projection (+gate in upper half if attn_output_gate)
 //                                           NB: GGUF stores the Q half separately from attn_gate
-//                                           (whereas llama.cpp's C++ builder fuses them in wq).
+//                                           (whereas the peer's builder fuses them in wq).
 //   blk.{i}.attn_k.weight                 — K projection
 //   blk.{i}.attn_v.weight                 — V projection
 //   blk.{i}.attn_q_norm.weight            — Q RMSNorm (per-head)

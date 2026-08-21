@@ -1,10 +1,7 @@
 //! BERT HF→GGUF tensor-name + metadata mapper.
 //!
-//! Port of `/opt/llama.cpp/conversion/bert.py::BertModel`'s name mapping
-//! (transitively via `base.py::TextModel::modify_tensors` ->
-//! `gguf-py/gguf/tensor_mapping.py`) and the BERT-specific
-//! `set_gguf_parameters` overlay (`bert.py:31-37`) on top of
-//! `TextModel::set_gguf_parameters` (`base.py:1111-1221`). Strictly the
+//! Canonical BERT name mapping plus the BERT-specific
+//! metadata overlay on top of the common text-model keys. Strictly the
 //! `BertModel` / `BertForMaskedLM` encoder-only path — no RoBERTa,
 //! DistilBert, NomicBert, ModernBert, JinaBert, NeoBERT, EuroBert or
 //! XLMRoberta special-cases (each gets its own module file when wired).
@@ -170,7 +167,7 @@ pub fn map_tensor_name(hf_name: &str) -> Option<String> {
 /// Translate the user-facing pooling-mode string into the GGUF
 /// `PoolingType` enum's `u32` representation.
 ///
-/// Values per `/opt/llama.cpp/gguf-py/gguf/constants.py:4102-4107`:
+/// GGUF PoolingType values:
 /// `NONE=0`, `MEAN=1`, `CLS=2`, `LAST=3`, `RANK=4`. Default (None
 /// supplied) is `MEAN=1` — the BAAI/bge reference shape.
 ///
@@ -212,7 +209,7 @@ fn pooling_type_u32(mode: Option<&str>) -> Option<u32> {
 ///     [[feedback-no-loop-suppression-2026-05-17]] we surface bad
 ///     metadata rather than silently downgrade to a default.
 ///
-/// `file_type` is the chosen `LlamaFtype` as a `u32` (matches
+/// `file_type` is the chosen `GgufFtype` as a `u32` (matches
 /// `gguf_writer.add_file_type(self.ftype)` at base.py:1220).
 pub fn build_metadata(
     config: &serde_json::Value,

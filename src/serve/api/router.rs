@@ -11,7 +11,7 @@
 //!     response ← cors ← request-id ← [route] ← bearer_auth ← handler
 //!
 //! - CORS is outermost so preflight `OPTIONS` requests are handled without
-//!   hitting auth (matches ollama/llama.cpp convention for LAN deployments).
+//!   hitting auth (matches the peer-server convention for LAN deployments).
 //! - request-id is between CORS and auth so every response carries the id
 //!   even when auth rejects the request (useful for client-side debugging).
 //! - auth is innermost so it runs AFTER the request-id is stamped, allowing
@@ -613,7 +613,7 @@ mod tests {
         // When auth is configured and the caller is unauthenticated, the
         // auth layer fires *before* the handler dispatch — so an unknown
         // route without a token returns 401, not 404. This matches
-        // ollama/llama.cpp behavior and is the documented Decision #8 path.
+        // peer-server behavior and is the documented Decision #8 path.
         let app = build_router(state_with_auth("secret"));
         let req = Request::builder()
             .uri("/does-not-exist")

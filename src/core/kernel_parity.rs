@@ -6,8 +6,8 @@
 //! depending on thread-group scheduling, even with identical inputs.
 //! Asserting byte-identity (`a.to_bits() == b.to_bits()`) on such pairs
 //! produces false-positive failures on noise that does not affect
-//! observable behavior (greedy decode tokens, parity vs canonical
-//! references like llama.cpp).
+//! observable behavior (greedy decode tokens, parity vs the canonical
+//! peer reference).
 //!
 //! The right invariant for a behavior-preserving refactor (e.g. lifting
 //! an arena, extracting an `_into` variant, fusing CBs) is *kernel

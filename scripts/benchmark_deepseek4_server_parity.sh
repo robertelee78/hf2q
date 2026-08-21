@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Source-bound DeepSeek-V4 server parity gate.
 #
-# This developer-only harness runs the pinned llama.cpp reference and hf2q
+# This developer-only harness runs the pinned peer reference and hf2q
 # sequentially against the same hf2q-produced GGUF and identical OpenAI chat
-# requests. It never makes llama.cpp a product dependency. Each measured
+# requests. It never makes the peer a product dependency. Each measured
 # request starts with a trial-specific prefix, and the gate rejects material
 # prompt-cache credit so the reported prefill rate represents new work.
 #
@@ -403,7 +403,7 @@ record_llama() {
       and .timings.prompt_per_second > 0
       and .timings.predicted_per_second > 0
     ' "$response" >/dev/null || {
-        echo "llama.cpp trial $trial failed output/timing oracle" >&2
+        echo "peer trial $trial failed output/timing oracle" >&2
         jq '{choices, usage, timings}' "$response" >&2
         exit 5
     }

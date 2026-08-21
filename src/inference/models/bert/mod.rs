@@ -13,7 +13,7 @@
 //!     the `embed_forward` API is plumbed (blocked on live-model
 //!     validation).
 //!
-//! # GGUF metadata keys (llama.cpp convention)
+//! # GGUF metadata keys (the peer's convention)
 //!
 //!   - `general.architecture = "bert"`
 //!   - `bert.embedding_length`      → hidden_size
@@ -25,7 +25,7 @@
 //!   - `bert.pooling_type`          → pooling method (enum below)
 //!   - `bert.causal_attention`      → false for encoder-only (BERT default)
 //!
-//! # Tensor-name table (llama.cpp GGUF BERT convention)
+//! # Tensor-name table (the peer's GGUF BERT convention)
 //!
 //! Every tensor the encoder forward pass needs is declared here as a
 //! const so the loader + forward code share a single source of truth.

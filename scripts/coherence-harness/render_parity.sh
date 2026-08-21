@@ -1,5 +1,5 @@
 #!/bin/bash
-# render_parity.sh — Byte-compare hf2q's chat-template render vs llama.cpp's.
+# render_parity.sh — Byte-compare hf2q's chat-template render vs the peer's.
 #
 # 2026-05-03 — built per user directive after hf2q started emitting garbage
 # on the wedding-cake prompt. Output is the same model + same prompt rendered
@@ -30,7 +30,7 @@ HF2Q_DUMP_RENDERED_PROMPT="$WORKDIR/hf2q.txt" \
   "$HF2Q" generate --model "$MODEL" --prompt "$PROMPT" --max-tokens 1 $HF2Q_FLAG \
   >/dev/null 2>"$WORKDIR/hf2q.stderr" || true
 
-# 2. llama.cpp render — extract jinja from gguf, render via debug-template-parser.
+# 2. peer render — extract jinja from gguf, render via debug-template-parser.
 python3 "$EXTRACT_PY" "$MODEL" >"$WORKDIR/template.jinja"
 case "$MODE" in
   thinking) REASONING_FLAG="--enable-reasoning=1" ;;
@@ -65,7 +65,7 @@ hf_bytes=$(wc -c < "$WORKDIR/hf2q.txt" | tr -d ' ')
 ll_bytes=$(wc -c < "$WORKDIR/llama.txt" | tr -d ' ')
 
 echo "hf2q     bytes=$hf_bytes  sha256=$hf_sum"
-echo "llama.cpp bytes=$ll_bytes  sha256=$ll_sum"
+echo "peer     bytes=$ll_bytes  sha256=$ll_sum"
 if [ "$hf_sum" = "$ll_sum" ]; then
   echo "RENDER PARITY: PASS"
   exit 0

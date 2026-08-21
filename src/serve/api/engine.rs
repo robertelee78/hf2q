@@ -116,7 +116,7 @@ use crate::serve::multi_seq_kv::MultiSeqError;
 /// **Plumbed but NOT yet honored** (accepted from the request,
 /// retained on the struct, but not consumed by the current sampler):
 /// - `frequency_penalty`, `presence_penalty` — Tier 2 OpenAI extras.
-/// - `min_p` — Tier 3 llama.cpp extension.
+/// - `min_p` — Tier 3 peer extension.
 /// - `logprobs`, `top_logprobs` — Tier 4 response shape; surface only.
 ///
 /// `seed` is honored by `sampler_pure`: seeded requests use a counter-based
@@ -168,7 +168,7 @@ pub enum ToolCallPolicy {
     ///     declared tools.
     ///
     /// Body-parse failures fall back to Content (existing wave-2.5
-    /// behaviour). Mirrors llama.cpp's unconstrained tool-call path.
+    /// behaviour). Mirrors the peer's unconstrained tool-call path.
     #[default]
     Auto,
     /// Wave 3 W-B2 — `tool_choice = "auto"` AND a lazy grammar IS active.
@@ -180,8 +180,7 @@ pub enum ToolCallPolicy {
     /// engine produced structurally invalid output — same regression
     /// signature as Constrained, same loud-error promotion required.
     ///
-    /// Mirrors llama.cpp `grammar_lazy=true` at common/chat.cpp:898-913,
-    /// 1177-1200, 1399-1416, 1626-1628.
+    /// Mirrors the peer's `grammar_lazy=true` semantics.
     AutoLazyGrammar,
     /// `tool_choice = "required"` or `tool_choice = {type: "function", ...}`.
     /// Grammar guarantees well-formed output FROM BYTE 0; a parse failure is
@@ -209,17 +208,8 @@ impl ToolCallPolicy {
 
 /// Kind discriminant for the grammar attached to a request.
 ///
-/// Mirrors llama.cpp `enum common_grammar_type` at
-/// `/opt/llama.cpp/common/common.h:171-176`:
-///
-/// ```c++
-/// enum common_grammar_type {
-///     COMMON_GRAMMAR_TYPE_NONE,
-///     COMMON_GRAMMAR_TYPE_USER,
-///     COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT,
-///     COMMON_GRAMMAR_TYPE_TOOL_CALLS,
-/// };
-/// ```
+/// Mirrors the peer's grammar-type discriminant
+/// (`NONE` / `USER` / `OUTPUT_FORMAT` / `TOOL_CALLS`).
 ///
 /// Wave 2.6 W-α5 motivation (cfa-20260427-adr005-wave2.6 research-report.md
 /// Q1, audit `codex-review-last.txt` divergence "A1 / response_format
@@ -229,8 +219,8 @@ impl ToolCallPolicy {
 /// enforcement on registered Gemma/Qwen models because the splitter never
 /// fires for non-tool requests.  The kind tells the runtime whether to
 /// enforce unconditionally (`ResponseFormat`) or to wait for a trigger
-/// before enforcing (`ToolCallBody`, the lazy-grammar pattern from
-/// llama.cpp PR #9639).
+/// before enforcing (`ToolCallBody`, the peer's lazy-grammar
+/// pattern).
 ///
 /// vLLM's `StructuredOutputsParams` and SGLang's mutually exclusive
 /// `json_schema` / `regex` / `ebnf` fields are the same shape — one
@@ -243,8 +233,7 @@ pub enum GrammarKind {
     /// state — the mask fires every step and `accept_bytes` advances
     /// every step.  Pre-A1 (wave 2.4 and earlier) behavior.
     ///
-    /// Mirrors `COMMON_GRAMMAR_TYPE_USER` + `COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT`
-    /// in llama.cpp.
+    /// Mirrors the peer's `USER` + `OUTPUT_FORMAT` grammar types.
     ///
     /// Default — preserves backward compatibility for any caller that
     /// constructs `SamplingParams` without setting the field.
@@ -261,8 +250,7 @@ pub enum GrammarKind {
     /// `runtime.trigger()` to flip the flag false; the runtime then
     /// enforces every subsequent token through to the close marker.
     ///
-    /// Mirrors llama.cpp `grammar_lazy = true` for `tool_choice == AUTO`
-    /// at `/opt/llama.cpp/common/chat.cpp:913, 1200, 1416`.
+    /// Mirrors the peer's `grammar_lazy = true` for `tool_choice == AUTO`.
     ///
     /// Wired post-wave-3 W-B2 + Wave 3.5 HIGH-1: `compile_tool_grammar`'s
     /// Auto branch produces this kind whenever `tool_choice=Auto` AND
@@ -290,9 +278,8 @@ pub enum GrammarKind {
     /// first byte of the open marker (e.g. `<` for Gemma 4 `<|tool_call>`)
     /// or the request rejects every other token via the mask.
     ///
-    /// Mirrors llama.cpp `grammar_lazy = false` for
-    /// `tool_choice == REQUIRED` at `/opt/llama.cpp/common/chat.cpp:898-913,
-    /// 1177-1200, 1399-1416`.  Wave 2.7 W-η HIGH-1.
+    /// Mirrors the peer's `grammar_lazy = false` for
+    /// `tool_choice == REQUIRED`.  Wave 2.7 W-η HIGH-1.
     ToolCallBodyRequired,
 }
 
@@ -319,7 +306,7 @@ pub struct SamplingParams {
     /// Greedy (T=0) decodes are deterministic regardless.
     pub seed: Option<u64>,
 
-    // --- Tier 3 addition (llama.cpp / ollama extension) ---
+    // --- Tier 3 addition (peer extension) ---
     /// Min-p sampling cutoff. `0.0` disables. Tier 3.
     pub min_p: f32,
 
@@ -23220,10 +23207,9 @@ fn generate_once_with_soft_tokens(
     // runtime so subsequent tokens are constrained by the body grammar.
     // (Typically the first decoded token is never the open marker, but
     // this keeps the state machine correct for any edge case where the
-    // chat template ends mid-marker.)  llama.cpp does NOT reset the
+    // chat template ends mid-marker.)  The peer does NOT reset the
     // trigger on close — multi-call support comes from the grammar
-    // shape `(call)+`.  See research-report.md Q2 anti-finding +
-    // /opt/llama.cpp/docs/function-calling.md.
+    // shape `(call)+`.  See research-report.md Q2 anti-finding.
     if let Some(tcs) = tc_splitter_ns.as_mut() {
         let events = tcs.feed(&first_fragment);
         if let Some(rt) = grammar_runtime.as_mut() {
@@ -23326,9 +23312,8 @@ fn generate_once_with_soft_tokens(
             // ToolCallClose does NOT reset the trigger — single-call
             // termination is delivered structurally by the grammar shape
             // exhausting after `body <tool_call|> space` (the iter-218
-            // default `parallel_tool_calls=false` matches llama.cpp's
-            // bounded `(call){min,max=1}` per
-            // `/opt/llama.cpp/docs/function-calling.md:24`); multi-call
+            // default `parallel_tool_calls=false` matches the peer's
+            // bounded `(call){min,max=1}`); multi-call
             // mode (`parallel_tool_calls=true` opt-in) carries via the
             // `gemma4-call*` shape which permits another open marker.
             if let Some(tcs) = tc_splitter_ns.as_mut() {
@@ -27959,7 +27944,7 @@ fn generate_stream_once(
     // on the SAME boolean, eliminating the split-state condition the
     // wave-2.5 audit caught at engine.rs:1401, 1489, 1554, 2041, 2145,
     // 2195.  See cfa-20260427-adr005-wave2.6 research-report.md Q2 +
-    // /opt/llama.cpp/src/llama-grammar.cpp:1287-1439 for the canonical
+    // the peer's grammar engine for the canonical
     // pattern.
     //
     // To call `runtime.trigger()` from the `route_content` closure, the
@@ -27982,8 +27967,7 @@ fn generate_stream_once(
     // so the ToolCallOpen branch can call `runtime.trigger()` — this is
     // the splice point where the lazy-grammar awakens.  ToolCallClose
     // does NOT reset (multi-call grammars rely on the grammar shape
-    // accepting `(call)+`; see research-report.md Q2 + llama.cpp PR
-    // #9639).
+    // accepting `(call)+`; see research-report.md Q2).
     let route_content = |tool_splitter: &mut Option<super::registry::ToolCallSplitter>,
                          body: &mut String,
                          tc_index: &mut usize,
@@ -28041,7 +28025,7 @@ fn generate_stream_once(
                     // steps enforce the body grammar.  No-op when the
                     // runtime is None (no grammar request) or already
                     // post-trigger (re-entry on a grammar without
-                    // explicit reset support — llama.cpp behavior).
+                    // explicit reset support — peer behavior).
                     if let Some(rt) = grammar_runtime.as_mut() {
                         rt.trigger();
                     }
@@ -28065,8 +28049,7 @@ fn generate_stream_once(
                     // space` exhausts after first close → is_dead → halt).
                     // Multi-call mode (`parallel_tool_calls=true` opt-in)
                     // relies on the `gemma4-call*` recursion accepting
-                    // subsequent open markers (Hermes 2 Pro template; see
-                    // `/opt/llama.cpp/common/chat.cpp:1399-1416` `p.repeat`).
+                    // subsequent open markers (Hermes 2 Pro template).
                     //
                     // Wave 3 W-A3: close-time dispatch delegated to
                     // `emit_streaming_tool_call_close` so the parse-failure
@@ -28821,7 +28804,7 @@ pub fn render_chat_prompt(
 /// Context keys the renderer owns; a request whose `chat_template_kwargs`
 /// names one of these is rejected before render (ADR-005 iter-229
 /// Decision 4). `enable_thinking` is deliberately absent: kwargs may
-/// override it (llama.cpp parity) — the merge order below makes kwargs
+/// override it (peer parity) — the merge order below makes kwargs
 /// win every collision that survives this validation.
 const RESERVED_TEMPLATE_KWARGS: &[&str] = &[
     "messages",
@@ -29206,7 +29189,7 @@ fn find_tokenizer(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf>
     // No filesystem walk fallback. Future P1.11 work: parse the embedded
     // tokenizer from GGUF metadata (`tokenizer.ggml.tokens`, scores,
     // merges, special-token ids) so the on-disk tokenizer.json is no
-    // longer required either, mirroring how llama.cpp self-bootstraps.
+    // longer required either, mirroring how the peer self-bootstraps.
     if let Some(p) = explicit {
         return Ok(p.to_path_buf());
     }
@@ -39213,9 +39196,7 @@ mod test_a1_conditional_grammar_wire {
         // from the grammar SHAPE exhausting (`body close space` under
         // iter-218's `parallel_tool_calls=false` default), and multi-call
         // re-entry is via the `(call)*` recursion when operators opt
-        // into parallel calls (research-report.md Q2; see
-        // `/opt/llama.cpp/docs/function-calling.md:24` and
-        // `/opt/llama.cpp/common/chat.cpp:1399-1416`).
+        // into parallel calls (research-report.md Q2).
         let _events_close = splitter.feed(close);
         assert!(
             !runtime.is_awaiting_trigger(),

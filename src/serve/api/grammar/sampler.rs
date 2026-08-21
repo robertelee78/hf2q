@@ -175,8 +175,6 @@ fn at<'a>(grammar: &'a Grammar, pos: Pos) -> Option<&'a GretElement> {
 
 /// Returns `(matched, after_range_pos)`. `after_range_pos` points to the
 /// element immediately following the char-range group (regardless of match).
-///
-/// Mirrors `llama_grammar_match_char` at llama-grammar.cpp:758.
 pub fn match_char(grammar: &Grammar, mut pos: Pos, chr: u32) -> (bool, Pos) {
     let rule = match grammar.rules.get(pos.rule_id as usize) {
         Some(r) => r.as_slice(),
@@ -210,8 +208,7 @@ pub fn match_char(grammar: &Grammar, mut pos: Pos, chr: u32) -> (bool, Pos) {
 }
 
 /// Returns `true` iff some continuation of the given partial UTF-8 sequence
-/// could satisfy the char range at `pos`. Mirrors
-/// `llama_grammar_match_partial_char`.
+/// could satisfy the char range at `pos`.
 pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8) -> bool {
     let rule = match grammar.rules.get(pos.rule_id as usize) {
         Some(r) => r.as_slice(),
@@ -271,8 +268,6 @@ pub fn match_partial_char(grammar: &Grammar, mut pos: Pos, partial: PartialUtf8)
 /// Transforms one stack into the set of stacks that all end at a terminal
 /// (char-class) element. Handles `RuleRef` expansion (with alternatives) and
 /// skips `End`/`Alt` elements at the stack top.
-///
-/// Mirrors `llama_grammar_advance_stack` at llama-grammar.cpp:853.
 pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
     let mut todo: Vec<Stack> = Vec::new();
     todo.push(stack);
@@ -369,7 +364,6 @@ pub fn advance_stack(grammar: &Grammar, stack: Stack, new_stacks: &mut Stacks) {
 // ---------------------------------------------------------------------------
 
 /// Feeds one character to one stack, producing zero or more successor stacks.
-/// Mirrors `llama_grammar_accept_chr` at llama-grammar.cpp:1016.
 fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut Stacks) {
     if stack.is_empty() {
         return;
@@ -379,7 +373,7 @@ fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut 
         Some(e) => *e,
         None => return,
     };
-    // Tokens aren't handled in this port (see mod-level docs).
+    // Tokens aren't handled here (see mod-level docs).
     if matches!(elem.ty, GretType::End | GretType::Alt) {
         return;
     }
@@ -398,7 +392,6 @@ fn accept_chr_into(grammar: &Grammar, stack: &Stack, chr: u32, new_stacks: &mut 
 }
 
 /// Accept one character against the current stack set, returning the new set.
-/// Mirrors `llama_grammar_accept`.
 pub fn accept_char(grammar: &Grammar, stacks: &Stacks, chr: u32) -> Stacks {
     let mut new_stacks: Stacks = Vec::with_capacity(stacks.len());
     for stack in stacks {
@@ -543,8 +536,7 @@ fn reject_candidates_for_stack(
 /// # Trigger gate (Wave 2.6 W-α5 Q2)
 ///
 /// The optional `awaiting_trigger` flag implements the **lazy grammar /
-/// trigger-activated FSM** pattern from llama.cpp PR #9639 (canonical
-/// implementation at `/opt/llama.cpp/src/llama-grammar.cpp:1287-1439`):
+/// trigger-activated FSM** pattern:
 ///
 /// * `apply` (mask) — `mask_invalid_tokens` short-circuits to 0 masked
 ///   when `is_awaiting_trigger()` is true.  All preamble tokens stay
@@ -568,10 +560,9 @@ fn reject_candidates_for_stack(
 /// [`GrammarRuntime::set_awaiting_trigger`] at construction time, and
 /// is flipped to false by [`GrammarRuntime::trigger`] when the engine's
 /// `ToolCallSplitter` sees the per-model open marker (e.g. Gemma 4
-/// `call:`, Qwen 3.5 `<function=`).  llama.cpp does NOT reset the flag
+/// `call:`, Qwen 3.5 `<function=`).  The peer does NOT reset the flag
 /// per call — multi-tool support comes from the chat-template-rendered
-/// grammar accepting `(call)+` directly.  See PR #9639 / Hermes 2 Pro
-/// template in `/opt/llama.cpp/docs/function-calling.md`.
+/// grammar accepting `(call)+` directly.
 ///
 /// Default for new runtimes is `awaiting_trigger == false` so existing
 /// callers that don't opt in get the eager-enforcement behavior
@@ -602,9 +593,8 @@ pub struct GrammarRuntime {
 }
 
 impl GrammarRuntime {
-    /// Initialize runtime from a parsed grammar and a start rule.
-    /// Mirrors the `llama_grammar_init_impl` behavior of seeding `stacks`
-    /// from the start rule's alternatives.
+    /// Initialize runtime from a parsed grammar and a start rule, seeding
+    /// `stacks` from the start rule's alternatives.
     pub fn new(grammar: Grammar, start_rule_id: u32) -> Option<Self> {
         let start_rule = grammar.rules.get(start_rule_id as usize)?;
         if start_rule.is_empty() {
@@ -672,17 +662,6 @@ impl GrammarRuntime {
     /// `true` for `GrammarKind::ToolCallBodyAuto` runtimes at construction;
     /// `GrammarKind::ResponseFormat` and `GrammarKind::ToolCallBodyRequired`
     /// runtimes leave the default (`false`) so enforcement is eager.
-    ///
-    /// Mirrors llama.cpp's `lazy` parameter to `llama_grammar_init_impl`
-    /// at `/opt/llama.cpp/src/llama-grammar.cpp:1287-1298`:
-    ///
-    /// ```c++
-    /// llama_grammar_init_impl(..., bool lazy, ...)
-    /// {
-    ///     ...
-    ///     grammar->awaiting_trigger = lazy;
-    /// }
-    /// ```
     pub fn set_awaiting_trigger(&mut self, value: bool) {
         self.awaiting_trigger = value;
         if !value {
@@ -708,12 +687,11 @@ impl GrammarRuntime {
     /// every subsequent `accept_bytes` / mask call enforces the grammar
     /// normally.
     ///
-    /// llama.cpp does NOT reset this flag back to `true` on the close
+    /// The peer does NOT reset this flag back to `true` on the close
     /// marker — the bounded grammar SHAPE reaches an accepted state after the
     /// close (`body close space` for hf2q's
-    /// `OneOrMoreCallsBodyOnly { parallel: false }` emission, mirroring
-    /// llama.cpp's `p.repeat(call, min, max=1)` at
-    /// `/opt/llama.cpp/common/chat.cpp:1399-1416`). Multi-tool support
+    /// `OneOrMoreCallsBodyOnly { parallel: false }` emission). Multi-tool
+    /// support
     /// comes from the grammar shape accepting `(call)+` directly when
     /// the operator opts in via `parallel_tool_calls=true`.
     ///
@@ -726,8 +704,7 @@ impl GrammarRuntime {
     /// recursion indefinitely, masking the training-signal `<turn|>`
     /// terminator (id 106) until max_tokens
     /// (`openwebui_tools_streaming_scenario_2` regression). iter-218
-    /// flips the default to `false` (matches
-    /// `/opt/llama.cpp/docs/function-calling.md:24`'s "disabled by
+    /// flips the default to `false` (matches the peer's "disabled by
     /// default") so the typical request gets the bounded `body close
     /// space` shape that accepts naturally after the first close. DeepSeek's
     /// single-call paths stop at that accepted boundary without evaluating an
@@ -753,8 +730,7 @@ impl GrammarRuntime {
     /// a no-op returning `true` (alive).  No stacks advance, no UTF-8
     /// accumulator state changes.  The runtime is suspended until the
     /// engine calls [`trigger`] (typically in the `ToolCallOpen`
-    /// handler).  Mirrors llama.cpp `llama_grammar_accept_impl` at
-    /// `/opt/llama.cpp/src/llama-grammar.cpp:1382-1439`.
+    /// handler).
     pub fn accept_bytes(&mut self, bytes: &[u8]) -> bool {
         if self.awaiting_trigger {
             let Some(marker) = self.lazy_trigger.as_deref() else {
@@ -1061,7 +1037,7 @@ mod tests {
 
     #[test]
     fn json_grammar_value_rule_accepts_scalars_and_arrays() {
-        // llama.cpp's `json.gbnf` has `root ::= object` (root accepts ONLY
+        // The peer's `json.gbnf` has `root ::= object` (root accepts ONLY
         // a top-level object), but `value ::= object | array | string |
         // number | ("true" | "false" | "null") ws` accepts everything.
         // Verify each alternative against the `value` rule.
@@ -1360,7 +1336,7 @@ mod tests {
         assert!(rt.lazy_trigger_tail.len() < b"<tool_call>".len());
     }
 
-    /// Multi-tool-call regression guard.  llama.cpp does NOT reset
+    /// Multi-tool-call regression guard.  The peer does NOT reset
     /// awaiting_trigger on the close marker — multi-call support comes
     /// from the chat-template-rendered grammar accepting `(call)+`
     /// directly.  This test verifies a `(call)+`-shaped grammar
@@ -1389,8 +1365,7 @@ mod tests {
 
         // Second complete call WITHOUT any reset — proving the runtime
         // carries state through naturally.  This is the canonical
-        // pattern from llama.cpp + Hermes 2 Pro template
-        // (/opt/llama.cpp/docs/function-calling.md).
+        // Hermes 2 Pro template pattern.
         assert!(
             rt.accept_bytes(b"<call>bar</call>"),
             "(call)+ grammar MUST accept a second complete call without runtime reset"

@@ -226,7 +226,7 @@ impl TensorRef {
         // — Q4_0/Q5_0/Q8_0 require row_dim divisible by 32, K-quants by 256.
         // ssm_conv1d.weight (shape [channels, K=4]) and similar small-kernel
         // tensors must be preserved at F16/F32. Without this gate the DWQ
-        // pipeline emits a Q4_0 ssm_conv1d which llama.cpp rejects with
+        // pipeline emits a Q4_0 ssm_conv1d which the peer rejects with
         //   "tensor 'blk.0.ssm_conv1d.weight' of type 2 (q4_0) has 4 elements
         //    per row, not a multiple of block size (32)"
         if self.shape.len() >= 2 {

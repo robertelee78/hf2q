@@ -1,22 +1,21 @@
 //! `.imatrix.gguf` loader — round-trips files written by
-//! [`super::gguf_writer::write_imatrix`] AND files written by the
-//! upstream `llama-imatrix` reference at
-//! `/opt/llama.cpp/tools/imatrix/imatrix.cpp::save_imatrix`.
+//! [`super::gguf_writer::write_imatrix`] AND files written by
+//! stock `llama-imatrix`.
 //!
 //! Pairs `<name>.in_sum2` + `<name>.counts` tensors back into the
 //! per-tensor [`Accumulator`] representation. Per
 //! [[feedback-no-loop-suppression-2026-05-17]] a missing half of a pair
-//! is a typed hard error, not a silent skip — mirrors imatrix.cpp:783's
+//! is a typed hard error, not a silent skip — mirrors `llama-imatrix`'s
 //! reference behavior.
 //!
 //! ## Out-of-scope (Phase A)
 //!
-//! - Legacy `.dat` format (imatrix.cpp:627-723). Phase A only handles
-//!   the modern GGUF format (`--output-format gguf` is the llama-imatrix
-//!   default since llama.cpp PR #9400). If an operator hands us a `.dat`
+//! - Legacy `.dat` format. Phase A only handles
+//!   the modern GGUF format (`--output-format gguf` is the modern
+//!   llama-imatrix default). If an operator hands us a `.dat`
 //!   file, `mlx_native::gguf::GgufFile::open` rejects with a parse error
 //!   that propagates as [`ImatrixError::Parse`].
-//! - Combining multiple imatrix files (imatrix.cpp:1247's
+//! - Combining multiple imatrix files (llama-imatrix's
 //!   `--in-file <a> --in-file <b>` merge). The Phase A driver accepts
 //!   exactly one `--imatrix <path>`.
 

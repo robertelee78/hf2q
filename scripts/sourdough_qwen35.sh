@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # sourdough_qwen35.sh — ADR-013 Phase P13 byte-parity gate for Qwen3.5
 # (and Qwen3.6, which routes through the same LLM_ARCH_QWEN35 / QWEN35MOE
-# code paths in both llama.cpp and our hf2q).
+# code paths in both the peer and our hf2q).
 #
 # Runs hf2q and llama-cli on a fixed prompt at T=0 greedy, seed=42,
 # max_tokens=N, then asserts that the common byte prefix of their outputs
 # is at least MIN_COMMON_PREFIX bytes. This enforces "hf2q's Qwen3.5 GPU
-# forward is byte-identical to llama.cpp on the same GGUF for the first N
+# forward is byte-identical to the peer on the same GGUF for the first N
 # decoded tokens" as the mandatory ship gate for ADR-013.
 #
 # Mirrors scripts/sourdough_gate.sh (the Gemma-4 gate per ADR-005 Phase 1b).
@@ -307,7 +307,7 @@ if [[ "$COMMON_BYTES" -lt "$MIN_COMMON_PREFIX" ]]; then
   echo "Debugging steps:"
   echo "  1. Check \`cargo test --lib qwen35\` — all P7b/P8b/P9b parity tests must be green."
   echo "  2. Use ActivationCapture to dump per-layer outputs from both hf2q"
-  echo "     (via HF2Q_CAPTURE_LAYER=N env) and llama.cpp (via --verbose-prompt"
+  echo "     (via HF2Q_CAPTURE_LAYER=N env) and the peer (via --verbose-prompt"
   echo "     + -lv 2); bisect layer-by-layer to find the first divergent layer."
   echo "  3. Common culprits: V-head reorder off-by-one, MROPE section index,"
   echo "     sigmoid-vs-swish on any gate, RMS +1 convention, KV cache slot"

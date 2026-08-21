@@ -1,7 +1,7 @@
 //! Gemma 4 Vision (transformer-style) mmproj HF→GGUF tensor-name + metadata mapper.
 //!
-//! Port of `/opt/llama.cpp/conversion/gemma.py::Gemma4VisionAudioModel`
-//! (lines 769-840) for the **vision-only** Gemma 4 26B-A4B-IT release. The
+//! Canonical Gemma 4 vision/audio mapping,
+//! for the **vision-only** Gemma 4 26B-A4B-IT release. The
 //! Gemma 4 vision tower is structurally distinct from the Gemma 3 SigLIP
 //! tower handled by `gemma4_mmproj.rs`:
 //!
@@ -134,8 +134,7 @@ pub fn build_metadata(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "model".to_string());
     let mut id_components = get_model_id_components(&raw_name);
-    // mmproj ID-component override: canonical's Metadata.get_model_id_components
-    // at /opt/llama.cpp/gguf-py/gguf/metadata.py:295-309 reclassifies a
+    // mmproj ID-component override: the canonical converter reclassifies a
     // numeric size_label part as `finetune` when its implied parameter
     // count is far from the model's total_params. For mmproj sidecars,
     // total_params is the vision tower (~440M for Gemma 4 26B-A4B-IT),

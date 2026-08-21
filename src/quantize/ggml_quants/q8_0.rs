@@ -1,8 +1,7 @@
-//! Q8_0 quantizer — ADR-033 P0 pure-Rust port of
-//! `quantize_row_q8_0_ref` at `/opt/llama.cpp/ggml/src/ggml-quants.c:234`
-//! (SHA pinned in `data/llama_cpp_pin.txt`).
+//! Q8_0 quantizer — ADR-033 P0 pure-Rust port of the peer's
+//! `quantize_row_q8_0_ref`.
 //!
-//! Block layout from `ggml-common.h:241-246`:
+//! Block layout (byte-identical to the peer's):
 //! ```text
 //! #define QK8_0 32
 //! typedef struct {

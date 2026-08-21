@@ -89,7 +89,7 @@ pub const ARCH_QWEN35MOE: &str = "qwen35moe";
 /// `Qwen/Qwen3-VL-4B-Instruct`, etc.).
 ///
 /// This is the dense Qwen3-VL variant. Note the underscore: the value is
-/// `qwen3_vl`, not the llama.cpp upstream's `qwen3vl`. hf2q's convert pipeline
+/// `qwen3_vl`, not the peer's `qwen3vl`. hf2q's convert pipeline
 /// (`src/convert/...`) preserves HF's `model_type = "qwen3_vl_text"` family
 /// stem when it stamps `general.architecture`. Both the underscored and
 /// non-underscored variants are recognized by [`is_qwen3_vl_arch`] so we
@@ -112,12 +112,12 @@ pub const ARCH_QWEN35MOE: &str = "qwen35moe";
 /// and is iter-228+ scope; iter-227 closes only the dispatch gap.
 pub const ARCH_QWEN3_VL: &str = "qwen3_vl";
 
-/// llama.cpp upstream's `general.architecture` string for the same family
+/// The peer's `general.architecture` string for the same family
 /// (no underscore). Recognized so a future convert-pipeline alignment to
-/// the upstream string doesn't silently re-break dispatch.
+/// that string doesn't silently re-break dispatch.
 pub const ARCH_QWEN3VL_UPSTREAM: &str = "qwen3vl";
 
-/// llama.cpp upstream's `general.architecture` string for the **MoE**
+/// The peer's `general.architecture` string for the **MoE**
 /// Qwen3-VL variant (e.g. `Qwen3-VL-30B-A3B`). hf2q does not yet emit
 /// or load this variant, but it is recognized by [`is_qwen3_vl_arch`]
 /// so the dispatch error message tells the operator we know what they
@@ -126,7 +126,7 @@ pub const ARCH_QWEN3VLMOE_UPSTREAM: &str = "qwen3vlmoe";
 
 /// True iff `arch` is any Qwen3-VL `general.architecture` string we
 /// recognize — covers both hf2q's underscored convention (`qwen3_vl`) and
-/// llama.cpp upstream's no-underscore convention (`qwen3vl`,
+/// the peer's no-underscore convention (`qwen3vl`,
 /// `qwen3vlmoe`). Used at the runtime dispatch sites in
 /// `serve::cmd_generate` and `serve::api::engine::LoadedModel::load` so
 /// either arch-string spelling lands on the same operator-actionable
@@ -235,7 +235,7 @@ pub struct Qwen35Config {
     pub full_attention_interval: u32,
     /// Per-layer kind. Authoritative. Computed from `full_attention_interval`
     /// when `layer_types` is not emitted as an explicit GGUF array (current
-    /// llama.cpp/apex convention; kept as a Vec so future metadata can
+    /// peer/apex convention; kept as a Vec so future metadata can
     /// override on a per-layer basis).
     pub layer_types: Vec<Qwen35LayerKind>,
 
@@ -440,9 +440,9 @@ impl Qwen35Config {
         //   3) Fallback (no MTP at all): default `true` to preserve historical Qwen3.5
         //      semantics; the loader is a no-op when mtp_num_hidden_layers == 0.
         //
-        // llama.cpp itself has no canonical key for this; it implicitly relies on
-        // tensor presence (llama-arch.cpp:759 "NextN/MTP tensors are currently
-        // ignored"). Our key is namespaced under the existing `{arch}.nextn.*`
+        // The peer itself has no canonical key for this; it implicitly relies
+        // on tensor presence (its NextN/MTP tensors are currently ignored).
+        // Our key is namespaced under the existing `{arch}.nextn.*`
         // family for cleanliness.
         let mtp_use_dedicated_embeddings = gguf
             .metadata(&format!("{p}.nextn.use_dedicated_embeddings"))
@@ -832,8 +832,8 @@ mod tests {
         assert!(!is_qwen3_vl_moe_arch("qwen3_vl"));
     }
 
-    /// llama.cpp upstream emits the no-underscore variant. We recognize
-    /// it so a future hf2q convert-pipeline alignment to the upstream
+    /// The peer emits the no-underscore variant. We recognize
+    /// it so a future hf2q convert-pipeline alignment to that
     /// string does not re-break dispatch.
     #[test]
     fn iter227_recognizes_upstream_no_underscore_qwen3vl_arch_string() {
@@ -842,7 +842,7 @@ mod tests {
         assert!(!is_qwen3_vl_moe_arch("qwen3vl"));
     }
 
-    /// llama.cpp upstream's MoE variant (Qwen3-VL-30B-A3B). hf2q does
+    /// The peer's MoE variant (Qwen3-VL-30B-A3B). hf2q does
     /// not yet emit or serve this, but the predicate must distinguish it
     /// from the dense variant so the dispatch error message can be
     /// MoE-specific.

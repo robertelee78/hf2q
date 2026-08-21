@@ -1,4 +1,4 @@
-//! DeepSeek sparse/sink adapter for mlx-native's llama.cpp flash prefill port.
+//! DeepSeek sparse/sink adapter for mlx-native's flash prefill kernel.
 
 use anyhow::{Context, Result};
 use mlx_native::graph::GraphSession;

@@ -139,7 +139,7 @@ done
 
 if [[ "$PEER" == "1" ]]; then
     if [[ -d "$LLAMA_SOURCE/.git" ]]; then
-        echo "llama.cpp commit: $(git -C "$LLAMA_SOURCE" rev-parse HEAD)" >&2
+        echo "peer commit: $(git -C "$LLAMA_SOURCE" rev-parse HEAD)" >&2
     fi
     for ((trial = 1; trial <= TRIALS; trial++)); do
         trial_dir="$OUT_DIR/llama-trial-$trial"
@@ -167,7 +167,7 @@ if [[ "$PEER" == "1" ]]; then
             sleep 0.25
         done
         if ((ready == 0)); then
-            echo "llama.cpp trial $trial failed to become ready; see $trial_dir/server.log" >&2
+            echo "peer trial $trial failed to become ready; see $trial_dir/server.log" >&2
             exit 1
         fi
 
@@ -185,15 +185,15 @@ if [[ "$PEER" == "1" ]]; then
         stop_server
 
         [[ "$(jq -r '.choices[0].message.content' "$trial_dir/turn1.json")" == "$EXPECTED_SEQUENCE" ]] || {
-            echo "llama.cpp trial $trial turn 1 coherence failure" >&2
+            echo "peer trial $trial turn 1 coherence failure" >&2
             exit 1
         }
         [[ "$(jq -r '.choices[0].message.content' "$trial_dir/turn2.json")" == "OK" ]] || {
-            echo "llama.cpp trial $trial turn 2 coherence failure" >&2
+            echo "peer trial $trial turn 2 coherence failure" >&2
             exit 1
         }
         [[ "$(jq -r '.choices[0].message.content' "$trial_dir/turn3.json")" == "DONE" ]] || {
-            echo "llama.cpp trial $trial turn 3 coherence failure" >&2
+            echo "peer trial $trial turn 3 coherence failure" >&2
             exit 1
         }
 

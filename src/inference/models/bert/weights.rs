@@ -27,7 +27,7 @@
 //! - `mxbai-embed-large-v1` (335M params, hidden=1024, layers=24)
 //! - `bge-small-en-v1.5` (33M params, hidden=384, layers=12)
 //!
-//! All three share the llama.cpp `bert.*` GGUF metadata convention and
+//! All three share the peer's `bert.*` GGUF metadata convention and
 //! the per-layer tensor names below. Variants (e.g. nomic's RoPE-based
 //! version of BERT, or mxbai's v2 with longer context) are validated as
 //! day-one models surface; the loader is structured so adding a new BERT
@@ -412,7 +412,7 @@ mod tests {
     }
 
     /// Real BERT GGUFs aren't on disk (Phase 2b downloads them in iter
-    /// 57+), but the vocab GGUFs at /opt/llama.cpp/models/ exercise the
+    /// 57+), but the peer's vocab GGUF fixtures exercise the
     /// architecture-validation branch. Vocab GGUFs deliberately lack
     /// the weight tensors, so `validate_tensor_set` must report a
     /// specific missing-list rather than panic.

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add a root `NOTICE` file carrying the single MIT attribution for the
+  pinned upstream GGUF engine ("the peer"), and a fail-closed CI ratchet
+  (`scripts/peer_ref_ratchet.sh` + `data/peer_ref_baseline.txt`) that
+  blocks new literal references outside the whitelisted zones.
+
+### Changed
+
+- Adopt the single-attribution reference policy repo-wide: prose in docs,
+  comments, scripts, and command output now says "the peer" instead of
+  naming the upstream engine; `LlamaFtype` is renamed `GgufFtype`
+  (`llama_ftype.rs` → `ftype.rs`), vision resize helpers and the
+  special-token resolvers take peer naming, the operator runbook moved to
+  `docs/operator-peer-refresh-runbook.md`, and the reddit posts moved to
+  `archive/`. Parity-harness code, `LLAMA_*` env vars, real binary names,
+  pinned source paths, receipt labels, and frozen historical ADRs are
+  unchanged.
+
 ## [0.1.7] — 2026-08-20
 
 ### Added

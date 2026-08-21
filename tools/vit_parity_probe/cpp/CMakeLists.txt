@@ -1,4 +1,4 @@
-# peer_dumper — llama.cpp ViT reference dumper for ADR-005 parity probe.
+# peer_dumper — peer ViT reference dumper for ADR-005 parity probe.
 #
 # Build:
 #   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \

@@ -3,7 +3,7 @@
 //! # Purpose
 //!
 //! ADR-012 §Optimize / Task #15 — close the MoE dwq46 0.90× decode parity gap
-//! vs llama.cpp.  Diagnostic localization (`HF2Q_DECODE_PROFILE=1`) showed
+//! vs the peer.  Diagnostic localization (`HF2Q_DECODE_PROFILE=1`) showed
 //! the gap is fixed-cost-per-layer not per-byte, and the per-layer cost is
 //! dominated by ~1750 `MlxDevice::alloc_buffer()` calls per decode token
 //! across the three dispatch helpers (`gpu_delta_net::build_delta_net_layer`,

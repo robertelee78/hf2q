@@ -338,7 +338,7 @@ impl Qwen35Model {
         // be loaded as native ggml-quantized blocks (`MoeQ`). The previous
         // F16-detection / F32-expand fallback ("Moe" variant via
         // `weight_loader::load_moe_ffn`) was peer-misaligned — peers
-        // (mlx-lm, llama.cpp, AutoAWQ) never F32-expand MoE experts at load
+        // (mlx-lm, the peer, AutoAWQ) never F32-expand MoE experts at load
         // time. Apex 35B-A3B at F32 is ~128 GB which doesn't fit on a
         // 128 GB system. If a caller ever supplies F16/F32 experts
         // (e.g. legacy GGUFs), we fail loud at load time rather than

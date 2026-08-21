@@ -165,9 +165,9 @@ run_convert() {
 
     verify_gguf "$label" "$gguf" | tee -a "$convert_log"
 
-    # Coherence gate. llama.cpp can't load Qwen3.5/3.6 MTP-emitting GGUFs
+    # Coherence gate. The peer can't load Qwen3.5/3.6 MTP-emitting GGUFs
     # (escape-hatch documented in p11_re_emit_dwq.sh:90-97 — "Drop MTP
-    # until llama.cpp gains qwen35 MTP loader"). For MTP-retained
+    # until the peer gains qwen35 MTP loader"). For MTP-retained
     # variants the GGUF is fine for hf2q's own runtime — which is what
     # the user actually serves with — so skip the llama check there.
     # MTP-dropped ("flat" / DWQ) variants get the standard llama-cli
@@ -183,7 +183,7 @@ run_convert() {
             return 1
         fi
     else
-        echo "[$label] llama-cli coherence: SKIPPED (MTP retained — llama.cpp can't load Qwen3.5/3.6 MTP yet; verified via metadata gate above)"
+        echo "[$label] llama-cli coherence: SKIPPED (MTP retained — the peer can't load Qwen3.5/3.6 MTP yet; verified via metadata gate above)"
     fi
     echo "[$label] PASS"
 }

@@ -93,7 +93,7 @@ pub fn read_model(
 /// HF safetensors often pad the embedding tensor to a multiple of 64 / 128
 /// for hardware-friendly shapes (e.g. Qwen3.6-27B emits `vocab_size: 248320`
 /// in `config.json` while the tokenizer only owns 248044 unique token ids).
-/// llama.cpp's loader compares the embedding tensor's row count against the
+/// The peer's loader compares the embedding tensor's row count against the
 /// emitted `tokenizer.ggml.tokens` array length and rejects mismatches with
 ///
 /// > tensor 'token_embd.weight' has wrong shape; expected H, T, got H, P
@@ -130,13 +130,13 @@ pub fn detect_padded_vocab(
     };
 
     // The de-padded vocab MUST match what the GGUF emit puts into
-    // `tokenizer.ggml.tokens` — llama.cpp's loader compares the embedding
+    // `tokenizer.ggml.tokens` — the peer's loader compares the embedding
     // row count against that array.  `src/backends/gguf.rs::emit_vocab_kv`
     // currently sizes that array from `vocab_obj` only (max id + 1 over
     // the base vocab map), NOT including `added_tokens`.  For the
     // Qwen3.6-27B + apex MoE this gives 248044 (vocab) vs the union of
     // 248070 (vocab ∪ added_tokens, ids 248044..248069 are the 26 chat
-    // special tokens).  llama.cpp expects 248044, so this routine returns
+    // special tokens).  The peer expects 248044, so this routine returns
     // the same.
     //
     // **Known follow-up:** extending the GGUF emit to also include
@@ -171,7 +171,7 @@ pub fn detect_padded_vocab(
 /// Truncate `model.embed_tokens.weight` and `lm_head.weight` to the actual
 /// (de-padded) vocab row count — matches the standard `convert_hf_to_gguf.py`
 /// behaviour for padded vocabularies (e.g. Qwen3.5-family) and prevents the
-/// `tensor 'token_embd.weight' has wrong shape` rejection at llama.cpp load.
+/// `tensor 'token_embd.weight' has wrong shape` rejection at peer load.
 ///
 /// Mutates `metadata.vocab_size` to the de-padded value so downstream
 /// metadata emission is consistent.
@@ -181,7 +181,7 @@ pub fn detect_padded_vocab(
 /// # Sovereignty
 ///
 /// Pure-Rust truncation; reads tokenizer.json from the source `input_dir`
-/// only, never consults llama.cpp output to "verify" the padding.
+/// only, never consults peer output to "verify" the padding.
 pub fn truncate_padded_vocab(
     tensor_map: &mut TensorMap,
     metadata: &mut ModelMetadata,
@@ -379,7 +379,7 @@ mod tests {
     /// this scenario silently no-ops because the early-return branch fires
     /// when `true_vocab >= metadata.vocab_size` (both at de-padded value),
     /// leaving the freshly-loaded padded embedding intact in the final
-    /// DWQ GGUF and tripping llama.cpp's
+    /// DWQ GGUF and tripping the peer's
     /// `tensor 'token_embd.weight' has wrong shape; expected H, T, got H, P`
     /// load rejection.
     #[test]
@@ -431,7 +431,7 @@ mod tests {
         // Match the current `gguf.rs::emit_vocab_kv` contract: the GGUF's
         // tokenizer.ggml.tokens array sizes from base vocab only, so this
         // routine must too — otherwise the embedding would be truncated
-        // to a count llama.cpp doesn't expect (rejection at load).
+        // to a count the peer doesn't expect (rejection at load).
         let tmp = tempfile::tempdir().unwrap();
         let mut vocab = serde_json::Map::new();
         for i in 0u64..50 {

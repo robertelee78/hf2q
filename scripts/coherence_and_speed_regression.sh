@@ -23,7 +23,7 @@
 #   - Coherence gate is mandatory before any perf bench. A pre-iter40
 #     coherence-blind workflow shipped 4 commits against broken decode.
 #   - Peer-parity is the truth-of-the-day. baseline ratios are renewed
-#     whenever llama.cpp peer drifts (project_end_gate_reality_check).
+#     whenever the peer drifts (project_end_gate_reality_check).
 #
 # Env:
 #   HF2Q_BIN=/path/to/hf2q          (default: target/release/hf2q)

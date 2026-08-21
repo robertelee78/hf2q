@@ -1187,7 +1187,7 @@ impl MlxModelWeights {
             // `MlxMlpWeights` (loaded above unconditionally at lines
             // 962-971) and never reads the placeholder MoE fields.
             // Layer mixing (some layers MoE, some dense) is supported
-            // structurally, mirroring llama.cpp's
+            // structurally, mirroring the peer's
             // `LLM_ARCH_QWEN3VLMOE` per-block decision.
             let gu_name = format!("blk.{i}.ffn_gate_up_exps.weight");
             let dn_name = format!("blk.{i}.ffn_down_exps.weight");

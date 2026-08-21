@@ -1,13 +1,9 @@
 //! Gemma 4 (real release) HF→GGUF tensor-name + metadata mapper.
 //!
-//! Port of `/opt/llama.cpp/conversion/gemma.py::Gemma4Model`
-//! (`@ModelBase.register("Gemma4ForConditionalGeneration")`,
-//! `model_arch = gguf.MODEL_ARCH.GEMMA4`) and its inherited
-//! `Gemma3Model` / `TextModel` `set_gguf_parameters` chain, plus the
-//! Gemma 4-specific overlay at `gemma.py:617-765`. Cross-validated
+//! Canonical Gemma 4 name mapping and metadata (common text-model
+//! keys plus the Gemma 4-specific overlay). Cross-validated
 //! against the operator's `/opt/hf2q/models/google-gemma-4-26b-a4b-it`
-//! checkpoint and llama.cpp's `gguf-py/gguf/tensor_mapping.py` /
-//! `constants.py::MODEL_ARCH.GEMMA4` (`:2450-2483`).
+//! checkpoint and the canonical GEMMA4 tensor tables.
 //!
 //! Per ADR-033 §P0 + the 2026-05-18 real-model finding
 //! (`docs/adr-033-real-model-findings/2026-05-18-gemma4-arch-mismatch.md`):
@@ -31,9 +27,7 @@
 //!    `vision_tower.*`, `embed_vision.*`, `audio_tower.*`). The mapper
 //!    transparently strips `language_model.` so the rest of the table
 //!    can be written against the same `model.layers.<N>.<rest>` shape
-//!    used by Llama-3 / Qwen3MoE. Mirrors the canonical Python strip at
-//!    `conversion/base.py:540-541` (`if "language_model." in name: name
-//!    = name.replace("language_model.", "")`).
+//!    used by Llama-3 / Qwen3MoE, mirroring the canonical strip.
 //!
 //! 2. **Fused gate+up experts.** Unlike Qwen3MoE (which has separate
 //!    per-expert `experts.<E>.gate_proj` / `experts.<E>.up_proj` /
@@ -43,12 +37,10 @@
 //!        (gate and up concatenated along the inner axis)
 //!      - `experts.down_proj` shape `[n_experts, hidden, moe_ffn]`
 //!    These map to the single GGUF tensor `blk.<N>.ffn_gate_up_exps.weight`
-//!    (per `MODEL_TENSOR.FFN_GATE_UP_EXP` /
-//!    `gguf-py/gguf/constants.py:1086`, `gguf-py/gguf/tensor_mapping.py:593`)
 //!    and `blk.<N>.ffn_down_exps.weight` — NO stacking needed.
 //!    The mapper returns `Direct` for both; the orchestrator's
 //!    shape-reverse (`[E, 2*ffn, h] → [h, 2*ffn, E]` and `[E, h, ffn] →
-//!    [ffn, h, E]`) lands the GGUF layout llama.cpp's gemma4 loader
+//!    [ffn, h, E]`) lands the GGUF layout the peer's gemma4 loader
 //!    expects.
 //!
 //! 3. **Four norm pairs per block (Gemma 4 hybrid attention + MoE).**
@@ -61,40 +53,34 @@
 //!    `post_feedforward_layernorm_1`                      `post_ffw_norm_1` (FFN_POST_NORM_1; gemma4)
 //!    `post_feedforward_layernorm_2`                      `post_ffw_norm_2` (FFN_POST_NORM_2; gemma4)
 //!    The trailing-digit variants are unique to Gemma 4 and surface at
-//!    llama.cpp's loader as `MODEL_TENSOR.FFN_{PRE,POST}_NORM_{1,2}`
-//!    (`gguf-py/gguf/constants.py:552-555`, `:1069-1071`).
+//!    the peer's loader as `FFN_{PRE,POST}_NORM_{1,2}` slots.
 //!
 //! 4. **Parallel dense FFN _and_ routed experts.** Every block carries
 //!    BOTH `mlp.{gate,up,down}_proj.weight` (dense SwiGLU FFN with dim
 //!    `intermediate_size`) AND the routed `experts.{gate_up,down}_proj`
-//!    pair (dim `moe_intermediate_size`, per-expert). llama.cpp's
-//!    `MODEL_ARCH.GEMMA4` includes both `FFN_{GATE,DOWN,UP}` and
-//!    `FFN_{GATE_UP,DOWN}_EXP{,S}` (`constants.py:2461-2467`); the
+//!    pair (dim `moe_intermediate_size`, per-expert). The peer's
+//!    gemma4 arch includes both `FFN_{GATE,DOWN,UP}` and
+//!    `FFN_{GATE_UP,DOWN}_EXP{,S}` slots; the
 //!    runtime sums the two branches.
 //!
 //! 5. **Router sub-block.** Each block has a `router.proj.weight`
 //!    (`[n_experts, hidden]`) that selects per-token experts. Maps to
 //!    `blk.<N>.ffn_gate_inp.weight` (the canonical
-//!    `MODEL_TENSOR.FFN_GATE_INP` slot; `tensor_mapping.py:451` has the
-//!    `# gemma4` comment on this exact entry). The optional scalar
+//!    `FFN_GATE_INP` slot). The optional scalar
 //!    `router.scale` (per-channel) and `router.per_expert_scale`
 //!    (per-expert) become sub-name extensions of `ffn_gate_inp` and
-//!    `ffn_down_exps` respectively per `gemma.py::Gemma4Model.modify_tensors:754-765`:
+//!    `ffn_down_exps` respectively:
 //!      `router.scale`            → `blk.<N>.ffn_gate_inp.scale`
 //!      `router.per_expert_scale` → `blk.<N>.ffn_down_exps.scale`
 //!    (the per-expert scale folds onto the expert down-projection at
-//!    runtime — see the `_generate_nvfp4_tensors` comment at
-//!    `gemma.py:719-741` for the algebra).
+//!    runtime).
 //!
 //! 6. **`layer_scalar`.** A 1-D scalar tensor (shape `[1]`) per block
 //!    that gates the layer's output contribution. Maps to
-//!    `MODEL_TENSOR.LAYER_OUT_SCALE` →
-//!    `blk.<N>.layer_output_scale.weight`
-//!    (`constants.py:1091`, `tensor_mapping.py:718`). Per
-//!    `gemma.py::Gemma4Model.filter_tensors:747-748` the HF on-disk name
-//!    has NO `.weight` suffix; the Python converter appends one to make
-//!    it match the canonical GGUF name. We do the same here (the bare
-//!    HF name without `.weight` is the canonical match key).
+//!    `blk.<N>.layer_output_scale.weight`. The HF on-disk name
+//!    has NO `.weight` suffix; the canonical converter appends one to
+//!    make it match the canonical GGUF name. We do the same here (the
+//!    bare HF name without `.weight` is the canonical match key).
 //!
 //! 7. **Tied embeddings.** Gemma 4 ties `lm_head` to `embed_tokens`;
 //!    production checkpoints OMIT `lm_head.weight`. If a fork ships
@@ -102,9 +88,8 @@
 //!    surfaces it as `UnmappedTensor`).
 //!
 //! 8. **GGUF architecture string is `"gemma4"`, NOT `"gemma3"`.**
-//!    `LLM_ARCH_GEMMA4` is a distinct entry at
-//!    `/opt/llama.cpp/src/llama-arch.cpp:59` and `MODEL_ARCH.GEMMA4`
-//!    has its own tensor list at `constants.py:2450`. The prior mapper
+//!    `gemma4` is a distinct arch entry with its own tensor list in
+//!    stock GGUF consumers. The prior mapper
 //!    at this path emitted `"gemma3"` per ADR-033's outdated spec — that
 //!    is fixed here. hf2q's runtime already keys on `"gemma4"` (see
 //!    `src/backends/gguf.rs:353,785,1999,2300,2972`,
@@ -469,7 +454,7 @@ fn is_offpath_modality_tensor(hf_name: &str) -> bool {
 ///                                      mirror it for compatibility with
 ///                                      older forks).
 ///
-/// `file_type` is the chosen `LlamaFtype` as a `u32`.
+/// `file_type` is the chosen `GgufFtype` as a `u32`.
 pub fn build_metadata(
     config: &serde_json::Value,
     file_type: u32,
@@ -1031,7 +1016,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `experts.gate_up_proj` is the FUSED gate+up expert tensor;
-    /// llama.cpp's MODEL_TENSOR.FFN_GATE_UP_EXP keeps it as one GGUF
+    /// the peer's FFN_GATE_UP_EXP slot keeps it as one GGUF
     /// tensor (NO split into separate gate+up). The mapper returns one
     /// `Direct` outcome that the orchestrator emits as a single
     /// `blk.<N>.ffn_gate_up_exps.weight` of shape
@@ -1067,7 +1052,7 @@ mod tests {
     }
 
     /// `experts.down_proj` is the standard MoE down-projection;
-    /// llama.cpp's MODEL_TENSOR.FFN_DOWN_EXP maps to
+    /// the peer's FFN_DOWN_EXP slot maps to
     /// `blk.<N>.ffn_down_exps.weight`. The HF tensor lacks the
     /// `.weight` suffix on disk (per the operator's
     /// google-gemma-4-26b-a4b-it inventory); we recognize the bare form.

@@ -7,7 +7,7 @@
 # floor must track tests/evals/reference/MANIFEST.json's
 # `sourdough.common_prefix_bytes` field. The historical 3094-byte floor (frozen
 # 2026-04-11 post-1bNEW.20.FIX) was lowered to 179 in iter-220 (commit `de9b7a4`,
-# 2026-05-01) after a full vs-llama anchor refresh at locked llama.cpp commit
+# 2026-05-01) after a full vs-peer anchor refresh at locked peer commit
 # `b3d758750a` on M5 Max — cross-implementation argmax drift on long prompts is
 # mathematical (independent kernel implementations) not a regression. See
 # project_w5b22_hf2q_exhausted_remaining_in_mul_mm_id memory entry.
@@ -16,15 +16,15 @@
 # T=0 greedy, max_tokens=1000, and asserts that the common byte prefix of
 # their outputs is at least MIN_COMMON_PREFIX bytes (default: 179, anchored
 # to today's measurement; previously 3094 pre-iter-220). This enforces "hf2q's
-# decode output does not regress further from llama.cpp on the DWQ GGUF" as
+# decode output does not regress further from the peer on the DWQ GGUF" as
 # a fast-iteration check. Source of truth: tests/evals/reference/MANIFEST.json.
 #
 # Origin: 2026-04-11 investigation (ADR-005 "Sourdough たglitch" Walk
 # Exception entry). The user reported a hiragana character appearing
-# mid-decode; the investigation determined both hf2q and llama.cpp emit
+# mid-decode; the investigation determined both hf2q and the peer emit
 # the same character at the same byte position on the same GGUF, making
 # it a DWQ-quant weight artifact rather than an hf2q bug. The only real
-# hf2q-vs-llama.cpp drift in 1000 decoded tokens is a single-letter case
+# hf2q-vs-peer drift in 1000 decoded tokens is a single-letter case
 # flip at decode token 840 (' On' vs ' ON' in "Phase 1 (Lid On/ON)"),
 # which this gate's 3094-byte floor catches: if anything widens the drift
 # earlier than byte 3094, the gate fails.
@@ -132,7 +132,7 @@ echo
 echo "--- Rendering chat template via hf2q ---"
 # ADR-007 post-close 2026-04-24: byte-exact gate requires DENSE decode.
 # TQ is the default decode path post-correction; force dense explicitly here
-# so the gate keeps asserting "hf2q dense == llama.cpp" byte-identity.
+# so the gate keeps asserting "hf2q dense == peer" byte-identity.
 if ! HF2Q_DUMP_RENDERED_PROMPT="$RENDERED_PROMPT" HF2Q_USE_DENSE=1 \
       "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$USER_PROMPT" \
         --max-tokens 1 --temperature 0 \
@@ -169,7 +169,7 @@ fi
 #    internally and produces byte-identical input tokens to step 1).
 echo "--- Running hf2q (T=0 greedy, $MAX_TOKENS tokens) ---"
 # ADR-007 post-close 2026-04-24: HF2Q_USE_DENSE=1 forces dense decode for the
-# byte-exact comparison vs llama.cpp. TQ is the production default but cannot
+# byte-exact comparison vs the peer. TQ is the production default but cannot
 # produce byte-identical output by design (quantization is lossy, passes
 # semantic gates not byte-exact gates).
 if ! HF2Q_USE_DENSE=1 "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$USER_PROMPT" \
@@ -240,7 +240,7 @@ if [[ "$COMMON_BYTES" -lt "$MIN_COMMON_PREFIX" ]]; then
   echo "  hf2q:  $DIVERGE_B"
   echo
   echo "This gate exists to catch any speed item that accidentally widens"
-  echo "the hf2q-vs-llama.cpp correctness drift. Bisect the most recent"
+  echo "the hf2q-vs-peer correctness drift. Bisect the most recent"
   echo "src/ change that could have touched the forward pass (attention,"
   echo "MoE, norms, RoPE, lm_head, KV cache, SDPA) and verify against this"
   echo "gate before landing."

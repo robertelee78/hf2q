@@ -98,8 +98,8 @@ pub(crate) static VIT_F32_ATTENTION_ACTIVE: LazyLock<bool> = LazyLock::new(|| {
 ///         0.4.8). Native peer-precision path: stages BOTH A (weight)
 ///         and B (activation) as `half` in shmem and runs
 ///         `simdgroup_half8x8` MMA with float4x4 accumulator. 10-bit
-///         mantissa per element, matches llama.cpp's
-///         `kernel_mul_mm_f16_f32`. Used for every Gemma 4 ViT weight
+///         mantissa per element, matches the peer's
+///         f16×f32 matmul kernel. Used for every Gemma 4 ViT weight
 ///         (all are F16 in GGUF storage).
 ///       * `DType::BF16` → `dense_matmul_bf16_f32_tensor`. 7-bit
 ///         mantissa per element; legacy path retained for tensor types
@@ -167,8 +167,8 @@ pub fn vit_linear_gpu(
         DType::F16 => {
             // Peer-precision path (W59 iter-128). The kernel reads the
             // F16 weight directly — no F32 round-trip and no F16→BF16
-            // narrowing. Per-element rounding budget matches llama.cpp's
-            // `kernel_mul_mm_f16_f32` exactly.
+            // narrowing. Per-element rounding budget matches the peer's
+            // f16×f32 matmul kernel exactly.
             let params = DenseMmF16F32Params {
                 m: seq_len,
                 n: out_features,
@@ -432,16 +432,16 @@ pub fn vit_softmax_last_dim_gpu(
 /// Pipeline (iter-129, peer parity):
 ///   1. Permute Q, K from seq-major `[batch, num_heads, head_dim]` to
 ///      head-major `[num_heads, batch, head_dim]` via `permute_021_f32`.
-///   2. Cast K_perm F32 → F16 (matches peer's `flash_attn_ext` K
-///      staging at clip.cpp:663; 10-bit mantissa per element).
+///   2. Cast K_perm F32 → F16 (matches the peer's flash-attention K
+///      staging; 10-bit mantissa per element).
 ///   3. Dispatch `dense_matmul_f16_f32_tensor` with src0=K_f16,
 ///      src1=Q_perm. Output: `[num_heads, batch_q, batch_k]` F32 with
-///      F32 accumulator (mirrors `kernel_mul_mm_f16_f32`'s
+///      F32 accumulator (mirrors the peer's f16×f32 matmul kernel's
 ///      `simdgroup_half8x8` MMA with float4x4 accumulator).
 ///   4. Apply `scale` via `scalar_mul_f32` in-place.
 ///
 /// `scale` for standard ViT = `1 / sqrt(head_dim)`. **For Gemma 4V the
-/// correct scale is 1.0** per llama.cpp `clip.cpp` — caller passes the
+/// correct scale is 1.0** per the peer — caller passes the
 /// arch-appropriate value. This function does no implicit scaling.
 ///
 /// `HF2Q_VIT_F32_ATTENTION=1` is a development-only override that
@@ -642,16 +642,16 @@ pub fn vit_attention_scores_gpu(
 ///      `[batch, num_heads, head_dim]`.
 ///
 /// `scale` matches `vit_attention_scores_gpu`. For Gemma 4V pass `1.0`
-/// (per llama.cpp); for standard ViT pass `1 / sqrt(head_dim)`.
+/// (per the peer); for standard ViT pass `1 / sqrt(head_dim)`.
 ///
 /// ADR-005 Phase 2c iter-129 (W60): V is staged at F16 (peer-precision
-/// parity).  Peer's gemma4v ViT uses `flash_attn_ext` on Metal (default
-/// AUTO upgrades to ENABLED at clip.cpp:2494-2528) and casts both K and
-/// V to F16 before the FA call (clip.cpp:663-664).  We replicate that
+/// parity).  The peer's gemma4v ViT uses flash attention on Metal
+/// (default AUTO upgrades to ENABLED) and casts both K and
+/// V to F16 before the FA call.  We replicate that
 /// 10-bit-mantissa staging through our decomposed scores@V matmul; the
 /// arithmetic contract stays F32-accumulated across the K reduction
-/// (`dense_matmul_f16_f32_tensor` matches llama.cpp's
-/// `kernel_mul_mm_f16_f32`, which uses `simdgroup_half8x8` MMA with
+/// (`dense_matmul_f16_f32_tensor` matches the peer's
+/// f16×f32 matmul kernel, which uses `simdgroup_half8x8` MMA with
 /// float4x4 accumulator).  Pre-iter-129 hf2q cast V F32→BF16 (7-bit
 /// mantissa), capturing the dominant residual per-block cascade after
 /// iter-128's weight-matmul F16 fix.
@@ -1391,8 +1391,8 @@ pub fn vit_silu_mul_gpu(
 ///   15. down = rms_norm_gpu(down, post_ffw_norm)
 ///   16. block_out = residual_add_gpu(post_attn, down)
 ///
-/// `scale` matches `vit_attention_gpu` — pass `1.0` for Gemma 4V (per
-/// llama.cpp parity), `1/sqrt(head_dim)` for standard ViT.
+/// `scale` matches `vit_attention_gpu` — pass `1.0` for Gemma 4V (peer
+/// parity), `1/sqrt(head_dim)` for standard ViT.
 ///
 /// Caller must register sigmoid_mul + softmax shaders before dispatch:
 /// `mlx_native::ops::sigmoid_mul::register(&mut registry)` and
@@ -1658,8 +1658,7 @@ kernel void vit_avg_pool_2x2_f32(
 // grid. Output shape is [n_y/k, n_x/k, hidden]. Generalizes
 // vit_avg_pool_2x2_f32 (which is the n_x=n_y=n_side, k=2 case).
 //
-// gemma4v call: n_x = n_patches_x, n_y = n_patches_y, k = n_merge = 3
-// (per /opt/llama.cpp/tools/mtmd/clip.cpp:1337).
+// gemma4v call: n_x = n_patches_x, n_y = n_patches_y, k = n_merge = 3.
 //
 // Layout assumption: input is row-major with rows iterating Y first
 // (so row stride = n_x * hidden), matching the
@@ -1728,8 +1727,8 @@ kernel void vit_std_bias_scale_f32(
 // values supplied via a 2-element params buffer. The convention:
 //   out[i] = clamp(in[i], min, max)
 // Setting min = -FLT_MAX or max = FLT_MAX makes that side a no-op,
-// matching llama.cpp's get_scalar default for the gemma4v
-// Gemma4ClippableLinear (`tools/mtmd/clip.cpp:1953-1956`).
+// matching the peer's get_scalar default for the gemma4v
+// Gemma4ClippableLinear.
 //
 // Caller dispatches once per clamp (input or output side); we don't
 // fuse the matmul-and-clamps because the Gemma4ClippableLinear
@@ -2059,7 +2058,7 @@ pub fn vit_avg_pool_2x2_gpu(
 ///   - arbitrary kernel size `k` (must divide both `n_x` and `n_y`).
 ///
 /// gemma4v call: pass `(n_x = n_patches_x, n_y = n_patches_y, k =
-/// n_merge = 3)` per `/opt/llama.cpp/tools/mtmd/clip.cpp:1337,1334`.
+/// n_merge = 3)` per the peer's gemma4v hparams.
 ///
 /// # Byte-stable wrt the 2×2 path
 ///
@@ -2075,7 +2074,7 @@ pub fn vit_avg_pool_2x2_gpu(
 ///
 /// - `n_x == 0` or `n_y == 0` or `k == 0`
 /// - `n_x % k != 0` or `n_y % k != 0` (input must be exactly tileable;
-///   llama.cpp's `ggml_pool_2d` with stride==kernel and pad==0 has the
+///   the peer's 2-D pool with stride==kernel and pad==0 has the
 ///   same tiling assumption — fractional-tile output isn't well-defined)
 /// - `hidden == 0`
 /// - propagated from kernel pipeline compile failures
@@ -2144,7 +2143,7 @@ pub fn vit_avg_pool_kxk_gpu(
 
 /// GPU thin wrapper for the gemma4v 3×3 avg-pool. Routes through
 /// `vit_avg_pool_kxk_gpu` with `k = 3` per the gemma4v `n_merge`
-/// reference (`/opt/llama.cpp/tools/mtmd/clip.cpp:1337`).
+/// reference value.
 ///
 /// `n_x` / `n_y` come from `Gemma4vPreprocessed.n_x` / `.n_y` — the
 /// variable patch grid produced by `preprocess_gemma4v`. Both must be
@@ -2164,10 +2163,10 @@ pub fn gemma4v_avg_pool_3x3_gpu(
 
 /// GPU elementwise scalar clamp: `out[i] = clamp(in[i], min_val, max_val)`.
 ///
-/// Building block for Gemma4ClippableLinear (`gemma4v.cpp:138-151`).
+/// Building block for Gemma4ClippableLinear.
 /// Pass `min_val = f32::NEG_INFINITY` (or `f32::MIN`) for "no min" and
 /// `max_val = f32::INFINITY` (or `f32::MAX`) for "no max" to match
-/// llama.cpp's `get_scalar(name, FLT_MAX/-FLT_MAX)` defaults.
+/// the peer's `FLT_MAX/-FLT_MAX` defaults.
 ///
 /// Allocates a fresh `[n_elements]` output buffer; the input is
 /// untouched (despite the name "_inplace" in the Metal kernel — the
@@ -2304,7 +2303,7 @@ pub fn vit_std_bias_scale_gpu(
 /// (no aliasing issue — each thread touches one element).
 ///
 /// Used by the post-blocks pipeline's `scale_in_place(√n_embd)` step
-/// (`ggml_scale(cur, sqrtf(n_embd))` in llama.cpp's gemma4v graph).
+/// (the `sqrt(n_embd)` scale in the peer's gemma4v graph).
 ///
 /// # Errors
 ///
@@ -2378,7 +2377,7 @@ pub fn apply_vit_blocks_loop_gpu(
 
 /// Full GPU ViT forward: pixel tensor → projected multimodal embeddings.
 ///
-/// Pipeline (matches llama.cpp `clip_graph_gemma4v::build`):
+/// Pipeline (matches the peer's gemma4v graph):
 ///   1. CPU `patch_embed_from_mmproj_weights(pixels, weights, cfg)` →
 ///      `[num_patches, hidden]` F32 (one-time per image; dominated by
 ///      the 27-block GPU compute that follows).
@@ -2398,7 +2397,7 @@ pub fn apply_vit_blocks_loop_gpu(
 /// downstream embedding injection into the chat prompt.
 ///
 /// `scale` matches `vit_attention_gpu` — pass `1.0` for Gemma 4V (per
-/// llama.cpp), `1/sqrt(head_dim)` for standard ViT.
+/// the peer), `1/sqrt(head_dim)` for standard ViT.
 ///
 /// Caller registers shaders before dispatch:
 /// ```
@@ -3421,9 +3420,8 @@ use mlx_native::ops::vision_2d_rope::{build_vision_2d_rope_params, dispatch_visi
 /// (literal gain).
 ///
 /// Spec: `transformers/models/gemma4/modeling_gemma4.py::Gemma4RMSNorm::forward`
-/// — applies the literal weight (initialized to `torch.ones(dim)`). Peer
-/// reference: llama.cpp `tools/mtmd/clip.cpp::clip_graph::build_norm`
-/// (lines 524-547) — `ggml_mul(cur, mw)` literal.
+/// — applies the literal weight (initialized to `torch.ones(dim)`). The
+/// peer's runtime norm likewise applies the literal weight.
 ///
 /// Bug-history (iter-122, 2026-04-26): originally this helper allocated a
 /// transient `weight + 1` buffer to apply the candle convention from
@@ -3459,8 +3457,8 @@ pub fn vit_gemma_rms_norm_gpu(
             "vit_gemma_rms_norm_gpu: rows ({rows}) and dim ({dim}) must be > 0"
         ));
     }
-    // Delegate to the literal-gain primitive — peer-identical to
-    // llama.cpp `clip_graph::build_norm` for the gemma4v ViT path.
+    // Delegate to the literal-gain primitive — peer-identical
+    // for the gemma4v ViT path.
     vit_rms_norm_gpu(encoder, registry, device, input, gain_f32, rows, dim, eps)
         .context("vit_gemma_rms_norm_gpu: rms_norm_gpu")
 }
@@ -3743,14 +3741,12 @@ pub fn vit_gelu_pytorch_tanh_gpu(
 ///
 /// # Tensor name lineage (W44 iter-116k)
 ///
-/// Gemma4v vision-namespace short forms per
-/// `/opt/llama.cpp/tools/mtmd/clip-impl.h`:
-///   - `attn_out.weight`        — TN_ATTN_OUTPUT (l.82, W34 iter-116e)
-///   - `attn_post_norm.weight`  — TN_ATTN_POST_NORM (l.94, post-attention norm)
-///   - `ln2.weight`             — TN_LN_2 (l.90, pre-FFN norm — W36 iter-116f
+/// Gemma4v vision-namespace short forms per the peer's mmproj naming:
+///   - `attn_out.weight`        — attention output proj (W34 iter-116e)
+///   - `attn_post_norm.weight`  — post-attention norm
+///   - `ln2.weight`             — pre-FFN norm (W36 iter-116f
 ///                                renamed `pre_feedforward_layernorm` → `ln2`)
-///   - `ffn_post_norm.weight`   — TN_FFN_POST_NORM (l.95, post-FFN norm —
-///                                W36 iter-116f renamed
+///   - `ffn_post_norm.weight`   — post-FFN norm (W36 iter-116f renamed
 ///                                `post_feedforward_layernorm` → `ffn_post_norm`)
 /// `block_tensor` accepts the legacy `attn_output` / `post_ffw_norm`
 /// aliases bidirectionally; the ln1/ln2/attn_post_norm/ffn_post_norm
@@ -4064,8 +4060,8 @@ pub fn gemma4v_block_forward_gpu(
     if dump_intra {
         // Peer counterpart: kqv_out-NN. hf2q's vit_attention_gpu output
         // is `[batch, num_heads*head_dim] = [batch, hidden]` row-major
-        // — same row-major as peer's `cur` after the cont_2d at the end
-        // of build_attn's non-flash branch (clip.cpp:683).
+        // — same row-major as the peer's equivalent tensor at the end
+        // of its non-flash attention branch.
         super::vit_dump::record(&intra_name("05_kqv_out"), &attn);
     }
 
@@ -4074,8 +4070,8 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &attn,
-        // W44 iter-116k: TN_ATTN_OUTPUT short form `attn_out` per
-        // /opt/llama.cpp/tools/mtmd/clip-impl.h:82 (W34 iter-116e
+        // W44 iter-116k: short form `attn_out` per the peer's
+        // naming (W34 iter-116e
         // writer rename). `block_tensor`'s legacy alias still
         // accepts `attn_output.weight`, but this site uses the
         // canonical name to match the writer's emit.
@@ -4102,13 +4098,10 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &attn_proj,
-        // W44 iter-116k: post-attention norm is `attn_post_norm`
-        // (TN_ATTN_POST_NORM, clip-impl.h:94), NOT `ln2`. W36
+        // W44 iter-116k: post-attention norm is `attn_post_norm`,
+        // NOT `ln2`. W36
         // iter-116f writer maps HF `post_attention_layernorm` →
-        // `attn_post_norm.weight` per
-        // /opt/llama.cpp/gguf-py/gguf/constants.py:1218
-        // (V_ENC_ATTN_POST_NORM). Build_vit consumes via
-        // `layer.attn_post_norm_w` (clip.cpp:439-441).
+        // `attn_post_norm.weight` per the peer's naming.
         block("attn_post_norm.weight")?,
         batch,
         hidden,
@@ -4131,9 +4124,8 @@ pub fn gemma4v_block_forward_gpu(
     encoder.memory_barrier();
     if dump_intra {
         // Peer counterpart: ffn_inp-NN (input to FFN half = post first
-        // residual add). Note clip.cpp:445-449 calls this `cur` then
-        // names the residual `ffn_inp` AFTER the add (line 449), so this
-        // matches the post-add tensor.
+        // residual add). The peer names the residual `ffn_inp` AFTER
+        // the add, so this matches the post-add tensor.
         super::vit_dump::record(&intra_name("08_ffn_inp"), &x_mid);
     }
     if audit_intra {
@@ -4146,12 +4138,10 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &x_mid,
-        // W44 iter-116k: pre-FFN norm is `ln2` (TN_LN_2,
-        // clip-impl.h:90), NOT `ffn_norm`. W36 iter-116f writer
-        // maps HF `pre_feedforward_layernorm` → `ln2.weight` per
-        // /opt/llama.cpp/gguf-py/gguf/constants.py:1214
-        // (V_ENC_POST_ATTN_NORM = "v.blk.{bid}.ln2"). Build_vit
-        // consumes via `layer.ln_2_w` (clip.cpp:452).
+        // W44 iter-116k: pre-FFN norm is `ln2`,
+        // NOT `ffn_norm`. W36 iter-116f writer
+        // maps HF `pre_feedforward_layernorm` → `ln2.weight`
+        // (`v.blk.{bid}.ln2` per the peer's naming).
         block("ln2.weight")?,
         batch,
         hidden,
@@ -4263,12 +4253,11 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &down,
-        // W44 iter-116k: post-FFN norm is `ffn_post_norm`
-        // (TN_FFN_POST_NORM, clip-impl.h:95). W36 iter-116f writer
+        // W44 iter-116k: post-FFN norm is `ffn_post_norm`.
+        // W36 iter-116f writer
         // maps HF `post_feedforward_layernorm` →
-        // `ffn_post_norm.weight` per
-        // /opt/llama.cpp/gguf-py/gguf/constants.py:1219
-        // (V_ENC_FFN_POST_NORM). `block_tensor`'s legacy alias
+        // `ffn_post_norm.weight` per the peer's
+        // naming. `block_tensor`'s legacy alias
         // still accepts `post_ffw_norm.weight`, but this site
         // uses the canonical name to match the writer's emit.
         block("ffn_post_norm.weight")?,
@@ -4387,8 +4376,7 @@ pub fn gemma4v_clippable_linear_gpu(
 /// Full GPU gemma4v ViT forward: pre-processed image → projected
 /// multimodal embeddings.
 ///
-/// Pipeline (matches `clip_graph_gemma4v::build`,
-/// `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp`):
+/// Pipeline (matches the peer's gemma4v graph):
 ///
 ///   1. Upload patches `[N, p²·3]` + position-index arrays
 ///      (`pos_x[N]`, `pos_y[N]`) to GPU.
@@ -4401,11 +4389,10 @@ pub fn gemma4v_clippable_linear_gpu(
 ///   5. Reshape `[N, hidden]` → `[n_y, n_x, hidden]` (no copy; the
 ///      pool kernel reads the same buffer with the rectangular layout)
 ///      and `gemma4v_avg_pool_3x3_gpu` → `[n_y/3, n_x/3, hidden]`.
-///   6. `vit_scale_gpu(sqrt(hidden))` — gemma4v.cpp:115.
-///   7. `vit_std_bias_scale_gpu(std_bias, std_scale)` — gemma4v.cpp:121-122.
-///   8. `gemma4v_clippable_linear_gpu(mm.0.weight, bounds)` —
-///      gemma4v.cpp:127, build_mm at 138-151.
-///   9. `vit_rms_norm_gpu(ones, eps)` — gemma4v.cpp:131
+///   6. `vit_scale_gpu(sqrt(hidden))`.
+///   7. `vit_std_bias_scale_gpu(std_bias, std_scale)`.
+///   8. `gemma4v_clippable_linear_gpu(mm.0.weight, bounds)`.
+///   9. `vit_rms_norm_gpu(ones, eps)`
 ///      (`embedding_post_projection_norm`, no learned gain).
 ///
 /// Returns the final `[N_post_pool, text_hidden]` F32 buffer on device.
@@ -4554,7 +4541,7 @@ pub fn gemma4v_apply_full_forward_gpu(
     //
     // Stage `00_post_patchify` — `[N_patches, P²·3]` flat, hf2q's native
     // layout after `preprocess_gemma4v`'s patchify (HWC `(dy, dx, c)`
-    // per row). hf2q-only; the peer (llama.cpp's `inp_raw_scaled`) is
+    // per row). hf2q-only; the peer's `inp_raw_scaled` is
     // captured pre-patchify so there's no peer counterpart at this
     // point. Useful for self-consistency checks across iters.
     //
@@ -8281,13 +8268,13 @@ mod tests {
         // Layer index = 0.
         let block_key = |suffix: &str| format!("v.blk.0.{}", suffix);
         // W44 iter-116k: emit-name semantics aligned with W36 iter-116f
-        // writer renames; canonical short forms per
-        // /opt/llama.cpp/tools/mtmd/clip-impl.h.
-        //   - ln1            = pre-attention norm                     (l.89)
-        //   - attn_post_norm = post-attention norm   (was: ln2)        (l.94)
-        //   - ln2            = pre-FFN norm          (was: ffn_norm)   (l.90)
-        //   - ffn_post_norm  = post-FFN norm         (was: post_ffw)   (l.95)
-        //   - attn_out       = attn output projection (was: attn_output) (l.82)
+        // writer renames; canonical short forms per the peer's mmproj
+        // naming.
+        //   - ln1            = pre-attention norm
+        //   - attn_post_norm = post-attention norm   (was: ln2)
+        //   - ln2            = pre-FFN norm          (was: ffn_norm)
+        //   - ffn_post_norm  = post-FFN norm         (was: post_ffw)
+        //   - attn_out       = attn output projection (was: attn_output)
         put(
             &mut tensors,
             &device,
@@ -8584,13 +8571,13 @@ mod tests {
 
         // Per-block tensors × num_layers.
         // W44 iter-116k: emit-name semantics aligned with W36 iter-116f
-        // writer renames. Canonical short forms per
-        // /opt/llama.cpp/tools/mtmd/clip-impl.h:
-        //   - ln1            (l.89) — pre-attention norm
-        //   - attn_post_norm (l.94) — post-attention norm   (was: ln2)
-        //   - ln2            (l.90) — pre-FFN norm          (was: ffn_norm)
-        //   - ffn_post_norm  (l.95) — post-FFN norm         (was: post_ffw_norm)
-        //   - attn_out       (l.82) — attn output proj      (was: attn_output)
+        // writer renames. Canonical short forms per the peer's mmproj
+        // naming:
+        //   - ln1            — pre-attention norm
+        //   - attn_post_norm — post-attention norm   (was: ln2)
+        //   - ln2            — pre-FFN norm          (was: ffn_norm)
+        //   - ffn_post_norm  — post-FFN norm         (was: post_ffw_norm)
+        //   - attn_out       — attn output proj      (was: attn_output)
         for layer_idx in 0..num_layers {
             let prefix = format!("v.blk.{}.", layer_idx);
             put(

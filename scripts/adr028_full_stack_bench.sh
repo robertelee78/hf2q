@@ -10,7 +10,7 @@
 # Defaults: long-form telescope prompt, 200 tokens, 3 runs per stack.
 #
 # Output: comparison table (default / Path E / Path E+G / Path E+F+G /
-# llama.cpp peer) with median tok/s + std-dev hint.
+# the peer) with median tok/s + std-dev hint.
 #
 # Requires: gemma-4-26B-A4B-it-DFlash-not-required model file at
 #   /opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf
@@ -90,11 +90,11 @@ if [[ -x "$LLAMA_BENCH" ]]; then
     # Use tg1024 for proper apples-to-apples regime match (matches hf2q's
     # measurement window). tg128 reported alongside for backwards
     # compatibility with iter-183/iter-216 historical numbers.
-    echo "=== llama.cpp peer (tg128 burst + tg1024 matched-regime) ==="
+    echo "=== peer (tg128 burst + tg1024 matched-regime) ==="
     "$LLAMA_BENCH" -m "$MODEL" -p 0 -n 128,1024 -r 3 -t 8 2>&1 \
         | grep -E "(tg128|tg1024) *\|" | tail -2
 else
-    echo "[skip] llama.cpp peer bench: $LLAMA_BENCH not found"
+    echo "[skip] peer bench: $LLAMA_BENCH not found"
 fi
 
 echo
@@ -106,7 +106,7 @@ echo "    Path E (USE_DENSE — breaks TQ-HB):        77.6-77.7 tok/s (0.754x pe
 echo "    Path E+F+G (F16 KV, degraded coherence):  78.6 tok/s    (0.763x peer) — DO NOT SHIP"
 echo "  1000-tok sustained-regime (default, iter-377/392):"
 echo "    Default at HEAD:                          74.2 tok/s    (0.765x peer 97)  ← +13.3% vs orig 65.5"
-echo "  llama.cpp peer:  tg128 ~103 (burst), tg1024 ~97 (matched)"
+echo "  peer:  tg128 ~103 (burst), tg1024 ~97 (matched)"
 echo
 echo "Operator decision tree (TQ-HB intact options at HEAD):"
 echo "  - Status quo / no env vars (5 phases default-on):  0.730x peer  TQ-HB ✓ (3.94x mem)"

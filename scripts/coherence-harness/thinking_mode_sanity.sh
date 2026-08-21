@@ -4,7 +4,7 @@
 #
 # 2026-05-03 — built per user "real harness, ground up testing" directive
 # after the wedding-cake `--no-thinking` regression. Both hf2q AND
-# llama.cpp produce the same degenerate loop on certain prompts when the
+# the peer produce the same degenerate loop on certain prompts when the
 # chat template's `enable_thinking=False` branch injects an empty
 # `<think></think>` suppressor (model is trained to ALWAYS emit thinking,
 # so an empty pre-filled block is OOD). Default-thinking mode works

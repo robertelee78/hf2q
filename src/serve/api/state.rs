@@ -40,7 +40,7 @@ use crate::serve::quant_select::QuantType;
 /// Server-level configuration, captured at startup from CLI flags + defaults.
 ///
 /// All fields are immutable for the lifetime of the server. A restart is
-/// required to change any of them (matching ollama / llama.cpp conventions).
+/// required to change any of them (matching peer-server conventions).
 ///
 /// Decision numbers reference ADR-005 Phase 2 refinement (2026-04-23).
 #[derive(Debug, Clone)]
@@ -648,11 +648,11 @@ pub struct AppState {
 pub struct EmbeddingModel {
     pub gguf_path: PathBuf,
     pub vocab: Arc<crate::inference::models::bert::BertVocab>,
-    /// llama.cpp-compatible WordPiece tokenizer (uses ▁-prefix word
+    /// Peer-compatible WordPiece tokenizer (uses ▁-prefix word
     /// starters, matches the bge / nomic / mxbai GGUF format byte-for-
     /// byte). Shared across BERT-family architectures because all of
     /// them use the same WPM vocab convention in GGUF (per
-    /// `llm_tokenizer_wpm_session::tokenize` in llama.cpp).
+    /// the peer's WPM tokenizer).
     pub tokenizer: Arc<crate::inference::models::bert::BertWpmTokenizer>,
     /// Model id (file stem) — surfaced via `/v1/models`.
     pub model_id: String,
@@ -737,7 +737,7 @@ impl std::fmt::Debug for EmbeddingModel {
 impl EmbeddingModel {
     /// Convenience: tokenize a single input string using the embedded
     /// WordPiece tokenizer. Returns the token-id vector. Matches
-    /// llama.cpp's WPM tokenizer; pass `add_special_tokens=true` to
+    /// the peer's WPM tokenizer; pass `add_special_tokens=true` to
     /// wrap the output in `[CLS] ... [SEP]`.
     pub fn encode(&self, input: &str, add_special_tokens: bool) -> Vec<u32> {
         self.tokenizer.encode(input, add_special_tokens)
@@ -1061,7 +1061,7 @@ mod tests {
         use crate::inference::models::bert::{
             BertSpecialTokens, BertVocab, build_wordpiece_tokenizer,
         };
-        // Synthetic vocab using llama.cpp's BERT-WPM convention:
+        // Synthetic vocab using the peer's BERT-WPM convention:
         // word-starter tokens are prefixed with ▁ (U+2581). The
         // BertWpmTokenizer prepends ▁ to every input word before
         // greedy lookup, so the vocab MUST store the ▁-prefixed form.
