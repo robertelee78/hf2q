@@ -13,7 +13,7 @@ use super::model_recipe::{
 };
 
 const RECIPE_BYTES: &[u8] = include_bytes!("../../data/model-recipes/qwen38-27b-official-v1.json");
-const RECIPE_SHA256: &str = "e3b60772d2abf33f14e215ba949bca22d16c0f1d8f985cd172b83b422e205126";
+const RECIPE_SHA256: &str = "8d62322eb7860b75fe4d26661354f9890d73e5b3f037a86ebcd60d6ea954fb3c";
 
 fn mutated(mutator: impl FnOnce(&mut Value)) -> Vec<u8> {
     let mut value: Value = serde_json::from_slice(RECIPE_BYTES).unwrap();

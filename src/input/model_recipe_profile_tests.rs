@@ -30,11 +30,11 @@ fn prepared_profile_golden_is_exact_and_cross_binds_the_pair_receipt() {
     assert_eq!(PROFILE_BYTES.len(), 1_240);
     assert_eq!(
         hex::encode(sha2::Sha256::digest(PROFILE_BYTES)),
-        "bc34868c014b2cd7de650bb2185c79d8a4389f71f68d7611ca6dd6de6c6dd9b0"
+        "a48bf14c469597f7567e9c11e689aeac9ccb39b1506afa57d79754f8f19c312b"
     );
     assert_eq!(
         profile.preparation_receipt_sha256(),
-        "b947550f429b7035a97b75a01dc430ba13ff0e83cfbb561d1dab89e926649f36"
+        "050900cc0bb998272504a5be94b3105092134a59d47ee1fcca28747464d8240a"
     );
     assert_eq!(
         profile

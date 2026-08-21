@@ -1314,7 +1314,10 @@ and checked again immediately before the first weight allocation.
 
 The evidence profile is itself an exact embedded artifact,
 `qwen38_source_teacher_canary_v1`, SHA-256
-`9f8fe69a79a5348f847e67e0dd1b5b45f6ed98f1b6735690484c77d19b6334cb`.
+`ecbb9a9a6f757fca9984ace998ae8a6ba3219c6d9a052c7727c00ec399749dd1`.
+This hash was reissued on 2026-08-21 solely to bind the accepted recipe's
+relocated ADR path; the model revision, source bundle, datasets, and execution
+bounds are unchanged.
 It pins source revision and recipe identity, the exact Calibration,
 PolicyValidation, and AcceptanceHoldout artifact hashes, renderer and token
 bounds, target/work/upload bounds, the 8 GiB host reserve, 8 GiB Metal reserve,
