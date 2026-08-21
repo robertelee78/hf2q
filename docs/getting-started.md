@@ -109,17 +109,22 @@ When OpenCode opens you are on `hf2q/Release Qwen38 E2` via `assistant` — ask
 it something; the answer is computed locally. Server logs:
 `/tmp/hf2q-serve.log`; stop it with `pkill -f "hf2q serve"`.
 
-Raw server check, no OpenCode needed:
+Prove it without OpenCode — `hf2q chat` discovers the running server and its
+model by itself (`/thinking off` matches the card's measured configuration;
+`/status` shows the endpoint; `/quit` exits):
+
+```bash
+hf2q chat
+```
+
+Or the raw API (`hf2q_enable_thinking: false` does the same there; add
+`"stream":true` for SSE):
 
 ```bash
 curl -fsS http://127.0.0.1:8081/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"Release Qwen38 E2","messages":[{"role":"user","content":"Write a Rust function that adds two i64 values."}],"temperature":0,"max_tokens":256,"hf2q_enable_thinking":false}'
 ```
-
-(`hf2q_enable_thinking: false`: the embedded template defaults to thinking
-mode; the model card's measured configuration is thinking-off. Add
-`"stream":true` for SSE.)
 
 ## Optional: web search and scraping (SearXNG, Crawl4AI, Firecrawl)
 
