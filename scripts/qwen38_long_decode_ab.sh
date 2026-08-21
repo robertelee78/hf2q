@@ -92,7 +92,22 @@ file_bytes() {
 
 "$script_dir/seal_release_binary.sh" --verify "$BINARY_PATH" "$BINARY_SHA256" \
   >/dev/null
-hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256"
+model_verification_receipt=${HF2Q_MODEL_VERIFICATION_RECEIPT:-}
+if [[ -z "$model_verification_receipt" ]]; then
+  if [[ -n ${HF2Q_MODEL_VERIFICATION_CACHE_DIR:-} ]]; then
+    model_verification_cache_dir=$HF2Q_MODEL_VERIFICATION_CACHE_DIR
+  elif [[ -n ${XDG_CACHE_HOME:-} ]]; then
+    model_verification_cache_dir="$XDG_CACHE_HOME/hf2q/model-verification"
+  else
+    model_verification_cache_dir="${HOME:?HOME is required when XDG_CACHE_HOME is unset}/.cache/hf2q/model-verification"
+  fi
+  model_verification_receipt="$OUT_DIR/model-verification.json"
+  hf2q_release_prepare_model_verification \
+    "$MODEL_PATH" "$MODEL_SHA256" "$model_verification_receipt" \
+    "$model_verification_cache_dir"
+fi
+hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
+  "$model_verification_receipt"
 binary_identity=$(file_identity "$BINARY_PATH")
 model_identity=$(file_identity "$MODEL_PATH")
 model_bytes=$(file_bytes "$MODEL_PATH")
@@ -599,7 +614,8 @@ done
   >/dev/null
 test "$(file_identity "$BINARY_PATH")" = "$binary_identity"
 test "$(file_identity "$MODEL_PATH")" = "$model_identity"
-hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256"
+hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
+  "$model_verification_receipt"
 phase_sha=$(sha256_file "$OUT_DIR/phase.log")
 phase_bytes=$(file_bytes "$OUT_DIR/phase.log")
 
