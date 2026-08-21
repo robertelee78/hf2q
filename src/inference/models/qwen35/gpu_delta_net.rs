@@ -624,7 +624,7 @@ enum Bf16ProjectionRoute {
 
 /// Select the source-BF16 projection route without inspecting process state.
 ///
-/// The published mlx-native v0.10.16 GEMV kernel processes two output rows
+/// The published mlx-native v0.11.0 GEMV kernel processes two output rows
 /// per threadgroup and forms both row pointers before guarding the second
 /// write. Until the native odd-width path is hardened, keep odd `N` on the
 /// tensor-MM route. All Qwen3.8 DeltaNet projection widths are even.

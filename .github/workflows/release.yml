@@ -126,12 +126,12 @@ jobs:
             .dependency_provenance == $dependency[0]
             and .dependency_provenance.package.crate_sha256 == .crate_sha256
             and .dependency_provenance.dependency.name == "mlx-native"
-            and .dependency_provenance.dependency.version == "0.10.16"
-            and .dependency_provenance.dependency.requirement == "=0.10.16"
+            and .dependency_provenance.dependency.version == "0.11.0"
+            and .dependency_provenance.dependency.requirement == "=0.11.0"
             and .dependency_provenance.dependency.source
               == "registry+https://github.com/rust-lang/crates.io-index"
             and .dependency_provenance.dependency.checksum
-              == "9236b563fc45c861ec772cb0b29aafc1144bc49b92b229790c7e1b57844fc83b"
+              == "f9e25280262b20fd2894acc90229a7d2f695a1d818451473f95ef40125962cd8"
           ' "$manifest" >/dev/null
           echo "DEPENDENCY_PROVENANCE_DIR=$dependency_provenance_dir" \
             >> "$GITHUB_ENV"
@@ -292,12 +292,12 @@ jobs:
              and .dependency_provenance.build.cargo_home_was_fresh_before_resolution == true
              and .dependency_provenance.build.rust_build_override_env_cleared == true
              and .dependency_provenance.dependency.name == "mlx-native"
-             and .dependency_provenance.dependency.version == "0.10.16"
-             and .dependency_provenance.dependency.requirement == "=0.10.16"
+             and .dependency_provenance.dependency.version == "0.11.0"
+             and .dependency_provenance.dependency.requirement == "=0.11.0"
              and .dependency_provenance.dependency.source
                == "registry+https://github.com/rust-lang/crates.io-index"
              and .dependency_provenance.dependency.checksum
-               == "9236b563fc45c861ec772cb0b29aafc1144bc49b92b229790c7e1b57844fc83b"
+               == "f9e25280262b20fd2894acc90229a7d2f695a1d818451473f95ef40125962cd8"
              and .models.deepseek.sha256 == $deepseek_sha
              and .models.gemma.sha256 == $gemma_sha
              and .models.qwen.sha256 == $qwen_sha
@@ -310,7 +310,7 @@ jobs:
                and $d.cooperative_prefill.status == "pass"
                and $d.cooperative_prefill.source_sha == $source_sha
                and $d.cooperative_prefill.model_sha256 == $deepseek_sha
-               and $d.cooperative_prefill.mlx_native_version == "0.10.16"
+               and $d.cooperative_prefill.mlx_native_version == "0.11.0"
                and $d.cooperative_prefill.prefix_rows == 148
                and $d.cooperative_prefill.benchmark.speedup > 1
                and $d.cooperative_prefill.thermal_status == "fair_or_better"

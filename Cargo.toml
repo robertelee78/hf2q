@@ -123,8 +123,8 @@ thiserror = "2"
 # command-buffer drop performance, paired MoE prefill scheduling, and the
 # machine-readable packed-affine capability contract and bounded D512
 # prefill-tail reads plus exact GGML routing/capability and host-side GGUF
-# evidence reads and typed resolved-dispatch traces require mlx-native 0.10.16.
-mlx-native = "=0.10.16"
+# evidence reads and typed resolved-dispatch traces require mlx-native 0.11.0.
+mlx-native = "=0.11.0"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
