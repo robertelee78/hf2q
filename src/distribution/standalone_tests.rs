@@ -227,4 +227,15 @@ fn standalone_installer_bootstrap_surface_is_hidden_bounded_and_parseable() {
         panic!("uninstall command was not selected");
     };
     assert!(args.yes);
+    assert!(!args.purge_config);
+    assert!(!args.purge_cache);
+
+    let cli = Cli::try_parse_from(["hf2q", "uninstall", "--purge-config", "--purge-cache"])
+        .expect("explicit purge preview parses without confirmation");
+    let Command::Uninstall(args) = cli.command else {
+        panic!("uninstall command was not selected");
+    };
+    assert!(!args.yes);
+    assert!(args.purge_config);
+    assert!(args.purge_cache);
 }

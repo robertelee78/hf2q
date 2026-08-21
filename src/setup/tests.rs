@@ -138,6 +138,68 @@ fn test_root(temp: &TempDir, name: &str) -> PathBuf {
     temp.path().canonicalize().unwrap().join(name)
 }
 
+#[test]
+fn config_purge_preview_is_non_mutating_and_execution_removes_only_owned_names() {
+    let temp = TempDir::new().unwrap();
+    let missing = test_root(&temp, "missing-state");
+    let plan = super::prepare_config_purge(Some(&missing)).unwrap();
+    assert_eq!(plan.root, missing);
+    assert!(!plan.root.exists(), "preview must not create a state root");
+    assert!(super::execute_config_purge(&plan).unwrap().is_empty());
+    assert!(!plan.root.exists(), "missing purge remains a no-op");
+
+    let root = test_root(&temp, "state");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    for (name, bytes) in [
+        ("config.toml", b"config".as_slice()),
+        (".config.toml.partial", b"partial".as_slice()),
+        (".config.toml.lock", b"".as_slice()),
+        ("operator-note", b"preserve".as_slice()),
+    ] {
+        fs::write(root.join(name), bytes).unwrap();
+        fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let before_note = fs::read(root.join("operator-note")).unwrap();
+    let plan = super::prepare_config_purge(Some(&root)).unwrap();
+    assert!(root.join("config.toml").exists());
+    let removed = super::execute_config_purge(&plan).unwrap();
+    assert_eq!(removed.len(), 3);
+    for path in plan.paths {
+        assert!(!path.exists(), "purged {}", path.display());
+    }
+    assert_eq!(fs::read(root.join("operator-note")).unwrap(), before_note);
+    assert!(
+        root.exists(),
+        "purge preserves the selected root and siblings"
+    );
+}
+
+#[test]
+fn config_purge_rejects_hostile_leaf_and_busy_setup_without_removing_config() {
+    let temp = TempDir::new().unwrap();
+    let root = test_root(&temp, "hostile-state");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let outside = test_root(&temp, "outside");
+    fs::write(&outside, b"outside").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("config.toml")).unwrap();
+    assert!(super::prepare_config_purge(Some(&root)).is_err());
+    assert_eq!(fs::read(&outside).unwrap(), b"outside");
+
+    fs::remove_file(root.join("config.toml")).unwrap();
+    fs::write(root.join("config.toml"), b"config").unwrap();
+    fs::set_permissions(root.join("config.toml"), fs::Permissions::from_mode(0o600)).unwrap();
+    let held = setup_fs::hold_setup_lock(&root).unwrap();
+    let plan = super::prepare_config_purge(Some(&root)).unwrap();
+    assert!(matches!(
+        super::execute_config_purge(&plan),
+        Err(SetupError::Busy)
+    ));
+    assert_eq!(fs::read(root.join("config.toml")).unwrap(), b"config");
+    drop(held);
+}
+
 fn execute_with_probe(
     invocation: TestInvocation,
     interactive: bool,

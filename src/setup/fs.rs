@@ -86,6 +86,52 @@ pub(super) fn load_config_if_present(
     Ok(observe_existing_config(root_path)?.config().cloned())
 }
 
+pub(super) fn validate_purge_target(root_path: &Path) -> Result<(), SetupError> {
+    let root = match reopen_root(root_path) {
+        Ok(root) => root,
+        Err(SetupError::Missing) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for name in [CONFIG_NAME, PARTIAL_NAME, LOCK_NAME] {
+        match open_private_file(&root, name, false) {
+            Ok(file) => {
+                let identity = private_identity(&file, &root)?;
+                verify_named(&root, name, identity)?;
+            }
+            Err(SetupError::Missing) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    verify_root(root_path, &root)
+}
+
+pub(super) fn purge_config(root_path: &Path) -> Result<Vec<&'static str>, SetupError> {
+    let root = match reopen_root(root_path) {
+        Ok(root) => root,
+        Err(SetupError::Missing) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let lock = acquire_lock(&root, LOCK_NAME)?;
+    verify_root(root_path, &root)?;
+    verify_lock(&root, LOCK_NAME, &lock)?;
+    let mut removed = Vec::new();
+    for name in [CONFIG_NAME, PARTIAL_NAME] {
+        if remove_named_private_if_present(&root, name)? {
+            removed.push(name);
+        }
+    }
+    sync_directory(&root)?;
+    verify_root(root_path, &root)?;
+    verify_lock(&root, LOCK_NAME, &lock)?;
+    full_sync_lock(&lock)?;
+    fs::unlinkat(root.fd.as_fd(), LOCK_NAME, AtFlags::empty())
+        .map_err(|error| io_error("remove setup lock", error))?;
+    removed.push(LOCK_NAME);
+    sync_directory(&root)?;
+    verify_root(root_path, &root)?;
+    Ok(removed)
+}
+
 fn observe_existing_config_with_hook(
     root_path: &Path,
     hook: impl FnOnce(),
@@ -433,6 +479,22 @@ fn remove_partial_if_private(root: &Directory) -> Result<(), SetupError> {
     fs::unlinkat(root.fd.as_fd(), PARTIAL_NAME, AtFlags::empty())
         .map_err(|error| io_error("remove completed setup partial", error))?;
     sync_directory(root)
+}
+
+fn remove_named_private_if_present(
+    root: &Directory,
+    name: &'static str,
+) -> Result<bool, SetupError> {
+    let file = match open_private_file(root, name, true) {
+        Ok(file) => file,
+        Err(SetupError::Missing) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let identity = private_identity(&file, root)?;
+    verify_named(root, name, identity)?;
+    fs::unlinkat(root.fd.as_fd(), name, AtFlags::empty())
+        .map_err(|error| io_error("remove setup-owned file", error))?;
+    Ok(true)
 }
 
 fn read_required(root: &Directory, name: &str, cap: usize) -> Result<Vec<u8>, SetupError> {

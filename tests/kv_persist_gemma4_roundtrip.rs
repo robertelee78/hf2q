@@ -389,16 +389,7 @@ pub fn resolve_cell_model_path(cell: &Cell) -> Option<PathBuf> {
 
 /// Locate the `hf2q` binary (mirrors `kv_persist_harness.rs::hf2q_binary_path`).
 pub fn hf2q_binary_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("CARGO_BIN_EXE_hf2q") {
-        return PathBuf::from(p);
-    }
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let manifest_dir = env!("CARGO_MANIFEST_DIR");
-            PathBuf::from(manifest_dir).join("target")
-        });
-    target_dir.join("release").join("hf2q")
+    PathBuf::from(env!("CARGO_BIN_EXE_hf2q"))
 }
 
 // =========================================================================
@@ -670,7 +661,7 @@ fn binary_is_locatable_and_runs_version() {
     let bin = hf2q_binary_path();
     assert!(
         bin.exists(),
-        "hf2q binary not found at {}: did `cargo build --release` run?",
+        "Cargo-provided hf2q test binary not found at {}",
         bin.display()
     );
     let out = Command::new(&bin)
