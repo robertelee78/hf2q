@@ -44,8 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   14 build, checkout-owned Developer ID signing without candidate execution,
   ZIP-carried notarization for the raw CLI, exact signed-byte verification,
   immutable draft assets, and local plus public installed setup/uninstall
-  verification. The public installer remains unavailable until the
-  credential-backed release and live stable-record gates succeed.
+  verification. v0.1.7 passed the credential-backed release and live
+  stable-record gates; `https://hf2q.us/install.sh` now serves the exact
+  published installer.
 - Accept canonical Hugging Face model IDs and official model/tree/blob/resolve
   URLs at `hf2q convert`, resolving mutable names to an exact commit before
   transfer and recording the normalized identity in conversion receipt v3.

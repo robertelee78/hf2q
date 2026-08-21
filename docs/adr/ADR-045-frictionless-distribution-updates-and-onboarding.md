@@ -1,7 +1,7 @@
 # ADR-045: Frictionless distribution, updates, and guided onboarding
 
-- Status: Proposed; product scope corrected on 2026-08-20 and release gate
-  simplified on 2026-08-21
+- Status: Proposed; product scope corrected on 2026-08-20, release gate
+  simplified and the first standalone channel shipped on 2026-08-21
 - Date: 2026-08-17
 - Updated: 2026-08-21
 - Owners: hf2q release engineering and operator experience
@@ -565,7 +565,7 @@ operator is told to move it aside and rerun setup. Publication retains the
 private descriptor-relative lock, exact-prefix recovery, atomic rename, and
 durability barriers already proven by setup's filesystem tests.
 
-### Slice D: publish the standalone Apple-Silicon channel
+### Slice D: publish the standalone Apple-Silicon channel — completed 2026-08-21
 
 1. Freeze the three-name standalone layout from the local lifecycle spike and
    implement its focused install/update/rollback/uninstall tests.
@@ -698,8 +698,7 @@ was published and the hardware job was skipped. A follow-up local falsifier
 proved the replacement boundary: the signed hf2q passed the combined online
 check plus `=notarized` requirement, while the local ad-hoc hf2q and `/bin/ls`
 failed the explicit requirement. The rail now verifies both that runtime check
-and the independently accepted notary log/exact CDHash; a new exact-byte run
-remains required before the channel becomes available. A subsequent attempt
+and the independently accepted notary log/exact CDHash. A subsequent attempt
 also demonstrated that coupling publication to the full cross-family model
 gate was a product error: unrelated compiler activity on the shared model
 runner invalidated a performance phase after signing and notarization had
@@ -711,6 +710,23 @@ setup, standalone distribution, and installed CLI behavior. Main CI owns broad
 source regressions; model workflows own family-specific correctness, quality,
 cache, and performance qualification.
 
+The reformulated rail then completed against exact source
+`cfa487a829d6e15508d41089e8d892f18bdb86b0`: main CI run `32470582081`,
+Apple candidate run `32472225070`, and release run `32472465388` all passed.
+The published v0.1.7 Apple-Silicon binary is 38,269,584 bytes with SHA-256
+`ff8a7735b1eac7c7b0c7076f684999460d268a1c596e84daa9333be1c9d56eef`,
+Team ID `3T2D2YNTVW`, and identifier `us.hf2q.cli`. GitHub and crates.io
+package bytes matched; the public release passed clean install, setup, and
+data-preserving uninstall.
+
+Website main `b2691e59951ad3381cbaa51c4c5e4211792ce7ca` now serves the exact
+v0.1.7 installer and canonical stable record directly from hf2q.us. Live
+transport verification and an isolated physical-HOME journey passed:
+install -> setup -> doctor -> already-current update check/update -> uninstall,
+with configuration and model bytes preserved. The measured order matters:
+setup establishes the private state root before doctor or another command uses
+it.
+
 The unreachable second managed-session store, its runtime authorization, and
 the provisional session-cache setup field have been removed. `hf2q setup` does
 not create or authorize a separate `cache/sessions` hierarchy.
@@ -719,11 +735,14 @@ Automatic shell-completion mutation on ordinary startup has also been removed;
 
 What is not yet the corrected product:
 
-- the live standalone installer at hf2q.us;
-- verified Homebrew/npm/direct user channels;
-- published-byte proof for the standalone `update`/`uninstall` commands and
-  package-manager adapters for later channels; and
-- the clean-account installed-artifact acceptance proof.
+- verified Homebrew and npm-family channels;
+- a published cross-version standalone update and rollback (v0.1.7 is the
+  first public standalone version, so only the already-current path can be
+  proven against public bytes today);
+- package-manager update/uninstall adapters and mismatch recovery for later
+  channels; and
+- the complete guide/update/uninstall journey from a distinct clean macOS
+  account, including the protected real-model acceptance path.
 
 The remaining dormant components listed above do not become ADR-045
 requirements. The scope audit has classified them for removal or retention
