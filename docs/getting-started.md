@@ -208,10 +208,12 @@ entry. Crawl4AI container restarts must pass the same token from
 ## Optional: convert the model yourself
 
 The download above is the author's Q5_K_M artifact. hf2q's owned pipeline
-produces its own Q4_K_M artifact from the exact pinned source revision and
-writes a provenance receipt
-(`<output>.receipt.json`) — no Python, `huggingface-cli`, or llama.cpp
-involved. Plan for 100 GiB free:
+produces its own Q4_K_M artifact from the exact pinned source revision
+`08c2f075b43bc06456382db6b918a3dcabdcf4dd` (51.77 GiB of selected source
+files). Because that source is multimodal, the same command automatically
+produces a source-matched text GGUF, F16 projector, and one provenance receipt
+beside each artifact — no Python, `huggingface-cli`, or llama.cpp involved.
+Plan for 100 GiB free:
 
 ```bash
 hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT \
@@ -219,8 +221,17 @@ hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT \
   --output "$HOME/.local/share/hf2q/models/qwen3.8/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf"
 ```
 
-`--quant` defaults to Q4_K_M from setup. Reference:
-[Converting a model](converting-a-model.md).
+`--quant` defaults to Q4_K_M from setup. The measured bound text output is
+16,810,714,944 bytes (15.66 GiB); an explicit `--quant` always wins. The
+command derives
+`Qwen3.8-27B-Abliterated-SFT-Q4_K_M-mmproj.gguf` beside it, and writes one
+conversion receipt beside each artifact. The text GGUF embeds the exact
+projector digest, so a missing or mismatched sidecar fails closed at serve
+time. Keep both receipts with the pair: they bind both outputs to the same
+resolved source and converter revisions while recording each output identity
+and quantization (`q4_k_m` and `f16-mmproj`). Use `--text-only` only when
+omitting vision is intentional. Reference: [Converting a
+model](converting-a-model.md).
 
 ## Problems?
 

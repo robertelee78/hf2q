@@ -327,7 +327,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                 imatrix_corpus: None,
                 imatrix_out: None,
                 imatrix_n_ctx: None,
-                mmproj: false,
+                mode: ConvertMode::TextOnly,
                 remote_source: Some(remote),
             },
             verified_source.clone(),
