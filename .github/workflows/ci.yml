@@ -463,16 +463,16 @@ jobs:
             ff9f5d3ba200f2ccc107fc6142d9752c87a8429697a6a19f5c67702b82731c17
           recipe=data/model-recipes/qwen38-27b-official-v1.json
           test "$(shasum -a 256 "$recipe" | awk '{print $1}')" = \
-            e3b60772d2abf33f14e215ba949bca22d16c0f1d8f985cd172b83b422e205126
+            8d62322eb7860b75fe4d26661354f9890d73e5b3f037a86ebcd60d6ea954fb3c
           preparation_v1_golden=data/model-recipes/qwen38-27b-preparation-receipt-v1.json
           test "$(shasum -a 256 "$preparation_v1_golden" | awk '{print $1}')" = \
             1f6d98b7269c1754d22248136c2793081dd33ed002a13935bde680fa694dffef
           preparation_golden=data/model-recipes/qwen38-27b-preparation-receipt-v2.json
           test "$(shasum -a 256 "$preparation_golden" | awk '{print $1}')" = \
-            b947550f429b7035a97b75a01dc430ba13ff0e83cfbb561d1dab89e926649f36
+            050900cc0bb998272504a5be94b3105092134a59d47ee1fcca28747464d8240a
           prepared_profile_golden=data/model-recipes/qwen38-27b-prepared-profile-v1.json
           test "$(shasum -a 256 "$prepared_profile_golden" | awk '{print $1}')" = \
-            bc34868c014b2cd7de650bb2185c79d8a4389f71f68d7611ca6dd6de6c6dd9b0
+            a48bf14c469597f7567e9c11e689aeac9ccb39b1506afa57d79754f8f19c312b
           fixture=src/distribution/update_auth/testdata/python-tuf-v1
           (cd "$fixture" && shasum -a 256 -c SHA256SUMS)
           expected_generator="$(jq -er .generator_sha256 "$fixture/PROVENANCE.json")"
