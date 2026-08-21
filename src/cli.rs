@@ -1793,6 +1793,8 @@ mod tests {
             "jenerallee78/Qwen3.8-27B-Abliterated-SFT",
             "--revision",
             revision,
+            "--quant",
+            "q4_k_m",
             "--output",
             model,
         ]);
@@ -1804,7 +1806,7 @@ mod tests {
             Some(PathBuf::from("jenerallee78/Qwen3.8-27B-Abliterated-SFT"))
         );
         assert_eq!(args.revision.as_deref(), Some(revision));
-        assert!(args.quant.is_none());
+        assert_eq!(args.quant.as_deref(), Some("q4_k_m"));
         assert_eq!(args.output, PathBuf::from(model));
 
         let cli = Cli::parse_from(["hf2q", "serve", "--model", model]);
@@ -1817,5 +1819,13 @@ mod tests {
         assert!(args.scheduler.is_none());
         assert!(args.max_slots.is_none());
         assert!(args.mmproj.is_none());
+
+        let endpoint = "http://127.0.0.1:8081/v1";
+        let cli = Cli::parse_from(["hf2q", "chat", "--url", endpoint]);
+        let Command::Chat(args) = cli.command else {
+            panic!("expected Chat");
+        };
+        assert_eq!(args.url.as_deref(), Some(endpoint));
+        assert!(args.model.is_none());
     }
 }

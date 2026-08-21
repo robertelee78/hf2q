@@ -95,6 +95,13 @@ hf2q doctor
 Cargo and exact-source builds remain available alternatives:
 
 ```bash
+cargo install hf2q --locked
+hf2q setup
+```
+
+For a source-development checkout:
+
+```bash
 git clone git@github.com:robertelee78/hf2q.git
 cd hf2q
 GIT_COMMIT_SHA="$(git rev-parse HEAD)" cargo build --release --locked
@@ -116,7 +123,10 @@ candidate, exact public binary, stable-record, clean install, setup, update
 already-current, and data-preserving uninstall gates; the branded installer is
 live at `https://hf2q.us/install.sh` as a no-cache temporary redirect to the
 exact immutable versioned GitHub release asset.
-Source/Cargo installs remain unmanaged by `hf2q update`.
+`hf2q update` follows the installation owner: standalone installations use
+the signed release channel, Cargo installations delegate to Cargo, and source
+checkouts receive exact update instructions without automatic repository
+mutation.
 
 `hf2q setup` inventories the selected Apple-Silicon host and records defaults
 that the existing `convert` and `serve` commands consume. It downloads,
@@ -152,12 +162,12 @@ to a sibling checkout.
 
 For the complete first-run path, use
 **[Get started with hf2q and Qwen3.8](docs/getting-started.md)**. It installs
-the signed binary, downloads the model author's pinned Q5_K_M GGUF of
-`jenerallee78/Qwen3.8-27B-Abliterated-SFT`, and walks through text serving,
-direct API use, and an optional OpenCode connection — with native Q4_K_M
-conversion from the exact pinned source revision retained as the optional
-provenance-grade path. It does not introduce a second onboarding or
-model-preparation workflow around the existing commands.
+the signed binary, runs setup, and uses hf2q's native pipeline to download,
+verify, convert, and quantize the exact pinned source revision of
+`jenerallee78/Qwen3.8-27B-Abliterated-SFT`. It then walks through foreground
+serving, `hf2q chat`, direct API use, and an optional existing OpenCode
+connection. It does not introduce a second onboarding or model-preparation
+workflow around the existing commands.
 
 `hf2q doctor` enumerates the runtime checks (hardware detection, disk
 space, optional RuVector backend); run it after `cargo install` if
@@ -175,8 +185,8 @@ regenerate them after upgrading when a new command such as `chat` is added.
 | Command | What it does |
 |---|---|
 | `hf2q setup` | Learn the Apple-Silicon host and record defaults consumed by `convert` and `serve`. |
-| `hf2q update` | Update a standalone installation; `--check` is read-only and `--rollback` restores one retained version. |
-| `hf2q uninstall` | Remove standalone-owned release files with `--yes` while preserving configuration and models. |
+| `hf2q update` | Check or update through the detected standalone or Cargo channel; source checkouts receive non-mutating instructions. Standalone `--rollback` restores one retained version. |
+| `hf2q uninstall` | Preview or remove channel-owned release files while preserving configuration, caches, and models unless explicit purge flags are confirmed. |
 | `hf2q convert` | HuggingFace safetensors → GGUF (streaming convert, ADR-033 unified pipeline). |
 | `hf2q gguf-patch` | Rewrite a GGUF's metadata in place (e.g. inject a chat template). |
 | `hf2q info` | Inspect a GGUF model without loading weights. |
