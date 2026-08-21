@@ -6,7 +6,8 @@ use crate::intelligence::calibration::{
 };
 use crate::intelligence::exact_teacher::{
     validate_canonical_exact_teacher_reference_comparison_receipt,
-    ExactTeacherReferenceComparisonReceiptV1, ExactTeacherReferenceTrajectoryComparisonV1,
+    validate_exact_teacher_reference_comparison_artifact, ExactTeacherReferenceComparisonReceiptV1,
+    ExactTeacherReferenceTrajectoryComparisonV1,
     EXACT_TEACHER_GREEDY_TOKEN_COUNT as GREEDY_TOKEN_COUNT,
 };
 
@@ -75,53 +76,7 @@ struct AcceptanceGateHashView<'a> {
     dwq: bool,
 }
 
-pub(crate) fn evaluate_official_acceptance_comparison(
-    authority: &VerifiedQwen38AcceptanceThresholdsV1,
-    acceptance_plan: &VerifiedTeacherPredictionPlan,
-    comparison: ExactTeacherReferenceComparisonReceiptV1,
-) -> Result<OfficialQwen38AcceptanceGateReceiptV1> {
-    validate_canonical_exact_teacher_reference_comparison_receipt(&comparison)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    validate_acceptance_plan_shape(acceptance_plan, authority.thresholds)?;
-    ensure!(
-        acceptance_plan.manifest().evaluation_split == DatasetSplit::AcceptanceHoldout
-            && comparison.prediction_plan_sha256 == acceptance_plan.manifest().manifest_sha256,
-        "holdout comparison differs from its freshly authenticated plan"
-    );
-    let evaluation = comparison_passes_thresholds(&comparison, authority.thresholds)?;
-    let mut receipt = OfficialQwen38AcceptanceGateReceiptV1 {
-        schema_version: ACCEPTANCE_GATE_SCHEMA_VERSION,
-        profile: ACCEPTANCE_GATE_PROFILE.into(),
-        threshold_profile_sha256: authority.plan_authority.threshold_profile_sha256().into(),
-        calibration_comparison_receipt_sha256: authority
-            .plan_authority
-            .calibration_comparison_receipt_sha256()
-            .into(),
-        policy_validation_comparison_receipt_sha256: authority
-            .plan_authority
-            .policy_validation_comparison_receipt_sha256()
-            .into(),
-        acceptance_prediction_plan_sha256: acceptance_plan.manifest().manifest_sha256.clone(),
-        thresholds: authority.thresholds,
-        evaluation,
-        comparison,
-        thresholds_predeclared: true,
-        quality_gate_authority: true,
-        source_teacher_authority: false,
-        sensitivity_authority: false,
-        allocator_authority: false,
-        selector_authority: false,
-        autoquant_authority: false,
-        runtime_dependency: false,
-        dwq: false,
-        acceptance_gate_receipt_sha256: String::new(),
-    };
-    receipt.acceptance_gate_receipt_sha256 = acceptance_gate_sha256(&receipt)?;
-    validate_official_acceptance_gate_receipt(authority, &receipt)?;
-    Ok(receipt)
-}
-
-pub(crate) fn validate_official_acceptance_gate_receipt_artifact(
+fn validate_official_acceptance_gate_receipt_artifact(
     authority: &VerifiedQwen38AcceptanceThresholdsV1,
     bytes: &[u8],
 ) -> Result<OfficialQwen38AcceptanceGateReceiptV1> {
@@ -133,6 +88,41 @@ pub(crate) fn validate_official_acceptance_gate_receipt_artifact(
         serde_json::from_slice(bytes).context("parse acceptance quality receipt")?;
     validate_official_acceptance_gate_receipt(authority, &receipt)?;
     Ok(receipt)
+}
+
+pub(super) fn validate_closed_acceptance_receipts(
+    authority: &VerifiedQwen38AcceptanceThresholdsV1,
+    comparison_bytes: &[u8],
+    gate_bytes: &[u8],
+) -> Result<(
+    ExactTeacherReferenceComparisonReceiptV1,
+    OfficialQwen38AcceptanceGateReceiptV1,
+)> {
+    let comparison = validate_exact_teacher_reference_comparison_artifact(comparison_bytes)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let receipt = validate_official_acceptance_gate_receipt_artifact(authority, gate_bytes)?;
+    ensure!(
+        receipt.comparison == comparison,
+        "closed quality receipt does not contain the exact raw comparison"
+    );
+    Ok((comparison, receipt))
+}
+
+pub(super) fn validate_closed_acceptance_plan_binding(
+    acceptance_plan: &VerifiedTeacherPredictionPlan,
+    thresholds: Qwen38SourceReferenceThresholdsV1,
+    comparison: &ExactTeacherReferenceComparisonReceiptV1,
+    receipt: &OfficialQwen38AcceptanceGateReceiptV1,
+) -> Result<()> {
+    validate_acceptance_plan_shape(acceptance_plan, thresholds)?;
+    ensure!(
+        acceptance_plan.manifest().evaluation_split == DatasetSplit::AcceptanceHoldout
+            && comparison.prediction_plan_sha256 == acceptance_plan.manifest().manifest_sha256
+            && receipt.acceptance_prediction_plan_sha256
+                == acceptance_plan.manifest().manifest_sha256,
+        "closed holdout evidence differs from its freshly authenticated plan"
+    );
+    Ok(())
 }
 
 fn validate_official_acceptance_gate_receipt(

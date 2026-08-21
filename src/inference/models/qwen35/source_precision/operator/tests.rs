@@ -136,6 +136,52 @@ fn acceptance_threshold_bundle_is_exact_predeclared_and_substitution_closed() {
     );
     assert_eq!(thresholds.external_implementation.source_dtype, "bfloat16");
     assert_eq!(thresholds.external_implementation.logit_dtype, "f32_le");
+    let (acceptance_comparison, acceptance_gate) =
+        super::acceptance::closed_acceptance_evidence_for_test();
+    assert_eq!(
+        hex::encode(Sha256::digest(acceptance_comparison)),
+        "e2f3cbd3bd1cce9e3964053a52409e36bf590679dea993881a066654a6e3ff01"
+    );
+    assert_eq!(
+        hex::encode(Sha256::digest(acceptance_gate)),
+        "9a7836e5ca1ed848dd6cc2bd64c4c9bcc97a418db346e5f182d0639720f8df2d"
+    );
+    super::acceptance::verify_closed_acceptance_receipts_for_test(
+        &thresholds,
+        acceptance_comparison,
+        acceptance_gate,
+    )
+    .unwrap();
+
+    let mut substituted_acceptance = acceptance_comparison.to_vec();
+    let candidate_offset = substituted_acceptance
+        .windows(b"07b59ba8".len())
+        .position(|window| window == b"07b59ba8")
+        .unwrap();
+    substituted_acceptance[candidate_offset] = b'1';
+    assert!(
+        super::acceptance::verify_closed_acceptance_receipts_for_test(
+            &thresholds,
+            &substituted_acceptance,
+            acceptance_gate,
+        )
+        .is_err()
+    );
+
+    let mut substituted_gate = acceptance_gate.to_vec();
+    let gate_hash_offset = substituted_gate
+        .windows(b"f84f6b56".len())
+        .position(|window| window == b"f84f6b56")
+        .unwrap();
+    substituted_gate[gate_hash_offset] = b'0';
+    assert!(
+        super::acceptance::verify_closed_acceptance_receipts_for_test(
+            &thresholds,
+            acceptance_comparison,
+            &substituted_gate,
+        )
+        .is_err()
+    );
 
     let mut mutated_profile = threshold_bytes.to_vec();
     let threshold_offset = mutated_profile

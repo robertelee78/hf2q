@@ -29,8 +29,7 @@ use super::super::{
     QwenSourceMetalUploadLimits, StructurallyBoundQwen35SourceTeacherWorkV1,
     VerifiedQwen35Bf16TopologyV1,
 };
-use super::acceptance::{official_acceptance_thresholds, VerifiedQwen38AcceptanceThresholdsV1};
-use super::corpus::{build_official_acceptance_prediction_plan, build_official_prediction_plan};
+use super::corpus::build_official_prediction_plan;
 use super::profile::{official_profile, OfficialEvidenceProfileV1, PROFILE_SHA256};
 use super::source_manifest::{official_source_manifest, OfficialSourceManifestV1};
 use super::OfficialQwen38EvaluationSplitV1;
@@ -38,8 +37,7 @@ use super::OfficialQwen38EvaluationSplitV1;
 mod execute;
 
 pub(crate) use execute::{
-    preflight_official_qwen38_acceptance_teacher, preflight_official_qwen38_source_teacher,
-    run_official_qwen38_acceptance_teacher, run_official_qwen38_source_teacher,
+    preflight_official_qwen38_source_teacher, run_official_qwen38_source_teacher,
 };
 
 const OFFICIAL_TENSOR_COUNT: usize = 1_199;
@@ -55,13 +53,6 @@ pub(crate) struct OfficialQwen38SourceTeacherRequestV1 {
     pub(crate) model_dir: PathBuf,
     pub(crate) output: PathBuf,
     pub(crate) evaluation_split: OfficialQwen38EvaluationSplitV1,
-}
-
-/// Sealed one-time holdout request. It has no caller-selectable split.
-#[derive(Debug, Clone)]
-pub(crate) struct OfficialQwen38AcceptanceTeacherRequestV1 {
-    pub(crate) model_dir: PathBuf,
-    pub(crate) output: PathBuf,
 }
 
 /// Sanitized operational summary. Content/work hashes are stable; device,
@@ -150,29 +141,17 @@ struct OfficialWorkV1 {
     preparation_policy: Qwen35SourceTeacherPreparationPolicyV1,
 }
 
-enum OfficialPlanSelectionV1 {
-    Characterization(OfficialQwen38EvaluationSplitV1),
-    Acceptance(VerifiedQwen38AcceptanceThresholdsV1),
-}
-
 fn build_official_work(
     model_dir: &Path,
     output: &Path,
     profile: &OfficialEvidenceProfileV1,
-    selection: OfficialPlanSelectionV1,
+    evaluation: OfficialQwen38EvaluationSplitV1,
 ) -> Result<OfficialWorkV1> {
     let source_started = Instant::now();
     let source = authenticate_official_source(model_dir, profile)?;
     let source_authentication_ms = elapsed_ms(source_started.elapsed());
     let corpus_started = Instant::now();
-    let prediction = match selection {
-        OfficialPlanSelectionV1::Characterization(evaluation) => {
-            build_official_prediction_plan(&source, profile, evaluation)
-        }
-        OfficialPlanSelectionV1::Acceptance(thresholds) => {
-            build_official_acceptance_prediction_plan(&source, profile, thresholds)
-        }
-    }?;
+    let prediction = build_official_prediction_plan(&source, profile, evaluation)?;
     let corpus_and_prediction_plan_ms = elapsed_ms(corpus_started.elapsed());
     let source_inventory_sha256 = source.inventory.manifest().manifest_sha256.clone();
     let source_partition_sha256 = source.partition.manifest_sha256.clone();

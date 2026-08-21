@@ -1537,25 +1537,56 @@ match through at least zero-based divergence index 10 (or match all 32 tokens).
 All bounds are inclusive and no extra policy margin is introduced.
 
 The ordinary split enums and `source-teacher --evaluation-split` remain limited
-to Calibration and PolicyValidation. The splitless hidden
-`source-teacher-acceptance` command first authenticates the threshold artifact
-and both exact characterization receipts, then consumes an opaque capability to
-construct a one-example, one-GenerationNext, one-trajectory holdout plan before
-topology or Metal work. The separate
-`source-teacher-acceptance-reference` command publishes a fresh raw schema-v1
-comparison receipt before evaluating it and creates a distinct quality receipt
-only on pass. Raw receipts retain every authority flag as false; the quality
-receipt sets only `thresholds_predeclared=true` and
-`quality_gate_authority=true`. It never grants source-teacher, sensitivity,
-allocator, selector, autoquant, runtime-dependency, performance, or DWQ
-authority. Before opening the holdout, the verifier was further closed over
-the exact characterized external-implementation record (including producer,
-lock, Python/framework, dtype, device, eager attention, and cache identity),
-required the native teacher and comparator to carry the same hf2q commit, and
-rejected a claimed divergence index outside the fixed 32-token trajectory.
-Raw and quality receipt creation syncs both file contents and the containing
-directory entry. The holdout remained unopened when this declaration was
-written.
+to Calibration and PolicyValidation. Before holdout was opened, commit
+`85ca8520ef05cd924bc48b093361bef25afb63d1` added separate splitless,
+one-time execution and raw-first comparison routes. Commit
+`07b59ba806f273ae8bb9eebf079277a317831a51` closed those routes over the exact
+characterized external-implementation record (including producer, lock,
+Python/framework, dtype, device, eager attention, and cache identity), required
+the native teacher and comparator to carry that same hf2q commit, rejected a
+claimed divergence index outside the fixed 32-token trajectory, and made raw
+and quality publication sync both file contents and containing-directory
+entries. The exact release binary SHA-256 was
+`6925429d8d747a2f724acf3c5154b3b0f65165407b3264f5a4ca6abe8efe577f`.
+
+The sealed preflight produced prediction plan
+`d0db832d6239e0807f8f10edb7d687f0407e5035a8848e3cd6362287e5eb37d8`:
+one example, one GenerationNext row, one 32-token trajectory, 32 forward calls,
+73 input tokens, and maximum cache length 73. The one-time native execution
+then produced target byte SHA-256
+`994fe9a773e1469db0044816e3e61be3e5431a6138f3326608761b37ba91fa6a`,
+summary byte SHA-256
+`9174ce67594e96935999df1e734337a4aea61d9e192da4a6be6e3b1af1748362`,
+and completion receipt SHA-256
+`7ca1613dc3d8e85c0a82898b13fc9c2f3363a6f86eede46b6cdda0a6f011154c`.
+The pinned external run produced target byte SHA-256
+`3b1142396f254384ebf4d54cd7b57644f7d7fbf61c655732e2689a11ff4e372c`
+and evidence byte SHA-256
+`958a3033e80b594fad9623614ead1513babdb79d520d5e116e60b141a86e9d6f`.
+
+The holdout passed without changing a threshold. Its maximum absolute logit
+difference was `3.5221433639526367`, row KL was
+`0.010162977825261292`, top-1 agreement was 1/1, and its greedy trajectory
+first diverged at zero-based index 23. The checked-in raw comparison has byte
+SHA-256
+`e2f3cbd3bd1cce9e3964053a52409e36bf590679dea993881a066654a6e3ff01`
+and self-hash
+`3e2a455326f5b0b6e19ac514162cf52739b7c162400cb973797b9ef530c13150`.
+The checked-in passing quality receipt has byte SHA-256
+`9a7836e5ca1ed848dd6cc2bd64c4c9bcc97a418db346e5f182d0639720f8df2d`
+and self-hash
+`f84f6b56a8c4ffba5981e3b46442d65df1edaeef95ba22ac1cbeebf92c971380`.
+
+After those exact receipts were sealed, both one-time execution and comparison
+minting routes were removed. Hidden command
+`source-teacher-acceptance-verify --model-dir <exact-source>` now authenticates
+the source, reconstructs the sealed plan, byte-verifies the embedded raw and
+quality receipts, and proves their plan and nested-comparison identity without
+loading Metal weights or accepting caller-provided evidence. The raw receipt
+retains every authority flag as false. The quality receipt sets only
+`thresholds_predeclared=true` and `quality_gate_authority=true`; it grants no
+source-teacher, sensitivity, allocator, selector, autoquant,
+runtime-dependency, performance, or DWQ authority.
 
 ### Phase E — production `--quant auto`
 

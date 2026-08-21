@@ -5,6 +5,8 @@
 //! verifies those exact bytes, their self-hashes, and the deterministic
 //! headroom rule. A raw comparison remains non-authoritative.
 
+use std::path::Path;
+
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,10 +28,7 @@ mod gate;
 #[cfg(test)]
 pub(super) use gate::comparison_passes_thresholds_for_test;
 use gate::trajectory_matching_prefix;
-pub(super) use gate::{
-    evaluate_official_acceptance_comparison, validate_official_acceptance_gate_receipt_artifact,
-    OfficialQwen38AcceptanceGateReceiptV1,
-};
+pub(super) use gate::OfficialQwen38AcceptanceGateReceiptV1;
 
 const THRESHOLD_PROFILE_BYTES: &[u8] = include_bytes!(
     "../../../../../../data/calibration/qwen38-source-teacher-canary-v1/acceptance-thresholds.json"
@@ -42,6 +41,16 @@ const CALIBRATION_COMPARISON_BYTES: &[u8] = include_bytes!(
 const POLICY_VALIDATION_COMPARISON_BYTES: &[u8] = include_bytes!(
     "../../../../../../data/calibration/qwen38-source-teacher-canary-v1/policy-validation-reference-comparison.json"
 );
+const ACCEPTANCE_COMPARISON_BYTES: &[u8] = include_bytes!(
+    "../../../../../../data/calibration/qwen38-source-teacher-canary-v1/acceptance-reference-comparison.json"
+);
+const ACCEPTANCE_COMPARISON_ARTIFACT_SHA256: &str =
+    "e2f3cbd3bd1cce9e3964053a52409e36bf590679dea993881a066654a6e3ff01";
+const ACCEPTANCE_GATE_BYTES: &[u8] = include_bytes!(
+    "../../../../../../data/calibration/qwen38-source-teacher-canary-v1/acceptance-quality-gate.json"
+);
+const ACCEPTANCE_GATE_ARTIFACT_SHA256: &str =
+    "9a7836e5ca1ed848dd6cc2bd64c4c9bcc97a418db346e5f182d0639720f8df2d";
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Qwen38SourceReferenceThresholdsV1 {
@@ -123,6 +132,45 @@ pub(super) fn official_acceptance_thresholds(
         THRESHOLD_PROFILE_ARTIFACT_SHA256,
         evidence_profile,
     )
+}
+
+pub(crate) fn verify_official_qwen38_acceptance_evidence(
+    model_dir: &Path,
+) -> Result<OfficialQwen38AcceptanceGateReceiptV1> {
+    let profile = super::profile::official_profile()?;
+    let authority = official_acceptance_thresholds(&profile)?;
+    let thresholds = authority.thresholds;
+    let (comparison, receipt) = verify_closed_acceptance_receipts(
+        &authority,
+        ACCEPTANCE_COMPARISON_BYTES,
+        ACCEPTANCE_GATE_BYTES,
+    )?;
+    let source = super::source::authenticate_official_source(model_dir, &profile)?;
+    let prediction =
+        super::corpus::build_official_acceptance_prediction_plan(&source, &profile, authority)?;
+    gate::validate_closed_acceptance_plan_binding(
+        &prediction.plan,
+        thresholds,
+        &comparison,
+        &receipt,
+    )?;
+    Ok(receipt)
+}
+
+fn verify_closed_acceptance_receipts(
+    authority: &VerifiedQwen38AcceptanceThresholdsV1,
+    comparison_bytes: &[u8],
+    gate_bytes: &[u8],
+) -> Result<(
+    ExactTeacherReferenceComparisonReceiptV1,
+    OfficialQwen38AcceptanceGateReceiptV1,
+)> {
+    ensure!(
+        sha256(comparison_bytes) == ACCEPTANCE_COMPARISON_ARTIFACT_SHA256
+            && sha256(gate_bytes) == ACCEPTANCE_GATE_ARTIFACT_SHA256,
+        "embedded closed AcceptanceHoldout receipt bytes changed"
+    );
+    gate::validate_closed_acceptance_receipts(authority, comparison_bytes, gate_bytes)
 }
 
 fn verify_threshold_bundle(
@@ -287,4 +335,18 @@ pub(super) fn verify_threshold_bundle_for_test(
         THRESHOLD_PROFILE_ARTIFACT_SHA256,
         evidence_profile,
     )
+}
+
+#[cfg(test)]
+pub(super) fn closed_acceptance_evidence_for_test() -> (&'static [u8], &'static [u8]) {
+    (ACCEPTANCE_COMPARISON_BYTES, ACCEPTANCE_GATE_BYTES)
+}
+
+#[cfg(test)]
+pub(super) fn verify_closed_acceptance_receipts_for_test(
+    authority: &VerifiedQwen38AcceptanceThresholdsV1,
+    comparison_bytes: &[u8],
+    gate_bytes: &[u8],
+) -> Result<()> {
+    verify_closed_acceptance_receipts(authority, comparison_bytes, gate_bytes).map(|_| ())
 }

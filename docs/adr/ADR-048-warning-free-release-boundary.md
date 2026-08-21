@@ -122,6 +122,17 @@ and replay remain test-only or unavailable. No Cargo feature or warning
 allowance is used. This is the smallest promotion consistent with both the
 new product root and warning-free release builds.
 
+ADR-046 subsequently completed its predeclared Qwen3.8 AcceptanceHoldout gate.
+The temporary splitless execution and comparison-minting roots were removed
+immediately after the exact raw and passing quality receipts were checked in.
+The retained hidden `source-teacher-acceptance-verify` root accepts only the
+exact source directory, reconstructs the sealed plan, and verifies embedded
+receipt bytes without loading Metal weights or minting evidence. This is not a
+return to the pre-ADR-048 compile-everything boundary: only code reachable from
+the ordinary characterization operator or closed verifier remains in release;
+copied policy/trace machinery, Dynamic frontier search, selector/autoquant,
+writers, and replay keep their test-only or unavailable boundary.
+
 Three integration harnesses path-include deliberately wider source/stub modules
 because the required internals are not library exports. Their test-module
 boundaries use narrow `expect(dead_code)` declarations with reasons. Unlike an

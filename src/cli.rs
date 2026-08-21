@@ -112,13 +112,9 @@ pub enum Command {
     #[command(name = "source-teacher-reference", hide = true)]
     SourceTeacherReference(SourceTeacherReferenceArgs),
 
-    /// Sealed one-time AcceptanceHoldout source-teacher route.
-    #[command(name = "source-teacher-acceptance", hide = true)]
-    SourceTeacherAcceptance(SourceTeacherAcceptanceArgs),
-
-    /// Sealed one-time AcceptanceHoldout reference and quality gate.
-    #[command(name = "source-teacher-acceptance-reference", hide = true)]
-    SourceTeacherAcceptanceReference(SourceTeacherAcceptanceReferenceArgs),
+    /// Verify the closed AcceptanceHoldout evidence against the exact source.
+    #[command(name = "source-teacher-acceptance-verify", hide = true)]
+    SourceTeacherAcceptanceVerify(SourceTeacherAcceptanceVerifyArgs),
 
     /// Diagnose RuVector, hardware detection, and disk space
     Doctor,
@@ -302,18 +298,10 @@ pub enum SourceTeacherEvaluationSplitArg {
 }
 
 #[derive(clap::Args, Debug, Clone)]
-pub struct SourceTeacherAcceptanceArgs {
+pub struct SourceTeacherAcceptanceVerifyArgs {
     /// Exact local Qwen3.8-27B snapshot selected by the source manifest.
     #[arg(long, value_name = "DIRECTORY")]
     pub model_dir: PathBuf,
-
-    /// Fresh AcceptanceHoldout target destination.
-    #[arg(long, value_name = "FILE")]
-    pub output: PathBuf,
-
-    /// Perform the Metal upload and one-shot holdout teacher run.
-    #[arg(long, default_value_t = false)]
-    pub execute: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -337,26 +325,6 @@ pub struct SourceTeacherReferenceArgs {
     /// Full-vocabulary target artifact emitted by the external reference.
     #[arg(long, value_name = "FILE")]
     pub external_target: PathBuf,
-}
-
-#[derive(clap::Args, Debug, Clone)]
-pub struct SourceTeacherAcceptanceReferenceArgs {
-    #[arg(long, value_name = "DIRECTORY")]
-    pub model_dir: PathBuf,
-    #[arg(long, value_name = "FILE")]
-    pub native_summary: PathBuf,
-    #[arg(long, value_name = "FILE")]
-    pub native_target: PathBuf,
-    #[arg(long, value_name = "FILE")]
-    pub external_evidence: PathBuf,
-    #[arg(long, value_name = "FILE")]
-    pub external_target: PathBuf,
-    /// Fresh raw non-authoritative comparison receipt destination.
-    #[arg(long, value_name = "FILE")]
-    pub raw_comparison_output: PathBuf,
-    /// Fresh quality-gate receipt destination, created only on pass.
-    #[arg(long, value_name = "FILE")]
-    pub quality_gate_output: PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1489,56 +1457,40 @@ mod tests {
     }
 
     #[test]
-    fn source_teacher_acceptance_is_a_sealed_splitless_route() {
+    fn source_teacher_acceptance_is_a_closed_source_bound_verifier() {
         let cli = Cli::parse_from([
             "hf2q",
-            "source-teacher-acceptance",
+            "source-teacher-acceptance-verify",
+            "--model-dir",
+            "/tmp/qwen38-source",
+        ]);
+        let Command::SourceTeacherAcceptanceVerify(args) = cli.command else {
+            panic!("expected SourceTeacherAcceptanceVerify");
+        };
+        assert_eq!(args.model_dir, PathBuf::from("/tmp/qwen38-source"));
+        assert!(Cli::try_parse_from([
+            "hf2q",
+            "source-teacher-acceptance-verify",
             "--model-dir",
             "/tmp/qwen38-source",
             "--output",
             "/tmp/holdout.bin",
-            "--execute",
-        ]);
-        let Command::SourceTeacherAcceptance(args) = cli.command else {
-            panic!("expected SourceTeacherAcceptance");
-        };
-        assert_eq!(args.output, PathBuf::from("/tmp/holdout.bin"));
-        assert!(args.execute);
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "hf2q",
+            "source-teacher-acceptance-reference",
+            "--model-dir",
+            "/tmp/qwen38-source",
+        ])
+        .is_err());
         assert!(Cli::try_parse_from([
             "hf2q",
             "source-teacher-acceptance",
             "--model-dir",
             "/tmp/qwen38-source",
-            "--output",
-            "/tmp/holdout.bin",
-            "--evaluation-split",
-            "calibration",
         ])
         .is_err());
-
-        let cli = Cli::parse_from([
-            "hf2q",
-            "source-teacher-acceptance-reference",
-            "--model-dir",
-            "/tmp/qwen38-source",
-            "--native-summary",
-            "/tmp/native.json",
-            "--native-target",
-            "/tmp/native.bin",
-            "--external-evidence",
-            "/tmp/external.json",
-            "--external-target",
-            "/tmp/external.bin",
-            "--raw-comparison-output",
-            "/tmp/raw.json",
-            "--quality-gate-output",
-            "/tmp/gate.json",
-        ]);
-        let Command::SourceTeacherAcceptanceReference(args) = cli.command else {
-            panic!("expected SourceTeacherAcceptanceReference");
-        };
-        assert_eq!(args.raw_comparison_output, PathBuf::from("/tmp/raw.json"));
-        assert_eq!(args.quality_gate_output, PathBuf::from("/tmp/gate.json"));
     }
 
     #[test]

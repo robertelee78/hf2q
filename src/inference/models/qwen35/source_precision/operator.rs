@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::intelligence::calibration::DatasetSplit;
 
 /// Characterization splits. AcceptanceHoldout is intentionally absent and is
-/// reachable only through the sealed one-time acceptance entrypoint.
+/// reconstructible only through the closed, non-executing evidence verifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OfficialQwen38EvaluationSplitV1 {
@@ -35,14 +35,14 @@ impl OfficialQwen38EvaluationSplitV1 {
 }
 
 pub(crate) use reference::{
-    compare_official_qwen38_acceptance_reference, compare_official_qwen38_source_reference,
-    OfficialQwen38AcceptanceReferenceRequestV1, OfficialQwen38SourceReferenceRequestV1,
+    compare_official_qwen38_source_reference, OfficialQwen38SourceReferenceRequestV1,
 };
 
+pub(crate) use acceptance::verify_official_qwen38_acceptance_evidence;
+
 pub(crate) use source::{
-    preflight_official_qwen38_acceptance_teacher, preflight_official_qwen38_source_teacher,
-    run_official_qwen38_acceptance_teacher, run_official_qwen38_source_teacher,
-    OfficialQwen38AcceptanceTeacherRequestV1, OfficialQwen38SourceTeacherRequestV1,
+    preflight_official_qwen38_source_teacher, run_official_qwen38_source_teacher,
+    OfficialQwen38SourceTeacherRequestV1,
 };
 
 #[cfg(test)]

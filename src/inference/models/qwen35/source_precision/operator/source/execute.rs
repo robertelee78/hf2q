@@ -1,4 +1,4 @@
-//! Characterization and sealed AcceptanceHoldout execution entrypoints.
+//! Characterization execution entrypoints.
 
 use super::*;
 
@@ -11,22 +11,7 @@ pub(crate) fn preflight_official_qwen38_source_teacher(
         &request.model_dir,
         &request.output,
         &profile,
-        OfficialPlanSelectionV1::Characterization(request.evaluation_split),
-    )?;
-    preflight_built_work(total_started, built, &request.output)
-}
-
-pub(crate) fn preflight_official_qwen38_acceptance_teacher(
-    request: &OfficialQwen38AcceptanceTeacherRequestV1,
-) -> Result<OfficialQwen38SourceTeacherSummaryV1> {
-    let total_started = Instant::now();
-    let profile = official_profile()?;
-    let thresholds = official_acceptance_thresholds(&profile)?;
-    let built = build_official_work(
-        &request.model_dir,
-        &request.output,
-        &profile,
-        OfficialPlanSelectionV1::Acceptance(thresholds),
+        request.evaluation_split,
     )?;
     preflight_built_work(total_started, built, &request.output)
 }
@@ -60,22 +45,7 @@ pub(crate) fn run_official_qwen38_source_teacher(
         &request.model_dir,
         &request.output,
         &profile,
-        OfficialPlanSelectionV1::Characterization(request.evaluation_split),
-    )?;
-    run_built_work(total_started, built, &request.output)
-}
-
-pub(crate) fn run_official_qwen38_acceptance_teacher(
-    request: OfficialQwen38AcceptanceTeacherRequestV1,
-) -> Result<OfficialQwen38SourceTeacherSummaryV1> {
-    let total_started = Instant::now();
-    let profile = official_profile()?;
-    let thresholds = official_acceptance_thresholds(&profile)?;
-    let built = build_official_work(
-        &request.model_dir,
-        &request.output,
-        &profile,
-        OfficialPlanSelectionV1::Acceptance(thresholds),
+        request.evaluation_split,
     )?;
     run_built_work(total_started, built, &request.output)
 }
