@@ -40,6 +40,7 @@ fn full_logit_rows_are_framed_reread_and_summarized_deterministically() {
 
     assert_eq!(artifact.receipt().rows.len(), 3);
     assert_eq!(artifact.receipt().rows[0].argmax_token_id, 0);
+    assert_eq!(canonical_teacher_argmax(&[-0.0, 0.0, -1.0]).unwrap(), 0);
     assert_eq!(
         artifact.receipt().rows[0]
             .top_k

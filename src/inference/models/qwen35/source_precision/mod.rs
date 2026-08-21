@@ -2,10 +2,11 @@
 //!
 //! Production deliberately stops at a retained, structurally verified source
 //! snapshot, opaque host-populated shared-Metal upload, and an exact
-//! family-owned prepared text graph. A `cfg(test)`-only parity harness executes
-//! that graph without exposing a production forward transition. Neither path
-//! mints completion, exact-teacher, sensitivity, performance, or allocator
-//! authority.
+//! family-owned prepared text graph. The only authority-bearing execution path
+//! is a consuming, one-shot source-teacher transaction; no raw model, cache, or
+//! forward session escapes it. It mints exact-teacher completion only after
+//! terminal Metal completion and publish-last target sealing, never
+//! sensitivity, performance, allocator, selector, or autoquant authority.
 
 mod header;
 mod retained_io;
@@ -29,12 +30,14 @@ pub(crate) use teacher_execution_plan::{
 #[allow(unused_imports)] // opaque B2a seam consumed by the subsequent Metal-upload slice
 pub(crate) use topology::{admit_qwen35_bf16_topology, VerifiedQwen35Bf16TopologyV1};
 pub(crate) use types::QwenSourceSnapshotLimits;
+pub(in crate::inference::models::qwen35) use upload::SourceTeacherCacheAuthorization;
 #[allow(unused_imports)] // opaque B3 preparation seams consumed by the completed runner
 pub(crate) use upload::{
     prepare_qwen35_source_teacher, prepare_qwen35_source_teacher_run_inputs,
-    prepare_uploaded_qwen35_source_teacher, PreparedQwen35SourceTeacherRunInputsV1,
-    PreparedQwen35SourceTeacherV1, Qwen35SourceTeacherLimitsV1,
-    Qwen35SourceTeacherPreparationPolicyV1,
+    prepare_uploaded_qwen35_source_teacher, run_qwen35_source_teacher,
+    PreparedQwen35SourceTeacherRunInputsV1, PreparedQwen35SourceTeacherV1,
+    Qwen35SourceTeacherLimitsV1, Qwen35SourceTeacherPreparationPolicyV1,
+    VerifiedQwen35SourceTeacherTargetV1,
 };
 #[allow(unused_imports)] // opaque B2b seam consumed by the subsequent teacher runner
 pub(crate) use upload::{upload_qwen35_bf16_topology_to_metal, VerifiedQwen35Bf16MetalUploadV1};

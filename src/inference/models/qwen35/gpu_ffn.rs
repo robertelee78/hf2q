@@ -75,10 +75,9 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 use crate::serve::forward_mlx_shared::MlxAffineMoeStack;
 
 use super::execution_dispatch::{
-    dense_gate_up_fusion_enabled, dense_q_arena_reset_enabled,
-    dispatch_fused_gate_up_silu_iq4_nl, dispatch_fused_gate_up_silu_q4_k,
-    dispatch_fused_gate_up_silu_q5_k, dispatch_fused_gate_up_silu_q6_k,
-    dispatch_fused_gate_up_silu_q8_0, quantized_matmul_ggml,
+    dense_gate_up_fusion_enabled, dense_q_arena_reset_enabled, dispatch_fused_gate_up_silu_iq4_nl,
+    dispatch_fused_gate_up_silu_q4_k, dispatch_fused_gate_up_silu_q5_k,
+    dispatch_fused_gate_up_silu_q6_k, dispatch_fused_gate_up_silu_q8_0, quantized_matmul_ggml,
 };
 
 /// ADR-020 AC#5 Iter C2.4 #4 — single-call dispatch wrapper that routes
@@ -983,7 +982,10 @@ pub fn build_dense_ffn_layer_gpu(
     // Prefill (seq>1): commit_and_wait() for correctness (fused_residual_norm
     // is a separate code path in forward_gpu that relies on ffn_out being ready,
     // and dump_hidden_stats may do a CPU read of hidden).
-    if seq_len == 1 {
+    if super::execution_dispatch::source_teacher_scope_active() {
+        enc.commit_and_wait_labeled("source_teacher.layer.dense_ffn")
+            .context("complete source-teacher dense FFN")?;
+    } else if seq_len == 1 {
         enc.commit();
     } else {
         enc.commit_and_wait().context("commit dense swiglu")?;
@@ -1289,9 +1291,8 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         weights.ggml_type_gate_up,
         mlx_native::ops::quantized_matmul_ggml::GgmlType::Q6_K
     );
-    let fused_eligible =
-        (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q5_k || fused_q6_k)
-            && dense_gate_up_fusion_enabled();
+    let fused_eligible = (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q5_k || fused_q6_k)
+        && dense_gate_up_fusion_enabled();
     if fused_eligible {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,

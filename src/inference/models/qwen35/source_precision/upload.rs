@@ -17,11 +17,13 @@ use super::upload_transform::{upload_source, UploadedTensorBuffer};
 
 mod teacher_model;
 
+pub(in crate::inference::models::qwen35) use teacher_model::SourceTeacherCacheAuthorization;
 pub(crate) use teacher_model::{
     prepare_qwen35_source_teacher, prepare_qwen35_source_teacher_run_inputs,
-    prepare_uploaded_qwen35_source_teacher, PreparedQwen35SourceTeacherRunInputsV1,
-    PreparedQwen35SourceTeacherV1, Qwen35SourceTeacherLimitsV1,
-    Qwen35SourceTeacherPreparationPolicyV1,
+    prepare_uploaded_qwen35_source_teacher, run_qwen35_source_teacher,
+    PreparedQwen35SourceTeacherRunInputsV1, PreparedQwen35SourceTeacherV1,
+    Qwen35SourceTeacherLimitsV1, Qwen35SourceTeacherPreparationPolicyV1,
+    VerifiedQwen35SourceTeacherTargetV1,
 };
 
 const UPLOAD_SCHEMA_VERSION: u32 = 1;

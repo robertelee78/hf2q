@@ -8,8 +8,16 @@
 use anyhow::Result;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::marker::PhantomData;
+use std::rc::Rc;
 
 const SOURCE_TEACHER_GRAPH_PROFILE: &str = "dense_qwen35_source_bf16_graph_scope_v1";
+
+/// Lifetime-bound, non-Clone and non-Send proof that the canonical source
+/// graph scope is active on the current thread.
+pub(in crate::inference::models::qwen35) struct SourceTeacherGraphScope {
+    pub(super) _not_send: PhantomData<Rc<()>>,
+}
 
 #[derive(Serialize)]
 struct SourceTeacherGraphPolicyV1 {
@@ -61,7 +69,7 @@ pub(in crate::inference::models::qwen35) fn source_teacher_graph_policy_sha256()
 }
 
 pub(in crate::inference::models::qwen35) fn with_source_teacher_graph_scope<T>(
-    operation: impl FnOnce() -> Result<T>,
+    operation: impl FnOnce(&SourceTeacherGraphScope) -> Result<T>,
 ) -> Result<T> {
     super::with_source_teacher_graph_scope_inner(operation)
 }
@@ -88,7 +96,7 @@ mod tests {
             Qwen35GateUpPolicy::Separate,
         )
         .unwrap();
-        let error: Result<()> = with_source_teacher_graph_scope(|| {
+        let error: Result<()> = with_source_teacher_graph_scope(|_| {
             assert!(!super::super::dense_gate_up_fusion_enabled());
             assert!(!super::super::fused_qkvg_enabled());
             assert!(super::super::dense_q_arena_reset_enabled());
@@ -96,7 +104,7 @@ mod tests {
             assert!(!super::super::chunk_scan_prefill_enabled(true));
             assert!(super::super::vec_small_path_enabled());
             assert!(super::super::fused_stage_ab_vec_enabled());
-            assert!(with_source_teacher_graph_scope(|| Ok(())).is_err());
+            assert!(with_source_teacher_graph_scope(|_| Ok(())).is_err());
             assert!(super::super::with_execution_configuration(&copied, || Ok(())).is_err());
             for operation in [
                 "GGML projection dispatch",
@@ -112,9 +120,9 @@ mod tests {
         });
         assert!(error.is_err());
         assert!(super::super::require_quantized_dispatch_for_test("GGML projection").is_ok());
-        with_source_teacher_graph_scope(|| Ok(())).unwrap();
+        with_source_teacher_graph_scope(|_| Ok(())).unwrap();
         super::super::with_execution_configuration(&copied, || {
-            assert!(with_source_teacher_graph_scope(|| Ok(())).is_err());
+            assert!(with_source_teacher_graph_scope(|_| Ok(())).is_err());
             Ok(())
         })
         .unwrap();
@@ -123,12 +131,12 @@ mod tests {
     #[test]
     fn source_teacher_scope_clears_after_panic_unwind() {
         let panic = std::panic::catch_unwind(|| {
-            with_source_teacher_graph_scope(|| -> Result<()> {
+            with_source_teacher_graph_scope(|_| -> Result<()> {
                 panic!("synthetic source-scope panic")
             })
             .unwrap();
         });
         assert!(panic.is_err());
-        with_source_teacher_graph_scope(|| Ok(())).unwrap();
+        with_source_teacher_graph_scope(|_| Ok(())).unwrap();
     }
 }

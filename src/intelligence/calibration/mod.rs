@@ -19,7 +19,7 @@ pub use prediction_plan::validate_teacher_prediction_plan;
 #[cfg(test)]
 pub(crate) use prediction_plan::{
     prediction_plan_for_test, prediction_plan_for_test_bound,
-    prediction_plan_for_test_bound_with_first_prefix,
+    prediction_plan_for_test_bound_with_first_prefix, prediction_plan_for_test_bound_with_gap,
 };
 pub(crate) use render::render_and_tokenize_verified_split;
 pub use render::{render_and_tokenize_split, verify_rendered_dataset_from_source};

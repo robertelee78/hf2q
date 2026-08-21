@@ -29,7 +29,7 @@ mod source_scope;
 
 #[allow(unused_imports)] // exercised by the cfg(test)-only source parity harness
 pub(super) use source_scope::{
-    source_teacher_graph_policy_sha256, with_source_teacher_graph_scope,
+    source_teacher_graph_policy_sha256, with_source_teacher_graph_scope, SourceTeacherGraphScope,
 };
 
 thread_local! {
@@ -93,7 +93,9 @@ pub(super) fn with_execution_configuration<T>(
     operation()
 }
 
-fn with_source_teacher_graph_scope_inner<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+fn with_source_teacher_graph_scope_inner<T>(
+    operation: impl FnOnce(&SourceTeacherGraphScope) -> Result<T>,
+) -> Result<T> {
     ACTIVE_CONFIGURATION.with(|slot| -> Result<()> {
         if slot.borrow().is_some() {
             bail!("nested Qwen execution scope is not admitted");
@@ -102,7 +104,21 @@ fn with_source_teacher_graph_scope_inner<T>(operation: impl FnOnce() -> Result<T
         Ok(())
     })?;
     let _guard = ActiveExecutionGuard;
-    operation()
+    operation(&SourceTeacherGraphScope {
+        _not_send: std::marker::PhantomData,
+    })
+}
+
+/// True only while the current thread owns the canonical source-teacher
+/// scope. Source-only helpers use this to replace asynchronous commits with
+/// checked waits; ordinary serving retains its existing scheduling.
+pub(in crate::inference::models::qwen35) fn source_teacher_scope_active() -> bool {
+    ACTIVE_CONFIGURATION.with(|slot| {
+        matches!(
+            slot.borrow().as_ref(),
+            Some(ActiveExecutionState::SourceTeacher)
+        )
+    })
 }
 
 pub(super) fn with_execution_trace_capture<T>(

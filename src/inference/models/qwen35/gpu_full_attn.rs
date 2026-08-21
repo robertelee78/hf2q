@@ -5251,7 +5251,12 @@ pub fn apply_sdpa_with_kv_cache(
         // slot.current_len update below is a CPU-only counter — safe to update
         // before GPU completes; the next read of current_len is on the next token
         // by which time the queue is drained.
-        enc.commit_labeled("layer.full_attn.sdpa_kv");
+        if super::execution_dispatch::source_teacher_scope_active() {
+            enc.commit_and_wait_labeled("source_teacher.layer.full_attn.sdpa_kv")
+                .context("complete source-teacher full-attention decode")?;
+        } else {
+            enc.commit_labeled("layer.full_attn.sdpa_kv");
+        }
     } else {
         // Prefill path (seq > 1) or non-standard head_dim:
         // CPU K/V permute is required for the head-major cache layout.
@@ -5310,7 +5315,12 @@ pub fn apply_sdpa_with_kv_cache(
             // commit's completion is not on the critical path of the FA bridge
             // — the legacy SDPA fallback will commit_and_wait at line 1497
             // and pick up the slot.k/slot.v writes via Metal queue ordering.
-            enc.commit_labeled("layer.full_attn.kv_cache_write");
+            if super::execution_dispatch::source_teacher_scope_active() {
+                enc.commit_and_wait_labeled("source_teacher.layer.full_attn.kv_cache_write")
+                    .context("complete source-teacher KV prefill write")?;
+            } else {
+                enc.commit_labeled("layer.full_attn.kv_cache_write");
+            }
         }
 
         // ── Production path: flash_attn_prefill_bf16_d256 ──
@@ -6850,7 +6860,10 @@ pub fn build_gated_attn_layer(
             // on the same Metal serial queue and orders after ops1-4 by GPU
             // queue ordering. iter58b residency-rescission is prevented by the
             // FaPrefillArena lifetime (scratches don't drop until end of prefill).
-            if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
+            if super::execution_dispatch::source_teacher_scope_active() {
+                enc.commit_and_wait_labeled("source_teacher.layer.full_attn.ops1-4")
+                    .context("complete source-teacher full-attention ops1-4")?;
+            } else if (seq_len == 1 && head_dim % 32 == 0) || use_arena {
                 enc.commit_labeled("layer.full_attn.ops1-4");
             } else {
                 enc.commit_and_wait_labeled("layer.full_attn.ops1-4")
@@ -7134,7 +7147,10 @@ pub fn build_gated_attn_layer(
         //   than the queue's FIFO drain. This is THE primary
         //   STAGE_FENCE site on the Qwen3.6 35B-A3B FA-dominated path
         //   (≈16 FA layers per chunk-engaged pp4096 prefill).
-        if fused_into_stage_a {
+        if super::execution_dispatch::source_teacher_scope_active() {
+            enc.commit_and_wait_labeled("source_teacher.layer.full_attn.ops6-7")
+                .context("complete source-teacher full-attention ops6-7")?;
+        } else if fused_into_stage_a {
             enc.fence_or_commit("layer.full_attn.stage_a")
                 .context("fence/commit FA stage_a")?;
         } else if seq_len == 1 || use_arena {
@@ -7612,7 +7628,7 @@ mod tests {
         // inflate the counts it asserts.
         let test_attr = format!("#[{}]", "test");
         let lock_call = format!("{}();", "hf2q_gpu_test_lock");
-        let modules: [(&str, &str); 43] = [
+        let modules: [(&str, &str); 44] = [
             (
                 "inference/models/bert/bert_gpu.rs",
                 include_str!("../bert/bert_gpu.rs"),
@@ -7713,6 +7729,12 @@ mod tests {
             (
                 "inference/models/qwen35/source_precision/upload/teacher_model/runner/tests.rs",
                 include_str!("source_precision/upload/teacher_model/runner/tests.rs"),
+            ),
+            (
+                "inference/models/qwen35/source_precision/upload/teacher_model/run_inputs/worker/tests.rs",
+                include_str!(
+                    "source_precision/upload/teacher_model/run_inputs/worker/tests.rs"
+                ),
             ),
             (
                 "inference/models/qwen3vl_text/forward.rs",

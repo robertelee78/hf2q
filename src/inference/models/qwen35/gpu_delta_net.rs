@@ -2781,7 +2781,12 @@ pub fn build_delta_net_layer(
         // commit() without wait: output is fed into fused_residual_norm
         // on the same Metal serial queue; GPU ordering is guaranteed.
         // state_out/conv_state_out hold the updated states; caller swaps ping-pong.
-        enc.commit_labeled("layer.delta_net.ops1-9");
+        if super::execution_dispatch::source_teacher_scope_active() {
+            enc.commit_and_wait_labeled("source_teacher.layer.delta_net.ops1-9")
+                .context("complete source-teacher Delta decode")?;
+        } else {
+            enc.commit_labeled("layer.delta_net.ops1-9");
+        }
         output
     } else {
         // ---- PREFILL PATH (seq>1): two encoders — CPU de-interleave between ----
@@ -2861,7 +2866,12 @@ pub fn build_delta_net_layer(
             // P21 Stage 3 hypothesis test: pooled scratches (qkv_raw/qkv_conv from
             // pooled_alloc_buffer), no CPU read between this and ops5-9. Downgrade
             // commit_and_wait → commit_labeled. If iter58b reproduces, revert.
-            enc.commit_labeled("layer.gdn.ops1-3");
+            if super::execution_dispatch::source_teacher_scope_active() {
+                enc.commit_and_wait_labeled("source_teacher.layer.gdn.ops1-3")
+                    .context("complete source-teacher Delta prefill ops1-3")?;
+            } else {
+                enc.commit_labeled("layer.gdn.ops1-3");
+            }
             (x_norm, qkv_conv, z)
         };
         // conv_state_out now holds the updated conv state (caller swaps ping-pong).
@@ -2933,7 +2943,12 @@ pub fn build_delta_net_layer(
             )
             .map_err(|e| anyhow!("dispatch_qkv_split_f32 (W-5b.18): {e}"))?;
             // P21 Stage 3 hypothesis test: pooled q/k/v scratches, no CPU read.
-            enc.commit_labeled("layer.gdn.qkv_split");
+            if super::execution_dispatch::source_teacher_scope_active() {
+                enc.commit_and_wait_labeled("source_teacher.layer.gdn.qkv_split")
+                    .context("complete source-teacher Delta QKV split")?;
+            } else {
+                enc.commit_labeled("layer.gdn.qkv_split");
+            }
             (q_gpu, k_gpu, v_gpu)
         };
 
@@ -3341,7 +3356,12 @@ pub fn build_delta_net_layer(
             )?;
             // P21 Stage 3 hypothesis test: pooled scratches throughout ops5-9, no CPU read.
             // Output is fed into next encoder (FFN) on same Metal serial queue.
-            enc.commit_labeled("layer.gdn.ops5-9");
+            if super::execution_dispatch::source_teacher_scope_active() {
+                enc.commit_and_wait_labeled("source_teacher.layer.gdn.ops5-9")
+                    .context("complete source-teacher Delta prefill ops5-9")?;
+            } else {
+                enc.commit_labeled("layer.gdn.ops5-9");
+            }
             output
         };
         // state_out/conv_state_out now hold updated states (caller swaps ping-pong).
