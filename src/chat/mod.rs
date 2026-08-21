@@ -86,18 +86,10 @@ pub(crate) fn cmd_chat_with_resolver(
 
 fn with_failure_diagnostics(error: anyhow::Error, session: &mut EndpointSession) -> anyhow::Error {
     match session.retain_failure_diagnostics() {
-        Ok(Some(diagnostics)) => {
-            let truncation = if diagnostics.truncated {
-                "last 32 KiB"
-            } else {
-                "complete log"
-            };
-            anyhow::anyhow!(
-                "{error:#}\nchat-owned server log retained at {} ({truncation}):\n{}",
-                diagnostics.path.display(),
-                diagnostics.tail.trim_end()
-            )
-        }
+        Ok(Some(diagnostics)) => anyhow::anyhow!(
+            "{error:#}\nchat-owned server diagnostic log retained at {} (contents are not printed automatically because the private log may contain sensitive local context)",
+            diagnostics.path.display()
+        ),
         Ok(None) => error,
         Err(retain_error) => anyhow::anyhow!(
             "{error:#}; additionally failed to retain chat-owned server diagnostics: {retain_error:#}"
@@ -441,6 +433,148 @@ mod tests {
         );
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("resident [loaded]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_failure_reports_private_log_path_without_echoing_log_contents() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut log = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        log.write_all(b"path=/private/operator/model.gguf token=hf_secret\n")
+            .unwrap();
+        log.flush().unwrap();
+
+        let (parent_lifeline, _child_lifeline) = std::os::unix::net::UnixStream::pair().unwrap();
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log)
+            .expect("verified isolated child");
+        let mut session = EndpointSession::spawned_loopback(9, process);
+
+        let error = with_failure_diagnostics(anyhow::anyhow!("safe public error"), &mut session);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("safe public error"));
+        assert!(rendered.contains("diagnostic log retained at"));
+        assert!(!rendered.contains("/private/operator/model.gguf"));
+        assert!(!rendered.contains("hf_secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_activation_failure_shuts_down_and_retains_only_private_log_path() {
+        use axum::http::StatusCode;
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+
+        #[derive(Clone)]
+        struct ShutdownFixture {
+            child_pid: libc::pid_t,
+        }
+
+        async fn activation_failure() -> (StatusCode, &'static str) {
+            (StatusCode::INTERNAL_SERVER_ERROR, "safe activation detail")
+        }
+
+        async fn shutdown_owned(State(fixture): State<ShutdownFixture>) -> StatusCode {
+            let result = unsafe { libc::kill(fixture.child_pid, libc::SIGTERM) };
+            if result == 0 {
+                StatusCode::OK
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+
+        struct FixedResolver(Option<EndpointSession>);
+
+        impl EndpointResolver for FixedResolver {
+            fn resolve(&mut self, _args: &ChatArgs) -> Result<EndpointSession> {
+                self.0.take().context("fixed endpoint already resolved")
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut log = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        log.write_all(b"path=/private/operator/model.gguf token=hf_secret\n")
+            .unwrap();
+        log.flush().unwrap();
+        let log_path = log.path().to_owned();
+
+        let (parent_lifeline, _child_lifeline) = std::os::unix::net::UnixStream::pair().unwrap();
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id() as libc::pid_t;
+        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log)
+            .expect("verified isolated child");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/hf2q/v1/runtime", get(runtime_fixture))
+            .route("/hf2q/v1/models/activate", post(activation_failure))
+            .route("/shutdown", post(shutdown_owned))
+            .with_state(ShutdownFixture { child_pid });
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let server_thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(async {
+                            let _ = stop_rx.await;
+                        })
+                        .await
+                        .unwrap();
+                });
+        });
+
+        let mut resolver = FixedResolver(Some(EndpointSession::spawned_loopback(port, process)));
+        let error = cmd_chat_with_resolver(
+            ChatArgs {
+                url: None,
+                model: Some("/fixture/invalid.gguf".into()),
+                quant: None,
+                artifact: None,
+                system: None,
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
+                seed: None,
+                reasoning_effort: None,
+                keep_serving: false,
+            },
+            &mut resolver,
+        )
+        .expect_err("activation fixture must fail");
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("safe activation detail"));
+        assert!(rendered.contains(&log_path.display().to_string()));
+        assert!(!rendered.contains("/private/operator/model.gguf"));
+        assert!(!rendered.contains("hf_secret"));
+        assert!(log_path.exists(), "failure log must survive session drop");
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+
+        let _ = stop_tx.send(());
+        server_thread.join().unwrap();
     }
 
     #[derive(Clone)]

@@ -1,4 +1,4 @@
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
@@ -66,7 +66,6 @@ enum Ownership {
     },
 }
 
-const STDERR_TAIL_BYTES: u64 = 32 * 1024;
 const GROUP_EXTINCTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
@@ -119,12 +118,10 @@ impl ServerLog {
 #[derive(Debug)]
 pub(crate) struct OwnedFailureDiagnostics {
     pub(crate) path: PathBuf,
-    pub(crate) tail: String,
-    pub(crate) truncated: bool,
 }
 
 /// Concrete process authority created only from the child spawned by chat.
-/// The process group, parent-lifetime writer, and bounded stderr tail remain
+/// The process group, parent-lifetime writer, and private server log remain
 /// inseparable so cleanup cannot accidentally degrade to PID-only signaling.
 pub(crate) struct OwnedServerProcess {
     child: Child,
@@ -202,27 +199,13 @@ impl OwnedServerProcess {
         Ok(log_path)
     }
 
-    pub(crate) fn stderr_tail(&self) -> String {
-        read_log_tail(self.server_log.path()).unwrap_or_else(|error| {
-            format!(
-                "<server log unavailable at {}: {error}>",
-                self.server_log.path().display()
-            )
-        })
+    pub(crate) fn retain_log(&mut self) -> Result<PathBuf> {
+        self.server_log.retain()
     }
 
     fn disarm_after_terminal_cleanup(&mut self) {
         self.lifeline.take();
     }
-}
-
-fn read_log_tail(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let bytes = file.metadata()?.len();
-    file.seek(SeekFrom::Start(bytes.saturating_sub(STDERR_TAIL_BYTES)))?;
-    let mut tail = Vec::with_capacity(bytes.min(STDERR_TAIL_BYTES) as usize);
-    file.read_to_end(&mut tail)?;
-    Ok(String::from_utf8_lossy(&tail).into_owned())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,24 +281,16 @@ impl EndpointSession {
         }
     }
 
-    /// Persist and snapshot the bounded server-log suffix for an operation
-    /// that is already failing. This changes no process authority: callers
-    /// still stop an attached child and still leave a detached child alone.
+    /// Persist the private server log for an operation that is already
+    /// failing. Log contents are deliberately not returned: arbitrary loader
+    /// context may contain local paths or credentials and must not be copied
+    /// into terminal errors automatically. This changes no process authority.
     pub(crate) fn retain_failure_diagnostics(&mut self) -> Result<Option<OwnedFailureDiagnostics>> {
         let Ownership::Owned { process, .. } = &mut self.ownership else {
             return Ok(None);
         };
         let path = process.server_log.retain()?;
-        let log_bytes = std::fs::metadata(&path)
-            .with_context(|| format!("inspect hf2q server diagnostic log at {}", path.display()))?
-            .len();
-        let tail = read_log_tail(&path)
-            .with_context(|| format!("read hf2q server diagnostic log at {}", path.display()))?;
-        Ok(Some(OwnedFailureDiagnostics {
-            path,
-            tail,
-            truncated: log_bytes > STDERR_TAIL_BYTES,
-        }))
+        Ok(Some(OwnedFailureDiagnostics { path }))
     }
 
     pub(crate) async fn shutdown_if_owned(
@@ -542,9 +517,8 @@ fn stop_remaining_owned_descendants(_process: &mut OwnedServerProcess) -> Result
 
 fn force_stop_owned_process(process: &mut OwnedServerProcess) -> Result<()> {
     let log_path = process.server_log.path().display().to_string();
-    let tail = process.stderr_tail();
     force_stop_owned_process_inner(process)
-        .with_context(|| format!("force-stop chat-owned server; log={log_path}; tail:\n{tail}"))
+        .with_context(|| format!("force-stop chat-owned server; private log={log_path}"))
 }
 
 fn force_stop_owned_process_inner(process: &mut OwnedServerProcess) -> Result<()> {
@@ -646,15 +620,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn failure_diagnostics_retain_only_a_bounded_tail_without_changing_authority() {
+    fn failure_diagnostics_retain_private_log_without_exposing_contents() {
         use std::io::Write;
 
         let directory = tempfile::tempdir().unwrap();
         let mut log = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
-        log.write_all(b"prefix-marker\n").unwrap();
-        log.write_all(&vec![b'x'; STDERR_TAIL_BYTES as usize + 1024])
+        log.write_all(b"private-path=/private/operator/model.gguf token=hf_secret\n")
             .unwrap();
-        log.write_all(b"\nsuffix-marker\n").unwrap();
         log.flush().unwrap();
 
         let process = owned_sleep_process_with_log("sleep 30", log);
@@ -668,10 +640,9 @@ mod tests {
             .retain_failure_diagnostics()
             .unwrap()
             .expect("owned failure must retain diagnostics");
-        assert!(diagnostics.truncated);
-        assert!(diagnostics.tail.contains("suffix-marker"));
-        assert!(!diagnostics.tail.contains("prefix-marker"));
         assert!(diagnostics.path.exists());
+        let retained_contents = std::fs::read_to_string(&diagnostics.path).unwrap();
+        assert!(retained_contents.contains("hf_secret"));
         let retained_path = diagnostics.path.clone();
         drop(session);
         assert!(

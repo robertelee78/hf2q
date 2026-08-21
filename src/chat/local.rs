@@ -91,17 +91,28 @@ async fn resolve_local(
             endpoint_port(&server.endpoint)?,
             child,
         )),
-        Err(error) => {
-            let tail = child.stderr_tail();
-            match stop_failed_child(&mut child) {
-                Ok(()) => Err(anyhow::anyhow!(
-                    "{error:#}; chat-owned server log tail:\n{tail}"
-                )),
-                Err(stop_error) => Err(anyhow::anyhow!(
-                    "{error:#}; cleanup failed: {stop_error:#}; chat-owned server log tail:\n{tail}"
-                )),
-            }
-        }
+        Err(error) => Err(finalize_failed_startup(error, &mut child)),
+    }
+}
+
+fn finalize_failed_startup(error: anyhow::Error, child: &mut OwnedServerProcess) -> anyhow::Error {
+    let cleanup = stop_failed_child(child);
+    let retained_log = child.retain_log();
+    match (cleanup, retained_log) {
+        (Ok(()), Ok(path)) => anyhow::anyhow!(
+            "{error:#}; private chat-owned server log retained at {}",
+            path.display()
+        ),
+        (Err(stop_error), Ok(path)) => anyhow::anyhow!(
+            "{error:#}; cleanup failed: {stop_error:#}; private chat-owned server log retained at {}",
+            path.display()
+        ),
+        (Ok(()), Err(log_error)) => anyhow::anyhow!(
+            "{error:#}; additionally failed to retain the private chat-owned server log: {log_error:#}"
+        ),
+        (Err(stop_error), Err(log_error)) => anyhow::anyhow!(
+            "{error:#}; cleanup failed: {stop_error:#}; additionally failed to retain the private chat-owned server log: {log_error:#}"
+        ),
     }
 }
 
@@ -336,6 +347,10 @@ fn stop_failed_child(process: &mut OwnedServerProcess) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
     use std::sync::{Arc, Mutex};
 
     use axum::extract::State;
@@ -430,6 +445,39 @@ mod tests {
             .to_string()
             .contains("DNS-SD candidates are untrusted"));
         assert!(error.to_string().contains("--url"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_startup_stops_child_and_retains_path_without_echoing_private_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut log = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        log.write_all(b"path=/private/operator/model.gguf token=hf_secret\n")
+            .unwrap();
+        log.flush().unwrap();
+        let log_path = log.path().to_owned();
+        let (parent_lifeline, _child_lifeline) = std::os::unix::net::UnixStream::pair().unwrap();
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id() as libc::pid_t;
+        let mut process = OwnedServerProcess::from_spawned(child, parent_lifeline, log).unwrap();
+
+        let error = finalize_failed_startup(anyhow::anyhow!("startup probe failed"), &mut process);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("startup probe failed"));
+        assert!(rendered.contains(&log_path.display().to_string()));
+        assert!(!rendered.contains("/private/operator/model.gguf"));
+        assert!(!rendered.contains("hf_secret"));
+        assert!(log_path.exists());
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[tokio::test]
