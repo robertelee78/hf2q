@@ -1212,43 +1212,51 @@ where
 /// [`Engine::try_admit_budget`].
 ///
 /// The variant exists so the SSE handler can route per-slot KV-budget
-/// rejections to `ApiError::slot_budget_exceeded` (HTTP 429 +
-/// `Retry-After: 1`) BEFORE `generate_stream_with_deepstack` returns
-/// `Ok` and the handler commits to opening an SSE body — the codex
-/// review CRITICAL #2 finding (handlers.rs:1739-1748 only matched on
-/// the `queue_full` anyhow prefix; SlotBudgetExceeded for the
-/// streaming arm reached the operator as a half-rendered SSE error
-/// frame instead of a clean 429).
+/// rejections to a clean JSON error BEFORE
+/// `generate_stream_with_deepstack` returns `Ok` and the handler
+/// commits to opening an SSE body — the codex review CRITICAL #2
+/// finding (handlers.rs:1739-1748 only matched on the `queue_full`
+/// anyhow prefix; a budget rejection in the streaming arm reached the
+/// operator as a half-rendered SSE error frame). Guarantees tune-up
+/// item 4 (2026-08-20): since this pre-stream check is
+/// occupancy-independent (never fits), the mapping is now
+/// `ApiError::kv_budget_unsatisfiable` — non-retryable 400, no
+/// Retry-After.
 ///
 /// The non-streaming admit path inside `worker_run` continues to surface
-/// the typed [`crate::serve::scheduler::AdmitError::SlotBudgetExceeded`]
-/// inside the existing anyhow channel-error envelope; the worker error
-/// string carries the `"slot_budget_exceeded"` literal so the
-/// non-streaming handler arm can string-match parallel to
-/// `"queue_full"`. Pre-stream surfacing via this typed enum is the
-/// streaming-arm fix; defense-in-depth at the worker layer is preserved.
+/// the typed [`crate::serve::scheduler::AdmitError`] variants inside the
+/// existing anyhow channel-error envelope; the worker error string
+/// carries the `"kv_budget_unsatisfiable"` (never fits) or
+/// `"slot_budget_exceeded"` (transient) literal so the non-streaming
+/// handler arm can string-match parallel to `"queue_full"`. Pre-stream
+/// surfacing via this typed enum is the streaming-arm fix;
+/// defense-in-depth at the worker layer is preserved.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineAdmitError {
     /// The request's projected KV byte cost
     /// (`(prompt_tokens + max_tokens) × kv_bytes_per_token`) exceeds the
-    /// shared physical KV budget configured at engine spawn time. The
-    /// logical model context is not divided by `max_slots`. Maps to HTTP 429 +
-    /// `Retry-After: 1` upstream via
-    /// [`crate::serve::api::schema::ApiError::slot_budget_exceeded`].
+    /// static per-slot KV budget configured at engine spawn time — a
+    /// ceiling this request can NEVER satisfy, independent of current
+    /// occupancy. The logical model context is not divided by
+    /// `max_slots`.
     ///
-    /// Distinct from
-    /// [`crate::serve::scheduler::AdmitError::QueueFull`] (transient
-    /// — capacity will free) because this is operator-actionable on
-    /// physical residency: another retained slot may need recycling, or the
-    /// operator may raise the aggregate budget.
+    /// Guarantees tune-up item 4 (2026-08-20): renamed from
+    /// `SlotBudgetExceeded` and remapped from 429 + `Retry-After: 1` to
+    /// a NON-RETRYABLE 400 via
+    /// [`crate::serve::api::schema::ApiError::kv_budget_unsatisfiable`].
+    /// The pre-stream `try_admit_budget` check is occupancy-independent,
+    /// so every rejection it produces is permanent — an agent honoring
+    /// the old Retry-After would loop forever. Transient budget
+    /// pressure is only detectable inside the scheduler (aggregate
+    /// retained high-water) and still surfaces as
+    /// [`crate::serve::scheduler::AdmitError::SlotBudgetExceeded`] → 429.
     #[error(
-        "ADR-040: slot_budget_exceeded — needed_bytes={needed_bytes}, \
-         budget_bytes={budget_bytes}. Shared physical KV budget exceeded; \
-         logical context was not divided by slot count. Wait for or recycle \
-         another slot, reduce max_tokens or shorten the prompt, or raise the \
-         shared KV budget."
+        "kv_budget_unsatisfiable: ADR-040 — needed_bytes={needed_bytes}, \
+         budget_bytes={budget_bytes}. Request can never fit the per-slot \
+         physical KV budget; non-retryable. Reduce max_tokens or shorten \
+         the prompt, or raise the KV budget."
     )]
-    SlotBudgetExceeded {
+    KvBudgetUnsatisfiable {
         needed_bytes: u64,
         budget_bytes: u64,
     },
@@ -1500,6 +1508,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
                 queue_capacity: 8,
                 admitted_total: 0,
                 rejected_429_total: 0,
+                rejected_unsatisfiable_total: 0,
                 completed_total: 0,
             })),
         }),
@@ -1555,6 +1564,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
                 queue_capacity: 8,
                 admitted_total: 0,
                 rejected_429_total: 0,
+                rejected_unsatisfiable_total: 0,
                 completed_total: 0,
             })),
         }),
@@ -1567,7 +1577,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
 ///
 /// Carries a non-zero `per_slot_kv_budget_bytes` + `kv_bytes_per_token_cached`
 /// so that `Engine::try_admit_budget(prompt, max_tokens)` actually surfaces
-/// `EngineAdmitError::SlotBudgetExceeded`. The worker drains until shutdown
+/// `EngineAdmitError::KvBudgetUnsatisfiable`. The worker drains until shutdown
 /// — the streaming handler's pre-stream admit at `handlers.rs:1748` returns
 /// early on the over-budget error, so the worker is never reached.
 ///
@@ -1626,6 +1636,7 @@ pub(crate) fn make_synthetic_engine_over_budget(
                 queue_capacity: 8,
                 admitted_total: 0,
                 rejected_429_total: 0,
+                rejected_unsatisfiable_total: 0,
                 completed_total: 0,
             })),
         }),
@@ -1694,6 +1705,7 @@ pub(crate) fn make_synthetic_engine_aggregate_stream_pressure(arch: LoadedArch) 
                 queue_capacity: 8,
                 admitted_total: 0,
                 rejected_429_total: 0,
+                rejected_unsatisfiable_total: 0,
                 completed_total: 0,
             })),
         }),
@@ -1783,6 +1795,7 @@ pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
                 queue_capacity: 8,
                 admitted_total: 0,
                 rejected_429_total: 0,
+                rejected_unsatisfiable_total: 0,
                 completed_total: 0,
             })),
         }),
@@ -3198,6 +3211,16 @@ impl LoadedModel {
         // MoE Qwen3-VL still bails at this site (no convert pipeline
         // emits it; the dense-only loader cannot consume an MoE GGUF
         // structurally), with the same operator-actionable message.
+        //
+        // **Guarantees tune-up item 1 (2026-08-20)**: iter-228a's
+        // load-then-501 state violated the published fail-closed
+        // guarantee — the server reported ready while every chat /
+        // embed / soft-token request 501'd (forward landed iter-8a-2;
+        // engine seam is ADR-041 iter-9b scope). The dense arm bails
+        // at spawn again until ADR-041 wires the seam; ADR-041
+        // iter-9b-4 deletes this bail in the same commit that lands
+        // the real worker dispatch. The loader + forward stay covered
+        // by tests/qwen3vl_text_lm_forward.rs.
         use crate::inference::models::qwen35::{is_qwen3_vl_arch, is_qwen3_vl_moe_arch};
         if is_qwen3_vl_arch(arch.as_str()) {
             if is_qwen3_vl_moe_arch(arch.as_str()) {
@@ -3210,9 +3233,21 @@ impl LoadedModel {
                     model_path.display(),
                 );
             }
-            // Dense Qwen3-VL — route through iter-228a's load path.
-            let v = super::engine_qwen3vl::Qwen3VlTextLoadedModel::load(opts)?;
-            return Ok(LoadedModel::Qwen3VlText(v));
+            // Dense Qwen3-VL — refuse at spawn until ADR-041 wires the
+            // engine seam (guarantees tune-up item 1, 2026-08-20).
+            // Refusing BEFORE `Qwen3VlTextLoadedModel::load` also avoids
+            // streaming gigabytes of tensors for a server that could not
+            // serve a single request.
+            anyhow::bail!(
+                "Qwen3-VL (dense, general.architecture = {arch:?}) is recognized and its \
+                 text-LM forward is implemented (iter-8a-2), but the serve engine seam is \
+                 not wired yet (ADR-041 iter-9b): every chat / embeddings / soft-token \
+                 request would return HTTP 501. Refusing at load rather than reporting a \
+                 ready server that cannot serve (fail-closed guarantee). For text-only \
+                 chat today use a Qwen3.5/3.6 GGUF; for chat + images use a Gemma 4 \
+                 GGUF. Model: {}",
+                model_path.display(),
+            );
         }
         match arch.as_str() {
             "qwen35" | "qwen35moe" => {
@@ -4186,6 +4221,7 @@ impl Engine {
             queue_capacity: queue_capacity_u32,
             admitted_total: 0,
             rejected_429_total: 0,
+            rejected_unsatisfiable_total: 0,
             completed_total: 0,
         }));
         let worker_stats_handle = Arc::clone(&scheduler_stats_snapshot);
@@ -4759,6 +4795,7 @@ impl Engine {
             queue_capacity: queue_capacity_u32,
             admitted_total: 0,
             rejected_429_total: 0,
+            rejected_unsatisfiable_total: 0,
             completed_total: 0,
         }));
         let worker_stats_handle = Arc::clone(&scheduler_stats_snapshot);
@@ -4938,26 +4975,29 @@ impl Engine {
     /// **ADR-040 §3.5 iter-A5b** — pre-stream admit-time KV byte
     /// budget check. Returns `Ok(())` when the request fits the
     /// per-slot budget (or enforcement is disabled), or
-    /// [`EngineAdmitError::SlotBudgetExceeded`] when the projected
-    /// KV cost exceeds the per-slot budget configured at engine spawn.
+    /// [`EngineAdmitError::KvBudgetUnsatisfiable`] when the projected
+    /// KV cost exceeds the per-slot budget configured at engine spawn
+    /// — a never-fits condition, mapped to a non-retryable 400 since
+    /// the guarantees tune-up item 4 (2026-08-20).
     ///
     /// **Why pre-stream**: per codex review CRITICAL #2 (handlers.rs:
     /// 1739-1748 originally string-matched `queue_full` only),
-    /// scheduler-side `SlotBudgetExceeded` rejection in the streaming
-    /// arm landed AFTER `Engine::generate_stream_with_deepstack`
-    /// returned `Ok`, meaning the handler had already committed to
-    /// opening an SSE body. Calling this method BEFORE handing the
-    /// request to `generate_stream_with_deepstack` lets the streaming
-    /// handler return a clean HTTP 429 + `Retry-After: 1` body
-    /// instead of a half-rendered SSE error frame.
+    /// scheduler-side budget rejection in the streaming arm landed
+    /// AFTER `Engine::generate_stream_with_deepstack` returned `Ok`,
+    /// meaning the handler had already committed to opening an SSE
+    /// body. Calling this method BEFORE handing the request to
+    /// `generate_stream_with_deepstack` lets the streaming handler
+    /// return a clean JSON error body instead of a half-rendered SSE
+    /// error frame.
     ///
     /// Defense-in-depth: the worker_run admit sites still surface
-    /// `slot_budget_exceeded`-prefixed anyhow errors for the
-    /// non-streaming path; the handler-side string-match converts
-    /// those to `ApiError::slot_budget_exceeded` parallel to
+    /// `kv_budget_unsatisfiable`- / `slot_budget_exceeded`-prefixed
+    /// anyhow errors for the non-streaming path; the handler-side
+    /// string-match converts those to
+    /// `ApiError::kv_budget_unsatisfiable` (400, never fits) /
+    /// `ApiError::slot_budget_exceeded` (429, transient) parallel to
     /// `queue_full`. Pre-stream check + worker-side check are
-    /// redundant by design — both surfaces map to the same wire-level
-    /// 429.
+    /// redundant by design.
     ///
     /// Behaviour:
     /// - `per_slot_kv_budget_bytes == 0` ⇒ `Ok(())` (enforcement
@@ -4987,7 +5027,7 @@ impl Engine {
             .saturating_mul(per_token)
             .saturating_add(self.inner.kv_fixed_bytes_per_slot_cached);
         if needed > budget {
-            return Err(EngineAdmitError::SlotBudgetExceeded {
+            return Err(EngineAdmitError::KvBudgetUnsatisfiable {
                 needed_bytes: needed,
                 budget_bytes: budget,
             });
@@ -12748,6 +12788,22 @@ fn admit_gemma4_slot(
             slot_fire_done(reply, gr, false);
             return None;
         }
+        // Guarantees tune-up item 4 (2026-08-20): never-fits →
+        // `kv_budget_unsatisfiable` prefix so the handler maps to a
+        // non-retryable 400 (no Retry-After) instead of the 429.
+        Err(AdmitError::KvBudgetUnsatisfiable {
+            needed_bytes,
+            budget_bytes,
+        }) => {
+            let gr = Err(anyhow::anyhow!(
+                "kv_budget_unsatisfiable: ADR-040 full-context slots — request can never \
+                 fit the shared physical KV budget (needed_bytes={needed_bytes}, \
+                 budget_bytes={budget_bytes}); non-retryable — reduce max_tokens, \
+                 shorten the prompt, or raise the budget."
+            ));
+            slot_fire_done(reply, gr, false);
+            return None;
+        }
         Err(e) => {
             let gr = Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e}"));
             slot_fire_done(reply, gr, false);
@@ -14597,6 +14653,21 @@ fn admit_gemma4_slots_stable_batched(
                     "slot_budget_exceeded: shared physical KV budget exceeded \
                      (needed_bytes={needed_bytes}, budget_bytes={budget_bytes}); \
                      logical context was not divided by slot count"
+                )),
+                false,
+            ),
+            // Guarantees tune-up item 4 (2026-08-20): never-fits →
+            // non-retryable 400 mapping upstream.
+            Err(AdmitError::KvBudgetUnsatisfiable {
+                needed_bytes,
+                budget_bytes,
+            }) => slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!(
+                    "kv_budget_unsatisfiable: request can never fit the shared \
+                     physical KV budget (needed_bytes={needed_bytes}, \
+                     budget_bytes={budget_bytes}); non-retryable — reduce \
+                     max_tokens or shorten the prompt"
                 )),
                 false,
             ),
@@ -18368,6 +18439,24 @@ fn admit_qwen35_slot(
             );
             return None;
         }
+        // Guarantees tune-up item 4 (2026-08-20): never-fits →
+        // non-retryable 400 mapping upstream.
+        Err(AdmitError::KvBudgetUnsatisfiable {
+            needed_bytes,
+            budget_bytes,
+        }) => {
+            slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!(
+                    "kv_budget_unsatisfiable: ADR-040 full-context slots — request can \
+                     never fit the shared physical KV budget (needed_bytes={needed_bytes}, \
+                     budget_bytes={budget_bytes}); non-retryable — reduce max_tokens, \
+                     shorten the prompt, or raise the budget."
+                )),
+                false,
+            );
+            return None;
+        }
         Err(e) => {
             slot_fire_done(
                 reply,
@@ -19668,6 +19757,22 @@ fn worker_run(
                         )));
                         continue;
                     }
+                    // Guarantees tune-up item 4 (2026-08-20): never-fits →
+                    // non-retryable 400 mapping upstream.
+                    Err(AdmitError::KvBudgetUnsatisfiable {
+                        needed_bytes,
+                        budget_bytes,
+                    }) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "kv_budget_unsatisfiable: request can never fit the \
+                             KV budget (needed_bytes={}, budget_bytes={}); \
+                             non-retryable — reduce max_tokens or use a shorter \
+                             prompt.",
+                            needed_bytes,
+                            budget_bytes
+                        )));
+                        continue;
+                    }
                     Err(e) => {
                         let _ = reply.send(Err(anyhow::anyhow!(
                             "ADR-040 C2b: scheduler admit failed: {:?}",
@@ -20173,6 +20278,26 @@ fn worker_run(
                                 "slot_budget_exceeded: ADR-040 §3.5 A5b — \
                                  shared physical KV budget exceeded for GenerateStream \
                                  (needed_bytes={}, budget_bytes={}). Reduce \
+                                 max_tokens or use a shorter prompt.",
+                                needed_bytes,
+                                budget_bytes
+                            ),
+                        );
+                        continue;
+                    }
+                    // Guarantees tune-up item 4 (2026-08-20): never-fits →
+                    // non-retryable 400 mapping upstream.
+                    Err(AdmitError::KvBudgetUnsatisfiable {
+                        needed_bytes,
+                        budget_bytes,
+                    }) => {
+                        reject_stream_before_sse(
+                            events,
+                            admission,
+                            anyhow::anyhow!(
+                                "kv_budget_unsatisfiable: GenerateStream request \
+                                 can never fit the KV budget (needed_bytes={}, \
+                                 budget_bytes={}); non-retryable — reduce \
                                  max_tokens or use a shorter prompt.",
                                 needed_bytes,
                                 budget_bytes
@@ -20790,6 +20915,21 @@ fn worker_run(
                         )));
                         continue;
                     }
+                    // Guarantees tune-up item 4 (2026-08-20): never-fits →
+                    // non-retryable 400 mapping upstream.
+                    Err(AdmitError::KvBudgetUnsatisfiable {
+                        needed_bytes,
+                        budget_bytes,
+                    }) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "kv_budget_unsatisfiable: Embed prompt can never fit \
+                             the KV budget (needed_bytes={}, budget_bytes={}); \
+                             non-retryable — reduce prompt length.",
+                            needed_bytes,
+                            budget_bytes
+                        )));
+                        continue;
+                    }
                     Err(e) => {
                         let _ = reply.send(Err(anyhow::anyhow!(
                             "ADR-040 C2b: scheduler admit failed for Embed: {:?}",
@@ -21181,6 +21321,22 @@ fn worker_run(
                              GenerateWithSoftTokens — shared physical KV budget \
                              exceeded (needed_bytes={}, budget_bytes={}). \
                              Reduce max_tokens or use a shorter prompt.",
+                            needed_bytes,
+                            budget_bytes
+                        )));
+                        continue;
+                    }
+                    // Guarantees tune-up item 4 (2026-08-20): never-fits →
+                    // non-retryable 400 mapping upstream.
+                    Err(AdmitError::KvBudgetUnsatisfiable {
+                        needed_bytes,
+                        budget_bytes,
+                    }) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "kv_budget_unsatisfiable: GenerateWithSoftTokens request \
+                             can never fit the KV budget (needed_bytes={}, \
+                             budget_bytes={}); non-retryable — reduce max_tokens \
+                             or use a shorter prompt.",
                             needed_bytes,
                             budget_bytes
                         )));
@@ -27149,7 +27305,11 @@ pub(super) fn emit_streaming_tool_call_close(
                 scrubbed = %scrubbed,
                 "tool-call body unparseable; emitting as content fallback \
                  (tool_choice=auto with no active grammar — no enforcement \
-                 on body shape; either tools[] empty or unregistered family). \
+                 on body shape; tools[] empty, or a registered family whose \
+                 model emitted a malformed call: deliberate peer-parity \
+                 fallback. tools[]-on-unregistered-family no longer reaches \
+                 here — refused 501 at request time since the 2026-08-20 \
+                 item-2 gate in compile_tool_grammar_with_registration). \
                  Special-token markers scrubbed from body before emit."
             );
             if events
@@ -31690,7 +31850,8 @@ assistant:
     /// Both `per_slot_kv_budget_bytes = 0` and `kv_bytes_per_token = 0`
     /// preserve the pre-A5 byte-equivalence (enforcement disabled);
     /// any non-zero value on BOTH fields exercises the typed
-    /// `EngineAdmitError::SlotBudgetExceeded` path.
+    /// `EngineAdmitError::KvBudgetUnsatisfiable` path (renamed from
+    /// SlotBudgetExceeded per guarantees tune-up item 4, 2026-08-20).
     fn make_test_engine_with_worker_arch_and_budget<F>(
         arch: LoadedArch,
         per_slot_kv_budget_bytes: u64,
@@ -31759,6 +31920,7 @@ assistant:
                         .expect("test queue capacity fits u32"),
                     admitted_total: 0,
                     rejected_429_total: 0,
+                    rejected_unsatisfiable_total: 0,
                     completed_total: 0,
                 })),
             }),
@@ -31935,9 +32097,11 @@ assistant:
     }
 
     #[test]
-    fn a5b_try_admit_budget_returns_slot_budget_exceeded_when_over() {
+    fn a5b_try_admit_budget_returns_kv_budget_unsatisfiable_when_over() {
         // 1 MiB budget, 1024 bytes/token, 1000 + 1000 = 2000 tokens ⇒
-        // 2000 × 1024 = 2_048_000 > 1_048_576 ⇒ SlotBudgetExceeded.
+        // 2000 × 1024 = 2_048_000 > 1_048_576 ⇒ KvBudgetUnsatisfiable
+        // (never fits — occupancy-independent check; guarantees tune-up
+        // item 4, 2026-08-20).
         let engine = make_test_engine_with_worker_arch_and_budget(
             LoadedArch::Gemma,
             1024 * 1024,
@@ -31945,7 +32109,7 @@ assistant:
             drain_until_shutdown,
         );
         match engine.try_admit_budget(1000, 1000) {
-            Err(EngineAdmitError::SlotBudgetExceeded {
+            Err(EngineAdmitError::KvBudgetUnsatisfiable {
                 needed_bytes,
                 budget_bytes,
             }) => {
@@ -31960,7 +32124,7 @@ assistant:
                     "budget_bytes echoes the configured per-slot budget"
                 );
             }
-            Ok(()) => panic!("over-budget admit MUST surface SlotBudgetExceeded, got Ok"),
+            Ok(()) => panic!("over-budget admit MUST surface KvBudgetUnsatisfiable, got Ok"),
         }
     }
 
@@ -32010,7 +32174,7 @@ assistant:
         // The Display impl is what the operator sees in tracing logs +
         // anyhow chains; pin that it names both fields verbatim AND
         // cites ADR-040 §3.5.
-        let err = EngineAdmitError::SlotBudgetExceeded {
+        let err = EngineAdmitError::KvBudgetUnsatisfiable {
             needed_bytes: 12_345_678,
             budget_bytes: 4_096_000,
         };
@@ -32065,24 +32229,25 @@ assistant:
     //   - `a5d_*_handler_returns_429_*` = production handler call
     // ─────────────────────────────────────────────────────────────────────
 
-    /// **SEAM-ONLY (supplemental to `a5d_chat_completions_non_streaming_handler_returns_429_*`)**
-    /// — direct `engine.try_admit_budget(...)` + `ApiError::slot_budget_exceeded`
+    /// **SEAM-ONLY (supplemental to the handler-level a5d tests)**
+    /// — direct `engine.try_admit_budget(...)` + `ApiError::kv_budget_unsatisfiable`
     /// wire-shape proof. Does NOT invoke `chat_completions` or any handler.
     ///
-    /// Retained because it isolates the
-    /// `EngineAdmitError::SlotBudgetExceeded → ApiError::slot_budget_exceeded → 429+JSON`
-    /// chain without the handler routing in between, so a regression
-    /// in JUST the seam (without breaking the handler test) would
-    /// still surface here with a precise failure message.
+    /// Guarantees tune-up item 4 (2026-08-20): `try_admit_budget` is an
+    /// occupancy-independent never-fits check, so its rejection is now
+    /// the NON-RETRYABLE
+    /// `EngineAdmitError::KvBudgetUnsatisfiable → ApiError::kv_budget_unsatisfiable → 400+JSON`
+    /// chain (was 429 + Retry-After: 1, which invited agents honoring
+    /// Retry-After to loop forever on a request that can never fit).
     ///
     /// Falsifier path (any one ⇒ seam contract broken):
     /// 1. `try_admit_budget` returns Ok for an over-budget request.
     /// 2. The error variant doesn't carry both needed + budget.
-    /// 3. `ApiError::slot_budget_exceeded` produces a non-429 status.
-    /// 4. The response lacks `Retry-After: 1`.
-    /// 5. The body JSON does not contain `"code":"slot_budget_exceeded"`.
+    /// 3. `ApiError::kv_budget_unsatisfiable` produces a non-400 status.
+    /// 4. The response carries a `Retry-After` header (must NOT — non-retryable).
+    /// 5. The body JSON does not contain `"code":"kv_budget_unsatisfiable"`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a5d_seam_only_try_admit_budget_to_api_error_429_wire_shape() {
+    async fn a5d_seam_only_try_admit_budget_to_api_error_400_wire_shape() {
         use super::super::schema::ApiError;
         use axum::body::to_bytes;
         use axum::http::header;
@@ -32105,28 +32270,27 @@ assistant:
         // The streaming path (CRITICAL #2's load-bearing case) uses
         // `try_admit_budget` directly.
         let response = match engine.try_admit_budget(1000, 1000) {
-            Err(EngineAdmitError::SlotBudgetExceeded {
+            Err(EngineAdmitError::KvBudgetUnsatisfiable {
                 needed_bytes,
                 budget_bytes,
-            }) => ApiError::slot_budget_exceeded(needed_bytes, budget_bytes).into_response(),
+            }) => ApiError::kv_budget_unsatisfiable(needed_bytes, budget_bytes).into_response(),
             Ok(()) => panic!(
-                "Synthetic over-budget admit MUST surface SlotBudgetExceeded — \
+                "Synthetic over-budget admit MUST surface KvBudgetUnsatisfiable — \
                  indicates `try_admit_budget` is broken"
             ),
         };
 
-        // (1/5) HTTP 429.
+        // (1/5) HTTP 400 — never-fits is non-retryable (item 4).
         assert_eq!(
             response.status(),
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            "non-streaming over-budget MUST return 429"
+            axum::http::StatusCode::BAD_REQUEST,
+            "non-streaming never-fits MUST return non-retryable 400"
         );
-        // (2/5) Retry-After: 1.
+        // (2/5) NO Retry-After — an agent honoring it would loop forever.
         let retry_after = response.headers().get(header::RETRY_AFTER);
         assert_eq!(
-            retry_after.and_then(|v| v.to_str().ok()),
-            Some("1"),
-            "non-streaming over-budget MUST set Retry-After: 1"
+            retry_after, None,
+            "never-fits rejection MUST NOT carry Retry-After"
         );
         // (3/5) JSON body shape — Content-Type + code field.
         let ct = response
@@ -32142,10 +32306,10 @@ assistant:
             .await
             .expect("collect body bytes");
         let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
-        // (4/5) Body contains `slot_budget_exceeded` code.
+        // (4/5) Body contains `kv_budget_unsatisfiable` code.
         assert!(
-            body_str.contains("slot_budget_exceeded"),
-            "body MUST contain `slot_budget_exceeded` code; got: {body_str}"
+            body_str.contains("kv_budget_unsatisfiable"),
+            "body MUST contain `kv_budget_unsatisfiable` code; got: {body_str}"
         );
         // (5/5) Body contains the actual byte numbers (operator-facing
         // remediation diagnostic — parse_slot_budget_exceeded contract
@@ -32163,10 +32327,11 @@ assistant:
     }
 
     /// **CRITICAL #2 GOLDEN** — streaming wire-shape: a streaming chat
-    /// **SEAM-ONLY (supplemental to `a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_*`)**
-    /// — direct `engine.try_admit_budget(...)` + `ApiError::slot_budget_exceeded`
+    /// **SEAM-ONLY (supplemental to the handler-level a5d stream test)**
+    /// — direct `engine.try_admit_budget(...)` + `ApiError::kv_budget_unsatisfiable`
     /// wire-shape proof for the streaming-path response. Does NOT
-    /// invoke `chat_completions_stream` or any handler.
+    /// invoke `chat_completions_stream` or any handler. (Item 4,
+    /// 2026-08-20: never-fits pre-stream rejection is now 400.)
     ///
     /// Retained because it isolates the `application/json` vs
     /// `text/event-stream` Content-Type discriminator at the seam
@@ -32190,24 +32355,25 @@ assistant:
         // handlers.rs:1748-1766 — `try_admit_budget` returns BEFORE the
         // handler reaches the SSE-building `generate_stream_with_deepstack`
         // call at handlers.rs:1767. The response produced via
-        // `ApiError::slot_budget_exceeded(...)` is `application/json`,
+        // `ApiError::kv_budget_unsatisfiable(...)` is `application/json`,
         // not `text/event-stream`.
         let response = match engine.try_admit_budget(1000, 1000) {
-            Err(EngineAdmitError::SlotBudgetExceeded {
+            Err(EngineAdmitError::KvBudgetUnsatisfiable {
                 needed_bytes,
                 budget_bytes,
-            }) => ApiError::slot_budget_exceeded(needed_bytes, budget_bytes).into_response(),
+            }) => ApiError::kv_budget_unsatisfiable(needed_bytes, budget_bytes).into_response(),
             Ok(()) => panic!(
-                "Synthetic over-budget admit MUST surface SlotBudgetExceeded \
+                "Synthetic over-budget admit MUST surface KvBudgetUnsatisfiable \
                  — streaming pre-admit seam is broken"
             ),
         };
 
-        // Load-bearing assertion #1: 429 (not 200 + mid-stream error).
+        // Load-bearing assertion #1: 400 (not 200 + mid-stream error;
+        // item 4: never-fits is non-retryable, so 400 not 429).
         assert_eq!(
             response.status(),
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            "streaming over-budget MUST short-circuit to 429 PRE-SSE; \
+            axum::http::StatusCode::BAD_REQUEST,
+            "streaming never-fits MUST short-circuit to 400 PRE-SSE; \
              a 200 here would indicate the handler proceeded to SSE body \
              construction and surfaced the error mid-stream (the iter-A5 \
              defect codex flagged)"
@@ -32222,23 +32388,22 @@ assistant:
             .unwrap_or("");
         assert!(
             ct.contains("application/json"),
-            "streaming pre-admit 429 MUST be a JSON body (NOT \
+            "streaming pre-admit 400 MUST be a JSON body (NOT \
              text/event-stream); got Content-Type: {ct:?} — this assertion \
              is the wire-level proof that the response is NOT an SSE \
              body"
         );
         assert!(
             !ct.contains("text/event-stream"),
-            "streaming pre-admit 429 MUST NOT carry text/event-stream; \
+            "streaming pre-admit 400 MUST NOT carry text/event-stream; \
              got: {ct:?}"
         );
-        // Retry-After: 1 — matches queue_full convention.
+        // Item 4 (2026-08-20): NO Retry-After — never-fits is
+        // non-retryable (an agent honoring it would loop forever).
         let retry_after = response.headers().get(header::RETRY_AFTER);
         assert_eq!(
-            retry_after.and_then(|v| v.to_str().ok()),
-            Some("1"),
-            "streaming over-budget MUST set Retry-After: 1 (parallel to \
-             queue_full convention)"
+            retry_after, None,
+            "streaming never-fits rejection MUST NOT set Retry-After"
         );
 
         engine.shutdown().await.expect("shutdown");
@@ -32252,7 +32417,7 @@ assistant:
     ///
     /// This test is purely supplemental: a refactor that swaps the order
     /// would also break the real handler-level test
-    /// (`a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded`)
+    /// (`a5d_chat_completions_stream_handler_returns_400_application_json_not_sse_when_kv_budget_unsatisfiable`)
     /// because Content-Type would become `text/event-stream`. The source
     /// grep here gives an additional, faster-to-diagnose failure mode
     /// (lints the source order BEFORE the handler test executes the
@@ -33627,6 +33792,7 @@ assistant:
                     queue_capacity: 8,
                     admitted_total: 0,
                     rejected_429_total: 0,
+                    rejected_unsatisfiable_total: 0,
                     completed_total: 0,
                 })),
             }),

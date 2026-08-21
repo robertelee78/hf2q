@@ -823,6 +823,7 @@ async fn chat_completions_with_prepared(
         summarized_messages,
         summary_tokens,
     );
+    apply_cached_tokens_header(&mut response, result.cached_tokens);
     apply_vit_transparency_headers(
         &mut response,
         vit_forward_ms,
@@ -1078,6 +1079,26 @@ fn apply_transparency_headers(
         if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
             headers.insert(HeaderName::from_static("x-hf2q-summary-tokens"), v);
         }
+    }
+}
+
+/// Guarantees tune-up item 5a (2026-08-20): `X-HF2Q-Cached-Tokens`
+/// transparency header (cf. `X-HF2Q-Overflow-Policy`) so orchestrators
+/// read cache effectiveness without parsing the response body.
+///
+/// Stamped on UNARY chat-completion responses only — unary always
+/// knows the exact count because the response is built after
+/// generation. Streaming responses OMIT the header (the count is only
+/// established worker-side after the SSE response headers have left)
+/// and carry it in the final usage frame instead
+/// (`prompt_tokens_details.cached_tokens`, always present when usage
+/// is emitted). Header ABSENCE therefore means "streaming / unknown",
+/// never "zero" — a zero is stamped explicitly as `0`.
+fn apply_cached_tokens_header(resp: &mut Response, cached_tokens: usize) {
+    use axum::http::{header::HeaderName, HeaderValue};
+    if let Ok(v) = HeaderValue::from_str(&cached_tokens.to_string()) {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("x-hf2q-cached-tokens"), v);
     }
 }
 
@@ -2776,16 +2797,21 @@ async fn chat_completions_stream(
     };
     if let Err(e) = engine.try_admit_budget(prompt_token_count_u32, max_token_count_u32) {
         match e {
-            engine::EngineAdmitError::SlotBudgetExceeded {
+            // Guarantees tune-up item 4 (2026-08-20): the pre-stream
+            // check is occupancy-independent, so its rejection can
+            // NEVER be relieved by another request completing →
+            // non-retryable 400 (no Retry-After), not 429.
+            engine::EngineAdmitError::KvBudgetUnsatisfiable {
                 needed_bytes,
                 budget_bytes,
             } => {
                 tracing::info!(
                     needed_bytes,
                     budget_bytes,
-                    "chat_completions_stream: ADR-040 §3.5 A5b pre-stream slot_budget_exceeded"
+                    "chat_completions_stream: ADR-040 §3.5 pre-stream kv_budget_unsatisfiable (never fits)"
                 );
-                return ApiError::slot_budget_exceeded(needed_bytes, budget_bytes).into_response();
+                return ApiError::kv_budget_unsatisfiable(needed_bytes, budget_bytes)
+                    .into_response();
             }
         }
     }
@@ -4739,7 +4765,10 @@ fn compile_tool_grammar_with_registration(
     // arms `awaiting_trigger=true` for the lazy path.  The distinction
     // also matters for precondition strictness:
     //   * Required/Function: missing tools[] OR unknown family ⇒ Err(400)
-    //   * Auto              : missing tools[] OR unknown family ⇒ Ok(None)
+    //   * Auto              : missing tools[] ⇒ Ok(None); declared
+    //     tools[] + unknown family ⇒ Err(501 capability_unsupported)
+    //     (guarantees tune-up item 2, 2026-08-20 — fail closed instead
+    //     of serving unenforceable tool calls; ADR-005 dated note)
     let constrain = matches!(
         tool_choice,
         ToolChoiceValue::Required | ToolChoiceValue::Function(_)
@@ -4795,21 +4824,41 @@ fn compile_tool_grammar_with_registration(
     // as the no-tools branch: silent Ok(None) re-opens the wave-2.6
     // divergence. Operator-actionable answer is a 400.
     //
-    // Wave 3 W-B2: under Auto, missing registration is benign — we have
-    // no per-model tool-call format to constrain, so the engine runs
-    // unconstrained (same effective behaviour as pre-W-B2 Auto).  Auto's
-    // body-parse-failure → content fallback remains the safety net for
-    // unregistered families; the new Auto-lazy path only activates on
-    // registered ones.
+    // Guarantees tune-up item 2 (2026-08-20): the Auto branch used to
+    // return Ok(None) here (unconstrained engine, with the body-parse-
+    // failure → content fallback as the safety net). That fallback
+    // LEAKS malformed tool-call syntax into `delta.content` — the
+    // published fail-closed guarantee says a call that cannot be
+    // enforced or parsed must fail closed instead. We only reach this
+    // branch with tools[] non-empty (the tools-empty branch above
+    // already returned Ok(None) for Auto), so the caller is asking for
+    // tool calling on a family that cannot serve it: refuse at request
+    // time with the 501 `capability_unsupported` surface. Auto WITHOUT
+    // tools[] and tool_choice=none keep their pre-existing Ok(None);
+    // the registered-family Auto content fallback (peer parity) is
+    // untouched.
     let reg = match registration {
         Some(r) => r,
         None => {
             if !constrain {
-                // Auto + unknown family: no per-model grammar to compile.
-                // Auto allows no-call; the unconstrained engine path is
-                // safe because the post-decode body-parse-failure fallback
-                // handles malformed output as content.
-                return Ok(None);
+                tracing::warn!(
+                    model = %req.model,
+                    "tool_call_capability_unsupported: tools[] declared with \
+                     tool_choice=auto but the loaded family has no registered \
+                     tool_call_gbnf emitter; refusing with 501 rather than \
+                     serving tool calls that can be neither enforced nor parsed"
+                );
+                return Err(ApiError::capability_unsupported_message(format!(
+                    "tools[] declared (tool_choice=auto) but model '{}' has no \
+                     registered tool-call emitter: tool-call output could be \
+                     neither grammar-enforced nor reliably parsed, so the \
+                     request is refused rather than risking malformed calls \
+                     leaking into content. Use a registered family (e.g. \
+                     gemma4-27b-it, qwen3.6-27b-dwq46, deepseek-v4-flash) or \
+                     remove tools[] from the request",
+                    req.model
+                ))
+                .into_response());
             }
             let label = match tool_choice {
                 ToolChoiceValue::Required => "required",
@@ -5173,13 +5222,41 @@ mod compile_tool_grammar_precondition_tests {
         assert!(g.is_none(), "Auto policy is allowed to compile no grammar");
     }
 
-    /// Auto + unknown model family → MUST keep returning Ok(None)
-    /// (regression-preserve).
+    /// Guarantees tune-up item 2 (2026-08-20): Auto + declared tools[] +
+    /// unknown family → 501 `capability_unsupported`. This REPLACES the
+    /// pre-tune-up `Ok(None)` regression-preserve pin: Ok(None) armed no
+    /// grammar, and a malformed model-emitted call then leaked (scrubbed)
+    /// into `content` via the Auto fallback — violating the published
+    /// fail-closed guarantee. Tool calls that can be neither enforced nor
+    /// parsed are refused at request time instead.
     #[test]
-    fn compile_tool_grammar_auto_with_unknown_family_returns_ok_none() {
+    fn compile_tool_grammar_auto_with_tools_unknown_family_returns_501() {
+        assert!(
+            registry::find_for("unknown-fake-model-zzzz").is_none(),
+            "test fixture must use an unregistered model id; \
+             update if registry adds a 'unknown-fake-model-zzzz' family"
+        );
         let req = req_with("unknown-fake-model-zzzz", Some(one_scalar_tool("foo")));
         let res = compile_tool_grammar(&req, &ToolChoiceValue::Auto);
-        let g = res.expect("Auto + unknown model MUST stay Ok(None)");
+        let resp = res.expect_err("Auto + tools[] + unknown family MUST fail closed (501)");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "must be 501 capability_unsupported — Ok(None) here re-opens \
+             the tool-syntax-leaks-as-content hole the guarantee forbids"
+        );
+    }
+
+    /// tool_choice=none + declared tools[] + unknown family MUST stay
+    /// Ok(None): None suppresses tools at render (the model never sees
+    /// them), so there is nothing to enforce and the item-2 501 gate
+    /// must NOT fire. Guards the None exemption of the tune-up gate.
+    #[test]
+    fn compile_tool_grammar_none_choice_unknown_family_stays_ok_none() {
+        assert!(registry::find_for("unknown-fake-model-zzzz").is_none());
+        let req = req_with("unknown-fake-model-zzzz", Some(one_scalar_tool("foo")));
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::None);
+        let g = res.expect("None choice + unknown family MUST stay Ok(None)");
         assert!(g.is_none());
     }
 
@@ -7499,6 +7576,16 @@ fn common_engine_error_response(state: Option<&AppState>, msg: &str) -> Option<R
         }
         return Some(ApiError::queue_full().into_response());
     }
+    // Guarantees tune-up item 4 (2026-08-20): never-fits worker
+    // rejections carry the `kv_budget_unsatisfiable` prefix → map to
+    // the non-retryable 400 (no Retry-After). Checked before
+    // `slot_budget_exceeded` (no substring overlap, but the order
+    // documents precedence). The numeric extractor is shared — both
+    // Display shapes carry needed_bytes=/budget_bytes= pairs.
+    if msg.contains("kv_budget_unsatisfiable") {
+        let (needed, budget) = parse_slot_budget_exceeded(msg);
+        return Some(ApiError::kv_budget_unsatisfiable(needed, budget).into_response());
+    }
     if msg.contains("slot_budget_exceeded") {
         let (needed, budget) = parse_slot_budget_exceeded(msg);
         return Some(ApiError::slot_budget_exceeded(needed, budget).into_response());
@@ -8021,16 +8108,18 @@ async fn chat_model_embeddings(
         // short-circuits the whole batch before any subprocess work.
         if let Err(e) = engine.try_admit_budget(prompt_tokens.len() as u32, 0) {
             match e {
-                engine::EngineAdmitError::SlotBudgetExceeded {
+                // Guarantees tune-up item 4 (2026-08-20): never-fits →
+                // non-retryable 400 (no Retry-After), not 429.
+                engine::EngineAdmitError::KvBudgetUnsatisfiable {
                     needed_bytes,
                     budget_bytes,
                 } => {
                     tracing::info!(
                         needed_bytes,
                         budget_bytes,
-                        "embeddings: ADR-040 §3.5 A5b pre-dispatch slot_budget_exceeded"
+                        "embeddings: ADR-040 §3.5 pre-dispatch kv_budget_unsatisfiable (never fits)"
                     );
-                    return ApiError::slot_budget_exceeded(needed_bytes, budget_bytes)
+                    return ApiError::kv_budget_unsatisfiable(needed_bytes, budget_bytes)
                         .into_response();
                 }
             }
@@ -11883,17 +11972,21 @@ mod a5d_handler_429_tests {
     /// = 1 MiB`, `kv_bytes_per_token_cached = 1 KiB`, request asking
     /// for `(prompt=1000 + max_tokens=1000) × 1024 = 2 MiB`), the
     /// handler's pre-stream admit at handlers.rs:1748 fires
-    /// `EngineAdmitError::SlotBudgetExceeded` and converts it to
-    /// `ApiError::slot_budget_exceeded(needed, budget).into_response()`
-    /// at handlers.rs:1762.
+    /// `EngineAdmitError::KvBudgetUnsatisfiable` and converts it to
+    /// `ApiError::kv_budget_unsatisfiable(needed, budget).into_response()`.
+    ///
+    /// Guarantees tune-up item 4 (2026-08-20): the pre-stream check is
+    /// occupancy-independent (never fits), so the contract here changed
+    /// from 429 + Retry-After: 1 to a NON-RETRYABLE 400 with no
+    /// Retry-After — an agent honoring Retry-After would loop forever.
     ///
     /// Falsifier paths (any one ⇒ handler-level contract broken):
     /// 1. `chat_completions_stream` doesn't call `try_admit_budget` at all.
     /// 2. The admit check happens AFTER `generate_stream_with_deepstack`
     ///    is invoked (would show as `Content-Type: text/event-stream`).
-    /// 3. The handler returns 500 / 503 instead of 429.
-    /// 4. The handler returns 429 without `Retry-After: 1`.
-    /// 5. The handler returns a JSON body without `slot_budget_exceeded`
+    /// 3. The handler returns 500 / 503 / 429 instead of 400.
+    /// 4. The handler sets a `Retry-After` header (must NOT — non-retryable).
+    /// 5. The handler returns a JSON body without `kv_budget_unsatisfiable`
     ///    code.
     ///
     /// **Why the Content-Type assertion is load-bearing**: the iter-A5
@@ -11904,7 +11997,7 @@ mod a5d_handler_429_tests {
     /// response is NOT an SSE body, i.e. the handler short-circuited
     /// BEFORE constructing the SSE response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded(
+    async fn a5d_chat_completions_stream_handler_returns_400_application_json_not_sse_when_kv_budget_unsatisfiable(
     ) {
         // Per-slot budget = 1 MiB; per-token cost = 1 KiB. Request asks
         // for (prompt_len=1000 + max_tokens=1000) × 1024 = 2 MiB > 1 MiB.
@@ -11926,23 +12019,24 @@ mod a5d_handler_429_tests {
         // pre-stream admit path at handlers.rs:1748-1766.
         let response = chat_completions_stream(state, req, prepared).await;
 
-        // Load-bearing assertion #1: 429 (NOT 200 + mid-stream SSE error).
+        // Load-bearing assertion #1: 400 (NOT 200 + mid-stream SSE
+        // error, and NOT 429 — item 4: never-fits is non-retryable).
         assert_eq!(
             response.status(),
-            StatusCode::TOO_MANY_REQUESTS,
-            "iter-A5d Critical #2: streaming handler MUST return 429 \
-             when over-budget; got {}",
+            StatusCode::BAD_REQUEST,
+            "guarantees tune-up item 4: streaming handler MUST return \
+             non-retryable 400 when the request can never fit; got {}",
             response.status()
         );
-        // Load-bearing assertion #2: Retry-After: 1 (matches queue_full).
+        // Load-bearing assertion #2: NO Retry-After (non-retryable).
         let retry_after = response
             .headers()
             .get(header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok());
         assert_eq!(
-            retry_after,
-            Some("1"),
-            "iter-A5d Critical #2: streaming handler MUST set Retry-After: 1"
+            retry_after, None,
+            "guarantees tune-up item 4: never-fits rejection MUST NOT \
+             set Retry-After (an agent honoring it would loop forever)"
         );
         // **LOAD-BEARING ASSERTION #3** (the iter-A5 defect codex
         // flagged): Content-Type MUST be application/json — NOT
@@ -11968,7 +12062,7 @@ mod a5d_handler_429_tests {
              construction — the regression codex flagged in iter-A5); \
              got Content-Type: {ct:?}"
         );
-        // Body shape: contains `slot_budget_exceeded` code + verbatim
+        // Body shape: contains `kv_budget_unsatisfiable` code + verbatim
         // needed/budget numbers (needed = 2 MiB = 2_097_152; budget =
         // 1 MiB = 1_048_576).
         let body_bytes = to_bytes(response.into_body(), 1 << 20)
@@ -11976,9 +12070,9 @@ mod a5d_handler_429_tests {
             .expect("collect body bytes");
         let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
         assert!(
-            body_str.contains("slot_budget_exceeded"),
-            "iter-A5d Critical #2: streaming handler body MUST contain \
-             `slot_budget_exceeded` code; got: {body_str}"
+            body_str.contains("kv_budget_unsatisfiable"),
+            "guarantees tune-up item 4: streaming handler body MUST \
+             contain `kv_budget_unsatisfiable` code; got: {body_str}"
         );
         // (1000 + 1000) × 1024 = 2_048_000 verbatim.
         assert!(
@@ -12518,6 +12612,38 @@ mod api_thinking_default_tests {
         assert_eq!(
             resolved.get("reasoning_effort"),
             Some(&serde_json::Value::String("high".into()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod cached_tokens_header_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    /// Guarantees tune-up item 5a (2026-08-20): the unary transparency
+    /// header stamps the exact cached-token count — including an
+    /// explicit `0` on a cache miss. Absence of the header is reserved
+    /// for streaming responses (count unknown at header time), so a
+    /// stamped zero and a missing header are distinguishable states.
+    #[test]
+    fn cached_tokens_header_stamps_exact_count_including_zero() {
+        let mut resp = (StatusCode::OK, "x").into_response();
+        apply_cached_tokens_header(&mut resp, 1234);
+        assert_eq!(
+            resp.headers()
+                .get("x-hf2q-cached-tokens")
+                .and_then(|v| v.to_str().ok()),
+            Some("1234")
+        );
+        let mut zero = (StatusCode::OK, "x").into_response();
+        apply_cached_tokens_header(&mut zero, 0);
+        assert_eq!(
+            zero.headers()
+                .get("x-hf2q-cached-tokens")
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+            "a known-zero is stamped explicitly; absence is reserved for streaming"
         );
     }
 }

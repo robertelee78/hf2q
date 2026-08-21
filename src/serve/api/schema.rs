@@ -218,6 +218,40 @@ impl ApiError {
         e
     }
 
+    /// **Guarantees tune-up item 4 (2026-08-20)** — the request's
+    /// prompt + max_tokens KV demand exceeds a hard ceiling it can
+    /// NEVER satisfy (per-slot budget, or the entire shared budget in
+    /// isolation). HTTP **400**, code `"kv_budget_unsatisfiable"`,
+    /// **no Retry-After**.
+    ///
+    /// Split out of [`Self::slot_budget_exceeded`], which used to cover
+    /// this permanent case too: "a 429 only ever means the box is busy
+    /// right now" is the published contract, and an agent honoring
+    /// `Retry-After: 1` on a request that can never fit would loop
+    /// forever. `slot_budget_exceeded` (429 + Retry-After) now fires
+    /// only for transient aggregate pressure that another request's
+    /// completion or slot recycling can relieve.
+    ///
+    /// `error_type` is `invalid_request_error` (400 class — the
+    /// request itself is unservable as specified), matching how
+    /// OpenAI-family SDKs treat context-length-style terminal errors.
+    pub fn kv_budget_unsatisfiable(needed_bytes: u64, budget_bytes: u64) -> Self {
+        Self::bare(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Request can never fit the physical KV cache budget \
+                 (needed_bytes={}, budget_bytes={}): prompt + max_tokens \
+                 exceeds what a slot can ever hold. Non-retryable — reduce \
+                 max_tokens or shorten the prompt, or raise \
+                 `kv_cache_budget_bytes` (ADR-040).",
+                needed_bytes, budget_bytes
+            ),
+            "invalid_request_error",
+            Some("kv_budget_unsatisfiable"),
+            None,
+        )
+    }
+
     /// Server is still warming up (HTTP 503). Emitted before `/readyz` flips to
     /// 200 (Decision #15, #16). Includes `Retry-After: 1`.
     pub fn not_ready() -> Self {
@@ -383,6 +417,25 @@ impl ApiError {
                 "Capability not yet implemented: {capability} \
                  (ADR-040 §6 Phase C C3 — MultiSeqKvCache::* unimplemented per-model)"
             ),
+            "server_error",
+            Some("capability_unsupported"),
+            None,
+        )
+    }
+
+    /// Same wire shape as [`Self::capability_unsupported`] (501 + code
+    /// `"capability_unsupported"`) but with a caller-authored message,
+    /// for capability refusals that are not `MultiSeqKvCache` trait gaps
+    /// and where the ADR-040 suffix baked into the sibling constructor
+    /// would mislead the operator. First consumer: the guarantees
+    /// tune-up item-2 tool-calling gate (2026-08-20) — tools[] declared
+    /// under tool_choice=auto on a family with no registered tool-call
+    /// emitter refuses at request time instead of serving calls that
+    /// can be neither enforced nor parsed.
+    pub fn capability_unsupported_message(message: impl Into<String>) -> Self {
+        Self::bare(
+            StatusCode::NOT_IMPLEMENTED,
+            message.into(),
             "server_error",
             Some("capability_unsupported"),
             None,
@@ -1287,6 +1340,46 @@ mod tests {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok()),
             Some("1")
+        );
+    }
+
+    /// Guarantees tune-up item 4 (2026-08-20): transient budget
+    /// pressure stays 429 + Retry-After: 1 (retryable — "a 429 only
+    /// ever means the box is busy right now").
+    #[test]
+    fn test_slot_budget_exceeded_is_429_with_retry_after() {
+        let err = ApiError::slot_budget_exceeded(5_000, 4_000);
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["error"]["code"], "slot_budget_exceeded");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// Guarantees tune-up item 4 (2026-08-20): a request that can NEVER
+    /// fit (prompt + max_tokens exceeds a hard KV ceiling) is a
+    /// non-retryable 400 with NO Retry-After — an agent honoring
+    /// Retry-After on this rejection would loop forever. Mirrors
+    /// `test_queue_full_error_is_429_with_retry_after` for the
+    /// non-retryable path.
+    #[test]
+    fn test_kv_budget_unsatisfiable_is_400_without_retry_after() {
+        let err = ApiError::kv_budget_unsatisfiable(2_048_000, 1_048_576);
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["error"]["code"], "kv_budget_unsatisfiable");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get("retry-after"),
+            None,
+            "never-fits rejection MUST NOT carry Retry-After"
         );
     }
 

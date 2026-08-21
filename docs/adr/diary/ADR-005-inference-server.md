@@ -10417,3 +10417,106 @@ Completion receipts on the candidate tree:
 These receipts close the local source and exact-artifact candidate. Clean
 immutable source, exact-SHA CI, and protected publication gates remain separate
 release authority.
+
+## 2026-08-20 — guarantees tune-up item 2: tools[] on an unregistered family fails closed (501)
+
+**Context.** Two independent source audits (gpt-5.6-sol + Kimi K3) confirmed a
+hole in the published fail-closed tool-calling guarantee: with
+`tool_choice=auto` and tools[] declared on a family with **no registered
+tool-call emitter**, `compile_tool_grammar_with_registration` returned
+`Ok(None)` — no grammar armed — and an unparseable model-emitted call body was
+scrubbed and re-emitted as plain `content` (handlers.rs non-stream fallback +
+`engine.rs::emit_streaming_tool_call_close` Auto branch). Malformed tool syntax
+leaked into text instead of failing closed.
+
+**Decision.** At request time, tools[] non-empty + `tool_choice=auto` + no
+registration ⇒ **HTTP 501, code `capability_unsupported`** (new
+`ApiError::capability_unsupported_message` — same wire shape as the ADR-040 C3
+constructor, caller-authored message). The gate keys on the LOADED family
+(`engine.registration()`), covering unary and SSE via the shared
+`prepare_chat_generation_core` prelude.
+
+**Explicitly preserved:** Auto without tools[] ⇒ `Ok(None)` (Auto allows
+no-call); `tool_choice=none` + tools[] ⇒ `Ok(None)` (tools suppressed at
+render, nothing to enforce — new regression guard
+`compile_tool_grammar_none_choice_unknown_family_stays_ok_none`);
+Required/Function preconditions (400s) unchanged; **registered-family Auto
+content fallback (peer parity) byte-unchanged**.
+
+**Tests.** `compile_tool_grammar_auto_with_tools_unknown_family_returns_501`
+replaces the pre-tune-up `..._returns_ok_none` behavior-preserve pin (that pin
+guarded the exact hole being closed, per the tune-up spec). 25/25
+`compile_tool_grammar` suite green.
+
+## 2026-08-20 — guarantees tune-up item 4: never-fits admission rejections are non-retryable 400s
+
+Decision #19's "429 + Retry-After" contract is amended: it now covers only
+transient pressure (queue_full, and slot_budget_exceeded aggregate
+retained-high-water). A request whose prompt + max_tokens can NEVER fit its
+KV ceiling (FIFO per-slot budget; SlotAware total budget in isolation; the
+pre-stream `Engine::try_admit_budget` check) returns **400, code
+`kv_budget_unsatisfiable`, type `invalid_request_error`, no Retry-After** —
+an agent honoring Retry-After on it would loop forever. Full decision table,
+variant split (`AdmitError::KvBudgetUnsatisfiable`,
+`EngineAdmitError::KvBudgetUnsatisfiable`), stats counter, and test pins:
+**ADR-040 §7.KV-BUDGET-SPLIT (2026-08-20)**.
+
+## 2026-08-20 — guarantees tune-up item 1: dense Qwen3-VL refuses at spawn (interim, until ADR-041)
+
+iter-228a's staged state — dense Qwen3-VL loads, `/readyz` flips 200,
+`/v1/models` lists it, and every chat / embeddings / soft-token request 501s
+(`qwen3vl_text_forward_pending`; SlotAware drains everything to 501) —
+violated the published "unsupported families are refused up front"
+guarantee. The serve dispatch arm now bails at spawn BEFORE tensor load,
+naming ADR-041 (iter-9b engine seam) and working alternatives (Qwen3.5/3.6
+for text chat; Gemma 4 for chat + images). The CLI `hf2q generate` path
+already bailed (iter-227/228a split unchanged). ADR-041 iter-9b-4 deletes
+the bail when the real worker dispatch lands — full ADR-041 execution is
+approved and targeted at 0.1.8. Pins:
+`load_engine_refuses_dense_qwen3vl_until_adr041_engine_seam` (+ upstream-arch
+sibling) replace the two iter-228a routing pins.
+
+## 2026-08-20 — guarantees tune-up item 5a: cached-token reporting is never ambiguous
+
+Two changes close the "every response reports its cached-token count" gap:
+
+1. **SSE usage frames always carry `prompt_tokens_details`.** With
+   `stream_options.include_usage` (the OpenAI opt-in, unchanged), the final
+   chunk previously omitted `prompt_tokens_details` whenever the producer
+   reported no cached tokens — indistinguishable from "server doesn't report
+   caching". The central usage build (`sse.rs`) now always emits
+   `prompt_tokens_details.cached_tokens`, with an explicit `0` on a miss;
+   qwen35's two producers report known-zero as `Some(0)` (`None` = "not
+   measured", rendered as 0). Pin:
+   `include_usage_cache_miss_reports_explicit_zero_cached_tokens`.
+
+2. **`X-HF2Q-Cached-Tokens` transparency header on unary responses**
+   (`apply_cached_tokens_header`, cf. `X-HF2Q-Overflow-Policy`). Unary always
+   knows the exact count (response built post-generation), including explicit
+   `0`. **Streaming responses deliberately OMIT the header**: the cache
+   decision (full-equality replay or prefix hit) is made worker-side after
+   the SSE response headers have left, and a probe-time advisory value could
+   drift — under the no-fake-numbers mantra, omission beats approximation.
+   Header absence = "streaming / unknown", never "zero"; the SSE usage frame
+   is the authoritative streaming surface. Pin:
+   `cached_tokens_header_stamps_exact_count_including_zero`.
+
+## 2026-08-20 — guarantees tune-up item 5b: TQ memory-savings claim cites its real pin
+
+README's performance section cited `tests/qh35_no_f32_kv_alloc_with_tq_kv.rs`
+as the in-tree regression pin for the 3.94× TQ KV memory-savings claim —
+that file never existed in any branch's history. The claim itself IS pinned,
+just elsewhere: `full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_32k`
+(+ 8K sibling) in `src/inference/models/qwen35/kv_cache.rs` asserts
+`f32_k_v_bytes == 0` with TQ active and the exact 340,787,200-byte vs
+1,342,177,280-byte (3.94×) totals at the 32K shape. A `tests/` integration
+pin is structurally unavailable: the lib target is a deliberate narrow
+facade (kv_persist leaves only) and pulling `inference` in would defeat it —
+which is why the promised file was never written. README now cites the real
+pins + the `cargo test --locked --bin hf2q
+full_attn_bytes_breakdown_tq_on_drops_f32` invocation.
+
+**Open half (queued):** the same README section's throughput claims
+(prefill 1.24×, decode 1.29× vs peer-FA) are operator-driven re-bench with
+no CI gate — re-verification on quiet hardware with documented commands is
+scheduled after the 0.1.7 release window as its own task.

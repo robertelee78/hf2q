@@ -6679,18 +6679,18 @@ mod tests {
     // the pre-iter-227 silent fall-through into the Gemma 4 loader's
     // `missing blk.0.ffn_gate_up_exps.weight` panic.
 
-    /// Synthetic GGUF with arch=qwen3_vl (hf2q's underscored convention,
-    /// emitted by Wedge-4f convert) used to surface the iter-227
-    /// dispatch bail. As of **iter-228a** (2026-05-02) the dense
-    /// Qwen3-VL arm no longer bails at the dispatch site — it routes
-    /// through `Qwen3VlTextLoadedModel::load`, which then fails
-    /// downstream when the synthetic 0-tensor GGUF has no
-    /// `qwen3_vl.block_count` etc. metadata to parse a config from.
-    /// This test pins the new failure shape: dispatch reaches the
-    /// iter-228a config parser, NOT the Gemma loader (the regression
-    /// guard the iter-227 test was originally for is preserved).
+    /// Guarantees tune-up item 1 (2026-08-20): dense Qwen3-VL REFUSES at
+    /// serve spawn until ADR-041 (iter-9b) wires the engine seam. The
+    /// iter-228a state this replaces — load succeeds, `/readyz` flips
+    /// 200, and every chat / embed / soft-token request 501s — violated
+    /// the published "unsupported families are refused up front"
+    /// guarantee. This test REPLACES
+    /// `iter228a_load_engine_routes_qwen3_vl_to_qwen3vl_text_loader`
+    /// (a routing pin for the superseded behavior). ADR-041 iter-9b-4
+    /// deletes the bail with the real worker dispatch and will flip
+    /// this pin again.
     #[test]
-    fn iter228a_load_engine_routes_qwen3_vl_to_qwen3vl_text_loader() {
+    fn load_engine_refuses_dense_qwen3vl_until_adr041_engine_seam() {
         let tmp = write_minimal_gguf_with_arch("qwen3_vl");
         let cfg = super::multi_model::EngineConfig {
             tokenizer_path: None,
@@ -6707,34 +6707,42 @@ mod tests {
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
             result.is_err(),
-            "0-tensor synthetic qwen3_vl GGUF must fail load (no metadata)"
+            "dense qwen3_vl must refuse at spawn until the ADR-041 seam lands"
         );
         let msg = format!("{:#}", result.err().unwrap());
-        // Must reach the Qwen3VlTextConfig parser (not Gemma).
+        // The refusal is the guarantee-level spawn bail, naming the
+        // gating ADR and a working alternative…
         assert!(
-            msg.contains("Qwen3VlTextConfig::from_gguf")
-                || msg.contains("missing core architecture facts"),
-            "iter-228a must route dense Qwen3-VL through Qwen3VlTextConfig parser; got: {msg}"
+            msg.contains("ADR-041"),
+            "spawn refusal must name the gating ADR; got: {msg}"
         );
-        // Regression guards from the iter-227 tests:
-        // (1) MUST NOT fall through to the Gemma loader's panic surface.
+        assert!(
+            msg.contains("Qwen3.5") || msg.contains("Gemma"),
+            "spawn refusal must name a working alternative; got: {msg}"
+        );
+        // …not the MoE-variant bail, and not a loader-level failure
+        // (the guard fires BEFORE tensors are touched).
+        assert!(
+            !msg.contains("MoE, general.architecture"),
+            "dense refusal must be distinguishable from the MoE bail; got: {msg}"
+        );
+        assert!(
+            !msg.contains("Qwen3VlTextConfig::from_gguf"),
+            "refusal must fire BEFORE the loader/config parser; got: {msg}"
+        );
+        // Preserved iter-227 regression guard: never fall through to
+        // the Gemma loader's panic surface.
         assert!(
             !msg.contains("missing blk.0.ffn_gate_up_exps.weight"),
-            "iter-228a must intercept BEFORE the Gemma MoE expert load; got: {msg}"
-        );
-        // (2) MUST NOT regress to the iter-227 actionable-error bail
-        // for dense Qwen3-VL (that bail is now lifted; only MoE bails).
-        assert!(
-            !msg.contains("iter-227 closes only the dispatch gap"),
-            "iter-228a lifted the iter-227 dispatch bail for dense Qwen3-VL; got: {msg}"
+            "must intercept BEFORE the Gemma MoE expert load; got: {msg}"
         );
     }
 
-    /// Symmetric for the peer's arch-string convention
-    /// (no underscore — `qwen3vl`). Both arch spellings route through
-    /// the iter-228a load path.
+    /// Symmetric for the peer's arch-string convention (no underscore —
+    /// `qwen3vl`). Both arch spellings hit the same item-1 spawn
+    /// refusal.
     #[test]
-    fn iter228a_load_engine_routes_qwen3vl_upstream_to_qwen3vl_text_loader() {
+    fn load_engine_refuses_dense_qwen3vl_upstream_arch_until_adr041_engine_seam() {
         let tmp = write_minimal_gguf_with_arch("qwen3vl");
         let cfg = super::multi_model::EngineConfig {
             tokenizer_path: None,
@@ -6752,9 +6760,8 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{:#}", result.err().unwrap());
         assert!(
-            msg.contains("Qwen3VlTextConfig::from_gguf")
-                || msg.contains("missing core architecture facts"),
-            "iter-228a must route upstream-arch dense Qwen3-VL through Qwen3VlTextConfig parser; got: {msg}"
+            msg.contains("ADR-041") && !msg.contains("MoE, general.architecture"),
+            "upstream-arch dense Qwen3-VL must hit the item-1 spawn refusal; got: {msg}"
         );
     }
 

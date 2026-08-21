@@ -749,7 +749,15 @@ for the full thermal-fair alt-pair protocol used by ADR-029 baselines.
   drops F32 K/V allocations entirely on Qwen 3.6 35B-A3B at 32K
   context, **340 MiB vs 1.34 GiB F32-only baseline = 3.94× memory
   savings**.  This is the only major performance claim with an
-  in-tree regression pin (`tests/qh35_no_f32_kv_alloc_with_tq_kv.rs`).
+  in-tree regression pin:
+  `full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_32k` (plus its
+  8K sibling) in `src/inference/models/qwen35/kv_cache.rs` asserts
+  `f32_k_v_bytes == 0` with TQ active and the exact
+  340,787,200-byte total vs the 1,342,177,280-byte F32-only baseline
+  (3.94×) at the 32K shape.  Run:
+  `cargo test --locked --bin hf2q full_attn_bytes_breakdown_tq_on_drops_f32`
+  (Metal device required; the lib target is a narrow facade, so the
+  pin lives in the bin's unit tests, not `tests/`).
 
 Regression protection for the decode path: 8 parity tests
 (V2/V3 unbatched + V3 batched), `coherence_smoke` (2 cells),

@@ -121,6 +121,11 @@ pub struct StreamStats {
     pub gpu_sync_count: Option<u64>,
     pub gpu_dispatch_count: Option<u64>,
     /// Prompt tokens served from prompt cache (Decision #24).
+    /// Guarantees tune-up item 5a (2026-08-20): producers report a
+    /// known-zero count as `Some(0)`; `None` means "not measured" and
+    /// the usage frame reports it as 0 — the emitted
+    /// `prompt_tokens_details.cached_tokens` field is never omitted
+    /// when usage is emitted.
     pub cached_prompt_tokens: Option<usize>,
     /// Tokens spent on pre-answer reasoning (Decision #21).
     pub reasoning_tokens: Option<usize>,
@@ -333,9 +338,16 @@ fn generation_events_stream_with_metrics(
                             prompt_tokens,
                             completion_tokens,
                             total_tokens: prompt_tokens + completion_tokens,
-                            prompt_tokens_details: stats
-                                .cached_prompt_tokens
-                                .map(|cached_tokens| PromptTokensDetails { cached_tokens }),
+                            // Guarantees tune-up item 5a (2026-08-20):
+                            // when usage is emitted, cached_tokens is
+                            // ALWAYS reported explicitly — a cache miss
+                            // is `cached_tokens: 0`, never an omitted
+                            // field (omission was indistinguishable
+                            // from "server doesn't report caching",
+                            // while unary always reported it).
+                            prompt_tokens_details: Some(PromptTokensDetails {
+                                cached_tokens: stats.cached_prompt_tokens.unwrap_or(0),
+                            }),
                             completion_tokens_details: stats
                                 .reasoning_tokens
                                 .map(|reasoning_tokens| CompletionTokensDetails { reasoning_tokens }),
@@ -1044,6 +1056,38 @@ mod tests {
         );
         assert_eq!(done["system_fingerprint"], "hf2q-test-mlx-native");
         assert!(done.get("x_hf2q_timing").is_none());
+    }
+
+    /// Guarantees tune-up item 5a (2026-08-20): a cache MISS (producer
+    /// reported no cached tokens) still yields an explicit
+    /// `prompt_tokens_details.cached_tokens: 0` in the usage frame —
+    /// the field is never omitted when usage is emitted, so
+    /// orchestrators can distinguish "no cache hit" from "server does
+    /// not report caching".
+    #[tokio::test]
+    async fn include_usage_cache_miss_reports_explicit_zero_cached_tokens() {
+        let (tx, rx) = mpsc::channel(8);
+        let events = vec![GenerationEvent::Done {
+            finish_reason: "stop",
+            prompt_tokens: 7,
+            completion_tokens: 5,
+            // Default stats: cached_prompt_tokens = None (miss / not
+            // measured).
+            stats: StreamStats::default(),
+        }];
+        let opts = SseStreamOptions {
+            include_usage: true,
+            ..Default::default()
+        };
+        let sse = make_sse(rx, opts);
+        tokio::spawn(spawn_feeder(tx, events));
+        let payloads = drain_sse(sse).await;
+        let done: serde_json::Value = serde_json::from_str(&payloads[payloads.len() - 2]).unwrap();
+        assert_eq!(
+            done["usage"]["prompt_tokens_details"]["cached_tokens"], 0,
+            "cache miss MUST serialize cached_tokens: 0 explicitly, not omit \
+             prompt_tokens_details"
+        );
     }
 
     #[tokio::test]
