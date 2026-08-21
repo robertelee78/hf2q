@@ -216,6 +216,8 @@ fn public_watchdog_fixture_consumers_share_the_canonical_digests() {
     let cancellation = include_str!("../../../scripts/test_qwen36_prefill_cancellation.sh");
     let deepseek_overlap = include_str!("../../../scripts/test_deepseek4_interactive_overlap.sh");
     let release_gate = include_str!("../../../scripts/run_agentic_cache_release_gate.sh");
+    let model_qualification_workflow =
+        include_str!("../../../.github/workflows/cache-lifecycle.yml");
     let release_workflow = include_str!("../../../.github/workflows/release.yml");
 
     for (name, script) in [
@@ -223,7 +225,6 @@ fn public_watchdog_fixture_consumers_share_the_canonical_digests() {
         ("cancellation", cancellation),
         ("deepseek overlap", deepseek_overlap),
         ("release gate", release_gate),
-        ("release workflow", release_workflow),
     ] {
         assert!(
             script.contains(REQUEST_SHA256),
@@ -234,6 +235,14 @@ fn public_watchdog_fixture_consumers_share_the_canonical_digests() {
             "{name} must reject the historical key-sorted fixture digest"
         );
     }
+    assert!(
+        model_qualification_workflow.contains("scripts/run_agentic_cache_release_gate.sh"),
+        "model qualification workflow must invoke the gate that owns the fixture digest"
+    );
+    assert!(
+        !release_workflow.contains(REQUEST_SHA256),
+        "release workflow must not own model-qualification fixture digests"
+    );
     for (name, script) in [("watchdog", watchdog), ("cancellation", cancellation)] {
         assert!(
             script.contains(RUNTIME_REQUEST_SHA256),
