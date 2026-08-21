@@ -155,10 +155,77 @@ compatibility.
 The narrow hosted bridge makes Q3_K_M, Q4_K_M, Q6_K, and Q8_0 selectable.
 Q5_K_M is recognized and displayed but unavailable until artifact file type is
 separated from ADR-005's conversion-policy identity. BF16, split GGUFs, and
-`mmproj` companions are likewise visible with explicit reasons. This slice
-does not merge hf2q conversion-cache entries into the picker: those historical
-entries do not yet provide authoritative emitted-artifact identity. Catalog
+`mmproj` companions are likewise visible with explicit reasons. Catalog
 resolution transfers no model payload.
+
+### Receipt-backed local artifact discovery amendment (2026-08-21)
+
+The hosted-only boundary above was correct for legacy cache entries, but it is
+not correct for every artifact hf2q now produces. Schema-v3 conversion
+receipts bind the exact Hugging Face repository, source revision, emitted byte
+length, output SHA-256, converter identity, and quant selector. Modern
+`ModelCache` quant entries likewise bind a canonical managed path, byte length,
+output SHA-256, and quant. Those are sufficient authorities for discovery as
+long as activation revalidates the bytes rather than trusting a filename.
+
+The server therefore advertises the additive
+`hf2q.local-artifact-resolution.v1` capability and exposes authenticated
+`GET /hf2q/v1/models/local-artifacts`. Hosted
+`hf2q.artifact-resolution.v2` remains unchanged so old clients and servers
+retain their current behavior. The local route accepts an optional bare
+repository filter; without one it supplies the initial picker for an empty
+chat-owned server.
+
+Local means local to the server, never to an arbitrary HTTP client. The
+inventory examines only the server startup directory's `models/` tree,
+repeatable explicit `serve --model-dir DIR` roots, and the canonical hf2q
+`ModelCache` manifest. Roots, traversal depth, visited entries, receipts,
+receipt bytes, candidates, public strings, and warnings are bounded. Roots and
+descendants are rechecked without following symlinks. A cache entry is eligible
+only when its path equals `cache_model_path(root, repository, quant)`; a
+manifest cannot grant authority to another path.
+
+For a conversion receipt, the sibling `<artifact>.gguf.receipt.json` names the
+candidate. Its recorded `output.path` is relocatable evidence and is never
+dereferenced. The sibling must be a regular non-symlink file inside the
+configured root with the recorded size. Cataloging performs a cheap supported-
+quant/header preflight but deliberately does not hash every potentially large
+artifact. Unsupported local selectors such as BF16 remain visible as disabled
+rows with the current loader limitation rather than disappearing.
+
+Paths and output digests never cross the HTTP catalog boundary. The server
+retains them behind the same bounded, ten-minute opaque candidate authority
+used by hosted selection. Receipt-backed local rows precede managed-cache rows;
+both precede hosted rows. Duplicate output digests are deterministic, with a
+schema-v3 receipt outranking matching cache metadata, while conflicting size or
+quant claims for one digest fail closed. Public rows contain only repository,
+revision, basename, bytes, quant hint, origin, role, selectability, and reason.
+
+Resolution order is resident, receipt-backed local, managed cache, then hosted.
+`--quant` and `--artifact` return immediately for one local match and perform
+zero Hub work. Local ambiguity fails before Hub access. Without a selector,
+the picker presents local rows and an explicit `Browse hosted artifacts` row;
+a Hub outage cannot make an already-local candidate unusable. Missing paths
+such as `./models/missing.gguf` remain paths and never become accidental Hub
+repository requests. Every string received from an endpoint is escaped before
+terminal rendering.
+
+Admission still runs before expensive preparation. After a non-evicting plan
+fits, or after the operator confirms an exact switch receipt, the server starts
+one independently bounded direct-child verifier. It rechecks root containment,
+regular-file and non-symlink status, byte length, complete SHA-256, supported
+GGUF header type, quant identity, and the file snapshot before returning a path
+receipt. The existing `PreparationSupervisor` owns cancellation and exact
+reaping; `--no-integrity` never bypasses this candidate check. Pool state is
+replanned before publication. A loaded engine retains its GGUF path so a later
+catalog of the same local artifact returns the existing resident rather than
+creating an alias.
+
+The filesystem boundary is cooperative between processes running as the same
+OS user. Re-stat and digest checks detect ordinary replacement before load, but
+eliminating the final pathname race completely would require an fd-bound
+`mlx-native` loader. hf2q does not claim protection from a same-user process
+actively rewriting model files during activation.
 
 When one repository exposes multiple selectable hosted GGUFs, interactive
 chat shows a numbered picker. `--quant` is non-interactive only when it
@@ -335,7 +402,12 @@ Implementation is not complete until all of the following are proven:
 10. hosted-selection tests prove immutable candidate binding across mutable
     branch changes, bounded metadata/transfer concurrency, Q5/BF16/split/mmproj
     rejection, zero transfer on conflict or stale switch, authoritative
-    request identity, and no implicit safetensors conversion.
+    request identity, and no implicit safetensors conversion; and
+11. local-selection tests prove schema-v3 and canonical-cache discovery,
+    bounded/symlink-safe traversal, no path or digest serialization, local-first
+    selector behavior with zero Hub work, repository-bound opaque authority,
+    post-catalog digest/header rejection before loading, verifier cancellation
+    and reaping, and successful activation of a real hf2q-produced GGUF.
 
 ## Validation evidence
 
@@ -485,6 +557,58 @@ receipt. On the macOS 26.5 M5 Max release host:
 
 These receipts close the correction's complete local Kata gate. Publication
 and merge remain subject to the repository's exact-commit GitHub checks.
+
+### Receipt-backed local selection correction (2026-08-21)
+
+The reported local-selection failure had a separate root cause from hosted
+selection: `chat --model owner/repository` called only the hosted catalog even
+when the exact artifact and its schema-v3 receipt were already below the
+server's `models/` directory. The obsolete design assumption was that local
+cache records did not identify emitted bytes. The smallest spike against the
+operator's current receipt disproved that assumption: it binds repository,
+source revision, byte length, output SHA-256, converter identity, and quant,
+while the sibling GGUF header independently binds its file type.
+
+The fail-first receipt test returned zero candidates before the new inventory
+was connected. The corrected implementation is based on `origin/main`
+`ccfa4dc3` and produced the following evidence on the same arm64 128 GiB host:
+
+- `cargo check --locked --all-targets --all-features`,
+  `cargo build --release --locked`, and the full `cargo test --locked`
+  workspace gate passed. Focused gates additionally passed 42/42 chat tests,
+  10/10 local-inventory/verifier tests, and the generated-completion tests;
+- adversarial tests reject symlink roots and artifacts, traversal, stale size,
+  wrong repository, malformed receipt authority, noncanonical cache paths,
+  digest or quant mutation after cataloging, and late-created or oversized
+  input outside the bounded policy. HTTP serialization tests prove local paths
+  and output digests stay server-private;
+- the Claude-Flow full/input-validation security scan reported zero findings.
+  `cargo audit --file Cargo.lock` found zero vulnerabilities and repeated only
+  the three already-allowed unmaintained transitive `bincode` and `paste`
+  warnings recorded by the preceding correction;
+- a release server launched from `/opt/hf2q` with no model and no explicit
+  model root discovered the real schema-v3 artifact for
+  `jenerallee78/Qwen3.8-27B-Abliterated-SFT`: revision
+  `08c2f075b43bc06456382db6b918a3dcabdcf4dd`, basename
+  `Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf`, 16,810,714,848 bytes, and selector
+  Q4_K_M. Its public JSON contained an opaque candidate id but neither the
+  `/opt/hf2q` path nor output SHA-256;
+- the real TUI displayed that artifact first as `[local hf2q] Q4_K_M`, followed
+  by one explicit `[hosted] Browse hosted artifacts` action. With
+  `--quant Q4_K_M`, selection reached local integrity verification without a
+  Hub catalog request or safetensors transfer;
+- Ctrl-C during full-file verification of that 15.66 GiB candidate exited chat,
+  reaped the `__verify-local-gguf` child, left the manually launched server
+  healthy, and left no test listener after explicit server shutdown; and
+- after the concurrent ADR-046 source-teacher process exited, a fresh
+  no-model release server completed the same local selection and full SHA-256
+  verification, loaded all 64 Qwen layers through `mlx-native`, and published
+  pool revision 1 with exactly 16,810,714,848 resident bytes. Thinking-off chat
+  returned exactly `LOCAL_OK` (17 prompt, 2 completion tokens; 211.0 ms TTFT;
+  80.6 prompt tok/s; 27.1 decode tok/s). `/status` reported the opaque
+  `local://` request identity and external lifecycle. `/quit` left that
+  manually launched server healthy and resident; explicit Ctrl-C then stopped
+  the server and left no listener or model process.
 
 ## Consequences
 

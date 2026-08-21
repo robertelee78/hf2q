@@ -42,6 +42,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics", get(handlers::metrics))
         .route("/hf2q/v1/runtime", get(control::hf2q_runtime))
         .route("/hf2q/v1/models/catalog", get(control::hub_gguf_catalog))
+        .route(
+            "/hf2q/v1/models/local-artifacts",
+            get(control::local_gguf_catalog),
+        )
         .route("/hf2q/v1/models/activate", post(control::activate_model))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/models/:model_id", get(handlers::get_model))
@@ -1447,6 +1451,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(catalog_missing.status(), StatusCode::UNAUTHORIZED);
+        let local_catalog_missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/hf2q/v1/models/local-artifacts?model=owner%2Fmodel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local_catalog_missing.status(), StatusCode::UNAUTHORIZED);
 
         let runtime = app
             .clone()
@@ -1468,6 +1483,10 @@ mod tests {
             "hf2q.artifact-resolution.v2"
         );
         assert_eq!(
+            body["capabilities"]["local_artifact_resolution"],
+            "hf2q.local-artifact-resolution.v1"
+        );
+        assert_eq!(
             body["capabilities"]["diagnostic_no_evict_header"]["name"],
             "x-hf2q-diagnostic-no-evict"
         );
@@ -1475,6 +1494,26 @@ mod tests {
             body["capabilities"]["diagnostic_no_evict_header"]["value"],
             "1"
         );
+
+        let local_catalog = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/hf2q/v1/models/local-artifacts?model=owner%2Fmodel")
+                    .header(header::AUTHORIZATION, "Bearer diagnostic-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local_catalog.status(), StatusCode::OK);
+        let local_body: serde_json::Value =
+            serde_json::from_str(&body_string(local_catalog).await).unwrap();
+        assert_eq!(
+            local_body["schema_version"],
+            "hf2q.local-artifact-resolution.v1"
+        );
+        assert!(local_body["candidates"].as_array().unwrap().is_empty());
 
         let activation = app
             .oneshot(

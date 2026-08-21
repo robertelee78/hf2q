@@ -11,12 +11,14 @@ use super::endpoint::Endpoint;
 const RUNTIME_SCHEMA: &str = "hf2q.runtime.v1";
 const ACTIVATION_SCHEMA: &str = "hf2q.model-activation.v2";
 const ARTIFACT_SCHEMA: &str = "hf2q.artifact-resolution.v2";
+const LOCAL_ARTIFACT_SCHEMA: &str = "hf2q.local-artifact-resolution.v1";
 pub(crate) const NON_EVICTING_HEADER: &str = "x-hf2q-diagnostic-no-evict";
 
 pub(crate) struct Hf2qControl {
     http: reqwest::Client,
     endpoint: Endpoint,
     artifact_resolution: bool,
+    local_artifact_resolution: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +37,8 @@ struct RuntimeCapabilities {
     diagnostic_no_evict_header: Option<DiagnosticHeaderCapability>,
     #[serde(default)]
     artifact_resolution: Option<String>,
+    #[serde(default)]
+    local_artifact_resolution: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +115,48 @@ struct ArtifactCandidate {
     unavailable_reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LocalArtifactCatalog {
+    schema_version: String,
+    candidates: Vec<LocalArtifactCandidate>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LocalArtifactCandidate {
+    candidate_id: Option<String>,
+    repository: String,
+    filename: String,
+    bytes: u64,
+    quant_hint: String,
+    origin: String,
+    role: String,
+    selectable: bool,
+    unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactChoice {
+    candidate_id: Option<String>,
+    repository: Option<String>,
+    filename: String,
+    bytes: u64,
+    quant_hint: Option<String>,
+    origin: &'static str,
+    role: String,
+    selectable: bool,
+    unavailable_reason: Option<String>,
+}
+
+enum PickerSelection {
+    Candidate(String),
+    BrowseHosted,
+}
+
+pub(crate) struct InitialLocalSelection {
+    pub model: String,
+    pub candidate_id: String,
+}
+
 enum ActivationResult {
     Ready(ActivationSuccess),
     Conflict(ActivationConflict),
@@ -182,13 +228,14 @@ impl Hf2qControl {
             endpoint: endpoint.clone(),
             artifact_resolution: view.capabilities.artifact_resolution.as_deref()
                 == Some(ARTIFACT_SCHEMA),
+            local_artifact_resolution: view.capabilities.local_artifact_resolution.as_deref()
+                == Some(LOCAL_ARTIFACT_SCHEMA),
         }))
     }
 
-    /// Resolve a mixed Hub repository to one exact hosted GGUF before model
-    /// activation. Returning `None` means the model string is not a Hub
-    /// repository candidate and should retain ordinary activation semantics.
-    pub(crate) async fn select_hub_gguf(
+    /// Resolve a repository to a receipt-backed local GGUF first, then to a
+    /// hosted GGUF only when needed. No conversion is implicit.
+    pub(crate) async fn select_gguf(
         &self,
         model: &str,
         quant: Option<&str>,
@@ -201,11 +248,126 @@ impl Hf2qControl {
         if !looks_like_hub && quant.is_none() && artifact.is_none() {
             return Ok(None);
         }
-        if !self.artifact_resolution {
+        if !self.artifact_resolution && !self.local_artifact_resolution {
             bail!(
-                "this hf2q endpoint does not advertise hosted-GGUF selection; use a local GGUF path or upgrade the server"
+                "this hf2q endpoint does not advertise GGUF selection; use an explicit local GGUF path or upgrade the server"
             );
         }
+        let local = if self.local_artifact_resolution {
+            self.fetch_local_artifacts(Some(model), auth_token).await?
+        } else {
+            Vec::new()
+        };
+        if let Some(filename) = artifact {
+            match exact_local_match(&local, filename)? {
+                Some(candidate_id) => return Ok(Some(candidate_id)),
+                None => {}
+            }
+        }
+        if let Some(quant) = quant {
+            match quant_local_match(&local, quant)? {
+                Some(candidate_id) => return Ok(Some(candidate_id)),
+                None => {}
+            }
+        }
+
+        if quant.is_none() && artifact.is_none() && local.iter().any(is_selectable_text_choice) {
+            let browse = self.artifact_resolution;
+            match pick_artifact(model, &local, browse, input, output)? {
+                PickerSelection::Candidate(candidate_id) => return Ok(Some(candidate_id)),
+                PickerSelection::BrowseHosted => {}
+            }
+        }
+
+        if !self.artifact_resolution {
+            bail!(
+                "no receipt-backed local GGUF matched, and this hf2q endpoint does not advertise hosted-GGUF selection"
+            );
+        }
+        let hosted = match self.fetch_hosted_artifacts(model, auth_token).await {
+            Ok(hosted) => hosted,
+            Err(error) if local.iter().any(is_selectable_text_choice) => {
+                writeln!(
+                    output,
+                    "hosted artifacts unavailable: {}; local artifacts remain selectable",
+                    terminal_safe(&format!("{error:#}"))
+                )?;
+                return match pick_artifact(model, &local, false, input, output)? {
+                    PickerSelection::Candidate(candidate_id) => Ok(Some(candidate_id)),
+                    PickerSelection::BrowseHosted => unreachable!("browse row was disabled"),
+                };
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(filename) = artifact {
+            return exact_hosted_match(&hosted, filename).map(Some);
+        }
+        if let Some(quant) = quant {
+            return quant_hosted_match(&hosted, quant).map(Some);
+        }
+        let mut combined = local;
+        combined.extend(hosted);
+        match pick_artifact(model, &combined, false, input, output)? {
+            PickerSelection::Candidate(candidate_id) => Ok(Some(candidate_id)),
+            PickerSelection::BrowseHosted => unreachable!("browse row was disabled"),
+        }
+    }
+
+    async fn fetch_local_artifacts(
+        &self,
+        model: Option<&str>,
+        auth_token: Option<&str>,
+    ) -> Result<Vec<ArtifactChoice>> {
+        let mut request = self
+            .http
+            .get(self.endpoint.route("/hf2q/v1/models/local-artifacts"));
+        if let Some(model) = model {
+            request = request.query(&[("model", model)]);
+        }
+        if let Some(token) = auth_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.context("catalog local hf2q GGUFs")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = read_text_bounded(response, "local GGUF catalog error").await?;
+            bail!(
+                "local GGUF catalog returned HTTP {status}: {}",
+                compact(&detail)
+            );
+        }
+        let catalog: LocalArtifactCatalog =
+            decode_json_bounded(response, "local GGUF catalog").await?;
+        if catalog.schema_version != LOCAL_ARTIFACT_SCHEMA {
+            bail!("hf2q returned an incompatible local-GGUF catalog");
+        }
+        Ok(catalog
+            .candidates
+            .into_iter()
+            .filter(|candidate| model.is_none_or(|expected| candidate.repository == expected))
+            .map(|candidate| ArtifactChoice {
+                candidate_id: candidate.candidate_id,
+                repository: Some(candidate.repository),
+                filename: candidate.filename,
+                bytes: candidate.bytes,
+                quant_hint: Some(candidate.quant_hint),
+                origin: if candidate.origin == "local_cache" {
+                    "local cache"
+                } else {
+                    "local hf2q"
+                },
+                role: candidate.role,
+                selectable: candidate.selectable,
+                unavailable_reason: candidate.unavailable_reason,
+            })
+            .collect())
+    }
+
+    async fn fetch_hosted_artifacts(
+        &self,
+        model: &str,
+        auth_token: Option<&str>,
+    ) -> Result<Vec<ArtifactChoice>> {
         let mut request = self
             .http
             .get(self.endpoint.route("/hf2q/v1/models/catalog"))
@@ -226,85 +388,81 @@ impl Hf2qControl {
         if catalog.schema_version != ARTIFACT_SCHEMA {
             bail!("hf2q returned an incompatible hosted-GGUF catalog");
         }
-        if let Some(filename) = artifact {
-            let selected = catalog
-                .candidates
-                .iter()
-                .find(|candidate| candidate.filename == filename)
-                .with_context(|| format!("hosted GGUF artifact `{filename}` was not found"))?;
-            ensure_selectable(selected)?;
-            return Ok(selected.candidate_id.clone());
-        }
-        let mut selectable = catalog
+        Ok(catalog
             .candidates
+            .into_iter()
+            .map(|candidate| ArtifactChoice {
+                candidate_id: candidate.candidate_id,
+                repository: Some(model.to_owned()),
+                filename: candidate.filename,
+                bytes: candidate.bytes,
+                quant_hint: candidate.quant_hint,
+                origin: "hosted",
+                role: candidate.role,
+                selectable: candidate.selectable,
+                unavailable_reason: candidate.unavailable_reason,
+            })
+            .collect())
+    }
+
+    pub(crate) async fn select_initial_local(
+        &self,
+        auth_token: Option<&str>,
+        input: &mut impl BufRead,
+        output: &mut impl Write,
+    ) -> Result<Option<InitialLocalSelection>> {
+        if !self.local_artifact_resolution {
+            return Ok(None);
+        }
+        let candidates = self.fetch_local_artifacts(None, auth_token).await?;
+        let selectable = candidates
             .iter()
-            .filter(|candidate| candidate.selectable && candidate.role == "text_model")
+            .filter(|candidate| is_selectable_text_choice(candidate))
             .collect::<Vec<_>>();
-        if let Some(quant) = quant {
-            selectable.retain(|candidate| {
-                candidate
-                    .quant_hint
-                    .as_deref()
-                    .is_some_and(|actual| actual.eq_ignore_ascii_case(quant))
-            });
-            match selectable.as_slice() {
-                [selected] => return Ok(selected.candidate_id.clone()),
-                [] => bail!("no selectable hosted GGUF matches --quant {quant}"),
-                _ => bail!(
-                    "--quant {quant} is ambiguous across {} artifacts; use --artifact",
-                    selectable.len()
-                ),
-            }
+        if selectable.is_empty() {
+            return Ok(None);
         }
-        match selectable.as_slice() {
-            [] => bail!(
-                "repository {model} has no compatible hosted text GGUF; source conversion is not implicit in diagnostic chat"
-            ),
-            [selected] => Ok(selected.candidate_id.clone()),
-            _ => {
-                writeln!(output, "hosted GGUF artifacts for {model}:")?;
-                for (index, candidate) in selectable.iter().enumerate() {
-                    writeln!(
-                        output,
-                        "  {}. {}  {}  {}",
-                        index + 1,
-                        candidate.quant_hint.as_deref().unwrap_or("unknown"),
-                        human_bytes(candidate.bytes),
-                        candidate.filename
-                    )?;
-                }
-                for candidate in catalog
-                    .candidates
-                    .iter()
-                    .filter(|candidate| !candidate.selectable)
-                {
-                    writeln!(
-                        output,
-                        "  - {}  {} [{}]",
-                        candidate.quant_hint.as_deref().unwrap_or("unknown"),
-                        candidate.filename,
-                        candidate
-                            .unavailable_reason
-                            .as_deref()
-                            .unwrap_or("unavailable")
-                    )?;
-                }
-                write!(output, "GGUF> ")?;
-                output.flush()?;
-                let mut answer = String::new();
-                if input.read_line(&mut answer)? == 0 {
-                    bail!("input ended before a GGUF was selected; nothing was downloaded");
-                }
-                let index: usize = answer
-                    .trim()
-                    .parse()
-                    .context("GGUF selection must be a number")?;
-                let selected = selectable
-                    .get(index.checked_sub(1).context("GGUF selection starts at 1")?)
-                    .context("GGUF selection is out of range")?;
-                Ok(selected.candidate_id.clone())
+        let selected = if selectable.len() == 1 {
+            selectable[0]
+        } else {
+            writeln!(output, "local hf2q GGUF artifacts:")?;
+            for (index, candidate) in selectable.iter().enumerate() {
+                writeln!(
+                    output,
+                    "  {}. {}  {}  {}  {}",
+                    index + 1,
+                    terminal_safe(candidate.repository.as_deref().unwrap_or("unknown")),
+                    terminal_safe(candidate.quant_hint.as_deref().unwrap_or("unknown")),
+                    human_bytes(candidate.bytes),
+                    terminal_safe(&candidate.filename)
+                )?;
             }
-        }
+            write!(output, "artifact> ")?;
+            output.flush()?;
+            let mut answer = String::new();
+            if input.read_line(&mut answer)? == 0 {
+                bail!("input ended before a local artifact was selected");
+            }
+            let index: usize = answer
+                .trim()
+                .parse()
+                .context("artifact selection must be a number")?;
+            selectable
+                .get(
+                    index
+                        .checked_sub(1)
+                        .context("artifact selection starts at 1")?,
+                )
+                .copied()
+                .context("artifact selection is out of range")?
+        };
+        Ok(Some(InitialLocalSelection {
+            model: selected
+                .repository
+                .clone()
+                .context("local artifact omitted its repository")?,
+            candidate_id: selectable_id(selected)?,
+        }))
     }
 
     pub(crate) async fn probe_resident(
@@ -371,7 +529,8 @@ impl Hf2qControl {
                 writeln!(
                     output,
                     "model activation: {} (pool revision {})",
-                    success.status, success.pool_revision
+                    terminal_safe(&success.status),
+                    success.pool_revision
                 )?;
                 Ok(Some(
                     success.request_model.unwrap_or_else(|| model.to_owned()),
@@ -393,7 +552,7 @@ impl Hf2qControl {
                     writeln!(
                         output,
                         "  unload {} generation {} ({})",
-                        victim.pool_key,
+                        terminal_safe(&victim.pool_key),
                         victim.generation,
                         human_bytes(victim.bytes_resident)
                     )?;
@@ -430,7 +589,10 @@ impl Hf2qControl {
                         ))
                     }
                     ActivationResult::Ready(success) => {
-                        bail!("hf2q returned unexpected switch status {}", success.status)
+                    bail!(
+                        "hf2q returned unexpected switch status {}",
+                        terminal_safe(&success.status)
+                    )
                     }
                     ActivationResult::Conflict(_) => {
                         bail!("the model pool changed before the switch; select the model again")
@@ -504,7 +666,7 @@ impl Hf2qControl {
             .pool
             .resident
             .iter()
-            .map(|resident| resident.pool_key.as_str())
+            .map(|resident| terminal_safe(&resident.pool_key))
             .collect::<Vec<_>>();
         writeln!(
             output,
@@ -526,26 +688,210 @@ impl Hf2qControl {
 
 pub(crate) fn looks_like_hub_model(model: &str) -> bool {
     model.starts_with("https://huggingface.co/")
-        || (model.contains('/') && !std::path::Path::new(model).exists())
+        || (!model.contains("://")
+            && !model.starts_with('.')
+            && !std::path::Path::new(model).is_absolute()
+            && crate::serve::auto_pipeline::looks_like_hf_repo_id(model))
 }
 
-fn ensure_selectable(candidate: &ArtifactCandidate) -> Result<()> {
-    if candidate.selectable && candidate.role == "text_model" {
-        if candidate.candidate_id.is_some() {
-            Ok(())
-        } else {
-            bail!("hf2q returned a selectable artifact without activation authority")
-        }
-    } else {
+fn is_selectable_text_choice(candidate: &ArtifactChoice) -> bool {
+    candidate.selectable && candidate.role == "text_model" && candidate.candidate_id.is_some()
+}
+
+fn selectable_id(candidate: &ArtifactChoice) -> Result<String> {
+    if !candidate.selectable || candidate.role != "text_model" {
         bail!(
-            "hosted GGUF artifact `{}` is unavailable: {}",
-            candidate.filename,
-            candidate
-                .unavailable_reason
-                .as_deref()
-                .unwrap_or("unknown reason")
-        )
+            "GGUF artifact `{}` is unavailable: {}",
+            terminal_safe(&candidate.filename),
+            terminal_safe(
+                candidate
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("unknown reason")
+            )
+        );
     }
+    candidate
+        .candidate_id
+        .clone()
+        .context("hf2q returned a selectable artifact without activation authority")
+}
+
+fn exact_local_match(candidates: &[ArtifactChoice], filename: &str) -> Result<Option<String>> {
+    let matches = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.origin != "hosted"
+                && candidate.filename == filename
+                && is_selectable_text_choice(candidate)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [selected] => selectable_id(selected).map(Some),
+        _ => bail!(
+            "--artifact {} is ambiguous across {} local artifacts; use the numbered picker or an explicit GGUF path",
+            terminal_safe(filename),
+            matches.len()
+        ),
+    }
+}
+
+fn quant_local_match(candidates: &[ArtifactChoice], quant: &str) -> Result<Option<String>> {
+    let matches = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.origin != "hosted"
+                && candidate
+                    .quant_hint
+                    .as_deref()
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(quant))
+                && is_selectable_text_choice(candidate)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [selected] => selectable_id(selected).map(Some),
+        _ => bail!(
+            "--quant {} is ambiguous across {} local artifacts; use --artifact or the numbered picker",
+            terminal_safe(quant),
+            matches.len()
+        ),
+    }
+}
+
+fn exact_hosted_match(candidates: &[ArtifactChoice], filename: &str) -> Result<String> {
+    let matches = candidates
+        .iter()
+        .filter(|candidate| candidate.filename == filename)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => bail!(
+            "hosted GGUF artifact `{}` was not found",
+            terminal_safe(filename)
+        ),
+        [selected] => selectable_id(selected),
+        _ => bail!(
+            "hosted GGUF artifact `{}` is ambiguous across {} entries",
+            terminal_safe(filename),
+            matches.len()
+        ),
+    }
+}
+
+fn quant_hosted_match(candidates: &[ArtifactChoice], quant: &str) -> Result<String> {
+    let matches = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .quant_hint
+                .as_deref()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(quant))
+                && is_selectable_text_choice(candidate)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => bail!(
+            "no selectable hosted GGUF matches --quant {}",
+            terminal_safe(quant)
+        ),
+        [selected] => selectable_id(selected),
+        _ => bail!(
+            "--quant {} is ambiguous across {} hosted artifacts; use --artifact",
+            terminal_safe(quant),
+            matches.len()
+        ),
+    }
+}
+
+fn pick_artifact(
+    model: &str,
+    candidates: &[ArtifactChoice],
+    browse_hosted: bool,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<PickerSelection> {
+    let selectable = candidates
+        .iter()
+        .filter(|candidate| is_selectable_text_choice(candidate))
+        .collect::<Vec<_>>();
+    if selectable.is_empty() && !browse_hosted {
+        bail!(
+            "repository {} has no compatible GGUF; source conversion is not implicit in diagnostic chat",
+            terminal_safe(model)
+        );
+    }
+    if selectable.len() == 1 && !browse_hosted {
+        return Ok(PickerSelection::Candidate(selectable_id(selectable[0])?));
+    }
+    writeln!(output, "GGUF artifacts for {}:", terminal_safe(model))?;
+    for (index, candidate) in selectable.iter().enumerate() {
+        writeln!(
+            output,
+            "  {}. [{}] {}  {}  {}",
+            index + 1,
+            candidate.origin,
+            terminal_safe(candidate.quant_hint.as_deref().unwrap_or("unknown")),
+            human_bytes(candidate.bytes),
+            terminal_safe(&candidate.filename)
+        )?;
+    }
+    let browse_index = browse_hosted.then_some(selectable.len() + 1);
+    if let Some(index) = browse_index {
+        writeln!(output, "  {index}. [hosted] Browse hosted artifacts")?;
+    }
+    for candidate in candidates.iter().filter(|candidate| !candidate.selectable) {
+        writeln!(
+            output,
+            "  - [{}] {}  {} [{}]",
+            candidate.origin,
+            terminal_safe(candidate.quant_hint.as_deref().unwrap_or("unknown")),
+            terminal_safe(&candidate.filename),
+            terminal_safe(
+                candidate
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            )
+        )?;
+    }
+    write!(output, "artifact> ")?;
+    output.flush()?;
+    let mut answer = String::new();
+    if input.read_line(&mut answer)? == 0 {
+        bail!("input ended before an artifact was selected; nothing was downloaded");
+    }
+    let index: usize = answer
+        .trim()
+        .parse()
+        .context("artifact selection must be a number")?;
+    if browse_index == Some(index) {
+        return Ok(PickerSelection::BrowseHosted);
+    }
+    let selected = selectable
+        .get(
+            index
+                .checked_sub(1)
+                .context("artifact selection starts at 1")?,
+        )
+        .context("artifact selection is out of range")?;
+    Ok(PickerSelection::Candidate(selectable_id(selected)?))
+}
+
+pub(crate) fn terminal_safe(value: &str) -> String {
+    const MAX_CHARS: usize = 256;
+    let mut rendered = String::new();
+    for character in value.chars().take(MAX_CHARS) {
+        if character.is_control() || character == '\u{1b}' {
+            rendered.extend(character.escape_default());
+        } else {
+            rendered.push(character);
+        }
+    }
+    if value.chars().count() > MAX_CHARS {
+        rendered.push('…');
+    }
+    rendered
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -562,11 +908,12 @@ fn human_bytes(bytes: u64) -> String {
 fn compact(value: &str) -> String {
     const MAX: usize = 512;
     let one_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= MAX {
+    let compacted = if one_line.chars().count() <= MAX {
         one_line
     } else {
         format!("{}…", one_line.chars().take(MAX).collect::<String>())
-    }
+    };
+    terminal_safe(&compacted)
 }
 
 #[cfg(test)]
@@ -681,6 +1028,162 @@ mod tests {
         }))
     }
 
+    async fn runtime_with_local() -> Json<Value> {
+        let mut value = runtime().await.0;
+        value["capabilities"]["local_artifact_resolution"] =
+            Value::String(LOCAL_ARTIFACT_SCHEMA.into());
+        Json(value)
+    }
+
+    async fn local_catalog() -> Json<Value> {
+        Json(serde_json::json!({
+            "schema_version": LOCAL_ARTIFACT_SCHEMA,
+            "candidates": [
+                {"candidate_id":"local-q4","repository":"owner/mixed","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filename":"model-q4_k_m.gguf","bytes":16810714848_u64,"quant_hint":"Q4_K_M","origin":"local_receipt","role":"text_model","selectable":true,"unavailable_reason":null},
+                {"candidate_id":null,"repository":"owner/mixed","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filename":"model-bf16.gguf","bytes":54000000000_u64,"quant_hint":"BF16","origin":"local_receipt","role":"text_model","selectable":false,"unavailable_reason":"GGUF quant is not supported by the current mlx-native diagnostic loader"}
+            ]
+        }))
+    }
+
+    #[tokio::test]
+    async fn local_quant_and_picker_complete_without_hub_catalog_work() {
+        #[derive(Clone, Default)]
+        struct Calls(Arc<std::sync::atomic::AtomicUsize>);
+        async fn hosted(State(calls): State<Calls>) -> Json<Value> {
+            calls.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            catalog().await
+        }
+        let calls = Calls::default();
+        let router = Router::new()
+            .route("/hf2q/v1/runtime", get(runtime_with_local))
+            .route("/hf2q/v1/models/local-artifacts", get(local_catalog))
+            .route("/hf2q/v1/models/catalog", get(hosted))
+            .with_state(calls.clone());
+        let (endpoint, stop) = serve(router).await;
+        let control = Hf2qControl::detect(&reqwest::Client::new(), &endpoint, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let selected = control
+            .select_gguf(
+                "owner/mixed",
+                Some("q4_k_m"),
+                None,
+                None,
+                &mut std::io::Cursor::new(Vec::<u8>::new()),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.as_deref(), Some("local-q4"));
+        assert_eq!(calls.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let mut output = Vec::new();
+        let selected = control
+            .select_gguf(
+                "owner/mixed",
+                None,
+                None,
+                None,
+                &mut std::io::Cursor::new(b"1\n"),
+                &mut output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.as_deref(), Some("local-q4"));
+        assert_eq!(calls.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("[local hf2q] Q4_K_M"));
+        assert!(output.contains("Browse hosted artifacts"));
+        assert!(output.contains("BF16"));
+
+        let initial = control
+            .select_initial_local(
+                None,
+                &mut std::io::Cursor::new(Vec::<u8>::new()),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.model, "owner/mixed");
+        assert_eq!(initial.candidate_id, "local-q4");
+        let _ = stop.send(());
+    }
+
+    #[test]
+    fn terminal_control_sequences_are_rendered_as_text() {
+        let rendered = terminal_safe("model\u{1b}]52;c;secret\u{7}\nnext");
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+        assert!(!rendered.contains('\n'));
+        assert!(rendered.contains("\\u{1b}"));
+        assert!(rendered.contains("\\n"));
+    }
+
+    #[test]
+    fn ambiguous_local_selector_fails_before_any_hosted_fallback() {
+        let candidate = |id: &str, filename: &str| ArtifactChoice {
+            candidate_id: Some(id.into()),
+            repository: Some("owner/model".into()),
+            filename: filename.into(),
+            bytes: 42,
+            quant_hint: Some("Q4_K_M".into()),
+            origin: "local hf2q",
+            role: "text_model".into(),
+            selectable: true,
+            unavailable_reason: None,
+        };
+        let candidates = vec![candidate("a", "one.gguf"), candidate("b", "two.gguf")];
+        let error = quant_local_match(&candidates, "q4_k_m").unwrap_err();
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn missing_local_paths_are_not_reclassified_as_hub_repositories() {
+        assert!(looks_like_hub_model("owner/model"));
+        assert!(looks_like_hub_model("https://huggingface.co/owner/model"));
+        assert!(!looks_like_hub_model("./models/missing.gguf"));
+        assert!(!looks_like_hub_model("/models/missing.gguf"));
+        assert!(!looks_like_hub_model(
+            "local://owner/model@revision/candidate"
+        ));
+    }
+
+    #[tokio::test]
+    async fn hosted_failure_after_browse_preserves_local_selection() {
+        async fn unavailable() -> (StatusCode, &'static str) {
+            (StatusCode::SERVICE_UNAVAILABLE, "offline")
+        }
+        let router = Router::new()
+            .route("/hf2q/v1/runtime", get(runtime_with_local))
+            .route("/hf2q/v1/models/local-artifacts", get(local_catalog))
+            .route("/hf2q/v1/models/catalog", get(unavailable));
+        let (endpoint, stop) = serve(router).await;
+        let control = Hf2qControl::detect(&reqwest::Client::new(), &endpoint, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut output = Vec::new();
+        let selected = control
+            .select_gguf(
+                "owner/mixed",
+                None,
+                None,
+                None,
+                &mut std::io::Cursor::new(b"2\n"),
+                &mut output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.as_deref(), Some("local-q4"));
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("local artifacts remain selectable"));
+        let _ = stop.send(());
+    }
+
     #[tokio::test]
     async fn hosted_gguf_quant_and_picker_select_exact_artifact_without_transfer() {
         let router = Router::new()
@@ -694,7 +1197,7 @@ mod tests {
 
         let mut unused = std::io::Cursor::new(Vec::<u8>::new());
         let q6 = control
-            .select_hub_gguf(
+            .select_gguf(
                 "owner/mixed",
                 Some("q6_k"),
                 None,
@@ -709,7 +1212,7 @@ mod tests {
         let mut picker = std::io::Cursor::new(b"1\n");
         let mut output = Vec::new();
         let picked = control
-            .select_hub_gguf("owner/mixed", None, None, None, &mut picker, &mut output)
+            .select_gguf("owner/mixed", None, None, None, &mut picker, &mut output)
             .await
             .unwrap();
         assert_eq!(picked.as_deref(), Some("q6-candidate"));

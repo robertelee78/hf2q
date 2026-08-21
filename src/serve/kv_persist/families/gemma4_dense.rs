@@ -1812,6 +1812,7 @@ mod tests {
         Arc::new(LoadedEngine {
             engine: TestEngine,
             repo: repo.to_string(),
+            gguf_path: std::path::PathBuf::new(),
             quant,
             bytes_resident: 1 << 30,
             loaded_at: SystemTime::now(),
