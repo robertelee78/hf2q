@@ -14,7 +14,7 @@ const PROFILE_BYTES: &[u8] = include_bytes!(
     "../../../../../../data/calibration/qwen38-source-teacher-canary-v1/profile.json"
 );
 pub(super) const PROFILE_SHA256: &str =
-    "9f8fe69a79a5348f847e67e0dd1b5b45f6ed98f1b6735690484c77d19b6334cb";
+    "ecbb9a9a6f757fca9984ace998ae8a6ba3219c6d9a052c7727c00ec399749dd1";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
