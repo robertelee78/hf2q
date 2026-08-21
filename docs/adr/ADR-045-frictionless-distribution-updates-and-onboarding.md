@@ -933,6 +933,14 @@ checks, exact download, rollback, uninstall, and atomic publisher remain the
 sole distribution implementation. That removal landed on main in merge commit
 `ccfa4dc368e2d2274d3234e75e10a69d9da56e0f` after exact-head CI passed.
 
+The separately scoped OpenCode, Agentic Kit, and local search/fetch materials
+remain available in `docs/hf2q+qwen3.8+ak+search-fetch-setup.md` and their own
+installer/tests. They are not the canonical first-run journey and do not run
+from ADR-045's shipping-contract gate. README, setup, and architecture pointers
+lead with `docs/getting-started.md`; the integration guide is labeled optional
+and cannot demote native conversion or make third-party infrastructure a CLI
+release requirement.
+
 What is not yet the corrected product:
 
 - the complete guide/update/uninstall journey from a distinct clean macOS

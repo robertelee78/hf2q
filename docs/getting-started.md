@@ -1,10 +1,5 @@
 # Get started with hf2q and Qwen3.8
 
-For the complete verified multimodal download, stock OpenCode, full Agentic
-Kit, and local search/fetch/crawl/extract journey, use
-**[hf2q + Qwen3.8 + AK + search/fetch: complete setup](hf2q+qwen3.8+ak+search-fetch-setup.md)**.
-The source-first core CLI journey remains below.
-
 This guide installs hf2q, configures it for one Mac, converts and quantizes an
 exact Hugging Face source revision with hf2q, serves the resulting GGUF, and
 opens a local terminal chat. Those are ordinary hf2q commands; there is no

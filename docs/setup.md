@@ -112,5 +112,5 @@ An invalid config fails before source download, model load, or listener bind.
 If setup records LAN binding (`0.0.0.0`), serve also requires `--auth-token` or
 `HF2Q_AUTH_TOKEN`; setup never stores the token.
 
-See [hf2q + Qwen3.8 + AK + search/fetch: complete setup](hf2q+qwen3.8+ak+search-fetch-setup.md) for the complete
-tested workflow using these defaults.
+See [Get started with hf2q and Qwen3.8](getting-started.md) for the complete
+tested hf2q workflow using these defaults.
