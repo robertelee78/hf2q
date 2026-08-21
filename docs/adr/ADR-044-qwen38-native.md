@@ -375,6 +375,29 @@ source syntax all passed in every arm. Lighter-load strict runs measured
 remains host-sensitive and open; this evidence accepts the bounded incremental
 speedup, not closure of the broader latency gate.
 
+Post-merge validation on source
+`cc0d99ae60a019c44133fe75a23f296a951e6afc` used release binary SHA-256
+`6d7535c9a958d754e5c1518303ad359647537bd77682d7440051859ef3331234`
+and the same Q4_K_M artifact. The opt-in real-artifact width-four gate executed
+one test (not a filtered or skipped run) and passed four sequential-versus-
+batched target decisions, native route assertions, hybrid-cache state, and
+eight continuation decisions. A fresh OFF/AUTO/AUTO/OFF receipt preserved all
+24 deterministic choices. Code wall-time median fell from 4.754997 to
+3.092766 seconds, a 53.746% throughput improvement; repeat-heavy median fell
+from 2.626848 to 1.444434 seconds, an 81.860% improvement. The AUTO arms
+recorded 314 verified proposer rounds and 804 accepted draft tokens.
+
+The full-context coding gate on that exact binary also passed required and
+automatic tool calls, SSE reconstruction, tool-result continuation, source
+syntax, and exact cached replay. The continuation reused 7,019 of 10,886
+prompt tokens and processed a 3,867-token suffix in 9.954 seconds. This is an
+exact-SHA pass of the 10-second gate, not evidence of comfortable latency
+margin: an unrelated foreground application was consuming substantial CPU,
+and the prior strict-run set still demonstrates host sensitivity. No thermal
+or power warning was recorded. The paired speculation receipt remains valid
+for relative OFF/AUTO behavior; the contended host state is not authority for
+an absolute cross-stack throughput claim.
+
 ### Vision candidate evidence (2026-08-16)
 
 The exact source revision above produced a 927,606,848-byte F16 projector with
