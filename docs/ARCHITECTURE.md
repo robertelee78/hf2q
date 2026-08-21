@@ -67,40 +67,10 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/preflight.rs     ADR-012 preflight checks (disk, token, …)
 ├── src/progress.rs      indicatif-based progress reporting
 ├── src/gguf_patch.rs    metadata-only GGUF rewriter (no tensor I/O)
-├── src/distribution/   ADR-045 release/install bounded context
-│   ├── standalone.rs  reachable single-binary lifecycle: channel marker,
-│   │   └── update.rs  stable record, exact download, Apple trust continuity,
-│   │                  thin-arm64 proof, Gatekeeper, rollback, and atomic
-│   │                  local publication
-│   ├── schema/         strict bounded manifest, receipt, marker schemas;
-│                       marker v2 records exact preparation-role versions and
-│                       deterministically reconstructs first-install receipts
-│   ├── install_state/  shared descriptor-relative installation lock,
-│       ├── metadata/   canonical crash-durable update-metadata journal;
-│       │                stored bytes are not cryptographic authority
-│       ├── extraction/ private exact-replay extraction tree, bounded retained
-│       │                stages, descriptor-relative crash recovery, and
-│       │                signed-mode prefix normalization plus exact-marker,
-│       │                no-replace prepared-version publication and recovery
-│       └── …           sequence-one activation and bounded restart cleanup
-│   ├── update_auth/    transport-free strict TUF profile, one-use request
-│                       tokens, historical replay floors, root-authorized
-│                       timestamp/snapshot recovery, sealed advancing
-│                       commit guard, and durable metadata-baseline proof;
-│                       all internal until the real root and public update
-│                       authority exist
-│   ├── update_transport/ closed Pages-metadata/pointer and GitHub-asset routes,
-│                       fresh verifier-request sessions, manual one-hop release
-│                       redirect, exact bounded bodies, and anonymous
-│                       same-FD streamed archive staging; no extraction,
-│                       prepared-version, installer, or CLI authority
-│   └── prepared_release/ bounded classic-ZIP structural/profile validation,
-│                       canonical embedded-manifest and exact payload binding,
-│                       shared-lock inert extraction, strict thin-arm64 Mach-O
-│                       and native Developer ID verification, plus double-
-│                       checked signed-mode normalization and dormant first-
-│                       install publication; no activation, update, or CLI
-│                       authority
+├── src/distribution/   ADR-045's reachable standalone release boundary
+│   └── standalone.rs  channel marker, bounded stable-record download,
+│       └── update.rs  exact checksum/Apple trust continuity, thin-arm64
+│                      proof, rollback, uninstall, and atomic publication
 │
 ├── .github/workflows/standalone-candidate.yml
 │                       exact packed build → protected ephemeral Developer ID
@@ -563,132 +533,17 @@ harness leans on three patterns:
 3. **End-gate smoke prompts.** `hf2q smoke` runs the arch's canonical
    prompts and asserts the model emits the expected first / stop
    tokens. Failure modes get distinct exit codes (see §7).
-4. **Isolated security spikes.** `tests/adr045_tuf_spike/` is an unpublished,
-   separately locked Rust 1.88 workspace. It compares signed-update verifiers
-   and crash-durable journal hypotheses without adding either candidate to the
-   production dependency graph or published crate. Its wire types grant no
-   production authority.
-5. **Installation identity boundary.** `distribution/install_state/identity.rs`
-   owns the 16 KiB canonical root-identity wire's descriptor-relative
-   publication and reopen protocol. A UUID-bearing exact-prefix intent is
-   full-synced before one no-replace final rename; real process-abort tests
-   exercise every durability barrier. The resulting non-cloneable capability
-   retains and repeats the exact root, update, lock, and identity inode/bytes.
-   Metadata, artifact staging, inert extraction, and first activation must
-   acquire/reopen through that capability rather than treating a path or
-   copied UUID as authority. The root inventory remains open for preserved
-   hf2q state, while the reserved `update/` identity inventory is bounded and
-   malformed residue is retained fail-closed.
-6. **Production signed-metadata boundary.** `distribution/update_auth/` uses
-   `sigstore-tuf::TrustedMetadataSet` as its only library verification state
-   machine behind hf2q's strict bounded profile. The stock `Updater`,
-   `FileStore`, and `Repository` APIs are not imported or used, and the
-   dependency's fetch/HTTP/TLS features are disabled. A retained Python-TUF
-   corpus, generated with canonical key IDs and a fully hashed dependency lock,
-   proves cross-implementation root rotation and lower-role authentication.
-   The closed root profile independently recomputes every canonical key ID and
-   accepts only exact Ed25519/Ed25519 keys with lowercase raw public bytes; key
-   IDs in maps, role bindings, and signatures use exact lowercase SHA-256 form.
-   Aliases, type/scheme mismatches, normalized key bytes, and extensions fail
-   before the library verification state machine.
-   The same bounded context now owns the structural `ChannelPointerV1`, typed
-   logical/consistent-snapshot target names, and a sealed current-time replay
-   that accepts one stable pointer plus complete retained release pairs. Pointer
-   binding exposes only the selected pointer/manifest/archive descriptors; it
-   is not generic target lookup or explicit downgrade authority. Before an
-   automatic plan can obtain artifact transport authority, the same shared
-   lock descriptor-relatively verifies the canonical active activation,
-   receipt, prepared version, installed marker, manifest, and payload twice.
-   That sealed floor rejects a lower numeric SemVer and same-version digest
-   equivocation, returns exact equality as a no-download `AlreadyCurrent`
-   outcome, and permits only a higher release or an explicitly absent
-   `current`. The exact active floor is rechecked before archive staging,
-   after network I/O, and at preparation-lock acquisition. Lock-held successor
-   authentication makes versioned pairs append-only by comparing the exact
-   selected predecessor and candidate before selector commit; the pointer may
-   move and new complete pairs may be appended, but old descriptors cannot be
-   rewritten or removed. The production module
-   still owns no URL, HTTP, download, archive extraction, activation, installer,
-   or CLI authority. The private sibling `distribution/update_transport/`
-   maps only those sealed typed artifact descriptors to fixed Pages/GitHub origins,
-   accepts at most one exact GitHub asset-CDN redirect, and verifies bounded
-   pointer/manifest bytes plus an unlinked same-FD streamed archive. A one-use
-   fetch capability replays the ordinary selected journal under the shared
-   installation lock before and after archive I/O and rejects generation or
-   clock drift. The result remains inert transport data: it grants no ZIP extraction,
-   codesign, prepared-version, activation, installer, or CLI authority. The
-   private `distribution/prepared_release/` boundary consumes that inert bundle,
-   revalidates the same anonymous archive descriptor, and uses a bounded custom
-   classic-ZIP parser before pinned `flate2` 1.1.9/`zlib-rs` proves exact raw
-   Deflate consumption and an actual `StreamEnd`; pinned `zip` 7.2.0 then
-   supplies an independent Stored/Deflate decode, CRC, and payload-digest view.
-   It requires canonical central/local layout, exact raw inventory/order/modes,
-   a byte-identical deterministic embedded manifest, and every streamed payload
-   digest. It then extracts only through directory descriptors into the
-   deterministic private `update/extractions/.extract-vVERSION-SHA256` stage.
-   At most eight retained stages are accepted. Raw extraction leaves files
-   `0600` and all directories `0700`; exact authenticated replay can reconstruct
-   torn scratch in the same inode, while unexpected names/types/modes/links fail
-   closed without deletion. The same shared installation lock brackets a
-   current-time selected-metadata replay before and after local I/O, and the
-   anonymous archive descriptor is revalidated on both sides. The sealed result
-   remains inert and grants no path/FD, prepared-version publication,
-   activation, installer, or CLI authority.
-   The same private boundary contains a dormant filesystem-free bounded read-at
-   validator for the exact thin arm64-ALL `MH_EXECUTE`/modern-dyld profile. It
-   proves segment, section, link-edit, entry-point, deployment, and terminal
-   code-signature structure. A sibling dormant macOS module pins the native
-   Security.framework wrappers, builds the closed Developer ID requirement,
-   validates all architectures with strict/trusted-anchor/no-network flags,
-   and type-checks the bounded signing-information dictionary, certificate
-   chain, timestamp, Hardened Runtime flags, entitlement absence, identifier,
-   Team ID, and leaf common name. Descriptor-relative acquisition now checks
-   the exact `bin/hf2q` path/inode/hash before and after each native call. The
-   first ephemeral Developer ID proof seals the live extraction namespace,
-   stage, executable path/inode, and exact manifest digest. Crash-resumable
-   signed-mode normalization rederives that binding before consuming the proof;
-   current TUF state is replayed again, and the same
-   path/inode must pass Mach-O and Developer ID verification a second time,
-   followed by a final complete normalized-tree identity/mode/size/hash replay.
-   Final-mode files/directories form canonical restart prefixes, and every
-   normalization/full-sync boundary has returned-error and real-process-abort
-   recovery proof. The retained-lock coordinator then writes a canonical marker
-   intent, moves the exact tree through `update/prepared/.pending-*`, repeats
-   current-time TUF plus Mach-O/Developer ID checks at the commit boundary, and
-   publishes `versions/VERSION` by no-replace rename. Every precommit error
-   leaves inert resumable state; every postcommit error is typed durability-
-   unknown and exact recovery repeats content, namespace, media, marker, and
-   native checks. Install-state can commit only through a one-use update-auth
-   guard sampled after its final namespace rebind; a receipt-bound final token
-   samples again after every postcommit durability check before minting
-   `AuthenticatedPreparedVersion`. Metadata cannot advance while an intent or
-   unactivated version exists. The 28 returned-error
-   and 28 real-process-abort barriers, hostile residue, namespace replacement,
-   clock equality/rollback, and first-activation bridge are covered. The only
-   signing-policy constructor is test-only; the real Team ID and protected
-   positive fixture are not yet present, so no production entry point can mint
-   this capability. No public activation, updater, installer, CLI, or deletion
-   authority is introduced.
-   The schema boundary now defines installed-version marker v2 and a narrow
-   first-standalone record builder. Marker v2 carries the exact metadata-role
-   versions needed to regenerate the same install-receipt-v1 transition after
-   a crash, and first activation requires full equality with that derived
-   receipt rather than trusting only its marker digest. Dormant marker-v1
-   fixture bytes are rejected fail-closed. This
-   builder remains structural output and cannot authenticate or publish a
-   prepared version without the sealed retained-lock coordinator above.
-   The sibling transport now consumes one verifier-issued metadata request at
-   a time from the exact Pages metadata route, maps only a next-root 404 to an
-   absence proof, independently enforces role caps, and durably commits only a
-   completed transcript after restart cleanup and lock-held reauthentication.
-   It remains dormant because no production root factory or public coordinator
-   exists.
-   Fresh-process recovery repairs the selected
-   rollback floor, crash-durably discards only the derived exact unselected
-   write prefix, and requires a wholly fresh transcript. An authenticated root
-   transition that changes the effective timestamp or snapshot authorization
-   may reset only those two floors; the sealed receipt binds the exact prior
-   and final roots, while root and targets floors remain monotonic.
+4. **Reachable distribution contracts.** The standalone installer/updater owns
+   one exact signed executable, one channel marker, one lock, and one retained
+   rollback executable. Tests exercise install, rollback, corrupt-candidate
+   rejection, and data-preserving uninstall through the same code shipped in
+   the CLI; retained release evidence additionally proves the public
+   already-current update journey. Apple signing and notarization are performed
+   by the protected release workflow; the runtime verifies exact size/digest,
+   thin-arm64 shape, Developer ID continuity, and the online notarization
+   requirement before atomic replacement. The removed TUF verifier, metadata
+   journal, archive parser, prepared-version graph, and installation-identity
+   experiment remain available in git history but are not product architecture.
    The external-model input boundary parses bounded Hugging Face references,
    resolves them through the official Hub to an immutable commit, downloads
    only the authenticated index-selected source inventory, and writes an

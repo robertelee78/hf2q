@@ -130,19 +130,11 @@ pub(super) fn persist(
     config: &OperatorConfigV2,
     expected: &[u8],
     observed: &ExistingConfig,
-    state_binding: &crate::distribution::SetupStateRootBinding,
 ) -> Result<bool, SetupError> {
-    persist_with_hook(
-        root_path,
-        config,
-        expected,
-        observed,
-        state_binding,
-        |barrier| {
-            abort_at_test_barrier(barrier);
-            Ok(())
-        },
-    )
+    persist_with_hook(root_path, config, expected, observed, |barrier| {
+        abort_at_test_barrier(barrier);
+        Ok(())
+    })
 }
 
 fn persist_with_hook(
@@ -150,7 +142,6 @@ fn persist_with_hook(
     config: &OperatorConfigV2,
     expected: &[u8],
     observed: &ExistingConfig,
-    state_binding: &crate::distribution::SetupStateRootBinding,
     mut hook: impl FnMut(SetupBarrier) -> Result<(), SetupError>,
 ) -> Result<bool, SetupError> {
     let (root, root_created) = if observed.root.is_some() {
@@ -177,10 +168,6 @@ fn persist_with_hook(
         ));
     }
     verify_lock(&root, LOCK_NAME, &lock)?;
-    state_binding
-        .revalidate()
-        .map_err(|error| SetupError::Filesystem(error.to_string()))?;
-
     let live_observed = observe_existing_config_from_root(&root)?;
     if !observed.matches(&live_observed) {
         return Err(SetupError::Filesystem(
@@ -196,9 +183,6 @@ fn persist_with_hook(
             full_sync_lock(&lock)?;
             hook(SetupBarrier::EndpointFullSynced)?;
             verify_root(root_path, &root)?;
-            state_binding
-                .revalidate()
-                .map_err(|error| SetupError::Filesystem(error.to_string()))?;
             verify_committed_config(&root, config, expected, live_observed.identity)?;
             verify_lock(&root, LOCK_NAME, &lock)?;
             return Ok(false);
@@ -229,9 +213,6 @@ fn persist_with_hook(
         ));
     }
     verify_lock(&root, LOCK_NAME, &lock)?;
-    state_binding
-        .revalidate()
-        .map_err(|error| SetupError::Filesystem(error.to_string()))?;
     verify_named(&root, PARTIAL_NAME, partial_identity)?;
     fs::renameat(root.fd.as_fd(), PARTIAL_NAME, root.fd.as_fd(), CONFIG_NAME)
         .map_err(|error| io_error("atomically replace config.toml", error))?;
@@ -246,17 +227,11 @@ fn persist_with_hook(
         hook(SetupBarrier::ConfigFullSynced)?;
         sync_directory(&root)?;
         verify_root(root_path, &root)?;
-        state_binding
-            .revalidate()
-            .map_err(|error| SetupError::Filesystem(error.to_string()))?;
         verify_committed_config(&root, config, expected, Some(partial_identity))?;
         verify_lock(&root, LOCK_NAME, &lock)?;
         full_sync_lock(&lock)?;
         hook(SetupBarrier::EndpointFullSynced)?;
         verify_root(root_path, &root)?;
-        state_binding
-            .revalidate()
-            .map_err(|error| SetupError::Filesystem(error.to_string()))?;
         verify_committed_config(&root, config, expected, Some(partial_identity))?;
         verify_lock(&root, LOCK_NAME, &lock)
     })();
@@ -272,9 +247,7 @@ pub(super) fn persist_with_test_hook(
     hook: impl FnMut(SetupBarrier) -> Result<(), SetupError>,
 ) -> Result<bool, SetupError> {
     let observed = observe_existing_config(root_path)?;
-    let state_binding = crate::distribution::verify_setup_state_root(root_path)
-        .map_err(|error| SetupError::Filesystem(error.to_string()))?;
-    persist_with_hook(root_path, config, expected, &observed, &state_binding, hook)
+    persist_with_hook(root_path, config, expected, &observed, hook)
 }
 
 #[cfg(test)]
@@ -285,9 +258,7 @@ pub(super) fn persist_observed_with_test_hook(
     observed: &ExistingConfig,
     hook: impl FnMut(SetupBarrier) -> Result<(), SetupError>,
 ) -> Result<bool, SetupError> {
-    let state_binding = crate::distribution::verify_setup_state_root(root_path)
-        .map_err(|error| SetupError::Filesystem(error.to_string()))?;
-    persist_with_hook(root_path, config, expected, observed, &state_binding, hook)
+    persist_with_hook(root_path, config, expected, observed, hook)
 }
 
 #[cfg(test)]
