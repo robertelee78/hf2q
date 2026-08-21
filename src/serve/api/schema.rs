@@ -388,6 +388,25 @@ impl ApiError {
             None,
         )
     }
+
+    /// Same wire shape as [`Self::capability_unsupported`] (501 + code
+    /// `"capability_unsupported"`) but with a caller-authored message,
+    /// for capability refusals that are not `MultiSeqKvCache` trait gaps
+    /// and where the ADR-040 suffix baked into the sibling constructor
+    /// would mislead the operator. First consumer: the guarantees
+    /// tune-up item-2 tool-calling gate (2026-08-20) — tools[] declared
+    /// under tool_choice=auto on a family with no registered tool-call
+    /// emitter refuses at request time instead of serving calls that
+    /// can be neither enforced nor parsed.
+    pub fn capability_unsupported_message(message: impl Into<String>) -> Self {
+        Self::bare(
+            StatusCode::NOT_IMPLEMENTED,
+            message.into(),
+            "server_error",
+            Some("capability_unsupported"),
+            None,
+        )
+    }
 }
 
 impl IntoResponse for ApiError {

@@ -4739,7 +4739,10 @@ fn compile_tool_grammar_with_registration(
     // arms `awaiting_trigger=true` for the lazy path.  The distinction
     // also matters for precondition strictness:
     //   * Required/Function: missing tools[] OR unknown family ⇒ Err(400)
-    //   * Auto              : missing tools[] OR unknown family ⇒ Ok(None)
+    //   * Auto              : missing tools[] ⇒ Ok(None); declared
+    //     tools[] + unknown family ⇒ Err(501 capability_unsupported)
+    //     (guarantees tune-up item 2, 2026-08-20 — fail closed instead
+    //     of serving unenforceable tool calls; ADR-005 dated note)
     let constrain = matches!(
         tool_choice,
         ToolChoiceValue::Required | ToolChoiceValue::Function(_)
@@ -4795,21 +4798,41 @@ fn compile_tool_grammar_with_registration(
     // as the no-tools branch: silent Ok(None) re-opens the wave-2.6
     // divergence. Operator-actionable answer is a 400.
     //
-    // Wave 3 W-B2: under Auto, missing registration is benign — we have
-    // no per-model tool-call format to constrain, so the engine runs
-    // unconstrained (same effective behaviour as pre-W-B2 Auto).  Auto's
-    // body-parse-failure → content fallback remains the safety net for
-    // unregistered families; the new Auto-lazy path only activates on
-    // registered ones.
+    // Guarantees tune-up item 2 (2026-08-20): the Auto branch used to
+    // return Ok(None) here (unconstrained engine, with the body-parse-
+    // failure → content fallback as the safety net). That fallback
+    // LEAKS malformed tool-call syntax into `delta.content` — the
+    // published fail-closed guarantee says a call that cannot be
+    // enforced or parsed must fail closed instead. We only reach this
+    // branch with tools[] non-empty (the tools-empty branch above
+    // already returned Ok(None) for Auto), so the caller is asking for
+    // tool calling on a family that cannot serve it: refuse at request
+    // time with the 501 `capability_unsupported` surface. Auto WITHOUT
+    // tools[] and tool_choice=none keep their pre-existing Ok(None);
+    // the registered-family Auto content fallback (peer parity) is
+    // untouched.
     let reg = match registration {
         Some(r) => r,
         None => {
             if !constrain {
-                // Auto + unknown family: no per-model grammar to compile.
-                // Auto allows no-call; the unconstrained engine path is
-                // safe because the post-decode body-parse-failure fallback
-                // handles malformed output as content.
-                return Ok(None);
+                tracing::warn!(
+                    model = %req.model,
+                    "tool_call_capability_unsupported: tools[] declared with \
+                     tool_choice=auto but the loaded family has no registered \
+                     tool_call_gbnf emitter; refusing with 501 rather than \
+                     serving tool calls that can be neither enforced nor parsed"
+                );
+                return Err(ApiError::capability_unsupported_message(format!(
+                    "tools[] declared (tool_choice=auto) but model '{}' has no \
+                     registered tool-call emitter: tool-call output could be \
+                     neither grammar-enforced nor reliably parsed, so the \
+                     request is refused rather than risking malformed calls \
+                     leaking into content. Use a registered family (e.g. \
+                     gemma4-27b-it, qwen3.6-27b-dwq46, deepseek-v4-flash) or \
+                     remove tools[] from the request",
+                    req.model
+                ))
+                .into_response());
             }
             let label = match tool_choice {
                 ToolChoiceValue::Required => "required",
@@ -5173,13 +5196,41 @@ mod compile_tool_grammar_precondition_tests {
         assert!(g.is_none(), "Auto policy is allowed to compile no grammar");
     }
 
-    /// Auto + unknown model family → MUST keep returning Ok(None)
-    /// (regression-preserve).
+    /// Guarantees tune-up item 2 (2026-08-20): Auto + declared tools[] +
+    /// unknown family → 501 `capability_unsupported`. This REPLACES the
+    /// pre-tune-up `Ok(None)` regression-preserve pin: Ok(None) armed no
+    /// grammar, and a malformed model-emitted call then leaked (scrubbed)
+    /// into `content` via the Auto fallback — violating the published
+    /// fail-closed guarantee. Tool calls that can be neither enforced nor
+    /// parsed are refused at request time instead.
     #[test]
-    fn compile_tool_grammar_auto_with_unknown_family_returns_ok_none() {
+    fn compile_tool_grammar_auto_with_tools_unknown_family_returns_501() {
+        assert!(
+            registry::find_for("unknown-fake-model-zzzz").is_none(),
+            "test fixture must use an unregistered model id; \
+             update if registry adds a 'unknown-fake-model-zzzz' family"
+        );
         let req = req_with("unknown-fake-model-zzzz", Some(one_scalar_tool("foo")));
         let res = compile_tool_grammar(&req, &ToolChoiceValue::Auto);
-        let g = res.expect("Auto + unknown model MUST stay Ok(None)");
+        let resp = res.expect_err("Auto + tools[] + unknown family MUST fail closed (501)");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "must be 501 capability_unsupported — Ok(None) here re-opens \
+             the tool-syntax-leaks-as-content hole the guarantee forbids"
+        );
+    }
+
+    /// tool_choice=none + declared tools[] + unknown family MUST stay
+    /// Ok(None): None suppresses tools at render (the model never sees
+    /// them), so there is nothing to enforce and the item-2 501 gate
+    /// must NOT fire. Guards the None exemption of the tune-up gate.
+    #[test]
+    fn compile_tool_grammar_none_choice_unknown_family_stays_ok_none() {
+        assert!(registry::find_for("unknown-fake-model-zzzz").is_none());
+        let req = req_with("unknown-fake-model-zzzz", Some(one_scalar_tool("foo")));
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::None);
+        let g = res.expect("None choice + unknown family MUST stay Ok(None)");
         assert!(g.is_none());
     }
 

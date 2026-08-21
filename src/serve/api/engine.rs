@@ -27149,7 +27149,11 @@ pub(super) fn emit_streaming_tool_call_close(
                 scrubbed = %scrubbed,
                 "tool-call body unparseable; emitting as content fallback \
                  (tool_choice=auto with no active grammar — no enforcement \
-                 on body shape; either tools[] empty or unregistered family). \
+                 on body shape; tools[] empty, or a registered family whose \
+                 model emitted a malformed call: deliberate peer-parity \
+                 fallback. tools[]-on-unregistered-family no longer reaches \
+                 here — refused 501 at request time since the 2026-08-20 \
+                 item-2 gate in compile_tool_grammar_with_registration). \
                  Special-token markers scrubbed from body before emit."
             );
             if events

@@ -10417,3 +10417,33 @@ Completion receipts on the candidate tree:
 These receipts close the local source and exact-artifact candidate. Clean
 immutable source, exact-SHA CI, and protected publication gates remain separate
 release authority.
+
+## 2026-08-20 — guarantees tune-up item 2: tools[] on an unregistered family fails closed (501)
+
+**Context.** Two independent source audits (gpt-5.6-sol + Kimi K3) confirmed a
+hole in the published fail-closed tool-calling guarantee: with
+`tool_choice=auto` and tools[] declared on a family with **no registered
+tool-call emitter**, `compile_tool_grammar_with_registration` returned
+`Ok(None)` — no grammar armed — and an unparseable model-emitted call body was
+scrubbed and re-emitted as plain `content` (handlers.rs non-stream fallback +
+`engine.rs::emit_streaming_tool_call_close` Auto branch). Malformed tool syntax
+leaked into text instead of failing closed.
+
+**Decision.** At request time, tools[] non-empty + `tool_choice=auto` + no
+registration ⇒ **HTTP 501, code `capability_unsupported`** (new
+`ApiError::capability_unsupported_message` — same wire shape as the ADR-040 C3
+constructor, caller-authored message). The gate keys on the LOADED family
+(`engine.registration()`), covering unary and SSE via the shared
+`prepare_chat_generation_core` prelude.
+
+**Explicitly preserved:** Auto without tools[] ⇒ `Ok(None)` (Auto allows
+no-call); `tool_choice=none` + tools[] ⇒ `Ok(None)` (tools suppressed at
+render, nothing to enforce — new regression guard
+`compile_tool_grammar_none_choice_unknown_family_stays_ok_none`);
+Required/Function preconditions (400s) unchanged; **registered-family Auto
+content fallback (peer parity) byte-unchanged**.
+
+**Tests.** `compile_tool_grammar_auto_with_tools_unknown_family_returns_501`
+replaces the pre-tune-up `..._returns_ok_none` behavior-preserve pin (that pin
+guarded the exact hole being closed, per the tune-up spec). 25/25
+`compile_tool_grammar` suite green.
