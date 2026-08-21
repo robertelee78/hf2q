@@ -45,10 +45,7 @@ fn skip_unless_gated(name: &str) -> bool {
 }
 
 fn hf2q_bin() -> PathBuf {
-    if let Ok(s) = std::env::var("CARGO_BIN_EXE_hf2q") {
-        return PathBuf::from(s);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/hf2q")
+    PathBuf::from(env!("CARGO_BIN_EXE_hf2q"))
 }
 
 /// Spawn `hf2q cache <args...>` with `HF2Q_CACHE_DIR=cache_dir`.
