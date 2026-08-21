@@ -535,9 +535,10 @@ harness leans on three patterns:
    tokens. Failure modes get distinct exit codes (see §7).
 4. **Reachable distribution contracts.** The standalone installer/updater owns
    one exact signed executable, one channel marker, one lock, and one retained
-   rollback executable. Tests exercise install, already-current update,
-   rollback, corrupt/offline failure, and data-preserving uninstall through the
-   same code shipped in the CLI. Apple signing and notarization are performed
+   rollback executable. Tests exercise install, rollback, corrupt-candidate
+   rejection, and data-preserving uninstall through the same code shipped in
+   the CLI; retained release evidence additionally proves the public
+   already-current update journey. Apple signing and notarization are performed
    by the protected release workflow; the runtime verifies exact size/digest,
    thin-arm64 shape, Developer ID continuity, and the online notarization
    requirement before atomic replacement. The removed TUF verifier, metadata

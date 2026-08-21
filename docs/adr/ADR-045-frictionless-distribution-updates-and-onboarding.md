@@ -61,7 +61,8 @@ The implementation disposition is therefore:
 | Exact release revision/tag/checksum lineage and the existing Cargo source-package channel | **Keep** | They are useful release evidence and an advanced install channel, but are not proof of the standalone native channel. |
 | Session-cache-only setup policy, dormant runtime authorization, and the second generic managed-session store | **Remove** | The runtime authorization and second store are removed. Schema 2 replaces the temporary cache field with defaults consumed by convert and serve. |
 | No-options model recipes, prepared-model profiles/registry/publication, source-retention orchestration, and post-conversion calibration state | **Remove** | They have no production caller and replace guide steps with an unrequested orchestration system. Any useful exact model evidence moves to the relevant model/conversion ADR or guide proof. |
-| Custom TUF client/spike, transport sealed to it, TUF metadata journal, first-activation graph, installation-identity coupling, custom archive/Mach-O preparation, and their structural CI sentinels | **Removed** | They had no production caller and did not participate in the shipped installer or updater. Their experiments remain in git history. |
+| Custom TUF client/spike, transport sealed to it, TUF metadata journal, first-activation graph, custom archive/Mach-O preparation, and their structural CI sentinels | **Removed** | They had no production caller and did not participate in the shipped installer or updater. Their experiments remain in git history. |
+| Setup's read-only installation-identity coupling | **Removed** | It was reachable from setup, but required an identity tree that no shipped installation path created or used. Setup retains its own descriptor-bound root, lock, config, and race checks. |
 | Reachable standalone record, Apple signature/notarization checks, and atomic publication mechanics | **Keep** | These are the small mechanisms used by the real signed installer, updater, rollback, and uninstaller. |
 | Automatic shell-completion mutation on ordinary CLI startup | **Remove** | Completion installation belongs to an explicit setup choice or the owning package/installer, not an unrelated command invocation. Explicit completion generation remains useful. |
 
@@ -737,11 +738,14 @@ read-only Qwen source-teacher manifest; it cannot download, convert, register,
 or serve a model.
 
 The unreachable custom TUF verifier and spike, sealed transport, metadata
-journal, installation-identity coupling, custom archive/Mach-O preparation,
-and first-activation graph have also been removed. They were not called by
-`hf2q update`, the installer, setup, or the release workflow. The reachable
-standalone record, Apple trust checks, exact download, rollback, uninstall,
-and atomic publisher remain the sole distribution implementation.
+journal, custom archive/Mach-O preparation, and first-activation graph have
+also been removed; they were not called by `hf2q update`, the installer,
+setup, or the release workflow. Setup's separate read-only installation-
+identity verifier was reachable, but it coupled configuration publication to
+an identity tree that no shipped installation path created or used, so that
+coupling was removed as well. The reachable standalone record, Apple trust
+checks, exact download, rollback, uninstall, and atomic publisher remain the
+sole distribution implementation.
 
 What is not yet the corrected product:
 
