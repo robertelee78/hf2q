@@ -3205,3 +3205,48 @@ This is **ADR-015 mlx-native territory** — see `feedback_evidence_first_no_bli
 **Net.** ADR-013 status remains **COMPLETE** as set 2026-04-25. The recent (2026-05-01 → 2026-05-02) progress log entries document a 7-stage post-completion optimization arc that turned hf2q's prefill from 0.18× of peer into 0.49–0.63× and confirmed decode parity — far better than the ADR's original ship-gate required. The residual prefill-vs-peer gap lives in the mlx-native repo's kernel implementations, not in the qwen35/qwen35moe forward-pass logic that ADR-013 owns.
 
 **No further action required for ADR-013.** Future qwen35/qwen35moe-related work (e.g., new GGUF variants, MTP improvements, additional kernels) opens new ADRs or new progress-log entries; the underlying forward-pass and Metal-kernel surface is stable.
+
+### 2026-08-21 post-completion correction — GGUF-native tied output heads
+
+Diagnostic hosted-GGUF selection exposed one inference omission rather than an
+artifact defect. The exact `ggml-org/Qwen3.5-0.8B-GGUF` Q8_0 hosted artifact
+at revision `8fea620810c4afa23dd6443f999a48574c1611a3` has SHA-256
+`37ae482d336108d23516fa35e8e0c4126688d81018b87178a18d752a1357814f`,
+size 833,592,096 bytes, `token_embd.weight` shape `[248320, 1024]`, and no
+`output.weight`. Its source configuration declares
+`tie_word_embeddings=true`. The pinned peer likewise treats
+`output.weight` as optional and resolves its absence to the token embedding.
+hf2q instead required `output.weight` unconditionally, so the first real
+hosted-load spike failed at that exact tensor lookup.
+
+The corrected Qwen3.5/Qwen3.5-MoE contract is artifact-driven:
+
+- a present `output.weight` remains the dedicated output head and takes
+  precedence, including artifacts whose embedding table has extra input-only
+  rows;
+- an absent `output.weight` means the output projection is tied to the exact
+  native `token_embd.weight` buffer and recorded GGML type;
+- the tied path uploads, registers, and accounts that physical allocation only
+  once, while forward and MTP retain distinct semantic uses;
+- model state records tying explicitly because `output_weight_native=None`
+  already means an F32 synthetic/lazy head on older construction paths; and
+- a DWQ output overlay against a tied native head fails before mutation.
+
+ADR-046's authenticated source-teacher topology remains explicitly untied and
+rejects tied artifacts at its boundary. No source-precision topology, Dynamic
+solver, conversion-policy identity, or global cache identity changed.
+
+Fail-first/regression proof uses a zero-layer GGUF writer fixture that reaches
+the production `Qwen35Model::load_from_gguf` path. It proves missing output
+loads as tied, reuses the exact Metal pointer, preserves Q8_0, and derives
+vocab width from token rows. A companion fixture proves dedicated-output
+precedence and extra embedding rows. Focused model tests pass 24/24 and MTP
+tests pass 15/15, including the production supplied-head path's exact Metal
+pointer reuse, tied MTP fallback, and DWQ fail-closed behavior.
+
+On the M5 Max release host, native hf2q generation from those exact bytes
+returned `HF2Q_TIED_OK` under temperature zero. The pinned peer at
+`521a64cd01979bb5b1a466152c576a9d809b068d` returned the identical content from
+the same file, prompt, token limit, temperature, seed, and reasoning-off
+settings. ADR-047 records the complete hosted activation, streaming,
+multi-turn cache, lifecycle, and telemetry receipt.

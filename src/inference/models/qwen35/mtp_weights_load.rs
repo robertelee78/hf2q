@@ -116,12 +116,13 @@ pub fn load_mtp_weights_if_present_with_shared_head(
     //
     // Qwen3.6 27B + 35B-A3B (`mtp_use_dedicated_embeddings: False`) ship neither
     // `mtp.embed_tokens` nor `mtp.shared_head.head`; the MTP block reuses the main
-    // verifier's `token_embd.weight` for the embedding lookup AND `output.weight`
-    // for the final logit projection. Convert correctly skips emitting
+    // verifier's `token_embd.weight` for the embedding lookup and resolves the
+    // main output projection from `output.weight` when present, otherwise from
+    // that same tied token-embedding allocation. Convert correctly skips emitting
     // `blk.{N}.nextn.shared_head_head.weight` in this configuration.
     //
     // Resolution: if the dedicated tensor is present we use it (Qwen3.5 MTP);
-    // otherwise (shared mode) we fall back to the main `output.weight`. The
+    // otherwise (shared mode) we fall back to the resolved main head. The
     // bf16 GPU buffer is materialised the same way either path; vocab_size
     // is derived from the row count of whichever tensor we actually loaded.
     let shared_head_head_tname = format!("{nextn}.shared_head_head.weight");
@@ -142,8 +143,14 @@ pub fn load_mtp_weights_if_present_with_shared_head(
                 shared_head_head_tname.clone(),
             )
         } else if !cfg.mtp_use_dedicated_embeddings {
-            // Shared mode: borrow the main LM head.
-            let main_lm = "output.weight";
+            // Shared mode: borrow the physical main LM head. GGUF represents
+            // tied Qwen3.5 heads by omitting output.weight; in that case the
+            // exact token_embd.weight blocks are the authoritative head.
+            let main_lm = if gguf.tensor_info("output.weight").is_some() {
+                "output.weight"
+            } else {
+                "token_embd.weight"
+            };
             if let Some(main) = main_output_head {
                 ensure!(
                     main.affine.is_none() && main.info.cols == h,
@@ -158,12 +165,12 @@ pub fn load_mtp_weights_if_present_with_shared_head(
             } else {
                 let info = gguf.tensor_info(main_lm).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "qwen35 MTP loader: shared head missing and main output.weight absent"
+                        "qwen35 MTP loader: shared head missing and resolved main head {main_lm} absent"
                     )
                 })?;
                 ensure!(
                     info.shape.len() == 2 && info.shape[1] == h,
-                    "output.weight shape {:?} is not [vocab, {h}]",
+                    "{main_lm} shape {:?} is not [vocab, {h}]",
                     info.shape
                 );
                 let vocab = info.shape[0];

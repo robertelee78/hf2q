@@ -150,6 +150,11 @@ pub struct Qwen35Model {
     /// Synthetic/lazy test models have no GGUF backing and leave this `None`.
     /// Explicit DWQ overlays also clear it when they replace `output_weight`.
     pub output_weight_native: Option<MlxQWeight>,
+    /// GGUF-native tied-embedding contract. When true, `output.weight` is
+    /// intentionally absent and the exact `token_embd.weight` buffer is also
+    /// the output projection. This is explicit because `None` alone already
+    /// means an F32 synthetic/lazy head on older construction paths.
+    pub tied_word_embeddings: bool,
     /// Final-layer RMSNorm weight, shape `[hidden_size]`.
     pub output_norm: Vec<f32>,
     /// Optional MTP draft block. Executed only by speculative decoding, never
@@ -206,6 +211,7 @@ impl Qwen35Model {
             token_embd_native: None,
             output_weight: vec![0.0f32; h * vocab],
             output_weight_native: None,
+            tied_word_embeddings: false,
             output_norm: vec![1.0f32; h],
             mtp: None,
             #[cfg(test)]
@@ -241,6 +247,33 @@ impl Qwen35Model {
             loaded_catalog,
         });
         Ok(())
+    }
+
+    /// Resolve the exact native output projection and its physical GGUF
+    /// source. Tied Qwen3.5 artifacts reuse the token-embedding allocation;
+    /// they never upload, register, or account a duplicate output buffer.
+    pub(crate) fn resolved_native_output_head(
+        &self,
+    ) -> Result<Option<(&MlxQWeight, &'static str)>> {
+        if self.tied_word_embeddings {
+            ensure!(
+                self.output_weight_native.is_none() && self.output_weight.is_empty(),
+                "tied Qwen3.5 output head must not carry a dedicated output.weight"
+            );
+            let token_embedding = self
+                .token_embd_native
+                .as_ref()
+                .context("tied Qwen3.5 output head requires native token_embd.weight storage")?;
+            ensure!(
+                token_embedding.affine.is_none(),
+                "tied Qwen3.5 output head cannot use affine embedding metadata"
+            );
+            return Ok(Some((token_embedding, "token_embd.weight")));
+        }
+        Ok(self
+            .output_weight_native
+            .as_ref()
+            .map(|output| (output, "output.weight")))
     }
 
     #[cfg(test)]
@@ -310,16 +343,20 @@ impl Qwen35Model {
         let output_weight = Vec::new();
         let output_norm = weight_loader::load_f32_tensor(gguf, "output_norm.weight", &device)
             .context("load output_norm.weight")?;
-        let output_weight_native =
-            crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "output.weight", &device)
-                .context("load native output.weight")?;
-        super::weight_pool::register_weight_buffer(&device, &output_weight_native.buffer)
-            .context("register native output.weight")?;
-        #[cfg(test)]
-        super::execution_observation::observe_loaded_ggml(
-            "output.weight",
-            &output_weight_native.buffer,
-        )?;
+        let tied_word_embeddings = gguf.tensor_info("output.weight").is_none();
+        let output_weight_native = if tied_word_embeddings {
+            None
+        } else {
+            let output =
+                crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "output.weight", &device)
+                    .context("load native output.weight")?;
+            super::weight_pool::register_weight_buffer(&device, &output.buffer)
+                .context("register native output.weight")?;
+            #[cfg(test)]
+            super::execution_observation::observe_loaded_ggml("output.weight", &output.buffer)?;
+            Some(output)
+        };
+        let output_head = output_weight_native.as_ref().unwrap_or(&token_embd_native);
 
         // The output head defines the logits width. The embedding table may
         // legally contain additional input-only rows, but neither tensor is
@@ -331,32 +368,30 @@ impl Qwen35Model {
             token_embd_native.info.cols
         );
         ensure!(
-            output_weight_native.info.cols == h,
-            "output.weight cols {} != hidden_size {h}",
-            output_weight_native.info.cols
+            output_head.info.cols == h,
+            "resolved output head cols {} != hidden_size {h}",
+            output_head.info.cols
         );
-        ensure!(
-            token_embd_native.info.rows >= output_weight_native.info.rows,
-            "token_embd.weight rows {} < output.weight rows {}",
-            token_embd_native.info.rows,
-            output_weight_native.info.rows
-        );
-        if cfg.vocab_size as usize != output_weight_native.info.rows {
+        if !tied_word_embeddings {
+            ensure!(
+                token_embd_native.info.rows >= output_head.info.rows,
+                "token_embd.weight rows {} < output.weight rows {}",
+                token_embd_native.info.rows,
+                output_head.info.rows
+            );
+        }
+        if cfg.vocab_size as usize != output_head.info.rows {
             tracing::info!(
                 metadata_vocab = cfg.vocab_size,
-                output_rows = output_weight_native.info.rows,
+                output_rows = output_head.info.rows,
                 "qwen35 vocab metadata differs from native output head; using exact output row count"
             );
-            cfg.vocab_size = output_weight_native.info.rows as u32;
+            cfg.vocab_size = output_head.info.rows as u32;
         }
 
-        let mtp = load_mtp_weights_if_present_with_shared_head(
-            gguf,
-            &cfg,
-            &device,
-            Some(&output_weight_native),
-        )
-        .context("load_mtp_weights_if_present")?;
+        let mtp =
+            load_mtp_weights_if_present_with_shared_head(gguf, &cfg, &device, Some(output_head))
+                .context("load_mtp_weights_if_present")?;
 
         // MoE experts must retain their GGUF-quantized representation. An
         // F16/F32 expert artifact would require a different native execution
@@ -418,7 +453,8 @@ impl Qwen35Model {
             token_embd,
             token_embd_native: Some(token_embd_native),
             output_weight,
-            output_weight_native: Some(output_weight_native),
+            output_weight_native,
+            tied_word_embeddings,
             output_norm,
             mtp,
             #[cfg(test)]
@@ -540,9 +576,8 @@ impl Qwen35Model {
                     .with_context(|| format!("qwen35 apply_dwq_overlay: parse {stem}"))?;
                 let h = self.cfg.hidden_size as usize;
                 let v = self
-                    .output_weight_native
-                    .as_ref()
-                    .map(|weight| weight.info.rows)
+                    .resolved_native_output_head()?
+                    .map(|(weight, _)| weight.info.rows)
                     .unwrap_or_else(|| self.output_weight.len() / h.max(1));
                 if linear.n != v || linear.k != h {
                     anyhow::bail!(
@@ -553,7 +588,7 @@ impl Qwen35Model {
                         h,
                     );
                 }
-                if self.output_weight_native.is_some() {
+                if self.resolved_native_output_head()?.is_some() {
                     anyhow::bail!(
                         "qwen35 DWQ overlay: output.weight direct affine execution is not wired \
                          for the native GGUF model; refusing the old affine -> F32 -> Q4_0 \
@@ -1286,6 +1321,229 @@ mod tests {
         cfg
     }
 
+    fn native_test_qweight(device: &MlxDevice, rows: usize, cols: usize) -> MlxQWeight {
+        use crate::serve::gpu::QuantWeightInfo;
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        use mlx_native::DType;
+
+        let bytes = rows * cols / 32 * 34;
+        MlxQWeight {
+            buffer: device
+                .alloc_buffer(bytes, DType::U8, vec![bytes])
+                .expect("allocate test Q8_0 blocks"),
+            info: QuantWeightInfo {
+                ggml_dtype: GgmlType::Q8_0,
+                rows,
+                cols,
+            },
+            affine: None,
+            f16_shadow: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn zero_layer_native_gguf(output_rows: Option<usize>) -> tempfile::NamedTempFile {
+        use crate::backends::gguf::types::MetaValue;
+        use crate::backends::gguf::writer::GgufWriter;
+        use crate::quantize::ggml_quants::GgmlType;
+
+        let hidden = 32usize;
+        let token_rows = 64usize;
+        let metadata = vec![
+            (
+                "general.architecture",
+                MetaValue::String("qwen35".to_owned()),
+            ),
+            ("qwen35.block_count", MetaValue::U32(0)),
+            ("qwen35.embedding_length", MetaValue::U32(hidden as u32)),
+            ("qwen35.attention.head_count", MetaValue::U32(1)),
+            ("qwen35.attention.head_count_kv", MetaValue::U32(1)),
+            ("qwen35.attention.key_length", MetaValue::U32(32)),
+            ("qwen35.attention.value_length", MetaValue::U32(32)),
+            (
+                "qwen35.attention.layer_norm_rms_epsilon",
+                MetaValue::F32(1e-6),
+            ),
+            ("qwen35.context_length", MetaValue::U32(128)),
+            ("qwen35.rope.freq_base", MetaValue::F32(1_000_000.0)),
+            ("qwen35.rope.dimension_count", MetaValue::U32(32)),
+            (
+                "qwen35.rope.dimension_sections",
+                MetaValue::ArrayI32(vec![8, 8, 0, 0]),
+            ),
+            ("qwen35.full_attention_interval", MetaValue::U32(4)),
+            ("qwen35.ssm.state_size", MetaValue::U32(32)),
+            ("qwen35.ssm.group_count", MetaValue::U32(1)),
+            ("qwen35.ssm.inner_size", MetaValue::U32(32)),
+            ("qwen35.ssm.conv_kernel", MetaValue::U32(4)),
+            ("qwen35.vocab_size", MetaValue::U32(token_rows as u32)),
+            ("qwen35.feed_forward_length", MetaValue::U32(32)),
+        ];
+        let file = tempfile::NamedTempFile::new().expect("temporary zero-layer GGUF");
+        let sink = std::fs::File::create(file.path()).expect("create zero-layer GGUF");
+        let tensor_count = 2 + usize::from(output_rows.is_some());
+        let mut writer = GgufWriter::new(sink);
+        writer
+            .write_header(tensor_count as u64, metadata.len() as u64)
+            .expect("write GGUF header");
+        for (key, value) in &metadata {
+            writer
+                .write_metadata_kv(key, value)
+                .expect("write Qwen35 fixture metadata");
+        }
+        let token_index = writer
+            .reserve_tensor_info(
+                "token_embd.weight",
+                &[hidden as u64, token_rows as u64],
+                GgmlType::Q8_0,
+            )
+            .expect("reserve token embedding");
+        let norm_index = writer
+            .reserve_tensor_info("output_norm.weight", &[hidden as u64], GgmlType::F32)
+            .expect("reserve output norm");
+        let output_index = output_rows.map(|rows| {
+            writer
+                .reserve_tensor_info(
+                    "output.weight",
+                    &[hidden as u64, rows as u64],
+                    GgmlType::Q8_0,
+                )
+                .expect("reserve output head")
+        });
+        writer.pad_to_alignment().expect("align GGUF fixture");
+        writer
+            .stream_tensor_payload(token_index, &vec![0; token_rows * 34])
+            .expect("write token embedding blocks");
+        writer
+            .stream_tensor_payload(norm_index, &vec![0; hidden * 4])
+            .expect("write output norm");
+        if let (Some(index), Some(rows)) = (output_index, output_rows) {
+            writer
+                .stream_tensor_payload(index, &vec![0; rows * 34])
+                .expect("write output head blocks");
+        }
+        writer.finalize().expect("finalize zero-layer GGUF");
+        file
+    }
+
+    #[test]
+    fn gguf_loader_accepts_absent_output_as_tied_native_head() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        if MlxDevice::new().is_err() {
+            return;
+        }
+        let file = zero_layer_native_gguf(None);
+        let gguf = GgufFile::open(file.path()).expect("open tied Qwen35 fixture");
+        let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .expect("missing output.weight must mean tied embeddings");
+        assert!(model.tied_word_embeddings);
+        assert!(model.output_weight_native.is_none());
+        assert!(model.output_weight.is_empty());
+        let token = model
+            .token_embd_native
+            .as_ref()
+            .expect("native token table");
+        let (head, source) = model
+            .resolved_native_output_head()
+            .unwrap()
+            .expect("resolved tied output head");
+        assert_eq!(source, "token_embd.weight");
+        assert_eq!(head.buffer.contents_ptr(), token.buffer.contents_ptr());
+        assert_eq!(head.info.ggml_dtype, mlx_native::GgmlType::Q8_0);
+        assert_eq!(model.cfg.vocab_size, 64);
+    }
+
+    #[test]
+    fn gguf_loader_prefers_dedicated_output_and_preserves_extra_embedding_rows() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        if MlxDevice::new().is_err() {
+            return;
+        }
+        let file = zero_layer_native_gguf(Some(48));
+        let gguf = GgufFile::open(file.path()).expect("open untied Qwen35 fixture");
+        let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .expect("dedicated output.weight must retain precedence");
+        assert!(!model.tied_word_embeddings);
+        let token = model
+            .token_embd_native
+            .as_ref()
+            .expect("native token table");
+        let (head, source) = model
+            .resolved_native_output_head()
+            .unwrap()
+            .expect("resolved dedicated output head");
+        assert_eq!(source, "output.weight");
+        assert_eq!(token.info.rows, 64);
+        assert_eq!(head.info.rows, 48);
+        assert_ne!(head.buffer.contents_ptr(), token.buffer.contents_ptr());
+        assert_eq!(model.cfg.vocab_size, 48);
+    }
+
+    #[test]
+    fn tied_native_output_resolution_reuses_the_token_buffer() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let mut model = Qwen35Model::empty_from_cfg(dense_cfg_12());
+        model.token_embd.clear();
+        model.output_weight.clear();
+        model.token_embd_native = Some(native_test_qweight(&device, 256, 64));
+        model.output_weight_native = None;
+        model.tied_word_embeddings = true;
+
+        let token_pointer = model
+            .token_embd_native
+            .as_ref()
+            .unwrap()
+            .buffer
+            .contents_ptr();
+        let (resolved, source) = model
+            .resolved_native_output_head()
+            .unwrap()
+            .expect("tied native head");
+        assert_eq!(source, "token_embd.weight");
+        assert_eq!(resolved.buffer.contents_ptr(), token_pointer);
+        assert_eq!(resolved.info.rows, 256);
+        assert_eq!(resolved.info.cols, 64);
+    }
+
+    #[test]
+    fn dedicated_native_output_resolution_takes_precedence() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let mut model = Qwen35Model::empty_from_cfg(dense_cfg_12());
+        model.token_embd.clear();
+        model.output_weight.clear();
+        model.token_embd_native = Some(native_test_qweight(&device, 260, 64));
+        model.output_weight_native = Some(native_test_qweight(&device, 256, 64));
+        model.tied_word_embeddings = false;
+
+        let token_pointer = model
+            .token_embd_native
+            .as_ref()
+            .unwrap()
+            .buffer
+            .contents_ptr();
+        let output_pointer = model
+            .output_weight_native
+            .as_ref()
+            .unwrap()
+            .buffer
+            .contents_ptr();
+        let (resolved, source) = model
+            .resolved_native_output_head()
+            .unwrap()
+            .expect("dedicated native head");
+        assert_eq!(source, "output.weight");
+        assert_eq!(resolved.buffer.contents_ptr(), output_pointer);
+        assert_ne!(resolved.buffer.contents_ptr(), token_pointer);
+    }
+
     #[test]
     fn empty_moe_40layer_has_correct_slot_counts() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
@@ -1754,6 +2012,55 @@ mod tests {
         let serialized =
             safetensors::tensor::serialize(entries, Some(metadata)).expect("safetensors serialize");
         std::fs::write(path, &serialized).expect("write tempfile");
+    }
+
+    #[test]
+    fn tied_native_output_overlay_fails_closed_without_mutating_embedding() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("[tied_native_output_overlay] SKIP: no Metal device: {error}");
+                return;
+            }
+        };
+        let mut model = Qwen35Model::empty_from_cfg(dense_cfg_12());
+        model.token_embd.clear();
+        model.output_weight.clear();
+        model.token_embd_native = Some(native_test_qweight(&device, 256, 64));
+        model.output_weight_native = None;
+        model.tied_word_embeddings = true;
+        let before = model
+            .token_embd_native
+            .as_ref()
+            .unwrap()
+            .buffer
+            .contents_ptr();
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let overlay = directory.path().join("tied-output-overlay.safetensors");
+        write_synthetic_overlay(
+            &overlay,
+            &[("output".to_owned(), synth_attn_linear(256, 64))],
+            4,
+            32,
+        );
+        let error = model
+            .apply_dwq_overlay(&device, &overlay)
+            .expect_err("native tied output overlay must fail closed")
+            .to_string();
+        assert!(error.contains("direct affine execution is not wired"));
+        assert!(model.tied_word_embeddings);
+        assert!(model.output_weight_native.is_none());
+        assert_eq!(
+            model
+                .token_embd_native
+                .as_ref()
+                .unwrap()
+                .buffer
+                .contents_ptr(),
+            before
+        );
     }
 
     #[test]

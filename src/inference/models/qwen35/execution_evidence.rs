@@ -7,7 +7,7 @@
 //! or a cross-process hardware identity and therefore intentionally exposes no
 //! runtime-cost manifest or Dynamic solver authority.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use mlx_native::GgmlWorkloadClass;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -315,6 +315,10 @@ pub(crate) fn load_no_dwq_qwen35_candidate(
 }
 
 fn validate_loaded_global_geometry(model: &Qwen35Model, expected: &Qwen35Config) -> Result<()> {
+    ensure!(
+        !model.tied_word_embeddings,
+        "authenticated Qwen source-teacher profile requires an untied output head"
+    );
     let expected_vocab = usize::try_from(expected.vocab_size)?;
     let expected_hidden = usize::try_from(expected.hidden_size)?;
     let expected_embedding_values = usize::try_from(expected.vocab_size)?

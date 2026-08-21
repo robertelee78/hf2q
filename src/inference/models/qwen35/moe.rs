@@ -22,10 +22,11 @@
 // Authoritative tensor-name enumeration for the Qwen3.5-MoE GGUF format,
 // grounded in the apex GGUF dump (2026-04-23, 733 tensors, 40 layers).
 //
-// # Global tensors (3)
+// # Global tensors (2 required, up to 3 with a dedicated output head)
 //
 //   token_embd.weight     — token embedding (vocab_size × hidden_size)
-//   output.weight         — LM head (hidden_size × vocab_size);
+//   output.weight         — optional dedicated LM head; absent GGUFs tie the
+//                           head to token_embd.weight at inference load;
 //                           in abliterated models it's a distinct tensor
 //                           from token_embd (no weight tying).
 //   output_norm.weight    — final RMSNorm (hidden_size)

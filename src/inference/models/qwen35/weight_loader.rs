@@ -983,6 +983,7 @@ impl Qwen35Model {
             token_embd_native: None,
             output_weight,
             output_weight_native: None,
+            tied_word_embeddings: false,
             output_norm,
             mtp: None,
             #[cfg(test)]
