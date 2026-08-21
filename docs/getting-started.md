@@ -45,7 +45,7 @@ MODEL="$HOME/.local/share/hf2q/models/qwen3.8/qwen38-abliterated-sft-q5_k_m.gguf
 nohup hf2q serve --model "$MODEL" > /tmp/hf2q-serve.log 2>&1 &
 
 npm install -g opencode-ai @pacphi/agentic-kit@next
-(cd "$HOME" && ak setup --yes && ak setup --opencode --yes)
+ak setup --minimal --opencode --yes
 
 CONFIG="$HOME/.config/opencode/opencode.json"
 mkdir -p "$(dirname "$CONFIG")"
@@ -83,12 +83,17 @@ jq '
   | .default_agent = "assistant"
 ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
 
+READY=0
 for _ in $(seq 1 90); do
-  curl -fsS http://127.0.0.1:8081/readyz > /dev/null 2>&1 && break
-  sleep 2
+  curl --connect-timeout 1 --max-time 1 -fsS \
+    http://127.0.0.1:8081/readyz > /dev/null 2>&1 && READY=1 && break
+  sleep 1
 done
-curl -fsS http://127.0.0.1:8081/readyz || echo "not ready yet — see /tmp/hf2q-serve.log" >&2
-opencode
+if [ "$READY" -eq 1 ]; then
+  opencode
+else
+  echo "not ready yet — see /tmp/hf2q-serve.log" >&2
+fi
 ```
 
 The model loads in the background while OpenCode and Agentic Kit install. The
@@ -102,8 +107,9 @@ measured that a stock coding-harness frame (big system prompt + tool schemas)
 moves this model back toward refusal. So: `"You are a helpful assistant."`,
 temperature 0, no tool schemas. Switch to the `build` agent (Tab) for
 file/shell work, and run `opencode` from a clean directory — `AGENTS.md` files
-above your cwd are injected into the frame. (If your home directory is itself
-a git repo, run the `ak setup` line from any other directory.)
+above your cwd are injected into the frame. `ak setup --minimal` intentionally
+limits Agentic Kit setup to machine scope, even when you paste this inside a
+Git repository.
 
 When OpenCode opens you are on `hf2q/Release Qwen38 E2` via `assistant` — ask
 it something; the answer is computed locally. Server logs:
@@ -201,8 +207,9 @@ entry. Crawl4AI container restarts must pass the same token from
 
 ## Optional: convert the model yourself
 
-The download above is the author's artifact. hf2q's owned pipeline reproduces
-it from the exact pinned source revision and writes a provenance receipt
+The download above is the author's Q5_K_M artifact. hf2q's owned pipeline
+produces its own Q4_K_M artifact from the exact pinned source revision and
+writes a provenance receipt
 (`<output>.receipt.json`) — no Python, `huggingface-cli`, or llama.cpp
 involved. Plan for 100 GiB free:
 
