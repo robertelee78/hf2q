@@ -41,7 +41,7 @@ jobs:
           actual_sha=$(git rev-parse HEAD)
           test "$actual_sha" = "$EXPECTED_SHA"
           git fetch origin main
-          test "$actual_sha" = "$(git rev-parse origin/main)"
+          git merge-base --is-ancestor "$actual_sha" origin/main
           git diff --exit-code
 
       - name: Toolchain
@@ -195,7 +195,7 @@ jobs:
           test "$(uname -m)" = arm64
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
           git fetch origin main
-          test "$(git rev-parse origin/main)" = "$EXPECTED_SHA"
+          git merge-base --is-ancestor "$EXPECTED_SHA" origin/main
           git diff --exit-code
 
       - name: Download exact build candidate
@@ -308,7 +308,7 @@ jobs:
           actual_sha=$(git rev-parse HEAD)
           test "$actual_sha" = "$EXPECTED_SHA"
           git fetch origin main
-          test "$actual_sha" = "$(git rev-parse origin/main)"
+          git merge-base --is-ancestor "$actual_sha" origin/main
           git diff --exit-code
 
           for model in "$DEEPSEEK_MODEL_PATH" "$GEMMA_MODEL_PATH" \

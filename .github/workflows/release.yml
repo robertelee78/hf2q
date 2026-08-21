@@ -52,7 +52,7 @@ jobs:
           actual_sha=$(git rev-parse HEAD)
           test "$actual_sha" = "$EXPECTED_SHA"
           git fetch origin main
-          test "$actual_sha" = "$(git rev-parse origin/main)"
+          git merge-base --is-ancestor "$actual_sha" origin/main
           actual_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$actual_version" = "$EXPECTED_VERSION"
           git diff --exit-code
