@@ -1,6 +1,6 @@
 # ADR-047: Diagnostic chat over the native inference server
 
-- **Status:** Accepted; cancellation and hosted-selection correction under validation
+- **Status:** Accepted and implemented
 - **Date:** 2026-08-20
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
 
@@ -122,11 +122,12 @@ descriptor. Bounded graceful shutdown escalates to the owned process group and
 reaps it; it never signals a discovered or explicit endpoint.
 
 The owned server's stdout/stderr are not inherited by the interactive
-terminal. Stderr is redirected directly to a private durable log, and only a
-bounded tail plus the path is surfaced when startup or shutdown fails. On
-detach the log is retained and reported. This prevents a child download
-progress bar from continuing to paint over a shell prompt after chat exits or
-blocking on a pipe whose TUI-side reader disappeared.
+terminal. Stderr is redirected directly to a private durable log. On startup,
+session, or cleanup failure the log is retained and its path is reported, but
+its arbitrary contents are never copied into terminal errors automatically;
+on detach the log is likewise retained and reported. This prevents a child
+download progress bar from continuing to paint over a shell prompt after chat
+exits or blocking on a pipe whose TUI-side reader disappeared.
 
 DNS-SD registration is isolated behind an hf2q-owned module. Non-macOS builds
 retain explicit-URL chat but do not claim automatic local discovery. DNS-SD
@@ -411,14 +412,78 @@ admission write gate; irreversible lifecycle transactions finish under server
 supervision; and shutdown returns before engine teardown if HTTP or supervised
 work has not reached a terminal state.
 
+The first small real-artifact spike then exposed a separate Qwen3.5 inference
+defect: the selected hosted ggml-org 0.8B Q8_0 GGUF legally ties its output
+projection to `token_embd.weight`, while hf2q required a separate
+`output.weight`. The artifact catalog had correctly made no compatibility
+claim; native load was the final compatibility gate. ADR-013 now records the
+family correction and explicit buffer-sharing contract.
+
+Load failures also crossed an unsafe diagnostic boundary. Ordinary
+`anyhow::Error` display hid the causal leaf, while returning the full chain
+would expose operator paths or credentials through HTTP. The server now emits
+typed, allow-listed public diagnostics (such as a bounded missing tensor name),
+keeps arbitrary context only in its private log, and retains and reports only
+that log's path whenever an owned chat session fails. Successful non-detached
+sessions still delete the temporary log; external endpoints confer no log or
+process authority. This preserves local postmortem evidence without undoing
+the HTTP redaction boundary at the terminal.
+
 Focused fail-first and regression coverage now includes fragmented client
 protocol, exact candidate binding, bounded catalog/transfer slots, the Q5
 closed boundary, admission and post-commit classification, real-TCP request
 drop to helper reap, server-root helper cancellation, pipe-retaining child
-failure, leader-exit process-group cleanup, and generated zsh completion. The
-exact final commit, complete locked gates, live metadata receipt, and full
-binary Ctrl-C/detach receipts must be recorded here before this correction is
-called landed.
+failure, leader-exit process-group cleanup, and generated zsh completion.
+
+The reconciled source implementation candidate is `7bd89799`, based on
+`origin/main` `84384d65`; the only later change is this ADR-only validation
+receipt. On the macOS 26.5 M5 Max release host:
+
+- focused correction suites passed 37/37 chat tests, 24/24 Qwen3.5 model
+  tests, and 15/15 MTP tests. These include one combined owned activation-500
+  test that receives the safe HTTP detail, shuts down and reaps the exact
+  process group, retains the private log, and proves a fake credential and
+  private path are absent from the terminal error; a separate startup test
+  proves the same path-only boundary before discovery succeeds;
+- the exact rebased tree passed the locked all-targets/all-features check,
+  `cargo build --release --locked` with zero warnings, and
+  the full single-threaded `cargo test --locked` workspace gate. The latter
+  included 51/51 library tests, 4,928 passed binary tests with zero failures
+  and 55 explicitly ignored hardware/fixture tests, every integration target,
+  and doc tests;
+- `cargo audit --file Cargo.lock` found zero vulnerabilities. It reported the
+  three already-allowed unmaintained-dependency warnings for transitive
+  `bincode` and `paste` paths through `ruvector-core`, `tokenizers`, and
+  `mlx-native`; this change introduced none of them;
+- the exact hosted artifact was
+  `ggml-org/Qwen3.5-0.8B-GGUF` revision
+  `8fea620810c4afa23dd6443f999a48574c1611a3`, file
+  `Qwen3.5-0.8B-Q8_0.gguf`, 833,592,096 bytes, SHA-256
+  `37ae482d336108d23516fa35e8e0c4126688d81018b87178a18d752a1357814f`.
+  Its immutable `hf://` identity, not the mutable repository name, became the
+  pool and request identity;
+- direct native generation from those bytes returned exactly
+  `HF2Q_TIED_OK`. Pinned llama.cpp `521a64cd01979bb5b1a466152c576a9d809b068d`
+  returned the identical content from the same file, prompt, 16-token limit,
+  greedy decoding, and reasoning-off settings;
+- a real owned TUI session selected and loaded that hosted Q8 without entering
+  safetensors conversion, reported 795.0 MiB resident, answered `ALPHA` and
+  `BETA`, and reused 119 of 141 second-turn prompt tokens. TTFT moved from
+  55.0 ms to 18.1 ms; `/status` reported the exact model identity, pool
+  revision, and owned lifecycle, and `/quit` left no child or listener;
+- Ctrl-C during an active 8,192-token SSE generation terminated chat and the
+  owned server group immediately. No server, helper, or listener remained on
+  the advertised port, and redirected child progress did not repaint the
+  restored terminal; and
+- `--keep-serving` retained a 0600 log, detached PID 89302 on port 52197, and
+  returned from chat without signaling it. `/health` remained 200 until the
+  operator explicitly requested `/shutdown`, after which the process exited;
+- a real invalid-artifact activation returned the typed safe 400, then
+  stopped the owned server and retained a 0600 private log. The terminal
+  displayed only its path and the safe HTTP message; no process remained.
+
+These receipts close the correction's complete local Kata gate. Publication
+and merge remain subject to the repository's exact-commit GitHub checks.
 
 ## Consequences
 
