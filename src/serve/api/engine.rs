@@ -16729,6 +16729,24 @@ pub(super) fn is_fatal_command_buffer_error(error: &anyhow::Error) -> bool {
 /// the conservative initial cap; promotion to 4K is a measured performance
 /// decision, never an automatic response to a near-watchdog completion.
 const QWEN35_SLOT_PREFILL_CHUNK_TOKENS: u32 = 2_048;
+/// A single-slot worker has no peer request to starve and can safely amortize
+/// fixed prefill costs across the measured 4K transaction. Multi-slot workers
+/// retain the 2K fairness/safety quantum.
+const QWEN35_SINGLE_SLOT_PREFILL_CHUNK_CEILING: u32 = 4_096;
+
+fn qwen35_slot_prefill_chunk_tokens(n_slots: usize) -> u32 {
+    if n_slots == 1 {
+        QWEN35_SINGLE_SLOT_PREFILL_CHUNK_CEILING
+    } else {
+        QWEN35_SLOT_PREFILL_CHUNK_TOKENS
+    }
+}
+
+fn qwen35_prefill_transaction_tokens(requested_tokens: u32) -> usize {
+    requested_tokens
+        .min(QWEN35_SINGLE_SLOT_PREFILL_CHUNK_CEILING)
+        .max(1) as usize
+}
 /// Inline Qwen surfaces do not yet have resumable request state. Keep them at
 /// the same proven transaction ceiling as bounded text prefill; longer work
 /// must fail before Metal instead of reintroducing a watchdog-sized escape
@@ -17779,7 +17797,13 @@ fn run_slot_aware_qwen35(
         }
     };
     let n_slots = guard.kv.as_ref().expect("kv Some at entry").n_seqs as usize;
-    scheduler.set_prefill_chunk_tokens(QWEN35_SLOT_PREFILL_CHUNK_TOKENS);
+    let prefill_chunk_tokens = qwen35_slot_prefill_chunk_tokens(n_slots);
+    scheduler.set_prefill_chunk_tokens(prefill_chunk_tokens);
+    tracing::info!(
+        n_slots,
+        prefill_chunk_tokens,
+        "Qwen35 SlotAware prefill transaction ceiling selected"
+    );
     let mut slots: Vec<Option<Qwen35Slot>> = (0..n_slots).map(|_| None).collect();
     let mut retained_tokens: Vec<Qwen35RetainedPrefix> = (0..n_slots)
         .map(|_| Qwen35RetainedPrefix::default())
@@ -18772,9 +18796,7 @@ fn advance_qwen35_prefill(
         return None;
     }
 
-    let max_chunk_tokens = requested_tokens
-        .min(QWEN35_SLOT_PREFILL_CHUNK_TOKENS)
-        .max(1) as usize;
+    let max_chunk_tokens = qwen35_prefill_transaction_tokens(requested_tokens);
     let advance = state.advance(
         guard.model,
         registration,
@@ -43706,6 +43728,43 @@ mod qwen35_bounded_prefill_watchdog_tests {
                 assert_eq!(decode_handles, vec![short]);
             }
             other => panic!("expected Mixed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen_single_slot_prefill_is_bounded_without_changing_multi_slot_fairness() {
+        assert_eq!(
+            qwen35_slot_prefill_chunk_tokens(1),
+            QWEN35_SINGLE_SLOT_PREFILL_CHUNK_CEILING
+        );
+        assert_eq!(
+            qwen35_slot_prefill_chunk_tokens(4),
+            QWEN35_SLOT_PREFILL_CHUNK_TOKENS
+        );
+        assert_eq!(qwen35_prefill_transaction_tokens(0), 1);
+        assert_eq!(qwen35_prefill_transaction_tokens(2_048), 2_048);
+        assert_eq!(qwen35_prefill_transaction_tokens(4_096), 4_096);
+        assert_eq!(qwen35_prefill_transaction_tokens(u32::MAX), 4_096);
+    }
+
+    #[test]
+    fn qwen_single_slot_scheduler_requests_the_measured_4k_quantum() {
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(1, 1, 0);
+        scheduler.set_prefill_chunk_tokens(qwen35_slot_prefill_chunk_tokens(1));
+        let handle = scheduler
+            .admit(request(87_972, 64))
+            .expect("admit long single-slot request")
+            .handle
+            .expect("single-slot handle");
+        match scheduler.step().expect("single-slot prefill step") {
+            SchedulerStep::Prefill {
+                handle: actual,
+                n_tokens,
+            } => {
+                assert_eq!(actual, handle);
+                assert_eq!(n_tokens, QWEN35_SINGLE_SLOT_PREFILL_CHUNK_CEILING);
+            }
+            other => panic!("expected single-slot Prefill, got {other:?}"),
         }
     }
 
