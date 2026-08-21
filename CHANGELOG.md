@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained rollback version, `hf2q update`, and marker-gated
   `hf2q uninstall --yes`. The public installer stays unavailable until the
   signed/notarized artifact and live stable record pass release gates.
+- Add the protected standalone release rail: locked packed-source arm64/macOS
+  14 build, ephemeral Developer ID signing, ZIP-carried notarization for the
+  raw CLI, exact signed-byte hardware gates, immutable draft assets, and
+  authenticated plus public-download installer verification. No public
+  installer is claimed until the credential-backed release run succeeds.
 
 ### Changed
 

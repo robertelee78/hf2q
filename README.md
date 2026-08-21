@@ -93,11 +93,13 @@ receipts when building from a checkout. Published packages and future native
 release artifacts embed their own source identity.
 
 The source tree now contains the reviewed standalone installer, updater,
-rollback, and data-preserving uninstaller implementation. It is not advertised
+rollback, data-preserving uninstaller, and protected signed-byte release rail.
+The rail signs/notarizes before the real-model hardware gate and publishes only
+the exact gated binary through a complete draft release. It is not advertised
 as an install method yet: `https://hf2q.us/install.sh` remains unavailable
-until an exact Developer-ID-signed, notarized binary and its stable release
-record pass the installed-artifact gates. Source/Cargo installs remain
-unmanaged by `hf2q update`.
+until that rail runs with the project Apple credentials and its exact public
+binary and stable release record pass the installed-artifact gates.
+Source/Cargo installs remain unmanaged by `hf2q update`.
 
 `hf2q setup` inventories the selected Apple-Silicon host and records defaults
 that the existing `convert` and `serve` commands consume. It downloads,

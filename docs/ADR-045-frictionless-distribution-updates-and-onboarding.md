@@ -193,6 +193,26 @@ notarization and Gatekeeper acceptance for the exact published bytes. This is
 the smallest trust chain for the first Apple-only channel; the dormant custom
 TUF client and multi-role local journal are not part of it.
 
+The distributed artifact is a thin `arm64` Mach-O with a macOS 14 deployment
+floor, hardened runtime, secure timestamp, the fixed `us.hf2q.cli` signing
+identifier, and the expected Developer ID team. A ZIP containing that exact
+signed executable is only the Apple notary submission carrier. Apple creates
+an online ticket for a standalone executable but cannot currently staple that
+ticket to the raw file, so the release retains the accepted submission/log and
+requires online Gatekeeper assessment of the exact raw bytes. The ZIP is not a
+product download.
+
+The exact-artifact workflow is deliberately three-stage. A no-secret job
+builds the locked packed-source candidate, a short protected `apple-release`
+job signs and notarizes it in an ephemeral keychain, and a no-secret
+Apple-Silicon hardware job runs the full cross-family gate against those exact
+signed bytes. Only a successful exact-SHA gate may feed the release workflow.
+That workflow assembles a complete draft, downloads and compares every asset,
+publishes the already-proven crate, then makes the complete GitHub release
+public and verifies its unauthenticated downloads and production-trust
+installer. Immutable standalone assets are never uploaded with overwrite
+authority, and stable-release workflow runs are globally serialized.
+
 The installer never owns `$HOME/.hf2q`, model directories, Hugging Face
 caches, or another application. If `$HOME/.local/bin` is not on `PATH`, it
 prints one exact shell instruction instead of silently rewriting unrelated
@@ -633,8 +653,12 @@ lock, and one retained executable are sufficient for the observable
 standalone lifecycle. The subsequent local implementation adds a canonical
 bounded stable-release record, exact size/SHA verification, same-Developer-ID
 continuity, Gatekeeper assessment, stable-version checks, and the same atomic
-publisher for install and update. It has not yet proved a real signed/notarized
-hf2q artifact or public transport, so the channel remains unavailable.
+publisher for install and update. The source tree now also contains the
+three-stage signed-byte release rail, ephemeral Apple credential handling,
+accepted-notary proof receipt, immutable draft publication, exact public-byte
+verification, and the real-trust clean-prefix installer gate. That rail has
+not yet run with the project's Apple credentials and has not published a real
+signed/notarized hf2q artifact, so the channel remains unavailable.
 
 The unreachable second managed-session store, its runtime authorization, and
 the provisional session-cache setup field have been removed. `hf2q setup` does
