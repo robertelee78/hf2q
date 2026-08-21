@@ -25,8 +25,8 @@ require Rust or a local build.
 
 ## 2. Download the verified hf2q Q4_K_M pair
 
-The repository also contains GGUFs made for llama.cpp and L40 GPUs. Do not use
-those files with this guide. In particular,
+The repository also contains GGUFs made for the peer engine and L40 GPUs. Do
+not use those files with this guide. In particular,
 `qwen38-abliterated-sft-q5_k_m.gguf` cannot execute hf2q's direct GPU embedding
 path, and `mmproj-qwen38-f16.gguf` is not paired with the hf2q Q4 text model.
 
