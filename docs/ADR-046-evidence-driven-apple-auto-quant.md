@@ -1352,15 +1352,39 @@ authority and drops it before returning; the published target and stdout
 summary therefore record historical completion evidence but cannot replay or
 reconstruct that authority.
 
-Completing D3a for the official model now requires the pinned 27B Apple run and
-matched source-reference validation through this family-owned path; an F32
-GGUF/CPU run remains only a tiny-model oracle or an explicitly preflighted
-small-model comparison. D3b then materializes exactly one D1 atomic option at
-a time and computes full-distribution KL, top-1, and trajectory metrics. The transferable
-Unsloth lessons are multi-domain native-template calibration, heterogeneous
-precision, separate tuning/validation/holdout data, and full-distribution plus
-trajectory gates—not an unpublished selector algorithm. No DWQ, learned
-affine overlay, or training path is introduced.
+The first pinned official Apple gate completed on implementation commit
+`1e02c81e1980a16af15c86664a17cbc29652a6ba`, built with that exact value in
+`GIT_COMMIT_SHA`, using `mlx-native 0.10.16` on an Apple M5 Max running macOS
+26.5.2. The no-execute pass authenticated all 18 shards and 1,199 source
+tensors, admitted 867 output buffers (514 BF16 and 353 F32), reproduced
+53,797,287,936 planned weight bytes, and reported 71,354,066,944 host and
+Metal admission bytes against point-in-time observations of 88,998,592,512
+host bytes and 115,448,266,752 Metal bytes available. It completed in 587.402
+seconds and left the target absent.
+
+The subsequent explicit `--execute` pass independently repeated source and
+capacity admission, completed 53 forward calls over 459 input tokens with 53
+output-head evaluations, wrote 22 full-vocabulary rows, and published one
+21,853,510-byte retained target. Its target SHA-256 is
+`b20c6a01128115c31747bde70d815014caab1003cf8923c692ced5d5f56622dd` and its
+family completion-receipt SHA-256 is
+`9b89485b22d549daf0eea4f055ff1c6b6357c4fe777b69b0f7bc6bdaed10ab85`.
+Observed phase times were 390.963 seconds for source authentication, 191.984
+seconds for topology/work preflight, 403.300 seconds for weight/cache
+preparation, 213.991 seconds for execution/publication, and 1,200.847 seconds
+total. These are single-run operational observations, not benchmark medians,
+allocator/peak-memory proof, or replay authority. An independent post-run
+reread reproduced the target length and SHA-256 from the published inode.
+
+The pinned 27B source execution is now complete, but D3a quality proof still
+requires matched source-reference validation through this family-owned path;
+an F32 GGUF/CPU run remains only a tiny-model oracle or an explicitly
+preflighted small-model comparison. D3b then materializes exactly one D1 atomic
+option at a time and computes full-distribution KL, top-1, and trajectory
+metrics. The transferable Unsloth lessons are multi-domain native-template
+calibration, heterogeneous precision, separate tuning/validation/holdout data,
+and full-distribution plus trajectory gates—not an unpublished selector
+algorithm. No DWQ, learned affine overlay, or training path is introduced.
 
 ### Phase E — production `--quant auto`
 
