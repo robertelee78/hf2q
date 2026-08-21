@@ -3211,6 +3211,16 @@ impl LoadedModel {
         // MoE Qwen3-VL still bails at this site (no convert pipeline
         // emits it; the dense-only loader cannot consume an MoE GGUF
         // structurally), with the same operator-actionable message.
+        //
+        // **Guarantees tune-up item 1 (2026-08-20)**: iter-228a's
+        // load-then-501 state violated the published fail-closed
+        // guarantee — the server reported ready while every chat /
+        // embed / soft-token request 501'd (forward landed iter-8a-2;
+        // engine seam is ADR-041 iter-9b scope). The dense arm bails
+        // at spawn again until ADR-041 wires the seam; ADR-041
+        // iter-9b-4 deletes this bail in the same commit that lands
+        // the real worker dispatch. The loader + forward stay covered
+        // by tests/qwen3vl_text_lm_forward.rs.
         use crate::inference::models::qwen35::{is_qwen3_vl_arch, is_qwen3_vl_moe_arch};
         if is_qwen3_vl_arch(arch.as_str()) {
             if is_qwen3_vl_moe_arch(arch.as_str()) {
@@ -3223,9 +3233,21 @@ impl LoadedModel {
                     model_path.display(),
                 );
             }
-            // Dense Qwen3-VL — route through iter-228a's load path.
-            let v = super::engine_qwen3vl::Qwen3VlTextLoadedModel::load(opts)?;
-            return Ok(LoadedModel::Qwen3VlText(v));
+            // Dense Qwen3-VL — refuse at spawn until ADR-041 wires the
+            // engine seam (guarantees tune-up item 1, 2026-08-20).
+            // Refusing BEFORE `Qwen3VlTextLoadedModel::load` also avoids
+            // streaming gigabytes of tensors for a server that could not
+            // serve a single request.
+            anyhow::bail!(
+                "Qwen3-VL (dense, general.architecture = {arch:?}) is recognized and its \
+                 text-LM forward is implemented (iter-8a-2), but the serve engine seam is \
+                 not wired yet (ADR-041 iter-9b): every chat / embeddings / soft-token \
+                 request would return HTTP 501. Refusing at load rather than reporting a \
+                 ready server that cannot serve (fail-closed guarantee). For text-only \
+                 chat today use a Qwen3.5/3.6 GGUF; for chat + images use a Gemma 4 \
+                 GGUF. Model: {}",
+                model_path.display(),
+            );
         }
         match arch.as_str() {
             "qwen35" | "qwen35moe" => {

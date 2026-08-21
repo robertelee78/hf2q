@@ -10460,3 +10460,18 @@ an agent honoring Retry-After on it would loop forever. Full decision table,
 variant split (`AdmitError::KvBudgetUnsatisfiable`,
 `EngineAdmitError::KvBudgetUnsatisfiable`), stats counter, and test pins:
 **ADR-040 §7.KV-BUDGET-SPLIT (2026-08-20)**.
+
+## 2026-08-20 — guarantees tune-up item 1: dense Qwen3-VL refuses at spawn (interim, until ADR-041)
+
+iter-228a's staged state — dense Qwen3-VL loads, `/readyz` flips 200,
+`/v1/models` lists it, and every chat / embeddings / soft-token request 501s
+(`qwen3vl_text_forward_pending`; SlotAware drains everything to 501) —
+violated the published "unsupported families are refused up front"
+guarantee. The serve dispatch arm now bails at spawn BEFORE tensor load,
+naming ADR-041 (iter-9b engine seam) and working alternatives (Qwen3.5/3.6
+for text chat; Gemma 4 for chat + images). The CLI `hf2q generate` path
+already bailed (iter-227/228a split unchanged). ADR-041 iter-9b-4 deletes
+the bail when the real worker dispatch lands — full ADR-041 execution is
+approved and targeted at 0.1.8. Pins:
+`load_engine_refuses_dense_qwen3vl_until_adr041_engine_seam` (+ upstream-arch
+sibling) replace the two iter-228a routing pins.

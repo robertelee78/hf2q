@@ -1,6 +1,7 @@
 # ADR-041 — Qwen3-VL Text-LM Engine-Seam Wire-Up (iter-9b)
 
 - **Status**: 📋 STUB — scope carved 2026-05-30 from ADR-040 §6.1.27→§6.1.55. Implementation deferred (multi-day structural work; not in any single ADR-040 iter). When work starts: this ADR moves to PROPOSED with an iter sequencing table.
+- **Updated**: 2026-08-20 — **interim spawn guard landed (guarantees tune-up item 1)**: the serve-side dense-arm dispatch in `serve/api/engine.rs::LoadedModel::load` bails at spawn again (operator-actionable message naming this ADR), replacing iter-228a's load-then-501 state that violated the published "refused up front" guarantee. iter-9b-4 (Generate-arm worker dispatch) DELETES that bail in the same commit that wires the real forward; the pins to flip then are `load_engine_refuses_dense_qwen3vl_until_adr041_engine_seam` + `..._upstream_arch_...` in `src/serve/mod.rs`. Robert approved executing this ADR (2026-08-20, tune-up conversation); targeted post-0.1.7 (0.1.8 scope per release-cut decision).
 - **Created**: 2026-05-30
 - **Owner**: Robert E. Lee
 - **Related**:
