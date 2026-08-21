@@ -394,6 +394,7 @@ def main() -> int:
         "greedy_trajectories": trajectories,
         "implementation": {
             "name": "huggingface_transformers.Qwen3_5ForConditionalGeneration",
+            "producer_sha256": sha256_file(Path(__file__).resolve())[1],
             "repository_url": TRANSFORMERS_REPOSITORY,
             "repository_commit": TRANSFORMERS_COMMIT,
             "package_version": transformers.__version__,

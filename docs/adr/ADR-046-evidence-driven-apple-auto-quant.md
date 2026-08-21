@@ -1411,8 +1411,10 @@ transcripts reuse a fresh per-example cache while advancing every intervening
 teacher token. Generation writes the prompt row and feeds back the canonical
 lowest-ID finite argmax for 31 more steps, yielding exactly 32 tokens. The
 program writes canonical F32 little-endian target framing and a self-hashed
-implementation/trajectory evidence record. It never becomes an hf2q runtime,
-conversion, quantization, tokenization, or inference fallback.
+implementation/trajectory evidence record that binds the producer script's
+exact SHA-256 in addition to the Transformers commit and dependency lock. It
+never becomes an hf2q runtime, conversion, quantization, tokenization, or
+inference fallback.
 
 The hidden `source-teacher-reference` command no-follow opens bounded regular
 files, reauthenticates the official recipe and three-way corpus, rebuilds the

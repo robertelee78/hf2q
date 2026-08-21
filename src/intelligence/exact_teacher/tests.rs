@@ -524,6 +524,7 @@ fn matched_reference_input_and_targets_are_rebuilt_and_compared() {
         greedy_trajectories: reference.receipt().greedy_trajectories.clone(),
         implementation: reference::ExternalReferenceImplementationV1 {
             name: "fixture".into(),
+            producer_sha256: "3".repeat(64),
             repository_url: "https://example.invalid/reference".into(),
             repository_commit: "1".repeat(64),
             package_version: "1.0.0".into(),

@@ -81,6 +81,7 @@ struct ReferenceInputHashView<'a> {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExternalReferenceImplementationV1 {
     pub(crate) name: String,
+    pub(crate) producer_sha256: String,
     pub(crate) repository_url: String,
     pub(crate) repository_commit: String,
     pub(crate) package_version: String,
@@ -253,6 +254,7 @@ pub(crate) fn validate_external_reference_evidence(
         || evidence.target_artifact.byte_len == 0
         || evidence.greedy_trajectories.len() != input.prediction_plan.greedy_prompts.len()
         || implementation.name.is_empty()
+        || !is_sha256(&implementation.producer_sha256)
         || implementation.repository_url.is_empty()
         || !is_sha256(&implementation.repository_commit)
         || implementation.package_version.is_empty()
