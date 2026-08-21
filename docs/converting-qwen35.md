@@ -1,5 +1,7 @@
 # Converting Qwen3.5 / Qwen3.6 Models with hf2q
 
+> Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
+
 Canonical reference for converting the Qwen3.5 / Qwen3.6 model family.
 Two variants are covered: the **27B dense** (`qwen35`) and the **35B-A3B
 MoE** (`qwen35moe`). See `docs/ADR-012-qwen35moe-conversion.md` for the
@@ -222,7 +224,7 @@ ADR-014 P11 re-emits these four GGUFs (and four DWQ safetensors twins)
 through the post-Iter-C streaming pipeline so the artefacts incorporate
 the K-quant base from the start instead of the legacy Q4_0 base. The
 re-emit is **pending hardware** as of 2026-04-27 — it requires the
-M5 Max apex MoE GPU + ~150 GB free disk + a Metal-validated llama.cpp
+M5 Max apex MoE GPU + ~150 GB free disk + a Metal-validated peer
 build that supports the `qwen35moe` MoE expert-routing kernel for
 post-emit verification.
 
@@ -246,13 +248,13 @@ remain the shipping artefacts.
 
 ## Manual smoke test
 
-After conversion, verify that llama.cpp can load the file without errors:
+After conversion, verify that the peer can load the file without errors:
 
 ```bash
 llama-cli --model models/.../out.gguf -p "Hello" -n 8
 ```
 
-Expected: llama.cpp prints the model load summary and emits 8 tokens
+Expected: the peer prints the model load summary and emits 8 tokens
 without error. Inference coherence (sourdough gate, sliding-window
 parity) is **out of scope** for the convert acceptance contract — see
 ADR-013.
@@ -327,7 +329,7 @@ Metal kernels available, the apex MoE path appears to fall back to
 single-thread CPU under heavy memory paging (~4M syscalls/sec,
 single-core saturation, 30 GB RSS). **Apex-scale q4_0 smoke validation
 is impractical without further tuning** (e.g. explicit `-ngl 99` + a
-Metal-validated llama.cpp build that supports the `qwen35moe` MoE
+Metal-validated peer build that supports the `qwen35moe` MoE
 expert-routing kernel).
 
 For now, real-model q4_0 smoke transcripts at apex scale are deferred:
@@ -344,7 +346,7 @@ complete the smoke in seconds — no design change required.
 `tests/convert_qwen35_mtp_roundtrip.rs` (ADR-012 Decision 19, landed
 with ADR-013 P14 cross-link) converts a synthetic
 `mtp_num_hidden_layers: 1` model and asserts the 4 MTP tensors land at
-the exact GGUF names ADR-013's loader + llama.cpp expect:
+the exact GGUF names ADR-013's loader + the peer expect:
 
 ```
 blk.{num_hidden_layers}.nextn.enorm.weight        (llama-arch.cpp:449)

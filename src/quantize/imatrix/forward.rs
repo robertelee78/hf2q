@@ -58,7 +58,7 @@ use crate::serve::multi_seq_kv::SlotId;
 /// in the **F32 input row** (the activation that's about to be matmul'd
 /// against the weight). The collector accumulates `in_sum2[i] += row[i]²`
 /// into its per-tensor [`super::accumulator::Accumulator`] — mirroring
-/// `/opt/llama.cpp/tools/imatrix/imatrix.cpp:380-393`.
+/// `llama-imatrix`'s per-row accumulation.
 ///
 /// `tensor_name` is the canonical GGUF tensor name (e.g.
 /// `"blk.0.attn_q.weight"`). It MUST match the name the convert
@@ -197,9 +197,8 @@ where
 ///
 /// Per-row dispatch: the intercept slices the materialized buffer into
 /// `m` contiguous chunks of `n_per_row` and calls
-/// [`ImatrixCollector::record`] once per token row. This matches the
-/// canonical llama-imatrix semantics at
-/// `/opt/llama.cpp/tools/imatrix/imatrix.cpp:380-393` where the
+/// [`ImatrixCollector::record`] once per token row. This matches
+/// canonical llama-imatrix semantics, where the
 /// per-row sum-of-squares accumulator advances `counts[mat_id] += 1`
 /// per absorbed row — NOT once per dispatch.
 ///
@@ -258,7 +257,7 @@ where
             // Zero-row dispatch — nothing to absorb, not an error.
             return Ok(());
         }
-        // imatrix.cpp:380-393 — accumulate per token row.
+        // Accumulate per token row.
         for row in buf.chunks_exact(n_per_row) {
             collector.record(&name, row);
         }
@@ -281,8 +280,7 @@ pub fn is_active() -> bool {
 /// [`intercept_qmatmul_with_hint`] does NOT see these — they bypass
 /// `dispatch_qmatmul` entirely.
 ///
-/// Contract per `imatrix.cpp:310-330` (canonical llama-imatrix for
-/// `GGML_OP_MUL_MAT_ID`):
+/// Contract (canonical llama-imatrix for `GGML_OP_MUL_MAT_ID`):
 ///
 /// ```text
 /// for each token in 0..n_tokens:
@@ -477,12 +475,12 @@ pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<super::ImatrixDa
     // representative of the underlying activation distribution).
     let inner_ftype = match params.arch {
         Arch::Qwen35Moe | Arch::Qwen35MoeFull => {
-            crate::quantize::ggml_quants::llama_ftype::LlamaFtype::MostlyQ8_0
+            crate::quantize::ggml_quants::ftype::GgufFtype::MostlyQ8_0
         }
-        _ => crate::quantize::ggml_quants::llama_ftype::LlamaFtype::MostlyF16,
+        _ => crate::quantize::ggml_quants::ftype::GgufFtype::MostlyF16,
     };
     let inner_ext = match inner_ftype {
-        crate::quantize::ggml_quants::llama_ftype::LlamaFtype::MostlyQ8_0 => "q8_0",
+        crate::quantize::ggml_quants::ftype::GgufFtype::MostlyQ8_0 => "q8_0",
         _ => "f16",
     };
     let f16_path = tmp.path().join(format!("model.{inner_ext}.gguf"));
@@ -527,12 +525,8 @@ pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<super::ImatrixDa
         }
     })?;
     // Extract BOS token id from the F16 GGUF for the per-chunk
-    // BOS-replacement that canonical llama-imatrix performs (see
-    // `/opt/llama.cpp/tools/imatrix/imatrix.cpp:1012-1014`:
-    //     if (add_bos && j == 0) {
-    //         tokens[seq_start] = llama_vocab_bos(vocab);
-    //     }
-    // — replaces the first token of each chunk with BOS when the
+    // BOS-replacement that canonical llama-imatrix performs
+    // (it replaces the first token of each chunk with BOS when the
     // vocab is configured to add BOS. Without this step every
     // mid-corpus chunk starts with whatever token happens to land
     // at the chunk boundary, and the LM's positional prior is
@@ -550,8 +544,7 @@ pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<super::ImatrixDa
     // ---- 4. Tokenize corpus -------------------------------------------
     //
     // Pass `add_special_tokens=true` to mirror llama-imatrix's
-    // `common_tokenize(prompt, /*add_special=*/true, parse_special)`
-    // at `/opt/llama.cpp/tools/imatrix/imatrix.cpp:932`. This adds
+    // corpus tokenization. This adds
     // the BOS at index 0 if the vocab is configured to do so;
     // matches the canonical chunk-boundary tokenization.
     let tokenizer = loaded.tokenizer();
@@ -865,7 +858,7 @@ mod tests {
 
     /// Multi-token prefill (m > 1) → record() fires once per token row
     /// with the per-row slice of length n_per_row. Mirrors canonical
-    /// llama-imatrix per-row accumulation (imatrix.cpp:380-393).
+    /// llama-imatrix per-row accumulation.
     #[test]
     fn intercept_chunks_multi_token_prefill_into_per_row_records() {
         use std::sync::Mutex;

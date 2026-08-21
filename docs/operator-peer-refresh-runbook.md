@@ -1,14 +1,16 @@
 # Operator runbook: refreshing `tests/evals/reference/*_llama.txt`
 
+> Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
+
 **Author:** ADR-005 iter-220 2026-05-01 (corrected from iter-219b draft)
-**Trigger:** parity_check.sh Gates C + E (vs-llama on long prompts) FAIL with low common-prefix despite hf2q being deterministic.
+**Trigger:** parity_check.sh Gates C + E (vs-peer on long prompts) FAIL with low common-prefix despite hf2q being deterministic.
 **Pre-conditions:** system-quiet window (no parallel-session llama-cli, llama-completion, or hf2q-bench holding the M5 Max GPU; check `ps -A -o %cpu,etime,comm | grep -iE "llama|hf2q"` returns nothing >5% CPU).
 
 **iter-220 correction (2026-05-01):** the iter-219b draft of this runbook used `llama-cli --no-conversation` which the locked commit `b3d758750a` REJECTS at startup with "--no-conversation is not supported by llama-cli, please use llama-completion instead" (and falls back to interactive mode that hangs forever). The CANONICAL invocation is `llama-completion` (raw-completion mode) with the chat template manually applied to the `--prompt` string. The frozen Apr 16 fixtures used this same invocation; the iter-219b draft mis-named the binary based on `scripts/sourdough_qwen35.sh` which is QWEN-specific (Qwen3.5/3.6 chat template inlines cleanly with `llama-cli -st`, but Gemma 4's `<|channel>thought\n<channel|>` template tags leak verbatim under `-st`).
 
 ## Context
 
-The `tests/evals/reference/*_llama.txt` references were captured at llama_cpp_commit `b3d758750a` 2026-04-16. Subsequent ADR-013 / ADR-017 kernel changes drift hf2q's argmax-token selection on long prompts. When the cross-ADR work converges, today's hf2q output may match neither the frozen Apr 16 llama nor today's llama on the same prompt; the canonical tie-breaker is to refresh the llama side at today's hardware to anchor the parity-gate against TODAY's peer-equivalent reference.
+The `tests/evals/reference/*_llama.txt` references were captured at llama_cpp_commit `b3d758750a` 2026-04-16. Subsequent ADR-013 / ADR-017 kernel changes drift hf2q's argmax-token selection on long prompts. When the cross-ADR work converges, today's hf2q output may match neither the frozen Apr 16 peer output nor today's peer output on the same prompt; the canonical tie-breaker is to refresh the peer side at today's hardware to anchor the parity-gate against TODAY's peer-equivalent reference.
 
 ## Steps
 
@@ -136,11 +138,11 @@ Per the live thresholds in `parity_check.sh` (anchored 2026-05-01):
 - `sourdough` requires `common_prefix >= 179` (long-prompt regression-detector floor).
 - `sliding_wrap` requires `common_prefix >= 108` (long-prompt regression-detector floor).
 
-**Option A** — common_prefix meets the threshold against today's freshly-captured llama: copy `/tmp/${p}_llama_refresh.txt` into `tests/evals/reference/${p}_llama.txt`, update `MANIFEST.json` `llama_cpp_commit` field to today's `b3d758750a` short-hash (or whatever locked commit was built), bump `generated` field to today's date.
+**Option A** — common_prefix meets the threshold against today's freshly-captured peer output: copy `/tmp/${p}_llama_refresh.txt` into `tests/evals/reference/${p}_llama.txt`, update `MANIFEST.json` `llama_cpp_commit` field to today's `b3d758750a` short-hash (or whatever locked commit was built), bump `generated` field to today's date.
 
-**Option B** — common_prefix is below threshold even against today's freshly-captured llama: there's a real cross-ADR drift in hf2q's argmax-token selection. Document the divergence point and the divergent token in MANIFEST's `divergence_note` field. Operator decision: lower the threshold (acknowledge cross-implementation drift) OR file an investigation issue against ADR-015 (mlx-native kernel parity) — note that ADR-013/017 ARE the upstream ADRs but the per-token argmax math lives in mlx-native (sibling repo at /opt/mlx-native).
+**Option B** — common_prefix is below threshold even against today's freshly-captured peer output: there's a real cross-ADR drift in hf2q's argmax-token selection. Document the divergence point and the divergent token in MANIFEST's `divergence_note` field. Operator decision: lower the threshold (acknowledge cross-implementation drift) OR file an investigation issue against ADR-015 (mlx-native kernel parity) — note that ADR-013/017 ARE the upstream ADRs but the per-token argmax math lives in mlx-native (sibling repo at /opt/mlx-native).
 
-**iter-220 precedent (2026-05-01):** post 14 days of ADR-013 P16 + ADR-017 phase work, sourdough common_prefix dropped from 3094 → 179 and sliding_wrap dropped from 700 → 108 even after fresh-llama capture at the same locked commit. Both outputs verified coherent on both sides (just argmax-flip on word choice — `flavor and texture are superior` vs `result is a superior flavor and texture`; `"calculating" to "processing"` vs `physical movement to electrical movement`). Floors anchored to today's measurement; any future hf2q kernel change that further reduces common_prefix trips the regression gate.
+**iter-220 precedent (2026-05-01):** post 14 days of ADR-013 P16 + ADR-017 phase work, sourdough common_prefix dropped from 3094 → 179 and sliding_wrap dropped from 700 → 108 even after a fresh peer capture at the same locked commit. Both outputs verified coherent on both sides (just argmax-flip on word choice — `flavor and texture are superior` vs `result is a superior flavor and texture`; `"calculating" to "processing"` vs `physical movement to electrical movement`). Floors anchored to today's measurement; any future hf2q kernel change that further reduces common_prefix trips the regression gate.
 
 ### 7. Re-run release-check to verify
 
@@ -159,6 +161,6 @@ When the refresh lands, the commit message MUST include:
 - `hardware`: M5 Max | M5 Pro | etc. (re-measurement is hardware-anchored per `project_end_gate_reality_check`).
 - `system_quiet_evidence`: `ps -A | grep -iE "llama|hf2q" | head -3` output proving no contention.
 - The `common_prefix` value for each prompt and its relation to the threshold.
-- Per-prompt diff summary: where today's hf2q vs today's llama first diverge (byte offset + 50-byte snippet around the divergence).
+- Per-prompt diff summary: where today's hf2q vs today's peer output first diverge (byte offset + 50-byte snippet around the divergence).
 
 These receipts are the operator's audit trail for the parity-gate adjustment. Future iterations can bisect ADR-005 closure quality by reading them.

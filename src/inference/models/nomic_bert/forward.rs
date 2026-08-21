@@ -1,7 +1,7 @@
 //! nomic-bert encoder forward pass on Metal GPU (ADR-005 Phase 2b, Task #16).
 //!
-//! Composes the per-block topology that matches llama.cpp's `llm_build_bert`
-//! with `arch == LLM_ARCH_NOMIC_BERT` (per `/opt/llama.cpp/src/models/bert.cpp`):
+//! Composes the per-block topology that matches the peer's `llm_build_bert`
+//! with `arch == LLM_ARCH_NOMIC_BERT`:
 //!
 //! ```text
 //!   inpL  = LayerNorm(token_embd[ids] + maybe token_types[type_ids])
@@ -261,7 +261,7 @@ fn alloc_rope_params(
 
 /// Build a BF16 padding mask of shape `[seq_len, seq_len]` for
 /// `flash_attn_prefill_bf16_d64` SeqMajor.  Attended positions hold `0.0`,
-/// masked positions hold `-INFINITY` (llama.cpp convention — see
+/// masked positions hold `-INFINITY` (the peer's convention — see
 /// `flash_attn_prefill.rs` module doc).
 ///
 /// Built once per request from `valid_token_count`; broadcast across heads
@@ -378,7 +378,7 @@ pub struct NomicBertEncoderBlockTensors<'a> {
 /// - `input`     F32 `[seq_len, hidden]`
 /// - `tensors`   per-layer weight bundle
 /// - `mask_bf16` BF16 `[seq_len, seq_len]` additive padding mask
-///               (`0.0` = attend, `-INFINITY` = mask out, llama.cpp
+///               (`0.0` = attend, `-INFINITY` = mask out, the peer's
 ///               convention).  Built once per request via
 ///               `alloc_nomic_attn_mask_bf16` and broadcast across heads
 ///               + batch by the flash-attn dispatcher's rank-2 stride
@@ -534,7 +534,7 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     // contiguous.
     //
     // `rope_dim = head_dim` for nomic-bert (full rotary, every dimension
-    // rotated). Per `bert.cpp:63-67` llama.cpp passes `n_rot` which is
+    // rotated). The peer passes `n_rot` which is
     // `n_embd_head` (the head_dim).
     let q_rotated = device
         .alloc_buffer(
@@ -769,8 +769,7 @@ pub fn apply_nomic_bert_encoder_block_gpu(
 
     // ---- 6. SwiGLU FFN ----
     //
-    // Per llama.cpp `build_ffn(LLM_FFN_SILU, LLM_FFN_PAR)` semantics
-    // (graph.cpp:1141-1280):
+    // Per the peer's `build_ffn(LLM_FFN_SILU, LLM_FFN_PAR)` semantics:
     //   tmp  = up(cur)            // ffn_up linear
     //   cur  = gate(cur)          // ffn_gate linear (PAR: from input, not tmp)
     //   cur  = swiglu_split(cur, tmp) = silu(cur) * tmp
@@ -1419,8 +1418,7 @@ pub(crate) mod tests {
     /// against `nomic-embed-text-v1.5-f16.gguf` with `--pooling mean`.
     /// Generated 2026-04-26 via:
     ///   `llama-embedding -m nomic-embed-text-v1.5-f16.gguf -p "hello world" --pooling mean --embd-output-format json`
-    /// (binary: `/opt/homebrew/Cellar/llama.cpp/8680/bin/llama-embedding`,
-    /// release b8680). The output is l2-normalized (||y||₂ ≈ 1.000000)
+    /// (llama-embedding release b8680). The output is l2-normalized (||y||₂ ≈ 1.000000)
     /// per llama-embedding's default normalization.
     #[rustfmt::skip]
     const LLAMA_EMBEDDING_GROUND_TRUTH_HELLO_WORLD: [f32; 768] = [
@@ -1855,7 +1853,7 @@ pub(crate) mod tests {
         let mean = timings.iter().sum::<f64>() / timings.len() as f64;
         let min = timings.iter().cloned().fold(f64::INFINITY, f64::min);
         eprintln!(
-            "  --> mean {:.2} ms, min {:.2} ms (llama-embedding reference: ~4.54 ms)",
+            "  --> mean {:.2} ms, min {:.2} ms (peer reference: ~4.54 ms)",
             mean, min
         );
     }
@@ -1872,16 +1870,16 @@ pub(crate) mod tests {
     /// order:**
     /// 1. **Fused-QKV slice convention** — verify Q at bytes [0, K·N·4),
     ///    K at [K·N·4, 2·K·N·4), V at [2·K·N·4, 3·K·N·4) matches the
-    ///    output-dim ordering llama.cpp uses in `create_tensor_qkv`.
+    ///    output-dim ordering the peer uses in `create_tensor_qkv`.
     ///    The diagnostic A/B is to extract Q/K/V into separate buffers
     ///    at load-time and re-run; if cosine improves to ≥ 0.999, the
     ///    slice ordering is wrong.
     /// 2. **RoPE convention** — verify NeoX pair convention matches
-    ///    llama.cpp's `LLAMA_ROPE_TYPE_NORM` for nomic-bert (per
-    ///    llama-arch.cpp:9266). Try interleaved (`dispatch_rope`) as A/B.
+    ///    the peer's `LLAMA_ROPE_TYPE_NORM` for nomic-bert.
+    ///    Try interleaved (`dispatch_rope`) as A/B.
     /// 3. **SwiGLU operand order** — `dispatch_silu_mul(gate, up, out)`
-    ///    computes `silu(gate) * up`. llama.cpp's `swiglu_split(cur=gate,
-    ///    tmp=up)` per graph.cpp:1220. Should match. Verify by swapping
+    ///    computes `silu(gate) * up`. The peer's `swiglu_split(cur=gate,
+    ///    tmp=up)`. Should match. Verify by swapping
     ///    args.
     /// 4. **Pre-existing BERT-lane parity gap** — bge uses CLS pool, so
     ///    even if the per-token output diverges, CLS taking position 0

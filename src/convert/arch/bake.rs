@@ -41,16 +41,11 @@ use std::ops::Range;
 pub enum BakeOp {
     /// Element-wise `x → x + 1.0`. Used by Qwen 3.5 / 3.6 for every
     /// post-remap `norm.weight` except the `linear_attn.norm.weight`
-    /// (which becomes `ssm_norm.weight` in GGUF). Mirrors
-    /// `/opt/llama.cpp/conversion/qwen.py:303-304` —
-    /// `data_torch = data_torch + 1` in
-    /// `Qwen3NextModel.modify_tensors`.
+    /// (which becomes `ssm_norm.weight` in GGUF).
     AddOne,
 
     /// Element-wise `x → -exp(x)`. Used by SSM `A_log` tensors in
-    /// Qwen 3.5 / 3.6 linear-attention layers. Mirrors
-    /// `/opt/llama.cpp/conversion/qwen.py:297` —
-    /// `data_torch = -torch.exp(data_torch)`.
+    /// Qwen 3.5 / 3.6 linear-attention layers.
     NegExp,
 
     /// Slice the buffer to `[start..end]` and return only those
@@ -69,9 +64,7 @@ pub enum BakeOp {
     /// for `in_proj_qkv` where only the V rows need reordering, not
     /// the Q and K rows.
     ///
-    /// Mirrors `/opt/llama.cpp/conversion/qwen.py:354-369` —
-    /// `_LinearAttentionVReorderBase._reorder_v_heads` with `dim=0`
-    /// and explicit `head_dim`. The orphan implementation at
+    /// The orphan implementation at
     /// `/opt/hf2q/src/models/qwen35/mod.rs:379-428` is the byte-cmp
     /// reference and uses identical index math; this enum re-encodes
     /// the same algorithm in the streaming-IR vocabulary.
@@ -86,11 +79,10 @@ pub enum BakeOp {
     /// `[outer_count, axis_size, inner_count]` (C-contiguous,
     /// outer-first) along the middle axis into halves. `half=First`
     /// returns the first `axis_size/2` rows per outer; `half=Second`
-    /// returns the second half. Mirrors canonical
-    /// `/opt/llama.cpp/conversion/qwen.py:99-112` — the pre-fused
+    /// returns the second half. Used for the pre-fused
     /// `mlp.experts.gate_up_proj` (HF shape `[n_expert, 2*n_ff,
-    /// n_embd]`) splits into separate gate and up tensors before
-    /// downstream MoE merge.
+    /// n_embd]`), which splits into separate gate and up tensors
+    /// before downstream MoE merge.
     SplitAxisHalf {
         outer_count: usize,
         axis_size: usize,
@@ -104,10 +96,8 @@ pub enum BakeOp {
     /// reordered independently using the same grouped→tiled swap as
     /// [`BakeOp::ReorderVHeads`]. Used by Qwen 3.5/3.6
     /// `linear_attn.out_proj.weight` where the column axis (input
-    /// dim) carries the V-head layout. Mirrors canonical
-    /// `qwen.py:5402-5408` (case 6 in orphan
-    /// `src/models/qwen35/mod.rs:670-705`) — `dim=-1` with
-    /// `head_dim=head_v_dim`.
+    /// dim) carries the V-head layout (case 6 in orphan
+    /// `src/models/qwen35/mod.rs:670-705`).
     ReorderVHeadsPerRow {
         row_count: usize,
         num_k_heads: usize,
@@ -132,9 +122,7 @@ pub enum BakeOp {
     /// squeeze followed by a sliced reorder (`conv1d.weight`).
     Sequence(Vec<BakeOp>),
 
-    /// Llama Q/K RoPE-halves permute. Mirrors canonical
-    /// `/opt/llama.cpp/conversion/llama.py:98-104` —
-    /// `LlamaModel.permute(weights, n_head, n_head_kv_or_n_head)`:
+    /// Llama Q/K RoPE-halves permute. Canonical transform:
     ///
     /// ```text
     /// weights.reshape(n_head, 2, head_dim/2, *inner)
@@ -146,7 +134,7 @@ pub enum BakeOp {
     /// is interpreted as `[n_head, 2, head_dim/2]` (HF native layout
     /// where each head's `head_dim` rows are split into two halves
     /// representing real/imag pairs for the RoPE rotation). After
-    /// swap+reshape, the layout becomes the llama.cpp convention
+    /// swap+reshape, the layout becomes the GGUF convention
     /// where pairs are interleaved as `[real, imag, real, imag, ...]`
     /// in the row axis.
     ///
@@ -165,7 +153,7 @@ pub enum BakeOp {
     /// Nomic-bert-moe expert UP-weight reshape. Pure metadata: the
     /// safetensors stores `mlp.experts.mlp.w1` as a 2-D tensor of
     /// shape `[n_experts * n_inner, n_embd]` (MegaBlocks-style row-
-    /// major flat layout), but llama.cpp's `nomic-bert-moe` arch
+    /// major flat layout), but the peer's `nomic-bert-moe` arch
     /// expects `ffn_up_exps.weight` as a 3-D tensor of shape
     /// `[n_experts, n_inner, n_embd]` (PyTorch order; equivalent
     /// GGUF-order `[n_embd, n_inner, n_experts]`). The byte stream
@@ -173,9 +161,6 @@ pub enum BakeOp {
     /// row-major / C-contiguous with the same innermost-fastest
     /// `n_embd` axis. Plan-build is responsible for emitting the 3-D
     /// `gguf_shape` via the same path as [`BakeOp::Squeeze`].
-    ///
-    /// Mirrors canonical `/opt/llama.cpp/conversion/bert.py:373-376`:
-    /// `data_torch.view(n_experts, self.hparams["n_inner"], self.hparams["n_embd"])`.
     MoeExpertReshape {
         n_experts: usize,
         n_inner: usize,
@@ -191,9 +176,6 @@ pub enum BakeOp {
     /// transpose moves data: per expert `e`, the inner `[n_inner,
     /// n_embd]` matrix at offset `e * n_inner * n_embd` is transposed
     /// to `[n_embd, n_inner]`.
-    ///
-    /// Mirrors canonical `/opt/llama.cpp/conversion/bert.py:377-380`:
-    /// `data_torch = data_torch.view(n_experts, n_inner, n_embd).transpose(1, 2)`.
     MoeExpertTranspose {
         n_experts: usize,
         n_inner: usize,
@@ -203,8 +185,8 @@ pub enum BakeOp {
     /// ViT patch-embedder 2-D → 4-D reshape + permute. The HF source is
     /// a 2-D linear-projection weight of shape
     /// `[out_features, patch_h * patch_w * channels]` (row-major,
-    /// inner axis = flattened patch in (h, w, c) order). Canonical's
-    /// /opt/llama.cpp/conversion/gemma.py:834-838 (Gemma 4 vision):
+    /// inner axis = flattened patch in (h, w, c) order). Canonical
+    /// transform (Gemma 4 vision):
     ///
     /// ```python
     /// n_embd, ksize_sq_c = data_torch.shape       # (1152, 768)
@@ -697,8 +679,7 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
             // Reshape 2-D [out_features, patch_h*patch_w*channels]
             // (HF, inner = HWC) to logical 4-D [out_features, channels,
             // patch_h, patch_w] (CHW per channel — torch conv2d kernel
-            // layout). Element transform per canonical
-            // /opt/llama.cpp/conversion/gemma.py:834-838:
+            // layout). Canonical element transform:
             //   .reshape(out, patch_h, patch_w, channels) → axes 0,1,2,3
             //   .permute(0, 3, 1, 2)                        → axes 0,3,1,2
             //
@@ -1155,7 +1136,7 @@ mod tests {
 
     #[test]
     fn split_axis_half_first_returns_leading_rows_per_outer() {
-        // Mirrors canonical /opt/llama.cpp/conversion/qwen.py:99-112 on
+        // Canonical gate/up split on
         // a small fixture: HF `[n_expert=2, 2*n_ff=4, n_embd=3]`
         // gate_up_proj. First-half = gate, second-half = up.
         //   expert 0: [ a0 a1 a2 | b0 b1 b2 | c0 c1 c2 | d0 d1 d2 ]

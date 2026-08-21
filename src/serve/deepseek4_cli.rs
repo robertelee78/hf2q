@@ -288,10 +288,10 @@ fn run_benchmark(
     for run in 0..RUNS {
         cache.reset().context("reset DeepSeek-V4 benchmark cache")?;
 
-        // Match llama.cpp's timing boundary: prompt evaluation includes the
+        // Match the peer's timing boundary: prompt evaluation includes the
         // output head that produces the first generated token. Decode timing
         // then contains one verifier + output-head evaluation per subsequent
-        // token (llama.cpp reports these as its eval runs).
+        // token (the peer reports these as its eval runs).
         let prefill_started = Instant::now();
         let final_state = model
             .forward_verifier_prompt(prompt_tokens, cache)

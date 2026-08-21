@@ -24,7 +24,7 @@ pub(super) fn profiling_enabled() -> bool {
 // §853-866) — the encode→F32-shadow→decode round-trip introduced
 // quantization noise the inline-fused `flash_attn_vec_tq` / `flash_attn_vec_tq_hb`
 // kernels do not have. Worker R's TurboQuant peer-impl research (TheTom
-// llama.cpp Phase 4b, animehacker CUDA, ollama mverrilli, sharpner-MLX V2,
+// peer-engine Phase 4b, animehacker CUDA, ollama mverrilli, sharpner-MLX V2,
 // vivekvar-dl turbokv) found every shipping production engine uses inline-fused
 // dequant as the default; the dequant-then-dense path is universally treated
 // as an ablation. Per the user's mantra ("Fallback is basically a swear word

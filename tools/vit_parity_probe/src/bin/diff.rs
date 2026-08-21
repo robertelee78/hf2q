@@ -1,9 +1,9 @@
-//! Stage-by-stage element-wise diff between hf2q and llama.cpp ViT dumps.
+//! Stage-by-stage element-wise diff between hf2q and peer ViT dumps.
 //!
 //! ADR-005 Phase 2c iter 124 (W55).
 //!
 //! Reads two dump directories produced by `HF2Q_VIT_DUMP=...` (hf2q) and
-//! by the C++ `peer_dumper` (llama.cpp), pairs them by stage name, and
+//! by the C++ `peer_dumper`, pairs them by stage name, and
 //! reports the max-abs-err per stage along with the first stage where
 //! the divergence exceeds a tolerance.
 //!

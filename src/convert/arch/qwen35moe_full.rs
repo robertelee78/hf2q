@@ -4,23 +4,19 @@
 //! older `qwen3moe` dense-MoE variant handled by
 //! [`crate::convert::arch::qwen35moe`].
 //!
-//! # Source-of-truth
-//! Port of `/opt/llama.cpp/conversion/qwen.py:626-628` —
-//! `Qwen3_5MoeTextModel(_Qwen35MtpMixin, _Qwen35MRopeMixin,
-//! _LinearAttentionVReorderBase)`. Inheritance chain pulls in three
-//! sources of HF→GGUF mapping behavior:
+//! # Mapping behavior
+//! The canonical HF→GGUF mapping combines four rule sets:
 //!
-//! - `Qwen3NextModel.modify_tensors` (qwen.py:296-345) — `.A_log` →
+//! - Qwen3Next-style value bakes — `.A_log` →
 //!   `-exp(.)`, `.dt_bias` rename, `conv1d` squeeze, `norm.weight + 1`
 //!   bake (except `linear_attn.norm.weight`).
-//! - `_LinearAttentionVReorderBase._reorder_v_heads` (qwen.py:354-369)
-//!   — V-head grouped→tiled reorder for `in_proj_qkv`, `in_proj_z`,
+//! - V-head grouped→tiled reorder for `in_proj_qkv`, `in_proj_z`,
 //!   `in_proj_a`, `in_proj_b`, `A_log`, `dt_bias`, `dt_proj`,
 //!   `conv1d`, `out_proj`.
-//! - `_Qwen35MtpMixin.modify_tensors` (qwen.py:597-618) — `mtp.*`
+//! - MTP remap — `mtp.*`
 //!   tensor remap into `model.layers.{N+n_layer}.*` form so the
-//!   inherited tensor_map handles them.
-//! - `Qwen2MoeModel.modify_tensors` (qwen.py:93-145) — pre-fused
+//!   shared per-block rules handle them.
+//! - Qwen2MoE expert fusion — pre-fused
 //!   `mlp.experts.gate_up_proj` split into separate gate + up
 //!   tensors before downstream expert merge.
 //!
@@ -123,7 +119,7 @@ pub struct Qwen35MoeFullCtx {
     /// Drop the MTP (Multi-Token-Prediction / NextN) block at
     /// `blk.{num_hidden_layers}.*` from the emitted GGUF. Set via
     /// the `HF2Q_QWEN35_DROP_MTP=1` env at convert time. Workaround
-    /// for stock llama.cpp which expects all blocks (including the
+    /// for the stock peer which expects all blocks (including the
     /// MTP block) to share the linear-attention slot layout and bails
     /// with `missing tensor 'blk.{N}.ssm_conv1d.weight'` otherwise.
     /// When set: (a) `mtp.*` source tensors map to `Drop`, (b)
@@ -259,7 +255,7 @@ pub fn map_tensor_name(
     if let Some(rest) = canonical_ref.strip_prefix("mtp.") {
         if ctx.drop_mtp {
             // HF2Q_QWEN35_DROP_MTP=1: skip the MTP block entirely so
-            // stock llama.cpp can load the file. See `Qwen35MoeFullCtx::drop_mtp`.
+            // the stock peer can load the file. See `Qwen35MoeFullCtx::drop_mtp`.
             return Some(MappedTensor::Drop);
         }
         return map_mtp(rest, hf_shape, ctx);
@@ -818,8 +814,8 @@ pub fn build_metadata(
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
     // HF2Q_QWEN35_DROP_MTP=1 strips MTP block from emitted GGUF; reflect
-    // the strip in block_count + nextn_predict_layers metadata so stock
-    // llama.cpp's create_tensor loop terminates at num_hidden_layers and
+    // the strip in block_count + nextn_predict_layers metadata so the
+    // stock peer's tensor-create loop terminates at num_hidden_layers and
     // doesn't expect blk.{num_hidden_layers}.ssm_conv1d.weight.
     let n_mtp = if ctx.drop_mtp { 0 } else { n_mtp_raw };
     let n_layers = n_layers_base + n_mtp;
@@ -1474,7 +1470,7 @@ mod tests {
         }
         // shared_expert_gate is squeezed (1, hidden) → (hidden) so it
         // lands in is_f32_keep_tensor's 1-D F32 path (matching
-        // canonical /opt/llama.cpp/conversion/base.py:825-826).
+        // canonical behavior).
         match map_tensor_name(
             "model.language_model.layers.2.mlp.shared_expert_gate.weight",
             &[],

@@ -10,7 +10,7 @@
 //!
 //! # GGUF metadata keys
 //!
-//! llama.cpp's mmproj GGUF writer uses the `clip.*` namespace (mmproj
+//! The peer's mmproj GGUF writer uses the `clip.*` namespace (mmproj
 //! inherits CLIP's vision-tower semantics). Key conventions:
 //!
 //!   - `general.architecture = "clip"`  (enforced by this parser)
@@ -42,10 +42,10 @@
 //!     bool array; we present it as a sorted `Vec<u32>` of true-indexes
 //!     for consumer-friendliness.
 //!   - Per-flagged-layer `v.deepstack.{N}.{norm,fc1,fc2}.{weight,bias}`
-//!     tensors (TN_DEEPSTACK_NORM/FC1/FC2; clip-impl.h:117-119). The
+//!     tensors. The
 //!     primary projector is still the CLIP-classic two-layer MLP at
-//!     `mm.0.weight` + `mm.2.weight` (clip.cpp:1844-1850, identical
-//!     load shape to PROJECTOR_TYPE_MLP).
+//!     `mm.0.weight` + `mm.2.weight` (identical load shape to the
+//!     plain MLP projector).
 //!
 //! Detection rule (`detect_arch_profile`): for tensor-only callers, the
 //! presence of `v.deepstack.0.fc1.weight` is the canonical Qwen3-VL
@@ -55,14 +55,13 @@
 //! `ProjectorType::Qwen3VlMerger` regardless of tensor enumeration.
 //!
 //! Detection uses `v.deepstack.0.fc1.weight` (a tensor name) rather
-//! than a metadata flag because llama.cpp does NOT define a dedicated
-//! `clip.has_qwen3vl_merger` GGUF key (verified in
-//! `/opt/llama.cpp/tools/mtmd/clip-impl.h` 2026-05-01) — only the
+//! than a metadata flag because the peer does NOT define a dedicated
+//! `clip.has_qwen3vl_merger` GGUF key — only the
 //! projector-type string and the per-layer DeepStack tensors uniquely
 //! identify a Qwen3-VL mmproj. The Worker W audit
 //! (`wedge4-qwen35-vision-plan.md`) initially named a
 //! `clip.has_qwen3vl_merger` flag; this implementation drops that
-//! assumption in favor of the actual upstream signal set.
+//! assumption in favor of the peer's actual signal set.
 //!
 //! # What this iter does NOT do
 //!
@@ -93,8 +92,7 @@ pub enum ProjectorType {
     /// Perceiver-style resampler (uncommon; present in some VLMs).
     Resampler,
     /// Gemma-4 vision projector — single `Gemma4ClippableLinear` head
-    /// (clamp-then-linear-then-clamp; see
-    /// `/opt/llama.cpp/tools/mtmd/clip-impl.h:323` ↦ "gemma4v").
+    /// (clamp-then-linear-then-clamp; projector-type string "gemma4v").
     /// hf2q runtime path lives in
     /// `vit_gpu::gemma4v_apply_full_forward_gpu` (W25 iter-115 +
     /// W26 iter-116a + iter-117/118 kernel fixes); the
@@ -104,9 +102,8 @@ pub enum ProjectorType {
     Gemma4v,
     /// Qwen3-VL spatial-merger projector — 2×2 patch merge → 2-layer
     /// MLP (`mm.0`/`mm.2`) → optional per-layer DeepStack heads at
-    /// `v.deepstack.{N}.{fc1,fc2,norm}`. llama.cpp constant
-    /// `PROJECTOR_TYPE_QWEN3VL` writes string `"qwen3vl_merger"`
-    /// (`/opt/llama.cpp/tools/mtmd/clip-impl.h:318`).
+    /// `v.deepstack.{N}.{fc1,fc2,norm}`. The peer writes the
+    /// projector-type string `"qwen3vl_merger"` for this shape.
     ///
     /// **Wedge-4b note (iter-224, this iter):** `is_supported()` returns
     /// `false` while the runtime ViT path is still queued under
@@ -130,14 +127,13 @@ impl ProjectorType {
         match s {
             "mlp" => ProjectorType::Mlp,
             "resampler" => ProjectorType::Resampler,
-            // llama.cpp's `PROJECTOR_TYPE_GEMMA4V` writes the literal
-            // string "gemma4v" via PROJECTOR_TYPE_NAMES (clip-impl.h:323).
+            // The peer writes the literal string "gemma4v" for this
+            // projector.
             // hf2q's writer matches via `build_mmproj_metadata`
             // (`backends/gguf.rs:606-610`).
             "gemma4v" => ProjectorType::Gemma4v,
-            // llama.cpp's `PROJECTOR_TYPE_QWEN3VL` writes the literal
-            // string "qwen3vl_merger" via PROJECTOR_TYPE_NAMES
-            // (`/opt/llama.cpp/tools/mtmd/clip-impl.h:318`). iter-224
+            // The peer writes the literal string "qwen3vl_merger" for
+            // this projector. iter-224
             // Wedge-4b: parse-only; the runtime forward path is still
             // queued under Wedge-4c.
             "qwen3vl_merger" => ProjectorType::Qwen3VlMerger,
@@ -245,17 +241,14 @@ pub struct MmprojConfig {
     ///
     /// **Source format**: GGUF stores this as a **boolean array of
     /// length `block_count`** under
-    /// `KEY_IS_DEEPSTACK_LAYERS = "clip.vision.is_deepstack_layers"`
-    /// (clip-impl.h:50). Writer reference:
-    /// `gguf_writer.add_array(IS_DEEPSTACK_LAYERS, layers)` at
-    /// `/opt/llama.cpp/gguf-py/gguf/gguf_writer.py:1219-1220`.
+    /// `"clip.vision.is_deepstack_layers"`.
     /// Conversion: indexes where `bool[i] == true` are pushed in
     /// ascending order.
     pub deepstack_indexes: Option<Vec<u32>>,
 }
 
 /// Read `clip.vision.is_deepstack_layers` (a `Bool[block_count]` array
-/// per `/opt/llama.cpp/tools/mtmd/clip-impl.h:50`) and convert to a
+/// per the peer's convention) and convert to a
 /// sorted ascending `Vec<u32>` of true-flagged layer indexes.
 ///
 /// Returns `Ok(None)` when the key is absent (non-Qwen3-VL mmproj).
@@ -352,7 +345,7 @@ impl MmprojConfig {
         let projector_str = gguf.metadata_string("clip.projector_type").unwrap_or("mlp");
         let projector = ProjectorType::from_str_gguf(projector_str);
 
-        // Optional mean/std arrays. llama.cpp writes each as `Array(Float32
+        // Optional mean/std arrays. The peer writes each as `Array(Float32
         // × 3)`. Fall back to Gemma 4's [0.5, 0.5, 0.5] when absent.
         let read_triple = |key: &str, default: [f32; 3]| -> [f32; 3] {
             match gguf.metadata(key) {
@@ -428,18 +421,17 @@ impl MmprojConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Tensor-name table (llama.cpp mmproj convention)
+// Tensor-name table (the peer's mmproj convention)
 // ---------------------------------------------------------------------------
 //
-// Standard llama.cpp mmproj tensor naming uses a `v.` prefix:
+// Standard mmproj tensor naming uses a `v.` prefix:
 //   - v.patch_embd.weight          — Conv2d patch stem weight [hidden, 3, patch, patch]
 //   - v.patch_embd.bias            — optional
 //   - v.position_embd.weight       — [num_patches (+1 cls), hidden]
 //   - v.blk.{N}.attn_q.{weight,bias}
 //   - v.blk.{N}.attn_k.{weight,bias}
 //   - v.blk.{N}.attn_v.{weight,bias}
-//   - v.blk.{N}.attn_out.{weight,bias}    (TN_ATTN_OUTPUT short form,
-//                                           clip-impl.h:82)
+//   - v.blk.{N}.attn_out.{weight,bias}    (short form)
 //   - v.blk.{N}.attn_norm.{weight,bias}
 //   - v.blk.{N}.ffn_up.{weight,bias}
 //   - v.blk.{N}.ffn_down.{weight,bias}
@@ -463,11 +455,10 @@ pub const TENSOR_MM_0_BIAS: &str = "mm.0.bias";
 /// MLP projector second linear.
 pub const TENSOR_MM_2_WEIGHT: &str = "mm.2.weight";
 pub const TENSOR_MM_2_BIAS: &str = "mm.2.bias";
-/// gemma4v projector head — `TN_MM_INP_PROJ` at
-/// `/opt/llama.cpp/tools/mtmd/clip-impl.h:110`. Distinct base name
+/// gemma4v projector head. Distinct base name
 /// from the CLIP-classic `mm.0.weight` because gemma4v's projector is
-/// a `Gemma4ClippableLinear`, not an MLP. clip.cpp:1937 hard-requires
-/// this exact name when `proj_type == PROJECTOR_TYPE_GEMMA4V`.
+/// a `Gemma4ClippableLinear`, not an MLP. The peer hard-requires
+/// this exact name for the gemma4v projector type.
 pub const TENSOR_MM_INPUT_PROJECTION_WEIGHT: &str = "mm.input_projection.weight";
 
 // ---------------------------------------------------------------------------
@@ -476,38 +467,32 @@ pub const TENSOR_MM_INPUT_PROJECTION_WEIGHT: &str = "mm.input_projection.weight"
 //
 // Qwen3-VL augments the standard CLIP-classic per-block tensor set with
 // a per-flagged-layer DeepStack head fed back into the LM. Naming
-// matches llama.cpp's `TN_DEEPSTACK_*` family
-// (`/opt/llama.cpp/tools/mtmd/clip-impl.h:117-119`):
+// matches the peer's deepstack tensor-name family:
 //
 //   - v.deepstack.{N}.norm.{weight,bias}    (LayerNorm before the
 //                                            DeepStack MLP)
 //   - v.deepstack.{N}.fc1.{weight,bias}     (Linear → GELU → Linear)
 //   - v.deepstack.{N}.fc2.{weight,bias}
 //
-// Per clip.cpp:1697-1705, these are loaded as OPTIONAL on every block —
-// the model treats a layer as "deepstack" when the trio is present
-// (`has_deepstack()` returns true). Validator behavior: when
+// The peer loads these as OPTIONAL on every block —
+// it treats a layer as "deepstack" when the trio is present.
+// Validator behavior: when
 // `MmprojConfig.deepstack_indexes` is `Some(vec)`, require the trio
 // for every flagged index. When `None` (key absent), skip the
-// deepstack tensor check entirely (lenient — mirrors llama.cpp's
+// deepstack tensor check entirely (lenient — matches the peer's
 // "load if present" semantics for the per-layer fields).
 
 /// Per-DeepStack-layer tensor name. `suffix` is e.g. `"fc1.weight"` or
-/// `"norm.bias"`.
-///
-/// Source format string: `TN_DEEPSTACK_FC1 = "v.deepstack.%d.fc1.%s"`
-/// at `/opt/llama.cpp/tools/mtmd/clip-impl.h:118`. Matching constants
-/// for `norm` (line 117) and `fc2` (line 119).
+/// `"norm.bias"`. Format: `v.deepstack.{N}.{norm,fc1,fc2}.{weight,bias}`.
 pub fn vit_deepstack_tensor(layer_idx: usize, suffix: &str) -> String {
     format!("v.deepstack.{}.{}", layer_idx, suffix)
 }
 
 /// Required DeepStack-tensor suffixes for a flagged Qwen3-VL layer.
-/// Bias tensors are present in the upstream definition but llama.cpp's
-/// loader treats them as optional (`get_tensor(..., false)`); the
-/// validator enforces only the weights, matching the
-/// `has_deepstack()` predicate at clip-model.h:227-229 which keys on
-/// `deepstack_fc1_w != nullptr`.
+/// Bias tensors are present in the upstream definition but the peer's
+/// loader treats them as optional; the
+/// validator enforces only the weights, matching the peer's
+/// deepstack-detection predicate, which keys on the fc1 weight alone.
 pub const DEEPSTACK_REQUIRED_SUFFIXES: &[&str] = &["norm.weight", "fc1.weight", "fc2.weight"];
 
 /// Per-layer tensor name helper.
@@ -523,13 +508,13 @@ pub fn vit_layer_tensor(layer_idx: usize, suffix: &str) -> String {
 ///
 /// Detection rule (order matters — first match wins):
 ///   - `Qwen3VlSiglip` — file ships `v.deepstack.0.fc1.weight` (the
-///     unique Qwen3-VL DeepStack head; clip-impl.h:118). This wins
+///     unique Qwen3-VL DeepStack head). This wins
 ///     over `Gemma4Siglip` because Qwen3-VL inherits Gemma 4's
 ///     `ln1`/`ln2` per-block layout but adds DeepStack on top.
 ///   - `Gemma4Siglip` — per-block has `ln1.weight`, `ln2.weight`, and
 ///     `ffn_post_norm.weight` (Gemma 4's dual-LN SigLIP variant —
-///     llama.cpp's `TN_FFN_POST_NORM` short form, clip-impl.h:95).
-///   - `ClipClassic`  — per-block has `attn_norm.weight` (llama.cpp's
+///     the peer's short form).
+///   - `ClipClassic`  — per-block has `attn_norm.weight` (the peer's
 ///     default CLIP-style writer).
 ///   - `Unknown`      — none matched. Forward pass not supported.
 ///
@@ -676,17 +661,16 @@ impl VisionFamily {
 /// Returns `Unknown` when the file has neither marker, which the
 /// validator maps to a 400 `no_mmproj_loaded`-style error at request time.
 ///
-/// W41 iter-116i: gemma4 marker tightened to llama.cpp's actual
-/// `TN_FFN_POST_NORM = "%s.blk.%d.ffn_post_norm.%s"`
-/// (`/opt/llama.cpp/tools/mtmd/clip-impl.h:95`); the prior
-/// `post_ffw_norm.weight` literal predates that header convention
-/// and never appeared in real llama.cpp-emitted gemma4 mmproj files.
+/// W41 iter-116i: gemma4 marker tightened to the peer's actual
+/// `v.blk.{N}.ffn_post_norm.*` naming; the prior
+/// `post_ffw_norm.weight` literal predates that convention
+/// and never appeared in real peer-emitted gemma4 mmproj files.
 /// The legacy spelling is still accepted as a fallback so any older
 /// fixtures don't regress.
 ///
 /// **iter-224 Wedge-4b**: Qwen3-VL detection probes for
-/// `v.deepstack.0.fc1.weight` — the canonical DeepStack head tensor
-/// at clip-impl.h:118. This is unique to the qwen3vl projector
+/// `v.deepstack.0.fc1.weight` — the canonical DeepStack head
+/// tensor. This is unique to the qwen3vl projector
 /// family (no other clip projector emits a `v.deepstack.*` tensor),
 /// so it's a sound first-match for the order. Callers that have
 /// the parsed `ProjectorType` available should prefer
@@ -724,9 +708,8 @@ pub fn detect_arch_profile(actual_names: &[&str]) -> ArchProfile {
 /// startup pipeline that just ran `MmprojConfig::from_gguf`). When
 /// `projector == Qwen3VlMerger` the profile is `Qwen3VlSiglip`
 /// regardless of which tensors are present — the projector_type
-/// string is the most decisive upstream signal because llama.cpp
-/// gates its `clip_graph_qwen3vl` builder on it
-/// (`/opt/llama.cpp/tools/mtmd/clip.cpp:865-867`).
+/// string is the most decisive signal because the peer
+/// gates its qwen3vl graph builder on it.
 ///
 /// Falls through to `detect_arch_profile` for the non-Qwen3-VL cases.
 pub fn detect_arch_profile_with_projector(
@@ -747,9 +730,8 @@ pub fn detect_arch_profile_with_projector(
 ///   - `v.position_embd.weight` (learned position encoding)
 ///   - `v.blk.0.attn_q.weight` + `attn_k.weight` + `attn_v.weight` +
 ///     `attn_out.weight` (block 0's QKV + output projection — the
-///     vision-namespace short form per llama.cpp's
-///     `TN_ATTN_OUTPUT = "%s.blk.%d.attn_out.%s"`,
-///     `/opt/llama.cpp/tools/mtmd/clip-impl.h:82`).
+///     vision-namespace short form per the peer's
+///     `v.blk.{N}.attn_out.*` naming).
 ///   - at least one of `mm.0.weight` / `mm.2.weight` (the projector head)
 ///   - per `MmprojConfig.num_hidden_layers`, the same QKV+output set for
 ///     every block (catches truncated files)
@@ -771,7 +753,7 @@ pub fn detect_arch_profile_with_projector(
 /// W41 iter-116i note: pre-iter-116i this validator required
 /// `attn_output.weight` (the text-decoder name).  W34 iter-116e
 /// fixed the writer to emit the vision-namespace `attn_out.weight`
-/// short form per `TN_ATTN_OUTPUT`, but the validator was missed —
+/// short form, but the validator was missed —
 /// causing `hf2q serve --mmproj <gemma4v>` to bail with "missing 28
 /// required tensor(s)" once the projector-type guard was unblocked.
 ///
@@ -786,7 +768,7 @@ pub fn detect_arch_profile_with_projector(
 ///
 /// **iter-224 Wedge-4c.5**: per-block QKV check now accepts EITHER
 /// the fused `v.blk.{N}.attn_qkv.weight` (Qwen3-VL HF-source canonical,
-/// emitted by /opt/llama.cpp/convert_hf_to_gguf.py:4853-4972) OR the
+/// emitted by the peer's HF converter) OR the
 /// classic split `attn_q/k/v.weight` trio. Mixing is rejected loud
 /// (producer bug). `Qwen3VlMerger.is_supported()` returns true after
 /// this iter, so a tensor-complete Qwen3-VL mmproj passes the gate
@@ -802,14 +784,12 @@ pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<
     let required: Vec<String> = vec![TENSOR_PATCH_EMBD.to_string(), TENSOR_POS_EMBD.to_string()];
     // Per-block QKV + output (present in CLIP, Gemma 4, AND Qwen3-VL).
     // The output projection's vision-namespace short-form is `attn_out`
-    // per `TN_ATTN_OUTPUT = "%s.blk.%d.attn_out.%s"`
-    // (`/opt/llama.cpp/tools/mtmd/clip-impl.h:82`); this is distinct
+    // (`v.blk.{N}.attn_out.*`); this is distinct
     // from the text-decoder `attn_output.weight` long-form.
     //
     // **Wedge-4c.5**: Qwen3-VL converters (HF source) emit a FUSED
-    // `attn_qkv.{weight,bias}` per block (clip-impl.h:78
-    // `TN_ATTN_QKV = "%s.blk.%d.attn_qkv.%s"`,
-    // /opt/llama.cpp/tools/mtmd/clip.cpp:1669) instead of split
+    // `attn_qkv.{weight,bias}` per block
+    // (`v.blk.{N}.attn_qkv.*`) instead of split
     // `attn_q/k/v`. Both forms back the same logical Q/K/V projection;
     // the runtime mmproj loader (`LoadedMmprojWeights::load`) installs
     // canonical-name slice views so the consumer code (`block_tensor`)
@@ -1038,7 +1018,7 @@ mod tests {
 
     #[test]
     fn tensor_constants_lock_llama_cpp_convention() {
-        // Changes here are silent compat breaks with llama.cpp mmproj
+        // Changes here are silent compat breaks with the peer's mmproj
         // files. Update only in lockstep with a writer change.
         assert_eq!(TENSOR_PATCH_EMBD, "v.patch_embd.weight");
         assert_eq!(TENSOR_POS_EMBD, "v.position_embd.weight");
@@ -1428,8 +1408,8 @@ mod tests {
     fn detect_arch_profile_with_projector_short_circuits_on_qwen3vl_merger() {
         // The projector-aware variant: when the parsed projector is
         // `Qwen3VlMerger`, the profile is `Qwen3VlSiglip` regardless
-        // of which tensors are enumerated. Mirrors llama.cpp's
-        // builder-selection at clip.cpp:865-867.
+        // of which tensors are enumerated — the same builder-selection
+        // rule the peer applies.
         let names: Vec<&str> = vec!["v.patch_embd.weight"]; // no deepstack marker
         assert_eq!(
             detect_arch_profile_with_projector(&ProjectorType::Qwen3VlMerger, &names),
@@ -1461,7 +1441,6 @@ mod tests {
 
     #[test]
     fn vit_deepstack_tensor_formats_deepstack_prefix() {
-        // Mirrors TN_DEEPSTACK_FC1 at clip-impl.h:118.
         assert_eq!(
             vit_deepstack_tensor(0, "fc1.weight"),
             "v.deepstack.0.fc1.weight"
@@ -1474,10 +1453,10 @@ mod tests {
 
     #[test]
     fn deepstack_required_suffixes_match_llama_cpp_load_predicate() {
-        // llama.cpp's `has_deepstack()` (clip-model.h:227-229) keys on
-        // `deepstack_fc1_w != nullptr`; we additionally require fc2
+        // The peer's deepstack-detection predicate keys on the fc1
+        // weight alone; we additionally require fc2
         // and norm weights (the trio that defines a fully-formed
-        // DeepStack head). Bias tensors are optional in llama.cpp's
+        // DeepStack head). Bias tensors are optional in the peer's
         // loader, so they're NOT in this list.
         assert_eq!(
             DEEPSTACK_REQUIRED_SUFFIXES,
@@ -1617,10 +1596,9 @@ mod tests {
     // -----------------------------------------------------------------------
     // Wedge-4c.5: validator accepts fused `attn_qkv` per-block.
     //
-    // /opt/llama.cpp/convert_hf_to_gguf.py:4853-4972's Qwen3VLVisionModel
-    // emits the fused name (`V_ENC_ATTN_QKV` mapped to
-    // `v.blk.{bid}.attn_qkv` at gguf-py/gguf/constants.py:1205);
-    // /opt/llama.cpp/tools/mtmd/clip.cpp:1669 loads it as a single
+    // The peer's HF converter
+    // emits the fused name (`v.blk.{bid}.attn_qkv`) for Qwen3-VL, and
+    // the peer's loader reads it as a single
     // optional tensor. Both shapes back the same logical Q/K/V projection.
     // -----------------------------------------------------------------------
 
@@ -1649,7 +1627,7 @@ mod tests {
     #[test]
     fn validate_qwen3vl_fused_attn_qkv_accepted() {
         // Wedge-4c.5: a Qwen3-VL mmproj with fused `attn_qkv.weight`
-        // (canonical from llama.cpp's HF converter) must validate
+        // (canonical from the peer's HF converter) must validate
         // cleanly. This is the green-flip companion to the loader's
         // slice-view extension.
         let cfg = qwen3vl_cfg(24, vec![5, 11, 17]);

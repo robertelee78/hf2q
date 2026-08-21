@@ -128,7 +128,7 @@ impl Qwen35Model {
 
             // Post-attention RMSNorm: the normed value is the FFN *input* only.
             // The FFN output is added back to `ffn_residual` (the pre-norm value),
-            // matching llama.cpp qwen35moe.cpp:
+            // matching the peer:
             //   ffn_residual = cur;               // after attn residual, BEFORE norm
             //   attn_post_norm = build_norm(cur); // norm for FFN input
             //   cur = build_layer_ffn(attn_post_norm);
@@ -187,7 +187,7 @@ impl Qwen35Model {
             };
 
             // Residual after FFN: add to pre-norm value (ffn_residual), not normed.
-            // This matches llama.cpp's `cur = ggml_add(cur, ffn_residual)`.
+            // This matches the peer's `cur = ggml_add(cur, ffn_residual)`.
             hidden = ffn_residual;
             residual_add(&mut hidden, &ffn_out);
         }

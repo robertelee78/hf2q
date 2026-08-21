@@ -73,11 +73,11 @@ exclude = [
     "docs/perf-traces/",
     "docs/phase0-*.json",
     "docs/research/",
-    "docs/reddit/",
+    "archive/",
     "docs/reference-lock.md",
     "docs/adr007-pathC/",
     # Per-runbook docs that ship at the URL via repository link.
-    "docs/operator-llama-refresh-runbook.md",
+    "docs/operator-peer-refresh-runbook.md",
 ]
 
 [features]

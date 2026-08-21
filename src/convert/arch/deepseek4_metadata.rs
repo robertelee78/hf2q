@@ -46,8 +46,8 @@ fn base_compress_ratios(config: &serde_json::Value, layers: u32) -> Vec<u32> {
     ratios[..layer_count].to_vec()
 }
 
-/// Build the base-artifact architecture block emitted by llama.cpp's
-/// `DeepseekV4Model.set_gguf_parameters`, plus the common text-model
+/// Build the base-artifact architecture block the canonical converter
+/// emits for DeepSeek-V4, plus the common text-model
 /// keys it inherits. Checkpoint-only MTP/DSpark array entries are excluded.
 pub fn build_metadata(
     config: &serde_json::Value,

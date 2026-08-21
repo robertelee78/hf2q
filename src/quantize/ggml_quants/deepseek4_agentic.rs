@@ -7,7 +7,7 @@
 //! little by quantizing the discrimination path aggressively and can become
 //! trapped in repeated structures.
 //!
-//! This policy is an overlay on llama.cpp-compatible `MostlyQ2_K`:
+//! This policy is an overlay on peer-compatible `MostlyQ2_K`:
 //!
 //! - expert gate/up projections remain Q2_K;
 //! - expert down projections inherit standard Q2_K's Q3_K promotion;

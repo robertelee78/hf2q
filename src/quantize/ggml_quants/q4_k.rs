@@ -1,9 +1,9 @@
-//! Q4_K quantizer — ADR-033 P0 pure-Rust port of
-//! `quantize_row_q4_K_ref` (`/opt/llama.cpp/ggml/src/ggml-quants.c:1395`),
-//! `quantize_row_q4_K_impl` (`.../ggml-quants.c:1491`), and the dispatcher
-//! `quantize_q4_K` (`.../ggml-quants.c:1564`).
+//! Q4_K quantizer — ADR-033 P0 pure-Rust port of the peer's
+//! `quantize_row_q4_K_ref`,
+//! `quantize_row_q4_K_impl`, and the dispatcher
+//! `quantize_q4_K`.
 //!
-//! Block layout from `ggml-common.h:319-328`:
+//! Block layout (byte-identical to the peer's):
 //! ```text
 //! #define QK_K 256
 //! #define K_SCALE_SIZE 12
@@ -11,22 +11,21 @@
 //!     union { struct { ggml_half d; ggml_half dmin; }; ggml_half2 dm; };
 //!     uint8_t scales[K_SCALE_SIZE]; // 8 sub-block scales + 8 sub-block mins,
 //!                                   // each 6-bit, packed via the q3/q4/q5_K
-//!                                   // shared encoding (see get_scale_min_k4
-//!                                   // at ggml-quants.c:818-825).
+//!                                   // shared encoding (`get_scale_min_k4`).
 //!     uint8_t qs[QK_K/2];           // 128 nibble bytes
 //! } block_q4_K;                     // sizeof == 2*2 + 12 + 128 == 144
 //! ```
 //!
-//! Helpers (ported byte-for-byte from llama.cpp):
-//! * `nearest_int` — `ggml-quants.c:559`
-//! * `make_qkx2_quants` — `ggml-quants.c:737-816` (used by `_ref`)
-//! * `make_qkx3_quants` — `ggml-quants.c:931-1012` (used by `_impl`)
-//! * `make_qp_quants` — `ggml-quants.c:1014-1085` (used by `_impl` for
+//! Helpers (ported byte-for-byte from the peer):
+//! * `nearest_int`
+//! * `make_qkx2_quants` (used by `_ref`)
+//! * `make_qkx3_quants` (used by `_impl`)
+//! * `make_qp_quants` (used by `_impl` for
 //!   the super-block-level d / m positive quantization to 6 bits)
 //!
 //! 6-bit scale packing (8 sub-block scales `ls[0..8]` + 8 mins `lm[0..8]`)
-//! lives in `y[i].scales[0..12]` per the ref/impl loops at C:1427-1439 and
-//! C:1526-1536. Bytes 0..3 hold the low 6 bits of `ls[0..4]`; bytes 4..7
+//! lives in `y[i].scales[0..12]`.
+//! Bytes 0..3 hold the low 6 bits of `ls[0..4]`; bytes 4..7
 //! hold the low 6 bits of `lm[0..4]`; bytes 8..11 hold the low 4 bits of
 //! `ls[4..8]` (low nibble) and `lm[4..8]` (high nibble), with the high 2
 //! bits of `ls[4..8]` and `lm[4..8]` OR'd into the top 2 bits of bytes
@@ -43,7 +42,7 @@ pub const BLOCK_BYTES: usize = 2 + 2 + K_SCALE_SIZE + QK_K / 2; // 144
 
 /// Quantize an F32 buffer to Q4_K bytes.
 ///
-/// Mirrors dispatcher `quantize_q4_K` at `ggml-quants.c:1564`. When
+/// Mirrors the peer's dispatcher `quantize_q4_K`. When
 /// `imatrix` is `Some`, the `_impl` path runs per row with `quant_weights`
 /// aliased to the same row-length slice each iteration (the C dispatcher
 /// reuses the same `quant_weights` pointer for every row).
@@ -1080,7 +1079,7 @@ mod tests {
     /// ADR-033 quality-matrix iter-23+ : real-model byte-cmp.
     ///
     /// Fast iteration path that bypasses full 10-minute model conversion.
-    /// Compares hf2q's Q4_K output against canonical llama.cpp's output
+    /// Compares hf2q's Q4_K output against the canonical peer's output
     /// for blk.0.attn_k.weight (Gemma 4 26B-A4B-IT). Fixture is the
     /// canonical F16 GGUF's F16→F32 dequantization (lossless).
     ///
@@ -1183,7 +1182,7 @@ mod tests {
             field_diffs.get("qs").unwrap_or(&0)
         );
         // 2026-05-20 (post-stale-fixture-fix): fixture regenerated against
-        // current /opt/llama.cpp HEAD `e15384a5c` and hf2q kernel reverted
+        // the peer's then-current HEAD `e15384a5c` and hf2q kernel reverted
         // to plain `+=` at sum_l/sum_l2/sum_xl (matches canonical's effective
         // fp-contract=off behavior). Result: 3/3244032 = 0.0001% bytes diff
         // — one block hit a deeper input-distribution-dependent FP rounding

@@ -72,13 +72,11 @@ pub fn parse_generation_config(dir: &Path) -> Option<SamplingConfig> {
     }
 }
 
-/// Emit the `general.*` KV pairs in canonical order, mirroring
-/// `/opt/llama.cpp/gguf-py/gguf/metadata.py::Metadata.set_gguf_meta_model`
-/// at lines 634-731. Canonical emit order (preserving conditional
-/// gating on Option fields):
+/// Emit the `general.*` KV pairs in canonical order (preserving
+/// conditional gating on Option fields):
 ///
 ///   1. architecture       (from `arch_name` arg)
-///   2. type = "model"     (`set_type` at base.py:905-906)
+///   2. type = "model"
 ///   3. sampling.top_k     (when `generation_config.json` present)
 ///   4. sampling.top_p     (when present)
 ///   5. sampling.temp      (when present)
@@ -456,9 +454,8 @@ pub fn split_base_model(raw: &str) -> (Option<String>, Option<String>, Option<St
     (Some(pretty_name), Some(pretty_org), Some(repo_url))
 }
 
-/// Format a parameter count using canonical's
-/// `model_weight_count_rounded_notation` rule at
-/// `/opt/llama.cpp/gguf-py/gguf/utility.py:21-41`. The integer
+/// Format a parameter count using the canonical rounded-notation
+/// rule. The integer
 /// `min_digits` constraint controls how many decimal places are used:
 /// canonical's `size_label` callers pass `min_digits=2`.
 ///
@@ -536,9 +533,7 @@ pub fn compute_size_label(
 }
 
 /// Result of parsing a HuggingFace model id (e.g.
-/// `"nomic-ai/nomic-xlm-2048"`) into its canonical name components
-/// per `/opt/llama.cpp/gguf-py/gguf/metadata.py:240-362` —
-/// `Metadata.get_model_id_components`.
+/// `"nomic-ai/nomic-xlm-2048"`) into its canonical name components.
 ///
 /// All fields are `None` when the input doesn't decompose into the
 /// expected `<org>/<basename>(-<size_label>)?(-<finetune>)?(-<version>)?`
@@ -570,8 +565,7 @@ pub struct ModelIdComponents {
     pub size_label: Option<String>,
 }
 
-/// Port of `Metadata.get_model_id_components` at
-/// `/opt/llama.cpp/gguf-py/gguf/metadata.py:240-362`. Splits a
+/// Splits a
 /// HuggingFace model id like `"nomic-ai/nomic-xlm-2048"` into the
 /// canonical-equivalent components emitted as `general.*` GGUF
 /// metadata keys.
@@ -938,8 +932,7 @@ fn normalize_size_label(part: &str) -> Option<String> {
 /// against `general.base_model.0.name = 'Nomic Embed Text v2 Moe
 /// Unsupervised'` in the canonical Q8_0 dump for nomic v2-moe.
 fn title_case_hyphenated(s: &str) -> String {
-    // Port of canonical's `Metadata.id_to_title` at
-    // `/opt/llama.cpp/gguf-py/gguf/metadata.py:235-237`:
+    // Canonical rule:
     //   return ' '.join([w.title() if w.islower() and not re.match(
     //       r'^(v\d+(?:\.\d+)*|\d.*)$', w) else w
     //       for w in string.strip().replace('-', ' ').split()])

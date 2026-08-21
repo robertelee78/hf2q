@@ -1,7 +1,7 @@
 //! GGUF-driven BPE tokenizer construction for Qwen3.5 / Qwen3.6.
 //!
 //! Builds a `tokenizers::Tokenizer` programmatically from the GGUF's own
-//! `tokenizer.ggml.*` metadata arrays — the same source `llama.cpp`
+//! `tokenizer.ggml.*` metadata arrays — the same source the peer
 //! consumes. Produces byte-identical token streams to llama-tokenize on
 //! the same GGUF, regardless of what the on-disk `tokenizer.json` claims.
 //!
@@ -18,28 +18,26 @@
 //! and the residual stream collapses to deterministic prompt-repetition
 //! gibberish.
 //!
-//! `llama.cpp`'s vocab path (llama-vocab.cpp:2197-2253) builds the
-//! tokenizer exclusively from the GGUF's own metadata — so the literal
-//! string `<|im_start|>` simply isn't a special token and falls through
-//! to byte-level pre-tokenization producing 6 raw chars: `<`, `|`,
-//! `im`, `_start`, `|`, `>`. This module mirrors that path verbatim in
+//! The peer's vocab path builds the tokenizer exclusively from the
+//! GGUF's own metadata — so the literal string `<|im_start|>` simply
+//! isn't a special token and falls through to byte-level
+//! pre-tokenization producing 6 raw chars: `<`, `|`, `im`, `_start`,
+//! `|`, `>`. This module follows the same GGUF-only construction in
 //! Rust, against the HuggingFace `tokenizers` crate.
 //!
-//! ## Spec citations (`/opt/llama.cpp` HEAD as of 2026-04-30, commit `8bc492ebb`)
+//! ## Parity-relevant facts
 //!
-//! - GGUF key catalogue: `src/llama-arch.cpp:294-321`
-//!   (`tokenizer.ggml.{model, pre, tokens, token_type, scores, merges,
-//!   bos_token_id, eos_token_id, padding_token_id, add_bos_token, ...,
-//!   chat_template}`).
-//! - Vocab loader: `src/llama-vocab.cpp:2197-2253` — resolves token_idx,
-//!   score_idx, toktype_idx; resizes `id_to_token` to the GGUF's actual
-//!   `n_tokens`; sets per-token `attr` based on `LLAMA_TOKEN_TYPE_*`.
-//! - Qwen3.5 pre-tokenizer: `src/llama-vocab.cpp:381-387` — regex
-//!   identical to the HF `tokenizer.json`'s `pre_tokenizer.Sequence[0]`
+//! - GGUF key catalogue: `tokenizer.ggml.{model, pre, tokens,
+//!   token_type, scores, merges, bos_token_id, eos_token_id,
+//!   padding_token_id, add_bos_token, ..., chat_template}`.
+//! - Vocab construction resolves token/score/toktype indexes; sizes the
+//!   vocab to the GGUF's actual `n_tokens`; sets per-token attributes
+//!   from the `token_type` array values.
+//! - Qwen3.5 pre-tokenizer: regex identical to the HF
+//!   `tokenizer.json`'s `pre_tokenizer.Sequence[0]`
 //!   `Split { pattern: { Regex: ... } }` for the qwen35 family.
-//! - `LLAMA_VOCAB_PRE_TYPE_QWEN35` selector: `src/llama-vocab.cpp:2029-2031`
-//!   (`tokenizer_pre == "qwen35"` ⇒ this pre-type, `clean_spaces = false`).
-//! - BPE constructor: `src/llama-vocab.cpp:279-286` (`llm_tokenizer_bpe`).
+//! - `tokenizer_pre == "qwen35"` selects this pre-type with
+//!   `clean_spaces = false`.
 //!
 //! ## Contract
 //!
@@ -51,10 +49,10 @@
 //!
 //! ## Sovereignty
 //!
-//! Per ADR-013 §"Absolute sovereignty": no `llama.cpp` binary, library,
-//! or output is linked at build/test/CI time. We read `llama-vocab.cpp`
-//! to derive the spec; the Rust BPE engine + regex engine come from the
-//! HF `tokenizers` crate (already a dependency). `llama-tokenize` is
+//! Per ADR-013 §"Absolute sovereignty": no peer binary, library,
+//! or output is linked at build/test/CI time. The spec was derived from
+//! the peer's vocab path; the Rust BPE engine + regex engine come from
+//! the HF `tokenizers` crate (already a dependency). `llama-tokenize` is
 //! invoked at gate-time (parity test) as an external black-box reference,
 //! never imported.
 
@@ -72,8 +70,8 @@ use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
 
 /// Pre-tokenizer regex for the `qwen35` family.
 ///
-/// Spec source: `/opt/llama.cpp/src/llama-vocab.cpp:381-387`. Identical
-/// to the HF `tokenizer.json`'s `pre_tokenizer.Sequence[0].pattern.Regex`
+/// Must stay identical to the peer's qwen35 pre-tokenizer regex and to
+/// the HF `tokenizer.json`'s `pre_tokenizer.Sequence[0].pattern.Regex`
 /// for the same family — confirmed by `python3 -c "import json;
 /// json.load(open(...))['pre_tokenizer']"` on
 /// `qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/tokenizer.json` on
@@ -84,8 +82,8 @@ use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
 /// (Devanagari, Hebrew nikkud, Vietnamese tone marks).
 pub const QWEN35_PRE_REGEX: &str = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
-/// `LLAMA_TOKEN_TYPE_*` constants — `/opt/llama.cpp/src/llama-vocab.h`
-/// (and mirrored in vocab loader at `llama-vocab.cpp:2241-2251`).
+/// Token-type values as stored in the GGUF's
+/// `tokenizer.ggml.token_type` array.
 ///
 /// We only need to distinguish "this token must be matched as an atomic
 /// unit during pre-tokenization" (CONTROL + USER_DEFINED) from
@@ -118,8 +116,8 @@ pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
     if pre != "qwen35" {
         bail!(
             "tokenizer.ggml.pre = {pre:?} is not supported by qwen35::tokenizer; \
-             this module only handles `qwen35` (see llama-vocab.cpp:381-387). \
-             Other pre-types need their own regex builder."
+             this module only handles `qwen35`. Other pre-types need their \
+             own regex builder."
         );
     }
 
@@ -348,10 +346,9 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// The qwen35 pre-tokenizer regex must be identical to the literal
-    /// at `/opt/llama.cpp/src/llama-vocab.cpp:385`. If `llama.cpp`
-    /// updates the regex upstream, this test reminds us to update
-    /// `QWEN35_PRE_REGEX` in lock-step.
+    /// The qwen35 pre-tokenizer regex must be identical to the peer's
+    /// literal. If the peer updates the regex, this test reminds us to
+    /// update `QWEN35_PRE_REGEX` in lock-step.
     #[test]
     fn pre_regex_matches_llama_cpp_spec() {
         let expected = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";

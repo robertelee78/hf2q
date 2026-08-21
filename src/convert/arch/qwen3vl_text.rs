@@ -1,25 +1,19 @@
 //! Qwen3-VL **text-decoder** HF→GGUF tensor-name + metadata mapper.
 //!
-//! Port of `/opt/llama.cpp/conversion/qwen3vl.py::Qwen3VLTextModel`
-//! (`@ModelBase.register("Qwen3VLForConditionalGeneration")`,
-//! `model_arch = gguf.MODEL_ARCH.QWEN3VL`). `Qwen3VLTextModel` inherits
-//! from `Qwen3Model` → `Qwen2Model` → `TextModel`, so the tensor-name
+//! The tensor-name
 //! mapping is identical to dense Qwen3 (Llama3 + per-head Q/K RMS norms,
 //! same as Gemma-4 quirk #3). The Qwen3-VL-specific bits are:
 //!
-//!   1. **`thinker.` prefix stripping** (`Qwen3VLTextModel.filter_tensors`
-//!      at `conversion/qwen3vl.py:267`): the multimodal `thinker.*`
-//!      wrapper is unwrapped before super().filter_tensors runs. The
+//!   1. **`thinker.` prefix stripping**: the multimodal `thinker.*`
+//!      wrapper is unwrapped before the base name-mapping runs. The
 //!      mapper accepts BOTH `thinker.model.embed_tokens.weight` AND bare
 //!      `model.embed_tokens.weight`, since v1 HF shards have appeared in
 //!      both shapes in the wild.
 //!
-//!   2. **`general.architecture = "qwen3vl"`** (per
-//!      `gguf-py/gguf/constants.py:928`, `MODEL_ARCH_NAMES[QWEN3VL] =
-//!      "qwen3vl"`). KV prefix is `qwen3vl.*` accordingly.
+//!   2. **`general.architecture = "qwen3vl"`**. KV prefix is
+//!      `qwen3vl.*` accordingly.
 //!
-//!   3. **`qwen3vl.n_deepstack_layers`** (uint32; `Keys.LLM.NUM_DEEPSTACK_LAYERS`
-//!      at `gguf-py/gguf/constants.py:130`, `{arch}.n_deepstack_layers`).
+//!   3. **`qwen3vl.n_deepstack_layers`** (uint32).
 //!      Counts the number of vision-side deepstack heads — the TEXT
 //!      decoder needs the count so that the inference loader knows how
 //!      many auxiliary residual injection points to wire. Sourced from
@@ -28,9 +22,8 @@
 //!      configs). Defaults to 0 when vision_config is absent (text-only
 //!      shard).
 //!
-//!   4. **`qwen3vl.rope.dimension_sections`** (array of uint32, padded to
-//!      4 with trailing zeros — `Keys.Rope.DIMENSION_SECTIONS` at
-//!      `gguf-py/gguf/constants.py:196`). Qwen3-VL uses **multi-modal
+//!   4. **`qwen3vl.rope.dimension_sections`** (array of uint32, padded
+//!      to 4 with trailing zeros). Qwen3-VL uses **multi-modal
 //!      RoPE (M-RoPE)** which splits the rope head-dim across [time,
 //!      height, width, extra] axes. Sourced from
 //!      `config["rope_scaling"]["mrope_section"]`; emitted only when
@@ -243,7 +236,7 @@ fn count_deepstack_layers(config: &serde_json::Value) -> u32 {
 ///     length used to compute `qwen3vl.n_deepstack_layers`; defaults
 ///     to 0 when absent (text-only shard).
 ///
-/// `file_type` is the chosen `LlamaFtype` as a `u32` (matches
+/// `file_type` is the chosen `GgufFtype` as a `u32` (matches
 /// `gguf_writer.add_file_type(self.ftype)` at base.py:1220).
 pub fn build_metadata(
     config: &serde_json::Value,
@@ -779,7 +772,7 @@ mod tests {
     }
 
     /// Sibling — `file_type` round-trips as a plain u32 in
-    /// `general.file_type` across the full LlamaFtype enum range.
+    /// `general.file_type` across the full GgufFtype enum range.
     #[test]
     fn qwen3vl_text_metadata_ftype_round_trips() {
         let cfg = json!({

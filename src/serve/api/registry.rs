@@ -159,9 +159,8 @@ impl ModelRegistration {
     ///     (Gemma: bare `(call)+`; Qwen: `call ("\n" call)*`).  Used by
     ///     `compile_tool_grammar` for `tool_choice = required / function`
     ///     paired with `GrammarKind::ToolCallBodyRequired` for eager
-    ///     enforcement from token 0.  Mirrors llama.cpp
-    ///     `p.repeat(call, min=1, max=parallel?-1:1)` at
-    ///     `/opt/llama.cpp/common/chat.cpp:898-902, 1177-1181, 1399-1404`.
+    ///     enforcement from token 0.  Mirrors the peer's
+    ///     `p.repeat(call, min=1, max=parallel?-1:1)`.
     ///
     /// Returns `Err(String)` when the family is unknown or when `params_schema`
     /// contains a feature the per-model emitter doesn't support yet. The error
@@ -2458,7 +2457,7 @@ fn gemma4_tool_call_gbnf(
     //     production-order rationale.
     // iter-219b grammar-exhaust fix (2026-05-01): drop trailing ` space`
     // from all root_body shapes. The `space` rule
-    // (`| " " | "\n"{1,2} [ \t]{0,20}`) was inherited from llama.cpp's
+    // (`| " " | "\n"{1,2} [ \t]{0,20}`) was inherited from the peer's
     // SPACE_RULE convention for JSON Schema grammars where it terminates
     // value rules. For tool-call grammars it served as a trailing-
     // whitespace allowance after the close marker — but its empty-alt +
@@ -2485,8 +2484,7 @@ fn gemma4_tool_call_gbnf(
                 format!("{} {} {}", open_marker, single_body, close_marker),
             ));
             // `(call)+` GBNF idiom: `call call*` — at least one, optional
-            // repeat.  Mirrors llama.cpp `p.repeat(call, 1, parallel?-1:1)`
-            // at common/chat.cpp:898-902, 1177-1181.
+            // repeat.  Mirrors the peer's `p.repeat(call, 1, parallel?-1:1)`.
             if parallel {
                 format!("{} {}*", g4_call_rule, g4_call_rule)
             } else {
@@ -3371,7 +3369,7 @@ fn compile_pattern(
 /// any key/value mismatch.  For OPEN objects (the JSON Schema default),
 /// the wildcard extra-kv tail can re-match a declared OPTIONAL key with
 /// an unconstrained value — a CFG cannot express "any key except these".
-/// llama.cpp's json-schema-to-grammar and this crate's json_schema.rs
+/// The peer's json-schema-to-grammar and this crate's json_schema.rs
 /// share the identical limitation; value validation for optional keys on
 /// open objects belongs to the tool server.
 fn qwen35_nested_value_rule(
@@ -6394,7 +6392,7 @@ mod tests {
     /// false`) rejects any value/key mismatch.  For OPEN objects the
     /// wildcard extra-kv tail can re-match a declared OPTIONAL key with
     /// an unconstrained value — an inherent CFG limitation shared with
-    /// llama.cpp + json_schema.rs (a CFG cannot express "any key except
+    /// the peer + json_schema.rs (a CFG cannot express "any key except
     /// these").  The anyOf-mismatch rejection below is therefore asserted
     /// on a CLOSED object, where the guarantee holds.
     #[test]
@@ -6458,7 +6456,7 @@ mod tests {
         let mut rt = qwen35_runtime("f", schema);
         // limit:3.5 violates items integer, but the OPEN object's
         // wildcard tail accepts it as an extra key (CFG limitation,
-        // llama.cpp + json_schema.rs parity).  Value validation for
+        // peer + json_schema.rs parity).  Value validation for
         // optional keys on open objects is the tool server's job.
         let input = b"<function=f>\n<parameter=cfg>\n{\"mode\":\"safe\",\"limit\":3.5}\n</parameter>\n</function>";
         assert!(
@@ -7073,8 +7071,8 @@ mod tests {
     /// first byte of `<|tool_call>`).  Any token whose decoded bytes don't
     /// prefix the open marker MUST be masked to -inf.
     ///
-    /// Mirrors llama.cpp `grammar_lazy=false` for `tool_choice=REQUIRED`
-    /// at common/chat.cpp:1200, 1416 — the model is structurally unable
+    /// Mirrors the peer's `grammar_lazy=false` for `tool_choice=REQUIRED`
+    /// — the model is structurally unable
     /// to skip the tool call.
     #[test]
     fn required_eager_grammar_masks_non_marker_first_token() {
@@ -7135,8 +7133,8 @@ mod tests {
     ///
     /// This is the AUTO-mode contract: the runtime is suspended until the
     /// `ToolCallSplitter` sees the open marker; preamble content tokens
-    /// flow through unconstrained.  Matches llama.cpp `grammar_lazy=true`
-    /// for `tool_choice=AUTO` at common/chat.cpp:913, 1200, 1416.
+    /// flow through unconstrained.  Matches the peer's `grammar_lazy=true`
+    /// for `tool_choice=AUTO`.
     #[test]
     fn auto_lazy_grammar_allows_preamble_content() {
         use crate::serve::api::grammar::mask;

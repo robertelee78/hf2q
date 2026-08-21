@@ -844,7 +844,7 @@ impl crate::serve::kv_persist::lcp_registry::ByteSized for DenseKvBuffers {
 ///   * Pure F16 K + F16 V (peer): 504 MB → 252 MB (2× saving).
 ///   * Hybrid (F16 K + TQ-HB V): 504 MB → 158 MB (3.19× saving — 81% of TQ-HB).
 ///
-/// The structural decode-side gap vs llama.cpp peer (1.81× per-dispatch wall on
+/// The structural decode-side gap vs the peer (1.81× per-dispatch wall on
 /// our TQ-HB SDPA, formally measured iter-326..342) is owned by the K-side
 /// scalar dequant loop inside `flash_attn_vec_tq_hb`: peer's K is F16 and consumed
 /// by `simdgroup_matrix` matmul, ours is byte-packed and consumed by per-thread

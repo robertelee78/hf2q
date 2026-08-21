@@ -451,7 +451,7 @@ impl FullAttnWeightsGpu {
     ///
     /// Precision: Q4_0 (4-bit with F16 per-block scale) introduces ~1% magnitude
     /// error, well within the I16→F32→Q4_0 chain used by APEX GGUF attn weights.
-    /// llama.cpp uses Q5_K_M for these same weights; Q4_0 is slightly less
+    /// The peer uses Q5_K_M for these same weights; Q4_0 is slightly less
     /// precise but produces the same token selections in practice (sourdough gate
     /// must confirm).
     pub fn from_cpu(weights: &FullAttnLayerWeights, device: &MlxDevice) -> Result<Self> {
@@ -686,7 +686,7 @@ pub fn download_f32(buf: &MlxBuffer) -> Result<Vec<f32>> {
 /// with `head_dim` innermost). The per-head RMSNorm treats each row as an
 /// independent vector and applies `x / sqrt(mean(x^2) + eps) * weight`
 /// element-wise, where `weight` is shape `[head_dim]` shared across all
-/// heads and tokens (matches llama.cpp / HF's Qwen3.5 convention).
+/// heads and tokens (matches the peer's / HF's Qwen3.5 convention).
 ///
 /// # Why this dispatches rms_norm with rows = seq*n_heads
 ///
@@ -994,7 +994,7 @@ pub fn apply_linear_projection_f32(
             };
             if seq_len == 1 {
                 // GEMV path — bandwidth-optimized for M=1 decode.
-                // mul_mv_bf16_f32_4 port from llama.cpp: processes multiple
+                // mul_mv_bf16_f32_4: processes multiple
                 // weight rows per threadgroup, ~2× faster than tiled MM for M=1.
                 dense_gemv_bf16_f32(encoder, registry, device, weight, input, &mut dst, &params)
                     .context("dense_gemv_bf16_f32 (M=1)")?;
@@ -3062,7 +3062,7 @@ pub fn qwen35_tree_verify_full_layer(
 
     // ── STEP B: ffn_residual = attn_out (PRE-norm, same buffer ARC) ──────
     // The FFN residual stream is the pre-norm attn_out per Qwen3.5 layer
-    // composition (forward_cpu.rs:133-149 + llama.cpp qwen35moe.cpp).
+    // composition (forward_cpu.rs:133-149 + the peer).
     let ffn_residual = attn_out.clone();
 
     // ── STEP C: Open fresh encoder for MLP+norm+residual chain ───────────
@@ -3590,7 +3590,7 @@ pub fn qwen35_tree_verify_full_layer_q(
 
     // ── STEP B: ffn_residual = attn_out (PRE-norm, same buffer ARC) ──────
     // The FFN residual stream is the pre-norm attn_out per Qwen3.5 layer
-    // composition (forward_cpu.rs:133-149 + llama.cpp qwen35moe.cpp).
+    // composition (forward_cpu.rs:133-149 + the peer).
     let ffn_residual = attn_out.clone();
 
     // ── STEP C: Open fresh encoder for MLP+norm+residual chain ───────────
@@ -3776,7 +3776,7 @@ pub fn qwen35_tree_verify_full_layer_q(
 /// # ffn_residual invariant
 ///
 /// `ffn_residual = attn_out` (PRE-norm value) per Qwen3.5 MoE composition
-/// (forward_cpu.rs:133-149, llama.cpp qwen35moe.cpp). Passed as `add_residual = Some(&ffn_residual)`
+/// (forward_cpu.rs:133-149, the peer). Passed as `add_residual = Some(&ffn_residual)`
 /// to `build_moe_ffn_layer_gpu_q` which performs the final residual add inside Phase F.
 ///
 /// # ggml_type validation invariant (INV-QMoE-ggml-type-validation)
@@ -5152,7 +5152,7 @@ pub fn apply_sdpa_with_kv_cache(
         // production head_dims (256/512). sdpa_decode dispatched a single
         // threadgroup per query head with serial KV iteration; at long
         // context (kv_seq_len > ~500) this bottlenecked single-SIMD
-        // throughput. flash_attn_vec is the llama.cpp-ported decode-path
+        // throughput. flash_attn_vec is the decode-path
         // SDPA: NWG=32 workgroups split the KV cache, each running an
         // online softmax, then a reduce kernel combines per-workgroup
         // partials. Empirical on qwen3.6-35B-A3B-dwq48 (head_dim=256):
@@ -8896,7 +8896,7 @@ mod tests {
     /// supplied encoder; the two encoder choreographies can produce
     /// different parallel-reduction orderings inside the kernel, yielding
     /// ULP-level (~1e-6 to ~1e-5) diffs that don't change observable
-    /// behavior. Real correctness vs canonical references (llama.cpp,
+    /// behavior. Real correctness vs canonical references (the peer,
     /// vllm, mlx-python) is gated by `scripts/parity_check.sh`. The
     /// behavior-preserving invariant for the wrapper-→-`_into` extraction
     /// is *kernel equivalence within FP tolerance*, not byte identity.

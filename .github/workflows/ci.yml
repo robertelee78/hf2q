@@ -39,6 +39,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  peer-ref-ratchet:
+    name: peer reference ratchet
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # Fail-closed ratchet: literal llama.cpp references outside the
+      # whitelist must never rise above data/peer_ref_baseline.txt.
+      # Attribution policy lives in NOTICE; prose says "the peer".
+      - name: peer_ref_ratchet
+        run: sh scripts/peer_ref_ratchet.sh
+
   build-and-test:
     name: build + test (macos-latest)
     runs-on: macos-latest

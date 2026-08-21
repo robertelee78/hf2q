@@ -1,19 +1,16 @@
 //! Gemma-4 mmproj HF→GGUF tensor-name + metadata mapper.
 //!
-//! Port of `/opt/llama.cpp/conversion/gemma.py::Gemma3VisionModel` plus the
-//! `MmprojModel` base it `super()`s into
-//! (`/opt/llama.cpp/conversion/base.py:2152-2305`). The Gemma-4 multimodal
+//! Canonical Gemma-3 vision mapping plus the common mmproj base
+//! behavior. The Gemma-4 multimodal
 //! family reuses the Gemma-3 SigLIP vision tower + 2-layer MLP projector
 //! verbatim (HF `Gemma3ForConditionalGeneration` /
 //! `Gemma4ForConditionalGeneration` checkpoints expose the same submodule
 //! tree: `model.vision_tower.vision_model.` + `model.multi_modal_projector.`).
 //!
 //! The mmproj sidecar is written as a SEPARATE GGUF file (suffixed
-//! `-mmproj.gguf`) consumed by `llama-mtmd-cli`. Its on-disk schema lives in
-//! `/opt/llama.cpp/tools/mtmd/clip-impl.h`:
+//! `-mmproj.gguf`) consumed by `llama-mtmd-cli`. Its on-disk schema:
 //!
-//! - `general.architecture = "clip"` (per
-//!   `gguf-py/gguf/constants.py::MODEL_ARCH_NAMES[MMPROJ] = "clip"`).
+//! - `general.architecture = "clip"`.
 //! - Vision-encoder weights are written under the `v.` prefix
 //!   (`TN_PATCH_EMBD = "v.patch_embd.weight"`,
 //!   `TN_POS_EMBD = "%s.position_embd.weight"`, `TN_LN_1 = "%s.blk.%d.ln1.%s"`,
@@ -70,9 +67,8 @@ use crate::backends::gguf::types::MetaValue;
 /// Note: the projector's `mm_input_projection_weight` is intentionally
 /// snake-case `_weight` (not `.weight`) in the upstream HF checkpoint
 /// (it's a registered `nn.Parameter`, not an `nn.Linear`); this mapper
-/// accepts both the raw `_weight` form and the dotted `.weight` form that
-/// gemma.py's `filter_tensors` rewrites it to (see
-/// `/opt/llama.cpp/conversion/gemma.py:289`).
+/// accepts both the raw `_weight` form and the dotted `.weight` form
+/// the canonical converter rewrites it to.
 pub fn map_tensor_name(hf_name: &str) -> Option<String> {
     // ---- Projector (no per-block index) ---------------------------------
     // Upstream HF stores `mm_input_projection_weight` as a single

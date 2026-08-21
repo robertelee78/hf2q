@@ -45,10 +45,9 @@ pub const QWEN3_CHATML: &str = include_str!("chat_templates/qwen3-chatml.jinja")
 ///
 /// The hf2q runtime uses [`crate::core::deepseek_v4_encoding`] for its
 /// stateful, pure-Rust encoding path. This Jinja fixture is emitted into GGUF
-/// metadata so external readers such as the pinned llama.cpp reference can
-/// apply the same public chat contract. Provenance: llama.cpp template
-/// `models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja`, commit
-/// `6ea215d17`, which ports DeepSeek's published `encoding_dsv4.py`.
+/// metadata so external readers such as the pinned peer reference can
+/// apply the same public chat contract. The fixture ports DeepSeek's
+/// published `encoding_dsv4.py`.
 pub const DEEPSEEK_V4_FLASH_0731: &str =
     include_str!("chat_templates/deepseek-v4-flash-0731.jinja");
 
@@ -157,7 +156,7 @@ mod tests {
         assert_eq!(
             DEEPSEEK_V4_FLASH_0731.len(),
             DEEPSEEK_V4_FLASH_0731_LEN,
-            "DeepSeek-V4 template drifted from pinned llama.cpp reference"
+            "DeepSeek-V4 template drifted from the pinned peer reference"
         );
     }
 

@@ -1,6 +1,6 @@
 //! Qwen3.5 gated full-attention forward pass (ADR-013 Decision 9).
 //!
-//! Op order (verbatim from the spec at llama.cpp `qwen35.cpp:117-196`, with
+//! Op order (verbatim from the peer's spec, with
 //! Qwen3.5's GGUF layout where `wq` and `w_gate` are stored as separate
 //! tensors rather than fused):
 //!

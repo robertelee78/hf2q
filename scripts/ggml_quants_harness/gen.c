@@ -1,10 +1,10 @@
 // ADR-033 P0 reference-fixture generator.
 //
-// Wraps llama.cpp's public `ggml_quantize_chunk` to emit byte-identical
+// Wraps the peer's public `ggml_quantize_chunk` to emit byte-identical
 // reference output for the per-`GgmlType` byte-cmp tests at
 // `tests/fixtures/ggml_quants/<type>_<n>_<variant>_{input,expected}.bin`.
 //
-// Pinned: llama.cpp @ /opt/llama.cpp (`data/llama_cpp_pin.txt`).
+// Pinned: the peer @ /opt/llama.cpp (`data/llama_cpp_pin.txt`).
 // Build:  scripts/ggml_quants_harness/build.sh
 // Use:    scripts/ggml_quants_harness/generate_all.sh
 //

@@ -6,7 +6,7 @@ from xctrace "Metal System Trace" .trace bundles.
 Why this exists:
   iter8b reported 14-37x per-kernel ratio gaps using HF2Q_MLX_KERNEL_PROFILE=1
   (242 sessions/token vs 1 in production). Side-by-side audit showed kernels
-  are byte-equivalent to llama.cpp's, so the ratios are kprofile-mode
+  are byte-equivalent to the peer's, so the ratios are kprofile-mode
   artifacts, not production gaps. This aggregator parses production-mode
   metal-system-trace .trace bundles to capture per-dispatch GPU times
   (gpu-submission-id pairs function=1 start with function=2 end) for

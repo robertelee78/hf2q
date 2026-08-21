@@ -5,7 +5,7 @@
 //! Peer-aligned convert pipeline: build the inference-time `Qwen35Model`
 //! directly from the convert-time `TensorMap`, with **no intermediate GGUF
 //! file** on disk. mlx-lm, AutoAWQ, and AutoGPTQ all keep tensors in memory
-//! throughout convert; llama.cpp keeps F16 GGUF as a user artifact, not
+//! throughout convert; the peer keeps F16 GGUF as a user artifact, not
 //! throwaway. Our prior pipeline emitted a 33–66 GB intermediate, reloaded
 //! it, then dropped it — a ~5-minute I/O tax and a peak-memory hazard.
 //!

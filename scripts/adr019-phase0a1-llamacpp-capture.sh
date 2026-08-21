@@ -1,13 +1,13 @@
 #!/bin/bash
-# ADR-019 Phase 0a.1 — cross-protocol llama.cpp companion capture.
+# ADR-019 Phase 0a.1 — cross-protocol peer companion capture.
 #
-# Purpose: capture llama.cpp on the SAME apex Q4_0-flat pp4096 fixture
+# Purpose: capture the peer on the SAME apex Q4_0-flat pp4096 fixture
 # via xctrace Metal System Trace, then bin into the same four classes
 # that 0a.1 (hf2q-side, commit 42dd6c6) used. Localizes the 305-616 ms
 # peer gap into one of:
-#   (i)   llama-bench wrap (model-load + warmup) — would show llama.cpp
+#   (i)   llama-bench wrap (model-load + warmup) — would show the peer's
 #         in-process wall ≈ hf2q in-process wall (≤ 50 ms delta).
-#   (ii)  GPU-active kernel-level difference — would show llama.cpp wall
+#   (ii)  GPU-active kernel-level difference — would show the peer wall
 #         materially less AND GPU-active dominant in the delta.
 #   (iii) Post-iter88a perf landings — gap already absorbed.
 #
@@ -75,7 +75,7 @@ LLAMA_ARGS=(
 )
 
 # (1) Wall-time baseline WITHOUT xctrace (3 cold trials).
-# This anchors the unperturbed llama.cpp in-process wall, comparable to
+# This anchors the unperturbed peer in-process wall, comparable to
 # ADR-019's 1233 ms peer-baseline number AND to 0a.1's no-xctrace baseline
 # (1534 ± 13 ms hf2q).
 echo "=== Wall-time baseline (no xctrace) — 3 trials ==="
@@ -112,7 +112,7 @@ run_xctrace() {
     echo "  xctrace exit=$rc"
     if [ -f "$stdout_log" ]; then
         grep -E "prompt eval time|tokens generated|^real" "$stdout_log" | head -5 \
-            || echo "  (no llama.cpp timing line in stdout)"
+            || echo "  (no peer timing line in stdout)"
     else
         echo "  WARN: target stdout $stdout_log not produced"
     fi

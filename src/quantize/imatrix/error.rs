@@ -42,8 +42,7 @@ pub enum ImatrixError {
 
     /// A tensor pair `<name>.in_sum2 / <name>.counts` was incomplete —
     /// either `in_sum2` exists without `counts` or vice versa. Per
-    /// llama-imatrix's `load_imatrix` (imatrix.cpp:783-788) this is a
-    /// hard error there too.
+    /// llama-imatrix's loader this is a hard error there too.
     #[error(
         "imatrix file `{path}` tensor `{name}`: \
          in_sum2 and counts must both be present"
@@ -129,8 +128,8 @@ pub enum ImatrixError {
     },
 
     /// Phase B Stage 3 driver: the corpus tokenized into too few
-    /// tokens to fill even one chunk of size `n_ctx`. Per the
-    /// canonical llama-imatrix behavior at `imatrix.cpp:960` partial
+    /// tokens to fill even one chunk of size `n_ctx`. Per
+    /// canonical llama-imatrix behavior partial
     /// trailing chunks are dropped; an all-trailing corpus produces
     /// zero chunks and an empty imatrix is meaningless.
     #[error(

@@ -2,7 +2,7 @@
 # adr-011-phase2-gate.sh — ADR-011 Phase 2 end-to-end parity gate.
 #
 # Verifies both halves of the Phase 2 success criterion:
-#   "hf2q produces coherent (basically identical) output as llama.cpp,
+#   "hf2q produces coherent (basically identical) output as the peer,
 #    and just as fast."
 #
 # What this script does:
@@ -367,9 +367,9 @@ echo "  ${GATE1_STATUS}"
 echo
 echo "Gate 2 — Prefill tok/s parity:"
 printf "  %-8s  %-16s  %-16s  %-8s  %s\n" \
-       "seq_len" "llama.cpp(fa=0)" "hf2q(batched)" "ratio" "status"
+       "seq_len" "peer(fa=0)" "hf2q(batched)" "ratio" "status"
 printf "  %-8s  %-16s  %-16s  %-8s  %s\n" \
-       "-------" "---------------" "-------------" "-----" "------"
+       "-------" "----------" "-------------" "-----" "------"
 for sl in "${GATE2_SEQ_LENS[@]}"; do
   llama_val="${GATE2_LLAMA_TPS[$sl]:-—}"
   hf2q_val="${GATE2_HF2Q_TPS[$sl]:-—}"

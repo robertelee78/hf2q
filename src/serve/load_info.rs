@@ -1022,7 +1022,7 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
 /// overweight a single small int-token-type-id tensor.  We weight by
 /// element count so the headline number reflects the dominant
 /// contributor to the file's quantized footprint, the same way
-/// llama.cpp's `llm_load_print_meta` reports a single BPW for the load.
+/// the peer reports a single BPW for the load.
 ///
 /// # Closed-form sanity
 ///

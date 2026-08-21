@@ -1,5 +1,7 @@
 # ADR-042: DeepSeek-V4-Flash-0731 — Rust-native source conversion and MLX inference
 
+> Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
+
 - **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
   cache growth revalidated 2026-08-08
 - **Updated:** 2026-08-20 — the four-agent workload is bound to an immutable
@@ -33,9 +35,9 @@ and inference are implemented in-process in Rust with owned Metal kernels in
 `mlx-native`.
 
 The product may invoke `hf`, `wget`, or `curl` solely to fetch official source
-repository files. It must not invoke Python, llama.cpp, or another converter,
+repository files. It must not invoke Python, the peer, or another converter,
 quantizer, or inference runtime. A separate developer-only parity harness may
-invoke the pinned llama.cpp build as an oracle.
+invoke the pinned peer build as an oracle.
 
 Prebuilt quantized weights are not an input, fallback, cache seed, or release
 artifact. Their published sizes may be used only as non-authoritative capacity
@@ -133,7 +135,7 @@ M5 Max and 107,431,343,104-byte artifact:
 
 The context-position throughput slope is not itself an arena leak. Ratio-four
 index selection must score an expanding compressed history, and the pinned
-llama.cpp graph also scans the valid lightning-indexer history. The new interval
+peer graph also scans the valid lightning-indexer history. The new interval
 metric makes that workload visible. A later matched reference and optimized
 native run are recorded below and supersede the earlier H4 qualification.
 The reviewed phase-adaptive DSpark bundle is a CUDA/vLLM speculative-decoding
@@ -265,11 +267,11 @@ checkpoint on the 128 GiB host.
 macOS enters critical memory pressure, swap grows materially during steady-state
 decode, or deterministic prompts become incoherent relative to the reference.
 
-### H4 — owned low-bit kernels meet or exceed llama.cpp
+### H4 — owned low-bit kernels meet or exceed the peer
 
 The Rust/Metal Q2_K path matches a scalar Rust decoder within the declared
 numeric tolerance, and the complete runtime reaches at least 1.00x the pinned
-llama.cpp decode and prompt-processing rates under the same artifact, prompt,
+peer decode and prompt-processing rates under the same artifact, prompt,
 context, threading, and sampling settings.
 
 **Falsifier:** decoded blocks differ, token decisions diverge outside documented
@@ -315,7 +317,7 @@ not claimed as one filesystem transaction.
 ### GGUF identity
 
 The architecture string is `deepseek4`. Metadata and tensor names follow the
-pinned llama.cpp registry, including:
+pinned peer registry, including:
 
 - q/o low-rank projection parameters and output groups;
 - compressor ratios and rotary base;
@@ -354,7 +356,7 @@ defines prompt behavior. The Rust encoder must pin BOS/EOS, user/assistant,
 thinking, DSML, and DSpark-noise token IDs from the source manifest and reproduce
 0731 system/chat/thinking/tool-call framing. A crafted 0731 template from the
 pinned reference may be ported as an owned asset, but it is not executed by or
-loaded from llama.cpp at runtime.
+loaded from the peer at runtime.
 
 ### Agentic serving and cache contract
 
@@ -452,14 +454,14 @@ grammar rather than discovered after generation by the client.
   cache rewind, cache fork, context-boundary, and interleaved-slot coherence.
 - A fixed prompt corpus covers plain chat, thinking, reasoning-effort controls,
   tool calls/DSML, long context, Unicode, and stop/EOS behavior.
-- Token/logit parity is measured against the same source-bound llama.cpp build.
+- Token/logit parity is measured against the same source-bound peer build.
 - Three-run median prompt/decode throughput and peak memory meet H3/H4.
 - Existing public API and model-family regression suites remain green.
 
 ## Benchmark discipline
 
 The parity harness is outside product code. It records exact hf2q, mlx-native,
-llama.cpp, source-model, and artifact commits/hashes; prompt bytes; context and
+peer, source-model, and artifact commits/hashes; prompt bytes; context and
 batch sizes; sampling parameters; cache state; thermals; memory pressure; and
 all raw timing samples. Warm and cold-cache results are not mixed. Optimization
 is allowed only after a profile identifies the limiting operation, and every
@@ -492,12 +494,12 @@ changes. The measured candidate is
 | Tool-result continuation | With tools enabled in `auto` mode, the model consumed the Cargo result and returned the requested sentinel without another call. The real OpenCode continuation consumed prior tool results, issued the next required calls, and reused the same live session. |
 | Prefix reuse | The current checked-in gate used a 6,262-token prompt and reused 6,254 tokens on repeated, automatic, SSE, and post-tool turns. Cold TTFT was 9.564 s and cached TTFT was 227 ms; every required/automatic tool, source-argument, tool-result, unary, and SSE assertion passed. |
 | Canonical launcher | `scripts/serve_deepseek4_opencode.sh` passed the curl agentic gate, the real OpenCode coding run, the four-agent full-context gate, and the 120K cache-growth gate. It advertises 524,288 tokens for every slot and demand-allocates 131K initially. Memory/port preflight refuses an unsafe 100 GiB load before model mapping. The 131K-to-262K boundary is proven; a near-512K physical allocation remains unproven on this 128 GiB host. |
-| Ordinary agentic prompt | On the same approximately 5.9K-token README coding prompt, hf2q warm prefill was about 518 tok/s and median decode was 32.1 tok/s; llama.cpp build 10293 reported 399.4 prompt tok/s and 31.7 generation tok/s. |
-| 120K cold prompt | `scripts/test_deepseek4_long_context_cache.sh` produced the exact required tool call for 119,808 prompt tokens in 321.034 s TTFT (373.194 tok/s); decode was 23.869 tok/s. The same source-bound prompt and artifact under llama.cpp build 10298 processed 119,807 tokens in 749.015 s (159.953 tok/s) and decoded at 19.565 tok/s. hf2q was 2.33x the reference prompt rate and 1.22x its decode rate for these source-bound runs. |
+| Ordinary agentic prompt | On the same approximately 5.9K-token README coding prompt, hf2q warm prefill was about 518 tok/s and median decode was 32.1 tok/s; peer build 10293 reported 399.4 prompt tok/s and 31.7 generation tok/s. |
+| 120K cold prompt | `scripts/test_deepseek4_long_context_cache.sh` produced the exact required tool call for 119,808 prompt tokens in 321.034 s TTFT (373.194 tok/s); decode was 23.869 tok/s. The same source-bound prompt and artifact under peer build 10298 processed 119,807 tokens in 749.015 s (159.953 tok/s) and decoded at 19.565 tok/s. hf2q was 2.33x the reference prompt rate and 1.22x its decode rate for these source-bound runs. |
 | 120K continuation cache | Appending the real tool result produced a 119,907-token request that reused 119,800 tokens (99.91%), evaluated only a 107-token suffix, returned its first semantic event in 1.113 s, and emitted the exact requested sentinel. |
 | 98K OpenCode-scale revalidation | A fresh 97,127-token required-tool request completed cold prefill in 424.522 s (228.79 tok/s). Its 97,214-token tool-result turn restored the compact recovery anchor, reused 97,119 tokens (99.90%), evaluated a 95-token suffix in 1.378 s TTFT, and completed in 2 s. |
 | Before/after control | The earlier identical-class hf2q run required 594.575 s for 119,808 tokens (201.502 tok/s). The completion candidate reduced cold-prefill time by 46.0% and increased its token rate by 85.2%. At the shorter exact 26,024-token gate, the threshold retune improved 388.846 tok/s to 497.277 tok/s while retaining the exact tool call; the cached continuation reused 26,016 tokens and reached 927 ms TTFT. |
-| Output parity | Both runtimes returned the exact requested comma-separated sequence. llama.cpp also returned the exact required `read_file` path on the long repository prompt. |
+| Output parity | Both runtimes returned the exact requested comma-separated sequence. The peer also returned the exact required `read_file` path on the long repository prompt. |
 | Memory safety | A 4,096-row prefill command buffer produced Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory`; the accepted 2,048-row transaction completed the 119.8K gate. A later OpenCode session falsified the steady-state claim when macOS killed hf2q at 108,840 MB after the shared transient arena retained cold-prefill buckets. The split-arena build releases prefill scratch before decode; the new file-backed build released 4,933,917,968 transient bytes after the 120K prefill, remained alive through its cached continuation, reported 2.0 GiB RSS, and shut down cleanly. Eagerly allocating the full 524,288-token cache beside this artifact still OOMs, so demand growth remains required. Only one 100 GiB-class runtime was resident during every comparison. |
 
 ### Completion-audit performance ledger (accepted candidate, 2026-08-06)
@@ -505,8 +507,8 @@ changes. The measured candidate is
 The tighter completion gate uses the reproduced 107,431,343,168-byte artifact
 with SHA-256
 `936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d` and
-llama.cpp commit `15586e2d7165570fb3aa7c26e0d442e289ef69de`. On the first clean
-cooled three-trial matched run, llama.cpp medians were 674.458 prompt tok/s and
+peer commit `15586e2d7165570fb3aa7c26e0d442e289ef69de`. On the first clean
+cooled three-trial matched run, peer medians were 674.458 prompt tok/s and
 31.955 decode tok/s; hf2q medians were 620.321 prompt tok/s and 33.984 decode
 tok/s. Every deterministic reasoning/answer transcript matched exactly. Decode
 passed; prefill reached 91.97% and remained an acceptance failure.
@@ -587,19 +589,19 @@ Follow-up hypotheses measured and rejected or removed from the landing diff:
   four preserved BF16 bit identity against the existing one-head-per-tile
   reference. It was nevertheless about 2x slower across Q=64 through Q=1,024;
   at Q=256 and a 640-entry attention width, NSG=4 measured 5.512 ms versus
-  2.669 ms for NSG=8. The explicit-NSG spike was removed and the llama-derived
+  2.669 ms for NSG=8. The explicit-NSG spike was removed and the peer-derived
   NSG=8 geometry remains authoritative.
 - Keeping every 2,048-token transaction on dense masked flash matched the
   exact 1-through-64 transcript with zero cached tokens, but reached only
   615.146 prompt tok/s and 33.865 decode tok/s. That missed the predeclared
-  624.185 prompt-tok/s scalar floor and the 674.458 llama.cpp median. The
+  624.185 prompt-tok/s scalar floor and the 674.458 peer median. The
   all-dense route was rejected; one final mixed-route spike isolates chunk 2
   before closing this routing hypothesis.
 - Routing chunk 2 through dense flash while leaving chunk 3 gathered produced
   three exact, zero-cache-credit trials at 625.484/625.724/625.436 prompt
   tok/s and 33.855/33.886/33.898 decode tok/s. The 625.484 median was only
   0.21% above the clean 624.185 scalar median and remained 7.26% below the
-  674.458 llama.cpp prompt median. That noise-sized short-shape result does
+  674.458 peer prompt median. That noise-sized short-shape result does
   not justify changing long-context routing, so the 1,024-entry crossover was
   restored and the routing hypothesis is closed.
 - A packed F16 heads-as-rows variant was bit-identical to the existing F16
@@ -638,7 +640,7 @@ Follow-up hypotheses measured and rejected or removed from the landing diff:
   official `inference/model.py` at verified revision `2b2bebc` explicitly
   applies block-64 FP8 simulation to every main non-RoPE KV row to match QAT,
   and applies normalized Hadamard rotation plus block-32 FP4 simulation to the
-  lightning-indexer query and compressed KV. llama.cpp's pinned DeepSeek-V4
+  lightning-indexer query and compressed KV. The peer's pinned DeepSeek-V4
   graph visibly applies the Hadamard transforms but has no equivalent runtime
   fake-quant operation. hf2q must retain the official arithmetic; removing it
   merely to win a benchmark would violate the coherence-first contract.
@@ -667,13 +669,13 @@ Follow-up hypotheses measured and rejected or removed from the landing diff:
 
 A sanitized Metal System Trace of the exact 4,987-token request changed the
 working hypothesis from slower GPU arithmetic to poorer host/submission
-continuity. During prefill, pinned llama.cpp occupied 6.982789 seconds of a
+continuity. During prefill, the pinned peer occupied 6.982789 seconds of a
 7.496751-second GPU submission span: 0.513962 seconds idle and 93.14% union
 utilization. hf2q occupied only 6.869377 seconds of a 7.757780-second span:
 0.888403 seconds idle and 88.55% utilization. hf2q therefore completed about
 113.4 ms less GPU work but accumulated about 374.4 ms more idle time, producing
 the observed approximately 261.0 ms wall-clock loss. Decode showed the
-opposite shape: llama.cpp occupied 4.033765 of 5.113851 seconds (78.88%), while
+opposite shape: the peer occupied 4.033765 of 5.113851 seconds (78.88%), while
 hf2q occupied 3.637267 of 3.822293 seconds (95.16%). The checked-in
 `aggregate_decode_mst.py` reports clipped phase windows, union busy time,
 overlap, idle time, utilization, and gap distributions; its units are GPU
@@ -699,10 +701,10 @@ a different lifetime design.
 
 The sanitized encoder list makes that submission difference structural rather
 than speculative. hf2q used 129 compute encoders for prefill, exactly three
-2,048/2,048/891-row chunks times 43 layers. Pinned llama.cpp used six compute
+2,048/2,048/891-row chunks times 43 layers. The pinned peer used six compute
 encoders over the same prompt, two per chunk, before its output work began.
 The runtimes therefore do not merely choose different kernel shapes: hf2q
-forces 43 CPU/GPU rendezvous points per chunk while llama.cpp lifetime-plans a
+forces 43 CPU/GPU rendezvous points per chunk while the peer lifetime-plans a
 whole chunk graph and partitions it into two command buffers.
 
 Hoisting hf2q's two reusable full-state buffers cannot close that gap. A
@@ -761,7 +763,7 @@ falsifies a thermal slowdown inside a specific MoE, attention, or indexer
 kernel as the explanation for the residual wall-time drift.
 
 Source comparison exposed a residency-preparation difference below hf2q's
-model graph. Pinned llama.cpp commits each Metal residency set, immediately
+model graph. The pinned peer commits each Metal residency set, immediately
 calls `requestResidency`, and refreshes active sets from a five-millisecond
 keep-alive loop. `mlx-native` commits pending membership and attaches its set
 to the command queue but has no `requestResidency` call. Apple's API contract
@@ -790,7 +792,7 @@ falsify Rust allocation, scratch lifetime, kernel arithmetic, and residency-set
 membership as the cause; Metal was preparing the inactive weight resources at
 the first consuming command buffer.
 
-Pinned llama.cpp supplies the missing lifecycle contract. Its Metal backend
+The pinned peer supplies the missing lifecycle contract. Its Metal backend
 refreshes active residency sets every five milliseconds and keeps that work
 alive for three minutes after graph execution. The accepted `mlx-native`
 boundary now owns the same family-neutral policy: each live residency set has
@@ -834,29 +836,29 @@ three zero-cache trials at 670.921/632.703/632.861 prompt tok/s and
 33.888/33.889/33.891 decode tok/s. The 632.861 prompt median is 1.32% above the
 matched 624.618 zero-filled control; decode is unchanged. The diagnostic
 environment switches were removed. This gain is accepted, but it does not
-close H4 because the pinned llama.cpp prefill median remains higher.
+close H4 because the pinned peer prefill median remains higher.
 
 The earlier attribution to ordinary sustained-load GPU DVFS is rejected by the
 GPU-interval and first-group measurements above. The final clean-registry
 paired gate used the same artifact, 4,987-token prompt, greedy
 temperature-zero/seed-42 settings, exact transcript oracle, zero prompt-cache
-credit, and 60-second gaps before and between three trials. Pinned llama.cpp
+credit, and 60-second gaps before and between three trials. The pinned peer
 commit `15586e2d7165570fb3aa7c26e0d442e289ef69de` measured
 673.497/672.744/674.711 prompt tok/s and
 31.810/31.855/31.821 decode tok/s. The hf2q build pinned to the verified
 `mlx-native` 0.10.3 registry archive measured
 674.026/674.785/676.812 prompt tok/s and
 34.054/33.885/33.958 decode tok/s. Every transcript was exact; hf2q therefore
-passed this cold-prefix gate at 1.0019x llama.cpp prefill and 1.0672x decode.
+passed this cold-prefix gate at 1.0019x peer prefill and 1.0672x decode.
 The complete source-bound receipt is retained under
 `hf2q-deepseek-parity.XXXXXX.1PXRWahgxc`; it records artifact, binary, hf2q
 patch, the clean mlx-native source state, and implementation hashes.
 
 The 2026-08-07 current-reference refresh used the same reproduced artifact,
 hf2q runtime `03e378e9862e6d9add0d08ea68c1d6c449357364`, clean `mlx-native`
-head `eb1b031876a0d5aa3b16803a54e78aa5de7d2e62`, and llama.cpp
+head `eb1b031876a0d5aa3b16803a54e78aa5de7d2e62`, and the peer at
 `3653e6d6d547ec763317d9ecd0ace334a7e21359`. All six transcripts were
-again exact with zero cache credit. llama.cpp measured
+again exact with zero cache credit. The peer measured
 666.655/674.345/669.544 prompt tok/s and 31.404/31.732/31.814 decode tok/s;
 hf2q measured 661.982/669.469/674.258 prompt tok/s and
 33.993/33.499/33.880 decode tok/s. The medians were therefore 669.544 versus
@@ -875,7 +877,7 @@ OOM transaction. The corrected spike used 4,096 varied valid token IDs through
 the ordinary prompt chunker, producing two bounded 2,048-row transactions and
 resetting cache/scratch before readiness. Its exact three-trial hf2q results
 were 661.703/671.261/624.270 prompt tok/s and
-33.687/33.659/30.504 decode tok/s, while the matched llama.cpp arm stayed flat
+33.687/33.659/30.504 decode tok/s, while the matched peer arm stayed flat
 at a 669.954 prompt-tok/s median. The warmup neither improved the first trial
 nor preserved sustained performance, so the entire code/test spike was
 removed. Moving another full sparse/indexer workload into startup is not an
@@ -884,8 +886,8 @@ accepted performance technique.
 The next spike kept the same three Metal transactions for the 4,987-token
 parity prompt but changed their shapes from 2,048/2,048/891 to
 1,664/1,664/1,659 by selecting 13 sparse windows. Against the same current
-llama.cpp source, the exact zero-cache hf2q trials measured
-671.015/672.071/671.476 prompt tok/s; llama.cpp measured
+peer source, the exact zero-cache hf2q trials measured
+671.015/672.071/671.476 prompt tok/s; the peer measured
 673.491/670.910/666.989. The 671.476 versus 670.910 medians passed at
 1.00084x, and hf2q decode remained 1.0653x faster. The raw evidence is
 `hf2q-deepseek-parity.XXXXXX.cBi5FosgDZ`.
@@ -902,11 +904,11 @@ boundary-sized prompts, long prompts, and grown-cache requests retain their
 previous measured policies.
 
 The final bounded-adaptive gate used the same reproduced artifact, current
-llama.cpp `3653e6d6d547ec763317d9ecd0ace334a7e21359`, clean mlx-native
+peer `3653e6d6d547ec763317d9ecd0ace334a7e21359`, clean mlx-native
 `eb1b031876a0d5aa3b16803a54e78aa5de7d2e62`, and the exact hf2q candidate
 binary SHA-256
 `222251a89a3535a92e6ba7c847fb1e395a5d617e78668c4c6f2449baf6ffae69`.
-llama.cpp measured 670.226/670.948/670.117 prompt tok/s and
+The peer measured 670.226/670.948/670.117 prompt tok/s and
 31.658/31.547/31.534 decode tok/s. hf2q measured
 672.913/678.760/677.283 prompt tok/s and
 33.647/33.982/33.985 decode tok/s. Every transcript was exact with zero cache
@@ -922,7 +924,7 @@ correctness run on the same server produced the exact required tool at
 332.240 prompt tok/s; its 119,916-token continuation reused 119,813 tokens and
 reached TTFT in 1.132 seconds. The lower cold rate than the earlier isolated
 373.194 tok/s observation is recorded as sustained-run variance, not claimed
-as a speedup. It remains over the historical 159.953-217.5 tok/s llama.cpp
+as a speedup. It remains over the historical 159.953-217.5 tok/s peer
 long-prompt observations, while the current strict matched performance claim
 is limited to the cooled three-trial gate above.
 
@@ -945,7 +947,7 @@ build, and full hosted-safe tests passed after removing the local path patch.
 The performance result comes from two measured defaults. Decode groups two
 verifier layers per Metal command buffer; one layer reached 29.49 tok/s, two
 reached 33.10, four plateaued at 33.05, and eight regressed to 32.80. The Q8_0
-matvec uses llama.cpp's peer geometry (`N_SG=4`, `N_R0=2`); enabling it raised
+matvec uses the peer's geometry (`N_SG=4`, `N_R0=2`); enabling it raised
 the accepted path to 35.55 tok/s with byte-identical Q8 parity tests. The Q3_K
 expert-down choice was retained after an exact production-shape spike measured
 201 us for six decode rows versus 351 us for Q2_K. These results falsify both
@@ -1023,7 +1025,7 @@ completed within 20-32 seconds. Exact server-side cold-cohort makespans were
 53.86 and 52.32 seconds (53.09-second median); client-observed semantic walls
 were 52-55 seconds.
 
-The matched llama.cpp server completed its corresponding cold four-request
+The matched peer server completed its corresponding cold four-request
 wave in about 54.1 seconds on the same artifact and host with `--kv-unified`,
 `--parallel 4`, and 131,072 logical tokens per slot. Its 524,288-token unified
 allocation did not fit beside the 100 GiB artifact on this 128 GiB host. hf2q
@@ -1185,7 +1187,7 @@ At that stage the 55-second bound was intentionally unchanged. A fresh
 exact-packed M5 Max
 rerun of the frozen request twice is the discriminator: success restores
 matched release authority; failure leaves a current-scheduler performance
-blocker that must be optimized or re-baselined against a same-input llama.cpp
+blocker that must be optimized or re-baselined against a same-input
 peer. This section records a candidate correction, not a passing hardware
 claim.
 
@@ -1210,7 +1212,7 @@ tok/s; the separate published-0.10.6 decode control fell from roughly
 alone was insufficient evidence of an unthrottled host.
 
 The corrected wrapper runs both calibrated waves before the long functional
-workloads. Before each fresh server starts, with no hf2q/llama model runtime
+workloads. Before each fresh server starts, with no hf2q/peer model runtime
 loaded, the host
 must report `ProcessInfo.thermalState == nominal` at five-second cadence for at
 least 60 seconds. Thermal state is then sampled every two seconds throughout
@@ -1300,13 +1302,13 @@ must not be relaxed without a source-bound peer or a measured optimization.
 
 `scripts/test_deepseek4_peer_cold_wave.sh` and
 `scripts/run_deepseek4_matched_peer.sh` now make that peer comparison
-reproducible. They use llama.cpp build 10326 (`3653e6d6d`), binary SHA-256
+reproducible. They use peer build 10326 (`3653e6d6d`), binary SHA-256
 `90bdf03673f7ee61d65d579a4e0be64a914edac1ccb23e74871040bc30d13543`,
 the exact model SHA-256
 `936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`,
 `--ctx-size 131072 --parallel 4 --kv-unified --flash-attn on`, and disabled
 prompt caching. The four request JSON files are generated by the same frozen
-builder used by hf2q. Pinned llama.cpp renders those identical bytes as 6,695
+builder used by hf2q. The pinned peer renders those identical bytes as 6,695
 tokens rather than hf2q's 6,685; the peer-specific count is bound explicitly.
 
 The first peer probe returned four exact zero-cache `read_file` calls in
@@ -1440,7 +1442,7 @@ response already finishes in one pure-decode visit, so another quantum increase
 cannot remove the remaining serial four-slot decode floor.
 
 That exact failure triggered the checked-in same-input peer discriminator
-rather than a favorable hf2q rerun. Pinned llama.cpp build 10326 (binary
+rather than a favorable hf2q rerun. The pinned peer build 10326 (binary
 SHA-256 `90bdf03673f7ee61d65d579a4e0be64a914edac1ccb23e74871040bc30d13543`)
 ran alone against the same model and request bytes with prompt caching disabled.
 After separate 180-second loaded-idle Nominal settles, both continuously
@@ -1889,7 +1891,7 @@ made cache/ledger-consistent and recovered alone, while healthy peers keep
 their committed suffix. Fatal cleanup owns every removed reply.
 
 The protected benchmark compiles its release test binary before the Nominal
-settle, launches it from a minimal `env -i` allowlist with no hf2q, MLX, Metal,
+settle, launches it from a minimal `env -i` whitelist with no hf2q, MLX, Metal,
 profiling, or scheduling override, and fixes the alternating pair count at
 five. CI, packed-artifact, release-check, and publication builds also reject a
 set `MLX_NATIVE_SKIP_METALLIB` before Cargo runs, because that build-script
@@ -2256,13 +2258,13 @@ historical ledger below:
 | OpenAI/SSE protocol | Unary and SSE both emitted structured `tool_calls`, `finish_reason: "tool_calls"`, and a terminal `[DONE]`; no raw DSML leaked. |
 | Checked-in agentic gate | `scripts/test_deepseek4_agentic.sh` uses a unique run ID and deliberately withholds the requested manifest until the tool result. It requires a zero-cache first request, near-complete reuse on repeats and tool results, bounded wall-clock semantic response latency, reconstructed valid SSE tool-call JSON, matching call identity/arguments, `finish_reason: "tool_calls"`, usage, and exactly one terminal `[DONE]`. The 128-token completion budget prevents a valid but slightly longer DSML call from being mistaken for a grammar failure. The gate remains fail-closed on the Q2 tool-semantic defect below. |
 | Tool semantics at Q2 | Failed. Required-tool runs requested paths including `/home/robertl/agent/coding/1`, `/opt/hf2q/README.md`, and, after removing the initially embedded manifest from the fixture, `/cargo/1.0.0.1/daniel/hf2q/cargo.toml` instead of the explicit `/opt/hf2q/Cargo.toml`. One separate cold SSE run chose the correct path, demonstrating inconsistent artifact quality rather than a stable agentic pass. Automatic tool choice also failed to produce a reliable native call. |
-| Long-prompt throughput | A controlled 18,526-token candidate improved from 95.57 s / 193.85 tok/s at 512-row chunks to 70.52 s / 262.70 tok/s at 4K chunks. The matched llama.cpp reference was 361.89 tok/s, so hf2q reached about 72.6% and failed the H4 85% prompt-processing floor. |
-| Decode throughput | A warmed 6.2K agent prompt decoded at about 16.35 tok/s versus about 38.58 tok/s for the matched llama.cpp run. H4 decode parity is therefore reopened. |
-| Quality reference | llama.cpp on the same Q2 artifact also emitted malformed/non-actionable tool content in automatic and required modes. That implicates the aggressive quantization, but does not relax hf2q's agentic correctness gate. |
+| Long-prompt throughput | A controlled 18,526-token candidate improved from 95.57 s / 193.85 tok/s at 512-row chunks to 70.52 s / 262.70 tok/s at 4K chunks. The matched peer reference was 361.89 tok/s, so hf2q reached about 72.6% and failed the H4 85% prompt-processing floor. |
+| Decode throughput | A warmed 6.2K agent prompt decoded at about 16.35 tok/s versus about 38.58 tok/s for the matched peer run. H4 decode parity is therefore reopened. |
+| Quality reference | The peer on the same Q2 artifact also emitted malformed/non-actionable tool content in automatic and required modes. That implicates the aggressive quantization, but does not relax hf2q's agentic correctness gate. |
 
 DeepSeek-V4-Flash Q2 is therefore an experimental serving target. “Ready” now
 means the process and Metal pipelines are initialized; it does not mean the
-artifact has passed the agentic quality or llama.cpp parity gates. Release
+artifact has passed the agentic quality or peer parity gates. Release
 acceptance requires a realistic multi-turn coding fixture to produce the right
 tool call, consume its result, reuse the unchanged prefix, stream a timely first
 semantic token, and meet both H4 throughput floors.
@@ -2283,8 +2285,8 @@ current readiness.
 | hf2q Q2_K_S converter | Rust in-process; FP8/FP4/E8M0 ingest, bounded expert fusion, atomic provenance receipt |
 | mlx-native Q2_K loader/matvec | Dense + expert-ID Metal paths; exact routing, activation, sparse-attention, compressor, indexer, HC, and tail-RoPE primitives |
 | Q2_K decode microbench | 55.81 us / 98.63 GB/s at M=1, N=K=4096 (integration rerun) |
-| Pinned llama.cpp conversion and graph | Present at reference commit |
-| Pinned llama.cpp oracle binaries | Rebuilt locally as version 10276 (`6ea215d17`) |
+| Pinned peer conversion and graph | Present at reference commit |
+| Pinned peer oracle binaries | Rebuilt locally as version 10276 (`6ea215d17`) |
 | Synthetic converter proof | Positive/negative dtype, shape, scale, fusion, receipt, and round-trip suites green |
 | Official full conversion | Passed from pinned source with hf2q converter commit `a8e00a24c1ac043182761e9df3347853b2d74d41` |
 | Official output | 96,265,459,008 bytes (89.65 GiB), SHA-256 `0318b99b4ece1222d8cf4d93a705458d339907910af5af3a175bc3989dcb01a1` |
@@ -2305,9 +2307,9 @@ current readiness.
 | Official vocabulary-logits proof | Owned HC collapse, final RMSNorm, and Q6_K output projection passed with the 43-layer verifier in 27.81 s; 62,708,498,432-byte max RSS; zero swaps; finite nonzero `[1, 129280]` logits |
 | Official tokenizer parity | GGUF-driven Rust GPT-2 BPE emitted the same IDs as the pinned source `tokenizer.json` for the fixed Unicode, numeric, punctuation, and 0731 prompt-atom corpus |
 | Coherent real-model inference | Rust-native `hf2q generate` rendered the 0731 chat prompt, crossed the position-3 ratio-four compression boundary, selected the greedy token on Metal, and decoded `Hello` for the fixed six-token prompt |
-| One-token reference parity | Pinned llama.cpp `llama-simple` on the exact same GGUF and rendered six-token prompt also greedily decoded `Hello`; no product path invoked the oracle |
+| One-token reference parity | Pinned peer `llama-simple` on the exact same GGUF and rendered six-token prompt also greedily decoded `Hello`; no product path invoked the oracle |
 | Native inference telemetry | 20.80 s load; 8.15 s incremental six-token prefill (0.736 tok/s); 30.38 s total; 67,364,585,472-byte max RSS; zero swaps |
-| Reference inference telemetry | Pinned llama.cpp raw-completion oracle processed the same six tokens in 73.89 ms (81.20 tok/s) after load; not yet an H4 comparison because hf2q currently submits one-token graphs while the reference batches all six |
+| Reference inference telemetry | Pinned peer raw-completion oracle processed the same six tokens in 73.89 ms (81.20 tok/s) after load; not yet an H4 comparison because hf2q currently submits one-token graphs while the reference batches all six |
 | Official arithmetic coherence | Prompt `What is 2+2? Answer with only the number.` rendered to 17 source-parity token IDs; greedy output reasoned to `2+2 = 4` and terminated with final answer `4` |
 | Extended-context execution | Fresh prompts matrix-prefill up to 1,024 rows beyond the 128-row physical window, then extend exactly; cached suffixes retain exact token-wise extension; server default 131,072 tokens with a metadata-enforced 1,048,576-token ceiling |
 | Matrix-bound artifact proof | A fresh 1,036-token request crossed the 1,024-row matrix bound, completed its exact incremental tail coherently, and reached 356.03 prompt tok/s / 2.910 s TTFT on the warm shape |
@@ -2316,8 +2318,8 @@ current readiness.
 | Artifact-backed tests | Exact 1,328-tensor catalog, all 43 verifier layers plus finite vocabulary logits, greedy token selection, and embedded tokenizer parity passed against the 96.3 GB artifact |
 | Final native decode sample | 56 generated tokens in 1.24 s (45.308 tok/s) on the official arithmetic prompt after the clean pinned-dependency release build |
 | Matched five-run native benchmark | 45.1, 45.1, 37.7, 45.2, and 45.1 tok/s; median 45.1 tok/s, p95 45.2 tok/s; 63 verifier evaluations for 64 generated tokens; warm-prefill median 74.6 tok/s |
-| Matched llama.cpp reference | 41.58 tok/s on the same artifact and benchmark contract; hf2q median is 1.085x (+8.5%) |
-| Performance parity | Passed: native median exceeds the H4 0.90x decode floor and the pinned llama.cpp reference while retaining coherent greedy output |
+| Matched peer reference | 41.58 tok/s on the same artifact and benchmark contract; hf2q median is 1.085x (+8.5%) |
+| Performance parity | Passed: native median exceeds the H4 0.90x decode floor and the pinned peer reference while retaining coherent greedy output |
 | Native OpenAI server load | Real 96.3 GB artifact loaded in 19.92 s as `DeepSeek-V4-Flash-0731-Q2_K_S`; `/v1/models` reports `deepseek4`, Q2_K, 256 experts/6 active, native MLX, and the configured 4,096-token validation context |
 | Exact growing-turn cache | Final real-artifact unary check reused 16 of 27 prompt tokens; only the 11-token suffix ran, with 0.276 s TTFT; an earlier 37-of-48-token coding turn prefetched its suffix in 0.287 s |
 | Canonical reasoning recovery | Thinking-mode follow-up with old `reasoning_content` removed restored the native recovery checkpoint (`cached_tokens=4` of 21 on the deliberately tiny prompt) rather than replaying the whole prefix |

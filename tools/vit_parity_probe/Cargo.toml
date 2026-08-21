@@ -4,7 +4,7 @@
 # doesn't pollute the main hf2q crate's build). Provides:
 #
 #   * `diff` binary: stage-by-stage element-wise max-abs-error between a
-#     hf2q dump dir and an llama.cpp peer-reference dump dir.
+#     hf2q dump dir and a peer-reference dump dir.
 #
 #   * `weight_bytes` binary (iter-131, ADR-005 Phase 2c): F16 weight
 #     byte-identity probe — opens an mmproj GGUF and asserts that the

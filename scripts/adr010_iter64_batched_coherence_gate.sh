@@ -121,7 +121,7 @@ fi
 
 # Iter-74 strengthening: STRICT byte-identity check between per-token and
 # batched decoded outputs. The Apr-20 9091b8c baseline had 3656/3658 byte
-# match between hf2q batched and llama.cpp batched on sourdough; the
+# match between hf2q batched and the peer batched on sourdough; the
 # stronger invariant for THIS gate is byte-identity vs hf2q per-token,
 # which exercises the same compute and KV-cache state ABI. ADR-010 L6 MoE
 # router top-K sensitivity may legitimately diverge per-token vs batched

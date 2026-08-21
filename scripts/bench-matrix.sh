@@ -2,7 +2,7 @@
 # scripts/bench-matrix.sh
 #
 # ADR-015 iter18 — paired-binary cold-SoC bench across (model × quant) cells.
-# Operationalizes feedback_speed_bar_full_matrix: hf2q ≥1.00× llama.cpp
+# Operationalizes feedback_speed_bar_full_matrix: hf2q ≥1.00× the peer
 # across ALL quants/conversions/lengths/modes on the same hardware.
 #
 # Output: a single markdown matrix at $OUT_DIR/matrix-${DATE}.md showing

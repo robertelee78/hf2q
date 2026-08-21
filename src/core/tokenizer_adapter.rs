@@ -10,16 +10,16 @@
 //! sets `tokenizer.ggml.add_bos_token = true`. The HF
 //! `tokenizer.encode(text, add_special_tokens=true)` call is then a
 //! no-op for BOS, producing token sequences that diverge from
-//! `llama.cpp`'s `common_tokenize` output by exactly the leading
+//! the peer's `common_tokenize` output by exactly the leading
 //! BOS token.
 //!
 //! For Gemma 4 31B Q4_K_M, that missing BOS caused saturated garbage
 //! output (token 240017 `"額"` repeated) — see ADR-038 G4-CFA-5e
 //! commit `b0423671`.
 //!
-//! ## Semantics — `llama.cpp` parity
+//! ## Semantics — peer parity
 //!
-//! Mirrors `llama.cpp`'s `common_tokenize(text, add_special=true,
+//! Mirrors the peer's `common_tokenize(text, add_special=true,
 //! parse_special=true)`:
 //!
 //! 1. Run `tokenizer.encode(text, add_special_tokens=false)` — bypass
@@ -31,10 +31,9 @@
 //!
 //! BOS / EOS IDs are resolved by:
 //! - GGUF `tokenizer.ggml.bos_token_id` / `eos_token_id` (preferred,
-//!   matches `llama.cpp`'s preferred path), then
-//! - `llama.cpp`'s tokenizer-model defaults (e.g. `gpt2` defaults
-//!   both BOS and EOS to id 11) per
-//!   `/opt/llama.cpp/src/llama-vocab.cpp`.
+//!   matches the peer's preferred path), then
+//! - the peer's tokenizer-model defaults (e.g. `gpt2` defaults
+//!   both BOS and EOS to id 11).
 //!
 //! ## Why not fix the tokenizer.json file?
 //!
@@ -42,7 +41,7 @@
 //! re-download GGUF model directories from third parties (bartowski,
 //! unsloth, official Google) whose sibling `tokenizer.json` files
 //! may or may not include BOS in post_processor — silent regression
-//! risk. The GGUF-metadata-driven approach (matching `llama.cpp`) is
+//! risk. The GGUF-metadata-driven approach (matching the peer) is
 //! robust to that variance.
 //!
 //! For belt-and-suspenders, the [`fix_tokenizer_json_bos`] helper
@@ -82,11 +81,11 @@ fn resolve_token_id(
     tokenizer: &tokenizers::Tokenizer,
     metadata_key: &str,
 ) -> Option<u32> {
-    llama_cpp_special_token_id(gguf, metadata_key)
+    peer_special_token_id(gguf, metadata_key)
         .and_then(|id| tokenizer.id_to_token(id).map(|_| id))
 }
 
-fn llama_cpp_special_token_id(
+fn peer_special_token_id(
     gguf: &mlx_native::gguf::GgufFile,
     metadata_key: &str,
 ) -> Option<u32> {
@@ -94,13 +93,13 @@ fn llama_cpp_special_token_id(
         return Some(id);
     }
     let tokenizer_model = gguf.metadata_string("tokenizer.ggml.model")?;
-    llama_cpp_special_token_id_for_model(tokenizer_model, metadata_key)
+    peer_special_token_id_for_model(tokenizer_model, metadata_key)
 }
 
-fn llama_cpp_special_token_id_for_model(tokenizer_model: &str, metadata_key: &str) -> Option<u32> {
+fn peer_special_token_id_for_model(tokenizer_model: &str, metadata_key: &str) -> Option<u32> {
     match (tokenizer_model, metadata_key) {
-        // Mirrors `/opt/llama.cpp/src/llama-vocab.cpp`: for tokenizer
-        // model `gpt2`, llama.cpp initializes both BOS and EOS to
+        // Mirrors the peer's vocab defaults: for tokenizer
+        // model `gpt2`, the peer initializes both BOS and EOS to
         // token id 11 before applying GGUF metadata overrides.
         ("gpt2", "tokenizer.ggml.bos_token_id") | ("gpt2", "tokenizer.ggml.eos_token_id") => {
             Some(11)
@@ -109,7 +108,7 @@ fn llama_cpp_special_token_id_for_model(tokenizer_model: &str, metadata_key: &st
     }
 }
 
-/// Tokenize a rendered prompt with `llama.cpp` `common_tokenize(...,
+/// Tokenize a rendered prompt with the peer's `common_tokenize(...,
 /// add_special=true, parse_special=true)` semantics.
 ///
 /// See module docs for the contract.

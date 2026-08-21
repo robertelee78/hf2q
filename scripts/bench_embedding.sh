@@ -148,7 +148,7 @@ echo
 echo "[bench] === comparison table ==="
 HF2Q_FMT=$(python3 -c "print(f'{${HF2Q_STEADY_STATE}:.2f}')")
 RATIO=$(python3 -c "print(f'{${HF2Q_STEADY_STATE} / ${LLAMA_PE_MEAN}:.2f}')")
-printf "  %-42s %s\n" "llama.cpp internal prompt_eval (mean)"   "${LLAMA_PE_MEAN} ms"
+printf "  %-42s %s\n" "the peer internal prompt_eval (mean)"   "${LLAMA_PE_MEAN} ms"
 printf "  %-42s %s\n" "hf2q HTTP /v1/embeddings (warm mean)"   "${HF2Q_FMT} ms"
 printf "  %-42s %s\n" "ratio (hf2q full-stack / llama bare-GPU)" "${RATIO}×"
 

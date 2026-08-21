@@ -13,7 +13,7 @@
 //! port follows once CPU parity is locked against an mlx-lm Gemma 4
 //! vision reference (live-model-gated).
 //!
-//! # Tensor-layout conventions (match llama.cpp's mmproj writer)
+//! # Tensor-layout conventions (match the peer's mmproj writer)
 //!
 //!   - `pixel_values`  — CHW, `[3, H, W]` f32, row-major within each channel,
 //!     channels concatenated. Produced by `preprocess::preprocess_rgb_chw`.
@@ -189,7 +189,7 @@ pub fn layer_norm_forward(
 ///
 /// # Why Gemma 4 uses RMSNorm despite the `ln1`/`ln2` tensor names
 ///
-/// The llama.cpp mmproj writer inherits CLIP's naming even when the
+/// The peer's mmproj writer inherits CLIP's naming even when the
 /// underlying model family switched from LayerNorm to RMSNorm.
 /// Gemma 4's vision tower ships `ln1.weight` + `ln2.weight` +
 /// `ffn_norm.weight` + `post_ffw_norm.weight` but NO matching
@@ -912,7 +912,7 @@ pub fn scale_in_place(x: &mut [f32], c: f32) {
 /// adjacent input rows.
 ///
 /// For Gemma 4V: `[196, 1152]` (14×14 patches) → `[49, 1152]` (7×7
-/// patches). Matches llama.cpp's `ggml_pool_2d(..., AVG, 2, 2, 2, 2)`.
+/// patches). Matches the peer's average pool with stride==kernel==2.
 ///
 /// Output memory layout is row-major over the new 7×7 grid:
 /// `out[y*7 + x]` = mean of input patches `(2y, 2x)`, `(2y, 2x+1)`,
@@ -1036,8 +1036,8 @@ pub fn std_bias_scale_in_place(
 /// ```
 ///
 /// `hidden_states` is consumed and the returned `Vec<f32>` replaces it
-/// for the next block's input. Matches llama.cpp `build_vit` Gemma 4V
-/// path structure; known block-parity TODOs (Gemma 4V `scale=1.0`,
+/// for the next block's input. Matches the peer's Gemma 4V ViT block
+/// structure; known block-parity TODOs (Gemma 4V `scale=1.0`,
 /// V-RMSNorm, 2D RoPE) are unchanged from iter 40.
 pub fn apply_vit_block_forward(
     hidden_states: Vec<f32>,
@@ -1119,7 +1119,7 @@ pub fn apply_vit_block_forward(
 
 /// Full CPU ViT forward: pixel tensor → projected multimodal embeddings.
 ///
-/// Pipeline (from llama.cpp `clip_graph_gemma4v::build`):
+/// Pipeline (the peer's gemma4v graph):
 ///
 /// ```text
 ///   1. hidden = patch_embed(pixels)                          [196, 1152]
@@ -1224,7 +1224,7 @@ pub fn apply_vit_full_forward(
     )?;
 
     // --- Stage 7: no-gain final RMSNorm ---
-    // llama.cpp calls ggml_rms_norm without a weight param, so gamma is
+    // The peer applies this RMSNorm without a weight param, so gamma is
     // effectively all-ones. Allocate once per call; cheap relative to
     // the ~81 GFLOP that preceded.
     let ones = vec![1.0f32; text_hidden];
@@ -1278,7 +1278,7 @@ pub fn patch_embed_from_mmproj_weights(
 // ---------------------------------------------------------------------------
 //
 // These mirror `patch_embed_forward` and `position_embed_add` (above) but
-// follow the gemma4v graph from `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp`
+// follow the peer's gemma4v graph
 // + the candle reference at `/opt/candle/.../gemma4/vision.rs:114-183`:
 //
 //   - PatchEmbedder is a Linear-no-bias `[hidden, p²·3]`, NOT a Conv2d.
@@ -1372,7 +1372,7 @@ pub fn gemma4v_patch_embed_forward(
 
 /// Dual position-embed lookup for the gemma4v vision tower.
 ///
-/// Implements the C++ reference at `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp:18-42`:
+/// Implements the peer's dual position-embed lookup:
 ///
 /// ```text
 ///   tbl_x = pe_table[0]                  // [pos_size, hidden]
@@ -1499,11 +1499,8 @@ pub fn gemma4v_position_embed_add(
 //   7. Activation is GELU(pytorch_tanh) on the gate proj (not SiLU).
 //   8. Attention scale is 1.0 (Q is RMS-normalized).
 //
-// All four refs:
-//   - `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp:46-99`
-//   - `/opt/candle/.../gemma4/vision.rs:202-365`
-//   - `/opt/llama.cpp/tools/mtmd/clip.cpp:1334-1343` (gemma4v hparams)
-//   - `/opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp` (NeoX rope semantics)
+// Refs: the peer's gemma4v graph, hparams, and NeoX rope semantics,
+// plus `/opt/candle/.../gemma4/vision.rs:202-365`.
 
 /// Gemma4 ViT RMSNorm: `y = x * rsqrt(mean(x²) + eps) * weight` (literal gain).
 ///
@@ -1512,12 +1509,11 @@ pub fn gemma4v_position_embed_add(
 /// `torch.ones(dim)` (line 164). This is **OPPOSITE** to Gemma3's RMSNorm
 /// (`output * (1.0 + weight)`); Gemma4 deliberately changed the convention.
 ///
-/// llama.cpp peer reference:
-///   - converter (`convert_hf_to_gguf.py::Gemma4VisionAudioModel`, lines
-///     7805-7879) does NOT shift weights; vision tensors pass through verbatim
-///     (in contrast to `Gemma3VisionModel` which adds +1 to `soft_emb_norm`).
-///   - runtime (`tools/mtmd/clip.cpp::clip_graph::build_norm`, lines 524-547)
-///     applies `ggml_mul(cur, mw)` — literal weight.
+/// Peer reference:
+///   - the peer's converter does NOT shift weights; vision tensors pass
+///     through verbatim (in contrast to its Gemma 3 vision converter,
+///     which adds +1 to `soft_emb_norm`).
+///   - the peer's runtime norm applies the literal weight.
 ///
 /// Bug-history (iter-122, 2026-04-26): hf2q originally copied candle's
 /// `(&self.weight + 1.0)` from `/opt/candle/.../gemma4/vision.rs:39` — but
@@ -1555,8 +1551,8 @@ pub fn gemma_rms_norm_forward(
             hidden
         ));
     }
-    // Delegate to the literal-gain `rms_norm_forward` — peer-identical to
-    // llama.cpp `clip_graph::build_norm` for the gemma4v ViT path.
+    // Delegate to the literal-gain `rms_norm_forward` — peer-identical
+    // for the gemma4v ViT path.
     rms_norm_forward(input, weight, hidden, eps)
 }
 
@@ -1635,8 +1631,8 @@ pub fn v_norm_no_scale_forward(input: &mut [f32], hidden: usize, eps: f32) -> Re
 /// represented as an `Option<f32>`; `None` collapses to `f32::NEG_INFINITY`
 /// (for min) or `f32::INFINITY` (for max), making that side a no-op.
 ///
-/// Mirrors llama.cpp's `clamp_info` struct (`tools/mtmd/clip.cpp:1952-1957`)
-/// which carries the four scalars as plain f32 with `+/- FLT_MAX` defaults.
+/// The peer carries the same four scalars as plain f32 with
+/// `+/- FLT_MAX` defaults.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Gemma4ClippableLinearBounds {
     pub input_min: Option<f32>,
@@ -1676,8 +1672,7 @@ impl Gemma4ClippableLinearBounds {
     }
 }
 
-/// CPU reference for the `Gemma4ClippableLinear` projector primitive
-/// (`/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp:138-151`).
+/// CPU reference for the `Gemma4ClippableLinear` projector primitive.
 ///
 /// Pipeline:
 ///   1. (optional) clamp `input` to `[input_min, input_max]`
@@ -2928,8 +2923,8 @@ mod tests {
     //   1. `kq_scale = 1.0` for Gemma 4V (iter 37 uses 1/√d_head default).
     //   2. V gets its own RMSNorm (no gain) before attention (currently skipped).
     //   3. 2D RoPE on Q and K (not yet ported).
-    // Ordering + tensor wiring below matches llama.cpp's clip.cpp
-    // `build_vit` exactly for the Gemma 4V path.
+    // Ordering + tensor wiring below matches the peer's ViT graph
+    // exactly for the Gemma 4V path.
 
     #[test]
     fn block_0_full_forward_on_real_gemma4() {
@@ -3070,8 +3065,8 @@ mod tests {
         assert_eq!(down.len(), num_patches * hidden);
 
         // post_ffw_norm applied to the FFN output BEFORE the residual add
-        // (matches llama.cpp build_vit: `cur = build_norm(cur, ff_post_norm_w)`
-        // before `cur = inpL + cur`).
+        // (matches the peer's ViT graph: post-FFN norm precedes the
+        // residual add).
         rms_norm_forward(&mut down, &post_ffw_norm_w, hidden, 1e-6).expect("post_ffw_norm");
 
         let mut block_out = post_attn.clone();

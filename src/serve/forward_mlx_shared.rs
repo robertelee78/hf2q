@@ -562,7 +562,7 @@ pub fn dispatch_qmatmul(
     // 26B-A4B's `ffn_down.weight` (intermediate=2112) and `ffn_down_exps.weight`
     // (moe_intermediate=704).  Community quants (bartowski, unsloth) instead
     // fall back to 32-aligned legacy quants (Q5_1 / IQ4_NL / Q8_0); both
-    // patterns are valid per the GGUF spec and llama.cpp accepts either.
+    // patterns are valid per the GGUF spec and the peer accepts either.
     //
     // `quantized_matmul_ggml` below only handles Q-family block types, so
     // F16 weights would error there ("does not support F16").  Route them to

@@ -1026,12 +1026,12 @@ impl MlxModelWeights {
         // divergence 0.8% exceeds <1%; Gate C PPL delta 1.24% / 0.017 absolute
         // meets KIVI + KVQuant + AmesianX + vLLM + TurboQuant shippability gates).
         // Rationale: "TQ should be default if it is better" — user feedback on
-        // iter-28's overly-conservative flip to dense. Byte-exact vs llama.cpp is
+        // iter-28's overly-conservative flip to dense. Byte-exact vs the peer is
         // still achievable via HF2Q_USE_DENSE=1 (sourdough_gate.sh sets this).
         //
         // HF2Q_LAYER_POLICY values:
         //   unset OR "tq_all"         = DEFAULT: full TQ decode (8-bit native HB SDPA)
-        //   "dense_all"               = dense everywhere (byte-exact vs llama.cpp)
+        //   "dense_all"               = dense everywhere (byte-exact vs the peer)
         //   "tq_slide_dense_global"   = TQ for sliding layers, dense for global
         //   "dense_slide_tq_global"   = dense for sliding, TQ for global
         //
@@ -2206,7 +2206,7 @@ impl MlxModelWeights {
 
             // ============================================================
             // Dense MLP + MoE routing INTERLEAVED dispatch
-            // (ADR-006 Phase 4e: matches llama.cpp's graph reorder pattern)
+            // (ADR-006 Phase 4e: matches the peer's graph reorder pattern)
             //
             // Group B8:  pre-FF norm1 + pre-FF norm2 + router norm  [3 concurrent]
             // Group B9:  dense gate + dense up + router logits      [3 concurrent]
@@ -3004,9 +3004,8 @@ impl MlxModelWeights {
         // split CB. When HF2Q_DECODE_SPLIT_CB_AT_LAYER=N is set,
         // commit (non-blocking) the current session at end of layer
         // N-1 and start a new session for the remaining layers.
-        // Mirrors peer's dispatch_apply overlap pattern at
-        // /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:550
-        // — peer encodes multi-CB in parallel during GPU execution.
+        // Mirrors the peer's dispatch_apply overlap pattern
+        // — the peer encodes multi-CB in parallel during GPU execution.
         // We achieve the same overlap WITHOUT worker threads by
         // splitting into 2 CBs (non-blocking commit on CB1, encode
         // CB2 while GPU runs CB1, commit_and_wait CB2 at end).

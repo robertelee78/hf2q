@@ -60,12 +60,12 @@ pos=$(( pos - 1 ))  # cmp -l is 1-indexed; convert to 0-indexed
 prefix_sha=$(head -c "$pos" "$TA" | shasum -a 256 | awk '{print $1}')
 
 echo "DIVERGENCE at byte position $pos (0-indexed)"
-echo "  llama.cpp output length: $la bytes"
+echo "  peer      output length: $la bytes"
 echo "  hf2q     output length: $lb bytes"
 echo "  agreed-prefix sha256:   $prefix_sha"
 echo
 echo "  byte AT divergence point:"
-echo "    llama.cpp: $(head -c $((pos + 1)) "$TA" | tail -c 1 | od -An -c | tr -d ' ')"
+echo "    peer     : $(head -c $((pos + 1)) "$TA" | tail -c 1 | od -An -c | tr -d ' ')"
 echo "    hf2q     : $(head -c $((pos + 1)) "$TB" | tail -c 1 | od -An -c | tr -d ' ')"
 echo
 # Sanitized context: print only the divergent byte's hex + 5 bytes after
@@ -74,5 +74,5 @@ echo
 ctx_a=$(dd if="$TA" bs=1 skip="$pos" count=6 2>/dev/null | xxd -p)
 ctx_b=$(dd if="$TB" bs=1 skip="$pos" count=6 2>/dev/null | xxd -p)
 echo "  6-byte window FROM divergence (hex):"
-echo "    llama.cpp: $ctx_a"
+echo "    peer     : $ctx_a"
 echo "    hf2q     : $ctx_b"

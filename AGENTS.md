@@ -59,8 +59,10 @@ configuration and must not be copied into this checked-in file.
 ## Non-negotiable product boundaries
 
 - hf2q owns conversion and quantization. Production code must not shell out
-  to Python, llama.cpp, mlx-lm, vendor converters, or another quantization
-  tool as an implementation or fallback.
+  to Python, the peer engine, mlx-lm, vendor converters, or another
+  quantization tool as an implementation or fallback. ("The peer" is the
+  pinned upstream GGUF engine used only as a benchmark/parity baseline —
+  see `NOTICE` and `data/llama_cpp_pin.txt`.)
 - hf2q owns inference. Production serving and generation must run through the
   Rust and `mlx-native` paths, not an external inference process.
 - Downloads are the narrow exception. Rust code may use `hf-hub`, and
@@ -106,7 +108,7 @@ continuation, valid unary/SSE output, and prefix reuse. For performance work,
 report cached-token counts, prefill/decode rates, time to first token, model
 quality, exact prompt/settings, and the matched reference result.
 
-On a 128 GiB host, never co-reside hf2q and llama.cpp instances of a roughly
+On a 128 GiB host, never co-reside hf2q and peer instances of a roughly
 90 GiB DeepSeek artifact. Verify memory and listeners before each load, run one
 full-model runtime at a time, and unload it before starting the reference.
 

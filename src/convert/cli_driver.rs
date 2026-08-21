@@ -22,7 +22,7 @@
 //! misalignments at the policy/quantizer layer.
 //!
 //! Per [[feedback-no-backwards-compat-2026-05-18]]: no migration shims,
-//! no `--quant` aliases for legacy names — `LlamaFtype::from_name` is
+//! no `--quant` aliases for legacy names — `GgufFtype::from_name` is
 //! the single source of truth.
 
 use std::collections::HashMap;
@@ -70,7 +70,7 @@ use crate::quantize::ggml_quants::apex::{
     ApexError, ApexPolicy, FingerprintHParams, detect_apex_config, load_mudler_config,
 };
 use crate::quantize::ggml_quants::standard_policy::HParams;
-use crate::quantize::ggml_quants::{ArchName, LlamaFtype};
+use crate::quantize::ggml_quants::{ArchName, GgufFtype};
 
 #[path = "cli_driver/stored_evidence.rs"]
 mod stored_evidence;
@@ -95,7 +95,7 @@ mod stored_evidence_tests;
 /// string is already resolved to a [`QuantSelector`] here).
 ///
 /// `selector` is the unified `--quant <name>` parse result — either a
-/// standard llama.cpp ftype, an Apex algorithmic tier, or (out of v1
+/// standard GGUF ftype, an Apex algorithmic tier, or (out of v1
 /// scope) an `apex-custom` tensor-type-file path. See
 /// [`crate::convert::quant_selector::QuantSelector`].
 #[derive(Debug, Clone)]
@@ -221,7 +221,7 @@ pub enum ConvertError {
     /// `tokenizer::build_tokenizer_metadata` failed — missing /
     /// malformed `tokenizer.json`, unresolvable EOS token, etc. Per
     /// [[feedback-no-loop-suppression-2026-05-17]] this surfaces here
-    /// rather than producing a GGUF that llama.cpp rejects with
+    /// rather than producing a GGUF that the peer rejects with
     /// `key not found in model: tokenizer.ggml.model`.
     Tokenizer(TokenizerError),
     /// ADR-033 §Pi: an imatrix-subsystem failure surfaced. Wraps the
@@ -694,7 +694,7 @@ fn run_convert_internal(
                 });
             }
             let orch = ConvertOrchestrator::new_deepseek4_agentic_q2(arch, hparams);
-            (orch, crate::quantize::ggml_quants::LlamaFtype::MostlyQ2_K)
+            (orch, crate::quantize::ggml_quants::GgufFtype::MostlyQ2_K)
         }
         QuantSelector::Apex(tier) => {
             let n_layers = config_n_layers(config).ok_or(ConvertError::ApexMissingLayerCount)?;
@@ -831,8 +831,7 @@ fn run_convert_internal(
     // Qwen3-VL deepstack count comes from vision_config (sibling to
     // text_config at root). After `effective_config()` unwraps to
     // text_config the vision_config is invisible — so we read it from
-    // the original src.config here. Mirrors canonical
-    // /opt/llama.cpp/conversion/qwen3vl.py:255-258 path.
+    // the original src.config here. Mirrors the canonical converter.
     let qwen3vl_n_deepstack = if matches!(arch, ArchName::Qwen3VlText) {
         let vc = src
             .config
@@ -891,7 +890,7 @@ fn run_convert_internal(
     }
 
     // ----- 4b. Emit tokenizer metadata --------------------------------
-    // llama.cpp's vocab loader rejects any GGUF that is missing
+    // The peer's vocab loader rejects any GGUF that is missing
     // `tokenizer.ggml.model` — failure mode reported 2026-05-18 by the
     // real-model convert-v2 smoke test on
     // /opt/hf2q/models/google-gemma-4-26b-a4b-it. Per
@@ -1463,9 +1462,7 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
 /// config → MissingHparam error.
 /// Resolve BERT pooling type by walking `modules.json` to find a
 /// `*Pooling` entry's `path`, then reading that subdir's
-/// `config.json` for `pooling_mode_*_token` booleans. Port of
-/// canonical's `TextModel._try_set_pooling_type` at
-/// /opt/llama.cpp/conversion/base.py:1883-1915.
+/// `config.json` for `pooling_mode_*_token` booleans.
 ///
 /// Returns `Some(PoolingType as u32)` if a Pooling module is found
 /// AND its config carries a recognized mode. Otherwise `None` (BERT
@@ -1536,8 +1533,6 @@ fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertError> {
     let config = effective_config(config);
     // Accept BOTH HF naming conventions: most arches use
     // `num_attention_heads`; nomic-bert / older HF variants use `n_head`.
-    // Mirrors canonical `find_hparam(["n_heads", "num_attention_heads"])`
-    // in `/opt/llama.cpp/conversion/llama.py:131` and similar in bert.py.
     let n_head = config
         .get("num_attention_heads")
         .or_else(|| config.get("n_head"))
@@ -1561,8 +1556,7 @@ fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertError> {
         .map(|x| x as u32)
         .unwrap_or(0);
     // Accept BOTH conventions: standard HF uses `num_hidden_layers`;
-    // nomic-bert v2-moe uses bare `n_layer`. Same find_hparam pattern
-    // as canonical at `/opt/llama.cpp/conversion/base.py`.
+    // nomic-bert v2-moe uses bare `n_layer`.
     let n_hidden = config
         .get("num_hidden_layers")
         .or_else(|| config.get("n_layer"))
@@ -1820,10 +1814,6 @@ struct Llama3Ctx {
 /// `None` if any required key is absent or if `hidden_size` isn't
 /// divisible by `num_attention_heads` (would indicate a malformed
 /// config; callers should surface that as `UnmappedTensor`).
-///
-/// Mirrors canonical `/opt/llama.cpp/conversion/llama.py:131-141` —
-/// `n_head = find_hparam(["n_heads","num_attention_heads"])`;
-/// `n_kv_head = find_hparam(["n_kv_heads","num_key_value_heads"])`.
 fn build_llama3_ctx(config: &serde_json::Value) -> Option<Llama3Ctx> {
     let text = effective_config(config);
     let hidden_size = text.get("hidden_size")?.as_u64()? as usize;
@@ -1974,9 +1964,8 @@ fn map_tensor(
         ArchName::Qwen3VlText => match qwen3vl_text::map_tensor_name(hf_name) {
             Some(s) => MapOutcome::Direct(s),
             None => {
-                // Mirror canonical TextModel.filter_tensors at
-                // `/opt/llama.cpp/conversion/base.py:1064-1078` which
-                // SILENTLY DROPS multimodal-side tensors (visual,
+                // The canonical converter SILENTLY DROPS
+                // multimodal-side tensors (visual,
                 // audio, vision-projector) rather than erroring. The
                 // mmproj sidecar is written by a separate `--mmproj`
                 // run. Unmapped genuinely-unknown names still surface
@@ -2108,8 +2097,7 @@ fn compute_size_label_for_arch(
 
 /// Build the `NomicBertCtx` from the HF `config.json`. v1.5 returns a
 /// ctx with `num_experts = None`; v2-moe carries
-/// `num_experts` / `num_local_experts` per canonical
-/// `/opt/llama.cpp/conversion/bert.py:372`. Missing-on-v2-moe surfaces
+/// `num_experts` / `num_local_experts`. Missing-on-v2-moe surfaces
 /// to the convert pipeline as `UnmappedTensor` on the expert
 /// tensors — typed error per the no-fallback rule.
 fn build_nomic_bert_ctx(config: &serde_json::Value) -> nomic_bert::NomicBertCtx {
@@ -2146,7 +2134,7 @@ fn build_qwen35moe_full_ctx(config: &serde_json::Value) -> Option<Qwen35MoeFullC
         .unwrap_or(false);
 
     // HF2Q_QWEN35_DROP_MTP=1 (or =true, case-insensitive) — convert-time
-    // workaround for stock llama.cpp's lack of a qwen35 MTP loader. Strips
+    // workaround for the stock peer's lack of a qwen35 MTP loader. Strips
     // the MTP block from the emitted GGUF (loses MTP inference). See
     // `Qwen35MoeFullCtx::drop_mtp`.
     let drop_mtp = matches!(
@@ -2154,13 +2142,13 @@ fn build_qwen35moe_full_ctx(config: &serde_json::Value) -> Option<Qwen35MoeFullC
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
     );
 
-    // Ergonomics: stock llama.cpp (current stable) lacks a qwen35 MTP
+    // Ergonomics: the stock peer (current stable) lacks a qwen35 MTP
     // loader — it expects all blocks to share the linear-attention slot
     // layout, so the MTP block triggers `missing tensor 'blk.<N>.ssm_conv1d.weight'`
     // on load. Without `HF2Q_QWEN35_DROP_MTP=1` the produced GGUF is
-    // unloadable by current llama.cpp / llama-cli / llama-perplexity.
+    // unloadable by stock peer engines (llama-cli / llama-perplexity).
     // hf2q's own inference path DOES handle MTP, so the strip is only
-    // necessary for llama.cpp interop. Warn so operators discover this
+    // necessary for peer interop. Warn so operators discover this
     // at convert time rather than at load time. See src/arch/smoke.rs:464-479.
     if !drop_mtp {
         // Inline lookup since `effective_text_config` is per-arch private
@@ -2174,9 +2162,9 @@ fn build_qwen35moe_full_ctx(config: &serde_json::Value) -> Option<Qwen35MoeFullC
         if n_mtp_raw > 0 {
             eprintln!(
                 "[hf2q convert] note: qwen35moe model has {n_mtp_raw} MTP block(s); \
-                 the resulting GGUF will NOT load in stock llama.cpp (current stable \
-                 lacks a qwen35 MTP loader). Set HF2Q_QWEN35_DROP_MTP=1 to strip \
-                 the MTP block(s) for llama.cpp interop (loses MTP inference, but \
+                 the resulting GGUF will NOT load in stock peer engines (current \
+                 stable lacks a qwen35 MTP loader). Set HF2Q_QWEN35_DROP_MTP=1 to \
+                 strip the MTP block(s) for peer interop (loses MTP inference, but \
                  hf2q's own inference path handles MTP separately)."
             );
         }
@@ -2635,7 +2623,7 @@ fn build_convert_plan<'a>(
                 // Squeeze drops every singleton dim from gguf_shape —
                 // the safetensors stores Qwen 3.5/3.6 linear_attn
                 // `conv1d.weight` as `[hidden, 1, kernel]` (3-D) but
-                // GGUF + llama.cpp's ggml_ssm_conv expect `[hidden,
+                // GGUF + the peer's `ggml_ssm_conv` expect `[hidden,
                 // kernel]` (2-D matrix). The element data is preserved
                 // bit-exact; only the shape vector changes.
                 // Also handle Squeeze nested inside Sequence (the
@@ -2923,9 +2911,8 @@ fn build_convert_plan<'a>(
     steps.extend(synth_steps);
 
     // Canonical-equivalent sort: llama-quantize stores tensors in a
-    // `std::map<string, ..., weight_name_comparer>` (see
-    // `/opt/llama.cpp/src/llama-model-loader.h:53-64`), so the output
-    // GGUF emits tensors in the comparator's order:
+    // name-ordered map, so the output GGUF emits tensors in the
+    // comparator's order:
     //   - non-`blk.N.*` tensors first (layer = -1 from failed sscanf),
     //     sorted alphabetically among themselves
     //   - then `blk.N.*` tensors with numeric N order, within each
@@ -2975,8 +2962,8 @@ fn build_convert_plan<'a>(
     })
 }
 
-/// Port of canonical's `weight_name_comparer` at
-/// `/opt/llama.cpp/src/llama-model-loader.h:53-64`. Sorts tensor names
+/// Canonical tensor-name ordering used by stock llama-quantize
+/// output. Sorts tensor names
 /// so that non-`blk.N.` names come first (alphabetically), then
 /// `blk.N.` names with numeric N order, then alphabetical within
 /// each layer.
@@ -3074,7 +3061,7 @@ fn expert_kind_label(k: ExpertKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quantize::ggml_quants::LlamaFtype;
+    use crate::quantize::ggml_quants::GgufFtype;
     use crate::quantize::ggml_quants::apex::ApexTier;
     use serde_json::json;
     use std::io::Write;
@@ -3092,7 +3079,7 @@ mod tests {
     fn basename_test_args(hf_dir: &str, repo: Option<&str>) -> ConvertArgs {
         ConvertArgs {
             hf_dir: PathBuf::from(hf_dir),
-            selector: QuantSelector::Standard(LlamaFtype::MostlyQ8_0),
+            selector: QuantSelector::Standard(GgufFtype::MostlyQ8_0),
             output: PathBuf::from("out.gguf"),
             dry_run: true,
             imatrix: None,
@@ -3272,8 +3259,7 @@ mod tests {
         //
         // Note: "Qwen 3.6" is a model VERSION name; all locally-
         // available qwen3.6-* models use Qwen3_5* arch strings
-        // (canonical /opt/llama.cpp/conversion/qwen.py:626 only
-        // registers Qwen3_5Moe*).
+        // (the canonical converter only registers Qwen3_5Moe*).
         for mt in ["qwen3_5_moe", "qwen3_5_moe_text"] {
             assert_eq!(
                 detect_arch(&json!({ "model_type": mt })).unwrap(),
@@ -3512,7 +3498,7 @@ mod tests {
     #[test]
     fn parse_quant_selector_standard_round_trip() {
         let sel = QuantSelector::from_name("q5_k_m").expect("must parse");
-        assert_eq!(sel, QuantSelector::Standard(LlamaFtype::MostlyQ5_K_M));
+        assert_eq!(sel, QuantSelector::Standard(GgufFtype::MostlyQ5_K_M));
     }
 
     /// "apex-balanced" → QuantSelector::Apex(ApexTier::Balanced).
@@ -4038,7 +4024,7 @@ mod tests {
         run_convert_with_recipe_producer_version(
             ConvertArgs {
                 hf_dir: dir.path().to_path_buf(),
-                selector: QuantSelector::Standard(LlamaFtype::MostlyQ2_K_S),
+                selector: QuantSelector::Standard(GgufFtype::MostlyQ2_K_S),
                 output: output.clone(),
                 dry_run: false,
                 imatrix: None,

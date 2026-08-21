@@ -2,7 +2,7 @@
 //! (ADR-005 iter-231c).
 //!
 //! Frontier constraint engines (llguidance, xgrammar) compile regex
-//! constraints into the grammar; llama.cpp's json-schema-to-grammar
+//! constraints into the grammar; the peer's json-schema-to-grammar
 //! defers `pattern`. Real-world tool schemas (e.g. MCP servers such as
 //! ruvnet-brain's `argv` items: `^[a-z][a-z0-9-]*$`) DO use `pattern`,
 //! so this module closes the gap with a real compiler instead of a

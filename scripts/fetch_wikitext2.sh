@@ -7,7 +7,7 @@ DEFAULT_OUTPUT="tests/fixtures/ppl-corpus/wikitext2-full.tokens"
 DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/hf2q/wikitext2"
 
 # Source choice: Stephen Merity/Salesforce wikitext-2-raw-v1 zip,
-# mirrored by ggml-org/ci for llama.cpp CI. The SHA-256 below matches
+# mirrored by ggml-org/ci for the peer's CI. The SHA-256 below matches
 # the Salesforce/HuggingFace dataset_infos checksum for the original
 # S3 artifact:
 # https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-raw-v1.zip

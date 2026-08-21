@@ -5,7 +5,7 @@
 # contract.md in sequence, exiting non-zero on first fail:
 #
 #   1. parity suite (Gates C/D/E + F) — short_hello / sourdough / sliding_wrap
-#      each run 3× at T=0 against the llama.cpp reference (C/E) AND the
+#      each run 3× at T=0 against the peer reference (C/E) AND the
 #      committed hf2q self-baseline (D), via scripts/parity_check.sh's
 #      --self-baseline branch. F is the "every run byte-identical" wrapper.
 #   2. perf sanity (Gate B) — median-of-3 decode tok/s on sourdough ≥ floor.
@@ -47,7 +47,7 @@ cd "$REPO_ROOT"
 
 HF2Q_BIN="target/release/hf2q"
 # Gate B floor: hf2q decode median 102.9-103.4 tok/s on M5 Max (HEAD post
-# mlx-native 0.3.1 race fix); peer llama.cpp 102.01 tok/s median on identical
+# mlx-native 0.3.1 race fix); the peer at 102.01 tok/s median on identical
 # setup. Floor at 100 encodes "within measurement variance of peer" — tight
 # enough to flag actual regressions, loose enough to tolerate minor thermal
 # jitter. Previous floor of 95 was set when hf2q was 17 tok/s below peer
@@ -63,7 +63,7 @@ usage() {
 Usage: scripts/release-check.sh <gguf_path> [--min-decode-tps N] [--max-tokens N]
   <gguf_path>         Path to the Gemma 4 GGUF model (required)
   --min-decode-tps N  Decode tok/s floor for perf sanity (default: 100,
-                      = within variance of peer llama.cpp ~102 tok/s)
+                      = within variance of the peer ~102 tok/s)
   --max-tokens N      Max tokens for perf sanity run (default: 1000)
 
 Exit codes:
@@ -108,7 +108,7 @@ echo
 # perf gate below runs under the DENSE regime via HF2Q_USE_DENSE=1. TQ-8-bit
 # became the default decode path that day; argmax divergence is ~0.8% by
 # physical design (Lloyd-Max codebook is lossy), so byte-exact gates against
-# llama.cpp / the frozen self-baseline must force dense to stay valid.
+# the peer / the frozen self-baseline must force dense to stay valid.
 # Precedent: scripts/sourdough_gate.sh:120-123. Iter-107 reconciliation
 # (W11) finished the half-done migration: this script previously had zero
 # HF2Q_USE_DENSE references. The `env -u` prefix clears any inherited
@@ -183,8 +183,8 @@ fi
 
 
 # --- Gate 3: prefill tok/s on a ≥2048-token prompt (batched path) ---
-# ADR-005 Closeout Amendment Gate A: prefill tok/s parity vs llama.cpp on
-# a ≥2048-token prompt. llama.cpp is the reference at ~3260 tok/s on M5 Max.
+# ADR-005 Closeout Amendment Gate A: prefill tok/s parity vs the peer on
+# a ≥2048-token prompt. The peer is the reference at ~3260 tok/s on M5 Max.
 # hf2q batched prefill (post mlx-native 0.3.1 race fix + sdpa_sliding
 # re-enable) sits at ~152-155 tok/s on the same prompt. True peer-parity
 # is Run-scope (needs a flash-attn-style tiled kernel, not a one-liner).

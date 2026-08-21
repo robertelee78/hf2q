@@ -11,7 +11,7 @@
 #     1) capture hf2q TQ-default-on output (no HF2Q_USE_DENSE), N runs
 #     2) capture hf2q dense-forced output (HF2Q_USE_DENSE=1), N runs
 #     3) compute common_prefix bytes against:
-#           - tests/evals/reference/<P>_llama.txt    (llama.cpp baseline)
+#           - tests/evals/reference/<P>_llama.txt    (peer baseline)
 #           - tests/evals/reference/<P>_hf2q.txt     (frozen hf2q baseline)
 #           - the dense run of the same prompt       (TQ-vs-dense self-compare)
 #     4) verify determinism: N runs at same mode produce byte-identical output

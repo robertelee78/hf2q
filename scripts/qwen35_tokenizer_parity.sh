@@ -13,7 +13,7 @@
 #  * llama-tokenize prepends BOS by default (use `--no-bos` to suppress).
 #  * hf2q's `tokenize_rendered_prompt_llama_style` explicitly prepends
 #    BOS via `resolve_token_id(..., "tokenizer.ggml.bos_token_id")`,
-#    falling back to `llama_cpp_special_token_id_for_model("gpt2", ...)`
+#    falling back to `peer_special_token_id_for_model("gpt2", ...)`
 #    → 11 (mirrors llama-vocab.cpp:1838-1839 GPT-2 default
 #    `special_bos_id = 11`) when GGUF lacks an explicit
 #    `tokenizer.ggml.bos_token_id`.

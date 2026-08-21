@@ -1,6 +1,7 @@
 //! Image-token-positioned residual add (ADR-005 iter-224 row 3 — Wedge-4c.5).
 //!
-//! Implements the LM-side counterpart of /opt/llama.cpp/src/models/qwen3vl.cpp:96-100:
+//! Implements the LM-side counterpart of the peer's per-layer deepstack
+//! residual add:
 //!
 //! ```text
 //! if (il < (int) n_deepstack_layers) {

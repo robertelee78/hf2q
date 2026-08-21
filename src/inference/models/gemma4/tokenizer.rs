@@ -25,8 +25,7 @@
 //!
 //! ## Spec citations
 //!
-//! - llama.cpp `LLAMA_VOCAB_PRE_TYPE_GEMMA4` regex:
-//!   `/opt/llama.cpp/src/llama-vocab.cpp:496-505` —
+//! - The peer's Gemma4 pre-tokenizer spec:
 //!   `regex_exprs = {"[^\\n]+|[\\n]+"}; byte_encode = false;`.
 //! - HF `tokenizer.json` schema for the abliterated Gemma4 file lives
 //!   at `/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/tokenizer.json`;
@@ -72,7 +71,7 @@ pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
     if model != "gemma4" {
         bail!(
             "tokenizer.ggml.model = {model:?} is not supported by gemma4::tokenizer; \
-             this module only handles `gemma4` (see llama-vocab.cpp:496)."
+             this module only handles `gemma4`."
         );
     }
 

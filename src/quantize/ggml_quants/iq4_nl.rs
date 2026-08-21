@@ -1,8 +1,7 @@
-//! IQ4_NL quantizer — ADR-033 P0 pure-Rust port of
-//! `quantize_row_iq4_nl_impl` at `/opt/llama.cpp/ggml/src/ggml-quants.c:4794`
-//! (SHA pinned in `data/llama_cpp_pin.txt`).
+//! IQ4_NL quantizer — ADR-033 P0 pure-Rust port of the peer's
+//! `quantize_row_iq4_nl_impl`.
 //!
-//! Block layout from `ggml-common.h` (`block_iq4_nl`):
+//! Block layout (byte-identical to the peer's `block_iq4_nl`):
 //! ```text
 //! #define QK4_NL 32
 //! typedef struct {
@@ -325,20 +324,10 @@ mod tests {
 
     /// Regression test for the all-zero block kernel fix (commit 29ac8d4f,
     /// 2026-05-21). When `amax < GROUP_MAX_EPS = 1e-15` (effectively
-    /// all-zero input), canonical's `quantize_row_iq4_nl_impl` at
-    /// /opt/llama.cpp/ggml/src/ggml-quants.c:4888-4895 runs the final
+    /// all-zero input), canonical's `quantize_row_iq4_nl_impl`
+    /// runs the final
     /// L re-fill UNCONDITIONALLY on `ntry > 0` (which is 7 for the
-    /// quantize_iq4_nl entry point):
-    ///
-    /// ```c
-    /// dh[0] = GGML_FP32_TO_FP16(scales[0]);  // 0.0
-    /// if (ntry > 0) {
-    ///     float id = scales[0] ? 1/scales[0] : 0;     // id = 0
-    ///     for (int j = 0; j < super_block_size; ++j) {
-    ///         L[j] = best_index_int8(16, values, id*x[j]);  // best_index_int8(0)
-    ///     }
-    /// }
-    /// ```
+    /// quantize_iq4_nl entry point), with `id = 0` when `scales[0] == 0`.
     ///
     /// `best_index_int8` of `0.0` against the `kvalues_iq4nl` table
     /// `{-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}`

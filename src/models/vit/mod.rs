@@ -3,7 +3,7 @@
 //! Converts HF `model.vision_tower.*` + `model.multi_modal_projector.*`
 //! safetensors tensors to a standalone `mmproj-<slug>-F16.gguf` file
 //! carrying the ViT weights and the cross-modal projector. Sovereignty:
-//! read `/opt/llama.cpp/tools/mtmd/clip-model.h` and `clip.cpp` as
+//! the peer's clip-model headers are the
 //! spec sources; produce all code + tests natively.
 //!
 //! # Layer decomposition (P10's four-layer defense)

@@ -371,7 +371,7 @@ pub fn register_bert_custom_shaders(registry: &mut KernelRegistry) {
 /// Returns a fresh F32 `[batch, hidden]` output buffer.
 ///
 /// `eps` is the LayerNorm epsilon (BERT uses `1e-12` in
-/// HuggingFace configs; llama.cpp emits the same value via
+/// HuggingFace configs; the peer emits the same value via
 /// `bert.attention.layer_norm_epsilon`).
 ///
 /// # Threadgroup configuration
@@ -614,7 +614,7 @@ pub fn bert_bias_add_gpu(
 /// For BERT linear projections this is acceptable — input magnitudes
 /// after LayerNorm are O(1), so post-bias output noise is bounded by
 /// `|x| × 2⁻⁷ × √hidden ≈ 2⁻⁷ × √384 ≈ 0.15`. Within the F16 round-off
-/// llama.cpp's BERT path itself accumulates.
+/// the peer's BERT path itself accumulates.
 ///
 /// **What this means for attention.** ViT iter 50 documented that the
 /// same BF16 K cast plus saturated softmax flips winners. BERT's
@@ -842,17 +842,17 @@ pub fn bert_linear_gpu(
 // GeLU activation — GPU dispatch (pytorch_tanh variant)
 // ---------------------------------------------------------------------------
 
-/// GPU GeLU activation, **pytorch_tanh variant** (matches llama.cpp's
+/// GPU GeLU activation, **pytorch_tanh variant** (matches the peer's
 /// `ggml_gelu`):
 /// `gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`
 ///
-/// llama.cpp's BERT path uses this same approximation regardless of
+/// The peer's BERT path uses this same approximation regardless of
 /// whether the upstream HF model declared `gelu` or `gelu_new` — and
-/// the Phase 2b accuracy gate is parity with llama.cpp's output, so we
+/// the Phase 2b accuracy gate is parity with the peer's output, so we
 /// use it unconditionally. The day-one models (`nomic-embed-text-v1.5`,
 /// `mxbai-embed-large-v1`, `bge-small-en-v1.5`) all clear this gate
 /// because their HF-released checkpoints' GeLU choices either are this
-/// approximation or are within the F16 round-off llama.cpp is graded
+/// approximation or are within the F16 round-off the peer is graded
 /// against.
 ///
 /// `input` is any F32 buffer; output is a fresh F32 buffer with the
@@ -2160,7 +2160,7 @@ fn bert_linear_cpu_ref(
 
 /// CPU reference GeLU pytorch_tanh: `0.5 * x * (1 + tanh(sqrt(2/pi) *
 /// (x + 0.044715 * x^3)))`. Test-only; F32 throughout. Constants match
-/// llama.cpp's `ggml_gelu_f32` (`/opt/llama.cpp/ggml/src/ggml.c`).
+/// the peer's `ggml_gelu_f32`.
 #[cfg(test)]
 fn bert_gelu_cpu_ref(input: &[f32]) -> Vec<f32> {
     const GELU_COEF_A: f32 = 0.044715;
@@ -4333,8 +4333,7 @@ mod tests {
     /// llama-embedding ground-truth vector for "hello world" tokenized
     /// against `bge-small-en-v1.5-f16.gguf`. Generated 2026-04-26 via:
     ///   `llama-embedding -m bge-small-en-v1.5-f16.gguf -p "hello world" --embd-output-format json`
-    /// (binary: `/opt/homebrew/Cellar/llama.cpp/8680/bin/llama-embedding`,
-    /// release b8680). bge uses pooling_type=2 (CLS) per its GGUF
+    /// (llama-embedding release b8680). bge uses pooling_type=2 (CLS) per its GGUF
     /// metadata, so the output is the L2-normalized first-row hidden
     /// state. ||y||_2 = 1.000000.
     #[rustfmt::skip]
@@ -4684,7 +4683,7 @@ mod tests {
     /// day-one model, locks BERT lane at hidden=1024 / layers=24 /
     /// heads=16 / pooling=CLS). Generated 2026-04-26 via:
     ///   `llama-embedding -m mxbai-embed-large-v1-f16.gguf -p "hello world" --embd-output-format json`
-    /// (binary: `/opt/homebrew/Cellar/llama.cpp/8680/bin/llama-embedding`).
+    /// (llama-embedding release b8680).
     /// Output is L2-normalized ||y||_2 = 1.000000 with CLS pool.
     #[rustfmt::skip]
     const MXBAI_GROUND_TRUTH_HELLO_WORLD: [f32; 1024] = [

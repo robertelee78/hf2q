@@ -830,7 +830,7 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
 
-    // --- Tier 3: llama.cpp / ollama extensions ---
+    // --- Tier 3: peer extensions ---
     #[serde(default)]
     pub top_k: Option<u32>,
     #[serde(default)]
@@ -867,7 +867,7 @@ pub struct ChatCompletionRequest {
     pub hf2q_enable_thinking: Option<bool>,
 
     /// Extra variables merged into the chat-template Jinja context
-    /// (ADR-005 iter-229 Decision 4; llama.cpp-compatible name/shape).
+    /// (ADR-005 iter-229 Decision 4; peer-compatible name/shape).
     /// Merged AFTER the renderer's own values, so a kwarg wins every
     /// collision that survives validation — renderer-owned keys
     /// (`messages`, `tools`, `add_generation_prompt`, `bos_token`,

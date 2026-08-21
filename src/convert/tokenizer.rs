@@ -45,12 +45,12 @@ use crate::backends::gguf::types::MetaValue;
 use crate::quantize::ggml_quants::ArchName;
 
 // ---------------------------------------------------------------------------
-// Token-type constants (mirror llama.cpp's TokenType enum)
+// Token-type constants (GGUF `tokenizer.ggml.token_type` values)
 // ---------------------------------------------------------------------------
 
 const TOKEN_TYPE_NORMAL: i32 = 1;
 // UNKNOWN — used for the `<unk>` token on Unigram-tokenizer models
-// (XLM-RoBERTa / sentencepiece). Canonical `bert.py:214-218` realigns
+// (XLM-RoBERTa / sentencepiece). The canonical converter realigns
 // the UNK token to UNKNOWN even though `added_tokens` carries it with
 // `special=True`; we replicate that classification here.
 const TOKEN_TYPE_UNKNOWN: i32 = 2;
@@ -75,7 +75,7 @@ pub enum TokenizerError {
     /// `tokenizer.json` is missing from the HF model directory. Real
     /// production models always ship one; absence is a typed error
     /// rather than a silent skip (the pre-port behavior emitted an
-    /// empty GGUF that llama.cpp rejects with `key not found in model:
+    /// empty GGUF that the peer rejects with `key not found in model:
     /// tokenizer.ggml.model`).
     TokenizerJsonMissing { dir: String },
     /// `tokenizer.json` is present but unreadable / malformed.
@@ -114,7 +114,7 @@ impl std::fmt::Display for TokenizerError {
             TokenizerError::TokenizerJsonMissing { dir } => write!(
                 f,
                 "tokenizer: no tokenizer.json in {dir} (convert-v2 requires one — \
-                 producing a GGUF without tokenizer metadata yields llama.cpp's \
+                 producing a GGUF without tokenizer metadata yields the peer's \
                  `key not found in model: tokenizer.ggml.model` rejection)"
             ),
             TokenizerError::TokenizerJsonMalformed { dir, source } => write!(
@@ -455,12 +455,11 @@ pub fn build_tokenizer_metadata(
     // in the post-realignment order (indices 0..3 = 0.0 for the four
     // special tokens, index 4+ = sentencepiece scores), so we just use
     // them directly. Padding entries beyond the tokenizer.json vocab
-    // get `-10000.0` (canonical's UNUSED placeholder at `bert.py:162`).
+    // get `-10000.0` (canonical's UNUSED placeholder).
     //
     // For BPE / WordPiece models the GGUF convention is to emit
     // `-1000.0` placeholders (the tokenizer.ggml.scores field is unused
-    // by llama.cpp's BPE / WordPiece tokenizers — see
-    // `LlamaHfVocab` codepath).
+    // by the peer's BPE / WordPiece tokenizers).
     let scores: Vec<f32> = if model_type == "Unigram" {
         let mut s = vec![-10000.0_f32; target_vocab_size];
         for (i, score) in token_scores.iter().enumerate() {
@@ -724,8 +723,8 @@ pub fn build_tokenizer_metadata(
             }
         }
     } else if arch == ArchName::Bert {
-        // BERT (BAAI bge / similar WordPiece encoders) emit order —
-        // canonical `BertModel.set_vocab` at /opt/llama.cpp/conversion/bert.py:39-66:
+        // BERT (BAAI bge / similar WordPiece encoders) canonical emit
+        // order:
         //   add_token_type_count(type_vocab_size)
         //   phantom-prefix transform on tokens (▁ for normal, strip ##
         //     for subword, leave CONTROL unchanged)
@@ -739,7 +738,7 @@ pub fn build_tokenizer_metadata(
         //     - add_bos_token, add_eos_token (TemplateProcessing parse),
         //       add_sep_token (defaults to False)
         //
-        // Apply phantom transform per bert.py:48-54: tokens are mutated
+        // Apply the canonical phantom transform: tokens are mutated
         // in-place at this point. CONTROL keeps original; ## prefix
         // stripped; else prepend U+2581.
         let phantom_tokens: Vec<String> = tokens
@@ -863,8 +862,7 @@ pub fn build_tokenizer_metadata(
             MetaValue::Bool(add_eos),
         ));
     } else if arch == ArchName::Llama3 {
-        // Llama 3 BPE / gpt2 emit order — canonical
-        // `_set_vocab_gpt2` at /opt/llama.cpp/conversion/base.py:1603-1611:
+        // Llama 3 BPE / gpt2 canonical emit order:
         //   add_tokenizer_model("gpt2")
         //   add_tokenizer_pre(tokpre)            ← right after model
         //   add_token_list(tokens)
@@ -915,8 +913,7 @@ pub fn build_tokenizer_metadata(
         ));
     } else if arch == ArchName::Gemma4 {
         // Gemma 4 canonical tokenizer order (verified against
-        // `/opt/llama.cpp/conversion/gemma.py::Gemma4Model::set_vocab`
-        // at lines 645-653 + dump positions 36-48):
+        // canonical dump positions 36-48):
         //   model, tokens, scores, token_type, merges, bos, eos, unk,
         //   pad, mask, chat_template, add_space_prefix, add_bos_token.
         // No `tokenizer.ggml.pre` — Gemma 4 doesn't call
@@ -1117,7 +1114,7 @@ fn read_full_vocab_size_from_config(dir: &Path) -> Option<u64> {
         .or_else(|| v.get("vocab_size").and_then(|x| x.as_u64()))
 }
 
-/// `<0xNN>` byte-fallback token detector (mirrors llama.cpp).
+/// `<0xNN>` byte-fallback token detector (canonical rule).
 fn is_byte_token(token: &str) -> bool {
     let b = token.as_bytes();
     b.len() == 6
@@ -1129,10 +1126,9 @@ fn is_byte_token(token: &str) -> bool {
         && b[5] == b'>'
 }
 
-/// Mirror of llama.cpp's `Model.does_token_look_special` heuristic.
+/// Canonical "does this token look special?" heuristic.
 fn does_token_look_special(token: &str) -> bool {
-    // Port of canonical `TextModel.does_token_look_special` at
-    // /opt/llama.cpp/conversion/base.py:1232-1253. STRICTER than the
+    // STRICTER than the
     // earlier hf2q heuristic — bare `<...>` tokens like `<tool_call>`,
     // `<think>`, `</think>` are NOT marked special by canonical (they
     // remain USER_DEFINED, not CONTROL). Only specific bracket forms
@@ -1190,13 +1186,11 @@ fn determine_tokenizer_model_name(model_section: &serde_json::Value, arch: ArchN
     if arch == ArchName::Gemma4 {
         return "gemma4".into();
     }
-    // BERT family is hard-wired to "bert" per canonical
-    // `/opt/llama.cpp/conversion/bert.py:59`:
-    //   `self.gguf_writer.add_tokenizer_model("bert")`.
+    // BERT family is hard-wired to "bert" by the canonical converter.
     // Nomic-BERT inherits from BertModel and uses the same string
     // for the WordPiece path. The XLM-RoBERTa nomic-bert-v2-moe
-    // variant uses "t5" instead (sentencepiece-based; see
-    // `bert.py:227`) — detected via Unigram tokenizer type below.
+    // variant uses "t5" instead (sentencepiece-based) — detected via
+    // Unigram tokenizer type below.
     if arch == ArchName::Bert {
         return "bert".into();
     }
@@ -1229,24 +1223,24 @@ fn determine_tokenizer_model_name(model_section: &serde_json::Value, arch: ArchN
     }
 }
 
-/// Per-arch `tokenizer.ggml.pre` dispatch — enumeration at
-/// `/opt/llama.cpp/src/llama-vocab.cpp` around line 1948-2061. The
+/// Per-arch `tokenizer.ggml.pre` dispatch — mirrors the peer's
+/// pre-tokenizer enumeration. The
 /// `pre` field selects the regex-bucket pre-tokenizer applied before
 /// BPE; different model families use distinct rules.
 fn determine_pre_tokenizer_type(arch: ArchName) -> String {
     match arch {
-        // llama-vocab.cpp:2042 — Qwen3.5 / Qwen3.6 family.
+        // Qwen3.5 / Qwen3.6 family.
         // Both the older qwen3moe variant AND the new qwen35moe
         // (linear-attn + MTP) use the same pre-tokenizer rules.
         ArchName::Qwen35 | ArchName::Qwen35Moe | ArchName::Qwen35MoeFull => "qwen35".into(),
-        // llama-vocab.cpp:2035 — Qwen2-family pre-tokenizer also used
+        // Qwen2-family pre-tokenizer also used
         // by Qwen3-VL text-side decoders.
         ArchName::Qwen3VlText => "qwen2".into(),
-        // llama-vocab.cpp:2005 — Gemma 4 (and Gemma 3 → same bucket).
+        // Gemma 4 (and Gemma 3 → same bucket).
         ArchName::Gemma4 | ArchName::Gemma4Mmproj | ArchName::Gemma4VisionMmproj => "gemma4".into(),
-        // llama-vocab.cpp:1951-1959 — LLaMA 3 BPE family.
+        // LLaMA 3 BPE family.
         ArchName::Llama3 => "llama-bpe".into(),
-        // llama-vocab.cpp — MiniMax-M2 has its own pre-tokenizer bucket
+        // MiniMax-M2 has its own pre-tokenizer bucket
         // (verified against canonical convert_hf_to_gguf.py output:
         // `tokenizer.ggml.pre = 'minimax-m2'`).
         ArchName::MiniMaxM2 => "minimax-m2".into(),
@@ -1256,7 +1250,7 @@ fn determine_pre_tokenizer_type(arch: ArchName) -> String {
         // BERT: BAAI bge tokenizer hashes to the same chkhsh as
         // jinaai/jina-embeddings-v2-base-en
         // (`0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f`)
-        // → canonical maps both to `jina-v2-en` per base.py:1431-1433.
+        // → canonical maps both to `jina-v2-en`.
         // The hash collision is intentional — same tokenizer config.
         ArchName::Bert => "jina-v2-en".into(),
         // Nomic-BERT uses the default pre-tokenizer.
@@ -1270,7 +1264,7 @@ fn determine_pre_tokenizer_type(arch: ArchName) -> String {
 /// both the old (`Vec<String>`: `["a b", ...]`) and the new
 /// (`Vec<Vec<String>>`: `[["a","b"], ...]`) formats. In the new
 /// format, spaces inside merge parts are encoded as chr(288) per
-/// llama.cpp's SpecialVocab convention.
+/// the peer's merges convention.
 fn extract_merges(model_section: &serde_json::Value) -> Vec<String> {
     let merges_val = match model_section.get("merges") {
         Some(v) => v,
@@ -1739,9 +1733,9 @@ mod tests {
 
     #[test]
     fn does_token_look_special_pinned_pattern() {
-        // Aligned with canonical TextModel.does_token_look_special at
-        // /opt/llama.cpp/conversion/base.py:1232-1253 — STRICT bracket
-        // forms only. Bare `<...>` tokens are USER_DEFINED, not CONTROL.
+        // Aligned with the canonical special-token heuristic — STRICT
+        // bracket forms only.
+        // Bare `<...>` tokens are USER_DEFINED, not CONTROL.
         // See commit 6693a52e for the alignment that closed Qwen3-VL
         // byte-cmp.
         for s in &[

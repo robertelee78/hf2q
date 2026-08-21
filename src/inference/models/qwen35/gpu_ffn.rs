@@ -1061,7 +1061,7 @@ pub fn build_dense_ffn_layer_gpu_q(
 ///
 /// Wave 5b.14: addressed the historical per-dense-layer 2-encoder overhead
 /// component from the W-5b.13 PP4106 audit (FFN dispatch bucket = 9,750 ms,
-/// 4.34x wall ratio vs llama at that time).  That old ratio is not the current
+/// 4.34x wall ratio vs the peer at that time).  That old ratio is not the current
 /// live decode frame: on 2026-04-28, a short apex dwq46 decode smoke measured
 /// hf2q 114.4 tok/s vs llama-bench 116.78 tok/s.  The larger current gap is
 /// prefill wall time, not this dense decode wrapper alone.
@@ -2114,7 +2114,7 @@ fn extract_expert_weight(
 ///   3d. y_e    = expert_down[e](h_e)               — proj (GPU, per expert)
 ///   3e. moe_out += w_e * y_e                       — CPU weighted accumulate
 ///
-/// // Shared expert (sigmoid-gated, llama.cpp qwen35moe.cpp:406-420)
+/// // Shared expert (sigmoid-gated, per the peer's spec)
 /// 4. sh_logit = shared_gate_inp(x)                 — proj (GPU, [seq, 1])
 /// 5. sh_gate  = sigmoid(sh_logit)                  — dispatch_sigmoid_mul(sh_logit, sh_logit)
 ///    Note: sigmoid(x) = sigmoid_mul(ones, x) but we compute via CPU to avoid
@@ -2257,7 +2257,7 @@ pub fn build_moe_ffn_layer_gpu(
 
     // ---- Shared expert: sigmoid-gated SwiGLU ----
     //
-    // llama.cpp qwen35moe.cpp:406-420 (spec):
+    // The peer's spec:
     //   shared_gate = sigmoid(gate_inp_shexp @ x)
     //   shared_out  = down_shexp(silu(gate_shexp @ x) * (up_shexp @ x))
     //   cur = moe_out + shared_gate * shared_out
@@ -2444,10 +2444,9 @@ pub fn build_moe_ffn_layer_gpu_q(
 ///
 /// With this variant, the caller can fuse step 1 + step 2 into a single
 /// command buffer per MoE layer (40 fewer command buffers per decode
-/// token on Qwen3.6-35B-A3B).  For comparison, llama.cpp's Metal compute
+/// token on Qwen3.6-35B-A3B).  For comparison, the peer's Metal compute
 /// path issues 1-2 command buffers per decode token total
-/// (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:458` —
-/// "optimal values for n_cb are 1 or 2"); hf2q pre-fusion issues 140.
+/// ("optimal values for n_cb are 1 or 2"); hf2q pre-fusion issues 140.
 ///
 /// # Caller contract
 ///

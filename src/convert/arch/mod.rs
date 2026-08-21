@@ -32,30 +32,28 @@ pub mod qwen3vl_text;
 ///
 /// HF safetensors checkpoints often carry non-weight buffers (e.g.
 /// BERT's `embeddings.position_ids` is an I64 `[0..max_pos]` lookup
-/// table — not a learnable weight; canonical's `bert.py:filter_tensors`
-/// drops it explicitly at lines 82-92). hf2q's source reader normally
+/// table — not a learnable weight; the canonical converter
+/// drops it explicitly). hf2q's source reader normally
 /// errors on unsupported dtypes (I64 / I32 / U8) because they'd
 /// otherwise silently slip through. The drop list lets the reader
 /// SKIP known non-weight tensors before the dtype check, preserving
 /// strictness on truly unexpected tensors.
 ///
-/// Mirrors canonical's per-class `filter_tensors` overrides
-/// (`/opt/llama.cpp/conversion/bert.py:82-92` for BERT; nomic-bert
-/// adds `mlp.experts.bias` per `bert.py:362-365`). Other arches
-/// (Gemma 4, Qwen 3.5, Llama 3, MiniMax-M2) have empty drop lists
-/// — their canonical converters don't override `filter_tensors`.
+/// Mirrors the canonical per-arch drop lists (BERT; nomic-bert
+/// additionally drops `mlp.experts.bias`). Other arches
+/// (Gemma 4, Qwen 3.5, Llama 3, MiniMax-M2) have empty drop lists.
 ///
 /// Called by `source_reader::HfModelSource::open` via `model_type`
 /// from `config.json`. Returns `true` if the (stripped) tensor name
 /// should be silently filtered out of the source meta list.
 pub fn should_drop_source_tensor(model_type: &str, hf_name: &str) -> bool {
-    // Canonical `bert.py:71-72` strips a leading `bert.` prefix
+    // The canonical converter strips a leading `bert.` prefix
     // before applying the filter rules.
     let stripped = hf_name.strip_prefix("bert.").unwrap_or(hf_name);
 
     match model_type {
         "bert" => {
-            // /opt/llama.cpp/conversion/bert.py:82-92 — exact drop list.
+            // Exact canonical drop list.
             // `position_ids` is I64; pooler is non-embedding-relevant.
             if matches!(
                 stripped,
@@ -70,9 +68,9 @@ pub fn should_drop_source_tensor(model_type: &str, hf_name: &str) -> bool {
             }
         }
         "nomic_bert" => {
-            // /opt/llama.cpp/conversion/bert.py:362-365 — nomic-bert
+            // nomic-bert
             // additionally drops `mlp.experts.bias`. Falls through to
-            // the BERT base list since NomicBertModel extends BertModel.
+            // the BERT base list.
             if stripped.contains("mlp.experts.bias") {
                 return true;
             }

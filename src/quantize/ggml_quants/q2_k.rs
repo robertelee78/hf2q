@@ -1,10 +1,10 @@
-//! Q2_K quantizer — ADR-033 P0 pure-Rust port of
-//! `quantize_row_q2_K_ref` (`/opt/llama.cpp/ggml/src/ggml-quants.c:829`) and
-//! `quantize_row_q2_K_impl` (`.../ggml-quants.c:1087`), with the dispatcher
-//! at `quantize_q2_K` (`.../ggml-quants.c:1149`) selecting between them on
+//! Q2_K quantizer — ADR-033 P0 pure-Rust port of the peer's
+//! `quantize_row_q2_K_ref` and
+//! `quantize_row_q2_K_impl`, with the dispatcher
+//! `quantize_q2_K` selecting between them on
 //! `quant_weights != NULL`.
 //!
-//! Block layout from `ggml-common.h:288-298`:
+//! Block layout (byte-identical to the peer's):
 //! ```text
 //! #define QK_K 256
 //! typedef struct {

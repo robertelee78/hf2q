@@ -407,8 +407,8 @@ pub fn dispatch(args: &SmokeArgs, env: &dyn SmokeEnv) -> SmokeOutcome {
 ///
 /// **Why no `--log-disable`:** real llama-cli routes both the model-
 /// loader summary (`loaded meta data with N tensors ...`) and the
-/// timing block (`eval time = X ms / N runs`) through `LLAMA_LOG_INFO`
-/// (see `/opt/llama.cpp/src/llama-context.cpp:3486`). Adding
+/// timing block (`eval time = X ms / N runs`) through `LLAMA_LOG_INFO`.
+/// Adding
 /// `--log-disable` (which calls `common_log_pause`) suppresses both
 /// — leaving the smoke harness's transcript-assertion parsers
 /// looking at empty stderr. The transcript itself is bounded
@@ -449,7 +449,7 @@ fn run_q4_0_pipeline(entry: &ArchEntry, args: &SmokeArgs) -> Result<PathBuf, Str
             // hf2q-produced GGUFs carry the complete MTP block for native
             // speculative decoding in the inference engine.
             //
-            // However, llama.cpp b8680 (current stable) has no qwen35 MTP
+            // However, the peer at b8680 (current stable) has no qwen35 MTP
             // loader: its create_tensor loop expects exactly num_hidden_layers
             // blocks all with the same linear-attn slot layout, and rejects
             // the file with "missing tensor 'blk.64.ssm_conv1d.weight'" when
@@ -460,9 +460,9 @@ fn run_q4_0_pipeline(entry: &ArchEntry, args: &SmokeArgs) -> Result<PathBuf, Str
             // requirement, blocks 0–63).  Verifying MTP emission is ADR-013's
             // mandate, not this smoke gate.  Activate the escape hatch so the
             // convert subprocess strips MTP and emits a 64-block GGUF that the
-            // installed llama.cpp can load.
+            // installed peer can load.
             //
-            // REMOVE when llama.cpp gains qwen35 MTP loading support (then
+            // REMOVE when the peer gains qwen35 MTP loading support (then
             // the smoke can verify MTP loading too).
             .env("HF2Q_QWEN35_DROP_MTP", "1")
             .output()
@@ -511,12 +511,11 @@ fn run_q4_0_pipeline(entry: &ArchEntry, args: &SmokeArgs) -> Result<PathBuf, Str
             // staring at empty stderr. See run_q4_0_pipeline doc comment.
             "--no-warmup",
             // ADR-012 Bug 5 (2026-04-25 cron-iter): llama-cli enters
-            // conversation mode by default in recent llama.cpp builds and
+            // conversation mode by default in recent peer builds and
             // reopens /dev/tty for interactive readline AFTER finishing
             // the requested -n tokens. Without -no-cnv the child blocks
             // forever in `console::readline()` even with stdin redirected
-            // to null (interactive mode bypasses parent stdin). See
-            // /opt/llama.cpp/common/arg.cpp:1490 for the canonical flag.
+            // to null (interactive mode bypasses parent stdin).
             "-no-cnv",
             // ADR-012 Bug 5 follow-up (2026-04-25 smoke-verify): -no-cnv
             // disables conversation mode but the process still enters
@@ -1125,7 +1124,7 @@ mod tests {
         let out = dispatch(&args_for("qwen35", "q4_0"), &env);
         // Note: preflight also checks /opt/llama.cpp/build/bin/llama-cli
         // on disk; in the mock we can't intercept that probe. If the
-        // developer machine has llama.cpp built, the test would short-
+        // developer machine has the peer built, the test would short-
         // circuit pass. On clean CI this path fires.
         if !Path::new("/opt/llama.cpp/build/bin/llama-cli").is_file() {
             assert_eq!(out.exit_code(), EXIT_LLAMA_CLI_MISSING);

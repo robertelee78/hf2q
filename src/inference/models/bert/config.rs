@@ -5,7 +5,7 @@
 //!     containing safetensors — not the common case for BERT in hf2q;
 //!     included for future `hf2q convert` support).
 //!   - A GGUF header's metadata key/value pairs (the common path —
-//!     llama.cpp's `bert.*` keys).
+//!     the peer's `bert.*` keys).
 //!
 //! Both parsers produce the same `BertConfig`, which then feeds the
 //! forward-pass entry point. No field is optional — if a key is missing
@@ -23,8 +23,7 @@ use std::path::Path;
 /// Pooling method used to reduce the encoder's last-hidden-state
 /// `[seq_len, hidden]` to a single vector `[hidden]`.
 ///
-/// Values match llama.cpp's `enum llama_pooling_type` (see
-/// `/opt/llama.cpp/include/llama.h`):
+/// Values match the peer's `enum llama_pooling_type`:
 ///   0 = NONE (no pooling — return all hidden states, invalid for
 ///             /v1/embeddings which always needs a single vector)
 ///   1 = MEAN
@@ -97,7 +96,7 @@ pub struct BertConfig {
     /// Pooling method for `/v1/embeddings` output reduction.
     pub pooling_type: PoolingType,
     /// `true` → encoder uses a causal mask (decoder-style). `false` for
-    /// standard BERT. llama.cpp's BERT GGUFs set this explicitly.
+    /// standard BERT. The peer's BERT GGUFs set this explicitly.
     pub causal_attention: bool,
 }
 
@@ -160,7 +159,7 @@ impl BertConfig {
         })
     }
 
-    /// Parse from a GGUF file's metadata header. Uses llama.cpp's
+    /// Parse from a GGUF file's metadata header. Uses the peer's
     /// `bert.*` key convention.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let arch = gguf
@@ -239,7 +238,7 @@ impl BertConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Tensor-name table (llama.cpp GGUF BERT convention)
+// Tensor-name table (the peer's GGUF BERT convention)
 // ---------------------------------------------------------------------------
 
 /// Token embedding table `[vocab_size, hidden_size]`.
@@ -253,7 +252,7 @@ pub const TENSOR_EMBED_NORM_WEIGHT: &str = "token_embd_norm.weight";
 /// LayerNorm applied to the summed embeddings — bias.
 pub const TENSOR_EMBED_NORM_BIAS: &str = "token_embd_norm.bias";
 
-/// Per-layer tensor name helper. llama.cpp's BERT convention uses
+/// Per-layer tensor name helper. The peer's BERT convention uses
 /// `blk.{n}.{suffix}` for every per-block tensor.
 ///
 /// Standard suffixes:
@@ -395,7 +394,7 @@ mod tests {
 
     #[test]
     fn tensor_name_constants_match_llama_cpp_convention() {
-        // Spot-check the global constants against llama.cpp's BERT GGUF
+        // Spot-check the global constants against the peer's BERT GGUF
         // writer convention. Changes here are a silent compat break — any
         // future refactor that touches these strings must update this test
         // + the corresponding loader code in lockstep.

@@ -1,12 +1,12 @@
-//! `GgmlType` — Rust enum mirroring llama.cpp's `enum ggml_type`
-//! (`/opt/llama.cpp/ggml/include/ggml.h:389`) at the literal numeric
+//! `GgmlType` — Rust enum mirroring the peer's `enum ggml_type`
+//! at the literal numeric
 //! values so the GGUF header bytes match byte-for-byte across the
 //! two pipelines.
 //!
 //! Per ADR-033 Decision §"Per-tensor IR (Decision §1 concrete)" and
-//! the LlamaFtype mapping in §"LlamaFtype mapping (Decision §2 concrete)".
+//! the GgufFtype mapping in §"GgufFtype mapping (Decision §2 concrete)".
 //!
-//! Holes in the numeric space (4, 5, 16..19, 21..29) are llama.cpp
+//! Holes in the numeric space (4, 5, 16..19, 21..29) are peer
 //! values currently out of v1 scope (TQ1_0/TQ2_0/IQ2_*/IQ3_*/IQ1_*).
 //! Add only when the matching `Quantizer` impl ships.
 
@@ -14,7 +14,7 @@ use super::error::QuantizeError;
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(non_camel_case_types)] // mirrors llama.cpp's GGML_TYPE_Q4_0-style names verbatim
+#[allow(non_camel_case_types)] // mirrors the peer's GGML_TYPE_Q4_0-style names verbatim
 pub enum GgmlType {
     F32 = 0,
     F16 = 1,
@@ -56,7 +56,7 @@ pub enum GgmlType {
 
 impl GgmlType {
     /// Number of f32 elements per disk-format block. From
-    /// `/opt/llama.cpp/ggml/src/ggml-common.h` defines (`QK4_0=32`,
+    /// the peer's block defines (`QK4_0=32`,
     /// `QK_K=256`, etc.).
     pub const fn block_size(self) -> usize {
         match self {
@@ -88,8 +88,8 @@ impl GgmlType {
         }
     }
 
-    /// Bytes per disk-format block. From the `static_assert`s in
-    /// `/opt/llama.cpp/ggml/src/ggml-common.h` (`sizeof(block_q4_0)`,
+    /// Bytes per disk-format block. From the peer's
+    /// block-struct sizes (`sizeof(block_q4_0)`,
     /// etc.). Mirrored as a Rust const so byte-cmp regressions surface
     /// at compile time if a kernel's BLOCK_BYTES drifts from this.
     pub const fn type_size(self) -> usize {
@@ -110,9 +110,9 @@ impl GgmlType {
             GgmlType::Q4_K => 144,  // f16 d + f16 dmin + scales[12] + qs[128]
             GgmlType::Q5_K => 176,  // f16 d + f16 dmin + scales[12] + qh[32] + qs[128]
             GgmlType::Q6_K => 210,  // ql[128] + qh[64] + scales[16] (i8) + f16 d
-            GgmlType::Q8_K => 292, // f32 d + qs[256] + bsums[16] (only used internally by llama.cpp)
+            GgmlType::Q8_K => 292, // f32 d + qs[256] + bsums[16] (only used internally by the peer)
             // Placeholder IQ/TQ/MXFP4 types — no Quantizer impl in v1.
-            // Sizes mirror llama.cpp's ggml-common.h for documentation
+            // Sizes mirror the peer's block sizes for documentation
             // value; v1 pipeline never emits these rows (NoQuantizerForType).
             GgmlType::IQ2_XXS => 66,
             GgmlType::IQ2_XS => 74,

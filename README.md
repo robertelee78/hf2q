@@ -26,10 +26,10 @@ Metal kernels we own end-to-end.
 
 | | |
 |---|---|
-| **License** | Apache-2.0 OR MIT (dual) |
+| **License** | Apache-2.0 OR MIT (dual); third-party attribution in [`NOTICE`](NOTICE) |
 | **Rust** | 1.88+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
-| **Output formats** | GGUF (`llama.cpp` consumers), mlx-lm safetensors |
+| **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
 | **Status** | hf2q 0.1.7 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.10.16`. Public availability is authoritative only when the `v0.1.7` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
@@ -55,7 +55,9 @@ hf2q serve --model models/gemma-4-26b-it-q4_k_m/out.gguf --port 8080
    `Q{2..6}_K_{S,M,L}`, imatrix-weighted K-quants including
    `imatrix-adaptive`, or mixed-bit `dynamic-quant-*`) and emit GGUF
    or mlx-lm safetensors.
-   No `llama.cpp` or `candle` is involved at build, test or runtime
+   No `llama.cpp` (the pinned upstream GGUF engine, referred to
+   throughout as "the peer" — see [`NOTICE`](NOTICE)) or `candle`
+   is involved at build, test or runtime
    (ADR-008 — "candle divorce"; sovereignty rule in
    `docs/arch-onboarding.md`).
 
@@ -179,7 +181,7 @@ values, parsed via
 
 | Family | Variants | Notes |
 |---|---|---|
-| Standard llama.cpp ftypes | `f32`, `f16`, `bf16`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q2_k`, `q3_k_{s,m,l}`, `q4_k_{s,m}`, `q5_k_{s,m}`, `q6_k`, `iq4_nl` | Byte-identical to stock `llama-quantize` output for the same ftype. |
+| Standard GGUF ftypes | `f32`, `f16`, `bf16`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q2_k`, `q3_k_{s,m,l}`, `q4_k_{s,m}`, `q5_k_{s,m}`, `q6_k`, `iq4_nl` | Byte-identical to stock `llama-quantize` output for the same ftype. |
 | APEX algorithmic tiers (MoE arches only) | `apex-quality`, `apex-i-quality`, `apex-balanced`, `apex-i-balanced`, `apex-compact`, `apex-i-compact`, `apex-mini` | Per-tier overlay derived from `mudler/apex-quant`. Auto-detects against the per-model fingerprint manifest at [`data/apex-references/manifest.json`](data/apex-references/manifest.json) (ADR-033 §9). I-tier variants require imatrix data via `--imatrix <file>` or `--imatrix-corpus <name>` (Pi shipped 2026-05-19 — see [I-tier APEX](#i-tier-apex-imatrix-aware-quantization) below). |
 
 Reserved names surface as typed errors with actionable hints:
@@ -191,7 +193,7 @@ Reserved names surface as typed errors with actionable hints:
 
 The `hf2q convert` pipeline reads a Hugging Face model directory
 (`config.json` + safetensors + tokenizer assets) and emits a single GGUF
-that loads in stock `llama.cpp` and in `hf2q serve`. The source can be an
+that loads in the stock peer engine and in `hf2q serve`. The source can be an
 explicit local path or a canonical Hub repository ID/URL. Remote conversion
 uses hf2q's in-process `hf-hub` client, resolves a branch or tag to one exact
 commit before transferring files, verifies the exact index-selected source
@@ -232,7 +234,7 @@ hf2q convert ./models/google-gemma-4-26b-a4b-it \
   --quant q5_k_m \
   -o ./out/gemma4-26b-q5_k_m.gguf
 
-# 2a. Test load with stock llama.cpp (single-shot generation):
+# 2a. Test load with the stock peer engine (single-shot generation):
 llama-cli -m ./out/gemma4-26b-q5_k_m.gguf \
   -p "What is the capital of France?" -n 64 --temp 0 --seed 42
 
@@ -511,7 +513,7 @@ focused receipt complements rather than replaces the unchanged four-agent
 agentic gate.
 
 `scripts/run_deepseek4_matched_peer.sh` is the developer-only same-input
-llama.cpp discriminator for the frozen four-agent cold workload. It starts a
+peer discriminator for the frozen four-agent cold workload. It starts a
 fresh pinned peer for each wave, disables prompt caching, binds binary/model/
 fixture/request identity, requires exact `read_file` semantics and zero-cache
 usage, and records monotonic response/cohort timing under continuous AC and
@@ -710,7 +712,7 @@ about every later commit or model artifact. Re-run the linked protocol for a
 current purchasing or deployment decision; correctness and release gates do
 not treat these historical medians as continuously verified.
 
-Re-bench at the recorded HEAD on M5 Max against `llama.cpp` peer
+Re-bench at the recorded HEAD on M5 Max against the peer
 (build `389ff61d7`, `-fa 1`) with identical GGUFs.  3-run median;
 hf2q uses default config including the HF2Q_NO_FA hybrid-attn
 fix from commit `03328ee5`.  See
@@ -726,7 +728,7 @@ for the full thermal-fair alt-pair protocol used by ADR-029 baselines.
 - **Prefill (Gemma-4 26B)** — crossover regime: `pp1800` **0.96×
   peer-FA** (hf2q 2734 t/s vs llama-bench 2837 t/s); `pp3700`
   **1.24× peer-FA AHEAD** (hf2q 2703 t/s vs 2181 t/s).  hf2q's
-  prefill rate drops ~1% from pp1800→pp3700 while llama's drops
+  prefill rate drops ~1% from pp1800→pp3700 while the peer's drops
   ~23% (FA tile-skip helps less at longer K), so the cross-over
   sits early in this range.  The historical `1.07-1.09× AHEAD`
   claim across the whole range no longer holds at current main.

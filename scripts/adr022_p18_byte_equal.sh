@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ADR-022 Phase 1 P1.8 byte-equal sub-AC.
 #
-# Verifies hf2q's mlx-native runtime and llama.cpp's llama-completion produce
+# Verifies hf2q's mlx-native runtime and the peer's llama-completion produce
 # byte-identical generated text on the original ADR-022 motivating file
 # (gemma4-ara-2pass-APEX-Q5_K_M.gguf, with Q5_1 + IQ4_NL + Q6_K + Q8_0 + F32
 # weights) under matched greedy sampling.

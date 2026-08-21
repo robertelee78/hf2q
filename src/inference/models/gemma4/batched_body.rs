@@ -2320,7 +2320,7 @@ impl MlxModelWeights {
         // ADR-040 §21 — intra-step command-buffer pipelining (HF2Q_DECODE_CB_CHUNKS=K,
         // default OFF=1). Splits the per-step layer loop into K command buffers,
         // ASYNC-committing each in order so the GPU executes chunk c while the CPU
-        // ENCODES chunk c+1 (llama.cpp ggml-metal's n_cb pattern, single-threaded so
+        // ENCODES chunk c+1 (the peer's ggml-metal n_cb pattern, single-threaded so
         // NO cross-thread aliasing). Cross-CB ordering is the same-queue COMMIT order
         // (no MTLFence/Event needed — codex-reviewed): chunk c's CB fully executes
         // before chunk c+1's reads its output. BYTE-IDENTICAL by construction (same

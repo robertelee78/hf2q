@@ -284,8 +284,8 @@ impl ApexPolicy {
             // hardcodes below — this preserves the override's
             // strictness on the enumerated tensors (per-layer attn /
             // exps / shexp / ssm) while letting the small structural
-            // set use llama.cpp's defaults, exactly mirroring stock
-            // `llama-quantize --tensor-type-file`'s semantics.
+            // set use stock `llama-quantize`'s defaults, exactly
+            // mirroring its `--tensor-type-file` semantics.
             let role = classify_moe_tensor(self.arch, tensor.name);
             match role {
                 MoeTensorRole::TokenEmbd
@@ -317,7 +317,7 @@ impl ApexPolicy {
         match role {
             // --- Global / structural tensors (no layer index needed) ---
             // Mudler convention: token_embd and output stay at Q6_K
-            // (implicit — llama.cpp's quantize-tool default for these
+            // (implicit — stock llama-quantize's default for these
             // when no `--token-embedding-type` / `--output-tensor-type`
             // override is given is Q6_K). We mirror that explicitly
             // so `target_for`'s contract stays "policy chooses
@@ -325,8 +325,9 @@ impl ApexPolicy {
             MoeTensorRole::TokenEmbd => Ok(GgmlType::Q6_K),
             MoeTensorRole::Output => Ok(GgmlType::Q6_K),
             // Router gate is a small per-token expert selector. Mudler
-            // doesn't list it in `generate_config.sh`, so llama.cpp's
-            // default fires — preserved at Q5_0 (small, perf-critical).
+            // doesn't list it in `generate_config.sh`, so stock
+            // llama-quantize's default fires — preserved at Q5_0
+            // (small, perf-critical).
             MoeTensorRole::RouterGate => Ok(GgmlType::Q5_0),
             // Norms are never quantized. F32 always.
             MoeTensorRole::Norm => Ok(GgmlType::F32),

@@ -1,5 +1,5 @@
 #!/bin/bash
-# logits_parity.sh — Compare hf2q's first-token logits to llama.cpp's on the
+# logits_parity.sh — Compare hf2q's first-token logits to the peer's on the
 # same rendered prompt. Reports top-10 token IDs from each side and the L2
 # delta on the overlapping vocab.
 #
@@ -31,11 +31,11 @@ if [ ! -f /tmp/hf2q_logits_t0.bin ]; then
 fi
 cp /tmp/hf2q_logits_t0.bin "$WORKDIR/hf2q.bin"
 
-# 2. llama.cpp first-token logits via llama-eval-callback.
+# 2. peer first-token logits via llama-eval-callback.
 "$LLAMA_EVAL" -m "$MODEL" -p "$PROMPT_TEXT" -n 0 \
   >"$WORKDIR/llama.stdout" 2>"$WORKDIR/llama.stderr" || true
 
-# 3. Compare. (For now top-1 argmax; full L2 distance requires a llama.cpp
+# 3. Compare. (For now top-1 argmax; full L2 distance requires a peer-side
 # logit-dump tool that we may need to script up.)
 python3 <<PY
 import struct
@@ -52,5 +52,5 @@ PY
 
 # llama-eval-callback prints "first 10 tokens" by default; surface them.
 echo "---"
-echo "llama.cpp last lines:"
+echo "peer last lines:"
 tail -30 "$WORKDIR/llama.stdout" "$WORKDIR/llama.stderr" 2>/dev/null | tail -30

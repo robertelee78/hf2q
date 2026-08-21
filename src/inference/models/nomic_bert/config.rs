@@ -1,7 +1,7 @@
 //! nomic-bert architecture config + tensor-name table.
 //!
 //! `NomicBertConfig` is parsed from a GGUF header's metadata using the
-//! `nomic-bert.*` key prefix (per llama.cpp `llama-arch.cpp:25`). The
+//! `nomic-bert.*` key prefix (the peer's key convention). The
 //! shape is identical to `bert::config::BertConfig` minus the BERT-only
 //! fields that nomic-bert does not use, plus the `rope_freq_base` field
 //! that nomic-bert needs for RoPE on Q/K.
@@ -19,14 +19,14 @@
 //! - `nomic-bert.rope.freq_base`              → RoPE base period (e.g. 1000.0)
 //! - `tokenizer.ggml.token_type_count`        → type_vocab_size (NOT
 //!   `nomic-bert.token_type_count` — nomic GGUFs use the global tokenizer
-//!   key per `llama-arch.cpp:263`).
+//!   key, matching the peer).
 //!
 //! # Why no `hidden_act` field
 //!
 //! BERT has `hidden_act` because the spec is parameterised over GeLU /
 //! GeLU-new / ReLU. nomic-bert is not — its FFN is always SwiGLU
-//! (`silu(ffn_up) * ffn_gate → ffn_down`) per llama.cpp
-//! `src/models/bert.cpp:131-138`. Encoding "always SwiGLU" as a hardcoded
+//! (`silu(ffn_up) * ffn_gate → ffn_down`) per the
+//! peer. Encoding "always SwiGLU" as a hardcoded
 //! contract instead of a config field eliminates a runtime branch and
 //! makes the forward pass auditable from the type alone.
 
@@ -87,7 +87,7 @@ impl NomicBertConfig {
         self.hidden_size / self.num_attention_heads
     }
 
-    /// Parse from a GGUF file's metadata header. Uses llama.cpp's
+    /// Parse from a GGUF file's metadata header. Uses the peer's
     /// `nomic-bert.*` key convention.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let arch = gguf
@@ -146,7 +146,7 @@ impl NomicBertConfig {
             })?;
 
         // type_vocab_size: prefer the global tokenizer key (per
-        // llama-arch.cpp:263); fall back to inferring from
+        // the peer); fall back to inferring from
         // token_types.weight tensor row count if that key is absent.
         let type_vocab_size = u32_key("tokenizer.ggml.token_type_count")
             .ok()
@@ -197,9 +197,9 @@ mod tests {
     #[test]
     fn tensor_name_constants_match_llama_cpp_convention() {
         // Stem names match the BERT family convention; deviations here
-        // are silent compat breaks. Locked against `bert.cpp` builder
-        // which gathers `tok_embd / type_embd / tok_norm` from the same
-        // GGUF strings for both BERT and nomic-bert.
+        // are silent compat breaks. Locked against the peer's BERT
+        // builder, which gathers `tok_embd / type_embd / tok_norm` from
+        // the same GGUF strings for both BERT and nomic-bert.
         assert_eq!(NOMIC_BERT_TENSOR_TOKEN_EMBD, "token_embd.weight");
         assert_eq!(NOMIC_BERT_TENSOR_TOKEN_TYPES, "token_types.weight");
         assert_eq!(

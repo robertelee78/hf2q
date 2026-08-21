@@ -49,7 +49,7 @@ use crate::quantize::ggml_quants::standard_policy::{
     HParams, LlmType, QsState, StandardPolicy, TensorCategory, tensor_type_fallback,
 };
 use crate::quantize::ggml_quants::{
-    ArchName, Deepseek4AgenticQ2Policy, GgmlType, LlamaFtype, QuantizeError, SourceDtype,
+    ArchName, Deepseek4AgenticQ2Policy, GgmlType, GgufFtype, QuantizeError, SourceDtype,
     TensorRef, is_audio_tensor_pattern, is_vision_tensor_pattern, quantizer_for,
 };
 
@@ -255,15 +255,15 @@ pub struct PlannedSizeSummary {
 /// docs for the lifecycle contract.
 ///
 /// Policy selection: by default the orchestrator routes per-tensor type
-/// decisions through [`StandardPolicy::target_for`] (mirroring
-/// llama.cpp's `llama_tensor_get_type_impl`). When constructed via
+/// decisions through [`StandardPolicy::target_for`] (mirroring the
+/// peer's canonical per-tensor type selection). When constructed via
 /// [`new_with_apex`] it routes through [`ApexPolicy::target_for`]
 /// instead — used by `--quant apex-<tier>` on the convert-v2 CLI per
 /// ADR-033 §"Plan" / Pa. The shape-misalignment fallback
 /// ([`tensor_type_fallback`]) runs for both policies; only the
 /// type-pick algorithm changes.
 pub struct ConvertOrchestrator {
-    ftype: LlamaFtype,
+    ftype: GgufFtype,
     arch: ArchName,
     hparams: HParams,
     /// `Some` when an Apex tier was selected; mutually exclusive with
@@ -295,7 +295,7 @@ impl ConvertOrchestrator {
     /// snapshot consumed by [`StandardPolicy::target_for`] for the
     /// counter-walk + `n_gqa` branches. Real callers populate this
     /// from the safetensors-side config; tests pass synthetic values.
-    pub fn new(ftype: LlamaFtype, arch: ArchName, hparams: HParams) -> Self {
+    pub fn new(ftype: GgufFtype, arch: ArchName, hparams: HParams) -> Self {
         Self {
             ftype,
             arch,
@@ -319,7 +319,7 @@ impl ConvertOrchestrator {
     /// dispatcher already does this when it builds the policy from the
     /// detected arch.
     pub fn new_with_apex(
-        ftype: LlamaFtype,
+        ftype: GgufFtype,
         arch: ArchName,
         hparams: HParams,
         apex_policy: ApexPolicy,
@@ -346,7 +346,7 @@ impl ConvertOrchestrator {
             "DeepSeek-V4 agentic quantization cannot be applied to another architecture"
         );
         Self {
-            ftype: LlamaFtype::MostlyQ2_K,
+            ftype: GgufFtype::MostlyQ2_K,
             arch,
             hparams,
             apex_policy: None,
@@ -407,16 +407,16 @@ impl ConvertOrchestrator {
         // (does NOT reorder `entries` itself — the caller's `stream_tensor`
         // protocol uses input-order indices and we preserve that).
         //
-        // Canonical (`llama-quant.cpp`) visits tensors in GGUF storage order
+        // The canonical quantizer visits tensors in GGUF storage order
         // which `convert_hf_to_gguf.py` emits as: globals → blk.0.* → blk.1.*
         // → ... → blk.<n_layer-1>.* (numeric layer, name-sorted within each).
         // hf2q's HfModelSource iterates HF safetensors v0.3 in **lexical name
         // order**: blk.0, blk.1, blk.10, blk.11, ..., blk.19, blk.2, ...
         //
-        // The mismatch is benign for the WRITE side (llama.cpp loads by name),
+        // The mismatch is benign for the WRITE side (the peer loads by name),
         // but `target_for` advances `qs.i_attention_wv` per visit and the
         // Q5_K_M attn_v branch at `standard_policy.rs:556` uses that counter
-        // DIRECTLY (no `layer_info` parsing, see `llama-quant.cpp:533-534`).
+        // DIRECTLY (no `layer_info` parsing).
         // So a lexical visit order makes `use_more_bits(visit_count, n_layer)`
         // fire on the wrong layer indices — measured as 12 attn_v Q5_K↔Q6_K
         // swaps vs canonical on Gemma 4 26B Q5_K_M (docs §10.2).
@@ -446,8 +446,7 @@ impl ConvertOrchestrator {
         // Pre-pass: count attn_v tensors and hardcode n_ffn_{down,gate,up}
         // to hparams.n_layer.
         //
-        // Mirrors `init_quantize_state_counters` at
-        // `/opt/llama.cpp/src/llama-quant.cpp:837-852`:
+        // Canonical quantize-state counter seeding:
         //   - attn_v counter is INCREMENTED per visited attn_v-like tensor
         //   - ffn_{down,gate,up} counters are HARDCODED to `n_layer`
         //
@@ -478,8 +477,7 @@ impl ConvertOrchestrator {
         qs.n_ffn_down = self.hparams.n_layer as i32;
         qs.n_ffn_gate = self.hparams.n_layer as i32;
         qs.n_ffn_up = self.hparams.n_layer as i32;
-        // Mirror canonical /opt/llama.cpp/src/llama-quant.cpp:181:
-        // has_tied_embeddings starts true and is cleared when
+        // Canonical seeding: has_tied_embeddings starts true and is cleared when
         // `output.weight` is observed in the model. Without this clear,
         // non-tied models (those with a real output.weight tensor)
         // incorrectly promote token_embd.weight via the Output/tied
@@ -495,7 +493,7 @@ impl ConvertOrchestrator {
         // stream-time validation. No payload bytes consumed here.
         //
         // Policy walk runs in CANONICAL order (so qs counters advance to
-        // match llama.cpp), but results are stored in `planned[]` indexed
+        // match the peer), but results are stored in `planned[]` indexed
         // by the input position so `stream_tensor(i, data)` semantics are
         // unchanged. See top-of-function note about `canonical_order`.
         let mut planned: Vec<Option<PlannedTensor>> = (0..entries.len()).map(|_| None).collect();
@@ -554,9 +552,7 @@ impl ConvertOrchestrator {
                 }
             } else if is_f32_keep_tensor(&e.name, e.shape.len()) {
                 // F32-keep gate — emit the F32 row-major payload as-is.
-                // Mirrors llama.cpp's `tensor_allows_quantization`
-                // predicate at `llama-quant.cpp:285-353`. See
-                // `is_f32_keep_tensor` doc for the rule list.
+                // See `is_f32_keep_tensor` doc for the rule list.
                 GgmlType::F32
             } else {
                 let tref = TensorRef {
@@ -934,13 +930,13 @@ impl<W: Write + Seek> StreamingWriter<W> {
     ///
     /// - **Dense** (`n_mat == 1`): return `Accumulator.values[..n_per_row]`
     ///   as-is. The accumulator stores sum-of-squared-activations per
-    ///   column; llama-quant.cpp passes these raw to the K-quant kernel,
+    ///   column; the canonical quantizer passes these raw to the K-quant kernel,
     ///   which then combines them with `sqrt(sigma2 + x_l²)` per-block.
     /// - **MoE** (`n_mat > 1`, e.g. `ffn_*_exps` for Qwen MoE): sum
     ///   per-column across all experts, divide by total token count, to
     ///   produce a single n_per_row importance vector that's then reused
-    ///   per row. This loses per-expert specificity vs. llama.cpp's
-    ///   `quantize_row_id` path but is the simplest correct first-cut for
+    ///   per row. This loses per-expert specificity vs. the peer's
+    ///   per-expert imatrix path but is the simplest correct first-cut for
     ///   the row-uniform quantize() signature; a future iter could thread
     ///   per-mat slices through if measurement justifies it.
     fn tensor_imatrix(
@@ -1436,31 +1432,28 @@ impl<W: Write + Seek> StreamingWriter<W> {
 /// Predicate: should this tensor be emitted as F32-raw, skipping the
 /// policy / quantizer entirely?
 ///
-/// Mirrors llama.cpp's canonical `tensor_allows_quantization` at
-/// `/opt/llama.cpp/src/llama-quant.cpp:285-353` (`quantize` returning
-/// false → caller writes the source dtype unchanged, which for our F32
-/// in-memory representation means F32 on disk).
+/// Mirrors the peer's canonical quantization-eligibility predicate
+/// (eligibility false → the source dtype is written unchanged, which
+/// for our F32 in-memory representation means F32 on disk).
 ///
-/// **Rules** (inverted from llama-quant.cpp; we return `true` to mean
-/// "keep as F32"):
+/// **Rules** (inverted from the canonical predicate; we return `true`
+/// to mean "keep as F32"):
 ///
-/// 1. `n_dims < 2` — scalars and 1-D vectors are never quantized
-///    (per `llama-quant.cpp:293`).  Catches `router.scale`,
-///    `router.per_expert_scale`, `layer_scalar`, all `*_norm.weight`
-///    that happen to be 1-D, etc.
-/// 2. Name does NOT end in `.weight` — `llama-quant.cpp:298`
-///    "ends with 'weight'" gate.  Catches `.scale` sub-name extensions
-///    Gemma 4 uses for router scales.
-/// 3. Name contains `_norm.weight` — `llama-quant.cpp:301`.
-/// 4. Name contains `ffn_gate_inp.weight` — `llama-quant.cpp:307`,
-///    the router-gate projection is small and stays F32.
+/// 1. `n_dims < 2` — scalars and 1-D vectors are never quantized.
+///    Catches `router.scale`, `router.per_expert_scale`,
+///    `layer_scalar`, all `*_norm.weight` that happen to be 1-D, etc.
+/// 2. Name does NOT end in `.weight` — the "ends with 'weight'" gate.
+///    Catches `.scale` sub-name extensions Gemma 4 uses for router
+///    scales.
+/// 3. Name contains `_norm.weight`.
+/// 4. Name contains `ffn_gate_inp.weight` — the router-gate
+///    projection is small and stays F32.
 /// 5. Name contains `altup` / `laurel` / `per_layer_model_proj` —
-///    `llama-quant.cpp:310-314` (Gemma3n; benign for arches that
-///    don't carry these patterns).
+///    Gemma3n patterns; benign for arches that don't carry them.
 /// 6. Name contains `ssm_conv1d` / `shortconv.conv.weight` /
 ///    `time_mix_*` / `attn_rel_b.weight` / `.position_embd` /
 ///    `sam.pos_embd` / `sam.neck.` / `sam.net_` / `.rel_pos` /
-///    `.patch_embd` / `.patch_merger` — `llama-quant.cpp:322-352`.
+///    `.patch_embd` / `.patch_merger`.
 /// 7. Gemma 4 synthesized `rope_freqs.weight` — the table carries
 ///    exact `1.0` / `1e30` magic values; quantizing would saturate
 ///    `1e30` to inf (F16) or zero (Q4_0). Already covered by rule
@@ -1468,40 +1461,39 @@ impl<W: Write + Seek> StreamingWriter<W> {
 ///    `_norm`, but it IS 1-D so rule (1) catches it.  Keep the
 ///    explicit rule too as a load-bearing comment anchor.
 ///
-/// **NOT included** (intentionally — these ARE quantized in llama.cpp):
+/// **NOT included** (intentionally — the peer quantizes these):
 ///   - `output.weight` is quantized by default (only kept F32 when
-///     `--quantize-output-tensor 0` per `llama-quant.cpp:303`).
+///     `--quantize-output-tensor 0`).
 ///   - `token_embd.weight` is quantized normally.
 ///   - Per-layer dense `mlp.{gate,up,down}_proj.weight` always quantized.
 fn is_f32_keep_tensor(name: &str, n_dims: usize) -> bool {
-    // Rule (1): scalars + 1-D vectors. llama-quant.cpp:293.
+    // Rule (1): scalars + 1-D vectors.
     if n_dims < 2 {
         return true;
     }
     // Rule (2): names not ending in `.weight` (Gemma 4 emits
-    // `.scale` sub-names that lack the `.weight` suffix per
-    // `gemma.py::format_tensor_name` `suffix=".scale"`). llama-quant.cpp:298.
+    // `.scale` sub-names that lack the `.weight` suffix).
     if !name.ends_with(".weight") {
         return true;
     }
-    // Rules (3)-(7): substring patterns. Same order as llama-quant.cpp
-    // for readability.
+    // Rules (3)-(7): substring patterns. Same order as the canonical
+    // predicate for readability.
     //
-    // BERT positional + token-type embeddings — `llama-quant.cpp:317-318`
-    // (exact match via `LLM_TN(arch)(LLM_TENSOR_POS_EMBD/TOKEN_TYPES, "weight")`,
-    // which expands to the bare `position_embd.weight` / `token_types.weight`
-    // names for BERT-family arches). The later `.position_embd`
-    // substring rule catches multimodal SAM-style names with a leading
-    // dot (e.g. `v.position_embd`), so it does NOT cover this case.
-    name == "position_embd.weight"       // BERT — llama-quant.cpp:317
-        || name == "token_types.weight"  // BERT — llama-quant.cpp:318
-        || name.contains("_norm.weight")        // (3) llama-quant.cpp:301
-        || name.contains("ffn_gate_inp.weight") // (4) llama-quant.cpp:307
-        || name.contains("altup")        // (5) llama-quant.cpp:310
-        || name.contains("laurel")       // (5) llama-quant.cpp:311
-        || name.contains("per_layer_model_proj") // (5) llama-quant.cpp:314
-        || name.contains("ssm_conv1d")   // (6) llama-quant.cpp:322
-        || name.contains("shortconv.conv.weight") // (6) llama-quant.cpp:323
+    // BERT positional + token-type embeddings — the canonical rule is
+    // an exact match on the bare `position_embd.weight` /
+    // `token_types.weight` names for BERT-family arches. The later
+    // `.position_embd` substring rule catches multimodal SAM-style
+    // names with a leading dot (e.g. `v.position_embd`), so it does
+    // NOT cover this case.
+    name == "position_embd.weight"       // BERT
+        || name == "token_types.weight"  // BERT
+        || name.contains("_norm.weight")        // (3)
+        || name.contains("ffn_gate_inp.weight") // (4)
+        || name.contains("altup")        // (5)
+        || name.contains("laurel")       // (5)
+        || name.contains("per_layer_model_proj") // (5)
+        || name.contains("ssm_conv1d")   // (6)
+        || name.contains("shortconv.conv.weight") // (6)
         || name.contains("time_mix_first.weight")
         || name.contains("time_mix_w0.weight")
         || name.contains("time_mix_w1.weight")
@@ -1517,14 +1509,14 @@ fn is_f32_keep_tensor(name: &str, n_dims: usize) -> bool {
         || name.contains("time_mix_decay_w1.weight")
         || name.contains("time_mix_decay_w2.weight")
         || name.contains("time_mix_lerp_fused.weight")
-        || name.contains("attn_rel_b.weight")  // (6) llama-quant.cpp:343
-        || name.contains(".position_embd") // (6) llama-quant.cpp:346
-        || name.contains("sam.pos_embd")   // (6) llama-quant.cpp:347
-        || name.contains("sam.neck.")      // (6) llama-quant.cpp:348
-        || name.contains("sam.net_")       // (6) llama-quant.cpp:349
-        || name.contains(".rel_pos")       // (6) llama-quant.cpp:350
-        || name.contains(".patch_embd")    // (6) llama-quant.cpp:351
-        || name.contains(".patch_merger")  // (6) llama-quant.cpp:352
+        || name.contains("attn_rel_b.weight")  // (6)
+        || name.contains(".position_embd") // (6)
+        || name.contains("sam.pos_embd")   // (6)
+        || name.contains("sam.neck.")      // (6)
+        || name.contains("sam.net_")       // (6)
+        || name.contains(".rel_pos")       // (6)
+        || name.contains(".patch_embd")    // (6)
+        || name.contains(".patch_merger")  // (6)
         || name == "rope_freqs.weight" // (7) Gemma 4 synthesized
 }
 
@@ -1550,7 +1542,7 @@ pub struct StagedTensor {
 /// orchestrator directly; exists so callers (P3 integration tests,
 /// downstream P4 driver tests) have one stable entry point.
 pub fn convert_synthetic<W: Write + Seek>(
-    ftype: LlamaFtype,
+    ftype: GgufFtype,
     arch: ArchName,
     hparams: HParams,
     metadata: Vec<(String, MetaValue)>,
@@ -1614,7 +1606,7 @@ mod tests {
     #[test]
     fn smoke_q5_k_m_round_trip_via_reader() {
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ5_K_M,
+            GgufFtype::MostlyQ5_K_M,
             ArchName::Llama3,
             default_hparams(),
         );
@@ -1738,7 +1730,7 @@ mod tests {
     #[test]
     fn vision_pattern_emits_f16_skipping_policy() {
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ5_K_M,
+            GgufFtype::MostlyQ5_K_M,
             ArchName::Gemma4Mmproj,
             default_hparams(),
         );
@@ -1804,7 +1796,7 @@ mod tests {
     #[test]
     fn bf16_storage_is_dense_and_has_no_quantizer_roundtrip() {
         let mut orch =
-            ConvertOrchestrator::new(LlamaFtype::BF16, ArchName::Llama3, default_hparams());
+            ConvertOrchestrator::new(GgufFtype::BF16, ArchName::Llama3, default_hparams());
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("llama".into()),
@@ -1834,7 +1826,7 @@ mod tests {
     #[test]
     fn ordinary_writer_does_not_allocate_or_update_evidence_hashers() {
         let mut orch =
-            ConvertOrchestrator::new(LlamaFtype::AllF32, ArchName::Llama3, default_hparams());
+            ConvertOrchestrator::new(GgufFtype::AllF32, ArchName::Llama3, default_hparams());
         orch.plan_tensors(vec![PlanEntry {
             name: "output_norm.weight".into(),
             shape: vec![4],
@@ -1864,7 +1856,7 @@ mod tests {
     #[test]
     fn unquantizable_row_surfaces_typed_error() {
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ5_K_M,
+            GgufFtype::MostlyQ5_K_M,
             ArchName::Llama3,
             default_hparams(),
         );
@@ -1898,7 +1890,7 @@ mod tests {
     #[test]
     fn stream_tensor_rejects_out_of_order() {
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ5_K_M,
+            GgufFtype::MostlyQ5_K_M,
             ArchName::Llama3,
             default_hparams(),
         );
@@ -1937,7 +1929,7 @@ mod tests {
     #[test]
     fn stream_tensor_rejects_wrong_length() {
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ5_K_M,
+            GgufFtype::MostlyQ5_K_M,
             ArchName::Llama3,
             default_hparams(),
         );
@@ -1964,7 +1956,7 @@ mod tests {
 
     fn one_deepseek_q2_tensor(shape: Vec<usize>) -> ConvertOrchestrator {
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ2_K_S,
+            GgufFtype::MostlyQ2_K_S,
             ArchName::Deepseek4,
             HParams {
                 n_expert: shape.last().copied().unwrap_or(0) as u32,
@@ -2176,7 +2168,7 @@ mod tests {
         const EXPERTS: usize = 256;
         const N_PER_ROW: usize = 256;
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ2_K_S,
+            GgufFtype::MostlyQ2_K_S,
             ArchName::Deepseek4,
             HParams {
                 n_expert: EXPERTS as u32,
@@ -2261,7 +2253,7 @@ mod tests {
     #[test]
     fn finalize_rejects_incomplete_stream() {
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ5_K_M,
+            GgufFtype::MostlyQ5_K_M,
             ArchName::Llama3,
             default_hparams(),
         );
@@ -2314,7 +2306,7 @@ mod tests {
         {
             let f = std::fs::File::create(tmp.path()).unwrap();
             convert_synthetic(
-                LlamaFtype::MostlyQ5_K_M,
+                GgufFtype::MostlyQ5_K_M,
                 ArchName::Llama3,
                 default_hparams(),
                 metadata,
@@ -2336,8 +2328,7 @@ mod tests {
     /// `<L>.ffn_down.weight` + `<L>.ffn_down_exps.weight` +
     /// `<L>.ffn_down_exps.scale` — all match the substring "ffn_down").
     ///
-    /// Canonical's `init_quantize_state_counters`
-    /// (`/opt/llama.cpp/src/llama-quant.cpp:837-852`) hardcodes
+    /// The canonical quantizer hardcodes
     /// `n_ffn_down = n_ffn_gate = n_ffn_up = hparams.n_layer` precisely
     /// to side-step this. Post-fix, hf2q does the same: the denominator
     /// must equal `n_layer` regardless of how many tensors classify
@@ -2360,7 +2351,7 @@ mod tests {
             n_mtp_layers: 0,
         };
         let mut orch =
-            ConvertOrchestrator::new(LlamaFtype::MostlyQ5_K_M, ArchName::Gemma4, hparams);
+            ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Gemma4, hparams);
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("gemma4".into()),
@@ -2455,7 +2446,7 @@ mod tests {
             n_mtp_layers: 0,
         };
         let mut orch =
-            ConvertOrchestrator::new(LlamaFtype::MostlyQ5_K_M, ArchName::Gemma4, hparams);
+            ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Gemma4, hparams);
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("gemma4".into()),
@@ -2512,7 +2503,7 @@ mod tests {
     #[test]
     fn empty_conversion_writes_header_only_gguf() {
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ5_K_M,
+            GgufFtype::MostlyQ5_K_M,
             ArchName::Llama3,
             default_hparams(),
         );
@@ -2761,7 +2752,7 @@ mod tests {
         // ---- Convert A: no imatrix ----
         let bytes_no_imatrix = {
             let mut orch =
-                ConvertOrchestrator::new(LlamaFtype::MostlyQ4_K_M, ArchName::Llama3, hparams);
+                ConvertOrchestrator::new(GgufFtype::MostlyQ4_K_M, ArchName::Llama3, hparams);
             orch.plan_tensors(entries()).expect("plan A");
             let mut buf = Vec::<u8>::new();
             {
@@ -2777,7 +2768,7 @@ mod tests {
         // ---- Convert B: same tensor + data, but with imatrix attached ----
         let bytes_with_imatrix = {
             let mut orch =
-                ConvertOrchestrator::new(LlamaFtype::MostlyQ4_K_M, ArchName::Llama3, hparams)
+                ConvertOrchestrator::new(GgufFtype::MostlyQ4_K_M, ArchName::Llama3, hparams)
                     .with_imatrix(Some(imatrix));
             orch.plan_tensors(entries()).expect("plan B");
             let mut buf = Vec::<u8>::new();
@@ -2826,7 +2817,7 @@ mod tests {
 
         // Construct an empty StreamingWriter just to exercise the helper.
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ4_K_M,
+            GgufFtype::MostlyQ4_K_M,
             ArchName::Llama3,
             default_hparams(),
         )
@@ -2856,7 +2847,7 @@ mod tests {
     /// Pin the `tensor_imatrix` aggregation policy for MoE tensors:
     /// the result must equal `(sum over experts of values[expert*npr + j]) / total_counts`.
     /// This is the row-uniform aggregate that quantize() consumes — losing
-    /// per-expert specificity vs. llama.cpp's quantize_row_id path, but
+    /// per-expert specificity vs. the peer's per-expert imatrix path, but
     /// the first-cut correct behavior for the current quantize() signature.
     #[test]
     fn p4b_tensor_imatrix_moe_aggregates_across_experts() {
@@ -2881,7 +2872,7 @@ mod tests {
         }
 
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ4_K_M,
+            GgufFtype::MostlyQ4_K_M,
             ArchName::Llama3,
             default_hparams(),
         )
@@ -2916,7 +2907,7 @@ mod tests {
     fn p4b_tensor_imatrix_missing_returns_none_mismatch_returns_err() {
         let imatrix = make_dense_imatrix("blk.0.attn_q.weight", 16, 7);
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ4_K_M,
+            GgufFtype::MostlyQ4_K_M,
             ArchName::Llama3,
             default_hparams(),
         )
@@ -2957,7 +2948,7 @@ mod tests {
     #[test]
     fn p4b_no_imatrix_attached_returns_none_for_everything() {
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ4_K_M,
+            GgufFtype::MostlyQ4_K_M,
             ArchName::Llama3,
             default_hparams(),
         );
@@ -3010,7 +3001,7 @@ mod tests {
         };
 
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ4_K_M,
+            GgufFtype::MostlyQ4_K_M,
             ArchName::Llama3,
             default_hparams(),
         )
@@ -3060,7 +3051,7 @@ mod tests {
         let imatrix = make_dense_imatrix(covered, n_per_row, 123);
 
         let mut orch = ConvertOrchestrator::new(
-            LlamaFtype::MostlyQ4_K_M,
+            GgufFtype::MostlyQ4_K_M,
             ArchName::Llama3,
             default_hparams(),
         )

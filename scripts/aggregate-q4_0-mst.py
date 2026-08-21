@@ -435,7 +435,7 @@ def shader_list_summary(rows: List[dict]) -> dict:
 # Why this exists:
 #   iter11 produced hf2q per-layer comparison via debug-group bucketing
 #   on metal-application-encoders-list, but llama side was unattributed
-#   (1 trace only, plus llama.cpp does not pushDebugGroup so no per-layer
+#   (1 trace only, plus the peer does not pushDebugGroup so no per-layer
 #   debug-group labels are available). iter12 adds a CLI-only per-encoder
 #   attribution path that works for BOTH binaries:
 #
@@ -443,7 +443,7 @@ def shader_list_summary(rows: List[dict]) -> dict:
 #     2. Filter to event-type="Encoding" and process matching the binary.
 #     3. Bucket by (cmdbuffer-label, encoder-label) — both are short generic
 #        names like "Command Buffer 0" / "Compute Command 0" / "Blit Command 0"
-#        because neither llama.cpp nor mlx-native sets MTLCommandBuffer.label
+#        because neither the peer nor mlx-native sets MTLCommandBuffer.label
 #        / MTLComputeCommandEncoder.label or pushes debug groups.
 #     4. The encoders-list duration is the encoder LIFETIME (host-side
 #        encoding wall-clock), NOT GPU execution time. For GPU time, JOIN
@@ -798,7 +798,7 @@ def median_encoder_summaries(per_trial: List[Dict[str, dict]], n_tokens_list: Li
 #      cmdbuffer_label).
 #   4. Report side-by-side hf2q vs llama (both should now carry semantic
 #      labels for hf2q; llama still emits generic "Command Buffer N" because
-#      llama.cpp does not setLabel — that's a comparable-axis issue but the
+#      the peer does not setLabel — that's a comparable-axis issue but the
 #      hf2q-side breakdown is the actionable signal for iter17 hypothesis
 #      ranking).
 #
@@ -1307,7 +1307,7 @@ def write_report(out_path: str, hf2q: dict, llama: dict, hf2q_trials: List[dict]
         lines.append("  Host time = encoder lifetime from metal-application-encoders-list")
         lines.append("  (encoding wall-clock, not GPU wall-clock — kept for reference).")
         lines.append("")
-        lines.append("Granularity caveat: both llama.cpp and mlx-native emit only generic encoder")
+        lines.append("Granularity caveat: both the peer and mlx-native emit only generic encoder")
         lines.append("  labels ('Compute Command N' / 'Blit Command N') — neither pushes debug")
         lines.append("  groups nor sets MTLObject labels.  Per-encoder attribution is therefore")
         lines.append("  COARSER than per-kernel; on a typical decode token both binaries emit a")
@@ -1392,7 +1392,7 @@ def write_report(out_path: str, hf2q: dict, llama: dict, hf2q_trials: List[dict]
         lines.append("  metal-gpu-submission-to-command-buffer-id (sub_id -> encoder_id) ->")
         lines.append("  metal-application-encoders-list (encoder_id -> cmdbuffer_label).")
         lines.append("")
-        lines.append("Comparable-axis caveat: llama.cpp does NOT setLabel on its CBs (verified")
+        lines.append("Comparable-axis caveat: the peer does NOT setLabel on its CBs (verified")
         lines.append("  iter15 Phase 0; iter16 §A.2 Phase 0 probe re-confirmed). llama rows here")
         lines.append("  bucket under generic 'Command Buffer N' phase names — so this table")
         lines.append("  shows hf2q's INTERNAL distribution across phases (the actionable signal")

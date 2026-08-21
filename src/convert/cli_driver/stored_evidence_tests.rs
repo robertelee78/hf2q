@@ -295,14 +295,14 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
     );
     for (selector, output_name, expected_embedding_type, expected_output_type, expected_ffn_type) in [
         (
-            QuantSelector::Standard(LlamaFtype::MostlyQ8_0),
+            QuantSelector::Standard(GgufFtype::MostlyQ8_0),
             "tiny-qwen-q8.gguf",
             "q8_0",
             "q8_0",
             "q8_0",
         ),
         (
-            QuantSelector::Standard(LlamaFtype::MostlyQ4_K_M),
+            QuantSelector::Standard(GgufFtype::MostlyQ4_K_M),
             "tiny-qwen-q4-k-m.gguf",
             "q4_k",
             "q6_k",

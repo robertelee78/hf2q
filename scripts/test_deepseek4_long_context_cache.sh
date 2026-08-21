@@ -20,7 +20,7 @@ TARGET_PROMPT_TOKENS=${TARGET_PROMPT_TOKENS:-121000}
 MIN_LONG_PROMPT_TOKENS=${MIN_LONG_PROMPT_TOKENS:-116000}
 MAX_LONG_PROMPT_TOKENS=${MAX_LONG_PROMPT_TOKENS:-125000}
 CALIBRATION_CHARS=${CALIBRATION_CHARS:-131072}
-# Historical source-bound M5 Max acceptance: llama.cpp (b10293-a1f96d4fc)
+# Historical source-bound M5 Max acceptance: the peer (b10293-a1f96d4fc)
 # processes the same 121K-class prompt in roughly 556 s (217.5 tok/s).
 # Keep a small variance margin while still failing any regression to the old
 # hf2q path, which returned no bytes before its 600 s client timeout.

@@ -5,8 +5,8 @@
 //! named errors (same pattern as ADR-012 P1's config.json parser).
 //!
 //! References (read-only spec sources per sovereignty):
-//!   - `/opt/llama.cpp/tools/mtmd/clip-model.h` — GGUF metadata key conventions
-//!   - `/opt/llama.cpp/tools/mtmd/clip.cpp` — projector type string table
+//!   - the peer's `clip-model.h` — GGUF metadata key conventions
+//!   - the peer's `clip.cpp` — projector type string table
 //!   - HF `transformers/src/transformers/models/clip/configuration_clip.py`
 
 use serde_json::Value;
@@ -40,7 +40,7 @@ pub enum VisionConfigError {
 ///
 /// All fields from `clip-model.h`'s `clip.vision.*` metadata. Extensible
 /// via `Option<T>` for known-optional keys (e.g. layer_norm_eps has a
-/// documented default in llama.cpp).
+/// documented default in the peer).
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisionConfig {
     /// ViT hidden (embedding) dim — GGUF `clip.vision.embedding_length`.
@@ -76,9 +76,9 @@ pub struct VisionConfig {
     /// degree (typically `2`, giving 2×2 patch fold + 4× token
     /// reduction). `None` for non-Qwen3-VL profiles. Source HF key:
     /// `vision_config.spatial_merge_size`. Source GGUF key:
-    /// `clip.vision.spatial_merge_size` (Keys.ClipVision.SPATIAL_MERGE_SIZE
-    /// at `/opt/llama.cpp/gguf-py/gguf/constants.py:315`). Writer ref:
-    /// `add_vision_spatial_merge_size` at gguf_writer.py:1178-1179.
+    /// `clip.vision.spatial_merge_size`
+    /// (Keys.ClipVision.SPATIAL_MERGE_SIZE; written by the canonical
+    /// `add_vision_spatial_merge_size` helper).
     pub spatial_merge_size: Option<u32>,
     /// `vision_config.deepstack_visual_indexes` — sorted ascending list
     /// of layer indexes (0-based) whose ViT hidden state is fed into
@@ -87,9 +87,9 @@ pub struct VisionConfig {
     /// `deepstack_visual_indexes`. Empty `Vec` when the key is present
     /// but no layer is flagged. Emitted to GGUF as a length-`block_count`
     /// `Bool[]` array under `clip.vision.is_deepstack_layers`
-    /// (Keys.ClipVision.IS_DEEPSTACK_LAYERS at constants.py:320), the
-    /// SAME format llama.cpp's `Qwen3VLVisionModel.set_gguf_parameters`
-    /// emits at convert_hf_to_gguf.py:4895-4896:
+    /// (Keys.ClipVision.IS_DEEPSTACK_LAYERS), the
+    /// SAME format the peer's `Qwen3VLVisionModel.set_gguf_parameters`
+    /// emits:
     ///
     /// ```python
     /// if self.is_deepstack_layers:
@@ -104,7 +104,7 @@ pub struct VisionConfig {
     /// patch stem produces TWO separate patch_embd weights (one per
     /// temporal frame) when `temporal_patch_size == 2`. Defaults to
     /// `2` for Qwen3-VL family per
-    /// `/opt/llama.cpp/convert_hf_to_gguf.py:4959-4960`. `None` for
+    /// the canonical converter. `None` for
     /// CLIP-classic / Gemma 4 (single-frame patch stem).
     pub temporal_patch_size: Option<u32>,
 }
@@ -279,7 +279,7 @@ impl VisionConfig {
                     }
                     // Wedge-4f Phase-2c (Codex review of 9e9e262, finding #2,
                     // medium): preserve HF config order. Peer implementations
-                    // (llama.cpp, vLLM, Candle) all enumerate
+                    // all enumerate
                     // `deepstack_visual_indexes` in HF order to attach
                     // DeepStack heads at the correct absolute layers.
                     // Sorting silently breaks `visual.deepstack_merger_list.{rel_idx}`
@@ -312,14 +312,13 @@ impl VisionConfig {
         // dispatch and causing Qwen3VlViTConfig::from_mmproj to reject.
         //
         // Detect Qwen3-VL family via TWO independent upstream signals
-        // mirroring llama.cpp's Qwen3VLVisionModel gate:
+        // mirroring the peer's Qwen3VLVisionModel gate:
         //   (a) vision_config.model_type == "qwen3_vl" (canonical HF
         //       Qwen3-VL), or
         //   (b) deepstack_visual_indexes presence (the unique-to-Qwen3-VL
         //       config key — same fallback used by `is_qwen3vl()`).
         // When either fires, force projector_type to "qwen3vl_merger"
-        // (the canonical GGUF projector_type string per
-        // /opt/llama.cpp/tools/mtmd/clip.cpp:865-867) regardless of
+        // (the canonical GGUF projector_type string) regardless of
         // whether the HF config carries a (different) projector_type
         // string.
         let model_type = vc
@@ -349,7 +348,7 @@ impl VisionConfig {
             deepstack_visual_indexes = Some(Vec::new());
         }
 
-        // projection_dim resolution order matches what llama.cpp's
+        // projection_dim resolution order matches what the peer's
         // MmprojModel.set_gguf_parameters does — read from the FIRST
         // available source: vision_config.projection_dim → vision_config
         // .out_hidden_size (Qwen3-VL canonical, e.g. 2048 for Qwen3-VL-2B)
@@ -445,9 +444,8 @@ impl VisionConfig {
     /// matching layer index appears in `deepstack_visual_indexes`.
     /// Returns `None` when `deepstack_visual_indexes` is `None` (the
     /// non-Qwen3-VL case — the GGUF key is then OMITTED entirely, NOT
-    /// emitted as all-false, matching llama.cpp's
-    /// `Qwen3VLVisionModel.set_gguf_parameters` at
-    /// `/opt/llama.cpp/convert_hf_to_gguf.py:4895-4896`:
+    /// emitted as all-false, matching the peer's
+    /// `Qwen3VLVisionModel.set_gguf_parameters`:
     ///
     ///     if self.is_deepstack_layers:
     ///         self.gguf_writer.add_vision_is_deepstack_layers(...)
@@ -699,8 +697,8 @@ mod tests {
     #[test]
     fn deepstack_indexes_preserve_hf_order_unsorted_input() {
         // RENAMED + SEMANTICS FLIPPED for Wedge-4f Phase-2c (Codex Phase-2b
-        // finding #2, medium): peer implementations (llama.cpp converter,
-        // vLLM, Candle) all preserve HF config order when remapping
+        // finding #2, medium): peer implementations
+        // all preserve HF config order when remapping
         // `visual.deepstack_merger_list.{rel_idx}` → absolute layer
         // indexes. Sorting silently breaks the remap for any unsorted
         // producer config. The pre-Phase-2c `sort_unstable()` was

@@ -41,11 +41,11 @@ pub struct Gemma4Config {
     // The field and its default value of `0.25` were introduced under the
     // misreading that Gemma 4 global-layer RoPE rotates only the first
     // `head_dim * partial_rotary_factor` elements of each head vector.
-    // llama.cpp's Gemma 4 path (`src/models/gemma4-iswa.cpp:49,73-75,97-98`)
+    // The peer's Gemma 4 path
     // and the GGUF metadata (`gemma4.rope.dimension_count = 512 = head_dim`)
     // show the opposite: global layers rotate the FULL head_dim with a
-    // per-pair `freq_factors` mask loaded from `rope_freqs.weight`
-    // (`src/llama-model.cpp:4311-4313`). Elements [64..256) of the mask
+    // per-pair `freq_factors` mask loaded from `rope_freqs.weight`.
+    // Elements [64..256) of the mask
     // are `1e+30`, which drives their rotation angle to ~0 via
     // `theta / freq_factor`, producing identity rotation on those pair
     // indices — numerically equivalent to "partial rotary" but structurally

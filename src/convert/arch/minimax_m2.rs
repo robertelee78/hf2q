@@ -1,10 +1,7 @@
 //! MiniMax-M2.7 HF→GGUF tensor-name + metadata mapper.
 //!
-//! Port of `/opt/llama.cpp/conversion/minimax.py::MiniMaxM2Model`
-//! (`@ModelBase.register("MiniMaxM2ForCausalLM")`,
-//! `model_arch = gguf.MODEL_ARCH.MINIMAXM2`) and its inherited
-//! `TextModel::set_gguf_parameters` chain plus MiniMax-specific
-//! overlay (`minimax.py:18-22`):
+//! Canonical MiniMax-M2 name mapping plus the common text-model
+//! metadata keys and the MiniMax-specific overlay:
 //!
 //! ```python
 //! self.gguf_writer.add_expert_feed_forward_length(self.find_hparam(["intermediate_size"]))
@@ -226,8 +223,8 @@ pub fn map_tensor_name(hf_name: &str) -> Option<MappedTensor> {
             });
         }
         // Real MiniMax-M2 HF checkpoints emit this as
-        // `e_score_correction_bias` (single token; canonical
-        // `/opt/llama.cpp/conversion/base.py:537-538` renames the
+        // `e_score_correction_bias` (single token; the canonical
+        // converter renames the
         // `_bias` suffix to `.bias` before mapping). Mirrors GGUF
         // `MODEL_TENSOR.FFN_EXP_PROBS_B` named `blk.{bid}.exp_probs_b`
         // with the standard `.bias` suffix.
@@ -326,7 +323,7 @@ fn match_dense_suffix(rest: &str) -> Option<&'static str> {
 ///     `minimax-m2.expert_used_count`. (`base.py:1197`)
 ///   - `_name_or_path` — defaults to `"model"`
 ///
-/// `file_type` is the chosen `LlamaFtype` as a `u32`.
+/// `file_type` is the chosen `GgufFtype` as a `u32`.
 pub fn build_metadata(
     config: &serde_json::Value,
     file_type: u32,

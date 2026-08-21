@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Model-free contract for the matched llama.cpp cold-wave harness.
+# Model-free contract for the matched peer cold-wave harness.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 tmp=$(mktemp -d -t hf2q-peer-wave-contract.XXXXXX)

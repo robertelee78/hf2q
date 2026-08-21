@@ -1,18 +1,14 @@
 //! NomicBert (nomic-embed-text v1 / v1.5 / v2-moe) HF→GGUF tensor-name
 //! + metadata mapper.
 //!
-//! Port of `/opt/llama.cpp/conversion/bert.py::NomicBertModel`'s name
-//! mapping (transitively via `BertModel::modify_tensors` →
-//! `gguf-py/gguf/tensor_mapping.py`) and `set_gguf_parameters`. Covers
+//! Canonical NomicBert name mapping and metadata. Covers
 //! BOTH the dense v1.5 path AND the v2-moe path (with caveats called
 //! out in the table below).
 //!
 //! Per ADR-033 §P0 "Per-arch convert-side mapping": this is the
 //! convert-side tensor-name + KV mapper for `LLM_ARCH_NOMIC_BERT`.
 //!
-//! NomicBert highlights (vs plain BERT, verified against
-//! `/opt/llama.cpp/gguf-py/gguf/tensor_mapping.py` lines 233/326/345/495/555/624/710
-//! and `conversion/bert.py::NomicBertModel.__init__` lines 340-354):
+//! NomicBert highlights (vs plain BERT):
 //!
 //!   - **Fused QKV.** The three Q/K/V projections live in one packed
 //!     tensor `encoder.layers.<N>.attn.Wqkv` (no `query`/`key`/`value`
@@ -40,7 +36,7 @@
 //!     their `.bias` half (standard LayerNorm has γ + β).
 //!   - **Mean pooling.** Nomic embeddings are mean-pooled over tokens;
 //!     emitted as `nomic-bert.pooling_type = u32 1` (MEAN). Matches
-//!     llama.cpp's `LLAMA_POOLING_TYPE_MEAN`.
+//!     the peer's MEAN pooling type.
 //!
 //! Per [[feedback-no-backwards-compat-2026-05-18]]: no fallback / no
 //! aliasing — every HF name we recognize maps to exactly one GGUF name,
@@ -89,10 +85,8 @@ pub enum MappedTensor {
     /// Emit under the given GGUF tensor name with a post-load
     /// [`BakeOp`] transform.
     DirectWithBake { gguf_name: String, bake: BakeOp },
-    /// Canonical drops this tensor in
-    /// `/opt/llama.cpp/conversion/bert.py` (`BertModel.filter_tensors`
-    /// at `bert.py:72-92` or `NomicBertModel.filter_tensors` at
-    /// `bert.py:362-369`). Do not error; just skip.
+    /// The canonical converter drops this tensor. Do not error; just
+    /// skip.
     Drop,
 }
 
@@ -102,8 +96,8 @@ pub enum MappedTensor {
 ///
 /// Accepts an optional `bert.` HF prefix (some checkpoints — typically
 /// those exported from a wrapping `BertForMaskedLM`-style head — carry
-/// it; nomic-embed-text-v1/v1.5 typically does not). Mirrors the strip
-/// in `BertModel.filter_tensors` (`/opt/llama.cpp/conversion/bert.py:72-73`).
+/// it; nomic-embed-text-v1/v1.5 typically does not). Mirrors the
+/// canonical prefix strip.
 ///
 /// NomicBert weight kinds. v1.5 columns vs v2-moe columns:
 ///
@@ -132,23 +126,23 @@ pub enum MappedTensor {
 /// | `encoder.layers.<N>.norm2.bias`                  | `blk.<N>.layer_output_norm.bias`     |  ✓   |   ✓    |
 ///
 /// `†` Dense FFN layers only (those where `bid % moe_every_n_layers != 0`
-/// in v2-moe; canonical bert.py:340 asserts `activation_function == "gelu"`
+/// in v2-moe; the canonical converter asserts
+/// `activation_function == "gelu"`
 /// when `is_moe`, so the v2-moe dense path is GELU and uses fc1/fc2 with
 /// biases). MoE layers don't have fc1/fc2.
 ///
 /// `‡` MoE layers only (`mlp.router.layer.weight` is the routing
-/// projection; emitted as `ffn_gate_inp.weight` per
-/// `tensor_mapping.py:438-442`).
+/// projection; emitted as `ffn_gate_inp.weight`).
 ///
 /// Returns `Some(MappedTensor::Drop)` for:
-///   - `mlp.experts.bias` — canonical `NomicBertModel.filter_tensors`
-///     drops this single-vector expert bias at `bert.py:366-369`.
-///     Not loaded by llama.cpp's nomic-bert-moe inference path.
-///   - `pooler.dense.weight/bias` — canonical `BertModel.filter_tensors`
-///     drops the pooler (`bert.py:74-81`).
+///   - `mlp.experts.bias` — the canonical converter
+///     drops this single-vector expert bias.
+///     Not loaded by the peer's nomic-bert-moe inference path.
+///   - `pooler.dense.weight/bias` — the canonical converter
+///     drops the pooler.
 ///   - `embeddings.position_embeddings.weight` — unused on NomicBert
-///     (RoPE replaces absolute positions); canonical drops it via
-///     `BertModel.filter_tensors` at `bert.py:82-90`.
+///     (RoPE replaces absolute positions); the canonical converter
+///     drops it.
 ///
 /// Returns `None` (`Unmapped` at caller) for:
 ///   - `encoder.layers.<N>.mlp.experts.mlp.w1` /
@@ -230,8 +224,8 @@ pub fn map_tensor_name(
     let rest = &rest_with_dot[1..]; // skip the dot
 
     // `mlp.experts.bias` is a single (n_embd,) shared expert bias that
-    // NomicBertModel.filter_tensors at `bert.py:366-369` drops. NOT a
-    // per-expert bias — llama.cpp's nomic-bert-moe inference doesn't
+    // the canonical converter drops. NOT a
+    // per-expert bias — the peer's nomic-bert-moe inference doesn't
     // consume it.
     if rest == "mlp.experts.bias" {
         return Some(MappedTensor::Drop);
@@ -397,17 +391,13 @@ pub fn build_metadata(
     // NomicBert has no GQA — head_count_kv == head_count.
     let n_head_kv = n_head;
 
-    // Detect MoE via presence of `moe_every_n_layers` (canonical
-    // `bert.py:323`: `self.is_moe = bool(hparams.get("moe_every_n_layers"))`).
+    // Detect MoE via presence of `moe_every_n_layers`.
     // On the v2-moe code path: switch the architecture name to
-    // `nomic-bert-moe` (canonical `MODEL_ARCH.NOMIC_BERT_MOE` at
-    // `bert.py:324`) and emit the three MoE-specific KV pairs that
-    // llama.cpp's nomic-bert-moe loader requires:
-    //   - `<arch>.expert_count` (`num_experts` or `num_local_experts`,
-    //     base TextModel.set_gguf_parameters at `base.py:1194-1196`)
-    //   - `<arch>.expert_used_count` (`moe_top_k`, NomicBertModel at
-    //     `bert.py:388`)
-    //   - `<arch>.moe_every_n_layers` (NomicBertModel at `bert.py:387`)
+    // `nomic-bert-moe` and emit the three MoE-specific KV pairs that
+    // the peer's nomic-bert-moe loader requires:
+    //   - `<arch>.expert_count` (`num_experts` or `num_local_experts`)
+    //   - `<arch>.expert_used_count` (`moe_top_k`)
+    //   - `<arch>.moe_every_n_layers`
     let moe_every_n = config
         .get("moe_every_n_layers")
         .and_then(|v| v.as_u64())
@@ -789,8 +779,7 @@ mod tests {
 
     /// Acceptance test 1c — v2-moe block-level patterns: biased
     /// attention, GELU dense FFN (fc1/fc2), router, and `mlp.experts.bias`
-    /// drop. Mirrors `/opt/llama.cpp/conversion/bert.py::NomicBertModel`
-    /// at the v2-moe `is_moe=True` branch.
+    /// drop. Mirrors the canonical v2-moe (`is_moe=True`) branch.
     #[test]
     fn nomic_bert_v2_moe_block_patterns_map() {
         // Biased attention (Wqkv + out_proj) — v2-moe only.
@@ -853,7 +842,6 @@ mod tests {
 
     /// Acceptance test 1e — v2-moe expert weight tensors map to
     /// `DirectWithBake` carrying the canonical reshape / transpose.
-    /// Mirrors `/opt/llama.cpp/conversion/bert.py:373-380`.
     ///
     /// Real safetensors shape for nomic-embed-text-v2-moe is
     /// `[n_experts=8, n_inner=3072, n_embd=768]` (verified at

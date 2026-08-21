@@ -1,24 +1,24 @@
 //! Shared helper functions used across the ggml-quants kernel ports.
 //!
-//! Each helper here is a 1:1 pure-Rust port of a primitive from
-//! `/opt/llama.cpp/ggml/src/ggml-quants.c`. Consolidating them into a
+//! Each helper here is a 1:1 pure-Rust port of a peer quantizer
+//! primitive. Consolidating them into a
 //! single source eliminates the latent-divergence bug class flagged by
 //! codex at `0bd0e7eb` (parallel kernel-port workers each ported their
 //! own copies; subtle finalize-block / d==0 differences crept in).
 //!
 //! The byte-cmp gates in each per-type submodule (`q*_*::tests::byte_cmp*`)
 //! cover this file transitively — any drift here surfaces immediately
-//! against the llama.cpp `ggml_quantize_chunk` reference fixtures.
+//! against the peer's `ggml_quantize_chunk` reference fixtures.
 
-/// `GROUP_MAX_EPS` at `ggml-quants.c:16`. Threshold below which an
+/// The peer's `GROUP_MAX_EPS`. Threshold below which an
 /// absolute-max scan is treated as the zero-block case.
 pub const GROUP_MAX_EPS: f32 = 1e-15;
 
-/// `nearest_int` at `ggml-quants.c:559`.
+/// The peer's `nearest_int`.
 ///
 /// The C version uses a bit-cast trick that rounds via the float-to-int
 /// hardware mode (RNE). We mirror the bitcast exactly so the rounding
-/// boundary behaviour is identical to llama.cpp.
+/// boundary behaviour is identical to the peer's.
 #[inline(always)]
 pub fn nearest_int(fval: f32) -> i32 {
     debug_assert!(fval.abs() <= 4_194_303.0);
@@ -27,7 +27,7 @@ pub fn nearest_int(fval: f32) -> i32 {
     (i & 0x007f_ffff) - 0x0040_0000
 }
 
-/// `best_index_int8` at `ggml-quants.c:24-33` — bisection over a
+/// The peer's `best_index_int8` — bisection over a
 /// monotonic codebook, picking the nearer of the two bracketing values.
 #[inline]
 pub fn best_index_int8(val: &[i8], x: f32) -> usize {
@@ -54,7 +54,7 @@ pub fn best_index_int8(val: &[i8], x: f32) -> usize {
     }
 }
 
-/// `make_qx_quants` at `ggml-quants.c:566`.
+/// The peer's `make_qx_quants`.
 ///
 /// Used by Q4_0 (`rmse_type=1`), Q3_K (`rmse_type=1`), Q6_K (`rmse_type=1`).
 /// `qw` may be empty for the `rmse_type`-derived weight fallback.
@@ -172,7 +172,7 @@ pub fn make_qx_quants(
     scale
 }
 
-/// `make_qkx2_quants` — `ggml-quants.c:737-816`.
+/// The peer's `make_qkx2_quants`.
 ///
 /// Returns `scale`; writes `-min` through `the_min`. Used by Q2_K /
 /// Q4_K / Q5_K's `_ref` paths.
@@ -295,7 +295,7 @@ pub fn make_qkx2_quants(
     scale
 }
 
-/// `make_qkx3_quants` — `ggml-quants.c:931-1012`.
+/// The peer's `make_qkx3_quants`.
 ///
 /// Like `make_qkx2_quants` but `weights` is optional. When `weights ==
 /// None`, falls back to `x[i] * x[i]`. Used by Q4_1 / Q5_1 / Q2_K /
@@ -418,7 +418,7 @@ pub fn make_qkx3_quants(
     scale
 }
 
-/// `make_qp_quants` — `ggml-quants.c:1014-1085`.
+/// The peer's `make_qp_quants`.
 ///
 /// Positive-only quant search; returns the chosen scale `d`. Used by
 /// Q2_K / Q4_K / Q5_K to quantize the per-sub-block `scales` / `mins`
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn group_max_eps_value() {
-        // Tracks `ggml-quants.c:16` literal.
+        // Tracks the peer's `GROUP_MAX_EPS` literal.
         assert_eq!(GROUP_MAX_EPS, 1e-15);
     }
 
@@ -595,7 +595,7 @@ mod tests {
     /// test a regression-guard against future kernel drift; do not chase
     /// the older 0x3b11a2a8 value — that path is no longer authoritative.
     ///
-    /// **Disassembly-verified codegen** (2026-05-20, /opt/llama.cpp HEAD
+    /// **Disassembly-verified codegen** (2026-05-20, peer HEAD
     /// `e15384a5c`, Apple clang `-O3 -DNDEBUG -arch arm64`, NO `-march`):
     /// in `quantize_row_q6_K_ref` (`_quantize_row_q6_K_ref` symbol,
     /// `ggml-quants.c.o`):

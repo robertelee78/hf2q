@@ -298,7 +298,7 @@ pub fn delta_net_layer_cpu_ref(
 
     // 6. L2 norm Q and K per-head (over D_k), then scale Q by 1/sqrt(D_k).
     //
-    // llama.cpp delta-net-base.cpp build_delta_net_{autoregressive,chunking}:
+    // The peer's build_delta_net_{autoregressive,chunking}:
     //   const float scale = 1.0f / sqrtf(S_k);
     //   q = ggml_scale(ctx0, q, scale);   // applied after ggml_l2_norm
     //
@@ -334,7 +334,7 @@ pub fn delta_net_layer_cpu_ref(
     for t in 0..seq {
         for h_idx in 0..nv {
             let a_logit = alpha_logits[t * nv + h_idx] + weights.ssm_dt_bias[h_idx];
-            // ssm_a_gguf stores -exp(A_log) (negated in llama.cpp convert_hf_to_gguf.py).
+            // ssm_a_gguf stores -exp(A_log) (negated by the peer's HF converter).
             // HF formula: g = softplus(delta) * exp(A_log)
             // GGUF:        ssm_a = -exp(A_log), so exp(A_log) = -ssm_a
             // Therefore:   g = softplus(delta) * (-ssm_a[h_idx])
@@ -399,9 +399,8 @@ pub fn delta_net_layer_cpu_ref(
     //    ssm_norm has shape [D_v] and is BROADCAST across all n_v_heads per token.
     //    For each token and each value head, RMSNorm is applied independently over
     //    the D_v elements of that head using the same ssm_norm weights.
-    //    Gate uses SiLU (x * sigmoid(x)) matching llama.cpp's build_norm_gated:
+    //    Gate uses SiLU (x * sigmoid(x)) matching the peer's build_norm_gated:
     //      ggml_silu(ctx0, gate) — SiLU, not plain sigmoid.
-    //    See llama.cpp qwen35moe.cpp::build_layer_attn_linear.
     assert_eq!(
         weights.ssm_norm.len(),
         dv,
@@ -418,7 +417,7 @@ pub fn delta_net_layer_cpu_ref(
             for d in 0..dv {
                 let z_val = z[head_off + d];
                 // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-                // Matches llama.cpp build_norm_gated: ggml_silu(ctx0, gate)
+                // Matches the peer's build_norm_gated: ggml_silu(ctx0, gate)
                 let z_silu = z_val / (1.0 + (-z_val).exp());
                 gated[head_off + d] = normed[d] * z_silu;
             }

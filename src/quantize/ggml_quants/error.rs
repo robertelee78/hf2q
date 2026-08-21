@@ -37,19 +37,19 @@ pub enum QuantizeError {
     NotRowAligned { src_len: usize, n_per_row: usize },
 
     /// Imatrix vector length doesn't match `n_per_row`. Per
-    /// llama.cpp's convention (and codex's 0bd0e7eb review), the
+    /// the peer's convention (and codex's 0bd0e7eb review), the
     /// imatrix is per-row (length `n_per_row`), reused across rows
     /// without advancement.
     #[error("imatrix len {im_len} must equal n_per_row {n_per_row} (per-row weights)")]
     ImatrixLenMismatch { n_per_row: usize, im_len: usize },
 
-    /// Numeric `u32` value didn't decode to a known `LlamaFtype`.
-    #[error("unknown llama_ftype value {0} (not in supported set)")]
-    UnknownLlamaFtype(u32),
+    /// Numeric `u32` value didn't decode to a known `GgufFtype`.
+    #[error("unknown ftype value {0} (not in supported set)")]
+    UnknownGgufFtype(u32),
 
     /// `StandardPolicy::target_for` couldn't parse `blk.<N>.` out of an
     /// MoE expert tensor's name, or the parsed layer was out of range.
-    /// Port of the runtime_error at `llama-quant.cpp:427-432`.
+    /// Port of the peer's matching runtime_error.
     #[error("bad/missing layer index for tensor {name} (n_layer = {n_layer})")]
     BadLayerForTensor { name: String, n_layer: i32 },
 }

@@ -142,16 +142,16 @@ impl LoadedMmprojWeights {
         // -------------------------------------------------------------------
         // Wedge-4c.5: fused `attn_qkv` → split `attn_q/k/v` slice views.
         //
-        // /opt/llama.cpp/convert_hf_to_gguf.py:4853-4972 emits Qwen3-VL's
-        // ViT QKV as a single fused tensor named `v.blk.{N}.attn_qkv.weight`
-        // (and optional `.bias`) per /opt/llama.cpp/tools/mtmd/clip-impl.h:78.
+        // The peer's HF converter emits Qwen3-VL's ViT QKV as a single
+        // fused tensor named `v.blk.{N}.attn_qkv.weight`
+        // (and optional `.bias`).
         // The runtime forward consumer at vit_gpu_qwen3vl.rs requests split
         // tensors by name (`attn_q.weight`, `attn_k.weight`, `attn_v.weight`)
         // — so when we detect a fused tensor, we install three slice-view
         // buffers under those split names. The slice views share the
         // fused tensor's underlying Metal buffer; no extra copy is paid.
         //
-        // Layout (per /opt/llama.cpp/tools/mtmd/clip.cpp:339-352):
+        // Layout (matches the peer's fused-QKV convention):
         //   fused weight `[3*hidden, hidden]` row-major (output dim first
         //   per hf2q's vit_linear_gpu convention) — Q rows are
         //   `[0..hidden][0..hidden]`, K rows `[hidden..2*hidden][0..hidden]`,
@@ -469,17 +469,17 @@ impl LoadedMmprojWeights {
     /// "ffn_down.weight", etc. — see `BLOCK_REQUIRED_SUFFIXES`).
     ///
     /// W41 iter-116i: vision-namespace tensor names migrated to
-    /// llama.cpp's short-form convention in W34 iter-116e (writer
+    /// the peer's short-form convention in W34 iter-116e (writer
     /// side) but the runtime forward path still uses the
     /// pre-migration suffixes. `block_tensor` accepts both: if the
     /// caller asks for a legacy name we fall back to the canonical
     /// short form. The mapping is bidirectional so a producer
     /// emitting either convention loads cleanly.
     ///
-    /// Mappings (legacy ↔ canonical short form, per
-    /// `/opt/llama.cpp/tools/mtmd/clip-impl.h`):
-    ///   - `attn_output.{w,b}`  ↔ `attn_out.{w,b}`     (TN_ATTN_OUTPUT, l.82)
-    ///   - `post_ffw_norm.{w,b}` ↔ `ffn_post_norm.{w,b}` (TN_FFN_POST_NORM, l.95)
+    /// Mappings (legacy ↔ canonical short form, per the peer's mmproj
+    /// naming):
+    ///   - `attn_output.{w,b}`  ↔ `attn_out.{w,b}`
+    ///   - `post_ffw_norm.{w,b}` ↔ `ffn_post_norm.{w,b}`
     pub fn block_tensor(&self, layer_idx: usize, suffix: &str) -> Result<&MlxBuffer> {
         let key = vit_layer_tensor(layer_idx, suffix);
         if let Some(b) = self.tensors.get(&key) {
@@ -509,12 +509,11 @@ impl LoadedMmprojWeights {
     /// Projector head weight tensor.
     ///
     /// W41 iter-116i: looks up the CLIP-classic name `mm.0.weight` first,
-    /// then falls back to gemma4v's `mm.input_projection.weight`
-    /// (`TN_MM_INP_PROJ` at `/opt/llama.cpp/tools/mtmd/clip-impl.h:110`).
+    /// then falls back to gemma4v's `mm.input_projection.weight`.
     /// Both name back the same logical tensor — the writer chose the
-    /// projector-specific base per llama.cpp convention (clip.cpp:1937
-    /// hard-requires `mm.input_projection` for `PROJECTOR_TYPE_GEMMA4V`),
-    /// and the runtime forward path uses whichever is present.
+    /// projector-specific base per the peer's convention (which
+    /// hard-requires `mm.input_projection` for the gemma4v projector
+    /// type), and the runtime forward path uses whichever is present.
     ///
     /// The accessor name is preserved (`mm_0_weight`) for source-compat
     /// across `vit_gpu.rs` callers; the fallback is invisible to them.
@@ -544,14 +543,13 @@ impl LoadedMmprojWeights {
     // -----------------------------------------------------------------------
     // Gemma4ClippableLinear scalar bounds for `mm.0.weight`.
     //
-    // Per `/opt/llama.cpp/tools/mtmd/clip.cpp:1935-1959`, gemma4v emits
-    // four optional scalar f32 tensors as siblings of `mm.0.weight`:
+    // Gemma4v mmproj files carry four optional scalar f32 tensors as
+    // siblings of `mm.0.weight`:
     //   - `mm.0.input_min`, `mm.0.input_max` (clamps applied BEFORE matmul)
     //   - `mm.0.output_min`, `mm.0.output_max` (clamps applied AFTER matmul)
     //
     // Each is a 1-element f32 tensor (the converter `unsqueeze(0)`s the
-    // 0-D scalar so GGUF round-trips it as a 1-D `[1]` tensor; see
-    // `/opt/llama.cpp/convert_hf_to_gguf.py:7851-7853`).
+    // 0-D scalar so GGUF round-trips it as a 1-D `[1]` tensor).
     //
     // Returns `Some(value)` when the tensor is present and decodes to
     // exactly one f32, else `None`. Callers compose the four into a
@@ -573,7 +571,7 @@ impl LoadedMmprojWeights {
     /// Read a clamp-scalar bound under either the CLIP-classic
     /// `mm.0.<suffix>` or the gemma4v `mm.input_projection.<suffix>`
     /// base name. W41 iter-116i: gemma4v's projector head is named
-    /// `mm.input_projection` (clip-impl.h:110 + clip.cpp:1937-1959),
+    /// `mm.input_projection`,
     /// so the optional clamp scalars share that base. Returns the
     /// first match in (`mm.0`, `mm.input_projection`) order.
     fn read_projector_scalar(&self, suffix: &str) -> Option<f32> {
@@ -588,7 +586,7 @@ impl LoadedMmprojWeights {
     /// Read the `mm.0.input_min` (or gemma4v's `mm.input_projection.input_min`)
     /// scalar bound (clamp BEFORE matmul). `None` when absent OR
     /// mis-shaped — caller treats absence as `f32::NEG_INFINITY` (no-op)
-    /// per llama.cpp's default.
+    /// per the peer's default.
     pub fn mm_0_input_min(&self) -> Option<f32> {
         self.read_projector_scalar("input_min")
     }
@@ -656,8 +654,8 @@ mod tests {
         assert_eq!(cfg.patch_size, 16);
         assert_eq!(cfg.hidden_size, 1152);
         // W41 iter-116i: hf2q-emitted gemma4 mmproj writes
-        // `clip.projector_type = "gemma4v"` (matches llama.cpp's
-        // `PROJECTOR_TYPE_GEMMA4V` literal at clip-impl.h:323).
+        // `clip.projector_type = "gemma4v"` (matches the peer's
+        // projector-type literal).
         // Pre-iter-116i the loader parsed this to `Other("gemma4v")`
         // and `is_supported()` returned false, blocking serve startup.
         assert_eq!(cfg.projector, ProjectorType::Gemma4v);
@@ -676,9 +674,8 @@ mod tests {
         assert!(weights.post_ln_weight().is_err());
         assert!(weights.mm_2_weight().is_err());
         // Every layer's arch-agnostic QKV+output suffixes present.
-        // W41/W42 iter-116i: vision-namespace short-form `attn_out` per
-        // `TN_ATTN_OUTPUT = "%s.blk.%d.attn_out.%s"`
-        // (`/opt/llama.cpp/tools/mtmd/clip-impl.h:82`); W34 iter-116e
+        // W41/W42 iter-116i: vision-namespace short-form `attn_out`
+        // (`v.blk.{N}.attn_out.*` per the peer's naming); W34 iter-116e
         // fixed the writer to emit this short form and `validate_tensor_set`
         // requires the same. The pre-iter-116e long-form
         // `attn_output.weight` is no longer present.

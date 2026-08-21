@@ -66,7 +66,7 @@ pub struct InvestigationEnv {
     ///
     /// Historical: ADR-009 (2026-04-16) classified this as "known-
     /// worse output" based on a measured 19× cache_k drift + 45×
-    /// sdpa_out drift vs llama.cpp. **REFUTED at HEAD** by ADR-028
+    /// sdpa_out drift vs the peer. **REFUTED at HEAD** by ADR-028
     /// iter-168 byte-identity test (`mlx-native` commit `a325827`,
     /// `tests/test_flash_attn_vec_f16_byte_identity.rs`):
     ///

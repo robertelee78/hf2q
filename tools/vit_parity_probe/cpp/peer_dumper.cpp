@@ -1,4 +1,4 @@
-// peer_dumper.cpp — llama.cpp ViT reference dumper for hf2q parity probe.
+// peer_dumper.cpp — peer ViT reference dumper for hf2q parity probe.
 //
 // ADR-005 Phase 2c iter 124 (W55).
 //
@@ -24,7 +24,7 @@
 //
 // Stages dumped (mapped to hf2q's vit_dump.rs taxonomy):
 //
-//   hf2q                    | llama.cpp tensor name
+//   hf2q                    | peer tensor name
 //   ────────────────────── ─|──────────────────────
 //   00_pre_patchify         | inp_raw_scaled        — [3, H, W] planar CHW,
 //                                                     post the two-step
@@ -53,9 +53,9 @@
 //
 // Note: `pooled` in gemma4v.cpp captures the tensor AFTER both pool +
 // sqrt(n_embd) scale. There's no separate `30_final_pool` checkpoint
-// pre-scale on llama.cpp's side. So our `30_final_pool` and
+// pre-scale on the peer's side. So our `30_final_pool` and
 // `31_pool_sqrt_scale` are aliases of the same `pooled` capture; the
-// diff binary will compare both hf2q stages against the same llama.cpp
+// diff binary will compare both hf2q stages against the same peer
 // reference, and divergence between them in hf2q indicates the scale
 // itself is broken.
 //
@@ -128,7 +128,7 @@ static int parse_args(int argc, char ** argv, args & out) {
 
 struct capture_state {
     fs::path dump_dir;
-    // Map from llama.cpp tensor name → hf2q stage name.
+    // Map from peer tensor name → hf2q stage name.
     // Layer-output entries are matched by prefix and constructed at
     // capture time (e.g. "layer_out-12" → "03_block_12").
     std::unordered_map<std::string, std::string> name_map;

@@ -34,8 +34,8 @@ pub struct TensorCatalogEntry {
     pub scope: LayerScope,
     /// Declared dtype. `Quantized` accepts any quantized block type.
     pub dtype: TensorDtype,
-    /// Source of truth citation (file:line in `/opt/llama.cpp/src/llama-arch.cpp`
-    /// or `convert_hf_to_gguf.py`). Comment-only; not enforced at runtime but
+    /// Source of truth citation (file:line in the peer's arch table
+    /// or converter). Comment-only; not enforced at runtime but
     /// REQUIRED for every catalog entry per ADR-012 mantra.
     pub citation: &'static str,
 }

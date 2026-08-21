@@ -135,7 +135,7 @@ fn map_quant_to_cli(quant: QuantType) -> &'static str {
         // would tolerate.
         QuantType::Q6_K => "q8",
         // Q4_K_M is the K-quant trajectory for Q4_0 today.  Same 4 bpw
-        // ballpark, same dispatch in candle/llama.cpp readers.
+        // ballpark, same dispatch in external GGUF readers.
         QuantType::Q4_K_M => "q4",
         // Q3_K_M is < 4 bpw — there is no legacy 3-bit quant on the
         // convert CLI.  Q4_0 is the safe minimum until P7 lands Q3_K

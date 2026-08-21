@@ -98,7 +98,7 @@ impl MudlerConfig {
     /// Look up one tensor name in the parsed map.
     ///
     /// Match policy mirrors stock `llama-quantize --tensor-type-file`
-    /// semantics (`std::regex_search` at `llama-quant.cpp:680-687`):
+    /// semantics (a `std::regex_search` upstream):
     /// for the simple literal patterns mudler ships
     /// (`blk.0.ffn_gate_exps=Q6_K`), this reduces to: the manifest
     /// key is a prefix or whole-name substring of the GGUF tensor

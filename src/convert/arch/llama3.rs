@@ -1,8 +1,6 @@
 //! Llama-3 HF→GGUF tensor-name + metadata mapper.
 //!
-//! Port of `/opt/llama.cpp/conversion/llama.py::LlamaModel`'s name
-//! mapping (transitively via `base.py::TextModel::modify_tensors` ->
-//! `gguf-py/gguf/tensor_mapping.py`) and `set_gguf_parameters`. Strictly
+//! Canonical Llama name mapping and metadata. Strictly
 //! the dense-decoder Llama-3 path — no Mistral / Llama4 / multimodal
 //! special-cases.
 //!
@@ -79,9 +77,8 @@ pub fn map_tensor_name(hf_name: &str) -> Option<String> {
 }
 
 /// Build the GGUF metadata KV pairs for a Llama-3 model from its HF
-/// `config.json`. Port of `conversion/llama.py::LlamaModel::set_gguf_parameters`
-/// + the `TextModel::set_gguf_parameters` base it `super()`s into
-/// (`/opt/llama.cpp/conversion/base.py:1111-1221`), restricted to the
+/// `config.json`. Canonical Llama metadata plus the common
+/// text-model base keys, restricted to the
 /// keys every Llama-3-8B class model actually carries.
 ///
 /// Required HF keys (mandatory; missing key → caller-side panic from
@@ -99,14 +96,13 @@ pub fn map_tensor_name(hf_name: &str) -> Option<String> {
 ///     IS optional in the HF schema — older Llama-2 architecture
 ///     configs may omit it. Default-to-num_heads mirrors HF's
 ///     `LlamaConfig.__init__` (`transformers/models/llama/configuration_llama.py`).
-///   - `rope_theta` — defaults to `10000.0` per llama.cpp's base.py
-///     read (it doesn't emit the KV if `rope_theta` is absent; we do,
+///   - `rope_theta` — defaults to `10000.0` (the canonical converter
+///     doesn't emit the KV if `rope_theta` is absent; we do,
 ///     because every Llama-3 we'll convert has it and the canonical
-///     pipeline emits `10000.0` as the implicit C default in
-///     `llama-hparams.cpp::llama_hparams_init`).
+///     pipeline falls back to `10000.0` as its implicit default).
 ///   - `_name_or_path` — defaults to `"model"`.
 ///
-/// `file_type` is the chosen `LlamaFtype` as a `u32` (matches
+/// `file_type` is the chosen `GgufFtype` as a `u32` (matches
 /// `gguf_writer.add_file_type(self.ftype)` at base.py:1220).
 pub fn build_metadata(
     config: &serde_json::Value,
@@ -158,7 +154,7 @@ pub fn build_metadata(
 
     // Optional with defaults — both keys can be absent on older Llama-2
     // class configs; Llama-3 always supplies them, but the mapper
-    // tolerates absence to match HF + llama.cpp behavior.
+    // tolerates absence to match HF + peer behavior.
     let n_head_kv = config
         .get("num_key_value_heads")
         .and_then(|v| v.as_u64())

@@ -2,8 +2,8 @@
 //!
 //! nomic-bert GGUFs ship the same WordPiece (WPM) vocab format that
 //! BERT uses — `tokenizer.ggml.model = "bert"`, `▁`-prefixed
-//! word-starter pieces, bare continuation pieces (per llama.cpp's
-//! `llm_tokenizer_wpm_session::tokenize`). The
+//! word-starter pieces, bare continuation pieces (per the peer's WPM
+//! tokenizer routine). The
 //! `bert::tokenizer::BertWpmTokenizer` is a byte-for-byte port of that
 //! routine and is reused as-is.
 //!

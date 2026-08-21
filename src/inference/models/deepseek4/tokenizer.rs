@@ -26,7 +26,7 @@ mod token_type {
 }
 
 /// Build the tokenizer solely from the converted artifact's embedded GGUF
-/// metadata, mirroring the same source consumed by llama.cpp.
+/// metadata, mirroring the same source consumed by the peer.
 pub fn build_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Tokenizer> {
     let model = gguf
         .metadata_string("tokenizer.ggml.model")

@@ -2,7 +2,7 @@
 //!
 //! Unlike `forward_prefill` (which loops per-token), this processes the
 //! entire prompt through each transformer layer in ONE batched session per
-//! layer, matching llama.cpp's default batched prefill kernel dispatch.
+//! layer, matching the peer's default batched prefill kernel dispatch.
 //!
 //! Key differences from per-token prefill:
 //! - Embedding: single dispatch gathers all seq_len rows
@@ -225,7 +225,7 @@ pub fn gemma_lcp_resume_worthwhile(
 // and head session (copy+final_norm, lm_head, softcap, argmax).  With
 // every op isolated, the sum of buckets accounts for the total prefill
 // wall-clock (modulo CPU encode overhead), so the "unaccounted" gap to
-// llama.cpp can be attributed category by category.
+// the peer can be attributed category by category.
 static PROFILE_FA_SW_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_FA_SW_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROFILE_FA_GL_NS: AtomicU64 = AtomicU64::new(0);
@@ -567,12 +567,12 @@ impl MlxModelWeights {
         // History: this was previously default-on at seq_len>=32 as a
         // workaround for Bug A (FA-D=512 BF16-Q argmax drift, Hemoglobin
         // loop at decode-pos ~70 on enumeration prompts).  ADR-032 Phase 1
-        // peer-kernel diff against llama.cpp's `kernel_flash_attn_ext`
+        // kernel diff against the peer's `kernel_flash_attn_ext`
         // showed that bug was specifically an *instantiation* deviation:
-        // llama.cpp's default `kernel_flash_attn_ext_f16_dk512_dv512` uses
+        // the peer's default `kernel_flash_attn_ext_f16_dk512_dv512` uses
         // `FA_TYPES` (Q/K/V all `half`/F16 in shmem), and only the explicit
         // BF16-KV-cache instantiation (`FA_TYPES_BF`) uses `bfloat`.
-        // Gemma 4's default KV cache is F16 in llama.cpp, so peer's
+        // Gemma 4's default KV cache is F16 in the peer, so the peer's
         // production path is F16-Q-in-shmem — NOT BF16.  Our prior NO_FA
         // default routed around the FA path entirely; ADR-032 instead
         // fixes the kernel-instantiation deviation (see `HF2Q_FA_F16`
@@ -611,9 +611,8 @@ impl MlxModelWeights {
         // Q/K/V are written F32 → F16 via `permute_021_f32_to_f16` (single
         // rounding step, mantissa-faithful) and the FA prefill kernel
         // instantiates with `T=half` (10-bit mantissa).  This matches
-        // llama.cpp's default `kernel_flash_attn_ext_f16_dk{256,512}_dv*`
-        // template `FA_TYPES` (see /opt/llama.cpp/ggml/src/ggml-metal/
-        // ggml-metal.metal:6472, `half, half4, simdgroup_half8x8` for Q
+        // the peer's default `kernel_flash_attn_ext_f16_dk{256,512}_dv*`
+        // template `FA_TYPES` (`half, half4, simdgroup_half8x8` for Q
         // shmem; F32 for accumulator, softmax, scale).
         //
         // Mantissa budget over a 512-element Q·K dot product accumulator:
@@ -2334,10 +2333,10 @@ impl MlxModelWeights {
 
                 // 6. Flash-attention tiled prefill (ADR-011 Phase 2 Wave 4):
                 //    Q: [1, nh, seq_len, hd], K: [1, nkv, seq_len, hd], V: same
-                //    scale = 1.0 for Gemma 4 (per llama.cpp oracle — Q is
+                //    scale = 1.0 for Gemma 4 (per peer oracle — Q is
                 //      pre-scaled upstream in qmatmul).
                 //    Global layers (head_dim=512): flash_attn_prefill_bf16_d512
-                //      (llama.cpp-derived NSG=8 kernel). Consumes global_mask
+                //      (peer-derived NSG=8 kernel). Consumes global_mask
                 //      + blk_global built once per prefill above.
                 //    Sliding layers (head_dim=256): flash_attn_prefill_bf16_d256
                 //      (candle-derived BQ=32/BK=16 kernel). Consumes sliding_mask
@@ -2348,7 +2347,7 @@ impl MlxModelWeights {
                 // History note: Wave 3 had a narrow bf16 SDPA island using
                 // sdpa_bf16 (D=256) and sdpa (D=512) kernels; this was a
                 // stepping-stone. Wave 4 replaces both with the flash-attention
-                // tiled kernels that llama.cpp uses (flash_attn_ext_* family)
+                // tiled kernels that the peer uses (flash_attn_ext_* family)
                 // — single kernel for both sliding + global, with a single
                 // mask representation. sdpa_sliding previously had a "dense
                 // cap 1024" issue at pp=2455 (docs/spike-gate-a-prefill.md
@@ -3302,7 +3301,7 @@ impl MlxModelWeights {
                 } else if route_through_nofa {
                     // ---- HF2Q_NO_FA path: tensor-mm attention ----
                     //
-                    // Mirrors llama.cpp's `-fa 0` fast path (which on M5
+                    // Mirrors the peer's `-fa 0` fast path (which on M5
                     // today measures 3410 vs 3217 for `-fa 1` at pp2455):
                     //
                     //   1. Q bf16 -> f32 (src1 dtype for our bf16 tensor-mm)
@@ -4206,7 +4205,7 @@ impl MlxModelWeights {
                         } // end sliding else (existing non-xlen path)
                     } else {
                         // ADR-011 Phase 2 Wave 4 Stage 3: flash_attn_prefill D=512
-                        // (NSG=8 llama.cpp-derived kernel) replaces s.sdpa for
+                        // (NSG=8 peer-derived kernel) replaces s.sdpa for
                         // Gemma 4's 5 global layers (head_dim=512).
                         //   - Q/K/V/O: bf16 [n_heads/n_kv_heads, seq_len, 512],
                         //     contiguous inner dim.

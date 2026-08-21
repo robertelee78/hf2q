@@ -286,7 +286,7 @@ impl BundlePath {
         if !allowed {
             return Err(SchemaValueError::new(
                 field,
-                "path is outside the v1 release-bundle allowlist",
+                "path is outside the v1 release-bundle whitelist",
             ));
         }
 

@@ -35,8 +35,7 @@
 //!
 //! ## Per-tensor algorithm reference
 //!
-//! Mirrors `/opt/llama.cpp/tools/imatrix/imatrix.cpp` at the pinned SHA
-//! (`data/llama_cpp_pin.txt`). The on-disk schema is identical, modulo
+//! Mirrors `llama-imatrix`. The on-disk schema is identical, modulo
 //! FP accumulation order (ADR-033 §Pi "Risk 2 — Metal-vs-CPU activation
 //! order").
 

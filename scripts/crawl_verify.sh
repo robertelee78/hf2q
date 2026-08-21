@@ -133,7 +133,7 @@ echo "hf2q rendered prompt: $(wc -c < "$RENDERED_PROMPT" | tr -d ' ') bytes"
 #       - `add_special=true` AND vocab `add_bos=true` makes
 #         /opt/llama.cpp/src/llama-vocab.cpp:3081 push another BOS token at
 #         position 0 BEFORE the parsed-special BOS.
-#     Result: llama.cpp's token sequence is `[2, 2, 105, 2364, ...]` (188
+#     Result: the peer's token sequence is `[2, 2, 105, 2364, ...]` (188
 #     tokens, two BOS) while hf2q's is `[2, 105, 2364, ...]` (187 tokens,
 #     one BOS). Every position index is shifted by one, every per-position
 #     hidden state is non-comparable, and the byte-prefix classification is
@@ -155,7 +155,7 @@ echo "hf2q rendered prompt: $(wc -c < "$RENDERED_PROMPT" | tr -d ' ') bytes"
 #     established.
 #
 # Fix: rewrite the rendered prompt with the leading `<bos>` (5 bytes) stripped
-# off. llama.cpp then auto-prepends exactly one BOS via add_special=true and
+# off. The peer then auto-prepends exactly one BOS via add_special=true and
 # we get the same `[2, 105, 2364, ...]` 187-token sequence as hf2q.
 #
 # Citations:
@@ -207,7 +207,7 @@ if ! "$LLAMA_BIN" --model "$GGUF_PATH" --file "$RENDERED_PROMPT_LLAMA" \
   echo "llama-completion failed. See $LOG_LLAMA" >&2; exit 3
 fi
 
-# 1bNEW.19 sanity gate: llama.cpp must report exactly the same prompt token
+# 1bNEW.19 sanity gate: the peer must report exactly the same prompt token
 # count as hf2q (187 on the canonical bench prompt). If we ever see a
 # mismatch here, the comparison is structurally invalid and the byte-prefix
 # classification is meaningless — fail loudly instead of silently producing
@@ -257,9 +257,9 @@ echo "Common prefix:    ${COMMON_BYTES} bytes (~${APPROX_TOKENS} tokens, ~4 char
 
 # Classify -------------------------------------------------------------------
 if   [[ "$COMMON_BYTES" -eq "$LLAMA_BYTES" && "$COMMON_BYTES" -eq "$HF2Q_BYTES" ]]; then
-  CLASS="PERFECT"; CLASS_MSG="Token-for-token match with llama.cpp."
+  CLASS="PERFECT"; CLASS_MSG="Token-for-token match with the peer."
 elif [[ "$COMMON_BYTES" -lt 20  ]]; then
-  CLASS="RED";     CLASS_MSG="Chat template mismatch or major math bug. hf2q is NOT porting llama.cpp's pipeline correctly."
+  CLASS="RED";     CLASS_MSG="Chat template mismatch or major math bug. hf2q is NOT porting the peer's pipeline correctly."
 elif [[ "$COMMON_BYTES" -lt 200 ]]; then
   CLASS="YELLOW";  CLASS_MSG="Early FP drift. Partial port correctness."
 else

@@ -469,18 +469,18 @@ for i in $(seq 0 $((${#LCP_TTFT[@]} - 1))); do
 done
 echo ""
 
-# ── llama.cpp peer baseline (optional, gated on PEER=1) ───────────────────
+# ── peer baseline (optional, gated on PEER=1) ─────────────────────────────
 # Spirit-rule "as fast as peer" verification. Spins up llama-server on a
 # separate port, runs the same TTFT-strict measurement on a single
 # turn-2-shape canonical prompt cold + repeat, and prints a comparison
 # block. NEVER changes the hf2q acceptance gate (peer is informational).
 #
-# llama.cpp does automatic kv-cache reuse for shared prefixes via its
+# The peer does automatic kv-cache reuse for shared prefixes via its
 # slot machinery — sending the same prompt twice → second is faster.
 # This is the apples-to-apples comparison for the iter-3 default-on
 # claim "85.41× TTFT speedup on long prompts".
 if [ "${PEER:-0}" = "1" ]; then
-    echo "[BENCH] === llama.cpp peer baseline (PEER=1) ==="
+    echo "[BENCH] === peer baseline (PEER=1) ==="
     PEER_PORT="${PEER_PORT:-52484}"
     LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/opt/homebrew/bin/llama-server}"
     if [ ! -x "$LLAMA_SERVER_BIN" ]; then
@@ -510,7 +510,7 @@ if [ "${PEER:-0}" = "1" ]; then
             echo "[BENCH] llama-server failed to come up — peer arm skipped" >&2
             kill "$PEER_PID" 2>/dev/null || true
         else
-            # Issue same chat request to llama.cpp; first = cold, second+ = cache reuse.
+            # Issue same chat request to the peer; first = cold, second+ = cache reuse.
             peer_chat_ttft_ms() {
                 local body="$1"
                 HOST="$HOST" PORT="$PEER_PORT" /usr/bin/python3 -c "
@@ -578,7 +578,7 @@ print(json.dumps({
                 PEER_SPEEDUP="N/A"
             fi
             echo ""
-            echo "[BENCH] === llama.cpp peer baseline ==="
+            echo "[BENCH] === peer baseline ==="
             echo "[BENCH]   peer cold TTFT:    ${PEER_COLD_TTFT} ms (total ${PEER_COLD_TOTAL} ms)"
             echo "[BENCH]   peer warm TTFT p50: ${PEER_WARM_P50} ms (3 trials: ${PEER_WARM_TTFTS[*]})"
             echo "[BENCH]   peer speedup:      ${PEER_SPEEDUP}× (cold/warm)"
@@ -586,7 +586,7 @@ print(json.dumps({
             echo "[BENCH] === side-by-side (TTFT-strict) ==="
             echo "[BENCH]                    │ cold (no cache)  │ warm/LCP (cache hit) │ speedup"
             echo "[BENCH]   hf2q default-on   │ ${COLD_TTFT_P50} ms          │ ${LCP_TTFT_P50} ms             │ ${TTFT_SPEEDUP}×"
-            echo "[BENCH]   llama.cpp slot-reuse │ ${PEER_COLD_TTFT} ms          │ ${PEER_WARM_P50} ms             │ ${PEER_SPEEDUP}×"
+            echo "[BENCH]   peer slot-reuse      │ ${PEER_COLD_TTFT} ms          │ ${PEER_WARM_P50} ms             │ ${PEER_SPEEDUP}×"
             echo ""
             kill "$PEER_PID" 2>/dev/null || true
             wait "$PEER_PID" 2>/dev/null || true

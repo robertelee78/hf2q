@@ -202,7 +202,7 @@ pub struct SoftTokenInjection<'a> {
 /// Per-LM-layer DeepStack residual injection metadata (ADR-005 iter-224
 /// Wedge-4c.5).
 ///
-/// Mirrors /opt/llama.cpp/src/models/qwen3vl.cpp:96-100's per-layer
+/// Mirrors the peer's per-layer
 /// `cur += ds` add: at LM layer `il < n_deepstack` (where
 /// `n_deepstack = chunks.len()`), the post-FFN-residual `cur` is
 /// updated in-place at the image-token positions with chunk `il`'s
@@ -275,8 +275,7 @@ impl Qwen3VlImageGrid {
         self.n_x.saturating_mul(self.n_y)
     }
 
-    /// Per peer `mtmd_image_tokens_get_n_pos` at
-    /// `/opt/llama.cpp/tools/mtmd/mtmd.cpp:1354-1357` —
+    /// Per the peer's `mtmd_image_tokens_get_n_pos` —
     /// `MTMD_POS_TYPE_MROPE` returns `max(nx, ny)` for the temporal-axis
     /// advance after an image chunk. For Qwen3-VL the LM's "global"
     /// time index advances by `max(n_x, n_y)`, NOT by the full
@@ -291,12 +290,10 @@ impl Qwen3VlImageGrid {
 /// Build the 3D-mRoPE flat-position buffer (`positions_flat[4 *
 /// seq_len]` axis-major) for a sequence containing text + image chunks.
 ///
-/// Implements peer's MROPE position assignment for Qwen3-VL combined
-/// with the temporal-advance rule observed at
-/// `/opt/llama.cpp/tools/mtmd/mtmd.cpp:1295-1304`
-/// (`mtmd_image_tokens_get_decoder_pos` for `MTMD_POS_TYPE_MROPE`) and
-/// `/opt/llama.cpp/tools/mtmd/mtmd-helper.cpp:166-181`
-/// (`set_position_mrope_2d` writing `[t, y, x, z]` axes column-major).
+/// Implements the peer's MROPE position assignment for Qwen3-VL combined
+/// with its temporal-advance rule
+/// (`mtmd_image_tokens_get_decoder_pos` for `MTMD_POS_TYPE_MROPE`, and
+/// `set_position_mrope_2d` writing `[t, y, x, z]` axes column-major).
 ///
 /// **Position layout per axis** (column-major: `flat[axis * seq_len + t]`):
 ///   - axis 0 = t (temporal)
@@ -784,9 +781,9 @@ impl MlxModelWeights {
         // is oldest is immaterial — the causal mask within the
         // sliding window still yields the correct attention pattern.
         // ===================================================================
-        // ADR-009 Phase 3A finding: matching llama.cpp's F16 KV cache
+        // ADR-009 Phase 3A finding: matching the peer's F16 KV cache
         // REGRESSED our parity (sourdough 3656→3095, sliding_wrap 752→627).
-        // llama.cpp itself is insensitive to KV dtype (its F16 and F32 outputs
+        // The peer itself is insensitive to KV dtype (its F16 and F32 outputs
         // are byte-identical). Our F16 path has a separate bug worse than F32.
         // F32 remains the default; F16 is opt-in via HF2Q_F16_KV=1 for the
         // follow-up investigation into the F16-specific regression.
@@ -2118,7 +2115,7 @@ impl MlxModelWeights {
                         head_dim: hd as u32,
                         kv_seq_len: dense_kv_seq_len,
                         kv_capacity: layer_dense_cap as u32,
-                        scale: 1.0, // Gemma4: scale = 1.0 (llama.cpp oracle)
+                        scale: 1.0, // Gemma4: scale = 1.0 (peer oracle)
                         mask_type: mask_type_val,
                         sliding_window: sliding_window_val,
                         softcap: 0.0,

@@ -1,8 +1,6 @@
 //! Per-tensor activation-importance accumulator.
 //!
-//! Mirrors the `Stats` struct and `IMatrixCollector::collect_imatrix`
-//! algorithm at `/opt/llama.cpp/tools/imatrix/imatrix.cpp:41-409` (pinned
-//! SHA `data/llama_cpp_pin.txt`).
+//! Mirrors `llama-imatrix`'s `Stats` accumulation algorithm.
 //!
 //! ## Algorithm (per llama-imatrix)
 //!
@@ -37,7 +35,7 @@ use std::collections::BTreeMap;
 
 use super::error::ImatrixError;
 
-/// Per-tensor accumulator. Mirrors `Stats` at imatrix.cpp:41.
+/// Per-tensor accumulator. Mirrors `llama-imatrix`'s `Stats`.
 #[derive(Debug, Clone)]
 pub struct Accumulator {
     /// Tensor name (e.g. `"blk.0.attn_q.weight"`). Matches the GGUF
@@ -45,8 +43,7 @@ pub struct Accumulator {
     /// `"<name>.counts"`.
     pub name: String,
     /// `n_per_row` = the input dimension of the linear being calibrated.
-    /// Equivalent to `src0->ne[0]` at imatrix.cpp:294. Fixed at
-    /// `register` time.
+    /// Fixed at `register` time.
     pub n_per_row: usize,
     /// `n_mat` = 1 for dense tensors, `n_experts` for MoE expert tensors
     /// (`GGML_OP_MUL_MAT_ID`). Fixed at `register` time.
@@ -255,8 +252,8 @@ mod tests {
         assert_eq!(acc.counts, vec![2]);
     }
 
-    /// `absorb_moe` lays out per-expert per-column importance in the
-    /// imatrix.cpp:294 convention: `values[expert_id*n_per_row + j]`.
+    /// `absorb_moe` lays out per-expert per-column importance in
+    /// `llama-imatrix`'s convention: `values[expert_id*n_per_row + j]`.
     #[test]
     fn absorb_moe_layout() {
         let mut acc = Accumulator::new("blk.0.ffn_gate_exps.weight".to_string(), 3, 4);
@@ -321,8 +318,8 @@ mod tests {
         assert!(matches!(err, ImatrixError::CorpusRead { .. }));
     }
 
-    /// Iteration order is sorted by name (matches imatrix.cpp:568's
-    /// `std::sort`). Critical for byte-cmp against llama-imatrix.
+    /// Iteration order is sorted by name (matches `llama-imatrix`'s
+    /// sorted emit order). Critical for byte-cmp against llama-imatrix.
     #[test]
     fn registry_iter_sorted() {
         let mut reg = AccumulatorRegistry::new();

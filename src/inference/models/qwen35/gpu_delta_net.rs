@@ -1435,9 +1435,8 @@ pub fn apply_gated_delta_net_chunk(
     // their GQA mapping as `kh = i_h / group_ratio` (block-style), inherited
     // from FLA's chunk_delta_h.py:64. The autoregressive Metal kernel and
     // mlx-native cpu_reference_f32 both use `k_head = v_head % n_k_heads`
-    // (tiled-style), inherited from llama.cpp's `ggml_repeat` semantics
-    // (ops.cpp:1695-1737, the row-broadcast convention used in
-    // `delta-net-base.cpp:357 k = ggml_repeat(ctx0, k, s)`).
+    // (tiled-style), inherited from the peer's `ggml_repeat` semantics
+    // (the row-broadcast convention).
     //
     // For Qwen3.6 GGUF tensor layout, **tiled** is the correct mapping —
     // confirmed by Wave 5b.3 pp4096 reproducer (commit c3e88a0): with
@@ -1556,7 +1555,7 @@ pub fn apply_gated_delta_net_chunk(
     // above. The chunk-pipeline kernels' internal `kh = i_h / group_ratio`
     // mapping then reduces to `kh = i_h / 1 = i_h`, which (after our tiled
     // pre-expansion) is the tiled GQA convention — matching autoregressive
-    // and llama.cpp ggml_repeat semantics for Qwen3.6.
+    // and the peer's ggml_repeat semantics for Qwen3.6.
     let p = ChunkGatedDeltaRuleParams {
         b: n_seqs,
         t: seq_len,
@@ -2161,7 +2160,7 @@ pub fn apply_gated_delta_net_chunk_with_arena(
 ///
 /// Returns `[seq_len, nv*dv]` F32 = `RMSNorm_per_head(attn_out) * silu(z)`.
 ///
-/// Gate: SiLU(x) = x / (1 + exp(-x)), matching llama.cpp build_norm_gated
+/// Gate: SiLU(x) = x / (1 + exp(-x)), matching the peer's build_norm_gated
 /// which calls `ggml_silu(ctx0, gate)`.
 ///
 /// This variant accepts CPU slices directly, avoiding GPU downloads.
@@ -2202,7 +2201,7 @@ pub fn apply_ssm_norm_and_gate(
             for d in 0..dv {
                 let normed_val = head_row[d] * inv * ssm_norm_w_cpu[d];
                 let z_val = z_cpu[head_off + d];
-                // SiLU: x / (1 + exp(-x)) — matches llama.cpp ggml_silu
+                // SiLU: x / (1 + exp(-x)) — matches the peer's ggml_silu
                 let z_silu = z_val / (1.0 + (-z_val).exp());
                 gated[head_off + d] = normed_val * z_silu;
             }
@@ -3240,13 +3239,13 @@ pub fn build_delta_net_layer(
             enc.memory_barrier();
             // ADR-013 P21 stage-4 (2026-05-01) + ADR-015 iter59 / iter66a
             // rebase reconciliation: autoregressive prefill GDN uses the
-            // simd_sum-based decode kernel (mirrors llama.cpp's
+            // simd_sum-based decode kernel (mirrors the peer's
             // kernel_gated_delta_net_f32_<NSG>) when D_k is supported.
             // Per-thread register state shrinks from D_k floats to NSG=D_k/32
             // floats (32x lower at D_k=128) and cross-lane reductions become
             // single-cycle simd_sum vs threadgroup_barrier+shared_memory.
             // Measured at pp726: 2.04x prefill speedup (1010 -> 2061 t/s),
-            // ratio vs llama 0.37x -> 0.75-1.18x (at peer parity).
+            // ratio vs the peer 0.37x -> 0.75-1.18x (at peer parity).
             //
             // iter66a note: iter59-mtnsg originally added a `seq_len <=
             // NSG_PREFILL_MAX_TOKENS` upper bound (32) here; Stage-4 supersedes
@@ -4530,7 +4529,7 @@ pub fn build_delta_net_layer_decode_into(
 
     // ---- Op 7: GDN — reads state_in, writes state_out ----
     // ADR-015 iter56 — decode path uses the `simd_sum` variant which mirrors
-    // llama.cpp's `kernel_gated_delta_net_f32_<NSG>` threading model. Same
+    // the peer's `kernel_gated_delta_net_f32_<NSG>` threading model. Same
     // bit-equivalent math (cpu_reference + unfused-GPU parity tests under
     // `mlx-native/tests/test_gated_delta_net_decode.rs`; smoke parity
     // verified byte-identical to `dispatch_gated_delta_net` on apex
@@ -5852,7 +5851,7 @@ mod tests {
     /// changes the parallel-reduction order inside kernels, which
     /// produces ULP-level (~1e-6 to ~1e-5) accumulation differences.
     /// Those diffs do NOT change observable behavior (greedy decode
-    /// tokens, cosine-similarity vs llama.cpp/vllm/mlx-python reference).
+    /// tokens, cosine-similarity vs the peer/vllm/mlx-python reference).
     /// The byte-identity assertion was over-tight — measuring noise that
     /// would never propagate to user-facing output. The reframed test
     /// measures kernel equivalence within FP tolerance, which is the
@@ -6170,7 +6169,7 @@ mod tests {
     //   max_diff_chunk_vs_cpu  : chunk pipeline vs the same f32 reference.
     //
     // CPU reference uses the SAME recurrence as our autoregressive Metal
-    // kernel and llama.cpp build_delta_net_autoregressive (post-decay state
+    // kernel and the peer's build_delta_net_autoregressive (post-decay state
     // for `err = v - alpha*S @ k`). FLA's fused_recurrent_gated_delta_rule
     // (vllm/.../fused_recurrent.py:134-149) uses the same convention.
     //
@@ -6215,7 +6214,7 @@ mod tests {
     }
 
     /// FLA-naive recurrence: pre-decay state for err.
-    /// S' = alpha*S + beta*outer(v - S@k, k)  (NOT the llama.cpp/fused_recurrent form).
+    /// S' = alpha*S + beta*outer(v - S@k, k)  (NOT the peer/fused_recurrent form).
     /// This is the math the chunk_gated_delta_rule_fwd_oracle.py implements.
     /// We compute it here to disambiguate which convention each path matches.
     fn cpu_ref_recurrence_pre_decay(
@@ -6384,7 +6383,7 @@ mod tests {
             .expect("sync wait");
         let chunk_cpu = download_f32(&chunk_out).expect("dl chunk");
 
-        // CPU reference (post-decay-err — llama.cpp / FLA fused_recurrent form).
+        // CPU reference (post-decay-err — the peer / FLA fused_recurrent form).
         let cpu_post = cpu_ref_recurrence(
             &q_cpu,
             &k_cpu,

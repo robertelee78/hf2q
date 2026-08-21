@@ -1,29 +1,26 @@
-//! GBNF parser — ported from `llama-grammar.cpp::llama_grammar_parser`.
+//! GBNF parser.
 //!
-//! Input: a `.gbnf` grammar text (e.g. `/opt/llama.cpp/grammars/json.gbnf`).
+//! Input: a `.gbnf` grammar text (e.g. `json.gbnf`).
 //! Output: an encoded rule set of `Vec<Vec<GretElement>>` where each rule is
 //! a list of elements terminated by `End`, with `Alt` separating
-//! alternatives. This binary encoding matches llama.cpp's exactly so the
+//! alternatives. This binary encoding matches the peer's exactly so the
 //! two runtimes can share fixtures.
 //!
 //! Implementation notes:
-//!   - Operates on `&[u8]` via index arithmetic rather than `&str` because
-//!     the llama.cpp port uses raw byte pointers; preserving that shape
-//!     makes the line-by-line port unambiguous.
+//!   - Operates on `&[u8]` via index arithmetic rather than `&str`.
 //!   - UTF-8 code points are decoded to `u32` scalars (not Rust `char`); the
 //!     parser stores grammar chars as `u32` throughout.
 //!   - Repetition expansion (`S{m,n}`, `S*`, `S+`, `S?`) rewrites to
-//!     synthesized sub-rules identically to llama.cpp's `handle_repetitions`,
-//!     so a `json.gbnf` parsed here produces a byte-identical rule set.
+//!     synthesized sub-rules identically to the peer, so a `json.gbnf`
+//!     parsed here produces a byte-identical rule set.
 //!
-//! Errors are recoverable via `Result<Grammar, ParseError>` instead of
-//! llama.cpp's C++ exceptions. `parser::parse` returns the grammar on
-//! success and a `ParseError` pointing at the offending byte offset on
-//! failure.
+//! Errors are recoverable via `Result<Grammar, ParseError>`. `parser::parse`
+//! returns the grammar on success and a `ParseError` pointing at the
+//! offending byte offset on failure.
 
 use std::collections::HashMap;
 
-/// Grammar-element type. Wire-compatible with llama.cpp's `llama_gretype`:
+/// Grammar-element type. Wire-compatible with the peer's `llama_gretype`:
 /// the u8 discriminants match so fixtures cross-compare cleanly.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -112,8 +109,8 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 // ---------------------------------------------------------------------------
-// Max repetition threshold — mirrors `MAX_REPETITION_THRESHOLD` in
-// llama-grammar.cpp:13. Prevents grammars like `a{999999}` from exploding.
+// Max repetition threshold. Prevents grammars like `a{999999}` from
+// exploding.
 // ---------------------------------------------------------------------------
 const MAX_REPETITION_THRESHOLD: u64 = 2000;
 
@@ -514,7 +511,7 @@ impl<'a> ParserState<'a> {
 
     /// Rewrite the tail of `rule` (from `*last_sym_start`) as `min_times`
     /// copies followed by a chain of synthesized sub-rules for the `max -
-    /// min` optional copies. Mirrors `handle_repetitions` in llama.cpp.
+    /// min` optional copies.
     #[allow(clippy::too_many_arguments)]
     fn handle_repetitions(
         &mut self,
@@ -590,7 +587,7 @@ impl<'a> ParserState<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Low-level parse helpers (ported from the file-top of llama-grammar.cpp)
+// Low-level parse helpers
 // ---------------------------------------------------------------------------
 
 fn is_digit(c: u8) -> bool {
@@ -598,17 +595,16 @@ fn is_digit(c: u8) -> bool {
 }
 
 fn is_word_char(c: u8) -> bool {
-    // llama.cpp's `is_word_char` (src/llama-grammar.cpp:98) does NOT include
-    // `_`, but its `generate_symbol_id` (src/llama-grammar.cpp:421-424)
-    // synthesizes rule names like `root_1` for `?`/`*`/`+`/`{n,m}`/`(...)`
-    // expansions.  llama.cpp gets away with the inconsistency because it
-    // never round-trips parsed grammars through its own parser — `print`
-    // is a debug-only sink there.
+    // The peer's `is_word_char` does NOT include `_`, but its symbol-id
+    // generator synthesizes rule names like `root_1` for
+    // `?`/`*`/`+`/`{n,m}`/`(...)` expansions.  The peer gets away with the
+    // inconsistency because it never round-trips parsed grammars through
+    // its own parser — `print` is a debug-only sink there.
     //
     // hf2q's `combine_function_grammars` (handlers.rs) NEEDS the round-trip:
     // parse user grammars → rename via `serialize::rename_rules` → serialize
     // → re-parse the combined output.  Without `_` in the word set, every
-    // synthesized subrule name fails to re-parse.  We diverge from llama.cpp
+    // synthesized subrule name fails to re-parse.  We diverge from the peer
     // by one byte to keep the parser self-consistent with its own emitter.
     // Wave 2.6 W-γ5a (Q4-A) — see /opt/hf2q/src/serve/api/grammar/serialize.rs.
     (b'a'..=b'z').contains(&c)
@@ -955,7 +951,7 @@ mod tests {
 
     #[test]
     fn multiline_rule_via_grouping() {
-        // llama.cpp's multi-line rules only work inside groupings (parse_space
+        // The peer's multi-line rules only work inside groupings (parse_space
         // inside `(...)` is called with newline_ok=true via the is_nested
         // flag). A raw top-level sequence split across newlines is NOT
         // supported — the first newline terminates the outer parse_sequence.
@@ -973,9 +969,9 @@ mod tests {
 
     #[test]
     fn json_grammar_fixture_parses() {
-        // The canonical llama.cpp json grammar. Vendored verbatim to validate
-        // the port against the exact grammar OpenAI-compatible grammar-
-        // constrained JSON will rely on.
+        // The peer's canonical json grammar. Used verbatim to validate
+        // against the exact grammar OpenAI-compatible grammar-constrained
+        // JSON will rely on.
         let src = std::fs::read_to_string("/opt/llama.cpp/grammars/json.gbnf")
             .expect("json.gbnf fixture present");
         let g = parse_ok(&src);
@@ -992,7 +988,7 @@ mod tests {
 
     #[test]
     fn arithmetic_grammar_fixture_parses() {
-        // Another llama.cpp canonical fixture.
+        // Another canonical fixture from the peer.
         let src = std::fs::read_to_string("/opt/llama.cpp/grammars/arithmetic.gbnf")
             .expect("arithmetic.gbnf fixture present");
         let g = parse_ok(&src);
@@ -1039,8 +1035,8 @@ mod tests {
 
     #[test]
     fn rule_with_empty_body_accepted_as_always_match_empty() {
-        // llama.cpp accepts empty rule bodies — they match the empty string.
-        // This documents parity with the reference implementation.
+        // The peer accepts empty rule bodies — they match the empty string.
+        // This documents parity with it.
         let g = parse_ok("root ::= \n");
         assert_eq!(g.rules.len(), 1);
         assert_eq!(g.rules[0], vec![GretElement::new(GretType::End, 0)]);

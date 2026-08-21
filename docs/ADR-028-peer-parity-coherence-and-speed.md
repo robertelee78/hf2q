@@ -5,6 +5,8 @@
 - **Deciders**: Robert (operator), Claude (this session)
 - **Tags**: performance, kernel-parity, gemma, qwen35, prefill, decode, lock-in
 
+> Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
+
 ## Mantra (load-bearing — operator-stated 2026-05-09 iter-86)
 
 > *"We need to be as coherent as peers, and as fast as or faster than peers."*
@@ -70,7 +72,7 @@ prior 100% dormant state.
 ### gemma4 4.5 ms/token gap decomposition (iter-292 layer-attribution)
 
 Per-layer dispatch count is uniform (32 sliding / 31 full).  +9 disp/layer
-vs llama.cpp peer:
+vs peer:
 - ~6 = TQ-HB infrastructure (operator-mandated retain)
 - ~3 = non-TQ-HB fusion gaps (limited by iter-186 concurrent-fusion
   regression and iter-219 +0.3% sequential-fusion measurement)
@@ -98,7 +100,7 @@ Gap composition (iter-288):
 - `mlx_native::pipeline_dispatch_buckets()` API + `MLX_DISP_BUCKET=1`
   env (iter-284) — per-pipeline dispatch counts
 - `HF2Q_PER_LAYER_DISP=1` in gemma4 forward_decode (iter-292)
-- `LLAMA_DISP_COUNT=1` instrumentation in llama.cpp ggml-metal (uncommitted, iter-283)
+- `LLAMA_DISP_COUNT=1` instrumentation in the peer ggml-metal (uncommitted, iter-283)
 - `apex-q5km` + `gemma4-apex-q5km` coherence fixtures + goldens (iter-296)
 - `scripts/adr028_full_stack_bench.sh` G+FUSED row + decision tree (iter-299)
 
@@ -133,7 +135,7 @@ Did you forget about the speed gap problem we have with gemma?"*
 Direct re-bench at HEAD on `gemma4-ara-2pass-APEX-Q5_K_M.gguf` (Q6_K
 dominant, 19.16 GiB, M5 Max):
 
-| pp   | hf2q per-token (default) | llama.cpp peer | gap |
+| pp   | hf2q per-token (default) | peer | gap |
 |------|-------------------------:|---------------:|----:|
 | 128  |   65 t/s                 |  1715 t/s      | **0.038× = 26.6× SLOWER** |
 | 512  |   67 t/s                 |  2576 t/s      | **0.026× = 38.4× SLOWER** |
@@ -220,16 +222,16 @@ Pre-fix banner: `full_attn_every=none` (misleading); post-fix:
 
 ### Combined speedup (iter-64+iter-68 on Gemma-4 batched prefill)
 
-| pp | per-token (default) | batched (post-fix) | llama.cpp | speedup vs default | vs peer |
+| pp | per-token (default) | batched (post-fix) | peer | speedup vs default | vs peer |
 |---:|--------------------:|-------------------:|----------:|-------------------:|--------:|
 | 128 |   65 t/s            |    609 t/s         |   1715 t/s |    9.4×           | 0.36×   |
 | 512 |   67 t/s            |   1477 t/s         |   2576 t/s |   22×             | 0.57×   |
-| **1024** | 67 t/s         |  **1942 t/s**      |   1884 t/s | **29×**           | **1.03× — BEATS llama** |
+| **1024** | 67 t/s         |  **1942 t/s**      |   1884 t/s | **29×**           | **1.03× — BEATS peer** |
 | 2455 |  67 t/s            |   2329 t/s         |   3023 t/s |   35×             | 0.77×   |
 
 ### Cross-model validation (iter-78)
 
-qwen35moe pp512: hf2q 2300 t/s vs llama.cpp 2921 t/s = **0.79× peer**.
+qwen35moe pp512: hf2q 2300 t/s vs peer 2921 t/s = **0.79× peer**.
 qwen35 uses its own code path but routes through the same shared
 `mm_id_pooled` dispatcher → iter-68 typo fix benefits qwen35 too.
 
@@ -254,14 +256,14 @@ First decode token id=8409 byte-identical across runs.
 | MoE total | 53.4% | 34.0% | -53% |
 | TOTAL | 1574 ms | **1165 ms** | **-26%** |
 | Throughput pp2455 | 1737 t/s | **2119 t/s** | +22% |
-| **vs llama.cpp peer** | 0.57× | **0.70×** | **+13pp** |
+| **vs peer** | 0.57× | **0.70×** | **+13pp** |
 
 ### Decode investigation (iter-69..72, 81)
 
-- hf2q decode = 64 t/s vs llama.cpp 103 t/s = **0.62× peer**
+- hf2q decode = 64 t/s vs peer 103 t/s = **0.62× peer**
 - ~10% decay 32→1000 tok context (KV reads grow linearly on Full layers)
 - 528 dispatches/token at ~30 µs/dispatch each (dispatch-floor bound)
-- iter-71 confirmed dispatch count is at parity with llama.cpp; gap is
+- iter-71 confirmed dispatch count is at parity with the peer; gap is
   per-kernel-time, not graph fusion
 - iter-72 `HF2Q_DUAL_BUFFER` sweep: default split=3 already optimal
 - **Decode gap is structural** — no 1-line fix; multi-day µbench scope
@@ -294,22 +296,22 @@ that clears thermal noise. Iter-78 qwen35 step uses 3-trial no-cooldown
 methodology and lands at ~2254 t/s (floor 1800).
 
 **Honest peer-gap recompute (cool-state, unprofiled)**:
-- pp2455: 2416 t/s vs llama.cpp cited 3023 t/s = **0.80× peer** (was
+- pp2455: 2416 t/s vs peer cited 3023 t/s = **0.80× peer** (was
   0.70× per-iter-86 hot-state-affected reading; iter-86 cited 0.70×
   matches the bucket-profile-overhead 2147 t/s)
-- pp1024: 1996 t/s vs llama.cpp 1884 t/s = **1.06× peer** (BEATS, was
+- pp1024: 1996 t/s vs peer 1884 t/s = **1.06× peer** (BEATS, was
   1.03× per iter-68/74 measurement)
-- llama.cpp peer baseline cited from iter-68 era (`d05fe1d7d`/build 9010);
-  current llama.cpp HEAD (`5d6f18a63`) NOT YET re-benchmarked. Closing
+- peer baseline cited from iter-68 era (`d05fe1d7d`/build 9010);
+  current peer HEAD (`5d6f18a63`) NOT YET re-benchmarked. Closing
   this loop requires `cd /opt/llama.cpp && cmake -B build -DGGML_METAL=1
   && cmake --build build -j --target llama-bench` ~2 min on M5.
 
 ### Iter-87 kernel coverage gap analysis (kernel-fusion-sweep, ADR-028 #4)
 
 Direct comparison of `host_name` template instantiations between
-mlx-native and llama.cpp `ggml-metal.metal`:
+mlx-native and the peer `ggml-metal.metal`:
 
-| Family | llama.cpp variants | mlx-native variants | Gap |
+| Family | peer variants | mlx-native variants | Gap |
 |---|---:|---:|---|
 | `mul_mv_ext_*_r1_{2,3,4,5}` | 80+ | 28 | missing q1_0/q2_K/q3_K/q4_1/q5_0/mxfp4/f32_f32/f16_f32/bf16_f32 |
 | `mul_mv_id_*_f32` | 25+ | 7 K-quants + 1 fused (q4_0_swiglu) | missing IQ-quants, MXFP4, BF16/F16/F32 |
@@ -336,13 +338,13 @@ remaining ~20% pp2455 gap is **per-kernel-time** within the kernels we
 already share, not unported variants. Confirming iter-71's earlier
 finding ("dispatch count at parity; gap is per-kernel-time").
 
-### Iter-88 fresh peer baseline at llama.cpp HEAD (2026-05-09)
+### Iter-88 fresh peer baseline at the peer HEAD (2026-05-09)
 
-Built `/opt/llama.cpp/build/bin/llama-bench` from llama.cpp HEAD
+Built `/opt/llama.cpp/build/bin/llama-bench` from the peer HEAD
 `5d6f18a63` (build 9078), ran on identical fixture
 (`gemma4-ara-2pass-APEX-Q5_K_M.gguf`, M5 Max, 5-run median):
 
-| Test | hf2q (cool, 5-trial) | llama.cpp build 9078 FA=1 | llama.cpp build 9078 FA=0 | hf2q vs FA=1 peer | hf2q vs FA=0 peer |
+| Test | hf2q (cool, 5-trial) | peer build 9078 FA=1 | peer build 9078 FA=0 | hf2q vs FA=1 peer | hf2q vs FA=0 peer |
 |---|---:|---:|---:|---:|---:|
 | pp1024 | 1996 t/s | 1759 ± 30 | 1398 ± 44 | **1.13× faster** | **1.43× faster** |
 | pp2455 | 2416 t/s | 1573 ± 39 | 1292 ± 58 | **1.54× faster** | **1.87× faster** |
@@ -350,7 +352,7 @@ Built `/opt/llama.cpp/build/bin/llama-bench` from llama.cpp HEAD
 | tg128 | 61.4 t/s | 88.3 ± 1.0 | (n/a) | 0.70× | (n/a) |
 | tg256 | 62.5 t/s | 90.4 ± 0.5 | (n/a) | 0.69× | (n/a) |
 
-**Surprise**: at llama.cpp HEAD, prefill speed has REGRESSED relative
+**Surprise**: at the peer HEAD, prefill speed has REGRESSED relative
 to the iter-66/68 cited build-9010 numbers (1884 t/s pp1024 / 3023 t/s
 pp2455). Build 9078 is **6.6% slower at pp1024 and 48% slower at
 pp2455 with FA=1** vs cited build-9010 numbers. We did not measure
@@ -358,16 +360,16 @@ the regression cause — could be intentional fault-tolerance/correctness
 tightening, kernel re-org, or unrelated work.
 
 **Mantra-status at iter-88 (real numbers)**:
-- ✅ **Coherence**: byte-identical to llama.cpp on sourdough fixture
+- ✅ **Coherence**: byte-identical to the peer on sourdough fixture
   (per ADR-010 sourdough_gate.sh; iter-65/74/79 byte-identity gate).
-- ✅ **Prefill speed**: hf2q is **1.13× to 1.87× FASTER** than llama.cpp
+- ✅ **Prefill speed**: hf2q is **1.13× to 1.87× FASTER** than the peer
   HEAD across pp1024 + pp2455 with both FA modes. Mantra MET for prefill.
 - ❌ **Decode speed**: hf2q is **0.65×-0.70× peer** vs FA=1, **2.28×
   FASTER** vs FA=0 default. With FA=1 (apples-to-apples) we still trail
   by 30-35%. Mantra NOT MET for decode at FA=1.
 
 The remaining mantra-violation is decode at FA=1. Per the "as fast as
-peer" reading of the mantra, llama.cpp's FA=1 mode is the relevant peer.
+peer" reading of the mantra, the peer's FA=1 mode is the relevant peer.
 ADR-028 #3 (decode µbench infrastructure) is the only remaining
 work-item to close mantra at FA=1.
 
@@ -432,7 +434,7 @@ Find longest n-gram with length in [min_n, max_n] matching the suffix
 ending at the current position; propose the K tokens that followed
 that n-gram earlier in the sequence.
 
-**Verify** (per llama.cpp `common/speculative.cpp` + standard SD): run
+**Verify** (per the peer `common/speculative.cpp` + standard SD): run
 the model on `[T_t, draft_1..draft_K]` (K+1 tokens), argmax each
 position, accept the longest matching prefix, take the model's argmax
 at the first non-matching position. KV cache truncates to accept_count.
@@ -458,7 +460,7 @@ spec-decode-2026-05-09.md`):
 - Acceptance rate 60-80% on natural-language outputs
 - Decode lift 1.6-3.0× depending on acceptance
 - gemma-4-26b decode 63 t/s → **100-190 t/s** target range
-- Conservative middle: **125 t/s = 1.42× llama.cpp HEAD's 88 t/s**
+- Conservative middle: **125 t/s = 1.42× the peer HEAD's 88 t/s**
 - **MANTRA SATISFIED at K=3, acceptance ≥ 60%**
 
 **Operator decision points** (NO implementation starts until approved):
@@ -622,12 +624,12 @@ Decoding the gap structurally:
   **near-optimal**. Q5_K mix would save ~10-15% = 0.3 ms.
 - Dense FFN (1.96 ms): same — near-optimal.
 - mv_id MoE (0.96 ms): at floor, can't go below.
-- FA-vec-tq-hb (1.43 ms): structural TQ overhead vs llama.cpp's flat F16.
+- FA-vec-tq-hb (1.43 ms): structural TQ overhead vs peer's flat F16.
   **Cannot recover without dropping ADR-027 Phase B's 3.94× memory savings.**
 - 449 small dispatches at floor (~7 ms): fusion ROI ~1-3% per merge,
   most already maximally fused.
 
-**Hard truth**: the kernel-time gap vs llama.cpp HEAD is **structurally
+**Hard truth**: the kernel-time gap vs peer HEAD is **structurally
 ~3-4 ms** (TQ-HB overhead + Q-format choice). Closing it without losing
 TQ-HB's 3.94× memory savings would require:
 1. Dropping TQ entirely (mantra-violating: loses memory savings)
@@ -637,8 +639,8 @@ TQ-HB's 3.94× memory savings would require:
    gives 2-4× decode at acceptance ≥ 60% per iter-99 vLLM/dflash research
 
 **Mantra status post-iter-110**:
-- ✅ Coherence: byte-identical to llama.cpp on sourdough
-- ✅ Prefill: 1.13×–1.87× FASTER than llama.cpp HEAD
+- ✅ Coherence: byte-identical to the peer on sourdough
+- ✅ Prefill: 1.13×–1.87× FASTER than the peer HEAD
 - ❌ Decode: 0.65× peer at FA=1 — STRUCTURAL within current TQ-HB regime
   Recoverable via speculative decode (orthogonal to kernel work)
 
@@ -689,16 +691,16 @@ decode shapes. Combined with iter-103's mv_id+FA+norm+FWHT data:
    - 4 projections: all at compute ceiling for their shape × Q6_K.
 
 4. **Q5_K vs Q6_K opportunity**: gemma-4-ara-2pass-APEX-Q5_K_M is mostly
-   Q5_K with some Q6_K layers (per llama.cpp `Q5_K_M` mixed convention).
+   Q5_K with some Q6_K layers (per the peer `Q5_K_M` mixed convention).
    My bench used Q6_K (heavier). Production likely averages ~Q5_K cost
    = ~17% smaller bandwidth. But this is a comparison-methodology
    artifact, not a hf2q optimization lever — we already use whatever
    the .gguf provides.
 
-**Updated peer-gap analysis** (15.83 ms hf2q vs 11.11 ms llama.cpp = 4.72 ms gap):
+**Updated peer-gap analysis** (15.83 ms hf2q vs 11.11 ms the peer = 4.72 ms gap):
 - TQ-HB structural overhead: ~1.5-3 ms (FA + KV encode + FWHTs)
-- Quantization-format choice (Q6_K vs llama.cpp's Q5_K mix): ~0.5-1 ms
-- Apple-Metal-vs-llama.cpp scheduling/encoding: ~0.5-1 ms
+- Quantization-format choice (Q6_K vs peer's Q5_K mix): ~0.5-1 ms
+- Apple-Metal-vs-peer scheduling/encoding: ~0.5-1 ms
 - Other (KV cache copy, sampling, etc.): the 8.78 ms unaccounted split
 
 **Iter-110 plan**: bench dense FFN gate/up/down (regular Q5_K mv at
@@ -741,7 +743,7 @@ with concurrent work (e.g., KV TQ-HB encode in same encoder) even when
 access but doesn't block the rest of the GPU. Saved-encoder-CPU is also
 trivial (~3 µs/dispatch in iter-101 benches). Net t/s wash.
 
-**11th hypothesis falsification** on M5 Max where a llama.cpp-style or
+**11th hypothesis falsification** on M5 Max where a peer-style or
 peer-derived kernel-fusion lever did NOT port to a measurable hf2q
 decode speedup. Per `feedback_metal_compiler_auto_optimizes_static_levers`.
 
@@ -757,7 +759,7 @@ decode speedup. Per `feedback_metal_compiler_auto_optimizes_static_levers`.
 - Iter-103 measured FA-vec-tq-hb compute alone = 1.43 ms (compute-bound).
 - TQ overhead minus FA-compute = 1.76 ms — likely **per-token-per-head
   F32 norm multiply** + **8-bit codebook table lookup** intrinsic to TQ-HB
-  (vs llama.cpp's flat F16 K/V).
+  (vs peer's flat F16 K/V).
 - Structural cost of ADR-027 Phase B's 3.94× memory savings.
 - Closing this gap requires either dropping TQ-HB (loses memory savings,
   violates mantra of HOLD coherence) or reducing the codebook-lookup cost.
@@ -889,7 +891,7 @@ write-after-read on attn_q_normed (FWHT-pre) and on sdpa_out (FWHT-
 undo) by moving both into the FA kernel's shared memory.
 
 **Mantra check**: closing this 10.5% lifts decode 63.8 → 71.3 t/s.
-llama.cpp HEAD peer = 88-97 t/s. Closes ~50% of the 4.72 ms peer gap.
+Peer HEAD = 88-97 t/s. Closes ~50% of the 4.72 ms peer gap.
 
 **Iter-105 plan**: design + implement FA-vec-tq-hb kernel with FWHT
 prologue + epilogue. Falsifier gates:
@@ -932,13 +934,13 @@ This is the FIRST measured kernel that's NOT at the 16 µs floor.
 Confirms kernel-time gap (not dispatch-count gap) is the real lever
 per iter-71 + iter-90 + iter-101 + iter-102 reframe.
 
-**Why FA-vec-tq-hb is heavier than llama.cpp's FA-vec**: TQ-HB path
+**Why FA-vec-tq-hb is heavier than the peer's FA-vec**: TQ-HB path
 performs 8-bit codebook lookup per K row + per-token-per-head F32 norm
-multiply (tiers 5/6/8). llama.cpp's F16 K/V FA-vec skips the lookup +
+multiply (tiers 5/6/8). The peer's F16 K/V FA-vec skips the lookup +
 norm. The TQ overhead is the cost of the **3.94× memory savings**
 (ADR-027 Phase B). Trading memory bandwidth for codebook-lookup
-compute. This is structural; matching llama.cpp's FA-vec speed would
-require dropping TQ-HB or porting llama.cpp's nsg-ramp (also doesn't
+compute. This is structural; matching the peer's FA-vec speed would
+require dropping TQ-HB or porting the peer's nsg-ramp (also doesn't
 help at kL ≤ 256 per iter-100).
 
 **The 82% unaccounted bucket** — iter-104 must measure:
@@ -1014,7 +1016,7 @@ test_fused_ops bench_fwht_sign_premult_gemma_decode -- --ignored
 
 ### Iter-101 vec4 norm fusion (item D) — FALSIFIED by GPU pure-time bench
 
-Iter-99 item D estimated 2.8-3.4% decode ROI from porting llama.cpp's
+Iter-99 item D estimated 2.8-3.4% decode ROI from porting the peer's
 `kernel_rms_norm_mul_add_f32_4` (vec4 variant) over hf2q's scalar
 `fused_norm_add_f32`. Hypothesis from iter-99 lookup: `dot(x[i00],
 x[i00])` with `float4` reduces memory ops 4× per access; `simd_sum` skips
@@ -1044,10 +1046,10 @@ decode speedup** — within thermal noise. Item D dead by physics.
 
 The 1.7% ceiling explains why iter-98 listed norm sites as "already
 fused" / "small" — internal categorization was directionally correct.
-Iter-99 item D inherited llama.cpp's relative ROI claim without
+Iter-99 item D inherited the peer's relative ROI claim without
 measuring at hf2q's actual call count + per-call cost.
 
-10th hypothesis falsification on M5 Max where a llama.cpp lever did
+10th hypothesis falsification on M5 Max where a peer lever did
 NOT port to a hf2q win. Memory updated: `feedback_metal_compiler_auto_
 optimizes_static_levers`.
 
@@ -1071,10 +1073,10 @@ test_fused_ops bench_fused_norm_add_f32_gemma_decode -- --ignored
 
 ### Iter-100 FA-vec nwg A/B (item A) — FALSIFIED at gemma decode kL ≤ 170
 
-Iter-99 item A claimed llama.cpp's nwg=32 + nsg-ramp could be a long-
-context decode lever. Direct read of llama.cpp's dispatch logic
+Iter-99 item A claimed the peer's nwg=32 + nsg-ramp could be a long-
+context decode lever. Direct read of the peer's dispatch logic
 (`ggml-metal-ops.cpp:2944-2956`) corrected the prior agent's claim:
-**llama.cpp ALWAYS uses nwg=32 for FA-vec** — the `if (false)` branch
+**The peer ALWAYS uses nwg=32 for FA-vec** — the `if (false)` branch
 labelled "for small KV caches, we could launch a single workgroup" is
 explicitly disabled with the comment "this does not lead to significant
 improvement, so disabled". The `2*nwg*nsg*ncpsg < ne11` loop only ramps
@@ -1092,16 +1094,16 @@ max-tokens=128 (kL range 42→170), `--temperature 0` `--benchmark`:
 |---:|---:|---:|---|
 | 1 | 49.0 | **-23%** | Single WG can't saturate GPU |
 | 16 (default) | **63.6** | baseline | |
-| 32 (llama.cpp parity) | 63.4 | -0.3% (noise) | No improvement |
+| 32 (peer parity) | 63.4 | -0.3% (noise) | No improvement |
 
 **Verdict (TESTABLE → FALSIFIED)**:
 - nwg=16 already saturates the GPU at decode kL ≤ 170. Bumping to 32
   does nothing (within thermal noise floor).
-- The `nsg=1` structural fix (vs llama.cpp's nsg-up-to-4) MIGHT matter
+- The `nsg=1` structural fix (vs peer's nsg-up-to-4) MIGHT matter
   at long kL (kL ≥ 1024) but is OUT-OF-SCOPE for the peer-bench we're
   trying to close — `llama-bench tg128` runs at kL ≤ 128.
 - Per `feedback_metal_compiler_auto_optimizes_static_levers` — 9th
-  hypothesis falsification on M5 Max where a llama.cpp constant did NOT
+  hypothesis falsification on M5 Max where a peer constant did NOT
   port to a hf2q win.
 
 **Chesterton's fence**: hf2q's compute_nwg=16 default was a real
@@ -1138,23 +1140,23 @@ foundation):**
   dispatches/token**. Same order as hf2q's 990. The "9.4× headroom"
   claim collapses. Lines 732 + 775 retracted in-place.
 - Reframes the gap: per-dispatch GPU time (~16 µs hf2q vs ~11 µs
-  llama.cpp HEAD per iter-90) is the structural lever, NOT graph
+  the peer HEAD per iter-90) is the structural lever, NOT graph
   density. Confirms iter-71's earlier finding using independent data.
 
 **Action items ranked by ROI × risk (additive to iter-98 fusion plan):**
 
 | # | Action | Tag | Source | Est ROI | Risk |
 |---|--------|-----|--------|---------|------|
-| A | Verify FA-vec `nwg=32` engaged at decode kL ≥ 512 | TESTABLE | llama.cpp ggml-metal-ops.cpp:2944-3052 | small (long-ctx only) | low |
+| A | Verify FA-vec `nwg=32` engaged at decode kL ≥ 512 | TESTABLE | peer ggml-metal-ops.cpp:2944-3052 | small (long-ctx only) | low |
 | B | Fuse gate+up+SwiGLU into one Q5_K mv_id kernel for gemma-4 dense FFN | TESTABLE | DS4 dense.metal:203-271 | ~56 dispatches/token (~5%) | medium |
 | C | Persistent batch-encoder (one compute encoder per decode step) | TESTABLE | DS4 ds4_metal.m:223-235 | unknown — measure encode-CPU first | medium |
-| D | Port `kernel_rms_norm_fuse_impl<F=2/3>` `_4` (vec4) suffix variant | TESTABLE | llama.cpp ggml-metal.metal:2986-3059 | ~2.8-3.4% per iter-93 | low |
+| D | Port `kernel_rms_norm_fuse_impl<F=2/3>` `_4` (vec4) suffix variant | TESTABLE | peer ggml-metal.metal:2986-3059 | ~2.8-3.4% per iter-93 | low |
 | E | 2-pass SDPA-vector for long-K (kL ≥ 512) | TESTABLE | candle/MLX scaled_dot_product_attention.metal:434+577 | hot path FA_GL D=512 12.59 ms/call | medium |
 | F | N-gram speculative decode (verify-batched, no draft model) | TESTABLE | vLLM v1/spec_decode/ngram_proposer.py | 2-4× at acceptance ≥ 60% | medium |
 | G | DFlash block-diffusion drafter (z-lab gemma-4-26B-A4B-it-DFlash exists) | SPECULATIVE | dflash + omlx | 3-4× claimed Apple Silicon | high |
 | H | MTP K=3 self-spec for **qwen3.6**, NOT gemma | OUT-OF-SCOPE for ADR-028 | reddit-mtp + ds4 | 2× M5 Max for qwen | high |
-| I | `bin_fuse_f32_f32_f32_4` chain | TESTABLE | llama.cpp bin_fuse_impl 1209-1364 | ~6% per ADR-028 #14 | low |
-| J | Apple `mpp::tensor_ops::matmul2d` for K-quants | SPECULATIVE | greenfield (neither candle nor llama.cpp use it) | unknown | very high |
+| I | `bin_fuse_f32_f32_f32_4` chain | TESTABLE | peer bin_fuse_impl 1209-1364 | ~6% per ADR-028 #14 | low |
+| J | Apple `mpp::tensor_ops::matmul2d` for K-quants | SPECULATIVE | greenfield (neither candle nor peer use it) | unknown | very high |
 
 **Scope split:**
 - **ADR-028** (gemma-4-26b decode parity): items A, B, C, D, E, I — kernel
@@ -1314,15 +1316,15 @@ amortized across 990 dispatches), the real per-call cost is ~95-100 µs.
 - Remaining 65% (10.23 ms): QKV mv + FA-vec-tq-hb + O mv + norms + KV
   copy + swiglu + gelu_routing + end_layer + LM head + amortized encode
 
-**Where the 30% peer gap actually lives** (hf2q 15.86 ms vs llama.cpp
+**Where the 30% peer gap actually lives** (hf2q 15.86 ms vs peer
 11.11 ms = 4.75 ms gap):
 
-If hf2q & llama.cpp Q6_K mv_id GPU times are at parity (both ~95 µs),
+If hf2q & the peer Q6_K mv_id GPU times are at parity (both ~95 µs),
 then the entire 4.75 ms gap lives in the OTHER 65% (10.23 ms us vs
-5.48 ms llama = **46% slower on non-MoE work**). Most likely culprits:
+5.48 ms peer = **46% slower on non-MoE work**). Most likely culprits:
 1. **FA-vec-tq-hb** — TQ-HB SDPA path with FWHT + dequant sub-passes
 2. **Encoder overhead per dispatch** — at 990 dispatches × 5-10 µs CPU
-   encode = 5-10 ms, may differ between us and llama.cpp
+   encode = 5-10 ms, may differ between us and the peer
 3. **Other matmuls (QKV, O, MLP)** — Q6_K mv at smaller shapes
 
 Iter-95's y-reuse refactor falsification is now CONSISTENT: y-reuse
@@ -1334,7 +1336,7 @@ of decode. The static-evidence prediction was always small.
    If GPU pure time is large, the kernel itself is slow → kernel
    optimization. If small, then encode overhead per dispatch is
    dominant → fewer dispatches via fusion.
-2. Measure llama.cpp's actual per-kernel GPU time via Metal capture.
+2. Measure the peer's actual per-kernel GPU time via Metal capture.
 3. Strip TQ-HB at decode (operator-gated; conflicts with ADR-027
    3.94× memory savings) to isolate KV-format-related overhead.
 
@@ -1343,7 +1345,7 @@ of decode. The static-evidence prediction was always small.
 Implemented the y-vector register-reuse refactor identified in iter-91:
 - Each simdgroup now handles **NR0=2 weight rows** (was 1)
 - Pre-loads `yl[16]` once per outer-block, reuses across both rows
-- Mirrors llama.cpp's `kernel_mul_mv_q6_K_f32_impl` register-cache pattern
+- Mirrors the peer's `kernel_mul_mv_q6_K_f32_impl` register-cache pattern
 - Adjusted dispatch geometry: Q6_K uses `align=4` (was 2) → threadgroups.x = ceil(N/4)
 
 Files changed (transient):
@@ -1392,12 +1394,12 @@ to end-to-end speedup because:
 future iterations to skip this attack vector.
 
 **Iter-96 attack pivot**: where IS the 30% per-call gap? Hypotheses:
-1. **L1 cache miss rate**: llama.cpp's `nsg=2` thread-grouping may
+1. **L1 cache miss rate**: the peer's `nsg=2` thread-grouping may
    produce different L1 behavior than ours.
-2. **Pipeline cache**: llama.cpp's tag suffix `_nsg=2` suggests
+2. **Pipeline cache**: the peer's tag suffix `_nsg=2` suggests
    function-constant-driven specialization — our kernel doesn't use
    function constants.
-3. **Threadgroup→barrier scheduling**: llama.cpp's grid shape
+3. **Threadgroup→barrier scheduling**: the peer's grid shape
    `(ceil(N/(NSG*nr0)), m, 1)` produces fewer larger threadgroups
    (4 rows each) vs our many small (2 rows each). Apple GPU scheduler
    may favor fewer-larger.
@@ -1438,7 +1440,7 @@ n_experts=128, Q6_K weights):
 **Per-token aggregate** (gate_up only, ×60 layers): **11.25 ms = 71% of
 the 15.86 ms decode token time**. Q6_K mv_id is the dominant kernel.
 
-**Implied llama.cpp per-call** (assuming similar dispatch count): at
+**Implied peer per-call** (assuming similar dispatch count): at
 11.11 ms/token total × 71% MoE share = 7.9 ms / 60 calls ≈ 132 µs/call
 → **hf2q is ~42% slower per call** (187.5 vs 132 µs).
 
@@ -1468,11 +1470,11 @@ for (uint i = tid; i < dim; i += tg_size) {
 ```
 
 That's `rms_norm + mul-by-weight + add-residual` in one kernel. Same
-fusion as llama.cpp's `kernel_rms_norm_mul_add_f32_4`. We dispatch it
+fusion as the peer's `kernel_rms_norm_mul_add_f32_4`. We dispatch it
 at 8+ sites in forward_mlx.rs (3 in forward_decode body alone — lines
 1417, 1689, 1705).
 
-**The actual gap is the `_4` suffix — vec4 vectorization.** Llama.cpp's
+**The actual gap is the `_4` suffix — vec4 vectorization.** The peer's
 kernel uses `float4` loads/stores (4 elements per memory op); ours is
 scalar (`for (uint i = tid; i < dim; i += tg_size)` with 1 element per
 iteration).
@@ -1492,14 +1494,14 @@ the biggest fish.
 same ~3-5% range.
 
 **Where the real ~30% gap lives** (per iter-90 measurement of 15.86
-µs/dispatch hf2q vs 11.22 µs llama.cpp): per-kernel GPU-time on the
+µs/dispatch hf2q vs 11.22 µs peer): per-kernel GPU-time on the
 **dominant** kernels — mv_id Q6_K (MoE matmul), flash_attn_vec_tq_hb
 (SDPA decode), and the QKV mv kernels.
 
 **Iter-94 attack plan** (in order):
 1. Per-call timing instrumentation: add ENV-gated commit_and_wait
    timer around dispatch_id_mv to get ground-truth Q6_K mv_id µs/call
-   at gemma decode shape (n_tokens=1, top_k=8). Compare to llama.cpp
+   at gemma decode shape (n_tokens=1, top_k=8). Compare to the peer
    `kernel_mul_mv_q6_K_f32_nsg=2` per-call cost.
 2. If our Q6_K mv_id is significantly slower per-call: do the y-reuse
    refactor (iter-91 candidate) AND measure before/after.
@@ -1510,10 +1512,10 @@ The `feedback_metal_compiler_auto_optimizes_static_levers` standing
 rule applies: 7 prior kernel hypotheses falsified. Measure first,
 optimize after.
 
-### Iter-92 llama.cpp HEAD pipeline compile log → concrete fusion candidates
+### Iter-92 peer HEAD pipeline compile log → concrete fusion candidates
 
-Captured llama.cpp build-9078 actual decode-time pipeline compile log
-via `llama-bench -v -p 0 -n 32 -fa 1 -r 1`. The pipelines llama.cpp
+Captured the peer build-9078 actual decode-time pipeline compile log
+via `llama-bench -v -p 0 -n 32 -fa 1 -r 1`. The pipelines the peer
 loads at decode-time on gemma APEX-Q5_K_M, with their function-constant
 suffixes, are direct evidence of which kernels they ACTUALLY use:
 
@@ -1540,7 +1542,7 @@ kernel_cpy_f32_f16
    speedup**.
 
 2. **`kernel_bin_fuse_f32_f32_f32_4`** (fused elementwise multiply) —
-   used by llama.cpp's gate_silu × up flow for SwiGLU. We have
+   used by the peer's gate_silu × up flow for SwiGLU. We have
    `mul_mv_id_q4_0_f32_swiglu` (kernel-fused gate+up+swiglu+matmul)
    for Q4_0 ONLY. Gemma uses Q6_K experts → falls to the slow path.
    Adding Q6_K and Q5_K swiglu-fused mv_id kernels could save ~2
@@ -1548,12 +1550,12 @@ kernel_cpy_f32_f16
    speedup**.
 
 3. **`kernel_flash_attn_ext_vec_..._nwg=32`** (split-K FA-vec) —
-   llama.cpp parallelizes the K dimension across 32 work-groups, then
+   the peer parallelizes the K dimension across 32 work-groups, then
    does a separate reduce kernel. We do single-pass FA-vec without
    split-K. For long-context decode (e.g. tg256), split-K can be 1.5-2×
    faster on the FA-vec dispatch. Savings depend on context length.
 
-4. **`kernel_set_rows_f16_i64`** + **F16 KV cache** — llama.cpp uses F16
+4. **`kernel_set_rows_f16_i64`** + **F16 KV cache** — the peer uses F16
    KV (not TQ-HB) at decode. We use TQ-HB (per ADR-027 for 3.94×
    memory). The TQ-HB path adds 4-5 dispatches per layer (FWHT
    premult + hadamard + quantize + dequant + FWHT undo). Skipping
@@ -1573,7 +1575,7 @@ kernel_cpy_f32_f16
 The Q6_K mv_id y-reuse refactor (iter-91 candidate) is **lower
 priority** than these fusions: the static-evidence hypothesis is
 ~5-10%, while these fusions have direct measurement support from
-llama.cpp's actual kernel inventory. Per standing rule
+the peer's actual kernel inventory. Per standing rule
 `feedback_metal_compiler_auto_optimizes_static_levers`, prefer
 hypotheses with empirical support.
 
@@ -1581,9 +1583,9 @@ hypotheses with empirical support.
 
 Direct code-read comparison of Q6_K mv_id kernel between hf2q
 (`/opt/mlx-native/src/shaders/quantized_matmul_id_ggml.metal:803`) and
-llama.cpp (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:7968`):
+the peer (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:7968`):
 
-**llama.cpp** `kernel_mul_mv_q6_K_f32_impl`:
+**The peer** `kernel_mul_mv_q6_K_f32_impl`:
 - Templated on `nr0` (rows per simdgroup); for Q6_K `N_R0_Q6_K = 2`
 - Outer loop `for (int i = ix; i < nb; i += 2)`:
   - **Pre-loads `yl[16]` from device once**:
@@ -1602,13 +1604,13 @@ llama.cpp (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:7968`):
 - Re-loads `y[]` from device **for every row** inside `for (int l = 0;
   l < n; ++l)` — no yl[] register reuse across rows.
 
-**Y-vector reuse savings**: per outer-loop iteration, llama.cpp does 1
+**Y-vector reuse savings**: per outer-loop iteration, the peer does 1
 y-load + 2 row computations vs hf2q's 2 separate y-loads + 2 row
 computations. For a 2816-dim hidden (gemma-4-26b) Q6_K row with
 nb = 2816/256 = 11 blocks, this saves ~16 device-memory reads per
 block × 11 blocks = ~176 device reads per row, halved across 2 rows.
 
-**Refactor**: change kernel_mul_mv_id_q6_K_f32 to match llama.cpp's
+**Refactor**: change kernel_mul_mv_id_q6_K_f32 to match the peer's
 nr0=2 pattern. Adjust `dispatch_id_mv` in
 `/opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs:540` to use
 threadgroup geometry `(div_ceil(n, NSG*nr0), m, 1)` instead of
@@ -1644,9 +1646,9 @@ dispatches/token**.
 | Head dispatches/token | 990 | **4** | LM-head + softcap + argmax = 3-4 ops |
 | µs / dispatch | 0.97 µs | **15.8 µs** | Apple Metal GPU dispatch latency |
 
-**Corrected per-dispatch comparison vs llama.cpp HEAD**:
+**Corrected per-dispatch comparison vs peer HEAD**:
 - hf2q decode: 15.71 ms / 990 dispatches = **15.86 µs/dispatch**
-- llama.cpp at 90 t/s = 11.11 ms/token; assuming similar ~990 dispatches
+- The peer at 90 t/s = 11.11 ms/token; assuming similar ~990 dispatches
   (per iter-71 dispatch-count parity): **11.22 µs/dispatch** → 29% faster
 
 **Conclusion**: decode gap is **per-dispatch GPU time**, not dispatch
@@ -1685,14 +1687,14 @@ decode is dominated by encoder/dispatch overhead, NOT GPU kernel time.
 **Comparison vs candle Phase 0 baseline**: this iter-89 line ("~105
 dispatches/token") **was wrong**. See iter-99: candle issues ~400-1000
 dispatches/token, same order as hf2q's 990. Retracted; the structural
-gap is per-dispatch GPU time (~16 µs vs ~11 µs llama.cpp HEAD), not
+gap is per-dispatch GPU time (~16 µs vs ~11 µs the peer HEAD), not
 dispatch density.
 
-llama.cpp also has high dispatch counts (iter-71 confirmed parity); the
+The peer also has high dispatch counts (iter-71 confirmed parity); the
 ~30% per-dispatch encoder gap accounts for the 0.65-0.70× decode peer.
 
 **Highest-leverage attack**: cut dispatch count by 2× via kernel fusion.
-At 8000 dispatches × 0.97 µs ≈ 8 ms/token = **125 t/s = BEATS llama.cpp
+At 8000 dispatches × 0.97 µs ≈ 8 ms/token = **125 t/s = BEATS the peer
 HEAD by 30%**. iter-90 to break down the 510-per-layer count by site.
 
 **`forward_decode_kernel_profile` rebuild needed for site-level
@@ -1708,7 +1710,7 @@ forward_decode (mirroring forward_prefill_batched.rs's 20+ buckets).
 ### Positive
 
 - **User-visible win**: 29× prefill speedup over per-token default at
-  pp1024; hf2q BEATS llama.cpp at this size on Gemma-4. 4.3× TTFT
+  pp1024; hf2q BEATS the peer at this size on Gemma-4. 4.3× TTFT
   improvement on real chat prompts.
 - **Cross-model benefit**: same iter-68 typo fix unlocks qwen35moe too
   (different code path, same shared dispatcher).
@@ -1731,14 +1733,14 @@ forward_decode (mirroring forward_prefill_batched.rs's 20+ buckets).
 - **Decode 0.62× peer remains**: iter-69..72/81 measured but did not
   close. Multi-day µbench infrastructure (Q6_K pack helper that doesn't
   exist) is required for kernel-level attack.
-- **Pp2455 prefill at llama.cpp HEAD = 1.54× FASTER** (iter-88
+- **Pp2455 prefill at the peer HEAD = 1.54× FASTER** (iter-88
   re-bench). The cited 0.80× / 0.71× was vs stale build-9010 peer; at
   build 9078 hf2q is solidly ahead. Mantra MET for prefill at all sizes
   measured.
 - **Decode at FA=1 still 0.65-0.70× peer at HEAD** (iter-88 re-bench).
   The cited 0.62× was vs build-9010; at build 9078 the gap is slightly
   smaller (0.65-0.70× across tg32/128/256) but still meaningful. With
-  FA=0 (llama.cpp default) hf2q is 2.28× FASTER. ADR-028 #3 (decode
+  FA=0 (the peer default) hf2q is 2.28× FASTER. ADR-028 #3 (decode
   µbench infrastructure) remains the path to close mantra at FA=1.
 
 ### Neutral
@@ -1782,8 +1784,8 @@ narrow the work scope.
 - **HF2Q_SKIP_*-style env flags are timing bisects, not surgical
   isolations.** The "saved" time includes everything in the gated
   branch. Microbench the SPECIFIC dispatch + barrier instead.
-- **llama.cpp constants do not necessarily port to hf2q wins on M5
-  Max.** Apple's compiler/scheduler hoists what llama.cpp hand-tunes.
+- **The peer constants do not necessarily port to hf2q wins on M5
+  Max.** Apple's compiler/scheduler hoists what the peer hand-tunes.
   Verify every port empirically.
 - **HF2Q_SKIP_TQ_SDPA=1 → 79.1 t/s** (vs 63.6 default) measures the
   total TQ regime cost = 3.19 ms = 20% of decode. Garbage output, but
@@ -1902,7 +1904,7 @@ Kernel-level levers approaching exhaustion:
   port cost vs marginal win
 - Projs/O-proj/etc: at compute wall per iter-100..118 falsifications
 
-The decode peer gap (15.83ms hf2q vs 11.11ms llama.cpp = 0.70× peer at
+The decode peer gap (15.83ms hf2q vs 11.11ms the peer = 0.70× peer at
 Gemma 4 26B-Q5_K_M) is **structurally bounded** within current TQ-HB
 + Q5_K_M. Closure paths confirmed:
 
@@ -1996,7 +1998,7 @@ decode path:
 - Searched for standalone `add_f32`/`elementwise_add`/`dispatch_add` in
   `forward_mlx.rs`: zero matches.
 
-llama.cpp's `bin_fuse_f32_f32_f32_4` exists for chains of unfused
+The peer's `bin_fuse_f32_f32_f32_4` exists for chains of unfused
 binary ops (e.g., `out = a + b + c + d`). hf2q's decode pattern is
 `hidden = norm(hidden + attn_out)` and `hidden = norm(hidden +
 ffn_out)` — the residual+norm pair is already a single kernel. **Task
@@ -2088,7 +2090,7 @@ needed on priority vs Shape B (spec-decode).**
 
 ### iter-126: Path D scope refined — nsg axis is the actual lever
 
-Re-read llama.cpp's flash_attn_vec at `ggml-metal.metal:6782`:
+Re-read the peer's flash_attn_vec at `ggml-metal.metal:6782`:
 
 ```c
 for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) { ... }
@@ -2099,7 +2101,7 @@ per-simdgroup index. At long context they grow nsg ∈ {1,2,4} (per
 `ggml-metal-ops.cpp:2953`: `while (2*nwg*nsg*ncpsg < ne11 && nsg < 4)
 { nsg *= 2; }`).
 
-**At kL=4096:** llama.cpp uses nwg=32, nsg=4 → 128 simdgroups split K
+**At kL=4096:** the peer uses nwg=32, nsg=4 → 128 simdgroups split K
 (1 K-iter each). hf2q uses nwg=32, **nsg=1 implicit** (32 simdgroups,
 4 K-iters each). That's the **structural 4× gap** at long context.
 
@@ -2123,7 +2125,7 @@ partial buffer same size). Required changes:
    NSG simdgroups.
 2. K-loop: `for (ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG)`.
 3. Shared memory: ss[] / so[] / sm[] sized `NSG × per-simdgroup` (or
-   per-simdgroup banks via `+ sgitg*SH` offset like llama.cpp 6714-17).
+   per-simdgroup banks via `+ sgitg*SH` offset like the peer's 6714-17).
 4. Cross-simdgroup reduce inside the workgroup at end-of-K (online
    softmax: each simdgroup has local M, S, partial output; combine via
    threadgroup_barrier + simd_max + simd_sum).
@@ -2147,7 +2149,7 @@ saved/token** = 28% decode speedup. Same headline as iter-125 but
 
 #### Standing rule for kernel parallelism levers
 
-llama.cpp uses BOTH nwg and nsg, with nsg growing past short context.
+The peer uses BOTH nwg and nsg, with nsg growing past short context.
 hf2q has only ever tuned nwg. Future kernel work where K-axis
 parallelism matters (e.g., extending to other quant types) should
 consider nsg as a first-class axis, not implicit-1.
@@ -2217,7 +2219,7 @@ Gemma path (compute_nsg returns 1 → no change).
 
 #### Standing rule for future kernel parallelism work
 
-llama.cpp uses BOTH nwg AND nsg as first-class axes. Apple Metal
+The peer uses BOTH nwg AND nsg as first-class axes. Apple Metal
 threadgroup_size is `(simdwidth=32, NSG, 1)` and threadgroup memory
 should bank per-simdgroup at sgitg-strided offsets. Any future FA-class
 kernel work where K-axis parallelism matters (e.g., extending to other
@@ -2230,14 +2232,14 @@ Operator triggered: "qwen was 120+ -- have we regressed? how do we
 compare to peers?" Production A/B with rebuilt binary (Path D in,
 hf2q HEAD `cbae809`):
 
-#### hf2q vs llama.cpp peer (qwen3.6-35B-A3B-APEX-Q5_K_M, M5 Max)
+#### hf2q vs peer (qwen3.6-35B-A3B-APEX-Q5_K_M, M5 Max)
 
-| Scenario              | hf2q t/s | llama.cpp t/s | Ratio        |
+| Scenario              | hf2q t/s | peer t/s | Ratio        |
 |-----------------------|----------|---------------|--------------|
 | Short cold (tg64-eq)  | **128.0** | 101.0         | **1.27× peer** |
 | Long (kL=4096 decode) | **110.2** | ~96.6         | **1.14× peer** |
 
-llama.cpp tg256 = 101.06 t/s (cold). pp4096+tg256 combined = 1156.82 t/s
+The peer tg256 = 101.06 t/s (cold). pp4096+tg256 combined = 1156.82 t/s
 (extracted decode ≈ 96.6 t/s post-prefill).
 
 #### Status vs ADR-028 mantra
@@ -2245,7 +2247,7 @@ llama.cpp tg256 = 101.06 t/s (cold). pp4096+tg256 combined = 1156.82 t/s
 1. ✅ **Coherence ≥ peers**: byte-identical sourdough + long-context
    F32-vs-TQ-on equivalence at kL ∈ {4096, 8192}.
 2. ✅ **Speed ≥ peers**: 1.14-1.27× of peer. **MET** at qwen3.6 35B.
-3. ✅ **TQ enabled**: 3.94× per-slot KV memory savings (llama.cpp has
+3. ✅ **TQ enabled**: 3.94× per-slot KV memory savings (the peer has
    none) + adaptive NSG=4 long-context lever.
 
 ADR-028 mantra MET on Qwen3.6 35B. The earlier "still kinda slow at
@@ -2292,7 +2294,7 @@ Operator: "yeah we need to test qwen3.6 AND gemma4 for all of this".
 
 #### gemma4 26B-A4B (gemma4-ara-2pass-APEX-Q5_K_M.gguf, M5 Max)
 
-**llama.cpp peer**:
+**peer**:
 - pp1024: 4647.90 ± 5.46 t/s
 - tg256 cold: **102.46 ± 0.59 t/s**
 
@@ -2302,7 +2304,7 @@ Operator: "yeah we need to test qwen3.6 AND gemma4 for all of this".
 
 #### Per-model peer comparison (REAL measurements, M5 Max, M5 Max HEAD)
 
-| Model     | Context | hf2q t/s | llama.cpp t/s | Ratio        |
+| Model     | Context | hf2q t/s | peer t/s | Ratio        |
 |-----------|---------|----------|---------------|--------------|
 | qwen3.6   | short   | 128.0    | 101.0         | **1.27× WIN** |
 | qwen3.6   | long    | 110.2    | ~96.6         | **1.14× WIN** |
@@ -2316,7 +2318,7 @@ Operator: "yeah we need to test qwen3.6 AND gemma4 for all of this".
    - **qwen3.6**: ✅ MET (1.14-1.27× peer)
    - **gemma4**: ❌ NOT MET (0.71× peer at short context)
 3. **TQ enabled ≥ peers**: ✅ MET on both (3.94× per-slot KV memory
-   savings llama.cpp doesn't have).
+   savings the peer doesn't have).
 
 #### Why gemma4 loses while qwen3.6 wins (structural diagnosis)
 
@@ -2333,7 +2335,7 @@ which gemma4 doesn't reach due to sw=1024 cap.
 
 **The qwen3.6 win is from**:
 - TQ-HB cache architecture (3.94× memory savings → fits in M5 Max
-  unified memory headroom; llama.cpp's flat F16 forces partial KV
+  unified memory headroom; the peer's flat F16 forces partial KV
   paging)
 - Long-context (sw=4096) enables Path D's NSG axis lift
 - MoE expert dispatch path well-optimized in mv_id kernels (per
@@ -2652,7 +2654,7 @@ suggesting a regression. iter-133 verified:
   from `gemma-4-26B-A4B-it-ara-abliterated-dwq` series).
 - Today's only available gemma fixture is the APEX-Q5_K_M variant
   (`gemma4-ara-2pass-APEX-Q5_K_M.gguf`).
-- llama.cpp peer at APEX-Q5_K_M = 102 t/s; we're at 63 t/s long-context.
+- peer at APEX-Q5_K_M = 102 t/s; we're at 63 t/s long-context.
 - These are NOT directly comparable to iter51's dwq (different quant,
   different bandwidth pressure).
 
@@ -2755,7 +2757,7 @@ Before iter-141 (Shape B body), download DFlash draft models locally:
 - `huggingface-cli download z-lab/Qwen3.6-35B-A3B-DFlash`
 
 Then iter-141..145 implements verify_batched with DFlash as the proposer.
-Final benchmarking measures actual decode speedup vs both peer (llama.cpp)
+Final benchmarking measures actual decode speedup vs both peer
 and existing Shape S serial baseline.
 
 ### iter-141: walk-phase pivot — spec-decode is run-phase, refocus on peer kernel ports
@@ -2770,7 +2772,7 @@ to land before kernel-level peer-porting is exhausted.
 - Port best-from-peer KERNEL optimizations
 - Task #23: DS4 fused gate+up+SwiGLU mv_id (gemma4 dense FFN target)
 - Task #18: Q6_K + Q5_K fused-swiglu-down mv_id
-- Future kernel micro-optimizations from llama.cpp / ds4 / vllm
+- Future kernel micro-optimizations from the peer / ds4 / vllm
 
 **DEFER (run phase, after walk closes)**:
 - Path A spec-decode (n-gram source) — iter-134..140 scaffold preserved
@@ -2817,7 +2819,7 @@ but never trust them over code."
 
 #### Peer-kernel survey at gemma4 dense-FFN scope
 
-Read llama.cpp metal kernels for unported fused variants
+Read the peer metal kernels for unported fused variants
 (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal`):
 - `kernel_geglu_f32` line 1444 — gate*GELU(up). Equivalent to our
   `fused_gelu_mul`. Already ported.
@@ -2827,14 +2829,14 @@ Read llama.cpp metal kernels for unported fused variants
   — all single-buffer activation kernels (NO matmul fusion). Same shape
   as our gate*activation(up) post-matmul ops.
 
-**Finding**: llama.cpp does NOT have a fused gate-projection +
+**Finding**: the peer does NOT have a fused gate-projection +
 up-projection + activation kernel. All three projections are independent
 mat-vec dispatches; gate and up matmuls are SEPARATE in their build_ffn
 graph.
 
 DS4's `kernel_dsv4_shared_gate_up_swiglu_q8_0`
 (`/opt/ds4/metal/dense.metal:203`) IS a fused 2-projection + activation
-kernel. **DS4 is BEYOND llama.cpp here.** Porting DS4's fusion would put
+kernel. **DS4 is BEYOND the peer here.** Porting DS4's fusion would put
 us ahead of peer.
 
 #### Re-checking gemma4 graph against peer at decode
@@ -2856,7 +2858,7 @@ us ahead of peer.
 14. `build_ffn(LLM_FFN_GELU, LLM_FFN_PAR)` — gate + up + activation +
     down (4 dispatches; PAR=parallel gate/up = 2 matmul + 1 GELU + 1 down)
 
-= **15 dispatches per dense layer in llama.cpp**
+= **15 dispatches per dense layer in the peer**
 
 hf2q gemma4 path at forward_mlx.rs:4807-4854 + earlier QKV/attn:
 - 1 fused_norm_add (post-attn norm + add) — 1 dispatch (FUSED 2 ops)
@@ -2867,14 +2869,14 @@ hf2q gemma4 path at forward_mlx.rs:4807-4854 + earlier QKV/attn:
 - 1 down_proj — 1 dispatch
 - (attn block: similar count but with extra post-attn-norm fused into add)
 
-**Compared to llama.cpp's 15 dispatches/layer, hf2q is at ~13** (the
+**Compared to the peer's 15 dispatches/layer, hf2q is at ~13** (the
 norm+add fusion saves 1, the fused_gelu_mul saves 1). Already AHEAD on
 fusion count.
 
 #### Implication for iter-142 walk-phase
 
 Two findings together:
-1. We already have FEWER dispatches per layer than llama.cpp.
+1. We already have FEWER dispatches per layer than the peer.
 2. DS4's fusion would save ~1-2 more dispatches/layer (gate+up+activation
    collapse from 3→1 vs our current 3-dispatch unfused).
 
@@ -2883,12 +2885,12 @@ The 0.71× peer gap on gemma4 is NOT explained by dispatch count vs peer
 per-kernel COUNT.
 
 **Hypothesis to test before any kernel port**:
-- H1: hf2q's per-Q5_K-mv kernel time > llama.cpp's at gemma4 shape
+- H1: hf2q's per-Q5_K-mv kernel time > the peer's at gemma4 shape
   (hidden=2816, intermediate=2112). Measurable via xctrace
   `Metal System Trace` with `scripts/profile-decode-mst.sh`.
-- H2: hf2q's encode-CPU per dispatch > llama.cpp's. Measurable via
+- H2: hf2q's encode-CPU per dispatch > the peer's. Measurable via
   `HF2Q_SPLIT_TIMING=1` (encode_ns vs gpu_ns body split) plus
-  llama.cpp counterpart.
+  the peer counterpart.
 
 If H1 dominates → kernel-level port (DS4 won't help; need shader
 optimization on individual mv kernels).
@@ -2930,7 +2932,7 @@ Steady-state per-token figures:
 - Dispatches/token: 986 (BODY only) → 32.9 dispatches/layer at 30 layers
 - Barriers/token: 459 (BODY) → 15.3 barriers/layer
 
-#### Run 2 — llama.cpp peer baseline on same fixture
+#### Run 2 — peer baseline on same fixture
 
 ```
 llama-bench --model gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 0 -n 16 -t 1
@@ -2941,7 +2943,7 @@ Output:
 | gemma4 26B.A4B Q6_K | 19.15 GiB | 25.23 B | BLAS,MTL | 1 | tg16 | 102.05 ± 2.95 |
 ```
 
-llama.cpp build d05fe1d7d (9010) reports **102.05 tok/s tg16** on the
+The peer build d05fe1d7d (9010) reports **102.05 tok/s tg16** on the
 same gguf. Per-token: **9.80 ms**.
 
 #### Verdict
@@ -2976,7 +2978,7 @@ session-overhead-inflated but ratios are still relative-truth):
 - Q6_K dense FFN (gate+up+down)
 
 Bisection plan iter-144+:
-1. Run xctrace Metal System Trace on hf2q + llama.cpp at this fixture
+1. Run xctrace Metal System Trace on hf2q + the peer at this fixture
    (script `scripts/profile-decode-mst.sh` already exists)
 2. Aggregate per-kernel µs+count → which kernel families own the 4.65 ms
 3. Port the slowest 1-2 kernels at peer parity
@@ -3019,14 +3021,14 @@ H3: hf2q's KV cache copy path does extra work peer skips:
 
 Read locations to inspect:
 - `forward_mlx.rs` ~3204..3251 (`dense_kvs[layer_idx].k`/`.v` copy/cast)
-- llama.cpp `kernel_cpy_f32_*` family for peer copy
+- The peer `kernel_cpy_f32_*` family for peer copy
 
 If the gap reduces to <5× by porting peer's KV-cache-copy shape, that
 recovers ~1.0-1.3 ms/token = ~7% of decode = a real walk-phase win
 (unlike DS4 fusion's 0.09%).
 
 iter-145 plan: bisect KV cache copy with focused µbench harness +
-read llama.cpp's KV write path; identify the single change that closes
+read the peer's KV write path; identify the single change that closes
 the 37.6× ratio gap.
 
 ### iter-145+146: fused dispatch_kv_cache_copy_batch_f32_kv_dual + finding
@@ -3063,7 +3065,7 @@ Comparing the same gemma4 APEX-Q5_K_M decode:
 |------|---:|---:|---:|
 | **Default** (TQ-HB encode + FA-vec-tq-hb) | 69.3 | 14.43 | 0.679× |
 | **HF2Q_USE_DENSE=1** (dense_kvs + FA-vec) | **81.5** | **12.27** | **0.799×** |
-| llama.cpp peer (HEAD build 9010) | 102.05 | 9.80 | 1.0× |
+| peer (HEAD build 9010) | 102.05 | 9.80 | 1.0× |
 
 **Default path adds ~2.16 ms/token of TQ-HB overhead.** At gemma4
 production with `tq_kv = inactive` reported at load time, the
@@ -3209,7 +3211,7 @@ Real next-iter targets (operator pick required):
 
 ### iter-150: peer FA-vec architecture + structural-distribution finding
 
-#### llama.cpp's FA-vec layout (the peer model)
+#### The peer's FA-vec layout
 
 Read `kernel_flash_attn_ext_vec` at
 `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:6666`:
@@ -3252,13 +3254,13 @@ single-kernel optimization at this fixture.
 
 #### Structural-distribution finding
 
-The 4.65 ms gap to peer (hf2q 14.45 vs llama.cpp 9.80) is NOT
+The 4.65 ms gap to peer (hf2q 14.45 vs peer 9.80) is NOT
 concentrated in one kernel. Per iter-111 inventory, the gap is
-**distributed** — hf2q is roughly 30% slower than llama.cpp **across
+**distributed** — hf2q is roughly 30% slower than the peer **across
 multiple kernel families** (FA-vec, projs, MLP matmuls, LM head). 32%
 gap × 6 kernel families = no single 4ms target.
 
-What llama.cpp does differently architecture-wise:
+What the peer does differently architecture-wise:
 1. FA-vec uses NE=4 (4 cache positions per simdgroup vs hf2q's 1)
 2. mat-vec kernels use SIMD-group matrix-multiply intrinsics where
    shape allows (`simdgroup_matrix_multiply`)
@@ -3303,7 +3305,7 @@ The last template parameter is **NE** (cache positions per simdgroup).
 | dk192_dv192 | 2 | larger heads |
 | **dk256_dv256** | **1** | gemma4 shape — NE=1 is peer choice |
 
-**Falsification**: At gemma4 head_dim=256, llama.cpp uses NE=1 — the
+**Falsification**: At gemma4 head_dim=256, the peer uses NE=1 — the
 SAME pattern hf2q's flash_attn_vec_tq_hb uses. NE=4 would actually
 DEVIATE from peer-tuned shape. Each lane would handle 8× more float4
 elements per cache position with NL=8 lanes — high register pressure,
@@ -3369,7 +3371,7 @@ iter-152+ continues only if operator engages on (1) or (2).
 
 `docs/reddit/reddit-mtp.txt` (operator-flagged): MTP (Multi-Token
 Prediction) is the **2.5× speedup lever for Qwen 3.6 27B** in
-llama.cpp via PR 22673:
+the peer via PR 22673:
 
 ```
 llama-server -m Qwen3.6-27B-Q5_K_M-mtp.gguf \
@@ -3499,7 +3501,7 @@ If MTP forward_draft ≈ verifier forward_decode in cost, the loop is
 tokens per iter at 80% accept. That matches the observed 27/34 = 0.80×.
 
 For the lever to PAY: MTP forward_draft must be MUCH cheaper than
-verifier forward_decode. Reddit reports llama.cpp achieves 2.5× with
+verifier forward_decode. Reddit reports the peer achieves 2.5× with
 `--spec-draft-n-max 3` (3 drafts per verify). hf2q does N=1 drafts
 (single MTP block, single propose) and forward_draft cost equals
 verifier — neither lever applied.
@@ -3586,7 +3588,7 @@ verifier pattern. Expected:
               spec_iter ≈ 31.8 + 1.5 = 33.3 ms
               tok/s @ 80% accept = 1.8 / 0.0333 = 54 tok/s
   Speedup:    54 / 34 = 1.59× over greedy on qwen3.6
-  Peer:       54 / 102 (gemma4 llama peer) = depends on qwen3.6 peer
+  Peer:       54 / 102 (gemma4 peer) = depends on qwen3.6 peer
 
 Plus iter-156 reduces loop overhead (logits readback, embed upload).
 
@@ -3896,7 +3898,7 @@ If T_v(2) ≈ 1.4 × T_v (decode is sublinear on N because KV-state dominates):
 - T_v = 31.5 ms, T_d = 4 ms, a = 0.78
 - Spec: 1.78 × 31.5 / (44.1 + 4) = 56 / 48 = **1.16× greedy**
 
-Modest. To get llama.cpp's 2.5×, need K=3:
+Modest. To get the peer's 2.5×, need K=3:
 - 3 chained drafts: 12 ms
 - T_v(4) ≈ ~1.7 × T_v = 53 ms
 - 4 tokens at 78%-each accept ≈ 1 + 0.78 + 0.78² + 0.78³ = 2.62 tokens
@@ -3938,7 +3940,7 @@ Total LOC: ~150-300. Multi-iter.
 
 Operator pinged: `gemma4: --- mlx-native: 853 tokens in 13.67s
 (62.4 tok/s) --- -- still` — confirming gemma4 gap to peer
-(llama.cpp 102 tok/s) is "still" present. Pivoting walk-phase
+(the peer 102 tok/s) is "still" present. Pivoting walk-phase
 from qwen36/MTP/spec-decode back to gemma4 for next iter
 sequence.
 
@@ -3948,7 +3950,7 @@ sequence.
 |------|---:|---:|---:|
 | **Default** (TQ-HB + FA-vec-tq-hb) | 69.3 | **62.5** | -9.8% |
 | **HF2Q_USE_DENSE=1** | 81.5 | **70.9** | -13.0% |
-| llama.cpp peer (HEAD build 9010) | 102.05 | (cached) | — |
+| peer (HEAD build 9010) | 102.05 | (cached) | — |
 
 Current gap to peer: 0.613× (default), 0.695× (USE_DENSE=1).
 
@@ -4032,7 +4034,7 @@ quants amplify the bottleneck.
 
 #### Peer comparison
 
-llama.cpp `kernel_swiglu_f32` is also a SEPARATE kernel from
+The peer `kernel_swiglu_f32` is also a SEPARATE kernel from
 `kernel_mul_mv_id_q5_K_f32` / `_q6_K_f32`. Peer also pays the
 silu_mul + barrier + matmul triplet at gemma4 expert_down. **Peer
 hits 102 tok/s on the unfused path**; we hit 62 tok/s on the
@@ -4087,7 +4089,7 @@ greedy):
 
 | | tok/s | × peer |
 |---|---:|---:|
-| llama.cpp (HEAD 9078) | **103.13** | 1.000× |
+| peer (HEAD 9078) | **103.13** | 1.000× |
 | hf2q USE_DENSE=1 | 70.9 | 0.687× |
 | hf2q DEFAULT (TQ-HB) | 62.5 | **0.606×** |
 
@@ -4240,7 +4242,7 @@ hf2q has full plumbing:
 | Default (TQ-HB) | 62.5 | 1.000× | 0.606× |
 | USE_DENSE=1 | 70.9 | 1.134× | 0.687× |
 | **USE_DENSE=1 + F16_KV=1** | **72.3** | **1.157×** | **0.701×** |
-| llama.cpp peer | 103.13 | 1.650× | 1.000× |
+| peer | 103.13 | 1.650× | 1.000× |
 
 **+15.7% over default, +2.0% over USE_DENSE alone.** F16 KV adds
 incremental win on top of USE_DENSE.
@@ -4306,13 +4308,13 @@ byte-comparison, surface to operator with quality A/B.
 Specific findings:
 - Sourdough: 3656/3658 → 3095/3658 = **−561 bytes** (15% loss)
 - Sliding wrap: 752/2327 → 627/2316 = **−125 bytes**
-- L24 cache_k rel_rms vs llama: 1.4e-2 → 2.7e-1 = **19× worse**
-- L24 sdpa_out rel_rms vs llama: 1.4e-2 → 6.4e-1 = **45× worse**
+- L24 cache_k rel_rms vs peer: 1.4e-2 → 2.7e-1 = **19× worse**
+- L24 sdpa_out rel_rms vs peer: 1.4e-2 → 6.4e-1 = **45× worse**
 
 **Critical control test (the load-bearing finding)**:
-- llama.cpp F16 KV vs F32 KV: **2327/2327 bytes — IDENTICAL**
+- The peer F16 KV vs F32 KV: **2327/2327 bytes — IDENTICAL**
 
-llama.cpp's F16 path is byte-identical to F32. Ours is 19× drift.
+The peer's F16 path is byte-identical to F32. Ours is 19× drift.
 **The 19× is a real bug** in our F16 flash_attn_vec kernel — not
 F16 precision tradeoff (peer pays no precision cost on the same
 F16 storage).
@@ -4340,7 +4342,7 @@ stakes. **Long-context drift does not break production output.**
 | Short factual ("Paris") | "Paris" | "Paris" | **Identical** |
 | Long essay | coherent | coherent (~50% token-divergent) | **Coherent** |
 | Strict-byte vs F32 | 3656/3658 | 3095/3658 | **−561 bytes drift** |
-| Strict-byte vs llama F32 | 752/2327 | 627/2316 | **−125 bytes drift** |
+| Strict-byte vs peer F32 | 752/2327 | 627/2316 | **−125 bytes drift** |
 | Coherence under sliding wrap | OK | OK | **OK** |
 | L24 SDPA drift vs peer | 1.4e-2 | 6.4e-1 | **45× amplification (BUG)** |
 
@@ -4406,8 +4408,8 @@ semantic content equivalent.
 | Strict-byte interpretation | -561 bytes drift | -3824 bytes (after 877) |
 
 These aren't apples-to-apples — ADR-009 compared hf2q-F16 vs
-llama.cpp F16; I'm comparing hf2q-F16 vs hf2q-F32. ADR-009's
-"3095/3658" was hf2q-F16's common prefix with llama.cpp; today's
+peer F16; I'm comparing hf2q-F16 vs hf2q-F32. ADR-009's
+"3095/3658" was hf2q-F16's common prefix with the peer; today's
 877 is hf2q-F16 vs hf2q-F32.
 
 Net status: F16 KV produces production-coherent output across
@@ -4428,7 +4430,7 @@ Three operator picks for gemma4 default:
 - 72.3 tok/s, 0.701× peer, 251 MiB/slot
 - F16 precision in KV — 877-byte common prefix on sourdough,
   recipe-equivalent semantics beyond
-- Documented "known-worse" via ADR-009 strict-byte vs llama —
+- Documented "known-worse" via ADR-009 strict-byte vs peer —
   re-eval at HEAD warranted (this iter shows production-coherent)
 
 (c) **No flip** — keep TQ-HB default
@@ -4575,7 +4577,7 @@ qwen36 batched-verify spec_decode (iter-160 scope, has documented
 
 #### Standing decision — Three closure paths still apply
 
-Independent of regression: gemma4's structural gap to llama.cpp
+Independent of regression: gemma4's structural gap to the peer
 (measured at iter-150 as TQ-HB structural overhead 0.9 ms/tok =
 6%, distributed across 6+ kernel families) requires:
 - **Path E** (USE_DENSE default-flip, +12-18% with token divergence)
@@ -4586,7 +4588,7 @@ Operator decision still pending on Path E.
 
 ### Three closure paths to the decode mantra-violation
 
-The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
+The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms the peer HEAD)
 is structurally bounded within the current TQ-HB + Q5_K_M regime.
 Closure requires operator decision on:
 
@@ -4632,16 +4634,16 @@ approval.
    helper + per-kernel timing harness. Would close 0.62× → ~0.85×
    peer estimate.
 4. **Kernel fusion sweep for decode** — iter-87 done: hot-path coverage
-   at parity with llama.cpp; one candidate fusion (`rms_norm_mul_add`,
+   at parity with the peer; one candidate fusion (`rms_norm_mul_add`,
    `norm_mul[_add]`) ~4% potential pp2455 gain, ~0% decode gain (decode
    doesn't pay norm cost the same way). Not the biggest fish.
 5. **Pp2455 closer-to-peer attack** — distributed work across 4-5
    kernel categories; iter-87 honest measurement = 0.80× peer cool-state
    = 20% gap, not 30%. Per-kernel-time level fixes only.
-6. **llama.cpp peer baseline at HEAD** — iter-87 found llama.cpp moved
+6. **peer baseline at HEAD** — iter-87 found the peer moved
    from `d05fe1d7d` (build 9010, used as iter-68 baseline) to
    `5d6f18a63` (current HEAD). Re-bench needed to validate 3023/1884 t/s
-   peer numbers still hold or have shifted under llama.cpp's own work.
+   peer numbers still hold or have shifted under the peer's own work.
 
 ### iter-170: qwen3.6 MTP verifier(N) scaling bench LANDED
 
@@ -4812,7 +4814,7 @@ calls instead of one 2-token forward.
 
 Per-iter cost: 72ms (slower than K=0 38ms) — correctness test only.
 
-### iter-179 — gemma4 bandwidth bisect via llama.cpp peer-code study
+### iter-179 — gemma4 bandwidth bisect via peer-code study
 
 **Trigger**: operator's most recent signal: `--- mlx-native: 853 tokens in
 13.69s (62.3 tok/s) --- -- still` for `gemma4-ara-2pass-APEX-Q5_K_M.gguf`.
@@ -4875,9 +4877,9 @@ NOT defer; it surfaces the bisect data and waits for direction.
 - Path E (F32 dense KV, sliding+global): +12.8% wall, 502 MiB/slot.
 - Path E+F (F16 KV): +14.4% wall, 251 MiB/slot, ~25 ppm rel_rms drift.
 - Default (TQ-HB): 191 MiB/slot, 0 ppm drift.
-- llama.cpp peer (CPU-instr unknown): 103 tok/s = 309 GB/s effective at
+- peer (CPU-instr unknown): 103 tok/s = 309 GB/s effective at
   Q5_K_M MoE 4B-active. M5 Max peak 546 GB/s.
-- hf2q current 63 tok/s = 189 GB/s = 35% of peak vs llama.cpp 57%.
+- hf2q current 63 tok/s = 189 GB/s = 35% of peak vs peer 57%.
 - 22pp efficiency gap = mat-mul/SDPA kernel efficiency, NOT structural.
   ⚠ **iter-180 REFUTED this** — see below.
 
@@ -4929,7 +4931,7 @@ The 33% gemma4-specific deficit must live in:
    (LinearAttn) which is much cheaper per token. ~6× attention cost
    ratio per layer.
 2. **Dual-FFN per layer** (gemma4 only): MoE layers run BOTH dense MLP
-   AND MoE expert routing summed (llama.cpp gemma4.cpp:307
+   AND MoE expert routing summed (the peer gemma4.cpp:307
    `cur = ggml_add(cur_mlp, cur_moe)`). qwen3.6 has only one path.
 3. **TQ-HB SDPA dequant cost**: per-element Hadamard transform + scale.
    Each FA layer pays this.
@@ -5058,18 +5060,18 @@ M5 Max with both target models:
 
 **Decode (tg128)** at the same `.gguf` file:
 
-| Model | hf2q | llama.cpp | hf2q/peer |
+| Model | hf2q | peer | hf2q/peer |
 |-------|-----:|----------:|----------:|
 | gemma4 26B-A4B APEX-Q5_K_M | 62 | **97.16 ± 8.77** | **0.64×** (35% slower) |
 | qwen3.6 35B-A3B APEX-Q5_K_M | 132 | 97.41 ± 2.71 | **1.36×** (36% faster) |
 
-**Prefill (pp128)** llama.cpp gemma4 = **3253.40 ± 10.51 tok/s**.
+**Prefill (pp128)** the peer gemma4 = **3253.40 ± 10.51 tok/s**.
 hf2q gemma4 prefill ~46 tok/s at 20 tokens (likely includes JIT compile
 in 1st measurement; long-prompt prefill needs separate bench).
 
 **Reframed verdict** (correcting iter-180b's "architectural" framing):
 
-The gemma4 gap is **NOT purely architectural**.  llama.cpp runs the
+The gemma4 gap is **NOT purely architectural**.  The peer runs the
 same Apple Metal GPU, same `.gguf` file, same Q5_K/Q6_K/Q8_0 quants —
 yet gets 1.57× more decode throughput than hf2q.  hf2q's gemma4 path
 has engineering inefficiency that doesn't exist for qwen35moe.
@@ -5078,9 +5080,9 @@ Path E+F (+14%) closes ~14 of the 35 pp gap → 0.74× ratio.
 Remaining 21 pp gap: gemma4-specific code path inefficiencies in
 hf2q's `MlxModelWeights::forward_decode`.  Candidates:
 1. **TQ-HB SDPA dequant cost** (8-bit Lloyd-Max codebook + Hadamard
-   transform per K element) — llama.cpp uses F16 KV directly.
+   transform per K element) — the peer uses F16 KV directly.
 2. **Per-layer dispatch density** (956 in gemma4 vs whatever
-   llama.cpp's gemma4 path encodes — need to count).
+   the peer's gemma4 path encodes — need to count).
 3. **lm_head GEMM** for vocab=262144 (massive output matrix) —
    hf2q goes through a generic dense_matmul; peer may have a
    specialized large-vocab kernel.
@@ -5124,7 +5126,7 @@ Ran `HF2Q_SPLIT_TIMING=1` in 4 configurations on the same gemma4 prompt:
    Each layer pays ~50 µs to Hadamard-encode K vectors before SDPA.
    With F32 dense KV (Path E), this work is skipped entirely.
 
-**Updated breakdown of 35pp gap to llama.cpp peer**:
+**Updated breakdown of 35pp gap to peer**:
 - TQ-HB encode dispatches: ~12.5pp (USE_DENSE skips them) → covered by Path E
 - F16 KV bandwidth halving: ~2pp → covered by Path F (on top of E)
 - **Remaining 21pp**: SDPA kernel impl + lm_head + per-layer fusion gap
@@ -5172,7 +5174,7 @@ are ~20 per layer × 30 = 600 of them.
 | (current) Default TQ-HB | 62 | exact (TQ-HB) | 191 MiB |
 | **Path E** (USE_DENSE=1) | **78** | **exact F32** | 502 MiB |
 | Path E+F (USE_DENSE+F16_KV) | 80 | F16 (~25 ppm) | 251 MiB |
-| llama.cpp peer | 97 | F16 KV | ~256 MiB |
+| peer | 97 | F16 KV | ~256 MiB |
 
 **Path E is operator-orthogonal-to-precision**.  Buys +12.5%
 (80% of gap-to-Path-E+F win) at zero precision drift — only memory
@@ -5180,7 +5182,7 @@ cost (+311 MiB/slot, manageable on M5 Max with 128 GB unified memory).
 Operator's prior precision-tradeoff hesitation does NOT apply to
 Path E.
 
-The remaining 21pp gap to llama.cpp peer (97 tok/s) lives in the 6 ms
+The remaining 21pp gap to peer (97 tok/s) lives in the 6 ms
 "small ops" bucket — fundamentally a multi-week kernel-fusion + dispatch-
 reduction effort (no single fusion saves >2 pp).
 
@@ -5238,7 +5240,7 @@ useful for any future code path that needs the prefill-style fusion or
 where dispatch overhead becomes more limiting (e.g. small batches).
 
 **iter-187+ plan**: dispatch-density walking is invalidated as a strategy.
-The remaining 21pp gap to llama.cpp peer must be addressed via:
+The remaining 21pp gap to peer must be addressed via:
 - (a) lower-level kernel impl (specific SDPA/lm_head optimization),
 - (b) Path E default-flip (operator-gate, +12.5%, no precision change),
 - (c) different fusion targets that DON'T already overlap on GPU
@@ -5249,7 +5251,7 @@ The remaining 21pp gap to llama.cpp peer must be addressed via:
 
 gemma4 has tied embeddings: `token_embd.weight` Q6_K [2816, 262144] is
 loaded as F32 (2.95 GB) and re-quantized at load to Q8_0 (784 MB) for
-the lm_head matmul.  Peer (llama.cpp) uses Q6_K storage directly for
+the lm_head matmul.  Peer uses Q6_K storage directly for
 both embedding lookup AND lm_head — saving 179 MB read per token.
 
 **Bench at lm_head shape** (n=262144, k=2816, mlx-native d6a6f83):
@@ -5366,7 +5368,7 @@ short-fixture numbers):
 | Path E+G | 72.2 | 0.74× | exact | available NOW |
 | Path E+F | ~71 (estimate) | 0.73× | F16 ~25 ppm | available NOW |
 | **Path E+F+G** | **73.2** | **0.75×** | **F16 ~25 ppm** | **available NOW** |
-| llama.cpp peer | 97 | 1.00× | F16 KV | — |
+| peer | 97 | 1.00× | F16 KV | — |
 
 **Operator can opt into the best stack today** without any
 default-flip:
@@ -5463,11 +5465,11 @@ F16's 4× bytes is more manageable.
 
 **Implication for 25pp peer gap**:
 
-llama.cpp uses F16 KV directly (no TQ-HB).  Path E+F at 73.2 tok/s =
+The peer uses F16 KV directly (no TQ-HB).  Path E+F at 73.2 tok/s =
 0.75× peer 97 still has 24pp gap.  This isn't TQ-HB related — Path E+F
 doesn't use TQ-HB.  The 24pp lives elsewhere:
 - Per-layer fixed overhead (norms, RoPE, KV-copy, dispatch chain)
-- SDPA F16 kernel impl differences vs llama.cpp's
+- SDPA F16 kernel impl differences vs peer's
   `kernel_flash_attn_ext_vec`
 
 **TQ-HB SDPA optimization** (if pursued): only valuable while Path E+F
@@ -5505,22 +5507,22 @@ gain <1% based on amortization curve.
 - 73.2 tok/s = 0.75× peer (97 tok/s)
 - 24-25pp gap remaining lives in:
   - Per-layer fixed kernel costs (norms/RoPE/KV-copy)
-  - SDPA F16 kernel impl differences vs llama.cpp
+  - SDPA F16 kernel impl differences vs peer
   - HEAD sync overhead (~0.6 ms residual)
 - All these are multi-day-to-multi-week individual items, each <2pp.
 
 iter-193+ candidates:
-- Bench our F16 SDPA vs llama.cpp's `kernel_flash_attn_ext_vec` at
+- Bench our F16 SDPA vs peer's `kernel_flash_attn_ext_vec` at
   decode shape (one direct kernel comparison)
 - Investigate triple-buffer / 3-way CB split
 - HEAD pipeline restructure (async argmax-on-GPU)
 
 ### iter-193 — peer baseline refined to 102 tok/s; gap = 28.7%
 
-Re-ran llama.cpp llama-bench with more samples (`-n 200` and pp+tg
+Re-ran the peer llama-bench with more samples (`-n 200` and pp+tg
 combined modes) to tighten the peer baseline std-dev:
 
-| llama.cpp test | tok/s |
+| peer test | tok/s |
 |----------------|------:|
 | tg128 (iter-183 short) | 97.16 ± 8.77 (high noise) |
 | tg128 (re-run) | 102.72 ± 0.10 (low noise) |
@@ -5541,12 +5543,12 @@ Updated lever inventory + gap math:
 | Path E alone | 70.7 | 0.69× | -31.2% |
 | Path E+G | 72.2 | 0.70× | -29.7% |
 | Path E+F+G | 73.3 | **0.713×** | **-28.7%** |
-| llama.cpp peer | 102.7 | 1.00× | — |
+| peer | 102.7 | 1.00× | — |
 
 The 28.7pp gap is the honest steady-state delta against peer.
 
 **Prefill comparison** (separate concern from operator's decode signal):
-- llama.cpp pp512+tg200 = 327 tok/s combined
+- The peer pp512+tg200 = 327 tok/s combined
 - Implies pp throughput ~3000 tok/s (tg amortizes)
 - hf2q gemma4 prefill ~46 tok/s — large gap; not addressed this session
 
@@ -5729,7 +5731,7 @@ fused-fwht-pre, multi-seed).
 | Pre-session default (iter-179 baseline) | 62.5 | — |
 | iter-195 (vector load shipped) | 63.8 | +2.08% |
 | iter-197 (vector load + fn-constant) | **69.2** | **+10.7%** |
-| llama.cpp peer 102.7 | — | (target) |
+| peer 102.7 | — | (target) |
 
 Iter-197 matches iter-196 BISECT exactly (69.2 ± 0.1 std-dev).
 
@@ -5993,7 +5995,7 @@ amortized).  No single kernel dominates; no obvious fusion target.
 floor.  Further default-path gain requires either:
 - Major architectural fusion (multi-week, e.g. fold post-attn-norm+add
   into next layer's attention QKV)
-- llama.cpp-style "ggml graph fuse" pass that combines many small ops
+- peer-style "ggml graph fuse" pass that combines many small ops
 - Path E+F+G operator-flip (already +6.4% available today)
 
 iter-204+ plan: examine the dispatch density per B-block to see if
@@ -6528,7 +6530,7 @@ avg.  Includes:
 
 **Peer gap analysis**:
 - hf2q current: 12.5 ms body + 1.95 ms head = 14.45 ms (69.2 tok/s)
-- llama.cpp peer: ~8 ms body + 1.2 ms head = 9.74 ms (102.7 tok/s)
+- peer: ~8 ms body + 1.2 ms head = 9.74 ms (102.7 tok/s)
 - Gap: 4.7 ms (3.5 ms body + 1.2 ms head/sync overhead)
 
 **Cumulative session shipped wins**: +10.7% default-path (iter-195+197).
@@ -6552,7 +6554,7 @@ complete and validated.
 | Path E alone | 71.0 | — | 0.691× |
 | Path E+G | 72.4 | — | 0.705× |
 | **Path E+F+G** (best opt-in) | **73.2** | 0.2 | **0.713×** |
-| llama.cpp peer | 102.7 | 0.1 | 1.000× |
+| peer | 102.7 | 0.1 | 1.000× |
 
 **Default-path session improvement**: +6.3 tok/s = **+10.1%
 byte-identical**, no env flag, no precision change.
@@ -6825,7 +6827,7 @@ Same launch-overhead-limited magnitude.
 | Path E+G | 72.4 | 0.705× | exact |
 | Path E+F+G | 73.3 | 0.713× | F16 ~25 ppm |
 | **Path E+F+G + FUSED** | **73.6** | **0.717×** | F16 ~25 ppm |
-| llama.cpp peer | 102.7 | 1.000× | F16 |
+| peer | 102.7 | 1.000× | F16 |
 
 The iter-217 fused kernel adds a marginal +0.4% on top of any base
 configuration.  Available as `HF2Q_FUSED_END_OF_LAYER=1` opt-in flag.
@@ -6891,7 +6893,7 @@ focus models):
 
 **Estimated speedup** (per SD literature, 2-4×):
 - gemma4 current 68.8 tok/s × 2-4× = 140-280 tok/s
-- That **EXCEEDS llama.cpp peer** 102.7 tok/s
+- That **EXCEEDS peer** 102.7 tok/s
 - Even at conservative 1.5×, would reach 103 tok/s = peer parity
 
 **This is the LARGEST single lever discovered this session.**
@@ -6996,12 +6998,12 @@ it's an accurate scope assessment from peer-code reading.
 Read all 3 operator-mentioned reddit docs to understand the broader
 SD/MTP landscape:
 
-**reddit-mtp.txt** (3268 lines — qwen3.6-27B MTP via llama.cpp PR):
+**reddit-mtp.txt** (3268 lines — qwen3.6-27B MTP via the peer PR):
 - Built-in MTP layer in qwen3.6-27B model (NOT in our 35B-A3B target)
-- llama.cpp PR 22673: `--spec-type mtp --spec-draft-n-max 3`
+- The peer PR 22673: `--spec-type mtp --spec-draft-n-max 3`
 - Mac M2 Max 96 GB: 28 tok/s = 2.5× speedup
 - froggeric/Qwen3.6-27B-MTP-GGUF on HF — drop-in replacement
-- Shows MTP works on Apple Silicon + llama.cpp Metal backend
+- Shows MTP works on Apple Silicon + the peer Metal backend
 
 **reddit-atlas.txt** (Atlas inference engine, GB10 hardware):
 - Pure Rust + CUDA, no PyTorch, no Python runtime (aligns with hf2q
@@ -7020,14 +7022,14 @@ SD/MTP landscape:
 
 | Path | Architecture | SD support | hf2q applicability |
 |------|--------------|------------|---------------------|
-| llama.cpp MTP | C++ + Metal | qwen3.6-27B built-in | qwen3.6-27B via fresh GGUF |
+| peer MTP | C++ + Metal | qwen3.6-27B built-in | qwen3.6-27B via fresh GGUF |
 | Atlas | Rust + CUDA | qwen3.6-35B 130 tok/s | reference for hf2q SD architecture |
 | **DFlash** | **Python + MLX** | **gemma-4-26B-A4B + qwen3.6-35B-A3B** | **draft model fits hf2q's targets** |
 
 **Strategic takeaway**:
 - DFlash is the ONLY path that explicitly supports BOTH operator-focus
   models (gemma4 + qwen3.6-35B-A3B)
-- llama.cpp's MTP is qwen3.6-27B-only — different target than our
+- The peer's MTP is qwen3.6-27B-only — different target than our
   benchmark
 - Atlas validates the architectural pattern (Rust + GPU SD = 3× peer)
   but is GB10-CUDA, not Apple Metal
@@ -7236,7 +7238,7 @@ mlx-lm runtime).
 
 | Engine | Runtime | SD support | Apple Silicon? |
 |--------|---------|------------|----------------|
-| llama.cpp | C++ + Metal | qwen3.6-27B built-in MTP | ✅ |
+| peer | C++ + Metal | qwen3.6-27B built-in MTP | ✅ |
 | ds4 | C + Metal | DeepSeek V4 built-in MTP | ✅ (pure native) |
 | omlx | Python + mlx-lm | DFlash + mlx_lm_mtp + specprefill | ✅ (Python wrap) |
 | **DFlash standalone** | **Python + MLX** | **gemma4, qwen3.6-35B-A3B** | **✅ (target lib)** |
@@ -7319,13 +7321,13 @@ introduced no regression.
 | Path E+G | 72.3 | 72.4 | ✓ |
 | **Path E+F+G** | **73.3** | **73.3** | **✓ exact** |
 | +FUSED_END_OF_LAYER | 73.6 | 73.6 | ✓ exact |
-| llama.cpp peer | 96.23 ± 2.76 | 102.7 ± 8.77 | within sd-dev |
+| peer | 96.23 ± 2.76 | 102.7 ± 8.77 | within sd-dev |
 
 **Zero perf regression** from iter-229 trim() infrastructure
 (methods are dead-code-flagged until SD state machine lands).
 Numbers reproduce iter-216 exactly within ±0.3 noise.
 
-llama.cpp peer drift (96 vs 102.7) within their reported 8.77 std-dev
+peer drift (96 vs 102.7) within their reported 8.77 std-dev
 — hardware/sampling variability, not regression.
 
 iter-231's bench-runner script proven useful: produces clean
@@ -7511,7 +7513,7 @@ Three testable hypotheses captured in `project_mlx_lm_gemma3_peer_source_finding
 - H3: compare mlx-lm `mx.fast.rms_norm` to our rms_norm.metal at
   decode shape
 
-### iter-237 — peer-source: llama.cpp gemma4 decode dossier (researcher agent)
+### iter-237 — peer-source: gemma4 decode dossier (researcher agent)
 
 Researcher agent produced file:line evidence dossier on
 `/opt/llama.cpp` gemma4 (`src/models/gemma4.cpp`) and Metal SDPA.
@@ -7527,7 +7529,7 @@ Key structural findings:
   passes `nullptr` for `Kcur, Vcur`).  For 30-layer 26B-A4B this can
   make the tail of decode do **zero KV write/read traffic**.  → Need
   to audit hf2q for this — if missing, it's free win.
-- llama.cpp's iswa cache is **dual-instance** (`llama-kv-cache-iswa.h:14-79`):
+- The peer's iswa cache is **dual-instance** (`llama-kv-cache-iswa.h:14-79`):
   separate KV cache for full-attn layers vs sliding layers.  Each
   layer is filtered into exactly one.  Structurally different from
   hf2q's uniform `Vec<DenseKvBuffers>`.
@@ -7972,7 +7974,7 @@ to capture fresh HEAD numbers (vs stale iter-216 estimates).
 | **Path E+G** (USE_DENSE + LMHEAD_Q6K) | **71.5** | **+4.7%** | **0.713× ★** |
 | Path E+G+FUSED (UNSAFE_EXP gate) | 72.6 | +6.3% | 0.724× |
 | Path E+F+G (deprecated F16 KV) | 73.0 | +6.9% | 0.728× — DEGRADED long-ctx |
-| llama.cpp peer | 100.2 | — | 1.000× |
+| peer | 100.2 | — | 1.000× |
 
 **Operator-actionable now (zero engineering)**:
 
@@ -8060,7 +8062,7 @@ USE_DENSE gets 90% of E+F win".
 
 **Why the dossier estimate was wrong for hf2q**:
 
-llama.cpp's peer-grounded +12% estimate assumed bypassing TQ-HB-
+The peer-grounded +12% estimate assumed bypassing TQ-HB-
 equivalent overhead.  But hf2q's TQ-HB SDPA is already heavily
 optimized post-iter-195 (vectorized dequant_hb_float4) + iter-197
 (function-constant cbits) = **+10.6% measured default-path improvement
@@ -8121,7 +8123,7 @@ methods used so far.
 
 1. **Metal Capture / Xcode GPU debugger never run**.  We've assumed
    concurrency from `barrier_between` calls but never visualized the
-   actual GPU timeline.  iter-237 dossier noted llama.cpp uses
+   actual GPU timeline.  iter-237 dossier noted the peer uses
    range-overlap concurrency analysis to skip barriers when ranges
    don't conflict; we don't know if hf2q's barriers are over-
    conservative without measurement.
@@ -8139,7 +8141,7 @@ methods used so far.
    optimization is the right lever.
 4. **omlx (Python+mlx-lm) same-machine baseline never run**.  iter-228
    noted omlx is "production DFlash+MTP on Apple Silicon".  We've
-   benched llama.cpp (C++) but never mlx-lm (Apple's optimized MLX
+   benched the peer (C++) but never mlx-lm (Apple's optimized MLX
    Python).  Without omlx, we can't tell if 0.71× peer ceiling is
    C++/MLX-specific or Apple-Silicon fundamental.
 5. **In-flight per-component GPU timing not active**.  iter-185 added
@@ -8157,7 +8159,7 @@ methods used so far.
 
 | # | Action | Cost | Falsifier / what it answers |
 |---|--------|------|------------------------------|
-| 1 | Bench omlx (mlx-lm) on same gemma4 GGUF | ~1 hr | Independent peer baseline; if omlx > llama.cpp, gap is impl-specific not Apple-Silicon-fundamental |
+| 1 | Bench omlx (mlx-lm) on same gemma4 GGUF | ~1 hr | Independent peer baseline; if omlx > peer, gap is impl-specific not Apple-Silicon-fundamental |
 | 2 | Run Metal Capture on single decode step | ~2 hr | Visualizes actual barrier/concurrency timeline; falsifies "peer skips barriers via range-overlap" hypothesis for hf2q |
 | 3 | Re-activate iter-185 per-block GPU timing for prod benches | minutes | Whether cost-map component attributions are stable across runs (iter-213 confound check) |
 | 4 | Sample MTL bandwidth + ALU counters | ~4 hr | Memory-bound vs compute-bound on roofline → determines optimization direction |
@@ -8165,7 +8167,7 @@ methods used so far.
 | 6 | Build full roofline-analysis script | ~3 hr | Combines #3+#4 into single artifact: GB/s used vs avail, GFLOPs used vs avail |
 
 **Top-1**: Bench omlx on the same gemma4 GGUF (#1, ~1 hour).
-Independent peer baseline; if omlx outperforms llama.cpp on the same
+Independent peer baseline; if omlx outperforms the peer on the same
 hardware + same model file, the structural-vs-engineering split
 shifts.
 
@@ -8177,7 +8179,7 @@ tools that we have not yet used.
 
 **Methodology contradictions surfaced**:
 - iter-237 dossier H1 ~12% ROI vs iter-246 measured ~+1-2% ROI:
-  resolved — dossier estimate based on llama.cpp's pre-optimization
+  resolved — dossier estimate based on the peer's pre-optimization
   starting cost; iter-195/197 closed the gap.  **Lesson**: dossier
   ROI estimates should be re-grounded against post-optimization hf2q
   cost map before becoming engineering plans.
@@ -8192,7 +8194,7 @@ tools that we have not yet used.
 - Apple Metal Performance Shaders documentation
 - Xcode Metal Frame Capture output for any hf2q decode step
 
-### iter-248 — peer-vs-peer baseline (mlx-lm vs llama.cpp)
+### iter-248 — peer-vs-peer baseline (mlx-lm vs peer)
 
 Operator restated bar: **≥ peers in coherence AND speed, while
 implementing proper TQ**.  This rules out F16 KV path entirely (TQ
@@ -8205,28 +8207,28 @@ Used cached `unsloth/gemma-4-31b-it-UD-MLX-4bit` (different size: 31B,
 
 **Cross-engine baseline on Apple Silicon M5 Max** (200-token decode):
 
-| Engine | Model | Quant | tok/s | × llama.cpp peer |
+| Engine | Model | Quant | tok/s | × peer |
 |--------|-------|-------|------:|------------------|
 | hf2q (default) | gemma-4-26B-A4B | Q5_K_M | 68.3 | 0.682× |
 | hf2q (Path E+G+FUSED) | gemma-4-26B-A4B | Q5_K_M | 72.6 | 0.724× |
-| llama.cpp tg128 | gemma-4-26B-A4B | Q5_K_M | 100-103 | 1.000× |
+| peer tg128 | gemma-4-26B-A4B | Q5_K_M | 100-103 | 1.000× |
 | mlx-lm 0.31.2 | gemma-4-31B (different size) | 4-bit MLX | 22.4 | (different model) |
 
 **Key findings**:
 
-1. **mlx-lm is dramatically SLOWER than llama.cpp** on similar-class
+1. **mlx-lm is dramatically SLOWER than the peer** on similar-class
    Apple Silicon decode (22.4 vs 100+ tok/s on comparable models).
-   Apple's own MLX framework is NOT a faster reference; **llama.cpp
+   Apple's own MLX framework is NOT a faster reference; **the peer
    genuinely is the fast peer to chase**.
 
 2. **hf2q at Path E+G+FUSED beats mlx-lm by ~3.2×** on similar-scale
    models.  Our default-path 68.3 tok/s already beats mlx-lm's 22.4
    by ~3×.  This is context worth knowing — hf2q is fast among
-   Apple-Silicon engines, just not as fast as llama.cpp.
+   Apple-Silicon engines, just not as fast as the peer.
 
 3. **Gap to operator's bar (≥ peer)**:
-   - From Default 68.3 → llama.cpp 100 = need **+46.4%**
-   - From Path E+G+FUSED 72.6 → llama.cpp 100 = need **+37.8%**
+   - From Default 68.3 → the peer 100 = need **+46.4%**
+   - From Path E+G+FUSED 72.6 → the peer 100 = need **+37.8%**
 
    This is a HUGE gap.  H1 (revoked, ~+1-2%) doesn't close it.
    Path E+G default flip alone (+4.7%) doesn't close it.  Even
@@ -8300,7 +8302,7 @@ Avg per dispatch:    14.6 µs (-0.5 µs vs default)
 Path E+G saves 30 dispatches AND reduces avg dispatch time by 0.5 µs
 = 14.57 - 13.65 = **0.92 ms/token gain (6.3%)**.
 
-**Critical comparison vs llama.cpp peer**:
+**Critical comparison vs peer**:
 
 iter-237 dossier estimated peer at ~14-16 dispatches/layer × 30 layers
 = **~450 dispatches/token**.  At 100 tok/s = 10 ms/token, peer runs at
@@ -8310,10 +8312,10 @@ iter-237 dossier estimated peer at ~14-16 dispatches/layer × 30 layers
 |--------|------------------:|------------:|---------------:|
 | hf2q default | 960 | 15.1 | 14.57 |
 | hf2q Path E+G | 930 | 14.6 | 13.65 |
-| llama.cpp (estimated) | ~450 | ~22 | 10.0 |
+| peer (estimated) | ~450 | ~22 | 10.0 |
 
 **Telling**: hf2q has **2× MORE dispatches**, each **SMALLER** in
-average duration.  llama.cpp fuses more work per kernel — fewer,
+average duration.  The peer fuses more work per kernel — fewer,
 bigger kernels = less inter-dispatch scheduling overhead.
 
 **Diagnosis**: at 99.2% GPU time, we're NOT launch-overhead-bound
@@ -8387,7 +8389,7 @@ that survives fusion per iter-219).  3 µs is the launch + barrier
 
 **Math of closing the gap via sequential fusion**:
 
-- Excess dispatches vs peer: 960 (hf2q) - 450 (llama.cpp est) = **510**
+- Excess dispatches vs peer: 960 (hf2q) - 450 (the peer est) = **510**
 - Saving overhead: 510 × 3 µs = **1.53 ms total**
 - New time: 14.57 - 1.53 = 13.04 ms/token = **76.7 tok/s**
 - × peer: 76.7 / 100.2 = **0.77×**
@@ -8397,7 +8399,7 @@ below peer's 100 by 23%**.  The remaining ~3 ms must come from
 **kernel efficiency** delta (peer's larger kernels do more work per
 cycle: better L1/L2 cache reuse + fewer scheduler gaps).  For TQ-HB-
 preserving design, this is a STRUCTURAL cost of byte-packed quant +
-per-pos norms vs llama.cpp's contiguous F16 cache.
+per-pos norms vs peer's contiguous F16 cache.
 
 **Realistic ceiling estimates**:
 
@@ -8442,7 +8444,7 @@ with TQ preserved" — it was inferred-by-exclusion, not measured:
 
 | iter-250 claim | Actual evidence |
 |----------------|-----------------|
-| "Peer has ~450 dispatches/token" | iter-237 dossier ESTIMATE from reading llama.cpp source.  **Never measured via Metal Capture or counter sampling.** |
+| "Peer has ~450 dispatches/token" | iter-237 dossier ESTIMATE from reading peer source.  **Never measured via Metal Capture or counter sampling.** |
 | "Remaining 3 ms is structural TQ-HB cost" | Inferred: 510 excess × 3 µs = 1.53 ms; remaining 3 ms attributed to "kernel efficiency / TQ-HB structural" by exclusion.  **Never directly measured TQ-HB SDPA vs F16 SDPA at same shape.** |
 | "0.91× peer ceiling" | Stacked from above two assumptions.  Falsifiable. |
 
@@ -8461,7 +8463,7 @@ assumptions" — I assumed structural cost without microbench evidence.
    shape due to specific implementation (codebook gather pattern,
    per-pos norm scaling order, FWHT-undo loop) — fixable engineering
 2. Per-dispatch CPU overhead in our Rust wrapping layer might be
-   higher than llama.cpp's thin C-level binding — fixable engineering
+   higher than the peer's thin C-level binding — fixable engineering
 3. Dispatch count gap may be smaller than estimated — re-measurement
    needed
 4. Some buffers we use F32 where peer uses F16 — fixable engineering
@@ -8472,7 +8474,7 @@ Drop it.  The gap is engineering until proven structural.
 **Iter-252+ plan** — exhaust sequential-fusion + kernel optimization
 per operator directive, before DFlash:
 
-1. **MEASURE peer dispatch count actually** — read llama.cpp gemma4
+1. **MEASURE peer dispatch count actually** — read the peer gemma4
    dispatches in `/opt/llama.cpp/src/models/gemma4.cpp` line by line,
    count exact dispatches per layer, multiply by 30.
 2. **MEASURE TQ-HB SDPA vs F16 SDPA at same shape** — write a
@@ -8523,7 +8525,7 @@ actual GPU dispatches.
 | Engine | Dispatches | µs/dispatch | Total ms | tok/s |
 |--------|-----------:|------------:|---------:|------:|
 | hf2q Path E+G | 930 | 14.7 | 13.65 | 73.3 |
-| llama.cpp peer | ~850 | ~11.4 | 9.69 | 103.2 |
+| peer | ~850 | ~11.4 | 9.69 | 103.2 |
 | **Δ** | **+80** | **+3.3** | **+3.96** | -29.9 |
 
 **Key correction**: only **~80 excess dispatches** (not 510).  At 3 µs
@@ -8546,7 +8548,7 @@ H1. **TQ-HB SDPA is slower than F16 SDPA at same shape** — codebook
     Expected delta: 2-3 µs/dispatch on SDPA only (not all 850).
 H2. **Rust binding layer adds CPU overhead per dispatch** —
     encoder_session, KernelArg enum, contents_ptr lookups.
-    Falsifier: profile CPU cycles per dispatch in hf2q vs llama.cpp's
+    Falsifier: profile CPU cycles per dispatch in hf2q vs peer's
     thin C-level binding.
 H3. **Buffer access patterns differ** — F32 intermediate buffers
     where peer uses F16 (more bandwidth), or different tensor
@@ -8636,7 +8638,7 @@ breakdown:
 **Iter-254 plan**: investigate the 4.76 ms "Other" residual.
 Specifically: profile RoPE, KV-copy, head-norm, embed gather as
 separate categories.  Also: directly compare hf2q's Rust-Metal
-binding overhead vs llama.cpp's C-Metal binding for the SAME kernel
+binding overhead vs peer's C-Metal binding for the SAME kernel
 dispatch (per H2).
 
 ### iter-254 — H2 FALSIFIED: CPU encode = 0.36 µs/dispatch (negligible); gap is GPU-side
@@ -8671,7 +8673,7 @@ saves 1.5 tok/s.  Not the bottleneck.
 **The Router shape unmasks a more important number**: total
 3.48 µs/dispatch when GPU work is tiny.  Subtracting CPU 0.36 µs
 leaves **3.1 µs/dispatch as the GPU launch + barrier + scheduler
-floor on M5 Max**.  This is the same hardware floor llama.cpp peer
+floor on M5 Max**.  This is the same hardware floor the peer
 sees (Apple Silicon GPU dispatch cost is identical across drivers).
 
 **Reframed gap math**:
@@ -8896,7 +8898,7 @@ microbenches):
    195+197 in mlx-native).
 2. Opt-in stack: Path E+F+G = **+16.7%** (iter-189).
 3. **Every major decode kernel is at hardware ceiling**.
-4. The remaining 32 tok/s gap to llama.cpp peer (102.7 vs ~70 measured)
+4. The remaining 32 tok/s gap to peer (102.7 vs ~70 measured)
    = GPU launch+barrier floor (3.1 µs × 850 dispatches = 2.6 ms) +
    minor compute deltas, **all hardware-bound on M5 Max**.
 
@@ -8935,7 +8937,7 @@ benches; production engine path unchanged).
 | **Path E+G ★**| 71.0 | 71.1 | 71.1 | **71.1** | ≈ 70.9 (stable) |
 | E+G+FUSED     | 71.6 | 64.7 | 68.1 | **68.1** | NOISY σ≈3.5 |
 | E+F+G (F16 KV)| 69.4 | 69.6 | 72.8 | **69.6** | broken anyway |
-| llama.cpp peer | --  | --   | --   | **90.68 ± 6.60** | was 102.7 ± 0.1 |
+| peer | --  | --   | --   | **90.68 ± 6.60** | was 102.7 ± 0.1 |
 
 **Three findings**:
 
@@ -8950,13 +8952,13 @@ benches; production engine path unchanged).
    measurable signal above noise even at the best-case end-of-layer
    pair.  Default-flip of HF2Q_FUSED_END_OF_LAYER=1 NOT recommended.
 
-3. **llama.cpp peer dropped from 102.7 ± 0.1 to 90.68 ± 6.60 tok/s**
+3. **peer dropped from 102.7 ± 0.1 to 90.68 ± 6.60 tok/s**
    on the SAME model file.  Two-sigma confidence interval is now
    [77, 104], a 27 tok/s spread.  Causes (likely):
    - Thermal contention from concurrent system load
    - llama-bench tg128 (128 tokens) vs hf2q 1000-token measurement —
      different sustained-thermal regimes
-   - llama.cpp version drift since iter-183
+   - Peer version drift since iter-183
    **All "vs peer" claims in this ADR should henceforth be reported
    with ±13% confidence, not as point estimates.**  Previous peer
    ratios (e.g., "0.666× peer", "0.713× peer") were based on a
@@ -8983,7 +8985,7 @@ a quiesced environment (operator action: power-cycle then re-run).
 Direct measurement via `llama-bench -m <APEX-Q5_K_M> -n 128,512,1024
 -r 3 -t 8` resolves both iter-258 anomalies:
 
-| llama.cpp regime | tok/s | σ |
+| peer regime | tok/s | σ |
 |------------------|------:|--:|
 | tg128 (burst, current quiesced) | **103.59** | ±0.19 |
 | tg512 (medium) | 101.71 | ±0.17 |
@@ -8996,7 +8998,7 @@ Direct measurement via `llama-bench -m <APEX-Q5_K_M> -n 128,512,1024
    ± 0.1 within noise.  System contention at iter-258 measurement
    inflated σ ~30× (from 0.19 to 6.60).
 
-2. **llama.cpp drops 8.7% from tg128 → tg1024** (103.6 → 94.6).  This
+2. **The peer drops 8.7% from tg128 → tg1024** (103.6 → 94.6).  This
    is Apple Silicon thermal throttle on **sustained decode**.  M5 Max
    maintains short-burst throughput but throttles at >5s sustained
    GPU load.  hf2q runs at 1000-token sustained — same regime as
@@ -9011,7 +9013,7 @@ Direct measurement via `llama-bench -m <APEX-Q5_K_M> -n 128,512,1024
 | Default | 68.6 | **0.726×** | 0.663× |
 | Path E  | 69.7 | **0.737×** | 0.673× |
 | Path E+G ★ | 71.1 | **0.752×** | 0.687× |
-| llama.cpp tg1024 | 94.55 | 1.000× | 0.913× |
+| peer tg1024 | 94.55 | 1.000× | 0.913× |
 
 **Methodological correction**: the entire ADR-028 series of "× peer"
 claims (e.g., iter-216 "0.666× peer", iter-237 "0.713× peer") were
@@ -9035,9 +9037,9 @@ due to peer-vs-hf2q regime mismatch.
 - → DFlash at 1.5-3× speedup would put hf2q at 1.13-2.26× peer
   (matched) = clearly above peer
 
-**ADR header sentence to revise**: "currently 67.5-70 tok/s, llama.cpp
+**ADR header sentence to revise**: "currently 67.5-70 tok/s, the peer
 peer at 100-103 tok/s" should read "currently 68.6-71.1 tok/s
-sustained, llama.cpp peer at 94.55 ± 2.56 sustained (tg1024 matched
+sustained, peer at 94.55 ± 2.56 sustained (tg1024 matched
 regime); the often-cited 102.7 burst figure is tg128 = different
 thermal regime than hf2q's 1000-token measurement."
 
@@ -9100,7 +9102,7 @@ reveals dramatically different reality:
 3-run hf2q quiesced:  126.3, 126.3, 126.1 tok/s (median 126.3, σ ≈ 0.1)
 ```
 
-**llama.cpp peer at matched regimes**:
+**peer at matched regimes**:
 
 | qwen3.6 | tok/s | σ |
 |---------|------:|--:|
@@ -9213,7 +9215,7 @@ hf2q's qwen3.5/3.6 spec-decode infrastructure (`src/inference/spec_decode/`,
 `src/inference/models/qwen35/spec_decode.rs`, `cli.rs:767-768`,
 `HF2Q_SPEC_DECODE` env flag).
 
-**Loaded the 27B-MTP-Q4_0 GGUF that fails in current llama.cpp build but
+**Loaded the 27B-MTP-Q4_0 GGUF that fails in current peer build but
 loads in hf2q** — banner reads "qwen35 spec" indicating MTP active.
 
 **A/B at HEAD on qwen3.6-27b-mtp-q4_0.gguf** (1000-tok prompt):
@@ -9225,7 +9227,7 @@ loads in hf2q** — banner reads "qwen35 spec" indicating MTP active.
 | **Δ** | **-13%** | — |
 
 **Hidden perf bug**: hf2q's MTP path is **slower** than no-MTP, despite
-high acceptance rate.  Reddit reports peer (llama.cpp) at 2.5× speedup
+high acceptance rate.  Reddit reports peer at 2.5× speedup
 with MTP (28 → 70 tok/s on M2 Max 96GB).  hf2q goes the OTHER way.
 
 **Why the previous iter-261 mantra-claim still holds**:
@@ -9306,7 +9308,7 @@ fires only on the first slot.
 - → Iter-265+ to localize the EOS check bug at the 2-token boundary
   in `qwen35/spec_decode.rs`.  Once fixed, K1 becomes the default
   spec-decode path = +7.5% lever for any qwen3.5/3.6 GGUF with NextN
-  tensors (incl. the 27B-MTP file currently broken in llama.cpp).
+  tensors (incl. the 27B-MTP file currently broken in the peer).
 
 **Updated landscape**:
 
@@ -9649,7 +9651,7 @@ PENDING per task list #63).
 **MTP optimization domain assessment**:
 - With the current qwen35moe arch, K1 cannot simultaneously deliver
   perf win AND byte-identical-to-greedy.
-- Reddit-claimed 2.5× speedup uses llama.cpp's spec-decode, which
+- Reddit-claimed 2.5× speedup uses the peer's spec-decode, which
   presumably has correct multi-token handling for qwen3 hybrid arch.
 - hf2q's K1 path is **structurally limited** by the DeltaNet bug
   until iter-179 is resolved.
@@ -9666,7 +9668,7 @@ PENDING per task list #63).
    regresses 7.9% from baseline.  Worse than non-MTP.
 
 3. **Investigate DeltaNet multi-token bug** (iter-179): multi-week
-   port of fix from llama.cpp/dflash reference impls.  Required to
+   port of fix from peer/dflash reference impls.  Required to
    unlock K1's potential.
 
 4. **Ship K1 default as "MTP-mode" opt-in with caveat**: +8.2% but
@@ -10455,10 +10457,10 @@ cop out", the operator is almost always right.  Don't retreat to
 ### iter-282b — operator REFRAMES: same HW + same math = solvable engineering
 
 Operator additional clarification messages:
-> "do our peers have dflash enabled?  e.g. does llama.cpp have
+> "do our peers have dflash enabled?  e.g. does the peer have
 > dflash enabled?  if not, then shut the fuck up about dflash for a
 > bit .. that can come later.  for now just know we're on the same
-> hardware.  trying to do the same type of maths as llama.cpp, but
+> hardware.  trying to do the same type of maths as the peer, but
 > our implementation is slower by a lot"
 
 **THIS IS THE OPERATOR'S CORE QUESTION** that I have been
@@ -10466,9 +10468,9 @@ sidestepping for ~30 iterations:
 
 **Same HW.  Same math.  Why slower?**
 
-llama.cpp does NOT use DFlash for gemma4 APEX.  It does standard
+The peer does NOT use DFlash for gemma4 APEX.  It does standard
 transformer decode + MoE + FA the same way hf2q does.  Same Apple
-Silicon M5 Max GPU, same ggml kernels (we ported llama.cpp's
+Silicon M5 Max GPU, same ggml kernels (we ported the peer's
 kernels per ADR-022).  Yet hf2q is 0.726× peer matched while peer
 is 1.0×.
 
@@ -10478,7 +10480,7 @@ our per-kernel slower than peer's per-kernel.  The 3.3 µs delta is
 a SYMPTOM, not a root cause.
 
 **Real path forward (iter-283+)**:
-1. Profile llama.cpp on gemma4 APEX at sustained tg1024 — get
+1. Profile the peer on gemma4 APEX at sustained tg1024 — get
    per-dispatch / per-op breakdown
 2. Profile hf2q at same regime — HF2Q_MLX_PROFILE per-token already
    has this for hf2q
@@ -10491,15 +10493,15 @@ a SYMPTOM, not a root cause.
 
 **Suspect categories** (re-examination needed, not foregone):
 - **Excessive sync points** — hf2q may force CPU↔GPU syncs
-  (`commit_and_wait`) that llama.cpp avoids by batching deeper
-- **Threadgroup config mismatches** — llama.cpp's mat-vec may use
+  (`commit_and_wait`) that the peer avoids by batching deeper
+- **Threadgroup config mismatches** — the peer's mat-vec may use
   different tile sizes optimally tuned for M-series GPUs
 - **Buffer layout differences** — different memory layout =
   different cache behavior at same bytes
 - **Excess barriers** — hf2q may have RAW barriers between ops that
   could run concurrent
 - **TQ-HB SDPA actual overhead** — iter-257 measured vs hypothetical
-  F16; never compared vs llama.cpp's actual KV path
+  F16; never compared vs peer's actual KV path
 - **MoE routing scaffolding** — different gather/scatter pattern;
   iter-201 measured raw matmul matched but routing scaffold may differ
 
@@ -10507,7 +10509,7 @@ a SYMPTOM, not a root cause.
 - ✓ DFlash framing retracted per operator direction
 - ✓ Real question accepted: "same HW + same math = why slower?"
 - ✓ Cadence change to 5-min per operator
-- → iter-283 profiles llama.cpp gemma4 APEX decode for direct
+- → iter-283 profiles the peer gemma4 APEX decode for direct
   comparison
 
 **This is the right level of "diving deep"** the operator's mantra
@@ -10525,7 +10527,7 @@ Operator additional messages (clarifies the framing above):
 
 **Operating rules locked in for iter-283+**:
 
-1. **Premise**: hf2q does same math on same hardware as llama.cpp.
+1. **Premise**: hf2q does same math on same hardware as the peer.
    Rust is not slower than C.  If we're slower, **WE ARE DOING
    SOMETHING WRONG IN THE IMPLEMENTATION** that has a fixable gap.
 2. **Methodology**: measurement-driven comparison.  Profile both,
@@ -10536,7 +10538,7 @@ Operator additional messages (clarifies the framing above):
    resolve to a concrete implementation difference.
 
 **Iter-283+ method** (concrete steps, no speculation):
-1. Get llama.cpp's actual runtime dispatch count for gemma4 APEX
+1. Get the peer's actual runtime dispatch count for gemma4 APEX
    tg1024 — instrument or measure, don't estimate from code reads
 2. Get hf2q's per-dispatch profile (HF2Q_MLX_PROFILE=1 already does
    this at ~960 disp/token)
@@ -10552,7 +10554,7 @@ Operator additional messages (clarifies the framing above):
 - ✓ Operating rules locked in (no guess / no random changes)
 - ✓ APEX-only focus locked
 - ✓ Cadence: 5 minutes
-- → iter-283: get llama.cpp's actual runtime dispatch profile
+- → iter-283: get the peer's actual runtime dispatch profile
 
 **Operator additional direction** (iter-282 cycle):
 > "set up the right tests to know where our gap is"
@@ -10563,14 +10565,14 @@ Operator additional messages (clarifies the framing above):
 **Test 1 — Dispatch count parity**:
 - Measure hf2q dispatches/token at gemma4 APEX tg1024
   (HF2Q_MLX_PROFILE=1 — already exists, ~960/token reported iter-249)
-- Measure llama.cpp dispatches/token at same model + tg1024
+- Measure the peer dispatches/token at same model + tg1024
   (need to instrument ggml-metal or use xctrace)
 - DELTA reveals "extra dispatches hf2q makes"
 
 **Test 2 — Per-op timing parity**:
 - For each major op (Q_sliding mat-vec, MoE _id, FA SDPA, fused_norm):
   - Time hf2q's production calling pattern via existing benches
-  - Time llama.cpp's same op at same shape via ggml-metal direct test
+  - Time the peer's same op at same shape via ggml-metal direct test
   - DELTA reveals "hf2q's op is X µs slower" — concrete fix target
 
 **Test 3 — End-to-end decomposition parity**:
@@ -10606,14 +10608,14 @@ Cumulative cost map (12.5 ms body):
 
 ---
 
-## iter-283 — Test 1 EXECUTED: hf2q dispatches 38% MORE per token than llama.cpp
+## iter-283 — Test 1 EXECUTED: hf2q dispatches 38% MORE per token than the peer
 
 **Operator's REFRAME (iter-282) demanded measurement before code changes.
 This iter delivers the first concrete number: the dispatch-count gap.**
 
 ### Method
 
-**llama.cpp instrumentation** — added env-gated atomic counter at the
+**Peer instrumentation** — added env-gated atomic counter at the
 single Metal dispatch site `ggml-metal-device.m:509`
 (`ggml_metal_encoder_dispatch_threadgroups`):
 
@@ -10641,7 +10643,7 @@ if (g_llama_disp_count_enabled) {
 ```
 
 Single dispatch site (verified by `grep dispatchThreadgroups`) — every
-Metal compute kernel in llama.cpp goes through this function, so the
+Metal compute kernel in the peer goes through this function, so the
 counter captures 100% of the Metal dispatch traffic.
 
 **hf2q instrumentation** — already exists.  `HF2Q_DUMP_COUNTERS=1` env
@@ -10652,7 +10654,7 @@ flag prints `[MLX_COUNTERS]` line via `mlx_native::dispatch_count()`
 per-process startup dispatch overhead (Metal pipeline compilation,
 model load, warmup).  Same prompt for both -n values; subtract.
 
-### llama.cpp gemma4 APEX-Q5_K_M tg numbers
+### Peer gemma4 APEX-Q5_K_M tg numbers
 
 ```
 LLAMA_DISP_COUNT=1 llama-bench -m gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 0 -n 64   -r 1
@@ -10664,7 +10666,7 @@ LLAMA_DISP_COUNT=1 llama-bench -m gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 0 -n 1024
 Difference: `1423725 - 90285 = 1333440` dispatches over `(1024-64)*2 = 1920`
 extra tokens (1 warmup run + 1 measured run, both at -n).
 
-**llama.cpp = 694.5 dispatches per decode token at gemma4 APEX tg1024.**
+**The peer = 694.5 dispatches per decode token at gemma4 APEX tg1024.**
 
 ### hf2q gemma4 APEX-Q5_K_M generate numbers
 
@@ -10683,7 +10685,7 @@ extra decode tokens.
 
 ### Decomposition of the 4.53 ms / token gap
 
-| | llama.cpp | hf2q | delta |
+| | peer | hf2q | delta |
 |---|---|---|---|
 | ms / token | 10.005 | 14.535 | +4.530 ms |
 | dispatches / token | 694.5 | 960.0 | +265.5 (+38.2%) |
@@ -10692,7 +10694,7 @@ extra decode tokens.
 If we keep hf2q's per-dispatch time but cut to 694.5 dispatches/token:
   694.5 × 15.14 µs = 10.515 ms/tok = **95.1 tok/s = 0.951× peer**
 
-If we additionally match llama.cpp's per-dispatch time:
+If we additionally match the peer's per-dispatch time:
   694.5 × 14.40 µs = 10.001 ms/tok = **99.99 tok/s = 1.00× peer**
 
 **Of the 4.53 ms gap:**
@@ -10708,16 +10710,16 @@ The 0.36 µs CPU figure ignored the GPU launch+barrier per-dispatch cost
 dominant lever**.
 
 **Concrete next step (Test 2)** — find WHICH dispatches hf2q has that
-llama.cpp does not.  Approach:
+the peer does not.  Approach:
 
-1. Per-op breakdown of llama.cpp's 694.5 disp/token: enable per-pipeline
+1. Per-op breakdown of the peer's 694.5 disp/token: enable per-pipeline
    counters keyed by `pipeline_with_params.label` at the same site
    (already instrumented; just split by pipeline name).
 2. Per-op breakdown of hf2q's 960 disp/token: hf2q already labels via
    `kernel_profile.rs` (lines 18, 69) — extract dispatch counts per
    pipeline label.
-3. Diff: identify dispatches hf2q makes that llama.cpp doesn't, OR
-   dispatches llama.cpp fuses that hf2q splits.
+3. Diff: identify dispatches hf2q makes that the peer doesn't, OR
+   dispatches the peer fuses that hf2q splits.
 
 This is the iter-284 work.
 
@@ -10750,7 +10752,7 @@ kernels each implementation dispatches reveals the concrete gap.**
 
 ### What shipped (instrumentation)
 
-**llama.cpp** (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m`):
+**The peer** (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m`):
 - Parallel pipeline-pointer → name table populated at compile (since
   `MTLComputePipelineState.label` is read-only post-creation)
 - Per-name buckets (linear-scan hash; ≤512 unique kernels)
@@ -10772,7 +10774,7 @@ kernels each implementation dispatches reveals the concrete gap.**
 
 ### Measurements (gemma4-ara-2pass-APEX-Q5_K_M.gguf at -n 256, -n 1024)
 
-**llama.cpp tg1024** (1,423,725 dispatches over ~2050 token batches):
+**Peer tg1024** (1,423,725 dispatches over ~2050 token batches):
 
 | Rank | %     | Kernel | Per-tok est |
 |------|-------|--------|------|
@@ -10793,8 +10795,8 @@ kernels each implementation dispatches reveals the concrete gap.**
 
 | Rank | %     | Kernel | Note |
 |------|-------|--------|------|
-| 1    | 18.18 | kernel_mul_mv_q6_K_f32 | matches llama.cpp #2 |
-| 2    | 15.68 | rms_norm_f32 (NOT fused) | vs llama.cpp's fused #1 |
+| 1    | 18.18 | kernel_mul_mv_q6_K_f32 | matches peer #2 |
+| 2    | 15.68 | rms_norm_f32 (NOT fused) | vs peer's fused #1 |
 | 3    | 6.23  | fused_head_norm_rope_f32 | hf2q-only fusion |
 | 4    | 6.23  | fused_norm_add_f32 | hf2q-only fusion |
 | 5    | 5.19  | hadamard_quantize_kv_fast_d256 | TQ-HB only |
@@ -10820,7 +10822,7 @@ kernels each implementation dispatches reveals the concrete gap.**
 **1. TQ-HB-specific dispatches (~16% of hf2q's budget = ~169 disp/tok)**
 
 These exist purely because hf2q runs TQ-HB SDPA for the 3.94× per-slot
-KV memory savings shipped in ADR-027.  llama.cpp uses F16 KV → no
+KV memory savings shipped in ADR-027.  The peer uses F16 KV → no
 hadamard_quantize / fwht / flash_attn_vec_tq_hb dispatches needed.
 
 | TQ-HB kernel | hf2q % |
@@ -10839,13 +10841,13 @@ This is the cost of the design choice, not a bug.
 
 **2. Missing rms+mul fusion (~10% potentially recoverable)**
 
-llama.cpp ships `kernel_rms_norm_mul_f32_4` (15.26% of dispatches) — a
+The peer ships `kernel_rms_norm_mul_f32_4` (15.26% of dispatches) — a
 fused RMSNorm + element-wise multiply kernel.  hf2q ships standalone
 `rms_norm_f32` (15.68%) that emits one dispatch, then a separate mul
 follows in its own dispatch.
 
 **Note on apparent matching frequency**: 15.68% (hf2q) ≈ 15.26%
-(llama.cpp).  Same call rate — but llama.cpp's kernel does TWO ops per
+(the peer).  Same call rate — but the peer's kernel does TWO ops per
 dispatch (rms+mul).  hf2q would need 2× dispatches to match the same
 work.  We avoid this only because some sites use `fused_norm_add_f32`
 (6.23%) etc.  But many norm-then-mul patterns are still split.
@@ -10858,10 +10860,10 @@ hf2q forward paths.  Identify which are followed by a same-token mul
 
 hf2q's `flash_attn_vec_reduce_dk256` (2.60%) is a separate dispatch
 after `flash_attn_vec_dk256` (0.24% — much fewer because most go
-through TQ-HB path).  llama.cpp's softmax is one-shot (4.32%) — no
+through TQ-HB path).  The peer's softmax is one-shot (4.32%) — no
 separate reduce.
 
-**4. llama.cpp also has fused triple op** (`kernel_rms_norm_mul_add_f32_4`,
+**4. The peer also has fused triple op** (`kernel_rms_norm_mul_add_f32_4`,
 4.25%) — three ops in one dispatch.  hf2q has `fused_norm_add_*` for
 some sites but not all.
 
@@ -10898,7 +10900,7 @@ robust at both ends.
   (+19 lines)
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
-llama.cpp instrumentation stays uncommitted in /opt/llama.cpp working
+The peer instrumentation stays uncommitted in /opt/llama.cpp working
 tree (peer repo, instrumentation only — ADR documents the diff exactly).
 
 
@@ -10957,7 +10959,7 @@ to 0.69× → 1.0× peer.
 
 Per iter-284 buckets (gemma4 APEX, hf2q normalized to per-tok):
 
-| Component | hf2q/tok | llama.cpp/tok | hf2q multiplier |
+| Component | hf2q/tok | peer/tok | hf2q multiplier |
 |-----------|---------:|--------------:|----------------:|
 | MoE matmuls (q6_K, q5_1, iq4_nl, q8_0 _id) | ~66 | ~30 | 2.20× |
 | MoE activations (swiglu_batch / geglu) | 33 | 30 | 1.10× |
@@ -10965,8 +10967,8 @@ Per iter-284 buckets (gemma4 APEX, hf2q normalized to per-tok):
 | fused_moe_routing | 33 | 0 | hf2q-only |
 | **Total MoE-related** | **~165** | **~60** | **2.75×** |
 
-**hf2q does 2.75× more MoE-related dispatches per token than llama.cpp
-on the SAME gemma4 APEX file.**  llama.cpp consolidates the routing +
+**hf2q does 2.75× more MoE-related dispatches per token than the peer
+on the SAME gemma4 APEX file.**  The peer consolidates the routing +
 weighted-sum + activation work into the main matmul or a single
 `geglu` step.  hf2q has separate dispatches for each.
 
@@ -10980,7 +10982,7 @@ the BIGGEST single component and the most likely place where the
 |-------|--------|
 | `moe_weighted_sum` cost | HF2Q_SKIP_MOE_WEIGHTED_SUM env flag |
 | `fused_moe_routing` cost | HF2Q_SKIP_MOE_ROUTING env flag |
-| Per-expert vs batched-experts dispatch | Read llama.cpp's MoE forward for batching pattern |
+| Per-expert vs batched-experts dispatch | Read peer's MoE forward for batching pattern |
 | MoE matmul count (66 vs 30) | Why does hf2q dispatch per Q-type? |
 
 ### Methodology lock-in
@@ -11006,14 +11008,14 @@ No code changes this iter — Chesterton's fence prevented a wrong fix.
 
 ## iter-286 — STRUCTURAL gap identified: graph-level op fusion (peer-grounded)
 
-### Peer code analysis (Chesterton's fence on llama.cpp)
+### Peer code analysis (Chesterton's fence on the peer)
 
 **Read /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-common.cpp:375-432**:
 `ggml_graph_optimize()` walks the cgraph, fuses chains of ADD/NORM/RMS_NORM
 followed by ADD/MUL/NORM/RMS_NORM up to MAX_FUSE=16 ops, then reorders
 via `ggml_metal_graph_optimize_reorder` for concurrency.
 
-This is what generates llama.cpp's bucket entries like:
+This is what generates the peer's bucket entries like:
 - `kernel_bin_fuse_f32_f32_f32_4_op=0_nf=7_rb=1_cb=0` (30/tok)
   → 7 element-wise ops fused into ONE dispatch
 - Total `kernel_bin_fuse_*` ≈ 180/tok, packing many small ops
@@ -11029,9 +11031,9 @@ hf2q's `forward_mlx.rs:4014-4135` has the EQUIVALENT dual-FFN structure
 (B11: dense down + gate_up_id concurrent).  Architecture is the same on
 both sides — gap isn't from extra hf2q work.
 
-### What llama.cpp does that hf2q doesn't
+### What the peer does that hf2q doesn't
 
-llama.cpp builds an explicit cgraph (data-flow graph of ops), then the
+The peer builds an explicit cgraph (data-flow graph of ops), then the
 Metal backend OPTIMIZES it before dispatching:
 
 ```
@@ -11053,7 +11055,7 @@ grep -rnE "\.fuse\(\)|\.fuse\(" /opt/hf2q/src /opt/mlx-native/src
 ```
 
 `mlx_native::ComputeGraph::fuse()` (`/opt/mlx-native/src/graph.rs:349`)
-implements EXACTLY the equivalent of llama.cpp's ggml_graph_optimize:
+implements EXACTLY the equivalent of the peer's ggml_graph_optimize:
 
 - Walks captured nodes
 - Maps `rms_norm_f32 → rms_norm_mul_f32` (line 467-468 fusion table)
@@ -11166,7 +11168,7 @@ SERIAL cost.  Concurrent dispatches in hf2q's B8/B9/B10/B11 groups
 pay launch overhead in PARALLEL — eliminating one of N concurrent
 dispatches saves 0-5 µs incremental, not 15 µs.
 
-llama.cpp ALSO can't fuse the concurrent ops without losing
+The peer ALSO can't fuse the concurrent ops without losing
 parallelism.  Its `kernel_bin_fuse_*_nf=7` style fuses *sequential*
 chains where the data dependencies allow.  Per the gemma4.cpp dual-FFN
 pattern, these chains exist — but most of hf2q's equivalent work is
@@ -11504,7 +11506,7 @@ peer at matched regime.
 
 ### Per-pipeline mat-vec count comparison (from iter-284 + iter-290 buckets)
 
-| Mat-vec kernels | llama.cpp/tok | hf2q/tok | Δ |
+| Mat-vec kernels | peer/tok | hf2q/tok | Δ |
 |-----------------|--------------:|---------:|---:|
 | q6_K dense matvec | 88 | 192 | +104 |
 | q8_0 dense matvec | 15 | 31 | +16 |
@@ -11533,7 +11535,7 @@ layer.ffn_gate_up_exps = create_tensor(... LLM_TENSOR_FFN_GATE_UP_EXPS,
     {n_embd, n_ff_exp * 2, n_expert}, 0);  // MoE EXPERTS — stacked
 ```
 
-llama.cpp's stacked tensor is for **MoE experts only**, passed to
+The peer's stacked tensor is for **MoE experts only**, passed to
 `build_moe_ffn(... gate_up_exps ...)` at line 298.  For **dense MLP**
 (line 263-268 `build_ffn(ffn_up, ffn_gate, ffn_down, ...)`), peer also
 dispatches 2 separate matmuls.
@@ -11613,12 +11615,12 @@ just larger per-dispatch work.
 
 ### Where the +9-disp-per-layer vs peer gap actually lives
 
-llama.cpp gemma4 = ~694.5 disp/tok / 30 layers ≈ 23 disp/layer.
+The peer gemma4 = ~694.5 disp/tok / 30 layers ≈ 23 disp/layer.
 hf2q gemma4 = ~32 disp/layer.  Δ = +9 dispatches per layer × 30 = +270/tok.
 
 Decomposition (from iter-284 + iter-290 buckets):
 
-| Component | hf2q disp/layer | llama.cpp disp/layer | Δ |
+| Component | hf2q disp/layer | peer disp/layer | Δ |
 |-----------|----------------:|---------------------:|---:|
 | TQ-HB infrastructure | ~6 | 0 (F16 KV) | **+6** |
 | - hadamard_quantize_kv_fast | 2 | 0 | |
@@ -12072,7 +12074,7 @@ hot kernel source.**
 [... TQ-HB d512 variants + smaller buckets ...]
 ```
 
-**llama.cpp peer (same gemma4 APEX-Q5_K_M file, tg50 r=1, 102.13 tok/s):**
+**peer (same gemma4 APEX-Q5_K_M file, tg50 r=1, 102.13 tok/s):**
 
 ```
 [LLAMA_DISP_COUNT] Total Metal dispatches: 70839
@@ -12244,7 +12246,7 @@ production decode shows no statistically significant change.**
 
 Added `kernel_mul_mv_q6_K_f32_nr2` to
 `/opt/mlx-native/src/shaders/quantized_matmul_ggml.metal`, ported
-from llama.cpp `kernel_mul_mv_q6_K_f32_impl` with `N_R0_Q6_K=2`:
+from the peer `kernel_mul_mv_q6_K_f32_impl` with `N_R0_Q6_K=2`:
 - 2 simdgroups × 2 rows = 4 rows per threadgroup (vs baseline 2)
 - `float yl[16]` cached once per QK_K block, reused across both rows
 - `simd_sum` reduction per row, write-boundary check per row
@@ -12500,7 +12502,7 @@ Delta: +7.0%
 Current barrier density already gives +7% over fully-serial.  Each
 "barrier-bounded group" is ~2 dispatches on average (956/459 = 2.08).
 
-### Peer comparison (llama.cpp ggml-metal-ops.cpp)
+### Peer comparison (the peer ggml-metal-ops.cpp)
 
 ```c
 // ggml_metal_op_encode_impl, lines 220-225:
@@ -14267,7 +14269,7 @@ dispatches have an explicit `enc.memory_barrier()` preceding them.
 
 Per the iter-326 deep-research finding (CPU-side overhead source #1):
 > "hf2q emits enc.encoder().memory_barrier() between EVERY RAW-dependent
-> dispatch pair... llama.cpp relies on Metal's implicit hazard tracking
+> dispatch pair... The peer relies on Metal's implicit hazard tracking
 > and rarely calls memoryBarrierWithScope per-dispatch (only when
 > explicit dependencies cross kernel boundaries in fusion paths)."
 
@@ -14447,10 +14449,10 @@ before code touched).
 
 Per /loop directive "Code + test == truth", before committing weeks
 to Phase 7 (TQ-HB kernel-fusion redesign), re-measured the actual gap
-at HEAD using current llama.cpp binary on this hardware with the SAME
+at HEAD using current peer binary on this hardware with the SAME
 gemma4 APEX file.
 
-### Bench (llama.cpp build d05fe1d7d, 9010, M5 Max, gemma4-ara-2pass-APEX-Q5_K_M.gguf)
+### Bench (the peer build d05fe1d7d, 9010, M5 Max, gemma4-ara-2pass-APEX-Q5_K_M.gguf)
 
 ```
 $ llama-bench -m gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 0 -n 128
@@ -14695,7 +14697,7 @@ this is the right closure.
 ### Finding 3: hadamard_quantize_kv_fast_d256 is hf2q-unique
 
 5.32% of dispatches (5850/100-tok = 58.5/tok) is TQ-HB encoding
-(`hadamard_quantize_kv_fast_d256`).  Peer (llama.cpp) has NO equivalent
+(`hadamard_quantize_kv_fast_d256`).  Peer has NO equivalent
 — grep on `/opt/llama.cpp/ggml/src/ggml-metal/` returns zero matches
 for `hadamard_quantize`.  This is the cost of having TQ-HB.
 
@@ -14792,7 +14794,7 @@ Kernel is ALREADY SIMD-optimized:
 - Threadgroup geometry: (32, 1, 1) = single simdgroup per threadgroup,
   processes 1 KV head per dispatch
 
-Peer (llama.cpp) has **NO Hadamard equivalent** (grep on
+Peer has **NO Hadamard equivalent** (grep on
 `/opt/llama.cpp/ggml/src/ggml-metal/` returns zero hadamard matches).
 There is no peer to port from.
 
@@ -15737,7 +15739,7 @@ Lesson saved: when changing kernel encoding, derive the dequant→encode constra
 | Hybrid (iter-350, FWHT-undo kept) | **74.5 tok/s** | +1.4% |
 | Hybrid (iter-351, full no-FWHT) | **75.2 tok/s** | **+2.3%** |
 
-Cumulative gemma4 decode improvement across Phase 10: **+2.3%** (73.5 → 75.2 tok/s).  Peer (llama.cpp) at 103 tok/s — gap is now **0.73×** (was 0.71× at iter-326 before Phase 10).
+Cumulative gemma4 decode improvement across Phase 10: **+2.3%** (73.5 → 75.2 tok/s).  Peer at 103 tok/s — gap is now **0.73×** (was 0.71× at iter-326 before Phase 10).
 
 Output divergence: 244 vs 246 tokens to EOS — 2-token difference vs legacy (same magnitude as iter-350's 1-token).  V quantization noise propagates to next-token argmax at a small number of decode steps.  Coherence on the smoke prompt unchanged.
 
@@ -15839,7 +15841,7 @@ Peer = **103.33 tok/s**.  Our HEAD (hybrid) = 75.0 tok/s = **0.726× peer**.  Ga
 
 ### Hypothesis tested + FALSIFIED
 
-**H1**: Add `_Pragma("clang loop unroll(full)")` to the inner `for (l = 0..4)` loops in `kernel_mul_mv_q6_K_f32_nr2` and the `_id` variant, mirroring peer's `FOR_UNROLL` macro at llama.cpp ggml-metal.metal:8035.  Expected delta: +1-3% if Apple Metal's auto-unroll wasn't already optimal.
+**H1**: Add `_Pragma("clang loop unroll(full)")` to the inner `for (l = 0..4)` loops in `kernel_mul_mv_q6_K_f32_nr2` and the `_id` variant, mirroring peer's `FOR_UNROLL` macro at ggml-metal.metal:8035.  Expected delta: +1-3% if Apple Metal's auto-unroll wasn't already optimal.
 
 **Result**: -0.2 to -0.4 tok/s (legacy 73.5 → 73.1; hybrid 75.2 → 75.0).  **FALSIFIED.**
 
@@ -16005,7 +16007,7 @@ Combining the hybrid path's two stand-alone KV-write dispatches (`dispatch_kv_ca
 | Hybrid post-10e.5 (iter-351) | 75.2 | +2.0% | +0.9% |
 | **Hybrid post-10c.5 (iter-354)** | **75.5** | **+2.4%** | **+0.4%** |
 
-Peer (llama.cpp): 103.33 tok/s.  Gap: 0.728× → **0.731× peer** (closes ~0.3pp on the 27.2pp gap).
+Peer: 103.33 tok/s.  Gap: 0.728× → **0.731× peer** (closes ~0.3pp on the 27.2pp gap).
 
 #### Dispatch reduction confirmed
 
@@ -16348,7 +16350,7 @@ $ grep -rn "MTLIndirectCommandBuffer" /opt/llama.cpp/ggml/src/ggml-metal/    →
 $ grep -rln "MTLIndirectCommandBuffer" /opt/mlx-lm /opt/candle /opt/dflash /opt/ds4 /opt/omlx → 0 matches
 ```
 
-**Neither peer (llama.cpp) nor any other ML framework on Apple Silicon uses ICB.**  Peer hits 103 tok/s without it; we hit 75 without it.  ICB is therefore NOT the lever — if it were +3.5% as advertised, peer would already use it.
+**Neither peer nor any other ML framework on Apple Silicon uses ICB.**  Peer hits 103 tok/s without it; we hit 75 without it.  ICB is therefore NOT the lever — if it were +3.5% as advertised, peer would already use it.
 
 This is a strong falsifier-by-precedent: the +3.5% theoretical estimate from generic Apple docs doesn't materialize in practice for this workload class, otherwise mature peer projects would have adopted it.
 
@@ -17033,7 +17035,7 @@ Production default unchanged: chain (`moe_weighted_sum + fused_post_ff_norm2_end
 
 ### Hypothesis
 Per dispatch breakdown, `kernel_mul_mv_q8_0_f32` is 3.41% of decode dispatches.
-Peer (llama.cpp) uses N_R0_Q8_0=2 + N_SG_Q8_0=4 (128 threads/TG, 2 rows/TG with
+Peer uses N_R0_Q8_0=2 + N_SG_Q8_0=4 (128 threads/TG, 2 rows/TG with
 cross-SG reduction).  Ours uses N_DST=4 + N_SIMDGROUP=2 (64 threads/TG, 8
 rows/TG).  Same total work but peer has 2× more threads per TG → better Apple
 GPU latency hiding.  Predicted 0.5-1% decode improvement.
@@ -19013,7 +19015,7 @@ to 0.730× peer at HEAD.  Roughly +1.7pp of peer parity since iter-322.
 
 Operator mantra: "as fast as our peers specifically for
 gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf.
-hf2q vs llama.cpp to start."
+hf2q vs peer to start."
 
 **Current**: 0.730× peer default / 0.749× peer hybrid.  Still 25-27%
 behind peer.
@@ -19101,14 +19103,14 @@ through iter-393's reference-refresh.
 4. Apple Instruments trace (operator GUI required)
 5. Accept current 0.730× / 0.749× peer asymptote
 
-## iter-395 — cross-peer audit beyond llama.cpp
+## iter-395 — cross-peer audit beyond the peer
 
 ### Date
 2026-05-10
 
 ### Goal
 Per "DO NOT BE LAZY" + /loop charter "continue until complete", survey
-peer repos beyond llama.cpp for optimizations applicable to gemma4 decode.
+peer repos beyond the peer for optimizations applicable to gemma4 decode.
 
 ### Repos surveyed
 
@@ -20094,7 +20096,7 @@ Same M5 Max, same model
 
 | Stack | tok/s (5 reps) | Ratio vs peer |
 |---|---|---|
-| **llama.cpp** d05fe1d7d (build 9010) | 103.68 ± 0.65 | 1.000× |
+| **peer** d05fe1d7d (build 9010) | 103.68 ± 0.65 | 1.000× |
 | **hf2q default** | 75.24 ± 0.05 | **0.726×** |
 | **hf2q hybrid** (HF2Q_HYBRID_KV=1) | 77.08 ± 0.10 | **0.743×** |
 | Hybrid uplift over default | — | +2.45% |
@@ -20149,9 +20151,9 @@ Apples-to-apples on M5 Max,
 
 | Stack | pp size | tok/s | Ratio vs peer |
 |---|---|---|---|
-| **Peer** llama.cpp 9010 | pp512 | 3154.17 ± 39.50 | 1.000× |
-| **Peer** llama.cpp 9010 | pp1024 | 3147.02 ± 12.22 | 1.000× |
-| **Peer** llama.cpp 9010 | **pp413** | **2848.43 ± 25.51** | 1.000× |
+| **Peer** 9010 | pp512 | 3154.17 ± 39.50 | 1.000× |
+| **Peer** 9010 | pp1024 | 3147.02 ± 12.22 | 1.000× |
+| **Peer** 9010 | **pp413** | **2848.43 ± 25.51** | 1.000× |
 | **hf2q** HEAD | **413 tok** | **1449.5 ± 8.6** | **0.509×** |
 
 Apples-to-apples gap: **0.509× peer = 1.96× slower** (≈2.0×).
@@ -20248,7 +20250,7 @@ the worst point of the scaling curve (small-prompt overhead-dominated
 regime).
 
 ### Reconciliation with auto-memory
-- `gemma_prefill_bitrot_2026_05_09` claimed "hf2q BEATS llama.cpp at
+- `gemma_prefill_bitrot_2026_05_09` claimed "hf2q BEATS the peer at
   pp1024 (1.03× peer)" — today's measurement: 0.669× peer at pp1013,
   not 1.03×.  Likely the 2026-05-09 number was on a different model or
   used a different baseline.  The structural shape (prefill scales
@@ -20551,14 +20553,14 @@ Mirrored at both call sites (non-streaming line 4581, streaming line 7064).
 | 400w (4022 tok) HTTP wall | 63298 ms | **1573 ms** | **40×** |
 | 400w (4022 tok) prefill rate | 63 tok/s | **2758 tok/s** | **43.4×** |
 
-### Ratio vs peer (llama.cpp d05fe1d7d, build 9010)
+### Ratio vs peer (d05fe1d7d, build 9010)
 
 | Size | Peer | Per-token serve | **Batched serve** |
 |---|---|---|---|
 | pp~512 | 3154 tok/s | 71 = 0.022× | **2525 = 0.801× peer** |
 | pp~4K | 2950 tok/s | 63 = 0.021× | **2758 = 0.935× peer** |
 
-**At pp4K, hf2q serve is now 0.935× peer — within 7% of llama.cpp.**
+**At pp4K, hf2q serve is now 0.935× peer — within 7% of the peer.**
 
 ### Action — LANDED
 Patch shipped at `engine.rs:4581+` (non-streaming) + `engine.rs:7064+`
@@ -21446,7 +21448,7 @@ directly for the canonical comparison.
 **Peer pp16K direct measurement**:
 | Stack | pp16021 | Ratio |
 |---|---|---|
-| **Peer** llama.cpp 9010 | 2461.84 ± 56.74 tok/s | 1.000× |
+| **Peer** 9010 | 2461.84 ± 56.74 tok/s | 1.000× |
 | **hf2q** HEAD (Phase 15 default-on) | 1929.7 tok/s | **0.784× peer** |
 
 ### Gap at long context (refined)
@@ -23085,7 +23087,7 @@ prompt structure both stacks.
 
 | Stack | tok/s (5 reps) | mean ± std |
 |---|---|---|
-| **Peer** llama.cpp 9010 | 93.63 / 92.86 / 92.45 / 93.14 / 93.07 | **93.0 ± 0.4** |
+| **Peer** 9010 | 93.63 / 92.86 / 92.45 / 93.14 / 93.07 | **93.0 ± 0.4** |
 | **hf2q** Phase 15 default-on | 63.16 / 66.78 / 66.98 / 66.66 / 66.94 | **66.1 ± 1.5** |
 | **Ratio** | | **0.711× peer e2e** |
 
@@ -23880,7 +23882,7 @@ memcpy time + ~1.5 sec in alloc/lock/seek/registration overhead =
 ~2 sec measured.
 
 ### Peer's architecture (inferred)
-llama.cpp uses **mmap'd MTLBuffer** — points the Metal buffer
+The peer uses **mmap'd MTLBuffer** — points the Metal buffer
 descriptor directly at the mmap'd file region.  Zero memcpy at
 load time.  Per-tensor cost is just buffer descriptor construction
 (microseconds).
@@ -23942,7 +23944,7 @@ Read:
 
 ### Findings
 
-**Peer (llama.cpp) uses POSIX mmap + `newBufferWithBytesNoCopy`**:
+**Peer uses POSIX mmap + `newBufferWithBytesNoCopy`**:
 ```cpp
 // llama-mmap.cpp:456 — mmap with MAP_SHARED + PROT_READ + MAP_POPULATE prefetch
 addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
@@ -25617,7 +25619,7 @@ forward-pointer.
 ### Mantra verdict for qwen3.6 APEX-Q5_K_M
 
 ✓ **EXCEEDS** — 1.27× peer is comfortably above the "as fast as peer" bar.
-hf2q is 27% faster than llama.cpp at 200-token decode on this model on
+hf2q is 27% faster than the peer at 200-token decode on this model on
 M5 Max.  Coherence tied.  TQ-HB 3.94× per-slot memory savings
 preserved at HEAD (qwen3.6 uses the same TQ pipeline as gemma4).
 
