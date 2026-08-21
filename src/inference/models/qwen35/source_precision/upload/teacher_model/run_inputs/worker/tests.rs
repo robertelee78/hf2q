@@ -19,7 +19,8 @@ use crate::inference::models::qwen35::source_precision::upload::teacher_model::{
 };
 use crate::inference::models::qwen35::source_precision::upload_plan::QwenSourceMetalUploadLimits;
 use crate::intelligence::calibration::{
-    prediction_plan_for_test_bound, prediction_plan_for_test_bound_with_gap,
+    policy_prediction_plan_for_test_bound, prediction_plan_for_test_bound,
+    prediction_plan_for_test_bound_with_gap,
 };
 use crate::intelligence::exact_teacher::{canonical_teacher_argmax, TeacherTargetArtifactLimits};
 
@@ -93,6 +94,25 @@ fn h256_gap_work() -> Result<(
     Ok((fixture, work))
 }
 
+fn h256_policy_work() -> Result<(
+    crate::inference::models::qwen35::source_precision::topology_tests::TopologyFixture,
+    StructurallyBoundQwen35SourceTeacherWorkV1,
+)> {
+    let fixture = h256_fixture();
+    let topology = admit_qwen35_bf16_topology(open(&fixture)?)?;
+    let prediction_plan = policy_prediction_plan_for_test_bound(
+        topology.source().clone(),
+        topology.verified_source_manifest_sha256().into(),
+    );
+    let work = preflight_qwen35_source_teacher_execution(
+        topology,
+        prediction_plan,
+        target_limits(),
+        run_limits(),
+    )?;
+    Ok((fixture, work))
+}
+
 fn prepare_h256_inputs(
     output: &std::path::Path,
 ) -> Result<(
@@ -113,7 +133,7 @@ fn prepare_h256_inputs(
 
 fn expected_cpu_outputs(
     model: &crate::inference::models::qwen35::model::Qwen35Model,
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
 ) -> Result<(Vec<Vec<f32>>, Vec<Vec<u32>>)> {
     let mut rows = Vec::new();
     let mut trajectories = Vec::new();
@@ -227,6 +247,40 @@ fn production_worker_completes_exact_plan_and_publishes_retained_target() -> Res
     {
         assert_eq!(&actual.token_ids, expected);
         assert_eq!(actual.token_ids.len(), EXACT_TEACHER_GREEDY_TOKEN_COUNT);
+    }
+    Ok(())
+}
+
+#[test]
+fn production_worker_completes_policy_rows_without_a_trajectory() -> Result<()> {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let output_dir = tempfile::tempdir()?;
+    let destination = output_dir.path().join("policy-target.bin");
+    let (fixture, work) = h256_policy_work()?;
+    let device = MlxDevice::new()?;
+    let inputs = prepare_qwen35_source_teacher_run_inputs(
+        work,
+        &destination,
+        &device,
+        QwenSourceMetalUploadLimits::default(),
+        preparation_policy(),
+    )?;
+    let model = cpu_model(&inputs._teacher);
+    let retained_plan = inputs._prediction_plan.clone();
+    let (expected_rows, expected_trajectories) = expected_cpu_outputs(&model, &retained_plan)?;
+    drop(fixture);
+
+    let completed = run_qwen35_source_teacher(inputs)?;
+    let structural = completed.target.receipt();
+    assert_eq!(structural.rows.len(), 2);
+    assert_eq!(structural.rows.len(), expected_rows.len());
+    assert!(expected_trajectories.is_empty());
+    assert_eq!(structural.generation_prompt_count, 0);
+    assert!(structural.greedy_trajectories.is_empty());
+    let file = File::open(completed.path())?;
+    for (index, (row, expected)) in structural.rows.iter().zip(&expected_rows).enumerate() {
+        let actual = read_target_row(&file, row)?;
+        assert_row_parity(&actual, expected, &format!("policy target row {index}"));
     }
     Ok(())
 }

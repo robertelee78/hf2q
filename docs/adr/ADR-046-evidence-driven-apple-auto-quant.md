@@ -1470,6 +1470,124 @@ runtime-dependency, performance, or DWQ authority. A broader Calibration and
 PolicyValidation characterization remains required before thresholds are
 declared and AcceptanceHoldout is opened once.
 
+#### 2026-08-21 — split-explicit characterization plan
+
+Teacher prediction-plan schema v3 names and hashes its exact
+`evaluation_split`, evaluation-corpus artifact, rendered manifest, and token
+stream instead of describing every plan as Calibration. The family-owned
+characterization constructor admits only Calibration and PolicyValidation.
+Calibration retains the existing scored-transcript plus 32-token greedy
+contract; PolicyValidation may contain scored transcripts without a generation
+prompt, so its structural target and matched-reference receipt may correctly
+contain zero trajectories. The target verifier, worker, and pinned Transformers
+harness all preserve that zero-trajectory cardinality rather than inventing a
+prompt.
+
+The hidden operator requires an explicit `--evaluation-split` value and exposes
+only `calibration` and `policy-validation`. `acceptance-holdout` is not a CLI
+value and the characterization constructor rejects it before source topology,
+Metal allocation, or target creation. A later holdout constructor must consume
+the checked-in threshold authority derived from both characterization receipts;
+schema validity alone cannot open the holdout. This change adds no threshold or
+quality-gate authority and does not alter the canary-only, no-DWQ scope.
+
+#### 2026-08-21 — completed characterization and predeclared holdout gate
+
+The schema-v3 characterization was completed before opening AcceptanceHoldout.
+Both native runs used hf2q commit
+`9b314ce4ff4cc9667ee927c056898ed5035fbd91`, the exact upstream source revision
+`1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, source bundle SHA-256
+`73ded708c49c2d0a47c790ce1d6181e848ac7591dab741de83dbb57218cc6873`,
+published `mlx-native = 0.11.0`, and the pinned Transformers implementation at
+commit `945dac9117cb54196888c0e6c08035792a98c485`. The external producer and
+dependency-lock SHA-256 values were respectively
+`2250b23d876da535b12d9e17ffe3e91fa1736c800e4447b3962b64fdf6980a76`
+and `9569989d63c1b83404986536485cf8afe9deba1bc244ab68db8e34701e4733f8`.
+
+Calibration plan
+`4634995c2e2404a882c9cd2994499c62bc794afc0dc0a7e2cbf7d7e16701b08d`
+produced 22 rows. Its maximum absolute logit difference was
+`4.955787658691406`; mean, maximum, and p95
+`KL(reference || hf2q)` were `0.015885771034098786`,
+`0.05723891423613325`, and `0.04290778159326072`; top-1 agreement was
+22/22; and the greedy trajectory first diverged at zero-based index 10. The
+raw comparison receipt SHA-256 is
+`41fdf58a53bca32c255951bcc8e9193843afb176c89fdbaee057afadea8bc77d`,
+and its checked-in byte artifact SHA-256 is
+`6627b23c9a8519dc7b1e2ace38a466e9dc2582caac55778787051932305c63ed`.
+
+PolicyValidation plan
+`45b05d34dfd12c0b34aaf9c072a30ca8bccd48c127f785d1a3dee36510cc4bcf`
+produced 33 rows and no trajectory by contract. Its maximum absolute logit
+difference was `3.6840256452560425`; mean, maximum, and p95 KL were
+`0.02774875897420403`, `0.11881776542775319`, and
+`0.09240500608777208`; and top-1 agreement was 30/33
+(`0.9090909090909091`). The raw comparison receipt SHA-256 is
+`ed24074db26dde69ccafb6ac797dd77a999000993a26f8eb661b4ac91f1fb919`,
+and its checked-in byte artifact SHA-256 is
+`76483a2bafdfd043663bf580948bf0f24c59fcea1a8e04ce0da81493f6708109`.
+
+The byte-pinned threshold declaration has SHA-256
+`6a3d36c3006355315820b331aaaeb75bc04ef58b04b81c2be31692b7f99ababb`.
+It deterministically rounds the worse characterized maximum absolute error up
+to one decimal (`5.0`) and the worse maximum row KL up to two decimals
+(`0.12`). Because holdout has one row, that row must match top-1 exactly.
+Because Calibration has the only characterization trajectory, holdout must
+match through at least zero-based divergence index 10 (or match all 32 tokens).
+All bounds are inclusive and no extra policy margin is introduced.
+
+The ordinary split enums and `source-teacher --evaluation-split` remain limited
+to Calibration and PolicyValidation. Before holdout was opened, commit
+`85ca8520ef05cd924bc48b093361bef25afb63d1` added separate splitless,
+one-time execution and raw-first comparison routes. Commit
+`07b59ba806f273ae8bb9eebf079277a317831a51` closed those routes over the exact
+characterized external-implementation record (including producer, lock,
+Python/framework, dtype, device, eager attention, and cache identity), required
+the native teacher and comparator to carry that same hf2q commit, rejected a
+claimed divergence index outside the fixed 32-token trajectory, and made raw
+and quality publication sync both file contents and containing-directory
+entries. The exact release binary SHA-256 was
+`6925429d8d747a2f724acf3c5154b3b0f65165407b3264f5a4ca6abe8efe577f`.
+
+The sealed preflight produced prediction plan
+`d0db832d6239e0807f8f10edb7d687f0407e5035a8848e3cd6362287e5eb37d8`:
+one example, one GenerationNext row, one 32-token trajectory, 32 forward calls,
+73 input tokens, and maximum cache length 73. The one-time native execution
+then produced target byte SHA-256
+`994fe9a773e1469db0044816e3e61be3e5431a6138f3326608761b37ba91fa6a`,
+summary byte SHA-256
+`9174ce67594e96935999df1e734337a4aea61d9e192da4a6be6e3b1af1748362`,
+and completion receipt SHA-256
+`7ca1613dc3d8e85c0a82898b13fc9c2f3363a6f86eede46b6cdda0a6f011154c`.
+The pinned external run produced target byte SHA-256
+`3b1142396f254384ebf4d54cd7b57644f7d7fbf61c655732e2689a11ff4e372c`
+and evidence byte SHA-256
+`958a3033e80b594fad9623614ead1513babdb79d520d5e116e60b141a86e9d6f`.
+
+The holdout passed without changing a threshold. Its maximum absolute logit
+difference was `3.5221433639526367`, row KL was
+`0.010162977825261292`, top-1 agreement was 1/1, and its greedy trajectory
+first diverged at zero-based index 23. The checked-in raw comparison has byte
+SHA-256
+`e2f3cbd3bd1cce9e3964053a52409e36bf590679dea993881a066654a6e3ff01`
+and self-hash
+`3e2a455326f5b0b6e19ac514162cf52739b7c162400cb973797b9ef530c13150`.
+The checked-in passing quality receipt has byte SHA-256
+`9a7836e5ca1ed848dd6cc2bd64c4c9bcc97a418db346e5f182d0639720f8df2d`
+and self-hash
+`f84f6b56a8c4ffba5981e3b46442d65df1edaeef95ba22ac1cbeebf92c971380`.
+
+After those exact receipts were sealed, both one-time execution and comparison
+minting routes were removed. Hidden command
+`source-teacher-acceptance-verify --model-dir <exact-source>` now authenticates
+the source, reconstructs the sealed plan, byte-verifies the embedded raw and
+quality receipts, and proves their plan and nested-comparison identity without
+loading Metal weights or accepting caller-provided evidence. The raw receipt
+retains every authority flag as false. The quality receipt sets only
+`thresholds_predeclared=true` and `quality_gate_authority=true`; it grants no
+source-teacher, sensitivity, allocator, selector, autoquant,
+runtime-dependency, performance, or DWQ authority.
+
 ### Phase E — production `--quant auto`
 
 - Add an operator profile and budget surface.

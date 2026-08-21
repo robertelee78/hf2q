@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::core::provenance::tensor_execution::ArtifactEvidence;
 use crate::intelligence::calibration::{
     validate_teacher_prediction_plan, RenderMode, TeacherPredictionPlanManifest,
-    VerifiedCalibrationPredictionPlan,
+    VerifiedTeacherPredictionPlan,
 };
 
 use super::target_artifact::{
@@ -27,8 +27,13 @@ use super::{
 mod compare;
 
 pub(crate) use compare::{
-    compare_exact_teacher_reference_targets, ExactTeacherReferenceComparisonReceiptV1,
+    compare_exact_teacher_reference_targets,
+    validate_canonical_exact_teacher_reference_comparison_receipt,
+    validate_exact_teacher_reference_comparison_artifact,
+    ExactTeacherReferenceComparisonReceiptV1, ExactTeacherReferenceTrajectoryComparisonV1,
 };
+#[cfg(test)]
+pub(crate) use compare::validate_exact_teacher_reference_comparison_receipt;
 
 const REFERENCE_INPUT_SCHEMA_VERSION: u32 = 1;
 const REFERENCE_INPUT_PROFILE: &str = "exact_teacher_reference_input_v1";
@@ -136,7 +141,7 @@ struct ExternalEvidenceHashView<'a> {
 }
 
 pub(crate) fn build_exact_teacher_reference_input(
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
     vocabulary_size: usize,
     target_limits: TeacherTargetArtifactLimits,
 ) -> Result<ExactTeacherReferenceInputV1, ExactTeacherTargetError> {
@@ -286,7 +291,7 @@ pub(crate) fn validate_external_reference_evidence(
 pub(crate) fn open_native_reference_target(
     path: &Path,
     input: &ExactTeacherReferenceInputV1,
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
     receipt: ExactTeacherTargetReceipt,
 ) -> Result<super::StructurallyVerifiedTeacherTargetArtifact, ExactTeacherTargetError> {
     validate_exact_teacher_reference_input(input)?;
@@ -297,7 +302,7 @@ pub(crate) fn open_native_reference_target(
 pub(crate) fn open_external_reference_target(
     path: &Path,
     input: &ExactTeacherReferenceInputV1,
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
     evidence: &ExactTeacherExternalReferenceEvidenceV1,
 ) -> Result<super::StructurallyVerifiedTeacherTargetArtifact, ExactTeacherTargetError> {
     validate_exact_teacher_reference_input(input)?;
@@ -322,7 +327,7 @@ pub(crate) fn open_external_reference_target(
 
 pub(crate) fn ensure_input_matches_plan(
     input: &ExactTeacherReferenceInputV1,
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
 ) -> Result<(), ExactTeacherTargetError> {
     let rebuilt =
         build_exact_teacher_reference_input(plan, input.vocabulary_size, input.target_limits)?;

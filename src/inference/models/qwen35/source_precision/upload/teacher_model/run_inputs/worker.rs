@@ -11,7 +11,7 @@ use crate::inference::models::qwen35::execution_dispatch::{
 };
 use crate::inference::models::qwen35::source_precision::snapshot::VerifiedQwenSourceSnapshot;
 use crate::intelligence::calibration::{
-    RenderMode, TeacherPredictionPointReceipt, VerifiedCalibrationPredictionPlan,
+    RenderMode, TeacherPredictionPointReceipt, VerifiedTeacherPredictionPlan,
 };
 use crate::intelligence::exact_teacher::{
     canonical_teacher_argmax, StructurallyVerifiedTeacherTargetArtifact,
@@ -40,7 +40,7 @@ const WORKER_NAME: &str = "hf2q-qwen35-source-teacher-v1";
 /// source file, Metal buffer, cache, model, session, or logit row escapes.
 pub(crate) struct VerifiedQwen35SourceTeacherTargetV1 {
     _source_snapshot: VerifiedQwenSourceSnapshot,
-    _prediction_plan: VerifiedCalibrationPredictionPlan,
+    _prediction_plan: VerifiedTeacherPredictionPlan,
     target: StructurallyVerifiedTeacherTargetArtifact,
     receipt: Qwen35SourceTeacherCompletionReceiptV1,
 }
@@ -69,7 +69,7 @@ impl VerifiedQwen35SourceTeacherTargetV1 {
 
 struct ReadyToPublishQwen35SourceTeacherTargetV1 {
     source_snapshot: VerifiedQwenSourceSnapshot,
-    prediction_plan: VerifiedCalibrationPredictionPlan,
+    prediction_plan: VerifiedTeacherPredictionPlan,
     target: UnpublishedStructuralTeacherTargetArtifact,
     receipt: Qwen35SourceTeacherCompletionReceiptV1,
 }
@@ -253,7 +253,7 @@ fn worker_scoped(
 
 fn execute_plan(
     session: &mut SourceTeacherSessionV1<'_>,
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
     stream: &mut crate::intelligence::exact_teacher::StructuralTeacherTargetStream<'_>,
     behavior: &WorkerBehavior,
 ) -> Result<CompletedExecutionV1> {

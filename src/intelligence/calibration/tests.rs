@@ -271,7 +271,7 @@ fn production_rendering_and_partition_are_source_bound_and_disjoint() {
 }
 
 #[test]
-fn prediction_plan_uses_only_calibration_tokens_and_binds_next_token_alignment() {
+fn characterization_plans_bind_the_selected_split_and_keep_holdout_closed() {
     let (temp, request) = model_dir();
     let calibration_manifest = build_structured_dataset_manifest(
         "dataset".into(),
@@ -327,15 +327,17 @@ fn prediction_plan_uses_only_calibration_tokens_and_binds_next_token_alignment()
     let holdout = render_and_tokenize_split(
         &dataset(
             DatasetSplit::AcceptanceHoldout,
-            example("hold", "holdout", true),
+            example("hold", "holdout", false),
         ),
         &request,
     )
     .unwrap();
     let partition = verify_dataset_partition(&calibration, &validation, &holdout).unwrap();
-    let plan = build_teacher_prediction_plan(
+    let plan = build_teacher_characterization_plan(
         &partition,
+        DatasetSplit::Calibration,
         &corpus,
+        &calibration,
         &calibration,
         &validation,
         &holdout,
@@ -344,6 +346,7 @@ fn prediction_plan_uses_only_calibration_tokens_and_binds_next_token_alignment()
     .unwrap();
 
     validate_teacher_prediction_plan(plan.manifest()).unwrap();
+    assert_eq!(plan.manifest().evaluation_split, DatasetSplit::Calibration);
     assert_eq!(plan.manifest().source, calibration.manifest().source);
     assert_eq!(
         plan.manifest().verified_source_manifest_sha256,
@@ -409,12 +412,145 @@ fn prediction_plan_uses_only_calibration_tokens_and_binds_next_token_alignment()
     .unwrap();
     assert_eq!(grouped_ids, vec!["cal", "gen"]);
 
+    let validation_corpus_path = temp.path().join("policy-validation.json");
+    let validation_corpus_bytes = serde_json::to_vec(&validation.structured).unwrap();
+    std::fs::write(&validation_corpus_path, &validation_corpus_bytes).unwrap();
+    let validation_corpus = verify_calibration_corpus_artifact(&VerifyCalibrationCorpusRequest {
+        path: validation_corpus_path,
+        expected_sha256: sha256(&validation_corpus_bytes),
+        expected_dataset_id: "dataset".into(),
+        expected_revision: "revision".into(),
+        expected_declared_license: "apache-2.0".into(),
+        expected_split: DatasetSplit::PolicyValidation,
+        limits: CalibrationCorpusArtifactLimits {
+            max_artifact_bytes: 64 * 1024,
+            max_examples: 4,
+            max_messages: 8,
+            max_tools: 4,
+        },
+    })
+    .unwrap();
+    let policy_plan = build_teacher_characterization_plan(
+        &partition,
+        DatasetSplit::PolicyValidation,
+        &validation_corpus,
+        &validation,
+        &calibration,
+        &validation,
+        &holdout,
+        limits,
+    )
+    .unwrap();
+    assert_eq!(
+        policy_plan.manifest().evaluation_split,
+        DatasetSplit::PolicyValidation
+    );
+    assert!(policy_plan.manifest().greedy_prompts.is_empty());
+    assert!(policy_plan
+        .manifest()
+        .prediction_points
+        .iter()
+        .all(|point| point.stable_id == "val"));
+    validate_teacher_prediction_plan(policy_plan.manifest()).unwrap();
+
+    let holdout_corpus_path = temp.path().join("acceptance-holdout.json");
+    let holdout_corpus_bytes = serde_json::to_vec(&holdout.structured).unwrap();
+    std::fs::write(&holdout_corpus_path, &holdout_corpus_bytes).unwrap();
+    let holdout_corpus = verify_calibration_corpus_artifact(&VerifyCalibrationCorpusRequest {
+        path: holdout_corpus_path,
+        expected_sha256: sha256(&holdout_corpus_bytes),
+        expected_dataset_id: "dataset".into(),
+        expected_revision: "revision".into(),
+        expected_declared_license: "apache-2.0".into(),
+        expected_split: DatasetSplit::AcceptanceHoldout,
+        limits: CalibrationCorpusArtifactLimits {
+            max_artifact_bytes: 64 * 1024,
+            max_examples: 4,
+            max_messages: 8,
+            max_tools: 4,
+        },
+    })
+    .unwrap();
+    let thresholds = bind_teacher_acceptance_thresholds(
+        "1".repeat(64),
+        "2".repeat(64),
+        "3".repeat(64),
+        holdout.manifest().source.clone(),
+        holdout.manifest().verified_source_manifest_sha256.clone(),
+        holdout_corpus.artifact().sha256.clone(),
+    )
+    .unwrap();
+    let authorized_holdout = build_teacher_acceptance_holdout_plan(
+        thresholds,
+        &partition,
+        &holdout_corpus,
+        &holdout,
+        &calibration,
+        &validation,
+        &holdout,
+        limits,
+    )
+    .unwrap();
+    assert_eq!(
+        authorized_holdout.threshold_profile_sha256(),
+        "1".repeat(64)
+    );
+    let holdout_plan = authorized_holdout.into_prediction_plan();
+    assert_eq!(
+        holdout_plan.manifest().evaluation_split,
+        DatasetSplit::AcceptanceHoldout
+    );
+    assert_eq!(holdout_plan.manifest().greedy_prompts.len(), 1);
+    assert!(holdout_plan
+        .manifest()
+        .prediction_points
+        .iter()
+        .all(|point| point.stable_id == "hold"));
+    validate_teacher_prediction_plan(holdout_plan.manifest()).unwrap();
+
+    let wrong_thresholds = bind_teacher_acceptance_thresholds(
+        "1".repeat(64),
+        "2".repeat(64),
+        "3".repeat(64),
+        holdout.manifest().source.clone(),
+        holdout.manifest().verified_source_manifest_sha256.clone(),
+        "4".repeat(64),
+    )
+    .unwrap();
+    assert!(build_teacher_acceptance_holdout_plan(
+        wrong_thresholds,
+        &partition,
+        &holdout_corpus,
+        &holdout,
+        &calibration,
+        &validation,
+        &holdout,
+        limits,
+    )
+    .is_err());
+
+    assert!(matches!(
+        build_teacher_characterization_plan(
+            &partition,
+            DatasetSplit::AcceptanceHoldout,
+            &holdout_corpus,
+            &holdout,
+            &calibration,
+            &validation,
+            &holdout,
+            limits,
+        ),
+        Err(CalibrationInputError::InvalidDataset(_))
+    ));
+
     let mut wrong_partition = partition.clone();
     wrong_partition.manifest_sha256 = "0".repeat(64);
     assert!(matches!(
-        build_teacher_prediction_plan(
+        build_teacher_characterization_plan(
             &wrong_partition,
+            DatasetSplit::Calibration,
             &corpus,
+            &calibration,
             &calibration,
             &validation,
             &holdout,
@@ -426,9 +562,11 @@ fn prediction_plan_uses_only_calibration_tokens_and_binds_next_token_alignment()
     let mut too_small = limits;
     too_small.max_prediction_points = 1;
     assert!(matches!(
-        build_teacher_prediction_plan(
+        build_teacher_characterization_plan(
             &partition,
+            DatasetSplit::Calibration,
             &corpus,
+            &calibration,
             &calibration,
             &validation,
             &holdout,

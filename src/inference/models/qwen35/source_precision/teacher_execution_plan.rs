@@ -1,7 +1,7 @@
 //! Source-bound, pre-model-weight/Metal-allocation work preflight for the
 //! completed Qwen teacher.
 //!
-//! This capability consumes the exact B2a topology and calibration prediction
+//! This capability consumes the exact B2a topology and teacher-evaluation
 //! plan before any B2b Metal allocation. It proves source identity, vocabulary,
 //! target dimensions, and checked execution-work arithmetic only. It neither
 //! prepares weights nor executes the graph.
@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 use crate::intelligence::calibration::{
-    RenderMode, TeacherPredictionPointKind, VerifiedCalibrationPredictionPlan,
+    RenderMode, TeacherPredictionPointKind, VerifiedTeacherPredictionPlan,
 };
 use crate::intelligence::exact_teacher::{
     preflight_structural_teacher_target, TeacherTargetArtifactLimits,
@@ -90,7 +90,7 @@ struct WorkHashView<'a> {
 /// work were joined before any model or Metal allocation.
 pub(crate) struct StructurallyBoundQwen35SourceTeacherWorkV1 {
     topology: VerifiedQwen35Bf16TopologyV1,
-    prediction_plan: VerifiedCalibrationPredictionPlan,
+    prediction_plan: VerifiedTeacherPredictionPlan,
     receipt: Qwen35SourceTeacherWorkReceiptV1,
 }
 
@@ -154,7 +154,7 @@ impl StructurallyBoundQwen35SourceTeacherWorkV1 {
         self,
     ) -> (
         VerifiedQwen35Bf16TopologyV1,
-        VerifiedCalibrationPredictionPlan,
+        VerifiedTeacherPredictionPlan,
         TeacherTargetArtifactLimits,
         Qwen35SourceTeacherRunLimitsV1,
         Qwen35SourceTeacherExpectedWorkV1,
@@ -173,7 +173,7 @@ impl StructurallyBoundQwen35SourceTeacherWorkV1 {
 
 pub(crate) fn preflight_qwen35_source_teacher_execution(
     topology: VerifiedQwen35Bf16TopologyV1,
-    prediction_plan: VerifiedCalibrationPredictionPlan,
+    prediction_plan: VerifiedTeacherPredictionPlan,
     target_limits: TeacherTargetArtifactLimits,
     run_limits: Qwen35SourceTeacherRunLimitsV1,
 ) -> Result<StructurallyBoundQwen35SourceTeacherWorkV1> {

@@ -12,8 +12,11 @@ mod types;
 
 pub(crate) use reference::{
     build_exact_teacher_reference_input, compare_exact_teacher_reference_targets,
-    validate_exact_teacher_reference_input, ExactTeacherExternalReferenceEvidenceV1,
-    ExactTeacherReferenceComparisonReceiptV1, ExactTeacherReferenceInputV1,
+    validate_canonical_exact_teacher_reference_comparison_receipt,
+    validate_exact_teacher_reference_comparison_artifact, validate_exact_teacher_reference_input,
+    ExactTeacherExternalReferenceEvidenceV1, ExactTeacherReferenceComparisonReceiptV1,
+    ExactTeacherReferenceInputV1, ExactTeacherReferenceTrajectoryComparisonV1,
+    ExternalReferenceImplementationV1,
 };
 
 #[cfg(test)]

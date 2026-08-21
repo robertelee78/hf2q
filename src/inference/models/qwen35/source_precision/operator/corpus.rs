@@ -3,14 +3,16 @@ use std::path::PathBuf;
 use anyhow::{ensure, Context, Result};
 
 use crate::intelligence::calibration::{
-    build_teacher_prediction_plan, render_and_tokenize_split, render_and_tokenize_verified_split,
-    verify_dataset_partition, verify_embedded_calibration_corpus_artifact,
-    CalibrationCorpusArtifactLimits, DatasetSplit, RenderDatasetRequest,
-    VerifiedCalibrationPredictionPlan, VerifyCalibrationCorpusRequest,
+    build_teacher_acceptance_holdout_plan, build_teacher_characterization_plan,
+    render_and_tokenize_split, render_and_tokenize_verified_split, verify_dataset_partition,
+    verify_embedded_calibration_corpus_artifact, CalibrationCorpusArtifactLimits, DatasetSplit,
+    RenderDatasetRequest, VerifiedTeacherPredictionPlan, VerifyCalibrationCorpusRequest,
 };
 
+use super::acceptance::VerifiedQwen38AcceptanceThresholdsV1;
 use super::profile::OfficialEvidenceProfileV1;
 use super::source::OfficialSourceV1;
+use super::OfficialQwen38EvaluationSplitV1;
 
 const CALIBRATION: &[u8] = include_bytes!(
     "../../../../../../data/calibration/qwen38-source-teacher-canary-v1/calibration.json"
@@ -23,17 +25,55 @@ const ACCEPTANCE_HOLDOUT: &[u8] = include_bytes!(
 );
 
 pub(super) struct OfficialPredictionPlanV1 {
-    pub(super) plan: VerifiedCalibrationPredictionPlan,
+    pub(super) plan: VerifiedTeacherPredictionPlan,
+    pub(super) evaluation_split: DatasetSplit,
     pub(super) dataset_partition_sha256: String,
     pub(super) calibration_corpus_sha256: String,
     pub(super) policy_validation_corpus_sha256: String,
     pub(super) acceptance_holdout_corpus_sha256: String,
+    pub(super) threshold_profile_sha256: Option<String>,
 }
 
 pub(super) fn build_official_prediction_plan(
     source: &OfficialSourceV1,
     profile: &OfficialEvidenceProfileV1,
+    evaluation: OfficialQwen38EvaluationSplitV1,
 ) -> Result<OfficialPredictionPlanV1> {
+    build_official_plan(
+        source,
+        profile,
+        OfficialPlanSelectionV1::Characterization(evaluation),
+    )
+}
+
+pub(super) fn build_official_acceptance_prediction_plan(
+    source: &OfficialSourceV1,
+    profile: &OfficialEvidenceProfileV1,
+    thresholds: VerifiedQwen38AcceptanceThresholdsV1,
+) -> Result<OfficialPredictionPlanV1> {
+    build_official_plan(
+        source,
+        profile,
+        OfficialPlanSelectionV1::Acceptance(thresholds),
+    )
+}
+
+enum OfficialPlanSelectionV1 {
+    Characterization(OfficialQwen38EvaluationSplitV1),
+    Acceptance(VerifiedQwen38AcceptanceThresholdsV1),
+}
+
+fn build_official_plan(
+    source: &OfficialSourceV1,
+    profile: &OfficialEvidenceProfileV1,
+    selection: OfficialPlanSelectionV1,
+) -> Result<OfficialPredictionPlanV1> {
+    let (evaluation_split, acceptance_thresholds) = match selection {
+        OfficialPlanSelectionV1::Characterization(evaluation) => (evaluation.dataset_split(), None),
+        OfficialPlanSelectionV1::Acceptance(thresholds) => {
+            (DatasetSplit::AcceptanceHoldout, Some(thresholds))
+        }
+    };
     let limits = profile.prediction_limits();
     let calibration = verified_corpus(
         CALIBRATION,
@@ -74,21 +114,50 @@ pub(super) fn build_official_prediction_plan(
         &rendered_holdout,
     )
     .context("verify official three-way corpus partition")?;
-    let plan = build_teacher_prediction_plan(
-        &partition,
-        &calibration,
-        &rendered_calibration,
-        &rendered_validation,
-        &rendered_holdout,
-        limits,
-    )
-    .context("build official source-teacher prediction plan")?;
+    let (evaluation_corpus, rendered_evaluation) = match evaluation_split {
+        DatasetSplit::Calibration => (&calibration, &rendered_calibration),
+        DatasetSplit::PolicyValidation => (&validation, &rendered_validation),
+        DatasetSplit::AcceptanceHoldout => (&holdout, &rendered_holdout),
+    };
+    let (plan, threshold_profile_sha256) = if let Some(thresholds) = acceptance_thresholds {
+        let authorized = build_teacher_acceptance_holdout_plan(
+            thresholds.plan_authority,
+            &partition,
+            evaluation_corpus,
+            rendered_evaluation,
+            &rendered_calibration,
+            &rendered_validation,
+            &rendered_holdout,
+            limits,
+        )?;
+        let threshold_profile_sha256 = authorized.threshold_profile_sha256().into();
+        (
+            authorized.into_prediction_plan(),
+            Some(threshold_profile_sha256),
+        )
+    } else {
+        (
+            build_teacher_characterization_plan(
+                &partition,
+                evaluation_split,
+                evaluation_corpus,
+                rendered_evaluation,
+                &rendered_calibration,
+                &rendered_validation,
+                &rendered_holdout,
+                limits,
+            )?,
+            None,
+        )
+    };
     Ok(OfficialPredictionPlanV1 {
         plan,
+        evaluation_split,
         dataset_partition_sha256: partition.manifest_sha256,
         calibration_corpus_sha256: calibration.artifact().sha256.clone(),
         policy_validation_corpus_sha256: validation.artifact().sha256.clone(),
         acceptance_holdout_corpus_sha256: holdout.artifact().sha256.clone(),
+        threshold_profile_sha256,
     })
 }
 

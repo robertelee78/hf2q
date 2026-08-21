@@ -32,6 +32,13 @@ use super::super::{
 use super::corpus::build_official_prediction_plan;
 use super::profile::{official_profile, OfficialEvidenceProfileV1, PROFILE_SHA256};
 use super::source_manifest::{official_source_manifest, OfficialSourceManifestV1};
+use super::OfficialQwen38EvaluationSplitV1;
+
+mod execute;
+
+pub(crate) use execute::{
+    preflight_official_qwen38_source_teacher, run_official_qwen38_source_teacher,
+};
 
 const OFFICIAL_TENSOR_COUNT: usize = 1_199;
 const OFFICIAL_WEIGHT_SHARD_COUNT: usize = 18;
@@ -45,6 +52,7 @@ const OFFICIAL_PLANNED_WEIGHT_BYTES: u64 = 53_797_287_936;
 pub(crate) struct OfficialQwen38SourceTeacherRequestV1 {
     pub(crate) model_dir: PathBuf,
     pub(crate) output: PathBuf,
+    pub(crate) evaluation_split: OfficialQwen38EvaluationSplitV1,
 }
 
 /// Sanitized operational summary. Content/work hashes are stable; device,
@@ -66,9 +74,11 @@ pub(crate) struct OfficialQwen38SourceTeacherSummaryV1 {
     pub(crate) source_partition_sha256: String,
     pub(crate) topology_sha256: String,
     pub(crate) dataset_partition_sha256: String,
+    pub(crate) evaluation_split: crate::intelligence::calibration::DatasetSplit,
     pub(crate) calibration_corpus_sha256: String,
     pub(crate) policy_validation_corpus_sha256: String,
     pub(crate) acceptance_holdout_corpus_sha256: String,
+    pub(crate) threshold_profile_sha256: Option<String>,
     pub(crate) prediction_plan_sha256: String,
     pub(crate) work_plan_sha256: String,
     pub(crate) source_tensor_count: usize,
@@ -124,69 +134,6 @@ pub(super) struct OfficialSourceV1 {
     partition: TensorPartitionManifest,
 }
 
-pub(crate) fn preflight_official_qwen38_source_teacher(
-    request: &OfficialQwen38SourceTeacherRequestV1,
-) -> Result<OfficialQwen38SourceTeacherSummaryV1> {
-    let total_started = Instant::now();
-    let mut built = build_official_work(request)?;
-    built.work.preflight_target_destination(&request.output)?;
-    let device = MlxDevice::new().context("create official source-teacher Metal device")?;
-    built.summary.metal_device = Some(device_summary(&device));
-    let capacity_started = Instant::now();
-    built.summary.capacity_preflight = Some(preflight_qwen35_source_teacher_run_inputs_capacity(
-        &built.work,
-        &device,
-        built.upload_limits,
-        built.preparation_policy,
-    )?);
-    built.summary.timings.capacity_preflight_ms = elapsed_ms(capacity_started.elapsed());
-    built.summary.timings.total_ms = elapsed_ms(total_started.elapsed());
-    Ok(built.summary)
-}
-
-pub(crate) fn run_official_qwen38_source_teacher(
-    request: OfficialQwen38SourceTeacherRequestV1,
-) -> Result<OfficialQwen38SourceTeacherSummaryV1> {
-    let total_started = Instant::now();
-    let mut built = build_official_work(&request)?;
-    let device = MlxDevice::new().context("create official source-teacher Metal device")?;
-    built.summary.metal_device = Some(device_summary(&device));
-    let capacity_started = Instant::now();
-    let capacity_preflight = preflight_qwen35_source_teacher_run_inputs_capacity(
-        &built.work,
-        &device,
-        built.upload_limits,
-        built.preparation_policy,
-    )?;
-    built.summary.timings.capacity_preflight_ms = elapsed_ms(capacity_started.elapsed());
-    ensure!(
-        capacity_preflight.eligible,
-        "official source-teacher capacity preflight is not eligible"
-    );
-    built.summary.capacity_preflight = Some(capacity_preflight);
-    let prepare_started = Instant::now();
-    let inputs = prepare_qwen35_source_teacher_run_inputs(
-        built.work,
-        &request.output,
-        &device,
-        built.upload_limits,
-        built.preparation_policy,
-    )?;
-    built.summary.timings.prepare_weights_and_cache_ms =
-        Some(elapsed_ms(prepare_started.elapsed()));
-    let execution_started = Instant::now();
-    let completed = run_qwen35_source_teacher(inputs)?;
-    built.summary.timings.execute_and_publish_ms = Some(elapsed_ms(execution_started.elapsed()));
-    built.summary.target_path = completed.path().to_path_buf();
-    built.summary.executed = true;
-    built.summary.target_artifact_sha256 = Some(completed.target_artifact_sha256().to_owned());
-    built.summary.completion_receipt_sha256 =
-        Some(completed.completion_receipt_sha256().to_owned());
-    built.summary.structural_target_receipt = Some(completed.structural_target_receipt().clone());
-    built.summary.timings.total_ms = elapsed_ms(total_started.elapsed());
-    Ok(built.summary)
-}
-
 struct OfficialWorkV1 {
     summary: OfficialQwen38SourceTeacherSummaryV1,
     work: StructurallyBoundQwen35SourceTeacherWorkV1,
@@ -194,13 +141,17 @@ struct OfficialWorkV1 {
     preparation_policy: Qwen35SourceTeacherPreparationPolicyV1,
 }
 
-fn build_official_work(request: &OfficialQwen38SourceTeacherRequestV1) -> Result<OfficialWorkV1> {
-    let profile = official_profile()?;
+fn build_official_work(
+    model_dir: &Path,
+    output: &Path,
+    profile: &OfficialEvidenceProfileV1,
+    evaluation: OfficialQwen38EvaluationSplitV1,
+) -> Result<OfficialWorkV1> {
     let source_started = Instant::now();
-    let source = authenticate_official_source(&request.model_dir, &profile)?;
+    let source = authenticate_official_source(model_dir, profile)?;
     let source_authentication_ms = elapsed_ms(source_started.elapsed());
     let corpus_started = Instant::now();
-    let prediction = build_official_prediction_plan(&source, &profile)?;
+    let prediction = build_official_prediction_plan(&source, profile, evaluation)?;
     let corpus_and_prediction_plan_ms = elapsed_ms(corpus_started.elapsed());
     let source_inventory_sha256 = source.inventory.manifest().manifest_sha256.clone();
     let source_partition_sha256 = source.partition.manifest_sha256.clone();
@@ -254,9 +205,11 @@ fn build_official_work(request: &OfficialQwen38SourceTeacherRequestV1) -> Result
         source_partition_sha256,
         topology_sha256,
         dataset_partition_sha256: prediction.dataset_partition_sha256,
+        evaluation_split: prediction.evaluation_split,
         calibration_corpus_sha256: prediction.calibration_corpus_sha256,
         policy_validation_corpus_sha256: prediction.policy_validation_corpus_sha256,
         acceptance_holdout_corpus_sha256: prediction.acceptance_holdout_corpus_sha256,
+        threshold_profile_sha256: prediction.threshold_profile_sha256,
         prediction_plan_sha256,
         work_plan_sha256: work.work_plan_sha256().to_owned(),
         source_tensor_count,
@@ -280,7 +233,7 @@ fn build_official_work(request: &OfficialQwen38SourceTeacherRequestV1) -> Result
             topology_and_work_preflight_ms,
             ..OfficialSourceTeacherTimingsV1::default()
         },
-        target_path: request.output.clone(),
+        target_path: output.to_path_buf(),
         executed: false,
         target_artifact_sha256: None,
         completion_receipt_sha256: None,

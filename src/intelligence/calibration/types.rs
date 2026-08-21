@@ -8,7 +8,7 @@ use crate::intelligence::measured_auto_quant::SourceIdentity;
 use crate::serve::api::schema::{ChatMessage, Tool};
 
 pub const CALIBRATION_INPUT_SCHEMA_VERSION: u32 = 1;
-pub const TEACHER_PREDICTION_PLAN_SCHEMA_VERSION: u32 = 2;
+pub const TEACHER_PREDICTION_PLAN_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -264,8 +264,9 @@ pub struct TeacherPredictionPlanManifest {
     pub source: SourceIdentity,
     pub verified_source_manifest_sha256: String,
     pub dataset_partition_manifest_sha256: String,
-    pub calibration_corpus_artifact_sha256: String,
-    pub calibration_manifest_sha256: String,
+    pub evaluation_split: DatasetSplit,
+    pub evaluation_corpus_artifact_sha256: String,
+    pub evaluation_manifest_sha256: String,
     pub rendered_token_stream_sha256: String,
     pub limits: TeacherPredictionPlanLimits,
     pub total_example_count: usize,
@@ -278,9 +279,54 @@ pub struct TeacherPredictionPlanManifest {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct VerifiedCalibrationPredictionPlan {
+pub(crate) struct VerifiedTeacherPredictionPlan {
     pub(super) manifest: TeacherPredictionPlanManifest,
     pub(super) examples: Vec<TeacherPredictionExample>,
+}
+
+/// Opaque proof that a family-owned operator verified a predeclared threshold
+/// profile against both characterization receipts before opening holdout.
+/// This capability binds the only source/corpus identity that it may unlock.
+#[derive(Debug)]
+pub(crate) struct VerifiedTeacherAcceptanceThresholdsV1 {
+    pub(super) threshold_profile_sha256: String,
+    pub(super) calibration_comparison_receipt_sha256: String,
+    pub(super) policy_validation_comparison_receipt_sha256: String,
+    pub(super) source: SourceIdentity,
+    pub(super) verified_source_manifest_sha256: String,
+    pub(super) acceptance_holdout_corpus_sha256: String,
+}
+
+/// Non-clone sealed result of consuming the predeclared threshold authority
+/// to open exactly one AcceptanceHoldout prediction plan.
+#[derive(Debug)]
+pub(crate) struct VerifiedTeacherAcceptanceHoldoutPlanV1 {
+    pub(super) plan: VerifiedTeacherPredictionPlan,
+    pub(super) threshold_profile_sha256: String,
+}
+
+impl VerifiedTeacherAcceptanceHoldoutPlanV1 {
+    pub(crate) fn threshold_profile_sha256(&self) -> &str {
+        &self.threshold_profile_sha256
+    }
+
+    pub(crate) fn into_prediction_plan(self) -> VerifiedTeacherPredictionPlan {
+        self.plan
+    }
+}
+
+impl VerifiedTeacherAcceptanceThresholdsV1 {
+    pub(crate) fn threshold_profile_sha256(&self) -> &str {
+        &self.threshold_profile_sha256
+    }
+
+    pub(crate) fn calibration_comparison_receipt_sha256(&self) -> &str {
+        &self.calibration_comparison_receipt_sha256
+    }
+
+    pub(crate) fn policy_validation_comparison_receipt_sha256(&self) -> &str {
+        &self.policy_validation_comparison_receipt_sha256
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -290,7 +336,7 @@ pub(super) struct TeacherPredictionExample {
     pub greedy_prompt_ordinal: Option<usize>,
 }
 
-impl VerifiedCalibrationPredictionPlan {
+impl VerifiedTeacherPredictionPlan {
     pub(crate) fn manifest(&self) -> &TeacherPredictionPlanManifest {
         &self.manifest
     }
@@ -299,7 +345,7 @@ impl VerifiedCalibrationPredictionPlan {
         self.manifest.prediction_points.len()
     }
 
-    /// Visit each retained Calibration example exactly once in canonical
+    /// Visit each retained evaluation example exactly once in canonical
     /// manifest order. Completed transcripts expose all of their scored points
     /// as one contiguous slice; generation prompts expose their single
     /// next-token point plus the matching greedy prompt. This is the bounded

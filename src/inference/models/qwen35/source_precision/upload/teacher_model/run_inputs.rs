@@ -24,7 +24,7 @@ use crate::inference::models::qwen35::source_precision::topology::VerifiedQwen35
 use crate::inference::models::qwen35::source_precision::upload_plan::{
     QwenSourceMetalCapacityV1, QwenSourceMetalUploadLimits,
 };
-use crate::intelligence::calibration::VerifiedCalibrationPredictionPlan;
+use crate::intelligence::calibration::VerifiedTeacherPredictionPlan;
 use crate::intelligence::exact_teacher::{
     preflight_structural_teacher_target, UnpublishedStructuralTeacherTargetReservation,
 };
@@ -155,7 +155,7 @@ struct PreparedQwen35SourceTeacherRunInputsReceiptV1 {
 pub(crate) struct PreparedQwen35SourceTeacherRunInputsV1 {
     _teacher: PreparedQwen35SourceTeacherV1,
     _cache: PreparedQwen35BaseTextCacheV1,
-    _prediction_plan: VerifiedCalibrationPredictionPlan,
+    _prediction_plan: VerifiedTeacherPredictionPlan,
     _target_reservation: UnpublishedStructuralTeacherTargetReservation,
     _expected_work: Qwen35SourceTeacherExpectedWorkV1,
     receipt: PreparedQwen35SourceTeacherRunInputsReceiptV1,

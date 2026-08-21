@@ -166,7 +166,6 @@ pub(super) fn verify_structural_teacher_target_artifact(
         .map_err(|error| ExactTeacherTargetError::io(Path::new("<retained-target>"), error))?
         != 0
         || expected_offset != receipt.target_artifact.byte_len
-        || receipt.greedy_trajectories.is_empty()
         || receipt.greedy_trajectories.iter().any(|trajectory| {
             trajectory.stable_id.is_empty()
                 || !is_lower_sha256(&trajectory.prompt_token_ids_sha256)

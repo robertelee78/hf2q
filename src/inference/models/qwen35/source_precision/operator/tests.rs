@@ -101,3 +101,207 @@ fn embedded_qwen38_corpora_are_exact_owned_disjoint_splits() {
     }
     assert_eq!(seen.len(), 4);
 }
+
+#[test]
+fn acceptance_threshold_bundle_is_exact_predeclared_and_substitution_closed() {
+    let profile = super::profile::official_profile().unwrap();
+    let (threshold_bytes, calibration_bytes, policy_bytes) =
+        super::acceptance::threshold_evidence_for_test();
+    let thresholds = super::acceptance::verify_threshold_bundle_for_test(
+        threshold_bytes,
+        calibration_bytes,
+        policy_bytes,
+        &profile,
+    )
+    .unwrap();
+    assert_eq!(
+        thresholds.plan_authority.threshold_profile_sha256(),
+        "6a3d36c3006355315820b331aaaeb75bc04ef58b04b81c2be31692b7f99ababb"
+    );
+    assert_eq!(
+        thresholds
+            .plan_authority
+            .calibration_comparison_receipt_sha256(),
+        "41fdf58a53bca32c255951bcc8e9193843afb176c89fdbaee057afadea8bc77d"
+    );
+    assert_eq!(
+        thresholds
+            .plan_authority
+            .policy_validation_comparison_receipt_sha256(),
+        "ed24074db26dde69ccafb6ac797dd77a999000993a26f8eb661b4ac91f1fb919"
+    );
+    assert_eq!(
+        thresholds.external_implementation.repository_commit,
+        "945dac9117cb54196888c0e6c08035792a98c485"
+    );
+    assert_eq!(thresholds.external_implementation.source_dtype, "bfloat16");
+    assert_eq!(thresholds.external_implementation.logit_dtype, "f32_le");
+    let (acceptance_comparison, acceptance_gate) =
+        super::acceptance::closed_acceptance_evidence_for_test();
+    assert_eq!(
+        hex::encode(Sha256::digest(acceptance_comparison)),
+        "e2f3cbd3bd1cce9e3964053a52409e36bf590679dea993881a066654a6e3ff01"
+    );
+    assert_eq!(
+        hex::encode(Sha256::digest(acceptance_gate)),
+        "9a7836e5ca1ed848dd6cc2bd64c4c9bcc97a418db346e5f182d0639720f8df2d"
+    );
+    super::acceptance::verify_closed_acceptance_receipts_for_test(
+        &thresholds,
+        acceptance_comparison,
+        acceptance_gate,
+    )
+    .unwrap();
+
+    let mut substituted_acceptance = acceptance_comparison.to_vec();
+    let candidate_offset = substituted_acceptance
+        .windows(b"07b59ba8".len())
+        .position(|window| window == b"07b59ba8")
+        .unwrap();
+    substituted_acceptance[candidate_offset] = b'1';
+    assert!(
+        super::acceptance::verify_closed_acceptance_receipts_for_test(
+            &thresholds,
+            &substituted_acceptance,
+            acceptance_gate,
+        )
+        .is_err()
+    );
+
+    let mut substituted_gate = acceptance_gate.to_vec();
+    let gate_hash_offset = substituted_gate
+        .windows(b"f84f6b56".len())
+        .position(|window| window == b"f84f6b56")
+        .unwrap();
+    substituted_gate[gate_hash_offset] = b'0';
+    assert!(
+        super::acceptance::verify_closed_acceptance_receipts_for_test(
+            &thresholds,
+            acceptance_comparison,
+            &substituted_gate,
+        )
+        .is_err()
+    );
+
+    let mut mutated_profile = threshold_bytes.to_vec();
+    let threshold_offset = mutated_profile
+        .windows(b"\"max_abs\":5.0".len())
+        .position(|window| window == b"\"max_abs\":5.0")
+        .unwrap();
+    mutated_profile[threshold_offset + b"\"max_abs\":5.".len()] = b'1';
+    assert!(super::acceptance::verify_threshold_bundle_for_test(
+        &mutated_profile,
+        calibration_bytes,
+        policy_bytes,
+        &profile,
+    )
+    .is_err());
+
+    let mut substituted_calibration = calibration_bytes.to_vec();
+    let commit_offset = substituted_calibration
+        .windows(b"9b314ce4".len())
+        .position(|window| window == b"9b314ce4")
+        .unwrap();
+    substituted_calibration[commit_offset] = b'8';
+    assert!(super::acceptance::verify_threshold_bundle_for_test(
+        threshold_bytes,
+        &substituted_calibration,
+        policy_bytes,
+        &profile,
+    )
+    .is_err());
+    assert!(super::acceptance::verify_threshold_bundle_for_test(
+        threshold_bytes,
+        policy_bytes,
+        calibration_bytes,
+        &profile,
+    )
+    .is_err());
+
+    crate::intelligence::exact_teacher::validate_exact_teacher_reference_comparison_artifact(
+        calibration_bytes,
+    )
+    .unwrap();
+    let mut rehashed_metric = calibration_bytes.to_vec();
+    let metric_offset = rehashed_metric
+        .windows(b"4.955787658691406".len())
+        .position(|window| window == b"4.955787658691406")
+        .unwrap();
+    rehashed_metric[metric_offset] = b'3';
+    assert!(
+        crate::intelligence::exact_teacher::validate_exact_teacher_reference_comparison_artifact(
+            &rehashed_metric,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn acceptance_metrics_fail_at_every_predeclared_boundary() {
+    let (_, calibration_bytes, policy_bytes) = super::acceptance::threshold_evidence_for_test();
+    let mut holdout: crate::intelligence::exact_teacher::ExactTeacherReferenceComparisonReceiptV1 =
+        serde_json::from_slice(calibration_bytes).unwrap();
+    let policy: crate::intelligence::exact_teacher::ExactTeacherReferenceComparisonReceiptV1 =
+        serde_json::from_slice(policy_bytes).unwrap();
+    holdout.rows.truncate(1);
+    holdout.rows[0].max_abs = 5.0;
+    holdout.rows[0].kl_reference_to_native = 0.12;
+    holdout.rows[0].top1_match = true;
+    let passing = super::acceptance::Qwen38SourceReferenceThresholdsV1 {
+        expected_row_count: 1,
+        expected_generation_prompt_count: 1,
+        required_trajectory_count: 1,
+        max_abs: 5.0,
+        max_row_kl_reference_to_native: 0.12,
+        require_top1_match: true,
+        min_first_divergence_index: 10,
+    };
+    super::acceptance::comparison_passes_thresholds_for_test(&holdout, passing).unwrap();
+
+    let mut above_max_abs = holdout.clone();
+    above_max_abs.rows[0].max_abs = f64::from_bits(5.0_f64.to_bits() + 1);
+    assert!(
+        super::acceptance::comparison_passes_thresholds_for_test(&above_max_abs, passing).is_err()
+    );
+    let mut above_kl = holdout.clone();
+    above_kl.rows[0].kl_reference_to_native = f64::from_bits(0.12_f64.to_bits() + 1);
+    assert!(super::acceptance::comparison_passes_thresholds_for_test(&above_kl, passing).is_err());
+
+    let mut failing = passing;
+    failing.expected_row_count = 2;
+    assert!(super::acceptance::comparison_passes_thresholds_for_test(&holdout, failing).is_err());
+    let mut failing = passing;
+    failing.required_trajectory_count = 2;
+    assert!(super::acceptance::comparison_passes_thresholds_for_test(&holdout, failing).is_err());
+    let mut top1_mismatch = holdout.clone();
+    top1_mismatch.rows[0].top1_match = false;
+    assert!(
+        super::acceptance::comparison_passes_thresholds_for_test(&top1_mismatch, passing).is_err()
+    );
+    let mut failing = passing;
+    failing.min_first_divergence_index = 11;
+    assert!(super::acceptance::comparison_passes_thresholds_for_test(&holdout, failing).is_err());
+    let mut early_divergence = holdout;
+    early_divergence.trajectories[0].first_divergence_index = Some(9);
+    assert!(
+        super::acceptance::comparison_passes_thresholds_for_test(&early_divergence, passing)
+            .is_err()
+    );
+    let mut missing_divergence = early_divergence;
+    missing_divergence.trajectories[0].first_divergence_index = None;
+    assert!(
+        super::acceptance::comparison_passes_thresholds_for_test(&missing_divergence, passing)
+            .is_err()
+    );
+    let mut out_of_range_divergence = missing_divergence;
+    out_of_range_divergence.trajectories[0].first_divergence_index = Some(32);
+    assert!(super::acceptance::comparison_passes_thresholds_for_test(
+        &out_of_range_divergence,
+        passing,
+    )
+    .is_err());
+    assert!(
+        super::acceptance::comparison_passes_thresholds_for_test(&policy, passing).is_err(),
+        "a zero-trajectory split cannot masquerade as AcceptanceHoldout"
+    );
+}

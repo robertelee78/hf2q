@@ -14,9 +14,10 @@ use crate::intelligence::exact_teacher::{
     ExactTeacherReferenceInputV1, ExactTeacherTargetReceipt,
 };
 
-use super::corpus::build_official_prediction_plan;
+use super::corpus::{build_official_prediction_plan, OfficialPredictionPlanV1};
 use super::profile::official_profile;
 use super::source::authenticate_official_source;
+use super::OfficialQwen38EvaluationSplitV1;
 
 const MAX_EVIDENCE_JSON_BYTES: u64 = 16 * 1024 * 1024;
 const EVIDENCE_OPEN_FLAGS: OFlags = OFlags::RDONLY
@@ -36,6 +37,8 @@ pub(crate) struct OfficialQwen38SourceReferenceRequestV1 {
 #[derive(Deserialize)]
 struct NativeSummaryReferenceViewV1 {
     profile: String,
+    evaluation_split: crate::intelligence::calibration::DatasetSplit,
+    threshold_profile_sha256: Option<String>,
     prediction_plan_sha256: String,
     executed: bool,
     target_artifact_sha256: Option<String>,
@@ -47,6 +50,18 @@ struct NativeSummaryReferenceViewV1 {
 pub(crate) fn compare_official_qwen38_source_reference(
     request: &OfficialQwen38SourceReferenceRequestV1,
 ) -> Result<ExactTeacherReferenceComparisonReceiptV1> {
+    let profile = official_profile()?;
+    let (_, comparison) = compare_reference(request, &profile)?;
+    Ok(comparison)
+}
+
+fn compare_reference(
+    request: &OfficialQwen38SourceReferenceRequestV1,
+    profile: &super::profile::OfficialEvidenceProfileV1,
+) -> Result<(
+    OfficialPredictionPlanV1,
+    ExactTeacherReferenceComparisonReceiptV1,
+)> {
     let native: NativeSummaryReferenceViewV1 = read_json(&request.native_summary)
         .context("read native source-teacher evidence summary")?;
     ensure!(
@@ -74,14 +89,38 @@ pub(crate) fn compare_official_qwen38_source_reference(
     let comparator_git_commit = crate::convert::receipt::require_converter_git_commit()
         .context("resolve exact hf2q comparator Git commit")?;
 
-    let profile = official_profile()?;
-    let source = authenticate_official_source(&request.model_dir, &profile)?;
-    let prediction = build_official_prediction_plan(&source, &profile)?;
+    let source = authenticate_official_source(&request.model_dir, profile)?;
+    let prediction = match native.evaluation_split {
+        crate::intelligence::calibration::DatasetSplit::Calibration => {
+            ensure!(
+                native.threshold_profile_sha256.is_none(),
+                "characterization summary unexpectedly binds acceptance thresholds"
+            );
+            build_official_prediction_plan(
+                &source,
+                profile,
+                OfficialQwen38EvaluationSplitV1::Calibration,
+            )?
+        }
+        crate::intelligence::calibration::DatasetSplit::PolicyValidation => {
+            ensure!(
+                native.threshold_profile_sha256.is_none(),
+                "characterization summary unexpectedly binds acceptance thresholds"
+            );
+            build_official_prediction_plan(
+                &source,
+                profile,
+                OfficialQwen38EvaluationSplitV1::PolicyValidation,
+            )?
+        }
+        _ => anyhow::bail!("source-reference command does not match the native evaluation split"),
+    };
     ensure!(
-        prediction.plan.manifest().manifest_sha256 == native.prediction_plan_sha256,
+        prediction.evaluation_split == native.evaluation_split
+            && prediction.plan.manifest().manifest_sha256 == native.prediction_plan_sha256,
         "freshly authenticated prediction plan differs from native evidence"
     );
-    compare_exact_teacher_reference_targets(
+    let comparison = compare_exact_teacher_reference_targets(
         &prediction.plan,
         &native.reference_input,
         &request.native_target,
@@ -91,10 +130,17 @@ pub(crate) fn compare_official_qwen38_source_reference(
         &request.external_target,
         &external,
     )
-    .map_err(|error| anyhow::anyhow!(error.to_string()))
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok((prediction, comparison))
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    let bytes = read_bounded_bytes(path)?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse evidence file {}", path.display()))
+}
+
+fn read_bounded_bytes(path: &Path) -> Result<Vec<u8>> {
     let descriptor = fs::open(path, EVIDENCE_OPEN_FLAGS, Mode::empty())
         .map_err(std::io::Error::from)
         .with_context(|| format!("open evidence file {}", path.display()))?;
@@ -112,6 +158,5 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let mut bytes = Vec::with_capacity(usize::try_from(stat.st_size).unwrap_or(0));
     file.read_to_end(&mut bytes)
         .with_context(|| format!("read evidence file {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse evidence file {}", path.display()))
+    Ok(bytes)
 }

@@ -173,6 +173,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Info(args) => cmd_info(args).map_err(AppError::Input),
         Command::SourceTeacher(args) => cmd_source_teacher(args),
         Command::SourceTeacherReference(args) => cmd_source_teacher_reference(args),
+        Command::SourceTeacherAcceptanceVerify(args) => cmd_source_teacher_acceptance_verify(args),
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
         Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
         Command::Generate(args) => serve::cmd_generate(args).map_err(AppError::Conversion),
@@ -253,12 +254,22 @@ fn cmd_verify_local_gguf(args: cli::VerifyLocalGgufArgs) -> Result<(), AppError>
 fn cmd_source_teacher(args: cli::SourceTeacherArgs) -> Result<(), AppError> {
     use crate::inference::models::qwen35::source_precision::{
         preflight_official_qwen38_source_teacher, run_official_qwen38_source_teacher,
-        OfficialQwen38SourceTeacherRequestV1,
+        OfficialQwen38EvaluationSplitV1, OfficialQwen38SourceTeacherRequestV1,
+    };
+
+    let evaluation_split = match args.evaluation_split {
+        cli::SourceTeacherEvaluationSplitArg::Calibration => {
+            OfficialQwen38EvaluationSplitV1::Calibration
+        }
+        cli::SourceTeacherEvaluationSplitArg::PolicyValidation => {
+            OfficialQwen38EvaluationSplitV1::PolicyValidation
+        }
     };
 
     let request = OfficialQwen38SourceTeacherRequestV1 {
         model_dir: args.model_dir,
         output: args.output,
+        evaluation_split,
     };
     let summary = if args.execute {
         run_official_qwen38_source_teacher(request)
@@ -271,6 +282,24 @@ fn cmd_source_teacher(args: cli::SourceTeacherArgs) -> Result<(), AppError> {
         serde_json::to_string(&summary).map_err(|error| {
             AppError::Conversion(anyhow::anyhow!(
                 "serialize source-teacher evidence summary: {error}"
+            ))
+        })?
+    );
+    Ok(())
+}
+
+fn cmd_source_teacher_acceptance_verify(
+    args: cli::SourceTeacherAcceptanceVerifyArgs,
+) -> Result<(), AppError> {
+    use crate::inference::models::qwen35::source_precision::verify_official_qwen38_acceptance_evidence;
+
+    let receipt = verify_official_qwen38_acceptance_evidence(&args.model_dir)
+        .map_err(AppError::Conversion)?;
+    println!(
+        "{}",
+        serde_json::to_string(&receipt).map_err(|error| {
+            AppError::Conversion(anyhow::anyhow!(
+                "serialize closed acceptance quality-gate receipt: {error}"
             ))
         })?
     );

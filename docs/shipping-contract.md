@@ -221,11 +221,16 @@ Internal scaffolding. Not listed in `docs/operator-env-vars.md` as
 operator-facing; loaded through `src/debug/investigation_env.rs`
 (centralized), not read ad-hoc in hot paths.
 
-ADR-046 calibration, exact-teacher, source-precision teacher, copied-execution
-evidence, and exact Dynamic-frontier generation are validation substrate, not
-default-binary or operator surfaces. Per ADR-048 they compile with their tests;
-the completed bounded family transaction does not cross that boundary until an
-explicit product entrypoint and the required official-model gates land.
+ADR-046's fixed-profile `source-teacher` characterization operator and closed
+`source-teacher-acceptance-verify` command are hidden validation surfaces, not
+public conversion, serving, or default behavior. Their minimal authenticated
+calibration, exact-teacher, source-precision, and base-text-cache chain compiles
+in release under ADR-048's reachability rule. The one-time AcceptanceHoldout
+execution and comparison-minting routes were removed after their exact receipts
+passed and were checked in; the retained verifier performs no Metal model load
+and accepts no caller-provided receipt. Copied-execution evidence and trace
+capture, exact Dynamic-frontier generation, selector/autoquant activation,
+compatibility writers, and replay remain test-only or unavailable.
 
 **Ack-required (known to risk correctness or runtime reliability):**
 
