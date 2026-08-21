@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use super::wire::{ChatChunk, Timing, ToolCall, ToolFunction, Usage};
 
 const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SSE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StreamUpdate {
@@ -42,12 +43,17 @@ pub(crate) struct SseDecoder {
     usage: Option<Usage>,
     timing: Option<Timing>,
     saw_done: bool,
+    received_bytes: usize,
 }
 
 impl SseDecoder {
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<StreamUpdate>> {
         if self.saw_done && !bytes.iter().all(u8::is_ascii_whitespace) {
             bail!("received data after the [DONE] terminator");
+        }
+        self.received_bytes = self.received_bytes.saturating_add(bytes.len());
+        if self.received_bytes > MAX_SSE_RESPONSE_BYTES {
+            bail!("chat SSE response exceeded the 64 MiB diagnostic-client limit");
         }
         self.bytes.extend_from_slice(bytes);
         let mut updates = Vec::new();
@@ -233,5 +239,18 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("finish_reason=error"));
+    }
+
+    #[test]
+    fn rejects_cumulative_streams_above_the_session_bound() {
+        let mut decoder = SseDecoder {
+            received_bytes: MAX_SSE_RESPONSE_BYTES,
+            ..Default::default()
+        };
+        assert!(decoder
+            .push(b"x")
+            .unwrap_err()
+            .to_string()
+            .contains("64 MiB"));
     }
 }

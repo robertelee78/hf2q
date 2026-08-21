@@ -5,6 +5,7 @@ use std::io::{BufRead, Write};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::client::{decode_json_bounded, read_text_bounded};
 use super::endpoint::Endpoint;
 
 const RUNTIME_SCHEMA: &str = "hf2q.runtime.v1";
@@ -28,6 +29,14 @@ struct RuntimeCapabilities {
     model_activation: String,
     #[serde(default)]
     non_evicting_load: bool,
+    #[serde(default)]
+    diagnostic_no_evict_header: Option<DiagnosticHeaderCapability>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiagnosticHeaderCapability {
+    name: String,
+    value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,7 +102,14 @@ impl Hf2qControl {
         if let Some(token) = auth_token {
             request = request.bearer_auth(token);
         }
-        let response = request.send().await.context("probe hf2q runtime API")?;
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) if !required => {
+                tracing::debug!(%error, "explicit endpoint did not answer the optional hf2q runtime probe");
+                return Ok(None);
+            }
+            Err(error) => return Err(error).context("probe hf2q runtime API"),
+        };
         if matches!(
             response.status(),
             reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
@@ -105,7 +121,7 @@ impl Hf2qControl {
         }
         if !response.status().is_success() {
             let status = response.status();
-            let detail = response.text().await.unwrap_or_default();
+            let detail = read_text_bounded(response, "hf2q runtime error").await?;
             if required {
                 bail!(
                     "hf2q runtime API returned HTTP {status}: {}",
@@ -114,10 +130,22 @@ impl Hf2qControl {
             }
             return Ok(None);
         }
-        let view: RuntimeView = response.json().await.context("decode hf2q runtime API")?;
+        let view: RuntimeView = match decode_json_bounded(response, "hf2q runtime API").await {
+            Ok(view) => view,
+            Err(error) if !required => {
+                tracing::debug!(%error, "explicit endpoint did not expose a compatible hf2q runtime payload");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         if view.schema_version != RUNTIME_SCHEMA
             || view.capabilities.model_activation != ACTIVATION_SCHEMA
             || !view.capabilities.non_evicting_load
+            || !view
+                .capabilities
+                .diagnostic_no_evict_header
+                .as_ref()
+                .is_some_and(|header| header.name == NON_EVICTING_HEADER && header.value == "1")
         {
             if required {
                 bail!("the discovered hf2q server has an incompatible diagnostic lifecycle API");
@@ -232,23 +260,19 @@ impl Hf2qControl {
         let response = request.send().await.context("activate hf2q model")?;
         let status = response.status();
         if status.is_success() {
-            let success: ActivationSuccess = response
-                .json()
-                .await
-                .context("decode hf2q activation response")?;
+            let success: ActivationSuccess =
+                decode_json_bounded(response, "hf2q activation response").await?;
             if success.schema_version != ACTIVATION_SCHEMA {
                 bail!("hf2q returned an incompatible activation response");
             }
             return Ok(ActivationResult::Ready(success));
         }
         if status == reqwest::StatusCode::CONFLICT {
-            let conflict: ActivationConflict = response
-                .json()
-                .await
-                .context("decode hf2q activation conflict")?;
+            let conflict: ActivationConflict =
+                decode_json_bounded(response, "hf2q activation conflict").await?;
             return Ok(ActivationResult::Conflict(conflict));
         }
-        let detail = response.text().await.unwrap_or_default();
+        let detail = read_text_bounded(response, "hf2q activation error").await?;
         bail!(
             "hf2q model activation returned HTTP {status}: {}",
             compact(&detail)
@@ -263,10 +287,10 @@ impl Hf2qControl {
         let response = request.send().await.context("query hf2q runtime")?;
         let status = response.status();
         if !status.is_success() {
-            let detail = response.text().await.unwrap_or_default();
+            let detail = read_text_bounded(response, "hf2q runtime error").await?;
             bail!("hf2q runtime returned HTTP {status}: {}", compact(&detail));
         }
-        response.json().await.context("decode hf2q runtime")
+        decode_json_bounded(response, "hf2q runtime").await
     }
 
     pub(crate) async fn write_runtime_status(
@@ -274,7 +298,13 @@ impl Hf2qControl {
         auth_token: Option<&str>,
         output: &mut impl Write,
     ) -> Result<()> {
-        let view = self.runtime(auth_token).await?;
+        let view = match self.runtime(auth_token).await {
+            Ok(view) => view,
+            Err(error) => {
+                writeln!(output, "[pool] unavailable: {error:#}")?;
+                return Ok(());
+            }
+        };
         let residents = view
             .pool
             .resident
@@ -343,6 +373,10 @@ mod tests {
             "capabilities": {
                 "model_activation": ACTIVATION_SCHEMA,
                 "non_evicting_load": true,
+                "diagnostic_no_evict_header": {
+                    "name": NON_EVICTING_HEADER,
+                    "value": "1"
+                },
                 "explicit_revision_bound_switch": true,
                 "request_generation_leases": true
             },
@@ -479,6 +513,27 @@ mod tests {
     #[tokio::test]
     async fn generic_endpoint_without_capability_remains_usable() {
         let (endpoint, stop) = serve(Router::new()).await;
+        assert!(
+            Hf2qControl::detect(&reqwest::Client::new(), &endpoint, None, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Hf2qControl::detect(&reqwest::Client::new(), &endpoint, None, true)
+                .await
+                .is_err()
+        );
+        let _ = stop.send(());
+    }
+
+    #[tokio::test]
+    async fn generic_endpoint_with_an_invalid_optional_capability_remains_usable() {
+        let router = Router::new().route(
+            "/hf2q/v1/runtime",
+            get(|| async { (StatusCode::OK, "not-json") }),
+        );
+        let (endpoint, stop) = serve(router).await;
         assert!(
             Hf2qControl::detect(&reqwest::Client::new(), &endpoint, None, false)
                 .await

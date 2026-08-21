@@ -10,6 +10,7 @@ use crate::cli::ChatArgs;
 // failure by the diagnostic client.
 const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 const CHILD_SIGNAL_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A normalized HTTP endpoint. Automatic discovery must construct this from
 /// a verified loopback port, never from DNS-SD TXT host/URL/PID metadata.
@@ -169,27 +170,34 @@ impl EndpointSession {
         if let Some(token) = auth_token {
             request = request.bearer_auth(token);
         }
-        let response = request.send().await;
+        let response = tokio::time::timeout(SHUTDOWN_REQUEST_TIMEOUT, request.send()).await;
         let graceful_requested = match response {
-            Ok(response) if response.status().is_success() => true,
-            Ok(response) => {
+            Ok(Ok(response)) if response.status().is_success() => true,
+            Ok(Ok(response)) => {
                 tracing::warn!(
                     status = %response.status(),
                     "chat-owned server rejected /shutdown; signaling the owned child"
                 );
                 false
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::warn!(
                     error = %error,
                     "chat-owned server /shutdown failed; signaling the owned child"
                 );
                 false
             }
+            Err(_) => {
+                tracing::warn!(
+                    timeout = ?SHUTDOWN_REQUEST_TIMEOUT,
+                    "chat-owned server /shutdown timed out; signaling the owned child"
+                );
+                false
+            }
         };
         if !graceful_requested {
             signal_owned_child(child)?;
-            if wait_for_child(child, signal_timeout).await? {
+            if wait_for_child(child, graceful_timeout).await? {
                 return Ok(());
             }
             tracing::warn!("chat-owned server ignored SIGTERM; force-stopping the owned child");

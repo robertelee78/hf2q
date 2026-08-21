@@ -1,10 +1,13 @@
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
+use serde::de::DeserializeOwned;
 
 use super::endpoint::Endpoint;
 use super::sse::{CompletedResponse, SseDecoder, StreamUpdate};
 use super::transcript::Transcript;
 use super::wire::{ChatRequest, Model, ModelList, RequestOptions, ThinkingMode};
+
+const MAX_AUXILIARY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) struct ChatClient {
     http: reqwest::Client,
@@ -90,7 +93,7 @@ impl ChatClient {
         let response = builder.send().await.context("send chat request")?;
         let status = response.status();
         if !status.is_success() {
-            let detail = response.text().await.unwrap_or_default();
+            let detail = read_text_bounded(response, "chat error response").await?;
             bail!("chat endpoint returned HTTP {status}: {}", compact(&detail));
         }
 
@@ -119,17 +122,46 @@ pub(crate) async fn fetch_models(
     let response = builder.send().await.context("query endpoint models")?;
     let status = response.status();
     if !status.is_success() {
-        let detail = response.text().await.unwrap_or_default();
+        let detail = read_text_bounded(response, "model-list error response").await?;
         bail!(
             "model endpoint returned HTTP {status}: {}",
             compact(&detail)
         );
     }
-    let models: ModelList = response
-        .json()
-        .await
-        .context("decode /v1/models response")?;
+    let models: ModelList = decode_json_bounded(response, "/v1/models response").await?;
     Ok(models.data)
+}
+
+pub(crate) async fn decode_json_bounded<T: DeserializeOwned>(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<T> {
+    let bytes = read_bytes_bounded(response, label).await?;
+    serde_json::from_slice(&bytes).with_context(|| format!("decode {label}"))
+}
+
+pub(crate) async fn read_text_bounded(response: reqwest::Response, label: &str) -> Result<String> {
+    let bytes = read_bytes_bounded(response, label).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn read_bytes_bounded(response: reqwest::Response, label: &str) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_AUXILIARY_RESPONSE_BYTES as u64)
+    {
+        bail!("{label} exceeded the 4 MiB diagnostic-client limit");
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("read {label}"))?;
+        if body.len().saturating_add(chunk.len()) > MAX_AUXILIARY_RESPONSE_BYTES {
+            bail!("{label} exceeded the 4 MiB diagnostic-client limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn compact(value: &str) -> String {
