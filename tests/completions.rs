@@ -66,6 +66,7 @@ fn explicit_completions_emit_grammar_to_stdout_without_writing_shell_files() {
     assert!(stdout.contains("chat"));
     assert!(stdout.contains("--model"));
     assert!(stdout.contains("--quant"));
+    assert!(stdout.contains("Q4_K_M"));
     assert!(stdout.contains("--artifact"));
     assert_no_implicit_completion_files(home.path());
 }

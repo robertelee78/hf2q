@@ -408,6 +408,18 @@ impl ModelCache {
         &self.manifest
     }
 
+    /// Read the current atomic manifest from disk without mutating this
+    /// process's cache handle. Diagnostic local-artifact inventory uses this
+    /// so conversions completed by another hf2q process become discoverable.
+    pub fn manifest_snapshot(&self) -> Result<CacheManifest> {
+        let path = self.root.join("manifest.json");
+        if path.exists() {
+            read_manifest(&path)
+        } else {
+            Ok(CacheManifest::default())
+        }
+    }
+
     /// Look up a quant entry; returns `None` if either the model or the
     /// requested quant is uncached.
     pub fn lookup(&self, repo_id: &str, quant: QuantType) -> Option<&QuantEntry> {

@@ -38,6 +38,7 @@ pub mod grammar;
 pub mod handlers;
 pub mod kv_spill_descriptor;
 pub mod lifecycle;
+pub mod local_artifacts;
 pub mod middleware;
 pub mod qwen35_speculation;
 pub mod registry;

@@ -81,6 +81,10 @@ pub enum Command {
     #[command(name = "__catalog-hub-gguf", hide = true)]
     CatalogHubGguf(CatalogHubGgufArgs),
 
+    /// Internal cancellable verifier for one server-owned local GGUF.
+    #[command(name = "__verify-local-gguf", hide = true)]
+    VerifyLocalGguf(VerifyLocalGgufArgs),
+
     /// Update a standalone installation, or restore its retained previous version.
     Update(UpdateArgs),
 
@@ -180,6 +184,20 @@ pub struct FetchHubGgufArgs {
 pub struct CatalogHubGgufArgs {
     #[arg(long)]
     pub repository: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct VerifyLocalGgufArgs {
+    #[arg(long)]
+    pub root: PathBuf,
+    #[arg(long)]
+    pub artifact: PathBuf,
+    #[arg(long)]
+    pub bytes: u64,
+    #[arg(long)]
+    pub sha256: String,
+    #[arg(long)]
+    pub quant: String,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -892,10 +910,12 @@ pub struct ChatArgs {
     #[arg(
         long,
         value_name = "TYPE",
+        value_enum,
+        ignore_case = true,
         requires = "model",
         conflicts_with = "artifact"
     )]
-    pub quant: Option<String>,
+    pub quant: Option<DiagnosticQuantArg>,
 
     /// Select one exact hosted GGUF filename from a Hugging Face repository.
     /// Requires an hf2q endpoint and --model; no source-conversion fallback.
@@ -936,6 +956,29 @@ pub struct ChatArgs {
     pub keep_serving: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DiagnosticQuantArg {
+    #[value(name = "Q8_0")]
+    Q8Zero,
+    #[value(name = "Q6_K")]
+    Q6K,
+    #[value(name = "Q4_K_M")]
+    Q4KM,
+    #[value(name = "Q3_K_M")]
+    Q3KM,
+}
+
+impl DiagnosticQuantArg {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Q8Zero => "Q8_0",
+            Self::Q6K => "Q6_K",
+            Self::Q4KM => "Q4_K_M",
+            Self::Q3KM => "Q3_K_M",
+        }
+    }
+}
+
 #[derive(clap::Args, Debug)]
 pub struct ServeArgs {
     /// Path to GGUF model file. Optional in the iter-2 backbone which only
@@ -944,6 +987,11 @@ pub struct ServeArgs {
     /// --model is supplied, the GGUF header is validated at startup.
     #[arg(long)]
     pub model: Option<PathBuf>,
+
+    /// Additional server-local directory to search for schema-v3 hf2q
+    /// conversion receipts. Repeatable; roots are bounded and never exposed.
+    #[arg(long = "model-dir", value_name = "DIR")]
+    pub model_dirs: Vec<PathBuf>,
 
     /// Internal inherited descriptor for a server owned by `hf2q chat`.
     /// The server accepts it only while leading an isolated process group;
@@ -1452,7 +1500,7 @@ mod tests {
         let Command::Chat(args) = cli.command else {
             panic!("expected Chat");
         };
-        assert_eq!(args.quant.as_deref(), Some("q6_k"));
+        assert_eq!(args.quant, Some(DiagnosticQuantArg::Q6K));
         assert!(args.artifact.is_none());
 
         let exact = Cli::try_parse_from([
@@ -1493,6 +1541,7 @@ mod tests {
         let completion = String::from_utf8(output).unwrap();
         assert!(completion.contains("chat"));
         assert!(completion.contains("--quant"));
+        assert!(completion.contains("Q4_K_M"));
         assert!(completion.contains("--artifact"));
         assert!(completion.contains("--keep-serving"));
     }
@@ -1504,6 +1553,24 @@ mod tests {
             panic!("expected Serve");
         };
         assert!(args.no_integrity);
+    }
+
+    #[test]
+    fn serve_accepts_repeatable_local_model_roots() {
+        let cli = Cli::parse_from([
+            "hf2q",
+            "serve",
+            "--model-dir",
+            "/models/one",
+            "--model-dir=/models/two",
+        ]);
+        let Command::Serve(args) = cli.command else {
+            panic!("expected Serve");
+        };
+        assert_eq!(
+            args.model_dirs,
+            vec![PathBuf::from("/models/one"), PathBuf::from("/models/two")]
+        );
     }
 
     #[test]

@@ -4388,12 +4388,15 @@ pub fn cmd_serve(
         .model
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
+    let local_artifacts =
+        api::local_artifacts::LocalArtifactInventory::for_serve(&args.model_dirs)?;
     let mut state = api::AppState::new_for_serve(
         config.clone(),
         args.no_integrity,
         config.queue_capacity,
         default_model_arg.clone(),
-    )?;
+    )?
+    .with_local_artifacts(local_artifacts);
 
     // --- ADR-017 Phase C.1 — optional persistent block-prefix KV cache ---
     // When `--kv-persist=PATH` is set, replace the AppState's

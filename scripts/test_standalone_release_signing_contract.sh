@@ -109,8 +109,25 @@ for forbidden_release_dependency in \
     fail "routine standalone release still depends on model qualification: $forbidden_release_dependency"
   fi
 done
-grep -Fq 'standalone_candidate_run_id:' "$RELEASE_WORKFLOW" || \
-  fail "release workflow does not accept a standalone candidate run"
+if grep -Fq 'standalone_candidate_run_id:' "$RELEASE_WORKFLOW"; then
+  fail "release still requires an operator to hand off a candidate run ID"
+fi
+grep -Fq 'uses: ./.github/workflows/standalone-candidate.yml' \
+  "$RELEASE_WORKFLOW" || \
+  fail "release workflow does not invoke the candidate workflow"
+grep -Fq 'needs: standalone-candidate' "$RELEASE_WORKFLOW" || \
+  fail "publication does not wait for the candidate workflow"
+grep -Fq 'EXPECTED_STANDALONE_CANDIDATE_RUN_ID: ${{ github.run_id }}' \
+  "$RELEASE_WORKFLOW" || \
+  fail "release does not consume candidate artifacts from its own run"
+grep -Fq '"$proof_root" "$GITHUB_ENV" Release' "$RELEASE_WORKFLOW" || \
+  fail "release candidate verifier is not pinned to the Release workflow"
+grep -Fq 'workflow_call:' "$STANDALONE_WORKFLOW" || \
+  fail "standalone candidate workflow is not reusable by Release"
+if grep -Fq -- '--json conclusion,event,headSha,workflowName,url' \
+  "$VERIFY_SCRIPT" "$CACHE_WORKFLOW"; then
+  fail "candidate consumers still confuse the workflow ref with candidate identity"
+fi
 grep -Fq 'scripts/verify_standalone_candidate.sh \' "$RELEASE_WORKFLOW" || \
   fail "release workflow does not verify the standalone candidate"
 grep -Fq 'signer="$GITHUB_WORKSPACE/scripts/sign_notarize_standalone_release.sh"' \
@@ -148,6 +165,13 @@ if grep -En \
 fi
 grep -Fq 'proof="$signed_root/proof.json"' "$VERIFY_SCRIPT" || \
   fail "release workflow does not consume the signed proof receipt"
+token_unset_line=$(grep -nF 'unset GH_TOKEN GITHUB_TOKEN' "$VERIFY_SCRIPT" | \
+  cut -d: -f1)
+unsigned_execution_line=$(grep -nF '[[ $("$unsigned" --version) == "hf2q $version" ]]' \
+  "$VERIFY_SCRIPT" | cut -d: -f1)
+[[ -n "$token_unset_line" && -n "$unsigned_execution_line" && \
+  "$token_unset_line" -lt "$unsigned_execution_line" ]] || \
+  fail "candidate verifier does not drop GitHub credentials before execution"
 grep -Fq '.input.unsigned_sha256 == $unsigned_sha' "$VERIFY_SCRIPT" || \
   fail "release verification does not bind the signed proof to the packed input"
 grep -Fq 'hf2q-aarch64-apple-darwin' "$RELEASE_WORKFLOW" || \

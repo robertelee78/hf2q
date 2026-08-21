@@ -11,10 +11,6 @@ on:
         description: Exact crate version to publish
         required: true
         type: string
-      standalone_candidate_run_id:
-        description: Successful exact-SHA Standalone candidate workflow run ID
-        required: true
-        type: string
 
 permissions:
   actions: read
@@ -27,13 +23,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  standalone-candidate:
+    uses: ./.github/workflows/standalone-candidate.yml
+    with:
+      commit_sha: ${{ inputs.commit_sha }}
+      version: ${{ inputs.version }}
+
   publish:
+    needs: standalone-candidate
     runs-on: macos-latest
     timeout-minutes: 90
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
       EXPECTED_VERSION: ${{ inputs.version }}
-      EXPECTED_STANDALONE_CANDIDATE_RUN_ID: ${{ inputs.standalone_candidate_run_id }}
+      EXPECTED_STANDALONE_CANDIDATE_RUN_ID: ${{ github.run_id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -76,7 +79,7 @@ jobs:
           scripts/verify_standalone_candidate.sh \
             "$EXPECTED_STANDALONE_CANDIDATE_RUN_ID" \
             "$EXPECTED_SHA" "$EXPECTED_VERSION" \
-            "$proof_root" "$GITHUB_ENV"
+            "$proof_root" "$GITHUB_ENV" Release
 
       - name: Toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -193,6 +196,7 @@ jobs:
             HOME="$proof_home" \
             HF2Q_INSTALL_DIR="$proof_install" \
             HF2Q_RELEASE_BASE_URL="file://$standalone_stage" \
+            HF2Q_INSTALL_TEST_MODE=1 \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
             sh >/dev/null
           test "$(shasum -a 256 "$proof_install/hf2q" | awk '{print $1}')" = \

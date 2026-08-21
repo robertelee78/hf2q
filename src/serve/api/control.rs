@@ -7,7 +7,10 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use super::artifact_catalog::{ArtifactCatalogCoordinator, CatalogError, ARTIFACT_CATALOG_SCHEMA};
+use super::artifact_catalog::{
+    ArtifactCatalogCoordinator, CatalogError, StoredArtifact, ARTIFACT_CATALOG_SCHEMA,
+    LOCAL_ARTIFACT_CATALOG_SCHEMA,
+};
 use super::cancellation::{
     run_consistent_result_task, run_preparation_command, PreparationError, PreparationLimits,
 };
@@ -43,6 +46,12 @@ pub struct ModelActivationRequest {
 #[derive(Debug, serde::Deserialize)]
 pub struct HubGgufCatalogQuery {
     pub model: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LocalGgufCatalogQuery {
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize, PartialEq, Eq)]
@@ -145,6 +154,7 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
             "capabilities": {
                 "model_activation": HF2Q_ACTIVATION_SCHEMA,
                 "artifact_resolution": ARTIFACT_CATALOG_SCHEMA,
+                "local_artifact_resolution": LOCAL_ARTIFACT_CATALOG_SCHEMA,
                 "non_evicting_load": true,
                 "diagnostic_no_evict_header": {
                     "name": DIAGNOSTIC_NO_EVICT_HEADER,
@@ -164,6 +174,63 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
         })),
     )
         .into_response()
+}
+
+/// Bounded server-local hf2q artifact inventory. The optional model filter is
+/// a bare Hub repository id; omitting it supports the initial diagnostic
+/// picker on an empty chat-owned server.
+pub async fn local_gguf_catalog(
+    State(state): State<AppState>,
+    Query(query): Query<LocalGgufCatalogQuery>,
+) -> Response {
+    state
+        .metrics
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let repository = match query.model.as_deref() {
+        Some(model) if model.trim().is_empty() => {
+            return ApiError::invalid_request("model must not be empty", Some("model".into()))
+                .into_response()
+        }
+        Some(model) => match normalize_hub_repository(model) {
+            Ok(Some(repository)) => Some(repository),
+            Ok(None) => {
+                return ApiError::invalid_request(
+                    "local artifact filtering requires an owner/repository model id",
+                    Some("model".into()),
+                )
+                .into_response()
+            }
+            Err(response) => return response,
+        },
+        None => None,
+    };
+    let (cache_root, manifest) = match state.cache.lock() {
+        Ok(cache) => {
+            let root = cache.root().to_path_buf();
+            match cache.manifest_snapshot() {
+                Ok(manifest) => (root, manifest),
+                Err(error) => {
+                    tracing::warn!(%error, "cannot refresh local artifact cache manifest");
+                    (root, cache.manifest().clone())
+                }
+            }
+        }
+        Err(_) => return ApiError::internal_error().into_response(),
+    };
+    let inventory = state.local_artifacts.clone();
+    let catalog = match tokio::task::spawn_blocking(move || {
+        inventory.discover(repository.as_deref(), Some((&cache_root, &manifest)))
+    })
+    .await
+    {
+        Ok(catalog) => catalog,
+        Err(_) => return ApiError::internal_error().into_response(),
+    };
+    match state.artifact_catalog.register_local(catalog) {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(_) => ApiError::internal_error().into_response(),
+    }
 }
 
 /// Metadata-only hosted GGUF inventory. This endpoint never downloads model
@@ -273,7 +340,8 @@ fn activation_engine_config(state: &AppState) -> EngineConfig {
 }
 
 enum ActivationPayload {
-    Local(std::path::PathBuf),
+    ExplicitLocal(std::path::PathBuf),
+    VerifiedLocal(super::local_artifacts::LocalGgufArtifact),
     Hosted(crate::input::hf_download::HubGgufArtifact),
 }
 
@@ -309,6 +377,15 @@ struct ActivationTarget {
 }
 
 impl ActivationTarget {
+    fn verified_local_path(&self) -> Option<&std::path::Path> {
+        match &self.payload {
+            ActivationPayload::VerifiedLocal(artifact) => Some(&artifact.path),
+            _ => None,
+        }
+    }
+}
+
+impl ActivationTarget {
     async fn materialize(
         self,
         cancellation: super::cancellation::CancellationSignal,
@@ -316,7 +393,23 @@ impl ActivationTarget {
         catalog: &ArtifactCatalogCoordinator,
     ) -> std::result::Result<(String, QuantType, std::path::PathBuf, u64, String), Response> {
         let (path, validate_catalog_type) = match self.payload {
-            ActivationPayload::Local(path) => (path, false),
+            ActivationPayload::ExplicitLocal(path) => (path, false),
+            ActivationPayload::VerifiedLocal(artifact) => {
+                let permit = catalog.try_local_verify_slot().map_err(|error| match error {
+                    CatalogError::LocalVerifyBusy => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [(header::RETRY_AFTER, "1")],
+                        Json(serde_json::json!({"error":{"message":error.to_string(),"type":"server_busy","code":"local_artifact_verification_busy"}})),
+                    )
+                        .into_response(),
+                    _ => ApiError::internal_error().into_response(),
+                })?;
+                (
+                    verify_local_gguf_cancellable(&artifact, cancellation, supervisor, permit)
+                        .await?,
+                    false,
+                )
+            }
             ActivationPayload::Hosted(artifact) => {
                 let permit = catalog.try_transfer_slot().map_err(|error| match error {
                     CatalogError::TransferBusy => (
@@ -357,6 +450,72 @@ impl ActivationTarget {
         }
         Ok((self.repo, self.quant, path, self.bytes, self.request_model))
     }
+}
+
+async fn verify_local_gguf_cancellable(
+    artifact: &super::local_artifacts::LocalGgufArtifact,
+    cancellation: super::cancellation::CancellationSignal,
+    supervisor: super::cancellation::PreparationSupervisor,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> std::result::Result<std::path::PathBuf, Response> {
+    let executable =
+        std::env::current_exe().map_err(|_| ApiError::internal_error().into_response())?;
+    let quant = artifact.quant.ok_or_else(|| {
+        ApiError::invalid_request(
+            "selected local artifact has no supported quant",
+            Some("artifact".into()),
+        )
+        .into_response()
+    })?;
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("__verify-local-gguf")
+        .arg("--root")
+        .arg(&artifact.root)
+        .arg("--artifact")
+        .arg(&artifact.path)
+        .arg("--bytes")
+        .arg(artifact.bytes.to_string())
+        .arg("--sha256")
+        .arg(&artifact.sha256)
+        .arg("--quant")
+        .arg(quant.as_str());
+    let output = run_preparation_command(
+        command,
+        cancellation,
+        supervisor,
+        PreparationLimits::transfer_receipt(),
+        Some(permit),
+    )
+    .await
+    .map_err(|error| {
+        ApiError::generation_error(format!("local GGUF verification failed: {error}"))
+            .into_response()
+    })?;
+    if !output.status.success() {
+        tracing::warn!(
+            status = %output.status,
+            stderr_bytes = output.stderr.len(),
+            "local GGUF verification helper rejected selected artifact"
+        );
+        return Err(ApiError::invalid_request(
+            "selected local GGUF no longer matches its hf2q receipt or cache authority",
+            Some("artifact".into()),
+        )
+        .into_response());
+    }
+    let receipt: super::local_artifacts::LocalVerificationReceipt =
+        serde_json::from_slice(&output.stdout).map_err(|_| {
+            ApiError::generation_error("local GGUF verifier returned an invalid receipt")
+                .into_response()
+        })?;
+    if receipt.path != artifact.path {
+        return Err(ApiError::generation_error(
+            "local GGUF verifier returned a different artifact",
+        )
+        .into_response());
+    }
+    Ok(receipt.path)
 }
 
 async fn fetch_hub_gguf_cancellable(
@@ -451,25 +610,57 @@ async fn resolve_activation_target(
             )
                 .into_response()
         })?;
-        if hub_repository.as_deref() != Some(artifact.repository.as_str()) {
-            return Err(ApiError::invalid_request(
-                "artifact selection does not belong to requested model",
-                Some("candidate_id".into()),
-            )
-            .into_response());
-        }
-        let quant =
-            QuantType::from_canonical_str(artifact.quant_hint.as_deref().unwrap_or_default())
+        return match artifact {
+            StoredArtifact::Hosted(artifact) => {
+                if hub_repository.as_deref() != Some(artifact.repository.as_str()) {
+                    return Err(ApiError::invalid_request(
+                        "artifact selection does not belong to requested model",
+                        Some("candidate_id".into()),
+                    )
+                    .into_response());
+                }
+                let quant = QuantType::from_canonical_str(
+                    artifact.quant_hint.as_deref().unwrap_or_default(),
+                )
                 .map_err(|error| {
                     ApiError::invalid_request(error, Some("candidate_id".into())).into_response()
                 })?;
-        return Ok(ActivationTarget {
-            repo: artifact.request_model(),
-            quant,
-            bytes: artifact.bytes,
-            request_model: artifact.request_model(),
-            payload: ActivationPayload::Hosted(artifact),
-        });
+                Ok(ActivationTarget {
+                    repo: artifact.request_model(),
+                    quant,
+                    bytes: artifact.bytes,
+                    request_model: artifact.request_model(),
+                    payload: ActivationPayload::Hosted(artifact),
+                })
+            }
+            StoredArtifact::Local(artifact) => {
+                if hub_repository.as_deref() != Some(artifact.repository.as_str()) {
+                    return Err(ApiError::invalid_request(
+                        "local artifact selection does not belong to requested model",
+                        Some("candidate_id".into()),
+                    )
+                    .into_response());
+                }
+                let quant = artifact.quant.ok_or_else(|| {
+                    ApiError::invalid_request(
+                        "selected local artifact is unavailable",
+                        Some("candidate_id".into()),
+                    )
+                    .into_response()
+                })?;
+                let request_model = format!(
+                    "local://{}@{}/{}",
+                    artifact.repository, artifact.revision, candidate_id
+                );
+                Ok(ActivationTarget {
+                    repo: request_model.clone(),
+                    quant,
+                    bytes: artifact.bytes,
+                    request_model,
+                    payload: ActivationPayload::VerifiedLocal(artifact),
+                })
+            }
+        };
     }
 
     // Diagnostic activation is intentionally conversion-free. A bare Hub id
@@ -533,7 +724,7 @@ async fn resolve_activation_target(
         repo,
         quant,
         bytes,
-        payload: ActivationPayload::Local(gguf_path),
+        payload: ActivationPayload::ExplicitLocal(gguf_path),
     })
 }
 
@@ -610,6 +801,7 @@ pub async fn activate_model(
     if request.candidate_id.is_none() {
         if let Ok(manager) = state.pool.read() {
             let hosted_prefix = format!("hf://{}@", resident_model);
+            let local_prefix = format!("local://{}@", resident_model);
             let matches = manager
                 .snapshot_engines()
                 .into_iter()
@@ -618,6 +810,7 @@ pub async fn activate_model(
                         || resident_model == engine.repo
                         || resident_model == format!("{}@{}", engine.repo, engine.quant.as_str())
                         || engine.repo.starts_with(&hosted_prefix)
+                        || engine.repo.starts_with(&local_prefix)
                 })
                 .collect::<Vec<_>>();
             if matches.len() > 1 {
@@ -682,6 +875,28 @@ pub async fn activate_model(
     let quant = target.quant;
     let bytes = target.bytes;
     let engine_config = activation_engine_config(&state);
+
+    if let Some(local_path) = target.verified_local_path() {
+        if let Ok(manager) = state.pool.read() {
+            if let Some(engine) = manager
+                .snapshot_engines()
+                .into_iter()
+                .find(|engine| engine.quant == quant && engine.gguf_path == local_path)
+            {
+                let revision = manager.pool_stats().revision;
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "schema_version": HF2Q_ACTIVATION_SCHEMA,
+                        "status": "resident",
+                        "pool_revision": revision,
+                        "request_model": engine.repo,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     if let Ok(manager) = state.pool.read() {
         if let Some(engine) = manager
@@ -1056,5 +1271,48 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["code"], "restart_required");
         assert_eq!(json["restart_required"], true);
+    }
+
+    #[tokio::test]
+    async fn local_candidate_is_repository_bound_and_keeps_path_server_private() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("model.gguf");
+        std::fs::write(&path, b"GGUF fixture").unwrap();
+        let state = AppState::new(super::super::state::ServerConfig::default());
+        let view = state
+            .artifact_catalog
+            .register_local(super::super::local_artifacts::LocalArtifactCatalog {
+                artifacts: vec![super::super::local_artifacts::LocalGgufArtifact {
+                    repository: "owner/model".into(),
+                    revision: "a".repeat(40),
+                    filename: "model.gguf".into(),
+                    root: root.path().to_path_buf(),
+                    path: path.clone(),
+                    bytes: 12,
+                    sha256: "b".repeat(64),
+                    quant_hint: "Q4_K_M".into(),
+                    quant: Some(QuantType::Q4_K_M),
+                    selectable: true,
+                    unavailable_reason: None,
+                    provenance: super::super::local_artifacts::LocalArtifactProvenance::ConversionReceipt,
+                }],
+                warnings: Vec::new(),
+            })
+            .unwrap();
+        let candidate_id = view.candidates[0].candidate_id.as_deref().unwrap();
+        let target = resolve_activation_target(&state, "owner/model", Some(candidate_id))
+            .await
+            .unwrap();
+        assert_eq!(target.verified_local_path(), Some(path.as_path()));
+        assert!(!target.request_model.contains(&"b".repeat(64)));
+        assert!(target.request_model.contains(candidate_id));
+
+        let response = match resolve_activation_target(&state, "other/model", Some(candidate_id))
+            .await
+        {
+            Ok(_) => panic!("candidate must be bound to its repository"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

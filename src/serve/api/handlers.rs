@@ -10792,6 +10792,7 @@ mod readiness_guard_tests {
         let loaded = Arc::new(LoadedEngine {
             engine,
             repo: "raced-dead-qwen".to_string(),
+            gguf_path: std::path::PathBuf::new(),
             quant: QuantType::Q4_K_M,
             bytes_resident: 1_024,
             loaded_at: SystemTime::now(),
@@ -11094,6 +11095,7 @@ mod iter215_qwen35_chat_501_tests {
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
             repo: "iter-215-test-model".to_string(),
+            gguf_path: std::path::PathBuf::new(),
             quant: QuantType::Q4_K_M,
             bytes_resident: 1024,
             loaded_at: SystemTime::now(),
@@ -11946,6 +11948,7 @@ mod a5d_handler_429_tests {
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
             repo: "a5d-handler-test".to_string(),
+            gguf_path: std::path::PathBuf::new(),
             quant: QuantType::Q4_K_M,
             bytes_resident: 0,
             loaded_at: SystemTime::now(),

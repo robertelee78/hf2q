@@ -7,8 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Make one `Release` dispatch build, Developer-ID sign, notarize, publish, and
+  post-verify the exact standalone candidate. The independently dispatchable
+  candidate workflow remains available for diagnostics and optional model
+  qualification; publishing no longer requires copying a run ID between two
+  manual workflows.
+- Parameterize standalone-candidate and optional cache-lifecycle qualification
+  by the requested stable version instead of embedding the previous release
+  number.
+
+### Fixed
+
+- Harden the readable standalone installer against truncated `curl | sh`
+  input, candidate stdin capture, Rosetta architecture misdetection,
+  unbounded transfers, production `file://` overrides, and group/world-
+  writable install directories. Require exact HTTP 200 responses in the
+  standalone updater and preserve the same directory invariant in Rust.
+- Drop the publication job's GitHub API credentials immediately after exact
+  candidate artifact download and before either candidate is executed.
+
 ### Removed
 
+- Remove the unreachable custom TUF verifier and spike, sealed update
+  transport, metadata journal, archive/Mach-O preparation stack, first-
+  activation graph, and their structural CI gates. Also remove setup's
+  read-only installation-identity coupling: it was reachable, but depended on
+  state no shipped installation channel creates or uses. The standalone
+  installer, updater, rollback, uninstaller, Apple trust checks, and atomic
+  publisher remain unchanged.
 - Remove the unreachable ADR-045 no-options model recipe, preparation plan,
   paired-artifact publication, prepared-profile registry, retention, and
   calibration-pending stack. Normal Hugging Face `convert` behavior remains

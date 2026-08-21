@@ -191,9 +191,12 @@ impl InstallDirectory {
         let metadata = handle
             .metadata()
             .map_err(|error| StandaloneError::io("inspect install directory", error))?;
-        if !metadata.is_dir() || metadata.uid() != rustix::process::geteuid().as_raw() {
+        if !metadata.is_dir()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o022 != 0
+        {
             return Err(StandaloneError::Invalid(
-                "install directory must be owned by the current user",
+                "install directory must be current-user-owned and not group/world-writable",
             ));
         }
         Ok(Self {
@@ -215,6 +218,7 @@ impl InstallDirectory {
             || metadata.dev() != self.device
             || metadata.ino() != self.inode
             || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o022 != 0
         {
             return Err(StandaloneError::Invalid(
                 "install directory changed during the transition",

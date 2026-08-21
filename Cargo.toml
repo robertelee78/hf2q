@@ -109,8 +109,9 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # parser/serializer so canonical producer bytes and hostile-input behavior do
 # not drift under an otherwise unrelated dependency update.
 toml = { version = "=1.1.4", default-features = false, features = ["parse", "display", "serde"] }
-# Release manifests use strict SemVer parsing at their untrusted wire boundary.
-# Keep this direct instead of relying on a transitive crate.
+# The standalone stable-release record uses strict SemVer parsing at its
+# untrusted wire boundary. Keep this direct instead of relying on a transitive
+# crate.
 semver = "1"
 
 # Error handling
@@ -192,29 +193,12 @@ tempfile = "3"
 # corpus drift assertions, promoted to runtime deps here.
 sha2 = "0.10"
 hex = "0.4"
-# Crash-durable update metadata records preserve the exact sampled RFC 3339
-# instant, including subsecond precision, as a monotonic restart clock floor.
-jiff = { version = "0.2", features = ["serde"] }
-
-# ADR-045: only the transport-free trusted-metadata state machine is used.
-# hf2q deliberately does not enable sigstore-tuf's fetch/HTTP/store features;
-# request sequencing, exact-byte capture, rollback floors, and persistence are
-# owned by the distribution bounded context.
-sigstore-tuf = { version = "=0.11.0", default-features = false }
 
 # HTTPS transport is shared by vision URL fetches and the diagnostic chat
 # client. `blocking` remains required by vision; `json` and `stream` let chat
 # send OpenAI requests and decode SSE without introducing another HTTP stack.
 # `rustls-tls` keeps TLS off system OpenSSL.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "stream", "rustls-tls"] }
-# The custom classic-ZIP profile must prove that a Deflate stream consumes its
-# entire declared compressed range. Pin the same backend selected for `zip` so
-# hf2q can require `StreamEnd` plus exact `total_in`/`total_out` counters.
-flate2 = { version = "=1.1.9", default-features = false, features = ["zlib-rs"] }
-# ADR-045 release archives are a deliberately narrow ZIP profile. Pin the
-# parser proven by the isolated hostile-archive spike and enable only stored
-# entries plus pure-Rust Deflate decoding; extraction remains hf2q-owned.
-zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # ADR-047 machine-local serve discovery. This wraps Apple's native DNS-SD
@@ -223,19 +207,8 @@ async-dnssd = "=0.5.1"
 # Setup host inventory reads fixed sysctl keys in-process; never trust caller
 # facts or a PATH-resolved `sysctl` subprocess.
 sysctl = { version = "=0.6.0", default-features = false }
-# ADR-045 native Developer ID validation. These are already locked transitively,
-# but the dormant verifier consumes their exact APIs directly. The macOS 12
-# feature exposes SecTrustCopyCertificateChain without enabling network access.
-core-foundation = "=0.10.1"
-security-framework = { version = "=3.7.0", default-features = false, features = ["macos-12"] }
-security-framework-sys = { version = "=2.17.0", default-features = false, features = ["macos-12"] }
 
 [dev-dependencies]
-# Deterministic Ed25519 fixture signing for the production TUF verifier's
-# hostile/root-rotation corpus. This exact crate is already a transitive
-# verifier dependency; tests promote it only to build independently signed
-# metadata rather than relying on sigstore-tuf's own test helpers.
-aws-lc-rs = "=1.18.0"
 assert_cmd = "2"
 predicates = "3"
 criterion = "0.5"

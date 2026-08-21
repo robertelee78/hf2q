@@ -111,7 +111,8 @@ release. Model/cache/performance qualification is separate and remains owned by
 the relevant model and serving decisions. v0.1.7 passed the credentialed Apple
 candidate, exact public binary, stable-record, clean install, setup, update
 already-current, and data-preserving uninstall gates; the branded installer is
-live at `https://hf2q.us/install.sh`.
+live at `https://hf2q.us/install.sh` as a no-cache temporary redirect to the
+exact immutable versioned GitHub release asset.
 Source/Cargo installs remain unmanaged by `hf2q update`.
 
 `hf2q setup` inventories the selected Apple-Silicon host and records defaults
@@ -147,10 +148,12 @@ to a sibling checkout.
   to start below `disk_floor_gb + 10`.
 
 For the complete first-run path, use
-**[Get started with hf2q and Qwen3.8](docs/getting-started.md)**. It pins
-`jenerallee78/Qwen3.8-27B-Abliterated-SFT` to an exact source revision and
-walks through native Q4_K_M conversion, text serving, direct API use, and an
-optional OpenCode connection. It does not introduce a second onboarding or
+**[Get started with hf2q and Qwen3.8](docs/getting-started.md)**. It installs
+the signed binary, downloads the model author's pinned Q5_K_M GGUF of
+`jenerallee78/Qwen3.8-27B-Abliterated-SFT`, and walks through text serving,
+direct API use, and an optional OpenCode connection — with native Q4_K_M
+conversion from the exact pinned source revision retained as the optional
+provenance-grade path. It does not introduce a second onboarding or
 model-preparation workflow around the existing commands.
 
 `hf2q doctor` enumerates the runtime checks (hardware detection, disk

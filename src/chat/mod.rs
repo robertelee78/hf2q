@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use crate::cli::ChatArgs;
 
 use client::{fetch_models, ChatClient};
-use control::{looks_like_hub_model, Hf2qControl};
+use control::{looks_like_hub_model, terminal_safe, Hf2qControl};
 use endpoint::{EndpointResolver, EndpointSession};
 use local::AutomaticEndpointResolver;
 use render::StreamRenderer;
@@ -108,12 +108,6 @@ async fn run_session(
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .context("build endpoint probe client")?;
-    let mut model = match args.model.clone() {
-        Some(model) => model,
-        None => {
-            choose_remote_model(&probe_http, session, auth_token.as_deref(), input, output).await?
-        }
-    };
     let control = Hf2qControl::detect(
         &probe_http,
         session.endpoint(),
@@ -121,18 +115,47 @@ async fn run_session(
         session.expects_hf2q_control(),
     )
     .await?;
+    let (mut model, preselected_candidate) = match args.model.clone() {
+        Some(model) => (model, None),
+        None => {
+            choose_initial_model(
+                &probe_http,
+                session,
+                control.as_ref(),
+                auth_token.as_deref(),
+                input,
+                output,
+            )
+            .await?
+        }
+    };
     if let Some(control) = &control {
-        let Some(request_model) = activate_diagnostic_model(
-            control,
-            &model,
-            args.quant.as_deref(),
-            args.artifact.as_deref(),
-            auth_token.as_deref(),
-            input,
-            output,
-        )
-        .await?
-        else {
+        let activated = match preselected_candidate.as_deref() {
+            Some(candidate_id) => {
+                control
+                    .ensure_active(
+                        &model,
+                        Some(candidate_id),
+                        auth_token.as_deref(),
+                        input,
+                        output,
+                    )
+                    .await?
+            }
+            None => {
+                activate_diagnostic_model(
+                    control,
+                    &model,
+                    args.quant.map(crate::cli::DiagnosticQuantArg::as_str),
+                    args.artifact.as_deref(),
+                    auth_token.as_deref(),
+                    input,
+                    output,
+                )
+                .await?
+            }
+        };
+        let Some(request_model) = activated else {
             bail!("model switch declined");
         };
         model = request_model;
@@ -159,7 +182,7 @@ async fn run_session(
     writeln!(
         output,
         "hf2q diagnostic chat — {} @ {}",
-        client.model(),
+        terminal_safe(client.model()),
         session.endpoint().base_url()
     )?;
     writeln!(
@@ -176,6 +199,35 @@ async fn run_session(
         output,
     )
     .await
+}
+
+async fn choose_initial_model(
+    http: &reqwest::Client,
+    session: &EndpointSession,
+    control: Option<&Hf2qControl>,
+    auth_token: Option<&str>,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<(String, Option<String>)> {
+    let mut models = fetch_models(http, session.endpoint(), auth_token).await?;
+    if !models.is_empty() {
+        models.sort_by_key(|model| (!model.loaded.unwrap_or(false), model.id.clone()));
+        let model = if models.len() == 1 {
+            models.remove(0).id
+        } else {
+            pick_model(&models, input, output)?
+        };
+        return Ok((model, None));
+    }
+    if let Some(control) = control {
+        if let Some(selected) = control
+            .select_initial_local(auth_token, input, output)
+            .await?
+        {
+            return Ok((selected.model, Some(selected.candidate_id)));
+        }
+    }
+    bail!("endpoint advertised no resident, cached, or receipt-backed local models")
 }
 
 async fn activate_diagnostic_model(
@@ -195,7 +247,7 @@ async fn activate_diagnostic_model(
             }
         }
         let candidate = control
-            .select_hub_gguf(model, quant, artifact, auth_token, input, output)
+            .select_gguf(model, quant, artifact, auth_token, input, output)
             .await?
             .context("hf2q did not issue activation authority for the selected artifact")?;
         control
@@ -296,7 +348,7 @@ async fn handle_command(
             writeln!(
                 output,
                 "model={} url={} thinking={} lifecycle={}",
-                client.model(),
+                terminal_safe(client.model()),
                 session.endpoint().base_url(),
                 client.thinking().as_str(),
                 lifecycle
@@ -320,28 +372,42 @@ async fn handle_command(
             Ok(false)
         }
         "/model" => {
-            let mut model = if let Some(model) = words.next() {
+            let (mut model, preselected_candidate) = if let Some(model) = words.next() {
                 if words.next().is_some() {
                     writeln!(output, "usage: /model [id]")?;
                     return Ok(false);
                 }
-                model.to_owned()
+                (model.to_owned(), None)
             } else {
-                choose_remote_model(client.http(), session, auth_token, input, output).await?
+                choose_initial_model(client.http(), session, control, auth_token, input, output)
+                    .await?
             };
             if let Some(control) = control {
-                let Some(request_model) = activate_diagnostic_model(
-                    control, &model, None, None, auth_token, input, output,
-                )
-                .await?
-                else {
+                let activated = match preselected_candidate.as_deref() {
+                    Some(candidate_id) => {
+                        control
+                            .ensure_active(&model, Some(candidate_id), auth_token, input, output)
+                            .await?
+                    }
+                    None => {
+                        activate_diagnostic_model(
+                            control, &model, None, None, auth_token, input, output,
+                        )
+                        .await?
+                    }
+                };
+                let Some(request_model) = activated else {
                     writeln!(output, "model unchanged")?;
                     return Ok(false);
                 };
                 model = request_model;
             }
             client.set_model(model);
-            writeln!(output, "model={} (context cleared)", client.model())?;
+            writeln!(
+                output,
+                "model={} (context cleared)",
+                terminal_safe(client.model())
+            )?;
             Ok(false)
         }
         other => {
@@ -349,24 +415,6 @@ async fn handle_command(
             Ok(false)
         }
     }
-}
-
-async fn choose_remote_model(
-    http: &reqwest::Client,
-    session: &EndpointSession,
-    auth_token: Option<&str>,
-    input: &mut impl BufRead,
-    output: &mut impl Write,
-) -> Result<String> {
-    let mut models = fetch_models(http, session.endpoint(), auth_token).await?;
-    if models.is_empty() {
-        bail!("endpoint advertised no models");
-    }
-    models.sort_by_key(|model| (!model.loaded.unwrap_or(false), model.id.clone()));
-    if models.len() == 1 {
-        return Ok(models.remove(0).id);
-    }
-    pick_model(&models, input, output)
 }
 
 fn pick_model(
@@ -381,7 +429,13 @@ fn pick_model(
         } else {
             ""
         };
-        writeln!(output, "  {}. {}{}", index + 1, model.id, state)?;
+        writeln!(
+            output,
+            "  {}. {}{}",
+            index + 1,
+            terminal_safe(&model.id),
+            state
+        )?;
     }
     write!(output, "model> ")?;
     output.flush()?;

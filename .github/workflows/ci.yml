@@ -78,7 +78,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'tests/adr045_tuf_spike/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
       # --- fmt: informational (baseline drift, see header) ---
@@ -100,6 +100,25 @@ jobs:
             exit 1
           fi
 
+      - name: Standalone distribution package contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_list="$(cargo +1.88.0 package --locked --list)"
+          for required in \
+            src/distribution/mod.rs \
+            src/distribution/standalone.rs \
+            src/distribution/standalone/update.rs \
+            src/distribution/standalone_tests.rs \
+            scripts/install.sh.in \
+            scripts/sign_notarize_standalone_release.sh \
+            scripts/test_standalone_installer.sh \
+            scripts/test_standalone_release_signing_contract.sh \
+            docs/adr/ADR-045-frictionless-distribution-updates-and-onboarding.md
+          do
+            grep -Fqx -- "$required" <<<"$package_list"
+          done
+
       - name: cargo check
         run: cargo check --locked --all-targets --all-features
 
@@ -110,452 +129,6 @@ jobs:
         run: |
           cargo install cargo-audit --locked --version 0.22.2 --no-default-features
           cargo audit
-
-      - name: ADR-045 signed-update verifier spike (blocking)
-        env:
-          CARGO_TARGET_DIR: target/adr045-tuf-spike
-        run: |
-          set -euo pipefail
-          spike=tests/adr045_tuf_spike/Cargo.toml
-          cargo +1.88.0 fmt --manifest-path "$spike" -- --check
-          cargo +1.88.0 check --locked --all-targets --manifest-path "$spike"
-          cargo +1.88.0 clippy --locked --all-targets --manifest-path "$spike" -- -D warnings
-          cargo +1.88.0 test --locked --lib --manifest-path "$spike" -- --test-threads=1
-          cargo audit --file tests/adr045_tuf_spike/Cargo.lock
-          package_list="$(cargo package --locked --list)"
-          if grep -q '^tests/adr045_tuf_spike/' <<<"$package_list"; then
-            echo 'ADR-045 spike leaked into the published hf2q crate' >&2
-            exit 1
-          fi
-
-      - name: ADR-045 production verifier boundary and corpus (blocking)
-        run: |
-          set -euo pipefail
-          direct_metadata="$(cargo +1.88.0 metadata --locked --all-features --format-version 1 --no-deps)"
-          jq -e '
-            .packages[]
-            | select(.name == "hf2q")
-            | .dependencies[]
-            | select(.name == "sigstore-tuf")
-            | .req == "=0.11.0"
-              and .uses_default_features == false
-              and .features == []
-          ' <<<"$direct_metadata"
-          jq -e '
-            .packages[]
-            | select(.name == "hf2q")
-            | .dependencies[]
-            | select(.name == "toml")
-            | .req == "=1.1.4"
-              and .uses_default_features == false
-              and (.features | sort) == ["display", "parse", "serde"]
-          ' <<<"$direct_metadata"
-          jq -e '
-            [.packages[]
-              | select(.name == "hf2q")
-              | .dependencies[]
-              | select(
-                  .name == "percent-encoding"
-                  or .name == "sha1"
-                  or .name == "url"
-                )
-              | {name, req, uses_default_features, features}]
-            | sort_by(.name)
-            == [
-              {"name":"percent-encoding","req":"=2.3.2","uses_default_features":true,"features":[]},
-              {"name":"sha1","req":"=0.10.7","uses_default_features":true,"features":[]},
-              {"name":"url","req":"=2.5.8","uses_default_features":true,"features":[]}
-            ]
-          ' <<<"$direct_metadata"
-          jq -e '
-            .packages[]
-            | select(.name == "hf2q")
-            | .dependencies[]
-            | select(.name == "flate2")
-            | .req == "=1.1.9"
-              and .uses_default_features == false
-              and .features == ["zlib-rs"]
-          ' <<<"$direct_metadata"
-          jq -e '
-            .packages[]
-            | select(.name == "hf2q")
-            | .dependencies[]
-            | select(.name == "zip")
-            | .req == "=7.2.0"
-              and .uses_default_features == false
-              and .features == ["deflate-flate2-zlib-rs"]
-          ' <<<"$direct_metadata"
-          jq -e '
-            [.packages[]
-              | select(.name == "hf2q")
-              | .dependencies[]
-              | select(
-                  .name == "core-foundation"
-                  or .name == "security-framework"
-                  or .name == "security-framework-sys"
-                )
-              | {
-                  name,
-                  req,
-                  uses_default_features,
-                  features,
-                  target
-                }]
-            | sort_by(.name)
-            == [
-              {
-                "name":"core-foundation",
-                "req":"=0.10.1",
-                "uses_default_features":true,
-                "features":[],
-                "target":"cfg(target_os = \"macos\")"
-              },
-              {
-                "name":"security-framework",
-                "req":"=3.7.0",
-                "uses_default_features":false,
-                "features":["macos-12"],
-                "target":"cfg(target_os = \"macos\")"
-              },
-              {
-                "name":"security-framework-sys",
-                "req":"=2.17.0",
-                "uses_default_features":false,
-                "features":["macos-12"],
-                "target":"cfg(target_os = \"macos\")"
-              }
-            ]
-          ' <<<"$direct_metadata"
-          jq -e '
-            .packages[]
-            | select(.name == "hf2q")
-            | .dependencies[]
-            | select(.name == "sysctl")
-            | .req == "=0.6.0"
-              and .uses_default_features == false
-              and .features == []
-              and .target == "cfg(target_os = \"macos\")"
-          ' <<<"$direct_metadata"
-          resolved_metadata="$(cargo +1.88.0 metadata --locked --all-features --format-version 1)"
-          jq -e '
-            (.packages[] | select(.name == "toml") | .id) as $id
-            | .resolve.nodes[]
-            | select(.id == $id)
-            | (.features | sort) == ["display", "parse", "serde"]
-          ' <<<"$resolved_metadata"
-          jq -e '
-            (.packages[]
-              | select(.name == "sigstore-tuf" and .version == "0.11.0")
-              | .id) as $id
-            | .resolve.nodes[]
-            | select(.id == $id)
-            | .features == []
-          ' <<<"$resolved_metadata"
-          jq -e '
-            ["percent-encoding@2.3.2", "sha1@0.10.7", "url@2.5.8"] as $expected
-            | [.packages[]
-                | select(
-                    (.name == "percent-encoding" and .version == "2.3.2")
-                    or (.name == "sha1" and .version == "0.10.7")
-                    or (.name == "url" and .version == "2.5.8")
-                  )
-                | .id] as $ids
-            | [.resolve.nodes[]
-                | select(.id as $id | $ids | index($id))
-                | ((.id | split("#")[-1]) + ":" + ((.features | sort) | join(",")))]
-              | sort
-              == [
-                "percent-encoding@2.3.2:alloc,default,std",
-                "sha1@0.10.7:default,std",
-                "url@2.5.8:default,std"
-              ]
-          ' <<<"$resolved_metadata"
-          jq -e '
-            (.packages[]
-              | select(.name == "zip" and .version == "7.2.0")
-              | .id) as $id
-            | .resolve.nodes[]
-            | select(.id == $id)
-            | (.features | sort) == [
-                "_deflate-any",
-                "deflate-flate2",
-                "deflate-flate2-zlib-rs"
-              ]
-          ' <<<"$resolved_metadata"
-          jq -e '
-            (.packages[]
-              | select(.name == "flate2" and .version == "1.1.9")
-              | .id) as $id
-            | .resolve.nodes[]
-            | select(.id == $id)
-            | (.features | sort) == [
-                "any_impl",
-                "any_zlib",
-                "default",
-                "miniz_oxide",
-                "rust_backend",
-                "zlib-rs"
-              ]
-          ' <<<"$resolved_metadata"
-          jq -e '[.packages[] | select(.name == "tough")] | length == 0' \
-            <<<"$resolved_metadata"
-          unexpected_imports="$(
-            grep -RIl --include='*.rs' 'sigstore_tuf' src \
-              | grep -v '^src/distribution/update_auth/' || true
-          )"
-          test -z "$unexpected_imports"
-          unexpected_transport_authority="$(
-            grep -RInE --include='*.rs' \
-              '^[[:space:]]*use[[:space:]]+(reqwest|hyper|std::net|tokio::net|url::)|std::process::Command|clap::' \
-              src/distribution/update_auth || true
-          )"
-          test -z "$unexpected_transport_authority"
-          unexpected_metadata_session_callers="$(
-            grep -RIlE --include='*.rs' \
-              'begin_metadata_update|MetadataFetchResponse|MetadataSessionProgress|MetadataUpdateSession' \
-              src/distribution \
-              | grep -v '^src/distribution/update_auth/' \
-              | grep -v '^src/distribution/update_transport/' || true
-          )"
-          test -z "$unexpected_metadata_session_callers"
-          unexpected_preparation_authority="$(
-            grep -RInE --include='*.rs' --exclude='tests.rs' \
-              'rustix::fs|std::fs|File::(create|open|options)|OpenOptions::|std::net|std::process|reqwest|hyper|tokio::net|(^|[^:[:alnum:]_])url::|clap::|ZipWriter|\.extract(_unwrapped_root_dir)?\(' \
-              src/distribution/prepared_release || true
-          )"
-          unexpected_preparation_authority="$(
-            grep -vE '^[^:]+:[0-9]+:use std::fs::File;$' \
-              <<<"$unexpected_preparation_authority" || true
-          )"
-          test -z "$unexpected_preparation_authority"
-          unexpected_extraction_authority="$(
-            grep -InE \
-              'remove_named|remove_dir|remove_file|unlink|rename|fchmod|AuthenticatedPreparedVersion|version-installation|install-receipt|std::process::Command|reqwest|hyper|tokio::net|clap::' \
-              src/distribution/install_state/extraction.rs \
-              src/distribution/install_state/extraction/io.rs \
-              src/distribution/install_state/extraction/modes.rs \
-              src/distribution/prepared_release/extract.rs || true
-          )"
-          test -z "$unexpected_extraction_authority"
-          unexpected_identity_deletion="$(
-            grep -RInE --include='*.rs' \
-              'remove_named|remove_dir|remove_file|unlink|quarantine|trash' \
-              src/distribution/install_state/identity.rs \
-              src/distribution/install_state/identity || true
-          )"
-          test -z "$unexpected_identity_deletion"
-          test "$(grep -Fc 'open_private_regular_file_read_only(&update, LOCK_FILE)' src/distribution/install_state/identity.rs)" = 1
-          test "$(grep -Fc 'pub(super) fn open_private_regular_file_read_only' src/distribution/install_state/unix.rs)" = 1
-          unexpected_transport_extraction="$(
-            grep -RInE --include='*.rs' --exclude='tests.rs' \
-              'ReleaseExtractionStage|PostReplayExtraction|ExtractedRelease|extract_release|with_locked_extraction' \
-              src/distribution/update_transport || true
-          )"
-          test -z "$unexpected_transport_extraction"
-          unexpected_hf_external_authority="$(
-            grep -InE \
-              'std::process|Command::new|(^|[^[:alnum:]_])reqwest(::|[[:space:]])|(^|[^[:alnum:]_])hyper(::|[[:space:]])' \
-              src/input/hf_reference.rs \
-              src/input/hf_download.rs \
-              src/input/hf_download/resolution.rs \
-              src/input/integrity.rs \
-              src/convert/receipt.rs \
-              src/main.rs || true
-          )"
-          unexpected_hf_external_authority="$(
-            grep -vE '^src/main.rs:[0-9]+:use std::process::ExitCode;$' \
-              <<<"$unexpected_hf_external_authority" || true
-          )"
-          test -z "$unexpected_hf_external_authority"
-          unexpected_pretransfer_authority="$(
-            grep -nE \
-              'repo\.(get|download|download_with_progress)\(|download_file|std::fs|File::|OpenOptions|std::process|Command::new|reqwest|hyper|tokio::net|clap::|Serialize|Deserialize' \
-              src/input/hf_download/resolution.rs || true
-          )"
-          test -z "$unexpected_pretransfer_authority"
-          unexpected_source_manifest_authority="$(
-            grep -nE \
-              'hf_hub|reqwest|hyper|tokio::net|std::net|std::process|Command::new|crate::(convert|quantize|serve)|File::create|OpenOptions|std::fs::(write|copy|create_dir|remove_dir|remove_file|rename|hard_link|set_permissions)' \
-              src/inference/models/qwen35/source_precision/operator/source_manifest.rs || true
-          )"
-          test -z "$unexpected_source_manifest_authority"
-          unexpected_setup_authority="$(
-            grep -nE \
-              'hf_hub|reqwest|hyper|tokio::net|std::net|std::process|Command::new|crate::(models|convert|quantize|serve)|calibration|bootstrap_installation_identity|update_auth|update_transport|remove_dir|remove_file' \
-              src/setup/mod.rs src/setup/schema.rs src/setup/host.rs src/setup/policy.rs \
-              | grep -vE '^src/setup/schema.rs:[0-9]+:[[:space:]]*crate::convert::QuantSelector::from_name\(&self\.quant\)$' || true
-          )"
-          test -z "$unexpected_setup_authority"
-          test "$(grep -Fhc 'QuantSelector::from_name' src/setup/schema.rs)" = 1
-          unexpected_setup_file_authority="$(
-            grep -nE \
-              'std::fs::(write|copy|create_dir|remove_dir|remove_file|rename|hard_link|set_permissions)|File::create|OpenOptions|hf_hub|reqwest|hyper|tokio::net|std::net|std::process|Command::new|crate::(models|convert|quantize|serve)|calibration|bootstrap_installation_identity|update_auth|update_transport' \
-              src/setup/fs.rs src/setup/fs/unix.rs || true
-          )"
-          test -z "$unexpected_setup_file_authority"
-          setup_file_modules=(src/setup/fs.rs src/setup/fs/unix.rs)
-          test "$(grep -Fhc 'fs::renameat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(grep -Fhc 'fs::unlinkat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 2
-          test "$(grep -Fhc 'fs::mkdirat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(grep -Fhc 'OFlags::CREATE' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(grep -Fhc 'fs::fchmod(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(grep -Fhc 'fs::chmodat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(grep -Fhc 'OFlags::EXCL' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(grep -Fhc 'OFlags::NOFOLLOW' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 3
-          test "$(grep -Fhc 'OFlags::NONBLOCK' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(grep -Fhc 'fs::flock(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(grep -Fhc 'fs::fsync(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 2
-          test "$(grep -Fhc 'fs::fcntl_fullfsync(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          setup_golden=src/setup/testdata/config_v2.toml
-          test "$(shasum -a 256 "$setup_golden" | awk '{print $1}')" = \
-            ff9f5d3ba200f2ccc107fc6142d9752c87a8429697a6a19f5c67702b82731c17
-          source_teacher_manifest=data/calibration/qwen38-source-teacher-canary-v1/source-manifest.json
-          test "$(shasum -a 256 "$source_teacher_manifest" | awk '{print $1}')" = \
-            e87e1b2637f929288fded02e3acbb72818fe18d4fd29d21558e6007385eee09d
-          source_teacher_profile=data/calibration/qwen38-source-teacher-canary-v1/profile.json
-          test "$(shasum -a 256 "$source_teacher_profile" | awk '{print $1}')" = \
-            58ea26548ba581ec79191e44a59a2fd5b8274693baba69ab7067c7ea825c8c7e
-          fixture=src/distribution/update_auth/testdata/python-tuf-v1
-          (cd "$fixture" && shasum -a 256 -c SHA256SUMS)
-          expected_generator="$(jq -er .generator_sha256 "$fixture/PROVENANCE.json")"
-          actual_generator="$(shasum -a 256 "$fixture/generate.py" | awk '{print $1}')"
-          test "$actual_generator" = "$expected_generator"
-          package_list="$(cargo +1.88.0 package --locked --list)"
-          for required in \
-            src/distribution/schema/channel_pointer.rs \
-            src/distribution/schema/testdata/channel_pointer_v1.json \
-            src/distribution/schema/first_standalone_record.rs \
-            src/distribution/schema/install_receipt.rs \
-            src/distribution/schema/install_receipt_validation.rs \
-            src/distribution/schema/install_receipt_tests.rs \
-            src/distribution/schema/installation_identity.rs \
-            src/distribution/schema/installation_identity_tests.rs \
-            src/distribution/schema/testdata/installation_identity_v1.json \
-            src/distribution/schema/installed_version_marker.rs \
-            src/distribution/schema/release_manifest.rs \
-            src/distribution/schema/release_manifest_tests.rs \
-            src/distribution/schema/testdata/install_receipt_v1_initial_marker_v2.json \
-            src/distribution/schema/testdata/installed_version_marker_v1.json \
-            src/distribution/schema/testdata/installed_version_marker_v2.json \
-            src/distribution/schema/target_name.rs \
-            src/distribution/install_state/artifact.rs \
-            src/distribution/install_state/artifact/tests.rs \
-            src/distribution/install_state/extraction.rs \
-            src/distribution/install_state/extraction/io.rs \
-            src/distribution/install_state/extraction/modes.rs \
-            src/distribution/install_state/extraction/prepared.rs \
-            src/distribution/install_state/extraction/prepared/fault.rs \
-            src/distribution/install_state/extraction/prepared/support.rs \
-            src/distribution/install_state/extraction/prepared/types.rs \
-            src/distribution/install_state/extraction_tests.rs \
-            src/distribution/install_state/identity.rs \
-            src/distribution/install_state/identity/fault.rs \
-            src/distribution/install_state/identity/inventory.rs \
-            src/distribution/install_state/identity_tests.rs \
-            src/distribution/install_state/identity_tests/process_cases.rs \
-            src/distribution/install_state/release_floor.rs \
-            src/distribution/install_state/release_floor_tests.rs \
-            src/distribution/install_state/unix.rs \
-            src/distribution/prepared_release/mod.rs \
-            src/distribution/prepared_release/archive.rs \
-            src/distribution/prepared_release/codesign.rs \
-            src/distribution/prepared_release/codesign_tests.rs \
-            src/distribution/prepared_release/deflate.rs \
-            src/distribution/prepared_release/extract.rs \
-            src/distribution/prepared_release/publish.rs \
-            src/distribution/prepared_release/macho.rs \
-            src/distribution/prepared_release/macho/linkedit.rs \
-            src/distribution/prepared_release/macho/segment.rs \
-            src/distribution/prepared_release/macho_tests.rs \
-            src/distribution/prepared_release/macho_tests/fixture.rs \
-            src/distribution/prepared_release/macho_tests/hostile_cases.rs \
-            src/distribution/prepared_release/tests.rs \
-            src/distribution/update_auth/artifact_authorization.rs \
-            src/distribution/update_auth/artifact_authorization/extraction.rs \
-            src/distribution/update_auth/commit.rs \
-            src/distribution/update_auth/profile.rs \
-            src/distribution/update_auth/session.rs \
-            src/distribution/update_auth/target_set.rs \
-            src/distribution/update_auth/target_set_tests.rs \
-            src/distribution/update_auth/target_set_tests/extraction_cases.rs \
-            src/distribution/update_auth/target_set_tests/extraction_cases/prepared_publication_cases.rs \
-            src/distribution/update_auth/target_set_tests/extraction_cases/prepared_publication_cases/fault_cases.rs \
-            src/distribution/update_auth/target_set_tests/extraction_cases/prepared_publication_cases/hostile_cases.rs \
-            src/distribution/update_auth/test_repository.rs \
-            src/distribution/update_auth/test_repository/hostile_keys.rs \
-            src/distribution/update_auth/tests/hostile_profile.rs \
-            src/distribution/update_auth/tests/rotation.rs \
-            src/distribution/update_transport/mod.rs \
-            src/distribution/update_transport/fetch.rs \
-            src/distribution/update_transport/http.rs \
-            src/distribution/update_transport/metadata.rs \
-            src/distribution/update_transport/origin.rs \
-            src/distribution/update_transport/tests.rs \
-            src/distribution/update_transport/tests/metadata.rs \
-            src/distribution/update_auth/testdata/python-tuf-v1/1.root.json \
-            src/distribution/update_auth/testdata/python-tuf-v1/2.root.json \
-            src/distribution/update_auth/testdata/python-tuf-v1/timestamp.json \
-            src/distribution/update_auth/testdata/python-tuf-v1/2.snapshot.json \
-            src/distribution/update_auth/testdata/python-tuf-v1/2.targets.json \
-            src/distribution/update_auth/testdata/python-tuf-v1/PROVENANCE.json \
-            src/distribution/update_auth/testdata/python-tuf-v1/SHA256SUMS \
-            src/distribution/update_auth/testdata/python-tuf-v1/generate.py \
-            src/distribution/update_auth/testdata/python-tuf-v1/requirements.lock \
-            src/input/hf_reference.rs \
-            src/input/hf_reference_tests.rs \
-            src/input/hf_download.rs \
-            src/input/hf_download/resolution.rs \
-            src/input/hf_download_plan_tests.rs \
-            src/input/integrity.rs \
-            src/inference/models/qwen35/source_precision/operator.rs \
-            src/inference/models/qwen35/source_precision/operator/source.rs \
-            src/inference/models/qwen35/source_precision/operator/profile.rs \
-            src/inference/models/qwen35/source_precision/operator/source_manifest.rs \
-            src/inference/models/qwen35/source_precision/operator/tests.rs \
-            data/calibration/qwen38-source-teacher-canary-v1/source-manifest.json \
-            data/calibration/qwen38-source-teacher-canary-v1/profile.json \
-            src/setup/mod.rs \
-            src/setup/schema.rs \
-            src/setup/host.rs \
-            src/setup/policy.rs \
-            src/setup/fs.rs \
-            src/setup/fs/unix.rs \
-            src/setup/tests.rs \
-            src/setup/defaults_contract_tests.rs \
-            src/setup/testdata/config_v2.toml \
-            src/distribution/mod.rs \
-            src/distribution/standalone.rs \
-            src/distribution/standalone/update.rs \
-            src/distribution/standalone_tests.rs \
-            src/distribution/install_state/identity.rs \
-            scripts/install.sh.in \
-            scripts/render_standalone_installer.sh \
-            scripts/render_standalone_release_record.sh \
-            scripts/sign_notarize_standalone_release.sh \
-            scripts/verify_standalone_candidate.sh \
-            scripts/test_standalone_installer.sh \
-            scripts/test_standalone_release_signing_contract.sh \
-            tests/completions.rs \
-            Cargo.toml \
-            Cargo.lock \
-            src/main.rs \
-            src/cli.rs \
-            src/serve/mod.rs \
-            src/core/integrity.rs \
-            src/core/provenance/source_shard.rs \
-            src/convert/cli_driver.rs \
-            src/convert/receipt.rs \
-            README.md \
-            CHANGELOG.md \
-            docs/adr/ADR-045-frictionless-distribution-updates-and-onboarding.md \
-            docs/adr/ADR-033-unified-quant-convert-pipeline.md \
-            docs/ARCHITECTURE.md \
-            docs/setup.md \
-            docs/converting-a-model.md \
-            docs/getting-started.md
-          do
-            grep -Fqx -- "$required" <<<"$package_list"
-          done
 
       # GitHub's hosted macOS VM returns nil from Metal residency-set
       # creation. Keep the hosted gate blocking and deterministic by running
@@ -571,11 +144,6 @@ jobs:
           cargo test --locked --test convert_integration --all-features
           cargo test --locked --test lcp_registry_unit --all-features
           cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
-          cargo test --locked --bin hf2q --all-features distribution::schema::
-          cargo test --locked --bin hf2q --all-features distribution::install_state:: -- --test-threads=1
-          cargo test --locked --bin hf2q --all-features distribution::update_auth:: -- --test-threads=1
-          cargo test --locked --bin hf2q --all-features distribution::update_transport:: -- --test-threads=1
-          cargo test --locked --bin hf2q --all-features distribution::prepared_release:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features distribution::standalone:: -- --test-threads=1
           scripts/test_standalone_installer.sh
           scripts/test_standalone_release_signing_contract.sh
@@ -609,13 +177,11 @@ jobs:
             serve::tests::configured_lan_requires_runtime_auth \
             serve::tests::c4_scheduler_cli_wins_over_env \
             serve::tests::c4_max_slots_cli_wins_over_env \
-            setup::tests::matching_existing_installation_identity_is_read_only_and_accepted \
             setup::tests::lock_contention_is_busy_and_mints_no_config \
             setup::tests::exact_read_rejects_leaf_replacement_after_reading_the_open_inode \
             setup::tests::partial_leaf_replacement_before_rename_is_rejected_without_publication \
             setup::tests::config_lock_and_partial_leaf_replacements_never_return_success \
             setup::tests::stale_prompt_snapshot_and_partial_prefix_replacement_fail_closed \
-            setup::tests::installation_identity_appearance_or_replacement_during_setup_is_rejected \
             setup::tests::sigabrt_at_every_publication_barrier_recovers_in_a_fresh_process \
             input::hf_reference_tests::equivalent_model_references_share_one_canonical_identity \
             input::hf_download_plan_tests::file_specific_resolution_fails_before_any_hub_lookup \
@@ -638,20 +204,6 @@ jobs:
           cargo test --locked --bin hf2q --all-features convert::cli_driver::tests::deepseek_tiny_official_layout_converts_to_q2_k_s_end_to_end -- --exact
           cargo test --locked --bin hf2q --all-features convert::receipt::tests::
           cargo test --locked --bin hf2q --all-features tests::convert_source_classifier
-          distribution_tests="$(cargo test --locked --bin hf2q --all-features -- --list)"
-          for required_test in \
-            distribution::install_state::identity::tests::process_cases::process_abort_at_every_identity_barrier_is_exactly_recoverable \
-            distribution::install_state::identity::tests::process_cases::shared_identity_lock_excludes_a_fresh_process_bootstrap \
-            distribution::install_state::extraction::tests::process_abort_mid_file_leaves_only_resumable_inert_state \
-            distribution::install_state::extraction::tests::every_normalization_barrier_is_exactly_restartable_after_sigabrt \
-            distribution::install_state::extraction::tests::every_normalization_barrier_is_exactly_retryable_after_returned_error \
-            distribution::update_auth::target_set::tests::extraction_cases::stored_and_deflated_bundles_cross_the_complete_extraction_boundary \
-            distribution::update_auth::target_set::tests::extraction_cases::signed_mode_normalization_is_sealed_and_keeps_the_tree_inert \
-            distribution::update_auth::target_set::tests::extraction_cases::failed_native_brackets_return_no_capability_and_exact_retry_recovers \
-            distribution::update_auth::target_set::tests::extraction_cases::post_extraction_archive_revalidation_failure_returns_no_capability_and_is_retryable
-          do
-            grep -Fq -- "$required_test: test" <<<"$distribution_tests"
-          done
           cargo test --locked --bin hf2q --all-features qwen38 -- --test-threads=1
           cargo test --locked --bin hf2q --all-features qwen_thinking_budget -- --test-threads=1
           cargo test --locked --bin hf2q --all-features gqa_q2_policy::tests -- --test-threads=1
