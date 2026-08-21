@@ -52,8 +52,8 @@ hf2q doctor
 ```
 
 The explicit `GIT_COMMIT_SHA` gives remote-conversion receipts the immutable
-converter identity they require. The published standalone binary embeds that
-identity already, so its installer users do not set this variable.
+converter identity they require. A future published binary installer will
+provide that identity as part of the release artifact instead.
 
 ## 2. Configure defaults for this Mac
 
