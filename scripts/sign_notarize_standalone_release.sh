@@ -152,7 +152,10 @@ signing_fingerprint=$(grep -F -- "\"$signing_identity\"" <<<"$identities" | awk 
   fail "signed Team ID does not match"
 [[ $(grep -Fxc -- "Authority=$signing_identity" "$codesign_log") -eq 1 ]] || \
   fail "signed authority does not match"
-grep -Eq '^flags=0x[0-9a-f]+\(runtime\)' "$codesign_log" || \
+# `codesign --display --verbose=4` emits flags inside its CodeDirectory line,
+# for example `CodeDirectory ... flags=0x10000(runtime) hashes=...`.
+grep -Eq '^CodeDirectory .* flags=0x[0-9a-f]+\(runtime\)( |$)' \
+  "$codesign_log" || \
   fail "hardened runtime is absent from the signature"
 grep -Eq '^Timestamp=.+$' "$codesign_log" || \
   fail "secure timestamp is absent from the signature"
