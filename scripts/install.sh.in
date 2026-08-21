@@ -61,7 +61,8 @@ if [ "${HF2Q_INSTALL_TEST_MODE:-0}" = 1 ]; then
 else
   [ "$(/usr/bin/lipo -archs "$candidate" 2>/dev/null)" = arm64 ] \
     || fail 'release is not an exact thin Apple-Silicon executable'
-  /usr/bin/codesign --verify --strict --verbose=2 "$candidate" >/dev/null 2>&1 \
+  /usr/bin/codesign --verify --strict --all-architectures --verbose=2 \
+    "$candidate" >/dev/null 2>&1 \
     || fail 'Apple code-signature verification failed'
   signing_info=$(/usr/bin/codesign --display --verbose=4 "$candidate" 2>&1) \
     || fail 'Apple signing identity could not be read'
@@ -69,8 +70,29 @@ else
     || fail 'Apple Developer ID team does not match this hf2q release'
   printf '%s\n' "$signing_info" | grep -qx "Identifier=$release_identifier" \
     || fail 'Apple signing identifier does not match this hf2q release'
-  /usr/sbin/spctl --assess --type execute "$candidate" >/dev/null 2>&1 \
-    || fail 'Gatekeeper did not accept the notarized hf2q release'
+  [ "$(printf '%s\n' "$signing_info" | grep -c '^Authority=')" = 3 ] \
+    || fail 'Apple Developer ID authority chain is incomplete or ambiguous'
+  application_authority=$(printf '%s\n' "$signing_info" | \
+    sed -n 's/^Authority=//p' | sed -n '1p')
+  case "$application_authority" in
+    "Developer ID Application: "*" ($release_team_id)") ;;
+    *) fail 'Apple Developer ID application authority does not match this release' ;;
+  esac
+  [ "$(printf '%s\n' "$signing_info" | \
+    grep -c '^Authority=Developer ID Certification Authority$')" = 1 ] \
+    || fail 'Apple Developer ID intermediate authority is missing'
+  [ "$(printf '%s\n' "$signing_info" | \
+    grep -c '^Authority=Apple Root CA$')" = 1 ] \
+    || fail 'Apple root authority is missing'
+  printf '%s\n' "$signing_info" | \
+    grep -Eq '^CodeDirectory .* flags=0x[0-9a-f]+\(runtime\)( |$)' \
+    || fail 'hf2q release does not enable the hardened runtime'
+  printf '%s\n' "$signing_info" | grep -Eq '^Timestamp=.+$' \
+    || fail 'hf2q release does not have a secure signing timestamp'
+  /usr/bin/codesign --verify --strict --all-architectures \
+    --check-notarization --test-requirement '=notarized' "$candidate" \
+    >/dev/null 2>&1 \
+    || fail 'Apple did not verify the online notarization ticket for this hf2q release'
 fi
 
 chmod 0555 "$candidate"

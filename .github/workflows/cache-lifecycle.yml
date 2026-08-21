@@ -372,14 +372,15 @@ jobs:
               and .notarization.status == "Accepted"
               and .notarization.standalone_ticket_stapled == false
               and .verification.codesign == "accepted"
-              and .verification.gatekeeper == "Notarized Developer ID"
+              and .verification.online_notarization == "accepted"
+              and .verification.notary_ticket_cdhash_matches == true
             ' "$signed_receipt" >/dev/null
           for pair in \
             "notary-submission.json:.notarization.submission_sha256" \
             "notary-wait.json:.notarization.wait_sha256" \
             "notary-log.json:.notarization.log_sha256" \
             "codesign.txt:.verification.codesign_log_sha256" \
-            "gatekeeper.txt:.verification.gatekeeper_log_sha256"; do
+            "notarization-check.txt:.verification.online_notarization_log_sha256"; do
             file=${pair%%:*}
             selector=${pair#*:}
             test "$(shasum -a 256 "$signed_root/$file" | awk '{print $1}')" = \
@@ -392,7 +393,18 @@ jobs:
           test "$(/usr/bin/lipo -archs "$signed_binary")" = arm64
           test "$(/usr/bin/vtool -show-build "$signed_binary" | awk '$1 == "minos" {print $2}')" = 14.0
           /usr/bin/codesign --verify --strict --all-architectures "$signed_binary"
-          /usr/sbin/spctl --assess --type execute "$signed_binary"
+          /usr/bin/codesign --verify --strict --all-architectures \
+            --check-notarization --test-requirement '=notarized' "$signed_binary"
+          codesign_info=$(/usr/bin/codesign --display --verbose=4 "$signed_binary" 2>&1)
+          test "$(grep -c '^CDHash=' <<<"$codesign_info")" = 1
+          signed_cdhash=$(sed -n 's/^CDHash=//p' <<<"$codesign_info")
+          test "$signed_cdhash" = "$(jq -er .signing.cdhash "$signed_receipt")"
+          jq -e --arg cdhash "$signed_cdhash" '
+            .status == "Accepted"
+            and ((.issues // []) | length) == 0
+            and any(.ticketContents[]?;
+              .digestAlgorithm == "SHA-256" and .cdhash == $cdhash)
+          ' "$signed_root/notary-log.json" >/dev/null
           test "$("$signed_binary" --version)" = \
             "hf2q $EXPECTED_VERSION"
 
@@ -414,7 +426,7 @@ jobs:
           "$package_root/scripts/seal_release_binary.sh" \
             "$signed_binary" "$sealed_binary" "$binary_sha"
           for evidence in proof.json notary-submission.json notary-wait.json notary-log.json \
-            codesign.txt gatekeeper.txt hf2q-aarch64-apple-darwin.sha256; do
+            codesign.txt notarization-check.txt hf2q-aarch64-apple-darwin.sha256; do
             cp "$signed_root/$evidence" "$release_evidence/$evidence"
           done
           {

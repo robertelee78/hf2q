@@ -151,7 +151,8 @@ source revision. The Apple-Silicon artifact must be:
 
 - built with the repository's locked Rust dependencies;
 - code-signed with the hf2q Developer ID identity;
-- notarized and accepted by Gatekeeper;
+- notarized with an Apple `Accepted` result whose ticket binds the exact
+  signed executable CDHash;
 - versioned and immutable after publication;
 - accompanied by an exact checksum and release manifest; and
 - tested from the bytes that the channel actually installs.
@@ -189,7 +190,7 @@ Before activation, the standalone installer/updater verifies the bounded
 download, exact checksum and size, Apple-Silicon target, pinned Developer ID
 team and executable identifier, and the version reported by the candidate.
 Normal update rejects a downgrade. The release workflow separately proves
-notarization and Gatekeeper acceptance for the exact published bytes. This is
+accepted notarization and exact ticket-CDHash binding for the published bytes. This is
 the smallest trust chain for the first Apple-only channel; the dormant custom
 TUF client and multi-role local journal are not part of it.
 
@@ -199,8 +200,17 @@ identifier, and the expected Developer ID team. A ZIP containing that exact
 signed executable is only the Apple notary submission carrier. Apple creates
 an online ticket for a standalone executable but cannot currently staple that
 ticket to the raw file, so the release retains the accepted submission/log and
-requires online Gatekeeper assessment of the exact raw bytes. The ZIP is not a
-product download.
+rebinds its ticket CDHash to the exact distributed executable. Apple's `spctl`
+assessment is defined for top-level app bundles and rejects this valid raw CLI
+as “not an app”; it is therefore not used as a raw-executable trust oracle.
+The installer and updater instead verify the exact checksum, thin-arm64 shape,
+strict Developer ID signature and authority chain, hardened runtime, secure
+timestamp, team, identifier, and version. They also combine `codesign`'s
+`--check-notarization` online-ticket lookup with the explicit
+`--test-requirement '=notarized'` code requirement. The online option alone is
+not sufficient: the measured local negative control accepted ad-hoc and Apple
+platform code unless the explicit notarized requirement was also present. The
+ZIP is not a product download.
 
 The exact-artifact workflow is deliberately three-stage. A no-secret job
 builds the locked packed-source candidate, a short protected `apple-release`
@@ -446,8 +456,8 @@ stable host facts.
 The public journey fails closed at ownership and trust boundaries while
 remaining understandable to an operator:
 
-- an unsupported platform or unsigned/unnotarized release is rejected before
-  installation;
+- an unsupported platform or unsigned release is rejected before installation,
+  and the release rail refuses to publish a non-Accepted notarization result;
 - an unavailable package channel is not presented as available;
 - setup probe failure or cancellation leaves existing config unchanged;
 - invalid config never becomes an unlimited or externally exposed default;
@@ -609,7 +619,8 @@ published bytes.
 
 - `hf2q update` uses or clearly delegates to the recorded installation channel
   for standalone, Homebrew, npm-family, Cargo, and source/development cases.
-- Channel mismatch, offline, corrupt download, signature/notarization failure,
+- Channel mismatch, offline, corrupt download, signature failure, release-time
+  notarization failure,
   interrupted update, and already-current behavior preserve the active
   installation.
 - Update preserves config, sources, converted models, caches, and logs.
@@ -656,16 +667,24 @@ It showed that the active executable plus one channel marker, one persistent
 lock, and one retained executable are sufficient for the observable
 standalone lifecycle. The subsequent local implementation adds a canonical
 bounded stable-release record, exact size/SHA verification, same-Developer-ID
-continuity, Gatekeeper assessment, stable-version checks, and the same atomic
+continuity, release-time notarization proof, stable-version checks, and the same atomic
 publisher for install and update. The source tree now also contains the
 three-stage signed-byte release rail, ephemeral Apple credential handling,
 accepted-notary proof receipt, immutable draft publication, exact public-byte
-verification, and a real-trust clean-prefix gate that runs the installed
+verification, and a real-signature clean-prefix gate that runs the installed
 binary's noninteractive setup, revalidates its canonical config, and proves
 uninstall preserves that config and model data. The protected signing job uses
-only its verified checkout script and never executes candidate bytes. That rail
-has not yet run with the project's Apple credentials and has not published a
-real signed/notarized hf2q artifact, so the channel remains unavailable.
+only its verified checkout script and never executes candidate bytes. The first
+credentialed run on 2026-08-20 produced an Apple `Accepted`, zero-issue
+submission whose ticket CDHash exactly matched the signed hf2q binary. It also
+falsified the prior `spctl` assumption: current macOS rejects a raw Mach-O as
+“not an app” even when its code and notarization ticket are valid. No artifact
+was published and the hardware job was skipped. A follow-up local falsifier
+proved the replacement boundary: the signed hf2q passed the combined online
+check plus `=notarized` requirement, while the local ad-hoc hf2q and `/bin/ls`
+failed the explicit requirement. The rail now verifies both that runtime check
+and the independently accepted notary log/exact CDHash; a new exact-byte run
+remains required before the channel becomes available.
 
 The unreachable second managed-session store, its runtime authorization, and
 the provisional session-cache setup field have been removed. `hf2q setup` does

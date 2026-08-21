@@ -690,7 +690,7 @@ jobs:
             notary-wait.json \
             notary-log.json \
             codesign.txt \
-            gatekeeper.txt; do
+            notarization-check.txt; do
             test -f "$standalone_dir/$required"
             test ! -L "$standalone_dir/$required"
           done
@@ -723,14 +723,15 @@ jobs:
               and .notarization.status == "Accepted"
               and .notarization.standalone_ticket_stapled == false
               and .verification.codesign == "accepted"
-              and .verification.gatekeeper == "Notarized Developer ID"
+              and .verification.online_notarization == "accepted"
+              and .verification.notary_ticket_cdhash_matches == true
             ' "$standalone_proof" >/dev/null
           for pair in \
             "notary-submission.json:.notarization.submission_sha256" \
             "notary-wait.json:.notarization.wait_sha256" \
             "notary-log.json:.notarization.log_sha256" \
             "codesign.txt:.verification.codesign_log_sha256" \
-            "gatekeeper.txt:.verification.gatekeeper_log_sha256"; do
+            "notarization-check.txt:.verification.online_notarization_log_sha256"; do
             file=${pair%%:*}
             selector=${pair#*:}
             test "$(shasum -a 256 "$standalone_dir/$file" | awk '{print $1}')" = \
@@ -745,7 +746,18 @@ jobs:
           test "$(/usr/bin/lipo -archs "$standalone_binary")" = arm64
           test "$(/usr/bin/vtool -show-build "$standalone_binary" | awk '$1 == "minos" {print $2}')" = 14.0
           /usr/bin/codesign --verify --strict --all-architectures "$standalone_binary"
-          /usr/sbin/spctl --assess --type execute "$standalone_binary"
+          /usr/bin/codesign --verify --strict --all-architectures \
+            --check-notarization --test-requirement '=notarized' "$standalone_binary"
+          codesign_info=$(/usr/bin/codesign --display --verbose=4 "$standalone_binary" 2>&1)
+          test "$(grep -c '^CDHash=' <<<"$codesign_info")" = 1
+          signed_cdhash=$(sed -n 's/^CDHash=//p' <<<"$codesign_info")
+          test "$signed_cdhash" = "$(jq -er .signing.cdhash "$standalone_proof")"
+          jq -e --arg cdhash "$signed_cdhash" '
+            .status == "Accepted"
+            and ((.issues // []) | length) == 0
+            and any(.ticketContents[]?;
+              .digestAlgorithm == "SHA-256" and .cdhash == $cdhash)
+          ' "$standalone_dir/notary-log.json" >/dev/null
           test "$("$standalone_binary" --version)" = \
             "hf2q $EXPECTED_VERSION"
           echo "EXPECTED_CRATE_SHA256=$expected_crate_sha" >> "$GITHUB_ENV"
@@ -1554,7 +1566,8 @@ jobs:
           test "$(/usr/bin/lipo -archs "$binary")" = arm64
           test "$(/usr/bin/vtool -show-build "$binary" | awk '$1 == "minos" {print $2}')" = 14.0
           /usr/bin/codesign --verify --strict --all-architectures "$binary"
-          /usr/sbin/spctl --assess --type execute "$binary"
+          /usr/bin/codesign --verify --strict --all-architectures \
+            --check-notarization --test-requirement '=notarized' "$binary"
           test "$("$binary" --version)" = \
             "hf2q $EXPECTED_VERSION"
 
@@ -1797,7 +1810,8 @@ jobs:
             "$STANDALONE_BINARY_SHA256"
           test "$(/usr/bin/lipo -archs "$public_binary")" = arm64
           /usr/bin/codesign --verify --strict --all-architectures "$public_binary"
-          /usr/sbin/spctl --assess --type execute "$public_binary"
+          /usr/bin/codesign --verify --strict --all-architectures \
+            --check-notarization --test-requirement '=notarized' "$public_binary"
           test "$("$public_binary" --version)" = \
             "hf2q $EXPECTED_VERSION"
 
