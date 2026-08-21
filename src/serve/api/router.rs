@@ -41,6 +41,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/readyz", get(handlers::readyz))
         .route("/metrics", get(handlers::metrics))
         .route("/hf2q/v1/runtime", get(control::hf2q_runtime))
+        .route("/hf2q/v1/models/catalog", get(control::hub_gguf_catalog))
         .route("/hf2q/v1/models/activate", post(control::activate_model))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/models/:model_id", get(handlers::get_model))
@@ -1382,9 +1383,43 @@ mod tests {
 
     fn activation_target(bytes: usize) -> tempfile::NamedTempFile {
         use std::io::Write;
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(&vec![0; bytes]).unwrap();
+        let mut file = tempfile::Builder::new().suffix(".gguf").tempfile().unwrap();
+        let key = b"general.file_type";
+        let mut gguf = Vec::new();
+        gguf.extend_from_slice(b"GGUF");
+        gguf.extend_from_slice(&3_u32.to_le_bytes());
+        gguf.extend_from_slice(&0_u64.to_le_bytes());
+        gguf.extend_from_slice(&1_u64.to_le_bytes());
+        gguf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        gguf.extend_from_slice(key);
+        gguf.extend_from_slice(&4_u32.to_le_bytes());
+        gguf.extend_from_slice(&15_u32.to_le_bytes());
+        gguf.resize(bytes.max(gguf.len()), 0);
+        file.write_all(&gguf).unwrap();
         file
+    }
+
+    fn hosted_candidate(state: &AppState, bytes: u64) -> String {
+        let view = state
+            .artifact_catalog
+            .register_hosted(crate::input::hf_download::HubGgufCatalog {
+                schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+                repository: "owner/hosted".into(),
+                revision: "a".repeat(40),
+                artifacts: vec![crate::input::hf_download::HubGgufArtifact {
+                    repository: "owner/hosted".into(),
+                    revision: "a".repeat(40),
+                    filename: "model-q6_k.gguf".into(),
+                    bytes,
+                    sha256: "b".repeat(64),
+                    quant_hint: Some("Q6_K".into()),
+                    role: "text_model".into(),
+                    selectable: true,
+                    unavailable_reason: None,
+                }],
+            })
+            .unwrap();
+        view.candidates[0].candidate_id.clone().unwrap()
     }
 
     #[tokio::test]
@@ -1401,6 +1436,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        let catalog_missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/hf2q/v1/models/catalog?model=owner%2Fmodel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(catalog_missing.status(), StatusCode::UNAUTHORIZED);
 
         let runtime = app
             .clone()
@@ -1417,6 +1463,10 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&body_string(runtime).await).unwrap();
         assert_eq!(body["schema_version"], "hf2q.runtime.v1");
         assert_eq!(body["capabilities"]["non_evicting_load"], true);
+        assert_eq!(
+            body["capabilities"]["artifact_resolution"],
+            "hf2q.artifact-resolution.v2"
+        );
         assert_eq!(
             body["capabilities"]["diagnostic_no_evict_header"]["name"],
             "x-hf2q-diagnostic-no-evict"
@@ -1587,6 +1637,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_activation_conflict_returns_before_transfer_helper() {
+        use crate::serve::quant_select::QuantType;
+
+        let (state, engine) = single_capacity_state();
+        let candidate_id = hosted_candidate(&state, 500);
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hf2q/v1/models/activate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model":"owner/hosted",
+                            "candidate_id":candidate_id,
+                            "action":"load"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let manager = state.pool.read().unwrap();
+        assert!(manager
+            .try_get("resident/model", QuantType::Q4_K_M)
+            .is_some());
+        assert_eq!(manager.pool_stats().loaded_count, 1);
+        drop(manager);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn explicit_switch_rejects_stale_revision_before_shutdown_or_load() {
         use crate::serve::quant_select::QuantType;
         let (state, engine) = single_capacity_state();
@@ -1620,6 +1705,49 @@ mod tests {
             serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(receipt["code"], "stale_activation_plan");
         assert!(engine.is_worker_healthy());
+        let manager = state.pool.read().unwrap();
+        assert!(manager
+            .try_get("resident/model", QuantType::Q4_K_M)
+            .is_some());
+        assert_eq!(manager.pool_stats().loaded_count, 1);
+        drop(manager);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_hosted_switch_returns_before_transfer_helper() {
+        use crate::serve::quant_select::QuantType;
+
+        let (state, engine) = single_capacity_state();
+        let candidate_id = hosted_candidate(&state, 500);
+        let victim = state.pool.read().unwrap().iter_loaded().next().unwrap();
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hf2q/v1/models/activate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model":"owner/hosted",
+                            "candidate_id":candidate_id,
+                            "action":"switch",
+                            "expected_revision":0,
+                            "victims":[{
+                                "pool_key":victim.pool_key,
+                                "quant":victim.quant,
+                                "bytes_resident":victim.bytes_resident,
+                                "generation":victim.generation
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let manager = state.pool.read().unwrap();
         assert!(manager
             .try_get("resident/model", QuantType::Q4_K_M)

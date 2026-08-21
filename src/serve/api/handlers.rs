@@ -197,7 +197,10 @@ async fn resolve_engine_for_request(
     //    regression bisect.
     if let Ok(pool_guard) = state.pool.read() {
         for le in pool_guard.snapshot_engines() {
-            if le.engine.model_id() == model_arg {
+            if le.engine.model_id() == model_arg
+                || le.repo == model_arg
+                || format!("{}@{}", le.repo, le.quant.as_str()) == model_arg
+            {
                 drop(pool_guard);
                 let lease = state
                     .model_lifecycle
@@ -384,9 +387,16 @@ pub(super) fn map_hotswap_error_to_response(e: HotSwapError) -> Response {
             }
             .into_response()
         }
-        HotSwapError::LoaderFailed(ref inner) => {
-            tracing::error!(error = %inner, "hot-swap loader failed");
-            ApiError::generation_error(format!("model load failed: {inner}")).into_response()
+        HotSwapError::LoaderFailed(_) => {
+            tracing::error!(
+                error = %crate::serve::load_diagnostic::private_hotswap_diagnostic(&e),
+                "hot-swap loader failed"
+            );
+            ApiError::generation_error(format!(
+                "model load failed: {}",
+                crate::serve::load_diagnostic::public_hotswap_diagnostic(&e)
+            ))
+            .into_response()
         }
         HotSwapError::FileSize {
             ref path,
@@ -396,10 +406,9 @@ pub(super) fn map_hotswap_error_to_response(e: HotSwapError) -> Response {
                 path = %path.display(), error = %source,
                 "hot-swap file size read failed"
             );
-            ApiError::generation_error(format!(
-                "cannot read GGUF size at {}: {source}",
-                path.display()
-            ))
+            ApiError::generation_error(
+                crate::serve::load_diagnostic::public_hotswap_diagnostic(&e).to_string(),
+            )
             .into_response()
         }
     }
@@ -475,7 +484,7 @@ pub async fn chat_completions(
     let prepared = match prepare_chat_generation(
         &state,
         &req,
-        cancellation.map(|Extension(token)| token.0),
+        cancellation.map(|Extension(token)| token.0.flag()),
         diagnostic_no_evict,
     )
     .await
@@ -10853,13 +10862,51 @@ mod pool_error_tests {
 
     /// Loader failures are still 500 (not retryable in the same way as pool
     /// capacity limits).
-    #[test]
-    fn loader_failed_maps_to_500() {
-        let err = HotSwapError::LoaderFailed(anyhow::anyhow!("tokenizer missing"));
+    #[tokio::test]
+    async fn typed_loader_failure_is_actionable_without_reflecting_private_context() {
+        let error = anyhow::Error::new(crate::serve::load_diagnostic::MissingGgufTensor::new(
+            "output.weight",
+        ))
+        .context("credential hf_secret and /private/operator/model.gguf")
+        .context("Qwen35Model::load_from_gguf");
+        let err = HotSwapError::LoaderFailed(error);
         let resp = map_hotswap_error_to_response(err);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        // No Retry-After on a hard loader failure.
         assert!(resp.headers().get(RETRY_AFTER).is_none());
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("output.weight"));
+        assert!(!body.contains("hf_secret"));
+        assert!(!body.contains("/private/operator"));
+        assert!(!body.contains("Qwen35Model::load_from_gguf"));
+    }
+
+    #[tokio::test]
+    async fn unknown_loader_failure_and_file_path_are_redacted() {
+        let loader = map_hotswap_error_to_response(HotSwapError::LoaderFailed(anyhow::anyhow!(
+            "token hf_secret at /private/operator/model.gguf"
+        )));
+        let loader_body = axum::body::to_bytes(loader.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let loader_body = String::from_utf8(loader_body.to_vec()).unwrap();
+        assert!(loader_body.contains("inspect server diagnostics"));
+        assert!(!loader_body.contains("hf_secret"));
+        assert!(!loader_body.contains("/private/operator"));
+
+        let file = map_hotswap_error_to_response(HotSwapError::FileSize {
+            path: std::path::PathBuf::from("/private/operator/model.gguf"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "hf_secret"),
+        });
+        let file_body = axum::body::to_bytes(file.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let file_body = String::from_utf8(file_body.to_vec()).unwrap();
+        assert!(file_body.contains("inspect server diagnostics"));
+        assert!(!file_body.contains("hf_secret"));
+        assert!(!file_body.contains("/private/operator"));
     }
 
     /// ADR-005 wave-1.5 Codex fix T1.1 — real end-to-end path test.

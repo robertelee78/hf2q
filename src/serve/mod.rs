@@ -20,6 +20,7 @@ pub mod header;
 #[allow(dead_code)]
 pub mod kv_persist;
 pub mod layer_ctx;
+pub(crate) mod load_diagnostic;
 #[allow(dead_code)]
 pub mod load_info;
 #[allow(dead_code)]
@@ -4289,6 +4290,10 @@ pub fn cmd_serve(
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
 
+    if let Some(fd) = args.chat_parent_lifeline_fd {
+        start_chat_parent_lifeline(fd)?;
+    }
+
     operator_ui::validate_mode(args.operator_ui, matches!(log_format, cli::LogFormat::Text))?;
 
     // --- Resolve config ---
@@ -5322,9 +5327,11 @@ pub fn cmd_serve(
         // shutdown signal, not at server startup.
         let shutdown_observed = std::sync::Arc::new(tokio::sync::Notify::new());
         let shutdown_for_server = shutdown_observed.clone();
+        let preparations_for_shutdown = state_for_warmup.preparations.clone();
         let mut server = Box::pin(std::future::IntoFuture::into_future(
             axum::serve(listener, router).with_graceful_shutdown(async move {
                 shutdown_signal().await;
+                preparations_for_shutdown.cancel_all();
                 shutdown_for_server.notify_one();
             }),
         ));
@@ -5339,7 +5346,21 @@ pub fn cmd_serve(
                 }
             }
         };
-        let mut shutdown_failure = http_result.err();
+        let http_failure = http_result.err();
+        state_for_warmup.preparations.cancel_all();
+        if let Err(error) = state_for_warmup
+            .preparations
+            .wait_idle(std::time::Duration::from_secs(15))
+            .await
+        {
+            return Err(anyhow::anyhow!(
+                "preparation_shutdown_failed: {error}; refusing normal engine teardown while a model lifecycle transaction may still be active"
+            ));
+        }
+        if let Some(error) = http_failure {
+            return Err(error);
+        }
+        let mut shutdown_failure = None;
         // The HTTP listener has stopped accepting and all in-flight responses
         // have drained. Remove the discovery record before the potentially
         // longer KV-cache/worker shutdown so chat never selects a dead endpoint.
@@ -5438,6 +5459,73 @@ pub fn cmd_serve(
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
+}
+
+/// Crash-safe ownership channel for a server launched by diagnostic chat.
+/// The descriptor is a private inherited capability, not stdin. The launcher
+/// puts this process in a dedicated process group; the server verifies that
+/// fact before arming the watcher and marks the descriptor close-on-exec so
+/// descendants cannot consume detach or prolong lifetime.
+pub(crate) const CHAT_LIFELINE_DETACH_FRAME: &[u8] = b"HF2Q-L1:DETACH\n";
+
+#[cfg(unix)]
+fn start_chat_parent_lifeline(fd: i32) -> Result<()> {
+    use std::os::fd::FromRawFd;
+
+    if fd < 3 {
+        anyhow::bail!("chat parent lifeline descriptor must not alias stdin/stdout/stderr");
+    }
+    let pid = unsafe { libc::getpid() };
+    let process_group = unsafe { libc::getpgrp() };
+    if process_group != pid {
+        anyhow::bail!(
+            "refusing chat parent lifeline outside an isolated process group (pid={pid}, pgrp={process_group})"
+        );
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("validate inherited chat parent lifeline descriptor");
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("make chat parent lifeline close-on-exec");
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect inherited chat parent lifeline descriptor");
+    }
+    // SAFETY: fstat succeeded and initialized the structure.
+    let mode = unsafe { stat.assume_init() }.st_mode;
+    if mode & libc::S_IFMT != libc::S_IFSOCK && mode & libc::S_IFMT != libc::S_IFIFO {
+        anyhow::bail!("chat parent lifeline descriptor must be a private socket or pipe");
+    }
+    // SAFETY: `fd` was validated above and ownership transfers exactly once
+    // into the watcher thread. The launcher retains only the peer socket.
+    let mut lifeline = unsafe { std::fs::File::from_raw_fd(fd) };
+    std::thread::Builder::new()
+        .name("hf2q-chat-lifeline".to_owned())
+        .spawn(move || {
+            use std::io::Read;
+            let mut frame = [0u8; CHAT_LIFELINE_DETACH_FRAME.len()];
+            let detached =
+                lifeline.read_exact(&mut frame).is_ok() && frame == CHAT_LIFELINE_DETACH_FRAME;
+            if detached {
+                tracing::info!("diagnostic chat explicitly detached server lifecycle ownership");
+                return;
+            }
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        })
+        .context("spawn diagnostic chat parent-lifetime watcher")?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn start_chat_parent_lifeline(_fd: i32) -> Result<()> {
+    anyhow::bail!("chat-owned server lifelines are unsupported on this platform; use --url")
 }
 
 /// Build the server's `system_fingerprint` — `hf2q-<short-git-sha-or-ver>-mlx-native`.

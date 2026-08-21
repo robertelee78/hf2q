@@ -20,10 +20,9 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use super::cancellation::CancellationSignal;
 use super::schema::ApiError;
 use super::state::AppState;
 
@@ -31,17 +30,17 @@ use super::state::AppState;
 pub const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 #[derive(Debug, Clone)]
-pub struct RequestCancellation(pub Arc<AtomicBool>);
+pub struct RequestCancellation(pub CancellationSignal);
 
 struct RequestCancellationGuard {
-    cancelled: Arc<AtomicBool>,
+    cancelled: CancellationSignal,
     armed: bool,
 }
 
 impl Drop for RequestCancellationGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.cancelled.store(true, Ordering::Release);
+            self.cancelled.cancel();
         }
     }
 }
@@ -54,9 +53,9 @@ pub async fn request_cancellation_layer(
     mut req: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
-    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled = CancellationSignal::default();
     req.extensions_mut()
-        .insert(RequestCancellation(Arc::clone(&cancelled)));
+        .insert(RequestCancellation(cancelled.clone()));
     let mut guard = RequestCancellationGuard {
         cancelled,
         armed: true,
@@ -230,6 +229,257 @@ pub async fn fallback(req: Request<Body>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn real_tcp_abort_drops_the_request_service_future() {
+        use axum::extract::Extension;
+        use axum::routing::{get, post};
+        use axum::Router;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+
+        type Started = Arc<std::sync::Mutex<Option<oneshot::Sender<CancellationSignal>>>>;
+        async fn hang(
+            Extension(started): Extension<Started>,
+            Extension(cancellation): Extension<RequestCancellation>,
+        ) -> &'static str {
+            if let Some(sender) = started.lock().unwrap().take() {
+                let _ = sender.send(cancellation.0);
+            }
+            std::future::pending::<()>().await;
+            "unreachable"
+        }
+
+        let (started_tx, started_rx) = oneshot::channel::<CancellationSignal>();
+        let app = Router::new()
+            .route("/hang", post(hang))
+            .route("/health", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(request_cancellation_layer))
+            .layer(Extension(Arc::new(std::sync::Mutex::new(Some(started_tx)))));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(
+                b"POST /hang HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let cancellation = tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("handler must start")
+            .unwrap();
+        drop(socket);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cancellation.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("loopback disconnect must drop the service future promptly");
+        let health = reqwest::get(format!("http://{address}/health"))
+            .await
+            .unwrap();
+        assert!(health.status().is_success(), "server must remain alive");
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_tcp_abort_cancels_and_reaps_supervised_helper() {
+        use super::super::cancellation::{
+            run_preparation_command, PreparationLimits, PreparationSupervisor,
+        };
+        use axum::extract::{Extension, State};
+        use axum::routing::{get, post};
+        use axum::Router;
+        use std::path::PathBuf;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        #[derive(Clone)]
+        struct Fixture {
+            supervisor: PreparationSupervisor,
+            pid_file: PathBuf,
+        }
+
+        async fn prepare(
+            State(fixture): State<Fixture>,
+            Extension(cancellation): Extension<RequestCancellation>,
+        ) -> StatusCode {
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "echo $$ > \"$HF2Q_TEST_HELPER_PID_FILE\"; exec sleep 30",
+                ])
+                .env("HF2Q_TEST_HELPER_PID_FILE", &fixture.pid_file);
+            let _ = run_preparation_command(
+                command,
+                cancellation.0,
+                fixture.supervisor,
+                PreparationLimits::transfer_receipt(),
+                None,
+            )
+            .await;
+            StatusCode::REQUEST_TIMEOUT
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("helper.pid");
+        let supervisor = PreparationSupervisor::default();
+        let app = Router::new()
+            .route("/prepare", post(prepare))
+            .route("/health", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(request_cancellation_layer))
+            .with_state(Fixture {
+                supervisor: supervisor.clone(),
+                pid_file: pid_file.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(
+                b"POST /prepare HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let helper_pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = tokio::fs::read_to_string(&pid_file).await {
+                    break pid.trim().parse().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("supervised helper must start");
+        drop(socket);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let result = unsafe { libc::kill(helper_pid, 0) };
+                if result == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("disconnected request must kill and reap its exact helper");
+        supervisor.wait_idle(Duration::from_secs(1)).await.unwrap();
+        let health = reqwest::get(format!("http://{address}/health"))
+            .await
+            .unwrap();
+        assert!(health.status().is_success(), "external server must survive");
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_root_shutdown_cancels_helper_before_http_drain() {
+        use super::super::cancellation::{
+            run_preparation_command, PreparationLimits, PreparationSupervisor,
+        };
+        use axum::extract::{Extension, State};
+        use axum::routing::post;
+        use axum::Router;
+        use std::path::PathBuf;
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+
+        #[derive(Clone)]
+        struct Fixture {
+            supervisor: PreparationSupervisor,
+            pid_file: PathBuf,
+        }
+
+        async fn prepare(
+            State(fixture): State<Fixture>,
+            Extension(cancellation): Extension<RequestCancellation>,
+        ) -> StatusCode {
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "echo $$ > \"$HF2Q_TEST_HELPER_PID_FILE\"; exec sleep 30",
+                ])
+                .env("HF2Q_TEST_HELPER_PID_FILE", &fixture.pid_file);
+            let _ = run_preparation_command(
+                command,
+                cancellation.0,
+                fixture.supervisor,
+                PreparationLimits::transfer_receipt(),
+                None,
+            )
+            .await;
+            StatusCode::REQUEST_TIMEOUT
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("helper.pid");
+        let supervisor = PreparationSupervisor::default();
+        let app = Router::new()
+            .route("/prepare", post(prepare))
+            .layer(axum::middleware::from_fn(request_cancellation_layer))
+            .with_state(Fixture {
+                supervisor: supervisor.clone(),
+                pid_file: pid_file.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_supervisor = supervisor.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                    shutdown_supervisor.cancel_all();
+                })
+                .await
+                .unwrap();
+        });
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{address}/prepare"))
+                .send()
+                .await
+        });
+        let helper_pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = tokio::fs::read_to_string(&pid_file).await {
+                    break pid.trim().parse().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("supervised helper must start");
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("root cancellation must complete before the HTTP drain budget")
+            .unwrap();
+        let _ = request.await;
+        supervisor.wait_idle(Duration::from_secs(1)).await.unwrap();
+        let result = unsafe { libc::kill(helper_pid, 0) };
+        assert_eq!(result, -1, "root-cancelled helper must be reaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
 
     #[test]
     fn request_id_is_generated_when_header_absent() {

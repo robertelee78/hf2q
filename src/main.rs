@@ -157,6 +157,8 @@ fn run(cli: Cli) -> Result<(), AppError> {
     let state_root = cli.state_root;
     match cli.command {
         Command::StandaloneInstall(args) => cmd_standalone_install(args),
+        Command::FetchHubGguf(args) => cmd_fetch_hub_gguf(args),
+        Command::CatalogHubGguf(args) => cmd_catalog_hub_gguf(args),
         Command::Update(args) => cmd_update(args),
         Command::Uninstall(args) => cmd_uninstall(args),
         Command::Setup(args) => setup::run(args, state_root.as_deref()).map_err(|error| {
@@ -197,6 +199,35 @@ fn run(cli: Cli) -> Result<(), AppError> {
         }
         Command::Tokenizer(args) => cmd_tokenizer(args),
     }
+}
+
+fn cmd_fetch_hub_gguf(args: cli::FetchHubGgufArgs) -> Result<(), AppError> {
+    let artifact = input::hf_download::HubGgufArtifact {
+        repository: args.repository,
+        revision: args.revision,
+        filename: args.artifact,
+        bytes: args.bytes,
+        sha256: args.sha256,
+        quant_hint: Some(args.quant),
+        role: "text_model".to_owned(),
+        selectable: true,
+        unavailable_reason: None,
+    };
+    let path = input::hf_download::download_hub_gguf(&artifact)
+        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+fn cmd_catalog_hub_gguf(args: cli::CatalogHubGgufArgs) -> Result<(), AppError> {
+    let reference = input::hf_reference::HfModelReference::parse(&args.repository, None)
+        .map_err(|error| AppError::Input(anyhow::Error::from(error)))?;
+    let catalog = input::hf_download::resolve_hub_gguf_catalog(reference)
+        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+    serde_json::to_writer(std::io::stdout().lock(), &catalog)
+        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+    println!();
+    Ok(())
 }
 
 fn cmd_source_teacher(args: cli::SourceTeacherArgs) -> Result<(), AppError> {

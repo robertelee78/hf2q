@@ -72,6 +72,15 @@ pub enum Command {
     #[command(name = "__standalone-install", hide = true)]
     StandaloneInstall(StandaloneInstallArgs),
 
+    /// Internal request-cancellable boundary for one authenticated hosted
+    /// GGUF transfer selected by the diagnostic control plane.
+    #[command(name = "__fetch-hub-gguf", hide = true)]
+    FetchHubGguf(FetchHubGgufArgs),
+
+    /// Internal cancellable metadata boundary for diagnostic artifact choice.
+    #[command(name = "__catalog-hub-gguf", hide = true)]
+    CatalogHubGguf(CatalogHubGgufArgs),
+
     /// Update a standalone installation, or restore its retained previous version.
     Update(UpdateArgs),
 
@@ -149,6 +158,28 @@ pub enum Command {
     /// surface is a belt-and-suspenders option for operators who feed
     /// hf2q's bundled `tokenizer.json` files to other tools.
     Tokenizer(TokenizerArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct FetchHubGgufArgs {
+    #[arg(long)]
+    pub repository: String,
+    #[arg(long)]
+    pub revision: String,
+    #[arg(long)]
+    pub artifact: String,
+    #[arg(long)]
+    pub bytes: u64,
+    #[arg(long)]
+    pub sha256: String,
+    #[arg(long)]
+    pub quant: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CatalogHubGgufArgs {
+    #[arg(long)]
+    pub repository: String,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -845,6 +876,26 @@ pub struct ChatArgs {
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
 
+    /// Select one hosted GGUF quant from a mixed Hugging Face repository.
+    /// Requires an hf2q endpoint and --model; ambiguous matches fail closed.
+    #[arg(
+        long,
+        value_name = "TYPE",
+        requires = "model",
+        conflicts_with = "artifact"
+    )]
+    pub quant: Option<String>,
+
+    /// Select one exact hosted GGUF filename from a Hugging Face repository.
+    /// Requires an hf2q endpoint and --model; no source-conversion fallback.
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "model",
+        conflicts_with = "quant"
+    )]
+    pub artifact: Option<String>,
+
     /// System message kept for this TUI session only.
     #[arg(long)]
     pub system: Option<String>,
@@ -882,6 +933,12 @@ pub struct ServeArgs {
     /// --model is supplied, the GGUF header is validated at startup.
     #[arg(long)]
     pub model: Option<PathBuf>,
+
+    /// Internal inherited descriptor for a server owned by `hf2q chat`.
+    /// The server accepts it only while leading an isolated process group;
+    /// EOF terminates that group and `D` explicitly detaches it.
+    #[arg(long, hide = true, value_name = "FD")]
+    pub chat_parent_lifeline_fd: Option<i32>,
 
     /// Path to tokenizer.json (if not alongside GGUF).
     #[arg(long)]
@@ -1290,6 +1347,8 @@ mod tests {
         };
         assert_eq!(args.url.as_deref(), Some("http://127.0.0.1:9123"));
         assert!(args.model.is_none());
+        assert!(args.quant.is_none());
+        assert!(args.artifact.is_none());
         assert!(args.system.is_none());
         assert!(args.temperature.is_none());
         assert!(args.top_p.is_none());
@@ -1333,6 +1392,65 @@ mod tests {
         assert_eq!(args.seed, Some(7));
         assert_eq!(args.reasoning_effort.as_deref(), Some("high"));
         assert!(args.keep_serving);
+    }
+
+    #[test]
+    fn chat_accepts_exact_hub_gguf_selection_without_implicit_conversion() {
+        let cli = Cli::try_parse_from([
+            "hf2q",
+            "chat",
+            "--model",
+            "owner/mixed-source-and-gguf",
+            "--quant",
+            "q6_k",
+        ])
+        .expect("diagnostic chat must expose a non-interactive hosted-GGUF selector");
+        let Command::Chat(args) = cli.command else {
+            panic!("expected Chat");
+        };
+        assert_eq!(args.quant.as_deref(), Some("q6_k"));
+        assert!(args.artifact.is_none());
+
+        let exact = Cli::try_parse_from([
+            "hf2q",
+            "chat",
+            "--model",
+            "owner/mixed-source-and-gguf",
+            "--artifact",
+            "gguf/model-q6_k.gguf",
+        ])
+        .expect("diagnostic chat must expose an exact hosted-GGUF selector");
+        let Command::Chat(args) = exact.command else {
+            panic!("expected Chat");
+        };
+        assert_eq!(args.artifact.as_deref(), Some("gguf/model-q6_k.gguf"));
+        assert!(args.quant.is_none());
+
+        assert!(Cli::try_parse_from([
+            "hf2q",
+            "chat",
+            "--model",
+            "owner/mixed-source-and-gguf",
+            "--quant",
+            "q6_k",
+            "--artifact",
+            "gguf/model-q6_k.gguf",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn generated_zsh_completion_contains_chat_and_diagnostic_selectors() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let mut output = Vec::new();
+        clap_complete::generate(Shell::Zsh, &mut command, "hf2q", &mut output);
+        let completion = String::from_utf8(output).unwrap();
+        assert!(completion.contains("chat"));
+        assert!(completion.contains("--quant"));
+        assert!(completion.contains("--artifact"));
+        assert!(completion.contains("--keep-serving"));
     }
 
     #[test]

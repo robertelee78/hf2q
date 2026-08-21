@@ -666,7 +666,9 @@ fn default_chain_n(cfg: &Qwen35Config, layer_weights_gpu: &[LayerWeightsGpu]) ->
 
 struct OutputHeadGpu {
     norm_w: MlxBuffer,
-    /// Exact `output.weight` bytes emitted by conversion.
+    /// Exact GGUF head bytes: dedicated `output.weight`, or the shared
+    /// `token_embd.weight` allocation when the artifact declares tying by
+    /// omitting a dedicated output tensor.
     lm_head: MlxBuffer,
     /// GGML type recorded in the GGUF tensor directory.  Never inferred from
     /// `DType::U8`: all block quants share that Metal storage dtype.
@@ -2188,8 +2190,8 @@ impl Qwen35Model {
             &self.output_norm,
             &output_head.norm_w,
         )?;
-        if self.output_weight_native.is_some() {
-            builder.add_direct_ggml("output.weight", "output.weight", &output_head.lm_head)?;
+        if let Some((_native, source)) = self.resolved_native_output_head()? {
+            builder.add_direct_ggml(source, "output.weight", &output_head.lm_head)?;
         } else {
             builder.add_gpu_f32(
                 "output.weight",
@@ -2392,17 +2394,18 @@ impl Qwen35Model {
     /// replacement weights remain F32: inference does not make a second
     /// quantization decision after conversion.
     fn materialize_output_head_weight(&self, device: &MlxDevice) -> Result<(MlxBuffer, GgmlType)> {
-        if let Some(native) = self.output_weight_native.as_ref() {
+        if let Some((native, source)) = self.resolved_native_output_head()? {
             ensure!(
                 native.info.rows == self.cfg.vocab_size as usize
                     && native.info.cols == self.cfg.hidden_size as usize,
-                "native output.weight shape [{}, {}] != [{}, {}]",
+                "native output head {source} shape [{}, {}] != [{}, {}]",
                 native.info.rows,
                 native.info.cols,
                 self.cfg.vocab_size,
                 self.cfg.hidden_size,
             );
             tracing::info!(
+                source,
                 ggml_type = ?native.info.ggml_dtype,
                 "qwen35 output head: using conversion-time GGUF representation"
             );

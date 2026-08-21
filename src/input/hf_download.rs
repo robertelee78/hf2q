@@ -251,6 +251,43 @@ pub struct DownloadedModel {
     manifest: Vec<ShardIntegrity>,
 }
 
+/// Metadata-only view of one GGUF-like entry in a resolved Hub repository.
+/// This is a deliberately narrow projection of the private repository
+/// inventory: callers cannot select arbitrary source files through it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HubGgufArtifact {
+    pub repository: String,
+    pub revision: String,
+    pub filename: String,
+    pub bytes: u64,
+    pub sha256: String,
+    /// Filename-derived hint only. The GGUF header remains authoritative.
+    pub quant_hint: Option<String>,
+    pub role: String,
+    pub selectable: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl HubGgufArtifact {
+    /// Immutable model-pool/request identity. The strong object identity is
+    /// included so a mutable branch or same-named replacement cannot alias an
+    /// already resident engine.
+    pub fn request_model(&self) -> String {
+        format!(
+            "hf://{}@{}/{}#{}",
+            self.repository, self.revision, self.filename, self.sha256
+        )
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HubGgufCatalog {
+    pub schema_version: String,
+    pub repository: String,
+    pub revision: String,
+    pub artifacts: Vec<HubGgufArtifact>,
+}
+
 impl DownloadedModel {
     pub fn local_dir(&self) -> &Path {
         &self.local_dir
@@ -396,6 +433,196 @@ pub fn resolve_model_reference(
     let cache_dir = resolve_hf_cache_dir();
     let api = build_hub_api(&cache_dir, false)?;
     resolve_with_api(&api, reference)
+}
+
+/// Resolve the hosted GGUF choices for one repository without transferring
+/// model payload. Every returned artifact is bound to the same exact commit
+/// and a strong Hugging Face LFS identity.
+pub fn resolve_hub_gguf_catalog(
+    reference: HfModelReference,
+) -> Result<HubGgufCatalog, DownloadError> {
+    if reference.filename().is_some() {
+        return Err(DownloadError::FileReferenceUnsupported);
+    }
+    let cache_dir = resolve_hf_cache_dir();
+    let api = build_hub_api(&cache_dir, false)?;
+    let (resolved, inventory) = resolve_with_api(&api, reference)?.into_download_parts();
+    let repo = api.repo(hf_hub::Repo::with_revision(
+        resolved.repo_id().to_owned(),
+        hf_hub::RepoType::Model,
+        resolved.revision().to_owned(),
+    ));
+    let mut artifacts = Vec::new();
+    let gguf_filenames = inventory
+        .iter()
+        .filter(|filename| filename.to_ascii_lowercase().ends_with(".gguf"))
+        .collect::<Vec<_>>();
+    if gguf_filenames.len() > 128 {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "repository exposes {} GGUF entries; diagnostic catalog limit is 128",
+                gguf_filenames.len()
+            ),
+        });
+    }
+    for filename in gguf_filenames {
+        let record = fetch_expected_file_metadata(&api, &repo, &resolved, filename)?;
+        let sha256 = record
+            .sha256
+            .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+                reason: format!("GGUF artifact `{filename}` has no strong LFS SHA-256 identity"),
+            })?;
+        let (role, quant_hint, unavailable_reason) = classify_hub_gguf(filename);
+        artifacts.push(HubGgufArtifact {
+            repository: resolved.repo_id().to_owned(),
+            revision: resolved.revision().to_owned(),
+            filename: filename.clone(),
+            bytes: record.bytes,
+            sha256,
+            quant_hint,
+            role: role.to_owned(),
+            selectable: unavailable_reason.is_none() && role == "text_model",
+            unavailable_reason,
+        });
+    }
+    artifacts.sort_by(|left, right| left.filename.cmp(&right.filename));
+    Ok(HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".to_owned(),
+        repository: resolved.repo_id().to_owned(),
+        revision: resolved.revision().to_owned(),
+        artifacts,
+    })
+}
+
+/// Download and authenticate exactly one artifact previously returned by
+/// [`resolve_hub_gguf_catalog`]. No source weights or sibling GGUFs are read.
+pub fn download_hub_gguf(artifact: &HubGgufArtifact) -> Result<PathBuf, DownloadError> {
+    if !artifact.selectable || artifact.role != "text_model" {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!("GGUF artifact `{}` is not selectable", artifact.filename),
+        });
+    }
+    validate_repo_filename(&artifact.filename)?;
+    let identity_valid = artifact.filename.to_ascii_lowercase().ends_with(".gguf")
+        && artifact.bytes > 0
+        && artifact.revision.len() == 40
+        && artifact
+            .revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && artifact.sha256.len() == 64
+        && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && artifact.quant_hint.as_deref().is_some_and(|quant| {
+            matches!(
+                quant.to_ascii_uppercase().as_str(),
+                "Q3_K_M" | "Q4_K_M" | "Q6_K" | "Q8_0"
+            )
+        });
+    if !identity_valid {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: "hosted GGUF identity is incomplete or malformed".to_owned(),
+        });
+    }
+    let cache_dir = resolve_hf_cache_dir();
+    check_artifact_disk_preflight(&artifact.repository, &cache_dir, artifact.bytes)?;
+    let api = build_hub_api(&cache_dir, false)?;
+    let repo = api.repo(hf_hub::Repo::with_revision(
+        artifact.repository.clone(),
+        hf_hub::RepoType::Model,
+        artifact.revision.clone(),
+    ));
+    let resolved = HfModelReference::parse(&artifact.repository, Some(&artifact.revision))?
+        .resolve(&artifact.revision)?;
+    let record = fetch_expected_file_metadata(&api, &repo, &resolved, &artifact.filename)?;
+    if record.bytes != artifact.bytes || record.sha256.as_deref() != Some(artifact.sha256.as_str())
+    {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "GGUF artifact `{}` changed after catalog resolution",
+                artifact.filename
+            ),
+        });
+    }
+    let path = download_file(&repo, &artifact.repository, &artifact.filename)?;
+    verify_shard(&artifact.repository, &artifact.revision, &path, &record)?;
+    Ok(path)
+}
+
+fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<String>) {
+    let lower = filename.to_ascii_lowercase();
+    let basename = lower.rsplit('/').next().unwrap_or(&lower);
+    if basename.starts_with("mmproj") || basename.contains("-mmproj") {
+        return (
+            "companion",
+            None,
+            Some("vision projector companion; not a text model".to_owned()),
+        );
+    }
+    let stem = basename.strip_suffix(".gguf").unwrap_or(basename);
+    if stem.rsplit_once("-of-").is_some_and(|(left, right)| {
+        left.rsplit('-')
+            .next()
+            .is_some_and(|part| part.len() == 5 && part.bytes().all(|byte| byte.is_ascii_digit()))
+            && right.len() == 5
+            && right.bytes().all(|byte| byte.is_ascii_digit())
+    }) {
+        return (
+            "text_model",
+            infer_filename_quant(stem),
+            Some("split GGUF sets are not supported by the current loader".to_owned()),
+        );
+    }
+    let quant_hint = infer_filename_quant(stem);
+    if quant_hint.as_deref() == Some("Q5_K_M") {
+        return (
+            "text_model",
+            quant_hint,
+            Some(
+                "Q5_K_M hosted activation is deferred until GGUF file type is separated from conversion policy"
+                    .to_owned(),
+            ),
+        );
+    }
+    if quant_hint.as_deref() == Some("BF16") {
+        return (
+            "text_model",
+            quant_hint,
+            Some("BF16 GGUF weights are not supported by the current mlx-native loader".to_owned()),
+        );
+    }
+    if quant_hint.is_none() {
+        return (
+            "text_model",
+            None,
+            Some("GGUF quant type cannot be established from metadata-only inventory".to_owned()),
+        );
+    }
+    ("text_model", quant_hint, None)
+}
+
+fn infer_filename_quant(stem: &str) -> Option<String> {
+    ["q3_k_m", "q4_k_m", "q5_k_m", "q6_k", "q8_0", "bf16"]
+        .into_iter()
+        .find(|quant| stem.ends_with(quant))
+        .map(|quant| quant.to_ascii_uppercase())
+}
+
+fn check_artifact_disk_preflight(
+    repo_id: &str,
+    cache_dir: &Path,
+    artifact_bytes: u64,
+) -> Result<(), DownloadError> {
+    let available = get_available_space_for_path(cache_dir);
+    let required = artifact_bytes.saturating_add(2 * 1024 * 1024 * 1024);
+    if available != 0 && available < required {
+        return Err(DownloadError::InsufficientDisk {
+            label: format!("hosted GGUF from {repo_id}"),
+            required_gb: required.div_ceil(1024 * 1024 * 1024),
+            found_gb: available / (1024 * 1024 * 1024),
+            path: cache_dir.display().to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Consume a host-checked preparation plan only after resolving the exact
@@ -614,16 +841,16 @@ pub(super) fn validate_file_metadata(
             reason: format!("metadata for `{filename}` has no supported immutable identity"),
         });
     }
-    if filename.ends_with(".safetensors") && !record.is_lfs {
+    if (filename.ends_with(".safetensors") || filename.ends_with(".gguf")) && !record.is_lfs {
         return Err(DownloadError::InvalidRepositoryInventory {
-            reason: format!("weight shard `{filename}` has no strong LFS SHA-256 identity"),
+            reason: format!("model payload `{filename}` has no strong LFS SHA-256 identity"),
         });
     }
     Ok(record)
 }
 
 pub(super) fn metadata_size_cap(filename: &str) -> Option<u64> {
-    if filename.ends_with(".safetensors") {
+    if filename.ends_with(".safetensors") || filename.ends_with(".gguf") {
         None
     } else if matches!(
         filename,
@@ -1248,6 +1475,125 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("org/model-name"));
+    }
+
+    #[test]
+    fn mixed_repository_ggufs_are_classified_without_source_fallback() {
+        for (filename, quant) in [
+            ("gguf/model-q3_k_m.gguf", "Q3_K_M"),
+            ("gguf/model-q4_k_m.gguf", "Q4_K_M"),
+            ("gguf/model-q6_k.gguf", "Q6_K"),
+            ("gguf/model-q8_0.gguf", "Q8_0"),
+        ] {
+            assert_eq!(
+                classify_hub_gguf(filename),
+                ("text_model", Some(quant.to_owned()), None)
+            );
+        }
+        assert_eq!(
+            classify_hub_gguf("gguf/model-q5_k_m.gguf"),
+            (
+                "text_model",
+                Some("Q5_K_M".to_owned()),
+                Some(
+                    "Q5_K_M hosted activation is deferred until GGUF file type is separated from conversion policy"
+                        .to_owned()
+                )
+            )
+        );
+        let mmproj = classify_hub_gguf("gguf/mmproj-model-f16.gguf");
+        assert_eq!(mmproj.0, "companion");
+        assert!(mmproj.2.unwrap().contains("not a text model"));
+        let bf16 = classify_hub_gguf("gguf/model-bf16.gguf");
+        assert_eq!(bf16.1.as_deref(), Some("BF16"));
+        assert!(bf16.2.unwrap().contains("not supported"));
+        let split = classify_hub_gguf("model-q6_k-00001-of-00002.gguf");
+        assert!(split.2.unwrap().contains("split GGUF"));
+    }
+
+    #[test]
+    fn hosted_artifact_request_identity_includes_revision_filename_and_hash() {
+        let artifact = HubGgufArtifact {
+            repository: "owner/model".to_owned(),
+            revision: "a".repeat(40),
+            filename: "gguf/model-q6_k.gguf".to_owned(),
+            bytes: 42,
+            sha256: "b".repeat(64),
+            quant_hint: Some("Q6_K".to_owned()),
+            role: "text_model".to_owned(),
+            selectable: true,
+            unavailable_reason: None,
+        };
+        let identity = artifact.request_model();
+        assert!(identity.contains("owner/model@aaaaaaaa"));
+        assert!(identity.contains("gguf/model-q6_k.gguf"));
+        assert!(identity.ends_with(&"b".repeat(64)));
+    }
+
+    #[test]
+    fn hosted_gguf_transfer_rejects_forged_non_gguf_identity_before_network() {
+        let artifact = HubGgufArtifact {
+            repository: "owner/model".to_owned(),
+            revision: "main".to_owned(),
+            filename: "model-00001-of-00012.safetensors".to_owned(),
+            bytes: 42,
+            sha256: "not-a-hash".to_owned(),
+            quant_hint: Some("Q6_K".to_owned()),
+            role: "text_model".to_owned(),
+            selectable: true,
+            unavailable_reason: None,
+        };
+        let error = download_hub_gguf(&artifact).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("identity is incomplete or malformed"));
+    }
+
+    #[test]
+    fn hosted_q5_transfer_is_rejected_before_hub_access() {
+        let artifact = HubGgufArtifact {
+            repository: "owner/model".to_owned(),
+            revision: "a".repeat(40),
+            filename: "model-q5_k_m.gguf".to_owned(),
+            bytes: 42,
+            sha256: "b".repeat(64),
+            quant_hint: Some("Q5_K_M".to_owned()),
+            role: "text_model".to_owned(),
+            selectable: true,
+            unavailable_reason: None,
+        };
+        let error = download_hub_gguf(&artifact).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("identity is incomplete or malformed"));
+    }
+
+    /// Metadata-only regression proof for the mixed repository that exposed
+    /// the diagnostic-chat source-download defect. No GGUF/safetensors bytes
+    /// are transferred by this gate.
+    #[test]
+    fn live_mixed_qwen38_repository_catalogs_hosted_ggufs_only() {
+        if std::env::var("HF2Q_NETWORK_TESTS").ok().as_deref() != Some("1") {
+            eprintln!("skipping network test (set HF2Q_NETWORK_TESTS=1 to run)");
+            return;
+        }
+        let reference =
+            HfModelReference::parse("jenerallee78/Qwen3.8-27B-Abliterated-SFT", None).unwrap();
+        let catalog = resolve_hub_gguf_catalog(reference).unwrap();
+        assert_eq!(catalog.revision, "fe1ff12a900bcb7021872a901a920dc6713ac583");
+        let selectable = catalog
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.selectable)
+            .map(|artifact| artifact.filename.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selectable,
+            vec![
+                "gguf/qwen38-abliterated-sft-q6_k.gguf",
+                "gguf/qwen38-abliterated-sft-q8_0.gguf",
+            ]
+        );
     }
 
     /// Opt-in live proof that the accepted Qwen3.8 revision resolves through

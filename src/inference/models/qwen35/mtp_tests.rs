@@ -3,7 +3,10 @@ use super::super::kv_cache::HybridKvCache;
 use super::super::mtp::MtpFfnKind;
 use super::super::mtp_weights_load::mtp_tensor_names;
 use super::super::{default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
-use super::{load_mtp_weights_if_present, shifted_nextn_copy_plan, upload_i32};
+use super::{
+    load_mtp_weights_if_present, load_mtp_weights_if_present_with_shared_head,
+    shifted_nextn_copy_plan, upload_i32,
+};
 use mlx_native::gguf::GgufFile;
 use mlx_native::{KernelRegistry, MlxDevice};
 use std::io::Write;
@@ -297,6 +300,86 @@ fn mtp_loads_with_shared_embeddings_when_flag_false_and_tensor_absent() {
             .any(|n| n == "blk.2.nextn.embed_tokens.weight"),
         "dedicated tensor must not appear in loaded_tensor_names"
     );
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn mtp_shared_head_falls_back_to_tied_main_token_embedding() {
+    let Some(device) = try_device() else { return };
+    let h = 32usize;
+    let vocab = 64usize;
+    let mut tensors: Vec<TestTensor> = tiny_tensors()
+        .into_iter()
+        .filter(|tensor| {
+            tensor.name != "blk.2.nextn.embed_tokens.weight"
+                && tensor.name != "blk.2.nextn.shared_head_head.weight"
+        })
+        .collect();
+    tensors.push(TestTensor {
+        name: "token_embd.weight",
+        dims: vec![h as u64, vocab as u64],
+        data: zeros(vocab * h),
+    });
+    let tmp = std::env::temp_dir().join(format!("mtp_tied_head_{}.gguf", std::process::id()));
+    write_gguf(&tmp, &tensors);
+    let gguf = GgufFile::open(&tmp).expect("open");
+    let mut cfg = tiny_cfg(1);
+    cfg.mtp_use_dedicated_embeddings = false;
+    let mtp = load_mtp_weights_if_present(&gguf, &cfg, &device)
+        .expect("tied main token embedding is the shared output head")
+        .expect("MTP weights");
+    assert_eq!(mtp.vocab_size, 64);
+    assert!(mtp.embed_tokens.is_none());
+    assert_eq!(mtp.shared_head_head.element_count(), vocab * h);
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn mtp_shared_head_borrows_the_supplied_main_buffer_without_a_second_allocation() {
+    use crate::serve::forward_mlx_shared::MlxQWeight;
+    use crate::serve::gpu::QuantWeightInfo;
+    use mlx_native::metal::foreign_types::ForeignType;
+    use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+    use mlx_native::DType;
+
+    let Some(device) = try_device() else { return };
+    let h = 32usize;
+    let vocab = 64usize;
+    let tensors: Vec<TestTensor> = tiny_tensors()
+        .into_iter()
+        .filter(|tensor| {
+            tensor.name != "blk.2.nextn.embed_tokens.weight"
+                && tensor.name != "blk.2.nextn.shared_head_head.weight"
+        })
+        .collect();
+    let tmp = std::env::temp_dir().join(format!("mtp_supplied_head_{}.gguf", std::process::id()));
+    write_gguf(&tmp, &tensors);
+    let gguf = GgufFile::open(&tmp).expect("open");
+    let mut cfg = tiny_cfg(1);
+    cfg.mtp_use_dedicated_embeddings = false;
+
+    let bytes = vocab * h / 32 * 34;
+    let supplied = MlxQWeight {
+        buffer: device
+            .alloc_buffer(bytes, DType::U8, vec![bytes])
+            .expect("allocate supplied Q8_0 head"),
+        info: QuantWeightInfo {
+            ggml_dtype: GgmlType::Q8_0,
+            rows: vocab,
+            cols: h,
+        },
+        affine: None,
+        f16_shadow: None,
+        decode_record_q6k_m1: std::sync::OnceLock::new(),
+    };
+    let supplied_ptr = supplied.buffer.metal_buffer().as_ptr();
+    let mtp = load_mtp_weights_if_present_with_shared_head(&gguf, &cfg, &device, Some(&supplied))
+        .expect("supplied main head is valid")
+        .expect("MTP weights");
+
+    assert_eq!(mtp.shared_head_head.metal_buffer().as_ptr(), supplied_ptr);
+    assert_eq!(mtp.shared_head_head_ggml_type, GgmlType::Q8_0);
+    assert_eq!(mtp.vocab_size, vocab as u32);
     std::fs::remove_file(&tmp).ok();
 }
 

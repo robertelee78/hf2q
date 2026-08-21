@@ -57,7 +57,8 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/doctor.rs        `hf2q doctor` runtime diagnostic
 ├── src/chat/            ADR-047 diagnostic terminal client: discovery,
 │                        OpenAI SSE, session transcript, explicit model
-│                        activation, telemetry, and owned-child lifecycle
+│                        activation, hosted-GGUF selection, telemetry, and
+│                        process-group/parent-lifetime child supervision
 ├── src/setup/           `hf2q setup` host inventory, strict operator-default
 │                        schema/loader, interactive policy, and private
 │                        descriptor-relative crash-durable publication;
@@ -189,7 +190,10 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/serve/           HTTP API, KV-cache, multi-model
 │   ├── discovery.rs             macOS LocalOnly DNS-SD advertise/browse
 │   ├── api/                   axum router + handlers + state
-│   │   ├── control.rs                 versioned diagnostic lifecycle API
+│   │   ├── artifact_catalog.rs        bounded opaque hosted-artifact authority
+│   │   ├── cancellation.rs            request/root preparation + commit supervision
+│   │   ├── control.rs                 versioned diagnostic lifecycle and
+│   │   │                              metadata-only Hub GGUF catalog API
 │   │   ├── lifecycle.rs               generation leases + safe model switch
 │   │   ├── schema.rs                  OpenAI wire types
 │   │   ├── handlers.rs                /v1/* request handlers

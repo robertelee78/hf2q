@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
+use crate::serve::load_diagnostic::PublicLoadDiagnostic;
 use crate::serve::multi_model::{
     AdmissionOutcome, HotSwapError, HotSwapManager, LoadedEngine, LoadedSummary, NonEvictingLoad,
     PreparedEvictionError,
@@ -91,7 +92,8 @@ pub enum LifecycleError {
     VictimPlanChanged,
     PrepareFailed(PreparedEvictionError),
     ShutdownFailed(String),
-    LoadFailed(String),
+    LoadFailed(PublicLoadDiagnostic),
+    PostCommitFailed(String),
 }
 
 impl std::fmt::Display for LifecycleError {
@@ -124,11 +126,30 @@ impl std::fmt::Display for LifecycleError {
             Self::PrepareFailed(error) => write!(f, "eviction preparation failed: {error}"),
             Self::ShutdownFailed(error) => write!(f, "victim worker shutdown failed: {error}"),
             Self::LoadFailed(error) => write!(f, "replacement model load failed: {error}"),
+            Self::PostCommitFailed(error) => {
+                write!(f, "model switch failed after victim removal: {error}")
+            }
         }
     }
 }
 
 impl std::error::Error for LifecycleError {}
+
+impl LifecycleError {
+    /// Whether a failed explicit switch can have crossed the draining or
+    /// eviction boundary and therefore requires process restart before the
+    /// endpoint can be trusted for further diagnostic activation.
+    pub fn requires_restart(&self) -> bool {
+        matches!(
+            self,
+            Self::DrainTimeout { .. }
+                | Self::PrepareFailed(_)
+                | Self::ShutdownFailed(_)
+                | Self::LoadFailed(_)
+                | Self::PostCommitFailed(_)
+        )
+    }
+}
 
 impl ModelLifecycleCoordinator {
     pub async fn read_admission(&self) -> OwnedRwLockReadGuard<()> {
@@ -261,44 +282,7 @@ impl ModelLifecycleCoordinator {
         LoadFuture: std::future::Future<Output = Result<NonEvictingLoad<E>, HotSwapError>>,
     {
         let _admission_guard = self.write_admission().await;
-
-        {
-            let manager = pool.read().map_err(|_| LifecycleError::PoolPoisoned)?;
-            let actual_revision = manager.pool_stats().revision;
-            if actual_revision != confirmation.expected_revision {
-                return Err(LifecycleError::StalePlan {
-                    expected_revision: confirmation.expected_revision,
-                    actual_revision,
-                });
-            }
-            let plan = manager.admission_plan(
-                &confirmation.candidate_repo,
-                confirmation.candidate_quant,
-                confirmation.candidate_bytes,
-            );
-            let planned_keys = match plan.outcome {
-                AdmissionOutcome::WouldEvict { victims, .. } => victims
-                    .into_iter()
-                    .map(|victim| victim.repo_id)
-                    .collect::<Vec<_>>(),
-                _ => return Err(LifecycleError::VictimPlanChanged),
-            };
-            let confirmed_keys = confirmation
-                .victims
-                .iter()
-                .map(|victim| victim.pool_key.clone())
-                .collect::<Vec<_>>();
-            if planned_keys != confirmed_keys {
-                return Err(LifecycleError::VictimPlanChanged);
-            }
-            let current = manager
-                .iter_loaded()
-                .filter(|entry| confirmed_keys.contains(&entry.pool_key))
-                .collect::<Vec<_>>();
-            if current != confirmation.victims {
-                return Err(LifecycleError::VictimPlanChanged);
-            }
-        }
+        self.validate_switch_confirmation(&pool, &confirmation)?;
 
         let drains = self.begin_drain(&confirmation.victims)?;
         self.wait_for_zero(&drains, drain_timeout).await?;
@@ -322,15 +306,71 @@ impl ModelLifecycleCoordinator {
                 .commit_prepared(prepared)
                 .map_err(LifecycleError::PrepareFailed)?;
         }
-        self.finish_removal(&drains)?;
+        self.finish_removal(&drains).map_err(|error| {
+            LifecycleError::PostCommitFailed(format!("activity cleanup failed: {error}"))
+        })?;
 
-        match load(Arc::clone(&pool))
-            .await
-            .map_err(|error| LifecycleError::LoadFailed(error.to_string()))?
-        {
-            NonEvictingLoad::Conflict(_) => Err(LifecycleError::VictimPlanChanged),
+        match load(Arc::clone(&pool)).await.map_err(|error| {
+            tracing::error!(
+                error = %crate::serve::load_diagnostic::private_hotswap_diagnostic(&error),
+                "explicit model switch replacement load failed"
+            );
+            LifecycleError::LoadFailed(crate::serve::load_diagnostic::public_hotswap_diagnostic(
+                &error,
+            ))
+        })? {
+            NonEvictingLoad::Conflict(_) => Err(LifecycleError::PostCommitFailed(
+                "replacement admission conflicted after the confirmed victims were removed"
+                    .to_owned(),
+            )),
             loaded => Ok(loaded),
         }
+    }
+
+    /// Pure preflight for an explicit switch receipt. Callers that need the
+    /// result to remain stable while acting must hold the admission write
+    /// guard; [`Self::switch`] always re-runs this check under its own guard.
+    pub fn validate_switch_confirmation<E>(
+        &self,
+        pool: &Arc<std::sync::RwLock<HotSwapManager<E>>>,
+        confirmation: &SwitchConfirmation,
+    ) -> Result<(), LifecycleError> {
+        let manager = pool.read().map_err(|_| LifecycleError::PoolPoisoned)?;
+        let actual_revision = manager.pool_stats().revision;
+        if actual_revision != confirmation.expected_revision {
+            return Err(LifecycleError::StalePlan {
+                expected_revision: confirmation.expected_revision,
+                actual_revision,
+            });
+        }
+        let plan = manager.admission_plan(
+            &confirmation.candidate_repo,
+            confirmation.candidate_quant,
+            confirmation.candidate_bytes,
+        );
+        let planned_keys = match plan.outcome {
+            AdmissionOutcome::WouldEvict { victims, .. } => victims
+                .into_iter()
+                .map(|victim| victim.repo_id)
+                .collect::<Vec<_>>(),
+            _ => return Err(LifecycleError::VictimPlanChanged),
+        };
+        let confirmed_keys = confirmation
+            .victims
+            .iter()
+            .map(|victim| victim.pool_key.clone())
+            .collect::<Vec<_>>();
+        if planned_keys != confirmed_keys {
+            return Err(LifecycleError::VictimPlanChanged);
+        }
+        let current = manager
+            .iter_loaded()
+            .filter(|entry| confirmed_keys.contains(&entry.pool_key))
+            .collect::<Vec<_>>();
+        if current != confirmation.victims {
+            return Err(LifecycleError::VictimPlanChanged);
+        }
+        Ok(())
     }
 }
 
@@ -656,6 +696,84 @@ mod tests {
             coordinator.acquire(&current),
             Err(LifecycleError::Draining(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn post_commit_admission_conflict_is_restart_required() {
+        let coordinator = ModelLifecycleCoordinator::default();
+        let (pool, loader, _events, _current_file, _current, confirmation) = switch_fixture();
+        // The confirmation was issued for 500 bytes, but the materialized
+        // local artifact grew beyond the entire 800-byte pool budget before
+        // publication. This conflict is after victim commit, not a stale
+        // preflight plan, so the endpoint must require restart.
+        let target_file = fixture_file(900);
+        let error = coordinator
+            .switch(
+                Arc::clone(&pool),
+                confirmation,
+                Duration::from_secs(1),
+                |_engine| async move { Ok(()) },
+                move |pool| async move {
+                    pool.write()
+                        .map_err(|error| {
+                            HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                "pool rwlock poisoned: {error}"
+                            ))
+                        })?
+                        .load_or_get_non_evicting(
+                            "b/2",
+                            QuantType::Q4_K_M,
+                            target_file.path(),
+                            &EngineConfig::default(),
+                        )
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, LifecycleError::PostCommitFailed(_)));
+        assert!(error.requires_restart());
+        assert_eq!(loader.calls.load(Ordering::SeqCst), 1);
+        let manager = pool.read().unwrap();
+        assert!(manager.try_get("a/1", QuantType::Q4_K_M).is_none());
+        assert!(manager.try_get("b/2", QuantType::Q4_K_M).is_none());
+    }
+
+    #[tokio::test]
+    async fn post_commit_loader_failure_preserves_only_typed_public_diagnostic() {
+        let coordinator = ModelLifecycleCoordinator::default();
+        let (pool, _loader, _events, _current_file, _current, confirmation) = switch_fixture();
+        let error = coordinator
+            .switch(
+                Arc::clone(&pool),
+                confirmation,
+                Duration::from_secs(1),
+                |_engine| async move { Ok(()) },
+                |_pool| async move {
+                    let source = anyhow::Error::new(
+                        crate::serve::load_diagnostic::MissingGgufTensor::new("output.weight"),
+                    )
+                    .context("credential hf_secret and /private/operator/model.gguf")
+                    .context("Qwen35Model::load_from_gguf");
+                    Err(HotSwapError::LoaderFailed(source))
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            LifecycleError::LoadFailed(
+                crate::serve::load_diagnostic::PublicLoadDiagnostic::MissingRequiredTensor(
+                    "output.weight".to_owned()
+                )
+            )
+        );
+        assert!(error.requires_restart());
+        let public = error.to_string();
+        assert!(public.contains("output.weight"));
+        assert!(!public.contains("hf_secret"));
+        assert!(!public.contains("/private/operator"));
     }
 
     #[tokio::test]
