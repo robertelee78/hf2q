@@ -115,6 +115,9 @@ fi
 grep -Fq 'uses: ./.github/workflows/standalone-candidate.yml' \
   "$RELEASE_WORKFLOW" || \
   fail "release workflow does not invoke the candidate workflow"
+standalone_call=$(workflow_job "$RELEASE_WORKFLOW" standalone-candidate)
+grep -Fq 'secrets: inherit' <<<"$standalone_call" || \
+  fail "release does not pass its secret context to the reusable candidate workflow"
 grep -Fq 'needs: standalone-candidate' "$RELEASE_WORKFLOW" || \
   fail "publication does not wait for the candidate workflow"
 grep -Fq 'EXPECTED_STANDALONE_CANDIDATE_RUN_ID: ${{ github.run_id }}' \
