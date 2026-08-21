@@ -79,8 +79,17 @@ smoke prompts and MTP/vision flags.
 
 ## Install
 
-`hf2q` is a Cargo crate. Apple Silicon is currently the only supported
-target — the inference path is Metal-only.
+Apple Silicon is currently the only supported target — the inference path is
+Metal-only. The primary installation path is the signed and notarized
+standalone release:
+
+```bash
+curl -fsSL https://hf2q.us/install.sh | sh
+hf2q setup --accept-defaults
+hf2q doctor
+```
+
+Cargo and exact-source builds remain available alternatives:
 
 ```bash
 git clone git@github.com:robertelee78/hf2q.git
@@ -91,18 +100,18 @@ GIT_COMMIT_SHA="$(git rev-parse HEAD)" cargo build --release --locked
 ```
 
 The explicit commit identity is required for immutable remote-conversion
-receipts when building from a checkout. Published packages and future native
-release artifacts embed their own source identity.
+receipts when building from a checkout. Published packages and the standalone
+release embed their own source identity.
 
 The source tree now contains the reviewed standalone installer, updater,
 rollback, data-preserving uninstaller, and protected signed-byte release rail.
 The rail builds a locked packed-source candidate, signs and notarizes its exact
 bytes, and publishes only that verified candidate through a complete draft
 release. Model/cache/performance qualification is separate and remains owned by
-the relevant model and serving decisions. The standalone channel is not
-advertised yet: `https://hf2q.us/install.sh` remains unavailable until the
-credentialed candidate, exact public binary, and stable release record pass
-their installed-artifact gates.
+the relevant model and serving decisions. v0.1.7 passed the credentialed Apple
+candidate, exact public binary, stable-record, clean install, setup, update
+already-current, and data-preserving uninstall gates; the branded installer is
+live at `https://hf2q.us/install.sh`.
 Source/Cargo installs remain unmanaged by `hf2q update`.
 
 `hf2q setup` inventories the selected Apple-Silicon host and records defaults
