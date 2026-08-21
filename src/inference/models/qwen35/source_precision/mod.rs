@@ -23,9 +23,12 @@ mod upload_plan;
 mod upload_transform;
 
 pub(crate) use operator::{
-    compare_official_qwen38_source_reference, preflight_official_qwen38_source_teacher,
-    run_official_qwen38_source_teacher, OfficialQwen38EvaluationSplitV1,
-    OfficialQwen38SourceReferenceRequestV1, OfficialQwen38SourceTeacherRequestV1,
+    compare_official_qwen38_acceptance_reference, compare_official_qwen38_source_reference,
+    preflight_official_qwen38_acceptance_teacher, preflight_official_qwen38_source_teacher,
+    run_official_qwen38_acceptance_teacher, run_official_qwen38_source_teacher,
+    OfficialQwen38AcceptanceReferenceRequestV1, OfficialQwen38AcceptanceTeacherRequestV1,
+    OfficialQwen38EvaluationSplitV1, OfficialQwen38SourceReferenceRequestV1,
+    OfficialQwen38SourceTeacherRequestV1,
 };
 pub(crate) use snapshot::open_verified_qwen_source_snapshot;
 #[cfg(test)]

@@ -5,8 +5,12 @@ use sha2::{Digest, Sha256};
 use super::render::validate_rendered_dataset;
 use super::types::*;
 
+mod acceptance;
 mod verify;
 
+pub(crate) use acceptance::{
+    bind_teacher_acceptance_thresholds, build_teacher_acceptance_holdout_plan,
+};
 use verify::prediction_plan_sha256;
 pub(super) use verify::validate_prediction_plan_limits;
 pub use verify::validate_teacher_prediction_plan;
@@ -37,13 +41,43 @@ pub(crate) fn build_teacher_characterization_plan(
     acceptance_holdout: &RenderedDataset,
     limits: TeacherPredictionPlanLimits,
 ) -> Result<VerifiedTeacherPredictionPlan, CalibrationInputError> {
-    validate_prediction_plan_limits(limits)?;
     if !matches!(
         evaluation_split,
         DatasetSplit::Calibration | DatasetSplit::PolicyValidation
     ) {
         return Err(CalibrationInputError::InvalidDataset(
             "characterization plans cannot open AcceptanceHoldout".into(),
+        ));
+    }
+    build_teacher_prediction_plan(
+        expected_partition,
+        evaluation_split,
+        evaluation_corpus,
+        evaluation,
+        calibration,
+        policy_validation,
+        acceptance_holdout,
+        limits,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_teacher_prediction_plan(
+    expected_partition: &DatasetPartitionManifest,
+    evaluation_split: DatasetSplit,
+    evaluation_corpus: &VerifiedCalibrationCorpus,
+    evaluation: &RenderedDataset,
+    calibration: &RenderedDataset,
+    policy_validation: &RenderedDataset,
+    acceptance_holdout: &RenderedDataset,
+    limits: TeacherPredictionPlanLimits,
+    allow_acceptance_holdout: bool,
+) -> Result<VerifiedTeacherPredictionPlan, CalibrationInputError> {
+    validate_prediction_plan_limits(limits)?;
+    if (evaluation_split == DatasetSplit::AcceptanceHoldout) != allow_acceptance_holdout {
+        return Err(CalibrationInputError::InvalidDataset(
+            "teacher prediction-plan authority does not match its split".into(),
         ));
     }
     let actual_partition = super::partition::verify_dataset_partition(
@@ -221,7 +255,7 @@ pub(crate) fn build_teacher_characterization_plan(
     let split_shape_valid = match evaluation_split {
         DatasetSplit::Calibration => has_teacher_forced && !greedy_prompts.is_empty(),
         DatasetSplit::PolicyValidation => has_teacher_forced,
-        DatasetSplit::AcceptanceHoldout => unreachable!("rejected above"),
+        DatasetSplit::AcceptanceHoldout => !greedy_prompts.is_empty(),
     };
     if points.is_empty() || !split_shape_valid {
         return Err(CalibrationInputError::InvalidDataset(

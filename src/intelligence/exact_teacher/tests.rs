@@ -591,6 +591,14 @@ fn matched_reference_input_and_targets_are_rebuilt_and_compared() {
     assert!(receipt.trajectories[0].exact_match);
     assert!(!receipt.thresholds_predeclared);
     assert!(!receipt.quality_gate_authority);
+    let parsed: reference::ExactTeacherReferenceComparisonReceiptV1 =
+        serde_json::from_slice(&serde_json::to_vec(&receipt).unwrap()).unwrap();
+    reference::validate_exact_teacher_reference_comparison_receipt(&parsed).unwrap();
+    let mut forged_authority = parsed;
+    forged_authority.quality_gate_authority = true;
+    assert!(
+        reference::validate_exact_teacher_reference_comparison_receipt(&forged_authority).is_err()
+    );
 
     let mut tampered = input.clone();
     tampered.examples[0].token_ids[0] ^= 1;

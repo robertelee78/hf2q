@@ -5,6 +5,7 @@
 //! does not expose caller-authored tensor dispositions, prediction plans, or
 //! execution knobs.
 
+mod acceptance;
 mod corpus;
 mod profile;
 mod reference;
@@ -15,8 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::intelligence::calibration::DatasetSplit;
 
-/// The characterization splits that may be executed before thresholds exist.
-/// AcceptanceHoldout deliberately has no constructor at this boundary.
+/// Characterization splits. AcceptanceHoldout is intentionally absent and is
+/// reachable only through the sealed one-time acceptance entrypoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OfficialQwen38EvaluationSplitV1 {
@@ -34,12 +35,14 @@ impl OfficialQwen38EvaluationSplitV1 {
 }
 
 pub(crate) use reference::{
-    compare_official_qwen38_source_reference, OfficialQwen38SourceReferenceRequestV1,
+    compare_official_qwen38_acceptance_reference, compare_official_qwen38_source_reference,
+    OfficialQwen38AcceptanceReferenceRequestV1, OfficialQwen38SourceReferenceRequestV1,
 };
 
 pub(crate) use source::{
-    preflight_official_qwen38_source_teacher, run_official_qwen38_source_teacher,
-    OfficialQwen38SourceTeacherRequestV1,
+    preflight_official_qwen38_acceptance_teacher, preflight_official_qwen38_source_teacher,
+    run_official_qwen38_acceptance_teacher, run_official_qwen38_source_teacher,
+    OfficialQwen38AcceptanceTeacherRequestV1, OfficialQwen38SourceTeacherRequestV1,
 };
 
 #[cfg(test)]

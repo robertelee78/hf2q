@@ -284,6 +284,51 @@ pub(crate) struct VerifiedTeacherPredictionPlan {
     pub(super) examples: Vec<TeacherPredictionExample>,
 }
 
+/// Opaque proof that a family-owned operator verified a predeclared threshold
+/// profile against both characterization receipts before opening holdout.
+/// This capability binds the only source/corpus identity that it may unlock.
+#[derive(Debug)]
+pub(crate) struct VerifiedTeacherAcceptanceThresholdsV1 {
+    pub(super) threshold_profile_sha256: String,
+    pub(super) calibration_comparison_receipt_sha256: String,
+    pub(super) policy_validation_comparison_receipt_sha256: String,
+    pub(super) source: SourceIdentity,
+    pub(super) verified_source_manifest_sha256: String,
+    pub(super) acceptance_holdout_corpus_sha256: String,
+}
+
+/// Non-clone sealed result of consuming the predeclared threshold authority
+/// to open exactly one AcceptanceHoldout prediction plan.
+#[derive(Debug)]
+pub(crate) struct VerifiedTeacherAcceptanceHoldoutPlanV1 {
+    pub(super) plan: VerifiedTeacherPredictionPlan,
+    pub(super) threshold_profile_sha256: String,
+}
+
+impl VerifiedTeacherAcceptanceHoldoutPlanV1 {
+    pub(crate) fn threshold_profile_sha256(&self) -> &str {
+        &self.threshold_profile_sha256
+    }
+
+    pub(crate) fn into_prediction_plan(self) -> VerifiedTeacherPredictionPlan {
+        self.plan
+    }
+}
+
+impl VerifiedTeacherAcceptanceThresholdsV1 {
+    pub(crate) fn threshold_profile_sha256(&self) -> &str {
+        &self.threshold_profile_sha256
+    }
+
+    pub(crate) fn calibration_comparison_receipt_sha256(&self) -> &str {
+        &self.calibration_comparison_receipt_sha256
+    }
+
+    pub(crate) fn policy_validation_comparison_receipt_sha256(&self) -> &str {
+        &self.policy_validation_comparison_receipt_sha256
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct TeacherPredictionExample {
     pub token_ids: Vec<u32>,

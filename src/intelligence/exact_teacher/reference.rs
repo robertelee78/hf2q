@@ -27,8 +27,13 @@ use super::{
 mod compare;
 
 pub(crate) use compare::{
-    compare_exact_teacher_reference_targets, ExactTeacherReferenceComparisonReceiptV1,
+    compare_exact_teacher_reference_targets,
+    validate_canonical_exact_teacher_reference_comparison_receipt,
+    validate_exact_teacher_reference_comparison_artifact,
+    ExactTeacherReferenceComparisonReceiptV1, ExactTeacherReferenceTrajectoryComparisonV1,
 };
+#[cfg(test)]
+pub(crate) use compare::validate_exact_teacher_reference_comparison_receipt;
 
 const REFERENCE_INPUT_SCHEMA_VERSION: u32 = 1;
 const REFERENCE_INPUT_PROFILE: &str = "exact_teacher_reference_input_v1";

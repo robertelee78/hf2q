@@ -1491,6 +1491,65 @@ the checked-in threshold authority derived from both characterization receipts;
 schema validity alone cannot open the holdout. This change adds no threshold or
 quality-gate authority and does not alter the canary-only, no-DWQ scope.
 
+#### 2026-08-21 — completed characterization and predeclared holdout gate
+
+The schema-v3 characterization was completed before opening AcceptanceHoldout.
+Both native runs used hf2q commit
+`9b314ce4ff4cc9667ee927c056898ed5035fbd91`, the exact upstream source revision
+`1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, source bundle SHA-256
+`73ded708c49c2d0a47c790ce1d6181e848ac7591dab741de83dbb57218cc6873`,
+published `mlx-native = 0.11.0`, and the pinned Transformers implementation at
+commit `945dac9117cb54196888c0e6c08035792a98c485`. The external producer and
+dependency-lock SHA-256 values were respectively
+`2250b23d876da535b12d9e17ffe3e91fa1736c800e4447b3962b64fdf6980a76`
+and `9569989d63c1b83404986536485cf8afe9deba1bc244ab68db8e34701e4733f8`.
+
+Calibration plan
+`4634995c2e2404a882c9cd2994499c62bc794afc0dc0a7e2cbf7d7e16701b08d`
+produced 22 rows. Its maximum absolute logit difference was
+`4.955787658691406`; mean, maximum, and p95
+`KL(reference || hf2q)` were `0.015885771034098786`,
+`0.05723891423613325`, and `0.04290778159326072`; top-1 agreement was
+22/22; and the greedy trajectory first diverged at zero-based index 10. The
+raw comparison receipt SHA-256 is
+`41fdf58a53bca32c255951bcc8e9193843afb176c89fdbaee057afadea8bc77d`,
+and its checked-in byte artifact SHA-256 is
+`6627b23c9a8519dc7b1e2ace38a466e9dc2582caac55778787051932305c63ed`.
+
+PolicyValidation plan
+`45b05d34dfd12c0b34aaf9c072a30ca8bccd48c127f785d1a3dee36510cc4bcf`
+produced 33 rows and no trajectory by contract. Its maximum absolute logit
+difference was `3.6840256452560425`; mean, maximum, and p95 KL were
+`0.02774875897420403`, `0.11881776542775319`, and
+`0.09240500608777208`; and top-1 agreement was 30/33
+(`0.9090909090909091`). The raw comparison receipt SHA-256 is
+`ed24074db26dde69ccafb6ac797dd77a999000993a26f8eb661b4ac91f1fb919`,
+and its checked-in byte artifact SHA-256 is
+`76483a2bafdfd043663bf580948bf0f24c59fcea1a8e04ce0da81493f6708109`.
+
+The byte-pinned threshold declaration has SHA-256
+`6a3d36c3006355315820b331aaaeb75bc04ef58b04b81c2be31692b7f99ababb`.
+It deterministically rounds the worse characterized maximum absolute error up
+to one decimal (`5.0`) and the worse maximum row KL up to two decimals
+(`0.12`). Because holdout has one row, that row must match top-1 exactly.
+Because Calibration has the only characterization trajectory, holdout must
+match through at least zero-based divergence index 10 (or match all 32 tokens).
+All bounds are inclusive and no extra policy margin is introduced.
+
+The ordinary split enums and `source-teacher --evaluation-split` remain limited
+to Calibration and PolicyValidation. The splitless hidden
+`source-teacher-acceptance` command first authenticates the threshold artifact
+and both exact characterization receipts, then consumes an opaque capability to
+construct a one-example, one-GenerationNext, one-trajectory holdout plan before
+topology or Metal work. The separate
+`source-teacher-acceptance-reference` command publishes a fresh raw schema-v1
+comparison receipt before evaluating it and creates a distinct quality receipt
+only on pass. Raw receipts retain every authority flag as false; the quality
+receipt sets only `thresholds_predeclared=true` and
+`quality_gate_authority=true`. It never grants source-teacher, sensitivity,
+allocator, selector, autoquant, runtime-dependency, performance, or DWQ
+authority. The holdout remained unopened when this declaration was written.
+
 ### Phase E — production `--quant auto`
 
 - Add an operator profile and budget surface.

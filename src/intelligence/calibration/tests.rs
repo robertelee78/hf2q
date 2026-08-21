@@ -327,7 +327,7 @@ fn characterization_plans_bind_the_selected_split_and_keep_holdout_closed() {
     let holdout = render_and_tokenize_split(
         &dataset(
             DatasetSplit::AcceptanceHoldout,
-            example("hold", "holdout", true),
+            example("hold", "holdout", false),
         ),
         &request,
     )
@@ -453,11 +453,87 @@ fn characterization_plans_bind_the_selected_split_and_keep_holdout_closed() {
         .all(|point| point.stable_id == "val"));
     validate_teacher_prediction_plan(policy_plan.manifest()).unwrap();
 
+    let holdout_corpus_path = temp.path().join("acceptance-holdout.json");
+    let holdout_corpus_bytes = serde_json::to_vec(&holdout.structured).unwrap();
+    std::fs::write(&holdout_corpus_path, &holdout_corpus_bytes).unwrap();
+    let holdout_corpus = verify_calibration_corpus_artifact(&VerifyCalibrationCorpusRequest {
+        path: holdout_corpus_path,
+        expected_sha256: sha256(&holdout_corpus_bytes),
+        expected_dataset_id: "dataset".into(),
+        expected_revision: "revision".into(),
+        expected_declared_license: "apache-2.0".into(),
+        expected_split: DatasetSplit::AcceptanceHoldout,
+        limits: CalibrationCorpusArtifactLimits {
+            max_artifact_bytes: 64 * 1024,
+            max_examples: 4,
+            max_messages: 8,
+            max_tools: 4,
+        },
+    })
+    .unwrap();
+    let thresholds = bind_teacher_acceptance_thresholds(
+        "1".repeat(64),
+        "2".repeat(64),
+        "3".repeat(64),
+        holdout.manifest().source.clone(),
+        holdout.manifest().verified_source_manifest_sha256.clone(),
+        holdout_corpus.artifact().sha256.clone(),
+    )
+    .unwrap();
+    let authorized_holdout = build_teacher_acceptance_holdout_plan(
+        thresholds,
+        &partition,
+        &holdout_corpus,
+        &holdout,
+        &calibration,
+        &validation,
+        &holdout,
+        limits,
+    )
+    .unwrap();
+    assert_eq!(
+        authorized_holdout.threshold_profile_sha256(),
+        "1".repeat(64)
+    );
+    let holdout_plan = authorized_holdout.into_prediction_plan();
+    assert_eq!(
+        holdout_plan.manifest().evaluation_split,
+        DatasetSplit::AcceptanceHoldout
+    );
+    assert_eq!(holdout_plan.manifest().greedy_prompts.len(), 1);
+    assert!(holdout_plan
+        .manifest()
+        .prediction_points
+        .iter()
+        .all(|point| point.stable_id == "hold"));
+    validate_teacher_prediction_plan(holdout_plan.manifest()).unwrap();
+
+    let wrong_thresholds = bind_teacher_acceptance_thresholds(
+        "1".repeat(64),
+        "2".repeat(64),
+        "3".repeat(64),
+        holdout.manifest().source.clone(),
+        holdout.manifest().verified_source_manifest_sha256.clone(),
+        "4".repeat(64),
+    )
+    .unwrap();
+    assert!(build_teacher_acceptance_holdout_plan(
+        wrong_thresholds,
+        &partition,
+        &holdout_corpus,
+        &holdout,
+        &calibration,
+        &validation,
+        &holdout,
+        limits,
+    )
+    .is_err());
+
     assert!(matches!(
         build_teacher_characterization_plan(
             &partition,
             DatasetSplit::AcceptanceHoldout,
-            &validation_corpus,
+            &holdout_corpus,
             &holdout,
             &calibration,
             &validation,
