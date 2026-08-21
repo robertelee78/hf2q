@@ -2,8 +2,8 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
-This document defines the public hf2q 0.1.6 product surface and the
-**Unreleased next-release candidate** where explicitly marked. It also defines
+This document defines the public hf2q product surface and the **Unreleased
+next-release candidate** where explicitly marked. It also defines
 the policy each environment variable is classified under. Per-variable
 effects live in `docs/operator-env-vars.md`; this document sits one level above
 and defines *what is supported*.
@@ -29,7 +29,7 @@ family's graph, cache, or scheduler contract by approximation.
 - **Auto Q8 lm_head** with exact F32 rerank, selected when
   `hidden_size % 32 == 0` **and** F16 lm_head weight > 256 MB;
   otherwise F16.
-- **Public by 0.1.6; strengthened in the Unreleased 0.1.7 candidate:**
+- **Public by 0.1.6; strengthened in the 0.1.7 release:**
   Qwen3.5/Qwen3.6 generation and OpenAI-compatible
   serving use the shared autoregressive `qwen35`/`qwen35moe` graph by default.
   Slot-aware Qwen prefill
@@ -40,14 +40,14 @@ family's graph, cache, or scheduler contract by approximation.
   before Qwen LM scheduler/SSE admission until their own prefill and decode are scheduler-yielding;
   the historical multimodal primitive remains available only under
   SerialFifo. The separate chunk-scan prefill experiment remains Category 3.
-- **Public by 0.1.6; strengthened in the Unreleased 0.1.7 candidate:** long
+- **Public by 0.1.6; strengthened in the 0.1.7 release:** long
   plain-text Gemma SlotAware prefill advances in
   at most 4,096-token transactions, split at the stable-prefix boundary. The
   transaction publishes all configured per-layer cache cursors together.
   Compatible installed prefill states may share those 4,096 aggregate rows;
   the bound never multiplies by the number of slots. Long soft-token work
   remains fail-closed until a resumable graph is proven.
-- **Public by 0.1.6; strengthened in the Unreleased 0.1.7 candidate:** DeepSeek
+- **Public by 0.1.6; strengthened in the 0.1.7 release:** DeepSeek
   meaningful cached suffixes use the same
   atomic resumable verifier transactions as cold prefill. Lopsided cold waves
   use an interactive budget of up to eight decode tokens between prefill slices
@@ -63,7 +63,7 @@ family's graph, cache, or scheduler contract by approximation.
   remain sequence-local; aggregate rows never exceed 2,048, and no request
   waits or is skipped to form a cohort. Cancellation restores only a valid, position-consistent
   pre-request turn anchor; poisoned or inconsistent state resets fully.
-  The Unreleased 0.1.7 candidate also pairs large automatic MoE gate/up
+  The 0.1.7 release also pairs large automatic MoE gate/up
   projections through the routing-schedule primitive introduced in
   `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.11.0`.
   Decode-sized and forced diagnostic routes remain independent;

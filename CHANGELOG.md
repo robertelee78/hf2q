@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-08-21
+
+### Added
+
+- Let `hf2q chat` discover receipt-backed and canonical-cache GGUF artifacts
+  local to the server, verify their exact bytes before activation, prefer them
+  over hosted downloads, and keep server paths and digests out of the terminal
+  and HTTP catalog.
+
 ### Changed
 
+- Widen Qwen single-slot prefill transactions when no decoder is waiting,
+  retaining the bounded interactive transaction size once mixed work appears.
 - Make one `Release` dispatch build, Developer-ID sign, notarize, publish, and
   post-verify the exact standalone candidate. The independently dispatchable
   candidate workflow remains available for diagnostics and optional model
@@ -886,7 +897,8 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
-[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/robertelee78/hf2q/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/robertelee78/hf2q/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/robertelee78/hf2q/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/robertelee78/hf2q/compare/v0.1.4...v0.1.5
