@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HARNESS="$ROOT_DIR/scripts/test_gemma4_long_short_overlap.sh"
 RELEASE_GATE="$ROOT_DIR/scripts/run_agentic_cache_release_gate.sh"
+MODEL_WORKFLOW="$ROOT_DIR/.github/workflows/cache-lifecycle.yml"
 RELEASE_WORKFLOW="$ROOT_DIR/.github/workflows/release.yml"
 PARITY_VERIFIER="$ROOT_DIR/scripts/verify_gemma4_parity_receipt.sh"
 
@@ -15,6 +16,14 @@ for command in awk bash grep jq shasum; do
 done
 bash -n "$HARNESS" "$RELEASE_GATE" "$PARITY_VERIFIER"
 bash -n "$ROOT_DIR/scripts/verify_gemma4_wave_thermal_receipt.sh"
+grep -qF 'scripts/run_agentic_cache_release_gate.sh' "$MODEL_WORKFLOW" || {
+  echo "model qualification workflow does not invoke the Gemma gate" >&2
+  exit 1
+}
+if grep -qF '.receipt_sha256.gemma.' "$RELEASE_WORKFLOW"; then
+  echo "publication still owns Gemma model-qualification receipts" >&2
+  exit 1
+fi
 
 invalid_stderr=$(mktemp)
 exit_probe_script=$(mktemp)
@@ -115,14 +124,6 @@ grep -qF 'bash scripts/verify_gemma4_wave_thermal_receipt.sh "$wave"' \
   echo "Gemma release producer does not verify its thermal receipt" >&2
   exit 1
 }
-# jq variables below are literal publication contracts.
-# shellcheck disable=SC2016
-grep -qF 'and .thermal.measurement_scope == "full-agent-wave"' \
-  "$RELEASE_WORKFLOW" || {
-  echo "publication does not require full-wave Gemma thermal evidence" >&2
-  exit 1
-}
-
 awk '
   /^run_gemma_wave\(\)/ { in_wave=1 }
   in_wave && /if \[\[ "\$agents" == 8 \]\]/ { in_eight=1 }
@@ -177,40 +178,6 @@ grep -qF 'jq -e -f scripts/gemma4_eight_slot_receipt.jq' \
   echo "Gemma release producer does not validate the N=8 summary before sealing" >&2
   exit 1
 }
-grep -qF "'.receipt_sha256.gemma.eight_slots_thermal'" "$RELEASE_WORKFLOW" || {
-  echo "publication does not rehash the eight-slot thermal summary" >&2
-  exit 1
-}
-grep -qF 'verify_gemma4_wave_thermal_receipt.sh eight-slots' \
-  "$RELEASE_WORKFLOW" || {
-  echo "publication does not independently replay the eight-slot thermal receipt" >&2
-  exit 1
-}
-grep -qF 'jq -e -f scripts/gemma4_eight_slot_receipt.jq' \
-  "$RELEASE_WORKFLOW" || {
-  echo "publication does not replay the N=8 summary schema" >&2
-  exit 1
-}
-
-for predicate in \
-  'and .maximum_cold_ttft_ms <= 40000' \
-  'and .maximum_cold_semantic_response_ms <= 60000' \
-  'and .maximum_tool_result_ms <= 30000'; do
-  grep -qF "$predicate" "$RELEASE_WORKFLOW" || {
-    echo "publication does not enforce the eight-slot timing envelope: $predicate" >&2
-    exit 1
-  }
-done
-for field in \
-  maximum_cold_ttft_ms \
-  maximum_cold_semantic_response_ms \
-  maximum_tool_result_ms; do
-  grep -qF "and (.$field | type) == \"number\"" "$RELEASE_WORKFLOW" || {
-    echo "publication accepts a missing/non-numeric eight-slot timing: $field" >&2
-    exit 1
-  }
-done
-
 awk '
   /^on_exit\(\)/ { in_exit=1 }
   in_exit && /local original_rc=\$\?/ { captures=1 }
@@ -262,11 +229,6 @@ done
   echo "Gemma producer must verify leaf parity logs after creation and before manifest seal" >&2
   exit 1
 }
-grep -qF 'verify_gemma4_parity_receipt.sh' "$RELEASE_WORKFLOW" || {
-  echo "publication does not independently rehash Gemma parity leaf logs" >&2
-  exit 1
-}
-
 parity_files=(
   n4.log
   n8.log
@@ -319,42 +281,12 @@ grep -qF 'HF2Q_GEMMA_N8_PARITY_MAX_TOKENS=1' "$RELEASE_GATE" || {
   echo "Gemma release gate does not bind the one-token N=8 seed budget" >&2
   exit 1
 }
-# jq variables below are literal publication contracts.
-# shellcheck disable=SC2016
-for predicate in \
-  'and $g.parity.n8_cross_slot_admit == true' \
-  'and $g.parity.n8_max_tokens == 24' \
-  'and $g.parity.n8_rounds == 25' \
-  'and $g.parity.n8_seed_budget_exact_output_parity == true' \
-  'and $g.parity.n8_seed_budget_max_tokens == 1' \
-  'and $g.parity.n8_seed_budget_rounds == 25' \
-  'and $g.parity.n8_tiny_hybrid_exact_output_parity == true' \
-  'and $g.parity.n8_tiny_full_tq_exact_output_parity == true' \
-  'and $g.parity.n8_tiny_prefill_rounds == 64' \
-  'and $g.parity.n8_tiny_resume_rounds == 16'; do
-  grep -qF "$predicate" "$RELEASE_WORKFLOW" || {
-    echo "publication does not bind the N=8 production parity contract: $predicate" >&2
-    exit 1
-  }
-done
 grep -qF 'fresh_and_reused_4096_8193_bounded_output_parity:true' "$RELEASE_GATE" || {
   echo "Gemma parity receipt does not bind bounded fresh-versus-reused output" >&2
   exit 1
 }
-# jq variable is a literal workflow contract.
-# shellcheck disable=SC2016
-grep -qF 'and $g.parity.profile == "release"' "$RELEASE_WORKFLOW" || {
-  echo "publication does not require release-profile Gemma parity" >&2
-  exit 1
-}
-# shellcheck disable=SC2016
-grep -qF 'and $g.parity.fresh_and_reused_4096_8193_bounded_output_parity == true' \
-  "$RELEASE_WORKFLOW" || {
-  echo "publication does not require bounded fresh-versus-reused Gemma parity" >&2
-  exit 1
-}
 if grep -qF 'eager_4096_and_resumed_8193_exact_output_parity' \
-  "$RELEASE_GATE" "$RELEASE_WORKFLOW"; then
+  "$RELEASE_GATE"; then
   echo "stale monolithic-versus-bounded Gemma parity schema remains accepted" >&2
   exit 1
 fi
