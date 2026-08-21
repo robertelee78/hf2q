@@ -2,7 +2,7 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
-Current published release: `v0.1.8`.
+Current published release: `v0.1.9`.
 
 This document defines the public hf2q product surface and the **next-release
 candidate** where explicitly marked. It also defines

@@ -7,11 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-08-21
+
+### Added
+
+- Detect standalone, Cargo registry/Git/path, source-development, ambiguous,
+  and unmanaged installations so `hf2q update` and `hf2q uninstall` honor the
+  channel that owns the active executable instead of guessing or crossing
+  channels.
+- Add exact, non-mutating config/cache purge previews and confirmed execution
+  that removes only named hf2q-owned data while preserving unknown siblings,
+  external models, Hugging Face data, persistent-KV roots, locks, and logs.
+- Add the source-bound Qwen3.8 reference acceptance verifier and retain its
+  exact comparison, thresholds, and quality evidence.
+- Add the verified Qwen3.8 operator guides for the core hf2q journey and the
+  separately scoped OpenCode, Agentic Kit, and local search/fetch integration.
+
+### Changed
+
+- Preserve Cargo root, source selector, features, profile, target, and version
+  requirements during delegated updates; source checkouts remain explicitly
+  non-mutating and receive exact rebuild instructions.
+- Make native Qwen3.8 conversion, Q4_K_M quantization, foreground serving,
+  `hf2q chat`, and direct API proof the documented core CLI sequence.
+
 ### Fixed
 
 - Publish automatically converted text/projector GGUF pairs as one
   crash-recoverable, generation-bound transaction, and enforce the text
   artifact's projector digest for local as well as receipt-backed models.
+- Bind Qwen3.8 qualification inputs to the exact paired artifact identity and
+  keep peer-reference wording within the checked-in policy boundary.
 
 ## [0.1.8] — 2026-08-21
 
@@ -903,7 +929,8 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
-[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/robertelee78/hf2q/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/robertelee78/hf2q/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/robertelee78/hf2q/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/robertelee78/hf2q/compare/v0.1.5...v0.1.6
