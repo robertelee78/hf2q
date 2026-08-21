@@ -96,11 +96,13 @@ release artifacts embed their own source identity.
 
 The source tree now contains the reviewed standalone installer, updater,
 rollback, data-preserving uninstaller, and protected signed-byte release rail.
-The rail signs/notarizes before the real-model hardware gate and publishes only
-the exact gated binary through a complete draft release. It is not advertised
-as an install method yet: `https://hf2q.us/install.sh` remains unavailable
-until the credentialed rail, signed-byte hardware proof, exact public binary,
-and stable release record pass their installed-artifact gates.
+The rail builds a locked packed-source candidate, signs and notarizes its exact
+bytes, and publishes only that verified candidate through a complete draft
+release. Model/cache/performance qualification is separate and remains owned by
+the relevant model and serving decisions. The standalone channel is not
+advertised yet: `https://hf2q.us/install.sh` remains unavailable until the
+credentialed candidate, exact public binary, and stable release record pass
+their installed-artifact gates.
 Source/Cargo installs remain unmanaged by `hf2q update`.
 
 `hf2q setup` inventories the selected Apple-Silicon host and records defaults
@@ -534,8 +536,9 @@ serving and cannot replace hf2q's exact packed-artifact cache gate.
 
 The Qwen watchdog acceptance scripts are reproducible operator gates, not
 startup defaults. Existing receipts are causal local dependency-spike evidence;
-they are not final hf2q artifact authority. Release requires rerunning the same
-gates from a clean hf2q package resolving published `mlx-native 0.11.0`:
+they are not final hf2q distribution authority. Changes to those model or
+serving paths require rerunning the applicable gates from a clean hf2q package
+resolving published `mlx-native 0.11.0`:
 
 - `scripts/test_qwen36_prefill_watchdog.sh` enqueues the deterministic
   552-token SSE lane immediately before the public 87,972-token/347-tool lane,
@@ -556,13 +559,13 @@ gates from a clean hf2q package resolving published `mlx-native 0.11.0`:
   the restored checkpoint, and checks that an unrelated conversation cannot
   inherit private history. Run it once per process; never co-reside the large
   family artifacts on a 128 GiB host.
-- `scripts/run_agentic_cache_release_gate.sh` is the release wrapper used by
-  the manual `Cache lifecycle` workflow. It packages the exact main commit,
-  runs DeepSeek, Gemma, Qwen, and the Qwen3.8 short/long decode discriminator
-  sequentially under continuous AC and
+- `scripts/run_agentic_cache_release_gate.sh` is the model-qualification wrapper
+  used by the manual `Cache lifecycle` workflow. It consumes the exact signed
+  standalone candidate, runs DeepSeek, Gemma, Qwen, and the Qwen3.8 short/long
+  decode discriminator sequentially under continuous AC and
   `caffeinate` guards, verifies each GGUF against a protected SHA-256, and
-  emits a source/crate/binary/model-bound manifest that the publication
-  workflow must download and verify. Its calibrated four-slot Gemma waves run
+  emits a source/crate/binary/model-bound qualification manifest. Publication
+  does not consume that manifest. Its calibrated four-slot Gemma waves run
   before the long overlap/lifecycle soak, retain the default latency limits,
   and bind continuous Nominal thermal telemetry across every cold, cached,
   automatic-tool, and tool-result turn.

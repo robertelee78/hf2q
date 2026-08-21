@@ -611,6 +611,7 @@ jobs:
             scripts/render_standalone_installer.sh \
             scripts/render_standalone_release_record.sh \
             scripts/sign_notarize_standalone_release.sh \
+            scripts/verify_standalone_candidate.sh \
             scripts/test_standalone_installer.sh \
             scripts/test_standalone_release_signing_contract.sh \
             tests/completions.rs \
@@ -834,6 +835,7 @@ jobs:
             scripts/seal_release_binary.sh \
             scripts/test_release_binary_seal_contract.sh \
             scripts/sign_notarize_standalone_release.sh \
+            scripts/verify_standalone_candidate.sh \
             scripts/test_standalone_release_signing_contract.sh \
             scripts/verify_release_dependency_provenance.sh \
             scripts/test_release_dependency_provenance_contract.sh \

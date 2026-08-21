@@ -1,8 +1,9 @@
 # ADR-045: Frictionless distribution, updates, and guided onboarding
 
-- Status: Proposed; product scope corrected on 2026-08-20
+- Status: Proposed; product scope corrected on 2026-08-20 and release gate
+  simplified on 2026-08-21
 - Date: 2026-08-17
-- Updated: 2026-08-20
+- Updated: 2026-08-21
 - Owners: hf2q release engineering and operator experience
 - Related: `docs/shipping-contract.md`,
   `docs/adr/diary/ADR-005-inference-server.md`,
@@ -212,15 +213,21 @@ not sufficient: the measured local negative control accepted ad-hoc and Apple
 platform code unless the explicit notarized requirement was also present. The
 ZIP is not a product download.
 
-The exact-artifact workflow is deliberately three-stage. A no-secret job
-builds the locked packed-source candidate, a short protected `apple-release`
-job signs and notarizes it in an ephemeral keychain, and a no-secret
-Apple-Silicon hardware job runs the full cross-family gate against those exact
-signed bytes. The protected job invokes its signer only from the verified exact
-checkout and treats the unsigned and signed executables as data: it never runs
-candidate code while Apple credentials are present. Version execution belongs
-to the surrounding no-secret jobs. Only a successful exact-SHA gate may feed
-the release workflow.
+The distribution candidate workflow is deliberately short. A no-secret job
+builds the locked packed-source candidate, and a protected `apple-release` job
+signs and notarizes that exact input in an ephemeral keychain. The protected
+job invokes its signer only from the verified exact checkout and treats the
+unsigned and signed executables as data: it never runs candidate code while
+Apple credentials are present. The release workflow revalidates the packed
+crate, dependency provenance, exact unsigned-input binding, Developer ID
+identity, hardened runtime, minimum OS and architecture, accepted notary log,
+ticket CDHash, and signed executable bytes before publication.
+
+Model-family quality, cache, and performance qualification is independent. It
+may consume the same signed candidate and remains required when a governing
+model or serving ADR calls for it, but it does not authorize the CLI artifact
+and cannot block an otherwise unchanged distribution release because an
+unrelated model, runner workload, or performance environment is unavailable.
 That workflow assembles a complete draft, downloads and compares every asset,
 publishes the already-proven crate, then makes the complete GitHub release
 public and verifies its unauthenticated downloads and production-trust
@@ -524,11 +531,13 @@ continuation, and warm-versus-cold semantic replay. The warm direct
 continuation reused 297 of 374 prompt tokens and exactly matched the cold
 result.
 
-The protected cache-lifecycle and release workflows bind that accepted digest
-in source and require the runner's `QWEN38_MODEL_SHA256` setting to match it.
-The filesystem path remains runner-configurable, but a mutable repository
-variable cannot silently substitute the official upstream checkpoint or any
-other Qwen3.8 artifact for the guide's accepted abliterated checkpoint.
+The guide and its retained evidence bind that accepted digest. A separately
+dispatched model-qualification workflow may require the runner's
+`QWEN38_MODEL_SHA256` setting to match it, but routine CLI publication does not
+rerun or reinterpret this model proof. The filesystem path remains
+runner-configurable for qualification; a mutable repository variable cannot
+silently substitute another Qwen3.8 artifact for the guide's accepted
+community checkpoint.
 
 The first OpenCode spike also found and corrected one real documentation gap:
 OpenCode 1.18.18 rendered a 7,105-token agent prompt, which the default
@@ -644,7 +653,7 @@ published bytes.
 
 ## Current implementation truth
 
-As of 2026-08-20, ADR-045 remains **Proposed**.
+As of 2026-08-21, ADR-045 remains **Proposed**.
 
 What exists:
 
@@ -675,7 +684,7 @@ standalone lifecycle. The subsequent local implementation adds a canonical
 bounded stable-release record, exact size/SHA verification, same-Developer-ID
 continuity, release-time notarization proof, stable-version checks, and the same atomic
 publisher for install and update. The source tree now also contains the
-three-stage signed-byte release rail, ephemeral Apple credential handling,
+two-stage standalone-candidate rail, ephemeral Apple credential handling,
 accepted-notary proof receipt, immutable draft publication, exact public-byte
 verification, and a real-signature clean-prefix gate that runs the installed
 binary's noninteractive setup, revalidates its canonical config, and proves
@@ -690,7 +699,13 @@ proved the replacement boundary: the signed hf2q passed the combined online
 check plus `=notarized` requirement, while the local ad-hoc hf2q and `/bin/ls`
 failed the explicit requirement. The rail now verifies both that runtime check
 and the independently accepted notary log/exact CDHash; a new exact-byte run
-remains required before the channel becomes available.
+remains required before the channel becomes available. A subsequent attempt
+also demonstrated that coupling publication to the full cross-family model
+gate was a product error: unrelated compiler activity on the shared model
+runner invalidated a performance phase after signing and notarization had
+already succeeded. The rail is now split into a short standalone candidate
+workflow, the distribution release, and optional model qualification. Only the
+first two govern publication of unchanged CLI bytes.
 
 The unreachable second managed-session store, its runtime authorization, and
 the provisional session-cache setup field have been removed. `hf2q setup` does

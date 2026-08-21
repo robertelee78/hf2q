@@ -1,0 +1,276 @@
+name: Standalone candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact main-branch commit to build, sign, and notarize
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: standalone-candidate-${{ inputs.commit_sha }}
+  cancel-in-progress: false
+
+jobs:
+  build-release-candidate:
+    name: build exact packed Apple-Silicon candidate
+    runs-on: [self-hosted, macOS, ARM64, hf2q-gates]
+    timeout-minutes: 90
+    env:
+      EXPECTED_SHA: ${{ inputs.commit_sha }}
+      EXPECTED_VERSION: "0.1.7"
+      CARGO_TERM_COLOR: always
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable main identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          actual_sha=$(git rev-parse HEAD)
+          test "$actual_sha" = "$EXPECTED_SHA"
+          git fetch origin main
+          git merge-base --is-ancestor "$actual_sha" origin/main
+          git diff --exit-code
+
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.88.0"
+
+      - name: Package and build exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          if [[ ${MLX_NATIVE_SKIP_METALLIB+x} ]]; then
+            echo "MLX_NATIVE_SKIP_METALLIB is forbidden for exact-artifact builds" >&2
+            exit 1
+          fi
+          actual_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$actual_version" = "$EXPECTED_VERSION"
+          checkout_root=$(pwd -P)
+          cargo package --locked --no-verify
+          crate="$GITHUB_WORKSPACE/target/package/hf2q-${EXPECTED_VERSION}.crate"
+          test -s "$crate"
+          crate_sha=$(shasum -a 256 "$crate" | awk '{print $1}')
+
+          packed_build_root=$(mktemp -d "/private/var/tmp/hf2q-packed-build.XXXXXX")
+          printf 'PACKED_BUILD_ROOT=%s\n' "$packed_build_root" >> "$GITHUB_ENV"
+          cargo_home=$(mktemp -d "$RUNNER_TEMP/hf2q-packed-cargo-home.XXXXXX")
+          cargo_target=$(mktemp -d "$RUNNER_TEMP/hf2q-packed-target.XXXXXX")
+          provenance_stage=$(mktemp -d "$RUNNER_TEMP/hf2q-dependency-provenance.XXXXXX")
+          metadata_stage=$(mktemp -d "$RUNNER_TEMP/hf2q-metadata-stage.XXXXXX")
+          test -z "$(find "$cargo_home" -mindepth 1 -print -quit)"
+          /usr/bin/tar -xzf "$crate" -C "$packed_build_root"
+          package_root=$(cd "$packed_build_root/hf2q-${EXPECTED_VERSION}" && pwd -P)
+          trusted_verifier="$checkout_root/scripts/verify_release_dependency_provenance.sh"
+          cargo_env=(env)
+          while IFS='=' read -r variable_name _; do
+            case "$variable_name" in
+              RUSTUP_TOOLCHAIN|RUSTC|RUSTDOC|RUSTFLAGS|RUSTDOCFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_ENCODED_RUSTDOCFLAGS|RUSTC_*|RUSTDOC_*|CARGO_BUILD_*|CARGO_PROFILE_*|CARGO_TARGET_*)
+                cargo_env+=(-u "$variable_name")
+                ;;
+            esac
+          done < <(env)
+          cargo_env+=(CARGO_HOME="$cargo_home" CARGO_TARGET_DIR="$cargo_target" MACOSX_DEPLOYMENT_TARGET=14.0)
+          bash "$trusted_verifier" \
+            check-build-root "$package_root" "$checkout_root" \
+            "$cargo_home" "$cargo_target"
+          "${cargo_env[@]}" bash "$trusted_verifier" \
+            check-build-env "$cargo_home" "$cargo_target"
+          case "$package_root/" in
+            "$checkout_root/"*)
+              echo "packed build root must be outside checkout ancestry" >&2
+              exit 1
+              ;;
+          esac
+
+          (
+            cd "$package_root"
+            "${cargo_env[@]}" cargo metadata --locked --format-version 1 \
+              > "$metadata_stage/cargo-metadata.json"
+            bash "$trusted_verifier" capture \
+              "$package_root" "$metadata_stage/cargo-metadata.json" \
+              "$provenance_stage" "$checkout_root" "$cargo_home" \
+              "$cargo_target" true true "$crate_sha"
+            "${cargo_env[@]}" bash "$trusted_verifier" \
+              check-build-env "$cargo_home" "$cargo_target"
+            bash "$trusted_verifier" check-build-root \
+              "$package_root" "$checkout_root" "$cargo_home" "$cargo_target"
+            "${cargo_env[@]}" cargo build --release --locked
+            bash "$trusted_verifier" check-build-root \
+              "$package_root" "$checkout_root" "$cargo_home" "$cargo_target"
+          )
+          built_binary="$cargo_target/release/hf2q"
+          test -x "$built_binary"
+          test "$(/usr/bin/lipo -archs "$built_binary")" = arm64
+          test "$(/usr/bin/vtool -show-build "$built_binary" | awk '$1 == "minos" {print $2}')" = 14.0
+          test "$("$built_binary" --version)" = \
+            "hf2q $EXPECTED_VERSION"
+          built_sha=$(shasum -a 256 "$built_binary" | awk '{print $1}')
+
+          candidate_root="$RUNNER_TEMP/standalone-candidate-build-$EXPECTED_SHA"
+          test ! -e "$candidate_root"
+          mkdir -m 0700 "$candidate_root"
+          mkdir -m 0700 "$candidate_root/dependency-provenance"
+          cp "$built_binary" "$candidate_root/hf2q-unsigned"
+          chmod 0555 "$candidate_root/hf2q-unsigned"
+          cp "$crate" "$candidate_root/hf2q-${EXPECTED_VERSION}.crate"
+          cp -R "$provenance_stage/." "$candidate_root/dependency-provenance/"
+          jq -nS \
+            --arg source_sha "$EXPECTED_SHA" \
+            --arg version "$EXPECTED_VERSION" \
+            --arg crate_sha256 "$crate_sha" \
+            --arg binary_sha256 "$built_sha" \
+            '{kind:"hf2q.standalone-build-candidate",schema_version:1,source_sha:$source_sha,version:$version,target:"aarch64-apple-darwin",minimum_macos:"14.0",crate_sha256:$crate_sha256,unsigned_binary_sha256:$binary_sha256}' \
+            > "$candidate_root/build.json"
+          chmod 0444 "$candidate_root/build.json" \
+            "$candidate_root/hf2q-${EXPECTED_VERSION}.crate"
+          printf 'CANDIDATE_ROOT=%s\n' "$candidate_root" >> "$GITHUB_ENV"
+
+      - name: Upload unsigned exact candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: standalone-candidate-build-${{ inputs.commit_sha }}
+          path: ${{ env.CANDIDATE_ROOT }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Clean external packed build root
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed_build_root=${PACKED_BUILD_ROOT:-}
+          [[ -n "$packed_build_root" ]] || exit 0
+          case "$packed_build_root" in
+            /private/var/tmp/hf2q-packed-build.*)
+              suffix=${packed_build_root#/private/var/tmp/hf2q-packed-build.}
+              [[ -n "$suffix" && "$suffix" != */* ]] || exit 1
+              ;;
+            *)
+              echo "refusing unsafe packed-build cleanup: $packed_build_root" >&2
+              exit 1
+              ;;
+          esac
+          [[ -d "$packed_build_root" && ! -L "$packed_build_root" ]] || exit 0
+          rm -rf -- "$packed_build_root"
+
+  sign-release-candidate:
+    name: Developer ID sign and notarize exact candidate
+    needs: build-release-candidate
+    runs-on: macos-latest
+    environment: apple-release
+    timeout-minutes: 60
+    env:
+      EXPECTED_SHA: ${{ inputs.commit_sha }}
+      EXPECTED_VERSION: "0.1.7"
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable main identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git fetch origin main
+          git merge-base --is-ancestor "$EXPECTED_SHA" origin/main
+          git diff --exit-code
+
+      - name: Download exact build candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: standalone-candidate-build-${{ inputs.commit_sha }}
+          path: ${{ runner.temp }}/standalone-candidate-build
+
+      - name: Verify, sign, and notarize
+        shell: bash
+        env:
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ vars.APPLE_DEVELOPER_ID_APPLICATION }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_CODESIGN_IDENTIFIER: ${{ vars.APPLE_CODESIGN_IDENTIFIER }}
+        run: |
+          set -euo pipefail
+          build_root="$RUNNER_TEMP/standalone-candidate-build"
+          build_receipt="$build_root/build.json"
+          test -z "$(find "$build_root" -type l -print -quit)"
+          test "$(find "$build_root" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 4
+          jq -e \
+            --arg source_sha "$EXPECTED_SHA" \
+            --arg version "$EXPECTED_VERSION" '
+              .kind == "hf2q.standalone-build-candidate"
+              and .schema_version == 1
+              and .source_sha == $source_sha
+              and .version == $version
+              and .target == "aarch64-apple-darwin"
+              and .minimum_macos == "14.0"
+              and (.crate_sha256 | test("^[0-9a-f]{64}$"))
+              and (.unsigned_binary_sha256 | test("^[0-9a-f]{64}$"))
+            ' "$build_receipt" >/dev/null
+          unsigned="$build_root/hf2q-unsigned"
+          chmod 0555 "$unsigned"
+          test "$(shasum -a 256 "$unsigned" | awk '{print $1}')" = \
+            "$(jq -er .unsigned_binary_sha256 "$build_receipt")"
+          crate="$build_root/hf2q-${EXPECTED_VERSION}.crate"
+          test "$(shasum -a 256 "$crate" | awk '{print $1}')" = \
+            "$(jq -er .crate_sha256 "$build_receipt")"
+          signer="$GITHUB_WORKSPACE/scripts/sign_notarize_standalone_release.sh"
+          test -x "$signer"
+          test "$APPLE_CODESIGN_IDENTIFIER" = us.hf2q.cli
+          signed_stage="$RUNNER_TEMP/standalone-candidate-signed-$EXPECTED_SHA"
+          export APPLE_RELEASE_SECRET_DIRECTORY="$RUNNER_TEMP/hf2q-apple-release-secrets-$EXPECTED_SHA"
+          "$signer" \
+            "$unsigned" "$signed_stage" "$EXPECTED_VERSION" "$EXPECTED_SHA" \
+            "$APPLE_TEAM_ID" "$APPLE_CODESIGN_IDENTIFIER"
+
+      - name: Upload exact signed release candidate
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: standalone-candidate-signed-${{ inputs.commit_sha }}
+          path: ${{ runner.temp }}/standalone-candidate-signed-${{ inputs.commit_sha }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove Apple credential material
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          scratch="$RUNNER_TEMP/hf2q-apple-release-secrets-$EXPECTED_SHA"
+          case "$scratch" in
+            "$RUNNER_TEMP"/hf2q-apple-release-secrets-*) ;;
+            *) exit 1 ;;
+          esac
+          if [[ -e "$scratch/release.keychain-db" ]]; then
+            /usr/bin/security delete-keychain "$scratch/release.keychain-db" \
+              >/dev/null 2>&1 || true
+          fi
+          [[ ! -d "$scratch" || -L "$scratch" ]] || rm -rf -- "$scratch"

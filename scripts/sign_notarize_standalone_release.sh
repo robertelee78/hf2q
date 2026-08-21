@@ -37,6 +37,7 @@ fail() {
 [[ "$identifier" =~ ^[A-Za-z0-9.-]+$ ]] || fail "signing identifier is not canonical"
 [[ $(/usr/bin/lipo -archs "$input_binary" 2>/dev/null) == arm64 ]] || \
   fail "input is not an exact thin arm64 Mach-O"
+input_sha=$(sha256_file "$input_binary")
 
 signing_identity=${APPLE_DEVELOPER_ID_APPLICATION:?APPLE_DEVELOPER_ID_APPLICATION is required}
 p12_base64=${APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64:?APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 is required}
@@ -142,6 +143,8 @@ signing_fingerprint=$(grep -F -- "\"$signing_identity\"" <<<"$identities" | awk 
 
 /bin/cp "$input_binary" "$candidate"
 /bin/chmod 0755 "$candidate"
+[[ $(sha256_file "$candidate") == "$input_sha" ]] || \
+  fail "private signing copy changed the exact unsigned input"
 /usr/bin/codesign --force --sign "$signing_fingerprint" --keychain "$keychain" \
   --identifier "$identifier" --options runtime --timestamp "$candidate"
 /usr/bin/codesign --verify --strict --all-architectures --verbose=2 "$candidate"
@@ -229,6 +232,7 @@ notarization_check_log_sha=$(sha256_file "$notarization_check_log")
 jq -nS \
   --arg source_sha "$source_sha" \
   --arg version "$version" \
+  --arg unsigned_sha256 "$input_sha" \
   --arg asset_name "$asset_name" \
   --arg sha256 "$binary_sha" \
   --arg team_id "$team_id" \
@@ -249,6 +253,7 @@ jq -nS \
     target:"aarch64-apple-darwin",
     source_sha:$source_sha,
     version:$version,
+    input:{unsigned_sha256:$unsigned_sha256},
     asset:{name:$asset_name,size:$size,sha256:$sha256},
     signing:{
       authority:"Developer ID Application",

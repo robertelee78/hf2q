@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1003,SC2016
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SEAL_SCRIPT="$ROOT_DIR/scripts/seal_release_binary.sh"
-CACHE_WORKFLOW="$ROOT_DIR/.github/workflows/cache-lifecycle.yml"
-RELEASE_GATE="$ROOT_DIR/scripts/run_agentic_cache_release_gate.sh"
+STANDALONE_WORKFLOW="$ROOT_DIR/.github/workflows/standalone-candidate.yml"
+VERIFY_SCRIPT="$ROOT_DIR/scripts/verify_standalone_candidate.sh"
+RELEASE_WORKFLOW="$ROOT_DIR/.github/workflows/release.yml"
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/hf2q-release-binary-seal.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 
@@ -53,39 +55,21 @@ fi
 [[ ! -e "$wrong_destination" ]] || \
   fail "failed seal left a destination artifact"
 
-# shellcheck disable=SC2016
-grep -qF 'sealed_binary="$release_evidence/hf2q-aarch64-apple-darwin"' \
-  "$CACHE_WORKFLOW" || fail "cache workflow does not place the sealed binary outside Cargo target"
-# shellcheck disable=SC2016
-grep -qF '"$package_root/scripts/seal_release_binary.sh"' "$CACHE_WORKFLOW" || \
-  fail "cache workflow does not invoke the packaged binary sealer"
-# shellcheck disable=SC2016
-grep -qF '"$signed_binary" "$sealed_binary" "$binary_sha"' "$CACHE_WORKFLOW" || \
-  fail "cache workflow does not seal the signed candidate"
-grep -qF "printf 'HF2Q_BIN=%s\\n' \"\$sealed_binary\"" "$CACHE_WORKFLOW" || \
-  fail "cache workflow does not export the sealed binary"
-# shellcheck disable=SC2016
-grep -qF "printf 'EXPECTED_BINARY_SHA256=%s\\n' \"\$binary_sha\"" \
-  "$CACHE_WORKFLOW" || fail "cache workflow does not export the signed-candidate digest"
-# shellcheck disable=SC2016
-grep -qF 'EXPECTED_BINARY_SHA256="$EXPECTED_BINARY_SHA256"' "$CACHE_WORKFLOW" || \
-  fail "cache workflow does not pass the signed-candidate digest to the wrapper"
-
-awk '
-  /^start_server\(\)/ { in_start=1; next }
-  in_start && /assert_exact_binary/ { asserted=1 }
-  in_start && /ensure_guard_health/ { guarded=1; exit }
-  END { exit(asserted && guarded ? 0 : 1) }
-' "$RELEASE_GATE" || fail "release gate does not assert binary identity before model load"
-# shellcheck disable=SC2016
-grep -qF 'seal_release_binary.sh" --verify "$HF2Q_BIN" "$binary_sha"' \
-  "$RELEASE_GATE" || fail "release launch guard does not use the tested identity verifier"
-# shellcheck disable=SC2016
-grep -qF 'binary_sha=$EXPECTED_BINARY_SHA256' "$RELEASE_GATE" || \
-  fail "release wrapper does not keep signed-candidate digest authority"
-# shellcheck disable=SC2016
-if grep -qF 'binary_sha=$(sha256_file "$HF2Q_BIN")' "$RELEASE_GATE"; then
-  fail "release wrapper adopts the sealed path digest as new authority"
-fi
+# The standalone candidate freezes the packed-build bytes before signing, and
+# the release revalidates the signed artifact instead of rebuilding it.
+grep -qF 'cp "$built_binary" "$candidate_root/hf2q-unsigned"' \
+  "$STANDALONE_WORKFLOW" || \
+  fail "standalone workflow does not freeze the exact packed-build binary"
+grep -qF 'unsigned_binary_sha256:$binary_sha256' "$STANDALONE_WORKFLOW" || \
+  fail "standalone build receipt does not bind the unsigned binary digest"
+grep -qF 'name: standalone-candidate-signed-${{ inputs.commit_sha }}' \
+  "$STANDALONE_WORKFLOW" || \
+  fail "standalone workflow does not publish the signed candidate separately"
+grep -qF '[[ $(sha256_file "$binary") == "$binary_sha" ]]' "$VERIFY_SCRIPT" || \
+  fail "release verifier does not recheck the signed binary digest"
+grep -qF '.input.unsigned_sha256 == $unsigned_sha' "$VERIFY_SCRIPT" || \
+  fail "release verifier does not bind signed bytes to the packed input"
+grep -qF 'scripts/verify_standalone_candidate.sh \' "$RELEASE_WORKFLOW" || \
+  fail "release workflow does not consume the frozen signed candidate"
 
 echo "release binary seal contract: PASS"

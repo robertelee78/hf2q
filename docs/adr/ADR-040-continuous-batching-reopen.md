@@ -1490,13 +1490,12 @@ the owner, requires the queued retry to report substantial cached
 tokens, then reuses the arena for an unrelated exact-output conversation and
 rejects private-prefix-sized reuse or semantic leakage. Qwen, Gemma, and
 DeepSeek must each pass that unchanged gate from the exact packed artifact,
-one model process at a time, before this candidate is called release-worthy.
-The manual `.github/workflows/cache-lifecycle.yml` workflow is the executable
-authority for that requirement: it checks out an exact current-main SHA,
-packages it, builds from the extracted crate, copies the executable to an
-evidence path sealed outside Cargo's target directory, holds a `caffeinate`
-assertion, checks AC power continuously, and runs one large-model process at a
-time. In
+one model process at a time, before a change to this shared serving/cache path
+is called qualified. The manual `.github/workflows/cache-lifecycle.yml`
+workflow is the executable authority for that requirement: it consumes an
+exact packed, signed candidate from
+`.github/workflows/standalone-candidate.yml`, holds a `caffeinate` assertion,
+checks AC power continuously, and runs one large-model process at a time. In
 addition to the shared lifecycle, it runs Qwen's deterministic overlap,
 three cold four-agent waves, native heap series, and fresh one-slot disconnect;
 Gemma's long-prefill overlap/cancellation, four- and eight-slot transaction
@@ -1507,10 +1506,11 @@ crate SHA-256, binary SHA-256, protected GGUF SHA-256 values, every receipt
 digest, and the load-bearing result fields. Guard-process health and the
 visible `caffeinate` assertion are checked before and after every family and
 immediately before the manifest is sealed; the text-only Gemma lane explicitly
-disables any local-default projector. `.github/workflows/release.yml` requires
-a successful run at the same SHA, rehashes every downloaded receipt, validates
-the detailed family predicates, and requires the crate digest to equal the
-newly reproduced publication artifact before `cargo publish` can execute.
+disables any local-default projector. The manifest is model-qualification
+evidence, not standalone publication authority. `.github/workflows/release.yml`
+independently consumes and verifies the packed, signed, notarized candidate;
+it does not require the large-model workflow when those governed paths are
+unchanged.
 
 Exact-main run `31730699128` passed the complete DeepSeek and Gemma matrices,
 including both thermally guarded four-slot waves, the independently settled

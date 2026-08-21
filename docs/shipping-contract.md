@@ -88,10 +88,11 @@ Every Gemma change that could affect the forward pass or lm_head must pass
 | `sliding_wrap` common-byte-prefix with locked hf2q reference | ≥ 700 bytes |
 | Decode perf sanity on the sourdough prompt | ≥ 95 tok/s |
 
-Before the Unreleased 0.1.7 Qwen cache-lifecycle corrections may ship, every
-Qwen SlotAware serving change must additionally pass all of these gates
-from a clean packed artifact that resolves the published, checksum-pinned
-`mlx-native` dependency:
+Before a Qwen SlotAware serving change merges, it must additionally pass the
+applicable gates below from a clean packed artifact that resolves the
+published, checksum-pinned `mlx-native` dependency. The resulting evidence is
+authority for those model/serving bytes; an unchanged distribution-only
+descendant does not rerun it merely to publish the CLI:
 
 | Gate | Contract |
 |---|---|
