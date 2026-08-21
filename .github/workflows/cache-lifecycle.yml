@@ -33,7 +33,7 @@ jobs:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
       EXPECTED_VERSION: ${{ inputs.version }}
       EXPECTED_STANDALONE_CANDIDATE_RUN_ID: ${{ inputs.standalone_candidate_run_id }}
-      ACCEPTED_QWEN38_MODEL_SHA256: "d2ea096cf688ebb02a233ee19b66ade4dc48fdff543793c35631bc5e6291aaaf"
+      ACCEPTED_QWEN38_MODEL_SHA256: "1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a"
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout exact candidate

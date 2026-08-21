@@ -6,7 +6,8 @@ set -euo pipefail
 # long-context or release-artifact gate.
 
 BINARY_PATH=${BINARY_PATH:-/opt/hf2q/target/release/hf2q}
-MODEL_PATH=${MODEL_PATH:-/opt/hf2q/models/qwen3.8/Qwen3.8-27B-Q4_K_M.gguf}
+MODEL_PATH=${MODEL_PATH:-/opt/hf2q/models/qwen3.8/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf}
+MODEL_SHA256=${MODEL_SHA256:?MODEL_SHA256 is required}
 OUT_DIR=${OUT_DIR:?OUT_DIR is required and must be fresh}
 PORT=${PORT:-18084}
 MIN_CODE_IMPROVEMENT_PERCENT=${MIN_CODE_IMPROVEMENT_PERCENT:-5}
@@ -20,6 +21,8 @@ readonly CASES='code-a code-b code-c repeat-a repeat-b repeat-c'
 readonly TRIAL_ORDER='off auto auto off'
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/qwen36_watchdog_validate.sh
+source "$script_dir/qwen36_watchdog_validate.sh"
 
 for command in awk cmp curl find jq sed shasum sort stat; do
     command -v "$command" >/dev/null || {
@@ -33,6 +36,10 @@ done
 }
 [[ -f "$MODEL_PATH" ]] || {
     echo "Qwen3.8 model is missing: $MODEL_PATH" >&2
+    exit 2
+}
+[[ "$MODEL_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "MODEL_SHA256 must be a lowercase 64-character digest" >&2
     exit 2
 }
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT < 1 || PORT > 65535)); then
@@ -57,6 +64,28 @@ if [[ -e "$OUT_DIR" && -n "$(find "$OUT_DIR" -mindepth 1 -print -quit 2>/dev/nul
     exit 2
 fi
 mkdir -p "$OUT_DIR/requests"
+
+model_verification_receipt=${HF2Q_MODEL_VERIFICATION_RECEIPT:-}
+if [[ -z "$model_verification_receipt" ]]; then
+    if [[ -n ${HF2Q_MODEL_VERIFICATION_CACHE_DIR:-} ]]; then
+        model_verification_cache_dir=$HF2Q_MODEL_VERIFICATION_CACHE_DIR
+    elif [[ -n ${XDG_CACHE_HOME:-} ]]; then
+        model_verification_cache_dir="$XDG_CACHE_HOME/hf2q/model-verification"
+    else
+        model_verification_cache_dir="${HOME:?HOME is required when XDG_CACHE_HOME is unset}/.cache/hf2q/model-verification"
+    fi
+    model_verification_receipt="$OUT_DIR/model-verification.json"
+    hf2q_release_prepare_model_verification \
+        "$MODEL_PATH" "$MODEL_SHA256" "$model_verification_receipt" \
+        "$model_verification_cache_dir"
+    model_verification_mode=$(jq -er .run_verification \
+        "$model_verification_receipt")
+else
+    model_verification_mode=provided_receipt
+fi
+hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
+    "$model_verification_receipt"
+model_file_snapshot=$(jq -er .file_snapshot "$model_verification_receipt")
 
 sha256_file() {
     shasum -a 256 "$1" | awk '{print $1}'
@@ -273,13 +302,16 @@ if ((auto_proposals < 1 || auto_accepted < 1)); then
 fi
 
 binary_sha256=$(sha256_file "$BINARY_PATH")
-model_sha256=$(sha256_file "$MODEL_PATH")
+hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
+    "$model_verification_receipt"
 model_bytes=$(file_bytes "$MODEL_PATH")
 jq -n \
     --arg binary_path "$BINARY_PATH" \
     --arg binary_sha256 "$binary_sha256" \
     --arg model_path "$MODEL_PATH" \
-    --arg model_sha256 "$model_sha256" \
+    --arg model_sha256 "$MODEL_SHA256" \
+    --arg model_verification "$model_verification_mode" \
+    --arg model_file_snapshot "$model_file_snapshot" \
     --argjson model_bytes "$model_bytes" \
     --argjson max_tokens "$MAX_TOKENS" \
     --argjson decode_mvn "$DECODE_MVN" \
@@ -294,7 +326,8 @@ jq -n \
     --argjson auto_accepted_tokens "$auto_accepted" \
     '{schema:1,verdict:"pass",exact_choices_parity:true,
       binary:{path:$binary_path,sha256:$binary_sha256},
-      model:{path:$model_path,sha256:$model_sha256,bytes:$model_bytes},
+      model:{path:$model_path,sha256:$model_sha256,bytes:$model_bytes,
+             verification:$model_verification,file_snapshot:$model_file_snapshot},
       routing:{dense_decode_mvn:$decode_mvn,dense_decode_mv_ext:$decode_mv_ext},
       workload:{trial_order:"off auto auto off",cases_per_group_per_trial:3,
                 repetitions_per_mode:2,max_tokens:$max_tokens,temperature:0},

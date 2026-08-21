@@ -1767,7 +1767,9 @@ mod tests {
         let path = std::env::var_os("HF2Q_TEST_QWEN38_GGUF")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                std::path::PathBuf::from("/opt/hf2q/models/qwen3.8/Qwen3.8-27B-Q4_K_M.gguf")
+                std::path::PathBuf::from(
+                    "/opt/hf2q/models/qwen3.8/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf",
+                )
             });
         assert!(
             path.is_file(),

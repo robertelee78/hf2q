@@ -11,7 +11,9 @@
   A one-slot worker now uses the measured 4,096-token prefill quantum while
   multi-slot workers retain the 2,048-token fairness ceiling. The remaining
   single-user gap and true physical multi-slot batching remain performance
-  blockers.
+  blockers. Exact Qwen3.8 gates are bound to the paired abliterated text
+  artifact and reuse snapshot-bound model-verification receipts instead of
+  repeatedly scanning an unchanged multi-gigabyte GGUF.
 - Owners: hf2q conversion, quantization, inference, and serving
 
 ## Context
@@ -605,3 +607,31 @@ the current reference uses fixed depth three, and an unmerged adaptive-MTP
 change is not treated as shipped source truth. Split-K retuning and true
 packed TQ6/TQ5 storage remain downstream of the established bandwidth and
 occupancy regime.
+
+### Paired-artifact gate identity and verification lifecycle (2026-08-21)
+
+The automatic multimodal conversion superseded the earlier text-only
+Qwen3.8 gate artifact at the canonical model path. The accepted text GGUF is
+now the 16,810,714,944-byte output bound to its automatically produced
+projector, with SHA-256
+`1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a`.
+The paired 927,606,848-byte F16 projector has SHA-256
+`463b264713f8e081f0fae753c80d8089308e01b1e2ac0948dd9966d0711d8f1b`;
+these text-only performance gates do not pretend to exercise it.
+The focused speculation harness had retained the removed vanilla filename,
+while Cache lifecycle still accepted the preceding text-only abliterated
+digest. Both were contract drift: a default benchmark could target no file,
+and the release gate could not qualify the paired artifact now used by the
+product.
+
+The speculation and long-decode runners now use the shared one-time model
+verification protocol. A standalone run hashes content once, records the
+digest with the file's device, inode, size, modification time, and change
+time, and reuses that receipt only while the complete snapshot is unchanged.
+An enclosing release gate may pass its already-verified receipt. Every runner
+checks the snapshot again after inference, so avoiding a second content scan
+does not waive mutation detection. The speculation runner defaults only the
+paired path and requires the caller's expected digest, preventing a baked-in
+digest from silently drifting at the next artifact rotation. The model-free
+contract pins the paired path and release-gate digest, requires receipt use in
+both runners, and rejects any direct full-model `sha256_file` reread.
