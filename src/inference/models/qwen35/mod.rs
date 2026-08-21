@@ -69,9 +69,7 @@ pub mod model;
 pub mod moe;
 pub mod mtp;
 pub mod mtp_weights_load;
-#[cfg(test)]
 mod source_config;
-#[cfg(test)]
 pub(crate) mod source_precision;
 pub mod spec_decode;
 pub mod tokenizer;

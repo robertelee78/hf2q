@@ -6,6 +6,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::core::provenance::tensor_execution::ArtifactEvidence;
+#[cfg(test)]
 use crate::intelligence::calibration::VerifiedCalibrationPredictionPlan;
 
 use super::types::*;
@@ -16,9 +17,11 @@ mod stream;
 mod verify;
 
 pub(crate) use reservation::UnpublishedStructuralTeacherTargetReservation;
+#[cfg(test)]
+pub(crate) use stream::StructuralTeacherTargetPreflight;
 pub(crate) use stream::{
-    preflight_structural_teacher_target, StructuralTeacherTargetPreflight,
-    StructuralTeacherTargetStream, UnpublishedStructuralTeacherTargetArtifact,
+    preflight_structural_teacher_target, StructuralTeacherTargetStream,
+    UnpublishedStructuralTeacherTargetArtifact,
 };
 
 #[cfg(test)]
@@ -242,6 +245,7 @@ fn digest_to_array(value: &str) -> Result<[u8; 32], ExactTeacherTargetError> {
 /// Write and independently reread a bounded target artifact supplied by an
 /// arbitrary logit source. The returned type is structural only and therefore
 /// cannot authorize sensitivity or allocation.
+#[cfg(test)]
 pub(crate) fn write_structural_teacher_target_artifact<LF, GF>(
     plan: &VerifiedCalibrationPredictionPlan,
     output: &Path,

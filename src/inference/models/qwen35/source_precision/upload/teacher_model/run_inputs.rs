@@ -30,13 +30,16 @@ use crate::intelligence::exact_teacher::{
 };
 
 use super::{
-    observe_capacity, prepare_qwen35_source_teacher, validate_incremental_capacity,
-    PreparedQwen35SourceTeacherV1, Qwen35SourceTeacherLimitsV1,
+    combined_capacity_preflight, observe_capacity, prepare_qwen35_source_teacher, runtime_envelope,
+    validate_incremental_capacity, PreparedQwen35SourceTeacherV1,
+    Qwen35SourceTeacherCapacityPreflightV1, Qwen35SourceTeacherLimitsV1,
 };
 
 #[cfg(test)]
 mod tests;
 mod worker;
+
+pub(crate) use worker::run_qwen35_source_teacher;
 
 const RUN_INPUTS_SCHEMA_VERSION: u32 = 1;
 const RUN_INPUTS_PROFILE: &str = "dense_qwen35_source_teacher_ordered_run_inputs_v1";
@@ -159,10 +162,12 @@ pub(crate) struct PreparedQwen35SourceTeacherRunInputsV1 {
 }
 
 impl PreparedQwen35SourceTeacherRunInputsV1 {
+    #[cfg(test)]
     pub(crate) fn catalog_sha256(&self) -> &str {
         &self.receipt.run_inputs_catalog_sha256
     }
 
+    #[cfg(test)]
     pub(crate) fn receipt_sha256(&self) -> &str {
         &self.receipt.run_inputs_receipt_sha256
     }
@@ -188,6 +193,34 @@ pub(crate) fn prepare_qwen35_source_teacher_run_inputs(
             prepare_qwen35_source_teacher(topology, device, upload_limits, teacher_limits)
         },
         prepare_cache_from_teacher,
+    )
+}
+
+/// Observe the exact combined preparation requirement without allocating
+/// source weights or cache state. The production transition independently
+/// re-observes and revalidates immediately before allocation.
+pub(crate) fn preflight_qwen35_source_teacher_run_inputs_capacity(
+    work: &StructurallyBoundQwen35SourceTeacherWorkV1,
+    device: &MlxDevice,
+    upload_limits: QwenSourceMetalUploadLimits,
+    preparation_policy: Qwen35SourceTeacherPreparationPolicyV1,
+) -> Result<Qwen35SourceTeacherCapacityPreflightV1> {
+    let (topology, expected_work) = work.preparation_parts();
+    let config = topology.projected_config_for_teacher()?;
+    let limits = Qwen35SourceTeacherLimitsV1 {
+        max_sequence_tokens: u32::try_from(expected_work.max_cache_tokens)
+            .context("source teacher cache work is not representable")?,
+        max_target_rows: u32::try_from(expected_work.prediction_row_count)
+            .context("source teacher target rows are not representable")?,
+        max_cpu_control_mirror_bytes: preparation_policy.max_cpu_control_mirror_bytes,
+        unmeasured_runtime_reserve_bytes: preparation_policy.unmeasured_runtime_reserve_bytes,
+    };
+    let runtime = runtime_envelope(&config, limits)?;
+    combined_capacity_preflight(
+        topology.planned_output_bytes()?,
+        &runtime,
+        upload_limits,
+        observe_capacity(device),
     )
 }
 

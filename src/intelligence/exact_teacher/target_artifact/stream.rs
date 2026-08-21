@@ -149,6 +149,7 @@ impl<'a> StructuralTeacherTargetPreflight<'a> {
         self.preflight_bytes
     }
 
+    #[cfg(test)]
     pub(crate) fn begin(
         self,
         output: &Path,
@@ -366,6 +367,7 @@ impl StructuralTeacherTargetStream<'_> {
     /// Compatibility transition for structural-only callers. Family-owned
     /// execution builds its completion receipt between `finish_unpublished`
     /// and `publish_noclobber` instead.
+    #[cfg(test)]
     pub(crate) fn finish(
         self,
     ) -> Result<StructurallyVerifiedTeacherTargetArtifact, ExactTeacherTargetError> {
@@ -388,7 +390,7 @@ impl UnpublishedStructuralTeacherTargetArtifact {
         })?;
         Ok(StructurallyVerifiedTeacherTargetArtifact {
             receipt,
-            file,
+            _file: file,
             path: output,
         })
     }

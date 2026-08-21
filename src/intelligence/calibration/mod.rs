@@ -11,7 +11,9 @@ mod prediction_plan;
 mod render;
 mod types;
 
+#[cfg(test)]
 pub(crate) use corpus::verify_calibration_corpus_artifact;
+pub(crate) use corpus::verify_embedded_calibration_corpus_artifact;
 pub use manifest::{build_structured_dataset_manifest, validate_structured_dataset_manifest};
 pub use partition::verify_dataset_partition;
 pub(crate) use prediction_plan::build_teacher_prediction_plan;

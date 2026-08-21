@@ -18,6 +18,11 @@ use super::upload_transform::{upload_source, UploadedTensorBuffer};
 mod teacher_model;
 
 pub(in crate::inference::models::qwen35) use teacher_model::SourceTeacherCacheAuthorization;
+pub(crate) use teacher_model::{
+    preflight_qwen35_source_teacher_run_inputs_capacity, prepare_qwen35_source_teacher_run_inputs,
+    run_qwen35_source_teacher, Qwen35SourceTeacherCapacityPreflightV1,
+    Qwen35SourceTeacherPreparationPolicyV1,
+};
 const UPLOAD_SCHEMA_VERSION: u32 = 1;
 const UPLOAD_PROFILE: &str = "dense_qwen35_source_bf16_host_verified_metal_upload_v1";
 
@@ -102,18 +107,22 @@ pub(crate) struct VerifiedQwen35Bf16MetalUploadV1 {
 }
 
 impl VerifiedQwen35Bf16MetalUploadV1 {
+    #[cfg(test)]
     pub(crate) fn catalog_sha256(&self) -> &str {
         &self.receipt.catalog_sha256
     }
 
+    #[cfg(test)]
     pub(crate) fn receipt_sha256(&self) -> &str {
         &self.receipt.receipt_sha256
     }
 
+    #[cfg(test)]
     pub(crate) fn output_tensor_count(&self) -> usize {
         self.receipt.preflight.output_tensor_count
     }
 
+    #[cfg(test)]
     pub(crate) fn total_output_bytes(&self) -> u64 {
         self.receipt.preflight.total_output_bytes
     }

@@ -32,6 +32,18 @@ phrases such as "production constructor" or "production entrypoint" in the
 staged sections mean production-shaped internal validation logic, not a
 compiled or supported operator surface.
 
+### 2026-08-21 source-teacher operator promotion
+
+The hidden, fixed-profile `source-teacher` command described below is the
+explicit operator root required by the compilation-boundary clarification.
+Its landing promotes only the authenticated calibration, exact-target,
+source-precision, base-text-cache, and fixed source-graph-scope chain that the
+command consumes. Copied-GGML execution evidence, Dynamic frontier search,
+selector/autoquant activation, and replay remain outside the production
+boundary. The crate-wide warning denial remains unchanged, and unused
+compatibility helpers stay `cfg(test)` rather than crossing the release
+boundary or acquiring warning allowances.
+
 ## Context
 
 hf2q has three surfaces that have been called "auto" but do not form one
@@ -1285,6 +1297,60 @@ sensitivity, Dynamic/selector/autoquant admission, cross-process replay, or
 DWQ. The real 27B Apple run, matched external-reference parity, reproducible
 resource measurement, and downstream one-option-at-a-time sensitivity remain
 required before the wider D3/D4 policy stages can consume this lane.
+
+The official-model gate uses one sealed, hidden operator command rather than
+requiring a caller to reconstruct the preceding opaque authorities. `hf2q
+source-teacher --model-dir <dir> --output <fresh>` authenticates the embedded
+`qwen38-27b-official-v1` recipe, derives the source tensor inventory, constructs
+a teacher-only partition, renders the pinned corpus with the authenticated
+tokenizer/template, proves three-way partition separation, admits the exact
+source topology, binds the completed work, dry-runs the no-clobber target
+reservation, and reports the combined capacity observation. This mode creates
+ordinary bounded CPU state and private directory entries, but performs no
+model-weight or Metal-buffer allocation. `--execute` is the explicit gate that
+consumes the same sealed work through the existing upload, cache, one-shot
+worker, completion receipt, and publish-last transition; capacity is observed
+and checked again immediately before the first weight allocation.
+
+The evidence profile is itself an exact embedded artifact,
+`qwen38_source_teacher_canary_v1`, SHA-256
+`9f8fe69a79a5348f847e67e0dd1b5b45f6ed98f1b6735690484c77d19b6334cb`.
+It pins source revision and recipe identity, the exact Calibration,
+PolicyValidation, and AcceptanceHoldout artifact hashes, renderer and token
+bounds, target/work/upload bounds, the 8 GiB host reserve, 8 GiB Metal reserve,
+and 8 GiB unmeasured-runtime allowance. It explicitly records
+`canary_only=true`, `dynamic_calibration_sufficient=false`, source BF16 with F32
+controls, and false vision/MTP/TQ/Q4/DWQ execution. The four small owned examples
+exercise a completed tool-call/tool-result transcript, a generation prompt,
+ordinary review text, and a held-out generation prompt. They are an official
+runner canary, not a claim of adequate Dynamic calibration or acceptance
+coverage.
+
+Hugging Face cache snapshots use symlink directory entries, while B1's retained
+source boundary intentionally requires regular no-follow leaves. The operator
+therefore creates a fresh private flat view containing hard links to the
+resolved recipe payloads, then authenticates that view and lets B1 retain its
+directory and file descriptors. No tensor payload is copied. Every recipe leaf
+must be safe, the source and link must be the same regular inode and exact
+length, and the complete recipe/inventory/snapshot hashing chain runs after
+linking. The private names may then disappear while the retained descriptors
+continue to own authority. A pathname or cache mutation can only fail a later
+hash/identity check.
+
+For this teacher-only bridge every non-vision text tensor is `Protected`, MTP
+remains protected and nonexecuted, and exact `model.visual.*` inputs are
+`Excluded`. There are no caller-authored variable allocation units. This is
+deliberately not the future D3b one-option-at-a-time partition: inventing those
+atomic groups here would bind unmeasured sensitivity semantics into the source
+teacher's identity. The command's stdout JSON is a sanitized operational
+summary of hashes, exact work counts, the point-in-time capacity observation,
+phase wall times, and (after execution) target/completion hashes. Timings and
+capacity are observational single-run fields, not a benchmark, reservation,
+or peak-memory proof. The summary is not a deserializable teacher capability or
+cross-process replay receipt. The command never exports the opaque family
+authority and drops it before returning; the published target and stdout
+summary therefore record historical completion evidence but cannot replay or
+reconstruct that authority.
 
 Completing D3a for the official model now requires the pinned 27B Apple run and
 matched source-reference validation through this family-owned path; an F32

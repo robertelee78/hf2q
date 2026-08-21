@@ -9,6 +9,7 @@
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::path::Path;
 
 use crate::intelligence::calibration::{
     RenderMode, TeacherPredictionPointKind, VerifiedCalibrationPredictionPlan,
@@ -104,6 +105,49 @@ impl StructurallyBoundQwen35SourceTeacherWorkV1 {
 
     pub(crate) fn max_cache_tokens(&self) -> usize {
         self.receipt.expected_work.max_cache_tokens
+    }
+
+    pub(crate) fn example_count(&self) -> usize {
+        self.receipt.expected_work.example_count
+    }
+
+    pub(crate) fn prediction_row_count(&self) -> usize {
+        self.receipt.expected_work.prediction_row_count
+    }
+
+    pub(crate) fn input_tokens_processed(&self) -> u64 {
+        self.receipt.expected_work.input_tokens_processed
+    }
+
+    pub(crate) fn output_head_evaluation_count(&self) -> u64 {
+        self.receipt.expected_work.output_head_evaluation_count
+    }
+
+    pub(crate) fn target_artifact_bytes(&self) -> u64 {
+        self.receipt.expected_work.target_artifact_bytes
+    }
+
+    pub(super) fn preparation_parts(
+        &self,
+    ) -> (
+        &VerifiedQwen35Bf16TopologyV1,
+        Qwen35SourceTeacherExpectedWorkV1,
+    ) {
+        (&self.topology, self.receipt.expected_work)
+    }
+
+    /// Exercise the exact no-clobber target reservation and immediately drop
+    /// the private temp. This is a destination dry-run only; the consuming
+    /// production transition reserves again before weight allocation.
+    pub(crate) fn preflight_target_destination(&self, output: &Path) -> Result<()> {
+        let reservation = preflight_structural_teacher_target(
+            &self.prediction_plan,
+            self.receipt.vocabulary_size,
+            self.receipt.target_limits,
+        )?
+        .reserve(output)?;
+        reservation.validate_private()?;
+        Ok(())
     }
 
     pub(super) fn into_parts(

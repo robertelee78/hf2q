@@ -37,6 +37,73 @@ fn capacity(extra: u64) -> QwenSourceMetalCapacityV1 {
     }
 }
 
+#[test]
+fn combined_capacity_preflight_reports_exact_boundary_without_allocating() -> Result<()> {
+    let runtime = Qwen35SourceTeacherRuntimeEnvelopeV1 {
+        max_sequence_tokens: 32,
+        max_target_rows: 16,
+        base_full_attention_cache_bytes: 40,
+        base_linear_attention_state_bytes: 50,
+        max_input_activation_bytes: 30,
+        one_logit_row_bytes: 20,
+        target_payload_upper_bound_bytes: 320,
+        cpu_control_mirror_bytes: 60,
+        accounted_runtime_payload_bytes: 200,
+        unmeasured_runtime_reserve_bytes: 300,
+    };
+    let limits = QwenSourceMetalUploadLimits {
+        host_reserve_bytes: 11,
+        metal_reserve_bytes: 13,
+        ..upload_limits()
+    };
+    let planned_weight_bytes = 100;
+    let accounted = planned_weight_bytes + 4 * 1024 * 1024 + 200 + 300;
+    let exact = QwenSourceMetalCapacityV1 {
+        host_available_bytes: accounted + 11,
+        metal_recommended_working_set_bytes: accounted + 13 + 17,
+        metal_current_allocated_bytes: 17,
+        metal_max_buffer_bytes: 16 * 1024 * 1024 * 1024,
+    };
+    let accepted = combined_capacity_preflight(planned_weight_bytes, &runtime, limits, exact)?;
+    assert!(accepted.eligible);
+    assert_eq!(accepted.host_required_bytes, accounted + 11);
+    assert_eq!(accepted.metal_required_bytes, accounted + 13);
+    assert_eq!(accepted.metal_available_bytes, accounted + 13);
+
+    let host_short = combined_capacity_preflight(
+        planned_weight_bytes,
+        &runtime,
+        limits,
+        QwenSourceMetalCapacityV1 {
+            host_available_bytes: exact.host_available_bytes - 1,
+            ..exact
+        },
+    )?;
+    assert!(!host_short.eligible);
+    let metal_short = combined_capacity_preflight(
+        planned_weight_bytes,
+        &runtime,
+        limits,
+        QwenSourceMetalCapacityV1 {
+            metal_recommended_working_set_bytes: exact.metal_recommended_working_set_bytes - 1,
+            ..exact
+        },
+    )?;
+    assert!(!metal_short.eligible);
+    assert!(validate_combined_capacity(planned_weight_bytes, &runtime, limits, exact).is_ok());
+    assert!(validate_combined_capacity(
+        planned_weight_bytes,
+        &runtime,
+        limits,
+        QwenSourceMetalCapacityV1 {
+            host_available_bytes: exact.host_available_bytes - 1,
+            ..exact
+        }
+    )
+    .is_err());
+    Ok(())
+}
+
 fn upload(
     device: &MlxDevice,
     observed: QwenSourceMetalCapacityV1,

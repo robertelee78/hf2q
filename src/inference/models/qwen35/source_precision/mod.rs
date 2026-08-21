@@ -9,6 +9,7 @@
 //! sensitivity, performance, allocator, selector, or autoquant authority.
 
 mod header;
+mod operator;
 mod retained_io;
 mod scope;
 mod snapshot;
@@ -21,9 +22,27 @@ mod upload;
 mod upload_plan;
 mod upload_transform;
 
-pub(crate) use snapshot::{open_verified_qwen_source_snapshot, VerifiedQwenSourceSnapshot};
+pub(crate) use operator::{
+    preflight_official_qwen38_source_teacher, run_official_qwen38_source_teacher,
+    OfficialQwen38SourceTeacherRequestV1,
+};
+pub(crate) use snapshot::open_verified_qwen_source_snapshot;
+#[cfg(test)]
+pub(crate) use snapshot::VerifiedQwenSourceSnapshot;
+pub(crate) use teacher_execution_plan::{
+    preflight_qwen35_source_teacher_execution, Qwen35SourceTeacherRunLimitsV1,
+    StructurallyBoundQwen35SourceTeacherWorkV1,
+};
+pub(crate) use topology::{admit_qwen35_bf16_topology, VerifiedQwen35Bf16TopologyV1};
+#[cfg(test)]
 pub(crate) use types::QwenSourceSnapshotLimits;
 pub(in crate::inference::models::qwen35) use upload::SourceTeacherCacheAuthorization;
+pub(crate) use upload::{
+    preflight_qwen35_source_teacher_run_inputs_capacity, prepare_qwen35_source_teacher_run_inputs,
+    run_qwen35_source_teacher, Qwen35SourceTeacherCapacityPreflightV1,
+    Qwen35SourceTeacherPreparationPolicyV1,
+};
+pub(crate) use upload_plan::QwenSourceMetalUploadLimits;
 
 #[cfg(test)]
 mod tests;

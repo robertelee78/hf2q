@@ -205,7 +205,7 @@ fn streaming_writer_matches_callback_writer_and_rejects_incomplete_or_reordered_
     let streaming = unpublished.publish_noclobber().unwrap();
     assert!(streaming_path.exists());
     let named_metadata = std::fs::metadata(&streaming_path).unwrap();
-    let retained_metadata = streaming.file.metadata().unwrap();
+    let retained_metadata = streaming._file.metadata().unwrap();
     assert_eq!(named_metadata.dev(), retained_metadata.dev());
     assert_eq!(named_metadata.ino(), retained_metadata.ino());
 
@@ -385,7 +385,7 @@ fn retained_target_file_is_not_redirected_by_final_path_replacement() {
         |_request| Ok(vec![0; 32]),
     )
     .unwrap();
-    let retained_metadata = artifact.file.metadata().unwrap();
+    let retained_metadata = artifact._file.metadata().unwrap();
     std::fs::rename(&output, temp.path().join("moved.bin")).unwrap();
     std::fs::write(&output, b"replacement").unwrap();
     let replacement_metadata = std::fs::metadata(&output).unwrap();

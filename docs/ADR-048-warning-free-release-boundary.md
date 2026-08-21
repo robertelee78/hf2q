@@ -103,6 +103,25 @@ Specifically:
 6. `[lints.rust] warnings = "deny"` is crate policy. A new hf2q warning is a
    build failure in developer, CI, test, and release profiles.
 
+### ADR-046 source-teacher reconciliation
+
+The original boundary above was correct at `c9443b15`: the completed internal
+transaction had no command or API root. ADR-046's subsequent hidden,
+fixed-profile `source-teacher` operator changes that reachability fact without
+changing this ADR's governing rule. The release binary now compiles the exact
+authenticated calibration, exact-target, Qwen source-precision,
+base-text-cache, and fixed source-graph-scope chain consumed by that command.
+The production source scope freezes its graph switches and rejects GGML or
+fused-quantized dispatch; it does not restore copied-GGML policy or trace
+machinery.
+
+Everything not reachable from that operator stays on the original boundary:
+copied-execution evidence and trace capture, Dynamic frontier search and its
+calibration adapter, selector/autoquant activation, compatibility writers,
+and replay remain test-only or unavailable. No Cargo feature or warning
+allowance is used. This is the smallest promotion consistent with both the
+new product root and warning-free release builds.
+
 Three integration harnesses path-include deliberately wider source/stub modules
 because the required internals are not library exports. Their test-module
 boundaries use narrow `expect(dead_code)` declarations with reasons. Unlike an

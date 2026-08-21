@@ -20,7 +20,9 @@ use crate::inference::models::qwen35::gpu_ffn::DenseFfnWeightsGpu;
 use crate::inference::models::qwen35::gpu_full_attn::FullAttnWeightsGpu;
 use crate::inference::models::qwen35::{Qwen35Config, Qwen35LayerKind};
 
-use super::{observe_capacity, upload_with_capacity, VerifiedQwen35Bf16MetalUploadV1};
+#[cfg(test)]
+use super::VerifiedQwen35Bf16MetalUploadV1;
+use super::{observe_capacity, upload_with_capacity};
 use crate::inference::models::qwen35::source_precision::topology::VerifiedQwen35Bf16TopologyV1;
 use crate::inference::models::qwen35::source_precision::upload_plan::QwenSourceMetalCapacityV1;
 use crate::inference::models::qwen35::source_precision::upload_plan::QwenSourceMetalUploadLimits;
@@ -37,13 +39,14 @@ mod tests;
 
 const PREPARED_SCHEMA_VERSION: u32 = 1;
 const PREPARED_PROFILE: &str = "dense_qwen35_source_bf16_prepared_text_graph_v1";
-pub(crate) use preflight::Qwen35SourceTeacherLimitsV1;
 use preflight::{
-    runtime_envelope, validate_combined_capacity, validate_incremental_capacity,
-    Qwen35SourceTeacherRuntimeEnvelopeV1,
+    combined_capacity_preflight, runtime_envelope, validate_combined_capacity,
+    validate_incremental_capacity, Qwen35SourceTeacherRuntimeEnvelopeV1,
 };
+pub(crate) use preflight::{Qwen35SourceTeacherCapacityPreflightV1, Qwen35SourceTeacherLimitsV1};
 pub(crate) use run_inputs::{
-    prepare_qwen35_source_teacher_run_inputs, Qwen35SourceTeacherPreparationPolicyV1,
+    preflight_qwen35_source_teacher_run_inputs_capacity, prepare_qwen35_source_teacher_run_inputs,
+    run_qwen35_source_teacher, Qwen35SourceTeacherPreparationPolicyV1,
 };
 pub(in crate::inference::models::qwen35) use runner::SourceTeacherCacheAuthorization;
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -180,18 +183,22 @@ pub(crate) struct PreparedQwen35SourceTeacherV1 {
 }
 
 impl PreparedQwen35SourceTeacherV1 {
+    #[cfg(test)]
     pub(crate) fn graph_catalog_sha256(&self) -> &str {
         &self.receipt.graph_catalog_sha256
     }
 
+    #[cfg(test)]
     pub(crate) fn preparation_receipt_sha256(&self) -> &str {
         &self.receipt.preparation_receipt_sha256
     }
 
+    #[cfg(test)]
     pub(crate) fn layer_count(&self) -> usize {
         self.layers.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn accounted_runtime_payload_bytes(&self) -> u64 {
         self.receipt.runtime.accounted_runtime_payload_bytes
     }
@@ -298,6 +305,7 @@ pub(crate) fn prepare_qwen35_source_teacher(
 /// B2b type-state as a promotable path, but its capacity check can cover only
 /// the incremental runtime envelope because the weight allocation already
 /// exists. New callers should prefer [`prepare_qwen35_source_teacher`].
+#[cfg(test)]
 pub(crate) fn prepare_uploaded_qwen35_source_teacher(
     upload: VerifiedQwen35Bf16MetalUploadV1,
     teacher_limits: Qwen35SourceTeacherLimitsV1,
@@ -364,6 +372,7 @@ where
     assemble::assemble(upload, config, runtime)
 }
 
+#[cfg(test)]
 fn prepare_uploaded_with_capacity(
     upload: VerifiedQwen35Bf16MetalUploadV1,
     teacher_limits: Qwen35SourceTeacherLimitsV1,

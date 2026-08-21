@@ -161,6 +161,7 @@ impl VerifiedQwen35Bf16TopologyV1 {
         &self.topology_sha256
     }
 
+    #[cfg(test)]
     pub(crate) fn source_count(&self) -> usize {
         self.records.len()
     }
