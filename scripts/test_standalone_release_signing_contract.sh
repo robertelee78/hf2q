@@ -47,6 +47,17 @@ grep -Fq '"${original_user_keychains[@]}" >/dev/null 2>&1 || true' \
   "$SIGN_SCRIPT" || \
   fail "signing cleanup does not restore the original user keychain search list"
 
+runtime_flag_pattern='^CodeDirectory .* flags=0x[0-9a-f]+\(runtime\)( |$)'
+grep -Fq "grep -Eq '$runtime_flag_pattern'" "$SIGN_SCRIPT" || \
+  fail "signing script does not inspect runtime flags in the CodeDirectory line"
+valid_codesign_metadata='CodeDirectory v=20500 size=123 flags=0x10000(runtime) hashes=42+7 location=embedded'
+grep -Eq "$runtime_flag_pattern" <<<"$valid_codesign_metadata" || \
+  fail "runtime verifier rejected Apple's CodeDirectory output shape"
+invalid_codesign_metadata='CodeDirectory v=20500 size=123 flags=0x0(none) hashes=42+7 location=embedded'
+if grep -Eq "$runtime_flag_pattern" <<<"$invalid_codesign_metadata"; then
+  fail "runtime verifier accepted a signature without hardened runtime"
+fi
+
 if grep -En 'stapler[[:space:]]+staple' "$SIGN_SCRIPT"; then
   fail "standalone Mach-O must not claim an unsupported stapled ticket"
 fi

@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Read the macOS-reported performance-level count during setup instead of
   assuming every Apple Silicon host exposes exactly two levels.
+
+### Fixed
+
+- Validate the Developer ID hardened-runtime flag at its actual location in
+  Apple's `codesign --display --verbose=4` `CodeDirectory` line.
 - Keep shell-completion installation explicit through
   `hf2q completions --shell <shell>`; ordinary CLI startup no longer writes
   completion registrations or shell startup files.
