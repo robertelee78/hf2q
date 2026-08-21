@@ -386,3 +386,26 @@ pub(crate) fn prediction_plan_for_test_bound_with_first_prefix(
     validate_teacher_prediction_plan(&plan.manifest).unwrap();
     plan
 }
+
+#[cfg(test)]
+pub(crate) fn prediction_plan_for_test_bound_with_gap(
+    source: crate::intelligence::measured_auto_quant::SourceIdentity,
+    verified_source_manifest_sha256: String,
+) -> VerifiedCalibrationPredictionPlan {
+    let mut plan = prediction_plan_for_test_bound(source, verified_source_manifest_sha256);
+    let tokens = &mut plan.examples[0].token_ids;
+    tokens.push(2);
+    let last_index = tokens.len() - 1;
+    plan.manifest.examples[0].token_count = tokens.len();
+    plan.manifest.total_token_count += 1;
+    plan.manifest.prediction_points[1].kind = TeacherPredictionPointKind::TeacherForced {
+        target_token_index: last_index,
+        target_token_id: tokens[last_index],
+    };
+    plan.manifest.prediction_points[1].prefix_token_count = last_index;
+    plan.manifest.prediction_points[1].prefix_token_ids_sha256 =
+        prefix_token_sha256(&tokens[..last_index]).unwrap();
+    plan.manifest.manifest_sha256 = prediction_plan_sha256(&plan.manifest).unwrap();
+    validate_teacher_prediction_plan(&plan.manifest).unwrap();
+    plan
+}

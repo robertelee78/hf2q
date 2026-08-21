@@ -1190,15 +1190,87 @@ a peak-memory or liveness proof. Official 27B execution, full one-shot
 completion, route/performance evidence, target authority, sensitivity,
 Dynamic/selector/autoquant admission, and DWQ remain out of scope.
 
-Completing D3a requires a family-owned, bounded source-precision dense-Qwen
-runner that consumes authenticated source tensors without the production
-Q4_0 attention/Delta/output repacks, explicitly completes execution, and wraps
-the retained target artifact in an opaque authority. The intended real-model
-route is streaming BF16-to-Metal with exact family-defined semantic transforms
-and lossless layout changes; an F32
-GGUF/CPU run remains a tiny-model oracle or an explicitly preflighted small
-model path. D3b then materializes exactly one D1 atomic option at a time and
-computes full-distribution KL, top-1, and trajectory metrics. The transferable
+The first authority-bearing B3b runner now closes that deliberately test-only
+boundary with one consuming family transaction. Its only entrypoint accepts
+the sealed run-input owner by value and moves the authenticated prediction
+plan, retained source snapshot, prepared BF16/F32 graph, base-text cache, and
+private target reservation onto a fresh named worker thread. The source graph
+scope supplies a non-Clone, non-`Send`, lifetime-bound token. Both the raw-cache
+transition and every source call require that token, so neither state can be
+detached from the canonical tagged thread-local policy. The worker cannot be
+resumed or used as a generic logit callback, and no model, cache, Metal buffer,
+target stream, or logit row escapes it.
+
+V1 makes each hf2q source-path command buffer a checked synchronous completion
+point. This is intentionally slower than serving: mlx-native 0.10.16 does not
+retain an error ledger for earlier asynchronous command buffers after their
+handles are dropped, so a later empty wait alone cannot truthfully authorize
+their status. Synchronous completion also keeps every local activation and
+scratch owner alive through the corresponding Metal work even when native
+retained references are disabled. The final output head still materializes
+only one F32 vocabulary row. The worker retains the session outside its
+`catch_unwind` boundary; a returned error or Rust panic poisons the session and
+performs a same-queue terminal drain before cache, weights, thread-local
+scratch, or the private target may be dropped. A failed drain cannot mint
+completion. Process aborts and foreign Objective-C exceptions are not claimed
+recoverable.
+
+Execution follows the retained plan exactly. Every example receives a
+fallible fresh base-cache reset. A completed transcript prefills its first
+scored prefix once, advances one ground-truth token for every subsequent
+prefix—including unscored gaps—and evaluates the output head only at retained
+prediction points. A generation prompt evaluates and stores its one required
+row, uses that row's canonical finite, lowest-token-ID-on-tie argmax as greedy
+token zero, then performs exactly 31 one-token continuations for a 32-token
+trajectory. Observed examples, resets, calls, input tokens, output-head
+evaluations, terminal call completions, rows, trajectories, and cache
+high-water must exactly equal the pre-upload work record. A second canonical
+schedule hash binds every actual stable ID, position, input token, and
+emit/advance decision; after target finalization it is independently
+reconstructed from the retained plan and stored trajectory.
+
+After all calls complete, the worker terminally drains again while the private
+target stream remains live, verifies the exact counters, finishes the
+structural target under its private name, verifies the exact schedule,
+rehashes the same retained config/shard descriptors, drops the GPU graph/cache,
+and constructs a non-deserializable family completion receipt.
+That receipt joins the work, topology, plan, projected config, prepared graph,
+cache, target reservation, source snapshot, graph policy, exact structural
+receipt/artifact, device, and expected/observed work. It records source BF16
+projections with F32 controls and base-text F32 cache, checked synchronous
+source commits, and explicit `q4=false`, `ggml=false`, `dwq=false`, `tq=false`,
+`mtp_executed=false`, and `vision_executed=false`. The worker returns only a
+completed-but-unpublished private owner. Its caller joins the worker and then
+performs the existing descriptor-relative no-replace rename as the final
+fallible operation; only the infallible post-rename wrapper creates the opaque
+completed authority. That authority retains the exact source snapshot, opaque
+prediction plan, and published target inode.
+
+The non-skipping Apple authority gate drives the finite authenticated H256
+Delta-plus-full-attention fixture through the complete production entrypoint.
+For the canonical two-example plan it checks exactly 34 calls, 64 processed
+input tokens, 34 output-head evaluations, three full-vocabulary rows, cache
+high-water 47, and one 32-token trajectory. All rows and the trajectory match
+the BF16-derived CPU oracle with identical top-1 and row maximum absolute error
+at most `5e-3`. A separate gapped transcript proves 35 forwards but only 34
+head evaluations and three rows. Persistent retained-source mutation rejects,
+an injected panic after a real completed call drains and publishes nothing,
+and a destination created after worker join remains byte-exact when the final
+no-replace publication rejects.
+
+This is bounded, process-local source-teacher target authority, not official
+Qwen3.8-27B acceptance. The receipt deliberately does not claim a complete
+native kernel route, allocator or peak-memory proof, timing/performance,
+sensitivity, Dynamic/selector/autoquant admission, cross-process replay, or
+DWQ. The real 27B Apple run, matched external-reference parity, reproducible
+resource measurement, and downstream one-option-at-a-time sensitivity remain
+required before the wider D3/D4 policy stages can consume this lane.
+
+Completing D3a for the official model now requires the pinned 27B Apple run and
+matched source-reference validation through this family-owned path; an F32
+GGUF/CPU run remains only a tiny-model oracle or an explicitly preflighted
+small-model comparison. D3b then materializes exactly one D1 atomic option at
+a time and computes full-distribution KL, top-1, and trajectory metrics. The transferable
 Unsloth lessons are multi-domain native-template calibration, heterogeneous
 precision, separate tuning/validation/holdout data, and full-distribution plus
 trajectory gates—not an unpublished selector algorithm. No DWQ, learned

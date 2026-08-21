@@ -4,9 +4,9 @@
 //! upload plus bounded-runtime capacity check before the first Metal weight
 //! allocation, uploads through B2b, and drains every uploaded node into the
 //! exact dense-Qwen layer slots. The resulting production type is
-//! intentionally inert: it has no buffer accessor and no forward/session
-//! constructor. A `cfg(test)`-only child harness borrows its private fields for
-//! the bounded numerical wiring gate.
+//! intentionally opaque: it has no buffer accessor or general-purpose forward
+//! method. The only production execution transition consumes the sealed
+//! run-input owner in the family-owned one-shot worker.
 
 #[cfg(test)]
 use anyhow::ensure;
@@ -29,9 +29,7 @@ mod assemble;
 mod layers;
 mod preflight;
 mod run_inputs;
-#[cfg(test)]
 mod runner;
-#[cfg(test)]
 mod runner_io;
 
 #[cfg(test)]
@@ -45,9 +43,11 @@ use preflight::{
     Qwen35SourceTeacherRuntimeEnvelopeV1,
 };
 pub(crate) use run_inputs::{
-    prepare_qwen35_source_teacher_run_inputs, PreparedQwen35SourceTeacherRunInputsV1,
-    Qwen35SourceTeacherPreparationPolicyV1,
+    prepare_qwen35_source_teacher_run_inputs, run_qwen35_source_teacher,
+    PreparedQwen35SourceTeacherRunInputsV1, Qwen35SourceTeacherPreparationPolicyV1,
+    VerifiedQwen35SourceTeacherTargetV1,
 };
+pub(in crate::inference::models::qwen35) use runner::SourceTeacherCacheAuthorization;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct Qwen35SourceTeacherConfigV1 {

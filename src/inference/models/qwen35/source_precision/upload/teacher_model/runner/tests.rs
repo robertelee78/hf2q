@@ -23,7 +23,7 @@ fn spec(name: impl Into<String>, shape: &[usize]) -> TensorSpec {
     }
 }
 
-fn h256_fixture(
+pub(in crate::inference::models::qwen35::source_precision::upload::teacher_model) fn h256_fixture(
 ) -> crate::inference::models::qwen35::source_precision::topology_tests::TopologyFixture {
     finite_bf16_fixture(|config, specs| {
         *config = serde_json::json!({
@@ -132,7 +132,9 @@ fn f32_values(buffer: &MlxBuffer) -> Vec<f32> {
     buffer.as_slice::<f32>().unwrap().to_vec()
 }
 
-fn cpu_model(teacher: &PreparedQwen35SourceTeacherV1) -> Qwen35Model {
+pub(in crate::inference::models::qwen35::source_precision::upload::teacher_model) fn cpu_model(
+    teacher: &PreparedQwen35SourceTeacherV1,
+) -> Qwen35Model {
     let mut model = Qwen35Model::empty_from_cfg(teacher.config.clone());
     model.token_embd = bf16_values(&teacher.embedding);
     model.output_norm = f32_values(&teacher.output_norm);
@@ -195,7 +197,10 @@ fn cpu_model(teacher: &PreparedQwen35SourceTeacherV1) -> Qwen35Model {
     model
 }
 
-fn last_cpu_logits(model: &Qwen35Model, tokens: &[u32]) -> Vec<f32> {
+pub(in crate::inference::models::qwen35::source_precision::upload::teacher_model) fn last_cpu_logits(
+    model: &Qwen35Model,
+    tokens: &[u32],
+) -> Vec<f32> {
     let positions: Vec<[i32; 4]> = (0..tokens.len())
         .map(|position| [position as i32; 4])
         .collect();
@@ -316,44 +321,52 @@ fn source_teacher_private_runner_matches_cpu_for_prefill_and_cached_decode() {
                 std::thread::current().name(),
                 Some("hf2q-qwen35-source-teacher-test")
             );
-            let mut session =
-                PrivateSourceTeacherParitySessionV1::new(teacher, prepared_cache).unwrap();
-            let fresh_cursor = session.cache.full_attn[0].current_len.clone();
-            let fresh_parity = session.cache.linear_attn[0].pp_flipped.clone();
-            assert!(session.run_call(&prefix[..15]).is_err());
-            assert_eq!(session.cache.full_attn[0].current_len, fresh_cursor);
-            assert_eq!(session.cache.linear_attn[0].pp_flipped, fresh_parity);
-            assert!(
-                !session.poisoned,
-                "preflight rejection poisoned the session"
-            );
-            let prefill = session.run_call(&prefix).unwrap();
-            assert_eq!(prefill.graph_policy_sha256.len(), 64);
-            assert_logits(
-                &prefill.logits,
-                &last_cpu_logits(&model, &prefix),
-                "prefill",
-            );
+            crate::inference::models::qwen35::execution_dispatch::with_source_teacher_graph_scope(
+                |scope| {
+                    let mut session = SourceTeacherSessionV1::new(scope, teacher, prepared_cache)?;
+                    let fresh_cursor = session.cache.cache.full_attn[0].current_len.clone();
+                    let fresh_parity = session.cache.cache.linear_attn[0].pp_flipped.clone();
+                    assert!(session.run_call(&prefix[..15], true).is_err());
+                    assert_eq!(session.cache.cache.full_attn[0].current_len, fresh_cursor);
+                    assert_eq!(session.cache.cache.linear_attn[0].pp_flipped, fresh_parity);
+                    assert!(
+                        !session.poisoned,
+                        "preflight rejection poisoned the session"
+                    );
+                    let prefill = session.run_call(&prefix, true)?.unwrap();
+                    assert_eq!(prefill.graph_policy_sha256.len(), 64);
+                    assert_logits(
+                        &prefill.logits,
+                        &last_cpu_logits(&model, &prefix),
+                        "prefill",
+                    );
 
-            let decode = session.run_call(&[next]).unwrap();
-            assert_eq!(
-                prefill.graph_policy_sha256, decode.graph_policy_sha256,
-                "prefill/decode did not share the canonical source graph policy"
-            );
-            assert_logits(&decode.logits, &last_cpu_logits(&model, &full), "decode");
-            assert_eq!(session.cache.full_attn[0].current_len.as_slice(), &[17]);
-            assert!(!session.cache.linear_attn[0].pp_flipped[0]);
+                    let decode = session.run_call(&[next], true)?.unwrap();
+                    assert_eq!(
+                        prefill.graph_policy_sha256, decode.graph_policy_sha256,
+                        "prefill/decode did not share the canonical source graph policy"
+                    );
+                    assert_logits(&decode.logits, &last_cpu_logits(&model, &full), "decode");
+                    assert_eq!(
+                        session.cache.cache.full_attn[0].current_len.as_slice(),
+                        &[17]
+                    );
+                    assert!(!session.cache.cache.linear_attn[0].pp_flipped[0]);
 
-            session.cache.full_attn[0].current_len[0] = 16;
-            let cursor_before = session.cache.full_attn[0].current_len.clone();
-            let parity_before = session.cache.linear_attn[0].pp_flipped.clone();
-            assert!(session.run_call(&[7]).is_err());
-            assert_eq!(session.cache.full_attn[0].current_len, cursor_before);
-            assert_eq!(session.cache.linear_attn[0].pp_flipped, parity_before);
-            assert!(
-                !session.poisoned,
-                "preflight rejection poisoned the session"
-            );
+                    session.cache.cache.full_attn[0].current_len[0] = 16;
+                    let cursor_before = session.cache.cache.full_attn[0].current_len.clone();
+                    let parity_before = session.cache.cache.linear_attn[0].pp_flipped.clone();
+                    assert!(session.run_call(&[7], true).is_err());
+                    assert_eq!(session.cache.cache.full_attn[0].current_len, cursor_before);
+                    assert_eq!(session.cache.cache.linear_attn[0].pp_flipped, parity_before);
+                    assert!(
+                        !session.poisoned,
+                        "preflight rejection poisoned the session"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
         })
         .unwrap()
         .join()

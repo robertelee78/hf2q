@@ -154,3 +154,17 @@ fn metal_cache_is_fresh_base_text_only_and_receipt_bound() {
     prepared.cache.full_attn[0].current_len[0] = 1;
     assert!(validate_fresh_cache(&prepared.cache, &config, &device, &prepared.receipt).is_err());
 }
+
+#[test]
+fn production_cache_consumption_has_no_family_wide_raw_borrow_api() {
+    let cache_source = include_str!("source_teacher.rs");
+    let runner_source = include_str!("../source_precision/upload/teacher_model/runner.rs");
+    assert!(cache_source.contains("SourceTeacherCacheAuthorization<'_>"));
+    assert!(!cache_source.contains("fn cache(&self) -> &HybridKvCache"));
+    assert!(!cache_source.contains("fn cache_mut(&mut self) -> &mut HybridKvCache"));
+    assert!(runner_source.contains("struct SourceTeacherExecutionCacheV1<'scope>"));
+    assert!(!runner_source
+        .contains("pub(in crate::inference::models::qwen35) struct SourceTeacherExecutionCacheV1"));
+    assert!(runner_source.contains("struct SourceTeacherCacheAuthorization<'scope>"));
+    assert!(runner_source.contains("_private: ()"));
+}

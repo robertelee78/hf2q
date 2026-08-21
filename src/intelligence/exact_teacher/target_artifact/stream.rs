@@ -191,7 +191,7 @@ impl StructuralTeacherTargetStream<'_> {
         &mut self,
         point: &TeacherPredictionPointReceipt,
         logits: &[f32],
-    ) -> Result<(), ExactTeacherTargetError> {
+    ) -> Result<u32, ExactTeacherTargetError> {
         let expected = self
             .plan
             .manifest()
@@ -269,7 +269,7 @@ impl StructuralTeacherTargetStream<'_> {
             top_k,
             logsumexp_f64_bits,
         });
-        Ok(())
+        Ok(argmax_token_id)
     }
 
     pub(crate) fn write_trajectory(

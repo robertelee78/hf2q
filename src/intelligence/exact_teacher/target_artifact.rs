@@ -164,6 +164,27 @@ fn row_summary(
     Ok((argmax_token_id, top, logsumexp.to_bits()))
 }
 
+/// Canonical finite-logit argmax shared by structural row summaries and the
+/// family-owned greedy trajectory. Equal numeric values, including signed
+/// zero, resolve to the lowest token id.
+pub(crate) fn canonical_teacher_argmax(logits: &[f32]) -> Result<u32, ExactTeacherTargetError> {
+    if logits.is_empty() || logits.iter().any(|value| !value.is_finite()) {
+        return Err(ExactTeacherTargetError::Invalid(
+            "teacher logits must be non-empty and finite".into(),
+        ));
+    }
+    let mut best_id = 0usize;
+    let mut best = logits[0];
+    for (token_id, value) in logits.iter().copied().enumerate().skip(1) {
+        if value > best {
+            best = value;
+            best_id = token_id;
+        }
+    }
+    u32::try_from(best_id)
+        .map_err(|_| ExactTeacherTargetError::Invalid("argmax token id overflow".into()))
+}
+
 fn trajectory_sha256(tokens: &[u32]) -> Result<String, ExactTeacherTargetError> {
     let count = u64::try_from(tokens.len())
         .map_err(|_| ExactTeacherTargetError::Invalid("trajectory length overflow".into()))?;
@@ -242,7 +263,7 @@ where
             point,
             prefix_token_ids,
         })?;
-        stream.write_row(point, &logits)
+        stream.write_row(point, &logits).map(|_| ())
     })?;
     plan.visit_greedy_prompts(|prompt, prompt_token_ids| {
         let token_ids = greedy_for(TeacherGreedyRequest {

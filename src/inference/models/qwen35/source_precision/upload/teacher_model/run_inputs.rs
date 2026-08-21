@@ -1,10 +1,11 @@
-//! Ordered ownership boundary for a future completed source-teacher run.
+//! Ordered ownership boundary for a completed source-teacher transaction.
 //!
 //! This module consumes the source-bound work capability, reserves the target
 //! destination before weight allocation, prepares the exact source weights,
 //! then attaches a fresh base-text-only cache from the prepared teacher's own
 //! device/config. The result is intentionally inert and exposes no graph,
-//! cache, buffer, target writer, or execution method.
+//! cache, buffer, target writer, or execution method; the family worker can
+//! only consume the whole owner once.
 
 use std::path::Path;
 
@@ -35,6 +36,9 @@ use super::{
 
 #[cfg(test)]
 mod tests;
+mod worker;
+
+pub(crate) use worker::{run_qwen35_source_teacher, VerifiedQwen35SourceTeacherTargetV1};
 
 const RUN_INPUTS_SCHEMA_VERSION: u32 = 1;
 const RUN_INPUTS_PROFILE: &str = "dense_qwen35_source_teacher_ordered_run_inputs_v1";
