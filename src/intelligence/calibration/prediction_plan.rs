@@ -1,4 +1,4 @@
-//! Opaque, bounded prediction plans derived from the verified Calibration split.
+//! Opaque, bounded prediction plans derived from a verified evaluation split.
 
 use sha2::{Digest, Sha256};
 
@@ -25,18 +25,27 @@ fn prefix_token_sha256(tokens: &[u32]) -> Result<String, CalibrationInputError> 
 }
 
 /// Reverify the three-way split, then derive every teacher-forced and
-/// generation-next point from the opaque Calibration token stream.
-/// Policy-validation and acceptance-holdout token ids are never retained in
-/// the returned capability.
-pub(crate) fn build_teacher_prediction_plan(
+/// generation-next point from one explicitly selected characterization split.
+/// Acceptance-holdout token ids are never retained by this constructor.
+pub(crate) fn build_teacher_characterization_plan(
     expected_partition: &DatasetPartitionManifest,
-    calibration_corpus: &VerifiedCalibrationCorpus,
+    evaluation_split: DatasetSplit,
+    evaluation_corpus: &VerifiedCalibrationCorpus,
+    evaluation: &RenderedDataset,
     calibration: &RenderedDataset,
     policy_validation: &RenderedDataset,
     acceptance_holdout: &RenderedDataset,
     limits: TeacherPredictionPlanLimits,
-) -> Result<VerifiedCalibrationPredictionPlan, CalibrationInputError> {
+) -> Result<VerifiedTeacherPredictionPlan, CalibrationInputError> {
     validate_prediction_plan_limits(limits)?;
+    if !matches!(
+        evaluation_split,
+        DatasetSplit::Calibration | DatasetSplit::PolicyValidation
+    ) {
+        return Err(CalibrationInputError::InvalidDataset(
+            "characterization plans cannot open AcceptanceHoldout".into(),
+        ));
+    }
     let actual_partition = super::partition::verify_dataset_partition(
         calibration,
         policy_validation,
@@ -45,21 +54,21 @@ pub(crate) fn build_teacher_prediction_plan(
     if &actual_partition != expected_partition {
         return Err(CalibrationInputError::SplitMismatch);
     }
-    let rendered_structured = serde_json::to_vec(&calibration.structured)
+    let rendered_structured = serde_json::to_vec(&evaluation.structured)
         .map_err(|error| CalibrationInputError::Serialization(error.to_string()))?;
-    let corpus_structured = serde_json::to_vec(&calibration_corpus.manifest)
+    let corpus_structured = serde_json::to_vec(&evaluation_corpus.manifest)
         .map_err(|error| CalibrationInputError::Serialization(error.to_string()))?;
     if rendered_structured != corpus_structured {
         return Err(CalibrationInputError::InvalidDataset(
-            "rendered Calibration split differs from its owned corpus artifact".into(),
+            "rendered evaluation split differs from its owned corpus artifact".into(),
         ));
     }
-    validate_rendered_dataset(calibration)?;
-    if calibration.manifest.split != DatasetSplit::Calibration
-        || calibration.manifest.examples.len() > limits.max_examples
+    validate_rendered_dataset(evaluation)?;
+    if evaluation.manifest.split != evaluation_split
+        || evaluation.manifest.examples.len() > limits.max_examples
     {
         return Err(CalibrationInputError::InvalidDataset(
-            "teacher prediction plan admits only a bounded Calibration split".into(),
+            "teacher prediction plan evaluation split or bound is invalid".into(),
         ));
     }
 
@@ -67,15 +76,15 @@ pub(crate) fn build_teacher_prediction_plan(
     let mut total_rendered_utf8_bytes = 0u64;
     let mut points = Vec::new();
     let mut greedy_prompts = Vec::new();
-    let mut example_receipts = Vec::with_capacity(calibration.manifest.examples.len());
-    let mut retained = Vec::with_capacity(calibration.manifest.examples.len());
-    for (receipt, structured) in calibration
+    let mut example_receipts = Vec::with_capacity(evaluation.manifest.examples.len());
+    let mut retained = Vec::with_capacity(evaluation.manifest.examples.len());
+    for (receipt, structured) in evaluation
         .manifest
         .examples
         .iter()
-        .zip(&calibration.structured.examples)
+        .zip(&evaluation.structured.examples)
     {
-        let tokens = calibration
+        let tokens = evaluation
             .token_ids
             .get(&receipt.stable_id)
             .ok_or_else(|| {
@@ -100,7 +109,7 @@ pub(crate) fn build_teacher_prediction_plan(
                 "teacher prediction total-token bound exceeded".into(),
             ));
         }
-        let rendered_len = calibration
+        let rendered_len = evaluation
             .rendered_utf8
             .get(&receipt.stable_id)
             .ok_or_else(|| {
@@ -113,17 +122,17 @@ pub(crate) fn build_teacher_prediction_plan(
         total_rendered_utf8_bytes = total_rendered_utf8_bytes
             .checked_add(u64::try_from(rendered_len).map_err(|_| {
                 CalibrationInputError::InvalidDataset(
-                    "rendered Calibration byte count is not representable".into(),
+                    "rendered evaluation byte count is not representable".into(),
                 )
             })?)
             .ok_or_else(|| {
                 CalibrationInputError::InvalidDataset(
-                    "rendered Calibration byte count overflow".into(),
+                    "rendered evaluation byte count overflow".into(),
                 )
             })?;
         if total_rendered_utf8_bytes > limits.max_rendered_utf8_bytes {
             return Err(CalibrationInputError::InvalidDataset(
-                "rendered Calibration byte bound exceeded".into(),
+                "rendered evaluation byte bound exceeded".into(),
             ));
         }
 
@@ -206,24 +215,32 @@ pub(crate) fn build_teacher_prediction_plan(
             greedy_prompt_ordinal,
         });
     }
-    if points.is_empty() || greedy_prompts.is_empty() {
+    let has_teacher_forced = points
+        .iter()
+        .any(|point| matches!(point.kind, TeacherPredictionPointKind::TeacherForced { .. }));
+    let split_shape_valid = match evaluation_split {
+        DatasetSplit::Calibration => has_teacher_forced && !greedy_prompts.is_empty(),
+        DatasetSplit::PolicyValidation => has_teacher_forced,
+        DatasetSplit::AcceptanceHoldout => unreachable!("rejected above"),
+    };
+    if points.is_empty() || !split_shape_valid {
         return Err(CalibrationInputError::InvalidDataset(
-            "teacher prediction plan requires scored transcript points and a generation prompt"
-                .into(),
+            "teacher prediction plan does not satisfy its split-specific point contract".into(),
         ));
     }
 
     let mut manifest = TeacherPredictionPlanManifest {
         schema_version: TEACHER_PREDICTION_PLAN_SCHEMA_VERSION,
-        source: calibration.manifest.source.clone(),
-        verified_source_manifest_sha256: calibration
+        source: evaluation.manifest.source.clone(),
+        verified_source_manifest_sha256: evaluation
             .manifest
             .verified_source_manifest_sha256
             .clone(),
         dataset_partition_manifest_sha256: actual_partition.manifest_sha256,
-        calibration_corpus_artifact_sha256: calibration_corpus.artifact.sha256.clone(),
-        calibration_manifest_sha256: calibration.manifest.manifest_sha256.clone(),
-        rendered_token_stream_sha256: calibration.manifest.token_id_stream_sha256.clone(),
+        evaluation_split,
+        evaluation_corpus_artifact_sha256: evaluation_corpus.artifact.sha256.clone(),
+        evaluation_manifest_sha256: evaluation.manifest.manifest_sha256.clone(),
+        rendered_token_stream_sha256: evaluation.manifest.token_id_stream_sha256.clone(),
         limits,
         total_example_count: retained.len(),
         total_token_count,
@@ -235,7 +252,7 @@ pub(crate) fn build_teacher_prediction_plan(
     };
     manifest.manifest_sha256 = prediction_plan_sha256(&manifest)?;
     validate_teacher_prediction_plan(&manifest)?;
-    Ok(VerifiedCalibrationPredictionPlan {
+    Ok(VerifiedTeacherPredictionPlan {
         manifest,
         examples: retained,
     })
@@ -252,7 +269,7 @@ pub(super) fn resign_prediction_plan_for_test(manifest: &mut TeacherPredictionPl
 }
 
 #[cfg(test)]
-pub(crate) fn prediction_plan_for_test() -> VerifiedCalibrationPredictionPlan {
+pub(crate) fn prediction_plan_for_test() -> VerifiedTeacherPredictionPlan {
     let limits = TeacherPredictionPlanLimits {
         max_examples: 2,
         max_total_tokens: 64,
@@ -327,8 +344,9 @@ pub(crate) fn prediction_plan_for_test() -> VerifiedCalibrationPredictionPlan {
         },
         verified_source_manifest_sha256: "5".repeat(64),
         dataset_partition_manifest_sha256: "a".repeat(64),
-        calibration_corpus_artifact_sha256: "f".repeat(64),
-        calibration_manifest_sha256: "b".repeat(64),
+        evaluation_split: DatasetSplit::Calibration,
+        evaluation_corpus_artifact_sha256: "f".repeat(64),
+        evaluation_manifest_sha256: "b".repeat(64),
         rendered_token_stream_sha256: "c".repeat(64),
         limits,
         total_example_count: 2,
@@ -341,7 +359,7 @@ pub(crate) fn prediction_plan_for_test() -> VerifiedCalibrationPredictionPlan {
     };
     manifest.manifest_sha256 = prediction_plan_sha256(&manifest).unwrap();
     validate_teacher_prediction_plan(&manifest).unwrap();
-    VerifiedCalibrationPredictionPlan {
+    VerifiedTeacherPredictionPlan {
         manifest,
         examples: vec![
             TeacherPredictionExample {
@@ -359,10 +377,40 @@ pub(crate) fn prediction_plan_for_test() -> VerifiedCalibrationPredictionPlan {
 }
 
 #[cfg(test)]
+pub(crate) fn policy_prediction_plan_for_test() -> VerifiedTeacherPredictionPlan {
+    let mut plan = prediction_plan_for_test();
+    plan.manifest.evaluation_split = DatasetSplit::PolicyValidation;
+    plan.manifest.evaluation_corpus_artifact_sha256 = "e".repeat(64);
+    plan.manifest.evaluation_manifest_sha256 = "d".repeat(64);
+    plan.manifest.examples.truncate(1);
+    plan.manifest.prediction_points.truncate(2);
+    plan.manifest.greedy_prompts.clear();
+    plan.examples.truncate(1);
+    plan.manifest.total_example_count = 1;
+    plan.manifest.total_token_count = plan.examples[0].token_ids.len();
+    plan.manifest.manifest_sha256 = prediction_plan_sha256(&plan.manifest).unwrap();
+    validate_teacher_prediction_plan(&plan.manifest).unwrap();
+    plan
+}
+
+#[cfg(test)]
+pub(crate) fn policy_prediction_plan_for_test_bound(
+    source: crate::intelligence::measured_auto_quant::SourceIdentity,
+    verified_source_manifest_sha256: String,
+) -> VerifiedTeacherPredictionPlan {
+    let mut plan = policy_prediction_plan_for_test();
+    plan.manifest.source = source;
+    plan.manifest.verified_source_manifest_sha256 = verified_source_manifest_sha256;
+    plan.manifest.manifest_sha256 = prediction_plan_sha256(&plan.manifest).unwrap();
+    validate_teacher_prediction_plan(&plan.manifest).unwrap();
+    plan
+}
+
+#[cfg(test)]
 pub(crate) fn prediction_plan_for_test_bound(
     source: crate::intelligence::measured_auto_quant::SourceIdentity,
     verified_source_manifest_sha256: String,
-) -> VerifiedCalibrationPredictionPlan {
+) -> VerifiedTeacherPredictionPlan {
     let mut plan = prediction_plan_for_test();
     plan.manifest.source = source;
     plan.manifest.verified_source_manifest_sha256 = verified_source_manifest_sha256;
@@ -376,7 +424,7 @@ pub(crate) fn prediction_plan_for_test_bound_with_first_prefix(
     source: crate::intelligence::measured_auto_quant::SourceIdentity,
     verified_source_manifest_sha256: String,
     first_prefix_token_count: usize,
-) -> VerifiedCalibrationPredictionPlan {
+) -> VerifiedTeacherPredictionPlan {
     let mut plan = prediction_plan_for_test_bound(source, verified_source_manifest_sha256);
     let tokens = &plan.examples[0].token_ids;
     plan.manifest.prediction_points[0].kind = TeacherPredictionPointKind::TeacherForced {
@@ -395,7 +443,7 @@ pub(crate) fn prediction_plan_for_test_bound_with_first_prefix(
 pub(crate) fn prediction_plan_for_test_bound_with_gap(
     source: crate::intelligence::measured_auto_quant::SourceIdentity,
     verified_source_manifest_sha256: String,
-) -> VerifiedCalibrationPredictionPlan {
+) -> VerifiedTeacherPredictionPlan {
     let mut plan = prediction_plan_for_test_bound(source, verified_source_manifest_sha256);
     let tokens = &mut plan.examples[0].token_ids;
     tokens.push(2);

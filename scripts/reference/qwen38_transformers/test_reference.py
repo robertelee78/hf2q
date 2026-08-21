@@ -151,6 +151,50 @@ class ReferenceArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "teacher-forced target"):
             REFERENCE.validate_reference_input(reference_input)
 
+    def test_policy_validation_executes_rows_without_a_trajectory(self) -> None:
+        class Writer:
+            def __init__(self) -> None:
+                self.rows = 0
+
+            def write(self, point: dict, logits: np.ndarray) -> int:
+                self.rows += 1
+                self.assert_point = point
+                return int(np.argmax(logits))
+
+        point = {
+            "point_ordinal": 0,
+            "stable_id": "policy-1",
+            "kind": {
+                "kind": "teacher_forced",
+                "target_token_index": 2,
+                "target_token_id": 6,
+            },
+            "prefix_token_count": 2,
+            "prefix_token_ids_sha256": REFERENCE.prefix_sha256([4, 5]),
+        }
+        reference_input = {
+            "prediction_plan": {
+                "prediction_points": [point],
+                "greedy_prompts": [],
+            },
+            "examples": [{"stable_id": "policy-1", "token_ids": [4, 5, 6]}],
+        }
+        calls: list[list[int]] = []
+
+        def fake_last_logits(model, torch, device, tokens, cache):
+            calls.append(tokens)
+            return np.array([0.0, 2.0, 1.0], dtype=np.float32), object()
+
+        writer = Writer()
+        with mock.patch.object(REFERENCE, "last_logits", fake_last_logits):
+            trajectories = REFERENCE.execute_plan(
+                reference_input, writer, object(), object(), object()
+            )
+
+        self.assertEqual(writer.rows, 1)
+        self.assertEqual(calls, [[4, 5]])
+        self.assertEqual(trajectories, [])
+
 
 if __name__ == "__main__":
     unittest.main()

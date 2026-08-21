@@ -11,6 +11,28 @@ mod reference;
 mod source;
 mod source_manifest;
 
+use serde::{Deserialize, Serialize};
+
+use crate::intelligence::calibration::DatasetSplit;
+
+/// The characterization splits that may be executed before thresholds exist.
+/// AcceptanceHoldout deliberately has no constructor at this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OfficialQwen38EvaluationSplitV1 {
+    Calibration,
+    PolicyValidation,
+}
+
+impl OfficialQwen38EvaluationSplitV1 {
+    fn dataset_split(self) -> DatasetSplit {
+        match self {
+            Self::Calibration => DatasetSplit::Calibration,
+            Self::PolicyValidation => DatasetSplit::PolicyValidation,
+        }
+    }
+}
+
 pub(crate) use reference::{
     compare_official_qwen38_source_reference, OfficialQwen38SourceReferenceRequestV1,
 };

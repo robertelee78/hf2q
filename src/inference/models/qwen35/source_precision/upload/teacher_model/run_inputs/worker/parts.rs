@@ -4,7 +4,7 @@ use anyhow::{ensure, Result};
 
 use crate::inference::models::qwen35::kv_cache::PreparedQwen35BaseTextCacheV1;
 use crate::inference::models::qwen35::source_precision::teacher_execution_plan::Qwen35SourceTeacherExpectedWorkV1;
-use crate::intelligence::calibration::VerifiedCalibrationPredictionPlan;
+use crate::intelligence::calibration::VerifiedTeacherPredictionPlan;
 use crate::intelligence::exact_teacher::UnpublishedStructuralTeacherTargetReservation;
 
 use super::super::super::PreparedQwen35SourceTeacherV1;
@@ -16,7 +16,7 @@ use super::super::{
 pub(super) struct SourceTeacherWorkerPartsV1 {
     pub(super) teacher: PreparedQwen35SourceTeacherV1,
     pub(super) cache: PreparedQwen35BaseTextCacheV1,
-    pub(super) prediction_plan: VerifiedCalibrationPredictionPlan,
+    pub(super) prediction_plan: VerifiedTeacherPredictionPlan,
     pub(super) target_reservation: UnpublishedStructuralTeacherTargetReservation,
     pub(super) expected_work: Qwen35SourceTeacherExpectedWorkV1,
     pub(super) receipt: PreparedQwen35SourceTeacherRunInputsReceiptV1,

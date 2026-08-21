@@ -14,6 +14,7 @@ GIT_COMMIT_SHA="$(git rev-parse HEAD)" cargo build --release --locked
 target/release/hf2q source-teacher \
   --model-dir "$MODEL_DIR" \
   --output "$NATIVE_TARGET" \
+  --evaluation-split "$EVALUATION_SPLIT" \
   --execute >"$NATIVE_SUMMARY"
 
 uv run --frozen --project scripts/reference/qwen38_transformers \
@@ -32,9 +33,11 @@ target/release/hf2q source-teacher-reference \
   --external-target "$REFERENCE_TARGET" >"$COMPARISON_RECEIPT"
 ```
 
-The first matched canary characterizes backend drift. It deliberately has no
-quality threshold. Thresholds must be declared from Calibration and
-PolicyValidation evidence before AcceptanceHoldout is opened. The external
+Run this sequence once with `EVALUATION_SPLIT=calibration` and once with
+`EVALUATION_SPLIT=policy-validation`, using fresh destinations throughout.
+These characterization runs deliberately have no quality threshold.
+Thresholds must be declared from both receipts before AcceptanceHoldout is
+opened. The external
 target, evidence JSON, and comparison JSON cannot recreate source-teacher,
 sensitivity, allocator, selector, autoquant, or replay authority.
 

@@ -258,10 +258,21 @@ pub struct SourceTeacherArgs {
     #[arg(long, value_name = "FILE")]
     pub output: PathBuf,
 
+    /// Characterization split to execute. AcceptanceHoldout is intentionally
+    /// unavailable until a threshold authority has been checked in.
+    #[arg(long, value_enum, value_name = "SPLIT")]
+    pub evaluation_split: SourceTeacherEvaluationSplitArg,
+
     /// Perform the ~54 GB Metal upload and completed one-shot teacher run.
     /// Omit this flag for a model-weight/Metal-allocation-free preflight.
     #[arg(long, default_value_t = false)]
     pub execute: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SourceTeacherEvaluationSplitArg {
+    Calibration,
+    PolicyValidation,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -1291,12 +1302,18 @@ mod tests {
             "/tmp/qwen38-source",
             "--output",
             "/tmp/qwen38-teacher.bin",
+            "--evaluation-split",
+            "calibration",
         ]);
         let Command::SourceTeacher(args) = cli.command else {
             panic!("expected SourceTeacher");
         };
         assert_eq!(args.model_dir, PathBuf::from("/tmp/qwen38-source"));
         assert_eq!(args.output, PathBuf::from("/tmp/qwen38-teacher.bin"));
+        assert_eq!(
+            args.evaluation_split,
+            SourceTeacherEvaluationSplitArg::Calibration
+        );
         assert!(!args.execute);
 
         let cli = Cli::parse_from([
@@ -1306,12 +1323,39 @@ mod tests {
             "/tmp/qwen38-source",
             "--output",
             "/tmp/qwen38-teacher.bin",
+            "--evaluation-split",
+            "policy-validation",
             "--execute",
         ]);
         let Command::SourceTeacher(args) = cli.command else {
             panic!("expected SourceTeacher");
         };
+        assert_eq!(
+            args.evaluation_split,
+            SourceTeacherEvaluationSplitArg::PolicyValidation
+        );
         assert!(args.execute);
+
+        assert!(Cli::try_parse_from([
+            "hf2q",
+            "source-teacher",
+            "--model-dir",
+            "/tmp/qwen38-source",
+            "--output",
+            "/tmp/qwen38-teacher.bin",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "hf2q",
+            "source-teacher",
+            "--model-dir",
+            "/tmp/qwen38-source",
+            "--output",
+            "/tmp/qwen38-teacher.bin",
+            "--evaluation-split",
+            "acceptance-holdout",
+        ])
+        .is_err());
     }
 
     #[test]

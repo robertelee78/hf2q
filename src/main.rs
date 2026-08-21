@@ -233,12 +233,22 @@ fn cmd_catalog_hub_gguf(args: cli::CatalogHubGgufArgs) -> Result<(), AppError> {
 fn cmd_source_teacher(args: cli::SourceTeacherArgs) -> Result<(), AppError> {
     use crate::inference::models::qwen35::source_precision::{
         preflight_official_qwen38_source_teacher, run_official_qwen38_source_teacher,
-        OfficialQwen38SourceTeacherRequestV1,
+        OfficialQwen38EvaluationSplitV1, OfficialQwen38SourceTeacherRequestV1,
+    };
+
+    let evaluation_split = match args.evaluation_split {
+        cli::SourceTeacherEvaluationSplitArg::Calibration => {
+            OfficialQwen38EvaluationSplitV1::Calibration
+        }
+        cli::SourceTeacherEvaluationSplitArg::PolicyValidation => {
+            OfficialQwen38EvaluationSplitV1::PolicyValidation
+        }
     };
 
     let request = OfficialQwen38SourceTeacherRequestV1 {
         model_dir: args.model_dir,
         output: args.output,
+        evaluation_split,
     };
     let summary = if args.execute {
         run_official_qwen38_source_teacher(request)

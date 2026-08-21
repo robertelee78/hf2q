@@ -6,8 +6,8 @@ use super::teacher_execution_plan::{
 use super::topology::admit_qwen35_bf16_topology;
 use super::topology_tests::{fixture, open};
 use crate::intelligence::calibration::{
-    prediction_plan_for_test, prediction_plan_for_test_bound,
-    prediction_plan_for_test_bound_with_first_prefix,
+    policy_prediction_plan_for_test_bound, prediction_plan_for_test,
+    prediction_plan_for_test_bound, prediction_plan_for_test_bound_with_first_prefix,
 };
 use crate::intelligence::exact_teacher::TeacherTargetArtifactLimits;
 
@@ -18,6 +18,33 @@ fn target_limits() -> TeacherTargetArtifactLimits {
         max_target_bytes: 1024 * 1024,
         top_k: 4,
     }
+}
+
+#[test]
+fn policy_validation_work_preflight_has_rows_without_greedy_work() -> anyhow::Result<()> {
+    let source_fixture = fixture(Dtype::BF16, |_, _| {});
+    let topology = admit_qwen35_bf16_topology(open(&source_fixture)?)?;
+    let plan = policy_prediction_plan_for_test_bound(
+        topology.source().clone(),
+        topology.verified_source_manifest_sha256().into(),
+    );
+    let verified =
+        preflight_qwen35_source_teacher_execution(topology, plan, target_limits(), run_limits())?;
+    let (_, retained_plan, _, _, expected, _) = verified.into_parts();
+
+    assert_eq!(
+        retained_plan.manifest().evaluation_split,
+        crate::intelligence::calibration::DatasetSplit::PolicyValidation
+    );
+    assert_eq!(expected.example_count, 1);
+    assert_eq!(expected.completed_transcript_count, 1);
+    assert_eq!(expected.generation_prompt_count, 0);
+    assert_eq!(expected.prediction_row_count, 2);
+    assert_eq!(expected.forward_call_count, 2);
+    assert_eq!(expected.input_tokens_processed, 17);
+    assert_eq!(expected.output_head_evaluation_count, 2);
+    assert_eq!(expected.max_cache_tokens, 17);
+    Ok(())
 }
 
 fn run_limits() -> Qwen35SourceTeacherRunLimitsV1 {
@@ -32,7 +59,7 @@ fn run_limits() -> Qwen35SourceTeacherRunLimitsV1 {
 
 fn bound_inputs() -> anyhow::Result<(
     super::topology::VerifiedQwen35Bf16TopologyV1,
-    crate::intelligence::calibration::VerifiedCalibrationPredictionPlan,
+    crate::intelligence::calibration::VerifiedTeacherPredictionPlan,
 )> {
     let source_fixture = fixture(Dtype::BF16, |_, _| {});
     let topology = admit_qwen35_bf16_topology(open(&source_fixture)?)?;

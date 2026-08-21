@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::core::provenance::tensor_execution::ArtifactEvidence;
 use crate::intelligence::calibration::{
-    TeacherGreedyPromptReceipt, TeacherPredictionPointReceipt, VerifiedCalibrationPredictionPlan,
+    TeacherGreedyPromptReceipt, TeacherPredictionPointReceipt, VerifiedTeacherPredictionPlan,
 };
 
 use super::publication::RetainedTargetTemp;
@@ -38,7 +38,7 @@ impl UnpublishedStructuralTeacherTargetReservation {
 
     pub(crate) fn begin<'a>(
         self,
-        plan: &'a VerifiedCalibrationPredictionPlan,
+        plan: &'a VerifiedTeacherPredictionPlan,
     ) -> Result<StructuralTeacherTargetStream<'a>, ExactTeacherTargetError> {
         self.validate_private()?;
         let preflight = preflight_structural_teacher_target(
@@ -74,14 +74,14 @@ impl UnpublishedStructuralTeacherTargetReservation {
 /// structural capability, but it is intentionally produced before any family
 /// runner allocates model weights or Metal buffers.
 pub(crate) struct StructuralTeacherTargetPreflight<'a> {
-    plan: &'a VerifiedCalibrationPredictionPlan,
+    plan: &'a VerifiedTeacherPredictionPlan,
     vocabulary_size: usize,
     limits: TeacherTargetArtifactLimits,
     preflight_bytes: u64,
 }
 
 pub(crate) fn preflight_structural_teacher_target(
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
     vocabulary_size: usize,
     limits: TeacherTargetArtifactLimits,
 ) -> Result<StructuralTeacherTargetPreflight<'_>, ExactTeacherTargetError> {
@@ -134,7 +134,7 @@ pub(crate) fn preflight_structural_teacher_target(
 /// source teacher. It proves framing and plan closure only; callers cannot
 /// promote its result into execution or allocator authority.
 pub(crate) struct StructuralTeacherTargetStream<'a> {
-    plan: &'a VerifiedCalibrationPredictionPlan,
+    plan: &'a VerifiedTeacherPredictionPlan,
     temporary: RetainedTargetTemp,
     vocabulary_size: usize,
     limits: TeacherTargetArtifactLimits,

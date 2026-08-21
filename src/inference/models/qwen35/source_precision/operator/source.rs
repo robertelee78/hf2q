@@ -32,6 +32,7 @@ use super::super::{
 use super::corpus::build_official_prediction_plan;
 use super::profile::{official_profile, OfficialEvidenceProfileV1, PROFILE_SHA256};
 use super::source_manifest::{official_source_manifest, OfficialSourceManifestV1};
+use super::OfficialQwen38EvaluationSplitV1;
 
 const OFFICIAL_TENSOR_COUNT: usize = 1_199;
 const OFFICIAL_WEIGHT_SHARD_COUNT: usize = 18;
@@ -45,6 +46,7 @@ const OFFICIAL_PLANNED_WEIGHT_BYTES: u64 = 53_797_287_936;
 pub(crate) struct OfficialQwen38SourceTeacherRequestV1 {
     pub(crate) model_dir: PathBuf,
     pub(crate) output: PathBuf,
+    pub(crate) evaluation_split: OfficialQwen38EvaluationSplitV1,
 }
 
 /// Sanitized operational summary. Content/work hashes are stable; device,
@@ -66,6 +68,7 @@ pub(crate) struct OfficialQwen38SourceTeacherSummaryV1 {
     pub(crate) source_partition_sha256: String,
     pub(crate) topology_sha256: String,
     pub(crate) dataset_partition_sha256: String,
+    pub(crate) evaluation_split: crate::intelligence::calibration::DatasetSplit,
     pub(crate) calibration_corpus_sha256: String,
     pub(crate) policy_validation_corpus_sha256: String,
     pub(crate) acceptance_holdout_corpus_sha256: String,
@@ -200,7 +203,7 @@ fn build_official_work(request: &OfficialQwen38SourceTeacherRequestV1) -> Result
     let source = authenticate_official_source(&request.model_dir, &profile)?;
     let source_authentication_ms = elapsed_ms(source_started.elapsed());
     let corpus_started = Instant::now();
-    let prediction = build_official_prediction_plan(&source, &profile)?;
+    let prediction = build_official_prediction_plan(&source, &profile, request.evaluation_split)?;
     let corpus_and_prediction_plan_ms = elapsed_ms(corpus_started.elapsed());
     let source_inventory_sha256 = source.inventory.manifest().manifest_sha256.clone();
     let source_partition_sha256 = source.partition.manifest_sha256.clone();
@@ -254,6 +257,7 @@ fn build_official_work(request: &OfficialQwen38SourceTeacherRequestV1) -> Result
         source_partition_sha256,
         topology_sha256,
         dataset_partition_sha256: prediction.dataset_partition_sha256,
+        evaluation_split: prediction.evaluation_split,
         calibration_corpus_sha256: prediction.calibration_corpus_sha256,
         policy_validation_corpus_sha256: prediction.policy_validation_corpus_sha256,
         acceptance_holdout_corpus_sha256: prediction.acceptance_holdout_corpus_sha256,

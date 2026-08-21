@@ -10,7 +10,7 @@ use std::path::Path;
 
 use rustix::fs::{self, FileType, Mode, OFlags};
 
-use crate::intelligence::calibration::VerifiedCalibrationPredictionPlan;
+use crate::intelligence::calibration::VerifiedTeacherPredictionPlan;
 
 use super::*;
 
@@ -21,7 +21,7 @@ const RETAINED_OPEN_FLAGS: OFlags = OFlags::RDONLY
 
 pub(crate) fn open_receipted_structural_teacher_target(
     path: &Path,
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
     receipt: ExactTeacherTargetReceipt,
 ) -> Result<StructurallyVerifiedTeacherTargetArtifact, ExactTeacherTargetError> {
     validate_receipt_against_plan(plan, &receipt)?;
@@ -36,7 +36,7 @@ pub(crate) fn open_receipted_structural_teacher_target(
 
 pub(crate) fn reconstruct_structural_teacher_reference_target(
     path: &Path,
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
     vocabulary_size: usize,
     limits: TeacherTargetArtifactLimits,
     trajectories: Vec<TeacherGreedyTrajectoryReceipt>,
@@ -157,7 +157,7 @@ pub(crate) fn reconstruct_structural_teacher_reference_target(
 }
 
 fn validate_receipt_against_plan(
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
     receipt: &ExactTeacherTargetReceipt,
 ) -> Result<(), ExactTeacherTargetError> {
     if receipt.prediction_plan_sha256 != plan.manifest().manifest_sha256

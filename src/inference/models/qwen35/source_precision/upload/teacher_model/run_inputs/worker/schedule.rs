@@ -3,7 +3,7 @@
 use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::intelligence::calibration::{RenderMode, VerifiedCalibrationPredictionPlan};
+use crate::intelligence::calibration::{RenderMode, VerifiedTeacherPredictionPlan};
 use crate::intelligence::exact_teacher::ExactTeacherTargetReceipt;
 
 const CALL_SCHEDULE_DOMAIN: &[u8] = b"hf2q-qwen35-source-teacher-call-schedule-v1";
@@ -41,7 +41,7 @@ impl CallScheduleHasher {
 }
 
 pub(super) fn expected_call_schedule_sha256(
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
     target: &ExactTeacherTargetReceipt,
 ) -> Result<String> {
     let mut schedule = CallScheduleHasher::new();

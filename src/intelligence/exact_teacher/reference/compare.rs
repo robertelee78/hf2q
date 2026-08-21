@@ -5,7 +5,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::core::provenance::tensor_execution::ArtifactEvidence;
-use crate::intelligence::calibration::VerifiedCalibrationPredictionPlan;
+use crate::intelligence::calibration::VerifiedTeacherPredictionPlan;
 
 use super::{
     is_git_commit, is_sha256, open_external_reference_target, open_native_reference_target,
@@ -111,7 +111,7 @@ struct ComparisonHashView<'a> {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compare_exact_teacher_reference_targets(
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
     input: &ExactTeacherReferenceInputV1,
     native_target_path: &Path,
     native_receipt: ExactTeacherTargetReceipt,

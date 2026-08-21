@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::core::provenance::tensor_execution::ArtifactEvidence;
 #[cfg(test)]
-use crate::intelligence::calibration::VerifiedCalibrationPredictionPlan;
+use crate::intelligence::calibration::VerifiedTeacherPredictionPlan;
 
 use super::types::*;
 
@@ -252,7 +252,7 @@ fn digest_to_array(value: &str) -> Result<[u8; 32], ExactTeacherTargetError> {
 /// cannot authorize sensitivity or allocation.
 #[cfg(test)]
 pub(crate) fn write_structural_teacher_target_artifact<LF, GF>(
-    plan: &VerifiedCalibrationPredictionPlan,
+    plan: &VerifiedTeacherPredictionPlan,
     output: &Path,
     vocabulary_size: usize,
     limits: TeacherTargetArtifactLimits,

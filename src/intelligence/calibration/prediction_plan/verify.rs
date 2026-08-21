@@ -20,8 +20,9 @@ struct PredictionPlanHashView<'a> {
     source: &'a crate::intelligence::measured_auto_quant::SourceIdentity,
     verified_source_manifest_sha256: &'a str,
     dataset_partition_manifest_sha256: &'a str,
-    calibration_corpus_artifact_sha256: &'a str,
-    calibration_manifest_sha256: &'a str,
+    evaluation_split: DatasetSplit,
+    evaluation_corpus_artifact_sha256: &'a str,
+    evaluation_manifest_sha256: &'a str,
     rendered_token_stream_sha256: &'a str,
     limits: TeacherPredictionPlanLimits,
     total_example_count: usize,
@@ -47,8 +48,9 @@ pub(super) fn prediction_plan_sha256(
         source: &manifest.source,
         verified_source_manifest_sha256: &manifest.verified_source_manifest_sha256,
         dataset_partition_manifest_sha256: &manifest.dataset_partition_manifest_sha256,
-        calibration_corpus_artifact_sha256: &manifest.calibration_corpus_artifact_sha256,
-        calibration_manifest_sha256: &manifest.calibration_manifest_sha256,
+        evaluation_split: manifest.evaluation_split,
+        evaluation_corpus_artifact_sha256: &manifest.evaluation_corpus_artifact_sha256,
+        evaluation_manifest_sha256: &manifest.evaluation_manifest_sha256,
         rendered_token_stream_sha256: &manifest.rendered_token_stream_sha256,
         limits: manifest.limits,
         total_example_count: manifest.total_example_count,
@@ -91,8 +93,8 @@ pub fn validate_teacher_prediction_plan(
         || !super::super::render::source_valid(&manifest.source)
         || !is_lower_sha256(&manifest.verified_source_manifest_sha256)
         || !is_lower_sha256(&manifest.dataset_partition_manifest_sha256)
-        || !is_lower_sha256(&manifest.calibration_corpus_artifact_sha256)
-        || !is_lower_sha256(&manifest.calibration_manifest_sha256)
+        || !is_lower_sha256(&manifest.evaluation_corpus_artifact_sha256)
+        || !is_lower_sha256(&manifest.evaluation_manifest_sha256)
         || !is_lower_sha256(&manifest.rendered_token_stream_sha256)
         || !is_lower_sha256(&manifest.manifest_sha256)
         || manifest.total_example_count == 0
@@ -104,7 +106,6 @@ pub fn validate_teacher_prediction_plan(
         || manifest.examples.len() != manifest.total_example_count
         || manifest.prediction_points.is_empty()
         || manifest.prediction_points.len() > manifest.limits.max_prediction_points
-        || manifest.greedy_prompts.is_empty()
         || manifest.greedy_prompts.len() > manifest.limits.max_generation_prompts
     {
         return Err(CalibrationInputError::InvalidDataset(
@@ -251,7 +252,12 @@ pub fn validate_teacher_prediction_plan(
         .iter()
         .map(|prompt| prompt.stable_id.as_str())
         .collect::<Vec<_>>();
-    if !has_teacher_forced
+    let split_shape_valid = match manifest.evaluation_split {
+        DatasetSplit::Calibration => has_teacher_forced && !manifest.greedy_prompts.is_empty(),
+        DatasetSplit::PolicyValidation => has_teacher_forced,
+        DatasetSplit::AcceptanceHoldout => !manifest.greedy_prompts.is_empty(),
+    };
+    if !split_shape_valid
         || manifest.greedy_prompts.iter().any(|prompt| {
             prompt.stable_id.is_empty()
                 || !greedy_ids.insert(prompt.stable_id.as_str())

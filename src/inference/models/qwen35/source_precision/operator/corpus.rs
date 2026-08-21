@@ -3,14 +3,15 @@ use std::path::PathBuf;
 use anyhow::{ensure, Context, Result};
 
 use crate::intelligence::calibration::{
-    build_teacher_prediction_plan, render_and_tokenize_split, render_and_tokenize_verified_split,
-    verify_dataset_partition, verify_embedded_calibration_corpus_artifact,
-    CalibrationCorpusArtifactLimits, DatasetSplit, RenderDatasetRequest,
-    VerifiedCalibrationPredictionPlan, VerifyCalibrationCorpusRequest,
+    build_teacher_characterization_plan, render_and_tokenize_split,
+    render_and_tokenize_verified_split, verify_dataset_partition,
+    verify_embedded_calibration_corpus_artifact, CalibrationCorpusArtifactLimits, DatasetSplit,
+    RenderDatasetRequest, VerifiedTeacherPredictionPlan, VerifyCalibrationCorpusRequest,
 };
 
 use super::profile::OfficialEvidenceProfileV1;
 use super::source::OfficialSourceV1;
+use super::OfficialQwen38EvaluationSplitV1;
 
 const CALIBRATION: &[u8] = include_bytes!(
     "../../../../../../data/calibration/qwen38-source-teacher-canary-v1/calibration.json"
@@ -23,7 +24,8 @@ const ACCEPTANCE_HOLDOUT: &[u8] = include_bytes!(
 );
 
 pub(super) struct OfficialPredictionPlanV1 {
-    pub(super) plan: VerifiedCalibrationPredictionPlan,
+    pub(super) plan: VerifiedTeacherPredictionPlan,
+    pub(super) evaluation_split: DatasetSplit,
     pub(super) dataset_partition_sha256: String,
     pub(super) calibration_corpus_sha256: String,
     pub(super) policy_validation_corpus_sha256: String,
@@ -33,6 +35,7 @@ pub(super) struct OfficialPredictionPlanV1 {
 pub(super) fn build_official_prediction_plan(
     source: &OfficialSourceV1,
     profile: &OfficialEvidenceProfileV1,
+    evaluation: OfficialQwen38EvaluationSplitV1,
 ) -> Result<OfficialPredictionPlanV1> {
     let limits = profile.prediction_limits();
     let calibration = verified_corpus(
@@ -74,9 +77,16 @@ pub(super) fn build_official_prediction_plan(
         &rendered_holdout,
     )
     .context("verify official three-way corpus partition")?;
-    let plan = build_teacher_prediction_plan(
+    let evaluation_split = evaluation.dataset_split();
+    let (evaluation_corpus, rendered_evaluation) = match evaluation {
+        OfficialQwen38EvaluationSplitV1::Calibration => (&calibration, &rendered_calibration),
+        OfficialQwen38EvaluationSplitV1::PolicyValidation => (&validation, &rendered_validation),
+    };
+    let plan = build_teacher_characterization_plan(
         &partition,
-        &calibration,
+        evaluation_split,
+        evaluation_corpus,
+        rendered_evaluation,
         &rendered_calibration,
         &rendered_validation,
         &rendered_holdout,
@@ -85,6 +95,7 @@ pub(super) fn build_official_prediction_plan(
     .context("build official source-teacher prediction plan")?;
     Ok(OfficialPredictionPlanV1 {
         plan,
+        evaluation_split,
         dataset_partition_sha256: partition.manifest_sha256,
         calibration_corpus_sha256: calibration.artifact().sha256.clone(),
         policy_validation_corpus_sha256: validation.artifact().sha256.clone(),

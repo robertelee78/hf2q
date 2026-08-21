@@ -1470,6 +1470,27 @@ runtime-dependency, performance, or DWQ authority. A broader Calibration and
 PolicyValidation characterization remains required before thresholds are
 declared and AcceptanceHoldout is opened once.
 
+#### 2026-08-21 — split-explicit characterization plan
+
+Teacher prediction-plan schema v3 names and hashes its exact
+`evaluation_split`, evaluation-corpus artifact, rendered manifest, and token
+stream instead of describing every plan as Calibration. The family-owned
+characterization constructor admits only Calibration and PolicyValidation.
+Calibration retains the existing scored-transcript plus 32-token greedy
+contract; PolicyValidation may contain scored transcripts without a generation
+prompt, so its structural target and matched-reference receipt may correctly
+contain zero trajectories. The target verifier, worker, and pinned Transformers
+harness all preserve that zero-trajectory cardinality rather than inventing a
+prompt.
+
+The hidden operator requires an explicit `--evaluation-split` value and exposes
+only `calibration` and `policy-validation`. `acceptance-holdout` is not a CLI
+value and the characterization constructor rejects it before source topology,
+Metal allocation, or target creation. A later holdout constructor must consume
+the checked-in threshold authority derived from both characterization receipts;
+schema validity alone cannot open the holdout. This change adds no threshold or
+quality-gate authority and does not alter the canary-only, no-DWQ scope.
+
 ### Phase E — production `--quant auto`
 
 - Add an operator profile and budget surface.

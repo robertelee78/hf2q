@@ -5,7 +5,7 @@ use super::*;
 use crate::inference::models::qwen35::{
     forward_cpu::text_positions, model::Qwen35Model, Qwen35Config, Qwen35Variant,
 };
-use crate::intelligence::calibration::prediction_plan_for_test;
+use crate::intelligence::calibration::{policy_prediction_plan_for_test, prediction_plan_for_test};
 
 fn limits() -> TeacherTargetArtifactLimits {
     TeacherTargetArtifactLimits {
@@ -60,6 +60,27 @@ fn full_logit_rows_are_framed_reread_and_summarized_deterministically() {
             .unwrap()
             .join(output.file_name().unwrap())
     );
+    target_artifact::verify_for_test(&mut artifact).unwrap();
+}
+
+#[test]
+fn policy_validation_target_is_valid_without_a_greedy_trajectory() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("policy-validation-targets.bin");
+    let plan = policy_prediction_plan_for_test();
+    let mut artifact = write_structural_teacher_target_artifact(
+        &plan,
+        &output,
+        4,
+        limits(),
+        |_request| Ok(vec![-0.0, 0.0, -1.0, -2.0]),
+        |_request| panic!("PolicyValidation has no greedy trajectory"),
+    )
+    .unwrap();
+
+    assert_eq!(artifact.receipt().rows.len(), 2);
+    assert_eq!(artifact.receipt().generation_prompt_count, 0);
+    assert!(artifact.receipt().greedy_trajectories.is_empty());
     target_artifact::verify_for_test(&mut artifact).unwrap();
 }
 

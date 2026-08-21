@@ -17,6 +17,7 @@ use crate::intelligence::exact_teacher::{
 use super::corpus::build_official_prediction_plan;
 use super::profile::official_profile;
 use super::source::authenticate_official_source;
+use super::OfficialQwen38EvaluationSplitV1;
 
 const MAX_EVIDENCE_JSON_BYTES: u64 = 16 * 1024 * 1024;
 const EVIDENCE_OPEN_FLAGS: OFlags = OFlags::RDONLY
@@ -36,6 +37,7 @@ pub(crate) struct OfficialQwen38SourceReferenceRequestV1 {
 #[derive(Deserialize)]
 struct NativeSummaryReferenceViewV1 {
     profile: String,
+    evaluation_split: crate::intelligence::calibration::DatasetSplit,
     prediction_plan_sha256: String,
     executed: bool,
     target_artifact_sha256: Option<String>,
@@ -76,9 +78,21 @@ pub(crate) fn compare_official_qwen38_source_reference(
 
     let profile = official_profile()?;
     let source = authenticate_official_source(&request.model_dir, &profile)?;
-    let prediction = build_official_prediction_plan(&source, &profile)?;
+    let evaluation = match native.evaluation_split {
+        crate::intelligence::calibration::DatasetSplit::Calibration => {
+            OfficialQwen38EvaluationSplitV1::Calibration
+        }
+        crate::intelligence::calibration::DatasetSplit::PolicyValidation => {
+            OfficialQwen38EvaluationSplitV1::PolicyValidation
+        }
+        crate::intelligence::calibration::DatasetSplit::AcceptanceHoldout => {
+            anyhow::bail!("AcceptanceHoldout has no characterization comparator")
+        }
+    };
+    let prediction = build_official_prediction_plan(&source, &profile, evaluation)?;
     ensure!(
-        prediction.plan.manifest().manifest_sha256 == native.prediction_plan_sha256,
+        prediction.evaluation_split == native.evaluation_split
+            && prediction.plan.manifest().manifest_sha256 == native.prediction_plan_sha256,
         "freshly authenticated prediction plan differs from native evidence"
     );
     compare_exact_teacher_reference_targets(
