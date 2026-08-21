@@ -214,15 +214,23 @@ not sufficient: the measured local negative control accepted ad-hoc and Apple
 platform code unless the explicit notarized requirement was also present. The
 ZIP is not a product download.
 
-The distribution candidate workflow is deliberately short. A no-secret job
-builds the locked packed-source candidate, and a protected `apple-release` job
-signs and notarizes that exact input in an ephemeral keychain. The protected
-job invokes its signer only from the verified exact checkout and treats the
-unsigned and signed executables as data: it never runs candidate code while
-Apple credentials are present. The release workflow revalidates the packed
-crate, dependency provenance, exact unsigned-input binding, Developer ID
-identity, hardened runtime, minimum OS and architecture, accepted notary log,
-ticket CDHash, and signed executable bytes before publication.
+The distribution candidate workflow is deliberately short and reusable. A
+no-secret job builds the locked packed-source candidate, and a protected
+`apple-release` job signs and notarizes that exact input in an ephemeral
+keychain. The protected job invokes its signer only from the verified exact
+checkout and treats the unsigned and signed executables as data: it never runs
+candidate code while Apple credentials are present. One `Release` dispatch
+invokes those jobs and then revalidates the packed crate, dependency
+provenance, exact unsigned-input binding, Developer ID identity, hardened
+runtime, minimum OS and architecture, accepted notary log, ticket CDHash, and
+signed executable bytes before publication. The candidate workflow remains
+directly dispatchable for diagnostics and optional model qualification; an
+operator does not copy a run ID between workflows to publish a release. The
+requested source SHA must be an ancestor of main and is bound by candidate
+receipts; GitHub's workflow-definition `headSha` is not misused as candidate
+identity, so unrelated later merges do not invalidate an in-flight release.
+The publication verifier drops its GitHub API credentials immediately after
+artifact download and before executing even a verified candidate.
 
 Model-family quality, cache, and performance qualification is independent. It
 may consume the same signed candidate and remains required when a governing
@@ -413,10 +421,12 @@ guide must agree on:
 - update and uninstall behavior; and
 - which later hf2q commands are existing product behavior.
 
-The branded installer URL is enabled only after it returns a real reviewed
-script with the expected content type and an authenticated, immutable release
-path. A parked page, HTML error, mutable placeholder, or missing release asset
-is a release blocker.
+The branded installer URL is a mutable selector, not another copy of the
+installer. It uses a temporary no-cache redirect to the exact immutable
+versioned GitHub release asset, never `/latest`. The updater's small stable
+record remains a direct same-origin `200` because update transport rejects
+redirects. A permanent or cacheable installer redirect, parked page, HTML
+error, mutable release target, or missing asset is a release blocker.
 
 ## Explicit non-goals
 
@@ -706,7 +716,9 @@ first two govern publication of unchanged CLI bytes. The release's unpacked
 crate check is correspondingly limited to compilation, explicit completions,
 setup, standalone distribution, and installed CLI behavior. Main CI owns broad
 source regressions; model workflows own family-specific correctness, quality,
-cache, and performance qualification.
+cache, and performance qualification. That trust separation no longer creates
+two operator steps: the release calls the candidate workflow and consumes its
+artifacts within one serialized run.
 
 The reformulated rail then completed against exact source
 `cfa487a829d6e15508d41089e8d892f18bdb86b0`: main CI run `32470582081`,
@@ -717,13 +729,24 @@ Team ID `3T2D2YNTVW`, and identifier `us.hf2q.cli`. GitHub and crates.io
 package bytes matched; the public release passed clean install, setup, and
 data-preserving uninstall.
 
-Website main `b2691e59951ad3381cbaa51c4c5e4211792ce7ca` now serves the exact
-v0.1.7 installer and canonical stable record directly from hf2q.us. Live
-transport verification and an isolated physical-HOME journey passed:
+Website main `20b0bbcd5a2f05e07c21f567c7aca82b039c77a2` now sends a no-store
+temporary redirect from `https://hf2q.us/install.sh` to the exact immutable
+v0.1.7 GitHub release asset. It serves the canonical stable record directly
+with explicit revalidation. Live transport verification and an isolated
+physical-HOME journey passed:
 install -> setup -> doctor -> already-current update check/update -> uninstall,
 with configuration and model bytes preserved. The measured order matters:
 setup establishes the private state root before doctor or another command uses
 it.
+
+The source installer for the next release is intentionally readable and adds
+only measured boundary hardening: one parse-before-execute compound command,
+closed candidate stdin, physical Apple-Silicon detection under Rosetta,
+bounded HTTPS transfer, test-only local fixtures, and current-user-owned,
+non-group/world-writable install directories checked again at native
+activation. Its lifecycle test falsifies truncated inputs, stdin capture,
+unsafe directories, and oversized downloads before proving install, setup, and
+data-preserving uninstall. The updater accepts exact HTTP `200` only.
 
 The unreachable second managed-session store, its runtime authorization, and
 the provisional session-cache setup field have been removed. `hf2q setup` does
@@ -745,7 +768,8 @@ identity verifier was reachable, but it coupled configuration publication to
 an identity tree that no shipped installation path created or used, so that
 coupling was removed as well. The reachable standalone record, Apple trust
 checks, exact download, rollback, uninstall, and atomic publisher remain the
-sole distribution implementation.
+sole distribution implementation. That removal landed on main in merge commit
+`ccfa4dc368e2d2274d3234e75e10a69d9da56e0f` after exact-head CI passed.
 
 What is not yet the corrected product:
 

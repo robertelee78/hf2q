@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Download and verify the exact packed-source and Developer-ID/notarization
-# artifacts produced by one successful Standalone candidate workflow run.
+# artifacts produced by the candidate jobs in one standalone or release run.
 set -euo pipefail
 
-if [[ $# -ne 5 ]]; then
-  echo "usage: $0 RUN_ID SOURCE_SHA VERSION OUTPUT_DIRECTORY GITHUB_ENV" >&2
+if [[ $# -lt 5 || $# -gt 6 ]]; then
+  echo "usage: $0 RUN_ID SOURCE_SHA VERSION OUTPUT_DIRECTORY GITHUB_ENV [WORKFLOW]" >&2
   exit 2
 fi
 
@@ -13,6 +13,7 @@ source_sha=$2
 version=$3
 output_directory=$4
 github_env=$5
+expected_workflow=${6:-Standalone candidate}
 
 fail() {
   echo "standalone candidate verification: $*" >&2
@@ -31,20 +32,27 @@ sha256_file() {
   fail "output directory must be a new absolute path"
 [[ "$github_env" == /* && -f "$github_env" && ! -L "$github_env" ]] || \
   fail "GitHub environment file is not a regular absolute file"
+case "$expected_workflow" in
+  'Standalone candidate'|'Release') ;;
+  *) fail "expected workflow is not supported" ;;
+esac
 [[ $(uname -s) == Darwin && $(uname -m) == arm64 ]] || \
   fail "verification requires an Apple-Silicon macOS runner"
 : "${GH_TOKEN:?GH_TOKEN is required}"
 
 run_json=$(gh run view "$run_id" \
-  --json conclusion,event,headSha,workflowName,url)
-[[ $(jq -r .workflowName <<<"$run_json") == "Standalone candidate" ]] || \
-  fail "run is not a Standalone candidate workflow"
+  --json conclusion,event,workflowName,url)
+[[ $(jq -r .workflowName <<<"$run_json") == "$expected_workflow" ]] || \
+  fail "run is not the expected $expected_workflow workflow"
 [[ $(jq -r .event <<<"$run_json") == workflow_dispatch ]] || \
   fail "candidate was not explicitly dispatched"
-[[ $(jq -r .headSha <<<"$run_json") == "$source_sha" ]] || \
-  fail "candidate source SHA differs from the release source"
-[[ $(jq -r .conclusion <<<"$run_json") == success ]] || \
-  fail "candidate workflow did not succeed"
+if [[ "$expected_workflow" == Release ]]; then
+  [[ ${GITHUB_RUN_ID:-} == "$run_id" ]] || \
+    fail "an in-progress Release candidate must come from the current run"
+else
+  [[ $(jq -r .conclusion <<<"$run_json") == success ]] || \
+    fail "candidate workflow did not succeed"
+fi
 
 mkdir -m 0700 "$output_directory"
 build_root="$output_directory/build"
@@ -53,6 +61,7 @@ gh run download "$run_id" \
   --name "standalone-candidate-build-$source_sha" --dir "$build_root"
 gh run download "$run_id" \
   --name "standalone-candidate-signed-$source_sha" --dir "$signed_root"
+unset GH_TOKEN GITHUB_TOKEN
 
 [[ -z $(find "$build_root" "$signed_root" -type l -print -quit) ]] || \
   fail "candidate artifacts contain a symbolic link"
