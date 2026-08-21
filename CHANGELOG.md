@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unbounded transfers, production `file://` overrides, and group/world-
   writable install directories. Require exact HTTP 200 responses in the
   standalone updater and preserve the same directory invariant in Rust.
+- Drop the publication job's GitHub API credentials immediately after exact
+  candidate artifact download and before either candidate is executed.
 
 ### Removed
 
