@@ -888,7 +888,7 @@ cache locks.
 
 The local lifecycle slice then passed `cargo check --locked --all-targets
 --all-features`, `cargo build --release --locked`, and the complete
-`cargo test --locked` suite: 51 library tests, 4,632 binary tests with 54
+`cargo test --locked` suite: 51 library tests, 4,638 binary tests with 54
 declared ignores, and every executed integration target completed with zero
 failures. The changed Rust files are rustfmt-clean; whole-tree
 `cargo fmt --check` still reports only pre-existing formatting debt outside
