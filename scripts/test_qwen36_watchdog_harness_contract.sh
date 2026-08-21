@@ -219,12 +219,12 @@ printf '%s\n' 'chunk complete' 'other' 'chunk complete' >"$progress_log"
 [[ "$(qwen36_count_matching_lines 'no such chunk' "$progress_log")" == 0 ]]
 # A scanner that emits a plausible count and then fails must not be accepted.
 # shellcheck disable=SC2329
-rg() {
+grep() {
   printf '2\n'
   return 42
 }
 expect_fail qwen36_count_matching_lines 'chunk complete' "$progress_log"
-unset -f rg
+unset -f grep
 
 cancellation_counts="$test_dir/cancellation-counts.json"
 jq -n '{chunks_at_disconnect:3,chunks_after_cancel:4,chunks_after_stability:4}' \
@@ -457,21 +457,13 @@ grep -Fq '.chunks_after_cancel <= (.chunks_at_disconnect + 1)' \
   "$script_dir/test_qwen36_prefill_cancellation.sh"
 grep -Fq '.chunks_after_cancel == (.chunks_after_cancel | floor)' \
   "$script_dir/test_qwen36_prefill_cancellation.sh"
-# Literal jq source; `$q` is the release verifier binding, not a shell value.
-# shellcheck disable=SC2016
-grep -Fq '$q.cancellation.chunks_after_cancel <= ($q.cancellation.chunks_at_disconnect + 1)' \
-  "$script_dir/../.github/workflows/release.yml"
-# Literal jq source; `$q` is the release verifier binding, not a shell value.
-# shellcheck disable=SC2016
-grep -Fq '$q.cancellation.chunks_after_cancel == ($q.cancellation.chunks_after_cancel | floor)' \
-  "$script_dir/../.github/workflows/release.yml"
 grep -Fq 'qwen36_validate_cancellation_transaction_counts' \
-  "$script_dir/../.github/workflows/release.yml"
-grep -Fq 'fixture_sha256 == "3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e"' \
-  "$script_dir/../.github/workflows/release.yml"
-if grep -Fq 'fixture_sha256 == "6671a0c89b8d4935caa4b87bee08361c5b8727ec557e9edb05947ad90c94c13d"' \
-  "$script_dir/../.github/workflows/release.yml"; then
-  echo "release verifier still accepts the historical key-sorted fixture" >&2
+  "$script_dir/run_agentic_cache_release_gate.sh"
+grep -Fq '3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e' \
+  "$script_dir/run_agentic_cache_release_gate.sh"
+if grep -Fq '6671a0c89b8d4935caa4b87bee08361c5b8727ec557e9edb05947ad90c94c13d' \
+  "$script_dir/run_agentic_cache_release_gate.sh"; then
+  echo "model qualification still accepts the historical key-sorted fixture" >&2
   exit 1
 fi
 # Literal jq source; `$qwen_cancellation` must not expand in this contract.
@@ -499,7 +491,7 @@ awk '
 grep -Fq 'power_event_snapshots_sha256' \
   "$script_dir/run_agentic_cache_release_gate.sh"
 grep -Fq 'qwen36_verify_power_snapshot_manifest' \
-  "$script_dir/../.github/workflows/release.yml"
+  "$script_dir/run_agentic_cache_release_gate.sh"
 
 clean_log="$test_dir/clean.log"
 printf 'INFO bounded transaction complete\n' >"$clean_log"

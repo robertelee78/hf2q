@@ -6,6 +6,7 @@ supervisor="$script_dir/run_release_gate_process_group.sh"
 release_gate="$script_dir/run_agentic_cache_release_gate.sh"
 decode_gate="$script_dir/run_deepseek4_decode_cohort_gate.sh"
 thermal_guard="$script_dir/macos_thermal_guard.sh"
+model_workflow="$script_dir/../.github/workflows/cache-lifecycle.yml"
 release_workflow="$script_dir/../.github/workflows/release.yml"
 test_dir=$(mktemp -d -t hf2q-release-process-group.XXXXXX)
 wrapper_pid=""
@@ -87,15 +88,12 @@ grep -F 'host_contention_validate_thermal_alignment' "$release_gate" >/dev/null
 grep -F 'contention_settle_log="$out_dir/settle-contention.log"' \
   "$decode_gate" >/dev/null
 grep -F 'host_contention_validate_thermal_alignment' "$decode_gate" >/dev/null
-# Literal jq source contracts; the `$d` variable must not expand in this shell.
-# shellcheck disable=SC2016
-grep -F '$d.cooperative_prefill.schema_version == 2' \
-  "$release_workflow" >/dev/null
-# shellcheck disable=SC2016
-grep -F '$d.decode_cohort.schema_version == 3' "$release_workflow" >/dev/null
-grep -F '.thermal.schema_version == 2' "$release_workflow" >/dev/null
-test "$(grep -Fc 'host_contention.policy == "process-group-v1"' \
-  "$release_workflow")" -ge 3
+grep -F 'scripts/run_release_gate_process_group.sh env' "$model_workflow" >/dev/null
+grep -F 'scripts/run_agentic_cache_release_gate.sh' "$model_workflow" >/dev/null
+if grep -Fq '$d.cooperative_prefill.schema_version == 2' "$release_workflow"; then
+  echo "publication still owns model-qualification process receipts" >&2
+  exit 1
+fi
 grep -F 'name ~ /^hf2q(-|$)/ && pgid[i] != owner_pgid' \
   "$thermal_guard" >/dev/null
 if awk '
