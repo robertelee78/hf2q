@@ -14,6 +14,12 @@ use self::host::{HostObservation, HostProbe, LiveHostProbe};
 use self::policy::{resolve_preferences, PreferenceResolution};
 pub(crate) use self::schema::{OperatorConfigV2, ServeDefaultsV2};
 
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigPurgePlan {
+    pub(crate) root: PathBuf,
+    pub(crate) paths: [PathBuf; 3],
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SetupError {
     #[error("setup input: {0}")]
@@ -64,6 +70,30 @@ pub(crate) fn load_operator_config(
 ) -> Result<Option<OperatorConfigV2>, SetupError> {
     let root = resolve_root(explicit_root)?;
     fs::load_config_if_present(&root)
+}
+
+pub(crate) fn prepare_config_purge(
+    explicit_root: Option<&Path>,
+) -> Result<ConfigPurgePlan, SetupError> {
+    let root = resolve_root(explicit_root)?;
+    fs::validate_purge_target(&root)?;
+    Ok(ConfigPurgePlan {
+        paths: [
+            root.join("config.toml"),
+            root.join(".config.toml.partial"),
+            root.join(".config.toml.lock"),
+        ],
+        root,
+    })
+}
+
+pub(crate) fn execute_config_purge(plan: &ConfigPurgePlan) -> Result<Vec<PathBuf>, SetupError> {
+    fs::validate_purge_target(&plan.root)?;
+    let removed = fs::purge_config(&plan.root)?;
+    Ok(removed
+        .into_iter()
+        .map(|name| plan.root.join(name))
+        .collect())
 }
 
 fn execute<P: HostProbe, R: BufRead, W: Write>(

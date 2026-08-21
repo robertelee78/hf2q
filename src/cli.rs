@@ -85,10 +85,10 @@ pub enum Command {
     #[command(name = "__verify-local-gguf", hide = true)]
     VerifyLocalGguf(VerifyLocalGgufArgs),
 
-    /// Update a standalone installation, or restore its retained previous version.
+    /// Update hf2q through its detected installation channel.
     Update(UpdateArgs),
 
-    /// Remove a standalone hf2q executable while preserving config and models.
+    /// Remove hf2q through its detected installation channel.
     Uninstall(UninstallArgs),
 
     /// Learn this Mac and record defaults used by convert and serve.
@@ -225,18 +225,26 @@ pub struct StandaloneInstallArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct UninstallArgs {
-    /// Confirm removal of the standalone executable and its channel files.
+    /// Confirm the exact channel-owned release removal shown by the preview.
     #[arg(long)]
     pub yes: bool,
+
+    /// Also remove only setup-owned config files from the selected state root.
+    #[arg(long)]
+    pub purge_config: bool,
+
+    /// Also purge the validated hf2q model-cache manifest and models tree.
+    #[arg(long)]
+    pub purge_cache: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct UpdateArgs {
-    /// Report whether a newer stable standalone release exists without installing it.
+    /// Check the channel or print its exact non-mutating next action.
     #[arg(long, conflicts_with = "rollback")]
     pub check: bool,
 
-    /// Atomically restore the one previous standalone executable.
+    /// Atomically restore the retained previous standalone executable.
     #[arg(long, conflicts_with = "check")]
     pub rollback: bool,
 }

@@ -1,8 +1,10 @@
 # ADR-045: Frictionless distribution, updates, and guided onboarding
 
-- Status: Proposed; product scope corrected on 2026-08-20, release gate
+- Status: Proposed; product scope corrected on 2026-08-20 and 2026-08-21,
+  release gate
   simplified, and the first public cross-version standalone journey shipped
-  on 2026-08-21
+  on 2026-08-21; universal Cargo/source ownership and explicit purge are
+  implemented locally pending landing evidence
 - Date: 2026-08-17
 - Updated: 2026-08-21
 - Owners: hf2q release engineering and operator experience
@@ -88,8 +90,8 @@ Today an operator still has to infer too much:
 - how to update or remove hf2q without losing models or configuration.
 
 The hf2q.us product surface should take the same useful lesson as OpenCode's
-installation experience: make the installation choice obvious, show exact
-copyable commands, and offer familiar package-manager alternatives. This is
+installation experience: make the installation choice obvious and show exact
+copyable commands. This is
 an interaction model, not a request to copy OpenCode's visual identity or to
 turn hf2q into a JavaScript application.
 
@@ -127,9 +129,6 @@ The intended channels are:
 
 - a standalone installer, with
   `curl -fsSL https://hf2q.us/install.sh | sh` as the primary command;
-- Homebrew;
-- an npm-compatible native-binary package usable from npm and, where the
-  package managers are compatible, Bun, pnpm, or Yarn;
 - direct versioned release downloads; and
 - Cargo/source installation for contributors and advanced operators.
 
@@ -139,10 +138,10 @@ version output, setup invocation, update behavior, and uninstall behavior have
 been proven. Until then, hf2q.us labels it planned or does not show a copyable
 command.
 
-The npm package, if offered, is a thin distributor for the native hf2q binary.
-It must not introduce a Node.js implementation of conversion, quantization,
-or inference. Homebrew and other package-manager recipes similarly distribute
-the same native product.
+Homebrew and npm-family distribution are explicitly outside ADR-045. They are
+not deferred acceptance requirements, planned website methods, or runtime
+ownership cases. A later product decision may add either channel with its own
+artifact and lifecycle proof; this ADR does not reserve or implement them.
 
 The first supported production target is `aarch64-apple-darwin`. Additional
 platforms require their own truthful artifact and runtime proof.
@@ -328,6 +327,13 @@ The guide must distinguish:
 - unsupported or approximate family compatibility, which must not be
   presented as supported.
 
+The client-independent path is the guide's primary path: verify hf2q, run
+setup, select the pinned source, convert and quantize it with hf2q, serve the
+result, and call the API directly. A supported model-author GGUF may appear
+later as a clearly labeled faster external-artifact shortcut, but it cannot
+replace or demote the native conversion journey. Node.js, `jq`, OpenCode, and
+other client prerequisites belong only to their optional section.
+
 Optional client sections show configuration snippets and verification steps.
 hf2q does not install, rewrite, or take ownership of third-party client
 configuration. The core guide must remain complete without OpenCode or any
@@ -355,19 +361,16 @@ channel-specific package identity. Update behavior is:
 
 - standalone/direct-release installs authenticate and atomically replace the
   native hf2q release using the selected release channel;
-- Homebrew installs update through the hf2q Homebrew formula/tap;
-- npm-family installs update through the package manager that installed the
-  package;
 - Cargo installs update through Cargo; and
 - source/development checkouts are explicitly unmanaged and receive exact
   source-update instructions rather than an unsafe automated repository edit.
 
 For every advertised end-user channel, `hf2q update` performs the update by
-using that recorded channel; it may show the exact package-manager action and
-ask for confirmation first. A missing manager or invalid channel receipt is an
-actionable failure, not a fallback to another channel. It must never guess a
-manager, cross channels silently, reinterpret an arbitrary binary on `PATH`,
-or replace a package-manager-owned binary behind that manager's back.
+using that recorded channel; it may show the exact action and ask for
+confirmation first. A missing Cargo executable or invalid channel receipt is
+an actionable failure, not a fallback to another channel. It must never guess
+ownership, cross channels silently, reinterpret an arbitrary binary on
+`PATH`, or replace a Cargo-owned binary behind Cargo's back.
 
 An update changes hf2q-owned release files only. It preserves configuration,
 downloaded source weights, converted models, caches, logs, and other operator
@@ -376,8 +379,9 @@ be versioned, crash-safe, and reversible or fail before changing the active
 installation.
 
 The standalone channel retains the previous known-good hf2q version until the
-new version passes validation and activation. Package-manager rollback follows
-the guarantees of that package manager and must be documented truthfully.
+new version passes validation and activation. Cargo rollback is unsupported
+unless Cargo itself gains an exact, recorded rollback contract; hf2q reports
+that limitation instead of improvising one.
 
 For standalone update, the new executable is downloaded to an OS-managed
 temporary file, bounded and fully verified, then copied to the fixed private
@@ -390,16 +394,96 @@ reported as activation-possibly-complete and reconciled from the executable
 bytes, not guessed from a transition ledger. `hf2q update --rollback` swaps
 only the two exact standalone-owned executable files.
 
+#### Measured installation-ownership contract
+
+The first universal resolver is deliberately limited to channels that can be
+proved from current artifacts. A 2026-08-21 spike on the supported Cargo
+1.88.0 toolchain installed a tiny `hf2q` package through both `--path` and
+`--git file://...` into isolated `--root` directories. Cargo wrote the active
+binary at `<root>/bin/hf2q` and kept two adjacent receipts in sync:
+`.crates.toml` v1 and `.crates2.json`. Both identified one package ID, exact
+version and source, and the exact `hf2q` bin. A separate installed-registry
+sample used Cargo's canonical crates.io source ID
+`registry+https://github.com/rust-lang/crates.io-index`, even though the local
+registry transport used Cargo's sparse cache. `cargo uninstall --root <root>
+hf2q` removed the executable and removed the package from both receipts.
+
+A follow-up selector spike then tested default Git, `--branch`, `--tag`,
+`--rev`, and `--path` installs. Cargo retained `branch`, `tag`, or `rev` as an
+explicit query selector and kept the separately resolved commit after `#`;
+the default-branch form retained no selector, only the resolved commit. Path
+receipts retained the exact local file URL. Cargo 1.88 also exposes `--index`
+for replaying an exact custom-registry index URL. This falsified the earlier
+hypothesis that all non-crates.io Cargo updates lacked stable selection data.
+
+The resolver therefore collects all applicable evidence before choosing an
+owner:
+
+- a standalone marker is valid only when the existing standalone verifier
+  binds it to the canonical running executable;
+- a Cargo root is derived only from a canonical `<root>/bin/hf2q` executable,
+  never from `CARGO_HOME` or another ambient setting; both current Cargo
+  receipts must be bounded, non-symlink, current-user-controlled files and
+  must agree on exactly one `hf2q` owner, version, source, and bin;
+- a source/development build is recognized only in Cargo's standard
+  `target/{debug,release}/hf2q` or target-triple variant below a manifest whose
+  package name is exactly `hf2q`; custom target directories and copied
+  executables are unmanaged; and
+- malformed present evidence is an invalid installation, while two valid
+  owners are ambiguous. Neither condition falls back to another channel.
+
+Cargo update delegates through one direct-argv `cargo install` invocation
+using the exact derived root, source selector, selected `hf2q` binary,
+features, profile, target, and version requirement retained by Cargo. The
+canonical registry uses `--registry crates-io`; a path receipt uses its exact
+`--path` without updating that checkout; Git uses the exact repository and
+retained default/branch/tag/rev selector; and a custom registry uses its exact
+`--index` URL. Credential-bearing or otherwise non-replayable source forms
+remain owned for uninstall but receive an explicit recovery instruction
+rather than leaking credentials or guessing. After Cargo succeeds, hf2q
+proves the binary and both receipts still bind the same root, source selector,
+and options. Cargo uninstall delegates without a shell to `cargo uninstall
+--root <detected-root> --package hf2q@<installed-version> --bin hf2q` and
+proves that the binary and receipt entry are gone. A standard source build
+similarly tells the operator to update the checkout with its chosen VCS
+workflow and rebuild with `cargo build --release --locked`; hf2q never runs
+`git pull`, `cargo clean`, or deletes a checkout.
+
+`hf2q update --check` remains a real remote comparison for standalone. For a
+Cargo or source installation it reports the detected owner and the exact next
+action without mutating anything; Cargo has no stable install dry-run in the
+supported toolchain. `--rollback` remains standalone-only because neither
+Cargo nor a source checkout records hf2q's one-file previous-version slot. A
+raw copied release binary without the standalone marker is unmanaged, even if
+its bytes match a release; the recovery message points to the versioned
+installer or the owning installation method instead of adopting it silently.
+
 ### 6. Make uninstall channel-aware and preserve operator data
 
 `hf2q uninstall` removes hf2q through the installation channel that owns it.
-By default it removes only hf2q release files and package-manager records. It
+By default it removes only hf2q release files and exact Cargo receipts. It
 preserves configuration, model sources, converted artifacts, caches, and logs.
 
 Destructive data removal requires a separate explicit purge request, an exact
 preview of the owned paths, and confirmation. hf2q must never recursively
 delete a broad home, state, cache, or model directory based only on a guessed
 path.
+
+The first explicit surface is `hf2q uninstall --purge-config` and
+`hf2q uninstall --purge-cache`, each still requiring `--yes`. Without
+`--yes`, uninstall resolves and validates the installation owner and selected
+purge roots, prints the exact release action and purge paths, and changes
+nothing. Config purge reuses setup's descriptor-relative ownership checks and
+removes only `config.toml`, `.config.toml.partial`, and
+`.config.toml.lock` from the selected private state root; it does not remove
+unknown siblings. Cache purge reuses the existing manifest-owned model-cache
+operation: it clears the validated hf2q cache `models/` tree and atomically
+resets its manifest while preserving cache locks, Hugging Face's cache,
+operator-selected model directories, persistent-KV roots, and logs. A purge
+target must be an exact, non-root, current-user-controlled path; missing data
+is an idempotent no-op. Release removal is reconciled before purge, and any
+post-removal purge failure reports the completed release action and exact
+survivors rather than claiming full success.
 
 The first standalone uninstall removes only `hf2q`,
 `.hf2q-standalone.json`, `.hf2q-previous`, and an exact in-progress temporary
@@ -410,11 +494,10 @@ the default uninstall implementation.
 ### 7. Keep hf2q.us truthful and product-led
 
 The website will use hf2q's own identity while adopting the useful install
-selector pattern: clear method tabs, one exact copyable command, platform and
-prerequisite notes, and a visible distinction between available and planned
-channels.
+selector pattern: one exact primary command, direct-release and Cargo/source
+alternatives, and clear platform and prerequisite notes.
 
-The website, README, release notes, installer, package recipes, and canonical
+The website, README, release notes, installer, Cargo metadata, and canonical
 guide must agree on:
 
 - supported platforms;
@@ -446,7 +529,7 @@ ADR-045 does not require or authorize:
 - background daemons or forced updates;
 - downloading a pre-quantized model as a substitute for an hf2q conversion;
   or
-- advertising unbuilt package-manager channels.
+- Homebrew or npm-family distribution under this ADR.
 
 If one of those outcomes is needed, it requires its own governing decision or
 the already applicable ADR. It must not be smuggled into onboarding as an
@@ -610,20 +693,10 @@ durability barriers already proven by setup's filesystem tests.
 5. Add the method to the website only after the live bytes pass post-publication
    verification.
 
-### Slice E: add package-manager channels one at a time
-
-For Homebrew, npm-family distribution, and any later channel:
-
-1. build the native-binary package/recipe;
-2. prove clean installation and artifact identity;
-3. implement and prove channel-aware update/uninstall behavior;
-4. verify the installed guide/setup journey; and
-5. only then mark the channel available on hf2q.us.
-
-### Slice F: finish universal update, uninstall, and clean-account proof
+### Slice E: finish universal update, uninstall, and clean-account proof
 
 1. Prove the full channel matrix and mismatch failures.
-2. Prove standalone rollback and truthful package-manager recovery.
+2. Prove standalone rollback and truthful Cargo/source recovery.
 3. Prove default data preservation and explicit purge boundaries.
 4. Run the complete install -> setup -> guide -> update -> uninstall journey
    from a clean Apple-Silicon account using only published artifacts.
@@ -667,7 +740,7 @@ published bytes.
 ### Update and uninstall
 
 - `hf2q update` uses or clearly delegates to the recorded installation channel
-  for standalone, Homebrew, npm-family, Cargo, and source/development cases.
+  for standalone, Cargo, and source/development cases.
 - Channel mismatch, offline, corrupt download, signature failure, release-time
   notarization failure,
   interrupted update, and already-current behavior preserve the active
@@ -678,7 +751,7 @@ published bytes.
 
 ### Traceability
 
-- The website, README, guide, CLI help, release notes, package recipes, and
+- The website, README, guide, CLI help, release notes, and
   governing ADR describe the same current behavior.
 - Source and packaged-artifact tests execute the load-bearing install/setup/
   update/uninstall and guide selectors.
@@ -700,7 +773,12 @@ What exists:
   the existing commands through a selected state root;
 - a local standalone installer template, hidden exact-byte bootstrap, public
   `hf2q update`/`hf2q update --rollback`, and marker-gated
-  `hf2q uninstall --yes` implementation.
+  `hf2q uninstall --yes` implementation;
+- fail-closed standalone, Cargo, source-development, and unmanaged ownership
+  resolution, including direct-argv Cargo update/uninstall delegation; and
+- explicit non-mutating config/cache purge previews whose execution preserves
+  unknown state siblings, cache locks, external model/Hugging Face data,
+  persistent-KV roots, and logs.
 
 The first Slice-D filesystem hypothesis was tested locally on 2026-08-20 with
 two distinct real arm64 hf2q executables. Their SHA-256 values were
@@ -795,6 +873,31 @@ preserved the generated `config.toml` and a separate model sentinel. This
 closes the prior lack of published cross-version standalone evidence without
 adding another installation or update mechanism.
 
+The Cargo/source hypothesis was then measured on Cargo 1.88.0 with isolated
+path and Git installs. Default-branch, branch, tag, revision, path, and
+registry receipt shapes were captured before implementation. Thirteen focused
+resolver/manager tests now cover matching and hostile receipts, exact
+direct-argv reconstruction, selector retention, option/root reconciliation,
+credential-bearing source redaction, and a real offline Cargo path install ->
+update -> uninstall round trip. The source-development CLI check is
+non-mutating; update without `--check` and uninstall both refuse with exact
+checkout instructions. A separate black-box standalone CLI test proves that
+explicit config/cache purge preview changes nothing and confirmed execution
+removes only the named data while preserving unknown state/cache siblings and
+cache locks.
+
+The local lifecycle slice then passed `cargo check --locked --all-targets
+--all-features`, `cargo build --release --locked`, and the complete
+`cargo test --locked` suite: 51 library tests, 4,632 binary tests with 54
+declared ignores, and every executed integration target completed with zero
+failures. The changed Rust files are rustfmt-clean; whole-tree
+`cargo fmt --check` still reports only pre-existing formatting debt outside
+this slice. Parser-focused Agentic-QE SAST reported zero findings in
+`src/distribution` and `src/setup`; no configured external model provider was
+available for its optional consensus pass. This is software/filesystem proof,
+not the still-required distinct-account Apple-Silicon guide and real-model
+acceptance run.
+
 The source installer for the next release is intentionally readable and adds
 only measured boundary hardening: one parse-before-execute compound command,
 closed candidate stdin, physical Apple-Silicon detection under Rosetta,
@@ -829,9 +932,6 @@ sole distribution implementation. That removal landed on main in merge commit
 
 What is not yet the corrected product:
 
-- verified Homebrew and npm-family channels;
-- explicit `hf2q update`/uninstall delegation for Cargo, source, and any later
-  package-manager channels, plus their mismatch recovery;
 - the complete guide/update/uninstall journey from a distinct clean macOS
   account, including the protected real-model acceptance path.
 
@@ -844,14 +944,14 @@ What is not yet the corrected product:
   and observable acceptance gates.
 - Existing conversion/quantization/serving work is reused instead of wrapped
   in a second orchestration system.
-- Package-manager support can grow incrementally without advertising fiction.
+- Additional install-channel support can be proposed later without
+  advertising fiction now.
 - Cache and model-runtime engineering can proceed under the decisions that
   actually govern those subsystems.
 
 ### Trade-offs
 
-- Correcting setup does not itself ship an installer or package-manager
-  channel.
+- Correcting setup does not itself ship an installer or lifecycle channel.
 - Previously landed ADR-045-labeled code requires an explicit follow-up audit.
 - Channel-aware update/uninstall behavior must be implemented and tested for
   each advertised method rather than hidden behind one generic mechanism.

@@ -161,7 +161,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::CatalogHubGguf(args) => cmd_catalog_hub_gguf(args),
         Command::VerifyLocalGguf(args) => cmd_verify_local_gguf(args),
         Command::Update(args) => cmd_update(args),
-        Command::Uninstall(args) => cmd_uninstall(args),
+        Command::Uninstall(args) => cmd_uninstall(args, state_root.as_deref()),
         Command::Setup(args) => setup::run(args, state_root.as_deref()).map_err(|error| {
             if error.is_input() {
                 AppError::Input(anyhow::Error::from(error))
@@ -342,54 +342,26 @@ fn running_executable() -> Result<std::path::PathBuf, AppError> {
 
 fn cmd_update(args: cli::UpdateArgs) -> Result<(), AppError> {
     let executable = running_executable()?;
-    if args.rollback {
-        let install_dir = distribution::standalone::verify_running_installation(&executable)
-            .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
-        distribution::standalone::rollback(&install_dir)
-            .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
-        println!(
-            "Restored the previous standalone hf2q in {}. Run `hf2q --version` to inspect it.",
-            install_dir.display()
-        );
-        return Ok(());
-    }
-    let outcome = distribution::standalone::run_update(&executable, args.check)
-        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
-    match outcome {
-        distribution::standalone::UpdateOutcome::Current { version } => {
-            println!("hf2q {version} is already the current stable standalone release.");
-        }
-        distribution::standalone::UpdateOutcome::Available { current, latest } => {
-            println!("Standalone update available: {current} -> {latest}.");
-        }
-        distribution::standalone::UpdateOutcome::Updated { previous, current } => {
-            println!(
-                "Updated standalone hf2q {previous} -> {current}. Roll back with `hf2q update --rollback`."
-            );
-        }
-    }
-    Ok(())
+    distribution::commands::update(args, &executable).map_err(lifecycle_app_error)
 }
 
-fn cmd_uninstall(args: cli::UninstallArgs) -> Result<(), AppError> {
+fn cmd_uninstall(
+    args: cli::UninstallArgs,
+    state_root: Option<&std::path::Path>,
+) -> Result<(), AppError> {
     let executable = running_executable()?;
-    let install_dir = distribution::standalone::verify_running_installation(&executable)
-        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
-    if !args.yes {
-        return Err(AppError::Input(anyhow::anyhow!(
-            "standalone uninstall would remove only {}, .hf2q-standalone.json, .hf2q-previous, and .hf2q-standalone.lock; configuration and models are preserved. Rerun `hf2q uninstall --yes` to confirm",
-            executable.display()
-        )));
-    }
-    distribution::standalone::uninstall(&install_dir)
-        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
-    println!(
-        "Removed standalone hf2q from {}. Configuration and models were preserved.",
-        install_dir.display()
-    );
-    Ok(())
+    distribution::commands::uninstall(args, state_root, &executable).map_err(lifecycle_app_error)
 }
 
+fn lifecycle_app_error(error: distribution::commands::LifecycleError) -> AppError {
+    let is_input = error.is_input();
+    let error = anyhow::Error::from(error);
+    if is_input {
+        AppError::Input(error)
+    } else {
+        AppError::Conversion(error)
+    }
+}
 fn cmd_standalone_install(args: cli::StandaloneInstallArgs) -> Result<(), AppError> {
     let expectation =
         distribution::standalone::CandidateExpectation::from_hex(args.size, &args.sha256)
