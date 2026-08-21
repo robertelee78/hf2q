@@ -20,6 +20,7 @@ pub mod header;
 #[allow(dead_code)]
 pub mod kv_persist;
 pub mod layer_ctx;
+pub(crate) mod load_diagnostic;
 #[allow(dead_code)]
 pub mod load_info;
 #[allow(dead_code)]

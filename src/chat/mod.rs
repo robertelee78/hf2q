@@ -32,16 +32,23 @@ pub(crate) fn cmd_chat_with_resolver(
     args: ChatArgs,
     resolver: &mut impl EndpointResolver,
 ) -> Result<()> {
-    let mut session = resolver.resolve(&args)?;
-    if args.keep_serving {
-        if let Some(log_path) = session.detach()? {
-            eprintln!("detached hf2q server log: {}", log_path.display());
-        }
-    }
+    // Build the runtime before endpoint resolution can spawn a child. A
+    // runtime-construction failure must not create an owned process whose only
+    // diagnostic log is then unlinked during Drop.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build diagnostic chat runtime")?;
+    let mut session = resolver.resolve(&args)?;
+    if args.keep_serving {
+        match session.detach() {
+            Ok(Some(log_path)) => {
+                eprintln!("detached hf2q server log: {}", log_path.display());
+            }
+            Ok(None) => {}
+            Err(error) => return Err(with_failure_diagnostics(error, &mut session)),
+        }
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = stdin.lock();
@@ -62,15 +69,40 @@ pub(crate) fn cmd_chat_with_resolver(
         let shutdown_result = session
             .shutdown_if_owned(&cleanup_http, auth_token.as_deref())
             .await;
-        match (run_result, shutdown_result) {
+        let result = match (run_result, shutdown_result) {
             (Err(run_error), Err(shutdown_error)) => Err(anyhow::anyhow!(
                 "{run_error:#}; chat-owned server cleanup also failed: {shutdown_error:#}"
             )),
             (Err(error), Ok(())) => Err(error),
             (Ok(()), Err(error)) => Err(error),
             (Ok(()), Ok(())) => Ok(()),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(with_failure_diagnostics(error, &mut session)),
         }
     })
+}
+
+fn with_failure_diagnostics(error: anyhow::Error, session: &mut EndpointSession) -> anyhow::Error {
+    match session.retain_failure_diagnostics() {
+        Ok(Some(diagnostics)) => {
+            let truncation = if diagnostics.truncated {
+                "last 32 KiB"
+            } else {
+                "complete log"
+            };
+            anyhow::anyhow!(
+                "{error:#}\nchat-owned server log retained at {} ({truncation}):\n{}",
+                diagnostics.path.display(),
+                diagnostics.tail.trim_end()
+            )
+        }
+        Ok(None) => error,
+        Err(retain_error) => anyhow::anyhow!(
+            "{error:#}; additionally failed to retain chat-owned server diagnostics: {retain_error:#}"
+        ),
+    }
 }
 
 async fn run_session(

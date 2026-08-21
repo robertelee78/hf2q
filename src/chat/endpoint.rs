@@ -108,12 +108,19 @@ impl ServerLog {
             Ok(retained) => retained,
             Err(error) => {
                 self.temporary = Some(error.file);
-                return Err(error.error).context("retain detached hf2q server log");
+                return Err(error.error).context("retain hf2q server diagnostic log");
             }
         };
         self.retained = Some(path.clone());
         Ok(path)
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnedFailureDiagnostics {
+    pub(crate) path: PathBuf,
+    pub(crate) tail: String,
+    pub(crate) truncated: bool,
 }
 
 /// Concrete process authority created only from the child spawned by chat.
@@ -289,6 +296,26 @@ impl EndpointSession {
                 Ok(Some(log_path))
             }
         }
+    }
+
+    /// Persist and snapshot the bounded server-log suffix for an operation
+    /// that is already failing. This changes no process authority: callers
+    /// still stop an attached child and still leave a detached child alone.
+    pub(crate) fn retain_failure_diagnostics(&mut self) -> Result<Option<OwnedFailureDiagnostics>> {
+        let Ownership::Owned { process, .. } = &mut self.ownership else {
+            return Ok(None);
+        };
+        let path = process.server_log.retain()?;
+        let log_bytes = std::fs::metadata(&path)
+            .with_context(|| format!("inspect hf2q server diagnostic log at {}", path.display()))?
+            .len();
+        let tail = read_log_tail(&path)
+            .with_context(|| format!("read hf2q server diagnostic log at {}", path.display()))?;
+        Ok(Some(OwnedFailureDiagnostics {
+            path,
+            tail,
+            truncated: log_bytes > STDERR_TAIL_BYTES,
+        }))
     }
 
     pub(crate) async fn shutdown_if_owned(
@@ -560,6 +587,14 @@ mod tests {
 
     #[cfg(unix)]
     fn owned_sleep_process(command: &str) -> OwnedServerProcess {
+        owned_sleep_process_with_log(command, tempfile::NamedTempFile::new().unwrap())
+    }
+
+    #[cfg(unix)]
+    fn owned_sleep_process_with_log(
+        command: &str,
+        server_log: tempfile::NamedTempFile,
+    ) -> OwnedServerProcess {
         use std::io::Read;
         use std::os::unix::process::CommandExt;
         let mut command_builder = std::process::Command::new("sh");
@@ -573,12 +608,8 @@ mod tests {
             let mut frame = vec![0u8; crate::serve::CHAT_LIFELINE_DETACH_FRAME.len()];
             let _ = peer.read_exact(&mut frame);
         });
-        OwnedServerProcess::from_spawned(
-            command_builder.spawn().unwrap(),
-            lifeline,
-            tempfile::NamedTempFile::new().unwrap(),
-        )
-        .unwrap()
+        OwnedServerProcess::from_spawned(command_builder.spawn().unwrap(), lifeline, server_log)
+            .unwrap()
     }
 
     #[test]
@@ -610,6 +641,60 @@ mod tests {
         .await
         .expect("external cleanup must not attempt a network request")
         .unwrap();
+        assert!(session.retain_failure_diagnostics().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_diagnostics_retain_only_a_bounded_tail_without_changing_authority() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut log = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        log.write_all(b"prefix-marker\n").unwrap();
+        log.write_all(&vec![b'x'; STDERR_TAIL_BYTES as usize + 1024])
+            .unwrap();
+        log.write_all(b"\nsuffix-marker\n").unwrap();
+        log.flush().unwrap();
+
+        let process = owned_sleep_process_with_log("sleep 30", log);
+        let mut session = EndpointSession::spawned_loopback(9, process);
+        let Ownership::Owned { process, .. } = &mut session.ownership else {
+            panic!("expected owned child");
+        };
+        process.force_stop().unwrap();
+
+        let diagnostics = session
+            .retain_failure_diagnostics()
+            .unwrap()
+            .expect("owned failure must retain diagnostics");
+        assert!(diagnostics.truncated);
+        assert!(diagnostics.tail.contains("suffix-marker"));
+        assert!(!diagnostics.tail.contains("prefix-marker"));
+        assert!(diagnostics.path.exists());
+        let retained_path = diagnostics.path.clone();
+        drop(session);
+        assert!(
+            retained_path.exists(),
+            "retained failure log must survive session drop"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_owned_session_deletes_its_temporary_log() {
+        let process = owned_sleep_process("sleep 30");
+        let temporary_path = process.server_log.path().to_owned();
+        let mut session = EndpointSession::spawned_loopback(9, process);
+        let Ownership::Owned { process, .. } = &mut session.ownership else {
+            panic!("expected owned child");
+        };
+        process.force_stop().unwrap();
+        drop(session);
+        assert!(
+            !temporary_path.exists(),
+            "clean non-detached session must remove its temporary log"
+        );
     }
 
     #[cfg(unix)]

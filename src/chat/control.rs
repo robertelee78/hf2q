@@ -757,6 +757,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activation_preserves_bounded_safe_loader_diagnostic() {
+        async fn rejected() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": "model load failed: selected GGUF is missing required tensor 'output.weight'",
+                        "type": "generation_error"
+                    }
+                })),
+            )
+        }
+        let router = Router::new()
+            .route("/hf2q/v1/runtime", get(runtime))
+            .route("/hf2q/v1/models/activate", post(rejected));
+        let (endpoint, stop) = serve(router).await;
+        let control = Hf2qControl::detect(&reqwest::Client::new(), &endpoint, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = control
+            .ensure_active(
+                "owner/mixed",
+                Some("q8-candidate"),
+                None,
+                &mut std::io::Cursor::new(Vec::<u8>::new()),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("output.weight"));
+        assert!(error.contains("HTTP 500"));
+        let _ = stop.send(());
+    }
+
+    #[tokio::test]
     async fn explicit_switch_resends_exact_revision_and_victim_receipt() {
         let recorded = Recorded::default();
         let router = Router::new()

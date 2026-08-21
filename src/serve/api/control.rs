@@ -516,10 +516,14 @@ async fn resolve_activation_target(
     };
     let bytes = std::fs::metadata(&gguf_path)
         .map_err(|error| {
-            ApiError::generation_error(format!(
-                "cannot read GGUF size at {}: {error}",
-                gguf_path.display()
-            ))
+            tracing::error!(
+                path = %gguf_path.display(),
+                error = %error,
+                "cannot inspect local diagnostic GGUF size"
+            );
+            ApiError::generation_error(
+                "cannot inspect local GGUF file metadata; inspect server diagnostics",
+            )
             .into_response()
         })?
         .len();
@@ -1044,7 +1048,9 @@ mod tests {
 
     #[tokio::test]
     async fn post_commit_load_failure_requires_restart() {
-        let response = lifecycle_error_response(LifecycleError::LoadFailed("boom".to_string()));
+        let response = lifecycle_error_response(LifecycleError::LoadFailed(
+            crate::serve::load_diagnostic::PublicLoadDiagnostic::LoaderRejected,
+        ));
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();

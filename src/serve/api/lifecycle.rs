@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
+use crate::serve::load_diagnostic::PublicLoadDiagnostic;
 use crate::serve::multi_model::{
     AdmissionOutcome, HotSwapError, HotSwapManager, LoadedEngine, LoadedSummary, NonEvictingLoad,
     PreparedEvictionError,
@@ -91,7 +92,7 @@ pub enum LifecycleError {
     VictimPlanChanged,
     PrepareFailed(PreparedEvictionError),
     ShutdownFailed(String),
-    LoadFailed(String),
+    LoadFailed(PublicLoadDiagnostic),
     PostCommitFailed(String),
 }
 
@@ -309,10 +310,15 @@ impl ModelLifecycleCoordinator {
             LifecycleError::PostCommitFailed(format!("activity cleanup failed: {error}"))
         })?;
 
-        match load(Arc::clone(&pool))
-            .await
-            .map_err(|error| LifecycleError::LoadFailed(error.to_string()))?
-        {
+        match load(Arc::clone(&pool)).await.map_err(|error| {
+            tracing::error!(
+                error = %crate::serve::load_diagnostic::private_hotswap_diagnostic(&error),
+                "explicit model switch replacement load failed"
+            );
+            LifecycleError::LoadFailed(crate::serve::load_diagnostic::public_hotswap_diagnostic(
+                &error,
+            ))
+        })? {
             NonEvictingLoad::Conflict(_) => Err(LifecycleError::PostCommitFailed(
                 "replacement admission conflicted after the confirmed victims were removed"
                     .to_owned(),
@@ -731,6 +737,43 @@ mod tests {
         let manager = pool.read().unwrap();
         assert!(manager.try_get("a/1", QuantType::Q4_K_M).is_none());
         assert!(manager.try_get("b/2", QuantType::Q4_K_M).is_none());
+    }
+
+    #[tokio::test]
+    async fn post_commit_loader_failure_preserves_only_typed_public_diagnostic() {
+        let coordinator = ModelLifecycleCoordinator::default();
+        let (pool, _loader, _events, _current_file, _current, confirmation) = switch_fixture();
+        let error = coordinator
+            .switch(
+                Arc::clone(&pool),
+                confirmation,
+                Duration::from_secs(1),
+                |_engine| async move { Ok(()) },
+                |_pool| async move {
+                    let source = anyhow::Error::new(
+                        crate::serve::load_diagnostic::MissingGgufTensor::new("output.weight"),
+                    )
+                    .context("credential hf_secret and /private/operator/model.gguf")
+                    .context("Qwen35Model::load_from_gguf");
+                    Err(HotSwapError::LoaderFailed(source))
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            LifecycleError::LoadFailed(
+                crate::serve::load_diagnostic::PublicLoadDiagnostic::MissingRequiredTensor(
+                    "output.weight".to_owned()
+                )
+            )
+        );
+        assert!(error.requires_restart());
+        let public = error.to_string();
+        assert!(public.contains("output.weight"));
+        assert!(!public.contains("hf_secret"));
+        assert!(!public.contains("/private/operator"));
     }
 
     #[tokio::test]

@@ -244,7 +244,7 @@ pub(crate) fn load_gguf_qweight(
     };
     let info = gguf
         .tensor_info(&full_name)
-        .ok_or_else(|| anyhow::anyhow!("tensor '{}' not found in GGUF", full_name))?;
+        .ok_or_else(|| crate::serve::load_diagnostic::MissingGgufTensor::new(full_name.clone()))?;
     let buffer = gguf
         .load_tensor(&full_name, device)
         .map_err(|e| anyhow::anyhow!("load {}: {e}", full_name))?;
