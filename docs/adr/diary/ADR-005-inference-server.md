@@ -10447,3 +10447,16 @@ content fallback (peer parity) byte-unchanged**.
 replaces the pre-tune-up `..._returns_ok_none` behavior-preserve pin (that pin
 guarded the exact hole being closed, per the tune-up spec). 25/25
 `compile_tool_grammar` suite green.
+
+## 2026-08-20 — guarantees tune-up item 4: never-fits admission rejections are non-retryable 400s
+
+Decision #19's "429 + Retry-After" contract is amended: it now covers only
+transient pressure (queue_full, and slot_budget_exceeded aggregate
+retained-high-water). A request whose prompt + max_tokens can NEVER fit its
+KV ceiling (FIFO per-slot budget; SlotAware total budget in isolation; the
+pre-stream `Engine::try_admit_budget` check) returns **400, code
+`kv_budget_unsatisfiable`, type `invalid_request_error`, no Retry-After** —
+an agent honoring Retry-After on it would loop forever. Full decision table,
+variant split (`AdmitError::KvBudgetUnsatisfiable`,
+`EngineAdmitError::KvBudgetUnsatisfiable`), stats counter, and test pins:
+**ADR-040 §7.KV-BUDGET-SPLIT (2026-08-20)**.

@@ -2776,16 +2776,21 @@ async fn chat_completions_stream(
     };
     if let Err(e) = engine.try_admit_budget(prompt_token_count_u32, max_token_count_u32) {
         match e {
-            engine::EngineAdmitError::SlotBudgetExceeded {
+            // Guarantees tune-up item 4 (2026-08-20): the pre-stream
+            // check is occupancy-independent, so its rejection can
+            // NEVER be relieved by another request completing →
+            // non-retryable 400 (no Retry-After), not 429.
+            engine::EngineAdmitError::KvBudgetUnsatisfiable {
                 needed_bytes,
                 budget_bytes,
             } => {
                 tracing::info!(
                     needed_bytes,
                     budget_bytes,
-                    "chat_completions_stream: ADR-040 §3.5 A5b pre-stream slot_budget_exceeded"
+                    "chat_completions_stream: ADR-040 §3.5 pre-stream kv_budget_unsatisfiable (never fits)"
                 );
-                return ApiError::slot_budget_exceeded(needed_bytes, budget_bytes).into_response();
+                return ApiError::kv_budget_unsatisfiable(needed_bytes, budget_bytes)
+                    .into_response();
             }
         }
     }
@@ -7550,6 +7555,16 @@ fn common_engine_error_response(state: Option<&AppState>, msg: &str) -> Option<R
         }
         return Some(ApiError::queue_full().into_response());
     }
+    // Guarantees tune-up item 4 (2026-08-20): never-fits worker
+    // rejections carry the `kv_budget_unsatisfiable` prefix → map to
+    // the non-retryable 400 (no Retry-After). Checked before
+    // `slot_budget_exceeded` (no substring overlap, but the order
+    // documents precedence). The numeric extractor is shared — both
+    // Display shapes carry needed_bytes=/budget_bytes= pairs.
+    if msg.contains("kv_budget_unsatisfiable") {
+        let (needed, budget) = parse_slot_budget_exceeded(msg);
+        return Some(ApiError::kv_budget_unsatisfiable(needed, budget).into_response());
+    }
     if msg.contains("slot_budget_exceeded") {
         let (needed, budget) = parse_slot_budget_exceeded(msg);
         return Some(ApiError::slot_budget_exceeded(needed, budget).into_response());
@@ -8072,16 +8087,18 @@ async fn chat_model_embeddings(
         // short-circuits the whole batch before any subprocess work.
         if let Err(e) = engine.try_admit_budget(prompt_tokens.len() as u32, 0) {
             match e {
-                engine::EngineAdmitError::SlotBudgetExceeded {
+                // Guarantees tune-up item 4 (2026-08-20): never-fits →
+                // non-retryable 400 (no Retry-After), not 429.
+                engine::EngineAdmitError::KvBudgetUnsatisfiable {
                     needed_bytes,
                     budget_bytes,
                 } => {
                     tracing::info!(
                         needed_bytes,
                         budget_bytes,
-                        "embeddings: ADR-040 §3.5 A5b pre-dispatch slot_budget_exceeded"
+                        "embeddings: ADR-040 §3.5 pre-dispatch kv_budget_unsatisfiable (never fits)"
                     );
-                    return ApiError::slot_budget_exceeded(needed_bytes, budget_bytes)
+                    return ApiError::kv_budget_unsatisfiable(needed_bytes, budget_bytes)
                         .into_response();
                 }
             }
@@ -11934,17 +11951,21 @@ mod a5d_handler_429_tests {
     /// = 1 MiB`, `kv_bytes_per_token_cached = 1 KiB`, request asking
     /// for `(prompt=1000 + max_tokens=1000) × 1024 = 2 MiB`), the
     /// handler's pre-stream admit at handlers.rs:1748 fires
-    /// `EngineAdmitError::SlotBudgetExceeded` and converts it to
-    /// `ApiError::slot_budget_exceeded(needed, budget).into_response()`
-    /// at handlers.rs:1762.
+    /// `EngineAdmitError::KvBudgetUnsatisfiable` and converts it to
+    /// `ApiError::kv_budget_unsatisfiable(needed, budget).into_response()`.
+    ///
+    /// Guarantees tune-up item 4 (2026-08-20): the pre-stream check is
+    /// occupancy-independent (never fits), so the contract here changed
+    /// from 429 + Retry-After: 1 to a NON-RETRYABLE 400 with no
+    /// Retry-After — an agent honoring Retry-After would loop forever.
     ///
     /// Falsifier paths (any one ⇒ handler-level contract broken):
     /// 1. `chat_completions_stream` doesn't call `try_admit_budget` at all.
     /// 2. The admit check happens AFTER `generate_stream_with_deepstack`
     ///    is invoked (would show as `Content-Type: text/event-stream`).
-    /// 3. The handler returns 500 / 503 instead of 429.
-    /// 4. The handler returns 429 without `Retry-After: 1`.
-    /// 5. The handler returns a JSON body without `slot_budget_exceeded`
+    /// 3. The handler returns 500 / 503 / 429 instead of 400.
+    /// 4. The handler sets a `Retry-After` header (must NOT — non-retryable).
+    /// 5. The handler returns a JSON body without `kv_budget_unsatisfiable`
     ///    code.
     ///
     /// **Why the Content-Type assertion is load-bearing**: the iter-A5
@@ -11955,7 +11976,7 @@ mod a5d_handler_429_tests {
     /// response is NOT an SSE body, i.e. the handler short-circuited
     /// BEFORE constructing the SSE response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded(
+    async fn a5d_chat_completions_stream_handler_returns_400_application_json_not_sse_when_kv_budget_unsatisfiable(
     ) {
         // Per-slot budget = 1 MiB; per-token cost = 1 KiB. Request asks
         // for (prompt_len=1000 + max_tokens=1000) × 1024 = 2 MiB > 1 MiB.
@@ -11977,23 +11998,24 @@ mod a5d_handler_429_tests {
         // pre-stream admit path at handlers.rs:1748-1766.
         let response = chat_completions_stream(state, req, prepared).await;
 
-        // Load-bearing assertion #1: 429 (NOT 200 + mid-stream SSE error).
+        // Load-bearing assertion #1: 400 (NOT 200 + mid-stream SSE
+        // error, and NOT 429 — item 4: never-fits is non-retryable).
         assert_eq!(
             response.status(),
-            StatusCode::TOO_MANY_REQUESTS,
-            "iter-A5d Critical #2: streaming handler MUST return 429 \
-             when over-budget; got {}",
+            StatusCode::BAD_REQUEST,
+            "guarantees tune-up item 4: streaming handler MUST return \
+             non-retryable 400 when the request can never fit; got {}",
             response.status()
         );
-        // Load-bearing assertion #2: Retry-After: 1 (matches queue_full).
+        // Load-bearing assertion #2: NO Retry-After (non-retryable).
         let retry_after = response
             .headers()
             .get(header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok());
         assert_eq!(
-            retry_after,
-            Some("1"),
-            "iter-A5d Critical #2: streaming handler MUST set Retry-After: 1"
+            retry_after, None,
+            "guarantees tune-up item 4: never-fits rejection MUST NOT \
+             set Retry-After (an agent honoring it would loop forever)"
         );
         // **LOAD-BEARING ASSERTION #3** (the iter-A5 defect codex
         // flagged): Content-Type MUST be application/json — NOT
@@ -12019,7 +12041,7 @@ mod a5d_handler_429_tests {
              construction — the regression codex flagged in iter-A5); \
              got Content-Type: {ct:?}"
         );
-        // Body shape: contains `slot_budget_exceeded` code + verbatim
+        // Body shape: contains `kv_budget_unsatisfiable` code + verbatim
         // needed/budget numbers (needed = 2 MiB = 2_097_152; budget =
         // 1 MiB = 1_048_576).
         let body_bytes = to_bytes(response.into_body(), 1 << 20)
@@ -12027,9 +12049,9 @@ mod a5d_handler_429_tests {
             .expect("collect body bytes");
         let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
         assert!(
-            body_str.contains("slot_budget_exceeded"),
-            "iter-A5d Critical #2: streaming handler body MUST contain \
-             `slot_budget_exceeded` code; got: {body_str}"
+            body_str.contains("kv_budget_unsatisfiable"),
+            "guarantees tune-up item 4: streaming handler body MUST \
+             contain `kv_budget_unsatisfiable` code; got: {body_str}"
         );
         // (1000 + 1000) × 1024 = 2_048_000 verbatim.
         assert!(

@@ -1846,6 +1846,43 @@ tool/SSE semantics, `/readyz` remained 200, and the powered receipt recorded
 zero sleep or thermal events. Its atomic summary SHA-256 is
 `6f93283e07f65952bbd314cc01b791e439875ed0ca7a8a72b4553378ae9c177c`.
 
+## 7.KV-BUDGET-SPLIT — never-fits vs transient admission rejection (2026-08-20)
+
+**Guarantees tune-up item 4.** Two independent source audits confirmed the
+published contract "a 429 only ever means the box is busy right now" was
+violated: `AdmitError::SlotBudgetExceeded` covered BOTH the transient
+aggregate-pressure case (retained idle-slot high-water; recycling relieves
+it) AND two permanent never-fits cases (FIFO `kv_bytes_needed >
+per_slot_kv_budget_bytes`; SlotAware `kv_bytes_needed >
+total_kv_budget_bytes` in isolation), all mapped to 429 + `Retry-After: 1`.
+An agent honoring Retry-After on a request that can never fit loops forever.
+
+**Decision (Decision #19 amendment).** Split the variant:
+
+| Condition | Error | HTTP | Retry-After | `code` |
+|---|---|---|---|---|
+| queue + in-flight at cap | `AdmitError::QueueFull` | 429 | 1 | `queue_full` |
+| aggregate retained high-water + request > shared budget | `AdmitError::SlotBudgetExceeded` | 429 | 1 | `slot_budget_exceeded` |
+| request alone > per-slot budget (FIFO) or > total shared budget (SlotAware); `Engine::try_admit_budget` pre-stream check | `AdmitError::KvBudgetUnsatisfiable` / `EngineAdmitError::KvBudgetUnsatisfiable` | **400** | **none** | `kv_budget_unsatisfiable` |
+
+The 400 carries `error_type: invalid_request_error` (OpenAI-family SDKs
+treat it as terminal, matching context-length-exceeded conventions) and the
+same operator-actionable needed/budget byte pair. Scheduler stats gain
+`rejected_unsatisfiable_total`, separate from `rejected_429_total`. All 7
+worker_run admit sites emit the `kv_budget_unsatisfiable:` anyhow prefix
+alongside the existing `slot_budget_exceeded:` prefix;
+`common_engine_error_response` sniffs both. Wire-shape pins:
+`test_kv_budget_unsatisfiable_is_400_without_retry_after` (schema),
+`a5d_seam_only_try_admit_budget_to_api_error_400_wire_shape` +
+`a5d_seam_only_streaming_response_is_json_not_sse_when_over_budget`
+(engine seam),
+`a5d_chat_completions_stream_handler_returns_400_application_json_not_sse_when_kv_budget_unsatisfiable`
+(production handler); transient paths keep their 429 pins
+(`slot_aware_aggregate_pressure_returns_429_before_sse`,
+`aggregate_pressure_never_returns_a_payloadless_queued_descriptor`,
+`test_slot_budget_exceeded_is_429_with_retry_after`). 102/102 affected
+tests green.
+
 ## 8. References
 
 ### vLLM
@@ -1861,7 +1898,7 @@ zero sleep or thermal events. Its atomic summary SHA-256 is
 - §"Concurrent-deployment scaling (deferred, future ADR)" (line 1097-1103) — the carve-out this ADR reopens.
 - Resolved Question "Phase 2 scope refinement" Decision #1 (line 6652) — deferral decision with reopen trigger.
 - Resolved Question "Phase 2 scope refinement" Decision #2 (line 6653) — FIFO contract this ADR preserves under `SchedulerPolicy::FifoSerial`.
-- Resolved Question "Phase 2 scope refinement" Decision #19 (line 6679) — 429 + Retry-After contract preserved.
+- Resolved Question "Phase 2 scope refinement" Decision #19 (line 6679) — 429 + Retry-After contract preserved for transient pressure; amended 2026-08-20 by §7.KV-BUDGET-SPLIT (never-fits requests now 400 `kv_budget_unsatisfiable`, no Retry-After).
 - Phase 4 §"Out of scope" (line 6439) — "Phase 4's pool is request-serial within each loaded model" — superseded by this ADR's Phase C cutover.
 
 ---

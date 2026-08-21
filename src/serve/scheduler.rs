@@ -430,6 +430,27 @@ pub enum AdmitError {
         /// Shared physical KV budget configured on the scheduler.
         budget_bytes: u64,
     },
+    /// The request's caller-computed KV-byte high-water exceeds a hard
+    /// ceiling it can NEVER satisfy — the FIFO per-slot budget, or the
+    /// SlotAware TOTAL shared budget considered in isolation. No other
+    /// request's completion can relieve it.
+    ///
+    /// Guarantees tune-up item 4 (2026-08-20): split out of
+    /// [`Self::SlotBudgetExceeded`], which used to cover BOTH this
+    /// permanent case and the transient aggregate-pressure case under
+    /// one 429 + `Retry-After: 1` — an agent honoring Retry-After would
+    /// loop forever on a request that can never fit. This variant maps
+    /// to a NON-RETRYABLE 400 (`kv_budget_unsatisfiable`, no
+    /// Retry-After) upstream; transient budget pressure (retained
+    /// idle-slot high-water that recycling can relieve) stays
+    /// [`Self::SlotBudgetExceeded`] → 429.
+    KvBudgetUnsatisfiable {
+        /// Bytes the admit attempt would need (from `AdmitRequest::kv_bytes_needed`).
+        needed_bytes: u64,
+        /// The hard ceiling this request can never satisfy (FIFO
+        /// per-slot budget or SlotAware total shared budget).
+        budget_bytes: u64,
+    },
 }
 
 impl fmt::Display for AdmitError {
@@ -453,6 +474,16 @@ impl fmt::Display for AdmitError {
                 "slot_budget_exceeded: shared KV budget exceeded (needed_bytes={}, budget_bytes={}) \
                  — ADR-040 full-context slots: reduce max_tokens, shorten the prompt, \
                  or raise the physical KV budget",
+                needed_bytes, budget_bytes,
+            ),
+            AdmitError::KvBudgetUnsatisfiable {
+                needed_bytes,
+                budget_bytes,
+            } => write!(
+                f,
+                "kv_budget_unsatisfiable: request can never fit the physical KV budget \
+                 (needed_bytes={}, budget_bytes={}) — non-retryable: reduce max_tokens, \
+                 shorten the prompt, or raise the physical KV budget",
                 needed_bytes, budget_bytes,
             ),
         }
@@ -480,6 +511,12 @@ pub struct SchedulerStats {
     pub queue_capacity: u32,
     pub admitted_total: u64,
     pub rejected_429_total: u64,
+    /// Admission rejections that can NEVER succeed (guarantees tune-up
+    /// item 4, 2026-08-20): the request alone exceeds a hard KV
+    /// ceiling. Mapped to a non-retryable 400 upstream
+    /// (`kv_budget_unsatisfiable`), so counted separately from
+    /// `rejected_429_total` (transient pressure — retryable 429s).
+    pub rejected_unsatisfiable_total: u64,
     pub completed_total: u64,
 }
 
@@ -541,6 +578,7 @@ pub struct FifoSchedulerAdapter {
     next_request_id: u64,
     admitted_total: u64,
     rejected_429_total: u64,
+    rejected_unsatisfiable_total: u64,
     completed_total: u64,
     /// **ADR-040 §3.5 iter-A5** — physical KV budget in bytes. `0`
     /// disables enforcement (preserves byte-equivalence for pre-A5
@@ -608,6 +646,7 @@ impl FifoSchedulerAdapter {
             next_request_id: 0,
             admitted_total: 0,
             rejected_429_total: 0,
+            rejected_unsatisfiable_total: 0,
             completed_total: 0,
             per_slot_kv_budget_bytes,
             fixed_kv_bytes_per_slot,
@@ -785,13 +824,16 @@ impl Scheduler for FifoSchedulerAdapter {
         // ADR-040 §3.5 iter-A5 — physical KV budget check FIRST. A
         // request that cannot fit in the FIFO worker's only slot
         // cannot be served regardless of queue state; rejecting before
-        // the queue check is operator-honest (the 429 names the per-
-        // request structural problem, not transient capacity).  Budget
-        // == 0 disables the check entirely (pre-A5 byte-equivalence).
+        // the queue check is operator-honest. Budget == 0 disables the
+        // check entirely (pre-A5 byte-equivalence). Guarantees tune-up
+        // item 4 (2026-08-20): this is the NEVER-fits case — no other
+        // request's completion can relieve it — so it returns the
+        // non-retryable `KvBudgetUnsatisfiable` (→ 400, no Retry-After)
+        // instead of the retryable SlotBudgetExceeded 429.
         if self.per_slot_kv_budget_bytes > 0 && req.kv_bytes_needed > self.per_slot_kv_budget_bytes
         {
-            self.rejected_429_total = self.rejected_429_total.saturating_add(1);
-            return Err(AdmitError::SlotBudgetExceeded {
+            self.rejected_unsatisfiable_total = self.rejected_unsatisfiable_total.saturating_add(1);
+            return Err(AdmitError::KvBudgetUnsatisfiable {
                 needed_bytes: req.kv_bytes_needed,
                 budget_bytes: self.per_slot_kv_budget_bytes,
             });
@@ -895,6 +937,7 @@ impl Scheduler for FifoSchedulerAdapter {
             queue_capacity: self.queue_capacity,
             admitted_total: self.admitted_total,
             rejected_429_total: self.rejected_429_total,
+            rejected_unsatisfiable_total: self.rejected_unsatisfiable_total,
             completed_total: self.completed_total,
         }
     }
@@ -999,6 +1042,7 @@ pub struct InflightBatchedScheduler {
     next_request_id: u64,
     admitted_total: u64,
     rejected_429_total: u64,
+    rejected_unsatisfiable_total: u64,
     completed_total: u64,
     /// Shared physical KV budget across every logical slot. `0` disables
     /// enforcement. Logical context capacity is independent of this value.
@@ -1063,6 +1107,7 @@ impl InflightBatchedScheduler {
             next_request_id: 0,
             admitted_total: 0,
             rejected_429_total: 0,
+            rejected_unsatisfiable_total: 0,
             completed_total: 0,
             total_kv_budget_bytes,
             fixed_kv_bytes_per_slot,
@@ -1440,9 +1485,13 @@ impl Scheduler for InflightBatchedScheduler {
         }
         // One request can never fit if its physical demand exceeds the whole
         // shared budget. Concurrency pressure below is queueable.
+        // Guarantees tune-up item 4 (2026-08-20): NEVER-fits →
+        // non-retryable `KvBudgetUnsatisfiable` (→ 400, no Retry-After);
+        // the aggregate retained-high-water case further down stays the
+        // retryable SlotBudgetExceeded 429 (recycling relieves it).
         if self.total_kv_budget_bytes > 0 && req.kv_bytes_needed > self.total_kv_budget_bytes {
-            self.rejected_429_total = self.rejected_429_total.saturating_add(1);
-            return Err(AdmitError::SlotBudgetExceeded {
+            self.rejected_unsatisfiable_total = self.rejected_unsatisfiable_total.saturating_add(1);
+            return Err(AdmitError::KvBudgetUnsatisfiable {
                 needed_bytes: req.kv_bytes_needed,
                 budget_bytes: self.total_kv_budget_bytes,
             });
@@ -1646,6 +1695,7 @@ impl Scheduler for InflightBatchedScheduler {
             queue_capacity: self.queue_capacity,
             admitted_total: self.admitted_total,
             rejected_429_total: self.rejected_429_total,
+            rejected_unsatisfiable_total: self.rejected_unsatisfiable_total,
             completed_total: self.completed_total,
         }
     }
@@ -3171,7 +3221,7 @@ mod tests {
         let mut s = FifoSchedulerAdapter::new_with_kv_budget(4, 1024 * 1024);
         let needed = 2 * 1024 * 1024;
         match s.admit(req_with_kv(1024, 64, needed)) {
-            Err(AdmitError::SlotBudgetExceeded {
+            Err(AdmitError::KvBudgetUnsatisfiable {
                 needed_bytes,
                 budget_bytes,
             }) => {
@@ -3185,14 +3235,21 @@ mod tests {
                     "error names the per-slot budget bytes"
                 );
             }
-            other => panic!("expected SlotBudgetExceeded, got {:?}", other),
+            other => panic!("expected KvBudgetUnsatisfiable, got {:?}", other),
         }
-        // Counters: rejected_429_total bumped; admitted_total NOT bumped
-        // (admit returned Err before the admitted-counter increment).
+        // Counters (guarantees tune-up item 4, 2026-08-20): a request
+        // that can NEVER fit bumps rejected_unsatisfiable_total (maps
+        // to non-retryable 400 upstream), NOT rejected_429_total;
+        // admitted_total NOT bumped (admit returned Err first).
         let stats = s.stats();
         assert_eq!(
-            stats.rejected_429_total, 1,
-            "SlotBudgetExceeded bumps rejected_429_total (maps to 429 upstream)"
+            stats.rejected_unsatisfiable_total, 1,
+            "KvBudgetUnsatisfiable bumps rejected_unsatisfiable_total \
+             (maps to non-retryable 400 upstream)"
+        );
+        assert_eq!(
+            stats.rejected_429_total, 0,
+            "never-fits rejection must NOT count as a retryable 429"
         );
         assert_eq!(stats.admitted_total, 0);
         assert_eq!(
@@ -3229,16 +3286,22 @@ mod tests {
         let mut s = InflightBatchedScheduler::new_with_kv_budget(8, 4, 4 * 1024 * 1024);
         let needed = 5 * 1024 * 1024;
         match s.admit(req_with_kv(2048, 128, needed)) {
-            Err(AdmitError::SlotBudgetExceeded {
+            Err(AdmitError::KvBudgetUnsatisfiable {
                 needed_bytes,
                 budget_bytes,
             }) => {
                 assert_eq!(needed_bytes, needed);
                 assert_eq!(budget_bytes, 4 * 1024 * 1024);
             }
-            other => panic!("expected SlotBudgetExceeded, got {:?}", other),
+            other => panic!("expected KvBudgetUnsatisfiable, got {:?}", other),
         }
-        assert_eq!(s.stats().rejected_429_total, 1);
+        assert_eq!(
+            s.stats().rejected_unsatisfiable_total,
+            1,
+            "single request > total shared budget can NEVER fit → \
+             non-retryable counter (guarantees tune-up item 4)"
+        );
+        assert_eq!(s.stats().rejected_429_total, 0);
         assert_eq!(s.stats().admitted_total, 0);
         assert_eq!(
             s.stats().in_flight_slots,
@@ -3276,6 +3339,37 @@ mod tests {
         assert!(
             disp.contains("ADR-040"),
             "Display cites ADR-040 §3.5: {}",
+            disp
+        );
+        assert!(
+            disp.contains("max_tokens") || disp.contains("prompt"),
+            "Display names the actionable remediation: {}",
+            disp
+        );
+    }
+
+    /// Guarantees tune-up item 4 (2026-08-20): the never-fits variant's
+    /// Display carries the stable `kv_budget_unsatisfiable` prefix (the
+    /// handler string-sniffs it on the worker anyhow path, parallel to
+    /// `slot_budget_exceeded`) plus the needed/budget key=value pair the
+    /// numeric extractor reads.
+    #[test]
+    fn admit_error_kv_budget_unsatisfiable_display_names_needed_and_budget() {
+        let err = AdmitError::KvBudgetUnsatisfiable {
+            needed_bytes: 12_345_678,
+            budget_bytes: 4_096_000,
+        };
+        let disp = format!("{}", err);
+        assert!(
+            disp.starts_with("kv_budget_unsatisfiable:"),
+            "stable sniffable prefix: {}",
+            disp
+        );
+        assert!(disp.contains("needed_bytes=12345678"), "{}", disp);
+        assert!(disp.contains("budget_bytes=4096000"), "{}", disp);
+        assert!(
+            disp.contains("non-retryable"),
+            "Display states the non-retryable contract: {}",
             disp
         );
         assert!(
@@ -3341,16 +3435,17 @@ mod tests {
         assert_eq!(s.resident_high_water_bytes(), one_mib);
         assert_eq!(s.reserved_high_water_bytes(), total);
 
-        // A single request larger than the entire physical pool can never run.
+        // A single request larger than the entire physical pool can never
+        // run — guarantees tune-up item 4: non-retryable variant.
         match s.admit(req_with_kv(64, 16, total + 1)) {
-            Err(AdmitError::SlotBudgetExceeded {
+            Err(AdmitError::KvBudgetUnsatisfiable {
                 needed_bytes,
                 budget_bytes,
             }) => {
                 assert_eq!(needed_bytes, total + 1);
                 assert_eq!(budget_bytes, total);
             }
-            other => panic!("expected SlotBudgetExceeded, got {:?}", other),
+            other => panic!("expected KvBudgetUnsatisfiable, got {:?}", other),
         }
     }
 
