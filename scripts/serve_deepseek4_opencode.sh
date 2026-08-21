@@ -66,6 +66,9 @@
 #   MAX_SLOTS=8 scripts/serve_deepseek4_opencode.sh         # np8-like
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/hf2q_process_guard.sh"
+
 # The default is the schema-v2, source-bound reproduction used by the strict
 # coherence/performance gate. Operators may still set MODEL to any explicitly
 # supported DeepSeek-V4 GGUF; serving is not restricted by producer identity.
@@ -146,7 +149,8 @@ fi
 
 # One-model-at-a-time guard: the agentic artifact is ~100 GiB and a second
 # inference process on a 128 GiB unified-memory host will exhaust headroom.
-if RUNTIME_PIDS="$(pgrep -x hf2q 2>/dev/null)"; then
+RUNTIME_PIDS="$(hf2q_active_serve_pids)"
+if [[ -n "$RUNTIME_PIDS" ]]; then
     echo "another hf2q server is already running — refusing before model load" >&2
     echo "pid(s): ${RUNTIME_PIDS//$'\n'/, }" >&2
     echo "stop that server before starting DeepSeek-V4" >&2
