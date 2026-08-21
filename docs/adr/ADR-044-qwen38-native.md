@@ -4,12 +4,14 @@
   speculation accepted for the measured one-slot workloads; vision candidate
   is under exact-artifact acceptance
 - Date: 2026-08-16
-- Updated: 2026-08-20 — the canonical server now owns exact fixed-K3 MTP and
+- Updated: 2026-08-21 — the canonical server now owns exact fixed-K3 MTP and
   request-history speculation with per-proposer measured cost gates. GGUF
   inference preserves the artifact's declared weight encodings; the qualified
   width-four verifier substantially narrows the measured one-slot code gap.
-  The remaining single-user gap and true physical multi-slot batching remain
-  performance blockers.
+  A one-slot worker now uses the measured 4,096-token prefill quantum while
+  multi-slot workers retain the 2,048-token fairness ceiling. The remaining
+  single-user gap and true physical multi-slot batching remain performance
+  blockers.
 - Owners: hf2q conversion, quantization, inference, and serving
 
 ## Context
@@ -358,6 +360,20 @@ performance failure: 7,038 tokens were reused, but the 4,017-token uncached
 suffix plus decode completed in 11.464 seconds against a 10-second limit. Its
 semantics were correct; the latency failure remains open and is not waived by
 the smaller passing fixture.
+
+Merged commit `1aa7cdebcb2a` promotes a 4,096-token prefill quantum only when
+the slot-aware worker owns one physical slot. Multi-slot workers and inline
+surfaces retain the established 2,048-token ceiling, and every target
+transaction remains hard-capped at 4,096 tokens. On the exact Q4_K_M artifact
+above, the large continuation reused 7,020 of 10,887 prompt tokens and
+processed the same 3,867-token suffix in both arms. Two current-base arms per
+configuration measured 13.326 seconds at 2,048 versus 12.102 seconds at 4,096:
+a 1.224-second, 9.2% median improvement. Cold and cached unary behavior,
+automatic tool choice, SSE reconstruction, tool-result continuation, and
+source syntax all passed in every arm. Lighter-load strict runs measured
+9.766, 10.024, and 9.881 seconds at 4,096, so the absolute 10-second bound
+remains host-sensitive and open; this evidence accepts the bounded incremental
+speedup, not closure of the broader latency gate.
 
 ### Vision candidate evidence (2026-08-16)
 
