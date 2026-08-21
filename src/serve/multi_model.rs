@@ -703,6 +703,9 @@ pub struct LoadedEngine<E> {
     pub engine: E,
     /// HuggingFace repo id (or path stem) — same key the pool uses.
     pub repo: String,
+    /// Canonical or loader-supplied GGUF path for exact local-artifact
+    /// resident matching. Empty only in synthetic tests.
+    pub gguf_path: PathBuf,
     /// Quantization variant resident on this engine.
     pub quant: QuantType,
     /// On-GPU resident-bytes estimate (typically GGUF file size; the
@@ -1241,6 +1244,7 @@ impl<E> HotSwapManager<E> {
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
             repo: repo.to_string(),
+            gguf_path: PathBuf::new(),
             quant,
             bytes_resident,
             loaded_at: SystemTime::now(),
@@ -1507,6 +1511,7 @@ impl<E> HotSwapManager<E> {
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
             repo: repo.to_string(),
+            gguf_path: gguf_path.to_path_buf(),
             quant,
             bytes_resident,
             loaded_at: SystemTime::now(),
@@ -1591,6 +1596,7 @@ impl<E> HotSwapManager<E> {
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
             repo: repo.to_string(),
+            gguf_path: gguf_path.to_path_buf(),
             quant,
             bytes_resident,
             loaded_at: SystemTime::now(),

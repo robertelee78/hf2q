@@ -57,7 +57,8 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/doctor.rs        `hf2q doctor` runtime diagnostic
 ├── src/chat/            ADR-047 diagnostic terminal client: discovery,
 │                        OpenAI SSE, session transcript, explicit model
-│                        activation, hosted-GGUF selection, telemetry, and
+│                        activation, receipt-backed local/hosted GGUF
+│                        selection, telemetry, and
 │                        process-group/parent-lifetime child supervision
 ├── src/setup/           `hf2q setup` host inventory, strict operator-default
 │                        schema/loader, interactive policy, and private
@@ -404,6 +405,8 @@ markers.
 | `POST /v1/chat/completions` | `handlers::chat_completions` |
 | `POST /v1/embeddings` | `handlers::embeddings` |
 | `GET /hf2q/v1/runtime` | `control::hf2q_runtime` — versioned capabilities and pool state |
+| `GET /hf2q/v1/models/local-artifacts` | `control::local_gguf_catalog` — bounded server-local receipt/cache inventory with opaque activation IDs |
+| `GET /hf2q/v1/models/catalog` | `control::hub_gguf_catalog` — metadata-only hosted GGUF inventory |
 | `POST /hf2q/v1/models/activate` | `control::activate_model` — non-evicting load or explicit revision-bound switch |
 | `POST /shutdown` | `handlers::shutdown` (auth-gated) |
 

@@ -159,6 +159,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::StandaloneInstall(args) => cmd_standalone_install(args),
         Command::FetchHubGguf(args) => cmd_fetch_hub_gguf(args),
         Command::CatalogHubGguf(args) => cmd_catalog_hub_gguf(args),
+        Command::VerifyLocalGguf(args) => cmd_verify_local_gguf(args),
         Command::Update(args) => cmd_update(args),
         Command::Uninstall(args) => cmd_uninstall(args),
         Command::Setup(args) => setup::run(args, state_root.as_deref()).map_err(|error| {
@@ -225,6 +226,25 @@ fn cmd_catalog_hub_gguf(args: cli::CatalogHubGgufArgs) -> Result<(), AppError> {
     let catalog = input::hf_download::resolve_hub_gguf_catalog(reference)
         .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
     serde_json::to_writer(std::io::stdout().lock(), &catalog)
+        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+    println!();
+    Ok(())
+}
+
+fn cmd_verify_local_gguf(args: cli::VerifyLocalGgufArgs) -> Result<(), AppError> {
+    let quant = serve::quant_select::QuantType::from_canonical_str(&args.quant)
+        .map_err(|error| AppError::Input(anyhow::anyhow!(error)))?;
+    let receipt = serve::api::local_artifacts::verify_local_artifact(
+        serve::api::local_artifacts::LocalVerificationRequest {
+            root: &args.root,
+            artifact: &args.artifact,
+            bytes: args.bytes,
+            sha256: &args.sha256,
+            quant,
+        },
+    )
+    .map_err(AppError::Input)?;
+    serde_json::to_writer(std::io::stdout().lock(), &receipt)
         .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
     println!();
     Ok(())

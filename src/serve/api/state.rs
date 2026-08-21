@@ -550,6 +550,9 @@ pub struct AppState {
     pub preparations: super::cancellation::PreparationSupervisor,
     /// Bounded, ephemeral server authority for exact hosted artifact choices.
     pub artifact_catalog: super::artifact_catalog::ArtifactCatalogCoordinator,
+    /// Bounded server-local roots eligible for receipt-backed diagnostic
+    /// artifact discovery. Paths never cross the HTTP boundary.
+    pub local_artifacts: super::local_artifacts::LocalArtifactInventory,
     /// On-disk cache (`~/.cache/hf2q/`).  Held behind `Arc<Mutex<_>>` so
     /// concurrent handlers that resolve a `req.model` through the
     /// auto-pipeline (which may mutate the manifest on download /
@@ -792,7 +795,10 @@ impl AppState {
     ) -> anyhow::Result<Self> {
         let hardware = crate::core::hardware::HardwareProfiler::detect()
             .map_err(|e| anyhow::anyhow!("hardware detection: {e}"))?;
-        let cache = ModelCache::open()?;
+        let cache = match config.cache_dir.as_ref() {
+            Some(root) => ModelCache::open_at(root)?,
+            None => ModelCache::open()?,
+        };
         let pool = LoadedPool::from_hardware(&hardware);
         // ADR-005 Phase 4 reopen iter-213 (AC 5472): KV-spill counters
         // are owned by AppState and Arc-cloned into HotSwapManager so the
@@ -813,6 +819,7 @@ impl AppState {
             model_lifecycle: Arc::new(super::lifecycle::ModelLifecycleCoordinator::default()),
             preparations: super::cancellation::PreparationSupervisor::default(),
             artifact_catalog: super::artifact_catalog::ArtifactCatalogCoordinator::default(),
+            local_artifacts: super::local_artifacts::LocalArtifactInventory::default(),
             cache: Arc::new(std::sync::Mutex::new(cache)),
             hardware: Arc::new(hardware),
             no_integrity,
@@ -881,6 +888,7 @@ impl AppState {
             model_lifecycle: Arc::new(super::lifecycle::ModelLifecycleCoordinator::default()),
             preparations: super::cancellation::PreparationSupervisor::default(),
             artifact_catalog: super::artifact_catalog::ArtifactCatalogCoordinator::default(),
+            local_artifacts: super::local_artifacts::LocalArtifactInventory::default(),
             cache: Arc::new(std::sync::Mutex::new(cache)),
             hardware: Arc::new(hardware),
             no_integrity: false,
@@ -905,6 +913,14 @@ impl AppState {
     /// argument).  Returned by-value for builder chaining.
     pub fn with_default_model(mut self, default_model: Option<String>) -> Self {
         self.default_model = default_model;
+        self
+    }
+
+    pub fn with_local_artifacts(
+        mut self,
+        local_artifacts: super::local_artifacts::LocalArtifactInventory,
+    ) -> Self {
+        self.local_artifacts = local_artifacts;
         self
     }
 

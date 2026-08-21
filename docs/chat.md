@@ -12,11 +12,14 @@ hf2q chat
 # Select or load a particular model
 hf2q chat --model /path/to/model.gguf
 
-# A mixed Hub repository prompts for one selectable hosted GGUF before any
-# payload transfer. Use --quant or --artifact for non-interactive selection.
+# A repository offers receipt-backed local GGUFs before hosted GGUFs.
+# Use --quant or --artifact for non-interactive local-first selection.
 hf2q chat --model owner/model
-hf2q chat --model owner/model --quant q6_k
+hf2q chat --model owner/model --quant Q6_K
 hf2q chat --model owner/model --artifact gguf/model-q6_k.gguf
+
+# Add a bounded server-local receipt root for a manually launched server
+hf2q serve --port 9123 --model-dir /srv/hf2q-models
 
 # Use any explicitly named OpenAI-compatible endpoint
 hf2q chat --url http://127.0.0.1:9123 --model model-id
@@ -35,22 +38,28 @@ parent exit also stop the chat-owned process group. Child server logs are
 captured rather than inherited, so a stopped chat cannot leave a download
 progress bar painting over the shell prompt.
 
-For a Hugging Face repository that contains both source weights and GGUFs,
-diagnostic chat queries the hf2q server's metadata-only catalog and presents
-selectable text GGUFs. The current hosted bridge selects Q3_K_M, Q4_K_M, Q6_K,
-and Q8_0. Q5_K_M remains visible but disabled until artifact file type is
+For a Hugging Face repository, diagnostic chat first asks the hf2q server for
+schema-v3 conversion receipts and canonical managed-cache entries. The server
+automatically inventories its startup directory's `models/` tree; repeatable
+`serve --model-dir DIR` flags add explicit roots. A matching `--quant` or
+`--artifact` selects a unique local artifact without contacting the Hub. With
+no selector, local rows appear first and `Browse hosted artifacts` makes Hub
+metadata access explicit. Paths, receipt-recorded paths, and output digests
+never enter the TUI.
+
+If hosted browsing is selected, the current bridge selects Q3_K_M, Q4_K_M,
+Q6_K, and Q8_0. Q5_K_M remains visible but disabled until artifact file type is
 separated from ADR-005's conversion-policy identity; BF16, split GGUFs, and
 mmproj companions are also shown with an unavailable reason. The catalog's
 quant is a filename-derived hint, not a compatibility claim. After selection,
-hf2q verifies the downloaded GGUF header before pool publication. Source
-conversion remains outside this diagnostic flow and is never its silent
-default. Cataloging pins the Hub commit, filename, byte size, and LFS SHA-256;
-only the chosen file is downloaded and authenticated.
+hf2q verifies local artifacts against their full receipt/cache SHA-256, or
+verifies hosted downloads against pinned Hub commit, filename, byte size, LFS
+SHA-256, and GGUF header, before pool publication. Source conversion remains
+outside this diagnostic flow and is never its silent default.
 
-A unique resident repository match connects without Hub access. An ambiguous
-or nonresident repository opens the hosted picker. This slice deliberately
-does not merge hf2q's conversion cache into that picker because legacy cache
-entries do not yet carry authoritative emitted-artifact identity.
+A unique resident repository match connects without disk or Hub access.
+Receipt-backed and canonical managed-cache candidates are next. Legacy cache
+metadata without canonical emitted-artifact authority remains excluded.
 
 ## Session controls
 
@@ -94,13 +103,15 @@ An explicit `--url` needs only OpenAI-compatible chat and model-list routes for
 basic use. The switch operation appears only when that endpoint exposes the
 hf2q lifecycle capability.
 
-The hf2q-specific control routes are `GET /hf2q/v1/runtime`, metadata-only
+The hf2q-specific control routes are `GET /hf2q/v1/runtime`, server-local
+`GET /hf2q/v1/models/local-artifacts`, metadata-only
 `GET /hf2q/v1/models/catalog`, and `POST /hf2q/v1/models/activate`. They use the
-same Bearer-auth middleware as the OpenAI routes. Hosted payload transfer runs
-behind a request-cancellable hf2q process boundary; cancelling an external
-chat request stops the transfer without stopping the pre-existing server.
-Metadata helpers and hosted transfers are independently bounded to two active
-children, and opaque activation selections expire after ten minutes.
+same Bearer-auth middleware as the OpenAI routes. Local SHA verification and
+hosted payload transfer run behind request-cancellable hf2q process boundaries;
+cancelling an external chat request stops preparation without stopping the
+pre-existing server. Local verification is bounded to one active child;
+metadata helpers and hosted transfers are independently bounded to two, and
+opaque activation selections expire after ten minutes.
 
 Shell completion files are generated snapshots of the clap grammar. After
 upgrading from a build that predates `chat`, regenerate and re-source them with
