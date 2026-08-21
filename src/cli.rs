@@ -95,6 +95,10 @@ pub enum Command {
     #[command(name = "source-teacher", hide = true)]
     SourceTeacher(SourceTeacherArgs),
 
+    /// Compare the pinned source-teacher target to an external reference.
+    #[command(name = "source-teacher-reference", hide = true)]
+    SourceTeacherReference(SourceTeacherReferenceArgs),
+
     /// Diagnose RuVector, hardware detection, and disk space
     Doctor,
 
@@ -227,6 +231,29 @@ pub struct SourceTeacherArgs {
     /// Omit this flag for a model-weight/Metal-allocation-free preflight.
     #[arg(long, default_value_t = false)]
     pub execute: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct SourceTeacherReferenceArgs {
+    /// Exact local Qwen3.8-27B snapshot selected by the embedded recipe.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub model_dir: PathBuf,
+
+    /// JSON stdout captured from the completed native source-teacher run.
+    #[arg(long, value_name = "FILE")]
+    pub native_summary: PathBuf,
+
+    /// Published native full-vocabulary target artifact.
+    #[arg(long, value_name = "FILE")]
+    pub native_target: PathBuf,
+
+    /// Metadata emitted by the pinned external reference harness.
+    #[arg(long, value_name = "FILE")]
+    pub external_evidence: PathBuf,
+
+    /// Full-vocabulary target artifact emitted by the external reference.
+    #[arg(long, value_name = "FILE")]
+    pub external_target: PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1228,6 +1255,31 @@ mod tests {
             panic!("expected SourceTeacher");
         };
         assert!(args.execute);
+    }
+
+    #[test]
+    fn source_teacher_reference_requires_all_exact_artifacts() {
+        let cli = Cli::parse_from([
+            "hf2q",
+            "source-teacher-reference",
+            "--model-dir",
+            "/tmp/qwen38-source",
+            "--native-summary",
+            "/tmp/native.json",
+            "--native-target",
+            "/tmp/native.bin",
+            "--external-evidence",
+            "/tmp/reference.json",
+            "--external-target",
+            "/tmp/reference.bin",
+        ]);
+        let Command::SourceTeacherReference(args) = cli.command else {
+            panic!("expected SourceTeacherReference");
+        };
+        assert_eq!(args.native_summary, PathBuf::from("/tmp/native.json"));
+        assert_eq!(args.native_target, PathBuf::from("/tmp/native.bin"));
+        assert_eq!(args.external_evidence, PathBuf::from("/tmp/reference.json"));
+        assert_eq!(args.external_target, PathBuf::from("/tmp/reference.bin"));
     }
 
     #[test]

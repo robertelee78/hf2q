@@ -12,9 +12,14 @@ use crate::intelligence::calibration::VerifiedCalibrationPredictionPlan;
 use super::types::*;
 
 mod publication;
+mod reference;
 mod reservation;
 mod stream;
 mod verify;
+
+pub(crate) use reference::{
+    open_receipted_structural_teacher_target, reconstruct_structural_teacher_reference_target,
+};
 
 pub(crate) use reservation::UnpublishedStructuralTeacherTargetReservation;
 #[cfg(test)]

@@ -1,0 +1,14 @@
+[project]
+name = "hf2q-qwen38-transformers-reference"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "accelerate==1.10.0",
+  "numpy==2.3.2",
+  "safetensors==0.8.0",
+  "torch==2.8.0",
+  "transformers @ git+https://github.com/huggingface/transformers.git@945dac9117cb54196888c0e6c08035792a98c485",
+]
+
+[tool.uv]
+package = false

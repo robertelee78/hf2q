@@ -57,6 +57,14 @@ impl VerifiedQwen35SourceTeacherTargetV1 {
     pub(crate) fn completion_receipt_sha256(&self) -> &str {
         self.receipt.receipt_sha256()
     }
+
+    /// Structural comparison evidence only. Serializing this receipt cannot
+    /// recreate the retained source-teacher authority owned by `self`.
+    pub(crate) fn structural_target_receipt(
+        &self,
+    ) -> &crate::intelligence::exact_teacher::ExactTeacherTargetReceipt {
+        self.target.receipt()
+    }
 }
 
 struct ReadyToPublishQwen35SourceTeacherTargetV1 {

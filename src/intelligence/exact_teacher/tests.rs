@@ -482,3 +482,111 @@ fn tiny_qwen_f32_cpu_oracle_streams_completed_full_vocab_rows() {
         .iter()
         .all(|row| row.argmax_token_id == 0));
 }
+
+#[test]
+fn matched_reference_input_and_targets_are_rebuilt_and_compared() {
+    let temp = tempfile::tempdir().unwrap();
+    let plan = prediction_plan_for_test();
+    let input = build_exact_teacher_reference_input(&plan, 4, limits()).unwrap();
+    validate_exact_teacher_reference_input(&input).unwrap();
+
+    let native_path = temp.path().join("native.bin");
+    let native = write_structural_teacher_target_artifact(
+        &plan,
+        &native_path,
+        4,
+        limits(),
+        |_request| Ok(vec![0.0, 1.0, 2.0, 3.0]),
+        |_request| Ok(vec![3; EXACT_TEACHER_GREEDY_TOKEN_COUNT]),
+    )
+    .unwrap();
+    let reference_path = temp.path().join("reference.bin");
+    let reference = write_structural_teacher_target_artifact(
+        &plan,
+        &reference_path,
+        4,
+        limits(),
+        |_request| Ok(vec![0.0, 1.125, 2.0, 3.0]),
+        |_request| Ok(vec![3; EXACT_TEACHER_GREEDY_TOKEN_COUNT]),
+    )
+    .unwrap();
+    let mut external = reference::ExactTeacherExternalReferenceEvidenceV1 {
+        schema_version: 1,
+        profile: "external_exact_teacher_reference_target_v1".into(),
+        reference_input_sha256: input.reference_input_sha256.clone(),
+        prediction_plan_sha256: input.prediction_plan.manifest_sha256.clone(),
+        target_artifact: crate::core::provenance::tensor_execution::ArtifactEvidence {
+            artifact_id: "external_exact_teacher_logits".into(),
+            role: "external_full_vocabulary_f32_target_rows".into(),
+            byte_len: reference.receipt().target_artifact.byte_len,
+            sha256: reference.receipt().target_artifact.sha256.clone(),
+        },
+        greedy_trajectories: reference.receipt().greedy_trajectories.clone(),
+        implementation: reference::ExternalReferenceImplementationV1 {
+            name: "fixture".into(),
+            repository_url: "https://example.invalid/reference".into(),
+            repository_commit: "1".repeat(64),
+            package_version: "1.0.0".into(),
+            dependency_lock_sha256: "2".repeat(64),
+            python_version: "3.12".into(),
+            framework_version: "test".into(),
+            device: "cpu".into(),
+            source_dtype: "f32".into(),
+            logit_dtype: "f32_le".into(),
+            attention_implementation: "reference".into(),
+            cache_enabled: true,
+        },
+        external_reference: true,
+        runtime_dependency: false,
+        source_teacher_authority: false,
+        sensitivity_authority: false,
+        allocator_authority: false,
+        selector_authority: false,
+        autoquant_authority: false,
+        dwq: false,
+        evidence_sha256: String::new(),
+    };
+    external.evidence_sha256 = reference::external_evidence_sha256(&external).unwrap();
+    let external: reference::ExactTeacherExternalReferenceEvidenceV1 =
+        serde_json::from_slice(&serde_json::to_vec(&external).unwrap()).unwrap();
+
+    let receipt = compare_exact_teacher_reference_targets(
+        &plan,
+        &input,
+        &native_path,
+        native.receipt().clone(),
+        "3".repeat(64),
+        &reference_path,
+        &external,
+    )
+    .unwrap();
+    assert_eq!(receipt.rows.len(), 3);
+    assert_eq!(receipt.aggregate.top1_match_count, 3);
+    assert_eq!(receipt.aggregate.max_abs, 0.125);
+    assert!(receipt.aggregate.mean_kl_reference_to_native > 0.0);
+    assert!(receipt.trajectories[0].exact_match);
+    assert!(!receipt.thresholds_predeclared);
+    assert!(!receipt.quality_gate_authority);
+
+    let mut tampered = input.clone();
+    tampered.examples[0].token_ids[0] ^= 1;
+    assert!(validate_exact_teacher_reference_input(&tampered).is_err());
+
+    use std::os::unix::fs::FileExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&reference_path)
+        .unwrap()
+        .write_all_at(&[1_u8], reference.receipt().rows[0].payload_offset)
+        .unwrap();
+    assert!(compare_exact_teacher_reference_targets(
+        &plan,
+        &input,
+        &native_path,
+        native.receipt().clone(),
+        "3".repeat(64),
+        &reference_path,
+        &external,
+    )
+    .is_err());
+}

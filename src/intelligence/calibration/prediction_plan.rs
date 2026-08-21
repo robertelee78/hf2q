@@ -302,13 +302,17 @@ pub(crate) fn prediction_plan_for_test() -> VerifiedCalibrationPredictionPlan {
             stable_id: "completed".into(),
             render_mode: RenderMode::CompletedAssistantTranscript,
             token_count: transcript_tokens.len(),
-            token_ids_sha256: "d".repeat(64),
+            token_ids_sha256: hex::encode(Sha256::digest(
+                super::render::framed_token_bytes_for_test("completed", &transcript_tokens),
+            )),
         },
         TeacherPredictionExampleReceipt {
             stable_id: "generation".into(),
             render_mode: RenderMode::GenerationPrompt,
             token_count: prompt_tokens.len(),
-            token_ids_sha256: "e".repeat(64),
+            token_ids_sha256: hex::encode(Sha256::digest(
+                super::render::framed_token_bytes_for_test("generation", &prompt_tokens),
+            )),
         },
     ];
     let mut manifest = TeacherPredictionPlanManifest {

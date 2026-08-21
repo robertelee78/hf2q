@@ -169,6 +169,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::GgufPatch(args) => cmd_gguf_patch(args),
         Command::Info(args) => cmd_info(args).map_err(AppError::Input),
         Command::SourceTeacher(args) => cmd_source_teacher(args),
+        Command::SourceTeacherReference(args) => cmd_source_teacher_reference(args),
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
         Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
         Command::Generate(args) => serve::cmd_generate(args).map_err(AppError::Conversion),
@@ -219,6 +220,31 @@ fn cmd_source_teacher(args: cli::SourceTeacherArgs) -> Result<(), AppError> {
         serde_json::to_string(&summary).map_err(|error| {
             AppError::Conversion(anyhow::anyhow!(
                 "serialize source-teacher evidence summary: {error}"
+            ))
+        })?
+    );
+    Ok(())
+}
+
+fn cmd_source_teacher_reference(args: cli::SourceTeacherReferenceArgs) -> Result<(), AppError> {
+    use crate::inference::models::qwen35::source_precision::{
+        compare_official_qwen38_source_reference, OfficialQwen38SourceReferenceRequestV1,
+    };
+
+    let receipt =
+        compare_official_qwen38_source_reference(&OfficialQwen38SourceReferenceRequestV1 {
+            model_dir: args.model_dir,
+            native_summary: args.native_summary,
+            native_target: args.native_target,
+            external_evidence: args.external_evidence,
+            external_target: args.external_target,
+        })
+        .map_err(AppError::Conversion)?;
+    println!(
+        "{}",
+        serde_json::to_string(&receipt).map_err(|error| {
+            AppError::Conversion(anyhow::anyhow!(
+                "serialize source-reference comparison receipt: {error}"
             ))
         })?
     );

@@ -86,6 +86,10 @@ impl StructurallyVerifiedTeacherTargetArtifact {
     pub(crate) fn path(&self) -> &std::path::Path {
         &self.path
     }
+
+    pub(in crate::intelligence::exact_teacher) fn retained_file_mut(&mut self) -> &mut File {
+        &mut self._file
+    }
 }
 
 #[cfg(test)]
