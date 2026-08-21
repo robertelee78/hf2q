@@ -26,6 +26,9 @@ use std::path::Path;
 use super::config::VisionConfig;
 use super::convert::VitTensor;
 use super::VitConvertError;
+use crate::core::paired_artifact::{
+    KEY_PAIR_GENERATION, KEY_PAIR_SCHEMA_VERSION, PAIR_METADATA_SCHEMA_VERSION,
+};
 use crate::core::provenance::{KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
 
 const GGUF_MAGIC: [u8; 4] = [0x47, 0x47, 0x55, 0x46]; // "GGUF"
@@ -77,6 +80,17 @@ pub fn write_mmproj_gguf_with_provenance(
     tensors: &HashMap<String, VitTensor>,
     source_sha256: Option<&str>,
 ) -> Result<(), VitConvertError> {
+    write_mmproj_gguf_with_provenance_and_pair(output, vision_config, tensors, source_sha256, None)
+}
+
+/// Write a projector GGUF with optional source and pair-generation binding.
+pub fn write_mmproj_gguf_with_provenance_and_pair(
+    output: &Path,
+    vision_config: &VisionConfig,
+    tensors: &HashMap<String, VitTensor>,
+    source_sha256: Option<&str>,
+    pair_generation: Option<&str>,
+) -> Result<(), VitConvertError> {
     let file = File::create(output)
         .map_err(|e| VitConvertError::GgufEmit(format!("create {:?}: {}", output, e)))?;
     let mut w = BufWriter::new(file);
@@ -96,6 +110,16 @@ pub fn write_mmproj_gguf_with_provenance(
         metadata.push((
             KEY_SOURCE_SHA256.to_owned(),
             MetaValue::String(source_sha256.to_owned()),
+        ));
+    }
+    if let Some(generation) = pair_generation {
+        metadata.push((
+            KEY_PAIR_SCHEMA_VERSION.to_owned(),
+            MetaValue::String(PAIR_METADATA_SCHEMA_VERSION.to_owned()),
+        ));
+        metadata.push((
+            KEY_PAIR_GENERATION.to_owned(),
+            MetaValue::String(generation.to_owned()),
         ));
     }
     let kv_count = metadata.len() as u64;
@@ -702,6 +726,34 @@ mod tests {
                 source_sha256: source.to_string(),
                 mmproj_sha256: None,
             }
+        );
+    }
+
+    #[test]
+    fn projector_pair_generation_round_trips_through_the_shared_reader() {
+        let root: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/qwen38/config.json"))
+                .expect("Qwen3.8 config fixture");
+        let cfg = VisionConfig::from_hf_config(&root).expect("vision config");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("projector-pair.gguf");
+        let generation = uuid::Uuid::new_v4().to_string();
+        write_mmproj_gguf_with_provenance_and_pair(
+            &path,
+            &cfg,
+            &tiny_tensors(),
+            None,
+            Some(&generation),
+        )
+        .expect("write projector");
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open projector");
+        assert_eq!(
+            gguf.metadata_string(KEY_PAIR_SCHEMA_VERSION),
+            Some(PAIR_METADATA_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            gguf.metadata_string(KEY_PAIR_GENERATION),
+            Some(generation.as_str())
         );
     }
 

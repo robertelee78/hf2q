@@ -56,6 +56,7 @@ pub mod kernel_parity;
 pub mod mlx_safetensors_loader;
 pub mod model_arch;
 pub mod provenance;
+pub(crate) mod paired_artifact;
 pub mod sha256;
 pub mod tokenizer_adapter;
 pub mod traits;

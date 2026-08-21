@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Publish automatically converted text/projector GGUF pairs as one
+  crash-recoverable, generation-bound transaction, and enforce the text
+  artifact's projector digest for local as well as receipt-backed models.
+
 ## [0.1.8] — 2026-08-21
 
 ### Added

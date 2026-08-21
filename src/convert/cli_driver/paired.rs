@@ -2,24 +2,28 @@
 //!
 //! The projector is completed first and its digest is embedded in the text
 //! GGUF as `hf2q.mmproj_sha256`. The text GGUF is promoted after the
-//! projector, so it is the pair's fail-closed commit marker. A process crash
-//! can leave an inert orphan projector, but never a newly published text
-//! artifact that claims an absent or different projector.
+//! projector and every optional receipt, so it remains the sole commit
+//! marker. A durable journal and same-filesystem backups keep the previous
+//! complete pair recoverable until that final text rename is durable.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::paired_transaction::PairWorkspace;
 use super::{
-    ConvertArgs, ConvertError, ConvertMode, clear_stale_conversion_receipts_before_replacement,
-    detect_arch, run_convert_internal,
+    detect_arch, run_convert_internal, ConvertArgs, ConvertError, ConvertMode, PairBinding,
 };
-use crate::convert::HfModelSource;
 use crate::convert::quant_selector::QuantSelector;
-use crate::convert::receipt::{ConversionReceipt, receipt_path};
+use crate::convert::receipt::{receipt_path, ConversionReceipt};
+use crate::convert::tensor_lineage::tensor_conversion_receipt_path;
+use crate::convert::HfModelSource;
+use crate::core::paired_artifact::{
+    canonical_parent, file_name, PairMemberRole, KEY_PAIR_GENERATION,
+};
 use crate::core::provenance::KEY_MMPROJ_SHA256;
 use crate::core::sha256::compute_file_sha256;
 use crate::models::vit::VisionConfig;
-use crate::quantize::ggml_quants::{ArchName, GgufFtype, is_vision_tensor_pattern};
+use crate::quantize::ggml_quants::{is_vision_tensor_pattern, ArchName, GgufFtype};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectorEmitter {
@@ -27,18 +31,10 @@ enum ProjectorEmitter {
     GemmaMapper,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PublishStep {
-    Projector,
-    ProjectorReceipt,
-    Text,
-    TextReceipt,
-}
-
 pub(super) fn run(mut args: ConvertArgs) -> Result<(), ConvertError> {
     let requested_projector_output = match &args.mode {
         ConvertMode::TextOnly | ConvertMode::ProjectorOnly => {
-            return run_convert_internal(args, None, None).map(|_| ());
+            return run_convert_internal(args, None, PairBinding::default()).map(|_| ());
         }
         ConvertMode::Paired { projector_output } => projector_output.clone(),
     };
@@ -47,19 +43,24 @@ pub(super) fn run(mut args: ConvertArgs) -> Result<(), ConvertError> {
     // actual vision tensors before either output is touched.
     let source = HfModelSource::open(&args.hf_dir)?;
     let has_vision_config = source.config.get("vision_config").is_some();
+    let has_vision_tensors = source
+        .tensor_metas()
+        .any(|tensor| is_vision_tensor_pattern(&tensor.name));
     if !has_vision_config {
         if requested_projector_output.is_some() {
             return Err(pair_error(
                 "--mmproj-output requires a source with vision_config",
             ));
         }
+        if has_vision_tensors {
+            return Err(pair_error(
+                "source contains vision tensors but has no vision_config; refusing a silent text-only conversion (pass --text-only only when that omission is intentional)",
+            ));
+        }
         args.mode = ConvertMode::TextOnly;
-        return run_convert_internal(args, None, None).map(|_| ());
+        return run_convert_internal(args, None, PairBinding::default()).map(|_| ());
     }
 
-    let has_vision_tensors = source
-        .tensor_metas()
-        .any(|tensor| is_vision_tensor_pattern(&tensor.name));
     if !has_vision_tensors {
         return Err(pair_error(
             "source has vision_config but no vision tensors; refusing a silent text-only conversion (pass --text-only only when that omission is intentional)",
@@ -93,7 +94,7 @@ pub(super) fn run(mut args: ConvertArgs) -> Result<(), ConvertError> {
             "multimodal dry run plans a text + projector pair; no output is written"
         );
         args.mode = ConvertMode::TextOnly;
-        return run_convert_internal(args, None, None).map(|_| ());
+        return run_convert_internal(args, None, PairBinding::default()).map(|_| ());
     }
 
     drop(source);
@@ -145,8 +146,10 @@ fn validate_pair_paths(text: &Path, projector: &Path) -> Result<(), ConvertError
     let destinations = [
         text.to_path_buf(),
         receipt_path(text),
+        tensor_conversion_receipt_path(text),
         projector.to_path_buf(),
         receipt_path(projector),
+        tensor_conversion_receipt_path(projector),
     ];
     for (index, path) in destinations.iter().enumerate() {
         if destinations[index + 1..].contains(path) {
@@ -170,52 +173,124 @@ fn run_pair(args: ConvertArgs, projector_output: PathBuf) -> Result<(), ConvertE
     let text_output = args.output.clone();
     let parent = normalized_parent(&text_output);
     fs::create_dir_all(&parent)?;
-    let staging = tempfile::Builder::new()
-        .prefix(".hf2q-pair-stage-")
-        .tempdir_in(&parent)?;
-    let staged_projector = staging.path().join("projector.gguf");
-    let staged_text = staging.path().join("text.gguf");
+    let canonical_output_parent =
+        canonical_parent(&text_output).map_err(|error| pair_error(error.to_string()))?;
+    if canonical_parent(&projector_output).map_err(|error| pair_error(error.to_string()))?
+        != canonical_output_parent
+    {
+        return Err(pair_error(
+            "paired text and projector outputs must resolve to the same directory",
+        ));
+    }
+    let canonical_text_output = canonical_output_parent
+        .join(file_name(&text_output).map_err(|error| pair_error(error.to_string()))?);
+    let canonical_projector_output = canonical_output_parent
+        .join(file_name(&projector_output).map_err(|error| pair_error(error.to_string()))?);
+    validate_pair_paths(&canonical_text_output, &canonical_projector_output)?;
+    let workspace = PairWorkspace::create(&canonical_text_output)
+        .map_err(|error| pair_error(error.to_string()))?;
+    let staged_projector = workspace.staged_path(PairMemberRole::Projector);
+    let staged_text = workspace.staged_path(PairMemberRole::Text);
 
+    let result = run_pair_in_workspace(
+        &args,
+        &workspace,
+        &staged_projector,
+        &staged_text,
+        &text_output,
+        &projector_output,
+        &canonical_text_output,
+        &canonical_projector_output,
+    );
+    if result.is_err() {
+        workspace.discard_unpublished();
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pair_in_workspace(
+    args: &ConvertArgs,
+    workspace: &PairWorkspace,
+    staged_projector: &Path,
+    staged_text: &Path,
+    text_output: &Path,
+    projector_output: &Path,
+    canonical_text_output: &Path,
+    canonical_projector_output: &Path,
+) -> Result<(), ConvertError> {
     // Projector first: its exact digest is part of the text artifact's
     // immutable consumer contract.
     let mut projector_args = args.clone();
     projector_args.selector = QuantSelector::Standard(GgufFtype::MostlyF16);
-    projector_args.output = staged_projector.clone();
+    projector_args.output = staged_projector.to_path_buf();
     projector_args.mode = ConvertMode::ProjectorOnly;
     projector_args.imatrix = None;
     projector_args.imatrix_corpus = None;
     projector_args.imatrix_out = None;
     projector_args.imatrix_n_ctx = None;
-    run_convert_internal(projector_args, None, None)?;
-    let staged_projector_receipt = retarget_receipt(&staged_projector, &projector_output)?;
+    run_convert_internal(
+        projector_args,
+        None,
+        PairBinding {
+            projector_sha256: None,
+            generation: Some(workspace.transaction_id()),
+        },
+    )?;
+    let staged_projector_receipt = retarget_receipt(staged_projector, projector_output)?;
     let projector_sha256 = fresh_artifact_sha256(
-        &staged_projector,
+        staged_projector,
         staged_projector_receipt.as_deref(),
-        &projector_output,
+        projector_output,
         "f16-mmproj",
     )?;
 
     let mut text_args = args.clone();
-    text_args.output = staged_text.clone();
+    text_args.output = staged_text.to_path_buf();
     text_args.mode = ConvertMode::TextOnly;
-    run_convert_internal(text_args, None, Some(&projector_sha256))?;
-    let staged_text_receipt = retarget_receipt(&staged_text, &text_output)?;
-    validate_bound_text(&staged_text, &projector_sha256)?;
+    run_convert_internal(
+        text_args,
+        None,
+        PairBinding {
+            projector_sha256: Some(&projector_sha256),
+            generation: Some(workspace.transaction_id()),
+        },
+    )?;
+    let staged_text_receipt = retarget_receipt(staged_text, text_output)?;
+    validate_bound_text(staged_text, &projector_sha256, workspace.transaction_id())?;
+    validate_bound_projector(staged_projector, workspace.transaction_id())?;
     validate_receipt_pair(
-        &args,
+        args,
         staged_text_receipt.as_deref(),
         staged_projector_receipt.as_deref(),
     )?;
 
-    publish_pair(
-        &staged_projector,
-        staged_projector_receipt.as_deref(),
-        &projector_output,
-        &staged_text,
-        staged_text_receipt.as_deref(),
-        &text_output,
-        None,
-    )?;
+    let destinations = vec![
+        (
+            PairMemberRole::Projector,
+            canonical_projector_output.to_path_buf(),
+        ),
+        (
+            PairMemberRole::ProjectorReceipt,
+            receipt_path(canonical_projector_output),
+        ),
+        (
+            PairMemberRole::ProjectorTensorReceipt,
+            tensor_conversion_receipt_path(canonical_projector_output),
+        ),
+        (
+            PairMemberRole::TextReceipt,
+            receipt_path(canonical_text_output),
+        ),
+        (
+            PairMemberRole::TextTensorReceipt,
+            tensor_conversion_receipt_path(canonical_text_output),
+        ),
+        (PairMemberRole::Text, canonical_text_output.to_path_buf()),
+    ];
+    workspace
+        .publish(&destinations)
+        .map_err(|error| pair_error(error.to_string()))?;
 
     tracing::info!(
         target: "convert",
@@ -280,12 +355,32 @@ fn fresh_artifact_sha256(
     Ok(receipt.output.sha256)
 }
 
-fn validate_bound_text(text: &Path, projector_sha256: &str) -> Result<(), ConvertError> {
+fn validate_bound_text(
+    text: &Path,
+    projector_sha256: &str,
+    generation: &str,
+) -> Result<(), ConvertError> {
     let gguf = mlx_native::gguf::GgufFile::open(text)
         .map_err(|error| pair_error(format!("reopen staged text GGUF: {error}")))?;
     if gguf.metadata_string(KEY_MMPROJ_SHA256) != Some(projector_sha256) {
         return Err(pair_error(
             "staged text GGUF does not contain the exact projector digest binding",
+        ));
+    }
+    if gguf.metadata_string(KEY_PAIR_GENERATION) != Some(generation) {
+        return Err(pair_error(
+            "staged text GGUF does not contain the pair generation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bound_projector(projector: &Path, generation: &str) -> Result<(), ConvertError> {
+    let gguf = mlx_native::gguf::GgufFile::open(projector)
+        .map_err(|error| pair_error(format!("reopen staged projector GGUF: {error}")))?;
+    if gguf.metadata_string(KEY_PAIR_GENERATION) != Some(generation) {
+        return Err(pair_error(
+            "staged projector GGUF does not contain the pair generation",
         ));
     }
     Ok(())
@@ -320,68 +415,6 @@ fn validate_receipt_pair(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn publish_pair(
-    staged_projector: &Path,
-    staged_projector_receipt: Option<&Path>,
-    projector_output: &Path,
-    staged_text: &Path,
-    staged_text_receipt: Option<&Path>,
-    text_output: &Path,
-    fail_before: Option<PublishStep>,
-) -> Result<(), ConvertError> {
-    // Clear both old receipt sets before either artifact is touched. Complete
-    // earlier artifacts are intentionally retained after a later failure;
-    // without the bound text commit marker an orphan projector is inert.
-    clear_stale_conversion_receipts_before_replacement(projector_output)?;
-    clear_stale_conversion_receipts_before_replacement(text_output)?;
-
-    promote_member(
-        staged_projector,
-        projector_output,
-        PublishStep::Projector,
-        fail_before,
-    )?;
-    if let Some(receipt) = staged_projector_receipt {
-        promote_member(
-            receipt,
-            &receipt_path(projector_output),
-            PublishStep::ProjectorReceipt,
-            fail_before,
-        )?;
-    }
-    promote_member(staged_text, text_output, PublishStep::Text, fail_before)?;
-    if let Some(receipt) = staged_text_receipt {
-        promote_member(
-            receipt,
-            &receipt_path(text_output),
-            PublishStep::TextReceipt,
-            fail_before,
-        )?;
-    }
-    fs::File::open(normalized_parent(text_output))?.sync_all()?;
-    Ok(())
-}
-
-fn promote_member(
-    staged: &Path,
-    destination: &Path,
-    step: PublishStep,
-    fail_before: Option<PublishStep>,
-) -> Result<(), ConvertError> {
-    if fail_before == Some(step) {
-        return Err(pair_error(format!(
-            "injected pair publication failure before {step:?}"
-        )));
-    }
-    fs::rename(staged, destination).map_err(|error| {
-        pair_error(format!(
-            "publish {step:?} to {} failed: {error}; complete earlier artifacts were retained and no stale receipt was left behind",
-            destination.display()
-        ))
-    })
-}
-
 fn pair_error(detail: impl Into<String>) -> ConvertError {
     ConvertError::Pair {
         detail: detail.into(),
@@ -392,8 +425,8 @@ fn pair_error(detail: impl Into<String>) -> ConvertError {
 mod tests {
     use super::*;
     use crate::convert::receipt::{
-        CONVERSION_RECEIPT_SCHEMA_VERSION, ConverterReceipt, ExcludedDsparkReceipt, OutputReceipt,
-        PeakChunkBoundReceipt, RemoteConversionSource, SourceReceipt,
+        ConverterReceipt, ExcludedDsparkReceipt, OutputReceipt, PeakChunkBoundReceipt,
+        RemoteConversionSource, SourceReceipt, CONVERSION_RECEIPT_SCHEMA_VERSION,
     };
 
     fn remote_test_args(output: PathBuf) -> ConvertArgs {
@@ -481,82 +514,6 @@ mod tests {
     }
 
     #[test]
-    fn projector_failure_does_not_touch_existing_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let text = dir.path().join("model.gguf");
-        let projector = dir.path().join("model-mmproj.gguf");
-        let staged_text = dir.path().join("staged-text.gguf");
-        let staged_projector = dir.path().join("staged-projector.gguf");
-        fs::write(&text, b"old-text").unwrap();
-        fs::write(&projector, b"old-projector").unwrap();
-        fs::write(&staged_text, b"new-text").unwrap();
-        fs::write(&staged_projector, b"new-projector").unwrap();
-
-        publish_pair(
-            &staged_projector,
-            None,
-            &projector,
-            &staged_text,
-            None,
-            &text,
-            Some(PublishStep::Projector),
-        )
-        .unwrap_err();
-        assert_eq!(fs::read(&text).unwrap(), b"old-text");
-        assert_eq!(fs::read(&projector).unwrap(), b"old-projector");
-    }
-
-    #[test]
-    fn text_failure_leaves_only_the_complete_new_projector() {
-        let dir = tempfile::tempdir().unwrap();
-        let text = dir.path().join("model.gguf");
-        let projector = dir.path().join("model-mmproj.gguf");
-        let staged_text = dir.path().join("staged-text.gguf");
-        let staged_projector = dir.path().join("staged-projector.gguf");
-        fs::write(&text, b"old-text").unwrap();
-        fs::write(&projector, b"old-projector").unwrap();
-        fs::write(&staged_text, b"new-text").unwrap();
-        fs::write(&staged_projector, b"new-projector").unwrap();
-
-        publish_pair(
-            &staged_projector,
-            None,
-            &projector,
-            &staged_text,
-            None,
-            &text,
-            Some(PublishStep::Text),
-        )
-        .unwrap_err();
-        assert_eq!(fs::read(&text).unwrap(), b"old-text");
-        assert_eq!(fs::read(&projector).unwrap(), b"new-projector");
-    }
-
-    #[test]
-    fn successful_publication_promotes_projector_then_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let text = dir.path().join("model.gguf");
-        let projector = dir.path().join("model-mmproj.gguf");
-        let staged_text = dir.path().join("staged-text.gguf");
-        let staged_projector = dir.path().join("staged-projector.gguf");
-        fs::write(&staged_text, b"new-text").unwrap();
-        fs::write(&staged_projector, b"new-projector").unwrap();
-
-        publish_pair(
-            &staged_projector,
-            None,
-            &projector,
-            &staged_text,
-            None,
-            &text,
-            None,
-        )
-        .unwrap();
-        assert_eq!(fs::read(&text).unwrap(), b"new-text");
-        assert_eq!(fs::read(&projector).unwrap(), b"new-projector");
-    }
-
-    #[test]
     fn remote_receipts_require_one_exact_source_and_projector_contract() {
         let dir = tempfile::tempdir().unwrap();
         let args = remote_test_args(dir.path().join("model.gguf"));
@@ -578,73 +535,19 @@ mod tests {
         let mut mismatched = remote_test_receipt(&args, "f16-mmproj");
         mismatched.source.bundle_sha256 = "e".repeat(64);
         write_receipt(&projector_receipt_path, &mismatched);
-        assert!(
-            validate_receipt_pair(
-                &args,
-                Some(&text_receipt_path),
-                Some(&projector_receipt_path),
-            )
-            .is_err()
-        );
+        assert!(validate_receipt_pair(
+            &args,
+            Some(&text_receipt_path),
+            Some(&projector_receipt_path),
+        )
+        .is_err());
 
         write_receipt(&projector_receipt_path, &remote_test_receipt(&args, "q8_0"));
-        assert!(
-            validate_receipt_pair(
-                &args,
-                Some(&text_receipt_path),
-                Some(&projector_receipt_path),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn receipt_publication_failures_remove_stale_receipts_and_fail_closed() {
-        for fail_before in [PublishStep::ProjectorReceipt, PublishStep::TextReceipt] {
-            let dir = tempfile::tempdir().unwrap();
-            let text = dir.path().join("model.gguf");
-            let projector = dir.path().join("model-mmproj.gguf");
-            let staged_text = dir.path().join("staged-text.gguf");
-            let staged_projector = dir.path().join("staged-projector.gguf");
-            let staged_text_receipt = dir.path().join("staged-text.receipt.json");
-            let staged_projector_receipt = dir.path().join("staged-projector.receipt.json");
-            fs::write(&text, b"old-text").unwrap();
-            fs::write(&projector, b"old-projector").unwrap();
-            fs::write(receipt_path(&text), b"old-text-receipt").unwrap();
-            fs::write(receipt_path(&projector), b"old-projector-receipt").unwrap();
-            fs::write(&staged_text, b"new-text").unwrap();
-            fs::write(&staged_projector, b"new-projector").unwrap();
-            fs::write(&staged_text_receipt, b"new-text-receipt").unwrap();
-            fs::write(&staged_projector_receipt, b"new-projector-receipt").unwrap();
-
-            publish_pair(
-                &staged_projector,
-                Some(&staged_projector_receipt),
-                &projector,
-                &staged_text,
-                Some(&staged_text_receipt),
-                &text,
-                Some(fail_before),
-            )
-            .unwrap_err();
-
-            assert_eq!(fs::read(&projector).unwrap(), b"new-projector");
-            match fail_before {
-                PublishStep::ProjectorReceipt => {
-                    assert_eq!(fs::read(&text).unwrap(), b"old-text");
-                    assert!(!receipt_path(&projector).exists());
-                    assert!(!receipt_path(&text).exists());
-                }
-                PublishStep::TextReceipt => {
-                    assert_eq!(fs::read(&text).unwrap(), b"new-text");
-                    assert_eq!(
-                        fs::read(receipt_path(&projector)).unwrap(),
-                        b"new-projector-receipt"
-                    );
-                    assert!(!receipt_path(&text).exists());
-                }
-                _ => unreachable!(),
-            }
-        }
+        assert!(validate_receipt_pair(
+            &args,
+            Some(&text_receipt_path),
+            Some(&projector_receipt_path),
+        )
+        .is_err());
     }
 }
