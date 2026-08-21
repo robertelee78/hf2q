@@ -165,6 +165,7 @@ manual setup.
 | `hf2q gguf-patch` | Rewrite a GGUF's metadata in place (e.g. inject a chat template). |
 | `hf2q info` | Inspect a GGUF model without loading weights. |
 | `hf2q generate` | Single-shot text generation from a GGUF on the local GPU. |
+| `hf2q chat` | Minimal diagnostic terminal chat over an OpenAI-compatible server. |
 | `hf2q serve` | OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/embeddings`). |
 | `hf2q parity` | ADR-009 parity validation against locked reference outputs. |
 | `hf2q smoke` | ADR-012 end-gate smoke test for a registered architecture. |
@@ -799,6 +800,7 @@ catalog + smoke prompt before any forward-pass code lands.
 - `docs/ARCHITECTURE.md` — source-grounded architecture map.
 - `docs/converting-a-model.md` — generic convert reference.
 - `docs/converting-qwen35.md` — Qwen 3.5/3.6 specifics.
+- `docs/chat.md` — diagnostic chat, local server discovery, and explicit model switching.
 - `docs/operating-kv-cache.md` — TurboQuant KV cache operator guide.
 - `docs/operator-env-vars.md` — every `HF2Q_*` env var, what it gates.
 - `docs/ADR-043-foreground-serve-dashboard.md` — live foreground serve UX,

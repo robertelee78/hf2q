@@ -81,12 +81,13 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
+use futures::StreamExt;
 use futures::stream::Stream;
 use tokio::sync::mpsc;
 
 use super::schema::{
     ChatCompletionChunk, ChoiceLogprobs, ChunkChoice, ChunkDelta, CompletionTokensDetails,
-    PromptTokensDetails, UsageStats,
+    PromptTokensDetails, StreamingTimingInfo, UsageStats,
 };
 use super::state::ServerMetrics;
 
@@ -233,6 +234,7 @@ fn generation_events_stream_with_metrics(
                 logprobs: None,
             }],
             usage: None,
+            x_hf2q_timing: None,
         };
         yield Ok(Event::default().data(serde_json::to_string(&role_chunk).unwrap_or_default()));
 
@@ -266,6 +268,7 @@ fn generation_events_stream_with_metrics(
                             logprobs: pending_logprobs.take(),
                         }],
                         usage: None,
+                        x_hf2q_timing: None,
                     };
                     yield Ok(Event::default()
                         .data(serde_json::to_string(&chunk).unwrap_or_default()));
@@ -306,6 +309,7 @@ fn generation_events_stream_with_metrics(
                             logprobs: None,
                         }],
                         usage: None,
+                        x_hf2q_timing: None,
                     };
                     yield Ok(Event::default()
                         .data(serde_json::to_string(&chunk).unwrap_or_default()));
@@ -339,6 +343,17 @@ fn generation_events_stream_with_metrics(
                     } else {
                         None
                     };
+                    let timing = StreamingTimingInfo {
+                        prefill_time_secs: stats.prefill_time_secs,
+                        decode_time_secs: stats.decode_time_secs,
+                        total_time_secs: stats.total_time_secs,
+                        time_to_first_token_ms: stats.time_to_first_token_ms,
+                        prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+                        decode_tokens_per_sec: stats.decode_tokens_per_sec,
+                        gpu_sync_count: stats.gpu_sync_count,
+                        gpu_dispatch_count: stats.gpu_dispatch_count,
+                    };
+                    let timing = (!timing.is_empty()).then_some(timing);
                     let final_chunk = ChatCompletionChunk {
                         id: request_id.clone(),
                         object: "chat.completion.chunk",
@@ -357,6 +372,7 @@ fn generation_events_stream_with_metrics(
                             logprobs: pending_logprobs.take(),
                         }],
                         usage,
+                        x_hf2q_timing: timing,
                     };
                     yield Ok(Event::default()
                         .data(serde_json::to_string(&final_chunk).unwrap_or_default()));
@@ -394,6 +410,7 @@ fn generation_events_stream_with_metrics(
                             logprobs: None,
                         }],
                         usage: None,
+                        x_hf2q_timing: None,
                     };
                     yield Ok(Event::default()
                         .data(serde_json::to_string(&message_chunk).unwrap_or_default()));
@@ -415,6 +432,7 @@ fn generation_events_stream_with_metrics(
                             logprobs: None,
                         }],
                         usage: None,
+                        x_hf2q_timing: None,
                     };
                     yield Ok(Event::default()
                         .data(serde_json::to_string(&error_chunk).unwrap_or_default()));
@@ -446,6 +464,7 @@ fn generation_events_stream_with_metrics(
                 logprobs: None,
             }],
             usage: None,
+            x_hf2q_timing: None,
         };
         yield Ok(Event::default().data(serde_json::to_string(&error_chunk).unwrap_or_default()));
         yield Ok(Event::default().data("[DONE]"));
@@ -549,6 +568,43 @@ pub(crate) fn generation_events_to_sse_with_metrics(
     )
 }
 
+/// Metrics-aware SSE whose stream owns an arbitrary lifetime guard. The
+/// guard is dropped only when the stream terminates or the HTTP body is
+/// dropped, which lets ADR-047 bind a model lease to the complete SSE body.
+pub(crate) fn generation_events_to_sse_with_metrics_and_guard<G>(
+    rx: mpsc::Receiver<GenerationEvent>,
+    request_id: String,
+    model_name: String,
+    created: i64,
+    opts: SseStreamOptions,
+    metrics: Arc<ServerMetrics>,
+    guard: G,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
+where
+    G: Send + 'static,
+{
+    let inner = generation_events_stream_with_metrics(
+        rx,
+        request_id,
+        model_name,
+        created,
+        opts,
+        Some(metrics),
+    );
+    let guarded = async_stream::stream! {
+        let _guard = guard;
+        futures::pin_mut!(inner);
+        while let Some(item) = inner.next().await {
+            yield item;
+        }
+    };
+    Sse::new(guarded).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(SSE_KEEPALIVE_INTERVAL_SECS))
+            .text(SSE_KEEPALIVE_TEXT),
+    )
+}
+
 /// **ADR-040 §6 Phase C C3** — slot-aware variant of
 /// [`generation_events_to_sse`]. Accepts an optional `slot_id: Option<u32>`
 /// carrying the scheduler-allocated `SlotId.0` for this stream.
@@ -637,6 +693,34 @@ mod tests {
     use axum::body::to_bytes;
     use axum::response::IntoResponse;
     use futures::StreamExt;
+
+    #[tokio::test]
+    async fn sse_response_body_owns_lifetime_guard_until_drop() {
+        #[derive(Clone)]
+        struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = DropProbe(Arc::clone(&dropped));
+        let (_tx, rx) = mpsc::channel(1);
+        let response = generation_events_to_sse_with_metrics_and_guard(
+            rx,
+            "chatcmpl-lease".into(),
+            "model".into(),
+            0,
+            SseStreamOptions::default(),
+            Arc::new(ServerMetrics::default()),
+            probe,
+        )
+        .into_response();
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+        drop(response);
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc::Sender;
 
@@ -914,9 +998,11 @@ mod tests {
         assert!(reasoning["choices"][0]["delta"].get("content").is_none());
         let content: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
         assert_eq!(content["choices"][0]["delta"]["content"], "42");
-        assert!(content["choices"][0]["delta"]
-            .get("reasoning_content")
-            .is_none());
+        assert!(
+            content["choices"][0]["delta"]
+                .get("reasoning_content")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -957,6 +1043,30 @@ mod tests {
             1
         );
         assert_eq!(done["system_fingerprint"], "hf2q-test-mlx-native");
+        assert!(done.get("x_hf2q_timing").is_none());
+    }
+
+    #[tokio::test]
+    async fn final_chunk_serializes_only_available_timing_fields() {
+        let (tx, rx) = mpsc::channel(4);
+        let events = vec![GenerationEvent::Done {
+            finish_reason: "stop",
+            prompt_tokens: 7,
+            completion_tokens: 5,
+            stats: StreamStats {
+                time_to_first_token_ms: Some(42.5),
+                decode_tokens_per_sec: Some(18.25),
+                ..Default::default()
+            },
+        }];
+        let sse = make_sse(rx, SseStreamOptions::default());
+        tokio::spawn(spawn_feeder(tx, events));
+        let payloads = drain_sse(sse).await;
+        let done: serde_json::Value = serde_json::from_str(&payloads[payloads.len() - 2]).unwrap();
+        assert_eq!(done["x_hf2q_timing"]["time_to_first_token_ms"], 42.5);
+        assert_eq!(done["x_hf2q_timing"]["decode_tokens_per_sec"], 18.25);
+        assert!(done["x_hf2q_timing"].get("gpu_sync_count").is_none());
+        assert!(done.get("usage").is_none());
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ prior-art inference path see `docs/arch-current-inference-path.md`.
    MLX-affine output is target-state work governed by ADR-046, not a current
    converter backend.
 
-2. **Serve / Generate** — load a GGUF, run prefill + decode on the
+2. **Serve / Generate / Chat** — load a GGUF, run prefill + decode on the
    Apple-Silicon GPU through the `mlx-native` crate, and expose
    OpenAI-compatible HTTP endpoints (chat completions, embeddings,
    models) with SSE streaming, tool calls, vision, grammar-constrained
@@ -55,6 +55,9 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │                        for tests under `tests/`)
 ├── src/cli.rs           clap derive — every subcommand + arg
 ├── src/doctor.rs        `hf2q doctor` runtime diagnostic
+├── src/chat/            ADR-047 diagnostic terminal client: discovery,
+│                        OpenAI SSE, session transcript, explicit model
+│                        activation, telemetry, and owned-child lifecycle
 ├── src/setup/           `hf2q setup` host inventory, strict operator-default
 │                        schema/loader, interactive policy, and private
 │                        descriptor-relative crash-durable publication;
@@ -176,7 +179,10 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   └── vision/                mmproj load + image embed
 │
 ├── src/serve/           HTTP API, KV-cache, multi-model
+│   ├── discovery.rs             macOS LocalOnly DNS-SD advertise/browse
 │   ├── api/                   axum router + handlers + state
+│   │   ├── control.rs                 versioned diagnostic lifecycle API
+│   │   ├── lifecycle.rs               generation leases + safe model switch
 │   │   ├── schema.rs                  OpenAI wire types
 │   │   ├── handlers.rs                /v1/* request handlers
 │   │   ├── router.rs                  axum router + middleware
@@ -419,10 +425,13 @@ markers.
 | `GET /v1/models/:model_id` | `handlers::get_model` |
 | `POST /v1/chat/completions` | `handlers::chat_completions` |
 | `POST /v1/embeddings` | `handlers::embeddings` |
+| `GET /hf2q/v1/runtime` | `control::hf2q_runtime` — versioned capabilities and pool state |
+| `POST /hf2q/v1/models/activate` | `control::activate_model` — non-evicting load or explicit revision-bound switch |
 | `POST /shutdown` | `handlers::shutdown` (auth-gated) |
 
 `AppState` (`serve/api/state.rs`) carries the engine handle, the
-multi-model registry, the embedding pool, and a warmed
+multi-model registry, generation-bound request lifecycle coordinator, the
+embedding pool, and a warmed
 `KernelRegistry` for `/v1/embeddings` so handlers never pay
 shader-compile latency.
 
@@ -752,6 +761,7 @@ ADRs under `docs/`. The most architecturally consequential ones:
 | **ADR-030** | dFlash block-diffusion spec-decode. |
 | **ADR-040** | Full-context agent slots, scheduler admission, fairness, and per-slot state. |
 | **ADR-046** | Evidence-driven Apple-Silicon auto quantization and the hf2q/mlx-native ownership seam. |
+| **ADR-047** | Minimal diagnostic chat, LocalOnly discovery, telemetry, and explicit safe model switching. |
 
 Each ADR carries phase status, acceptance tests, and a "what comes
 next" section. ADRs are append-only; superseded ones are linked
@@ -767,6 +777,7 @@ forward rather than deleted.
 | Read the public CLI surface | `src/cli.rs` |
 | Trace a `convert` request | `src/serve/mod.rs` → `cmd_generate` is the wrong one; `src/main.rs` dispatches `Command::Convert` into `quantize::cmd_convert`. |
 | Trace a serve chat request | `src/serve/api/handlers.rs::chat_completions` → `engine*.rs` → `inference/models/<arch>/forward.rs` |
+| Trace the diagnostic chat client | `src/chat/mod.rs` → `local.rs` / `control.rs` / `client.rs` |
 | Add a new model family | `docs/arch-onboarding.md` |
 | Add a new quant variant | `src/quantize/` + register in `src/cli.rs::QuantArg` |
 | Tune the KV cache | `docs/operating-kv-cache.md` + `src/serve/kv_persist/` |

@@ -19,16 +19,17 @@
 
 use std::path::Path;
 
-use axum::extract::{Extension, Path as AxPath, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::extract::{Extension, Path as AxPath, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::engine::{self, Engine, SamplingParams};
 use super::grammar;
+use super::lifecycle::ModelLease;
 use super::registry;
 use super::schema::{
     ApiError, ApiErrorBody, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
@@ -38,8 +39,13 @@ use super::schema::{
 };
 use super::state::AppState;
 use crate::serve::auto_pipeline;
-use crate::serve::multi_model::{EngineConfig, HotSwapError, LoadedEngine, PoolError};
+use crate::serve::multi_model::{
+    AdmissionOutcome, AdmissionPlan, EngineConfig, HotSwapError, LoadedEngine, NonEvictingLoad,
+    PoolError,
+};
 use crate::serve::quant_select::QuantType;
+
+use super::{DIAGNOSTIC_NO_EVICT_HEADER, DIAGNOSTIC_NO_EVICT_VALUE};
 
 /// Probe-order list of BOS-token text fragments used by the `/v1/embeddings`
 /// handler when a GGUF doesn't surface `tokenizer.ggml.bos_token_id` through
@@ -120,10 +126,51 @@ fn prefill_tokens_per_second(
 /// - Loader failed (GGUF parse / weights load / tokenizer / warmup) →
 ///   500 `generation_error`.
 /// - GGUF metadata read failed → 500 `generation_error`.
+enum RequestLoadOutcome {
+    Engine(Arc<LoadedEngine<Engine>>),
+    Conflict(AdmissionPlan),
+}
+
+fn diagnostic_no_evict_conflict_response(plan: AdmissionPlan) -> Response {
+    match plan.outcome {
+        AdmissionOutcome::WouldEvict { victims, .. } => {
+            let victims = victims
+                .iter()
+                .map(|victim| victim.repo_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            ApiError {
+                status: StatusCode::CONFLICT,
+                retry_after_seconds: None,
+                error: ApiErrorBody {
+                    message: format!(
+                        "diagnostic no-evict request conflicts with pool revision {} and would evict: {victims}; activate or switch the model explicitly, then retry",
+                        plan.revision
+                    ),
+                    error_type: "invalid_request_error".to_string(),
+                    code: Some("diagnostic_model_conflict".to_string()),
+                    param: Some(DIAGNOSTIC_NO_EVICT_HEADER.to_string()),
+                },
+            }
+            .into_response()
+        }
+        AdmissionOutcome::Impossible { reason } => {
+            map_hotswap_error_to_response(HotSwapError::PoolRefused(reason))
+        }
+        AdmissionOutcome::Resident | AdmissionOutcome::FitsAlongside { .. } => {
+            ApiError::internal_error().into_response()
+        }
+    }
+}
+
 async fn resolve_engine_for_request(
     state: &AppState,
     requested_model: &str,
-) -> std::result::Result<Arc<LoadedEngine<Engine>>, Response> {
+    diagnostic_no_evict: bool,
+) -> std::result::Result<ResolvedEngine, Response> {
+    // Shared only through resolution + lease acquisition. Generation never
+    // holds this gate, so explicit switching can drain without deadlocking.
+    let admission_guard = state.model_lifecycle.read_admission().await;
     // 1. Resolve the lookup key.  Empty / whitespace req.model falls
     //    back to `state.default_model`; if both are empty / unset,
     //    that's a Decision #26 400.
@@ -152,7 +199,15 @@ async fn resolve_engine_for_request(
         for le in pool_guard.snapshot_engines() {
             if le.engine.model_id() == model_arg {
                 drop(pool_guard);
-                return Ok(le);
+                let lease = state
+                    .model_lifecycle
+                    .acquire(&le)
+                    .map_err(|_| ApiError::not_ready().into_response())?;
+                drop(admission_guard);
+                return Ok(ResolvedEngine {
+                    loaded_engine: le,
+                    model_lease: Some(lease),
+                });
             }
         }
         // Drop guard before touching auto-pipeline (which acquires
@@ -247,18 +302,44 @@ async fn resolve_engine_for_request(
     let gguf_path = resolved.gguf_path.clone();
     // Two-level Result: outer = JoinError from spawn_blocking; inner = HotSwapError
     // (typed, not anyhow-wrapped) so we can match on PoolRefused variants.
-    let load_outcome: Result<
-        Result<Arc<LoadedEngine<Engine>>, HotSwapError>,
-        tokio::task::JoinError,
-    > = tokio::task::spawn_blocking(move || {
-        let mut w = pool_arc.write().map_err(|e| {
-            HotSwapError::LoaderFailed(anyhow::anyhow!("pool rwlock poisoned: {e}"))
-        })?;
-        w.load_or_get(&pool_repo_blocking, pool_quant, &gguf_path, &engine_config)
-    })
-    .await;
+    let load_outcome: Result<Result<RequestLoadOutcome, HotSwapError>, tokio::task::JoinError> =
+        tokio::task::spawn_blocking(move || {
+            let mut w = pool_arc.write().map_err(|e| {
+                HotSwapError::LoaderFailed(anyhow::anyhow!("pool rwlock poisoned: {e}"))
+            })?;
+            if diagnostic_no_evict {
+                match w.load_or_get_non_evicting(
+                    &pool_repo_blocking,
+                    pool_quant,
+                    &gguf_path,
+                    &engine_config,
+                )? {
+                    NonEvictingLoad::Resident(engine) | NonEvictingLoad::Loaded(engine) => {
+                        Ok(RequestLoadOutcome::Engine(engine))
+                    }
+                    NonEvictingLoad::Conflict(plan) => Ok(RequestLoadOutcome::Conflict(plan)),
+                }
+            } else {
+                w.load_or_get(&pool_repo_blocking, pool_quant, &gguf_path, &engine_config)
+                    .map(RequestLoadOutcome::Engine)
+            }
+        })
+        .await;
     match load_outcome {
-        Ok(Ok(arc)) => Ok(arc),
+        Ok(Ok(RequestLoadOutcome::Engine(arc))) => {
+            let lease = state
+                .model_lifecycle
+                .acquire(&arc)
+                .map_err(|_| ApiError::not_ready().into_response())?;
+            drop(admission_guard);
+            Ok(ResolvedEngine {
+                loaded_engine: arc,
+                model_lease: Some(lease),
+            })
+        }
+        Ok(Ok(RequestLoadOutcome::Conflict(plan))) => {
+            Err(diagnostic_no_evict_conflict_response(plan))
+        }
         Ok(Err(e)) => {
             tracing::error!(model = %model_arg, error = %e, "hot-swap load failed");
             Err(map_hotswap_error_to_response(e))
@@ -279,7 +360,7 @@ async fn resolve_engine_for_request(
 ///   operator may need to raise the memory budget, but transient eviction
 ///   races also cause this and resolve on their own).
 /// - [`HotSwapError::LoaderFailed`] / [`HotSwapError::FileSize`] → 500.
-fn map_hotswap_error_to_response(e: HotSwapError) -> Response {
+pub(super) fn map_hotswap_error_to_response(e: HotSwapError) -> Response {
     match e {
         HotSwapError::PoolRefused(ref pool_err) => {
             let detail = match pool_err {
@@ -346,12 +427,40 @@ fn map_hotswap_error_to_response(e: HotSwapError) -> Response {
 /// Streaming (SSE) lands in the next iter; this path only handles
 /// `stream: false` or absent. A request with `stream: true` returns 400
 /// pointing to the iter-4 placeholder until streaming lands.
+fn diagnostic_no_evict_from_headers(headers: &HeaderMap) -> Result<bool, Response> {
+    let mut values = headers.get_all(DIAGNOSTIC_NO_EVICT_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(false);
+    };
+    if values.next().is_some() || value.to_str().ok() != Some(DIAGNOSTIC_NO_EVICT_VALUE) {
+        return Err(ApiError::invalid_request(
+            format!(
+                "{DIAGNOSTIC_NO_EVICT_HEADER} must appear once with value {DIAGNOSTIC_NO_EVICT_VALUE}"
+            ),
+            Some(DIAGNOSTIC_NO_EVICT_HEADER.to_string()),
+        )
+        .into_response());
+    }
+    Ok(true)
+}
+
 pub async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     cancellation: Option<Extension<super::middleware::RequestCancellation>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    let diagnostic_no_evict = match diagnostic_no_evict_from_headers(&headers) {
+        Ok(enabled) => enabled,
+        Err(response) => {
+            state
+                .metrics
+                .requests_rejected_total
+                .fetch_add(1, Ordering::Relaxed);
+            return response;
+        }
+    };
     tracing::info!(
         model = %req.model,
         stream = req.stream.unwrap_or(false),
@@ -363,19 +472,23 @@ pub async fn chat_completions(
     // Shared prelude: engine gate, model-id match, chat-template render,
     // tokenize, sampling-params build. Returns either a prepared context or
     // an error response to return directly.
-    let prepared =
-        match prepare_chat_generation(&state, &req, cancellation.map(|Extension(token)| token.0))
-            .await
-        {
-            Ok(p) => p,
-            Err(resp) => {
-                state
-                    .metrics
-                    .requests_rejected_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return resp;
-            }
-        };
+    let prepared = match prepare_chat_generation(
+        &state,
+        &req,
+        cancellation.map(|Extension(token)| token.0),
+        diagnostic_no_evict,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => {
+            state
+                .metrics
+                .requests_rejected_total
+                .fetch_add(1, Ordering::Relaxed);
+            return resp;
+        }
+    };
     state
         .metrics
         .chat_completions_started
@@ -439,6 +552,7 @@ async fn chat_completions_with_prepared(
 ) -> Response {
     let PreparedChatContext {
         loaded_engine,
+        model_lease: _model_lease,
         prompt_tokens,
         params,
         summarized_messages,
@@ -941,7 +1055,7 @@ fn apply_transparency_headers(
     summary_tokens: Option<usize>,
 ) {
     use super::schema::OverflowPolicy;
-    use axum::http::{header::HeaderName, HeaderValue};
+    use axum::http::{HeaderValue, header::HeaderName};
     let policy = req
         .hf2q_overflow_policy
         .unwrap_or(state.config.default_overflow_policy);
@@ -973,11 +1087,26 @@ fn apply_transparency_headers(
 /// Used by the injectable seam added for ADR-005 wave-1.5 Codex fix T1.1.
 type ResolverBoxFuture<'s> = std::pin::Pin<
     Box<
-        dyn std::future::Future<Output = std::result::Result<Arc<LoadedEngine<Engine>>, Response>>
-            + Send
-            + 's,
+        dyn std::future::Future<Output = std::result::Result<ResolvedEngine, Response>> + Send + 's,
     >,
 >;
+
+struct ResolvedEngine {
+    loaded_engine: Arc<LoadedEngine<Engine>>,
+    /// `None` is reserved for synthetic handler seams. Production engine
+    /// resolution always returns a generation-bound request lease.
+    model_lease: Option<ModelLease>,
+}
+
+#[cfg(test)]
+impl ResolvedEngine {
+    fn unleased(loaded_engine: Arc<LoadedEngine<Engine>>) -> Self {
+        Self {
+            loaded_engine,
+            model_lease: None,
+        }
+    }
+}
 
 /// Everything the non-streaming + streaming paths both need to start the
 /// generation on the worker thread.
@@ -987,6 +1116,8 @@ struct PreparedChatContext {
     /// keep the engine alive through the handler's lifetime even if
     /// the pool evicts it concurrently.
     loaded_engine: Arc<LoadedEngine<Engine>>,
+    /// Held through unary execution or transferred into the SSE body stream.
+    model_lease: Option<ModelLease>,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
     /// Decision #23 transparency counters. `Some` only when the
@@ -1107,8 +1238,8 @@ fn repeated_tool_result_signature(
     messages: &[ChatMessage],
     threshold: usize,
 ) -> Option<(&str, usize)> {
-    use std::collections::hash_map::DefaultHasher;
     use std::collections::HashMap;
+    use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let chain_start = messages
@@ -1562,9 +1693,10 @@ async fn prepare_chat_generation(
     state: &AppState,
     req: &ChatCompletionRequest,
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    diagnostic_no_evict: bool,
 ) -> std::result::Result<PreparedChatContext, Response> {
-    prepare_chat_generation_core(state, req, cancellation, |s, m| {
-        Box::pin(async move { resolve_engine_for_request(s, &m).await })
+    prepare_chat_generation_core(state, req, cancellation, move |s, m| {
+        Box::pin(async move { resolve_engine_for_request(s, &m, diagnostic_no_evict).await })
     })
     .await
 }
@@ -1628,7 +1760,9 @@ where
     // the `HotSwapManager` pool: cache hit → reused engine; cache miss
     // → auto-pipeline + admit + return.  Decision #26's 400 fires only
     // when the auto-pipeline cannot resolve the requested name.
-    let loaded_engine = resolver(state, req.model.clone()).await?;
+    let resolved_engine = resolver(state, req.model.clone()).await?;
+    let loaded_engine = resolved_engine.loaded_engine;
+    let model_lease = resolved_engine.model_lease;
     let engine: &Engine = &loaded_engine.engine;
     if !engine.is_worker_healthy() {
         return Err(
@@ -2268,6 +2402,7 @@ where
 
     Ok(PreparedChatContext {
         loaded_engine,
+        model_lease,
         prompt_tokens: final_prompt_tokens,
         params,
         summarized_messages,
@@ -2305,7 +2440,7 @@ fn dispatch_qwen3vl_seam_split(
     qwen3vl_image_grids: &[(u32, u32)],
     final_prompt_tokens: &[u32],
 ) -> std::result::Result<(engine::DeepstackData, Vec<i32>), Response> {
-    use crate::serve::forward_prefill::{build_qwen3vl_positions, Qwen3VlImageGrid};
+    use crate::serve::forward_prefill::{Qwen3VlImageGrid, build_qwen3vl_positions};
 
     let hidden = engine.hidden_size();
     let n_deepstack = mmproj
@@ -2564,7 +2699,7 @@ async fn chat_completions_stream(
     req: ChatCompletionRequest,
     prepared: PreparedChatContext,
 ) -> Response {
-    use super::sse::{generation_events_to_sse_with_metrics, SseStreamOptions};
+    use super::sse::{SseStreamOptions, generation_events_to_sse_with_metrics_and_guard};
 
     // Iter-209: stream path uses the resolved engine from
     // `prepared.loaded_engine` — the pool resolution already ran in
@@ -2572,6 +2707,7 @@ async fn chat_completions_stream(
     // of the inner state); the resulting handle is `'static` so the SSE
     // encoder body can move it.
     let engine: Engine = prepared.loaded_engine.engine.clone();
+    let model_lease = prepared.model_lease;
 
     // Phase 2c iter-211 W79: vision streaming is supported. The
     // `Request::GenerateStream` variant now carries `soft_tokens` and the
@@ -2699,13 +2835,14 @@ async fn chat_completions_stream(
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono_seconds();
     let events_rx = engine.supervise_stream_events(events_rx);
-    let sse = generation_events_to_sse_with_metrics(
+    let sse = generation_events_to_sse_with_metrics_and_guard(
         events_rx,
         request_id,
         req.model.clone(),
         created,
         opts,
         Arc::clone(&state.metrics),
+        model_lease,
     );
     let mut response = sse.into_response();
     apply_transparency_headers(
@@ -4062,7 +4199,7 @@ fn apply_vit_transparency_headers(
     n_images: Option<usize>,
     soft_tokens_total: Option<usize>,
 ) {
-    use axum::http::{header::HeaderName, HeaderValue};
+    use axum::http::{HeaderValue, header::HeaderName};
     let headers = resp.headers_mut();
     if let Some(ms) = forward_ms {
         if let Ok(v) = HeaderValue::from_str(&ms.to_string()) {
@@ -4366,7 +4503,7 @@ ws ::= | " " | "\n" [ \t]{0,20}
                         "json_schema → GBNF failed: {}",
                         e
                     ))
-                    .into_response())
+                    .into_response());
                 }
             }
         }
@@ -7444,7 +7581,7 @@ mod qwen_engine_wire_error_tests {
 }
 
 fn queue_full_with_rate_limit_headers(state: &AppState) -> Response {
-    use axum::http::{header::HeaderName, HeaderValue};
+    use axum::http::{HeaderValue, header::HeaderName};
     let err = ApiError::queue_full();
     let mut resp = err.into_response();
     let cap = state.config.queue_capacity as u64;
@@ -7528,11 +7665,12 @@ pub async fn embeddings(
         // (Last pooling on the chat model's last-layer hidden state).
         // Resolution failures map to 400 model_not_loaded just as
         // pre-iter-209's no-engine branch did.
-        let loaded = match resolve_engine_for_request(&state, &req.model).await {
+        let loaded = match resolve_engine_for_request(&state, &req.model, false).await {
             Ok(arc) => arc,
             Err(resp) => return resp,
         };
-        return chat_model_embeddings(loaded.engine.clone(), req).await;
+        return chat_model_embeddings(loaded.loaded_engine.engine.clone(), req, loaded.model_lease)
+            .await;
     }
 
     // --- Dedicated embedding model path (--embedding-model) ---
@@ -7791,7 +7929,11 @@ pub async fn embeddings(
 /// Inputs run sequentially through the engine's FIFO worker queue —
 /// concurrent embedding requests get the same 429 + Retry-After
 /// behaviour as concurrent chat completions when the queue fills.
-async fn chat_model_embeddings(engine: super::engine::Engine, req: EmbeddingRequest) -> Response {
+async fn chat_model_embeddings(
+    engine: super::engine::Engine,
+    req: EmbeddingRequest,
+    _model_lease: Option<ModelLease>,
+) -> Response {
     let want_base64 = match req.encoding_format.as_deref() {
         None | Some("float") => false,
         Some("base64") => true,
@@ -10401,10 +10543,11 @@ mod readiness_guard_tests {
             quant: QuantType::Q4_K_M,
             bytes_resident: 1_024,
             loaded_at: SystemTime::now(),
+            generation: 1,
         });
         let resolver = move |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
             let loaded = Arc::clone(&loaded);
-            Box::pin(async move { Ok(loaded) })
+            Box::pin(async move { Ok(ResolvedEngine::unleased(loaded)) })
         };
         let response = match prepare_chat_generation_core(
             &state,
@@ -10664,11 +10807,12 @@ mod iter215_qwen35_chat_501_tests {
             quant: QuantType::Q4_K_M,
             bytes_resident: 1024,
             loaded_at: SystemTime::now(),
+            generation: 1,
         });
         let resolver_le = loaded_engine.clone();
         let resolver = move |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
             let le = resolver_le.clone();
-            Box::pin(async move { Ok(le) })
+            Box::pin(async move { Ok(ResolvedEngine::unleased(le)) })
         };
 
         // `prepare_chat_generation_core` does the engine resolution +
@@ -11237,8 +11381,8 @@ mod test_a4_tool_call_policy {
 
 #[cfg(test)]
 mod bos_probe_tests {
-    use super::{probe_bos_token_id, BOS_PROBE_FRAGMENTS};
-    use tokenizers::{models::bpe::BPE, AddedToken, Tokenizer};
+    use super::{BOS_PROBE_FRAGMENTS, probe_bos_token_id};
+    use tokenizers::{AddedToken, Tokenizer, models::bpe::BPE};
 
     /// Build a minimal `tokenizers::Tokenizer` with each provided fragment
     /// registered as a special token. This is the cheapest path to a
@@ -11484,15 +11628,15 @@ mod bos_probe_tests {
 #[cfg(test)]
 mod a5d_handler_429_tests {
     use super::super::engine::{
-        make_synthetic_engine_aggregate_stream_pressure, make_synthetic_engine_over_budget,
-        make_synthetic_engine_with_slot_budget_exceeded_worker, LoadedArch,
+        LoadedArch, make_synthetic_engine_aggregate_stream_pressure,
+        make_synthetic_engine_over_budget, make_synthetic_engine_with_slot_budget_exceeded_worker,
     };
     use super::super::state::{AppState, ServerConfig};
     use super::*;
     use crate::serve::multi_model::LoadedEngine;
     use crate::serve::quant_select::QuantType;
     use axum::body::to_bytes;
-    use axum::http::{header, StatusCode};
+    use axum::http::{StatusCode, header};
     use std::sync::Arc;
     use std::time::SystemTime;
 
@@ -11515,11 +11659,13 @@ mod a5d_handler_429_tests {
             quant: QuantType::Q4_K_M,
             bytes_resident: 0,
             loaded_at: SystemTime::now(),
+            generation: 1,
         });
         let mut params = SamplingParams::default();
         params.max_tokens = max_tokens;
         PreparedChatContext {
             loaded_engine,
+            model_lease: None,
             prompt_tokens,
             params,
             summarized_messages: None,
@@ -11604,8 +11750,8 @@ mod a5d_handler_429_tests {
     /// response is NOT an SSE body, i.e. the handler short-circuited
     /// BEFORE constructing the SSE response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded(
-    ) {
+    async fn a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded()
+     {
         // Per-slot budget = 1 MiB; per-token cost = 1 KiB. Request asks
         // for (prompt_len=1000 + max_tokens=1000) × 1024 = 2 MiB > 1 MiB.
         let per_slot_kv_budget_bytes: u64 = 1024 * 1024;
@@ -11758,8 +11904,8 @@ mod a5d_handler_429_tests {
     /// "POST through the handler path" — this test covers the
     /// non-streaming half.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a5d_chat_completions_non_streaming_handler_returns_429_when_worker_signals_slot_budget_exceeded(
-    ) {
+    async fn a5d_chat_completions_non_streaming_handler_returns_429_when_worker_signals_slot_budget_exceeded()
+     {
         // Worker will respond to Request::Generate with
         // "slot_budget_exceeded: ... needed_bytes=2048000, budget_bytes=1048576".
         let needed_bytes: u64 = 2_048_000;
