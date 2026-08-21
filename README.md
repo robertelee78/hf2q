@@ -269,6 +269,9 @@ Start the launcher for the model family you want to serve:
 # Qwen 3.8-27B multimodal (default port 8081)
 ./scripts/serve_qwen38_opencode.sh
 
+# Disable the launcher's exact, cost-gated MTP/history speculation if needed
+QWEN38_SPECULATION=off ./scripts/serve_qwen38_opencode.sh
+
 # DeepSeek-V4 (default port 8081; run one large family at a time)
 ./scripts/serve_deepseek4_opencode.sh
 
@@ -372,10 +375,16 @@ reset is not safe recovery from a poisoned Metal queue.
 Qwen3.5/Qwen3.6/Qwen3.8 SlotAware chat uses at most 2,048 prompt tokens per GPU
 prefill transaction. Active decoders run before the next cold transaction,
 multiple cold prompts rotate fairly, and cache/ledger state advances only
-after the verifier full-attention cursors agree. The optional MTP cursor is
-tracked independently until speculative decoding runs. For a bound Qwen3.8
-projector, image requests carry soft-token embeddings, the explicit DeepStack
-layout, and 3D positions through the same scheduler-yielding prefill state;
+after the verifier full-attention cursors agree. Ordinary prefixes may omit
+speculative metadata; a Qwen3.8 prefix that advertises reusable MTP state must
+have equal target and MTP cursors at the exact published token count. The
+canonical Qwen3.8 launcher enables exact, independently cost-gated fixed-K3
+MTP and request-history lookup with `QWEN38_SPECULATION=auto`; unsupported
+request semantics remain on ordinary target decode. Run
+`scripts/qwen38_speculation_ab.sh` for the exact-output OFF/AUTO performance
+gate. For a bound Qwen3.8 projector, image requests carry soft-token
+embeddings, the explicit DeepStack layout, and 3D positions through the same
+scheduler-yielding prefill state;
 the payload is validated before its first GPU transaction. Image-bearing KV
 remains exact-image isolated. A later first-image turn may reuse only the
 causally earlier text-only snapshot when every soft/DeepStack position is in

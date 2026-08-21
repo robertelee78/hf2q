@@ -1520,6 +1520,39 @@ impl HybridKvCache {
         Ok(())
     }
 
+    /// Verify the target and optional MTP attention cursors at an exact
+    /// speculative transaction boundary.
+    ///
+    /// Ordinary Qwen serving intentionally keeps the MTP cursor independent;
+    /// callers must opt into this stronger invariant only after mirroring the
+    /// same target batch through `MtpWeights::process_target_batch`.
+    pub(crate) fn validate_speculative_cursors_for_slot(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        expected: usize,
+    ) -> Result<()> {
+        self.validate_sequence_len_for_slot(slot, expected)?;
+        let slot_idx = slot.0 as usize;
+        let expected = u32::try_from(expected)
+            .context("validate_speculative_cursors_for_slot: expected cursor exceeds u32")?;
+        let mtp = self
+            .mtp_slot
+            .as_ref()
+            .context("validate_speculative_cursors_for_slot: MTP slot missing")?;
+        let actual = mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
+            anyhow!(
+                "validate_speculative_cursors_for_slot: MTP cursor missing for slot {}",
+                slot.0
+            )
+        })?;
+        anyhow::ensure!(
+            actual == expected,
+            "validate_speculative_cursors_for_slot: MTP cursor={actual} != expected={expected} for slot {}",
+            slot.0
+        );
+        Ok(())
+    }
+
     /// Capture the prompt boundary for one physical agent slot without
     /// duplicating its append-only full-attention K/V rows.
     pub(crate) fn snapshot_slot_anchor(
@@ -9646,6 +9679,36 @@ mod tests {
             .snapshot_slot_anchor(slot, 5)
             .expect("prompt anchor captures the independent MTP cursor");
         assert_eq!(anchor.mtp_current_len, Some(3));
+    }
+
+    #[test]
+    fn qwen35_speculative_boundary_requires_target_mtp_cursor_equality() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let mut cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        cfg.mtp_num_hidden_layers = 1;
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
+        let slot = SlotId(1);
+        cache.append_for_seq(slot, 5).expect("seed target cursors");
+        cache
+            .mtp_slot
+            .as_mut()
+            .expect("fixture has MTP")
+            .current_len[1] = 0;
+
+        let mismatch = cache
+            .validate_speculative_cursors_for_slot(slot, 5)
+            .expect_err("empty MTP cursor must fail the speculative boundary");
+        assert!(format!("{mismatch:#}").contains("MTP cursor=0 != expected=5"));
+
+        cache
+            .mtp_slot
+            .as_mut()
+            .expect("fixture has MTP")
+            .current_len[1] = 5;
+        cache
+            .validate_speculative_cursors_for_slot(slot, 5)
+            .expect("target and MTP cursor equality");
     }
 
     #[test]

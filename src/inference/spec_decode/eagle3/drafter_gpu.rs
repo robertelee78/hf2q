@@ -29,18 +29,23 @@
 //!
 //! ## Embed lookup
 //!
-//! For testing + the simple case where the drafter has its own
-//! `embed_tokens.weight`, GpuDrafter owns a CPU-side `embed_table:
-//! &[f32]` of shape `[vocab_size, hidden_size]`. Real production
-//! use will share the target model's embedding table; that
-//! plumbing is out of scope for this iteration.
+//! Fixtures may provide an F32 table. Production Qwen shares the target's
+//! conversion-emitted native Q4_K table and gathers only the selected row;
+//! the drafter never expands or re-quantizes that table.
 
 use super::config::Eagle3DrafterConfig;
 use super::drafter::{extract_top_k_from_row_logits, DraftCandidate, Drafter, TreeContextView};
 use super::kv_cache::DrafterKvCache;
 use super::tensors::Eagle3DrafterTensors;
+use crate::serve::forward_mlx_shared::MlxQWeight;
 use anyhow::{anyhow, ensure, Result};
+use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+
+enum DrafterEmbedding<'a> {
+    F32(&'a [f32]),
+    NativeQ4K(&'a MlxQWeight),
+}
 
 /// GPU drafter implementing Phase E4a's [`Drafter`] trait by running
 /// the full Eagle3 forward chain.
@@ -59,11 +64,7 @@ pub struct GpuDrafter<'a> {
     /// current spec-decode step. Shape `[1, num_aux * target_hidden_size]`
     /// F32 (single-token decode in this iteration).
     pub target_aux: &'a MlxBuffer,
-    /// CPU-side embedding table `[vocab_size, hidden_size]` F32.
-    /// `predict_topk` looks up the last path token's embedding from
-    /// this. Stored on CPU to avoid GPU memory pressure for vocabularies
-    /// up to ~200K rows.
-    pub embed_table: &'a [f32],
+    embedding: DrafterEmbedding<'a>,
     /// Absolute position of the root tree-node in the target sequence
     /// (used for RoPE linear-position math: position[i] = base_pos +
     /// depths[i] for tree-aware decoding; for this iteration's
@@ -120,20 +121,75 @@ impl<'a> GpuDrafter<'a> {
         embed_table: &'a [f32],
         base_pos: u32,
     ) -> Result<Self> {
+        Self::new_with_embedding(
+            cfg,
+            tensors,
+            device,
+            registry,
+            target_aux,
+            DrafterEmbedding::F32(embed_table),
+            base_pos,
+        )
+    }
+
+    /// Construct a drafter sharing an exact native target embedding table.
+    pub fn new_with_native_embedding(
+        cfg: &'a Eagle3DrafterConfig,
+        tensors: &'a Eagle3DrafterTensors,
+        device: &'a MlxDevice,
+        registry: &'a mut KernelRegistry,
+        target_aux: &'a MlxBuffer,
+        embed_weight: &'a MlxQWeight,
+        base_pos: u32,
+    ) -> Result<Self> {
+        ensure!(
+            embed_weight.affine.is_none()
+                && embed_weight.info.ggml_dtype == GgmlType::Q4_K
+                && embed_weight.info.rows == cfg.vocab_size
+                && embed_weight.info.cols == cfg.hidden_size,
+            "GpuDrafter::new_with_native_embedding: expected exact Q4_K [{}, {}], got {:?} [{}, {}]",
+            cfg.vocab_size,
+            cfg.hidden_size,
+            embed_weight.info.ggml_dtype,
+            embed_weight.info.rows,
+            embed_weight.info.cols,
+        );
+        Self::new_with_embedding(
+            cfg,
+            tensors,
+            device,
+            registry,
+            target_aux,
+            DrafterEmbedding::NativeQ4K(embed_weight),
+            base_pos,
+        )
+    }
+
+    fn new_with_embedding(
+        cfg: &'a Eagle3DrafterConfig,
+        tensors: &'a Eagle3DrafterTensors,
+        device: &'a MlxDevice,
+        registry: &'a mut KernelRegistry,
+        target_aux: &'a MlxBuffer,
+        embedding: DrafterEmbedding<'a>,
+        base_pos: u32,
+    ) -> Result<Self> {
         cfg.validate()
             .map_err(|e| anyhow!("GpuDrafter::new: cfg invalid: {e}"))?;
         let expected_embed = cfg
             .vocab_size
             .checked_mul(cfg.hidden_size)
             .ok_or_else(|| anyhow!("GpuDrafter::new: vocab_size * hidden_size overflows usize"))?;
-        ensure!(
-            embed_table.len() == expected_embed,
-            "GpuDrafter::new: embed_table has {} elements, expected {} (vocab_size {} * hidden_size {})",
-            embed_table.len(),
-            expected_embed,
-            cfg.vocab_size,
-            cfg.hidden_size
-        );
+        if let DrafterEmbedding::F32(embed_table) = &embedding {
+            ensure!(
+                embed_table.len() == expected_embed,
+                "GpuDrafter::new: embed_table has {} elements, expected {} (vocab_size {} * hidden_size {})",
+                embed_table.len(),
+                expected_embed,
+                cfg.vocab_size,
+                cfg.hidden_size
+            );
+        }
         ensure!(
             target_aux.dtype() == DType::F32,
             "GpuDrafter::new: target_aux dtype must be F32, got {:?}",
@@ -182,7 +238,7 @@ impl<'a> GpuDrafter<'a> {
             device,
             registry,
             target_aux,
-            embed_table,
+            embedding,
             base_pos,
             kv_cache: None,
             tree_node_cache_slot: Vec::new(),
@@ -306,9 +362,9 @@ impl<'a> GpuDrafter<'a> {
         Ok(mask)
     }
 
-    /// Look up the embedding for `token` from the CPU embed table.
-    /// Returns a freshly-allocated `Vec<f32>` of length `hidden_size`.
-    fn lookup_embedding(&self, token: u32) -> Result<Vec<f32>> {
+    /// Gather one target embedding row without changing its stored weight
+    /// representation.
+    fn lookup_embedding_gpu(&mut self, token: u32) -> Result<MlxBuffer> {
         let t = token as usize;
         ensure!(
             t < self.cfg.vocab_size,
@@ -316,22 +372,63 @@ impl<'a> GpuDrafter<'a> {
             token,
             self.cfg.vocab_size
         );
-        let start = t.checked_mul(self.cfg.hidden_size).ok_or_else(|| {
-            anyhow!(
-                "GpuDrafter::lookup_embedding: token {} * hidden_size overflows usize",
-                token
+        let mut output = self
+            .device
+            .alloc_buffer(
+                self.cfg.hidden_size * std::mem::size_of::<f32>(),
+                DType::F32,
+                vec![1, self.cfg.hidden_size],
             )
-        })?;
-        let end = start
-            .checked_add(self.cfg.hidden_size)
-            .ok_or_else(|| anyhow!("GpuDrafter::lookup_embedding: end offset overflows usize"))?;
-        ensure!(
-            end <= self.embed_table.len(),
-            "GpuDrafter::lookup_embedding: embed_table too small (end {} > len {})",
-            end,
-            self.embed_table.len()
-        );
-        Ok(self.embed_table[start..end].to_vec())
+            .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: alloc output: {e}"))?;
+        match &self.embedding {
+            DrafterEmbedding::F32(embed_table) => {
+                let start = t.checked_mul(self.cfg.hidden_size).ok_or_else(|| {
+                    anyhow!("GpuDrafter::lookup_embedding_gpu: token offset overflow")
+                })?;
+                let end = start
+                    .checked_add(self.cfg.hidden_size)
+                    .ok_or_else(|| anyhow!("GpuDrafter::lookup_embedding_gpu: end overflow"))?;
+                ensure!(
+                    end <= embed_table.len(),
+                    "GpuDrafter F32 embedding table too small"
+                );
+                output
+                    .as_mut_slice::<f32>()
+                    .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: map output: {e}"))?
+                    .copy_from_slice(&embed_table[start..end]);
+            }
+            DrafterEmbedding::NativeQ4K(weight) => {
+                let mut ids = self
+                    .device
+                    .alloc_buffer(4, DType::U32, vec![1])
+                    .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: alloc ID: {e}"))?;
+                ids.as_mut_slice::<u32>()
+                    .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: map ID: {e}"))?[0] =
+                    token;
+                let mut enc = self
+                    .device
+                    .command_encoder()
+                    .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: encoder: {e}"))?;
+                mlx_native::ops::embedding_q4_k::register(self.registry);
+                mlx_native::embedding_gather_q4_k(
+                    &mut enc,
+                    self.registry,
+                    self.device,
+                    &weight.buffer,
+                    &ids,
+                    &output,
+                    &mlx_native::EmbeddingQ4KParams {
+                        vocab_size: weight.info.rows,
+                        embed_dim: weight.info.cols,
+                        n_tokens: 1,
+                    },
+                )
+                .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: Q4_K gather: {e}"))?;
+                enc.commit_and_wait_labeled("eagle3.embedding.native")
+                    .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: completion: {e}"))?;
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -404,26 +501,7 @@ impl<'a> Drafter for GpuDrafter<'a> {
         // token). Cache-aware forward conditions on ancestors via the cache;
         // cache-less forward sees only this token.
         let last_token = *path.last().unwrap();
-        let embed_vec = self.lookup_embedding(last_token)?;
-        ensure!(
-            embed_vec.len() == self.cfg.hidden_size,
-            "GpuDrafter::predict_topk: embed lookup returned len {} != hidden_size {}",
-            embed_vec.len(),
-            self.cfg.hidden_size
-        );
-        // Upload embedding to GPU.
-        let mut embed_gpu = self
-            .device
-            .alloc_buffer(
-                self.cfg.hidden_size * std::mem::size_of::<f32>(),
-                DType::F32,
-                vec![1, self.cfg.hidden_size],
-            )
-            .map_err(|e| anyhow!("GpuDrafter::predict_topk: alloc embed: {e}"))?;
-        embed_gpu
-            .as_mut_slice::<f32>()
-            .map_err(|e| anyhow!("GpuDrafter::predict_topk: embed slice: {e}"))?
-            .copy_from_slice(&embed_vec);
+        let embed_gpu = self.lookup_embedding_gpu(last_token)?;
 
         // Depth-adjusted RoPE position.
         let depth_from_root = path.len() - 1; // node_to_expand's depth

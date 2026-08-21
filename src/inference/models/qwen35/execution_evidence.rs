@@ -315,15 +315,31 @@ pub(crate) fn load_no_dwq_qwen35_candidate(
 }
 
 fn validate_loaded_global_geometry(model: &Qwen35Model, expected: &Qwen35Config) -> Result<()> {
+    let expected_vocab = usize::try_from(expected.vocab_size)?;
+    let expected_hidden = usize::try_from(expected.hidden_size)?;
     let expected_embedding_values = usize::try_from(expected.vocab_size)?
-        .checked_mul(usize::try_from(expected.hidden_size)?)
+        .checked_mul(expected_hidden)
         .context("authenticated Qwen embedding geometry overflows usize")?;
-    if model.token_embd.len() != expected_embedding_values
-        || model.output_weight.len() != expected_embedding_values
-        || model.output_norm.len() != usize::try_from(expected.hidden_size)?
-    {
+
+    let embedding_matches = match &model.token_embd_native {
+        Some(weight) => {
+            model.token_embd.is_empty()
+                && weight.info.rows == expected_vocab
+                && weight.info.cols == expected_hidden
+        }
+        None => model.token_embd.len() == expected_embedding_values,
+    };
+    let output_matches = match &model.output_weight_native {
+        Some(weight) => {
+            model.output_weight.is_empty()
+                && weight.info.rows == expected_vocab
+                && weight.info.cols == expected_hidden
+        }
+        None => model.output_weight.len() == expected_embedding_values,
+    };
+    if !embedding_matches || !output_matches || model.output_norm.len() != expected_hidden {
         bail!(
-            "loaded Qwen globals differ from authenticated source geometry; synthetic vocab extension is not admitted"
+            "loaded Qwen globals differ from authenticated source geometry; alternate storage and synthetic vocab extension are not admitted"
         );
     }
     Ok(())

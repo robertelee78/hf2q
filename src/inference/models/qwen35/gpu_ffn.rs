@@ -62,6 +62,7 @@
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
@@ -218,7 +219,7 @@ fn dispatch_moe_id_routed(
 }
 
 use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeFfnShape, MoeFfnWeights};
-use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32};
+use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32, upload_f32_weight};
 use super::weight_loader::DenseFfnWeightsQ;
 
 // ================================================================
@@ -238,13 +239,13 @@ pub struct DenseFfnWeightsGpu {
 impl DenseFfnWeightsGpu {
     /// Upload a [`DenseFfnWeights`] (pure-Rust f32) to Metal buffers.
     ///
-    /// Weights pre-cast to BF16 to avoid per-inference F32→BF16 GPU cast
-    /// in `proj()`.
+    /// F32 source weights remain F32; inference does not make a second
+    /// precision decision after conversion/source materialization.
     pub fn from_cpu(weights: &DenseFfnWeights, device: &MlxDevice) -> Result<Self> {
         Ok(Self {
-            gate: upload_bf16_from_f32(&weights.gate, device)?,
-            up: upload_bf16_from_f32(&weights.up, device)?,
-            down: upload_bf16_from_f32(&weights.down, device)?,
+            gate: upload_f32_weight(&weights.gate, device)?,
+            up: upload_f32_weight(&weights.up, device)?,
+            down: upload_f32_weight(&weights.down, device)?,
         })
     }
 }
@@ -532,6 +533,33 @@ fn proj(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
+    if weight.dtype() == DType::F32 {
+        let out_bytes = (seq_len * out_features) as usize * 4;
+        let dst = device
+            .alloc_buffer(
+                out_bytes,
+                DType::F32,
+                vec![seq_len as usize, out_features as usize],
+            )
+            .map_err(|e| anyhow!("alloc F32 proj dst: {e}"))?;
+        dense_matmul_f32_f32_tensor(
+            encoder,
+            registry,
+            device,
+            weight,
+            input,
+            &dst,
+            &DenseMmF32F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            },
+        )
+        .context("dense_matmul_f32_f32_tensor proj")?;
+        return Ok(dst);
+    }
     let n_w = (out_features * in_features) as usize;
 
     // If the weight is already BF16 (pre-cast at load time), use it directly;
@@ -2115,6 +2143,7 @@ fn extract_expert_weight(
 ///   3e. moe_out += w_e * y_e                       — CPU weighted accumulate
 ///
 /// // Shared expert (sigmoid-gated, per the peer's spec)
+/// // Shared expert (sigmoid-gated)
 /// 4. sh_logit = shared_gate_inp(x)                 — proj (GPU, [seq, 1])
 /// 5. sh_gate  = sigmoid(sh_logit)                  — dispatch_sigmoid_mul(sh_logit, sh_logit)
 ///    Note: sigmoid(x) = sigmoid_mul(ones, x) but we compute via CPU to avoid
@@ -2258,6 +2287,7 @@ pub fn build_moe_ffn_layer_gpu(
     // ---- Shared expert: sigmoid-gated SwiGLU ----
     //
     // The peer's spec:
+    // Shared-expert contract:
     //   shared_gate = sigmoid(gate_inp_shexp @ x)
     //   shared_out  = down_shexp(silu(gate_shexp @ x) * (up_shexp @ x))
     //   cur = moe_out + shared_gate * shared_out
@@ -2447,6 +2477,8 @@ pub fn build_moe_ffn_layer_gpu_q(
 /// token on Qwen3.6-35B-A3B).  For comparison, the peer's Metal compute
 /// path issues 1-2 command buffers per decode token total
 /// ("optimal values for n_cb are 1 or 2"); hf2q pre-fusion issues 140.
+/// token on Qwen3.6-35B-A3B). The pre-fusion path issues 140 command buffers;
+/// the target steady-state budget is one or two per decode token.
 ///
 /// # Caller contract
 ///

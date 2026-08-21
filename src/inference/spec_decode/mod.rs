@@ -1,13 +1,10 @@
-//! Speculative-decode primitives (ADR-029).
+//! Speculative-decode primitives (ADR-029 / ADR-034).
 //!
-//! Phase 1 (iter-113, LANDED): pure-CPU n-gram proposer, no model touch.
-//! Phase 2 (pending): forward_decode_verify — multi-token verify forward
-//!   returning per-position logits + KV-cache rollback.
-//! Phase 3 (pending): generate-loop integration (sourdough byte-identity
-//!   gate at K=0 enforces production safety until verified).
-//!
-//! Status: NO production wire-up yet. The proposer module is publicly
-//! accessible but no caller exists in `cmd_generate*` until Phase 3.
+//! Qwen CLI generation owns native MTP verification, and the OpenAI Qwen
+//! server owns target-verified request-history/MTP transactions under its
+//! explicit `HF2Q_QWEN_SPECULATION` policy. DFlash and EAGLE-3 retain their
+//! separate experimental admission contracts; one module's activation never
+//! implicitly enables another proposer.
 //!
 //! # ADR-040 §6.1.55 (iter-A4-cont-acceptance-telemetry, 2026-05-30)
 //!
@@ -19,6 +16,7 @@
 //! production telemetry pipeline (`/metrics` schema + scrape) is
 //! deferred-on-external-signal per the §6.1.55 dossier framing.
 
+pub mod cost_controller;
 pub mod dflash;
 pub mod eagle3;
 pub mod eagle3_orchestrator;

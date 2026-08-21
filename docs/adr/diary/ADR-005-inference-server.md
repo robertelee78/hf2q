@@ -1554,7 +1554,14 @@ Headline results: chat completion returns HTTP 200 with 16 generated tokens; SSE
   3. W-B3 incremental tool-call argument streaming for Qwen35 — Wedge-3 uses the close-buffered single-arguments-delta shape (spec-valid OpenAI streaming tool-call); progressive args display requires porting the `ToolCallStreamEmitter` per-family extractor (`extract_qwen35_name_prefix` already exists at `engine.rs:2924`).
   4. LCP-based partial-prefill resume for `HybridPromptCache::try_match` — Wedge-3 ships full-equality only; the iter-97+ Gemma-side LCP design is the analogue. Touches `HybridKvCache` per-layer write-cursor exposure for the linear-attn slot (the DeltaNet conv ring + recurrent state advance non-trivially with LCP < prompt.len()).
   5. Long-lived `HybridKvCache` on `Qwen35LoadedModel` — Wedge-3 allocates the cache per-request (~1-4 GB Metal alloc); a Wedge-4 follow-up may move the cache to a long-lived field with `reset()` between requests to amortize the alloc.
-  6. Optional `SpecDecode` integration on the SERVE path — `cmd_generate_qwen35` already supports it via `HF2Q_SPEC_DECODE=1`; the worker arm doesn't read that env var today (Wedge-3 keeps the simpler greedy/sampling fork; spec-decode through the channel needs a measurement plan first).
+  6. Historical note, superseded 2026-08-20: `HF2Q_SPEC_DECODE` was a
+     CLI-generation control and the OpenAI worker never read it. Exporting it
+     from a server launcher was therefore dead configuration, not a safety
+     gate. The live Qwen SlotAware path now reads
+     `HF2Q_QWEN_SPECULATION=off|auto`, owns request-local target/MTP state,
+     fixed-K3 verification, request-history proposals, rollback, and measured
+     per-proposer cost gates. ADR-044 and the shipping contract are the
+     current authority.
 
 ###### iter-217 — Gemma 4 chat-template `<channel|>` close-marker leak fix + content-correctness gate (2026-04-30)
 

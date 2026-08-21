@@ -9,14 +9,17 @@
 //! - Optional [`MtpWeights`](super::mtp::MtpWeights) for MTP speculative decoding.
 //! - Global tensors: `token_embd`, `output_weight`, `output_norm`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 
 use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
-use super::mtp::{load_mtp_weights_if_present, MtpWeights};
+use super::gpu_delta_net::DeltaNetWeightsGpu;
+use super::gpu_full_attn::FullAttnWeightsGpu;
+use super::mtp::{load_mtp_weights_if_present_with_shared_head, MtpWeights};
 use super::weight_loader::{DenseFfnWeightsQ, MoeFfnWeightsQ};
 use super::{weight_loader, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
+use crate::serve::forward_mlx_shared::MlxQWeight;
 
 use mlx_native::gguf::GgufFile;
 use mlx_native::MlxDevice;
@@ -68,6 +71,17 @@ pub enum Qwen35LayerWeights {
         attn: DeltaNetLayerWeights,
         ffn: Qwen35FfnWeights,
     },
+    /// Production GGUF full-attention layer. Large projections retain the
+    /// exact conversion-emitted blocks and GGML type.
+    NativeFullAttn {
+        attn: FullAttnWeightsGpu,
+        ffn: Qwen35FfnWeights,
+    },
+    /// Production GGUF DeltaNet layer with native projection storage.
+    NativeLinearAttn {
+        attn: DeltaNetWeightsGpu,
+        ffn: Qwen35FfnWeights,
+    },
 }
 
 impl Qwen35LayerWeights {
@@ -75,6 +89,8 @@ impl Qwen35LayerWeights {
         match self {
             Qwen35LayerWeights::FullAttn { .. } => Qwen35LayerKind::FullAttention,
             Qwen35LayerWeights::LinearAttn { .. } => Qwen35LayerKind::LinearAttention,
+            Qwen35LayerWeights::NativeFullAttn { .. } => Qwen35LayerKind::FullAttention,
+            Qwen35LayerWeights::NativeLinearAttn { .. } => Qwen35LayerKind::LinearAttention,
         }
     }
 
@@ -82,6 +98,8 @@ impl Qwen35LayerWeights {
         match self {
             Qwen35LayerWeights::FullAttn { ffn, .. } => ffn,
             Qwen35LayerWeights::LinearAttn { ffn, .. } => ffn,
+            Qwen35LayerWeights::NativeFullAttn { ffn, .. } => ffn,
+            Qwen35LayerWeights::NativeLinearAttn { ffn, .. } => ffn,
         }
     }
 
@@ -93,6 +111,8 @@ impl Qwen35LayerWeights {
         match self {
             Qwen35LayerWeights::FullAttn { ffn, .. } => ffn,
             Qwen35LayerWeights::LinearAttn { ffn, .. } => ffn,
+            Qwen35LayerWeights::NativeFullAttn { ffn, .. } => ffn,
+            Qwen35LayerWeights::NativeLinearAttn { ffn, .. } => ffn,
         }
     }
 }
@@ -113,10 +133,23 @@ pub struct Qwen35Model {
     /// Per-layer weight bundles. `len() == cfg.num_hidden_layers`.
     pub layers: Vec<Qwen35LayerWeights>,
     /// Token-embedding table (vocab_size × hidden_size, row-major).
+    /// Populated only by synthetic/lazy fixtures.
     pub token_embd: Vec<f32>,
+    /// Exact GGUF representation of `token_embd.weight` for production GPU
+    /// inference. Indexed rows are decoded directly by the matching native
+    /// embedding kernel; the full table is never expanded to F32.
+    pub token_embd_native: Option<MlxQWeight>,
     /// LM-head output projection (hidden_size × vocab_size, row-major per
     /// GGUF's `[out_dim, in_dim]` convention).
     pub output_weight: Vec<f32>,
+    /// Native GGUF representation of `output.weight` for production GPU
+    /// inference.  Quantization is a conversion-time decision: serving must
+    /// consume these exact encoded blocks instead of dequantizing and silently
+    /// re-quantizing the head to a different format.
+    ///
+    /// Synthetic/lazy test models have no GGUF backing and leave this `None`.
+    /// Explicit DWQ overlays also clear it when they replace `output_weight`.
+    pub output_weight_native: Option<MlxQWeight>,
     /// Final-layer RMSNorm weight, shape `[hidden_size]`.
     pub output_norm: Vec<f32>,
     /// Optional MTP draft block. Executed only by speculative decoding, never
@@ -170,7 +203,9 @@ impl Qwen35Model {
         Self {
             layers,
             token_embd: vec![0.0f32; vocab * h],
+            token_embd_native: None,
             output_weight: vec![0.0f32; h * vocab],
+            output_weight_native: None,
             output_norm: vec![1.0f32; h],
             mtp: None,
             #[cfg(test)]
@@ -230,9 +265,10 @@ impl Qwen35Model {
 
     /// Load a complete model from a GGUF file.
     ///
-    /// Acquires a Metal GPU device for dequantization, loads the three
-    /// global tensors (`token_embd`, `output`, `output_norm`), then
-    /// iterates over all layers.
+    /// Acquires a Metal GPU device, loads the global tensors, then iterates
+    /// over all layers. Large GGUF weights retain their recorded native GGML
+    /// representation; only declared floating-point norms/state tensors are
+    /// materialized as F32.
     ///
     /// For MoE models the expert weight tensors (`ffn_{gate,up,down}_exps`)
     /// are kept in their native GGML block quantization via
@@ -240,8 +276,9 @@ impl Qwen35Model {
     /// Metal working-set OOM that an F32-expanded load would cause for the
     /// 35B-A3B apex model.
     ///
-    /// For Dense models the behaviour is unchanged: weights are dequantized
-    /// to f32 via [`weight_loader::load_layer`].
+    /// Dense FFN and attention projections use the same native-block contract
+    /// as MoE experts. There is no production fallback that expands a
+    /// quantized model and re-encodes it under another codec.
     ///
     /// `progress` drives the default-mode in-place `\r`-overwrite progress
     /// line on stderr (mirrors the Gemma path at [`crate::inference::models::gemma4::MlxModelWeights::load_from_gguf`]).
@@ -259,90 +296,71 @@ impl Qwen35Model {
         let device =
             MlxDevice::new().map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
 
-        let (mut token_embd, output_weight, output_norm) =
-            weight_loader::load_global_tensors(gguf, &cfg, &device)
-                .context("load_global_tensors")?;
+        let token_embd = Vec::new();
+        let token_embd_native =
+            crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "token_embd.weight", &device)
+                .context("load native token_embd.weight")?;
+        super::weight_pool::register_weight_buffer(&device, &token_embd_native.buffer)
+            .context("register native token_embd.weight")?;
+        #[cfg(test)]
+        super::execution_observation::observe_loaded_ggml(
+            "token_embd.weight",
+            &token_embd_native.buffer,
+        )?;
+        let output_weight = Vec::new();
+        let output_norm = weight_loader::load_f32_tensor(gguf, "output_norm.weight", &device)
+            .context("load output_norm.weight")?;
+        let output_weight_native =
+            crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "output.weight", &device)
+                .context("load native output.weight")?;
+        super::weight_pool::register_weight_buffer(&device, &output_weight_native.buffer)
+            .context("register native output.weight")?;
+        #[cfg(test)]
+        super::execution_observation::observe_loaded_ggml(
+            "output.weight",
+            &output_weight_native.buffer,
+        )?;
 
-        // ADR-012 P9b real-model finding (Qwen3.6-27B): the embedding table is
-        // physically padded for alignment (e.g. 248320 rows) while the metadata
-        // vocab_size reports the logical vocab (e.g. 248044). When they
-        // disagree, take the tensor shape as authoritative for cfg.vocab_size
-        // — the io_heads.rs assertion `token_embd.len() == vocab * hidden`
-        // and the LM head matmul both require the row-count match. The logical
-        // vocab is still recoverable from `tokenizer.ggml.tokens` metadata if
-        // ever needed (e.g. for sampler masking of pad rows).
+        // The output head defines the logits width. The embedding table may
+        // legally contain additional input-only rows, but neither tensor is
+        // padded or rewritten by inference.
         let h = cfg.hidden_size as usize;
-        if h > 0 {
-            let physical_vocab = token_embd.len() / h;
-            if (physical_vocab as u32) != cfg.vocab_size {
-                tracing::info!(
-                    metadata_vocab = cfg.vocab_size,
-                    physical_vocab = physical_vocab,
-                    "qwen35 vocab pad: metadata reports {} but token_embd has {} rows; using physical for cfg.vocab_size",
-                    cfg.vocab_size,
-                    physical_vocab,
-                );
-                cfg.vocab_size = physical_vocab as u32;
-            }
+        ensure!(
+            token_embd_native.info.cols == h,
+            "token_embd.weight cols {} != hidden_size {h}",
+            token_embd_native.info.cols
+        );
+        ensure!(
+            output_weight_native.info.cols == h,
+            "output.weight cols {} != hidden_size {h}",
+            output_weight_native.info.cols
+        );
+        ensure!(
+            token_embd_native.info.rows >= output_weight_native.info.rows,
+            "token_embd.weight rows {} < output.weight rows {}",
+            token_embd_native.info.rows,
+            output_weight_native.info.rows
+        );
+        if cfg.vocab_size as usize != output_weight_native.info.rows {
+            tracing::info!(
+                metadata_vocab = cfg.vocab_size,
+                output_rows = output_weight_native.info.rows,
+                "qwen35 vocab metadata differs from native output head; using exact output row count"
+            );
+            cfg.vocab_size = output_weight_native.info.rows as u32;
         }
 
-        // Special-token coverage fix (Qwen3.5 / Qwen3.6-27B dense):
-        //
-        // The GGUF embed table is truncated to the base tokenizer vocab (e.g.
-        // 248044 entries derived from tokenizer.ggml.tokens), but the Qwen3.5
-        // chat template inserts special tokens <|im_start|> (248045),
-        // <|im_end|> (248046), … up to <|fim_suffix|> (248062).  These IDs
-        // live in tokenizer.json's added_tokens section and are NOT reflected
-        // in tokenizer.ggml.tokens or any GGUF metadata key.
-        //
-        // Fix: if cfg.vocab_size < QWEN35_FULL_VOCAB (248320 — the authoritative
-        // vocab_size from the HF config, which covers all special tokens) and
-        // the gap is small (< 2048 rows), extend token_embd in-place with zero
-        // rows.  Zero-filled embeddings for structural special tokens
-        // (<|im_start|> etc.) are functional: the model's attention pattern
-        // treats these IDs as role delimiters regardless of embedding magnitude.
-        // This avoids an OOB panic in embed_tokens when prompt tokens exceed
-        // the GGUF's truncated vocab.
-        //
-        // output_weight (lm_head) is NOT extended: the model never generates
-        // special token IDs through argmax over the trained 248044-wide logits.
-        if h > 0 {
-            const QWEN35_FULL_VOCAB: u32 = 248_320;
-            let current_vocab = cfg.vocab_size;
-            if current_vocab < QWEN35_FULL_VOCAB && (QWEN35_FULL_VOCAB - current_vocab) < 2048 {
-                let rows_to_add = (QWEN35_FULL_VOCAB - current_vocab) as usize;
-                tracing::info!(
-                    current_vocab,
-                    extended_vocab = QWEN35_FULL_VOCAB,
-                    rows_to_add,
-                    "qwen35 special-token coverage: extending token_embd \
-                     from {} to {} rows with zero embeddings",
-                    current_vocab,
-                    QWEN35_FULL_VOCAB,
-                );
-                token_embd.resize(QWEN35_FULL_VOCAB as usize * h, 0.0f32);
-                // NOTE: cfg.vocab_size is NOT updated here.  cfg.vocab_size
-                // reflects the LM-head output dimension (output_weight rows =
-                // 248044).  The embed table now has more rows than cfg.vocab_size,
-                // and embed_tokens_gpu uses token_embd.len()/h as its effective
-                // vocab_size so it can look up any token in [0, 248320).
-                // Keeping cfg.vocab_size at 248044 ensures the lm_head matmul
-                // allocates the correct output buffer size.
-            }
-        }
+        let mtp = load_mtp_weights_if_present_with_shared_head(
+            gguf,
+            &cfg,
+            &device,
+            Some(&output_weight_native),
+        )
+        .context("load_mtp_weights_if_present")?;
 
-        let mtp = load_mtp_weights_if_present(gguf, &cfg, &device)
-            .context("load_mtp_weights_if_present")?;
-
-        // ADR-012 item-2 architectural fix (2026-04-25): MoE experts MUST
-        // be loaded as native ggml-quantized blocks (`MoeQ`). The previous
-        // F16-detection / F32-expand fallback ("Moe" variant via
-        // `weight_loader::load_moe_ffn`) was peer-misaligned — peers
-        // (mlx-lm, the peer, AutoAWQ) never F32-expand MoE experts at load
-        // time. Apex 35B-A3B at F32 is ~128 GB which doesn't fit on a
-        // 128 GB system. If a caller ever supplies F16/F32 experts
-        // (e.g. legacy GGUFs), we fail loud at load time rather than
-        // silently expanding.
+        // MoE experts must retain their GGUF-quantized representation. An
+        // F16/F32 expert artifact would require a different native execution
+        // path; silently expanding it during load is not admitted.
         use mlx_native::ops::quantized_matmul_ggml::GgmlType;
         if cfg.variant == Qwen35Variant::Moe {
             if let Some(info) = gguf.tensor_info("blk.0.ffn_gate_exps.weight") {
@@ -351,7 +369,7 @@ impl Qwen35Model {
                         "qwen35moe load: MoE expert tensor 'blk.0.ffn_gate_exps.weight' \
                          is dtype {:?}; native ggml-block quantization (Q4_0, Q5_K, Q6_K, Q8_0) \
                          is required. Re-emit the GGUF with quantized MoE experts — no \
-                         F32-expansion fallback per ADR-012 item-2 (peer alignment).",
+                         F32-expansion fallback is permitted by the native-storage contract.",
                         info.ggml_type
                     ));
                 }
@@ -367,41 +385,24 @@ impl Qwen35Model {
             // (`forward_mlx::MlxModelWeights::load_from_gguf` which calls
             // `progress.on_layer(i + 1)` per layer).
             progress.on_layer(i as usize + 1);
-            let layer = match cfg.variant {
-                Qwen35Variant::Moe => {
-                    let kind = cfg
-                        .layer_types
-                        .get(i as usize)
-                        .copied()
-                        .ok_or_else(|| anyhow!("layer_idx {i} out of range"))?;
-                    // Production quantized experts (Q4_0/Q5_K/Q6_K/Q8_0) —
-                    // keep native blocks on Metal; no F32 expansion.
-                    let ffn_weights = {
-                        let ffn = weight_loader::load_moe_ffn_quantized(gguf, i, &device)
-                            .with_context(|| format!("load_moe_ffn_quantized layer {i}"))?;
-                        Qwen35FfnWeights::MoeQ(ffn)
-                    };
-                    match kind {
-                        Qwen35LayerKind::FullAttention => {
-                            let attn = weight_loader::load_full_attn_layer(gguf, &cfg, i, &device)
-                                .with_context(|| format!("load_full_attn layer {i}"))?;
-                            Qwen35LayerWeights::FullAttn {
-                                attn,
-                                ffn: ffn_weights,
-                            }
-                        }
-                        Qwen35LayerKind::LinearAttention => {
-                            let attn = weight_loader::load_delta_net_layer(gguf, &cfg, i, &device)
-                                .with_context(|| format!("load_delta_net layer {i}"))?;
-                            Qwen35LayerWeights::LinearAttn {
-                                attn,
-                                ffn: ffn_weights,
-                            }
-                        }
-                    }
-                }
-                Qwen35Variant::Dense => weight_loader::load_layer(gguf, &cfg, i, &device)
-                    .with_context(|| format!("load_layer {i}"))?,
+            let kind = cfg
+                .layer_types
+                .get(i as usize)
+                .copied()
+                .ok_or_else(|| anyhow!("layer_idx {i} out of range"))?;
+            let ffn = weight_loader::load_ffn(gguf, &cfg, i, &device)
+                .with_context(|| format!("load native FFN layer {i}"))?;
+            let layer = match kind {
+                Qwen35LayerKind::FullAttention => Qwen35LayerWeights::NativeFullAttn {
+                    attn: weight_loader::load_full_attn_layer_native(gguf, &cfg, i, &device)
+                        .with_context(|| format!("load native full-attention layer {i}"))?,
+                    ffn,
+                },
+                Qwen35LayerKind::LinearAttention => Qwen35LayerWeights::NativeLinearAttn {
+                    attn: weight_loader::load_delta_net_layer_native(gguf, &cfg, i, &device)
+                        .with_context(|| format!("load native DeltaNet layer {i}"))?,
+                    ffn,
+                },
             };
             layers.push(layer);
         }
@@ -415,7 +416,9 @@ impl Qwen35Model {
             cfg,
             layers,
             token_embd,
+            token_embd_native: Some(token_embd_native),
             output_weight,
+            output_weight_native: Some(output_weight_native),
             output_norm,
             mtp,
             #[cfg(test)]
@@ -432,7 +435,13 @@ impl Qwen35Model {
     pub fn num_linear_attn_layers(&self) -> usize {
         self.layers
             .iter()
-            .filter(|l| matches!(l, Qwen35LayerWeights::LinearAttn { .. }))
+            .filter(|l| {
+                matches!(
+                    l,
+                    Qwen35LayerWeights::LinearAttn { .. }
+                        | Qwen35LayerWeights::NativeLinearAttn { .. }
+                )
+            })
             .count()
     }
 
@@ -440,7 +449,12 @@ impl Qwen35Model {
     pub fn num_full_attn_layers(&self) -> usize {
         self.layers
             .iter()
-            .filter(|l| matches!(l, Qwen35LayerWeights::FullAttn { .. }))
+            .filter(|l| {
+                matches!(
+                    l,
+                    Qwen35LayerWeights::FullAttn { .. } | Qwen35LayerWeights::NativeFullAttn { .. }
+                )
+            })
             .count()
     }
 
@@ -492,26 +506,19 @@ impl Qwen35Model {
             Vec<(usize, MlxAffineLinear)>,
         > = std::collections::HashMap::new();
         let mut unknown_skipped: usize = 0;
-        // ADR-020 AC#7 iter B1 — track whether lm_head ("output") was overlaid.
-        // The lm_head weights live as `Vec<f32>` (NOT a per-layer MlxQWeight),
-        // so the overlay path dequantizes the DWQ-trained codes back to f32
-        // and overwrites `self.output_weight` in place.  The next forward
-        // call re-quantizes these to Q4_0 via `upload_q4_0_from_f32` (in
-        // `forward_gpu.rs::ensure_gpu_cache_primed`); the round-trip loses
-        // the per-group DWQ bias term but preserves the trained scale +
-        // codes — measurable AC#7 signal without requiring a new affine
-        // matmul kernel path.
+        // Track whether lm_head ("output") was overlaid. Synthetic models
+        // retain the exact dequantized replacement as F32. Native GGUF models
+        // fail closed above until direct affine execution is implemented;
+        // inference never re-quantizes the replacement to another codec.
         let mut lm_head_overridden: bool = false;
-        // ADR-020 AC#7 iter B2.A — count of dense attn projections overlaid
-        // (Q/K/V/O across all FullAttn layers).  Same Vec<f32>+Q4_0 storage
-        // path as lm_head; F2 round-trip drift was measured under 0.10 for
-        // every attn Linear in the empirical 27B 20-step overlay.
+        // ADR-020 AC#7 iter B2.A — count of dense attention projections
+        // overlaid in legacy synthetic/F32 models. Native GGUF layers fail
+        // closed below: inference must never dequantize and re-encode their
+        // declared artifact weights.
         let mut overridden_dense_attn: usize = 0;
-        // ADR-020 AC#7 iter B2.B — count of dense FFN projections overlaid
-        // (Gate/Up/Down across all FullAttn layers with DenseQ variant).
-        // Path: dequant DWQ → transpose to GGUF native → Q4_0 re-encode →
-        // replace MlxBuffer in DenseFfnWeightsQ.  MoE FFN layers are NOT
-        // counted here (they go through the existing MoE bucket path).
+        // ADR-020 AC#7 iter B2.B — count of legacy synthetic dense FFN
+        // projections overlaid. Native GGUF DenseQ layers reject this path;
+        // a future overlay must carry and execute its own declared format.
         let mut overridden_dense_ffn: usize = 0;
 
         for name in st.names() {
@@ -532,7 +539,11 @@ impl Qwen35Model {
                 let linear = MlxAffineLinear::from_safetensors(&st, stem, bits, group_size)
                     .with_context(|| format!("qwen35 apply_dwq_overlay: parse {stem}"))?;
                 let h = self.cfg.hidden_size as usize;
-                let v = self.output_weight.len() / h.max(1);
+                let v = self
+                    .output_weight_native
+                    .as_ref()
+                    .map(|weight| weight.info.rows)
+                    .unwrap_or_else(|| self.output_weight.len() / h.max(1));
                 if linear.n != v || linear.k != h {
                     anyhow::bail!(
                         "qwen35 DWQ overlay: output shape ({}, {}) != model lm_head ({}, {})",
@@ -542,44 +553,18 @@ impl Qwen35Model {
                         h,
                     );
                 }
-                // ADR-020 AC#7 foundation F2 — measure the Q4_0 round-trip
-                // drift the iter-B1 path will incur when
-                // `forward_gpu.rs::ensure_gpu_cache_primed::upload_q4_0_from_f32`
-                // re-quantizes our dequantized lm_head Vec<f32>.  This
-                // gives operators a deterministic readout of how much
-                // DWQ signal is being LOST to the codec round-trip on
-                // every overlay-load — independent of any training
-                // run's actual KL improvement.
-                match linear.q4_0_round_trip_drift() {
-                    Ok(d) => {
-                        eprintln!(
-                            "[qwen35 DWQ overlay] lm_head Q4_0 round-trip drift: \
-                             rms={rms:.4e} max={max:.4e} \
-                             relative_rms={rrms:.4} bias_fraction={bf:.4} \
-                             ({n}x{k}, gs={gs}, bits={bits}); \
-                             read: relative_rms<0.1 ⇒ codec preserves signal, \
-                             >0.5 ⇒ codec destroys it",
-                            rms = d.rms_drift,
-                            max = d.max_abs_drift,
-                            rrms = d.relative_rms,
-                            bf = d.bias_fraction,
-                            n = d.n,
-                            k = d.k,
-                            gs = d.group_size,
-                            bits = d.bits,
-                        );
-                    }
-                    Err(e) => {
-                        // Never fatal — drift measurement is purely a
-                        // diagnostic; alignment failure here would have
-                        // already tripped the from_safetensors load
-                        // earlier (Q4_0 alignment is a subset of DWQ's
-                        // group_size constraint at gs=32).
-                        tracing::warn!(error = %e,
-                            "qwen35 DWQ overlay: Q4_0 round-trip drift measurement skipped");
-                    }
+                if self.output_weight_native.is_some() {
+                    anyhow::bail!(
+                        "qwen35 DWQ overlay: output.weight direct affine execution is not wired \
+                         for the native GGUF model; refusing the old affine -> F32 -> Q4_0 \
+                         rewrite. Convert the safetensors overlay into the final GGUF artifact \
+                         or add an exact affine output-head route first"
+                    );
                 }
                 self.output_weight = linear.dequantize_to_f32();
+                // The overlay is an explicit replacement format. Do not keep
+                // routing a stale GGUF-native head after replacement.
+                self.output_weight_native = None;
                 lm_head_overridden = true;
                 continue;
             }
@@ -633,6 +618,15 @@ impl Qwen35Model {
             if let Some(role_kind) = attn_role_target {
                 let linear = MlxAffineLinear::from_safetensors(&st, stem, bits, group_size)
                     .with_context(|| format!("qwen35 apply_dwq_overlay: parse {stem}"))?;
+                if matches!(
+                    self.layers[layer_idx],
+                    Qwen35LayerWeights::NativeFullAttn { .. }
+                ) {
+                    anyhow::bail!(
+                        "qwen35 DWQ overlay: {stem} direct affine execution is not wired for \
+                         native full attention; refusing the old affine -> F32 -> Q4_0 rewrite"
+                    );
+                }
                 let layer_kind_label = format!("{role_kind:?}");
                 match overwrite_full_attn_f32_linear(
                     &mut self.layers[layer_idx],
@@ -694,6 +688,16 @@ impl Qwen35Model {
             if let Some(ffn_role) = dense_ffn_role {
                 let linear = MlxAffineLinear::from_safetensors(&st, stem, bits, group_size)
                     .with_context(|| format!("qwen35 apply_dwq_overlay: parse {stem}"))?;
+                if matches!(
+                    self.layers[layer_idx],
+                    Qwen35LayerWeights::NativeFullAttn { .. }
+                        | Qwen35LayerWeights::NativeLinearAttn { .. }
+                ) {
+                    anyhow::bail!(
+                        "qwen35 DWQ overlay: {stem} direct affine execution is not wired for \
+                         native dense FFN weights; refusing the old affine -> F32 -> Q4_0 rewrite"
+                    );
+                }
                 let role_label = format!("{ffn_role:?}");
                 match overwrite_dense_ffn_q4_0_linear(
                     &mut self.layers[layer_idx],
@@ -1037,8 +1041,9 @@ fn overwrite_dense_ffn_q4_0_linear(
     use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 
     let ffn = match layer {
-        Qwen35LayerWeights::FullAttn { ffn, .. } => ffn,
-        Qwen35LayerWeights::LinearAttn { .. } => {
+        Qwen35LayerWeights::FullAttn { ffn, .. }
+        | Qwen35LayerWeights::NativeFullAttn { ffn, .. } => ffn,
+        Qwen35LayerWeights::LinearAttn { .. } | Qwen35LayerWeights::NativeLinearAttn { .. } => {
             anyhow::bail!(
                 "qwen35 DWQ overlay: layer {layer_idx} is LinearAttention; \
                  FFN-role stem '{stem}' not applicable"
@@ -1086,12 +1091,9 @@ fn overwrite_dense_ffn_q4_0_linear(
 /// projection (Q, K, V, or Output) on a [`Qwen35LayerWeights::FullAttn`]
 /// layer with DWQ-trained values.
 ///
-/// Mirrors the iter-B1 lm_head pattern: dequantize the affine-DWQ codes
-/// to f32 and overwrite the existing `Vec<f32>` slot.  The next forward's
-/// [`gpu_full_attn::FullAttnWeightsGpu::from_cpu`] call re-quantizes via
-/// `upload_q4_0_from_f32` — F2 measurement on the empirical 27B 20-step
-/// overlay confirms `relative_rms < 0.10` for every attn role (codec
-/// preserves >90% of DWQ signal).
+/// This legacy path applies only to synthetic/F32 models. Native GGUF layers
+/// fail closed rather than dequantizing their artifact weights and re-encoding
+/// them to a different runtime codec.
 ///
 /// Errors when:
 ///   - The layer at `layer_idx` is `LinearAttention` (DeltaNet); the
@@ -1109,7 +1111,12 @@ fn overwrite_full_attn_f32_linear(
 ) -> anyhow::Result<()> {
     let attn = match layer {
         Qwen35LayerWeights::FullAttn { attn, .. } => attn,
-        Qwen35LayerWeights::LinearAttn { .. } => {
+        Qwen35LayerWeights::NativeFullAttn { .. } => {
+            anyhow::bail!(
+                "qwen35 DWQ overlay: native full-attention layer {layer_idx} cannot be replaced through the legacy F32→Q4_0 path; an overlay must provide and route its declared native format"
+            );
+        }
+        Qwen35LayerWeights::LinearAttn { .. } | Qwen35LayerWeights::NativeLinearAttn { .. } => {
             anyhow::bail!(
                 "qwen35 DWQ overlay: layer {layer_idx} is LinearAttention \
                  (DeltaNet); attn-role stem '{stem}' is not applicable \

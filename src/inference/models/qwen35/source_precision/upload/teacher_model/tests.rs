@@ -5,6 +5,7 @@ use mlx_native::MlxDevice;
 use safetensors::Dtype as SafeDtype;
 
 use super::*;
+use crate::inference::models::qwen35::gpu_full_attn::FullAttnQGateWeightsGpu;
 use crate::inference::models::qwen35::source_precision::topology::admit_qwen35_bf16_topology;
 use crate::inference::models::qwen35::source_precision::topology_tests::{fixture, open};
 use crate::inference::models::qwen35::source_precision::upload::upload_with_capacity_for_test;
@@ -139,17 +140,22 @@ fn prepared_buffer_addresses(prepared: &PreparedQwen35SourceTeacherV1) -> BTreeS
             layer.ffn.down.contents_ptr() as usize,
         ]);
         match &layer.attention {
-            PreparedQwen35SourceAttentionV1::Full(weights) => addresses.extend([
-                weights.attn_norm.contents_ptr() as usize,
-                weights.post_attn_norm.contents_ptr() as usize,
-                weights.wq.contents_ptr() as usize,
-                weights.wk.contents_ptr() as usize,
-                weights.wv.contents_ptr() as usize,
-                weights.w_gate.contents_ptr() as usize,
-                weights.attn_q_norm.contents_ptr() as usize,
-                weights.attn_k_norm.contents_ptr() as usize,
-                weights.wo.contents_ptr() as usize,
-            ]),
+            PreparedQwen35SourceAttentionV1::Full(weights) => {
+                let FullAttnQGateWeightsGpu::Split { wq, w_gate, .. } = &weights.q_gate else {
+                    panic!("source teacher must retain split Q/gate weights");
+                };
+                addresses.extend([
+                    weights.attn_norm.contents_ptr() as usize,
+                    weights.post_attn_norm.contents_ptr() as usize,
+                    wq.contents_ptr() as usize,
+                    weights.wk.contents_ptr() as usize,
+                    weights.wv.contents_ptr() as usize,
+                    w_gate.contents_ptr() as usize,
+                    weights.attn_q_norm.contents_ptr() as usize,
+                    weights.attn_k_norm.contents_ptr() as usize,
+                    weights.wo.contents_ptr() as usize,
+                ])
+            }
             PreparedQwen35SourceAttentionV1::Linear(weights) => addresses.extend([
                 weights.attn_norm.contents_ptr() as usize,
                 weights.post_attn_norm.contents_ptr() as usize,

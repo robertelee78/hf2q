@@ -3,16 +3,29 @@ use mlx_native::gguf::GgufFile;
 use mlx_native::{MlxBuffer, MlxDevice};
 
 use super::ffn::{DenseFfnWeights, MoeFfnShape};
-use super::gpu_ffn::{DenseFfnWeightsGpu, MoeFfnWeightsGpuQ};
-use super::gpu_full_attn::{upload_bf16_from_f32, upload_f32_weight, upload_q4_0_from_f32};
-use super::mtp::{MtpFfnWeightsGpu, MtpFullAttnWeightsGpu, MtpWeights};
-use super::weight_loader::{load_f32_tensor, load_moe_ffn_quantized};
+use super::gpu_ffn::{DenseFfnWeightsGpu, DenseFfnWeightsGpuQ, MoeFfnWeightsGpuQ};
+use super::gpu_full_attn::{upload_f32_weight, FullAttnQGateWeightsGpu};
+use super::mtp::{MtpFfnWeightsGpu, MtpFullAttnWeightsGpu, MtpQGateWeightsGpu, MtpWeights};
+use super::weight_loader::{
+    dense_ffn_storage, dense_ffn_tensor_types, load_dense_ffn_quantized, load_f32_tensor,
+    load_moe_ffn_quantized, load_native_projection, DenseFfnStorage,
+};
 use super::Qwen35Config;
+use crate::serve::forward_mlx_shared::MlxQWeight;
 
 pub fn load_mtp_weights_if_present(
     gguf: &GgufFile,
     cfg: &Qwen35Config,
     device: &MlxDevice,
+) -> Result<Option<MtpWeights>> {
+    load_mtp_weights_if_present_with_shared_head(gguf, cfg, device, None)
+}
+
+pub fn load_mtp_weights_if_present_with_shared_head(
+    gguf: &GgufFile,
+    cfg: &Qwen35Config,
+    device: &MlxDevice,
+    main_output_head: Option<&MlxQWeight>,
 ) -> Result<Option<MtpWeights>> {
     if cfg.mtp_num_hidden_layers == 0 {
         return Ok(None);
@@ -51,15 +64,24 @@ pub fn load_mtp_weights_if_present(
     // Logged at INFO level so operators can confirm the path.
     let embed_tokens_tname = format!("{nextn}.embed_tokens.weight");
     let embed_tokens = if cfg.mtp_use_dedicated_embeddings {
-        let buf = upload_bf16_required(gguf, &embed_tokens_tname, device).with_context(|| {
-            format!(
-                "MTP loader expected dedicated `{embed_tokens_tname}` because \
-                     mtp_use_dedicated_embeddings=True (set explicitly via metadata or \
-                     inferred from tensor presence); to share main embeddings, re-emit \
-                     the GGUF without `nextn.embed_tokens.weight` or set the metadata \
-                     key `{p}.nextn.use_dedicated_embeddings = false`"
-            )
+        let info = gguf.tensor_info(&embed_tokens_tname).ok_or_else(|| {
+            anyhow::anyhow!("MTP dedicated embedding tensor `{embed_tokens_tname}` is missing")
         })?;
+        ensure!(
+            info.shape.len() == 2 && info.shape[1] == h,
+            "{embed_tokens_tname} shape {:?} is not [vocab,{h}]",
+            info.shape
+        );
+        let buf =
+            crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, &embed_tokens_tname, device)
+                .with_context(|| {
+                    format!(
+                        "MTP loader expected dedicated `{embed_tokens_tname}` because \
+                 mtp_use_dedicated_embeddings=True"
+                    )
+                })?;
+        super::weight_pool::register_weight_buffer(device, &buf.buffer)
+            .with_context(|| format!("register {embed_tokens_tname}"))?;
         tracing::info!(
             mtp_layer = layer_index,
             mtp_use_dedicated_embeddings = true,
@@ -84,8 +106,8 @@ pub fn load_mtp_weights_if_present(
         );
         None
     };
-    let (eh_proj_embed, eh_proj_hidden) =
-        load_split_eh_proj(gguf, &format!("{nextn}.eh_proj.weight"), h, device)?;
+    let (eh_proj, eh_proj_ggml_type) =
+        load_native_projection(gguf, &format!("{nextn}.eh_proj.weight"), h, 2 * h, device)?;
     let shared_head_norm =
         load_norm_gpu(gguf, &format!("{nextn}.shared_head_norm.weight"), h, device)?;
 
@@ -103,23 +125,51 @@ pub fn load_mtp_weights_if_present(
     // bf16 GPU buffer is materialised the same way either path; vocab_size
     // is derived from the row count of whichever tensor we actually loaded.
     let shared_head_head_tname = format!("{nextn}.shared_head_head.weight");
-    let (shared_head_head_f32, shared_head_head_source) =
-        if gguf.tensor_info(&shared_head_head_tname).is_some() {
-            let data = load_f32_tensor(gguf, &shared_head_head_tname, device)
-                .with_context(|| shared_head_head_tname.clone())?;
-            (data, shared_head_head_tname.clone())
+    let (shared_head_head, shared_head_head_ggml_type, vocab_size, shared_head_head_source) =
+        if let Some(info) = gguf.tensor_info(&shared_head_head_tname) {
+            ensure!(
+                info.shape.len() == 2 && info.shape[1] == h,
+                "{shared_head_head_tname} shape {:?} is not [vocab, {h}]",
+                info.shape
+            );
+            let vocab = info.shape[0];
+            let (buffer, ggml_type) =
+                load_native_projection(gguf, &shared_head_head_tname, vocab, h, device)?;
+            (
+                buffer,
+                ggml_type,
+                vocab as u32,
+                shared_head_head_tname.clone(),
+            )
         } else if !cfg.mtp_use_dedicated_embeddings {
             // Shared mode: borrow the main LM head.
             let main_lm = "output.weight";
-            ensure!(
-                gguf.tensor_info(main_lm).is_some(),
-                "qwen35 MTP loader: mtp_use_dedicated_embeddings=False and \
-                 `{shared_head_head_tname}` absent, but main `{main_lm}` is also \
-                 missing — cannot resolve the MTP final projection."
-            );
-            let data = load_f32_tensor(gguf, main_lm, device)
-                .with_context(|| format!("MTP shared_head_head fallback to {main_lm}"))?;
-            (data, main_lm.to_string())
+            if let Some(main) = main_output_head {
+                ensure!(
+                    main.affine.is_none() && main.info.cols == h,
+                    "qwen35 MTP loader: supplied shared output head is not a native [vocab,{h}] GGUF projection"
+                );
+                (
+                    main.buffer.clone(),
+                    main.info.ggml_dtype,
+                    main.info.rows as u32,
+                    main_lm.to_string(),
+                )
+            } else {
+                let info = gguf.tensor_info(main_lm).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "qwen35 MTP loader: shared head missing and main output.weight absent"
+                    )
+                })?;
+                ensure!(
+                    info.shape.len() == 2 && info.shape[1] == h,
+                    "output.weight shape {:?} is not [vocab, {h}]",
+                    info.shape
+                );
+                let vocab = info.shape[0];
+                let (buffer, ggml_type) = load_native_projection(gguf, main_lm, vocab, h, device)?;
+                (buffer, ggml_type, vocab as u32, main_lm.to_string())
+            }
         } else {
             bail!(
                 "qwen35 MTP loader: `{shared_head_head_tname}` is missing AND \
@@ -128,30 +178,12 @@ pub fn load_mtp_weights_if_present(
                  flag to false."
             );
         };
-    ensure!(
-        shared_head_head_f32.len() % h == 0,
-        "{shared_head_head_source} has {} floats, not divisible by hidden_size {h}",
-        shared_head_head_f32.len()
-    );
-    let vocab_size = (shared_head_head_f32.len() / h) as u32;
     tracing::info!(
         mtp_layer = layer_index,
         source = %shared_head_head_source,
         vocab_size,
         "qwen35 MTP loader: shared_head_head resolved"
     );
-    // ADR-028 iter-157: shared_head_head was stored as F32→BF16 (2.54 GB at
-    // qwen3.6 vocab=248320 × hidden=5120). At 587 GB/s peak bandwidth that
-    // pays 4.33 ms per draft step — matched iter-156 measurement (4.52 ms,
-    // 65% of forward_draft). Verifier already learned this lesson at
-    // forward_gpu.rs:416-422 ("Q4_0 matmul on Apple Silicon is faster than
-    // BF16 at BOTH M=1 and M>1, ~1.4 ms saved per step → +14 tok/s") and
-    // switched its lm_head from BF16 to Q4_0. Replicate that here for the
-    // MTP shared_head_head — same `apply_linear_projection_f32` call site
-    // works with the Q4_0 U8 buffer (verified by reading verifier path at
-    // forward_gpu.rs:856).
-    let shared_head_head = upload_q4_0_from_f32(&shared_head_head_f32, device)
-        .context("MTP upload shared_head_head Q4_0")?;
     let attn = load_mtp_attn(gguf, cfg, layer_index, device)?;
     let (ffn, intermediate_size) = load_mtp_ffn(gguf, cfg, layer_index, device)?;
 
@@ -163,11 +195,12 @@ pub fn load_mtp_weights_if_present(
         loaded_tensor_names,
         enorm,
         hnorm,
-        eh_proj_embed,
-        eh_proj_hidden,
+        eh_proj,
+        eh_proj_ggml_type,
         embed_tokens,
         shared_head_norm,
         shared_head_head,
+        shared_head_head_ggml_type,
         attn,
         ffn,
     }))
@@ -229,62 +262,60 @@ fn load_mtp_attn(
     let post_attn_norm =
         load_norm_gpu(gguf, &format!("{p}.post_attention_norm.weight"), h, device)?;
 
-    let q_or_q_gate = load_f32_tensor(gguf, &format!("{p}.attn_q.weight"), device)
-        .with_context(|| format!("{p}.attn_q.weight"))?;
-    let (wq_f32, w_gate_f32) = if q_or_q_gate.len() == q_total * h {
+    let q_name = format!("{p}.attn_q.weight");
+    let q_info = gguf
+        .tensor_info(&q_name)
+        .ok_or_else(|| anyhow::anyhow!("{q_name} not found"))?;
+    let q_gate = if q_info.shape.as_slice() == [q_total, h] {
+        let (q, q_type) = load_native_projection(gguf, &q_name, q_total, h, device)?;
         let gate_name = format!("{p}.attn_gate.weight");
-        let gate = if gguf.tensor_info(&gate_name).is_some() {
-            let gate =
-                load_f32_tensor(gguf, &gate_name, device).with_context(|| gate_name.clone())?;
-            ensure!(gate.len() == q_total * h, "{gate_name} shape mismatch");
-            Some(gate)
+        if gguf.tensor_info(&gate_name).is_some() {
+            let (gate, gate_type) = load_native_projection(gguf, &gate_name, q_total, h, device)?;
+            MtpQGateWeightsGpu::Gated(FullAttnQGateWeightsGpu::Split {
+                wq: q,
+                wq_ggml_type: q_type,
+                w_gate: gate,
+                w_gate_ggml_type: gate_type,
+            })
         } else {
-            None
-        };
-        (q_or_q_gate, gate)
-    } else if q_or_q_gate.len() == 2 * q_total * h {
-        split_interleaved_q_gate(&q_or_q_gate, cfg)?
+            MtpQGateWeightsGpu::Ungated {
+                wq: q,
+                wq_ggml_type: q_type,
+            }
+        }
+    } else if q_info.shape.as_slice() == [2 * q_total, h] {
+        let (fused, q_type) = load_native_projection(gguf, &q_name, 2 * q_total, h, device)?;
+        MtpQGateWeightsGpu::Gated(FullAttnQGateWeightsGpu::Fused {
+            weight: fused,
+            ggml_type: q_type,
+        })
     } else {
         bail!(
-            "{p}.attn_q.weight has {} floats, expected {} (Q) or {} (interleaved Q+gate)",
-            q_or_q_gate.len(),
-            q_total * h,
-            2 * q_total * h
+            "{q_name} shape {:?}, expected [{q_total},{h}] or [{}, {h}] interleaved Q+gate",
+            q_info.shape,
+            2 * q_total,
         );
     };
 
-    let wk_f32 = load_f32_tensor(gguf, &format!("{p}.attn_k.weight"), device)
-        .with_context(|| format!("{p}.attn_k.weight"))?;
-    let wv_f32 = load_f32_tensor(gguf, &format!("{p}.attn_v.weight"), device)
-        .with_context(|| format!("{p}.attn_v.weight"))?;
-    let wo_f32 = load_f32_tensor(gguf, &format!("{p}.attn_output.weight"), device)
-        .with_context(|| format!("{p}.attn_output.weight"))?;
-    ensure!(
-        wk_f32.len() == kv_total * h,
-        "{p}.attn_k.weight shape mismatch"
-    );
-    ensure!(
-        wv_f32.len() == kv_total * h,
-        "{p}.attn_v.weight shape mismatch"
-    );
-    ensure!(
-        wo_f32.len() == h * q_total,
-        "{p}.attn_output.weight shape mismatch"
-    );
+    let (wk, wk_ggml_type) =
+        load_native_projection(gguf, &format!("{p}.attn_k.weight"), kv_total, h, device)?;
+    let (wv, wv_ggml_type) =
+        load_native_projection(gguf, &format!("{p}.attn_v.weight"), kv_total, h, device)?;
+    let (wo, wo_ggml_type) =
+        load_native_projection(gguf, &format!("{p}.attn_output.weight"), h, q_total, device)?;
 
     Ok(MtpFullAttnWeightsGpu {
         attn_norm,
         post_attn_norm,
-        wq: upload_bf16_from_f32(&wq_f32, device).context("MTP upload wq")?,
-        wk: upload_bf16_from_f32(&wk_f32, device).context("MTP upload wk")?,
-        wv: upload_bf16_from_f32(&wv_f32, device).context("MTP upload wv")?,
-        w_gate: match w_gate_f32 {
-            Some(w) => Some(upload_bf16_from_f32(&w, device).context("MTP upload w_gate")?),
-            None => None,
-        },
+        q_gate,
+        wk,
+        wk_ggml_type,
+        wv,
+        wv_ggml_type,
         attn_q_norm: load_norm_gpu(gguf, &format!("{p}.attn_q_norm.weight"), d, device)?,
         attn_k_norm: load_norm_gpu(gguf, &format!("{p}.attn_k_norm.weight"), d, device)?,
-        wo: upload_bf16_from_f32(&wo_f32, device).context("MTP upload wo")?,
+        wo,
+        wo_ggml_type,
     })
 }
 
@@ -319,34 +350,47 @@ fn load_mtp_dense_ffn(
     p: &str,
     device: &MlxDevice,
 ) -> Result<(MtpFfnWeightsGpu, u32)> {
-    let h = cfg.hidden_size as usize;
-    let gate = load_f32_tensor(gguf, &format!("{p}.ffn_gate.weight"), device)
-        .with_context(|| format!("{p}.ffn_gate.weight"))?;
-    ensure!(gate.len() % h == 0, "{p}.ffn_gate.weight width mismatch");
-    let intermediate = gate.len() / h;
-    let up = load_f32_tensor(gguf, &format!("{p}.ffn_up.weight"), device)
-        .with_context(|| format!("{p}.ffn_up.weight"))?;
-    let down = load_f32_tensor(gguf, &format!("{p}.ffn_down.weight"), device)
-        .with_context(|| format!("{p}.ffn_down.weight"))?;
-    ensure!(
-        up.len() == intermediate * h,
-        "{p}.ffn_up.weight shape mismatch"
-    );
-    ensure!(
-        down.len() == h * intermediate,
-        "{p}.ffn_down.weight shape mismatch"
-    );
-    let weights = DenseFfnWeights { gate, up, down };
-    let dense_gpu =
-        DenseFfnWeightsGpu::from_cpu(&weights, device).context("MTP upload dense FFN")?;
-    let intermediate_size = intermediate as u32;
-    Ok((
-        MtpFfnWeightsGpu::Dense {
-            weights: dense_gpu,
-            intermediate_size,
-        },
-        intermediate_size,
-    ))
+    let layer_idx = cfg.num_hidden_layers;
+    let (gate_type, up_type, down_type) = dense_ffn_tensor_types(gguf, layer_idx)?;
+    match dense_ffn_storage(layer_idx, gate_type, up_type, down_type)? {
+        DenseFfnStorage::Quantized => {
+            let weights_q = load_dense_ffn_quantized(gguf, layer_idx, cfg, device)
+                .with_context(|| format!("MTP native dense FFN {p}"))?;
+            let intermediate_size = weights_q.intermediate_size;
+            let dense_gpu = DenseFfnWeightsGpuQ::from_quantized(&weights_q);
+            Ok((
+                MtpFfnWeightsGpu::DenseQ { weights: dense_gpu },
+                intermediate_size,
+            ))
+        }
+        DenseFfnStorage::Float => {
+            let h = cfg.hidden_size as usize;
+            let gate_name = format!("{p}.ffn_gate.weight");
+            let gate = load_f32_tensor(gguf, &gate_name, device)?;
+            ensure!(gate.len() % h == 0, "{gate_name} width mismatch");
+            let intermediate = gate.len() / h;
+            let up = load_f32_tensor(gguf, &format!("{p}.ffn_up.weight"), device)?;
+            let down = load_f32_tensor(gguf, &format!("{p}.ffn_down.weight"), device)?;
+            ensure!(
+                up.len() == intermediate * h,
+                "{p}.ffn_up.weight shape mismatch"
+            );
+            ensure!(
+                down.len() == h * intermediate,
+                "{p}.ffn_down.weight shape mismatch"
+            );
+            let weights =
+                DenseFfnWeightsGpu::from_cpu(&DenseFfnWeights { gate, up, down }, device)?;
+            let intermediate_size = intermediate as u32;
+            Ok((
+                MtpFfnWeightsGpu::Dense {
+                    weights,
+                    intermediate_size,
+                },
+                intermediate_size,
+            ))
+        }
+    }
 }
 
 fn load_mtp_moe_ffn(
@@ -406,59 +450,4 @@ fn load_norm_gpu(gguf: &GgufFile, name: &str, len: usize, device: &MlxDevice) ->
     // W-5b.7 iter 2: MTP norm weights are static / reused across decode tokens —
     // route them through the residency-aware helper.
     upload_f32_weight(&data, device).with_context(|| format!("upload {name}"))
-}
-
-fn upload_bf16_required(gguf: &GgufFile, name: &str, device: &MlxDevice) -> Result<MlxBuffer> {
-    let data = load_f32_tensor(gguf, name, device).with_context(|| name.to_string())?;
-    upload_bf16_from_f32(&data, device).with_context(|| format!("upload {name}"))
-}
-
-fn load_split_eh_proj(
-    gguf: &GgufFile,
-    name: &str,
-    hidden_size: usize,
-    device: &MlxDevice,
-) -> Result<(MlxBuffer, MlxBuffer)> {
-    let data = load_f32_tensor(gguf, name, device).with_context(|| name.to_string())?;
-    ensure!(
-        data.len() == hidden_size * hidden_size * 2,
-        "{name} shape mismatch"
-    );
-    let mut embed = vec![0.0f32; hidden_size * hidden_size];
-    let mut hidden = vec![0.0f32; hidden_size * hidden_size];
-    for row in 0..hidden_size {
-        let src = row * 2 * hidden_size;
-        let dst = row * hidden_size;
-        embed[dst..dst + hidden_size].copy_from_slice(&data[src..src + hidden_size]);
-        hidden[dst..dst + hidden_size]
-            .copy_from_slice(&data[src + hidden_size..src + 2 * hidden_size]);
-    }
-    Ok((
-        upload_bf16_from_f32(&embed, device).context("upload MTP eh_proj embed half")?,
-        upload_bf16_from_f32(&hidden, device).context("upload MTP eh_proj hidden half")?,
-    ))
-}
-
-fn split_interleaved_q_gate(
-    data: &[f32],
-    cfg: &Qwen35Config,
-) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
-    let h = cfg.hidden_size as usize;
-    let nh = cfg.num_attention_heads as usize;
-    let d = cfg.head_dim as usize;
-    let q_total = nh * d;
-    ensure!(
-        data.len() == 2 * q_total * h,
-        "interleaved Q+gate shape mismatch"
-    );
-    let mut q = vec![0.0f32; q_total * h];
-    let mut gate = vec![0.0f32; q_total * h];
-    for head_idx in 0..nh {
-        let src_q = (head_idx * 2 * d) * h;
-        let src_gate = ((head_idx * 2 + 1) * d) * h;
-        let dst = head_idx * d * h;
-        q[dst..dst + d * h].copy_from_slice(&data[src_q..src_q + d * h]);
-        gate[dst..dst + d * h].copy_from_slice(&data[src_gate..src_gate + d * h]);
-    }
-    Ok((q, Some(gate)))
 }

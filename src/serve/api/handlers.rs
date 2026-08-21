@@ -19,13 +19,13 @@
 
 use std::path::Path;
 
-use axum::Json;
 use axum::extract::{Extension, Path as AxPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use super::engine::{self, Engine, SamplingParams};
 use super::grammar;
@@ -1055,7 +1055,7 @@ fn apply_transparency_headers(
     summary_tokens: Option<usize>,
 ) {
     use super::schema::OverflowPolicy;
-    use axum::http::{HeaderValue, header::HeaderName};
+    use axum::http::{header::HeaderName, HeaderValue};
     let policy = req
         .hf2q_overflow_policy
         .unwrap_or(state.config.default_overflow_policy);
@@ -1238,8 +1238,8 @@ fn repeated_tool_result_signature(
     messages: &[ChatMessage],
     threshold: usize,
 ) -> Option<(&str, usize)> {
-    use std::collections::HashMap;
     use std::collections::hash_map::DefaultHasher;
+    use std::collections::HashMap;
     use std::hash::{Hash, Hasher};
 
     let chain_start = messages
@@ -2436,7 +2436,7 @@ fn dispatch_qwen3vl_seam_split(
     qwen3vl_image_grids: &[(u32, u32)],
     final_prompt_tokens: &[u32],
 ) -> std::result::Result<(engine::DeepstackData, Vec<i32>), Response> {
-    use crate::serve::forward_prefill::{Qwen3VlImageGrid, build_qwen3vl_positions};
+    use crate::serve::forward_prefill::{build_qwen3vl_positions, Qwen3VlImageGrid};
 
     let hidden = engine.hidden_size();
     let n_deepstack = mmproj
@@ -2695,7 +2695,7 @@ async fn chat_completions_stream(
     req: ChatCompletionRequest,
     prepared: PreparedChatContext,
 ) -> Response {
-    use super::sse::{SseStreamOptions, generation_events_to_sse_with_metrics_and_guard};
+    use super::sse::{generation_events_to_sse_with_metrics_and_guard, SseStreamOptions};
 
     // Iter-209: stream path uses the resolved engine from
     // `prepared.loaded_engine` — the pool resolution already ran in
@@ -4195,7 +4195,7 @@ fn apply_vit_transparency_headers(
     n_images: Option<usize>,
     soft_tokens_total: Option<usize>,
 ) {
-    use axum::http::{HeaderValue, header::HeaderName};
+    use axum::http::{header::HeaderName, HeaderValue};
     let headers = resp.headers_mut();
     if let Some(ms) = forward_ms {
         if let Ok(v) = HeaderValue::from_str(&ms.to_string()) {
@@ -7569,7 +7569,7 @@ mod qwen_engine_wire_error_tests {
 }
 
 fn queue_full_with_rate_limit_headers(state: &AppState) -> Response {
-    use axum::http::{HeaderValue, header::HeaderName};
+    use axum::http::{header::HeaderName, HeaderValue};
     let err = ApiError::queue_full();
     let mut resp = err.into_response();
     let cap = state.config.queue_capacity as u64;
@@ -8319,6 +8319,129 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         } else {
             (0u64, 0u64)
         };
+    // Qwen exact-speculation counters are process-wide. Per-proposer labels
+    // keep history verification distinct from the native MTP head; the older
+    // `hf2q_qwen_mtp_*` names remain compatibility aggregates below.
+    let qwen_mtp = &super::qwen35_speculation::TELEMETRY;
+    let qwen_mtp_fallback_reasons = format!(
+        "# HELP hf2q_qwen_mtp_fallback_requests_by_reason_total Compatibility aggregate of exact Qwen speculation fallbacks by closed reason.\n\
+# TYPE hf2q_qwen_mtp_fallback_requests_by_reason_total counter\n\
+hf2q_qwen_mtp_fallback_requests_by_reason_total{{reason=\"disabled\"}} {}\n\
+hf2q_qwen_mtp_fallback_requests_by_reason_total{{reason=\"unsupported_semantics\"}} {}\n\
+hf2q_qwen_mtp_fallback_requests_by_reason_total{{reason=\"no_mtp_weights\"}} {}\n\
+hf2q_qwen_mtp_fallback_requests_by_reason_total{{reason=\"prompt_cache_hit\"}} {}\n\
+hf2q_qwen_mtp_fallback_requests_by_reason_total{{reason=\"unprofitable\"}} {}\n\
+hf2q_qwen_mtp_fallback_requests_by_reason_total{{reason=\"slot_aware_unavailable\"}} {}\n\
+hf2q_qwen_mtp_fallback_requests_by_reason_total{{reason=\"runtime_unavailable\"}} {}\n",
+        qwen_mtp.fallback_disabled.load(Ordering::Relaxed),
+        qwen_mtp
+            .fallback_unsupported_semantics
+            .load(Ordering::Relaxed),
+        qwen_mtp.fallback_no_mtp_weights.load(Ordering::Relaxed),
+        qwen_mtp.fallback_prompt_cache_hit.load(Ordering::Relaxed),
+        qwen_mtp.fallback_unprofitable.load(Ordering::Relaxed),
+        qwen_mtp
+            .fallback_slot_aware_unavailable
+            .load(Ordering::Relaxed),
+        qwen_mtp.fallback_runtime_unavailable.load(Ordering::Relaxed),
+    );
+
+    let qwen_speculation_fallback_reasons = format!(
+        "# HELP hf2q_qwen_speculation_fallback_requests_by_reason_total Exact Qwen speculation fallbacks by closed reason.\n\
+# TYPE hf2q_qwen_speculation_fallback_requests_by_reason_total counter\n\
+hf2q_qwen_speculation_fallback_requests_by_reason_total{{reason=\"disabled\"}} {}\n\
+hf2q_qwen_speculation_fallback_requests_by_reason_total{{reason=\"unsupported_semantics\"}} {}\n\
+hf2q_qwen_speculation_fallback_requests_by_reason_total{{reason=\"no_mtp_weights\"}} {}\n\
+hf2q_qwen_speculation_fallback_requests_by_reason_total{{reason=\"prompt_cache_hit\"}} {}\n\
+hf2q_qwen_speculation_fallback_requests_by_reason_total{{reason=\"unprofitable\"}} {}\n\
+hf2q_qwen_speculation_fallback_requests_by_reason_total{{reason=\"slot_aware_unavailable\"}} {}\n\
+hf2q_qwen_speculation_fallback_requests_by_reason_total{{reason=\"runtime_unavailable\"}} {}\n",
+        qwen_mtp.fallback_disabled.load(Ordering::Relaxed),
+        qwen_mtp
+            .fallback_unsupported_semantics
+            .load(Ordering::Relaxed),
+        qwen_mtp.fallback_no_mtp_weights.load(Ordering::Relaxed),
+        qwen_mtp.fallback_prompt_cache_hit.load(Ordering::Relaxed),
+        qwen_mtp.fallback_unprofitable.load(Ordering::Relaxed),
+        qwen_mtp
+            .fallback_slot_aware_unavailable
+            .load(Ordering::Relaxed),
+        qwen_mtp.fallback_runtime_unavailable.load(Ordering::Relaxed),
+    );
+
+    let qwen_speculation_proposers = format!(
+        "# HELP hf2q_qwen_speculation_proposals_total Exact Qwen block-verifier rounds by proposer.\n\
+# TYPE hf2q_qwen_speculation_proposals_total counter\n\
+hf2q_qwen_speculation_proposals_total{{proposer=\"history_lookup\"}} {}\n\
+hf2q_qwen_speculation_proposals_total{{proposer=\"mtp\"}} {}\n\
+# HELP hf2q_qwen_speculation_drafted_tokens_total Draft tokens by exact Qwen proposer.\n\
+# TYPE hf2q_qwen_speculation_drafted_tokens_total counter\n\
+hf2q_qwen_speculation_drafted_tokens_total{{proposer=\"history_lookup\"}} {}\n\
+hf2q_qwen_speculation_drafted_tokens_total{{proposer=\"mtp\"}} {}\n\
+# HELP hf2q_qwen_speculation_accepted_tokens_total Draft tokens accepted by the target, by proposer.\n\
+# TYPE hf2q_qwen_speculation_accepted_tokens_total counter\n\
+hf2q_qwen_speculation_accepted_tokens_total{{proposer=\"history_lookup\"}} {}\n\
+hf2q_qwen_speculation_accepted_tokens_total{{proposer=\"mtp\"}} {}\n\
+# HELP hf2q_qwen_speculation_rejected_tokens_total Draft tokens rejected by the target, by proposer.\n\
+# TYPE hf2q_qwen_speculation_rejected_tokens_total counter\n\
+hf2q_qwen_speculation_rejected_tokens_total{{proposer=\"history_lookup\"}} {}\n\
+hf2q_qwen_speculation_rejected_tokens_total{{proposer=\"mtp\"}} {}\n\
+# HELP hf2q_qwen_speculation_target_forwards_total Target forwards issued by exact Qwen speculation, by proposer.\n\
+# TYPE hf2q_qwen_speculation_target_forwards_total counter\n\
+hf2q_qwen_speculation_target_forwards_total{{proposer=\"history_lookup\"}} {}\n\
+hf2q_qwen_speculation_target_forwards_total{{proposer=\"mtp\"}} {}\n\
+# HELP hf2q_qwen_speculation_cost_disabled_total Generations whose measured proposer cost was not better than equivalent ordinary decode.\n\
+# TYPE hf2q_qwen_speculation_cost_disabled_total counter\n\
+hf2q_qwen_speculation_cost_disabled_total{{proposer=\"history_lookup\"}} {}\n\
+hf2q_qwen_speculation_cost_disabled_total{{proposer=\"mtp\"}} {}\n\
+# HELP hf2q_qwen_speculation_round_seconds_total Complete proposer plus target-verifier time by proposer.\n\
+# TYPE hf2q_qwen_speculation_round_seconds_total counter\n\
+hf2q_qwen_speculation_round_seconds_total{{proposer=\"history_lookup\"}} {:.9}\n\
+hf2q_qwen_speculation_round_seconds_total{{proposer=\"mtp\"}} {:.9}\n\
+# HELP hf2q_qwen_speculation_equivalent_ordinary_seconds_total Measured ordinary target time for the same output decisions.\n\
+# TYPE hf2q_qwen_speculation_equivalent_ordinary_seconds_total counter\n\
+hf2q_qwen_speculation_equivalent_ordinary_seconds_total{{proposer=\"history_lookup\"}} {:.9}\n\
+hf2q_qwen_speculation_equivalent_ordinary_seconds_total{{proposer=\"mtp\"}} {:.9}\n\
+# HELP hf2q_qwen_history_lookup_no_match_total History lookup rounds with no continuation.\n\
+# TYPE hf2q_qwen_history_lookup_no_match_total counter\n\
+hf2q_qwen_history_lookup_no_match_total {}\n",
+        qwen_mtp.history_lookup_proposals.load(Ordering::Relaxed),
+        qwen_mtp.mtp_proposals.load(Ordering::Relaxed),
+        qwen_mtp
+            .history_lookup_drafted_tokens
+            .load(Ordering::Relaxed),
+        qwen_mtp.mtp_drafted_tokens.load(Ordering::Relaxed),
+        qwen_mtp
+            .history_lookup_accepted_tokens
+            .load(Ordering::Relaxed),
+        qwen_mtp.mtp_accepted_tokens.load(Ordering::Relaxed),
+        qwen_mtp
+            .history_lookup_rejected_tokens
+            .load(Ordering::Relaxed),
+        qwen_mtp.mtp_rejected_tokens.load(Ordering::Relaxed),
+        qwen_mtp
+            .history_lookup_target_forwards
+            .load(Ordering::Relaxed),
+        qwen_mtp.mtp_target_forwards.load(Ordering::Relaxed),
+        qwen_mtp
+            .history_lookup_cost_disabled
+            .load(Ordering::Relaxed),
+        qwen_mtp.mtp_cost_disabled.load(Ordering::Relaxed),
+        qwen_mtp
+            .history_lookup_round_nanos
+            .load(Ordering::Relaxed) as f64
+            / 1_000_000_000.0,
+        qwen_mtp.mtp_round_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        qwen_mtp
+            .history_lookup_equivalent_ordinary_nanos
+            .load(Ordering::Relaxed) as f64
+            / 1_000_000_000.0,
+        qwen_mtp
+            .mtp_equivalent_ordinary_nanos
+            .load(Ordering::Relaxed) as f64
+            / 1_000_000_000.0,
+        qwen_mtp.history_lookup_no_match.load(Ordering::Relaxed),
+    );
 
     let body = format!(
         "\
@@ -8375,6 +8498,39 @@ hf2q_decode_tokens_total {decode_tok}\n\
 # HELP hf2q_prompt_tokens_total Prompt tokens ingested across all completions.\n\
 # TYPE hf2q_prompt_tokens_total counter\n\
 hf2q_prompt_tokens_total {prompt_tok}\n\
+# HELP hf2q_qwen_speculation_cached_tokens_total Prompt tokens reused by exact Qwen speculation requests.\n\
+# TYPE hf2q_qwen_speculation_cached_tokens_total counter\n\
+hf2q_qwen_speculation_cached_tokens_total {qwen_mtp_cached_tokens}\n\
+# HELP hf2q_qwen_speculation_fallback_requests_total Qwen requests routed to ordinary target decode.\n\
+# TYPE hf2q_qwen_speculation_fallback_requests_total counter\n\
+hf2q_qwen_speculation_fallback_requests_total {qwen_mtp_fallbacks}\n\
+{qwen_speculation_fallback_reasons}\
+# HELP hf2q_qwen_speculation_conversation_resets_total Exact Qwen speculation controller resets at conversation boundaries.\n\
+# TYPE hf2q_qwen_speculation_conversation_resets_total counter\n\
+hf2q_qwen_speculation_conversation_resets_total {qwen_mtp_resets}\n\
+# HELP hf2q_qwen_mtp_drafted_tokens_total Compatibility aggregate of tokens proposed by all exact Qwen proposers.\n\
+# TYPE hf2q_qwen_mtp_drafted_tokens_total counter\n\
+hf2q_qwen_mtp_drafted_tokens_total {qwen_mtp_drafted}\n\
+# HELP hf2q_qwen_mtp_accepted_tokens_total Compatibility aggregate of exact Qwen proposals accepted by the target.\n\
+# TYPE hf2q_qwen_mtp_accepted_tokens_total counter\n\
+hf2q_qwen_mtp_accepted_tokens_total {qwen_mtp_accepted}\n\
+# HELP hf2q_qwen_mtp_rejected_tokens_total Compatibility aggregate of exact Qwen proposals rejected by the target.\n\
+# TYPE hf2q_qwen_mtp_rejected_tokens_total counter\n\
+hf2q_qwen_mtp_rejected_tokens_total {qwen_mtp_rejected}\n\
+# HELP hf2q_qwen_mtp_target_forwards_total Compatibility aggregate of target forwards issued by exact Qwen speculation.\n\
+# TYPE hf2q_qwen_mtp_target_forwards_total counter\n\
+hf2q_qwen_mtp_target_forwards_total {qwen_mtp_target_forwards}\n\
+# HELP hf2q_qwen_mtp_cached_tokens_total Prompt tokens actually reused by the Qwen transaction path.\n\
+# TYPE hf2q_qwen_mtp_cached_tokens_total counter\n\
+hf2q_qwen_mtp_cached_tokens_total {qwen_mtp_cached_tokens}\n\
+# HELP hf2q_qwen_mtp_fallback_requests_total Qwen requests routed to ordinary decode.\n\
+# TYPE hf2q_qwen_mtp_fallback_requests_total counter\n\
+hf2q_qwen_mtp_fallback_requests_total {qwen_mtp_fallbacks}\n\
+{qwen_mtp_fallback_reasons}\
+# HELP hf2q_qwen_mtp_conversation_resets_total Qwen MTP controller resets at conversation boundaries.\n\
+# TYPE hf2q_qwen_mtp_conversation_resets_total counter\n\
+hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
+{qwen_speculation_proposers}\
 ",
         uptime = state.uptime_seconds(),
         ready = ready,
@@ -8397,6 +8553,16 @@ hf2q_prompt_tokens_total {prompt_tok}\n\
         sse_cancel = m.sse_cancellations.load(Ordering::Relaxed),
         decode_tok = m.decode_tokens_total.load(Ordering::Relaxed),
         prompt_tok = m.prompt_tokens_total.load(Ordering::Relaxed),
+        qwen_mtp_drafted = qwen_mtp.drafted_tokens.load(Ordering::Relaxed),
+        qwen_mtp_accepted = qwen_mtp.accepted_tokens.load(Ordering::Relaxed),
+        qwen_mtp_rejected = qwen_mtp.rejected_tokens.load(Ordering::Relaxed),
+        qwen_mtp_target_forwards = qwen_mtp.target_forwards.load(Ordering::Relaxed),
+        qwen_mtp_cached_tokens = qwen_mtp.cached_token_reuse.load(Ordering::Relaxed),
+        qwen_mtp_fallbacks = qwen_mtp.fallback_requests.load(Ordering::Relaxed),
+        qwen_speculation_fallback_reasons = qwen_speculation_fallback_reasons,
+        qwen_mtp_fallback_reasons = qwen_mtp_fallback_reasons,
+        qwen_mtp_resets = qwen_mtp.conversation_resets.load(Ordering::Relaxed),
+        qwen_speculation_proposers = qwen_speculation_proposers,
     );
     // Prometheus exposition format: text/plain with a versioned content-type.
     let mut resp = (StatusCode::OK, body).into_response();
@@ -11369,8 +11535,8 @@ mod test_a4_tool_call_policy {
 
 #[cfg(test)]
 mod bos_probe_tests {
-    use super::{BOS_PROBE_FRAGMENTS, probe_bos_token_id};
-    use tokenizers::{AddedToken, Tokenizer, models::bpe::BPE};
+    use super::{probe_bos_token_id, BOS_PROBE_FRAGMENTS};
+    use tokenizers::{models::bpe::BPE, AddedToken, Tokenizer};
 
     /// Build a minimal `tokenizers::Tokenizer` with each provided fragment
     /// registered as a special token. This is the cheapest path to a
@@ -11616,15 +11782,15 @@ mod bos_probe_tests {
 #[cfg(test)]
 mod a5d_handler_429_tests {
     use super::super::engine::{
-        LoadedArch, make_synthetic_engine_aggregate_stream_pressure,
-        make_synthetic_engine_over_budget, make_synthetic_engine_with_slot_budget_exceeded_worker,
+        make_synthetic_engine_aggregate_stream_pressure, make_synthetic_engine_over_budget,
+        make_synthetic_engine_with_slot_budget_exceeded_worker, LoadedArch,
     };
     use super::super::state::{AppState, ServerConfig};
     use super::*;
     use crate::serve::multi_model::LoadedEngine;
     use crate::serve::quant_select::QuantType;
     use axum::body::to_bytes;
-    use axum::http::{StatusCode, header};
+    use axum::http::{header, StatusCode};
     use std::sync::Arc;
     use std::time::SystemTime;
 
@@ -11738,8 +11904,8 @@ mod a5d_handler_429_tests {
     /// response is NOT an SSE body, i.e. the handler short-circuited
     /// BEFORE constructing the SSE response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded()
-     {
+    async fn a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded(
+    ) {
         // Per-slot budget = 1 MiB; per-token cost = 1 KiB. Request asks
         // for (prompt_len=1000 + max_tokens=1000) × 1024 = 2 MiB > 1 MiB.
         let per_slot_kv_budget_bytes: u64 = 1024 * 1024;
@@ -11892,8 +12058,8 @@ mod a5d_handler_429_tests {
     /// "POST through the handler path" — this test covers the
     /// non-streaming half.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a5d_chat_completions_non_streaming_handler_returns_429_when_worker_signals_slot_budget_exceeded()
-     {
+    async fn a5d_chat_completions_non_streaming_handler_returns_429_when_worker_signals_slot_budget_exceeded(
+    ) {
         // Worker will respond to Request::Generate with
         // "slot_budget_exceeded: ... needed_bytes=2048000, budget_bytes=1048576".
         let needed_bytes: u64 = 2_048_000;
