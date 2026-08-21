@@ -132,8 +132,9 @@ load and synchronous warmup succeeds. The non-evicting load path must never
 invoke the loader when the plan requires eviction and must never publish an
 unplanned victim.
 
-hf2q exposes a versioned capability/runtime view and an authenticated model
-activation action. A normal activation returns immediately for a resident
+hf2q exposes `GET /hf2q/v1/runtime` as a versioned capability/runtime view and
+`POST /hf2q/v1/models/activate` as an authenticated model-activation action. A
+normal activation returns immediately for a resident
 model, attempts a non-evicting load when it fits, and otherwise returns a
 conflict containing the exact candidate, pool revision, and victims. The
 terminal may then offer an explicit `Switch to X` action. It never performs
@@ -158,6 +159,14 @@ request and worker lifecycles:
 
 This preserves the existing serve process and endpoint. It does not kill a
 manually started process.
+
+The runtime capability also advertises the exact
+`x-hf2q-diagnostic-no-evict: 1` request header. After activation, diagnostic
+chat sends that header on OpenAI chat requests. If another client changes
+residency between activation and generation, request-time resolution returns
+409 instead of reopening ADR-005's ordinary auto-eviction path. The JSON body
+therefore retains the zero-hidden-parameter contract above. Clients without
+the header retain ADR-005 behavior.
 
 ### Diagnostic telemetry
 
