@@ -1,7 +1,8 @@
 # ADR-045: Frictionless distribution, updates, and guided onboarding
 
 - Status: Proposed; product scope corrected on 2026-08-20, release gate
-  simplified and the first standalone channel shipped on 2026-08-21
+  simplified, and the first public cross-version standalone journey shipped
+  on 2026-08-21
 - Date: 2026-08-17
 - Updated: 2026-08-21
 - Owners: hf2q release engineering and operator experience
@@ -762,6 +763,38 @@ with configuration and model bytes preserved. The measured order matters:
 setup establishes the private state root before doctor or another command uses
 it.
 
+The v0.1.8 release then completed against exact source
+`5bca834264479257a086bfc3d82ac98e17f2df8c`: exact-main CI run
+`32509856510` and release run `32511435203` passed. The published signed and
+notarized Apple-Silicon binary is 37,688,896 bytes with SHA-256
+`c66f3203839a9a6c4d78ffff985c0f2547b1c58fb7bb5f6be53f77b8bf94ff0a`.
+The installer SHA-256 is
+`bdf6d545f6d2bad8625cde4ca65bb5d008270c925978bebbdde1561ec3561e0c`,
+and the stable-record SHA-256 is
+`6e0bdce77127965f9f5ccb6d3f960e57a1062e5a75bf6604b248c8f836f2563a`.
+The workflow verified the packed crate, ephemeral Developer ID signing and
+notarization, crates.io bytes, public GitHub assets, and a clean-prefix
+installation. This release includes the client-independent `hf2q chat`
+operator surface used by the canonical guide.
+
+Website PR `robertelee78/hf2q.us#5` passed exact-head verification and merged
+as `b1d7a1b3fad17981e27f4b64dfb5e137cc46e651`; main verification run
+`32514514110` passed. The deployed `/install.sh` now returns a no-store
+temporary redirect to the exact immutable v0.1.8 installer, while the stable
+record remains a direct same-origin `200` with mandatory revalidation. Live
+transport verification matched both public surfaces to the release bytes.
+
+The first public cross-version lifecycle then passed from an isolated physical
+path on the Apple M5 Max:
+
+`v0.1.7 install -> setup -> doctor -> update check -> v0.1.8 -> hf2q chat
+help -> rollback to v0.1.7 -> update to v0.1.8 -> uninstall`.
+
+The fail-closed run exited successfully, left the install directory empty, and
+preserved the generated `config.toml` and a separate model sentinel. This
+closes the prior lack of published cross-version standalone evidence without
+adding another installation or update mechanism.
+
 The source installer for the next release is intentionally readable and adds
 only measured boundary hardening: one parse-before-execute compound command,
 closed candidate stdin, physical Apple-Silicon detection under Rosetta,
@@ -797,11 +830,8 @@ sole distribution implementation. That removal landed on main in merge commit
 What is not yet the corrected product:
 
 - verified Homebrew and npm-family channels;
-- a published cross-version standalone update and rollback (v0.1.7 is the
-  first public standalone version, so only the already-current path can be
-  proven against public bytes today);
-- package-manager update/uninstall adapters and mismatch recovery for later
-  channels; and
+- explicit `hf2q update`/uninstall delegation for Cargo, source, and any later
+  package-manager channels, plus their mismatch recovery;
 - the complete guide/update/uninstall journey from a distinct clean macOS
   account, including the protected real-model acceptance path.
 
