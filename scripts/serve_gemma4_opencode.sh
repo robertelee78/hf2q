@@ -97,6 +97,9 @@
 #   PORT=8086 scripts/serve_gemma4_opencode.sh  # override port
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/hf2q_process_guard.sh"
+
 MODEL="${MODEL:-/opt/hf2q/models/gemma4/gemma4-ara-2pass-APEX-Q5_K_M.gguf}"
 MMPROJ="${MMPROJ:-/opt/hf2q/models/gemma4/mmproj-gemma4-f16.gguf}"
 HOST="${HOST:-127.0.0.1}"
@@ -139,7 +142,8 @@ fi
 # One-model-at-a-time guard (feedback_oom_prevention): a 26B-class model
 # holds ~25-35 GB of unified memory; concurrent inference processes on
 # one box OOM it (measured 2026-08-03).
-if RUNTIME_PIDS="$(pgrep -x hf2q 2>/dev/null)"; then
+RUNTIME_PIDS="$(hf2q_active_serve_pids)"
+if [[ -n "$RUNTIME_PIDS" ]]; then
     echo "another hf2q server is already running — refusing before model load" >&2
     echo "pid(s): ${RUNTIME_PIDS//$'\n'/, }" >&2
     echo "stop that server before starting Gemma" >&2

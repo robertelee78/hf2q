@@ -80,6 +80,9 @@
 #   PORT=8082 scripts/serve_qwen36_opencode.sh  # override port
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/hf2q_process_guard.sh"
+
 MODEL="${MODEL:-/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf}"
 MMPROJ="${MMPROJ:-/opt/hf2q/models/qwen3.6/mmproj-qwen36-F16.gguf}"
 VISION_MODE="${VISION_MODE:-auto}"
@@ -138,7 +141,8 @@ fi
 # One-model-at-a-time guard (feedback_oom_prevention): a 35B-class model
 # holds ~30 GB of unified memory; a second concurrent inference process
 # on the same box risks OOM.
-if RUNTIME_PIDS="$(pgrep -x hf2q 2>/dev/null)"; then
+RUNTIME_PIDS="$(hf2q_active_serve_pids)"
+if [[ -n "$RUNTIME_PIDS" ]]; then
     echo "another hf2q server is already running — refusing before model load" >&2
     echo "pid(s): ${RUNTIME_PIDS//$'\n'/, }" >&2
     echo "stop that server before starting Qwen" >&2
