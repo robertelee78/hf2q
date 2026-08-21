@@ -896,7 +896,7 @@ Files touched (absolute paths):
 - `/opt/hf2q/src/inference/models/qwen35/gpu_full_attn.rs` — bridge + parity test
 - `/opt/hf2q/src/inference/models/qwen35/forward_gpu.rs` — kernel-family registration
 - `/opt/hf2q/scripts/bench-w5b10-flash-attn-prefill.sh` — bench script
-- `/opt/hf2q/docs/ADR-005-inference-server.md` — W-5b.10 closure paragraph above the W-5b.9 paragraph
+- `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md` — W-5b.10 closure paragraph above the W-5b.9 paragraph
 - `/opt/hf2q/docs/wave5b3-walkbar-results.md` — this section
 
 mlx-native: untouched. The bridge uses only public APIs already shipping in mlx-native (`dispatch_flash_attn_prefill_bf16_d256`, `permute_021_bf16`, `permute_021_bf16_to_f32`, `cast(F32→BF16)`).
@@ -1067,7 +1067,7 @@ The W-5b.11 per-DN-layer audit (the iter's primary goal) is independent of this;
 
 Files touched (absolute paths):
 - `/opt/hf2q/scripts/bench-w5b11-post-attn.sh` — committed in recovery
-- `/opt/hf2q/docs/ADR-005-inference-server.md` — W-5b.11 closure paragraph above the W-5b.10 paragraph
+- `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md` — W-5b.11 closure paragraph above the W-5b.10 paragraph
 - `/opt/hf2q/docs/wave5b3-walkbar-results.md` — this section
 
 mlx-native: untouched (verified `5d9bb2e3` start = `5d9bb2e3` finish).
@@ -1266,7 +1266,7 @@ Per worker prompt: "if the audit reveals moe_q already uses simdgroup_matrix MMA
 - `/opt/mlx-native/benches/bench_moe_q_qwen36_shape.rs` (new bench, additive only)
 - `/opt/mlx-native/Cargo.toml` (`[[bench]]` registration, 3 lines)
 - `/opt/mlx-native/docs/moe-q-perf-audit-2026-04-27.md` (full hand-off doc)
-- `/opt/hf2q/docs/ADR-005-inference-server.md` (W-5b.13 paragraph above W-5b.12)
+- `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md` (W-5b.13 paragraph above W-5b.12)
 - `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section)
 
 NO `/opt/mlx-native/src/` modifications.
@@ -1371,7 +1371,7 @@ Until then, retain the env gate for forensic A/B comparability.
 - `src/inference/models/qwen35/forward_gpu.rs` (T3 chunk-prefill + greedy-decode call-site fusion)
 - `scripts/bench-w5b14-dense-q-fused.sh` (new bench harness)
 - `docs/wave5b3-walkbar-results.md` (this section)
-- `docs/ADR-005-inference-server.md` (W-5b.14 closure paragraph above W-5b.13)
+- `docs/adr/diary/ADR-005-inference-server.md` (W-5b.14 closure paragraph above W-5b.13)
 
 NO `/opt/mlx-native/` modifications.
 
@@ -1823,7 +1823,7 @@ Honourable mention: `chunk.gqa_expand` 496.9 ms (10.4 ms/layer × 48) is also pu
 
 ### ADR-005 closure
 
-Per worker prompt directive, ADR-005 closure paragraph added immediately above the W-5b.16 paragraph in `/opt/hf2q/docs/ADR-005-inference-server.md`.
+Per worker prompt directive, ADR-005 closure paragraph added immediately above the W-5b.16 paragraph in `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md`.
 
 ### Build + test status
 
@@ -2043,7 +2043,7 @@ Expected outcome: `chunk.gqa_expand` drops to ~5-10 ms total (only the encode-ti
 
 ### ADR-005 closure
 
-ADR-005 closure paragraph added immediately above the W-5b.18 paragraph in `/opt/hf2q/docs/ADR-005-inference-server.md` documenting Phase A LANDED + Phase B REVERTED + W-5b.20 mega-encoder follow-up.
+ADR-005 closure paragraph added immediately above the W-5b.18 paragraph in `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md` documenting Phase A LANDED + Phase B REVERTED + W-5b.20 mega-encoder follow-up.
 
 ### Files touched
 
@@ -2194,7 +2194,7 @@ The mega-encoder already contains: F32→BF16 cast (3 dispatches), scalar_mul_f3
 
 ### ADR-005 closure
 
-ADR-005 closure paragraph added immediately above the W-5b.19 paragraph in `/opt/hf2q/docs/ADR-005-inference-server.md` documenting W-5b.20 LANDED + the W-5b.19 Phase B technical rationale + the cherry-pick of `369fef9` → `826edff` on mlx-native main.
+ADR-005 closure paragraph added immediately above the W-5b.19 paragraph in `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md` documenting W-5b.20 LANDED + the W-5b.19 Phase B technical rationale + the cherry-pick of `369fef9` → `826edff` on mlx-native main.
 
 ### Files touched
 
@@ -2454,7 +2454,7 @@ bash scripts/bench-w5b21-reaudit.sh
 3. `src/debug/investigation_env.rs`: −20 LOC (gate field + parser + activate-diagnostic deleted).
 4. `src/inference/models/qwen35/gpu_delta_net.rs`: −250 LOC net (LEGACY CPU triple-loop fill block, parity test, all 5 call-site param edits).
 5. `docs/wave5b3-walkbar-results.md`: this section (~250 LOC).
-6. `docs/ADR-005-inference-server.md`: ADR-005 closure paragraph above the W-5b.20 paragraph.
+6. `docs/adr/diary/ADR-005-inference-server.md`: ADR-005 closure paragraph above the W-5b.20 paragraph.
 
 **mlx-native (`826edff` start AND end — unchanged this iter):**
 
@@ -2672,7 +2672,7 @@ bash scripts/bench-w5b22-residual-audit.sh
 2. `src/inference/models/qwen35/forward_gpu.rs`: +44 LOC (4 RAII guard sites at the OUTER per-DN-layer choreography — `_w5b22_dn_outer_total`, `_w5b22_dn_post_attn_norm`, `_w5b22_dn_ffn_dispatch`, `_w5b22_dn_ffn_post_res` — gated by `match layer_gpu { LinearAttn => Some(...), FullAttn => None }`; explicit drops mirror the existing `_w5b11_*` guards' boundaries).
 3. `scripts/bench-w5b22-residual-audit.sh`: new file, ~75 LOC, 3 cold llama + 3 cold hf2q at PP4106 with W-5b.8 + W-5b.17 + W-5b.22 instrumentation enabled.
 4. `docs/wave5b3-walkbar-results.md`: this section (~250 LOC).
-5. `docs/ADR-005-inference-server.md`: ADR-005 closure paragraph above the W-5b.21 paragraph.
+5. `docs/adr/diary/ADR-005-inference-server.md`: ADR-005 closure paragraph above the W-5b.21 paragraph.
 
 **mlx-native (`826edff` start AND end — unchanged this iter):**
 
@@ -2889,7 +2889,7 @@ done
 - `/opt/mlx-native/benches/bench_mul_mm_id_qwen36_ffn.rs` (NEW, ~250 lines, additive)
 - `/opt/mlx-native/Cargo.toml` (+4 lines: 1 `[[bench]]` entry)
 - `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section)
-- `/opt/hf2q/docs/ADR-005-inference-server.md` (closure paragraph update)
+- `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md` (closure paragraph update)
 
 ### mlx-native HEAD start vs end
 
@@ -2920,7 +2920,7 @@ W-5b.23's #1 recommendation lands. `gpu_ffn.rs:1492-1560`'s 3 `quantized_matmul_
 | `src/inference/models/qwen35/gpu_ffn.rs` (tests) | New `#[test] ffn_pooled_path_matches_legacy_at_seq128` — 4-run alternating LEGACY ↔ NEW with bit-equality determinism guard + cross-path `< 1e-5` inf-norm equality. seq_len=16 to exercise the mm_id (not mv_id) branch since `MM_ID_ROUTING_THRESHOLD = 8`. |
 | `scripts/bench-w5b24-ffn-pooled.sh` | NEW: 3 cold × NEW + 3 cold × LEGACY + 3 cold llama at PP4106 with `HF2Q_PROFILE_W5B8/W5B17/W5B22=1`. |
 | `docs/wave5b3-walkbar-results.md` | This section. |
-| `docs/ADR-005-inference-server.md` | W-5b.24 closure paragraph above the W-5b.23 paragraph. |
+| `docs/adr/diary/ADR-005-inference-server.md` | W-5b.24 closure paragraph above the W-5b.23 paragraph. |
 
 ### Bench protocol
 
@@ -3012,7 +3012,7 @@ cargo build --release --bin hf2q
 - `/opt/hf2q/src/inference/models/qwen35/gpu_ffn.rs` (call sites + new parity test)
 - `/opt/hf2q/scripts/bench-w5b24-ffn-pooled.sh`
 - `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section)
-- `/opt/hf2q/docs/ADR-005-inference-server.md` (closure paragraph)
+- `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md` (closure paragraph)
 
 ### mlx-native HEAD start vs end
 
@@ -3160,7 +3160,7 @@ done > /tmp/walkbar-pp65536-prompt.txt
 - `/opt/hf2q/src/inference/models/qwen35/gpu_ffn.rs` — Phase C block, Phase E block, import set, parity test deletion (+ attribution comment block).
 - `/opt/hf2q/scripts/sunset-w5b24-ffn-pooled-legacy.sh` (NEW, ~130 LOC).
 - `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section).
-- `/opt/hf2q/docs/ADR-005-inference-server.md` (closure paragraph).
+- `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md` (closure paragraph).
 
 ### mlx-native HEAD start vs end
 
@@ -3298,7 +3298,7 @@ N/A — gate did not land. The `bench-w5b26-ffn-output-lift.sh` script is preser
 ### Files touched (revert-net delta)
 
 - `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section).
-- `/opt/hf2q/docs/ADR-005-inference-server.md` (closure paragraph).
+- `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md` (closure paragraph).
 - `/opt/hf2q/scripts/bench-w5b26-ffn-output-lift.sh` (NEW, 86 LOC; preserved as reusable A/B harness).
 
 The 3 reverts produce zero net code delta across `decode_pool.rs` / `gpu_ffn.rs` / `wave5b8_profile.rs` vs the post-W-5b.25 baseline.
@@ -3504,7 +3504,7 @@ Per `feedback_loop_mistakes_catalog`: project pre-coding from a per-op-cost MEAS
 ### Files touched (revert-net delta)
 
 - `/opt/hf2q/docs/wave5b3-walkbar-results.md` (this section).
-- `/opt/hf2q/docs/ADR-005-inference-server.md` (closure paragraph).
+- `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md` (closure paragraph).
 - `/opt/hf2q/scripts/bench-w5b27-phase-b-lift.sh` (NEW, 84 LOC; preserved as reusable A/B harness for any future dense-Q FFN lift A/B).
 
 The 3 reverts produce zero net code delta across `decode_pool.rs` / `gpu_ffn.rs` vs the post-Phase-A baseline (HEAD `ad86d45` = HEAD `c73b48a`). The Phase A docs commit (`ad86d45`) lands; the Phase B implementation is reverted.

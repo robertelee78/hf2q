@@ -142,7 +142,7 @@ src/inference/spec_decode/dflash/
 Total: 2,855 LOC across 8 source files
 Tests: 32 unit, 15 GPU integration — ALL GREEN on M5 Max
 docs:
-- docs/ADR-030-dflash-block-diffusion-spec-decode.md (the ADR)
+- docs/adr/diary/ADR-030-dflash-block-diffusion-spec-decode.md (the ADR)
 - docs/research/ADR-030-phase1-m5max-results.{json,md}
 - docs/research/ADR-030-phase1-blocksize-sweep.json
 - docs/research/ADR-030-phase4-integration-plan.md

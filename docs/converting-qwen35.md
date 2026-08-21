@@ -4,8 +4,8 @@
 
 Canonical reference for converting the Qwen3.5 / Qwen3.6 model family.
 Two variants are covered: the **27B dense** (`qwen35`) and the **35B-A3B
-MoE** (`qwen35moe`). See `docs/ADR-012-qwen35moe-conversion.md` for the
-full architectural rationale and `docs/ADR-014-streaming-convert-pipeline.md`
+MoE** (`qwen35moe`). See `docs/adr/diary/ADR-012-qwen35moe-conversion.md` for the
+full architectural rationale and `docs/adr/diary/ADR-014-streaming-convert-pipeline.md`
 for the streaming-pipeline + peer-parity gate context.
 
 ---
@@ -411,9 +411,9 @@ and the smoke-harness gate — lives at `docs/shipping-contract.md`
 
 ## References
 
-- `docs/ADR-012-qwen35moe-conversion.md` — full decision record for the
+- `docs/adr/diary/ADR-012-qwen35moe-conversion.md` — full decision record for the
   Qwen3.5 / Qwen3.6 convert pipeline.
-- `docs/ADR-014-streaming-convert-pipeline.md` — streaming pipeline +
+- `docs/adr/diary/ADR-014-streaming-convert-pipeline.md` — streaming pipeline +
   peer-parity gate matrix (8 cells, 4 dense + 4 MoE).
 - `docs/converting-a-model.md` — generic convert-command reference (full
   17-variant menu, format options, env vars, error catalog).

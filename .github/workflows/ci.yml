@@ -625,8 +625,8 @@ jobs:
             src/convert/receipt.rs \
             README.md \
             CHANGELOG.md \
-            docs/ADR-045-frictionless-distribution-updates-and-onboarding.md \
-            docs/ADR-033-unified-quant-convert-pipeline.md \
+            docs/adr/ADR-045-frictionless-distribution-updates-and-onboarding.md \
+            docs/adr/ADR-033-unified-quant-convert-pipeline.md \
             docs/ARCHITECTURE.md \
             docs/setup.md \
             docs/converting-a-model.md \

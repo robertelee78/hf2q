@@ -28,8 +28,8 @@ The hf2q vs peer-FA decode gap (~6-8% at tg100, ~7.5% at tg2000) lives in **per-
 
 ### Sources checked
 
-- **ADR-029** (`/opt/hf2q/docs/ADR-029-gemma4-moe-pipeline-is-the-gap.md`) — 3,619 lines covering iter-100..175 with thermal-fair benches, multi-regime gates, 31-lever ledger, dispatch-count comparisons
-- **ADR-031** (`/opt/hf2q/docs/ADR-031-parallel-encode-decode-forward.md`) — Phase A/B/C lifecycle including iter-220 thread-safety research, iter-2 bench, C0 + C0-deep diagnostic findings
+- **ADR-029** (`/opt/hf2q/docs/adr/diary/ADR-029-gemma4-moe-pipeline-is-the-gap.md`) — 3,619 lines covering iter-100..175 with thermal-fair benches, multi-regime gates, 31-lever ledger, dispatch-count comparisons
+- **ADR-031** (`/opt/hf2q/docs/adr/diary/ADR-031-parallel-encode-decode-forward.md`) — Phase A/B/C lifecycle including iter-220 thread-safety research, iter-2 bench, C0 + C0-deep diagnostic findings
 - **Auto-memory** (`~/.claude/projects/-opt-hf2q/memory/`) — 20+ ADR-029 iter-* topic files + ADR-031 Phase A/B/closed entries
 - **Codebase** (`/opt/hf2q/src/serve/forward_mlx.rs`, `/opt/mlx-native/src/encoder.rs`, `/opt/mlx-native/src/shaders/*.metal`, `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal`)
 - **Bench data** (`/tmp/parallel-profile-c0.log`, `/tmp/parallel-split-timing.log`, ADR-031 iter-2 bench artifact)
@@ -88,8 +88,8 @@ The hf2q vs peer-FA decode gap (~6-8% at tg100, ~7.5% at tg2000) lives in **per-
 ## Sources
 
 ### ADRs
-- `docs/ADR-029-gemma4-moe-pipeline-is-the-gap.md` (3,619 lines; iter-100..175)
-- `docs/ADR-031-parallel-encode-decode-forward.md` (Phase A/B/C lifecycle + close-out)
+- `docs/adr/diary/ADR-029-gemma4-moe-pipeline-is-the-gap.md` (3,619 lines; iter-100..175)
+- `docs/adr/diary/ADR-031-parallel-encode-decode-forward.md` (Phase A/B/C lifecycle + close-out)
 
 ### Research artifacts
 - `docs/research/ADR-031-phase-B-thread-safety-analysis.md` — Path D design grounding (Send/Sync analysis)

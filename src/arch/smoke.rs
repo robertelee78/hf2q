@@ -381,7 +381,7 @@ pub fn dispatch(args: &SmokeArgs, env: &dyn SmokeEnv) -> SmokeOutcome {
         return SmokeOutcome::Skipped {
             reason: format!(
                 "DWQ quality gate (ADR-012 P9) not yet wired — {} returns Skipped until \
-                 RealActivationCapture lands. See docs/ADR-012-qwen35moe-conversion.md Decision 17.",
+                 RealActivationCapture lands. See docs/adr/diary/ADR-012-qwen35moe-conversion.md Decision 17.",
                 args.quant
             ),
         };

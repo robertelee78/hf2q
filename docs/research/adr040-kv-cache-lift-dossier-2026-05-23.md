@@ -3,7 +3,7 @@
 - **Date**: 2026-05-23
 - **Author**: research agent (grounding pass for iter-2 implementation)
 - **Inputs**:
-  - `/opt/hf2q/docs/ADR-040-continuous-batching-reopen.md`
+  - `/opt/hf2q/docs/adr/ADR-040-continuous-batching-reopen.md`
   - `/opt/hf2q/src/serve/multi_seq_kv.rs` (Phase A iter-1 trait, 746 LOC)
   - `/opt/hf2q/src/inference/models/qwen35/kv_cache.rs` (5918 LOC)
   - `/opt/hf2q/src/inference/models/gemma4/kv_cache.rs` (466 LOC)

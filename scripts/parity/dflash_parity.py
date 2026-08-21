@@ -71,7 +71,7 @@ def main() -> int:
     print()
     print("Reference: /opt/dflash/dflash/model_mlx.py (582 LOC, pinned @ 94e4abc5)")
     print("Target Rust path: src/inference/spec_decode/dflash/forward.rs (2158 LOC)")
-    print("ADR: docs/ADR-034-speculative-decode-end-to-end.md §P4")
+    print("ADR: docs/adr/ADR-034-speculative-decode-end-to-end.md §P4")
     return 2
 
 

@@ -266,7 +266,7 @@ HF2Q_PARALLEL_ENCODE=1 gate.
 ## References
 
 - `/opt/hf2q/docs/research/ADR-030-iter-220-parallel-encode-research.md` (predecessor research; superseded on Q1 by this artifact)
-- `/opt/hf2q/docs/ADR-031-parallel-encode-decode-forward.md` (parent ADR, Phase A landed at `c7f98865`)
+- `/opt/hf2q/docs/adr/diary/ADR-031-parallel-encode-decode-forward.md` (parent ADR, Phase A landed at `c7f98865`)
 - `/opt/mlx-native/src/encoder_worker.rs` (`submit<F: FnOnce + Send + 'static>(f)` API)
 - `/opt/mlx-native/src/graph.rs:1029` (GraphSession definition)
 - `/opt/mlx-native/src/kernel_registry.rs:36` (KernelRegistry definition)

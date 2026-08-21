@@ -47,7 +47,7 @@ empty from that view; use `ak status` and the live memory MCP.
 Established memory namespaces include `decisions`, `evidence`, `hf2q`, and
 `hf2q-patterns`. For DeepSeek-V4, the decision key
 `deepseek-v4-flash-architecture-contract` points to
-`docs/ADR-042-deepseek-v4-flash-rust-native.md`; the agentic acceptance contract
+`docs/adr/ADR-042-deepseek-v4-flash-rust-native.md`; the agentic acceptance contract
 is stored as `hf2q/deepseek4-agentic-serving-contract-2026-08-05`.
 
 Use Ruflo routing or swarms only when work has genuinely independent lanes and

@@ -7,7 +7,7 @@
 
 ## Inputs read
 
-1. `/opt/hf2q/docs/ADR-040-continuous-batching-reopen.md` §3.2, §3.3, §3.6, §6 (C1/C2/C3/C4 rows), §6.1.1–§6.1.6
+1. `/opt/hf2q/docs/adr/ADR-040-continuous-batching-reopen.md` §3.2, §3.3, §3.6, §6 (C1/C2/C3/C4 rows), §6.1.1–§6.1.6
 2. `/opt/hf2q/docs/research/adr040-kv-cache-lift-dossier-2026-05-23.md` (A2/A3 dossier — shape + style reference)
 3. `/opt/hf2q/src/serve/api/engine.rs` (12,791 LOC; key spans: 1–32 docstring; 460–541 Engine + LoadedArch + EngineMode; 555–576 EngineSpawnError; 847–939 EngineInner; 1224–1282 GemmaLoadedModel; 2410–2683 spawn + spawn_with_mode + mode accessor; 2832–3245 the 11 `tx.try_send` handler sites; 3263 shutdown; 3346–3700 worker_run + generate_once)
 4. `/opt/hf2q/src/serve/scheduler.rs` (2,045 LOC; iter-2.5 surface — pages 1–1255 audited; concrete types: `Scheduler` trait, `FifoSchedulerAdapter`, `InflightBatchedScheduler`, `SlotHandle`, `RequestId`, `SchedulerStep`, `SchedulerPolicy`, `AdmitRequest`, `RequestSlot`, `AdmitError`, `StepError`, `SchedulerStats`)

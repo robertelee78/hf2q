@@ -53,7 +53,7 @@
 //!
 //! Per the iter spec the only `.rs` files this iter may modify are
 //! `tests/p0_apex_moe_lazy_iter.rs` (this file, NEW) and
-//! `docs/ADR-014-streaming-convert-pipeline.md` (P0 row update only).
+//! `docs/adr/diary/ADR-014-streaming-convert-pipeline.md` (P0 row update only).
 //! The lazy reader's modules live under `src/`; we reach them via the
 //! established `#[path]`-include pattern (precedent:
 //! `tests/imatrix_xvalidation.rs:48-52`). hf2q is a binary crate with no

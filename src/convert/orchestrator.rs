@@ -456,7 +456,7 @@ impl ConvertOrchestrator {
         // 30 for a Gemma 4 26B MoE with 30 layers), causing `use_more_bits`
         // to land on the wrong layer indices — measured 1.188× perplexity
         // regression vs canonical on Gemma 4 26B Q5_K_M (see
-        // `docs/adr-033-real-model-findings/2026-05-19-quality-equivalence-gemma4-26b.md`
+        // `docs/adr/033-real-model-findings/2026-05-19-quality-equivalence-gemma4-26b.md`
         // §8 for the diagnosis trace).
         //
         // The counters do NOT count vision/audio tensors — those skip
@@ -2390,7 +2390,7 @@ mod tests {
 
         // Canonical use_more_bits(i, 30) TRUE-set for the Q5_K_M Q6_K
         // promotion on ffn_down. See
-        // `docs/adr-033-real-model-findings/2026-05-19-quality-equivalence-gemma4-26b.md`
+        // `docs/adr/033-real-model-findings/2026-05-19-quality-equivalence-gemma4-26b.md`
         // §8.2 for the bartowski/canonical agreement on this set.
         let canonical_promoted: std::collections::HashSet<usize> =
             [0, 1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29]

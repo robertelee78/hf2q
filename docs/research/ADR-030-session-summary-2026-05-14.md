@@ -138,7 +138,7 @@ src/serve/forward_mlx.rs:
 src/serve/forward_prefill_batched.rs:
 + layer-loop hook (line 2197+)
 
-docs/ADR-030-dflash-block-diffusion-spec-decode.md (the ADR, 600+ LOC)
+docs/adr/diary/ADR-030-dflash-block-diffusion-spec-decode.md (the ADR, 600+ LOC)
 docs/research/
 ├── ADR-030-phase1-m5max-results.{json, md}
 ├── ADR-030-phase1-blocksize-sweep.json

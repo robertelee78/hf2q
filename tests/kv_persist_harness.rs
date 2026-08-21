@@ -3,7 +3,7 @@
 //! ## What this file is
 //!
 //! The substrate for the M5 Max ship-or-kill matrix described in
-//! `docs/ADR-017-persistent-block-prefix-cache.md` §Phase A0. Phase A0.1
+//! `docs/adr/diary/ADR-017-persistent-block-prefix-cache.md` §Phase A0. Phase A0.1
 //! lands the *substrate* (this file + the synthetic spiller fixture).
 //! Phase A0.2 / A0.3 run the matrix and decide ship-or-kill. Per the
 //! mantra, the harness lands BEFORE any production `src/serve/kv_persist/`

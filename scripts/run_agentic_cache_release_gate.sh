@@ -997,7 +997,7 @@ run_deepseek_release_gates() {
   SERVER_LOG="$current_log" SERVER_PID="$server_pid" \
   OUT_DIR="$OUT_ROOT/deepseek/cached-suffix" EXPECTED_PATH="$PWD/README.md" \
   OVERLAP_TOOL_RESULT_PATH="$PWD/README.md" \
-  CANCEL_TOOL_RESULT_PATH="$PWD/docs/ADR-042-deepseek-v4-flash-rust-native.md" \
+  CANCEL_TOOL_RESULT_PATH="$PWD/docs/adr/ADR-042-deepseek-v4-flash-rust-native.md" \
   CURL_MAX_TIME_SECONDS=180 PREFILL_CHUNKS_BEFORE_CANCEL=3 \
   CANCEL_SETTLE_SECONDS=15 CANCEL_STABILITY_SECONDS=10 \
     scripts/test_deepseek4_cached_suffix.sh \

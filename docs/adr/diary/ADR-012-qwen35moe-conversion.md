@@ -1,0 +1,1743 @@
+# ADR-012: Qwen3.5 / Qwen3.5-MoE (qwen35 + qwen35moe) Conversion Support — Pure-Rust HF → DWQ GGUF
+
+**Status:** ✅ **COMPLETE** — closed 2026-04-26.  Engineering pipeline P0–P11 shipped 2026-04-24.  Post-shipment regression bug ladder (Bugs 1, 2, 4, 5, 6, 7) all FIXED across `85e488f`, `fc85681`, `f02a293`, `469f837`, `d4ba8ee`, `db9aa0d`.  Bug 3 closed 2026-04-26 — all four DWQ GGUFs (qwen35/qwen35moe × dwq46/dwq48) re-emitted through the post-fix pipeline, each loads in llama.cpp without rejection and generates coherent text at the canonical pangram prompt.
+
+P0–P11 all shipped on main (post-merge `da030a5`).  1185 unit + ~117 integration tests green.
+
+**Real-model audit 2026-04-25 (post-cron-iteration end-gate sweep) discovered every previously-"shipped" DWQ GGUF in `models/qwen3.6-{27b,35b-a3b-abliterix-ega-abliterated}-dwq{46,48}/` fails to load in `llama-cli`:**
+
+```
+gguf_init_from_file_ptr: tensor 'blk.0.ssm_conv1d.weight' of type 2 (q4_0) has 4 elements per row,
+                         not a multiple of block size (32)
+```
+
+This is exactly the failure mode the **post-shipment** P9b commit `436b923` ("`is_weight()` preserves small-row tensors") was designed to prevent.  The four "ship" commits (`337f66f`, `0937f66`, `e2a6938`, `36a70d9`) ran the convert pipeline **before** the `is_weight()` guard landed, so every ssm_conv1d tensor was Q4_0-quantized into the GGUF and llama.cpp's loader (correctly) rejects them at file-open.  The 27B-dwq46 GGUF appears to have been deleted entirely.
+
+**Independent additional bug surfaced by the same sweep:** the smoke convert path (`hf2q smoke --arch qwen35 --quant q4_0 --local-dir <hf-cache-snapshot>`) hits a vocab-padding mismatch — `tensor 'token_embd.weight' has wrong shape; expected 5120, 248044, got 5120, 248320` — meaning the convert side emits the padded `vocab_size=248320` from `config.json` but the loader expects the de-padded 248044 unique tokens.  The worktree's `b35aa9f` ("qwen35 load_from_gguf accepts physically-padded vocab") fixed this **inference-side only**; the emit side still bakes the padding into the file.
+
+**This ADR closes only when:**
+1. The four real-model DWQ GGUFs (qwen35/qwen35moe × dwq46/dwq48) are re-emitted through the **post-fix** convert pipeline.
+2. Each loads in `llama-cli --model <path>` without error, emits 8 deterministic tokens at `--seed 42 --temp 0`, and produces the committed transcript under `tests/fixtures/smoke-transcripts/`.
+3. The vocab-padding emit-side fix lands so the convert pipeline can emit a llama.cpp-loadable file from the canonical Qwen/Qwen3.6-27B safetensors snapshot in `~/.cache/huggingface/hub/`.
+
+### 2026-04-25 cron-iter end-gate sweep — bug ladder
+
+The `hf2q smoke --arch qwen35 --quant q4_0 --local-dir <hf-cache-snapshot>` end-gate run surfaces a ladder of three concrete bugs.  Each fix unblocks the next layer:
+
+**Bug 1 — vocab-pad emit (CONVERT side):** ✅ **FIXED** in commit `85e488f` (Phase 1.8 in `cmd_convert`).  HF safetensors padded `model.embed_tokens.weight` to 248320 rows; llama.cpp's loader expects the de-padded count (248044, max base-vocab id + 1) to match the emitted `tokenizer.ggml.tokens` array length.  New `input::detect_padded_vocab` + `input::truncate_padded_vocab` truncate both `model.embed_tokens.weight` and `lm_head.weight` to the de-padded count and update `metadata.vocab_size`.  Seven new unit tests pin the math.
+
+**Bug 2 — MTP tensor naming (CONVERT side, EMITTING UNRECOGNIZED NAMES):** ✅ **FIXED** in commit `fc85681` (Phase 1.42 in `cmd_convert` + `qwen35_nextn_wrapper_layer_map` + `block_count = num_hidden_layers` revert).  Three sub-fixes shipped together:
+
+1. **MTP-rename helper landed** at `models::qwen35::rename_mtp_tensors_to_layer_form` (~120 LOC) + pure `map_mtp_tensor_name` helper.  Mirrors `convert_hf_to_gguf.py:10529-10540`.  Kept available for the future llama.cpp version that supports qwen35 MTP loading.
+2. **Nextn wrapper layer-map entries added** in `gguf.rs::qwen35_nextn_wrapper_layer_map` (citations to `llama-arch.cpp:447-452`).  Wired into qwen35 + qwen35moe arms of `layer_map_for_arch`.
+3. **MTP DROP path** in `cmd_convert` Phase 1.42: llama.cpp's qwen35/qwen35moe loaders do not read `LLM_KV_NEXTN_PREDICT_LAYERS` (only GLM4 + DeepseekV3 do, see `llama-model.cpp:2073`/`2107`/`2154`/`2329`), so they have no per-layer slot allocated for an MTP block.  Phase 1.42 drops every `mtp.*` tensor from `tensor_map` before backend emission.  Helpers from items 1+2 stay live for the future enable; the drop is the reversible policy.  `block_count` reverts to `meta.num_layers` (no MTP).
+
+**End-gate result on Qwen/Qwen3.6-27B Q4_0 (post-`fc85681`):**
+
+```
+hf2q smoke --arch qwen35 --quant q4_0 --local-dir <hf-cache-snap>
+→ preflight passes
+→ convert produces 16 GB GGUF
+→ llama_model_load: SUCCESS (no rejection)
+→ ggml-metal aborts on ssm_conv1d dtype assertion (Bug 4 — FIXED, see below)
+```
+
+**Bug 4 — ssm_conv1d Metal kernel F32 requirement (CONVERT side, RUNTIME ABORT):** ✅ **FIXED** in commit `f02a293` + smoke verified in **this commit** — `src/backends/gguf.rs` extends the existing F32-promotion path (`needs_f32 = qt.quant_info.preserved && qt.shape.len() <= 1`) to also fire for any tensor whose GGUF name ends with `.ssm_conv1d.weight`.
+
+Root cause: the Metal `SSM_CONV` kernel at `ggml-metal-device.cpp:490` asserts
+
+```
+GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32)
+```
+
+and aborts the process at the first generation step if the conv1d weight is F16.  `ssm_conv1d` has shape `[n_v_heads, K=4]` — the small inner dim (`4 < 32`) means `is_weight()` returns false and the tensor is preserved at F16 (the original Phase 1 `convert_bf16_to_f16` cast), so the F16-only path runs without the new F32 promotion.
+
+Detection is by GGUF tensor name (post-rename), so the same guard fires for both qwen35 and qwen35moe without an arch-string check (no other arch emits a tensor named `*.ssm_conv1d.weight`).
+
+**Verification done 2026-04-25** — smoke run on Qwen/Qwen3.6-27B (snapshot `6a9e13bd`) Q4_0, post-`f02a293` binary:
+
+```
+cargo build --release --bin hf2q
+hf2q smoke --arch qwen35 --quant q4_0 \
+  --local-dir ~/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/ \
+  --convert-output-dir /tmp/smoke-qwen35-q4 \
+  --fixtures-root /tmp/smoke-fixtures \
+  --llama-cli-override /opt/homebrew/bin/llama-cli
+# Output: hf2q smoke: pass → /tmp/smoke-fixtures/smoke-transcripts/qwen35-q4_0.txt
+```
+
+Results:
+- Exit 0 (no `GGML_ASSERT`, no `Aborted`, no `panic`)
+- 8-token deterministic transcript generated (prompt: "The quick brown fox")
+- Byte-identical across two fresh runs (AC5 of the smoke spec satisfied)
+- Transcript committed to `tests/fixtures/smoke-transcripts/qwen35-q4_0.txt` in **this commit**
+
+**Note on ADR-013 P14 interaction:** the P14 merge (commit `79140ec`) changed the default qwen35 convert to emit MTP blocks (`block_count = num_hidden_layers + 1 = 65`) for native speculative decoding. Current llama.cpp b8680 has no qwen35 MTP loader and rejects the file with "missing tensor 'blk.64.ssm_conv1d.weight'" (the MTP block is full-attention with no ssm_conv1d). The smoke harness sets `HF2Q_QWEN35_DROP_MTP=1` for its convert subprocess (in `src/arch/smoke.rs`) so it tests the base 64-block GGUF load path — which is the correct scope for Bug 4 (ssm_conv1d F32 for blocks 0–63). Remove this workaround when llama.cpp gains qwen35 MTP loading.
+
+The same code path runs for qwen35moe.  Re-emitting the four DWQ deliverables (Bug 3 below) is then unblocked.
+
+**Bug 5 — `hf2q smoke` llama-cli interactive-readline hang (TEST HARNESS side, INFINITE BLOCK):** ✅ **FIXED** in `src/arch/smoke.rs` — smoke verified 2026-04-25.  Surfaced 2026-04-25 cron-iter when running the post-`f02a293` Bug 4 smoke verification.  Bug 5 was the latent blocker for Bug 4 verification; the F32-promotion fix appears correct (the GGUF builds, llama-cli loads it without rejection) but the smoke harness itself hung before the transcript could be scraped.
+
+Symptom: `hf2q smoke --arch qwen35 --quant q4_0 …` runs convert → produces `/tmp/smoke-qwen35-q4/qwen35-q4_0.gguf` (16.9 GB, valid) → invokes `llama-cli --model … --prompt "The quick brown fox" -n 8 --seed 42 --temp 0 --no-warmup` → llama-cli hangs indefinitely (25+ minutes observed before kill).  `sample(1)` on the hung child PID showed the dominant call stack:
+
+```
+main → console::readline() → fflush → __sflush → _swrite → __write_nocancel
+```
+
+The 8-token greedy generation completes; llama-cli then enters **conversation mode** and reopens `/dev/tty` for further input, ignoring stdin redirection from the parent process.  `Command::output()` in std defers to the child for stdin, and `output()`'s default stdin pipe close-on-spawn does not block `/dev/tty` reopens.
+
+Root cause: recent llama.cpp builds default to conversation mode (`-cnv` / `--conversation` ON), per `/opt/llama.cpp/common/arg.cpp:1490`.  The `Command::new(&llama_cli)` invocation in `src/arch/smoke.rs:486-503` did not pass `-no-cnv` to disable it.
+
+Fix: added `"-no-cnv"` and `"--single-turn"` to the args list.  `-no-cnv` disables conversation mode; `--single-turn` (added in **this commit**) further ensures exit after the first prompt response even when interactive mode is otherwise entered.  Also added `strip_terminal_control()` to the stdout sanitizer to remove backspace characters from the loading spinner and apply proper terminal emulation, producing a byte-stable transcript.  The mock `write_mock_llama_cli` in `tests/smoke_conformance.rs` ignores all args, so existing CI tests are unaffected.
+
+**Verification done 2026-04-25** — Bug 5 ✅ FIXED in same commit as Bug 4 closure.  The smoke transcript at `tests/fixtures/smoke-transcripts/qwen35-q4_0.txt` materialized cleanly (68 lines, 2904 bytes, byte-identical across two fresh runs).
+
+**Bug 6 — P9b re-read path missing Phase 1.8 vocab-pad re-truncation (CONVERT side, DWQ-only):** ✅ **FIXED** 2026-04-26 — `src/input/mod.rs::truncate_padded_vocab` refactored to detect padded rows from `tensor_map` itself (not solely from `metadata.vocab_size`), and `src/main.rs:940` re-applies it on the P9b re-read path.  Surfaced 2026-04-26 cron-iter when running the post-Bug-5 Bug 3 (DWQ re-emit) ladder for `qwen35-dwq46`.
+
+The DWQ pipeline takes a two-pass shape (P9b): first pass emits an intermediate F16 GGUF for activation capture; second pass re-reads the safetensors fresh and runs the activation-aware DWQ scale calibration.  The first-pass Phase 1.8 (commit `85e488f`) truncated the safetensors-padded `model.embed_tokens.weight` + `lm_head.weight` from 248320 → 248044 rows AND updated `metadata.vocab_size` → 248044.  The re-read path applied the qwen35 normalization phases (linear-attn transforms, MoE expert merge, RMS+1) but did NOT re-apply Phase 1.8, leaving the freshly-re-read tensor_map's embeddings at the padded 248320-row shape.  The final DWQ GGUF then carried 248320-row embeddings vs. the metadata-declared 248044 vocab size, and llama.cpp rejected the load with `tensor 'token_embd.weight' has wrong shape; expected 5120, 248044, got 5120, 248320`.
+
+The original `truncate_padded_vocab` early-returned when `true_vocab >= metadata.vocab_size` — so passing `metadata.vocab_size` (248044) as `true_vocab` against a 248044 metadata was a no-op even though the tensor_map embeddings still had 248320 rows.  Refactor: the helper now detects the actual padded row count from one of the embed tensors and falls back to `metadata.vocab_size` only when no embed is present.  This makes it idempotent and lets it work on both the first-pass path (metadata + tensor in sync at padded value) and the re-read path (metadata at de-padded, tensor at padded).  New regression test `truncate_padded_vocab_handles_re_read_path_metadata_already_de_padded` pins the new behaviour.
+
+**Bug 7 — P9b re-read path missing HF2Q_QWEN35_DROP_MTP=1 re-application (CONVERT side, DWQ-only):** ✅ **FIXED** 2026-04-26 — `src/main.rs:940` re-applies the MTP-tensor drop on the re-read tensor_map.  Surfaced in the same cron-iter immediately after Bug 6 was fixed.
+
+The first-pass at `src/main.rs:543-559` drops 15 `mtp.*` tensors when `HF2Q_QWEN35_DROP_MTP=1` is set; the re-read path mirrored none of that.  After Bug 6 fixed the vocab-pad shape mismatch, the next failure was `done_getting_tensors: wrong number of tensors; expected 866, got 851` because the DWQ ran on a re-read tensor_map containing the 15 MTP tensors, producing a final GGUF with 866 tensor entries while metadata declared `block_count = 64` (no MTP block) so llama.cpp's qwen35 schema only knew 851 tensor names.
+
+Bug 6 + Bug 7 are the same class of defect: P9b re-read symmetry — every transformation the first-pass tensor_map underwent must also fire on the re-read tensor_map BEFORE the DWQ pass, since DWQ emits the final GGUF from the re-read view.  Both are gated by the same env var (`HF2Q_QWEN35_DROP_MTP`) for MTP and by `metadata.vocab_size` for vocab pad, both with the same removal/exit conditions as the first-pass call.
+
+**Verification (2026-04-26):**
+```
+HF2Q_QWEN35_DROP_MTP=1 hf2q convert --repo Qwen/Qwen3.6-27B \
+    --quant dwq-mixed-4-6 --skip-quality \
+    --output models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf
+```
+Produces a 16.08 GB GGUF that llama.cpp loads cleanly (no "wrong number of tensors" rejection, no "wrong shape" rejection) and runs at 28.24 tok/s decode.  Generates the canonical pangram completion `The quick brown fox → jumps over the lazy` at `--temp 0`.
+
+`--skip-quality` is required for now because Phase 4.5 quality measurement holds `tensor_map` (~70 GB) + F32-dequantized model (~100 GB) simultaneously, exceeding 128 GB unified RAM on M5 Max.  Tracked as a separate streaming-dequant refactor follow-up.
+
+---
+
+**Original Bug 2 surface (preserved for context):**
+
+The smoke run at commit `eee1c39` surfaced "wrong number of tensors; expected 866, got 851" — the GGUF emitted 866 total but llama.cpp only recognized 851.  Root cause: 15 raw `mtp.*` HF tensor names passed through `hf_name_to_gguf` unrenamed.  ADR-012 P11's MTP rename only covered four wrapper suffixes (`enorm`, `hnorm`, `embed_tokens`, `eh_proj`) and even those used the wrong HF source names — Qwen3.6-27B's HF schema actually emits:
+  * `mtp.pre_fc_norm_embedding.weight` (not `mtp.layers.0.enorm.weight`)
+  * `mtp.pre_fc_norm_hidden.weight` (not `mtp.layers.0.hnorm.weight`)
+  * `mtp.embed_tokens.weight` (no `layers.0` infix on the wrapper)
+  * `mtp.fc.weight` (the eh_proj equivalent)
+  * `mtp.norm.weight` (the per-llama-arch.cpp `nextn.shared_head_norm` analog)
+  * **Plus** the inner transformer block at `mtp.layers.0.{self_attn,mlp}.*` + `input_layernorm.weight` + `post_attention_layernorm.weight` (11 tensors that map to a separate `blk.{n_layer}.*` block — same shape as a regular transformer layer; the `nextn` block is a single transformer layer prepended to the lm-head).
+
+  **Fix design (next iter):** extend `gguf.rs::hf_name_to_gguf` MTP branch to recognize all 15 `mtp.*` patterns and route them per `llama-arch.cpp:447-452` (the 6 `LLM_TENSOR_NEXTN_*` slots) plus the inner transformer block at `blk.{n_layer}.*`.  Cross-reference `/opt/llama.cpp/convert_hf_to_gguf.py` for the canonical HF→GGUF MTP mapping to avoid guesswork.  Update the ADR-012 P11 round-trip test to load all 15 (currently only verifies 4); ADR-013's `mtp.rs::load_mtp_weights_if_present` already scans the full `blk.{N}.nextn.*` prefix so it picks up whatever new mappings land.
+
+**Bug 3 — ssm_conv1d Q4_0 alignment (PRE-FIX SHIPPED ARTIFACTS):** ✅ **FIXED** 2026-04-26 — all four DWQ GGUFs re-emitted through the post-fix pipeline (post-Bug-1, post-Bug-2, post-Bug-4, post-Bug-6, post-Bug-7).  The pre-fix shipped GGUFs at `models/qwen3.6-27b-dwq{46,48}/` and `models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq{46,48}/` were originally produced before the post-shipment `is_weight()` guard (`436b923`) landed and failed to load with `tensor 'blk.0.ssm_conv1d.weight' of type 2 (q4_0) has 4 elements per row, not a multiple of block size (32)`.
+
+**Re-emit verification (2026-04-26 01:02–01:17, this commit):**
+
+| Model + repo | Quant | Output GGUF size | Compression | Decode | Pangram |
+|---|---|---|---|---|---|
+| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-6 | 16.08 GB | 3.2× | 28.24 t/s | "jumps over the lazy" |
+| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-8 | 16.69 GB | 3.1× | 27.48 t/s | "jumps over the lazy" |
+| jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated (MoE) | dwq-mixed-4-6 | 19.25 GB | 3.4× | 114.69 t/s | "jumps over the lazy dog." |
+| jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated (MoE) | dwq-mixed-4-8 | 27.46 GB | 2.4× | 97.81 t/s | "jumps over the lazy" |
+
+All four load in `/opt/homebrew/bin/llama-completion` (llama.cpp build b8680-15f786e65) without rejection — no shape mismatch, no tensor-count mismatch, no GGML_ASSERT, no Aborted.  At `--prompt "The quick brown fox" --seed 42 --temp 0 --n 8`, each produces the canonical pangram completion deterministically.  Wall-clock per re-emit: 7–10 minutes on M5 Max + 128 GB unified RAM (significantly faster than the docs' "~2 h" conservative estimate, attributable to (a) the existing safetensors cache (no HF download), (b) `--skip-quality` bypass of the Phase 4.5 dequant peak — see `project_phase45_quality_oom.md`, and (c) cohort-prior bit allocation pruning calibration to 1–3 sensitive layer ranges).
+
+Re-emit invocation (canonical for follow-up runs):
+
+```
+HF2Q_QWEN35_DROP_MTP=1 hf2q convert \
+  --repo <hf-repo> \
+  --format gguf \
+  --quant dwq-mixed-{4-6,4-8} \
+  --skip-quality \
+  --output models/<slug>/<slug>.gguf
+```
+
+`HF2Q_QWEN35_DROP_MTP=1` is the temporary escape hatch from the ADR-013 P14 interaction (see "Note on ADR-013 P14 interaction" above) and removes when llama.cpp gains qwen35 MTP loading or by 2026-Q4.  `--skip-quality` defers the Phase 4.5 PPL/KL measurement (separate streaming-dequant refactor follow-up — ~170 GB peak vs. 128 GB physical RAM on M5 Max).
+
+Per mantra: no fallback, no stubs.  The post-merge "🟢 ENGINEERING COMPLETE" header (commit `38d2f3c`) was based on the worktree's claim of four shipped DWQ GGUFs without independent llama.cpp load verification.  That addendum was correctly reverted in `eee1c39`; this closure re-flips the status only after all four GGUFs were independently load-verified by `/opt/homebrew/bin/llama-completion` end-to-end.
+
+### §Benchmark — decode tok/s vs llama.cpp baseline (2026-04-26)
+
+Measured on M5 Max + 128 GB unified RAM, llama.cpp build `b8680-15f786e65`, hf2q HEAD `10fb092` (post-Bug-3 closure).  Methodology per `reference_decode_benchmark_methodology` and `tooling_llama_bench_ub_methodology`:
+
+* **llama.cpp baseline**: `llama-bench -m <gguf> -p 0 -n 256 -r 5` (5 reps, in-process median, BLAS+MTL backend).
+* **hf2q**: `hf2q generate --benchmark --max-tokens 256 --temperature 0` (in-process 5-run median; mlx-native Metal backend).
+
+| Model + repo | Quant | hf2q decode | llama.cpp decode | Parity ratio |
+|---|---|---|---|---|
+| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-6 | 29.1 t/s | 28.56 ± 0.48 t/s | **1.02×** |
+| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-8 | 28.3 t/s | 27.75 ± 0.43 t/s | **1.02×** |
+| jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated (MoE) | dwq-mixed-4-6 | 110.5 t/s | 118.96 ± 0.92 t/s | **0.93×** |
+| jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated (MoE) | dwq-mixed-4-8 | 105.7 t/s | 103.93 ± 0.08 t/s | **1.02×** |
+
+(hf2q numbers post Task #13 + Task #14 + Task #15 buffer-pool + MoE-FFN-fusion, 2026-04-26 — `hf2q generate --benchmark --max-tokens 256` 5-run median; llama.cpp baselines re-measured same day to control for thermal/system variance.)
+
+**MoE parity verdict:** hf2q is at 0.91–0.99× of llama.cpp's BLAS+MTL backend for the 35B-A3B MoE GGUFs.  Within tolerance for a pure-Rust + mlx-native implementation against llama.cpp's mature tensor-cores Metal path.  dwq48 is essentially at parity (0.99×); dwq46 trails by ~10% — likely the additional Lloyd-Max codebook decode cost on the 4-bit majority of layers (see `project_tq_sdpa_perf_analysis.md` for the codebook-decode hypothesis on the related TQ family).
+
+**Dense parity verdict (post Task #14):** hf2q is at **1.02×** of llama.cpp on both 27B dense GGUFs after Task #14 closed (commits `d975cb8` + `92604a2`, 2026-04-26): dwq46 29.0 vs 28.56 t/s, dwq48 28.3 vs 27.75 t/s.  R14 entry gate (load + canonical pangram via llama-completion) is GREEN on all four GGUFs.
+
+**Task #14 root cause (closed 2026-04-26):** the dense path uploaded weights via Q4_0→F32→Q4_0 round-trip (`upload_q4_0_from_f32`), expanding a 14 GB Q4_0 GGUF to ~108 GB F32 CPU staging + 17 GB GGUF mmap = 129 GB physical on a 128 GB M5 Max.  Fix: mirror the MoE pattern (`MoeFfnWeightsGpuQ::from_quantized`) — landed `DenseFfnWeightsGpuQ` + `load_dense_ffn_quantized` + `build_dense_ffn_layer_gpu_q` to keep raw GGML blocks on Metal as U8.  Plus a special-token coverage extension (token_embd 248044→248320 with zero rows for `<|im_start|>=248045`..`<|fim_suffix|>=248062` from tokenizer.json's added_tokens, which are absent from `tokenizer.ggml.tokens`).  Working set 129 GB → 17.3 GB; load 7.8 s; coherent decode.
+
+**Why not match -ub batching:** llama-bench at `-p 0 -n 256` is decode-only (no prefill batching), so `-ub` doesn't apply.  The bench compares apples-to-apples on pure decode token throughput.
+
+### §Optimize — follow-ups beyond ADR-012 closure
+
+The mission's "optimize" phase is deferred to subsequent ADRs / tasks since ADR-012's scope is the conversion pipeline:
+
+* **Task #13** — ✅ CLOSED 2026-04-26 (commit `53037d2`).  Phase 4.5 now uses `measure_quality_streaming` which dequantizes + compares one tensor at a time, bounding peak memory to ~max_tensor_F32 × 2 instead of whole-model × 2.  `--skip-quality` is no longer required for 27B+ DWQ re-emits; can be removed from the dwq46/dwq48 manifests on the next re-emit cycle.
+* **Task #14** — ✅ CLOSED 2026-04-26 (commits `d975cb8` dense Q-path + `92604a2` special-token coverage).  hf2q dense 27B now decodes at 0.96–1.10× of llama.cpp.  Working set 129 GB → 17.3 GB.
+* **Task #15 — MoE buffer-pool refactor (partial close, 2026-04-26 commit `3778597`).**  Threaded `MlxBufferPool` through `gpu_delta_net.rs`, `gpu_ffn.rs`, and `gpu_full_attn.rs` decode hot paths — eliminates ~1750 unpooled `device.alloc_buffer()` calls per token.  Bench impact: MoE dwq46 +1.7% (108.0 → 109.8 t/s, 0.90× → 0.91×), MoE dwq48 +1.7% (102.6 → 104.3 t/s, 0.99× → 1.00× parity).  Dense unaffected (no MoE FFN).  R14 entry gate GREEN on all four GGUFs.
+* **MoE dwq46 residual parity gap (0.93×, ~8 t/s).**  Diagnostic localization 2026-04-26 narrowed it to **Q4_0 mv_id kernel performance specifically**: dwq48 (8-bit majority) is at 1.02× of llama.cpp on the same hf2q codebase / same hardware / same arch.  dwq46 differs only in being 4-bit-majority (487 Q4_0 vs 232 Q4_0 in dwq48).  Same `kernel_mul_mv_id_q4_0_f32` shader as llama.cpp (vendored from llama-metal); same `N_R0_Q4_0=4`, `N_SG_Q4_0=2` constants; same dot-helper math (4-accumulator ILP, post-`block_q4_0_dot_y` revert).
+  Diagnostic counter (`mlx_native::cmd_buf_count` + `HF2Q_DECODE_PROFILE=1`) shows hf2q issues **100 command buffers per decode token** post-MoE-FFN-fusion (down from pre-fusion 140), vs llama.cpp's **1-2 cmd buffers per `n_cb` graph submission** (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:458`).  Cross-layer encoder fusion would close this 100→~5 gap but cb cost on M5 Max measured at ~1-2 µs each (140→100 fusion saved only 0.5%), so reduction value is bounded ≤1% throughput.
+  Seven static-evidence kernel hypotheses now falsified on M5 Max (per `project_metal_compiler_auto_optimizes_static_levers.md` + this and prior iterations' geometry tests):
+    1. 4-accumulator ILP in `id_ggml.metal` Q4_0 dot-helper — zero effect (see `project_moe_dwq46_parity_gap_diagnostics.md`).
+    2. Pre-MoE-FFN-fusion buffer pool — small +1.7% but missed parity.
+    3. MoE-FFN encoder fusion (140→100 cb/token, commit `fa42395`) — only +0.5% throughput.
+    4. `commandBufferWithUnretainedReferences` — broke transient buffer ARC, reverted.
+    5. (32, 2) vs (8, 8) Q4_0 mv_id threadgroup layout — 1.8% short-bench win, 2% long-decode regress, reverted.
+    6. Output_norm + lm_head + argmax encoder fusion (3→1 cb at decode tail) — no measurable change, reverted.
+    7. **Routing-via-Z dispatch grid** — switching `kernel_mul_mv_id_*` to read `tgpig.z` paired with dispatcher `MTLSize::new(N/8, 1, m)` (mirroring llama.cpp's `ggml-metal-ops.cpp:2452` shape) **regressed dwq46 64-token decode from 114.0 t/s to 90.9 t/s (-19%)** on M5 Max (2026-04-26).  Apple GPU's threadgroup scheduler distributes this dispatch shape better via Y than Z. Reverted.
+  
+  The remaining gap is most likely an internal Apple Metal driver / scheduler interaction with the specific Q4_0 mv_id workload signature that pure-Rust mlx-native cannot easily match without per-dispatch GPU profiling + dispatch-graph fusion that goes beyond ADR-012's conversion-pipeline scope.  Belongs in a new mlx-native ADR.
+
+  **2026-04-26 verification re-bench** (post-fa42395, post-9a3d953, post-z-routing-revert): 5-cold runs at n=256, dwq46 = 109.6, 110.5, 111.0 t/s (median 110.5 t/s) — matches ADR-recorded baseline.  llama.cpp at n=64 = 119.36 t/s.  Current ratio: 0.926× = 0.93× (rounded).  **dwq46 GGUF tensor-type breakdown via `gguf-dump`**: 487 Q4_0 + 24 Q6_K + 221 F32 + 1 F16 (vs dwq48: 232 Q4_0 + 279 Q8_0 + 221 F32 + 1 F16).  In MoE expert-stack tensors specifically: dwq46 has 114 Q4_0 + 6 Q6_K, dwq48 has 54 Q4_0 + 66 Q8_0 — confirms the 2× Q4_0 dispatch volume in dwq46 vs dwq48 amplifies the per-Q4_0-dispatch slowness.
+
+  **2026-04-26 high-level forward-graph audit** (vs llama.cpp's `qwen35moe.cpp` + `llama-graph.cpp:build_moe_ffn`):
+    - llama.cpp's `build_moe_ffn` accepts a **fused `gate_up_exps`** tensor (`llama-graph.cpp:1512-1535`) — when present, ONE `mul_mat_id` produces gate||up concatenated, then split into views.  This halves expert-FFN mv_id dispatches per MoE layer (2 → 1 for the gate/up pair).  **Verified absent in our dwq46 GGUF**: only `blk.{L}.ffn_gate_exps.weight` + `blk.{L}.ffn_up_exps.weight` exist as separate tensors.  Conclusion: llama.cpp uses the same separate-gate+up code path as hf2q on our GGUFs (`llama-graph.cpp:1536-1575`), so this is not the lever.  Could become a future optimization if we emit `ffn_gate_up_exps` as a fused tensor in the convert pipeline (would need llama.cpp loader support too).
+    - hf2q's MoE-Q decode path (`build_moe_ffn_layer_gpu_q_into`, line 1047–) already uses GPU `dispatch_silu_mul` for gate/up combine — no CPU round-trip in the hot path.  CPU silu_mul calls (`gpu_ffn.rs:861, 913`) are in the LEGACY `build_moe_ffn_layer_gpu_q` non-_into helper used only by tests / non-MoeQ-decode callers.
+    - mlx-native's `moe_swiglu_fused` kernel (`moe_dispatch.rs:393`) implements **GELU** not SILU activation — applies to gemma-4 MoE, not qwen3.6 SILU MoE.  Adding a SILU variant could fuse silu_mul into expert_down's preceding multiply, but the dispatch saving is only 40/token (one silu_mul per layer); kernel-fusion at this granularity is bounded ≤1% per the cb-creation-cost measurements above.
+
+  **Per-token cost decomposition** (from `HF2Q_DECODE_PROFILE=1` instrumentation at HEAD):
+    - 100 cb / 1070 dispatches per token
+    - CPU encoding wall: 3.3ms (3.1µs/dispatch average)
+    - GPU drain in `output_head` after layer-loop: 5.7-6.3ms
+    - Total per-token wall: 8.87ms (= 1/112.7 t/s)
+    - llama.cpp at 1/119.36 = 8.38ms/token
+
+  Closing the remaining 0.49ms/token gap via further mlx-native optimization belongs in a separate ADR — candidates: (1) per-dispatch GPU sampling via `MTLCounterSampleBuffer` to surface true per-kernel time, (2) parallel-encoding `dispatch_apply` pattern (mirrors llama.cpp's `ggml-metal-context.m:550`) to reduce the 3.3ms CPU encoding, (3) cross-token speculative pipelining.  None of these are within ADR-012's conversion-pipeline scope.
+
+  **2026-04-26 per-CB GPU profiling SHIPPED** (mlx-native commit `f11cef9` + hf2q commit `4122f9e`): `mlx_native::kernel_profile` module + `CommandEncoder::commit_labeled` / `commit_and_wait_labeled` — when `MLX_PROFILE_CB=1` is set, each labeled commit accumulates `GPUEndTime - GPUStartTime` into a global table.  hf2q's `forward_gpu_greedy` decode dumps a sorted breakdown after each token.  Profile mode is slow (forces sync per labeled commit) but gives clean per-CB attribution.  Zero overhead when env var is unset.
+
+  **dwq46 decode per-CB breakdown** (`MLX_PROFILE_CB=1`, n=4 tokens, M5 Max):
+    | Phase | GPU time | Per-cb | Count | % |
+    |---|---|---|---|---|
+    | `layer.moe_ffn` | 3.85ms | 96µs avg | 40 | 46% |
+    | `layer.delta_net.ops1-9` | 3.03ms | 101µs avg | 30 | 36% |
+    | `output_head.lm_head_q4` | 0.50ms | 504µs | 1 | 6% |
+    | `layer.full_attn.sdpa_kv` | 0.42ms | 42µs avg | 10 | 5% |
+    | `layer.full_attn.ops1-4` | 0.39ms | 38µs avg | 10 | 5% |
+    | `layer.full_attn.ops6-7` | 0.15ms | 15µs avg | 10 | 2% |
+    | `output_head.argmax` | 0.05ms | 48µs | 1 | 1% |
+    | `output_head.norm` | 0.01ms | 7µs | 1 | 0% |
+    | **Total** | **8.45ms** | | **102 cb** | |
+
+  **Conclusion**: total profiled GPU work (8.45ms) ≈ llama.cpp's per-token wall (8.38ms).  The 0.5ms hf2q-vs-llama gap is **not in kernel speed** — both implementations spend the same amount of time computing on the GPU.  The gap is in CPU-side CB scheduling/encoding overhead × 100 cb/token vs llama.cpp's 1-2 cb/token (`ggml-metal-context.m:458` "optimal values for n_cb are 1 or 2").  Per-CB scheduling overhead at ~5µs × ~100 cb ≈ 0.5ms gap.  Closing this requires either dispatch-graph fusion (large-scope falsified per `gpu_full_attn.rs:1108-1112`) or `dispatch_apply` parallel encoding — both belong in a new mlx-native perf ADR.
+
+  **2026-04-26 small-scope CB fusion experiment** (sdpa_kv + ops6-7 → 1 cb, FullAttn decode path): refactored `apply_sdpa_with_kv_cache` to add a `_into` variant taking external encoder, then chained sigmoid_gate + out_proj into the same encoder.  Per-CB profile after fusion: `layer.full_attn.sdpa+ops6-7` = 56µs/cb × 10 = 0.56ms (was 42 + 15 = 57µs across 2 cb pre-fusion).  **Total cb count: 102 → 92 (−10 cb/token).  3 cold-run n=256 decode median: 110.5 t/s → 111.0 t/s = +0.5%, within noise.**  Confirms the 0.5ms gap is **not** dominated by CB-count overhead at this scale — the lever is **dispatch-count** (1070/token), not CB-count.  Source-level kernel fusion (combining adjacent compute kernels) is the only remaining lever and belongs in a new mlx-native perf ADR.  The fusion refactor was not committed to keep code complexity aligned with measured benefit (per `feedback_no_broken_windows`).
+
+  **2026-04-26 per-DISPATCH profiling — HARDWARE-IMPOSSIBLE on M5 Max.**  Probed `MTLDevice.supportsCounterSampling()` for all `MTLCounterSamplingPoint` variants on the host machine:
+
+    | Sampling point | M5 Max support |
+    |---|---|
+    | AtStageBoundary | **true** |
+    | AtDrawBoundary | false |
+    | AtDispatchBoundary | **false** |
+    | AtTileDispatchBoundary | false |
+    | AtBlitBoundary | false |
+
+  The `timestamp` counter set IS available, but only for `AtStageBoundary` sampling — i.e., at compute-encoder transitions, not between individual dispatches within an encoder.  Apple Silicon (M1–M5) does not expose per-dispatch GPU timestamps via `MTLCounterSampleBuffer.sampleCounters`; this is supported on Apple's discrete-GPU products only.  **The per-dispatch GPU timestamping the user's `/loop` directive named as the next localization step is therefore not achievable on this hardware** without resorting to GPU-trace capture (`MTLCaptureManager.startCaptureWithDescriptor`) — a manual offline workflow that doesn't fit a perf-iteration loop.
+
+  **Final closure verdict for the dwq46 0.93× decode parity gap (after this iteration's data):**
+    - Kernel speed: identical to llama.cpp (per-CB GPU profile total 8.45ms ≈ 8.38ms llama wall).
+    - CB-count: small-scope fusion saved 10 cb/token → +0.5% (noise).  Large-scope falsified twice on M5 Max.
+    - Per-dispatch profiling: hardware-impossible on M5 Max via Metal API.
+    - 8 falsified static-evidence kernel/dispatch hypotheses on M5 Max.
+
+  Closing the last 0.5ms requires one of: (1) source-level kernel fusion (combine adjacent compute kernels — significant mlx-native shader work, separate ADR), (2) `dispatch_apply` parallel encoding (mirrors llama.cpp `ggml-metal-context.m:550` pattern), (3) cross-token speculative pipelining (changes program structure).  None are within ADR-012's conversion-pipeline scope.  **dwq46 at 0.93× of llama.cpp on M5 Max is the practical ceiling for the current pure-Rust mlx-native architecture; closing further requires a new mlx-native perf ADR.**
+
+  **2026-04-26 source-level kernel fusion experiment** (mlx-native commit `4efeec0`): implemented `kernel_mul_mv_id_q4_0_f32_swiglu` — a fused Q4_0 mv_id kernel that computes `silu(gate)*up` inline before the dot product, eliminating the standalone silu_mul dispatch between Phase D and Phase E of the MoE FFN.  Parity test (`tests/test_quantized_matmul_id_swiglu.rs`) validates bit-equivalence to the unfused sequence (max_err ≈ 1e-4 on 8×128 production-shape).
+  **Bench result: REGRESS −1.5% (110.5 → 108.0 t/s on n=256 cold-run median)** despite saving 40 dispatches/token (one silu_mul per MoE layer × 40 layers).  Per-CB profile: moe_ffn cb GPU time unchanged (96µs avg).  Hypothesis: inlining silu into the Q4_0 matmul kernel adds 16 transcendentals per simdthread inner loop, making it ALU-bound where it was bandwidth-bound — the saved silu_mul dispatch (~1-2µs/cb) costs less than the added kernel ALU pressure.  Wire-up reverted; kernel + dispatcher retained in mlx-native as a tool for future re-eval.  **9th confirmed M5 Max static-evidence kernel hypothesis falsified.**
+
+  **2026-04-26 same-day n=256 ratio refresh**: hf2q dwq46 = 109.1 t/s (3-cold-run median), llama.cpp dwq46 = 116.01 t/s (`llama-bench -p 0 -n 256 -r 3`).  Ratio: **0.940×** at n=256 same-day vs prior 0.93× at n=64 — within thermal-state variance.  Both implementations have drifted ~3-5% slower than the ADR-recorded baseline, likely M5 Max thermal state.  The relative gap (5-7%) is stable.
+* **Phase 4.5 refactor** would also unlock real-model PPL/KL gate runs that the test infrastructure under `tests/quality_thresholds.rs` currently exercises with synthetic-tiny inputs only.
+
+**Decision Makers:** Robert, Claude
+**Related ADRs:** ADR-004 (GGUF compatibility), ADR-006 (mlx-native GPU backend), ADR-008 (candle divorce)
+
+## Phase status
+
+| Phase | Status | Commit | Notes |
+|---|---|---|---|
+| P0 — Broken-window fix (Decision 10) | ✅ shipped 2026-04-24 | `4a2b1e6` | DWQ bit-pair parameterization; 4 new CLI variants (4-8/6-8/2-8 alongside 4-6); --bits+DWQ now errors; auto-naming dwq46/48/68/28. 18 CLI integration tests green, zero new clippy errors. Solo-merged via CFA session `cfa-20260424-adr012-P0-dwq-bitpair` (Codex dual-mode driver failed stdin binding; Claude driver shipped clean). |
+| P1 — Config ingestion (Decisions 2, 3) | ✅ shipped 2026-04-24 | `c7b1296` | 18 new `Option<T>` fields on `ModelMetadata` + nested `RopeParameters`; `resolved_layer_types()` dual-support getter (prefers explicit `layer_types` over derived `full_attention_interval`); `validate_required_qwen35moe_fields()` public API for P2; preflight hybrid sanity check + `LinearAttentionWithoutFullAttention` error variant. 12 files, 1118 insertions, 12 new tests (apex config parses all 18 fields; Gemma-4 AST unchanged; malformed qwen35moe errors with field name; preflight 100%-linear fails). 650 binary tests + integration tests green; zero new clippy in touched files. Cross-cutting: P2+ MUST call `resolved_layer_types()`, not the legacy `layer_types` Vec. |
+| P2 — qwen35 module + V-head reorder (4, 5) | ✅ shipped 2026-04-24 | `1a849e1` | `src/models/qwen35/{mod,dense,moe}.rs` (conversion-side, separate from ADR-013's `src/inference/models/qwen35/`). `Qwen35Arch` enum + `Qwen35ConvertContext`; `is_linear_attention_layer` / `is_full_attention_layer` using P1's `resolved_layer_types()`. 6-case V-head grouped→tiled reorder ported from `llama.cpp/convert_hf_to_gguf.py:5375-5424`. **Insight**: `reorder_v_heads` is NOT self-inverse for nk≠nv — added explicit `reorder_v_heads_inverse` with proof. 35 new tests (per-case + round-trip + hand-authored spec-driven permutation + dispatcher against apex). Cases 4/5 (A_log/conv1d) return typed `PhaseStub` errors for P3. 5 files, 2019 insertions. |
+| P3 — Non-reorder transforms (6) | ✅ shipped 2026-04-24 | `73a96e4` | A_log negation (no overflow clamp, matches llama.cpp exactly — -inf for large positives); `.dt_bias`/`.dt_proj` V-head reorder; `conv1d` [k,1,d] squeeze + V-channel reorder (typed `ReorderInvariantViolated` on shape mismatch, no silent reshape); `transform_in_proj_qkvz` fused-split helper; **RMS norm +1 verdict: YES** per `convert_hf_to_gguf.py:4794-4795` (Qwen3NextModel base, inherited by both variants; exclusion: `linear_attn.norm.weight`; bias baked at convert time). 19 new tests, 694 total green, zero new clippy in `src/models/`. Cross-cutting for P4: `apply_rms_norm_plus_one()` + `transform_in_proj_qkvz()` public and ready; `.dt_bias → .dt_proj.bias` GGUF key rename pending in name-mapping. |
+| P4 — GGUF metadata + tensor naming (1, 7, 8, 11) | ✅ shipped 2026-04-24 | `4ffd035` | Arch dispatch in `src/backends/gguf.rs` (`arch_gguf_name()` from `architectures[0]` — **not** `model_type`). `emit_metadata_dense/moe` validators + `emit_qwen35_metadata()` KV emission. **CRITICAL P3 correction**: P3's `lin_attn_*` prefix was wrong throughout; corrected from llama-arch.cpp: `in_proj_qkv→attn_qkv` (:382), `in_proj_z→attn_gate` (:370), `out_proj→ssm_out` (:402), `A_log→ssm_a` (:395), `dt_bias→ssm_dt.bias` (:397). **`post_attention_layernorm → post_attention_norm`** verdict (llama-arch.cpp:367, not `ffn_norm`). MTP: `model.mtp.layers.0.* → blk.{n_layer}.nextn.*` (llama-arch.cpp:447-450). 3 files, 832 insertions, 90 deletions. 717 tests pass; zero new clippy. |
+| P5 — Expert merge (9, MoE only) | ✅ shipped 2026-04-24 (+ wire-up fix 2026-04-24) | `6175bb7` · `7d5d6eb` · `64bcb30` | `merge_expert_tensors` body + layer-streaming orchestration via `merge_moe_experts_in_place`. Dim order verified from `llama-model.cpp:3281-3283`: gate/up stack as `[N, moe_inter, hidden]` but down stacks as `[N, hidden, moe_inter]` — different per projection. Memory strategy: layer-streaming, peak add ~3.7 GB above baseline (256 × 2 × 512 × 7168 × 2B for BF16) — well within 64 GB budget. Typed errors `DenseContextMergeCall`, `ExpertMergeEmpty`, `ExpertMergeShapeMismatch`. Dense arch-gate verified. Shared experts confirmed emit as `_shexp` singletons (not merged). **P11 round-trip gate caught a silent wire-up gap** — the P5 merge function was defined but never invoked from the convert pipeline, and `hf_name_to_gguf::layer_map_for_arch("qwen35moe")` didn't map MoE-specific HF names. Follow-up fix adds `merge_moe_experts_in_tensor_map` (pre-quant variant; the post-quant variant has a byte-size mismatch) + invokes it at Phase 1.5 + extends the qwen35moe branch of layer_map_for_arch with 8 new entries (router, shared-expert trio + gate, merged-experts trio). |
+| P6 — DWQ hybrid-arch calibration (12, 13) | ✅ shipped 2026-04-24 | `db644f8` | **Adopted** `ActivationCapture` from ADR-013 P12 (`src/inference/models/qwen35/activation_capture.rs`) — no redefinition. Cohort priors via new `ArchFamily::Qwen35Dense/Qwen35MoE` matched BEFORE generic `qwen` catch-all → Gemma untouched. Both qwen35: SSM state (A_log/dt_*/conv1d) → 8-bit always. qwen35moe only: router + shared experts → 8-bit always; routed experts use `next_valid_bits(base, 2)` (+2 threshold). **No-fallback enforcement** (defence in depth): `DwqArch::requires_activation_capture()` in `src/quantize/dwq.rs` + `main.rs` DWQ arm immediately returns `DwqError::NoActivationCapture` for qwen35/qwen35moe before `DwqConfig`. Non-qwen35 weight-space path unchanged. Gemma snapshot regression verified byte-identical. 18 new tests, 790 total green. 3 files, 623 insertions, 18 deletions. |
+| P7 — Integration + HF download + docs (14, 15) | ✅ shipped 2026-04-24 | `8aab918` | `tests/convert_qwen35_integration.rs` (6 tests, dense end-to-end + sidecar); `tests/convert_qwen35moe_integration.rs` (6 tests, MoE end-to-end + sidecar + expert-count assertion); disk preflight in `src/input/hf_download.rs` (Decision 14: ModelClass routing, 150/55/100 GB floors, 13 new unit tests); sidecar copy in `src/main.rs` (Decision 15: Phase 4.7, byte-identical, silent-skip on missing); `docs/converting-qwen35.md` (canonical commands for MoE + dense + smoke test); `docs/converting-a-model.md` (generic convert reference + Gemma canonical command); `docs/shipping-contract.md` updated with qwen35/qwen35moe acceptance section. 8 files, 1952 insertions. 814 tests pass, 0 fail. |
+| P8 — Arch-registry + smoke subcommand (Decisions 16, 20) | 🟡 functional-complete 2026-04-24 | `ebec4a1` · `d90ac1d` · `d9800bf` · `ba5a3bc` · `18e23ab` | Scaffolding (`ebec4a1`) + preflight exit codes 2-8 + uniform `UnknownArch` for unregistered arches. `hf2q smoke` CLI now fully wired: `--local-dir` skips HF_TOKEN preflight (`d90ac1d`), `--llama-cli-override` enables CI-safe mock stub testing (`ba5a3bc`), `--dry-run` prints a multi-field ArchEntry diagnostic report (`d9800bf`). Full Q4_0 end-to-end pipeline — convert → llama-cli → transcript — lives in `run_q4_0_pipeline`. Byte-identical transcript determinism across two fresh runs proven by `smoke_transcript_byte_identical_across_two_runs` (`18e23ab`, 0.5 s wall on release). 15 `tests/smoke_conformance.rs` tests green. **Remaining for real-model close:** Q4_0 transcripts on `Qwen/Qwen3.6-27B` + `jenerallee78/Qwen3.6-35B-A3B-...` under `tests/fixtures/smoke-transcripts/` (needs HF_TOKEN + disk + release build + llama.cpp — out of CI scope per Decision 16 §CI skip gate). |
+| P9 — DWQ ActivationCapture + PPL/KL quality gate (Decision 17) | 🟡 real impl shipped 2026-04-25 | `448477e` · `28df83c` · `df2cce8` · `6258a8b` | `src/inference/models/qwen35/activation_capture_real.rs` now ships the **real** `impl ActivationCapture for Qwen35Model` (commit `28df83c`, 2026-04-25) — closes ADR-013 P12's deferred deliverable. Mirrors `forward_cpu`'s loop body so captured residual streams are byte-identical to forward intermediate state. `RealActivationCapture` wrapper supports three constructors: `from_model(Qwen35Model)`, `new(gguf, tokenizer)` (loads via `Qwen35Model::load_from_gguf`), and `not_ready()` (preserved for explicit no-fallback-guard testing). 9 new unit tests on the impl pass. Variant coverage: Dense Qwen3.5 + unquantized MoE work via CPU forward; production MoeQ (native GGML block-quantized experts in GGUF) returns typed `RealActivationCaptureError::ForwardPass` rather than F32-expanding 256 experts (~128 GB OOM). `QualityThresholds::ADR_012_DEFAULT` constants pinned in `src/arch/registry.rs` (1.10 / 1.05 / 0.02). **Test infrastructure:** `tests/quality_thresholds.rs` (4 drift gates) + `tests/calibration_eval_disjoint.rs` (4 corpus/fixture integrity checks) + `tests/convert_qwen35_real_activation_capture.rs` (4-variant DWQ NoActivationCapture guard) + `DwqArch::from_hf_architecture` case-insensitivity anchor. `ppl_kl_eval` helper in `src/arch/conformance.rs`. **P9b — convert-pipeline wire-up:** ✅ **SHIPPED 2026-04-25** across 7 sub-tasks (all green). The two-pass conversion (path a) is now live: synthetic-tiny qwen35 reaches `RealActivationCapture::new`; real-model qwen35 / qwen35moe DWQ runs the full activation-aware calibration. Sub-task ledger: 9b.1 `7b7cbbb` (`emit_gguf_from_tensor_map`), 9b.3a `076fd82` (real `run_dwq_activation_calibration`), 9b.2/3b/4/5 `c04e47d` (main.rs two-pass branch + `tempfile::TempDir` RAII), 9b.6/7 `302c602` (reachability tests + docstring refresh). 1114 tests passing across the worktree (1112 unit + 2 new integration); 5 inherited broken windows from the c9cd958 merge unchanged. **P9 final close blocker:** real-model artifact production (4 DWQ GGUFs, qwen35/moe × dwq46/dwq48) — gated on HF_TOKEN + ~150 GB disk + release build, tracked as Task #16; same environment gate as P8 real-model close. |
+| P10 — mmproj vision-tower emitter (defense-in-depth, Decision 18) | ✅ shipped 2026-04-24 | `13d619a` · `6a3617c` · `18cbaaa` | Module + CLI + all three defense-in-depth layers complete. `src/models/vit/{mod,config,convert,gguf_emit}.rs` (~900 LOC) emits `mmproj-<slug>-F16.gguf`. `--emit-vision-tower` flag + silent-skip semantics wired in Phase 4.8 of cmd_convert. **Layer A** structural integration — synthetic tiny ViT convert → read-back + catalog assertion (`tests/convert_vision_tower_integration.rs`, 3 tests incl. Gemma4 no-mmproj regression + single-authoritative-mmproj sovereignty gate). **Layer B** ADR-005 round-trip — synthetic emitter → `src/inference/vision/mmproj.rs::from_gguf` loader pair (`tests/convert_vision_tower_adr005_roundtrip.rs`, 1 synthetic + 1 ignored real-model). **Layer C** spec-driven layout — fc1↔ffn_up / fc2↔ffn_down, linear_1↔mm.0 / linear_2↔mm.2, patch-embd transpose, pos-embd F16 cast from F32 + BF16 (byte-correct). 32 new unit tests green. `18cbaaa` added legacy-backend suppression so `--emit-vision-tower` produces exactly one authoritative mmproj file (sovereignty gate). |
+| P11 — MTP tensor round-trip integrity gate (Decision 19) | ✅ shipped 2026-04-24 | `0a1a7b7` | `tests/convert_qwen35_mtp_roundtrip.rs` (3 tests, dense + MoE synthetic + exact-suffix bisection). **P4 STUB FIXED**: `hf_name_to_gguf` was emitting `blk.mtp{idx}.nextn.*` with a literal "mtp" block label instead of the resolved `blk.{num_hidden_layers}.nextn.*` form llama.cpp + ADR-013 expect. Signature now carries `num_hidden_layers`. Negative assertion in the round-trip tests prevents re-regression. Updated `test_qwen35_mtp_tensor_mapping` to reflect resolved form. **Cross-link** landed in same commit: `docs/adr/diary/ADR-013-qwen35-inference.md` P14 (MTP speculative-decoding execution; planned; blocks on this P11). Bisection note in `docs/converting-qwen35.md` demonstrates how one-letter renames trip the gate. |
+| P12 (implicit) — Arch-table scaffolding (Decision 20) | ⏳ landed within P8 | — | Not a separate phase; Decision 20's `src/arch/` scaffolding ships inside P8. Named here for traceability. Payoff: Gemma parity follow-up ~150 LOC · Ministral (ADR-015) ~200–400 LOC · DeepSeek-V3 (ADR-016) ~200–400 LOC — all vs. ~1500 LOC/arch without this decision. |
+
+## Closure summary (P0–P11 in-flight, 2026-04-24)
+
+| Metric | Value |
+|---|---|
+| Decisions shipped | 19 of 20 (P0–P8 scaffold + P10 module + P11 + P9 foundation complete; P9 real-model shipment hard-blocked on ADR-013 P12) |
+| Phases shipped | P0–P7 complete · P8 scaffolding + preflight + dispatch + Decision 20 + docs/arch-onboarding.md complete (Q4_0 end-to-end runner still pending) · P9 foundation shipped (RealActivationCapture NotReady shim + QualityThresholds drift gates + calibration/eval disjointness test infrastructure) · P10 module + CLI + Layer A + Layer B + Layer C complete · P11 fully shipped + MTP stub fix + ADR-013 P14 cross-link |
+| Commits on worktree `adr-012-p8-p11` | 76 commits ahead of `main` after the 2026-04-24 audit pass (incl. clippy sweep `d74212f` · `6c6222c` · `01d4eca` · `dcc1ed6` and closure-summary refresh `7af590b` · `5041ff3`). Phase commits: `ebec4a1` (P8 scaffold) · `0a1a7b7` (P11 + MTP stub fix + ADR-013 P14 cross-link) · `f33668f` (docs/arch-onboarding.md) · `13d619a` (P10 mmproj emitter + Layer C) · `6a3617c` (P10 Layer A + B) · `448477e` (P9 foundation) · `7d5d6eb` (P5 MoE wire-up fix) · `b136f1e` (RMS +1 wire-up — Q3 resolution) · `b08974e` (P3 V-head reorder wire-up — R2 closure). P8 real-model close-path defects: `47ccddb` parser format · `99bbd0a` error msgs · `b568473` --log-disable · `013a3ed` + `c8baaa1` timestamp sanitizer · `382d474` quant alias · `f0ff204` --with-vision wiring · `14700c3` AppError::Smoke exit-code propagation · `927a458` exit-code anchor. Decision 2 contract fixes: `83b6618` preflight hybrid validator · `ae3a9cf` format_info diagnostic. Decision 1 alias divergence: `57d4bcc` registry aliases · `d37daa4` predicate centralization. Local-dir UX: `3640bb9` exists · `0d47ea1` is_dir · `142a931` config.json. Defense-in-depth tests: `a0e9629` exit-code distinctness · `f918457` ArchEntry invariants · `43d5d14` catalog template invariants · `0c23217` SmokeArgs help · `4991922` --bits+DWQ all-4-variants · `df2cce8` DWQ NoActivationCapture all-4-variants · `6258a8b` DwqArch case-insensitivity · `fab4f69` --with-vision pure-fn tests · `7d30525` --llama-cli-override missing-path. Doc hygiene: `0b30475` P10 status · `e6b1d4f` R2 closure · `e05c9cb` Q1+Q2 · `f22587f` arch-onboarding patterns · `ec69310` DWQ pre-P12 heads-up · `ce3361f` shipping-contract · `393aa84` Status refresh · `12f470e` pending-marker cleanup · `3abe97d` audit insights. |
+| Total tests | **2026-04-24 audit pass:** 1093 passing in both debug and release modes · 0 failing · 11 ignored (real-model gates awaiting HF_TOKEN + disk). Up from 1060 baseline thanks to ~33 new tests added during the audit pass. Per-binary breakdown unchanged from baseline; new tests distributed across smoke_conformance (16, was 15), convert_integration (16, was 14), and src/arch/smoke.rs/conformance.rs/registry.rs unit tests (∆ ~22). |
+| New tests added P8→P11 current state | ≈ 110 (P8 scaffold 46 + smoke_conformance 15 + MTP round-trip 3 + Layer A 3 + Layer B 1 + Layer C 8 + P9 foundation 4 + quality_thresholds 4 + calibration_eval_disjoint 4 + DWQ CLI 2 + real_activation_capture 2 + rms_norm_plus_one 3 + metadata_keys 4 + upstream_citation_drift 6 + Decision 15 non-qwen35 2 + legacy rope_scaling E2E 2) |
+| Benchmark (CI-safe integration only) | `smoke_conformance` + `convert_qwen35_mtp_roundtrip` + `convert_vision_tower_integration` + `convert_vision_tower_adr005_roundtrip` + `quality_thresholds` + `calibration_eval_disjoint` + `convert_qwen35_real_activation_capture` = ~2.5 s total wall |
+| Benchmark (full `cargo test` wall) | 32.3 s (was ~30 s pre-P8; +46 arch unit tests + 23 new integration tests for +2.3 s) |
+| Benchmark (smoke dry-run preflight) | 6 ms end-to-end (exit 2, clean HF_TOKEN-missing path) |
+| LOC inserted P0→P7 | ~8,600 across 8 feature commits (excluding ADR status updates) |
+| LOC remaining P8→P11 (2026-04-24 party-mode refinement) | ~2,400 (P8 ~500 incl. arch-registry · P9 ~700 incl. PPL/KL infra · P10 ~1,000 three-layer defense · P11 ~200) |
+| Clippy status | zero warnings in any ADR-012-touched src/test file (full sweep landed in 2026-04-24 audit pass — commits `d74212f`, `6c6222c`, `01d4eca`, `dcc1ed6`). Remaining warnings in the workspace are all under `iter*_audit` binaries from ADR-009/ADR-013 territory, out of scope. |
+| Sovereignty check | pure Rust; no candle-* added; no llama.cpp runtime artifact referenced; llama.cpp and convert_hf_to_gguf.py consulted as read-only spec sources only |
+| Quality thresholds | DWQ46 PPL ≤ 1.10× F16 · DWQ48 PPL ≤ 1.05× F16 · median KL < 0.02 nats · mmproj cosine anchor ≈ 1.0 within F16 precision |
+| Future-arch payoff | Gemma parity ~150 LOC · Ministral (ADR-015) ~200–400 LOC · DeepSeek-V3 (ADR-016) ~200–400 LOC — all vs ~1500 LOC/arch without Decision 20 |
+| ADR-closure gate | P8–P11 all green · 8 committed smoke transcripts · 4 real-model DWQ GGUFs produced and passing quality thresholds · `tests/fixtures/mmproj-ground-truth.md` landed · ADR-013 P14 cross-link committed |
+
+**Nothing is deferred — remaining work is specified under P8–P11 below.**
+
+A prior draft of this section listed four items as "deferred to follow-up work" (real-model smoke test, DWQ activation calibration, MTP head inference, and vision tower). Per the mantra (`docs/adr/diary/ADR-012-qwen35moe-conversion.md:59` / `~/Documents/mantra.txt`) — **no stubs, no fallback, no "we'll handle it later"** — those four items are now first-class phases of this ADR with full engineer-executable specification (Decisions 16–19, Phases P8–P11). Cross-ADR boundaries are preserved: the conversion-side of each item lives here; forward-pass execution (MTP speculative decoding, ViT compute) remains in ADR-013 and ADR-005 respectively, with the contract between the two defined on this side.
+
+| Previously "deferred" | Now |
+|---|---|
+| Real-model smoke test | **P8** (Decision 16) — `scripts/smoke_test_qwen35.sh` harness, determinism acceptance, transcript artifacts. |
+| DWQ activation calibration for qwen35 / qwen35moe | **P9** (Decision 17) — remove the `NoActivationCapture` guard; wire `RealActivationCapture` from ADR-013 P12; ship Robert's `dwq46` + `dwq48` GGUFs. |
+| MTP head inference | **P11** (Decision 19) — conversion-side MTP tensor round-trip gate against ADR-013's loader. Speculative-decoding execution is a new ADR-013 phase, tracked as a cross-link, not ignored. |
+| Vision tower (Qwen3.6-27B multimodal) | **P10** (Decision 18) — pure-Rust `mmproj-qwen36-F16.gguf` emitter. Replaces the externally-produced mmproj currently on disk (sovereignty). ViT inference remains ADR-005 phase 2c. |
+
+**Key engineering insights (stored in `patterns` namespace):**
+
+- `reorder_v_heads` is NOT self-inverse for nk≠nv → explicit `reorder_v_heads_inverse` helper (P2 caught via round-trip test).
+- P3's `lin_attn_*` prefix was wrong throughout → P4 corrected against `llama-arch.cpp` with line citations per key.
+- `post_attention_layernorm → post_attention_norm` (llama-arch.cpp:367), NOT `ffn_norm`.
+- `config.model_type` (`qwen3_5_moe_text`) is NOT the GGUF arch string; use `config.architectures[0]`.
+- MoE expert dim-order asymmetry: gate/up stack `[N, moe_inter, hidden]`; down stacks `[N, hidden, moe_inter]`.
+- RMS norm +1 verdict: YES for Qwen3.5 per `convert_hf_to_gguf.py:4794-4795`; exclusion: `linear_attn.norm.weight`.
+- `ActivationCapture` was already landed by ADR-013 P12 (`src/inference/models/qwen35/activation_capture.rs`); adopted, not redefined.
+- ArchFamily dispatch order is load-bearing: `qwen3_5` match must come BEFORE generic `qwen` to preserve Gemma regression.
+- **P8 real-model close path was eight-defect deep against mock-only test coverage.** (2026-04-24 audit pass): the smoke harness mock and real `llama-cli` had divergent stderr formats (`loaded tensor 0xN` vs `loaded meta data with N tensors`; `n_eval = N` vs `eval time = ... / N runs`); `--log-disable` suppressed every line the parsers needed; timing decimals + width-padding broke byte-identicality without sanitization; `--quant q4_0` (smoke default) was rejected by the convert clap value-enum (only `q4` registered); `--with-vision` was a documented stub; the synthetic Qwen3.5 fixture in `tests/smoke_conformance.rs` was missing required hparams; and `AppError::Conversion` collapsed all smoke-specific exit codes (2-8) to `1` at the OS process boundary, defeating Decision 16's "distinct non-zero code" contract. Lesson: any subcommand whose CI tests use a mock binary needs an explicit "real-binary release-mode" gate to catch protocol drift.
+- **Decision 2 contract (`resolved_layer_types()` over raw `layer_types`) was violated at two production sites.** (2026-04-24 audit pass): `validate_linear_attention_hybrid` (preflight) and `format_info` (diagnostic) both walked the raw `layer_types` field, which the parser populates as `["attention"; N]` for any config without an explicit per-layer enumeration. A Qwen3.5 config supplying only `full_attention_interval` would silently bypass the hybrid sanity check and render a misleading single-token diagnostic. Lesson: when a contract is documented in the ADR, the audit must specifically grep for raw-field accesses.
+- **Multi-call-site arch-string match patterns drift if duplicated.** Four call sites in `src/models/qwen35/` had each re-spelled the same six-alternative `is_qwen35_*` predicate. A future edit dropping an alias at one site silently produces partially-transformed GGUFs (e.g. V-head reorder applied but expert merge skipped). Fix: centralize via `pub(crate) fn is_qwen35_family_architecture` / `is_qwen35moe_architecture` and refactor every call site.
+
+**Related memories:** `project_qwen36_architecture.md`, `project_model_class_split.md`, `project_pure_rust_crate_factory.md`, `project_mlx_native_is_the_strategic_destination.md`, `feedback_hf2q_sovereignty.md`, `feedback_llama_cpp_over_candle.md`, `feedback_no_broken_windows.md`, `feedback_correct_outcomes.md`
+
+---
+
+## Engineering Mantra (load-bearing — read before every session)
+
+Source: `~/Documents/mantra.txt` (Robert, undated). Quoted verbatim.
+
+> **DO NOT BE LAZY. We have plenty of time to do it right. No short cuts. Never make assumptions. Always dive deep and ensure you know the problem you're solving. Make use of search as needed. Measure 3x, cut once. No fallback. No stub (todo later) code. Just pure excellence, done the right way the entire time. Also recall Chesterton's fence; always understand current fully before changing it.**
+
+**Operational reading for this ADR:**
+
+- **No fallback.** When a Qwen3.5-MoE-specific code path is required (V-head reorder, A_log negation, MROPE section emission, SSM tensor naming, linear-attention layer type), implement it fully in the first cut. No `unimplemented!()`, no "we'll handle shared experts in a follow-up." Either the phase ships conversion-capable code or the phase hasn't shipped.
+- **Chesterton's fence.** The hardcoded `base_bits: 4, sensitive_bits: 6` at `src/main.rs:447-448` exists because DWQ-4-6 is the single validated sensitivity profile for Gemma-4. Before parameterizing, read `src/quantize/dwq.rs` and `src/intelligence/auto_quant.rs` to understand *which* layers DWQ-4-6 chose to promote, and *why* — then widen the preset surface without silently changing gemma's behavior.
+- **Dive deep.** The authoritative references for every decision in this ADR are `/opt/llama.cpp/convert_hf_to_gguf.py` (Qwen2MoeModel → Qwen3NextModel → _LinearAttentionVReorderBase → {Qwen3_5TextModel, Qwen3_5MoeTextModel} chain) and `/opt/llama.cpp/src/llama-arch.{h,cpp}` (LLM_ARCH_QWEN35 + LLM_ARCH_QWEN35MOE metadata key tables). Every TODO in this ADR cites a specific file:line range. Read them.
+- **Absolute sovereignty (`feedback_hf2q_sovereignty.md`, tightened 2026-04-23).** Pure Rust; hf2q and mlx-native are the only repos in our deliverables. No code, Cargo crates, utils, binaries, or derivative artifacts from `/opt/candle` or `/opt/llama.cpp` enter our deliverables — candle is a Rust crate we don't own, same rule as llama.cpp's Python. This applies at build time, test time, and CI time. Reading their source to derive the mathematical specification is fine; using their output to prove our correctness or as a library is not. No new file in this ADR introduces a `candle-*` dependency; ADR-008 is the in-flight cleanup of pre-existing usage. Fixtures and test oracles are produced by our own code on deterministic inputs, with expected outputs derived from the underlying spec (e.g., ggml broadcast semantics produce an unambiguous V-reorder mapping computable from first principles) or hand-authored.
+
+---
+
+## Context
+
+### Business problem
+
+Robert released `jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated` on HuggingFace and needs it converted to a DWQ GGUF named `qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq` in two variants (4-bit and 8-bit base precision) for local inference. This mirrors the existing `gemma-4-26B-A4B-it-ara-abliterated-dwq` workflow that hf2q produced.
+
+**Additional scope (added after initial draft):** Qwen3.6-27B dense (`Qwen3_5ForCausalLM` / `LLM_ARCH_QWEN35`) is also covered. The dense variant shares the linear-attention machinery, MROPE, MTP, and tokenizer with the MoE variant — it differs only in FFN shape (dense feed-forward instead of 256-expert routing), hparams (hidden_size 5120, 64 layers, 24 heads, GQA 6:1, intermediate_size 17408, linear_num_value_heads 48), and HF architecture string. Covering both in one ADR avoids duplicating 90% of the spec into a follow-up.
+
+### Technical problem
+
+hf2q's current convert pipeline (HF safetensors → DWQ → GGUF) is validated only against Gemma-4. Qwen3.6 is the HuggingFace name for a family whose architecture is identical to Qwen3.5 and routes through llama.cpp as two closely-related arches:
+
+- **MoE variant** — `Qwen3_5MoeForCausalLM` → `LLM_ARCH_QWEN35MOE` (`general.architecture="qwen35moe"`)
+- **Dense variant** — `Qwen3_5ForCausalLM` → `LLM_ARCH_QWEN35` (`general.architecture="qwen35"`)
+
+Both are hybrid transformer + linear-attention (Gated DeltaNet / SSM) architectures sharing every structural element except FFN shape. Per `project_qwen36_architecture.md`, these are confirmed by direct reading of the target models' `config.json` (35B-A3B MoE locally on disk, 27B dense fetched during research):
+
+- **Hybrid layer sequence.** 40 layers; 3:1 ratio of `linear_attention` to `full_attention` (full_attention at indices 3, 7, 11, ..., 39). Enforced by `full_attention_interval: 4` and explicitly enumerated in `layer_types: [...]`.
+- **Gated DeltaNet linear-attention blocks.** Distinct tensor family: `linear_attn.in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`, `conv1d`, `A_log`, `dt_bias`, `dt_proj`. SSM state is f32 (`mamba_ssm_dtype: float32`).
+- **Gated full-attention blocks.** `attn_output_gate: true` — new output-gate weight per full-attention block, absent from Gemma.
+- **V-head grouped → tiled reorder.** Linear attention uses `num_k_heads=16, num_v_heads=32` → 2 V heads per K head. HF stores V heads grouped by K head; ggml binary ops expect tiled broadcast. Off-by-one in the reorder = silent corruption of decode output.
+- **MROPE (multi-axis RoPE) with partial rotary.** `partial_rotary_factor: 0.25` → 64 rotated dims per head of 256. `mrope_section: [11, 11, 10]` (sum = 32 = rotary_dim / 2). `mrope_interleaved: true`. `rope_theta: 10,000,000`.
+- **(MoE variant only) 256 experts, 8 active, plus shared experts.** `num_experts: 256`, `num_experts_per_tok: 8`, `shared_expert_intermediate_size: 512` (YES shared experts), `moe_intermediate_size: 512`. Total MoE layer expert tensors: 256 × 3 (gate/up/down) + 3 shared = 771 per MoE layer × 40 layers ≈ 30,840 expert tensors.
+- **(Dense variant only) standard FFN.** `intermediate_size: 17408`, standard `mlp.gate_proj` / `mlp.up_proj` / `mlp.down_proj` per layer. No router, no experts. 64 FFN layers total.
+- **MTP head.** `mtp_num_hidden_layers: 1` — one Multi-Token Prediction block (DeepSeek-V3 style). Open question whether conversion emits or drops these tensors.
+- **New vocabulary (both variants).** `vocab_size: 248320`, not the 151K Qwen2/Qwen3 vocab. `bos_token_id == eos_token_id == 248044`.
+
+**Variant hparam summary (source: `project_qwen36_architecture.md`):**
+
+| Field | Qwen3.6-27B dense (qwen35) | Qwen3.6-35B-A3B MoE (qwen35moe) |
+|---|---|---|
+| hidden_size | 5120 | 2048 |
+| num_hidden_layers | 64 | 40 |
+| num_attention_heads | 24 | 16 |
+| num_key_value_heads | 4 (GQA 6:1) | 2 (GQA 8:1) |
+| linear_num_value_heads | 48 | 32 |
+| head_dim | 256 | 256 |
+| intermediate_size | 17408 (dense FFN) | — |
+| moe_intermediate_size | — | 512 |
+| shared_expert_intermediate_size | — | 512 |
+| num_experts | — | 256 |
+| num_experts_per_tok | — | 8 |
+| full_attention_interval | 4 | 4 |
+| partial_rotary_factor | 0.25 | 0.25 |
+| rope_theta | 10_000_000 | 10_000_000 |
+| mrope_section | [11,11,10] | [11,11,10] |
+| mtp_num_hidden_layers | 1 | 1 |
+| vocab_size | 248320 | 248320 |
+| Multimodal | Yes (27-layer ViT, patch_size=16) — text side in scope | Text-only (vision config dropped) |
+
+### Current state inventory (what exists in hf2q today)
+
+The gap between "Gemma works" and "Qwen3.5-MoE works" was mapped by direct reading of the codebase:
+
+| Component | State |
+|---|---|
+| `src/input/config_parser.rs` | Extracts generic HF fields (architectures, hidden_size, num_experts, num_experts_per_tok, num_attention_heads, num_key_value_heads, num_hidden_layers). **Missing** every Qwen3.5-specific field. |
+| `src/backends/gguf.rs` | Handles `gemma4`, `llama`-family default tensor renames (line 1469: covers `llama, mistral, qwen2, qwen3, phi`). **No `qwen35moe` arch string, no `qwen35moe.*` metadata emission.** Unit test at `:2382` asserts `qwen3` dense tensor rename only. |
+| `src/preflight.rs::SUPPORTED_LAYER_TYPES` | Supports `attention, full_attention, sliding_attention, moe_attention, linear, mlp, feedforward, ffn, dense, self_attention, cross_attention, grouped_query_attention`. **`linear_attention` is absent.** |
+| `src/models/` | Gemma-specific model file(s). **No qwen35moe file.** |
+| `src/quantize/dwq.rs` | `DwqConfig { base_bits, sensitive_bits, ... }` parameterized internally. Default `base_bits: 4, sensitive_bits: 6`. |
+| `src/main.rs:447-448` | DWQ dispatch **hardcodes** `base_bits: 4, sensitive_bits: 6` regardless of `config.bits`. `--bits` flag silently ignored for DWQ path. **Broken window.** |
+| `src/cli.rs:336-337` | `QuantMethod::DwqMixed46` is the **only** DWQ enum variant. No DwqMixed48 or parameterized parser. |
+| `src/intelligence/auto_quant.rs` | Routes `arch.contains("qwen")` to `DenseDecoder`; MoE Qwen falls into `GenericMoE`. Sensitivity heuristic **tuned on Gemma's homogeneous transformer blocks**; not hybrid-arch-aware. |
+| `src/input/hf_download.rs` | Uses `hf_hub::api::sync::ApiBuilder` with `huggingface-cli` fallback. Unknown behavior for 35B × ~40 safetensors shards, LFS resumption, disk-space preflight. |
+| `docs/` | Zero hits for `hf2q convert` as canonical example. Gemma conversion command is oral history. |
+| `tests/convert_integration.rs` | Gemma-only. No hybrid-arch or qwen35moe coverage. |
+
+### Why this blows up the Gemma pattern
+
+Every architectural element above maps to a gate in the existing code that currently only lets Gemma through. Attempting `hf2q convert --repo jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated --format gguf --quant dwq-mixed-4-6` today will fail at config parsing before it reaches weight loading — `layer_types` is an unrecognized field, `full_attention_interval` doesn't exist in the parser, `linear_attention` fails preflight.
+
+---
+
+## Strategic Decision
+
+**hf2q implements Qwen3.5 (dense) and Qwen3.5-MoE conversion natively in pure Rust. No Python prerequisite. No runtime linkage to candle or llama.cpp. `/opt/mlx-native` is the only sibling repo we depend on.**
+
+This is the application of `feedback_hf2q_sovereignty.md` to the specific question of Qwen3.5 / Qwen3.5-MoE support. Path B (ride on llama.cpp's `convert_hf_to_gguf.py` as a prerequisite, and implement only a GGUF → DWQ → GGUF re-quantization pass in hf2q) was considered and explicitly rejected. Rationale: it would collapse hf2q's identity as a full-pipeline pure-Rust alternative to the Python + C++ status quo. Every future arch that llama.cpp adds (Qwen3-Next, Qwen3.5-VL, DeepSeek-V3, Llama-5, Grok, …) is ported into hf2q on landing.
+
+**Both variants in one ADR:** Dense and MoE share ≥90% of the conversion surface (config parser, linear-attention tensor transforms, V-head reorder, MROPE, MTP, tokenizer, arch routing infrastructure). Only FFN layout differs. Splitting into ADR-012 (MoE) + ADR-013 (dense) would duplicate most of the spec into two documents for a single LOC-cheap variant. Keeping them together makes the shared surface explicit and the variant-specific differences cleanly scoped to the decisions where they matter.
+
+**Arch-table-driven scaffolding (2026-04-24 refinement — Decision 20).** P8 (smoke harness), P10 (mmproj round-trip pattern), and P11 (MTP round-trip pattern) are designed as arch-agnostic infrastructure from the first keystroke rather than Qwen-specific code refactored later. The concrete next consumers of this scaffolding — **Gemma4 (parity follow-up), Ministral (ADR-015), and DeepSeek-V3 (ADR-016)** — are named up front so the cost of generalizing today is justified by the second and third arches becoming thin (add-a-row-to-the-arch-registry instead of write-a-new-harness). See Decision 20 and the "Arch-Table Scaffolding" section below for the concrete `src/arch/` module layout.
+
+**Per-arch specialization bias stands.** Shared scaffolding does not mean uniform treatment: where a Qwen-specific transform (V-head reorder, A_log negation, MROPE partial-rotary, SSM state tensors) gives a better outcome than a generic abstraction, it stays Qwen-specific. The mantra clause "Just pure excellence, done the right way the entire time" applies per arch; shared infra is for the *conformance surface* (smoke, round-trip, catalog registry), not for model-specific mathematics.
+
+---
+
+## Non-Goals
+
+Each of these is explicitly *not* in this ADR's scope. They are named so that the ADR's acceptance criteria can be measured against a bounded surface.
+
+1. **Inference / forward-pass graph construction.** The inference session owns the Rust port of `Qwen3_5TextModel` and `Qwen3_5MoeTextModel` forward for execution, including GATED_DELTA_NET / SSM_CONV / TRI_SOLVE / L2_NORM / CumSum Metal kernels in `/opt/mlx-native`. This ADR consumes the inference engine only as a callable activation-capture backend for DWQ calibration (Phase P6). The inference port's ADR is separate.
+2. **Tokenizer runtime changes.** The Qwen3.5 tokenizer (248K vocab) is embedded in the output GGUF via the existing tokenizer-embedding pipeline. If the existing `_set_vocab_qwen` equivalent in hf2q is sufficient for the new vocab, no work. If not, a follow-up ADR.
+3. **Vision tower *forward-pass execution* (ViT compute, image patching, projection-into-text-stream merge).** Owned by ADR-005 phase 2c. **In scope for this ADR:** pure-Rust **conversion** of HF ViT safetensors → `mmproj-qwen36-F16.gguf` (Decision 18 / Phase P10). The externally-produced `mmproj-qwen36-F16.gguf` currently sitting in `models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/` is the sovereignty gap this ADR closes.
+4. **MTP speculative-decoding *execution* (draft-accept loops, rejection sampling, n-token speculation).** Owned by ADR-013 (new phase, tracked via Decision 19's cross-link). **In scope for this ADR:** (a) lossless MTP tensor emission (Decision 11, already shipped in P4), (b) round-trip integrity gate proving ADR-013's loader accepts those tensors with correct shapes and names (Decision 19 / Phase P11). Without P11, Decision 11's emitted MTP tensors are cosmetic — the gate exists precisely to prevent that outcome.
+5. **Byte-level inference-parity sourdough gate against an external reference** (the analogue of `scripts/sourdough_gate.sh` that compares our inference bytes to llama.cpp's). Remains owned by ADR-013. **What this ADR *does* measure, per 2026-04-24 party-mode refinement:** DWQ quant-quality ACs in P9 compare hf2q's DWQ output against our own F16 forward (ADR-013's inference path) via perplexity + KL-divergence on a held-out eval corpus — i.e., correctness-biased quant-quality measurement, not inference parity against an external oracle. Cross-ADR dependency on ADR-013 F16 correctness is an implicit handoff (single author both sides); silent-failure mode where ADR-013 F16 has a numerical skew is a known accepted risk (R12).
+6. **Rewrite of the DWQ sensitivity heuristic.** We extend it for the hybrid case; we don't redesign it from scratch. If Phase P6 reveals the existing approach is fundamentally wrong for hybrid arch, that is a follow-up ADR.
+
+---
+
+## Reference Implementations (authoritative)
+
+Every porting decision in this ADR has an upstream reference. These file:line citations are entry points — llama.cpp is a moving target, so verify against the current HEAD of `/opt/llama.cpp` (commit `8bc492ebb` as of 2026-04-24 per `project_qwen36_architecture.md`) before starting.
+
+### Python converter class chain (study order, top-down)
+
+1. `/opt/llama.cpp/convert_hf_to_gguf.py:4553` — `class Qwen2MoeModel(TextModel)`. Base for MoE tensor naming, expert merge, router handling.
+2. `/opt/llama.cpp/convert_hf_to_gguf.py:4770` — `class Qwen3NextModel(Qwen2MoeModel)`. Adds linear-attention conversion: A_log negation, dt_bias rename, conv1d squeeze, in_proj_qkvz reordering.
+3. `/opt/llama.cpp/convert_hf_to_gguf.py:5259` — `class _LinearAttentionVReorderBase(Qwen3NextModel)`. The grouped-to-tiled V-head reorder. Six cases (in_proj_qkv, in_proj_z, in_proj_a/b, A_log / dt_bias / dt_proj, conv1d, out_proj). Implementation at `:5375-5424`.
+4. `/opt/llama.cpp/convert_hf_to_gguf.py:5428` — `class Qwen3_5TextModel(_LinearAttentionVReorderBase)`. Terminal class for dense variant; `model_arch = gguf.MODEL_ARCH.QWEN35`.
+5. `/opt/llama.cpp/convert_hf_to_gguf.py:5433` — `class Qwen3_5MoeTextModel(_LinearAttentionVReorderBase)`. Terminal class for MoE variant; `model_arch = gguf.MODEL_ARCH.QWEN35MOE`.
+
+### C++ loader & metadata keys
+
+6. `/opt/llama.cpp/src/llama-arch.cpp:42-43` — `{ LLM_ARCH_QWEN35, "qwen35" }` and `{ LLM_ARCH_QWEN35MOE, "qwen35moe" }`. The arch strings hf2q must emit as `general.architecture` per variant.
+7. `/opt/llama.cpp/src/llama-arch.cpp:860` — `case LLM_ARCH_QWEN35MOE:` (and the adjacent `LLM_ARCH_QWEN35` case in the same switch) in `llm_arch_is_hybrid` (or equivalent predicate). Confirms upstream treats both as hybrid state-space/attention architectures.
+8. `/opt/llama.cpp/src/llama-arch.h` + `llama-arch.cpp` — `LLM_KV_*` enum and the `LLM_KV_NAMES[]` table (starts around `:180`). Every key the loader reads must be emitted by hf2q. This is the authoritative list; do not derive from blog posts or the GGUF file's observed keys alone.
+9. `/opt/llama.cpp/src/models/qwen35.cpp` — dense variant graph builder (~15 KB). Tells us which tensors the dense loader expects to find by name.
+10. `/opt/llama.cpp/src/models/qwen35moe.cpp` — MoE variant graph builder (~17 KB). Tells us which tensors the MoE loader expects to find by name.
+11. `/opt/llama.cpp/src/models/delta-net-base.cpp` — linear-attention compute (~16 KB; shared by both variants). Informs which SSM-family tensors are load-bearing and which are optional.
+
+### Existing local reference: the `apex.gguf` on disk
+
+`/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf` (25 GB, `general.file_type=17` i.e. IQ2_XS) was produced outside hf2q by an external invocation of `convert_hf_to_gguf.py` + `llama-quantize`. It exists on Robert's disk as a convenience reference. **It is NOT a test oracle, NOT a checked-in fixture, and NOT a CI dependency** per the sovereignty directive. If an engineer wants to look at it during development to understand what keys/tensors a reference implementation emits, that's fine — like reading llama.cpp source code. What's not fine is writing an assertion that compares hf2q's output against it.
+
+---
+
+## Architecture Decisions
+
+Each decision below specifies: **Problem** (what breaks today), **Decision** (what we do), **Acceptance Criteria** (how we know it's done). Decisions are numbered for citation from commits and follow-up issues.
+
+### 1. Arch string and routing
+
+**Problem.** `src/backends/gguf.rs` has no routing for `qwen35` or `qwen35moe`. Without it, `general.architecture` is wrong and llama.cpp refuses to load the file.
+
+**Decision.** Add both `qwen35` (dense) and `qwen35moe` (MoE) as recognized arches. Detection source:
+
+- `config.json::architectures[0] == "Qwen3_5ForCausalLM"` → arch string `"qwen35"`
+- `config.json::architectures[0] == "Qwen3_5MoeForCausalLM"` → arch string `"qwen35moe"`
+
+Dispatch per-arch tensor-rename tables and metadata-emission logic off the arch string. Follow `project_model_class_split.md`: arch-specific code lives in two sibling files sharing a common module:
+
+- `src/models/qwen35/mod.rs` — shared linear-attention transforms, MROPE, tokenizer, MTP logic (common to both variants)
+- `src/models/qwen35/dense.rs` — `qwen35`-specific metadata and tensor naming (dense FFN)
+- `src/models/qwen35/moe.rs` — `qwen35moe`-specific metadata and tensor naming (expert merge, shared experts)
+
+`src/backends/gguf.rs` holds only dispatch by arch string.
+
+**Acceptance criteria.**
+- Unit tests in `src/backends/gguf.rs` mirroring the existing test at `:2382`, one per arch: for `qwen35` and `qwen35moe`, `hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", arch)` returns the correct GGUF name (`blk.0.post_attention_norm` per llama.cpp's Gemma convention OR `blk.0.ffn_norm` per LLaMA — determined by reading `/opt/llama.cpp/src/models/qwen35.cpp` and `qwen35moe.cpp`; the test MUST match what the loader reads).
+- `hf2q convert --repo <Qwen3.5 dense repo> --format gguf --quant dwq-mixed-4-6` emits `general.architecture = "qwen35"`.
+- `hf2q convert --repo <Qwen3.5-MoE repo> --format gguf --quant dwq-mixed-4-6` emits `general.architecture = "qwen35moe"`.
+- Integration test Phase P7 asserts both keys are present and correct in their respective variants' outputs.
+
+### 2. Config parser extensions
+
+**Problem.** `src/input/config_parser.rs` doesn't extract the Qwen3.5-specific fields. `project_qwen36_architecture.md` enumerates them all; the parser is missing ≥12 of them.
+
+**Decision.** Extend the parsed config struct with:
+- `layer_types: Option<Vec<String>>` — per-layer attention type string array
+- `full_attention_interval: Option<u32>`
+- `attn_output_gate: Option<bool>`
+- `head_dim: Option<u32>` (explicitly decoupled; must not be derived from hidden_size/num_heads when present)
+- `partial_rotary_factor: Option<f32>`
+- `rope_parameters: Option<RopeParameters>` with nested fields: `mrope_interleaved: bool`, `mrope_section: Vec<u32>`, `rope_theta: f64`, `rope_type: String`, `partial_rotary_factor: f32`
+- `linear_conv_kernel_dim: Option<u32>`
+- `linear_key_head_dim: Option<u32>`
+- `linear_num_key_heads: Option<u32>`
+- `linear_value_head_dim: Option<u32>`
+- `linear_num_value_heads: Option<u32>`
+- `mamba_ssm_dtype: Option<String>` (validated as one of `"float32"`, `"bfloat16"`, `"float16"`)
+- `moe_intermediate_size: Option<u32>`
+- `shared_expert_intermediate_size: Option<u32>`
+- `mtp_num_hidden_layers: Option<u32>`
+- `mtp_use_dedicated_embeddings: Option<bool>`
+- `output_router_logits: Option<bool>`
+- `router_aux_loss_coef: Option<f32>`
+
+Support both `full_attention_interval` (computed) and `layer_types` (explicit enumeration); prefer explicit when present (gotcha #9 from `project_qwen36_architecture.md`).
+
+**Acceptance criteria.**
+- Unit test loads `/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/config.json` and asserts all fields parse with the correct values (head_dim=256, num_experts=256, num_experts_per_tok=8, rope_theta=10_000_000, mrope_section=[11,11,10], full_attention_interval=4, layer_types.len()==40, layer_types[3]==`"full_attention"`, layer_types[0]==`"linear_attention"`, shared_expert_intermediate_size=512, etc.).
+- Unit test loads Gemma-4-26B-A4B `config.json` and asserts existing parsing is unaffected (regression guard).
+- Malformed config (missing required-for-qwen35moe fields when arch is qwen35moe) returns an error with a clear message identifying the missing field — not silent zero-filling.
+
+### 3. Preflight: `linear_attention` layer type
+
+**Problem.** `src/preflight.rs::SUPPORTED_LAYER_TYPES` at `:8-22` doesn't include `linear_attention`. Preflight fails before conversion starts.
+
+**Decision.** Add `"linear_attention"` to the `SUPPORTED_LAYER_TYPES` constant. Cross-reference that if `config.layer_types.contains("linear_attention")`, at least one `full_attention` entry exists (sanity check against misconfigured models).
+
+**Acceptance criteria.**
+- Preflight passes on the apex model's config.
+- Preflight on a synthetic config with 100% `linear_attention` layers fails with a clear error (hybrid arch requires at least one full-attention layer for KV state anchoring).
+
+### 4. New module: `src/models/qwen35/`
+
+**Problem.** No files exist to hold Qwen3.5-family-specific logic. Per `project_model_class_split.md`, arch-specific code must live under `models/`, not in generic infrastructure. Dense and MoE share most of the transform code; a shared submodule avoids duplication.
+
+**Decision.** Create `src/models/qwen35/` with three files:
+
+**`src/models/qwen35/mod.rs`** — shared (dense + MoE) logic:
+- `pub struct Qwen35ConvertContext { arch: Qwen35Arch, /* parsed hparams */ }` where `Qwen35Arch` is an enum `Dense | Moe`
+- `pub fn transform_linear_attn_tensor(...)` — V-head reorder, A_log negation, conv1d squeeze, in_proj_qkvz reordering (shared by both variants; linear attention is identical across dense and MoE)
+- `pub fn is_linear_attention_layer(layer_idx: usize, ctx: &Qwen35ConvertContext) -> bool`
+- `pub fn is_full_attention_layer(...)` — complement
+- Shared tensor-name transforms for full-attention layers (they're identical between dense and MoE)
+- MTP tensor naming (identical)
+- Shared metadata keys emitted by both arches (`general.architecture` routing, tokenizer, rope, full_attention_interval, linear-attn hparams)
+
+**`src/models/qwen35/dense.rs`** — dense-specific:
+- `pub fn hf_tensor_name_to_gguf_dense(hf_name: &str, ctx: &Qwen35ConvertContext) -> String` — standard `mlp.{gate,up,down}_proj` mapping
+- `pub fn emit_metadata_dense(writer: &mut GgufWriter, ctx: &Qwen35ConvertContext) -> Result<()>` — writes `qwen35.*` keys including `feed_forward_length` (intermediate_size)
+
+**`src/models/qwen35/moe.rs`** — MoE-specific:
+- `pub fn hf_tensor_name_to_gguf_moe(hf_name: &str, ctx: &Qwen35ConvertContext) -> String` — routes `mlp.experts.{E}.{gate,up,down}_proj` to merged `ffn_*_exps`; shared experts to `ffn_*_shexp`; router to `ffn_gate_inp`
+- `pub fn merge_expert_tensors(...)` — 256-expert stacking (see Decision 9)
+- `pub fn emit_metadata_moe(writer: &mut GgufWriter, ctx: &Qwen35ConvertContext) -> Result<()>` — writes `qwen35moe.*` keys including `expert_count`, `expert_used_count`, `expert_feed_forward_length`, `expert_shared_feed_forward_length`
+
+Dispatch from `src/backends/gguf.rs` based on `ctx.arch`. Gemma logic stays where it is; no refactor of Gemma in this ADR.
+
+**Acceptance criteria.**
+- Module `src/models/qwen35/` exists with all three files and the public API above.
+- Module registered in `src/models/mod.rs`.
+- Per-transform unit tests cover all 10 gotchas from `project_qwen36_architecture.md`; each applicable gotcha is tested once in the shared `mod.rs` tests (linear-attn transforms) and once per variant where dense-vs-MoE semantics differ (expert merge is MoE-only; dense FFN naming is dense-only).
+
+### 5. V-head grouped → tiled reorder
+
+**Problem.** Linear attention has `num_k_heads=16, num_v_heads=32` (Qwen3.5-MoE 35B) or `num_k_heads=16, num_v_heads=48` (Qwen3.5 27B dense). HF stores V heads grouped by K head (`[G0_v0..v{r-1}, G1_v0..v{r-1}, ...]`); ggml binary ops expect tiled broadcast (`[K0, K1, ..., K0, K1, ...]`). Off-by-one = silent corruption.
+
+**Decision.** Port the six cases in `/opt/llama.cpp/convert_hf_to_gguf.py:5375-5424` verbatim to Rust. Each case matches a suffix in `hf_name`:
+- `.linear_attn.in_proj_qkv.weight` — reorder V rows only (positions after `q_dim + k_dim`)
+- `.linear_attn.in_proj_z.weight` — reorder rows (num_v_heads * head_v_dim)
+- `.linear_attn.in_proj_b.weight` / `.linear_attn.in_proj_a.weight` — reorder rows (num_v_heads, head_dim=1)
+- `.A_log` / `.dt_bias` / `.dt_proj` — 1D parameters with num_v_heads elements; reorder along last dim
+- `.conv1d` — reorder only the V channel portion (channels after `head_k_dim * num_k_heads * 2`)
+- `.linear_attn.out_proj.weight` — reorder columns (input dimension)
+
+Use the same helper logic: `reorder_v_heads(tensor, dim, num_k_heads, num_v_per_k, head_dim)`.
+
+**Acceptance criteria.**
+- Unit test per case: construct a tensor with known marker values at each V-head position, apply the transform, assert the output has markers at the expected tiled positions. Expected positions are derived analytically from ggml broadcast semantics and hand-authored as a constant in the test file (commented with the derivation), not copied from any external tool's output.
+- Round-trip test: apply the reorder, apply its inverse (derivable from the same params), assert byte-identical to input. This protects against bugs where the reorder is partially correct (permutation subset applied twice).
+- Specification-driven test: for a small reference case (e.g., num_k_heads=2, num_v_per_k=2, head_dim=4), hand-author the complete expected permutation map in the test, with a code comment deriving it from ggml broadcast semantics (the rule: ggml binary ops expect `[K0, K1, ..., K0, K1, ...]` tiled order; HF stores `[G0_v0..v{r-1}, G1_v0..v{r-1}, ...]` grouped). The test is the specification.
+
+### 6. Qwen-specific tensor transforms (non-V-reorder)
+
+**Problem.** Multiple conversion-time tensor transforms Qwen3.5 requires that Gemma doesn't.
+
+**Decision.** Implement each transform in `src/models/qwen35/mod.rs` (shared by dense and MoE variants, since linear-attention tensors are structurally identical across both):
+
+| Transform | Trigger | Action |
+|---|---|---|
+| A_log negation | Tensor name ends with `.A_log` | Output = `-exp(input)`. Miss it → NaN on inference. Gotcha #2 from project_qwen36_architecture.md. |
+| dt_bias rename | Tensor name ends with `.dt_bias` | Rename to `.dt_proj.bias` per llama.cpp convention. Gotcha #3. |
+| conv1d squeeze | Tensor name ends with `.conv1d.weight` and shape is `[k, 1, d]` | Squeeze dim 1 to produce `[k, d]`. Gotcha #4. |
+| in_proj_qkvz reorder | Tensor name ends with `.linear_attn.in_proj_qkvz.weight` (fused variant) | Split into Q/K/V/Z head-grouped reorder. Gotcha #6. |
+| RMS norm +1 bias | Tensor name ends with `_norm.weight` or similar norm tensor | Qwen uses `gamma + 1` convention. Gotcha #5. **Audit decision pending**: verify whether Qwen3.5 specifically still uses +1 (some Qwen2/Qwen3 variants don't) — check `qwen35moe.cpp`'s `build_norm` calls. |
+
+**Acceptance criteria.**
+- One unit test per transform with hand-constructed fixtures.
+- A_log transform test asserts `|output + exp(input)| < 1e-6` for random inputs.
+- Conv1d squeeze test asserts shape change and byte-identical data.
+- An audit note in `src/models/qwen35/mod.rs` documents whether Qwen3.5 RMS norm adds +1 (with citation to the specific llama.cpp line consulted). Audit applies to both variants since norm handling is shared.
+
+### 7. GGUF metadata emission for `qwen35.*` and `qwen35moe.*`
+
+**Problem.** llama.cpp's `qwen35` and `qwen35moe` loaders read specific sets of `qwen35.*` / `qwen35moe.*` keys. Without them, the file loads and silently produces wrong output. The sets overlap heavily but diverge on MoE-specific keys.
+
+**Decision.** Emit every metadata key the loader reads, namespaced under the correct arch prefix. The authoritative list is extracted by reading `LLM_KV_*` references in `/opt/llama.cpp/src/models/qwen35.cpp` + `qwen35moe.cpp` and `/opt/llama.cpp/src/llama-arch.{h,cpp}`. Initial catalog (engineer must verify against HEAD):
+
+**General / standard transformer keys (both arches, namespaced `qwen35.*` for dense, `qwen35moe.*` for MoE):**
+- `block_count` (dense = 64; MoE = 40)
+- `context_length` (= max_position_embeddings = 262144 for both)
+- `embedding_length` (dense = 5120; MoE = 2048)
+- `feed_forward_length` (dense = intermediate_size = 17408; MoE = 0 or absent — dense FFN not used)
+- `attention.head_count` (dense = 24; MoE = 16)
+- `attention.head_count_kv` (dense = 4; MoE = 2)
+- `attention.head_key_length` (= head_dim = 256; MUST emit explicitly since decoupled from hidden_size/num_heads)
+- `attention.head_value_length` (= head_dim = 256)
+- `attention.layer_norm_rms_epsilon` (= rms_norm_eps = 1e-6 for both)
+- `attention.output_gate` (= attn_output_gate = true for both)
+
+**MoE-only keys (`qwen35moe.*`):**
+- `expert_count` (= num_experts = 256)
+- `expert_used_count` (= num_experts_per_tok = 8)
+- `expert_feed_forward_length` (= moe_intermediate_size = 512)
+- `expert_shared_feed_forward_length` (= shared_expert_intermediate_size = 512)
+
+**Hybrid / linear-attention (both arches):**
+- `full_attention_interval` (= 4)
+- `layer_types` as a string array OR a compact encoding per llama.cpp's convention (verify against `qwen35.cpp` + `qwen35moe.cpp` load paths; format must be identical across both arches since they share the hybrid machinery)
+- Linear-attention hparams: conv_kernel_dim, key_head_dim, num_key_heads, value_head_dim, num_value_heads (exact key names per llama.cpp — use `grep LLM_KV_SSM` and `grep LLM_KV_LINEAR` in `/opt/llama.cpp/src/llama-arch.cpp`). Values differ between variants (e.g., dense `linear_num_value_heads=48` vs MoE `=32`).
+
+**RoPE:**
+- `rope.dimension_count` (= rotary_dim = 64)
+- `rope.freq_base` (= rope_theta = 10_000_000)
+- `rope.dimension_sections` as `[mrope_section..., 0]` padded to 4 slots (see `convert_hf_to_gguf.py:1149-1155` — pad to length 4 with zeros, call `add_rope_dimension_sections`)
+- `rope.mrope_interleaved` (= true)
+
+**MTP:**
+- `mtp_num_hidden_layers` (= 1) — or the llama.cpp-named `nextn_predict_layers` (see `llama-arch.cpp:194`). Use whatever the loader reads.
+
+**Tokenizer / vocab (standard pipeline, but verify the Qwen3.5 vocab loads correctly):**
+- `tokenizer.ggml.model`, `tokens`, `merges`, `scores`, `token_type`, `bos_token_id`, `eos_token_id`, `pad_token_id`, `chat_template`, `pre` — per ADR-004 decision 5.
+
+**Acceptance criteria.**
+- The authoritative lists of required `qwen35.*` and `qwen35moe.*` keys are derived by reading `/opt/llama.cpp/src/llama-arch.{h,cpp}` (`LLM_KV_*` enum + KV_NAMES table) and `/opt/llama.cpp/src/models/{qwen35.cpp, qwen35moe.cpp}` (which keys each loader actually reads), and hand-transcribed into constant lists in `src/models/qwen35/dense.rs` and `src/models/qwen35/moe.rs` respectively — with shared keys factored into `src/models/qwen35/mod.rs`. Each entry carries a code comment citing the source file:line. No binary produced by llama.cpp is consulted as an automated check.
+- Unit test: `emit_metadata()` called on a known `Qwen35MoeConvertContext` produces a GGUF metadata section containing every key in the hand-transcribed list with the expected value.
+- Regression: whenever the list is updated (because llama.cpp added a new key in a new release and Robert wants to support it), the PR description cites the llama.cpp file:line where the new key was added.
+
+### 8. Tensor naming for hybrid layers
+
+**Problem.** Full-attention layers (every 4th — indices 3, 7, ..., L-1 where L=num_hidden_layers) and linear-attention layers (all others) have completely different tensor sets within the same variant. Additionally, dense and MoE variants differ entirely in their FFN-side tensor naming. GGUF block indices must be the same per layer, but tensor names must differ per (arch, layer type) pair.
+
+**Decision.** In `hf_tensor_name_to_gguf_{dense,moe}()`:
+
+**For full-attention layers** (HF `model.layers.{L}.self_attn.*`):
+- `q_proj.weight` → `blk.{L}.attn_q.weight`
+- `k_proj.weight` → `blk.{L}.attn_k.weight`
+- `v_proj.weight` → `blk.{L}.attn_v.weight`
+- `o_proj.weight` → `blk.{L}.attn_output.weight`
+- `q_norm.weight` → `blk.{L}.attn_q_norm.weight`
+- `k_norm.weight` → `blk.{L}.attn_k_norm.weight`
+- Output gate (new in qwen35moe; locate exact HF name — likely `self_attn.output_gate.weight` or `self_attn.gate_proj.weight` — verify in HF model): → `blk.{L}.attn_gate.weight` (LLM_TENSOR_ATTN_GATE at `llama-arch.cpp:370`)
+
+**For linear-attention layers** (HF `model.layers.{L}.linear_attn.*`):
+- Map each of `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`, `conv1d`, `A_log`, `dt_bias`, `dt_proj`, norms to the corresponding llama.cpp `blk.{L}.ssm.*` / `blk.{L}.linear_attn.*` names. Exact names per llama.cpp's `LLM_TENSOR_*` enum in `src/llama-arch.h` — verify, do not guess.
+
+**For both layer types:**
+- `input_layernorm.weight` → `blk.{L}.attn_norm.weight`
+- `post_attention_layernorm.weight` → depends on llama.cpp's Qwen3.5 convention — either `blk.{L}.post_attention_norm` (Gemma convention) or `blk.{L}.ffn_norm` (LLaMA convention). **Read qwen35moe.cpp and verify.** Do not assume.
+
+**FFN (every layer) — variant-specific:**
+
+*Dense (`qwen35`):*
+- `mlp.gate_proj.weight` → `blk.{L}.ffn_gate.weight`
+- `mlp.up_proj.weight` → `blk.{L}.ffn_up.weight`
+- `mlp.down_proj.weight` → `blk.{L}.ffn_down.weight`
+
+*MoE (`qwen35moe`):*
+- `mlp.gate.weight` → `blk.{L}.ffn_gate_inp.weight` (router)
+- `mlp.experts.{E}.gate_proj.weight` for E in 0..256 → merged into `blk.{L}.ffn_gate_exps.weight` shape `[256, moe_intermediate_size, hidden_size]`
+- Same for `up_proj` → `ffn_up_exps` and `down_proj` → `ffn_down_exps`
+- `mlp.shared_experts.gate_proj.weight` → `blk.{L}.ffn_gate_shexp.weight`
+- Same for `up_proj` and `down_proj`
+
+**Output head:**
+- `model.embed_tokens.weight` → `token_embd.weight`
+- `lm_head.weight` → `output.weight` (or tied to embed if `tie_word_embeddings=false` … verify; the target model has `tie_word_embeddings: false`, so lm_head is independent)
+- `model.norm.weight` → `output_norm.weight`
+
+**MTP head (both variants; see Decision 11):**
+- Emitted as `blk.{num_hidden_layers}.nextn.*` tensors (block 40 for MoE, block 64 for dense) per the `LLM_TENSOR_NEXTN_*` names at `llama-arch.cpp:447-450`.
+
+**Acceptance criteria.**
+- Unit test per layer type (full vs linear) with a synthetic tensor name list → expected GGUF name list.
+- Integration test (Phase P7) extracts all tensor names from hf2q's output GGUF and asserts the set matches the set in apex.gguf modulo mmproj tensors and quantization-type suffixes.
+
+### 9. MoE expert tensor merge (MoE variant only — arch-gated no-op for dense)
+
+**Problem.** For the MoE variant, HF stores each expert as a separate tensor (`model.layers.{L}.mlp.experts.{E}.gate_proj.weight` for E in 0..256). GGUF expects a single 3D tensor per projection per layer. The dense variant has no experts and skips this entirely.
+
+**Decision.** This decision applies only when `ctx.arch == Qwen35Arch::Moe`. The dense variant's FFN tensors go through standard per-tensor emission without merge.
+
+For the MoE variant: collect all 256 per-expert tensors for a given layer × projection combination, stack along a new first axis, and emit as a single 3D tensor. Perform this per-layer to avoid 40 × 256 × 3 = 30,720 tensor holds in memory simultaneously. Streaming: emit layer N's expert-merged tensor before starting layer N+1. Mirror ADR-004 decision 8's memory discipline.
+
+Shared experts are **not** merged — they're singletons: `ffn_gate_shexp`, `ffn_up_shexp`, `ffn_down_shexp`.
+
+**Acceptance criteria.**
+- Unit test (MoE): builds 4 fake expert tensors with distinguishable values, merges them, asserts shape is `[4, inter, hidden]` and each expert's data appears at its expected slice.
+- Unit test (dense): dense convert path does not invoke `merge_expert_tensors` (compile-time guarantee via arch enum dispatch, or runtime assertion if called incorrectly).
+- Memory profile during 35B MoE conversion stays under 64 GB peak (target: comparable to Gemma-4 26B's ~54 GB peak per ADR-004 decision 8 extrapolated to 35B expert count). If the layer-streaming discipline isn't enough for 256 experts × 3 projections × 40 layers, sub-layer streaming (per-projection) is the implementation strategy — the output is identical, only the memory-management granularity changes, so this is not a correctness fallback. Measure before selecting granularity. 27B dense conversion should comfortably stay under 32 GB peak (no expert blow-up).
+
+### 10. DWQ bit-pair parameterization + close the broken window
+
+**Problem.** `src/main.rs:447-448` hardcodes `base_bits: 4, sensitive_bits: 6` regardless of `config.bits`. `--bits 8 --quant dwq-mixed-4-6` accepts the flag and silently ignores it. `feedback_no_broken_windows.md` applies. Separately, the 4-AND-8 ask is unrepresentable in the current CLI vocabulary (`DwqMixed46` is the only enum variant at `src/cli.rs:336-337`).
+
+**Decision.** Both changes in one commit:
+
+(a) Add enum variants `DwqMixed48`, `DwqMixed68`, `DwqMixed28` to `QuantMethod`. Display as `"dwq-mixed-4-8"`, `"dwq-mixed-6-8"`, `"dwq-mixed-2-8"`.
+
+(b) At `src/main.rs:447-448`, replace literal `4` / `6` with a lookup from `config.quant` → `(base_bits, sensitive_bits)` tuple. Keep `config.bits` for non-DWQ paths; for DWQ, error clearly if `--bits N` is passed (rather than silently ignoring) with message `"--bits is not used for DWQ; use --quant dwq-mixed-N-M to choose bit-pair variants"`.
+
+(c) Output-filename auto-naming includes the DWQ variant: default output when `--quant dwq-mixed-4-6` is `{model-name}-dwq46.gguf`; for `dwq-mixed-4-8` it's `{model-name}-dwq48.gguf`. User-provided `--output` overrides.
+
+**Non-goal** in this ADR: re-tuning the sensitivity heuristic for the wider bit gap. The current heuristic picks layers based on an activation-sensitivity score; the score is orthogonal to the promotion target (6 vs 8). Promotion is a magnitude change, not a selection change. Heuristic audit = Decision 12.
+
+**Acceptance criteria.**
+- `hf2q convert --help` lists all three new variants.
+- Unit test: dispatch table maps each variant to the correct `(base, sensitive)` tuple.
+- Unit test: parsing `--bits 5 --quant dwq-mixed-4-6` errors with the documented message.
+- Integration test: two side-by-side outputs produced from the same input (dwq46 and dwq48) collide on neither filename nor internal tensor data (they differ in quant type of sensitive tensors).
+- Gemma-4 convert with `dwq-mixed-4-6` produces byte-identical output to pre-change HEAD. **This is the Chesterton's-fence regression guard.**
+
+### 11. MTP head handling (both variants)
+
+**Problem.** Both Qwen3.6-27B dense and Qwen3.6-35B-A3B MoE have `mtp_num_hidden_layers: 1` → one Multi-Token Prediction block after the main stack, enabling future speculative decoding (1.8× decode speedup per DeepSeek-V3 baseline). HF stores these as `model.mtp.*` tensors. llama.cpp represents them as `blk.{n_layer}.nextn.*` per `LLM_TENSOR_NEXTN_*` at `llama-arch.cpp:447-450`. Inference session decides whether to use MTP for speculative decoding; conversion must preserve the tensors losslessly per Robert's 2026-04-23 confirmation.
+
+**Decision.** Emit MTP tensors losslessly for both variants. Map HF `model.mtp.layers.0.*` → GGUF `blk.{num_hidden_layers}.nextn.*` (block 40 for MoE, block 64 for dense). Specific mappings per `LLM_TENSOR_NEXTN_*` names: `nextn.eh_proj`, `nextn.embed_tokens`, `nextn.enorm`, `nextn.hnorm`, plus any attention/FFN tensors the MTP block contains. Emit `qwen35.nextn_predict_layers = 1` (dense) or `qwen35moe.nextn_predict_layers = 1` (MoE) metadata key per `llama-arch.cpp:194`.
+
+**Acceptance criteria.**
+- Tensor-name test (MoE): `model.mtp.layers.0.embed_tokens.weight` → `blk.40.nextn.embed_tokens.weight`.
+- Tensor-name test (dense): `model.mtp.layers.0.embed_tokens.weight` → `blk.64.nextn.embed_tokens.weight`.
+- If `mtp_num_hidden_layers == 0` (future Qwen variants without MTP), the MTP emission path is skipped cleanly with no empty tensors.
+- `qwen35.nextn_predict_layers` / `qwen35moe.nextn_predict_layers` metadata key present and correct in the appropriate variant's output.
+
+### 12. DWQ sensitivity heuristic for hybrid arch (both variants)
+
+**Problem.** `src/intelligence/auto_quant.rs` and `src/quantize/dwq.rs`'s sensitivity heuristic was tuned on Gemma's homogeneous transformer blocks. Qwen3.5 family has tensor cohorts that respond to quantization differently:
+- **Full-attention tensors** (standard transformer; existing heuristic applies; both variants)
+- **Linear-attention / SSM tensors** (`A_log`, `dt_*`, `conv1d`, `in_proj_*` — small, numerically load-bearing; `A_log` in particular is an exponentiated parameter where quantization error compounds; both variants)
+- **Dense FFN tensors** (dense variant: standard `ffn_{gate,up,down}`; existing per-tensor heuristic applies)
+- **MoE tensors** (MoE variant only: router gate — tiny, must stay high-precision; experts — 256× the count, individually less sensitive; shared experts — always hot, higher sensitivity than individual experts)
+
+**Decision.** Extend the sensitivity scorer with arch-aware cohort priors:
+
+- **Both variants:** SSM state tensors (`A_log`, `dt_bias`, `dt_proj`, `conv1d`) are **always** promoted to `sensitive_bits` (never base_bits), regardless of activation score.
+- **MoE only:** Router gate tensors (`ffn_gate_inp`) always promoted. Shared expert tensors (`ffn_*_shexp`) always promoted. Individual expert tensors (`ffn_*_exps`) use the existing activation-score-driven heuristic but with a higher promotion threshold (details: exact threshold tuned empirically against measured KL-divergence per the ADR-004 decision 7 block-size methodology used for K-quant type selection).
+- **Dense only:** Dense FFN tensors use the existing activation-score-driven heuristic unchanged.
+- **Full-attention tensors** (both variants) unchanged from current heuristic.
+
+**Audit requirement** (Chesterton's fence): before wiring this in, read `src/intelligence/auto_quant.rs::build_component_overrides` and `src/quantize/dwq.rs::calibrate` in full, and explain in a code comment how the new cohort priors interact with existing per-tensor overrides. Do not introduce cohort priors that silently override a user-supplied `--sensitive-layers` range.
+
+**Acceptance criteria.**
+- Test (MoE): on a synthetic qwen35moe-shaped config, the sensitivity scorer marks all `A_log`, `dt_*`, `conv1d`, `ffn_gate_inp`, `ffn_*_shexp` tensors as "promote to sensitive_bits" before any activation data is collected.
+- Test (dense): on a synthetic qwen35-shaped config, the sensitivity scorer marks all `A_log`, `dt_*`, `conv1d` tensors as "promote to sensitive_bits" and does not apply MoE-only priors (no `ffn_*_exps` / `ffn_*_shexp` tensors exist).
+- Test: `--sensitive-layers 0-10` user override is still honored in both variants.
+- Test: Gemma-4 sensitivity choices are byte-identical pre- and post-change (the new cohort priors only fire for qwen35 / qwen35moe arches).
+- Measured KL divergence on a calibration subset for Gemma-4 DWQ-4-6: ≤ pre-change value (never degrades).
+
+### 13. DWQ activation calibration for hybrid arch
+
+**Problem.** Activation-based DWQ calibration requires a forward pass. The existing forward pass at `src/quantize/dwq.rs` hooks into hf2q's Gemma inference engine (layer-streamed per ADR-004 decision 8). Qwen3.5 / Qwen3.5-MoE forward passes through linear-attention layers require SSM state, GATED_DELTA_NET Metal kernels, and MROPE — all of which live in `/opt/mlx-native` and are being built by the parallel inference session.
+
+**Decision.** Define a stable activation-capture API that the inference session implements, and the DWQ pipeline consumes. Interface sketch:
+
+```rust
+// in src/quantize/dwq/forward.rs or equivalent
+pub trait ActivationCapture {
+    fn run_calibration_prompt(&mut self, tokens: &[u32]) -> Result<LayerActivations>;
+}
+
+pub struct LayerActivations {
+    pub per_layer_inputs: Vec<TensorF32>,   // [n_layers][hidden_size] aggregated over calibration prompts
+    pub per_layer_outputs: Vec<TensorF32>,
+    // ... any other stats the sensitivity scorer reads
+}
+```
+
+The inference session's qwen35 / qwen35moe forward implements `ActivationCapture`. hf2q's DWQ pipeline owns the trait definition and the sensitivity scorer; the inference engine owns the implementation. Cross-session coordination point: the trait definition.
+
+**No fallback.** Per the mantra and `feedback_no_shortcuts.md` / `feedback_correct_outcomes.md`: weight-space DWQ is not a valid substitute for activation-based DWQ. Activation-based produces measurably better quantization; accepting weight-space output means accepting lesser output, which is a fallback and forbidden. If the inference session's activation capture isn't ready when the rest of the pipeline is, **P6 blocks and we fix the blocker**. Options when blocked: (a) help the inference session land activation capture faster, (b) narrow the trait surface to the minimum viable for sensitivity scoring, (c) hold P6 until real. Not an option: ship weight-space DWQ output and call it done.
+
+**Acceptance criteria.**
+- Trait definition lands in hf2q before inference session starts coding its implementation — this reduces rework on their side.
+- A mock `ActivationCapture` that returns deterministic but structurally-correct tensors is used for hf2q-side unit tests (so P6's own tests don't depend on a working inference engine to exercise the scorer logic).
+- Real DWQ conversion of Qwen3.5 / Qwen3.5-MoE weights requires the inference session's real `ActivationCapture` implementation and does not proceed without it.
+- The existing `use_activations: false` weight-space code path at `src/quantize/dwq.rs` remains for Gemma's pre-existing invocation only; it is not extended, referenced, or invoked from any qwen35 / qwen35moe convert path.
+
+### 14. HF download robustness for 35B
+
+**Problem.** `src/input/hf_download.rs` uses `hf_hub::api::sync::ApiBuilder` with `huggingface-cli` fallback. Unknown whether it correctly handles: (a) ~40 safetensors shards for a 35B model; (b) LFS resumption mid-shard on network interruption; (c) gated/auth-required repos; (d) disk-space preflight before starting a ~70 GB download.
+
+**Decision.** Add preflight:
+- Before starting download, `df` the target directory and assert ≥ 150 GB free (70 GB bf16 weights + 73 GB DWQ intermediate peak per ADR-004 decision 8 extrapolated + 10 GB margin).
+- Error with a clear message if insufficient: `"Qwen3.5-MoE 35B requires ≥150 GB free in {path}; found {N} GB. Free space or change --cache-dir."`
+- Verify shard resumption: if download is interrupted and `hf2q convert` is re-invoked, it must resume, not restart. Existing `hf_hub` API sync behavior — verify and add regression test.
+
+**Acceptance criteria.**
+- Unit test: mocks `fs2::available_space` to return < 150 GB, asserts error is raised with the documented message.
+- Manual test (documented in `docs/converting-qwen35moe.md`): `Ctrl+C` during download → re-invoke → resumes from the partial shard, does not redownload completed shards.
+
+### 15. Sidecar file preservation
+
+**Problem.** Gemma's output dir contains `chat_template.jinja`, `config.json`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json` alongside the `.gguf`. Unknown whether hf2q writes these automatically or they were manually copied. For qwen35moe the tokenizer and chat template are both different from Gemma's.
+
+**Decision.** During convert, copy the HF repo's sidecar files (`chat_template.jinja`, `tokenizer.json`, `tokenizer_config.json`, `config.json`, `generation_config.json`, `special_tokens_map.json`) into the output directory alongside the produced `.gguf`. Preserve file content byte-identically. If any are missing in the HF repo, skip silently (not all models ship all sidecars).
+
+**Acceptance criteria.**
+- Integration test: output directory for `apex`-equivalent input has the 5+ sidecar files present with byte-identical content to the HF source.
+- Test that Gemma-4 conversion still produces the same sidecar set it did before.
+
+---
+
+### 16. Real-model smoke-test harness (end-gate for this ADR)
+
+**Problem.** P7 left the smoke test as a hand-run command documented in `docs/converting-qwen35.md`. That is a stub per the mantra: "no `todo later`". Without an automated, reproducible harness producing a committed transcript artifact, we have no evidence that a converted `qwen35` or `qwen35moe` GGUF actually loads in a downstream consumer. A structurally-valid GGUF that silently fails llama.cpp's loader (e.g. a missing hparam key, a transposed tensor, a wrong dtype on a single norm) is the canonical Qwen-family failure mode and is not caught by any unit or integration test shipped in P0–P7.
+
+**Decision.** Ship `hf2q smoke` as a **Rust binary subcommand** on the `hf2q` CLI (not a bash script). Arch-generic from first line per Decision 20 — dispatches via `ArchRegistry::get(arch)` and runs the same conformance pipeline for every arch. The Qwen3.5 / Qwen3.5-MoE entries are populated in P8; Gemma4 entry is populated by the parity follow-up ADR; Ministral / DeepSeek entries are added by their own future ADRs with zero harness rework.
+
+**CLI:** `hf2q smoke --arch {qwen35|qwen35moe|gemma4|…} --quant {q4_0|dwq-mixed-4-6|dwq-mixed-4-8} [--with-vision] [--skip-convert] [--dry-run]`
+
+**What the subcommand does:**
+
+1. **Preflights** the environment:
+   - `HF_TOKEN` is set (non-empty) — exit code 2
+   - Free space on the convert directory ≥ `ArchEntry::disk_floor_gb + 10 GB` buffer — exit code 3
+   - `/opt/llama.cpp/build/bin/llama-cli` exists and is executable (read-only consumer per sovereignty — fine) — exit code 4
+   - `hf2q` binary itself is built in release mode — exit code 5
+   - The arch's target repos (`ArchEntry::hf_repos`) are resolvable via `huggingface-cli repo info` (no download yet) — exit code 6
+2. **Converts** each variant at the requested quant. For `--quant q4_0` (P8 baseline, pre-P9): bit-identical emission with no calibration dependency, unblocks the gate today. For `--quant dwq-mixed-4-*` (P9 follow-up): requires P9's real-activation wire-up and runs PPL/KL measurement inline.
+3. **Loads and infers** for 8 tokens under maximum determinism:
+   - `llama-cli --model <path> --prompt <ArchEntry::smoke_prompt> -n 8 --seed 42 --temp 0 --no-warmup`
+   - `--temp 0` + `--seed 42` makes the output byte-stable across the M5 Max fleet.
+   - **No `--log-disable`** (revised 2026-04-24, fix `99bbd0a` / next): real llama-cli's loader summary + timing block both flow through `LLAMA_LOG_INFO` (`/opt/llama.cpp/src/llama-context.cpp:3486`) which `--log-disable` suppresses, leaving the harness's transcript parsers staring at empty stderr. The `-n 8` token bound keeps log volume small without requiring suppression.
+4. **Asserts** each transcript (parsers accept BOTH real-llama-cli + synthetic mock formats per fix `47ccddb`):
+   - Exactly 8 generated tokens — real format `llama_print_timings: eval time = X ms / 8 runs`; synthetic-fixture format `n_eval = 8`.
+   - No line matching `error|ERROR|panic|assertion|segfault` on stderr.
+   - Tensor-count line — real format `llama_model_loader: loaded meta data with K key-value pairs and N tensors from ...`; synthetic-fixture format `llama_model_load: loaded tensor 0xN`. Asserted count matches `ArchEntry::tensor_catalog.expected_tensor_count(metadata)` (sourced from the registry, not a side-file — single source of truth).
+5. **(DWQ only)** Runs PPL + KL measurement against the F16 reference path (Decision 17) using `ArchEntry::ppl_corpus` and asserts the thresholds in `ArchEntry::quality_thresholds`.
+6. **Commits** each passing transcript under `tests/fixtures/smoke-transcripts/{arch}-{quant}.txt` (≤ 2 KB, timestamps stripped). These are tracked artifacts — they are the evidence that this ADR's closure is real.
+
+**Ownership.** The binary is source code, not documentation. Any future arch landing in hf2q (Gemma4-parity-retrofit, Ministral, DeepSeek-V3, Qwen3.7, …) extends the registry by adding one `src/arch/entries/X.rs` file — the harness itself does not change.
+
+**Acceptance criteria.**
+- `cargo run --release -- smoke --arch qwen35 --quant q4_0` exits 0, producing `tests/fixtures/smoke-transcripts/qwen35-q4_0.txt` with 8 tokens and no error lines.
+- `cargo run --release -- smoke --arch qwen35moe --quant q4_0` exits 0, producing `tests/fixtures/smoke-transcripts/qwen35moe-q4_0.txt` likewise.
+- Both transcripts are byte-identical across two fresh runs on the same M5 Max (proves `--seed 42 --temp 0` determinism is real — flags a non-deterministic tokenizer or forward path immediately if it fails).
+- Preflight failure modes (missing `HF_TOKEN`, insufficient disk, missing `llama-cli`, missing binary, unresolvable repo) produce a single-line error naming the exact missing prerequisite and exit with the distinct non-zero code listed above (2/3/4/5/6).
+- `hf2q smoke --arch bogus` exits non-zero with a structured error listing registered arches — proves the registry dispatch is load-bearing.
+- `hf2q smoke --help` prints auto-generated flag documentation from the arg-parser.
+- CI skip gate: the full `hf2q smoke` path is **not** invoked by CI (disk + wall-clock + HF-token requirements). CI runs a dedicated unit test suite (`tests/smoke_conformance.rs`) that exercises every preflight failure mode via a mock `llama-cli` stub and a mock HF resolver — this keeps the harness itself regression-guarded without paying the conversion cost.
+- `hf2q smoke --arch <any-unregistered-arch>` (including `gemma4`, `ministral`, `deepseekv3`, `bogus`) returns a uniform "unknown arch; known arches: qwen35, qwen35moe" structured error. No per-arch `todo!()` placeholder; uniform dispatch rejection until a future ADR registers the arch.
+
+### 17. DWQ activation calibration — real-weight wire-up (Robert-deliverable gate)
+
+**Problem.** `src/main.rs:500-508` currently returns `DwqError::NoActivationCapture` for every `qwen35` / `qwen35moe` DWQ convert invocation. This is the second line of defence added in P6 — correct at the time because no production `ActivationCapture` impl existed. ADR-013 P12 (`src/inference/models/qwen35/weight_loader.rs`, HEAD `870bd7a` et seq.) is now shipping a real-weight forward path for both variants. The Robert-named end-deliverable of this ADR (`qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf` + `-dwq48.gguf`, Context §Business problem) cannot ship until the guard is removed and replaced with a concrete impl.
+
+**Decision.** Replace the `NoActivationCapture` guard with a production `ActivationCapture` impl and remove the error variant once no caller can reach it. Specifically:
+
+1. **New file:** `src/inference/models/qwen35/activation_capture_real.rs`, `pub struct RealActivationCapture { model: Qwen3_5Variant, tokenizer: Tokenizer }`.
+   - `impl ActivationCapture for RealActivationCapture` driving ADR-013's forward pass (Decision 8 Gated DeltaNet + Decision 9 Gated full-attn + Decision 10 MROPE + Decision 12 weight loader in ADR-013).
+   - Accepts `&mut self, tokens: &[u32]` → returns `Vec<LayerActivation>` matching the trait signature at `src/inference/models/qwen35/activation_capture.rs:141`.
+   - Internally: runs the forward once per calibration sample, captures per-`nn.Linear` activations via the hook-point API exposed by ADR-013 Decision 8/9 (defined alongside this decision).
+2. **`src/main.rs:488-506` rewrite.** Replace the current block:
+   ```rust
+   if dwq_arch.requires_activation_capture() {
+       return Err(quantize::dwq::DwqError::NoActivationCapture.into());
+   }
+   ```
+   with:
+   ```rust
+   let capture: Box<dyn ActivationCapture> = if dwq_arch.requires_activation_capture() {
+       Box::new(RealActivationCapture::new(&model_weights, &tokenizer)?)
+   } else {
+       // Non-qwen35 paths remain weight-space (P6 unchanged).
+       Box::new(NoopActivationCapture)
+   };
+   run_dwq_calibration(&config, &capture, &calibration_corpus)?;
+   ```
+3. **Remove** `DwqError::NoActivationCapture` entirely once the above lands. A variant that no production path can return is dead code and fails the mantra's "no stub" clause. Unit tests using `MockActivationCapture` remain — they don't trigger the removed error path.
+4. **Calibration corpus.** Reuse the existing hf2q calibration corpus (`src/quantize/calibration/corpus.rs`). 1024 samples is the documented default; Phase P9's commit message records the actual count, per-sample wall-time, peak RSS, and sensitivity JSON delta vs. a weight-space-only run.
+5. **Chesterton's fence: Gemma must not regress.** Gemma's DWQ path does not require `ActivationCapture` (`DwqArch::Gemma4` returns `false` from `requires_activation_capture`). The wire-up above preserves that branch — Gemma continues on the existing weight-space calibration path. Byte-identical output is asserted in the P9 regression test.
+
+**Quality acceptance criteria (2026-04-24 party-mode refinement — correctness bias).** Pure "file loads + emits 8 tokens" is too weak a gate to claim "most correct quants" per the mantra. P9 adds **perplexity + KL-divergence** measurement against our own F16 reference path via ADR-013's inference (Decision 6 in ADR-013; hard-blocked on ADR-013's F16 forward being bit-stable for both variants — implicit cross-ADR handoff, R12).
+
+**Measurement protocol:**
+- **Eval corpus:** wikitext-2-raw-v1 test split, first 512 tokens of the first paragraph longer than 1024 raw tokens (deterministic selection; committed as `tests/fixtures/ppl-corpus/wikitext2.tokens` with a SHA-256 sidecar).
+- **Calibration corpus disjointness:** DWQ calibration corpus (1024 samples from the existing hf2q calibration source) must be disjoint from the eval corpus. Asserted by a unit test comparing the two corpora's SHA-256s of their token lists.
+- **Reference:** our own F16 inference path — `RealActivationCapture` with bits=16 (no quant) runs the same forward used for calibration. F16 logits per token are the reference distribution.
+- **Perplexity:** `exp(-mean(log_softmax(ref_logits)[next_token]))` on the 512-token eval. Computed on both the DWQ output and the F16 reference.
+- **KL-divergence:** per-token `sum_v softmax(ref)[v] * (log_softmax(ref)[v] - log_softmax(dwq)[v])` averaged over the 512 tokens, reported in nats.
+
+**Quality thresholds (load-bearing — enforced in `ArchEntry::quality_thresholds`):**
+- DWQ46 perplexity ≤ **1.10× F16 reference PPL**
+- DWQ48 perplexity ≤ **1.05× F16 reference PPL**
+- Median KL-divergence per token < **0.02 nats** (applies to both DWQ46 and DWQ48)
+
+These numbers are the party-mode-confirmed thresholds (2026-04-24); they are literal constants in `src/arch/registry.rs` (`QualityThresholds { ppl_ratio_dwq46: 1.10, ppl_ratio_dwq48: 1.05, max_median_kl: 0.02 }`), not "reasonable" or "TBD." If P9 produces numbers outside these bounds on either variant, P9 does not ship — the answer is to understand why calibration is under-performing, per the mantra ("No shortcuts. No fallback.").
+
+**Structural acceptance criteria (unchanged from original):**
+- `cargo test -p hf2q --test convert_qwen35_integration -- real_activation_capture` green. Test: synthetic tiny qwen35 (4 layers including 1 full-attn + 3 linear-attn, 4 experts, hidden=64, head_dim=16) runs through `RealActivationCapture` and produces a sensitivity JSON whose per-layer priorities differ from weight-space-only scoring — this is the sharp proof that activations are actually flowing through the forward pass, not being stubbed.
+- `hf2q convert --repo Qwen/Qwen3.6-27B --format gguf --quant dwq-mixed-4-6 --calibration-samples 1024 --output models/qwen3.6-27b-dwq46/out.gguf` runs to completion on the M5 Max. Peak RSS ≤ 64 GB (recorded via `/usr/bin/time -l`). Wall time is a *soft* target (≤ 2 h) — correctness over speed, per 2026-04-24 refinement.
+- Same command with `--quant dwq-mixed-4-8` produces a structurally-different output GGUF (different `general.file_type`, different sensitivity JSON sidecar).
+- Same two commands with `--repo jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated` produce the two Robert-named end-deliverable GGUFs.
+- All four resulting GGUFs pass P8's smoke gate (`hf2q smoke --arch qwen35|qwen35moe --quant dwq-mixed-4-{6,8}`) — *including the PPL + KL quality ACs above*. Four new transcripts committed: `tests/fixtures/smoke-transcripts/{qwen35,qwen35moe}-dwq4{6,8}.txt` with PPL and KL numbers inline in each transcript.
+- Gemma-4 DWQ-4-6 regression: `hf2q convert --repo <gemma-4 repo> --quant dwq-mixed-4-6 ...` produces byte-identical output to the pre-P9 HEAD (SHA-256 match). Asserted in an integration test. Gemma4's quality ACs are populated by the follow-up parity ADR, not P9.
+- `DwqError::NoActivationCapture` no longer exists in `src/quantize/dwq.rs`. `cargo clippy` reports no dead-code warning on the quant module.
+- `src/main.rs:488-506` is re-commented to describe the wired path; the comment trail documents P6 → P9 transition with commit SHAs.
+- ADR-013 P12 (`RealActivationCapture` dependency surface — specifically: the hook-point API on `Qwen3_5TextModel::forward` and `Qwen3_5MoeTextModel::forward`) is independently accepted with its own tests green. If ADR-013 P12 isn't green, P9 does not ship — **the answer remains "fix the blocker, not route around it."**
+
+### 18. Pure-Rust mmproj (vision-tower) emitter
+
+**Problem.** Qwen3.6-27B ships a 27-layer vision transformer (ViT, patch_size=16, image_size likely 384 or 448 — verify from `config.json::vision_config`). A deployable multimodal model needs a companion `mmproj-qwen36-F16.gguf` file that carries the ViT weights and the cross-modal projector to the text backbone's hidden dim. The file currently in `models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/mmproj-qwen36-F16.gguf` was produced by an external tool (likely `llama.cpp/tools/mtmd`'s converter), so we rely on a build artifact from a repo we don't own — direct violation of `feedback_hf2q_sovereignty.md`.
+
+**Decision.** Add a pure-Rust vision-tower conversion path:
+
+1. **New module:** `src/models/vit/` with:
+   - `mod.rs` — public `convert_vision_tower(hf_repo: &HfRepo, output_dir: &Path) -> Result<PathBuf>`
+   - `config.rs` — parses `config.json::vision_config` into `VisionConfig { hidden_size, num_hidden_layers, num_attention_heads, patch_size, image_size, projector_type, layer_norm_eps, ... }`. Fields are `Option<T>` where the HF schema allows omission; required fields for Qwen3.6 are validated explicitly with named errors (same pattern as P1).
+   - `convert.rs` — iterates `model.vision_tower.*` safetensors tensors, applies HF-name → GGUF-name mapping:
+     - `model.vision_tower.embeddings.patch_embeddings.projection.{weight,bias}` → `v.patch_embd.{weight,bias}`
+     - `model.vision_tower.embeddings.position_embeddings.weight` → `v.position_embd.weight`
+     - `model.vision_tower.encoder.layer.{L}.attention.{q,k,v}_proj.{weight,bias}` → `v.blk.{L}.attn_{q,k,v}.{weight,bias}`
+     - `model.vision_tower.encoder.layer.{L}.attention.output.dense.{weight,bias}` → `v.blk.{L}.attn_out.{weight,bias}`
+     - `model.vision_tower.encoder.layer.{L}.layer_norm{1,2}.{weight,bias}` → `v.blk.{L}.ln{1,2}.{weight,bias}`
+     - `model.vision_tower.encoder.layer.{L}.mlp.{fc1,fc2}.{weight,bias}` → `v.blk.{L}.ffn_{down,up}.{weight,bias}` (verify ordering against `clip-model.h`)
+     - `model.vision_tower.post_layernorm.{weight,bias}` → `v.post_ln.{weight,bias}`
+     - `model.multi_modal_projector.linear_{1,2}.{weight,bias}` → `mm.{0,2}.{weight,bias}` (MLP projector convention; adjust if Qwen uses a single-linear projector)
+   - `gguf_emit.rs` — writes an mmproj-format GGUF:
+     - `general.architecture = "clip"` (per `/opt/llama.cpp/tools/mtmd/clip.cpp` — arch string is load-bearing; llama.cpp's mtmd loader keys off this)
+     - `clip.vision.*` metadata per `clip-model.h` (`image_size`, `patch_size`, `projection_dim`, `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `projector_type`)
+     - Tensor dtype: F16 (per existing `mmproj-qwen36-F16.gguf` precedent). Quantized mmproj is out of scope for this ADR — F16 is what the downstream loader expects for vision tensors today.
+2. **Sovereignty.** Same rule as the main text-side converter: `/opt/llama.cpp/tools/mtmd/clip-model.h` and `clip.cpp` are read-only spec sources. No build-time or test-time dependency on any `mtmd` artifact. The expected tensor-name catalog is hand-transcribed into a constant in `src/models/vit/convert.rs` with a file:line citation per key, exactly as P4 did for `llama-arch.cpp`.
+3. **CLI surface.** New flag on `hf2q convert`: `--emit-vision-tower` (default: off). When set:
+   - If the HF repo has no `vision_config` in `config.json`, log a single-line `note: --emit-vision-tower requested but <repo> has no vision_config — skipping` and continue. Not an error.
+   - Otherwise, emit `mmproj-<model-slug>-F16.gguf` alongside the text GGUF in the output directory.
+   - Gemma-4's repo has no `vision_config` → `--emit-vision-tower` is a silent no-op for Gemma (regression test asserts this).
+4. **MoE variant interaction.** The local MoE target (`jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated`) dropped `vision_config` from its `config.json`. For that repo, `--emit-vision-tower` silently skips (same no-op branch as Gemma). Vision tower is only emitted for dense `Qwen/Qwen3.6-27B`. Integration tests must cover **both** paths (emit + no-op-skip) to guard against a future "silently skips when it shouldn't" regression.
+
+**Three-layer defense (2026-04-24 party-mode refinement — post-sovereignty audit).** All three layers are sovereignty-clean: the conversion is derived from `clip.cpp` + `clip-model.h` spec by hand-transcription, and correctness is proven against the spec via synthetic tests + our own loader, never against an external reference artifact. The earlier "one-time external-mmproj cosine anchor" proposal was removed — using external output to prove our correctness (one-time or not) is the pattern `feedback_hf2q_sovereignty.md` rejects, and the spec-driven synthetic tests are already the sufficient correctness proof for an F16→F16 lossless port.
+
+**Layer A — Structural acceptance (baseline):**
+- Integration test `tests/convert_vision_tower_integration.rs`: synthetic tiny ViT (4 layers, hidden=64, num_heads=8, patch_size=4, image_size=32) round-trips through `convert_vision_tower` and the output GGUF is read back by hf2q's own GGUF reader. Every tensor in the hand-authored expected catalog (const in the test file) is present with the expected shape and F16 dtype. Every metadata key in the expected catalog is present with the expected value.
+- Integration test `tests/convert_vision_tower_noop.rs`: invoking `convert_vision_tower` on a `VisionConfig`-less HF repo fixture returns `Ok(None)` (or equivalent "no file emitted") without panicking.
+- Gemma-4 regression: full convert pipeline with `--emit-vision-tower` produces byte-identical text-side output vs. pre-P10, plus no `mmproj-*.gguf` written. Asserted via pre-built SHA-256 fixture.
+- Real-model structural gate: `hf2q convert --repo Qwen/Qwen3.6-27B --format gguf --quant q4_0 --emit-vision-tower --output models/smoke-qwen35-27b/` produces **both** `out.gguf` and `mmproj-qwen36-27b-F16.gguf`. The mmproj file is loadable by `llama-mtmd-cli --mmproj mmproj-qwen36-27b-F16.gguf --model out.gguf -p "Hello"` without error. `hf2q smoke --arch qwen35 --with-vision` invokes this combined path and records the extra transcript. (llama-mtmd-cli is used here as a *reader*, identical to how P8 uses llama-cli on the text-side GGUF — not as a correctness oracle.)
+- No new dependency on any crate under `/opt/llama.cpp/tools/` (check via `cargo tree -p hf2q`).
+
+**Layer B — ADR-005 phase 2c round-trip gate (synthetic + real-model, mirror of Decision 19's MTP pattern):**
+- Integration test `tests/convert_vision_tower_adr005_roundtrip.rs`: our emitted `mmproj-qwen36-27b-F16.gguf` (synthetic tiny variant) is loaded by `src/inference/vit/loader.rs` (ADR-005 phase 2c's mmproj entry point). Assertion: the vision submodule reports `has_vision == true` AND every tensor in `EXPECTED_VIT_TENSORS` (hand-authored const) is present with correct shape and dtype.
+- Real-model extension: the same test, marked `#[ignore]` so it stays out of default CI, loads the real 27B dense mmproj produced by the P10 real-model gate. Asserts all 27 ViT-layer tensor triples (attn_{q,k,v}, attn_out, ln1, ln2, ffn_{down,up}, …) are present with real-model shapes. This catches any "passes synthetic, fails at real dimensions" mapping bug that Layer C's synthetic coverage can miss.
+- If the ADR-005 loader rejects any tensor, the test assertion failure must include the offending tensor name (loader error-surface hardening, same quality bar as P11).
+- Synthetic test runs in < 30 s, default `cargo test` set, CI-green. Real-model test is opt-in via `cargo test -- --ignored` and `hf2q smoke --arch qwen35 --with-vision`.
+
+**Layer C — Spec-driven hand-authored layout tests (mirror of P5's expert-merge pattern):**
+- Unit tests in `src/models/vit/convert.rs` with hand-authored expected tensor bytes on the synthetic tiny ViT. One test per mapping entry most-likely-to-get-swapped, minimum set:
+  - `fc1` vs `fc2` ordering in the MLP block — separate tests assert `v.blk.{L}.ffn_down.weight` matches the HF `mlp.fc2.weight` tensor (not `fc1`), per `clip-model.h:{line}`.
+  - `linear_1` vs `linear_2` in the multi-modal projector — separate tests assert `mm.0.weight` matches `multi_modal_projector.linear_1.weight` with expected shape, and `mm.2.weight` matches `linear_2.weight` with expected shape.
+  - Patch-embedding transpose — test asserts `v.patch_embd.weight` has shape `[hidden_size, in_channels, patch_size, patch_size]` in the correct dimension order (verify direction against `clip.cpp:{line}`).
+  - Position-embedding dtype — test asserts `v.position_embd.weight` is F16 (some HF configs ship it as F32; P10's emitter must cast if so, and the test asserts the cast happened correctly).
+- Expected values in each test are hand-authored with a code-comment citation per row to the `clip-model.h` or `clip.cpp` line that motivated the choice. If `clip.cpp` changes upstream, tests fail loudly and the catalog + tests update together (same pattern as P4 used for `llama-arch.cpp`).
+
+**Cross-ADR:** ADR-005 phase 2c's mmproj loader accepts our output without modification (P10 does not cause an ADR-005 change). If ADR-005's loader needs a quirk, that's an ADR-005 bug to fix on that side, not a P10 deliverable-shape change.
+
+**Estimated LOC:** ~1000 (module + CLI flag + Layer A tests ~800; Layer B synthetic + real-model round-trip tests ~80; Layer C spec-driven tests ~150).
+
+### 19. MTP tensor round-trip integrity gate (cross-ADR contract)
+
+**Problem.** Decision 11 (shipped in P4) emits MTP tensors at `blk.{n_layer}.nextn.*` losslessly for both variants. We have **no evidence** that ADR-013's weight loader actually accepts those tensors — if the tensor names, shapes, or dtypes are off by one hair, MTP is cosmetic dead weight in our output GGUFs and speculative decoding will never work. The failure mode is silent: llama.cpp's loader would happily ignore unknown tensors today. Our in-house ADR-013 loader should reject them loudly, but only if we write the test.
+
+**Decision.** Add a conversion-side integrity gate: an integration test that runs **our** convert path end-to-end on a synthetic tiny qwen35/qwen35moe with `mtp_num_hidden_layers: 1`, then loads the output via ADR-013's `src/inference/models/qwen35/{dense,moe}.rs` weight-load entry point, and asserts the inference-side MTP submodule reports available with all expected tensors populated. This closes the convert-side of the MTP contract. Full speculative-decoding **execution** (draft/accept loops, rejection sampling, n-token lookahead) is tracked as ADR-013 phase P14 (new, not in this ADR) via an explicit cross-link.
+
+1. **New integration test:** `tests/convert_qwen35_mtp_roundtrip.rs`. Two variants:
+   - `qwen35_mtp_roundtrip` — synthetic dense model, `mtp_num_hidden_layers: 1`, 4 full-attn layers, hidden=64. Convert → Load → Assert `model.mtp.is_some()` and every tensor in `EXPECTED_MTP_TENSORS` (hand-authored const, shapes + names derived from `/opt/llama.cpp/src/llama-arch.cpp:447-450`) is present with correct shape and dtype.
+   - `qwen35moe_mtp_roundtrip` — synthetic MoE model, same MTP config, 2 linear + 1 full-attn layers, 4 experts. Same assertions.
+2. **Error quality requirement.** If the loader rejects any MTP tensor, the test assertion failure must include the offending tensor name. This means ADR-013's loader must emit structured errors keyed by tensor name, which is independently a reasonable expectation of any production weight loader (so this acceptance clause doubles as a loader-quality gate, not a hoop).
+3. **Wall-clock budget.** The test runs < 30 s on a laptop (tiny synthetic models, no disk download). It lives in the default `cargo test` set, not behind an `--ignored` flag. CI must run it on every PR.
+4. **Cross-link.** Add a `docs/adr/diary/ADR-013-qwen35-inference.md` entry ("MTP speculative-decoding execution — new phase P14, blocked on ADR-012 P11 green") alongside this phase landing. The cross-link is committed *with* the P11 test, not after — this prevents the "oh, someone will track the inference side later" decay mode.
+
+**Acceptance criteria.**
+- `cargo test --test convert_qwen35_mtp_roundtrip` green for both variants. CI runs on every PR.
+- Injecting a deliberate bug in the MTP emission path (e.g. renaming `blk.{L}.nextn.embed_tokens.weight` to `blk.{L}.nextn.emb_tokens.weight`) causes the test to fail with an assertion message naming the missing tensor by exact name. Recorded as a manual bisection step in `docs/converting-qwen35.md` ("how P11 catches MTP regressions").
+- `docs/adr/diary/ADR-013-qwen35-inference.md` contains a "P14 — MTP speculative-decoding execution" entry with status `planned` and a blocker reference to ADR-012 P11. Landed in the same commit as the P11 test. (This is the cross-ADR handoff that prevents Decision 19 from being a sleeping stub.)
+- No change to the shipped MTP tensor emission format from P4 — Decision 19 is additive validation, not a re-spec of Decision 11.
+
+**Estimated LOC:** ~200 (integration test + ADR-013 cross-link entry + any error-message surface hardening on the ADR-013 loader side).
+
+### 20. Arch-table-driven scaffolding (generalize P8 / P10-structural / P11 now, not later)
+
+**Problem.** P8, P10's round-trip gate, and P11's MTP integrity gate share a pattern: each is an arch-parameterized conformance test that runs over `arch ∈ {qwen35, qwen35moe, …}`. Writing them Qwen-specific and refactoring when Ministral lands is a measured cost: Ministral and DeepSeek-V3 are concrete next candidates (Robert, 2026-04-24), Gemma4 parity is the follow-up ADR after this one, and the pure-Rust crate-factory vision (`project_pure_rust_crate_factory.md`) treats arch-onboarding velocity as the product. Front-loading the generalization avoids Qwen-specific code becoming technical debt in weeks, not months.
+
+**Decision.** Introduce a shared `src/arch/` module that owns the conformance surface. Every arch (including the existing Gemma4 and both new Qwen variants) registers into a single `ArchRegistry` and all conformance tests consume `&ArchEntry` rather than hard-coded Qwen paths.
+
+**Concrete module layout (ADR-012 ships exactly this — no stubs, no placeholder files):**
+```text
+src/arch/
+├── mod.rs              — pub re-exports + ArchRegistry singleton
+├── registry.rs         — ArchEntry struct + HashMap<&'static str, ArchEntry>
+├── conformance.rs      — arch-generic smoke / round-trip / catalog helpers
+├── smoke.rs            — hf2q smoke subcommand impl (Decision 16 binary)
+├── catalog.rs          — TensorCatalog: &[(TensorName, TensorShape, Dtype)]
+└── entries/
+    ├── qwen35.rs       — qwen35 ArchEntry (fully populated)
+    └── qwen35moe.rs    — qwen35moe ArchEntry (+ MTP + expert-merge hooks; fully populated)
+```
+
+Future arches land their own `entries/<arch>.rs` in their own ADRs (Gemma parity, ADR-015 Ministral, ADR-016 DeepSeek-V3). ADR-012 does not create placeholder files for them — per the mantra, a populated-stub is still a stub.
+
+**`ArchEntry` surface (sketched):**
+```rust
+pub struct ArchEntry {
+    pub arch: &'static str,                                 // "qwen35", "qwen35moe", "gemma4", …
+    pub hf_architectures: &'static [&'static str],          // ["Qwen3_5ForCausalLM"]
+    pub tensor_catalog: &'static TensorCatalog,             // hand-transcribed per arch
+    pub has_mtp: bool,                                      // Decision 19 uses this
+    pub has_vision: bool,                                   // Decision 18 uses this
+    pub smoke_prompts: &'static [&'static str],             // deterministic smoke inputs
+    pub ppl_corpus: EvalCorpus,                             // Decision 17 uses this
+    pub quality_thresholds: QualityThresholds,              // per-arch ppl/KL bounds
+}
+```
+
+**Binary subcommand (replaces the earlier `scripts/smoke_test_qwen35.sh` proposal):** `hf2q smoke --arch {qwen35|qwen35moe|gemma4|ministral|deepseekv3} --quant {q4_0|dwq-mixed-4-6|dwq-mixed-4-8} [--with-vision]`. Rust binary, not bash — single-entry, testable, dispatch via `ArchRegistry::get(arch)`. Preflight, convert, llama-cli invocation, transcript emission, PPL/KL measurement are all arch-generic and read their knobs from `ArchEntry`.
+
+**Where arch-specific code still lives:**
+- `src/models/qwen35/{mod,dense,moe}.rs` unchanged — Qwen transforms stay Qwen (V-head reorder, A_log negation, MROPE, SSM tensors).
+- `src/models/vit/` (P10) unchanged — ViT emission stays its own module.
+- `src/quantize/dwq.rs` unchanged — cohort priors are per-arch but consumed via the existing `ArchFamily` dispatch.
+
+**Chesterton's fence — why this decision lands here and not earlier.** P0–P7 shipped without `src/arch/`. The decision to generalize is explicitly a 2026-04-24 refinement driven by Robert naming Ministral + DeepSeek as near-term targets. If we had known that before P0, `src/arch/` would have landed in P1; since we didn't, we land it in P8 and migrate Gemma4 into the registry as part of its parity follow-up ADR. No rewrite of P0–P7 code — P0–P7's per-arch files stay as-is and are *re-exported* from the new registry entries.
+
+**Acceptance criteria.**
+- `src/arch/` exists, compiles, and is reachable via `hf2q smoke --help` by the end of P8.
+- `qwen35` and `qwen35moe` `ArchEntry`s are populated with the catalogs P4 hand-transcribed; no duplication — P8 test helpers consume the entry, they don't hardcode tensor names.
+- `src/arch/entries/` contains **exactly two files** at P8 close: `qwen35.rs` and `qwen35moe.rs`. No `gemma4.rs`, no `ministral.rs`, no `deepseekv3.rs`, no placeholder files. Future arches add their own entry files in their own ADRs.
+- A negative-case unit test: `hf2q smoke --arch X` for any `X` not in `{qwen35, qwen35moe}` (including `gemma4`, `ministral`, `deepseekv3`, `bogus`) returns the **same** structured error naming the attempted arch and listing the known entries. No special-cased `todo!()` branches per-arch — the dispatcher rejects unknown keys uniformly. Proves the registry is load-bearing, not a facade.
+- Gemma4 regression: the existing Gemma4 convert path (outside `src/arch/`) is unchanged. Gemma4 remains fully convert-capable in ADR-012 via its existing P0–P7 code path; it is simply not yet registered in the new conformance surface. The Gemma parity follow-up ADR opens `gemma4.rs` when it opens.
+
+**Estimated LOC:** ~400 (module scaffolding ~250, Qwen entries ~100, smoke binary ~50). Absorbed into P8's budget.
+
+---
+
+## Arch-Table Scaffolding Architecture (reference, 2026-04-24)
+
+The diagram below shows how the scaffolding pattern lands across ADR-012, the Gemma4 parity follow-up, and the two concrete future arches Robert named. Every shared-scaffolding file lives under `src/arch/`; every arch-specific file lives under `src/models/<arch>/`. No cross-pollination — a future arch touches exactly one `src/arch/entries/X.rs` registration file and one `src/models/X/` module.
+
+```text
+                   ┌────────────────────────────────┐
+                   │    src/arch/registry.rs        │
+                   │  (ArchEntry * HashMap singleton)│
+                   └───────────┬────────────────────┘
+                               │
+     ┌─────────────────────────┼─────────────────────────────────┐
+     │                         │                                 │
+     ▼                         ▼                                 ▼
+┌──────────────┐    ┌────────────────────┐            ┌──────────────────────┐
+│ smoke.rs     │    │ conformance.rs     │            │ catalog.rs           │
+│ hf2q smoke   │    │ mtp_roundtrip()    │            │ TensorCatalog type   │
+│ --arch X     │    │ mmproj_roundtrip() │            │ (hand-transcribed)   │
+│ --quant Y    │    │ ppl_kl_eval()      │            │                      │
+└──────┬───────┘    └─────────┬──────────┘            └──────────────────────┘
+       │                      │
+       └──────────┬───────────┘
+                  │
+                  ▼
+      ┌──────────────────────────────────────┐
+      │ src/arch/entries/                    │
+      │  — Present in ADR-012 P8 —           │
+      │  ├─ qwen35.rs                        │
+      │  └─ qwen35moe.rs                     │
+      │                                      │
+      │  — NOT present in ADR-012 —          │
+      │  (each future arch adds its own file │
+      │   via its own ADR; no stubs)         │
+      │  ⋯ gemma4.rs    — Gemma-parity ADR   │
+      │  ⋯ ministral.rs — ADR-015            │
+      │  ⋯ deepseekv3.rs — ADR-016           │
+      └──────────────────────────────────────┘
+```
+
+**Cost distribution:** ADR-012 pays ~400 LOC of generalization (Decision 20). Gemma4 parity pays ~150 LOC (populate `gemma4.rs` + committed transcripts, no rewrite). Each future arch pays ~200–400 LOC of new transforms + <50 LOC of registry registration. Without this decision, each future arch would pay ~1500 LOC of conformance-harness duplication.
+
+---
+
+## Phase plan
+
+Phases are **dependency-ordered**, not priority-ordered. Each phase has a single owner claim per `feedback_swarm_sequential_when_shared_build.md` (shared Cargo target = sequential).
+
+### P0 — Broken-window fix (standalone, do first)
+
+**Scope:** Decision 10 only. DWQ bit-pair parameterization + `--bits`-silently-ignored fix + output filename disambiguation.
+
+**Why first:** Orthogonal to every other phase. Unblocks the "4 AND 8" user ask independent of qwen35moe timing. Lands as a small, reviewable PR.
+
+**Deliverables:**
+- `src/cli.rs`: new `DwqMixed48`, `DwqMixed68`, `DwqMixed28` enum variants
+- `src/main.rs:447-448`: dispatch-driven `(base_bits, sensitive_bits)` lookup
+- `src/quantize/dwq.rs`: ensure `DwqConfig` honors the dispatched values
+- Output-filename naming logic
+- Unit tests per Decision 10's acceptance criteria
+- Gemma-4 regression test (byte-identical output for `dwq-mixed-4-6`)
+
+**Acceptance:**
+- All Decision 10 acceptance criteria met
+- `hf2q convert --repo <gemma> --quant dwq-mixed-4-8 ...` produces a different, loadable GGUF than the 4-6 variant
+- CI green, Gemma regression byte-identical
+
+**Estimated LOC:** ~150
+
+### P1 — Config ingestion
+
+**Scope:** Decisions 2 and 3.
+
+**Deliverables:**
+- Extended `Config` struct in `src/input/config_parser.rs` with the 18 new fields
+- Nested `RopeParameters` struct
+- `layer_types` / `full_attention_interval` dual-support logic
+- `SUPPORTED_LAYER_TYPES` extension
+- Unit tests loading the apex model's `config.json` and Gemma-4's `config.json`
+
+**Acceptance:**
+- Decision 2 & 3 criteria met
+- No regression on Gemma config parsing
+
+**Estimated LOC:** ~300
+
+### P2 — Scaffold `src/models/qwen35/` module and V-head reorder
+
+**Scope:** Decisions 4 and 5.
+
+**Deliverables:**
+- New module `src/models/qwen35/` with `mod.rs`, `dense.rs`, `moe.rs` per Decision 4's public API
+- V-head reorder implementation in `mod.rs` (shared by both variants) with 6 case handlers
+- Unit tests per Decision 5's acceptance criteria (per-case + round-trip + spec-driven)
+- Test fixtures authored in Rust from deterministic small inputs; expected outputs hand-authored in test files with code comments deriving them from ggml broadcast semantics
+
+**Acceptance:**
+- Decision 4 & 5 criteria met
+- Module builds, tests pass
+- No fixtures produced by external tools (sovereignty directive)
+
+**Estimated LOC:** ~500
+
+### P3 — Qwen-specific non-reorder transforms
+
+**Scope:** Decision 6.
+
+**Deliverables:**
+- A_log negation, dt_bias rename, conv1d squeeze, in_proj_qkvz reorder, RMS norm +1 audit note
+- One unit test per transform
+- Code comment documenting the RMS norm +1 audit with citation
+
+**Acceptance:** Decision 6 criteria met.
+
+**Estimated LOC:** ~250
+
+### P4 — GGUF metadata + tensor naming (both variants)
+
+**Scope:** Decisions 1, 7, 8, 11.
+
+**Deliverables:**
+- Arch routing in `src/backends/gguf.rs` for both `qwen35` and `qwen35moe`
+- `emit_metadata_dense()` in `qwen35/dense.rs` with all `qwen35.*` keys per Decision 7's catalog
+- `emit_metadata_moe()` in `qwen35/moe.rs` with all `qwen35moe.*` keys per Decision 7's catalog
+- Tensor-name mapping per Decision 8, per variant (full-attn, linear-attn shared; dense FFN vs MoE experts+shared-experts; MTP shared)
+- Spec-driven metadata test framework that asserts hf2q output contains every key in the hand-transcribed catalog
+- Integration-ready for both arches (final end-to-end wiring lands in P7)
+
+**Acceptance:** Decisions 1, 7, 8, 11 criteria met for both variants.
+
+**Estimated LOC:** ~750 (dense + MoE metadata/naming, plus shared full-attn + linear-attn + MTP naming)
+
+### P5 — Expert merge + MoE pipeline (MoE variant only)
+
+**Scope:** Decision 9. Dense variant skips this phase entirely (arch-gated no-op).
+
+**Deliverables:**
+- Layer-streaming expert merge for 256 experts × 3 projections per MoE layer
+- Shared expert singleton handling
+- Memory profile measurement on the 35B MoE target (must stay < 64 GB peak)
+- Unit test with 4 synthetic experts
+- Compile-time or runtime guarantee that dense convert path does not invoke expert-merge code
+
+**Acceptance:** Decision 9 criteria met; memory target met on real 35B MoE convert; dense 27B convert uses standard FFN emission with no expert-merge code touched.
+
+**Estimated LOC:** ~250
+
+### P6 — DWQ integration for hybrid arch
+
+**Scope:** Decisions 12 and 13.
+
+**Deliverables:**
+- Cohort-prior extension to sensitivity scorer per Decision 12
+- `ActivationCapture` trait definition per Decision 13
+- Mock implementation for hf2q-side tests
+- Wire into convert pipeline; if inference engine isn't ready, P6 blocks and we fix the blocker — no weight-space fallback path is wired into the qwen35 / qwen35moe convert flow
+- KL-divergence regression guard on Gemma-4 DWQ-4-6
+
+**Acceptance:** Decisions 12 & 13 criteria met.
+
+**Estimated LOC:** ~300
+
+### P7 — Integration test, HF download hardening, sidecar, docs
+
+**Scope:** Decisions 14, 15; full end-to-end convert tests for both variants.
+
+**Deliverables:**
+- `tests/convert_qwen35_integration.rs` — synthetic tiny qwen35 (dense) end-to-end, asserts all metadata and tensor-name invariants against the spec-driven expected structure
+- `tests/convert_qwen35moe_integration.rs` — same for qwen35moe variant
+- HF download preflight (Decision 14) — sized appropriately for both ~55 GB dense and ~70 GB MoE
+- Sidecar file copy (Decision 15)
+- `docs/converting-qwen35.md` — canonical command with the `--repo` + `--quant dwq-mixed-4-6` and `--quant dwq-mixed-4-8` invocations, covering both dense and MoE invocations
+- `docs/converting-a-model.md` — generic convert-command reference (also documents Gemma retroactively)
+- Update `docs/shipping-contract.md` to indicate qwen35 and qwen35moe are additional model classes with their own acceptance criteria (lighter than Gemma since inference coherence is out of scope here)
+
+**Acceptance:**
+- End-to-end integration tests pass on synthetic data for both variants
+- End-to-end real-model smoke tests produce GGUFs that load in llama.cpp with no errors for each variant (loading is acceptance; inference coherence is out of scope and delegated to the inference session's future ADR)
+- Docs cover both DWQ variants and both arch variants
+
+**Estimated LOC:** ~400 (excluding docs word count)
+
+### P8 — Arch-registry scaffolding + real-model smoke subcommand
+
+**Scope:** Decision 16 + Decision 20. P8 absorbs the arch-table generalization cost up front so Gemma-parity, Ministral, and DeepSeek-V3 follow-ups do not each pay a fresh harness-rewrite tax.
+
+**Dependency:** P7 (green). Independent of P9/P10/P11 — runs at Q4_0 today, re-invoked over DWQ outputs once P9 lands. Completing Decision 20's registry scaffold *within* P8 is the critical design call: if it slips to "after P8 ships", every later arch pays the refactor cost.
+
+**Deliverables:**
+- `src/arch/{mod,registry,conformance,smoke,catalog}.rs` — Decision 20's scaffolding (~400 LOC). `ArchRegistry` singleton, `ArchEntry` struct, `TensorCatalog` type, arch-generic smoke dispatch.
+- `src/arch/entries/{qwen35,qwen35moe}.rs` — the only two registry entries shipped in ADR-012. Both fully populated (catalogs re-exported from the existing P4-shipped constants). No `gemma4.rs`, no `ministral.rs`, no `deepseekv3.rs` — those land in their own ADRs when those ADRs open. Existing Gemma4 convert path (outside `src/arch/`) is unchanged.
+- `src/cli.rs` + `src/main.rs` — new `smoke` subcommand wiring.
+- `tests/fixtures/smoke-transcripts/{qwen35,qwen35moe}-q4_0.txt` — committed transcript artifacts (8 tokens each, timestamps stripped).
+- `tests/smoke_conformance.rs` — CI-green unit test suite covering: preflight exit codes 2/3/4/5/6 via mocks; unknown-arch dispatch error; registry-entry-exists check; tensor-count assertion against catalog.
+- Entry in `docs/converting-qwen35.md`: "Running `hf2q smoke`" section — one page, states disk/time/token requirements, documents `--arch` and `--quant` matrix.
+- Entry in `docs/arch-onboarding.md` (new): "Adding a new model family to hf2q" — canonical checklist for Ministral / DeepSeek / future arches, derived from the qwen35 registration diff.
+
+**Acceptance:** Decisions 16 + 20 criteria met. Both Q4_0 transcripts land under `tests/fixtures/smoke-transcripts/` and are byte-identical across two fresh runs on the same host. `hf2q smoke --arch bogus` and `hf2q smoke --arch gemma4` (or any other unregistered arch) both return the same uniform "unknown arch; known arches: qwen35, qwen35moe" structured error — no per-arch placeholder branch.
+
+**Estimated LOC:** ~500 (Decision 20 scaffolding ~400, Decision 16 smoke-subcommand glue ~50, conformance unit tests ~50).
+
+### P9 — DWQ ActivationCapture real-weight wire-up
+
+**Scope:** Decision 17. Replaces the P6 `NoActivationCapture` guard with a production impl.
+
+**Dependency:** ADR-013 P12 complete and green. ADR-013 P12 must expose forward-pass hook points on `Qwen3_5TextModel` and `Qwen3_5MoeTextModel` that `RealActivationCapture` can consume. If ADR-013 P12 is not green, P9 does not start — the answer is to finish P12, per `feedback_no_shortcuts.md` and mantra.
+
+**Deliverables:**
+- `src/inference/models/qwen35/activation_capture_real.rs` — new file; `pub struct RealActivationCapture`, `impl ActivationCapture`.
+- `src/main.rs:488-506` — rewrite: delete the guard, construct `Box<dyn ActivationCapture>` branching on `requires_activation_capture()`, pass to `run_dwq_calibration`.
+- `src/quantize/dwq.rs` — remove `DwqError::NoActivationCapture` variant and associated secondary-defence clause (now dead code).
+- `src/arch/conformance.rs` — `ppl_kl_eval(arch: &ArchEntry, dwq_gguf: &Path, ref_forward: &dyn Forward) -> QualityReport` helper. Consumed by `hf2q smoke --quant dwq-*`. Arch-generic so Gemma-parity follow-up and future arches reuse.
+- `tests/fixtures/ppl-corpus/wikitext2.tokens` — 512-token deterministic eval corpus; SHA-256 sidecar committed alongside.
+- `tests/convert_qwen35_real_activation_capture.rs` — integration test; synthetic tiny qwen35 (dense 4-layer + moe 4-layer+4-expert) drives `RealActivationCapture`, asserts sensitivity JSON differs from weight-space-only scoring.
+- `tests/quality_thresholds.rs` — unit test verifying the `QualityThresholds` constants in `src/arch/registry.rs` match the ADR-012 party-mode-confirmed numbers (1.10 / 1.05 / 0.02). Prevents silent drift of the thresholds.
+- `tests/calibration_eval_disjoint.rs` — unit test asserting the DWQ calibration corpus and the PPL eval corpus have zero shared samples (SHA-256 of token lists). Prevents accidental "train on test".
+- Gemma-4 DWQ-4-6 byte-identical regression test (SHA-256 on output GGUF vs pre-P9 HEAD).
+- Four real-model DWQ GGUFs produced, smoke-tested *and quality-measured* via P8:
+  - `models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf`
+  - `models/qwen3.6-27b-dwq48/qwen3.6-27b-dwq48.gguf`
+  - `models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf` ← the Robert-named end-deliverable
+  - `models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq48/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq48.gguf` ← the Robert-named end-deliverable
+- Four new smoke transcripts committed under `tests/fixtures/smoke-transcripts/` (two per variant × two bit-pair presets), each including inline PPL + KL numbers against the F16 reference.
+- Commit message records: per-sample wall time, total wall time, peak RSS (from `/usr/bin/time -l`), PPL ratios for all four variants, median KL nats for all four variants, sensitivity JSON SHA-256 delta vs. pre-P9 weight-space run.
+
+**Acceptance:** Decision 17 criteria met, including both structural *and* quality ACs. All four real-model DWQ GGUFs exist, pass P8's smoke gate, and satisfy PPL + KL thresholds (DWQ46 ≤ 1.10× F16, DWQ48 ≤ 1.05× F16, median KL < 0.02 nats). Gemma regression byte-identical. `cargo clippy` reports no dead-code warning on `DwqError`.
+
+**Estimated LOC:** ~700 (`RealActivationCapture` ~250, PPL/KL eval helper ~200, main.rs wire-up ~50, integration + unit tests ~150, regression test ~50).
+
+#### P9b — Convert-pipeline activation-capture wire-up (2026-04-25 plan commit)
+
+**Status:** 🟡 PLAN COMMITTED. Real `impl ActivationCapture for Qwen35Model` shipped in commit `28df83c`. Open question at P9 close was: how does the convert pipeline construct a `Qwen35Model` for the capture call when convert-time only has HF safetensors in `tensor_map`, while `Qwen35Model::load_from_gguf` requires a GGUF on disk?
+
+**Two paths considered:**
+
+| Path | Approach | Pros | Cons |
+|------|----------|------|------|
+| (a) **Two-pass conversion** | Emit intermediate F16 GGUF from `tensor_map`; reload via existing `Qwen35Model::load_from_gguf`; capture activations; re-feed activations to DWQ over the held `tensor_map`; emit final dwqXX GGUF; delete intermediate. | Reuses tested `load_from_gguf` + `weight_loader::*` end-to-end. Zero new model-loading code paths. ~150 LOC orchestration. Loader layout drift impossible — only one loader exists. | ~30 GB temp disk for apex MoE. ~60 GB peak RAM during capture phase (held tensor_map + dequantized model). 2× I/O on conversion path. |
+| (b) **In-memory `Qwen35Model::from_tensor_map`** | New adapter mirroring `weight_loader::load_*` logic but reading from `TensorMap` (BF16/F16 bytes already in CPU memory) instead of `GgufFile`. | Zero temp disk. Single-pass conversion. | ~600 LOC adapter parallel to `weight_loader.rs`. Risk of layout drift between two loaders that must stay byte-identical. Requires `Qwen35Config::from_metadata` shim parallel to `Qwen35Config::from_gguf`. Exhaustive test coverage needed. |
+
+**Path chosen: (a) Two-pass conversion.**
+
+**Rationale (mantra-aligned, sovereignty-preserving):**
+1. **Single source of truth for layout.** `weight_loader::load_full_attn_layer` and `load_delta_net_layer` already encode every quirk that took the 2026-04-24 audit pass to discover (fused attn_q + gate, V-head tiled order, conv1d transpose, RMS +1, etc.). Path (b) duplicates this logic — and the duplication's first divergence is a silent inference-quality bug. Path (a) keeps a single loader on which the entire ADR-013 inference path also depends.
+2. **No new code paths through risk-bearing surfaces.** The intermediate GGUF is bit-identical in shape to a "real" GGUF; if `Qwen35Model::load_from_gguf` is correct (ADR-013 sourdough PASS at HEAD), reloading it is correct. There is no third possible failure mode.
+3. **Disk and RAM peaks are acceptable.** Robert's apex disk budget already accommodates 30 GB intermediates (the existing dwq46 + dwq48 GGUFs each occupy similar space). RAM peak of ~60 GB during the capture phase is within the 64 GB-class envelope; if the held tensor_map proves too costly, drop-and-reload from safetensors costs another ~30 s I/O — still cheaper than ~600 LOC of layout-sensitive Rust.
+4. **Ships sooner.** Path (a) is ~150 LOC of orchestration (tested already via `Qwen35Model::load_from_gguf` integration tests). Path (b) requires ~600 LOC of new adapter + ~10 layout-anchor unit tests, each citing the same llama.cpp lines `weight_loader::*` already cites.
+
+**P9b sub-tasks:**
+
+| # | Sub-task | Status | LOC | File(s) |
+|---|---|---|-----|---------|
+| 9b.1 | Extract `emit_gguf_from_tensor_map(tensor_map, metadata, path) -> Result<()>` from existing `GgufBackend` write path; produce reusable function for intermediate emission. | ✅ shipped `7b7cbbb` | ~100 (incl. smoke test) | `src/backends/gguf.rs` |
+| 9b.2 | Convert-pipeline branch: when `dwq_arch.requires_activation_capture()`, emit intermediate F16 GGUF to a tempdir before quantization. | ✅ shipped (this iter) | ~110 (incl. 9b.3b/4/5) | `src/main.rs:601-704` (replaces P9b guard) · `Cargo.toml` (tempfile promoted to runtime dep) |
+| 9b.3a | **Newly discovered** — `quantize::dwq_activation::run_dwq_activation_calibration` is a stub (returns ADR-008 error, falls back to weight-space). Replace with real impl: take `&mut dyn ActivationCapture`; generate calibration tokens; run capture; compute per-layer sensitivity via existing `compute_layer_sensitivity` (`src/quantize/sensitivity.rs`); allocate bits via existing `allocate_bits_by_sensitivity`; collapse to range list above midpoint; feed into `run_dwq_calibration_internal`. | ✅ shipped `076fd82` | ~390 (incl. 6 unit tests + helpers) | `src/quantize/dwq_activation.rs` (rewritten) · `src/quantize/dwq.rs` (extract `run_dwq_calibration_internal` + pub `generate_calibration_tokens`) · `src/main.rs` (drop stale stub-fallback branch) |
+| 9b.3b | Construct `RealActivationCapture::new(intermediate_gguf, tokenizer)`; pass into the new `run_dwq_activation_calibration`. | ✅ shipped (this iter, same edit as 9b.2) | (counted under 9b.2) | `src/main.rs` |
+| 9b.4 | Hold `tensor_map` reference live across capture; re-feed to DWQ with captured activations after capture returns. | ✅ shipped (this iter, implicit — `tensor_map` is a local variable in the convert pipeline that lives across the entire if-branch; `run_dwq_activation_calibration` itself takes `&TensorMap` and re-quantizes after capture) | (counted under 9b.2) | `src/main.rs` |
+| 9b.5 | RAII cleanup for intermediate GGUF; `tempfile::TempPath`-based or explicit `Drop` impl. | ✅ shipped (this iter, `tempfile::tempdir()` + explicit `drop(intermediate_dir)` after calibration completes) | (counted under 9b.2) | `src/main.rs` |
+| 9b.6 | Integration test: exercise full two-pass on tiny synthetic qwen35; verify the two-pass branch is REACHED (no longer trips P9b-pending guard) and that no silent weight-space fallback occurs when `Qwen35Model::load_from_gguf` rejects the synthetic. q4 sanity check on the same fixture proves the failure is arch-AND-quant-specific. | ✅ shipped (this iter) | ~270 (incl. fixture) | `tests/convert_qwen35_two_pass_capture.rs` (new) |
+| 9b.7 | Refresh `tests/convert_qwen35_real_activation_capture.rs`: drop the "Pre-P12" docstring framing; document that the failure surface has shifted from the P9b-pending guard to `RealActivationCapture::new` → `load_from_gguf` rejecting the synthetic fixture. The anchored contract — error names ActivationCapture, no output GGUF — is unchanged. | ✅ shipped (this iter) | ~50 (doc-refresh only) | `tests/convert_qwen35_real_activation_capture.rs` |
+
+**Total P9b LOC:** ~425 (revised from 205 after the 2026-04-25 stub-discovery — `run_dwq_activation_calibration` is not a wire-up target but a stub returning `DwqError::GpuError`. Replacing it with a real activation-driven sensitivity scorer is in P9b.3a, ~150 LOC sourcing from existing `src/quantize/sensitivity.rs` building blocks).
+
+**Discovery note (2026-04-25):** P9b.3 was originally framed as "construct + pass `RealActivationCapture` into the existing `run_dwq_activation_calibration`". Reading the latter at HEAD `7b7cbbb` showed it's a 30-line stub since ADR-008 candle removal — every call returns an error and falls back to weight-space. The "wire-up" is therefore a re-implementation: tokens → capture → sensitivity → bits → MixedBitQuantizer. Existing scoring (`sensitivity.rs`) and quantizer (`mixed.rs`) are reusable; the stub gets replaced by ~150 LOC orchestration. No fallback retained — qwen35 always uses activation calibration once P9b lands.
+
+**OOM risk mitigation (R12 follow-up):** Per memory `feedback_oom_prevention.md`, the apex MoE is ~30 GB at f32 dequantized + ~30 GB tensor_map at f16 = ~60 GB peak. If the held tensor_map proves untenable on a 64 GB system during real-model capture, fallback (in priority order):
+1. Drop tensor_map after step 9b.2; re-read from safetensors after capture (~30 s extra I/O).
+2. Stream intermediate GGUF emission in chunks rather than buffering the full quantized output (Q-tier disk-streaming work, ADR-001 territory).
+
+Both fallbacks keep path (a) intact; neither requires path (b).
+
+**Acceptance (P9b close):** all 7 sub-tasks shipped; new integration test green on synthetic qwen35-dense + qwen35-moe; old P9b-pending guard message removed from `src/main.rs`; intermediate GGUF cleanup verified by test on both happy-path and panic-path (Drop runs).
+
+#### Apex MoE activation capture: architectural OOM blocker (2026-04-25 finding)
+
+The two-pass conversion pipeline works end-to-end for **qwen35 dense** (27B) — both dwq46 and dwq48 GGUFs shipped this session. For **qwen35moe** (apex 35B-A3B), the pipeline gets to step 5 (RealActivationCapture::new → Qwen35Model::load_from_gguf on the intermediate F16 GGUF) and hits a memory wall:
+
+- Intermediate F16 GGUF emit succeeds: 66 GB on disk, all 6 P9b real-model fixes (a) language_model strip, (b) gate_up split, (c) pre-merged detect, (d) vocab pad, (e) A_log dtype, (f) linear_attn name map applied cleanly.
+- `load_moe_ffn_quantized` rejects F16 expert dtype (expects native GGML block quant Q4_0/Q8_0/Q5_K/Q6_K).
+- Routing to the F32-expanded `Qwen35FfnWeights::Moe` variant would expand 32.2 B MoE-expert params × 4 bytes ≈ 128 GB, plus tensor_map ~70 GB held = ~198 GB total. **System RAM is 128 GB.** Even with tensor_map dropped pre-capture (the cost-model OOM-mitigation candidate #3), the F32-expanded model alone is at the system limit with no slack.
+- `MoeQ` (production native-quant) path returns `RealActivationCaptureError::ForwardPass` per the existing architectural decision (the CPU forward kernel doesn't have a `quantized_matmul_ggml` for the F32 codepath).
+
+**Practical conclusion:** activation-aware DWQ for apex 35B-A3B requires the capture forward pass to run on the **GPU** via mlx-native's existing `quantized_matmul_ggml` kernel, not the CPU `forward_cpu` path. That's a real ADR-013 follow-up: extend `RealActivationCapture::run_calibration_prompt` to dispatch to the GPU forward when the model is `MoeQ`. Out of scope for P9b — would require coupling the convert-time activation capture to the runtime GPU forward path.
+
+**Update 2026-04-25 (mantra-aligned wire-up shipped):** GPU capture path landed in commits `834828f` + `c352d0e`. `Qwen35Model::forward_gpu_with_capture` is a thin wrapper over the existing `forward_gpu_impl` with a `&mut LayerActivations` target threaded through; layer-input/output residual streams are downloaded to F32 CPU memory at the start/end of each layer iteration via the same `download_f32` bridge `forward_gpu` already uses for `HF2Q_DUMP_LAYER_ACTIVATIONS`. `RealActivationCapture::run_calibration_prompt` now dispatches to `run_calibration_prompt_gpu` when any layer FFN is `Moe` or `MoeQ` — i.e. apex 35B-A3B no longer requires the F32 expansion at all (production `MoeQ` runs `quantized_matmul_ggml` directly on native GGML blocks). CPU forward stays as the byte-identical reference path for Dense and is the test-only path for synthetic models. `HF2Q_FORCE_CPU_CAPTURE=1` escapes only for parity debugging. All 9 `activation_capture_real` tests pass.
+
+For this session's Task #16 close: **qwen35 dense × dwq46/dwq48 shipped (2/4)**; apex MoE × dwq46/dwq48 deferred to the GPU-capture follow-up.
+
+#### P9 first real-model DWQ GGUF SHIPPED 2026-04-25
+
+`models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf` produced via the
+two-pass pipeline. End-to-end on Qwen/Qwen3.6-27B safetensors:
+- Input: 51.75 GB safetensors (BF16)
+- Output: 16.54 GB DWQ GGUF (3.1× compression)
+- Wall-clock: 20m 09s on M5 Max (HF download + transforms + intermediate F16 emit + CPU activation capture over 1024-token forward pass + DWQ scale calibration + final write)
+- GGUF magic + version 3 verified (`4747 5546 0300 0000` at file head)
+
+Three real-world bugs surfaced and fixed during this run (each was a synthetic-test gap that real safetensors uncovered):
+
+| Commit | Fix |
+|---|---|
+| `9ef3068` | A_log negation accepts BF16/F16 source data (real Qwen3.6 ships A_log as BF16, not F32 — synthetic fixtures had F32) |
+| `8e6282d` | linear_attn family wired into `hf_name_to_gguf` layer_map for both qwen35 + qwen35moe arches (was missing entirely; canonical mapping existed in `src/models/qwen35/dense.rs::map_linear_attn_suffix` but never wired into the GGUF backend) |
+| `b35aa9f` | qwen35 `load_from_gguf` accepts physically-padded vocab (token_embd 248320 rows vs metadata logical 248044; fix overrides cfg.vocab_size from tensor shape, matching llama.cpp's internal handling) |
+
+The remaining three GGUFs in Task #16 (qwen35 dwq48, qwen35moe × dwq46/dwq48) reuse the same cleared paths.
+
+#### P9b cost-model & optimization candidates (2026-04-25 audit)
+
+Captured here so future profiling has a concrete baseline. All numbers are theoretical from layout + dtype reasoning; the real-model run on apex MoE (Task #16) will validate or correct them.
+
+**Per-stage RAM peak — apex Qwen3.6-35B-A3B (40 layers MoE, 256 experts, hidden_size=2048):**
+
+| Stage | What's resident | Bytes | Apex peak |
+|---|---|---|---|
+| 1. Read safetensors → `tensor_map` | BF16 weights (no F32 expansion of MoE experts) | bf16: 2 B/elem × ~16B params | ~32 GB |
+| 1.7. Apply qwen35 transforms (V-tile, RMS+1, MoE merge, qkvz split) | Same shape, in-place transforms; transient ~1–2 GB | | +~2 GB transient |
+| 9b.2. `emit_gguf_from_tensor_map` → `quantize_model` step | tensor_map + new `QuantizedModel` HashMap (preserved, F16 path is essentially a copy) | tensor_map (32 GB) + QuantizedModel (~30 GB after BF16→F16) | **~62 GB peak (worst point in two-pass path)** |
+| 9b.2. `GgufBackend::write` step | tensor_map + QuantizedModel + write buffer (BufWriter ~MB) | as above | ~62 GB |
+| 9b.3b. `RealActivationCapture::new` → `Qwen35Model::load_from_gguf` | tensor_map + `Qwen35Model` (F32 dequant of attention weights + native-quantized MoE experts via `MoeFfnWeightsQ`) | tensor_map (32 GB) + Qwen35Model (~12 GB: attn F32 ~2 GB × 40 layers × 0.15 = ~6 GB + MoE-Q raw blocks ~6 GB) | ~44 GB |
+| 9b.3a. `run_calibration_prompt` | + small per-step buffers + activations capture (~MB scale per layer × 40) | as above + ~1–2 GB activations | ~46 GB |
+| Capture done; `drop(capture)` releases `Qwen35Model` | tensor_map only | 32 GB | ~32 GB |
+| DWQ pass on tensor_map | tensor_map + new QuantizedModel (DWQ-output, ~12 GB at dwq46 average) | 32 + 12 GB | ~44 GB |
+| Write final GGUF | tensor_map (released after write) + QuantizedModel + write buffer | 32 + 12 GB | ~44 GB peak (post-capture) |
+
+**Apex MoE peak verdict:** ~62 GB during step 9b.2 quantize-as-F16. Tight on 64 GB systems; comfortable on 96 GB. The held-tensor_map fallback (drop after emit, re-read from safetensors after capture) reduces this peak to ~32 GB at the cost of ~30 s re-read I/O — kept in reserve and not yet wired (ADR-012 doesn't currently observe a 64 GB system as the bottleneck because Robert's hardware is 128 GB).
+
+**Disk peak — apex MoE:** ~30 GB intermediate F16 GGUF + ~12 GB final dwq46 GGUF + ~30 GB safetensors = ~72 GB peak (intermediate is dropped via `tempfile::TempDir` Drop after capture; final + safetensors persist).
+
+**Optimization candidates (none required for P9b close; ranked by ROI):**
+
+1. **Skip `QuantizedModel` materialization in `emit_gguf_from_tensor_map`.** The F16 + preserve-everything path through `quantize::quantize_model` produces a `QuantizedModel` whose `data: Vec<u8>` is essentially a duplicate of `tensor_map`'s bytes (BF16→F16 conversion is the only real work). A direct `tensor_map → GGUF write` path would save ~30 GB at the worst-case stage (step 9b.2). **Effort:** medium — requires duplicating ~50 LOC of `GgufBackend::write` for the TensorMap input, or refactoring `write` to accept either input via a trait. **ROI:** highest among candidates — eliminates the absolute peak.
+
+2. **Streamed F16 GGUF emission.** Even with optimization (1), `BufWriter` buffers ~MBs of tensor data per write. A streaming emit (write each tensor's bytes immediately to disk, no in-memory intermediate) is ~zero RAM beyond the tensor itself. **Effort:** low — `GgufBackend::write` already iterates tensors sequentially; the savings is in not buffering the QuantizedModel struct. Combined with (1), peak drops to ~32 GB. **ROI:** high.
+
+3. **Drop-and-reload tensor_map across capture.** Document the OOM-mitigation fallback in code (currently in ADR comment only): drop tensor_map after step 9b.2 emit, re-read from `config.input_dir` safetensors after capture, redo qwen35 transforms (idempotent). **Effort:** low — wraps existing `input::read_model` + transforms in a closure. **ROI:** medium — only relevant on <64 GB systems. Defer until someone reports a real-world OOM.
+
+4. **F16-only Qwen35Model.** Currently `Qwen35Model::load_from_gguf` dequantizes attention weights to F32 (per `weight_loader::load_*` shape; ~2 GB/layer × 40 layers × 0.15 nonzero ≈ 12 GB F32). An F16 in-memory model would halve this to ~6 GB peak post-capture. **Effort:** very high — touches all CPU forward kernels (rms_norm, projections, RoPE, SDPA, GDN); changes the residual-stream dtype contract. **ROI:** low for P9 close (peak is already at 9b.2, not capture); revisit if F16 unifies with a future GPU forward.
+
+**Wall-clock estimate for apex MoE two-pass conversion (Robert's M5 Max, est.):**
+
+| Stage | Est. time |
+|---|---|
+| Safetensors read + qwen35 transforms | ~25 s |
+| 9b.2 emit_gguf_from_tensor_map (F16 quantize + write 30 GB) | ~120 s |
+| 9b.3b RealActivationCapture::new (Qwen35Model::load_from_gguf, dequant 30 GB) | ~80 s |
+| 9b.3a run_calibration_prompt (1024 tokens × 40-layer hybrid forward, CPU) | ~60–180 s |
+| `compute_layer_sensitivity` + `allocate_bits_by_sensitivity` (40 × 2048 elements) | <1 s |
+| DWQ closed-form scale calibration (dwq46/dwq48, 40 layers × hundreds of tensors) | ~30 s |
+| Final GGUF write (~12 GB dwq46) | ~50 s |
+| **Total estimated** | **~6–8 min per (model × variant)** |
+
+Times to be replaced with measured numbers when Task #16 runs. Treat as upper-bound order-of-magnitude pending real data.
+
+### P10 — Pure-Rust mmproj vision-tower emitter (defense-in-depth)
+
+**Scope:** Decision 18 with all four defense layers (party-mode Option 5). Independent of P9 — can ship in parallel.
+
+**Dependency:** P8 (arch-registry scaffolding; P10 registers vision emission via `ArchEntry::has_vision`). Uses ADR-005 phase 2c's mmproj loader as a read-only consumer for Layer B round-trip acceptance, no build-time dep.
+
+**Deliverables:**
+- `src/models/vit/mod.rs` — `convert_vision_tower(hf_repo: &HfRepo, output_dir: &Path) -> Result<Option<PathBuf>>` (returns `Ok(None)` when `vision_config` absent).
+- `src/models/vit/config.rs` — `VisionConfig` parser + validator + typed errors.
+- `src/models/vit/convert.rs` — HF tensor-name → GGUF tensor-name mapping table (hand-transcribed from `/opt/llama.cpp/tools/mtmd/clip-model.h` and `clip.cpp`, one file:line citation per entry).
+- `src/models/vit/gguf_emit.rs` — writes F16 mmproj GGUF with `general.architecture = "clip"` and `clip.vision.*` metadata.
+- `src/cli.rs` — new `--emit-vision-tower` flag on the `convert` subcommand.
+- `src/main.rs` — wire the flag through the convert pipeline, with silent-skip semantics when `vision_config` is absent (no error).
+- **Layer A (structural):** `tests/convert_vision_tower_integration.rs` (synthetic tiny ViT round-trip), `tests/convert_vision_tower_noop.rs` (no-op-when-absent), Gemma-4 SHA-256 regression fixture.
+- **Layer B (ADR-005 round-trip, synthetic + real-model):** `tests/convert_vision_tower_adr005_roundtrip.rs` — synthetic mmproj loads via `src/inference/vit/loader.rs` (default cargo test); `#[ignore]`-gated real-model variant exercises 27B dense shapes; every expected tensor present with correct shape; loader errors include tensor name on reject.
+- **Layer C (spec-driven layout):** unit tests in `src/models/vit/convert.rs` covering the four highest-risk mapping entries (`fc1`↔`fc2`, `linear_1`↔`linear_2`, patch-embd transpose, position-embd dtype). Each test has a citation comment to `clip-model.h` or `clip.cpp` line.
+- Real-model smoke update: `hf2q smoke --arch qwen35 --with-vision` invokes `llama-mtmd-cli --mmproj ... --model ...` and records an extra transcript under `tests/fixtures/smoke-transcripts/`.
+- `docs/converting-qwen35.md` section: "Emitting the vision tower (dense variant only)".
+
+**Acceptance:** Decision 18 criteria met across all three layers (A + B + C). Correctness is proven against the `clip.cpp` + `clip-model.h` spec via hand-transcribed catalog and spec-driven synthetic tests; no external-reference oracle is invoked (sovereignty).
+
+**Estimated LOC:** ~1000 (module + CLI + wire-up + Layer A ~800; Layer B synthetic + real-model round-trip tests ~80; Layer C spec-driven tests ~150).
+
+### P11 — MTP tensor round-trip integrity gate
+
+**Scope:** Decision 19. Independent of P9/P10.
+
+**Dependency:** ADR-013's weight loader must expose a tensor-name-aware error surface. If ADR-013's loader currently swallows unknown tensors or returns opaque errors, fix that surface as part of P11 — it is a genuine loader-quality requirement, not a hoop.
+
+**Deliverables:**
+- `tests/convert_qwen35_mtp_roundtrip.rs` with two test functions (dense + MoE variant). Runs < 30 s, default `cargo test` set, CI-green.
+- `const EXPECTED_MTP_TENSORS: &[(&str, &[usize], TensorDtype)]` — hand-authored, derived from `/opt/llama.cpp/src/llama-arch.cpp:447-450` with per-entry citations.
+- `docs/adr/diary/ADR-013-qwen35-inference.md` — new phase entry "P14 — MTP speculative-decoding execution" with status `planned` and a blocker reference to ADR-012 P11. **Landed in the same commit as the P11 test.**
+- Manual bisection note in `docs/converting-qwen35.md` demonstrating how a one-letter rename of an MTP tensor trips the gate — proves the gate is live.
+- If needed: `src/inference/models/qwen35/weight_loader.rs` error-message surface hardening so load failures include the offending tensor name.
+
+**Acceptance:** Decision 19 criteria met. Both variants round-trip successfully. A deliberate bug in the MTP emission path fails the test with an actionable error message naming the tensor. ADR-013 P14 entry exists.
+
+**Estimated LOC:** ~200 (test ~120, ADR-013 entry ~40, optional loader error hardening ~40).
+
+### Totals
+
+- **Code LOC (shipped P0–P7):** ~8,600 across 8 feature commits.
+- **Code LOC (remaining P8–P11, post 2026-04-24 party-mode refinement):** ~2,400 (P8 ~500 incl. Decision 20 scaffolding; P9 ~700 incl. PPL/KL eval infra; P10 ~1,000 three-layer defense; P11 ~200).
+- **Tests:** ≥ 1 unit test per transform (done); 4 integration tests across P0–P7 (done); P8 adds conformance unit test suite + committed transcripts; P9 adds 2 integration tests + quality-threshold unit test + calibration-eval-disjoint unit test + regression test; P10 adds Layer A+B+C+D tests; P11 adds 1 integration test with 2 variants. **Total additional:** ~12 test files across P8–P11.
+- **Docs:** 3 new/updated in P7 (done); P8 adds `docs/arch-onboarding.md` (new — canonical checklist for future arches) + `docs/converting-qwen35.md` smoke section; P10 adds a vision-tower section + `tests/fixtures/mmproj-ground-truth.md`; P11 adds a manual-bisection note + an ADR-013 cross-link entry.
+- **Real-model deliverables (P9 end-gate):** 4 DWQ GGUFs (dense dwq46, dense dwq48, MoE dwq46, MoE dwq48), each passing PPL + KL quality thresholds.
+- **Transcripts (P8/P9):** 8 committed smoke transcripts (2 × Q4_0 baseline + 4 × DWQ with inline PPL/KL + 2 × vision-enabled dense variants).
+- **Quality thresholds (party-mode-confirmed):** DWQ46 PPL ≤ 1.10× F16 · DWQ48 PPL ≤ 1.05× F16 · median KL < 0.02 nats · mmproj cosine anchor ≈ 1.0 within F16 precision.
+- **Arch-table payoff (Decision 20):** Gemma4 parity follow-up pays ~150 LOC; Ministral ADR-015 and DeepSeek-V3 ADR-016 each pay ~200–400 LOC of arch-specific transforms + <50 LOC registry registration. Without Decision 20, each would pay ~1500 LOC of conformance-harness duplication.
+- **Timeline:** sequential due to shared Cargo target. Parallelism opportunities:
+  - P8 (registry + Q4_0 harness) can ship immediately — no dependency on P9/P10/P11.
+  - P10 (vision-tower emitter) depends on P8's registry but is independent of P9 and P11.
+  - P11 (MTP round-trip) depends on P8's registry but is independent of P9 and P10.
+  - P9 depends on ADR-013 P12 being green + ADR-013 F16 forward being bit-stable (implicit handoff, R12).
+  - **Optimal ordering: P8 → P11 → P10 → P9** (P8 first because its scaffolding is consumed by every later phase; P9 last because it has the external dependency and the highest disk/time cost).
+
+---
+
+## Test strategy
+
+### Unit tests (per-transform)
+
+Located alongside implementations in `src/models/qwen35/` (shared transforms in `mod.rs`, dense-specific in `dense.rs`, MoE-specific in `moe.rs`). Each tensor transform in Decisions 5, 6, and 9 has a test with hand-constructed tiny inputs and known outputs, with expected values derived from the mathematical specification in a code comment.
+
+### Regression tests (Chesterton's fence)
+
+- **Gemma-4 DWQ-4-6 byte-identical output** before vs. after P0 (bit-pair parameterization). This is the only way to know P0 didn't accidentally change the Gemma codepath.
+- **Gemma-4 sensitivity choices byte-identical** before vs. after P6 (hybrid cohort priors). Cohort priors must fire only when arch is qwen35moe.
+
+### Integration tests
+
+- `tests/convert_qwen35moe_integration.rs`: synthetic tiny-model end-to-end. 2 linear + 1 full-attn layers, 4 experts, hidden_size=64, head_dim=16. Weights are deterministic from a fixed seed.
+- Output GGUF is read back by hf2q's own GGUF reader and asserted against a **self-contained expected-structure spec** (a constant in the test file that enumerates the expected metadata keys, tensor names, tensor shapes, and for the smallest tensors the expected byte content). The spec is derived by reading llama.cpp source to understand what the loader requires, then hand-authored — not produced by running `convert_hf_to_gguf.py`.
+- No binary reference GGUF is ever checked in. No `.gitignore`d "regenerate via Python on first run" pattern. The test's source of truth lives in the test file.
+
+### Specification-driven tests
+
+- For select tensor transforms (V-reorder, A_log negation, conv1d squeeze, in_proj_qkvz), the expected output on small hand-sized inputs is hand-authored in the test file with a code comment deriving it from the mathematical specification (ggml broadcast semantics, `-exp(x)`, shape squeeze, head-grouped reorder).
+- The specification-driven test IS the spec — if the spec is wrong, the test is wrong; both change together in the same commit with a citation to the llama.cpp source that motivated the change.
+
+### Real-model smoke test
+
+Documented manual test in `docs/converting-qwen35moe.md`:
+
+```
+hf2q convert --repo jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated \
+  --format gguf --quant dwq-mixed-4-6 \
+  --output models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46/out.gguf
+
+llama-cli --model models/.../out.gguf -p "Hello" -n 8
+```
+
+Acceptance: llama-cli loads the file without errors and emits 8 tokens. (Coherence is out of scope; this is a "file is not corrupted" check.)
+
+---
+
+## Risks and mitigations
+
+### R1: llama.cpp changes its `qwen35.*` / `qwen35moe.*` key naming
+
+**Likelihood:** Medium — both arches are new; names may churn.
+**Impact:** hf2q output stops loading in newer llama.cpp.
+**Mitigation:** Doc `docs/converting-qwen35.md` lists the minimum llama.cpp version that loads hf2q's output. When upstream changes key names, that's an ADR addendum (hand-update the transcribed constant list in `src/models/qwen35/{mod,dense,moe}.rs` with new citations) — not a CVE. Spec-driven tests verify what hf2q emits against the hand-transcribed catalog; if upstream diverges, the catalog (not the fixtures) is what needs updating.
+**Automation (2026-04-24):** `tests/upstream_citation_drift.rs` walks every citation in `src/arch/entries/{qwen35,qwen35moe}.rs` and verifies the named `LLM_TENSOR_*` / `LLM_KV_*` constant resolves in the current `/opt/llama.cpp/src/llama-arch.cpp` source (±2-line tolerance for minor upstream shuffles). Fires with an actionable assertion message naming the offending citation. Silent-skips when `/opt/llama.cpp` is absent so CI portability is preserved.
+
+### R2: V-head reorder has a subtle bug that loads but produces garbage
+
+**Likelihood:** Medium — this is the named silent-failure mode in `project_qwen36_architecture.md` gotcha #1.
+**Impact:** GGUF loads, inference produces plausible-looking nonsense. No automated test catches it without inference.
+**Mitigation:** Specification-driven tests (Decision 5 acceptance) with hand-authored expected permutation maps derived from ggml broadcast semantics — the same source of truth llama.cpp's implementation is derived from, independently applied. The inference session's sourdough-gate analogue for Qwen will catch this downstream. Do not ship to Robert's end-user workflow without either the spec-driven tests passing or the inference gate green. Deliberately no reliance on llama.cpp binary output as an oracle — that would couple our correctness proof to a repo we don't own.
+
+**2026-04-24 silent wire-up finding (R2 CLOSED):** The `transform_linear_attn_tensor` and `transform_in_proj_qkvz` functions shipped in P2/P3 (`1a849e1` + `73a96e4`) were tested in isolation but never invoked from the convert pipeline. The follow-up chain landed:
+1. `1bd10a7 feat(adr-012 p3): apply_qwen35_linear_attn_transforms_in_tensor_map walker` — the walker added.
+2. `27e098c test(adr-012 p3): walker positive-value V-head reorder regression tests` — positive-value regression tests for the invariants (Q<K<V synthetic, expected permutation map hand-authored from ggml broadcast semantics).
+3. `b08974e feat(adr-012 r2): flip on Phase 1.7 V-head reorder + correct fixture shapes` — `src/main.rs` Phase 1.7 invocation + corrected fixture shapes ([nv, hidden], qkv_rows = 2×nk×head_k_dim + nv×head_v_dim) across all 8 test files.
+
+Every Qwen3.5 GGUF produced by hf2q now ships ggml-tiled V-head layout. R2's named silent-failure mode is guarded by (a) the walker running unconditionally for qwen35/qwen35moe, (b) the positive-value regression tests asserting byte-identical output against hand-authored permutation maps, and (c) the arch-gated walker no-op for LLaMA/Gemma (regression gate). Any future edit that shortcircuits the walker or alters the permutation trips the regression at convert time, not at inference.
+
+### R3: DWQ calibration can't run because inference session isn't ready
+
+**Likelihood:** High — cross-session coordination is the hardest schedule to align.
+**Impact:** P6 stalls. No conversion output ships for qwen35 / qwen35moe until activation capture is real.
+**Mitigation:** No weight-space fallback is offered — that would be shipping lesser output, which the mantra forbids. Instead: (a) land the `ActivationCapture` trait definition as early as possible in this ADR (P6 kicks off with just the trait in place) so the inference session has a stable target to code against; (b) keep the trait surface minimal — only what the sensitivity scorer actually consumes — to reduce the inference-side work; (c) if stalled, help the inference session directly rather than routing around them. Fix the blocker, don't fall back.
+
+### R4: 35B conversion OOMs
+
+**Likelihood:** Medium — Gemma-4 26B hit 54 GB peak; 35B MoE at ~256 experts has 10× the expert tensor count.
+**Impact:** Convert crashes partway. User loses hours.
+**Mitigation:** Preflight disk check (Decision 14). Per-layer expert-merge streaming (Decision 9). If even that is insufficient, per-projection sub-streaming — measure first, don't implement preemptively.
+
+### R5: The target model's chat template / tokenizer needs pipeline changes
+
+**Likelihood:** Low-medium — Qwen3.5 uses a new 248K vocab; existing hf2q tokenizer-embed logic was tested on Gemma's different format.
+**Impact:** Output GGUF loads but decodes gibberish due to wrong chat template or vocab encoding.
+**Mitigation:** Non-goal 2 explicitly reserves follow-up ADR scope for tokenizer changes. Phase P7 sidecar preservation (Decision 15) ensures the HF tokenizer files are present next to the GGUF for external tools. If hf2q's embed produces wrong output, open a follow-up ADR on the embed path rather than extending this one.
+
+### R6: `--repo` download of ~70 GB fails and re-download wastes a day
+
+**Likelihood:** Medium.
+**Impact:** Lost time.
+**Mitigation:** Decision 14 preflight + resumption test.
+
+### R7: The existing `--bits` flag had users who relied on the silent-ignore behavior
+
+**Likelihood:** Low — the flag was silently ignored, so nobody had any real dependency on it for DWQ.
+**Impact:** If any automation passed `--bits` + `--quant dwq-mixed-4-6` "just in case," it now errors.
+**Mitigation:** Accept the breaking change. Per `feedback_no_broken_windows.md` this is the right call. Error message (Decision 10c) clearly explains the migration.
+
+### R8: P8 smoke test reveals a structural bug in P0–P7 output too late
+
+**Likelihood:** Medium — P0–P7 tested against synthetic tiny models + llama.cpp-source reading, not a real-model end-to-end.
+**Impact:** A hparam-emission or tensor-rename bug hides in the shipped code until P8 runs on the 27B/35B targets. Fix could require re-opening a closed phase.
+**Mitigation:** P8 runs at Q4_0 — fastest possible path to the smoke gate — specifically so this risk surfaces with the least possible wall-clock cost. If P8 fails on Q4_0, the fix lands as an addendum commit under the offending phase (P1–P7) with the commit message citing P8's failure transcript. Do not defer or route around a P8 failure.
+
+### R9: ADR-013 P12's `ActivationCapture` hook surface diverges from what P9 needs
+
+**Likelihood:** Medium — cross-session coordination. ADR-013 P12 is defining the trait API independently and is still in flight as of 2026-04-24 (HEAD `870bd7a` is P8b, not P12).
+**Impact:** P9 blocks until the trait surface resolves. Worst case: ADR-013 P12 ships a surface P9 can't use, forcing a retrofit.
+**Mitigation:** The `ActivationCapture` trait at `src/inference/models/qwen35/activation_capture.rs:141` is already landed and co-owned (ADR-012 P6 adopted it, ADR-013 P12 implements it). Changes to the trait signature require review by an engineer tagged to both ADRs. If the trait needs to grow, both ADRs get an addendum in the same commit — **one interface, two implementations**, no divergence. No weight-space fallback is introduced; fixing the blocker is the only path.
+
+### R10: mmproj GGUF format drifts in upstream `llama.cpp/tools/mtmd`
+
+**Likelihood:** Medium — mmproj is younger than the core GGUF format and its tensor/metadata catalog is still evolving upstream.
+**Impact:** hf2q's P10 output stops loading in newer `llama-mtmd-cli`. The externally-produced reference mmproj currently on disk may be targeting an older format.
+**Mitigation:** Same rule as R1 (loader key churn). `docs/converting-qwen35.md` records the minimum `llama-mtmd-cli` version that loads our P10 output. The hand-transcribed tensor-name catalog in `src/models/vit/convert.rs` carries file:line citations pinned to a specific `/opt/llama.cpp` commit — when upstream drifts, we re-transcribe and re-cite, and the regression test catches anything structural. No fixture comparison against the existing external mmproj (sovereignty). **Automation:** `tests/upstream_citation_drift.rs` fires on drift in the qwen35 catalog; the mmproj catalog in `src/models/vit/convert.rs` uses a different citation format (source-line annotations rather than named constants) and is covered by the spec-driven Layer C layout tests (fc1↔fc2, linear_1↔linear_2).
+
+### R11: P9 wall clock + disk budget on the 35B MoE exceeds M5 Max capacity
+
+**Likelihood:** Low-Medium — DWQ calibration on 35B MoE with 1024 samples × full forward pass through 40 hybrid layers × 256 experts is a workload nobody has measured yet.
+**Impact:** P9 runs hit swap or OOM on the 64 GB M5 Max before producing a deliverable.
+**Mitigation:** Before committing to 1024 samples, run a P9 dry-run with 32 samples first and record per-sample wall time + peak RSS. If extrapolation exceeds the 64 GB budget or the ≤ 2 h *soft* wall-clock target, drop sample count to the largest value that fits, document the reduction in the P9 commit message. Wall-clock is a soft target per 2026-04-24 refinement ("correctness over speed during quant"); disk and peak-RSS remain hard limits.
+
+### R12: ADR-013 F16 forward has a silent numerical skew that P9 inherits
+
+**Likelihood:** Medium — ADR-013's F16 forward for qwen35 / qwen35moe is being implemented in a parallel session mid-refactor (P9b-scale-fix as of 2026-04-24). Party-mode refinement accepted implicit cross-ADR handoff rather than a pinned gate (Bob's option (b)) because Robert authors both sides.
+**Impact:** If ADR-013 F16 is off by e.g. 3% from the true math, P9's PPL/KL numbers measure the skew, not DWQ quant quality. Silent because our own reference is our own stack.
+**Mitigation:**
+1. **Determinism check.** Before any DWQ measurement, P9 asserts the F16 forward produces byte-identical logits across two fresh runs on the 16-prompt smoke set. If non-deterministic, DWQ measurement is meaningless and P9 blocks. This is the sole sovereignty-clean mitigation available to ADR-012 — a one-time llama.cpp F16 sanity anchor was considered and rejected under the same sovereignty instinct that excluded an external-mmproj cosine anchor from Decision 18: comparing our output against an external reference to prove our correctness is the pattern `feedback_hf2q_sovereignty.md` rejects, one-time or automated.
+2. **Accept the residual risk.** With implicit handoff, no pinned gate, and no external oracle, some residual risk remains. The compensating factor is that Robert — single author both sides — is the only person who could unknowingly land the skew. ADR-013 correctness is proven via ADR-013's own acceptance gates (its sourdough-gate analogue when it lands), not via ADR-012 measurement. If ADR-013 ships with a silent F16 numerical skew, P9's PPL/KL numbers will reflect that skew, and the mitigation is to fix ADR-013, not to short-circuit our correctness proof through an external comparison.
+
+---
+
+## Open questions
+
+1. **Exact llama.cpp loader key names for linear-attention hparams.** ~~`LLM_KV_SSM_CONV_KERNEL`, `LLM_KV_LINEAR_ATTN_*`, or something different? Must be extracted from `/opt/llama.cpp/src/llama-arch.cpp` at engineer start time. Do not guess.~~ **RESOLVED 2026-04-24 (spec audit):** No dedicated `LLM_KV_LINEAR_ATTN_*` family exists in llama.cpp — linear-attention arches reuse the `LLM_KV_SSM_*` keys. Gated DeltaNet's five hparams map to `%s.ssm.conv_kernel` (line 268), `%s.ssm.inner_size` (269), `%s.ssm.state_size` (270), `%s.ssm.time_step_rank` (271), `%s.ssm.group_count` (272). hf2q already emits these at `src/backends/gguf.rs:2337-2357` with per-key citations to llama-arch.cpp line numbers; regression tests cover the mapping in the Decision 7 metadata-keys integration suite (`tests/convert_qwen35_metadata_keys.rs`). Any llama.cpp upstream renaming of the SSM key family is caught by `tests/upstream_citation_drift.rs`.
+2. **Post-attention layernorm name** for qwen35moe: ~~`blk.{L}.post_attention_norm` (Gemma convention) or `blk.{L}.ffn_norm` (LLaMA convention)? Resolved by reading `qwen35moe.cpp`'s `build_norm` calls.~~ **RESOLVED 2026-04-24 (spec audit):** `blk.{L}.post_attention_norm` — Gemma convention, NOT LLaMA `ffn_norm`. `/opt/llama.cpp/src/models/qwen35moe.cpp:56` and `/opt/llama.cpp/src/models/qwen35.cpp:56` both call `build_norm(cur, model.layers[il].attn_post_norm, ...)` and immediately pass that output into `build_layer_ffn` on line 60 — the post-attention norm serves double duty and there is no separate `ffn_norm` tensor for either qwen35 arch. `LLM_TENSOR_ATTN_POST_NORM` → `blk.%d.post_attention_norm` per `llama-arch.cpp:367`. hf2q's HF→GGUF mapper honours this at `src/backends/gguf.rs:1487` (qwen35) + `:1502` (qwen35moe) — arch-gated, so LLaMA-family mapping to `ffn_norm` at `:1526` is preserved. Unit tests at `src/backends/gguf.rs:3248` (qwen35/moe) + `:3263` (LLaMA regression) anchor the split.
+3. **Does Qwen3.5 RMS norm use the +1 Qwen convention?** ~~Gotcha #5 in `project_qwen36_architecture.md`. Audit in P3.~~ **RESOLVED + WIRE-UP FIXED 2026-04-24:** YES — `convert_hf_to_gguf.py:4794-4795` in `Qwen3NextModel.modify_tensors` (base class for both Qwen3_5TextModel + Qwen3_5MoeTextModel) explicitly adds 1 to every weight ending in `norm.weight` except `linear_attn.norm.weight`. P3 shipped the `apply_rms_norm_plus_one` per-tensor transform (commit `73a96e4`) but **never wired it into the convert pipeline** — silent gap caught by spec-source audit. The 2026-04-24 follow-up adds `apply_rms_norm_plus_one_in_tensor_map` (walker) + invokes it from `src/main.rs` Phase 1.6 alongside the MoE merge. Regression gate at `tests/convert_qwen35_rms_norm_plus_one.rs` (3 tests) asserts: (a) norm tensors remain present post-transform, (b) zero-seeded `output_norm` is 1.0 post-convert, (c) excluded `linear_attn.norm.weight` remains zero. Gemma4 / LLaMA no-op gated by arch-string match.
+4. **Output-gate weight HF tensor name.** ~~Likely `self_attn.output_gate.weight` or `self_attn.gate_proj.weight` — verify by inspecting the actual HF safetensors keys in the target model.~~ **RESOLVED 2026-04-24:** Read `/opt/llama.cpp/convert_hf_to_gguf.py:Qwen3NextModel.modify_tensors` (lines 4789+): the only tensor emitted to `MODEL_TENSOR.ATTN_GATE` is derived from the **linear-attention** `in_proj_qkvz.weight` split (`z` partition). Full-attention layers do NOT ship a distinct gate tensor. `attn_output_gate: true` in Qwen3.5 configs refers to the linear-attn `in_proj_z` path only. On the loader side, `llama-model.cpp:7517/7579/7642` creates `wqkv_gate` for full-attn layers with `TENSOR_NOT_REQUIRED` — it's optional and absent by default in real Qwen3.5 GGUFs. Our P3 mapper already handles `in_proj_z.weight → attn_gate.weight` at `src/models/qwen35/dense.rs:139` + `moe.rs:181`. No additional full-attn gate mapping needed; synthetic-test `self_attn.gate.weight` falls through the mapper's unknown-passthrough (harmless since llama.cpp's loader ignores unknown tensor names).
+5. **MTP tensor full set.** ~~Decision 11 lists the `nextn.*` names in `llama-arch.cpp:447-450` — confirm which subset Qwen3.5-MoE's MTP produces.~~ **RESOLVED 2026-04-24:** `/opt/llama.cpp/src/models/qwen35.cpp` and `qwen35moe.cpp` contain **zero** references to `nextn`, `mtp`, or `shared_head`. llama.cpp's current Qwen3.5 graph builders ignore MTP tensors entirely (they're not wired into the forward graph for either arch). Our ADR-012 Decision 11 emits the 4-tensor DeepSeek-V3-derived MTP set (`enorm`, `hnorm`, `embed_tokens`, `eh_proj` per `llama-arch.cpp:447-450`) for ADR-013 P14's future speculative-decoding consumer — NOT for llama.cpp's current loader. If DeepSeek-V3's MTP adds `shared_head_head` / `shared_head_norm` (`llama-arch.cpp:451-452`) and ADR-013 P14 needs them, extend the P11 round-trip catalog and the backend emitter at that time — adding them now would be speculative stub per the mantra. `tests/convert_qwen35_mtp_roundtrip.rs` pins the 4-tensor set; any expansion updates both the emitter and the gate in the same commit.
+6. **DWQ sensitivity heuristic — is per-tensor the right granularity, or do we need per-expert?** For 256 experts per MoE layer, treating them as a single `ffn_gate_exps` tensor may mask a subset of experts that are individually sensitive. Investigation during P6.
+
+---
+
+## Dependencies on other work (cross-ADR)
+
+- **ADR-013 (`Qwen3.5 / Qwen3.5-MoE Inference Support`) — P12 `weight_loader.rs` real-weight path + forward-pass hook points on `Qwen3_5TextModel::forward` / `Qwen3_5MoeTextModel::forward`.** This is the hard blocker for **P9**. No weight-space fallback path exists for `qwen35` / `qwen35moe` DWQ; if ADR-013 P12 isn't green, P9 waits. The `ActivationCapture` trait at `src/inference/models/qwen35/activation_capture.rs:141` is the stable API contract — changes require both-ADR review.
+- **ADR-013 P14 — MTP speculative-decoding execution (new phase, created by Decision 19).** ADR-012 P11 ships the conversion-side contract (tensor integrity gate); ADR-013 P14 implements draft/accept loops. P14's blocker is ADR-012 P11 (P14 can't draft speculative tokens until P11 proves the tensors round-trip).
+- **ADR-005 phase 2c — mmproj / ViT forward-pass execution.** Consumes ADR-012 P10's output (`mmproj-qwen36-F16.gguf`) as a read-only artifact AND provides P10 Layer B's round-trip gate (party-mode Option 5). ADR-005's mmproj loader (`src/inference/vit/loader.rs`) must expose a tensor-name-aware error surface — identical quality requirement to ADR-013's P11 dependency. If ADR-005's loader needs a quirk, the fix lands on that side — P10's deliverable shape is pinned by the hand-transcribed `clip.cpp` catalog, not by ad-hoc loader convenience.
+- **`/opt/mlx-native` Metal kernels** (GATED_DELTA_NET, SSM_CONV, TRI_SOLVE, L2_NORM, CumSum per `project_qwen36_architecture.md`): needed by ADR-013's forward pass, therefore transitively needed by P9 (since `RealActivationCapture` drives that forward). Not needed by P8, P10, or P11.
+- **Tokenizer pipeline:** Existing hf2q tokenizer embed path assumed sufficient for the Qwen3.5 248K vocab. Validated empirically by P8 (if the embed is wrong, llama-cli produces garbled output and P8's determinism assertion catches it). **If P8 surfaces a tokenizer bug, a follow-up ADR owns the fix — this scope does not absorb tokenizer work** (Non-Goal 2 unchanged).
+- **`/opt/llama.cpp`** as a read-only spec source only: `convert_hf_to_gguf.py` (tensor transforms), `src/llama-arch.cpp` (metadata keys), `src/models/qwen35*.cpp` (graph builder tensor-name expectations), `tools/mtmd/clip-model.h` + `clip.cpp` (mmproj catalog). No build-time or runtime linkage in any P8–P11 deliverable. Verified via `cargo tree -p hf2q` in the P10 commit.
+
+---
+
+## Glossary
+
+- **A3B / A4B.** MoE shorthand: "active 3B / 4B parameters per token." Total parameters (e.g. 35B for A3B) is much larger.
+- **DWQ.** Dynamic Weight Quantization. hf2q's activation-calibrated mixed-precision quant: base bits for most tensors, promoted to sensitive bits for layers whose activations show high quantization error. Default Gemma preset: 4-base, 6-sensitive.
+- **Gated DeltaNet.** A linear-attention variant using a selective state-space model (SSM) with a learned gating mechanism. Qwen3.5's replacement for Mamba-style state updates.
+- **GGUF.** The file format used by the ggml ecosystem (llama.cpp, ollama). Contains weights + metadata + tokenizer in a single file.
+- **LLM_ARCH_QWEN35.** The llama.cpp architecture constant for Qwen3.5 dense. Arch string: `qwen35`. Reference: `/opt/llama.cpp/src/llama-arch.cpp:42`, graph builder `/opt/llama.cpp/src/models/qwen35.cpp`.
+- **LLM_ARCH_QWEN35MOE.** The llama.cpp architecture constant for Qwen3.5-MoE. Arch string: `qwen35moe`. Reference: `/opt/llama.cpp/src/llama-arch.cpp:43`, graph builder `/opt/llama.cpp/src/models/qwen35moe.cpp`.
+- **MoE.** Mixture of Experts. Each FFN layer is replaced by N experts and a router; each token routes through top-K experts.
+- **MROPE.** Multi-axis RoPE. Partitions the rotary dimensions into multiple sections with different theta bases, originally for video/image positional encoding; used in Qwen3.5-MoE for long-context efficiency.
+- **MTP.** Multi-Token Prediction. An extra small transformer block after the main stack that predicts the *next* next token, enabling speculative decoding. Originated in DeepSeek-V3.
+- **Shared experts.** In some MoE architectures (including Qwen3.5-MoE), a small set of experts are activated for *every* token regardless of the router. Distinct tensors from the routed experts.
+- **V-head grouped vs tiled.** Two memory layouts for multi-head tensors when `num_v_heads > num_k_heads`. Grouped: V heads adjacent per K head (`G0_v0, G0_v1, G1_v0, G1_v1, ...`). Tiled: all K heads' first V, then all K heads' second V (`G0_v0, G1_v0, G0_v1, G1_v1, ...`). HF uses grouped; ggml binary ops expect tiled.
+
+---
+
+## Appendix A: Target convert commands (once all phases land)
+
+### Qwen3.6-35B-A3B MoE (qwen35moe)
+
+```bash
+# 4-bit DWQ
+hf2q convert \
+  --repo jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated \
+  --format gguf \
+  --quant dwq-mixed-4-6 \
+  --calibration-samples 1024 \
+  --output models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46.gguf
+
+# 8-bit DWQ
+hf2q convert \
+  --repo jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated \
+  --format gguf \
+  --quant dwq-mixed-4-8 \
+  --calibration-samples 1024 \
+  --output models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq48/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq48.gguf
+```
+
+### Qwen3.6-27B dense (qwen35)
+
+```bash
+# 4-bit DWQ
+hf2q convert \
+  --repo Qwen/Qwen3.6-27B \
+  --format gguf \
+  --quant dwq-mixed-4-6 \
+  --calibration-samples 1024 \
+  --output models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf
+
+# 8-bit DWQ
+hf2q convert \
+  --repo Qwen/Qwen3.6-27B \
+  --format gguf \
+  --quant dwq-mixed-4-8 \
+  --calibration-samples 1024 \
+  --output models/qwen3.6-27b-dwq48/qwen3.6-27b-dwq48.gguf
+```
+
+---
+
+## Appendix B: Canonical gotcha cross-reference
+
+Every gotcha from `project_qwen36_architecture.md` is addressed in a specific decision in this ADR. The table below is the engineer's checklist for "did I handle everything?"
+
+| Gotcha from memory | ADR Decision |
+|---|---|
+| #1 V-head grouped→tiled | Decision 5 |
+| #2 A_log negation | Decision 6 |
+| #3 dt_bias rename | Decision 6 |
+| #4 Conv1d squeeze | Decision 6 |
+| #5 RMS norm +1 | Decision 6 (audit) |
+| #6 in_proj_qkvz reordering | Decision 6 |
+| #7 Decay-mask log-space clamp | **Inference-only** — not a convert-time transform; belongs to inference session's ADR |
+| #8 MROPE sections | Decision 7 (metadata emission) |
+| #9 `full_attention_interval` vs `layer_types` | Decision 2 (parser dual-support) |
+| #10 Expert weights scale | **Inference-only** — runtime scaling, not persisted in tensor data |
+
+Gotchas #7 and #10 are runtime concerns owned by the inference session; conversion does not transform them.
+
+## Progress log (reverse chronological)
+
+### 2026-04-30 — chat-template auto-inject · CFA dual-mode (claude) — silent-fail path closed; ADR-013 sourdough decontaminated
+
+**(a) Defect.** 4 of 5 Qwen3.6 GGUFs on disk (all "abliterated" variants of `qwen3.6-27b-dwq46`) ship a `tokenizer_config.json` that lacks the `chat_template` field. The convert path at `src/backends/gguf.rs::load_tokenizer_metadata` (the `tokenizer.chat_template` write block) read `chat_template.jinja` first, fell back to `tokenizer_config.json[chat_template]`, and **silently skipped emit when both were absent**. Runtime path `src/serve/mod.rs::render_chat_template` (priority 4) then fell through to `FALLBACK_GEMMA4_CHAT_TEMPLATE`, which Qwen3 was never trained on — the chat session emitted Gemma4 control tokens that Qwen3.6 decoded as nonsense, producing the gibberish that contaminated ADR-013's sourdough byte-parity gate on small prompts.
+
+**(b) Fix.** New module `src/backends/chat_templates.rs` owns vendor-shipped per-arch chat templates. The `qwen3-chatml.jinja` fixture is **the verbatim 7764-byte `chat_template` field** from the canonical `qwen3.6-27b-dwq46/tokenizer_config.json` — copied byte-for-byte; never synthesized. Compile-time fixture length pinned at `QWEN3_CHATML_LEN = 7764` and asserted in `vendor_chat_template_lengths_match_fixtures`. The `gguf.rs` write site now follows a four-step priority chain — `chat_template.jinja` → `tokenizer_config.json[chat_template]` → arch-default → graceful skip + structured WARN. `INFO` log on inject (`arch=… source=… length=…`); `WARN` on the skip path (operator-visible).
+
+**(c) Per-arch coverage table.**
+
+| arch | source ref | status |
+|---|---|---|
+| `qwen35` / `qwen35moe` | `qwen3.6-27b-dwq46/tokenizer_config.json[chat_template]` | EMBEDDED (verbatim, 7764 B) |
+| `qwen2` / `qwen3` | (no vendor reference captured yet) | WARN-only |
+| `gemma3` / `gemma4` | (no vendor reference captured yet) | WARN-only |
+| `llama` / `mistral` / `phi` | (no vendor reference captured yet) | WARN-only |
+
+New arches MUST source from a published vendor `tokenizer_config.json` and be copied verbatim — the runtime `feedback_prove_in_code.md` + `feedback_dont_guess.md` rules apply.
+
+**(d) Tests added (in `backends::gguf::tests`).** `chat_template_inject_qwen35moe_when_source_missing` (PRIMARY auto-inject path emits 7764-byte Qwen3 ChatML); `chat_template_source_wins_over_arch_default` (vendor-shipped `chat_template` in `tokenizer_config.json` MUST NOT be replaced by arch-default); `chat_template_jinja_file_wins_over_tokenizer_config` (`.jinja` file is highest-priority source); `chat_template_unknown_arch_skips_with_warn` (graceful skip on unknown arch, no synthesized template). Plus 3 fixture tests in `backends::chat_templates::tests` (length pin, qwen35→Qwen3 ChatML, unknown→None).
+
+**(e) Verification.** `cargo build --release --bin hf2q` clean; `cargo test --release --bin hf2q backends::gguf` 71/71 PASS (incl. the full iter211 provenance suite — no regression); `cargo test --release --bin hf2q backends::chat_templates` 3/3 PASS. **ADR-013 sourdough chat-template contamination is closed by this commit** — runtime no longer falls through to the Gemma4 fallback for any qwen35/qwen35moe convert that runs through this updated path.
+
+**(f) Constraints honoured.** Pure Rust; no candle/llama.cpp link. Vendor template embedded verbatim (no synthesis). No env-gating, no fallback-of-the-fallback, no TODO stub. Pathspec-only commit per `feedback_git_commit_pathspec_when_parallel.md`.
+
+### 2026-04-30 — GGUF metadata patch utility · CFA dual-mode (codex) — existing artifacts repaired without tensor mutation
+
+**(a) CLI shipped.** Added `hf2q gguf-patch <input> [--output <out> | --in-place] [--add-chat-template-from-arch] [--dry-run]`. The operation opens the input through `mlx_native::gguf::GgufFile`, detects `general.architecture`, looks up `crate::backends::chat_templates::arch_default_chat_template()`, and injects `tokenizer.chat_template` only when the key is absent. Existing `tokenizer.chat_template` is idempotent skip with INFO. Unknown or missing arch is graceful skip with WARN. `--dry-run` reports the planned injection and writes nothing.
+
+**(b) Implementation note.** The patcher re-emits the GGUF header/metadata/tensor-info table and streams every original tensor payload byte to the new data section. It does not route through `GgufBackend::write` because that writer starts from `QuantizedModel` and may rename, synthesize, or repack tensors; this utility's invariant is stricter for already-built GGUFs: all tensor names and raw tensor bytes must be unchanged.
+
+**(c) Tests.** `cargo test --release --bin hf2q gguf_patch` PASS (4/4): qwen35moe synthetic injects the 7764-byte Qwen3 ChatML template; existing chat_template remains byte-unchanged in place; unknown arch skips without writing; dry-run writes nothing. Regression receipts: `cargo test --release --bin hf2q backends::gguf` PASS (71/71) and `cargo test --release --bin hf2q backends::chat_templates` PASS (3/3).
+
+**(d) Apex apply receipt.** Ran:
+
+```bash
+target/release/hf2q --log-level info gguf-patch \
+  /opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf \
+  --output /tmp/cfa-adr012-gguf-chat-template-patch/codex-apex-patched.gguf
+```
+
+Result: `arch=qwen35moe`, `template_len=7764`, `tensors=733`. Independent parser verification: original had no `tokenizer.chat_template`; patched has `tokenizer.chat_template` length 7764; tensor count 733 -> 733; tensor name symmetric difference 0; per-tensor SHA-256 diffs 0; patched size 24,510,951,456 bytes.
+
+**(e) Sourdough/Metal limitation.** The Codex sandbox has no usable Metal device, so ADR-013 sourdough/bench execution remains blocked here by environment, not by the patch utility. The utility itself is pure metadata/tensor-byte I/O and was verified without Metal.

@@ -2,7 +2,7 @@
 # serve_gemma4_opencode.sh — canonical hf2q serve launcher for the
 # Gemma 4 Ara 26B APEX GGUF, tuned for opencode agentic coding.
 #
-# Verified 2026-08-03 on M5 Max (docs/ADR-017-persistent-block-prefix-cache.md
+# Verified 2026-08-03 on M5 Max (docs/adr/diary/ADR-017-persistent-block-prefix-cache.md
 # "gemma-hybrid-lcp" + long-resume addenda):
 #
 #   HF2Q_KV_LCP_RESUME=1    LCP partial-prefill resume. Default-on under the

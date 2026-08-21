@@ -6,7 +6,7 @@
 //! checkpoint and the canonical GEMMA4 tensor tables.
 //!
 //! Per ADR-033 §P0 + the 2026-05-18 real-model finding
-//! (`docs/adr-033-real-model-findings/2026-05-18-gemma4-arch-mismatch.md`):
+//! (`docs/adr/033-real-model-findings/2026-05-18-gemma4-arch-mismatch.md`):
 //! the prior mapper at this path was written against ADR-033's
 //! "gemma4 = gemma3-shape" assumption, which is **wrong** for the
 //! actual google-gemma-4-26b-a4b-it release. Real Gemma 4 is a

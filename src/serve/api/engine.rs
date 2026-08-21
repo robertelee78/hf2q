@@ -47125,7 +47125,7 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
 /// duplicate-marker ambiguity.
 #[cfg(test)]
 pub(crate) fn adr040_history_doc() -> &'static str {
-    include_str!("../../../docs/ADR-040-history.md")
+    include_str!("../../../docs/adr/ADR-040-history.md")
 }
 
 #[cfg(test)]
@@ -47467,7 +47467,7 @@ mod adr040_phase_e1_closure_tests {
     /// not vanish with the status flip).
     #[test]
     fn adr040_status_line_carries_earned_live_status() {
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = include_str!("../../../docs/adr/ADR-040-continuous-batching-reopen.md");
         // The Status line is the first `- **Status**:` line in the
         // file (per ADR-040 header). Restrict scan to the first
         // 4 KB so we don't accidentally match a §6.1.* status mention

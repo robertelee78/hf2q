@@ -453,7 +453,7 @@ C++ implementation.
 These are deliberately not part of any category:
 
 - Byte-identical batched-prefill parity with the peer at the ~752-byte
-  `sliding_wrap` level (see `docs/ADR-010-exact-batched-kernel-parity.md`;
+  `sliding_wrap` level (see `docs/adr/ADR-010-exact-batched-kernel-parity.md`;
   deferred).
 - Qwen SlotAware soft-token, deepstack, and 3D-position generation. Those
   request shapes fail before Qwen LM scheduler/SSE admission; Qwen3-VL and
@@ -468,15 +468,15 @@ These are deliberately not part of any category:
 ## References
 
 - `docs/operator-env-vars.md` — per-variable effects and defaults.
-- `docs/ADR-009-reference-parity-and-coherence-recovery.md` — why
+- `docs/adr/ADR-009-reference-parity-and-coherence-recovery.md` — why
   F32-KV is the default, and the original per-token prefill baseline
   (since superseded as the default by ADR-028 iter-344).
-- `docs/ADR-010-exact-batched-kernel-parity.md` — why batched-prefill
+- `docs/adr/ADR-010-exact-batched-kernel-parity.md` — why batched-prefill
   is now the default and why its `sliding_wrap` byte-parity is deferred.
-- `docs/ADR-028-peer-parity-coherence-and-speed.md` — iter-344
+- `docs/adr/diary/ADR-028-peer-parity-coherence-and-speed.md` — iter-344
   default-flip of batched prefill and ack-decoupling.
-- `docs/ADR-012-qwen35moe-conversion.md` — qwen35/qwen35moe convert spec.
-- `docs/ADR-014-streaming-convert-pipeline.md` — streaming pipeline +
+- `docs/adr/diary/ADR-012-qwen35moe-conversion.md` — qwen35/qwen35moe convert spec.
+- `docs/adr/diary/ADR-014-streaming-convert-pipeline.md` — streaming pipeline +
   Decision-15 peer-parity gate matrix (the source of truth for the
   8-cell table above).
 - `docs/converting-qwen35.md` — canonical convert commands for Qwen3.5/3.6.

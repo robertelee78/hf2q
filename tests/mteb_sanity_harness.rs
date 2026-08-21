@@ -1,7 +1,7 @@
 //! ADR-005 Phase 2b — MTEB 5-task sanity harness.
 //!
 //! This integration test drives the AC at
-//! `/opt/hf2q/docs/ADR-005-inference-server.md:3979`:
+//! `/opt/hf2q/docs/adr/diary/ADR-005-inference-server.md:3979`:
 //!
 //!   > MTEB 5-task sanity suite recovers published scores within ±1 pt
 //!   > per supported model.

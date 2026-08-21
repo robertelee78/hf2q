@@ -559,9 +559,9 @@ gates from a clean hf2q package resolving published `mlx-native 0.10.16`:
   automatic-tool, and tool-result turn.
 
 The governing decisions and the old-failure-versus-final-artifact distinction
-are recorded in `docs/ADR-019-mlx-native-encoder-architecture.md`,
-`docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
-`docs/ADR-040-continuous-batching-reopen.md`.
+are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
+`docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
+`docs/adr/ADR-040-continuous-batching-reopen.md`.
 
 #### Test the 0.1.7 serving release
 
@@ -801,19 +801,19 @@ catalog + smoke prompt before any forward-pass code lands.
 - `docs/chat.md` — diagnostic chat, local server discovery, and explicit model switching.
 - `docs/operating-kv-cache.md` — TurboQuant KV cache operator guide.
 - `docs/operator-env-vars.md` — every `HF2Q_*` env var, what it gates.
-- `docs/ADR-043-foreground-serve-dashboard.md` — live foreground serve UX,
+- `docs/adr/ADR-043-foreground-serve-dashboard.md` — live foreground serve UX,
   nonblocking telemetry, privacy, and terminal acceptance contract.
 - `docs/shipping-contract.md` — default, supported, experimental, and
   investigation-only product surfaces.
-- `docs/ADR-019-mlx-native-encoder-architecture.md` — Metal encoder ownership
+- `docs/adr/ADR-019-mlx-native-encoder-architecture.md` — Metal encoder ownership
   and pool-less worker lifetime contract.
-- `docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md` — Qwen hybrid cache,
+- `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md` — Qwen hybrid cache,
   bounded prefill, cancellation, and watchdog containment.
-- `docs/ADR-040-continuous-batching-reopen.md` — full-context slot scheduling.
+- `docs/adr/ADR-040-continuous-batching-reopen.md` — full-context slot scheduling.
 - `docs/ADR-*.md` — architectural decisions, rationale, failed spikes, and verification status.
 
 ## License
 
 Dual-licensed under Apache-2.0 OR MIT (`Cargo.toml` `license` field;
 `LICENSE-APACHE` and `LICENSE-MIT` files at repo root).  See
-`docs/ADR-008-candle-divorce.md` for the dependency philosophy.
+`docs/adr/ADR-008-candle-divorce.md` for the dependency philosophy.

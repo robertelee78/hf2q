@@ -2,7 +2,7 @@
 # ADR-034 workload-aware speculative-decode bench.
 #
 # Captures the workload-sensitivity finding from
-# /opt/hf2q/docs/ADR-034-speculative-decode-end-to-end.md §Mission status
+# /opt/hf2q/docs/adr/ADR-034-speculative-decode-end-to-end.md §Mission status
 # (commits 4dd6df2a + 00b9ac54). Runs 3-rep paired benches across:
 #
 #   - Base               (HF2Q_SPEC_DECODE=0)

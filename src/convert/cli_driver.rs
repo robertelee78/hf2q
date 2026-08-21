@@ -2197,7 +2197,7 @@ fn build_qwen35_dense_ctx(config: &serde_json::Value) -> Option<Qwen35DenseCtx> 
 /// without conflating it with "unmapped tensor = bug".
 ///
 /// Surfaced 2026-05-18 by the real-model finding at
-/// `docs/adr-033-real-model-findings/2026-05-18-gemma4-arch-mismatch.md`
+/// `docs/adr/033-real-model-findings/2026-05-18-gemma4-arch-mismatch.md`
 /// — the operator's google-gemma-4-26b-a4b-it ships 220+ vision-tower
 /// tensors alongside the text decoder, and the convert-v2 driver must
 /// silently route those to the mmproj sidecar instead of erroring.

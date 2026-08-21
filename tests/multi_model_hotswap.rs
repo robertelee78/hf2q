@@ -1,6 +1,6 @@
 //! ADR-005 Phase 4 iter-208 (W76) — HotSwapManager E2E harness scaffolding.
 //!
-//! AC 5356 (line 4779 of `docs/ADR-005-inference-server.md`) calls for a
+//! AC 5356 (line 4779 of `docs/adr/diary/ADR-005-inference-server.md`) calls for a
 //! measurement harness proving that two cached GGUFs swap-time on M5
 //! Max stays under the spec'd budget.  This file is the scaffolding
 //! that AC closure (iter-210) will fill in once iter-209 wires the

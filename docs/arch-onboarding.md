@@ -220,7 +220,7 @@ shipped products.
 
 - `src/arch/entries/qwen35.rs` — canonical example (dense variant).
 - `src/arch/entries/qwen35moe.rs` — canonical example (MoE variant).
-- `docs/ADR-012-qwen35moe-conversion.md` — full Decision set (20 decisions, 12 phases).
+- `docs/adr/diary/ADR-012-qwen35moe-conversion.md` — full Decision set (20 decisions, 12 phases).
 - `docs/converting-qwen35.md` — canonical user-facing convert guide.
 - `src/arch/smoke.rs` — the dispatcher every arch inherits for free.
 - `docs/shipping-contract.md` — product-level acceptance clauses.

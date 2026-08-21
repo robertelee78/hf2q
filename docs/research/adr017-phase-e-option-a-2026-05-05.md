@@ -318,7 +318,7 @@ Iter-3 modifies the load-bearing wholesale-reset invariant identified in §1. Pe
 ### KILL criterion — escalates Phase E.a abandonment
 
 - **If H1 fails** at any (K, fixture) — partial prefill is byte-INCOHERENT → ABANDON Phase E.a → pivot to option (b)-only (already shipped iter-5/6) and document that LCP partial-prefill is incompatible with the Gemma 4 dense path.
-- **Cross-link.** Per ADR-009 byte-identity policy, R-C4 byte-equality regressions are HARD escalations (`docs/ADR-009-reference-parity-and-coherence-recovery.md`).
+- **Cross-link.** Per ADR-009 byte-identity policy, R-C4 byte-equality regressions are HARD escalations (`docs/adr/ADR-009-reference-parity-and-coherence-recovery.md`).
 
 ### Cold/warm M5 Max numbers (computed from already-measured baselines)
 
@@ -483,9 +483,9 @@ For Codex Phase-2b citation verification:
 - `kv_persist/prompt_cache_persist.rs` — option (b) reference impl (§2.1, contrast)
 - `tests/kv_persist_gemma4_roundtrip.rs:1563-1730` — R-C4 sourdough internal harness (§1.3)
 - `tests/kv_persist_gemma4_roundtrip.rs:160` — sourdough prompt fixture string (§5 H1)
-- `docs/ADR-017-persistent-block-prefix-cache.md:3434-3461` — iter-4 finding + Phase E motivation (§Q1, TL;DR)
-- `docs/ADR-017-persistent-block-prefix-cache.md:3439` — iter-97+ scope quote (§1.1)
-- `docs/ADR-017-persistent-block-prefix-cache.md:3465-3507` — Phase E iter-5 PromptCache replay (option (b), shipped)
+- `docs/adr/diary/ADR-017-persistent-block-prefix-cache.md:3434-3461` — iter-4 finding + Phase E motivation (§Q1, TL;DR)
+- `docs/adr/diary/ADR-017-persistent-block-prefix-cache.md:3439` — iter-97+ scope quote (§1.1)
+- `docs/adr/diary/ADR-017-persistent-block-prefix-cache.md:3465-3507` — Phase E iter-5 PromptCache replay (option (b), shipped)
 - `/opt/omlx/omlx/cache/prefix_cache.py:1-120` — peer reference, oMLX BlockAwarePrefixCache (§8)
 - `/opt/llama.cpp/tools/server/server-context.cpp:2358-2426` — peer reference, llama-server `cache_prompt`/`n_cache_reuse` (§8)
 - `/opt/vllm/docs/design/prefix_caching.md:1-100` — peer reference, vLLM Automatic Prefix Caching with `cache_salt` (§8, R7)

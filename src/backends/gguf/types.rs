@@ -1,6 +1,6 @@
 //! GGUF v3 byte-format constants + KV-pair encoding utilities.
 //!
-//! Per ADR-033 §P2 + audit file `docs/adr-033-audit/gguf-writer.md`. The
+//! Per ADR-033 §P2 + audit file `docs/adr/033-audit/gguf-writer.md`. The
 //! KV-pair encoding logic here is byte-identical to the inline version
 //! in `src/backends/gguf.rs::write_metadata_kv` (line 4007) and
 //! `write_gguf_string` (line 3999) — existing GGUF files produced by

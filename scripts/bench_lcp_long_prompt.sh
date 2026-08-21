@@ -28,7 +28,7 @@ TRIALS="${TRIALS:-5}"
 LOG_DIR="${LOG_DIR:-/tmp/lcp-long-bench-$$}"
 MAX_TOKENS="${MAX_TOKENS:-16}"
 PROMPT_BYTES="${PROMPT_BYTES:-30000}"  # ~5K tokens at ~6 chars/token for ASCII Markdown
-PROMPT_SOURCE="${PROMPT_SOURCE:-/opt/hf2q/docs/ADR-017-persistent-block-prefix-cache.md}"
+PROMPT_SOURCE="${PROMPT_SOURCE:-/opt/hf2q/docs/adr/diary/ADR-017-persistent-block-prefix-cache.md}"
 
 if [ ! -f "$MODEL" ]; then
     echo "[BENCH] model not found: $MODEL" >&2

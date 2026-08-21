@@ -2,7 +2,7 @@
 //! benchmark harness.
 //!
 //! This crate orchestrates the eight Decision-15 gate cells (lines
-//! 575–582 of `docs/ADR-014-streaming-convert-pipeline.md`) that
+//! 575–582 of `docs/adr/diary/ADR-014-streaming-convert-pipeline.md`) that
 //! compare hf2q's streaming convert pipeline against llama.cpp and
 //! mlx-lm peers across 27B-dense + apex-MoE × {GGUF None, GGUF
 //! Imatrix, safetensors DWQ, GGUF DWQ vs current pipeline}.
@@ -283,7 +283,7 @@ impl fmt::Display for PeerId {
 
 /// A single gate cell from Decision 15. Fields map column-for-column
 /// to the matrix on lines 575–582 of
-/// `docs/ADR-014-streaming-convert-pipeline.md`:
+/// `docs/adr/diary/ADR-014-streaming-convert-pipeline.md`:
 ///
 /// | Field                | Decision-15 column |
 /// |----------------------|--------------------|

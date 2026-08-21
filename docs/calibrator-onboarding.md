@@ -479,6 +479,6 @@ land without churning the API.
   `dwq_bit_pair` + `default_filename_suffix`.
 - `docs/converting-a-model.md` — end-user surface for the variants
   this trait emits.
-- `docs/ADR-014-streaming-convert-pipeline.md` — the ADR that locked
+- `docs/adr/diary/ADR-014-streaming-convert-pipeline.md` — the ADR that locked
   the orthogonal split (Decision 9) and the 17-variant menu
   (Decision 12).

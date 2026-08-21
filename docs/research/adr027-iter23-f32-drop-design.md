@@ -180,7 +180,7 @@ investigation is the load-bearing measurement.
 
 **Scope (1 file, ~30 LOC):**
 - `Users/robert/.claude/projects/-opt-hf2q/memory/project_adr027_phase_b_LANDED_2026_05_08.md` — append iter-23a..d closure section noting the F32-drop and the empirical 3.94× savings.
-- `docs/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`:
+- `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`:
   - Bump iter log with iter-23a..d entries.
   - Update §1 KV memory table footnote: "iter-23 LANDED 2026-05-09 — empirically verified 3.94× per-slot savings at qwen36 32K shape (340 MiB vs 1.34 GB F32 baseline)."
 

@@ -118,7 +118,7 @@
 //! operator-actionable message ("run again or increase REPS") so a
 //! noisy single-iteration measurement cannot fail AC-4 spuriously.
 //! Rationale + rep-count justification documented in
-//! `docs/ADR-040-continuous-batching-reopen.md` §6.1.15.
+//! `docs/adr/ADR-040-continuous-batching-reopen.md` §6.1.15.
 //!
 //! # Metric report shape
 //!

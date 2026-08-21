@@ -142,7 +142,7 @@ const ENV_PHASE_D_R_P1_CONCURRENT: &str = "HF2Q_KV_PERSIST_PHASE_D_R_P1_CONCURRE
 
 /// Phase D R-P5 cold-process-resume ship-gate. When set to "1" alongside
 /// `HF2Q_KV_PERSIST_PHASE_D=1`, the `kv_persist_phase_d_r_p5_e2e` test
-/// runs. R-P5 spec (`docs/ADR-017-persistent-block-prefix-cache.md:372`):
+/// runs. R-P5 spec (`docs/adr/diary/ADR-017-persistent-block-prefix-cache.md:372`):
 /// `cache_hit_TTFT(32K) / no_cache_TTFT(32K) <= 0.15` for cold-process
 /// resume with `ssd_cold_post_restart` cache state — i.e. the SERVER
 /// process is killed between the no-cache and cache-hit decodes (cache
@@ -154,7 +154,7 @@ const ENV_PHASE_D_R_P5: &str = "HF2Q_KV_PERSIST_PHASE_D_R_P5";
 /// Phase D R-P6 multi-agent shared-prefix ship-gate. When set to "1"
 /// alongside `HF2Q_KV_PERSIST_PHASE_D=1`, the
 /// `kv_persist_phase_d_r_p6_e2e` test runs. R-P6 spec
-/// (`docs/ADR-017-persistent-block-prefix-cache.md:374`): with 4
+/// (`docs/adr/diary/ADR-017-persistent-block-prefix-cache.md:374`): with 4
 /// concurrent agents sharing a 4K system prompt, aggregate prefill cost
 /// `<= 1.25 * single_agent_prefill_cost(4K)` — one-time prefill
 /// amortized across 4 agents within 25%.
@@ -1966,7 +1966,7 @@ fn kv_persist_phase_d_r_p1_concurrent_eviction_e2e() {
 /// `HF2Q_KV_PERSIST_E2E_PREFILL_LEN=N`). Default `cargo test`
 /// short-circuits.
 ///
-/// R-P5 spec (`docs/ADR-017-persistent-block-prefix-cache.md:372`):
+/// R-P5 spec (`docs/adr/diary/ADR-017-persistent-block-prefix-cache.md:372`):
 /// `cache_hit_TTFT(32K) / no_cache_TTFT(32K) <= 0.15` for cold-process
 /// resume with `ssd_cold_post_restart` cache state. R-P5 is stricter
 /// than R-P4 (0.15 vs 0.20 ratio) AND requires a true cold process —
@@ -2240,7 +2240,7 @@ fn kv_persist_phase_d_r_p5_e2e() {
 /// `HF2Q_KV_PERSIST_PHASE_D=1` + `HF2Q_KV_PERSIST_PHASE_D_R_P6=1`).
 /// Default `cargo test` short-circuits.
 ///
-/// R-P6 spec (`docs/ADR-017-persistent-block-prefix-cache.md:374`):
+/// R-P6 spec (`docs/adr/diary/ADR-017-persistent-block-prefix-cache.md:374`):
 /// with 4 concurrent agents sharing a 4K system prompt, aggregate
 /// prefill cost `<= 1.25 * single_agent_prefill_cost(4K)` — one-time
 /// prefill amortized across 4 agents within 25%.

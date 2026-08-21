@@ -101,7 +101,7 @@ src/serve/forward_prefill_batched.rs:
 + forward_decode_verify_batched REAL BODY (line 2698+, replaces
   iter-139 serial delegation)
 
-docs/ADR-030-dflash-block-diffusion-spec-decode.md (the ADR itself, 600+ LOC)
+docs/adr/diary/ADR-030-dflash-block-diffusion-spec-decode.md (the ADR itself, 600+ LOC)
 docs/research/
 ├── ADR-030-phase1-m5max-results.{json, md}      Phase 1 K=15 baseline
 ├── ADR-030-phase1-blocksize-sweep.json          K=8/12/15 sweep data

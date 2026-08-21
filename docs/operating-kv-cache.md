@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-01
 **Authored against commit:** `7c6c16005250ffb3ce993a9227d01456adf403b2`
-**ADR:** `docs/ADR-017-persistent-block-prefix-cache.md` (R-O1)
+**ADR:** `docs/adr/diary/ADR-017-persistent-block-prefix-cache.md` (R-O1)
 
 > **⚠ 2026-08-08 addendum (supersedes qwen35-family claims below).**
 > This runbook predates the qwen35/3.6 persist family. What it calls
@@ -178,7 +178,7 @@ clearing KV namespaces. The CLI's `cache` subcommand
 (`src/cli.rs:140-173`) supports only `List`, `Size`, and
 `Clear { model, quant, all, yes }` — none of these touch the
 `<kv-persist>/models/<fp_short>/` subtree. The ADR-017 R-F6 spec
-(`docs/ADR-017-persistent-block-prefix-cache.md:336`) calls for
+(`docs/adr/diary/ADR-017-persistent-block-prefix-cache.md:336`) calls for
 `hf2q cache clear --kv-namespace --model <repo>`; it has not landed.
 
 Operator fallback (run while `cmd_serve` is stopped — there is no
@@ -399,7 +399,7 @@ representative of the real Gemma 4 26B (64 layers).
 
 **Default budget recommendation:** ADR-017 §R-F5 says 10% of unified RAM
 (12.8 GiB on 128 GiB M5 Max,
-`docs/ADR-017-persistent-block-prefix-cache.md:334`). Operator must
+`docs/adr/diary/ADR-017-persistent-block-prefix-cache.md:334`). Operator must
 manually run `du -sh <PATH>/models` and `rm -rf` periodically until the
 budget knob lands.
 
@@ -422,7 +422,7 @@ hot SSD takes single-digit seconds (per ADR §R-F8 SLA).
 ### b. Restore latency higher than expected
 
 ADR §R2 risk register
-(`docs/ADR-017-persistent-block-prefix-cache.md:528`): SSD restore
+(`docs/adr/diary/ADR-017-persistent-block-prefix-cache.md:528`): SSD restore
 latency dominates at 32K context. Computed budget: 5 GB/s NVMe × 670 MB
 ≈ 130 ms. If observed restore wall is far higher:
 
@@ -445,7 +445,7 @@ divergence appears in production:
 1. Capture baseline decode (no `--kv-persist`) and post-restore decode
    (with `--kv-persist`, forced evict-readmit cycle) for the canonical
    sourdough fixture; diff. Per §R-C4
-   (`docs/ADR-017-persistent-block-prefix-cache.md:354`), bytes MUST
+   (`docs/adr/diary/ADR-017-persistent-block-prefix-cache.md:354`), bytes MUST
    match under `HF2Q_USE_DENSE=1`.
 2. Check `kv-quarantine/`. A `parity_fail` bump on `kv_restores_total`
    means the spiller already caught it (`spiller.rs:437-442`); past

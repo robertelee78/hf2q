@@ -1,7 +1,7 @@
 //! DFlash block-diffusion speculative decode draft model (ADR-030).
 //!
 //! Rust port of `/opt/dflash/dflash/model_mlx.py` (582 LOC reference).
-//! See `docs/ADR-030-dflash-block-diffusion-spec-decode.md` for the full
+//! See `docs/adr/diary/ADR-030-dflash-block-diffusion-spec-decode.md` for the full
 //! design.
 //!
 //! Phase 2 (in_progress iter-15): drafter Rust port — config, weights,

@@ -88,7 +88,7 @@ This fixture exists **only** to exercise the iter-2a harness plumbing:
 
 It is **not** a parity-grade corpus. The 512-token window is too
 short for statistically meaningful PPL — Decision 16 (lines ~602 of
-`docs/ADR-014-streaming-convert-pipeline.md`) locks the gate corpus
+`docs/adr/diary/ADR-014-streaming-convert-pipeline.md`) locks the gate corpus
 to the full wikitext-2 raw test split. The peer-parity loader now
 prefers `wikitext2-full.tokens` when present and valid, and logs a
 fallback to `wikitext2-smoke.tokens` otherwise.

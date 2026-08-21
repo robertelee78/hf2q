@@ -3,11 +3,11 @@
 Canonical reference for invoking `hf2q generate` against Qwen3.5 (`qwen35`)
 and Qwen3.5-MoE / Qwen3.6-MoE (`qwen35moe`) GGUFs on Apple Silicon.
 
-See `docs/ADR-013-qwen35-inference.md` for the full architectural rationale,
+See `docs/adr/diary/ADR-013-qwen35-inference.md` for the full architectural rationale,
 phase plan, and end-gate methodology.
 
 For the conversion side (HuggingFace → DWQ GGUF) see
-`docs/converting-qwen35.md` and `docs/ADR-012-qwen35moe-conversion.md`.
+`docs/converting-qwen35.md` and `docs/adr/diary/ADR-012-qwen35moe-conversion.md`.
 
 ---
 
@@ -213,8 +213,8 @@ follow-up ADR:
 
 ## References
 
-- `docs/ADR-013-qwen35-inference.md` — full ADR with phase plan.
-- `docs/ADR-012-qwen35moe-conversion.md` — conversion contract (DWQ GGUF emission).
+- `docs/adr/diary/ADR-013-qwen35-inference.md` — full ADR with phase plan.
+- `docs/adr/diary/ADR-012-qwen35moe-conversion.md` — conversion contract (DWQ GGUF emission).
 - `docs/converting-qwen35.md` — HF → GGUF conversion howto.
 - `scripts/sourdough_qwen35.sh` — byte-prefix correctness gate.
 - `scripts/qwen35_bench.sh` — match-or-beat performance gate.
