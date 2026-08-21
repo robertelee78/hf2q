@@ -94,6 +94,11 @@ if grep -Fq '$d.cooperative_prefill.schema_version == 2' "$release_workflow"; th
   echo "publication still owns model-qualification process receipts" >&2
   exit 1
 fi
+if grep -Eq 'qwen|deepseek|gemma|agentic_cache|model_recipe|hf_download' \
+  "$release_workflow"; then
+  echo "publication still executes model-family qualification" >&2
+  exit 1
+fi
 grep -F 'name ~ /^hf2q(-|$)/ && pgid[i] != owner_pgid' \
   "$thermal_guard" >/dev/null
 if awk '
