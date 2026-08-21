@@ -526,7 +526,7 @@ fn matched_reference_input_and_targets_are_rebuilt_and_compared() {
             name: "fixture".into(),
             producer_sha256: "3".repeat(64),
             repository_url: "https://example.invalid/reference".into(),
-            repository_commit: "1".repeat(64),
+            repository_commit: "1".repeat(40),
             package_version: "1.0.0".into(),
             dependency_lock_sha256: "2".repeat(64),
             python_version: "3.12".into(),
