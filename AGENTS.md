@@ -44,11 +44,31 @@ state. It may show no active memory backend when no swarm is running even while
 the project's native AgentDB is healthy. Do not infer that project memory is
 empty from that view; use `ak status` and the live memory MCP.
 
-Established memory namespaces include `decisions`, `evidence`, `hf2q`, and
-`hf2q-patterns`. For DeepSeek-V4, the decision key
+Established memory namespaces include `decisions`, `evidence`, `hf2q`,
+`hf2q-patterns`, and `coordination`. For DeepSeek-V4, the decision key
 `deepseek-v4-flash-architecture-contract` points to
 `docs/adr/ADR-042-deepseek-v4-flash-rust-native.md`; the agentic acceptance contract
 is stored as `hf2q/deepseek4-agentic-serving-contract-2026-08-05`.
+
+### Live multi-agent coordination (all platforms)
+
+This repo is worked concurrently by agents on multiple platforms (Claude
+Code, Codex, OpenCode, …). The shared bus is Ruflo memory, namespace
+`coordination` — every platform has the memory tools; use them, not
+platform-private memory, for anything another agent might need:
+
+- `hf2q/release/status` — live release/gate state. Check it BEFORE heavy
+  box work (builds, model loads); the self-hosted model gates fail closed
+  on host contention.
+- `hf2q/release/driver` — which session is driving a release. Exactly one
+  driver dispatches cache-lifecycle/release workflows; ask it (key
+  `hf2q/release/inbox/<your-name>`) instead of dispatching yourself.
+- `hf2q/release/protocol` — the standing rules: merges to main are never
+  blocked by gate runs (identity checks assert main *ancestry*, not tip);
+  compile-quiet applies only during model-gate windows; gate models are
+  pinned via repo Actions variables (`<FAMILY>_MODEL_PATH`/`_SHA256`);
+  never delete under `/opt/hf2q/models/` — it is release-gate
+  infrastructure.
 
 Use Ruflo routing or swarms only when work has genuinely independent lanes and
 the added coordination is useful. Never allow two writers in one worktree.
