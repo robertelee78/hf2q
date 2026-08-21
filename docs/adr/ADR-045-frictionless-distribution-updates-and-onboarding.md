@@ -1,10 +1,9 @@
 # ADR-045: Frictionless distribution, updates, and guided onboarding
 
 - Status: Proposed; product scope corrected on 2026-08-20 and 2026-08-21,
-  release gate
-  simplified, and the first public cross-version standalone journey shipped
-  on 2026-08-21; universal Cargo/source ownership and explicit purge are
-  implemented locally pending landing evidence
+  release gate simplified, the first public cross-version standalone journey
+  shipped on 2026-08-21, and channel-aware standalone/Cargo/source lifecycle
+  plus explicit purge landed the same day; distinct-account proof remains
 - Date: 2026-08-17
 - Updated: 2026-08-21
 - Owners: hf2q release engineering and operator experience
@@ -644,9 +643,9 @@ The exact first-image cache gate then used an 86,077-token cold text turn and
 a first-image follow-up with 86,172 prompt tokens. The follow-up reused 86,072
 tokens, performed GPU vision inference, answered that the fixture was red in
 73 completion tokens, stopped normally, and left readiness at HTTP 200. This
-supersedes the earlier text-only artifact as the native self-conversion proof;
-the separately pinned model-author Q5_K_M fast-download path remains a distinct
-text-only guide option.
+supersedes the earlier text-only artifact as the native self-conversion proof.
+The canonical guide now leads with that hf2q-owned conversion path; it does not
+replace it with a model-author preconverted download.
 
 The guide and its retained evidence bind that accepted digest. A separately
 dispatched model-qualification workflow may require the runner's
@@ -765,13 +764,14 @@ As of 2026-08-21, ADR-045 remains **Proposed**.
 What exists:
 
 - hf2q's core conversion, quantization, and serving commands;
-- a source/Cargo-oriented install path;
+- the signed and notarized standalone install path plus Cargo and exact-source
+  alternatives;
 - the canonical tested Qwen3.8 guide whose conversion preserves the
   multimodal pair and whose first serving path exercises text, direct API use,
   and optional OpenCode;
 - a `setup` command that records conversion and serving defaults consumed by
   the existing commands through a selected state root;
-- a local standalone installer template, hidden exact-byte bootstrap, public
+- the published standalone installer, hidden exact-byte bootstrap, public
   `hf2q update`/`hf2q update --rollback`, and marker-gated
   `hf2q uninstall --yes` implementation;
 - fail-closed standalone, Cargo, source-development, and unmanaged ownership
@@ -886,7 +886,10 @@ explicit config/cache purge preview changes nothing and confirmed execution
 removes only the named data while preserving unknown state/cache siblings and
 cache locks.
 
-The local lifecycle slice then passed `cargo check --locked --all-targets
+The channel-lifecycle slice landed through PR #151 at exact reviewed head
+`c2141e4c42d0e3455c362a3813dbd97dc1597d1d` and main merge commit
+`2c12bb43a68d61cec93f292f04b25c2e48144406`. Before landing it passed
+`cargo check --locked --all-targets
 --all-features`, `cargo build --release --locked`, and the complete
 `cargo test --locked` suite: 51 library tests, 4,638 binary tests with 54
 declared ignores, and every executed integration target completed with zero

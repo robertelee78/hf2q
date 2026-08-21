@@ -76,4 +76,6 @@ reject_literal "$contract" "Qwen SlotAware soft-token, deepstack, and 3D-positio
 reject_literal "$readme" "vision (\`qwen3vl\`)"
 require_literal "$readme" "Standalone Qwen3-VL generation and serving fail closed"
 
+"$repo_root/scripts/test_getting_started_guide.sh"
+
 echo "shipping-contract check passed for v${crate_version}"
