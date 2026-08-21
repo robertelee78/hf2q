@@ -468,7 +468,7 @@ fn cmd_convert(
     operator_config: Option<&setup::OperatorConfigV2>,
 ) -> Result<(), AppError> {
     use crate::convert::{
-        run_convert, ConvertArgs, ConvertError, QuantSelector, RemoteConversionSource,
+        run_convert, ConvertArgs, ConvertError, ConvertMode, QuantSelector, RemoteConversionSource,
     };
 
     // QuantSelector parses both standard ftypes (`q5_k_m`, `q8_0`, ...)
@@ -534,6 +534,15 @@ fn cmd_convert(
         );
     }
 
+    let mode = if args.mmproj {
+        ConvertMode::ProjectorOnly
+    } else if args.text_only {
+        ConvertMode::TextOnly
+    } else {
+        ConvertMode::Paired {
+            projector_output: args.mmproj_output,
+        }
+    };
     let resolved = ConvertArgs {
         hf_dir,
         selector,
@@ -543,7 +552,7 @@ fn cmd_convert(
         imatrix_corpus: args.imatrix_corpus,
         imatrix_out: args.imatrix_out,
         imatrix_n_ctx: args.imatrix_n_ctx,
-        mmproj: args.mmproj,
+        mode,
         remote_source,
     };
     run_convert(resolved).map_err(|e| match e {
@@ -569,6 +578,7 @@ fn cmd_convert(
         | ConvertError::Integrity(_)
         | ConvertError::Receipt(_)
         | ConvertError::Vision(_)
+        | ConvertError::Pair { .. }
         | ConvertError::HfDownload(_) => AppError::Conversion(anyhow::anyhow!("{e}")),
     })
 }

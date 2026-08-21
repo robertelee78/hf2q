@@ -338,9 +338,11 @@ name the exact artifact, settings, and host evidence.
 
 The first guide model is
 `jenerallee78/Qwen3.8-27B-Abliterated-SFT` at exact revision
-`08c2f075b43bc06456382db6b918a3dcabdcf4dd`. The guide covers its accepted
-Qwen3.8 text path only. It does not broaden the still-separate Qwen3.8 vision
-candidate or treat a community checkpoint as an official upstream release.
+`08c2f075b43bc06456382db6b918a3dcabdcf4dd`. The guide exercises its accepted
+Qwen3.8 text-serving path, while conversion preserves the source's complete
+text/projector pair under ADR-004. Producing the companion does not broaden
+the still-separate Qwen3.8 vision acceptance claim or treat a community
+checkpoint as an official upstream release.
 
 ### 5. Make `hf2q update` honor the installation channel
 
@@ -670,8 +672,9 @@ What exists:
 
 - hf2q's core conversion, quantization, and serving commands;
 - a source/Cargo-oriented install path;
-- the canonical tested text-only Qwen3.8 guide for conversion, serving,
-  direct API use, and optional OpenCode;
+- the canonical tested Qwen3.8 guide whose conversion preserves the
+  multimodal pair and whose first serving path exercises text, direct API use,
+  and optional OpenCode;
 - a `setup` command that records conversion and serving defaults consumed by
   the existing commands through a selected state root;
 - a local standalone installer template, hidden exact-byte bootstrap, public

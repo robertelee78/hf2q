@@ -148,15 +148,22 @@ has landed. See `hf2q convert --help` for the exact supported corpus surface.
 
 ## Output and projector mode
 
-`--output <PATH>` names one GGUF file and is required. `--dry-run` creates no
-GGUF, but a remote dry run can still resolve, download, and hash the complete
-source because the plan must be based on authenticated bytes.
+`--output <PATH>` names the text GGUF and is required. For a supported
+multimodal source, the default command also writes an F16 projector beside it
+as `<output-stem>-mmproj.gguf`. `--mmproj-output <PATH>` selects a different
+name in the same directory. Each remote-source artifact has its own receipt,
+and the text GGUF binds the exact projector digest.
 
-`--mmproj` emits the architecture's supported multimodal projector GGUF
-instead of the text decoder. It is not a generic fallback: unsupported
-architectures fail explicitly. The operator supplies `--quant` and `--output`
-and invokes projector conversion explicitly when the selected family supports
-one.
+`--text-only` explicitly suppresses the companion projector. `--mmproj`
+retains the projector-only expert path for repairing or replacing a sidecar;
+it does not mean the ordinary multimodal workflow needs two invocations.
+Unsupported projector families and incomplete multimodal sources fail before
+writing rather than silently dropping vision.
+
+`--dry-run` creates no GGUF. For a multimodal source it reports both planned
+paths while the detailed tensor/type/byte plan remains the text plan. A remote
+dry run can still resolve, download, and hash the complete source because the
+plan must be based on authenticated bytes.
 
 ## Disk preflight and resumability
 
@@ -174,8 +181,10 @@ hf2q never deletes source data from the shared Hub cache.
 ## Current boundary
 
 The canonical identity parser, immutable resolution, exact selected download,
-integrity checks, and receipt schema v3 have landed. Model selection, revision,
-output path, and projector conversion remain explicit operator choices. Setup
-can provide a default quant selector, but it does not download, convert,
-register, retain, or delete model files. Unsupported inputs fail visibly rather
-than being routed through an implicit orchestration or external tool path.
+integrity checks, receipt schema v3, and automatic source-bound multimodal
+pairs have landed. Model selection, revision, and text output path remain
+explicit operator choices; the projector path is deterministic unless
+overridden. Setup can provide a default quant selector, but it does not
+download, convert, register, retain, or delete model files. Unsupported inputs
+fail visibly rather than being routed through an implicit orchestration or
+external tool path.

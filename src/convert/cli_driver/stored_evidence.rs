@@ -105,9 +105,9 @@ pub(crate) fn run_convert_with_stored_evidence(
             "stored conversion evidence cannot be produced by a dry run".into(),
         )));
     }
-    if args.mmproj {
+    if !matches!(args.mode, super::ConvertMode::TextOnly) {
         return Err(ConvertError::UnsupportedArch {
-            arch_name: "stored conversion evidence is text-only; --mmproj is not admitted".into(),
+            arch_name: "stored conversion evidence is text-only; paired/projector conversion is not admitted".into(),
         });
     }
     if args.imatrix.is_some()
@@ -156,6 +156,7 @@ pub(crate) fn run_convert_with_stored_evidence(
             source_artifacts,
             converter_git_commit,
         }),
+        None,
     )?
     .ok_or_else(|| {
         ConvertError::Source(SourceError::Safetensors(

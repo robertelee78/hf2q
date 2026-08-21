@@ -207,8 +207,10 @@ Reserved names surface as typed errors with actionable hints:
 ## Quick start: convert + serve a model
 
 The `hf2q convert` pipeline reads a Hugging Face model directory
-(`config.json` + safetensors + tokenizer assets) and emits a single GGUF
-that loads in the stock peer engine and in `hf2q serve`. The source can be an
+(`config.json` + safetensors + tokenizer assets) and emits a text GGUF that
+loads in the stock peer engine and in `hf2q serve`. Supported multimodal
+sources automatically add a source-bound F16 projector sibling; use
+`--text-only` only when intentionally excluding vision. The source can be an
 explicit local path or a canonical Hub repository ID/URL. Remote conversion
 uses hf2q's in-process `hf-hub` client, resolves a branch or tag to one exact
 commit before transferring files, verifies the exact index-selected source
@@ -328,7 +330,7 @@ DeepSeek chat-completion request and retains the older
 integer `seed` now drives a decode-step-indexed deterministic sampler; identical
 rendered prompts and sampling settings reproduce across worker threads.
 
-The canonical getting-started guide uses the selected text checkpoint
+The canonical getting-started guide uses the selected checkpoint
 `jenerallee78/Qwen3.8-27B-Abliterated-SFT`. Create it natively from its
 immutable source revision before using that launcher:
 
@@ -341,8 +343,10 @@ hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT \
 ```
 
 See the [getting-started guide](docs/getting-started.md) for the complete
-convert, serve, API, and OpenCode sequence. This first path is text-only;
-Qwen3.8 vision remains a separate candidate surface.
+convert, serve, API, and OpenCode sequence. Conversion automatically preserves
+both text and vision artifacts from this multimodal source. The first serving
+path remains text-only; pass the generated projector explicitly when running
+the separately gated vision surface.
 
 Native text conversion and serving are accepted. Vision is a separate
 candidate surface: hf2q converts the 333-tensor tower into a paired projector,

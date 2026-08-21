@@ -28,6 +28,7 @@ use std::path::Path;
 
 use assert_cmd::Command;
 use safetensors::tensor::{Dtype, TensorView};
+use sha2::{Digest, Sha256};
 
 /// Drop a minimal `tokenizer.json` + `tokenizer_config.json` alongside
 /// every fixture so the convert-v2 driver's tokenizer-metadata
@@ -505,7 +506,16 @@ fn synthesize_tiny_qwen38(dir: &Path) {
             "mtp_use_dedicated_embeddings": false,
             "vocab_size": VOCAB
         },
-        "vision_config": {"depth": 1, "hidden_size": H}
+        "vision_config": {
+            "depth": 1,
+            "hidden_size": H,
+            "num_heads": 2,
+            "patch_size": 14,
+            "intermediate_size": FF,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "deepstack_visual_indexes": []
+        }
     });
     fs::write(
         dir.join("config.json"),
@@ -528,6 +538,7 @@ fn convert_qwen38_dense_tiny_round_trip() {
             .arg(model_dir.path())
             .arg("--quant")
             .arg(quant)
+            .arg("--text-only")
             .arg("-o")
             .arg(output.path())
             .assert()
@@ -548,7 +559,103 @@ fn convert_qwen38_dense_tiny_round_trip() {
         assert!(gguf.tensor_info("blk.4.nextn.eh_proj.weight").is_some());
         assert!(gguf.tensor_info("blk.4.ffn_gate.weight").is_some());
         assert!(gguf.tensor_info("model.visual.pos_embed.weight").is_none());
+        assert!(gguf.metadata_string("hf2q.mmproj_sha256").is_none());
     }
+}
+
+#[test]
+fn convert_qwen38_multimodal_dry_run_plans_pair_without_writes() {
+    let model_dir = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_qwen38(model_dir.path());
+    fs::write(
+        model_dir.path().join("preprocessor_config.json"),
+        r#"{"size":{"shortest_edge":56,"longest_edge":3136}}"#,
+    )
+    .unwrap();
+    let text = output_dir.path().join("tiny-qwen38.gguf");
+    let projector = output_dir.path().join("tiny-qwen38-mmproj.gguf");
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("q8_0")
+        .arg("--dry-run")
+        .arg("--output")
+        .arg(&text)
+        .assert()
+        .success();
+
+    assert!(!text.exists());
+    assert!(!projector.exists());
+}
+
+#[test]
+fn convert_qwen38_default_pair_fails_before_writes_without_processor_config() {
+    let model_dir = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_qwen38(model_dir.path());
+    let text = output_dir.path().join("tiny-qwen38.gguf");
+    let projector = output_dir.path().join("tiny-qwen38-mmproj.gguf");
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("q8_0")
+        .arg("--output")
+        .arg(&text)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("preprocessor_config.json"));
+
+    assert!(!text.exists());
+    assert!(!projector.exists());
+}
+
+#[test]
+fn convert_qwen38_default_produces_projector_bound_pair() {
+    let model_dir = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_qwen38(model_dir.path());
+    fs::write(
+        model_dir.path().join("preprocessor_config.json"),
+        r#"{"size":{"shortest_edge":56,"longest_edge":3136}}"#,
+    )
+    .unwrap();
+    let text = output_dir.path().join("tiny-qwen38.gguf");
+    let projector = output_dir.path().join("tiny-qwen38-mmproj.gguf");
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("q8_0")
+        .arg("--output")
+        .arg(&text)
+        .assert()
+        .success();
+
+    assert!(text.is_file());
+    assert!(projector.is_file());
+    let projector_sha = hex::encode(Sha256::digest(fs::read(&projector).unwrap()));
+    let text_gguf = mlx_native::gguf::GgufFile::open(&text).unwrap();
+    assert_eq!(
+        text_gguf.metadata_string("hf2q.mmproj_sha256"),
+        Some(projector_sha.as_str())
+    );
+    let projector_gguf =
+        mlx_native::gguf::GgufFile::open(&projector).expect("projector must reopen as GGUF");
+    assert!(
+        projector_gguf
+            .tensor_info("v.position_embd.weight")
+            .is_some(),
+        "the paired projector must contain the fixture's mapped vision tensor"
+    );
 }
 
 /// Sibling test — feeding an unsupported `model_type` surfaces typed

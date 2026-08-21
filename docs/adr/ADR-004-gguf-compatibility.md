@@ -2,6 +2,9 @@
 
 **Status:** Implemented  
 **Date:** 2026-04-09  
+**Updated:** 2026-08-21 — restored the originally accepted automatic
+multimodal-pair contract after implementation drift left projector conversion
+behind an opt-in replacement mode.
 **Decision Makers:** Robert, Claude
 
 ## Context
@@ -34,7 +37,25 @@ hf2q converts HuggingFace models to quantized GGUF format. The GGUF files must l
 
 **Problem:** llama.cpp expects multimodal models as two separate GGUF files.
 
-**Decision:** Automatically produce both `model.gguf` (text) and `model-mmproj.gguf` (vision) when vision tensors are present. One convert command, two files.
+**Decision:** Automatically produce both `model.gguf` (text) and
+`model-mmproj.gguf` (vision) when `vision_config` and supported vision tensors
+are present. One convert command, two files. `--text-only` is the explicit
+opt-out; the existing `--mmproj` spelling remains projector-only repair mode.
+
+The projector is staged first and its exact SHA-256 is written into the text
+GGUF as `hf2q.mmproj_sha256`. The projector is promoted first and the bound
+text GGUF second. Two filesystem renames cannot be made jointly atomic, so the
+text artifact is the fail-closed commit marker: interruption can leave a
+complete but inert orphan projector, never a new text artifact that claims a
+missing or different projector. Serving already rejects a supplied projector
+whose digest differs from the text contract. Both remote-source receipts bind
+the same resolved revision, source bundle, and converter; projector receipts
+use `f16-mmproj` regardless of the text quantization.
+
+`vision_config` without matching source tensors, a missing Qwen processor
+config, an unsupported projector family, or colliding output paths fails
+before either destination is written. A multimodal dry run names both planned
+outputs but creates neither.
 
 ### 5. Tokenizer Embedding
 

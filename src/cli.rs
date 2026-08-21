@@ -491,25 +491,39 @@ pub struct ConvertCliArgs {
     #[arg(long)]
     pub imatrix_n_ctx: Option<u32>,
 
-    /// Export the multimodal projector (mmproj) sidecar instead of
-    /// the text decoder. Mirrors the canonical converter's
-    /// `--mmproj` mode.
+    /// Export only the multimodal projector (mmproj) sidecar instead of
+    /// the text decoder. This expert mode is retained for repairing or
+    /// replacing a projector independently. By default, a supported
+    /// multimodal source produces both the text GGUF and its F16 projector.
     ///
-    /// When set, hf2q routes the input model through the per-arch
-    /// mmproj mapper (currently Gemma 4 vision: SigLIP encoder +
-    /// Gemma-3 MLP projector). The output GGUF carries the vision
-    /// tower (`v.*`) + projector (`mm.*`) tensors and the
-    /// `clip.*` metadata schema; text-decoder tensors are silently
-    /// dropped (they're written separately by a non-`--mmproj` run).
+    /// When set, hf2q routes the input model through its family-specific
+    /// projector emitter. The output GGUF carries the vision tower (`v.*`)
+    /// plus projector (`mm.*`) tensors and the `clip.*` metadata schema;
+    /// text-decoder tensors are intentionally excluded.
     /// Conventional output filename: `<basename>-mmproj.gguf` —
     /// operator picks via `--output`.
     ///
-    /// Currently supported arches: Gemma 4 multimodal
-    /// (`Gemma4ForConditionalGeneration` with `vision_config`).
-    /// Other multimodal arches surface
-    /// `ConvertError::UnsupportedArch`.
-    #[arg(long, default_value_t = false)]
+    /// Currently supported arches include Gemma 4 multimodal and the
+    /// Qwen3.5/Qwen3-VL conditional-generation families.
+    #[arg(long, default_value_t = false, conflicts_with = "text_only")]
     pub mmproj: bool,
+
+    /// Convert only the text decoder even when the source contains a
+    /// supported vision tower. This is the explicit opt-out from hf2q's
+    /// default paired text + projector conversion contract.
+    #[arg(long, default_value_t = false, conflicts_with = "mmproj")]
+    pub text_only: bool,
+
+    /// Override the projector path for an automatic paired conversion.
+    /// Without this flag, `<output-stem>-mmproj.gguf` is used beside the
+    /// text GGUF. Paired outputs must share one directory. Invalid for
+    /// `--text-only` and projector-only `--mmproj`.
+    #[arg(
+        long,
+        value_name = "GGUF",
+        conflicts_with_all = ["mmproj", "text_only"]
+    )]
+    pub mmproj_output: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1585,6 +1599,82 @@ mod tests {
         };
         assert_eq!(args.revision.as_deref(), Some("main"));
         assert_eq!(args.hf_dir, Some(PathBuf::from("Qwen/Qwen3.8-27B")));
+    }
+
+    #[test]
+    fn convert_multimodal_pair_is_default_and_text_only_is_explicit() {
+        let default = Cli::parse_from([
+            "hf2q",
+            "convert",
+            "/tmp/multimodal-source",
+            "--quant",
+            "q4_k_m",
+            "--output",
+            "/tmp/model.gguf",
+        ]);
+        let Command::Convert(default) = default.command else {
+            panic!("expected Convert");
+        };
+        assert!(!default.mmproj);
+        assert!(!default.text_only);
+
+        let text_only = Cli::parse_from([
+            "hf2q",
+            "convert",
+            "/tmp/multimodal-source",
+            "--quant",
+            "q4_k_m",
+            "--output",
+            "/tmp/model.gguf",
+            "--text-only",
+        ]);
+        let Command::Convert(text_only) = text_only.command else {
+            panic!("expected Convert");
+        };
+        assert!(text_only.text_only);
+        assert!(!text_only.mmproj);
+    }
+
+    #[test]
+    fn convert_projector_only_conflicts_with_text_only() {
+        assert!(Cli::try_parse_from([
+            "hf2q",
+            "convert",
+            "/tmp/multimodal-source",
+            "--quant",
+            "q4_k_m",
+            "--output",
+            "/tmp/model.gguf",
+            "--mmproj",
+            "--text-only",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "hf2q",
+            "convert",
+            "/tmp/multimodal-source",
+            "--quant",
+            "q4_k_m",
+            "--output",
+            "/tmp/model.gguf",
+            "--mmproj",
+            "--mmproj-output",
+            "/tmp/projector.gguf",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "hf2q",
+            "convert",
+            "/tmp/multimodal-source",
+            "--quant",
+            "q4_k_m",
+            "--output",
+            "/tmp/model.gguf",
+            "--text-only",
+            "--mmproj-output",
+            "/tmp/projector.gguf",
+        ])
+        .is_err());
     }
 
     #[test]

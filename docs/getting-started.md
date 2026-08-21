@@ -251,7 +251,8 @@ the SearXNG and Firecrawl tools answer; Crawl4AI handles JS-heavy pages.
 The download above is the model author's pre-converted artifact. hf2q's owned
 pipeline can produce the artifact from the exact pinned source revision
 `08c2f075b43bc06456382db6b918a3dcabdcf4dd` — 51.77 GiB of selected source
-files — and writes a conversion receipt next to the GGUF:
+files. Because that source is multimodal, the same command automatically
+produces a source-matched text GGUF and F16 projector:
 
 ```bash
 hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT \
@@ -266,11 +267,15 @@ choice. The measured native Q4_K_M output is 16,810,714,848 bytes
 
 hf2q uses its in-process Hugging Face client; Python, `huggingface-cli`,
 llama.cpp, and an external converter are not involved. The command writes the
-GGUF and a sibling conversion receipt at `<output>.receipt.json`. Keep the
-receipt with the model: it records the resolved source revision, converter
-revision, selected quantization, output identity, and bounded conversion
-evidence. Plan for 100 GiB free and a substantially longer download-plus-
-conversion run than the direct download above.
+text path shown above, derives
+`Qwen3.8-27B-Abliterated-SFT-Q4_K_M-mmproj.gguf` beside it, and writes one
+conversion receipt beside each artifact. The text GGUF embeds the exact
+projector digest, so a missing or mismatched sidecar fails closed at serve
+time. Keep both receipts with the pair: they bind both outputs to the same
+resolved source and converter revisions while recording each output identity
+and quantization (`q4_k_m` and `f16-mmproj`). Plan for 100 GiB free and a
+substantially longer download-plus-conversion run than the direct download
+above. Use `--text-only` only when omitting vision is intentional.
 
 ## What this guide does not do
 
