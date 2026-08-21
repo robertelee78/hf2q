@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -19,7 +19,7 @@ use crate::serve::discovery::{
 };
 
 use super::client::fetch_models;
-use super::endpoint::{Endpoint, EndpointResolver, EndpointSession};
+use super::endpoint::{Endpoint, EndpointResolver, EndpointSession, OwnedServerProcess};
 use super::wire::Model;
 
 const EXISTING_DISCOVERY_WINDOW: Duration = Duration::from_secs(2);
@@ -83,7 +83,7 @@ async fn resolve_local(
     let mut startup_browser =
         LocalDiscoveryBrowser::start().context("start owned-server discovery")?;
     let mut child = spawn_server().context("start hf2q serve")?;
-    let child_pid = child.id().to_string();
+    let child_pid = child.child_mut().id().to_string();
     let startup =
         wait_for_spawned_server(&mut startup_browser, &http, &mut child, &child_pid).await;
     match startup {
@@ -92,8 +92,15 @@ async fn resolve_local(
             child,
         )),
         Err(error) => {
-            stop_failed_child(&mut child);
-            Err(error)
+            let tail = child.stderr_tail();
+            match stop_failed_child(&mut child) {
+                Ok(()) => Err(anyhow::anyhow!(
+                    "{error:#}; chat-owned server log tail:\n{tail}"
+                )),
+                Err(stop_error) => Err(anyhow::anyhow!(
+                    "{error:#}; cleanup failed: {stop_error:#}; chat-owned server log tail:\n{tail}"
+                )),
+            }
         }
     }
 }
@@ -107,24 +114,54 @@ fn require_credentialless_automatic_discovery(auth_token: Option<&str>) -> Resul
     Ok(())
 }
 
-fn spawn_server() -> Result<Child> {
+#[cfg(unix)]
+fn spawn_server() -> Result<OwnedServerProcess> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
     let executable = std::env::current_exe().context("locate current hf2q executable")?;
-    Command::new(executable)
-        .args([
-            "serve",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "0",
-            "--quiet",
-            "--operator-ui",
-            "plain",
-        ])
+    let (parent_lifeline, child_lifeline) = std::os::unix::net::UnixStream::pair()
+        .context("create private chat parent-lifetime channel")?;
+    let child_fd = child_lifeline.as_raw_fd();
+    let server_log = tempfile::Builder::new()
+        .prefix("hf2q-chat-server-")
+        .suffix(".log")
+        .tempfile()
+        .context("create chat-owned server log")?;
+    let stderr = server_log
+        .reopen()
+        .context("open chat-owned server log writer")?;
+    let mut command = Command::new(executable);
+    command
+        .args(["serve", "--host", "127.0.0.1", "--port", "0", "--quiet"])
+        .args(["--operator-ui", "plain", "--chat-parent-lifeline-fd"])
+        .arg(child_fd.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::from(stderr))
+        .process_group(0);
+    // The socket pair is CLOEXEC by default. Clear it only in the child just
+    // before exec; the server immediately restores CLOEXEC before spawning
+    // any model-transfer or conversion descendants.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(child_fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
         .spawn()
-        .context("spawn current executable as hf2q serve")
+        .context("spawn current executable as hf2q serve")?;
+    drop(child_lifeline);
+    OwnedServerProcess::from_spawned(child, parent_lifeline, server_log)
+}
+
+#[cfg(not(unix))]
+fn spawn_server() -> Result<OwnedServerProcess> {
+    bail!("automatic chat-owned server lifecycle is unavailable on this platform; use --url")
 }
 
 async fn collect_verified(
@@ -160,13 +197,13 @@ async fn collect_verified(
 async fn wait_for_spawned_server(
     browser: &mut LocalDiscoveryBrowser,
     http: &reqwest::Client,
-    child: &mut Child,
+    process: &mut OwnedServerProcess,
     child_pid: &str,
 ) -> Result<VerifiedServer> {
     let deadline = tokio::time::Instant::now() + STARTUP_DISCOVERY_TIMEOUT;
     loop {
-        if let Some(status) = child.try_wait().context("check spawned hf2q serve")? {
-            bail!("chat-started hf2q serve exited before discovery ({status})");
+        if process.leader_exited_unreaped()? {
+            bail!("chat-started hf2q serve exited before discovery");
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -291,15 +328,10 @@ fn endpoint_port(endpoint: &Endpoint) -> Result<u16> {
         .context("verified local endpoint had no port")
 }
 
-fn stop_failed_child(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_some() {
-        return;
-    }
-    if let Err(error) = child.kill() {
-        tracing::warn!(%error, pid = child.id(), "failed to stop unverified chat-started server");
-        return;
-    }
-    let _ = child.wait();
+fn stop_failed_child(process: &mut OwnedServerProcess) -> Result<()> {
+    process
+        .force_stop()
+        .context("stop unverified chat-started server process group")
 }
 
 #[cfg(test)]

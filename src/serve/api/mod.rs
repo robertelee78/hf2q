@@ -25,6 +25,8 @@
 pub(crate) const DIAGNOSTIC_NO_EVICT_HEADER: &str = "x-hf2q-diagnostic-no-evict";
 pub(crate) const DIAGNOSTIC_NO_EVICT_VALUE: &str = "1";
 
+pub mod artifact_catalog;
+pub mod cancellation;
 pub mod control;
 pub mod embedding_pool;
 pub mod engine;

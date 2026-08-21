@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use crate::cli::ChatArgs;
 
 use client::{fetch_models, ChatClient};
-use control::Hf2qControl;
+use control::{looks_like_hub_model, Hf2qControl};
 use endpoint::{EndpointResolver, EndpointSession};
 use local::AutomaticEndpointResolver;
 use render::StreamRenderer;
@@ -34,7 +34,9 @@ pub(crate) fn cmd_chat_with_resolver(
 ) -> Result<()> {
     let mut session = resolver.resolve(&args)?;
     if args.keep_serving {
-        session.detach();
+        if let Some(log_path) = session.detach()? {
+            eprintln!("detached hf2q server log: {}", log_path.display());
+        }
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -82,7 +84,7 @@ async fn run_session(
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .context("build endpoint probe client")?;
-    let model = match args.model.clone() {
+    let mut model = match args.model.clone() {
         Some(model) => model,
         None => {
             choose_remote_model(&probe_http, session, auth_token.as_deref(), input, output).await?
@@ -96,12 +98,22 @@ async fn run_session(
     )
     .await?;
     if let Some(control) = &control {
-        if !control
-            .ensure_active(&model, auth_token.as_deref(), input, output)
-            .await?
-        {
+        let Some(request_model) = activate_diagnostic_model(
+            control,
+            &model,
+            args.quant.as_deref(),
+            args.artifact.as_deref(),
+            auth_token.as_deref(),
+            input,
+            output,
+        )
+        .await?
+        else {
             bail!("model switch declined");
-        }
+        };
+        model = request_model;
+    } else if args.quant.is_some() || args.artifact.is_some() {
+        bail!("--quant and --artifact require an hf2q hosted-GGUF capability endpoint");
     }
     let options = RequestOptions {
         temperature: args.temperature,
@@ -140,6 +152,36 @@ async fn run_session(
         output,
     )
     .await
+}
+
+async fn activate_diagnostic_model(
+    control: &Hf2qControl,
+    model: &str,
+    quant: Option<&str>,
+    artifact: Option<&str>,
+    auth_token: Option<&str>,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<Option<String>> {
+    if looks_like_hub_model(model) {
+        if quant.is_none() && artifact.is_none() {
+            if let Some(resident) = control.probe_resident(model, auth_token).await? {
+                writeln!(output, "model activation: resident")?;
+                return Ok(Some(resident));
+            }
+        }
+        let candidate = control
+            .select_hub_gguf(model, quant, artifact, auth_token, input, output)
+            .await?
+            .context("hf2q did not issue activation authority for the selected artifact")?;
+        control
+            .ensure_active(model, Some(&candidate), auth_token, input, output)
+            .await
+    } else {
+        control
+            .ensure_active(model, None, auth_token, input, output)
+            .await
+    }
 }
 
 async fn interactive_loop(
@@ -205,8 +247,12 @@ async fn handle_command(
             Ok(false)
         }
         "/detach" => {
-            if session.detach() {
-                writeln!(output, "detached; the chat-owned server will keep serving")?;
+            if let Some(log_path) = session.detach()? {
+                writeln!(
+                    output,
+                    "detached; the chat-owned server will keep serving (log: {})",
+                    log_path.display()
+                )?;
             } else {
                 writeln!(
                     output,
@@ -250,7 +296,7 @@ async fn handle_command(
             Ok(false)
         }
         "/model" => {
-            let model = if let Some(model) = words.next() {
+            let mut model = if let Some(model) = words.next() {
                 if words.next().is_some() {
                     writeln!(output, "usage: /model [id]")?;
                     return Ok(false);
@@ -260,13 +306,15 @@ async fn handle_command(
                 choose_remote_model(client.http(), session, auth_token, input, output).await?
             };
             if let Some(control) = control {
-                if !control
-                    .ensure_active(&model, auth_token, input, output)
-                    .await?
-                {
+                let Some(request_model) = activate_diagnostic_model(
+                    control, &model, None, None, auth_token, input, output,
+                )
+                .await?
+                else {
                     writeln!(output, "model unchanged")?;
                     return Ok(false);
-                }
+                };
+                model = request_model;
             }
             client.set_model(model);
             writeln!(output, "model={} (context cleared)", client.model())?;
@@ -334,6 +382,12 @@ fn pick_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
 
     #[test]
     fn picker_marks_loaded_models_and_returns_numbered_choice() {
@@ -355,5 +409,159 @@ mod tests {
         );
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("resident [loaded]"));
+    }
+
+    #[derive(Clone)]
+    struct ActivationFixture {
+        ambiguous_probe: bool,
+        catalog_calls: Arc<AtomicUsize>,
+    }
+
+    async fn runtime_fixture() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "schema_version":"hf2q.runtime.v1",
+            "backend":"mlx-native",
+            "capabilities":{
+                "model_activation":"hf2q.model-activation.v2",
+                "artifact_resolution":"hf2q.artifact-resolution.v2",
+                "non_evicting_load":true,
+                "explicit_revision_bound_switch":true,
+                "request_generation_leases":true,
+                "diagnostic_no_evict_header":{"name":"x-hf2q-diagnostic-no-evict","value":"1"}
+            },
+            "pool":{
+                "revision":1,"loaded_count":1,"capacity_models":2,
+                "total_resident_bytes":42,"memory_budget_bytes":100,
+                "resident":[]
+            }
+        }))
+    }
+
+    async fn catalog_fixture(State(fixture): State<ActivationFixture>) -> Json<serde_json::Value> {
+        fixture.catalog_calls.fetch_add(1, Ordering::SeqCst);
+        Json(serde_json::json!({
+            "schema_version":"hf2q.artifact-resolution.v2",
+            "repository":"owner/model",
+            "revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "candidates":[{
+                "candidate_id":"q6-candidate",
+                "filename":"model-q6_k.gguf",
+                "bytes":42,
+                "quant_hint":"Q6_K",
+                "role":"text_model",
+                "selectable":true,
+                "unavailable_reason":null
+            }]
+        }))
+    }
+
+    async fn activation_fixture(
+        State(fixture): State<ActivationFixture>,
+        Json(request): Json<serde_json::Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        if request["action"] == "probe" {
+            if fixture.ambiguous_probe {
+                return axum::http::StatusCode::NOT_FOUND.into_response();
+            }
+            return Json(serde_json::json!({
+                "schema_version":"hf2q.model-activation.v2",
+                "status":"resident",
+                "pool_revision":1,
+                "request_model":"hf://owner/model@aaaaaaaa/model-q6_k.gguf#bbbb"
+            }))
+            .into_response();
+        }
+        assert_eq!(request["candidate_id"], "q6-candidate");
+        Json(serde_json::json!({
+            "schema_version":"hf2q.model-activation.v2",
+            "status":"resident",
+            "pool_revision":1,
+            "request_model":"hf://owner/model@aaaaaaaa/model-q6_k.gguf#bbbb"
+        }))
+        .into_response()
+    }
+
+    async fn serve_activation_fixture(
+        ambiguous_probe: bool,
+    ) -> (endpoint::Endpoint, Arc<AtomicUsize>, oneshot::Sender<()>) {
+        let catalog_calls = Arc::new(AtomicUsize::new(0));
+        let fixture = ActivationFixture {
+            ambiguous_probe,
+            catalog_calls: Arc::clone(&catalog_calls),
+        };
+        let app = Router::new()
+            .route("/hf2q/v1/runtime", get(runtime_fixture))
+            .route("/hf2q/v1/models/catalog", get(catalog_fixture))
+            .route("/hf2q/v1/models/activate", post(activation_fixture))
+            .with_state(fixture);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stop_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (
+            endpoint::Endpoint::discovered_loopback(port),
+            catalog_calls,
+            stop_tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn unique_resident_repository_uses_zero_catalog_calls() {
+        let (endpoint, catalog_calls, stop) = serve_activation_fixture(false).await;
+        let control = Hf2qControl::detect(&reqwest::Client::new(), &endpoint, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let model = activate_diagnostic_model(
+            &control,
+            "owner/model",
+            None,
+            None,
+            None,
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            model.as_deref(),
+            Some("hf://owner/model@aaaaaaaa/model-q6_k.gguf#bbbb")
+        );
+        assert_eq!(catalog_calls.load(Ordering::SeqCst), 0);
+        let _ = stop.send(());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_resident_repository_falls_through_to_exact_hosted_candidate() {
+        let (endpoint, catalog_calls, stop) = serve_activation_fixture(true).await;
+        let control = Hf2qControl::detect(&reqwest::Client::new(), &endpoint, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let model = activate_diagnostic_model(
+            &control,
+            "owner/model",
+            None,
+            None,
+            None,
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            model.as_deref(),
+            Some("hf://owner/model@aaaaaaaa/model-q6_k.gguf#bbbb")
+        );
+        assert_eq!(catalog_calls.load(Ordering::SeqCst), 1);
+        let _ = stop.send(());
     }
 }

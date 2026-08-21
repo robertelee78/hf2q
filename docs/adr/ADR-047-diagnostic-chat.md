@@ -1,6 +1,6 @@
 # ADR-047: Diagnostic chat over the native inference server
 
-- **Status:** Accepted and implemented; landing remains CI-gated
+- **Status:** Accepted; cancellation and hosted-selection correction under validation
 - **Date:** 2026-08-20
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
 
@@ -112,10 +112,100 @@ Exiting chat stops only a server it spawned, using the existing graceful
 shutdown path. `/detach` and `--keep-serving` relinquish that responsibility.
 Pre-existing servers are never stopped by chat.
 
+The owned-child contract includes abnormal terminal exit, not only `/quit` or
+EOF. A chat-started server runs in its own process group and has an explicit
+parent-lifetime channel. Normal exits run bounded cleanup. If SIGINT, SIGTERM,
+terminal loss, or another abnormal exit kills chat before cleanup, loss of the
+lifetime channel makes the owned server terminate its own process group.
+Detach is an explicit message on that channel, never inferred from a closed
+descriptor. Bounded graceful shutdown escalates to the owned process group and
+reaps it; it never signals a discovered or explicit endpoint.
+
+The owned server's stdout/stderr are not inherited by the interactive
+terminal. Stderr is redirected directly to a private durable log, and only a
+bounded tail plus the path is surfaced when startup or shutdown fails. On
+detach the log is retained and reported. This prevents a child download
+progress bar from continuing to paint over a shell prompt after chat exits or
+blocking on a pipe whose TUI-side reader disappeared.
+
 DNS-SD registration is isolated behind an hf2q-owned module. Non-macOS builds
 retain explicit-URL chat but do not claim automatic local discovery. DNS-SD
 failure must be visible in logs and must not make the established HTTP server
 unusable.
+
+### Mixed Hub repositories and exact GGUF selection
+
+A bare Hugging Face repository is not an artifact identity. ADR-005 retains
+its conversion-first behavior for ordinary `serve --model owner/repo` and
+ordinary OpenAI request-time resolution, but diagnostic chat must not silently
+choose that path when the same repository already contains GGUF artifacts.
+
+For an hf2q-capable endpoint, a unique resident repository match returns
+immediately without Hub access. An ambiguous or nonresident repository asks
+the server for a metadata-only hosted catalog before activation. The server
+uses its own Hub credentials; neither the token nor raw repository inventory
+crosses into the TUI. The server retains repository, exact commit, safe
+filename, byte size, and strong LFS SHA-256 behind a short-lived opaque
+candidate ID. The TUI receives display fields only: filename, bytes, role,
+selectability, unavailable reason, and a filename-derived `quant_hint`.
+Catalog metadata does not claim the actual GGUF header type or loader
+compatibility.
+
+The narrow hosted bridge makes Q3_K_M, Q4_K_M, Q6_K, and Q8_0 selectable.
+Q5_K_M is recognized and displayed but unavailable until artifact file type is
+separated from ADR-005's conversion-policy identity. BF16, split GGUFs, and
+`mmproj` companions are likewise visible with explicit reasons. This slice
+does not merge hf2q conversion-cache entries into the picker: those historical
+entries do not yet provide authoritative emitted-artifact identity. Catalog
+resolution transfers no model payload.
+
+When one repository exposes multiple selectable hosted GGUFs, interactive
+chat shows a numbered picker. `--quant` is non-interactive only when it
+identifies exactly one selectable candidate; `--artifact` names one exact
+repository filename and wins no implicit fallback. They are mutually exclusive
+and require `--model`. Ambiguity, EOF, declining the picker, admission conflict,
+and stale switch confirmation transfer zero payload bytes. Source conversion
+is outside this diagnostic selection flow and never silently outranks a hosted
+GGUF.
+
+Admission preflight uses the server-retained exact bytes before transfer.
+Only after a no-evict plan fits, or after the operator confirms the exact
+switch receipt, may hf2q fetch the selected filename at the pinned revision.
+It revalidates exact Hub metadata, verifies size and LFS SHA-256, parses the
+downloaded GGUF header, confirms that header matches the selectable hint, and
+only then loads and warms it. Pool publication remains the final compatibility
+test.
+
+The hosted pool subject is the immutable
+`hf://repo@commit/filename#sha256` identity, not merely the source repository.
+This is a hosted-only identity bridge, not a global pool/cache type migration.
+Activation returns that authoritative `request_model`; the TUI uses it for
+every subsequent OpenAI request. Two resident hosted artifacts from one
+repository therefore do not alias. Ordinary conversion cache and ADR-005
+policy types remain unchanged.
+
+Generic OpenAI endpoints retain opaque model strings and `/v1/models` only.
+They never cause Hub catalog traffic, and artifact-selection flags fail with an
+actionable hf2q-capability requirement.
+
+Hosted catalog and transfer work runs in direct-child hf2q helpers supervised
+by the server. Metadata helpers and transfer helpers each have an independent
+two-child cap; catalog output, error output, candidate count, and candidate
+lifetime are bounded. The transfer helper, not the HTTP handler, owns the
+payload operation until it is explicitly killed and reaped. Dropping an
+activation request cancels preparation and never publishes an incomplete
+artifact. Cancelling chat against an external server leaves that server alive;
+cancelling chat against an owned server additionally invokes the private
+parent-lifetime cleanup above.
+
+Artifact transfer occurs outside the exclusive lifecycle admission gate so a
+slow download does not block requests for resident models. The gate is
+reacquired and admission is recalculated before publication. Once load or
+explicit switch crosses its irreversible commit boundary, an AppState-owned
+task finishes it to one consistent terminal state even if the client
+disconnects. Server shutdown cancels preparation before HTTP drain and waits
+for all supervised work; an HTTP-drain or supervisor deadline fails before any
+normal engine snapshot or teardown can race the still-active work.
 
 ### Non-evicting admission and explicit switching
 
@@ -229,15 +319,31 @@ Implementation is not complete until all of the following are proven:
    turns, and prove the exact second-turn request;
 6. real macOS tests prove LocalOnly registration/browse/resolve/removal,
    simultaneous instances, name collision handling, and HTTP verification;
-7. a subprocess test proves owned-server shutdown, detach/keep-serving, and
-   that a pre-existing server is never stopped; and
+7. subprocess tests prove normal owned-server shutdown, abnormal parent-
+   lifeline EOF, leader-exit descendant cleanup, detach/keep-serving with a
+   durable log, and that a pre-existing server is never stopped;
 8. a real hf2q model test proves multi-turn unary/SSE compatibility, TUI
    tool-call display, direct-API tool-result continuation, prefix-cache reuse,
    timing/usage, and unchanged model output under matched settings. The direct
    API proves the agentic serving contract; the diagnostic TUI remains a
-   display-only client and never becomes a tool harness.
+   display-only client and never becomes a tool harness;
+9. real TCP tests prove request disconnect kills and reaps the exact hosted
+   helper while an external server remains healthy, server-root cancellation
+   reaps preparation before HTTP drain, and pipe-retaining descendants make
+   shutdown fail closed; and
+10. hosted-selection tests prove immutable candidate binding across mutable
+    branch changes, bounded metadata/transfer concurrency, Q5/BF16/split/mmproj
+    rejection, zero transfer on conflict or stale switch, authoritative
+    request identity, and no implicit safetensors conversion.
 
 ## Validation evidence
+
+### Original diagnostic-chat landing (2026-08-20)
+
+The evidence in this subsection validates the original TUI, discovery,
+generation, and explicit-switch implementation. It predates the hosted-GGUF
+selection and abnormal-exit correction below and is not evidence for those
+new boundaries.
 
 The implementation candidate was frozen at `477172af` after two independent
 review findings were reproduced and fixed. After integrating the current
@@ -286,6 +392,33 @@ Two failed spikes remain evidence rather than accepted claims. The repository's
 `tool_choice` from `required` to `auto` and observed zero reused tokens, so the
 final cache proof held request settings constant instead of treating a changed
 grammar contract as the same prefix.
+
+### Hosted-selection and Ctrl-C RCA correction (2026-08-21)
+
+The reported failure was one causal chain. Diagnostic activation of a bare Hub
+repository entered ADR-005's synchronous source-conversion path, so it began a
+safetensors download. Ctrl-C terminated chat before its normal owned-child
+cleanup. The server received shutdown too, but Axum retained the in-flight
+blocking activation for its drain window, and that server inherited the
+terminal's stderr. The surviving download therefore continued repainting the
+restored shell prompt.
+
+The correction replaces that chain rather than masking its output: diagnostic
+Hub activation is conversion-free and selects one immutable hosted GGUF;
+preparation is cancellable and explicitly reaped; owned servers use a verified
+private process-group lifeline and durable log; transfer does not hold the
+admission write gate; irreversible lifecycle transactions finish under server
+supervision; and shutdown returns before engine teardown if HTTP or supervised
+work has not reached a terminal state.
+
+Focused fail-first and regression coverage now includes fragmented client
+protocol, exact candidate binding, bounded catalog/transfer slots, the Q5
+closed boundary, admission and post-commit classification, real-TCP request
+drop to helper reap, server-root helper cancellation, pipe-retaining child
+failure, leader-exit process-group cleanup, and generated zsh completion. The
+exact final commit, complete locked gates, live metadata receipt, and full
+binary Ctrl-C/detach receipts must be recorded here before this correction is
+called landed.
 
 ## Consequences
 

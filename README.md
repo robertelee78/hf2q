@@ -152,7 +152,8 @@ Shell completion is explicit. Generate the current clap grammar with
 `hf2q completions --shell <bash|zsh|fish>` and install or source that output
 through the shell or package manager that owns it. Ordinary hf2q invocations,
 including `--help`, `--version`, and `setup`, do not write completion files or
-shell startup configuration.
+shell startup configuration. Generated scripts are static snapshots, so
+regenerate them after upgrading when a new command such as `chat` is added.
 
 ## CLI subcommands
 

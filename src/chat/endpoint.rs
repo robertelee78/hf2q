@@ -1,3 +1,5 @@
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
@@ -58,7 +60,162 @@ impl Endpoint {
 #[derive(Debug)]
 enum Ownership {
     External,
-    Owned { child: Child, detached: bool },
+    Owned {
+        process: OwnedServerProcess,
+        detached: bool,
+    },
+}
+
+const STDERR_TAIL_BYTES: u64 = 32 * 1024;
+const GROUP_EXTINCTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+pub(crate) type ParentLifeline = std::os::unix::net::UnixStream;
+#[cfg(not(unix))]
+pub(crate) type ParentLifeline = std::process::ChildStdin;
+
+struct ServerLog {
+    temporary: Option<tempfile::NamedTempFile>,
+    retained: Option<PathBuf>,
+}
+
+impl ServerLog {
+    fn new(temporary: tempfile::NamedTempFile) -> Self {
+        Self {
+            temporary: Some(temporary),
+            retained: None,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.retained.as_deref().unwrap_or_else(|| {
+            self.temporary
+                .as_ref()
+                .expect("owned server log must have a path")
+                .path()
+        })
+    }
+
+    fn retain(&mut self) -> Result<PathBuf> {
+        if let Some(path) = &self.retained {
+            return Ok(path.clone());
+        }
+        let temporary = self
+            .temporary
+            .take()
+            .context("chat-owned server log was unavailable")?;
+        let (_file, path) = match temporary.keep() {
+            Ok(retained) => retained,
+            Err(error) => {
+                self.temporary = Some(error.file);
+                return Err(error.error).context("retain detached hf2q server log");
+            }
+        };
+        self.retained = Some(path.clone());
+        Ok(path)
+    }
+}
+
+/// Concrete process authority created only from the child spawned by chat.
+/// The process group, parent-lifetime writer, and bounded stderr tail remain
+/// inseparable so cleanup cannot accidentally degrade to PID-only signaling.
+pub(crate) struct OwnedServerProcess {
+    child: Child,
+    lifeline: Option<ParentLifeline>,
+    #[cfg(unix)]
+    process_group: libc::pid_t,
+    server_log: ServerLog,
+}
+
+impl std::fmt::Debug for OwnedServerProcess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("OwnedServerProcess");
+        debug.field("pid", &self.child.id());
+        #[cfg(unix)]
+        debug.field("process_group", &self.process_group);
+        debug
+            .field("server_log", &self.server_log.path())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OwnedServerProcess {
+    pub(crate) fn from_spawned(
+        mut child: Child,
+        lifeline: ParentLifeline,
+        server_log: tempfile::NamedTempFile,
+    ) -> Result<Self> {
+        #[cfg(unix)]
+        let process_group = child.id() as libc::pid_t;
+        #[cfg(unix)]
+        {
+            let actual = unsafe { libc::getpgid(process_group) };
+            if actual != process_group {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "chat-owned server did not enter its isolated process group (pid={process_group}, pgrp={actual})"
+                );
+            }
+        }
+        Ok(Self {
+            child,
+            lifeline: Some(lifeline),
+            #[cfg(unix)]
+            process_group,
+            server_log: ServerLog::new(server_log),
+        })
+    }
+
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    pub(crate) fn force_stop(&mut self) -> Result<()> {
+        force_stop_owned_process(self)
+    }
+
+    pub(crate) fn leader_exited_unreaped(&mut self) -> Result<bool> {
+        leader_exited_unreaped(&mut self.child)
+    }
+
+    fn detach_lifeline(&mut self) -> Result<PathBuf> {
+        // Persist the log while lifecycle ownership is still intact. Once the
+        // detach frame is accepted the server cannot safely be reclaimed on a
+        // later filesystem error.
+        let log_path = self.server_log.retain()?;
+        let Some(lifeline) = self.lifeline.as_mut() else {
+            return Ok(log_path);
+        };
+        lifeline
+            .write_all(crate::serve::CHAT_LIFELINE_DETACH_FRAME)
+            .context("detach chat-owned server parent lifetime")?;
+        lifeline.flush().context("flush detach lifetime message")?;
+        self.lifeline.take();
+        Ok(log_path)
+    }
+
+    pub(crate) fn stderr_tail(&self) -> String {
+        read_log_tail(self.server_log.path()).unwrap_or_else(|error| {
+            format!(
+                "<server log unavailable at {}: {error}>",
+                self.server_log.path().display()
+            )
+        })
+    }
+
+    fn disarm_after_terminal_cleanup(&mut self) {
+        self.lifeline.take();
+    }
+}
+
+fn read_log_tail(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let bytes = file.metadata()?.len();
+    file.seek(SeekFrom::Start(bytes.saturating_sub(STDERR_TAIL_BYTES)))?;
+    let mut tail = Vec::with_capacity(bytes.min(STDERR_TAIL_BYTES) as usize);
+    file.read_to_end(&mut tail)?;
+    Ok(String::from_utf8_lossy(&tail).into_owned())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,12 +253,12 @@ impl EndpointSession {
 
     /// Integration seam for the automatic discovery/launcher lane.
     #[allow(dead_code)]
-    pub(crate) fn spawned_loopback(port: u16, child: Child) -> Self {
+    pub(crate) fn spawned_loopback(port: u16, process: OwnedServerProcess) -> Self {
         Self {
             endpoint: Endpoint::discovered_loopback(port),
             kind: EndpointKind::DiscoveredHf2q,
             ownership: Ownership::Owned {
-                child,
+                process,
                 detached: false,
             },
         }
@@ -123,12 +280,13 @@ impl EndpointSession {
         matches!(self.ownership, Ownership::Owned { detached: true, .. })
     }
 
-    pub(crate) fn detach(&mut self) -> bool {
+    pub(crate) fn detach(&mut self) -> Result<Option<PathBuf>> {
         match &mut self.ownership {
-            Ownership::External => false,
-            Ownership::Owned { detached, .. } => {
+            Ownership::External => Ok(None),
+            Ownership::Owned { process, detached } => {
+                let log_path = process.detach_lifeline()?;
                 *detached = true;
-                true
+                Ok(Some(log_path))
             }
         }
     }
@@ -154,15 +312,20 @@ impl EndpointSession {
         graceful_timeout: Duration,
         signal_timeout: Duration,
     ) -> Result<()> {
-        let Ownership::Owned { child, detached } = &mut self.ownership else {
+        let Ownership::Owned { process, detached } = &mut self.ownership else {
             return Ok(());
         };
-        if *detached
-            || child
-                .try_wait()
-                .context("check owned server child")?
-                .is_some()
-        {
+        if *detached || process.leader_exited_unreaped()? {
+            if !*detached {
+                stop_remaining_owned_descendants(process)?;
+                process
+                    .child_mut()
+                    .wait()
+                    .context("reap exited chat-owned server leader")?;
+                process.disarm_after_terminal_cleanup();
+                #[cfg(unix)]
+                wait_for_group_extinction(process.process_group)?;
+            }
             return Ok(());
         }
 
@@ -196,39 +359,67 @@ impl EndpointSession {
             }
         };
         if !graceful_requested {
-            signal_owned_child(child)?;
-            if wait_for_child(child, graceful_timeout).await? {
+            signal_owned_process(process, termination_signal())?;
+            if wait_for_owned_process(process, graceful_timeout).await? {
                 return Ok(());
             }
             tracing::warn!("chat-owned server ignored SIGTERM; force-stopping the owned child");
-            return force_stop_owned_child(child);
+            return force_stop_owned_process(process);
         }
 
-        if wait_for_child(child, graceful_timeout).await? {
+        if wait_for_owned_process(process, graceful_timeout).await? {
             return Ok(());
         }
         tracing::warn!(
             "chat-owned server exceeded graceful drain deadline; signaling the owned child"
         );
-        signal_owned_child(child)?;
-        if wait_for_child(child, signal_timeout).await? {
+        signal_owned_process(process, termination_signal())?;
+        if wait_for_owned_process(process, signal_timeout).await? {
             return Ok(());
         }
         tracing::warn!(
             "chat-owned server ignored graceful shutdown and SIGTERM; force-stopping the owned child"
         );
-        force_stop_owned_child(child)
+        force_stop_owned_process(process)
     }
 }
 
-async fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<bool> {
+#[cfg(unix)]
+fn leader_exited_unreaped(child: &mut Child) -> Result<bool> {
+    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+
+    let pid = Pid::from_child(child);
+    let status = waitid(
+        WaitId::Pid(pid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    )
+    .context("peek chat-owned server leader without reaping")?;
+    Ok(status.is_some())
+}
+
+#[cfg(not(unix))]
+fn leader_exited_unreaped(child: &mut Child) -> Result<bool> {
+    Ok(child
+        .try_wait()
+        .context("check chat-owned server leader")?
+        .is_some())
+}
+
+async fn wait_for_owned_process(
+    process: &mut OwnedServerProcess,
+    timeout: Duration,
+) -> Result<bool> {
     let deadline = Instant::now() + timeout;
     loop {
-        if child
-            .try_wait()
-            .context("wait for chat-owned server")?
-            .is_some()
-        {
+        if process.leader_exited_unreaped()? {
+            stop_remaining_owned_descendants(process)?;
+            process
+                .child_mut()
+                .wait()
+                .context("reap chat-owned server leader")?;
+            process.disarm_after_terminal_cleanup();
+            #[cfg(unix)]
+            wait_for_group_extinction(process.process_group)?;
             return Ok(true);
         }
         let now = Instant::now();
@@ -240,35 +431,123 @@ async fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<bool> {
 }
 
 #[cfg(unix)]
-fn signal_owned_child(child: &mut Child) -> Result<()> {
-    // The PID comes only from the live Child handle created by this chat
-    // process. Discovery metadata is never accepted as process authority.
-    let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+fn signal_owned_group(process_group: libc::pid_t, signal: libc::c_int) -> Result<bool> {
+    // The process group comes only from the concrete child chat spawned with
+    // setpgid(0,0). Discovery metadata is never accepted as authority.
+    let result = unsafe { libc::kill(-process_group, signal) };
     if result == 0 {
-        Ok(())
+        Ok(true)
     } else {
-        Err(std::io::Error::last_os_error()).context("signal chat-owned server child")
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH)
+            // Darwin may report EPERM when a verified owned group contains
+            // only its unreaped zombie leader. There is no signalable member;
+            // the caller reaps that leader before proving group extinction.
+            || (signal == libc::SIGKILL && error.raw_os_error() == Some(libc::EPERM))
+        {
+            Ok(false)
+        } else {
+            Err(error).context("signal chat-owned server process group")
+        }
     }
+}
+
+#[cfg(unix)]
+fn termination_signal() -> libc::c_int {
+    libc::SIGTERM
 }
 
 #[cfg(not(unix))]
-fn signal_owned_child(child: &mut Child) -> Result<()> {
-    child.kill().context("stop chat-owned server child")
+fn termination_signal() -> i32 {
+    0
 }
 
-fn force_stop_owned_child(child: &mut Child) -> Result<()> {
-    if child
-        .try_wait()
-        .context("check owned server child")?
-        .is_some()
-    {
-        return Ok(());
+#[cfg(unix)]
+fn signal_owned_process(process: &mut OwnedServerProcess, signal: libc::c_int) -> Result<()> {
+    signal_owned_group(process.process_group, signal).map(|_| ())
+}
+
+#[cfg(not(unix))]
+fn signal_owned_process(process: &mut OwnedServerProcess, _signal: i32) -> Result<()> {
+    process.child.kill().context("stop chat-owned server")
+}
+
+#[cfg(unix)]
+fn owned_group_exists(process_group: libc::pid_t) -> Result<bool> {
+    let result = unsafe { libc::kill(-process_group, 0) };
+    if result == 0 {
+        return Ok(true);
     }
-    child.kill().context("force-stop chat-owned server child")?;
-    child
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        // POSIX defines EPERM from signal 0 as proof that at least one
+        // process exists but is not signalable. Darwin can transiently
+        // report this while a killed orphan is awaiting its new reaper.
+        // Keep polling for ESRCH; never mistake EPERM for extinction.
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error).context("probe chat-owned server process group"),
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_group_extinction(process_group: libc::pid_t) -> Result<()> {
+    let deadline = Instant::now() + GROUP_EXTINCTION_TIMEOUT;
+    while owned_group_exists(process_group)? {
+        if Instant::now() >= deadline {
+            bail!("chat-owned process group {process_group} did not terminate");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stop_remaining_owned_descendants(process: &mut OwnedServerProcess) -> Result<()> {
+    signal_owned_group(process.process_group, libc::SIGKILL)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn stop_remaining_owned_descendants(_process: &mut OwnedServerProcess) -> Result<()> {
+    Ok(())
+}
+
+fn force_stop_owned_process(process: &mut OwnedServerProcess) -> Result<()> {
+    let log_path = process.server_log.path().display().to_string();
+    let tail = process.stderr_tail();
+    force_stop_owned_process_inner(process)
+        .with_context(|| format!("force-stop chat-owned server; log={log_path}; tail:\n{tail}"))
+}
+
+fn force_stop_owned_process_inner(process: &mut OwnedServerProcess) -> Result<()> {
+    #[cfg(unix)]
+    signal_owned_group(process.process_group, libc::SIGKILL)?;
+    #[cfg(not(unix))]
+    process.child.kill().context("kill chat-owned server")?;
+    process
+        .child
         .wait()
         .context("reap force-stopped chat-owned server")?;
+    process.disarm_after_terminal_cleanup();
+    #[cfg(unix)]
+    wait_for_group_extinction(process.process_group)?;
     Ok(())
+}
+
+impl Drop for OwnedServerProcess {
+    fn drop(&mut self) {
+        if self.lifeline.is_none() {
+            return;
+        }
+        #[cfg(unix)]
+        let _ = signal_owned_group(self.process_group, libc::SIGKILL);
+        #[cfg(not(unix))]
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        #[cfg(unix)]
+        let _ = wait_for_group_extinction(self.process_group);
+    }
 }
 
 pub(crate) trait EndpointResolver {
@@ -278,6 +557,29 @@ pub(crate) trait EndpointResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn owned_sleep_process(command: &str) -> OwnedServerProcess {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        let mut command_builder = std::process::Command::new("sh");
+        command_builder
+            .args(["-c", command])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let (lifeline, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut frame = vec![0u8; crate::serve::CHAT_LIFELINE_DETACH_FRAME.len()];
+            let _ = peer.read_exact(&mut frame);
+        });
+        OwnedServerProcess::from_spawned(
+            command_builder.spawn().unwrap(),
+            lifeline,
+            tempfile::NamedTempFile::new().unwrap(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn discovered_endpoints_are_forced_to_loopback_and_have_no_pid_authority() {
@@ -313,19 +615,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn detach_relinquishes_an_owned_child_without_stopping_it() {
-        let child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
-        let mut session = EndpointSession::spawned_loopback(9, child);
-        assert!(session.detach());
+        let process = owned_sleep_process("sleep 30");
+        let mut session = EndpointSession::spawned_loopback(9, process);
+        assert!(session.detach().unwrap().is_some());
         session
             .shutdown_if_owned(&reqwest::Client::new(), None)
             .await
             .unwrap();
-        let Ownership::Owned { child, .. } = &mut session.ownership else {
+        let Ownership::Owned { process, .. } = &mut session.ownership else {
             panic!("expected owned child");
         };
+        let child = process.child_mut();
         assert!(child.try_wait().unwrap().is_none());
         child.kill().unwrap();
         child.wait().unwrap();
@@ -348,11 +648,8 @@ mod tests {
             .await
             .unwrap();
         });
-        let child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
-        let mut session = EndpointSession::spawned_loopback(port, child);
+        let process = owned_sleep_process("sleep 30");
+        let mut session = EndpointSession::spawned_loopback(port, process);
         session
             .shutdown_if_owned_with_timeouts(
                 &reqwest::Client::new(),
@@ -362,10 +659,47 @@ mod tests {
             )
             .await
             .unwrap();
-        let Ownership::Owned { child, .. } = &mut session.ownership else {
+        let Ownership::Owned { process, .. } = &mut session.ownership else {
             panic!("expected owned child");
         };
+        let child = process.child_mut();
         assert!(child.try_wait().unwrap().is_some());
         server.abort();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_stop_targets_the_owned_process_group_and_reaps_descendants() {
+        let mut process = owned_sleep_process("trap '' TERM; sleep 30 & wait");
+        let process_group = process.process_group;
+        process.force_stop().unwrap();
+        let result = unsafe { libc::kill(-process_group, 0) };
+        assert_eq!(result, -1, "owned process group must no longer exist");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_stop_cleans_descendants_after_the_group_leader_exits() {
+        let mut process = owned_sleep_process("sleep 0.1; trap '' TERM; sleep 30 & exit 0");
+        let process_group = process.process_group;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if process.leader_exited_unreaped().unwrap() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "group leader did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        process.force_stop().unwrap();
+        let result = unsafe { libc::kill(-process_group, 0) };
+        assert_eq!(result, -1, "orphaned descendants must be stopped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 }

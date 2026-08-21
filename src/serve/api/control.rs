@@ -2,13 +2,18 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Extension, Query, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use super::artifact_catalog::{ArtifactCatalogCoordinator, CatalogError, ARTIFACT_CATALOG_SCHEMA};
+use super::cancellation::{
+    run_consistent_result_task, run_preparation_command, PreparationError, PreparationLimits,
+};
 use super::handlers::map_hotswap_error_to_response;
 use super::lifecycle::{LifecycleError, SwitchConfirmation};
+use super::middleware::RequestCancellation;
 use super::schema::ApiError;
 use super::state::AppState;
 use super::{DIAGNOSTIC_NO_EVICT_HEADER, DIAGNOSTIC_NO_EVICT_VALUE};
@@ -19,16 +24,25 @@ use crate::serve::multi_model::{
 use crate::serve::quant_select::QuantType;
 
 const HF2Q_RUNTIME_SCHEMA: &str = "hf2q.runtime.v1";
-const HF2Q_ACTIVATION_SCHEMA: &str = "hf2q.model-activation.v1";
+const HF2Q_ACTIVATION_SCHEMA: &str = "hf2q.model-activation.v2";
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelActivationRequest {
     pub model: String,
+    /// Opaque server-issued id for an exact revision/size/SHA artifact.
+    #[serde(default)]
+    pub candidate_id: Option<String>,
     #[serde(default)]
     pub action: ModelActivationAction,
     pub expected_revision: Option<u64>,
     #[serde(default)]
     pub victims: Vec<ModelActivationVictim>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct HubGgufCatalogQuery {
+    pub model: String,
 }
 
 #[derive(Debug, Default, serde::Deserialize, PartialEq, Eq)]
@@ -37,6 +51,7 @@ pub enum ModelActivationAction {
     #[default]
     Load,
     Switch,
+    Probe,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -45,6 +60,29 @@ pub struct ModelActivationVictim {
     pub quant: String,
     pub bytes_resident: u64,
     pub generation: u64,
+}
+
+fn normalize_hub_repository(model: &str) -> std::result::Result<Option<String>, Response> {
+    let model = model.trim();
+    if !model.contains("://") && !auto_pipeline::looks_like_hf_repo_id(model) {
+        return Ok(None);
+    }
+    let reference =
+        crate::input::hf_reference::HfModelReference::parse(model, None).map_err(|error| {
+            ApiError::invalid_request(
+                format!("invalid Hugging Face model reference: {error}"),
+                Some("model".into()),
+            )
+            .into_response()
+        })?;
+    if reference.requested_revision().is_some() || reference.filename().is_some() {
+        return Err(ApiError::invalid_request(
+            "diagnostic hosted selection requires a repository id or base model URL; choose the exact artifact in the hf2q picker",
+            Some("model".into()),
+        )
+        .into_response());
+    }
+    Ok(Some(reference.repo_id().to_owned()))
 }
 
 impl From<ModelActivationVictim> for LoadedSummary {
@@ -106,6 +144,7 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
             "backend": "mlx-native",
             "capabilities": {
                 "model_activation": HF2Q_ACTIVATION_SCHEMA,
+                "artifact_resolution": ARTIFACT_CATALOG_SCHEMA,
                 "non_evicting_load": true,
                 "diagnostic_no_evict_header": {
                     "name": DIAGNOSTIC_NO_EVICT_HEADER,
@@ -127,6 +166,98 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+/// Metadata-only hosted GGUF inventory. This endpoint never downloads model
+/// payload and is protected by the same bearer middleware as activation.
+pub async fn hub_gguf_catalog(
+    State(state): State<AppState>,
+    Extension(cancellation): Extension<RequestCancellation>,
+    Query(query): Query<HubGgufCatalogQuery>,
+) -> Response {
+    state
+        .metrics
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let requested_model = query.model.trim();
+    if requested_model.is_empty() {
+        return ApiError::invalid_request("model must not be empty", Some("model".into()))
+            .into_response();
+    }
+    let model = match normalize_hub_repository(requested_model) {
+        Ok(Some(repository)) => repository,
+        Ok(None) => {
+            return ApiError::invalid_request(
+                "hosted artifact catalog requires an owner/repository model id",
+                Some("model".into()),
+            )
+            .into_response()
+        }
+        Err(response) => return response,
+    };
+    let slot = match state.artifact_catalog.try_hub_slot() {
+        Ok(slot) => slot,
+        Err(CatalogError::Busy) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+                Json(serde_json::json!({"error":{"message":"artifact catalog is busy; retry shortly","type":"server_busy","code":"artifact_catalog_busy"}})),
+            )
+                .into_response()
+        }
+        Err(_) => return ApiError::internal_error().into_response(),
+    };
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(_) => return ApiError::internal_error().into_response(),
+    };
+    let mut command = tokio::process::Command::new(executable);
+    command.args(["__catalog-hub-gguf", "--repository", &model]);
+    let output = match run_preparation_command(
+        command,
+        cancellation.0,
+        state.preparations.clone(),
+        PreparationLimits::catalog(),
+        Some(slot),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(PreparationError::Cancelled(_)) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+        Err(error) => {
+            return ApiError::generation_error(format!(
+                "hosted artifact catalog helper failed: {error}"
+            ))
+            .into_response()
+        }
+    };
+    if !output.status.success() {
+        tracing::warn!(
+            status = %output.status,
+            stderr_bytes = output.stderr.len(),
+            "hosted artifact catalog helper failed"
+        );
+        return ApiError::invalid_request(
+            format!(
+                "cannot catalog hosted GGUFs (helper exited {}); verify the repository, network access, and HF_TOKEN",
+                output.status
+            ),
+            Some("model".into()),
+        )
+        .into_response();
+    }
+    let catalog: crate::input::hf_download::HubGgufCatalog =
+        match serde_json::from_slice(&output.stdout) {
+            Ok(catalog) => catalog,
+            Err(_) => return ApiError::internal_error().into_response(),
+        };
+    if catalog.schema_version != "hf2q.hub-gguf-catalog.v2" {
+        return ApiError::internal_error().into_response();
+    }
+    match state.artifact_catalog.register_hosted(catalog) {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(_) => ApiError::internal_error().into_response(),
+    }
+}
+
 fn activation_engine_config(state: &AppState) -> EngineConfig {
     EngineConfig {
         tokenizer_path: None,
@@ -141,10 +272,165 @@ fn activation_engine_config(state: &AppState) -> EngineConfig {
     }
 }
 
+enum ActivationPayload {
+    Local(std::path::PathBuf),
+    Hosted(crate::input::hf_download::HubGgufArtifact),
+}
+
+const fn diagnostic_gguf_file_type(quant: QuantType) -> u32 {
+    use crate::quantize::ggml_quants::GgufFtype;
+
+    match quant {
+        QuantType::Q8_0 => GgufFtype::MostlyQ8_0 as u32,
+        QuantType::Q6_K => GgufFtype::MostlyQ6_K as u32,
+        QuantType::Q4_K_M => GgufFtype::MostlyQ4_K_M as u32,
+        QuantType::Q3_K_M => GgufFtype::MostlyQ3_K_M as u32,
+    }
+}
+
+fn diagnostic_quant_from_file_type(file_type: u32) -> Option<QuantType> {
+    use crate::quantize::ggml_quants::GgufFtype;
+
+    match GgufFtype::try_from(file_type).ok()? {
+        GgufFtype::MostlyQ8_0 => Some(QuantType::Q8_0),
+        GgufFtype::MostlyQ6_K => Some(QuantType::Q6_K),
+        GgufFtype::MostlyQ4_K_M => Some(QuantType::Q4_K_M),
+        GgufFtype::MostlyQ3_K_M => Some(QuantType::Q3_K_M),
+        _ => None,
+    }
+}
+
+struct ActivationTarget {
+    repo: String,
+    quant: QuantType,
+    bytes: u64,
+    request_model: String,
+    payload: ActivationPayload,
+}
+
+impl ActivationTarget {
+    async fn materialize(
+        self,
+        cancellation: super::cancellation::CancellationSignal,
+        supervisor: super::cancellation::PreparationSupervisor,
+        catalog: &ArtifactCatalogCoordinator,
+    ) -> std::result::Result<(String, QuantType, std::path::PathBuf, u64, String), Response> {
+        let (path, validate_catalog_type) = match self.payload {
+            ActivationPayload::Local(path) => (path, false),
+            ActivationPayload::Hosted(artifact) => {
+                let permit = catalog.try_transfer_slot().map_err(|error| match error {
+                    CatalogError::TransferBusy => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [(header::RETRY_AFTER, "1")],
+                        Json(serde_json::json!({"error":{"message":error.to_string(),"type":"server_busy","code":"artifact_transfer_busy"}})),
+                    )
+                        .into_response(),
+                    _ => ApiError::internal_error().into_response(),
+                })?;
+                (
+                    fetch_hub_gguf_cancellable(&artifact, cancellation, supervisor, permit).await?,
+                    true,
+                )
+            }
+        };
+        if !validate_catalog_type {
+            return Ok((self.repo, self.quant, path, self.bytes, self.request_model));
+        }
+        let actual = mlx_native::gguf::GgufFile::open(&path).map_err(|error| {
+            ApiError::invalid_request(
+                format!("selected artifact is not a loadable GGUF: {error}"),
+                Some("artifact".into()),
+            )
+            .into_response()
+        })?;
+        let actual_ftype = actual.metadata_u32("general.file_type");
+        let expected_ftype = diagnostic_gguf_file_type(self.quant);
+        if actual_ftype != Some(expected_ftype) {
+            return Err(ApiError::invalid_request(
+                format!(
+                    "selected GGUF file type {:?} does not match catalog quant {}",
+                    actual_ftype, self.quant
+                ),
+                Some("artifact".into()),
+            )
+            .into_response());
+        }
+        Ok((self.repo, self.quant, path, self.bytes, self.request_model))
+    }
+}
+
+async fn fetch_hub_gguf_cancellable(
+    artifact: &crate::input::hf_download::HubGgufArtifact,
+    cancellation: super::cancellation::CancellationSignal,
+    supervisor: super::cancellation::PreparationSupervisor,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> std::result::Result<std::path::PathBuf, Response> {
+    let executable =
+        std::env::current_exe().map_err(|_| ApiError::internal_error().into_response())?;
+    let quant = artifact.quant_hint.as_deref().ok_or_else(|| {
+        ApiError::invalid_request("selected artifact has no quant", Some("artifact".into()))
+            .into_response()
+    })?;
+    let mut command = tokio::process::Command::new(executable);
+    command.args([
+        "__fetch-hub-gguf",
+        "--repository",
+        &artifact.repository,
+        "--revision",
+        &artifact.revision,
+        "--artifact",
+        &artifact.filename,
+        "--bytes",
+        &artifact.bytes.to_string(),
+        "--sha256",
+        &artifact.sha256,
+        "--quant",
+        quant,
+    ]);
+    let output = run_preparation_command(
+        command,
+        cancellation,
+        supervisor,
+        PreparationLimits::transfer_receipt(),
+        Some(permit),
+    )
+    .await
+    .map_err(|error| {
+        ApiError::generation_error(format!("hosted GGUF transfer failed: {error}")).into_response()
+    })?;
+    if !output.status.success() {
+        tracing::warn!(
+            status = %output.status,
+            stderr_bytes = output.stderr.len(),
+            "hosted GGUF transfer helper failed"
+        );
+        return Err(ApiError::invalid_request(
+            format!(
+                "selected GGUF transfer failed (helper exited {}); verify disk space, network access, repository access, and HF_TOKEN",
+                output.status
+            ),
+            Some("artifact".into()),
+        )
+        .into_response());
+    }
+    let path = String::from_utf8(output.stdout).map_err(|_| {
+        ApiError::generation_error("hosted GGUF helper returned non-UTF-8 output").into_response()
+    })?;
+    let path = path.trim();
+    if path.is_empty() || path.lines().count() != 1 {
+        return Err(ApiError::generation_error(
+            "hosted GGUF helper returned an invalid path receipt",
+        )
+        .into_response());
+    }
+    Ok(std::path::PathBuf::from(path))
+}
+
 async fn resolve_activation_target(
     state: &AppState,
     requested_model: &str,
-) -> std::result::Result<(String, QuantType, std::path::PathBuf, u64), Response> {
+    candidate_id: Option<&str>,
+) -> std::result::Result<ActivationTarget, Response> {
     let model = requested_model.trim();
     if model.is_empty() {
         return Err(
@@ -152,44 +438,99 @@ async fn resolve_activation_target(
                 .into_response(),
         );
     }
-    let cache = Arc::clone(&state.cache);
-    let hardware = Arc::clone(&state.hardware);
-    let model_arg = model.to_string();
-    let no_integrity = state.no_integrity;
-    let resolved = tokio::task::spawn_blocking(move || {
-        let mut cache = cache
-            .lock()
-            .map_err(|error| anyhow::anyhow!("cache mutex poisoned: {error}"))?;
-        auto_pipeline::resolve_or_prepare_model(
-            &model_arg,
-            &mut cache,
-            hardware.as_ref(),
-            no_integrity,
+    let hub_repository = normalize_hub_repository(model)?;
+    if let Some(candidate_id) = candidate_id {
+        let artifact = state.artifact_catalog.resolve(candidate_id).map_err(|error| {
+            let status = match error {
+                CatalogError::Gone => StatusCode::GONE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(serde_json::json!({"error":{"message":error.to_string(),"type":"invalid_request_error","code":"artifact_selection_gone"}})),
+            )
+                .into_response()
+        })?;
+        if hub_repository.as_deref() != Some(artifact.repository.as_str()) {
+            return Err(ApiError::invalid_request(
+                "artifact selection does not belong to requested model",
+                Some("candidate_id".into()),
+            )
+            .into_response());
+        }
+        let quant =
+            QuantType::from_canonical_str(artifact.quant_hint.as_deref().unwrap_or_default())
+                .map_err(|error| {
+                    ApiError::invalid_request(error, Some("candidate_id".into())).into_response()
+                })?;
+        return Ok(ActivationTarget {
+            repo: artifact.request_model(),
+            quant,
+            bytes: artifact.bytes,
+            request_model: artifact.request_model(),
+            payload: ActivationPayload::Hosted(artifact),
+        });
+    }
+
+    // Diagnostic activation is intentionally conversion-free. A bare Hub id
+    // must be resolved through the exact artifact catalog first.
+    if hub_repository.is_some() {
+        return Err(ApiError::invalid_request(
+            "bare Hub model activation is disabled in diagnostic chat; select an exact hosted GGUF",
+            Some("model".into()),
         )
-    })
-    .await
-    .map_err(|_| ApiError::internal_error().into_response())?
-    .map_err(|error| {
+        .into_response());
+    }
+    let gguf_path = std::path::PathBuf::from(model);
+    if !gguf_path.is_file()
+        || !gguf_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        return Err(ApiError::invalid_request(
+            "diagnostic activation requires an existing local GGUF file or a hosted artifact selection",
+            Some("model".into()),
+        )
+        .into_response());
+    }
+    let header = mlx_native::gguf::GgufFile::open(&gguf_path).map_err(|error| {
         ApiError::invalid_request(
-            format!("cannot resolve activation model: {error:#}"),
+            format!("cannot open local GGUF header: {error}"),
             Some("model".into()),
         )
         .into_response()
     })?;
-    let repo = resolved
-        .repo_id
-        .unwrap_or_else(|| crate::serve::pool_key_for_path(&resolved.gguf_path));
-    let quant = resolved.quant.unwrap_or(QuantType::Q4_K_M);
-    let bytes = std::fs::metadata(&resolved.gguf_path)
+    let actual_file_type = header.metadata_u32("general.file_type");
+    let quant = match actual_file_type.and_then(diagnostic_quant_from_file_type) {
+        Some(quant) => quant,
+        None => {
+            return Err(ApiError::invalid_request(
+                format!(
+                    "local GGUF file type {actual_file_type:?} is not supported by diagnostic activation"
+                ),
+                Some("model".into()),
+            )
+            .into_response())
+        }
+    };
+    let bytes = std::fs::metadata(&gguf_path)
         .map_err(|error| {
             ApiError::generation_error(format!(
                 "cannot read GGUF size at {}: {error}",
-                resolved.gguf_path.display()
+                gguf_path.display()
             ))
             .into_response()
         })?
         .len();
-    Ok((repo, quant, resolved.gguf_path, bytes))
+    let repo = crate::serve::pool_key_for_path(&gguf_path);
+    Ok(ActivationTarget {
+        request_model: repo.clone(),
+        repo,
+        quant,
+        bytes,
+        payload: ActivationPayload::Local(gguf_path),
+    })
 }
 
 fn activation_conflict_response(
@@ -224,7 +565,8 @@ fn lifecycle_error_response(error: LifecycleError) -> Response {
         LifecycleError::DrainTimeout { .. }
         | LifecycleError::PrepareFailed(_)
         | LifecycleError::ShutdownFailed(_)
-        | LifecycleError::LoadFailed(_) => {
+        | LifecycleError::LoadFailed(_)
+        | LifecycleError::PostCommitFailed(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, "restart_required", true)
         }
         _ => (StatusCode::SERVICE_UNAVAILABLE, "activation_failed", false),
@@ -246,6 +588,7 @@ fn lifecycle_error_response(error: LifecycleError) -> Response {
 /// action. Ordinary OpenAI requests retain ADR-005 auto-swap semantics.
 pub async fn activate_model(
     State(state): State<AppState>,
+    Extension(cancellation): Extension<RequestCancellation>,
     Json(request): Json<ModelActivationRequest>,
 ) -> Response {
     state
@@ -253,25 +596,105 @@ pub async fn activate_model(
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    let normalized_hub = match normalize_hub_repository(&request.model) {
+        Ok(repository) => repository,
+        Err(response) => return response,
+    };
+    let resident_model = normalized_hub.as_deref().unwrap_or(request.model.trim());
+
     // A live model id, repo, or pool key is resident without touching disk.
+    if request.candidate_id.is_none() {
+        if let Ok(manager) = state.pool.read() {
+            let hosted_prefix = format!("hf://{}@", resident_model);
+            let matches = manager
+                .snapshot_engines()
+                .into_iter()
+                .filter(|engine| {
+                    resident_model == engine.engine.model_id()
+                        || resident_model == engine.repo
+                        || resident_model == format!("{}@{}", engine.repo, engine.quant.as_str())
+                        || engine.repo.starts_with(&hosted_prefix)
+                })
+                .collect::<Vec<_>>();
+            if matches.len() > 1 {
+                if request.action == ModelActivationAction::Probe {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "schema_version": HF2Q_ACTIVATION_SCHEMA,
+                            "status": "ambiguous_resident",
+                            "message": "multiple resident artifacts match; select an exact hosted artifact",
+                        })),
+                    )
+                        .into_response();
+                }
+                return ApiError::invalid_request(
+                    "multiple resident artifacts match this repository; use --quant or --artifact",
+                    Some("model".into()),
+                )
+                .into_response();
+            }
+            if let Some(engine) = matches.into_iter().next() {
+                let stats = manager.pool_stats();
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "schema_version": HF2Q_ACTIVATION_SCHEMA,
+                        "status": "resident",
+                        "pool_revision": stats.revision,
+                        "request_model": engine.repo,
+                        "candidate": activation_candidate_json(
+                            &request.model,
+                            &engine.repo,
+                            engine.quant,
+                            engine.bytes_resident,
+                        ),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if request.action == ModelActivationAction::Probe {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "schema_version": HF2Q_ACTIVATION_SCHEMA,
+                "status": "not_resident",
+            })),
+        )
+            .into_response();
+    }
+
+    let target =
+        match resolve_activation_target(&state, &request.model, request.candidate_id.as_deref())
+            .await
+        {
+            Ok(target) => target,
+            Err(response) => return response,
+        };
+    let repo = target.repo.clone();
+    let quant = target.quant;
+    let bytes = target.bytes;
+    let engine_config = activation_engine_config(&state);
+
     if let Ok(manager) = state.pool.read() {
-        if let Some(engine) = manager.snapshot_engines().into_iter().find(|engine| {
-            request.model == engine.engine.model_id()
-                || request.model == engine.repo
-                || request.model == format!("{}@{}", engine.repo, engine.quant.as_str())
-        }) {
-            let stats = manager.pool_stats();
+        if let Some(engine) = manager
+            .snapshot_engines()
+            .into_iter()
+            .find(|engine| engine.repo == repo && engine.quant == quant)
+        {
+            let revision = manager.pool_stats().revision;
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "schema_version": HF2Q_ACTIVATION_SCHEMA,
                     "status": "resident",
-                    "pool_revision": stats.revision,
+                    "pool_revision": revision,
+                    "request_model": engine.repo,
                     "candidate": activation_candidate_json(
-                        &request.model,
-                        &engine.repo,
-                        engine.quant,
-                        engine.bytes_resident,
+                        &request.model, &repo, quant, engine.bytes_resident,
                     ),
                 })),
             )
@@ -279,16 +702,74 @@ pub async fn activate_model(
         }
     }
 
-    let (repo, quant, gguf_path, bytes) =
-        match resolve_activation_target(&state, &request.model).await {
-            Ok(target) => target,
-            Err(response) => return response,
-        };
-    let engine_config = activation_engine_config(&state);
-
     match request.action {
         ModelActivationAction::Load => {
-            let _admission_guard = state.model_lifecycle.write_admission().await;
+            // Reject known conflict/impossible cases before transferring any
+            // bytes, then release the lifecycle gate so resident generation
+            // can continue while the exact artifact is prepared.
+            {
+                let _admission_guard = state.model_lifecycle.write_admission().await;
+                let manager = match state.pool.read() {
+                    Ok(manager) => manager,
+                    Err(_) => return ApiError::internal_error().into_response(),
+                };
+                let plan = manager.admission_plan(&repo, quant, bytes);
+                match &plan.outcome {
+                    AdmissionOutcome::WouldEvict {
+                        victims,
+                        projected_bytes,
+                    } => {
+                        let victim_keys = victims
+                            .iter()
+                            .map(|victim| victim.repo_id.as_str())
+                            .collect::<Vec<_>>();
+                        let summaries = manager
+                            .iter_loaded()
+                            .filter(|entry| victim_keys.contains(&entry.pool_key.as_str()))
+                            .collect::<Vec<_>>();
+                        return activation_conflict_response(
+                            &request.model,
+                            &repo,
+                            quant,
+                            bytes,
+                            plan.revision,
+                            &summaries,
+                            *projected_bytes,
+                        );
+                    }
+                    AdmissionOutcome::Impossible { reason } => {
+                        return (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(serde_json::json!({
+                                "schema_version": HF2Q_ACTIVATION_SCHEMA,
+                                "status": "impossible",
+                                "candidate": activation_candidate_json(
+                                    &request.model, &repo, quant, bytes
+                                ),
+                                "pool_revision": plan.revision,
+                                "message": reason.to_string(),
+                            })),
+                        )
+                            .into_response();
+                    }
+                    _ => plan,
+                }
+            };
+            let (repo, quant, gguf_path, bytes, request_model) = match target
+                .materialize(
+                    cancellation.0.clone(),
+                    state.preparations.clone(),
+                    &state.artifact_catalog,
+                )
+                .await
+            {
+                Ok(materialized) => materialized,
+                Err(response) => return response,
+            };
+            // The pool may have changed during preparation. Re-plan under the
+            // exclusive gate and publish only if admission is still
+            // non-evicting.
+            let admission_guard = state.model_lifecycle.write_admission().await;
             let plan = {
                 let manager = match state.pool.read() {
                     Ok(manager) => manager,
@@ -338,12 +819,32 @@ pub async fn activate_model(
             };
             let pool = Arc::clone(&state.pool);
             let repo_for_load = repo.clone();
-            let load = tokio::task::spawn_blocking(move || {
-                let mut manager = pool.write().map_err(|error| {
-                    HotSwapError::LoaderFailed(anyhow::anyhow!("pool rwlock poisoned: {error}"))
-                })?;
-                manager.load_or_get_non_evicting(&repo_for_load, quant, &gguf_path, &engine_config)
-            })
+            let load = run_consistent_result_task(
+                state.preparations.clone(),
+                async move {
+                    let _admission_guard = admission_guard;
+                    tokio::task::spawn_blocking(move || {
+                        let mut manager = pool.write().map_err(|error| {
+                            HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                "pool rwlock poisoned: {error}"
+                            ))
+                        })?;
+                        manager.load_or_get_non_evicting(
+                            &repo_for_load,
+                            quant,
+                            &gguf_path,
+                            &engine_config,
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        HotSwapError::LoaderFailed(anyhow::anyhow!(
+                            "model load task failed: {error}"
+                        ))
+                    })?
+                },
+                |_| false,
+            )
             .await;
             match load {
                 Ok(Ok(NonEvictingLoad::Resident(_))) => (
@@ -352,6 +853,7 @@ pub async fn activate_model(
                         "schema_version": HF2Q_ACTIVATION_SCHEMA,
                         "status": "resident",
                         "pool_revision": plan.revision,
+                        "request_model": request_model,
                     })),
                 )
                     .into_response(),
@@ -367,6 +869,7 @@ pub async fn activate_model(
                             "schema_version": HF2Q_ACTIVATION_SCHEMA,
                             "status": "loaded",
                             "pool_revision": revision,
+                            "request_model": request_model,
                             "candidate": activation_candidate_json(
                                 &request.model, &repo, quant, bytes
                             ),
@@ -378,7 +881,10 @@ pub async fn activate_model(
                     lifecycle_error_response(LifecycleError::VictimPlanChanged)
                 }
                 Ok(Err(error)) => map_hotswap_error_to_response(error),
-                Err(_) => ApiError::internal_error().into_response(),
+                Err(error) => ApiError::generation_error(format!(
+                    "model activation transaction failed: {error}"
+                ))
+                .into_response(),
             }
         }
         ModelActivationAction::Switch => {
@@ -403,39 +909,76 @@ pub async fn activate_model(
                 expected_revision,
                 victims: request.victims.into_iter().map(Into::into).collect(),
             };
-            let target_repo = repo.clone();
-            let result = state
-                .model_lifecycle
-                .switch(
-                    Arc::clone(&state.pool),
-                    confirmation,
-                    std::time::Duration::from_secs(60),
-                    |loaded| async move { loaded.engine.shutdown().await },
-                    move |pool| async move {
-                        tokio::task::spawn_blocking(move || {
-                            let mut manager = pool.write().map_err(|error| {
-                                HotSwapError::LoaderFailed(anyhow::anyhow!(
-                                    "pool rwlock poisoned: {error}"
-                                ))
-                            })?;
-                            manager.load_or_get_non_evicting(
-                                &target_repo,
-                                quant,
-                                &gguf_path,
-                                &engine_config,
-                            )
-                        })
-                        .await
-                        .map_err(|error| {
-                            HotSwapError::LoaderFailed(anyhow::anyhow!(
-                                "replacement model load task failed: {error}"
-                            ))
-                        })?
-                    },
+            // Validate the receipt before a potentially large transfer. The
+            // switch revalidates after transfer before draining anything.
+            {
+                let _admission_guard = state.model_lifecycle.write_admission().await;
+                if let Err(error) = state
+                    .model_lifecycle
+                    .validate_switch_confirmation(&state.pool, &confirmation)
+                {
+                    return lifecycle_error_response(error);
+                }
+            }
+            let (repo, quant, gguf_path, bytes, request_model) = match target
+                .materialize(
+                    cancellation.0,
+                    state.preparations.clone(),
+                    &state.artifact_catalog,
                 )
-                .await;
+                .await
+            {
+                Ok(materialized) => materialized,
+                Err(response) => return response,
+            };
+            let confirmation = SwitchConfirmation {
+                candidate_repo: repo.clone(),
+                candidate_quant: quant,
+                candidate_bytes: bytes,
+                expected_revision,
+                victims: confirmation.victims,
+            };
+            let target_repo = repo.clone();
+            let lifecycle = Arc::clone(&state.model_lifecycle);
+            let switch_pool = Arc::clone(&state.pool);
+            let result = run_consistent_result_task(
+                state.preparations.clone(),
+                async move {
+                    lifecycle
+                        .switch(
+                            switch_pool,
+                            confirmation,
+                            std::time::Duration::from_secs(60),
+                            |loaded| async move { loaded.engine.shutdown().await },
+                            move |pool| async move {
+                                tokio::task::spawn_blocking(move || {
+                                    let mut manager = pool.write().map_err(|error| {
+                                        HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                            "pool rwlock poisoned: {error}"
+                                        ))
+                                    })?;
+                                    manager.load_or_get_non_evicting(
+                                        &target_repo,
+                                        quant,
+                                        &gguf_path,
+                                        &engine_config,
+                                    )
+                                })
+                                .await
+                                .map_err(|error| {
+                                    HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                        "replacement model load task failed: {error}"
+                                    ))
+                                })?
+                            },
+                        )
+                        .await
+                },
+                LifecycleError::requires_restart,
+            )
+            .await;
             match result {
-                Ok(NonEvictingLoad::Loaded(_)) | Ok(NonEvictingLoad::Resident(_)) => {
+                Ok(Ok(NonEvictingLoad::Loaded(_))) | Ok(Ok(NonEvictingLoad::Resident(_))) => {
                     let revision = state
                         .pool
                         .read()
@@ -447,6 +990,7 @@ pub async fn activate_model(
                             "schema_version": HF2Q_ACTIVATION_SCHEMA,
                             "status": "switched",
                             "pool_revision": revision,
+                            "request_model": request_model,
                             "candidate": activation_candidate_json(
                                 &request.model, &repo, quant, bytes
                             ),
@@ -454,12 +998,17 @@ pub async fn activate_model(
                     )
                         .into_response()
                 }
-                Ok(NonEvictingLoad::Conflict(_)) => {
+                Ok(Ok(NonEvictingLoad::Conflict(_))) => {
                     lifecycle_error_response(LifecycleError::VictimPlanChanged)
                 }
-                Err(error) => lifecycle_error_response(error),
+                Ok(Err(error)) => lifecycle_error_response(error),
+                Err(error) => {
+                    ApiError::generation_error(format!("model switch transaction failed: {error}"))
+                        .into_response()
+                }
             }
         }
+        ModelActivationAction::Probe => unreachable!("probe returns before target resolution"),
     }
 }
 
@@ -469,6 +1018,29 @@ mod tests {
     use axum::http::StatusCode;
 
     use super::*;
+
+    #[test]
+    fn canonical_hugging_face_base_url_normalizes_to_repository_id() {
+        assert_eq!(
+            normalize_hub_repository("https://huggingface.co/owner/model").unwrap(),
+            Some("owner/model".to_owned())
+        );
+        assert!(normalize_hub_repository("https://huggingface.co/owner/model/tree/main").is_err());
+    }
+
+    #[test]
+    fn diagnostic_hosted_quant_to_header_mapping_is_exact() {
+        for (quant, file_type) in [
+            (QuantType::Q3_K_M, 12),
+            (QuantType::Q4_K_M, 15),
+            (QuantType::Q6_K, 18),
+            (QuantType::Q8_0, 7),
+        ] {
+            assert_eq!(diagnostic_gguf_file_type(quant), file_type);
+            assert_eq!(diagnostic_quant_from_file_type(file_type), Some(quant));
+        }
+        assert_eq!(diagnostic_quant_from_file_type(17), None);
+    }
 
     #[tokio::test]
     async fn post_commit_load_failure_requires_restart() {

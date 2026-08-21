@@ -197,7 +197,10 @@ async fn resolve_engine_for_request(
     //    regression bisect.
     if let Ok(pool_guard) = state.pool.read() {
         for le in pool_guard.snapshot_engines() {
-            if le.engine.model_id() == model_arg {
+            if le.engine.model_id() == model_arg
+                || le.repo == model_arg
+                || format!("{}@{}", le.repo, le.quant.as_str()) == model_arg
+            {
                 drop(pool_guard);
                 let lease = state
                     .model_lifecycle
@@ -475,7 +478,7 @@ pub async fn chat_completions(
     let prepared = match prepare_chat_generation(
         &state,
         &req,
-        cancellation.map(|Extension(token)| token.0),
+        cancellation.map(|Extension(token)| token.0.flag()),
         diagnostic_no_evict,
     )
     .await
