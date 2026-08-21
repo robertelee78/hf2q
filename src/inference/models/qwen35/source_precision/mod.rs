@@ -23,7 +23,8 @@ mod upload_plan;
 mod upload_transform;
 
 pub(crate) use operator::{
-    preflight_official_qwen38_source_teacher, run_official_qwen38_source_teacher,
+    compare_official_qwen38_source_reference, preflight_official_qwen38_source_teacher,
+    run_official_qwen38_source_teacher, OfficialQwen38SourceReferenceRequestV1,
     OfficialQwen38SourceTeacherRequestV1,
 };
 pub(crate) use snapshot::open_verified_qwen_source_snapshot;

@@ -3,12 +3,12 @@
 - Status: Accepted; measured-selector foundation implemented, artifact
   generation and CLI activation remain gated by the phases below
 - Date: 2026-08-18
-- Updated: 2026-08-20 — source-to-stored evidence and the bounded
-  loaded/executed/encoded producer use exact published
-  `mlx-native = 0.10.16`. The backend-independent exact-teacher target storage
-  and model-free allocation binding remain structural and cannot invoke the
-  proposer without authenticated source-precision completion, sensitivity,
-  measurement, and quality evidence
+- Updated: 2026-08-21 — the current release boundary pins exact published
+  `mlx-native = 0.11.0`; the first official source-teacher gate below remains
+  historical evidence from exact `0.10.16`. The backend-independent
+  exact-teacher target storage and model-free allocation binding cannot invoke
+  the proposer without authenticated source-precision completion,
+  sensitivity, measurement, and quality evidence
 - Owners: hf2q product pipeline; mlx-native model-agnostic execution primitives
 - Supersedes: ADR-020's proposed DWQ architecture and performance claims
 
@@ -1388,6 +1388,50 @@ metrics. The transferable Unsloth lessons are multi-domain native-template
 calibration, heterogeneous precision, separate tuning/validation/holdout data,
 and full-distribution plus trajectory gates—not an unpublished selector
 algorithm. No DWQ, learned affine overlay, or training path is introduced.
+
+#### 2026-08-21 — pinned matched-reference artifact boundary
+
+Matched-reference validation is a separate, non-authoritative boundary. The
+source-teacher summary now carries a self-hashed `exact_teacher_reference_input_v1`
+artifact containing the exact plan-owned token IDs, prediction points,
+vocabulary, and target bounds, plus the completed structural target receipt.
+It still does not serialize the opaque prediction plan or family completion
+authority. A validation program can therefore consume exact IDs without
+re-rendering text, while the Rust comparison command freshly authenticates the
+source, reconstructs the prediction plan, and rejects any input, plan, target,
+or receipt substitution.
+
+The primary external canary is
+`Qwen3_5ForConditionalGeneration` from Hugging Face Transformers commit
+`945dac9117cb54196888c0e6c08035792a98c485`, locked with its exact Python
+dependencies under `scripts/reference/qwen38_transformers`. It loads the exact
+local revision in BF16 with eager attention and cache enabled, computes only
+the final full-vocabulary row, and uses the plan-provided token IDs. Completed
+transcripts reuse a fresh per-example cache while advancing every intervening
+teacher token. Generation writes the prompt row and feeds back the canonical
+lowest-ID finite argmax for 31 more steps, yielding exactly 32 tokens. The
+program writes canonical F32 little-endian target framing and a self-hashed
+implementation/trajectory evidence record. It never becomes an hf2q runtime,
+conversion, quantization, tokenization, or inference fallback.
+
+The hidden `source-teacher-reference` command no-follow opens bounded regular
+files, reauthenticates the official recipe and three-way corpus, rebuilds the
+opaque plan, independently reconstructs both structural target receipts, and
+reports per-row maximum absolute error, stable-F64
+`KL(reference || hf2q)`, and top-1 agreement, plus aggregate mean/max/p50/p95
+KL and exact 32-token trajectory divergence. The comparison receipt is
+self-hashed and explicitly records `thresholds_predeclared=false` and false
+quality-gate, source-teacher, sensitivity, allocator, selector, autoquant,
+runtime-dependency, and DWQ authority.
+
+This slice establishes a reproducible measurement mechanism, not a passing
+quality threshold. The first matched Calibration/PolicyValidation run must
+characterize backend drift. Numeric and trajectory thresholds are then
+declared here before AcceptanceHoldout is evaluated once. Native and external
+27B processes run sequentially; no two large runtimes may be co-resident. An
+optional MLX-lm comparison remains independent supporting evidence and must
+use a separately pinned direct-source loader rather than a community-converted
+artifact.
 
 ### Phase E — production `--quant auto`
 

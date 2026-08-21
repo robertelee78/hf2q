@@ -7,7 +7,12 @@
 
 mod corpus;
 mod profile;
+mod reference;
 mod source;
+
+pub(crate) use reference::{
+    compare_official_qwen38_source_reference, OfficialQwen38SourceReferenceRequestV1,
+};
 
 pub(crate) use source::{
     preflight_official_qwen38_source_teacher, run_official_qwen38_source_teacher,

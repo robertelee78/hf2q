@@ -6,8 +6,15 @@
 //! completed source-precision runner may wrap this artifact in its bounded
 //! process-local execution authority.
 
+mod reference;
 mod target_artifact;
 mod types;
+
+pub(crate) use reference::{
+    build_exact_teacher_reference_input, compare_exact_teacher_reference_targets,
+    validate_exact_teacher_reference_input, ExactTeacherExternalReferenceEvidenceV1,
+    ExactTeacherReferenceComparisonReceiptV1, ExactTeacherReferenceInputV1,
+};
 
 #[cfg(test)]
 pub(crate) use target_artifact::write_structural_teacher_target_artifact;

@@ -17,6 +17,9 @@ use crate::intelligence::dynamic_allocator::producer::{
     NonVariableTensor, TensorPartitionManifest, VerifiedSourceTensorInventory,
 };
 use crate::intelligence::dynamic_allocator::TensorAllocationUnit;
+use crate::intelligence::exact_teacher::{
+    build_exact_teacher_reference_input, ExactTeacherReferenceInputV1, ExactTeacherTargetReceipt,
+};
 use crate::intelligence::measured_auto_quant::SourceIdentity;
 
 use super::super::types::QwenSourceSnapshotLimits;
@@ -81,6 +84,7 @@ pub(crate) struct OfficialQwen38SourceTeacherSummaryV1 {
     pub(crate) output_head_evaluation_count: u64,
     pub(crate) max_cache_tokens: usize,
     pub(crate) target_artifact_bytes: u64,
+    pub(crate) reference_input: ExactTeacherReferenceInputV1,
     pub(crate) metal_device: Option<OfficialMetalDeviceSummaryV1>,
     pub(crate) capacity_preflight: Option<Qwen35SourceTeacherCapacityPreflightV1>,
     pub(crate) timings: OfficialSourceTeacherTimingsV1,
@@ -88,6 +92,7 @@ pub(crate) struct OfficialQwen38SourceTeacherSummaryV1 {
     pub(crate) executed: bool,
     pub(crate) target_artifact_sha256: Option<String>,
     pub(crate) completion_receipt_sha256: Option<String>,
+    pub(crate) structural_target_receipt: Option<ExactTeacherTargetReceipt>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -178,6 +183,7 @@ pub(crate) fn run_official_qwen38_source_teacher(
     built.summary.target_artifact_sha256 = Some(completed.target_artifact_sha256().to_owned());
     built.summary.completion_receipt_sha256 =
         Some(completed.completion_receipt_sha256().to_owned());
+    built.summary.structural_target_receipt = Some(completed.structural_target_receipt().clone());
     built.summary.timings.total_ms = elapsed_ms(total_started.elapsed());
     Ok(built.summary)
 }
@@ -207,6 +213,11 @@ fn build_official_work(request: &OfficialQwen38SourceTeacherRequestV1) -> Result
     let source_tensor_count = source.inventory.manifest().tensors.len();
     let weight_shard_count = source.verified_source.required_weight_shards().len();
     let prediction_plan_sha256 = prediction.plan.manifest().manifest_sha256.clone();
+    let reference_input = build_exact_teacher_reference_input(
+        &prediction.plan,
+        profile.target_limits().max_vocabulary_size,
+        profile.target_limits(),
+    )?;
     let topology_started = Instant::now();
     let topology = source.into_topology()?;
     let topology_sha256 = topology.topology_sha256().to_owned();
@@ -261,6 +272,7 @@ fn build_official_work(request: &OfficialQwen38SourceTeacherRequestV1) -> Result
         output_head_evaluation_count: work.output_head_evaluation_count(),
         max_cache_tokens: work.max_cache_tokens(),
         target_artifact_bytes: work.target_artifact_bytes(),
+        reference_input,
         metal_device: None,
         capacity_preflight: None,
         timings: OfficialSourceTeacherTimingsV1 {
@@ -273,6 +285,7 @@ fn build_official_work(request: &OfficialQwen38SourceTeacherRequestV1) -> Result
         executed: false,
         target_artifact_sha256: None,
         completion_receipt_sha256: None,
+        structural_target_receipt: None,
     };
     Ok(OfficialWorkV1 {
         summary,
