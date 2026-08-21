@@ -206,7 +206,11 @@ The exact-artifact workflow is deliberately three-stage. A no-secret job
 builds the locked packed-source candidate, a short protected `apple-release`
 job signs and notarizes it in an ephemeral keychain, and a no-secret
 Apple-Silicon hardware job runs the full cross-family gate against those exact
-signed bytes. Only a successful exact-SHA gate may feed the release workflow.
+signed bytes. The protected job invokes its signer only from the verified exact
+checkout and treats the unsigned and signed executables as data: it never runs
+candidate code while Apple credentials are present. Version execution belongs
+to the surrounding no-secret jobs. Only a successful exact-SHA gate may feed
+the release workflow.
 That workflow assembles a complete draft, downloads and compares every asset,
 publishes the already-proven crate, then makes the complete GitHub release
 public and verifies its unauthenticated downloads and production-trust
@@ -656,13 +660,18 @@ continuity, Gatekeeper assessment, stable-version checks, and the same atomic
 publisher for install and update. The source tree now also contains the
 three-stage signed-byte release rail, ephemeral Apple credential handling,
 accepted-notary proof receipt, immutable draft publication, exact public-byte
-verification, and the real-trust clean-prefix installer gate. That rail has
-not yet run with the project's Apple credentials and has not published a real
-signed/notarized hf2q artifact, so the channel remains unavailable.
+verification, and a real-trust clean-prefix gate that runs the installed
+binary's noninteractive setup, revalidates its canonical config, and proves
+uninstall preserves that config and model data. The protected signing job uses
+only its verified checkout script and never executes candidate bytes. That rail
+has not yet run with the project's Apple credentials and has not published a
+real signed/notarized hf2q artifact, so the channel remains unavailable.
 
 The unreachable second managed-session store, its runtime authorization, and
 the provisional session-cache setup field have been removed. `hf2q setup` does
 not create or authorize a separate `cache/sessions` hierarchy.
+Automatic shell-completion mutation on ordinary startup has also been removed;
+`hf2q completions --shell <shell>` remains the explicit generation surface.
 
 What is not yet the corrected product:
 

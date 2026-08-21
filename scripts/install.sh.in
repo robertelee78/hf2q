@@ -74,7 +74,7 @@ else
 fi
 
 chmod 0555 "$candidate"
-[ "$(HF2Q_NO_COMPLETION_INSTALL=1 "$candidate" --version)" = "hf2q $release_version" ] \
+[ "$("$candidate" --version)" = "hf2q $release_version" ] \
   || fail 'candidate version does not match the immutable release'
 
 "$candidate" __standalone-install \

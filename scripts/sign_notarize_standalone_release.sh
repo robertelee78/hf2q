@@ -55,8 +55,6 @@ unset APPLE_DEVELOPER_ID_APPLICATION APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 \
 [[ "$notary_key_id" =~ ^[A-Z0-9]{10}$ ]] || fail "notary key ID is not canonical"
 [[ "$notary_issuer_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || \
   fail "notary issuer ID is not canonical"
-[[ $(HF2Q_NO_COMPLETION_INSTALL=1 "$input_binary" --version) == "hf2q $version" ]] || \
-  fail "input version does not match the release version"
 minimum_macos=$(/usr/bin/vtool -show-build "$input_binary" 2>/dev/null | \
   awk '$1 == "minos" {print $2}')
 [[ "$minimum_macos" == 14.0 ]] || fail "input minimum macOS version is not exactly 14.0"
@@ -87,8 +85,24 @@ notary_log="$secret_directory/notary-log.json"
 gatekeeper_log="$secret_directory/gatekeeper.txt"
 codesign_log="$secret_directory/codesign.txt"
 keychain_password="$(/usr/bin/uuidgen)-$(/usr/bin/uuidgen)"
+original_user_keychains=()
+while IFS= read -r original_keychain; do
+  original_keychain=${original_keychain#"${original_keychain%%[![:space:]]*}"}
+  original_keychain=${original_keychain#\"}
+  original_keychain=${original_keychain%\"}
+  [[ "$original_keychain" == /* ]] || \
+    fail "user keychain search list contains a noncanonical path"
+  original_user_keychains+=("$original_keychain")
+done < <(/usr/bin/security list-keychains -d user)
+[[ ${#original_user_keychains[@]} -gt 0 ]] || \
+  fail "user keychain search list is empty"
+user_keychain_list_modified=false
 
 cleanup() {
+  if [[ "$user_keychain_list_modified" == true ]]; then
+    /usr/bin/security list-keychains -d user -s \
+      "${original_user_keychains[@]}" >/dev/null 2>&1 || true
+  fi
   /usr/bin/security delete-keychain "$keychain" >/dev/null 2>&1 || true
   rm -f -- "$p12" "$notary_key" "$candidate" "$submission_archive" \
     "$notary_log" "$gatekeeper_log" "$codesign_log"
@@ -113,6 +127,9 @@ unset p12_base64 notary_key_base64
 /usr/bin/security set-key-partition-list -S apple-tool:,apple: -s \
   -k "$keychain_password" "$keychain" >/dev/null
 unset p12_password
+user_keychain_list_modified=true
+/usr/bin/security list-keychains -d user -s "$keychain" \
+  "${original_user_keychains[@]}"
 
 identities=$(/usr/bin/security find-identity -v -p codesigning "$keychain")
 [[ $(grep -Fc -- "\"$signing_identity\"" <<<"$identities") -eq 1 ]] || \
@@ -142,9 +159,6 @@ grep -Eq '^Timestamp=.+$' "$codesign_log" || \
 cdhash=$(sed -n 's/^CDHash=//p' "$codesign_log")
 [[ "$cdhash" =~ ^[0-9a-f]{40,64}$ ]] || fail "signed CDHash is not canonical"
 [[ $(grep -c '^CDHash=' "$codesign_log") -eq 1 ]] || fail "signed CDHash is ambiguous"
-[[ $(HF2Q_NO_COMPLETION_INSTALL=1 "$candidate" --version) == "hf2q $version" ]] || \
-  fail "signed candidate version changed"
-
 /usr/bin/ditto -c -k --keepParent "$candidate" "$submission_archive"
 archive_sha=$(sha256_file "$submission_archive")
 mkdir -m 0700 "$output_directory"

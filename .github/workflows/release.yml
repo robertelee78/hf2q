@@ -746,7 +746,7 @@ jobs:
           test "$(/usr/bin/vtool -show-build "$standalone_binary" | awk '$1 == "minos" {print $2}')" = 14.0
           /usr/bin/codesign --verify --strict --all-architectures "$standalone_binary"
           /usr/sbin/spctl --assess --type execute "$standalone_binary"
-          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$standalone_binary" --version)" = \
+          test "$("$standalone_binary" --version)" = \
             "hf2q $EXPECTED_VERSION"
           echo "EXPECTED_CRATE_SHA256=$expected_crate_sha" >> "$GITHUB_ENV"
           {
@@ -804,6 +804,7 @@ jobs:
             cd "$package_root"
             cargo check --locked --all-targets --all-features
             cargo test --locked --lib --all-features
+            cargo test --locked --test completions --all-features
             cargo test --locked --test convert_integration --all-features
             cargo test --locked --test lcp_registry_unit --all-features
             cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
@@ -1298,6 +1299,7 @@ jobs:
               scripts/sign_notarize_standalone_release.sh \
               scripts/test_standalone_installer.sh \
               scripts/test_standalone_release_signing_contract.sh \
+              tests/completions.rs \
               Cargo.toml \
               Cargo.lock \
               src/main.rs \
@@ -1334,6 +1336,7 @@ jobs:
               setup::tests::interactive_setup_uses_current_values_and_records_explicit_operator_choices \
               setup::tests::cancelled_or_interrupted_interactive_setup_creates_nothing \
               setup::tests::noninteractive_setup_requires_complete_choices_or_accept_defaults \
+              setup::tests::named_performance_levels_accept_one_or_more_levels_and_reject_incoherent_facts \
               tests::convert_config_quant_is_used_and_explicit_quant_wins \
               tests::invalid_operator_config_fails_before_convert_source_or_serve_bind \
               serve::tests::serve_config_defaults_are_used_and_cli_env_override_them \
@@ -1552,7 +1555,7 @@ jobs:
           test "$(/usr/bin/vtool -show-build "$binary" | awk '$1 == "minos" {print $2}')" = 14.0
           /usr/bin/codesign --verify --strict --all-architectures "$binary"
           /usr/sbin/spctl --assess --type execute "$binary"
-          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$binary" --version)" = \
+          test "$("$binary" --version)" = \
             "hf2q $EXPECTED_VERSION"
 
           scripts/render_standalone_release_record.sh \
@@ -1565,12 +1568,9 @@ jobs:
             "$STANDALONE_BINARY_SHA256" "$STANDALONE_TEAM_ID" \
             "$STANDALONE_IDENTIFIER"
 
-          proof_home=$(mktemp -d "$RUNNER_TEMP/hf2q-standalone-install-home.XXXXXX")
+          proof_home=$(cd "$(mktemp -d "$RUNNER_TEMP/hf2q-standalone-install-home.XXXXXX")" && pwd -P)
           proof_install="$proof_home/.local/bin"
           proof_state="$proof_home/.hf2q"
-          mkdir -p "$proof_state/models"
-          printf 'operator config\n' > "$proof_state/config.toml"
-          printf 'converted model\n' > "$proof_state/models/model.gguf"
           curl -fsSL "file://$standalone_stage/install.sh" | \
             HOME="$proof_home" \
             HF2Q_INSTALL_DIR="$proof_install" \
@@ -1579,12 +1579,36 @@ jobs:
             sh >/dev/null
           test "$(shasum -a 256 "$proof_install/hf2q" | awk '{print $1}')" = \
             "$STANDALONE_BINARY_SHA256"
-          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$proof_install/hf2q" --version)" = \
+          test "$("$proof_install/hf2q" --version)" = \
             "hf2q $EXPECTED_VERSION"
-          "$proof_install/hf2q" uninstall --yes >/dev/null
+          HOME="$proof_home" "$proof_install/hf2q" --state-root "$proof_state" \
+            setup --accept-defaults >/dev/null
+          test -s "$proof_state/config.toml"
+          test "$(stat -f '%Lp' "$proof_state/config.toml")" = 600
+          grep -Fx 'kind = "hf2q.config"' "$proof_state/config.toml"
+          grep -Fx 'schema_version = 2' "$proof_state/config.toml"
+          grep -Fx 'package = "hf2q"' "$proof_state/config.toml"
+          setup_golden=${RELEASE_PACKAGE_ROOT:?RELEASE_PACKAGE_ROOT is required}/src/setup/testdata/config_v2.toml
+          cmp -s "$proof_state/config.toml" "$setup_golden"
+          setup_config_sha=$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')
+          HOME="$proof_home" "$proof_install/hf2q" --state-root "$proof_state" \
+            setup --accept-defaults >/dev/null
+          test "$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')" = \
+            "$setup_config_sha"
+          mkdir -p "$proof_state/models"
+          printf 'converted model\n' > "$proof_state/models/model.gguf"
+          model_sha=$(shasum -a 256 "$proof_state/models/model.gguf" | awk '{print $1}')
+          HOME="$proof_home" "$proof_install/hf2q" uninstall --yes >/dev/null
           test ! -e "$proof_install/hf2q"
+          test ! -e "$proof_install/.hf2q-standalone.json"
+          test ! -e "$proof_install/.hf2q-standalone.lock"
+          test ! -e "$proof_install/.hf2q-previous"
           test -f "$proof_state/config.toml"
           test -f "$proof_state/models/model.gguf"
+          test "$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')" = \
+            "$setup_config_sha"
+          test "$(shasum -a 256 "$proof_state/models/model.gguf" | awk '{print $1}')" = \
+            "$model_sha"
           echo "STANDALONE_STAGE=$standalone_stage" >> "$GITHUB_ENV"
 
       - name: Create draft release and attach exact assets once
@@ -1774,23 +1798,44 @@ jobs:
           test "$(/usr/bin/lipo -archs "$public_binary")" = arm64
           /usr/bin/codesign --verify --strict --all-architectures "$public_binary"
           /usr/sbin/spctl --assess --type execute "$public_binary"
-          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$public_binary" --version)" = \
+          test "$("$public_binary" --version)" = \
             "hf2q $EXPECTED_VERSION"
 
-          proof_home=$(mktemp -d "$RUNNER_TEMP/hf2q-public-install-home.XXXXXX")
+          proof_home=$(cd "$(mktemp -d "$RUNNER_TEMP/hf2q-public-install-home.XXXXXX")" && pwd -P)
           proof_install="$proof_home/.local/bin"
           proof_state="$proof_home/.hf2q"
-          mkdir -p "$proof_state/models"
-          printf 'operator config\n' > "$proof_state/config.toml"
-          printf 'converted model\n' > "$proof_state/models/model.gguf"
           curl -fsSL "$public_base/install.sh" | \
             HOME="$proof_home" HF2Q_INSTALL_DIR="$proof_install" \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin sh >/dev/null
           test "$(shasum -a 256 "$proof_install/hf2q" | awk '{print $1}')" = \
             "$STANDALONE_BINARY_SHA256"
-          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$proof_install/hf2q" --version)" = \
+          test "$("$proof_install/hf2q" --version)" = \
             "hf2q $EXPECTED_VERSION"
-          "$proof_install/hf2q" uninstall --yes >/dev/null
+          HOME="$proof_home" "$proof_install/hf2q" --state-root "$proof_state" \
+            setup --accept-defaults >/dev/null
+          test -s "$proof_state/config.toml"
+          test "$(stat -f '%Lp' "$proof_state/config.toml")" = 600
+          grep -Fx 'kind = "hf2q.config"' "$proof_state/config.toml"
+          grep -Fx 'schema_version = 2' "$proof_state/config.toml"
+          grep -Fx 'package = "hf2q"' "$proof_state/config.toml"
+          setup_golden=${RELEASE_PACKAGE_ROOT:?RELEASE_PACKAGE_ROOT is required}/src/setup/testdata/config_v2.toml
+          cmp -s "$proof_state/config.toml" "$setup_golden"
+          setup_config_sha=$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')
+          HOME="$proof_home" "$proof_install/hf2q" --state-root "$proof_state" \
+            setup --accept-defaults >/dev/null
+          test "$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')" = \
+            "$setup_config_sha"
+          mkdir -p "$proof_state/models"
+          printf 'converted model\n' > "$proof_state/models/model.gguf"
+          model_sha=$(shasum -a 256 "$proof_state/models/model.gguf" | awk '{print $1}')
+          HOME="$proof_home" "$proof_install/hf2q" uninstall --yes >/dev/null
           test ! -e "$proof_install/hf2q"
+          test ! -e "$proof_install/.hf2q-standalone.json"
+          test ! -e "$proof_install/.hf2q-standalone.lock"
+          test ! -e "$proof_install/.hf2q-previous"
           test -f "$proof_state/config.toml"
           test -f "$proof_state/models/model.gguf"
+          test "$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')" = \
+            "$setup_config_sha"
+          test "$(shasum -a 256 "$proof_state/models/model.gguf" | awk '{print $1}')" = \
+            "$model_sha"

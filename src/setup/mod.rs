@@ -83,19 +83,23 @@ fn execute<P: HostProbe, R: BufRead, W: Write>(
         hardware,
         macos_version,
         configured_shell,
-        performance_level0_name,
-        performance_level0_cores,
-        performance_level1_name,
-        performance_level1_cores,
+        performance_levels,
+        logical_cores,
         open_file_soft_limit,
         volume_total_bytes,
         volume_available_bytes,
     } = probe.observe(&root)?;
     hardware.validate()?;
+    host::validate_performance_levels(&performance_levels, logical_cores)?;
+    let performance_summary = performance_levels
+        .iter()
+        .map(|level| format!("{} {}", level.logical_cores, level.name))
+        .collect::<Vec<_>>()
+        .join(" + ");
 
     writeln!(
         output,
-        "Detected {} on {}: {} / {} with {} bytes unified memory and a {}-byte Metal recommended working set (macOS {}, {} {} + {} {} logical cores, configured shell {}, RLIMIT_NOFILE {}).",
+        "Detected {} on {}: {} / {} with {} bytes unified memory and a {}-byte Metal recommended working set (macOS {}, {} logical cores, configured shell {}, RLIMIT_NOFILE {}).",
         hardware.target,
         root.display(),
         hardware.chip_model,
@@ -103,10 +107,7 @@ fn execute<P: HostProbe, R: BufRead, W: Write>(
         hardware.unified_memory_bytes,
         hardware.metal_recommended_working_set_bytes,
         macos_version,
-        performance_level0_cores,
-        performance_level0_name,
-        performance_level1_cores,
-        performance_level1_name,
+        performance_summary,
         configured_shell.as_str(),
         open_file_soft_limit,
     )?;

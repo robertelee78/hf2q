@@ -7,28 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Add the first reachable standalone lifecycle: a generated exact-release
-  installer, canonical channel marker, atomic executable replacement, one
-  retained rollback version, `hf2q update`, and marker-gated
-  `hf2q uninstall --yes`. The public installer stays unavailable until the
-  signed/notarized artifact and live stable record pass release gates.
-- Add the protected standalone release rail: locked packed-source arm64/macOS
-  14 build, ephemeral Developer ID signing, ZIP-carried notarization for the
-  raw CLI, exact signed-byte hardware gates, immutable draft assets, and
-  authenticated plus public-download installer verification. No public
-  installer is claimed until the credential-backed release run succeeds.
-
-### Changed
-
-- Replace the provisional session-cache-only setup schema with canonical
-  operator defaults for conversion quantization and serving host, port,
-  scheduler, and active slots. `hf2q convert` and `hf2q serve` now consume
-  those defaults through the global `--state-root`, while explicit CLI and
-  existing serving environment overrides retain precedence. Provisional
-  schema-1 config is preserved and rejected with instructions to rerun setup.
-
 ## [0.1.7] — 2026-08-20
 
 ### Added
@@ -37,23 +15,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `jenerallee78/Qwen3.8-27B-Abliterated-SFT` source revision. The guide uses
   the existing native convert, Q4_K_M quantization, serve, OpenAI-compatible
   API, and optional OpenCode surfaces without adding onboarding orchestration.
-- Add `hf2q setup`, a no-download Apple-Silicon inventory and bounded
-  session-cache policy producer with deterministic TOML, explicit
-  non-interactive flags, descriptor-relative crash recovery, and a custom
-  absolute state-root option. The recorded policy remains inert and will be
-  replaced by setup defaults that the existing convert and serve commands
-  actually consume.
+- Add `hf2q setup`, a no-download Apple-Silicon inventory and deterministic
+  schema-2 configuration producer with explicit noninteractive flags,
+  descriptor-relative crash recovery, and a custom absolute state-root option.
+  Its conversion quantization and serving host, port, scheduler, and active-slot
+  defaults are consumed by the existing `convert` and `serve` commands, with
+  explicit command options retaining precedence.
+- Add the first reachable standalone lifecycle: a generated exact-release
+  installer, canonical channel marker, atomic executable replacement, one
+  retained rollback version, `hf2q update`, and marker-gated
+  `hf2q uninstall --yes`.
+- Add the protected standalone release rail: locked packed-source arm64/macOS
+  14 build, checkout-owned Developer ID signing without candidate execution,
+  ZIP-carried notarization for the raw CLI, exact signed-byte hardware gates,
+  immutable draft assets, and local plus public installed setup/uninstall
+  verification. The public installer remains unavailable until the
+  credential-backed release and live stable-record gates succeed.
 - Accept canonical Hugging Face model IDs and official model/tree/blob/resolve
   URLs at `hf2q convert`, resolving mutable names to an exact commit before
   transfer and recording the normalized identity in conversion receipt v3.
 - Add native Qwen3.8 conversion and Apple-Silicon inference, including the
   model's hybrid attention graph, multimodal projector path, OpenAI-compatible
   reasoning/tools, retained-prefix serving, and exact-artifact agentic gates.
-- Add strict signed distribution, activation-state, and update-journal schemas,
-  plus automatic shell completion for the CLI.
+- Add strict signed distribution, activation-state, and update-journal schemas.
 
 ### Changed
 
+- Read the macOS-reported performance-level count during setup instead of
+  assuming every Apple Silicon host exposes exactly two levels.
+- Keep shell-completion installation explicit through
+  `hf2q completions --shell <shell>`; ordinary CLI startup no longer writes
+  completion registrations or shell startup files.
 - Remove the unreachable second managed-session cache and its runtime
   authorization boundary from setup. Existing persistence remains owned by
   ADR-017 and ADR-027.

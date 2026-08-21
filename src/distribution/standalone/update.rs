@@ -338,7 +338,6 @@ fn verify_apple_release(
         let output = Command::new(candidate)
             .arg("--version")
             .env_clear()
-            .env("HF2Q_NO_COMPLETION_INSTALL", "1")
             .output()
             .map_err(|error| StandaloneError::io("run candidate version check", error))?;
         if !output.status.success()
