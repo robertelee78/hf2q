@@ -48,6 +48,8 @@ grep -Fq -- '--max-redirs 3' "$TEMPLATE"
 grep -Fq -- '--max-filesize "$release_size"' "$TEMPLATE"
 # shellcheck disable=SC2016
 grep -Fq 'ulimit -f "$file_limit_blocks"' "$TEMPLATE"
+# shellcheck disable=SC2016
+grep -Fq 'file_limit_blocks=$(( (release_size + 1023) / 1024 ))' "$TEMPLATE"
 grep -Fq "Authority=Developer ID Certification Authority" "$TEMPLATE"
 grep -Fq "Authority=Apple Root CA" "$TEMPLATE"
 grep -Fq "flags=0x[0-9a-f]+\\(runtime\\)" "$TEMPLATE"
