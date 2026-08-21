@@ -130,6 +130,12 @@ fn acceptance_threshold_bundle_is_exact_predeclared_and_substitution_closed() {
             .policy_validation_comparison_receipt_sha256(),
         "ed24074db26dde69ccafb6ac797dd77a999000993a26f8eb661b4ac91f1fb919"
     );
+    assert_eq!(
+        thresholds.external_implementation.repository_commit,
+        "945dac9117cb54196888c0e6c08035792a98c485"
+    );
+    assert_eq!(thresholds.external_implementation.source_dtype, "bfloat16");
+    assert_eq!(thresholds.external_implementation.logit_dtype, "f32_le");
 
     let mut mutated_profile = threshold_bytes.to_vec();
     let threshold_offset = mutated_profile
@@ -241,6 +247,13 @@ fn acceptance_metrics_fail_at_every_predeclared_boundary() {
         super::acceptance::comparison_passes_thresholds_for_test(&missing_divergence, passing)
             .is_err()
     );
+    let mut out_of_range_divergence = missing_divergence;
+    out_of_range_divergence.trajectories[0].first_divergence_index = Some(32);
+    assert!(super::acceptance::comparison_passes_thresholds_for_test(
+        &out_of_range_divergence,
+        passing,
+    )
+    .is_err());
     assert!(
         super::acceptance::comparison_passes_thresholds_for_test(&policy, passing).is_err(),
         "a zero-trajectory split cannot masquerade as AcceptanceHoldout"

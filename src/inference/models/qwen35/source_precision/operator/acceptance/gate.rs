@@ -7,14 +7,13 @@ use crate::intelligence::calibration::{
 use crate::intelligence::exact_teacher::{
     validate_canonical_exact_teacher_reference_comparison_receipt,
     ExactTeacherReferenceComparisonReceiptV1, ExactTeacherReferenceTrajectoryComparisonV1,
+    EXACT_TEACHER_GREEDY_TOKEN_COUNT as GREEDY_TOKEN_COUNT,
 };
 
 use super::{sha256_json, Qwen38SourceReferenceThresholdsV1, VerifiedQwen38AcceptanceThresholdsV1};
 
 const ACCEPTANCE_GATE_SCHEMA_VERSION: u32 = 1;
 const ACCEPTANCE_GATE_PROFILE: &str = "qwen38_source_bf16_acceptance_gate_v1";
-const GREEDY_TOKEN_COUNT: usize = 32;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Qwen38AcceptanceMetricEvaluationV1 {
@@ -159,6 +158,7 @@ fn validate_official_acceptance_gate_receipt(
             && receipt.acceptance_prediction_plan_sha256
                 == receipt.comparison.prediction_plan_sha256
             && receipt.thresholds == authority.thresholds
+            && receipt.comparison.external_implementation == authority.external_implementation
             && receipt.evaluation == reproduced
             && receipt.comparison.rows[0].point_ordinal == 0
             && receipt.comparison.rows[0].stable_id == "holdout-cache-001"
@@ -260,13 +260,17 @@ pub(super) fn trajectory_matching_prefix(
         },
         "holdout trajectory hashes or divergence are inconsistent"
     );
-    Ok(if trajectory.exact_match {
-        GREEDY_TOKEN_COUNT
-    } else {
-        trajectory
-            .first_divergence_index
-            .context("non-matching trajectory lacks its first divergence")?
-    })
+    if trajectory.exact_match {
+        return Ok(GREEDY_TOKEN_COUNT);
+    }
+    let first_divergence_index = trajectory
+        .first_divergence_index
+        .context("non-matching trajectory lacks its first divergence")?;
+    ensure!(
+        first_divergence_index < GREEDY_TOKEN_COUNT,
+        "holdout trajectory divergence exceeds its fixed token count"
+    );
+    Ok(first_divergence_index)
 }
 
 fn acceptance_gate_sha256(receipt: &OfficialQwen38AcceptanceGateReceiptV1) -> Result<String> {

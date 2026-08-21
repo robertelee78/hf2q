@@ -55,6 +55,7 @@ pub(crate) struct OfficialQwen38AcceptanceReferenceRequestV1 {
 #[derive(Deserialize)]
 struct NativeSummaryReferenceViewV1 {
     profile: String,
+    hf2q_git_commit: String,
     evaluation_split: crate::intelligence::calibration::DatasetSplit,
     threshold_profile_sha256: Option<String>,
     prediction_plan_sha256: String,
@@ -76,6 +77,13 @@ pub(crate) fn compare_official_qwen38_source_reference(
 pub(crate) fn compare_official_qwen38_acceptance_reference(
     request: &OfficialQwen38AcceptanceReferenceRequestV1,
 ) -> Result<OfficialQwen38AcceptanceGateReceiptV1> {
+    ensure!(
+        evidence_destination_identity(&request.raw_comparison_output)?
+            != evidence_destination_identity(&request.quality_gate_output)?,
+        "raw comparison and quality-gate destinations must differ"
+    );
+    preflight_new_evidence_path(&request.raw_comparison_output)?;
+    preflight_new_evidence_path(&request.quality_gate_output)?;
     let profile = official_profile()?;
     let thresholds_for_plan = official_acceptance_thresholds(&profile)?;
     let base = OfficialQwen38SourceReferenceRequestV1 {
@@ -190,8 +198,10 @@ fn compare_reference(
         ) => {
             ensure!(
                 native.threshold_profile_sha256.as_deref()
-                    == Some(thresholds.plan_authority.threshold_profile_sha256()),
-                "holdout summary differs from the predeclared threshold artifact"
+                    == Some(thresholds.plan_authority.threshold_profile_sha256())
+                    && native.hf2q_git_commit == comparator_git_commit
+                    && external.implementation == thresholds.external_implementation,
+                "holdout hf2q lineage or external implementation differs from its predeclaration"
             );
             build_official_acceptance_prediction_plan(&source, profile, thresholds)?
         }
@@ -235,12 +245,61 @@ fn write_json_new(path: &Path, value: &impl Serialize) -> Result<()> {
         .with_context(|| format!("finish evidence file {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("sync evidence file {}", path.display()))?;
+    sync_parent_directory(path)?;
     Ok(())
+}
+
+fn preflight_new_evidence_path(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect evidence destination {}", path.display()))
+        }
+        Ok(_) => anyhow::bail!("evidence destination already exists: {}", path.display()),
+    }
+}
+
+fn evidence_destination_identity(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .context("evidence destination lacks a file name")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = parent.canonicalize().with_context(|| {
+        format!(
+            "canonicalize evidence parent directory {}",
+            parent.display()
+        )
+    })?;
+    Ok(canonical_parent.join(file_name))
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let descriptor = fs::open(
+        parent,
+        OFlags::RDONLY
+            .union(OFlags::DIRECTORY)
+            .union(OFlags::NOFOLLOW)
+            .union(OFlags::CLOEXEC),
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)
+    .with_context(|| format!("open evidence parent directory {}", parent.display()))?;
+    File::from(descriptor)
+        .sync_all()
+        .with_context(|| format!("sync evidence parent directory {}", parent.display()))
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let bytes = read_bounded_bytes(path)?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parse evidence file {}", path.display()))
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse evidence file {}", path.display()))
 }
 
 fn read_bounded_bytes(path: &Path) -> Result<Vec<u8>> {
@@ -270,12 +329,19 @@ mod tests {
     fn evidence_publication_is_create_new_and_no_clobber() {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("receipt.json");
+        let alias = temp.path().join(".").join("receipt.json");
+        assert_eq!(
+            super::evidence_destination_identity(&output).unwrap(),
+            super::evidence_destination_identity(&alias).unwrap()
+        );
+        super::preflight_new_evidence_path(&output).unwrap();
         super::write_json_new(&output, &serde_json::json!({"receipt": 1})).unwrap();
         assert_eq!(
             std::fs::read_to_string(&output).unwrap(),
             "{\"receipt\":1}\n"
         );
         assert!(super::write_json_new(&output, &serde_json::json!({"receipt": 2})).is_err());
+        assert!(super::preflight_new_evidence_path(&output).is_err());
         assert_eq!(
             std::fs::read_to_string(&output).unwrap(),
             "{\"receipt\":1}\n"

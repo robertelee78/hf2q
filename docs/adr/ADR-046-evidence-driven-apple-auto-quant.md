@@ -1548,7 +1548,14 @@ only on pass. Raw receipts retain every authority flag as false; the quality
 receipt sets only `thresholds_predeclared=true` and
 `quality_gate_authority=true`. It never grants source-teacher, sensitivity,
 allocator, selector, autoquant, runtime-dependency, performance, or DWQ
-authority. The holdout remained unopened when this declaration was written.
+authority. Before opening the holdout, the verifier was further closed over
+the exact characterized external-implementation record (including producer,
+lock, Python/framework, dtype, device, eager attention, and cache identity),
+required the native teacher and comparator to carry the same hf2q commit, and
+rejected a claimed divergence index outside the fixed 32-token trajectory.
+Raw and quality receipt creation syncs both file contents and the containing
+directory entry. The holdout remained unopened when this declaration was
+written.
 
 ### Phase E — production `--quant auto`
 

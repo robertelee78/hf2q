@@ -14,6 +14,7 @@ use crate::intelligence::calibration::{
 };
 use crate::intelligence::exact_teacher::{
     validate_exact_teacher_reference_comparison_artifact, ExactTeacherReferenceComparisonReceiptV1,
+    ExternalReferenceImplementationV1,
 };
 use crate::intelligence::measured_auto_quant::SourceIdentity;
 
@@ -26,8 +27,7 @@ mod gate;
 pub(super) use gate::comparison_passes_thresholds_for_test;
 use gate::trajectory_matching_prefix;
 pub(super) use gate::{
-    evaluate_official_acceptance_comparison,
-    validate_official_acceptance_gate_receipt_artifact,
+    evaluate_official_acceptance_comparison, validate_official_acceptance_gate_receipt_artifact,
     OfficialQwen38AcceptanceGateReceiptV1,
 };
 
@@ -110,6 +110,7 @@ struct ThresholdScopeV1 {
 pub(super) struct VerifiedQwen38AcceptanceThresholdsV1 {
     pub(super) plan_authority: VerifiedTeacherAcceptanceThresholdsV1,
     pub(super) thresholds: Qwen38SourceReferenceThresholdsV1,
+    pub(super) external_implementation: ExternalReferenceImplementationV1,
 }
 
 pub(super) fn official_acceptance_thresholds(
@@ -182,6 +183,7 @@ fn verify_threshold_bundle(
         "acceptance-threshold scope grants unsupported authority"
     );
 
+    let external_implementation = calibration.external_implementation.clone();
     let plan_authority = bind_teacher_acceptance_thresholds(
         expected_profile_artifact_sha256.into(),
         calibration.comparison_receipt_sha256,
@@ -194,6 +196,7 @@ fn verify_threshold_bundle(
     Ok(VerifiedQwen38AcceptanceThresholdsV1 {
         plan_authority,
         thresholds: profile.thresholds,
+        external_implementation,
     })
 }
 
