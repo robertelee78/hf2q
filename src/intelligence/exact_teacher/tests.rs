@@ -526,7 +526,7 @@ fn matched_reference_input_and_targets_are_rebuilt_and_compared() {
             name: "fixture".into(),
             producer_sha256: "3".repeat(64),
             repository_url: "https://example.invalid/reference".into(),
-            repository_commit: "1".repeat(64),
+            repository_commit: "1".repeat(40),
             package_version: "1.0.0".into(),
             dependency_lock_sha256: "2".repeat(64),
             python_version: "3.12".into(),
@@ -557,6 +557,7 @@ fn matched_reference_input_and_targets_are_rebuilt_and_compared() {
         &native_path,
         native.receipt().clone(),
         "3".repeat(64),
+        "4".repeat(40),
         &reference_path,
         &external,
     )
@@ -564,6 +565,7 @@ fn matched_reference_input_and_targets_are_rebuilt_and_compared() {
     assert_eq!(receipt.rows.len(), 3);
     assert_eq!(receipt.aggregate.top1_match_count, 3);
     assert_eq!(receipt.aggregate.max_abs, 0.125);
+    assert_eq!(receipt.comparator_git_commit, "4".repeat(40));
     assert!(receipt.aggregate.mean_kl_reference_to_native > 0.0);
     assert!(receipt.trajectories[0].exact_match);
     assert!(!receipt.thresholds_predeclared);
@@ -586,6 +588,7 @@ fn matched_reference_input_and_targets_are_rebuilt_and_compared() {
         &native_path,
         native.receipt().clone(),
         "3".repeat(64),
+        "4".repeat(40),
         &reference_path,
         &external,
     )

@@ -71,6 +71,8 @@ pub(crate) fn compare_official_qwen38_source_reference(
     );
     let external: ExactTeacherExternalReferenceEvidenceV1 =
         read_json(&request.external_evidence).context("read external reference evidence")?;
+    let comparator_git_commit = crate::convert::receipt::require_converter_git_commit()
+        .context("resolve exact hf2q comparator Git commit")?;
 
     let profile = official_profile()?;
     let source = authenticate_official_source(&request.model_dir, &profile)?;
@@ -85,6 +87,7 @@ pub(crate) fn compare_official_qwen38_source_reference(
         &request.native_target,
         native_receipt,
         native_completion,
+        comparator_git_commit,
         &request.external_target,
         &external,
     )

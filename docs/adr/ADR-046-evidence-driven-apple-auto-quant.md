@@ -1419,7 +1419,8 @@ inference fallback.
 The hidden `source-teacher-reference` command no-follow opens bounded regular
 files, reauthenticates the official recipe and three-way corpus, rebuilds the
 opaque plan, independently reconstructs both structural target receipts, and
-reports per-row maximum absolute error, stable-F64
+binds its exact 40-hex hf2q comparator Git commit before reporting per-row
+maximum absolute error, stable-F64
 `KL(reference || hf2q)`, and top-1 agreement, plus aggregate mean/max/p50/p95
 KL and exact 32-token trajectory divergence. The comparison receipt is
 self-hashed and explicitly records `thresholds_predeclared=false` and false
@@ -1434,6 +1435,40 @@ declared here before AcceptanceHoldout is evaluated once. Native and external
 optional MLX-lm comparison remains independent supporting evidence and must
 use a separately pinned direct-source loader rather than a community-converted
 artifact.
+
+#### 2026-08-21 — first matched 27B canary characterization
+
+The first pinned Transformers comparison completed on the 22-row Calibration
+canary. Native source execution was produced by hf2q commit
+`2e1494d2b1de048f12b6875c3d4bbd8ee5a71f53`; the comparison used hf2q commit
+`78979cc22958e57f6f8deb7f044d254b0ae2eee7`. The prediction plan SHA-256 was
+`024f9762aabda7980f908f0f8297c577242db75f92caa4c6c9eb8d01b0e381c2`.
+The native target SHA-256 was
+`b20c6a01128115c31747bde70d815014caab1003cf8923c692ced5d5f56622dd`;
+the external target SHA-256 was
+`81f37a72799da8f54f719a9339296491ae6363de85b41e5bd36ecb664a931bc9`.
+The external evidence bound producer SHA-256
+`2250b23d876da535b12d9e17ffe3e91fa1736c800e4447b3962b64fdf6980a76`
+and self-hashed to
+`f022b855b7a892ca0d20291ca7544417945c2de468ad9719fc5ad2f3e3ef7193`.
+
+All 22 rows agreed on top-1. `KL(reference || hf2q)` had mean
+`0.015885771034098786`, maximum `0.05723891423613325`, p50
+`0.007022535309170345`, and p95 `0.04290778159326072`. The maximum absolute
+logit difference was `4.955787658691406` at point ordinal 20, token 257. The
+32-token greedy trajectories first diverged at index 10; their native and
+reference SHA-256 values were respectively
+`3c515b215a84fbe51ac8449e78fb9af63cfcb613a6fd8909395d953a11ab7692`
+and `6a7a6d4061554275fd9dcdb7bd5722e4f00fa6dac62c09758bf8a5139855686f`.
+The self-hashed comparison receipt was
+`4e7bc6eded214ef8523efc421566f3d01104125281e986d511a83968aa4aa136`.
+
+This result characterizes the small canary only. It does not set or satisfy a
+quality threshold, does not authorize AcceptanceHoldout evaluation, and does
+not grant source-teacher, sensitivity, allocator, selector, autoquant,
+runtime-dependency, performance, or DWQ authority. A broader Calibration and
+PolicyValidation characterization remains required before thresholds are
+declared and AcceptanceHoldout is opened once.
 
 ### Phase E — production `--quant auto`
 

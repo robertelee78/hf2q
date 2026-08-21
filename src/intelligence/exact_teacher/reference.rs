@@ -256,7 +256,7 @@ pub(crate) fn validate_external_reference_evidence(
         || implementation.name.is_empty()
         || !is_sha256(&implementation.producer_sha256)
         || implementation.repository_url.is_empty()
-        || !is_sha256(&implementation.repository_commit)
+        || !is_git_commit(&implementation.repository_commit)
         || implementation.package_version.is_empty()
         || !is_sha256(&implementation.dependency_lock_sha256)
         || implementation.python_version.is_empty()
@@ -425,6 +425,13 @@ fn sha256_json(value: &impl Serialize) -> Result<String, ExactTeacherTargetError
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_git_commit(value: &str) -> bool {
+    value.len() == 40
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
