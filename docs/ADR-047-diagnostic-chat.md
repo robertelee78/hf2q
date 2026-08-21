@@ -240,7 +240,8 @@ Implementation is not complete until all of the following are proven:
 ## Validation evidence
 
 The implementation candidate was frozen at `477172af` after two independent
-review findings were reproduced and fixed:
+review findings were reproduced and fixed. After integrating the current
+`origin/main`, the exact validation tree was `b9c64c34`:
 
 - replacement loading previously ran synchronous model warmup inside the Axum
   Tokio runtime. A nested-runtime sentinel test now proves the complete switch
@@ -256,7 +257,7 @@ following source-bound evidence:
 
 - `cargo check --locked --all-targets --all-features` and
   `cargo build --release --locked` passed;
-- the serial full-bin suite passed 4,801 tests with zero failures and 53
+- the serial full-bin suite passed 4,807 tests with zero failures and 53
   explicitly hardware/fixture-gated ignored tests; focused chat, lifecycle,
   router, SSE, multi-model, and discovery tests also passed, including every
   possible single SSE split boundary plus byte-at-a-time delivery;
