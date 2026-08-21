@@ -463,7 +463,8 @@ receipt. On the macOS 26.5 M5 Max release host:
   Its immutable `hf://` identity, not the mutable repository name, became the
   pool and request identity;
 - direct native generation from those bytes returned exactly
-  `HF2Q_TIED_OK`. Pinned llama.cpp `521a64cd01979bb5b1a466152c576a9d809b068d`
+  `HF2Q_TIED_OK`. The pinned peer at
+  `521a64cd01979bb5b1a466152c576a9d809b068d`
   returned the identical content from the same file, prompt, 16-token limit,
   greedy decoding, and reasoning-off settings;
 - a real owned TUI session selected and loaded that hosted Q8 without entering
