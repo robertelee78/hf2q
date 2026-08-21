@@ -61,8 +61,8 @@ The implementation disposition is therefore:
 | Exact release revision/tag/checksum lineage and the existing Cargo source-package channel | **Keep** | They are useful release evidence and an advanced install channel, but are not proof of the standalone native channel. |
 | Session-cache-only setup policy, dormant runtime authorization, and the second generic managed-session store | **Remove** | The runtime authorization and second store are removed. Schema 2 replaces the temporary cache field with defaults consumed by convert and serve. |
 | No-options model recipes, prepared-model profiles/registry/publication, source-retention orchestration, and post-conversion calibration state | **Remove** | They have no production caller and replace guide steps with an unrequested orchestration system. Any useful exact model evidence moves to the relevant model/conversion ADR or guide proof. |
-| Custom TUF client/spike, transport sealed to it, TUF metadata journal, first-activation graph, and their structural CI sentinels | **Remove** | The current code cannot install, update, or uninstall hf2q and does not shorten the path to the first real channel. |
-| Release manifest/receipt and installation-identity concepts, archive/signature validation, and atomic publication mechanics | **Keep, then simplify behind the reachable standalone channel** | The first channel needs a signed/notarized native artifact, a small manifest and channel receipt, atomic replacement with one known-good fallback, and observable behavior tests. The artifact spike decides which existing validators remain necessary. |
+| Custom TUF client/spike, transport sealed to it, TUF metadata journal, first-activation graph, installation-identity coupling, custom archive/Mach-O preparation, and their structural CI sentinels | **Removed** | They had no production caller and did not participate in the shipped installer or updater. Their experiments remain in git history. |
+| Reachable standalone record, Apple signature/notarization checks, and atomic publication mechanics | **Keep** | These are the small mechanisms used by the real signed installer, updater, rollback, and uninstaller. |
 | Automatic shell-completion mutation on ordinary CLI startup | **Remove** | Completion installation belongs to an explicit setup choice or the owning package/installer, not an unrelated command invocation. Explicit completion generation remains useful. |
 
 Removing dormant code does not erase its history. Git and the project decision
@@ -661,7 +661,6 @@ What exists:
 - a source/Cargo-oriented install path;
 - the canonical tested text-only Qwen3.8 guide for conversion, serving,
   direct API use, and optional OpenCode;
-- partial dormant distribution/update security infrastructure;
 - a `setup` command that records conversion and serving defaults consumed by
   the existing commands through a selected state root;
 - a local standalone installer template, hidden exact-byte bootstrap, public
@@ -737,6 +736,13 @@ ADR-033. The only exact source projection retained is ADR-046's private,
 read-only Qwen source-teacher manifest; it cannot download, convert, register,
 or serve a model.
 
+The unreachable custom TUF verifier and spike, sealed transport, metadata
+journal, installation-identity coupling, custom archive/Mach-O preparation,
+and first-activation graph have also been removed. They were not called by
+`hf2q update`, the installer, setup, or the release workflow. The reachable
+standalone record, Apple trust checks, exact download, rollback, uninstall,
+and atomic publisher remain the sole distribution implementation.
+
 What is not yet the corrected product:
 
 - verified Homebrew and npm-family channels;
@@ -747,10 +753,6 @@ What is not yet the corrected product:
   channels; and
 - the complete guide/update/uninstall journey from a distinct clean macOS
   account, including the protected real-model acceptance path.
-
-The remaining dormant distribution components listed by the scope audit do not
-become ADR-045 requirements. They must be removed or retained under their
-actual governing decisions before more onboarding code is added.
 
 ## Consequences
 

@@ -75,8 +75,6 @@ fn execute<P: HostProbe, R: BufRead, W: Write>(
     output: &mut W,
 ) -> Result<(), SetupError> {
     let root = resolve_root(explicit_root)?;
-    let state_binding = crate::distribution::verify_setup_state_root(&root)
-        .map_err(|error| SetupError::Filesystem(error.to_string()))?;
     let observed = fs::observe_existing_config(&root)?;
     let current = observed.config();
     let HostObservation {
@@ -129,7 +127,7 @@ fn execute<P: HostProbe, R: BufRead, W: Write>(
         PreferenceResolution::Selected(config) => config,
     };
     let bytes = config.to_canonical_bytes()?;
-    let changed = fs::persist(&root, &config, &bytes, &observed, &state_binding)?;
+    let changed = fs::persist(&root, &config, &bytes, &observed)?;
     writeln!(
         output,
         "{} {}",

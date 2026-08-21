@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Remove the unreachable custom TUF verifier and spike, sealed update
+  transport, metadata journal, archive/Mach-O preparation stack, first-
+  activation graph, installation-identity coupling, and their structural CI
+  gates. The shipped standalone installer, updater, rollback, uninstaller,
+  Apple trust checks, and atomic publisher remain unchanged.
 - Remove the unreachable ADR-045 no-options model recipe, preparation plan,
   paired-artifact publication, prepared-profile registry, retention, and
   calibration-pending stack. Normal Hugging Face `convert` behavior remains
