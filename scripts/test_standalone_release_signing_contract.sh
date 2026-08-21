@@ -8,10 +8,21 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 SIGN_SCRIPT="$ROOT_DIR/scripts/sign_notarize_standalone_release.sh"
 CACHE_WORKFLOW="$ROOT_DIR/.github/workflows/cache-lifecycle.yml"
 RELEASE_WORKFLOW="$ROOT_DIR/.github/workflows/release.yml"
+ACCEPTED_QWEN38_MODEL_SHA256=d2ea096cf688ebb02a233ee19b66ade4dc48fdff543793c35631bc5e6291aaaf
 
 fail() {
   echo "$*" >&2
   exit 1
+}
+
+workflow_job() {
+  local workflow=$1
+  local job=$2
+  awk -v start="  ${job}:" '
+    $0 == start { capture = 1 }
+    capture && /^  [A-Za-z0-9_-]+:$/ && $0 != start { exit }
+    capture { print }
+  ' "$workflow"
 }
 
 workflow_executes_unsigned_candidate() {
@@ -84,6 +95,25 @@ if grep -En 'stapler[[:space:]]+staple' "$SIGN_SCRIPT"; then
 fi
 grep -Fq 'environment: apple-release' "$CACHE_WORKFLOW" || \
   fail "exact-artifact gate is not protected by the Apple release environment"
+cache_hardware_job=$(workflow_job \
+  "$CACHE_WORKFLOW" exact-artifact-cache-lifecycle)
+release_publish_job=$(workflow_job "$RELEASE_WORKFLOW" publish)
+grep -Eq \
+  "^[[:space:]]+ACCEPTED_QWEN38_MODEL_SHA256: \"$ACCEPTED_QWEN38_MODEL_SHA256\"$" \
+  <<<"$cache_hardware_job" ||
+  fail "cache hardware job does not bind the accepted Qwen3.8 artifact"
+grep -Eq \
+  "^[[:space:]]+ACCEPTED_QWEN38_MODEL_SHA256: \"$ACCEPTED_QWEN38_MODEL_SHA256\"$" \
+  <<<"$release_publish_job" ||
+  fail "release workflow does not bind the accepted Qwen3.8 artifact"
+grep -Eq \
+  '^[[:space:]]+test "\$QWEN38_MODEL_SHA256" = "\$ACCEPTED_QWEN38_MODEL_SHA256"$' \
+  <<<"$cache_hardware_job" ||
+  fail "cache lifecycle accepts a mutable Qwen3.8 digest as model authority"
+grep -Eq \
+  '^[[:space:]]+test "\$EXPECTED_QWEN38_MODEL_SHA256" = "\$ACCEPTED_QWEN38_MODEL_SHA256"$' \
+  <<<"$release_publish_job" ||
+  fail "release accepts a mutable Qwen3.8 digest as model authority"
 grep -Fq 'signer="$GITHUB_WORKSPACE/scripts/sign_notarize_standalone_release.sh"' \
   "$CACHE_WORKFLOW" || \
   fail "protected signing does not invoke the exact checked-out signer"
