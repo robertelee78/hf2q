@@ -65,17 +65,20 @@ hf2q serve --model models/gemma-4-26b-it-q4_k_m/out.gguf --port 8080
    speculative-or-vanilla decode on the GPU via `mlx-native`, expose
    it through an OpenAI-style `/v1/chat/completions`, `/v1/embeddings`
    and `/v1/models` HTTP API. Supports tools / function-calling,
-   streaming SSE, vision (`qwen3vl`), grammar-constrained sampling,
-   and a persistent block-prefix KV cache.
+   streaming SSE, source-matched paired vision on qualified Gemma and Qwen
+   paths, grammar-constrained sampling, and a persistent block-prefix KV
+   cache.
 
-Supported architectures today: **Gemma 4 (dense + MoE)**, **Qwen 3.5 /
-3.6 (dense + MoE + multi-token-prediction)**, **Qwen 3.8-27B text
-(dense + multi-token-prediction)**, **DeepSeek-V4-Flash-0731
-(compressed-attention MoE)**, **Qwen 3-VL (vision + text)**, and **BERT /
-Nomic-BERT** (embedding-only). Each lives under a single
-`src/inference/models/<arch>/` module — the arch-registry (`src/arch/`)
-is the single source of truth for tensor catalogs, quality thresholds,
-smoke prompts and MTP/vision flags.
+Native generation and chat serving support **Gemma 4 (dense + MoE)**,
+**Qwen 3.5 / 3.6 (`qwen35` / `qwen35moe`)**, **Qwen 3.8-27B through the
+`qwen35` graph**, and **DeepSeek-V4-Flash-0731**. **BERT / Nomic-BERT** are
+embedding-only. Conversion additionally supports legacy `qwen3moe`, dense
+Qwen3-VL, Llama 3, and MiniMax M2.7 artifacts.
+Standalone Qwen3-VL generation and serving fail closed before model load
+pending ADR-041; it must not be confused with the qualified Qwen3.8
+text/projector pair. The
+operation-specific source of truth is
+[`docs/shipping-contract.md`](docs/shipping-contract.md).
 
 ## Install
 

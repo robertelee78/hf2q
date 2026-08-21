@@ -2,14 +2,18 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
-This document defines the public hf2q product surface and the **Unreleased
-next-release candidate** where explicitly marked. It also defines
+Current published release: `v0.1.8`.
+
+This document defines the public hf2q product surface and the **next-release
+candidate** where explicitly marked. It also defines
 the policy each environment variable is classified under. Per-variable
 effects live in `docs/operator-env-vars.md`; this document sits one level above
 and defines *what is supported*.
 
-**Anything not listed in categories 1–3 below may be removed or
-relocated without notice** — it is not part of the supported surface.
+**Anything not listed in Category 1, its explicitly named appendices, or
+Categories 2–3 below may be removed or relocated without notice** — it is not
+part of the supported surface. Support is per operation; conversion support
+does not imply native generation or serving support.
 
 ---
 
@@ -18,6 +22,23 @@ relocated without notice** — it is not part of the supported surface.
 What the default release binary does with **no environment variables set**.
 The exact model-family surface is explicit below; no family inherits another
 family's graph, cache, or scheduler contract by approximation.
+
+### Supported family and command matrix
+
+| Family / emitted GGUF architecture | `hf2q convert` | Native runtime surface | Boundary |
+|---|---|---|---|
+| Gemma 4 (`gemma4`, including source-matched projectors) | Supported | CLI generation and OpenAI-compatible chat, SSE, tools, embeddings, and qualified vision serving | Uses the Gemma graph and cache contract only. |
+| Qwen3.5 / Qwen3.6 (`qwen35`, `qwen35moe`) | Supported | Text CLI generation plus OpenAI-compatible chat, SSE, tools, embeddings, retained-prefix reuse, and source-matched paired vision | Uses the shared Qwen35 autoregressive graph. Multimodal requests must pass the Qwen soft-token, DeepStack, 3D-position, and projector-binding checks. |
+| Qwen3.8-27B (`qwen35`) | Supported; an ordinary conversion of a multimodal source automatically publishes the bound text GGUF and F16 projector pair | The Qwen35 surface above, including the qualified SlotAware paired-vision, exact-speculation, and long-context decode paths | `hf2q generate` is text-only; paired vision uses `hf2q serve --mmproj` through `scripts/serve_qwen38_opencode.sh`. The text and projector provenance/digests must match. |
+| Legacy Qwen 3 MoE (`qwen3moe`) | Supported | None | Conversion-only. It is not silently routed through the `qwen35moe` runtime. |
+| Standalone Qwen3-VL dense (`qwen3vl` / `qwen3_vl`) | Supported | None | CLI generation and server startup fail closed before loading weights pending the ADR-041 engine seam. Qwen3-VL MoE conversion/runtime is unsupported. This is distinct from the qualified Qwen3.8 text/projector pair. |
+| DeepSeek-V4 (`deepseek4`) | Supported | CLI generation and OpenAI-compatible chat, SSE, tools, embeddings, and retained-prefix reuse | Uses the DeepSeek-V4 graph and compressed-cache contract only. |
+| BERT / Nomic-BERT (`bert`, `nomic-bert`) | Supported | OpenAI-compatible `/v1/embeddings` when loaded with `--embedding-model` | Embeddings-only; no chat generation. |
+| Llama 3 / MiniMax M2.7 (`llama`, `minimax_m2`) | Supported | None | Conversion-only; no native generation or serving graph. |
+
+Variants and operations absent from this matrix are unsupported and must fail
+closed rather than entering an approximately compatible loader, template,
+cache, or forward graph.
 
 - Batched `forward_prefill_batched` (default-on since ADR-028
   iter-344; per-token `forward_prefill` was 14-45× slower than peer).
@@ -29,17 +50,19 @@ family's graph, cache, or scheduler contract by approximation.
 - **Auto Q8 lm_head** with exact F32 rerank, selected when
   `hidden_size % 32 == 0` **and** F16 lm_head weight > 256 MB;
   otherwise F16.
-- **Public by 0.1.6; strengthened in the 0.1.7 release:**
-  Qwen3.5/Qwen3.6 generation and OpenAI-compatible
+- **Public by 0.1.6; strengthened through the 0.1.8 release:**
+  Qwen3.5/Qwen3.6 and Qwen3.8 generation and OpenAI-compatible
   serving use the shared autoregressive `qwen35`/`qwen35moe` graph by default.
   Slot-aware Qwen prefill
   is bounded and scheduler-yielding; no `HF2Q_QWEN36_AUTOREG` activation is
   required. This default contract is the plain-text unary/SSE chat surface,
   including native tools, reasoning, grammar, and retained-prefix
-  continuations. SlotAware soft-token/deepstack/3D-position requests fail
-  before Qwen LM scheduler/SSE admission until their own prefill and decode are scheduler-yielding;
-  the historical multimodal primitive remains available only under
-  SerialFifo. The separate chunk-scan prefill experiment remains Category 3.
+  continuations. SlotAware multimodal work retains and validates soft-token,
+  DeepStack, and 3D-position state and advances prefill in bounded transactions;
+  the exact source-matched Qwen3.8 text/projector pair also passed the
+  first-image-after-text cache-reuse gate. Unbound projectors and unsupported
+  request geometries fail closed. The separate chunk-scan prefill experiment
+  remains Category 3.
 - **Public by 0.1.6; strengthened in the 0.1.7 release:** long
   plain-text Gemma SlotAware prefill advances in
   at most 4,096-token transactions, split at the stable-prefix boundary. The
@@ -155,8 +178,9 @@ threshold or a latency rebaseline.
 | Family | Candidate artifact gate |
 |---|---|
 | Gemma 4 | Fresh-versus-reused bounded output parity at the 4,096 boundary and the non-aligned 8,193-token tail; aggregate cross-slot and installed-state transaction rows remain <=4,096 at both four and eight configured slots; short-SSE/long-prefill overlap; transaction cancellation; existing agentic/cache gate; bounded native object populations. The two four-slot calibrated waves retain the default latency limits, run before the destructive 175K/120K soak, and each require a trailing 60 seconds of Nominal state plus fail-closed two-second sampling through the complete cold/cached/tool-result sequence. The experimental eight-slot correctness/aggregate-cap wave is not a latency SLO, but its 40-second TTFT, 60-second whole-response, and 30-second tool-result functional ceilings are accepted only after the already-loaded eight-slot process receives its own trailing 60-second Nominal settle and continuous full-wave thermal receipt binding all eight cold requests. The transaction cap is not accepted until this passes. |
+| Qwen3.5 / Qwen3.6 / Qwen3.8 | Bounded 2,048-token SlotAware prefill, exact short-SSE/long-prefill overlap, cancellation recovery, four-slot agentic/tool/cache semantics, and native lifetime checks pass. Qwen3.8 additionally binds the exact speculation and short/long decode gates above. A multimodal candidate also requires a source-matched text/projector receipt, GPU vision execution, correct first-image semantics, nonzero retained-prefix reuse for an image following a text anchor, and a healthy `/readyz` result. |
 | DeepSeek-V4 | Cached suffix spanning at least three native transactions with a live decode peer; middle-transaction cancellation and recovery; lopsided cold SSE progress with terminal parking; the four-agent cold/cached/tool gate twice using the immutable `full-context-agentic-v2` prompt contract and its `2c894c9e…b4ef` repository context, exactly 6,684 insertion-ordered prompt tokens per agent, explicit rejection of the 6,685-token legacy key-sorted rendering, zero cold reuse, and the literal 60-second cold bounds. The contract binds all request/render/token hashes, the historical 8,912-byte tool result, the exact 6,676-token recovery anchor, and the 2,798-token continuation suffix. The ceiling remains 9.2 seconds below the current thermally valid matched peer median. Each calibrated wave starts only after at least 60 seconds of Nominal, process-contention-free samples at five-second cadence with no hf2q/peer model runtime loaded, then remains under fail-closed two-second thermal and host-process sampling until all four atomic cold receipts exist. Four cold prefills may run in one bounded cohort; terminal cold unary lanes publish together, and only a warm 1–8-token recovery suffix may align four compatible decode cursors before cached work. Large tool-result suffixes remain interleavable. The same live caches must finish cached unary/SSE, automatic tool choice, and tool-result continuation under the unchanged 15/15/15/35-second bounds. Before those waves, a prebuilt exact-artifact test binary launched from a minimal clean-environment whitelist must pass B=2/3/4 non-aligned warm-prefix cooperative state/logit/subsequent-token parity and its alternating five-pair N=4 speed benchmark, plus the exact four-lane decode proof across at least 130 steps and ratio-four/ratio-128 boundaries. The sustained cooperative-prefill and decode microbenchmarks each still require their own 60-second Nominal, contention-free settle and a Nominal, contention-free first measurement, but may reach Fair under continuous two-second telemetry; Serious or Critical thermal samples or forbidden host work fail either gate. The decode proof must show bit-identical per-lane state, logits, cache, and recurrent data; 92-to-23 command-buffer and four-to-one synchronization topology; and a positive alternating-order median. Release independently rehashes the raw timing, test, thermal measurement/settle, and host-contention measurement/settle files, recomputes medians and speedups, and replays both validator families. Each wave's rehashed server log must contain positive post-publication warm-prefill transactions and exact warm B=4 decode selections; cold server completion and client publication must remain cohort-synchronized. The thermal receipt binds the four cold-receipt names and hashes; semantic/tool parity and retained-prefix counts remain unchanged. |
-| All three | The generic fail-stop ownership test covers origin, installed, buffered, and pre-close-permitted replies; synthetic dead workers keep `/health` live while `/readyz` and new generation fail with 503. |
+| Gemma 4 + Qwen35 family + DeepSeek-V4 | The generic fail-stop ownership test covers origin, installed, buffered, and pre-close-permitted replies; synthetic dead workers keep `/health` live while `/readyz` and new generation fail with 503. |
 
 ---
 
@@ -171,6 +195,8 @@ not remove or silently change them without an ADR.
 | `HF2Q_DEFAULT_THINKING_TOKEN_BUDGET` | non-negative integer, unset | Operator default for Qwen reasoning when a request omits `thinking_token_budget`; the canonical Qwen launcher uses 2,048 and the handler still reserves answer capacity. `0` disables the default. Explicit request budgets take precedence. |
 | `HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET` | non-negative integer, unset | Operator ceiling for the first Qwen tool-result continuation; the canonical launcher uses 512 and deeper cycles reduce to a 256-token floor. `0` disables this launcher override. |
 | `HF2Q_QWEN_SPECULATION` | `off`/unset, `auto` | Live Qwen SlotAware speculation policy. The process default is off; the canonical Qwen3.8 launcher explicitly selects auto. Auto preserves the target sampler/grammar state, requires coherent request-owned cache metadata, and cost-gates history lookup and fixed-K3 MTP independently. Unsupported semantics and runtime failures fail closed to ordinary decode or invalidate the affected slot; invalid values warn and resolve to off. |
+| `HF2Q_DECODE_MVN` | `0`, `1` | Exact-tree Q4_K/Q6_K multi-column matvec routing. The global default is `1`; the canonical Qwen3.8 launcher selects `0` because its K=3 verifier is qualified on the weight-amortized width-four route. |
+| `HF2Q_DECODE_MV_EXT` | `0`, `1` | Weight-amortized multi-column matvec routing. The global default is `0`; the canonical Qwen3.8 launcher selects `1`. K-quants route only at widths 4–8; legacy Q4_0/Q8_0 route at widths 2–8. |
 | `HF2Q_QWEN_GQA_Q2` | `auto`/unset, `off`/`0`/`false`, `on`/`1`/`true` | Qwen3.8 long-context TQ-HB selector. Auto uses the bit-exact Q2 cooperative kernel only at KV length ≥8,192 and only for its hard D=256/GQA/no-mask geometry. Off is the supported escape hatch. On cannot bypass geometry checks. Invalid values fail safe to off. |
 | `HF2Q_BATCHED_PREFILL` | `0`/`false`/`off`, unset | Opt out of the default batched prefill path (Category 1) back to per-token `forward_prefill`. For parity diagnostics only — per-token is 14-45× slower than peer. Default-on since ADR-028 iter-344; decoupled from the `HF2Q_UNSAFE_EXPERIMENTS` ack at that iter. The remaining `sliding_wrap` long-sequence byte-parity gap is the operator-signed deferral (2026-04-16; see ADR-010), a coherence deferral — not a runtime error. |
 | `HF2Q_STREAMING_PHASE3` | `1`, unset | ADR-014 P7 iter-3 production wire-up. Routes all 4 Phase 3 quantize dispatch arms (K-quant codec direct / ImatrixAdaptive / StaticQuantizer / DwqK) and Phase 4.5 quality measurement through the streaming `LazyTensorMap` pipeline (`quantize_via_streaming_borrowed` + `measure_quality_streaming_lazy`). Output is byte-identical to the eager path — every wired arm has a per-arm byte-identity gate. Currently a TEST INTEGRATION channel, not a memory win (wedge clones bytes ~2× peak briefly); actual memory savings land when iter-3 wholesale surgery removes the upstream `materialize_all()` bridge. Default OFF; default behavior unchanged. |
@@ -243,7 +269,7 @@ document (for categories 2–3).
 
 ---
 
-## Historical ADR-012 conversion acceptance (superseded for inference)
+## Category 1 appendix — Qwen conversion acceptance (ADR-012 foundation)
 
 ADR-012 originally accepted `qwen35` (dense 27B) and `qwen35moe` (MoE
 35B) as convert-only classes. That historical conversion contract remains
@@ -307,7 +333,7 @@ correctness and sidecar behavior without downloading real model weights.
 
 ---
 
-## Peer-parity gates (ADR-014 P10)
+## Category 1 appendix — Peer-parity gates (ADR-014 P10)
 
 ADR-014 P10 lands the **8-cell peer-parity benchmark harness**
 (`tests/peer_parity_gates.rs`) that compares hf2q's streaming convert
@@ -458,9 +484,13 @@ These are deliberately not part of any category:
 - Byte-identical batched-prefill parity with the peer at the ~752-byte
   `sliding_wrap` level (see `docs/adr/ADR-010-exact-batched-kernel-parity.md`;
   deferred).
-- Qwen SlotAware soft-token, deepstack, and 3D-position generation. Those
-  request shapes fail before Qwen LM scheduler/SSE admission; Qwen3-VL and
-  the historical SerialFifo multimodal primitive have separate contracts.
+- Standalone Qwen3-VL generation and serving, pending the ADR-041 engine seam.
+  Dense conversion is supported, but server startup and CLI generation fail
+  closed before weights load; the Qwen3-VL MoE variant is also unsupported.
+- Qwen multimodal artifacts or request geometries that have not passed the
+  source-pair binding and family-specific soft-token/DeepStack/3D-position
+  validation gates. The accepted Qwen3.8 pair does not qualify arbitrary
+  Qwen projectors or standalone Qwen3-VL.
 - In-process recovery after a fatal Metal command-buffer/watchdog/ignored-
   submission failure or an expired non-returning transaction. The worker and
   HTTP surfaces fail closed, but an OS supervisor must recreate the
@@ -471,6 +501,8 @@ These are deliberately not part of any category:
 ## References
 
 - `docs/operator-env-vars.md` — per-variable effects and defaults.
+- `docs/adr/ADR-004-gguf-compatibility.md` — source-bound Qwen3.8 automatic
+  pair and first-image cache acceptance evidence.
 - `docs/adr/ADR-009-reference-parity-and-coherence-recovery.md` — why
   F32-KV is the default, and the original per-token prefill baseline
   (since superseded as the default by ADR-028 iter-344).
@@ -479,6 +511,13 @@ These are deliberately not part of any category:
 - `docs/adr/diary/ADR-028-peer-parity-coherence-and-speed.md` — iter-344
   default-flip of batched prefill and ack-decoupling.
 - `docs/adr/diary/ADR-012-qwen35moe-conversion.md` — qwen35/qwen35moe convert spec.
+- `docs/adr/diary/ADR-013-qwen35-inference.md` — Qwen35 inference graph.
+- `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md` — Qwen cache
+  and persisted-family contract.
+- `docs/adr/ADR-040-continuous-batching-reopen.md` — Qwen SlotAware bounded
+  text/multimodal prefill and cross-family fatal-device ownership.
+- `docs/adr/ADR-041-qwen3vl-text-lm-engine-seam.md` — standalone Qwen3-VL
+  runtime blocker and fail-closed boundary.
 - `docs/adr/diary/ADR-014-streaming-convert-pipeline.md` — streaming pipeline +
   Decision-15 peer-parity gate matrix (the source of truth for the
   8-cell table above).
