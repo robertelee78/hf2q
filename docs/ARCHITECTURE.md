@@ -101,13 +101,17 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │                       install publication; no activation, update, or CLI
 │                       authority
 │
-├── .github/workflows/cache-lifecycle.yml
+├── .github/workflows/standalone-candidate.yml
 │                       exact packed build → protected ephemeral Developer ID
 │                       sign/notary from the verified checkout, without
-│                       executing candidate bytes → no-secret cross-family
-│                       hardware proof of the exact signed standalone bytes
+│                       executing candidate bytes
+├── .github/workflows/cache-lifecycle.yml
+│                       optional model/cache/performance qualification that
+│                       consumes, but cannot redefine or publish, the exact
+│                       signed standalone candidate
 ├── .github/workflows/release.yml
-│                       exact-SHA proof consumer, complete immutable draft,
+│                       standalone-candidate proof consumer, complete immutable
+│                       draft,
 │                       crate publication, public-byte and clean-prefix
 │                       install/setup/uninstall preservation proof
 │

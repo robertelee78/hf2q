@@ -119,7 +119,7 @@ for model_consumer in \
     exit 1
   }
 done
-if rg -n 'sha256_file "\$(MODEL_PATH|FIXTURE_MODEL)"' \
+if grep -En 'sha256_file "\$(MODEL_PATH|FIXTURE_MODEL)"' \
   "$script_dir/test_deepseek4_interactive_overlap.sh" \
   "$script_dir/test_gemma4_long_short_overlap.sh" \
   "$script_dir/test_qwen36_cumulative_release.sh" \
@@ -129,7 +129,7 @@ if rg -n 'sha256_file "\$(MODEL_PATH|FIXTURE_MODEL)"' \
   echo "release child still rereads a complete model for SHA-256" >&2
   exit 1
 fi
-[[ "$(rg -c 'HF2Q_MODEL_VERIFICATION_RECEIPT=' \
+[[ "$(grep -cF 'HF2Q_MODEL_VERIFICATION_RECEIPT=' \
   "$script_dir/run_agentic_cache_release_gate.sh")" == 5 ]]
 
 expect_fail qwen36_bind_server_process \

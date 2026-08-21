@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hf2q uninstall --yes`.
 - Add the protected standalone release rail: locked packed-source arm64/macOS
   14 build, checkout-owned Developer ID signing without candidate execution,
-  ZIP-carried notarization for the raw CLI, exact signed-byte hardware gates,
+  ZIP-carried notarization for the raw CLI, exact signed-byte verification,
   immutable draft assets, and local plus public installed setup/uninstall
   verification. The public installer remains unavailable until the
   credential-backed release and live stable-record gates succeed.
@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Separate standalone publication from model qualification. Routine releases
+  consume the exact packed, signed, notarized CLI candidate and no longer wait
+  for DeepSeek, Gemma, Qwen, or Qwen3.8 cache/performance runs; those remain
+  independently dispatchable gates under their model and serving decisions.
 - Adopt the single-attribution reference policy repo-wide: prose in docs,
   comments, scripts, and command output now says "the peer" instead of
   naming the upstream engine; `LlamaFtype` is renamed `GgufFtype`
@@ -201,7 +205,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Nominal thermal envelope. Two pinned same-input llama.cpp waves measured
   68.438 s and 69.944 s (69.191 s median), so the protected hf2q ceiling is
   rebaselined to 60 s—9.2 s below the current peer median. Exact packed
-  two-wave and cross-family release authority remains pending.
+  two-wave and cross-family model-qualification authority remains pending.
 
 ### Fixed
 
@@ -227,7 +231,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dirty-source evidence passed 25/25 fresh N=8 worker rounds at each of
   `max_tokens=1`, `2`, and `24`, plus 64 cold/staggered and 16 retained-suffix
   rounds in both Hybrid and full-TQ/HB regimes. A new exact-packed N=8 worker
-  and cross-family hardware run is still required; its worker receipt now
+  and cross-family model-qualification run is still required; its worker
+  receipt now
   requires canonical cross-slot admission, 25 repeated normal 24-token and
   one-token seed-budget parity rounds, and both Hybrid and full-TQ/HB direct
   tiny-prefill discriminators.
@@ -331,13 +336,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scratch and no diagnostic threshold override. The published native package
   and broad DeepSeek model-free suite are locked gates; real-model quality,
   cache, overlap, and calibrated cold-wave performance remain hardware gates.
-- Add a guarded self-hosted `Cache lifecycle` workflow that packages one exact
-  main-branch commit, builds only from that extracted crate, runs DeepSeek,
+- Add a guarded self-hosted `Cache lifecycle` workflow that runs DeepSeek,
   Gemma, and Qwen one process at a time under continuously checked AC power,
   verifies protected GGUF digests, and uploads a
-  source/crate/binary/model-bound receipt. The publication workflow now
-  requires that successful exact-SHA receipt and reproduces its crate digest
-  before publishing.
+  source/crate/binary/model-bound qualification receipt. It now consumes the
+  independently packed and signed standalone candidate; publication verifies
+  that candidate without depending on the large-model receipt.
 - Seal the packed `hf2q` executable into the runner's temporary evidence
   directory before any hardware work, export its build-time digest as a
   distinct immutable input, and recheck the copy against that digest before

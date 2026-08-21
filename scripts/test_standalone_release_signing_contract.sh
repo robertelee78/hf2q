@@ -6,9 +6,10 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 SIGN_SCRIPT="$ROOT_DIR/scripts/sign_notarize_standalone_release.sh"
+VERIFY_SCRIPT="$ROOT_DIR/scripts/verify_standalone_candidate.sh"
+STANDALONE_WORKFLOW="$ROOT_DIR/.github/workflows/standalone-candidate.yml"
 CACHE_WORKFLOW="$ROOT_DIR/.github/workflows/cache-lifecycle.yml"
 RELEASE_WORKFLOW="$ROOT_DIR/.github/workflows/release.yml"
-ACCEPTED_QWEN38_MODEL_SHA256=d2ea096cf688ebb02a233ee19b66ade4dc48fdff543793c35631bc5e6291aaaf
 
 fail() {
   echo "$*" >&2
@@ -36,6 +37,7 @@ workflow_executes_unsigned_candidate() {
 }
 
 bash -n "$SIGN_SCRIPT"
+bash -n "$VERIFY_SCRIPT"
 if "$SIGN_SCRIPT" >/dev/null 2>&1; then
   fail "signing script accepted a missing release contract"
 fi
@@ -63,6 +65,7 @@ for raw_trust_source in \
   "$SIGN_SCRIPT" \
   "$ROOT_DIR/scripts/install.sh.in" \
   "$ROOT_DIR/src/distribution/standalone/update.rs" \
+  "$VERIFY_SCRIPT" \
   "$CACHE_WORKFLOW" \
   "$RELEASE_WORKFLOW"; do
   if grep -Fq '/usr/sbin/spctl' "$raw_trust_source"; then
@@ -93,34 +96,29 @@ fi
 if grep -En 'stapler[[:space:]]+staple' "$SIGN_SCRIPT"; then
   fail "standalone Mach-O must not claim an unsupported stapled ticket"
 fi
-grep -Fq 'environment: apple-release' "$CACHE_WORKFLOW" || \
-  fail "exact-artifact gate is not protected by the Apple release environment"
-cache_hardware_job=$(workflow_job \
-  "$CACHE_WORKFLOW" exact-artifact-cache-lifecycle)
+grep -Fq 'environment: apple-release' "$STANDALONE_WORKFLOW" || \
+  fail "standalone candidate signing is not protected by the Apple release environment"
 release_publish_job=$(workflow_job "$RELEASE_WORKFLOW" publish)
-grep -Eq \
-  "^[[:space:]]+ACCEPTED_QWEN38_MODEL_SHA256: \"$ACCEPTED_QWEN38_MODEL_SHA256\"$" \
-  <<<"$cache_hardware_job" ||
-  fail "cache hardware job does not bind the accepted Qwen3.8 artifact"
-grep -Eq \
-  "^[[:space:]]+ACCEPTED_QWEN38_MODEL_SHA256: \"$ACCEPTED_QWEN38_MODEL_SHA256\"$" \
-  <<<"$release_publish_job" ||
-  fail "release workflow does not bind the accepted Qwen3.8 artifact"
-grep -Eq \
-  '^[[:space:]]+test "\$QWEN38_MODEL_SHA256" = "\$ACCEPTED_QWEN38_MODEL_SHA256"$' \
-  <<<"$cache_hardware_job" ||
-  fail "cache lifecycle accepts a mutable Qwen3.8 digest as model authority"
-grep -Eq \
-  '^[[:space:]]+test "\$EXPECTED_QWEN38_MODEL_SHA256" = "\$ACCEPTED_QWEN38_MODEL_SHA256"$' \
-  <<<"$release_publish_job" ||
-  fail "release accepts a mutable Qwen3.8 digest as model authority"
+for forbidden_release_dependency in \
+  cache_gate_run_id \
+  EXPECTED_DEEPSEEK_MODEL_SHA256 \
+  EXPECTED_GEMMA_MODEL_SHA256 \
+  EXPECTED_QWEN_MODEL_SHA256 \
+  EXPECTED_QWEN38_MODEL_SHA256; do
+  if grep -Fq "$forbidden_release_dependency" <<<"$release_publish_job"; then
+    fail "routine standalone release still depends on model qualification: $forbidden_release_dependency"
+  fi
+done
+grep -Fq 'standalone_candidate_run_id:' "$RELEASE_WORKFLOW" || \
+  fail "release workflow does not accept a standalone candidate run"
+grep -Fq 'scripts/verify_standalone_candidate.sh \' "$RELEASE_WORKFLOW" || \
+  fail "release workflow does not verify the standalone candidate"
 grep -Fq 'signer="$GITHUB_WORKSPACE/scripts/sign_notarize_standalone_release.sh"' \
-  "$CACHE_WORKFLOW" || \
+  "$STANDALONE_WORKFLOW" || \
   fail "protected signing does not invoke the exact checked-out signer"
-grep -Fq '"$signer" \' "$CACHE_WORKFLOW" || \
+grep -Fq '"$signer" \' "$STANDALONE_WORKFLOW" || \
   fail "protected signing does not call its verified checkout signer"
-sign_job=$(sed -n '/^  sign-release-candidate:/,/^  exact-artifact-cache-lifecycle:/p' \
-  "$CACHE_WORKFLOW")
+sign_job=$(workflow_job "$STANDALONE_WORKFLOW" sign-release-candidate)
 if grep -Fq 'tar -xzf' <<<"$sign_job" || \
   grep -Fq '$package_root/scripts/sign_notarize_standalone_release.sh' <<<"$sign_job"; then
   fail "protected signing must not execute code extracted from the unsigned artifact"
@@ -148,11 +146,10 @@ if grep -En \
   "$SIGN_SCRIPT"; then
   fail "secret-bearing signer must not execute candidate bytes in a substitution"
 fi
-grep -Fq 'sealed_binary="$release_evidence/hf2q-aarch64-apple-darwin"' \
-  "$CACHE_WORKFLOW" || \
-  fail "exact-artifact gate does not export the tested signed binary"
-grep -Fq 'standalone_proof="$standalone_dir/proof.json"' "$RELEASE_WORKFLOW" || \
+grep -Fq 'proof="$signed_root/proof.json"' "$VERIFY_SCRIPT" || \
   fail "release workflow does not consume the signed proof receipt"
+grep -Fq '.input.unsigned_sha256 == $unsigned_sha' "$VERIFY_SCRIPT" || \
+  fail "release verification does not bind the signed proof to the packed input"
 grep -Fq 'hf2q-aarch64-apple-darwin' "$RELEASE_WORKFLOW" || \
   fail "release workflow does not publish the native standalone asset"
 if grep -En 'gh release upload.*--clobber|--clobber.*hf2q-aarch64-apple-darwin' \
