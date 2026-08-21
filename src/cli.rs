@@ -8,8 +8,6 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
-pub(crate) mod completion_install;
-
 /// hf2q — Pure Rust CLI for converting HuggingFace models to hardware-optimized formats.
 #[derive(Parser, Debug)]
 #[command(name = "hf2q", version, about, long_about = None)]

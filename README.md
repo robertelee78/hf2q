@@ -144,15 +144,11 @@ model-preparation workflow around the existing commands.
 space, optional RuVector backend); run it after `cargo install` if
 anything misbehaves.
 
-Release builds also provision tab completion automatically on the first normal
-non-setup invocation. `hf2q setup`, including its help and malformed-input
-paths, is excluded so its closed configuration step cannot edit shell
-integration. Bash, Zsh, and Fish registrations stay synchronized with the
-installed clap grammar; start a new shell after the first run. Existing
-non-hf2q completion files are left untouched. Set
-`HF2Q_NO_COMPLETION_INSTALL=1` to disable this behavior. The
-`hf2q completions --shell <shell>` command remains available for packaging or
-manual setup.
+Shell completion is explicit. Generate the current clap grammar with
+`hf2q completions --shell <bash|zsh|fish>` and install or source that output
+through the shell or package manager that owns it. Ordinary hf2q invocations,
+including `--help`, `--version`, and `setup`, do not write completion files or
+shell startup configuration.
 
 ## CLI subcommands
 

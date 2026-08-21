@@ -45,14 +45,18 @@ impl HardwareProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PerformanceLevel {
+    pub(super) name: String,
+    pub(super) logical_cores: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct HostObservation {
     pub(super) hardware: HardwareProfile,
     pub(super) macos_version: String,
     pub(super) configured_shell: ConfiguredShell,
-    pub(super) performance_level0_name: String,
-    pub(super) performance_level0_cores: u32,
-    pub(super) performance_level1_name: String,
-    pub(super) performance_level1_cores: u32,
+    pub(super) performance_levels: Vec<PerformanceLevel>,
+    pub(super) logical_cores: u32,
     pub(super) open_file_soft_limit: u64,
     pub(super) volume_total_bytes: u64,
     pub(super) volume_available_bytes: u64,
@@ -82,21 +86,8 @@ fn read_host_profile() -> Result<HostObservation, SetupError> {
     let macos_version = read_sysctl_string("kern.osproductversion")?;
     require_supported_macos(&macos_version)?;
     let unified_memory_bytes = read_sysctl_u64("hw.memsize")?;
-    let performance_level0_name = read_sysctl_string("hw.perflevel0.name")?;
-    let performance_level0_cores = read_sysctl_u32("hw.perflevel0.logicalcpu_max")?;
-    let performance_level1_name = read_sysctl_string("hw.perflevel1.name")?;
-    let performance_level1_cores = read_sysctl_u32("hw.perflevel1.logicalcpu_max")?;
     let logical_cores = read_sysctl_u32("hw.logicalcpu_max")?;
-    if performance_level0_name == performance_level1_name
-        || performance_level0_cores
-            .checked_add(performance_level1_cores)
-            .filter(|total| *total == logical_cores)
-            .is_none()
-    {
-        return Err(SetupError::Host(
-            "named performance-level core counts do not match hw.logicalcpu_max".to_owned(),
-        ));
-    }
+    let performance_levels = read_performance_levels(logical_cores)?;
     let device = MlxDevice::new()
         .map_err(|error| SetupError::Host(format!("cannot open the Metal device: {error}")))?;
     let working_set = device.metal_device().recommended_max_working_set_size();
@@ -115,10 +106,8 @@ fn read_host_profile() -> Result<HostObservation, SetupError> {
         },
         macos_version,
         configured_shell: configured_shell(),
-        performance_level0_name,
-        performance_level0_cores,
-        performance_level1_name,
-        performance_level1_cores,
+        performance_levels,
+        logical_cores,
         open_file_soft_limit: open_file_soft_limit()?,
         volume_total_bytes: 0,
         volume_available_bytes: 0,
@@ -133,7 +122,7 @@ fn read_host_profile() -> Result<HostObservation, SetupError> {
 }
 
 #[cfg(target_os = "macos")]
-fn read_sysctl_string(name: &'static str) -> Result<String, SetupError> {
+fn read_sysctl_string(name: &str) -> Result<String, SetupError> {
     use sysctl::Sysctl;
 
     let control = sysctl::Ctl::new(name)
@@ -149,7 +138,7 @@ fn read_sysctl_string(name: &'static str) -> Result<String, SetupError> {
 }
 
 #[cfg(target_os = "macos")]
-fn read_sysctl_u64(name: &'static str) -> Result<u64, SetupError> {
+fn read_sysctl_u64(name: &str) -> Result<u64, SetupError> {
     let value = read_sysctl_string(name)?
         .parse::<u64>()
         .map_err(|_| SetupError::Host(format!("{name} is not an unsigned integer")))?;
@@ -160,9 +149,67 @@ fn read_sysctl_u64(name: &'static str) -> Result<u64, SetupError> {
 }
 
 #[cfg(target_os = "macos")]
-fn read_sysctl_u32(name: &'static str) -> Result<u32, SetupError> {
+fn read_sysctl_u32(name: &str) -> Result<u32, SetupError> {
     u32::try_from(read_sysctl_u64(name)?)
         .map_err(|_| SetupError::Host(format!("{name} exceeds u32")))
+}
+
+#[cfg(target_os = "macos")]
+fn read_performance_levels(logical_cores: u32) -> Result<Vec<PerformanceLevel>, SetupError> {
+    const MAX_PERFORMANCE_LEVELS: usize = 8;
+
+    let level_count = usize::try_from(read_sysctl_u32("hw.nperflevels")?)
+        .map_err(|_| SetupError::Host("hw.nperflevels exceeds usize".to_owned()))?;
+    if !(1..=MAX_PERFORMANCE_LEVELS).contains(&level_count) {
+        return Err(SetupError::Host(format!(
+            "hw.nperflevels must be 1..={MAX_PERFORMANCE_LEVELS}"
+        )));
+    }
+    let mut levels = Vec::with_capacity(level_count);
+    for index in 0..level_count {
+        let name_key = format!("hw.perflevel{index}.name");
+        let cores_key = format!("hw.perflevel{index}.logicalcpu_max");
+        levels.push(PerformanceLevel {
+            name: read_sysctl_string(&name_key)?,
+            logical_cores: read_sysctl_u32(&cores_key)?,
+        });
+    }
+    validate_performance_levels(&levels, logical_cores)?;
+    Ok(levels)
+}
+
+pub(super) fn validate_performance_levels(
+    levels: &[PerformanceLevel],
+    logical_cores: u32,
+) -> Result<(), SetupError> {
+    if levels.is_empty() || levels.len() > 8 {
+        return Err(SetupError::Host(
+            "macOS must report 1..=8 named performance levels".to_owned(),
+        ));
+    }
+    let mut total = 0_u32;
+    for (index, level) in levels.iter().enumerate() {
+        if level.name.is_empty()
+            || level.name.len() > 128
+            || level.name.chars().any(char::is_control)
+            || level.logical_cores == 0
+            || levels[..index].iter().any(|prior| prior.name == level.name)
+        {
+            return Err(SetupError::Host(
+                "performance-level names must be unique valid text with positive core counts"
+                    .to_owned(),
+            ));
+        }
+        total = total
+            .checked_add(level.logical_cores)
+            .ok_or_else(|| SetupError::Host("performance-level core count overflow".to_owned()))?;
+    }
+    if total != logical_cores {
+        return Err(SetupError::Host(
+            "named performance-level core counts do not match hw.logicalcpu_max".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn require_supported_macos(value: &str) -> Result<(), SetupError> {

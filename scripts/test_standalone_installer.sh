@@ -12,7 +12,7 @@ RECORD_RENDER="$ROOT_DIR/scripts/render_standalone_release_record.sh"
   exit 2
 }
 
-workspace=$(mktemp -d "${TMPDIR:-/tmp}/hf2q-installer-test.XXXXXX")
+workspace=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/hf2q-installer-test.XXXXXX")" && pwd -P)
 trap 'rm -rf "$workspace"' EXIT
 fixture="$workspace/release"
 home="$workspace/home"
@@ -21,14 +21,12 @@ state_root="$home/.hf2q"
 asset="$fixture/hf2q-aarch64-apple-darwin"
 installer="$workspace/install.sh"
 release_record="$workspace/stable-aarch64-apple-darwin.json"
-mkdir -p "$fixture" "$state_root/models"
+mkdir -p "$fixture"
 cp "$HF2Q_BIN" "$asset"
 chmod 0555 "$asset"
 size=$(stat -f '%z' "$asset")
 sha256=$(shasum -a 256 "$asset" | awk '{print $1}')
 version=$($HF2Q_BIN --version | awk '{print $2}')
-printf 'operator config\n' >"$state_root/config.toml"
-printf 'converted model\n' >"$state_root/models/model.gguf"
 
 "$RECORD_RENDER" "$release_record" "$version" "$size" "$sha256" >/dev/null
 expected_record=$(printf '{"kind":"hf2q.standalone-release","schema_version":1,"package":"hf2q","channel":"stable","target":"aarch64-apple-darwin","version":"%s","size":%s,"sha256":"%s"}' "$version" "$size" "$sha256")
@@ -65,9 +63,18 @@ curl -fsSL "file://$installer" | \
 
 [[ -x "$install_dir/hf2q" ]]
 [[ $(shasum -a 256 "$install_dir/hf2q" | awk '{print $1}') == "$sha256" ]]
-[[ $("$install_dir/hf2q" --version) == "hf2q $version" ]]
+[[ $(HOME="$home" "$install_dir/hf2q" --version) == "hf2q $version" ]]
 [[ -f "$install_dir/.hf2q-standalone.json" ]]
 [[ -f "$install_dir/.hf2q-standalone.lock" ]]
+HOME="$home" "$install_dir/hf2q" --state-root "$state_root" \
+  setup --accept-defaults >/dev/null
+[[ -s "$state_root/config.toml" ]]
+[[ $(stat -f '%Lp' "$state_root/config.toml") == 600 ]]
+cmp -s "$state_root/config.toml" "$ROOT_DIR/src/setup/testdata/config_v2.toml"
+mkdir -p "$state_root/models"
+printf 'converted model\n' >"$state_root/models/model.gguf"
+config_sha=$(shasum -a 256 "$state_root/config.toml" | awk '{print $1}')
+model_sha=$(shasum -a 256 "$state_root/models/model.gguf" | awk '{print $1}')
 [[ -f "$state_root/config.toml" ]]
 [[ -f "$state_root/models/model.gguf" ]]
 
@@ -85,16 +92,18 @@ if curl -fsSL "file://$installer" | \
 fi
 [[ $(shasum -a 256 "$install_dir/hf2q" | awk '{print $1}') == "$sha256" ]]
 
-if "$install_dir/hf2q" uninstall >/dev/null 2>&1; then
+if HOME="$home" "$install_dir/hf2q" uninstall >/dev/null 2>&1; then
   echo "uninstall without confirmation unexpectedly succeeded" >&2
   exit 1
 fi
 [[ $(shasum -a 256 "$install_dir/hf2q" | awk '{print $1}') == "$sha256" ]]
-"$install_dir/hf2q" uninstall --yes >/dev/null
+HOME="$home" "$install_dir/hf2q" uninstall --yes >/dev/null
 [[ ! -e "$install_dir/hf2q" ]]
 [[ ! -e "$install_dir/.hf2q-standalone.json" ]]
 [[ ! -e "$install_dir/.hf2q-standalone.lock" ]]
 [[ -f "$state_root/config.toml" ]]
 [[ -f "$state_root/models/model.gguf" ]]
+[[ $(shasum -a 256 "$state_root/config.toml" | awk '{print $1}') == "$config_sha" ]]
+[[ $(shasum -a 256 "$state_root/models/model.gguf" | awk '{print $1}') == "$model_sha" ]]
 
 printf 'standalone installer fixture passed: %s (%s bytes)\n' "$sha256" "$size"

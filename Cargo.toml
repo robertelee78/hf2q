@@ -33,6 +33,7 @@ exclude = [
     # crate-local unit tests read with include_str!. Keeping those makes the
     # exact registry archive testable after download.
     "tests/**",
+    "!tests/completions.rs",
     "!tests/continuous_batching_throughput.rs",
     "!tests/convert_integration.rs",
     "!tests/lcp_partial_prefill_byte_identity.rs",

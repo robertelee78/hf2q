@@ -8,10 +8,10 @@ use clap::Parser;
 use tempfile::TempDir;
 
 use super::fs as setup_fs;
-use super::host::HardwareProfile;
 use super::host::{
     nearest_existing_directory, require_supported_macos, HostObservation, HostProbe,
 };
+use super::host::{validate_performance_levels, HardwareProfile, PerformanceLevel};
 use super::schema::{ConfiguredScheduler, ConfiguredShell, OperatorConfigV2};
 use super::{execute, SetupError};
 use crate::cli::{Cli, Command, SchedulerArg, SetupArgs};
@@ -36,10 +36,17 @@ impl HostProbe for FakeProbe {
             hardware: fixture_hardware(),
             macos_version: "15.6.1".to_owned(),
             configured_shell: ConfiguredShell::Zsh,
-            performance_level0_name: "Super".to_owned(),
-            performance_level0_cores: 4,
-            performance_level1_name: "Performance".to_owned(),
-            performance_level1_cores: 12,
+            performance_levels: vec![
+                PerformanceLevel {
+                    name: "Super".to_owned(),
+                    logical_cores: 4,
+                },
+                PerformanceLevel {
+                    name: "Performance".to_owned(),
+                    logical_cores: 12,
+                },
+            ],
+            logical_cores: 16,
             open_file_soft_limit: 10240,
             volume_total_bytes: self.total,
             volume_available_bytes: self.available,
@@ -55,6 +62,41 @@ fn fixture_hardware() -> HardwareProfile {
         metal_device_name: "Apple M5 Max".to_owned(),
         metal_recommended_working_set_bytes: 96 * GIB,
     }
+}
+
+#[test]
+fn named_performance_levels_accept_one_or_more_levels_and_reject_incoherent_facts() {
+    let one = [PerformanceLevel {
+        name: "Performance".to_owned(),
+        logical_cores: 4,
+    }];
+    validate_performance_levels(&one, 4).unwrap();
+
+    let two = [
+        PerformanceLevel {
+            name: "Super".to_owned(),
+            logical_cores: 6,
+        },
+        PerformanceLevel {
+            name: "Performance".to_owned(),
+            logical_cores: 12,
+        },
+    ];
+    validate_performance_levels(&two, 18).unwrap();
+    assert!(validate_performance_levels(&two, 17).is_err());
+    assert!(validate_performance_levels(&[], 0).is_err());
+
+    let duplicate = [
+        PerformanceLevel {
+            name: "Performance".to_owned(),
+            logical_cores: 2,
+        },
+        PerformanceLevel {
+            name: "Performance".to_owned(),
+            logical_cores: 2,
+        },
+    ];
+    assert!(validate_performance_levels(&duplicate, 4).is_err());
 }
 
 fn fixture_config(limit_bytes: u64) -> (OperatorConfigV2, Vec<u8>) {
@@ -143,9 +185,6 @@ fn cli_parses_the_closed_noninteractive_surface() {
         "1",
     ];
     let cli = Cli::try_parse_from(raw).unwrap();
-    assert!(crate::invocation_suppresses_completion_reconciliation(
-        &raw.into_iter().map(Into::into).collect::<Vec<_>>()
-    ));
     let Command::Setup(args) = cli.command else {
         panic!("setup command was not selected");
     };
@@ -155,50 +194,6 @@ fn cli_parses_the_closed_noninteractive_surface() {
     assert_eq!(args.serve_port, Some(8081));
     assert_eq!(args.serve_scheduler, Some(SchedulerArg::InflightBatched));
     assert_eq!(args.serve_max_slots, Some(1));
-    assert!(crate::invocation_suppresses_completion_reconciliation(&[
-        "hf2q".into(),
-        "setup".into(),
-        "--help".into(),
-    ]));
-    assert!(crate::invocation_suppresses_completion_reconciliation(&[
-        "hf2q".into(),
-        "setup".into(),
-        "--not-a-real-flag".into(),
-    ]));
-    assert!(crate::invocation_suppresses_completion_reconciliation(&[
-        "hf2q".into(),
-        "__standalone-install".into(),
-        "--help".into(),
-    ]));
-    assert!(crate::invocation_suppresses_completion_reconciliation(&[
-        "hf2q".into(),
-        "update".into(),
-        "--help".into(),
-    ]));
-    assert!(crate::invocation_suppresses_completion_reconciliation(&[
-        "hf2q".into(),
-        "uninstall".into(),
-        "--help".into(),
-    ]));
-    assert!(crate::invocation_suppresses_completion_reconciliation(&[
-        "hf2q".into(),
-        "--state-root".into(),
-        "/tmp/hf2q-state".into(),
-        "--log-format".into(),
-        "json".into(),
-        "-vv".into(),
-        "setup".into(),
-    ]));
-    assert!(!crate::invocation_suppresses_completion_reconciliation(&[
-        "hf2q".into(),
-        "info".into(),
-        "setup".into(),
-    ]));
-    assert!(!crate::invocation_suppresses_completion_reconciliation(&[
-        "hf2q".into(),
-        "--log-level".into(),
-        "setup".into(),
-    ]));
 
     let cli = Cli::try_parse_from([
         "hf2q",

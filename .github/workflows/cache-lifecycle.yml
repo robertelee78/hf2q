@@ -118,7 +118,7 @@ jobs:
           test -x "$built_binary"
           test "$(/usr/bin/lipo -archs "$built_binary")" = arm64
           test "$(/usr/bin/vtool -show-build "$built_binary" | awk '$1 == "minos" {print $2}')" = 14.0
-          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$built_binary" --version)" = \
+          test "$("$built_binary" --version)" = \
             "hf2q $EXPECTED_VERSION"
           built_sha=$(shasum -a 256 "$built_binary" | awk '{print $1}')
 
@@ -240,15 +240,12 @@ jobs:
           crate="$build_root/hf2q-${EXPECTED_VERSION}.crate"
           test "$(shasum -a 256 "$crate" | awk '{print $1}')" = \
             "$(jq -er .crate_sha256 "$build_receipt")"
-          package_stage=$(mktemp -d "$RUNNER_TEMP/hf2q-sign-package.XXXXXX")
-          echo "SIGN_PACKAGE_STAGE=$package_stage" >> "$GITHUB_ENV"
-          /usr/bin/tar -xzf "$crate" -C "$package_stage"
-          package_root="$package_stage/hf2q-${EXPECTED_VERSION}"
-          test -x "$package_root/scripts/sign_notarize_standalone_release.sh"
+          signer="$GITHUB_WORKSPACE/scripts/sign_notarize_standalone_release.sh"
+          test -x "$signer"
           test "$APPLE_CODESIGN_IDENTIFIER" = us.hf2q.cli
           signed_stage="$RUNNER_TEMP/cache-lifecycle-signed-$EXPECTED_SHA"
           export APPLE_RELEASE_SECRET_DIRECTORY="$RUNNER_TEMP/hf2q-apple-release-secrets-$EXPECTED_SHA"
-          "$package_root/scripts/sign_notarize_standalone_release.sh" \
+          "$signer" \
             "$unsigned" "$signed_stage" "$EXPECTED_VERSION" "$EXPECTED_SHA" \
             "$APPLE_TEAM_ID" "$APPLE_CODESIGN_IDENTIFIER"
 
@@ -277,15 +274,6 @@ jobs:
               >/dev/null 2>&1 || true
           fi
           [[ ! -d "$scratch" || -L "$scratch" ]] || rm -rf -- "$scratch"
-          package_stage=${SIGN_PACKAGE_STAGE:-}
-          case "$package_stage" in
-            "$RUNNER_TEMP"/hf2q-sign-package.*)
-              [[ ! -d "$package_stage" || -L "$package_stage" ]] || \
-                rm -rf -- "$package_stage"
-              ;;
-            '') ;;
-            *) exit 1 ;;
-          esac
 
   exact-artifact-cache-lifecycle:
     name: exact signed artifact · DeepSeek + Gemma + Qwen + Qwen3.8
@@ -405,7 +393,7 @@ jobs:
           test "$(/usr/bin/vtool -show-build "$signed_binary" | awk '$1 == "minos" {print $2}')" = 14.0
           /usr/bin/codesign --verify --strict --all-architectures "$signed_binary"
           /usr/sbin/spctl --assess --type execute "$signed_binary"
-          test "$(HF2Q_NO_COMPLETION_INSTALL=1 "$signed_binary" --version)" = \
+          test "$("$signed_binary" --version)" = \
             "hf2q $EXPECTED_VERSION"
 
           packed_build_root=$(mktemp -d "/private/var/tmp/hf2q-packed-build.XXXXXX")

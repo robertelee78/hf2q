@@ -88,17 +88,7 @@ impl std::fmt::Display for AppError {
 }
 
 fn main() -> ExitCode {
-    // Best-effort zero-config tab completion. Release builds reconcile
-    // hf2q-owned Bash, Zsh, and Fish registrations in their per-user loader
-    // locations; debug/test builds require explicit isolated destinations.
-    // This normally precedes clap parsing so --help/--version and parse errors
-    // can complete first-run registration. `setup` and the standalone
-    // installer/updater/uninstaller are closed exceptions: even help or malformed
-    // input must not mutate shell integration.
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if !invocation_suppresses_completion_reconciliation(&raw_args) {
-        cli::completion_install::reconcile();
-    }
 
     // Emit one-shot warning / ack-gate summary for any investigation-only
     // env vars that are set. Uses direct eprintln! (not tracing), so it
@@ -160,35 +150,6 @@ fn main() -> ExitCode {
             ExitCode::from(exit_code)
         }
     }
-}
-
-fn invocation_suppresses_completion_reconciliation(args: &[std::ffi::OsString]) -> bool {
-    let mut arguments = args.iter().skip(1);
-    while let Some(argument) = arguments.next() {
-        let Some(argument) = argument.to_str() else {
-            continue;
-        };
-        if argument == "--" {
-            return arguments.next().is_some_and(|value| {
-                matches!(
-                    value.to_str(),
-                    Some("setup" | "__standalone-install" | "update" | "uninstall")
-                )
-            });
-        }
-        if matches!(argument, "--log-format" | "--log-level" | "--state-root") {
-            let _ = arguments.next();
-            continue;
-        }
-        if argument.starts_with('-') {
-            continue;
-        }
-        return matches!(
-            argument,
-            "setup" | "__standalone-install" | "update" | "uninstall"
-        );
-    }
-    false
 }
 
 fn run(cli: Cli) -> Result<(), AppError> {

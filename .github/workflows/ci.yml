@@ -601,6 +601,7 @@ jobs:
             scripts/sign_notarize_standalone_release.sh \
             scripts/test_standalone_installer.sh \
             scripts/test_standalone_release_signing_contract.sh \
+            tests/completions.rs \
             Cargo.toml \
             Cargo.lock \
             src/main.rs \
@@ -632,6 +633,7 @@ jobs:
           set -euo pipefail
           cargo test --locked --lib --all-features
           cargo test --locked --test build_script_contract --all-features
+          cargo test --locked --test completions --all-features
           cargo test --locked --test convert_integration --all-features
           cargo test --locked --test lcp_registry_unit --all-features
           cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
@@ -666,6 +668,7 @@ jobs:
             setup::tests::interactive_setup_uses_current_values_and_records_explicit_operator_choices \
             setup::tests::cancelled_or_interrupted_interactive_setup_creates_nothing \
             setup::tests::noninteractive_setup_requires_complete_choices_or_accept_defaults \
+            setup::tests::named_performance_levels_accept_one_or_more_levels_and_reject_incoherent_facts \
             tests::convert_config_quant_is_used_and_explicit_quant_wins \
             tests::invalid_operator_config_fails_before_convert_source_or_serve_bind \
             serve::tests::serve_config_defaults_are_used_and_cli_env_override_them \
