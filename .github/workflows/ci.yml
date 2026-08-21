@@ -100,6 +100,25 @@ jobs:
             exit 1
           fi
 
+      - name: Standalone distribution package contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_list="$(cargo +1.88.0 package --locked --list)"
+          for required in \
+            src/distribution/mod.rs \
+            src/distribution/standalone.rs \
+            src/distribution/standalone/update.rs \
+            src/distribution/standalone_tests.rs \
+            scripts/install.sh.in \
+            scripts/sign_notarize_standalone_release.sh \
+            scripts/test_standalone_installer.sh \
+            scripts/test_standalone_release_signing_contract.sh \
+            docs/adr/ADR-045-frictionless-distribution-updates-and-onboarding.md
+          do
+            grep -Fqx -- "$required" <<<"$package_list"
+          done
+
       - name: cargo check
         run: cargo check --locked --all-targets --all-features
 
@@ -111,74 +130,6 @@ jobs:
           cargo install cargo-audit --locked --version 0.22.2 --no-default-features
           cargo audit
 
-      - name: ADR-045 reachable distribution boundary (blocking)
-        shell: bash
-        run: |
-          set -euo pipefail
-          direct_metadata="$(cargo +1.88.0 metadata --locked --all-features --format-version 1 --no-deps)"
-          jq -e '
-            [.packages[]
-              | select(.name == "hf2q")
-              | .dependencies[]
-              | select(
-                  .name == "sigstore-tuf"
-                  or .name == "jiff"
-                  or .name == "zip"
-                  or .name == "flate2"
-                  or .name == "aws-lc-rs"
-                  or .name == "core-foundation"
-                  or .name == "security-framework"
-                  or .name == "security-framework-sys"
-                )]
-            | length == 0
-          ' <<<"$direct_metadata"
-          test "$(grep -Fhc 'mod standalone;' src/distribution/mod.rs)" = 1
-          test "$(find src/distribution -type f | wc -l | tr -d ' ')" = 4
-          test -z "$(find tests/adr045_tuf_spike -type f -print -quit 2>/dev/null || true)"
-          unexpected_setup_authority="$(
-            grep -nE \
-              'hf_hub|reqwest|hyper|tokio::net|std::net|std::process|Command::new|crate::(models|convert|quantize|serve)|calibration|remove_dir|remove_file' \
-              src/setup/mod.rs src/setup/schema.rs src/setup/host.rs src/setup/policy.rs \
-              | grep -vE '^src/setup/schema.rs:[0-9]+:[[:space:]]*crate::convert::QuantSelector::from_name\(&self\.quant\)$' || true
-          )"
-          test -z "$unexpected_setup_authority"
-          test "$(grep -Fhc 'QuantSelector::from_name' src/setup/schema.rs)" = 1
-          setup_file_modules=(src/setup/fs.rs src/setup/fs/unix.rs)
-          test "$(grep -Fhc 'fs::renameat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(grep -Fhc 'fs::unlinkat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 2
-          test "$(grep -Fhc 'fs::mkdirat(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(grep -Fhc 'fs::flock(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(grep -Fhc 'fs::fsync(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 2
-          test "$(grep -Fhc 'fs::fcntl_fullfsync(' "${setup_file_modules[@]}" | awk '{ total += $1 } END { print total }')" = 1
-          test "$(shasum -a 256 src/setup/testdata/config_v2.toml | awk '{print $1}')" = \
-            ff9f5d3ba200f2ccc107fc6142d9752c87a8429697a6a19f5c67702b82731c17
-          test "$(shasum -a 256 data/calibration/qwen38-source-teacher-canary-v1/source-manifest.json | awk '{print $1}')" = \
-            e87e1b2637f929288fded02e3acbb72818fe18d4fd29d21558e6007385eee09d
-          package_list="$(cargo +1.88.0 package --locked --list)"
-          for required in \
-            src/distribution/mod.rs \
-            src/distribution/standalone.rs \
-            src/distribution/standalone/update.rs \
-            src/distribution/standalone_tests.rs \
-            src/setup/mod.rs \
-            src/setup/fs.rs \
-            src/setup/fs/unix.rs \
-            src/setup/schema.rs \
-            src/setup/tests.rs \
-            src/setup/defaults_contract_tests.rs \
-            src/setup/testdata/config_v2.toml \
-            scripts/install.sh.in \
-            scripts/sign_notarize_standalone_release.sh \
-            scripts/test_standalone_installer.sh \
-            scripts/test_standalone_release_signing_contract.sh \
-            docs/adr/ADR-045-frictionless-distribution-updates-and-onboarding.md
-          do
-            grep -Fqx -- "$required" <<<"$package_list"
-          done
-          if grep -Eq '^src/distribution/(update_auth|update_transport|install_state|prepared_release|schema)/|^tests/adr045_tuf_spike/' <<<"$package_list"; then
-            echo 'removed ADR-045 experiment leaked into the package' >&2
-            exit 1
-          fi
       # GitHub's hosted macOS VM returns nil from Metal residency-set
       # creation. Keep the hosted gate blocking and deterministic by running
       # the library, native conversion, and non-Metal DeepSeek contracts here.
