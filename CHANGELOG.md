@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.7] — 2026-08-21
 
+### Fixed
+
+- Guarantee serve-side error semantics for the guarantees tune-up:
+  `tools[]` on a family without a registered tool-call emitter now refuses
+  up front with `501 capability_unsupported`; never-fits KV-budget
+  admissions return a non-retryable `400 kv_budget_unsatisfiable` instead
+  of `429`; dense Qwen3-VL is refused at spawn until the ADR-041 engine
+  seam lands; SSE responses report cached tokens and carry the
+  `X-HF2Q-Cached-Tokens` header.
+
 ### Added
 
 - Add a root `NOTICE` file carrying the single MIT attribution for the
