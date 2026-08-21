@@ -30,6 +30,35 @@ end-to-end product contract: exact artifact bytes -> real unary/SSE/vision
 generation -> stock OpenCode Build tools -> full Agentic Kit -> live
 search/fetch/crawl/extract.
 
+## Post-landing regression discovered during review
+
+The first landing still left a second, contradictory journey in
+`docs/getting-started.md`. A newer source-first rewrite had reached `main`
+while the issue-146 correction was being prepared. During rebase, that file was
+preserved as the newer side of the conflict instead of being checked against
+the user's stated outcome. The regression was then made worse by changing
+`scripts/test_getting_started_guide.sh` to accept both journeys.
+
+That alternate document told users to run a fresh source conversion, claimed
+the command produced a projector, served only the text model, and reduced
+OpenCode to an optional provider snippet. It omitted the exact published
+artifact pair, multimodal serve and image proof, full Agentic Kit, preservation
+of stock coding tools, the research stack, and cleanup. The README repeated the
+source-first path, and the complete guide included the same unqualified
+conversion claim as an optional section.
+
+CI passed because the test encoded the regression as required behavior. This
+was a validation-oracle failure, not evidence that both paths met the same
+contract.
+
+The correction removes the competing executable journey. The generic
+`docs/getting-started.md` page now points to the one complete guide, the README
+describes that same path, and the complete guide no longer offers an unproved
+conversion substitute. The contract test now rejects the source-conversion
+command and text-only wording on every onboarding surface while requiring the
+published pair, `--mmproj`, text/SSE/image proof, full AK, stock Build tools,
+research tools, and cleanup.
+
 ## User-visible failures
 
 1. **Wrong GGUF for hf2q.** The guide downloaded the author-hosted Q5_K_M made

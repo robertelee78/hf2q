@@ -27,37 +27,21 @@ reject_literal() {
     fi
 }
 
-# Preserve the source-first core CLI journey landed on main by PR #152.
-require_literal "$core_guide" "curl -fsSL https://hf2q.us/install.sh | sh"
-require_literal "$core_guide" "hf2q --version"
-require_literal "$core_guide" "validated against hf2q 0.1.8"
-require_literal "$core_guide" "hf2q setup"
-require_literal "$core_guide" "hf2q setup --accept-defaults"
-require_literal "$core_guide" "hf2q doctor"
-require_literal "$core_guide" "hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT"
-require_literal "$core_guide" "--revision 08c2f075b43bc06456382db6b918a3dcabdcf4dd"
-require_literal "$core_guide" "--quant q4_k_m"
-require_literal "$core_guide" "hf2q serve --model \"\$MODEL\""
-require_literal "$core_guide" "hf2q chat --url http://127.0.0.1:8081/v1"
-require_literal "$core_guide" "http://127.0.0.1:8081/v1/models"
-require_literal "$core_guide" "http://127.0.0.1:8081/v1/chat/completions"
-require_literal "$core_guide" "server later with Ctrl-C"
-require_literal "$core_guide" "hf2q update --check"
-require_literal "$core_guide" "hf2q uninstall --yes"
+# The generic entry point must lead to the one complete, qualified journey.
 require_literal "$core_guide" "hf2q+qwen3.8+ak+search-fetch-setup.md"
-
+require_literal "$core_guide" "There is one supported end-to-end setup"
+require_literal "$core_guide" "exact published hf2q Q4_K_M text GGUF"
+require_literal "$core_guide" "matching F16"
+require_literal "$core_guide" "--mmproj"
+require_literal "$core_guide" "unary, SSE, and real image generation"
+require_literal "$core_guide" "full Agentic Kit"
+require_literal "$core_guide" "stock OpenCode Build"
+require_literal "$core_guide" "search, fetch, crawl, and extraction"
+reject_literal "$core_guide" "hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT"
+reject_literal "$core_guide" "source-first core"
+reject_literal "$core_guide" "serves the text model only"
 reject_literal "$core_guide" "qwen38-abliterated-sft-q5_k_m.gguf"
-reject_literal "$core_guide" "npm install -"
-reject_literal "$core_guide" "brew install"
-reject_literal "$core_guide" "ak setup"
-reject_literal "$core_guide" "nohup"
 reject_literal "$core_guide" "pkill -f"
-reject_literal "$core_guide" "docker run"
-
-convert_line="$(grep -nF "hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT" "$core_guide" | head -n 1 | cut -d: -f1)"
-opencode_line="$(grep -nF "Connect an existing OpenCode installation" "$core_guide" | head -n 1 | cut -d: -f1)"
-[[ -n "$convert_line" && -n "$opencode_line" && "$convert_line" -lt "$opencode_line" ]] ||
-    fail "native conversion must remain before the optional client section"
 
 # Bind the complete issue-146 journey to the exact tested artifact and harness.
 require_literal "$guide" "40d771ee15d826017f297261f5bedcf2c32cf4c2"
@@ -75,6 +59,11 @@ require_literal "$guide" "image_url"
 require_literal "$guide" "ak setup --yes"
 require_literal "$guide" "ak setup --opencode --yes"
 require_literal "$guide" "--agent build"
+require_literal "$guide" '"attachment": true'
+require_literal "$guide" '"modalities": {"input": ["text", "image"], "output": ["text"]}'
+require_literal "$guide" "preserving every existing agent, tool, permission,"
+require_literal "$guide" "agent retains Bash, read/write/edit, task, skill, and"
+require_literal "$guide" "perform a harmless proof: list the current"
 require_literal "$guide" "HF2Q_DEFAULT_REPETITION_PENALTY=1.05"
 require_literal "$guide" "HF2Q_DEFAULT_THINKING_TOKEN_BUDGET=2048"
 require_literal "$guide" "HF2Q_QWEN_SPECULATION=auto"
@@ -94,8 +83,13 @@ reject_literal "$guide" '| .default_agent ='
 reject_literal "$guide" '"tools": { "*": false }'
 reject_literal "$guide" '"permission": "deny"'
 reject_literal "$guide" 'pkill -f'
+reject_literal "$guide" "hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT"
+reject_literal "$guide" "Optional: convert the pair yourself"
+reject_literal "$guide" "serves the text model only"
 reject_literal "$readme" "downloads the model author's pinned Q5_K_M GGUF"
 reject_literal "$readme" "The first serving path remains text-only"
+reject_literal "$readme" "hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT"
+reject_literal "$readme" "source-first core CLI journey"
 
 for asset in \
     web-search-fetch.js \
@@ -146,4 +140,4 @@ for guide_spec in "$core_guide:$core_shell" "$guide:$guide_shell"; do
     bash -n "$shell_path"
 done
 
-echo "source-first and complete getting-started guide contracts passed"
+echo "single complete getting-started guide contract passed"

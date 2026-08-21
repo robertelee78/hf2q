@@ -389,23 +389,6 @@ network. The stealth fallback does not provide credentials, bypass paywalls, or
 guarantee access to every protected site. Use it only for content you are
 authorized to access and respect site policies and rate limits.
 
-## Optional: convert the pair yourself
-
-The download above is the known-good hf2q artifact. To reproduce it from the
-immutable Hugging Face source, plan for 100 GiB of free disk space:
-
-```bash
-hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT \
-  --revision 08c2f075b43bc06456382db6b918a3dcabdcf4dd \
-  --quant q4_k_m \
-  --output "$HOME/.local/share/hf2q/models/qwen3.8/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf"
-```
-
-For this multimodal source, the command produces the text GGUF, the derived
-`Qwen3.8-27B-Abliterated-SFT-Q4_K_M-mmproj.gguf`, and a provenance receipt for
-each artifact. Keep the pair and both receipts together. Use `--text-only` only
-when omitting vision is intentional. See [Converting a model](converting-a-model.md).
-
 ## Stop or troubleshoot
 
 Temporarily turn off every search/fetch/crawl/extract tool and both background

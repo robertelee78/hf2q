@@ -3,7 +3,9 @@
 - Status: Proposed; product scope corrected on 2026-08-20 and 2026-08-21,
   release gate simplified, the first public cross-version standalone journey
   shipped on 2026-08-21, and channel-aware standalone/Cargo/source lifecycle
-  plus explicit purge landed the same day; distinct-account proof remains
+  plus explicit purge landed the same day; the issue-146 guide contract was
+  corrected after a post-landing regression review; distinct-account proof
+  remains
 - Date: 2026-08-17
 - Updated: 2026-08-21
 - Owners: hf2q release engineering and operator experience
@@ -29,8 +31,9 @@ The corrected product boundary is:
 1. familiar installation choices, presented like a modern CLI product;
 2. `hf2q setup`, which learns the host and operator preferences and writes
    defaults consumed by later hf2q commands;
-3. one tested guide for choosing a supported model and using the existing
-   convert-with-quantization, serve, and API surfaces;
+3. one tested guide for downloading an exact published hf2q artifact pair and
+   using the existing multimodal serve, API, OpenCode, Agentic Kit, and research
+   surfaces; generic source conversion remains documented separately;
 4. `hf2q update`, which updates hf2q through the channel that installed it;
 5. safe, channel-aware uninstall behavior; and
 6. a clean-Mac proof that the whole journey works.
@@ -307,47 +310,52 @@ layer. One canonical getting-started guide will cover:
 
 1. verifying the installation with `hf2q --version` and `hf2q doctor`;
 2. reading the supported model/family matrix;
-3. choosing a model appropriate for the operator's task and measured Mac;
-4. acquiring the selected Hugging Face source weights through the supported
-   existing hf2q path, with an exact revision and clear upstream lineage;
-5. converting and quantizing with the current `hf2q convert` syntax;
-6. serving the produced GGUF with the current `hf2q serve` syntax;
-7. checking the OpenAI-compatible endpoint directly; and
-8. optionally connecting an already installed client such as OpenCode.
+3. downloading and checksum-verifying the exact published text/projector pair;
+4. serving both artifacts with the qualified `hf2q serve` settings;
+5. proving unary, SSE, and image generation directly;
+6. installing full Agentic Kit and connecting stock OpenCode Build without
+   removing any coding capability;
+7. installing and proving search, fetch, crawl, and extraction; and
+8. disabling, re-enabling, stopping, troubleshooting, and uninstalling only
+   the exact components created by the guide.
 
 Model recommendations in the guide must be explicit, dated, and grounded in
 the checked-in support matrix and measured hardware requirements. They are not
 a hidden runtime recommender.
 
-The guide must distinguish:
+The guide and its provenance record must distinguish:
 
 - hf2q-converted output from the exact source repository named by the guide;
 - explicitly supported external GGUF input; and
 - unsupported or approximate family compatibility, which must not be
   presented as supported.
 
-The client-independent path is the guide's primary path: verify hf2q, run
-setup, select the pinned source, convert and quantize it with hf2q, serve the
-result, and call the API directly. A supported model-author GGUF may appear
-later as a clearly labeled faster external-artifact shortcut, but it cannot
-replace or demote the native conversion journey. Node.js, `jq`, OpenCode, and
-other client prerequisites belong only to their optional section.
+The issue-146 guide's primary path is the exact hf2q-produced Q4_K_M text GGUF
+and source-matched F16 projector published at an immutable Hugging Face commit.
+It verifies both hashes, serves the pair with explicit qualified settings,
+proves unary/SSE/image generation, then configures stock OpenCode Build, full
+Agentic Kit, and the local research stack. Generic native conversion remains a
+separate product capability and provenance source; it is not a second
+onboarding path or a substitute for the exact bytes accepted by this guide.
 
-Optional client sections show configuration snippets and verification steps.
-hf2q does not install, rewrite, or take ownership of third-party client
-configuration. The core guide must remain complete without OpenCode or any
-other integration.
+The guide may merge the hf2q provider into third-party configuration only
+after backing it up and must preserve existing agents, tools, permissions,
+plugins, instructions, and MCP settings. It must never replace the stock coding
+prompt, disable tool schemas, or make a restricted agent the default.
 
 Every published command in the guide is an acceptance surface. CI or a
 reproducible release gate must prove its syntax, and hardware/model claims must
 name the exact artifact, settings, and host evidence.
 
 The first guide model is
-`jenerallee78/Qwen3.8-27B-Abliterated-SFT` at exact revision
-`08c2f075b43bc06456382db6b918a3dcabdcf4dd`. The guide exercises its accepted
-Qwen3.8 text-serving path, while conversion preserves the source's complete
-text/projector pair under ADR-004. Producing the companion does not broaden
-the still-separate Qwen3.8 vision acceptance claim or treat a community
+`jenerallee78/Qwen3.8-27B-Abliterated-SFT`. Its source provenance remains bound
+to revision `08c2f075b43bc06456382db6b918a3dcabdcf4dd`, while the downloadable
+guide pair is bound to artifact commit
+`40d771ee15d826017f297261f5bedcf2c32cf4c2`, text digest
+`1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a`, and
+projector digest
+`463b264713f8e081f0fae753c80d8089308e01b1e2ac0948dd9966d0711d8f1b`.
+The guide exercises both text and vision and does not treat a community
 checkpoint as an official upstream release.
 
 ### 5. Make `hf2q update` honor the installation channel
@@ -593,12 +601,13 @@ the next slice begins.
 ### Slice B: freeze and prove the guide against today's product
 
 1. Write the canonical getting-started guide using current commands.
-2. Use bounded synthetic fixtures to prove command syntax and conversion
-   behavior in the fast hosted gate, without claiming that a synthetic model
-   proves chat serving. Use one exact supported Apple-Silicon model artifact
-   for the protected end-to-end conversion and serving gate.
-3. Prove conversion, quantization, serving, direct API use, and the optional
-   OpenCode instructions without adding orchestration code.
+2. Use bounded synthetic fixtures to prove generic command syntax and
+   conversion behavior in the fast hosted gate, without claiming that a
+   synthetic model proves chat serving. Use one exact published Apple-Silicon
+   model/projector pair for the protected end-to-end serving gate.
+3. Preserve source conversion as provenance evidence, then prove the published
+   pair, multimodal serving, direct API use, stock OpenCode Build, full Agentic
+   Kit, and research tools without adding a second preparation workflow.
 4. Feed any actual usability gaps into the setup schema rather than inventing
    a parallel workflow.
 
@@ -644,8 +653,10 @@ a first-image follow-up with 86,172 prompt tokens. The follow-up reused 86,072
 tokens, performed GPU vision inference, answered that the fixture was red in
 73 completion tokens, stopped normally, and left readiness at HTTP 200. This
 supersedes the earlier text-only artifact as the native self-conversion proof.
-The canonical guide now leads with that hf2q-owned conversion path; it does not
-replace it with a model-author preconverted download.
+Those exact hf2q-produced bytes were then published at immutable artifact
+commit `40d771ee15d826017f297261f5bedcf2c32cf4c2`. The canonical guide downloads
+and verifies that pair; it does not ask each new user to repeat the provenance
+conversion or substitute a different model-author artifact.
 
 The guide and its retained evidence bind that accepted digest. A separately
 dispatched model-qualification workflow may require the runner's
@@ -729,12 +740,14 @@ published bytes.
 
 - Every command parses against the shipped CLI.
 - A clean-account operator can follow the guide from its exact pinned Hugging
-  Face source weights to an hf2q-converted GGUF and a valid OpenAI-compatible
-  response.
-- The exact protected Apple-Silicon proof records source revision, model
-  artifact, quantization, settings, hardware, output correctness, and cleanup.
-- The optional OpenCode section proves connection and a realistic tool-call
-  continuation, while the core hf2q journey remains independent of it.
+  Face artifact commit to checksum-verified text/projector bytes and valid
+  text, SSE, and image responses.
+- The exact protected Apple-Silicon proof records source provenance, published
+  artifact digests, quantization, settings, hardware, output correctness, and
+  cleanup.
+- Stock OpenCode Build proves Bash/file tool calls and continuation with full
+  Agentic Kit plus live search/fetch/crawl/extract; resolved configuration names
+  alone are not acceptance.
 
 ### Update and uninstall
 
@@ -766,9 +779,9 @@ What exists:
 - hf2q's core conversion, quantization, and serving commands;
 - the signed and notarized standalone install path plus Cargo and exact-source
   alternatives;
-- the canonical tested Qwen3.8 guide whose conversion preserves the
-  multimodal pair and whose first serving path exercises text, direct API use,
-  and optional OpenCode;
+- the canonical tested Qwen3.8 guide that downloads the exact published
+  multimodal pair and proves text, SSE, image generation, stock OpenCode Build,
+  full Agentic Kit, research tools, and cleanup;
 - a `setup` command that records conversion and serving defaults consumed by
   the existing commands through a selected state root;
 - the published standalone installer, hidden exact-byte bootstrap, public
