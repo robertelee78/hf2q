@@ -74,7 +74,7 @@ pub struct ExactTeacherTargetReceipt {
 /// framing and arithmetic only; it cannot be converted into allocator input.
 pub(crate) struct StructurallyVerifiedTeacherTargetArtifact {
     pub(super) receipt: ExactTeacherTargetReceipt,
-    pub(super) file: File,
+    pub(super) _file: File,
     pub(super) path: PathBuf,
 }
 
@@ -88,11 +88,13 @@ impl StructurallyVerifiedTeacherTargetArtifact {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct TeacherTargetLogitRequest<'a> {
     pub point: &'a crate::intelligence::calibration::TeacherPredictionPointReceipt,
     pub prefix_token_ids: &'a [u32],
 }
 
+#[cfg(test)]
 pub(crate) struct TeacherGreedyRequest<'a> {
     pub prompt: &'a crate::intelligence::calibration::TeacherGreedyPromptReceipt,
     pub prompt_token_ids: &'a [u32],

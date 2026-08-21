@@ -40,6 +40,27 @@ pub(super) struct Qwen35SourceTeacherRuntimeEnvelopeV1 {
     pub(super) unmeasured_runtime_reserve_bytes: u64,
 }
 
+/// Sanitized, model-weight/Metal-allocation-free observation of the combined
+/// source-weight and bounded runtime requirement. `eligible` is point-in-time
+/// admission evidence, not a reservation or a measured peak.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Qwen35SourceTeacherCapacityPreflightV1 {
+    pub planned_weight_bytes: u64,
+    pub loader_scratch_bytes: u64,
+    pub accounted_runtime_payload_bytes: u64,
+    pub unmeasured_runtime_reserve_bytes: u64,
+    pub host_reserve_bytes: u64,
+    pub metal_reserve_bytes: u64,
+    pub host_required_bytes: u64,
+    pub metal_required_bytes: u64,
+    pub host_available_bytes: u64,
+    pub metal_recommended_working_set_bytes: u64,
+    pub metal_current_allocated_bytes: u64,
+    pub metal_available_bytes: u64,
+    pub metal_max_buffer_bytes: u64,
+    pub eligible: bool,
+}
+
 pub(super) fn runtime_envelope(
     config: &Qwen35Config,
     limits: Qwen35SourceTeacherLimitsV1,
@@ -122,6 +143,28 @@ pub(super) fn validate_combined_capacity(
     upload_limits: QwenSourceMetalUploadLimits,
     capacity: QwenSourceMetalCapacityV1,
 ) -> Result<()> {
+    let preflight =
+        combined_capacity_preflight(planned_weight_bytes, runtime, upload_limits, capacity)?;
+    ensure!(
+        preflight.eligible,
+        "source teacher combined weight/runtime requirement exceeds observed capacity"
+    );
+    Ok(())
+}
+
+pub(super) fn combined_capacity_preflight(
+    planned_weight_bytes: u64,
+    runtime: &Qwen35SourceTeacherRuntimeEnvelopeV1,
+    upload_limits: QwenSourceMetalUploadLimits,
+    capacity: QwenSourceMetalCapacityV1,
+) -> Result<Qwen35SourceTeacherCapacityPreflightV1> {
+    upload_limits.validate()?;
+    ensure!(
+        capacity.host_available_bytes > 0
+            && capacity.metal_recommended_working_set_bytes > 0
+            && capacity.metal_max_buffer_bytes > 0,
+        "source teacher capacity observation is incomplete"
+    );
     let accounted = planned_weight_bytes
         .checked_add(UPLOAD_SCRATCH_BYTES)
         .and_then(|value| value.checked_add(runtime.accounted_runtime_payload_bytes))
@@ -137,11 +180,23 @@ pub(super) fn validate_combined_capacity(
         .metal_recommended_working_set_bytes
         .checked_sub(capacity.metal_current_allocated_bytes)
         .context("source teacher Metal working-set observation is already exhausted")?;
-    ensure!(
-        host_required <= capacity.host_available_bytes && metal_required <= metal_available,
-        "source teacher combined weight/runtime requirement exceeds observed capacity"
-    );
-    Ok(())
+    Ok(Qwen35SourceTeacherCapacityPreflightV1 {
+        planned_weight_bytes,
+        loader_scratch_bytes: UPLOAD_SCRATCH_BYTES,
+        accounted_runtime_payload_bytes: runtime.accounted_runtime_payload_bytes,
+        unmeasured_runtime_reserve_bytes: runtime.unmeasured_runtime_reserve_bytes,
+        host_reserve_bytes: upload_limits.host_reserve_bytes,
+        metal_reserve_bytes: upload_limits.metal_reserve_bytes,
+        host_required_bytes: host_required,
+        metal_required_bytes: metal_required,
+        host_available_bytes: capacity.host_available_bytes,
+        metal_recommended_working_set_bytes: capacity.metal_recommended_working_set_bytes,
+        metal_current_allocated_bytes: capacity.metal_current_allocated_bytes,
+        metal_available_bytes: metal_available,
+        metal_max_buffer_bytes: capacity.metal_max_buffer_bytes,
+        eligible: host_required <= capacity.host_available_bytes
+            && metal_required <= metal_available,
+    })
 }
 
 pub(super) fn validate_incremental_capacity(

@@ -62,10 +62,12 @@ impl StructuralTeacherTargetReservationReceiptV1 {
         &self.reservation_contract_sha256
     }
 
+    #[cfg(test)]
     pub(crate) fn prediction_plan_sha256(&self) -> &str {
         &self.prediction_plan_sha256
     }
 
+    #[cfg(test)]
     pub(crate) fn vocabulary_size(&self) -> usize {
         self.vocabulary_size
     }

@@ -109,6 +109,7 @@ impl VerifiedQwenSourceSnapshot {
     /// Copy one retained BF16/F16 payload directly into its final u16 view.
     /// The source bytes are reread positionally and rehashed during the copy;
     /// no whole-tensor host allocation or pathname reopen occurs.
+    #[cfg(test)]
     pub(crate) fn read_tensor_u16(&self, name: &str, output: &mut [u16]) -> Result<()> {
         let tensor = self
             .tensor_record(name)

@@ -190,5 +190,5 @@ pub(super) fn verify_structural_teacher_target_artifact(
 pub(in crate::intelligence::exact_teacher) fn verify_for_test(
     artifact: &mut StructurallyVerifiedTeacherTargetArtifact,
 ) -> Result<(), ExactTeacherTargetError> {
-    verify_structural_teacher_target_artifact(&mut artifact.file, &artifact.receipt)
+    verify_structural_teacher_target_artifact(&mut artifact._file, &artifact.receipt)
 }

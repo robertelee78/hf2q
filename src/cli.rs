@@ -87,6 +87,14 @@ pub enum Command {
     /// Inspect model metadata before converting
     Info(InfoArgs),
 
+    /// Run the pinned Qwen3.8 source-teacher evidence canary.
+    ///
+    /// This command is intentionally hidden while the official 27B Apple
+    /// artifact gate is being established. Without `--execute` it performs
+    /// source/corpus/work/destination/capacity preflight only.
+    #[command(name = "source-teacher", hide = true)]
+    SourceTeacher(SourceTeacherArgs),
+
     /// Diagnose RuVector, hardware detection, and disk space
     Doctor,
 
@@ -203,6 +211,22 @@ pub struct SetupArgs {
     /// Explicit setup flags override individual values.
     #[arg(long, default_value_t = false)]
     pub accept_defaults: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct SourceTeacherArgs {
+    /// Exact local Qwen3.8-27B snapshot selected by the embedded recipe.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub model_dir: PathBuf,
+
+    /// Fresh target artifact destination. Existing entries are never replaced.
+    #[arg(long, value_name = "FILE")]
+    pub output: PathBuf,
+
+    /// Perform the ~54 GB Metal upload and completed one-shot teacher run.
+    /// Omit this flag for a model-weight/Metal-allocation-free preflight.
+    #[arg(long, default_value_t = false)]
+    pub execute: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1172,6 +1196,38 @@ mod tests {
             panic!("expected Serve");
         };
         assert!(!args.no_integrity);
+    }
+
+    #[test]
+    fn source_teacher_requires_explicit_execute_for_model_allocation() {
+        let cli = Cli::parse_from([
+            "hf2q",
+            "source-teacher",
+            "--model-dir",
+            "/tmp/qwen38-source",
+            "--output",
+            "/tmp/qwen38-teacher.bin",
+        ]);
+        let Command::SourceTeacher(args) = cli.command else {
+            panic!("expected SourceTeacher");
+        };
+        assert_eq!(args.model_dir, PathBuf::from("/tmp/qwen38-source"));
+        assert_eq!(args.output, PathBuf::from("/tmp/qwen38-teacher.bin"));
+        assert!(!args.execute);
+
+        let cli = Cli::parse_from([
+            "hf2q",
+            "source-teacher",
+            "--model-dir",
+            "/tmp/qwen38-source",
+            "--output",
+            "/tmp/qwen38-teacher.bin",
+            "--execute",
+        ]);
+        let Command::SourceTeacher(args) = cli.command else {
+            panic!("expected SourceTeacher");
+        };
+        assert!(args.execute);
     }
 
     #[test]

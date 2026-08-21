@@ -1,5 +1,6 @@
 //! Bounded, owned structured-corpus artifact verification.
 
+#[cfg(test)]
 use std::io::Read;
 
 use sha2::{Digest, Sha256};
@@ -35,10 +36,9 @@ fn validate_limits(limits: CalibrationCorpusArtifactLimits) -> Result<(), Calibr
     Ok(())
 }
 
-pub(crate) fn verify_calibration_corpus_artifact(
+fn validate_expected_identity(
     request: &VerifyCalibrationCorpusRequest,
-) -> Result<VerifiedCalibrationCorpus, CalibrationInputError> {
-    validate_limits(request.limits)?;
+) -> Result<(), CalibrationInputError> {
     if !is_lower_sha256(&request.expected_sha256)
         || request.expected_dataset_id.is_empty()
         || request.expected_revision.is_empty()
@@ -48,6 +48,15 @@ pub(crate) fn verify_calibration_corpus_artifact(
             "calibration corpus expected identity is invalid".into(),
         ));
     }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn verify_calibration_corpus_artifact(
+    request: &VerifyCalibrationCorpusRequest,
+) -> Result<VerifiedCalibrationCorpus, CalibrationInputError> {
+    validate_limits(request.limits)?;
+    validate_expected_identity(request)?;
     let file =
         std::fs::File::open(&request.path).map_err(|source| CalibrationInputError::Read {
             path: request.path.clone(),
@@ -84,14 +93,40 @@ pub(crate) fn verify_calibration_corpus_artifact(
             "calibration corpus artifact changed size or exceeded its byte bound".into(),
         ));
     }
-    let sha256 = hex::encode(Sha256::digest(&bytes));
+    verify_calibration_corpus_bytes(&bytes, request)
+}
+
+/// Verify compile-time embedded corpus bytes under the same exact contract as
+/// the path-backed operator surface. No caller-provided deserialized manifest
+/// can bypass the byte hash or collection bounds.
+pub(crate) fn verify_embedded_calibration_corpus_artifact(
+    bytes: &[u8],
+    request: &VerifyCalibrationCorpusRequest,
+) -> Result<VerifiedCalibrationCorpus, CalibrationInputError> {
+    validate_limits(request.limits)?;
+    validate_expected_identity(request)?;
+    if bytes.is_empty()
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > request.limits.max_artifact_bytes
+    {
+        return Err(CalibrationInputError::InvalidDataset(
+            "embedded calibration corpus is empty or exceeds its byte bound".into(),
+        ));
+    }
+    verify_calibration_corpus_bytes(bytes, request)
+}
+
+fn verify_calibration_corpus_bytes(
+    bytes: &[u8],
+    request: &VerifyCalibrationCorpusRequest,
+) -> Result<VerifiedCalibrationCorpus, CalibrationInputError> {
+    let sha256 = hex::encode(Sha256::digest(bytes));
     if sha256 != request.expected_sha256 {
         return Err(CalibrationInputError::InvalidDataset(
             "calibration corpus artifact SHA-256 mismatch".into(),
         ));
     }
     let manifest: StructuredDatasetManifest =
-        serde_json::from_slice(&bytes).map_err(|error| CalibrationInputError::Parse {
+        serde_json::from_slice(bytes).map_err(|error| CalibrationInputError::Parse {
             path: request.path.clone(),
             detail: error.to_string(),
         })?;

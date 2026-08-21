@@ -342,6 +342,7 @@ impl VerifiedCalibrationPredictionPlan {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn visit_prediction_points<E>(
         &self,
         mut visit: impl FnMut(&TeacherPredictionPointReceipt, &[u32]) -> Result<(), E>,
@@ -355,6 +356,7 @@ impl VerifiedCalibrationPredictionPlan {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn visit_greedy_prompts<E>(
         &self,
         mut visit: impl FnMut(&TeacherGreedyPromptReceipt, &[u32]) -> Result<(), E>,
