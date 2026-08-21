@@ -119,6 +119,28 @@ fn invalid_candidate_and_unowned_existing_binary_leave_installation_unchanged() 
 }
 
 #[test]
+fn writable_by_others_install_directory_is_rejected_before_mutation() {
+    let (_root, install) = install_dir();
+    let (_candidate_temp, candidate, expectation) = fixture(b"candidate");
+
+    for mode in [0o775, 0o777] {
+        fs::set_permissions(&install, fs::Permissions::from_mode(mode))
+            .expect("set unsafe install-directory mode");
+        assert!(matches!(
+            publish_verified_candidate(&install, &candidate, &expectation),
+            Err(StandaloneError::Invalid(_))
+        ));
+        assert!(
+            fs::read_dir(&install)
+                .expect("inspect install directory")
+                .next()
+                .is_none(),
+            "unsafe install directory was mutated at mode {mode:o}"
+        );
+    }
+}
+
+#[test]
 fn hostile_marker_nodes_are_rejected_without_replacement() {
     let (_root, install) = install_dir();
     let external = install.join("external-marker");

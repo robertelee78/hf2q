@@ -1,117 +1,175 @@
 #!/bin/sh
-# Generated per immutable hf2q release. Do not publish this template directly.
-set -eu
+# The release values below are immutable and verified before hf2q runs.
+# The final `fi` makes this whole script one parse-before-execute command.
 
-release_version='@HF2Q_VERSION@'
-release_sha256='@HF2Q_SHA256@'
-release_size='@HF2Q_SIZE@'
-release_team_id='@HF2Q_TEAM_ID@'
-release_identifier='@HF2Q_IDENTIFIER@'
-asset_name='hf2q-aarch64-apple-darwin'
-default_base_url='https://github.com/robertelee78/hf2q/releases/download/v@HF2Q_VERSION@'
+if :; then
+main() {
+  set -eu
 
-fail() {
-  printf 'hf2q installer: %s\n' "$1" >&2
-  exit 1
+  release_version='@HF2Q_VERSION@'
+  release_sha256='@HF2Q_SHA256@'
+  release_size='@HF2Q_SIZE@'
+  release_team_id='@HF2Q_TEAM_ID@'
+  release_identifier='@HF2Q_IDENTIFIER@'
+  asset_name='hf2q-aarch64-apple-darwin'
+  default_base_url='https://github.com/robertelee78/hf2q/releases/download/v@HF2Q_VERSION@'
+
+  fail() {
+    printf 'hf2q installer: %s\n' "$1" >&2
+    exit 1
+  }
+
+  [ "$(uname -s)" = Darwin ] || fail 'only macOS is supported by this release'
+  [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ] \
+    || fail 'this release requires Apple Silicon (arm64)'
+  macos_version=$(/usr/bin/sw_vers -productVersion 2>/dev/null) \
+    || fail 'macOS version could not be determined'
+  macos_major=${macos_version%%.*}
+  case "$macos_major" in
+    ''|*[!0-9]*) fail 'macOS version is not canonical' ;;
+  esac
+  [ "$macos_major" -ge 14 ] || fail 'this release requires macOS 14 or newer'
+
+  if [ -n "${HF2Q_INSTALL_DIR:-}" ]; then
+    install_dir=$HF2Q_INSTALL_DIR
+  else
+    [ -n "${HOME:-}" ] || fail 'HOME is unavailable; set HF2Q_INSTALL_DIR explicitly'
+    install_dir="$HOME/.local/bin"
+  fi
+  case "$install_dir" in
+    /*) ;;
+    *) fail 'HF2Q_INSTALL_DIR must be an absolute path' ;;
+  esac
+
+  umask 022
+  mkdir -p "$install_dir"
+  install_dir=$(cd "$install_dir" && pwd -P)
+  install_owner_and_mode=$(stat -f '%u %Lp' "$install_dir") \
+    || fail 'install directory ownership and mode could not be read'
+  install_owner=${install_owner_and_mode%% *}
+  install_mode=${install_owner_and_mode#* }
+  [ "$install_owner" = "$(id -u)" ] \
+    || fail 'install directory must be owned by the current user'
+  case "$install_mode" in
+    [0-7][0-7][0-7]) ;;
+    [0-7][0-7][0-7][0-7]) install_mode=${install_mode#?} ;;
+    *) fail 'install directory mode is not canonical' ;;
+  esac
+  group_and_world=${install_mode#?}
+  group_mode=${group_and_world%?}
+  world_mode=${group_and_world#?}
+  case "$group_mode" in
+    2|3|6|7) fail 'install directory must not be group-writable' ;;
+  esac
+  case "$world_mode" in
+    2|3|6|7) fail 'install directory must not be world-writable' ;;
+  esac
+  umask 077
+
+  if [ "${HF2Q_INSTALL_TEST_MODE:-0}" = 1 ]; then
+    [ -n "${HF2Q_RELEASE_BASE_URL:-}" ] \
+      || fail 'test mode requires an explicit local release fixture'
+    base_url=$HF2Q_RELEASE_BASE_URL
+    case "$base_url" in
+      file://*) ;;
+      *) fail 'test mode is restricted to an exact local file:// fixture' ;;
+    esac
+    curl_protocol='=file'
+  else
+    [ -z "${HF2Q_RELEASE_BASE_URL+x}" ] \
+      || fail 'HF2Q_RELEASE_BASE_URL is available only in installer test mode'
+    base_url=$default_base_url
+    curl_protocol='=https'
+  fi
+  asset_url="$base_url/$asset_name"
+  candidate=$(mktemp "$install_dir/.hf2q-download.XXXXXX")
+  cleanup() {
+    rm -f "$candidate"
+  }
+  trap cleanup EXIT HUP INT TERM
+
+  # ulimit is the byte-transfer backstop when an HTTP server omits or lies
+  # about Content-Length. POSIX file-size blocks are 512 bytes.
+  file_limit_blocks=$(( (release_size + 511) / 512 ))
+  (
+    ulimit -f "$file_limit_blocks"
+    curl -fsSL \
+      --proto "$curl_protocol" \
+      --proto-redir '=https' \
+      --tlsv1.2 \
+      --connect-timeout 15 \
+      --max-time 300 \
+      --max-redirs 3 \
+      --max-filesize "$release_size" \
+      "$asset_url" -o "$candidate"
+  ) || fail 'download failed or exceeded the immutable release bound; the existing installation was not changed'
+
+  actual_size=$(stat -f '%z' "$candidate")
+  [ "$actual_size" = "$release_size" ] \
+    || fail 'downloaded byte length does not match the immutable release'
+  actual_sha256=$(shasum -a 256 "$candidate" | awk '{print $1}')
+  [ "$actual_sha256" = "$release_sha256" ] \
+    || fail 'downloaded SHA-256 does not match the immutable release'
+
+  if [ "${HF2Q_INSTALL_TEST_MODE:-0}" != 1 ]; then
+    [ "$(/usr/bin/lipo -archs "$candidate" 2>/dev/null)" = arm64 ] \
+      || fail 'release is not an exact thin Apple-Silicon executable'
+    /usr/bin/codesign --verify --strict --all-architectures --verbose=2 \
+      "$candidate" >/dev/null 2>&1 \
+      || fail 'Apple code-signature verification failed'
+    signing_info=$(/usr/bin/codesign --display --verbose=4 "$candidate" 2>&1) \
+      || fail 'Apple signing identity could not be read'
+    printf '%s\n' "$signing_info" | grep -qx "TeamIdentifier=$release_team_id" \
+      || fail 'Apple Developer ID team does not match this hf2q release'
+    printf '%s\n' "$signing_info" | grep -qx "Identifier=$release_identifier" \
+      || fail 'Apple signing identifier does not match this hf2q release'
+    [ "$(printf '%s\n' "$signing_info" | grep -c '^Authority=')" = 3 ] \
+      || fail 'Apple Developer ID authority chain is incomplete or ambiguous'
+    application_authority=$(printf '%s\n' "$signing_info" | \
+      sed -n 's/^Authority=//p' | sed -n '1p')
+    case "$application_authority" in
+      "Developer ID Application: "*" ($release_team_id)") ;;
+      *) fail 'Apple Developer ID application authority does not match this release' ;;
+    esac
+    [ "$(printf '%s\n' "$signing_info" | \
+      grep -c '^Authority=Developer ID Certification Authority$')" = 1 ] \
+      || fail 'Apple Developer ID intermediate authority is missing'
+    [ "$(printf '%s\n' "$signing_info" | \
+      grep -c '^Authority=Apple Root CA$')" = 1 ] \
+      || fail 'Apple root authority is missing'
+    printf '%s\n' "$signing_info" | \
+      grep -Eq '^CodeDirectory .* flags=0x[0-9a-f]+\(runtime\)( |$)' \
+      || fail 'hf2q release does not enable the hardened runtime'
+    printf '%s\n' "$signing_info" | grep -Eq '^Timestamp=.+$' \
+      || fail 'hf2q release does not have a secure signing timestamp'
+    /usr/bin/codesign --verify --strict --all-architectures \
+      --check-notarization --test-requirement '=notarized' "$candidate" \
+      >/dev/null 2>&1 \
+      || fail 'Apple did not verify the online notarization ticket for this hf2q release'
+  fi
+
+  chmod 0555 "$candidate"
+  [ "$("$candidate" --version </dev/null)" = "hf2q $release_version" ] \
+    || fail 'candidate version does not match the immutable release'
+
+  "$candidate" __standalone-install \
+    --install-dir "$install_dir" \
+    --candidate "$candidate" \
+    --size "$release_size" \
+    --sha256 "$release_sha256" \
+    </dev/null
+
+  case ":${PATH:-}:" in
+    *:"$install_dir":*) ;;
+    *)
+      # The printed $PATH is an operator command, not installer expansion.
+      # shellcheck disable=SC2016
+      printf '\nAdd hf2q to this shell with:\n  export PATH="%s:$PATH"\n' "$install_dir"
+      ;;
+  esac
+
+  printf '\nNext: hf2q setup\n'
 }
 
-[ "$(uname -s)" = Darwin ] || fail 'only macOS is supported by this release'
-[ "$(uname -m)" = arm64 ] || fail 'this release requires Apple Silicon (arm64)'
-macos_version=$(/usr/bin/sw_vers -productVersion 2>/dev/null) \
-  || fail 'macOS version could not be determined'
-macos_major=${macos_version%%.*}
-case "$macos_major" in
-  ''|*[!0-9]*) fail 'macOS version is not canonical' ;;
-esac
-[ "$macos_major" -ge 14 ] || fail 'this release requires macOS 14 or newer'
-[ -n "${HOME:-}" ] || fail 'HOME is unavailable; set HF2Q_INSTALL_DIR explicitly'
-
-install_dir=${HF2Q_INSTALL_DIR:-"$HOME/.local/bin"}
-case "$install_dir" in
-  /*) ;;
-  *) fail 'HF2Q_INSTALL_DIR must be an absolute path' ;;
-esac
-
-umask 077
-mkdir -p "$install_dir"
-install_dir=$(cd "$install_dir" && pwd -P)
-base_url=${HF2Q_RELEASE_BASE_URL:-$default_base_url}
-asset_url="$base_url/$asset_name"
-candidate=$(mktemp "$install_dir/.hf2q-download.XXXXXX")
-cleanup() {
-  rm -f "$candidate"
-}
-trap cleanup EXIT HUP INT TERM
-
-curl -fsSL --proto '=https,file' --proto-redir '=https' --tlsv1.2 "$asset_url" -o "$candidate" \
-  || fail 'download failed; the existing installation was not changed'
-
-actual_size=$(stat -f '%z' "$candidate")
-[ "$actual_size" = "$release_size" ] \
-  || fail 'downloaded byte length does not match the immutable release'
-actual_sha256=$(shasum -a 256 "$candidate" | awk '{print $1}')
-[ "$actual_sha256" = "$release_sha256" ] \
-  || fail 'downloaded SHA-256 does not match the immutable release'
-
-if [ "${HF2Q_INSTALL_TEST_MODE:-0}" = 1 ]; then
-  case "$asset_url" in
-    file://*) ;;
-    *) fail 'test mode is restricted to an exact local file:// fixture' ;;
-  esac
-else
-  [ "$(/usr/bin/lipo -archs "$candidate" 2>/dev/null)" = arm64 ] \
-    || fail 'release is not an exact thin Apple-Silicon executable'
-  /usr/bin/codesign --verify --strict --all-architectures --verbose=2 \
-    "$candidate" >/dev/null 2>&1 \
-    || fail 'Apple code-signature verification failed'
-  signing_info=$(/usr/bin/codesign --display --verbose=4 "$candidate" 2>&1) \
-    || fail 'Apple signing identity could not be read'
-  printf '%s\n' "$signing_info" | grep -qx "TeamIdentifier=$release_team_id" \
-    || fail 'Apple Developer ID team does not match this hf2q release'
-  printf '%s\n' "$signing_info" | grep -qx "Identifier=$release_identifier" \
-    || fail 'Apple signing identifier does not match this hf2q release'
-  [ "$(printf '%s\n' "$signing_info" | grep -c '^Authority=')" = 3 ] \
-    || fail 'Apple Developer ID authority chain is incomplete or ambiguous'
-  application_authority=$(printf '%s\n' "$signing_info" | \
-    sed -n 's/^Authority=//p' | sed -n '1p')
-  case "$application_authority" in
-    "Developer ID Application: "*" ($release_team_id)") ;;
-    *) fail 'Apple Developer ID application authority does not match this release' ;;
-  esac
-  [ "$(printf '%s\n' "$signing_info" | \
-    grep -c '^Authority=Developer ID Certification Authority$')" = 1 ] \
-    || fail 'Apple Developer ID intermediate authority is missing'
-  [ "$(printf '%s\n' "$signing_info" | \
-    grep -c '^Authority=Apple Root CA$')" = 1 ] \
-    || fail 'Apple root authority is missing'
-  printf '%s\n' "$signing_info" | \
-    grep -Eq '^CodeDirectory .* flags=0x[0-9a-f]+\(runtime\)( |$)' \
-    || fail 'hf2q release does not enable the hardened runtime'
-  printf '%s\n' "$signing_info" | grep -Eq '^Timestamp=.+$' \
-    || fail 'hf2q release does not have a secure signing timestamp'
-  /usr/bin/codesign --verify --strict --all-architectures \
-    --check-notarization --test-requirement '=notarized' "$candidate" \
-    >/dev/null 2>&1 \
-    || fail 'Apple did not verify the online notarization ticket for this hf2q release'
+main "$@" </dev/null
 fi
-
-chmod 0555 "$candidate"
-[ "$("$candidate" --version)" = "hf2q $release_version" ] \
-  || fail 'candidate version does not match the immutable release'
-
-"$candidate" __standalone-install \
-  --install-dir "$install_dir" \
-  --candidate "$candidate" \
-  --size "$release_size" \
-  --sha256 "$release_sha256"
-
-case ":${PATH:-}:" in
-  *:"$install_dir":*) ;;
-  *)
-    # The printed $PATH is an operator command, not installer expansion.
-    # shellcheck disable=SC2016
-    printf '\nAdd hf2q to this shell with:\n  export PATH="%s:$PATH"\n' "$install_dir"
-    ;;
-esac
-
-printf '\nNext: hf2q setup\n'

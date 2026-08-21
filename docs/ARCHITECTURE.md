@@ -81,10 +81,10 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │                       consumes, but cannot redefine or publish, the exact
 │                       signed standalone candidate
 ├── .github/workflows/release.yml
-│                       standalone-candidate proof consumer, complete immutable
-│                       draft,
-│                       crate publication, public-byte and clean-prefix
-│                       install/setup/uninstall preservation proof
+│                       one-dispatch candidate invocation and proof consumer,
+│                       complete immutable draft, crate publication,
+│                       public-byte and clean-prefix install/setup/uninstall
+│                       preservation proof
 │
 ├── src/arch/            ADR-012 arch registry (single source of truth)
 │   ├── catalog.rs       TensorCatalog — expected tensor names + dtypes

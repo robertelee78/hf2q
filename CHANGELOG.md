@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Make one `Release` dispatch build, Developer-ID sign, notarize, publish, and
+  post-verify the exact standalone candidate. The independently dispatchable
+  candidate workflow remains available for diagnostics and optional model
+  qualification; publishing no longer requires copying a run ID between two
+  manual workflows.
+- Parameterize standalone-candidate and optional cache-lifecycle qualification
+  by the requested stable version instead of embedding the previous release
+  number.
+
+### Fixed
+
+- Harden the readable standalone installer against truncated `curl | sh`
+  input, candidate stdin capture, Rosetta architecture misdetection,
+  unbounded transfers, production `file://` overrides, and group/world-
+  writable install directories. Require exact HTTP 200 responses in the
+  standalone updater and preserve the same directory invariant in Rust.
+
 ### Removed
 
 - Remove the unreachable custom TUF verifier and spike, sealed update

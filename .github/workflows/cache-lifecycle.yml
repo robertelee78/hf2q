@@ -7,6 +7,10 @@ on:
         description: Exact main-branch commit and signed candidate to qualify
         required: true
         type: string
+      version:
+        description: Exact stable candidate version to qualify
+        required: true
+        type: string
       standalone_candidate_run_id:
         description: Successful exact-SHA Standalone candidate workflow run ID
         required: true
@@ -27,7 +31,7 @@ jobs:
     timeout-minutes: 300
     env:
       EXPECTED_SHA: ${{ inputs.commit_sha }}
-      EXPECTED_VERSION: "0.1.7"
+      EXPECTED_VERSION: ${{ inputs.version }}
       EXPECTED_STANDALONE_CANDIDATE_RUN_ID: ${{ inputs.standalone_candidate_run_id }}
       ACCEPTED_QWEN38_MODEL_SHA256: "d2ea096cf688ebb02a233ee19b66ade4dc48fdff543793c35631bc5e6291aaaf"
       CARGO_TERM_COLOR: always
@@ -91,10 +95,9 @@ jobs:
         run: |
           set -euo pipefail
           run_json=$(gh run view "$EXPECTED_STANDALONE_CANDIDATE_RUN_ID" \
-            --json conclusion,event,headSha,workflowName,url)
+            --json conclusion,event,workflowName,url)
           test "$(jq -r .workflowName <<<"$run_json")" = "Standalone candidate"
           test "$(jq -r .event <<<"$run_json")" = "workflow_dispatch"
-          test "$(jq -r .headSha <<<"$run_json")" = "$EXPECTED_SHA"
           test "$(jq -r .conclusion <<<"$run_json")" = "success"
           input_root="$RUNNER_TEMP/cache-lifecycle-inputs"
           mkdir -m 0700 "$input_root"

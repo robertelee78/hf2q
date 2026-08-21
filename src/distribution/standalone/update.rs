@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -257,12 +258,7 @@ fn require_success_response(
     response: &Response,
     expected_length: Option<u64>,
 ) -> Result<(), StandaloneError> {
-    if !response.status().is_success() {
-        return Err(StandaloneError::Network(format!(
-            "server returned HTTP {}",
-            response.status().as_u16()
-        )));
-    }
+    require_ok_status(response.status())?;
     if response.headers().contains_key(CONTENT_ENCODING) {
         return Err(StandaloneError::Network(
             "encoded responses are not accepted".to_owned(),
@@ -277,6 +273,16 @@ fn require_success_response(
         if actual != Some(expected) {
             return Err(StandaloneError::DigestMismatch);
         }
+    }
+    Ok(())
+}
+
+fn require_ok_status(status: StatusCode) -> Result<(), StandaloneError> {
+    if status != StatusCode::OK {
+        return Err(StandaloneError::Network(format!(
+            "server returned HTTP {}",
+            status.as_u16()
+        )));
     }
     Ok(())
 }
@@ -566,6 +572,17 @@ mod tests {
         assert!(parse_thin_arm64(b"arm64e\n").is_err());
         assert!(parse_thin_arm64(b"").is_err());
         assert!(parse_thin_arm64(b"arm64\xff").is_err());
+    }
+
+    #[test]
+    fn standalone_transport_requires_exact_http_200() {
+        require_ok_status(StatusCode::OK).expect("HTTP 200");
+        for status in [StatusCode::NO_CONTENT, StatusCode::PARTIAL_CONTENT] {
+            assert!(matches!(
+                require_ok_status(status),
+                Err(StandaloneError::Network(_))
+            ));
+        }
     }
 
     #[cfg(target_os = "macos")]

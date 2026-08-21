@@ -111,7 +111,8 @@ release. Model/cache/performance qualification is separate and remains owned by
 the relevant model and serving decisions. v0.1.7 passed the credentialed Apple
 candidate, exact public binary, stable-record, clean install, setup, update
 already-current, and data-preserving uninstall gates; the branded installer is
-live at `https://hf2q.us/install.sh`.
+live at `https://hf2q.us/install.sh` as a no-cache temporary redirect to the
+exact immutable versioned GitHub release asset.
 Source/Cargo installs remain unmanaged by `hf2q update`.
 
 `hf2q setup` inventories the selected Apple-Silicon host and records defaults
