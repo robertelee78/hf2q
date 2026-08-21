@@ -61,6 +61,7 @@ gh run download "$run_id" \
   --name "standalone-candidate-build-$source_sha" --dir "$build_root"
 gh run download "$run_id" \
   --name "standalone-candidate-signed-$source_sha" --dir "$signed_root"
+unset GH_TOKEN GITHUB_TOKEN
 
 [[ -z $(find "$build_root" "$signed_root" -type l -print -quit) ]] || \
   fail "candidate artifacts contain a symbolic link"

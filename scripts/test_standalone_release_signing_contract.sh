@@ -165,6 +165,13 @@ if grep -En \
 fi
 grep -Fq 'proof="$signed_root/proof.json"' "$VERIFY_SCRIPT" || \
   fail "release workflow does not consume the signed proof receipt"
+token_unset_line=$(grep -nF 'unset GH_TOKEN GITHUB_TOKEN' "$VERIFY_SCRIPT" | \
+  cut -d: -f1)
+unsigned_execution_line=$(grep -nF '[[ $("$unsigned" --version) == "hf2q $version" ]]' \
+  "$VERIFY_SCRIPT" | cut -d: -f1)
+[[ -n "$token_unset_line" && -n "$unsigned_execution_line" && \
+  "$token_unset_line" -lt "$unsigned_execution_line" ]] || \
+  fail "candidate verifier does not drop GitHub credentials before execution"
 grep -Fq '.input.unsigned_sha256 == $unsigned_sha' "$VERIFY_SCRIPT" || \
   fail "release verification does not bind the signed proof to the packed input"
 grep -Fq 'hf2q-aarch64-apple-darwin' "$RELEASE_WORKFLOW" || \

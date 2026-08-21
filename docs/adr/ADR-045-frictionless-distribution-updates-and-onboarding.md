@@ -229,6 +229,8 @@ operator does not copy a run ID between workflows to publish a release. The
 requested source SHA must be an ancestor of main and is bound by candidate
 receipts; GitHub's workflow-definition `headSha` is not misused as candidate
 identity, so unrelated later merges do not invalidate an in-flight release.
+The publication verifier drops its GitHub API credentials immediately after
+artifact download and before executing even a verified candidate.
 
 Model-family quality, cache, and performance qualification is independent. It
 may consume the same signed candidate and remains required when a governing
