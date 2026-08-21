@@ -705,7 +705,11 @@ gate was a product error: unrelated compiler activity on the shared model
 runner invalidated a performance phase after signing and notarization had
 already succeeded. The rail is now split into a short standalone candidate
 workflow, the distribution release, and optional model qualification. Only the
-first two govern publication of unchanged CLI bytes.
+first two govern publication of unchanged CLI bytes. The release's unpacked
+crate check is correspondingly limited to compilation, explicit completions,
+setup, standalone distribution, and installed CLI behavior. Main CI owns broad
+source regressions; model workflows own family-specific correctness, quality,
+cache, and performance qualification.
 
 The unreachable second managed-session store, its runtime authorization, and
 the provisional session-cache setup field have been removed. `hf2q setup` does

@@ -60,6 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consume the exact packed, signed, notarized CLI candidate and no longer wait
   for DeepSeek, Gemma, Qwen, or Qwen3.8 cache/performance runs; those remain
   independently dispatchable gates under their model and serving decisions.
+  The packed release smoke now checks only compilation, explicit completions,
+  setup, standalone distribution, and installed CLI behavior.
 - Adopt the single-attribution reference policy repo-wide: prose in docs,
   comments, scripts, and command output now says "the peer" instead of
   naming the upstream engine; `LlamaFtype` is renamed `GgufFtype`

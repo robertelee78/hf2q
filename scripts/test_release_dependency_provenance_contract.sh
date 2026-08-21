@@ -241,7 +241,9 @@ grep -qF '/private/var/tmp/hf2q-packed-build.*)' "$STANDALONE_WORKFLOW" || \
   fail "standalone workflow cleanup lacks an exact packed-build root guard"
 
 awk '
-  /bash -n scripts\/qwen36_watchdog_validate\.sh/ { in_packed_bash_n = 1 }
+  /bash -n scripts\/verify_release_dependency_provenance\.sh/ {
+    in_packed_bash_n = 1
+  }
   in_packed_bash_n && /scripts\/verify_release_dependency_provenance\.sh/ {
     saw_verifier = 1
   }
