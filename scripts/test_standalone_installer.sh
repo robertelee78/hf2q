@@ -36,6 +36,16 @@ expected_record=$(printf '{"kind":"hf2q.standalone-release","schema_version":1,"
 grep -Fq '[ "$(/usr/bin/lipo -archs "$candidate" 2>/dev/null)" = arm64 ]' \
   "$TEMPLATE"
 grep -Fq "[ \"\$macos_major\" -ge 14 ]" "$TEMPLATE"
+grep -Fq "Authority=Developer ID Certification Authority" "$TEMPLATE"
+grep -Fq "Authority=Apple Root CA" "$TEMPLATE"
+grep -Fq "flags=0x[0-9a-f]+\\(runtime\\)" "$TEMPLATE"
+grep -Fq "grep -Eq '^Timestamp=.+$'" "$TEMPLATE"
+grep -Fq -- '--check-notarization' "$TEMPLATE"
+grep -Fq -- "--test-requirement '=notarized'" "$TEMPLATE"
+if grep -Fq '/usr/sbin/spctl' "$TEMPLATE"; then
+  echo "raw standalone installer must not apply the app-bundle-only spctl assessment" >&2
+  exit 1
+fi
 
 "$RENDER" "$TEMPLATE" "$installer" "$version" "$size" "$sha256" ABCDE12345 us.hf2q.cli >/dev/null
 

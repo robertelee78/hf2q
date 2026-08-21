@@ -99,8 +99,8 @@ rollback, data-preserving uninstaller, and protected signed-byte release rail.
 The rail signs/notarizes before the real-model hardware gate and publishes only
 the exact gated binary through a complete draft release. It is not advertised
 as an install method yet: `https://hf2q.us/install.sh` remains unavailable
-until that rail runs with the project Apple credentials and its exact public
-binary and stable release record pass the installed-artifact gates.
+until the credentialed rail, signed-byte hardware proof, exact public binary,
+and stable release record pass their installed-artifact gates.
 Source/Cargo installs remain unmanaged by `hf2q update`.
 
 `hf2q setup` inventories the selected Apple-Silicon host and records defaults

@@ -38,10 +38,31 @@ for required in \
   'notarytool wait "$submission_id"' \
   '--timeout 30m --output-format json' \
   'notarytool log "$submission_id"' \
-  'source=Notarized Developer ID' \
+  'any(.ticketContents[]?;' \
+  '--check-notarization' \
+  "--test-requirement '=notarized'" \
+  'online_notarization:"accepted"' \
+  'notarization-check.txt' \
+  'notary_ticket_cdhash_matches:true' \
   'standalone_ticket_stapled:false'; do
   grep -Fq -- "$required" "$SIGN_SCRIPT" || \
     fail "signing script is missing required contract: $required"
+done
+for raw_trust_source in \
+  "$SIGN_SCRIPT" \
+  "$ROOT_DIR/scripts/install.sh.in" \
+  "$ROOT_DIR/src/distribution/standalone/update.rs" \
+  "$CACHE_WORKFLOW" \
+  "$RELEASE_WORKFLOW"; do
+  if grep -Fq '/usr/sbin/spctl' "$raw_trust_source"; then
+    fail "raw standalone executables must not use the app-bundle-only spctl assessment"
+  fi
+  grep -Fq -- '--check-notarization' "$raw_trust_source" ||
+    fail "raw standalone trust boundary does not force an online notarization check: $raw_trust_source"
+  grep -Fq -- '--test-requirement' "$raw_trust_source" ||
+    fail "raw standalone trust boundary does not apply an explicit code requirement: $raw_trust_source"
+  grep -Fq -- '=notarized' "$raw_trust_source" ||
+    fail "raw standalone trust boundary does not require notarized code: $raw_trust_source"
 done
 grep -Fq '"${original_user_keychains[@]}" >/dev/null 2>&1 || true' \
   "$SIGN_SCRIPT" || \

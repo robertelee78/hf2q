@@ -82,8 +82,8 @@ submission_archive="$secret_directory/hf2q-notary.zip"
 submission_json="$output_directory/notary-submission.json"
 notary_wait="$output_directory/notary-wait.json"
 notary_log="$secret_directory/notary-log.json"
-gatekeeper_log="$secret_directory/gatekeeper.txt"
 codesign_log="$secret_directory/codesign.txt"
+notarization_check_log="$secret_directory/notarization-check.txt"
 keychain_password="$(/usr/bin/uuidgen)-$(/usr/bin/uuidgen)"
 original_user_keychains=()
 while IFS= read -r original_keychain; do
@@ -105,7 +105,7 @@ cleanup() {
   fi
   /usr/bin/security delete-keychain "$keychain" >/dev/null 2>&1 || true
   rm -f -- "$p12" "$notary_key" "$candidate" "$submission_archive" \
-    "$notary_log" "$gatekeeper_log" "$codesign_log"
+    "$notary_log" "$codesign_log" "$notarization_check_log"
   rmdir "$secret_directory" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -198,27 +198,34 @@ jq -e --arg cdhash "$cdhash" '
     .digestAlgorithm == "SHA-256" and .cdhash == $cdhash)
 ' "$notary_log" >/dev/null || fail "notary log does not bind the accepted standalone binary"
 
-accepted=0
+# `spctl --assess --type execute` is an app-bundle assessment and rejects a
+# valid raw CLI as "not an app".  For a standalone Mach-O, combine the
+# purpose-built online-ticket check with the explicit notarized code
+# requirement.  Neither option is sufficient alone: `--check-notarization`
+# can accept platform/ad-hoc code, while the requirement alone need not force
+# an online ticket lookup for this unstapled executable.
+notarization_verified=0
 for _ in $(seq 1 12); do
-  if /usr/sbin/spctl --assess --type execute --verbose=4 "$candidate" \
-    >"$gatekeeper_log" 2>&1 && \
-    grep -Fq 'source=Notarized Developer ID' "$gatekeeper_log"; then
-    accepted=1
+  if /usr/bin/codesign --verify --strict --all-architectures \
+    --check-notarization --test-requirement '=notarized' --verbose=4 "$candidate" \
+    >"$notarization_check_log" 2>&1; then
+    notarization_verified=1
     break
   fi
   sleep 5
 done
-[[ $accepted -eq 1 ]] || fail "Gatekeeper did not accept the notarized standalone binary"
+[[ $notarization_verified -eq 1 ]] || \
+  fail "online notarization ticket verification did not accept the standalone binary"
 
 submission_sha=$(sha256_file "$submission_json")
 notary_wait_sha=$(sha256_file "$notary_wait")
 notary_log_sha=$(sha256_file "$notary_log")
 codesign_log_sha=$(sha256_file "$codesign_log")
-gatekeeper_log_sha=$(sha256_file "$gatekeeper_log")
+notarization_check_log_sha=$(sha256_file "$notarization_check_log")
 
 /bin/mv "$notary_log" "$output_directory/notary-log.json"
 /bin/mv "$codesign_log" "$output_directory/codesign.txt"
-/bin/mv "$gatekeeper_log" "$output_directory/gatekeeper.txt"
+/bin/mv "$notarization_check_log" "$output_directory/notarization-check.txt"
 jq -nS \
   --arg source_sha "$source_sha" \
   --arg version "$version" \
@@ -233,7 +240,7 @@ jq -nS \
   --arg wait_sha256 "$notary_wait_sha" \
   --arg notary_log_sha256 "$notary_log_sha" \
   --arg codesign_log_sha256 "$codesign_log_sha" \
-  --arg gatekeeper_log_sha256 "$gatekeeper_log_sha" \
+  --arg notarization_check_log_sha256 "$notarization_check_log_sha" \
   --argjson size "$binary_size" \
   '{
     kind:"hf2q.standalone-apple-release-proof",
@@ -263,11 +270,12 @@ jq -nS \
     verification:{
       codesign:"accepted",
       codesign_log_sha256:$codesign_log_sha256,
-      gatekeeper:"Notarized Developer ID",
-      gatekeeper_log_sha256:$gatekeeper_log_sha256
+      online_notarization:"accepted",
+      online_notarization_log_sha256:$notarization_check_log_sha256,
+      notary_ticket_cdhash_matches:true
     }
   }' >"$output_directory/proof.json"
-/bin/chmod 0444 "$output_directory"/{proof.json,notary-submission.json,notary-wait.json,notary-log.json,codesign.txt,gatekeeper.txt}
+/bin/chmod 0444 "$output_directory"/{proof.json,notary-submission.json,notary-wait.json,notary-log.json,codesign.txt,notarization-check.txt}
 printf '%s  %s\n' "$binary_sha" "$asset_name" \
   >"$output_directory/${asset_name}.sha256"
 /bin/chmod 0444 "$output_directory/${asset_name}.sha256"
@@ -280,7 +288,7 @@ for required in \
   notary-wait.json \
   notary-log.json \
   codesign.txt \
-  gatekeeper.txt; do
+  notarization-check.txt; do
   [[ -f "$output_directory/$required" && ! -L "$output_directory/$required" ]] || \
     fail "signed release output is incomplete or unsafe: $required"
 done

@@ -67,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Validate the Developer ID hardened-runtime flag at its actual location in
   Apple's `codesign --display --verbose=4` `CodeDirectory` line.
+- Bind raw-CLI notarization to Apple's accepted ticket CDHash at release time;
+  replace the app-bundle-only `spctl` assessment with `codesign`'s forced
+  online ticket lookup plus explicit `=notarized` requirement, while retaining
+  strict signature-chain checks in install/update.
 - Keep shell-completion installation explicit through
   `hf2q completions --shell <shell>`; ordinary CLI startup no longer writes
   completion registrations or shell startup files.

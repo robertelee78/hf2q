@@ -329,12 +329,7 @@ fn verify_apple_release(
                 "candidate Developer ID does not match the installed standalone binary",
             ));
         }
-        command_success(
-            "/usr/sbin/spctl",
-            &["--assess", "--type", "execute"],
-            candidate,
-            "Gatekeeper did not accept the candidate",
-        )?;
+        verify_online_notarization(candidate)?;
         let output = Command::new(candidate)
             .arg("--version")
             .env_clear()
@@ -397,6 +392,23 @@ fn verify_codesign(path: &Path) -> Result<(), StandaloneError> {
 }
 
 #[cfg(target_os = "macos")]
+fn verify_online_notarization(path: &Path) -> Result<(), StandaloneError> {
+    command_success(
+        "/usr/bin/codesign",
+        &[
+            "--verify",
+            "--strict",
+            "--all-architectures",
+            "--check-notarization",
+            "--test-requirement",
+            "=notarized",
+        ],
+        path,
+        "Apple did not verify the candidate's online notarization ticket",
+    )
+}
+
+#[cfg(target_os = "macos")]
 fn command_success(
     program: &str,
     arguments: &[&str],
@@ -431,6 +443,11 @@ fn signing_identity(path: &Path) -> Result<SigningIdentity, StandaloneError> {
     }
     let text = std::str::from_utf8(&output.stderr)
         .map_err(|_| StandaloneError::Trust("Apple signing identity was not UTF-8"))?;
+    parse_signing_identity(text)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_signing_identity(text: &str) -> Result<SigningIdentity, StandaloneError> {
     let team_id = unique_signing_value(text, "TeamIdentifier=")?;
     if team_id.len() != 10
         || !team_id
@@ -449,6 +466,48 @@ fn signing_identity(path: &Path) -> Result<SigningIdentity, StandaloneError> {
     {
         return Err(StandaloneError::Trust(
             "Apple signing identifier is not canonical",
+        ));
+    }
+    let authorities = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Authority="))
+        .collect::<Vec<_>>();
+    let application_prefix = "Developer ID Application: ";
+    let application_suffix = format!(" ({team_id})");
+    if authorities.len() != 3
+        || !authorities[0].starts_with(application_prefix)
+        || !authorities[0].ends_with(&application_suffix)
+        || authorities[0].len() <= application_prefix.len() + application_suffix.len()
+        || authorities[1] != "Developer ID Certification Authority"
+        || authorities[2] != "Apple Root CA"
+    {
+        return Err(StandaloneError::Trust(
+            "Apple Developer ID authority chain is incomplete or ambiguous",
+        ));
+    }
+    let code_directory = text
+        .lines()
+        .filter(|line| line.starts_with("CodeDirectory "))
+        .collect::<Vec<_>>();
+    let runtime_enabled = code_directory.len() == 1
+        && code_directory[0]
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix("flags=0x"))
+            .and_then(|flags| flags.split_once('('))
+            .is_some_and(|(hex, names)| {
+                !hex.is_empty()
+                    && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && names == "runtime)"
+            });
+    if !runtime_enabled {
+        return Err(StandaloneError::Trust(
+            "Apple signature does not enable the hardened runtime",
+        ));
+    }
+    let timestamp = unique_signing_value(text, "Timestamp=")?;
+    if timestamp.is_empty() {
+        return Err(StandaloneError::Trust(
+            "Apple signature does not have a secure timestamp",
         ));
     }
     Ok(SigningIdentity {
@@ -512,7 +571,22 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn signing_identity_fields_are_unique_and_canonical() {
-        let parsed = "Identifier=us.hf2q.cli\nTeamIdentifier=ABCDE12345\n";
+        let parsed = concat!(
+            "Identifier=us.hf2q.cli\n",
+            "CodeDirectory v=20500 size=123 flags=0x10000(runtime) hashes=42+7 location=embedded\n",
+            "Authority=Developer ID Application: Example Operator (ABCDE12345)\n",
+            "Authority=Developer ID Certification Authority\n",
+            "Authority=Apple Root CA\n",
+            "Timestamp=Aug 20, 2026 at 8:32:48 PM\n",
+            "TeamIdentifier=ABCDE12345\n",
+        );
+        assert_eq!(
+            parse_signing_identity(parsed).expect("valid Developer ID metadata"),
+            SigningIdentity {
+                team_id: "ABCDE12345".to_owned(),
+                identifier: "us.hf2q.cli".to_owned(),
+            }
+        );
         assert_eq!(
             unique_signing_value(parsed, "Identifier=").unwrap(),
             "us.hf2q.cli"
@@ -522,5 +596,15 @@ mod tests {
             "Identifier="
         )
         .is_err());
+        assert!(parse_signing_identity(&parsed.replace(
+            "Authority=Developer ID Application: Example Operator (ABCDE12345)\n",
+            "Authority=Self Signed Example (ABCDE12345)\n",
+        ))
+        .is_err());
+        assert!(parse_signing_identity(
+            &parsed.replace("flags=0x10000(runtime)", "flags=0x0(none)",)
+        )
+        .is_err());
+        assert!(parse_signing_identity(&parsed.replace("Timestamp=", "Signed Time=")).is_err());
     }
 }
