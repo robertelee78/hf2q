@@ -1,6 +1,6 @@
 # ADR-047: Diagnostic chat over the native inference server
 
-- **Status:** Accepted for implementation; release remains proof-gated
+- **Status:** Accepted and implemented; landing remains CI-gated
 - **Date:** 2026-08-20
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
 
@@ -236,6 +236,55 @@ Implementation is not complete until all of the following are proven:
    timing/usage, and unchanged model output under matched settings. The direct
    API proves the agentic serving contract; the diagnostic TUI remains a
    display-only client and never becomes a tool harness.
+
+## Validation evidence
+
+The implementation candidate was frozen at `477172af` after two independent
+review findings were reproduced and fixed:
+
+- replacement loading previously ran synchronous model warmup inside the Axum
+  Tokio runtime. A nested-runtime sentinel test now proves the complete switch
+  route loads off-runtime, and the real Qwen-to-Gemma switch completed without
+  a panic;
+- automatic discovery previously attached `HF2Q_AUTH_TOKEN` to an untrusted
+  LocalOnly candidate. Real loopback HTTP tests now prove both `/health` and
+  `/v1/models` probes carry no authorization header, and authenticated
+  automatic discovery fails closed until the operator supplies `--url`.
+
+On 2026-08-20 the release M5 Max host (macOS 26.5, arm64, 128 GiB) produced the
+following source-bound evidence:
+
+- `cargo check --locked --all-targets --all-features` and
+  `cargo build --release --locked` passed;
+- the serial full-bin suite passed 4,801 tests with zero failures and 53
+  explicitly hardware/fixture-gated ignored tests; focused chat, lifecycle,
+  router, SSE, multi-model, and discovery tests also passed, including every
+  possible single SSE split boundary plus byte-at-a-time delivery;
+- Agentic-QE SAST and both Claude-Flow full/input-validation scans reported
+  zero findings;
+- `hf2q chat` found no server, spawned the current release binary on port
+  `61856`, activated the 16,810,714,752-byte Qwen3.8 27B Q4_K_M artifact,
+  completed two streamed turns, reused 61 of 124 prompt tokens on turn two,
+  displayed reasoning/usage/timing/pool telemetry, changed thinking mode, and
+  gracefully stopped only that owned child on exit;
+- a manually launched server remained PID `21648` on port `61947` while an
+  explicit, revision-bound switch removed Qwen and loaded the
+  20,576,631,488-byte Gemma4 Ara Q5_K_M artifact under a 24,700,000,000-byte
+  pool budget. Chat returned `GEMMA_OK`, reported pool revision 3, identified
+  itself as external, and left the manually launched server running;
+- matched direct-API tool requests produced one structured `read_file` call.
+  Exact unary replay reused 123 of 123 prompt tokens, SSE emitted the same call
+  and one terminal `[DONE]`, and a role=`tool` continuation reused 130 of 240
+  prompt tokens before returning exactly `HF2Q_CHAT_AGENTIC_OK`; and
+- matched normal and `x-hf2q-diagnostic-no-evict: 1` requests produced equal
+  OpenAI choices with the exact content `HF2Q_HEADER_PARITY_OK`.
+
+Two failed spikes remain evidence rather than accepted claims. The repository's
+7,102-token agentic fixture correctly exceeded Gemma SerialFifo's documented
+4,096-token transaction bound. A reduced legacy harness then changed
+`tool_choice` from `required` to `auto` and observed zero reused tokens, so the
+final cache proof held request settings constant instead of treating a changed
+grammar contract as the same prefix.
 
 ## Consequences
 
