@@ -28,6 +28,7 @@ jobs:
     with:
       commit_sha: ${{ inputs.commit_sha }}
       version: ${{ inputs.version }}
+    secrets: inherit
 
   publish:
     needs: standalone-candidate
