@@ -36,8 +36,8 @@ export PATH="$HOME/.local/bin:$PATH"
 hf2q --version
 ```
 
-This guide requires hf2q 0.1.8 or newer because it uses the `hf2q chat`
-command.
+This guide is validated against hf2q 0.1.8. If `hf2q --version` reports an
+older release, run `hf2q update` before continuing.
 
 Run setup and answer its five operator choices. Press Enter to accept a
 recommendation; explicit flags on later commands still win.

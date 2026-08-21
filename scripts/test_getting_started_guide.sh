@@ -23,7 +23,7 @@ reject_literal() {
 
 require_literal "curl -fsSL https://hf2q.us/install.sh | sh"
 require_literal "hf2q --version"
-require_literal "requires hf2q 0.1.8 or newer"
+require_literal "validated against hf2q 0.1.8"
 require_literal "hf2q setup"
 require_literal "hf2q setup --accept-defaults"
 require_literal "hf2q doctor"
