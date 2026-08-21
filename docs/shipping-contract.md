@@ -190,6 +190,12 @@ Internal scaffolding. Not listed in `docs/operator-env-vars.md` as
 operator-facing; loaded through `src/debug/investigation_env.rs`
 (centralized), not read ad-hoc in hot paths.
 
+ADR-046 calibration, exact-teacher, source-precision teacher, copied-execution
+evidence, and exact Dynamic-frontier generation are validation substrate, not
+default-binary or operator surfaces. Per ADR-048 they compile with their tests;
+the completed bounded family transaction does not cross that boundary until an
+explicit product entrypoint and the required official-model gates land.
+
 **Ack-required (known to risk correctness or runtime reliability):**
 
 | Var | Notes |

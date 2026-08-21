@@ -38,9 +38,10 @@
 //! ≈8 projections across the 4-layer stack).
 
 use anyhow::{anyhow, ensure, Context, Result};
+#[cfg(test)]
+use mlx_native::metal::foreign_types::ForeignType;
 use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
-use mlx_native::metal::foreign_types::ForeignType;
 use std::sync::OnceLock;
 
 use super::delta_net::DeltaNetLayerShape;
@@ -323,17 +324,16 @@ struct ForwardGpuCache {
     model_ptr: *const (),
     /// Exact evidence authority whose weights/configuration produced this
     /// cache. `None` preserves the legacy non-evidence path.
+    #[cfg(test)]
     loaded_candidate_identity: Option<(String, String, String)>,
     /// Exact loaded→cache buffer observations for the evidence-bearing
     /// candidate. This is byte authority only, not dispatch/cost authority.
+    #[cfg(test)]
     executed_catalog:
         Option<std::sync::Arc<super::execution_observation::VerifiedExecutedTensorCatalog>>,
-    trace_weight_slots: Option<
-        std::collections::BTreeMap<
-            usize,
-            super::execution_dispatch::Qwen35TraceWeightSlot,
-        >,
-    >,
+    #[cfg(test)]
+    trace_weight_slots:
+        Option<std::collections::BTreeMap<usize, super::execution_dispatch::Qwen35TraceWeightSlot>>,
     device: MlxDevice,
     registry: KernelRegistry,
     layer_weights: Vec<LayerWeightsGpu>,
@@ -346,6 +346,7 @@ struct ForwardGpuCache {
 // MlxBuffer is not Send but we never move the cache across thread boundaries.
 unsafe impl Send for ForwardGpuCache {}
 
+#[cfg(test)]
 fn gpu_cache_matches_model(cache: &ForwardGpuCache, model: &Qwen35Model) -> bool {
     let model_ptr = model as *const _ as *const ();
     let authority_matches = match (
@@ -359,6 +360,11 @@ fn gpu_cache_matches_model(cache: &ForwardGpuCache, model: &Qwen35Model) -> bool
         _ => false,
     };
     cache.model_ptr == model_ptr && authority_matches
+}
+
+#[cfg(not(test))]
+fn gpu_cache_matches_model(cache: &ForwardGpuCache, model: &Qwen35Model) -> bool {
+    cache.model_ptr == model as *const _ as *const ()
 }
 
 thread_local! {
@@ -392,18 +398,16 @@ enum FfnWeightsGpu {
     MoeQ(MoeFfnWeightsGpuQ),
 }
 
+#[cfg(test)]
 fn observe_dense_ffn_cache(
     builder: &mut super::execution_observation::ExecutedTensorCatalogBuilder<'_>,
     prefix: &str,
     loaded: &Qwen35FfnWeights,
     executed: &FfnWeightsGpu,
 ) -> Result<()> {
-    let (Qwen35FfnWeights::DenseQ(loaded), FfnWeightsGpu::DenseQ(executed)) =
-        (loaded, executed)
+    let (Qwen35FfnWeights::DenseQ(loaded), FfnWeightsGpu::DenseQ(executed)) = (loaded, executed)
     else {
-        anyhow::bail!(
-            "evidence profile requires native-GGML dense FFN weights in every layer"
-        );
+        anyhow::bail!("evidence profile requires native-GGML dense FFN weights in every layer");
     };
     builder.add_direct_ggml(
         &format!("{prefix}.ffn_gate.weight"),
@@ -1641,17 +1645,13 @@ fn residual_add_gpu(
 // ================================================================
 
 impl Qwen35Model {
+    #[cfg(test)]
     fn loaded_candidate_trace_weight_slots(
         &self,
         layer_weights: &[LayerWeightsGpu],
         output_head: &OutputHeadGpu,
     ) -> Result<
-        Option<
-            std::collections::BTreeMap<
-                usize,
-                super::execution_dispatch::Qwen35TraceWeightSlot,
-            >,
-        >,
+        Option<std::collections::BTreeMap<usize, super::execution_dispatch::Qwen35TraceWeightSlot>>,
     > {
         if self.loaded_candidate_tensor_catalog().is_none() {
             return Ok(None);
@@ -1705,18 +1705,17 @@ impl Qwen35Model {
         Ok(Some(slots))
     }
 
+    #[cfg(test)]
     fn observe_loaded_candidate_cache(
         &self,
         layer_weights: &[LayerWeightsGpu],
         output_head: &OutputHeadGpu,
-    ) -> Result<
-        Option<std::sync::Arc<super::execution_observation::VerifiedExecutedTensorCatalog>>,
-    > {
+    ) -> Result<Option<std::sync::Arc<super::execution_observation::VerifiedExecutedTensorCatalog>>>
+    {
         let Some(loaded) = self.loaded_candidate_tensor_catalog() else {
             return Ok(None);
         };
-        let mut builder =
-            super::execution_observation::ExecutedTensorCatalogBuilder::new(loaded);
+        let mut builder = super::execution_observation::ExecutedTensorCatalogBuilder::new(loaded);
         builder.add_cpu_f32("token_embd.weight", "token_embd.weight", &self.token_embd)?;
         builder.add_gpu_f32(
             "output_norm.weight",
@@ -1734,11 +1733,8 @@ impl Qwen35Model {
             self.layers.len() == layer_weights.len(),
             "loaded/cached Qwen layer count differs"
         );
-        for (layer_index, (loaded_layer, executed_layer)) in self
-            .layers
-            .iter()
-            .zip(layer_weights.iter())
-            .enumerate()
+        for (layer_index, (loaded_layer, executed_layer)) in
+            self.layers.iter().zip(layer_weights.iter()).enumerate()
         {
             let prefix = format!("blk.{layer_index}");
             match (loaded_layer, executed_layer) {
@@ -1803,12 +1799,7 @@ impl Qwen35Model {
                         &attn.wo,
                         &executed.wo,
                     )?;
-                    observe_dense_ffn_cache(
-                        &mut builder,
-                        &prefix,
-                        ffn,
-                        executed_ffn,
-                    )?;
+                    observe_dense_ffn_cache(&mut builder, &prefix, ffn, executed_ffn)?;
                 }
                 (
                     Qwen35LayerWeights::LinearAttn { attn, ffn },
@@ -1841,9 +1832,9 @@ impl Qwen35Model {
                         &attn.attn_gate,
                         &executed.attn_gate,
                     )?;
-                    let qkv_channels = 2 * self.cfg.linear_num_key_heads
-                        * self.cfg.linear_key_head_dim
-                        + self.cfg.linear_num_value_heads * self.cfg.linear_value_head_dim;
+                    let qkv_channels =
+                        2 * self.cfg.linear_num_key_heads * self.cfg.linear_key_head_dim
+                            + self.cfg.linear_num_value_heads * self.cfg.linear_value_head_dim;
                     builder.add_delta_conv_roundtrip(
                         &format!("{prefix}.ssm_conv1d.weight"),
                         &format!("{prefix}.ssm_conv1d.weight"),
@@ -1888,12 +1879,7 @@ impl Qwen35Model {
                         &attn.ssm_out,
                         &executed.ssm_out,
                     )?;
-                    observe_dense_ffn_cache(
-                        &mut builder,
-                        &prefix,
-                        ffn,
-                        executed_ffn,
-                    )?;
+                    observe_dense_ffn_cache(&mut builder, &prefix, ffn, executed_ffn)?;
                 }
                 _ => anyhow::bail!(
                     "loaded and cached Qwen layer topology differs from the evidence profile"
@@ -2688,11 +2674,12 @@ impl Qwen35Model {
     /// `forward_gpu_impl` does on its first call.
     pub fn ensure_gpu_cache_primed(&self) -> Result<()> {
         let self_ptr = self as *const _ as *const ();
-        let loaded_candidate_identity = self
-            .loaded_candidate_cache_identity()
-            .map(|(receipt, graph, routing)| {
-                (receipt.to_owned(), graph.to_owned(), routing.to_owned())
-            });
+        #[cfg(test)]
+        let loaded_candidate_identity =
+            self.loaded_candidate_cache_identity()
+                .map(|(receipt, graph, routing)| {
+                    (receipt.to_owned(), graph.to_owned(), routing.to_owned())
+                });
         GPU_CACHE.with(|cell| -> Result<()> {
             let mut cache = cell.borrow_mut();
             if cache
@@ -2880,14 +2867,19 @@ impl Qwen35Model {
                     }
                 }
 
+                #[cfg(test)]
                 let executed_catalog =
                     self.observe_loaded_candidate_cache(&layer_weights, &output_head)?;
+                #[cfg(test)]
                 let trace_weight_slots =
                     self.loaded_candidate_trace_weight_slots(&layer_weights, &output_head)?;
                 *cache = Some(ForwardGpuCache {
                     model_ptr: self_ptr,
+                    #[cfg(test)]
                     loaded_candidate_identity,
+                    #[cfg(test)]
                     executed_catalog,
+                    #[cfg(test)]
                     trace_weight_slots,
                     device,
                     registry,
@@ -2926,11 +2918,11 @@ impl Qwen35Model {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn loaded_candidate_executed_catalog(
         &self,
-    ) -> Result<
-        Option<std::sync::Arc<super::execution_observation::VerifiedExecutedTensorCatalog>>,
-    > {
+    ) -> Result<Option<std::sync::Arc<super::execution_observation::VerifiedExecutedTensorCatalog>>>
+    {
         GPU_CACHE.with(|cell| -> Result<_> {
             let guard = cell.borrow();
             let cache = guard.as_ref().ok_or_else(|| {
@@ -2944,15 +2936,11 @@ impl Qwen35Model {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn loaded_candidate_trace_slots(
         &self,
     ) -> Result<
-        Option<
-            std::collections::BTreeMap<
-                usize,
-                super::execution_dispatch::Qwen35TraceWeightSlot,
-            >,
-        >,
+        Option<std::collections::BTreeMap<usize, super::execution_dispatch::Qwen35TraceWeightSlot>>,
     > {
         GPU_CACHE.with(|cell| -> Result<_> {
             let guard = cell.borrow();
@@ -5314,11 +5302,12 @@ impl Qwen35Model {
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
         let self_ptr = self as *const _ as *const ();
-        let loaded_candidate_identity = self
-            .loaded_candidate_cache_identity()
-            .map(|(receipt, graph, routing)| {
-                (receipt.to_owned(), graph.to_owned(), routing.to_owned())
-            });
+        #[cfg(test)]
+        let loaded_candidate_identity =
+            self.loaded_candidate_cache_identity()
+                .map(|(receipt, graph, routing)| {
+                    (receipt.to_owned(), graph.to_owned(), routing.to_owned())
+                });
 
         // Populate GPU cache (same as forward_gpu).
         GPU_CACHE.with(|cell| -> Result<()> {
@@ -5349,14 +5338,19 @@ impl Qwen35Model {
                         .context("upload output_norm")?,
                     lm_head_q4,
                 };
+                #[cfg(test)]
                 let executed_catalog =
                     self.observe_loaded_candidate_cache(&layer_weights, &output_head)?;
+                #[cfg(test)]
                 let trace_weight_slots =
                     self.loaded_candidate_trace_weight_slots(&layer_weights, &output_head)?;
                 *cache = Some(ForwardGpuCache {
                     model_ptr: self_ptr,
+                    #[cfg(test)]
                     loaded_candidate_identity,
+                    #[cfg(test)]
                     executed_catalog,
+                    #[cfg(test)]
                     trace_weight_slots,
                     device,
                     registry,

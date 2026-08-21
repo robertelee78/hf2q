@@ -8,11 +8,13 @@
 //! materialization verifier are required before observations become measured
 //! coverage evidence.
 
+#[cfg(test)]
 mod bindings;
 mod coverage;
 mod partition;
 mod types;
 
+#[cfg(test)]
 pub use bindings::{
     validate_structural_dynamic_allocation_bindings, StructurallyBoundDynamicAllocationProblem,
 };

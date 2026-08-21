@@ -4020,6 +4020,7 @@ pub(crate) fn maybe_print_serve_banner<W: std::io::Write>(
 /// This keeps the function unit-testable without `std::env::set_var`
 /// races (the existing `should_enable_kv_persist` follows the same
 /// pattern for the same reason).
+#[cfg(test)]
 pub(crate) fn parse_scheduler_config(
     scheduler_cli: Option<cli::SchedulerArg>,
     scheduler_env: Option<&str>,

@@ -59,9 +59,17 @@
 //! `tests/imatrix_xvalidation.rs:48-52`). hf2q is a binary crate with no
 //! `[lib]` target, so `use hf2q::...` is unavailable.
 
+#[expect(
+    dead_code,
+    reason = "the path-included lazy-reader harness intentionally compiles a wider IR API"
+)]
 #[path = "../src/ir/mod.rs"]
 mod ir;
 
+#[expect(
+    dead_code,
+    reason = "the path-included lazy-reader harness uses only progress construction"
+)]
 #[path = "../src/progress.rs"]
 mod progress;
 

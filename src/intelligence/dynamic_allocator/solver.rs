@@ -840,6 +840,7 @@ pub fn allocation_problem_sha256(
     hash_serialized(&normalize_problem(problem))
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct State {
     bytes: u64,
@@ -848,10 +849,12 @@ struct State {
     choices: Vec<usize>,
 }
 
+#[cfg(test)]
 fn metrics_equal(left: &State, right: &State) -> bool {
     left.bytes == right.bytes && left.loss == right.loss && left.costs == right.costs
 }
 
+#[cfg(test)]
 fn dominates(left: &State, right: &State) -> bool {
     let all_no_worse = left.bytes <= right.bytes
         && left.loss <= right.loss
@@ -862,6 +865,7 @@ fn dominates(left: &State, right: &State) -> bool {
     all_no_worse && any_better
 }
 
+#[cfg(test)]
 fn insert_nondominated(
     frontier: &mut Vec<State>,
     candidate: State,
@@ -897,6 +901,7 @@ fn insert_nondominated(
 /// assignments are counted in the receipt and collapsed; full-model repair is
 /// responsible for exploring interaction effects. The live-state bound is
 /// fail-closed and never an implicit heuristic.
+#[cfg(test)]
 pub(super) fn allocate_dynamic_frontier(
     problem: &DynamicAllocationProblem,
 ) -> Result<PolicyFrontier, DynamicAllocationError> {

@@ -34,10 +34,14 @@ pub mod dense_ffn_arena;
 pub mod dn_prefill_arena;
 pub mod dump_bisect;
 pub(super) mod encoder_stage;
+#[cfg(test)]
 pub(crate) mod execution_config;
 pub(crate) mod execution_dispatch;
+#[cfg(test)]
 pub(crate) mod execution_evidence;
+#[cfg(test)]
 pub(crate) mod execution_observation;
+#[cfg(test)]
 pub(crate) mod execution_trace;
 pub mod fa_prefill_arena;
 pub mod fa_projections_arena;
@@ -65,7 +69,9 @@ pub mod model;
 pub mod moe;
 pub mod mtp;
 pub mod mtp_weights_load;
+#[cfg(test)]
 mod source_config;
+#[cfg(test)]
 pub(crate) mod source_precision;
 pub mod spec_decode;
 pub mod tokenizer;

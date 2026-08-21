@@ -289,7 +289,6 @@ pub(in crate::inference::models::qwen35) fn plan_qwen35_base_text_cache(
 
 /// Allocate and validate the exact base-text cache. Failure drops all partial
 /// Metal ownership and returns no prepared type.
-#[allow(dead_code)] // consumed by the source-teacher runner slice
 pub(in crate::inference::models::qwen35) fn prepare_qwen35_base_text_cache(
     config: &Qwen35Config,
     device: &MlxDevice,

@@ -125,6 +125,10 @@ mod serve {
 
 mod inference {
     pub mod models {
+        #[expect(
+            dead_code,
+            reason = "the early-failure parity harness intentionally mirrors a wider Qwen API"
+        )]
         pub mod qwen35 {
             //! Type-stubs sufficient to satisfy `ppl_driver.rs`'s
             //! `use crate::inference::models::qwen35::...` lines. NEVER

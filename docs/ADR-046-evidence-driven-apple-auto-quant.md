@@ -12,6 +12,26 @@
 - Owners: hf2q product pipeline; mlx-native model-agnostic execution primitives
 - Supersedes: ADR-020's proposed DWQ architecture and performance claims
 
+### 2026-08-20 compilation boundary clarification
+
+ADR-048 proved that the source-precision, copied-execution evidence,
+calibration, exact-teacher, and family teacher/cache code below has no accepted
+production command or API root yet. It is therefore compiled as a coherent
+`cfg(test)` validation island. The bounded family-owned runner added by the
+B3b slice remains fully compiled and exercised there; completing that internal
+transaction did not itself create an operator surface. Reusable evidence
+schemas, hashes, source partitioning, and ordinary conversion/inference code
+remain in production. This boundary does not weaken any acceptance test and is
+not a Cargo feature: an experimental feature without a usable entrypoint would
+falsely advertise activation and would recreate the same all-features
+reachability debt.
+
+Promotion must occur in the same change that adds the explicit product
+entrypoint and required official-source/model/hardware proof. Until then,
+phrases such as "production constructor" or "production entrypoint" in the
+staged sections mean production-shaped internal validation logic, not a
+compiled or supported operator surface.
+
 ## Context
 
 hf2q has three surfaces that have been called "auto" but do not form one

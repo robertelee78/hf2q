@@ -87,7 +87,6 @@ struct WorkHashView<'a> {
 
 /// Opaque proof that source, plan, vocabulary, target framing, and execution
 /// work were joined before any model or Metal allocation.
-#[allow(dead_code)] // consumed by the subsequent completed runner slice
 pub(crate) struct StructurallyBoundQwen35SourceTeacherWorkV1 {
     topology: VerifiedQwen35Bf16TopologyV1,
     prediction_plan: VerifiedCalibrationPredictionPlan,
@@ -107,7 +106,6 @@ impl StructurallyBoundQwen35SourceTeacherWorkV1 {
         self.receipt.expected_work.max_cache_tokens
     }
 
-    #[allow(dead_code)] // consuming seam for the subsequent completed runner
     pub(super) fn into_parts(
         self,
     ) -> (
