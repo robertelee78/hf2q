@@ -85,6 +85,11 @@ default = []
 # Enable RuVector self-learning
 ruvector = ["dep:ruvector-core"]
 
+[lints.rust]
+# Release/operator builds must stay signal-clean. Experimental validation
+# substrate belongs behind a real compile boundary, not a warning allowance.
+warnings = "deny"
+
 [dependencies]
 safetensors = "0.7"
 half = "2.4"

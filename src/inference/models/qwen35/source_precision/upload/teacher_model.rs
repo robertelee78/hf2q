@@ -43,12 +43,9 @@ use preflight::{
     Qwen35SourceTeacherRuntimeEnvelopeV1,
 };
 pub(crate) use run_inputs::{
-    prepare_qwen35_source_teacher_run_inputs, run_qwen35_source_teacher,
-    PreparedQwen35SourceTeacherRunInputsV1, Qwen35SourceTeacherPreparationPolicyV1,
-    VerifiedQwen35SourceTeacherTargetV1,
+    prepare_qwen35_source_teacher_run_inputs, Qwen35SourceTeacherPreparationPolicyV1,
 };
 pub(in crate::inference::models::qwen35) use runner::SourceTeacherCacheAuthorization;
-
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct Qwen35SourceTeacherConfigV1 {
     hidden_size: u32,

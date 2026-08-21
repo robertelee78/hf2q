@@ -164,6 +164,8 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   ├── fingerprint.rs         stable model fingerprint (for cache keys)
 │   ├── auto_quant.rs          legacy estimate-only planner
 │   ├── measured_auto_quant.rs ADR-046 exact-evidence selector
+│   ├── calibration/           ADR-046 test-only validation substrate
+│   ├── exact_teacher/         ADR-046 test-only structural target substrate
 │   ├── heuristics.rs          rule-based fallback when RuVector is silent
 │   └── ruvector.rs            optional self-learning store (cargo feature)
 │
@@ -764,6 +766,7 @@ ADRs under `docs/`. The most architecturally consequential ones:
 | **ADR-040** | Full-context agent slots, scheduler admission, fairness, and per-slot state. |
 | **ADR-046** | Evidence-driven Apple-Silicon auto quantization and the hf2q/mlx-native ownership seam. |
 | **ADR-047** | Minimal diagnostic chat, LocalOnly discovery, telemetry, and explicit safe model switching. |
+| **ADR-048** | Warning-free release boundary and test-only ADR-046 validation island. |
 
 Each ADR carries phase status, acceptance tests, and a "what comes
 next" section. ADRs are append-only; superseded ones are linked

@@ -192,7 +192,6 @@ fn fetch_canonical_model_id(server: &ServerGuard) -> String {
 
 /// Result of a chat-completion request with timing breakdown.
 struct ChatTiming {
-    text: String,
     wall_ms: f64,
     /// `time_to_first_token_ms` from the response's timing block — the
     /// engine's measurement of prefill duration from the first token.
@@ -279,41 +278,18 @@ fn chat_with_timing(
     let body_start = buf.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
     let resp_body = &buf[body_start..];
 
-    // Extract content (naive escape-aware string scanner).
+    // This timing gate does not grade output text, but a successful response
+    // must still contain the chat content field.
     let key = "\"content\":\"";
-    let p = resp_body
+    resp_body
         .find(key)
         .unwrap_or_else(|| panic!("no content field in response: {resp_body}"));
-    let rest = &resp_body[p + key.len()..];
-    let mut text = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('"') => text.push('"'),
-                Some('\\') => text.push('\\'),
-                Some('n') => text.push('\n'),
-                Some('r') => text.push('\r'),
-                Some('t') => text.push('\t'),
-                Some(other) => {
-                    text.push('\\');
-                    text.push(other);
-                }
-                None => break,
-            }
-        } else if c == '"' {
-            break;
-        } else {
-            text.push(c);
-        }
-    }
 
     // Extract time_to_first_token_ms.
     let server_ttft_ms = extract_f64_field(resp_body, "\"time_to_first_token_ms\":").unwrap_or(0.0);
     let prompt_tokens = extract_u64_field(resp_body, "\"prompt_tokens\":").unwrap_or(0);
 
     ChatTiming {
-        text,
         wall_ms,
         server_ttft_ms,
         prompt_tokens,

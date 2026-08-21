@@ -18,14 +18,6 @@ use super::upload_transform::{upload_source, UploadedTensorBuffer};
 mod teacher_model;
 
 pub(in crate::inference::models::qwen35) use teacher_model::SourceTeacherCacheAuthorization;
-pub(crate) use teacher_model::{
-    prepare_qwen35_source_teacher, prepare_qwen35_source_teacher_run_inputs,
-    prepare_uploaded_qwen35_source_teacher, run_qwen35_source_teacher,
-    PreparedQwen35SourceTeacherRunInputsV1, PreparedQwen35SourceTeacherV1,
-    Qwen35SourceTeacherLimitsV1, Qwen35SourceTeacherPreparationPolicyV1,
-    VerifiedQwen35SourceTeacherTargetV1,
-};
-
 const UPLOAD_SCHEMA_VERSION: u32 = 1;
 const UPLOAD_PROFILE: &str = "dense_qwen35_source_bf16_host_verified_metal_upload_v1";
 
@@ -210,19 +202,6 @@ impl VerifiedQwen35Bf16MetalUploadV1 {
             _ => return None,
         })
     }
-}
-
-pub(crate) fn upload_qwen35_bf16_topology_to_metal(
-    topology: VerifiedQwen35Bf16TopologyV1,
-    device: &MlxDevice,
-    limits: QwenSourceMetalUploadLimits,
-) -> Result<VerifiedQwen35Bf16MetalUploadV1> {
-    let capacity = observe_capacity(device);
-    upload_with_capacity(topology, device, limits, capacity, |bytes, dtype, shape| {
-        device
-            .alloc_buffer(bytes, dtype, shape)
-            .map_err(anyhow::Error::from)
-    })
 }
 
 fn observe_capacity(device: &MlxDevice) -> QwenSourceMetalCapacityV1 {

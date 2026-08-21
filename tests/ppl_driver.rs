@@ -85,6 +85,10 @@ mod inference {
     //! before any `Qwen35Model` method is called.
 
     pub mod models {
+        #[expect(
+            dead_code,
+            reason = "the early-failure integration harness intentionally mirrors a wider Qwen API"
+        )]
         pub mod qwen35 {
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
             pub enum Qwen35Variant {

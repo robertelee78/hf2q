@@ -1,490 +1,139 @@
-//! Runtime consumption of the canonical dense-Qwen execution configuration.
+//! Qwen3.5 production dispatch boundary.
 //!
-//! Ordinary Qwen execution retains the legacy environment-backed mlx-native
-//! entrypoints. The evidence-bearing copied-GGML candidate enters a scoped
-//! configuration which routes every dense GGML projection through the exact
-//! resolved policy. The private source-BF16 runner instead enters a distinct
-//! fixed graph scope which rejects GGML dispatch. Both scopes are thread-local
-//! because Qwen's Metal cache and forward loop are themselves thread-local;
-//! neither confers runtime or solver authority by itself.
-
-use anyhow::{bail, Result};
-use serde::Serialize;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-
-use mlx_native::metal::foreign_types::ForeignType;
-use mlx_native::ops::quantized_matmul_ggml::{
-    quantized_matmul_ggml as legacy_quantized_matmul_ggml, quantized_matmul_ggml_with_policy,
-    quantized_matmul_ggml_with_policy_and_trace, GgmlQuantizedMatmulParams,
-};
-use mlx_native::{
-    CommandEncoder, GgmlResolvedDispatchTrace, GgmlWorkloadClass, KernelRegistry, MlxBuffer,
-    MlxDevice, MlxError,
-};
-
-use super::execution_config::{Qwen35ExecutionConfiguration, Qwen35GateUpPolicy};
-
-mod source_scope;
-
-#[allow(unused_imports)] // exercised by the cfg(test)-only source parity harness
-pub(super) use source_scope::{
-    source_teacher_graph_policy_sha256, with_source_teacher_graph_scope, SourceTeacherGraphScope,
-};
-
-thread_local! {
-    static ACTIVE_CONFIGURATION: RefCell<Option<ActiveExecutionState>> =
-        const { RefCell::new(None) };
-}
-
-struct TraceCaptureState {
-    weight_slots: BTreeMap<usize, Qwen35TraceWeightSlot>,
-    workload: GgmlWorkloadClass,
-    observations: Vec<Qwen35EncodedDispatchObservation>,
-}
-
-enum ActiveExecutionState {
-    CopiedGgml {
-        configuration: Qwen35ExecutionConfiguration,
-        trace_capture: Option<TraceCaptureState>,
-    },
-    SourceTeacher,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct Qwen35EncodedDispatchObservation {
-    pub operation_id: String,
-    pub executed_tensor_node_ids: Vec<String>,
-    pub trace: GgmlResolvedDispatchTrace,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct Qwen35TraceWeightSlot {
-    pub operation_id: String,
-    pub executed_tensor_node_id: String,
-}
-
-struct ActiveExecutionGuard;
-
-impl Drop for ActiveExecutionGuard {
-    fn drop(&mut self) {
-        ACTIVE_CONFIGURATION.with(|slot| {
-            slot.replace(None);
-        });
-    }
-}
-
-pub(super) fn with_execution_configuration<T>(
-    configuration: &Qwen35ExecutionConfiguration,
-    operation: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    configuration.validate()?;
-    ACTIVE_CONFIGURATION.with(|slot| -> Result<()> {
-        if slot.borrow().is_some() {
-            bail!("nested Qwen evidence execution configuration is not admitted");
-        }
-        slot.replace(Some(ActiveExecutionState::CopiedGgml {
-            configuration: configuration.clone(),
-            trace_capture: None,
-        }));
-        Ok(())
-    })?;
-    let _guard = ActiveExecutionGuard;
-    operation()
-}
-
-fn with_source_teacher_graph_scope_inner<T>(
-    operation: impl FnOnce(&SourceTeacherGraphScope) -> Result<T>,
-) -> Result<T> {
-    ACTIVE_CONFIGURATION.with(|slot| -> Result<()> {
-        if slot.borrow().is_some() {
-            bail!("nested Qwen execution scope is not admitted");
-        }
-        slot.replace(Some(ActiveExecutionState::SourceTeacher));
-        Ok(())
-    })?;
-    let _guard = ActiveExecutionGuard;
-    operation(&SourceTeacherGraphScope {
-        _not_send: std::marker::PhantomData,
-    })
-}
-
-/// True only while the current thread owns the canonical source-teacher
-/// scope. Source-only helpers use this to replace asynchronous commits with
-/// checked waits; ordinary serving retains its existing scheduling.
-pub(in crate::inference::models::qwen35) fn source_teacher_scope_active() -> bool {
-    ACTIVE_CONFIGURATION.with(|slot| {
-        matches!(
-            slot.borrow().as_ref(),
-            Some(ActiveExecutionState::SourceTeacher)
-        )
-    })
-}
-
-pub(super) fn with_execution_trace_capture<T>(
-    configuration: &Qwen35ExecutionConfiguration,
-    weight_slots: BTreeMap<usize, Qwen35TraceWeightSlot>,
-    workload: GgmlWorkloadClass,
-    operation: impl FnOnce() -> Result<T>,
-) -> Result<(T, Vec<Qwen35EncodedDispatchObservation>)> {
-    configuration.validate()?;
-    ACTIVE_CONFIGURATION.with(|slot| -> Result<()> {
-        if slot.borrow().is_some() {
-            bail!("nested Qwen evidence execution configuration is not admitted");
-        }
-        slot.replace(Some(ActiveExecutionState::CopiedGgml {
-            configuration: configuration.clone(),
-            trace_capture: Some(TraceCaptureState {
-                weight_slots,
-                workload,
-                observations: Vec::new(),
-            }),
-        }));
-        Ok(())
-    })?;
-    let guard = ActiveExecutionGuard;
-    let value = operation()?;
-    let state = ACTIVE_CONFIGURATION.with(|slot| slot.replace(None));
-    std::mem::forget(guard);
-    let observations = state
-        .and_then(|state| match state {
-            ActiveExecutionState::CopiedGgml { trace_capture, .. } => trace_capture,
-            ActiveExecutionState::SourceTeacher => None,
-        })
-        .map(|capture| capture.observations)
-        .ok_or_else(|| anyhow::anyhow!("Qwen trace capture state disappeared"))?;
-    Ok((value, observations))
-}
-
-fn buffer_key(buffer: &MlxBuffer) -> usize {
-    buffer.metal_buffer().as_ptr() as usize
-}
-
-fn fused_gate_up_operation_id(
-    capture: &TraceCaptureState,
-    gate: &MlxBuffer,
-    up: &MlxBuffer,
-) -> mlx_native::Result<(String, Vec<String>)> {
-    let gate_slot = capture
-        .weight_slots
-        .get(&buffer_key(gate))
-        .ok_or_else(|| MlxError::InvalidArgument("traced gate weight has no Qwen slot".into()))?;
-    let up_slot = capture
-        .weight_slots
-        .get(&buffer_key(up))
-        .ok_or_else(|| MlxError::InvalidArgument("traced up weight has no Qwen slot".into()))?;
-    let prefix = gate_slot
-        .operation_id
-        .strip_suffix("ffn_gate.weight")
-        .ok_or_else(|| {
-            MlxError::InvalidArgument("traced fused gate slot has the wrong semantic role".into())
-        })?;
-    if up_slot.operation_id != format!("{prefix}ffn_up.weight") {
-        return Err(MlxError::InvalidArgument(
-            "traced fused gate/up weights belong to different Qwen layers".into(),
-        ));
-    }
-    Ok((
-        format!("{prefix}ffn_gate_up_silu"),
-        vec![
-            gate_slot.executed_tensor_node_id.clone(),
-            up_slot.executed_tensor_node_id.clone(),
-        ],
-    ))
-}
-
-fn reject_source_teacher_quantized_dispatch(
-    active: Option<&ActiveExecutionState>,
-    operation: &str,
-) -> mlx_native::Result<()> {
-    if matches!(active, Some(ActiveExecutionState::SourceTeacher)) {
-        Err(MlxError::InvalidArgument(format!(
-            "source-teacher graph scope forbids {operation}"
-        )))
-    } else {
-        Ok(())
-    }
-}
+//! The default binary keeps only the ordinary, environment-backed MLX
+//! dispatch path. ADR-046 evidence configuration, trace capture, and the
+//! source-teacher graph scope are validation substrate and compile with the
+//! tests that exercise them.
 
 #[cfg(test)]
-fn require_quantized_dispatch_for_test(operation: &str) -> mlx_native::Result<()> {
-    ACTIVE_CONFIGURATION
-        .with(|slot| reject_source_teacher_quantized_dispatch(slot.borrow().as_ref(), operation))
-}
+include!("execution_dispatch/evidence.rs");
 
-macro_rules! define_fused_gate_up_wrapper {
-    ($name:ident, $normal:path, $traced:path, $args:path) => {
-        #[allow(clippy::too_many_arguments)]
-        pub(super) fn $name(
-            encoder: &mut CommandEncoder,
-            registry: &mut KernelRegistry,
-            device: &MlxDevice,
-            gate: &MlxBuffer,
-            up: &MlxBuffer,
-            input: &MlxBuffer,
-            output: &MlxBuffer,
-            args: $args,
-        ) -> mlx_native::Result<()> {
-            ACTIVE_CONFIGURATION.with(|slot| {
-                let mut active = slot.borrow_mut();
-                if let Some(ActiveExecutionState::CopiedGgml {
-                    configuration,
-                    trace_capture,
-                }) = active.as_mut()
-                {
-                    if let Some(capture) = trace_capture.as_mut() {
-                        let (operation_id, executed_tensor_node_ids) =
-                            fused_gate_up_operation_id(capture, gate, up)?;
-                        let workload = capture.workload.clone();
-                        let trace = $traced(
-                            encoder,
-                            registry,
-                            device,
-                            gate,
-                            up,
-                            input,
-                            output,
-                            args,
-                            configuration.ggml_routing_policy(),
-                            workload,
-                        )?;
-                        capture.observations.push(Qwen35EncodedDispatchObservation {
-                            operation_id,
-                            executed_tensor_node_ids,
-                            trace,
-                        });
-                        Ok(())
-                    } else {
-                        $normal(encoder, registry, device, gate, up, input, output, args)
-                    }
-                } else {
-                    reject_source_teacher_quantized_dispatch(
-                        active.as_ref(),
-                        "fused quantized gate/up dispatch",
-                    )?;
-                    $normal(encoder, registry, device, gate, up, input, output, args)
-                }
-            })
-        }
+mod production {
+    use mlx_native::ops::quantized_matmul_ggml::{
+        quantized_matmul_ggml as legacy_quantized_matmul_ggml, GgmlQuantizedMatmulParams,
     };
-}
+    use mlx_native::{CommandEncoder, KernelRegistry, MlxBuffer, MlxDevice};
 
-define_fused_gate_up_wrapper!(
-    dispatch_fused_gate_up_silu_q4_k,
-    mlx_native::ops::fused_gate_up_silu_q4_K::dispatch_fused_gate_up_silu_q4_K,
-    mlx_native::ops::fused_gate_up_silu_q4_K::dispatch_fused_gate_up_silu_q4_K_with_trace,
-    mlx_native::ops::fused_gate_up_silu_q4_K::FusedGateUpSiluQ4_KArgs
-);
-define_fused_gate_up_wrapper!(
-    dispatch_fused_gate_up_silu_q5_k,
-    mlx_native::ops::fused_gate_up_silu_q5_K::dispatch_fused_gate_up_silu_q5_K,
-    mlx_native::ops::fused_gate_up_silu_q5_K::dispatch_fused_gate_up_silu_q5_K_with_trace,
-    mlx_native::ops::fused_gate_up_silu_q5_K::FusedGateUpSiluQ5_KArgs
-);
-define_fused_gate_up_wrapper!(
-    dispatch_fused_gate_up_silu_q6_k,
-    mlx_native::ops::fused_gate_up_silu_q6_K::dispatch_fused_gate_up_silu_q6_K,
-    mlx_native::ops::fused_gate_up_silu_q6_K::dispatch_fused_gate_up_silu_q6_K_with_trace,
-    mlx_native::ops::fused_gate_up_silu_q6_K::FusedGateUpSiluQ6_KArgs
-);
-define_fused_gate_up_wrapper!(
-    dispatch_fused_gate_up_silu_q8_0,
-    mlx_native::ops::fused_gate_up_silu_q8_0::dispatch_fused_gate_up_silu_q8_0,
-    mlx_native::ops::fused_gate_up_silu_q8_0::dispatch_fused_gate_up_silu_q8_0_with_trace,
-    mlx_native::ops::fused_gate_up_silu_q8_0::FusedGateUpSiluQ8_0Args
-);
-define_fused_gate_up_wrapper!(
-    dispatch_fused_gate_up_silu_iq4_nl,
-    mlx_native::ops::fused_gate_up_silu_iq4_nl::dispatch_fused_gate_up_silu_iq4_nl,
-    mlx_native::ops::fused_gate_up_silu_iq4_nl::dispatch_fused_gate_up_silu_iq4_nl_with_trace,
-    mlx_native::ops::fused_gate_up_silu_iq4_nl::FusedGateUpSiluIq4NlArgs
-);
-
-/// Dense GGML dispatch used by every admitted Qwen text projection.
-///
-/// Under an evidence configuration this consumes the exact policy resolved at
-/// load time.  Outside that scope it delegates to the legacy entrypoint and
-/// therefore preserves existing serving behavior.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn quantized_matmul_ggml(
-    encoder: &mut CommandEncoder,
-    registry: &mut KernelRegistry,
-    device: &MlxDevice,
-    input: &MlxBuffer,
-    weight: &MlxBuffer,
-    output: &MlxBuffer,
-    params: &GgmlQuantizedMatmulParams,
-) -> mlx_native::Result<()> {
-    ACTIVE_CONFIGURATION.with(|slot| {
-        let mut active = slot.borrow_mut();
-        if let Some(ActiveExecutionState::CopiedGgml {
-            configuration,
-            trace_capture,
-        }) = active.as_mut()
-        {
-            if let Some(capture) = trace_capture.as_mut() {
-                let weight_slot = capture
-                    .weight_slots
-                    .get(&buffer_key(weight))
-                    .cloned()
-                    .ok_or_else(|| {
-                        MlxError::InvalidArgument(
-                            "Qwen traced GGML weight is absent from the executed catalog".into(),
-                        )
-                    })?;
-                let trace = quantized_matmul_ggml_with_policy_and_trace(
-                    encoder,
-                    registry,
-                    device,
-                    input,
-                    weight,
-                    output,
-                    params,
-                    configuration.ggml_routing_policy(),
-                    capture.workload.clone(),
-                )?;
-                capture.observations.push(Qwen35EncodedDispatchObservation {
-                    operation_id: weight_slot.operation_id,
-                    executed_tensor_node_ids: vec![weight_slot.executed_tensor_node_id],
-                    trace,
-                });
-                Ok(())
-            } else {
-                quantized_matmul_ggml_with_policy(
-                    encoder,
-                    registry,
-                    device,
-                    input,
-                    weight,
-                    output,
-                    params,
-                    configuration.ggml_routing_policy(),
-                )
+    macro_rules! define_fused_gate_up_wrapper {
+        ($name:ident, $normal:path, $args:path) => {
+            #[allow(clippy::too_many_arguments)]
+            pub(in crate::inference::models::qwen35) fn $name(
+                encoder: &mut CommandEncoder,
+                registry: &mut KernelRegistry,
+                device: &MlxDevice,
+                gate: &MlxBuffer,
+                up: &MlxBuffer,
+                input: &MlxBuffer,
+                output: &MlxBuffer,
+                args: $args,
+            ) -> mlx_native::Result<()> {
+                $normal(encoder, registry, device, gate, up, input, output, args)
             }
-        } else {
-            reject_source_teacher_quantized_dispatch(active.as_ref(), "GGML projection dispatch")?;
-            legacy_quantized_matmul_ggml(encoder, registry, device, input, weight, output, params)
-        }
-    })
-}
+        };
+    }
 
-pub(super) fn dense_gate_up_fusion_enabled() -> bool {
-    ACTIVE_CONFIGURATION.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|active| match active {
-                ActiveExecutionState::CopiedGgml { configuration, .. } => {
-                    configuration.dense_ffn_gate_up()
-                        == Qwen35GateUpPolicy::PreferFusedWhenSupported
-                }
-                ActiveExecutionState::SourceTeacher => false,
-            })
-            .unwrap_or_else(|| {
-                !matches!(
-                    std::env::var("HF2Q_FUSED_GATE_UP_SILU").as_deref(),
-                    Ok("0") | Ok("false") | Ok("off")
-                )
-            })
-    })
-}
+    define_fused_gate_up_wrapper!(
+        dispatch_fused_gate_up_silu_q4_k,
+        mlx_native::ops::fused_gate_up_silu_q4_K::dispatch_fused_gate_up_silu_q4_K,
+        mlx_native::ops::fused_gate_up_silu_q4_K::FusedGateUpSiluQ4_KArgs
+    );
+    define_fused_gate_up_wrapper!(
+        dispatch_fused_gate_up_silu_q5_k,
+        mlx_native::ops::fused_gate_up_silu_q5_K::dispatch_fused_gate_up_silu_q5_K,
+        mlx_native::ops::fused_gate_up_silu_q5_K::FusedGateUpSiluQ5_KArgs
+    );
+    define_fused_gate_up_wrapper!(
+        dispatch_fused_gate_up_silu_q6_k,
+        mlx_native::ops::fused_gate_up_silu_q6_K::dispatch_fused_gate_up_silu_q6_K,
+        mlx_native::ops::fused_gate_up_silu_q6_K::FusedGateUpSiluQ6_KArgs
+    );
+    define_fused_gate_up_wrapper!(
+        dispatch_fused_gate_up_silu_q8_0,
+        mlx_native::ops::fused_gate_up_silu_q8_0::dispatch_fused_gate_up_silu_q8_0,
+        mlx_native::ops::fused_gate_up_silu_q8_0::FusedGateUpSiluQ8_0Args
+    );
+    define_fused_gate_up_wrapper!(
+        dispatch_fused_gate_up_silu_iq4_nl,
+        mlx_native::ops::fused_gate_up_silu_iq4_nl::dispatch_fused_gate_up_silu_iq4_nl,
+        mlx_native::ops::fused_gate_up_silu_iq4_nl::FusedGateUpSiluIq4NlArgs
+    );
 
-pub(super) fn fused_qkvg_enabled() -> bool {
-    ACTIVE_CONFIGURATION.with(|slot| {
-        if slot.borrow().is_some() {
-            false
-        } else {
-            std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
-        }
-    })
-}
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::inference::models::qwen35) fn quantized_matmul_ggml(
+        encoder: &mut CommandEncoder,
+        registry: &mut KernelRegistry,
+        device: &MlxDevice,
+        input: &MlxBuffer,
+        weight: &MlxBuffer,
+        output: &MlxBuffer,
+        params: &GgmlQuantizedMatmulParams,
+    ) -> mlx_native::Result<()> {
+        legacy_quantized_matmul_ggml(encoder, registry, device, input, weight, output, params)
+    }
 
-pub(super) fn dense_q_arena_reset_enabled() -> bool {
-    ACTIVE_CONFIGURATION.with(|slot| {
-        if slot.borrow().is_some() {
-            true
-        } else {
-            std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0")
-        }
-    })
-}
+    pub(in crate::inference::models::qwen35) fn dense_gate_up_fusion_enabled() -> bool {
+        !matches!(
+            std::env::var("HF2Q_FUSED_GATE_UP_SILU").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    }
 
-pub(super) fn dense_q_split_profile_enabled() -> bool {
-    ACTIVE_CONFIGURATION.with(|slot| {
-        if slot.borrow().is_some() {
-            false
-        } else {
-            std::env::var("HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS").as_deref() == Ok("1")
-        }
-    })
-}
+    pub(in crate::inference::models::qwen35) fn fused_qkvg_enabled() -> bool {
+        std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
+    }
 
-pub(super) fn chunk_scan_prefill_enabled(legacy_value: bool) -> bool {
-    ACTIVE_CONFIGURATION.with(|slot| {
-        if slot.borrow().is_some() {
-            false
-        } else {
-            legacy_value
-        }
-    })
-}
+    pub(in crate::inference::models::qwen35) fn source_teacher_scope_active() -> bool {
+        false
+    }
 
-pub(super) fn vec_small_path_enabled() -> bool {
-    ACTIVE_CONFIGURATION.with(|slot| {
-        if slot.borrow().is_some() {
-            true
-        } else {
-            std::env::var("HF2Q_NO_VEC_SMALL_PATH").as_deref() != Ok("1")
-        }
-    })
-}
+    pub(in crate::inference::models::qwen35) fn dense_q_arena_reset_enabled() -> bool {
+        std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() != Ok("0")
+    }
 
-pub(super) fn fused_stage_ab_vec_enabled() -> bool {
-    ACTIVE_CONFIGURATION.with(|slot| {
-        if slot.borrow().is_some() {
-            true
-        } else {
-            std::env::var("HF2Q_NO_FUSED_STAGE_AB_VEC").as_deref() != Ok("1")
-        }
-    })
+    pub(in crate::inference::models::qwen35) fn dense_q_split_profile_enabled() -> bool {
+        std::env::var("HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS").as_deref() == Ok("1")
+    }
+
+    pub(in crate::inference::models::qwen35) fn chunk_scan_prefill_enabled(
+        legacy_value: bool,
+    ) -> bool {
+        legacy_value
+    }
+
+    pub(in crate::inference::models::qwen35) fn vec_small_path_enabled() -> bool {
+        std::env::var("HF2Q_NO_VEC_SMALL_PATH").as_deref() != Ok("1")
+    }
+
+    pub(in crate::inference::models::qwen35) fn fused_stage_ab_vec_enabled() -> bool {
+        std::env::var("HF2Q_NO_FUSED_STAGE_AB_VEC").as_deref() != Ok("1")
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use mlx_native::GgmlRoutingPolicy;
+mod production_boundary_tests {
+    use super::production;
 
     #[test]
-    fn scoped_graph_switches_are_canonical_and_environment_independent() {
-        let configuration = Qwen35ExecutionConfiguration::from_resolved(
-            GgmlRoutingPolicy::default(),
-            Qwen35GateUpPolicy::Separate,
-        )
-        .unwrap();
-        with_execution_configuration(&configuration, || {
-            assert!(!dense_gate_up_fusion_enabled());
-            assert!(!fused_qkvg_enabled());
-            assert!(dense_q_arena_reset_enabled());
-            assert!(!dense_q_split_profile_enabled());
-            assert!(!chunk_scan_prefill_enabled(true));
-            assert!(vec_small_path_enabled());
-            assert!(fused_stage_ab_vec_enabled());
-            Ok(())
-        })
-        .unwrap();
-    }
+    fn release_dispatch_surface_is_complete_and_keeps_plain_chunk_policy() {
+        let _ = production::dispatch_fused_gate_up_silu_q4_k;
+        let _ = production::dispatch_fused_gate_up_silu_q5_k;
+        let _ = production::dispatch_fused_gate_up_silu_q6_k;
+        let _ = production::dispatch_fused_gate_up_silu_q8_0;
+        let _ = production::dispatch_fused_gate_up_silu_iq4_nl;
+        let _ = production::quantized_matmul_ggml;
+        let _ = production::dense_gate_up_fusion_enabled;
+        let _ = production::fused_qkvg_enabled;
+        let _ = production::source_teacher_scope_active;
+        let _ = production::dense_q_arena_reset_enabled;
+        let _ = production::dense_q_split_profile_enabled;
+        let _ = production::vec_small_path_enabled;
+        let _ = production::fused_stage_ab_vec_enabled;
 
-    #[test]
-    fn scope_is_not_reentrant_and_drains_after_error() {
-        let configuration = Qwen35ExecutionConfiguration::from_resolved(
-            GgmlRoutingPolicy::default(),
-            Qwen35GateUpPolicy::PreferFusedWhenSupported,
-        )
-        .unwrap();
-        let error: Result<()> = with_execution_configuration(&configuration, || {
-            assert!(with_execution_configuration(&configuration, || Ok(())).is_err());
-            bail!("synthetic operation failure")
-        });
-        assert!(error.is_err());
-        with_execution_configuration(&configuration, || Ok(())).unwrap();
+        assert!(production::chunk_scan_prefill_enabled(true));
+        assert!(!production::chunk_scan_prefill_enabled(false));
+        assert!(!production::source_teacher_scope_active());
     }
 }
+
+#[cfg(not(test))]
+pub(super) use production::*;

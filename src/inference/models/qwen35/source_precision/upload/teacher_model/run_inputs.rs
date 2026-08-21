@@ -38,8 +38,6 @@ use super::{
 mod tests;
 mod worker;
 
-pub(crate) use worker::{run_qwen35_source_teacher, VerifiedQwen35SourceTeacherTargetV1};
-
 const RUN_INPUTS_SCHEMA_VERSION: u32 = 1;
 const RUN_INPUTS_PROFILE: &str = "dense_qwen35_source_teacher_ordered_run_inputs_v1";
 const CAPACITY_RECHECK_PROFILE: &str = "dense_qwen35_post_weight_capacity_recheck_v1";

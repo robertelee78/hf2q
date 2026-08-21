@@ -49,12 +49,12 @@ pub use mlx_native::ops::gated_delta_net::cpu_reference_f32 as gated_delta_net_c
 use super::gqa_q2_policy::use_gqa_q2_tq_sdpa;
 use super::{Qwen35Config, Qwen35LayerKind};
 
+#[cfg(test)]
 mod source_teacher;
 
-#[allow(unused_imports)] // consumed by the source-teacher runner slice
+#[cfg(test)]
 pub(super) use source_teacher::{
     plan_qwen35_base_text_cache, prepare_qwen35_base_text_cache, PreparedQwen35BaseTextCacheV1,
-    Qwen35BaseTextCachePlanV1, Qwen35BaseTextCacheReceiptV1,
 };
 
 /// Per-full-attention-layer KV slot.

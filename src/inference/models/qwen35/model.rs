@@ -124,14 +124,15 @@ pub struct Qwen35Model {
     pub mtp: Option<MtpWeights>,
     /// Present only on the evidence-bearing copied-load path. Ordinary Qwen
     /// loading remains behaviorally unchanged until it opts into that path.
+    #[cfg(test)]
     pub(super) loaded_candidate_identity: Option<Qwen35LoadedCandidateIdentity>,
 }
 
+#[cfg(test)]
 pub(super) struct Qwen35LoadedCandidateIdentity {
     configuration: std::sync::Arc<super::execution_config::Qwen35ExecutionConfiguration>,
     conversion_receipt_sha256: String,
-    loaded_catalog:
-        std::sync::Arc<super::execution_observation::VerifiedLoadedTensorCatalog>,
+    loaded_catalog: std::sync::Arc<super::execution_observation::VerifiedLoadedTensorCatalog>,
 }
 
 impl Qwen35Model {
@@ -172,6 +173,7 @@ impl Qwen35Model {
             output_weight: vec![0.0f32; h * vocab],
             output_norm: vec![1.0f32; h],
             mtp: None,
+            #[cfg(test)]
             loaded_candidate_identity: None,
             cfg,
         }
@@ -181,12 +183,12 @@ impl Qwen35Model {
     /// reconciled the same artifact inode. This is not runtime authority: the
     /// stored policy is not authoritative until every admitted dispatch
     /// consumes it and produces a typed trace.
+    #[cfg(test)]
     pub(super) fn bind_loaded_candidate_identity(
         &mut self,
         reconciled: super::execution_evidence::ReconciledLoadedCandidateIdentity,
     ) -> Result<()> {
-        let (configuration, conversion_receipt_sha256, loaded_catalog) =
-            reconciled.into_parts();
+        let (configuration, conversion_receipt_sha256, loaded_catalog) = reconciled.into_parts();
         configuration.validate()?;
         if conversion_receipt_sha256.len() != 64
             || !conversion_receipt_sha256
@@ -206,6 +208,7 @@ impl Qwen35Model {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn loaded_candidate_cache_identity(&self) -> Option<(&str, &str, &str)> {
         let identity = self.loaded_candidate_identity.as_ref()?;
         let configuration = identity.configuration.as_ref();
@@ -216,6 +219,7 @@ impl Qwen35Model {
         ))
     }
 
+    #[cfg(test)]
     pub(super) fn loaded_candidate_tensor_catalog(
         &self,
     ) -> Option<&super::execution_observation::VerifiedLoadedTensorCatalog> {
@@ -414,6 +418,7 @@ impl Qwen35Model {
             output_weight,
             output_norm,
             mtp,
+            #[cfg(test)]
             loaded_candidate_identity: None,
         })
     }
