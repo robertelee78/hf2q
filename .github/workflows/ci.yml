@@ -132,18 +132,9 @@ jobs:
                 )]
             | length == 0
           ' <<<"$direct_metadata"
-          for removed in \
-            src/distribution/update_auth \
-            src/distribution/update_transport \
-            src/distribution/install_state \
-            src/distribution/prepared_release \
-            src/distribution/schema \
-            tests/adr045_tuf_spike
-          do
-            test ! -e "$removed"
-          done
           test "$(grep -Fhc 'mod standalone;' src/distribution/mod.rs)" = 1
           test "$(find src/distribution -type f | wc -l | tr -d ' ')" = 4
+          test -z "$(find tests/adr045_tuf_spike -type f -print -quit 2>/dev/null || true)"
           unexpected_setup_authority="$(
             grep -nE \
               'hf_hub|reqwest|hyper|tokio::net|std::net|std::process|Command::new|crate::(models|convert|quantize|serve)|calibration|remove_dir|remove_file' \
