@@ -1419,7 +1419,8 @@ inference fallback.
 The hidden `source-teacher-reference` command no-follow opens bounded regular
 files, reauthenticates the official recipe and three-way corpus, rebuilds the
 opaque plan, independently reconstructs both structural target receipts, and
-reports per-row maximum absolute error, stable-F64
+binds its exact 40-hex hf2q comparator Git commit before reporting per-row
+maximum absolute error, stable-F64
 `KL(reference || hf2q)`, and top-1 agreement, plus aggregate mean/max/p50/p95
 KL and exact 32-token trajectory divergence. The comparison receipt is
 self-hashed and explicitly records `thresholds_predeclared=false` and false

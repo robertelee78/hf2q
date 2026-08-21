@@ -8,7 +8,7 @@ use crate::core::provenance::tensor_execution::ArtifactEvidence;
 use crate::intelligence::calibration::VerifiedCalibrationPredictionPlan;
 
 use super::{
-    is_sha256, open_external_reference_target, open_native_reference_target,
+    is_git_commit, is_sha256, open_external_reference_target, open_native_reference_target,
     ExactTeacherExternalReferenceEvidenceV1, ExactTeacherReferenceInputV1,
     ExternalReferenceImplementationV1,
 };
@@ -60,6 +60,7 @@ pub(crate) struct ExactTeacherReferenceTrajectoryComparisonV1 {
 pub(crate) struct ExactTeacherReferenceComparisonReceiptV1 {
     pub(crate) schema_version: u32,
     pub(crate) profile: &'static str,
+    pub(crate) comparator_git_commit: String,
     pub(crate) reference_input_sha256: String,
     pub(crate) prediction_plan_sha256: String,
     pub(crate) native_completion_receipt_sha256: String,
@@ -86,6 +87,7 @@ pub(crate) struct ExactTeacherReferenceComparisonReceiptV1 {
 struct ComparisonHashView<'a> {
     schema_version: u32,
     profile: &'static str,
+    comparator_git_commit: &'a str,
     reference_input_sha256: &'a str,
     prediction_plan_sha256: &'a str,
     native_completion_receipt_sha256: &'a str,
@@ -114,12 +116,13 @@ pub(crate) fn compare_exact_teacher_reference_targets(
     native_target_path: &Path,
     native_receipt: ExactTeacherTargetReceipt,
     native_completion_receipt_sha256: String,
+    comparator_git_commit: String,
     external_target_path: &Path,
     external_evidence: &ExactTeacherExternalReferenceEvidenceV1,
 ) -> Result<ExactTeacherReferenceComparisonReceiptV1, ExactTeacherTargetError> {
-    if !is_sha256(&native_completion_receipt_sha256) {
+    if !is_sha256(&native_completion_receipt_sha256) || !is_git_commit(&comparator_git_commit) {
         return Err(ExactTeacherTargetError::Invalid(
-            "native completion receipt SHA-256 is invalid".into(),
+            "native completion or comparator identity is invalid".into(),
         ));
     }
     let mut native = open_native_reference_target(native_target_path, input, plan, native_receipt)?;
@@ -194,6 +197,7 @@ pub(crate) fn compare_exact_teacher_reference_targets(
     let mut receipt = ExactTeacherReferenceComparisonReceiptV1 {
         schema_version: COMPARISON_SCHEMA_VERSION,
         profile: COMPARISON_PROFILE,
+        comparator_git_commit,
         reference_input_sha256: input.reference_input_sha256.clone(),
         prediction_plan_sha256: input.prediction_plan.manifest_sha256.clone(),
         native_completion_receipt_sha256,
@@ -354,6 +358,7 @@ fn comparison_sha256(
     let view = ComparisonHashView {
         schema_version: receipt.schema_version,
         profile: receipt.profile,
+        comparator_git_commit: &receipt.comparator_git_commit,
         reference_input_sha256: &receipt.reference_input_sha256,
         prediction_plan_sha256: &receipt.prediction_plan_sha256,
         native_completion_receipt_sha256: &receipt.native_completion_receipt_sha256,
