@@ -1740,6 +1740,7 @@ mod tests {
             quant_type: Some("Q4_K".to_string()),
             load_duration: Duration::from_millis(7),
             provenance: Provenance::External,
+            expected_projector_sha256: None,
             prompt_cache: HybridPromptCache::new(),
             lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),
             kv_metrics_sink: None,

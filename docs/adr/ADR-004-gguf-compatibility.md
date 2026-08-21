@@ -3,8 +3,8 @@
 **Status:** Implemented  
 **Date:** 2026-04-09  
 **Updated:** 2026-08-21 — restored the originally accepted automatic
-multimodal-pair contract after implementation drift left projector conversion
-behind an opt-in replacement mode.
+multimodal-pair contract and made paired publication crash-recoverable with
+runtime generation/digest enforcement.
 **Decision Makers:** Robert, Claude
 
 ## Context
@@ -43,19 +43,38 @@ are present. One convert command, two files. `--text-only` is the explicit
 opt-out; the existing `--mmproj` spelling remains projector-only repair mode.
 
 The projector is staged first and its exact SHA-256 is written into the text
-GGUF as `hf2q.mmproj_sha256`. The projector is promoted first and the bound
-text GGUF second. Two filesystem renames cannot be made jointly atomic, so the
-text artifact is the fail-closed commit marker: interruption can leave a
-complete but inert orphan projector, never a new text artifact that claims a
-missing or different projector. Serving already rejects a supplied projector
-whose digest differs from the text contract. Both remote-source receipts bind
-the same resolved revision, source bundle, and converter; projector receipts
-use `f16-mmproj` regardless of the text quantization.
+GGUF as `hf2q.mmproj_sha256`. Both GGUFs carry one UUID
+`hf2q.pair_generation` and schema marker. Publication takes an exclusive
+sibling lock, persists a same-directory recovery journal, moves every previous
+member to a private same-filesystem backup, then promotes the projector,
+receipts, and bound text GGUF in that order. The text rename is the sole commit
+marker. Before it, an error rolls the complete old pair back; after it,
+recovery cleans forward to the complete new pair. Regular files receive
+`F_FULLFSYNC` on macOS; directories receive `fsync` after each rename, with
+the destination directory synchronized before the source directory for every
+cross-directory move.
+Terminal cleanup removes and synchronizes the journal before deleting private
+staging/backups, so interruption can leave only an inert private orphan—not a
+recovery journal whose required state has already disappeared.
 
-`vision_config` without matching source tensors, a missing Qwen processor
-config, an unsupported projector family, or colliding output paths fails
-before either destination is written. A multimodal dry run names both planned
-outputs but creates neither.
+Serving holds the shared side of the same lock from before opening the text
+GGUF through projector validation/load. On read-only mounts or cross-user
+artifact stores where the private sibling lock is unavailable, readers lock
+the current text GGUF inode instead; writers always take that inode
+exclusively as well as the stable sibling lock before mutation. The staged new
+text inode is exclusively locked before its commit-marker rename as well.
+Generation-marked members must share the schema, UUID, and directory, and the
+projector bytes must match the digest embedded in the text GGUF. The digest
+check also applies to older local pairs that predate remote provenance
+receipts; provenance classification cannot silently discard an embedded
+projector binding. Both remote-source receipts bind the same resolved
+revision, source bundle, and converter; projector receipts use `f16-mmproj`
+regardless of the text quantization.
+
+`vision_config` without matching source tensors, vision tensors without
+`vision_config`, a missing Qwen processor config, an unsupported projector
+family, or colliding output paths fails before either destination is written.
+A multimodal dry run names both planned outputs but creates neither.
 
 ### 5. Tokenizer Embedding
 

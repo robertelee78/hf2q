@@ -62,6 +62,9 @@ use crate::convert::tokenizer::TokenizerError;
 use crate::convert::{
     build_tokenizer_metadata, ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError,
 };
+use crate::core::paired_artifact::{
+    KEY_PAIR_GENERATION, KEY_PAIR_SCHEMA_VERSION, PAIR_METADATA_SCHEMA_VERSION,
+};
 use crate::core::provenance::{KEY_MMPROJ_SHA256, KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
 use crate::input::integrity::VerifiedSourceManifest;
 use crate::quantize::ggml_quants::apex::{
@@ -73,6 +76,8 @@ use crate::quantize::ggml_quants::{ArchName, GgufFtype};
 
 #[path = "cli_driver/paired.rs"]
 mod paired;
+#[path = "cli_driver/paired_transaction.rs"]
+mod paired_transaction;
 #[path = "cli_driver/stored_evidence.rs"]
 mod stored_evidence;
 #[cfg(test)]
@@ -475,10 +480,16 @@ struct StoredEvidenceRequest {
     converter_git_commit: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct PairBinding<'a> {
+    projector_sha256: Option<&'a str>,
+    generation: Option<&'a str>,
+}
+
 fn run_convert_internal(
     args: ConvertArgs,
     evidence_request: Option<StoredEvidenceRequest>,
-    bound_projector_sha256: Option<&str>,
+    pair_binding: PairBinding<'_>,
 ) -> Result<Option<VerifiedSourceToStoredConversion>, ConvertError> {
     // ----- 1. Open source (mmap, metadata-only) ---------------------------
     // Per ADR-033 §"Open Issues / Real-Model Findings" 2026-05-18: the
@@ -542,12 +553,13 @@ fn run_convert_internal(
         }
 
         clear_stale_conversion_receipts_before_replacement(&args.output)?;
-        crate::models::vit::convert_vision_tower_to_path_with_source(
+        crate::models::vit::convert_vision_tower_to_path_with_source_and_pair(
             &args.hf_dir,
             &args.output,
             args.remote_source
                 .as_ref()
                 .map(RemoteConversionSource::source_sha256),
+            pair_binding.generation,
         )?;
 
         if let Some(remote) = args.remote_source.as_ref() {
@@ -892,10 +904,20 @@ fn run_convert_internal(
             MetaValue::String(remote.source_sha256().to_owned()),
         );
     }
-    if let Some(projector_sha256) = bound_projector_sha256 {
+    if let Some(projector_sha256) = pair_binding.projector_sha256 {
         orch.add_metadata(
             KEY_MMPROJ_SHA256.to_string(),
             MetaValue::String(projector_sha256.to_owned()),
+        );
+    }
+    if let Some(generation) = pair_binding.generation {
+        orch.add_metadata(
+            KEY_PAIR_SCHEMA_VERSION.to_string(),
+            MetaValue::String(PAIR_METADATA_SCHEMA_VERSION.to_owned()),
+        );
+        orch.add_metadata(
+            KEY_PAIR_GENERATION.to_string(),
+            MetaValue::String(generation.to_owned()),
         );
     }
 

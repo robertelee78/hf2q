@@ -2311,6 +2311,9 @@ pub struct GemmaLoadedModel {
     /// legacy `(repo, quant)` key for foreign GGUFs (`Provenance::External`).
     /// Read once at spawn; not consulted afterwards.
     pub provenance: crate::core::provenance::Provenance,
+    /// Text-GGUF projector binding captured even when source provenance is
+    /// absent, so a local artifact cannot silently accept another projector.
+    pub expected_projector_sha256: Option<String>,
 
     /// **ADR-040 Phase C iter-2c (C2c)** — multi-seq KV scaffolds
     /// provisioned at `spawn_with_mode(SlotAware { max_slots: N })` time
@@ -2523,13 +2526,9 @@ impl LoadedModel {
     fn vision_consumer_contract(&self) -> Option<VisionConsumerContract> {
         use crate::inference::vision::mmproj::ArchProfile;
 
-        let (source_sha256, expected_projector_sha256) = match self.provenance() {
-            crate::core::provenance::Provenance::Hf2q {
-                source_sha256,
-                mmproj_sha256,
-                ..
-            } => (Some(source_sha256), mmproj_sha256),
-            crate::core::provenance::Provenance::External => (None, None),
+        let source_sha256 = match self.provenance() {
+            crate::core::provenance::Provenance::Hf2q { source_sha256, .. } => Some(source_sha256),
+            crate::core::provenance::Provenance::External => None,
         };
         match self {
             LoadedModel::Gemma(g) => Some(VisionConsumerContract {
@@ -2537,7 +2536,7 @@ impl LoadedModel {
                 output_width: g.weights.hidden_size as u32,
                 deepstack_output_count: Some(0),
                 source_sha256,
-                expected_projector_sha256,
+                expected_projector_sha256: g.expected_projector_sha256.clone(),
             }),
             // Producer-neutral Qwen binding. Fresh hf2q artifacts carry the
             // explicit profile metadata; compatible external GGUFs are
@@ -2551,7 +2550,7 @@ impl LoadedModel {
                     output_width: q.hidden_size as u32,
                     deepstack_output_count: q.vision_deepstack_output_count,
                     source_sha256,
-                    expected_projector_sha256,
+                    expected_projector_sha256: q.expected_projector_sha256.clone(),
                 })
             }
             LoadedModel::Qwen35(_) | LoadedModel::Qwen3VlText(_) | LoadedModel::Deepseek4(_) => {
@@ -3362,6 +3361,8 @@ impl GemmaLoadedModel {
         // keys) yield `Provenance::External` and the spiller falls back
         // to the legacy `(repo, quant)` namespace.
         let provenance = crate::core::provenance::detect(&gguf);
+        let expected_projector_sha256 = crate::core::provenance::projector_sha256(&gguf)
+            .map_err(|error| anyhow::anyhow!("Gemma projector binding: {error}"))?;
 
         // Extract model id: prefer general.name, fall back to file stem.
         let model_id = gguf
@@ -3601,6 +3602,7 @@ impl GemmaLoadedModel {
             // being `Some`.
             kv_metrics_sink: None,
             provenance,
+            expected_projector_sha256,
             // ADR-040 Phase C iter-2c (C2c): None until `spawn_with_mode(
             // SlotAware { .. })` provisions per-layer multi-seq KV
             // scaffolds. SerialFifo path NEVER populates this field —
@@ -33468,7 +33470,8 @@ assistant:
             quant_type: Some("Q4_0".to_string()),
             load_duration: Duration::from_millis(7),
             provenance: crate::core::provenance::Provenance::External,
-            vision_projector_profile: None,
+            expected_projector_sha256: Some("a".repeat(64)),
+            vision_projector_profile: Some("qwen3vl_siglip".to_string()),
             vision_deepstack_output_count: None,
             vision_special_tokens_present: false,
             prompt_cache: super::super::engine_qwen35::HybridPromptCache::new(),
@@ -33497,6 +33500,15 @@ assistant:
         assert_eq!(qwen.eos_token_ids(), &[151645]);
         assert_eq!(qwen.chat_template(), "qwen-template");
         assert_eq!(qwen.load_duration(), Duration::from_millis(7));
+        let vision_contract = qwen
+            .vision_consumer_contract()
+            .expect("multimodal Qwen fixture must expose its consumer contract");
+        assert_eq!(vision_contract.source_sha256, None);
+        assert_eq!(
+            vision_contract.expected_projector_sha256,
+            Some("a".repeat(64)),
+            "local projector binding must survive External provenance"
+        );
         assert!(
             qwen.prompt_cache().is_none(),
             "Qwen35 variant has no prompt_cache in iter-215 MVP"

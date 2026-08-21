@@ -121,6 +121,10 @@ pub struct Qwen35LoadedModel {
     /// `LoadedModel::provenance()` surface; Qwen35 KV-spill remains
     /// descriptor-pending because the cache is hybrid.
     pub provenance: Provenance,
+    /// Text-GGUF projector binding captured independently of remote-source
+    /// provenance so local copies and request-time projector swaps remain
+    /// fail-closed.
+    pub expected_projector_sha256: Option<String>,
     /// Exact projector profile emitted only for multimodal
     /// ConditionalGeneration artifacts. Text-only artifacts keep this
     /// unset and cannot consume a process projector.
@@ -270,6 +274,8 @@ impl Qwen35LoadedModel {
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
         let provenance = provenance::detect(&gguf);
+        let expected_projector_sha256 = provenance::projector_sha256(&gguf)
+            .map_err(|error| anyhow::anyhow!("Qwen projector binding: {error}"))?;
         let vision_projector_profile = gguf
             .metadata_string("hf2q.vision.projector_profile")
             .map(str::to_owned);
@@ -466,6 +472,7 @@ impl Qwen35LoadedModel {
             quant_type,
             load_duration,
             provenance,
+            expected_projector_sha256,
             vision_projector_profile,
             vision_deepstack_output_count,
             vision_special_tokens_present,
@@ -10821,6 +10828,7 @@ mod tests {
             quant_type: Some("Q4_K".to_string()),
             load_duration: std::time::Duration::from_millis(1),
             provenance: crate::core::provenance::Provenance::External,
+            expected_projector_sha256: None,
             vision_projector_profile: None,
             vision_deepstack_output_count: None,
             vision_special_tokens_present: false,

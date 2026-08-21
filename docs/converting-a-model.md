@@ -154,11 +154,23 @@ as `<output-stem>-mmproj.gguf`. `--mmproj-output <PATH>` selects a different
 name in the same directory. Each remote-source artifact has its own receipt,
 and the text GGUF binds the exact projector digest.
 
+Pair publication is one recoverable transaction. hf2q stages and fully syncs
+both artifacts, assigns the same generation UUID to their GGUF metadata, and
+publishes the projector and receipts before publishing the text GGUF as the
+commit marker. A private sibling journal and backup preserve the entire old
+pair until that commit. An ordinary error rolls back immediately; after a
+process or machine interruption, the next conversion recovers the journal
+before starting. Serving takes the matching shared lock and rejects mixed
+generations or projector bytes that do not match the digest embedded in the
+text artifact. Older locally converted pairs keep working, but any embedded
+projector digest is still enforced even when no remote-source receipt exists.
+
 `--text-only` explicitly suppresses the companion projector. `--mmproj`
 retains the projector-only expert path for repairing or replacing a sidecar;
 it does not mean the ordinary multimodal workflow needs two invocations.
-Unsupported projector families and incomplete multimodal sources fail before
-writing rather than silently dropping vision.
+Unsupported projector families and incomplete multimodal sources—including
+vision tensors without a usable `vision_config`—fail before writing rather
+than silently dropping vision.
 
 `--dry-run` creates no GGUF. For a multimodal source it reports both planned
 paths while the detailed tensor/type/byte plan remains the text plan. A remote
