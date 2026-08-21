@@ -14,8 +14,8 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-export MODEL="${MODEL:-/opt/hf2q/models/qwen3.8/Qwen3.8-27B-Q4_K_M.gguf}"
-export MMPROJ="${MMPROJ:-/opt/hf2q/models/qwen3.8/Qwen3.8-27B-mmproj-F16.gguf}"
+export MODEL="${MODEL:-/opt/hf2q/models/qwen3.8/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf}"
+export MMPROJ="${MMPROJ:-${MODEL%.gguf}-mmproj.gguf}"
 export VISION_MODE="${QWEN38_VISION:-required}"
 export HF2Q_QWEN_SPECULATION="${QWEN38_SPECULATION:-auto}"
 # Qwen3.8 K=3 verifies four target positions at once. The native qL4

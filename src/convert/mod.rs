@@ -32,7 +32,7 @@ pub mod source_reader;
 pub mod tensor_lineage;
 pub mod tokenizer;
 
-pub use cli_driver::{ConvertArgs, ConvertError, run_convert};
+pub use cli_driver::{ConvertArgs, ConvertError, ConvertMode, run_convert};
 pub use orchestrator::{
     ConvertOrchestrator, OrchestratorError, PlanEntry, PlannedSizeSummary, PlannedTypeSize,
     StreamingWriter,

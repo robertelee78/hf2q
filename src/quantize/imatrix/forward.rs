@@ -499,9 +499,9 @@ pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<super::ImatrixDa
         // through). `imatrix_n_ctx` is consulted ONLY when
         // `imatrix_corpus` is set, so None here is structurally safe.
         imatrix_n_ctx: None,
-        // The inner convert is always text-decoder; mmproj sidecar
-        // export is operator-initiated via the top-level CLI flag.
-        mmproj: false,
+        // The inner convert is always text-decoder; automatic paired
+        // conversion belongs only to the top-level operator command.
+        mode: crate::convert::cli_driver::ConvertMode::TextOnly,
         // Inner imatrix conversion consumes the already-local source.
         remote_source: None,
     };

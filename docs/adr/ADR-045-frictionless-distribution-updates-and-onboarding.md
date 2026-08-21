@@ -338,9 +338,11 @@ name the exact artifact, settings, and host evidence.
 
 The first guide model is
 `jenerallee78/Qwen3.8-27B-Abliterated-SFT` at exact revision
-`08c2f075b43bc06456382db6b918a3dcabdcf4dd`. The guide covers its accepted
-Qwen3.8 text path only. It does not broaden the still-separate Qwen3.8 vision
-candidate or treat a community checkpoint as an official upstream release.
+`08c2f075b43bc06456382db6b918a3dcabdcf4dd`. The guide exercises its accepted
+Qwen3.8 text-serving path, while conversion preserves the source's complete
+text/projector pair under ADR-004. Producing the companion does not broaden
+the still-separate Qwen3.8 vision acceptance claim or treat a community
+checkpoint as an official upstream release.
 
 ### 5. Make `hf2q update` honor the installation channel
 
@@ -542,6 +544,26 @@ continuation, and warm-versus-cold semantic replay. The warm direct
 continuation reused 297 of 374 prompt tokens and exactly matched the cold
 result.
 
+The automatic multimodal-pair follow-up at converter commit
+`54fd9a089c2d9ebf2ec3ac20b8d24fdc1236c318` reused that exact source revision
+and source-bundle identity. One default conversion command produced a bound
+16,810,714,944-byte text GGUF with SHA-256
+`1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a` and a
+927,606,848-byte F16 projector with SHA-256
+`463b264713f8e081f0fae753c80d8089308e01b1e2ac0948dd9966d0711d8f1b`.
+The two schema-v3 receipts share the exact source and converter identities;
+their selectors are `q4_k_m` and `f16-mmproj`. Runtime startup reopened 866
+text tensors and 496 projector tensors, verified the projector digest embedded
+in the text header, and loaded the Qwen3-VL SigLIP/merger path.
+
+The exact first-image cache gate then used an 86,077-token cold text turn and
+a first-image follow-up with 86,172 prompt tokens. The follow-up reused 86,072
+tokens, performed GPU vision inference, answered that the fixture was red in
+73 completion tokens, stopped normally, and left readiness at HTTP 200. This
+supersedes the earlier text-only artifact as the native self-conversion proof;
+the separately pinned model-author Q5_K_M fast-download path remains a distinct
+text-only guide option.
+
 The guide and its retained evidence bind that accepted digest. A separately
 dispatched model-qualification workflow may require the runner's
 `QWEN38_MODEL_SHA256` setting to match it, but routine CLI publication does not
@@ -670,8 +692,9 @@ What exists:
 
 - hf2q's core conversion, quantization, and serving commands;
 - a source/Cargo-oriented install path;
-- the canonical tested text-only Qwen3.8 guide for conversion, serving,
-  direct API use, and optional OpenCode;
+- the canonical tested Qwen3.8 guide whose conversion preserves the
+  multimodal pair and whose first serving path exercises text, direct API use,
+  and optional OpenCode;
 - a `setup` command that records conversion and serving defaults consumed by
   the existing commands through a selected state root;
 - a local standalone installer template, hidden exact-byte bootstrap, public

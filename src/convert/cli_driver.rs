@@ -62,7 +62,7 @@ use crate::convert::tokenizer::TokenizerError;
 use crate::convert::{
     build_tokenizer_metadata, ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError,
 };
-use crate::core::provenance::{KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
+use crate::core::provenance::{KEY_MMPROJ_SHA256, KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
 use crate::input::integrity::VerifiedSourceManifest;
 use crate::quantize::ggml_quants::apex::{
     detect_apex_config, load_mudler_config, ApexError, ApexPolicy, FingerprintHParams,
@@ -71,6 +71,8 @@ use crate::quantize::ggml_quants::standard_policy::HParams;
 use crate::quantize::ggml_quants::SourceDtype;
 use crate::quantize::ggml_quants::{ArchName, GgufFtype};
 
+#[path = "cli_driver/paired.rs"]
+mod paired;
 #[path = "cli_driver/stored_evidence.rs"]
 mod stored_evidence;
 #[cfg(test)]
@@ -134,11 +136,20 @@ pub struct ConvertArgs {
     /// surfaces `ImatrixError::CorpusTooShort` if the tokenized corpus
     /// can't fill even one chunk of size `n_ctx`.
     pub imatrix_n_ctx: Option<u32>,
-    /// `--mmproj` flag: export the vision projector (mmproj) sidecar
-    /// GGUF instead of the text decoder. See `ConvertCliArgs::mmproj`.
-    pub mmproj: bool,
+    /// Text-only, projector-only, or default automatic paired conversion.
+    pub mode: ConvertMode,
     /// Verified exact-revision identity for `--repo` conversion.
     pub remote_source: Option<RemoteConversionSource>,
+}
+
+/// Closed conversion product mode. The CLI's flags are reduced to this enum
+/// before any conversion code runs, so internal callers cannot construct an
+/// invalid combination of boolean modes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvertMode {
+    TextOnly,
+    ProjectorOnly,
+    Paired { projector_output: Option<PathBuf> },
 }
 
 /// Errors raised by [`run_convert`]. Wraps the typed errors from the
@@ -169,6 +180,8 @@ pub enum ConvertError {
     Receipt(ReceiptError),
     /// Native multimodal projector conversion failed.
     Vision(crate::models::vit::VitConvertError),
+    /// Automatic multimodal pair planning or transactional publication failed.
+    Pair { detail: String },
     /// `config.json` did not name one of the 8 supported architectures.
     /// `arch_name` carries the offending raw string (from `model_type`
     /// or `architectures[0]`).
@@ -263,6 +276,7 @@ impl std::fmt::Display for ConvertError {
             ConvertError::Integrity(e) => write!(f, "convert/integrity: {e}"),
             ConvertError::Receipt(e) => write!(f, "convert/receipt: {e}"),
             ConvertError::Vision(e) => write!(f, "convert/vision: {e}"),
+            ConvertError::Pair { detail } => write!(f, "convert/pair: {detail}"),
             ConvertError::UnsupportedArch { arch_name } => {
                 write!(
                     f,
@@ -451,7 +465,7 @@ impl From<TokenizerError> for ConvertError {
 /// 7. Stream into a same-directory temporary GGUF, sync it, then atomically
 ///    replace the requested output only after successful finalization.
 pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
-    run_convert_internal(args, None).map(|_| ())
+    paired::run(args)
 }
 
 struct StoredEvidenceRequest {
@@ -464,6 +478,7 @@ struct StoredEvidenceRequest {
 fn run_convert_internal(
     args: ConvertArgs,
     evidence_request: Option<StoredEvidenceRequest>,
+    bound_projector_sha256: Option<&str>,
 ) -> Result<Option<VerifiedSourceToStoredConversion>, ConvertError> {
     // ----- 1. Open source (mmap, metadata-only) ---------------------------
     // Per ADR-033 §"Open Issues / Real-Model Findings" 2026-05-18: the
@@ -505,7 +520,7 @@ fn run_convert_internal(
             ),
         });
     }
-    if args.mmproj
+    if matches!(args.mode, ConvertMode::ProjectorOnly)
         && matches!(
             detected_arch,
             ArchName::Qwen35 | ArchName::Qwen35MoeFull | ArchName::Qwen3VlText
@@ -562,7 +577,7 @@ fn run_convert_internal(
     // when `--mmproj` is set, the script swaps `TEXT_MODEL_MAP` for
     // `MMPROJ_MODEL_MAP`. Requires a `vision_config` sub-object in the
     // root config.json (Gemma 4 / Gemma 3 ForConditionalGeneration).
-    let arch = if args.mmproj {
+    let arch = if matches!(args.mode, ConvertMode::ProjectorOnly) {
         if config.get("vision_config").is_none() {
             return Err(ConvertError::UnsupportedArch {
                 arch_name: format!(
@@ -877,6 +892,12 @@ fn run_convert_internal(
             MetaValue::String(remote.source_sha256().to_owned()),
         );
     }
+    if let Some(projector_sha256) = bound_projector_sha256 {
+        orch.add_metadata(
+            KEY_MMPROJ_SHA256.to_string(),
+            MetaValue::String(projector_sha256.to_owned()),
+        );
+    }
 
     // ----- 5. Plan + stream tensors (with MoE expert fusion) -------------
     //
@@ -1114,12 +1135,17 @@ fn run_convert_internal(
         .as_ref()
         .zip(converter_git_commit.as_deref())
         .map(|(remote, commit)| {
+            let quant_selector = if matches!(args.mode, ConvertMode::ProjectorOnly) {
+                "f16-mmproj".to_owned()
+            } else {
+                args.selector.receipt_name()
+            };
             prepare_success_receipt(
                 temporary_output.path(),
                 &args.output,
                 remote,
                 commit,
-                &args.selector.receipt_name(),
+                &quant_selector,
                 excluded_dspark_count,
                 peak_chunk_bound,
             )
@@ -3008,7 +3034,7 @@ mod tests {
             imatrix_corpus: None,
             imatrix_out: None,
             imatrix_n_ctx: None,
-            mmproj: false,
+            mode: ConvertMode::TextOnly,
             remote_source: repo.map(remote_source),
         }
     }
@@ -3940,7 +3966,7 @@ mod tests {
             imatrix_corpus: None,
             imatrix_out: None,
             imatrix_n_ctx: None,
-            mmproj: false,
+            mode: ConvertMode::TextOnly,
             remote_source: Some(remote_source("deepseek-ai/DeepSeek-V4-Flash-0731")),
         })
         .unwrap();
