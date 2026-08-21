@@ -17,9 +17,9 @@
 //! - auth is innermost so it runs AFTER the request-id is stamped, allowing
 //!   401 responses to carry the request-id for correlation.
 
-use axum::Router;
 use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
+use axum::Router;
 
 use super::middleware::{
     bearer_auth, cors_layer, fallback, request_cancellation_layer, request_id_layer,
@@ -74,8 +74,8 @@ pub fn build_router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode, header};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
     use tower::ServiceExt;
 
     use super::super::state::ServerConfig;
@@ -195,12 +195,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["code"], "model_not_found");
         assert_eq!(v["error"]["type"], "invalid_request_error");
-        assert!(
-            v["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("does-not-exist")
-        );
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does-not-exist"));
     }
 
     // --- fallback 404 ---
@@ -217,12 +215,10 @@ mod tests {
         let body = body_string(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["type"], "invalid_request_error");
-        assert!(
-            v["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("/this-route-does-not-exist")
-        );
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("/this-route-does-not-exist"));
     }
 
     // --- bearer auth ---
@@ -1334,6 +1330,56 @@ mod tests {
         (state, engine)
     }
 
+    struct RuntimeWarmupSentinelLoader {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::serve::multi_model::ModelLoader<super::super::engine::Engine>
+        for RuntimeWarmupSentinelLoader
+    {
+        fn load(
+            &self,
+            _path: &std::path::Path,
+            _config: &crate::serve::multi_model::EngineConfig,
+        ) -> anyhow::Result<super::super::engine::Engine> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async { tokio::task::yield_now().await });
+            Ok(super::super::engine::make_synthetic_engine_for_test(
+                super::super::engine::LoadedArch::Qwen35,
+            ))
+        }
+    }
+
+    fn single_capacity_state_with_runtime_warmup_loader() -> (
+        AppState,
+        super::super::engine::Engine,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use crate::serve::multi_model::{HotSwapManager, LoadedPool};
+        use crate::serve::quant_select::QuantType;
+        use std::sync::Arc;
+
+        let mut state = AppState::new(ServerConfig::default());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut manager = HotSwapManager::new(
+            LoadedPool::with_capacity_and_budget(1, 800),
+            Arc::new(RuntimeWarmupSentinelLoader {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let engine = super::super::engine::make_synthetic_engine_for_test(
+            super::super::engine::LoadedArch::Qwen35,
+        );
+        manager
+            .admit_for_test("resident/model", QuantType::Q4_K_M, 400, engine.clone())
+            .unwrap();
+        state.pool = Arc::new(std::sync::RwLock::new(manager));
+        (state, engine, calls)
+    }
+
     fn activation_target(bytes: usize) -> tempfile::NamedTempFile {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -1442,11 +1488,9 @@ mod tests {
             serde_json::from_str(&body_string(conflict).await).unwrap();
         assert_eq!(receipt["error"]["code"], "diagnostic_model_conflict");
         let manager = state.pool.read().unwrap();
-        assert!(
-            manager
-                .try_get("resident/model", QuantType::Q4_K_M)
-                .is_some()
-        );
+        assert!(manager
+            .try_get("resident/model", QuantType::Q4_K_M)
+            .is_some());
         assert_eq!(manager.pool_stats().loaded_count, 1);
         drop(manager);
         engine.shutdown().await.unwrap();
@@ -1534,11 +1578,9 @@ mod tests {
         assert_eq!(receipt["victims"][0]["pool_key"], "resident/model@Q4_K_M");
         assert!(receipt["pool_revision"].as_u64().is_some());
         let manager = state.pool.read().unwrap();
-        assert!(
-            manager
-                .try_get("resident/model", QuantType::Q4_K_M)
-                .is_some()
-        );
+        assert!(manager
+            .try_get("resident/model", QuantType::Q4_K_M)
+            .is_some());
         assert_eq!(manager.pool_stats().loaded_count, 1);
         drop(manager);
         engine.shutdown().await.unwrap();
@@ -1579,14 +1621,65 @@ mod tests {
         assert_eq!(receipt["code"], "stale_activation_plan");
         assert!(engine.is_worker_healthy());
         let manager = state.pool.read().unwrap();
-        assert!(
-            manager
-                .try_get("resident/model", QuantType::Q4_K_M)
-                .is_some()
-        );
+        assert!(manager
+            .try_get("resident/model", QuantType::Q4_K_M)
+            .is_some());
         assert_eq!(manager.pool_stats().loaded_count, 1);
         drop(manager);
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_switch_loads_off_runtime_and_returns_the_new_resident() {
+        use crate::serve::quant_select::QuantType;
+        use std::sync::atomic::Ordering;
+
+        let (state, _victim_engine, loader_calls) =
+            single_capacity_state_with_runtime_warmup_loader();
+        let target = activation_target(500);
+        let victim = state.pool.read().unwrap().iter_loaded().next().unwrap();
+        let expected_revision = state.pool.read().unwrap().pool_stats().revision;
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "model": target.path().to_string_lossy(),
+            "action": "switch",
+            "expected_revision": expected_revision,
+            "victims": [{
+                "pool_key": victim.pool_key,
+                "quant": victim.quant,
+                "bytes_resident": victim.bytes_resident,
+                "generation": victim.generation,
+            }],
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hf2q/v1/models/activate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let receipt: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(receipt["status"], "switched");
+        assert!(receipt["pool_revision"].as_u64().unwrap() > expected_revision);
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
+
+        let candidate_repo = receipt["candidate"]["repo"].as_str().unwrap();
+        let replacement = {
+            let manager = state.pool.read().unwrap();
+            assert!(manager
+                .try_get("resident/model", QuantType::Q4_K_M)
+                .is_none());
+            manager
+                .try_get(candidate_repo, QuantType::Q4_K_M)
+                .expect("replacement must be resident")
+        };
+        replacement.engine.shutdown().await.unwrap();
     }
 
     // ────────────────────────────────────────────────────────────────

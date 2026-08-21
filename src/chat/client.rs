@@ -341,12 +341,17 @@ mod tests {
             })
         );
         assert_eq!(
-            requests[1]["messages"],
-            serde_json::json!([
-                {"role":"user","content":"first"},
-                {"role":"assistant","content":"one","reasoning_content":"check 1"},
-                {"role":"user","content":"second"}
-            ])
+            requests[1],
+            serde_json::json!({
+                "model": "model-a",
+                "messages": [
+                    {"role":"user","content":"first"},
+                    {"role":"assistant","content":"one","reasoning_content":"check 1"},
+                    {"role":"user","content":"second"}
+                ],
+                "stream": true,
+                "stream_options": {"include_usage": true}
+            })
         );
         drop(requests);
         let _ = stop.send(());

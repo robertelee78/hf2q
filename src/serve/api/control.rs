@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 
 use super::handlers::map_hotswap_error_to_response;
 use super::lifecycle::{LifecycleError, SwitchConfirmation};
@@ -411,13 +411,26 @@ pub async fn activate_model(
                     confirmation,
                     std::time::Duration::from_secs(60),
                     |loaded| async move { loaded.engine.shutdown().await },
-                    move |manager| {
-                        manager.load_or_get_non_evicting(
-                            &target_repo,
-                            quant,
-                            &gguf_path,
-                            &engine_config,
-                        )
+                    move |pool| async move {
+                        tokio::task::spawn_blocking(move || {
+                            let mut manager = pool.write().map_err(|error| {
+                                HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                    "pool rwlock poisoned: {error}"
+                                ))
+                            })?;
+                            manager.load_or_get_non_evicting(
+                                &target_repo,
+                                quant,
+                                &gguf_path,
+                                &engine_config,
+                            )
+                        })
+                        .await
+                        .map_err(|error| {
+                            HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                "replacement model load task failed: {error}"
+                            ))
+                        })?
                     },
                 )
                 .await;

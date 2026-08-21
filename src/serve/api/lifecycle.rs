@@ -245,7 +245,7 @@ impl ModelLifecycleCoordinator {
     /// Execute ADR-047's explicit, revision-bound switch. The exclusive
     /// admission guard is held for the state transition, but request execution
     /// is represented only by leases and therefore drains without deadlock.
-    pub async fn switch<E, Shutdown, ShutdownFuture, Load>(
+    pub async fn switch<E, Shutdown, ShutdownFuture, Load, LoadFuture>(
         &self,
         pool: Arc<std::sync::RwLock<HotSwapManager<E>>>,
         confirmation: SwitchConfirmation,
@@ -257,7 +257,8 @@ impl ModelLifecycleCoordinator {
         E: Send + Sync + 'static,
         Shutdown: Fn(Arc<LoadedEngine<E>>) -> ShutdownFuture,
         ShutdownFuture: std::future::Future<Output = anyhow::Result<()>>,
-        Load: FnOnce(&mut HotSwapManager<E>) -> Result<NonEvictingLoad<E>, HotSwapError>,
+        Load: FnOnce(Arc<std::sync::RwLock<HotSwapManager<E>>>) -> LoadFuture,
+        LoadFuture: std::future::Future<Output = Result<NonEvictingLoad<E>, HotSwapError>>,
     {
         let _admission_guard = self.write_admission().await;
 
@@ -323,8 +324,10 @@ impl ModelLifecycleCoordinator {
         }
         self.finish_removal(&drains)?;
 
-        let mut manager = pool.write().map_err(|_| LifecycleError::PoolPoisoned)?;
-        match load(&mut manager).map_err(|error| LifecycleError::LoadFailed(error.to_string()))? {
+        match load(Arc::clone(&pool))
+            .await
+            .map_err(|error| LifecycleError::LoadFailed(error.to_string()))?
+        {
             NonEvictingLoad::Conflict(_) => Err(LifecycleError::VictimPlanChanged),
             loaded => Ok(loaded),
         }
@@ -588,13 +591,19 @@ mod tests {
                         Ok(())
                     }
                 },
-                move |manager| {
-                    manager.load_or_get_non_evicting(
-                        "b/2",
-                        QuantType::Q4_K_M,
-                        target_file.path(),
-                        &EngineConfig::default(),
-                    )
+                move |pool| async move {
+                    pool.write()
+                        .map_err(|error| {
+                            HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                "pool rwlock poisoned: {error}"
+                            ))
+                        })?
+                        .load_or_get_non_evicting(
+                            "b/2",
+                            QuantType::Q4_K_M,
+                            target_file.path(),
+                            &EngineConfig::default(),
+                        )
                 },
             )
             .await
@@ -620,13 +629,19 @@ mod tests {
                 confirmation,
                 Duration::from_secs(1),
                 |_engine| async move { anyhow::bail!("synthetic shutdown failure") },
-                move |manager| {
-                    manager.load_or_get_non_evicting(
-                        "b/2",
-                        QuantType::Q4_K_M,
-                        target_file.path(),
-                        &EngineConfig::default(),
-                    )
+                move |pool| async move {
+                    pool.write()
+                        .map_err(|error| {
+                            HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                "pool rwlock poisoned: {error}"
+                            ))
+                        })?
+                        .load_or_get_non_evicting(
+                            "b/2",
+                            QuantType::Q4_K_M,
+                            target_file.path(),
+                            &EngineConfig::default(),
+                        )
                 },
             )
             .await
@@ -641,5 +656,106 @@ mod tests {
             coordinator.acquire(&current),
             Err(LifecycleError::Draining(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn switch_drain_timeout_keeps_victim_and_never_loads_replacement() {
+        let coordinator = ModelLifecycleCoordinator::default();
+        let (pool, loader, _events, _current_file, current, confirmation) = switch_fixture();
+        let held_request = coordinator.acquire(&current).unwrap();
+        let target_file = fixture_file(500);
+
+        let err = coordinator
+            .switch(
+                Arc::clone(&pool),
+                confirmation,
+                Duration::from_millis(1),
+                |_engine| async move { Ok(()) },
+                move |pool| async move {
+                    pool.write()
+                        .map_err(|error| {
+                            HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                "pool rwlock poisoned: {error}"
+                            ))
+                        })?
+                        .load_or_get_non_evicting(
+                            "b/2",
+                            QuantType::Q4_K_M,
+                            target_file.path(),
+                            &EngineConfig::default(),
+                        )
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, LifecycleError::DrainTimeout { .. }));
+        assert_eq!(loader.calls.load(Ordering::SeqCst), 1);
+        let manager = pool.read().unwrap();
+        assert!(manager.try_get("a/1", QuantType::Q4_K_M).is_some());
+        assert!(manager.try_get("b/2", QuantType::Q4_K_M).is_none());
+        drop(manager);
+        assert!(matches!(
+            coordinator.acquire(&current),
+            Err(LifecycleError::Draining(_))
+        ));
+        drop(held_request);
+    }
+
+    #[tokio::test]
+    async fn switch_waits_for_unary_embedding_queued_and_sse_leases() {
+        let coordinator = ModelLifecycleCoordinator::default();
+        let (pool, loader, _events, _current_file, current, confirmation) = switch_fixture();
+        // Every production pool-routed request acquires the same
+        // generation-bound lease before dispatch. Give the four relevant
+        // lifetimes distinct names here so one switch proves it cannot pass
+        // the drain until all of them are gone.
+        let unary = coordinator.acquire(&current).unwrap();
+        let embedding = coordinator.acquire(&current).unwrap();
+        let queued = coordinator.acquire(&current).unwrap();
+        let sse_body = coordinator.acquire(&current).unwrap();
+        let target_file = fixture_file(500);
+        let switch_coordinator = coordinator.clone();
+        let switch_pool = Arc::clone(&pool);
+
+        let switching = tokio::spawn(async move {
+            switch_coordinator
+                .switch(
+                    switch_pool,
+                    confirmation,
+                    Duration::from_secs(1),
+                    |_engine| async move { Ok(()) },
+                    move |pool| async move {
+                        pool.write()
+                            .map_err(|error| {
+                                HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                    "pool rwlock poisoned: {error}"
+                                ))
+                            })?
+                            .load_or_get_non_evicting(
+                                "b/2",
+                                QuantType::Q4_K_M,
+                                target_file.path(),
+                                &EngineConfig::default(),
+                            )
+                    },
+                )
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        for lease in [unary, embedding, queued] {
+            drop(lease);
+            tokio::task::yield_now().await;
+            assert!(!switching.is_finished());
+            assert_eq!(loader.calls.load(Ordering::SeqCst), 1);
+        }
+        drop(sse_body);
+
+        assert!(matches!(
+            switching.await.unwrap().unwrap(),
+            NonEvictingLoad::Loaded(_)
+        ));
+        assert_eq!(loader.calls.load(Ordering::SeqCst), 2);
     }
 }

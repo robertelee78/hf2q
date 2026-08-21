@@ -196,23 +196,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reconstructs_split_utf8_reasoning_tools_usage_and_timing() {
+    fn reconstructs_every_split_utf8_reasoning_tools_usage_and_timing() {
         let wire = concat!(
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"café \"}}]}\r\n\r\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"done\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"inspect\",\"arguments\":\"{\\\"x\\\":\"}}]}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6},\"x_hf2q_timing\":{\"time_to_first_token_ms\":12.5}}\n\n",
             "data: [DONE]\n\n"
         );
-        let split = wire.find("é").unwrap() + 1;
-        let mut decoder = SseDecoder::default();
-        decoder.push(&wire.as_bytes()[..split]).unwrap();
-        decoder.push(&wire.as_bytes()[split..]).unwrap();
-        let completed = decoder.finish().unwrap();
-        assert_eq!(completed.reasoning_content, "café ");
-        assert_eq!(completed.content, "done");
-        assert_eq!(completed.tool_calls[0].function.arguments, "{\"x\":1}");
-        assert_eq!(completed.usage.unwrap().total_tokens, 6);
-        assert_eq!(completed.timing.unwrap().time_to_first_token_ms, Some(12.5));
+        let assert_completed = |completed: CompletedResponse| {
+            assert_eq!(completed.reasoning_content, "café ");
+            assert_eq!(completed.content, "done");
+            assert_eq!(completed.tool_calls[0].function.arguments, "{\"x\":1}");
+            assert_eq!(completed.usage.unwrap().total_tokens, 6);
+            assert_eq!(completed.timing.unwrap().time_to_first_token_ms, Some(12.5));
+        };
+
+        for split in 0..=wire.len() {
+            let mut decoder = SseDecoder::default();
+            decoder.push(&wire.as_bytes()[..split]).unwrap();
+            decoder.push(&wire.as_bytes()[split..]).unwrap();
+            assert_completed(decoder.finish().unwrap());
+        }
+
+        let mut bytewise = SseDecoder::default();
+        for byte in wire.as_bytes() {
+            bytewise.push(std::slice::from_ref(byte)).unwrap();
+        }
+        assert_completed(bytewise.finish().unwrap());
     }
 
     #[test]

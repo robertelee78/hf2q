@@ -40,6 +40,10 @@ impl EndpointResolver for AutomaticEndpointResolver {
         if let Some(url) = args.url.as_deref() {
             return Endpoint::explicit(url).map(EndpointSession::external);
         }
+        let auth_token = std::env::var("HF2Q_AUTH_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty());
+        require_credentialless_automatic_discovery(auth_token.as_deref())?;
         if !discovery::is_supported() {
             bail!("automatic local hf2q discovery is unavailable on this platform; use --url");
         }
@@ -61,9 +65,6 @@ async fn resolve_local(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<EndpointSession> {
-    let auth_token = std::env::var("HF2Q_AUTH_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty());
     let http = reqwest::Client::builder()
         .connect_timeout(HTTP_PROBE_TIMEOUT)
         .timeout(HTTP_PROBE_TIMEOUT)
@@ -71,13 +72,7 @@ async fn resolve_local(
         .context("build local server probe client")?;
 
     let mut browser = LocalDiscoveryBrowser::start().context("start local hf2q discovery")?;
-    let existing = collect_verified(
-        &mut browser,
-        &http,
-        auth_token.as_deref(),
-        EXISTING_DISCOVERY_WINDOW,
-    )
-    .await?;
+    let existing = collect_verified(&mut browser, &http, EXISTING_DISCOVERY_WINDOW).await?;
     if !existing.is_empty() {
         let selected = select_server(&existing, args.model.as_deref(), input, output)?;
         return Ok(EndpointSession::discovered_hf2q(selected.endpoint.clone()));
@@ -89,14 +84,8 @@ async fn resolve_local(
         LocalDiscoveryBrowser::start().context("start owned-server discovery")?;
     let mut child = spawn_server().context("start hf2q serve")?;
     let child_pid = child.id().to_string();
-    let startup = wait_for_spawned_server(
-        &mut startup_browser,
-        &http,
-        auth_token.as_deref(),
-        &mut child,
-        &child_pid,
-    )
-    .await;
+    let startup =
+        wait_for_spawned_server(&mut startup_browser, &http, &mut child, &child_pid).await;
     match startup {
         Ok(server) => Ok(EndpointSession::spawned_loopback(
             endpoint_port(&server.endpoint)?,
@@ -107,6 +96,15 @@ async fn resolve_local(
             Err(error)
         }
     }
+}
+
+fn require_credentialless_automatic_discovery(auth_token: Option<&str>) -> Result<()> {
+    if auth_token.is_some() {
+        bail!(
+            "automatic discovery is disabled while HF2Q_AUTH_TOKEN is set because DNS-SD candidates are untrusted; use --url with the intended local endpoint"
+        );
+    }
+    Ok(())
 }
 
 fn spawn_server() -> Result<Child> {
@@ -132,7 +130,6 @@ fn spawn_server() -> Result<Child> {
 async fn collect_verified(
     browser: &mut LocalDiscoveryBrowser,
     http: &reqwest::Client,
-    auth_token: Option<&str>,
     timeout: Duration,
 ) -> Result<Vec<VerifiedServer>> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -145,7 +142,7 @@ async fn collect_verified(
         match browser.next_event(remaining).await? {
             None => break,
             Some(LocalDiscoveryEvent::Added(candidate)) => {
-                if let Some(server) = verify_candidate(http, auth_token, candidate).await {
+                if let Some(server) = verify_candidate(http, candidate).await {
                     servers.insert(server.identity.clone(), server);
                 }
             }
@@ -163,7 +160,6 @@ async fn collect_verified(
 async fn wait_for_spawned_server(
     browser: &mut LocalDiscoveryBrowser,
     http: &reqwest::Client,
-    auth_token: Option<&str>,
     child: &mut Child,
     child_pid: &str,
 ) -> Result<VerifiedServer> {
@@ -188,7 +184,7 @@ async fn wait_for_spawned_server(
         if candidate.hints.pid_hint.as_deref() != Some(child_pid) {
             continue;
         }
-        if let Some(server) = verify_candidate(http, auth_token, candidate).await {
+        if let Some(server) = verify_candidate(http, candidate).await {
             return Ok(server);
         }
     }
@@ -196,15 +192,10 @@ async fn wait_for_spawned_server(
 
 async fn verify_candidate(
     http: &reqwest::Client,
-    auth_token: Option<&str>,
     candidate: UntrustedDiscoveryCandidate,
 ) -> Option<VerifiedServer> {
     let endpoint = Endpoint::discovered_loopback(candidate.endpoint.port());
-    let mut health = http.get(endpoint.route("/health"));
-    if let Some(token) = auth_token {
-        health = health.bearer_auth(token);
-    }
-    let response = match health.send().await {
+    let response = match http.get(endpoint.route("/health")).send().await {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
             if matches!(
@@ -214,7 +205,7 @@ async fn verify_candidate(
                 tracing::warn!(
                     url = %endpoint.base_url(),
                     status = %response.status(),
-                    "local hf2q server is inaccessible; set HF2Q_AUTH_TOKEN if it requires authentication"
+                    "authenticated local hf2q servers require an explicit --url so credentials are never sent to an untrusted discovery candidate"
                 );
             } else {
                 tracing::debug!(url = %endpoint.base_url(), status = %response.status(), "ignored unhealthy local discovery candidate");
@@ -227,7 +218,7 @@ async fn verify_candidate(
         }
     };
     drop(response);
-    let models = match fetch_models(http, &endpoint, auth_token).await {
+    let models = match fetch_models(http, &endpoint, None).await {
         Ok(models) => models,
         Err(error) => {
             tracing::debug!(url = %endpoint.base_url(), %error, "ignored local discovery candidate without a usable model API");
@@ -313,6 +304,14 @@ fn stop_failed_child(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use tokio::sync::oneshot;
+
     use super::*;
 
     fn server(port: u16, models: &[(&str, bool)]) -> VerifiedServer {
@@ -331,6 +330,33 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn candidate(port: u16) -> UntrustedDiscoveryCandidate {
+        UntrustedDiscoveryCandidate {
+            identity: DiscoveryIdentity {
+                service_name: format!("candidate-{port}"),
+                service_type: discovery::SERVICE_TYPE.to_owned(),
+                domain: "local.".to_owned(),
+            },
+            endpoint: format!("127.0.0.1:{port}").parse().unwrap(),
+            hints: Default::default(),
+        }
+    }
+
+    async fn serve(router: Router) -> (u16, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = stop_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (port, stop_tx)
     }
 
     #[test]
@@ -362,5 +388,63 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("resident=resident"));
         assert!(output.contains("requested model advertised"));
+    }
+
+    #[test]
+    fn authenticated_automatic_discovery_requires_an_explicit_url() {
+        assert!(require_credentialless_automatic_discovery(None).is_ok());
+        let error = require_credentialless_automatic_discovery(Some("secret")).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("DNS-SD candidates are untrusted"));
+        assert!(error.to_string().contains("--url"));
+    }
+
+    #[tokio::test]
+    async fn candidate_verification_uses_real_http_without_authorization() {
+        #[derive(Clone, Default)]
+        struct Recorded(Arc<Mutex<Vec<Option<String>>>>);
+
+        async fn record(
+            State(recorded): State<Recorded>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            recorded.0.lock().unwrap().push(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+            );
+            Json(serde_json::json!({"status":"ok","data":[]}))
+        }
+
+        let recorded = Recorded::default();
+        let router = Router::new()
+            .route("/health", get(record))
+            .route("/v1/models", get(record))
+            .with_state(recorded.clone());
+        let (port, stop) = serve(router).await;
+        let verified = verify_candidate(&reqwest::Client::new(), candidate(port))
+            .await
+            .expect("healthy candidate must verify");
+        assert_eq!(
+            verified.endpoint.base_url(),
+            format!("http://127.0.0.1:{port}")
+        );
+        assert_eq!(*recorded.0.lock().unwrap(), vec![None, None]);
+        let _ = stop.send(());
+    }
+
+    #[tokio::test]
+    async fn unhealthy_http_candidate_is_rejected() {
+        let router = Router::new().route(
+            "/health",
+            get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "not ready") }),
+        );
+        let (port, stop) = serve(router).await;
+        assert!(verify_candidate(&reqwest::Client::new(), candidate(port))
+            .await
+            .is_none());
+        let _ = stop.send(());
     }
 }

@@ -95,6 +95,12 @@ Chat neither scans arbitrary ports nor maintains an ephemeral registry file.
 A manually launched `hf2q serve --port 9123` is therefore as discoverable as
 a server started by chat.
 
+DNS-SD does not authenticate the process behind a loopback port. Automatic
+discovery therefore never sends credentials while probing candidates. When
+`HF2Q_AUTH_TOKEN` is set, chat requires an explicit `--url`; naming the endpoint
+is the operator's trust decision and bearer authentication is then used for
+that endpoint only.
+
 - One verified local server is selected automatically.
 - Multiple verified servers produce a numbered picker showing endpoint and
   resident models.
@@ -190,8 +196,9 @@ teacher-forced scoring, so neither is zero-interference diagnostic telemetry.
 - A discovered record that does not resolve, pass HTTP verification, or
   answer before the bounded discovery deadline is ignored and reported when
   useful.
-- A protected endpoint without usable credentials is shown as inaccessible;
-  credentials are never copied into DNS-SD.
+- A protected endpoint requires explicit `--url`. Automatic discovery never
+  sends credentials to an untrusted DNS-SD candidate, and credentials are
+  never copied into DNS-SD.
 - A non-hf2q `--url` endpoint can chat but cannot perform hf2q model-pool or
   owned-process actions unless it exposes and passes the exact capability
   contract.
@@ -224,9 +231,11 @@ Implementation is not complete until all of the following are proven:
    simultaneous instances, name collision handling, and HTTP verification;
 7. a subprocess test proves owned-server shutdown, detach/keep-serving, and
    that a pre-existing server is never stopped; and
-8. a real hf2q model test proves multi-turn unary/SSE compatibility, tool-call
-   display and tool-result continuation, prefix-cache reuse, timing/usage,
-   and unchanged model output under matched settings.
+8. a real hf2q model test proves multi-turn unary/SSE compatibility, TUI
+   tool-call display, direct-API tool-result continuation, prefix-cache reuse,
+   timing/usage, and unchanged model output under matched settings. The direct
+   API proves the agentic serving contract; the diagnostic TUI remains a
+   display-only client and never becomes a tool harness.
 
 ## Consequences
 

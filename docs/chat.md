@@ -40,7 +40,9 @@ The client sends no implicit system prompt, tool definitions, sampling knobs,
 or template arguments. Optional `--system`, `--temperature`, `--top-p`,
 `--max-tokens`, `--seed`, and `--reasoning-effort` flags add exactly the named
 request fields. `HF2Q_AUTH_TOKEN`, when set, is used as the bearer token but is
-never published in discovery metadata.
+never published in discovery metadata. Because machine-local DNS-SD candidates
+are not authenticated, automatic discovery is disabled while that variable is
+set; use `--url` to explicitly name the endpoint that may receive the token.
 
 When the endpoint advertises hf2q's diagnostic capability, chat adds the
 capability-declared `x-hf2q-diagnostic-no-evict: 1` HTTP header. This does not
