@@ -258,9 +258,45 @@ impl Qwen35LoadedModel {
     /// - GGUF open / parse
     /// - `Qwen35Model::load_from_gguf` (weights load via mlx-native)
     /// - tokenizer file resolution + parse
+    /// ADR-044: the Qwen3.8-qualified K-quant width-four decode route
+    /// (`HF2Q_DECODE_MVN=0` + `HF2Q_DECODE_MV_EXT=1`, qualified by the
+    /// native qL4 decision/cache gate and the matched ABBA receipt) was
+    /// previously applied only by the canonical `serve_qwen38_opencode.sh`
+    /// launcher. Loading a Qwen3.8-identified model now applies the same
+    /// route by default, at engine load, before the first quantized matmul
+    /// snapshots mlx-native's process-global routing policy. Explicit
+    /// operator-exported values always win.
+    ///
+    /// The route stays Qwen3.8-scoped on purpose: unlike the default-on
+    /// byte-exact mvN route, `mul_mv_ext` is not bit-exact, and no other
+    /// model family carries the qualifying receipt. The id match mirrors
+    /// the serve registry's deliberately fuzzy substring philosophy.
+    ///
+    /// Multi-model note: mlx-native's routing policy is process-global and
+    /// cached on first dispatch, so this default can only take effect when
+    /// the Qwen3.8 load precedes the process's first quantized matmul —
+    /// the same per-process scope the launcher always had.
+    fn apply_qwen38_qualified_decode_route(model_path: &std::path::Path) {
+        let id = model_path.to_string_lossy().to_ascii_lowercase();
+        if !(id.contains("qwen38") || id.contains("qwen3.8")) {
+            return;
+        }
+        for (key, value) in [("HF2Q_DECODE_MVN", "0"), ("HF2Q_DECODE_MV_EXT", "1")] {
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, value);
+                tracing::info!(
+                    key,
+                    value,
+                    "applied Qwen3.8-qualified decode route default"
+                );
+            }
+        }
+    }
+
     pub fn load(opts: &LoadOptions) -> Result<Self> {
         let load_start = Instant::now();
         let model_path = &opts.model_path;
+        Self::apply_qwen38_qualified_decode_route(model_path);
         anyhow::ensure!(
             model_path.exists(),
             "Model not found: {}",
@@ -559,6 +595,9 @@ impl Qwen35LoadedModel {
             // populates this lazily via `HybridKvCache::new_with_options
             // (... n_seqs = max_slots, ...)`.
             persistent_kv_cache: None,
+            // ADR-044 (2026-08-21): `auto` is now the default server
+            // policy for this family when HF2Q_QWEN_SPECULATION is unset;
+            // explicit `off` remains the escape. See qwen35_speculation.rs.
             speculation: super::qwen35_speculation::QwenSpeculationController::from_environment(),
         };
 

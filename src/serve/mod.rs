@@ -29,6 +29,7 @@ pub mod multi_model;
 // Production callsite activation gated on Phase A iter-2+ per-model impls.
 #[allow(dead_code)]
 pub mod multi_seq_kv;
+pub(crate) mod operator_profile;
 pub(crate) mod operator_ui;
 // ADR-040 Phase B iter-1 scaffolding — Scheduler trait + FifoSchedulerAdapter +
 // InflightBatchedScheduler signature stub. Production activation gated on
@@ -4323,6 +4324,12 @@ pub fn cmd_serve(
     }
 
     operator_ui::validate_mode(args.operator_ui, matches!(log_format, cli::LogFormat::Text))?;
+
+    // Setup-persisted agentic serving profile -> process env defaults.
+    // Runs before the INVESTIGATION_ENV LazyLock snapshot and before any
+    // request handler reads the thinking-budget variables; explicit
+    // operator environment always wins (see operator_profile module docs).
+    operator_profile::apply_operator_serve_profile(operator_defaults);
 
     // --- Resolve config ---
     let auth_token = args.auth_token.clone().or_else(|| {

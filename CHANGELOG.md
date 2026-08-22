@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Persist the qualified agentic serving profile in `hf2q setup`: answering
+  yes to "Optimize serving for long agent and tool-use prompts?" (the
+  default) writes repetition penalty `1.05`, thinking budget `2048`, and
+  tool-continuation budget `512` to `config.toml`, and `hf2q serve` applies
+  them to `HF2Q_DEFAULT_REPETITION_PENALTY`,
+  `HF2Q_DEFAULT_THINKING_TOKEN_BUDGET`, and
+  `HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET` only when the operator has not
+  exported those variables. Existing v2 configs without the new keys keep
+  loading unchanged.
+- Default `HF2Q_QWEN_SPECULATION` to `auto` in the qwen35 server engine
+  when the variable is unset (ADR-044, updated 2026-08-21); every admission
+  path still fails closed to ordinary target decode, and explicit `off`
+  remains the escape hatch.
+- Apply the Qwen3.8-qualified decode route (`HF2Q_DECODE_MVN=0` +
+  `HF2Q_DECODE_MV_EXT=1`) by default when loading a Qwen3.8-identified
+  model, at engine load, without overriding operator-exported values. The
+  route stays Qwen3.8-scoped because `mul_mv_ext` is not bit-exact and no
+  other family carries the qualifying receipt.
+
 ## [0.1.9] — 2026-08-21
 
 ### Added

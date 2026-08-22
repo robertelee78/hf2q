@@ -69,18 +69,72 @@ if [[ "$ACTION" == "enable" ]]; then
 fi
 
 if [[ "$ACTION" == "status" ]]; then
+    command -v jq >/dev/null 2>&1 || {
+        echo "required command not found: jq" >&2
+        exit 2
+    }
+    STATUS_FAIL=0
     if [[ -f "$PLUGIN_PATH" ]]; then
         echo "plugin: enabled ($PLUGIN_PATH)"
     elif [[ -f "$DISABLED_PLUGIN_PATH" ]]; then
         echo "plugin: disabled ($DISABLED_PLUGIN_PATH)"
+        STATUS_FAIL=1
     else
         echo "plugin: not installed"
+        STATUS_FAIL=1
     fi
+    SEARX_LOADED=0
+    FETCH_LOADED=0
     launchctl print "$USER_DOMAIN/com.opencode.searxng" >/dev/null 2>&1 \
-        && echo "searxng: running" || echo "searxng: stopped"
+        && { echo "searxng: loaded"; SEARX_LOADED=1; } \
+        || { echo "searxng: not loaded"; STATUS_FAIL=1; }
     launchctl print "$USER_DOMAIN/com.opencode.crawl4ai" >/dev/null 2>&1 \
-        && echo "crawl4ai: running" || echo "crawl4ai: stopped"
-    exit 0
+        && { echo "crawl4ai: loaded"; FETCH_LOADED=1; } \
+        || { echo "crawl4ai: not loaded"; STATUS_FAIL=1; }
+
+    if [[ "$FETCH_LOADED" -eq 1 ]]; then
+        if HEALTH="$(curl --connect-timeout 2 --max-time 5 -fsS \
+            http://127.0.0.1:11235/healthz 2>/dev/null)"; then
+            echo "$HEALTH" | jq -r '"fetch /healthz: ok=\(.ok) browser_warm=\(.browser_warm) stealth_available=\(.stealth_available)"'
+            [[ "$(echo "$HEALTH" | jq -r '.ok')" == "true" ]] || STATUS_FAIL=1
+            [[ "$(echo "$HEALTH" | jq -r '.stealth_available')" == "true" ]] \
+                || echo "warning: stealth fallback unavailable (scrapling/patchright)"
+        else
+            echo "fetch /healthz: unreachable"
+            STATUS_FAIL=1
+        fi
+        if curl --connect-timeout 2 --max-time 30 -fsS -X POST \
+            http://127.0.0.1:11235/fetch \
+            -H 'Content-Type: application/json' \
+            -d '{"url":"https://example.com/","mode":"auto","max_chars":2000}' \
+            2>/dev/null | jq -e '.ok == true and (.markdown | length > 0)' >/dev/null; then
+            echo "fetch example.com: ok"
+        else
+            echo "fetch example.com: FAILED"
+            STATUS_FAIL=1
+        fi
+    fi
+
+    if [[ "$SEARX_LOADED" -eq 1 ]]; then
+        if RESULTS="$(curl --connect-timeout 2 --max-time 25 -fsS --get \
+            http://127.0.0.1:8888/search \
+            --data-urlencode 'q=hf2q local inference' \
+            --data 'format=json' 2>/dev/null | jq -r '.results | length' 2>/dev/null)"; then
+            echo "searxng live search: ${RESULTS:-0} results"
+            [[ "${RESULTS:-0}" -gt 0 ]] \
+                || echo "warning: search returned no results (public engines may be rate-limiting; retry shortly)"
+        else
+            echo "searxng live search: FAILED"
+            STATUS_FAIL=1
+        fi
+    fi
+
+    if [[ "$STATUS_FAIL" -eq 0 ]]; then
+        echo "status: healthy"
+    else
+        echo "status: degraded (see lines above)" >&2
+    fi
+    exit "$STATUS_FAIL"
 fi
 
 if [[ "$ACTION" == "uninstall" ]]; then
@@ -339,16 +393,38 @@ done
 node --check "$PLUGIN_DIR/web-search-fetch.js"
 plutil -lint "$SEARX_PLIST" "$FETCH_PLIST"
 
+HEALTH="$(curl -fsS http://127.0.0.1:11235/healthz)"
+echo "$HEALTH" | jq -e '.ok == true' >/dev/null
+if [[ "$(echo "$HEALTH" | jq -r '.stealth_available')" != "true" ]]; then
+    echo "warning: stealth fallback unavailable (scrapling/patchright); ordinary fetch works, anti-bot pages will not" >&2
+fi
+
 curl -fsS -X POST http://127.0.0.1:11235/fetch \
     -H 'Content-Type: application/json' \
     -d '{"url":"https://example.com/","mode":"auto","max_chars":2000}' \
     | jq -e '.ok == true and (.markdown | length > 0)' >/dev/null
-curl -fsS --get http://127.0.0.1:8888/search \
-    --data-urlencode 'q=hf2q local inference' \
-    --data 'format=json' \
-    | jq -e '.results | type == "array"' >/dev/null
+
+# An empty result set is not a working search: public engines occasionally
+# rate-limit, so retry briefly, but never report success on zero results.
+SEARCH_OK=0
+for _ in 1 2 3; do
+    if curl -fsS --get http://127.0.0.1:8888/search \
+        --data-urlencode 'q=hf2q local inference' \
+        --data 'format=json' 2>/dev/null \
+        | jq -e '.results | length > 0' >/dev/null 2>&1; then
+        SEARCH_OK=1
+        break
+    fi
+    sleep 10
+done
+[[ "$SEARCH_OK" -eq 1 ]] || {
+    echo "SearXNG returned no results after 3 attempts; engines may be rate-limiting." >&2
+    echo "Re-check later with: $0 --status" >&2
+    exit 1
+}
 
 echo
 echo "OpenCode web stack installed and verified."
+echo "Re-check at any time with: $0 --status"
 echo "Restart OpenCode, then use: web_search, web_fetch, web_crawl, web_extract."
 echo "Ruflo aliases are also present: WebSearch, WebFetch, WebCrawl, WebExtract."

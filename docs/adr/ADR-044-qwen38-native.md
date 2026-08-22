@@ -121,11 +121,23 @@ so the official Qwen3.8 checkpoint correctly failed closed as unsupported.
 
 Qwen3.8 reuses the native dense Qwen execution family without approximate
 architecture routing, while conversion and evidence remain explicit. The
-canonical launcher selects `HF2Q_QWEN_SPECULATION=auto`; the process default
-remains `off` outside that launcher. Auto is a measured candidate, not a
-promise that every request speculates: unsupported semantics, cached state
-without coherent MTP metadata, an unavailable proposer, or a negative
-per-generation cost decision stays on ordinary target decode. Vision is a
+canonical launcher selects `HF2Q_QWEN_SPECULATION=auto`. **Updated
+2026-08-21:** the qwen35 server engine now defaults to `auto` when
+`HF2Q_QWEN_SPECULATION` is unset — the launcher-only default left every
+bare `hf2q serve` on ordinary decode even though all admission paths fail
+closed (unsupported semantics, prompt-cache hits, unavailable proposer, or
+a negative per-generation cost decision stay on ordinary target decode, so
+the worst case for default-on `auto` is ordinary decode plus telemetry).
+Explicit `off` remains the operator escape. In the same change, loading a
+Qwen3.8-identified model applies the launcher's qualified decode route
+(`HF2Q_DECODE_MVN=0` + `HF2Q_DECODE_MV_EXT=1`) at engine load when those
+variables are unset; the route stays Qwen3.8-scoped because `mul_mv_ext`
+is not bit-exact and no other family carries the qualifying receipt.
+Also since 2026-08-21, `hf2q setup` persists the qualified agentic serving
+profile (repetition penalty 1.05, thinking budget 2048, tool-continuation
+budget 512) into `config.toml` when the operator optimizes for long agent
+and tool-use prompts, and `hf2q serve` applies those values only to
+environment variables the operator has not exported. Vision is a
 separately measured candidate surface and does not inherit text-only
 performance authority.
 

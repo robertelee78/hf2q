@@ -7,7 +7,7 @@ const CONFIG_KIND: &str = "hf2q.config";
 const CONFIG_SCHEMA_VERSION: i64 = 2;
 const PACKAGE: &str = "hf2q";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OperatorConfigV2 {
     kind: String,
@@ -23,13 +23,35 @@ pub(crate) struct ConvertDefaultsV2 {
     pub(crate) quant: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Qualified agentic-coding serving profile (OpenCode acceptance host,
+/// 2026-08-21). Persisted by `hf2q setup` when the operator optimizes for
+/// long agent and tool-use prompts; applied by `hf2q serve` as process
+/// defaults without overriding explicit operator environment.
+pub(crate) const AGENTIC_PROFILE_REPETITION_PENALTY: f64 = 1.05;
+pub(crate) const AGENTIC_PROFILE_THINKING_BUDGET: u32 = 2048;
+pub(crate) const AGENTIC_PROFILE_TOOL_THINKING_BUDGET: u32 = 512;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServeDefaultsV2 {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) scheduler: ConfiguredScheduler,
     pub(crate) max_slots: u32,
+    /// Server-wide repetition penalty for clients that omit the field
+    /// (`HF2Q_DEFAULT_REPETITION_PENALTY`). `None` leaves the built-in
+    /// default (1.0 = off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repetition_penalty: Option<f64>,
+    /// Default Qwen thinking budget (`HF2Q_DEFAULT_THINKING_TOKEN_BUDGET`).
+    /// `None` leaves thinking unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking_token_budget: Option<u32>,
+    /// Tool-continuation thinking budget override
+    /// (`HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET`). `None` leaves the
+    /// adaptive derivation from `thinking_token_budget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_thinking_token_budget: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,16 +113,24 @@ impl OperatorConfigV2 {
     }
 
     pub(crate) fn guide_defaults() -> Result<Self, SetupError> {
+        let mut serve = ServeDefaultsV2 {
+            host: "127.0.0.1".to_owned(),
+            port: 8081,
+            scheduler: ConfiguredScheduler::InflightBatched,
+            max_slots: 1,
+            repetition_penalty: None,
+            thinking_token_budget: None,
+            tool_thinking_token_budget: None,
+        };
+        // The guide journey optimizes for long agent and tool-use prompts
+        // (the default setup answer), so the qualified profile is part of
+        // the default configuration rather than an environment ritual.
+        serve.apply_agentic_profile();
         Self::new(
             ConvertDefaultsV2 {
                 quant: "q4_k_m".to_owned(),
             },
-            ServeDefaultsV2 {
-                host: "127.0.0.1".to_owned(),
-                port: 8081,
-                scheduler: ConfiguredScheduler::InflightBatched,
-                max_slots: 1,
-            },
+            serve,
         )
     }
 
@@ -166,6 +196,22 @@ impl ConvertDefaultsV2 {
 }
 
 impl ServeDefaultsV2 {
+    /// Persist the qualified agentic-coding profile. Called when the
+    /// operator answers yes to "Optimize serving for long agent and
+    /// tool-use prompts?" (the default answer), so a plain `hf2q serve`
+    /// picks up the same behavior the canonical OpenCode launchers export.
+    pub(crate) fn apply_agentic_profile(&mut self) {
+        self.repetition_penalty = Some(AGENTIC_PROFILE_REPETITION_PENALTY);
+        self.thinking_token_budget = Some(AGENTIC_PROFILE_THINKING_BUDGET);
+        self.tool_thinking_token_budget = Some(AGENTIC_PROFILE_TOOL_THINKING_BUDGET);
+    }
+
+    pub(crate) fn clear_agentic_profile(&mut self) {
+        self.repetition_penalty = None;
+        self.thinking_token_budget = None;
+        self.tool_thinking_token_budget = None;
+    }
+
     fn validate(&self) -> Result<(), SetupError> {
         if !matches!(self.host.as_str(), "127.0.0.1" | "0.0.0.0") {
             return Err(SetupError::InvalidConfig(
@@ -186,6 +232,13 @@ impl ServeDefaultsV2 {
             return Err(SetupError::InvalidConfig(
                 "serve.max_slots must be 1 for fifo_serial".to_owned(),
             ));
+        }
+        if let Some(penalty) = self.repetition_penalty {
+            if !penalty.is_finite() || penalty <= 0.0 {
+                return Err(SetupError::InvalidConfig(
+                    "serve.repetition_penalty must be a finite positive number".to_owned(),
+                ));
+            }
         }
         Ok(())
     }

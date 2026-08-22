@@ -28,7 +28,8 @@ a rerun. EOF or interrupted input cancels successfully without changing the
 configuration.
 
 The canonical Qwen3.8 guide defaults are Q4_K_M conversion, localhost port
-8081, and the inflight-batched scheduler with one active slot. On a fresh
+8081, the inflight-batched scheduler with one active slot, and the qualified
+agentic serving profile (see the config keys below). On a fresh
 config, automation can record those values without prompting; on a rerun the
 same flag accepts the current values. Operators using another family should
 review its scheduler support or run interactive setup:
@@ -81,11 +82,23 @@ host = "127.0.0.1"
 port = 8081
 scheduler = "inflight_batched"
 max_slots = 1
+repetition_penalty = 1.05
+thinking_token_budget = 2048
+tool_thinking_token_budget = 512
 ```
 
-Those are the only durable defaults. Model identity, revision, output path,
-cache location, source retention, auth tokens, hardware snapshots, and
-calibration state remain explicit or owned by their existing commands.
+The three profile keys are present when serving is optimized for long agent
+and tool-use prompts (the default answer); answering no omits them. They are
+the qualified agentic-coding profile: `hf2q serve` applies them as process
+defaults for `HF2Q_DEFAULT_REPETITION_PENALTY`,
+`HF2Q_DEFAULT_THINKING_TOKEN_BUDGET`, and
+`HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET` — but only to variables the operator
+has not exported, so an explicit environment always wins. Configs written
+before the profile keys existed keep loading unchanged.
+
+Model identity, revision, output path, cache location, source retention, auth
+tokens, hardware snapshots, and calibration state remain explicit or owned by
+their existing commands.
 
 The state root is mode `0700`; `config.toml`, the persistent transaction lock,
 and any partial are owned, single-link, same-device regular files at mode
@@ -112,5 +125,5 @@ An invalid config fails before source download, model load, or listener bind.
 If setup records LAN binding (`0.0.0.0`), serve also requires `--auth-token` or
 `HF2Q_AUTH_TOKEN`; setup never stores the token.
 
-See [hf2q + Qwen3.8 + AK + search/fetch: complete setup](getting-started.md) for the complete
-tested workflow using these defaults.
+See [Getting started: hf2q + OpenCode + local web research](getting-started.md)
+for the complete tested workflow using these defaults.

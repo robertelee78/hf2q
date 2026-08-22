@@ -30,56 +30,69 @@ reject_literal() {
 # There is exactly one guide. Do not reintroduce a core/complete split.
 [[ ! -e "$extra_guide" ]] || fail "second onboarding guide must not exist"
 
-# Bind the complete issue-146 journey to the exact tested artifact and harness.
+# --- Issue-146 prevention rules: bind the exact tested artifact and proof ---
 require_literal "$guide" "40d771ee15d826017f297261f5bedcf2c32cf4c2"
 require_literal "$guide" "qwen38-abliterated-sft-hf2q-q4_k_m.gguf"
 require_literal "$guide" "qwen38-abliterated-sft-hf2q-q4_k_m-mmproj.gguf"
-require_literal "$guide" "1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a"
-require_literal "$guide" "463b264713f8e081f0fae753c80d8089308e01b1e2ac0948dd9966d0711d8f1b"
+require_literal "$guide" "shasum -a 256 -c hf2q-q4_k_m-SHA256SUMS.txt"
 require_literal "$guide" "--mmproj"
-require_literal "$guide" "--port 8081"
-require_literal "$guide" "lsof -nP -iTCP:8081 -sTCP:LISTEN"
-require_literal "$guide" "kill -0 \"\$SERVER_PID\""
-require_literal "$guide" "/v1/chat/completions"
-require_literal "$guide" "data: \\[DONE\\]"
+# Generation is proven by a real client conversation, not by /readyz alone.
+require_literal "$guide" "hf2q chat"
+# Multimodal is served and proven with one simple image request.
 require_literal "$guide" "image_url"
-require_literal "$guide" "ak setup --yes"
-require_literal "$guide" "ak setup --opencode --yes"
-require_literal "$guide" "--agent build"
-require_literal "$guide" '"attachment": true'
-require_literal "$guide" '"modalities": {"input": ["text", "image"], "output": ["text"]}'
-require_literal "$guide" "preserving every existing agent, tool, permission,"
-require_literal "$guide" "agent retains Bash, read/write/edit, task, skill, and"
-require_literal "$guide" "perform a harmless proof: list the current"
-require_literal "$guide" "HF2Q_DEFAULT_REPETITION_PENALTY=1.05"
-require_literal "$guide" "HF2Q_DEFAULT_THINKING_TOKEN_BUDGET=2048"
-require_literal "$guide" "HF2Q_QWEN_SPECULATION=auto"
+require_literal "$guide" "grep -i red"
+# Full Agentic Kit: machine + project setup, OpenCode host wiring, then
+# converge-and-verify. --minimal is never presented as equivalent.
+require_literal "$guide" "ak setup"
+require_literal "$guide" "ak setup --opencode"
+require_literal "$guide" "ak sync"
+# The OpenCode provider merge preserves existing configuration.
+require_literal "$guide" "preserves every existing agent, tool, permission,"
+require_literal "$guide" "opencode.json"
+require_literal "$guide" "opencode --model"
+# The local research stack and its four tool names.
 require_literal "$guide" "install_opencode_web_stack.sh"
 require_literal "$guide" "web_search"
 require_literal "$guide" "web_fetch"
 require_literal "$guide" "web_crawl"
 require_literal "$guide" "web_extract"
-require_literal "$guide" "bash -s -- --disable"
-require_literal "$guide" "bash -s -- --uninstall"
-require_literal "$guide" "SERVER_COMMAND=\"\$(ps -p \"\$SERVER_PID\" -o command="
-require_literal "$guide" "\"--model \$MODEL\"*\"--port 8081\""
+require_literal "$guide" "--status"
 
-reject_literal "$guide" "ak setup --minimal --opencode"
+# --- The guide must not reintroduce the slop it replaced ---
+# No environment-variable ritual: qualified defaults ship in the product
+# (setup-persisted profile + engine defaults), not in the guide.
+for knob in \
+    HF2Q_TQ_KV HF2Q_ENCODER_SESSION HF2Q_FFN_TERMINAL_K_BATCH \
+    HF2Q_QWEN_SPECULATION HF2Q_DECODE_MVN HF2Q_DECODE_MV_EXT HF2Q_QWEN_GQA_Q2 \
+    HF2Q_DEFAULT_REPETITION_PENALTY HF2Q_DEFAULT_THINKING_TOKEN_BUDGET \
+    HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET
+do
+    reject_literal "$guide" "$knob"
+done
+# No background-server apparatus: the guide serves in the foreground and
+# stops with Ctrl-C, so PID files, nohup, and broad process kills are
+# forbidden.
+reject_literal "$guide" "nohup"
+reject_literal "$guide" "SERVER_PID"
+reject_literal "$guide" 'pkill -f'
+# No harness destruction: never write agents, default agents, blanket tool
+# removal, or blanket permission denial.
 reject_literal "$guide" '| .agent ='
 reject_literal "$guide" '| .default_agent ='
 reject_literal "$guide" '"tools": { "*": false }'
 reject_literal "$guide" '"permission": "deny"'
-reject_literal "$guide" 'pkill -f'
+reject_literal "$guide" "ak setup --minimal --opencode"
+# No unproved conversion substitute for the published verified pair.
 reject_literal "$guide" "hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT"
 reject_literal "$guide" "Optional: convert the pair yourself"
-reject_literal "$guide" "serves the text model only"
+
+# --- README entry point stays pointed at the one guide ---
 reject_literal "$readme" "downloads the model author's pinned Q5_K_M GGUF"
-reject_literal "$readme" "The first serving path remains text-only"
 reject_literal "$readme" "hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT"
-reject_literal "$readme" "source-first core CLI journey"
 reject_literal "$readme" "hf2q+qwen3.8+ak+search-fetch-setup.md"
 require_literal "$readme" "](docs/getting-started.md)"
 
+# --- Web-stack assets the guide's installer step depends on ---
 for asset in \
     web-search-fetch.js \
     server.py \
@@ -124,4 +137,4 @@ awk '
 ' "$guide" > "$guide_shell"
 bash -n "$guide_shell"
 
-echo "single complete getting-started guide contract passed"
+echo "getting-started guide contract passed"
