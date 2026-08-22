@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.88+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | hf2q 0.1.11 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.11` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | hf2q 0.1.12 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.12` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 # Convert a HuggingFace model to a Q4_K_M GGUF (auto-downloads via --repo)
@@ -178,6 +178,9 @@ standalone installer activates it against the stable installed binary; a Cargo
 install activates it on the first `hf2q` invocation. hf2q keeps dynamic,
 public-command-only adapters current for Bash, Zsh, and Fish, so newly added
 commands and quant/architecture values appear without regenerating snapshots.
+For `serve --model` and `--mmproj`, an empty or bare value prefers
+`${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models`; typing an explicit relative,
+home-relative, or absolute path keeps normal filesystem completion.
 Open a new shell after the first activation when hf2q reports that setup was
 updated.
 
@@ -605,7 +608,7 @@ are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/adr/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.11 serving release
+#### Test the 0.1.12 serving release
 
 Build and verify the exact checkout before loading a model:
 

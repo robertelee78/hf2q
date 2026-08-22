@@ -1,6 +1,6 @@
 [package]
 name = "hf2q"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 rust-version = "1.88.0"
 build = "src/build_script.rs"
