@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13] — 2026-08-22
+
+### Fixed
+
+- Apply canonical managed-model completion consistently to every user-facing
+  local GGUF selector: chat, generation, serving, embedding, projector, and
+  parity arguments. Hybrid `chat --model` still accepts endpoint model IDs and
+  Hugging Face repositories, explicit customer paths remain explicit, and the
+  repository-only `cache clear --model` selector remains unchanged.
+
 ## [0.1.12] — 2026-08-22
 
 ### Changed
@@ -999,7 +1009,8 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
-[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.13...HEAD
+[0.1.13]: https://github.com/robertelee78/hf2q/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/robertelee78/hf2q/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/robertelee78/hf2q/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/robertelee78/hf2q/compare/v0.1.9...v0.1.10
