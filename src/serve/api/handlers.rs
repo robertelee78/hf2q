@@ -8406,7 +8406,10 @@ hf2q_qwen_anchor_simultaneous_pending_capacity_slots {}\n\
 hf2q_qwen_anchor_partial_capacity_captures_total {}\n\
 # HELP hf2q_qwen_anchor_spec_boundary_restore_tokens_total Prompt tokens whose exact speculative boundary state was accepted from an epoch-valid SlotAware anchor.\n\
 # TYPE hf2q_qwen_anchor_spec_boundary_restore_tokens_total counter\n\
-hf2q_qwen_anchor_spec_boundary_restore_tokens_total {}\n",
+hf2q_qwen_anchor_spec_boundary_restore_tokens_total {}\n\
+# HELP hf2q_qwen_anchor_post_admission_prefill_failures_total One-shot acceptance faults injected after a successful non-empty GPU prefill slice and before scheduler publication.\n\
+# TYPE hf2q_qwen_anchor_post_admission_prefill_failures_total counter\n\
+hf2q_qwen_anchor_post_admission_prefill_failures_total {}\n",
         qwen_anchor.captures_total.load(Ordering::Relaxed),
         qwen_anchor
             .capture_budget_skips_total
@@ -8437,6 +8440,9 @@ hf2q_qwen_anchor_spec_boundary_restore_tokens_total {}\n",
             .load(Ordering::Relaxed),
         qwen_anchor
             .spec_boundary_restore_tokens_total
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .post_admission_prefill_failures_total
             .load(Ordering::Relaxed),
     );
     let qwen_mtp_fallback_reasons = format!(

@@ -47,11 +47,12 @@ use super::qwen35_anchor_store::{
     record_capture as record_qwen35_anchor_capture,
     record_configuration as record_qwen35_anchor_configuration,
     record_evictions as record_qwen35_anchor_evictions,
+    record_post_admission_prefill_failure as record_qwen35_post_admission_prefill_failure,
     record_restore_hit as record_qwen35_anchor_restore_hit,
     record_restore_miss as record_qwen35_anchor_restore_miss,
     record_spec_boundary_restore as record_qwen35_anchor_spec_boundary_restore,
     simultaneous_pending_capacity_slots as qwen35_simultaneous_pending_capacity_slots, AnchorEntry,
-    AnchorStore, DEFAULT_MAX_COMMITTED_ANCHORS,
+    AnchorStore, PostAdmissionPrefillFailure, DEFAULT_MAX_COMMITTED_ANCHORS,
 };
 
 const SLOT_AWARE_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -18195,6 +18196,9 @@ fn run_slot_aware_qwen35(
     let mut prompt_anchors: Vec<Qwen35AnchorStore> = (0..n_slots)
         .map(|_| Qwen35AnchorStore::with_committed_capacity(anchor_committed_control_capacity))
         .collect();
+    let mut post_admission_prefill_failure = PostAdmissionPrefillFailure::new(
+        crate::debug::INVESTIGATION_ENV.qwen_post_admission_prefill_failure_max_tokens,
+    );
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
@@ -18312,6 +18316,7 @@ fn run_slot_aware_qwen35(
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
                         anchor_aggregate_budget_bytes,
+                        &mut post_admission_prefill_failure,
                         &supervisor,
                         prompt_tokens,
                         params,
@@ -18370,6 +18375,7 @@ fn run_slot_aware_qwen35(
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
                         anchor_aggregate_budget_bytes,
+                        &mut post_admission_prefill_failure,
                         &supervisor,
                         prompt_tokens,
                         params,
@@ -18481,6 +18487,7 @@ fn run_slot_aware_qwen35(
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
                         anchor_aggregate_budget_bytes,
+                        &mut post_admission_prefill_failure,
                         &supervisor,
                         prompt_tokens,
                         params,
@@ -18636,6 +18643,7 @@ fn run_slot_aware_qwen35(
                     n_tokens,
                     kv_bytes_per_token,
                     anchor_aggregate_budget_bytes,
+                    &mut post_admission_prefill_failure,
                     &supervisor,
                 ) {
                     fail_qwen35_worker_after_gpu_fatal(
@@ -18729,6 +18737,7 @@ fn run_slot_aware_qwen35(
                     n_prefill_tokens,
                     kv_bytes_per_token,
                     anchor_aggregate_budget_bytes,
+                    &mut post_admission_prefill_failure,
                     &supervisor,
                 ) {
                     fail_qwen35_worker_after_gpu_fatal(
@@ -18769,6 +18778,7 @@ fn admit_qwen35_slot(
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
     anchor_aggregate_budget_bytes: u64,
+    post_admission_prefill_failure: &mut PostAdmissionPrefillFailure,
     supervisor: &EngineSupervisor,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
@@ -19256,6 +19266,7 @@ fn admit_qwen35_slot(
             1,
             kv_bytes_per_token,
             anchor_aggregate_budget_bytes,
+            post_admission_prefill_failure,
             supervisor,
         );
     }
@@ -19276,6 +19287,7 @@ fn advance_qwen35_prefill(
     requested_tokens: u32,
     kv_bytes_per_token: u64,
     anchor_aggregate_budget_bytes: u64,
+    post_admission_prefill_failure: &mut PostAdmissionPrefillFailure,
     supervisor: &EngineSupervisor,
 ) -> Option<Qwen35FatalFailure> {
     let slot_idx = handle.slot_id.0 as usize;
@@ -19345,13 +19357,36 @@ fn advance_qwen35_prefill(
     }
 
     let max_chunk_tokens = qwen35_prefill_transaction_tokens(requested_tokens);
-    let advance = state.advance(
+    let request_max_tokens = state.requested_max_tokens();
+    let mut advance = state.advance(
         guard.model,
         registration,
         guard.kv.as_mut().expect("kv Some during loop"),
         max_chunk_tokens,
         supervisor,
     );
+    let advanced_tokens = match advance.as_ref() {
+        Ok(super::engine_qwen35::Qwen35PrefillAdvance::Pending {
+            advanced_tokens, ..
+        })
+        | Ok(super::engine_qwen35::Qwen35PrefillAdvance::Ready {
+            advanced_tokens, ..
+        }) => *advanced_tokens,
+        Err(_) => 0,
+    };
+    if post_admission_prefill_failure.should_fail(request_max_tokens, advanced_tokens) {
+        record_qwen35_post_admission_prefill_failure();
+        tracing::warn!(
+            target: "hf2q::serve::api::qwen35_anchor",
+            slot = handle.slot_id.0,
+            request_max_tokens,
+            advanced_tokens,
+            "injecting one-shot post-admission Qwen prefill failure after a successful GPU slice"
+        );
+        advance = Err(anyhow::anyhow!(
+            "injected_post_admission_qwen_prefill_failure: successful GPU slice of {advanced_tokens} tokens was not published"
+        ));
+    }
     match advance {
         Ok(super::engine_qwen35::Qwen35PrefillAdvance::Pending {
             state,
@@ -43873,6 +43908,46 @@ mod qwen35_bounded_prefill_watchdog_tests {
             prompt_kv_bytes: 0,
             preferred_slot: None,
         }
+    }
+
+    #[test]
+    fn adr049_gate_proves_post_admission_failure_reset_then_rebuild() {
+        let script = include_str!("../../../scripts/test_qwen35_slot_anchor_divergence.sh");
+        for required in [
+            "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS",
+            "hf2q_qwen_anchor_post_admission_prefill_failures_total",
+            "post_admission_failure_status",
+            "^5[0-9][0-9]$",
+            "post_admission_failures_before + 1",
+            "post_failure_cold_cached == 0",
+            "post_failure_reuse_cached > 0",
+        ] {
+            assert!(
+                script.contains(required),
+                "ADR-049 gate lost mutation-sensitive contract: {required}"
+            );
+        }
+
+        let injected = script
+            .find("post_admission_failure_status=")
+            .expect("injected request must be issued");
+        let counted = script[injected..]
+            .find("post_admission_failures_after_fault=")
+            .map(|offset| injected + offset)
+            .expect("fault metric must be read after the request");
+        let ready = script[counted..]
+            .find("$BASE_URL/readyz")
+            .map(|offset| counted + offset)
+            .expect("worker readiness must be checked after the fault");
+        let cold = script[ready..]
+            .find("post_failure_cold_cached=$(cached_tokens")
+            .map(|offset| ready + offset)
+            .expect("the affected unique boundary must be retried cold");
+        let reuse = script[cold..]
+            .find("post_failure_reuse_cached=$(cached_tokens")
+            .map(|offset| cold + offset)
+            .expect("the rebuilt boundary must be reused");
+        assert!(injected < counted && counted < ready && ready < cold && cold < reuse);
     }
 
     #[test]

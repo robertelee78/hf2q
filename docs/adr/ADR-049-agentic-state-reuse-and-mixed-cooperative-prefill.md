@@ -1,9 +1,9 @@
 # ADR-049: Agentic state reuse (multi-anchor) and Mixed-phase cooperative prefill
 
 - Status: Accepted; execution in progress (qwen35-family model-free Lane A
-  proof complete at rev 5, real-artifact gates and cross-family phases open)
+  proof complete at rev 6, real-artifact gates and cross-family phases open)
 - Date: 2026-08-22
-- Updated: 2026-08-22 (rev 5, qwen35-family aggregate-budget hardening)
+- Updated: 2026-08-22 (rev 6, qwen35-family post-admission failure gate)
   — implementation commit `95d618c8`, based on main `32181b61`: explicit
   per-slot AnchorStore,
   linear-lineage pruning, fail-atomic restore preflight, exact payload
@@ -12,7 +12,7 @@
   Qwen3.6/Qwen3.8 hardware receipts are intentionally not claimed here; see
   the execution ledger below.
 - Owners: hf2q serving engine (execution: the active qwen35/qwen38 serving-lane session; plan authored by the FreeToken research session)
-- Code pins: planning review at hf2q `242882e8`; rev-5 execution based on
+- Code pins: planning review at hf2q `242882e8`; rev-6 execution based on
   merged main `32181b61`; mlx-native `0.11.2`. Anchors were authored at
   `815bd48d`; every correction-touched anchor was re-verified before editing.
 - Provenance: full paper+code study of FreeToken (arXiv 2608.16157, "FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution") mapped onto hf2q/mlx-native by a nine-agent research swarm, then adversarially reviewed by two independent external models (Kimi K3 via opencode; gpt-5.6-sol via codex, 516k-token source-grounded review). Both reviews' MUST-FIX items are incorporated; the gpt-5.6-sol review found and this ADR closes a stale-KV lineage coherence bug in the original draft (§A.2).
@@ -103,9 +103,13 @@ Mandatory regression (must exist before any restore path merges): build lineage 
    `--scheduler inflight-batched` plus an exact configurable `--max-slots`,
    truly concurrent clients, equality hits, divergent rewrites, cancellation,
    admission isolation, speculative-state carry, aggregate-capacity receipts,
-   and stale-descendant rejection. A post-admission GPU-prefill failure remains
-   a separate open hardware gate; an oversized pre-admission 4xx is not
-   evidence for that lifecycle. The script exits nonzero
+   stale-descendant rejection, and a one-shot post-admission failure after a
+   successful non-empty GPU prefill slice. That fault is centrally parsed,
+   requires `HF2Q_UNSAFE_EXPERIMENTS=1`, fires before scheduler publication,
+   and the gate requires its 5xx plus exact counter delta, worker readiness,
+   cold retry of the affected unique boundary, and reuse after rebuilding it.
+   An oversized pre-admission 4xx remains admission-isolation evidence only.
+   The script exits nonzero
    on every miss and refuses to run when the listener process arguments do not
    prove the required scheduler shape. (`bench_lcp_resume_speedup.sh` is NOT a
    gate for this feature: it drives the stride registry, issues its "4-worker"
@@ -135,12 +139,12 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 2. Document (not fix, this ADR) the two budget hazards: two independent 5%-of-RAM LCP budgets (engine.rs:3595-3597, engine_qwen35.rs:523-525 — same `default_lcp_byte_budget()` instantiated twice); `HF2Q_KV_PERSIST` carries THREE meanings (path — serve/mod.rs:974; `"0"` disable — :4457-4485; `"1"`/`"on"` enable — kv_persist/families/gemma4_dense.rs:21, kv_persist/index.rs:9). State the registry end-state: the SerialFifo registry + disk hydrate is the *permanent restart-hydrate tier* until the A.7 follow-on ADR replaces it — documented scope, not a stub.
 3. Import FreeToken's evaluation discipline into release evidence: report worst-case (tail) TTFT against client watchdog ceilings, not just means; an agentic-stability criterion (decode rate within a fixed % of single-turn under the N=4 workload); the A.4 strict-equality idle conservation audit; a reference-model invariant battery over the AnchorStore state machine (injected-mutation style — FreeToken's equivalent suite caught 17/17).
 
-### Qwen execution ledger — rev 5
+### Qwen execution ledger — rev 6
 
 Model-free evidence from the implementation lineage beginning at `95d618c8`
-and its rev-5 hardening checkpoint:
+and its rev-6 gate-hardening checkpoint:
 
-- `qwen35_anchor_store` has an independent reference state machine and twelve
+- `qwen35_anchor_store` has an independent reference state machine and fourteen
   focused tests. The mutation battery rejects 17/17 injected corruptions;
   A→B→C/rewind removes B and C before branch X can write; pending state is
   affinity-invisible; eviction is positional keep-newest-K; accounting charges
@@ -178,13 +182,17 @@ and its rev-5 hardening checkpoint:
   exact owned bytes. Pending capture never grows committed control storage;
   publication evicts before its push, and a deliberately tiny grant selects
   zero control capacity instead of allocating then idle-failing. The rejected
-  oversized request is correctly classified
-  as admission isolation, leaving post-admission GPU-prefill failure open.
+  oversized request is correctly classified as admission isolation. The
+  real-artifact script separately arms a one-shot failure only after a
+  successful non-empty GPU prefill slice and requires full-store invalidation,
+  hard-reset recovery, a cold unique-boundary retry, and reuse after rebuilding.
+  Its Qwen3.6/Qwen3.8 hardware receipts remain open.
 
 Open proof work is concrete rather than implied by these unit results: run the
 new concurrent SlotAware divergence gate plus every-depth cold byte comparison
 on both Qwen3.6-35B-A3B and Qwen3.8-27B at 2,048- and 4,096-token transaction
-widths; record cancellation, post-admission failed-prefill, speculative-state,
+widths; execute and record cancellation, post-admission failed-prefill,
+speculative-state,
 tail-TTFT,
 append-only-no-regression, and N=4 stability receipts. The release driver owns
 that hardware window. Gemma4/deepseek4 parity and Lane B remain required by the

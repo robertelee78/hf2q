@@ -7,7 +7,11 @@ set -euo pipefail
 # count, builds an A->B->C checkpoint lineage, rewinds to A for branch X, and rejects reuse of
 # stale B/C descendants. It also overlaps four clients, cancels the owner,
 # verifies rollback reuse, and requires speculative cached-state reuse to
-# remain live.
+# remain live. Start the server with both
+# `HF2Q_UNSAFE_EXPERIMENTS=1` and
+# `HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS=39` (or the
+# matching value below): the gate consumes that one-shot fault only after a
+# real, non-empty GPU prefill slice succeeds.
 
 BASE_URL=${BASE_URL:-http://127.0.0.1:8081}
 MODEL=${MODEL:-}
@@ -20,6 +24,7 @@ OVERFLOW_WORDS=${OVERFLOW_WORDS:-300000}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-900}
 SEMANTIC_WAIT_SECONDS=${SEMANTIC_WAIT_SECONDS:-180}
 EXPECTED_MAX_SLOTS=${EXPECTED_MAX_SLOTS:-4}
+POST_ADMISSION_FAILURE_MAX_TOKENS=${POST_ADMISSION_FAILURE_MAX_TOKENS:-39}
 
 for command in awk curl jq lsof ps rg sed; do
   command -v "$command" >/dev/null || {
@@ -28,13 +33,22 @@ for command in awk curl jq lsof ps rg sed; do
   }
 done
 for setting in CONTEXT_LINES ACTIVE_MAX_TOKENS OVERFLOW_WORDS \
-  CURL_MAX_TIME_SECONDS SEMANTIC_WAIT_SECONDS EXPECTED_MAX_SLOTS; do
+  CURL_MAX_TIME_SECONDS SEMANTIC_WAIT_SECONDS EXPECTED_MAX_SLOTS \
+  POST_ADMISSION_FAILURE_MAX_TOKENS; do
   value=${!setting}
   if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
     echo "$setting must be a positive integer (got: $value)" >&2
     exit 2
   fi
 done
+(( POST_ADMISSION_FAILURE_MAX_TOKENS >= 39 && POST_ADMISSION_FAILURE_MAX_TOKENS <= 96 )) || {
+  echo "POST_ADMISSION_FAILURE_MAX_TOKENS must be in [39, 96] to avoid earlier gate requests" >&2
+  exit 2
+}
+(( POST_ADMISSION_FAILURE_MAX_TOKENS != ACTIVE_MAX_TOKENS )) || {
+  echo "POST_ADMISSION_FAILURE_MAX_TOKENS must differ from ACTIVE_MAX_TOKENS" >&2
+  exit 2
+}
 
 mkdir -p "$OUT_DIR"
 
@@ -110,6 +124,7 @@ hits_before=$(metric hf2q_qwen_anchor_restore_hits_total)
 pruned_before=$(metric hf2q_qwen_anchor_descendants_pruned_total)
 spec_cached_before=$(metric hf2q_qwen_speculation_cached_tokens_total)
 spec_anchor_cached_before=$(metric hf2q_qwen_anchor_spec_boundary_restore_tokens_total)
+post_admission_failures_before=$(metric hf2q_qwen_anchor_post_admission_prefill_failures_total)
 
 jq -n --arg model "$MODEL" --arg run "$RUN_ID" --rawfile context "$context_file" '{
   model: $model,
@@ -309,13 +324,90 @@ overflow_status=$(curl --silent --show-error --output "$overflow_response" --wri
   exit 1
 }
 
-post_failure_request="$OUT_DIR/post-failure.request.json"
-post_failure_response="$OUT_DIR/post-failure.response.json"
-jq '.max_tokens = 38' "$request_x" >"$post_failure_request"
-post_json "$post_failure_request" "$post_failure_response"
-post_failure_cached=$(cached_tokens "$post_failure_response")
-(( post_failure_cached > 0 )) || {
+post_rejected_admission_request="$OUT_DIR/post-rejected-admission.request.json"
+post_rejected_admission_response="$OUT_DIR/post-rejected-admission.response.json"
+jq '.max_tokens = 38' "$request_x" >"$post_rejected_admission_request"
+post_json "$post_rejected_admission_request" "$post_rejected_admission_response"
+post_rejected_admission_cached=$(cached_tokens "$post_rejected_admission_response")
+(( post_rejected_admission_cached > 0 )) || {
   echo "committed anchor was lost after rejected oversized prefill" >&2
+  exit 1
+}
+
+# Establish a boundary unique to one slot, then extend it with the one-shot
+# failure budget. The injected error occurs only after state.advance() returns
+# a successful, non-empty GPU slice and before scheduler publication. The
+# ordinary failed-slice path must therefore clear both the retained ledger and
+# the complete AnchorStore, hard-reset the physical slot, release it, and keep
+# the worker ready. A cold retry of the unique prior boundary proves stale
+# anchors did not survive; a second retry proves the recovered slot can anchor
+# and reuse again.
+failure_base_request="$OUT_DIR/post-admission-base.request.json"
+failure_base_response="$OUT_DIR/post-admission-base.response.json"
+jq -n --slurpfile request "$request_x" --slurpfile response "$response_x" \
+  --argjson max_tokens "$((POST_ADMISSION_FAILURE_MAX_TOKENS + 1))" '{
+  model: $request[0].model,
+  messages: ($request[0].messages + [$response[0].choices[0].message,
+    {role: "user", content: "ADR-049 unique failed-prefill recovery base. Reply briefly."}]),
+  temperature: 0, max_tokens: $max_tokens, stream: false
+}' >"$failure_base_request"
+post_json "$failure_base_request" "$failure_base_response"
+failure_base_cached=$(cached_tokens "$failure_base_response")
+(( failure_base_cached > 0 )) || {
+  echo "post-admission failure base did not reuse branch X" >&2
+  exit 1
+}
+
+post_admission_failure_request="$OUT_DIR/post-admission-failure.request.json"
+post_admission_failure_response="$OUT_DIR/post-admission-failure.response.json"
+jq -n --slurpfile request "$failure_base_request" \
+  --slurpfile response "$failure_base_response" \
+  --argjson max_tokens "$POST_ADMISSION_FAILURE_MAX_TOKENS" '{
+  model: $request[0].model,
+  messages: ($request[0].messages + [$response[0].choices[0].message,
+    {role: "user", content: "This admitted suffix must fail only after its GPU prefill slice succeeds."}]),
+  temperature: 0, max_tokens: $max_tokens, stream: false
+}' >"$post_admission_failure_request"
+post_admission_failure_status=$(curl --silent --show-error \
+  --output "$post_admission_failure_response" --write-out '%{http_code}' \
+  --connect-timeout 5 --max-time "$CURL_MAX_TIME_SECONDS" \
+  -H 'Content-Type: application/json' --data-binary "@$post_admission_failure_request" \
+  "$BASE_URL/v1/chat/completions")
+[[ "$post_admission_failure_status" =~ ^5[0-9][0-9]$ ]] || {
+  echo "post-admission prefill fault did not return 5xx (HTTP $post_admission_failure_status)" >&2
+  exit 1
+}
+post_admission_failures_after_fault=$(
+  metric hf2q_qwen_anchor_post_admission_prefill_failures_total
+)
+(( post_admission_failures_after_fault == post_admission_failures_before + 1 )) || {
+  echo "post-admission prefill fault counter did not advance exactly once" >&2
+  exit 1
+}
+curl --fail-with-body --silent --show-error "$BASE_URL/readyz" >/dev/null || {
+  echo "Qwen worker was not ready after recoverable post-admission prefill failure" >&2
+  exit 1
+}
+
+post_failure_cold_request="$OUT_DIR/post-admission-cold-recovery.request.json"
+post_failure_cold_response="$OUT_DIR/post-admission-cold-recovery.response.json"
+jq --argjson max_tokens "$((POST_ADMISSION_FAILURE_MAX_TOKENS + 2))" \
+  '.max_tokens = $max_tokens' "$failure_base_request" >"$post_failure_cold_request"
+post_json "$post_failure_cold_request" "$post_failure_cold_response"
+post_failure_cold_cached=$(cached_tokens "$post_failure_cold_response")
+(( post_failure_cold_cached == 0 )) || {
+  echo "failed-prefill slot retained stale cache state ($post_failure_cold_cached cached tokens)" >&2
+  exit 1
+}
+
+post_failure_reuse_request="$OUT_DIR/post-admission-reuse.request.json"
+post_failure_reuse_response="$OUT_DIR/post-admission-reuse.response.json"
+jq --argjson max_tokens "$((POST_ADMISSION_FAILURE_MAX_TOKENS + 3))" \
+  '.max_tokens = $max_tokens' "$failure_base_request" >"$post_failure_reuse_request"
+post_json "$post_failure_reuse_request" "$post_failure_reuse_response"
+post_failure_reuse_cached=$(cached_tokens "$post_failure_reuse_response")
+(( post_failure_reuse_cached > 0 )) || {
+  echo "slot did not rebuild and reuse an anchor after failed-prefill reset" >&2
   exit 1
 }
 
@@ -329,6 +421,7 @@ pending_capacity_slots=$(metric hf2q_qwen_anchor_simultaneous_pending_capacity_s
 configured_slots=$(metric hf2q_qwen_anchor_configured_slots)
 aggregate_anchor_budget=$(metric hf2q_qwen_anchor_aggregate_budget_bytes)
 aggregate_anchor_peak=$(metric hf2q_qwen_anchor_aggregate_peak_committed_pending_bytes)
+post_admission_failures_after=$(metric hf2q_qwen_anchor_post_admission_prefill_failures_total)
 
 (( captures_after > captures_before )) || { echo "anchor capture telemetry did not move" >&2; exit 1; }
 (( hits_after >= hits_before + 4 )) || { echo "too few anchor restore hits" >&2; exit 1; }
@@ -353,6 +446,10 @@ aggregate_anchor_peak=$(metric hf2q_qwen_anchor_aggregate_peak_committed_pending
   echo "aggregate anchor peak exceeded budget ($aggregate_anchor_peak > $aggregate_anchor_budget)" >&2
   exit 1
 }
+(( post_admission_failures_after == post_admission_failures_before + 1 )) || {
+  echo "post-admission prefill fault fired more than once" >&2
+  exit 1
+}
 
 summary="$OUT_DIR/summary.json"
 jq -n \
@@ -364,6 +461,10 @@ jq -n \
   --argjson stale_old_c_cached "$old_c_cached" \
   --argjson cancellation_siblings 3 \
   --argjson rejected_prefill_http "$overflow_status" \
+  --argjson post_admission_failed_prefill_http "$post_admission_failure_status" \
+  --argjson post_admission_failed_prefill_faults_delta "$((post_admission_failures_after - post_admission_failures_before))" \
+  --argjson post_failure_cold_cached_tokens "$post_failure_cold_cached" \
+  --argjson post_failure_reuse_cached_tokens "$post_failure_reuse_cached" \
   --argjson restore_hits_delta "$((hits_after - hits_before))" \
   --argjson descendants_pruned_delta "$((pruned_after - pruned_before))" \
   --argjson speculative_cached_tokens_delta "$((spec_cached_after - spec_cached_before))" \
@@ -382,6 +483,10 @@ jq -n \
     concurrent_clients: 4,
     cancellation_siblings: $cancellation_siblings,
     rejected_admission_http: $rejected_prefill_http,
+    post_admission_failed_prefill_http: $post_admission_failed_prefill_http,
+    post_admission_failed_prefill_faults_delta: $post_admission_failed_prefill_faults_delta,
+    post_failure_cold_cached_tokens: $post_failure_cold_cached_tokens,
+    post_failure_reuse_cached_tokens: $post_failure_reuse_cached_tokens,
     restore_hits_delta: $restore_hits_delta,
     descendants_pruned_delta: $descendants_pruned_delta,
     speculative_cached_tokens_delta: $speculative_cached_tokens_delta,
