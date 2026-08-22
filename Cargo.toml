@@ -127,9 +127,10 @@ thiserror = "2"
 # machine-readable packed-affine capability contract and bounded D512
 # prefill-tail reads plus exact GGML routing/capability and host-side GGUF
 # evidence reads, typed resolved-dispatch traces, exact Q4_K inference, and
-# direct packed Q5_K/Q6_K embedding gathers and deterministic lowest-index
-# argmax tie handling require mlx-native 0.11.2.
-mlx-native = "=0.11.2"
+# direct packed Q5_K/Q6_K embedding gathers, native scalar GGUF execution,
+# deterministic lowest-index argmax tie handling, and truthful Metal commit
+# telemetry require mlx-native 0.12.0.
+mlx-native = "=0.12.0"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).

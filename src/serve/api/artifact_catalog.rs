@@ -282,12 +282,17 @@ mod tests {
             filename: if selectable {
                 "model-q5_k_m.gguf".into()
             } else {
-                "model-bf16.gguf".into()
+                "mmproj-model-f16.gguf".into()
             },
             bytes: 42,
             sha256: "b".repeat(64),
-            quant_hint: Some(if selectable { "Q5_K_M" } else { "BF16" }.into()),
-            role: "text_model".into(),
+            quant_hint: selectable.then(|| "Q5_K_M".into()),
+            role: if selectable {
+                "text_model"
+            } else {
+                "companion"
+            }
+            .into(),
             selectable,
             unavailable_reason: (!selectable).then(|| "unsupported".into()),
         }

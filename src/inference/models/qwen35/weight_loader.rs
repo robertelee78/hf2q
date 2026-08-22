@@ -118,6 +118,24 @@ pub struct DenseFfnWeightsQ {
     pub hidden_size: u32,
 }
 
+/// Per-layer dense SwiGLU weights retaining native scalar GGUF storage.
+///
+/// F32, F16, and BF16 buffers remain typed Metal buffers exactly as loaded;
+/// execution selects the matching dense kernel per projection. This is
+/// intentionally separate from [`DenseFfnWeights`] so production GGUF loads
+/// can never materialize a second F32 copy as an incidental CPU-reference
+/// representation.
+pub struct DenseFfnWeightsNative {
+    pub gate: MlxBuffer,
+    pub up: MlxBuffer,
+    pub down: MlxBuffer,
+    pub gate_type: GgmlType,
+    pub up_type: GgmlType,
+    pub down_type: GgmlType,
+    pub intermediate_size: u32,
+    pub hidden_size: u32,
+}
+
 /// Load a tensor from the GGUF, dequantize to f32, and download into
 /// a `Vec<f32>`.
 pub fn load_f32_tensor(gguf: &GgufFile, name: &str, device: &MlxDevice) -> Result<Vec<f32>> {
@@ -174,10 +192,6 @@ pub(super) fn load_native_projection(
         info.shape
     );
     anyhow::ensure!(
-        info.ggml_type != GgmlType::F16,
-        "native Qwen projection '{name}' is F16; the encoder lacks a direct F16 projection and inference refuses to substitute another storage format"
-    );
-    anyhow::ensure!(
         cols % info.ggml_type.block_values() as usize == 0,
         "native Qwen projection '{name}' row width {cols} is not aligned to {:?}'s {}-value blocks",
         info.ggml_type,
@@ -194,31 +208,19 @@ pub(super) fn load_native_projection(
         info.ggml_type
     );
     let buffer = load_tensor_with_residency(gguf, name, device)?;
-    let loaded_bytes = match info.ggml_type {
-        GgmlType::F32 => {
-            anyhow::ensure!(
-                buffer.dtype() == MlxDType::F32,
-                "native Qwen projection '{name}' F32 tensor loaded as {:?}",
-                buffer.dtype()
-            );
-            buffer
-                .as_slice::<f32>()
-                .map_err(|e| anyhow!("map native Qwen projection '{name}': {e}"))?
-                .len()
-                * std::mem::size_of::<f32>()
-        }
-        _ => {
-            anyhow::ensure!(
-                buffer.dtype() == MlxDType::U8,
-                "native Qwen projection '{name}' quantized tensor loaded as {:?}",
-                buffer.dtype()
-            );
-            buffer
-                .as_slice::<u8>()
-                .map_err(|e| anyhow!("map native Qwen projection '{name}': {e}"))?
-                .len()
-        }
+    let expected_dtype = match info.ggml_type {
+        GgmlType::F32 => MlxDType::F32,
+        GgmlType::F16 => MlxDType::F16,
+        GgmlType::BF16 => MlxDType::BF16,
+        _ => MlxDType::U8,
     };
+    anyhow::ensure!(
+        buffer.dtype() == expected_dtype,
+        "native Qwen projection '{name}' {:?} tensor loaded as {:?}",
+        info.ggml_type,
+        buffer.dtype()
+    );
+    let loaded_bytes = buffer.data_byte_len();
     anyhow::ensure!(
         loaded_bytes == expected,
         "native Qwen projection '{name}' loaded byte length {loaded_bytes} != {expected}"
@@ -1391,7 +1393,7 @@ pub fn load_dense_ffn(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DenseFfnStorage {
-    Float,
+    NativeScalar,
     Quantized,
 }
 
@@ -1401,7 +1403,7 @@ pub(super) fn dense_ffn_storage(
     up: GgmlType,
     down: GgmlType,
 ) -> Result<DenseFfnStorage> {
-    let is_float = |t: GgmlType| matches!(t, GgmlType::F16 | GgmlType::F32);
+    let is_scalar = |t: GgmlType| matches!(t, GgmlType::F16 | GgmlType::BF16 | GgmlType::F32);
     let is_supported_quant = |t: GgmlType| {
         matches!(
             t,
@@ -1409,8 +1411,8 @@ pub(super) fn dense_ffn_storage(
         )
     };
 
-    if is_float(gate) && is_float(up) && is_float(down) {
-        return Ok(DenseFfnStorage::Float);
+    if is_scalar(gate) && is_scalar(up) && is_scalar(down) {
+        return Ok(DenseFfnStorage::NativeScalar);
     }
     if is_supported_quant(gate) && is_supported_quant(up) && is_supported_quant(down) {
         anyhow::ensure!(
@@ -1425,6 +1427,52 @@ pub(super) fn dense_ffn_storage(
         "layer {layer_idx}: unsupported or mixed dense FFN storage: \
          gate={gate:?}, up={up:?}, down={down:?}; refusing a silent F32 expansion"
     ))
+}
+
+/// Load native scalar dense-FFN projections without changing their storage
+/// dtype or allocating a dequantized/re-encoded shadow.
+pub fn load_dense_ffn_native(
+    gguf: &GgufFile,
+    layer_idx: u32,
+    cfg: &Qwen35Config,
+    device: &MlxDevice,
+) -> Result<DenseFfnWeightsNative> {
+    let p = format!("blk.{layer_idx}");
+    let hidden_size = cfg.hidden_size;
+    let intermediate_size = cfg
+        .intermediate_size
+        .ok_or_else(|| anyhow!("layer {layer_idx}: dense FFN but intermediate size is absent"))?;
+    let (gate, gate_type) = load_native_projection(
+        gguf,
+        &format!("{p}.ffn_gate.weight"),
+        intermediate_size as usize,
+        hidden_size as usize,
+        device,
+    )?;
+    let (up, up_type) = load_native_projection(
+        gguf,
+        &format!("{p}.ffn_up.weight"),
+        intermediate_size as usize,
+        hidden_size as usize,
+        device,
+    )?;
+    let (down, down_type) = load_native_projection(
+        gguf,
+        &format!("{p}.ffn_down.weight"),
+        hidden_size as usize,
+        intermediate_size as usize,
+        device,
+    )?;
+    Ok(DenseFfnWeightsNative {
+        gate,
+        up,
+        down,
+        gate_type,
+        up_type,
+        down_type,
+        intermediate_size,
+        hidden_size,
+    })
 }
 
 pub(super) fn dense_ffn_tensor_types(
@@ -1550,9 +1598,9 @@ pub fn load_ffn(
                 DenseFfnStorage::Quantized => Qwen35FfnWeights::DenseQ(load_dense_ffn_quantized(
                     gguf, layer_idx, cfg, device,
                 )?),
-                DenseFfnStorage::Float => {
-                    Qwen35FfnWeights::Dense(load_dense_ffn(gguf, layer_idx, device)?)
-                }
+                DenseFfnStorage::NativeScalar => Qwen35FfnWeights::DenseNative(
+                    load_dense_ffn_native(gguf, layer_idx, cfg, device)?,
+                ),
             }
         }
         Qwen35Variant::Moe => {
@@ -1585,12 +1633,19 @@ mod tests {
     }
 
     #[test]
-    fn dense_float_fixtures_use_explicit_float_storage() {
+    fn dense_scalar_fixtures_keep_native_storage() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for storage in [GgmlType::F32, GgmlType::F16, GgmlType::BF16] {
+            assert_eq!(
+                dense_ffn_storage(0, storage, storage, storage)
+                    .expect("native scalar fixtures remain supported"),
+                DenseFfnStorage::NativeScalar
+            );
+        }
         assert_eq!(
-            dense_ffn_storage(0, GgmlType::F32, GgmlType::F16, GgmlType::F32)
-                .expect("float fixtures remain supported"),
-            DenseFfnStorage::Float
+            dense_ffn_storage(1, GgmlType::F32, GgmlType::F16, GgmlType::BF16)
+                .expect("mixed native scalar storage is dispatched per projection"),
+            DenseFfnStorage::NativeScalar
         );
     }
 

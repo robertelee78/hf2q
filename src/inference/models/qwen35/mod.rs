@@ -49,6 +49,7 @@ pub mod ffn;
 pub mod forward_cpu;
 pub mod forward_gpu;
 pub mod full_attn;
+pub(super) mod gguf_preflight;
 pub mod gpu_delta_net;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;

@@ -1022,7 +1022,7 @@ mod tests {
                 {"candidate_id":"q6-candidate","filename":"gguf/model-q6_k.gguf","bytes":22431000128_u64,"quant_hint":"Q6_K","role":"text_model","selectable":true,"unavailable_reason":null},
                 {"candidate_id":"q5-candidate","filename":"gguf/model-q5_k_m.gguf","bytes":19535701568_u64,"quant_hint":"Q5_K_M","role":"text_model","selectable":true,"unavailable_reason":null},
                 {"candidate_id":"q8-candidate","filename":"gguf/model-q8_0.gguf","bytes":28000000000_u64,"quant_hint":"Q8_0","role":"text_model","selectable":true,"unavailable_reason":null},
-                {"candidate_id":null,"filename":"gguf/model-bf16.gguf","bytes":54657734208_u64,"quant_hint":"BF16","role":"text_model","selectable":false,"unavailable_reason":"BF16 unsupported"},
+                {"candidate_id":"bf16-candidate","filename":"gguf/model-bf16.gguf","bytes":54657734208_u64,"quant_hint":"BF16","role":"text_model","selectable":true,"unavailable_reason":null},
                 {"candidate_id":null,"filename":"gguf/mmproj-f16.gguf","bytes":927607264_u64,"quant_hint":null,"role":"companion","selectable":false,"unavailable_reason":"not a text model"}
             ]
         }))
@@ -1040,7 +1040,7 @@ mod tests {
             "schema_version": LOCAL_ARTIFACT_SCHEMA,
             "candidates": [
                 {"candidate_id":"local-q4","repository":"owner/mixed","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filename":"model-q4_k_m.gguf","bytes":16810714848_u64,"quant_hint":"Q4_K_M","origin":"local_receipt","role":"text_model","selectable":true,"unavailable_reason":null},
-                {"candidate_id":null,"repository":"owner/mixed","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filename":"model-bf16.gguf","bytes":54000000000_u64,"quant_hint":"BF16","origin":"local_receipt","role":"text_model","selectable":false,"unavailable_reason":"GGUF quant is not supported by the current mlx-native diagnostic loader"}
+                {"candidate_id":"local-bf16","repository":"owner/mixed","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filename":"model-bf16.gguf","bytes":54000000000_u64,"quant_hint":"BF16","origin":"local_receipt","role":"text_model","selectable":true,"unavailable_reason":null}
             ]
         }))
     }
@@ -1231,7 +1231,7 @@ mod tests {
         assert_eq!(picked.as_deref(), Some("q6-candidate"));
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Q5_K_M"));
-        assert!(output.contains("BF16 unsupported"));
+        assert!(output.contains("BF16"));
         assert!(output.contains("not a text model"));
         let _ = stop.send(());
     }

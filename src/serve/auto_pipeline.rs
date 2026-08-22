@@ -118,6 +118,7 @@ pub fn looks_like_hf_repo_id(arg: &str) -> bool {
 /// conversion CLI.
 fn map_quant_to_cli(quant: QuantType) -> &'static str {
     match quant {
+        QuantType::BF16 => "bf16",
         QuantType::Q2_K => "q2_k",
         QuantType::Q8_0 => "q8_0",
         QuantType::Q6_K => "q6_k",
@@ -746,6 +747,7 @@ mod tests {
 
     #[test]
     fn map_quant_uses_exact_conversion_selectors() {
+        assert_eq!(map_quant_to_cli(QuantType::BF16), "bf16");
         assert_eq!(map_quant_to_cli(QuantType::Q2_K), "q2_k");
         assert_eq!(map_quant_to_cli(QuantType::Q8_0), "q8_0");
         assert_eq!(map_quant_to_cli(QuantType::Q6_K), "q6_k");

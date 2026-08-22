@@ -2,13 +2,13 @@ use anyhow::{bail, ensure, Context, Result};
 use mlx_native::gguf::GgufFile;
 use mlx_native::{MlxBuffer, MlxDevice};
 
-use super::ffn::{DenseFfnWeights, MoeFfnShape};
+use super::ffn::MoeFfnShape;
 use super::gpu_ffn::{DenseFfnWeightsGpu, DenseFfnWeightsGpuQ, MoeFfnWeightsGpuQ};
 use super::gpu_full_attn::{upload_f32_weight, FullAttnQGateWeightsGpu};
 use super::mtp::{MtpFfnWeightsGpu, MtpFullAttnWeightsGpu, MtpQGateWeightsGpu, MtpWeights};
 use super::weight_loader::{
-    dense_ffn_storage, dense_ffn_tensor_types, load_dense_ffn_quantized, load_f32_tensor,
-    load_moe_ffn_quantized, load_native_projection, DenseFfnStorage,
+    dense_ffn_storage, dense_ffn_tensor_types, load_dense_ffn_native, load_dense_ffn_quantized,
+    load_f32_tensor, load_moe_ffn_quantized, load_native_projection, DenseFfnStorage,
 };
 use super::Qwen35Config;
 use crate::serve::forward_mlx_shared::MlxQWeight;
@@ -80,6 +80,7 @@ pub fn load_mtp_weights_if_present_with_shared_head(
                  mtp_use_dedicated_embeddings=True"
                     )
                 })?;
+        super::model::ensure_qwen_native_weight_has_no_f16_shadow(&embed_tokens_tname, &buf)?;
         super::forward_gpu::ensure_native_embedding_admitted(&buf)
             .with_context(|| format!("admit direct execution for {embed_tokens_tname}"))?;
         super::weight_pool::register_weight_buffer(device, &buf.buffer)
@@ -123,70 +124,74 @@ pub fn load_mtp_weights_if_present_with_shared_head(
     // that same tied token-embedding allocation. Convert correctly skips emitting
     // `blk.{N}.nextn.shared_head_head.weight` in this configuration.
     //
-    // Resolution: if the dedicated tensor is present we use its native GGUF
-    // buffer (Qwen3.5 MTP); otherwise shared mode borrows the resolved main
-    // head allocation. `vocab_size` is derived from the row count of the exact
-    // tensor selected by that rule.
+    // Resolution follows metadata, not tensor-presence preference. Dedicated
+    // mode requires its own head; shared mode requires that tensor to be absent
+    // and borrows the resolved main head allocation. This prevents an
+    // inconsistent GGUF from silently replacing the target head used by MTP.
+    // `vocab_size` is derived from the exact tensor selected by that rule.
     let shared_head_head_tname = format!("{nextn}.shared_head_head.weight");
-    let (shared_head_head, shared_head_head_ggml_type, vocab_size, shared_head_head_source) =
-        if let Some(info) = gguf.tensor_info(&shared_head_head_tname) {
-            ensure!(
-                info.shape.len() == 2 && info.shape[1] == h,
-                "{shared_head_head_tname} shape {:?} is not [vocab, {h}]",
-                info.shape
+    let (shared_head_head, shared_head_head_ggml_type, vocab_size, shared_head_head_source) = if cfg
+        .mtp_use_dedicated_embeddings
+    {
+        let info = gguf.tensor_info(&shared_head_head_tname).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "qwen35 MTP loader: `{shared_head_head_tname}` is missing while mtp_use_dedicated_embeddings=True"
+                )
+            })?;
+        ensure!(
+            info.shape.len() == 2 && info.shape[1] == h,
+            "{shared_head_head_tname} shape {:?} is not [vocab, {h}]",
+            info.shape
+        );
+        let vocab = info.shape[0];
+        let (buffer, ggml_type) =
+            load_native_projection(gguf, &shared_head_head_tname, vocab, h, device)?;
+        (
+            buffer,
+            ggml_type,
+            vocab as u32,
+            shared_head_head_tname.clone(),
+        )
+    } else {
+        ensure!(
+                gguf.tensor_info(&shared_head_head_tname).is_none(),
+                "qwen35 MTP loader: mtp_use_dedicated_embeddings=False but `{shared_head_head_tname}` is present; refusing a silent shared-head replacement"
             );
-            let vocab = info.shape[0];
-            let (buffer, ggml_type) =
-                load_native_projection(gguf, &shared_head_head_tname, vocab, h, device)?;
-            (
-                buffer,
-                ggml_type,
-                vocab as u32,
-                shared_head_head_tname.clone(),
-            )
-        } else if !cfg.mtp_use_dedicated_embeddings {
-            // Shared mode: borrow the physical main LM head. GGUF represents
-            // tied Qwen3.5 heads by omitting output.weight; in that case the
-            // exact token_embd.weight blocks are the authoritative head.
-            let main_lm = if gguf.tensor_info("output.weight").is_some() {
-                "output.weight"
-            } else {
-                "token_embd.weight"
-            };
-            if let Some(main) = main_output_head {
-                ensure!(
+        // Shared mode: borrow the physical main LM head. GGUF represents
+        // tied Qwen3.5 heads by omitting output.weight; in that case the
+        // exact token_embd.weight blocks are the authoritative head.
+        let main_lm = if gguf.tensor_info("output.weight").is_some() {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        if let Some(main) = main_output_head {
+            ensure!(
                     main.affine.is_none() && main.info.cols == h,
                     "qwen35 MTP loader: supplied shared output head is not a native [vocab,{h}] GGUF projection"
                 );
-                (
-                    main.buffer.clone(),
-                    main.info.ggml_dtype,
-                    main.info.rows as u32,
-                    main_lm.to_string(),
-                )
-            } else {
-                let info = gguf.tensor_info(main_lm).ok_or_else(|| {
+            (
+                main.buffer.clone(),
+                main.info.ggml_dtype,
+                main.info.rows as u32,
+                main_lm.to_string(),
+            )
+        } else {
+            let info = gguf.tensor_info(main_lm).ok_or_else(|| {
                     anyhow::anyhow!(
                         "qwen35 MTP loader: shared head missing and resolved main head {main_lm} absent"
                     )
                 })?;
-                ensure!(
-                    info.shape.len() == 2 && info.shape[1] == h,
-                    "{main_lm} shape {:?} is not [vocab, {h}]",
-                    info.shape
-                );
-                let vocab = info.shape[0];
-                let (buffer, ggml_type) = load_native_projection(gguf, main_lm, vocab, h, device)?;
-                (buffer, ggml_type, vocab as u32, main_lm.to_string())
-            }
-        } else {
-            bail!(
-                "qwen35 MTP loader: `{shared_head_head_tname}` is missing AND \
-                 mtp_use_dedicated_embeddings=True — cannot resolve the MTP final \
-                 projection. Re-emit the GGUF with the dedicated tensor or set the \
-                 flag to false."
+            ensure!(
+                info.shape.len() == 2 && info.shape[1] == h,
+                "{main_lm} shape {:?} is not [vocab, {h}]",
+                info.shape
             );
-        };
+            let vocab = info.shape[0];
+            let (buffer, ggml_type) = load_native_projection(gguf, main_lm, vocab, h, device)?;
+            (buffer, ggml_type, vocab as u32, main_lm.to_string())
+        }
+    };
     tracing::info!(
         mtp_layer = layer_index,
         source = %shared_head_head_source,
@@ -372,25 +377,11 @@ fn load_mtp_dense_ffn(
                 intermediate_size,
             ))
         }
-        DenseFfnStorage::Float => {
-            let h = cfg.hidden_size as usize;
-            let gate_name = format!("{p}.ffn_gate.weight");
-            let gate = load_f32_tensor(gguf, &gate_name, device)?;
-            ensure!(gate.len() % h == 0, "{gate_name} width mismatch");
-            let intermediate = gate.len() / h;
-            let up = load_f32_tensor(gguf, &format!("{p}.ffn_up.weight"), device)?;
-            let down = load_f32_tensor(gguf, &format!("{p}.ffn_down.weight"), device)?;
-            ensure!(
-                up.len() == intermediate * h,
-                "{p}.ffn_up.weight shape mismatch"
-            );
-            ensure!(
-                down.len() == h * intermediate,
-                "{p}.ffn_down.weight shape mismatch"
-            );
-            let weights =
-                DenseFfnWeightsGpu::from_cpu(&DenseFfnWeights { gate, up, down }, device)?;
-            let intermediate_size = intermediate as u32;
+        DenseFfnStorage::NativeScalar => {
+            let weights_native = load_dense_ffn_native(gguf, layer_idx, cfg, device)
+                .with_context(|| format!("MTP native scalar dense FFN {p}"))?;
+            let intermediate_size = weights_native.intermediate_size;
+            let weights = DenseFfnWeightsGpu::from_native(&weights_native);
             Ok((
                 MtpFfnWeightsGpu::Dense {
                     weights,

@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::convert::tensor_lineage::ConversionSourceDisposition;
 use crate::core::provenance::tensor_execution::logical_f32_sha256;
 
-use super::loaded::{f32_bytes_sha256, LoadedTensorCodec, VerifiedLoadedTensorCatalog};
+use super::loaded::{
+    buffer_storage_bytes, f32_bytes_sha256, LoadedTensorCodec, VerifiedLoadedTensorCatalog,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -190,18 +192,14 @@ impl<'a> ExecutedTensorCatalogBuilder<'a> {
     ) -> Result<()> {
         let source = self.loaded.observation(source_tensor_name)?;
         let LoadedTensorCodec::Ggml { .. } = &source.codec else {
-            bail!("{source_tensor_name} was not loaded as native GGML blocks");
+            bail!("{source_tensor_name} was not loaded in native GGUF storage");
         };
-        let data_len = executed.data_byte_len();
-        let allocated = executed
-            .as_slice::<u8>()
-            .map_err(|error| anyhow::anyhow!("read executed GGML {semantic_name}: {error}"))?;
-        let bytes = allocated
-            .get(..data_len)
-            .context("executed GGML byte extent exceeds allocation")?;
+        let bytes = buffer_storage_bytes(executed)
+            .map_err(|error| anyhow::anyhow!("read executed GGUF {semantic_name}: {error}"))?;
+        let data_len = bytes.len();
         let byte_sha = hex::encode(Sha256::digest(bytes));
         if u64::try_from(data_len)? != source.byte_len || byte_sha != source.byte_sha256 {
-            bail!("executed GGML {semantic_name} differs from loaded blocks");
+            bail!("executed GGUF {semantic_name} differs from loaded storage");
         }
         self.consumed_sources.insert(source_tensor_name.to_owned());
         self.insert(ExecutedTensorObservation {
