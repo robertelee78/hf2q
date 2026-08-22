@@ -36,7 +36,10 @@ pub(crate) fn update(args: cli::UpdateArgs, executable: &Path) -> Result<(), Lif
     match installation {
         Installation::Standalone { install_dir } => {
             if args.rollback {
+                let completion_cleanup = crate::cli::completion_receipt::cleanup_owned();
                 super::standalone::rollback(&install_dir).map_err(LifecycleError::operational)?;
+                refresh_completion(executable);
+                report_completion_cleanup(&completion_cleanup);
                 println!(
                     "Restored the previous standalone hf2q in {}. Run `hf2q --version` to inspect it.",
                     install_dir.display()
@@ -53,6 +56,7 @@ pub(crate) fn update(args: cli::UpdateArgs, executable: &Path) -> Result<(), Lif
                     println!("Standalone update available: {current} -> {latest}.");
                 }
                 super::standalone::UpdateOutcome::Updated { previous, current } => {
+                    refresh_completion(executable);
                     println!(
                         "Updated standalone hf2q {previous} -> {current}. Roll back with `hf2q update --rollback`."
                     );
@@ -103,6 +107,7 @@ pub(crate) fn update(args: cli::UpdateArgs, executable: &Path) -> Result<(), Lif
             let current =
                 installation::reconcile_cargo_update(executable, &root, &source, &options)
                     .map_err(installation_error)?;
+            refresh_completion(executable);
             if current == version.to_string() {
                 println!(
                     "Cargo reports hf2q {current} is already current under {}.",
@@ -157,17 +162,20 @@ pub(crate) fn uninstall(
         .transpose()
         .map_err(purge_error)?;
     let purge_preview = uninstall_purge_preview(config_purge.as_ref(), cache_purge.as_ref());
+    let completion_preview = completion_uninstall_preview();
     match installation {
         Installation::Standalone { install_dir } => {
             if !args.yes {
                 return Err(LifecycleError::input(anyhow::anyhow!(
-                    "standalone uninstall would remove only {}, .hf2q-standalone.json, .hf2q-previous, and .hf2q-standalone.lock.{} Rerun `hf2q uninstall{}{} --yes` to confirm",
+                    "standalone uninstall would remove only {}, .hf2q-standalone.json, .hf2q-previous, .hf2q-standalone.lock, and exact receipt-owned completion artifacts.{}{} Rerun `hf2q uninstall{}{} --yes` to confirm",
                     executable.display(),
+                    completion_preview,
                     purge_preview,
                     if args.purge_config { " --purge-config" } else { "" },
                     if args.purge_cache { " --purge-cache" } else { "" }
                 )));
             }
+            let completion_cleanup = crate::cli::completion_receipt::cleanup_owned();
             super::standalone::uninstall(&install_dir).map_err(LifecycleError::operational)?;
             execute_uninstall_purges(
                 config_purge.as_ref(),
@@ -179,6 +187,7 @@ pub(crate) fn uninstall(
                 install_dir.display(),
                 uninstall_preservation_summary(&args)
             );
+            report_completion_cleanup(&completion_cleanup);
             Ok(())
         }
         Installation::Cargo {
@@ -187,14 +196,16 @@ pub(crate) fn uninstall(
             let command = ManagerCommand::cargo_uninstall(&root, &version);
             if !args.yes {
                 return Err(LifecycleError::input(anyhow::anyhow!(
-                    "Cargo owns hf2q {version} under {}. Uninstall would delegate exactly `{}`.{} Rerun `hf2q uninstall{}{} --yes` to confirm",
+                    "Cargo owns hf2q {version} under {}. Uninstall would delegate exactly `{}` and remove exact receipt-owned completion artifacts.{}{} Rerun `hf2q uninstall{}{} --yes` to confirm",
                     root.display(),
                     command.display(),
+                    completion_preview,
                     purge_preview,
                     if args.purge_config { " --purge-config" } else { "" },
                     if args.purge_cache { " --purge-cache" } else { "" }
                 )));
             }
+            let completion_cleanup = crate::cli::completion_receipt::cleanup_owned();
             println!("Delegating hf2q uninstall to Cargo: {}", command.display());
             command.run().map_err(installation_error)?;
             installation::reconcile_cargo_uninstall(&root, executable)
@@ -209,6 +220,7 @@ pub(crate) fn uninstall(
                 root.display(),
                 uninstall_preservation_summary(&args)
             );
+            report_completion_cleanup(&completion_cleanup);
             Ok(())
         }
         Installation::SourceDevelopment {
@@ -224,6 +236,52 @@ pub(crate) fn uninstall(
             "{} has no valid installation owner, so hf2q will not remove it. Use the package manager or source checkout that owns this file",
             executable.display()
         ))),
+    }
+}
+
+fn completion_uninstall_preview() -> String {
+    match crate::cli::completion_receipt::owned_paths() {
+        Ok(paths) if paths.is_empty() => " No completion ownership receipt exists.".to_owned(),
+        Ok(paths) => format!(
+            " Completion cleanup is limited to: {}.",
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Err(error) => format!(
+            " Completion cleanup will preserve artifacts because its ownership receipt is invalid ({error})."
+        ),
+    }
+}
+
+fn report_completion_cleanup(cleanup: &crate::cli::completion_receipt::CompletionCleanup) {
+    if !cleanup.removed.is_empty() {
+        println!(
+            "Removed {} receipt-owned completion artifact(s).",
+            cleanup.removed.len()
+        );
+    }
+    for preserved in &cleanup.preserved {
+        eprintln!("hf2q: preserved {preserved}");
+    }
+}
+
+fn refresh_completion(executable: &Path) {
+    let result = std::process::Command::new(executable)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status();
+    match result {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!(
+            "hf2q: updated successfully, but completion refresh exited with {status}; run `hf2q --version` once to retry"
+        ),
+        Err(error) => eprintln!(
+            "hf2q: updated successfully, but completion refresh could not start: {error}; run `hf2q --version` once to retry"
+        ),
     }
 }
 

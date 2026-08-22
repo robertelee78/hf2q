@@ -88,7 +88,19 @@ impl std::fmt::Display for AppError {
 }
 
 fn main() -> ExitCode {
+    // Dynamic completion is the first operational branch. A completion
+    // request exits before diagnostics, logging, configuration, cache access,
+    // downloads, or model/runtime initialization.
+    cli::completion_install::complete_env();
+
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+
+    // Proven standalone/Cargo release installations keep their owned Bash,
+    // Zsh, and Fish adapters synchronized with this exact binary. Other
+    // binaries require explicit isolated destinations; protocol calls never
+    // reconcile.
+    cli::completion_install::reconcile(&raw_args);
+    cli::completion_install::report_outcome();
 
     // Emit one-shot warning / ack-gate summary for any investigation-only
     // env vars that are set. Uses direct eprintln! (not tracing), so it
@@ -756,11 +768,16 @@ fn resolve_info_input(args: &cli::InfoArgs) -> Result<PathBuf> {
 
 /// Handle the `completions` subcommand.
 fn cmd_completions(args: cli::CompletionsArgs) -> Result<()> {
-    use clap::CommandFactory;
-    use clap_complete::generate;
+    use std::io::Write as _;
 
-    let mut cmd = Cli::command();
-    generate(args.shell, &mut cmd, "hf2q", &mut std::io::stdout());
+    let mut command = cli::complete::public_completion_command();
+    let mut generated = Vec::new();
+    clap_complete::generate(args.shell, &mut command, "hf2q", &mut generated);
+    match std::io::stdout().lock().write_all(&generated) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+        Err(error) => return Err(error).context("write generated completion script"),
+    }
 
     Ok(())
 }

@@ -90,8 +90,10 @@ sha1 = "=0.10.7"
 ruvector-core = { version = "2.3", optional = true }
 
 # CLI framework
-clap = { version = "4.5", features = ["derive"] }
-clap_complete = "4.5"
+clap = { version = "4.5", features = ["derive", "string"] }
+# Dynamic registration scripts are protocol-coupled to clap_complete's exact
+# output shape (see ADR-045 and src/cli/completion_install.rs).
+clap_complete = { version = "=4.6.7", features = ["unstable-dynamic"] }
 
 # Performance
 rayon = "1.10"

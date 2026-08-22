@@ -15,6 +15,23 @@ case "${1:-}" in
     printf 'hf2q %s\n' "$probe_version"
     ;;
   __standalone-install)
+    shift
+    install_dir=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --install-dir)
+          install_dir=${2:?missing --install-dir value}
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    [ -n "$install_dir" ]
+    mkdir -p "$install_dir"
+    cp "$0" "$install_dir/hf2q"
+    chmod 0555 "$install_dir/hf2q"
     ;;
   *)
     exit 91

@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use crate::quantize::ggml_quants::apex::{ApexTier, SUPPORTED_APEX_TIERS};
-use crate::quantize::ggml_quants::{GgufFtype, DEEPSEEK4_AGENTIC_Q2_NAME};
+use crate::quantize::ggml_quants::{DEEPSEEK4_AGENTIC_Q2_NAME, GgufFtype};
 
 /// One resolved `--quant <name>` selector.
 ///
@@ -119,6 +119,40 @@ pub enum QuantSelectorError {
 }
 
 impl QuantSelector {
+    /// Canonical, operator-facing selectors accepted by the shipped convert
+    /// pipeline. Completion, documentation checks, and parser tests share this
+    /// list so Tab never advertises reserved or implementation-only ftypes.
+    pub const COMPLETION_NAMES: &'static [&'static str] = &[
+        "f32",
+        "f16",
+        "bf16",
+        "q4_0",
+        "q4_1",
+        "q5_0",
+        "q5_1",
+        "q8_0",
+        "q2_k",
+        "q2_k_s",
+        "q3_k_s",
+        "q3_k_m",
+        "q3_k_l",
+        "q4_k_s",
+        "q4_k_m",
+        "q5_k_s",
+        "q5_k_m",
+        "q6_k",
+        "iq4_nl",
+        "iq4_xs",
+        "apex-quality",
+        "apex-i-quality",
+        "apex-balanced",
+        "apex-i-balanced",
+        "apex-compact",
+        "apex-i-compact",
+        "apex-mini",
+        DEEPSEEK4_AGENTIC_Q2_NAME,
+    ];
+
     /// Canonical spelling persisted in conversion receipts.
     pub fn receipt_name(&self) -> String {
         match self {

@@ -150,9 +150,18 @@ jobs:
             --path "$package_root" \
             --locked \
             --root "$install_root"
-          test "$("$install_root/bin/hf2q" --version)" = \
+          completion_home="$RUNNER_TEMP/hf2q-cargo-completion-home"
+          mkdir -p "$completion_home"
+          test "$(HOME="$completion_home" SHELL=/bin/zsh \
+            "$install_root/bin/hf2q" --version)" = \
             "hf2q $EXPECTED_VERSION"
-          "$install_root/bin/hf2q" --help >/dev/null
+          HOME="$completion_home" SHELL=/bin/zsh \
+            "$install_root/bin/hf2q" --help >/dev/null
+          test -f "$completion_home/.local/share/bash-completion/completions/hf2q"
+          test -f "$completion_home/.local/share/zsh/site-functions/_hf2q"
+          test -f "$completion_home/.config/fish/completions/hf2q.fish"
+          test -f "$completion_home/.zshrc"
+          test -f "$completion_home/.local/state/hf2q/completion-ownership-v1.json"
 
       - name: Prepare and locally prove standalone release assets
         shell: bash
@@ -195,6 +204,7 @@ jobs:
           proof_state="$proof_home/.hf2q"
           curl -fsSL "file://$standalone_stage/install.sh" | \
             HOME="$proof_home" \
+            SHELL=/bin/bash \
             HF2Q_INSTALL_DIR="$proof_install" \
             HF2Q_RELEASE_BASE_URL="file://$standalone_stage" \
             HF2Q_INSTALL_TEST_MODE=1 \
@@ -202,9 +212,17 @@ jobs:
             sh >/dev/null
           test "$(shasum -a 256 "$proof_install/hf2q" | awk '{print $1}')" = \
             "$STANDALONE_BINARY_SHA256"
-          test "$("$proof_install/hf2q" --version)" = \
+          test "$(HOME="$proof_home" SHELL=/bin/bash \
+            "$proof_install/hf2q" --version)" = \
             "hf2q $EXPECTED_VERSION"
-          HOME="$proof_home" "$proof_install/hf2q" --state-root "$proof_state" \
+          test -f "$proof_home/.local/share/bash-completion/completions/hf2q"
+          test -f "$proof_home/.local/share/zsh/site-functions/_hf2q"
+          test -f "$proof_home/.config/fish/completions/hf2q.fish"
+          test -f "$proof_home/.bashrc"
+          test -f "$proof_home/.profile"
+          test -f "$proof_home/.local/state/hf2q/completion-ownership-v1.json"
+          HOME="$proof_home" SHELL=/bin/bash \
+            "$proof_install/hf2q" --state-root "$proof_state" \
             setup --accept-defaults >/dev/null
           test -s "$proof_state/config.toml"
           test "$(stat -f '%Lp' "$proof_state/config.toml")" = 600
@@ -214,18 +232,26 @@ jobs:
           setup_golden=${RELEASE_PACKAGE_ROOT:?RELEASE_PACKAGE_ROOT is required}/src/setup/testdata/config_v2.toml
           cmp -s "$proof_state/config.toml" "$setup_golden"
           setup_config_sha=$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')
-          HOME="$proof_home" "$proof_install/hf2q" --state-root "$proof_state" \
+          HOME="$proof_home" SHELL=/bin/bash \
+            "$proof_install/hf2q" --state-root "$proof_state" \
             setup --accept-defaults >/dev/null
           test "$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')" = \
             "$setup_config_sha"
           mkdir -p "$proof_state/models"
           printf 'converted model\n' > "$proof_state/models/model.gguf"
           model_sha=$(shasum -a 256 "$proof_state/models/model.gguf" | awk '{print $1}')
-          HOME="$proof_home" "$proof_install/hf2q" uninstall --yes >/dev/null
+          HOME="$proof_home" SHELL=/bin/bash \
+            "$proof_install/hf2q" uninstall --yes >/dev/null
           test ! -e "$proof_install/hf2q"
           test ! -e "$proof_install/.hf2q-standalone.json"
           test ! -e "$proof_install/.hf2q-standalone.lock"
           test ! -e "$proof_install/.hf2q-previous"
+          test ! -e "$proof_home/.local/share/bash-completion/completions/hf2q"
+          test ! -e "$proof_home/.local/share/zsh/site-functions/_hf2q"
+          test ! -e "$proof_home/.config/fish/completions/hf2q.fish"
+          test ! -e "$proof_home/.bashrc"
+          test ! -e "$proof_home/.profile"
+          test ! -e "$proof_home/.local/state/hf2q/completion-ownership-v1.json"
           test -f "$proof_state/config.toml"
           test -f "$proof_state/models/model.gguf"
           test "$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')" = \
@@ -358,7 +384,13 @@ jobs:
             --path "$registry_root/hf2q-${EXPECTED_VERSION}" \
             --locked \
             --root "$install_root"
-          "$install_root/bin/hf2q" --help >/dev/null
+          completion_home="$RUNNER_TEMP/hf2q-registry-completion-home"
+          mkdir -p "$completion_home"
+          HOME="$completion_home" SHELL=/bin/zsh \
+            "$install_root/bin/hf2q" --help >/dev/null
+          test -f "$completion_home/.local/share/bash-completion/completions/hf2q"
+          test -f "$completion_home/.local/share/zsh/site-functions/_hf2q"
+          test -f "$completion_home/.config/fish/completions/hf2q.fish"
 
       - name: Publish the complete GitHub release
         shell: bash
@@ -429,13 +461,21 @@ jobs:
           proof_install="$proof_home/.local/bin"
           proof_state="$proof_home/.hf2q"
           curl -fsSL "$public_base/install.sh" | \
-            HOME="$proof_home" HF2Q_INSTALL_DIR="$proof_install" \
+            HOME="$proof_home" SHELL=/bin/bash HF2Q_INSTALL_DIR="$proof_install" \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin sh >/dev/null
           test "$(shasum -a 256 "$proof_install/hf2q" | awk '{print $1}')" = \
             "$STANDALONE_BINARY_SHA256"
-          test "$("$proof_install/hf2q" --version)" = \
+          test "$(HOME="$proof_home" SHELL=/bin/bash \
+            "$proof_install/hf2q" --version)" = \
             "hf2q $EXPECTED_VERSION"
-          HOME="$proof_home" "$proof_install/hf2q" --state-root "$proof_state" \
+          test -f "$proof_home/.local/share/bash-completion/completions/hf2q"
+          test -f "$proof_home/.local/share/zsh/site-functions/_hf2q"
+          test -f "$proof_home/.config/fish/completions/hf2q.fish"
+          test -f "$proof_home/.bashrc"
+          test -f "$proof_home/.profile"
+          test -f "$proof_home/.local/state/hf2q/completion-ownership-v1.json"
+          HOME="$proof_home" SHELL=/bin/bash \
+            "$proof_install/hf2q" --state-root "$proof_state" \
             setup --accept-defaults >/dev/null
           test -s "$proof_state/config.toml"
           test "$(stat -f '%Lp' "$proof_state/config.toml")" = 600
@@ -445,18 +485,26 @@ jobs:
           setup_golden=${RELEASE_PACKAGE_ROOT:?RELEASE_PACKAGE_ROOT is required}/src/setup/testdata/config_v2.toml
           cmp -s "$proof_state/config.toml" "$setup_golden"
           setup_config_sha=$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')
-          HOME="$proof_home" "$proof_install/hf2q" --state-root "$proof_state" \
+          HOME="$proof_home" SHELL=/bin/bash \
+            "$proof_install/hf2q" --state-root "$proof_state" \
             setup --accept-defaults >/dev/null
           test "$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')" = \
             "$setup_config_sha"
           mkdir -p "$proof_state/models"
           printf 'converted model\n' > "$proof_state/models/model.gguf"
           model_sha=$(shasum -a 256 "$proof_state/models/model.gguf" | awk '{print $1}')
-          HOME="$proof_home" "$proof_install/hf2q" uninstall --yes >/dev/null
+          HOME="$proof_home" SHELL=/bin/bash \
+            "$proof_install/hf2q" uninstall --yes >/dev/null
           test ! -e "$proof_install/hf2q"
           test ! -e "$proof_install/.hf2q-standalone.json"
           test ! -e "$proof_install/.hf2q-standalone.lock"
           test ! -e "$proof_install/.hf2q-previous"
+          test ! -e "$proof_home/.local/share/bash-completion/completions/hf2q"
+          test ! -e "$proof_home/.local/share/zsh/site-functions/_hf2q"
+          test ! -e "$proof_home/.config/fish/completions/hf2q.fish"
+          test ! -e "$proof_home/.bashrc"
+          test ! -e "$proof_home/.profile"
+          test ! -e "$proof_home/.local/state/hf2q/completion-ownership-v1.json"
           test -f "$proof_state/config.toml"
           test -f "$proof_state/models/model.gguf"
           test "$(shasum -a 256 "$proof_state/config.toml" | awk '{print $1}')" = \
