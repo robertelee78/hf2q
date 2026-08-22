@@ -550,10 +550,11 @@ pub struct InvestigationEnv {
     /// `chunk_gated_delta_rule` precondition at gpu_delta_net.rs:1078).
     /// Default 1024 = 16 internal chunks per stride.
     ///
-    /// Memory cost: per cached entry, `ceil(N / stride)` checkpoints
-    /// at ~96 MB each (Qwen 3.6 27B 48 DeltaNet layers × ~2 MB
-    /// recurrent state). For N=8192, stride=1024: 8 checkpoints =
-    /// ~768 MB per cached entry. Capacity=1 registry ⇒ bounded.
+    /// Memory cost: per cached entry, `ceil(N / stride)` checkpoints at
+    /// about 149.6 MiB each for the 48-DeltaNet-layer 27B shape, computed
+    /// from recurrent plus conv allocation code. For N=8192 and stride=1024,
+    /// eight checkpoints retain about 1.17 GiB before payload metadata. The
+    /// registry is byte-budgeted rather than entry-count bounded.
     pub kv_lcp_deltanet_checkpoint_stride: usize,
 
     /// `HF2Q_DEFAULT_REPETITION_PENALTY` — default `1.0` (off) — the

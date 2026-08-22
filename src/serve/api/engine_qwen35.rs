@@ -166,8 +166,9 @@ pub struct Qwen35LoadedModel {
     /// snapshots; engine resume gate restores at K_aligned and slices
     /// tokens to [K_aligned..N) before calling forward_gpu_impl.
     ///
-    /// Capacity = 1 — same as Gemma's lcp_registry. /cfa Phase 2
-    /// fan-out gets the speedup once B.2 ships; multi-turn chat too.
+    /// The live registry is byte-budgeted through `with_byte_budget`; its
+    /// entry count is intentionally unbounded (`usize::MAX`) and eviction is
+    /// driven by owned bytes, not a stale one-entry capacity.
     pub lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry<
         crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot,
     >,
@@ -2587,9 +2588,9 @@ fn generate_qwen35_once_ordinary(
         //   temperature/top_p/top_k/seed (registry_len=0 forever).
         //
         // ADR-017 Phase E.a B.2b: snapshot BOTH the existing prompt_cache
-        // (Phase E.b full-equality replay, capacity 1) AND the lcp_registry
-        // (Phase E.a partial-prefill resume, capacity defined at
-        // Qwen35LoadedModel construction).  Two snapshots is wasteful
+        // (Phase E.b full-equality replay, one latest entry) AND the
+        // byte-budgeted lcp_registry (Phase E.a partial-prefill resume).
+        // Two snapshots is wasteful
         // (~2× GB-scale memcpy) — a follow-up should refactor
         // HybridPromptCache to share Arc<HybridKvCacheSnapshot> with
         // lcp_registry, eliminating the duplication.  Cost is one-time
@@ -3395,6 +3396,7 @@ pub(crate) struct Qwen35StablePromptCheckpoint {
     pub prefill_logits: Vec<f32>,
     pub vision_fingerprint: Option<[u8; 32]>,
     pub spec: Option<Qwen35SpecPrefixBoundary>,
+    pub capture_duration: Duration,
 }
 
 /// Model-semantic state paired with a physically snapshotted prompt prefix.
@@ -3404,6 +3406,30 @@ pub(crate) struct Qwen35StablePromptCheckpoint {
 pub(crate) struct Qwen35SpecPrefixBoundary {
     pub token_count: usize,
     pub pending_target_hidden: MlxBuffer,
+}
+
+impl Qwen35SpecPrefixBoundary {
+    /// Materialize the logical hidden row into its own Metal allocation.
+    /// Stable anchors must never retain a large prefill residual through a
+    /// zero-copy view clone.
+    pub(crate) fn clone_owned(&self, model: &Qwen35Model) -> Result<Self> {
+        let pending_target_hidden = model
+            .copy_logical_buffer_owned(&self.pending_target_hidden)
+            .context("copy Qwen speculative boundary hidden row")?;
+        anyhow::ensure!(
+            pending_target_hidden.byte_offset() == 0
+                && pending_target_hidden.byte_len() == pending_target_hidden.data_byte_len(),
+            "owned Qwen speculative boundary retained a parent allocation"
+        );
+        Ok(Self {
+            token_count: self.token_count,
+            pending_target_hidden,
+        })
+    }
+
+    pub(crate) fn owned_bytes(&self) -> u64 {
+        self.pending_target_hidden.data_byte_len() as u64
+    }
 }
 
 /// Owned multimodal state carried by a bounded SlotAware prefill. Unlike the
@@ -3964,13 +3990,28 @@ impl Qwen35PrefillState {
             let advanced = end - self.next_token_index;
             self.next_token_index = end;
             let checkpoint = if self.stable_prompt_prefix_tokens == Some(end) {
-                let spec =
-                    self.mtp_pending_hidden
-                        .as_ref()
-                        .map(|hidden| Qwen35SpecPrefixBoundary {
-                            token_count: end,
-                            pending_target_hidden: hidden.clone(),
-                        });
+                let capture_started = Instant::now();
+                let spec = self.mtp_pending_hidden.as_ref().and_then(|hidden| {
+                    let boundary = Qwen35SpecPrefixBoundary {
+                        token_count: end,
+                        pending_target_hidden: hidden.clone(),
+                    };
+                    match boundary.clone_owned(&qwen.model) {
+                        Ok(boundary) => Some(boundary),
+                        Err(error) => {
+                            tracing::warn!(
+                                slot = self.slot_id.0,
+                                token_count = end,
+                                error = %error,
+                                "Qwen stable checkpoint dropped speculative metadata because its hidden row could not be detached"
+                            );
+                            super::qwen35_speculation::record_fallback(
+                                super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable,
+                            );
+                            None
+                        }
+                    }
+                });
                 Some(Qwen35StablePromptCheckpoint {
                     prompt_tokens: self.prompt_tokens[..end].to_vec(),
                     kv: kv_cache
@@ -3979,6 +4020,7 @@ impl Qwen35PrefillState {
                     prefill_logits: logits.clone(),
                     vision_fingerprint: self.params.vision_fingerprint,
                     spec,
+                    capture_duration: capture_started.elapsed(),
                 })
             } else {
                 None

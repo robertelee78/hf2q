@@ -124,10 +124,11 @@ pub struct LinearAttnStateSlot {
     /// recurrent buffer (parity-aware, ADR-040 M-QWEN) via
     /// [`HybridKvCache::rollback_la_to`].
     ///
-    /// Memory cost (Qwen 3.5/3.6 D_k=D_v=128, n_v_heads=8, n_seqs=1,
-    /// n_tokens_max=4): 2 MB per LA layer. ~60-90 MB total per forward
-    /// across 30+ LA layers. Allocated once per spec-decode cache
-    /// construction; freed when the cache drops.
+    /// Memory cost at the live SerialFifo recovery width (D_k=D_v=128,
+    /// n_v_heads=32, n_seqs=1, n_tokens_max=32): 64 MiB per LA layer;
+    /// recurrent plus conv capture is about 1.96 GiB across 30 layers.
+    /// Allocated once per spec-decode cache construction and freed when the
+    /// cache drops.
     pub capture_states: Option<MlxBuffer>,
     /// ADR-034 task #90 Step 4c (2026-05-21) — per-position conv1d
     /// state capture buffer for K=N speculative decoding rollback.
@@ -1011,6 +1012,38 @@ impl HybridKvSlotAnchor {
             .sum()
     }
 
+    /// Exact heap capacity retained by this anchor payload, including cursor
+    /// vectors and the nested Vec allocation tables omitted by `total_bytes`.
+    pub fn owned_bytes(&self) -> u64 {
+        let bytes = self
+            .full_attn_current_len
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(
+                self.linear_conv
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<u8>>()),
+            )
+            .saturating_add(
+                self.linear_recurrent
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<u8>>()),
+            )
+            .saturating_add(
+                self.linear_conv
+                    .iter()
+                    .map(|bytes| bytes.capacity())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.linear_recurrent
+                    .iter()
+                    .map(|bytes| bytes.capacity())
+                    .sum::<usize>(),
+            );
+        bytes as u64
+    }
+
     pub fn prompt_len(&self) -> usize {
         self.prompt_len
     }
@@ -1196,6 +1229,37 @@ fn deep_copy_buffer(device: &MlxDevice, src: &MlxBuffer) -> Result<MlxBuffer> {
     anyhow::ensure!(
         src_bytes.len() == dst_bytes.len(),
         "deep_copy_buffer byte-length mismatch (src={} dst={})",
+        src_bytes.len(),
+        dst_bytes.len()
+    );
+    dst_bytes.copy_from_slice(src_bytes);
+    Ok(dst)
+}
+
+/// Copy only a handle's logical tensor region into a dedicated right-sized
+/// allocation. Unlike `deep_copy_buffer`, this is safe for a slice view whose
+/// backing Metal allocation is a much larger transient parent.
+pub(crate) fn deep_copy_logical_buffer(device: &MlxDevice, src: &MlxBuffer) -> Result<MlxBuffer> {
+    let logical_bytes = src
+        .element_count()
+        .checked_mul(src.dtype().size_of())
+        .ok_or_else(|| anyhow!("deep_copy_logical_buffer byte-length overflow"))?;
+    anyhow::ensure!(
+        logical_bytes > 0,
+        "deep_copy_logical_buffer requires a non-empty tensor"
+    );
+    let mut dst = device
+        .alloc_buffer(logical_bytes, src.dtype(), src.shape().to_vec())
+        .map_err(|e| anyhow!("deep_copy_logical_buffer allocation: {e}"))?;
+    let src_bytes = src
+        .as_logical_slice::<u8>()
+        .map_err(|e| anyhow!("deep_copy_logical_buffer src logical slice: {e}"))?;
+    let dst_bytes = dst
+        .as_logical_mut_slice::<u8>()
+        .map_err(|e| anyhow!("deep_copy_logical_buffer dst logical slice: {e}"))?;
+    anyhow::ensure!(
+        src_bytes.len() == logical_bytes && dst_bytes.len() == logical_bytes,
+        "deep_copy_logical_buffer logical byte mismatch (src={} dst={} expected={logical_bytes})",
         src_bytes.len(),
         dst_bytes.len()
     );
@@ -1404,35 +1468,60 @@ fn copy_slot_region_out(
     Ok(src_bytes[start..start + per_slot].to_vec())
 }
 
-fn copy_slot_region_in(
+fn preflight_slot_region_in(
     src: &[u8],
     dst: &mut MlxBuffer,
     slot_idx: usize,
     n_seqs: usize,
     name: &str,
 ) -> Result<()> {
-    anyhow::ensure!(n_seqs > 0, "copy_slot_region_in ({name}): n_seqs is zero");
+    anyhow::ensure!(
+        n_seqs > 0,
+        "preflight_slot_region_in ({name}): n_seqs is zero"
+    );
     anyhow::ensure!(
         slot_idx < n_seqs,
-        "copy_slot_region_in ({name}): slot {slot_idx} outside n_seqs={n_seqs}"
+        "preflight_slot_region_in ({name}): slot {slot_idx} outside n_seqs={n_seqs}"
+    );
+    anyhow::ensure!(
+        dst.is_cpu_writable(),
+        "preflight_slot_region_in ({name}): destination is not CPU-writable"
     );
     let dst_bytes = dst
         .as_mut_slice::<u8>()
-        .with_context(|| format!("copy_slot_region_in ({name}) as_mut_slice"))?;
+        .with_context(|| format!("preflight_slot_region_in ({name}) as_mut_slice"))?;
     anyhow::ensure!(
         dst_bytes.len() % n_seqs == 0,
-        "copy_slot_region_in ({name}): byte length {} not divisible by n_seqs={n_seqs}",
+        "preflight_slot_region_in ({name}): byte length {} not divisible by n_seqs={n_seqs}",
         dst_bytes.len()
     );
     let per_slot = dst_bytes.len() / n_seqs;
     anyhow::ensure!(
         src.len() == per_slot,
-        "copy_slot_region_in ({name}): checkpoint bytes {} != destination slot bytes {per_slot}",
+        "preflight_slot_region_in ({name}): checkpoint bytes {} != destination slot bytes {per_slot}",
         src.len()
     );
-    let start = slot_idx * per_slot;
-    dst_bytes[start..start + per_slot].copy_from_slice(src);
     Ok(())
+}
+
+/// Mutation half of [`preflight_slot_region_in`]. The restore caller invokes
+/// this only after every layer and cursor has passed preflight, so no
+/// recoverable error remains after the first cursor/state mutation.
+fn copy_slot_region_in_preflighted(
+    src: &[u8],
+    dst: &mut MlxBuffer,
+    slot_idx: usize,
+    n_seqs: usize,
+    name: &str,
+) {
+    let dst_bytes = dst.as_mut_slice::<u8>().unwrap_or_else(|error| {
+        panic!("preflighted slot restore ({name}) lost writability: {error}")
+    });
+    let per_slot = dst_bytes.len() / n_seqs;
+    let start = slot_idx * per_slot;
+    let end = start + per_slot;
+    debug_assert_eq!(src.len(), per_slot);
+    dst_bytes[start..end].copy_from_slice(src);
 }
 
 /// DeltaNet 1D conv kernel width — Qwen3.5 uses 4; kept as a constant here so
@@ -1636,16 +1725,17 @@ impl HybridKvCache {
             "restore_slot_anchor: linear-attn layer count mismatch"
         );
 
-        // The anchor intentionally owns no full-attention K/V copy. Refuse
-        // the rewind unless the live append-only cursor proves those rows
-        // are still populated in this same slot.
+        // Phase 1: validate every cursor and byte destination without
+        // changing the slot. A restore error must leave the caller able to
+        // hard-reset one coherent pre-restore state, never a partially
+        // rewound mixture of cursors and DeltaNet layers.
         for (layer_idx, (full, &saved_cursor)) in self
             .full_attn
-            .iter_mut()
+            .iter()
             .zip(anchor.full_attn_current_len.iter())
             .enumerate()
         {
-            let live_cursor = full.current_len.get_mut(slot_idx).ok_or_else(|| {
+            let live_cursor = full.current_len.get(slot_idx).ok_or_else(|| {
                 anyhow!("restore_slot_anchor: full_attn[{layer_idx}] cursor missing")
             })?;
             anyhow::ensure!(
@@ -1653,11 +1743,10 @@ impl HybridKvCache {
                 "restore_slot_anchor: full_attn[{layer_idx}] live cursor {} is behind saved cursor {saved_cursor}; prompt K/V cannot be proven intact",
                 *live_cursor
             );
-            *live_cursor = saved_cursor;
         }
-        match (self.mtp_slot.as_mut(), anchor.mtp_current_len) {
+        match (self.mtp_slot.as_ref(), anchor.mtp_current_len) {
             (Some(mtp), Some(saved_cursor)) => {
-                let live_cursor = mtp.current_len.get_mut(slot_idx).ok_or_else(|| {
+                let live_cursor = mtp.current_len.get(slot_idx).ok_or_else(|| {
                     anyhow!(
                         "restore_slot_anchor: MTP cursor missing for slot {}",
                         slot.0
@@ -1668,27 +1757,61 @@ impl HybridKvCache {
                     "restore_slot_anchor: MTP live cursor {} is behind saved cursor {saved_cursor}",
                     *live_cursor
                 );
-                *live_cursor = saved_cursor;
             }
             (None, None) => {}
             _ => anyhow::bail!("restore_slot_anchor: MTP presence mismatch"),
         }
 
         for (layer_idx, linear) in self.linear_attn.iter_mut().enumerate() {
-            copy_slot_region_in(
+            anyhow::ensure!(
+                linear.pp_flipped.get(slot_idx).is_some(),
+                "restore_slot_anchor: linear_attn[{layer_idx}] parity missing for slot {}",
+                slot.0
+            );
+            preflight_slot_region_in(
                 &anchor.linear_conv[layer_idx],
                 &mut linear.conv_state,
                 slot_idx,
                 n_seqs,
                 &format!("linear_attn[{layer_idx}].conv"),
             )?;
-            copy_slot_region_in(
+            preflight_slot_region_in(
                 &anchor.linear_recurrent[layer_idx],
                 &mut linear.recurrent,
                 slot_idx,
                 n_seqs,
                 &format!("linear_attn[{layer_idx}].recurrent"),
             )?;
+        }
+
+        // Phase 2: all fallible shape/cursor checks passed. The anchor owns no
+        // full-attention K/V copy; rewind only the proven append-only cursors,
+        // then copy every slot-local DeltaNet payload into canonical buffers.
+        for (full, &saved_cursor) in self
+            .full_attn
+            .iter_mut()
+            .zip(anchor.full_attn_current_len.iter())
+        {
+            full.current_len[slot_idx] = saved_cursor;
+        }
+        if let (Some(mtp), Some(saved_cursor)) = (self.mtp_slot.as_mut(), anchor.mtp_current_len) {
+            mtp.current_len[slot_idx] = saved_cursor;
+        }
+        for (layer_idx, linear) in self.linear_attn.iter_mut().enumerate() {
+            copy_slot_region_in_preflighted(
+                &anchor.linear_conv[layer_idx],
+                &mut linear.conv_state,
+                slot_idx,
+                n_seqs,
+                &format!("linear_attn[{layer_idx}].conv"),
+            );
+            copy_slot_region_in_preflighted(
+                &anchor.linear_recurrent[layer_idx],
+                &mut linear.recurrent,
+                slot_idx,
+                n_seqs,
+                &format!("linear_attn[{layer_idx}].recurrent"),
+            );
             // The named buffers now hold the restored current state for this
             // slot. Peer parity remains exactly as it was.
             linear.pp_flipped[slot_idx] = false;
@@ -11823,5 +11946,91 @@ mod tests {
             );
             assert!(linear.pp_flipped[peer.0 as usize], "peer parity changed");
         }
+    }
+
+    #[test]
+    fn slot_anchor_restore_preflights_every_payload_before_mutation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
+        let target = SlotId(1);
+        cache.append_for_seq(target, 9).expect("prompt cursor");
+        let mut anchor = cache
+            .snapshot_slot_anchor(target, 9)
+            .expect("slot-local anchor");
+        cache.append_for_seq(target, 5).expect("decode cursor");
+
+        for linear in &mut cache.linear_attn {
+            let conv_per_slot = linear.conv_state.byte_len() / 2;
+            let rec_per_slot = linear.recurrent.byte_len() / 2;
+            linear.conv_state.as_mut_slice::<u8>().unwrap()[conv_per_slot..].fill(0xA5);
+            linear.recurrent.as_mut_slice::<u8>().unwrap()[rec_per_slot..].fill(0x5A);
+            linear.pp_flipped[target.0 as usize] = false;
+        }
+        let before_cursor = cache.seq_len(target).expect("cursor before failed restore");
+        let before_linear: Vec<(Vec<u8>, Vec<u8>, bool)> = cache
+            .linear_attn
+            .iter()
+            .map(|linear| {
+                (
+                    linear.conv_state.as_slice::<u8>().unwrap().to_vec(),
+                    linear.recurrent.as_slice::<u8>().unwrap().to_vec(),
+                    linear.pp_flipped[target.0 as usize],
+                )
+            })
+            .collect();
+
+        anchor
+            .linear_recurrent
+            .last_mut()
+            .expect("linear layer")
+            .pop();
+        assert!(cache.restore_slot_anchor(target, &anchor).is_err());
+        assert_eq!(
+            cache.seq_len(target).expect("cursor after failed restore"),
+            before_cursor,
+            "validation failure must not rewind any cursor"
+        );
+        for (linear, (conv, recurrent, flipped)) in
+            cache.linear_attn.iter().zip(before_linear.iter())
+        {
+            assert_eq!(linear.conv_state.as_slice::<u8>().unwrap(), conv);
+            assert_eq!(linear.recurrent.as_slice::<u8>().unwrap(), recurrent);
+            assert_eq!(linear.pp_flipped[target.0 as usize], *flipped);
+        }
+    }
+
+    #[test]
+    fn logical_buffer_copy_does_not_retain_chunk_sized_parent() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let mut parent = device
+            .alloc_buffer(4096, mlx_native::DType::F32, vec![1024])
+            .expect("parent");
+        for (index, value) in parent
+            .as_mut_slice::<f32>()
+            .expect("parent slice")
+            .iter_mut()
+            .enumerate()
+        {
+            *value = index as f32;
+        }
+        let row = parent.slice_view(512 * 4, 8);
+        let owned = deep_copy_logical_buffer(&device, &row).expect("dedicated row");
+        assert_eq!(row.byte_len(), 4096, "view must expose the retention trap");
+        assert_eq!(owned.byte_offset(), 0);
+        assert_eq!(owned.byte_len(), 8 * 4);
+        assert_eq!(owned.data_byte_len(), 8 * 4);
+        assert_eq!(owned.shape(), row.shape());
+        assert_eq!(
+            owned.as_slice::<f32>().expect("owned values"),
+            &[512.0, 513.0, 514.0, 515.0, 516.0, 517.0, 518.0, 519.0]
+        );
+        drop(parent);
+        assert_eq!(
+            owned.as_slice::<f32>().expect("owned survives parent"),
+            &[512.0, 513.0, 514.0, 515.0, 516.0, 517.0, 518.0, 519.0]
+        );
     }
 }
