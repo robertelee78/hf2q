@@ -5878,6 +5878,41 @@ pub fn apply_sdpa_with_kv_cache(
             return Ok(out_buf);
         }
 
+        // A stable-boundary clamp can split a short prompt into two chunks
+        // whose combined K/V length is still below the tiled prefill kernel's
+        // 16-row safety floor (for example 5 + 7). TQ-only caches have no F32
+        // backing to feed the legacy fallback, but the direct packed-KV
+        // verifier is valid for the same bounded query widths. Route that
+        // region explicitly instead of falling through to an impossible F32
+        // cache access.
+        let tq_short_resume_eligible = head_dim == 256
+            && cur_len > 0
+            && seq_len <= QWEN35_TQ_DIRECT_PREFILL_MAX_QUERIES
+            && slot.k.is_none()
+            && slot.v.is_none()
+            && slot.tq.is_some();
+        if tq_short_resume_eligible {
+            let _w5b10_kernel = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaSdpaKernel,
+            );
+            let output = apply_tq_prefill_seq_major_resume_direct_for_slot(
+                device,
+                registry,
+                slot,
+                q_seq_major,
+                seq_len,
+                cur_len as u32,
+                kv_seq_len,
+                max_seq_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                slot_id,
+            )?;
+            slot.current_len[slot_id.0 as usize] = kv_seq_len;
+            return Ok(output);
+        }
+
         // ── ADR-034 task #89 Step 3a (2026-05-21): vec_small_path ──
         //
         // For small-seq-len verify forwards (DFlash K+1 = 2..8, K=N MTP
@@ -8572,6 +8607,88 @@ mod tests {
                 "qL={seq_len}: attention result must not depend on persistent cache representation"
             );
         }
+    }
+
+    #[test]
+    fn tq_short_resume_below_sixteen_is_finite_and_slot_exact() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let cfg = fresh_short_d256_cfg();
+        let mut registry = KernelRegistry::new();
+        let mut cache =
+            super::super::kv_cache::HybridKvCache::new_with_options(&cfg, &device, 16, 4, true)
+                .expect("allocate four-slot TQ cache");
+        let mut seed = 0xD256_0507_u32;
+        let q_first =
+            upload_f32(&mk_rand(&mut seed, 5 * 2 * 256, 0.2), &device).expect("upload first Q");
+        let k_first =
+            upload_f32(&mk_rand(&mut seed, 5 * 256, 0.2), &device).expect("upload first K");
+        let v_first =
+            upload_f32(&mk_rand(&mut seed, 5 * 256, 0.2), &device).expect("upload first V");
+        let q_resume =
+            upload_f32(&mk_rand(&mut seed, 7 * 2 * 256, 0.2), &device).expect("upload resume Q");
+        let k_resume =
+            upload_f32(&mk_rand(&mut seed, 7 * 256, 0.2), &device).expect("upload resume K");
+        let v_resume =
+            upload_f32(&mk_rand(&mut seed, 7 * 256, 0.2), &device).expect("upload resume V");
+
+        let mut slot_outputs = Vec::new();
+        for slot_id in [SlotId(0), SlotId(3)] {
+            apply_sdpa_with_kv_cache(
+                &device,
+                &mut registry,
+                &q_first,
+                &k_first,
+                &v_first,
+                &mut cache.full_attn[0],
+                5,
+                2,
+                1,
+                256,
+                16,
+                None,
+                slot_id,
+            )
+            .expect("fresh five-token TQ prefill");
+            let output = apply_sdpa_with_kv_cache(
+                &device,
+                &mut registry,
+                &q_resume,
+                &k_resume,
+                &v_resume,
+                &mut cache.full_attn[0],
+                7,
+                2,
+                1,
+                256,
+                16,
+                None,
+                slot_id,
+            )
+            .expect("seven-token TQ resume below tiled safety floor");
+            let values = output
+                .as_slice::<f32>()
+                .expect("map short-resume output")
+                .to_vec();
+            assert!(values.iter().all(|value| value.is_finite()));
+            assert_eq!(cache.full_attn[0].current_len[slot_id.0 as usize], 12);
+            slot_outputs.push(values);
+        }
+        assert_eq!(
+            slot_outputs[0]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            slot_outputs[1]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "identical short resumes must not depend on physical slot"
+        );
+        assert_eq!(cache.full_attn[0].current_len[1], 0);
+        assert_eq!(cache.full_attn[0].current_len[2], 0);
     }
 
     #[test]
