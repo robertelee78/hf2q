@@ -1634,6 +1634,7 @@ mod tests {
 
     #[test]
     fn qwen38_linked_quantized_text_artifact_routes_retain_native_blocks() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         for ggml_type in [
             GgmlType::Q4_K,
             GgmlType::Q5_K,

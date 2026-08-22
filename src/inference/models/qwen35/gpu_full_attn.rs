@@ -8463,6 +8463,7 @@ mod tests {
 
     #[test]
     fn tq_decode_execution_buckets_pin_geometry_boundaries() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         assert_eq!(tq_decode_execution_bucket(512), (false, false));
         assert_eq!(tq_decode_execution_bucket(513), (true, false));
         assert_eq!(tq_decode_execution_bucket(1024), (true, false));
@@ -8717,6 +8718,7 @@ mod tests {
 
     #[test]
     fn physical_batch_uses_the_batched_tq_dispatchers_fused_undo_contract() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let source = include_str!("gpu_full_attn.rs");
         let start = source
             .find("pub fn apply_gated_attn_layer_decode_batched_into(")

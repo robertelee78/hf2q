@@ -8178,6 +8178,7 @@ mod tests {
 
     #[test]
     fn qwen38_width_q8_0_native_embedding_gather_is_bit_exact() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::gpu::QuantWeightInfo;
         use half::f16;
 
@@ -8186,7 +8187,6 @@ mod tests {
         const QK8_0: usize = 32;
         const BLOCK_BYTES: usize = 34;
 
-        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let Ok(device) = MlxDevice::new() else {
             return;
         };
@@ -8778,9 +8778,9 @@ mod tests {
 
     #[test]
     fn qwen35moe_router_ties_choose_lowest_experts_for_every_batch_row() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::ops::moe_softmax_topk::{dispatch_moe_softmax_topk, register};
 
-        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let Ok(device) = MlxDevice::new() else {
             return;
         };
@@ -12339,25 +12339,23 @@ mod tests {
 
     /// ADR-040 Phase B4d H167 — `forward_gpu_greedy` body source-grep.
     ///
-    /// Pin the 4 internal dispatch sites (FA decode + DN decode + FA
-    /// legacy + DN legacy) now route through `slot_id` (not
-    /// `SlotId(0)` hard-codes).  Falsifier: any of the 4 sites
-    /// silently regressing to `SlotId(0)`.
+    /// Pin the scalar compatibility entry point to the physical-batch
+    /// implementation with the caller's slot, never a `SlotId(0)` hard-code.
+    /// The four historical scalar dispatch sites no longer exist: full
+    /// attention and DeltaNet are selected inside the row-mapped batched body.
     #[test]
     fn h167_forward_gpu_greedy_threads_slot_id_to_all_4_internal_sites_2026_05_30() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let body = std::fs::read_to_string("src/inference/models/qwen35/forward_gpu.rs")
             .expect("read forward_gpu.rs");
-        // Locate the `pub fn forward_gpu_greedy(` declaration + walk
-        // forward to the function end.  We approximate by grabbing
-        // ~60K chars starting at the declaration — covers the full
-        // FA + DN dispatch bodies + their epilogue (function is
-        // ~1300 lines).
+        // Isolate the scalar wrapper from the following physical-batch body.
         let decl_idx = body
             .find("pub fn forward_gpu_greedy(")
             .expect("H167: forward_gpu_greedy declaration not found");
         let body_window = &body[decl_idx..];
-        let end_window = (body_window.len()).min(70_000);
+        let end_window = body_window
+            .find("pub fn forward_gpu_greedy_multi_slot(")
+            .expect("H167: physical-batch implementation not found");
         let window = &body_window[..end_window];
 
         // The new signature MUST carry `slot_id: SlotId` as a param.
@@ -12385,22 +12383,14 @@ mod tests {
         assert_eq!(
             slot_id_zero_count, 0,
             "H167 FALSIFIED: forward_gpu_greedy body contains {} \
-             code-side `SlotId(0)` literal(s) (comments stripped).  The 4 \
-             internal dispatch sites (FA at :5293 + :5612, DN at :5380 + \
-             :5716) MUST route through `slot_id`, not the literal.",
+             code-side `SlotId(0)` literal(s) (comments stripped). The scalar \
+             wrapper must preserve the caller's slot.",
             slot_id_zero_count
         );
-        // Spot-check that the threaded literal `slot_id,` appears at
-        // ≥4 dispatch-site routings.  Doc comments mention `slot_id`
-        // (no trailing comma) so the comma constraint isolates the
-        // call-site positional-arg occurrences.
-        let threaded = code_only.matches("slot_id,").count();
         assert!(
-            threaded >= 4,
-            "H167 FALSIFIED: `slot_id,` appears only {} time(s) in \
-             forward_gpu_greedy code body — expected ≥4 dispatch-site \
-             routings (FA decode + DN decode + FA legacy + DN legacy)",
-            threaded
+            code_only.contains("std::slice::from_ref(&slot_id)"),
+            "H167 FALSIFIED: scalar greedy no longer routes the caller's slot \
+             through the physical-batch row map"
         );
     }
 

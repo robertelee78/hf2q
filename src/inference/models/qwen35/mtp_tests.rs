@@ -261,19 +261,27 @@ fn mtp_loads_gpu_weights_from_synthetic_gguf() {
 }
 
 /// ADR-013 P14 follow-up (2026-04-30): Qwen3.6 27B + 35B-A3B share the main
-/// model's `token_embd.weight`; convert correctly skips emitting
-/// `blk.{N}.nextn.embed_tokens.weight`. The loader must succeed (not bail) when
-/// `mtp_use_dedicated_embeddings=false` AND the dedicated tensor is absent, and
-/// must populate `embed_tokens = None` to signal the shared path.
+/// model's `token_embd.weight`; convert correctly skips both dedicated MTP
+/// embedding/head tensors. The loader must succeed when the metadata selects
+/// sharing and both dedicated tensors are absent, and must populate
+/// `embed_tokens = None` while borrowing the native main head.
 #[test]
 fn mtp_loads_with_shared_embeddings_when_flag_false_and_tensor_absent() {
     let Some(device) = try_device() else { return };
-    // tiny_tensors() includes the dedicated embed_tokens tensor; strip it for
-    // the shared-embeddings scenario.
-    let tensors: Vec<TestTensor> = tiny_tensors()
+    // tiny_tensors() includes both dedicated tensors; strip them and provide
+    // the tied main embedding that is authoritative in shared mode.
+    let mut tensors: Vec<TestTensor> = tiny_tensors()
         .into_iter()
-        .filter(|t| t.name != "blk.2.nextn.embed_tokens.weight")
+        .filter(|t| {
+            t.name != "blk.2.nextn.embed_tokens.weight"
+                && t.name != "blk.2.nextn.shared_head_head.weight"
+        })
         .collect();
+    tensors.push(TestTensor {
+        name: "token_embd.weight",
+        dims: vec![32, 64],
+        data: zeros(64 * 32),
+    });
     let tmp = std::env::temp_dir().join(format!("mtp_shared_{}.gguf", std::process::id()));
     write_gguf(&tmp, &tensors);
     let gguf = GgufFile::open(&tmp).expect("open");
@@ -297,8 +305,9 @@ fn mtp_loads_with_shared_embeddings_when_flag_false_and_tensor_absent() {
     assert!(
         !mtp.loaded_tensor_names
             .iter()
-            .any(|n| n == "blk.2.nextn.embed_tokens.weight"),
-        "dedicated tensor must not appear in loaded_tensor_names"
+            .any(|n| n == "blk.2.nextn.embed_tokens.weight"
+                || n == "blk.2.nextn.shared_head_head.weight"),
+        "dedicated tensors must not appear in loaded_tensor_names"
     );
     std::fs::remove_file(&tmp).ok();
 }

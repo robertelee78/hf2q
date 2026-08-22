@@ -5222,6 +5222,7 @@ mod tests {
 
     #[test]
     fn physical_batch_slot_regions_are_disjoint_and_byte_addressed() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let qkv_channels = 128_u32;
         let k_minus_one = 3_u32;
         let d_k = 32_u32;

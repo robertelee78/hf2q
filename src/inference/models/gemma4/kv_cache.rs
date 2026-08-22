@@ -3171,6 +3171,7 @@ mod tests {
 
     #[test]
     fn gemma_anchor_owned_bytes_charge_all_family_allocations() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let anchor = GemmaHybridSlotAnchor::synthetic(7, &[11, 13, 17]);
         let layer_table = (anchor.layers.capacity() as u64)
             * std::mem::size_of::<Option<GemmaHybridSlidingLayerAnchor>>() as u64;
