@@ -1728,27 +1728,30 @@ mod tests {
     ///
     /// This loads a full model artifact and is intentionally ignored by
     /// hosted tests. Run this exact ignored test with an explicit
-    /// `HF2Q_TEST_QWEN38_GGUF` path. Set
+    /// `HF2Q_TEST_QWEN38_GGUF` path and an exact
+    /// `HF2Q_TEST_QWEN38_FORMAT` value from BF16, Q4_K_M, Q5_K_M, Q6_K, or
+    /// Q8_0. Storage assertions bind the declared format to its exact GGUF
+    /// file type and native tensor representations. Set
     /// `HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN=1` to prove the exact Q4_K mvN route,
     /// or `HF2Q_TEST_QWEN38_EXPECT_MV_EXT=1` with
     /// `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1` to prove the same width-four
-    /// qualified weight-amortized width-four route. Set
-    /// `HF2Q_TEST_QWEN38_EXPECT_Q5_K_M=1` with a Q5_K_M artifact path to bind
-    /// the storage assertions to file type 17, a Q5_K embedding/projection,
-    /// and the native Q6_K output head.
+    /// qualified weight-amortized width-four route. Those route-specific
+    /// canaries apply only to Q4_K_M; the five-format matrix always runs the
+    /// common trajectory, cache-handoff, and no-storage-substitution proof.
     #[test]
     #[ignore = "requires an explicit full Qwen3.8 GGUF and Apple Metal"]
     fn qwen38_real_four_position_normal_forward_parity() {
         let expect_q4k_mvn = std::env::var_os("HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN").is_some();
         let expect_mv_ext = std::env::var_os("HF2Q_TEST_QWEN38_EXPECT_MV_EXT").is_some();
-        let expect_q5_k_m = std::env::var_os("HF2Q_TEST_QWEN38_EXPECT_Q5_K_M").is_some();
+        let artifact_format = std::env::var("HF2Q_TEST_QWEN38_FORMAT")
+            .expect("ignored Qwen3.8 parity gate requires HF2Q_TEST_QWEN38_FORMAT");
         assert!(
             !(expect_q4k_mvn && expect_mv_ext),
             "Qwen3.8 qL4 route proof must select exactly one expected route"
         );
         assert!(
-            !(expect_q5_k_m && (expect_q4k_mvn || expect_mv_ext)),
-            "Q5_K_M storage proof cannot request a Q4_K-only route assertion"
+            !(expect_q4k_mvn || expect_mv_ext) || artifact_format == "Q4_K_M",
+            "Q4_K route proof requires HF2Q_TEST_QWEN38_FORMAT=Q4_K_M"
         );
         if expect_q4k_mvn || expect_mv_ext {
             assert_eq!(
@@ -1784,21 +1787,30 @@ mod tests {
         use crate::serve::header::LoadProgress;
         use crate::serve::multi_seq_kv::SlotId;
         use mlx_native::gguf::GgufFile;
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 
         let gguf = GgufFile::open(&path).expect("open Qwen3.8 GGUF");
-        if expect_q5_k_m {
-            assert_eq!(
-                gguf.metadata_u32("general.file_type"),
-                Some(17),
-                "Q5_K_M proof requires exact GGUF file type 17"
-            );
-        }
+        let (expected_file_type, expected_primary_type, expected_output_type) =
+            match artifact_format.as_str() {
+                "BF16" => (32, GgmlType::BF16, GgmlType::BF16),
+                "Q4_K_M" => (15, GgmlType::Q4_K, GgmlType::Q6_K),
+                "Q5_K_M" => (17, GgmlType::Q5_K, GgmlType::Q6_K),
+                "Q6_K" => (18, GgmlType::Q6_K, GgmlType::Q6_K),
+                "Q8_0" => (7, GgmlType::Q8_0, GgmlType::Q8_0),
+                other => panic!(
+                    "unsupported HF2Q_TEST_QWEN38_FORMAT={other}; expected BF16, Q4_K_M, Q5_K_M, Q6_K, or Q8_0"
+                ),
+            };
+        assert_eq!(
+            gguf.metadata_u32("general.file_type"),
+            Some(expected_file_type),
+            "{artifact_format} proof requires its exact GGUF file type"
+        );
         let mut progress = LoadProgress::new(false, 1, 0);
         let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen3.8 model");
         use crate::inference::models::qwen35::gpu_full_attn::FullAttnQGateWeightsGpu;
         use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35LayerWeights};
         use crate::inference::models::qwen35::mtp::MtpFfnWeightsGpu;
-        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 
         // Inference consumes the conversion artifact as written. The accepted
         // GGUF must never fall back to an expanded CPU table or a runtime
@@ -1823,13 +1835,7 @@ mod tests {
                 .is_none(),
             "Qwen native embedding must never carry a dequantized F16 shadow"
         );
-        assert!(
-            matches!(embedding_type, GgmlType::Q4_K | GgmlType::Q5_K),
-            "unexpected native embedding type {embedding_type:?}"
-        );
-        if expect_q5_k_m {
-            assert_eq!(embedding_type, GgmlType::Q5_K);
-        }
+        assert_eq!(embedding_type, expected_primary_type);
         assert_eq!(
             model
                 .output_weight_native
@@ -1837,7 +1843,7 @@ mod tests {
                 .expect("native output head")
                 .info
                 .ggml_dtype,
-            GgmlType::Q6_K
+            expected_output_type
         );
         assert!(
             model
@@ -1848,13 +1854,28 @@ mod tests {
                 .is_none(),
             "Qwen native output head must never carry a dequantized F16 shadow"
         );
-        let is_artifact_quant =
-            |kind: GgmlType| matches!(kind, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K);
+        let is_artifact_storage = |kind: GgmlType| match artifact_format.as_str() {
+            "Q4_K_M" => matches!(kind, GgmlType::Q4_K | GgmlType::Q6_K),
+            "Q5_K_M" => matches!(kind, GgmlType::Q5_K | GgmlType::Q6_K),
+            _ => kind == expected_primary_type,
+        };
         for (layer_index, layer) in model.layers.iter().enumerate() {
-            assert!(
-                matches!(layer.ffn(), Qwen35FfnWeights::DenseQ(_)),
-                "layer {layer_index} FFN did not retain native quantized storage"
-            );
+            match layer.ffn() {
+                Qwen35FfnWeights::DenseNative(weights) => {
+                    assert_eq!(artifact_format, "BF16");
+                    assert_eq!(weights.gate_type, GgmlType::BF16);
+                    assert_eq!(weights.up_type, GgmlType::BF16);
+                    assert_eq!(weights.down_type, GgmlType::BF16);
+                }
+                Qwen35FfnWeights::DenseQ(weights) => {
+                    assert_ne!(artifact_format, "BF16");
+                    assert!(is_artifact_storage(weights.ggml_type_gate_up));
+                    assert!(is_artifact_storage(weights.ggml_type_down));
+                }
+                _ => panic!(
+                    "layer {layer_index} FFN did not retain declared {artifact_format} storage"
+                ),
+            }
             match layer {
                 Qwen35LayerWeights::NativeFullAttn { attn, .. } => {
                     let q_type = match &attn.q_gate {
@@ -1863,10 +1884,10 @@ mod tests {
                             panic!("layer {layer_index} split/re-encoded native Q+gate")
                         }
                     };
-                    assert!(is_artifact_quant(q_type));
-                    assert!(is_artifact_quant(attn.wk_ggml_type));
-                    assert!(is_artifact_quant(attn.wv_ggml_type));
-                    assert!(is_artifact_quant(attn.wo_ggml_type));
+                    assert!(is_artifact_storage(q_type));
+                    assert!(is_artifact_storage(attn.wk_ggml_type));
+                    assert!(is_artifact_storage(attn.wv_ggml_type));
+                    assert!(is_artifact_storage(attn.wo_ggml_type));
                 }
                 Qwen35LayerWeights::NativeLinearAttn { attn, .. } => {
                     for kind in [
@@ -1877,7 +1898,7 @@ mod tests {
                         attn.ssm_out_ggml_type,
                     ] {
                         assert!(
-                            is_artifact_quant(kind),
+                            is_artifact_storage(kind),
                             "layer {layer_index} projection was rewritten as {kind:?}"
                         );
                     }
@@ -1892,15 +1913,8 @@ mod tests {
             mtp.embed_tokens.is_none(),
             "Qwen3.8 MTP must share embeddings"
         );
-        assert!(
-            matches!(mtp.eh_proj_ggml_type, GgmlType::Q4_K | GgmlType::Q5_K),
-            "Qwen3.8 MTP projection was rewritten as {:?}",
-            mtp.eh_proj_ggml_type
-        );
-        if expect_q5_k_m {
-            assert_eq!(mtp.eh_proj_ggml_type, GgmlType::Q5_K);
-        }
-        assert_eq!(mtp.shared_head_head_ggml_type, GgmlType::Q6_K);
+        assert_eq!(mtp.eh_proj_ggml_type, expected_primary_type);
+        assert_eq!(mtp.shared_head_head_ggml_type, expected_output_type);
         use mlx_native::metal::foreign_types::ForeignType;
         let main_head = model
             .output_weight_native
@@ -1916,7 +1930,11 @@ mod tests {
             main_head.buffer.byte_offset(),
             "Qwen3.8 MTP must borrow the exact main output-head view"
         );
-        assert!(matches!(&mtp.ffn, MtpFfnWeightsGpu::DenseQ { .. }));
+        if artifact_format == "BF16" {
+            assert!(matches!(&mtp.ffn, MtpFfnWeightsGpu::Dense { .. }));
+        } else {
+            assert!(matches!(&mtp.ffn, MtpFfnWeightsGpu::DenseQ { .. }));
+        }
         assert_eq!(model.cfg.head_dim, 256, "Qwen3.8 parity requires D=256");
         model
             .ensure_gpu_cache_primed()

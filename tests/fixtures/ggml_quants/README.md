@@ -1,16 +1,16 @@
 # `ggml_quants` reference fixtures (ADR-033 P0)
 
-Byte-cmp ground truth for the per-`GgmlType` Rust quantizer ports under `src/quantize/ggml_quants/`. Each fixture pair `<type>_<n_per_row>_<variant>_{input,expected}.bin` is the F32 input bytes (little-endian, IEEE-754 native) plus the bytes emitted by `ggml_quantize_chunk` at the pinned llama.cpp SHA. The Rust port's `Quantizer::quantize(read_floats(input), n_per_row, imatrix)` MUST return exactly the bytes in `expected.bin`.
+Byte-cmp ground truth for the per-`GgmlType` Rust quantizer ports under `src/quantize/ggml_quants/`. Each fixture pair `<type>_<n_per_row>_<variant>_{input,expected}.bin` is the F32 input bytes (little-endian, IEEE-754 native) plus the bytes emitted by `ggml_quantize_chunk` at the pinned peer SHA. The Rust port's `Quantizer::quantize(read_floats(input), n_per_row, imatrix)` MUST return exactly the bytes in `expected.bin`.
 
 ## Pins
 
-- llama.cpp: `data/llama_cpp_pin.txt` (currently `e15384a5cb092b080c2a01c0b9e3f8635079d6df`; updated 2026-05-20 from prior `c779f619` — synthetic mulberry32 fixtures verified byte-identical between both SHAs by `scripts/ggml_quants_harness/generate_all.sh` re-run with current build + `git diff tests/fixtures/ggml_quants/` showing zero changes)
+- Pinned peer: `data/llama_cpp_pin.txt` (currently `3f545beccee69d9975f466ec7e45fd9aacd8ba90`). On 2026-08-22, build 10587 from that exact clean source produced `llama-server` SHA-256 `a68636546fce8ba0588eb26284b134e3a9057f8e10c53e506fe3512ff5e26ae9`; regenerating all 12 types in both `im` and `noim` modes left this fixture directory byte-identical. The former `e15384a5cb092b080c2a01c0b9e3f8635079d6df` value was not resolvable from the repository or its origin and is not a reproducible pin. Commit `9a286ac98d2cab74231bd3f1fc3f2b8bdf05422e` remains historical evidence for the accepted Q5 benchmark in ADR-044, not the current fixture identity.
 - Build flags: `GGML_NATIVE=ON` on `aarch64-apple-darwin` (NEON enabled — see ADR-033 §P0 acceptance finding I)
 - PRNG: mulberry32 with input_seed=1, imatrix_seed=2 (constants; changing them is an ADR amendment because all fixtures regenerate)
 
 ## Fixture set (v1)
 
-11 types × 2 variants × 2 rows × `n_per_row` size matching the canonical block boundary:
+12 types × 2 variants × 2 rows × `n_per_row` size matching the canonical block boundary:
 
 | Type | block size | n_per_row | n_rows | bytes/expected | imatrix variant |
 |---|---|---|---|---|---|
@@ -20,6 +20,7 @@ Byte-cmp ground truth for the per-`GgmlType` Rust quantizer ports under `src/qua
 | Q5_1 | 24 | 64 | 2 | 96 | noim, im |
 | Q8_0 | 34 | 64 | 2 | 136 | noim, im |
 | IQ4_NL | 18 | 64 | 2 | 72 | noim, im |
+| IQ4_XS | 136 | 512 | 2 | 544 | noim, im |
 | Q2_K | 84 | 512 | 2 | 336 | noim, im |
 | Q3_K | 110 | 512 | 2 | 440 | noim, im |
 | Q4_K | 144 | 512 | 2 | 576 | noim, im |
@@ -29,12 +30,20 @@ Byte-cmp ground truth for the per-`GgmlType` Rust quantizer ports under `src/qua
 ## Regenerate
 
 ```bash
-cd /opt/llama.cpp && git checkout $(cat /opt/hf2q/data/llama_cpp_pin.txt) && cmake -B build -DGGML_NATIVE=ON && cmake --build build
-cd /opt/hf2q && scripts/ggml_quants_harness/build.sh
+git -C /opt/llama.cpp worktree add --detach \
+  /opt/llama.cpp-worktrees/hf2q-pinned-reference \
+  "$(cat /opt/hf2q/data/llama_cpp_pin.txt)"
+cmake -S /opt/llama.cpp-worktrees/hf2q-pinned-reference \
+  -B /opt/llama.cpp-worktrees/hf2q-pinned-reference/build \
+  -DGGML_NATIVE=ON
+cmake --build /opt/llama.cpp-worktrees/hf2q-pinned-reference/build
+cd /opt/hf2q
+LLAMA_CPP_DIR=/opt/llama.cpp-worktrees/hf2q-pinned-reference \
+  scripts/ggml_quants_harness/build.sh
 scripts/ggml_quants_harness/generate_all.sh
 ```
 
-The harness source is `scripts/ggml_quants_harness/gen.c`; it links `libggml.dylib + libggml-cpu.dylib + libggml-base.dylib` and wraps the public `ggml_quantize_chunk` (`/opt/llama.cpp/ggml/include/ggml.h:2764`).
+The harness source is `scripts/ggml_quants_harness/gen.c`; it links `libggml.dylib + libggml-cpu.dylib + libggml-base.dylib` and wraps the public `ggml_quantize_chunk` from the pinned peer source.
 
 ## NEON-vs-scalar caveat
 

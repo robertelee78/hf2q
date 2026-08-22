@@ -131,6 +131,20 @@ jq '.choices[0].message.content = ""' \
 expect_failure empty-output qwen38_physical_validate_response \
     "$test_dir/response-empty.json" fixture-model
 
+cp "$test_dir/response-1.json" "$test_dir/scalar-equal.json"
+qwen38_physical_validate_scalar_parity \
+    "$test_dir/response-1.json" "$test_dir/scalar-equal.json"
+jq '.choices[0].message.content = "different"' \
+    "$test_dir/response-1.json" >"$test_dir/scalar-diverged.json"
+expect_failure scalar-trajectory-divergence \
+    qwen38_physical_validate_scalar_parity \
+    "$test_dir/response-1.json" "$test_dir/scalar-diverged.json"
+jq '.usage.completion_tokens += 1' \
+    "$test_dir/response-1.json" >"$test_dir/scalar-token-count-drift.json"
+expect_failure scalar-token-count-drift \
+    qwen38_physical_validate_scalar_parity \
+    "$test_dir/response-1.json" "$test_dir/scalar-token-count-drift.json"
+
 bash -n "$script_dir/qwen38_physical_multislot_gate.sh"
 bash -n "$script_dir/qwen38_physical_multislot_contract.sh"
 bash -n "$script_dir/serve_qwen36_opencode.sh"
@@ -140,5 +154,12 @@ grep -Fq 'MAX_SLOTS > 16' "$script_dir/serve_qwen36_opencode.sh" || \
 grep -Fq 'readonly WIDTHS=(1 2 4 8 16)' \
     "$script_dir/qwen38_physical_multislot_gate.sh" || \
     fail "physical-width runner does not require the complete width set"
+# shellcheck disable=SC2016
+grep -Fq 'qwen38_physical_validate_scalar_parity "$response" "$scalar_response"' \
+    "$script_dir/qwen38_physical_multislot_gate.sh" || \
+    fail "physical-width runner does not compare every lane to scalar execution"
+grep -Fq 'qwen38_validate_artifact_identity' \
+    "$script_dir/qwen38_physical_multislot_gate.sh" || \
+    fail "physical-width runner does not bind the qualified artifact format"
 
 echo "Qwen3.8 physical multi-slot gate contract: PASS"

@@ -13,9 +13,11 @@
   equal-logit argmax choose the lowest vocabulary index deterministically.
   A one-slot worker now uses the measured 4,096-token prefill quantum while
   multi-slot workers retain the 2,048-token fairness ceiling. The qualified
-  Q5_K_M one-slot workload now has a sealed, stable faster-than-baseline result;
-  broader workloads and true physical multi-slot batching remain open. Exact
-  Qwen3.8 gates are bound to the paired abliterated text artifact and reuse
+  Q5_K_M one-slot workload now has a sealed, stable faster-than-baseline result.
+  Universal Qwen3.8 acceptance now requires the same fail-closed correctness,
+  physical-width, and matched-performance matrices over BF16, Q4_K_M, Q5_K_M,
+  Q6_K, and Q8_0; individual cells do not authorize a universal claim. Exact
+  Qwen3.8 gates are bound to their immutable abliterated text artifacts and reuse
   snapshot-bound model-verification receipts instead of repeatedly scanning an
   unchanged multi-gigabyte GGUF.
 - Owners: hf2q conversion, quantization, inference, and serving
@@ -437,6 +439,41 @@ transcription warmups totaling at least 512 generated tokens, within-engine
 semantic identity, no more than 5% aggregate and 10% per-case spread, and
 non-overlapping observed speed bands. The result establishes superiority for
 this exact artifact and workload, not a universal Qwen3.8 speed claim.
+
+### Cross-quant and physical-width acceptance contract (2026-08-22)
+
+The accepted Q5_K_M receipt above is one required matrix cell, not an
+exemption from artifact breadth or concurrency. Universal Qwen3.8 authority
+requires all of the following exact author-hosted artifacts at immutable
+revision `0a72776892f98db49381fdf69f4b9982222ec9dc`:
+
+| Format | GGUF file | Bytes | SHA-256 | `general.file_type` |
+|---|---|---:|---|---:|
+| BF16 | `gguf/qwen38-abliterated-sft-bf16.gguf` | 54,657,734,208 | `f30d9a6ea40ca3c5265d0996a460ad1474173c40c8e7f04c0b03caf6084c2cee` | 32 |
+| Q4_K_M | `gguf/qwen38-abliterated-sft-hf2q-q4_k_m.gguf` | 16,810,714,944 | `1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a` | 15 |
+| Q5_K_M | `gguf/qwen38-abliterated-sft-q5_k_m.gguf` | 19,535,701,568 | `4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e` | 17 |
+| Q6_K | `gguf/qwen38-abliterated-sft-q6_k.gguf` | 22,431,000,128 | `78f62a87ef851443d4e0c74c4e1eb1dfe73e3bf0ded3cf320ec80f763020ddb3` | 18 |
+| Q8_0 | `gguf/qwen38-abliterated-sft-q8_0.gguf` | 29,047,084,608 | `53c076e5117be1391e76a9746998fbe2040e6b69a73aa47d1c1b0ca97a8a2c99` | 7 |
+
+`scripts/qwen38_artifact_contract.sh` is the single machine-readable identity
+authority. Every real-model runner validates format, byte length, digest, and
+GGUF file type before model allocation. The four-position matrix additionally
+proves native stored-width retention, shared target/MTP output-head allocation,
+batched-versus-scalar decisions at four positions, and an eight-token handoff.
+The physical matrix must pass exact concurrent-versus-scalar response parity
+at widths 1, 2, 4, 8, and 16 for every artifact. The matched pinned-peer matrix
+must pass the existing quality, transcript, stability, non-overlap, and
+faster-than-peer criteria for every artifact. A matrix receipt is published
+only after all cells pass; a missing or failed cell fails the matrix.
+
+The current pinned-peer source identity is
+`3f545beccee69d9975f466ec7e45fd9aacd8ba90`, read from
+`data/llama_cpp_pin.txt`. Build 10587 from that exact clean source produced
+server SHA-256
+`a68636546fce8ba0588eb26284b134e3a9057f8e10c53e506fe3512ff5e26ae9`.
+Regenerating all 12 quantizer fixture families in both importance-matrix modes
+left every checked fixture byte-identical. The 9a286 commit and binary named in
+the accepted Q5 section remain historical receipt identity only.
 
 The final binary above also passed the shared full-context coding contract with
 a 20,584-character repository fixture and a real 230-byte Rust tool result.

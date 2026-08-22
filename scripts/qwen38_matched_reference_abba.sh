@@ -2,13 +2,15 @@
 set -euo pipefail
 
 # Matched single-user Qwen3.8 comparison on one exact GGUF. This developer
-# harness runs hf2q and a caller-bound clean reference HEAD sequentially; the
-# reference is never a product dependency or conversion pin. Fresh servers run in ABBA order,
+# harness runs hf2q and the clean pinned peer sequentially; the peer is never
+# a product dependency or conversion pin. Fresh servers run in ABBA order,
 # every response is retained, and speed is accepted only after complete-code,
 # exact-transcription, and calibrated-host gates pass.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT_DIR="$ROOT_DIR/scripts"
+# shellcheck source=scripts/qwen38_artifact_contract.sh
+source "$SCRIPT_DIR/qwen38_artifact_contract.sh"
 HF2Q_BIN=${HF2Q_BIN:?HF2Q_BIN is required}
 HF2Q_COMMIT=${HF2Q_COMMIT:?HF2Q_COMMIT is required}
 HF2Q_SHA256=${HF2Q_SHA256:?HF2Q_SHA256 is required}
@@ -18,7 +20,13 @@ REFERENCE_COMMIT=${REFERENCE_COMMIT:?REFERENCE_COMMIT is required}
 REFERENCE_SHA256=${REFERENCE_SHA256:?REFERENCE_SHA256 is required}
 MODEL_PATH=${MODEL_PATH:?MODEL_PATH is required}
 MODEL_SHA256=${MODEL_SHA256:?MODEL_SHA256 is required}
-MODEL_BYTES=${MODEL_BYTES:-19535701568}
+MODEL_FORMAT=${MODEL_FORMAT:?MODEL_FORMAT is required}
+artifact_record=$(qwen38_artifact_record "$MODEL_FORMAT")
+IFS=$'\t' read -r qualified_model_format qualified_model_file \
+  qualified_model_bytes _qualified_model_sha256 qualified_model_file_type \
+  <<<"$artifact_record"
+[[ "$qualified_model_format" == "$MODEL_FORMAT" ]]
+MODEL_BYTES=${MODEL_BYTES:-$qualified_model_bytes}
 OUT_DIR=${OUT_DIR:?OUT_DIR is required and must be fresh}
 PORT=${PORT:-18086}
 MODEL_ID=${MODEL_ID:-}
@@ -31,12 +39,6 @@ readonly SUSTAINED_WARMUP_CASES='warmup-a warmup-b warmup-c'
 readonly MIN_SUSTAINED_WARMUP_TOKENS=512
 readonly MAX_WARMUP_TO_MEASUREMENT_SECONDS=2
 readonly TRIAL_ORDER='hf2q reference reference hf2q'
-readonly EXPECTED_MLX_NATIVE_VERSION='0.11.2'
-readonly EXPECTED_MLX_NATIVE_CHECKSUM='22f4bd6661e77994c6f26a79fdd2c188f3d5252aa7e51616f5feb080b22da8e0'
-readonly QUALIFIED_MODEL_REPOSITORY='jenerallee78/Qwen3.8-27B-Abliterated-SFT'
-readonly QUALIFIED_MODEL_REVISION='0a72776892f98db49381fdf69f4b9982222ec9dc'
-readonly QUALIFIED_MODEL_FILE='gguf/qwen38-abliterated-sft-q5_k_m.gguf'
-readonly QUALIFIED_MODEL_SHA256='4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e'
 readonly THERMAL_SETTLE_SECONDS=120
 readonly THERMAL_SETTLE_TIMEOUT_SECONDS=900
 readonly THERMAL_SAMPLE_SECONDS=2
@@ -118,10 +120,9 @@ awk -v minimum="$MIN_HF2Q_RATIO" 'BEGIN { exit !(minimum >= 1.0) }' || {
     echo "MIN_HF2Q_RATIO must be >= 1.0" >&2
     exit 2
 }
-[[ "$MODEL_SHA256" == "$QUALIFIED_MODEL_SHA256" ]] || {
-    echo "matched Q5_K_M gate requires the qualified model SHA-256" >&2
-    exit 2
-}
+qwen38_validate_artifact_identity "$MODEL_FORMAT" "$MODEL_SHA256" \
+  "$MODEL_BYTES" "$qualified_model_file_type"
+qwen38_validate_pinned_peer_commit "$REFERENCE_COMMIT"
 if [[ -e "$OUT_DIR" && -n "$(find "$OUT_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
     echo "matched-reference output directory must be fresh: $OUT_DIR" >&2
     exit 2
@@ -191,7 +192,7 @@ file_bytes() {
 }
 
 require_clean_exact_source "$ROOT_DIR" "$HF2Q_COMMIT" hf2q
-require_clean_exact_source "$REFERENCE_SOURCE_DIR" "$REFERENCE_COMMIT" reference
+require_clean_exact_source "$REFERENCE_SOURCE_DIR" "$REFERENCE_COMMIT" pinned-peer
 [[ "$(sha256_file "$HF2Q_BIN")" == "$HF2Q_SHA256" ]] || {
     echo "hf2q binary SHA-256 mismatch" >&2
     exit 2
@@ -238,8 +239,14 @@ lock_identity=$(awk '
   found && /^version = / { version = $3; gsub(/\"/, "", version); next }
   found && /^checksum = / { checksum = $3; gsub(/\"/, "", checksum); print version " " checksum; exit }
 ' "$ROOT_DIR/Cargo.lock")
-[[ "$lock_identity" == "$EXPECTED_MLX_NATIVE_VERSION $EXPECTED_MLX_NATIVE_CHECKSUM" ]] || {
-    echo "Cargo.lock mlx-native identity is not the qualified release" >&2
+IFS=' ' read -r EXPECTED_MLX_NATIVE_VERSION EXPECTED_MLX_NATIVE_CHECKSUM \
+  <<<"$lock_identity"
+manifest_mlx_native_version=$(sed -nE \
+  's/^mlx-native = "=([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' \
+  "$ROOT_DIR/Cargo.toml")
+[[ "$EXPECTED_MLX_NATIVE_VERSION" == "$manifest_mlx_native_version" \
+  && "$EXPECTED_MLX_NATIVE_CHECKSUM" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "Cargo.toml/Cargo.lock mlx-native identity is not an exact registry release" >&2
     exit 2
 }
 
@@ -1234,13 +1241,15 @@ hf2q_lock_sha=$(sha256_file "$ROOT_DIR/Cargo.lock")
 hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
   "$model_verification_receipt"
 require_clean_exact_source "$ROOT_DIR" "$HF2Q_COMMIT" hf2q
-require_clean_exact_source "$REFERENCE_SOURCE_DIR" "$REFERENCE_COMMIT" reference
+require_clean_exact_source "$REFERENCE_SOURCE_DIR" "$REFERENCE_COMMIT" pinned-peer
 verify_request_manifest
 [[ "$(sha256_file "$launch_settings")" == "$launch_settings_sha" ]]
 
 script_sha=$(sha256_file "$ROOT_DIR/scripts/qwen38_matched_reference_abba.sh")
 contract_sha=$(sha256_file \
   "$ROOT_DIR/scripts/qwen38_matched_reference_contract.sh")
+artifact_contract_sha=$(sha256_file \
+  "$ROOT_DIR/scripts/qwen38_artifact_contract.sh")
 request_manifest_sha=$(sha256_file "$request_manifest")
 measurements_sha=$(sha256_file "$rows_file")
 ttft_rows_sha=$(sha256_file "$ttft_rows_file")
@@ -1269,9 +1278,11 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --arg reference_binary_snapshot "$reference_binary_snapshot" \
   --arg rustc_version "$rustc_version" \
   --arg model_id "$MODEL_ID" --arg model_path "$MODEL_PATH" \
-  --arg model_repository "$QUALIFIED_MODEL_REPOSITORY" \
-  --arg model_revision "$QUALIFIED_MODEL_REVISION" \
-  --arg model_file "$QUALIFIED_MODEL_FILE" \
+  --arg model_format "$MODEL_FORMAT" \
+  --argjson model_file_type "$qualified_model_file_type" \
+  --arg model_repository "$QWEN38_QUALIFIED_MODEL_REPOSITORY" \
+  --arg model_revision "$QWEN38_QUALIFIED_MODEL_REVISION" \
+  --arg model_file "$qualified_model_file" \
   --arg model_sha "$MODEL_SHA256" \
   --arg model_verification "$model_verification_mode" \
   --arg model_file_snapshot "$model_file_snapshot" \
@@ -1285,6 +1296,7 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --arg thermal_probe_binary_sha "$thermal_probe_binary_sha" \
   --arg script_sha "$script_sha" \
   --arg contract_sha "$contract_sha" \
+  --arg artifact_contract_sha "$artifact_contract_sha" \
   --arg request_manifest_sha "$request_manifest_sha" \
   --arg measurements_sha "$measurements_sha" \
   --arg ttft_rows_sha "$ttft_rows_sha" \
@@ -1335,11 +1347,12 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
       proposals:$hf2q_proposals,accepted_draft_tokens:$hf2q_accepted},
     reference:{commit:$reference_commit,binary_sha256:$reference_sha,
       binary_file_snapshot:$reference_binary_snapshot,
-      source_policy:"caller-bound-clean-current-head",
+      source_policy:"clean exact data/llama_cpp_pin.txt commit",
       speculation:"fixed-k3-mtp",drafted_tokens:$reference_drafted,
       accepted_draft_tokens:$reference_accepted,
       kv_cache:"q8_0-k-and-v"},
-    model:{id:$model_id,path:$model_path,repository:$model_repository,
+    model:{id:$model_id,path:$model_path,format:$model_format,
+      gguf_file_type:$model_file_type,repository:$model_repository,
       revision:$model_revision,file:$model_file,sha256:$model_sha,
       bytes:$model_bytes,verification:$model_verification,
       file_snapshot:$model_file_snapshot},
@@ -1369,6 +1382,7 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
       sample_seconds:2,
       trial_logs:16,manifest_sha256:$calibration_manifest_sha},
     evidence:{script_sha256:$script_sha,contract_sha256:$contract_sha,
+      artifact_contract_sha256:$artifact_contract_sha,
       request_manifest_sha256:$request_manifest_sha,
       launch_settings_sha256:$launch_settings_sha,
       measurements_sha256:$measurements_sha,
@@ -1386,6 +1400,11 @@ jq -e '
   and .quality.repeat.natural_stop == true
   and .quality.repeat.exact_across_engines == true
   and .quality.repeat.receipts == 12
+  and ((.model.format == "BF16" and .model.gguf_file_type == 32)
+    or (.model.format == "Q4_K_M" and .model.gguf_file_type == 15)
+    or (.model.format == "Q5_K_M" and .model.gguf_file_type == 17)
+    or (.model.format == "Q6_K" and .model.gguf_file_type == 18)
+    or (.model.format == "Q8_0" and .model.gguf_file_type == 7))
   and .code.hf2q_over_reference >= .acceptance.minimum_hf2q_ratio
   and .repeat.hf2q_over_reference >= .acceptance.minimum_hf2q_ratio
   and .stability.stable == true
