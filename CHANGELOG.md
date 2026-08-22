@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] — 2026-08-22
+
 ### Changed
 
 - Persist the qualified agentic serving profile in `hf2q setup`: answering
@@ -27,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model, at engine load, without overriding operator-exported values. The
   route stays Qwen3.8-scoped because `mul_mv_ext` is not bit-exact and no
   other family carries the qualifying receipt.
+- Rewrite `docs/getting-started.md` as the single first-run journey:
+  install, `hf2q setup`, verified pair download, one-line foreground serve,
+  `hf2q chat` generation proof, single-request vision proof, OpenCode
+  provider setup, full Agentic Kit, and the local research stack. The
+  environment-variable ritual, background-server apparatus, and shell SSE
+  parsing are gone; qualified behavior now ships as product defaults.
+- Make the OpenCode web-stack installer's `--status` a real health check
+  (plugin state, LaunchAgents, fetch health content, live fetch, live
+  search) and fail installation on empty SearXNG results instead of
+  accepting an unproven search path.
 
 ## [0.1.9] — 2026-08-21
 
@@ -950,7 +962,8 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
-[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/robertelee78/hf2q/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/robertelee78/hf2q/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/robertelee78/hf2q/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/robertelee78/hf2q/compare/v0.1.6...v0.1.7
