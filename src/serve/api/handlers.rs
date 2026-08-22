@@ -30,6 +30,12 @@ use std::sync::Arc;
 use super::engine::{self, Engine, SamplingParams};
 use super::grammar;
 use super::lifecycle::ModelLease;
+#[cfg(test)]
+use super::qwen_thinking_policy::{adaptive_qwen_default_thinking_budget, QwenToolChainState};
+use super::qwen_thinking_policy::{
+    constrained_thinking_budget_conflicts, effective_qwen_thinking_budget, qwen_thinking_mode,
+    qwen_tool_chain_state, resolve_qwen_thinking_policy, QwenThinkingDefaults,
+};
 use super::registry;
 use super::schema::{
     ApiError, ApiErrorBody, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
@@ -1205,9 +1211,6 @@ struct PreparedChatContext {
     positions_flat: Option<Vec<i32>>,
 }
 
-const QWEN_TOOL_CONTINUATION_THINKING_CEILING: usize = 512;
-const QWEN_REPEATED_CAP_THINKING_FLOOR: usize = 256;
-
 fn deepseek_required_tool_thinking_eligible(
     registration: Option<&registry::ModelRegistration>,
     reasoning_forced_open: bool,
@@ -1224,59 +1227,6 @@ fn deepseek_required_tool_thinking_eligible(
         && !parallel_tool_calls
         && !logprobs
         && explicit_thinking_budget.is_none()
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct QwenToolChainState {
-    is_tool_continuation: bool,
-    /// Assistant turns that requested one or more tools since the latest user turn.
-    /// Parallel tool results belong to the same cycle and must not deepen the chain.
-    tool_cycles_since_user: usize,
-}
-
-fn qwen_tool_chain_state(messages: &[ChatMessage]) -> QwenToolChainState {
-    let is_tool_continuation = messages
-        .iter()
-        .rev()
-        .find(|message| message.role != "system")
-        .is_some_and(|message| message.role == "tool");
-    let chain_start = messages
-        .iter()
-        .rposition(|message| message.role == "user")
-        .map_or(0, |index| index.saturating_add(1));
-    let tool_cycles_since_user = messages[chain_start..]
-        .iter()
-        .filter(|message| {
-            message.role == "assistant"
-                && message
-                    .tool_calls
-                    .as_ref()
-                    .is_some_and(|calls| !calls.is_empty())
-        })
-        .count();
-    QwenToolChainState {
-        is_tool_continuation,
-        tool_cycles_since_user,
-    }
-}
-
-fn adaptive_qwen_default_thinking_budget(
-    base: Option<usize>,
-    continuation_override: Option<Option<usize>>,
-    chain: QwenToolChainState,
-) -> Option<usize> {
-    if !chain.is_tool_continuation {
-        return base;
-    }
-    let configured = continuation_override.unwrap_or_else(|| {
-        base.map(|budget| budget.min(QWEN_TOOL_CONTINUATION_THINKING_CEILING))
-    })?;
-    let reductions = chain
-        .tool_cycles_since_user
-        .saturating_sub(1)
-        .min(usize::BITS as usize - 1);
-    let reduced = configured >> reductions;
-    Some(reduced.max(configured.min(QWEN_REPEATED_CAP_THINKING_FLOOR)))
 }
 
 fn repeated_tool_result_signature(
@@ -1331,31 +1281,6 @@ fn repeated_tool_result_signature(
         }
     }
     None
-}
-
-fn effective_qwen_thinking_budget(
-    configured: Option<usize>,
-    explicit: bool,
-    max_tokens: usize,
-    transition_tokens: usize,
-) -> Result<Option<usize>, String> {
-    let Some(budget) = configured else {
-        return Ok(None);
-    };
-    let maximum_safe_budget = max_tokens.saturating_sub(transition_tokens.saturating_add(1));
-    if explicit && budget > maximum_safe_budget {
-        return Err(format!(
-            "thinking_token_budget ({budget}) plus its {transition_tokens}-token forced transition must be less than max_tokens ({max_tokens}) so answer capacity remains"
-        ));
-    }
-    let effective = if explicit {
-        budget
-    } else {
-        budget
-            .min(max_tokens.saturating_mul(3) / 4)
-            .min(maximum_safe_budget)
-    };
-    Ok((effective > 0).then_some(effective))
 }
 
 #[cfg(test)]
@@ -2055,10 +1980,7 @@ where
         &tool_choice,
         super::schema::ToolChoiceValue::Required | super::schema::ToolChoiceValue::Function(_)
     );
-    let qwen_thinking_mode = reasoning_forced_open
-        && engine
-            .registration()
-            .is_some_and(|registration| registration.family == "qwen35");
+    let qwen_thinking_mode = qwen_thinking_mode(engine.registration(), reasoning_forced_open);
     let deepseek_required_tool_thinking_mode = deepseek_required_tool_thinking_eligible(
         engine.registration(),
         reasoning_forced_open,
@@ -2078,41 +2000,34 @@ where
             );
         }
     }
-    let qwen_default_thinking_budget =
-        if explicit_thinking_budget.is_none() && qwen_thinking_mode && !constrained_tool_choice {
-            let base = match std::env::var("HF2Q_DEFAULT_THINKING_TOKEN_BUDGET") {
-                Ok(value) => match value.parse::<usize>() {
-                    Ok(0) => None,
-                    Ok(value) => Some(value),
-                    Err(_) => {
-                        return Err(ApiError::invalid_request(
-                            "HF2Q_DEFAULT_THINKING_TOKEN_BUDGET must be a non-negative integer",
-                            Some("thinking_token_budget".into()),
-                        )
-                        .into_response());
-                    }
-                },
-                Err(_) => None,
-            };
-            let continuation_override =
-                match std::env::var("HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET") {
-                    Ok(value) => match value.parse::<usize>() {
-                        Ok(0) => Some(None),
-                        Ok(value) => Some(Some(value)),
-                        Err(_) => {
-                            return Err(ApiError::invalid_request(
-                        "HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET must be a non-negative integer",
-                        Some("thinking_token_budget".into()),
-                    )
-                    .into_response());
-                        }
-                    },
-                    Err(_) => None,
-                };
-            adaptive_qwen_default_thinking_budget(base, continuation_override, chain_state)
-        } else {
-            None
-        };
+    let qwen_defaults = if explicit_thinking_budget.is_none() && qwen_thinking_mode {
+        QwenThinkingDefaults::from_env().map_err(|message| {
+            ApiError::invalid_request(message, Some("thinking_token_budget".into())).into_response()
+        })?
+    } else {
+        QwenThinkingDefaults::default()
+    };
+    let qwen_resolution = resolve_qwen_thinking_policy(
+        engine.registration(),
+        reasoning_forced_open,
+        &tool_choice,
+        explicit_thinking_budget,
+        max_tokens,
+        chain_state,
+        qwen_defaults,
+        matches!(engine.mode(), engine::EngineMode::SlotAware { .. }),
+        |text| {
+            engine
+                .tokenizer()
+                .encode(text, false)
+                .map(|encoding| std::sync::Arc::new(encoding.get_ids().to_vec()))
+                .map_err(|error| error.to_string())
+        },
+    )
+    .map_err(|error| {
+        ApiError::invalid_request(error.message, Some(error.param.into())).into_response()
+    })?;
+    let qwen_required_tool_thinking_mode = qwen_resolution.required_tool_mode;
     let deepseek_default_thinking_budget = if deepseek_required_tool_thinking_mode {
         match std::env::var("HF2Q_DEEPSEEK4_REQUIRED_TOOL_THINKING_TOKEN_BUDGET") {
             Ok(value) => match value.parse::<usize>() {
@@ -2131,22 +2046,24 @@ where
     } else {
         None
     };
-    if explicit_thinking_budget == Some(0) {
+    if !qwen_thinking_mode && explicit_thinking_budget == Some(0) {
         return Err(ApiError::invalid_request(
             "thinking_token_budget must be greater than zero",
             Some("thinking_token_budget".into()),
         )
         .into_response());
     }
-    let configured_thinking_budget = explicit_thinking_budget
-        .or(qwen_default_thinking_budget)
-        .or(deepseek_default_thinking_budget);
+    let configured_thinking_budget = (!qwen_thinking_mode)
+        .then_some(explicit_thinking_budget.or(deepseek_default_thinking_budget))
+        .flatten();
     if qwen_thinking_mode {
         tracing::info!(
             tool_continuation = chain_state.is_tool_continuation,
             tool_cycles_since_user = chain_state.tool_cycles_since_user,
             explicit_thinking_budget,
-            effective_default_thinking_budget = qwen_default_thinking_budget,
+            effective_default_thinking_budget = qwen_resolution.default_budget,
+            effective_thinking_budget = qwen_resolution.effective_budget,
+            required_tool_mode = qwen_resolution.required_tool_mode,
             "Qwen thinking budget policy resolved"
         );
     }
@@ -2157,7 +2074,13 @@ where
         );
     }
     let (thinking_token_budget, reasoning_end_tokens, reasoning_close_tokens) =
-        if let Some(budget) = configured_thinking_budget {
+        if qwen_thinking_mode {
+            (
+                qwen_resolution.effective_budget,
+                qwen_resolution.end_tokens,
+                qwen_resolution.close_tokens,
+            )
+        } else if let Some(budget) = configured_thinking_budget {
             let Some(registration) = engine.registration() else {
                 return Err(ApiError::invalid_request(
                     "thinking_token_budget requires a registered reasoning-capable model",
@@ -2190,11 +2113,7 @@ where
                 )
                 .into_response()
             })?;
-            let transition = if qwen_budget {
-                format!("\nI need to answer now.{close}")
-            } else {
-                close.to_string()
-            };
+            let transition = close.to_string();
             let encode = |text: &str| {
                 engine
                     .tokenizer()
@@ -2217,9 +2136,6 @@ where
                 )
                 .into_response());
             }
-            // The launcher default is a ceiling, not a reason for ordinary
-            // short requests to fail. Reserve at least roughly one quarter of
-            // the caller's completion window for the answer and transition.
             let effective_budget = effective_qwen_thinking_budget(
                 Some(budget),
                 explicit_thinking_budget.is_some(),
@@ -2303,10 +2219,12 @@ where
         }
         _ => engine::ToolCallPolicy::Auto,
     };
-    if thinking_token_budget.is_some()
-        && tc_policy == engine::ToolCallPolicy::Constrained
-        && !deepseek_required_tool_thinking_mode
-    {
+    if constrained_thinking_budget_conflicts(
+        thinking_token_budget,
+        tc_policy,
+        qwen_required_tool_thinking_mode,
+        deepseek_required_tool_thinking_mode,
+    ) {
         return Err(ApiError::invalid_request(
             "thinking_token_budget cannot be combined with required or named tool_choice",
             Some("thinking_token_budget".into()),

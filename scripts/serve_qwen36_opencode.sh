@@ -29,7 +29,10 @@
 #                           continues decoding the answer. For shorter client
 #                           limits this is an adaptive ceiling that reserves
 #                           roughly one quarter of max_tokens for the answer.
-#                           Set THINKING_TOKEN_BUDGET=0 to disable.
+#                           Set THINKING_TOKEN_BUDGET=0 to disable the
+#                           ordinary/automatic ceiling. Required and named
+#                           tool calls retain a response-local forced-close
+#                           ceiling so the required call can complete.
 #   HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET=512
 #                           Smaller default for tool-result continuations.
 #                           Deeper tool-result turns in one user tool chain
