@@ -279,13 +279,14 @@ matched_validate_host_observation_log() {
     local required_duration=$3
     local maximum_gap=$4
     local stats
-    local samples duration gaps invalid starts ends
+    local samples duration gaps invalid starts ends modes
 
     stats=$(awk -F '\t' -v maximum="$maximum_gap" '
       BEGIN { invalid = 0; gaps = 0 }
       {
-        if (NF != 4 || $1 !~ /^[0-9]+$/ || $2 != "ac" || $3 != "quiet" ||
-          length($4) == 0) {
+        if (NF != 6 || $1 !~ /^[0-9]+$/ || $2 != "ac" || $3 != "quiet" ||
+          ($4 != "automatic" && $4 != "high") || $5 !~ /^[0-9]+$/ ||
+          length($6) == 0) {
           invalid++
           next
         }
@@ -294,22 +295,65 @@ matched_validate_host_observation_log() {
         if (samples > 1 && ($1 < previous || $1 - previous > maximum)) gaps++
         previous = $1
         last = $1
-        phases[$4]++
+        phases[$6]++
+        power_modes[$4 "\t" $5]++
       }
       END {
         duration = samples > 0 ? last - first : -1
-        printf "%d\t%d\t%d\t%d\t%d\t%d\n", samples, duration, gaps,
-          invalid, phases["measurement-start"], phases["measurement-end"]
+        for (mode in power_modes) modes++
+        printf "%d\t%d\t%d\t%d\t%d\t%d\t%d\n", samples, duration, gaps,
+          invalid, phases["measurement-start"], phases["measurement-end"], modes
       }
     ' "$host_log") || return 1
-    IFS=$'\t' read -r samples duration gaps invalid starts ends <<<"$stats"
+    IFS=$'\t' read -r samples duration gaps invalid starts ends modes <<<"$stats"
     ((samples >= minimum_samples && duration >= required_duration \
-      && gaps == 0 && invalid == 0)) || return 1
+      && gaps == 0 && invalid == 0 && modes == 1)) || return 1
     if ((minimum_samples >= 3)); then
         ((starts == 1 && ends == 1)) || return 1
-        awk -F '\t' '$4 == "measurement" { found = 1 }
+        awk -F '\t' '$6 == "measurement" { found = 1 }
           END { exit !found }' "$host_log"
     fi
+}
+
+# Parse the active AC Energy Mode from `system_profiler SPPowerDataType`.
+# The explicit labels are authoritative; the private numeric `pmset` value is
+# captured separately only as a cheap continuity canary during measurement.
+matched_parse_ac_power_mode() {
+    awk '
+      /^[[:space:]]*AC Power:[[:space:]]*$/ { in_ac = 1; next }
+      in_ac && /^[[:space:]]*Battery Power:[[:space:]]*$/ { in_ac = 0 }
+      in_ac && /^[[:space:]]*Current Power Source:[[:space:]]*Yes[[:space:]]*$/ {
+        current = 1
+      }
+      in_ac && /^[[:space:]]*High Power Mode:/ {
+        high = $0
+        sub(/^.*High Power Mode:[[:space:]]*/, "", high)
+      }
+      in_ac && /^[[:space:]]*Low Power Mode:/ {
+        low = $0
+        sub(/^.*Low Power Mode:[[:space:]]*/, "", low)
+      }
+      END {
+        if (!current) exit 1
+        if (high == "Yes" && low == "No") print "high"
+        else if (high == "No" && low == "No") print "automatic"
+        else if (high == "No" && low == "Yes") print "low"
+        else exit 1
+      }
+    '
+}
+
+matched_parse_live_power_mode_code() {
+    awk '
+      $1 == "powermode" && $2 ~ /^[0-9]+$/ && NF == 2 {
+        value = $2
+        matches++
+      }
+      END {
+        if (matches != 1) exit 1
+        print value
+      }
+    '
 }
 
 # Read `ps -axo pid=,command=` rows from stdin and report Python processes
@@ -336,7 +380,109 @@ matched_validate_calibration_alignment() {
     local host_log=$2
     cmp -s \
       <(awk -F '\t' 'NF == 3 { print $1 "\t" $3 }' "$thermal_log") \
-      <(awk -F '\t' 'NF == 4 { print $1 "\t" $4 }' "$host_log")
+      <(awk -F '\t' 'NF == 6 { print $1 "\t" $6 }' "$host_log")
+}
+
+# Emit a sealed-shape stability receipt for the two observations of every
+# engine/case and the two complete trial totals for every engine/group.
+matched_measurement_stability_json() {
+    local rows_file=$1
+    local maximum_group_spread=$2
+    local maximum_case_spread=$3
+
+    jq -s --argjson maximum_group_spread "$maximum_group_spread" \
+      --argjson maximum_case_spread "$maximum_case_spread" '
+      def spread($values):
+        ($values | min) as $minimum
+        | ($values | max) as $maximum
+        | if $minimum <= 0 then error("non-positive stability sample")
+          else 100 * ($maximum - $minimum) / (($maximum + $minimum) / 2)
+          end;
+      def median($values):
+        ($values | sort) as $sorted
+        | ($sorted | length) as $count
+        | if $count == 0 then error("empty median sample")
+          elif ($count % 2) == 1 then $sorted[($count / 2 | floor)]
+          else (($sorted[$count / 2 - 1] + $sorted[$count / 2]) / 2)
+          end;
+      . as $rows
+      | ($rows | sort_by(.engine, .name) | group_by(.engine, .name)
+        | map({engine:.[0].engine,name:.[0].name,samples:length,
+            trials:(map(.trial) | sort),
+            wall_spread_percent:spread(map(.wall_seconds)),
+            decode_tps_spread_percent:spread(map(.internal_decode_tps)),
+            completion_token_variants:(map(.completion_tokens) | unique | length)}))
+        as $cases
+      | ($rows | sort_by(.engine, .group, .trial)
+        | group_by(.engine, .group, .trial)
+        | map(. as $trial_rows
+          | ($trial_rows | map(.completion_tokens) | add) as $tokens
+          | ($trial_rows | map(.wall_seconds) | add) as $wall
+          | ($trial_rows | map(.internal_decode_seconds) | add) as $decode
+          | {engine:.[0].engine,group:.[0].group,trial:.[0].trial,
+              samples:length,total_seconds:$wall,completion_tokens:$tokens,
+              aggregate_decode_tps:($tokens / $decode),
+              e2e_tps:($tokens / $wall)})
+        | sort_by(.engine, .group)
+        | group_by(.engine, .group)
+        | map({engine:.[0].engine,group:.[0].group,
+            samples_per_trial:(map(.samples)),trials:(map(.trial) | sort),
+            trial_total_seconds:(map(.total_seconds)),
+            trial_aggregate_decode_tps:(map(.aggregate_decode_tps)),
+            trial_e2e_tps:(map(.e2e_tps)),
+            median_trial_total_seconds:median(map(.total_seconds)),
+            wall_spread_percent:spread(map(.total_seconds)),
+            decode_tps_spread_percent:spread(map(.aggregate_decode_tps))})) as $groups
+      | (["code","repeat"] | map(. as $group
+          | ($groups[] | select(.engine == "hf2q" and .group == $group)) as $hf2q
+          | ($groups[] | select(.engine == "reference" and .group == $group)) as $reference
+          | {group:$group,
+              hf2q_worst_total_seconds:($hf2q.trial_total_seconds | max),
+              reference_best_total_seconds:($reference.trial_total_seconds | min),
+              hf2q_worst_e2e_tps:($hf2q.trial_e2e_tps | min),
+              reference_best_e2e_tps:($reference.trial_e2e_tps | max),
+              wall_dominance:(($hf2q.trial_total_seconds | max)
+                <= ($reference.trial_total_seconds | min)),
+              e2e_tps_dominance:(($hf2q.trial_e2e_tps | min)
+                >= ($reference.trial_e2e_tps | max))})) as $comparisons
+      | {schema:1,total_samples:($rows | length),
+          maximum_group_spread_percent:$maximum_group_spread,
+          maximum_case_spread_percent:$maximum_case_spread,
+          cases:$cases,groups:$groups,comparisons:$comparisons,
+          observed_band_dominance:all($comparisons[];
+            .wall_dominance and .e2e_tps_dominance),
+          stable:(($rows | length) == 24
+            and all($rows[];
+              (.engine == "hf2q" or .engine == "reference")
+              and (.name == "code-a" or .name == "code-b" or
+                .name == "code-c" or .name == "repeat-a" or
+                .name == "repeat-b" or .name == "repeat-c")
+              and .group == (if (.name | startswith("code-"))
+                then "code" else "repeat" end)
+              and (.trial == (if .engine == "hf2q" then 1 else 2 end) or
+                .trial == (if .engine == "hf2q" then 4 else 3 end))
+              and (.wall_seconds | type == "number") and .wall_seconds > 0
+              and (.internal_decode_tps | type == "number")
+              and .internal_decode_tps > 0
+              and (.internal_decode_seconds | type == "number")
+              and .internal_decode_seconds > 0
+              and (.completion_tokens | type == "number")
+              and (.completion_tokens | floor) == .completion_tokens
+              and .completion_tokens > 0)
+            and ($cases | length) == 12
+            and ($groups | length) == 4
+            and all($cases[];
+              .samples == 2
+              and (.trials == (if .engine == "hf2q" then [1,4] else [2,3] end))
+              and .completion_token_variants == 1
+              and .wall_spread_percent <= ($maximum_case_spread + 1e-9)
+              and .decode_tps_spread_percent <= ($maximum_case_spread + 1e-9))
+            and all($groups[];
+              .samples_per_trial == [3,3]
+              and (.trials == (if .engine == "hf2q" then [1,4] else [2,3] end))
+              and .wall_spread_percent <= ($maximum_group_spread + 1e-9)
+              and .decode_tps_spread_percent <= ($maximum_group_spread + 1e-9)))}
+    ' "$rows_file"
 }
 
 matched_publish_result() {

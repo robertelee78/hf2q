@@ -71,6 +71,9 @@ fi
 for needle in \
   'HF2Q_SHA256=${HF2Q_SHA256:?HF2Q_SHA256 is required}' \
   'MIN_HF2Q_RATIO must be >= 1.0' \
+  'readonly MIN_SUSTAINED_WARMUP_TOKENS=512' \
+  'readonly MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT=5' \
+  'readonly MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT=10' \
   "readonly QUALIFIED_MODEL_SHA256='4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e'" \
   'readonly THERMAL_SETTLE_SECONDS=30' \
   'verify_executable_identity hf2q' \
@@ -80,7 +83,11 @@ for needle in \
   'contract_sha256:$contract_sha' \
   'request_manifest_sha256' \
   'evidence_manifest_sha256' \
-  'required_process_state:"quiet"'; do
+  'required_energy_mode:"automatic-or-high"' \
+  'required_process_state:"quiet"' \
+  'matched_measurement_stability_json "$rows_file"' \
+  '.observed_band_dominance == true' \
+  'sustained_warmup:$warmup_diagnostics'; do
   grep -Fq "$needle" "$matched_runner" || {
     echo "matched Q5_K_M runner lost required evidence contract: $needle" >&2
     exit 1

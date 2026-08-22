@@ -183,17 +183,17 @@ printf '%s\n' \
 expect_failure missing-reference-trial-acceptance \
   matched_reference_speculation_totals "$fixture_dir/speculation.jsonl" 3
 
-# Calibration accepts only aligned nominal/ac/quiet observations with bounded
-# gaps and explicit measurement boundary markers.
+# Calibration accepts only aligned nominal/ac/quiet/full-power observations
+# with bounded gaps and explicit measurement boundary markers.
 printf '%s\n' \
   $'100\tnominal\tmeasurement-start' \
   $'102\tnominal\tmeasurement' \
   $'104\tnominal\tmeasurement-end' \
   >"$fixture_dir/thermal-good.tsv"
 printf '%s\n' \
-  $'100\tac\tquiet\tmeasurement-start' \
-  $'102\tac\tquiet\tmeasurement' \
-  $'104\tac\tquiet\tmeasurement-end' \
+  $'100\tac\tquiet\tautomatic\t0\tmeasurement-start' \
+  $'102\tac\tquiet\tautomatic\t0\tmeasurement' \
+  $'104\tac\tquiet\tautomatic\t0\tmeasurement-end' \
   >"$fixture_dir/host-good.tsv"
 thermal_validate_measurement_log "$fixture_dir/thermal-good.tsv" 3
 matched_validate_host_observation_log "$fixture_dir/host-good.tsv" 3 4 3
@@ -207,14 +207,150 @@ sed 's/\tquiet\t/\tbusy\t/' "$fixture_dir/host-good.tsv" \
   >"$fixture_dir/host-busy.tsv"
 expect_failure busy-calibration matched_validate_host_observation_log \
   "$fixture_dir/host-busy.tsv" 3 4 3
+sed 's/\tautomatic\t0\t/\tlow\t2\t/' "$fixture_dir/host-good.tsv" \
+  >"$fixture_dir/host-low-power.tsv"
+expect_failure low-power-calibration matched_validate_host_observation_log \
+  "$fixture_dir/host-low-power.tsv" 3 4 3
+sed '2s/\tautomatic\t0\t/\thigh\t2\t/' "$fixture_dir/host-good.tsv" \
+  >"$fixture_dir/host-mode-change.tsv"
+expect_failure changing-power-mode matched_validate_host_observation_log \
+  "$fixture_dir/host-mode-change.tsv" 3 4 3
 printf '%s\n' $'100\tnominal\tmeasurement-start' \
   $'104\tnominal\tmeasurement-end' >"$fixture_dir/thermal-gap.tsv"
 expect_failure thermal-sampling-gap thermal_validate_measurement_log \
   "$fixture_dir/thermal-gap.tsv" 3
-printf '%s\n' $'100\tac\tquiet\tmeasurement-start' \
-  $'104\tac\tquiet\tmeasurement-end' >"$fixture_dir/host-gap.tsv"
+printf '%s\n' $'100\tac\tquiet\tautomatic\t0\tmeasurement-start' \
+  $'104\tac\tquiet\tautomatic\t0\tmeasurement-end' \
+  >"$fixture_dir/host-gap.tsv"
 expect_failure host-sampling-gap matched_validate_host_observation_log \
   "$fixture_dir/host-gap.tsv" 2 4 3
+
+cat >"$fixture_dir/power-automatic.txt" <<'EOF'
+    System Power Settings:
+      AC Power:
+          Current Power Source: Yes
+          High Power Mode: No
+          Low Power Mode: No
+      Battery Power:
+          High Power Mode: No
+          Low Power Mode: Yes
+EOF
+[[ "$(matched_parse_ac_power_mode <"$fixture_dir/power-automatic.txt")" \
+  == automatic ]]
+sed 's/High Power Mode: No/High Power Mode: Yes/; s/Low Power Mode: No/Low Power Mode: No/' \
+  "$fixture_dir/power-automatic.txt" >"$fixture_dir/power-high.txt"
+[[ "$(matched_parse_ac_power_mode <"$fixture_dir/power-high.txt")" == high ]]
+cat >"$fixture_dir/power-low.txt" <<'EOF'
+    System Power Settings:
+      AC Power:
+          Current Power Source: Yes
+          High Power Mode: No
+          Low Power Mode: Yes
+      Battery Power:
+          High Power Mode: No
+          Low Power Mode: Yes
+EOF
+[[ "$(matched_parse_ac_power_mode <"$fixture_dir/power-low.txt")" == low ]]
+printf '%s\n' 'System-wide power settings:' 'Currently in use:' \
+  ' powermode            2' ' womp                 1' \
+  >"$fixture_dir/power-live.txt"
+[[ "$(matched_parse_live_power_mode_code <"$fixture_dir/power-live.txt")" == 2 ]]
+expect_failure missing-live-power-mode matched_parse_live_power_mode_code \
+  < /dev/null
+printf '%s\n' ' powermode nope' >"$fixture_dir/power-live-invalid.txt"
+expect_failure invalid-live-power-mode matched_parse_live_power_mode_code \
+  <"$fixture_dir/power-live-invalid.txt"
+printf '%s\n' ' powermode 0' ' powermode 2' \
+  >"$fixture_dir/power-live-duplicate.txt"
+expect_failure duplicate-live-power-mode matched_parse_live_power_mode_code \
+  <"$fixture_dir/power-live-duplicate.txt"
+
+write_stability_fixture() {
+    local path=$1
+    local hf2q_first=$2
+    local hf2q_last=$3
+    local reference_first=$4
+    local reference_last=$5
+    local engine trial factor name group case_index wall tps tokens decode_seconds
+    : >"$path"
+    for engine in hf2q reference; do
+        for trial in $(if [[ "$engine" == hf2q ]]; then printf '1 4'; else printf '2 3'; fi); do
+            if [[ "$engine/$trial" == hf2q/1 ]]; then factor=$hf2q_first
+            elif [[ "$engine/$trial" == hf2q/4 ]]; then factor=$hf2q_last
+            elif [[ "$engine/$trial" == reference/2 ]]; then factor=$reference_first
+            else factor=$reference_last
+            fi
+            case_index=0
+            for name in code-a code-b code-c repeat-a repeat-b repeat-c; do
+                case_index=$((case_index + 1))
+                group=${name%%-*}
+                wall=$(awk -v base="$case_index" -v factor="$factor" \
+                  'BEGIN { printf "%.9f", base * factor }')
+                tps=$factor
+                tokens=$((40 + case_index))
+                decode_seconds=$(awk -v tokens="$tokens" -v tps="$tps" \
+                  'BEGIN { printf "%.9f", tokens / tps }')
+                jq -cn --arg engine "$engine" --arg name "$name" \
+                  --arg group "$group" --argjson trial "$trial" \
+                  --argjson wall "$wall" --argjson tps "$tps" \
+                  --argjson decode_seconds "$decode_seconds" \
+                  --argjson tokens "$tokens" \
+                  '{engine:$engine,trial:$trial,name:$name,group:$group,
+                    wall_seconds:$wall,internal_decode_tps:$tps,
+                    internal_decode_seconds:$decode_seconds,
+                    completion_tokens:$tokens}' >>"$path"
+            done
+        done
+    done
+}
+
+validate_stability_fixture() {
+    matched_measurement_stability_json "$1" 5 10 | jq -e '.stable == true' \
+      >/dev/null
+}
+
+# The exact ABBA shape passes at stable frequency, including the 5% boundary.
+write_stability_fixture "$fixture_dir/stability-good.jsonl" 0.975 1.025 1 1
+validate_stability_fixture "$fixture_dir/stability-good.jsonl"
+matched_measurement_stability_json "$fixture_dir/stability-good.jsonl" 5 10 \
+  | jq -e '.observed_band_dominance == false' >/dev/null
+write_stability_fixture "$fixture_dir/stability-dominant.jsonl" 0.80 0.81 1 1
+matched_measurement_stability_json "$fixture_dir/stability-dominant.jsonl" 5 10 \
+  | jq -e '.stable == true and .observed_band_dominance == true' >/dev/null
+
+# Nominal host telemetry cannot hide a same-engine 50 -> 28 t/s collapse.
+write_stability_fixture "$fixture_dir/stability-collapse.jsonl" 1 1.78 1 1
+expect_failure dvfs-collapse validate_stability_fixture \
+  "$fixture_dir/stability-collapse.jsonl"
+
+write_stability_fixture "$fixture_dir/stability-over-limit.jsonl" 0.974 1.026 1 1
+expect_failure over-five-percent validate_stability_fixture \
+  "$fixture_dir/stability-over-limit.jsonl"
+write_stability_fixture "$fixture_dir/stability-case-base.jsonl" 1 1 1 1
+jq -c 'if .engine == "hf2q" and .trial == 4 and .name == "code-a"
+  then .wall_seconds = 1.1052631578947367
+    | .internal_decode_tps = 1.1052631578947367
+    | .internal_decode_seconds = (.completion_tokens / .internal_decode_tps)
+  else . end' "$fixture_dir/stability-case-base.jsonl" \
+  >"$fixture_dir/stability-case-boundary.jsonl"
+validate_stability_fixture "$fixture_dir/stability-case-boundary.jsonl"
+jq -c 'if .engine == "hf2q" and .trial == 4 and .name == "code-a"
+  then .wall_seconds = 1.106
+    | .internal_decode_tps = 1.106
+    | .internal_decode_seconds = (.completion_tokens / .internal_decode_tps)
+  else . end' "$fixture_dir/stability-case-base.jsonl" \
+  >"$fixture_dir/stability-case-over.jsonl"
+expect_failure over-ten-percent-case validate_stability_fixture \
+  "$fixture_dir/stability-case-over.jsonl"
+sed '1d' "$fixture_dir/stability-good.jsonl" \
+  >"$fixture_dir/stability-missing.jsonl"
+expect_failure missing-abba-row validate_stability_fixture \
+  "$fixture_dir/stability-missing.jsonl"
+jq 'if .engine == "hf2q" and .trial == 4 and .name == "code-a"
+  then .completion_tokens += 1 else . end' \
+  "$fixture_dir/stability-good.jsonl" >"$fixture_dir/stability-token-drift.jsonl"
+expect_failure completion-token-drift validate_stability_fixture \
+  "$fixture_dir/stability-token-drift.jsonl"
 
 # The production host-contention parser must execute under the platform awk,
 # exclude the current server PID, and distinguish Python model work from an
@@ -281,6 +417,9 @@ for call in \
   'matched_reference_speculation_totals "$rows_file"' \
   'matched_find_scripted_model_work "$allowed_pid"' \
   'matched_validate_host_observation_log ' \
+  'matched_parse_ac_power_mode' \
+  'matched_parse_live_power_mode_code' \
+  'matched_measurement_stability_json "$rows_file"' \
   'matched_publish_result '; do
     grep -Fq "$call" "$runner" \
       || fail "production runner does not invoke tested predicate: $call"

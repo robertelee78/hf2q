@@ -27,6 +27,9 @@ MIN_HF2Q_RATIO=${MIN_HF2Q_RATIO:-1.0}
 readonly MAX_TOKENS=256
 readonly TTFT_MAX_TOKENS=16
 readonly CASES='code-a code-b code-c repeat-a repeat-b repeat-c'
+readonly SUSTAINED_WARMUP_CASES='warmup-a warmup-b warmup-c'
+readonly MIN_SUSTAINED_WARMUP_TOKENS=512
+readonly MAX_WARMUP_TO_MEASUREMENT_SECONDS=2
 readonly TRIAL_ORDER='hf2q reference reference hf2q'
 readonly EXPECTED_MLX_NATIVE_VERSION='0.11.1'
 readonly EXPECTED_MLX_NATIVE_CHECKSUM='6f2fd765e3288d4e59a55eceaf11d978d45f40ef1fb34794a273636b69de05b7'
@@ -37,6 +40,8 @@ readonly QUALIFIED_MODEL_SHA256='4b19f41c391d962882e459be3315d4e3c54079892db2848
 readonly THERMAL_SETTLE_SECONDS=30
 readonly THERMAL_SETTLE_TIMEOUT_SECONDS=900
 readonly THERMAL_SAMPLE_SECONDS=2
+readonly MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT=5
+readonly MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT=10
 
 if [[ ${HF2Q_THERMAL_SWIFTC_BIN+x} || ${HF2Q_THERMAL_PROBE_BIN+x} \
   || ${HF2Q_THERMAL_PROBE_SOURCE+x} ]]; then
@@ -53,7 +58,8 @@ source "$SCRIPT_DIR/macos_thermal_guard.sh"
 source "$SCRIPT_DIR/qwen38_matched_reference_contract.sh"
 
 for command in awk basename caffeinate cat cmp cp curl date dirname find git jq kill \
-  lsof mkdir mv perl pmset ps rg rustc sed shasum sort stat sw_vers sysctl tr uname; do
+  lsof mkdir mv perl pmset ps rg rustc sed shasum sort stat sw_vers \
+  system_profiler sysctl tr uname; do
     command -v "$command" >/dev/null || {
         echo "missing required command: $command" >&2
         exit 2
@@ -317,6 +323,21 @@ write_request repeat-c \
 write_request warmup \
   'This request is benchmark warmup only.' \
   'Return exactly WARMUP.' 'WARMUP'
+warmup_a_segment='Amber lanterns marked the northern footpath while careful surveyors measured every stone, copied each coordinate into waterproof notebooks, checked the compass twice, and returned the polished instruments to numbered cedar cases before the evening rain reached the quiet valley.'
+warmup_b_segment='Copper relays clicked inside the control room as patient technicians inspected every cable, compared the voltage readings with yesterday records, signed the maintenance sheet, and placed three calibrated meters beside the sealed cabinet for the incoming morning team.'
+warmup_c_segment='Silver clouds crossed the observatory dome while four astronomers aligned the mirrors, verified the tracking clock, recorded the cooling pressure, archived the raw images, and carried the completed logbook downstairs before the first pale sunlight appeared above the ridge.'
+write_request warmup-a \
+  'You are a transcription engine. Return only the requested text exactly.' \
+  "Repeat the following text exactly, with no introduction or quotation marks: $warmup_a_segment $warmup_a_segment $warmup_a_segment $warmup_a_segment" \
+  "$warmup_a_segment $warmup_a_segment $warmup_a_segment $warmup_a_segment"
+write_request warmup-b \
+  'You are a transcription engine. Return only the requested text exactly.' \
+  "Repeat the following text exactly, with no introduction or quotation marks: $warmup_b_segment $warmup_b_segment $warmup_b_segment $warmup_b_segment" \
+  "$warmup_b_segment $warmup_b_segment $warmup_b_segment $warmup_b_segment"
+write_request warmup-c \
+  'You are a transcription engine. Return only the requested text exactly.' \
+  "Repeat the following text exactly, with no introduction or quotation marks: $warmup_c_segment $warmup_c_segment $warmup_c_segment $warmup_c_segment" \
+  "$warmup_c_segment $warmup_c_segment $warmup_c_segment $warmup_c_segment"
 jq -n --arg model "$MODEL_ID" --argjson max_tokens "$TTFT_MAX_TOKENS" '{
   model:$model,
   messages:[
@@ -372,7 +393,8 @@ write_launch_settings() {
         reasoning:false,speculation:"fixed-k3-mtp",
         draft_max:3,draft_min:0,draft_probability_minimum:0,
         draft_backend_sampling:true},
-      host_calibration:{power:"ac",thermal:"nominal",sample_seconds:2,
+      host_calibration:{power:"ac",energy_mode:"automatic-or-high",
+        thermal:"nominal",sample_seconds:2,
         settle_seconds:30,
         forbidden_processes:["hf2q","llama-server","llama-cli","llama-bench",
           "cargo","rustc","ollama","mlx-lm","mlx_lm","swift-frontend",
@@ -415,6 +437,42 @@ assert_no_model_runtime() {
 require_ac_power() {
     pmset -g batt | rg -q "Now drawing from 'AC Power'" || {
         echo "matched run requires continuous AC power" >&2
+        return 1
+    }
+}
+
+power_mode_name=''
+power_mode_code=''
+read_live_power_mode_code() {
+    pmset -g live | matched_parse_live_power_mode_code
+}
+
+initialize_power_mode_contract() {
+    require_ac_power
+    power_mode_name=$(LANG=C LC_ALL=C system_profiler SPPowerDataType \
+      | matched_parse_ac_power_mode) || {
+        echo "could not resolve the active AC Energy Mode" >&2
+        return 1
+    }
+    [[ "$power_mode_name" != low ]] || {
+        echo "matched performance gate rejects AC Low Power Mode; select Automatic or High Power Mode" >&2
+        return 1
+    }
+    power_mode_code=$(read_live_power_mode_code) || {
+        echo "could not read the live numeric power-mode canary" >&2
+        return 1
+    }
+}
+
+verify_power_mode_contract() {
+    local explicit_mode live_code
+    require_ac_power
+    explicit_mode=$(LANG=C LC_ALL=C system_profiler SPPowerDataType \
+      | matched_parse_ac_power_mode) || return 1
+    live_code=$(read_live_power_mode_code) || return 1
+    [[ "$explicit_mode" == "$power_mode_name" \
+      && "$live_code" == "$power_mode_code" ]] || {
+        echo "AC Energy Mode changed during the matched run: expected=$power_mode_name/$power_mode_code actual=$explicit_mode/$live_code" >&2
         return 1
     }
 }
@@ -507,16 +565,22 @@ record_calibration_observation() {
     local thermal_log=$1
     local host_log=$2
     local phase=$3
-    local sampled_at
+    local sampled_at live_power_mode_code
 
     require_ac_power
     require_no_foreign_heavy_work "$server_pid"
+    live_power_mode_code=$(read_live_power_mode_code)
+    [[ "$live_power_mode_code" == "$power_mode_code" ]] || {
+        echo "numeric power-mode canary changed during calibration" >&2
+        return 1
+    }
     thermal_read_state
     sampled_at=$(date +%s)
     [[ "$sampled_at" =~ ^[0-9]+$ ]]
     printf '%s\t%s\t%s\n' "$sampled_at" "$THERMAL_STATE" "$phase" \
       >>"$thermal_log"
-    printf '%s\tac\tquiet\t%s\n' "$sampled_at" "$phase" >>"$host_log"
+    printf '%s\tac\tquiet\t%s\t%s\t%s\n' "$sampled_at" \
+      "$power_mode_name" "$power_mode_code" "$phase" >>"$host_log"
 }
 
 wait_loaded_idle_calibration() {
@@ -677,12 +741,14 @@ rows_file="$OUT_DIR/measurements.jsonl"
 : >"$rows_file"
 ttft_rows_file="$OUT_DIR/ttft.jsonl"
 : >"$ttft_rows_file"
+warmup_rows_file="$OUT_DIR/sustained-warmup.jsonl"
+: >"$warmup_rows_file"
 thermal_prepare_probe
 thermal_probe_source_sha=$(sha256_file "$THERMAL_PROBE_SOURCE")
 thermal_probe_compiler_sha=$(sha256_file "$THERMAL_PROBE_COMPILER")
 thermal_probe_binary_sha=$(sha256_file "$THERMAL_PROBE_BIN")
 thermal_probe_compiler_version=$THERMAL_PROBE_COMPILER_VERSION
-require_ac_power
+initialize_power_mode_contract
 assert_no_model_runtime
 caffeinate -dimsu -w "$$" &
 caffeinate_pid=$!
@@ -723,6 +789,7 @@ run_trial() {
     local measurement_log="$trial_dir/thermal-measurement.tsv"
     local host_measurement_log="$trial_dir/host-measurement.tsv"
     local name group response elapsed content source_path
+    local warmup_finished_at measurement_started_at warmup_delay
     mkdir -p "$trial_dir"
     assert_no_model_runtime
     launch_server "$engine" "$log"
@@ -747,10 +814,65 @@ run_trial() {
     cmp <(jq -j '.choices[0].message.content' "$trial_dir/warmup.json") \
       "$OUT_DIR/expected/warmup.txt"
     run_stream_ttft "$engine" "$index" "$trial_dir"
+    for name in $SUSTAINED_WARMUP_CASES; do
+        response="$trial_dir/$name.json"
+        elapsed=$(curl --fail-with-body --silent --show-error --max-time 600 \
+          --header 'Content-Type: application/json' \
+          --data-binary "@$OUT_DIR/requests/$name.json" \
+          --output "$response" --write-out '%{time_total}' \
+          "http://127.0.0.1:$PORT/v1/chat/completions")
+        matched_validate_common_response "$response"
+        cmp <(jq -j '.choices[0].message.content' "$response") \
+          "$OUT_DIR/expected/$name.txt"
+        [[ "$(jq -er '.choices[0].finish_reason' "$response")" == stop ]]
+        jq -cn --arg engine "$engine" --arg name "$name" \
+          --argjson trial "$index" --argjson wall_seconds "$elapsed" \
+          --arg content_sha256 "$(jq -j '.choices[0].message.content' \
+            "$response" | shasum -a 256 | awk '{print $1}')" \
+          --slurpfile response "$response" '{engine:$engine,trial:$trial,
+            name:$name,wall_seconds:$wall_seconds,
+            prompt_tokens:$response[0].usage.prompt_tokens,
+            completion_tokens:$response[0].usage.completion_tokens,
+            finish_reason:$response[0].choices[0].finish_reason,
+            content_sha256:$content_sha256}' >>"$warmup_rows_file"
+    done
+    warmup_finished_at=$(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+      -e 'printf "%.9f", clock_gettime(CLOCK_MONOTONIC)')
     curl --fail --silent --show-error --max-time 10 \
       "http://127.0.0.1:$PORT/metrics" >"$trial_dir/metrics-before.txt"
 
     for name in $CASES; do
+        if [[ "$name" == code-a ]]; then
+            measurement_started_at=$(perl \
+              -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+              -e 'printf "%.9f", clock_gettime(CLOCK_MONOTONIC)')
+            warmup_delay=$(awk -v started="$measurement_started_at" \
+              -v finished="$warmup_finished_at" \
+              'BEGIN { printf "%.9f", started - finished }')
+            awk -v delay="$warmup_delay" \
+              -v maximum="$MAX_WARMUP_TO_MEASUREMENT_SECONDS" \
+              'BEGIN { exit !(delay >= 0 && delay <= maximum) }'
+            jq -s --arg engine "$engine" --argjson trial "$index" \
+              --argjson delay "$warmup_delay" \
+              --argjson minimum_tokens "$MIN_SUSTAINED_WARMUP_TOKENS" \
+              --argjson maximum_delay "$MAX_WARMUP_TO_MEASUREMENT_SECONDS" '
+              [.[] | select(.engine == $engine and .trial == $trial)] as $rows
+              | {schema:1,engine:$engine,trial:$trial,samples:($rows | length),
+                  completion_tokens:([$rows[].completion_tokens] | add),
+                  exact_content:all($rows[];
+                    (.content_sha256 | test("^[0-9a-f]{64}$"))),
+                  natural_stop:all($rows[]; .finish_reason == "stop"),
+                  warmup_to_measurement_seconds:$delay,
+                  minimum_completion_tokens:$minimum_tokens,
+                  maximum_warmup_to_measurement_seconds:$maximum_delay}
+              | . + {pass:(.samples == 3
+                  and .completion_tokens >= .minimum_completion_tokens
+                  and .exact_content and .natural_stop
+                  and .warmup_to_measurement_seconds
+                    <= .maximum_warmup_to_measurement_seconds)}
+            ' "$warmup_rows_file" >"$trial_dir/sustained-warmup.json"
+            jq -e '.pass == true' "$trial_dir/sustained-warmup.json" >/dev/null
+        fi
         response="$trial_dir/$name.json"
         elapsed=$(curl --fail-with-body --silent --show-error --max-time 600 \
           --header 'Content-Type: application/json' \
@@ -849,6 +971,7 @@ run_trial() {
       "$host_measurement_log"
     [[ ! -e "$trial_dir/calibration-failure.txt" ]]
     stop_server
+    verify_power_mode_contract
     qwen36_reject_fatal_log "$log"
     for name in code-a code-b code-c; do
         matched_validate_rust_case "$name" \
@@ -862,6 +985,31 @@ for engine in $TRIAL_ORDER; do
     trial=$((trial + 1))
     run_trial "$trial" "$engine"
 done
+
+warmup_diagnostics=$(jq -s \
+  --argjson minimum_tokens "$MIN_SUSTAINED_WARMUP_TOKENS" '
+  sort_by(.engine, .name) as $rows
+  | ($rows | group_by(.engine, .name)
+    | map({engine:.[0].engine,name:.[0].name,samples:length,
+        trials:(map(.trial) | sort),
+        completion_token_variants:(map(.completion_tokens) | unique | length),
+        content_sha256_variants:(map(.content_sha256) | unique | length)})) as $cases
+  | ($rows | sort_by(.engine, .trial) | group_by(.engine, .trial)
+    | map({engine:.[0].engine,trial:.[0].trial,samples:length,
+        completion_tokens:(map(.completion_tokens) | add)})) as $trials
+  | {schema:1,samples:($rows | length),cases:$cases,trials:$trials,
+      minimum_completion_tokens_per_trial:$minimum_tokens,
+      pass:(($rows | length) == 12
+        and ($cases | length) == 6 and ($trials | length) == 4
+        and all($cases[];
+          .samples == 2
+          and (.trials == (if .engine == "hf2q" then [1,4] else [2,3] end))
+          and .completion_token_variants == 1
+          and .content_sha256_variants == 1)
+        and all($trials[];
+          .samples == 3 and .completion_tokens >= $minimum_tokens))}
+' "$warmup_rows_file")
+jq -e '.pass == true' <<<"$warmup_diagnostics" >/dev/null
 
 calibration_manifest="$OUT_DIR/calibration.sha256"
 : >"$calibration_manifest"
@@ -888,6 +1036,10 @@ for name in $CASES; do
         echo "expected four quality receipts for $name" >&2
         exit 1
     }
+    cmp "$OUT_DIR/trials/trial-1-hf2q/$name.semantic.json" \
+      "$OUT_DIR/trials/trial-4-hf2q/$name.semantic.json"
+    cmp "$OUT_DIR/trials/trial-2-reference/$name.semantic.json" \
+      "$OUT_DIR/trials/trial-3-reference/$name.semantic.json"
     if [[ "$name" == repeat-* ]]; then
         baseline="$OUT_DIR/trials/trial-1-hf2q/$name.semantic.json"
         for candidate in "$OUT_DIR"/trials/trial-*/"$name.semantic.json"; do
@@ -960,49 +1112,45 @@ done
     exit 1
 }
 
-median_seconds() {
-    local engine=$1
-    local group=$2
-    jq -r --arg engine "$engine" --arg group "$group" \
-      'select(.engine == $engine and .group == $group) | .wall_seconds' \
-      "$rows_file" | sort -n | awk '
-        { value[NR] = $1 }
-        END {
-          if (NR == 0) exit 2
-          if (NR % 2 == 1) printf "%.6f", value[(NR + 1) / 2]
-          else printf "%.6f", (value[NR / 2] + value[NR / 2 + 1]) / 2.0
-        }
-      '
+stability_json="$OUT_DIR/stability.json"
+matched_measurement_stability_json "$rows_file" \
+  "$MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT" \
+  "$MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT" >"$stability_json"
+jq -e '.stable == true' "$stability_json" >/dev/null || {
+    echo "matched performance calibration is unstable; no speed verdict is valid" >&2
+    jq '{maximum_group_spread_percent,maximum_case_spread_percent,
+      cases:[.cases[] | select(
+        .wall_spread_percent > $maximum_case_spread_percent or
+        .decode_tps_spread_percent > $maximum_case_spread_percent)],
+      groups:[.groups[] | select(
+        .wall_spread_percent > $maximum_group_spread_percent or
+        .decode_tps_spread_percent > $maximum_group_spread_percent)]}' \
+      "$stability_json" >&2
+    exit 1
+}
+jq -e '.observed_band_dominance == true' "$stability_json" >/dev/null || {
+    echo "matched speed bands overlap; result is inconclusive, not parity" >&2
+    jq '.comparisons' "$stability_json" >&2
+    exit 1
 }
 
-spread_percent() {
+group_seconds() {
     local engine=$1
     local group=$2
-    local median=$3
-    jq -r --arg engine "$engine" --arg group "$group" \
-      'select(.engine == $engine and .group == $group) | .wall_seconds' \
-      "$rows_file" | sort -n | awk -v median="$median" '
-        NR == 1 { minimum = $1 }
-        { maximum = $1 }
-        END {
-          if (NR == 0 || median <= 0) exit 2
-          printf "%.6f", 100.0 * (maximum - minimum) / median
-        }
-      '
+    jq -er --arg engine "$engine" --arg group "$group" '
+      .groups[] | select(.engine == $engine and .group == $group)
+      | .median_trial_total_seconds
+    ' "$stability_json"
 }
 
-hf2q_code=$(median_seconds hf2q code)
-reference_code=$(median_seconds reference code)
-hf2q_repeat=$(median_seconds hf2q repeat)
-reference_repeat=$(median_seconds reference repeat)
+hf2q_code=$(group_seconds hf2q code)
+reference_code=$(group_seconds reference code)
+hf2q_repeat=$(group_seconds hf2q repeat)
+reference_repeat=$(group_seconds reference repeat)
 code_ratio=$(awk -v reference="$reference_code" -v hf2q="$hf2q_code" \
   'BEGIN { printf "%.6f", reference / hf2q }')
 repeat_ratio=$(awk -v reference="$reference_repeat" -v hf2q="$hf2q_repeat" \
   'BEGIN { printf "%.6f", reference / hf2q }')
-hf2q_code_spread=$(spread_percent hf2q code "$hf2q_code")
-reference_code_spread=$(spread_percent reference code "$reference_code")
-hf2q_repeat_spread=$(spread_percent hf2q repeat "$hf2q_repeat")
-reference_repeat_spread=$(spread_percent reference repeat "$reference_repeat")
 
 for ratio in "$code_ratio" "$repeat_ratio"; do
     awk -v actual="$ratio" -v minimum="$MIN_HF2Q_RATIO" \
@@ -1124,6 +1272,8 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --arg model_file_snapshot "$model_file_snapshot" \
   --arg hardware_model "$hardware_model" --arg hardware_chip "$hardware_chip" \
   --arg hardware_arch "$hardware_arch" --arg hardware_os "$hardware_os" \
+  --arg power_mode_name "$power_mode_name" \
+  --argjson power_mode_code "$power_mode_code" \
   --arg thermal_probe_source_sha "$thermal_probe_source_sha" \
   --arg thermal_probe_compiler_sha "$thermal_probe_compiler_sha" \
   --arg thermal_probe_compiler_version "$thermal_probe_compiler_version" \
@@ -1138,18 +1288,17 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --arg evidence_manifest_sha "$evidence_manifest_sha" \
   --argjson model_bytes "$MODEL_BYTES" --argjson max_tokens "$MAX_TOKENS" \
   --argjson hardware_memory_bytes "$hardware_memory_bytes" \
+  --argjson maximum_group_spread "$MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT" \
+  --argjson maximum_case_spread "$MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT" \
   --argjson runtime_diagnostics "$runtime_diagnostics" \
   --argjson ttft_diagnostics "$ttft_diagnostics" \
+  --argjson warmup_diagnostics "$warmup_diagnostics" \
   --argjson hf2q_code_seconds "$hf2q_code" \
   --argjson reference_code_seconds "$reference_code" \
   --argjson code_ratio "$code_ratio" \
-  --argjson hf2q_code_spread "$hf2q_code_spread" \
-  --argjson reference_code_spread "$reference_code_spread" \
   --argjson hf2q_repeat_seconds "$hf2q_repeat" \
   --argjson reference_repeat_seconds "$reference_repeat" \
   --argjson repeat_ratio "$repeat_ratio" \
-  --argjson hf2q_repeat_spread "$hf2q_repeat_spread" \
-  --argjson reference_repeat_spread "$reference_repeat_spread" \
   --argjson minimum_ratio "$MIN_HF2Q_RATIO" \
   --argjson hf2q_proposals "$hf2q_proposals" \
   --argjson hf2q_accepted "$hf2q_accepted" \
@@ -1157,8 +1306,9 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --argjson reference_accepted "$reference_accepted" \
   --argjson code_quality_receipts "$code_quality_receipts" \
   --argjson repeat_quality_receipts "$repeat_quality_receipts" \
-  --slurpfile launch_settings "$launch_settings" '{
-    schema:3,verdict:$verdict,
+  --slurpfile launch_settings "$launch_settings" \
+  --slurpfile stability "$stability_json" '{
+    schema:4,verdict:$verdict,
     workload:{trial_order:$trial_order,cases_per_group_per_engine:6,
       max_tokens:$max_tokens,temperature:0,repetition_penalty:1.05,seed:null,
       chat_template_kwargs:{enable_thinking:false},
@@ -1189,24 +1339,26 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
       file_snapshot:$model_file_snapshot},
     hardware:{model:$hardware_model,chip:$hardware_chip,arch:$hardware_arch,
       memory_bytes:$hardware_memory_bytes,os_version:$hardware_os,
+      power_mode:{name:$power_mode_name,numeric_canary:$power_mode_code},
       thermal_probe:{source_sha256:$thermal_probe_source_sha,
         compiler_sha256:$thermal_probe_compiler_sha,
         compiler_version:$thermal_probe_compiler_version,
         binary_sha256:$thermal_probe_binary_sha}},
     diagnostics:$runtime_diagnostics,
     streamed_semantic_ttft:$ttft_diagnostics,
-    code:{hf2q_median_seconds:$hf2q_code_seconds,
-      reference_median_seconds:$reference_code_seconds,
-      hf2q_over_reference:$code_ratio,
-      hf2q_spread_percent:$hf2q_code_spread,
-      reference_spread_percent:$reference_code_spread},
-    repeat:{hf2q_median_seconds:$hf2q_repeat_seconds,
-      reference_median_seconds:$reference_repeat_seconds,
-      hf2q_over_reference:$repeat_ratio,
-      hf2q_spread_percent:$hf2q_repeat_spread,
-      reference_spread_percent:$reference_repeat_spread},
-    acceptance:{minimum_hf2q_ratio:$minimum_ratio},
+    sustained_warmup:$warmup_diagnostics,
+    code:{hf2q_median_trial_total_seconds:$hf2q_code_seconds,
+      reference_median_trial_total_seconds:$reference_code_seconds,
+      hf2q_over_reference:$code_ratio},
+    repeat:{hf2q_median_trial_total_seconds:$hf2q_repeat_seconds,
+      reference_median_trial_total_seconds:$reference_repeat_seconds,
+      hf2q_over_reference:$repeat_ratio},
+    acceptance:{minimum_hf2q_ratio:$minimum_ratio,
+      maximum_within_engine_group_spread_percent:$maximum_group_spread,
+      maximum_within_engine_case_spread_percent:$maximum_case_spread},
+    stability:$stability[0],
     calibration:{required_state:"nominal",required_power:"ac",
+      required_energy_mode:"automatic-or-high",
       required_process_state:"quiet",settle_seconds:30,sample_seconds:2,
       trial_logs:16,manifest_sha256:$calibration_manifest_sha},
     evidence:{script_sha256:$script_sha,contract_sha256:$contract_sha,
@@ -1217,7 +1369,7 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
       evidence_manifest_sha256:$evidence_manifest_sha}
   }' >"$OUT_DIR/summary.json.tmp"
 jq -e '
-  .schema == 3 and .verdict == "pass"
+  .schema == 4 and .verdict == "pass"
   and .quality.code.complete_rust == true
   and .quality.code.compiled == true
   and .quality.code.model_unit_test_present == true
@@ -1229,10 +1381,13 @@ jq -e '
   and .quality.repeat.receipts == 12
   and .code.hf2q_over_reference >= .acceptance.minimum_hf2q_ratio
   and .repeat.hf2q_over_reference >= .acceptance.minimum_hf2q_ratio
+  and .stability.stable == true
+  and .stability.observed_band_dominance == true
   and .hf2q.proposals > 0 and .hf2q.accepted_draft_tokens > 0
   and .reference.drafted_tokens > 0 and .reference.accepted_draft_tokens > 0
   and .streamed_semantic_ttft.hf2q.samples == 2
   and .streamed_semantic_ttft.reference.samples == 2
+  and .sustained_warmup.pass == true
   and .calibration.trial_logs == 16
   and (.evidence.evidence_manifest_sha256 | test("^[0-9a-f]{64}$"))
 ' "$OUT_DIR/summary.json.tmp" >/dev/null
