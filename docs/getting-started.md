@@ -37,9 +37,9 @@ Non-interactive shells can run `hf2q setup --accept-defaults` instead.
 
 ## 2. Download the verified model
 
-The model repository also hosts GGUFs built for a different engine; those do
-not run on hf2q. Use only the two hf2q-named files from this pinned,
-checksummed artifact commit:
+The model repository also hosts additional GGUFs, but they are not the
+source-matched text/projector pair qualified for this multimodal journey. Use
+only the two hf2q-named files from this pinned, checksummed artifact commit:
 
 ```bash
 MODEL_DIR="$HOME/.local/share/hf2q/models/qwen3.8"

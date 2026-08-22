@@ -257,7 +257,7 @@ replacement.
 | Family | Where it lives | Notes |
 |---|---|---|
 | **Legacy block** (`q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`) | `src/quantize/ggml_quants/q*.rs` | Pure-Rust 32-element block codecs. Converter support does not imply runtime support; ADR-046 Gate 0 tracks the current Q4_1/Q5_0 seam. |
-| **K-quant** (`q2_k`…`q6_k`, `q4_k_m`, `q5_k_m`, …) | `src/quantize/ggml_quants/` | 256-element super-block codecs and llama.cpp-parity `StandardPolicy`. |
+| **K-quant** (`q2_k`…`q6_k`, `q4_k_m`, `q5_k_m`, …) | `src/quantize/ggml_quants/` | 256-element super-block codecs and `StandardPolicy` tensor selection. |
 | **APEX mixed precision** | `src/quantize/ggml_quants/apex/` | Per-tensor GGUF policy; exact tensor encodings still use the codecs above. |
 | **Imatrix input** | `src/quantize/imatrix/` | Corpus/capture and `.imatrix.gguf` producer/consumer for supported families. It is importance evidence, not DWQ. |
 | **MLX affine overlay consumer (legacy)** | `src/core/mlx_safetensors_loader.rs`, `src/serve/forward_mlx_shared.rs` | Narrow Q4/group-32 consume-only path. There is no current DWQ producer or production full-model affine artifact. |
@@ -265,6 +265,16 @@ replacement.
 `dwq` remains a typed reserved selector. ADR-046 defines the source-agnostic
 quality, artifact, kernel, and benchmark gates required before that name can be
 activated.
+
+Native packed inference paths consume each tensor in its recorded GGML
+representation. This is the production contract for Qwen3.8 text inference;
+quantization policy is applied while converting source weights, and explicit
+overlay artifacts retain their own declared representation. Serving never
+dequantizes an artifact weight merely to encode it into another runtime codec.
+A missing native tensor-type or shape capability fails artifact admission
+instead of changing the model during load. Older architecture-specific paths
+that deliberately materialize a declared compute shadow remain documented in
+their own loaders and are not evidence of native packed coverage.
 
 ---
 
@@ -281,8 +291,13 @@ activated.
    `serve/api/engine*.rs` (Gemma 4, Qwen 3.5/3.6, Qwen 3-VL,
    DeepSeek-V4). Unsupported or cross-family shapes fail rather than falling
    through an approximately compatible graph.
-3. **Weight load** dequantizes-on-demand into `mlx-native` MTL buffers
-   (`inference/models/<arch>/...`). Fused-kernel pipelines compile at
+3. **Weight load** follows the selected architecture's explicit representation
+   contract (`inference/models/<arch>/...`). Native packed paths bind admitted
+   tensors directly to `mlx-native`; declared compute shadows, where an older
+   path still uses one, are architecture-specific and visible in that loader.
+   Explicit overlays retain their own declared representation. Unsupported
+   tensor-type or shape combinations fail admission instead of being silently
+   re-encoded during serving. Fused-kernel pipelines compile at
    load time so the first request doesn't pay shader-compile latency.
 4. **Warmup** runs a 1-token decode + a 10-token prefill, clears the
    KV cache, and emits the structured `loaded` event

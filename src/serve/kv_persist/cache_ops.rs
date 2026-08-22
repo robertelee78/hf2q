@@ -232,14 +232,7 @@ pub fn clear_namespace_all_quants(
     }
 
     let mut outcomes = Vec::new();
-    for q in [
-        QuantType::Q2_K,
-        QuantType::Q8_0,
-        QuantType::Q6_K,
-        QuantType::Q5_K_M,
-        QuantType::Q4_K_M,
-        QuantType::Q3_K_M,
-    ] {
+    for q in QuantType::ALL {
         let fp_short = fp_short_for(repo, q);
         let target = kv_root.join("models").join(&fp_short);
         let existed = target.exists();
@@ -587,7 +580,11 @@ mod tests {
         );
 
         let outcomes = clear_namespace_all_quants(&kv, "acme/repo-X", false).unwrap();
-        assert_eq!(outcomes.len(), 4, "one outcome per QuantType variant");
+        assert_eq!(
+            outcomes.len(),
+            QuantType::ALL.len(),
+            "one outcome per QuantType variant"
+        );
         let removed_count = outcomes.iter().filter(|o| o.existed).count();
         assert_eq!(
             removed_count, 2,

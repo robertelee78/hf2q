@@ -61,6 +61,17 @@ pub enum QuantType {
 }
 
 impl QuantType {
+    /// Complete runtime pool/cache identity set. Exhaustive operations use
+    /// this catalog so a new quant type cannot leave stale cache namespaces.
+    pub const ALL: [Self; 6] = [
+        Self::Q2_K,
+        Self::Q8_0,
+        Self::Q6_K,
+        Self::Q5_K_M,
+        Self::Q4_K_M,
+        Self::Q3_K_M,
+    ];
+
     /// Canonical GGML name (matches `quant_name_to_ggml_type` strings in
     /// `src/backends/gguf.rs:1038-1057`).
     pub fn as_str(self) -> &'static str {
@@ -400,6 +411,10 @@ mod tests {
         assert_eq!(QuantType::Q5_K_M.as_str(), "Q5_K_M");
         assert_eq!(QuantType::Q4_K_M.as_str(), "Q4_K_M");
         assert_eq!(QuantType::Q3_K_M.as_str(), "Q3_K_M");
+        assert_eq!(QuantType::ALL.len(), 6);
+        for quant in QuantType::ALL {
+            assert_eq!(QuantType::from_canonical_str(quant.as_str()), Ok(quant));
+        }
     }
 
     #[test]

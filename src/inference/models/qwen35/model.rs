@@ -711,11 +711,10 @@ impl Qwen35Model {
             // MoE per-expert stems (`ffn_gate.{e}` etc.) take the bucket
             // path below.
             //
-            // Native storage is GGML Q4_0 blocks (MlxBuffer), not Vec<f32>,
-            // so the helper does a full DWQ→native-shape→Q4_0-re-encode→
-            // new MlxBuffer dance.  F2 round-trip measurement on the
-            // empirical 27B 20-step overlay found relative_rms < 0.10 on
-            // every dense FFN role (codec preserves >90% of DWQ signal).
+            // The legacy synthetic DenseQ fixture stores GGML Q4_0 blocks, so
+            // this test-only compatibility path rebuilds its buffer. Native
+            // GGUF layers fail closed above; production serving never rewrites
+            // an artifact tensor during overlay application.
             let dense_ffn_role: Option<DenseFfnRole> = match role {
                 "ffn_gate" => Some(DenseFfnRole::Gate),
                 "ffn_up" => Some(DenseFfnRole::Up),
@@ -1044,8 +1043,8 @@ fn dwq_to_native_q4_0_f32(
 
 /// ADR-020 AC#7 iter B2.B — overwrite a single dense FFN projection
 /// (Gate, Up, or Down) on a [`Qwen35LayerWeights::FullAttn`] layer
-/// whose FFN variant is [`Qwen35FfnWeights::DenseQ`] (the production
-/// path for non-MoE Qwen3.5/3.6 models).
+/// whose FFN variant is [`Qwen35FfnWeights::DenseQ`] (a legacy synthetic
+/// compatibility path; native production layers are rejected by the caller).
 ///
 /// Unlike the iter-B2.A attn path (which overwrites a `Vec<f32>` and
 /// lets the next forward's `upload_q4_0_from_f32` handle the GPU
@@ -1065,8 +1064,8 @@ fn dwq_to_native_q4_0_f32(
 ///     production GGUF-loaded model.
 ///   - Native ggml type is not Q4_0: the trainer was validated against
 ///     Qwen3.6-27B-MTP (all-Q4_0 dense FFN, confirmed by gguf-dump).
-///     Q8_0 / Q6_K paths are deferred until operator validates a
-///     fixture that uses them.
+///     Other recorded types are rejected; supporting an overlay there requires
+///     its own exact native representation and qualification.
 fn overwrite_dense_ffn_q4_0_linear(
     layer: &mut Qwen35LayerWeights,
     role: DenseFfnRole,
@@ -1105,8 +1104,8 @@ fn overwrite_dense_ffn_q4_0_linear(
     if native_t != GgmlType::Q4_0 {
         anyhow::bail!(
             "qwen35 DWQ overlay: layer {layer_idx} {role:?} native ggml type \
-             is {native_t:?}; only Q4_0 is supported by iter-B2.B (Q8_0 / \
-             Q6_K paths deferred pending operator-validated fixture)"
+             is {native_t:?}; only the legacy synthetic Q4_0 fixture is \
+             supported by iter-B2.B"
         );
     }
 

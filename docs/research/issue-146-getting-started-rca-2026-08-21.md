@@ -12,11 +12,11 @@ Severity: release-blocking onboarding failure
 The guide promised a working local abliterated Qwen3.8 model inside a working
 OpenCode/Agentic Kit harness. It delivered neither.
 
-The recommended `qwen38-abliterated-sft-q5_k_m.gguf` was a peer-engine/L40
-artifact whose Q5_K embedding tensor is unsupported by hf2q's direct Metal
-embedding gather. hf2q loaded the file and reported ready, but every generation
-failed with HTTP 500. The guide never made a real completion request before
-opening OpenCode, so its acceptance path could not detect this.
+At the affected release/dependency boundary, the recommended
+`qwen38-abliterated-sft-q5_k_m.gguf` had no admitted direct Metal gather for its
+Q5_K embedding tensor. hf2q loaded the file and reported ready, but every
+generation failed with HTTP 500. The guide never made a real completion request
+before opening OpenCode, so its acceptance path could not detect this.
 
 Independently, the guide treated the model card's prompt-sensitivity note as a
 configuration prescription. It replaced `agent.assistant`, selected that agent
@@ -62,13 +62,14 @@ tools, and cleanup.
 
 ## User-visible failures
 
-1. **Wrong GGUF for hf2q.** The guide downloaded the author-hosted Q5_K_M made
-   for the peer engine/L40. hf2q's runtime cannot directly gather its Q5_K
+1. **Unqualified GGUF at the affected boundary.** The guide downloaded the
+   author-hosted Q5_K_M without proving its runtime tensor coverage. At that
+   release/dependency boundary, hf2q had no admitted direct gather for the Q5_K
    `token_embd.weight`, so generation returned 500.
 2. **Readiness was treated as generation proof.** `/readyz` returned 200 after
    load even though the first embedding/prefill could not execute. Runtime
-   admission is being fixed separately; the guide must still execute a real
-   completion.
+   admission and native coverage are separate from readiness; the guide must
+   still execute a real completion.
 3. **OpenCode obscured the original runtime error.** The guide opened a retrying
    coding client before proving a unary and streamed request, turning one clear
    backend failure into repeated harness failures.
@@ -111,10 +112,10 @@ tools, and cleanup.
 ### RC1: artifact provenance was confused with runtime compatibility
 
 The Q5 file was immutable and checksum-pinned, but those properties prove only
-identity and integrity. They do not prove that hf2q supports every tensor type
-needed for inference. The artifact's own documentation described it as an
-L40/peer-engine build. The guide substituted “externally produced GGUF validates
-at serve time” for an execution compatibility test.
+identity and integrity. They do not prove that the running hf2q revision
+supports every tensor type needed for inference. The guide substituted
+“externally produced GGUF validates at serve time” for an execution
+compatibility test.
 
 The conversion pipeline already produced a native hf2q Q4_K_M text GGUF, but
 the known-good bytes were not published as the guide artifact. This encouraged
@@ -123,8 +124,9 @@ the shortcut of reusing an unrelated pre-quantized upload.
 ### RC2: load/readiness and generation were collapsed into one gate
 
 The guide waited for `/readyz`, then immediately opened OpenCode. Its acceptance
-oracle was process health plus model metadata. The unsupported direct-gather
-type is encountered on the first forward pass, after those checks. No unary
+oracle was process health plus model metadata. At the affected boundary, the
+missing direct-gather capability was encountered on the first forward pass,
+after those checks. No unary
 completion, SSE reconstruction, or image request existed in the documented
 happy path.
 

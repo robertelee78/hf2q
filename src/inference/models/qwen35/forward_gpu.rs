@@ -2036,7 +2036,7 @@ fn apply_output_head_gpu_greedy_into(
         // legacy CB boundary at forward_gpu.rs:400→:404.
         enc.memory_barrier();
 
-        // Stage 2: lm_head_q4 → logits_buf.
+        // Stage 2: artifact-declared output head → logits_buf.
         apply_linear_projection_f32_into_with_ggml_type(
             enc,
             registry,
@@ -2862,8 +2862,6 @@ impl Qwen35Model {
     ///      dispatches `image_token_residual_add_gpu` to add chunk `il`
     ///      at the image-token positions.
     ///
-    /// **Caller contract for the augmented-embed split** (per the
-    /// peer's qwen3vl LM graph):
     /// **Caller contract for the augmented-embed split**:
     ///
     ///   * `soft_tokens[i].embeddings` carries the **base** chunk row
@@ -3349,7 +3347,7 @@ impl Qwen35Model {
     }
 
     /// ADR-034 task #78 Step 3c.A.3 (2026-05-21) — apply target's
-    /// `lm_head` (Q4_0 quantized output projection) to a pre-normed
+    /// `lm_head` (in its recorded GGML representation) to a pre-normed
     /// host-side hidden buffer and return per-position argmaxes.
     ///
     /// Use case: the DFlash drafter produces `h_final` (already passed
@@ -3369,11 +3367,9 @@ impl Qwen35Model {
     ///   * `n_pos == 0`.
     ///   * Any GPU dispatch / download failure.
     ///
-    /// The math is byte-equivalent (within Q4_0 quant rounding) to
-    /// taking `forward_gpu_with_hidden`'s logits for the same hidden
-    /// row, because both paths dispatch the same
-    /// `apply_linear_projection_f32(..., lm_head_q4, ...)` kernel with
-    /// the same inputs.
+    /// The math is equivalent to taking `forward_gpu_with_hidden`'s logits for
+    /// the same hidden row because both paths dispatch the same native output
+    /// projection with the same recorded GGML type and inputs.
     pub fn per_position_argmax_from_normed_hidden(
         &self,
         host: &[f32],
@@ -3397,7 +3393,7 @@ impl Qwen35Model {
             ));
         }
         self.ensure_gpu_cache_primed()?;
-        // Borrow device + registry + output_head.lm_head_q4 from the
+        // Borrow the device, registry, and native output head from the
         // thread-local cache. The borrow is scoped to the closure so
         // it's released before any subsequent forward call would
         // need it.
@@ -3973,20 +3969,18 @@ impl Qwen35Model {
 
         // ---- Acquire GPU device + kernel registry + per-layer weights ----
         //
-        // Weights are expensive to upload (~17 GB Q4 onto Metal heap). The
-        // pre-existing `ensure_gpu_cache_primed` method does the upload +
-        // lm_head BF16/Q4_0 pre-quant + flash_attn_prefill kernel registration
-        // and caches everything in a per-thread `GPU_CACHE` keyed by `self`
-        // pointer. Calling it here is idempotent: first-call from a non-warmed
-        // path still works, repeat calls are O(1).
+        // Large native GGUF weights are expensive to upload to the Metal heap.
+        // The pre-existing `ensure_gpu_cache_primed` method uploads their
+        // recorded representations, registers the prefill kernels, and caches
+        // everything in a per-thread `GPU_CACHE` keyed by `self` pointer.
+        // Calling it here is idempotent: first-call from a non-warmed path still
+        // works, repeat calls are O(1).
         //
         // ADR-013 P19 H12 (2026-05-01): `cmd_generate_qwen35` now invokes
         // `ensure_gpu_cache_primed` AFTER `Qwen35Model::load_from_gguf` but
-        // BEFORE `prefill_start = Instant::now()`, so the one-shot ~17 GB
-        // upload no longer pollutes the prefill timer. Compute is unchanged;
-        // only the timer-span moves to expose peer-comparable
-        // `prompt eval time` semantics. Verified by 3-rep cold bench.
-        // only the timer span moves so prompt-evaluation timing excludes model
+        // BEFORE `prefill_start = Instant::now()`, so the one-shot upload no
+        // longer pollutes the prefill timer. Compute is unchanged; only the
+        // timer span moves so prompt-evaluation timing excludes model
         // materialization. Verified by a three-repetition cold bench.
         self.ensure_gpu_cache_primed()?;
 
@@ -5052,7 +5046,6 @@ impl Qwen35Model {
             //   ffn_residual = hidden + attn_out          (write_sum=true path)
             //   ffn_input    = rms_norm(ffn_residual, w)  (normed_output)
             //
-            // Matches the peer:
             // Qwen residual contract:
             //   ffn_residual = cur;                // after attn residual, BEFORE norm
             //   attn_post_norm = build_norm(cur);  // norm for FFN input only
@@ -5668,8 +5661,6 @@ impl Qwen35Model {
             // ----------------------------------------------------------
             // Wedge-4c.5: Qwen3-VL DeepStack post-FFN-residual injection.
             //
-            // Per the peer's qwen3vl LM graph — at LM layer
-            // `il < n_deepstack`, add the deepstack chunk for layer il
             // At LM layer `il < n_deepstack`, add the deepstack chunk for layer il
             // (a `[n_image_tokens, hidden]` F32 tensor) to `hidden` at
             // exactly the image-token positions; non-image positions
@@ -6205,9 +6196,6 @@ impl Qwen35Model {
                 // Wave 5b.10: register flash_attn_prefill kernel family for
                 // the Qwen3.5 FA prefill path (replaces legacy `sdpa`).
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
-                // 2026-05-03 — register flash_attn_vec for decode-path SDPA.
-                // See forward_gpu.rs:1504 sister registration; closes
-                // long-context decode parity gap vs the peer.
                 // Register flash_attn_vec for decode-path SDPA; see the sister
                 // registration above. This closes the long-context decode gap.
                 mlx_native::ops::flash_attn_vec::register(&mut registry);
@@ -8709,7 +8697,6 @@ mod tests {
     // ADR-005 Phase 4 Wedge-4c.5 (2026-05-02) — DeepStack hooks
     // ============================================================
     //
-    // The Qwen3-VL DeepStack contract per the peer:
     // The Qwen3-VL DeepStack contract:
     //
     //   if (il < n_deepstack_layers) {
