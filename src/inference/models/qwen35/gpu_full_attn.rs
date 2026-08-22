@@ -5242,6 +5242,15 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
         .tq
         .as_ref()
         .ok_or_else(|| anyhow!("direct TQ prefill requires a TQ-active full-attention slot"))?;
+    let views = tq
+        .slot_views(slot_id, n_kv_heads, cache_capacity, head_dim)
+        .context("direct TQ prefill physical slot view")?;
+    anyhow::ensure!(
+        kv_seq_len <= views.capacity_tokens,
+        "direct TQ prefill needs {kv_seq_len} rows but slot {} has physical capacity {}",
+        slot_id.0,
+        views.capacity_tokens
+    );
     let output_elems = (seq_len as usize) * (n_heads as usize) * (head_dim as usize);
     let output = device
         .alloc_buffer(
@@ -5271,7 +5280,9 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
     slot_ids
         .as_mut_slice::<u32>()
         .map_err(|error| anyhow!("direct TQ prefill slot-id mapping: {error}"))?
-        .fill(slot_id.0);
+        // The slot view already selects the physical bank, so this scalar
+        // batch is expressed as slot zero inside that view.
+        .fill(0);
     let mut sequence_positions = super::decode_pool::pooled_alloc_buffer(
         device,
         (seq_len as usize) * std::mem::size_of::<u32>(),
@@ -5298,7 +5309,7 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
         num_kv_heads: n_kv_heads,
         head_dim,
         kv_seq_len,
-        kv_capacity: cache_capacity,
+        kv_capacity: views.capacity_tokens,
         scale: 1.0 / (head_dim as f32).sqrt(),
         mask_type: 0,
         sliding_window: 0,
@@ -5318,10 +5329,10 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct_for_slot(
         device,
         seq_len,
         q_seq_major,
-        &tq.k_packed,
-        &tq.k_norms,
-        &tq.v_packed,
-        &tq.v_norms,
+        &views.k_packed,
+        &views.k_norms,
+        &views.v_packed,
+        &views.v_norms,
         &output,
         &tmp,
         &slot_ids,
@@ -8295,21 +8306,43 @@ pub fn apply_gated_attn_layer_decode_batched_into(
     )?;
     enc.memory_barrier();
 
-    let mut slot_id_buf = super::decode_pool::pooled_alloc_buffer(
+    let (base_token_rows, physical_capacities, arena_token_rows) = tq
+        .banked_geometry_for_slots(slot_ids)
+        .context("Qwen batched full-attention banked arena geometry")?;
+    for ((slot_id, &cursor), &capacity) in
+        slot_ids.iter().zip(&current_lens).zip(&physical_capacities)
+    {
+        ensure!(
+            cursor < capacity,
+            "Qwen batched full-attention slot {} cursor {} reached physical capacity {}",
+            slot_id.0,
+            cursor,
+            capacity
+        );
+    }
+    let max_physical_capacity = physical_capacities.iter().copied().max().unwrap_or(0);
+    let mut base_token_rows_buf = super::decode_pool::pooled_alloc_buffer(
         device,
         slot_ids.len() * std::mem::size_of::<u32>(),
         DType::U32,
         vec![slot_ids.len()],
     )
-    .map_err(|error| anyhow!("Qwen batched full-attention slot map allocation: {error}"))?;
-    for (dst, slot_id) in slot_id_buf
+    .map_err(|error| anyhow!("Qwen batched full-attention base map allocation: {error}"))?;
+    base_token_rows_buf
         .as_mut_slice::<u32>()
-        .map_err(|error| anyhow!("Qwen batched full-attention slot map: {error}"))?
-        .iter_mut()
-        .zip(slot_ids)
-    {
-        *dst = slot_id.0;
-    }
+        .map_err(|error| anyhow!("Qwen batched full-attention base map: {error}"))?
+        .copy_from_slice(&base_token_rows);
+    let mut physical_capacities_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        slot_ids.len() * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![slot_ids.len()],
+    )
+    .map_err(|error| anyhow!("Qwen batched full-attention capacity map allocation: {error}"))?;
+    physical_capacities_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched full-attention capacity map: {error}"))?
+        .copy_from_slice(&physical_capacities);
     let mut position_buf = super::decode_pool::pooled_alloc_buffer(
         device,
         slot_ids.len() * std::mem::size_of::<u32>(),
@@ -8328,37 +8361,39 @@ pub fn apply_gated_attn_layer_decode_batched_into(
     } else {
         8
     };
-    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
+    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_banked(
         enc,
         registry,
         device.metal_device(),
         &k_rope,
         &tq.k_packed,
         &tq.k_norms,
-        &slot_id_buf,
+        &base_token_rows_buf,
+        &physical_capacities_buf,
         &position_buf,
         n,
         n_kv_heads,
         head_dim,
-        max_seq_len,
+        arena_token_rows,
         false,
         1.0,
         codebook_bits,
     )
     .map_err(|error| anyhow!("Qwen batched TQ K encode: {error}"))?;
-    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
+    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_banked(
         enc,
         registry,
         device.metal_device(),
         &v_flat,
         &tq.v_packed,
         &tq.v_norms,
-        &slot_id_buf,
+        &base_token_rows_buf,
+        &physical_capacities_buf,
         &position_buf,
         n,
         n_kv_heads,
         head_dim,
-        max_seq_len,
+        arena_token_rows,
         false,
         1.0,
         codebook_bits,
@@ -8398,7 +8433,7 @@ pub fn apply_gated_attn_layer_decode_batched_into(
         // The batched kernel reads each row's real length from position_buf.
         // This maximum selects the one execution bucket shared by the cohort.
         kv_seq_len: max_kv_seq_len,
-        kv_capacity: max_seq_len,
+        kv_capacity: max_physical_capacity,
         scale: 1.0 / (head_dim as f32).sqrt(),
         mask_type: 0,
         sliding_window: 0,
@@ -8409,7 +8444,7 @@ pub fn apply_gated_attn_layer_decode_batched_into(
         fuse_fwht_pre: 0,
         nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(max_kv_seq_len),
     };
-    mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_batched(
+    mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_batched_banked(
         enc,
         registry,
         device,
@@ -8421,8 +8456,10 @@ pub fn apply_gated_attn_layer_decode_batched_into(
         &tq.v_norms,
         &attn_out,
         &tmp,
-        &slot_id_buf,
+        &base_token_rows_buf,
+        &physical_capacities_buf,
         &position_buf,
+        arena_token_rows,
         &params,
     )
     .map_err(|error| anyhow!("Qwen batched TQ attention: {error}"))?;
@@ -8730,8 +8767,10 @@ mod tests {
                 )
                 .expect("tests follow physical-batch full-attention function");
         let physical = &source[start..end];
-        assert!(physical.contains("dispatch_hadamard_quantize_kv_hb_batched("));
-        assert!(physical.contains("flash_attn_vec_tq_hb_batched("));
+        assert!(physical.contains("dispatch_hadamard_quantize_kv_hb_banked("));
+        assert!(physical.contains("flash_attn_vec_tq_hb_batched_banked("));
+        assert!(physical.contains("banked_geometry_for_slots(slot_ids)"));
+        assert!(!physical.contains("dispatch_hadamard_quantize_kv_hb_batched("));
         assert!(
             !physical.contains("dispatch_fwht_sign_undo_f32("),
             "batched TQ attention already returns model-domain output"

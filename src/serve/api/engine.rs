@@ -16825,6 +16825,72 @@ fn record_retained_slot_kv(
     );
 }
 
+fn record_qwen35_physical_slot_kv(
+    guard: &Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    handle: SlotHandle,
+    fallback_live_tokens: usize,
+    kv_bytes_per_token: u64,
+) -> Result<()> {
+    let physical_bytes = if guard.model.tq_kv_active {
+        guard
+            .kv
+            .as_ref()
+            .context("Qwen35 physical KV accounting requires live cache")?
+            .tq_physical_bytes_for_slot(handle.slot_id)
+            .context("Qwen35 physical KV accounting")?
+    } else {
+        (fallback_live_tokens as u64).saturating_mul(kv_bytes_per_token)
+    };
+    scheduler.record_slot_high_water(handle, physical_bytes);
+    Ok(())
+}
+
+fn provision_qwen35_tq_slot_capacity(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &InflightBatchedScheduler,
+    handle: SlotHandle,
+    required_tokens: u32,
+) -> Result<u64> {
+    guard
+        .model
+        .model
+        .ensure_gpu_cache_primed()
+        .context("prime Qwen GPU cache before physical KV admission")?;
+    let model = &guard.model.model;
+    let kv = guard
+        .kv
+        .as_mut()
+        .context("Qwen physical KV admission requires a live cache")?;
+    model.with_gpu_cache_mut(|device, _registry| {
+        let transient_extra =
+            kv.tq_growth_transient_extra_bytes_for_slot(handle.slot_id, required_tokens)?;
+        let budget = scheduler.total_kv_budget_bytes();
+        let reserved = scheduler.reserved_high_water_bytes();
+        ensure_qwen35_tq_growth_fits_budget(handle.slot_id, reserved, transient_extra, budget)?;
+        kv.ensure_tq_physical_capacity_for_slot(&model.cfg, device, handle.slot_id, required_tokens)
+    })
+}
+
+fn ensure_qwen35_tq_growth_fits_budget(
+    slot_id: SlotId,
+    steady_reserved_bytes: u64,
+    transient_extra_bytes: u64,
+    budget_bytes: u64,
+) -> Result<()> {
+    let needed_bytes = steady_reserved_bytes.saturating_add(transient_extra_bytes);
+    anyhow::ensure!(
+        budget_bytes == 0 || needed_bytes <= budget_bytes,
+        "slot_budget_exceeded: Qwen slot {} steady-state reservation {} bytes fits, but layer-transactional growth needs {} temporary bytes; needed_bytes={}, budget_bytes={}; reduce retained KV or raise the budget",
+        slot_id.0,
+        steady_reserved_bytes,
+        transient_extra_bytes,
+        needed_bytes,
+        budget_bytes,
+    );
+    Ok(())
+}
+
 /// Commit the cursor-visible Qwen KV extent before invalidating a slot.
 /// Overwrite-backed tails remain physically resident after cursor reset, so
 /// releasing without this measurement would undercount pages touched by a
@@ -16840,7 +16906,7 @@ fn reset_qwen35_slot(
         .as_ref()
         .and_then(|kv| kv.sequence_len_for_slot(handle.slot_id).ok())
         .unwrap_or(0) as usize;
-    record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
+    record_qwen35_physical_slot_kv(guard, scheduler, handle, live_tokens, kv_bytes_per_token)?;
     if let Some(kv) = guard.kv.as_mut() {
         kv.reset_for_slot(handle.slot_id).with_context(|| {
             format!(
@@ -16885,11 +16951,15 @@ fn recover_qwen35_slot_after_cancellation(
     prompt_anchor: &mut Qwen35AnchorStore,
     preserve_unmodified_live_prefix: bool,
 ) -> Result<()> {
+    let live_tokens = guard
+        .kv
+        .as_ref()
+        .expect("kv Some during loop")
+        .sequence_len_for_slot(handle.slot_id)
+        .context("read Qwen35 live cursor before cancellation recovery")?
+        as usize;
+    record_qwen35_physical_slot_kv(guard, scheduler, handle, live_tokens, kv_bytes_per_token)?;
     let kv = guard.kv.as_mut().expect("kv Some during loop");
-    let live_tokens =
-        kv.sequence_len_for_slot(handle.slot_id)
-            .context("read Qwen35 live cursor before cancellation recovery")? as usize;
-    record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
     let cancellation_prune = prompt_anchor.cancel_request_at_cursor(live_tokens);
     tracing::info!(
         target: "hf2q::serve::api::qwen35_anchor",
@@ -17355,6 +17425,9 @@ fn qwen35_yields_after_inline_admission(request: &Request) -> bool {
 struct Qwen35ValidatedRequestShape {
     prompt_tokens: u32,
     max_tokens: u32,
+    /// Physical target rows, including the family safety window used by
+    /// speculative verification and bounded transactions.
+    cache_tokens: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17440,6 +17513,8 @@ fn validate_qwen35_generation_request(
     Ok(Qwen35ValidatedRequestShape {
         prompt_tokens: prompt_tokens_u32,
         max_tokens: max_tokens_u32,
+        cache_tokens: u32::try_from(need_seq)
+            .context("invalid_request: Qwen35 cache token count exceeds u32")?,
     })
 }
 
@@ -19395,9 +19470,7 @@ fn admit_qwen35_slot(
     let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
         0
     } else {
-        u64::from(request_shape.prompt_tokens)
-            .saturating_add(u64::from(request_shape.max_tokens))
-            .saturating_mul(kv_bytes_per_token)
+        u64::from(request_shape.cache_tokens).saturating_mul(kv_bytes_per_token)
     };
     let admit_req = AdmitRequest {
         prompt_tokens: request_shape.prompt_tokens,
@@ -19467,6 +19540,30 @@ fn admit_qwen35_slot(
         );
         return None;
     };
+    if guard.model.tq_kv_active {
+        let growth =
+            provision_qwen35_tq_slot_capacity(guard, scheduler, handle, request_shape.cache_tokens);
+        if let Err(error) = growth {
+            if let Some(kv) = guard.kv.as_ref() {
+                if let Ok(physical_bytes) = kv.tq_physical_bytes_for_slot(handle.slot_id) {
+                    scheduler.record_slot_high_water(handle, physical_bytes);
+                }
+            }
+            scheduler.release(handle);
+            if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+                *snapshot = scheduler.stats();
+            }
+            slot_fire_done(
+                reply,
+                Err(error.context(format!(
+                    "Qwen35 SlotAware physical KV provisioning failed before SSE for slot {}",
+                    handle.slot_id.0
+                ))),
+                false,
+            );
+            return None;
+        }
+    }
     reply.accept_stream_admission();
     let admission_slot_idx = handle.slot_id.0 as usize;
     tracing::debug!(
@@ -20314,12 +20411,20 @@ fn finish_qwen35_prefill(
                 .validate_speculative_cursors_for_slot(handle.slot_id, spec.token_count)
                 .is_ok()
         });
-        record_retained_slot_kv(
+        if let Err(error) = record_qwen35_physical_slot_kv(
+            guard,
             scheduler,
             handle,
             retained_tokens[slot_idx].len(),
             kv_bytes_per_token,
-        );
+        ) {
+            return Some(Qwen35FatalFailure {
+                handle: Some(handle),
+                reply: Qwen35FatalReply::Slot(reply),
+                error,
+                kind: Qwen35WorkerFatalKind::Invariant,
+            });
+        }
         retained_tokens[slot_idx].vision_fingerprint = params.vision_fingerprint;
         publish_qwen35_pending_anchor(handle, prompt_anchors, anchor_aggregate_budget_bytes);
         scheduler.advance_after_decode(handle);
@@ -20386,6 +20491,26 @@ fn embed_qwen35_inline(
         )));
         return None;
     };
+    if guard.model.tq_kv_active {
+        let required_tokens = u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX);
+        let growth = provision_qwen35_tq_slot_capacity(guard, scheduler, handle, required_tokens)
+            .context("provision Qwen embedding KV capacity");
+        if let Err(error) = growth {
+            if let Some(kv) = guard.kv.as_ref() {
+                if let Ok(physical_bytes) = kv.tq_physical_bytes_for_slot(handle.slot_id) {
+                    scheduler.record_slot_high_water(handle, physical_bytes);
+                }
+            }
+            scheduler.release(handle);
+            if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
+                *snapshot = scheduler.stats();
+            }
+            let _ = reply.send(Err(error.context(
+                "Qwen35 SlotAware embedding physical KV provisioning failed before GPU work",
+            )));
+            return None;
+        }
+    }
     // Embedding owns and resets the selected physical sequence. Invalidate
     // the serving ledger before the first GPU mutation so a later generation
     // can never advertise an anchor whose underlying cursor was reset.
@@ -20414,9 +20539,6 @@ fn embed_qwen35_inline(
         });
     }
     scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
-    if result.is_ok() {
-        record_retained_slot_kv(scheduler, handle, prompt_tokens.len(), kv_bytes_per_token);
-    }
     if let Err(error) = reset_qwen35_slot(guard, scheduler, handle, kv_bytes_per_token) {
         return Some(Qwen35FatalFailure {
             handle: Some(handle),
@@ -20746,12 +20868,20 @@ fn decode_batch_qwen35(
                         .validate_speculative_cursors_for_slot(handle.slot_id, spec.token_count)
                         .is_ok()
                 });
-            record_retained_slot_kv(
+            if let Err(error) = record_qwen35_physical_slot_kv(
+                guard,
                 scheduler,
                 handle,
                 retained_tokens[slot_idx].len(),
                 kv_bytes_per_token,
-            );
+            ) {
+                return Some(Qwen35FatalFailure {
+                    handle: Some(handle),
+                    reply: Qwen35FatalReply::Slot(reply),
+                    error,
+                    kind: Qwen35WorkerFatalKind::Invariant,
+                });
+            }
             retained_tokens[slot_idx].vision_fingerprint =
                 state.prompt_cache_identity().1.vision_fingerprint;
             publish_qwen35_pending_anchor(handle, prompt_anchors, anchor_aggregate_budget_bytes);
@@ -41136,7 +41266,7 @@ mod test_a1_conditional_grammar_wire {
         assert!(
             !runtime.is_awaiting_trigger(),
             "ToolCallClose MUST NOT re-arm the runtime trigger \
-             (llama.cpp parity: PR #9639 lazy grammar is one-shot per request; \
+             (pinned-reference parity: upstream PR #9639 makes lazy grammar one-shot per request; \
               iter-218 narrows the bug class via `parallel_tool_calls=false` default \
               so the bounded shape `body close space` exhausts naturally)"
         );
@@ -45705,6 +45835,23 @@ mod qwen35_bounded_prefill_watchdog_tests {
             .expect("watchdog fixture fits the full logical context");
         assert_eq!(shape.prompt_tokens, 87_972);
         assert_eq!(shape.max_tokens, 64);
+        assert_eq!(shape.cache_tokens, 88_100);
+    }
+
+    #[test]
+    fn qwen_tq_growth_budget_charges_transient_old_arena_before_migration() {
+        ensure_qwen35_tq_growth_fits_budget(SlotId(3), 900, 100, 1_000)
+            .expect("exact budget boundary admits");
+        ensure_qwen35_tq_growth_fits_budget(SlotId(3), u64::MAX, u64::MAX, 0)
+            .expect("zero budget keeps the explicit unbounded operator contract");
+
+        let error = ensure_qwen35_tq_growth_fits_budget(SlotId(3), 900, 101, 1_000)
+            .expect_err("transient replacement coexistence must fail before migration allocation");
+        let message = format!("{error:#}");
+        assert!(message.contains("slot_budget_exceeded"));
+        assert!(message.contains("Qwen slot 3"));
+        assert!(message.contains("needed_bytes=1001"));
+        assert!(message.contains("budget_bytes=1000"));
     }
 
     #[test]

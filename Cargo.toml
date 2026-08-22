@@ -128,9 +128,10 @@ thiserror = "2"
 # prefill-tail reads plus exact GGML routing/capability and host-side GGUF
 # evidence reads, typed resolved-dispatch traces, exact Q4_K inference, and
 # direct packed Q5_K/Q6_K embedding gathers, native scalar GGUF execution,
-# deterministic lowest-index argmax tie handling, and truthful Metal commit
-# telemetry require mlx-native 0.12.0.
-mlx-native = "=0.12.0"
+# deterministic lowest-index argmax tie handling, truthful Metal commit
+# telemetry, raw GPU blits, and unequal-capacity banked TQ dispatch require
+# mlx-native 0.12.1.
+mlx-native = "=0.12.1"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
@@ -172,8 +173,8 @@ base64 = "0.22"
 # iter-20+ audit binaries (ADR-007): pattern matching for tok/s parsing
 regex = "1"
 
-# Jinja2 chat template rendering (pure Rust; matches llama.cpp's vendored
-# common/jinja/ parser and mlx-lm's Python jinja2 behavior — see ADR-005 line 681).
+# Jinja2 chat template rendering (pure Rust; matches the pinned reference's
+# vendored parser and Python Jinja2 behavior — see ADR-005 line 681).
 #
 # `minijinja-contrib`'s `pycompat` feature is the canonical adapter for
 # chat templates authored against Python's Jinja2 (which transparently
