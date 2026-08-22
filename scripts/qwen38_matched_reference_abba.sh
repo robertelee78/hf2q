@@ -4,8 +4,8 @@ set -euo pipefail
 # Matched single-user Qwen3.8 comparison on one exact GGUF. This developer
 # harness runs hf2q and a caller-bound clean reference HEAD sequentially; the
 # reference is never a product dependency or conversion pin. Fresh servers run in ABBA order,
-# every response is retained, and speed is accepted only after exact output
-# and calibrated-host gates pass.
+# every response is retained, and speed is accepted only after complete-code,
+# exact-transcription, and calibrated-host gates pass.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT_DIR="$ROOT_DIR/scripts"
@@ -24,7 +24,7 @@ PORT=${PORT:-18086}
 MODEL_ID=${MODEL_ID:-}
 MIN_HF2Q_RATIO=${MIN_HF2Q_RATIO:-1.0}
 
-readonly MAX_TOKENS=128
+readonly MAX_TOKENS=256
 readonly TTFT_MAX_TOKENS=16
 readonly CASES='code-a code-b code-c repeat-a repeat-b repeat-c'
 readonly TRIAL_ORDER='hf2q reference reference hf2q'
@@ -52,8 +52,8 @@ source "$SCRIPT_DIR/macos_thermal_guard.sh"
 # shellcheck source=scripts/qwen38_matched_reference_contract.sh
 source "$SCRIPT_DIR/qwen38_matched_reference_contract.sh"
 
-for command in awk basename caffeinate cmp curl date dirname find git jq kill \
-  lsof mkdir mv perl pmset ps rg sed shasum sort stat sw_vers sysctl tr uname; do
+for command in awk basename caffeinate cat cmp cp curl date dirname find git jq kill \
+  lsof mkdir mv perl pmset ps rg rustc sed shasum sort stat sw_vers sysctl tr uname; do
     command -v "$command" >/dev/null || {
         echo "missing required command: $command" >&2
         exit 2
@@ -294,14 +294,14 @@ write_request() {
 }
 
 write_request code-a \
-  'You are a precise coding assistant. Return only the requested answer.' \
-  'Write a complete Rust function fn fibonacci(n: u64) -> u64 using an iterative algorithm. Include a short explanation and one unit test. Benchmark marker A; do not mention the marker.'
+  'Return only one complete compilable Rust source file. Do not use Markdown fences or prose.' \
+  'Implement fn fibonacci(n: u64) -> u64 iteratively. Include exactly one unit test containing exactly one assertion. Do not add benchmarks.'
 write_request code-b \
-  'You are a precise coding assistant. Return only the requested answer.' \
-  'Write a complete Rust function fn binary_search(xs: &[i32], needle: i32) -> Option<usize> using an iterative algorithm. Include a short explanation and one unit test. Benchmark marker B; do not mention the marker.'
+  'Return only one complete compilable Rust source file. Do not use Markdown fences or prose.' \
+  'Implement fn binary_search(xs: &[i32], needle: i32) -> Option<usize> iteratively for a sorted slice. Include exactly one unit test containing exactly one assertion. Do not add benchmarks.'
 write_request code-c \
-  'You are a precise coding assistant. Return only the requested answer.' \
-  'Write a complete Rust function fn gcd(mut a: u64, mut b: u64) -> u64 using the iterative Euclidean algorithm. Include a short explanation and one unit test. Benchmark marker C; do not mention the marker.'
+  'Return only one complete compilable Rust source file. Do not use Markdown fences or prose.' \
+  'Implement fn gcd(mut a: u64, mut b: u64) -> u64 with the iterative Euclidean algorithm. Include exactly one unit test containing exactly one assertion. Do not add benchmarks.'
 write_request repeat-a \
   'You are a transcription engine. Follow the request exactly.' \
   $'Repeat the following text exactly, with no introduction or quotation marks:\n\nThe copper observatory stood above the harbor while seven quiet instruments recorded wind, tide, temperature, pressure, cloud cover, rainfall, and the slow vibration of the old bridge. Each evening the keeper copied those readings into a blue ledger, checked every column twice, and left the completed page beneath a brass lamp for the morning crew.' \
@@ -722,7 +722,7 @@ run_trial() {
     local log="$trial_dir/server.log"
     local measurement_log="$trial_dir/thermal-measurement.tsv"
     local host_measurement_log="$trial_dir/host-measurement.tsv"
-    local name group response elapsed content
+    local name group response elapsed content source_path
     mkdir -p "$trial_dir"
     assert_no_model_runtime
     launch_server "$engine" "$log"
@@ -766,17 +766,23 @@ run_trial() {
         if [[ "$name" == repeat-* ]]; then
             cmp <(jq -j '.choices[0].message.content' "$response") \
               "$OUT_DIR/expected/$name.txt"
+            [[ "$(jq -er '.choices[0].finish_reason' "$response")" == stop ]]
+            jq -n --arg case "$name" \
+              --arg content_sha256 "$(jq -j '.choices[0].message.content' \
+                "$response" | shasum -a 256 | awk '{print $1}')" \
+              '{schema:1,case:$case,exact_expected_content:true,
+                natural_stop:true,content_sha256:$content_sha256}' \
+              >"$trial_dir/$name-quality.json"
         else
             content=$(jq -r '.choices[0].message.content' "$response")
-            [[ "$content" != *'Benchmark marker'* ]] || {
-                echo "$engine $name leaked its benchmark marker" >&2
-                return 1
-            }
             case "$name" in
                 code-a) rg -q 'fibonacci' <<<"$content" ;;
                 code-b) rg -q 'binary_search' <<<"$content" ;;
                 code-c) rg -q 'fn gcd|gcd\(' <<<"$content" ;;
             esac
+            mkdir -p "$trial_dir/code-validation"
+            source_path="$trial_dir/code-validation/$name.rs"
+            matched_extract_rust_source "$response" "$source_path"
         fi
         jq -S -c '{role:.choices[0].message.role,
           content:.choices[0].message.content,
@@ -844,6 +850,11 @@ run_trial() {
     [[ ! -e "$trial_dir/calibration-failure.txt" ]]
     stop_server
     qwen36_reject_fatal_log "$log"
+    for name in code-a code-b code-c; do
+        matched_validate_rust_case "$name" \
+          "$trial_dir/code-validation/$name.rs" \
+          "$trial_dir/code-validation"
+    done
 }
 
 trial=0
@@ -871,10 +882,21 @@ calibration_manifest_sha=$(sha256_file "$calibration_manifest")
 verify_request_manifest
 
 for name in $CASES; do
-    baseline="$OUT_DIR/trials/trial-1-hf2q/$name.semantic.json"
-    for candidate in "$OUT_DIR"/trials/trial-*/"$name.semantic.json"; do
-        cmp "$baseline" "$candidate"
-    done
+    quality_receipts=$(find "$OUT_DIR/trials" -path \
+      "*/$name-quality.json" -type f | awk 'END { print NR }')
+    [[ "$quality_receipts" == 4 ]] || {
+        echo "expected four quality receipts for $name" >&2
+        exit 1
+    }
+    if [[ "$name" == repeat-* ]]; then
+        baseline="$OUT_DIR/trials/trial-1-hf2q/$name.semantic.json"
+        for candidate in "$OUT_DIR"/trials/trial-*/"$name.semantic.json"; do
+            cmp <(jq -S -c '{role,content,tool_calls,finish_reason,prompt_tokens}' \
+              "$baseline") \
+              <(jq -S -c '{role,content,tool_calls,finish_reason,prompt_tokens}' \
+              "$candidate")
+        done
+    fi
     prompt_token_variants=$(jq -r --arg name "$name" \
       'select(.name == $name) | .prompt_tokens' "$rows_file" | sort -u | awk 'END { print NR }')
     [[ "$prompt_token_variants" == 1 ]] || {
@@ -882,6 +904,14 @@ for name in $CASES; do
         exit 1
     }
 done
+code_quality_receipts=$(find "$OUT_DIR/trials" -type f \
+  -name 'code-*-quality.json' | awk 'END { print NR }')
+repeat_quality_receipts=$(find "$OUT_DIR/trials" -type f \
+  -name 'repeat-*-quality.json' | awk 'END { print NR }')
+[[ "$code_quality_receipts" == 12 && "$repeat_quality_receipts" == 12 ]] || {
+    echo "quality receipt cardinality mismatch: code=$code_quality_receipts repeat=$repeat_quality_receipts" >&2
+    exit 1
+}
 
 metric_total() {
     local metric=$1
@@ -1045,6 +1075,7 @@ verify_executable_identity reference "$REFERENCE_BIN" "$REFERENCE_SHA256" \
   "$reference_binary_snapshot"
 final_reference_version=$("$REFERENCE_BIN" --version 2>&1)
 [[ "$final_reference_version" == "$reference_version" ]]
+rustc_version=$(rustc --version)
 hf2q_binary_sha=$(sha256_file "$HF2Q_BIN")
 hf2q_lock_sha=$(sha256_file "$ROOT_DIR/Cargo.lock")
 hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
@@ -1083,6 +1114,7 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --arg reference_commit "$REFERENCE_COMMIT" \
   --arg reference_sha "$REFERENCE_SHA256" \
   --arg reference_binary_snapshot "$reference_binary_snapshot" \
+  --arg rustc_version "$rustc_version" \
   --arg model_id "$MODEL_ID" --arg model_path "$MODEL_PATH" \
   --arg model_repository "$QUALIFIED_MODEL_REPOSITORY" \
   --arg model_revision "$QUALIFIED_MODEL_REVISION" \
@@ -1123,12 +1155,20 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --argjson hf2q_accepted "$hf2q_accepted" \
   --argjson reference_drafted "$reference_drafted" \
   --argjson reference_accepted "$reference_accepted" \
+  --argjson code_quality_receipts "$code_quality_receipts" \
+  --argjson repeat_quality_receipts "$repeat_quality_receipts" \
   --slurpfile launch_settings "$launch_settings" '{
-    schema:2,verdict:$verdict,exact_cross_engine_output:true,
+    schema:3,verdict:$verdict,
     workload:{trial_order:$trial_order,cases_per_group_per_engine:6,
       max_tokens:$max_tokens,temperature:0,repetition_penalty:1.05,seed:null,
       chat_template_kwargs:{enable_thinking:false},
-      quality_scope:"fixed 128-token trajectories; not a complete-code quality proof"},
+      quality_scope:"complete Rust compilation plus evaluator tests; exact repeat transcription"},
+    quality:{
+      code:{complete_rust:true,compiled:true,model_unit_test_present:true,
+        evaluator_tests_passed:true,
+        receipts:$code_quality_receipts,rustc_version:$rustc_version},
+      repeat:{exact_expected_content:true,natural_stop:true,
+        exact_across_engines:true,receipts:$repeat_quality_receipts}},
     launch_settings:$launch_settings[0],
     hf2q:{commit:$hf2q_commit,binary_sha256:$hf2q_binary_sha,
       binary_file_snapshot:$hf2q_binary_snapshot,
@@ -1177,7 +1217,16 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
       evidence_manifest_sha256:$evidence_manifest_sha}
   }' >"$OUT_DIR/summary.json.tmp"
 jq -e '
-  .schema == 2 and .verdict == "pass" and .exact_cross_engine_output == true
+  .schema == 3 and .verdict == "pass"
+  and .quality.code.complete_rust == true
+  and .quality.code.compiled == true
+  and .quality.code.model_unit_test_present == true
+  and .quality.code.evaluator_tests_passed == true
+  and .quality.code.receipts == 12
+  and .quality.repeat.exact_expected_content == true
+  and .quality.repeat.natural_stop == true
+  and .quality.repeat.exact_across_engines == true
+  and .quality.repeat.receipts == 12
   and .code.hf2q_over_reference >= .acceptance.minimum_hf2q_ratio
   and .repeat.hf2q_over_reference >= .acceptance.minimum_hf2q_ratio
   and .hf2q.proposals > 0 and .hf2q.accepted_draft_tokens > 0

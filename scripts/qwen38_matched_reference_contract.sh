@@ -96,6 +96,140 @@ matched_validate_common_response() {
     ' "$response" >/dev/null
 }
 
+# Extract one complete Rust source file from a measured response. The coding
+# prompts request raw source, but accepting one outer `rust` fence keeps the
+# validator focused on program correctness instead of presentation. Prose or
+# nested fences remain in the source and fail compilation.
+matched_extract_rust_source() {
+    local response=$1
+    local source_path=$2
+    local finish_reason
+
+    finish_reason=$(jq -er '.choices[0].finish_reason' "$response") \
+      || return 1
+    [[ "$finish_reason" == stop ]] || {
+        echo "Rust response did not finish naturally: $finish_reason" >&2
+        return 1
+    }
+    jq -er '.choices[0].message.content' "$response" \
+      | perl -0777 -e '
+          use strict;
+          use warnings;
+          my $source = do { local $/; <STDIN> };
+          $source =~ s/\r\n/\n/g;
+          $source =~ s/^\s*```(?:rust)?[ \t]*\n//;
+          $source =~ s/\n```[ \t]*\n?\s*$//;
+          die "nested or unmatched Markdown fence\n" if $source =~ /```/;
+          die "empty Rust source\n" unless $source =~ /\S/;
+          print $source;
+        ' >"$source_path"
+}
+
+# Compile a model-produced source file with fixed evaluator-owned tests, then
+# execute the resulting Rust test binary. This proves complete syntax and the
+# requested behavior without requiring two correct engines to choose identical
+# low-margin prose or identifier trajectories.
+matched_validate_rust_case() {
+    local name=$1
+    local source_path=$2
+    local validation_dir=$3
+    local contract_source="$validation_dir/$name-contract.rs"
+    local test_binary="$validation_dir/$name-test"
+    local compile_log="$validation_dir/$name-rustc.log"
+    local test_log="$validation_dir/$name-test.log"
+    local authored_test_count
+
+    mkdir -p "$validation_dir"
+    authored_test_count=$(awk '
+      {
+        line = $0
+        while (match(line, /#[[:space:]]*\[[[:space:]]*test[[:space:]]*\]/)) {
+          count++
+          line = substr(line, RSTART + RLENGTH)
+        }
+      }
+      END { print count + 0 }
+    ' "$source_path")
+    [[ "$authored_test_count" == 1 ]] || {
+        echo "$name must contain exactly one model-authored #[test]" >&2
+        return 1
+    }
+    cp "$source_path" "$contract_source"
+    case "$name" in
+        code-a)
+            cat >>"$contract_source" <<'RUST'
+
+#[cfg(test)]
+mod hf2q_contract_tests {
+    use super::*;
+    #[test]
+    fn evaluator_fibonacci_contract() {
+        assert_eq!(fibonacci(0), 0);
+        assert_eq!(fibonacci(1), 1);
+        assert_eq!(fibonacci(2), 1);
+        assert_eq!(fibonacci(10), 55);
+    }
+}
+RUST
+            ;;
+        code-b)
+            cat >>"$contract_source" <<'RUST'
+
+#[cfg(test)]
+mod hf2q_contract_tests {
+    use super::*;
+    #[test]
+    fn evaluator_binary_search_contract() {
+        let values = [1, 3, 5, 7];
+        assert_eq!(binary_search(&values, 1), Some(0));
+        assert_eq!(binary_search(&values, 5), Some(2));
+        assert_eq!(binary_search(&values, 2), None);
+        assert_eq!(binary_search(&[], 9), None);
+    }
+}
+RUST
+            ;;
+        code-c)
+            cat >>"$contract_source" <<'RUST'
+
+#[cfg(test)]
+mod hf2q_contract_tests {
+    use super::*;
+    #[test]
+    fn evaluator_gcd_contract() {
+        assert_eq!(gcd(48, 18), 6);
+        assert_eq!(gcd(54, 24), 6);
+        assert_eq!(gcd(0, 7), 7);
+        assert_eq!(gcd(13, 13), 13);
+    }
+}
+RUST
+            ;;
+        *)
+            echo "unknown Rust quality case: $name" >&2
+            return 1
+            ;;
+    esac
+
+    if ! rustc --edition 2021 --test --crate-name hf2q_qwen38_eval \
+      "$contract_source" -o "$test_binary" >"$compile_log" 2>&1; then
+        cat "$compile_log" >&2
+        return 1
+    fi
+    if ! "$test_binary" --quiet >"$test_log" 2>&1; then
+        cat "$test_log" >&2
+        rm -f -- "$test_binary"
+        return 1
+    fi
+    rm -f -- "$test_binary"
+    jq -n --arg case "$name" \
+      --arg source_sha256 "$(shasum -a 256 "$source_path" | awk '{print $1}')" \
+      '{schema:1,case:$case,complete_rust:true,compiled:true,
+        model_unit_test_present:true,evaluator_tests_passed:true,
+        source_sha256:$source_sha256}' \
+      >"$validation_dir/$name-quality.json"
+}
+
 matched_validate_hf2q_telemetry() {
     local response=$1
     jq -e '

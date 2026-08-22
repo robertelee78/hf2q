@@ -44,7 +44,10 @@ cache, or forward graph.
   iter-344; per-token `forward_prefill` was 14-45× slower than peer).
   Opt out to per-token via `HF2Q_BATCHED_PREFILL=0` for parity
   diagnostics — see Category 2.
-- Dense **F32** KV cache.
+- KV representation is family-specific. The canonical Qwen launcher uses
+  TQ-packed 8-bit K/V without an F32 shadow; `HF2Q_TQ_KV=0` is the explicit
+  conventional-F32 diagnostic. DeepSeek and Gemma retain their own qualified
+  cache contracts rather than inheriting Qwen's representation.
 - Default decode (single-buffer or dual-buffer internal tuning; not
   user-configurable).
 - **Auto Q8 lm_head** with exact F32 rerank, selected when
@@ -508,9 +511,9 @@ These are deliberately not part of any category:
 - `docs/operator-env-vars.md` — per-variable effects and defaults.
 - `docs/adr/ADR-004-gguf-compatibility.md` — source-bound Qwen3.8 automatic
   pair and first-image cache acceptance evidence.
-- `docs/adr/ADR-009-reference-parity-and-coherence-recovery.md` — why
-  F32-KV is the default, and the original per-token prefill baseline
-  (since superseded as the default by ADR-028 iter-344).
+- `docs/adr/ADR-009-reference-parity-and-coherence-recovery.md` — the
+  historical F32-KV and per-token prefill baselines; current family defaults
+  are defined above and in the family-specific ADRs.
 - `docs/adr/ADR-010-exact-batched-kernel-parity.md` — why batched-prefill
   is now the default and why its `sliding_wrap` byte-parity is deferred.
 - `docs/adr/diary/ADR-028-peer-parity-coherence-and-speed.md` — iter-344

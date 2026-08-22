@@ -105,6 +105,43 @@ if printf '%s\n' \
     fail "mismatched streamed content passed the TTFT contract"
 fi
 
+# Code quality is behavioral, not byte-trajectory equality between engines.
+# Each accepted response must stop naturally, yield one complete Rust source
+# file, compile, and pass evaluator-owned tests for the requested function.
+write_code_response() {
+    local path=$1
+    local content=$2
+    local finish_reason=${3:-stop}
+    jq -n --arg content "$content" --arg finish "$finish_reason" '{
+      choices:[{message:{role:"assistant",content:$content,tool_calls:null},
+        finish_reason:$finish}],
+      usage:{prompt_tokens:10,completion_tokens:20}
+    }' >"$path"
+}
+
+write_code_response "$fixture_dir/code-a.json" $'```rust\nfn fibonacci(n: u64) -> u64 {\n    let (mut a, mut b) = (0, 1);\n    for _ in 0..n { (a, b) = (b, a + b); }\n    a\n}\n#[cfg(test)] mod tests { use super::*; #[test] fn one() { assert_eq!(fibonacci(5), 5); } }\n```'
+write_code_response "$fixture_dir/code-b.json" $'fn binary_search(xs: &[i32], needle: i32) -> Option<usize> {\n    let (mut lo, mut hi) = (0, xs.len());\n    while lo < hi {\n        let mid = lo + (hi - lo) / 2;\n        match xs[mid].cmp(&needle) {\n            std::cmp::Ordering::Less => lo = mid + 1,\n            std::cmp::Ordering::Greater => hi = mid,\n            std::cmp::Ordering::Equal => return Some(mid),\n        }\n    }\n    None\n}\n#[cfg(test)] mod tests { use super::*; #[test] fn one() { assert_eq!(binary_search(&[1, 3], 3), Some(1)); } }'
+write_code_response "$fixture_dir/code-c.json" $'fn gcd(mut a: u64, mut b: u64) -> u64 {\n    while b != 0 { let remainder = a % b; a = b; b = remainder; }\n    a\n}\n#[cfg(test)] mod tests { use super::*; #[test] fn one() { assert_eq!(gcd(8, 6), 2); } }'
+for name in code-a code-b code-c; do
+    matched_extract_rust_source "$fixture_dir/$name.json" \
+      "$fixture_dir/$name.rs"
+    matched_validate_rust_case "$name" "$fixture_dir/$name.rs" \
+      "$fixture_dir/code-validation"
+    jq -e '.complete_rust and .compiled and .model_unit_test_present
+      and .evaluator_tests_passed' \
+      "$fixture_dir/code-validation/$name-quality.json" >/dev/null
+done
+write_code_response "$fixture_dir/code-length.json" \
+  'fn fibonacci(n: u64) -> u64 { n }' length
+expect_failure truncated-code-response matched_extract_rust_source \
+  "$fixture_dir/code-length.json" "$fixture_dir/code-length.rs"
+write_code_response "$fixture_dir/code-wrong.json" \
+  $'fn gcd(_a: u64, _b: u64) -> u64 { 1 }\n#[cfg(test)] mod tests { use super::*; #[test] fn one() { assert_eq!(gcd(1, 1), 1); } }'
+matched_extract_rust_source "$fixture_dir/code-wrong.json" \
+  "$fixture_dir/code-wrong.rs"
+expect_failure wrong-code-behavior matched_validate_rust_case code-c \
+  "$fixture_dir/code-wrong.rs" "$fixture_dir/wrong-validation"
+
 # Positive runtime telemetry and null/zero counterexamples exercise the same
 # predicates called for every measured response.
 jq -n '{
@@ -237,6 +274,8 @@ for call in \
   'matched_resolve_hf2q_model_id ' \
   'matched_validate_reference_model_alias ' \
   '| matched_parse_sse_stream ' \
+  'matched_extract_rust_source "$response" "$source_path"' \
+  'matched_validate_rust_case "$name" ' \
   'matched_validate_hf2q_telemetry "$response"' \
   'matched_validate_reference_telemetry "$response"' \
   'matched_reference_speculation_totals "$rows_file"' \
@@ -246,6 +285,10 @@ for call in \
     grep -Fq "$call" "$runner" \
       || fail "production runner does not invoke tested predicate: $call"
 done
+grep -Fq 'readonly MAX_TOKENS=256' "$runner" \
+  || fail "matched code workload is not sized for complete source"
+grep -Fq 'quality_scope:"complete Rust compilation plus evaluator tests; exact repeat transcription"' \
+  "$runner" || fail "matched summary lost its executable quality contract"
 # shellcheck disable=SC2016
 model_id_init_line=$(grep -nE '^if \[\[ -n "\$MODEL_ID" \]\]; then$' "$runner" \
   | cut -d: -f1)
