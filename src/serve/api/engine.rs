@@ -43,11 +43,15 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::engine_supervisor::EngineSupervisor;
 use super::qwen35_anchor_store::{
+    effective_committed_depth as qwen35_effective_committed_depth,
     record_capture as record_qwen35_anchor_capture,
+    record_configuration as record_qwen35_anchor_configuration,
     record_evictions as record_qwen35_anchor_evictions,
     record_restore_hit as record_qwen35_anchor_restore_hit,
-    record_restore_miss as record_qwen35_anchor_restore_miss, AnchorEntry, AnchorStore,
-    DEFAULT_MAX_COMMITTED_ANCHORS,
+    record_restore_miss as record_qwen35_anchor_restore_miss,
+    record_spec_boundary_restore as record_qwen35_anchor_spec_boundary_restore,
+    simultaneous_pending_capacity_slots as qwen35_simultaneous_pending_capacity_slots, AnchorEntry,
+    AnchorStore, DEFAULT_MAX_COMMITTED_ANCHORS,
 };
 
 const SLOT_AWARE_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -16948,11 +16952,43 @@ impl AnchorEntry for Qwen35PromptAnchor {
 
 type Qwen35AnchorStore = AnchorStore<Qwen35PromptAnchor>;
 
-// Five simultaneously-owned Qwen3.8 anchors (K=4 committed + one pending)
-// fit below this per-slot reclaimable envelope using allocation-derived bytes.
-// Smaller models naturally retain K=4; larger future configs reduce effective
-// depth by failing the byte preflight rather than overcommitting unified RAM.
-const QWEN35_ANCHOR_SLOT_BUDGET_BYTES: u64 = 768 * 1024 * 1024;
+fn qwen35_anchor_aggregate_budget_bytes() -> u64 {
+    // Anchor payloads are independently owned and reclaimable (bulk state is
+    // host memory; an optional spec row is a dedicated right-sized Metal
+    // allocation). Reuse the operator's
+    // byte-denominated LCP capacity knob, but instantiate an independent
+    // aggregate pool: these bytes are not Metal KV pages and never enter the
+    // scheduler's monotonic allocation high-water.
+    crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget()
+}
+
+fn qwen35_anchor_aggregate_owned_bytes(stores: &[Qwen35AnchorStore]) -> Result<u64> {
+    stores.iter().try_fold(0u64, |total, store| {
+        total
+            .checked_add(store.owned_bytes())
+            .context("Qwen aggregate anchor-owned byte overflow")
+    })
+}
+
+fn qwen35_anchor_aggregate_control_bytes(stores: &[Qwen35AnchorStore]) -> Result<u64> {
+    stores.iter().try_fold(0u64, |total, store| {
+        total
+            .checked_add(store.control_owned_bytes())
+            .context("Qwen aggregate anchor-control byte overflow")
+    })
+}
+
+fn qwen35_anchor_committed_control_capacity(n_slots: usize, aggregate_budget_bytes: u64) -> usize {
+    let full_control_fits = (std::mem::size_of::<Qwen35PromptAnchor>() as u64)
+        .checked_mul(DEFAULT_MAX_COMMITTED_ANCHORS as u64)
+        .and_then(|bytes| bytes.checked_mul(n_slots as u64))
+        .is_some_and(|bytes| bytes <= aggregate_budget_bytes);
+    if full_control_fits {
+        DEFAULT_MAX_COMMITTED_ANCHORS
+    } else {
+        0
+    }
+}
 
 #[derive(Default)]
 struct Qwen35RetainedPrefix {
@@ -16997,33 +17033,47 @@ fn qwen35_cached_spec_for_decision<T>(
         .flatten()
 }
 
-fn install_qwen35_stable_prompt_checkpoint(
+fn stage_qwen35_pending_anchor(
     handle: SlotHandle,
     prompt_anchors: &mut [Qwen35AnchorStore],
-    checkpoint: super::engine_qwen35::Qwen35StablePromptCheckpoint,
+    anchor: Qwen35PromptAnchor,
+    capture_source: &'static str,
+    aggregate_budget_bytes: u64,
 ) {
     let slot_idx = handle.slot_id.0 as usize;
-    let capture_duration = checkpoint.capture_duration;
-    let prompt_token_count = checkpoint.prompt_tokens.len();
-    let anchor = Qwen35PromptAnchor {
-        prompt_tokens: checkpoint.prompt_tokens,
-        kv: checkpoint.kv,
-        prefill_logits: checkpoint.prefill_logits,
-        vision_fingerprint: checkpoint.vision_fingerprint,
-        spec: checkpoint.spec,
-        capture_duration,
-        lineage_epoch: 0,
-    };
+    let capture_duration = anchor.capture_duration;
+    let prompt_token_count = anchor.prompt_tokens.len();
     let anchor_bytes = anchor.owned_bytes();
-    let outcome = prompt_anchors[slot_idx].stage_pending(
-        anchor,
+    let aggregate_before = qwen35_anchor_aggregate_owned_bytes(prompt_anchors).unwrap_or(u64::MAX);
+    let slot_owned_before = prompt_anchors[slot_idx].owned_bytes();
+    let other_owned = aggregate_before.saturating_sub(slot_owned_before);
+    let slot_stage_budget = aggregate_budget_bytes.saturating_sub(other_owned);
+    let effective_k = qwen35_effective_committed_depth(
         DEFAULT_MAX_COMMITTED_ANCHORS,
-        QWEN35_ANCHOR_SLOT_BUDGET_BYTES,
+        aggregate_budget_bytes.saturating_sub(
+            qwen35_anchor_aggregate_control_bytes(prompt_anchors).unwrap_or(u64::MAX),
+        ),
+        prompt_anchors.len(),
+        anchor_bytes,
     );
+    let simultaneous_pending_capacity_slots = qwen35_simultaneous_pending_capacity_slots(
+        aggregate_budget_bytes.saturating_sub(
+            qwen35_anchor_aggregate_control_bytes(prompt_anchors).unwrap_or(u64::MAX),
+        ),
+        prompt_anchors.len(),
+        anchor_bytes,
+        effective_k,
+    );
+    let outcome = prompt_anchors[slot_idx].stage_pending(anchor, effective_k, slot_stage_budget);
+    let aggregate_owned_bytes =
+        qwen35_anchor_aggregate_owned_bytes(prompt_anchors).unwrap_or(u64::MAX);
     record_qwen35_anchor_capture(
         outcome,
         capture_duration,
         prompt_anchors[slot_idx].owned_bytes(),
+        aggregate_owned_bytes,
+        effective_k,
+        simultaneous_pending_capacity_slots,
     );
     tracing::info!(
         target: "hf2q::serve::api::qwen35_anchor",
@@ -17032,16 +17082,62 @@ fn install_qwen35_stable_prompt_checkpoint(
         anchor_bytes,
         capture_ms = capture_duration.as_secs_f64() * 1000.0,
         peak_committed_pending_bytes = prompt_anchors[slot_idx].owned_bytes(),
+        aggregate_owned_bytes,
+        aggregate_budget_bytes,
+        configured_slots = prompt_anchors.len(),
+        effective_committed_depth = effective_k,
+        full_depth_available = effective_k == DEFAULT_MAX_COMMITTED_ANCHORS,
+        simultaneous_pending_capacity_slots,
+        full_pending_concurrency_available = simultaneous_pending_capacity_slots == prompt_anchors.len(),
         outcome = ?outcome,
-        "Qwen slot-local stable boundary capture preflight"
+        capture_source,
+        "Qwen slot-local boundary capture aggregate-budget preflight"
     );
 }
 
-fn publish_qwen35_pending_anchor(handle: SlotHandle, store: &mut Qwen35AnchorStore) {
-    if !store.has_pending() {
+fn install_qwen35_stable_prompt_checkpoint(
+    handle: SlotHandle,
+    prompt_anchors: &mut [Qwen35AnchorStore],
+    checkpoint: super::engine_qwen35::Qwen35StablePromptCheckpoint,
+    aggregate_budget_bytes: u64,
+) {
+    let anchor = Qwen35PromptAnchor {
+        prompt_tokens: checkpoint.prompt_tokens,
+        kv: checkpoint.kv,
+        prefill_logits: checkpoint.prefill_logits,
+        vision_fingerprint: checkpoint.vision_fingerprint,
+        spec: checkpoint.spec,
+        capture_duration: checkpoint.capture_duration,
+        lineage_epoch: 0,
+    };
+    stage_qwen35_pending_anchor(
+        handle,
+        prompt_anchors,
+        anchor,
+        "stable_prompt_boundary",
+        aggregate_budget_bytes,
+    );
+}
+
+fn publish_qwen35_pending_anchor(
+    handle: SlotHandle,
+    stores: &mut [Qwen35AnchorStore],
+    aggregate_budget_bytes: u64,
+) {
+    let slot_idx = handle.slot_id.0 as usize;
+    if !stores[slot_idx].has_pending() {
         return;
     }
-    match store.publish_pending(DEFAULT_MAX_COMMITTED_ANCHORS) {
+    let configured_slots = stores.len();
+    let effective_k = qwen35_effective_committed_depth(
+        DEFAULT_MAX_COMMITTED_ANCHORS,
+        aggregate_budget_bytes
+            .saturating_sub(qwen35_anchor_aggregate_control_bytes(stores).unwrap_or(u64::MAX)),
+        configured_slots,
+        stores[slot_idx].pending_bytes(),
+    );
+    let store = &mut stores[slot_idx];
+    match store.publish_pending(effective_k) {
         Ok(publication) => {
             record_qwen35_anchor_evictions(publication.evicted);
             tracing::info!(
@@ -17049,6 +17145,10 @@ fn publish_qwen35_pending_anchor(handle: SlotHandle, store: &mut Qwen35AnchorSto
                 slot = handle.slot_id.0,
                 committed_anchors = store.committed_len(),
                 anchor_owned_bytes = store.owned_bytes(),
+                aggregate_budget_bytes,
+                configured_slots,
+                effective_committed_depth = effective_k,
+                full_depth_available = effective_k == DEFAULT_MAX_COMMITTED_ANCHORS,
                 eviction_reason = if publication.evicted > 0 {
                     "positional_keep_newest_k"
                 } else if publication.replaced_equal_depth {
@@ -17074,9 +17174,19 @@ fn publish_qwen35_pending_anchor(handle: SlotHandle, store: &mut Qwen35AnchorSto
 }
 
 fn audit_qwen35_idle_anchor_conservation(
+    kv: &crate::inference::models::qwen35::kv_cache::HybridKvCache,
     scheduler: &InflightBatchedScheduler,
     stores: &[Qwen35AnchorStore],
-) -> Result<u64> {
+    retained: &[Qwen35RetainedPrefix],
+    kv_bytes_per_token: u64,
+    anchor_grant: u64,
+) -> Result<(u64, u64)> {
+    anyhow::ensure!(
+        stores.len() == retained.len(),
+        "Qwen idle accounting slot-count mismatch: stores={} retained={}",
+        stores.len(),
+        retained.len()
+    );
     let mut anchor_owned_bytes = 0u64;
     for (slot, store) in stores.iter().enumerate() {
         store
@@ -17090,9 +17200,6 @@ fn audit_qwen35_idle_anchor_conservation(
             .checked_add(store.owned_bytes())
             .context("Qwen aggregate anchor-owned byte overflow")?;
     }
-    let anchor_grant = QWEN35_ANCHOR_SLOT_BUDGET_BYTES
-        .checked_mul(stores.len() as u64)
-        .context("Qwen aggregate anchor grant overflow")?;
     let anchor_free = anchor_grant
         .checked_sub(anchor_owned_bytes)
         .context("Qwen anchor-owned bytes exceed aggregate reclaimable grant")?;
@@ -17102,22 +17209,78 @@ fn audit_qwen35_idle_anchor_conservation(
     );
 
     let kv_grant = scheduler.total_kv_budget_bytes();
-    let kv_resident = scheduler.resident_high_water_bytes();
+    let kv_allocation_high_water = scheduler.resident_high_water_bytes();
     let kv_reserved = scheduler.reserved_high_water_bytes();
+    let mut scheduler_accounted_cursor_bytes = 0u64;
+    let retained_prefix_bytes =
+        retained
+            .iter()
+            .enumerate()
+            .try_fold(0u64, |total, (slot, prefix)| {
+                kv.validate_sequence_len_for_slot(SlotId(slot as u32), prefix.len())
+                    .with_context(|| {
+                        format!(
+                            "Qwen idle slot {slot} physical cursor disagrees with retained ledger"
+                        )
+                    })?;
+                if let Some(spec) = prefix.spec.as_ref() {
+                    anyhow::ensure!(
+                        spec.token_count == prefix.len(),
+                        "Qwen idle slot {slot} speculative boundary={} != retained prefix={}",
+                        spec.token_count,
+                        prefix.len()
+                    );
+                    kv.validate_speculative_cursors_for_slot(SlotId(slot as u32), spec.token_count)
+                        .with_context(|| {
+                            format!("Qwen idle slot {slot} target/MTP cursor disagreement")
+                        })?;
+                }
+                let live_cursor = kv
+                    .sequence_len_for_slot(SlotId(slot as u32))
+                    .with_context(|| format!("read Qwen idle slot {slot} physical cursor"))?
+                    as u64;
+                let live_bytes = live_cursor
+                    .checked_mul(kv_bytes_per_token)
+                    .context("Qwen live-cursor byte overflow")?;
+                scheduler_accounted_cursor_bytes = scheduler_accounted_cursor_bytes
+                    .checked_add(live_bytes)
+                    .context("Qwen aggregate scheduler-accounted cursor byte overflow")?;
+                let prefix_bytes = (prefix.len() as u64)
+                    .checked_mul(kv_bytes_per_token)
+                    .context("Qwen retained-prefix byte overflow")?;
+                total
+                    .checked_add(prefix_bytes)
+                    .context("Qwen aggregate retained-prefix byte overflow")
+            })?;
     anyhow::ensure!(
-        kv_reserved == kv_resident,
-        "Qwen idle scheduler retained reservations: reserved={kv_reserved} resident={kv_resident}"
+        scheduler_accounted_cursor_bytes == retained_prefix_bytes,
+        "Qwen idle physical-cursor/retained-ledger mismatch: scheduler_accounted={scheduler_accounted_cursor_bytes} retained={retained_prefix_bytes}"
+    );
+    anyhow::ensure!(
+        kv_reserved == kv_allocation_high_water,
+        "Qwen idle scheduler retained reservations: reserved={kv_reserved} allocation_high_water={kv_allocation_high_water}"
     );
     if kv_grant > 0 {
         let kv_free = kv_grant
-            .checked_sub(kv_resident)
-            .context("Qwen resident KV high-water exceeds grant at idle")?;
+            .checked_sub(kv_allocation_high_water)
+            .context("Qwen KV allocation high-water exceeds grant at idle")?;
+        let allocation_slack = kv_allocation_high_water
+            .checked_sub(scheduler_accounted_cursor_bytes)
+            .context("Qwen scheduler-accounted cursor bytes exceed KV allocation high-water")?;
+        let total_grant = kv_grant
+            .checked_add(anchor_grant)
+            .context("Qwen combined idle grant overflow")?;
+        let conserved = scheduler_accounted_cursor_bytes
+            .checked_add(allocation_slack)
+            .and_then(|bytes| bytes.checked_add(kv_free))
+            .and_then(|bytes| bytes.checked_add(anchor_owned_bytes))
+            .and_then(|bytes| bytes.checked_add(anchor_free));
         anyhow::ensure!(
-            kv_resident.checked_add(kv_free) == Some(kv_grant),
-            "Qwen idle KV conservation mismatch"
+            conserved == Some(total_grant),
+            "Qwen idle cache conservation mismatch: scheduler_accounted_cursor={scheduler_accounted_cursor_bytes} retained={retained_prefix_bytes} allocation_slack={allocation_slack} kv_free={kv_free} anchors={anchor_owned_bytes} anchor_free={anchor_free} grant={total_grant}"
         );
     }
-    Ok(anchor_owned_bytes)
+    Ok((anchor_owned_bytes, retained_prefix_bytes))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18010,11 +18173,18 @@ fn run_slot_aware_qwen35(
         }
     };
     let n_slots = guard.kv.as_ref().expect("kv Some at entry").n_seqs as usize;
+    let anchor_aggregate_budget_bytes = qwen35_anchor_aggregate_budget_bytes();
+    let anchor_committed_control_capacity =
+        qwen35_anchor_committed_control_capacity(n_slots, anchor_aggregate_budget_bytes);
+    record_qwen35_anchor_configuration(n_slots, anchor_aggregate_budget_bytes);
     let prefill_chunk_tokens = qwen35_slot_prefill_chunk_tokens(n_slots);
     scheduler.set_prefill_chunk_tokens(prefill_chunk_tokens);
     tracing::info!(
         n_slots,
         prefill_chunk_tokens,
+        anchor_aggregate_budget_bytes,
+        anchor_committed_control_capacity,
+        anchor_budget_class = "reclaimable_anchor_owned",
         "Qwen35 SlotAware prefill transaction ceiling selected"
     );
     let mut slots: Vec<Option<Qwen35Slot>> = (0..n_slots).map(|_| None).collect();
@@ -18022,8 +18192,9 @@ fn run_slot_aware_qwen35(
         .map(|_| Qwen35RetainedPrefix::default())
         .collect();
     let mut prompt_caches: Vec<PromptCache> = (0..n_slots).map(|_| PromptCache::new()).collect();
-    let mut prompt_anchors: Vec<Qwen35AnchorStore> =
-        (0..n_slots).map(|_| Qwen35AnchorStore::default()).collect();
+    let mut prompt_anchors: Vec<Qwen35AnchorStore> = (0..n_slots)
+        .map(|_| Qwen35AnchorStore::with_committed_capacity(anchor_committed_control_capacity))
+        .collect();
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
@@ -18140,6 +18311,7 @@ fn run_slot_aware_qwen35(
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
+                        anchor_aggregate_budget_bytes,
                         &supervisor,
                         prompt_tokens,
                         params,
@@ -18197,6 +18369,7 @@ fn run_slot_aware_qwen35(
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
+                        anchor_aggregate_budget_bytes,
                         &supervisor,
                         prompt_tokens,
                         params,
@@ -18307,6 +18480,7 @@ fn run_slot_aware_qwen35(
                         &scheduler_stats_snapshot,
                         per_slot_kv_budget_bytes,
                         kv_bytes_per_token,
+                        anchor_aggregate_budget_bytes,
                         &supervisor,
                         prompt_tokens,
                         params,
@@ -18393,11 +18567,19 @@ fn run_slot_aware_qwen35(
         };
         match step {
             SchedulerStep::Idle => {
-                match audit_qwen35_idle_anchor_conservation(&scheduler, &prompt_anchors) {
-                    Ok(anchor_owned_bytes) => tracing::debug!(
+                match audit_qwen35_idle_anchor_conservation(
+                    guard.kv.as_ref().expect("kv Some during Qwen idle audit"),
+                    &scheduler,
+                    &prompt_anchors,
+                    &retained_tokens,
+                    kv_bytes_per_token,
+                    anchor_aggregate_budget_bytes,
+                ) {
+                    Ok((anchor_owned_bytes, retained_prefix_bytes)) => tracing::debug!(
                         target: "hf2q::serve::api::qwen35_anchor",
                         anchor_owned_bytes,
-                        kv_resident_high_water_bytes = scheduler.resident_high_water_bytes(),
+                        retained_prefix_bytes,
+                        kv_allocation_high_water_bytes = scheduler.resident_high_water_bytes(),
                         "Qwen idle cache conservation audit passed"
                     ),
                     Err(error) => {
@@ -18453,6 +18635,7 @@ fn run_slot_aware_qwen35(
                     handle,
                     n_tokens,
                     kv_bytes_per_token,
+                    anchor_aggregate_budget_bytes,
                     &supervisor,
                 ) {
                     fail_qwen35_worker_after_gpu_fatal(
@@ -18479,6 +18662,7 @@ fn run_slot_aware_qwen35(
                     registration.as_ref(),
                     &handles,
                     kv_bytes_per_token,
+                    anchor_aggregate_budget_bytes,
                     &supervisor,
                 ) {
                     fail_qwen35_worker_after_gpu_fatal(
@@ -18518,6 +18702,7 @@ fn run_slot_aware_qwen35(
                     registration.as_ref(),
                     &decode_handles,
                     kv_bytes_per_token,
+                    anchor_aggregate_budget_bytes,
                     &supervisor,
                 ) {
                     fail_qwen35_worker_after_gpu_fatal(
@@ -18543,6 +18728,7 @@ fn run_slot_aware_qwen35(
                     prefill,
                     n_prefill_tokens,
                     kv_bytes_per_token,
+                    anchor_aggregate_budget_bytes,
                     &supervisor,
                 ) {
                     fail_qwen35_worker_after_gpu_fatal(
@@ -18582,6 +18768,7 @@ fn admit_qwen35_slot(
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
+    anchor_aggregate_budget_bytes: u64,
     supervisor: &EngineSupervisor,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
@@ -18753,7 +18940,9 @@ fn admit_qwen35_slot(
         committed_anchors = prompt_anchors[admission_slot_idx].committed_len(),
         pending_anchor = prompt_anchors[admission_slot_idx].has_pending(),
         anchor_owned_bytes = prompt_anchors[admission_slot_idx].owned_bytes(),
-        anchor_budget_bytes = QWEN35_ANCHOR_SLOT_BUDGET_BYTES,
+        anchor_aggregate_owned_bytes = qwen35_anchor_aggregate_owned_bytes(prompt_anchors).unwrap_or(u64::MAX),
+        anchor_aggregate_budget_bytes,
+        configured_slots = prompt_anchors.len(),
         "Qwen admission reclaimable anchor accounting"
     );
     let operator_request_id = qwen35_operator_request_id(handle);
@@ -18846,7 +19035,7 @@ fn admit_qwen35_slot(
                 tokens_saved = 0,
                 descendant_prune_count = 0,
                 capture_ms = anchor_capture_duration.as_secs_f64() * 1000.0,
-                peak_committed_pending_bytes = 0,
+                peak_committed_pending_bytes = prompt_anchors[slot_idx].owned_bytes(),
                 committed_cleared = cleared.committed,
                 pending_discarded = cleared.pending_discarded,
                 "Qwen anchor restore failed; hard reset cleared the full lineage"
@@ -18927,9 +19116,10 @@ fn admit_qwen35_slot(
             super::qwen35_speculation::record_fallback(
                 super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable,
             );
-            if let Some(anchor) = prompt_anchors[slot_idx].committed_mut(anchor_index) {
-                anchor.spec = None;
-            }
+            // Keep the committed payload immutable. Dropping the optional row
+            // in place would require an accounting-aware store mutation and
+            // could make `owned_bytes` stale. This request falls back to
+            // target-only decode; a later exact restore revalidates the row.
         }
         retained_tokens[slot_idx].tokens = anchor_prompt_tokens;
         retained_tokens[slot_idx].spec = cached_spec.clone();
@@ -18995,6 +19185,15 @@ fn admit_qwen35_slot(
     );
     let cached_spec =
         qwen35_cached_spec_for_decision(slot_mtp_decision, vision.is_none(), cached_spec_candidate);
+    if anchor_hit && cached_spec.is_some() {
+        record_qwen35_anchor_spec_boundary_restore(cached_tokens);
+        tracing::info!(
+            target: "hf2q::serve::api::qwen35_anchor",
+            slot = handle.slot_id.0,
+            cached_tokens,
+            "Qwen SlotAware accepted speculative boundary state from an epoch-valid anchor"
+        );
+    }
 
     let prefill = match super::engine_qwen35::Qwen35PrefillState::begin(
         prompt_tokens,
@@ -19056,6 +19255,7 @@ fn admit_qwen35_slot(
             handle,
             1,
             kv_bytes_per_token,
+            anchor_aggregate_budget_bytes,
             supervisor,
         );
     }
@@ -19075,6 +19275,7 @@ fn advance_qwen35_prefill(
     handle: SlotHandle,
     requested_tokens: u32,
     kv_bytes_per_token: u64,
+    anchor_aggregate_budget_bytes: u64,
     supervisor: &EngineSupervisor,
 ) -> Option<Qwen35FatalFailure> {
     let slot_idx = handle.slot_id.0 as usize;
@@ -19167,7 +19368,12 @@ fn advance_qwen35_prefill(
                 rate,
             );
             if let Some(checkpoint) = checkpoint {
-                install_qwen35_stable_prompt_checkpoint(handle, prompt_anchors, checkpoint);
+                install_qwen35_stable_prompt_checkpoint(
+                    handle,
+                    prompt_anchors,
+                    checkpoint,
+                    anchor_aggregate_budget_bytes,
+                );
             }
             if reply.client_closed() {
                 reply.record_client_cancellation();
@@ -19212,7 +19418,12 @@ fn advance_qwen35_prefill(
                 rate,
             );
             if let Some(checkpoint) = checkpoint {
-                install_qwen35_stable_prompt_checkpoint(handle, prompt_anchors, checkpoint);
+                install_qwen35_stable_prompt_checkpoint(
+                    handle,
+                    prompt_anchors,
+                    checkpoint,
+                    anchor_aggregate_budget_bytes,
+                );
             }
             if reply.client_closed() {
                 reply.record_client_cancellation();
@@ -19251,6 +19462,7 @@ fn advance_qwen35_prefill(
                 prefill_logits,
                 reply,
                 kv_bytes_per_token,
+                anchor_aggregate_budget_bytes,
             ) {
                 return Some(fatal);
             }
@@ -19340,6 +19552,7 @@ fn finish_qwen35_prefill(
     prefill_logits: Vec<f32>,
     mut reply: SlotReply,
     kv_bytes_per_token: u64,
+    anchor_aggregate_budget_bytes: u64,
 ) -> Option<Qwen35FatalFailure> {
     let slot_idx = handle.slot_id.0 as usize;
     let (prompt_tokens, params) = {
@@ -19433,26 +19646,12 @@ fn finish_qwen35_prefill(
                     capture_duration,
                     lineage_epoch: 0,
                 };
-                let anchor_bytes = anchor.owned_bytes();
-                let outcome = prompt_anchors[slot_idx].stage_pending(
+                stage_qwen35_pending_anchor(
+                    handle,
+                    prompt_anchors,
                     anchor,
-                    DEFAULT_MAX_COMMITTED_ANCHORS,
-                    QWEN35_ANCHOR_SLOT_BUDGET_BYTES,
-                );
-                record_qwen35_anchor_capture(
-                    outcome,
-                    capture_duration,
-                    prompt_anchors[slot_idx].owned_bytes(),
-                );
-                tracing::info!(
-                    target: "hf2q::serve::api::qwen35_anchor",
-                    slot = handle.slot_id.0,
-                    prompt_tokens = prompt_tokens.len(),
-                    anchor_bytes,
-                    capture_ms = capture_duration.as_secs_f64() * 1000.0,
-                    peak_committed_pending_bytes = prompt_anchors[slot_idx].owned_bytes(),
-                    outcome = ?outcome,
-                    "Qwen full-prompt boundary capture preflight"
+                    "full_prompt_boundary",
+                    anchor_aggregate_budget_bytes,
                 );
             }
             Err(error) => {
@@ -19562,7 +19761,7 @@ fn finish_qwen35_prefill(
             kv_bytes_per_token,
         );
         retained_tokens[slot_idx].vision_fingerprint = params.vision_fingerprint;
-        publish_qwen35_pending_anchor(handle, &mut prompt_anchors[slot_idx]);
+        publish_qwen35_pending_anchor(handle, prompt_anchors, anchor_aggregate_budget_bytes);
         scheduler.advance_after_decode(handle);
         scheduler.release(handle);
         finish_qwen35_operator_request(handle, "complete");
@@ -19684,6 +19883,7 @@ fn decode_batch_qwen35(
     registration: Option<&super::registry::ModelRegistration>,
     handles: &[SlotHandle],
     kv_bytes_per_token: u64,
+    anchor_aggregate_budget_bytes: u64,
     supervisor: &EngineSupervisor,
 ) -> Option<Qwen35FatalFailure> {
     for &handle in handles {
@@ -19873,7 +20073,7 @@ fn decode_batch_qwen35(
             );
             retained_tokens[slot_idx].vision_fingerprint =
                 state.prompt_cache_identity().1.vision_fingerprint;
-            publish_qwen35_pending_anchor(handle, &mut prompt_anchors[slot_idx]);
+            publish_qwen35_pending_anchor(handle, prompt_anchors, anchor_aggregate_budget_bytes);
         }
         scheduler.advance_after_decode(handle);
 

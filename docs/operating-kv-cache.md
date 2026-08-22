@@ -24,7 +24,25 @@
 > envelope, so a process that owns both registries can reserve roughly twice
 > the percentage an operator may expect from the name. SlotAware anchor bytes
 > are a third, separately reclaimable line and must never be added to the
-> scheduler's monotonic Metal KV high-water.
+> scheduler's monotonic Metal KV high-water. The worker resolves this third
+> aggregate grant once at startup; it does not shrink as `available_memory`
+> changes mid-run. `HF2Q_KV_LCP_RESUME_CAPACITY` therefore controls each
+> independently-instantiated registry/anchor envelope, not one shared pool.
+>
+> Anchor capacity is artifact- and concurrency-dependent. Metrics expose the
+> configured slot count, immutable aggregate grant, aggregate owned/peak
+> bytes, effective committed depth, simultaneous pending-capacity slots, and
+> fail-closed capture skips. At N=16, a Qwen3.8 server may offer fewer than
+> four committed anchors per slot and fewer than 16 simultaneous pending
+> captures; that is explicit partial availability, not permission to exceed
+> the grant. The anchor line includes its retained store-control allocation.
+>
+> Do not infer physical residency from the scheduler's Metal allocation
+> high-water. Overwrite-backed 4 GiB resources were observed to stay GPU-bound
+> under the N=16 run; the high-water is allocation/accounting state. Anchor
+> payloads are separate anchor-owned allocations (bulk state in host memory,
+> optional speculative hidden rows in dedicated right-sized Metal buffers)
+> with their own reclamation and conservation audit.
 >
 > `HF2Q_KV_PERSIST` is overloaded and must be read in the context of its
 > consumer: Qwen load options interpret a non-empty value as a filesystem

@@ -1,9 +1,9 @@
 # ADR-049: Agentic state reuse (multi-anchor) and Mixed-phase cooperative prefill
 
 - Status: Accepted; execution in progress (qwen35-family model-free Lane A
-  proof complete at rev 4, real-artifact gates and cross-family phases open)
+  proof complete at rev 5, real-artifact gates and cross-family phases open)
 - Date: 2026-08-22
-- Updated: 2026-08-22 (rev 4, qwen35-family model-free execution milestone)
+- Updated: 2026-08-22 (rev 5, qwen35-family aggregate-budget hardening)
   — implementation commit `95d618c8`, based on main `32181b61`: explicit
   per-slot AnchorStore,
   linear-lineage pruning, fail-atomic restore preflight, exact payload
@@ -12,7 +12,7 @@
   Qwen3.6/Qwen3.8 hardware receipts are intentionally not claimed here; see
   the execution ledger below.
 - Owners: hf2q serving engine (execution: the active qwen35/qwen38 serving-lane session; plan authored by the FreeToken research session)
-- Code pins: planning review at hf2q `242882e8`; rev-4 execution based on
+- Code pins: planning review at hf2q `242882e8`; rev-5 execution based on
   merged main `32181b61`; mlx-native `0.11.2`. Anchors were authored at
   `815bd48d`; every correction-touched anchor was re-verified before editing.
 - Provenance: full paper+code study of FreeToken (arXiv 2608.16157, "FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution") mapped onto hf2q/mlx-native by a nine-agent research swarm, then adversarially reviewed by two independent external models (Kimi K3 via opencode; gpt-5.6-sol via codex, 516k-token source-grounded review). Both reviews' MUST-FIX items are incorporated; the gpt-5.6-sol review found and this ADR closes a stale-KV lineage coherence bug in the original draft (§A.2).
@@ -68,16 +68,17 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 **A.4 — Eviction & budget.**
 - Eviction: positional keep-newest-K (K default 4; anchors form a nested prefix chain, so LRU-by-restore is actively wrong — a twice-edited turn would evict the deeper anchor about to be needed; both reviewers concurred). Descendant invalidation (A.2) runs before any eviction policy matters. One refinement permitted later, telemetry-first: reserve slot 0 of the list for the oldest/system boundary, K−1 for newest.
 - **Payload ownership rule (executor-audit finding):** every element of an anchor's payload must be host-owned or a dedicated right-sized allocation — NEVER a view/clone retaining a larger transient allocation. Today `pending_target_hidden` is an `MlxBuffer` captured by cloning a view whose parent is the prefill residual allocation (engine_qwen35.rs:3406, capture sites :3972/:4759): the logical row is ~20 KiB, but the clone retains the ~40 MiB (2,048-row) / ~80 MiB (4,096-row) parent Metal allocation — one per anchor. Capture must copy the row into a dedicated `[1, H]` allocation or host memory. Required regression: after capture, assert no chunk-sized parent allocation remains retained by any anchor (allocation-accounting check).
-- Budget: `HybridKvSlotAnchor::total_bytes()` (kv_cache.rs:1004) undercounts — it omits prompt tokens, the vocab-sized `prefill_logits`, and the spec hidden row owned by `Qwen35PromptAnchor` (engine.rs:16865-16871, spec boundary struct engine_qwen35.rs:3404-3407). Account **all owned payload** as a separate reclaimable `anchor_owned_bytes` line surfaced to admission — NOT added to scheduler high-water, which is deliberately monotonic because Metal pages are never reclaimed (src/serve/scheduler.rs:1047, :1218); host-owned evictable bytes charged there would never return. **K counts committed anchors only; the preflight charges K committed + 1 pending.** Preflight fail-closed: a capture that would exceed the anchor budget is skipped (documented scope gap), never partially taken.
-- Per-model anchor cost (budget is byte-denominated; `K_effective = min(4, floor(slot_anchor_budget / anchor_bytes(model)))` — computed from allocation code, never doc comments):
+- Budget: `HybridKvSlotAnchor::total_bytes()` (kv_cache.rs:1004) undercounts — it omits prompt tokens, the vocab-sized `prefill_logits`, the spec hidden row owned by `Qwen35PromptAnchor` (engine.rs:16865-16871, spec boundary struct engine_qwen35.rs:3404-3407), and the store's retained `Vec` control allocation. Account **all owned bytes** as a separate reclaimable `anchor_owned_bytes` line surfaced to admission — NOT added to scheduler high-water, which is deliberately monotonic allocation accounting and is not proof that overwrite-backed Metal pages are demand-resident. Host-owned evictable bytes charged there would never return. **K counts committed anchors only; every capture preflight charges the slot's committed payload plus one pending payload against the live aggregate.** Preflight fail-closed: a capture that would exceed the immutable worker-lifetime anchor grant is skipped, never partially taken.
+- The budget is aggregate across all slots, not `N × a per-slot constant`. `K_effective = min(4, floor(aggregate_budget / (N × anchor_bytes(model))))` is committed-depth capacity. The separate `simultaneous_pending_capacity_slots = floor((aggregate_budget - N × K_effective × anchor_bytes) / anchor_bytes)` makes concurrent pending availability explicit. If that value is below N, later simultaneous captures may skip fail-closed even though every slot can retain K committed anchors. Both values, N, aggregate owned bytes, peak bytes, skips, and the immutable grant are production telemetry; no N=16 receipt may claim full depth or full pending concurrency without those gauges proving it.
+- Per-model anchor cost (computed from allocation code, never doc comments):
 
-  | Model | recurrent+conv state | ≈ total w/ logits+tokens+hidden | K=4 × 4 slots | K=4 × 8 slots |
-  |---|---|---|---|---|
-  | Qwen3.6-35B-A3B (30 DeltaNet layers) | 62.8 MiB | ≈63.5 MiB | ≈1.02 GiB | ≈2.03 GiB |
-  | Qwen3.8-27B (48 layers) | 149.6 MiB | ≈150.3 MiB | ≈2.35 GiB | ≈4.70 GiB |
+  | Model | recurrent+conv state | ≈ total w/ logits+tokens+hidden | K=4 × 4 slots | K=4 × 8 slots | K=4 × 16 slots |
+  |---|---|---|---|---|---|
+  | Qwen3.6-35B-A3B (30 DeltaNet layers) | 62.8 MiB | ≈63.5 MiB | ≈1.02 GiB | ≈2.03 GiB | ≈4.06 GiB |
+  | Qwen3.8-27B (48 layers) | 149.6 MiB | ≈150.3 MiB | ≈2.35 GiB | ≈4.70 GiB | ≈9.39 GiB |
 
   Gemma4/DeepSeek4 rows are computed the same way when their parity phases open.
-- Idle conservation invariant (strict equality, deliberately stricter than FreeToken's own `<=` on its GDN pool): at scheduler idle, per slot and in aggregate, `live cursor bytes + retained prefix accounting + anchor_owned_bytes + free = grant`. Run it in the same idle hook style FreeToken audits use; it is the audit that would have caught the repo's stale `n_v_heads=8` byte-math comments years early.
+- Idle conservation invariant: at scheduler idle, first prove every physical target cursor equals its retained ledger and every retained spec boundary has matching target+MTP cursors. Then audit the scheduler-accounted cursor bytes, monotonic allocation slack, KV free bytes, exact host-owned anchor bytes, and anchor free bytes against their two grants. The equalities are not substitutes for the cursor comparisons.
 
 **A.5 — Speculation interplay (LIVE requirements — corrected after the executor audit; verified at `242882e8`).** Slot-aware speculative rollback is live on main via its own transactional functions — `rollback_slot_mtp_transaction` (engine_qwen35.rs:4142) and `rollback_slot_target_transaction` (:4173), with fail-closed slot reset if a rollback itself fails (:4197-4226). H38 (engine.rs:44835-44897) still pins `rollback_la_to` — and with it the per-token DeltaNet capture arena — out of the slot-aware worker. The rules below bind NOW and are co-designed with the speculation lane:
 1. Anchor capture and restore must be sequenced strictly outside an open MTP/target rollback transaction — never observe mid-transaction cursors. Prefill-time anchors copy bytes OUT of live buffers and are safe once that sequencing holds.
@@ -99,9 +100,12 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 2. The A.2 lineage regression (A→B→C / rewind / old-C-must-not-restore).
 3. Cancellation: cancel mid-prefill after ≥2 anchors installed; committed list must equal the pre-request list.
 4. `scripts/test_qwen35_slot_anchor_divergence.sh`: explicit
-   `--scheduler inflight-batched --max-slots 4`, truly concurrent clients,
-   equality hits, divergent rewrites, cancellation, failed prefill,
-   speculative-state carry, and stale-descendant rejection. It exits nonzero
+   `--scheduler inflight-batched` plus an exact configurable `--max-slots`,
+   truly concurrent clients, equality hits, divergent rewrites, cancellation,
+   admission isolation, speculative-state carry, aggregate-capacity receipts,
+   and stale-descendant rejection. A post-admission GPU-prefill failure remains
+   a separate open hardware gate; an oversized pre-admission 4xx is not
+   evidence for that lifecycle. The script exits nonzero
    on every miss and refuses to run when the listener process arguments do not
    prove the required scheduler shape. (`bench_lcp_resume_speedup.sh` is NOT a
    gate for this feature: it drives the stride registry, issues its "4-worker"
@@ -131,11 +135,12 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 2. Document (not fix, this ADR) the two budget hazards: two independent 5%-of-RAM LCP budgets (engine.rs:3595-3597, engine_qwen35.rs:523-525 — same `default_lcp_byte_budget()` instantiated twice); `HF2Q_KV_PERSIST` carries THREE meanings (path — serve/mod.rs:974; `"0"` disable — :4457-4485; `"1"`/`"on"` enable — kv_persist/families/gemma4_dense.rs:21, kv_persist/index.rs:9). State the registry end-state: the SerialFifo registry + disk hydrate is the *permanent restart-hydrate tier* until the A.7 follow-on ADR replaces it — documented scope, not a stub.
 3. Import FreeToken's evaluation discipline into release evidence: report worst-case (tail) TTFT against client watchdog ceilings, not just means; an agentic-stability criterion (decode rate within a fixed % of single-turn under the N=4 workload); the A.4 strict-equality idle conservation audit; a reference-model invariant battery over the AnchorStore state machine (injected-mutation style — FreeToken's equivalent suite caught 17/17).
 
-### Qwen execution ledger — rev 4
+### Qwen execution ledger — rev 5
 
-Model-free evidence at implementation commit `95d618c8`:
+Model-free evidence from the implementation lineage beginning at `95d618c8`
+and its rev-5 hardening checkpoint:
 
-- `qwen35_anchor_store` has an independent reference state machine and eight
+- `qwen35_anchor_store` has an independent reference state machine and twelve
   focused tests. The mutation battery rejects 17/17 injected corruptions;
   A→B→C/rewind removes B and C before branch X can write; pending state is
   affinity-invisible; eviction is positional keep-newest-K; accounting charges
@@ -156,11 +161,31 @@ Model-free evidence at implementation commit `95d618c8`:
   prunes descendants before the first divergent write, and clears the full
   store before hard reset after failed restore, poison, or cold reset. A.8
   fields emit in structured logs and Prometheus counters.
+- The initial per-slot 768 MiB envelope was falsified by the Qwen3.8 N=16
+  target: depth-4 is about 9.4 GiB while a default grant may be about 4.5 GiB.
+  The worker now resolves one immutable aggregate anchor-owned grant at startup,
+  derives artifact-and-N-specific committed depth, applies a live aggregate
+  pending preflight, and reports partial pending availability explicitly.
+  Qwen3.8 N=16 therefore remains a supported serving shape without memory
+  overcommit, but its receipt must report observed depth and pending-capacity
+  slots rather than imply depth-4/full-pending coverage.
+- Independent review found and this revision fixes five proof/accounting
+  defects: idle audit now binds physical target/MTP cursors to retained
+  ledgers; scheduler fixed bytes no longer double-charge the former single
+  anchor; invalid spec metadata no longer mutates store payload behind byte
+  accounting; the gate requires old C to restore only cold/A and uses a
+  SlotAware-specific spec counter; store control allocations are included in
+  exact owned bytes. Pending capture never grows committed control storage;
+  publication evicts before its push, and a deliberately tiny grant selects
+  zero control capacity instead of allocating then idle-failing. The rejected
+  oversized request is correctly classified
+  as admission isolation, leaving post-admission GPU-prefill failure open.
 
 Open proof work is concrete rather than implied by these unit results: run the
 new concurrent SlotAware divergence gate plus every-depth cold byte comparison
 on both Qwen3.6-35B-A3B and Qwen3.8-27B at 2,048- and 4,096-token transaction
-widths; record cancellation, failed-prefill, speculative-state, tail-TTFT,
+widths; record cancellation, post-admission failed-prefill, speculative-state,
+tail-TTFT,
 append-only-no-regression, and N=4 stability receipts. The release driver owns
 that hardware window. Gemma4/deepseek4 parity and Lane B remain required by the
 scope directive.
@@ -210,7 +235,10 @@ Framing (Robert): items below are either FALSIFIED with evidence in hand, or OPE
 - Falsified paths carry their evidence and open hypotheses carry their named deciding spikes, so future sessions extend the data instead of re-litigating from scratch.
 
 ### Negative
-- Up to ~1 GiB (shipping config) / ~2 GiB (8-slot ceiling) of host RAM held in anchors; bounded and reclaimable, but real.
+- An immutable aggregate host-RAM grant is available to anchors; actual depth
+  varies with artifact and slot count. Qwen3.8 depth-4 is ~2.35 GiB at N=4,
+  ~4.70 GiB at N=8, and ~9.39 GiB at N=16, so wider shapes may expose partial
+  depth or pending-capture availability rather than overcommit.
 - Anchor lifecycle adds state-machine complexity to the slot worker (three-state publication, epoch checks, descendant pruning) — the price of multi-depth reuse on a mutable KV log.
 - Lane B carries genuine schedule risk: if B.0 fails, the Mixed-phase win needs a scheduler redesign (separate ADR), and the tool-result failure mode keeps its current mitigation only.
 

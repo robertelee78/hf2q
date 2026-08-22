@@ -15,6 +15,13 @@ pub(crate) struct AnchorTelemetry {
     pub descendants_pruned_total: AtomicU64,
     pub evictions_total: AtomicU64,
     pub peak_committed_pending_bytes: AtomicU64,
+    pub aggregate_peak_committed_pending_bytes: AtomicU64,
+    pub aggregate_budget_bytes: AtomicU64,
+    pub configured_slots: AtomicU64,
+    pub effective_committed_depth: AtomicU64,
+    pub simultaneous_pending_capacity_slots: AtomicU64,
+    pub partial_capacity_captures_total: AtomicU64,
+    pub spec_boundary_restore_tokens_total: AtomicU64,
 }
 
 pub(crate) static TELEMETRY: AnchorTelemetry = AnchorTelemetry {
@@ -28,7 +35,35 @@ pub(crate) static TELEMETRY: AnchorTelemetry = AnchorTelemetry {
     descendants_pruned_total: AtomicU64::new(0),
     evictions_total: AtomicU64::new(0),
     peak_committed_pending_bytes: AtomicU64::new(0),
+    aggregate_peak_committed_pending_bytes: AtomicU64::new(0),
+    aggregate_budget_bytes: AtomicU64::new(0),
+    configured_slots: AtomicU64::new(0),
+    effective_committed_depth: AtomicU64::new(0),
+    simultaneous_pending_capacity_slots: AtomicU64::new(0),
+    partial_capacity_captures_total: AtomicU64::new(0),
+    spec_boundary_restore_tokens_total: AtomicU64::new(0),
 };
+
+pub(crate) fn record_configuration(configured_slots: usize, aggregate_budget_bytes: u64) {
+    TELEMETRY
+        .configured_slots
+        .store(configured_slots as u64, Ordering::Relaxed);
+    TELEMETRY
+        .aggregate_budget_bytes
+        .store(aggregate_budget_bytes, Ordering::Relaxed);
+    TELEMETRY
+        .peak_committed_pending_bytes
+        .store(0, Ordering::Relaxed);
+    TELEMETRY
+        .aggregate_peak_committed_pending_bytes
+        .store(0, Ordering::Relaxed);
+    TELEMETRY
+        .effective_committed_depth
+        .store(0, Ordering::Relaxed);
+    TELEMETRY
+        .simultaneous_pending_capacity_slots
+        .store(0, Ordering::Relaxed);
+}
 
 fn raise_peak(peak: &AtomicU64, observed: u64) {
     let mut current = peak.load(Ordering::Relaxed);
@@ -40,18 +75,83 @@ fn raise_peak(peak: &AtomicU64, observed: u64) {
     }
 }
 
-pub(crate) fn record_capture(outcome: StagePending, duration: Duration, peak_bytes: u64) {
+pub(crate) fn record_capture(
+    outcome: StagePending,
+    duration: Duration,
+    slot_peak_bytes: u64,
+    aggregate_owned_bytes: u64,
+    effective_committed_depth: usize,
+    simultaneous_pending_capacity_slots: usize,
+) {
     TELEMETRY.captures_total.fetch_add(1, Ordering::Relaxed);
     TELEMETRY.capture_nanos_total.fetch_add(
         duration.as_nanos().min(u128::from(u64::MAX)) as u64,
         Ordering::Relaxed,
     );
-    if matches!(outcome, StagePending::BudgetExceeded { .. }) {
+    if matches!(
+        outcome,
+        StagePending::BudgetExceeded { .. } | StagePending::NoCommittedCapacity
+    ) {
         TELEMETRY
             .capture_budget_skips_total
             .fetch_add(1, Ordering::Relaxed);
     }
-    raise_peak(&TELEMETRY.peak_committed_pending_bytes, peak_bytes);
+    if effective_committed_depth < DEFAULT_MAX_COMMITTED_ANCHORS
+        || simultaneous_pending_capacity_slots
+            < TELEMETRY.configured_slots.load(Ordering::Relaxed) as usize
+    {
+        TELEMETRY
+            .partial_capacity_captures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    TELEMETRY
+        .effective_committed_depth
+        .store(effective_committed_depth as u64, Ordering::Relaxed);
+    TELEMETRY.simultaneous_pending_capacity_slots.store(
+        simultaneous_pending_capacity_slots as u64,
+        Ordering::Relaxed,
+    );
+    raise_peak(&TELEMETRY.peak_committed_pending_bytes, slot_peak_bytes);
+    raise_peak(
+        &TELEMETRY.aggregate_peak_committed_pending_bytes,
+        aggregate_owned_bytes,
+    );
+}
+
+/// Maximum committed depth whose retained payloads fit for every configured
+/// slot. Pending capture is then admitted against the live aggregate sum; use
+/// `simultaneous_pending_capacity_slots` to expose whether every slot could
+/// capture concurrently at that committed depth.
+pub(crate) fn effective_committed_depth(
+    max_committed: usize,
+    aggregate_budget_bytes: u64,
+    n_slots: usize,
+    anchor_bytes: u64,
+) -> usize {
+    if max_committed == 0 || n_slots == 0 || anchor_bytes == 0 {
+        return 0;
+    }
+    let per_depth_all_slots = anchor_bytes.saturating_mul(n_slots as u64);
+    if per_depth_all_slots == 0 {
+        return 0;
+    }
+    max_committed.min((aggregate_budget_bytes / per_depth_all_slots) as usize)
+}
+
+pub(crate) fn simultaneous_pending_capacity_slots(
+    aggregate_budget_bytes: u64,
+    n_slots: usize,
+    anchor_bytes: u64,
+    committed_depth: usize,
+) -> usize {
+    if n_slots == 0 || anchor_bytes == 0 {
+        return 0;
+    }
+    let committed_charge = anchor_bytes
+        .saturating_mul(n_slots as u64)
+        .saturating_mul(committed_depth as u64);
+    let free = aggregate_budget_bytes.saturating_sub(committed_charge);
+    n_slots.min((free / anchor_bytes) as usize)
 }
 
 pub(crate) fn record_restore_hit(tokens_saved: usize, descendants_pruned: usize) {
@@ -65,6 +165,12 @@ pub(crate) fn record_restore_hit(tokens_saved: usize, descendants_pruned: usize)
     TELEMETRY
         .descendants_pruned_total
         .fetch_add(descendants_pruned as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_spec_boundary_restore(tokens: usize) {
+    TELEMETRY
+        .spec_boundary_restore_tokens_total
+        .fetch_add(tokens as u64, Ordering::Relaxed);
 }
 
 pub(crate) fn record_restore_miss() {
@@ -134,16 +240,23 @@ pub(crate) struct AnchorStore<A: AnchorEntry> {
 
 impl<A: AnchorEntry> Default for AnchorStore<A> {
     fn default() -> Self {
-        Self {
-            committed: Vec::new(),
-            pending: None,
-            lineage_epoch: 0,
-            owned_bytes: 0,
-        }
+        Self::with_committed_capacity(DEFAULT_MAX_COMMITTED_ANCHORS)
     }
 }
 
 impl<A: AnchorEntry> AnchorStore<A> {
+    pub(crate) fn with_committed_capacity(capacity: usize) -> Self {
+        let committed = Vec::with_capacity(capacity);
+        let owned_bytes =
+            (committed.capacity() as u64).saturating_mul(std::mem::size_of::<A>() as u64);
+        Self {
+            committed,
+            pending: None,
+            lineage_epoch: 0,
+            owned_bytes,
+        }
+    }
+
     pub(crate) fn committed_len(&self) -> usize {
         self.committed.len()
     }
@@ -177,17 +290,14 @@ impl<A: AnchorEntry> AnchorStore<A> {
             .unwrap_or(0)
     }
 
+    pub(crate) fn control_owned_bytes(&self) -> u64 {
+        self.committed_control_bytes()
+    }
+
     pub(crate) fn committed(&self, index: usize) -> Option<&A> {
         self.committed
             .get(index)
             .filter(|anchor| anchor.lineage_epoch() == self.lineage_epoch)
-    }
-
-    pub(crate) fn committed_mut(&mut self, index: usize) -> Option<&mut A> {
-        let epoch = self.lineage_epoch;
-        self.committed
-            .get_mut(index)
-            .filter(|anchor| anchor.lineage_epoch() == epoch)
     }
 
     pub(crate) fn newest_committed_at_or_before(&self, token_count: usize) -> Option<usize> {
@@ -226,6 +336,9 @@ impl<A: AnchorEntry> AnchorStore<A> {
         }
         if self.pending.is_some() {
             return StagePending::PendingOccupied;
+        }
+        if max_committed > self.committed.capacity() {
+            return StagePending::NoCommittedCapacity;
         }
         let needed_bytes = self.owned_bytes.saturating_add(anchor.owned_bytes());
         if needed_bytes > byte_budget {
@@ -269,14 +382,17 @@ impl<A: AnchorEntry> AnchorStore<A> {
                 publication.replaced_equal_depth = true;
             }
         }
-        self.committed.push(pending);
-
-        if self.committed.len() > max_committed {
-            publication.evicted = self.committed.len() - max_committed;
+        if !publication.replaced_equal_depth && self.committed.len() >= max_committed {
+            publication.evicted = self.committed.len() - max_committed + 1;
             for evicted in self.committed.drain(0..publication.evicted) {
                 self.owned_bytes = self.owned_bytes.saturating_sub(evicted.owned_bytes());
             }
         }
+        ensure!(
+            self.committed.len() < self.committed.capacity(),
+            "anchor publication has no preflighted committed control slot"
+        );
+        self.committed.push(pending);
         self.validate()?;
         Ok(publication)
     }
@@ -348,7 +464,7 @@ impl<A: AnchorEntry> AnchorStore<A> {
         };
         self.committed.clear();
         self.pending = None;
-        self.owned_bytes = 0;
+        self.owned_bytes = self.committed_control_bytes();
         self.lineage_epoch = self.lineage_epoch.wrapping_add(1);
         result
     }
@@ -358,6 +474,10 @@ impl<A: AnchorEntry> AnchorStore<A> {
         for anchor in &mut self.committed {
             anchor.set_lineage_epoch(self.lineage_epoch);
         }
+    }
+
+    fn committed_control_bytes(&self) -> u64 {
+        (self.committed.capacity() as u64).saturating_mul(std::mem::size_of::<A>() as u64)
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -400,7 +520,9 @@ impl<A: AnchorEntry> AnchorStore<A> {
             .iter()
             .map(AnchorEntry::owned_bytes)
             .chain(self.pending.iter().map(AnchorEntry::owned_bytes))
-            .try_fold(0u64, |sum, bytes| sum.checked_add(bytes))
+            .try_fold(self.committed_control_bytes(), |sum, bytes| {
+                sum.checked_add(bytes)
+            })
             .ok_or_else(|| anyhow::anyhow!("anchor owned-byte accounting overflow"))?;
         ensure!(
             recomputed == self.owned_bytes,
@@ -417,11 +539,20 @@ impl<A: AnchorEntry> AnchorStore<A> {
             .map(AnchorEntry::token_count)
             .collect()
     }
+
+    #[cfg(test)]
+    fn payload_owned_bytes(&self) -> u64 {
+        self.owned_bytes
+            .saturating_sub(self.committed_control_bytes())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AnchorEntry, AnchorStore, StagePending};
+    use super::{
+        effective_committed_depth, simultaneous_pending_capacity_slots, AnchorEntry, AnchorStore,
+        StagePending,
+    };
 
     #[derive(Default)]
     struct ReferenceStore {
@@ -538,7 +669,7 @@ mod tests {
             reference.pending
         );
         assert_eq!(store.lineage_epoch(), reference.lineage_epoch);
-        assert_eq!(store.owned_bytes(), reference.owned_bytes());
+        assert_eq!(store.payload_owned_bytes(), reference.owned_bytes());
     }
 
     #[test]
@@ -593,7 +724,7 @@ mod tests {
     fn pending_is_invisible_until_terminal_publication() {
         let mut store = AnchorStore::default();
         assert_eq!(
-            store.stage_pending(FakeAnchor::new(&[1, 2], 20), 4, 100),
+            store.stage_pending(FakeAnchor::new(&[1, 2], 20), 4, 1_000),
             StagePending::Staged
         );
         assert_eq!(deepest(&store, &[1, 2, 3]), None);
@@ -609,27 +740,122 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_budget_reduces_depth_for_wide_qwen38_without_overcommit() {
+        const MIB: u64 = 1024 * 1024;
+        let budget = 4_608 * MIB;
+        let qwen38_anchor = 151 * MIB;
+        let qwen36_anchor = 64 * MIB;
+
+        assert_eq!(effective_committed_depth(4, budget, 4, qwen38_anchor), 4);
+        assert_eq!(effective_committed_depth(4, budget, 8, qwen38_anchor), 3);
+        assert_eq!(effective_committed_depth(4, budget, 16, qwen38_anchor), 1);
+        assert_eq!(effective_committed_depth(4, budget, 16, qwen36_anchor), 4);
+
+        let n16_qwen38_charge = qwen38_anchor
+            .checked_mul(16)
+            .expect("scaled aggregate charge");
+        assert!(n16_qwen38_charge <= budget);
+        assert_eq!(
+            simultaneous_pending_capacity_slots(budget, 16, qwen38_anchor, 1),
+            14
+        );
+        assert_eq!(
+            simultaneous_pending_capacity_slots(budget, 8, qwen38_anchor, 3),
+            6
+        );
+        assert_eq!(
+            simultaneous_pending_capacity_slots(budget, 16, qwen36_anchor, 4),
+            8
+        );
+    }
+
+    #[test]
+    fn aggregate_budget_depth_fails_closed_for_invalid_or_pending_only_capacity() {
+        assert_eq!(effective_committed_depth(4, 1_000, 0, 10), 0);
+        assert_eq!(effective_committed_depth(4, 1_000, 4, 0), 0);
+        assert_eq!(effective_committed_depth(0, 1_000, 4, 10), 0);
+        assert_eq!(effective_committed_depth(4, 10, 4, 10), 0);
+    }
+
+    #[test]
+    fn aggregate_preflight_makes_n16_partial_pending_availability_explicit() {
+        let mut stores: Vec<AnchorStore<FakeAnchor>> = (0..16)
+            .map(|_| AnchorStore::with_committed_capacity(4))
+            .collect();
+        let control_bytes: u64 = stores.iter().map(AnchorStore::owned_bytes).sum();
+        let budget = control_bytes + 4_608;
+
+        for (slot, store) in stores.iter_mut().enumerate() {
+            assert_eq!(
+                store.stage_pending(FakeAnchor::new(&vec![1; slot + 1], 151), 1, budget),
+                StagePending::Staged
+            );
+            store.publish_pending(1).expect("publish N16 baseline");
+        }
+
+        let mut staged = 0usize;
+        let mut skipped = 0usize;
+        for slot in 0..stores.len() {
+            let aggregate_before: u64 = stores.iter().map(AnchorStore::owned_bytes).sum();
+            let other_owned = aggregate_before - stores[slot].owned_bytes();
+            let slot_budget = budget.saturating_sub(other_owned);
+            match stores[slot].stage_pending(
+                FakeAnchor::new(&vec![1; slot + 17], 151),
+                1,
+                slot_budget,
+            ) {
+                StagePending::Staged => staged += 1,
+                StagePending::BudgetExceeded { .. } => skipped += 1,
+                outcome => panic!("unexpected N16 stage outcome: {outcome:?}"),
+            }
+        }
+        let aggregate_after: u64 = stores.iter().map(AnchorStore::owned_bytes).sum();
+        assert_eq!(staged, 14);
+        assert_eq!(skipped, 2);
+        assert!(aggregate_after <= budget);
+    }
+
+    #[test]
     fn preflight_charges_k_committed_plus_one_pending() {
-        let mut store = AnchorStore::default();
+        let mut store = AnchorStore::with_committed_capacity(4);
+        let budget = store.owned_bytes() + 50;
         for depth in 1..=4 {
             assert_eq!(
-                store.stage_pending(FakeAnchor::new(&vec![7; depth], 10), 4, 50),
+                store.stage_pending(FakeAnchor::new(&vec![7; depth], 10), 4, budget),
                 StagePending::Staged
             );
             store.publish_pending(4).expect("publish");
         }
         assert_eq!(store.committed_bytes(), 40);
+        let owned_before_failed_preflight = store.owned_bytes();
+        let control_before_failed_preflight = store.control_owned_bytes();
         assert_eq!(
-            store.stage_pending(FakeAnchor::new(&[7; 5], 11), 4, 50),
+            store.stage_pending(FakeAnchor::new(&[7; 5], 11), 4, budget),
             StagePending::BudgetExceeded {
-                needed_bytes: 51,
-                budget_bytes: 50,
+                needed_bytes: store.committed_control_bytes() + 51,
+                budget_bytes: budget,
             }
         );
         assert_eq!(store.committed_len(), 4);
         assert!(!store.has_pending());
-        assert_eq!(store.owned_bytes(), 40);
+        assert_eq!(store.owned_bytes(), owned_before_failed_preflight);
+        assert_eq!(store.control_owned_bytes(), control_before_failed_preflight);
+        assert_eq!(store.payload_owned_bytes(), 40);
         store.validate().expect("valid store");
+    }
+
+    #[test]
+    fn zero_control_capacity_skips_without_allocating_or_exceeding_tiny_grant() {
+        let mut store = AnchorStore::with_committed_capacity(0);
+        assert_eq!(store.owned_bytes(), 0);
+        assert_eq!(
+            store.stage_pending(FakeAnchor::new(&[1], 10), 1, 1),
+            StagePending::NoCommittedCapacity
+        );
+        assert_eq!(store.owned_bytes(), 0);
+        assert_eq!(store.control_owned_bytes(), 0);
+        assert!(!store.has_pending());
+        store.validate().expect("zero-capacity store remains valid");
     }
 
     #[test]
@@ -637,13 +863,13 @@ mod tests {
         let mut store = AnchorStore::default();
         for depth in 1..=5 {
             assert_eq!(
-                store.stage_pending(FakeAnchor::new(&vec![3; depth], 10), 4, 100),
+                store.stage_pending(FakeAnchor::new(&vec![3; depth], 10), 4, 1_000),
                 StagePending::Staged
             );
             store.publish_pending(4).expect("publish");
         }
         assert_eq!(store.committed_token_counts(), vec![2, 3, 4, 5]);
-        assert_eq!(store.owned_bytes(), 40);
+        assert_eq!(store.payload_owned_bytes(), 40);
         store.validate().expect("valid store");
     }
 
@@ -652,7 +878,7 @@ mod tests {
         let mut store = AnchorStore::default();
         for tokens in [&[1, 2][..], &[1, 2, 3][..], &[1, 2, 3, 4][..]] {
             assert_eq!(
-                store.stage_pending(FakeAnchor::new(tokens, 10), 4, 100),
+                store.stage_pending(FakeAnchor::new(tokens, 10), 4, 1_000),
                 StagePending::Staged
             );
             store.publish_pending(4).expect("publish");
@@ -668,7 +894,7 @@ mod tests {
         assert_eq!(deepest(&store, &[1, 2, 3, 4, 5]), Some(0));
 
         assert_eq!(
-            store.stage_pending(FakeAnchor::new(&[1, 2, 9], 10), 4, 100),
+            store.stage_pending(FakeAnchor::new(&[1, 2, 9], 10), 4, 1_000),
             StagePending::Staged
         );
         store.publish_pending(4).expect("publish branch X");
@@ -682,20 +908,20 @@ mod tests {
         let mut store = AnchorStore::default();
         for depth in [2, 4, 6] {
             assert_eq!(
-                store.stage_pending(FakeAnchor::new(&vec![1; depth], 10), 4, 100),
+                store.stage_pending(FakeAnchor::new(&vec![1; depth], 10), 4, 1_000),
                 StagePending::Staged
             );
             store.publish_pending(4).expect("publish");
         }
         assert_eq!(
-            store.stage_pending(FakeAnchor::new(&[1; 8], 10), 4, 100),
+            store.stage_pending(FakeAnchor::new(&[1; 8], 10), 4, 1_000),
             StagePending::Staged
         );
         let result = store.cancel_request_at_cursor(4);
         assert!(result.pending_discarded);
         assert_eq!(result.pruned, 1);
         assert_eq!(store.committed_token_counts(), vec![2, 4]);
-        assert_eq!(store.owned_bytes(), 20);
+        assert_eq!(store.payload_owned_bytes(), 20);
         store.validate().expect("valid store");
     }
 
@@ -704,12 +930,12 @@ mod tests {
         for _cause in ["reset", "poison", "restore-failure"] {
             let mut store = AnchorStore::default();
             assert_eq!(
-                store.stage_pending(FakeAnchor::new(&[1, 2], 10), 4, 100),
+                store.stage_pending(FakeAnchor::new(&[1, 2], 10), 4, 1_000),
                 StagePending::Staged
             );
             store.publish_pending(4).expect("publish");
             assert_eq!(
-                store.stage_pending(FakeAnchor::new(&[1, 2, 3], 10), 4, 100),
+                store.stage_pending(FakeAnchor::new(&[1, 2, 3], 10), 4, 1_000),
                 StagePending::Staged
             );
             let prior_epoch = store.lineage_epoch();
@@ -717,7 +943,7 @@ mod tests {
             assert_eq!(cleared.committed, 1);
             assert!(cleared.pending_discarded);
             assert_ne!(store.lineage_epoch(), prior_epoch);
-            assert_eq!(store.owned_bytes(), 0);
+            assert_eq!(store.payload_owned_bytes(), 0);
             assert_eq!(deepest(&store, &[1, 2, 3]), None);
             store.validate().expect("valid store");
         }
@@ -727,13 +953,13 @@ mod tests {
         let mut store = AnchorStore::default();
         for depth in [2, 4, 6] {
             assert_eq!(
-                store.stage_pending(FakeAnchor::new(&vec![1; depth], 10), 4, 100),
+                store.stage_pending(FakeAnchor::new(&vec![1; depth], 10), 4, 1_000),
                 StagePending::Staged
             );
             store.publish_pending(4).expect("publish fixture anchor");
         }
         assert_eq!(
-            store.stage_pending(FakeAnchor::new(&[1; 8], 10), 4, 100),
+            store.stage_pending(FakeAnchor::new(&[1; 8], 10), 4, 1_000),
             StagePending::Staged
         );
         store.validate().expect("reference fixture is valid");

@@ -8385,7 +8385,28 @@ hf2q_qwen_anchor_descendants_pruned_total {}\n\
 hf2q_qwen_anchor_evictions_total {}\n\
 # HELP hf2q_qwen_anchor_peak_committed_pending_bytes Peak reclaimable anchor payload bytes in one slot store.\n\
 # TYPE hf2q_qwen_anchor_peak_committed_pending_bytes gauge\n\
-hf2q_qwen_anchor_peak_committed_pending_bytes {}\n",
+hf2q_qwen_anchor_peak_committed_pending_bytes {}\n\
+# HELP hf2q_qwen_anchor_aggregate_peak_committed_pending_bytes Peak reclaimable anchor payload bytes across all slot stores.\n\
+# TYPE hf2q_qwen_anchor_aggregate_peak_committed_pending_bytes gauge\n\
+hf2q_qwen_anchor_aggregate_peak_committed_pending_bytes {}\n\
+# HELP hf2q_qwen_anchor_aggregate_budget_bytes Aggregate reclaimable anchor-owned budget, separate from Metal KV allocation accounting.\n\
+# TYPE hf2q_qwen_anchor_aggregate_budget_bytes gauge\n\
+hf2q_qwen_anchor_aggregate_budget_bytes {}\n\
+# HELP hf2q_qwen_anchor_configured_slots Configured Qwen SlotAware concurrency.\n\
+# TYPE hf2q_qwen_anchor_configured_slots gauge\n\
+hf2q_qwen_anchor_configured_slots {}\n\
+# HELP hf2q_qwen_anchor_effective_committed_depth Effective committed anchor depth available per configured slot for the most recent capture.\n\
+# TYPE hf2q_qwen_anchor_effective_committed_depth gauge\n\
+hf2q_qwen_anchor_effective_committed_depth {}\n\
+# HELP hf2q_qwen_anchor_simultaneous_pending_capacity_slots Number of slots that can hold one pending capture concurrently after every slot reaches the reported effective committed depth.\n\
+# TYPE hf2q_qwen_anchor_simultaneous_pending_capacity_slots gauge\n\
+hf2q_qwen_anchor_simultaneous_pending_capacity_slots {}\n\
+# HELP hf2q_qwen_anchor_partial_capacity_captures_total Captures attempted while aggregate capacity could not offer default committed depth or one simultaneous pending capture to every slot.\n\
+# TYPE hf2q_qwen_anchor_partial_capacity_captures_total counter\n\
+hf2q_qwen_anchor_partial_capacity_captures_total {}\n\
+# HELP hf2q_qwen_anchor_spec_boundary_restore_tokens_total Prompt tokens whose exact speculative boundary state was accepted from an epoch-valid SlotAware anchor.\n\
+# TYPE hf2q_qwen_anchor_spec_boundary_restore_tokens_total counter\n\
+hf2q_qwen_anchor_spec_boundary_restore_tokens_total {}\n",
         qwen_anchor.captures_total.load(Ordering::Relaxed),
         qwen_anchor
             .capture_budget_skips_total
@@ -8399,6 +8420,23 @@ hf2q_qwen_anchor_peak_committed_pending_bytes {}\n",
         qwen_anchor.evictions_total.load(Ordering::Relaxed),
         qwen_anchor
             .peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .aggregate_peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        qwen_anchor.aggregate_budget_bytes.load(Ordering::Relaxed),
+        qwen_anchor.configured_slots.load(Ordering::Relaxed),
+        qwen_anchor
+            .effective_committed_depth
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .simultaneous_pending_capacity_slots
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .partial_capacity_captures_total
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .spec_boundary_restore_tokens_total
             .load(Ordering::Relaxed),
     );
     let qwen_mtp_fallback_reasons = format!(
