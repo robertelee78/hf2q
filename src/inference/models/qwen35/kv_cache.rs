@@ -1626,13 +1626,17 @@ impl HybridKvCache {
             transaction.linear_pp_flipped.len() == self.linear_attn.len(),
             "rollback_slot_transaction: linear-attention layer count mismatch"
         );
+        // Validate the complete rollback point before changing any cursor or
+        // ping-pong selector. A late validation failure must leave the live
+        // slot wholly untouched so the serving layer can safely hard-reset
+        // it instead of inheriting a partially rewound cache.
         for (layer_idx, (full, &saved)) in self
             .full_attn
-            .iter_mut()
+            .iter()
             .zip(&transaction.full_attn_current_len)
             .enumerate()
         {
-            let live = full.current_len.get_mut(slot_idx).ok_or_else(|| {
+            let live = full.current_len.get(slot_idx).ok_or_else(|| {
                 anyhow!("rollback_slot_transaction: full_attn[{layer_idx}] cursor missing")
             })?;
             anyhow::ensure!(
@@ -1640,11 +1644,10 @@ impl HybridKvCache {
                 "rollback_slot_transaction: full_attn[{layer_idx}] live cursor {} is behind saved cursor {saved}",
                 *live
             );
-            *live = saved;
         }
-        match (self.mtp_slot.as_mut(), transaction.mtp_current_len) {
+        match (self.mtp_slot.as_ref(), transaction.mtp_current_len) {
             (Some(mtp), Some(saved)) => {
-                let live = mtp.current_len.get_mut(slot_idx).ok_or_else(|| {
+                let live = mtp.current_len.get(slot_idx).ok_or_else(|| {
                     anyhow!(
                         "rollback_slot_transaction: MTP cursor missing for slot {}",
                         slot.0
@@ -1655,21 +1658,32 @@ impl HybridKvCache {
                     "rollback_slot_transaction: MTP live cursor {} is behind saved cursor {saved}",
                     *live
                 );
-                *live = saved;
             }
             (None, None) => {}
             _ => anyhow::bail!("rollback_slot_transaction: MTP presence mismatch"),
         }
-        for (layer_idx, (linear, &saved)) in self
+        for (layer_idx, linear) in self.linear_attn.iter().enumerate() {
+            linear.pp_flipped.get(slot_idx).ok_or_else(|| {
+                anyhow!("rollback_slot_transaction: linear_attn[{layer_idx}] parity missing")
+            })?;
+        }
+
+        for (full, &saved) in self
+            .full_attn
+            .iter_mut()
+            .zip(&transaction.full_attn_current_len)
+        {
+            full.current_len[slot_idx] = saved;
+        }
+        if let (Some(mtp), Some(saved)) = (self.mtp_slot.as_mut(), transaction.mtp_current_len) {
+            mtp.current_len[slot_idx] = saved;
+        }
+        for (linear, &saved) in self
             .linear_attn
             .iter_mut()
             .zip(&transaction.linear_pp_flipped)
-            .enumerate()
         {
-            let parity = linear.pp_flipped.get_mut(slot_idx).ok_or_else(|| {
-                anyhow!("rollback_slot_transaction: linear_attn[{layer_idx}] parity missing")
-            })?;
-            *parity = saved;
+            linear.pp_flipped[slot_idx] = saved;
         }
         Ok(())
     }
@@ -12200,6 +12214,62 @@ mod tests {
         assert_eq!(
             owned.as_slice::<f32>().expect("owned survives parent"),
             &[512.0, 513.0, 514.0, 515.0, 516.0, 517.0, 518.0, 519.0]
+        );
+    }
+
+    #[test]
+    fn slot_transaction_rollback_validation_is_fail_atomic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc");
+        let slot = SlotId(0);
+        cache.append_for_seq(slot, 5).expect("seed cursor");
+        let mut transaction = cache
+            .begin_slot_transaction(slot, 5)
+            .expect("capture transaction");
+
+        cache
+            .append_for_seq(slot, 2)
+            .expect("simulate target append");
+        for linear in &mut cache.linear_attn {
+            linear.pp_flipped[0] = true;
+        }
+        let cursors_before: Vec<u32> = cache
+            .full_attn
+            .iter()
+            .map(|full| full.current_len[0])
+            .collect();
+        let parities_before: Vec<bool> = cache
+            .linear_attn
+            .iter()
+            .map(|linear| linear.pp_flipped[0])
+            .collect();
+
+        // Make only the second layer invalid. A validate-as-you-mutate
+        // rollback would rewind layer zero before discovering this error.
+        transaction.full_attn_current_len[1] = cursors_before[1] + 1;
+        let error = cache
+            .rollback_slot_transaction(slot, &transaction)
+            .expect_err("late-layer cursor mismatch must fail");
+        assert!(error.to_string().contains("full_attn[1] live cursor"));
+        assert_eq!(
+            cache
+                .full_attn
+                .iter()
+                .map(|full| full.current_len[0])
+                .collect::<Vec<_>>(),
+            cursors_before,
+            "failed rollback partially rewound full-attention cursors"
+        );
+        assert_eq!(
+            cache
+                .linear_attn
+                .iter()
+                .map(|linear| linear.pp_flipped[0])
+                .collect::<Vec<_>>(),
+            parities_before,
+            "failed rollback changed DeltaNet ping-pong selection"
         );
     }
 }
