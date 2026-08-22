@@ -187,6 +187,8 @@ impl std::fmt::Debug for EngineConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfigIdentity {
     pub queue_capacity: usize,
+    pub warmup_synchronously: bool,
+    pub kv_metrics_sink: bool,
     pub engine_mode: crate::serve::api::engine::EngineMode,
     pub kv_cache_budget_bytes: Option<u64>,
     pub explicit_tokenizer: bool,
@@ -204,6 +206,8 @@ impl From<&EngineConfig> for EngineConfigIdentity {
     fn from(config: &EngineConfig) -> Self {
         Self {
             queue_capacity: config.queue_capacity,
+            warmup_synchronously: config.warmup_synchronously,
+            kv_metrics_sink: config.kv_metrics_sink.is_some(),
             engine_mode: config.engine_mode,
             kv_cache_budget_bytes: config.kv_cache_budget_bytes,
             explicit_tokenizer: config.tokenizer_path.is_some(),

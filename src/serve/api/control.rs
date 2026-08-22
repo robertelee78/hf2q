@@ -127,6 +127,8 @@ fn engine_config_identity_json(
     };
     serde_json::json!({
         "queue_capacity": identity.queue_capacity,
+        "warmup_synchronously": identity.warmup_synchronously,
+        "kv_metrics_sink": identity.kv_metrics_sink,
         "scheduler": scheduler,
         "kv_cache_budget_bytes": identity.kv_cache_budget_bytes,
         "explicit_tokenizer": identity.explicit_tokenizer,

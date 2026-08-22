@@ -659,6 +659,16 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
         resident_b.engine_config["queue_capacity"], resident_a1.engine_config["queue_capacity"],
         "queue policy changed across A -> B"
     );
+    assert_eq!(
+        resident_b.engine_config["warmup_synchronously"],
+        resident_a1.engine_config["warmup_synchronously"],
+        "warmup policy changed across A -> B"
+    );
+    assert_eq!(
+        resident_b.engine_config["kv_metrics_sink"],
+        resident_a1.engine_config["kv_metrics_sink"],
+        "KV metrics wiring changed across A -> B"
+    );
     let (status_b, body_b, inference_b) =
         rt.block_on(post_inference(&client, request_model_b, kind_b));
     assert_eq!(status_b, 200, "B inference failed: {body_b}");
