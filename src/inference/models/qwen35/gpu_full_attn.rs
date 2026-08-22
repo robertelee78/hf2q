@@ -8109,9 +8109,17 @@ pub fn apply_gated_attn_layer_decode_into(
 /// different request, selected by `slot_ids`. The canonical TQ cache kernels
 /// consume the complete multi-sequence allocation plus explicit row-to-slot
 /// and row-to-position maps, so no row can observe another request's KV.
-/// Cursor lengths must currently be equal; this keeps every row in the same
-/// flash-attention execution bucket. Callers must fall back to scalar forwards
-/// when that precondition is not met.
+/// Cursor lengths may differ. Rows must share the same flash-attention
+/// execution bucket so the shared reduction geometry remains identical to the
+/// scalar path selected for every row.
+#[inline]
+pub(crate) fn tq_decode_execution_bucket(kv_seq_len: u32) -> (bool, bool) {
+    // mlx-native selects NWG=32 above 512 tokens and NSG=4 above 1024 tokens.
+    // Environment overrides choose one process-wide value, so this default
+    // partition is conservative when an override is active.
+    (kv_seq_len > 512, kv_seq_len > 1024)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn apply_gated_attn_layer_decode_batched_into(
     enc: &mut mlx_native::CommandEncoder,
@@ -8146,7 +8154,9 @@ pub fn apply_gated_attn_layer_decode_batched_into(
         .as_ref()
         .ok_or_else(|| anyhow!("Qwen batched full-attention requires the canonical TQ cache"))?;
     let mut seen = std::collections::BTreeSet::new();
-    let mut current_len = None;
+    let mut current_lens = Vec::with_capacity(slot_ids.len());
+    let mut execution_bucket = None;
+    let mut max_kv_seq_len = 0_u32;
     for slot_id in slot_ids {
         ensure!(
             seen.insert(slot_id.0),
@@ -8167,19 +8177,24 @@ pub fn apply_gated_attn_layer_decode_batched_into(
             cursor,
             max_seq_len
         );
-        if let Some(expected) = current_len {
+        let kv_seq_len = cursor
+            .checked_add(1)
+            .context("Qwen batched full-attention cursor overflow")?;
+        let bucket = tq_decode_execution_bucket(kv_seq_len);
+        if let Some(expected) = execution_bucket {
             ensure!(
-                cursor == expected,
-                "Qwen batched full-attention requires equal cursors; slot {} has {}, expected {}",
+                bucket == expected,
+                "Qwen batched full-attention execution-bucket mismatch; slot {} has cursor {}",
                 slot_id.0,
-                cursor,
-                expected
+                cursor
             );
         } else {
-            current_len = Some(cursor);
+            execution_bucket = Some(bucket);
         }
+        current_lens.push(cursor);
+        max_kv_seq_len = max_kv_seq_len.max(kv_seq_len);
     }
-    let current_len = current_len.expect("non-empty slot_ids checked above");
+    debug_assert!(execution_bucket.is_some());
 
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;
@@ -8305,7 +8320,7 @@ pub fn apply_gated_attn_layer_decode_batched_into(
     position_buf
         .as_mut_slice::<u32>()
         .map_err(|error| anyhow!("Qwen batched full-attention position map: {error}"))?
-        .fill(current_len);
+        .copy_from_slice(&current_lens);
 
     let codebook_bits = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
     let codebook_bits = if matches!(codebook_bits, 5 | 6 | 8) {
@@ -8376,12 +8391,13 @@ pub fn apply_gated_attn_layer_decode_batched_into(
         vec![tmp_bytes / std::mem::size_of::<f32>()],
     )
     .map_err(|error| anyhow!("Qwen batched attention scratch allocation: {error}"))?;
-    let kv_seq_len = current_len + 1;
     let params = mlx_native::ops::flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
         num_heads: n_heads,
         num_kv_heads: n_kv_heads,
         head_dim,
-        kv_seq_len,
+        // The batched kernel reads each row's real length from position_buf.
+        // This maximum selects the one execution bucket shared by the cohort.
+        kv_seq_len: max_kv_seq_len,
         kv_capacity: max_seq_len,
         scale: 1.0 / (head_dim as f32).sqrt(),
         mask_type: 0,
@@ -8391,7 +8407,7 @@ pub fn apply_gated_attn_layer_decode_batched_into(
         scale_factor_d512: 1.0,
         codebook_bits,
         fuse_fwht_pre: 0,
-        nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(kv_seq_len),
+        nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(max_kv_seq_len),
     };
     mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_batched(
         enc,
@@ -8431,8 +8447,8 @@ pub fn apply_gated_attn_layer_decode_batched_into(
         hidden_size,
     )?;
 
-    for slot_id in slot_ids {
-        slot.current_len[slot_id.0 as usize] = kv_seq_len;
+    for (slot_id, current_len) in slot_ids.iter().zip(current_lens) {
+        slot.current_len[slot_id.0 as usize] = current_len + 1;
     }
     Ok(out)
 }
@@ -8444,6 +8460,14 @@ pub fn apply_gated_attn_layer_decode_batched_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tq_decode_execution_buckets_pin_geometry_boundaries() {
+        assert_eq!(tq_decode_execution_bucket(512), (false, false));
+        assert_eq!(tq_decode_execution_bucket(513), (true, false));
+        assert_eq!(tq_decode_execution_bucket(1024), (true, false));
+        assert_eq!(tq_decode_execution_bucket(1025), (true, true));
+    }
 
     #[test]
     fn fresh_short_d256_prefill_selects_finite_vector_route() {

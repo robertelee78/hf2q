@@ -1206,7 +1206,11 @@ fn is_greedy_eligible(params: &SamplingParams) -> bool {
     !(params.temperature > 0.0
         || params.top_k > 0
         || params.top_p < 1.0
-        || effective_repetition_penalty(params) != 1.0
+        // The server-wide loop-mitigation default is sampling-only. A client
+        // that requested the ordinary T=0 defaults remains true greedy and
+        // never reaches a sampler; only an explicit request penalty changes
+        // that contract.
+        || params.repetition_penalty != 1.0
         || params.seed.is_some()
         || params.logprobs
         || !params.logit_bias.is_empty()
@@ -10589,6 +10593,25 @@ mod tests {
         grammar.grammar =
             Some(crate::serve::api::grammar::parse("root ::= \"a\"\n").expect("test grammar"));
         assert!(!is_greedy_eligible(&grammar));
+    }
+
+    #[test]
+    fn gpu_greedy_gate_reads_the_request_penalty_not_the_server_default() {
+        let source = include_str!("engine_qwen35.rs");
+        let start = source
+            .find("fn is_greedy_eligible(")
+            .expect("greedy predicate");
+        let end = start
+            + source[start..]
+                .find("\n}\n\n/// Server-complete semantics gate")
+                .expect("end of greedy predicate")
+            + 2;
+        let predicate = &source[start..end];
+        assert!(predicate.contains("params.repetition_penalty != 1.0"));
+        assert!(
+            !predicate.contains("effective_repetition_penalty(params)"),
+            "server default must not silently turn a T=0 request into sampling"
+        );
     }
 
     #[test]

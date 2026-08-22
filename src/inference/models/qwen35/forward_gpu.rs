@@ -6263,7 +6263,9 @@ impl Qwen35Model {
             || self.layers.iter().any(|layer| {
                 !matches!(
                     layer.ffn(),
-                    Qwen35FfnWeights::DenseQ(_) | Qwen35FfnWeights::Dense(_)
+                    Qwen35FfnWeights::DenseQ(_)
+                        | Qwen35FfnWeights::DenseNative(_)
+                        | Qwen35FfnWeights::Dense(_)
                 )
             })
             || kv_cache.full_attn.is_empty()
@@ -6273,8 +6275,9 @@ impl Qwen35Model {
         }
 
         let mut seen = std::collections::BTreeSet::new();
-        let mut common_cursor = None;
-        for slot_id in slot_ids {
+        let mut slot_cursors = vec![None; slot_ids.len()];
+        let mut common_bucket = None;
+        for (row, slot_id) in slot_ids.iter().enumerate() {
             let slot_idx = slot_id.0 as usize;
             if slot_id.0 >= kv_cache.n_seqs || !seen.insert(slot_id.0) {
                 return false;
@@ -6286,11 +6289,21 @@ impl Qwen35Model {
                 if cursor >= kv_cache.max_seq_len {
                     return false;
                 }
-                match common_cursor {
-                    None => common_cursor = Some(cursor),
+                match slot_cursors[row] {
+                    None => slot_cursors[row] = Some(cursor),
                     Some(expected) if expected == cursor => {}
                     Some(_) => return false,
                 }
+            }
+            let Some(kv_seq_len) = slot_cursors[row].and_then(|cursor| cursor.checked_add(1))
+            else {
+                return false;
+            };
+            let bucket = super::gpu_full_attn::tq_decode_execution_bucket(kv_seq_len);
+            match common_bucket {
+                None => common_bucket = Some(bucket),
+                Some(expected) if expected == bucket => {}
+                Some(_) => return false,
             }
         }
         true
@@ -8780,6 +8793,74 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn ordinary_physical_batch_preserves_staggered_slot_trajectories() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        if std::env::var_os("HF2Q_LEGACY_PER_LAYER_CB").is_some() {
+            return;
+        }
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let cfg = physical_batch_hybrid_cfg();
+        let model = deterministic_dense_model(cfg.clone());
+        let slot_ids = [SlotId(0), SlotId(1), SlotId(2), SlotId(3)];
+        let cursors = [1_u32, 3, 5, 7];
+        let mut scalar_cache =
+            HybridKvCache::new_with_options(&cfg, &device, 32, 4, true).expect("scalar cache");
+        let mut batch_cache =
+            HybridKvCache::new_with_options(&cfg, &device, 32, 4, true).expect("batch cache");
+
+        // Establish byte-equal but differently-sized prefixes in both caches.
+        for (row, (&slot_id, &cursor)) in slot_ids.iter().zip(&cursors).enumerate() {
+            for position in 0..cursor {
+                let token = 3 + ((row as u32 * 11 + position) % (cfg.vocab_size - 3));
+                let positions = [position as i32; 4];
+                model
+                    .forward_gpu_greedy(&[token], &positions, &mut scalar_cache, slot_id)
+                    .expect("prime scalar cache");
+                model
+                    .forward_gpu_greedy(&[token], &positions, &mut batch_cache, slot_id)
+                    .expect("prime batch cache");
+            }
+        }
+        assert!(model.can_forward_gpu_greedy_multi_slot(&batch_cache, &slot_ids));
+
+        let inputs: Vec<u32> = (0..4).map(|row| 67 + row as u32).collect();
+        let mut expected = Vec::with_capacity(4);
+        for row in 0..4 {
+            expected.push(
+                model
+                    .forward_gpu_greedy(
+                        &[inputs[row]],
+                        &[cursors[row] as i32; 4],
+                        &mut scalar_cache,
+                        slot_ids[row],
+                    )
+                    .expect("staggered scalar target"),
+            );
+        }
+        let mut positions = Vec::with_capacity(16);
+        for _axis in 0..4 {
+            positions.extend(cursors.iter().map(|&cursor| cursor as i32));
+        }
+        let actual = model
+            .forward_gpu_greedy_multi_slot(&inputs, &positions, &mut batch_cache, &slot_ids)
+            .expect("staggered physical target");
+        assert_eq!(actual, expected, "staggered physical tokens diverged");
+        for (scalar, physical) in scalar_cache.full_attn.iter().zip(&batch_cache.full_attn) {
+            assert_eq!(scalar.current_len, physical.current_len);
+        }
+        for (scalar, physical) in scalar_cache
+            .linear_attn
+            .iter()
+            .zip(&batch_cache.linear_attn)
+        {
+            assert_eq!(scalar.pp_flipped, physical.pp_flipped);
         }
     }
 
