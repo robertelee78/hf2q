@@ -65,7 +65,8 @@
 #                           packed/norm buffers carry an outer slot axis and
 #                           zero-copy Metal views select the active agent.
 #   --kv-cache-budget-bytes Shared physical high-water across the full-context
-#                           slots. MAX_SLOTS=8 is the np8-like setting.
+#                           slots. MAX_SLOTS=16 is the largest physical-decode
+#                           gate width.
 #
 # Family contract and prefix-cache stack:
 #   * The loader uses the GGUF-embedded Qwen ChatML template and validates its
@@ -103,8 +104,8 @@ if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
     echo "PORT must be an integer from 1 through 65535 (got: $PORT)" >&2
     exit 3
 fi
-if ! [[ "$MAX_SLOTS" =~ ^[0-9]+$ ]] || (( MAX_SLOTS < 1 || MAX_SLOTS > 8 )); then
-    echo "MAX_SLOTS must be from 1 through 8 (got: $MAX_SLOTS)" >&2
+if ! [[ "$MAX_SLOTS" =~ ^[0-9]+$ ]] || (( MAX_SLOTS < 1 || MAX_SLOTS > 16 )); then
+    echo "MAX_SLOTS must be from 1 through 16 (got: $MAX_SLOTS)" >&2
     exit 3
 fi
 if ! [[ "$KV_CACHE_BUDGET_BYTES" =~ ^[0-9]+$ ]] || (( KV_CACHE_BUDGET_BYTES < 1 )); then
