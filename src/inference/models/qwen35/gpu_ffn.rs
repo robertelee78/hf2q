@@ -62,6 +62,7 @@
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
@@ -220,7 +221,7 @@ fn dispatch_moe_id_routed(
 
 use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeFfnShape, MoeFfnWeights};
 use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32, upload_f32_weight};
-use super::weight_loader::DenseFfnWeightsQ;
+use super::weight_loader::{DenseFfnWeightsNative, DenseFfnWeightsQ};
 
 // ================================================================
 // GPU weight containers
@@ -247,6 +248,16 @@ impl DenseFfnWeightsGpu {
             up: upload_f32_weight(&weights.up, device)?,
             down: upload_f32_weight(&weights.down, device)?,
         })
+    }
+
+    /// Retain native scalar GGUF buffers by ARC-cloning their Metal handles.
+    /// No weight bytes are copied or converted.
+    pub fn from_native(weights: &DenseFfnWeightsNative) -> Self {
+        Self {
+            gate: weights.gate.clone(),
+            up: weights.up.clone(),
+            down: weights.down.clone(),
+        }
     }
 }
 
@@ -533,16 +544,23 @@ fn proj(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
-    if weight.dtype() == DType::F32 {
-        let out_bytes = (seq_len * out_features) as usize * 4;
-        let dst = device
-            .alloc_buffer(
-                out_bytes,
-                DType::F32,
-                vec![seq_len as usize, out_features as usize],
-            )
-            .map_err(|e| anyhow!("alloc F32 proj dst: {e}"))?;
-        dense_matmul_f32_f32_tensor(
+    // NOT pooled — `proj` is called from both `build_moe_ffn_layer_gpu` (the
+    // unquantized path, which downloads router logits via `download_f32` →
+    // `as_slice` → reads full `byte_len()`) AND `build_moe_ffn_layer_gpu_q`
+    // (the quantized path, which keeps the buffer on GPU).  The pool's
+    // power-of-two bucket rounding would inflate `byte_len()` beyond the
+    // requested shape and break the unquantized path.
+    let out_bytes = (seq_len * out_features) as usize * 4;
+    let dst = device
+        .alloc_buffer(
+            out_bytes,
+            DType::F32,
+            vec![seq_len as usize, out_features as usize],
+        )
+        .map_err(|e| anyhow!("alloc proj dst: {e}"))?;
+
+    match weight.dtype() {
+        DType::F32 => dense_matmul_f32_f32_tensor(
             encoder,
             registry,
             device,
@@ -557,101 +575,44 @@ fn proj(
                 src1_batch: 1,
             },
         )
-        .context("dense_matmul_f32_f32_tensor proj")?;
-        return Ok(dst);
-    }
-    let n_w = (out_features * in_features) as usize;
-
-    // If the weight is already BF16 (pre-cast at load time), use it directly;
-    // otherwise cast inline and barrier before the matmul. weight_bf16_owned
-    // holds the cast buffer alive for the function scope when we cast; in
-    // the BF16-already branch it's never assigned (and never read past the
-    // if-else, so Rust accepts the partial initialization).
-    let weight_bf16_owned: MlxBuffer;
-    let weight_bf16: &MlxBuffer = if weight.dtype() == DType::BF16 {
-        weight
-    } else {
-        // ADR-015 iter14: scratch-lift — `proj`'s F32-legacy weight cast
-        // is exactly the helper-allocated transient pattern the iter13
-        // unretained-refs docstring at `mlx-native/src/encoder.rs:419-444`
-        // warned about: `proj()` allocates `buf`, dispatches into it,
-        // returns BEFORE the caller commits the encoder (caller commits
-        // in the FFN encoder which runs the matmul that READS `buf`).
-        // Under retained refs the encoder's CB ARC keeps `buf` alive;
-        // under unretained refs only the local `weight_bf16_owned` ARC
-        // does, so we hand out a pool-anchored buffer.  At iter14 base
-        // this branch only fires for F32 weights (Qwen3.6 dwq46 is Q4_0
-        // U8, so this is a no-op on the apex fixture); lifted for
-        // forward-compatibility and to remove the pattern entirely.
-        let buf = super::decode_pool::pooled_alloc_buffer(
-            device,
-            n_w * 2,
-            DType::BF16,
-            vec![out_features as usize, in_features as usize],
-        )
-        .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
-        cast(
+        .context("native F32 dense projection")?,
+        DType::F16 => dense_matmul_f16_f32_tensor(
             encoder,
             registry,
-            device.metal_device(),
+            device,
             weight,
-            &buf,
-            n_w,
-            CastDirection::F32ToBF16,
-        )
-        .context("cast weight F32→BF16")?;
-        // Barrier: matmul reads weight_bf16 written by the cast above.
-        encoder.memory_barrier();
-        weight_bf16_owned = buf;
-        &weight_bf16_owned
-    };
-
-    // NOT pooled — `proj` is called from both `build_moe_ffn_layer_gpu` (the
-    // unquantized path, which downloads router logits via `download_f32` →
-    // `as_slice` → reads full `byte_len()`) AND `build_moe_ffn_layer_gpu_q`
-    // (the quantized path, which keeps the buffer on GPU).  The pool's
-    // power-of-two bucket rounding would inflate `byte_len()` beyond the
-    // requested shape and break the unquantized path.
-    let out_bytes = (seq_len * out_features) as usize * 4;
-    let mut dst = device
-        .alloc_buffer(
-            out_bytes,
-            DType::F32,
-            vec![seq_len as usize, out_features as usize],
-        )
-        .map_err(|e| anyhow!("alloc proj dst: {e}"))?;
-
-    let params = DenseMmBf16F32Params {
-        m: seq_len,
-        n: out_features,
-        k: in_features,
-        src0_batch: 1,
-        src1_batch: 1,
-    };
-    if seq_len == 1 {
-        // GEMV path for single-token decode — bandwidth-optimized, ~2× faster
-        // than tiled MM for M=1 on Apple Silicon.
-        dense_gemv_bf16_f32(
-            encoder,
-            registry,
-            device,
-            weight_bf16,
             input,
-            &mut dst,
-            &params,
+            &dst,
+            &DenseMmF16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            },
         )
-        .context("dense_gemv_bf16_f32 proj M=1")?;
-    } else {
-        dense_matmul_bf16_f32_tensor(
-            encoder,
-            registry,
-            device,
-            weight_bf16,
-            input,
-            &mut dst,
-            &params,
-        )
-        .context("dense_matmul_bf16_f32_tensor")?;
+        .context("native F16 dense projection")?,
+        DType::BF16 => {
+            let params = DenseMmBf16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            if seq_len == 1 {
+                dense_gemv_bf16_f32(encoder, registry, device, weight, input, &dst, &params)
+                    .context("native BF16 dense projection M=1")?;
+            } else {
+                dense_matmul_bf16_f32_tensor(
+                    encoder, registry, device, weight, input, &dst, &params,
+                )
+                .context("native BF16 dense projection M>1")?;
+            }
+        }
+        dtype => anyhow::bail!(
+            "dense scalar projection weight has unsupported storage {dtype:?}; refusing weight conversion"
+        ),
     }
     Ok(dst)
 }
@@ -3625,6 +3586,82 @@ mod tests {
             assert!(
                 err < 1e-3,
                 "single-token dense i={i}: gpu={g}, cpu={c}, err={err}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_swiglu_native_f16_executes_decode_and_batch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        let mut registry = KernelRegistry::new();
+        let shape = DenseFfnShape {
+            hidden_size: 32,
+            intermediate_size: 64,
+        };
+        let h = shape.hidden_size as usize;
+        let intermediate = shape.intermediate_size as usize;
+        let mut seed = 0xF160_u32;
+
+        let round_to_f16 = |values: Vec<f32>| {
+            values
+                .into_iter()
+                .map(|value| half::f16::from_f32(value).to_f32())
+                .collect::<Vec<_>>()
+        };
+        let weights_cpu = DenseFfnWeights {
+            gate: round_to_f16(mk_rand(&mut seed, intermediate * h, 0.08)),
+            up: round_to_f16(mk_rand(&mut seed, intermediate * h, 0.08)),
+            down: round_to_f16(mk_rand(&mut seed, h * intermediate, 0.08)),
+        };
+        let upload_native_f16 = |values: &[f32], rows: usize, cols: usize| {
+            let packed: Vec<half::f16> = values
+                .iter()
+                .map(|&value| half::f16::from_f32(value))
+                .collect();
+            let mut buffer = device
+                .alloc_buffer(
+                    packed.len() * std::mem::size_of::<half::f16>(),
+                    DType::F16,
+                    vec![rows, cols],
+                )
+                .expect("allocate native F16 dense weight");
+            buffer
+                .as_mut_slice::<half::f16>()
+                .expect("map native F16 dense weight")
+                .copy_from_slice(&packed);
+            buffer
+        };
+        let weights_gpu = DenseFfnWeightsGpu {
+            gate: upload_native_f16(&weights_cpu.gate, intermediate, h),
+            up: upload_native_f16(&weights_cpu.up, intermediate, h),
+            down: upload_native_f16(&weights_cpu.down, h, intermediate),
+        };
+
+        for seq_len in [1_usize, 2] {
+            let input = mk_rand(&mut seed, seq_len * h, 0.25);
+            let expected = dense_swiglu_cpu_ref(&input, &weights_cpu, shape);
+            let input_gpu = upload_f32(&input, &device).expect("upload native F16 FFN input");
+            let output_gpu = build_dense_ffn_layer_gpu(
+                &device,
+                &mut registry,
+                &input_gpu,
+                &weights_gpu,
+                shape,
+                None,
+            )
+            .expect("execute native F16 dense FFN");
+            let actual = download_f32(&output_gpu).expect("download native F16 FFN output");
+            assert_eq!(actual.len(), expected.len());
+            assert!(actual.iter().all(|value| value.is_finite()));
+            let max_error = actual
+                .iter()
+                .zip(expected.iter())
+                .map(|(&actual, &expected)| (actual - expected).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_error < 1e-3,
+                "native F16 dense FFN M={seq_len} max error {max_error:.3e}"
             );
         }
     }

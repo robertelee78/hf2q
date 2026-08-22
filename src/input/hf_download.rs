@@ -548,13 +548,6 @@ fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<St
         );
     }
     let quant_hint = infer_filename_quant(stem);
-    if quant_hint.as_deref() == Some("BF16") {
-        return (
-            "text_model",
-            quant_hint,
-            Some("BF16 GGUF weights are not supported by the current mlx-native loader".to_owned()),
-        );
-    }
     if quant_hint.is_none() {
         return (
             "text_model",
@@ -1436,6 +1429,7 @@ mod tests {
     #[test]
     fn mixed_repository_ggufs_are_classified_without_source_fallback() {
         for (filename, quant) in [
+            ("gguf/model-bf16.gguf", "BF16"),
             ("gguf/model-q3_k_m.gguf", "Q3_K_M"),
             ("gguf/model-q4_k_m.gguf", "Q4_K_M"),
             ("gguf/model-q5_k_m.gguf", "Q5_K_M"),
@@ -1450,9 +1444,6 @@ mod tests {
         let mmproj = classify_hub_gguf("gguf/mmproj-model-f16.gguf");
         assert_eq!(mmproj.0, "companion");
         assert!(mmproj.2.unwrap().contains("not a text model"));
-        let bf16 = classify_hub_gguf("gguf/model-bf16.gguf");
-        assert_eq!(bf16.1.as_deref(), Some("BF16"));
-        assert!(bf16.2.unwrap().contains("not supported"));
         let split = classify_hub_gguf("model-q6_k-00001-of-00002.gguf");
         assert!(split.2.unwrap().contains("split GGUF"));
     }

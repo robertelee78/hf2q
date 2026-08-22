@@ -17,12 +17,27 @@ use super::full_attn::FullAttnLayerWeights;
 use super::gpu_delta_net::DeltaNetWeightsGpu;
 use super::gpu_full_attn::FullAttnWeightsGpu;
 use super::mtp::{load_mtp_weights_if_present_with_shared_head, MtpWeights};
-use super::weight_loader::{DenseFfnWeightsQ, MoeFfnWeightsQ};
+use super::weight_loader::{DenseFfnWeightsNative, DenseFfnWeightsQ, MoeFfnWeightsQ};
 use super::{weight_loader, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
 use crate::serve::forward_mlx_shared::MlxQWeight;
 
 use mlx_native::gguf::GgufFile;
 use mlx_native::MlxDevice;
+
+/// Qwen consumes exact native GGUF blocks and never opts into the shared
+/// F16-shadow optimization. Keep this assertion at the architecture boundary
+/// so a future change to the generic weight constructor cannot silently add a
+/// dequantized shadow to Qwen weights.
+pub(super) fn ensure_qwen_native_weight_has_no_f16_shadow(
+    tensor_name: &str,
+    weight: &MlxQWeight,
+) -> Result<()> {
+    ensure!(
+        weight.f16_shadow.is_none(),
+        "Qwen native tensor '{tensor_name}' unexpectedly carries a dequantized F16 shadow"
+    );
+    Ok(())
+}
 
 // ================================================================
 // Layer weight enums
@@ -33,6 +48,8 @@ use mlx_native::MlxDevice;
 /// expert. Exactly one variant is populated per layer per model.
 pub enum Qwen35FfnWeights {
     Dense(DenseFfnWeights),
+    /// Production dense SwiGLU with F32/F16/BF16 GGUF storage retained.
+    DenseNative(DenseFfnWeightsNative),
     /// Quantized dense SwiGLU weights loaded directly from GGUF (production path).
     /// Gate/up/down tensors stay in GGML block format on the Metal device;
     /// no F32 expansion occurs during load. Used for 27B dense DWQ GGUFs.
@@ -49,6 +66,7 @@ impl Qwen35FfnWeights {
     pub fn variant(&self) -> &'static str {
         match self {
             Qwen35FfnWeights::Dense(_) => "dense",
+            Qwen35FfnWeights::DenseNative(_) => "dense-native",
             Qwen35FfnWeights::DenseQ(_) => "dense-q",
             Qwen35FfnWeights::Moe(_) => "moe",
             Qwen35FfnWeights::MoeQ(_) => "moe-q",
@@ -326,6 +344,15 @@ impl Qwen35Model {
     ) -> Result<Self> {
         let mut cfg = Self::load_config_only(gguf)?;
 
+        // Dense Qwen admission is tensor- and operation-specific. Run it
+        // before Metal device creation so an unsupported embedding, output
+        // head, projection, or FFN codec cannot partially allocate a model or
+        // trigger a storage substitution later in the load.
+        if cfg.variant == Qwen35Variant::Dense {
+            super::gguf_preflight::preflight_dense_qwen35_gguf(gguf, &cfg)
+                .context("preflight dense Qwen GGUF execution")?;
+        }
+
         let device =
             MlxDevice::new().map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
 
@@ -333,6 +360,7 @@ impl Qwen35Model {
         let token_embd_native =
             crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "token_embd.weight", &device)
                 .context("load native token_embd.weight")?;
+        ensure_qwen_native_weight_has_no_f16_shadow("token_embd.weight", &token_embd_native)?;
         super::forward_gpu::ensure_native_embedding_admitted(&token_embd_native)
             .context("admit native token_embd.weight execution")?;
         super::weight_pool::register_weight_buffer(&device, &token_embd_native.buffer)
@@ -352,6 +380,7 @@ impl Qwen35Model {
             let output =
                 crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "output.weight", &device)
                     .context("load native output.weight")?;
+            ensure_qwen_native_weight_has_no_f16_shadow("output.weight", &output)?;
             super::weight_pool::register_weight_buffer(&device, &output.buffer)
                 .context("register native output.weight")?;
             #[cfg(test)]
@@ -1335,18 +1364,16 @@ mod tests {
         use crate::serve::gpu::QuantWeightInfo;
         use mlx_native::DType;
 
-        let (dtype, bytes) = if kind == mlx_native::GgmlType::F32 {
-            (DType::F32, rows * cols * std::mem::size_of::<f32>())
-        } else {
-            (
-                DType::U8,
-                usize::try_from(
-                    mlx_native::ggml_matrix_bytes(kind, rows as u32, cols as u32)
-                        .expect("derive exact test GGUF bytes"),
-                )
-                .expect("test GGUF bytes fit usize"),
-            )
+        let dtype = match kind {
+            mlx_native::GgmlType::F32 => DType::F32,
+            mlx_native::GgmlType::F16 => DType::F16,
+            mlx_native::GgmlType::BF16 => DType::BF16,
+            _ => DType::U8,
         };
+        let bytes = crate::inference::models::qwen35::forward_gpu::native_matrix_storage_bytes(
+            kind, rows, cols,
+        )
+        .expect("derive exact test GGUF bytes");
         MlxQWeight {
             buffer: device
                 .alloc_buffer(bytes, dtype, vec![bytes / dtype.size_of()])
@@ -1375,6 +1402,8 @@ mod tests {
             mlx_native::GgmlType::Q6_K,
             mlx_native::GgmlType::Q8_0,
             mlx_native::GgmlType::F32,
+            mlx_native::GgmlType::F16,
+            mlx_native::GgmlType::BF16,
         ] {
             let weight = native_test_qweight_for_type(&device, 256, 256, kind);
             crate::inference::models::qwen35::forward_gpu::ensure_native_embedding_admitted(
@@ -1382,16 +1411,6 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{kind:?} must be admitted: {error:#}"));
         }
-        let mut weight = native_test_qweight(&device, 256, 256);
-        weight.info.ggml_dtype = mlx_native::GgmlType::F16;
-        let error =
-            crate::inference::models::qwen35::forward_gpu::ensure_native_embedding_admitted(
-                &weight,
-            )
-            .expect_err("F16 has no native embedding route");
-        assert!(error
-            .to_string()
-            .contains("unsupported direct-gather type F16"));
     }
 
     fn zero_layer_native_gguf(output_rows: Option<usize>) -> tempfile::NamedTempFile {

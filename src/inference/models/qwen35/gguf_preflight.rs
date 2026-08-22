@@ -1,0 +1,489 @@
+//! Payload- and Metal-device-free GGUF execution preflight for dense
+//! Qwen3.5-family models.
+//!
+//! A GGUF's `general.file_type` is only a summary: mixed artifacts can place
+//! different codecs on embeddings, attention projections, FFN projections,
+//! and the output head. Production admission therefore follows the exact
+//! tensor role consumed by the Qwen graph. This module reads tensor-directory
+//! metadata only; it never creates a Metal device or loads tensor payloads.
+
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use mlx_native::gguf::{GgufFile, TensorInfo};
+use mlx_native::{
+    GgmlCapabilityRequest, GgmlInvocation, GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
+};
+
+use super::{Qwen35Config, Qwen35LayerKind, Qwen35Variant};
+
+mod contract;
+use contract::{
+    admit_mtp_tensor_presence, admit_storage_for_role, Qwen35GgufPreflightReceipt, TensorRole,
+    TensorStorage,
+};
+
+fn checked_tensor_bytes(info: &TensorInfo) -> Result<usize> {
+    let (&inner, outer) = info
+        .shape
+        .split_last()
+        .ok_or_else(|| anyhow!("tensor '{}' has an empty shape", info.name))?;
+    let block_values = info.ggml_type.block_values() as usize;
+    ensure!(
+        inner > 0 && !outer.contains(&0),
+        "tensor '{}' has a zero dimension in {:?}",
+        info.name,
+        info.shape
+    );
+    ensure!(
+        inner % block_values == 0,
+        "tensor '{}' innermost dimension {inner} is not aligned to {:?}'s {block_values}-value blocks",
+        info.name,
+        info.ggml_type
+    );
+    outer
+        .iter()
+        .try_fold(inner / block_values, |elements, dim| {
+            elements.checked_mul(*dim)
+        })
+        .and_then(|blocks| blocks.checked_mul(info.ggml_type.block_bytes() as usize))
+        .ok_or_else(|| anyhow!("tensor '{}' byte length overflows usize", info.name))
+}
+
+fn require_tensor<'a>(
+    gguf: &'a GgufFile,
+    name: &str,
+    expected_shape: &[usize],
+    role: TensorRole,
+    receipt: &mut Qwen35GgufPreflightReceipt,
+) -> Result<&'a TensorInfo> {
+    let info = gguf
+        .tensor_info(name)
+        .ok_or_else(|| anyhow!("Qwen GGUF preflight: required tensor '{name}' is missing"))?;
+    ensure!(
+        info.shape == expected_shape,
+        "Qwen GGUF preflight: tensor '{name}' shape {:?} != expected {:?}",
+        info.shape,
+        expected_shape
+    );
+    let expected_bytes = checked_tensor_bytes(info)?;
+    ensure!(
+        info.byte_len == expected_bytes,
+        "Qwen GGUF preflight: tensor '{name}' byte length {} != {expected_bytes} for {:?} shape {:?}",
+        info.byte_len,
+        info.ggml_type,
+        info.shape
+    );
+    admit_storage_for_role(name, role, TensorStorage::Parsed(info.ggml_type))?;
+    receipt.record(role, TensorStorage::Parsed(info.ggml_type));
+    Ok(info)
+}
+
+fn require_f32(
+    gguf: &GgufFile,
+    name: &str,
+    shape: &[usize],
+    receipt: &mut Qwen35GgufPreflightReceipt,
+) -> Result<()> {
+    require_tensor(gguf, name, shape, TensorRole::F32State, receipt)?;
+    Ok(())
+}
+
+fn ensure_dense_capability(name: &str, info: &TensorInfo) -> Result<()> {
+    let [rows, cols] = info.shape.as_slice() else {
+        bail!(
+            "Qwen GGUF preflight: dense tensor '{name}' must be rank 2, got {:?}",
+            info.shape
+        );
+    };
+    let n = u32::try_from(*rows).context("Qwen dense projection rows exceed u32")?;
+    let k = u32::try_from(*cols).context("Qwen dense projection cols exceed u32")?;
+    for (m, workload) in [
+        (1, GgmlWorkloadClass::DecodeSingle),
+        (2, GgmlWorkloadClass::ContinuousWidth),
+        (4, GgmlWorkloadClass::ContinuousWidth),
+        (8, GgmlWorkloadClass::ContinuousWidth),
+        (16, GgmlWorkloadClass::Prompt),
+        (17, GgmlWorkloadClass::Prompt),
+    ] {
+        let capability = mlx_native::ggml_capability(GgmlCapabilityRequest {
+            schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
+            invocation: GgmlInvocation::DenseAuto { m, n, k },
+            ggml_type: info.ggml_type,
+            workload,
+            routing: mlx_native::ggml_routing_policy_from_environment(),
+        });
+        ensure!(
+            capability.executable,
+            "Qwen GGUF preflight: tensor '{name}' type {:?} is not executable at M={m} ({workload:?}): {}",
+            info.ggml_type,
+            capability.diagnostic
+        );
+    }
+    Ok(())
+}
+
+fn require_projection(
+    gguf: &GgufFile,
+    name: &str,
+    shape: &[usize],
+    receipt: &mut Qwen35GgufPreflightReceipt,
+) -> Result<()> {
+    let info = require_tensor(gguf, name, shape, TensorRole::DenseProjection, receipt)?;
+    ensure_dense_capability(name, info)
+}
+
+fn require_embedding(
+    gguf: &GgufFile,
+    name: &str,
+    hidden: usize,
+    receipt: &mut Qwen35GgufPreflightReceipt,
+) -> Result<usize> {
+    let info = gguf
+        .tensor_info(name)
+        .ok_or_else(|| anyhow!("Qwen GGUF preflight: required tensor '{name}' is missing"))?;
+    ensure!(
+        info.shape.len() == 2 && info.shape[1] == hidden,
+        "Qwen GGUF preflight: tensor '{name}' shape {:?} is not [rows,{hidden}]",
+        info.shape
+    );
+    let rows = info.shape[0];
+    require_tensor(gguf, name, &[rows, hidden], TensorRole::Embedding, receipt)?;
+
+    let capability = mlx_native::ggml_capability(GgmlCapabilityRequest {
+        schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
+        invocation: GgmlInvocation::EmbeddingGather {
+            n_tokens: 1,
+            vocab_size: u32::try_from(rows).context("Qwen embedding rows exceed u32")?,
+            embed_dim: u32::try_from(hidden).context("Qwen embedding width exceeds u32")?,
+        },
+        ggml_type: info.ggml_type,
+        workload: GgmlWorkloadClass::Embedding,
+        routing: mlx_native::ggml_routing_policy_from_environment(),
+    });
+    ensure!(
+        capability.executable,
+        "Qwen GGUF preflight: tensor '{name}' type {:?} has no native embedding route: {}",
+        info.ggml_type,
+        capability.diagnostic
+    );
+    Ok(rows)
+}
+
+fn require_dense_ffn(
+    gguf: &GgufFile,
+    layer_index: u32,
+    hidden: usize,
+    intermediate: usize,
+    receipt: &mut Qwen35GgufPreflightReceipt,
+) -> Result<()> {
+    let prefix = format!("blk.{layer_index}");
+    let gate_name = format!("{prefix}.ffn_gate.weight");
+    let up_name = format!("{prefix}.ffn_up.weight");
+    let down_name = format!("{prefix}.ffn_down.weight");
+    let gate = require_tensor(
+        gguf,
+        &gate_name,
+        &[intermediate, hidden],
+        TensorRole::FfnGateUp,
+        receipt,
+    )?;
+    let up = require_tensor(
+        gguf,
+        &up_name,
+        &[intermediate, hidden],
+        TensorRole::FfnGateUp,
+        receipt,
+    )?;
+    let down = require_tensor(
+        gguf,
+        &down_name,
+        &[hidden, intermediate],
+        TensorRole::FfnDown,
+        receipt,
+    )?;
+
+    super::weight_loader::dense_ffn_storage(
+        layer_index,
+        gate.ggml_type,
+        up.ggml_type,
+        down.ggml_type,
+    )
+    .with_context(|| format!("Qwen GGUF preflight: dense FFN layer {layer_index}"))?;
+    for (name, info) in [(&gate_name, gate), (&up_name, up), (&down_name, down)] {
+        ensure_dense_capability(name, info)?;
+    }
+    Ok(())
+}
+
+fn require_full_attention(
+    gguf: &GgufFile,
+    cfg: &Qwen35Config,
+    layer_index: u32,
+    allow_split_q_gate: bool,
+    receipt: &mut Qwen35GgufPreflightReceipt,
+) -> Result<()> {
+    let p = format!("blk.{layer_index}");
+    let hidden = cfg.hidden_size as usize;
+    let q_total = (cfg.num_attention_heads * cfg.head_dim) as usize;
+    let kv_total = (cfg.num_key_value_heads * cfg.head_dim) as usize;
+    let head_dim = cfg.head_dim as usize;
+
+    require_f32(gguf, &format!("{p}.attn_norm.weight"), &[hidden], receipt)?;
+    require_f32(
+        gguf,
+        &format!("{p}.post_attention_norm.weight"),
+        &[hidden],
+        receipt,
+    )?;
+    require_f32(
+        gguf,
+        &format!("{p}.attn_q_norm.weight"),
+        &[head_dim],
+        receipt,
+    )?;
+    require_f32(
+        gguf,
+        &format!("{p}.attn_k_norm.weight"),
+        &[head_dim],
+        receipt,
+    )?;
+
+    let q_name = format!("{p}.attn_q.weight");
+    let q_shape = gguf
+        .tensor_info(&q_name)
+        .ok_or_else(|| anyhow!("Qwen GGUF preflight: required tensor '{q_name}' is missing"))?
+        .shape
+        .clone();
+    if allow_split_q_gate && q_shape == [q_total, hidden] {
+        require_projection(gguf, &q_name, &[q_total, hidden], receipt)?;
+        let gate_name = format!("{p}.attn_gate.weight");
+        if gguf.tensor_info(&gate_name).is_some() {
+            require_projection(gguf, &gate_name, &[q_total, hidden], receipt)?;
+        }
+    } else {
+        require_projection(gguf, &q_name, &[2 * q_total, hidden], receipt)?;
+    }
+    require_projection(
+        gguf,
+        &format!("{p}.attn_k.weight"),
+        &[kv_total, hidden],
+        receipt,
+    )?;
+    require_projection(
+        gguf,
+        &format!("{p}.attn_v.weight"),
+        &[kv_total, hidden],
+        receipt,
+    )?;
+    require_projection(
+        gguf,
+        &format!("{p}.attn_output.weight"),
+        &[hidden, q_total],
+        receipt,
+    )?;
+    Ok(())
+}
+
+fn require_linear_attention(
+    gguf: &GgufFile,
+    cfg: &Qwen35Config,
+    layer_index: u32,
+    receipt: &mut Qwen35GgufPreflightReceipt,
+) -> Result<()> {
+    let p = format!("blk.{layer_index}");
+    let hidden = cfg.hidden_size as usize;
+    let nk = cfg.linear_num_key_heads as usize;
+    let nv = cfg.linear_num_value_heads as usize;
+    let dk = cfg.linear_key_head_dim as usize;
+    let dv = cfg.linear_value_head_dim as usize;
+    let kernel = cfg.linear_conv_kernel_dim as usize;
+    let qkv = 2 * nk * dk + nv * dv;
+    let value = nv * dv;
+
+    require_f32(gguf, &format!("{p}.attn_norm.weight"), &[hidden], receipt)?;
+    require_f32(
+        gguf,
+        &format!("{p}.post_attention_norm.weight"),
+        &[hidden],
+        receipt,
+    )?;
+    require_f32(
+        gguf,
+        &format!("{p}.ssm_conv1d.weight"),
+        &[qkv, kernel],
+        receipt,
+    )?;
+    require_f32(gguf, &format!("{p}.ssm_dt.bias"), &[nv], receipt)?;
+    require_f32(gguf, &format!("{p}.ssm_a"), &[nv], receipt)?;
+    require_f32(gguf, &format!("{p}.ssm_norm.weight"), &[dv], receipt)?;
+
+    require_projection(
+        gguf,
+        &format!("{p}.attn_qkv.weight"),
+        &[qkv, hidden],
+        receipt,
+    )?;
+    require_projection(
+        gguf,
+        &format!("{p}.attn_gate.weight"),
+        &[value, hidden],
+        receipt,
+    )?;
+    require_projection(
+        gguf,
+        &format!("{p}.ssm_alpha.weight"),
+        &[nv, hidden],
+        receipt,
+    )?;
+    require_projection(
+        gguf,
+        &format!("{p}.ssm_beta.weight"),
+        &[nv, hidden],
+        receipt,
+    )?;
+    require_projection(
+        gguf,
+        &format!("{p}.ssm_out.weight"),
+        &[hidden, value],
+        receipt,
+    )?;
+    Ok(())
+}
+
+fn require_mtp(
+    gguf: &GgufFile,
+    cfg: &Qwen35Config,
+    intermediate: usize,
+    receipt: &mut Qwen35GgufPreflightReceipt,
+) -> Result<()> {
+    ensure!(
+        cfg.mtp_num_hidden_layers == 1,
+        "Qwen GGUF preflight supports exactly one MTP layer, got {}",
+        cfg.mtp_num_hidden_layers
+    );
+    let layer = cfg.num_hidden_layers;
+    let nextn = format!("blk.{layer}.nextn");
+    let hidden = cfg.hidden_size as usize;
+    let embed_name = format!("{nextn}.embed_tokens.weight");
+    let head_name = format!("{nextn}.shared_head_head.weight");
+    admit_mtp_tensor_presence(
+        cfg.mtp_use_dedicated_embeddings,
+        gguf.tensor_info(&embed_name).is_some(),
+        gguf.tensor_info(&head_name).is_some(),
+    )?;
+
+    for suffix in ["enorm.weight", "hnorm.weight", "shared_head_norm.weight"] {
+        require_f32(gguf, &format!("{nextn}.{suffix}"), &[hidden], receipt)?;
+    }
+    require_projection(
+        gguf,
+        &format!("{nextn}.eh_proj.weight"),
+        &[hidden, 2 * hidden],
+        receipt,
+    )?;
+
+    if cfg.mtp_use_dedicated_embeddings {
+        require_embedding(gguf, &embed_name, hidden, receipt)?;
+    } else {
+        ensure!(
+            gguf.tensor_info(&embed_name).is_none(),
+            "Qwen GGUF preflight: shared-MTP metadata conflicts with present tensor '{embed_name}'"
+        );
+    }
+
+    if cfg.mtp_use_dedicated_embeddings {
+        let info = gguf.tensor_info(&head_name).ok_or_else(|| {
+            anyhow!("Qwen GGUF preflight: dedicated MTP requires tensor '{head_name}'")
+        })?;
+        ensure!(
+            info.shape.len() == 2 && info.shape[1] == hidden,
+            "Qwen GGUF preflight: tensor '{head_name}' shape {:?} is not [vocab,{hidden}]",
+            info.shape
+        );
+        require_projection(gguf, &head_name, &[info.shape[0], hidden], receipt)?;
+    } else {
+        ensure!(
+            gguf.tensor_info(&head_name).is_none(),
+            "Qwen GGUF preflight: shared-MTP metadata conflicts with present tensor '{head_name}'"
+        );
+    }
+
+    require_full_attention(gguf, cfg, layer, true, receipt)?;
+    require_dense_ffn(gguf, layer, hidden, intermediate, receipt)
+}
+
+/// Validate every tensor consumed by the dense Qwen graph before creating a
+/// Metal device or reading any tensor payload.
+pub(super) fn preflight_dense_qwen35_gguf(gguf: &GgufFile, cfg: &Qwen35Config) -> Result<()> {
+    ensure!(
+        cfg.variant == Qwen35Variant::Dense,
+        "dense Qwen GGUF preflight received {:?}",
+        cfg.variant
+    );
+    let hidden = cfg.hidden_size as usize;
+    let intermediate =
+        cfg.intermediate_size
+            .context("dense Qwen GGUF preflight requires feed_forward_length")? as usize;
+    let mut receipt = Qwen35GgufPreflightReceipt::default();
+
+    let embedding_rows = require_embedding(gguf, "token_embd.weight", hidden, &mut receipt)?;
+    require_f32(gguf, "output_norm.weight", &[hidden], &mut receipt)?;
+    if let Some(output) = gguf.tensor_info("output.weight") {
+        ensure!(
+            output.shape.len() == 2 && output.shape[1] == hidden,
+            "Qwen GGUF preflight: output.weight shape {:?} is not [vocab,{hidden}]",
+            output.shape
+        );
+        ensure!(
+            embedding_rows >= output.shape[0],
+            "Qwen GGUF preflight: token embedding rows {embedding_rows} < output rows {}",
+            output.shape[0]
+        );
+        require_projection(
+            gguf,
+            "output.weight",
+            &[output.shape[0], hidden],
+            &mut receipt,
+        )?;
+    } else {
+        let token = gguf
+            .tensor_info("token_embd.weight")
+            .context("Qwen GGUF preflight: tied output head has no token embedding")?;
+        admit_storage_for_role(
+            "token_embd.weight (tied output head)",
+            TensorRole::DenseProjection,
+            TensorStorage::Parsed(token.ggml_type),
+        )?;
+        ensure_dense_capability("token_embd.weight (tied output head)", token)?;
+    }
+
+    for (layer_index, kind) in cfg.layer_types.iter().copied().enumerate() {
+        let layer_index = u32::try_from(layer_index).context("Qwen layer index exceeds u32")?;
+        match kind {
+            Qwen35LayerKind::FullAttention => {
+                require_full_attention(gguf, cfg, layer_index, false, &mut receipt)?
+            }
+            Qwen35LayerKind::LinearAttention => {
+                require_linear_attention(gguf, cfg, layer_index, &mut receipt)?
+            }
+        }
+        require_dense_ffn(gguf, layer_index, hidden, intermediate, &mut receipt)?;
+    }
+
+    match cfg.mtp_num_hidden_layers {
+        0 => {}
+        1 => require_mtp(gguf, cfg, intermediate, &mut receipt)?,
+        count => bail!("Qwen GGUF preflight supports at most one MTP layer, got {count}"),
+    }
+
+    tracing::debug!(
+        required_tensors = receipt.required_tensor_count,
+        roles = ?receipt.role_counts,
+        storage = ?receipt.storage_counts,
+        "dense Qwen GGUF execution preflight passed"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "gguf_preflight_tests.rs"]
+mod tests;

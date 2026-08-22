@@ -604,6 +604,43 @@ pub fn dispatch_qmatmul(
         .map_err(|e| anyhow::anyhow!("dispatch_mm_v2_f16 (native F16) failed: {e}"));
     }
 
+    // Native BF16 GGUF storage. Execute the retained typed buffer directly at
+    // both decode and prompt widths; there is no BF16→F32/F16 shadow and no
+    // load-time or inference-time weight re-encoding.
+    if weight.info.ggml_dtype == mlx_native::GgmlType::BF16 {
+        let n = weight.info.rows as u32;
+        let k = weight.info.cols as u32;
+        let params = mlx_native::DenseMmBf16F32Params {
+            m,
+            n,
+            k,
+            src0_batch: 1,
+            src1_batch: 1,
+        };
+        if m == 1 {
+            return mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32(
+                session.encoder_mut(),
+                registry,
+                device,
+                &weight.buffer,
+                input,
+                output,
+                &params,
+            )
+            .map_err(|e| anyhow::anyhow!("native BF16 decode projection failed: {e}"));
+        }
+        return mlx_native::dense_matmul_bf16_f32_tensor(
+            session.encoder_mut(),
+            registry,
+            device,
+            &weight.buffer,
+            input,
+            output,
+            &params,
+        )
+        .map_err(|e| anyhow::anyhow!("native BF16 prompt projection failed: {e}"));
+    }
+
     // ADR-029 iter-175 Step 1d — Q6_K NR2 decode-m=1 fast path via
     // pre-baked DispatchRecord.  Eliminates per-call HashMap pipeline
     // lookup, MTLSize::new, ggml_type match arms, and

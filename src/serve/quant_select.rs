@@ -45,6 +45,9 @@ use anyhow::{anyhow, Context, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum QuantType {
+    /// Native bfloat16 storage. Selectable when requested explicitly; never
+    /// chosen by the generic hardware-to-quantization table.
+    BF16,
     /// 2-bit K-quant. Used by explicit-path runtimes such as DeepSeek;
     /// never selected by the generic hardware table.
     Q2_K,
@@ -63,7 +66,8 @@ pub enum QuantType {
 impl QuantType {
     /// Complete runtime pool/cache identity set. Exhaustive operations use
     /// this catalog so a new quant type cannot leave stale cache namespaces.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
+        Self::BF16,
         Self::Q2_K,
         Self::Q8_0,
         Self::Q6_K,
@@ -76,6 +80,7 @@ impl QuantType {
     /// `src/backends/gguf.rs:1038-1057`).
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::BF16 => "BF16",
             Self::Q2_K => "Q2_K",
             Self::Q8_0 => "Q8_0",
             Self::Q6_K => "Q6_K",
@@ -96,6 +101,7 @@ impl QuantType {
     /// for every variant.
     pub fn from_canonical_str(name: &str) -> std::result::Result<Self, String> {
         match name.to_ascii_uppercase().as_str() {
+            "BF16" => Ok(Self::BF16),
             "Q2_K" => Ok(Self::Q2_K),
             "Q8_0" => Ok(Self::Q8_0),
             "Q6_K" => Ok(Self::Q6_K),
@@ -103,7 +109,7 @@ impl QuantType {
             "Q4_K_M" => Ok(Self::Q4_K_M),
             "Q3_K_M" => Ok(Self::Q3_K_M),
             other => Err(format!(
-                "unknown quant type {other:?}: supported = Q2_K, Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q3_K_M"
+                "unknown quant type {other:?}: supported = BF16, Q2_K, Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q3_K_M"
             )),
         }
     }
@@ -113,6 +119,7 @@ impl QuantType {
         use crate::quantize::ggml_quants::GgufFtype;
 
         match GgufFtype::try_from(file_type).ok()? {
+            GgufFtype::BF16 => Some(Self::BF16),
             GgufFtype::MostlyQ2_K => Some(Self::Q2_K),
             GgufFtype::MostlyQ8_0 => Some(Self::Q8_0),
             GgufFtype::MostlyQ6_K => Some(Self::Q6_K),
@@ -128,6 +135,7 @@ impl QuantType {
         use crate::quantize::ggml_quants::GgufFtype;
 
         match self {
+            Self::BF16 => GgufFtype::BF16 as u32,
             Self::Q2_K => GgufFtype::MostlyQ2_K as u32,
             Self::Q8_0 => GgufFtype::MostlyQ8_0 as u32,
             Self::Q6_K => GgufFtype::MostlyQ6_K as u32,
@@ -406,12 +414,13 @@ mod tests {
         // src/backends/gguf.rs:1038-1057 so downstream serializers can
         // round-trip without a translation table.
         assert_eq!(QuantType::Q2_K.as_str(), "Q2_K");
+        assert_eq!(QuantType::BF16.as_str(), "BF16");
         assert_eq!(QuantType::Q8_0.as_str(), "Q8_0");
         assert_eq!(QuantType::Q6_K.as_str(), "Q6_K");
         assert_eq!(QuantType::Q5_K_M.as_str(), "Q5_K_M");
         assert_eq!(QuantType::Q4_K_M.as_str(), "Q4_K_M");
         assert_eq!(QuantType::Q3_K_M.as_str(), "Q3_K_M");
-        assert_eq!(QuantType::ALL.len(), 6);
+        assert_eq!(QuantType::ALL.len(), 7);
         for quant in QuantType::ALL {
             assert_eq!(QuantType::from_canonical_str(quant.as_str()), Ok(quant));
         }
@@ -432,6 +441,12 @@ mod tests {
     fn deepseek_q2_k_file_type_round_trips_exactly() {
         assert_eq!(QuantType::Q2_K.gguf_file_type(), 10);
         assert_eq!(QuantType::from_gguf_file_type(10), Some(QuantType::Q2_K));
+    }
+
+    #[test]
+    fn qwen38_bf16_file_type_round_trips_exactly() {
+        assert_eq!(QuantType::BF16.gguf_file_type(), 32);
+        assert_eq!(QuantType::from_gguf_file_type(32), Some(QuantType::BF16));
     }
 
     #[test]

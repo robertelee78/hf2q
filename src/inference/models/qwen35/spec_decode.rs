@@ -1815,6 +1815,15 @@ mod tests {
             .info
             .ggml_dtype;
         assert!(
+            model
+                .token_embd_native
+                .as_ref()
+                .expect("native token embedding")
+                .f16_shadow
+                .is_none(),
+            "Qwen native embedding must never carry a dequantized F16 shadow"
+        );
+        assert!(
             matches!(embedding_type, GgmlType::Q4_K | GgmlType::Q5_K),
             "unexpected native embedding type {embedding_type:?}"
         );
@@ -1829,6 +1838,15 @@ mod tests {
                 .info
                 .ggml_dtype,
             GgmlType::Q6_K
+        );
+        assert!(
+            model
+                .output_weight_native
+                .as_ref()
+                .expect("native output head")
+                .f16_shadow
+                .is_none(),
+            "Qwen native output head must never carry a dequantized F16 shadow"
         );
         let is_artifact_quant =
             |kind: GgmlType| matches!(kind, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K);

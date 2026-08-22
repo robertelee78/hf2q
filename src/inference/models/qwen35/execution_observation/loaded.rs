@@ -139,6 +139,31 @@ pub(crate) fn f32_bytes_sha256(values: &[f32]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Borrow the exact logical storage bytes without lying about the buffer's
+/// element type. This is observation-only: it neither converts values nor
+/// allocates a shadow representation.
+pub(super) fn buffer_storage_bytes(buffer: &mlx_native::MlxBuffer) -> Result<&[u8]> {
+    use mlx_native::DType;
+
+    let bytes = match buffer.dtype() {
+        DType::F32 => bytemuck::cast_slice(buffer.as_slice::<f32>()?),
+        DType::F16 => bytemuck::cast_slice(buffer.as_slice::<half::f16>()?),
+        DType::BF16 => bytemuck::cast_slice(buffer.as_slice::<half::bf16>()?),
+        DType::U8 => buffer.as_slice::<u8>()?,
+        DType::U16 => bytemuck::cast_slice(buffer.as_slice::<u16>()?),
+        DType::U32 => bytemuck::cast_slice(buffer.as_slice::<u32>()?),
+        DType::I32 => bytemuck::cast_slice(buffer.as_slice::<i32>()?),
+    };
+    if bytes.len() != buffer.data_byte_len() {
+        bail!(
+            "typed buffer byte view length {} != logical extent {}",
+            bytes.len(),
+            buffer.data_byte_len()
+        );
+    }
+    Ok(bytes)
+}
+
 fn record_loaded_observation(
     state: &mut LoadedObservationState,
     tensor_name: &str,
@@ -273,17 +298,13 @@ pub(crate) fn observe_loaded_ggml(tensor_name: &str, buffer: &mlx_native::MlxBuf
             .expected
             .get(tensor_name)
             .with_context(|| format!("loaded unexpected tensor {tensor_name}"))?;
-        let data_len = buffer.data_byte_len();
-        let bytes = buffer
-            .as_slice::<u8>()
-            .map_err(|error| anyhow::anyhow!("read loaded GGML tensor {tensor_name}: {error}"))?;
-        let bytes = bytes
-            .get(..data_len)
-            .context("loaded GGML logical byte extent exceeds its allocation")?;
+        let bytes = buffer_storage_bytes(buffer)
+            .map_err(|error| anyhow::anyhow!("read loaded GGUF tensor {tensor_name}: {error}"))?;
+        let data_len = bytes.len();
         let byte_sha = hex::encode(Sha256::digest(bytes));
         if u64::try_from(data_len)? != expected.payload_bytes || byte_sha != expected.payload_sha256
         {
-            bail!("loaded GGML tensor {tensor_name} differs from reopened payload evidence");
+            bail!("loaded GGUF tensor {tensor_name} differs from reopened payload evidence");
         }
         let observation = LoadedTensorObservation {
             tensor_name: tensor_name.to_owned(),
@@ -306,6 +327,25 @@ pub(crate) fn observe_loaded_ggml(tensor_name: &str, buffer: &mlx_native::MlxBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_bf16_storage_is_hashed_as_exact_bytes_without_an_untyped_view() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = mlx_native::MlxDevice::new().expect("Metal device");
+        let bits = [0x3f80_u16, 0xbf00, 0x0001, 0x7f80];
+        let mut buffer = device
+            .alloc_buffer(bits.len() * 2, mlx_native::DType::BF16, vec![2, 2])
+            .expect("BF16 buffer");
+        buffer
+            .as_mut_slice::<u16>()
+            .expect("BF16 storage bits")
+            .copy_from_slice(&bits);
+        let expected = bits
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(buffer_storage_bytes(&buffer).unwrap(), expected);
+    }
 
     #[test]
     fn repeated_shared_head_load_is_counted_only_when_bytes_are_identical() {

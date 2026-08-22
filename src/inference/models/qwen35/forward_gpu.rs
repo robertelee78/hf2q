@@ -407,33 +407,53 @@ fn observe_dense_ffn_cache(
     loaded: &Qwen35FfnWeights,
     executed: &FfnWeightsGpu,
 ) -> Result<()> {
-    let (Qwen35FfnWeights::DenseQ(loaded), FfnWeightsGpu::DenseQ(executed)) = (loaded, executed)
-    else {
-        anyhow::bail!("evidence profile requires native-GGML dense FFN weights in every layer");
+    let add = |builder: &mut super::execution_observation::ExecutedTensorCatalogBuilder<'_>,
+               suffix: &str,
+               buffer: &MlxBuffer|
+     -> Result<()> {
+        let tensor_name = format!("{prefix}.{suffix}");
+        builder.add_direct_ggml(&tensor_name, &tensor_name, buffer)
     };
-    builder.add_direct_ggml(
-        &format!("{prefix}.ffn_gate.weight"),
-        &format!("{prefix}.ffn_gate.weight"),
-        &executed.gate_q,
-    )?;
-    builder.add_direct_ggml(
-        &format!("{prefix}.ffn_up.weight"),
-        &format!("{prefix}.ffn_up.weight"),
-        &executed.up_q,
-    )?;
-    builder.add_direct_ggml(
-        &format!("{prefix}.ffn_down.weight"),
-        &format!("{prefix}.ffn_down.weight"),
-        &executed.down_q,
-    )?;
-    anyhow::ensure!(
-        loaded.ggml_type_gate_up == executed.ggml_type_gate_up
-            && loaded.ggml_type_down == executed.ggml_type_down
-            && loaded.hidden_size == executed.hidden_size
-            && loaded.intermediate_size == executed.intermediate_size,
-        "loaded and executed dense FFN metadata differs"
-    );
-    Ok(())
+    match (loaded, executed) {
+        (Qwen35FfnWeights::DenseQ(loaded), FfnWeightsGpu::DenseQ(executed)) => {
+            add(builder, "ffn_gate.weight", &executed.gate_q)?;
+            add(builder, "ffn_up.weight", &executed.up_q)?;
+            add(builder, "ffn_down.weight", &executed.down_q)?;
+            anyhow::ensure!(
+                loaded.ggml_type_gate_up == executed.ggml_type_gate_up
+                    && loaded.ggml_type_down == executed.ggml_type_down
+                    && loaded.hidden_size == executed.hidden_size
+                    && loaded.intermediate_size == executed.intermediate_size,
+                "loaded and executed quantized dense FFN metadata differs"
+            );
+            Ok(())
+        }
+        (Qwen35FfnWeights::DenseNative(loaded), FfnWeightsGpu::Dense(executed)) => {
+            let dtype_for = |kind: GgmlType| -> Result<DType> {
+                match kind {
+                    GgmlType::F32 => Ok(DType::F32),
+                    GgmlType::F16 => Ok(DType::F16),
+                    GgmlType::BF16 => Ok(DType::BF16),
+                    other => anyhow::bail!(
+                        "native scalar dense FFN evidence received unsupported {other:?}"
+                    ),
+                }
+            };
+            anyhow::ensure!(
+                executed.gate.dtype() == dtype_for(loaded.gate_type)?
+                    && executed.up.dtype() == dtype_for(loaded.up_type)?
+                    && executed.down.dtype() == dtype_for(loaded.down_type)?,
+                "loaded and executed native scalar dense FFN dtypes differ"
+            );
+            add(builder, "ffn_gate.weight", &executed.gate)?;
+            add(builder, "ffn_up.weight", &executed.up)?;
+            add(builder, "ffn_down.weight", &executed.down)?;
+            Ok(())
+        }
+        _ => {
+            anyhow::bail!("loaded and executed dense FFN storage differs from the evidence profile")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -692,6 +712,8 @@ enum NativeEmbeddingRoute {
     Q6K,
     Q8_0,
     F32,
+    F16,
+    BF16,
 }
 
 impl NativeEmbeddingRoute {
@@ -703,6 +725,8 @@ impl NativeEmbeddingRoute {
             GgmlType::Q6_K => Ok(Self::Q6K),
             GgmlType::Q8_0 => Ok(Self::Q8_0),
             GgmlType::F32 => Ok(Self::F32),
+            GgmlType::F16 => Ok(Self::F16),
+            GgmlType::BF16 => Ok(Self::BF16),
             other => Err(anyhow!(
                 "native token_embd.weight uses unsupported direct-gather type {other:?}; \
                  inference refuses to dequantize and substitute another format"
@@ -717,9 +741,30 @@ impl NativeEmbeddingRoute {
             Self::Q5K => Some(mlx_native::GgmlKernelRoute::EmbeddingQ5K),
             Self::Q6K => Some(mlx_native::GgmlKernelRoute::EmbeddingQ6K),
             Self::Q8_0 => Some(mlx_native::GgmlKernelRoute::EmbeddingQ8_0),
-            Self::F32 => None,
+            Self::F32 => Some(mlx_native::GgmlKernelRoute::EmbeddingF32),
+            Self::F16 => Some(mlx_native::GgmlKernelRoute::EmbeddingF16),
+            Self::BF16 => Some(mlx_native::GgmlKernelRoute::EmbeddingBF16),
         }
     }
+}
+
+pub(super) fn native_matrix_storage_bytes(
+    kind: GgmlType,
+    rows: usize,
+    cols: usize,
+) -> Result<usize> {
+    ensure!(
+        rows > 0 && cols > 0,
+        "native GGUF matrix dimensions must be positive"
+    );
+    let block_values = kind.block_values() as usize;
+    ensure!(
+        cols % block_values == 0,
+        "native GGUF matrix width {cols} is not aligned to {kind:?}'s {block_values}-value blocks"
+    );
+    rows.checked_mul(cols / block_values)
+        .and_then(|blocks| blocks.checked_mul(kind.block_bytes() as usize))
+        .context("native GGUF matrix byte extent overflow")
 }
 
 pub(super) fn ensure_native_embedding_admitted(native: &MlxQWeight) -> Result<()> {
@@ -728,29 +773,14 @@ pub(super) fn ensure_native_embedding_admitted(native: &MlxQWeight) -> Result<()
         native.affine.is_none(),
         "native token_embd.weight carries affine metadata instead of exact GGUF blocks"
     );
-    let expected_bytes = match route {
-        NativeEmbeddingRoute::F32 => native
-            .info
-            .rows
-            .checked_mul(native.info.cols)
-            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
-            .context("native F32 token_embd.weight byte length overflow")?,
-        _ => usize::try_from(
-            mlx_native::ggml_matrix_bytes(
-                native.info.ggml_dtype,
-                u32::try_from(native.info.rows)
-                    .context("native token_embd row count exceeds packed geometry")?,
-                u32::try_from(native.info.cols)
-                    .context("native token_embd column count exceeds packed geometry")?,
-            )
-            .context("derive native token_embd packed byte extent")?,
-        )
-        .context("native token_embd packed byte extent exceeds usize")?,
-    };
-    let expected_dtype = if route == NativeEmbeddingRoute::F32 {
-        DType::F32
-    } else {
-        DType::U8
+    let expected_bytes =
+        native_matrix_storage_bytes(native.info.ggml_dtype, native.info.rows, native.info.cols)
+            .context("derive native token_embd byte extent")?;
+    let expected_dtype = match route {
+        NativeEmbeddingRoute::F32 => DType::F32,
+        NativeEmbeddingRoute::F16 => DType::F16,
+        NativeEmbeddingRoute::BF16 => DType::BF16,
+        _ => DType::U8,
     };
     ensure!(
         native.buffer.dtype() == expected_dtype,
@@ -768,9 +798,7 @@ pub(super) fn ensure_native_embedding_admitted(native: &MlxQWeight) -> Result<()
         expected_bytes,
         native.buffer.data_byte_len()
     );
-    let Some(expected_capability_route) = route.capability_route() else {
-        return Ok(());
-    };
+    let expected_capability_route = route.capability_route();
     let n_tokens = 1;
     let vocab_size = u32::try_from(native.info.rows)
         .context("native token_embd row count exceeds capability dimensions")?;
@@ -794,7 +822,7 @@ pub(super) fn ensure_native_embedding_admitted(native: &MlxQWeight) -> Result<()
         capability.diagnostic
     );
     ensure!(
-        capability.route == Some(expected_capability_route),
+        capability.route == expected_capability_route,
         "native token_embd.weight capability route mismatch for {:?}: expected {:?}, got {:?}",
         native.info.ggml_dtype,
         expected_capability_route,
@@ -931,14 +959,21 @@ pub(super) fn embed_tokens_gpu_into(
                 )
                 .context("native Q8_0 embedding gather")?;
             }
-            NativeEmbeddingRoute::F32 => {
-                let table = native
-                    .buffer
-                    .as_slice::<f32>()
-                    .map_err(|e| anyhow!("map native F32 token embedding: {e}"))?;
-                let rows = embed_tokens(tokens, table, native.info.rows as u32, hidden_size);
-                return upload_f32_into(&rows, output)
-                    .context("upload selected native F32 embedding rows");
+            NativeEmbeddingRoute::F32 | NativeEmbeddingRoute::F16 | NativeEmbeddingRoute::BF16 => {
+                mlx_native::embedding_gather_dense(
+                    &mut enc,
+                    registry,
+                    device,
+                    &native.buffer,
+                    &ids,
+                    output,
+                    &mlx_native::EmbeddingDenseParams {
+                        vocab_size: native.info.rows,
+                        embed_dim: hidden,
+                        n_tokens: tokens.len(),
+                    },
+                )
+                .context("native scalar embedding gather")?;
             }
         }
         // The consuming Qwen/MTP forward is submitted to the same Metal
@@ -2305,12 +2340,21 @@ impl Qwen35Model {
                     ffn
                 }
             };
-            let FfnWeightsGpu::DenseQ(ffn) = ffn else {
-                anyhow::bail!("Qwen evidence profile encountered a non-dense FFN cache");
-            };
-            insert(&ffn.gate_q, format!("{prefix}.ffn_gate.weight"))?;
-            insert(&ffn.up_q, format!("{prefix}.ffn_up.weight"))?;
-            insert(&ffn.down_q, format!("{prefix}.ffn_down.weight"))?;
+            match ffn {
+                FfnWeightsGpu::DenseQ(ffn) => {
+                    insert(&ffn.gate_q, format!("{prefix}.ffn_gate.weight"))?;
+                    insert(&ffn.up_q, format!("{prefix}.ffn_up.weight"))?;
+                    insert(&ffn.down_q, format!("{prefix}.ffn_down.weight"))?;
+                }
+                FfnWeightsGpu::Dense(ffn) => {
+                    insert(&ffn.gate, format!("{prefix}.ffn_gate.weight"))?;
+                    insert(&ffn.up, format!("{prefix}.ffn_up.weight"))?;
+                    insert(&ffn.down, format!("{prefix}.ffn_down.weight"))?;
+                }
+                FfnWeightsGpu::Moe(_) | FfnWeightsGpu::MoeQ(_) => {
+                    anyhow::bail!("Qwen evidence profile encountered an MoE FFN cache")
+                }
+            }
         }
         Ok(Some(slots))
     }
@@ -7447,6 +7491,9 @@ impl Qwen35Model {
                     DenseFfnWeightsGpu::from_cpu(w, device)
                         .with_context(|| format!("upload dense_ffn layer {i}"))?,
                 ),
+                Qwen35FfnWeights::DenseNative(w) => {
+                    FfnWeightsGpu::Dense(DenseFfnWeightsGpu::from_native(w))
+                }
                 Qwen35FfnWeights::DenseQ(w) => {
                     // Projection buffers already on Metal device (ARC retain, no data copy).
                     FfnWeightsGpu::DenseQ(DenseFfnWeightsGpuQ::from_quantized(w))
@@ -7815,15 +7862,25 @@ mod tests {
                 NativeEmbeddingRoute::Q8_0,
                 Some(mlx_native::GgmlKernelRoute::EmbeddingQ8_0),
             ),
-            (GgmlType::F32, NativeEmbeddingRoute::F32, None),
+            (
+                GgmlType::F32,
+                NativeEmbeddingRoute::F32,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingF32),
+            ),
+            (
+                GgmlType::F16,
+                NativeEmbeddingRoute::F16,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingF16),
+            ),
+            (
+                GgmlType::BF16,
+                NativeEmbeddingRoute::BF16,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingBF16),
+            ),
         ] {
             assert_eq!(NativeEmbeddingRoute::for_type(kind).unwrap(), route);
             assert_eq!(route.capability_route(), capability_route);
         }
-
-        let error = NativeEmbeddingRoute::for_type(GgmlType::F16)
-            .expect_err("F16 has no direct embedding route");
-        assert!(error.to_string().contains("refuses to dequantize"));
     }
 
     #[test]
@@ -8083,8 +8140,8 @@ mod tests {
                         }
                         // DenseQ cannot be mutated in tests (Metal buffers are immutable);
                         // test models always use Dense (F32) weights via empty_from_cfg.
-                        Qwen35FfnWeights::DenseQ(_) => {
-                            panic!("unexpected DenseQ in test fixture — use Dense variant");
+                        Qwen35FfnWeights::DenseNative(_) | Qwen35FfnWeights::DenseQ(_) => {
+                            panic!("unexpected native dense FFN in mutable test fixture");
                         }
                         Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_) => {
                             panic!("unexpected MoE in dense cfg");
@@ -8120,8 +8177,8 @@ mod tests {
                             w.up = mk_rand(&mut seed, m_size * h, 0.02);
                             w.down = mk_rand(&mut seed, h * m_size, 0.02);
                         }
-                        Qwen35FfnWeights::DenseQ(_) => {
-                            panic!("unexpected DenseQ in test fixture — use Dense variant");
+                        Qwen35FfnWeights::DenseNative(_) | Qwen35FfnWeights::DenseQ(_) => {
+                            panic!("unexpected native dense FFN in mutable test fixture");
                         }
                         Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_) => {
                             panic!("unexpected MoE in dense cfg");

@@ -45,6 +45,7 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::flash_attn_prefill::{
@@ -1161,6 +1162,24 @@ pub fn apply_linear_projection_f32_with_ggml_type(
                 .context("dense_matmul_bf16_f32_tensor")?;
             }
         }
+        DType::F16 => {
+            dense_matmul_f16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                weight,
+                input,
+                &dst,
+                &DenseMmF16F32Params {
+                    m: seq_len,
+                    n: out_features,
+                    k: in_features,
+                    src0_batch: 1,
+                    src1_batch: 1,
+                },
+            )
+            .context("dense_matmul_f16_f32_tensor")?;
+        }
         DType::F32 => {
             let params = DenseMmF32F32Params {
                 m: seq_len,
@@ -1298,6 +1317,24 @@ pub fn apply_linear_projection_f32_qweight(
                 .context("dense_matmul_bf16_f32_tensor")?;
             }
         }
+        DType::F16 => {
+            dense_matmul_f16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                &qweight.buffer,
+                input,
+                &dst,
+                &DenseMmF16F32Params {
+                    m: seq_len,
+                    n: out_features,
+                    k: in_features,
+                    src0_batch: 1,
+                    src1_batch: 1,
+                },
+            )
+            .context("dense_matmul_f16_f32_tensor qweight")?;
+        }
         DType::F32 => {
             let params = DenseMmF32F32Params {
                 m: seq_len,
@@ -1418,6 +1455,24 @@ pub fn apply_linear_projection_f32_into_with_ggml_type(
                 )
                 .context("dense_matmul_bf16_f32_tensor (into)")?;
             }
+        }
+        DType::F16 => {
+            dense_matmul_f16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                weight,
+                input,
+                dst,
+                &DenseMmF16F32Params {
+                    m: seq_len,
+                    n: out_features,
+                    k: in_features,
+                    src0_batch: 1,
+                    src1_batch: 1,
+                },
+            )
+            .context("dense_matmul_f16_f32_tensor (into)")?;
         }
         DType::F32 => {
             let params = DenseMmF32F32Params {
@@ -9498,6 +9553,117 @@ mod tests {
             .map(|(&g, &e)| (g - e).abs())
             .fold(0.0f32, f32::max);
         assert!(max_err < 1e-3, "projection max_err={:.2e} >= 1e-3", max_err);
+    }
+
+    #[test]
+    fn native_f16_projection_executes_every_admitted_helper() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        let mut registry = KernelRegistry::new();
+        let (n, k) = (32_u32, 32_u32);
+        let weight_values: Vec<half::f16> = (0..n * k)
+            .map(|index| half::f16::from_f32((index as f32 % 29.0 - 14.0) / 128.0))
+            .collect();
+        let mut weight = device
+            .alloc_buffer(
+                weight_values.len() * std::mem::size_of::<half::f16>(),
+                DType::F16,
+                vec![n as usize, k as usize],
+            )
+            .expect("allocate native F16 weight");
+        weight
+            .as_mut_slice::<half::f16>()
+            .expect("map native F16 weight")
+            .copy_from_slice(&weight_values);
+
+        let qweight = crate::serve::forward_mlx_shared::MlxQWeight {
+            buffer: weight.clone(),
+            info: crate::serve::gpu::QuantWeightInfo {
+                ggml_dtype: GgmlType::F16,
+                rows: n as usize,
+                cols: k as usize,
+            },
+            affine: None,
+            f16_shadow: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        };
+
+        for m in [1_u32, 2] {
+            let input_values: Vec<f32> = (0..m * k)
+                .map(|index| (index as f32 - 17.0) / 64.0)
+                .collect();
+            let input = upload_f32(&input_values, &device).expect("upload F16-route input");
+            let mut into = device
+                .alloc_buffer(
+                    (m * n) as usize * std::mem::size_of::<f32>(),
+                    DType::F32,
+                    vec![m as usize, n as usize],
+                )
+                .expect("allocate F16-route output");
+            let mut encoder = device.command_encoder().expect("F16-route encoder");
+            let direct = apply_linear_projection_f32_with_ggml_type(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &weight,
+                GgmlType::F16,
+                m,
+                k,
+                n,
+            )
+            .expect("direct native F16 projection");
+            let wrapped = apply_linear_projection_f32_qweight(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &qweight,
+                m,
+                k,
+                n,
+            )
+            .expect("qweight native F16 projection");
+            apply_linear_projection_f32_into_with_ggml_type(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input,
+                &weight,
+                GgmlType::F16,
+                &mut into,
+                m,
+                k,
+                n,
+            )
+            .expect("caller-owned native F16 projection");
+            encoder
+                .commit_and_wait()
+                .expect("execute native F16 helpers");
+
+            let direct = download_f32(&direct).expect("download direct F16 result");
+            let wrapped = download_f32(&wrapped).expect("download qweight F16 result");
+            let into = download_f32(&into).expect("download into F16 result");
+            assert_eq!(direct, wrapped, "F16 helper routes must be byte-identical");
+            assert_eq!(direct, into, "F16 into route must be byte-identical");
+            assert!(direct.iter().all(|value| value.is_finite()));
+
+            for row in 0..m as usize {
+                for col in 0..n as usize {
+                    let expected = (0..k as usize)
+                        .map(|inner| {
+                            input_values[row * k as usize + inner]
+                                * weight_values[col * k as usize + inner].to_f32()
+                        })
+                        .sum::<f32>();
+                    let actual = direct[row * n as usize + col];
+                    assert!(
+                        (actual - expected).abs() < 1e-3,
+                        "native F16 projection mismatch at M={m} [{row},{col}]: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
     }
 
     /// **ADR-019 Phase 2 iter89e2-E kernel-equivalence parity test**: the

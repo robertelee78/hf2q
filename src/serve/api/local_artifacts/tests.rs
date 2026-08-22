@@ -107,6 +107,22 @@ fn qwen38_q5_k_m_receipt_is_selectable_with_exact_header_identity() {
 }
 
 #[test]
+fn qwen38_bf16_receipt_is_selectable_with_exact_header_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let artifact = root.path().join("model-bf16.gguf");
+    write_quant_gguf(&artifact, 32);
+    let mut receipt = receipt_for(&artifact, "owner/model");
+    receipt.quant_selector = "bf16".into();
+    write_receipt(&artifact, &receipt);
+
+    let catalog = LocalArtifactInventory::for_test(vec![root.path().to_path_buf()])
+        .discover(Some("owner/model"), None);
+    assert_eq!(catalog.artifacts.len(), 1);
+    assert_eq!(catalog.artifacts[0].quant, Some(QuantType::BF16));
+    assert!(catalog.artifacts[0].selectable);
+}
+
+#[test]
 fn stale_size_wrong_repo_and_symlinks_never_become_candidates() {
     let root = tempfile::tempdir().unwrap();
     let wrong_repo = root.path().join("wrong.gguf");
@@ -152,17 +168,17 @@ fn recorded_output_path_is_never_dereferenced() {
 #[test]
 fn unsupported_receipt_quant_is_visible_but_not_selectable() {
     let root = tempfile::tempdir().unwrap();
-    let artifact = root.path().join("model-bf16.gguf");
+    let artifact = root.path().join("model-iq3_xxs.gguf");
     write_q4_k_m_gguf(&artifact);
     let mut receipt = receipt_for(&artifact, "owner/model");
-    receipt.quant_selector = "bf16".into();
+    receipt.quant_selector = "iq3_xxs".into();
     write_receipt(&artifact, &receipt);
 
     let catalog = LocalArtifactInventory::for_test(vec![root.path().to_path_buf()])
         .discover(Some("owner/model"), None);
     assert_eq!(catalog.artifacts.len(), 1);
     assert!(!catalog.artifacts[0].selectable);
-    assert_eq!(catalog.artifacts[0].quant_hint, "BF16");
+    assert_eq!(catalog.artifacts[0].quant_hint, "IQ3_XXS");
     assert!(catalog.artifacts[0]
         .unavailable_reason
         .as_deref()

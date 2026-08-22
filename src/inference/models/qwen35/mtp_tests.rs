@@ -403,6 +403,29 @@ fn mtp_rejects_inconsistent_shared_flag_with_dedicated_tensor_present() {
 }
 
 #[test]
+fn mtp_rejects_shared_mode_with_only_a_dedicated_head_present() {
+    let Some(device) = try_device() else { return };
+    let tmp = std::env::temp_dir().join(format!(
+        "mtp_inconsistent_head_only_{}.gguf",
+        std::process::id()
+    ));
+    let mut tensors = tiny_tensors();
+    tensors.retain(|tensor| tensor.name != "blk.2.nextn.embed_tokens.weight");
+    write_gguf(&tmp, &tensors);
+    let gguf = GgufFile::open(&tmp).expect("open");
+    let mut cfg = tiny_cfg(1);
+    cfg.mtp_use_dedicated_embeddings = false;
+    let error = load_mtp_weights_if_present(&gguf, &cfg, &device)
+        .err()
+        .expect("shared MTP must reject a dedicated head-only replacement");
+    assert!(
+        format!("{error:#}").contains("shared_head_head"),
+        "rejection must identify the conflicting head: {error:#}"
+    );
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
 fn mtp_forward_draft_returns_logits() {
     let Some(device) = try_device() else { return };
     let tmp = std::env::temp_dir().join(format!("mtp_forward_{}.gguf", std::process::id()));
