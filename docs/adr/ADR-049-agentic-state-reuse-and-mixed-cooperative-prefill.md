@@ -2,8 +2,9 @@
 
 - Status: Proposed
 - Date: 2026-08-22
+- Updated: 2026-08-22 — executor-audit corrections incorporated: payload-ownership rule (`pending_target_hidden` parent-allocation retention), per-model budgets + K semantics (K excludes pending; preflight charges K+1), full-store invalidation on reset/poison/failed-restore, preflight-all-then-mutate restore contract, A.5 rewritten (slot-aware MTP/target transactional rollback is LIVE on main; H38 still pins `rollback_la_to`), B.0 publisher corrected to `publish_prefill_cohort_after_gate`, registry wording narrowed, and the scope directive: ALL supported families get Lane A. Rebased onto `242882e8`.
 - Owners: hf2q serving engine (execution: the active qwen35/qwen38 serving-lane session; plan authored by the FreeToken research session)
-- Code pins: hf2q `815bd48d` (= origin/main at authoring), mlx-native `0.11.2`. Every file:line below was re-verified at this commit; re-verify anchors after any pull before editing.
+- Code pins: hf2q `242882e8` (= origin/main at this revision), mlx-native `0.11.2`. Anchors were authored at `815bd48d`; every correction-touched anchor was re-verified at `242882e8`. Re-verify anchors after any pull before editing.
 - Provenance: full paper+code study of FreeToken (arXiv 2608.16157, "FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution") mapped onto hf2q/mlx-native by a nine-agent research swarm, then adversarially reviewed by two independent external models (Kimi K3 via opencode; gpt-5.6-sol via codex, 516k-token source-grounded review). Both reviews' MUST-FIX items are incorporated; the gpt-5.6-sol review found and this ADR closes a stale-KV lineage coherence bug in the original draft (§A.2).
 
 ## Context
@@ -25,6 +26,8 @@ Key enabling facts at HEAD:
 
 Three lanes, in this order. Lane A is the primary value; Lane B is gated on a coherence spike; Lane C ships with Lane A's first PR.
 
+**Scope directive (Robert, 2026-08-22): every supported serving family gets the Lane A benefit — the ADR is not complete while any supported model or family lacks it.** The first implementation lands on the qwen35-family engine (one engine serving both Qwen3.6-35B-A3B and Qwen3.8-27B); gemma4 and deepseek4 parity are REQUIRED phases, not optional follow-ons. Per-family gates run on the artifact each lane actually serves.
+
 **REMOVED from committed scope** (both reviewers concurred): raising `MAX_COOPERATIVE_PREFILL_ROWS` (the "Lane 2b" of the draft). ADR-042 records a 4,096-row OOM (ADR-042:59, :503) and a later 4,096/cold-cooperative failure (:2069); projected gain is ~1.15× confined to the pure-prefill wave; and the receipt verifiers/artifact tests encode the exact 2,048-row shapes. Reopen condition: Lane B profiling still shows pure-prefill F-dominance AND a design that materially reduces transient footprint (not the same constant raise).
 
 ### Lane A — Multi-anchor slot-local checkpoints (qwen35 first)
@@ -44,23 +47,34 @@ Three-state publication machine (gpt-5.6-sol M2; generalizes DeepSeek4's pending
 
 **A.2 — Linear-lineage invariant (the coherence core; closes the draft's stale-KV bug).** Anchors index positions in ONE mutable per-slot KV log. Restoring anchor A and then writing a divergent suffix overwrites the physical rows that backed every deeper anchor — after which a deeper anchor's token match AND cursor check can both pass while the KV bytes are wrong. Therefore, fail-closed law:
 
-> Before the first KV write after restoring anchor A, invalidate every anchor deeper than A (bump `lineage_epoch`; drop or tombstone the descendants). A cold reset invalidates all anchors. Anchor selection must check epoch, never tokens+cursor alone.
+> Before the first KV write after restoring anchor A, invalidate every anchor deeper than A (bump `lineage_epoch`; drop or tombstone the descendants). A cold reset, a slot poison, or any FAILED restore invalidates the ENTIRE store for that slot — mandatory for fail-closed recovery. Anchor selection must check epoch, never tokens+cursor alone.
 
 Mandatory regression (must exist before any restore path merges): build lineage A→B→C, restore A, prefill divergent branch X, then send a request matching old C — the engine must go cold (or restore A), NEVER restore B or C. Byte-compare the divergent-branch output against a cold run.
 
 **A.3 — Restore-on-divergence.** Extend slot affinity (`qwen35_slot_affinity`, engine.rs:16975-17047) from best-of-{live cursor, one anchor} to best-of-{live cursor, deepest *epoch-valid* committed anchor whose tokens are a prefix of the request}. Matching preserves **equality** (not strict prefix): the existing full-prompt-equality path replays stored `prefill_logits` and skips the forward entirely (engine.rs:16985, :17001) — that behavior generalizes to the deepest anchor equal to the full new prompt. On divergence inside retained tokens: `restore_slot_anchor` at the selected anchor, re-prefill only the suffix. Today's behavior in that case is cold; this is the lane's entire payoff.
 
+**Restore contract (fail-atomicity — executor-audit finding, verified at `242882e8`):** `restore_slot_anchor` currently interleaves validation with mutation — full-attn cursors are rewound inside the same loop as the per-layer ensures, and the MTP cursor is rewound before the linear-state copies, which can still fail — so a mid-restore error leaves the slot partially rewound. Lane A must refactor it to **preflight ALL validations, then mutate**. On any restore error: hard-reset the slot and clear its entire anchor store — NEVER fall back to a shallower anchor after a partial restore (that is the A.2 bug class by another road).
+
 **A.4 — Eviction & budget.**
 - Eviction: positional keep-newest-K (K default 4; anchors form a nested prefix chain, so LRU-by-restore is actively wrong — a twice-edited turn would evict the deeper anchor about to be needed; both reviewers concurred). Descendant invalidation (A.2) runs before any eviction policy matters. One refinement permitted later, telemetry-first: reserve slot 0 of the list for the oldest/system boundary, K−1 for newest.
-- Budget: `HybridKvSlotAnchor::total_bytes()` (kv_cache.rs:1004) undercounts — it omits prompt tokens, the vocab-sized `prefill_logits`, and optional speculative hidden state owned by `Qwen35PromptAnchor` (engine.rs:16865-16871, spec boundary struct engine_qwen35.rs:3403). Account **all owned payload** as a separate reclaimable `anchor_owned_bytes` line surfaced to admission — NOT added to scheduler high-water, which is deliberately monotonic because Metal pages are never reclaimed (src/serve/scheduler.rs:1047, :1218); host-owned evictable bytes charged there would never return. Preflight fail-closed: a capture that would exceed the anchor budget is skipped (documented scope gap), never partially taken.
+- **Payload ownership rule (executor-audit finding):** every element of an anchor's payload must be host-owned or a dedicated right-sized allocation — NEVER a view/clone retaining a larger transient allocation. Today `pending_target_hidden` is an `MlxBuffer` captured by cloning a view whose parent is the prefill residual allocation (engine_qwen35.rs:3406, capture sites :3972/:4759): the logical row is ~20 KiB, but the clone retains the ~40 MiB (2,048-row) / ~80 MiB (4,096-row) parent Metal allocation — one per anchor. Capture must copy the row into a dedicated `[1, H]` allocation or host memory. Required regression: after capture, assert no chunk-sized parent allocation remains retained by any anchor (allocation-accounting check).
+- Budget: `HybridKvSlotAnchor::total_bytes()` (kv_cache.rs:1004) undercounts — it omits prompt tokens, the vocab-sized `prefill_logits`, and the spec hidden row owned by `Qwen35PromptAnchor` (engine.rs:16865-16871, spec boundary struct engine_qwen35.rs:3404-3407). Account **all owned payload** as a separate reclaimable `anchor_owned_bytes` line surfaced to admission — NOT added to scheduler high-water, which is deliberately monotonic because Metal pages are never reclaimed (src/serve/scheduler.rs:1047, :1218); host-owned evictable bytes charged there would never return. **K counts committed anchors only; the preflight charges K committed + 1 pending.** Preflight fail-closed: a capture that would exceed the anchor budget is skipped (documented scope gap), never partially taken.
+- Per-model anchor cost (budget is byte-denominated; `K_effective = min(4, floor(slot_anchor_budget / anchor_bytes(model)))` — computed from allocation code, never doc comments):
+
+  | Model | recurrent+conv state | ≈ total w/ logits+tokens+hidden | K=4 × 4 slots | K=4 × 8 slots |
+  |---|---|---|---|---|
+  | Qwen3.6-35B-A3B (30 DeltaNet layers) | 62.8 MiB | ≈63.5 MiB | ≈1.02 GiB | ≈2.03 GiB |
+  | Qwen3.8-27B (48 layers) | 149.6 MiB | ≈150.3 MiB | ≈2.35 GiB | ≈4.70 GiB |
+
+  Gemma4/DeepSeek4 rows are computed the same way when their parity phases open.
 - Idle conservation invariant (strict equality, deliberately stricter than FreeToken's own `<=` on its GDN pool): at scheduler idle, per slot and in aggregate, `live cursor bytes + retained prefix accounting + anchor_owned_bytes + free = grant`. Run it in the same idle hook style FreeToken audits use; it is the audit that would have caught the repo's stale `n_v_heads=8` byte-math comments years early.
 
-**A.5 — Spec-decode rules** (binding on any future work that enables speculation slot-aware; today H38 keeps them latent):
-1. Prefill-time anchors copy bytes OUT of live buffers — spec-safe as-is.
-2. A decode-time anchor (not in this ADR's scope) may only snapshot after accept/rollback settles — never from optimistic post-verify state.
-3. Any boundary capture sharing the LA capture arena must extract its rows before `clear_la_capture`/re-arm. Note the arena's true size: ≈1.96 GiB at the 32-token SerialFifo window (30 layers × 67 MiB), 4× the stale in-code comment — Lane A does NOT use this arena (slice-boundary capture reads live state), and MUST NOT replicate it per slot.
+**A.5 — Speculation interplay (LIVE requirements — corrected after the executor audit; verified at `242882e8`).** Slot-aware speculative rollback is live on main via its own transactional functions — `rollback_slot_mtp_transaction` (engine_qwen35.rs:4142) and `rollback_slot_target_transaction` (:4173), with fail-closed slot reset if a rollback itself fails (:4197-4226). H38 (engine.rs:44835-44897) still pins `rollback_la_to` — and with it the per-token DeltaNet capture arena — out of the slot-aware worker. The rules below bind NOW and are co-designed with the speculation lane:
+1. Anchor capture and restore must be sequenced strictly outside an open MTP/target rollback transaction — never observe mid-transaction cursors. Prefill-time anchors copy bytes OUT of live buffers and are safe once that sequencing holds.
+2. After any restore, consumers must re-validate that target AND MTP cursors both equal the anchor's `token_count` — the coherence marker documented on `Qwen35SpecPrefixBoundary` itself (engine_qwen35.rs:3401-3402).
+3. A decode-time anchor (not in this ADR's scope) may only snapshot after accept/rollback settles — never from optimistic post-verify state; any capture sharing the LA arena must extract its rows before `clear_la_capture`/re-arm. The arena's true size is ≈1.96 GiB at the 32-token SerialFifo window (30 layers × 67 MiB), 4× the stale in-code comment — Lane A does NOT use this arena (boundary capture reads live state) and MUST NOT replicate it per slot.
 
-**A.6 — Family parity (follow-on PRs, same invariants):** gemma4 (`Gemma4PromptAnchor` is structurally identical; retire serial-path `live_prefix_tokens` special-casing where subsumed), then deepseek4 (its two-anchor pending/committed pair generalizes to the store; wire `Deepseek4CacheSnapshot::resident_bytes()` — currently zero callers — into the same accounting).
+**A.6 — Family parity (REQUIRED phases per the scope directive, same invariants):** gemma4 (`Gemma4PromptAnchor` is structurally identical; retire serial-path `live_prefix_tokens` special-casing where subsumed), then deepseek4 (its two-anchor pending/committed pair generalizes to the store; wire `Deepseek4CacheSnapshot::resident_bytes()` — currently zero callers — into the same accounting). The ADR does not reach Implemented until every supported serving family carries the anchor store.
 
 **A.7 — Explicitly deferred, with reopen conditions:**
 - *Cross-slot / restart-surviving registry tier*: the SerialFifo `LcpRegistry` + disk hydrate is the only mechanism that survives slot reassignment and restart. It remains in place, documented as the restart-hydrate tier; extending it slot-aware is a **separate future ADR** (it needs a slot-parameterized `restore_partial` — the current one is copy-owning and rewrites every sequence cursor, kv_cache.rs:3435, :3493 — plus an ownership answer to the `b44b92ed` tenant-isolation pin; FreeToken's donate-not-copy/CoW/dual-currency eviction is the design vocabulary for that ADR, not this one). Reopen when telemetry shows foreign-slot landings or restart warm-up matters.
@@ -78,7 +92,7 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 
 ### Lane B — Mixed-phase cooperative prefill (deepseek4)
 
-**B.0 — Coherence spike, first, in its own branch (Kimi M1 — this gate decides the lane).** Mixed cooperative execution has never run: cohort commit/poison concurrent with live decode cursors on peer slots. Before any policy work: enumerate exactly which per-slot state the cooperative transaction touches (`Deepseek4CooperativePrefillPlan` path, all-or-poison commit via `publish_verifier_cohort_after_gate`; direct session-cache borrow engine_deepseek4.rs:649-683), prove decode-lane KV append cursors and compressor accumulators are untouched by commit AND by poison, and land a byte-identity test shaped *cohort-prefill + concurrent decode step* (not cohort-prefill alone). **Abort criterion:** if the spike shows cohort commit touches decode-lane state, the `engine.rs:9716-9731` bypass is load-bearing for correctness, Lane B becomes a scheduler redesign, and it exits this ADR to its own.
+**B.0 — Coherence spike, first, in its own branch (Kimi M1 — this gate decides the lane).** Mixed cooperative execution has never run: cohort commit/poison concurrent with live decode cursors on peer slots. Before any policy work: enumerate exactly which per-slot state the cooperative transaction touches (`Deepseek4CooperativePrefillPlan` path, all-or-poison commit via `publish_prefill_cohort_after_gate` — verifier_forward.rs:76, the cooperative-PREFILL publisher; `publish_verifier_cohort_after_gate` in decode_cohort.rs:12 is the DECODE publisher, which a prior draft misnamed here; direct session-cache borrow engine_deepseek4.rs:649-683). The spike must exercise BOTH the commit and poison paths of the prefill publisher, and their interplay with the decode publisher during a Mixed step, prove decode-lane KV append cursors and compressor accumulators are untouched by commit AND by poison, and land a byte-identity test shaped *cohort-prefill + concurrent decode step* (not cohort-prefill alone). **Abort criterion:** if the spike shows cohort commit touches decode-lane state, the `engine.rs:9716-9731` bypass is load-bearing for correctness, Lane B becomes a scheduler redesign, and it exits this ADR to its own.
 
 **B.1 — Mixed cohort policy (only after B.0 passes).** Treat this as a new scheduler policy, not the removal of one bypass: cohort planning under a runnable decode must honor a per-lane row cap AND the aggregate cap while preserving FIFO-prefix compatibility, identical-plan/reply-class requirements, and recovery-tail behavior (planner engine.rs:9601-9687; lane clamp slots.rs:224-242; `MIN_MATRIX_APPEND_TOKENS = 33`, verifier_forward.rs:25; recovery tail engine_deepseek4.rs:48).
 - Rows-per-lane parameterized ∈ {128, 256}; **default 4×128** (halves F payments per aggregate progress while keeping GPU occupancy nearest today's serial Mixed slice); promote to 4×256 only on hardware measurement with contract margin. Projected walls for the canonical four ~3,520-token warm-suffix workload: serial Mixed ≈ 75 s of aggregate prefill work; 4×256 ≈ 31 s; 4×128 ≈ 46 s with near-serial per-slice occupancy.
@@ -117,7 +131,9 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 
 ## Acceptance (the ADR is DONE when)
 
-- [ ] A.1–A.4 landed for qwen35 with all six Lane A gates green (receipts linked here).
+- [ ] A.1–A.4 landed for the qwen35-family engine with all six Lane A gates green on the artifacts the lane actually serves — both Qwen3.6-35B-A3B and Qwen3.8-27B (receipts linked here).
+- [ ] Family coverage complete per the scope directive: gemma4 and deepseek4 anchor stores landed under the same invariants and gates.
+- [ ] Payload-ownership regression (no retained parent allocations) and the preflight-then-mutate `restore_slot_anchor` refactor landed.
 - [ ] A.2 lineage regression and the new SlotAware divergence gate exist in `scripts/` and fail closed.
 - [ ] Telemetry (A.8) emitting in production logs.
 - [ ] Lane C doc corrections merged; budget hazards + registry end-state documented in operating-kv-cache.md; ADR-017-per-family-status row updated.
@@ -139,7 +155,7 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 
 ### Neutral
 - FreeToken's remaining machinery stays un-imported; this ADR records why, which is itself a decision.
-- The SerialFifo registry tier remains production-dead but documented as the restart-hydrate mechanism pending the A.7 follow-on.
+- The SerialFifo registry tier remains active for SerialFifo restore/hydrate but unused by the SlotAware scheduler; documented as the restart-hydrate mechanism pending the A.7 follow-on.
 
 ## Links
 - ADR-040 (continuous batching; slot-aware scheduler substrate) — Status 🟢 full-context three-family workload served.
