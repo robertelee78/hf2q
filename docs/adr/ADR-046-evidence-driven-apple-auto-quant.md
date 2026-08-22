@@ -4,7 +4,8 @@
   generation and CLI activation remain gated by the phases below
 - Date: 2026-08-18
 - Updated: 2026-08-21 — the current release boundary pins exact published
-  `mlx-native = 0.11.0`; the first official source-teacher gate below remains
+  `mlx-native = 0.11.1`, including direct execution of packed Q5_K/Q6_K
+  embedding rows; the first official source-teacher gate below remains
   historical evidence from exact `0.10.16`. The backend-independent
   exact-teacher target storage and model-free allocation binding cannot invoke
   the proposer without authenticated source-precision completion,
@@ -98,11 +99,13 @@ and QDQ affine primitives, but the existence of a primitive does not prove
 that hf2q's loader, graph routing, prompt QMM, token QMV, width-N, or model
 family is complete or fast.
 
-Serving transformations are part of the candidate too. For example, the
-Qwen35 GPU path currently uploads `output.weight` as Q4_0 from its F32-loaded
-form even when conversion promoted the tensor to Q6_K. That load-time
-requantization may be a valid speed trade, but it changes the executed weights
-and therefore requires the same source-quality evidence as conversion.
+Serving transformations are part of the candidate too. When this decision was
+accepted, the Qwen35 GPU path uploaded `output.weight` as Q4_0 from an
+F32-loaded form even when conversion promoted the tensor to Q6_K. The current
+native-GGUF path instead retains the exact output-head blocks and recorded GGML
+type, and shared MTP borrows that same allocation. Any future serving
+transformation would still change the executed weights and therefore requires
+the same source-quality evidence as conversion.
 
 The motivating source model may be the upstream checkpoint or any exact
 weight-modified checkpoint: fine-tuned, merged, pruned, abliterated, or
@@ -657,9 +660,12 @@ It does not yet contain the real Qwen3.8 variable-unit/tap catalog. The exact
 Qwen3.8 source-precision teacher, full differentiable QDQ graph, sensitivity
 receipts, materialized mixed policies, repair loop, untouched acceptance
 results, typed execution manifest, and matched Apple measurements remain
-mandatory later gates. In particular, the current Qwen inference loader's
-hidden stored-to-Q4_0 conversions must be made explicit before Apple cost can
-guide allocation.
+mandatory later gates. In particular, the Qwen loader transformations that
+existed when this substrate was defined had to become explicit before Apple
+cost could guide allocation. Production native-GGUF loading now preserves the
+artifact's exact embedding, projection, and output-head block encodings; the
+historical execution-lineage fixtures below continue to describe the
+source-teacher evidence path they were built to validate.
 
 #### 2026-08-19 — physical execution-lineage schema v4 substrate
 

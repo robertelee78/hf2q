@@ -44,7 +44,10 @@ cache, or forward graph.
   iter-344; per-token `forward_prefill` was 14-45× slower than peer).
   Opt out to per-token via `HF2Q_BATCHED_PREFILL=0` for parity
   diagnostics — see Category 2.
-- Dense **F32** KV cache.
+- KV representation is family-specific. The canonical Qwen launcher uses
+  TQ-packed 8-bit K/V without an F32 shadow; `HF2Q_TQ_KV=0` is the explicit
+  conventional-F32 diagnostic. DeepSeek and Gemma retain their own qualified
+  cache contracts rather than inheriting Qwen's representation.
 - Default decode (single-buffer or dual-buffer internal tuning; not
   user-configurable).
 - **Auto Q8 lm_head** with exact F32 rerank, selected when
@@ -88,7 +91,7 @@ cache, or forward graph.
   pre-request turn anchor; poisoned or inconsistent state resets fully.
   The 0.1.7 release also pairs large automatic MoE gate/up
   projections through the routing-schedule primitive introduced in
-  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.11.0`.
+  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.11.2`.
   Decode-sized and forced diagnostic routes remain independent;
   native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
@@ -136,7 +139,7 @@ checkout-disjoint `CARGO_HOME` and target directory, clears Rust toolchain,
 compiler, documentation, flags, wrapper, target, and profile override
 variables, and rejects Cargo config anywhere in the packed root's ancestry.
 Its dependency receipt binds the packed `Cargo.lock` and raw `cargo metadata`
-bytes, including the exact `mlx-native 0.11.0` crates.io source and checksum.
+bytes, including the exact `mlx-native 0.11.2` crates.io source and checksum.
 The protected release workflow rehashes and revalidates those downloaded raw
 files, then requires its newly packed `Cargo.lock` to be byte-identical before
 publishing.
@@ -508,9 +511,9 @@ These are deliberately not part of any category:
 - `docs/operator-env-vars.md` — per-variable effects and defaults.
 - `docs/adr/ADR-004-gguf-compatibility.md` — source-bound Qwen3.8 automatic
   pair and first-image cache acceptance evidence.
-- `docs/adr/ADR-009-reference-parity-and-coherence-recovery.md` — why
-  F32-KV is the default, and the original per-token prefill baseline
-  (since superseded as the default by ADR-028 iter-344).
+- `docs/adr/ADR-009-reference-parity-and-coherence-recovery.md` — the
+  historical F32-KV and per-token prefill baselines; current family defaults
+  are defined above and in the family-specific ADRs.
 - `docs/adr/ADR-010-exact-batched-kernel-parity.md` — why batched-prefill
   is now the default and why its `sliding_wrap` byte-parity is deferred.
 - `docs/adr/diary/ADR-028-peer-parity-coherence-and-speed.md` — iter-344

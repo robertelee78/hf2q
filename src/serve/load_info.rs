@@ -935,14 +935,14 @@ pub fn emit_tracing(info: &LoadInfo) {
 // Helpers — derivation from an open GGUF
 // ---------------------------------------------------------------------------
 
-/// Dominant non-fp tensor-type label.
+/// Exact GGUF quantization profile, falling back to the dominant non-fp
+/// tensor-type label for legacy or custom artifacts.
 ///
-/// Builds a histogram of `GgmlType` variants over every tensor in the
-/// open GGUF (skipping `F32` / `F16`) and returns the label with the
-/// largest count, ties broken by `HashMap` iteration order (the legacy
-/// behaviour preserved verbatim from
-/// `engine.rs::infer_quant_type_from_gguf` — kept as-is so the C1
-/// migration introduces no observable behaviour delta).
+/// Standard mixed profiles such as Q5_K_M cannot be inferred from one tensor:
+/// a Q5_K_M artifact intentionally contains Q5_K and Q6_K tensors. Prefer its
+/// authoritative `general.file_type` identity. Builds a histogram only when
+/// that metadata is absent or outside the runtime pool's supported profile
+/// set, preserving observability for legacy and custom artifacts.
 ///
 /// Returns `None` for pure-fp GGUFs (every tensor is `F32` or `F16`) and
 /// for empty GGUFs.
@@ -960,6 +960,12 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
         gguf.metadata_string(crate::quantize::ggml_quants::DEEPSEEK4_AGENTIC_Q2_METADATA_KEY)
     {
         return Some(profile.to_string());
+    }
+    if let Some(profile) = gguf
+        .metadata_u32("general.file_type")
+        .and_then(crate::serve::quant_select::QuantType::from_gguf_file_type)
+    {
+        return Some(profile.as_str().to_string());
     }
 
     use mlx_native::GgmlType;
@@ -1103,6 +1109,7 @@ mod tests {
     const GGML_TYPE_F32: u32 = 0;
     const GGML_TYPE_F16: u32 = 1;
     const GGML_TYPE_Q4_K: u32 = 12;
+    const GGML_TYPE_Q5_K: u32 = 13;
     const GGML_TYPE_Q6_K: u32 = 14;
     const GGML_TYPE_Q8_0: u32 = 8;
 
@@ -1110,6 +1117,8 @@ mod tests {
     // `block_bytes()`.
     const BLOCK_VALUES_Q4_K: usize = 256;
     const BLOCK_BYTES_Q4_K: usize = 144;
+    const BLOCK_VALUES_Q5_K: usize = 256;
+    const BLOCK_BYTES_Q5_K: usize = 176;
     const BLOCK_VALUES_Q6_K: usize = 256;
     const BLOCK_BYTES_Q6_K: usize = 210;
     const BLOCK_VALUES_Q8_0: usize = 32;
@@ -1261,6 +1270,27 @@ mod tests {
 
         let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open synthetic gguf");
         assert_eq!(infer_quant_label(&gguf), Some("Q4_K".to_string()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn qwen38_infer_quant_label_prefers_exact_q5_k_m_file_type_over_tensor_codec() {
+        let path = tmp_path("q5_k_m_profile");
+        let tensors = vec![TensorSpec {
+            name: "token_embd.weight",
+            shape: vec![BLOCK_VALUES_Q5_K],
+            ggml_type_id: GGML_TYPE_Q5_K,
+            byte_len: BLOCK_BYTES_Q5_K,
+        }];
+        write_synthetic_gguf_with_metadata(
+            &path,
+            &[KvSpec::U32("general.file_type", 17)],
+            &tensors,
+        );
+
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open synthetic gguf");
+        assert_eq!(infer_quant_label(&gguf), Some("Q5_K_M".to_string()));
 
         let _ = std::fs::remove_file(&path);
     }

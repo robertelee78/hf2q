@@ -15,7 +15,7 @@ MIN_REPEAT_IMPROVEMENT_PERCENT=${MIN_REPEAT_IMPROVEMENT_PERCENT:-5}
 DECODE_MVN=${HF2Q_DECODE_MVN:-0}
 DECODE_MV_EXT=${HF2Q_DECODE_MV_EXT:-1}
 
-readonly MODEL_ID='Qwen3.8 27B'
+MODEL_ID=${MODEL_ID:-}
 readonly MAX_TOKENS=128
 readonly CASES='code-a code-b code-c repeat-a repeat-b repeat-c'
 readonly TRIAL_ORDER='off auto auto off'
@@ -189,6 +189,28 @@ wait_ready() {
     return 1
 }
 
+resolve_loaded_model_id() {
+    local loaded_model_id
+    local request
+    loaded_model_id=$(curl --fail --silent --show-error \
+        "http://127.0.0.1:$PORT/v1/models" | jq -er '
+          [.data[] | select(.loaded == true)]
+          | if length == 1 then .[0].id
+            else error("expected exactly one loaded model") end
+        ')
+    if [[ -z "$MODEL_ID" ]]; then
+        MODEL_ID=$loaded_model_id
+        for request in "$OUT_DIR"/requests/*.json; do
+            jq --arg model "$MODEL_ID" '.model = $model' "$request" \
+                >"$request.tmp"
+            mv "$request.tmp" "$request"
+        done
+    elif [[ "$loaded_model_id" != "$MODEL_ID" ]]; then
+        echo "Qwen3.8 loaded model identity drifted: expected=$MODEL_ID actual=$loaded_model_id" >&2
+        return 1
+    fi
+}
+
 run_trial() {
     local trial_index=$1
     local mode=$2
@@ -212,6 +234,7 @@ run_trial() {
         "$script_dir/serve_qwen38_opencode.sh" >"$log_path" 2>&1 &
     server_pid=$!
     wait_ready "$log_path"
+    resolve_loaded_model_id
 
     curl --fail --silent --show-error \
         --header 'Content-Type: application/json' \
@@ -308,6 +331,7 @@ model_bytes=$(file_bytes "$MODEL_PATH")
 jq -n \
     --arg binary_path "$BINARY_PATH" \
     --arg binary_sha256 "$binary_sha256" \
+    --arg model_id "$MODEL_ID" \
     --arg model_path "$MODEL_PATH" \
     --arg model_sha256 "$MODEL_SHA256" \
     --arg model_verification "$model_verification_mode" \
@@ -326,7 +350,7 @@ jq -n \
     --argjson auto_accepted_tokens "$auto_accepted" \
     '{schema:1,verdict:"pass",exact_choices_parity:true,
       binary:{path:$binary_path,sha256:$binary_sha256},
-      model:{path:$model_path,sha256:$model_sha256,bytes:$model_bytes,
+      model:{id:$model_id,path:$model_path,sha256:$model_sha256,bytes:$model_bytes,
              verification:$model_verification,file_snapshot:$model_file_snapshot},
       routing:{dense_decode_mvn:$decode_mvn,dense_decode_mv_ext:$decode_mv_ext},
       workload:{trial_order:"off auto auto off",cases_per_group_per_trial:3,

@@ -80,6 +80,8 @@ pub fn load_mtp_weights_if_present_with_shared_head(
                  mtp_use_dedicated_embeddings=True"
                     )
                 })?;
+        super::forward_gpu::ensure_native_embedding_admitted(&buf)
+            .with_context(|| format!("admit direct execution for {embed_tokens_tname}"))?;
         super::weight_pool::register_weight_buffer(device, &buf.buffer)
             .with_context(|| format!("register {embed_tokens_tname}"))?;
         tracing::info!(
@@ -121,10 +123,10 @@ pub fn load_mtp_weights_if_present_with_shared_head(
     // that same tied token-embedding allocation. Convert correctly skips emitting
     // `blk.{N}.nextn.shared_head_head.weight` in this configuration.
     //
-    // Resolution: if the dedicated tensor is present we use it (Qwen3.5 MTP);
-    // otherwise (shared mode) we fall back to the resolved main head. The
-    // bf16 GPU buffer is materialised the same way either path; vocab_size
-    // is derived from the row count of whichever tensor we actually loaded.
+    // Resolution: if the dedicated tensor is present we use its native GGUF
+    // buffer (Qwen3.5 MTP); otherwise shared mode borrows the resolved main
+    // head allocation. `vocab_size` is derived from the row count of the exact
+    // tensor selected by that rule.
     let shared_head_head_tname = format!("{nextn}.shared_head_head.weight");
     let (shared_head_head, shared_head_head_ggml_type, vocab_size, shared_head_head_source) =
         if let Some(info) = gguf.tensor_info(&shared_head_head_tname) {

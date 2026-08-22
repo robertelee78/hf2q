@@ -589,10 +589,10 @@ impl Hf2qControl {
                         ))
                     }
                     ActivationResult::Ready(success) => {
-                    bail!(
-                        "hf2q returned unexpected switch status {}",
-                        terminal_safe(&success.status)
-                    )
+                        bail!(
+                            "hf2q returned unexpected switch status {}",
+                            terminal_safe(&success.status)
+                        )
                     }
                     ActivationResult::Conflict(_) => {
                         bail!("the model pool changed before the switch; select the model again")
@@ -1019,8 +1019,8 @@ mod tests {
             "repository":"owner/mixed",
             "revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "candidates":[
-                {"candidate_id":null,"filename":"gguf/model-q5_k_m.gguf","bytes":19535701568_u64,"quant_hint":"Q5_K_M","role":"text_model","selectable":false,"unavailable_reason":"Q5 policy identity deferred"},
                 {"candidate_id":"q6-candidate","filename":"gguf/model-q6_k.gguf","bytes":22431000128_u64,"quant_hint":"Q6_K","role":"text_model","selectable":true,"unavailable_reason":null},
+                {"candidate_id":"q5-candidate","filename":"gguf/model-q5_k_m.gguf","bytes":19535701568_u64,"quant_hint":"Q5_K_M","role":"text_model","selectable":true,"unavailable_reason":null},
                 {"candidate_id":"q8-candidate","filename":"gguf/model-q8_0.gguf","bytes":28000000000_u64,"quant_hint":"Q8_0","role":"text_model","selectable":true,"unavailable_reason":null},
                 {"candidate_id":null,"filename":"gguf/model-bf16.gguf","bytes":54657734208_u64,"quant_hint":"BF16","role":"text_model","selectable":false,"unavailable_reason":"BF16 unsupported"},
                 {"candidate_id":null,"filename":"gguf/mmproj-f16.gguf","bytes":927607264_u64,"quant_hint":null,"role":"companion","selectable":false,"unavailable_reason":"not a text model"}
@@ -1208,6 +1208,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(q6.as_deref(), Some("q6-candidate"));
+
+        let q5 = control
+            .select_gguf(
+                "owner/mixed",
+                Some("q5_k_m"),
+                None,
+                None,
+                &mut unused,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(q5.as_deref(), Some("q5-candidate"));
 
         let mut picker = std::io::Cursor::new(b"1\n");
         let mut output = Vec::new();

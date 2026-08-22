@@ -108,7 +108,7 @@ write_summary() {
       "$over_limit_measurement_samples" \
     --argjson telemetry_gaps "$telemetry_gaps" '
     . + {schema_version:3,source_sha:$source_sha,model_sha256:$model_sha256,
-      mlx_native_version:"0.11.0",raw_sha256:$raw_sha256,
+      mlx_native_version:"0.11.2",raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
       required_start_state:"nominal",maximum_measurement_state:"fair",
       measurement_log_sha256:$measurement_log_sha256,

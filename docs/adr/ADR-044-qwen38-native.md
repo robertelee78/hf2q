@@ -4,16 +4,20 @@
   speculation accepted for the measured one-slot workloads; vision candidate
   is under exact-artifact acceptance
 - Date: 2026-08-16
-- Updated: 2026-08-21 — the canonical server now owns exact fixed-K3 MTP and
+- Updated: 2026-08-22 — the canonical server now owns exact fixed-K3 MTP and
   request-history speculation with per-proposer measured cost gates. GGUF
   inference preserves the artifact's declared weight encodings; the qualified
   width-four verifier substantially narrows the measured one-slot code gap.
+  Q5_K_M artifacts with Q5_K token embeddings and Q6_K output heads now retain
+  and execute those exact representations. The published dependency also makes
+  equal-logit argmax choose the lowest vocabulary index deterministically.
   A one-slot worker now uses the measured 4,096-token prefill quantum while
-  multi-slot workers retain the 2,048-token fairness ceiling. The remaining
-  single-user gap and true physical multi-slot batching remain performance
-  blockers. Exact Qwen3.8 gates are bound to the paired abliterated text
-  artifact and reuse snapshot-bound model-verification receipts instead of
-  repeatedly scanning an unchanged multi-gigabyte GGUF.
+  multi-slot workers retain the 2,048-token fairness ceiling. The qualified
+  Q5_K_M one-slot workload now has a sealed, stable faster-than-baseline result;
+  broader workloads and true physical multi-slot batching remain open. Exact
+  Qwen3.8 gates are bound to the paired abliterated text artifact and reuse
+  snapshot-bound model-verification receipts instead of repeatedly scanning an
+  unchanged multi-gigabyte GGUF.
 - Owners: hf2q conversion, quantization, inference, and serving
 
 ## Context
@@ -362,6 +366,77 @@ runtime-unavailable fallback, but generated 450 tokens in 30.77 seconds
 (14.62 aggregate tok/s). That is correctness evidence only. Qwen still
 interleaves scalar slot forwards; true physical width-N batching remains the
 blocking aggregate-throughput item.
+
+### Native Q5_K_M execution and deterministic argmax (2026-08-22)
+
+Issue 146 exposed a separate artifact-coverage failure: the server could parse
+and report ready for a Q5_K_M file whose `token_embd.weight` was Q5_K, then
+failed on the first forward because no admitted native gather existed. The
+correction extends the one embedding-routing authority to Q5_K and Q6_K and
+checks packed byte extent, storage dtype, executable capability, and resolved
+kernel route before execution. Unsupported embedding encodings fail closed;
+they are never expanded and rebuilt as another codec.
+
+The accepted author-hosted artifact is repository
+`jenerallee78/Qwen3.8-27B-Abliterated-SFT`, immutable revision
+`0a72776892f98db49381fdf69f4b9982222ec9dc`, file
+`gguf/qwen38-abliterated-sft-q5_k_m.gguf`, 19,535,701,568 bytes, SHA-256
+`4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e`.
+It contains 866 tensors and declares GGUF file type 17. Its token embedding and
+MTP embedding-hidden projection are Q5_K; its output head is Q6_K.
+
+The real Apple-Silicon storage/parity gate loads those bytes and asserts that
+the legacy F32 embedding and output tables are empty, every target projection
+remains in an artifact-declared K-quant representation, the MTP block borrows
+the exact target output-head Metal allocation and byte offset, and a
+four-position target verification followed by the shared-token handoff makes
+the same greedy choices as serial one-position forwards. The gate passed from
+hf2q commit `909dfd0b3dcce3635c54b2460771c91ee0f9ec2a` in 4.17 seconds.
+
+That commit resolves published, checksum-pinned `mlx-native 0.11.2`. Its
+protected release run `32567649315` verified the exact source, packed archive,
+crates.io bytes, downloaded registry archive, and GitHub release bytes. Tag
+`v0.11.2` and the release target resolve to
+`54859646fd1aab1878f891c35060d0fb961bc1b2`; both public crate surfaces have
+SHA-256
+`22f4bd6661e77994c6f26a79fdd2c188f3d5252aa7e51616f5feb080b22da8e0`.
+The release also corrects GPU argmax ties to choose the lowest vocabulary
+index, matching the engine's CPU greedy rule and preventing exact speculative
+verification from depending on the reduction tree.
+
+The accepted performance binary is built from
+`8f999ca75c014c1298670f593d1a9dd606fe5e43` with exact embedded provenance and
+SHA-256
+`15e7959f6227833b889e0ad09d4be86794f06fb4c6b12992d0a3de37d2049f7c`.
+The paired baseline is bound to commit
+`9a286ac98d2cab74231bd3f1fc3f2b8bdf05422e` and executable SHA-256
+`26fa7cb0f42c24468b95c7f6727e36ceb0eb4da3871e0ca0e3bcf7310705095b`.
+The sealed `qwen38-q5-matched-8f999ca7-r3` receipt has summary SHA-256
+`0ba9fd132bbbe7fffdc79e87d2d747e6b07e7e9e8388428e1babf5d6ba22528f`.
+
+That AC Automatic, nominal-thermal A-B-B-A run passed 12 executable-code
+quality receipts and 12 exact-transcription receipts. hf2q completed the code
+groups in a 10.579800-second median versus 11.410625 seconds, a 1.078529x
+speed ratio. It completed exact-repeat groups in 4.784610 seconds versus
+5.485687 seconds, a 1.146528x ratio. Median internal decode was 48.642751
+tokens/s versus 43.834526 tokens/s, and median semantic streamed TTFT was
+429.711 ms versus 488.924 ms. hf2q recorded 324 proposer rounds and 918
+accepted draft tokens; the baseline recorded 990 drafted and 936 accepted
+tokens. The worst hf2q arm beat the best baseline arm in wall time and
+end-to-end throughput for both groups. Maximum group wall/decode spread was
+1.436742%, maximum per-case spread was 2.665646%, and the observed bands did
+not overlap.
+
+Two prior attempts remain explicitly rejected. A Low Power Mode run had large
+hf2q arm drift, and the first Automatic run exceeded the 5% reference-repeat
+group bound. A subsequent attempt changed from nominal to fair thermal pressure
+during the second baseline arm and was terminated before measurements. That
+failure proved a 30-second loaded-idle interval insufficient, so the accepted
+gate requires 120 continuous nominal seconds before every arm, three fixed
+transcription warmups totaling at least 512 generated tokens, within-engine
+semantic identity, no more than 5% aggregate and 10% per-case spread, and
+non-overlapping observed speed bands. The result establishes superiority for
+this exact artifact and workload, not a universal Qwen3.8 speed claim.
 
 The final binary above also passed the shared full-context coding contract with
 a 20,584-character repository fixture and a real 230-byte Rust tool result.

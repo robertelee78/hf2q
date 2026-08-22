@@ -333,6 +333,8 @@ impl Qwen35Model {
         let token_embd_native =
             crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "token_embd.weight", &device)
                 .context("load native token_embd.weight")?;
+        super::forward_gpu::ensure_native_embedding_admitted(&token_embd_native)
+            .context("admit native token_embd.weight execution")?;
         super::weight_pool::register_weight_buffer(&device, &token_embd_native.buffer)
             .context("register native token_embd.weight")?;
         #[cfg(test)]
@@ -709,11 +711,10 @@ impl Qwen35Model {
             // MoE per-expert stems (`ffn_gate.{e}` etc.) take the bucket
             // path below.
             //
-            // Native storage is GGML Q4_0 blocks (MlxBuffer), not Vec<f32>,
-            // so the helper does a full DWQ→native-shape→Q4_0-re-encode→
-            // new MlxBuffer dance.  F2 round-trip measurement on the
-            // empirical 27B 20-step overlay found relative_rms < 0.10 on
-            // every dense FFN role (codec preserves >90% of DWQ signal).
+            // The legacy synthetic DenseQ fixture stores GGML Q4_0 blocks, so
+            // this test-only compatibility path rebuilds its buffer. Native
+            // GGUF layers fail closed above; production serving never rewrites
+            // an artifact tensor during overlay application.
             let dense_ffn_role: Option<DenseFfnRole> = match role {
                 "ffn_gate" => Some(DenseFfnRole::Gate),
                 "ffn_up" => Some(DenseFfnRole::Up),
@@ -1042,8 +1043,8 @@ fn dwq_to_native_q4_0_f32(
 
 /// ADR-020 AC#7 iter B2.B — overwrite a single dense FFN projection
 /// (Gate, Up, or Down) on a [`Qwen35LayerWeights::FullAttn`] layer
-/// whose FFN variant is [`Qwen35FfnWeights::DenseQ`] (the production
-/// path for non-MoE Qwen3.5/3.6 models).
+/// whose FFN variant is [`Qwen35FfnWeights::DenseQ`] (a legacy synthetic
+/// compatibility path; native production layers are rejected by the caller).
 ///
 /// Unlike the iter-B2.A attn path (which overwrites a `Vec<f32>` and
 /// lets the next forward's `upload_q4_0_from_f32` handle the GPU
@@ -1063,8 +1064,8 @@ fn dwq_to_native_q4_0_f32(
 ///     production GGUF-loaded model.
 ///   - Native ggml type is not Q4_0: the trainer was validated against
 ///     Qwen3.6-27B-MTP (all-Q4_0 dense FFN, confirmed by gguf-dump).
-///     Q8_0 / Q6_K paths are deferred until operator validates a
-///     fixture that uses them.
+///     Other recorded types are rejected; supporting an overlay there requires
+///     its own exact native representation and qualification.
 fn overwrite_dense_ffn_q4_0_linear(
     layer: &mut Qwen35LayerWeights,
     role: DenseFfnRole,
@@ -1103,8 +1104,8 @@ fn overwrite_dense_ffn_q4_0_linear(
     if native_t != GgmlType::Q4_0 {
         anyhow::bail!(
             "qwen35 DWQ overlay: layer {layer_idx} {role:?} native ggml type \
-             is {native_t:?}; only Q4_0 is supported by iter-B2.B (Q8_0 / \
-             Q6_K paths deferred pending operator-validated fixture)"
+             is {native_t:?}; only the legacy synthetic Q4_0 fixture is \
+             supported by iter-B2.B"
         );
     }
 
@@ -1322,17 +1323,36 @@ mod tests {
     }
 
     fn native_test_qweight(device: &MlxDevice, rows: usize, cols: usize) -> MlxQWeight {
+        native_test_qweight_for_type(device, rows, cols, mlx_native::GgmlType::Q8_0)
+    }
+
+    fn native_test_qweight_for_type(
+        device: &MlxDevice,
+        rows: usize,
+        cols: usize,
+        kind: mlx_native::GgmlType,
+    ) -> MlxQWeight {
         use crate::serve::gpu::QuantWeightInfo;
-        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
         use mlx_native::DType;
 
-        let bytes = rows * cols / 32 * 34;
+        let (dtype, bytes) = if kind == mlx_native::GgmlType::F32 {
+            (DType::F32, rows * cols * std::mem::size_of::<f32>())
+        } else {
+            (
+                DType::U8,
+                usize::try_from(
+                    mlx_native::ggml_matrix_bytes(kind, rows as u32, cols as u32)
+                        .expect("derive exact test GGUF bytes"),
+                )
+                .expect("test GGUF bytes fit usize"),
+            )
+        };
         MlxQWeight {
             buffer: device
-                .alloc_buffer(bytes, DType::U8, vec![bytes])
-                .expect("allocate test Q8_0 blocks"),
+                .alloc_buffer(bytes, dtype, vec![bytes / dtype.size_of()])
+                .expect("allocate exact test embedding blocks"),
             info: QuantWeightInfo {
-                ggml_dtype: GgmlType::Q8_0,
+                ggml_dtype: kind,
                 rows,
                 cols,
             },
@@ -1340,6 +1360,38 @@ mod tests {
             f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         }
+    }
+
+    #[test]
+    fn qwen38_native_embedding_admission_checks_exact_storage_when_metal_is_available() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        for kind in [
+            mlx_native::GgmlType::Q2_K,
+            mlx_native::GgmlType::Q4_K,
+            mlx_native::GgmlType::Q5_K,
+            mlx_native::GgmlType::Q6_K,
+            mlx_native::GgmlType::Q8_0,
+            mlx_native::GgmlType::F32,
+        ] {
+            let weight = native_test_qweight_for_type(&device, 256, 256, kind);
+            crate::inference::models::qwen35::forward_gpu::ensure_native_embedding_admitted(
+                &weight,
+            )
+            .unwrap_or_else(|error| panic!("{kind:?} must be admitted: {error:#}"));
+        }
+        let mut weight = native_test_qweight(&device, 256, 256);
+        weight.info.ggml_dtype = mlx_native::GgmlType::F16;
+        let error =
+            crate::inference::models::qwen35::forward_gpu::ensure_native_embedding_admitted(
+                &weight,
+            )
+            .expect_err("F16 has no native embedding route");
+        assert!(error
+            .to_string()
+            .contains("unsupported direct-gather type F16"));
     }
 
     fn zero_layer_native_gguf(output_rows: Option<usize>) -> tempfile::NamedTempFile {

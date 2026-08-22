@@ -1,0 +1,445 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+runner="$root_dir/scripts/qwen38_matched_reference_abba.sh"
+
+# shellcheck source=scripts/qwen38_matched_reference_contract.sh
+source "$root_dir/scripts/qwen38_matched_reference_contract.sh"
+# shellcheck source=scripts/macos_thermal_guard.sh
+source "$root_dir/scripts/macos_thermal_guard.sh"
+
+fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/hf2q-qwen38-matched-contract.XXXXXX")
+cleanup() {
+    case "$fixture_dir" in
+        "${TMPDIR:-/tmp}"/hf2q-qwen38-matched-contract.*)
+            rm -rf -- "$fixture_dir"
+            ;;
+        *)
+            echo "refusing to remove unexpected fixture path: $fixture_dir" >&2
+            return 1
+            ;;
+    esac
+}
+trap cleanup EXIT
+
+fail() {
+    echo "$*" >&2
+    exit 1
+}
+
+expect_failure() {
+    local label=$1
+    shift
+    if "$@" >/dev/null 2>&1; then
+        fail "negative matched-reference fixture passed: $label"
+    fi
+}
+
+# Both live /v1/models schemas are parsed behaviorally, including alias and
+# cardinality failures.
+jq -n '{data:[{id:"hf2q-model",loaded:true},{id:"cold",loaded:false}]}' \
+  >"$fixture_dir/hf2q-models.json"
+[[ "$(matched_resolve_hf2q_model_id "$fixture_dir/hf2q-models.json")" \
+  == hf2q-model ]]
+jq -n '{data:[{id:"a",loaded:true},{id:"b",loaded:true}]}' \
+  >"$fixture_dir/hf2q-models-multiple.json"
+expect_failure hf2q-model-cardinality matched_resolve_hf2q_model_id \
+  "$fixture_dir/hf2q-models-multiple.json"
+
+jq -n '{data:[
+  {id:"path-id",aliases:["served-model"],status:{value:"loaded"}},
+  {id:"cold",aliases:[],status:{value:"unloaded"}}
+]}' >"$fixture_dir/reference-models.json"
+matched_validate_reference_model_alias \
+  "$fixture_dir/reference-models.json" served-model
+expect_failure reference-model-alias matched_validate_reference_model_alias \
+  "$fixture_dir/reference-models.json" wrong-model
+
+# Current reference servers expose loaded entries directly in `.data` without
+# the older nested `status.value`; identity remains exact through id/aliases.
+jq -n '{object:"list",data:[{
+  id:"Release Qwen38 E2",aliases:["Release Qwen38 E2"],object:"model"
+}]}' >"$fixture_dir/reference-models-current.json"
+matched_validate_reference_model_alias \
+  "$fixture_dir/reference-models-current.json" 'Release Qwen38 E2'
+jq -n '{data:[{
+  id:"Release Qwen38 E2",aliases:["Release Qwen38 E2"],
+  status:{value:"unloaded"}
+}]}' >"$fixture_dir/reference-models-unloaded.json"
+expect_failure reference-model-unloaded matched_validate_reference_model_alias \
+  "$fixture_dir/reference-models-unloaded.json" 'Release Qwen38 E2'
+
+# The streamed TTFT parser must ignore role-only events, require semantic
+# content, require exactly one DONE, and compare the complete streamed text.
+started_at=$(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+  -e 'printf "%.9f", clock_gettime(CLOCK_MONOTONIC) - 0.01')
+printf '%s\n' \
+  'data: {"choices":[{"delta":{"role":"assistant"}}]}' \
+  'data: {"choices":[{"delta":{"content":"STREAM-"}}]}' \
+  'data: {"choices":[{"delta":{"content":"TTFT"}}]}' \
+  'data: [DONE]' \
+  | matched_parse_sse_stream "$started_at" "$fixture_dir/good.sse" \
+      "$fixture_dir/good-sse.json" STREAM-TTFT
+jq -e '.content == "STREAM-TTFT" and .done_count == 1
+  and .event_count == 3 and .first_semantic_ms > 0' \
+  "$fixture_dir/good-sse.json" >/dev/null
+if printf '%s\n' \
+  'data: {"choices":[{"delta":{"role":"assistant"}}]}' \
+  'data: [DONE]' \
+  | matched_parse_sse_stream "$started_at" "$fixture_dir/role-only.sse" \
+      "$fixture_dir/role-only.json" STREAM-TTFT >/dev/null 2>&1; then
+    fail "role-only SSE passed the semantic TTFT contract"
+fi
+if printf '%s\n' \
+  'data: {"choices":[{"delta":{"content":"STREAM-TTFT"}}]}' \
+  | matched_parse_sse_stream "$started_at" "$fixture_dir/no-done.sse" \
+      "$fixture_dir/no-done.json" STREAM-TTFT >/dev/null 2>&1; then
+    fail "SSE without DONE passed the TTFT contract"
+fi
+if printf '%s\n' \
+  'data: {"choices":[{"delta":{"content":"different"}}]}' \
+  'data: [DONE]' \
+  | matched_parse_sse_stream "$started_at" "$fixture_dir/mismatch.sse" \
+      "$fixture_dir/mismatch.json" STREAM-TTFT >/dev/null 2>&1; then
+    fail "mismatched streamed content passed the TTFT contract"
+fi
+
+# Code quality is behavioral, not byte-trajectory equality between engines.
+# Each accepted response must stop naturally, yield one complete Rust source
+# file, compile, and pass evaluator-owned tests for the requested function.
+write_code_response() {
+    local path=$1
+    local content=$2
+    local finish_reason=${3:-stop}
+    jq -n --arg content "$content" --arg finish "$finish_reason" '{
+      choices:[{message:{role:"assistant",content:$content,tool_calls:null},
+        finish_reason:$finish}],
+      usage:{prompt_tokens:10,completion_tokens:20}
+    }' >"$path"
+}
+
+write_code_response "$fixture_dir/code-a.json" $'```rust\nfn fibonacci(n: u64) -> u64 {\n    let (mut a, mut b) = (0, 1);\n    for _ in 0..n { (a, b) = (b, a + b); }\n    a\n}\n#[cfg(test)] mod tests { use super::*; #[test] fn one() { assert_eq!(fibonacci(5), 5); } }\n```'
+write_code_response "$fixture_dir/code-b.json" $'fn binary_search(xs: &[i32], needle: i32) -> Option<usize> {\n    let (mut lo, mut hi) = (0, xs.len());\n    while lo < hi {\n        let mid = lo + (hi - lo) / 2;\n        match xs[mid].cmp(&needle) {\n            std::cmp::Ordering::Less => lo = mid + 1,\n            std::cmp::Ordering::Greater => hi = mid,\n            std::cmp::Ordering::Equal => return Some(mid),\n        }\n    }\n    None\n}\n#[cfg(test)] mod tests { use super::*; #[test] fn one() { assert_eq!(binary_search(&[1, 3], 3), Some(1)); } }'
+write_code_response "$fixture_dir/code-c.json" $'fn gcd(mut a: u64, mut b: u64) -> u64 {\n    while b != 0 { let remainder = a % b; a = b; b = remainder; }\n    a\n}\n#[cfg(test)] mod tests { use super::*; #[test] fn one() { assert_eq!(gcd(8, 6), 2); } }'
+for name in code-a code-b code-c; do
+    matched_extract_rust_source "$fixture_dir/$name.json" \
+      "$fixture_dir/$name.rs"
+    matched_validate_rust_case "$name" "$fixture_dir/$name.rs" \
+      "$fixture_dir/code-validation"
+    jq -e '.complete_rust and .compiled and .model_unit_test_present
+      and .evaluator_tests_passed' \
+      "$fixture_dir/code-validation/$name-quality.json" >/dev/null
+done
+write_code_response "$fixture_dir/code-length.json" \
+  'fn fibonacci(n: u64) -> u64 { n }' length
+expect_failure truncated-code-response matched_extract_rust_source \
+  "$fixture_dir/code-length.json" "$fixture_dir/code-length.rs"
+write_code_response "$fixture_dir/code-wrong.json" \
+  $'fn gcd(_a: u64, _b: u64) -> u64 { 1 }\n#[cfg(test)] mod tests { use super::*; #[test] fn one() { assert_eq!(gcd(1, 1), 1); } }'
+matched_extract_rust_source "$fixture_dir/code-wrong.json" \
+  "$fixture_dir/code-wrong.rs"
+expect_failure wrong-code-behavior matched_validate_rust_case code-c \
+  "$fixture_dir/code-wrong.rs" "$fixture_dir/wrong-validation"
+
+# Positive runtime telemetry and null/zero counterexamples exercise the same
+# predicates called for every measured response.
+jq -n '{
+  choices:[{message:{role:"assistant",content:"ok",tool_calls:null},
+    finish_reason:"stop"}],
+  usage:{prompt_tokens:10,completion_tokens:2,
+    prompt_tokens_details:{cached_tokens:3}},
+  x_hf2q_timing:{prefill_time_secs:0.2,decode_time_secs:0.3,
+    time_to_first_token_ms:4,prefill_tokens_per_sec:50,decode_tokens_per_sec:7},
+  timings:{cache_n:3,prompt_n:7,predicted_n:2,prompt_ms:200,
+    predicted_ms:300,prompt_per_second:50,predicted_per_second:7,
+    draft_n:4,draft_n_accepted:2}
+}' >"$fixture_dir/response-good.json"
+matched_validate_common_response "$fixture_dir/response-good.json"
+matched_validate_hf2q_telemetry "$fixture_dir/response-good.json"
+matched_validate_reference_telemetry "$fixture_dir/response-good.json"
+jq '.usage.prompt_tokens_details.cached_tokens = null
+  | .x_hf2q_timing.prefill_time_secs = 0
+  | .x_hf2q_timing.decode_time_secs = 0' \
+  "$fixture_dir/response-good.json" >"$fixture_dir/response-bad-hf2q.json"
+expect_failure hf2q-null-zero-telemetry matched_validate_hf2q_telemetry \
+  "$fixture_dir/response-bad-hf2q.json"
+jq '.timings.cache_n = null | .timings.prompt_ms = 0
+  | .timings.predicted_ms = 0' \
+  "$fixture_dir/response-good.json" >"$fixture_dir/response-bad-reference.json"
+expect_failure reference-null-zero-telemetry \
+  matched_validate_reference_telemetry \
+  "$fixture_dir/response-bad-reference.json"
+
+# Each reference trial must independently show both drafted and accepted
+# tokens; aggregate activity from one trial cannot cover an inactive peer.
+printf '%s\n' \
+  '{"engine":"reference","trial":2,"drafted_tokens":4,"accepted_draft_tokens":2}' \
+  '{"engine":"reference","trial":2,"drafted_tokens":3,"accepted_draft_tokens":1}' \
+  '{"engine":"reference","trial":3,"drafted_tokens":0,"accepted_draft_tokens":0}' \
+  >"$fixture_dir/speculation.jsonl"
+[[ "$(matched_reference_speculation_totals \
+  "$fixture_dir/speculation.jsonl" 2)" == $'7\t3' ]]
+expect_failure missing-reference-trial-acceptance \
+  matched_reference_speculation_totals "$fixture_dir/speculation.jsonl" 3
+
+# Calibration accepts only aligned nominal/ac/quiet/full-power observations
+# with bounded gaps and explicit measurement boundary markers.
+printf '%s\n' \
+  $'100\tnominal\tmeasurement-start' \
+  $'102\tnominal\tmeasurement' \
+  $'104\tnominal\tmeasurement-end' \
+  >"$fixture_dir/thermal-good.tsv"
+printf '%s\n' \
+  $'100\tac\tquiet\tautomatic\t0\tmeasurement-start' \
+  $'102\tac\tquiet\tautomatic\t0\tmeasurement' \
+  $'104\tac\tquiet\tautomatic\t0\tmeasurement-end' \
+  >"$fixture_dir/host-good.tsv"
+thermal_validate_measurement_log "$fixture_dir/thermal-good.tsv" 3
+matched_validate_host_observation_log "$fixture_dir/host-good.tsv" 3 4 3
+matched_validate_calibration_alignment \
+  "$fixture_dir/thermal-good.tsv" "$fixture_dir/host-good.tsv"
+sed 's/\tac\t/\tbattery\t/' "$fixture_dir/host-good.tsv" \
+  >"$fixture_dir/host-battery.tsv"
+expect_failure non-ac-calibration matched_validate_host_observation_log \
+  "$fixture_dir/host-battery.tsv" 3 4 3
+sed 's/\tquiet\t/\tbusy\t/' "$fixture_dir/host-good.tsv" \
+  >"$fixture_dir/host-busy.tsv"
+expect_failure busy-calibration matched_validate_host_observation_log \
+  "$fixture_dir/host-busy.tsv" 3 4 3
+sed 's/\tautomatic\t0\t/\tlow\t2\t/' "$fixture_dir/host-good.tsv" \
+  >"$fixture_dir/host-low-power.tsv"
+expect_failure low-power-calibration matched_validate_host_observation_log \
+  "$fixture_dir/host-low-power.tsv" 3 4 3
+sed '2s/\tautomatic\t0\t/\thigh\t2\t/' "$fixture_dir/host-good.tsv" \
+  >"$fixture_dir/host-mode-change.tsv"
+expect_failure changing-power-mode matched_validate_host_observation_log \
+  "$fixture_dir/host-mode-change.tsv" 3 4 3
+printf '%s\n' $'100\tnominal\tmeasurement-start' \
+  $'104\tnominal\tmeasurement-end' >"$fixture_dir/thermal-gap.tsv"
+expect_failure thermal-sampling-gap thermal_validate_measurement_log \
+  "$fixture_dir/thermal-gap.tsv" 3
+printf '%s\n' $'100\tac\tquiet\tautomatic\t0\tmeasurement-start' \
+  $'104\tac\tquiet\tautomatic\t0\tmeasurement-end' \
+  >"$fixture_dir/host-gap.tsv"
+expect_failure host-sampling-gap matched_validate_host_observation_log \
+  "$fixture_dir/host-gap.tsv" 2 4 3
+
+cat >"$fixture_dir/power-automatic.txt" <<'EOF'
+    System Power Settings:
+      AC Power:
+          Current Power Source: Yes
+          High Power Mode: No
+          Low Power Mode: No
+      Battery Power:
+          High Power Mode: No
+          Low Power Mode: Yes
+EOF
+[[ "$(matched_parse_ac_power_mode <"$fixture_dir/power-automatic.txt")" \
+  == automatic ]]
+sed 's/High Power Mode: No/High Power Mode: Yes/; s/Low Power Mode: No/Low Power Mode: No/' \
+  "$fixture_dir/power-automatic.txt" >"$fixture_dir/power-high.txt"
+[[ "$(matched_parse_ac_power_mode <"$fixture_dir/power-high.txt")" == high ]]
+cat >"$fixture_dir/power-low.txt" <<'EOF'
+    System Power Settings:
+      AC Power:
+          Current Power Source: Yes
+          High Power Mode: No
+          Low Power Mode: Yes
+      Battery Power:
+          High Power Mode: No
+          Low Power Mode: Yes
+EOF
+[[ "$(matched_parse_ac_power_mode <"$fixture_dir/power-low.txt")" == low ]]
+printf '%s\n' 'System-wide power settings:' 'Currently in use:' \
+  ' powermode            2' ' womp                 1' \
+  >"$fixture_dir/power-live.txt"
+[[ "$(matched_parse_live_power_mode_code <"$fixture_dir/power-live.txt")" == 2 ]]
+expect_failure missing-live-power-mode matched_parse_live_power_mode_code \
+  < /dev/null
+printf '%s\n' ' powermode nope' >"$fixture_dir/power-live-invalid.txt"
+expect_failure invalid-live-power-mode matched_parse_live_power_mode_code \
+  <"$fixture_dir/power-live-invalid.txt"
+printf '%s\n' ' powermode 0' ' powermode 2' \
+  >"$fixture_dir/power-live-duplicate.txt"
+expect_failure duplicate-live-power-mode matched_parse_live_power_mode_code \
+  <"$fixture_dir/power-live-duplicate.txt"
+
+write_stability_fixture() {
+    local path=$1
+    local hf2q_first=$2
+    local hf2q_last=$3
+    local reference_first=$4
+    local reference_last=$5
+    local engine trial factor name group case_index wall tps tokens decode_seconds
+    : >"$path"
+    for engine in hf2q reference; do
+        for trial in $(if [[ "$engine" == hf2q ]]; then printf '1 4'; else printf '2 3'; fi); do
+            if [[ "$engine/$trial" == hf2q/1 ]]; then factor=$hf2q_first
+            elif [[ "$engine/$trial" == hf2q/4 ]]; then factor=$hf2q_last
+            elif [[ "$engine/$trial" == reference/2 ]]; then factor=$reference_first
+            else factor=$reference_last
+            fi
+            case_index=0
+            for name in code-a code-b code-c repeat-a repeat-b repeat-c; do
+                case_index=$((case_index + 1))
+                group=${name%%-*}
+                wall=$(awk -v base="$case_index" -v factor="$factor" \
+                  'BEGIN { printf "%.9f", base * factor }')
+                tps=$factor
+                tokens=$((40 + case_index))
+                decode_seconds=$(awk -v tokens="$tokens" -v tps="$tps" \
+                  'BEGIN { printf "%.9f", tokens / tps }')
+                jq -cn --arg engine "$engine" --arg name "$name" \
+                  --arg group "$group" --argjson trial "$trial" \
+                  --argjson wall "$wall" --argjson tps "$tps" \
+                  --argjson decode_seconds "$decode_seconds" \
+                  --argjson tokens "$tokens" \
+                  '{engine:$engine,trial:$trial,name:$name,group:$group,
+                    wall_seconds:$wall,internal_decode_tps:$tps,
+                    internal_decode_seconds:$decode_seconds,
+                    completion_tokens:$tokens}' >>"$path"
+            done
+        done
+    done
+}
+
+validate_stability_fixture() {
+    matched_measurement_stability_json "$1" 5 10 | jq -e '.stable == true' \
+      >/dev/null
+}
+
+# The exact ABBA shape passes at stable frequency, including the 5% boundary.
+write_stability_fixture "$fixture_dir/stability-good.jsonl" 0.975 1.025 1 1
+validate_stability_fixture "$fixture_dir/stability-good.jsonl"
+matched_measurement_stability_json "$fixture_dir/stability-good.jsonl" 5 10 \
+  | jq -e '.observed_band_dominance == false' >/dev/null
+write_stability_fixture "$fixture_dir/stability-dominant.jsonl" 0.80 0.81 1 1
+matched_measurement_stability_json "$fixture_dir/stability-dominant.jsonl" 5 10 \
+  | jq -e '.stable == true and .observed_band_dominance == true' >/dev/null
+
+# Nominal host telemetry cannot hide a same-engine 50 -> 28 t/s collapse.
+write_stability_fixture "$fixture_dir/stability-collapse.jsonl" 1 1.78 1 1
+expect_failure dvfs-collapse validate_stability_fixture \
+  "$fixture_dir/stability-collapse.jsonl"
+
+write_stability_fixture "$fixture_dir/stability-over-limit.jsonl" 0.974 1.026 1 1
+expect_failure over-five-percent validate_stability_fixture \
+  "$fixture_dir/stability-over-limit.jsonl"
+write_stability_fixture "$fixture_dir/stability-case-base.jsonl" 1 1 1 1
+jq -c 'if .engine == "hf2q" and .trial == 4 and .name == "code-a"
+  then .wall_seconds = 1.1052631578947367
+    | .internal_decode_tps = 1.1052631578947367
+    | .internal_decode_seconds = (.completion_tokens / .internal_decode_tps)
+  else . end' "$fixture_dir/stability-case-base.jsonl" \
+  >"$fixture_dir/stability-case-boundary.jsonl"
+validate_stability_fixture "$fixture_dir/stability-case-boundary.jsonl"
+jq -c 'if .engine == "hf2q" and .trial == 4 and .name == "code-a"
+  then .wall_seconds = 1.106
+    | .internal_decode_tps = 1.106
+    | .internal_decode_seconds = (.completion_tokens / .internal_decode_tps)
+  else . end' "$fixture_dir/stability-case-base.jsonl" \
+  >"$fixture_dir/stability-case-over.jsonl"
+expect_failure over-ten-percent-case validate_stability_fixture \
+  "$fixture_dir/stability-case-over.jsonl"
+sed '1d' "$fixture_dir/stability-good.jsonl" \
+  >"$fixture_dir/stability-missing.jsonl"
+expect_failure missing-abba-row validate_stability_fixture \
+  "$fixture_dir/stability-missing.jsonl"
+jq 'if .engine == "hf2q" and .trial == 4 and .name == "code-a"
+  then .completion_tokens += 1 else . end' \
+  "$fixture_dir/stability-good.jsonl" >"$fixture_dir/stability-token-drift.jsonl"
+expect_failure completion-token-drift validate_stability_fixture \
+  "$fixture_dir/stability-token-drift.jsonl"
+
+# The production host-contention parser must execute under the platform awk,
+# exclude the current server PID, and distinguish Python model work from an
+# unrelated Python utility. This catches syntax that GNU awk accepts but the
+# macOS implementation rejects before a timed trial can start.
+scripted_offenders=$(printf '%s\n' \
+  '101 /usr/bin/python3 teacher_model_gen.py' \
+  '202 /usr/bin/python3 calendar_export.py' \
+  '303 /opt/venv/bin/python inference.py' \
+  | matched_find_scripted_model_work 303)
+[[ "$scripted_offenders" == '101:python-model-work' ]] \
+  || fail "portable Python model-work matcher returned: $scripted_offenders"
+
+# A seal-publication failure must not expose summary.json. A successful call
+# publishes a self-consistent result manifest and the passing summary last.
+prepare_seal_fixture() {
+    local output_dir=$1
+    mkdir -p "$output_dir"
+    printf '%s\n' payload >"$output_dir/payload.txt"
+    printf '%s  payload.txt\n' \
+      "$(shasum -a 256 "$output_dir/payload.txt" | awk '{print $1}')" \
+      >"$output_dir/evidence.sha256"
+    printf '%s\n' '{"schema":2,"verdict":"pass"}' \
+      >"$output_dir/summary.json.tmp"
+}
+
+prepare_seal_fixture "$fixture_dir/seal-failure"
+# Called indirectly by matched_publish_result to force its first publication
+# step to fail.
+# shellcheck disable=SC2329
+mv() {
+    if [[ ${2:-} == "$fixture_dir/seal-failure/result.sha256" ]]; then
+        return 91
+    fi
+    command mv "$@"
+}
+expect_failure result-seal-publication matched_publish_result \
+  "$fixture_dir/seal-failure/summary.json.tmp" \
+  "$fixture_dir/seal-failure/summary.json" \
+  "$fixture_dir/seal-failure/evidence.sha256" \
+  "$fixture_dir/seal-failure/result.sha256"
+unset -f mv
+[[ ! -e "$fixture_dir/seal-failure/summary.json" ]] \
+  || fail "pass summary remained after result seal publication failed"
+
+prepare_seal_fixture "$fixture_dir/seal-success"
+matched_publish_result "$fixture_dir/seal-success/summary.json.tmp" \
+  "$fixture_dir/seal-success/summary.json" \
+  "$fixture_dir/seal-success/evidence.sha256" \
+  "$fixture_dir/seal-success/result.sha256"
+(cd "$fixture_dir/seal-success" && shasum -a 256 -c result.sha256 >/dev/null)
+
+# The production runner must call, rather than merely mention, each tested
+# predicate. A caller-provided model ID is initialized before any trial.
+# shellcheck disable=SC2016
+for call in \
+  'matched_resolve_hf2q_model_id ' \
+  'matched_validate_reference_model_alias ' \
+  '| matched_parse_sse_stream ' \
+  'matched_extract_rust_source "$response" "$source_path"' \
+  'matched_validate_rust_case "$name" ' \
+  'matched_validate_hf2q_telemetry "$response"' \
+  'matched_validate_reference_telemetry "$response"' \
+  'matched_reference_speculation_totals "$rows_file"' \
+  'matched_find_scripted_model_work "$allowed_pid"' \
+  'matched_validate_host_observation_log ' \
+  'matched_parse_ac_power_mode' \
+  'matched_parse_live_power_mode_code' \
+  'matched_measurement_stability_json "$rows_file"' \
+  'matched_publish_result '; do
+    grep -Fq "$call" "$runner" \
+      || fail "production runner does not invoke tested predicate: $call"
+done
+grep -Fq 'readonly MAX_TOKENS=256' "$runner" \
+  || fail "matched code workload is not sized for complete source"
+grep -Fq 'quality_scope:"complete Rust compilation plus evaluator tests; exact repeat transcription"' \
+  "$runner" || fail "matched summary lost its executable quality contract"
+# shellcheck disable=SC2016
+model_id_init_line=$(grep -nE '^if \[\[ -n "\$MODEL_ID" \]\]; then$' "$runner" \
+  | cut -d: -f1)
+# shellcheck disable=SC2016
+trial_loop_line=$(grep -nE '^for engine in \$TRIAL_ORDER; do$' "$runner" | cut -d: -f1)
+[[ "$model_id_init_line" =~ ^[0-9]+$ && "$trial_loop_line" =~ ^[0-9]+$
+  && model_id_init_line -lt trial_loop_line ]] \
+  || fail "caller-provided MODEL_ID is not initialized before trials"
+[[ "$(grep -c '^matched_publish_result ' "$runner")" == 1 ]] \
+  || fail "passing summary does not have one audited publication path"
+if grep -Eq '^mv .*summary\.json' "$runner"; then
+    fail "production runner bypasses summary-last publication"
+fi
+
+printf 'qwen38 matched-reference behavioral contract passed\n'
