@@ -48,8 +48,10 @@ pub use mlx_native::ops::gated_delta_net::cpu_reference_f32 as gated_delta_net_c
 
 use super::gqa_q2_policy::use_gqa_q2_tq_sdpa;
 use super::{Qwen35Config, Qwen35LayerKind};
+use tq_arena::TqArenaLayout;
 
 mod source_teacher;
+mod tq_arena;
 
 pub(super) use source_teacher::{
     plan_qwen35_base_text_cache, prepare_qwen35_base_text_cache, PreparedQwen35BaseTextCacheV1,
@@ -342,7 +344,7 @@ impl FullAttnKvSlot {
             norms,
             n_kv_heads,
             head_dim,
-            cache_capacity,
+            views.capacity_tokens,
             cache_write_pos_start,
             n_tokens,
             src_tok_offset,
@@ -460,7 +462,7 @@ impl FullAttnKvSlot {
             num_kv_heads: params.num_kv_heads,
             head_dim: params.head_dim,
             kv_seq_len: params.kv_seq_len,
-            kv_capacity: params.kv_capacity,
+            kv_capacity: views.capacity_tokens,
             scale: params.scale,
             mask_type: params.mask_type,
             sliding_window: params.sliding_window,
@@ -649,7 +651,7 @@ impl FullAttnKvSlot {
             &dst,
             n_kv_heads,
             head_dim,
-            cache_capacity,
+            views.capacity_tokens,
             start_pos,
             n_tokens,
             /*scale_factor_d512=*/ 1.0,
@@ -1946,11 +1948,42 @@ impl HybridKvCache {
         n_seqs: u32,
         tq_kv_active: bool,
     ) -> Result<Self> {
-        let mut cache =
-            Self::allocate_with_profile(cfg, device, max_seq_len, n_seqs, tq_kv_active, true)?;
+        let mut cache = Self::allocate_with_profile(
+            cfg,
+            device,
+            max_seq_len,
+            n_seqs,
+            tq_kv_active,
+            true,
+            None,
+        )?;
         // Full-attention storage is intentionally uninitialized: its cursor
         // is zero and every readable position is overwritten before the
         // cursor advances. Recurrent DeltaNet state remains semantic-zero.
+        cache.reset_all_buffers();
+        Ok(cache)
+    }
+
+    /// Construct a multi-sequence cache whose full-attention TQ buffers hold
+    /// only a small physical seed per slot. `max_seq_len` remains the full
+    /// logical context limit; callers must grow a slot before making rows
+    /// beyond its current physical capacity visible.
+    pub fn new_with_growable_tq(
+        cfg: &Qwen35Config,
+        device: &MlxDevice,
+        max_seq_len: u32,
+        n_seqs: u32,
+        initial_capacity_tokens: u32,
+    ) -> Result<Self> {
+        let mut cache = Self::allocate_with_profile(
+            cfg,
+            device,
+            max_seq_len,
+            n_seqs,
+            true,
+            true,
+            Some(initial_capacity_tokens),
+        )?;
         cache.reset_all_buffers();
         Ok(cache)
     }
@@ -1962,6 +1995,7 @@ impl HybridKvCache {
         n_seqs: u32,
         tq_kv_active: bool,
         include_mtp: bool,
+        tq_initial_capacity: Option<u32>,
     ) -> Result<Self> {
         if max_seq_len == 0 {
             return Err(anyhow!("HybridKvCache: max_seq_len must be > 0"));
@@ -1986,8 +2020,9 @@ impl HybridKvCache {
                         alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs, tq_kv_active)
                             .with_context(|| format!("alloc full-attn slot (layer {layer_idx})"))?;
                     if tq_kv_active {
+                        let physical_capacity = tq_initial_capacity.unwrap_or(max_seq_len);
                         slot.tq = Some(
-                            alloc_tq_full_attn_buffers(cfg, device, max_seq_len, n_seqs)
+                            alloc_tq_full_attn_buffers(cfg, device, physical_capacity, n_seqs)
                                 .with_context(|| {
                                     format!("alloc tq full-attn buffers (layer {layer_idx})")
                                 })?,
@@ -2012,8 +2047,9 @@ impl HybridKvCache {
             let mut slot = alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs, tq_kv_active)
                 .context("alloc MTP full-attn slot")?;
             if tq_kv_active {
+                let physical_capacity = tq_initial_capacity.unwrap_or(max_seq_len);
                 slot.tq = Some(
-                    alloc_tq_full_attn_buffers(cfg, device, max_seq_len, n_seqs)
+                    alloc_tq_full_attn_buffers(cfg, device, physical_capacity, n_seqs)
                         .context("alloc tq full-attn buffers (MTP slot)")?,
                 );
             }
@@ -3965,6 +4001,9 @@ pub struct TqFullAttnKvBuffers {
     /// 2 for head_dim=512).  Cached so SDPA dispatch (iter-8) doesn't
     /// recompute from `head_dim`.
     pub norms_per_pos: u32,
+    /// Physical per-slot segment map. Logical context remains on the owning
+    /// `HybridKvCache`; this map records only rows allocated in this arena.
+    layout: TqArenaLayout,
 }
 
 struct TqFullAttnSlotViews {
@@ -3972,6 +4011,7 @@ struct TqFullAttnSlotViews {
     k_norms: MlxBuffer,
     v_packed: MlxBuffer,
     v_norms: MlxBuffer,
+    capacity_tokens: u32,
 }
 
 impl TqFullAttnKvBuffers {
@@ -3985,32 +4025,42 @@ impl TqFullAttnKvBuffers {
         cache_capacity: u32,
         head_dim: u32,
     ) -> Result<TqFullAttnSlotViews> {
-        let n_seqs = self.k_packed.shape().first().copied().unwrap_or(0);
+        let n_seqs = self.layout.n_seqs();
         anyhow::ensure!(
             (slot_id.0 as usize) < n_seqs,
             "TQ slot {} out of range for n_seqs={n_seqs}",
             slot_id.0
         );
+        let segment = self.layout.segment(slot_id.0 as usize)?;
+        anyhow::ensure!(
+            cache_capacity >= segment.capacity_tokens,
+            "TQ slot {} physical capacity {} exceeds caller logical capacity {}",
+            slot_id.0,
+            segment.capacity_tokens,
+            cache_capacity
+        );
         let packed_elems = (n_kv_heads as usize)
-            .checked_mul(cache_capacity as usize)
+            .checked_mul(segment.capacity_tokens as usize)
             .and_then(|value| value.checked_mul(head_dim as usize))
             .ok_or_else(|| anyhow!("TQ packed slot extent overflow"))?;
         let norms_elems = (n_kv_heads as usize)
-            .checked_mul(cache_capacity as usize)
+            .checked_mul(segment.capacity_tokens as usize)
             .and_then(|value| value.checked_mul(self.norms_per_pos as usize))
             .ok_or_else(|| anyhow!("TQ norm slot extent overflow"))?;
-        let packed_offset = (slot_id.0 as u64)
-            .checked_mul(packed_elems as u64)
-            .ok_or_else(|| anyhow!("TQ packed slot offset overflow"))?;
-        let norms_offset = (slot_id.0 as u64)
-            .checked_mul(norms_elems as u64)
-            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+        let packed_offset =
+            self.layout
+                .packed_base_elements(slot_id.0 as usize, n_kv_heads, head_dim)?;
+        let norms_offset = self
+            .layout
+            .norms_base_elements(slot_id.0 as usize, n_kv_heads, self.norms_per_pos)?
+            .checked_mul(std::mem::size_of::<f32>() as u64)
             .ok_or_else(|| anyhow!("TQ norm slot offset overflow"))?;
         Ok(TqFullAttnSlotViews {
             k_packed: self.k_packed.slice_view(packed_offset, packed_elems),
             k_norms: self.k_norms.slice_view(norms_offset, norms_elems),
             v_packed: self.v_packed.slice_view(packed_offset, packed_elems),
             v_norms: self.v_norms.slice_view(norms_offset, norms_elems),
+            capacity_tokens: segment.capacity_tokens,
         })
     }
 }
@@ -4055,35 +4105,48 @@ pub fn alloc_tq_full_attn_buffers(
         return Err(anyhow!("alloc_tq_full_attn_buffers: n_seqs must be > 0"));
     }
 
+    let layout = TqArenaLayout::uniform(n_seqs, max_seq_len)?;
+    alloc_tq_full_attn_buffers_with_layout(cfg, device, layout)
+}
+
+fn alloc_tq_full_attn_buffers_with_layout(
+    cfg: &Qwen35Config,
+    device: &MlxDevice,
+    layout: TqArenaLayout,
+) -> Result<TqFullAttnKvBuffers> {
     let n_kv_heads = cfg.num_key_value_heads as usize;
     let head_dim = cfg.head_dim;
     let norms_per_pos = tq_norms_per_pos_for(head_dim);
+    let total_capacity_tokens = layout.total_capacity_tokens() as usize;
+    let first_capacity = layout.segment(0)?.capacity_tokens as usize;
+    let uniform_capacity = layout
+        .capacities()
+        .all(|capacity| capacity as usize == first_capacity)
+        .then_some(first_capacity);
 
-    // Packed: [n_seqs, n_kv_heads, max_seq_len, head_dim] U8.
+    // Packed arena: concatenated per-slot head-major segments. A static
+    // uniform layout remains byte-identical to the historical outer-axis
+    // allocation; a growable layout may assign different capacities.
     // 1 byte per element (8-bit Lloyd-Max index).
-    let packed_elems =
-        (n_seqs as usize) * n_kv_heads * (max_seq_len as usize) * (head_dim as usize);
+    let packed_elems = total_capacity_tokens * n_kv_heads * (head_dim as usize);
     let packed_bytes = packed_elems; // U8 → 1 byte/elem
-    let packed_shape = vec![
-        n_seqs as usize,
-        n_kv_heads,
-        max_seq_len as usize,
-        head_dim as usize,
-    ];
+    let packed_shape = match uniform_capacity {
+        Some(capacity) => vec![layout.n_seqs(), n_kv_heads, capacity, head_dim as usize],
+        None => vec![packed_elems],
+    };
 
-    // Norms: [n_seqs, n_kv_heads, max_seq_len, norms_per_pos] F32.
-    // norms_per_pos=1 collapses to a 3-D view at the kernel level,
-    // but we keep the 4-D shape on the buffer so cfg-shape validation
-    // is unambiguous (every dim is explicit).
-    let norms_elems =
-        (n_seqs as usize) * n_kv_heads * (max_seq_len as usize) * (norms_per_pos as usize);
+    // Norm arena mirrors the packed segment order.
+    let norms_elems = total_capacity_tokens * n_kv_heads * (norms_per_pos as usize);
     let norms_bytes = norms_elems * std::mem::size_of::<f32>();
-    let norms_shape = vec![
-        n_seqs as usize,
-        n_kv_heads,
-        max_seq_len as usize,
-        norms_per_pos as usize,
-    ];
+    let norms_shape = match uniform_capacity {
+        Some(capacity) => vec![
+            layout.n_seqs(),
+            n_kv_heads,
+            capacity,
+            norms_per_pos as usize,
+        ],
+        None => vec![norms_elems],
+    };
 
     // SAFETY: all TQ attention readers are bounded by the owning slot's
     // `current_len`; encoder writes packed values and norms before advancing
@@ -4107,12 +4170,50 @@ pub fn alloc_tq_full_attn_buffers(
         v_packed,
         v_norms,
         norms_per_pos,
+        layout,
     })
 }
 
 /// Total bytes the TQ-active full-attn slot occupies (sum of all 4
 /// buffers).  Useful for memory accounting + the parity test.
 impl TqFullAttnKvBuffers {
+    pub fn physical_capacity_for_slot(
+        &self,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<u32> {
+        Ok(self.layout.segment(slot_id.0 as usize)?.capacity_tokens)
+    }
+
+    /// Exact component bytes after growing one slot and compacting the arena.
+    /// This is a planning primitive only; allocation/copy/swap happens in the
+    /// owning cache so all layers change atomically.
+    pub fn planned_total_bytes_after_slot_growth(
+        &self,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
+        required_tokens: u32,
+        logical_max_tokens: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+    ) -> Result<usize> {
+        let layout =
+            self.layout
+                .grow_slot(slot_id.0 as usize, required_tokens, logical_max_tokens)?;
+        let total_tokens = layout.total_capacity_tokens() as usize;
+        let packed = total_tokens
+            .checked_mul(n_kv_heads as usize)
+            .and_then(|value| value.checked_mul(head_dim as usize))
+            .ok_or_else(|| anyhow!("TQ arena packed byte plan overflow"))?;
+        let norms = total_tokens
+            .checked_mul(n_kv_heads as usize)
+            .and_then(|value| value.checked_mul(self.norms_per_pos as usize))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| anyhow!("TQ arena norm byte plan overflow"))?;
+        packed
+            .checked_add(norms)
+            .and_then(|one_side| one_side.checked_mul(2))
+            .ok_or_else(|| anyhow!("TQ arena total byte plan overflow"))
+    }
+
     pub fn total_bytes(&self) -> usize {
         self.k_packed.byte_len()
             + self.k_norms.byte_len()
@@ -9047,6 +9148,34 @@ mod tests {
             mtp_use_dedicated_embeddings: true,
             intermediate_size: Some(128),
             moe: None,
+        }
+    }
+
+    #[test]
+    fn growable_tq_constructor_keeps_logical_context_but_seeds_small_physical_arenas() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device for test");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let cache = HybridKvCache::new_with_growable_tq(&cfg, &device, 4096, 16, 1)
+            .expect("growable cache");
+
+        assert_eq!(cache.max_seq_len, 4096, "logical context must not shrink");
+        assert_eq!(cache.n_seqs, 16);
+        for slot in &cache.full_attn {
+            let tq = slot.tq.as_ref().expect("TQ storage");
+            for slot_id in 0..16 {
+                assert_eq!(
+                    tq.physical_capacity_for_slot(crate::serve::multi_seq_kv::SlotId(slot_id))
+                        .unwrap(),
+                    1
+                );
+            }
+            let static_full_context_bytes =
+                16 * 2 * 4096 * 32 * 2 + 16 * 2 * 4096 * tq.norms_per_pos as usize * 4 * 2;
+            assert!(
+                tq.total_bytes() < static_full_context_bytes,
+                "physical seed must not allocate the logical full-context product"
+            );
         }
     }
 
