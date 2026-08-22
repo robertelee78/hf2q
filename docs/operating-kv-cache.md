@@ -4,6 +4,43 @@
 **Authored against commit:** `7c6c16005250ffb3ce993a9227d01456adf403b2`
 **ADR:** `docs/adr/diary/ADR-017-persistent-block-prefix-cache.md` (R-O1)
 
+> **2026-08-22 ADR-049 execution addendum (current authority for Qwen
+> agentic reuse).** Qwen now has two deliberately separate reuse tiers:
+>
+> - `SerialFifo` keeps the byte-budgeted `LcpRegistry` and optional disk
+>   hydrate path. This is the permanent restart-hydrate tier unless ADR-049
+>   A.7's telemetry justifies and designs a replacement.
+> - `SlotAware` (`inflight-batched`) does not consume that registry. It keeps
+>   slot-local, semantic-boundary anchors over each slot's live mutable KV
+>   lineage. Anchors are same-process reuse only: committed checkpoints are
+>   affinity-visible, one request-local pending checkpoint remains invisible
+>   until terminal cache+ledger success, and any reset, poison, or failed
+>   restore clears the whole slot store.
+>
+> Do not combine their memory figures. There are currently two independent
+> calls to `default_lcp_byte_budget()`—the Gemma registry in
+> `src/serve/api/engine.rs` and the Qwen registry in
+> `src/serve/api/engine_qwen35.rs`. Each computes its own 5%-of-available-RAM
+> envelope, so a process that owns both registries can reserve roughly twice
+> the percentage an operator may expect from the name. SlotAware anchor bytes
+> are a third, separately reclaimable line and must never be added to the
+> scheduler's monotonic Metal KV high-water.
+>
+> `HF2Q_KV_PERSIST` is overloaded and must be read in the context of its
+> consumer: Qwen load options interpret a non-empty value as a filesystem
+> path; the generic `--kv-persist` substrate interprets exactly `0` as a
+> startup disable; older Gemma/index documentation uses `1` or `on` as an
+> enable switch. Until a dedicated path variable replaces this triple use,
+> never pass `1`/`on` expecting every consumer to infer a cache directory,
+> and never assume `0` cannot also be observed by a path-reading load path.
+>
+> Release evidence for these tiers reports worst-case semantic TTFT against
+> the client watchdog (not only a mean), N=4 decode stability relative to a
+> single-turn baseline, exact cached-token counts, and strict idle byte
+> conservation. `scripts/bench_lcp_resume_speedup.sh` is a benchmark, not a
+> SlotAware acceptance gate: it is sequential and does not fail its process
+> merely because the speedup assertion misses.
+
 > **⚠ 2026-08-08 addendum (supersedes qwen35-family claims below).**
 > This runbook predates the qwen35/3.6 persist family. What it calls
 > `[NOT YET IMPLEMENTED]` items §11.9–10 ("Hybrid (Qwen 3.5) family",
