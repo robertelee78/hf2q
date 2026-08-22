@@ -41,7 +41,22 @@ use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
 
+use super::anchor_store::{
+    effective_committed_depth, simultaneous_pending_capacity_slots, AnchorEntry, AnchorStore,
+    StagePending,
+};
 use super::engine_supervisor::EngineSupervisor;
+use super::gemma4_anchor_store::{
+    record_cancellation as record_gemma4_anchor_cancellation,
+    record_capture as record_gemma4_anchor_capture,
+    record_configuration as record_gemma4_anchor_configuration,
+    record_lineage_clear as record_gemma4_anchor_lineage_clear,
+    record_publication as record_gemma4_anchor_publication,
+    record_restore_hit as record_gemma4_anchor_restore_hit,
+    record_restore_hit_during_cancellation as record_gemma4_anchor_cancellation_restore_hit,
+    record_restore_miss as record_gemma4_anchor_restore_miss,
+    DEFAULT_MAX_COMMITTED_ANCHORS as GEMMA4_DEFAULT_MAX_COMMITTED_ANCHORS,
+};
 use super::qwen35_anchor_store::{
     effective_committed_depth as qwen35_effective_committed_depth,
     record_capture as record_qwen35_anchor_capture,
@@ -51,8 +66,8 @@ use super::qwen35_anchor_store::{
     record_restore_hit as record_qwen35_anchor_restore_hit,
     record_restore_miss as record_qwen35_anchor_restore_miss,
     record_spec_boundary_restore as record_qwen35_anchor_spec_boundary_restore,
-    simultaneous_pending_capacity_slots as qwen35_simultaneous_pending_capacity_slots, AnchorEntry,
-    AnchorStore, PostAdmissionPrefillFailure, DEFAULT_MAX_COMMITTED_ANCHORS,
+    simultaneous_pending_capacity_slots as qwen35_simultaneous_pending_capacity_slots,
+    PostAdmissionPrefillFailure, DEFAULT_MAX_COMMITTED_ANCHORS,
 };
 
 const SLOT_AWARE_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -6343,7 +6358,7 @@ enum Gemma4PendingDisposition {
 fn gemma4_pending_disposition(
     request: &Request,
     retained_tokens: &[Vec<u32>],
-    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    prompt_anchors: &[Gemma4AnchorStore],
     slots: &[Option<Gemma4Slot>],
 ) -> Gemma4PendingDisposition {
     if matches!(request, Request::Shutdown) {
@@ -6725,6 +6740,7 @@ impl Gemma4PrefillState {
                     error: anyhow::anyhow!("Gemma stable prompt boundary requires hybrid KV"),
                 });
             };
+            let capture_started = Instant::now();
             let kv =
                 match crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
                     hybrid,
@@ -6739,10 +6755,13 @@ impl Gemma4PrefillState {
                         });
                     }
                 };
+            let prompt_tokens = self.prompt_tokens[..plan.end].to_vec();
             rollback_anchor = Some(Gemma4PromptAnchor {
-                prompt_tokens: self.prompt_tokens[..plan.end].to_vec(),
+                prompt_tokens,
                 kv,
                 vision_fingerprint: self.params.vision_fingerprint,
+                capture_duration: capture_started.elapsed(),
+                lineage_epoch: 0,
             });
         }
 
@@ -6776,6 +6795,7 @@ impl Gemma4PrefillState {
                     ),
                 });
             };
+            let capture_started = Instant::now();
             let kv =
                 match crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
                     hybrid,
@@ -6790,10 +6810,13 @@ impl Gemma4PrefillState {
                         });
                     }
                 };
+            let prompt_tokens = self.prompt_tokens.clone();
             rollback_anchor = Some(Gemma4PromptAnchor {
-                prompt_tokens: self.prompt_tokens.clone(),
+                prompt_tokens,
                 kv,
                 vision_fingerprint: self.params.vision_fingerprint,
+                capture_duration: capture_started.elapsed(),
+                lineage_epoch: 0,
             });
         }
 
@@ -7032,7 +7055,10 @@ impl Gemma4DecodeState {
         cached_tokens: usize,
     ) -> Result<(
         Self,
-        Option<crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor>,
+        Option<(
+            crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor,
+            Duration,
+        )>,
     )> {
         let max_decode_tokens = params.max_tokens.max(1);
 
@@ -7156,6 +7182,7 @@ impl Gemma4DecodeState {
                 }
                 clear_gemma4_self_mounts(loaded);
             }
+            let capture_started = Instant::now();
             let anchor =
                 crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
                     multi_seq_kv_hybrid
@@ -7181,7 +7208,10 @@ impl Gemma4DecodeState {
                             boundary,
                         )
                 })?;
-            (first_decode_token, Some(anchor))
+            (
+                first_decode_token,
+                Some((anchor, capture_started.elapsed())),
+            )
         } else if cached_tokens == 0 {
             (
                 supervised_gemma4_gpu_call(supervisor, "gemma4_prefill", || {
@@ -11460,6 +11490,179 @@ struct Gemma4PromptAnchor {
     prompt_tokens: Vec<u32>,
     kv: crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor,
     vision_fingerprint: Option<[u8; 32]>,
+    capture_duration: Duration,
+    lineage_epoch: u64,
+}
+
+impl AnchorEntry for Gemma4PromptAnchor {
+    fn token_count(&self) -> usize {
+        self.prompt_tokens.len()
+    }
+
+    fn lineage_epoch(&self) -> u64 {
+        self.lineage_epoch
+    }
+
+    fn set_lineage_epoch(&mut self, epoch: u64) {
+        self.lineage_epoch = epoch;
+    }
+
+    fn owned_bytes(&self) -> u64 {
+        (self.prompt_tokens.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<u32>() as u64)
+            .saturating_add(self.kv.owned_bytes())
+    }
+}
+
+type Gemma4AnchorStore = AnchorStore<Gemma4PromptAnchor>;
+
+fn gemma4_anchor_aggregate_budget_bytes() -> u64 {
+    crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget()
+}
+
+fn gemma4_anchor_aggregate_owned_bytes(stores: &[Gemma4AnchorStore]) -> Result<u64> {
+    stores.iter().try_fold(0u64, |total, store| {
+        total
+            .checked_add(store.owned_bytes())
+            .context("Gemma4 aggregate anchor-owned byte overflow")
+    })
+}
+
+fn gemma4_anchor_aggregate_control_bytes(stores: &[Gemma4AnchorStore]) -> Result<u64> {
+    stores.iter().try_fold(0u64, |total, store| {
+        total
+            .checked_add(store.control_owned_bytes())
+            .context("Gemma4 aggregate anchor-control byte overflow")
+    })
+}
+
+fn gemma4_anchor_committed_control_capacity(n_slots: usize, aggregate_budget_bytes: u64) -> usize {
+    let full_control_fits = (std::mem::size_of::<Gemma4PromptAnchor>() as u64)
+        .checked_mul(GEMMA4_DEFAULT_MAX_COMMITTED_ANCHORS as u64)
+        .and_then(|bytes| bytes.checked_mul(n_slots as u64))
+        .is_some_and(|bytes| bytes <= aggregate_budget_bytes);
+    if full_control_fits {
+        GEMMA4_DEFAULT_MAX_COMMITTED_ANCHORS
+    } else {
+        0
+    }
+}
+
+fn stage_gemma4_pending_anchor(
+    handle: SlotHandle,
+    stores: &mut [Gemma4AnchorStore],
+    anchor: Gemma4PromptAnchor,
+    aggregate_budget_bytes: u64,
+    capture_source: &'static str,
+) -> StagePending {
+    let slot_idx = handle.slot_id.0 as usize;
+    let anchor_bytes = anchor.owned_bytes();
+    let capture_duration = anchor.capture_duration;
+    let prompt_tokens = anchor.prompt_tokens.len();
+    let aggregate_before = gemma4_anchor_aggregate_owned_bytes(stores).unwrap_or(u64::MAX);
+    let other_owned = aggregate_before.saturating_sub(stores[slot_idx].owned_bytes());
+    let slot_budget = aggregate_budget_bytes.saturating_sub(other_owned);
+    let payload_budget = aggregate_budget_bytes
+        .saturating_sub(gemma4_anchor_aggregate_control_bytes(stores).unwrap_or(u64::MAX));
+    let effective_k = effective_committed_depth(
+        GEMMA4_DEFAULT_MAX_COMMITTED_ANCHORS,
+        payload_budget,
+        stores.len(),
+        anchor_bytes,
+    );
+    let pending_capacity = simultaneous_pending_capacity_slots(
+        payload_budget,
+        stores.len(),
+        anchor_bytes,
+        effective_k,
+    );
+    let outcome = stores[slot_idx].stage_pending(anchor, effective_k, slot_budget);
+    let aggregate_after = gemma4_anchor_aggregate_owned_bytes(stores).unwrap_or(u64::MAX);
+    record_gemma4_anchor_capture(
+        outcome,
+        capture_duration,
+        stores[slot_idx].owned_bytes(),
+        aggregate_after,
+    );
+    tracing::info!(
+        target: "hf2q::serve::api::gemma4_anchor",
+        slot = handle.slot_id.0,
+        prompt_tokens,
+        anchor_bytes,
+        capture_ms = capture_duration.as_secs_f64() * 1000.0,
+        aggregate_owned_bytes = aggregate_after,
+        aggregate_budget_bytes,
+        effective_committed_depth = effective_k,
+        simultaneous_pending_capacity_slots = pending_capacity,
+        outcome = ?outcome,
+        capture_source,
+        "Gemma4 slot-local boundary capture aggregate-budget preflight"
+    );
+    outcome
+}
+
+fn publish_gemma4_pending_anchor(
+    handle: SlotHandle,
+    stores: &mut [Gemma4AnchorStore],
+    aggregate_budget_bytes: u64,
+) {
+    let slot_idx = handle.slot_id.0 as usize;
+    if !stores[slot_idx].has_pending() {
+        return;
+    }
+    let payload_budget = aggregate_budget_bytes
+        .saturating_sub(gemma4_anchor_aggregate_control_bytes(stores).unwrap_or(u64::MAX));
+    let effective_k = effective_committed_depth(
+        GEMMA4_DEFAULT_MAX_COMMITTED_ANCHORS,
+        payload_budget,
+        stores.len(),
+        stores[slot_idx].pending_bytes(),
+    );
+    match stores[slot_idx].publish_pending(effective_k) {
+        Ok(publication) => {
+            record_gemma4_anchor_publication(publication);
+            tracing::info!(
+                target: "hf2q::serve::api::gemma4_anchor",
+                slot = handle.slot_id.0,
+                committed_anchors = stores[slot_idx].committed_len(),
+                anchor_owned_bytes = stores[slot_idx].owned_bytes(),
+                eviction_reason = if publication.evicted > 0 {
+                    "positional_keep_newest_k"
+                } else if publication.replaced_equal_depth {
+                    "replace_equal_depth"
+                } else {
+                    "none"
+                },
+                evicted = publication.evicted,
+                "Gemma4 pending anchor published after terminal ledger commit"
+            );
+        }
+        Err(error) => {
+            let cleared = stores[slot_idx].clear_all();
+            record_gemma4_anchor_lineage_clear();
+            tracing::error!(
+                target: "hf2q::serve::api::gemma4_anchor",
+                slot = handle.slot_id.0,
+                error = %error,
+                committed_cleared = cleared.committed,
+                pending_discarded = cleared.pending_discarded,
+                "Gemma4 pending publication violated its state-machine invariant; lineage cleared"
+            );
+        }
+    }
+}
+
+fn clear_gemma4_anchor_store(store: &mut Gemma4AnchorStore, cause: &'static str, slot: SlotId) {
+    let cleared = store.clear_all();
+    record_gemma4_anchor_lineage_clear();
+    tracing::info!(
+        target: "hf2q::serve::api::gemma4_anchor",
+        slot = slot.0,
+        cleared_committed = cleared.committed,
+        pending_discarded = cleared.pending_discarded,
+        cause,
+        "Gemma4 slot-local anchor lineage cleared"
+    );
 }
 
 /// ADR-040 Phase F M1 (F1) — Gemma 4 SlotAware admit-while-decoding loop.
@@ -11495,7 +11698,13 @@ fn run_slot_aware_gemma4(
     scheduler.set_prefill_chunk_tokens(GEMMA4_SLOT_PREFILL_CHUNK_TOKENS);
     let mut slots: Vec<Option<Gemma4Slot>> = (0..n_slots).map(|_| None).collect();
     let mut retained_tokens: Vec<Vec<u32>> = (0..n_slots).map(|_| Vec::new()).collect();
-    let mut prompt_anchors: Vec<Option<Gemma4PromptAnchor>> = (0..n_slots).map(|_| None).collect();
+    let anchor_aggregate_budget_bytes = gemma4_anchor_aggregate_budget_bytes();
+    let anchor_control_capacity =
+        gemma4_anchor_committed_control_capacity(n_slots, anchor_aggregate_budget_bytes);
+    record_gemma4_anchor_configuration(n_slots, anchor_aggregate_budget_bytes);
+    let mut prompt_anchors: Vec<Gemma4AnchorStore> = (0..n_slots)
+        .map(|_| Gemma4AnchorStore::with_committed_capacity(anchor_control_capacity))
+        .collect();
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
@@ -12691,7 +12900,7 @@ fn admit_gemma4_slot(
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
-    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    prompt_anchors: &mut [Gemma4AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -12855,6 +13064,19 @@ fn admit_gemma4_slot(
     let cached_tokens = selected_preference
         .map(|preference| preference.cached_tokens)
         .unwrap_or(0);
+    let restore_anchor_index =
+        selected_preference.and_then(|preference| preference.restore_anchor_index);
+    let selected_anchor = restore_anchor_index.and_then(|index| {
+        prompt_anchors[handle.slot_id.0 as usize]
+            .committed(index)
+            .map(|anchor| {
+                (
+                    anchor.prompt_tokens.len(),
+                    anchor.vision_fingerprint,
+                    common_token_prefix(&anchor.prompt_tokens, &prompt_tokens),
+                )
+            })
+    });
     let operator_request_id = gemma4_operator_request_id(handle);
     crate::serve::operator_ui::request_started(
         "gemma4",
@@ -12878,24 +13100,15 @@ fn admit_gemma4_slot(
         slot = handle.slot_id.0,
         prompt_tokens = prompt_tokens.len(),
         retained_tokens = retained_tokens[handle.slot_id.0 as usize].len(),
-        anchor_tokens = prompt_anchors[handle.slot_id.0 as usize]
-            .as_ref()
-            .map_or(0, |anchor| anchor.prompt_tokens.len()),
+        anchor_tokens = selected_anchor.map_or(0, |anchor| anchor.0),
         retained_common_prefix_tokens =
             common_token_prefix(&retained_tokens[handle.slot_id.0 as usize], &prompt_tokens,),
         anchor_common_prefix_tokens =
-            prompt_anchors[handle.slot_id.0 as usize]
-                .as_ref()
-                .map_or(0, |anchor| common_token_prefix(
-                    &anchor.prompt_tokens,
-                    &prompt_tokens
-                )),
+            selected_anchor.map_or(0, |anchor| anchor.2),
         vision_fingerprint = ?params.vision_fingerprint,
-        anchor_vision_fingerprint = ?prompt_anchors[handle.slot_id.0 as usize]
-            .as_ref()
-            .and_then(|anchor| anchor.vision_fingerprint),
+        anchor_vision_fingerprint = ?selected_anchor.and_then(|anchor| anchor.1),
         cached_tokens,
-        cache = if selected_preference.is_some_and(|preference| preference.restore_prompt_anchor) {
+        cache = if restore_anchor_index.is_some() {
             "prompt-anchor"
         } else if cached_tokens > 0 {
             "live"
@@ -12906,7 +13119,11 @@ fn admit_gemma4_slot(
     );
     if cached_tokens == 0 {
         retained_tokens[handle.slot_id.0 as usize].clear();
-        prompt_anchors[handle.slot_id.0 as usize] = None;
+        clear_gemma4_anchor_store(
+            &mut prompt_anchors[handle.slot_id.0 as usize],
+            "cold-admission-reset",
+            handle.slot_id,
+        );
         reply = match reset_gemma4_slot_for_reply(
             guard,
             scheduler,
@@ -12917,11 +13134,19 @@ fn admit_gemma4_slot(
             Ok(reply) => reply,
             Err(fatal) => return Some(fatal),
         };
-    } else if selected_preference.is_some_and(|preference| preference.restore_prompt_anchor) {
+    } else if let Some(anchor_index) = restore_anchor_index {
         let restore_result = (|| -> Result<()> {
             let anchor = prompt_anchors[handle.slot_id.0 as usize]
-                .as_ref()
+                .committed(anchor_index)
                 .ok_or_else(|| anyhow::anyhow!("Gemma prompt anchor disappeared before restore"))?;
+            anyhow::ensure!(
+                cached_tokens <= anchor.kv.prompt_len() && cached_tokens < prompt_tokens.len(),
+                "Gemma prompt anchor length {} incompatible with reusable prefix {} for request {}",
+                anchor.kv.prompt_len(),
+                cached_tokens,
+                prompt_tokens.len()
+            );
+            preflight_gemma4_slot_cursor_install(guard, handle.slot_id, cached_tokens)?;
             let hybrid = guard.hybrid.as_mut().ok_or_else(|| {
                 anyhow::anyhow!("Gemma prompt anchor requires the production hybrid KV cache")
             })?;
@@ -12931,35 +13156,38 @@ fn admit_gemma4_slot(
                 &anchor.kv,
                 cached_tokens,
             )?;
-            anyhow::ensure!(
-                cached_tokens <= anchor.kv.prompt_len() && cached_tokens < prompt_tokens.len(),
-                "Gemma prompt anchor length {} incompatible with reusable prefix {} for request {}",
-                anchor.kv.prompt_len(),
-                cached_tokens,
-                prompt_tokens.len()
-            );
+            install_gemma4_slot_cursor(guard, handle.slot_id, cached_tokens)?;
             Ok(())
         })();
-        if let Err(e) = restore_result {
-            reply = match reset_gemma4_slot_for_reply(
-                guard,
-                scheduler,
-                handle,
-                kv_bytes_per_token,
-                reply,
-            ) {
-                Ok(reply) => reply,
-                Err(fatal) => return Some(fatal),
-            };
-            retained_tokens[handle.slot_id.0 as usize].clear();
-            prompt_anchors[handle.slot_id.0 as usize] = None;
-            scheduler.release(handle);
-            slot_fire_done(reply, Err(e), false);
-            return None;
-        }
-        if let Err(error) = install_gemma4_slot_cursor(guard, handle.slot_id, cached_tokens) {
-            return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
-        }
+        let restore_result = restore_result.and_then(|()| {
+            prompt_anchors[handle.slot_id.0 as usize].prune_descendants_after_restore(anchor_index)
+        });
+        let prune = match restore_result {
+            Ok(prune) => prune,
+            Err(e) => {
+                record_gemma4_anchor_restore_miss();
+                clear_gemma4_anchor_store(
+                    &mut prompt_anchors[handle.slot_id.0 as usize],
+                    "failed-restore",
+                    handle.slot_id,
+                );
+                reply = match reset_gemma4_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                retained_tokens[handle.slot_id.0 as usize].clear();
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(e), false);
+                return None;
+            }
+        };
+        record_gemma4_anchor_restore_hit(cached_tokens, prune);
     } else if let Err(error) = validate_gemma4_slot_cursor(guard, handle.slot_id, cached_tokens) {
         return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
     }
@@ -13019,7 +13247,11 @@ fn admit_gemma4_slot(
                     Err(fatal) => return Some(fatal),
                 };
                 retained_tokens[slot_idx].clear();
-                prompt_anchors[slot_idx] = None;
+                clear_gemma4_anchor_store(
+                    &mut prompt_anchors[slot_idx],
+                    "rollback-capture-failure",
+                    handle.slot_id,
+                );
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(error), false);
                 return None;
@@ -13050,7 +13282,11 @@ fn admit_gemma4_slot(
                     Err(fatal) => return Some(fatal),
                 };
                 retained_tokens[handle.slot_id.0 as usize].clear();
-                prompt_anchors[handle.slot_id.0 as usize] = None;
+                clear_gemma4_anchor_store(
+                    &mut prompt_anchors[handle.slot_id.0 as usize],
+                    "prefill-state-construction-failure",
+                    handle.slot_id,
+                );
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(error), false);
                 return None;
@@ -13155,14 +13391,17 @@ fn admit_gemma4_slot(
         return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
     }
 
-    let committed_anchor = if let Some(kv) = stable_anchor {
+    let committed_anchor = if let Some((kv, capture_duration)) = stable_anchor {
         let boundary = kv.prompt_len();
         Some(Gemma4PromptAnchor {
             prompt_tokens: prompt_tokens[..boundary].to_vec(),
             kv,
             vision_fingerprint: params.vision_fingerprint,
+            capture_duration,
+            lineage_epoch: 0,
         })
     } else if params.vision_fingerprint.is_some() {
+        let capture_started = Instant::now();
         let anchor = guard
             .hybrid
             .as_ref()
@@ -13175,11 +13414,16 @@ fn admit_gemma4_slot(
                 )
             });
         match anchor {
-            Ok(kv) => Some(Gemma4PromptAnchor {
-                prompt_tokens: prompt_tokens.clone(),
-                kv,
-                vision_fingerprint: params.vision_fingerprint,
-            }),
+            Ok(kv) => {
+                let prompt_tokens = prompt_tokens.clone();
+                Some(Gemma4PromptAnchor {
+                    prompt_tokens,
+                    kv,
+                    vision_fingerprint: params.vision_fingerprint,
+                    capture_duration: capture_started.elapsed(),
+                    lineage_epoch: 0,
+                })
+            }
             Err(error) => {
                 reply = match recover_gemma4_slot_after_cancellation_for_reply(
                     guard,
@@ -13243,10 +13487,16 @@ fn admit_gemma4_slot(
             anchor_bytes = anchor.kv.total_bytes(),
             "Gemma stable pre-generation checkpoint committed"
         );
-        prompt_anchors[handle.slot_id.0 as usize] = Some(anchor);
-    } else {
-        prompt_anchors[handle.slot_id.0 as usize] = request_rollback_anchor;
+        let budget = gemma4_anchor_aggregate_budget_bytes();
+        let _ = stage_gemma4_pending_anchor(
+            handle,
+            prompt_anchors,
+            anchor,
+            budget,
+            "stable_prompt_boundary",
+        );
     }
+    drop(request_rollback_anchor);
 
     // ADR-040 Phase F `iter-F-prefill-determinism` (2026-06-24) — clear the
     // per-prefill self-mounts AGAIN, now AFTER prefill_seed, to enforce the
@@ -13302,6 +13552,11 @@ fn admit_gemma4_slot(
             retained_tokens[handle.slot_id.0 as usize].len(),
             kv_bytes_per_token,
         );
+        publish_gemma4_pending_anchor(
+            handle,
+            prompt_anchors,
+            gemma4_anchor_aggregate_budget_bytes(),
+        );
         scheduler.advance_after_decode(handle);
         scheduler.release(handle);
         finish_gemma4_operator_request(handle, "complete");
@@ -13321,7 +13576,7 @@ fn install_gemma4_prefill_advance(
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
-    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    prompt_anchors: &mut [Gemma4AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     handle: SlotHandle,
     kv_bytes_per_token: u64,
@@ -13431,7 +13686,16 @@ fn install_gemma4_prefill_advance(
                 );
                 return None;
             }
-            prompt_anchors[slot_idx] = prompt_anchor;
+            if let Some(anchor) = prompt_anchor {
+                let budget = gemma4_anchor_aggregate_budget_bytes();
+                let _ = stage_gemma4_pending_anchor(
+                    handle,
+                    prompt_anchors,
+                    anchor,
+                    budget,
+                    "stable_prompt_boundary",
+                );
+            }
             let seed_dropped = slot_emit_token(&mut reply, &state.seed_tick());
             if seed_dropped {
                 reply = match recover_gemma4_slot_after_cancellation_for_reply(
@@ -13460,6 +13724,11 @@ fn install_gemma4_prefill_advance(
                     retained_tokens[slot_idx].len(),
                     kv_bytes_per_token,
                 );
+                publish_gemma4_pending_anchor(
+                    handle,
+                    prompt_anchors,
+                    gemma4_anchor_aggregate_budget_bytes(),
+                );
                 scheduler.advance_after_decode(handle);
                 scheduler.release(handle);
                 finish_gemma4_operator_request(handle, "complete");
@@ -13478,7 +13747,7 @@ fn advance_gemma4_prefill(
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
-    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    prompt_anchors: &mut [Gemma4AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     handle: SlotHandle,
@@ -13629,7 +13898,7 @@ fn advance_gemma4_prefill_quantum(
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
-    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    prompt_anchors: &mut [Gemma4AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     handle: SlotHandle,
@@ -14001,7 +14270,7 @@ fn admit_gemma4_slots_batched(
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
-    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    prompt_anchors: &mut [Gemma4AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -14222,7 +14491,11 @@ fn admit_gemma4_slots_batched(
     }
     for (handle, _, _, _) in &admitted {
         retained_tokens[handle.slot_id.0 as usize].clear();
-        prompt_anchors[handle.slot_id.0 as usize] = None;
+        clear_gemma4_anchor_store(
+            &mut prompt_anchors[handle.slot_id.0 as usize],
+            "batched-cold-admission",
+            handle.slot_id,
+        );
     }
     clear_gemma4_self_mounts(guard.model);
 
@@ -14294,7 +14567,11 @@ fn admit_gemma4_slots_batched(
                 return Some(fatal);
             }
             for (handle, _, _, reply) in admitted {
-                prompt_anchors[handle.slot_id.0 as usize] = None;
+                clear_gemma4_anchor_store(
+                    &mut prompt_anchors[handle.slot_id.0 as usize],
+                    "batched-prefill-failure",
+                    handle.slot_id,
+                );
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(anyhow::anyhow!("{msg}")), false);
             }
@@ -14346,7 +14623,11 @@ fn admit_gemma4_slots_batched(
         // not an exact pre-generation boundary. Never manufacture a
         // rewindable checkpoint after the cue; boundary-bearing requests are
         // routed through `admit_gemma4_slot` above.
-        prompt_anchors[handle.slot_id.0 as usize] = None;
+        clear_gemma4_anchor_store(
+            &mut prompt_anchors[handle.slot_id.0 as usize],
+            "batched-cold-install",
+            handle.slot_id,
+        );
         let state = match Gemma4DecodeState::from_first_token(
             guard.model,
             &prompt_tokens,
@@ -14378,7 +14659,11 @@ fn admit_gemma4_slots_batched(
                     }
                 };
                 retained_tokens[handle.slot_id.0 as usize].clear();
-                prompt_anchors[handle.slot_id.0 as usize] = None;
+                clear_gemma4_anchor_store(
+                    &mut prompt_anchors[handle.slot_id.0 as usize],
+                    "batched-install-failure",
+                    handle.slot_id,
+                );
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
                 continue;
@@ -14438,6 +14723,11 @@ fn admit_gemma4_slots_batched(
                 retained_tokens[handle.slot_id.0 as usize].len(),
                 kv_bytes_per_token,
             );
+            publish_gemma4_pending_anchor(
+                handle,
+                prompt_anchors,
+                gemma4_anchor_aggregate_budget_bytes(),
+            );
             scheduler.advance_after_decode(handle);
             scheduler.release(handle);
             finish_gemma4_operator_request(handle, "complete");
@@ -14468,7 +14758,7 @@ fn admit_gemma4_slots_stable_batched(
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
-    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    prompt_anchors: &mut [Gemma4AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -14480,7 +14770,7 @@ fn admit_gemma4_slots_stable_batched(
                            scheduler: &mut InflightBatchedScheduler,
                            slots: &mut [Option<Gemma4Slot>],
                            retained_tokens: &mut [Vec<u32>],
-                           prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+                           prompt_anchors: &mut [Gemma4AnchorStore],
                            requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>|
      -> Option<SlotAwareGpuFatal> {
         let mut requests = requests.into_iter();
@@ -14755,24 +15045,31 @@ fn admit_gemma4_slots_stable_batched(
         );
     }
 
-    // Restore every exact anchor before mutating any suffix. A failed restore
-    // aborts the complete batch so no peer is left with partially advanced KV.
-    let restore_result = (|| -> Result<()> {
+    // Validate every lane before the first byte or cursor mutation. A late
+    // layout mismatch must not leave an earlier lane restored.
+    let restore_preflight = (|| -> Result<()> {
         let hybrid = guard
             .hybrid
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Gemma stable batched resume requires hybrid KV"))?;
         for (handle, prompt, _, _, preference, _) in &admitted {
-            if preference.restore_prompt_anchor {
+            if let Some(anchor_index) = preference.restore_anchor_index {
                 let anchor = prompt_anchors[handle.slot_id.0 as usize]
-                    .as_ref()
+                    .committed(anchor_index)
                     .ok_or_else(|| anyhow::anyhow!("Gemma prompt anchor disappeared"))?;
-                crate::inference::models::gemma4::kv_cache::restore_gemma_hybrid_slot_anchor(
+                preflight_gemma4_slot_cursor_install(
+                    guard,
+                    handle.slot_id,
+                    preference.cached_tokens,
+                )?;
+                crate::inference::models::gemma4::kv_cache::preflight_gemma_hybrid_slot_anchor_restore(
                     hybrid,
                     handle.slot_id,
                     &anchor.kv,
                     preference.cached_tokens,
                 )?;
+            } else {
+                validate_gemma4_slot_cursor(guard, handle.slot_id, preference.cached_tokens)?;
             }
             anyhow::ensure!(
                 preference.cached_tokens < prompt.len(),
@@ -14781,7 +15078,8 @@ fn admit_gemma4_slots_stable_batched(
         }
         Ok(())
     })();
-    if let Err(e) = restore_result {
+    if let Err(e) = restore_preflight {
+        record_gemma4_anchor_restore_miss();
         return fail_gemma4_stable_batch(
             guard,
             scheduler,
@@ -14792,22 +15090,59 @@ fn admit_gemma4_slots_stable_batched(
             e,
         );
     }
+
+    let restore_result = (|| -> Result<()> {
+        for (handle, _, _, _, preference, _) in &admitted {
+            if let Some(anchor_index) = preference.restore_anchor_index {
+                let anchor = prompt_anchors[handle.slot_id.0 as usize]
+                    .committed(anchor_index)
+                    .ok_or_else(|| anyhow::anyhow!("Gemma prompt anchor disappeared"))?;
+                let hybrid = guard
+                    .hybrid
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Gemma stable batched resume lost hybrid KV"))?;
+                crate::inference::models::gemma4::kv_cache::restore_gemma_hybrid_slot_anchor(
+                    hybrid,
+                    handle.slot_id,
+                    &anchor.kv,
+                    preference.cached_tokens,
+                )?;
+                install_gemma4_slot_cursor(guard, handle.slot_id, preference.cached_tokens)?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = restore_result {
+        record_gemma4_anchor_restore_miss();
+        return fail_gemma4_stable_batch(
+            guard,
+            scheduler,
+            retained_tokens,
+            prompt_anchors,
+            admitted,
+            kv_bytes_per_token,
+            error,
+        );
+    }
     for (handle, _, _, _, preference, _) in &admitted {
-        let cursor_result = if preference.restore_prompt_anchor {
-            install_gemma4_slot_cursor(guard, handle.slot_id, preference.cached_tokens)
-        } else {
-            validate_gemma4_slot_cursor(guard, handle.slot_id, preference.cached_tokens)
-        };
-        if let Err(error) = cursor_result {
-            return fail_gemma4_stable_batch(
-                guard,
-                scheduler,
-                retained_tokens,
-                prompt_anchors,
-                admitted,
-                kv_bytes_per_token,
-                error,
-            );
+        if let Some(anchor_index) = preference.restore_anchor_index {
+            let prune = match prompt_anchors[handle.slot_id.0 as usize]
+                .prune_descendants_after_restore(anchor_index)
+            {
+                Ok(prune) => prune,
+                Err(error) => {
+                    return fail_gemma4_stable_batch(
+                        guard,
+                        scheduler,
+                        retained_tokens,
+                        prompt_anchors,
+                        admitted,
+                        kv_bytes_per_token,
+                        error,
+                    );
+                }
+            };
+            record_gemma4_anchor_restore_hit(preference.cached_tokens, prune);
         }
     }
 
@@ -14837,6 +15172,8 @@ fn admit_gemma4_slots_stable_batched(
             })
         })
         .collect();
+    let mut captured_anchors: Vec<(SlotId, Option<Gemma4PromptAnchor>)> =
+        Vec::with_capacity(admitted.len());
     let forward_result = (|| -> Result<MultiSeqPrefillOutput> {
         let scaffold = guard
             .hybrid
@@ -14856,17 +15193,24 @@ fn admit_gemma4_slots_stable_batched(
         }
 
         for (handle, prompt, _, _, _, boundary) in &admitted {
+            let capture_started = Instant::now();
             let anchor =
                 crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
                     scaffold,
                     handle.slot_id,
                     *boundary,
                 )?;
-            prompt_anchors[handle.slot_id.0 as usize] = Some(Gemma4PromptAnchor {
-                prompt_tokens: prompt[..*boundary].to_vec(),
-                kv: anchor,
-                vision_fingerprint: None,
-            });
+            let prompt_tokens = prompt[..*boundary].to_vec();
+            captured_anchors.push((
+                handle.slot_id,
+                Some(Gemma4PromptAnchor {
+                    prompt_tokens,
+                    kv: anchor,
+                    vision_fingerprint: None,
+                    capture_duration: capture_started.elapsed(),
+                    lineage_epoch: 0,
+                }),
+            ));
         }
 
         let cue_seqs: Vec<(Vec<u32>, SlotId, usize)> = admitted
@@ -14987,7 +15331,11 @@ fn admit_gemma4_slots_stable_batched(
                     }
                 };
                 retained_tokens[handle.slot_id.0 as usize].clear();
-                prompt_anchors[handle.slot_id.0 as usize] = None;
+                clear_gemma4_anchor_store(
+                    &mut prompt_anchors[handle.slot_id.0 as usize],
+                    "stable-batch-install-failure",
+                    handle.slot_id,
+                );
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
                 continue;
@@ -15013,6 +15361,20 @@ fn admit_gemma4_slots_stable_batched(
             handle,
             u32::try_from(prompt.len()).expect("Gemma stable batch request was validated"),
         );
+        let budget = gemma4_anchor_aggregate_budget_bytes();
+        if let Some(anchor) = captured_anchors
+            .iter_mut()
+            .find(|(slot_id, _)| *slot_id == handle.slot_id)
+            .and_then(|(_, anchor)| anchor.take())
+        {
+            let _ = stage_gemma4_pending_anchor(
+                handle,
+                prompt_anchors,
+                anchor,
+                budget,
+                "stable_batched_prompt_boundary",
+            );
+        }
         if slot_emit_token(&mut reply, &state.seed_tick()) {
             let slot_idx = handle.slot_id.0 as usize;
             reply = match recover_gemma4_slot_after_cancellation_for_reply(
@@ -15039,20 +15401,28 @@ fn admit_gemma4_slots_stable_batched(
             scheduler.release(handle);
             finish_gemma4_operator_request(handle, "cancelled");
             slot_fire_done(reply, Ok(state.finish(registration)), true);
-        } else if state.finished_at_seed() {
-            retained_tokens[handle.slot_id.0 as usize] = state.retained_prefix();
-            record_retained_slot_kv(
-                scheduler,
-                handle,
-                retained_tokens[handle.slot_id.0 as usize].len(),
-                kv_bytes_per_token,
-            );
-            scheduler.advance_after_decode(handle);
-            scheduler.release(handle);
-            finish_gemma4_operator_request(handle, "complete");
-            slot_fire_done(reply, Ok(state.finish(registration)), false);
         } else {
-            slots[handle.slot_id.0 as usize] = Some((Gemma4SlotWork::Decode(state), reply, handle));
+            if state.finished_at_seed() {
+                retained_tokens[handle.slot_id.0 as usize] = state.retained_prefix();
+                record_retained_slot_kv(
+                    scheduler,
+                    handle,
+                    retained_tokens[handle.slot_id.0 as usize].len(),
+                    kv_bytes_per_token,
+                );
+                publish_gemma4_pending_anchor(
+                    handle,
+                    prompt_anchors,
+                    gemma4_anchor_aggregate_budget_bytes(),
+                );
+                scheduler.advance_after_decode(handle);
+                scheduler.release(handle);
+                finish_gemma4_operator_request(handle, "complete");
+                slot_fire_done(reply, Ok(state.finish(registration)), false);
+            } else {
+                slots[handle.slot_id.0 as usize] =
+                    Some((Gemma4SlotWork::Decode(state), reply, handle));
+            }
         }
     }
     if let Ok(mut stats) = scheduler_stats_snapshot.lock() {
@@ -15065,7 +15435,7 @@ fn fail_gemma4_stable_batch(
     guard: &mut Gemma4KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     retained_tokens: &mut [Vec<u32>],
-    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    prompt_anchors: &mut [Gemma4AnchorStore],
     admitted: Vec<(
         SlotHandle,
         Vec<u32>,
@@ -15078,20 +15448,19 @@ fn fail_gemma4_stable_batch(
     error: anyhow::Error,
 ) -> Option<SlotAwareGpuFatal> {
     let message = format!("Gemma stable multi-slot prefill failed: {error:#}");
-    let reset_failure = admitted.iter().find_map(|(handle, _, _, _, _, _)| {
+    for (handle, _, _, _, _, _) in &admitted {
         let slot_idx = handle.slot_id.0 as usize;
-        recover_gemma4_slot_after_cancellation(
-            guard,
-            scheduler,
-            *handle,
-            kv_bytes_per_token,
-            &mut retained_tokens[slot_idx],
+        retained_tokens[slot_idx].clear();
+        clear_gemma4_anchor_store(
             &mut prompt_anchors[slot_idx],
-            None,
-            false,
-        )
-        .err()
-        .map(|reset_error| (*handle, reset_error))
+            "stable-batch-failure",
+            handle.slot_id,
+        );
+    }
+    let reset_failure = admitted.iter().find_map(|(handle, _, _, _, _, _)| {
+        reset_gemma4_slot(guard, scheduler, *handle, kv_bytes_per_token)
+            .err()
+            .map(|reset_error| (*handle, reset_error))
     });
     if let Some((_failed_handle, reset_error)) = reset_failure {
         let mut fatal = SlotAwareGpuFatal {
@@ -15123,7 +15492,7 @@ fn embed_gemma4_inline(
     guard: &mut Gemma4KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     retained_tokens: &mut [Vec<u32>],
-    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    prompt_anchors: &mut [Gemma4AnchorStore],
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
@@ -15175,7 +15544,11 @@ fn embed_gemma4_inline(
     // generation metadata must be invalidated before that first mutation.
     let slot_idx = handle.slot_id.0 as usize;
     retained_tokens[slot_idx].clear();
-    prompt_anchors[slot_idx] = None;
+    clear_gemma4_anchor_store(
+        &mut prompt_anchors[slot_idx],
+        "embedding-reset",
+        handle.slot_id,
+    );
     clear_gemma4_self_mounts(guard.model);
     let result = supervised_gemma4_gpu_call(supervisor, "gemma4_embed", || {
         embed_gemma4_slot_aware(
@@ -15258,7 +15631,7 @@ fn decode_batch_gemma4(
     scheduler: &mut InflightBatchedScheduler,
     slots: &mut [Option<Gemma4Slot>],
     retained_tokens: &mut [Vec<u32>],
-    prompt_anchors: &mut [Option<Gemma4PromptAnchor>],
+    prompt_anchors: &mut [Gemma4AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     handles: &[SlotHandle],
     kv_bytes_per_token: u64,
@@ -15536,7 +15909,11 @@ fn decode_batch_gemma4(
                 }
                 for (handle, _slot_idx, _state, reply) in captured.drain(..) {
                     retained_tokens[handle.slot_id.0 as usize].clear();
-                    prompt_anchors[handle.slot_id.0 as usize] = None;
+                    clear_gemma4_anchor_store(
+                        &mut prompt_anchors[handle.slot_id.0 as usize],
+                        "decode-body-batch-failure",
+                        handle.slot_id,
+                    );
                     scheduler.release(handle);
                     slot_fire_done(
                         reply,
@@ -15665,7 +16042,11 @@ fn decode_batch_gemma4(
                         }
                     };
                     retained_tokens[handle.slot_id.0 as usize].clear();
-                    prompt_anchors[handle.slot_id.0 as usize] = None;
+                    clear_gemma4_anchor_store(
+                        &mut prompt_anchors[handle.slot_id.0 as usize],
+                        "decode-body-failure",
+                        handle.slot_id,
+                    );
                     scheduler.release(handle);
                     slot_fire_done(reply, Err(e), false);
                 }
@@ -15729,7 +16110,11 @@ fn decode_batch_gemma4(
                 }
                 for (handle, _slot_idx, _state, reply) in captured {
                     retained_tokens[handle.slot_id.0 as usize].clear();
-                    prompt_anchors[handle.slot_id.0 as usize] = None;
+                    clear_gemma4_anchor_store(
+                        &mut prompt_anchors[handle.slot_id.0 as usize],
+                        "decode-head-batch-failure",
+                        handle.slot_id,
+                    );
                     scheduler.release(handle);
                     slot_fire_done(reply, Err(anyhow::anyhow!("lm_head_batched: {msg}")), false);
                 }
@@ -15798,7 +16183,11 @@ fn decode_batch_gemma4(
                     }
                 };
                 retained_tokens[handle.slot_id.0 as usize].clear();
-                prompt_anchors[handle.slot_id.0 as usize] = None;
+                clear_gemma4_anchor_store(
+                    &mut prompt_anchors[handle.slot_id.0 as usize],
+                    "decode-finalize-failure",
+                    handle.slot_id,
+                );
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
                 continue;
@@ -15830,7 +16219,11 @@ fn decode_batch_gemma4(
                     }
                 };
                 retained_tokens[handle.slot_id.0 as usize].clear();
-                prompt_anchors[handle.slot_id.0 as usize] = None;
+                clear_gemma4_anchor_store(
+                    &mut prompt_anchors[handle.slot_id.0 as usize],
+                    "decode-tick-failure",
+                    handle.slot_id,
+                );
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
                 continue;
@@ -15858,6 +16251,11 @@ fn decode_batch_gemma4(
                 handle,
                 retained_tokens[slot_idx].len(),
                 kv_bytes_per_token,
+            );
+            publish_gemma4_pending_anchor(
+                handle,
+                prompt_anchors,
+                gemma4_anchor_aggregate_budget_bytes(),
             );
         }
         scheduler.advance_after_decode(handle);
@@ -15985,7 +16383,36 @@ fn install_gemma4_slot_cursor(
     slot_id: SlotId,
     cursor: usize,
 ) -> Result<()> {
+    preflight_gemma4_slot_cursor_install(guard, slot_id, cursor)?;
     let cursor = u32::try_from(cursor).context("Gemma4 slot cursor exceeds u32")?;
+    let slot_idx = slot_id.0 as usize;
+    for buffer in &mut guard.kv {
+        buffer.seq_lens[slot_idx] = cursor;
+    }
+    if let Some(buffers) = guard.hybrid.as_mut() {
+        for buffer in buffers {
+            buffer.seq_lens[slot_idx] = cursor;
+        }
+    }
+    if let Some(buffers) = guard.dense.as_mut() {
+        for buffer in buffers {
+            buffer.seq_lens[slot_idx] = cursor;
+        }
+    }
+    if let Some(buffers) = guard.mlx.as_mut() {
+        for buffer in buffers {
+            buffer.seq_lens[slot_idx] = cursor;
+        }
+    }
+    Ok(())
+}
+
+fn preflight_gemma4_slot_cursor_install(
+    guard: &Gemma4KvGuard<'_>,
+    slot_id: SlotId,
+    cursor: usize,
+) -> Result<()> {
+    let _ = u32::try_from(cursor).context("Gemma4 slot cursor exceeds u32")?;
     let slot_idx = slot_id.0 as usize;
     let validate = |regime: &str, layer: usize, seq_lens: &[u32]| -> Result<()> {
         anyhow::ensure!(
@@ -16012,24 +16439,6 @@ fn install_gemma4_slot_cursor(
     if let Some(buffers) = guard.mlx.as_ref() {
         for (layer, buffer) in buffers.iter().enumerate() {
             validate("mlx", layer, &buffer.seq_lens)?;
-        }
-    }
-    for buffer in &mut guard.kv {
-        buffer.seq_lens[slot_idx] = cursor;
-    }
-    if let Some(buffers) = guard.hybrid.as_mut() {
-        for buffer in buffers {
-            buffer.seq_lens[slot_idx] = cursor;
-        }
-    }
-    if let Some(buffers) = guard.dense.as_mut() {
-        for buffer in buffers {
-            buffer.seq_lens[slot_idx] = cursor;
-        }
-    }
-    if let Some(buffers) = guard.mlx.as_mut() {
-        for buffer in buffers {
-            buffer.seq_lens[slot_idx] = cursor;
         }
     }
     Ok(())
@@ -16135,7 +16544,7 @@ fn recover_gemma4_slot_after_cancellation(
     handle: SlotHandle,
     kv_bytes_per_token: u64,
     retained_tokens: &mut Vec<u32>,
-    prompt_anchor: &mut Option<Gemma4PromptAnchor>,
+    prompt_anchor: &mut Gemma4AnchorStore,
     rollback_anchor: Option<Gemma4PromptAnchor>,
     preserve_unmodified_live_prefix: bool,
 ) -> Result<()> {
@@ -16146,14 +16555,16 @@ fn recover_gemma4_slot_after_cancellation(
         && live_tokens == retained_tokens.len()
         && validate_gemma4_slot_cursor(guard, handle.slot_id, live_tokens).is_ok()
     {
+        let prune = prompt_anchor.cancel_request_at_cursor(live_tokens);
+        record_gemma4_anchor_cancellation(prune);
         return Ok(());
     }
 
-    let rollback_anchor = rollback_anchor.or_else(|| prompt_anchor.take());
     if let Some(anchor) = rollback_anchor {
         let anchor_tokens = anchor.prompt_tokens.len();
         let restore = (|| -> Result<()> {
             anyhow::ensure!(anchor_tokens > 0, "Gemma4 rollback anchor is empty");
+            preflight_gemma4_slot_cursor_install(guard, handle.slot_id, anchor_tokens)?;
             let hybrid = guard
                 .hybrid
                 .as_mut()
@@ -16170,7 +16581,8 @@ fn recover_gemma4_slot_after_cancellation(
         match restore {
             Ok(()) => {
                 retained_tokens.clone_from(&anchor.prompt_tokens);
-                *prompt_anchor = Some(anchor);
+                let prune = prompt_anchor.cancel_request_at_cursor(anchor_tokens);
+                record_gemma4_anchor_cancellation(prune);
                 tracing::info!(
                     slot = handle.slot_id.0,
                     cached_tokens = anchor_tokens,
@@ -16179,6 +16591,12 @@ fn recover_gemma4_slot_after_cancellation(
                 return Ok(());
             }
             Err(error) => {
+                record_gemma4_anchor_restore_miss();
+                clear_gemma4_anchor_store(
+                    prompt_anchor,
+                    "failed-cancellation-restore",
+                    handle.slot_id,
+                );
                 tracing::warn!(
                     slot = handle.slot_id.0,
                     error = %error,
@@ -16186,11 +16604,54 @@ fn recover_gemma4_slot_after_cancellation(
                 );
             }
         }
+    } else if let Some(anchor_index) = prompt_anchor.newest_committed_at_or_before(live_tokens) {
+        let restore = (|| -> Result<(usize, Vec<u32>)> {
+            let anchor = prompt_anchor
+                .committed(anchor_index)
+                .ok_or_else(|| anyhow::anyhow!("Gemma4 rollback anchor disappeared"))?;
+            let anchor_tokens = anchor.prompt_tokens.len();
+            let retained = anchor.prompt_tokens.clone();
+            preflight_gemma4_slot_cursor_install(guard, handle.slot_id, anchor_tokens)?;
+            let hybrid = guard
+                .hybrid
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Gemma4 rollback anchor requires hybrid KV"))?;
+            crate::inference::models::gemma4::kv_cache::restore_gemma_hybrid_slot_anchor(
+                hybrid,
+                handle.slot_id,
+                &anchor.kv,
+                anchor_tokens,
+            )?;
+            install_gemma4_slot_cursor(guard, handle.slot_id, anchor_tokens)?;
+            validate_gemma4_slot_cursor(guard, handle.slot_id, anchor_tokens)?;
+            Ok((anchor_tokens, retained))
+        })();
+        match restore {
+            Ok((anchor_tokens, retained)) => {
+                retained_tokens.clone_from(&retained);
+                let prune = prompt_anchor.prune_descendants_after_restore(anchor_index)?;
+                record_gemma4_anchor_cancellation_restore_hit(anchor_tokens, prune);
+                return Ok(());
+            }
+            Err(error) => {
+                record_gemma4_anchor_restore_miss();
+                clear_gemma4_anchor_store(
+                    prompt_anchor,
+                    "failed-cancellation-restore",
+                    handle.slot_id,
+                );
+                tracing::warn!(
+                    slot = handle.slot_id.0,
+                    error = %error,
+                    "Gemma4 committed cancellation restore failed; invalidating slot"
+                );
+            }
+        }
     }
 
     reset_gemma4_slot(guard, scheduler, handle, kv_bytes_per_token)?;
     retained_tokens.clear();
-    *prompt_anchor = None;
+    clear_gemma4_anchor_store(prompt_anchor, "cancellation-cold-reset", handle.slot_id);
     Ok(())
 }
 
@@ -16201,7 +16662,7 @@ fn recover_gemma4_slot_after_cancellation_for_reply(
     handle: SlotHandle,
     kv_bytes_per_token: u64,
     retained_tokens: &mut Vec<u32>,
-    prompt_anchor: &mut Option<Gemma4PromptAnchor>,
+    prompt_anchor: &mut Gemma4AnchorStore,
     rollback_anchor: Option<Gemma4PromptAnchor>,
     preserve_unmodified_live_prefix: bool,
     reply: SlotReply,
@@ -17735,7 +18196,7 @@ fn qwen35_pending_request_is_ready(
 fn gemma4_pending_request_is_ready(
     request: &Request,
     retained_tokens: &[Vec<u32>],
-    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    prompt_anchors: &[Gemma4AnchorStore],
     slots: &[Option<Gemma4Slot>],
 ) -> bool {
     slots.iter().any(Option::is_none)
@@ -17821,7 +18282,7 @@ fn active_qwen35_slot_affinity(
 struct Gemma4SlotPreference {
     slot: SlotId,
     cached_tokens: usize,
-    restore_prompt_anchor: bool,
+    restore_anchor_index: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17847,7 +18308,7 @@ fn gemma4_slot_affinity<'a>(
         Item = (
             usize,
             &'a [u32],
-            Option<&'a [u32]>,
+            Option<(usize, &'a [u32])>,
             Option<&'a [u32]>,
             bool,
             bool,
@@ -17864,22 +18325,24 @@ fn gemma4_slot_affinity<'a>(
             && retained.len() < prompt_tokens.len()
             && prompt_tokens.starts_with(retained))
         .then_some(retained.len());
-        let anchor_tokens =
-            anchor.and_then(|anchor| gemma_prompt_anchor_cached_tokens(anchor, prompt_tokens));
+        let anchor_tokens = anchor.and_then(|(anchor_index, anchor)| {
+            gemma_prompt_anchor_cached_tokens(anchor, prompt_tokens)
+                .map(|cached_tokens| (cached_tokens, anchor_index))
+        });
         let active_tokens = active_prompt.and_then(|active_prompt| {
             (!active_prompt.is_empty() && prompt_tokens.starts_with(active_prompt))
                 .then_some(active_prompt.len())
         });
 
-        let (cached_tokens, restore_prompt_anchor) = match (live_tokens, anchor_tokens) {
-            (Some(live), Some(anchor)) if live >= anchor => (live, false),
-            (_, Some(anchor)) => (anchor, true),
-            (Some(live), None) => (live, false),
-            (None, None) => (0, false),
+        let (cached_tokens, restore_anchor_index) = match (live_tokens, anchor_tokens) {
+            (Some(live), Some((anchor, _))) if live >= anchor => (live, None),
+            (_, Some((anchor, anchor_index))) => (anchor, Some(anchor_index)),
+            (Some(live), None) => (live, None),
+            (None, None) => (0, None),
         };
-        let (cached_tokens, restore_prompt_anchor) = match active_tokens {
-            Some(active) if active > cached_tokens => (active, false),
-            _ => (cached_tokens, restore_prompt_anchor),
+        let (cached_tokens, restore_anchor_index) = match active_tokens {
+            Some(active) if active > cached_tokens => (active, None),
+            _ => (cached_tokens, restore_anchor_index),
         };
         if cached_tokens == 0 {
             continue;
@@ -17887,7 +18350,7 @@ fn gemma4_slot_affinity<'a>(
         let preference = Gemma4SlotPreference {
             slot: SlotId(index as u32),
             cached_tokens,
-            restore_prompt_anchor,
+            restore_anchor_index,
         };
         let affinity = if active {
             Gemma4SlotAffinity::Active(preference)
@@ -17908,7 +18371,7 @@ fn gemma4_slot_affinity<'a>(
 
 fn gemma4_slot_affinity_excluding(
     retained_tokens: &[Vec<u32>],
-    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    prompt_anchors: &[Gemma4AnchorStore],
     active_slots: &[Option<Gemma4Slot>],
     prompt_tokens: &[u32],
     excluded_slots: &[bool],
@@ -17919,13 +18382,20 @@ fn gemma4_slot_affinity_excluding(
             .zip(prompt_anchors)
             .zip(active_slots)
             .enumerate()
-            .map(|(index, ((retained, anchor), active))| {
+            .map(|(index, ((retained, anchors), active))| {
+                let anchor = anchors
+                    .deepest_matching_index(|anchor| {
+                        prompt_tokens.starts_with(&anchor.prompt_tokens)
+                    })
+                    .and_then(|anchor_index| {
+                        anchors
+                            .committed(anchor_index)
+                            .map(|anchor| (anchor_index, anchor.prompt_tokens.as_slice()))
+                    });
                 (
                     index,
                     retained.as_slice(),
-                    anchor
-                        .as_ref()
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    anchor,
                     active.as_ref().map(|(work, _, _)| work.prompt_tokens()),
                     active.is_some(),
                     excluded_slots.get(index).copied().unwrap_or(true),
@@ -17937,7 +18407,7 @@ fn gemma4_slot_affinity_excluding(
 
 fn preferred_gemma4_slot(
     retained_tokens: &[Vec<u32>],
-    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    prompt_anchors: &[Gemma4AnchorStore],
     active_slots: &[Option<Gemma4Slot>],
     prompt_tokens: &[u32],
 ) -> Option<Gemma4SlotPreference> {
@@ -17952,7 +18422,7 @@ fn preferred_gemma4_slot(
 
 fn preferred_gemma4_slot_for_request(
     retained_tokens: &[Vec<u32>],
-    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    prompt_anchors: &[Gemma4AnchorStore],
     active_slots: &[Option<Gemma4Slot>],
     prompt_tokens: &[u32],
     vision_fingerprint: Option<[u8; 32]>,
@@ -17963,24 +18433,28 @@ fn preferred_gemma4_slot_for_request(
             .zip(prompt_anchors)
             .zip(active_slots)
             .enumerate()
-            .map(|(index, ((retained, anchor), active))| {
-                let identity_matches = anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.vision_fingerprint == vision_fingerprint);
+            .map(|(index, ((retained, anchors), active))| {
+                let anchor = anchors
+                    .deepest_matching_index(|anchor| {
+                        anchor.vision_fingerprint == vision_fingerprint
+                            && prompt_tokens.starts_with(&anchor.prompt_tokens)
+                    })
+                    .and_then(|anchor_index| {
+                        anchors
+                            .committed(anchor_index)
+                            .map(|anchor| (anchor_index, anchor.prompt_tokens.as_slice()))
+                    });
                 let active_matches = active
                     .as_ref()
                     .is_some_and(|(work, _, _)| work.vision_fingerprint() == vision_fingerprint);
                 (
                     index,
-                    if identity_matches {
+                    if anchor.is_some() {
                         retained.as_slice()
                     } else {
                         &[]
                     },
-                    anchor
-                        .as_ref()
-                        .filter(|_| identity_matches)
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    anchor,
                     active
                         .as_ref()
                         .filter(|_| active_matches)
@@ -17998,7 +18472,7 @@ fn preferred_gemma4_slot_for_request(
 
 fn preferred_gemma4_slot_excluding(
     retained_tokens: &[Vec<u32>],
-    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    prompt_anchors: &[Gemma4AnchorStore],
     active_slots: &[Option<Gemma4Slot>],
     prompt_tokens: &[u32],
     excluded_slots: &[bool],
@@ -18035,7 +18509,7 @@ fn gemma4_request_vision_fingerprint(request: &Request) -> Option<[u8; 32]> {
 
 fn active_gemma4_slot_affinity(
     retained_tokens: &[Vec<u32>],
-    prompt_anchors: &[Option<Gemma4PromptAnchor>],
+    prompt_anchors: &[Gemma4AnchorStore],
     slots: &[Option<Gemma4Slot>],
     prompt_tokens: &[u32],
     vision_fingerprint: Option<[u8; 32]>,
@@ -18046,24 +18520,28 @@ fn active_gemma4_slot_affinity(
             .zip(prompt_anchors)
             .zip(slots)
             .enumerate()
-            .map(|(index, ((retained, anchor), active))| {
-                let anchor_matches = anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.vision_fingerprint == vision_fingerprint);
+            .map(|(index, ((retained, anchors), active))| {
+                let anchor = anchors
+                    .deepest_matching_index(|anchor| {
+                        anchor.vision_fingerprint == vision_fingerprint
+                            && prompt_tokens.starts_with(&anchor.prompt_tokens)
+                    })
+                    .and_then(|anchor_index| {
+                        anchors
+                            .committed(anchor_index)
+                            .map(|anchor| (anchor_index, anchor.prompt_tokens.as_slice()))
+                    });
                 let active_matches = active
                     .as_ref()
                     .is_some_and(|(work, _, _)| work.vision_fingerprint() == vision_fingerprint);
                 (
                     index,
-                    if anchor_matches {
+                    if anchor.is_some() {
                         retained.as_slice()
                     } else {
                         &[]
                     },
-                    anchor
-                        .as_ref()
-                        .filter(|_| anchor_matches)
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    anchor,
                     active
                         .as_ref()
                         .filter(|_| active_matches)
@@ -18100,56 +18578,32 @@ fn take_gemma4_request_rollback_anchor(
     slot_id: SlotId,
     cached_tokens: usize,
     prompt_tokens: &[u32],
-    prompt_anchor: &mut Option<Gemma4PromptAnchor>,
+    _prompt_anchor: &mut Gemma4AnchorStore,
     vision_fingerprint: Option<[u8; 32]>,
 ) -> Result<Option<Gemma4PromptAnchor>> {
     if cached_tokens == 0 {
         return Ok(None);
     }
-    let existing_is_sufficient = prompt_anchor.as_ref().is_some_and(|anchor| {
-        prompt_tokens.starts_with(&anchor.prompt_tokens)
-            && anchor.prompt_tokens.len() >= cached_tokens
-            && anchor.vision_fingerprint == vision_fingerprint
-    });
-    if existing_is_sufficient {
-        return Ok(prompt_anchor.take());
-    }
     let Some(hybrid) = guard.hybrid.as_ref() else {
-        // Non-hybrid compatibility mode cannot materialize a rollback
-        // checkpoint. Preserve an older compatible checkpoint when present;
-        // otherwise cancellation will fail closed to a cold reset.
-        return Ok(prompt_anchor.take().filter(|anchor| {
-            prompt_tokens.starts_with(&anchor.prompt_tokens)
-                && anchor.vision_fingerprint == vision_fingerprint
-        }));
+        // Non-hybrid compatibility mode has no family-native payload. A
+        // cancellation therefore fails closed to a cold reset while the
+        // committed store remains untouched until that reset clears it.
+        return Ok(None);
     };
-    match crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+    let capture_started = Instant::now();
+    let kv = crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
         hybrid,
         slot_id,
         cached_tokens,
-    ) {
-        Ok(kv) => {
-            let _ = prompt_anchor.take();
-            Ok(Some(Gemma4PromptAnchor {
-                prompt_tokens: prompt_tokens[..cached_tokens].to_vec(),
-                kv,
-                vision_fingerprint,
-            }))
-        }
-        Err(error) if prompt_anchor.is_some() => {
-            tracing::warn!(
-                slot = slot_id.0,
-                cached_tokens,
-                error = %error,
-                "Gemma4 live-prefix rollback snapshot failed; retaining older checkpoint"
-            );
-            Ok(prompt_anchor.take().filter(|anchor| {
-                prompt_tokens.starts_with(&anchor.prompt_tokens)
-                    && anchor.vision_fingerprint == vision_fingerprint
-            }))
-        }
-        Err(error) => Err(error.context("capture Gemma4 request-start rollback checkpoint")),
-    }
+    )
+    .context("capture Gemma4 request-start rollback checkpoint")?;
+    Ok(Some(Gemma4PromptAnchor {
+        prompt_tokens: prompt_tokens[..cached_tokens].to_vec(),
+        kv,
+        vision_fingerprint,
+        capture_duration: capture_started.elapsed(),
+        lineage_epoch: 0,
+    }))
 }
 
 /// ADR-040 Phase F M1 (F1) — Qwen35 SlotAware admit-while-decoding loop.
@@ -31277,6 +31731,116 @@ mod tests {
         );
     }
 
+    fn synthetic_gemma_prompt_anchor(tokens: &[u32], payload_bytes: usize) -> Gemma4PromptAnchor {
+        Gemma4PromptAnchor {
+            prompt_tokens: tokens.to_vec(),
+            kv: crate::inference::models::gemma4::kv_cache::GemmaHybridSlotAnchor::synthetic(
+                tokens.len(),
+                &[payload_bytes],
+            ),
+            vision_fingerprint: None,
+            capture_duration: Duration::ZERO,
+            lineage_epoch: 0,
+        }
+    }
+
+    fn gemma_anchor_store_with_abc() -> Gemma4AnchorStore {
+        let mut store = Gemma4AnchorStore::with_committed_capacity(4);
+        for tokens in [&[1, 2][..], &[1, 2, 3, 4][..], &[1, 2, 3, 4, 5, 6][..]] {
+            assert_eq!(
+                store.stage_pending(synthetic_gemma_prompt_anchor(tokens, 17), 4, 100_000),
+                StagePending::Staged
+            );
+            store
+                .publish_pending(4)
+                .expect("publish synthetic Gemma anchor");
+        }
+        store
+    }
+
+    #[test]
+    fn gemma_anchor_store_uses_deepest_family_native_equality_prefix() {
+        let stores = vec![gemma_anchor_store_with_abc()];
+        let idle = vec![None];
+        let exact_b = preferred_gemma4_slot(&[Vec::new()], &stores, &idle, &[1, 2, 3, 4])
+            .expect("exact B retry");
+        assert_eq!(exact_b.cached_tokens, 3, "exact retry replays one token");
+        assert_eq!(exact_b.restore_anchor_index, Some(1));
+
+        let divergent_after_b =
+            preferred_gemma4_slot(&[Vec::new()], &stores, &idle, &[1, 2, 3, 4, 9])
+                .expect("B remains the deepest equal prefix");
+        assert_eq!(divergent_after_b.cached_tokens, 4);
+        assert_eq!(divergent_after_b.restore_anchor_index, Some(1));
+    }
+
+    #[test]
+    fn gemma_anchor_store_preserves_native_vision_identity_and_terminal_publication() {
+        let fingerprint = [0xA5; 32];
+        let mut anchor = synthetic_gemma_prompt_anchor(&[7, 8, 9, 10], 23);
+        anchor.vision_fingerprint = Some(fingerprint);
+        let mut stores = vec![Gemma4AnchorStore::with_committed_capacity(4)];
+        assert_eq!(
+            stores[0].stage_pending(anchor, 4, 100_000),
+            StagePending::Staged
+        );
+        let idle = vec![None];
+        let retained = vec![Vec::new()];
+        assert_eq!(
+            preferred_gemma4_slot_for_request(
+                &retained,
+                &stores,
+                &idle,
+                &[7, 8, 9, 10],
+                Some(fingerprint),
+            ),
+            None,
+            "request-local pending state must remain invisible before terminal success"
+        );
+
+        stores[0].publish_pending(4).expect("terminal publication");
+        let hit = preferred_gemma4_slot_for_request(
+            &retained,
+            &stores,
+            &idle,
+            &[7, 8, 9, 10],
+            Some(fingerprint),
+        )
+        .expect("matching native image identity");
+        assert_eq!(hit.restore_anchor_index, Some(0));
+        assert_eq!(hit.cached_tokens, 3);
+        assert_eq!(
+            preferred_gemma4_slot_for_request(
+                &retained,
+                &stores,
+                &idle,
+                &[7, 8, 9, 10],
+                Some([0x5A; 32]),
+            ),
+            None,
+            "same tokens with different image identity must not hit"
+        );
+    }
+
+    #[test]
+    fn gemma_anchor_store_exact_bytes_and_failed_restore_invalidation() {
+        let mut store = gemma_anchor_store_with_abc();
+        assert_eq!(
+            store.owned_bytes(),
+            store.control_owned_bytes() + store.committed_bytes(),
+            "Gemma family payload plus generic control bytes must conserve exactly"
+        );
+        let old_epoch = store.lineage_epoch();
+        clear_gemma4_anchor_store(&mut store, "test-failed-restore", SlotId(0));
+        assert_eq!(store.committed_len(), 0);
+        assert!(!store.has_pending());
+        assert_ne!(store.lineage_epoch(), old_epoch);
+        assert_eq!(store.owned_bytes(), store.control_owned_bytes());
+        store
+            .validate()
+            .expect("failed restore leaves a valid empty store");
+    }
+
     #[test]
     fn gemma_continuation_waits_for_strictly_better_active_prefix() {
         let prompt = vec![41_u32; 100_000];
@@ -31292,7 +31856,7 @@ mod tests {
             Some(Gemma4SlotAffinity::Active(Gemma4SlotPreference {
                 slot: SlotId(0),
                 cached_tokens: 99_000,
-                restore_prompt_anchor: false,
+                restore_anchor_index: None,
             }))
         );
     }
@@ -31303,7 +31867,7 @@ mod tests {
         let exact_retry = gemma4_slot_affinity(
             [
                 (0, &[][..], None, Some(prompt.as_slice()), true, false),
-                (1, &[][..], Some(prompt.as_slice()), None, false, false),
+                (1, &[][..], Some((0, prompt.as_slice())), None, false, false),
             ],
             &prompt,
         );
@@ -31313,7 +31877,7 @@ mod tests {
         let idle_tie = gemma4_slot_affinity(
             [
                 (0, &[][..], None, Some(prompt.as_slice()), true, false),
-                (1, &[][..], Some(prompt.as_slice()), None, false, false),
+                (1, &[][..], Some((0, prompt.as_slice())), None, false, false),
             ],
             &continuation,
         );
@@ -42891,7 +43455,7 @@ mod gemma4_bounded_prefill_tests {
         let waiting = Gemma4PendingDisposition::WaitForActive(Gemma4SlotPreference {
             slot: SlotId(0),
             cached_tokens: 99_000,
-            restore_prompt_anchor: true,
+            restore_anchor_index: Some(0),
         });
         assert_eq!(
             choose_gemma4_ready_request_index(&[waiting, Gemma4PendingDisposition::ReadyRequest,]),

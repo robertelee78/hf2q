@@ -1,6 +1,9 @@
-use anyhow::{ensure, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+pub(crate) use super::anchor_store::{
+    effective_committed_depth, simultaneous_pending_capacity_slots, StagePending,
+};
 
 pub(crate) const DEFAULT_MAX_COMMITTED_ANCHORS: usize = 4;
 
@@ -163,42 +166,6 @@ pub(crate) fn record_capture(
     );
 }
 
-/// Maximum committed depth whose retained payloads fit for every configured
-/// slot. Pending capture is then admitted against the live aggregate sum; use
-/// `simultaneous_pending_capacity_slots` to expose whether every slot could
-/// capture concurrently at that committed depth.
-pub(crate) fn effective_committed_depth(
-    max_committed: usize,
-    aggregate_budget_bytes: u64,
-    n_slots: usize,
-    anchor_bytes: u64,
-) -> usize {
-    if max_committed == 0 || n_slots == 0 || anchor_bytes == 0 {
-        return 0;
-    }
-    let per_depth_all_slots = anchor_bytes.saturating_mul(n_slots as u64);
-    if per_depth_all_slots == 0 {
-        return 0;
-    }
-    max_committed.min((aggregate_budget_bytes / per_depth_all_slots) as usize)
-}
-
-pub(crate) fn simultaneous_pending_capacity_slots(
-    aggregate_budget_bytes: u64,
-    n_slots: usize,
-    anchor_bytes: u64,
-    committed_depth: usize,
-) -> usize {
-    if n_slots == 0 || anchor_bytes == 0 {
-        return 0;
-    }
-    let committed_charge = anchor_bytes
-        .saturating_mul(n_slots as u64)
-        .saturating_mul(committed_depth as u64);
-    let free = aggregate_budget_bytes.saturating_sub(committed_charge);
-    n_slots.min((free / anchor_bytes) as usize)
-}
-
 pub(crate) fn record_restore_hit(tokens_saved: usize, descendants_pruned: usize) {
     TELEMETRY
         .restore_attempts_total
@@ -233,371 +200,17 @@ pub(crate) fn record_evictions(evicted: usize) {
         .fetch_add(evicted as u64, Ordering::Relaxed);
 }
 
-/// Payload facts the store needs to enforce lineage and exact ownership.
-/// Model tensors remain opaque to the state machine.
-pub(crate) trait AnchorEntry {
-    fn token_count(&self) -> usize;
-    fn lineage_epoch(&self) -> u64;
-    fn set_lineage_epoch(&mut self, epoch: u64);
-    fn owned_bytes(&self) -> u64;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StagePending {
-    Staged,
-    PendingOccupied,
-    NoCommittedCapacity,
-    BudgetExceeded {
-        needed_bytes: u64,
-        budget_bytes: u64,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Publication {
-    pub evicted: usize,
-    pub replaced_equal_depth: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PruneResult {
-    pub pruned: usize,
-    pub pending_discarded: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ClearResult {
-    pub committed: usize,
-    pub pending_discarded: bool,
-}
-
-/// Slot-local checkpoints over one mutable physical KV lineage.
-///
-/// `owned_bytes` is the exact reclaimable sum of committed plus pending
-/// payloads. It intentionally does not participate in the scheduler's
-/// monotonic Metal high-water counter.
-pub(crate) struct AnchorStore<A: AnchorEntry> {
-    committed: Vec<A>,
-    pending: Option<A>,
-    lineage_epoch: u64,
-    owned_bytes: u64,
-}
-
-impl<A: AnchorEntry> Default for AnchorStore<A> {
-    fn default() -> Self {
-        Self::with_committed_capacity(DEFAULT_MAX_COMMITTED_ANCHORS)
-    }
-}
-
-impl<A: AnchorEntry> AnchorStore<A> {
-    pub(crate) fn with_committed_capacity(capacity: usize) -> Self {
-        let committed = Vec::with_capacity(capacity);
-        let owned_bytes =
-            (committed.capacity() as u64).saturating_mul(std::mem::size_of::<A>() as u64);
-        Self {
-            committed,
-            pending: None,
-            lineage_epoch: 0,
-            owned_bytes,
-        }
-    }
-
-    pub(crate) fn committed_len(&self) -> usize {
-        self.committed.len()
-    }
-
-    pub(crate) fn has_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    pub(crate) fn pending(&self) -> Option<&A> {
-        self.pending
-            .as_ref()
-            .filter(|anchor| anchor.lineage_epoch() == self.lineage_epoch)
-    }
-
-    pub(crate) fn lineage_epoch(&self) -> u64 {
-        self.lineage_epoch
-    }
-
-    pub(crate) fn owned_bytes(&self) -> u64 {
-        self.owned_bytes
-    }
-
-    pub(crate) fn committed_bytes(&self) -> u64 {
-        self.committed.iter().map(AnchorEntry::owned_bytes).sum()
-    }
-
-    pub(crate) fn pending_bytes(&self) -> u64 {
-        self.pending
-            .as_ref()
-            .map(AnchorEntry::owned_bytes)
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn control_owned_bytes(&self) -> u64 {
-        self.committed_control_bytes()
-    }
-
-    pub(crate) fn committed(&self, index: usize) -> Option<&A> {
-        self.committed
-            .get(index)
-            .filter(|anchor| anchor.lineage_epoch() == self.lineage_epoch)
-    }
-
-    pub(crate) fn newest_committed_at_or_before(&self, token_count: usize) -> Option<usize> {
-        self.committed
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, anchor)| {
-                anchor.lineage_epoch() == self.lineage_epoch && anchor.token_count() <= token_count
-            })
-            .map(|(index, _)| index)
-    }
-
-    pub(crate) fn deepest_matching_index(
-        &self,
-        mut matches: impl FnMut(&A) -> bool,
-    ) -> Option<usize> {
-        self.committed
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, anchor)| anchor.lineage_epoch() == self.lineage_epoch && matches(anchor))
-            .map(|(index, _)| index)
-    }
-
-    /// Capture is request-local until terminal cache+ledger success. The
-    /// budget is checked against committed K plus this one pending payload.
-    pub(crate) fn stage_pending(
-        &mut self,
-        mut anchor: A,
-        max_committed: usize,
-        byte_budget: u64,
-    ) -> StagePending {
-        if max_committed == 0 {
-            return StagePending::NoCommittedCapacity;
-        }
-        if self.pending.is_some() {
-            return StagePending::PendingOccupied;
-        }
-        if max_committed > self.committed.capacity() {
-            return StagePending::NoCommittedCapacity;
-        }
-        let needed_bytes = self.owned_bytes.saturating_add(anchor.owned_bytes());
-        if needed_bytes > byte_budget {
-            return StagePending::BudgetExceeded {
-                needed_bytes,
-                budget_bytes: byte_budget,
-            };
-        }
-        anchor.set_lineage_epoch(self.lineage_epoch);
-        self.owned_bytes = needed_bytes;
-        self.pending = Some(anchor);
-        StagePending::Staged
-    }
-
-    /// Atomically expose the request-local capture, then apply positional
-    /// keep-newest-K eviction. Equal-depth publication replaces that boundary.
-    pub(crate) fn publish_pending(&mut self, max_committed: usize) -> Result<Publication> {
-        ensure!(max_committed > 0, "anchor publication requires K > 0");
-        let pending = self
-            .pending
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("anchor publication requires pending payload"))?;
-        ensure!(
-            pending.lineage_epoch() == self.lineage_epoch,
-            "pending anchor epoch {} != live epoch {}",
-            pending.lineage_epoch(),
-            self.lineage_epoch
-        );
-
-        let mut publication = Publication::default();
-        if let Some(last) = self.committed.last() {
-            ensure!(
-                pending.token_count() >= last.token_count(),
-                "pending anchor depth {} is behind newest committed depth {}",
-                pending.token_count(),
-                last.token_count()
-            );
-            if pending.token_count() == last.token_count() {
-                let replaced = self.committed.pop().expect("last existed");
-                self.owned_bytes = self.owned_bytes.saturating_sub(replaced.owned_bytes());
-                publication.replaced_equal_depth = true;
-            }
-        }
-        if !publication.replaced_equal_depth && self.committed.len() >= max_committed {
-            publication.evicted = self.committed.len() - max_committed + 1;
-            for evicted in self.committed.drain(0..publication.evicted) {
-                self.owned_bytes = self.owned_bytes.saturating_sub(evicted.owned_bytes());
-            }
-        }
-        ensure!(
-            self.committed.len() < self.committed.capacity(),
-            "anchor publication has no preflighted committed control slot"
-        );
-        self.committed.push(pending);
-        self.validate()?;
-        Ok(publication)
-    }
-
-    pub(crate) fn discard_pending(&mut self) -> bool {
-        let Some(pending) = self.pending.take() else {
-            return false;
-        };
-        self.owned_bytes = self.owned_bytes.saturating_sub(pending.owned_bytes());
-        true
-    }
-
-    /// A successful restore selects one valid ancestor. Before any new KV
-    /// write, all descendants and request-local pending state are invalidated,
-    /// then surviving ancestors are retagged onto the new physical lineage.
-    pub(crate) fn prune_descendants_after_restore(
-        &mut self,
-        restored_index: usize,
-    ) -> Result<PruneResult> {
-        let restored = self
-            .committed
-            .get(restored_index)
-            .ok_or_else(|| anyhow::anyhow!("restored anchor index {restored_index} missing"))?;
-        ensure!(
-            restored.lineage_epoch() == self.lineage_epoch,
-            "restored anchor epoch {} != live epoch {}",
-            restored.lineage_epoch(),
-            self.lineage_epoch
-        );
-        let pending_discarded = self.discard_pending();
-        let pruned = self.committed.len().saturating_sub(restored_index + 1);
-        for descendant in self.committed.drain(restored_index + 1..) {
-            self.owned_bytes = self.owned_bytes.saturating_sub(descendant.owned_bytes());
-        }
-        self.bump_and_retag_survivors();
-        self.validate()?;
-        Ok(PruneResult {
-            pruned,
-            pending_discarded,
-        })
-    }
-
-    /// Cancellation may preserve only checkpoints whose physical rows still
-    /// exist at the recovered cursor. Request-local pending never publishes.
-    pub(crate) fn cancel_request_at_cursor(&mut self, live_cursor: usize) -> PruneResult {
-        let pending_discarded = self.discard_pending();
-        let keep = self
-            .committed
-            .partition_point(|anchor| anchor.token_count() <= live_cursor);
-        let pruned = self.committed.len().saturating_sub(keep);
-        for anchor in self.committed.drain(keep..) {
-            self.owned_bytes = self.owned_bytes.saturating_sub(anchor.owned_bytes());
-        }
-        if pruned > 0 {
-            self.bump_and_retag_survivors();
-        }
-        PruneResult {
-            pruned,
-            pending_discarded,
-        }
-    }
-
-    /// Cold reset, poison, or any failed restore destroys all authority for
-    /// the slot's old mutable KV lineage.
-    pub(crate) fn clear_all(&mut self) -> ClearResult {
-        let result = ClearResult {
-            committed: self.committed.len(),
-            pending_discarded: self.pending.is_some(),
-        };
-        self.committed.clear();
-        self.pending = None;
-        self.owned_bytes = self.committed_control_bytes();
-        self.lineage_epoch = self.lineage_epoch.wrapping_add(1);
-        result
-    }
-
-    fn bump_and_retag_survivors(&mut self) {
-        self.lineage_epoch = self.lineage_epoch.wrapping_add(1);
-        for anchor in &mut self.committed {
-            anchor.set_lineage_epoch(self.lineage_epoch);
-        }
-    }
-
-    fn committed_control_bytes(&self) -> u64 {
-        (self.committed.capacity() as u64).saturating_mul(std::mem::size_of::<A>() as u64)
-    }
-
-    pub(crate) fn validate(&self) -> Result<()> {
-        ensure!(
-            self.committed
-                .iter()
-                .all(|anchor| anchor.lineage_epoch() == self.lineage_epoch),
-            "committed anchor carries a stale lineage epoch"
-        );
-        ensure!(
-            self.pending
-                .as_ref()
-                .is_none_or(|anchor| anchor.lineage_epoch() == self.lineage_epoch),
-            "pending anchor carries a stale lineage epoch"
-        );
-        ensure!(
-            self.committed
-                .windows(2)
-                .all(|pair| pair[0].token_count() < pair[1].token_count()),
-            "committed anchors are not a strict positional chain"
-        );
-        ensure!(
-            self.committed.iter().all(|anchor| anchor.token_count() > 0)
-                && self
-                    .pending
-                    .as_ref()
-                    .is_none_or(|anchor| anchor.token_count() > 0),
-            "anchor token depth must be non-zero"
-        );
-        ensure!(
-            self.pending.as_ref().is_none_or(|pending| {
-                self.committed
-                    .last()
-                    .is_none_or(|last| pending.token_count() >= last.token_count())
-            }),
-            "pending anchor is behind the newest committed depth"
-        );
-        let recomputed = self
-            .committed
-            .iter()
-            .map(AnchorEntry::owned_bytes)
-            .chain(self.pending.iter().map(AnchorEntry::owned_bytes))
-            .try_fold(self.committed_control_bytes(), |sum, bytes| {
-                sum.checked_add(bytes)
-            })
-            .ok_or_else(|| anyhow::anyhow!("anchor owned-byte accounting overflow"))?;
-        ensure!(
-            recomputed == self.owned_bytes,
-            "anchor owned-byte accounting mismatch: stored={} recomputed={recomputed}",
-            self.owned_bytes
-        );
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn committed_token_counts(&self) -> Vec<usize> {
-        self.committed
-            .iter()
-            .map(AnchorEntry::token_count)
-            .collect()
-    }
-
-    #[cfg(test)]
-    fn payload_owned_bytes(&self) -> u64 {
-        self.owned_bytes
-            .saturating_sub(self.committed_control_bytes())
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::anchor_store::{AnchorEntry, AnchorStore};
     use super::{
-        effective_committed_depth, simultaneous_pending_capacity_slots, AnchorEntry, AnchorStore,
-        PostAdmissionPrefillFailure, StagePending,
+        effective_committed_depth, simultaneous_pending_capacity_slots,
+        PostAdmissionPrefillFailure, StagePending, DEFAULT_MAX_COMMITTED_ANCHORS,
     };
+
+    fn default_store<A: AnchorEntry>() -> AnchorStore<A> {
+        AnchorStore::with_committed_capacity(DEFAULT_MAX_COMMITTED_ANCHORS)
+    }
 
     #[derive(Default)]
     struct ReferenceStore {
@@ -719,7 +332,7 @@ mod tests {
 
     #[test]
     fn state_machine_matches_independent_reference_model() {
-        let mut store = AnchorStore::default();
+        let mut store = default_store();
         let mut reference = ReferenceStore::default();
 
         for (depth, bytes) in [(2, 11), (4, 13), (6, 17), (8, 19), (10, 23)] {
@@ -767,7 +380,7 @@ mod tests {
 
     #[test]
     fn pending_is_invisible_until_terminal_publication() {
-        let mut store = AnchorStore::default();
+        let mut store = default_store();
         assert_eq!(
             store.stage_pending(FakeAnchor::new(&[1, 2], 20), 4, 1_000),
             StagePending::Staged
@@ -905,7 +518,7 @@ mod tests {
 
     #[test]
     fn positional_eviction_keeps_newest_k_not_recently_restored() {
-        let mut store = AnchorStore::default();
+        let mut store = default_store();
         for depth in 1..=5 {
             assert_eq!(
                 store.stage_pending(FakeAnchor::new(&vec![3; depth], 10), 4, 1_000),
@@ -920,7 +533,7 @@ mod tests {
 
     #[test]
     fn rewind_then_write_invalidates_descendants_and_old_c_cannot_restore() {
-        let mut store = AnchorStore::default();
+        let mut store = default_store();
         for tokens in [&[1, 2][..], &[1, 2, 3][..], &[1, 2, 3, 4][..]] {
             assert_eq!(
                 store.stage_pending(FakeAnchor::new(tokens, 10), 4, 1_000),
@@ -950,7 +563,7 @@ mod tests {
 
     #[test]
     fn cancellation_discards_pending_and_prunes_only_unreachable_committed() {
-        let mut store = AnchorStore::default();
+        let mut store = default_store();
         for depth in [2, 4, 6] {
             assert_eq!(
                 store.stage_pending(FakeAnchor::new(&vec![1; depth], 10), 4, 1_000),
@@ -973,7 +586,7 @@ mod tests {
     #[test]
     fn reset_poison_or_failed_restore_clears_the_whole_store() {
         for _cause in ["reset", "poison", "restore-failure"] {
-            let mut store = AnchorStore::default();
+            let mut store = default_store();
             assert_eq!(
                 store.stage_pending(FakeAnchor::new(&[1, 2], 10), 4, 1_000),
                 StagePending::Staged
@@ -995,7 +608,7 @@ mod tests {
     }
 
     fn store_with_pending() -> AnchorStore<FakeAnchor> {
-        let mut store = AnchorStore::default();
+        let mut store = default_store();
         for depth in [2, 4, 6] {
             assert_eq!(
                 store.stage_pending(FakeAnchor::new(&vec![1; depth], 10), 4, 1_000),
