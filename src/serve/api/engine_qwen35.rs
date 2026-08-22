@@ -871,9 +871,10 @@ impl Qwen35LoadedModel {
     /// is one allocator call vs Gemma 4's N (one per layer).
     ///
     /// **TQ-active path**: honours `self.tq_kv_active` so the multi-seq
-    /// scaffold matches the engine's TQ mode. Packed and norms buffers use
-    /// `n_seqs = max_slots` as their outer axis; encode, attention, and resume
-    /// dispatches receive zero-copy views of the selected slot region.
+    /// scaffold matches the engine's TQ mode. Every logical slot starts with
+    /// one physical token row; admission grows compact per-layer arenas under
+    /// the shared byte budget. Scalar dispatches receive zero-copy views and
+    /// physical batches receive explicit base/capacity descriptors.
     ///
     /// # Errors
     ///
@@ -893,20 +894,18 @@ impl Qwen35LoadedModel {
         }
         let device = mlx_native::MlxDevice::new()
             .context("ADR-040 C2d: MlxDevice::new for Qwen35 multi-seq KV provisioning")?;
-        // Every agent slot receives the complete model context. The Qwen KV
-        // allocator reserves full-attention storage lazily, while scheduler
-        // admission governs aggregate physical high-water use.
+        // Every agent slot retains the complete logical model context. In TQ
+        // mode the physical arena starts at one row per slot and admission
+        // grows only the selected slot under the shared scheduler grant.
         let max_seq_len = self.model.cfg.max_position_embeddings;
-        let cache = HybridKvCache::new_with_options(
-            &self.model.cfg,
-            &device,
-            max_seq_len,
-            max_slots,
-            self.tq_kv_active,
-        )
+        let cache = if self.tq_kv_active {
+            HybridKvCache::new_with_growable_tq(&self.model.cfg, &device, max_seq_len, max_slots, 1)
+        } else {
+            HybridKvCache::new_with_options(&self.model.cfg, &device, max_seq_len, max_slots, false)
+        }
         .with_context(|| {
             format!(
-                "ADR-040 C2d: HybridKvCache::new_with_options(max_seq_len={}, \
+                "ADR-040 C2d: HybridKvCache::new(max_seq_len={}, \
                  n_seqs={}, tq_kv_active={}) for Qwen35 SlotAware provisioning",
                 max_seq_len, max_slots, self.tq_kv_active
             )

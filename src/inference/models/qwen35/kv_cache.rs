@@ -1975,6 +1975,10 @@ impl HybridKvCache {
         n_seqs: u32,
         initial_capacity_tokens: u32,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            initial_capacity_tokens > 0 && initial_capacity_tokens <= max_seq_len,
+            "growable TQ initial capacity {initial_capacity_tokens} outside logical range 1..={max_seq_len}"
+        );
         let mut cache = Self::allocate_with_profile(
             cfg,
             device,
@@ -2071,13 +2075,138 @@ impl HybridKvCache {
         })
     }
 
+    /// Ensure one logical slot has enough physical TQ rows for an admitted
+    /// request while preserving every visible row in every peer slot.
+    ///
+    /// Growth is committed one full-attention layer at a time. Each layer is
+    /// itself transactional: allocate a replacement arena, GPU-blit every
+    /// cursor-visible prefix, wait for successful completion, then swap. A
+    /// failure never advances a cursor or exposes a partially copied layer.
+    /// Layers already migrated by an earlier successful transaction remain a
+    /// byte-equivalent physical representation, so the cache stays usable and
+    /// its exact resident bytes can be charged before rejecting admission.
+    pub fn ensure_tq_physical_capacity_for_slot(
+        &mut self,
+        cfg: &Qwen35Config,
+        device: &MlxDevice,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        required_tokens: u32,
+    ) -> Result<u64> {
+        anyhow::ensure!(self.tq_kv_active, "TQ arena growth requires active TQ KV");
+        anyhow::ensure!(
+            slot.0 < self.n_seqs,
+            "TQ arena growth slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(
+            required_tokens > 0 && required_tokens <= self.max_seq_len,
+            "TQ arena growth requires {required_tokens} tokens outside logical range 1..={}",
+            self.max_seq_len
+        );
+
+        for (layer_index, full) in self.full_attn.iter_mut().enumerate() {
+            grow_full_attn_tq_slot(cfg, device, full, slot, required_tokens, self.max_seq_len)
+                .with_context(|| format!("grow TQ full-attention layer {layer_index}"))?;
+        }
+        if let Some(mtp) = self.mtp_slot.as_mut() {
+            grow_full_attn_tq_slot(cfg, device, mtp, slot, required_tokens, self.max_seq_len)
+                .context("grow TQ MTP layer")?;
+        }
+        self.tq_physical_bytes_for_slot(slot)
+    }
+
+    /// Exact currently allocated TQ bytes attributed to one slot across
+    /// target and MTP layers. This is physical-capacity accounting, not a
+    /// cursor estimate; Metal commits an entire buffer when first bound.
+    pub fn tq_physical_bytes_for_slot(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            slot.0 < self.n_seqs,
+            "TQ physical-byte query slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        let mut bytes = 0_u64;
+        for (layer_index, full) in self.full_attn.iter().enumerate() {
+            let tq = full
+                .tq
+                .as_ref()
+                .with_context(|| format!("full-attention layer {layer_index} lacks TQ storage"))?;
+            bytes = bytes
+                .checked_add(tq.physical_bytes_for_slot(slot)?)
+                .ok_or_else(|| anyhow!("TQ physical-byte total overflow"))?;
+        }
+        if let Some(mtp) = self.mtp_slot.as_ref() {
+            let tq = mtp.tq.as_ref().context("MTP layer lacks TQ storage")?;
+            bytes = bytes
+                .checked_add(tq.physical_bytes_for_slot(slot)?)
+                .ok_or_else(|| anyhow!("TQ physical-byte total overflow"))?;
+        }
+        Ok(bytes)
+    }
+
+    /// Additional byte headroom required while growing one TQ slot.
+    ///
+    /// Growth swaps one full-attention layer at a time. While that layer is
+    /// copied, its old arena and replacement arena coexist; every other layer
+    /// is represented once. Admission already reserves the final compact
+    /// arena, so the conservative surcharge is the largest old layer arena
+    /// that will be replaced. A no-op growth needs no surcharge.
+    pub fn tq_growth_transient_extra_bytes_for_slot(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        required_tokens: u32,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            self.tq_kv_active,
+            "TQ growth headroom requires active TQ KV"
+        );
+        anyhow::ensure!(
+            slot.0 < self.n_seqs,
+            "TQ growth headroom slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(
+            required_tokens > 0 && required_tokens <= self.max_seq_len,
+            "TQ growth headroom requires {required_tokens} tokens outside logical range 1..={}",
+            self.max_seq_len
+        );
+
+        let mut extra = 0_u64;
+        for (layer_index, full) in self.full_attn.iter().enumerate() {
+            let tq = full
+                .tq
+                .as_ref()
+                .with_context(|| format!("full-attention layer {layer_index} lacks TQ storage"))?;
+            if required_tokens > tq.physical_capacity_for_slot(slot)? {
+                extra = extra.max(
+                    u64::try_from(tq.total_bytes())
+                        .context("TQ full-attention transient bytes exceed u64")?,
+                );
+            }
+        }
+        if let Some(mtp) = self.mtp_slot.as_ref() {
+            let tq = mtp.tq.as_ref().context("MTP layer lacks TQ storage")?;
+            if required_tokens > tq.physical_capacity_for_slot(slot)? {
+                extra = extra.max(
+                    u64::try_from(tq.total_bytes()).context("TQ MTP transient bytes exceed u64")?,
+                );
+            }
+        }
+        Ok(extra)
+    }
+
     /// Reset semantic state without touching unread full-attention pages.
     ///
     /// Full K/V is valid only below `current_len`; lowering the cursor makes
-    /// prior bytes unobservable. Zeroing the entire logical capacity here
-    /// would commit every page of every slot and defeat full-context virtual
-    /// reservation. DeltaNet recurrent/conv state is semantic input, so
-    /// [`Self::reset`] still zeros those comparatively small buffers.
+    /// prior bytes unobservable. Zeroing the allocated physical arena here
+    /// would needlessly rewrite every retained high-water page. DeltaNet
+    /// recurrent/conv state is semantic input, so [`Self::reset`] still zeros
+    /// those comparatively small buffers.
     ///
     /// `pub(crate)` because the qwen35 `--benchmark` 5-iter loop in
     /// `src/serve/mod.rs::cmd_generate_qwen35` calls this between
@@ -3976,11 +4105,10 @@ fn alloc_linear_attn_slot(
 /// slot (qwen35). Holds Hadamard-rotated 8-bit-quantized K/V indices and
 /// per-position F32 norms.
 ///
-/// Shape convention matches the qwen35 F32 cache layout (4D with `n_seqs`
-/// as the outer axis), differing from Gemma's HbKvBuffers shape which is
-/// 3D (no batch axis). The mlx-native `flash_attn_vec_tq_hb` kernel reads
-/// the inner three axes `[n_kv_heads, max_seq_len, head_dim]` per
-/// sequence; the n_seqs outer dimension is consumed at the call site.
+/// Uniform arenas preserve the historical 4D outer-sequence shape. Growable
+/// arenas are compact one-dimensional component buffers whose self-described
+/// segments may have unequal capacities. Scalar calls consume a zero-copy
+/// view of one segment; physical batches pass explicit base/capacity arrays.
 ///
 /// Constructed by [`alloc_tq_full_attn_buffers`] and installed by the
 /// `HybridKvCache` allocator when TQ mode is active.
@@ -4001,24 +4129,29 @@ pub struct TqFullAttnKvBuffers {
     /// 2 for head_dim=512).  Cached so SDPA dispatch (iter-8) doesn't
     /// recompute from `head_dim`.
     pub norms_per_pos: u32,
+    /// Physical KV geometry used by both scalar slot views and banked batched
+    /// dispatch. Keeping it beside the buffers makes variable-capacity
+    /// layouts self-describing instead of reconstructing them from shape.
+    n_kv_heads: u32,
+    head_dim: u32,
     /// Physical per-slot segment map. Logical context remains on the owning
     /// `HybridKvCache`; this map records only rows allocated in this arena.
     layout: TqArenaLayout,
 }
 
-struct TqFullAttnSlotViews {
-    k_packed: MlxBuffer,
-    k_norms: MlxBuffer,
-    v_packed: MlxBuffer,
-    v_norms: MlxBuffer,
-    capacity_tokens: u32,
+pub(super) struct TqFullAttnSlotViews {
+    pub(super) k_packed: MlxBuffer,
+    pub(super) k_norms: MlxBuffer,
+    pub(super) v_packed: MlxBuffer,
+    pub(super) v_norms: MlxBuffer,
+    pub(super) capacity_tokens: u32,
 }
 
 impl TqFullAttnKvBuffers {
     /// Zero-copy views for one sequence in the outer `n_seqs` axis. The MLX
     /// kernels remain single-sequence kernels; Metal buffer offsets select
     /// the agent slot without changing their math.
-    fn slot_views(
+    pub(super) fn slot_views(
         &self,
         slot_id: crate::serve::multi_seq_kv::SlotId,
         n_kv_heads: u32,
@@ -4038,6 +4171,12 @@ impl TqFullAttnKvBuffers {
             slot_id.0,
             segment.capacity_tokens,
             cache_capacity
+        );
+        anyhow::ensure!(
+            n_kv_heads == self.n_kv_heads && head_dim == self.head_dim,
+            "TQ slot geometry mismatch: caller heads/dim={n_kv_heads}/{head_dim}, arena={}/{}",
+            self.n_kv_heads,
+            self.head_dim
         );
         let packed_elems = (n_kv_heads as usize)
             .checked_mul(segment.capacity_tokens as usize)
@@ -4063,6 +4202,186 @@ impl TqFullAttnKvBuffers {
             capacity_tokens: segment.capacity_tokens,
         })
     }
+
+    fn slot_segment(
+        &self,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<tq_arena::TqArenaSegment> {
+        self.layout.segment(slot_id.0 as usize)
+    }
+
+    fn physical_bytes_for_slot(&self, slot_id: crate::serve::multi_seq_kv::SlotId) -> Result<u64> {
+        let capacity = u64::from(self.slot_segment(slot_id)?.capacity_tokens);
+        let packed_per_token = u64::from(self.n_kv_heads)
+            .checked_mul(u64::from(self.head_dim))
+            .ok_or_else(|| anyhow!("TQ packed per-token byte extent overflow"))?;
+        let norms_per_token = u64::from(self.n_kv_heads)
+            .checked_mul(u64::from(self.norms_per_pos))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or_else(|| anyhow!("TQ norm per-token byte extent overflow"))?;
+        capacity
+            .checked_mul(
+                packed_per_token
+                    .checked_add(norms_per_token)
+                    .and_then(|one_side| one_side.checked_mul(2))
+                    .ok_or_else(|| anyhow!("TQ per-token K/V byte extent overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("TQ slot physical byte extent overflow"))
+    }
+
+    pub(super) fn banked_geometry_for_slots(
+        &self,
+        slots: &[crate::serve::multi_seq_kv::SlotId],
+    ) -> Result<(Vec<u32>, Vec<u32>, u32)> {
+        let mut base_token_rows = Vec::with_capacity(slots.len());
+        let mut capacities = Vec::with_capacity(slots.len());
+        for &slot_id in slots {
+            let segment = self.slot_segment(slot_id)?;
+            base_token_rows.push(
+                segment
+                    .base_tokens
+                    .checked_mul(self.n_kv_heads)
+                    .ok_or_else(|| anyhow!("TQ banked base-token-row overflow"))?,
+            );
+            capacities.push(segment.capacity_tokens);
+        }
+        let arena_token_rows = self
+            .layout
+            .total_capacity_tokens()
+            .checked_mul(self.n_kv_heads)
+            .ok_or_else(|| anyhow!("TQ arena token-row extent overflow"))?;
+        Ok((base_token_rows, capacities, arena_token_rows))
+    }
+
+    /// Copy the visible prefix between two physical slot segments on the
+    /// host. This is used only by the legacy `fork_seq` trait surface, after
+    /// admission has already provisioned the destination capacity. Arena
+    /// growth itself uses ordered GPU blits and never maps live KV through the
+    /// CPU.
+    fn copy_slot_prefix_within(
+        &mut self,
+        src: crate::serve::multi_seq_kv::SlotId,
+        dst: crate::serve::multi_seq_kv::SlotId,
+        live_tokens: u32,
+    ) -> Result<()> {
+        let src_segment = self.slot_segment(src)?;
+        let dst_segment = self.slot_segment(dst)?;
+        anyhow::ensure!(
+            live_tokens <= src_segment.capacity_tokens
+                && live_tokens <= dst_segment.capacity_tokens,
+            "TQ fork prefix {live_tokens} exceeds source/destination physical capacity {}/{}",
+            src_segment.capacity_tokens,
+            dst_segment.capacity_tokens
+        );
+        if live_tokens == 0 || src == dst {
+            return Ok(());
+        }
+
+        copy_tq_component_slot_prefix_within(
+            &mut self.k_packed,
+            &self.layout,
+            src,
+            dst,
+            live_tokens,
+            self.n_kv_heads,
+            self.head_dim,
+            1,
+        )?;
+        copy_tq_component_slot_prefix_within(
+            &mut self.v_packed,
+            &self.layout,
+            src,
+            dst,
+            live_tokens,
+            self.n_kv_heads,
+            self.head_dim,
+            1,
+        )?;
+        copy_tq_component_slot_prefix_within(
+            &mut self.k_norms,
+            &self.layout,
+            src,
+            dst,
+            live_tokens,
+            self.n_kv_heads,
+            self.norms_per_pos,
+            std::mem::size_of::<f32>() as u32,
+        )?;
+        copy_tq_component_slot_prefix_within(
+            &mut self.v_norms,
+            &self.layout,
+            src,
+            dst,
+            live_tokens,
+            self.n_kv_heads,
+            self.norms_per_pos,
+            std::mem::size_of::<f32>() as u32,
+        )?;
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_tq_component_slot_prefix_within(
+    buffer: &mut MlxBuffer,
+    layout: &TqArenaLayout,
+    src: crate::serve::multi_seq_kv::SlotId,
+    dst: crate::serve::multi_seq_kv::SlotId,
+    live_tokens: u32,
+    n_kv_heads: u32,
+    elements_per_token: u32,
+    element_bytes: u32,
+) -> Result<()> {
+    let src_segment = layout.segment(src.0 as usize)?;
+    let dst_segment = layout.segment(dst.0 as usize)?;
+    let bytes_per_position = u64::from(elements_per_token)
+        .checked_mul(u64::from(element_bytes))
+        .ok_or_else(|| anyhow!("TQ fork bytes-per-position overflow"))?;
+    let src_slot_base = u64::from(src_segment.base_tokens)
+        .checked_mul(u64::from(n_kv_heads))
+        .and_then(|value| value.checked_mul(bytes_per_position))
+        .ok_or_else(|| anyhow!("TQ fork source base overflow"))?;
+    let dst_slot_base = u64::from(dst_segment.base_tokens)
+        .checked_mul(u64::from(n_kv_heads))
+        .and_then(|value| value.checked_mul(bytes_per_position))
+        .ok_or_else(|| anyhow!("TQ fork destination base overflow"))?;
+    let src_head_stride = u64::from(src_segment.capacity_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ fork source head stride overflow"))?;
+    let dst_head_stride = u64::from(dst_segment.capacity_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ fork destination head stride overflow"))?;
+    let copy_bytes = u64::from(live_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ fork copy extent overflow"))?;
+    let bytes = buffer
+        .as_mut_slice::<u8>()
+        .map_err(|error| anyhow!("TQ fork buffer mapping: {error}"))?;
+    for head in 0..u64::from(n_kv_heads) {
+        let src_start = src_slot_base
+            .checked_add(
+                head.checked_mul(src_head_stride)
+                    .ok_or_else(|| anyhow!("TQ fork source head stride overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("TQ fork source head offset overflow"))?;
+        let dst_start = dst_slot_base
+            .checked_add(
+                head.checked_mul(dst_head_stride)
+                    .ok_or_else(|| anyhow!("TQ fork destination head stride overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("TQ fork destination head offset overflow"))?;
+        let src_start = usize::try_from(src_start).context("TQ fork source offset usize")?;
+        let dst_start = usize::try_from(dst_start).context("TQ fork destination offset usize")?;
+        let copy_bytes = usize::try_from(copy_bytes).context("TQ fork extent usize")?;
+        anyhow::ensure!(
+            src_start.saturating_add(copy_bytes) <= bytes.len()
+                && dst_start.saturating_add(copy_bytes) <= bytes.len(),
+            "TQ fork component range exceeds buffer length {}",
+            bytes.len()
+        );
+        bytes.copy_within(src_start..src_start + copy_bytes, dst_start);
+    }
+    Ok(())
 }
 
 /// Number of F32 norms per (seq, head, position) for a given head_dim.
@@ -4128,7 +4447,10 @@ fn alloc_tq_full_attn_buffers_with_layout(
     // uniform layout remains byte-identical to the historical outer-axis
     // allocation; a growable layout may assign different capacities.
     // 1 byte per element (8-bit Lloyd-Max index).
-    let packed_elems = total_capacity_tokens * n_kv_heads * (head_dim as usize);
+    let packed_elems = total_capacity_tokens
+        .checked_mul(n_kv_heads)
+        .and_then(|value| value.checked_mul(head_dim as usize))
+        .ok_or_else(|| anyhow!("TQ packed arena extent overflow"))?;
     let packed_bytes = packed_elems; // U8 → 1 byte/elem
     let packed_shape = match uniform_capacity {
         Some(capacity) => vec![layout.n_seqs(), n_kv_heads, capacity, head_dim as usize],
@@ -4136,8 +4458,13 @@ fn alloc_tq_full_attn_buffers_with_layout(
     };
 
     // Norm arena mirrors the packed segment order.
-    let norms_elems = total_capacity_tokens * n_kv_heads * (norms_per_pos as usize);
-    let norms_bytes = norms_elems * std::mem::size_of::<f32>();
+    let norms_elems = total_capacity_tokens
+        .checked_mul(n_kv_heads)
+        .and_then(|value| value.checked_mul(norms_per_pos as usize))
+        .ok_or_else(|| anyhow!("TQ norm arena extent overflow"))?;
+    let norms_bytes = norms_elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow!("TQ norm arena byte extent overflow"))?;
     let norms_shape = match uniform_capacity {
         Some(capacity) => vec![
             layout.n_seqs(),
@@ -4170,8 +4497,195 @@ fn alloc_tq_full_attn_buffers_with_layout(
         v_packed,
         v_norms,
         norms_per_pos,
+        n_kv_heads: cfg.num_key_value_heads,
+        head_dim: cfg.head_dim,
         layout,
     })
+}
+
+fn grow_full_attn_tq_slot(
+    cfg: &Qwen35Config,
+    device: &MlxDevice,
+    slot: &mut FullAttnKvSlot,
+    slot_id: crate::serve::multi_seq_kv::SlotId,
+    required_tokens: u32,
+    logical_max_tokens: u32,
+) -> Result<()> {
+    let old = slot
+        .tq
+        .as_ref()
+        .context("grow_full_attn_tq_slot requires TQ storage")?;
+    anyhow::ensure!(
+        old.n_kv_heads == cfg.num_key_value_heads && old.head_dim == cfg.head_dim,
+        "TQ growth model geometry changed from heads/dim={}/{} to {}/{}",
+        old.n_kv_heads,
+        old.head_dim,
+        cfg.num_key_value_heads,
+        cfg.head_dim
+    );
+    let new_layout =
+        old.layout
+            .grow_slot(slot_id.0 as usize, required_tokens, logical_max_tokens)?;
+    if new_layout == old.layout {
+        return Ok(());
+    }
+    for (peer, &cursor) in slot.current_len.iter().enumerate() {
+        let old_capacity = old.layout.segment(peer)?.capacity_tokens;
+        anyhow::ensure!(
+            cursor <= old_capacity,
+            "TQ layer cursor {cursor} exceeds physical capacity {old_capacity} for slot {peer}"
+        );
+    }
+
+    let replacement = alloc_tq_full_attn_buffers_with_layout(cfg, device, new_layout)
+        .context("allocate replacement TQ arena")?;
+    if slot.current_len.iter().any(|&cursor| cursor > 0) {
+        let mut encoder = device
+            .command_encoder()
+            .context("create TQ arena migration encoder")?;
+        encode_tq_arena_prefix_blits(&mut encoder, old, &replacement, &slot.current_len)
+            .context("encode TQ arena visible-prefix migration")?;
+        encoder
+            .commit_and_wait_labeled("qwen.tq_arena.grow")
+            .context("execute TQ arena visible-prefix migration")?;
+    }
+    slot.tq = Some(replacement);
+    Ok(())
+}
+
+fn encode_tq_arena_prefix_blits(
+    encoder: &mut mlx_native::CommandEncoder,
+    source: &TqFullAttnKvBuffers,
+    destination: &TqFullAttnKvBuffers,
+    visible_tokens: &[u32],
+) -> Result<()> {
+    anyhow::ensure!(
+        source.n_kv_heads == destination.n_kv_heads
+            && source.head_dim == destination.head_dim
+            && source.norms_per_pos == destination.norms_per_pos,
+        "TQ arena migration geometry mismatch"
+    );
+    anyhow::ensure!(
+        visible_tokens.len() == source.layout.n_seqs()
+            && visible_tokens.len() == destination.layout.n_seqs(),
+        "TQ arena migration cursor/layout slot-count mismatch"
+    );
+    for (slot_index, &cursor) in visible_tokens.iter().enumerate() {
+        if cursor == 0 {
+            continue;
+        }
+        let src = source.layout.segment(slot_index)?;
+        let dst = destination.layout.segment(slot_index)?;
+        anyhow::ensure!(
+            cursor <= src.capacity_tokens && cursor <= dst.capacity_tokens,
+            "TQ arena migration cursor {cursor} exceeds source/destination capacity {}/{} for slot {slot_index}",
+            src.capacity_tokens,
+            dst.capacity_tokens
+        );
+        encode_tq_component_prefix_blits(
+            encoder,
+            &source.k_packed,
+            &destination.k_packed,
+            src,
+            dst,
+            cursor,
+            source.n_kv_heads,
+            source.head_dim,
+            1,
+        )?;
+        encode_tq_component_prefix_blits(
+            encoder,
+            &source.v_packed,
+            &destination.v_packed,
+            src,
+            dst,
+            cursor,
+            source.n_kv_heads,
+            source.head_dim,
+            1,
+        )?;
+        encode_tq_component_prefix_blits(
+            encoder,
+            &source.k_norms,
+            &destination.k_norms,
+            src,
+            dst,
+            cursor,
+            source.n_kv_heads,
+            source.norms_per_pos,
+            std::mem::size_of::<f32>() as u32,
+        )?;
+        encode_tq_component_prefix_blits(
+            encoder,
+            &source.v_norms,
+            &destination.v_norms,
+            src,
+            dst,
+            cursor,
+            source.n_kv_heads,
+            source.norms_per_pos,
+            std::mem::size_of::<f32>() as u32,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_tq_component_prefix_blits(
+    encoder: &mut mlx_native::CommandEncoder,
+    source: &MlxBuffer,
+    destination: &MlxBuffer,
+    source_segment: tq_arena::TqArenaSegment,
+    destination_segment: tq_arena::TqArenaSegment,
+    visible_tokens: u32,
+    n_kv_heads: u32,
+    elements_per_token: u32,
+    element_bytes: u32,
+) -> Result<()> {
+    let bytes_per_position = u64::from(elements_per_token)
+        .checked_mul(u64::from(element_bytes))
+        .ok_or_else(|| anyhow!("TQ migration bytes-per-position overflow"))?;
+    let source_slot_base = u64::from(source_segment.base_tokens)
+        .checked_mul(u64::from(n_kv_heads))
+        .and_then(|value| value.checked_mul(bytes_per_position))
+        .ok_or_else(|| anyhow!("TQ migration source base overflow"))?;
+    let destination_slot_base = u64::from(destination_segment.base_tokens)
+        .checked_mul(u64::from(n_kv_heads))
+        .and_then(|value| value.checked_mul(bytes_per_position))
+        .ok_or_else(|| anyhow!("TQ migration destination base overflow"))?;
+    let source_head_stride = u64::from(source_segment.capacity_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ migration source stride overflow"))?;
+    let destination_head_stride = u64::from(destination_segment.capacity_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ migration destination stride overflow"))?;
+    let byte_len = u64::from(visible_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ migration copy extent overflow"))?;
+    for head in 0..u64::from(n_kv_heads) {
+        let source_offset = source_slot_base
+            .checked_add(
+                head.checked_mul(source_head_stride)
+                    .ok_or_else(|| anyhow!("TQ migration source head offset overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("TQ migration source offset overflow"))?;
+        let destination_offset = destination_slot_base
+            .checked_add(
+                head.checked_mul(destination_head_stride)
+                    .ok_or_else(|| anyhow!("TQ migration destination head offset overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("TQ migration destination offset overflow"))?;
+        encoder
+            .blit_copy_bytes(
+                source,
+                source_offset,
+                destination,
+                destination_offset,
+                byte_len,
+            )
+            .map_err(|error| anyhow!("TQ arena byte blit: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Total bytes the TQ-active full-attn slot occupies (sum of all 4
@@ -4182,36 +4696,6 @@ impl TqFullAttnKvBuffers {
         slot_id: crate::serve::multi_seq_kv::SlotId,
     ) -> Result<u32> {
         Ok(self.layout.segment(slot_id.0 as usize)?.capacity_tokens)
-    }
-
-    /// Exact component bytes after growing one slot and compacting the arena.
-    /// This is a planning primitive only; allocation/copy/swap happens in the
-    /// owning cache so all layers change atomically.
-    pub fn planned_total_bytes_after_slot_growth(
-        &self,
-        slot_id: crate::serve::multi_seq_kv::SlotId,
-        required_tokens: u32,
-        logical_max_tokens: u32,
-        n_kv_heads: u32,
-        head_dim: u32,
-    ) -> Result<usize> {
-        let layout =
-            self.layout
-                .grow_slot(slot_id.0 as usize, required_tokens, logical_max_tokens)?;
-        let total_tokens = layout.total_capacity_tokens() as usize;
-        let packed = total_tokens
-            .checked_mul(n_kv_heads as usize)
-            .and_then(|value| value.checked_mul(head_dim as usize))
-            .ok_or_else(|| anyhow!("TQ arena packed byte plan overflow"))?;
-        let norms = total_tokens
-            .checked_mul(n_kv_heads as usize)
-            .and_then(|value| value.checked_mul(self.norms_per_pos as usize))
-            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or_else(|| anyhow!("TQ arena norm byte plan overflow"))?;
-        packed
-            .checked_add(norms)
-            .and_then(|one_side| one_side.checked_mul(2))
-            .ok_or_else(|| anyhow!("TQ arena total byte plan overflow"))
     }
 
     pub fn total_bytes(&self) -> usize {
@@ -4473,11 +4957,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         //       — same as `slot_k_v_region_for_full_attn` at
         //       `gpu_full_attn.rs:102-116`.
         //
-        //   * Full-attn TQ packed (U8) + TQ norms (F32):
-        //       packed `[n_seqs, n_kv_heads, max_seq_len, head_dim]`, norms
-        //       `[n_seqs, n_kv_heads, max_seq_len, norms_per_pos]`.  Stride
-        //       formulas match `alloc_tq_full_attn_buffers` at
-        //       `kv_cache.rs:2735-2763`.
+        //   * Full-attn TQ packed (U8) + TQ norms (F32): variable physical
+        //       segments described by the arena layout. Each head's visible
+        //       prefix is copied using the source and destination capacities;
+        //       physical capacity is provisioned before this trait call.
         //
         //   * MTP slot: identical shape to full-attn slot per
         //       `HybridKvCache::new_with_mtp` discipline (the MTP slot
@@ -4527,62 +5010,11 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
                     },
                 )?;
             }
-            // TQ-active shadow buffers (packed U8 + norms F32).
+            // TQ-active native buffers (packed U8 + norms F32).
             if let Some(ref mut tq) = slot.tq {
-                copy_buffer_slot_prefix(
-                    &mut tq.k_packed,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
+                tq.copy_slot_prefix_within(src, dst, cur_src).map_err(|e| {
                     crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: TQ K packed copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.v_packed,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: TQ V packed copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.k_norms,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: TQ K norms copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.v_norms,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: TQ V norms copy failed ({e})"
-                        )),
+                        capability: leak_static_str(format!("fork_seq: TQ copy failed ({e})")),
                     }
                 })?;
             }
@@ -4608,60 +5040,9 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
                 )?;
             }
             if let Some(ref mut tq) = mtp.tq {
-                copy_buffer_slot_prefix(
-                    &mut tq.k_packed,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
+                tq.copy_slot_prefix_within(src, dst, cur_src).map_err(|e| {
                     crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: MTP TQ K packed copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.v_packed,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: MTP TQ V packed copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.k_norms,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: MTP TQ K norms copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.v_norms,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: MTP TQ V norms copy failed ({e})"
-                        )),
+                        capability: leak_static_str(format!("fork_seq: MTP TQ copy failed ({e})")),
                     }
                 })?;
             }
@@ -9156,6 +9537,8 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("Metal device for test");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        assert!(HybridKvCache::new_with_growable_tq(&cfg, &device, 4096, 16, 0).is_err());
+        assert!(HybridKvCache::new_with_growable_tq(&cfg, &device, 4096, 16, 4097).is_err());
         let cache = HybridKvCache::new_with_growable_tq(&cfg, &device, 4096, 16, 1)
             .expect("growable cache");
 
@@ -9177,6 +9560,252 @@ mod tests {
                 "physical seed must not allocate the logical full-context product"
             );
         }
+    }
+
+    fn visible_tq_u8_prefix(
+        buffer: &MlxBuffer,
+        capacity: usize,
+        cursor: usize,
+        n_heads: usize,
+        elements_per_token: usize,
+    ) -> Vec<u8> {
+        let values = buffer.as_slice::<u8>().expect("TQ u8 mapping");
+        let mut visible = Vec::with_capacity(n_heads * cursor * elements_per_token);
+        for head in 0..n_heads {
+            let start = head * capacity * elements_per_token;
+            visible.extend_from_slice(&values[start..start + cursor * elements_per_token]);
+        }
+        visible
+    }
+
+    fn visible_tq_f32_prefix_bits(
+        buffer: &MlxBuffer,
+        capacity: usize,
+        cursor: usize,
+        n_heads: usize,
+        elements_per_token: usize,
+    ) -> Vec<u32> {
+        let values = buffer.as_slice::<f32>().expect("TQ f32 mapping");
+        let mut visible = Vec::with_capacity(n_heads * cursor * elements_per_token);
+        for head in 0..n_heads {
+            let start = head * capacity * elements_per_token;
+            visible.extend(
+                values[start..start + cursor * elements_per_token]
+                    .iter()
+                    .map(|value| value.to_bits()),
+            );
+        }
+        visible
+    }
+
+    #[test]
+    fn growable_tq_migration_preserves_every_peer_visible_bit() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device for test");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache =
+            HybridKvCache::new_with_growable_tq(&cfg, &device, 64, 3, 4).expect("growable cache");
+        let cursors = [4_u32, 2, 1];
+        for full in &mut cache.full_attn {
+            full.current_len.copy_from_slice(&cursors);
+            let tq = full.tq.as_mut().expect("TQ storage");
+            for (index, value) in tq
+                .k_packed
+                .as_mut_slice::<u8>()
+                .expect("K packed mapping")
+                .iter_mut()
+                .enumerate()
+            {
+                *value = (index as u8).wrapping_mul(17).wrapping_add(3);
+            }
+            for (index, value) in tq
+                .v_packed
+                .as_mut_slice::<u8>()
+                .expect("V packed mapping")
+                .iter_mut()
+                .enumerate()
+            {
+                *value = (index as u8).wrapping_mul(29).wrapping_add(11);
+            }
+            for (index, value) in tq
+                .k_norms
+                .as_mut_slice::<f32>()
+                .expect("K norm mapping")
+                .iter_mut()
+                .enumerate()
+            {
+                *value = f32::from_bits(0x3f00_0000_u32.wrapping_add(index as u32));
+            }
+            for (index, value) in tq
+                .v_norms
+                .as_mut_slice::<f32>()
+                .expect("V norm mapping")
+                .iter_mut()
+                .enumerate()
+            {
+                *value = f32::from_bits(0x4000_0000_u32.wrapping_add(index as u32));
+            }
+        }
+
+        let mut before = Vec::new();
+        for full in &cache.full_attn {
+            let tq = full.tq.as_ref().unwrap();
+            for (slot_index, &cursor) in cursors.iter().enumerate() {
+                let views = tq
+                    .slot_views(
+                        crate::serve::multi_seq_kv::SlotId(slot_index as u32),
+                        cfg.num_key_value_heads,
+                        cache.max_seq_len,
+                        cfg.head_dim,
+                    )
+                    .unwrap();
+                before.push((
+                    visible_tq_u8_prefix(
+                        &views.k_packed,
+                        4,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        cfg.head_dim as usize,
+                    ),
+                    visible_tq_u8_prefix(
+                        &views.v_packed,
+                        4,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        cfg.head_dim as usize,
+                    ),
+                    visible_tq_f32_prefix_bits(
+                        &views.k_norms,
+                        4,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        1,
+                    ),
+                    visible_tq_f32_prefix_bits(
+                        &views.v_norms,
+                        4,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        1,
+                    ),
+                ));
+            }
+        }
+        let bytes_before = cache
+            .tq_physical_bytes_for_slot(crate::serve::multi_seq_kv::SlotId(1))
+            .unwrap();
+        let old_layer_bytes = cache.full_attn[0]
+            .tq
+            .as_ref()
+            .expect("TQ layer")
+            .total_bytes() as u64;
+        assert_eq!(
+            cache
+                .tq_growth_transient_extra_bytes_for_slot(crate::serve::multi_seq_kv::SlotId(1), 9,)
+                .unwrap(),
+            old_layer_bytes,
+            "layer-transactional growth must reserve one old arena"
+        );
+        let bytes_after = cache
+            .ensure_tq_physical_capacity_for_slot(
+                &cfg,
+                &device,
+                crate::serve::multi_seq_kv::SlotId(1),
+                9,
+            )
+            .expect("grow slot 1");
+        assert!(bytes_after > bytes_before);
+        assert_eq!(
+            cache
+                .tq_growth_transient_extra_bytes_for_slot(crate::serve::multi_seq_kv::SlotId(1), 9,)
+                .unwrap(),
+            0,
+            "an already-provisioned slot needs no migration headroom"
+        );
+
+        let mut record = 0;
+        for full in &cache.full_attn {
+            assert_eq!(full.current_len, cursors, "growth must not move cursors");
+            let tq = full.tq.as_ref().unwrap();
+            assert_eq!(
+                tq.physical_capacity_for_slot(crate::serve::multi_seq_kv::SlotId(0))
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                tq.physical_capacity_for_slot(crate::serve::multi_seq_kv::SlotId(1))
+                    .unwrap(),
+                9
+            );
+            assert_eq!(
+                tq.physical_capacity_for_slot(crate::serve::multi_seq_kv::SlotId(2))
+                    .unwrap(),
+                4
+            );
+            for (slot_index, &cursor) in cursors.iter().enumerate() {
+                let capacity = if slot_index == 1 { 9 } else { 4 };
+                let views = tq
+                    .slot_views(
+                        crate::serve::multi_seq_kv::SlotId(slot_index as u32),
+                        cfg.num_key_value_heads,
+                        cache.max_seq_len,
+                        cfg.head_dim,
+                    )
+                    .unwrap();
+                let after = (
+                    visible_tq_u8_prefix(
+                        &views.k_packed,
+                        capacity,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        cfg.head_dim as usize,
+                    ),
+                    visible_tq_u8_prefix(
+                        &views.v_packed,
+                        capacity,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        cfg.head_dim as usize,
+                    ),
+                    visible_tq_f32_prefix_bits(
+                        &views.k_norms,
+                        capacity,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        1,
+                    ),
+                    visible_tq_f32_prefix_bits(
+                        &views.v_norms,
+                        capacity,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        1,
+                    ),
+                );
+                assert_eq!(after, before[record], "visible prefix record {record}");
+                record += 1;
+            }
+        }
+
+        let capacities_before: Vec<Vec<u32>> = cache
+            .full_attn
+            .iter()
+            .map(|full| full.tq.as_ref().unwrap().layout.capacities().collect())
+            .collect();
+        assert!(cache
+            .ensure_tq_physical_capacity_for_slot(
+                &cfg,
+                &device,
+                crate::serve::multi_seq_kv::SlotId(1),
+                65,
+            )
+            .is_err());
+        let capacities_after: Vec<Vec<u32>> = cache
+            .full_attn
+            .iter()
+            .map(|full| full.tq.as_ref().unwrap().layout.capacities().collect())
+            .collect();
+        assert_eq!(capacities_after, capacities_before);
     }
 
     /// Dossier §2.8 H1 — falsifies the ADR-040 §1.3 structural claim

@@ -1,6 +1,7 @@
 # ADR-040 — Continuous batching: reopen the ADR-005 carve-out
 
-> Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
+> Terminology: "the peer" is the pinned upstream GGUF reference named in
+> `NOTICE` and `data/llama_cpp_pin.txt`.
 
 - **Status**: 🟢 **FULL-CONTEXT THREE-FAMILY WORKLOAD SERVED (2026-08-08)** — every configured agent slot receives the complete logical model context; aggregate physical KV is governed by one shared high-water budget. Gemma 4, Qwen 3.6, and DeepSeek-V4 passed real four-agent OpenCode gates with native templates, tools, SSE, tool-result continuation, and retained prefix state. The historical 2026-07-01 8×32K result remains below as provenance for the fused batching work.
 >   - **Qwen3.6 public-fixture insertion-order calibration repaired (2026-08-18).** Exact-main release-gate run `32163242804` stopped before model load because the 347-tool fixture still asserted its historical key-sorted padding count after `serde_json/preserve_order` became the production wire contract in `d4874792`. Preserving each tool's three-property schema adds exactly 28 rendered tokens per tool (`28 × 347 = 9,716`), so the deterministic one-token padding is recalibrated from 56,122 to 46,406 and the canonical request SHA-256 is rebound to `3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e`. The accepted 87,972-token target, 87,965-token stable boundary, template digest, and short 552-token lane are unchanged. The failed run is not release authority; a new exact-main packed cross-family run remains mandatory.
@@ -8,7 +9,7 @@
 >   - **Decode: campaign CLOSED at practical floor (2026-06-30).** 255 t/s aggregate N=8 short-ctx = **1.14× peer**; GPU-busy at parity; §21–§26 + iter-I/J/K/L/M levers landed; iter-O refuted the residual host gap.
 >   - **Long context: historical 32k/slot × 8 proof retained; full-context contract corrected in §0.0 (2026-08-08).** The O(seq²) `pf_kq` wall was closed and 32k×8 was proven coherent in 2026-07-01. The operator contract is now stronger: every slot has the full configured logical context, while one shared physical high-water budget governs aggregate residency. The three-family real-model gate below decides whether that stronger contract ships.
 >   - **Historical coherence milestone met; current tiny-prefill proof pending.** Byte-identity to serial reference at N=8 (`n4`/`n8` parity gates), per-stream determinism, and concurrency-invariance at 8k/12k/16k/32k were established for the accepted graph. The 2026-08-14 2–5-token fault above reopens the exact packed N=8 parity proof for the containment candidate. Standing rule (operator, 2026-07-01): **coherence > speed** — no lever ships without the ladder. (Known non-blocking residual: 2×-process GPU-contention decode non-determinism — not the deployment shape; tracked low-severity in the §0.19 history.)
->   - **qwen35moe: cross-slot proof LANDED (M-QWEN, 2026-07-01, §0.12; TQ/full-context correction 2026-08-08, §0.0)** — the earlier proof found four real bugs. The 2026-08-08 correction removes the `HF2Q_TQ_KV=0` restriction: packed and norms allocations already had an outer sequence axis, and zero-copy slot views now route TQ encode, attention, and resume through the requested slot. Full logical context is no longer divided by slot count.
+>   - **qwen35-family: cross-slot proof LANDED (M-QWEN, 2026-07-01, §0.12; growable-TQ correction in execution 2026-08-22, §0.0)** — the earlier proof found four real bugs. The 2026-08-08 correction removed the `HF2Q_TQ_KV=0` restriction and preserved full logical context, but its fixed full-capacity outer-axis allocation was falsified at N=16: first GPU use wires the complete Metal buffer. The 2026-08-22 implementation replaces that physical layout with unequal-capacity banked arenas while retaining scalar slot views and one physical batched dispatch. Exact-main real-artifact gates remain the deciding proof.
 >   - **OPEN (speed, tracked = M-SPEED-LC):** N=8 long-context decode remains a matched-reference gate. The full-context/TQ correction changes capacity and isolation, not the rule that coherence must pass before a throughput result is accepted.
 >
 >   **Original reopen rationale (2026-06-23, now superseded by the Phase F progress above; preserved for provenance):** 🔴 REOPENED — empirical bench (Gemma-4 Ara `Q5_K_M`, M5 Max, `--scheduler inflight-batched --max-slots 4`): 4 concurrent decodes = **8.1 s** vs 4 sequential = **6.9 s** → **0.85×**. Triangulated (codex code-trace + adversarially-verified web research, see §0) to the SlotAware path running **N independent `batch=1` forward passes that time-slice one GPU** instead of a fused `batch=N` decode — the §1.4 / §3.1 "zero new Metal kernels / SeparateSlots reuses every existing kernel" assumption was the defect. **The fix is specified in §0 (Correction & Phase F)** and is what the Phase F milestones above deliver. Production default stays `EngineMode::SerialFifo` — existing users see no change; the reopening is purely additive.
@@ -20,6 +21,7 @@
 
 </details>
 - **Date**: 2026-05-23
+- **Updated**: 2026-08-22
 - **Supersedes**: nothing. Amends ADR-005 §"Concurrent-deployment scaling (deferred, future ADR)" (line 1097) and Resolved Question "Phase 2 scope refinement" Decision #1 (line 6652) by activating the deferred-ADR slot.
 - **Related**: ADR-005 (Phase 2 FIFO contract — Decision #2, Decision #19), ADR-007 (TurboQuant KV — single-seq scope), ADR-017 (persistent block prefix cache — single-seq, per-model spill), ADR-027 (Qwen35 TQ KV + persist — single-seq), ADR-013 (Qwen35 inference), ADR-034 (spec-decode end-to-end — intra-request batching only).
 - **Author note**: Per `feedback_multiweek_always_in_scope_2026_05_23.md` mantra — "no shortcuts, just pure excellence". Iter 1 of this ADR is the design pass + Phase A/B/C/D scaffolding stubs landing in parallel; subsequent iters implement.
@@ -57,27 +59,42 @@ configuration axes. The earlier comparison to the peer's non-unified
 each sequence the full context, while vLLM likewise keeps `max_model_len`,
 `max_num_seqs`, and KV-cache capacity separate.
 
-#### M5 Max allocation spike
+#### M5 Max allocation spike — corrected 2026-08-22
 
-The smallest Metal spike on the target 128 GiB M5 Max established a practical
-fixed-stride implementation that preserves the existing fused multi-slot
-kernels:
+The 2026-08-08 spike proved that an overwrite allocation is cheap before GPU
+use, but drew the wrong conclusion about first binding. A mutation-sensitive
+follow-up on the same 128 GiB M5 Max showed that Metal wires the complete
+`MTLBuffer` when a command first binds it, even when the kernel writes only a
+tiny prefix:
 
-| stage | logical buffer | physical footprint |
-|---|---:|---:|
-| before allocation | 0 | 4.0 MiB |
-| uninitialized shared allocation | 8 GiB | 4.0 MiB |
-| empty command-buffer commit, resource excluded from residency set | 8 GiB | 4.3 MiB |
-| after touching 256 MiB of pages | 8 GiB | 260.3 MiB |
+| declared buffer and GPU write | free-memory delta | wired-memory delta | process RSS delta |
+|---|---:|---:|---:|
+| 4 GiB buffer, one 16 KiB write | -4,229.250 MiB | +4,227.484 MiB | +4.078 MiB |
+| 8 GiB buffer, one 1 MiB write | -8,510 MiB | same whole-buffer behavior | not the deciding metric |
 
-Registering the same virtual buffer with the Metal residency set was a
-falsifier: the next empty command-buffer commit raised physical footprint to
-8.0 GiB. Full-context KV arenas must therefore use mlx-native's explicit
-overwrite allocation contract, skip eager zero-fill, and remain outside the
-residency set. Recurrent state and scratch that may be read before a complete
-write remain initialized and residency-managed. Code may never read or copy
-an overwrite-backed tail beyond the family cache cursor; snapshots, growth,
-and slot forks are therefore cursor-bounded.
+This falsifies fixed maximum-context buffers as a demand-paged physical
+reservation. Excluding them from a residency set and skipping eager zero-fill
+does not make first GPU use sparse. Logical context remains full-sized, but
+the allocated Metal resources themselves must be bounded by current physical
+capacity.
+
+For full-TQ Qwen caches, the accepted representation is one compact arena per
+layer with an explicit `(base_token_rows, capacity_tokens)` descriptor for
+each slot. Admission grows only the selected slot. A layer transaction
+allocates the replacement arena, GPU-blits every cursor-visible prefix for
+all peer slots, waits for success, and swaps that layer. This preserves packed
+bits, norms, cursors, physical batching, and limits transient duplication to
+one layer. Before mutation, admission must prove that the steady-state
+reservation plus the largest old layer arena fits the shared KV budget; a
+request that lacks this unavoidable migration headroom fails before SSE with
+`slot_budget_exceeded` and exact steady/transient byte evidence. The same
+bounded-allocation contract applies to every supported family where
+context-growing KV is resident; each family must use its native KV
+representation and cannot inherit Qwen state or kernels approximately.
+
+Recurrent state and scratch that may be read before a complete write remain
+initialized. Code may never read or copy an overwrite-backed tail beyond the
+family cache cursor; snapshots, growth, and slot forks are cursor-bounded.
 
 Touched Metal pages do not immediately decommit while the resource remains
 alive. Shared-budget accounting must therefore charge each slot's physical
@@ -433,7 +450,7 @@ Peer setup = `/opt/gemma4/serve.sh` (`-fa auto -ctk q8_0 -ctv q8_0`, peer build 
 | 4 | 163 | 199.6 | 0.82× |
 | 8 | 189 | **242.6** | 0.78× |
 
-The gap WIDENS with N (0.82×→0.78×) — the fingerprint of the root cause. **ROOT CAUSE = dispatch-count scaling**, confirmed by 3 source-cited reads of `/opt/llama.cpp/ggml/src/ggml-metal`: the peer's decode dispatch count is CONSTANT in N — N is always a Metal *grid dimension*, never a host-side loop (one dispatch per ggml node, ~18–24/layer at N=1 AND N=8; `ggml-metal-context.m:707`, all `ggml_metal_op_*` `return 1` node with `ne11`/`ne01`/`ne21`=N only as grid extents). Attention = ONE flash-vec dispatch (grid.x=token, grid.y=head) with unified-KV + KQ −INF mask + block-skip (`ggml-metal.metal:6782`,`:6913`) — NOT KV-amortized (impossible, distinct KV/seq), the win is dispatch fusion + occupancy. MoE at N<32 is the same non-amortized gemv for BOTH (`ggml-metal-ops.cpp:2321` ne21_mm_id_min=32) — so MoE bandwidth is NOT the gap. **We** still run per-slot HOST-SIDE loops: KV-encode (2N) + FWHT-undo (N) + MoE routing (N) + weighted-sum (N) + F16/F32 dense (2N) ≈ 5–7N dispatches/layer×30 — the scaling penalty. PROOF it's the lever: N=1 dead-even, and fusing JUST the flash (N→1, M4) bought +8.6%@N4 / +14.5%@N8 (bigger at higher N, exactly as the dispatch theory predicts).
+The gap WIDENS with N (0.82×→0.78×) — the fingerprint of the root cause. **ROOT CAUSE = dispatch-count scaling**, confirmed by three source-cited reads of the pinned reference's Metal backend: its decode dispatch count is CONSTANT in N — N is always a Metal *grid dimension*, never a host-side loop (one dispatch per graph node, ~18–24/layer at N=1 AND N=8; `ggml-metal-context.m:707`, all Metal operation planners return one node with `ne11`/`ne01`/`ne21`=N only as grid extents). Attention = ONE flash-vec dispatch (grid.x=token, grid.y=head) with unified-KV + KQ −INF mask + block-skip (`ggml-metal.metal:6782`,`:6913`) — NOT KV-amortized (impossible, distinct KV/seq), the win is dispatch fusion + occupancy. MoE at N<32 is the same non-amortized gemv for BOTH (`ggml-metal-ops.cpp:2321` ne21_mm_id_min=32) — so MoE bandwidth is NOT the gap. **We** still run per-slot HOST-SIDE loops: KV-encode (2N) + FWHT-undo (N) + MoE routing (N) + weighted-sum (N) + F16/F32 dense (2N) ≈ 5–7N dispatches/layer×30 — the scaling penalty. PROOF it's the lever: N=1 dead-even, and fusing JUST the flash (N→1, M4) bought +8.6%@N4 / +14.5%@N8 (bigger at higher N, exactly as the dispatch theory predicts).
 
 **PLAN (borrow the peer's "N-as-grid-dim, constant-dispatch" structure — not copy verbatim):** fuse each remaining per-slot loop into ONE grid-dim-N batched mlx-native kernel, per-row math untouched ⇒ bit-identical (gated, `slot_aware_n1`/`n4` byte-identity verified): (1) batched KV-encode 2N→2, (2) batched FWHT-undo N→1, (3) batched MoE routing N→1, (4) batched weighted-sum N→1, (5) batched F16/F32 dense gemv 2N→2 (grid.z=N, mul_mv-style — distinct from the lane-wasting tile we refuted; cuts dispatches without compute waste). Then the ~186→200 non-attention residual (MoE/dense scaling) is a separate lever.
 
@@ -478,7 +495,7 @@ Attention is now ONE batched dispatch per op (no per-slot loops) — **N=8 202 e
 
 **MoE-kernel quick fixes REFUTED by clean measurement (2026-06-24).** The down-path `n_tokens=top_k·N=64` crosses the `mm_id` threshold into the MM path, and our NSG=4 `_nr2` Q8_0 variant is default-OFF — both looked like the lever. Clean back-to-back N=8: forcing the down to the mv path (`HF2Q_MM_ID_ROUTING_THRESHOLD=128`) = NEUTRAL (201→199); flipping `HF2Q_Q8_0_ID_MV_NR2=1`+`HF2Q_Q6K_ID_MV_NR2=1` = NEUTRAL (201.7/201.1 vs 202.0/200.9) and byte-identical. So the MoE kernel-VARIANT choice is not the 2.3× — the cost is the inherent 64 expert-gemvs (8 tok × top_k=8) each streaming a full expert weight (bandwidth, same as the peer). Caveat on the 2.3× inference: it assumed our non-MoE ≈ the peer's non-MoE; if the peer's non-MoE is faster, the gap splits and the MoE share is smaller. Remaining MoE levers (fuse SwiGLU into the gate_up mv_id to kill a device round-trip + barrier; thread-axis `(32,nsg,1)` re-bench at N=8) are deeper kernel work with now-uncertain payoff — NOT to be built speculatively after the variant tweaks came up flat. **The verified, shipped deliverable is the ATTENTION batching (+15–22%, byte-identical, N=8 202 > the peer's N=4 200); the MoE residual to 243@N8 is a scoped, separate kernel-optimization phase.**
 
-**ONLINE-RESEARCH CORROBORATION (2026-06-24, cited).** (1) Dispatch-count IS the Metal-specific lever: measured Metal dispatch overhead ≈31.7–71µs EACH; on Metal "cutting dispatch count (not kernel quality) is the actionable optimization target" and per-slot loops are the named anti-pattern (arxiv 2604.02344). (2) **200 is BEATABLE, not a ceiling** — the peer's UNIFIED KV computes "cross-sequence attention" over the ENTIRE cache then masks, which its own maintainers call suboptimal for many sequences (ggml-org/llama.cpp#4130); **our per-slot `slot_id`-indexed KV avoids that waste**, so post-fusion we can EXCEED the peer's 200/243. (3) The ~186→200 non-attention residual = MoE: sort tokens by expert + grouped-GEMM so each expert's weights are read once per step (PyTorch grouped-GEMM blog; arxiv 2501.16103) — bandwidth-bound ⇒ matters more on Apple Silicon. (4) Roofline: at N=4 we're BEFORE bandwidth saturation (M5 Max 460–614 GB/s; arxiv 2601.19139 vllm-mlx 2.6×@16 on an 8B before saturating) ⇒ the gap is amortization/dispatch, not bandwidth. Target: **≥ the peer, ideally beat it** (our KV architecture is structurally favorable).
+**ONLINE-RESEARCH CORROBORATION (2026-06-24, cited).** (1) Dispatch-count IS the Metal-specific lever: measured Metal dispatch overhead ≈31.7–71µs EACH; on Metal "cutting dispatch count (not kernel quality) is the actionable optimization target" and per-slot loops are the named anti-pattern (arxiv 2604.02344). (2) **200 is BEATABLE, not a ceiling** — the pinned reference's unified KV computes cross-sequence attention over the entire cache and masks it, a behavior its maintainers describe as suboptimal for many sequences (upstream issue #4130); **our per-slot `slot_id`-indexed KV avoids that waste**, so post-fusion we can exceed 200/243. (3) The ~186→200 non-attention residual = MoE: sort tokens by expert + grouped-GEMM so each expert's weights are read once per step (PyTorch grouped-GEMM blog; arxiv 2501.16103) — bandwidth-bound ⇒ matters more on Apple Silicon. (4) Roofline: at N=4 we're BEFORE bandwidth saturation (M5 Max 460–614 GB/s; arxiv 2601.19139 vllm-mlx 2.6×@16 on an 8B before saturating) ⇒ the gap is amortization/dispatch, not bandwidth. Target: **at least pinned-reference parity, ideally faster** (our KV architecture is structurally favorable).
 
 **COHERENCE METHODOLOGY (mandatory gate, ADR-015 `coherence_and_speed_regression.sh`): coherence FIRST, then peer-parity speed.** Every kernel lands only when (a) `slot_aware_n1`/`n4` stay BYTE-IDENTICAL to the serial slot-aware path (batched ≡ serial ⇒ cannot be less coherent than the golden baseline) AND (b) the coherence gate is green (`coherence_smoke` = serial decode non-degenerate on real prompts vs the peer; `coherence-harness/coherence_bench.sh` = side-by-side hf2q-vs-peer) — THEN a peer-parity speed number (`tests/perf_baseline.json` ratio floors). The bar: **≥ the peer on BOTH coherence and speed** at N up to 8 / 32k-ctx-per-slot (8×32k=256k ≤ the model's 262k; `max_slots≤4` A4 threshold is env-configurable via `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS`, to be raised to 8 after the KV-memory math is validated). "Speed without coherence == junk."
 
