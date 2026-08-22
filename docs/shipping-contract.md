@@ -50,9 +50,16 @@ cache, or forward graph.
   cache contracts rather than inheriting Qwen's representation.
 - Default decode (single-buffer or dual-buffer internal tuning; not
   user-configurable).
-- **Auto Q8 lm_head** with exact F32 rerank, selected when
-  `hidden_size % 32 == 0` **and** F16 lm_head weight > 256 MB;
-  otherwise F16.
+- **Artifact-native Gemma matrix storage.** The loader admits the declared
+  GGUF encoding before Metal allocation, maps the exact stored embedding,
+  output-head, dense-projection, and expert bytes, and routes those bytes
+  through a matching native kernel. A tied output head reuses the embedding
+  allocation. Production load does not manufacture an F16, F32, or re-quantized
+  shadow; an unsupported encoding fails before model allocation. Explicit
+  affine overlay formats remain a separate, declared representation. The real
+  A→B→A gate requires Gemma's live artifact mapping to disappear on eviction,
+  reappear only for a fresh A generation, preserve exact A replay, and remain
+  within the endpoint-based no-double-residency and reload memory bounds.
 - **Public by 0.1.6; strengthened through the 0.1.8 release:**
   Qwen3.5/Qwen3.6 and Qwen3.8 generation and OpenAI-compatible
   serving use the shared autoregressive `qwen35`/`qwen35moe` graph by default.
@@ -91,7 +98,7 @@ cache, or forward graph.
   pre-request turn anchor; poisoned or inconsistent state resets fully.
   The 0.1.7 release also pairs large automatic MoE gate/up
   projections through the routing-schedule primitive introduced in
-  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.11.2`.
+  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.12.1`.
   Decode-sized and forced diagnostic routes remain independent;
   native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
@@ -139,7 +146,7 @@ checkout-disjoint `CARGO_HOME` and target directory, clears Rust toolchain,
 compiler, documentation, flags, wrapper, target, and profile override
 variables, and rejects Cargo config anywhere in the packed root's ancestry.
 Its dependency receipt binds the packed `Cargo.lock` and raw `cargo metadata`
-bytes, including the exact `mlx-native 0.11.2` crates.io source and checksum.
+bytes, including the exact `mlx-native 0.12.1` crates.io source and checksum.
 The protected release workflow rehashes and revalidates those downloaded raw
 files, then requires its newly packed `Cargo.lock` to be byte-identical before
 publishing.
@@ -194,7 +201,6 @@ not remove or silently change them without an ADR.
 
 | Var | Values | Purpose |
 |---|---|---|
-| `HF2Q_LMHEAD_Q8` | `1`, `0`, unset | Force Q8 on, force F16, or auto-select. Escape hatch for models the auto heuristic classifies incorrectly. |
 | `HF2Q_DEFAULT_THINKING_TOKEN_BUDGET` | non-negative integer, unset | Operator default for Qwen reasoning when a request omits `thinking_token_budget`; the qualified agentic profile uses 2,048 and is persisted into `config.toml` by `hf2q setup` (applied by `hf2q serve` only when this variable is absent). The handler still reserves answer capacity. `0` disables the default. Explicit request budgets take precedence. |
 | `HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET` | non-negative integer, unset | Operator ceiling for the first Qwen tool-result continuation; the qualified agentic profile uses 512 (persisted into `config.toml` by `hf2q setup`, applied only when this variable is absent) and deeper cycles reduce to a 256-token floor. `0` disables this override. |
 | `HF2Q_QWEN_SPECULATION` | `off`, `auto` | Live Qwen SlotAware speculation policy. The qwen35 server engine defaults to `auto` when the variable is unset (since 2026-08-21; previously the default was off outside the canonical Qwen3.8 launcher). Auto preserves the target sampler/grammar state, requires coherent request-owned cache metadata, and cost-gates history lookup and fixed-K3 MTP independently. Unsupported semantics and runtime failures fail closed to ordinary decode or invalidate the affected slot; invalid values warn and resolve to off. Explicit `off` remains the escape hatch. |
@@ -213,7 +219,6 @@ an explicit acknowledgment: `HF2Q_UNSAFE_EXPERIMENTS=1`.
 
 | Var | Unsafe-ack | Purpose |
 |---|---|---|
-| `HF2Q_LMHEAD_RERANK=0` | **required** | Measure raw Q8 argmax cost. Reintroduces the rare near-tiebreak flip (observed as mid-decode `<pad>` emission). |
 | `HF2Q_CHUNK_SCAN_PREFILL=1` | **required** | Wave 5b iter 5 opt-in: route Qwen3.6 prefills at `seq_len > 64` through the mlx-native chunk-parallel delta-rule pipeline (`mlx_native::ops::chunk_gated_delta_rule::dispatch_chunk_gated_delta_rule_fwd`). This is a performance experiment distinct from the production autoregressive path. Decode parity ±5% (AC 5468) and walk-bar parity at pp4096+ (W-5b.3) are required before this experimental kernel can become Category 1. |
 
 ---
@@ -249,7 +254,6 @@ compatibility writers, and replay remain test-only or unavailable.
 | Var | Notes |
 |---|---|
 | `HF2Q_GRAPH_OPT` | No measured win; reorder aborts on unannotated dispatches. |
-| `HF2Q_LMHEAD_COMPARE` | Keeps both F16 and Q8 resident; inert (not wired into live decode). |
 | `HF2Q_DUAL_BUFFER` | Internal perf tuning; default (3) is part of category 1. |
 
 **Silent / read-only diagnostics (no warning, no ack):**

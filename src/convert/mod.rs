@@ -411,14 +411,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
             let want = &expected_shapes[name];
             assert_eq!(&info.shape, want, "shape round-trip failed for `{name}`");
-            // Q8_0 has wire-position 3 in mlx_native's positional enum
-            // (F32=0, F16=1, Q4_0=2, Q8_0=3, ...). Token_embd + output
+            // Token_embd + output
             // route through the OUTPUT-branch which bumps to Q6_K
-            // (position 6) at Q8_0 ftype only if `new_type != Q8_0`;
+            // at Q8_0 ftype only if `new_type != Q8_0`;
             // since new_type IS Q8_0 for `MostlyQ8_0` ftype, the bump
             // at C:432-435 does NOT fire — token_embd + output stay
-            // Q8_0. Sanity that the policy did its job.
-            assert_eq!(info.ggml_type as u32, 3, "{name} → Q8_0 (positional 3)");
+            // Q8_0. Compare the semantic storage type rather than the
+            // Rust enum discriminant, which is not the GGUF wire ID.
+            assert_eq!(info.ggml_type, mlx_native::GgmlType::Q8_0, "{name} → Q8_0");
         }
     }
 }

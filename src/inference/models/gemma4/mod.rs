@@ -26,6 +26,7 @@ pub mod io_heads;
 pub mod kv_cache;
 pub mod kv_persist;
 pub mod model;
+pub mod native_matrix;
 pub mod profile;
 pub mod tokenizer;
 

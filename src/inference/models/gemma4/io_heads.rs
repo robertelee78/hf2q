@@ -138,60 +138,22 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("per_pos pre-normed copy: {e}"))?;
             }
 
-            if let Some(ref q6k) = self.lm_head_q6k {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q6k.buffer],
-                    &[&self.activations.logits],
-                );
-                crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q6k,
-                    &mut self.activations.logits,
-                    1,
-                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                )
-                .map_err(|e| anyhow::anyhow!("per_pos lm_head Q6_K: {e}"))?;
-            } else if let Some(ref q8) = self.lm_head_q8 {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q8.buffer],
-                    &[&self.activations.logits],
-                );
-                crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q8,
-                    &mut self.activations.logits,
-                    1,
-                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                )
-                .map_err(|e| anyhow::anyhow!("per_pos lm_head Q8: {e}"))?;
-            } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-                s.barrier_between(
-                    &[&self.activations.norm_out, lm_head_f16],
-                    &[&self.activations.logits],
-                );
-                mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &self.activations.norm_out,
-                    lm_head_f16,
-                    &self.activations.logits,
-                    &mlx_native::ops::dense_gemm::DenseGemmF16Params {
-                        m: 1,
-                        n: vocab_size as u32,
-                        k: hs as u32,
-                    },
-                )
-                .map_err(|e| anyhow::anyhow!("per_pos lm_head f16: {e}"))?;
-            } else {
-                anyhow::bail!("per_position_argmax_from_hidden requires lm_head_q6k / q8 / f16");
-            }
+            let lm_head = self.resolved_lm_head();
+            s.barrier_between(
+                &[&self.activations.norm_out, &lm_head.buffer],
+                &[&self.activations.logits],
+            );
+            crate::serve::forward_mlx_shared::dispatch_qmatmul(
+                &mut s,
+                reg,
+                dev,
+                &self.activations.norm_out,
+                lm_head,
+                &self.activations.logits,
+                1,
+                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+            )
+            .map_err(|e| anyhow::anyhow!("per_pos native lm_head: {e}"))?;
 
             if let Some(cap) = self.final_logit_softcapping {
                 s.barrier_between(&[&self.activations.logits], &[&self.activations.logits]);
@@ -308,7 +270,7 @@ impl MlxModelWeights {
         let norm_out_batched = dev
             .alloc_buffer(n * hs * 4, mlx_native::DType::F32, vec![n, hs])
             .map_err(|e| anyhow::anyhow!("alloc norm_out_batched: {e}"))?;
-        let mut logits_batched = dev
+        let logits_batched = dev
             .alloc_buffer(
                 n * (vocab_size as usize) * 4,
                 mlx_native::DType::F32,
@@ -352,51 +314,19 @@ impl MlxModelWeights {
         // (b) ONE lm_head dispatch with m=n.  dispatch_qmatmul routes
         //     m<=8 through mat-vec (multiple matvecs per dispatch) and
         //     m>8 through mat-mat (simdgroup MMA, tile kernel).
-        if let Some(ref q6k) = self.lm_head_q6k {
-            s.barrier_between(&[&norm_out_batched, &q6k.buffer], &[&logits_batched]);
-            crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                &mut s,
-                reg,
-                dev,
-                &norm_out_batched,
-                q6k,
-                &mut logits_batched,
-                n as u32,
-                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-            )
-            .map_err(|e| anyhow::anyhow!("batched arg lm_head Q6_K: {e}"))?;
-        } else if let Some(ref q8) = self.lm_head_q8 {
-            s.barrier_between(&[&norm_out_batched, &q8.buffer], &[&logits_batched]);
-            crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                &mut s,
-                reg,
-                dev,
-                &norm_out_batched,
-                q8,
-                &mut logits_batched,
-                n as u32,
-                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-            )
-            .map_err(|e| anyhow::anyhow!("batched arg lm_head Q8: {e}"))?;
-        } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-            s.barrier_between(&[&norm_out_batched, lm_head_f16], &[&logits_batched]);
-            mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
-                s.encoder_mut(),
-                reg,
-                metal_dev,
-                &norm_out_batched,
-                lm_head_f16,
-                &logits_batched,
-                &mlx_native::ops::dense_gemm::DenseGemmF16Params {
-                    m: n as u32,
-                    n: vocab_size as u32,
-                    k: hs as u32,
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("batched arg lm_head F16: {e}"))?;
-        } else {
-            anyhow::bail!("per_position_argmax_batched requires lm_head_q6k / q8 / f16");
-        }
+        let lm_head = self.resolved_lm_head();
+        s.barrier_between(&[&norm_out_batched, &lm_head.buffer], &[&logits_batched]);
+        crate::serve::forward_mlx_shared::dispatch_qmatmul(
+            &mut s,
+            reg,
+            dev,
+            &norm_out_batched,
+            lm_head,
+            &logits_batched,
+            n as u32,
+            crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+        )
+        .map_err(|e| anyhow::anyhow!("batched arg native lm_head: {e}"))?;
 
         // (c) ONE softcap on the full n*vocab logits (element-wise).
         //     ADR-040 §0.16: the softcap kernel early-returns `if id >= params[1]`,

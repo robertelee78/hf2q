@@ -28,7 +28,7 @@
 //! The prefill / decode / tokenize path is exactly the same pipeline as
 //! `serve::cmd_generate` (see `/opt/hf2q/src/serve/mod.rs`). This module
 //! does not reimplement the forward pass; it wraps it. Every existing
-//! behavior (ADR-009 dense-KV, ADR-010 Q8 rerank, chat-template priority
+//! behavior (ADR-009 dense-KV, native-head token selection, chat-template priority
 //! order) is preserved by construction.
 
 use std::collections::VecDeque;
@@ -5693,8 +5693,7 @@ pub const QWEN35_NOT_IMPLEMENTED_SENTINEL: &str = "qwen35_not_implemented";
 /// the working CLI alternative (`hf2q generate`) AND the function that
 /// implements it (`cmd_generate_qwen35`) so an operator can grep the
 /// codebase and confirm the surface is real, not a stub.
-pub const QWEN35_NOT_IMPLEMENTED_MESSAGE: &str =
-    "Qwen3.5/3.6 chat completion via the SERVE-side path is pending Phase E (Wedge-3). \
+pub const QWEN35_NOT_IMPLEMENTED_MESSAGE: &str = "Qwen3.5/3.6 chat completion via the SERVE-side path is pending Phase E (Wedge-3). \
      The model is loaded; /readyz, /v1/models, /metrics work. For chat completions today, \
      use `hf2q generate --model <path> --prompt <text>` which routes correctly via \
      cmd_generate_qwen35.";
@@ -7254,7 +7253,8 @@ impl Gemma4DecodeState {
         if std::env::var("HF2Q_PREFILL_TIMING").is_ok() {
             eprintln!(
                 "[PREFILL_TIMING] slot {} — {} prompt tokens in {:.1} ms ({:.1} prompt tok/s) first_token={}",
-                slot_id.0, prompt_tokens.len(),
+                slot_id.0,
+                prompt_tokens.len(),
                 prefill_duration.as_secs_f64() * 1000.0,
                 prompt_tokens.len() as f64 / prefill_duration.as_secs_f64(),
                 first_decode_token,
@@ -7546,7 +7546,7 @@ impl Gemma4DecodeState {
     /// then EOS / stop-string / grammar-dead / max_tokens bookkeeping. Shared by
     /// the full per-slot path (logits from `logits_view`) and the batched-head
     /// path in `decode_batch_gemma4` (logits from `lm_head_batched`, greedy from
-    /// `finalize_token_from_logits`). Bit-identical token selection either way.
+    /// the same first-max rule). Bit-identical token selection either way.
     fn decode_tick_finalize(
         &mut self,
         loaded: &mut GemmaLoadedModel,
@@ -8024,9 +8024,7 @@ fn resolve_deepseek4_decode_ownership(
     finished: bool,
 ) -> Result<Deepseek4DecodeOwnership> {
     match (disposition, finished) {
-        (Deepseek4DecodeDisposition::Continue, false) => {
-            Ok(Deepseek4DecodeOwnership::Reinstall)
-        }
+        (Deepseek4DecodeDisposition::Continue, false) => Ok(Deepseek4DecodeOwnership::Reinstall),
         (Deepseek4DecodeDisposition::Park { deferred_ticks }, true) => {
             anyhow::ensure!(
                 deferred_ticks > 0,
@@ -8034,9 +8032,7 @@ fn resolve_deepseek4_decode_ownership(
             );
             Ok(Deepseek4DecodeOwnership::Park { deferred_ticks })
         }
-        (Deepseek4DecodeDisposition::Finalize, true) => {
-            Ok(Deepseek4DecodeOwnership::Finalize)
-        }
+        (Deepseek4DecodeDisposition::Finalize, true) => Ok(Deepseek4DecodeOwnership::Finalize),
         (disposition, finished) => anyhow::bail!(
             "DeepSeek decode disposition/state mismatch: disposition={disposition:?}, finished={finished}"
         ),
@@ -9829,13 +9825,13 @@ fn advance_deepseek4_prefill_quantum(
                     supervisor,
                 ),
                 true,
-            )
+            );
         }
         Err(error) => {
             return (
                 Some(SlotAwareGpuFatal::invariant_handle(primary, error)),
                 false,
-            )
+            );
         }
     };
 
@@ -15708,10 +15704,7 @@ fn decode_batch_gemma4(
     kv_bytes_per_token: u64,
     supervisor: &EngineSupervisor,
 ) -> Option<SlotAwareGpuFatal> {
-    // First-max argmax (matches dispatch_argmax_f32's `>` tie-break). Only the
-    // VALUE (== logits max) feeds the rerank threshold; the index is a cosmetic
-    // seed that finalize_token_from_logits never lets affect the result (the max
-    // is always within delta of itself ⇒ always a rerank candidate).
+    // First-max argmax matches dispatch_argmax_f32's `>` tie-break.
     // ADR-040 iter-I — vectorizable argmax (byte-identical to the scalar
     // first-max `v > bv` loop, but the two passes auto-vectorize where the
     // loop-carried-dependency scalar loop did not). See `argmax_f32_first_max`.
@@ -15721,11 +15714,10 @@ fn decode_batch_gemma4(
 
     // ADR-040 S1c-2 — TWO-PASS batched-head tick. Pass 1 runs each live slot's
     // BODY only and gathers its final hidden row; ONE `lm_head_batched` then
-    // amortizes the 605 MB lm_head weight read across all slots; Pass 2
+    // amortizes the artifact-native output-head read across all slots; Pass 2
     // finalizes each slot from its logits row. Per-slot output is bit-identical
-    // to the prior per-slot full decode (H-S1-rowparity + shared
-    // finalize_token_from_logits + decode_tick_finalize).
-    let hs = guard.model.weights.hidden_size;
+    // to the prior per-slot full decode (H-S1-rowparity + first-max argmax +
+    // shared decode_tick_finalize).
     let vocab = guard.model.weights.vocab_size;
 
     // ADR-040 Phase F `iter-F-prefill-determinism` (2026-06-24) — clear the
@@ -15875,9 +15867,10 @@ fn decode_batch_gemma4(
             if crate::debug::INVESTIGATION_ENV.hybrid_kv {
                 match guard.hybrid.as_mut() {
                     Some(hybrid) => {
-                        let mut regime = crate::inference::models::gemma4::batched_body::BatchedKvRegime::Hybrid(
-                            hybrid.as_mut_slice(),
-                        );
+                        let mut regime =
+                            crate::inference::models::gemma4::batched_body::BatchedKvRegime::Hybrid(
+                                hybrid.as_mut_slice(),
+                            );
                         let lm = &mut *guard.model;
                         lm.weights.forward_decode_body_batched(
                             &tokens,
@@ -16204,66 +16197,10 @@ fn decode_batch_gemma4(
     let mut captured = captured.into_iter().enumerate();
     while let Some((i, (handle, slot_idx, mut state, mut reply))) = captured.next() {
         let logits_row = &head.logits[i * vocab..(i + 1) * vocab];
-        let normed_row = &head.normed[i * hs..(i + 1) * hs];
-        // Greedy token: the GPU-argmax index is irrelevant to the rerank and the
-        // top1 VALUE (== CPU max) is bit-identical, so a CPU argmax reproduces
-        // the scalar head's greedy token exactly.
+        // The artifact-native output head produces the authoritative logits;
+        // deterministic first-max selection needs no shadow-weight rerank.
         let _hp_am = std::time::Instant::now();
-        // ADR-040 §26 iter-M: use GPU-side argmax+candidate set (drops the ~0.92ms
-        // host full-vocab scan) when available + not overflowed; the cheap F64
-        // rerank still runs on host. BYTE-IDENTICAL: GPU candidate set == host
-        // threshold scan, both feed the same rerank tail. Host fallback on
-        // overflow (rare) or HF2Q_GPU_SAMPLE off.
-        let gpu_s = head
-            .gpu_sample
-            .as_ref()
-            .filter(|gs| gs.overflow[i] == 0 && (gs.cand_count[i] as usize) <= gs.cap);
-        let greedy_result = if let Some(gs) = gpu_s {
-            let cnt = (gs.cand_count[i] as usize).min(gs.cap);
-            let cands = &gs.cand_ids[i * gs.cap..i * gs.cap + cnt];
-            guard.model.weights.finalize_token_from_gpu_candidates(
-                cands,
-                normed_row,
-                gs.top1_idx[i],
-            )
-        } else {
-            let (ti, tv) = argmax_f32(logits_row);
-            guard
-                .model
-                .weights
-                .finalize_token_from_logits(logits_row, normed_row, ti, tv)
-        };
-        let greedy_token = match greedy_result {
-            Ok(t) => t,
-            Err(e) => {
-                reply = match reset_gemma4_slot_for_reply(
-                    guard,
-                    scheduler,
-                    handle,
-                    kv_bytes_per_token,
-                    reply,
-                ) {
-                    Ok(reply) => reply,
-                    Err(mut fatal) => {
-                        fatal.extend_slots(captured.map(
-                            |(_, (remaining_handle, _, _, remaining_reply))| {
-                                (Some(remaining_handle), remaining_reply)
-                            },
-                        ));
-                        return Some(fatal);
-                    }
-                };
-                retained_tokens[handle.slot_id.0 as usize].clear();
-                clear_gemma4_anchor_store(
-                    &mut prompt_anchors[handle.slot_id.0 as usize],
-                    "decode-finalize-failure",
-                    handle.slot_id,
-                );
-                scheduler.release(handle);
-                slot_fire_done(reply, Err(e), false);
-                continue;
-            }
-        };
+        let (greedy_token, _top1_value) = argmax_f32(logits_row);
         crate::inference::models::gemma4::batched_body::host_phases::add(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::ArgmaxFinalize,
             _hp_am.elapsed().as_nanos() as u64,
@@ -23459,7 +23396,9 @@ fn worker_run(
                 // corruption.
                 let result = match &mut loaded {
                     LoadedModel::Gemma(g) => {
-                        match crate::serve::kv_persist::prompt_cache_persist::try_deserialize(&payload) {
+                        match crate::serve::kv_persist::prompt_cache_persist::try_deserialize(
+                            &payload,
+                        ) {
                             Some(cache) => {
                                 g.prompt_cache = cache;
                                 Ok(())
@@ -26221,9 +26160,9 @@ fn generate_stream_gemma4_once_slot_aware(
     // wrapping remains iter-2-decode scope (matches the text-only
     // streaming arm's surviving sub-deferral).
     let _ = soft_tokens; // Soft tokens are threaded through to the
-                         // prefill call site below — this binding
-                         // exists only to document iter-5's lift in
-                         // the source-grep window.
+    // prefill call site below — this binding
+    // exists only to document iter-5's lift in
+    // the source-grep window.
 
     // Per-slot reset at entry — mirror of iter-1 Generate-arm entry-
     // reset discipline (engine.rs:7869-7874) for the streaming surface.
@@ -29598,8 +29537,8 @@ fn generate_stream_once(
                                 };
                                 if !per_layer_ok {
                                     tracing::debug!(
-                                    "lcp_resume (streaming): capacity check failed — falling back"
-                                );
+                                        "lcp_resume (streaming): capacity check failed — falling back"
+                                    );
                                     drop(prefix);
                                     None
                                 } else {
@@ -30879,7 +30818,7 @@ pub(crate) fn render_deepseek_v4_prompt_with_serialized_tools(
     kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<String> {
     use crate::core::deepseek_v4_encoding::{
-        encode_json, EncodeOptions, ReasoningEffort, ThinkingMode,
+        EncodeOptions, ReasoningEffort, ThinkingMode, encode_json,
     };
 
     let thinking = kwargs
@@ -31058,18 +30997,22 @@ mod tests {
     fn agentic_grammar_contract_gemma_initialization_requires_exactly_one_authoritative_table() {
         let mut table_only = SamplingParams::default();
         table_only.token_bytes = Some(Arc::new(vec![b"a".to_vec()]));
-        assert!(grammar_runtime_for_request(&table_only, None)
-            .expect_err("Gemma table without grammar must fail before GPU sampling")
-            .to_string()
-            .contains("without a grammar"));
+        assert!(
+            grammar_runtime_for_request(&table_only, None)
+                .expect_err("Gemma table without grammar must fail before GPU sampling")
+                .to_string()
+                .contains("without a grammar")
+        );
 
         let mut grammar_only = SamplingParams::default();
         grammar_only.grammar =
             Some(crate::serve::api::grammar::parse("root ::= \"a\"\n").expect("literal grammar"));
-        assert!(grammar_runtime_for_request(&grammar_only, None)
-            .expect_err("Gemma grammar without table must fail before GPU sampling")
-            .to_string()
-            .contains("without its authoritative token byte table"));
+        assert!(
+            grammar_runtime_for_request(&grammar_only, None)
+                .expect_err("Gemma grammar without table must fail before GPU sampling")
+                .to_string()
+                .contains("without its authoritative token byte table")
+        );
     }
 
     #[test]
@@ -31358,14 +31301,16 @@ mod tests {
         assert_eq!(plan.target_cursor, 7_316);
         assert_eq!(plan.window_cap, 5);
 
-        assert!(deepseek4_prefill_alignment_catchup(
-            handles
-                .iter()
-                .copied()
-                .map(|handle| (handle, Some((7_316, 9_466, 8)))),
-            128,
-        )
-        .is_none());
+        assert!(
+            deepseek4_prefill_alignment_catchup(
+                handles
+                    .iter()
+                    .copied()
+                    .map(|handle| (handle, Some((7_316, 9_466, 8)))),
+                128,
+            )
+            .is_none()
+        );
 
         let multi_laggard = deepseek4_prefill_alignment_catchup(
             [
@@ -31390,27 +31335,33 @@ mod tests {
             slot_id: SlotId(slot),
             generation: 1,
         };
-        assert!(deepseek4_prefill_alignment_catchup(
-            [
-                (handle(0), Some((6_676, 9_466, 8))),
-                (handle(1), Some((7_316, 9_594, 8))),
-            ],
-            128,
-        )
-        .is_none());
-        assert!(deepseek4_prefill_alignment_catchup(
-            [
-                (handle(0), Some((6_700, 9_466, 8))),
-                (handle(1), Some((7_316, 9_466, 8))),
-            ],
-            128,
-        )
-        .is_none());
-        assert!(deepseek4_prefill_alignment_catchup(
-            [(handle(0), Some((6_676, 9_466, 8))), (handle(1), None)],
-            128,
-        )
-        .is_none());
+        assert!(
+            deepseek4_prefill_alignment_catchup(
+                [
+                    (handle(0), Some((6_676, 9_466, 8))),
+                    (handle(1), Some((7_316, 9_594, 8))),
+                ],
+                128,
+            )
+            .is_none()
+        );
+        assert!(
+            deepseek4_prefill_alignment_catchup(
+                [
+                    (handle(0), Some((6_700, 9_466, 8))),
+                    (handle(1), Some((7_316, 9_466, 8))),
+                ],
+                128,
+            )
+            .is_none()
+        );
+        assert!(
+            deepseek4_prefill_alignment_catchup(
+                [(handle(0), Some((6_676, 9_466, 8))), (handle(1), None)],
+                128,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -35072,7 +35023,7 @@ assistant:
     #[test]
     fn loaded_model_enum_accessor_methods_dispatch_correctly() {
         use crate::inference::models::qwen35::{
-            default_layer_types, model::Qwen35Model, Qwen35Config, Qwen35MoeConfig, Qwen35Variant,
+            Qwen35Config, Qwen35MoeConfig, Qwen35Variant, default_layer_types, model::Qwen35Model,
         };
 
         // ---- Build a synthetic Qwen35 variant -----------------------
@@ -37519,7 +37470,8 @@ assistant:
                 serial.text.starts_with(&slot.text),
                 "ADR-040 §0.16 — batched-body N=4 SAME-prompt (stagger_ms={stagger_ms} evict={evict}) \
                  slot {i} text is NOT a prefix of the serial ref (FAIL ⇒ this admission pattern is the trigger)\n  slot:   {:?}\n  serial: {:?}",
-                slot.text, serial.text,
+                slot.text,
+                serial.text,
             );
         }
         rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
@@ -38381,7 +38333,10 @@ assistant:
             assert!(r.completion_tokens > 0, "iter-G(a) E2E: seq {i} no tokens");
         }
         let batched = ITER_GA_BATCHED_ADMIT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(batched > 0, "iter-G(a) E2E: batched admit NEVER fired (count=0) — the multi-seq prefill path was not exercised");
+        assert!(
+            batched > 0,
+            "iter-G(a) E2E: batched admit NEVER fired (count=0) — the multi-seq prefill path was not exercised"
+        );
         eprintln!("[iter-G(a) E2E] 8/8 complete; batched-admit forwards fired = {batched}");
         rt.block_on(engine.shutdown()).expect("shutdown e2e");
 
@@ -38506,7 +38461,9 @@ assistant:
         };
         eprintln!("[BISECT] single B first_token={single_tok}");
 
-        eprintln!("[BISECT] === multi-seq forward of [A(len {alen}), B(len {blen})] — B at offset {alen} ===");
+        eprintln!(
+            "[BISECT] === multi-seq forward of [A(len {alen}), B(len {blen})] — B at offset {alen} ==="
+        );
         let multi_toks = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load multi");
             let LoadedModel::Gemma(g) = &mut loaded else {
@@ -38600,7 +38557,9 @@ assistant:
     #[test]
     fn slot_aware_n4_batched_body_throughput_probe() {
         if std::env::var("HF2Q_BATCHED_BENCH").as_deref() != Ok("1") {
-            eprintln!("[skip] slot_aware_n4_batched_body_throughput_probe — set HF2Q_BATCHED_BENCH=1 + HF2Q_BYTE_EQUIV_E2E_GGUF to run");
+            eprintln!(
+                "[skip] slot_aware_n4_batched_body_throughput_probe — set HF2Q_BATCHED_BENCH=1 + HF2Q_BYTE_EQUIV_E2E_GGUF to run"
+            );
             return;
         }
         let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
@@ -38741,7 +38700,9 @@ assistant:
                     for (si, r) in results.iter().enumerate() {
                         eprintln!(
                             "[REPEAT_FPRINT] run={run} stream={si} conc=1 comp_tokens={} text_bytes={} fnv1a64={:016x}",
-                            r.completion_tokens, r.text.len(), fnv1a64(&r.text),
+                            r.completion_tokens,
+                            r.text.len(),
+                            fnv1a64(&r.text),
                         );
                     }
                 } else {
@@ -38751,7 +38712,10 @@ assistant:
                             .expect("generate");
                         eprintln!(
                             "[REPEAT_FPRINT] run={run} stream={si} conc=0 comp_tokens={} text_bytes={} fnv1a64={:016x} text={:?}",
-                            r.completion_tokens, r.text.len(), fnv1a64(&r.text), r.text,
+                            r.completion_tokens,
+                            r.text.len(),
+                            fnv1a64(&r.text),
+                            r.text,
                         );
                     }
                 }
@@ -38768,8 +38732,6 @@ assistant:
         crate::inference::models::gemma4::batched_body::host_phases::reset();
         // ADR-040 §25 barrier-tracking timing reset (HF2Q_BARRIER_NS=1).
         mlx_native::barrier_ns_reset();
-        // ADR-040 §26 rerank profiling reset (HF2Q_RERANK_PROFILE=1).
-        crate::inference::models::gemma4::batched_head::rerank_profile_reset();
         // ADR-040 §0.21 decode-gap profiling: snapshot process-global GPU
         // dispatch + sync counters around the timed decode (HF2Q_DISP_PROFILE=1).
         let disp0 = mlx_native::dispatch_count();
@@ -38816,7 +38778,11 @@ assistant:
         let tok_s = total_tokens as f64 / elapsed.as_secs_f64();
         eprintln!(
             "[THROUGHPUT] batched_body={} N={} concurrent: {} tokens in {:.3}s = {:.1} tok/s aggregate ({:.1}/stream)",
-            batched_on, n_streams, total_tokens, elapsed.as_secs_f64(), tok_s,
+            batched_on,
+            n_streams,
+            total_tokens,
+            elapsed.as_secs_f64(),
+            tok_s,
             tok_s / n_streams as f64,
         );
         // ADR-040 iter-G per-category GPU-busy split (HF2Q_DECODE_CATSPLIT=1).
@@ -38844,7 +38810,8 @@ assistant:
             rows.sort_by(|a, b| b.3.cmp(&a.3));
             eprintln!(
                 "[CATSPLIT] N={n_streams} per-category GPU-busy + DISPATCH COUNT, ranked by dispatches/step, over {} emitted tokens; total {:.1} disp/step:",
-                total_tokens, sum_disp as f64 / cs_steps as f64,
+                total_tokens,
+                sum_disp as f64 / cs_steps as f64,
             );
             eprintln!(
                 "[CATSPLIT]   {:<40} {:>10} {:>8} {:>10} {:>10}",
@@ -38888,10 +38855,16 @@ assistant:
                 let pct = 100.0 * gpu_busy as f64 / wall_ns as f64;
                 eprintln!(
                     "[GPU_BUSY] gpu_busy={:.3}s wall={:.3}s → GPU-busy = {:.1}% of wall-clock | per-step(N={n_streams}): gpu {:.2}ms vs wall {:.2}ms → {}",
-                    gpu_busy as f64 / 1e9, elapsed.as_secs_f64(), pct,
+                    gpu_busy as f64 / 1e9,
+                    elapsed.as_secs_f64(),
+                    pct,
                     gpu_busy as f64 / 1e6 / steps as f64,
                     wall_ns as f64 / 1e6 / steps as f64,
-                    if pct < 70.0 { "CPU-ENCODE/LAUNCH BOUND (hypothesis CONFIRMED)" } else { "GPU-WORK BOUND (CPU-encode refuted)" },
+                    if pct < 70.0 {
+                        "CPU-ENCODE/LAUNCH BOUND (hypothesis CONFIRMED)"
+                    } else {
+                        "GPU-WORK BOUND (CPU-encode refuted)"
+                    },
                 );
             }
             // ADR-040 §0.21 decode-CATEGORY split — body (embed+30 layers) vs
@@ -38903,8 +38876,10 @@ assistant:
                 let sum = (body_ns + lmh_ns).max(1);
                 eprintln!(
                     "[DECODE_CATSPLIT] body(embed+layers) {:.2}ms/step ({:.0}%) | lm_head {:.2}ms/step ({:.0}%) | sum {:.2}ms/step",
-                    body_ns as f64 / 1e6 / steps as f64, 100.0 * body_ns as f64 / sum as f64,
-                    lmh_ns as f64 / 1e6 / steps as f64, 100.0 * lmh_ns as f64 / sum as f64,
+                    body_ns as f64 / 1e6 / steps as f64,
+                    100.0 * body_ns as f64 / sum as f64,
+                    lmh_ns as f64 / 1e6 / steps as f64,
+                    100.0 * lmh_ns as f64 / sum as f64,
                     sum as f64 / 1e6 / steps as f64,
                 );
             }
@@ -38935,17 +38910,11 @@ assistant:
                 // §25: how much of the serial encode is barrier conflict-tracking.
                 let bns = mlx_native::barrier_ns();
                 if bns > 0 {
-                    eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step (barrier_between conflict-tracking; HF2Q_BARRIER_NS)",
-                        "of which barrier-track", bns as f64 / 1e6 / steps as f64);
-                }
-                // §26: split finalize's cost — rerank F64 dots (Metal-no-F64, stuck
-                // on host) vs the rest (argmax+candidate-scan, GPU-movable F32).
-                let (rr_ns, rr_cand, rr_calls) =
-                    crate::inference::models::gemma4::batched_head::rerank_profile();
-                if rr_calls > 0 {
-                    eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step | {:.1} candidates/slot avg ({} calls); HF2Q_RERANK_PROFILE",
-                        "of which rerank-F64-dots", rr_ns as f64 / 1e6 / steps as f64,
-                        rr_cand as f64 / rr_calls as f64, rr_calls);
+                    eprintln!(
+                        "[HOST_PHASES]   {:<32} {:6.3} ms/step (barrier_between conflict-tracking; HF2Q_BARRIER_NS)",
+                        "of which barrier-track",
+                        bns as f64 / 1e6 / steps as f64
+                    );
                 }
             }
         }
@@ -39273,7 +39242,8 @@ assistant:
         }
         eprintln!(
             "[fwd-divergence SUMMARY] prefill_logits_identical={} first_decode_argmax_flip_step={:?}",
-            max_abs == 0.0, first_argmax_flip
+            max_abs == 0.0,
+            first_argmax_flip
         );
         // LOAD-BEARING PIN (ADR-040 §0.12 verdict): the slot-aware forward
         // is NUMERICALLY IDENTICAL to the legacy NON-batched forward at
@@ -40079,7 +40049,7 @@ mod streaming_prompt_cache_replay_tests {
     #[test]
     fn replay_returns_err_when_receiver_dropped() {
         let (tx, rx) = mpsc::channel(1); // tiny buffer
-                                         // Drop receiver so all sends fail.
+        // Drop receiver so all sends fail.
         drop(rx);
 
         let cached = cached_non_streaming("anything", None);
@@ -41205,8 +41175,8 @@ mod test_a1_conditional_grammar_wire {
     /// `route_content` uses.
     #[test]
     fn tool_call_open_triggers_grammar_runtime() {
-        use crate::serve::api::grammar::parser::parse;
         use crate::serve::api::grammar::GrammarRuntime;
+        use crate::serve::api::grammar::parser::parse;
 
         // Real Gemma4 registration with real open/close markers.
         let reg = crate::serve::api::registry::find_for("gemma4-27b-it")
@@ -44261,8 +44231,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
     #[test]
     fn h25_capability_unsupported_label_names_iter_c2c_cont_and_b4c_gate() {
         let err = MultiSeqError::CapabilityUnsupported {
-            capability:
-                "gemma4-forward-prefill-slot-N (iter-C2c-cont per ADR-040 §6.1.21 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs)",
+            capability: "gemma4-forward-prefill-slot-N (iter-C2c-cont per ADR-040 §6.1.21 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs)",
         };
         let msg = format!("{}", err);
         assert!(
@@ -45083,7 +45052,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
 
     #[test]
     fn qwen_text_anchor_vision_reuse_requires_suffix_only_mrope_proof() {
-        use crate::serve::forward_prefill::{build_qwen3vl_positions, Qwen3VlImageGrid};
+        use crate::serve::forward_prefill::{Qwen3VlImageGrid, build_qwen3vl_positions};
 
         let prompt_len = 12;
         let image_start = 8usize;
@@ -45318,9 +45287,11 @@ mod qwen35_bounded_prefill_watchdog_tests {
             },
             |_| true,
         );
-        assert!(bounded
-            .iter()
-            .any(|request| matches!(request, Request::Shutdown)));
+        assert!(
+            bounded
+                .iter()
+                .any(|request| matches!(request, Request::Shutdown))
+        );
         assert_eq!(
             bounded.len(),
             2,
@@ -45369,9 +45340,11 @@ mod qwen35_bounded_prefill_watchdog_tests {
             |request| matches!(request, Request::Generate { .. }),
         );
         assert_eq!(saturated.len(), 2);
-        assert!(saturated
-            .iter()
-            .any(|request| matches!(request, Request::Generate { .. })));
+        assert!(
+            saturated
+                .iter()
+                .any(|request| matches!(request, Request::Generate { .. }))
+        );
         assert!(
             waiter_one_rx.try_recv().is_ok() || waiter_two_rx.try_recv().is_ok(),
             "runnable work displaces one blocked waiter instead of being rejected unseen"
@@ -45640,9 +45613,11 @@ mod qwen35_bounded_prefill_watchdog_tests {
 
         for chunks in [&first_chunks, &second_chunks] {
             assert_eq!(chunks.len(), 43);
-            assert!(chunks[..42]
-                .iter()
-                .all(|&tokens| tokens == QWEN35_SLOT_PREFILL_CHUNK_TOKENS));
+            assert!(
+                chunks[..42]
+                    .iter()
+                    .all(|&tokens| tokens == QWEN35_SLOT_PREFILL_CHUNK_TOKENS)
+            );
             assert_eq!(chunks[42], 1_956);
         }
         match scheduler.step().expect("both long lanes decode-ready") {
@@ -45685,9 +45660,11 @@ mod qwen35_bounded_prefill_watchdog_tests {
             }
         }
         assert_eq!(chunks.len(), 43);
-        assert!(chunks[..42]
-            .iter()
-            .all(|&tokens| tokens == QWEN35_SLOT_PREFILL_CHUNK_TOKENS));
+        assert!(
+            chunks[..42]
+                .iter()
+                .all(|&tokens| tokens == QWEN35_SLOT_PREFILL_CHUNK_TOKENS)
+        );
         assert_eq!(chunks[42], 1_956);
         assert_eq!(chunks.iter().copied().sum::<u32>(), 87_972);
         match scheduler.step().expect("both requests decode-ready") {
@@ -46513,8 +46490,7 @@ mod adr040_phase_c_iter2d_cont_qwen35_slot_aware_tests {
     #[test]
     fn h37_capability_unsupported_label_names_iter_c2d_cont_kernel_for_qwen35() {
         let err = MultiSeqError::CapabilityUnsupported {
-            capability:
-                "qwen35-forward-gpu-last-logits-slot-N (iter-C2d-cont-kernel per ADR-040 §6.1.24 — gated on persistent_kv_cache worker hot path lift + slot_id threading through Qwen35Model::forward_gpu_last_logits in src/serve/api/engine_qwen35.rs)",
+            capability: "qwen35-forward-gpu-last-logits-slot-N (iter-C2d-cont-kernel per ADR-040 §6.1.24 — gated on persistent_kv_cache worker hot path lift + slot_id threading through Qwen35Model::forward_gpu_last_logits in src/serve/api/engine_qwen35.rs)",
         };
         let msg = format!("{}", err);
         assert!(
@@ -49020,8 +48996,7 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
     #[test]
     fn h42_capability_unsupported_label_names_iter_b4c_kernel_for_gemma4() {
         let err = MultiSeqError::CapabilityUnsupported {
-            capability:
-                "gemma4-forward-prefill-slot-N (iter-C2c-cont per ADR-040 §6.1.21 / iter-B4c-kernel per ADR-040 §6.1.25 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs + per-slot MultiSeqHbKvBuffers slot routing)",
+            capability: "gemma4-forward-prefill-slot-N (iter-C2c-cont per ADR-040 §6.1.21 / iter-B4c-kernel per ADR-040 §6.1.25 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs + per-slot MultiSeqHbKvBuffers slot routing)",
         };
         let msg = format!("{}", err);
         assert!(
@@ -49072,8 +49047,8 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
     /// (operator-facing) + the source-grep structural pin (reviewer-
     /// facing) move in lockstep. Mirrors C2d-cont H38.
     #[test]
-    fn h43_typed_deferral_label_present_in_all_four_worker_arms_and_forward_prefill_slot_id_not_yet_threaded(
-    ) {
+    fn h43_typed_deferral_label_present_in_all_four_worker_arms_and_forward_prefill_slot_id_not_yet_threaded()
+     {
         let src = include_str!("engine.rs");
         // Count Gemma 4 B4c clamp occurrences. Each of the 4 worker
         // arms (Generate / GenerateStream / Embed /
@@ -52166,8 +52141,8 @@ mod adr040_phase_b_iter_b4c_kernel_iter3_gemma4_tests {
         // entry-reset (defense against a refactor that emits Error
         // BEFORE resetting the slot).
         let _ = first_error_idx; // referenced for clarity; the
-                                 // iter-2-decode cite-based pin
-                                 // above is the load-bearing one.
+        // iter-2-decode cite-based pin
+        // above is the load-bearing one.
 
         // The ADR-040 §6.1.35 closure block exists in the ADR.
         let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
@@ -52790,8 +52765,8 @@ mod adr040_phase_b_iter_b4c_kernel_iter5_gemma4_tests {
     /// equivalence chain extended to the Gemma 4 vision-aware soft-token
     /// surface.  Direct mirror of Qwen35 iter-C2d-cont-kernel iter-4 H70.
     #[test]
-    fn h116_slot_id_0_gemma4_soft_tokens_routes_through_generate_once_with_soft_tokens_byte_equivalent(
-    ) {
+    fn h116_slot_id_0_gemma4_soft_tokens_routes_through_generate_once_with_soft_tokens_byte_equivalent()
+     {
         let src = include_str!("engine.rs");
         let body = worker_run_body(src);
 
@@ -53482,8 +53457,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
         // Cover the full fn body — generously sized window.
         let fn_window = &src[fn_idx..(fn_idx + 20_000).min(src.len())];
         // (a) OLD iter-2-decode literal REMOVED.
-        let old_label =
-            "gemma4-forward-prefill-kernel-slot-N-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.32";
+        let old_label = "gemma4-forward-prefill-kernel-slot-N-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.32";
         assert!(
             !fn_window.contains(old_label),
             "H125 FALSIFIED: Generate orchestrator body still contains the \
@@ -53537,8 +53511,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
         // window widened to 50k to cover the trailing Done event.
         let fn_window = &src[fn_idx..(fn_idx + 50_000).min(src.len())];
         // (a) OLD streaming iter-2-decode literal REMOVED.
-        let old_label =
-            "gemma4-forward-prefill-kernel-slot-N-stream-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.35";
+        let old_label = "gemma4-forward-prefill-kernel-slot-N-stream-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.35";
         assert!(
             !fn_window.contains(old_label),
             "H126 FALSIFIED: GenerateStream orchestrator body still contains \
@@ -53583,8 +53556,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
             .expect("H127: generate_gemma4_once_with_soft_tokens_slot_aware not found");
         let fn_window = &src[fn_idx..(fn_idx + 20_000).min(src.len())];
         // (a) OLD iter-2-decode soft-tokens literal REMOVED.
-        let old_label =
-            "gemma4-forward-prefill-kernel-slot-N-soft-tokens-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.37";
+        let old_label = "gemma4-forward-prefill-kernel-slot-N-soft-tokens-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.37";
         assert!(
             !fn_window.contains(old_label),
             "H127 FALSIFIED: SoftTokens orchestrator body still contains the \
@@ -53858,8 +53830,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
         // sit before them.
         let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         // (a) OLD iter-2-decode-A sampling-clamp typed-error literal REMOVED.
-        let old_label =
-            "gemma4-forward-decode-slot-N-sampler-grammar (iter-B4c-kernel-iter-2-decode-C per ADR-040 §6.1.38";
+        let old_label = "gemma4-forward-decode-slot-N-sampler-grammar (iter-B4c-kernel-iter-2-decode-C per ADR-040 §6.1.38";
         assert!(
             !fn_window.contains(old_label),
             "H130 FALSIFIED: Generate orchestrator body still contains \
@@ -53926,8 +53897,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
             .expect("H132: generate_stream_gemma4_once_slot_aware not found");
         let fn_window = &src[fn_idx..(fn_idx + 40_000).min(src.len())];
         // (a) OLD iter-2-decode-A streaming sampling-clamp typed-error literal REMOVED.
-        let old_label =
-            "gemma4-forward-decode-stream-slot-N-sampler-grammar (iter-B4c-kernel-iter-2-decode-C per ADR-040 §6.1.38";
+        let old_label = "gemma4-forward-decode-stream-slot-N-sampler-grammar (iter-B4c-kernel-iter-2-decode-C per ADR-040 §6.1.38";
         assert!(
             !fn_window.contains(old_label),
             "H132 FALSIFIED: GenerateStream orchestrator body still \
@@ -55431,8 +55401,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests 
         // (a) The iter-2B-xlen typed-deferral capability literal — EXACT
         // string a CapabilityUnsupported constructor would have used at
         // iter-2B SHIP.  iter-2B-xlen REMOVES it from the default path.
-        let iter2b_xlen_typed_error_default =
-            "gemma4-forward-prefill-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2B-xlen per ADR-040 §6.1.34";
+        let iter2b_xlen_typed_error_default = "gemma4-forward-prefill-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2B-xlen per ADR-040 §6.1.34";
         assert!(
             !fn_window.contains(iter2b_xlen_typed_error_default),
             "H189 FALSIFIED: prefill fn body still contains the iter-2B \
@@ -55499,8 +55468,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests 
 
         // (a) Decode-side iter-2-decode-A-xlen typed-deferral capability
         // literal REMOVED from the default path.
-        let iter2_decode_xlen_typed_error_default =
-            "gemma4-forward-decode-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2-decode-A-xlen per ADR-040 §6.1.38";
+        let iter2_decode_xlen_typed_error_default = "gemma4-forward-decode-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2-decode-A-xlen per ADR-040 §6.1.38";
         assert!(
             !fn_window.contains(iter2_decode_xlen_typed_error_default),
             "H190 FALSIFIED: decode fn body still contains the \
@@ -56033,8 +56001,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_stream_tool_call_gemma4_tests 
         // deferral for the streaming tool-call body.  iter-2-decode-C-
         // stream-tool-call REMOVES that constructor + capability
         // literal pairing.
-        let iter2_decode_c_tc_capability =
-            "gemma4-forward-decode-stream-slot-N-tool-call-body (iter-B4c-kernel-iter-2-decode-C-stream-tool-call per ADR-040 §6.1.39 — streaming tool-call body emission";
+        let iter2_decode_c_tc_capability = "gemma4-forward-decode-stream-slot-N-tool-call-body (iter-B4c-kernel-iter-2-decode-C-stream-tool-call per ADR-040 §6.1.39 — streaming tool-call body emission";
         assert!(
             !fn_window.contains(iter2_decode_c_tc_capability),
             "H196 FALSIFIED: slot-aware streaming fn body still \
@@ -58049,9 +58016,7 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
             "SerialFifo Qwen35 Warmup must call the family warmup helper"
         );
         assert!(
-            slot_worker.contains(
-                "let result = warmup_qwen35_once(guard.model, &supervisor)"
-            ),
+            slot_worker.contains("let result = warmup_qwen35_once(guard.model, &supervisor)"),
             "SlotAware Qwen35 Warmup must call the same family helper before typed fatal classification"
         );
         let obsolete_serial_noop = ["LoadedModel::Qwen35", "(_) => Ok(())"].concat();
@@ -58082,9 +58047,7 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
             let (events, mut receiver) = tokio::sync::mpsc::channel(32);
 
             router.emit(&events, wire).expect("slot stream emit");
-            let finish_override = router
-                .finish(&events, 8)
-                .expect("slot stream finalize");
+            let finish_override = router.finish(&events, 8).expect("slot stream finalize");
             assert_eq!(finish_override, Some("tool_calls"));
             assert!(
                 router.saw_answer_event(),

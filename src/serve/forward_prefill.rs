@@ -14,7 +14,6 @@
 //! - After all tokens: extract last-row logits, argmax → first decode token
 
 use anyhow::Result;
-use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use mlx_native::ops::flash_attn_vec::FlashAttnVecParams;
 use mlx_native::MlxBuffer;
 use std::ops::Range;
@@ -1544,18 +1543,20 @@ impl MlxModelWeights {
                     })?;
                     s.track_dispatch(&[st.embeddings], &[&self.activations.hidden]);
                 } else {
-                    mlx_native::ops::elementwise::embedding_gather_scale_f32(
-                        s.encoder_mut(),
+                    self.activations
+                        .embedding_token_id
+                        .as_mut_slice::<u32>()
+                        .map_err(|e| anyhow::anyhow!("prefill token id write: {e}"))?[0] = tok;
+                    crate::inference::models::gemma4::native_matrix::encode_embedding(
+                        &mut s,
                         reg,
-                        metal_dev,
+                        dev,
                         &self.embed_weight,
+                        &self.activations.embedding_token_id,
                         &self.activations.hidden,
-                        tok,
-                        hs,
-                        (hs as f32).sqrt(),
+                        1,
                     )
-                    .map_err(|e| anyhow::anyhow!("prefill embed T{tok_i}: {e}"))?;
-                    s.track_dispatch(&[&self.embed_weight], &[&self.activations.hidden]);
+                    .map_err(|e| anyhow::anyhow!("prefill native embed T{tok_i}: {e}"))?;
                 }
 
                 // --- 2. Transformer layers ---
@@ -2780,61 +2781,22 @@ impl MlxModelWeights {
                 )
                 .map_err(|e| anyhow::anyhow!("prefill final norm T{tok_i}: {e}"))?;
 
-                // ADR-028 iter-188: prefer Q6_K-native lm_head (HF2Q_LMHEAD_Q6K=1).
-                if let Some(ref q6k) = self.lm_head_q6k {
-                    s.barrier_between(
-                        &[&self.activations.norm_out, &q6k.buffer],
-                        &[&self.activations.logits],
-                    );
-                    crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                        &mut s,
-                        reg,
-                        dev,
-                        &self.activations.norm_out,
-                        q6k,
-                        &mut self.activations.logits,
-                        1,
-                        crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                    )
-                    .map_err(|e| anyhow::anyhow!("prefill lm_head Q6_K T{tok_i}: {e}"))?;
-                } else if let Some(ref q8) = self.lm_head_q8 {
-                    s.barrier_between(
-                        &[&self.activations.norm_out, &q8.buffer],
-                        &[&self.activations.logits],
-                    );
-                    crate::serve::forward_mlx_shared::dispatch_qmatmul(
-                        &mut s,
-                        reg,
-                        dev,
-                        &self.activations.norm_out,
-                        q8,
-                        &mut self.activations.logits,
-                        1,
-                        crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                    )
-                    .map_err(|e| anyhow::anyhow!("prefill lm_head Q8 T{tok_i}: {e}"))?;
-                } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-                    s.barrier_between(
-                        &[&self.activations.norm_out, lm_head_f16],
-                        &[&self.activations.logits],
-                    );
-                    mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
-                        s.encoder_mut(),
-                        reg,
-                        metal_dev,
-                        &self.activations.norm_out,
-                        lm_head_f16,
-                        &self.activations.logits,
-                        &DenseGemmF16Params {
-                            m: 1,
-                            n: vocab_size as u32,
-                            k: hs as u32,
-                        },
-                    )
-                    .map_err(|e| anyhow::anyhow!("prefill lm_head T{tok_i}: {e}"))?;
-                } else {
-                    anyhow::bail!("Prefill requires GPU lm_head (F16 or Q8 weight)");
-                }
+                let lm_head = self.resolved_lm_head();
+                s.barrier_between(
+                    &[&self.activations.norm_out, &lm_head.buffer],
+                    &[&self.activations.logits],
+                );
+                crate::serve::forward_mlx_shared::dispatch_qmatmul(
+                    &mut s,
+                    reg,
+                    dev,
+                    &self.activations.norm_out,
+                    lm_head,
+                    &self.activations.logits,
+                    1,
+                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+                )
+                .map_err(|e| anyhow::anyhow!("prefill native lm_head T{tok_i}: {e}"))?;
 
                 if let Some(cap) = self.final_logit_softcapping {
                     s.barrier_between(&[&self.activations.logits], &[&self.activations.logits]);

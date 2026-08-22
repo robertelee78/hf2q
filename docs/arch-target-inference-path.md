@@ -166,7 +166,8 @@ Weight buffers (persistent, loaded once):
     expert_down_3d: MlxBuffer [num_experts, hidden, intermediate] quantized
     norm weights: MlxBuffer [hidden] f32
     layer_scalar: MlxBuffer [1] f32
-  lm_head_f16: MlxBuffer [vocab, hidden] f16
+  output_head: MlxQWeight [vocab, hidden] in the declared GGUF encoding
+    (the tied case aliases embed_weight; no synthesized dense shadow)
 
 Activation buffers (transient, from pool):
   hidden_state: MlxBuffer [1, seq_len, hidden] f32

@@ -378,7 +378,6 @@ fn mtp_shared_head_borrows_the_supplied_main_buffer_without_a_second_allocation(
             cols: h,
         },
         affine: None,
-        f16_shadow: None,
         decode_record_q6k_m1: std::sync::OnceLock::new(),
     };
     let supplied_ptr = supplied.buffer.metal_buffer().as_ptr();

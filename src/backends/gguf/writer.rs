@@ -618,8 +618,9 @@ mod tests {
         let info = gguf.tensor_info("test.weight").expect("tensor present");
         assert_eq!(info.shape, vec![32]);
         assert_eq!(info.byte_len, 18);
-        // Q4_0 wire code = 2
-        assert_eq!(info.ggml_type as u32, 2);
+        // Assert the parsed storage type semantically. The Rust enum's
+        // discriminant is an implementation detail and is not the GGUF wire ID.
+        assert_eq!(info.ggml_type, mlx_native::GgmlType::Q4_0);
 
         // Tensor BYTES round-trip — read from the file at
         // (tensor_data_offset + info.offset), confirm equal to the

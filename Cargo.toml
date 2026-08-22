@@ -127,10 +127,10 @@ thiserror = "2"
 # machine-readable packed-affine capability contract and bounded D512
 # prefill-tail reads plus exact GGML routing/capability and host-side GGUF
 # evidence reads, typed resolved-dispatch traces, exact Q4_K inference, and
-# direct packed Q5_K/Q6_K embedding gathers, native scalar GGUF execution,
-# deterministic lowest-index argmax tie handling, truthful Metal commit
-# telemetry, raw GPU blits, and unequal-capacity banked TQ dispatch require
-# mlx-native 0.12.1.
+# direct packed Q4_0/Q5_K/Q6_K embedding gathers, native scalar GGUF execution,
+# mapped GGUF tensor ownership, deterministic lowest-index argmax tie handling,
+# truthful Metal commit telemetry, raw GPU blits, and unequal-capacity banked
+# TQ dispatch require mlx-native 0.12.1.
 mlx-native = "=0.12.1"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct

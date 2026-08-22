@@ -44,7 +44,7 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 enum DrafterEmbedding<'a> {
     F32(&'a [f32]),
-    NativeQ4K(&'a MlxQWeight),
+    Native(&'a MlxQWeight),
 }
 
 /// GPU drafter implementing Phase E4a's [`Drafter`] trait by running
@@ -144,10 +144,9 @@ impl<'a> GpuDrafter<'a> {
     ) -> Result<Self> {
         ensure!(
             embed_weight.affine.is_none()
-                && embed_weight.info.ggml_dtype == GgmlType::Q4_K
                 && embed_weight.info.rows == cfg.vocab_size
                 && embed_weight.info.cols == cfg.hidden_size,
-            "GpuDrafter::new_with_native_embedding: expected exact Q4_K [{}, {}], got {:?} [{}, {}]",
+            "GpuDrafter::new_with_native_embedding: expected native [{}, {}], got {:?} [{}, {}]",
             cfg.vocab_size,
             cfg.hidden_size,
             embed_weight.info.ggml_dtype,
@@ -160,7 +159,7 @@ impl<'a> GpuDrafter<'a> {
             device,
             registry,
             target_aux,
-            DrafterEmbedding::NativeQ4K(embed_weight),
+            DrafterEmbedding::Native(embed_weight),
             base_pos,
         )
     }
@@ -397,7 +396,7 @@ impl<'a> GpuDrafter<'a> {
                     .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: map output: {e}"))?
                     .copy_from_slice(&embed_table[start..end]);
             }
-            DrafterEmbedding::NativeQ4K(weight) => {
+            DrafterEmbedding::Native(weight) => {
                 let mut ids = self
                     .device
                     .alloc_buffer(4, DType::U32, vec![1])
@@ -409,21 +408,104 @@ impl<'a> GpuDrafter<'a> {
                     .device
                     .command_encoder()
                     .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: encoder: {e}"))?;
-                mlx_native::ops::embedding_q4_k::register(self.registry);
-                mlx_native::embedding_gather_q4_k(
-                    &mut enc,
-                    self.registry,
-                    self.device,
-                    &weight.buffer,
-                    &ids,
-                    &output,
-                    &mlx_native::EmbeddingQ4KParams {
-                        vocab_size: weight.info.rows,
-                        embed_dim: weight.info.cols,
-                        n_tokens: 1,
-                    },
-                )
-                .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: Q4_K gather: {e}"))?;
+                match weight.info.ggml_dtype {
+                    GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
+                        mlx_native::embedding_gather_dense(
+                            &mut enc,
+                            self.registry,
+                            self.device,
+                            &weight.buffer,
+                            &ids,
+                            &output,
+                            &mlx_native::EmbeddingDenseParams {
+                                vocab_size: weight.info.rows,
+                                embed_dim: weight.info.cols,
+                                n_tokens: 1,
+                            },
+                        )?
+                    }
+                    GgmlType::Q4_0 => mlx_native::ops::embedding_q4_0::embedding_gather_q4_0(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::ops::embedding_q4_0::EmbeddingQ4_0Params {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    GgmlType::Q2_K => mlx_native::embedding_gather_q2_k(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::EmbeddingQ2KParams {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    GgmlType::Q4_K => mlx_native::embedding_gather_q4_k(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::EmbeddingQ4KParams {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    GgmlType::Q5_K => mlx_native::embedding_gather_q5_k(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::EmbeddingQ5KParams {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    GgmlType::Q6_K => mlx_native::embedding_gather_q6_k(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::EmbeddingQ6KParams {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    GgmlType::Q8_0 => mlx_native::embedding_gather_q8_0(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::EmbeddingQ8_0Params {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    other => anyhow::bail!(
+                        "GpuDrafter::lookup_embedding_gpu: unadmitted native type {other:?}"
+                    ),
+                }
                 enc.commit_and_wait_labeled("eagle3.embedding.native")
                     .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: completion: {e}"))?;
             }
