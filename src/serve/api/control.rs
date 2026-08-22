@@ -125,6 +125,16 @@ fn engine_config_identity_json(
             serde_json::json!({"mode": "slot_aware", "max_slots": max_slots})
         }
     };
+    let projector = identity.projector.as_ref().map(|projector| {
+        serde_json::json!({
+            "artifact_sha256": projector.artifact_sha256,
+            "source_sha256": projector.source_sha256,
+            "pair_generation": projector.pair_generation,
+            "profile": projector.profile,
+            "weight_bytes": projector.weight_bytes,
+            "cache_budget_bytes": projector.cache_budget_bytes,
+        })
+    });
     serde_json::json!({
         "queue_capacity": identity.queue_capacity,
         "warmup_synchronously": identity.warmup_synchronously,
@@ -134,6 +144,7 @@ fn engine_config_identity_json(
         "explicit_tokenizer": identity.explicit_tokenizer,
         "explicit_config": identity.explicit_config,
         "dwq_overlay": identity.dwq_overlay,
+        "projector": projector,
     })
 }
 
@@ -169,11 +180,28 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
         .snapshot_engines()
         .into_iter()
         .map(|engine| {
+            let projector_cache_resident_bytes = engine
+                .projector
+                .as_ref()
+                .map(|projector| projector.vision_cache.resident_bytes() as u64)
+                .unwrap_or(0);
+            let projector_load_ms = engine
+                .projector
+                .as_ref()
+                .map(|projector| projector.load_duration_ms);
             serde_json::json!({
                 "pool_key": format!("{}@{}", engine.repo, engine.quant.as_str()),
                 "quant": engine.quant.as_str(),
                 "bytes_resident": engine.bytes_resident,
+                "resident_components": {
+                    "text_gguf_bytes": engine.resident_bytes.text_gguf_bytes,
+                    "projector_weight_bytes": engine.resident_bytes.projector_weight_bytes,
+                    "projector_cache_budget_bytes": engine.resident_bytes.projector_cache_budget_bytes,
+                    "projector_cache_resident_bytes": projector_cache_resident_bytes,
+                },
+                "projector_load_ms": projector_load_ms,
                 "generation": engine.generation,
+                "engine_load_ms": engine.engine.info().load_wall_clock.as_millis() as u64,
                 "engine_config": engine_config_identity_json(&engine.config_identity),
             })
         })
@@ -386,6 +414,7 @@ struct ActivationTarget {
     quant: QuantType,
     bytes: u64,
     request_model: String,
+    projector: Option<crate::serve::multi_model::ProjectorLoadSpec>,
     payload: ActivationPayload,
 }
 
@@ -404,7 +433,18 @@ impl ActivationTarget {
         cancellation: super::cancellation::CancellationSignal,
         supervisor: super::cancellation::PreparationSupervisor,
         catalog: &ArtifactCatalogCoordinator,
-    ) -> std::result::Result<(String, QuantType, std::path::PathBuf, u64, String), Response> {
+    ) -> std::result::Result<
+        (
+            String,
+            QuantType,
+            std::path::PathBuf,
+            u64,
+            String,
+            Option<crate::serve::multi_model::ProjectorLoadSpec>,
+        ),
+        Response,
+    > {
+        let mut projector = self.projector;
         let (path, validate_catalog_type) = match self.payload {
             ActivationPayload::ExplicitLocal(path) => (path, false),
             ActivationPayload::VerifiedLocal(artifact) => {
@@ -440,7 +480,14 @@ impl ActivationTarget {
             }
         };
         if !validate_catalog_type {
-            return Ok((self.repo, self.quant, path, self.bytes, self.request_model));
+            return Ok((
+                self.repo,
+                self.quant,
+                path,
+                self.bytes,
+                self.request_model,
+                projector,
+            ));
         }
         let actual = mlx_native::gguf::GgufFile::open(&path).map_err(|error| {
             ApiError::invalid_request(
@@ -461,8 +508,87 @@ impl ActivationTarget {
             )
             .into_response());
         }
-        Ok((self.repo, self.quant, path, self.bytes, self.request_model))
+        if projector.is_none() {
+            let (resolved, _) = activation_projector_spec(&path, self.bytes)?;
+            projector = resolved;
+        }
+        let bytes = activation_pair_bytes(self.bytes, projector.as_ref())?;
+        Ok((
+            self.repo,
+            self.quant,
+            path,
+            bytes,
+            self.request_model,
+            projector,
+        ))
     }
+}
+
+fn activation_projector_spec(
+    text_path: &std::path::Path,
+    text_bytes: u64,
+) -> std::result::Result<(Option<crate::serve::multi_model::ProjectorLoadSpec>, u64), Response> {
+    let projector_path = crate::serve::auto_pipeline::resolve_projector_companion(text_path, None)
+        .map_err(|error| {
+            ApiError::invalid_request(
+                format!("cannot resolve exact text/projector pair: {error}"),
+                Some("model".into()),
+            )
+            .into_response()
+        })?;
+    let projector = match projector_path {
+        Some(path) => {
+            let text = mlx_native::gguf::GgufFile::open(text_path).map_err(|error| {
+                ApiError::invalid_request(
+                    format!("cannot open text artifact for pair identity: {error}"),
+                    Some("model".into()),
+                )
+                .into_response()
+            })?;
+            let expected = text
+                .metadata_string(crate::core::provenance::KEY_MMPROJ_SHA256)
+                .map(str::to_owned);
+            Some(
+                crate::serve::multi_model::ProjectorLoadSpec::preflight(
+                    path,
+                    expected,
+                    crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES as u64,
+                )
+                .map_err(|error| {
+                    ApiError::invalid_request(
+                        format!("projector preflight failed: {error}"),
+                        Some("model".into()),
+                    )
+                    .into_response()
+                })?,
+            )
+        }
+        None => None,
+    };
+    let bytes = activation_pair_bytes(text_bytes, projector.as_ref())?;
+    Ok((projector, bytes))
+}
+
+fn activation_pair_bytes(
+    text_bytes: u64,
+    projector: Option<&crate::serve::multi_model::ProjectorLoadSpec>,
+) -> std::result::Result<u64, Response> {
+    let components = match projector {
+        Some(projector) => crate::serve::multi_model::ResidentByteComponents::new(
+            text_bytes,
+            projector.projected_weight_bytes,
+            projector.cache_budget_bytes,
+        ),
+        None => Ok(crate::serve::multi_model::ResidentByteComponents::text_only(text_bytes)),
+    }
+    .map_err(|error| {
+        ApiError::invalid_request(
+            format!("model/projector resident-byte accounting failed: {error}"),
+            Some("model".into()),
+        )
+        .into_response()
+    })?;
+    Ok(components.total_bytes())
 }
 
 async fn verify_local_gguf_cancellable(
@@ -643,6 +769,7 @@ async fn resolve_activation_target(
                     quant,
                     bytes: artifact.bytes,
                     request_model: artifact.request_model(),
+                    projector: None,
                     payload: ActivationPayload::Hosted(artifact),
                 })
             }
@@ -665,11 +792,13 @@ async fn resolve_activation_target(
                     "local://{}@{}/{}",
                     artifact.repository, artifact.revision, candidate_id
                 );
+                let (projector, bytes) = activation_projector_spec(&artifact.path, artifact.bytes)?;
                 Ok(ActivationTarget {
                     repo: request_model.clone(),
                     quant,
-                    bytes: artifact.bytes,
+                    bytes,
                     request_model,
+                    projector,
                     payload: ActivationPayload::VerifiedLocal(artifact),
                 })
             }
@@ -731,12 +860,14 @@ async fn resolve_activation_target(
             .into_response()
         })?
         .len();
+    let (projector, bytes) = activation_projector_spec(&gguf_path, bytes)?;
     let repo = crate::serve::pool_key_for_path(&gguf_path);
     Ok(ActivationTarget {
         request_model: repo.clone(),
         repo,
         quant,
         bytes,
+        projector,
         payload: ActivationPayload::ExplicitLocal(gguf_path),
     })
 }
@@ -985,7 +1116,7 @@ pub async fn activate_model(
                     _ => plan,
                 }
             };
-            let (repo, quant, gguf_path, bytes, request_model) = match target
+            let (repo, quant, gguf_path, bytes, request_model, projector) = match target
                 .materialize(
                     cancellation.0.clone(),
                     state.preparations.clone(),
@@ -996,10 +1127,11 @@ pub async fn activate_model(
                 Ok(materialized) => materialized,
                 Err(response) => return response,
             };
-            let engine_config = match activation_engine_config(&state, &gguf_path) {
+            let mut engine_config = match activation_engine_config(&state, &gguf_path) {
                 Ok(config) => config,
                 Err(response) => return response,
             };
+            engine_config.projector = projector;
             // The pool may have changed during preparation. Re-plan under the
             // exclusive gate and publish only if admission is still
             // non-evicting.
@@ -1154,7 +1286,7 @@ pub async fn activate_model(
                     return lifecycle_error_response(error);
                 }
             }
-            let (repo, quant, gguf_path, bytes, request_model) = match target
+            let (repo, quant, gguf_path, bytes, request_model, projector) = match target
                 .materialize(
                     cancellation.0,
                     state.preparations.clone(),
@@ -1165,10 +1297,11 @@ pub async fn activate_model(
                 Ok(materialized) => materialized,
                 Err(response) => return response,
             };
-            let engine_config = match activation_engine_config(&state, &gguf_path) {
+            let mut engine_config = match activation_engine_config(&state, &gguf_path) {
                 Ok(config) => config,
                 Err(response) => return response,
             };
+            engine_config.projector = projector;
             let confirmation = SwitchConfirmation {
                 candidate_repo: repo.clone(),
                 candidate_quant: quant,
@@ -1281,6 +1414,30 @@ mod tests {
         assert_eq!(diagnostic_quant_from_file_type(0), None);
     }
 
+    #[test]
+    fn projector_config_receipt_is_exact_and_path_free() {
+        let identity = crate::serve::multi_model::EngineConfigIdentity {
+            projector: Some(crate::serve::multi_model::ProjectorConfigIdentity {
+                artifact_sha256: "a".repeat(64),
+                source_sha256: Some("b".repeat(64)),
+                pair_generation: Some("pair-generation-7".into()),
+                profile: "qwen3vl_siglip".into(),
+                weight_bytes: 123,
+                cache_budget_bytes: 456,
+            }),
+            ..crate::serve::multi_model::EngineConfigIdentity::default()
+        };
+        let receipt = engine_config_identity_json(&identity);
+        assert_eq!(receipt["projector"]["artifact_sha256"], "a".repeat(64));
+        assert_eq!(receipt["projector"]["source_sha256"], "b".repeat(64));
+        assert_eq!(receipt["projector"]["pair_generation"], "pair-generation-7");
+        assert_eq!(receipt["projector"]["weight_bytes"], 123);
+        assert_eq!(receipt["projector"]["cache_budget_bytes"], 456);
+        let encoded = serde_json::to_string(&receipt).unwrap();
+        assert!(!encoded.contains("/opt/"));
+        assert!(!encoded.contains(".gguf"));
+    }
+
     #[tokio::test]
     async fn post_commit_load_failure_requires_restart() {
         let response = lifecycle_error_response(LifecycleError::LoadFailed(
@@ -1297,7 +1454,17 @@ mod tests {
     async fn local_candidate_is_repository_bound_and_keeps_path_server_private() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("model.gguf");
-        std::fs::write(&path, b"GGUF fixture").unwrap();
+        let mut gguf = Vec::new();
+        gguf.extend_from_slice(b"GGUF");
+        gguf.extend_from_slice(&3u32.to_le_bytes());
+        gguf.extend_from_slice(&0u64.to_le_bytes());
+        gguf.extend_from_slice(&1u64.to_le_bytes());
+        let key = b"general.file_type";
+        gguf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        gguf.extend_from_slice(key);
+        gguf.extend_from_slice(&4u32.to_le_bytes());
+        gguf.extend_from_slice(&QuantType::Q4_K_M.gguf_file_type().to_le_bytes());
+        std::fs::write(&path, &gguf).unwrap();
         let state = AppState::new(super::super::state::ServerConfig::default());
         let view = state
             .artifact_catalog
@@ -1308,7 +1475,7 @@ mod tests {
                     filename: "model.gguf".into(),
                     root: root.path().to_path_buf(),
                     path: path.clone(),
-                    bytes: 12,
+                    bytes: gguf.len() as u64,
                     sha256: "b".repeat(64),
                     quant_hint: "Q4_K_M".into(),
                     quant: Some(QuantType::Q4_K_M),

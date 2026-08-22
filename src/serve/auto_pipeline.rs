@@ -135,6 +135,10 @@ fn map_quant_to_cli(quant: QuantType) -> &'static str {
 pub struct ResolvedModel {
     /// Final filesystem path to a GGUF ready for `mlx_native::gguf::GgufFile::open`.
     pub gguf_path: PathBuf,
+    /// Exact projector companion selected for this text artifact. `None`
+    /// means text-only; callers must never inherit a projector from another
+    /// resident generation.
+    pub mmproj_path: Option<PathBuf>,
     /// `Some` when the auto-pipeline ran (HF input); `None` for a path passthrough.
     pub repo_id: Option<String>,
     /// `Some` when the auto-pipeline ran; `None` for a path passthrough.
@@ -168,6 +172,7 @@ pub fn resolve_or_prepare_model(
     let input = classify_model_input(model_arg)?;
     match input {
         ModelInput::Path(p) => Ok(ResolvedModel {
+            mmproj_path: resolve_projector_companion(&p, None)?,
             gguf_path: p,
             repo_id: None,
             quant: None,
@@ -240,10 +245,11 @@ fn run_auto_pipeline(
         .with_context(|| format!("stat produced GGUF: {}", target_gguf.display()))?
         .len();
     let sha256 = sha256_file(&target_gguf)?;
+    let mmproj_path = resolve_projector_companion(&target_gguf, None)?;
     let entry = QuantEntry {
         quant_type: quant.as_str().to_string(),
         gguf_path: target_gguf.clone(),
-        mmproj_path: None,
+        mmproj_path: mmproj_path.clone(),
         bytes,
         sha256,
         quantized_at_secs: secs_since_epoch(),
@@ -263,6 +269,7 @@ fn run_auto_pipeline(
 
     Ok(ResolvedModel {
         gguf_path: target_gguf,
+        mmproj_path,
         repo_id: Some(repo_id.to_string()),
         quant: Some(quant),
         from_cache: false,
@@ -335,6 +342,7 @@ fn lookup_and_verify(
             quant.as_str()
         )
     })?;
+    let mmproj_path = resolve_projector_companion(&path, entry.mmproj_path.as_deref())?;
     tracing::info!(
         repo = repo_id,
         quant = quant.as_str(),
@@ -343,10 +351,56 @@ fn lookup_and_verify(
     );
     Ok(Some(ResolvedModel {
         gguf_path: path,
+        mmproj_path,
         repo_id: Some(repo_id.to_string()),
         quant: Some(quant),
         from_cache: true,
     }))
+}
+
+fn default_projector_companion(text_path: &Path) -> Result<PathBuf> {
+    let file_name = text_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("text GGUF must have a UTF-8 filename"))?;
+    let stem = file_name
+        .strip_suffix(".gguf")
+        .or_else(|| file_name.strip_suffix(".GGUF"))
+        .ok_or_else(|| anyhow!("text artifact must end in .gguf"))?;
+    Ok(text_path.with_file_name(format!("{stem}-mmproj.gguf")))
+}
+
+/// Resolve a projector only from explicit catalog state or an exact hf2q
+/// text-artifact binding. Shape-compatible siblings without a binding are
+/// deliberately ignored; that is the stale-global inheritance failure this
+/// lifecycle closes.
+pub(crate) fn resolve_projector_companion(
+    text_path: &Path,
+    catalog_path: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    // Preserve path-passthrough classification: the actual loader remains the
+    // authority for malformed GGUF errors. A header we cannot inspect cannot
+    // advertise or inherit a projector, so resolution safely stays text-only.
+    let Ok(text_gguf) = mlx_native::gguf::GgufFile::open(text_path) else {
+        return Ok(None);
+    };
+    let expected_digest = text_gguf
+        .metadata_string(crate::core::provenance::KEY_MMPROJ_SHA256)
+        .map(str::to_owned);
+    let candidate = match catalog_path {
+        Some(path) => Some(path.to_path_buf()),
+        None if expected_digest.is_some() => Some(default_projector_companion(text_path)?),
+        None => None,
+    };
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        candidate.is_file(),
+        "text/projector pair is incomplete: projector missing at {}",
+        candidate.display()
+    );
+    Ok(Some(candidate))
 }
 
 fn verify_quant_identity(path: &Path, expected: QuantType) -> Result<()> {

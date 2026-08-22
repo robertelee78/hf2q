@@ -42,6 +42,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use mlx_native::gguf::GgufFile;
+use mlx_native::metal::foreign_types::ForeignType;
 use mlx_native::{MlxBuffer, MlxDevice};
 
 // W59 ADR-005 Phase 2c iter-128: route F16-stored mmproj tensors through
@@ -94,6 +95,39 @@ impl std::fmt::Debug for LoadedMmprojWeights {
 }
 
 impl LoadedMmprojWeights {
+    /// Exact Metal allocation bytes the current loader will create for the
+    /// projector's original GGUF tensor inventory, before any zero-copy slice
+    /// views are installed. F16 stays native; every other supported storage
+    /// type follows `load_tensor_f32` and therefore expands to four bytes per
+    /// logical element.
+    pub fn projected_unique_owned_bytes(gguf: &GgufFile) -> Result<u64> {
+        gguf.tensor_names()
+            .into_iter()
+            .try_fold(0u64, |total, name| {
+                let info = gguf.tensor_info(name).ok_or_else(|| {
+                    anyhow!("mmproj tensor inventory changed during preflight: {name}")
+                })?;
+                let bytes = if info.ggml_type == GgmlType::F16 {
+                    u64::try_from(info.byte_len)
+                        .map_err(|_| anyhow!("mmproj F16 tensor byte length exceeds u64: {name}"))?
+                } else {
+                    let elements =
+                        info.shape.iter().try_fold(1u64, |n, dim| {
+                            n.checked_mul(u64::try_from(*dim).map_err(|_| {
+                                anyhow!("mmproj tensor dimension exceeds u64: {name}")
+                            })?)
+                            .ok_or_else(|| anyhow!("mmproj tensor element count overflow: {name}"))
+                        })?;
+                    elements
+                        .checked_mul(std::mem::size_of::<f32>() as u64)
+                        .ok_or_else(|| anyhow!("mmproj F32 tensor byte count overflow: {name}"))?
+                };
+                total
+                    .checked_add(bytes)
+                    .ok_or_else(|| anyhow!("mmproj projected resident-byte count overflow"))
+            })
+    }
+
     /// Load every tensor from the GGUF file onto the supplied device
     /// as F32. Arch-agnostic — walks `gguf.tensor_names()` and doesn't
     /// assume a particular naming convention, so it transparently
@@ -377,6 +411,28 @@ impl LoadedMmprojWeights {
         self.tensors.is_empty()
     }
 
+    /// Sum unique Metal backing allocations owned by this projector.
+    ///
+    /// `LoadedMmprojWeights` may install multiple logical tensor views over
+    /// one fused QKV allocation, and future mapped loading may expose several
+    /// tensors through one large mapped Metal buffer. `byte_len()` describes
+    /// the backing allocation, so deduplicating by the stable Metal object
+    /// pointer counts either representation exactly once.
+    pub fn unique_owned_bytes(&self) -> Result<u64> {
+        let mut seen = std::collections::HashSet::with_capacity(self.tensors.len());
+        self.tensors.values().try_fold(0u64, |total, buffer| {
+            let allocation = buffer.metal_buffer().as_ptr() as usize;
+            if !seen.insert(allocation) {
+                return Ok(total);
+            }
+            let bytes = u64::try_from(buffer.byte_len())
+                .map_err(|_| anyhow!("mmproj Metal allocation length exceeds u64"))?;
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow!("mmproj unique resident-byte count overflow"))
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Stem shortcuts. Each returns the buffer when present OR errors with
     // a specific name — matches what a forward-pass call-site needs.
@@ -629,6 +685,24 @@ mod tests {
     /// existence so CI without the fixture skips them cleanly.
     const GEMMA4_MMPROJ_PATH: &str =
         "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf";
+
+    #[test]
+    fn unique_owned_bytes_counts_shared_slice_backing_once() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let fused = alloc_f32_with(&device, 48, vec![12, 4], |i| i as f32);
+        let allocation_bytes = fused.byte_len() as u64;
+        let mut tensors = HashMap::new();
+        tensors.insert("v.blk.0.attn_qkv.weight".to_owned(), fused.clone());
+        tensors.insert("v.blk.0.attn_q.weight".to_owned(), fused.slice_view(0, 16));
+        tensors.insert("v.blk.0.attn_k.weight".to_owned(), fused.slice_view(64, 16));
+        tensors.insert(
+            "v.blk.0.attn_v.weight".to_owned(),
+            fused.slice_view(128, 16),
+        );
+        let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
+        assert_eq!(weights.unique_owned_bytes().unwrap(), allocation_bytes);
+    }
 
     #[test]
     fn load_gemma4_mmproj_populates_arch_tensors() {

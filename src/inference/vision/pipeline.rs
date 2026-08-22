@@ -193,12 +193,12 @@ impl VisionEmbeddingCache {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn resident_bytes(&self) -> usize {
-        self.state
-            .lock()
-            .expect("vision cache test lock")
-            .resident_bytes
+    pub fn resident_bytes(&self) -> usize {
+        self.state.lock().expect("vision cache lock").resident_bytes
+    }
+
+    pub const fn byte_budget(&self) -> usize {
+        self.byte_budget
     }
 }
 

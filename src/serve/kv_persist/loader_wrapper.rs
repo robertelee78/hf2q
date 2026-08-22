@@ -395,6 +395,15 @@ where
             )
         })
     }
+
+    fn load_projector(
+        &self,
+        text_path: &Path,
+        engine: &E,
+        spec: &crate::serve::multi_model::ProjectorLoadSpec,
+    ) -> Result<crate::serve::api::state::LoadedMmproj> {
+        self.inner.load_projector(text_path, engine, spec)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +533,7 @@ mod tests {
                 // SerialFifo (ADR-005 byte-equivalent path).
                 engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
                 kv_cache_budget_bytes: None,
+                projector: None,
             },
         )
     }

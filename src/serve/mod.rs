@@ -1080,6 +1080,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "mmproj".into());
+                let weights_resident_bytes = weights.unique_owned_bytes()?;
                 tracing::info!(
                     path = %mmp_path.display(),
                     image_size = mmp_config.image_size,
@@ -1106,6 +1107,13 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                     }
                     crate::core::provenance::Provenance::External => None,
                 },
+                pair_generation: mmp_gguf
+                    .metadata_string(crate::core::paired_artifact::KEY_PAIR_GENERATION)
+                    .map(str::to_owned),
+                weights_resident_bytes,
+                cache_budget_bytes:
+                    crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES as u64,
+                load_duration_ms: 0,
                 vision_cache: std::sync::Arc::new(
                     crate::inference::vision::pipeline::VisionEmbeddingCache::new(
                         crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
@@ -3981,6 +3989,141 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     Ok(engine)
 }
 
+/// Load, validate, and warm one projector for an already-warmed text engine.
+/// The caller publishes neither payload until this function succeeds.
+pub(crate) fn load_serving_projector(
+    text_path: &Path,
+    text_engine: &api::engine::Engine,
+    spec: &multi_model::ProjectorLoadSpec,
+) -> Result<api::state::LoadedMmproj> {
+    let load_started = std::time::Instant::now();
+    anyhow::ensure!(
+        spec.path.exists(),
+        "mmproj not found: {}",
+        spec.path.display()
+    );
+    let pair_guard = crate::core::paired_artifact::PairReadGuard::acquire(text_path, &spec.path)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let text_gguf = mlx_native::gguf::GgufFile::open(text_path)
+        .map_err(|error| anyhow::anyhow!("text GGUF pair preflight failed: {error}"))?;
+    let gguf = mlx_native::gguf::GgufFile::open(&spec.path)
+        .map_err(|error| anyhow::anyhow!("mmproj GGUF header parse failed: {error}"))?;
+    let artifact_sha256 = crate::core::sha256::compute_file_sha256(&spec.path)
+        .with_context(|| format!("hash vision projector '{}'", spec.path.display()))?;
+    anyhow::ensure!(
+        artifact_sha256 == spec.artifact_sha256,
+        "vision projector digest changed after artifact resolution"
+    );
+    pair_guard
+        .validate(&text_gguf, &gguf, &artifact_sha256)
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+    let config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&gguf)
+        .map_err(|error| anyhow::anyhow!("mmproj GGUF config parse failed: {error}"))?;
+    let actual_names: Vec<&str> = gguf.tensor_names();
+    crate::inference::vision::mmproj::validate_tensor_set(&config, &actual_names)
+        .map_err(|error| anyhow::anyhow!("mmproj GGUF tensor-set validation: {error}"))?;
+    let arch = crate::inference::vision::mmproj::detect_arch_profile_with_projector(
+        &config.projector,
+        &actual_names,
+    );
+    anyhow::ensure!(
+        arch.is_supported(),
+        "mmproj arch profile is Unknown — hf2q cannot dispatch this projector"
+    );
+    let provenance = crate::core::provenance::detect(&gguf);
+    let source_sha256 = match &provenance {
+        crate::core::provenance::Provenance::Hf2q { source_sha256, .. } => {
+            Some(source_sha256.clone())
+        }
+        crate::core::provenance::Provenance::External => None,
+    };
+    validate_mmproj_text_binding(
+        text_engine.vision_consumer_contract(),
+        arch,
+        config.projection_dim,
+        config.deepstack_indexes.as_ref().map_or(0, Vec::len),
+        source_sha256.as_deref(),
+        Some(&artifact_sha256),
+    )?;
+
+    let skip_load = std::env::var("HF2Q_SKIP_MMPROJ_LOAD").as_deref() == Ok("1");
+    let skip_warmup = std::env::var("HF2Q_SKIP_VIT_WARMUP").as_deref() == Ok("1");
+    validate_mmproj_diagnostic_mode(
+        skip_load,
+        skip_warmup,
+        std::env::var("HF2Q_UNSAFE_EXPERIMENTS").as_deref() == Ok("1"),
+    )?;
+    let device = mlx_native::MlxDevice::new()
+        .map_err(|error| anyhow::anyhow!("create MlxDevice for mmproj load: {error}"))?;
+    let weights = if skip_load {
+        tracing::warn!("HF2Q_SKIP_MMPROJ_LOAD=1 — using empty generation-owned projector weights");
+        crate::inference::vision::mmproj_weights::LoadedMmprojWeights::empty(device)
+    } else {
+        crate::inference::vision::mmproj_weights::LoadedMmprojWeights::load(&gguf, &config, device)
+            .map_err(|error| anyhow::anyhow!("mmproj weight load: {error}"))?
+    };
+    let weights_resident_bytes = weights.unique_owned_bytes()?;
+    if !skip_load {
+        anyhow::ensure!(
+            weights_resident_bytes == spec.projected_weight_bytes,
+            "projector resident-byte preflight changed during load: projected {}, loaded {}",
+            spec.projected_weight_bytes,
+            weights_resident_bytes
+        );
+    }
+    if !skip_warmup {
+        crate::inference::vision::vit_gpu::warmup_vit_gpu(
+            &weights,
+            &config,
+            arch,
+            text_engine.hidden_size(),
+        )
+        .with_context(|| {
+            format!(
+                "vision projector warmup failed for '{}' ({})",
+                spec.path.display(),
+                arch.as_str()
+            )
+        })?;
+    }
+    let cache_budget = usize::try_from(spec.cache_budget_bytes)
+        .map_err(|_| anyhow::anyhow!("vision cache budget exceeds usize"))?;
+    let model_id = spec
+        .path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mmproj".to_owned());
+    let pair_generation = gguf
+        .metadata_string(crate::core::paired_artifact::KEY_PAIR_GENERATION)
+        .map(str::to_owned);
+    let loaded = api::state::LoadedMmproj {
+        gguf_path: spec.path.clone(),
+        config,
+        arch,
+        weights: std::sync::Arc::new(weights),
+        model_id,
+        artifact_sha256,
+        source_sha256,
+        pair_generation,
+        weights_resident_bytes,
+        cache_budget_bytes: spec.cache_budget_bytes,
+        load_duration_ms: load_started.elapsed().as_millis() as u64,
+        vision_cache: std::sync::Arc::new(
+            crate::inference::vision::pipeline::VisionEmbeddingCache::new(cache_budget),
+        ),
+    };
+    tracing::info!(
+        path = %loaded.gguf_path.display(),
+        pair_generation = ?loaded.pair_generation,
+        weights_resident_bytes = loaded.weights_resident_bytes,
+        cache_budget_bytes = loaded.cache_budget_bytes,
+        elapsed_ms = loaded.load_duration_ms,
+        "Loaded generation-owned vision projector"
+    );
+    Ok(loaded)
+}
+
 /// Run the `serve` subcommand — start the OpenAI-compatible HTTP API server.
 ///
 /// ADR-005 Phase 2a iter-2 backbone: exposes `/health`, `/readyz`,
@@ -4322,6 +4465,10 @@ pub fn cmd_serve(
     if let Some(fd) = args.chat_parent_lifeline_fd {
         start_chat_parent_lifeline(fd)?;
     }
+    anyhow::ensure!(
+        args.mmproj.is_none() || args.model.is_some(),
+        "--mmproj requires --model so hf2q can own and validate the complete text/projector pair"
+    );
 
     operator_ui::validate_mode(args.operator_ui, matches!(log_format, cli::LogFormat::Text))?;
 
@@ -4423,13 +4570,6 @@ pub fn cmd_serve(
         .model
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
-    let pair_read_guard = match (args.model.as_ref(), args.mmproj.as_ref()) {
-        (Some(text), Some(projector)) => Some(
-            crate::core::paired_artifact::PairReadGuard::acquire(text, projector)
-                .map_err(|error| anyhow::anyhow!(error))?,
-        ),
-        _ => None,
-    };
     let local_artifacts =
         api::local_artifacts::LocalArtifactInventory::for_serve(&args.model_dirs)?;
     let mut state = api::AppState::new_for_serve(
@@ -4450,6 +4590,7 @@ pub fn cmd_serve(
         dwq_overlay_path: None,
         engine_mode,
         kv_cache_budget_bytes,
+        projector: None,
     });
 
     // --- ADR-017 Phase C.1 — optional persistent block-prefix KV cache ---
@@ -4878,6 +5019,7 @@ pub fn cmd_serve(
     // Filesystem-path passthrough uses the file stem as the pool's `repo`
     // key and the exact `general.file_type` as its quant identity.
     let mut startup_engine_for_banner: Option<api::engine::Engine> = None;
+    let mut startup_vision_projector: Option<load_info::VisionProjector> = None;
     if let Some(model_arg) = default_model_arg.as_ref() {
         let mut cache_guard = state
             .cache
@@ -4923,6 +5065,13 @@ pub fn cmd_serve(
         engine_config.tokenizer_path = args.tokenizer.clone();
         engine_config.config_path = args.config.clone();
         engine_config.dwq_overlay_path = args.dwq_overlay.clone();
+        if let Some(projector_path) = args.mmproj.as_ref().or(resolved.mmproj_path.as_ref()) {
+            engine_config.projector = Some(multi_model::ProjectorLoadSpec::preflight(
+                projector_path,
+                None,
+                crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES as u64,
+            )?);
+        }
         state.register_engine_config_for_path(&resolved.gguf_path, engine_config.clone())?;
         // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for
         // the about-to-fire load_or_get. Synchronous contract — see
@@ -4939,6 +5088,14 @@ pub fn cmd_serve(
             .load_or_get(&pool_repo, pool_quant, &resolved.gguf_path, &engine_config)
             .map_err(|e| anyhow::anyhow!("startup pre-warm: {e}"))?;
         startup_engine_for_banner = Some(loaded_engine.engine.clone());
+        startup_vision_projector =
+            loaded_engine
+                .projector
+                .as_ref()
+                .map(|projector| load_info::VisionProjector {
+                    mmproj_path: projector.gguf_path.clone(),
+                    mmproj_sha256: Some(projector.artifact_sha256.clone()),
+                });
         drop(pool_guard);
         tracing::info!(
             repo = %pool_repo,
@@ -5060,194 +5217,10 @@ pub fn cmd_serve(
         None
     };
 
-    // --- Optionally validate + load the mmproj (multimodal projector) ---
-    // Header parse only; weight loading lands alongside the ViT forward
-    // pass (ADR-005 Phase 2c Task #15). Fail fast if the file is absent
-    // or malformed so the server never advertises multimodal capability
-    // it can't back.
-    let (mmproj, startup_vision_projector) = if let Some(mmp_path) = args.mmproj.as_ref() {
-        anyhow::ensure!(
-            mmp_path.exists(),
-            "mmproj not found: {}",
-            mmp_path.display()
-        );
-        let gguf = mlx_native::gguf::GgufFile::open(mmp_path)
-            .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
-        let mmproj_sha256 = crate::core::sha256::compute_file_sha256(mmp_path)
-            .with_context(|| format!("hash vision projector '{}'", mmp_path.display()))?;
-        let text_path = args.model.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--mmproj requires --model so hf2q can lock and validate the complete pair"
-            )
-        })?;
-        let text_gguf = mlx_native::gguf::GgufFile::open(text_path)
-            .map_err(|error| anyhow::anyhow!("text GGUF pair preflight failed: {error}"))?;
-        pair_read_guard
-            .as_ref()
-            .expect("pair guard acquired whenever --model and --mmproj are present")
-            .validate(&text_gguf, &gguf, &mmproj_sha256)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        let mmp_config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&gguf)
-            .map_err(|e| anyhow::anyhow!("mmproj GGUF config parse failed: {e}"))?;
-        // Walk the GGUF's tensor list against the arch-agnostic
-        // required set (iter 30 + iter 31). Fails fast on an incomplete
-        // producer rather than hitting NotFound mid-forward-pass.
-        let actual_names: Vec<&str> = gguf.tensor_names();
-        crate::inference::vision::mmproj::validate_tensor_set(&mmp_config, &actual_names)
-            .map_err(|e| anyhow::anyhow!("mmproj GGUF tensor-set validation: {e}"))?;
-        // Detect the arch profile so forward-pass dispatch knows
-        // which per-block-norm shape to expect (Gemma 4 SigLIP vs
-        // classic CLIP vs Qwen3-VL SigLIP vs Unknown).
-        //
-        // 2026-05-02 Wedge-4c.5 Phase-2c (Codex review of 2eb1e36):
-        // call the projector-aware detector here, NOT the tensor-only
-        // `detect_arch_profile`. Real Qwen3-VL GGUFs may flag DeepStack
-        // at indices > 0 (e.g. [3, 7, 15, 23] for a 24-layer ViT),
-        // which would leave `v.deepstack.0.fc1.weight` absent and the
-        // tensor-only detector would emit `Unknown`, blocking even
-        // text-only chat against a perfectly valid Qwen3-VL projector.
-        // The parsed `MmprojConfig.projector` is the upstream-most
-        // signal (`clip.cpp:865-867` gates the qwen3vl builder on it).
-        let arch = crate::inference::vision::mmproj::detect_arch_profile_with_projector(
-            &mmp_config.projector,
-            &actual_names,
-        );
-        let mmproj_provenance = crate::core::provenance::detect(&gguf);
-        let mmproj_source_sha256 = match &mmproj_provenance {
-            crate::core::provenance::Provenance::Hf2q { source_sha256, .. } => {
-                Some(source_sha256.as_str())
-            }
-            crate::core::provenance::Provenance::External => None,
-        };
-        if !arch.is_supported() {
-            anyhow::bail!(
-                "mmproj arch profile is Unknown — neither Gemma 4 \
-                 SigLIP markers (ln1/ln2/post_ffw_norm) nor CLIP marker \
-                 (attn_norm) found in block 0. hf2q's ViT forward pass \
-                 cannot dispatch on this file."
-            );
-        }
-        let text_engine = startup_engine_for_banner.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--mmproj requires --model so hf2q can prove the projector/text-model binding before loading GPU weights"
-            )
-        })?;
-        validate_mmproj_text_binding(
-            text_engine.vision_consumer_contract(),
-            arch,
-            mmp_config.projection_dim,
-            mmp_config.deepstack_indexes.as_ref().map_or(0, Vec::len),
-            mmproj_source_sha256,
-            Some(mmproj_sha256.as_str()),
-        )?;
-        // Load every tensor onto the Metal device. For Gemma 4 this is
-        // ~400MB / 356 tensors / ~10s cold-cache on M5 Max.
-        //
-        // Iter-103 added the `HF2Q_SKIP_MMPROJ_LOAD=1` escape hatch
-        // for bisecting the chat-warmup-logits-go-NaN bug: if
-        // skipping the mmproj weight load (just keep the config +
-        // arch detection) makes chat warmup produce valid logits,
-        // the bug is in `LoadedMmprojWeights::load`'s buffer-alloc
-        // / dequant path; if NaN persists, the bug is somewhere
-        // earlier (the GGUF mmap itself).
-        let skip_mmproj_load = std::env::var("HF2Q_SKIP_MMPROJ_LOAD").as_deref() == Ok("1");
-        let skip_vit_warmup = std::env::var("HF2Q_SKIP_VIT_WARMUP").as_deref() == Ok("1");
-        validate_mmproj_diagnostic_mode(
-            skip_mmproj_load,
-            skip_vit_warmup,
-            std::env::var("HF2Q_UNSAFE_EXPERIMENTS").as_deref() == Ok("1"),
-        )?;
-        let device = mlx_native::MlxDevice::new()
-            .map_err(|e| anyhow::anyhow!("create MlxDevice for mmproj load: {e}"))?;
-        let mmp_weights = if skip_mmproj_load {
-            tracing::warn!(
-                "HF2Q_SKIP_MMPROJ_LOAD=1 — using empty mmproj weights; \
-                 vision requests will 500 on first forward attempt"
-            );
-            crate::inference::vision::mmproj_weights::LoadedMmprojWeights::empty(device)
-        } else {
-            crate::inference::vision::mmproj_weights::LoadedMmprojWeights::load(
-                &gguf,
-                &mmp_config,
-                device,
-            )
-            .map_err(|e| anyhow::anyhow!("mmproj weight load: {e}"))?
-        };
-        let model_id = mmp_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "mmproj".into());
-        tracing::info!(
-            path = %mmp_path.display(),
-            image_size = mmp_config.image_size,
-            patch_size = mmp_config.patch_size,
-            hidden = mmp_config.hidden_size,
-            layers = mmp_config.num_hidden_layers,
-            projector = mmp_config.projector.as_str(),
-            arch = arch.as_str(),
-            tensors_loaded = mmp_weights.len(),
-            "Loaded mmproj GGUF header + tensor set + weights"
-        );
-        // Iter 53: ViT GPU warmup — runs one synthetic full forward
-        // to trigger Metal kernel pipeline compilation. Drops first
-        // user-visible multimodal request from ~5–10s (cold compile)
-        // to ~1.3s (steady-state) on M5 Max.
-        //
-        // Iter-103 added the `HF2Q_SKIP_VIT_WARMUP=1` escape hatch
-        // for bisecting the chat-warmup-logits-go-NaN bug: if
-        // skipping the ViT warmup makes chat warmup produce valid
-        // logits, the bug lives in `warmup_vit_gpu`'s leftover GPU
-        // state; if NaN persists, the bug lives in
-        // `LoadedMmprojWeights::load`.
-        if skip_vit_warmup {
-            tracing::warn!(
-                "HF2Q_SKIP_VIT_WARMUP=1 — skipping ViT GPU warmup; first \
-                 multimodal request will pay kernel-compile cost"
-            );
-        } else {
-            let warmup_t0 = std::time::Instant::now();
-            crate::inference::vision::vit_gpu::warmup_vit_gpu(
-                &mmp_weights,
-                &mmp_config,
-                arch,
-                text_engine.hidden_size(),
-            )
-            .with_context(|| {
-                format!(
-                    "vision projector warmup failed for '{}' ({})",
-                    mmp_path.display(),
-                    arch.as_str()
-                )
-            })?;
-            tracing::info!(
-                elapsed_ms = warmup_t0.elapsed().as_millis() as u64,
-                "ViT GPU warmup complete"
-            );
-        }
-        (
-            Some(api::state::LoadedMmproj {
-                gguf_path: mmp_path.clone(),
-                config: mmp_config,
-                arch,
-                weights: std::sync::Arc::new(mmp_weights),
-                model_id,
-                artifact_sha256: mmproj_sha256.clone(),
-                source_sha256: mmproj_source_sha256.map(str::to_owned),
-                vision_cache: std::sync::Arc::new(
-                    crate::inference::vision::pipeline::VisionEmbeddingCache::new(
-                        crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
-                    ),
-                ),
-            }),
-            Some(load_info::VisionProjector {
-                mmproj_path: mmp_path.clone(),
-                mmproj_sha256: Some(mmproj_sha256),
-            }),
-        )
-    } else {
-        (None, None)
-    };
-    drop(pair_read_guard);
+    // The startup projector was validated, warmed, and admitted atomically with
+    // its text engine above. AppState deliberately owns no process-global
+    // projector; every handler leases the projector from the same loaded
+    // generation as the text engine.
 
     // --- Build router ---
     // `state` was constructed above (iter-209) with the cache + hardware
@@ -5266,9 +5239,6 @@ pub fn cmd_serve(
         state = state
             .with_embedding_model(em)
             .with_embedding_registry(std::sync::Arc::new(std::sync::Mutex::new(registry)));
-    }
-    if let Some(m) = mmproj {
-        state = state.with_mmproj(m);
     }
     let state_for_warmup = state.clone();
     let router = api::build_router(state);
@@ -6771,6 +6741,7 @@ mod tests {
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
             kv_cache_budget_bytes: None,
+            projector: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         // 0-tensor GGUF can't fully load, but the FAILURE shape proves
@@ -6810,6 +6781,7 @@ mod tests {
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
             kv_cache_budget_bytes: None,
+            projector: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "0-tensor synthetic GGUF must fail load");
@@ -6852,6 +6824,7 @@ mod tests {
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
             kv_cache_budget_bytes: None,
+            projector: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
@@ -6904,6 +6877,7 @@ mod tests {
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
             kv_cache_budget_bytes: None,
+            projector: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -6931,6 +6905,7 @@ mod tests {
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
             kv_cache_budget_bytes: None,
+            projector: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -6958,6 +6933,7 @@ mod tests {
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
             kv_cache_budget_bytes: None,
+            projector: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "unknown architecture must fail dispatch");
@@ -6988,6 +6964,7 @@ mod tests {
             dwq_overlay_path: None,
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
             kv_cache_budget_bytes: None,
+            projector: None,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
@@ -7025,6 +7002,7 @@ mod tests {
                 // SerialFifo default (the ADR-005 byte-equivalent route).
                 engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
                 kv_cache_budget_bytes: None,
+                projector: None,
             };
             let result = super::load_engine(tmp.path(), &cfg);
             assert!(

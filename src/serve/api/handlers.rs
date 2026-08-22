@@ -289,13 +289,26 @@ async fn resolve_engine_for_request(
     //    (NB: this implementation is "winner-loads, others-block" by
     //    virtue of the write-lock — simpler than per-key in-flight
     //    deduplication and acceptable for the request-rate workload).
-    let engine_config = match state.engine_config_for_path(&resolved.gguf_path) {
+    let mut engine_config = match state.engine_config_for_path(&resolved.gguf_path) {
         Ok(config) => config,
         Err(error) => {
             tracing::error!(%error, "cannot resolve dynamic engine load policy");
             return Err(ApiError::internal_error().into_response());
         }
     };
+    if let Some(projector_path) = resolved.mmproj_path.as_ref() {
+        engine_config.projector = Some(
+            crate::serve::multi_model::ProjectorLoadSpec::preflight(
+                projector_path,
+                None,
+                crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES as u64,
+            )
+            .map_err(|error| {
+                tracing::error!(%error, "cannot preflight dynamic projector companion");
+                ApiError::model_not_loaded(&model_arg).into_response()
+            })?,
+        );
+    }
     let pool_arc = state.pool.clone();
     let pool_repo_blocking = pool_repo.clone();
     let gguf_path = resolved.gguf_path.clone();
@@ -1742,7 +1755,13 @@ where
         vision_family,
         per_row_floats,
         qwen3vl_image_grids,
-    ) = prepare_vision_context(&req.messages, state.mmproj.as_ref(), engine, cancellation).await?;
+    ) = prepare_vision_context(
+        &req.messages,
+        loaded_engine.projector.as_deref(),
+        engine,
+        cancellation,
+    )
+    .await?;
 
     // Compile the response_format grammar (Decision #6).  Iter-95 wires
     // the parsed grammar into `SamplingParams.grammar` so the decode loop
@@ -2322,7 +2341,10 @@ where
     {
         match dispatch_qwen3vl_seam_split(
             engine,
-            state.mmproj.as_ref().expect("mmproj checked above"),
+            loaded_engine
+                .projector
+                .as_deref()
+                .expect("generation-owned mmproj checked above"),
             &vision_embeddings,
             &image_token_positions_per_image,
             &qwen3vl_image_grids,
@@ -8262,17 +8284,49 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     // `hf2q_model_loaded` keeps its pre-iter-210 single-bit semantics
     // for backward compatibility with operator dashboards built on the
     // iter-209 surface.
-    let pool_stats_for_metrics = state.pool.read().ok().map(|m| m.pool_stats());
-    let (model_loaded, pool_loaded_models, pool_resident_bytes, pool_memory_budget_bytes) =
-        match pool_stats_for_metrics {
-            Some(stats) => (
-                if stats.loaded_count > 0 { 1 } else { 0 },
-                stats.loaded_count as u64,
-                stats.total_resident_bytes,
-                stats.memory_budget_bytes,
-            ),
-            None => (0, 0, 0, 0),
-        };
+    let pool_stats_for_metrics = state.pool.read().ok().map(|manager| {
+        let stats = manager.pool_stats();
+        let components = manager.snapshot_engines().into_iter().fold(
+            (0u64, 0u64, 0u64, 0u64),
+            |(text, weights, cache_budget, cache_resident), engine| {
+                (
+                    text.saturating_add(engine.resident_bytes.text_gguf_bytes),
+                    weights.saturating_add(engine.resident_bytes.projector_weight_bytes),
+                    cache_budget.saturating_add(engine.resident_bytes.projector_cache_budget_bytes),
+                    cache_resident.saturating_add(
+                        engine
+                            .projector
+                            .as_ref()
+                            .map(|projector| projector.vision_cache.resident_bytes() as u64)
+                            .unwrap_or(0),
+                    ),
+                )
+            },
+        );
+        (stats, components)
+    });
+    let (
+        model_loaded,
+        pool_loaded_models,
+        pool_resident_bytes,
+        pool_memory_budget_bytes,
+        pool_text_bytes,
+        pool_projector_weight_bytes,
+        pool_projector_cache_budget_bytes,
+        pool_projector_cache_resident_bytes,
+    ) = match pool_stats_for_metrics {
+        Some((stats, components)) => (
+            if stats.loaded_count > 0 { 1 } else { 0 },
+            stats.loaded_count as u64,
+            stats.total_resident_bytes,
+            stats.memory_budget_bytes,
+            components.0,
+            components.1,
+            components.2,
+            components.3,
+        ),
+        None => (0, 0, 0, 0, 0, 0, 0, 0),
+    };
     // ADR-005 Phase 4 reopen iter-213 (AC 5472): build the KV-spill /
     // KV-restore counter blocks.  Cardinality: four outcome labels per
     // observed `(repo, quant)` pair (closed enum per
@@ -8758,9 +8812,21 @@ hf2q_model_loaded {model}\n\
 # HELP hf2q_pool_loaded_models Number of models currently resident in HotSwapManager.\n\
 # TYPE hf2q_pool_loaded_models gauge\n\
 hf2q_pool_loaded_models {pool_loaded}\n\
-# HELP hf2q_pool_resident_bytes Total bytes of GGUF data resident in HotSwapManager.\n\
+# HELP hf2q_pool_resident_bytes Total admission-charged bytes resident in HotSwapManager.\n\
 # TYPE hf2q_pool_resident_bytes gauge\n\
 hf2q_pool_resident_bytes {pool_resident}\n\
+# HELP hf2q_pool_text_gguf_bytes Text GGUF bytes charged to resident generations.\n\
+# TYPE hf2q_pool_text_gguf_bytes gauge\n\
+hf2q_pool_text_gguf_bytes {pool_text}\n\
+# HELP hf2q_pool_projector_weight_bytes Unique projector backing bytes charged to resident generations.\n\
+# TYPE hf2q_pool_projector_weight_bytes gauge\n\
+hf2q_pool_projector_weight_bytes {pool_projector_weights}\n\
+# HELP hf2q_pool_projector_cache_budget_bytes Projector cache reservation charged to resident generations.\n\
+# TYPE hf2q_pool_projector_cache_budget_bytes gauge\n\
+hf2q_pool_projector_cache_budget_bytes {pool_projector_cache_budget}\n\
+# HELP hf2q_pool_projector_cache_resident_bytes Projector embedding-cache bytes currently populated.\n\
+# TYPE hf2q_pool_projector_cache_resident_bytes gauge\n\
+hf2q_pool_projector_cache_resident_bytes {pool_projector_cache_resident}\n\
 # HELP hf2q_pool_memory_budget_bytes Memory budget for HotSwapManager (80% of unified RAM by default).\n\
 # TYPE hf2q_pool_memory_budget_bytes gauge\n\
 hf2q_pool_memory_budget_bytes {pool_budget}\n\
@@ -8842,6 +8908,10 @@ hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
         model = model_loaded,
         pool_loaded = pool_loaded_models,
         pool_resident = pool_resident_bytes,
+        pool_text = pool_text_bytes,
+        pool_projector_weights = pool_projector_weight_bytes,
+        pool_projector_cache_budget = pool_projector_cache_budget_bytes,
+        pool_projector_cache_resident = pool_projector_cache_resident_bytes,
         pool_budget = pool_memory_budget_bytes,
         kv_spills_block = kv_spills_block,
         kv_restores_block = kv_restores_block,
@@ -9098,7 +9168,7 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
     for le in pool_snapshot.iter() {
         let loaded_id = le.engine.model_id().to_string();
         let info = le.engine.info();
-        let bound_projector = bound_projector_for_engine(&state, &le.engine);
+        let bound_projector = bound_projector_for_engine(le);
         let model = match models.iter_mut().find(|m| m.id == loaded_id) {
             Some(m) => {
                 m.loaded = true;
@@ -9188,7 +9258,7 @@ pub async fn get_model(
             });
         model.loaded = true;
         enrich_model_object_from_load_info(&mut model, entry.engine.info());
-        if let Some(projector) = bound_projector_for_engine(&state, &entry.engine) {
+        if let Some(projector) = bound_projector_for_engine(&entry) {
             advertise_bound_vision(&mut model, &projector.model_id);
         }
         return (StatusCode::OK, Json(model)).into_response();
@@ -9369,13 +9439,12 @@ fn advertise_bound_vision(model: &mut ModelObject, projector_id: &str) {
     model.vision_projector = Some(projector_id.to_owned());
 }
 
-fn bound_projector_for_engine<'a>(
-    state: &'a AppState,
-    engine: &super::engine::Engine,
-) -> Option<&'a super::state::LoadedMmproj> {
-    state.mmproj.as_ref().filter(|projector| {
+fn bound_projector_for_engine(
+    loaded: &crate::serve::multi_model::LoadedEngine<super::engine::Engine>,
+) -> Option<&super::state::LoadedMmproj> {
+    loaded.projector.as_deref().filter(|projector| {
         crate::serve::validate_mmproj_text_binding(
-            engine.vision_consumer_contract(),
+            loaded.engine.vision_consumer_contract(),
             projector.arch,
             projector.config.projection_dim,
             projector
@@ -9961,6 +10030,10 @@ mod multimodal_tests {
             model_id: "synthetic-mmproj".into(),
             artifact_sha256: "0".repeat(64),
             source_sha256: None,
+            pair_generation: None,
+            weights_resident_bytes: 0,
+            cache_budget_bytes: 0,
+            load_duration_ms: 0,
             vision_cache: Arc::new(
                 crate::inference::vision::pipeline::VisionEmbeddingCache::new(
                     crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
@@ -10115,6 +10188,10 @@ mod multimodal_tests {
             model_id: "synthetic-mmproj-gemma4v".into(),
             artifact_sha256: "0".repeat(64),
             source_sha256: None,
+            pair_generation: None,
+            weights_resident_bytes: 0,
+            cache_budget_bytes: 0,
+            load_duration_ms: 0,
             vision_cache: Arc::new(
                 crate::inference::vision::pipeline::VisionEmbeddingCache::new(
                     crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
@@ -11034,6 +11111,8 @@ mod readiness_guard_tests {
             gguf_path: std::path::PathBuf::new(),
             quant: QuantType::Q4_K_M,
             bytes_resident: 1_024,
+            resident_bytes: crate::serve::multi_model::ResidentByteComponents::text_only(1_024),
+            projector: None,
             loaded_at: SystemTime::now(),
             generation: 1,
             config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),
@@ -11338,6 +11417,8 @@ mod iter215_qwen35_chat_501_tests {
             gguf_path: std::path::PathBuf::new(),
             quant: QuantType::Q4_K_M,
             bytes_resident: 1024,
+            resident_bytes: crate::serve::multi_model::ResidentByteComponents::text_only(1024),
+            projector: None,
             loaded_at: SystemTime::now(),
             generation: 1,
             config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),
@@ -12192,6 +12273,8 @@ mod a5d_handler_429_tests {
             gguf_path: std::path::PathBuf::new(),
             quant: QuantType::Q4_K_M,
             bytes_resident: 0,
+            resident_bytes: crate::serve::multi_model::ResidentByteComponents::text_only(0),
+            projector: None,
             loaded_at: SystemTime::now(),
             generation: 1,
             config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),

@@ -1815,6 +1815,8 @@ mod tests {
             gguf_path: std::path::PathBuf::new(),
             quant,
             bytes_resident: 1 << 30,
+            resident_bytes: crate::serve::multi_model::ResidentByteComponents::text_only(1 << 30),
+            projector: None,
             loaded_at: SystemTime::now(),
             generation: 1,
             config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),

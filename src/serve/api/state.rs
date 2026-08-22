@@ -599,12 +599,6 @@ pub struct AppState {
     /// (kept registry per-request → recompiled every shader; HTTP-path
     /// hit ~190 ms vs in-process ~8 ms forward floor).
     pub embedding_registry: Option<Arc<std::sync::Mutex<mlx_native::KernelRegistry>>>,
-    /// Multimodal projector (mmproj GGUF) loaded at startup from
-    /// `--mmproj <path>`. When `Some`, the chat handler accepts
-    /// `image_url` content parts and routes them through the vision
-    /// preprocessor + ViT forward pass that this mmproj describes.
-    /// `None` means the server is text-only.
-    pub mmproj: Option<LoadedMmproj>,
     /// Process-wide metric counters surfaced via `/metrics`.
     pub metrics: Arc<ServerMetrics>,
     /// KV-spill / KV-restore telemetry counters surfaced via `/metrics`
@@ -778,9 +772,80 @@ pub struct LoadedMmproj {
     pub model_id: String,
     pub artifact_sha256: String,
     pub source_sha256: Option<String>,
+    /// Durable converter transaction identity when both pair members carry
+    /// hf2q pair metadata. External explicitly paired artifacts may omit it.
+    pub pair_generation: Option<String>,
+    /// Unique Metal backing allocations owned by `weights` (slice/mapped
+    /// aliases counted once).
+    pub weights_resident_bytes: u64,
+    /// Cache memory reserved in pool admission for this projector.
+    pub cache_budget_bytes: u64,
+    /// Projector-only header/weight/warmup load duration.
+    pub load_duration_ms: u64,
     /// Bounded projector-local embedding cache and single-flight compute
     /// gate. The payload is Arc-owned so hits do not duplicate large tensors.
     pub vision_cache: Arc<crate::inference::vision::pipeline::VisionEmbeddingCache>,
+}
+
+impl LoadedMmproj {
+    pub fn config_identity(&self) -> crate::serve::multi_model::ProjectorConfigIdentity {
+        crate::serve::multi_model::ProjectorConfigIdentity {
+            artifact_sha256: self.artifact_sha256.clone(),
+            source_sha256: self.source_sha256.clone(),
+            pair_generation: self.pair_generation.clone(),
+            profile: self.arch.as_str().to_owned(),
+            weight_bytes: self.weights_resident_bytes,
+            cache_budget_bytes: self.cache_budget_bytes,
+        }
+    }
+
+    /// Synthetic no-weight projector used by hosted-safe ownership and
+    /// lifecycle tests. Runtime call sites always construct from a validated
+    /// GGUF and never enter this helper.
+    #[cfg(test)]
+    pub fn empty_for_test(
+        model_id: &str,
+        artifact_sha256: String,
+        weight_bytes: u64,
+        cache_budget_bytes: u64,
+    ) -> Arc<Self> {
+        let device = mlx_native::MlxDevice::new().expect("create synthetic projector device");
+        Arc::new(Self {
+            gguf_path: PathBuf::from(format!("/synthetic/{model_id}.gguf")),
+            config: MmprojConfig {
+                image_size: 8,
+                patch_size: 1,
+                num_patches_side: 8,
+                hidden_size: 8,
+                intermediate_size: 16,
+                num_attention_heads: 1,
+                num_hidden_layers: 1,
+                layer_norm_eps: 1e-6,
+                projector: crate::inference::vision::mmproj::ProjectorType::Mlp,
+                image_mean: [0.5; 3],
+                image_std: [0.5; 3],
+                image_min_pixels: None,
+                image_max_pixels: None,
+                spatial_merge_size: None,
+                projection_dim: Some(8),
+                deepstack_indexes: None,
+            },
+            arch: ArchProfile::ClipClassic,
+            weights: Arc::new(LoadedMmprojWeights::empty(device)),
+            model_id: model_id.to_owned(),
+            artifact_sha256,
+            source_sha256: None,
+            pair_generation: None,
+            weights_resident_bytes: weight_bytes,
+            cache_budget_bytes,
+            load_duration_ms: 0,
+            vision_cache: Arc::new(
+                crate::inference::vision::pipeline::VisionEmbeddingCache::new(
+                    usize::try_from(cache_budget_bytes).expect("synthetic cache budget fits usize"),
+                ),
+            ),
+        })
+    }
 }
 
 impl AppState {
@@ -824,6 +889,7 @@ impl AppState {
             dwq_overlay_path: None,
             engine_mode: super::engine::EngineMode::SerialFifo,
             kv_cache_budget_bytes: None,
+            projector: None,
         };
         Ok(Self {
             config: Arc::new(config),
@@ -848,7 +914,6 @@ impl AppState {
             default_model,
             embedding_config: None,
             embedding_registry: None,
-            mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
             kv_spill_counters,
             // ADR-017 §R-F7: gauge source wired post-construction by
@@ -893,6 +958,7 @@ impl AppState {
             dwq_overlay_path: None,
             engine_mode: super::engine::EngineMode::SerialFifo,
             kv_cache_budget_bytes: None,
+            projector: None,
         };
         // Synthetic cache root in a per-process tempdir.  Tests that need
         // a specific cache state should construct via `new_for_serve` or
@@ -930,7 +996,6 @@ impl AppState {
             default_model: None,
             embedding_config: None,
             embedding_registry: None,
-            mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
             kv_spill_counters: kv_spill_counters_test,
             // ADR-017 §R-F7: tests hand-wire this when they want to
@@ -1062,14 +1127,6 @@ impl AppState {
         registry: Arc<std::sync::Mutex<mlx_native::KernelRegistry>>,
     ) -> Self {
         self.embedding_registry = Some(registry);
-        self
-    }
-
-    /// Attach an mmproj descriptor. Called by `cmd_serve` after validating
-    /// the supplied mmproj GGUF header. The ViT forward pass that consumes
-    /// this lands in ADR-005 Phase 2c Task #15.
-    pub fn with_mmproj(mut self, m: LoadedMmproj) -> Self {
-        self.mmproj = Some(m);
         self
     }
 
@@ -1208,60 +1265,6 @@ mod tests {
         let ids = em.encode("hello world", false);
         assert!(ids.contains(&4), "expected 'hello'=4 in {:?}", ids);
         assert!(ids.contains(&5), "expected 'world'=5 in {:?}", ids);
-    }
-
-    #[test]
-    fn with_mmproj_attaches_descriptor_to_state() {
-        // Verifies the `with_mmproj` builder — iter 25 multimodal wiring.
-        // Exercises the typed plumbing (field presence, model_id, path
-        // round-trip) without touching a real GGUF; parsing is covered by
-        // `inference::vision::mmproj::tests`.
-        use crate::inference::vision::mmproj::{MmprojConfig, ProjectorType};
-        let cfg = MmprojConfig {
-            image_size: 896,
-            patch_size: 14,
-            num_patches_side: 64,
-            hidden_size: 1152,
-            intermediate_size: 4304,
-            num_attention_heads: 16,
-            num_hidden_layers: 27,
-            layer_norm_eps: 1e-6,
-            projector: ProjectorType::Mlp,
-            image_mean: [0.5, 0.5, 0.5],
-            image_std: [0.5, 0.5, 0.5],
-            image_min_pixels: None,
-            image_max_pixels: None,
-            // iter-224 Wedge-4b: Qwen3-VL-only fields default to None on
-            // non-Qwen3-VL fixtures.
-            spatial_merge_size: None,
-            projection_dim: None,
-            deepstack_indexes: None,
-        };
-        let device = mlx_native::MlxDevice::new().expect("create device");
-        let m = LoadedMmproj {
-            gguf_path: "/tmp/synthetic-mmproj.gguf".into(),
-            config: cfg.clone(),
-            arch: ArchProfile::Gemma4Siglip,
-            weights: Arc::new(LoadedMmprojWeights::empty(device)),
-            model_id: "synthetic-mmproj".into(),
-            artifact_sha256: "0".repeat(64),
-            source_sha256: None,
-            vision_cache: Arc::new(
-                crate::inference::vision::pipeline::VisionEmbeddingCache::new(
-                    crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
-                ),
-            ),
-        };
-        let state = AppState::new(ServerConfig::default()).with_mmproj(m);
-        let attached = state.mmproj.as_ref().expect("mmproj should be Some");
-        assert_eq!(attached.model_id, "synthetic-mmproj");
-        assert_eq!(
-            attached.gguf_path.file_name().unwrap(),
-            "synthetic-mmproj.gguf"
-        );
-        assert_eq!(attached.config, cfg);
-        assert_eq!(attached.arch, ArchProfile::Gemma4Siglip);
-        assert!(attached.config.projector.is_supported());
     }
 
     // ─────────────────────────────────────────────────────────────────────
