@@ -146,6 +146,29 @@ And one line to `src/arch/registry.rs::GLOBAL_REGISTRY`:
 &super::entries::<arch>::ENTRY,
 ```
 
+### 6a. Prove native inference storage before opening the serve path
+
+Conversion support does not imply inference support. The runtime loader must
+classify every tensor by consumer role before its first Metal allocation:
+
+- Matrix operands (embeddings, projections, expert matrices, and output heads)
+  retain the GGUF codec and use shared file-backed mapping. A family must add a
+  matching native kernel route or reject that role/codec during preflight.
+- Elementwise vectors may be expanded only when the consuming kernel requires
+  that exact dtype. The role and owned bytes must be explicit in accounting.
+- Production load or inference must never dequantize and requantize a matrix,
+  create an unreported dense shadow, or download a complete embedding/head
+  matrix for host-side lookup.
+- Tied matrices have one storage owner shared by every consumer. Drafter,
+  target, embedding, and output paths must not reinterpret the same source
+  tensor through different implicit formats.
+
+Required proof includes a source canary for forbidden transform fallbacks, a
+tiny real GPU dispatch for every admitted role/codec/width, exact artifact
+parity, resident file-backed versus anonymous byte receipts, and cold-load plus
+A→B→A model-generation timing/reclamation. Unsupported codecs fail before
+allocation; an approximate compatibility route is not allowed.
+
 ### 7. Tests to add
 
 **Unit tests (inside `src/arch/entries/<arch>.rs`):**
@@ -213,6 +236,8 @@ shipped products.
 | Reading `metadata.layer_types` directly when you need to know whether a layer is full / linear attention | Decision 2 contract violation: the parser populates raw `layer_types` as `["attention"; N]` for any config without an explicit per-layer enumeration, so a Qwen3.5-style config that supplies only `full_attention_interval` silently bypasses anything reading the raw field. Use `metadata.resolved_layer_types()` — verified against this trap by ADR-012 fixes `83b6618` (preflight hybrid validator) and `ae3a9cf` (format_info diagnostic). |
 | Listing only `*ForCausalLM` in `hf_architectures` | Multimodal checkpoints ship `*ForConditionalGeneration`. Registry-side `get_by_hf_architecture` will diverge from GGUF-side `arch_gguf_name` if you list only one alias. List EVERY known alias for the arch — see ADR-012 fix `57d4bcc`. |
 | Duplicating the arch-string string-set check in multiple call sites | Drift across copies silently corrupts the convert pipeline (e.g. one site applies V-head reorder for an alias but another site skips expert merge). Centralize via a `pub(crate) fn is_<arch>_architecture(arch, model_type) -> bool` and call it from every gate site. See `is_qwen35_family_architecture` / `is_qwen35moe_architecture` in `src/models/qwen35/mod.rs` (commit `d37daa4`). |
+| Loading a matrix through `load_tensor_f32` or an equivalent dequantize/requantize shadow | It changes the model's actual inference representation, hides unsupported kernels, increases cold-load time and anonymous residency, and can make target and speculative paths disagree. Preserve native mapped storage or fail preflight. |
+| Calling `load_tensor` once per native matrix when a shared GGUF mapping is available | Native dtype alone is not enough: per-tensor copies still tax load/swap latency and anonymous memory. Map the tensor-data region once, retain its owner for the model generation, and create bounded tensor views. |
 
 ---
 
