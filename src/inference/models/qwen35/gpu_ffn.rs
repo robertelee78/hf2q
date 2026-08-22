@@ -82,6 +82,21 @@ use super::execution_dispatch::{
     dispatch_fused_gate_up_silu_q6_k, dispatch_fused_gate_up_silu_q8_0, quantized_matmul_ggml,
 };
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_MOE_ID_PROJECTION_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_test_moe_id_projection_calls() {
+    TEST_MOE_ID_PROJECTION_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn test_moe_id_projection_calls() -> u64 {
+    TEST_MOE_ID_PROJECTION_CALLS.with(std::cell::Cell::get)
+}
+
 /// ADR-020 AC#5 Iter C2.4 #4 — single-call dispatch wrapper that routes
 /// per-MoE-role expert matmuls between the legacy GGML pooled path
 /// (default) and the new mlx-affine packed-U32 kernel path (active
@@ -128,6 +143,9 @@ fn dispatch_moe_id_routed(
     // fallback.
     imatrix_hint: crate::quantize::imatrix::ImatrixHint<'_>,
 ) -> anyhow::Result<()> {
+    #[cfg(test)]
+    TEST_MOE_ID_PROJECTION_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     if let Some(stack) = affine {
         // Affine path: kernel writes into `output` directly.  M/N/K
         // come from legacy_params (truth source for shape — the
