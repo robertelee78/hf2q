@@ -11,6 +11,10 @@ expected_model_sha=${7:?expected model SHA-256 is required}
 contention_measurement_log=${8:?contention measurement log is required}
 contention_settle_log=${9:?contention settle log is required}
 memory_log=${10:?memory-pressure log is required}
+phase_log=${11:?phase-marker log is required}
+setup_thermal_log=${12:?loaded-setup thermal log is required}
+setup_contention_log=${13:?loaded-setup contention log is required}
+setup_memory_log=${14:?loaded-setup memory log is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -21,7 +25,9 @@ source "$ROOT_DIR/scripts/macos_memory_guard.sh"
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 for path in "$summary" "$raw" "$test_log" "$measurement_log" "$settle_log" \
-  "$contention_measurement_log" "$contention_settle_log" "$memory_log"; do
+  "$contention_measurement_log" "$contention_settle_log" "$memory_log" \
+  "$phase_log" "$setup_thermal_log" "$setup_contention_log" \
+  "$setup_memory_log"; do
   [[ -s "$path" ]] || {
     echo "decode-cohort receipt input is missing or empty: $path" >&2
     exit 1
@@ -41,7 +47,15 @@ test "$(sha256_file "$contention_measurement_log")" = \
 test "$(sha256_file "$contention_settle_log")" = \
   "$(jq -er .host_contention.settle.log_sha256 "$summary")"
 test "$(sha256_file "$memory_log")" = \
-  "$(jq -er .memory_pressure.log_sha256 "$summary")"
+  "$(jq -er .memory_pressure.measurement.log_sha256 "$summary")"
+test "$(sha256_file "$phase_log")" = \
+  "$(jq -er .phase_evidence.log_sha256 "$summary")"
+test "$(sha256_file "$setup_thermal_log")" = \
+  "$(jq -er .loaded_setup.thermal.log_sha256 "$summary")"
+test "$(sha256_file "$setup_contention_log")" = \
+  "$(jq -er .loaded_setup.host_contention.log_sha256 "$summary")"
+test "$(sha256_file "$setup_memory_log")" = \
+  "$(jq -er .memory_pressure.setup.log_sha256 "$summary")"
 jq -s -e 'length == 1' "$summary" >/dev/null
 
 jq -e --slurpfile raw "$raw" \
@@ -80,7 +94,7 @@ jq -e --slurpfile raw "$raw" \
   | ($raw | length) == 1
     and ($summary | del(
       .schema_version,
-      .source_sha,.model_sha256,.mlx_native_version,.raw_sha256,
+      .source_sha,.model_sha256,.mlx_native_version,.producer_exit_code,.raw_sha256,
       .test_log_sha256,.thermal_status,.required_start_state,
       .maximum_measurement_state,.measurement_log_sha256,
       .settle_log_sha256,.settle_seconds,.settle_samples,
@@ -90,13 +104,15 @@ jq -e --slurpfile raw "$raw" \
       .measurement_samples,.measurement_duration_seconds,
       .sample_interval_seconds,.maximum_sample_gap_seconds,
       .non_nominal_measurement_samples,.fair_measurement_samples,
-      .over_limit_measurement_samples,.telemetry_gaps,.host_contention,
+      .over_limit_measurement_samples,.telemetry_gaps,.host_contention,.loaded_setup,
+      .phase_evidence,
       .memory_pressure
     )) == ($receipt | del(.schema_version))
-    and $receipt.schema_version == 1
-    and .schema_version == 4 and .status == "pass"
+    and $receipt.schema_version == 2
+    and .schema_version == 5 and .status == "pass"
     and .source_sha == $source_sha and .model_sha256 == $model_sha256
     and .mlx_native_version == "0.11.0"
+    and .producer_exit_code == 0
     and .thermal_probe.implementation == "compiled-foundation-helper"
     and .thermal_probe.source_path == "scripts/macos_thermal_probe.swift"
     and (.thermal_probe.source_sha256 | test("^[0-9a-f]{64}$"))
@@ -111,7 +127,14 @@ jq -e --slurpfile raw "$raw" \
       final_mod_128:24,physical_to_logical:[2,0,3,1],
       exact_state_logits_cache_recurrent:true
     }
+    and .residency.effective_weight_mode == "mmap-file-backed"
     and .residency.weight_bytes > 0
+    and .residency.weight_file_backed_bytes > .residency.weight_anonymous_bytes
+    and .residency.weight_anonymous_bytes >= 0
+    and .residency.weight_mapped_segment_count > 0
+    and .residency.weight_bytes == (
+      .residency.weight_file_backed_bytes + .residency.weight_anonymous_bytes)
+    and .residency.shape_pass == true
     and .residency.serial_live_cache_bytes > 0
     and .residency.cohort_live_cache_bytes > 0
     and .residency.serial_snapshot_bytes > 0
@@ -120,6 +143,68 @@ jq -e --slurpfile raw "$raw" \
       .residency.weight_bytes + .residency.serial_live_cache_bytes
       + .residency.cohort_live_cache_bytes + .residency.serial_snapshot_bytes
       + .residency.cohort_snapshot_bytes)
+    and .phase_contract.policy == "fsynced-run-bound-markers-v1"
+    and (.phase_contract.run_uuid
+      | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+    and (.phase_contract.pid | type) == "number" and .phase_contract.pid > 0
+    and .phase_contract.ack_timeout_seconds == 300
+    and (.phase_contract.markers | length) == 4
+    and all(.phase_contract.markers[];
+      .run_uuid == $receipt.phase_contract.run_uuid
+      and .pid == $receipt.phase_contract.pid
+      and (.monotonic_ns | type) == "number" and .monotonic_ns >= 0
+      and (.wall_ns | type) == "number" and .wall_ns > 0)
+    and [.phase_contract.markers[].sequence] == [0,1,2,3]
+    and [.phase_contract.markers[].phase] == ["process-start",
+      "loaded-settle-start","measurement-ready","measurement-complete"]
+    and .phase_contract.markers[0].monotonic_ns
+      < .phase_contract.markers[1].monotonic_ns
+    and .phase_contract.markers[1].monotonic_ns
+      < .phase_contract.markers[2].monotonic_ns
+    and .phase_contract.markers[2].monotonic_ns
+      < .phase_contract.markers[3].monotonic_ns
+    and (.phase_contract.markers[2].monotonic_ns
+      - .phase_contract.markers[1].monotonic_ns) >= 45000000000
+    and .darwin_vm_window.policy == "darwin25-phase-bound-no-vm-churn-v2"
+    and .darwin_vm_window.claim_scope == "within-run-paired-only"
+    and .darwin_vm_window.monotonic_counters == true
+    and .darwin_vm_window.pressure_boundary_pass == true
+    and .darwin_vm_window.no_churn_pass == true
+    and .darwin_vm_window.start.boot_time_seconds
+      == .darwin_vm_window.end.boot_time_seconds
+    and .darwin_vm_window.start.page_size == .darwin_vm_window.end.page_size
+    and .darwin_vm_window.start.page_size > 0
+    and (.darwin_vm_window.start.pressure_level == 1
+      or .darwin_vm_window.start.pressure_level == 2)
+    and (.darwin_vm_window.end.pressure_level == 1
+      or .darwin_vm_window.end.pressure_level == 2)
+    and .darwin_vm_window.start.throttled_pages == 0
+    and .darwin_vm_window.end.throttled_pages == 0
+    and .darwin_vm_window.deltas.pageins
+      == (.darwin_vm_window.end.pageins - .darwin_vm_window.start.pageins)
+    and .darwin_vm_window.deltas.pageouts
+      == (.darwin_vm_window.end.pageouts - .darwin_vm_window.start.pageouts)
+    and .darwin_vm_window.deltas.swapins
+      == (.darwin_vm_window.end.swapins - .darwin_vm_window.start.swapins)
+    and .darwin_vm_window.deltas.swapouts
+      == (.darwin_vm_window.end.swapouts - .darwin_vm_window.start.swapouts)
+    and .darwin_vm_window.deltas.compressions
+      == (.darwin_vm_window.end.compressions - .darwin_vm_window.start.compressions)
+    and .darwin_vm_window.deltas.decompressions
+      == (.darwin_vm_window.end.decompressions - .darwin_vm_window.start.decompressions)
+    and .darwin_vm_window.deltas.purges
+      == (.darwin_vm_window.end.purges - .darwin_vm_window.start.purges)
+    and .darwin_vm_window.deltas.reactivations
+      == (.darwin_vm_window.end.reactivations - .darwin_vm_window.start.reactivations)
+    and .darwin_vm_window.deltas.process_pageins
+      == (.darwin_vm_window.end.process_pageins
+        - .darwin_vm_window.start.process_pageins)
+    and all(.darwin_vm_window.deltas.pageins,
+      .darwin_vm_window.deltas.pageouts,.darwin_vm_window.deltas.swapins,
+      .darwin_vm_window.deltas.swapouts,.darwin_vm_window.deltas.compressions,
+      .darwin_vm_window.deltas.decompressions,.darwin_vm_window.deltas.purges,
+      .darwin_vm_window.deltas.process_pageins; . == 0)
+    and .darwin_vm_window.deltas.reactivations >= 0
     and .benchmark.position == 6676
     and .benchmark.anchor_exact_state_logits_cache_recurrent == true
     and .benchmark.logical_capacity == 131072
@@ -239,25 +324,57 @@ jq -e --slurpfile raw "$raw" \
     and .host_contention.measurement.duration_seconds > 0
     and .host_contention.measurement.contended_samples == 0
     and .host_contention.measurement.telemetry_gaps == 0
-    and .memory_pressure.policy == "darwin25-normal-no-swapout-v1"
+    and .loaded_setup.thermal.samples >= 2
+    and .loaded_setup.thermal.duration_seconds > 0
+    and .loaded_setup.thermal.fair_samples >= 0
+    and .loaded_setup.thermal.telemetry_gaps == 0
+    and .loaded_setup.host_contention.samples >= 2
+    and .loaded_setup.host_contention.duration_seconds > 0
+    and .loaded_setup.host_contention.contended_samples == 0
+    and .loaded_setup.host_contention.telemetry_gaps == 0
+    and .phase_evidence.policy == "fsynced-run-bound-markers-v1"
+    and .phase_evidence.run_uuid == $receipt.phase_contract.run_uuid
+    and .phase_evidence.producer_pid == $receipt.phase_contract.pid
+    and .phase_evidence.producer_pid > 0
+    and .phase_evidence.test_spawned_at > 0
+    and (.phase_evidence.log_sha256 | test("^[0-9a-f]{64}$"))
+    and .memory_pressure.policy == "darwin25-phase-bound-no-vm-churn-v2"
     and .memory_pressure.normal_level == 1
+    and .memory_pressure.warning_level == 2
+    and .memory_pressure.critical_level == 4
+    and .memory_pressure.claim_scope == "within-run-paired-only"
     and .memory_pressure.guard_source_path == "scripts/macos_memory_guard.sh"
     and (.memory_pressure.guard_source_sha256 | test("^[0-9a-f]{64}$"))
-    and (.memory_pressure.log_sha256 | test("^[0-9a-f]{64}$"))
     and .memory_pressure.sample_interval_seconds == 2
     and .memory_pressure.maximum_sample_gap_seconds == 5
-    and (.memory_pressure.samples | type) == "number"
-    and .memory_pressure.samples >= 2
-    and (.memory_pressure.duration_seconds | type) == "number"
-    and .memory_pressure.duration_seconds > 0
-    and (.memory_pressure.initial_swapouts | type) == "number"
-    and .memory_pressure.final_swapouts == .memory_pressure.initial_swapouts
-    and .memory_pressure.swapout_delta == 0
-    and (.memory_pressure.min_free_percentage | type) == "number"
-    and .memory_pressure.min_free_percentage >= 0
-    and .memory_pressure.min_free_percentage <= 100
-    and .memory_pressure.max_pressure_level == 1
-    and .memory_pressure.max_throttled_pages == 0
+    and .memory_pressure.setup.samples >= 2
+    and .memory_pressure.setup.duration_seconds > 0
+    and (.memory_pressure.setup.normal_samples
+      + .memory_pressure.setup.warning_samples) == .memory_pressure.setup.samples
+    and .memory_pressure.setup.min_free_percentage >= 0
+    and .memory_pressure.setup.min_free_percentage <= 100
+    and (.memory_pressure.setup.max_pressure_level == 1
+      or .memory_pressure.setup.max_pressure_level == 2)
+    and .memory_pressure.setup.max_throttled_pages == 0
+    and .memory_pressure.setup.observed_deltas.swapouts == 0
+    and .memory_pressure.measurement.samples >= 2
+    and .memory_pressure.measurement.duration_seconds > 0
+    and (.memory_pressure.measurement.normal_samples
+      + .memory_pressure.measurement.warning_samples)
+      == .memory_pressure.measurement.samples
+    and .memory_pressure.measurement.min_free_percentage >= 0
+    and .memory_pressure.measurement.min_free_percentage <= 100
+    and (.memory_pressure.measurement.max_pressure_level == 1
+      or .memory_pressure.measurement.max_pressure_level == 2)
+    and .memory_pressure.measurement.max_throttled_pages == 0
+    and .memory_pressure.setup.boot_time_seconds
+      == .memory_pressure.measurement.boot_time_seconds
+    and .memory_pressure.measurement.boot_time_seconds
+      == $receipt.darwin_vm_window.start.boot_time_seconds
+    and .memory_pressure.setup.page_size == .memory_pressure.measurement.page_size
+    and .memory_pressure.measurement.page_size
+      == $receipt.darwin_vm_window.start.page_size
+    and .memory_pressure.exact_window == $receipt.darwin_vm_window
   ' "$summary" >/dev/null
 
 if [[ "$(sha256_file "$ROOT_DIR/scripts/macos_thermal_probe.swift")" != \
@@ -270,23 +387,61 @@ if [[ "$(sha256_file "$ROOT_DIR/scripts/macos_memory_guard.sh")" != \
   echo "decode-cohort receipt memory-guard source digest mismatch" >&2
   exit 1
 fi
-memory_validate_normal_no_swapout_log "$memory_log" 5
-memory_validate_measurement_coverage "$memory_log" "$measurement_log" 5
-test "$MEMORY_LOG_SAMPLES" = "$(jq -er .memory_pressure.samples "$summary")"
-test "$MEMORY_LOG_DURATION_SECONDS" = \
-  "$(jq -er .memory_pressure.duration_seconds "$summary")"
-test "$MEMORY_LOG_INITIAL_SWAPOUTS" = \
-  "$(jq -er .memory_pressure.initial_swapouts "$summary")"
-test "$MEMORY_LOG_FINAL_SWAPOUTS" = \
-  "$(jq -er .memory_pressure.final_swapouts "$summary")"
-test "$MEMORY_LOG_SWAPOUT_DELTA" = \
-  "$(jq -er .memory_pressure.swapout_delta "$summary")"
-test "$MEMORY_LOG_MIN_FREE_PERCENTAGE" = \
-  "$(jq -er .memory_pressure.min_free_percentage "$summary")"
-test "$MEMORY_LOG_MAX_PRESSURE_LEVEL" = \
-  "$(jq -er .memory_pressure.max_pressure_level "$summary")"
-test "$MEMORY_LOG_MAX_THROTTLED_PAGES" = \
-  "$(jq -er .memory_pressure.max_throttled_pages "$summary")"
+memory_validate_warning_log "$setup_memory_log" 5 1
+setup_memory_actual=$(memory_log_summary_json)
+jq -e --argjson actual "$setup_memory_actual" \
+  '(.memory_pressure.setup | del(.log_sha256)) == $actual' \
+  "$summary" >/dev/null
+setup_boot_time=$MEMORY_LOG_BOOT_TIME_SECONDS
+setup_page_size=$MEMORY_LOG_PAGE_SIZE
+memory_validate_warning_log "$memory_log" 5 0
+measurement_memory_actual=$(memory_log_summary_json)
+jq -e --argjson actual "$measurement_memory_actual" \
+  '(.memory_pressure.measurement | del(.log_sha256)) == $actual' \
+  "$summary" >/dev/null
+test "$setup_boot_time" = "$MEMORY_LOG_BOOT_TIME_SECONDS"
+test "$setup_page_size" = "$MEMORY_LOG_PAGE_SIZE"
+
+# The runner samples immediately before acknowledging marker 2 and immediately
+# after observing marker 3. Those sampled system counters must enclose the
+# stronger in-process endpoint snapshots; this prevents a receipt from binding
+# an unrelated but internally self-consistent VM window.
+for field_column in \
+  pageins:6 pageouts:7 swapins:8 swapouts:9 compressions:10 \
+  decompressions:11 purges:12 reactivations:13; do
+  field=${field_column%%:*}
+  column=${field_column##*:}
+  sampled_start=$(head -1 "$memory_log" | awk -F '\t' -v column="$column" \
+    '{ print $column }')
+  sampled_end=$(tail -1 "$memory_log" | awk -F '\t' -v column="$column" \
+    '{ print $column }')
+  exact_start=$(jq -er --arg field "$field" \
+    '.darwin_vm_window.start[$field]' "$raw")
+  exact_end=$(jq -er --arg field "$field" \
+    '.darwin_vm_window.end[$field]' "$raw")
+  ((sampled_start <= exact_start && exact_start <= exact_end \
+    && exact_end <= sampled_end)) || {
+    echo "sampled VM counter does not enclose exact window: $field" >&2
+    exit 1
+  }
+done
+test "$(head -1 "$setup_memory_log" | awk -F '\t' '{print $18}')" = \
+  decode-cohort-loaded-setup-start
+test "$(tail -1 "$setup_memory_log" | awk -F '\t' '{print $18}')" = \
+  decode-cohort-loaded-setup-end
+awk -F '\t' 'NR > 1 && $18 != "decode-cohort-loaded-setup" &&
+  $18 != "decode-cohort-loaded-setup-end" { exit 1 }' "$setup_memory_log"
+test "$(head -1 "$memory_log" | awk -F '\t' '{print $18}')" = \
+  decode-cohort-measurement-start
+test "$(tail -1 "$memory_log" | awk -F '\t' '{print $18}')" = \
+  decode-cohort-measurement-end
+awk -F '\t' 'NR > 1 && $18 != "decode-cohort-measurement" &&
+  $18 != "decode-cohort-measurement-end" { exit 1 }' "$memory_log"
+
+jq -s -e --slurpfile raw "$raw" \
+  '. == $raw[0].phase_contract.markers' "$phase_log" >/dev/null
+jq -s -e --slurpfile phases "$phase_log" '. == $phases' \
+  <(sed -n 's/^.*HF2Q_DEEPSEEK4_PHASE //p' "$test_log") >/dev/null
 
 if ! grep -Fq \
     'test inference::models::deepseek4::real_artifact_decode_cohort_tests::official_artifact_b4_decode_body_is_exact_and_measured ... ' \
@@ -313,15 +468,41 @@ test_duration_seconds=$(sed -nE \
 grep -Fq 'exact_state_logits_cache_recurrent=true' "$test_log"
 
 thermal_validate_fair_or_better_measurement_log "$measurement_log" 5
+process_start_ns=$(jq -er 'select(.sequence == 0).monotonic_ns' "$phase_log")
+measurement_ready_ns=$(jq -er 'select(.sequence == 2).monotonic_ns' "$phase_log")
+measurement_complete_ns=$(jq -er 'select(.sequence == 3).monotonic_ns' "$phase_log")
+process_start_wall=$(jq -er \
+  'select(.sequence == 0) | (.wall_ns / 1000000000 | floor)' "$phase_log")
+measurement_ready_wall=$(jq -er \
+  'select(.sequence == 2) | (.wall_ns / 1000000000 | floor)' "$phase_log")
+measurement_complete_wall=$(jq -er \
+  'select(.sequence == 3) | (.wall_ns / 1000000000 | floor)' "$phase_log")
+test_spawned_at=$(jq -er .phase_evidence.test_spawned_at "$summary")
+thermal_first=$(head -1 "$measurement_log" | awk -F '\t' '{print $1}')
+thermal_last=$(tail -1 "$measurement_log" | awk -F '\t' '{print $1}')
+memory_first=$(head -1 "$memory_log" | awk -F '\t' '{print $1}')
+memory_last=$(tail -1 "$memory_log" | awk -F '\t' '{print $1}')
 awk -v test_duration="$test_duration_seconds" \
-  -v measured_duration="$THERMAL_LOG_DURATION_SECONDS" '
+  -v process_start_ns="$process_start_ns" \
+  -v measurement_ready_ns="$measurement_ready_ns" \
+  -v measurement_complete_ns="$measurement_complete_ns" \
+  -v spawned="$test_spawned_at" -v process_wall="$process_start_wall" \
+  -v ready_wall="$measurement_ready_wall" \
+  -v complete_wall="$measurement_complete_wall" \
+  -v thermal_first="$thermal_first" -v thermal_last="$thermal_last" \
+  -v memory_first="$memory_first" -v memory_last="$memory_last" '
   BEGIN {
-    delta=test_duration-measured_duration
-    if (delta < 0) delta=-delta
-    if (test_duration <= 0 || delta > 5) exit 1
+    phase_span=(measurement_complete_ns-process_start_ns)/1000000000
+    if (test_duration <= 0 || phase_span <= 0 || test_duration < phase_span)
+      exit 1
+    if (measurement_ready_ns <= process_start_ns ||
+        measurement_complete_ns <= measurement_ready_ns) exit 1
+    if (process_wall < spawned) exit 1
+    if (thermal_first < ready_wall || thermal_last < complete_wall) exit 1
+    if (memory_first < ready_wall || memory_last < complete_wall) exit 1
   }
 ' || {
-  echo "thermal telemetry does not cover the named test runtime" >&2
+  echo "phase-bound telemetry does not cover the named test runtime/window" >&2
   exit 1
 }
 test "$THERMAL_LOG_SAMPLES" = "$(jq -er .measurement_samples "$summary")"
@@ -346,6 +527,23 @@ esac
 awk -F '\t' 'NR > 1 && $3 != "decode-cohort-measurement" && \
   $3 != "decode-cohort-measurement-end" { exit 1 }' "$measurement_log"
 
+thermal_validate_fair_or_better_measurement_log "$setup_thermal_log" 5
+test "$THERMAL_LOG_SAMPLES" = \
+  "$(jq -er .loaded_setup.thermal.samples "$summary")"
+test "$THERMAL_LOG_DURATION_SECONDS" = \
+  "$(jq -er .loaded_setup.thermal.duration_seconds "$summary")"
+test "$THERMAL_LOG_FAIR_SAMPLES" = \
+  "$(jq -er .loaded_setup.thermal.fair_samples "$summary")"
+test "$THERMAL_LOG_GAPS" = \
+  "$(jq -er .loaded_setup.thermal.telemetry_gaps "$summary")"
+test "$(head -1 "$setup_thermal_log" | awk -F '\t' '{print $3}')" = \
+  decode-cohort-loaded-setup-start
+test "$(head -1 "$setup_thermal_log" | awk -F '\t' '{print $2}')" = nominal
+test "$(tail -1 "$setup_thermal_log" | awk -F '\t' '{print $3}')" = \
+  decode-cohort-loaded-setup-end
+awk -F '\t' 'NR > 1 && $3 != "decode-cohort-loaded-setup" &&
+  $3 != "decode-cohort-loaded-setup-end" { exit 1 }' "$setup_thermal_log"
+
 thermal_validate_settle_log "$settle_log" 60 8
 test "$THERMAL_LOG_SAMPLES" = "$(jq -er .settle_samples "$summary")"
 test "$THERMAL_LOG_DURATION_SECONDS" = \
@@ -362,6 +560,15 @@ test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = \
   "$(jq -er .host_contention.measurement.contended_samples "$summary")"
 test "$HOST_CONTENTION_LOG_GAPS" = \
   "$(jq -er .host_contention.measurement.telemetry_gaps "$summary")"
+host_contention_validate_measurement_log "$setup_contention_log" 5
+test "$HOST_CONTENTION_LOG_SAMPLES" = \
+  "$(jq -er .loaded_setup.host_contention.samples "$summary")"
+test "$HOST_CONTENTION_LOG_DURATION_SECONDS" = \
+  "$(jq -er .loaded_setup.host_contention.duration_seconds "$summary")"
+test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = \
+  "$(jq -er .loaded_setup.host_contention.contended_samples "$summary")"
+test "$HOST_CONTENTION_LOG_GAPS" = \
+  "$(jq -er .loaded_setup.host_contention.telemetry_gaps "$summary")"
 host_contention_validate_settle_log "$contention_settle_log" 60 8
 test "$HOST_CONTENTION_LOG_SAMPLES" = \
   "$(jq -er .host_contention.settle.samples "$summary")"
@@ -373,12 +580,18 @@ test "$HOST_CONTENTION_LOG_GAPS" = \
   "$(jq -er .host_contention.settle.telemetry_gaps "$summary")"
 host_contention_validate_thermal_alignment "$measurement_log" \
   "$contention_measurement_log"
+host_contention_validate_thermal_alignment "$setup_thermal_log" \
+  "$setup_contention_log"
 host_contention_validate_thermal_alignment "$settle_log" \
   "$contention_settle_log"
 awk -F '\t' 'NR == 1 && $3 != "decode-cohort-measurement-start" { exit 1 }
   NR > 1 && $3 != "decode-cohort-measurement" && \
     $3 != "decode-cohort-measurement-end" { exit 1 }' \
   "$contention_measurement_log"
+awk -F '\t' 'NR == 1 && $3 != "decode-cohort-loaded-setup-start" { exit 1 }
+  NR > 1 && $3 != "decode-cohort-loaded-setup" &&
+    $3 != "decode-cohort-loaded-setup-end" { exit 1 }' \
+  "$setup_contention_log"
 awk -F '\t' '$3 != "decode-cohort-settle" { exit 1 }' \
   "$contention_settle_log"
 

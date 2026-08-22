@@ -2087,21 +2087,68 @@ Before another protected run, the experiment is fixed as follows:
   count, retain nonzero dispatch/barrier and exact synchronization checks for
   every prime and measurement, and publish raw timing/topology evidence before
   asserting failure;
-- during the protected run, require the target host's calibrated normal macOS
-  memory-pressure signal for every sample and zero increase in the cumulative
-  swapout counter. The kernel signal and swap delta govern; no invented free-RAM
-  threshold is substituted. Free percentage remains diagnostic. The runner
-  binds that telemetry to the receipt, and the verifier requires matching
-  measurement start/end phases plus a telemetry span consistent with the
-  named test runtime. The Rust producer accounts for model, live-cache, and
-  snapshot bytes.
+- the original protected-run environment gate required the target host's
+  calibrated normal macOS memory-pressure signal for every sample and zero
+  increase in the cumulative swapout counter. That preregistration was tested
+  before any timing data was produced and was falsified by protected run 2:
+  the 107,431,343,168-byte mmap artifact drove free memory from 89 percent to
+  8--9 percent during load and the kernel signal changed from normal (`1`) to
+  warning (`2`), while `Swapouts` remained exactly `47,238,488`, throttled
+  pages remained zero, the test had not reached its loaded-idle marker, and no
+  timing receipt existed. Repeating or incrementally widening that setup gate
+  would not test the product's structurally memory-constrained operating point.
 
-If that predeclared experiment passes, the conditioned protocol replaces the
+The memory policy is therefore amended, before observing any conditioned B=4
+timings, from `darwin25-normal-no-swapout-v1` to
+`darwin25-phase-bound-no-vm-churn-v2`. The benchmark acceptance criteria,
+pairing, order strata, exactness checks, topology checks, 45-second loaded
+settle, thermal envelope, and host-contention envelope do not change. Only the
+environment observation is corrected:
+
+- the Rust test emits fsynced, run-UUID/PID/sequence-bound process-start,
+  loaded-settle-start, measurement-ready, and measurement-complete markers.
+  The runner acknowledges readiness only after setup telemetry is complete;
+  the Rust producer captures the VM baseline after that acknowledgement and
+  captures the terminal VM state before emitting measurement-complete. Thus
+  receipt and telemetry file I/O is outside the admitted timing window;
+- setup may report memory-pressure level `1` (normal) or `2` (warning), because
+  warning is structural for this artifact on the 128 GiB target. Level `4`
+  (critical), any other value, throttled pages, swapout growth during setup,
+  thermal state above Fair, foreign heavy work, or a changed boot epoch rejects
+  the run. Free percentage remains diagnostic and has no threshold;
+- over the exact Rust-captured measurement-ready to measurement-complete
+  window, cumulative system `pageins`, `pageouts`, `swapins`, `swapouts`,
+  `compressions`, `decompressions`, and `purges`, plus the test process's
+  `ri_pageins`, must each have delta zero. This closes the clean mmap
+  eviction/refault and swap read-back holes that a swapout-only policy misses.
+  Counter monotonicity, unchanged boot epoch, unchanged page size, and boundary
+  pressure in `{1,2}` are also required. Reactivations, wired pages, compressor
+  occupancy, free percentage, and the sampled normal/warning distribution are
+  recorded as diagnostics, not converted into invented tolerances;
+- the receipt binds the effective mmap residency shape (`file_backed_bytes`,
+  `anonymous_bytes`, and `mapped_segment_count`), requires file-backed weight
+  bytes to remain the majority, and labels the result as a within-run paired
+  comparison. Warning-admitted absolute latencies are not treated as
+  interchangeable with earlier all-normal runs without a separate calibration
+  experiment;
+- the runner executes each thermal/contention/VM probe once before arming and
+  buffers later samples in shell memory until measurement-complete. This warms
+  the probe executables and removes telemetry log writes from the exact window.
+  Probe execution still occurs during the window so a probe or any unrelated
+  host activity that causes a real page-in fails the exact-zero rule; that is
+  an intentional invalid-run signal, not an allowance to widen the threshold;
+- the verifier independently recomputes marker order and the at-least-45-second
+  loaded-settle span, matches marker objects to the raw receipt, replays every
+  exact-zero/epoch/residency rule from raw values, hashes all telemetry, and
+  rejects missing, duplicate, truncated, reordered, wrong-run, or wrong-process
+  evidence.
+
+If that amended predeclared experiment passes, the conditioned protocol replaces the
 switch-contaminated performance verdict after the receipt/verifier contract and
 product gates pass. If it fails, same-topology priming is rejected as a harness
 explanation; the positive-median gate is not waived, and the next work is a real
 B=4 implementation optimization. No result from a contended, thermally invalid,
-memory-pressured, swapped, or unreceipted run is admissible.
+critically memory-pressured, VM-churning, or unreceipted run is admissible.
 
 Run `32344447013` then exposed a receipt-verifier defect rather than a hardware
 defect.

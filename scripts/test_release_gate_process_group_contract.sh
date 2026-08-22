@@ -88,8 +88,36 @@ grep -F 'host_contention_validate_thermal_alignment' "$release_gate" >/dev/null
 grep -F 'contention_settle_log="$out_dir/settle-contention.log"' \
   "$decode_gate" >/dev/null
 grep -F 'host_contention_validate_thermal_alignment' "$decode_gate" >/dev/null
+
+# The decode monitor deliberately disables errexit while it observes the
+# producer so it can capture and clean up a failed child. Every command that
+# can authorize the exact measurement window must therefore propagate its own
+# failure explicitly. Normalize shell continuations before checking the
+# source contract so a failed probe cannot be masked by a later successful
+# command.
+decode_monitor=$(sed -e ':join' -e '/\\$/N;s/\\\n/ /;tjoin' "$decode_gate" |
+  awk '/^monitor_decode_run\(\)/ { in_monitor=1 }
+    in_monitor { print }
+    in_monitor && /^}/ { exit }')
+[[ -n "$decode_monitor" ]] || {
+  echo "decode monitor source contract could not find monitor_decode_run" >&2
+  exit 1
+}
+while IFS= read -r line; do
+  case "$line" in
+    *phase_marker_matches*|*thermal_sample*|*host_contention_sample*|\
+      *host_contention_require_quiet*|*memory_sample*|\
+      *capture_buffered_measurement_sample*|*flush_measurement_buffers*)
+      [[ "$line" == *'|| return 1'* ]] || {
+        echo "decode monitor has a fail-open measurement check: $line" >&2
+        exit 1
+      }
+      ;;
+  esac
+done <<<"$decode_monitor"
 grep -F 'scripts/run_release_gate_process_group.sh env' "$model_workflow" >/dev/null
 grep -F 'scripts/run_agentic_cache_release_gate.sh' "$model_workflow" >/dev/null
+# shellcheck disable=SC2016
 if grep -Fq '$d.cooperative_prefill.schema_version == 2' "$release_workflow"; then
   echo "publication still owns model-qualification process receipts" >&2
   exit 1

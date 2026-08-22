@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
-use std::path::PathBuf;
-use std::time::Instant;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mlx_native::{
     barrier_count, cmd_buf_count, dispatch_count, reset_counters, sync_count, MlxBuffer,
@@ -21,6 +23,10 @@ const BENCHMARK_LOGICAL_CAPACITY: usize = 131_072;
 const LOADED_IDLE_SECONDS: u64 = 45;
 const BENCHMARK_PAIRS: usize = 20;
 const RECEIPT_ENV: &str = "HF2Q_DEEPSEEK4_DECODE_COHORT_RECEIPT";
+const PHASE_DIR_ENV: &str = "HF2Q_DEEPSEEK4_DECODE_COHORT_PHASE_DIR";
+const RUN_UUID_ENV: &str = "HF2Q_DEEPSEEK4_DECODE_COHORT_RUN_UUID";
+const PHASE_ACK_FILE: &str = "measurement-armed.ack";
+const PHASE_ACK_TIMEOUT_SECONDS: u64 = 300;
 const PHYSICAL_TO_LOGICAL: [usize; LANES] = [2, 0, 3, 1];
 const BENCHMARK_OVERRIDE_ENV: &[&str] = &[
     "HF2Q_DEEPSEEK_COMPRESSED_STAGE_PROFILE",
@@ -29,12 +35,262 @@ const BENCHMARK_OVERRIDE_ENV: &[&str] = &[
     "HF2Q_DEEPSEEK_ENCODER_STAGES",
     "HF2Q_DEEPSEEK_GRAPH_DIAG",
     "HF2Q_DEEPSEEK_LAYERS_PER_CB",
+    "HF2Q_DEEPSEEK_MMAP_WEIGHTS",
     "HF2Q_DEEPSEEK_STAGE_PROFILE",
     "HF2Q_MM_ID_ROUTING_THRESHOLD",
     "MLX_PROFILE_CB",
     "MLX_PROFILE_DISPATCH",
     "MLX_UNRETAINED_REFS",
 ];
+
+#[derive(Clone, Debug)]
+struct PhaseMarker {
+    run_uuid: String,
+    sequence: u64,
+    phase: &'static str,
+    pid: u32,
+    monotonic_ns: u64,
+    wall_ns: u64,
+}
+
+impl PhaseMarker {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "run_uuid": self.run_uuid,
+            "sequence": self.sequence,
+            "phase": self.phase,
+            "pid": self.pid,
+            "monotonic_ns": self.monotonic_ns,
+            "wall_ns": self.wall_ns,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DarwinVmSnapshot {
+    boot_time_seconds: i64,
+    page_size: u64,
+    pressure_level: i32,
+    pageins: u64,
+    pageouts: u64,
+    swapins: u64,
+    swapouts: u64,
+    compressions: u64,
+    decompressions: u64,
+    purges: u64,
+    reactivations: u64,
+    throttled_pages: u64,
+    wired_pages: u64,
+    compressor_pages: u64,
+    uncompressed_compressor_pages: u64,
+    process_pageins: u64,
+}
+
+impl DarwinVmSnapshot {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "boot_time_seconds": self.boot_time_seconds,
+            "page_size": self.page_size,
+            "pressure_level": self.pressure_level,
+            "pageins": self.pageins,
+            "pageouts": self.pageouts,
+            "swapins": self.swapins,
+            "swapouts": self.swapouts,
+            "compressions": self.compressions,
+            "decompressions": self.decompressions,
+            "purges": self.purges,
+            "reactivations": self.reactivations,
+            "throttled_pages": self.throttled_pages,
+            "wired_pages": self.wired_pages,
+            "compressor_pages": self.compressor_pages,
+            "uncompressed_compressor_pages": self.uncompressed_compressor_pages,
+            "process_pageins": self.process_pageins,
+        })
+    }
+}
+
+fn checked_elapsed_ns(test_started: Instant) -> u64 {
+    u64::try_from(test_started.elapsed().as_nanos()).expect("phase monotonic time must fit u64")
+}
+
+fn wall_time_ns() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos(),
+    )
+    .expect("wall-clock nanoseconds must fit u64")
+}
+
+fn is_lowercase_uuid_shape(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+}
+
+fn write_phase_marker(
+    phase_dir: &Path,
+    run_uuid: &str,
+    sequence: u64,
+    phase: &'static str,
+    test_started: Instant,
+) -> PhaseMarker {
+    let marker = PhaseMarker {
+        run_uuid: run_uuid.to_owned(),
+        sequence,
+        phase,
+        pid: std::process::id(),
+        monotonic_ns: checked_elapsed_ns(test_started),
+        wall_ns: wall_time_ns(),
+    };
+    let name = format!("{sequence:03}-{phase}.json");
+    let published = phase_dir.join(&name);
+    let temporary = phase_dir.join(format!(".{name}.tmp"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .unwrap_or_else(|error| panic!("create phase marker {}: {error}", temporary.display()));
+    let mut encoded = serde_json::to_vec(&marker.json()).expect("serialize phase marker");
+    encoded.push(b'\n');
+    file.write_all(&encoded)
+        .unwrap_or_else(|error| panic!("write phase marker {}: {error}", temporary.display()));
+    file.sync_all()
+        .unwrap_or_else(|error| panic!("fsync phase marker {}: {error}", temporary.display()));
+    drop(file);
+    std::fs::rename(&temporary, &published).unwrap_or_else(|error| {
+        panic!(
+            "publish phase marker {} -> {}: {error}",
+            temporary.display(),
+            published.display()
+        )
+    });
+    std::fs::File::open(phase_dir)
+        .and_then(|directory| directory.sync_all())
+        .unwrap_or_else(|error| panic!("fsync phase directory {}: {error}", phase_dir.display()));
+    eprintln!(
+        "HF2Q_DEEPSEEK4_PHASE {}",
+        serde_json::to_string(&marker.json()).unwrap()
+    );
+    marker
+}
+
+fn wait_for_measurement_ack(phase_dir: &Path, run_uuid: &str) {
+    let ack = phase_dir.join(PHASE_ACK_FILE);
+    let deadline = Instant::now() + Duration::from_secs(PHASE_ACK_TIMEOUT_SECONDS);
+    loop {
+        match std::fs::read_to_string(&ack) {
+            Ok(value) => {
+                assert_eq!(
+                    value.trim(),
+                    run_uuid,
+                    "measurement acknowledgement is bound to the wrong run"
+                );
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!(
+                "read measurement acknowledgement {}: {error}",
+                ack.display()
+            ),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runner did not acknowledge measurement readiness within {PHASE_ACK_TIMEOUT_SECONDS}s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc exposes the system Mach call; this is test-only telemetry.
+fn capture_darwin_vm_snapshot() -> DarwinVmSnapshot {
+    use std::ffi::CString;
+    use std::mem::{size_of, zeroed};
+
+    unsafe fn sysctl_value<T: Copy>(name: &str) -> T {
+        let name = CString::new(name).expect("sysctl name must not contain NUL");
+        let mut value = std::mem::MaybeUninit::<T>::uninit();
+        let mut size = size_of::<T>();
+        let rc = libc::sysctlbyname(
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        );
+        assert_eq!(rc, 0, "sysctlbyname failed for {}", name.to_string_lossy());
+        assert_eq!(
+            size,
+            size_of::<T>(),
+            "sysctl size drift for {}",
+            name.to_string_lossy()
+        );
+        value.assume_init()
+    }
+
+    let pressure_level = unsafe { sysctl_value::<i32>("kern.memorystatus_vm_pressure_level") };
+    let boot_time = unsafe { sysctl_value::<libc::timeval>("kern.boottime") };
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(page_size > 0, "sysconf(_SC_PAGESIZE) failed");
+
+    let mut vm = unsafe { zeroed::<libc::vm_statistics64>() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let host_rc = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            (&mut vm as *mut libc::vm_statistics64).cast(),
+            &mut count,
+        )
+    };
+    assert_eq!(host_rc, libc::KERN_SUCCESS, "host_statistics64 failed");
+    assert_eq!(
+        count,
+        libc::HOST_VM_INFO64_COUNT,
+        "HOST_VM_INFO64 count drift"
+    );
+
+    let mut process = unsafe { zeroed::<libc::rusage_info_v4>() };
+    let process_rc = unsafe {
+        libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V4,
+            (&mut process as *mut libc::rusage_info_v4).cast(),
+        )
+    };
+    assert_eq!(process_rc, 0, "proc_pid_rusage(RUSAGE_INFO_V4) failed");
+
+    DarwinVmSnapshot {
+        boot_time_seconds: boot_time.tv_sec,
+        page_size: u64::try_from(page_size).expect("page size must fit u64"),
+        pressure_level,
+        pageins: vm.pageins,
+        pageouts: vm.pageouts,
+        swapins: vm.swapins,
+        swapouts: vm.swapouts,
+        compressions: vm.compressions,
+        decompressions: vm.decompressions,
+        purges: vm.purges,
+        reactivations: vm.reactivations,
+        throttled_pages: u64::from(vm.throttled_count),
+        wired_pages: u64::from(vm.wire_count),
+        compressor_pages: u64::from(vm.compressor_page_count),
+        uncompressed_compressor_pages: vm.total_uncompressed_pages_in_compressor,
+        process_pageins: process.ri_pageins,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn capture_darwin_vm_snapshot() -> DarwinVmSnapshot {
+    panic!("protected DeepSeek-V4 decode measurement requires macOS")
+}
 
 #[derive(Clone, Copy, Debug)]
 struct TrialCounters {
@@ -468,9 +724,22 @@ fn checked_resident_sum(label: &str, values: impl IntoIterator<Item = u64>) -> u
 #[test]
 #[ignore = "loads the official checkpoint and proves the production B=4 decode transaction"]
 fn official_artifact_b4_decode_body_is_exact_and_measured() {
+    let test_started = Instant::now();
     let receipt_path = std::env::var_os(RECEIPT_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("protected B=4 decode proof requires {RECEIPT_ENV}"));
+    let phase_dir = std::env::var_os(PHASE_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("protected B=4 decode proof requires {PHASE_DIR_ENV}"));
+    let run_uuid = std::env::var(RUN_UUID_ENV)
+        .unwrap_or_else(|_| panic!("protected B=4 decode proof requires {RUN_UUID_ENV}"));
+    assert!(phase_dir.is_dir(), "phase directory must already exist");
+    assert!(
+        is_lowercase_uuid_shape(&run_uuid),
+        "protected B=4 decode proof requires a lowercase UUID-shaped run identifier"
+    );
+    let process_start_marker =
+        write_phase_marker(&phase_dir, &run_uuid, 0, "process-start", test_started);
     for name in BENCHMARK_OVERRIDE_ENV {
         assert!(
             std::env::var_os(name).is_none(),
@@ -644,6 +913,15 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
     }
 
     let weight_resident_bytes = model.weights.resident_bytes();
+    let weight_file_backed_bytes = model.weights.file_backed_bytes();
+    let weight_anonymous_bytes = model.weights.anonymous_bytes();
+    let weight_mapped_segment_count = model.weights.mapped_segment_count();
+    let residency_shape_pass = weight_mapped_segment_count > 0
+        && weight_file_backed_bytes > weight_anonymous_bytes
+        && weight_resident_bytes
+            == weight_file_backed_bytes
+                .checked_add(weight_anonymous_bytes)
+                .expect("weight residency shape overflow");
     let serial_cache_resident_bytes = checked_resident_sum(
         "serial live caches",
         serial_caches.iter().map(Deepseek4Cache::resident_bytes),
@@ -677,8 +955,14 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
     eprintln!(
         "DeepSeek-V4 B=4 benchmark loaded-idle settle: position={BENCHMARK_POSITION} logical_capacity={BENCHMARK_LOGICAL_CAPACITY} seconds={LOADED_IDLE_SECONDS} weight_resident_bytes={weight_resident_bytes} serial_cache_resident_bytes={serial_cache_resident_bytes} cohort_cache_resident_bytes={cohort_cache_resident_bytes} serial_snapshot_resident_bytes={serial_snapshot_resident_bytes} cohort_snapshot_resident_bytes={cohort_snapshot_resident_bytes} tracked_resident_bytes={tracked_resident_bytes}"
     );
-    std::thread::sleep(std::time::Duration::from_secs(LOADED_IDLE_SECONDS));
-
+    let loaded_settle_marker = write_phase_marker(
+        &phase_dir,
+        &run_uuid,
+        1,
+        "loaded-settle-start",
+        test_started,
+    );
+    std::thread::sleep(Duration::from_secs(LOADED_IDLE_SECONDS));
     for (cache, snapshot) in serial_caches.iter_mut().zip(&serial_snapshots) {
         cache
             .restore(snapshot)
@@ -692,6 +976,11 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
             .expect("restore cohort warmup cache");
     }
     let _ = timed_cohort(&mut model, &mut cohort_caches, warm_tokens);
+    let measurement_ready_marker =
+        write_phase_marker(&phase_dir, &run_uuid, 2, "measurement-ready", test_started);
+    wait_for_measurement_ack(&phase_dir, &run_uuid);
+    let vm_window_start = capture_darwin_vm_snapshot();
+
     let mut serial_ms = Vec::with_capacity(BENCHMARK_PAIRS);
     let mut cohort_ms = Vec::with_capacity(BENCHMARK_PAIRS);
     let mut serial_counters = Vec::with_capacity(BENCHMARK_PAIRS);
@@ -779,6 +1068,15 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         }
     }
 
+    let vm_window_end = capture_darwin_vm_snapshot();
+    let measurement_complete_marker = write_phase_marker(
+        &phase_dir,
+        &run_uuid,
+        3,
+        "measurement-complete",
+        test_started,
+    );
+
     assert_eq!(serial_ms.len(), BENCHMARK_PAIRS);
     assert_eq!(cohort_ms.len(), BENCHMARK_PAIRS);
     assert_eq!(conditioned_serial_ms.len(), BENCHMARK_PAIRS);
@@ -856,8 +1154,58 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
     let unconditioned_odd_delta_median = median(order_stratum(&unconditioned_deltas, 1));
     let unconditioned_order_signature =
         unconditioned_even_delta_median < 0.0 && unconditioned_odd_delta_median > 0.0;
+    let vm_monotonic = vm_window_end.pageins >= vm_window_start.pageins
+        && vm_window_end.pageouts >= vm_window_start.pageouts
+        && vm_window_end.swapins >= vm_window_start.swapins
+        && vm_window_end.swapouts >= vm_window_start.swapouts
+        && vm_window_end.compressions >= vm_window_start.compressions
+        && vm_window_end.decompressions >= vm_window_start.decompressions
+        && vm_window_end.purges >= vm_window_start.purges
+        && vm_window_end.reactivations >= vm_window_start.reactivations
+        && vm_window_end.process_pageins >= vm_window_start.process_pageins;
+    let pagein_delta = vm_window_end
+        .pageins
+        .saturating_sub(vm_window_start.pageins);
+    let pageout_delta = vm_window_end
+        .pageouts
+        .saturating_sub(vm_window_start.pageouts);
+    let swapin_delta = vm_window_end
+        .swapins
+        .saturating_sub(vm_window_start.swapins);
+    let swapout_delta = vm_window_end
+        .swapouts
+        .saturating_sub(vm_window_start.swapouts);
+    let compression_delta = vm_window_end
+        .compressions
+        .saturating_sub(vm_window_start.compressions);
+    let decompression_delta = vm_window_end
+        .decompressions
+        .saturating_sub(vm_window_start.decompressions);
+    let purge_delta = vm_window_end.purges.saturating_sub(vm_window_start.purges);
+    let reactivation_delta = vm_window_end
+        .reactivations
+        .saturating_sub(vm_window_start.reactivations);
+    let process_pagein_delta = vm_window_end
+        .process_pageins
+        .saturating_sub(vm_window_start.process_pageins);
+    let pressure_boundary_pass = matches!(vm_window_start.pressure_level, 1 | 2)
+        && matches!(vm_window_end.pressure_level, 1 | 2);
+    let vm_window_pass = vm_monotonic
+        && vm_window_start.boot_time_seconds == vm_window_end.boot_time_seconds
+        && vm_window_start.page_size == vm_window_end.page_size
+        && pressure_boundary_pass
+        && vm_window_start.throttled_pages == 0
+        && vm_window_end.throttled_pages == 0
+        && pagein_delta == 0
+        && pageout_delta == 0
+        && swapin_delta == 0
+        && swapout_delta == 0
+        && compression_delta == 0
+        && decompression_delta == 0
+        && purge_delta == 0
+        && process_pagein_delta == 0;
     eprintln!(
-        "DeepSeek-V4 B=4 decode spike: artifact={} parity_prefix={} parity_steps={} benchmark_position={} benchmark_logical_capacity={} loaded_idle_seconds={} permutation={:?} pairs={} order=alternating exact_state_logits_cache_recurrent=true benchmark_anchor_exact_state_logits_cache_recurrent=true tracked_resident_bytes={} serial_ms={:?} cohort_ms={:?} serial_median_ms={:.3} cohort_median_ms={:.3} speedup={:.4}x unconditioned_even_delta_median_ms={:.3} unconditioned_odd_delta_median_ms={:.3} unconditioned_order_signature={} unconditioned_is_diagnostic_only=true conditioned_serial_prime_ms={:?} conditioned_cohort_prime_ms={:?} conditioned_serial_ms={:?} conditioned_cohort_ms={:?} conditioned_serial_median_ms={:.3} conditioned_cohort_median_ms={:.3} conditioned_speedup={:.4}x conditioned_even_speedup={:.4}x conditioned_odd_speedup={:.4}x conditioned_even_delta_median_ms={:.3} conditioned_odd_delta_median_ms={:.3} topology_pass={} topology_errors={:?} serial_counters={:?} cohort_counters={:?} conditioned_serial_prime_counters={:?} conditioned_cohort_prime_counters={:?} conditioned_serial_counters={:?} conditioned_cohort_counters={:?}",
+        "DeepSeek-V4 B=4 decode spike: artifact={} parity_prefix={} parity_steps={} benchmark_position={} benchmark_logical_capacity={} loaded_idle_seconds={} permutation={:?} pairs={} order=alternating exact_state_logits_cache_recurrent=true benchmark_anchor_exact_state_logits_cache_recurrent=true tracked_resident_bytes={} vm_window_pass={} pagein_delta={} pageout_delta={} swapin_delta={} swapout_delta={} compression_delta={} decompression_delta={} purge_delta={} process_pagein_delta={} serial_ms={:?} cohort_ms={:?} serial_median_ms={:.3} cohort_median_ms={:.3} speedup={:.4}x unconditioned_even_delta_median_ms={:.3} unconditioned_odd_delta_median_ms={:.3} unconditioned_order_signature={} unconditioned_is_diagnostic_only=true conditioned_serial_prime_ms={:?} conditioned_cohort_prime_ms={:?} conditioned_serial_ms={:?} conditioned_cohort_ms={:?} conditioned_serial_median_ms={:.3} conditioned_cohort_median_ms={:.3} conditioned_speedup={:.4}x conditioned_even_speedup={:.4}x conditioned_odd_speedup={:.4}x conditioned_even_delta_median_ms={:.3} conditioned_odd_delta_median_ms={:.3} topology_pass={} topology_errors={:?} serial_counters={:?} cohort_counters={:?} conditioned_serial_prime_counters={:?} conditioned_cohort_prime_counters={:?} conditioned_serial_counters={:?} conditioned_cohort_counters={:?}",
         path.display(),
         PREFIX_ROWS,
         DECODE_STEPS,
@@ -867,6 +1215,15 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         PHYSICAL_TO_LOGICAL,
         BENCHMARK_PAIRS,
         tracked_resident_bytes,
+        vm_window_pass,
+        pagein_delta,
+        pageout_delta,
+        swapin_delta,
+        swapout_delta,
+        compression_delta,
+        decompression_delta,
+        purge_delta,
+        process_pagein_delta,
         serial_ms,
         cohort_ms,
         serial_median,
@@ -903,7 +1260,8 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         && conditioned_odd_speedup > 1.0
         && conditioned_even_delta_median > 0.0
         && conditioned_odd_delta_median > 0.0;
-    let conditioned_pass = conditioned_performance_pass && topology_pass;
+    let conditioned_pass =
+        conditioned_performance_pass && topology_pass && vm_window_pass && residency_shape_pass;
 
     let artifact_bytes = std::fs::metadata(&path)
         .unwrap_or_else(|error| panic!("stat official artifact {}: {error}", path.display()))
@@ -921,8 +1279,102 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
             })
             .collect::<Vec<_>>()
     };
+    let residency_json = serde_json::json!({
+        "effective_weight_mode": "mmap-file-backed",
+        "weight_bytes": weight_resident_bytes,
+        "weight_file_backed_bytes": weight_file_backed_bytes,
+        "weight_anonymous_bytes": weight_anonymous_bytes,
+        "weight_mapped_segment_count": weight_mapped_segment_count,
+        "shape_pass": residency_shape_pass,
+        "serial_live_cache_bytes": serial_cache_resident_bytes,
+        "cohort_live_cache_bytes": cohort_cache_resident_bytes,
+        "serial_snapshot_bytes": serial_snapshot_resident_bytes,
+        "cohort_snapshot_bytes": cohort_snapshot_resident_bytes,
+        "tracked_total_bytes": tracked_resident_bytes,
+    });
+    let phase_contract_json = serde_json::json!({
+        "policy": "fsynced-run-bound-markers-v1",
+        "run_uuid": run_uuid,
+        "pid": std::process::id(),
+        "ack_timeout_seconds": PHASE_ACK_TIMEOUT_SECONDS,
+        "markers": [
+            process_start_marker.json(),
+            loaded_settle_marker.json(),
+            measurement_ready_marker.json(),
+            measurement_complete_marker.json(),
+        ],
+    });
+    let vm_window_json = serde_json::json!({
+        "policy": "darwin25-phase-bound-no-vm-churn-v2",
+        "claim_scope": "within-run-paired-only",
+        "start": vm_window_start.json(),
+        "end": vm_window_end.json(),
+        "deltas": {
+            "pageins": pagein_delta,
+            "pageouts": pageout_delta,
+            "swapins": swapin_delta,
+            "swapouts": swapout_delta,
+            "compressions": compression_delta,
+            "decompressions": decompression_delta,
+            "purges": purge_delta,
+            "reactivations": reactivation_delta,
+            "process_pageins": process_pagein_delta,
+        },
+        "monotonic_counters": vm_monotonic,
+        "pressure_boundary_pass": pressure_boundary_pass,
+        "no_churn_pass": vm_window_pass,
+    });
+    let conditioned_json = serde_json::json!({
+        "protocol": "same-topology-prime-restore-measure",
+        "primes_per_measurement": 1,
+        "serial_prime_ms": conditioned_serial_prime_ms,
+        "cohort_prime_ms": conditioned_cohort_prime_ms,
+        "serial_ms": conditioned_serial_ms,
+        "cohort_ms": conditioned_cohort_ms,
+        "serial_median_ms": conditioned_serial_median,
+        "cohort_median_ms": conditioned_cohort_median,
+        "speedup": conditioned_speedup,
+        "even_order_speedup": conditioned_even_speedup,
+        "odd_order_speedup": conditioned_odd_speedup,
+        "even_order_paired_delta_median_ms": conditioned_even_delta_median,
+        "odd_order_paired_delta_median_ms": conditioned_odd_delta_median,
+        "performance_pass": conditioned_performance_pass,
+        "serial_prime_counters": counters_json(&conditioned_serial_prime_counters),
+        "cohort_prime_counters": counters_json(&conditioned_cohort_prime_counters),
+        "serial_counters": counters_json(&conditioned_serial_counters),
+        "cohort_counters": counters_json(&conditioned_cohort_counters),
+    });
+    let benchmark_json = serde_json::json!({
+        "position": BENCHMARK_POSITION,
+        "anchor_exact_state_logits_cache_recurrent": true,
+        "logical_capacity": BENCHMARK_LOGICAL_CAPACITY,
+        "loaded_idle_seconds": LOADED_IDLE_SECONDS,
+        "pairs": BENCHMARK_PAIRS,
+        "order": "alternating",
+        "serial_ms": serial_ms,
+        "cohort_ms": cohort_ms,
+        "serial_median_ms": serial_median,
+        "cohort_median_ms": cohort_median,
+        "speedup": speedup,
+        "unconditioned_order_signature": {
+            "historical_signature": "even_delta_negative_odd_delta_positive",
+            "even_delta_median_ms": unconditioned_even_delta_median,
+            "odd_delta_median_ms": unconditioned_odd_delta_median,
+            "observed": unconditioned_order_signature,
+            "gating": false,
+        },
+        "conditioned": conditioned_json,
+        "serial_counters": counters_json(&serial_counters),
+        "cohort_counters": counters_json(&cohort_counters),
+        "serial_command_buffers_per_pair": expected_serial_command_buffers,
+        "cohort_command_buffers_per_pair": expected_cohort_command_buffers,
+        "serial_synchronizations_per_pair": LANES,
+        "cohort_synchronizations_per_pair": 1,
+        "topology_pass": topology_pass,
+        "topology_errors": topology_errors,
+    });
     let receipt = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "status": if conditioned_pass { "pass" } else { "fail" },
             "artifact_bytes": artifact_bytes,
             "layers": model.cfg.num_hidden_layers,
@@ -936,62 +1388,10 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
                 "physical_to_logical": PHYSICAL_TO_LOGICAL,
                 "exact_state_logits_cache_recurrent": true,
             },
-            "residency": {
-                "weight_bytes": weight_resident_bytes,
-                "serial_live_cache_bytes": serial_cache_resident_bytes,
-                "cohort_live_cache_bytes": cohort_cache_resident_bytes,
-                "serial_snapshot_bytes": serial_snapshot_resident_bytes,
-                "cohort_snapshot_bytes": cohort_snapshot_resident_bytes,
-                "tracked_total_bytes": tracked_resident_bytes,
-            },
-            "benchmark": {
-                "position": BENCHMARK_POSITION,
-                "anchor_exact_state_logits_cache_recurrent": true,
-                "logical_capacity": BENCHMARK_LOGICAL_CAPACITY,
-                "loaded_idle_seconds": LOADED_IDLE_SECONDS,
-                "pairs": BENCHMARK_PAIRS,
-                "order": "alternating",
-                "serial_ms": serial_ms,
-                "cohort_ms": cohort_ms,
-                "serial_median_ms": serial_median,
-                "cohort_median_ms": cohort_median,
-                "speedup": speedup,
-                "unconditioned_order_signature": {
-                    "historical_signature": "even_delta_negative_odd_delta_positive",
-                    "even_delta_median_ms": unconditioned_even_delta_median,
-                    "odd_delta_median_ms": unconditioned_odd_delta_median,
-                    "observed": unconditioned_order_signature,
-                    "gating": false,
-                },
-                "conditioned": {
-                    "protocol": "same-topology-prime-restore-measure",
-                    "primes_per_measurement": 1,
-                    "serial_prime_ms": conditioned_serial_prime_ms,
-                    "cohort_prime_ms": conditioned_cohort_prime_ms,
-                    "serial_ms": conditioned_serial_ms,
-                    "cohort_ms": conditioned_cohort_ms,
-                    "serial_median_ms": conditioned_serial_median,
-                    "cohort_median_ms": conditioned_cohort_median,
-                    "speedup": conditioned_speedup,
-                    "even_order_speedup": conditioned_even_speedup,
-                    "odd_order_speedup": conditioned_odd_speedup,
-                    "even_order_paired_delta_median_ms": conditioned_even_delta_median,
-                    "odd_order_paired_delta_median_ms": conditioned_odd_delta_median,
-                    "performance_pass": conditioned_performance_pass,
-                    "serial_prime_counters": counters_json(&conditioned_serial_prime_counters),
-                    "cohort_prime_counters": counters_json(&conditioned_cohort_prime_counters),
-                    "serial_counters": counters_json(&conditioned_serial_counters),
-                    "cohort_counters": counters_json(&conditioned_cohort_counters),
-                },
-                "serial_counters": counters_json(&serial_counters),
-                "cohort_counters": counters_json(&cohort_counters),
-                "serial_command_buffers_per_pair": expected_serial_command_buffers,
-                "cohort_command_buffers_per_pair": expected_cohort_command_buffers,
-                "serial_synchronizations_per_pair": LANES,
-                "cohort_synchronizations_per_pair": 1,
-                "topology_pass": topology_pass,
-                "topology_errors": topology_errors,
-            },
+            "residency": residency_json,
+            "phase_contract": phase_contract_json,
+            "darwin_vm_window": vm_window_json,
+            "benchmark": benchmark_json,
             "benchmark_environment": {
                 "profile": "clean-hf2q-mlx-metal-v1",
                 "override_variables_absent": true,
@@ -1023,6 +1423,6 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
     });
     assert!(
         conditioned_pass,
-        "exact B=4 conditioned benchmark must retain topology and a positive overall/even/odd paired median: topology_errors={topology_errors:?} serial={conditioned_serial_median:.3}ms cohort={conditioned_cohort_median:.3}ms even={conditioned_even_speedup:.4}x/{conditioned_even_delta_median:.3}ms odd={conditioned_odd_speedup:.4}x/{conditioned_odd_delta_median:.3}ms"
+        "exact B=4 conditioned benchmark must retain residency/topology, zero VM churn, and a positive overall/even/odd paired median: residency_shape_pass={residency_shape_pass} vm_window_pass={vm_window_pass} topology_errors={topology_errors:?} serial={conditioned_serial_median:.3}ms cohort={conditioned_cohort_median:.3}ms even={conditioned_even_speedup:.4}x/{conditioned_even_delta_median:.3}ms odd={conditioned_odd_speedup:.4}x/{conditioned_odd_delta_median:.3}ms"
     );
 }
