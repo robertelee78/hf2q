@@ -53,6 +53,8 @@ mod ffn_forward_tests;
 #[cfg(test)]
 mod forward_tests;
 #[cfg(test)]
+mod mixed_coherence_tests;
+#[cfg(test)]
 mod model_tests;
 #[cfg(test)]
 mod real_artifact_cohort_tests;

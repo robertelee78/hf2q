@@ -4,7 +4,8 @@
   DeepSeek4 model-free Lane A proof complete at rev 8; real-artifact gates
   remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-22 (rev 8, DeepSeek4 multi-anchor parity milestone)
+- Updated: 2026-08-22 (rev 9, cross-family multi-anchor parity plus B.0
+  coherence milestone)
   — the Qwen implementation lineage begins at `95d618c8`, based on main
   `32181b61`: explicit per-slot AnchorStore,
   linear-lineage pruning, fail-atomic restore preflight, exact payload
@@ -24,6 +25,11 @@
   committed and pending payload is preflighted before the live cache migrates
   once, and strict-prefix-only anchor matching preserves the family-native
   live-logit equality path. DeepSeek4 real-artifact receipts remain open too.
+  The model-free B.0 Mixed-step spike also passed both cooperative-prefill
+  commit and poison paths without changing any concurrently decoding peer
+  cursor or cache/compressor byte; the exact ownership ledger and test names
+  are recorded in §B.0. That result opens B.1 for implementation but does not
+  by itself accept the scheduler policy.
 - Owners: hf2q serving engine (execution: the active qwen35/qwen38 serving-lane session; plan authored by the FreeToken research session)
 - Code pins: planning review at hf2q `242882e8`; rev-6 execution based on
   merged main `32181b61`; mlx-native `0.11.2`. Anchors were authored at
@@ -206,6 +212,15 @@ and N>1 concurrency before marking the family phase hardware-proven.
 ### Lane B — Mixed-phase cooperative prefill (deepseek4)
 
 **B.0 — Coherence spike, first, in its own branch (Kimi M1 — this gate decides the lane).** Mixed cooperative execution has never run: cohort commit/poison concurrent with live decode cursors on peer slots. Before any policy work: enumerate exactly which per-slot state the cooperative transaction touches (`Deepseek4CooperativePrefillPlan` path, all-or-poison commit via `publish_prefill_cohort_after_gate` — verifier_forward.rs:76, the cooperative-PREFILL publisher; `publish_verifier_cohort_after_gate` in decode_cohort.rs:12 is the DECODE publisher, which a prior draft misnamed here; direct session-cache borrow engine_deepseek4.rs:649-683). The spike must exercise BOTH the commit and poison paths of the prefill publisher, and their interplay with the decode publisher during a Mixed step, prove decode-lane KV append cursors and compressor accumulators are untouched by commit AND by poison, and land a byte-identity test shaped *cohort-prefill + concurrent decode step* (not cohort-prefill alone). **Abort criterion:** if the spike shows cohort commit touches decode-lane state, the `engine.rs:9716-9731` bypass is load-bearing for correctness, Lane B becomes a scheduler redesign, and it exits this ADR to its own.
+
+**B.0 deciding-spike verdict (2026-08-22): PASS; B.1 may proceed.** The source-grounded ownership ledger is:
+
+- Planning is read-only. `plan_deepseek4_prefill_cohort` selects only FIFO handles whose installed work is `Prefill`; `prepare_cooperative_prefill` validates the selected cache cursor/token ledger/live-logit state and reserves selected token-ledger capacity without publishing tokens.
+- `supervised_verifier_prefill_cohort` forms mutable cache references from only the sorted selected slot indices. The uncommitted transaction can write those selected caches' circular/compressed attention storage, indexer rows, and the four F32 compressor accumulators (`main_kv_state`, `main_score_state`, `indexer_kv_state`, `indexer_score_state`). Its combined row state, attention buffer, FFN state, and `mm_id` scratch are transaction-local model buffers, not slot state.
+- `publish_prefill_cohort_after_gate` prevalidates and then advances only the selected caches' `next_position`. A prevalidation or supervisor-gate failure sets `poisoned` only on those selected caches; physical writes are deliberately not rolled back and remain invisible because a poisoned cache must reset/replay. It does not receive a peer decode cache reference.
+- After a successful cache publication, serving mutates only each selected prefill lane's pending recovery anchor (when the boundary is crossed), committed-token ledger, `Deepseek4PrefillState` cursor/progress, and scheduler prefill accounting. Final logits remain on the serial completion path. The decode publisher independently validates and advances only its four selected decode cursors.
+
+The executable proof is `mixed_prefill_commit_preserves_decode_lane_cursor_and_cache_bytes` plus `mixed_prefill_poison_preserves_decode_lane_cursor_and_cache_bytes` in `src/inference/models/deepseek4/mixed_coherence_tests.rs`. Both build six independent warm caches (two aligned prefill lanes and four live decode lanes), execute the real decode publisher first to mirror a Mixed step, then execute cooperative-prefill publication. The first accepts the prefill commit; the second rejects its supervisor gate and poisons the two prefill caches. Both byte-compare every decode lane's complete attention/KV backing, indexer storage, and all four compressor accumulators, and require its cursor to remain exactly at the one position published by its own decode step. Result: 2 passed, 0 failed. The bypass is not load-bearing for cache-state isolation; B.1 remains responsible for scheduler/SSE latency and product-performance contracts.
 
 **B.1 — Mixed cohort policy (only after B.0 passes).** Treat this as a new scheduler policy, not the removal of one bypass: cohort planning under a runnable decode must honor a per-lane row cap AND the aggregate cap while preserving FIFO-prefix compatibility, identical-plan/reply-class requirements, and recovery-tail behavior (planner engine.rs:9601-9687; lane clamp slots.rs:224-242; `MIN_MATRIX_APPEND_TOKENS = 33`, verifier_forward.rs:25; recovery tail engine_deepseek4.rs:48).
 - Rows-per-lane parameterized ∈ {128, 256}; **default 4×128** (halves F payments per aggregate progress while keeping GPU occupancy nearest today's serial Mixed slice); promote to 4×256 only on hardware measurement with contract margin. Projected walls for the canonical four ~3,520-token warm-suffix workload: serial Mixed ≈ 75 s of aggregate prefill work; 4×256 ≈ 31 s; 4×128 ≈ 46 s with near-serial per-slice occupancy.
