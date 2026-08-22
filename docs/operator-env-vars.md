@@ -3,10 +3,10 @@
 Default behavior on a supported model class (e.g., Gemma-4 26B GGUF,
 Qwen 3.5/3.6 GGUF):
 
-- **Coherence:** matches the F16 lm_head reference on the locked gates
-  (Qwen sourdough byte-identical vs llama.cpp; Gemma 300-Format greedy
-  enumeration coherent through 94+ items; chemistry+thinking probe
-  first-token byte-identical vs llama.cpp `--reasoning on`).
+- **Coherence:** matches the locked reference trajectories on the qualified
+  family gates. Gemma executes the artifact's declared embedding and output
+  matrix representation directly; it does not silently change the target
+  head at load time.
 - **Throughput** (M5 Max, APEX-Q5_K_M, post-ADR-032):
   - Gemma 4 26B-A4B-it: 1.51× AHEAD of llama.cpp `-fa 1` at tg2000,
     1.67× AHEAD at tg200.
@@ -19,29 +19,15 @@ normal operation none of them need to be set.
 
 ---
 
-## lm_head path
+## Gemma matrix storage
 
-The decoder's lm_head is the single biggest memory-bandwidth consumer
-at batch=1. hf2q auto-selects between an F16 dense mat-vec and a Q8_0
-quantized mat-vec based on the loaded weights' size, and when Q8 is
-used, a CPU-side exact rerank recovers the F16 trajectory.
-
-| Var | Default | Values | Effect |
-|---|---|---|---|
-| `HF2Q_LMHEAD_Q8` | auto | `1`, `0` | `1` forces Q8 (requires `hidden_size % 32 == 0`); `0` forces F16 (the escape hatch). Unset = auto: Q8 when F16 weight > 256 MB AND hidden_size % 32 == 0. |
-| `HF2Q_LMHEAD_RERANK` | on when Q8 | `0` | `0` disables the exact-F32 rerank of top candidates, leaving raw Q8 argmax. **Unsafe** — Q8's ~5e-3 logit noise envelope occasionally flips a near-tiebreak (observed as rare mid-decode `<pad>` emission). Only set for speed-vs-correctness benchmarking. |
-| `HF2Q_LMHEAD_COMPARE` | off | `1` | Keeps both F16 and Q8 buffers resident so a future A/B diagnostic can compare logits at every step. Not wired into the live decode path today. |
-
-**Why the default is Q8+rerank on large-vocab models:** Q8 alone
-recovers ~12% decode throughput vs F16 by halving the lm_head weight
-traffic (1.47 GB → 784 MB on Gemma-4 26B). The rerank adds ~0.4% back
-of overhead and preserves F16 output byte-for-byte on the locked gates.
-A dormant GPU top-K kernel exists (mlx-native `top_k_f32`); it is
-intentionally unused because for vocab=262144 the CPU threshold scan
-costs ~40 μs/token while the single-threadgroup GPU kernel costs
-~5 ms/token on phase-2 serial extraction. If a parallel-phase-2 redesign
-lands, the GPU path can be wired in without changing the Rust-side
-rerank logic.
+Gemma embeds tokens and projects logits from the exact matrix encoding stored
+in the GGUF. The loader checks that embedding gather and projection kernels
+both support that encoding before mapping model storage. A tied output head
+shares the embedding allocation; an explicit `output.weight` retains its own
+declared encoding. There is no head-format environment override because
+silently dequantizing or re-quantizing a served artifact would change its
+model semantics. Unsupported encodings fail closed before allocation.
 
 ---
 
@@ -120,8 +106,8 @@ fixable single-kernel mismatch. Closing it would require pervasive
 pre-MoE kernel alignment (option 1 in the ADR). Not pursuing in the
 current phase.
 
-Speed line: `shipping`. Default decode matches llama.cpp's coherence
+Speed line: `shipping`. Default decode matches the locked reference coherence
 on the locked gates at 1.31–1.67× of its throughput across Gemma 4
-and Qwen 3.6 APEX-Q5_K_M (see "Default behavior" at top for per-regime
-numbers).  Q8+rerank is the production lm_head strategy; F16 remains
-available via `HF2Q_LMHEAD_Q8=0`.
+and Qwen 3.6 APEX-Q5_K_M (see "Default behavior" at top for the historical
+per-regime measurements). Gemma's current output path uses the stored artifact
+representation directly.

@@ -1,231 +1,60 @@
 //! ADR-040 Phase F M2.2 / S1 — batched lm_head over N gathered decode slots.
 //!
-//! The single largest matmul in gemma4 decode is the lm_head (Q6_K
-//! [2816, 262144] = 605 MB weight read). Under continuous batching, N decode
-//! slots each run their own scalar lm_head → N independent 605 MB reads. This
-//! module computes the head ONCE for N gathered hidden rows (`m=N`), amortizing
-//! that weight read across slots — the first slice (S1) of the batched decode
-//! forward.
+//! The single largest matmul in Gemma decode is the artifact-declared output
+//! head. Under continuous batching, N scalar calls would reread that matrix N
+//! times. This module computes the head over N gathered hidden rows while
+//! preserving scalar-row reduction order — the first slice (S1) of the batched
+//! decode forward.
 //!
-//! Correctness rests on the proven kernel property H-S1-rowparity
-//! (mlx-native `bench_lmhead_batch_row_parity`, commit 272b2a3): the `mv`
-//! quantized matmul produces output row r BIT-IDENTICALLY at `m=N` and `m=1`,
-//! so the per-row logits this produces equal the scalar head's logits exactly.
-//! The end-to-end gate is the existing `slot_aware_*` byte-equivalence suite.
-//!
-//! Production regime only: Q6_K lm_head (the gemma4 default, ADR-028 iter-188).
-//! Non-Q6_K heads return an error rather than silently diverging (no fallback —
-//! mantra). The shared per-row finalize (argmax + Q6_K rerank) lands in S1b.
+//! Quantized types use their row-identical continuous-width route. Dense
+//! F32/F16/BF16 types execute one scalar row at a time because their tile
+//! reduction order differs. The end-to-end gate is the `slot_aware_*`
+//! byte-equivalence suite.
 
 use anyhow::Result;
 use mlx_native::graph::GraphSession;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
-use crate::debug::INVESTIGATION_ENV;
 use crate::quantize::imatrix::ImatrixHint;
-use crate::serve::forward_mlx_shared::dispatch_qmatmul;
 use crate::serve::gpu::GpuContext;
 
+use super::batched_body::dispatch_dense_rowident;
 use super::model::MlxModelWeights;
 
 /// DIAGNOSTIC: one-shot gate so the HF2Q_MVN_ENCODE_TRACE dump fires for only
 /// the FIRST lm_head_batched call (avoids 1000s of head calls' worth of noise).
 static FIRST_HEAD_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-// ADR-040 §26 — gated rerank profiling (HF2Q_RERANK_PROFILE=1).
-static RERANK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static RERANK_CAND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static RERANK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static RERANK_PROFILE_ON: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("HF2Q_RERANK_PROFILE").as_deref() == Ok("1"));
-/// (total_rerank_ns, total_candidates, calls) since last reset.
-pub fn rerank_profile() -> (u64, u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (
-        RERANK_NS.load(Relaxed),
-        RERANK_CAND.load(Relaxed),
-        RERANK_CALLS.load(Relaxed),
-    )
-}
-pub fn rerank_profile_reset() {
-    use std::sync::atomic::Ordering::Relaxed;
-    RERANK_NS.store(0, Relaxed);
-    RERANK_CAND.store(0, Relaxed);
-    RERANK_CALLS.store(0, Relaxed);
-}
-
-/// Output of [`MlxModelWeights::lm_head_batched`]: row-major per-slot logits and
-/// the post-final-norm hidden rows (the exact-F32 rerank operand that
-/// [`MlxModelWeights::finalize_token_from_logits`] needs).
+/// Output of [`MlxModelWeights::lm_head_batched`]: row-major per-slot logits.
 pub struct BatchedHeadOut {
     /// `[n, vocab_size]` post-softcap logits.
     pub logits: Vec<f32>,
-    /// `[n, hidden_size]` post-final-norm hidden (the `hidden·embed` operand).
-    pub normed: Vec<f32>,
-    /// ADR-040 §26 iter-M — GPU-side sampling results (top1 + threshold candidates
-    /// per slot), present only on the fused path with `HF2Q_GPU_SAMPLE=1`. When
-    /// present + not overflowed, Pass-2 uses these instead of the host full-vocab
-    /// argmax+candidate scan (the cheap F64 rerank still runs on host).
-    pub gpu_sample: Option<GpuSampleOut>,
 }
 
-/// ADR-040 §26 iter-M — host-side copy of the GPU sample kernel outputs.
-pub struct GpuSampleOut {
-    pub top1_idx: Vec<u32>,   // [n]
-    pub top1_val: Vec<f32>,   // [n]
-    pub cand_count: Vec<u32>, // [n] (total; may exceed cap)
-    pub overflow: Vec<u32>,   // [n] (1 if count>cap)
-    pub cand_ids: Vec<u32>,   // [n*cap], atomic-append order
-    pub cap: usize,
-}
+#[cfg(test)]
+mod host_payload_contract {
+    use super::BatchedHeadOut;
 
-/// ADR-040 §26 iter-M — the GPU buffers returned by `encode_lm_head_into`, read
-/// back to host after the single fused-pipeline finish.
-pub struct GpuSampleBuffers {
-    pub top1_idx: mlx_native::MlxBuffer,
-    pub top1_val: mlx_native::MlxBuffer,
-    pub cand_count: mlx_native::MlxBuffer,
-    pub overflow: mlx_native::MlxBuffer,
-    pub cand_ids: mlx_native::MlxBuffer,
-    pub params: mlx_native::MlxBuffer,
-    pub cap: usize,
+    #[test]
+    fn batched_head_host_payload_contains_logits_only() {
+        // Deliberately destructure without `..`: adding a second host payload
+        // (for example the retired post-norm hidden rows) must break this gate
+        // until the transfer is explicitly reviewed and qualified.
+        let BatchedHeadOut { logits } = BatchedHeadOut {
+            logits: vec![1.0, 2.0],
+        };
+        assert_eq!(logits, [1.0, 2.0]);
+    }
 }
 
 impl MlxModelWeights {
-    /// ADR-040 S1b — shared per-row finalize: Q8/Q6_K coarse-logit → exact-F32
-    /// argmax rerank. Pure CPU. Extracted verbatim from the scalar
-    /// `forward_decode` tail (forward_gpu.rs:1008–1077) so the scalar and
-    /// batched-lm_head paths produce BIT-IDENTICAL tokens by construction.
-    ///
-    /// Inputs are per-row slices so either path can supply its own buffers:
-    /// - `logits_row`: post-softcap logits `[vocab_size]`.
-    /// - `normed_row`: post-final-norm hidden `[hidden_size]` (the `hidden·embed`
-    ///   rerank operand — scalar passes `norm_out`, batched passes its `normed_b`
-    ///   row).
-    /// - `gpu_top1` / `top1_val`: the GPU-argmax index+value over `logits_row`
-    ///   (both paths run the SAME `dispatch_argmax_f32` kernel, so these match).
-    ///
-    /// When rerank is inactive (F16 head, or `HF2Q_LMHEAD_RERANK=0`) returns
-    /// `gpu_top1` unchanged — identical to the scalar `else` arm.
-    pub(crate) fn finalize_token_from_logits(
-        &self,
-        logits_row: &[f32],
-        normed_row: &[f32],
-        gpu_top1: u32,
-        top1_val: f32,
-    ) -> Result<u32> {
-        let vocab_size = self.vocab_size;
-        if !self.rerank_active() {
-            return Ok(gpu_top1);
-        }
-        // Headroom for Q8 noise (≈5e-3); delta=0.5 keeps the candidate set small
-        // while guaranteeing the true winner is included. Verbatim from scalar.
-        let delta: f32 = 0.5;
-        let threshold = top1_val - delta;
-        let mut candidates: Vec<u32> = Vec::with_capacity(64);
-        for (i, &v) in logits_row[..vocab_size].iter().enumerate() {
-            if v >= threshold {
-                candidates.push(i as u32);
-            }
-        }
-        self.rerank_candidates(candidates, normed_row, gpu_top1)
-    }
-
-    /// ADR-040 §26 iter-M — finalize using the GPU-collected threshold candidate
-    /// set (logits >= top1_val-0.5) instead of a host full-vocab scan. BYTE-IDENTICAL
-    /// to [`Self::finalize_token_from_logits`]: the GPU candidate set equals the host
-    /// threshold scan (proven in `adr_040_gpu_sample`), and BOTH feed the SAME
-    /// `rerank_candidates` tail (specials + sort+dedup + F64 rerank), so the token is
-    /// identical. `gpu_cand_ids` is the GPU's raw (unsorted) candidate id slice.
-    pub(crate) fn finalize_token_from_gpu_candidates(
-        &self,
-        gpu_cand_ids: &[u32],
-        normed_row: &[f32],
-        gpu_top1: u32,
-    ) -> Result<u32> {
-        if !self.rerank_active() {
-            return Ok(gpu_top1);
-        }
-        self.rerank_candidates(gpu_cand_ids.to_vec(), normed_row, gpu_top1)
-    }
-
-    #[inline]
-    fn rerank_active(&self) -> bool {
-        (self.lm_head_q8.is_some() || self.lm_head_q6k.is_some())
-            && !INVESTIGATION_ENV.lmhead_rerank_disabled
-    }
-
-    /// Shared finalize tail (host vs GPU candidate paths call this IDENTICALLY):
-    /// append the special tokens, sort+dedup, then the exact-F32 rerank via the
-    /// F64-accumulated hidden·embed dot. `candidates` is the raw threshold set.
-    fn rerank_candidates(
-        &self,
-        mut candidates: Vec<u32>,
-        normed_row: &[f32],
-        gpu_top1: u32,
-    ) -> Result<u32> {
-        let vocab_size = self.vocab_size;
-        let hs = self.hidden_size;
-        let embed_f32: &[f32] = self
-            .embed_weight
-            .as_slice()
-            .map_err(|e| anyhow::anyhow!("finalize rerank embed read: {e}"))?;
-        for sp in [0u32, 1, 2, 105, 106] {
-            if (sp as usize) < vocab_size {
-                candidates.push(sp);
-            }
-        }
-        candidates.sort_unstable();
-        candidates.dedup();
-
-        // ADR-040 §26 — gated profiling (HF2Q_RERANK_PROFILE=1).
-        let _rr_prof = *RERANK_PROFILE_ON;
-        let _rr_t = if _rr_prof {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        // Exact F32 rerank via hidden · embed_row. Softcap is monotonic so
-        // skipping it doesn't change argmax order. F64 accumulator for precision.
-        let mut best_tok: u32 = gpu_top1;
-        let mut best_logit: f32 = f32::NEG_INFINITY;
-        for &tok in &candidates {
-            let row_off = (tok as usize) * hs;
-            if row_off + hs > embed_f32.len() {
-                continue;
-            }
-            let row = &embed_f32[row_off..row_off + hs];
-            let mut acc: f64 = 0.0;
-            for i in 0..hs {
-                acc += (normed_row[i] as f64) * (row[i] as f64);
-            }
-            let l = acc as f32;
-            if l > best_logit {
-                best_logit = l;
-                best_tok = tok;
-            }
-        }
-        if let Some(t) = _rr_t {
-            RERANK_NS.fetch_add(
-                t.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            RERANK_CAND.fetch_add(
-                candidates.len() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            RERANK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok(best_tok)
-    }
-
     /// Batched final-norm + lm_head (`m=N`) + softcap over `n` gathered hidden
     /// rows. `hidden_rows` is the row-major `[n, hidden_size]` F32 final hidden
     /// state (one row per slot, captured before final-norm — i.e. the value at
     /// `self.activations.hidden` after the layer loop). Returns the row-major
     /// `[n, vocab_size]` F32 logits, post-softcap, ready for per-row finalize.
     ///
-    /// Per-row BIT-IDENTICAL to the scalar head (H-S1-rowparity). Q6_K only.
+    /// Per-row bit-identical to the scalar head by row-identical dispatch.
     pub fn lm_head_batched(
         &self,
         hidden_rows: &[f32],
@@ -235,11 +64,7 @@ impl MlxModelWeights {
         let hs = self.hidden_size;
         let vocab = self.vocab_size;
         if n == 0 {
-            return Ok(BatchedHeadOut {
-                logits: Vec::new(),
-                normed: Vec::new(),
-                gpu_sample: None,
-            });
+            return Ok(BatchedHeadOut { logits: Vec::new() });
         }
         if hidden_rows.len() != n * hs {
             anyhow::bail!(
@@ -249,13 +74,7 @@ impl MlxModelWeights {
                 hs
             );
         }
-        // S1 production path: Q6_K lm_head only. Other quant heads (Q8/F16) are
-        // not yet wired for the batched path; erroring here is intentional (the
-        // SlotAware worker routes only Q6_K-lm_head models through this) — no
-        // silent scalar fallback that would mask a misroute.
-        let q6k = self.lm_head_q6k.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("lm_head_batched requires a Q6_K lm_head (production decode path)")
-        })?;
+        let lm_head = self.resolved_lm_head();
 
         let (exec, reg) = gpu.split();
         let dev = exec.device();
@@ -338,16 +157,18 @@ impl MlxModelWeights {
         )
         .map_err(|e| anyhow::anyhow!("lm_head_batched final norm: {e}"))?;
 
-        // Batched lm_head: [n,hidden] x Q6_K[hidden,vocab] -> [n,vocab].
-        s.barrier_between(&[&normed_b, &q6k.buffer], &[&logits_b]);
-        dispatch_qmatmul(
+        // Batched lm_head executes the artifact's declared representation.
+        s.barrier_between(&[&normed_b, &lm_head.buffer], &[&logits_b]);
+        dispatch_dense_rowident(
             &mut s,
             reg,
             dev,
             &normed_b,
-            q6k,
+            lm_head,
             &logits_b,
-            n as u32,
+            n,
+            hs,
+            vocab,
             ImatrixHint::Global("output.weight"),
         )?;
 
@@ -401,31 +222,25 @@ impl MlxModelWeights {
             .as_slice::<f32>()
             .map_err(|e| anyhow::anyhow!("lm_head_batched read logits: {e}"))?
             .to_vec();
-        let normed: Vec<f32> = normed_b
-            .as_slice::<f32>()
-            .map_err(|e| anyhow::anyhow!("lm_head_batched read normed_b: {e}"))?
-            .to_vec();
         host_phases::add(
             host_phases::Phase::LmheadReadback,
             _hp.elapsed().as_nanos() as u64,
         );
-        Ok(BatchedHeadOut {
-            logits,
-            normed,
-            gpu_sample: None,
-        })
+        Ok(BatchedHeadOut { logits })
     }
 
-    /// ADR-040 §25 iter-L — encode the lm_head (final RMS-norm + Q6_K matmul +
+    /// ADR-040 §25 iter-L — encode the lm_head (final RMS-norm + native matmul +
     /// softcap) into an EXISTING session `s`, reading `hidden_buf` (the on-GPU
     /// `[n,hidden]` body output) DIRECTLY — no host round-trip and NO separate
     /// session/commit. BYTE-IDENTICAL to [`Self::lm_head_batched`]'s encode (same
     /// dispatches, order, and per-call `[cap, n*vocab]` softcap params — see the
     /// §0.16 root-cause note there). Does NOT finish/readback: the caller appends
     /// this as the final chunk of the body's CB pipeline, then does the single
-    /// `commit_and_wait` and reads the returned `(logits_b, normed_b)`. The third
-    /// returned buffer (`softcap_params_b`) is handed back so it outlives the GPU
-    /// read (kept alive until the caller's finish). Q6_K head only.
+    /// `commit_and_wait` and reads only `logits_b`. `normed_b` and the third
+    /// returned buffer (`softcap_params_b`) are handed back solely so they
+    /// outlive the GPU read; neither crosses the host boundary. The caller
+    /// currently enables this fused command-buffer path only for its qualified
+    /// Q6_K regime.
     pub(crate) fn encode_lm_head_into(
         &self,
         s: &mut GraphSession,
@@ -433,13 +248,11 @@ impl MlxModelWeights {
         n: usize,
         dev: &MlxDevice,
         reg: &mut KernelRegistry,
-    ) -> Result<(MlxBuffer, MlxBuffer, MlxBuffer, Option<GpuSampleBuffers>)> {
+    ) -> Result<(MlxBuffer, MlxBuffer, MlxBuffer)> {
         let hs = self.hidden_size;
         let vocab = self.vocab_size;
         let metal_dev = dev.metal_device();
-        let q6k = self.lm_head_q6k.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("encode_lm_head_into requires a Q6_K lm_head (production decode path)")
-        })?;
+        let lm_head = self.resolved_lm_head();
 
         let normed_b = dev
             .alloc_buffer(n * hs * 4, DType::F32, vec![n * hs])
@@ -480,15 +293,17 @@ impl MlxModelWeights {
         )
         .map_err(|e| anyhow::anyhow!("encode_lm_head_into final norm: {e}"))?;
 
-        s.barrier_between(&[&normed_b, &q6k.buffer], &[&logits_b]);
-        dispatch_qmatmul(
+        s.barrier_between(&[&normed_b, &lm_head.buffer], &[&logits_b]);
+        dispatch_dense_rowident(
             s,
             reg,
             dev,
             &normed_b,
-            q6k,
+            lm_head,
             &logits_b,
-            n as u32,
+            n,
+            hs,
+            vocab,
             ImatrixHint::Global("output.weight"),
         )?;
 
@@ -506,72 +321,6 @@ impl MlxModelWeights {
             .map_err(|e| anyhow::anyhow!("encode_lm_head_into softcap: {e}"))?;
         }
 
-        // ADR-040 §26 iter-M — GPU-side argmax+candidate collect over the
-        // post-softcap logits (DEFAULT-ON, opt out HF2Q_GPU_SAMPLE=0; Q6_K
-        // rerank-active head). Replaces the ~0.92ms host full-vocab scan; read
-        // back after the single finish. Byte-identical (slot_aware_n8 +
-        // staggered GREEN): the GPU candidate set == host threshold scan, both
-        // feed the shared rerank_candidates tail (specials+sort+dedup+F64 rerank).
-        let gpu_sample =
-            if std::env::var("HF2Q_GPU_SAMPLE").as_deref() != Ok("0") && self.rerank_active() {
-                const CAP: usize = 1024;
-                let top1_idx = dev
-                    .alloc_buffer(n * 4, DType::U32, vec![n])
-                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc top1_idx: {e}"))?;
-                let top1_val = dev
-                    .alloc_buffer(n * 4, DType::F32, vec![n])
-                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc top1_val: {e}"))?;
-                let cand_count = dev
-                    .alloc_buffer(n * 4, DType::U32, vec![n])
-                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc cand_count: {e}"))?;
-                let overflow = dev
-                    .alloc_buffer(n * 4, DType::U32, vec![n])
-                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc overflow: {e}"))?;
-                let cand_ids = dev
-                    .alloc_buffer(n * CAP * 4, DType::U32, vec![n, CAP])
-                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc cand_ids: {e}"))?;
-                let mut params = dev
-                    .alloc_buffer(8, DType::U32, vec![2])
-                    .map_err(|e| anyhow::anyhow!("gpu_sample alloc params: {e}"))?;
-                params
-                    .as_mut_slice::<u32>()
-                    .map_err(|e| anyhow::anyhow!("gpu_sample params slice: {e}"))?
-                    .copy_from_slice(&[vocab as u32, CAP as u32]);
-                // RAW: the softcap (or qmatmul, if no softcap) wrote logits_b in THIS
-                // session; barrier so the sample kernel reads the final logits.
-                s.barrier_between(
-                    &[&logits_b],
-                    &[&top1_idx, &top1_val, &cand_count, &overflow, &cand_ids],
-                );
-                mlx_native::ops::gpu_sample::dispatch_gpu_sample_argmax_candidates(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &logits_b,
-                    &top1_idx,
-                    &top1_val,
-                    &cand_count,
-                    &overflow,
-                    &cand_ids,
-                    &params,
-                    n as u32,
-                    vocab as u32,
-                    CAP as u32,
-                )
-                .map_err(|e| anyhow::anyhow!("gpu_sample dispatch: {e}"))?;
-                Some(GpuSampleBuffers {
-                    top1_idx,
-                    top1_val,
-                    cand_count,
-                    overflow,
-                    cand_ids,
-                    params,
-                    cap: CAP,
-                })
-            } else {
-                None
-            };
-
-        Ok((logits_b, normed_b, softcap_params_b, gpu_sample))
+        Ok((logits_b, normed_b, softcap_params_b))
     }
 }

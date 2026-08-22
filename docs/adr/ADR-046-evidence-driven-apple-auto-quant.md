@@ -3,10 +3,12 @@
 - Status: Accepted; measured-selector foundation implemented, artifact
   generation and CLI activation remain gated by the phases below
 - Date: 2026-08-18
-- Updated: 2026-08-21 — the current release boundary pins exact published
-  `mlx-native = 0.11.1`, including direct execution of packed Q5_K/Q6_K
-  embedding rows; the first official source-teacher gate below remains
-  historical evidence from exact `0.10.16`. The backend-independent
+- Updated: 2026-08-22 — the current release boundary pins exact published
+  `mlx-native = 0.12.1` (registry SHA-256
+  `1ac31334d9d6c74286451a0860b029b527a45d9264098301f98cd866f9e1147e`),
+  including direct execution of packed Q4_0/Q5_K/Q6_K embedding rows and
+  mapped GGUF tensor ownership; the first official source-teacher gate below
+  remains historical evidence from exact `0.10.16`. The backend-independent
   exact-teacher target storage and model-free allocation binding cannot invoke
   the proposer without authenticated source-precision completion,
   sensitivity, measurement, and quality evidence
@@ -44,6 +46,125 @@ selector/autoquant activation, and replay remain outside the production
 boundary. The crate-wide warning denial remains unchanged, and unused
 compatibility helpers stay `cfg(test)` rather than crossing the release
 boundary or acquiring warning allowances.
+
+### 2026-08-22 Gemma native-matrix execution amendment
+
+Conversion owns quantization from authenticated source weights. Production
+inference does not get a second, implicit opportunity to change a served
+artifact's matrix representation. Gemma therefore applies these invariants:
+
+- Before creating any Metal model storage, the family loader validates tensor
+  rank, shape, payload length, and the intersection of the embedding-gather,
+  dense projection, and expert execution capabilities required by that exact
+  stored GGUF type. Dense admission covers scalar decode, every continuous
+  width from 2 through 8, and prompt routing. Expert admission separately
+  exercises gate/up and down through serial auto-dispatch, forced row-identical
+  multi-slot dispatch, and pooled prompt paths below and above the grouped-MM
+  threshold. Unsupported or malformed matrices fail closed.
+- Admitted embedding, output-head, dense-projection, and expert tensors remain
+  file-backed views of their declared GGUF payload. The loader neither
+  dequantizes them into a dense shadow nor re-quantizes them into a different
+  block format. An explicitly declared affine safetensors overlay remains an
+  opt-in representation with its own metadata and dispatch contract. The
+  head-major BF16 flash-output fast path is used only when the stored
+  O-projection has a native permuted-input kernel; other admitted codecs
+  permute the activation to seq-major F32 and execute the ordinary native
+  stored-weight route. Activation layout conversion is not weight conversion.
+- When `output.weight` is absent, the output head resolves to the same
+  `MlxQWeight` object as `token_embd.weight`; it does not allocate or derive a
+  second head. An explicit output tensor retains its own declared format.
+- Batched output-head execution preserves the scalar row reduction order for
+  every admitted representation. Quantized row-identical routes remain
+  batched; dense F32/F16/BF16 heads execute scalar row views because their tile
+  reductions differ. Once reranking was removed, the post-norm hidden operand
+  also stopped crossing back to the CPU; multi-slot finalization reads only the
+  exact native-head logits and applies the same first-max rule as scalar decode.
+- `MlxQWeight::from_mapped_gguf_tensor` and the raw rank-3 mapped-view helper
+  are shared, path-independent ownership primitives. Family-specific
+  capability admission stays in the family loader. Dropping a model releases
+  its views; a later A→B→A load derives each generation solely from the newly
+  opened artifact and cannot reuse a transformed or process-global shadow.
+
+This corrects the former Gemma load path that decoded the stored output matrix
+and synthesized Q8/F16 heads, and the former prompt path that manufactured F16
+projection shadows. The correction is semantic, not merely a load-time
+optimization: target logits must come from the model representation the
+operator selected. The old head-format, rerank, comparison, and F16-shadow
+environment controls are removed rather than retained as alternate production
+semantics.
+
+The focused proof includes allocation-free admission tests for every currently
+executable embedding, dense, and expert codec; malformed/unsupported rejection;
+pointer-identical tied-head resolution; mapped-page ownership after the backing
+pathname is unlinked; and a one-resident A→B→A replay. Real-model acceptance
+also requires matched prompt-token counts, greedy continuation equality,
+single-user decode medians, long-prefill medians, and the shipping Gemma gates
+on the exact artifact and pinned runtime dependency.
+
+#### Native-matrix availability and performance evidence
+
+The 2026-08-22 Apple run used an M5 Max and exact artifact
+`gemma4-ara-2pass-APEX-Q5_K_M.gguf` (20,576,631,488 bytes, SHA-256
+`82beae39cdee643824dde5bc3fb1a3d6e2e4f8701572930163b0d703298bcf82`).
+The exact pp4109 rendered prompt had SHA-256
+`d21a065d3b24985a739beba59296b680fd8a8eaa7a21e98f428aca4039adb9dd`;
+all runs were greedy, generated one token, consumed 4,109 prompt tokens, and
+selected token 2,021.
+
+Five alternating fresh-process native runs reached mapped-model ready at a
+0.24-second median and reached the first generated token at a 2.04-second
+median. The
+exact pre-change tree at `32181b61`, which built dense and requantized matrix
+representations during load, required 4.77 seconds median to the same token.
+The matched `/usr/bin/time -lp` peak resident sizes were approximately 6.20 GB
+and 33.01 GB respectively. These are complete load-plus-prefill availability
+measurements, not claims derived from the mapped-load boundary alone.
+
+Production serving still performs its synchronous one-token prefill and decode
+before publication. Two observed native starts spent 220–265 ms reaching the
+load boundary and 204–210 ms in that warmup. After publication, four distinct
+uncached pp4109 requests reported 1.653–1.666 seconds to the first token; their
+4,096-row transaction bodies were stable at 1.339–1.350 seconds. A measured
+first-use profile attributed only 13.106 ms total to 43 pipelines, all resolved
+from the embedded metallib, so eager pipeline compilation cannot explain the
+cold-prefill remainder.
+
+Mapped-page readahead was tested and rejected. Advising all 20.56 GB of mapped
+tensor segments took a 514 ms median, raised maximum resident size from roughly
+6.20 GB to 26.76 GB, and worsened total first-token availability from
+2.08–2.11 seconds to a 2.62-second median while saving only noise-level prefill
+time. It is absent from production. The existing real forward warmup is the
+measured winner because it primes only through the same execution graph that
+serving must validate, without manufacturing a second weight representation.
+
+The initial real A→B→A lifecycle spike also falsified the old gate's
+`artifact-size delta => directional RSS drop` assumption. Native-mapped Gemma A
+settled at 2.94 GB process RSS while the smaller, copied-storage Qwen B settled
+at 22.03 GB, so a required A→B RSS drop measured representation choice rather
+than stale-model ownership. The gate now preserves caller A/B identity and
+proves the lifecycle directly: exactly one pool generation, exact logical byte
+accounting, live `lsof`/`vmmap -wide` ownership for a file-backed resident,
+absence of each evicted artifact, bounded transition peaks, fresh generations,
+successful inference for every resident, exact A output/config replay, and A2
+RSS/physical-footprint/process-wired/host-wired bounds. A copied resident is
+classified explicitly from absent file-map evidence and must still have fresh
+generation, inference, pool-byte, RSS, and physical-footprint evidence; if that
+family later adopts file-backed matrices, the same gate automatically observes
+and then requires its mapping to disappear after eviction.
+
+On the exact artifacts above and Qwen B
+`Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf` (16,810,714,944 bytes, SHA-256
+`1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a`), the
+corrected gate passed with synchronous switch-and-warm publication at 2.282 s
+for A→B and 0.922 s for B→A. The server-reported semantic TTFT was
+0.558/0.920/0.550 s for A1/B/A2, making total switch-request-to-first-semantic
+3.202 s for B and 1.472 s for reloaded A. The full 16-token unary requests took
+0.644/1.541/0.634 s; those are completion walls and remain labeled separately.
+A1/B/A2 RSS was 2.938/22.027/3.110 GB and physical footprint was
+19.053/59.031/19.224 GB. Gemma's artifact was visible through both OS ownership
+views at A1, absent at B, and visible again at A2; the B artifact was classified
+`anonymous_accounted` and absent after eviction. This final run used the
+published registry package and exact lock checksum above.
 
 ## Context
 

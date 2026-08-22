@@ -744,17 +744,13 @@ impl<'a> Gemma4Eagle3Orchestrator<'a> {
             let target_aux =
                 upload_f32_device(device, &target_aux_host, vec![1, target_aux_host.len()])
                     .context("Gemma4Eagle3Orchestrator: upload target_aux")?;
-            let embed_table: &[f32] = model
-                .embed_weight
-                .as_slice::<f32>()
-                .map_err(|e| anyhow!("Gemma4Eagle3Orchestrator: embed_weight slice: {e}"))?;
-            let mut drafter = GpuDrafter::new(
+            let mut drafter = GpuDrafter::new_with_native_embedding(
                 self.drafter_cfg,
                 self.drafter_tensors,
                 device,
                 registry,
                 &target_aux,
-                embed_table,
+                &model.embed_weight,
                 base_pos,
             )
             .context("Gemma4Eagle3Orchestrator: construct GpuDrafter")?;

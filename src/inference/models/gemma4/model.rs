@@ -13,11 +13,13 @@ use crate::debug::INVESTIGATION_ENV;
 use crate::inference::models::gemma4::kv_cache::{
     DecodeRegime, DenseKvBuffers, HbKvBuffers, HybridKvBuffers, MlxKvCache,
 };
+use crate::inference::models::gemma4::native_matrix::{
+    load_mapped_projection, preflight_io, preflight_projections, resolve_tied_or_explicit,
+};
 use crate::serve::config::{Gemma4Config, LayerType};
 use crate::serve::forward_mlx_shared::{
-    load_gguf_qweight, parse_dwq_moe_expert_role, parse_dwq_overlay_metadata,
-    parse_dwq_overlay_role, populate_f16_shadow_if_enabled, DwqOverlayRole, MlxAffineMoeStack,
-    MlxQWeight, MoeBaseRole,
+    DwqOverlayRole, MlxAffineMoeStack, MlxQWeight, MoeBaseRole, map_native_gguf_tensor_view,
+    parse_dwq_moe_expert_role, parse_dwq_overlay_metadata, parse_dwq_overlay_role,
 };
 use crate::serve::gpu::{GpuContext, QuantWeightInfo};
 
@@ -205,7 +207,6 @@ impl MlxMoeWeights {
                     cols: 1,
                 },
                 affine: None,
-                f16_shadow: None,
                 decode_record_q6k_m1: std::sync::OnceLock::new(),
             },
             per_expert_scale: alloc_one_f32_placeholder(mlx_device, "per_expert_scale")?,
@@ -258,6 +259,8 @@ pub struct MlxDecoderLayerWeights {
 
 /// Reusable activation buffers for one forward pass.
 pub struct MlxActivationBuffers {
+    /// Reusable token-id input for one-row native embedding gather.
+    pub embedding_token_id: MlxBuffer,
     /// Hidden state `[1, hidden_size]` F32.
     pub hidden: MlxBuffer,
     /// Scratch buffer for attention Q output `[1, num_heads * head_dim]` F32.
@@ -317,10 +320,6 @@ pub struct MlxActivationBuffers {
     pub moe_down_id_out: MlxBuffer,
     /// MoE scratch: swiglu output for _id path `[top_k, moe_intermediate]` F32.
     pub moe_swiglu_id_out: MlxBuffer,
-    /// F16 scratch for lm_head GPU path: hidden state cast to F16 `[1, hidden_size]`.
-    pub hidden_f16: MlxBuffer,
-    /// F16 scratch for lm_head GPU path: logits output `[1, vocab_size]`.
-    pub logits_f16: MlxBuffer,
     // --- Session merge buffers (S1+S2 collapse) ---
     /// Per-head norm params for sliding layers: `[eps, sliding_head_dim]` F32.
     pub norm_params_sliding_hd: MlxBuffer,
@@ -341,22 +340,14 @@ pub struct MlxActivationBuffers {
 
 /// All mlx-native weights for the full Gemma 4 model.
 pub struct MlxModelWeights {
-    pub embed_weight: MlxBuffer,
+    /// Artifact-native token table.  When `lm_head` is `None`, this exact
+    /// buffer is also the tied output head.
+    pub embed_weight: MlxQWeight,
     pub layers: Vec<MlxDecoderLayerWeights>,
     pub final_norm: MlxBuffer,
-    pub lm_head_f16: Option<MlxBuffer>,
-    /// Optional Q8_0-quantized lm_head (gated on HF2Q_LMHEAD_Q8=1 at load).
-    /// When present and the env var is still set at decode time, used instead
-    /// of lm_head_f16 via dispatch_qmatmul. Halves weight memory traffic vs F16.
-    pub lm_head_q8: Option<MlxQWeight>,
-    /// Optional Q6_K-native lm_head (gated on HF2Q_LMHEAD_Q6K=1 at load).
-    /// ADR-028 iter-188: gemma4 ships token_embd.weight as Q6_K [2816, 262144]
-    /// = 605 MB; current Q8_0 re-quant path stores 784 MB.  Loading the
-    /// on-disk Q6_K storage directly saves ~0.33 ms/token in lm_head
-    /// (= ~2% gemma4 throughput).  Embedding lookup at input still uses
-    /// the F32 `embed_weight`, so this is purely additive at load.
-    /// Preferred over `lm_head_q8` when both are present.
-    pub lm_head_q6k: Option<MlxQWeight>,
+    /// Explicit untied `output.weight`, if the artifact declares one.
+    /// Absence means tied storage; no duplicate buffer is synthesized.
+    pub lm_head: Option<MlxQWeight>,
     pub hidden_size: usize,
     pub vocab_size: usize,
     pub num_attention_heads: usize,
@@ -452,7 +443,7 @@ pub struct MlxModelWeights {
     // iter-222 (2026-05-01) along with the iter-34 dense-on-shadow Leg F decode
     // branch and `dense_sdpa_on_tq_kv_enabled()` helper. See the file-level
     // iter-222 closure note above the deleted helper site for the rationale
-    // (Gate H regression + peer-impl research + "no fallback" mantra). The
+    // (Gate H regression plus the "no fallback" contract). The
     // inline-fused TQ-native kernels (`flash_attn_vec_tq` / `flash_attn_vec_tq_hb`)
     // read directly from the TQ-packed `kv_caches[layer].{k,v}_packed` and
     // `leg_hb_encoded` buffers respectively — no F32 shadow cache required.
@@ -699,6 +690,13 @@ const _: fn() = || {
 // (ADR-038 Step 1). Re-exported via the pub use shim above.
 
 impl MlxModelWeights {
+    /// Resolve the artifact-declared output head.  A missing `output.weight`
+    /// is the tied case and intentionally returns the embedding allocation.
+    #[inline]
+    pub fn resolved_lm_head(&self) -> &MlxQWeight {
+        resolve_tied_or_explicit(&self.embed_weight, self.lm_head.as_ref())
+    }
+
     /// ADR-030 Phase 4 — install a DFlash hidden-state capture session.
     ///
     /// While installed, `forward_prefill_batched` will populate the
@@ -752,44 +750,50 @@ impl MlxModelWeights {
         if n_tokens == 0 {
             anyhow::bail!("embed_tokens: empty tokens");
         }
-        let scale = (hs as f32).sqrt();
-        let (exec, _reg) = gpu.split();
+        for &token in tokens {
+            if token as usize >= self.embed_weight.info.rows {
+                anyhow::bail!(
+                    "embed_tokens: token id {} out of vocab range {}",
+                    token,
+                    self.embed_weight.info.rows
+                );
+            }
+        }
+        let (exec, reg) = gpu.split();
         let dev = exec.device();
-        let mut out = dev
+        let out = dev
             .alloc_buffer(
                 n_tokens * hs * 4,
                 mlx_native::DType::F32,
                 vec![n_tokens, hs],
             )
             .map_err(|e| anyhow::anyhow!("alloc embed output: {e}"))?;
-        let embed_f32: &[f32] = self
-            .embed_weight
-            .as_slice()
-            .map_err(|e| anyhow::anyhow!("embed_weight slice: {e}"))?;
-        // Validate vocab bound
-        let vocab_in_buf = embed_f32.len() / hs;
-        for &tok in tokens.iter() {
-            if (tok as usize) >= vocab_in_buf {
-                anyhow::bail!(
-                    "embed_tokens: token id {} out of vocab range {}",
-                    tok,
-                    vocab_in_buf
-                );
-            }
-        }
-        {
-            let out_slice: &mut [f32] = out
-                .as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("embed output slice: {e}"))?;
-            for (i, &tok) in tokens.iter().enumerate() {
-                let src = (tok as usize) * hs;
-                let dst = i * hs;
-                out_slice[dst..dst + hs].copy_from_slice(&embed_f32[src..src + hs]);
-            }
-            for v in out_slice.iter_mut() {
-                *v *= scale;
-            }
-        }
+        let mut token_ids = dev
+            .alloc_buffer(
+                n_tokens * std::mem::size_of::<u32>(),
+                mlx_native::DType::U32,
+                vec![n_tokens],
+            )
+            .map_err(|e| anyhow::anyhow!("alloc embed token ids: {e}"))?;
+        token_ids
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow::anyhow!("write embed token ids: {e}"))?
+            .copy_from_slice(tokens);
+        let mut session = exec
+            .begin()
+            .map_err(|e| anyhow::anyhow!("begin embed session: {e}"))?;
+        crate::inference::models::gemma4::native_matrix::encode_embedding(
+            &mut session,
+            reg,
+            dev,
+            &self.embed_weight,
+            &token_ids,
+            &out,
+            n_tokens,
+        )?;
+        session
+            .finish()
+            .map_err(|e| anyhow::anyhow!("finish embed session: {e}"))?;
         Ok(out)
     }
 
@@ -811,16 +815,41 @@ impl MlxModelWeights {
         let mlx_device = gpu.device();
         tracing::debug!("Loading mlx-native weights directly from GGUF...");
 
-        // ADR-028 iter-482: time pre-loop loads (embed_weight + final_norm)
-        // separately to verify iter-481's embed_weight ~200ms estimate.
+        // Preflight the tied/untied IO contract before any Metal allocation.
+        // Malformed or unsupported storage therefore cannot leave a partially
+        // loaded multi-gigabyte model behind.
         let load_timing = std::env::var("HF2Q_LOAD_TIMING").as_deref() == Ok("1");
         let t_pre = std::time::Instant::now();
-
-        // --- Embedding weight (F32) ---
-        tracing::debug!("Loading embed_weight");
-        let embed_weight = gguf
-            .load_tensor_f32("token_embd.weight", mlx_device)
-            .map_err(|e| anyhow::anyhow!("embed: {e}"))?;
+        let io_plan = preflight_io(gguf, cfg.vocab_size, cfg.hidden_size)?;
+        preflight_projections(gguf, cfg)?;
+        let mapped = gguf
+            .map_tensor_data(mlx_device)
+            .map_err(|e| anyhow::anyhow!("map GGUF tensor data: {e}"))?;
+        let embed_weight = MlxQWeight::from_mapped_gguf_tensor(
+            &mapped,
+            gguf.tensor_info(&io_plan.embedding.name)
+                .expect("embedding passed preflight"),
+        )?;
+        let lm_head = io_plan
+            .output
+            .as_ref()
+            .map(|spec| {
+                MlxQWeight::from_mapped_gguf_tensor(
+                    &mapped,
+                    gguf.tensor_info(&spec.name)
+                        .expect("output head passed preflight"),
+                )
+            })
+            .transpose()?;
+        tracing::info!(
+            "Gemma IO matrices retain artifact storage: embedding={:?}, head={}, tied={}, file_backed=true",
+            embed_weight.info.ggml_dtype,
+            lm_head
+                .as_ref()
+                .map(|weight| format!("{:?}", weight.info.ggml_dtype))
+                .unwrap_or_else(|| "embedding".to_owned()),
+            lm_head.is_none(),
+        );
         if load_timing {
             tracing::info!(
                 "[LOAD_TIMING] embed_weight_load={:.0}ms",
@@ -840,254 +869,6 @@ impl MlxModelWeights {
                 t_fn.elapsed().as_secs_f64() * 1000.0
             );
         }
-
-        // --- lm_head: auto-pick Q8_0 vs F16 based on model size ---
-        //
-        // lm_head is memory-bandwidth-bound at batch=1; Q8_0 halves the
-        // weight traffic vs F16 and recovers ~12% decode throughput on
-        // Gemma-4-26B (1.47 GB F16 → 784 MB Q8). Raw Q8 occasionally flips
-        // a near-tiebreak (pad-emit mode, see ADR-010) — the rerank path
-        // (HF2Q_LMHEAD_RERANK; default on when Q8 is active) recovers the
-        // exact F16 trajectory by reranking top candidates on CPU using
-        // the F32 embed_weight already resident for the embedding gather.
-        //
-        // Heuristic: enable Q8_0 when F16 weight would exceed 256 MB and
-        // hidden_size % 32 == 0. Smaller models skip Q8 because the head
-        // time is already negligible.
-        //
-        // Env overrides:
-        //   HF2Q_LMHEAD_Q8=1   force Q8 (errors if hidden_size % 32 != 0)
-        //   HF2Q_LMHEAD_Q8=0   force F16 (escape hatch)
-        //   HF2Q_LMHEAD_RERANK=0   disable rerank (raw Q8 argmax, unsafe)
-        //   (unset)            auto-detect by size
-        let lm_head_f16_bytes = cfg.vocab_size * cfg.hidden_size * 2;
-        // HF2Q_LMHEAD_Q8 is a category-2 operator knob — documented in
-        // docs/operator-env-vars.md and docs/shipping-contract.md. It is
-        // intentionally read directly here (not via InvestigationEnv) because
-        // it is part of the supported user-facing product surface.
-        let q8_env = std::env::var("HF2Q_LMHEAD_Q8").ok();
-        let compare_mode = INVESTIGATION_ENV.lmhead_compare;
-
-        // ADR-028 iter-188: HF2Q_LMHEAD_Q6K — load token_embd.weight as
-        // native on-disk Q6_K (no F32→Q8 re-quant). Saves 0.33 ms/token
-        // (~2% decode).
-        //
-        // iter-326 default-flipped to ON; iter-344 reverted because of
-        // batched-prefill conflict; iter-345 RESTORED to default-ON
-        // because forward_prefill_batched.rs now has a Q6_K arm
-        // dispatching via dispatch_qmatmul + kernel_mul_mv_q6_K_f32_nr2.
-        // Q6_K lm_head + batched prefill COEXIST.  Opt-out via
-        // HF2Q_LMHEAD_Q6K=0/false/off.
-        let q6k_env_off = matches!(
-            std::env::var("HF2Q_LMHEAD_Q6K").ok().as_deref(),
-            Some(v) if v.eq_ignore_ascii_case("0")
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("off")
-        );
-        let use_q6k = !q6k_env_off && {
-            gguf.tensor_info("token_embd.weight")
-                .map(|t| t.ggml_type == mlx_native::GgmlType::Q6_K)
-                .unwrap_or(false)
-        };
-
-        let use_q8 = if use_q6k {
-            false
-        } else {
-            match q8_env.as_deref() {
-                Some("1") => true,
-                Some("0") => false,
-                _ => {
-                    // Auto: Q8 when F16 weight would exceed 256 MB and the
-                    // shape is Q8-compatible.
-                    lm_head_f16_bytes > 256 * 1024 * 1024 && cfg.hidden_size % 32 == 0
-                }
-            }
-        };
-
-        // Decide which buffers to allocate. Compare mode always keeps F16
-        // (needed as the oracle for A/B), and Q8 if requested.
-        let need_q8 = use_q8;
-        let need_f16 = !use_q8 && !use_q6k || compare_mode;
-        if use_q8 && cfg.hidden_size % 32 != 0 {
-            anyhow::bail!(
-                "HF2Q_LMHEAD_Q8=1 requires hidden_size % 32 == 0 (got {})",
-                cfg.hidden_size
-            );
-        }
-
-        let lm_head_q8: Option<MlxQWeight> = if need_q8 {
-            let source = match q8_env.as_deref() {
-                Some("1") => "forced",
-                _ => "auto",
-            };
-            tracing::info!(
-                "Quantizing lm_head to Q8_0 ({} — F16 size {:.1} MB)",
-                source,
-                lm_head_f16_bytes as f64 / 1e6
-            );
-            let embed_f32: &[f32] = embed_weight
-                .as_slice()
-                .map_err(|e| anyhow::anyhow!("embed as_slice for q8 quantize: {e}"))?;
-            let cols = cfg.hidden_size;
-            // ADR-005 iter-214 follow-up — vocab-pad slice OOB fix.
-            //
-            // Derive `rows` from the actual embed tensor's element count,
-            // NOT from `cfg.vocab_size`. ADR-012 Phase 1.8's vocab-pad
-            // de-pad transform strips the trailing padded row from
-            // `token_embd.weight` (e.g., Qwen3.6 27B carries the de-padded
-            // tensor on-disk while `cfg.vocab_size` may still reflect the
-            // padded count read from a different GGUF metadata key) — so
-            // `cfg.vocab_size > embed_f32.len() / cols` by exactly the
-            // pad-stride when de-pad fired upstream.
-            //
-            // The pre-fix code iterated `0..cfg.vocab_size` and hit a
-            // slice-OOB panic at row `embed_rows` (one past the actual
-            // tensor) on `forward_mlx.rs:861` — observed concretely on
-            // /opt/hf2q/models/qwen3.6-27b-dwq46/...gguf where the loop
-            // wanted row 248045 but the tensor had only 248044 rows.
-            //
-            // Per Engineering Mantra "code + test == truth": the tensor's
-            // actual element count is the source of truth here, not the
-            // metadata header. Surface a warn! when they differ so an
-            // upstream cfg-vs-tensor inconsistency stays visible.
-            if embed_f32.len() % cols != 0 {
-                anyhow::bail!(
-                    "embed_weight length {} is not divisible by hidden_size {} \
-                     (cannot derive Q8_0 LMHEAD row count)",
-                    embed_f32.len(),
-                    cols
-                );
-            }
-            let rows = embed_f32.len() / cols;
-            if rows != cfg.vocab_size {
-                tracing::warn!(
-                    "Q8_0 LMHEAD: embed_weight has {} rows but cfg.vocab_size={} \
-                     (ADR-012 Phase 1.8 vocab-pad de-pad likely fired; using tensor's \
-                     actual row count for Q8 quantize loop bound)",
-                    rows,
-                    cfg.vocab_size
-                );
-            }
-            let blocks_per_row = cols / 32;
-            let block_bytes: usize = 34;
-            let total_bytes = rows * blocks_per_row * block_bytes;
-            let q_buf = mlx_device
-                .alloc_buffer(
-                    total_bytes,
-                    mlx_native::DType::U8,
-                    vec![rows, blocks_per_row * block_bytes],
-                )
-                .map_err(|e| anyhow::anyhow!("lm_head_q8 alloc: {e}"))?;
-            let dst_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(q_buf.contents_ptr() as *mut u8, total_bytes)
-            };
-            for r in 0..rows {
-                let row_src = &embed_f32[r * cols..(r + 1) * cols];
-                let row_dst = &mut dst_bytes
-                    [r * blocks_per_row * block_bytes..(r + 1) * blocks_per_row * block_bytes];
-                for b in 0..blocks_per_row {
-                    let block_src = &row_src[b * 32..(b + 1) * 32];
-                    let amax = block_src.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-                    let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
-                    let inv_d = if d != 0.0 { 1.0 / d } else { 0.0 };
-                    let block_off = b * block_bytes;
-                    let d_bits = half::f16::from_f32(d).to_bits();
-                    row_dst[block_off] = (d_bits & 0xFF) as u8;
-                    row_dst[block_off + 1] = (d_bits >> 8) as u8;
-                    for (i, &v) in block_src.iter().enumerate() {
-                        let q = (v * inv_d).round().clamp(-127.0, 127.0) as i8;
-                        row_dst[block_off + 2 + i] = q as u8;
-                    }
-                }
-            }
-            tracing::info!(
-                "Q8_0 lm_head created ({:.1} MB, {:.2}× smaller than F16){}",
-                total_bytes as f64 / 1e6,
-                lm_head_f16_bytes as f64 / total_bytes as f64,
-                if compare_mode {
-                    " [COMPARE MODE — F16 also resident]"
-                } else {
-                    ""
-                }
-            );
-            Some(MlxQWeight {
-                buffer: q_buf,
-                info: QuantWeightInfo {
-                    ggml_dtype: mlx_native::GgmlType::Q8_0,
-                    rows,
-                    cols,
-                },
-                affine: None,
-                f16_shadow: None,
-                decode_record_q6k_m1: std::sync::OnceLock::new(),
-            })
-        } else {
-            None
-        };
-
-        // ADR-028 iter-188 — load token_embd.weight as Q6_K natively (no
-        // F32→Q8_0 re-quant).  Same source tensor as `embed_weight` but
-        // loaded directly from the GGUF Q6_K storage.  Used for lm_head
-        // dispatch via dispatch_qmatmul (Q6_K mat-vec kernel).
-        let lm_head_q6k: Option<MlxQWeight> = if use_q6k {
-            tracing::info!(
-                "Loading lm_head Q6_K natively (HF2Q_LMHEAD_Q6K=1, save \
-                 ~179 MB vs Q8_0)"
-            );
-            Some(
-                load_gguf_qweight(gguf, "token_embd.weight", mlx_device)
-                    .map_err(|e| anyhow::anyhow!("lm_head_q6k native load: {e}"))?,
-            )
-        } else {
-            None
-        };
-
-        let lm_head_f16: Option<MlxBuffer> = if need_f16 {
-            let reason = if use_q8 && compare_mode {
-                "COMPARE MODE oracle".to_string()
-            } else if q8_env.as_deref() == Some("0") {
-                "forced — HF2Q_LMHEAD_Q8=0".to_string()
-            } else if cfg.hidden_size % 32 != 0 {
-                format!("auto — hidden_size {} not divisible by 32", cfg.hidden_size)
-            } else {
-                format!(
-                    "auto — F16 size {:.1} MB ≤ 256 MB threshold",
-                    lm_head_f16_bytes as f64 / 1e6
-                )
-            };
-            eprintln!(
-                "  Creating F16 embed weight for GPU lm_head ({})...",
-                reason
-            );
-            let embed_f32: &[f32] = embed_weight
-                .as_slice()
-                .map_err(|e| anyhow::anyhow!("embed as_slice for f16 copy: {e}"))?;
-            let n_elements = embed_f32.len();
-            let f16_buf = mlx_device
-                .alloc_buffer(
-                    lm_head_f16_bytes,
-                    mlx_native::DType::F16,
-                    vec![cfg.vocab_size, cfg.hidden_size],
-                )
-                .map_err(|e| anyhow::anyhow!("lm_head_f16 alloc: {e}"))?;
-            let dst_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(f16_buf.contents_ptr() as *mut u8, lm_head_f16_bytes)
-            };
-            for i in 0..n_elements {
-                let f16_val = half::f16::from_f32(embed_f32[i]);
-                let bits = f16_val.to_bits();
-                dst_bytes[i * 2] = (bits & 0xFF) as u8;
-                dst_bytes[i * 2 + 1] = (bits >> 8) as u8;
-            }
-            eprintln!(
-                "  F16 embed weight created ({} elements, {:.1} MB).",
-                n_elements,
-                lm_head_f16_bytes as f64 / 1e6
-            );
-            Some(f16_buf)
-        } else {
-            None
-        };
 
         // --- Per-layer weights ---
         let num_layers = cfg.num_hidden_layers;
@@ -1114,19 +895,19 @@ impl MlxModelWeights {
 
             // -- Attention quantized weights --
             let t_attn = std::time::Instant::now();
-            let q_proj = load_gguf_qweight(gguf, &format!("blk.{i}.attn_q.weight"), mlx_device)?;
-            let k_proj = load_gguf_qweight(gguf, &format!("blk.{i}.attn_k.weight"), mlx_device)?;
+            let q_proj = load_mapped_projection(gguf, &mapped, &format!("blk.{i}.attn_q.weight"))?;
+            let k_proj = load_mapped_projection(gguf, &mapped, &format!("blk.{i}.attn_k.weight"))?;
             let v_proj = if cfg.is_full_attention(i) && cfg.attention_k_eq_v {
                 None
             } else {
-                Some(load_gguf_qweight(
+                Some(load_mapped_projection(
                     gguf,
+                    &mapped,
                     &format!("blk.{i}.attn_v.weight"),
-                    mlx_device,
                 )?)
             };
             let o_proj =
-                load_gguf_qweight(gguf, &format!("blk.{i}.attn_output.weight"), mlx_device)?;
+                load_mapped_projection(gguf, &mapped, &format!("blk.{i}.attn_output.weight"))?;
 
             // -- Attention head norms (F32) --
             let q_norm_weight = gguf
@@ -1149,10 +930,10 @@ impl MlxModelWeights {
             // -- Dense MLP (quantized) --
             let t_mlp = std::time::Instant::now();
             let gate_proj =
-                load_gguf_qweight(gguf, &format!("blk.{i}.ffn_gate.weight"), mlx_device)?;
-            let up_proj = load_gguf_qweight(gguf, &format!("blk.{i}.ffn_up.weight"), mlx_device)?;
+                load_mapped_projection(gguf, &mapped, &format!("blk.{i}.ffn_gate.weight"))?;
+            let up_proj = load_mapped_projection(gguf, &mapped, &format!("blk.{i}.ffn_up.weight"))?;
             let down_proj =
-                load_gguf_qweight(gguf, &format!("blk.{i}.ffn_down.weight"), mlx_device)?;
+                load_mapped_projection(gguf, &mapped, &format!("blk.{i}.ffn_down.weight"))?;
 
             let mlp = MlxMlpWeights {
                 gate_proj,
@@ -1187,8 +968,7 @@ impl MlxModelWeights {
             // `MlxMlpWeights` (loaded above unconditionally at lines
             // 962-971) and never reads the placeholder MoE fields.
             // Layer mixing (some layers MoE, some dense) is supported
-            // structurally, mirroring the peer's
-            // `LLM_ARCH_QWEN3VLMOE` per-block decision.
+            // structurally: expert presence is a per-block decision.
             let gu_name = format!("blk.{i}.ffn_gate_up_exps.weight");
             let dn_name = format!("blk.{i}.ffn_down_exps.weight");
             let gu_info_opt = gguf.tensor_info(&gu_name);
@@ -1202,19 +982,15 @@ impl MlxModelWeights {
                 // safe; we already established both are Some above.
                 let t_gu = std::time::Instant::now();
                 let gu_info = gu_info_opt.unwrap();
-                let stacked_gate_up_buf = gguf
-                    .load_tensor(&gu_name, mlx_device)
-                    .map_err(|e| anyhow::anyhow!("load {gu_name}: {e}"))?;
-                let gate_up_expert_stride = stacked_gate_up_buf.byte_len() / cfg.num_experts;
+                let stacked_gate_up_buf = map_native_gguf_tensor_view(&mapped, gu_info)?;
+                let gate_up_expert_stride = stacked_gate_up_buf.data_byte_len() / cfg.num_experts;
                 let gate_up_ggml_dtype = gu_info.ggml_type;
                 cum_moe_gate_up_ns += t_gu.elapsed().as_nanos();
 
                 let t_dn = std::time::Instant::now();
                 let dn_info = dn_info_opt.unwrap();
-                let stacked_down_buf = gguf
-                    .load_tensor(&dn_name, mlx_device)
-                    .map_err(|e| anyhow::anyhow!("load {dn_name}: {e}"))?;
-                let down_expert_stride = stacked_down_buf.byte_len() / cfg.num_experts;
+                let stacked_down_buf = map_native_gguf_tensor_view(&mapped, dn_info)?;
+                let down_expert_stride = stacked_down_buf.data_byte_len() / cfg.num_experts;
                 let down_ggml_dtype = dn_info.ggml_type;
                 cum_moe_down_ns += t_dn.elapsed().as_nanos();
 
@@ -1223,14 +999,14 @@ impl MlxModelWeights {
                         "GGUF layer {}/{}: MoE experts loaded (stacked, {:.1} MB + {:.1} MB)",
                         i + 1,
                         num_layers,
-                        stacked_gate_up_buf.byte_len() as f64 / 1e6,
-                        stacked_down_buf.byte_len() as f64 / 1e6
+                        stacked_gate_up_buf.data_byte_len() as f64 / 1e6,
+                        stacked_down_buf.data_byte_len() as f64 / 1e6
                     );
                 }
 
                 // -- Router and scales (F32) --
                 let router_proj =
-                    load_gguf_qweight(gguf, &format!("blk.{i}.ffn_gate_inp.weight"), mlx_device)?;
+                    load_mapped_projection(gguf, &mapped, &format!("blk.{i}.ffn_gate_inp.weight"))?;
                 let router_scale = gguf
                     .load_tensor_f32(&format!("blk.{i}.ffn_gate_inp.scale"), mlx_device)
                     .map_err(|e| anyhow::anyhow!("layer {i} router_scale: {e}"))?;
@@ -1510,9 +1286,7 @@ impl MlxModelWeights {
             embed_weight,
             layers,
             final_norm,
-            lm_head_f16,
-            lm_head_q8,
-            lm_head_q6k,
+            lm_head,
             hidden_size: cfg.hidden_size,
             vocab_size: cfg.vocab_size,
             num_attention_heads: cfg.num_attention_heads,
@@ -1607,89 +1381,6 @@ impl MlxModelWeights {
                     .as_mut_slice()
                     .map_err(|e| anyhow::anyhow!("argmax_params init: {e}"))?;
                 p[0] = w.vocab_size as u32;
-            }
-
-            // ADR-029 iter-28 H29 / iter-31 — F16 shadow population pass.
-            //
-            // Materializes an F16 pre-dequantized buffer for every attn
-            // and dense-MLP quantized weight in every layer, so that the
-            // runtime dispatch_qmatmul fast-paths through the F16-input
-            // matmul kernel (peer's gemma4 strategy).
-            //
-            // iter-31 default-flip: HF2Q_F16_SHADOW now default-true
-            // (opt-out via =0/false/off).  Multi-regime bench (4 ctxs ×
-            // 3 trials each, gemma4-APEX-Q5_K_M):
-            //   2K prefill: +16.0%
-            //   4K prefill: +7.3%
-            //   8K prefill: +1.9%
-            //   decode m=1: unaffected (V2 path gated on m > 8, H29 too)
-            // Byte-identical first decode tokens at every context.
-            // ~1 GB extra resident on gemma4-26B; 128 GB M5 Max budget
-            // accommodates without pressure.  0.4s load-time pass.
-            //
-            // Doing this in a second pass (after weight load) avoids
-            // borrow-checker conflicts between `gpu.device()` (read) and
-            // `gpu.registry` (write) during the per-layer load loop.
-            let f16_shadow_enabled = std::env::var("HF2Q_F16_SHADOW")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
-                .unwrap_or(true);
-            if f16_shadow_enabled {
-                let dev = gpu.executor.device();
-                let n_layers = w.layers.len();
-                eprintln!("[ADR-029 H29] Materializing F16 shadows for {} layers' attn + dense MLP weights...", n_layers);
-                let t0 = std::time::Instant::now();
-                for li in 0..n_layers {
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].attn.q_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.attn_q"),
-                    )?;
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].attn.k_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.attn_k"),
-                    )?;
-                    if let Some(ref mut v) = w.layers[li].attn.v_proj {
-                        populate_f16_shadow_if_enabled(
-                            v,
-                            dev,
-                            &mut gpu.registry,
-                            &format!("blk.{li}.attn_v"),
-                        )?;
-                    }
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].attn.o_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.attn_output"),
-                    )?;
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].mlp.gate_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.ffn_gate"),
-                    )?;
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].mlp.up_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.ffn_up"),
-                    )?;
-                    populate_f16_shadow_if_enabled(
-                        &mut w.layers[li].mlp.down_proj,
-                        dev,
-                        &mut gpu.registry,
-                        &format!("blk.{li}.ffn_down"),
-                    )?;
-                }
-                let elapsed = t0.elapsed();
-                eprintln!(
-                    "[ADR-029 H29] F16 shadow population done in {:.2}s",
-                    elapsed.as_secs_f64()
-                );
             }
         }
 
@@ -1930,16 +1621,25 @@ impl MlxModelWeights {
                 if l.n != n || l.k != k || l.bits != bits_per || l.group_size != gs_per {
                     anyhow::bail!(
                         "DWQ overlay MoE bucket (layer={layer_idx}, base={:?}) expert {} shape ({},{},bits={},gs={}) ≠ expert 0 ({},{},bits={},gs={})",
-                        base, e,
-                        l.n, l.k, l.bits, l.group_size,
-                        n, k, bits_per, gs_per,
+                        base,
+                        e,
+                        l.n,
+                        l.k,
+                        l.bits,
+                        l.group_size,
+                        n,
+                        k,
+                        bits_per,
+                        gs_per,
                     );
                 }
             }
             if bits_per != 4 || gs_per != 32 {
                 anyhow::bail!(
                     "DWQ overlay MoE bucket (layer={layer_idx}, base={:?}): only bits=4 group_size=32 supported in Iter C2.2 (got bits={}, gs={})",
-                    base, bits_per, gs_per,
+                    base,
+                    bits_per,
+                    gs_per,
                 );
             }
             let pack_factor = 32 / bits_per as usize;
@@ -2198,7 +1898,9 @@ mod dense_placeholder_tests {
             Err(_) => {
                 // No Metal device available (e.g. CI without GPU);
                 // skip — the live load path on M5 Max exercises this.
-                eprintln!("skipping iter227_dense_placeholder_has_no_stacked_expert_buffers: no MlxDevice");
+                eprintln!(
+                    "skipping iter227_dense_placeholder_has_no_stacked_expert_buffers: no MlxDevice"
+                );
                 return;
             }
         };
@@ -2328,6 +2030,7 @@ fn alloc_activation_buffers(
     let argmax_params = alloc_f32(2, "argmax_params")?;
 
     Ok(MlxActivationBuffers {
+        embedding_token_id: alloc_u32(1, "embedding_token_id")?,
         hidden: alloc_f32(hs, "hidden")?,
         attn_q: alloc_f32(num_heads * max_hd, "attn_q")?,
         attn_k: alloc_f32(max_kv_heads * max_hd, "attn_k")?,
@@ -2376,12 +2079,6 @@ fn alloc_activation_buffers(
         )?,
         moe_down_id_out: alloc_f32((cfg.top_k_experts * hs).max(1), "moe_down_id_out")?,
         moe_swiglu_id_out: alloc_f32((cfg.top_k_experts * moe_interm).max(1), "moe_swiglu_id_out")?,
-        hidden_f16: device
-            .alloc_buffer(hs * 2, mlx_native::DType::F16, vec![1, hs])
-            .map_err(|e| anyhow::anyhow!("alloc hidden_f16 ({hs} f16): {e}"))?,
-        logits_f16: device
-            .alloc_buffer(vocab * 2, mlx_native::DType::F16, vec![1, vocab])
-            .map_err(|e| anyhow::anyhow!("alloc logits_f16 ({vocab} f16): {e}"))?,
         // --- Session merge buffers (S1+S2 collapse) ---
         norm_params_sliding_hd: {
             let sliding_hd = cfg.head_dim;

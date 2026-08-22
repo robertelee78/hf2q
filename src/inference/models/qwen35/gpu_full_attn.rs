@@ -1210,9 +1210,10 @@ pub fn apply_linear_projection_f32_with_ggml_type(
 ///
 /// Behavior is identical for `Q4_0` weights (Qwen path), `BF16`, and `F32` —
 /// the only material change is the U8 arm reading `qweight.info.ggml_dtype`.
-/// `qweight.affine` and `qweight.f16_shadow` are NOT consulted; the encoder
-/// path does not currently have F16-shadow integration. Future cleanup can
-/// converge with `dispatch_qmatmul` once tree-verify migrates to sessions.
+/// `qweight.affine` is not consulted because declared affine overlays use a
+/// separate entry point. GGUF weights execute according to their stored type.
+/// Future cleanup can converge with `dispatch_qmatmul` once tree-verify
+/// migrates to sessions.
 pub fn apply_linear_projection_f32_qweight(
     encoder: &mut mlx_native::CommandEncoder,
     registry: &mut KernelRegistry,

@@ -78,9 +78,6 @@ impl Qwen35ExecutionConfiguration {
         if env_exact_one("HF2Q_FUSED_QKVG") {
             bail!("evidence profile v1 does not admit fused QKVG");
         }
-        if env_exact_one("HF2Q_F16_SHADOW") {
-            bail!("evidence profile v1 does not admit F16 shadow weights");
-        }
         if std::env::var("HF2Q_DENSE_Q_ARENA_RESET").as_deref() == Ok("0") {
             bail!("evidence profile v1 requires the production prefill arena topology");
         }

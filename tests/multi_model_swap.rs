@@ -6,19 +6,20 @@
 //! evicted, and no physical-memory release was proven.
 //!
 //! This gate requires two distinct physical GGUFs and exercises the production
-//! revision-bound control plane in the sequence A -> B -> A. The larger file is
-//! selected as A, and the pool byte budget is set to the larger file size so
-//! either artifact fits alone while the pair cannot co-reside logically. Each
-//! transition first obtains the exact conflict receipt, then submits that
-//! receipt as an explicit switch.
+//! revision-bound control plane in the sequence A -> B -> A. The caller's A/B
+//! identity is preserved, and the pool byte budget is set to the larger file
+//! size so either artifact fits alone while the pair cannot co-reside
+//! logically. Each transition first obtains the exact conflict receipt, then
+//! submits that receipt as an explicit switch.
 //!
 //! The proof covers pool-resident generative engines. Dedicated BERT/Nomic
 //! embedding models have a separate process-global lifecycle and are not
 //! counted by this gate. It asserts exact A-result replay after reload, a
 //! different resident generation for the reloaded A, one
-//! resident model throughout, load latency on both switch legs, and process
-//! RSS/physical-footprint/wired-memory reclamation with no double-residency
-//! peak. This is intentionally a real-hardware gate, not a hosted-safe smoke.
+//! resident model throughout, load latency on both switch legs, exact live-file
+//! ownership/reclaim for file-backed artifacts, and bounded process
+//! RSS/physical-footprint/wired memory with no double-residency peak. This is
+//! intentionally a real-hardware gate, not a hosted-safe smoke.
 //!
 //! # Why the AC budget is wall-clock under 10 s
 //!
@@ -398,6 +399,17 @@ fn canonical_result(body: &serde_json::Value) -> serde_json::Value {
     body["choices"][0]["message"].clone()
 }
 
+fn semantic_ttft(body: &serde_json::Value) -> Duration {
+    let milliseconds = body["x_hf2q_timing"]["time_to_first_token_ms"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("completion is missing semantic TTFT: {body}"));
+    assert!(
+        milliseconds.is_finite() && milliseconds > 0.0,
+        "completion semantic TTFT must be finite and positive: {milliseconds}"
+    );
+    Duration::from_secs_f64(milliseconds / 1000.0)
+}
+
 async fn fetch_runtime(client: &reqwest::Client) -> serde_json::Value {
     let resp = client
         .get(format!("{}/hf2q/v1/runtime", base_url()))
@@ -484,6 +496,103 @@ fn settled_memory_snapshot(pid: u32) -> MemorySnapshot {
 }
 
 #[derive(Debug)]
+struct ArtifactMappingEvidence {
+    path: PathBuf,
+    inode: u64,
+    lsof_live: bool,
+    vmmap_live: bool,
+}
+
+impl ArtifactMappingEvidence {
+    fn is_live(&self) -> bool {
+        self.lsof_live || self.vmmap_live
+    }
+}
+
+/// Query both the process file table and virtual-memory map for one physical
+/// artifact. A mapped GGUF may legitimately close its original file descriptor
+/// while retaining file-backed pages, so absence is proven only when both
+/// views agree. `lsof` selects by the exact canonical file identity (including
+/// inode); `vmmap -wide` is the path-visible fallback for descriptor-free maps.
+fn artifact_mapping_evidence(pid: u32, artifact: &std::path::Path) -> ArtifactMappingEvidence {
+    use std::os::unix::fs::MetadataExt;
+
+    let path = std::fs::canonicalize(artifact)
+        .unwrap_or_else(|error| panic!("cannot canonicalize {}: {error}", artifact.display()));
+    let inode = std::fs::metadata(&path)
+        .unwrap_or_else(|error| panic!("cannot stat {}: {error}", path.display()))
+        .ino();
+    let lsof = Command::new("lsof")
+        .args(["-nP", "-a", "-p", &pid.to_string(), "--"])
+        .arg(&path)
+        .output()
+        .expect("run lsof for artifact mapping");
+    let lsof_live = lsof.status.success();
+    assert!(
+        lsof_live || lsof.status.code() == Some(1),
+        "lsof failed for pid {pid}, artifact {}: status={:?}, stderr={}",
+        path.display(),
+        lsof.status,
+        String::from_utf8_lossy(&lsof.stderr)
+    );
+
+    let vmmap = Command::new("vmmap")
+        .args(["-wide", &pid.to_string()])
+        .output()
+        .expect("run vmmap for artifact mapping");
+    assert!(
+        vmmap.status.success(),
+        "vmmap failed for pid {pid}, artifact {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&vmmap.stderr)
+    );
+    let vmmap_stdout = String::from_utf8_lossy(&vmmap.stdout);
+    let path_text = path.to_string_lossy();
+    let vmmap_live = vmmap_stdout.contains(path_text.as_ref())
+        || path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| vmmap_stdout.contains(name));
+
+    ArtifactMappingEvidence {
+        path,
+        inode,
+        lsof_live,
+        vmmap_live,
+    }
+}
+
+fn assert_artifact_mapping_state(
+    pid: u32,
+    present: &std::path::Path,
+    absent: &std::path::Path,
+    phase: &str,
+    require_present_mapping: bool,
+) -> (ArtifactMappingEvidence, ArtifactMappingEvidence) {
+    let present = artifact_mapping_evidence(pid, present);
+    let absent = artifact_mapping_evidence(pid, absent);
+    assert_ne!(
+        present.path, absent.path,
+        "{phase}: artifacts resolved to the same canonical path"
+    );
+    assert_ne!(
+        present.inode, absent.inode,
+        "{phase}: artifacts are aliases of the same physical file"
+    );
+    if require_present_mapping {
+        assert!(
+            present.is_live(),
+            "{phase}: file-backed resident artifact has no live open/mapped-file ownership: {present:?}"
+        );
+    }
+    assert!(
+        !absent.is_live(),
+        "{phase}: evicted artifact still has live open/mapped-file ownership: {absent:?}"
+    );
+    (present, absent)
+}
+
+#[derive(Debug)]
 struct ResidentIdentity {
     pool_key: String,
     generation: u64,
@@ -553,16 +662,9 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
     let bytes_b = std::fs::metadata(&canonical_b)
         .expect("MODEL_B metadata")
         .len();
-    let ((model_a, bytes_a), (model_b, bytes_b)) = if bytes_a >= bytes_b {
-        ((canonical_a, bytes_a), (canonical_b, bytes_b))
-    } else {
-        ((canonical_b, bytes_b), (canonical_a, bytes_a))
-    };
-    let artifact_delta = bytes_a - bytes_b;
-    assert!(
-        artifact_delta >= GIB,
-        "resource-reclaim proof needs artifacts at least 1 GiB apart; A={bytes_a}, B={bytes_b}"
-    );
+    let model_a = canonical_a;
+    let model_b = canonical_b;
+    let pool_budget = bytes_a.max(bytes_b);
     let swap_budget = Duration::from_secs(
         std::env::var(ENV_MAX_SECS)
             .ok()
@@ -572,12 +674,13 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
 
     eprintln!(
         "model_swap: A={} ({bytes_a} bytes), B={} ({bytes_b} bytes), \
-         pool_budget={bytes_a}, swap_budget={swap_budget:?}",
+         pool_budget={pool_budget}, swap_budget={swap_budget:?}",
         model_a.display(),
         model_b.display()
     );
 
-    let server = ServerGuard::spawn(&model_a.to_string_lossy(), bytes_a).expect("spawn hf2q serve");
+    let server =
+        ServerGuard::spawn(&model_a.to_string_lossy(), pool_budget).expect("spawn hf2q serve");
     wait_for_readyz();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -591,7 +694,9 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
     assert_eq!(status_a1, 200, "initial A inference failed: {body_a1}");
     let result_a1 = canonical_result(&body_a1);
     assert!(!result_a1.is_null(), "initial A result missing: {body_a1}");
+    let ttft_a1 = semantic_ttft(&body_a1);
     let memory_a1 = settled_memory_snapshot(server.0.id());
+    let mappings_a1 = assert_artifact_mapping_state(server.0.id(), &model_a, &model_b, "A1", true);
 
     let (receipt_b, switch_to_b, peak_a_to_b) =
         measured_switch(&rt, &client, &model_b, server.0.id());
@@ -606,6 +711,10 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
     let resident_b = one_resident(&runtime_b);
     assert_eq!(resident_b.bytes_resident, bytes_b);
     assert_ne!(resident_b.pool_key, resident_a1.pool_key);
+    assert_ne!(
+        resident_b.generation, resident_a1.generation,
+        "B switch must publish a fresh resident generation"
+    );
     assert_eq!(
         resident_b.engine_config["scheduler"], resident_a1.engine_config["scheduler"],
         "process scheduler policy changed across A -> B"
@@ -634,35 +743,29 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
         !canonical_result(&body_b).is_null(),
         "B result missing: {body_b}"
     );
+    let ttft_b = semantic_ttft(&body_b);
     let memory_b = settled_memory_snapshot(server.0.id());
+    // Detect the resident representation from OS ownership evidence. A future
+    // native-mapped B automatically enters the file-backed branch and must be
+    // absent again after B -> A. A copied B has no file map; in that case its
+    // fresh generation, successful model-specific inference, and exact pool
+    // byte accounting are the explicit anonymous-storage proof.
+    let mappings_b = assert_artifact_mapping_state(server.0.id(), &model_b, &model_a, "B", false);
 
-    let reclaim_floor = artifact_delta / 4;
-    let rss_drop = memory_a1.rss_bytes.saturating_sub(memory_b.rss_bytes);
-    let footprint_drop = memory_a1
-        .physical_footprint_bytes
-        .saturating_sub(memory_b.physical_footprint_bytes);
-    let wired_drop = memory_a1.wired_bytes.saturating_sub(memory_b.wired_bytes);
-    let system_wired_drop = memory_a1
-        .system_wired_bytes
-        .saturating_sub(memory_b.system_wired_bytes);
     assert_eq!(
         runtime_b["pool"]["total_resident_bytes"].as_u64(),
         Some(bytes_b),
         "logical pool accounting must name only B: {runtime_b}"
     );
-    assert!(
-        rss_drop >= reclaim_floor,
-        "A -> B did not reclaim enough process memory: artifact_delta={artifact_delta}, \
-         floor={reclaim_floor}, rss_drop={rss_drop}, footprint_drop={footprint_drop}, \
-         A={memory_a1:?}, B={memory_b:?}"
-    );
-    assert!(
-        system_wired_drop >= reclaim_floor / 2,
-        "A -> B did not reclaim host wired model memory: floor={}, \
-         process_wired_drop={wired_drop}, system_wired_drop={system_wired_drop}, \
-         A={memory_a1:?}, B={memory_b:?}",
-        reclaim_floor / 2
-    );
+    let b_storage_contract = if mappings_b.0.is_live() {
+        "file_backed"
+    } else {
+        assert!(
+            memory_b.rss_bytes > 0 && memory_b.physical_footprint_bytes > 0,
+            "anonymous B storage has no physical-memory accounting: {memory_b:?}"
+        );
+        "anonymous_accounted"
+    };
     let peak_margin = memory_a1
         .rss_bytes
         .max(memory_b.rss_bytes)
@@ -711,16 +814,33 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
     let (status_a2, body_a2, inference_a2) = rt.block_on(post_inference(&client, request_model_a2));
     assert_eq!(status_a2, 200, "reloaded A inference failed: {body_a2}");
     let result_a2 = canonical_result(&body_a2);
+    let ttft_a2 = semantic_ttft(&body_a2);
     assert_eq!(
         result_a2, result_a1,
         "A result changed after A -> B -> A; stale model/template/tokenizer/cache state or nondeterminism"
     );
     let memory_a2 = settled_memory_snapshot(server.0.id());
+    let mappings_a2 = assert_artifact_mapping_state(server.0.id(), &model_a, &model_b, "A2", true);
     let reload_margin = (memory_a1.rss_bytes / 10).max(2 * GIB);
     assert!(
         memory_a2.rss_bytes <= memory_a1.rss_bytes.saturating_add(reload_margin),
         "A reload leaked process RSS: first={memory_a1:?}, reload={memory_a2:?}, \
          margin={reload_margin}"
+    );
+    let footprint_reload_margin = (memory_a1.physical_footprint_bytes / 10).max(2 * GIB);
+    assert!(
+        memory_a2.physical_footprint_bytes
+            <= memory_a1
+                .physical_footprint_bytes
+                .saturating_add(footprint_reload_margin),
+        "A reload leaked physical footprint: first={memory_a1:?}, reload={memory_a2:?}, \
+         margin={footprint_reload_margin}"
+    );
+    let wired_reload_margin = (memory_a1.wired_bytes / 10).max(2 * GIB);
+    assert!(
+        memory_a2.wired_bytes <= memory_a1.wired_bytes.saturating_add(wired_reload_margin),
+        "A reload leaked process wired memory: first={memory_a1:?}, reload={memory_a2:?}, \
+         margin={wired_reload_margin}"
     );
     assert!(
         memory_a2.system_wired_bytes <= memory_a1.system_wired_bytes.saturating_add(reload_margin),
@@ -749,8 +869,12 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
     eprintln!(
         "model_swap PASS: A -> B={switch_to_b:?}, B -> A={switch_to_a:?}, \
          inference A1/B/A2={inference_a1:?}/{inference_b:?}/{inference_a2:?}; \
+         semantic-TTFT A1/B/A2={ttft_a1:?}/{ttft_b:?}/{ttft_a2:?}; \
+         switch-to-first-semantic B/A2={:?}/{:?}; \
          RSS A1/B/A2={}/{}/{}; footprint A1/B/A2={}/{}/{}; \
          process-wired A1/B/A2={}/{}/{}; host-wired A1/B/A2={}/{}/{}",
+        switch_to_b + ttft_b,
+        switch_to_a + ttft_a2,
         memory_a1.rss_bytes,
         memory_b.rss_bytes,
         memory_a2.rss_bytes,
@@ -765,4 +889,8 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
         memory_a2.system_wired_bytes,
     );
     eprintln!("model_swap peaks: A -> B={peak_a_to_b:?}; B -> A={peak_b_to_a:?}");
+    eprintln!(
+        "model_swap mappings: A1={mappings_a1:?}; B_contract={b_storage_contract} \
+         B={mappings_b:?}; A2={mappings_a2:?}"
+    );
 }

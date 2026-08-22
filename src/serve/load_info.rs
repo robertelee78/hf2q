@@ -994,6 +994,7 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
             GgmlType::Q5_1 => "Q5_1",
             GgmlType::IQ4_NL => "IQ4_NL",
             GgmlType::IQ4_XS => "IQ4_XS",
+            _ => "UNKNOWN",
         };
         *histogram.entry(label).or_insert(0) += 1;
     }
@@ -1386,6 +1387,7 @@ mod tests {
                     GgmlType::Q5_1 => "Q5_1",
                     GgmlType::IQ4_NL => "IQ4_NL",
                     GgmlType::IQ4_XS => "IQ4_XS",
+                    _ => "UNKNOWN",
                 };
                 *histogram.entry(label).or_insert(0) += 1;
             }

@@ -15,13 +15,6 @@
 //! line so the user notices. This preserves prod-binary debuggability
 //! while preventing accidental bug reports.
 //!
-//! # Not in scope here
-//!
-//! - `HF2Q_LMHEAD_Q8` is a category-2 operator knob (user-facing,
-//!   documented in `docs/operator-env-vars.md`) and is read at load
-//!   time inside the lm_head init path. It does not belong in this
-//!   struct.
-//!
 //! # Parse semantics
 //!
 //! Each field's doc comment notes the original inline parse shape —
@@ -99,9 +92,8 @@ pub struct InvestigationEnv {
     /// coherent BUT zero perf gain (126.2 vs 125.7 tok/s — MoE
     /// sparse activation makes KV bandwidth not the bottleneck).
     ///
-    /// → **No remaining safe use case**.  Use Path E+G (USE_DENSE +
-    /// LMHEAD_Q6K) for gemma4 perf instead — F32 KV preserved,
-    /// +3.7% over default at 1000-tok, coherent at long context.
+    /// → **No remaining safe use case**. The declared native head keeps
+    /// the model's artifact semantics while preserving F32 KV.
     /// Activation banner now warns DEPRECATED.
     ///
     /// Original parse: `map_or(false, |v| v == "1")`.
@@ -218,11 +210,6 @@ pub struct InvestigationEnv {
     /// unannotated dispatches).
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub graph_opt: bool,
-
-    /// `HF2Q_LMHEAD_COMPARE=1` — keep both F16 and Q8 lm_head resident
-    /// for future A/B diagnostics. Not wired into live decode today.
-    /// Original parse: `map_or(false, |v| v == "1")`.
-    pub lmhead_compare: bool,
 
     // ========================================================================
     // Category 4 — internal perf tuning (not part of product surface).
@@ -611,10 +598,10 @@ pub struct InvestigationEnv {
     pub decode_emit_tokens: bool,
 
     /// `HF2Q_DECODE_INPUT_TOKENS=<space-separated u32 list>` — replay fixed
-    /// tokens overriding the on-GPU argmax (and any rerank). When set, for
+    /// tokens overriding the on-GPU argmax. When set, for
     /// step `i < replay.len()` the decode loop returns `replay[i]` instead
     /// of the sampler's pick. After the replay buffer is exhausted, control
-    /// falls through to the normal sampler. The argmax/rerank still runs
+    /// falls through to the normal sampler. The argmax still runs
     /// (so cosine/NLL captures see live logits) — only the *picked* token
     /// is overridden.  Format mirrors the audit-binary contract:
     /// `iter23_audit.rs:206-216` writes the env var as
@@ -650,7 +637,7 @@ pub struct InvestigationEnv {
     /// Parity byte-identical at gemma4 prod shape (dim=2816, top_k=8) — see
     /// test_fused_moe_wsum_endlayer_v2_parity.rs.
     /// **Default-OFF**: ADR-029 iter-3 re-test on adr-029 HEAD with full
-    /// default-flag stack (LMHEAD_Q6K + Q6K_MV_NR2 + Q6K_ID_MV_NR2 all on)
+    /// default native-head + Q6K_MV_NR2 + Q6K_ID_MV_NR2 stack
     /// produces byte-identical 50-tok haiku output on gemma4-APEX-Q5_K_M
     /// — coherence regresses are no longer reproducible at HEAD (the iter-367
     /// claim is stale).  Throughput at HEAD: 74.4 t/s median (σ-pct 0.11%)
@@ -732,16 +719,6 @@ pub struct InvestigationEnv {
     pub mlx_profile: bool,
 
     // ========================================================================
-    // Category 3 — benchmarking-only; ack-required.
-    // EFFECTIVE value (post-gate).
-    // ========================================================================
-    /// `HF2Q_LMHEAD_RERANK=0` — disable the exact-F32 rerank of top
-    /// Q8 candidates. Reintroduces the rare near-tiebreak flip.
-    /// Effective: `true` only when the env var is literally `"0"` AND
-    /// `HF2Q_UNSAFE_EXPERIMENTS=1` is set.
-    pub lmhead_rerank_disabled: bool,
-
-    // ========================================================================
     // Ack gate state (consumed by `activate` to print startup summary).
     // ========================================================================
     /// `HF2Q_UNSAFE_EXPERIMENTS=1` — explicit acknowledgment that the
@@ -781,7 +758,6 @@ struct RawAckIntent {
     skip_o_proj: bool,
     skip_routing: bool,
     skip_v_norm: bool,
-    lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
 }
 
@@ -809,7 +785,6 @@ impl InvestigationEnv {
             skip_o_proj: env_eq_one("HF2Q_SKIP_O_PROJ"),
             skip_routing: env_eq_one("HF2Q_SKIP_ROUTING"),
             skip_v_norm: env_eq_one("HF2Q_SKIP_V_NORM"),
-            lmhead_rerank_disabled: matches!(env::var("HF2Q_LMHEAD_RERANK").as_deref(), Ok("0")),
             chunk_scan_prefill: env_eq_one("HF2Q_CHUNK_SCAN_PREFILL"),
         };
         let ack = env_eq_one("HF2Q_UNSAFE_EXPERIMENTS");
@@ -838,13 +813,10 @@ impl InvestigationEnv {
             skip_o_proj: raw.skip_o_proj && ack,
             skip_routing: raw.skip_routing && ack,
             skip_v_norm: raw.skip_v_norm && ack,
-            lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
 
             // Warn-only — no gate.
             graph_opt: env_eq_one("HF2Q_GRAPH_OPT"),
-            lmhead_compare: env_eq_one("HF2Q_LMHEAD_COMPARE"),
-
             // Dual buffer: store raw for call-site resolution with num_layers.
             dual_buffer_raw: env::var("HF2Q_DUAL_BUFFER").ok(),
 
@@ -1091,12 +1063,6 @@ impl InvestigationEnv {
                 "timing bisection; PRODUCES GARBAGE OUTPUT",
             ));
         }
-        if self.lmhead_rerank_disabled {
-            active_unsafe.push((
-                "HF2Q_LMHEAD_RERANK=0",
-                "raw Q8 argmax; rare near-tiebreak flips",
-            ));
-        }
         if self.chunk_scan_prefill {
             active_unsafe.push((
                 "HF2Q_CHUNK_SCAN_PREFILL=1",
@@ -1128,12 +1094,6 @@ impl InvestigationEnv {
                 "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
             ));
         }
-        if self.raw.lmhead_rerank_disabled && !self.lmhead_rerank_disabled {
-            refused.push((
-                "HF2Q_LMHEAD_RERANK=0",
-                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
-            ));
-        }
         if self.raw.chunk_scan_prefill && !self.chunk_scan_prefill {
             refused.push((
                 "HF2Q_CHUNK_SCAN_PREFILL=1",
@@ -1147,12 +1107,6 @@ impl InvestigationEnv {
             active_safe.push((
                 "HF2Q_GRAPH_OPT=1",
                 "no measured win; reorder aborts on unannotated dispatches",
-            ));
-        }
-        if self.lmhead_compare {
-            active_safe.push((
-                "HF2Q_LMHEAD_COMPARE=1",
-                "inert today (not wired into live decode)",
             ));
         }
         // iter-487: per-token opt-out is the noteworthy state, not the
