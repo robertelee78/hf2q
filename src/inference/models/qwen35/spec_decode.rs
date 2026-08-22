@@ -1726,21 +1726,19 @@ mod tests {
     /// identically-prefilled Qwen3.8 cache. A fifth shared token then checks
     /// that the batched hybrid-cache handoff remains decision-equivalent.
     ///
-    /// This loads the accepted 16 GiB artifact and is intentionally excluded
-    /// from hosted tests. Set `HF2Q_TEST_QWEN38_FOUR_POSITION_PARITY=1` and
-    /// `HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN=1` to prove the exact Q4_K mvN
-    /// route, or `HF2Q_TEST_QWEN38_EXPECT_MV_EXT=1` with
+    /// This loads a full model artifact and is intentionally ignored by
+    /// hosted tests. Run this exact ignored test with an explicit
+    /// `HF2Q_TEST_QWEN38_GGUF` path. Set
+    /// `HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN=1` to prove the exact Q4_K mvN route,
+    /// or `HF2Q_TEST_QWEN38_EXPECT_MV_EXT=1` with
     /// `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1` to prove the same width-four
     /// qualified weight-amortized width-four route. Set
     /// `HF2Q_TEST_QWEN38_EXPECT_Q5_K_M=1` with a Q5_K_M artifact path to bind
     /// the storage assertions to file type 17, a Q5_K embedding/projection,
     /// and the native Q6_K output head.
     #[test]
+    #[ignore = "requires an explicit full Qwen3.8 GGUF and Apple Metal"]
     fn qwen38_real_four_position_normal_forward_parity() {
-        if std::env::var_os("HF2Q_TEST_QWEN38_FOUR_POSITION_PARITY").is_none() {
-            eprintln!("skipping: set HF2Q_TEST_QWEN38_FOUR_POSITION_PARITY=1");
-            return;
-        }
         let expect_q4k_mvn = std::env::var_os("HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN").is_some();
         let expect_mv_ext = std::env::var_os("HF2Q_TEST_QWEN38_EXPECT_MV_EXT").is_some();
         let expect_q5_k_m = std::env::var_os("HF2Q_TEST_QWEN38_EXPECT_Q5_K_M").is_some();
@@ -1774,11 +1772,7 @@ mod tests {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = std::env::var_os("HF2Q_TEST_QWEN38_GGUF")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from(
-                    "/opt/hf2q/models/qwen3.8/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf",
-                )
-            });
+            .expect("ignored Qwen3.8 parity gate requires HF2Q_TEST_QWEN38_GGUF");
         assert!(
             path.is_file(),
             "Qwen3.8 parity artifact is absent at {}",
