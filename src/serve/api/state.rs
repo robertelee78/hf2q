@@ -32,7 +32,7 @@ use crate::inference::vision::mmproj::{ArchProfile, MmprojConfig};
 use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
 use crate::serve::cache::ModelCache;
 use crate::serve::multi_model::{
-    DefaultModelLoader, HotSwapManager, LoadedPool, RestoreErrorKind, RestoreOutcome,
+    DefaultModelLoader, EngineConfig, HotSwapManager, LoadedPool, RestoreErrorKind, RestoreOutcome,
     SpillErrorKind, SpillOutcome,
 };
 use crate::serve::quant_select::QuantType;
@@ -572,6 +572,14 @@ pub struct AppState {
     /// at startup and threaded into every `EngineConfig` the loader
     /// dispatches with.
     pub engine_queue_capacity: usize,
+    /// Process-wide defaults for every dynamically loaded engine. Model-local
+    /// paths are deliberately absent here; scheduler, queue, KV budget, and
+    /// metrics wiring must survive model swaps unchanged.
+    pub engine_config_template: EngineConfig,
+    /// Exact canonical GGUF path -> model-local load configuration. Startup
+    /// sidecars and explicit overlays belong only to the artifact they were
+    /// supplied for and are restored when that same artifact is reloaded.
+    pub engine_config_overrides: Arc<std::sync::RwLock<HashMap<PathBuf, EngineConfig>>>,
     /// `--model` argument from CLI startup, if any.  Used as the fallback
     /// "default model" when a request omits the OpenAI `model:` field
     /// (or sends an empty string).  Stored as the original argument
@@ -806,6 +814,17 @@ impl AppState {
         let kv_spill_counters = Arc::new(KvSpillCounters::new());
         let mut manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
         manager.set_kv_counters(Arc::clone(&kv_spill_counters));
+        let engine_config_template = EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: engine_queue_capacity,
+            warmup_synchronously: true,
+            kv_metrics_sink: Some(Arc::clone(&kv_spill_counters)
+                as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
+            dwq_overlay_path: None,
+            engine_mode: super::engine::EngineMode::SerialFifo,
+            kv_cache_budget_bytes: None,
+        };
         Ok(Self {
             config: Arc::new(config),
             started_at: Arc::new(Instant::now()),
@@ -824,6 +843,8 @@ impl AppState {
             hardware: Arc::new(hardware),
             no_integrity,
             engine_queue_capacity,
+            engine_config_template,
+            engine_config_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
             default_model,
             embedding_config: None,
             embedding_registry: None,
@@ -862,6 +883,17 @@ impl AppState {
         let kv_spill_counters_test = Arc::new(KvSpillCounters::new());
         let mut manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
         manager.set_kv_counters(Arc::clone(&kv_spill_counters_test));
+        let engine_config_template = EngineConfig {
+            tokenizer_path: None,
+            config_path: None,
+            queue_capacity: 32,
+            warmup_synchronously: true,
+            kv_metrics_sink: Some(Arc::clone(&kv_spill_counters_test)
+                as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
+            dwq_overlay_path: None,
+            engine_mode: super::engine::EngineMode::SerialFifo,
+            kv_cache_budget_bytes: None,
+        };
         // Synthetic cache root in a per-process tempdir.  Tests that need
         // a specific cache state should construct via `new_for_serve` or
         // hand-build an `AppState` (every field is `pub`).
@@ -893,6 +925,8 @@ impl AppState {
             hardware: Arc::new(hardware),
             no_integrity: false,
             engine_queue_capacity: 32,
+            engine_config_template,
+            engine_config_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
             default_model: None,
             embedding_config: None,
             embedding_registry: None,
@@ -914,6 +948,59 @@ impl AppState {
     pub fn with_default_model(mut self, default_model: Option<String>) -> Self {
         self.default_model = default_model;
         self
+    }
+
+    /// Replace process-wide dynamic-load defaults after CLI scheduler and KV
+    /// policy resolution. Model-local sidecars/overlays must remain `None` in
+    /// this template and are registered separately by exact artifact path.
+    pub fn with_engine_config_template(mut self, config: EngineConfig) -> Self {
+        assert!(
+            config.tokenizer_path.is_none()
+                && config.config_path.is_none()
+                && config.dwq_overlay_path.is_none(),
+            "process-wide engine template cannot contain model-local sidecar or overlay paths"
+        );
+        self.engine_queue_capacity = config.queue_capacity;
+        self.engine_config_template = config;
+        self
+    }
+
+    /// Bind startup-only sidecars/overlay to the exact physical artifact.
+    pub fn register_engine_config_for_path(
+        &self,
+        path: &std::path::Path,
+        config: EngineConfig,
+    ) -> anyhow::Result<()> {
+        let key = std::fs::canonicalize(path).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot canonicalize engine-config artifact {}: {error}",
+                path.display()
+            )
+        })?;
+        self.engine_config_overrides
+            .write()
+            .map_err(|_| anyhow::anyhow!("engine-config registry poisoned"))?
+            .insert(key, config);
+        Ok(())
+    }
+
+    /// Resolve the exact configuration for one physical artifact. Unknown
+    /// artifacts inherit only the process-wide template; a previously loaded
+    /// startup artifact recovers its model-local sidecars and overlay.
+    pub fn engine_config_for_path(&self, path: &std::path::Path) -> anyhow::Result<EngineConfig> {
+        let key = std::fs::canonicalize(path).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot canonicalize engine-config artifact {}: {error}",
+                path.display()
+            )
+        })?;
+        Ok(self
+            .engine_config_overrides
+            .read()
+            .map_err(|_| anyhow::anyhow!("engine-config registry poisoned"))?
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| self.engine_config_template.clone()))
     }
 
     pub fn with_local_artifacts(
@@ -1230,5 +1317,42 @@ mod tests {
         // (Prometheus convention; absent counter ⇒ no histogram).
         let counters = KvSpillCounters::new();
         assert_eq!(counters.snapshot_lcp(), (0, 0));
+    }
+
+    #[test]
+    fn engine_config_registry_preserves_process_policy_without_leaking_model_sidecars() {
+        let mut base = AppState::new(ServerConfig::default()).engine_config_template;
+        base.engine_mode = crate::serve::api::engine::EngineMode::SlotAware { max_slots: 8 };
+        base.kv_cache_budget_bytes = Some(4 * 1024 * 1024);
+        let state =
+            AppState::new(ServerConfig::default()).with_engine_config_template(base.clone());
+        let model_a = tempfile::NamedTempFile::new().unwrap();
+        let model_b = tempfile::NamedTempFile::new().unwrap();
+        let mut model_a_config = base.clone();
+        model_a_config.tokenizer_path = Some("/private/model-a-tokenizer.json".into());
+        model_a_config.config_path = Some("/private/model-a-config.json".into());
+        model_a_config.dwq_overlay_path = Some("/private/model-a-overlay.safetensors".into());
+        state
+            .register_engine_config_for_path(model_a.path(), model_a_config.clone())
+            .unwrap();
+
+        let first_a = state.engine_config_for_path(model_a.path()).unwrap();
+        let unrelated_b = state.engine_config_for_path(model_b.path()).unwrap();
+        let reloaded_a = state.engine_config_for_path(model_a.path()).unwrap();
+        assert_eq!(
+            crate::serve::multi_model::EngineConfigIdentity::from(&first_a),
+            crate::serve::multi_model::EngineConfigIdentity::from(&reloaded_a)
+        );
+        assert_eq!(first_a.tokenizer_path, model_a_config.tokenizer_path);
+        assert_eq!(first_a.config_path, model_a_config.config_path);
+        assert_eq!(first_a.dwq_overlay_path, model_a_config.dwq_overlay_path);
+        assert_eq!(unrelated_b.engine_mode, base.engine_mode);
+        assert_eq!(
+            unrelated_b.kv_cache_budget_bytes,
+            base.kv_cache_budget_bytes
+        );
+        assert!(unrelated_b.tokenizer_path.is_none());
+        assert!(unrelated_b.config_path.is_none());
+        assert!(unrelated_b.dwq_overlay_path.is_none());
     }
 }

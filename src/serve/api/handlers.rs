@@ -46,8 +46,7 @@ use super::schema::{
 use super::state::AppState;
 use crate::serve::auto_pipeline;
 use crate::serve::multi_model::{
-    AdmissionOutcome, AdmissionPlan, EngineConfig, HotSwapError, LoadedEngine, NonEvictingLoad,
-    PoolError,
+    AdmissionOutcome, AdmissionPlan, HotSwapError, LoadedEngine, NonEvictingLoad, PoolError,
 };
 #[cfg(test)]
 use crate::serve::quant_select::QuantType;
@@ -290,36 +289,12 @@ async fn resolve_engine_for_request(
     //    (NB: this implementation is "winner-loads, others-block" by
     //    virtue of the write-lock — simpler than per-key in-flight
     //    deduplication and acceptable for the request-rate workload).
-    let engine_config = EngineConfig {
-        tokenizer_path: None,
-        config_path: None,
-        queue_capacity: state.engine_queue_capacity,
-        warmup_synchronously: true,
-        // ADR-017 Phase E.a iter-2: thread the AppState-owned counters
-        // through to the engine worker so per-request LCP probes bump
-        // the same Arc the /metrics handler reads. Upcast
-        // `Arc<KvSpillCounters>` → `Arc<dyn KvCacheMetricsSink>` once
-        // here; the worker captures the trait-object and calls the
-        // default-no-op `record_lcp_probe` impl on non-prod builds.
-        kv_metrics_sink: Some(Arc::clone(&state.kv_spill_counters)
-            as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
-        // ADR-020 AC#5 Iter D — request-time auto-pipeline does not
-        // surface DWQ overlay (it auto-resolves `(repo, quant)` from
-        // the request).  Only the cmd_serve startup pre-warm path
-        // honors `--dwq-overlay`.
-        dwq_overlay_path: None,
-        // ADR-040 Phase C iter-4 (C4) — request-time auto-pipeline
-        // inherits the same scheduler policy as the operator-selected
-        // startup. The state-level mode is recorded at startup; the
-        // auto-pipeline currently uses the SerialFifo default
-        // (byte-equivalent to pre-ADR-040). C2c's SlotAware activation
-        // lifts this when it ships — the auto-pipeline will read
-        // `state.engine_mode` instead of hardcoding here. Until then,
-        // the cmd_serve startup pre-warm is the load-bearing path for
-        // `--scheduler inflight_batched` and `EngineSpawnError::
-        // ModeNotYetWired` fires there if the operator requests it.
-        engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
-        kv_cache_budget_bytes: None,
+    let engine_config = match state.engine_config_for_path(&resolved.gguf_path) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(%error, "cannot resolve dynamic engine load policy");
+            return Err(ApiError::internal_error().into_response());
+        }
     };
     let pool_arc = state.pool.clone();
     let pool_repo_blocking = pool_repo.clone();
@@ -10730,6 +10705,7 @@ mod readiness_guard_tests {
             bytes_resident: 1_024,
             loaded_at: SystemTime::now(),
             generation: 1,
+            config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),
         });
         let resolver = move |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
             let loaded = Arc::clone(&loaded);
@@ -11033,6 +11009,7 @@ mod iter215_qwen35_chat_501_tests {
             bytes_resident: 1024,
             loaded_at: SystemTime::now(),
             generation: 1,
+            config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),
         });
         let resolver_le = loaded_engine.clone();
         let resolver = move |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
@@ -11886,6 +11863,7 @@ mod a5d_handler_429_tests {
             bytes_resident: 0,
             loaded_at: SystemTime::now(),
             generation: 1,
+            config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),
         });
         let mut params = SamplingParams::default();
         params.max_tokens = max_tokens;

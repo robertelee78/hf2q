@@ -114,6 +114,27 @@ fn loaded_summary_json(summary: &LoadedSummary) -> serde_json::Value {
     })
 }
 
+fn engine_config_identity_json(
+    identity: &crate::serve::multi_model::EngineConfigIdentity,
+) -> serde_json::Value {
+    let scheduler = match identity.engine_mode {
+        crate::serve::api::engine::EngineMode::SerialFifo => {
+            serde_json::json!({"mode": "serial_fifo"})
+        }
+        crate::serve::api::engine::EngineMode::SlotAware { max_slots } => {
+            serde_json::json!({"mode": "slot_aware", "max_slots": max_slots})
+        }
+    };
+    serde_json::json!({
+        "queue_capacity": identity.queue_capacity,
+        "scheduler": scheduler,
+        "kv_cache_budget_bytes": identity.kv_cache_budget_bytes,
+        "explicit_tokenizer": identity.explicit_tokenizer,
+        "explicit_config": identity.explicit_config,
+        "dwq_overlay": identity.dwq_overlay,
+    })
+}
+
 fn activation_candidate_json(
     model: &str,
     repo: &str,
@@ -143,8 +164,17 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
     };
     let stats = manager.pool_stats();
     let resident = manager
-        .iter_loaded()
-        .map(|entry| loaded_summary_json(&entry))
+        .snapshot_engines()
+        .into_iter()
+        .map(|engine| {
+            serde_json::json!({
+                "pool_key": format!("{}@{}", engine.repo, engine.quant.as_str()),
+                "quant": engine.quant.as_str(),
+                "bytes_resident": engine.bytes_resident,
+                "generation": engine.generation,
+                "engine_config": engine_config_identity_json(&engine.config_identity),
+            })
+        })
         .collect::<Vec<_>>();
     (
         StatusCode::OK,
@@ -325,18 +355,14 @@ pub async fn hub_gguf_catalog(
     }
 }
 
-fn activation_engine_config(state: &AppState) -> EngineConfig {
-    EngineConfig {
-        tokenizer_path: None,
-        config_path: None,
-        queue_capacity: state.engine_queue_capacity,
-        warmup_synchronously: true,
-        kv_metrics_sink: Some(Arc::clone(&state.kv_spill_counters)
-            as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
-        dwq_overlay_path: None,
-        engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
-        kv_cache_budget_bytes: None,
-    }
+fn activation_engine_config(
+    state: &AppState,
+    path: &std::path::Path,
+) -> std::result::Result<EngineConfig, Response> {
+    state.engine_config_for_path(path).map_err(|error| {
+        tracing::error!(%error, "cannot resolve activation engine load policy");
+        ApiError::internal_error().into_response()
+    })
 }
 
 enum ActivationPayload {
@@ -859,8 +885,6 @@ pub async fn activate_model(
     let repo = target.repo.clone();
     let quant = target.quant;
     let bytes = target.bytes;
-    let engine_config = activation_engine_config(&state);
-
     if let Some(local_path) = target.verified_local_path() {
         if let Ok(manager) = state.pool.read() {
             if let Some(engine) = manager
@@ -968,6 +992,10 @@ pub async fn activate_model(
                 .await
             {
                 Ok(materialized) => materialized,
+                Err(response) => return response,
+            };
+            let engine_config = match activation_engine_config(&state, &gguf_path) {
+                Ok(config) => config,
                 Err(response) => return response,
             };
             // The pool may have changed during preparation. Re-plan under the
@@ -1133,6 +1161,10 @@ pub async fn activate_model(
                 .await
             {
                 Ok(materialized) => materialized,
+                Err(response) => return response,
+            };
+            let engine_config = match activation_engine_config(&state, &gguf_path) {
+                Ok(config) => config,
                 Err(response) => return response,
             };
             let confirmation = SwitchConfirmation {

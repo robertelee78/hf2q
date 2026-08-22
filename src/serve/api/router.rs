@@ -1368,6 +1368,10 @@ mod tests {
         use std::sync::Arc;
 
         let mut state = AppState::new(ServerConfig::default());
+        let mut dynamic_config = state.engine_config_template.clone();
+        dynamic_config.engine_mode = super::super::engine::EngineMode::SlotAware { max_slots: 7 };
+        dynamic_config.kv_cache_budget_bytes = Some(777_777);
+        state = state.with_engine_config_template(dynamic_config);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut manager = HotSwapManager::new(
             LoadedPool::with_capacity_and_budget(1, 800),
@@ -1846,6 +1850,14 @@ mod tests {
                 .try_get(candidate_repo, QuantType::Q4_K_M)
                 .expect("replacement must be resident")
         };
+        assert_eq!(
+            replacement.config_identity.engine_mode,
+            super::super::engine::EngineMode::SlotAware { max_slots: 7 }
+        );
+        assert_eq!(
+            replacement.config_identity.kv_cache_budget_bytes,
+            Some(777_777)
+        );
         replacement.engine.shutdown().await.unwrap();
     }
 

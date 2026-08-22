@@ -180,6 +180,39 @@ impl std::fmt::Debug for EngineConfig {
     }
 }
 
+/// Path-free identity of the configuration that produced one engine
+/// generation. This is safe to expose through the local runtime endpoint and
+/// lets model-swap receipts prove that a reloaded artifact retained its
+/// process-wide scheduler/KV policy and its model-specific sidecar contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineConfigIdentity {
+    pub queue_capacity: usize,
+    pub engine_mode: crate::serve::api::engine::EngineMode,
+    pub kv_cache_budget_bytes: Option<u64>,
+    pub explicit_tokenizer: bool,
+    pub explicit_config: bool,
+    pub dwq_overlay: bool,
+}
+
+impl Default for EngineConfigIdentity {
+    fn default() -> Self {
+        Self::from(&EngineConfig::default())
+    }
+}
+
+impl From<&EngineConfig> for EngineConfigIdentity {
+    fn from(config: &EngineConfig) -> Self {
+        Self {
+            queue_capacity: config.queue_capacity,
+            engine_mode: config.engine_mode,
+            kv_cache_budget_bytes: config.kv_cache_budget_bytes,
+            explicit_tokenizer: config.tokenizer_path.is_some(),
+            explicit_config: config.config_path.is_some(),
+            dwq_overlay: config.dwq_overlay_path.is_some(),
+        }
+    }
+}
+
 /// Default pool capacity per ADR-005 Phase 4 narrative (line 929).
 /// Configurable via [`LoadedPool::with_capacity_and_budget`].
 pub const DEFAULT_POOL_CAPACITY: usize = 3;
@@ -718,6 +751,8 @@ pub struct LoadedEngine<E> {
     /// the same pool key receives a different generation so request leases
     /// from the old engine can never be mistaken for the new one.
     pub generation: u64,
+    /// Path-free identity of the exact load policy used for this generation.
+    pub config_identity: EngineConfigIdentity,
 }
 
 /// Trait for loading a GGUF into a live engine of type `E`.
@@ -1249,6 +1284,7 @@ impl<E> HotSwapManager<E> {
             bytes_resident,
             loaded_at: SystemTime::now(),
             generation: self.allocate_generation(),
+            config_identity: EngineConfigIdentity::default(),
         });
         let handle = LoadedHandle {
             repo_id: k.clone(),
@@ -1516,6 +1552,7 @@ impl<E> HotSwapManager<E> {
             bytes_resident,
             loaded_at: SystemTime::now(),
             generation: self.allocate_generation(),
+            config_identity: EngineConfigIdentity::from(config),
         });
         let handle = LoadedHandle {
             repo_id: k.clone(),
@@ -1601,6 +1638,7 @@ impl<E> HotSwapManager<E> {
             bytes_resident,
             loaded_at: SystemTime::now(),
             generation: self.allocate_generation(),
+            config_identity: EngineConfigIdentity::from(config),
         });
 
         // Admit to the pool.  May evict LRU entries; we drop the
