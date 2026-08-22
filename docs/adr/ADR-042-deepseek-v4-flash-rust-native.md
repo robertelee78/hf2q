@@ -4,7 +4,7 @@
 
 - **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
   cache growth revalidated 2026-08-08
-- **Updated:** 2026-08-20 — the four-agent workload is bound to an immutable
+- **Updated:** 2026-08-22 — the four-agent workload is bound to an immutable
   insertion-ordered prompt contract and historical tool-result payload;
   `mlx-native =0.10.12` fixes non-aligned D512 tail loads; warm compatible
   suffixes cooperate through FFN/MoE; and an exact four-lane decode transaction
@@ -17,7 +17,11 @@
   non-parallel default end to end and stops when its constrained grammar is
   accepted instead of evaluating an unused final token. The 2026-08-20 hf2q
   candidate requires exact-SHA CI and
-  protected packed-artifact hardware receipts before publication.
+  protected packed-artifact hardware receipts before publication. The B=4
+  decode proof now holds the already-loaded producer at its acknowledged
+  readiness barrier until setup telemetry proves a continuous 30-second
+  nominal thermal tail, with a 240-second runner deadline inside the producer's
+  300-second fail-closed acknowledgement timeout.
 - **Owner:** hf2q integration lane
 - **Source model:** `deepseek-ai/DeepSeek-V4-Flash-0731`
 - **Pinned source revision:** `7872f01b1d1fe23eabc4c98b48bffcef5a386062`
@@ -2137,6 +2141,20 @@ environment observation is corrected:
   Probe execution still occurs during the window so a probe or any unrelated
   host activity that causes a real page-in fails the exact-zero rule; that is
   an intentional invalid-run signal, not an allowance to widen the threshold;
+- protected run 4 reached `measurement-ready` with 114,929,848,668 tracked
+  resident bytes on a quiet host, but macOS had moved from Nominal to Fair
+  during the loaded settle. The runner rejected the run before acknowledgement
+  or any timed trial. That falsified the runner's single-sample readiness
+  implementation: the Rust producer already reserved a 300-second
+  acknowledgement barrier for a loaded cooldown, but the runner sampled once
+  and aborted. The corrected protocol keeps the model and production-capacity
+  caches resident, requires an uninterrupted 30-second Nominal suffix in the
+  setup log, and acknowledges only after a second Nominal boundary sample.
+  The runner gives that cooldown 240 seconds from first marker observation,
+  leaving roughly 57 seconds after observation lag for fail-closed cleanup
+  before the producer's existing timeout. Fair remains valid during
+  setup and measurement, but measurement must still start Nominal; no thermal
+  or performance acceptance threshold is widened;
 - the verifier independently recomputes marker order and the at-least-45-second
   loaded-settle span, matches marker objects to the raw receipt, replays every
   exact-zero/epoch/residency rule from raw values, hashes all telemetry, and

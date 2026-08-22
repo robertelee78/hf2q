@@ -113,7 +113,7 @@ for timestamp in $(seq 1940 2 2000); do
   [[ "$timestamp" == 1940 ]] && phase=decode-cohort-loaded-setup-start
   [[ "$timestamp" == 2000 ]] && phase=decode-cohort-loaded-setup-end
   state=nominal
-  ((timestamp >= 1980)) && state=fair
+  ((timestamp >= 1950 && timestamp < 1970)) && state=fair
   printf '%s\t%s\t%s\n' "$timestamp" "$state" "$phase" >>"$setup_thermal"
   printf '%s\tquiet\t%s\t100\t-\n' "$timestamp" "$phase" \
     >>"$setup_contention"
@@ -185,6 +185,8 @@ write_summary() {
   local setup_duration=$THERMAL_LOG_DURATION_SECONDS
   local setup_fair=$THERMAL_LOG_FAIR_SAMPLES
   local setup_gaps=$THERMAL_LOG_GAPS
+  thermal_validate_settle_log "$setup_thermal_path" 0 5 || return 1
+  local setup_nominal_tail=$THERMAL_LOG_DURATION_SECONDS
   memory_validate_warning_log "$setup_memory_path" 5 1 || return 1
   local setup_memory_json
   setup_memory_json=$(memory_log_summary_json)
@@ -219,6 +221,7 @@ write_summary() {
     --argjson setup_samples "$setup_samples" \
     --argjson setup_duration "$setup_duration" \
     --argjson setup_fair "$setup_fair" --argjson setup_gaps "$setup_gaps" \
+    --argjson setup_nominal_tail "$setup_nominal_tail" \
     --argjson setup_memory_json "$setup_memory_json" \
     --argjson measurement_memory_json "$measurement_memory_json" '
     . + {schema_version:5,source_sha:$source_sha,model_sha256:$model_sha256,
@@ -238,7 +241,10 @@ write_summary() {
       maximum_settle_sample_gap_seconds:8,settle_telemetry_gaps:0,
       loaded_setup:{thermal:{log_sha256:$setup_thermal_log_sha256,
           samples:$setup_samples,duration_seconds:$setup_duration,
-          fair_samples:$setup_fair,telemetry_gaps:$setup_gaps},
+          fair_samples:$setup_fair,telemetry_gaps:$setup_gaps,
+          required_nominal_tail_seconds:30,
+          nominal_tail_seconds:$setup_nominal_tail,
+          nominal_wait_timeout_seconds:240},
         host_contention:{log_sha256:$setup_contention_sha,samples:$setup_samples,
           duration_seconds:$setup_duration,contended_samples:0,telemetry_gaps:0}},
       measurement_samples:$measurement_samples,
@@ -303,6 +309,10 @@ for mutation in \
   '.memory_pressure.policy = "darwin25-normal-no-swapout-v1"' \
   '.required_start_state = "fair"' \
   '.maximum_measurement_state = "nominal"' \
+  '.loaded_setup.thermal.nominal_tail_seconds += 1' \
+  '.loaded_setup.thermal.required_nominal_tail_seconds = 20' \
+  '.loaded_setup.thermal.nominal_wait_timeout_seconds = 300' \
+  'del(.loaded_setup.thermal.nominal_tail_seconds)' \
   '.thermal_probe.source_sha256 = ("0" * 64)' \
   'del(.thermal_probe.binary_sha256)'; do
   label=$(printf '%s' "$mutation" | shasum | cut -c1-8)
@@ -490,6 +500,43 @@ write_summary "$tmp_dir/fair-measurement-start-summary.json" "$raw" \
 expect_reject fair-measurement-start \
   "$tmp_dir/fair-measurement-start-summary.json" "$raw" "$test_log" \
   "$tmp_dir/fair-measurement-start.log"
+
+# A nominal start sample alone is insufficient. The loaded producer must be
+# held at the readiness barrier until the setup log proves a continuously
+# nominal 30-second tail immediately before measurement is armed.
+awk -F '\t' 'BEGIN { OFS="\t" } $1 == 1980 { $2="fair" } { print }' \
+  "$setup_thermal" >"$tmp_dir/short-loaded-nominal-tail.log"
+write_summary "$tmp_dir/short-loaded-nominal-tail-summary.json" "$raw" \
+  "$phase_log" "$test_log" "$measurement" "$memory_log" "$setup_memory" \
+  "$tmp_dir/short-loaded-nominal-tail.log"
+expect_reject short-loaded-nominal-tail \
+  "$tmp_dir/short-loaded-nominal-tail-summary.json" "$raw" "$test_log" \
+  "$measurement" "$memory_log" "$phase_log" "$setup_memory" \
+  "$tmp_dir/short-loaded-nominal-tail.log"
+
+# Even a valid 30-second nominal tail is not the same run if it is separated
+# from measurement arming by an unobserved telemetry gap.
+awk -F '\t' 'BEGIN { OFS="\t" } { $1 += 6; print }' "$measurement" \
+  >"$tmp_dir/delayed-measurement.log"
+awk -F '\t' 'BEGIN { OFS="\t" } { $1 += 6; print }' \
+  "$contention_measurement" >"$tmp_dir/delayed-contention.log"
+awk -F '\t' 'BEGIN { OFS="\t" } { $1 += 6; print }' "$memory_log" \
+  >"$tmp_dir/delayed-memory.log"
+write_summary "$tmp_dir/delayed-summary-base.json" "$raw" "$phase_log" \
+  "$test_log" "$tmp_dir/delayed-measurement.log" \
+  "$tmp_dir/delayed-memory.log"
+jq --arg sha "$(sha256_file "$tmp_dir/delayed-contention.log")" \
+  '.host_contention.measurement.log_sha256 = $sha' \
+  "$tmp_dir/delayed-summary-base.json" >"$tmp_dir/delayed-summary.json"
+if bash "$VERIFY" "$tmp_dir/delayed-summary.json" "$raw" "$test_log" \
+    "$tmp_dir/delayed-measurement.log" "$settle" "$source_sha" \
+    "$model_sha" "$tmp_dir/delayed-contention.log" \
+    "$contention_settle" "$tmp_dir/delayed-memory.log" "$phase_log" \
+    "$setup_thermal" "$setup_contention" "$setup_memory" \
+    >/dev/null 2>&1; then
+  echo "decode-cohort verifier accepted a detached loaded nominal tail" >&2
+  exit 1
+fi
 
 awk -F '\t' 'BEGIN { OFS="\t" } NR > 1 { $9=31 } { print }' \
   "$setup_memory" >"$tmp_dir/setup-swapout-growth.log"

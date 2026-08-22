@@ -88,6 +88,12 @@ grep -F 'host_contention_validate_thermal_alignment' "$release_gate" >/dev/null
 grep -F 'contention_settle_log="$out_dir/settle-contention.log"' \
   "$decode_gate" >/dev/null
 grep -F 'host_contention_validate_thermal_alignment' "$decode_gate" >/dev/null
+grep -F 'loaded_nominal_settle_seconds=30' "$decode_gate" >/dev/null
+grep -F 'loaded_nominal_timeout_seconds=240' "$decode_gate" >/dev/null
+grep -F 'loaded nominal cooldown did not remain calibrated' \
+  "$decode_gate" >/dev/null
+grep -F 'thermal_validate_settle_log "$setup_thermal_log"' \
+  "$decode_gate" >/dev/null
 
 # The decode monitor deliberately disables errexit while it observes the
 # producer so it can capture and clean up a failed child. Every command that

@@ -482,6 +482,7 @@ thermal_first=$(head -1 "$measurement_log" | awk -F '\t' '{print $1}')
 thermal_last=$(tail -1 "$measurement_log" | awk -F '\t' '{print $1}')
 memory_first=$(head -1 "$memory_log" | awk -F '\t' '{print $1}')
 memory_last=$(tail -1 "$memory_log" | awk -F '\t' '{print $1}')
+setup_thermal_last=$(tail -1 "$setup_thermal_log" | awk -F '\t' '{print $1}')
 awk -v test_duration="$test_duration_seconds" \
   -v process_start_ns="$process_start_ns" \
   -v measurement_ready_ns="$measurement_ready_ns" \
@@ -490,6 +491,7 @@ awk -v test_duration="$test_duration_seconds" \
   -v ready_wall="$measurement_ready_wall" \
   -v complete_wall="$measurement_complete_wall" \
   -v thermal_first="$thermal_first" -v thermal_last="$thermal_last" \
+  -v setup_thermal_last="$setup_thermal_last" \
   -v memory_first="$memory_first" -v memory_last="$memory_last" '
   BEGIN {
     phase_span=(measurement_complete_ns-process_start_ns)/1000000000
@@ -499,6 +501,8 @@ awk -v test_duration="$test_duration_seconds" \
         measurement_complete_ns <= measurement_ready_ns) exit 1
     if (process_wall < spawned) exit 1
     if (thermal_first < ready_wall || thermal_last < complete_wall) exit 1
+    if (setup_thermal_last > thermal_first ||
+        thermal_first - setup_thermal_last > 5) exit 1
     if (memory_first < ready_wall || memory_last < complete_wall) exit 1
   }
 ' || {
@@ -536,6 +540,10 @@ test "$THERMAL_LOG_FAIR_SAMPLES" = \
   "$(jq -er .loaded_setup.thermal.fair_samples "$summary")"
 test "$THERMAL_LOG_GAPS" = \
   "$(jq -er .loaded_setup.thermal.telemetry_gaps "$summary")"
+test "$(jq -er .loaded_setup.thermal.required_nominal_tail_seconds \
+  "$summary")" = 30
+test "$(jq -er .loaded_setup.thermal.nominal_wait_timeout_seconds \
+  "$summary")" = 240
 test "$(head -1 "$setup_thermal_log" | awk -F '\t' '{print $3}')" = \
   decode-cohort-loaded-setup-start
 test "$(head -1 "$setup_thermal_log" | awk -F '\t' '{print $2}')" = nominal
@@ -543,6 +551,9 @@ test "$(tail -1 "$setup_thermal_log" | awk -F '\t' '{print $3}')" = \
   decode-cohort-loaded-setup-end
 awk -F '\t' 'NR > 1 && $3 != "decode-cohort-loaded-setup" &&
   $3 != "decode-cohort-loaded-setup-end" { exit 1 }' "$setup_thermal_log"
+thermal_validate_settle_log "$setup_thermal_log" 30 5
+test "$THERMAL_LOG_DURATION_SECONDS" = \
+  "$(jq -er .loaded_setup.thermal.nominal_tail_seconds "$summary")"
 
 thermal_validate_settle_log "$settle_log" 60 8
 test "$THERMAL_LOG_SAMPLES" = "$(jq -er .settle_samples "$summary")"

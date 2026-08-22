@@ -18,8 +18,9 @@ const DECODE_STEPS: usize = 132;
 const PARITY_CAPACITY: usize = PREFIX_ROWS + DECODE_STEPS;
 const BENCHMARK_POSITION: usize = 6_676;
 const BENCHMARK_LOGICAL_CAPACITY: usize = 131_072;
-// Gives the hardware runner enough room to require 30 continuously nominal
-// seconds after the model and production-capacity caches are resident.
+// The loaded-idle phase amortizes initial residency work before warmup. After
+// warmup, the acknowledgement barrier gives the hardware runner up to 300
+// seconds to prove a continuously nominal loaded-state tail before timing.
 const LOADED_IDLE_SECONDS: u64 = 45;
 const BENCHMARK_PAIRS: usize = 20;
 const RECEIPT_ENV: &str = "HF2Q_DEEPSEEK4_DECODE_COHORT_RECEIPT";

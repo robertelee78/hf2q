@@ -19,6 +19,11 @@ if [[ ${HF2Q_THERMAL_SWIFTC_BIN+x} || ${HF2Q_THERMAL_PROBE_BIN+x} \
   exit 2
 fi
 readonly HF2Q_THERMAL_SWIFTC_BIN=/usr/bin/swiftc
+readonly loaded_nominal_settle_seconds=30
+# The producer's acknowledgement timeout is 300 seconds. Stop at 240 seconds
+# from first observation, leaving roughly 57 seconds after marker-observation
+# lag so cleanup remains fail-closed rather than racing the producer panic.
+readonly loaded_nominal_timeout_seconds=240
 [[ -x "$HF2Q_THERMAL_SWIFTC_BIN" ]] || {
   echo "required system Swift compiler is unavailable: $HF2Q_THERMAL_SWIFTC_BIN" >&2
   exit 2
@@ -184,6 +189,9 @@ monitor_decode_run() {
   local producer_pid=$1
   local producer_state
   local measurement_active=0
+  local ready_validated=0
+  local loaded_nominal_since=-1
+  local loaded_ready_deadline=-1
 
   while :; do
     thermal_read_process_state "$producer_pid" || return 1
@@ -203,31 +211,67 @@ monitor_decode_run() {
 
     if ((measurement_active == 0)); then
       if [[ -e "$ready_marker" ]]; then
-        phase_marker_matches "$process_start_marker" 0 process-start \
-          "$producer_pid" || return 1
-        phase_marker_matches "$loaded_marker" 1 loaded-settle-start \
-          "$producer_pid" || return 1
-        phase_marker_matches "$ready_marker" 2 measurement-ready \
-          "$producer_pid" || return 1
+        if ((ready_validated == 0)); then
+          phase_marker_matches "$process_start_marker" 0 process-start \
+            "$producer_pid" || return 1
+          phase_marker_matches "$loaded_marker" 1 loaded-settle-start \
+            "$producer_pid" || return 1
+          phase_marker_matches "$ready_marker" 2 measurement-ready \
+            "$producer_pid" || return 1
+          ready_validated=1
+          loaded_ready_deadline=$((SECONDS + loaded_nominal_timeout_seconds))
+        fi
+
         thermal_sample "$setup_thermal_log" \
-          decode-cohort-loaded-setup-end || return 1
+          decode-cohort-loaded-setup || return 1
         case "$THERMAL_STATE" in nominal|fair) ;; *) return 1 ;; esac
         host_contention_sample "$setup_contention_log" \
-          decode-cohort-loaded-setup-end "$$" \
+          decode-cohort-loaded-setup "$$" \
           "$THERMAL_SAMPLED_AT" || return 1
         host_contention_require_quiet \
-          decode-cohort-loaded-setup-end || return 1
-        memory_sample "$setup_memory_log" decode-cohort-loaded-setup-end \
+          decode-cohort-loaded-setup || return 1
+        memory_sample "$setup_memory_log" decode-cohort-loaded-setup \
           "$setup_initial_swapouts" || return 1
 
-        capture_buffered_measurement_sample \
-          decode-cohort-measurement-start || return 1
-        test "$THERMAL_STATE" = nominal || return 1
-        printf '%s\n' "$run_uuid" >"$ack_tmp" || return 1
-        mv "$ack_tmp" "$ack_file" || return 1
-        measurement_active=1
+        if [[ "$THERMAL_STATE" == nominal ]]; then
+          if ((loaded_nominal_since < 0)); then
+            loaded_nominal_since=$THERMAL_SAMPLED_AT
+          fi
+        else
+          loaded_nominal_since=-1
+        fi
+
+        if ((loaded_nominal_since >= 0 \
+          && THERMAL_SAMPLED_AT - loaded_nominal_since \
+            >= loaded_nominal_settle_seconds)); then
+          thermal_sample "$setup_thermal_log" \
+            decode-cohort-loaded-setup-end || return 1
+          test "$THERMAL_STATE" = nominal || return 1
+          host_contention_sample "$setup_contention_log" \
+            decode-cohort-loaded-setup-end "$$" \
+            "$THERMAL_SAMPLED_AT" || return 1
+          host_contention_require_quiet \
+            decode-cohort-loaded-setup-end || return 1
+          memory_sample "$setup_memory_log" decode-cohort-loaded-setup-end \
+            "$setup_initial_swapouts" || return 1
+
+          capture_buffered_measurement_sample \
+            decode-cohort-measurement-start || return 1
+          test "$THERMAL_STATE" = nominal || return 1
+          printf '%s\n' "$run_uuid" >"$ack_tmp" || return 1
+          mv "$ack_tmp" "$ack_file" || return 1
+          measurement_active=1
+          /bin/sleep 2 || return 1
+          continue
+        fi
+
+        if ((SECONDS >= loaded_ready_deadline)); then
+          echo "loaded nominal cooldown did not remain calibrated for ${loaded_nominal_settle_seconds}s within ${loaded_nominal_timeout_seconds}s" >&2
+          return 1
+        fi
         /bin/sleep 2 || return 1
         continue
+
       fi
 
       thermal_sample "$setup_thermal_log" decode-cohort-loaded-setup || return 1
@@ -278,6 +322,9 @@ setup_thermal_samples=$THERMAL_LOG_SAMPLES
 setup_thermal_duration=$THERMAL_LOG_DURATION_SECONDS
 setup_thermal_fair=$THERMAL_LOG_FAIR_SAMPLES
 setup_thermal_gaps=$THERMAL_LOG_GAPS
+thermal_validate_settle_log "$setup_thermal_log" \
+  "$loaded_nominal_settle_seconds" 5
+setup_nominal_tail_seconds=$THERMAL_LOG_DURATION_SECONDS
 thermal_validate_fair_or_better_measurement_log "$measurement_log" 5
 measurement_samples=$THERMAL_LOG_SAMPLES
 measurement_duration_seconds=$THERMAL_LOG_DURATION_SECONDS
@@ -348,6 +395,11 @@ jq --arg source_sha "$expected_source_sha" \
   --argjson setup_thermal_duration "$setup_thermal_duration" \
   --argjson setup_thermal_fair "$setup_thermal_fair" \
   --argjson setup_thermal_gaps "$setup_thermal_gaps" \
+  --argjson setup_nominal_required_seconds \
+    "$loaded_nominal_settle_seconds" \
+  --argjson setup_nominal_tail_seconds "$setup_nominal_tail_seconds" \
+  --argjson setup_nominal_timeout_seconds \
+    "$loaded_nominal_timeout_seconds" \
   --argjson measurement_samples "$measurement_samples" \
   --argjson measurement_duration_seconds "$measurement_duration_seconds" \
   --argjson non_nominal_measurement_samples "$non_nominal_measurement_samples" \
@@ -392,7 +444,10 @@ jq --arg source_sha "$expected_source_sha" \
     settle_telemetry_gaps:$settle_telemetry_gaps,
     loaded_setup:{thermal:{log_sha256:$setup_thermal_log_sha256,
         samples:$setup_thermal_samples,duration_seconds:$setup_thermal_duration,
-        fair_samples:$setup_thermal_fair,telemetry_gaps:$setup_thermal_gaps},
+        fair_samples:$setup_thermal_fair,telemetry_gaps:$setup_thermal_gaps,
+        required_nominal_tail_seconds:$setup_nominal_required_seconds,
+        nominal_tail_seconds:$setup_nominal_tail_seconds,
+        nominal_wait_timeout_seconds:$setup_nominal_timeout_seconds},
       host_contention:{log_sha256:$setup_contention_log_sha256,
         samples:$setup_contention_samples,duration_seconds:$setup_contention_duration,
         contended_samples:0,telemetry_gaps:$setup_contention_gaps}},
