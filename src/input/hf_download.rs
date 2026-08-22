@@ -1496,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_q5_transfer_identity_is_admitted_before_hub_access() {
+    fn qwen38_hosted_q5_transfer_identity_is_admitted_before_hub_access() {
         let artifact = HubGgufArtifact {
             repository: "owner/model".to_owned(),
             revision: "a".repeat(40),

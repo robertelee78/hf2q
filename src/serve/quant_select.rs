@@ -400,13 +400,13 @@ mod tests {
     }
 
     #[test]
-    fn q5_k_m_file_type_round_trips_exactly() {
+    fn qwen38_q5_k_m_file_type_round_trips_exactly() {
         assert_eq!(QuantType::Q5_K_M.gguf_file_type(), 17);
         assert_eq!(QuantType::from_gguf_file_type(17), Some(QuantType::Q5_K_M));
     }
 
     #[test]
-    fn q5_k_m_path_identity_comes_from_the_gguf_header() {
+    fn qwen38_q5_k_m_path_identity_comes_from_the_gguf_header() {
         let key = b"general.file_type";
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");

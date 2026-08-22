@@ -91,7 +91,7 @@ fn schema_v3_receipt_discovers_nested_local_gguf_for_exact_repository() {
 }
 
 #[test]
-fn q5_k_m_receipt_is_selectable_with_exact_header_identity() {
+fn qwen38_q5_k_m_receipt_is_selectable_with_exact_header_identity() {
     let root = tempfile::tempdir().unwrap();
     let artifact = root.path().join("model-q5_k_m.gguf");
     write_quant_gguf(&artifact, 17);

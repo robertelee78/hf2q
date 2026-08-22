@@ -1364,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn native_embedding_admission_checks_exact_storage_when_metal_is_available() {
+    fn qwen38_native_embedding_admission_checks_exact_storage_when_metal_is_available() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let Ok(device) = MlxDevice::new() else {
             return;

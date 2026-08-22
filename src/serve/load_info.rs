@@ -1275,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn infer_quant_label_prefers_exact_q5_k_m_file_type_over_tensor_codec() {
+    fn qwen38_infer_quant_label_prefers_exact_q5_k_m_file_type_over_tensor_codec() {
         let path = tmp_path("q5_k_m_profile");
         let tensors = vec![TensorSpec {
             name: "token_embd.weight",

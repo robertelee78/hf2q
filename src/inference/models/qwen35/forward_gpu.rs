@@ -7799,7 +7799,7 @@ mod tests {
     use mlx_native::MlxDevice;
 
     #[test]
-    fn native_embedding_route_table_is_the_dispatch_and_admission_authority() {
+    fn qwen38_native_embedding_route_table_is_the_dispatch_and_admission_authority() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         for (kind, route, capability_route) in [
             (
