@@ -26,7 +26,7 @@ Key enabling facts at HEAD:
 
 Three lanes, in this order. Lane A is the primary value; Lane B is gated on a coherence spike; Lane C ships with Lane A's first PR.
 
-**Scope directive (Robert, 2026-08-22): every supported serving family gets the Lane A benefit — the ADR is not complete while any supported model or family lacks it.** The first implementation lands on the qwen35-family engine (one engine serving both Qwen3.6-35B-A3B and Qwen3.8-27B); gemma4 and deepseek4 parity are REQUIRED phases, not optional follow-ons. Per-family gates run on the artifact each lane actually serves.
+**Scope directive (Robert, 2026-08-22): every supported serving family gets the Lane A benefit — the ADR is not complete while any supported model or family lacks it.** The first implementation lands on the qwen35-family engine (one engine serving both Qwen3.6-35B-A3B and Qwen3.8-27B); gemma4 and deepseek4 parity are REQUIRED phases, not optional follow-ons. Per-family gates run on the artifact each lane actually serves. The directive also binds future families: any family gaining serve support later (e.g. Qwen3-VL if/when ADR-041's engine seam lands) must adopt the anchor store as part of its engine bring-up, not as a deferred extra.
 
 **REMOVED from committed scope** (both reviewers concurred): raising `MAX_COOPERATIVE_PREFILL_ROWS` (the "Lane 2b" of the draft). ADR-042 records a 4,096-row OOM (ADR-042:59, :503) and a later 4,096/cold-cooperative failure (:2069); projected gain is ~1.15× confined to the pure-prefill wave; and the receipt verifiers/artifact tests encode the exact 2,048-row shapes. Reopen condition: Lane B profiling still shows pure-prefill F-dominance AND a design that materially reduces transient footprint (not the same constant raise).
 
