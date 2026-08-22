@@ -2155,18 +2155,72 @@ environment observation is corrected:
   before the producer's existing timeout. Fair remains valid during
   setup and measurement, but measurement must still start Nominal; no thermal
   or performance acceptance threshold is widened;
+- protected run 5 proved the corrected cooldown and reached all 20 conditioned
+  pairs with exact recurrent state/logits, exact residency shape, and exact
+  topology. Conditioned B=4 measured 113.371 ms versus 117.409 ms serial
+  (`1.0356x`), with both alternating order strata positive (`1.0380x` and
+  `1.0320x`). The result is not accepted because its committed v2 policy failed:
+  producer `ri_pageins`, system swap-ins, and system swap-outs were zero,
+  pressure stayed Normal, and throttled pages stayed zero, but the exact Rust
+  endpoints recorded 415 system page-ins, 25 page-outs, 8,864,476
+  compressions, 8,869,594 decompressions, and 5,967 purges. The earlier
+  68-second interpretation was wrong: that marker span included about 50
+  seconds parked at the acknowledgement barrier. The enclosing sampled
+  measurement interval was 18 seconds. At the 16 KiB page size, the balanced
+  compressor traffic still represents about 145 GB, but its rate must be
+  compared with a control rather than treated as ambient by assertion;
+- the same run already contains that control. After `measurement-ready`, the
+  loaded producer remained parked while the identical two-second wrapper probes
+  continued. The unambiguous post-marker suffix from epoch seconds 1,787,384,657
+  through 1,787,384,706 lasted 49 seconds and recorded 10,496 compressions,
+  7,965 decompressions, 1,930 page-ins, 34 page-outs, and zero swapout growth
+  under Normal pressure. The sampled measurement interval recorded 8,864,476
+  compressions and 8,870,902 decompressions in 18 seconds. That is about 214
+  versus 492,471 compression pages per second, a roughly 2,300-fold separation
+  with process, artifact, probes, and time adjacency held fixed. System page-in
+  rate was higher while idle, not while measuring. The wrapper and in-process
+  compression deltas were identical; wrapper decompressions exceeded the exact
+  endpoint by only 1,308 and correctly enclosed every exact global counter.
+  This falsifies the probes and steady ambient activity as explanations for the
+  bulk compressor cycle and identifies it as workload-correlated;
+- a preregistered no-probe control was prepared before this existing control was
+  recognized. Its first attempt failed closed during loaded setup when a foreign
+  Cargo build started after host reservation; it never acknowledged readiness,
+  opened the exact VM window, or produced an admissible result. The adjacent
+  idle interval supersedes that spike because it holds the suspected probes
+  constant on both sides and varies the workload directly. The failed spike is
+  evidence, not landing code;
+- v3 replaces the falsified global-zero rule with
+  `darwin25-phase-bound-process-residency-v3`. It retains counter monotonicity,
+  unchanged boot epoch/page size, boundary pressure in `{1,2}`, zero throttled
+  pages, zero system swap-in and swap-out deltas, and zero process-scoped
+  `ri_pageins` as hard conditions. Host-global page-ins, page-outs,
+  compressions, decompressions, purges, and reactivations remain mandatory raw
+  diagnostics whose endpoints and deltas are independently recomputed; they are
+  not optional and receive no invented threshold. The runner's quiet-process,
+  AC-power, Nominal-start, Fair-or-better measurement, and continuously Nominal
+  30-second loaded tail rules do not change;
+- every v3 summary permanently includes the exact post-ready/pre-ACK suffix of
+  loaded setup memory telemetry as a hash-bound, non-gating idle control. The
+  verifier reconstructs that suffix from the setup log, rejects a detached or
+  missing selection, and requires the sampled measurement counters to enclose
+  the in-process exact endpoints. Old v2 receipts fail the v3 schema/policy
+  contract. Run 5 remains a v2 failure and justifies the amendment only; a fresh
+  protected run from a committed v3 producer and verifier is required for
+  acceptance;
 - the verifier independently recomputes marker order and the at-least-45-second
   loaded-settle span, matches marker objects to the raw receipt, replays every
-  exact-zero/epoch/residency rule from raw values, hashes all telemetry, and
+  gated-zero/epoch/residency rule from raw values, hashes all telemetry, and
   rejects missing, duplicate, truncated, reordered, wrong-run, or wrong-process
   evidence.
 
-If that amended predeclared experiment passes, the conditioned protocol replaces the
-switch-contaminated performance verdict after the receipt/verifier contract and
-product gates pass. If it fails, same-topology priming is rejected as a harness
-explanation; the positive-median gate is not waived, and the next work is a real
-B=4 implementation optimization. No result from a contended, thermally invalid,
-critically memory-pressured, VM-churning, or unreceipted run is admissible.
+If a fresh v3 protected experiment passes, the conditioned protocol replaces
+the switch-contaminated performance verdict after the receipt/verifier contract
+and product gates pass. If it fails, same-topology priming is rejected as a
+harness explanation; the positive-median gate is not waived, and the next work
+is a real B=4 implementation optimization. No result from a contended,
+thermally invalid, critically memory-pressured, swapping, process-refaulting, or
+unreceipted run is admissible.
 
 Run `32344447013` then exposed a receipt-verifier defect rather than a hardware
 defect.

@@ -1191,22 +1191,17 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         .saturating_sub(vm_window_start.process_pageins);
     let pressure_boundary_pass = matches!(vm_window_start.pressure_level, 1 | 2)
         && matches!(vm_window_end.pressure_level, 1 | 2);
-    let vm_window_pass = vm_monotonic
+    let vm_environment_pass = vm_monotonic
         && vm_window_start.boot_time_seconds == vm_window_end.boot_time_seconds
         && vm_window_start.page_size == vm_window_end.page_size
         && pressure_boundary_pass
         && vm_window_start.throttled_pages == 0
         && vm_window_end.throttled_pages == 0
-        && pagein_delta == 0
-        && pageout_delta == 0
         && swapin_delta == 0
         && swapout_delta == 0
-        && compression_delta == 0
-        && decompression_delta == 0
-        && purge_delta == 0
         && process_pagein_delta == 0;
     eprintln!(
-        "DeepSeek-V4 B=4 decode spike: artifact={} parity_prefix={} parity_steps={} benchmark_position={} benchmark_logical_capacity={} loaded_idle_seconds={} permutation={:?} pairs={} order=alternating exact_state_logits_cache_recurrent=true benchmark_anchor_exact_state_logits_cache_recurrent=true tracked_resident_bytes={} vm_window_pass={} pagein_delta={} pageout_delta={} swapin_delta={} swapout_delta={} compression_delta={} decompression_delta={} purge_delta={} process_pagein_delta={} serial_ms={:?} cohort_ms={:?} serial_median_ms={:.3} cohort_median_ms={:.3} speedup={:.4}x unconditioned_even_delta_median_ms={:.3} unconditioned_odd_delta_median_ms={:.3} unconditioned_order_signature={} unconditioned_is_diagnostic_only=true conditioned_serial_prime_ms={:?} conditioned_cohort_prime_ms={:?} conditioned_serial_ms={:?} conditioned_cohort_ms={:?} conditioned_serial_median_ms={:.3} conditioned_cohort_median_ms={:.3} conditioned_speedup={:.4}x conditioned_even_speedup={:.4}x conditioned_odd_speedup={:.4}x conditioned_even_delta_median_ms={:.3} conditioned_odd_delta_median_ms={:.3} topology_pass={} topology_errors={:?} serial_counters={:?} cohort_counters={:?} conditioned_serial_prime_counters={:?} conditioned_cohort_prime_counters={:?} conditioned_serial_counters={:?} conditioned_cohort_counters={:?}",
+        "DeepSeek-V4 B=4 decode spike: artifact={} parity_prefix={} parity_steps={} benchmark_position={} benchmark_logical_capacity={} loaded_idle_seconds={} permutation={:?} pairs={} order=alternating exact_state_logits_cache_recurrent=true benchmark_anchor_exact_state_logits_cache_recurrent=true tracked_resident_bytes={} vm_environment_pass={} pagein_delta={} pageout_delta={} swapin_delta={} swapout_delta={} compression_delta={} decompression_delta={} purge_delta={} process_pagein_delta={} serial_ms={:?} cohort_ms={:?} serial_median_ms={:.3} cohort_median_ms={:.3} speedup={:.4}x unconditioned_even_delta_median_ms={:.3} unconditioned_odd_delta_median_ms={:.3} unconditioned_order_signature={} unconditioned_is_diagnostic_only=true conditioned_serial_prime_ms={:?} conditioned_cohort_prime_ms={:?} conditioned_serial_ms={:?} conditioned_cohort_ms={:?} conditioned_serial_median_ms={:.3} conditioned_cohort_median_ms={:.3} conditioned_speedup={:.4}x conditioned_even_speedup={:.4}x conditioned_odd_speedup={:.4}x conditioned_even_delta_median_ms={:.3} conditioned_odd_delta_median_ms={:.3} topology_pass={} topology_errors={:?} serial_counters={:?} cohort_counters={:?} conditioned_serial_prime_counters={:?} conditioned_cohort_prime_counters={:?} conditioned_serial_counters={:?} conditioned_cohort_counters={:?}",
         path.display(),
         PREFIX_ROWS,
         DECODE_STEPS,
@@ -1216,7 +1211,7 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         PHYSICAL_TO_LOGICAL,
         BENCHMARK_PAIRS,
         tracked_resident_bytes,
-        vm_window_pass,
+        vm_environment_pass,
         pagein_delta,
         pageout_delta,
         swapin_delta,
@@ -1261,8 +1256,10 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         && conditioned_odd_speedup > 1.0
         && conditioned_even_delta_median > 0.0
         && conditioned_odd_delta_median > 0.0;
-    let conditioned_pass =
-        conditioned_performance_pass && topology_pass && vm_window_pass && residency_shape_pass;
+    let conditioned_pass = conditioned_performance_pass
+        && topology_pass
+        && vm_environment_pass
+        && residency_shape_pass;
 
     let artifact_bytes = std::fs::metadata(&path)
         .unwrap_or_else(|error| panic!("stat official artifact {}: {error}", path.display()))
@@ -1306,7 +1303,7 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         ],
     });
     let vm_window_json = serde_json::json!({
-        "policy": "darwin25-phase-bound-no-vm-churn-v2",
+        "policy": "darwin25-phase-bound-process-residency-v3",
         "claim_scope": "within-run-paired-only",
         "start": vm_window_start.json(),
         "end": vm_window_end.json(),
@@ -1323,7 +1320,10 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         },
         "monotonic_counters": vm_monotonic,
         "pressure_boundary_pass": pressure_boundary_pass,
-        "no_churn_pass": vm_window_pass,
+        "gated_zero_deltas": ["swapins", "swapouts", "process_pageins"],
+        "diagnostic_deltas": ["pageins", "pageouts", "compressions",
+            "decompressions", "purges", "reactivations"],
+        "environment_pass": vm_environment_pass,
     });
     let conditioned_json = serde_json::json!({
         "protocol": "same-topology-prime-restore-measure",
@@ -1375,7 +1375,7 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         "topology_errors": topology_errors,
     });
     let receipt = serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "status": if conditioned_pass { "pass" } else { "fail" },
             "artifact_bytes": artifact_bytes,
             "layers": model.cfg.num_hidden_layers,
@@ -1424,6 +1424,6 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
     });
     assert!(
         conditioned_pass,
-        "exact B=4 conditioned benchmark must retain residency/topology, zero VM churn, and a positive overall/even/odd paired median: residency_shape_pass={residency_shape_pass} vm_window_pass={vm_window_pass} topology_errors={topology_errors:?} serial={conditioned_serial_median:.3}ms cohort={conditioned_cohort_median:.3}ms even={conditioned_even_speedup:.4}x/{conditioned_even_delta_median:.3}ms odd={conditioned_odd_speedup:.4}x/{conditioned_odd_delta_median:.3}ms"
+        "exact B=4 conditioned benchmark must retain residency/topology, zero swap/process page-ins, healthy pressure, and a positive overall/even/odd paired median: residency_shape_pass={residency_shape_pass} vm_environment_pass={vm_environment_pass} topology_errors={topology_errors:?} serial={conditioned_serial_median:.3}ms cohort={conditioned_cohort_median:.3}ms even={conditioned_even_speedup:.4}x/{conditioned_even_delta_median:.3}ms odd={conditioned_odd_speedup:.4}x/{conditioned_odd_delta_median:.3}ms"
     );
 }

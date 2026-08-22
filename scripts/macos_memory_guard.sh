@@ -2,7 +2,7 @@
 # Source-only macOS VM telemetry for protected hardware gates.
 # shellcheck disable=SC2034 # Public globals are consumed by sourcing runners.
 
-MEMORY_PRESSURE_POLICY="darwin25-phase-bound-no-vm-churn-v2"
+MEMORY_PRESSURE_POLICY="darwin25-phase-bound-process-residency-v3"
 MEMORY_PRESSURE_NORMAL_LEVEL=1
 MEMORY_PRESSURE_WARNING_LEVEL=2
 MEMORY_PRESSURE_CRITICAL_LEVEL=4

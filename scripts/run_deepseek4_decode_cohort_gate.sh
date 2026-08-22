@@ -50,6 +50,7 @@ memory_log="$out_dir/memory-pressure.log"
 setup_thermal_log="$out_dir/loaded-setup-thermal.log"
 setup_contention_log="$out_dir/loaded-setup-contention.log"
 setup_memory_log="$out_dir/loaded-setup-memory.log"
+loaded_idle_memory_log="$out_dir/loaded-idle-memory.log"
 phase_log="$out_dir/phases.jsonl"
 phase_dir="$out_dir/phase-markers"
 run_uuid=$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')
@@ -58,6 +59,7 @@ run_uuid=$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')
 rm -f "$raw" "$test_log" "$measurement_log" "$settle_log" \
   "$contention_measurement_log" "$contention_settle_log" "$memory_log" \
   "$setup_thermal_log" "$setup_contention_log" "$setup_memory_log" \
+  "$loaded_idle_memory_log" \
   "$phase_log" "${raw}.tmp" "$out_dir/summary.json" \
   "$out_dir/summary.json.tmp" \
   "$out_dir/summary.json.sha256"
@@ -317,6 +319,15 @@ for marker in "$process_start_marker" "$loaded_marker" "$ready_marker" \
 done
 test "$(wc -l <"$phase_log" | tr -d '[:space:]')" = 4
 
+# Persist the already-loaded, post-ready interval as the adjacent idle control.
+# Samples in the marker's wall-clock second are excluded because second-level
+# wrapper timestamps cannot prove that they occurred after the nanosecond marker.
+measurement_ready_wall_seconds=$(jq -er \
+  '.wall_ns / 1000000000 | floor' "$ready_marker")
+awk -F '\t' -v ready="$measurement_ready_wall_seconds" '$1 > ready' \
+  "$setup_memory_log" >"$loaded_idle_memory_log"
+test "$(wc -l <"$loaded_idle_memory_log" | tr -d '[:space:]')" -ge 2
+
 thermal_validate_fair_or_better_measurement_log "$setup_thermal_log" 5
 setup_thermal_samples=$THERMAL_LOG_SAMPLES
 setup_thermal_duration=$THERMAL_LOG_DURATION_SECONDS
@@ -358,6 +369,8 @@ host_contention_validate_thermal_alignment "$settle_log" "$contention_settle_log
 
 memory_validate_warning_log "$setup_memory_log" 5 1
 setup_memory_summary=$(memory_log_summary_json)
+memory_validate_warning_log "$loaded_idle_memory_log" 5 1
+loaded_idle_memory_summary=$(memory_log_summary_json)
 memory_validate_warning_log "$memory_log" 5 0
 measurement_memory_summary=$(memory_log_summary_json)
 
@@ -379,6 +392,8 @@ jq --arg source_sha "$expected_source_sha" \
   --arg memory_policy "$MEMORY_PRESSURE_POLICY" \
   --arg memory_log_sha256 "$(sha256_file "$memory_log")" \
   --arg setup_memory_log_sha256 "$(sha256_file "$setup_memory_log")" \
+  --arg loaded_idle_memory_log_sha256 \
+    "$(sha256_file "$loaded_idle_memory_log")" \
   --arg memory_guard_source_sha256 "$memory_guard_source_sha" \
   --arg thermal_probe_source_sha256 "$thermal_probe_source_sha" \
   --arg thermal_probe_compiler_path "$THERMAL_PROBE_COMPILER" \
@@ -422,8 +437,9 @@ jq --arg source_sha "$expected_source_sha" \
     "$contention_measurement_contended_samples" \
   --argjson contention_measurement_gaps "$contention_measurement_gaps" \
   --argjson setup_memory "$setup_memory_summary" \
+  --argjson loaded_idle_memory "$loaded_idle_memory_summary" \
   --argjson measurement_memory "$measurement_memory_summary" '
-  . + {schema_version:5,source_sha:$source_sha,model_sha256:$model_sha256,
+  . + {schema_version:6,source_sha:$source_sha,model_sha256:$model_sha256,
     mlx_native_version:"0.11.0",producer_exit_code:$producer_exit_code,
     raw_sha256:$raw_sha256,test_log_sha256:$test_log_sha256,
     phase_evidence:{policy:"fsynced-run-bound-markers-v1",run_uuid:$run_uuid,
@@ -474,6 +490,9 @@ jq --arg source_sha "$expected_source_sha" \
       guard_source_sha256:$memory_guard_source_sha256,
       sample_interval_seconds:2,maximum_sample_gap_seconds:5,
       setup:($setup_memory + {log_sha256:$setup_memory_log_sha256}),
+      loaded_idle:($loaded_idle_memory + {
+        log_sha256:$loaded_idle_memory_log_sha256,
+        phase:"post-ready-pre-ack",gating:false}),
       measurement:($measurement_memory + {log_sha256:$memory_log_sha256}),
       exact_window:.darwin_vm_window}}
 ' "$raw" >"$out_dir/summary.json.tmp"
@@ -483,6 +502,7 @@ bash "$ROOT_DIR/scripts/verify_deepseek4_decode_cohort_receipt.sh" \
   "$out_dir/summary.json" "$raw" "$test_log" "$measurement_log" \
   "$settle_log" "$expected_source_sha" "$expected_model_sha" \
   "$contention_measurement_log" "$contention_settle_log" "$memory_log" \
-  "$phase_log" "$setup_thermal_log" "$setup_contention_log" "$setup_memory_log"
+  "$phase_log" "$setup_thermal_log" "$setup_contention_log" \
+  "$setup_memory_log" "$loaded_idle_memory_log"
 test "$test_rc" = 0
 sha256_file "$out_dir/summary.json" >"$out_dir/summary.json.sha256"

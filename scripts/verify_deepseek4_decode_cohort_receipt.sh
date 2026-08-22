@@ -15,6 +15,7 @@ phase_log=${11:?phase-marker log is required}
 setup_thermal_log=${12:?loaded-setup thermal log is required}
 setup_contention_log=${13:?loaded-setup contention log is required}
 setup_memory_log=${14:?loaded-setup memory log is required}
+loaded_idle_memory_log=${15:?loaded-idle memory log is required}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -27,7 +28,7 @@ sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 for path in "$summary" "$raw" "$test_log" "$measurement_log" "$settle_log" \
   "$contention_measurement_log" "$contention_settle_log" "$memory_log" \
   "$phase_log" "$setup_thermal_log" "$setup_contention_log" \
-  "$setup_memory_log"; do
+  "$setup_memory_log" "$loaded_idle_memory_log"; do
   [[ -s "$path" ]] || {
     echo "decode-cohort receipt input is missing or empty: $path" >&2
     exit 1
@@ -56,6 +57,8 @@ test "$(sha256_file "$setup_contention_log")" = \
   "$(jq -er .loaded_setup.host_contention.log_sha256 "$summary")"
 test "$(sha256_file "$setup_memory_log")" = \
   "$(jq -er .memory_pressure.setup.log_sha256 "$summary")"
+test "$(sha256_file "$loaded_idle_memory_log")" = \
+  "$(jq -er .memory_pressure.loaded_idle.log_sha256 "$summary")"
 jq -s -e 'length == 1' "$summary" >/dev/null
 
 jq -e --slurpfile raw "$raw" \
@@ -108,8 +111,8 @@ jq -e --slurpfile raw "$raw" \
       .phase_evidence,
       .memory_pressure
     )) == ($receipt | del(.schema_version))
-    and $receipt.schema_version == 2
-    and .schema_version == 5 and .status == "pass"
+    and $receipt.schema_version == 3
+    and .schema_version == 6 and .status == "pass"
     and .source_sha == $source_sha and .model_sha256 == $model_sha256
     and .mlx_native_version == "0.11.0"
     and .producer_exit_code == 0
@@ -165,11 +168,16 @@ jq -e --slurpfile raw "$raw" \
       < .phase_contract.markers[3].monotonic_ns
     and (.phase_contract.markers[2].monotonic_ns
       - .phase_contract.markers[1].monotonic_ns) >= 45000000000
-    and .darwin_vm_window.policy == "darwin25-phase-bound-no-vm-churn-v2"
+    and .darwin_vm_window.policy == "darwin25-phase-bound-process-residency-v3"
     and .darwin_vm_window.claim_scope == "within-run-paired-only"
     and .darwin_vm_window.monotonic_counters == true
     and .darwin_vm_window.pressure_boundary_pass == true
-    and .darwin_vm_window.no_churn_pass == true
+    and .darwin_vm_window.gated_zero_deltas
+      == ["swapins","swapouts","process_pageins"]
+    and .darwin_vm_window.diagnostic_deltas
+      == ["pageins","pageouts","compressions","decompressions",
+          "purges","reactivations"]
+    and .darwin_vm_window.environment_pass == true
     and .darwin_vm_window.start.boot_time_seconds
       == .darwin_vm_window.end.boot_time_seconds
     and .darwin_vm_window.start.page_size == .darwin_vm_window.end.page_size
@@ -199,12 +207,13 @@ jq -e --slurpfile raw "$raw" \
     and .darwin_vm_window.deltas.process_pageins
       == (.darwin_vm_window.end.process_pageins
         - .darwin_vm_window.start.process_pageins)
-    and all(.darwin_vm_window.deltas.pageins,
-      .darwin_vm_window.deltas.pageouts,.darwin_vm_window.deltas.swapins,
-      .darwin_vm_window.deltas.swapouts,.darwin_vm_window.deltas.compressions,
-      .darwin_vm_window.deltas.decompressions,.darwin_vm_window.deltas.purges,
+    and all(.darwin_vm_window.deltas.swapins,
+      .darwin_vm_window.deltas.swapouts,
       .darwin_vm_window.deltas.process_pageins; . == 0)
-    and .darwin_vm_window.deltas.reactivations >= 0
+    and all(.darwin_vm_window.deltas.pageins,
+      .darwin_vm_window.deltas.pageouts,.darwin_vm_window.deltas.compressions,
+      .darwin_vm_window.deltas.decompressions,.darwin_vm_window.deltas.purges,
+      .darwin_vm_window.deltas.reactivations; . >= 0)
     and .benchmark.position == 6676
     and .benchmark.anchor_exact_state_logits_cache_recurrent == true
     and .benchmark.logical_capacity == 131072
@@ -338,7 +347,7 @@ jq -e --slurpfile raw "$raw" \
     and .phase_evidence.producer_pid > 0
     and .phase_evidence.test_spawned_at > 0
     and (.phase_evidence.log_sha256 | test("^[0-9a-f]{64}$"))
-    and .memory_pressure.policy == "darwin25-phase-bound-no-vm-churn-v2"
+    and .memory_pressure.policy == "darwin25-phase-bound-process-residency-v3"
     and .memory_pressure.normal_level == 1
     and .memory_pressure.warning_level == 2
     and .memory_pressure.critical_level == 4
@@ -357,6 +366,19 @@ jq -e --slurpfile raw "$raw" \
       or .memory_pressure.setup.max_pressure_level == 2)
     and .memory_pressure.setup.max_throttled_pages == 0
     and .memory_pressure.setup.observed_deltas.swapouts == 0
+    and .memory_pressure.loaded_idle.phase == "post-ready-pre-ack"
+    and .memory_pressure.loaded_idle.gating == false
+    and .memory_pressure.loaded_idle.samples >= 2
+    and .memory_pressure.loaded_idle.duration_seconds > 0
+    and (.memory_pressure.loaded_idle.normal_samples
+      + .memory_pressure.loaded_idle.warning_samples)
+      == .memory_pressure.loaded_idle.samples
+    and .memory_pressure.loaded_idle.min_free_percentage >= 0
+    and .memory_pressure.loaded_idle.min_free_percentage <= 100
+    and (.memory_pressure.loaded_idle.max_pressure_level == 1
+      or .memory_pressure.loaded_idle.max_pressure_level == 2)
+    and .memory_pressure.loaded_idle.max_throttled_pages == 0
+    and .memory_pressure.loaded_idle.observed_deltas.swapouts == 0
     and .memory_pressure.measurement.samples >= 2
     and .memory_pressure.measurement.duration_seconds > 0
     and (.memory_pressure.measurement.normal_samples
@@ -368,10 +390,14 @@ jq -e --slurpfile raw "$raw" \
       or .memory_pressure.measurement.max_pressure_level == 2)
     and .memory_pressure.measurement.max_throttled_pages == 0
     and .memory_pressure.setup.boot_time_seconds
+      == .memory_pressure.loaded_idle.boot_time_seconds
+    and .memory_pressure.loaded_idle.boot_time_seconds
       == .memory_pressure.measurement.boot_time_seconds
     and .memory_pressure.measurement.boot_time_seconds
       == $receipt.darwin_vm_window.start.boot_time_seconds
     and .memory_pressure.setup.page_size == .memory_pressure.measurement.page_size
+    and .memory_pressure.loaded_idle.page_size
+      == .memory_pressure.measurement.page_size
     and .memory_pressure.measurement.page_size
       == $receipt.darwin_vm_window.start.page_size
     and .memory_pressure.exact_window == $receipt.darwin_vm_window
@@ -394,6 +420,19 @@ jq -e --argjson actual "$setup_memory_actual" \
   "$summary" >/dev/null
 setup_boot_time=$MEMORY_LOG_BOOT_TIME_SECONDS
 setup_page_size=$MEMORY_LOG_PAGE_SIZE
+measurement_ready_wall=$(jq -er \
+  '.phase_contract.markers[] | select(.sequence == 2)
+    | (.wall_ns / 1000000000 | floor)' "$raw")
+awk -F '\t' -v ready="$measurement_ready_wall" '$1 > ready' \
+  "$setup_memory_log" | cmp -s - "$loaded_idle_memory_log"
+memory_validate_warning_log "$loaded_idle_memory_log" 5 1
+loaded_idle_memory_actual=$(memory_log_summary_json)
+jq -e --argjson actual "$loaded_idle_memory_actual" \
+  '(.memory_pressure.loaded_idle
+    | del(.log_sha256,.phase,.gating)) == $actual' \
+  "$summary" >/dev/null
+test "$setup_boot_time" = "$MEMORY_LOG_BOOT_TIME_SECONDS"
+test "$setup_page_size" = "$MEMORY_LOG_PAGE_SIZE"
 memory_validate_warning_log "$memory_log" 5 0
 measurement_memory_actual=$(memory_log_summary_json)
 jq -e --argjson actual "$measurement_memory_actual" \
@@ -431,6 +470,13 @@ test "$(tail -1 "$setup_memory_log" | awk -F '\t' '{print $18}')" = \
   decode-cohort-loaded-setup-end
 awk -F '\t' 'NR > 1 && $18 != "decode-cohort-loaded-setup" &&
   $18 != "decode-cohort-loaded-setup-end" { exit 1 }' "$setup_memory_log"
+test "$(head -1 "$loaded_idle_memory_log" | awk -F '\t' '{print $18}')" = \
+  decode-cohort-loaded-setup
+test "$(tail -1 "$loaded_idle_memory_log" | awk -F '\t' '{print $18}')" = \
+  decode-cohort-loaded-setup-end
+awk -F '\t' '$18 != "decode-cohort-loaded-setup" &&
+  $18 != "decode-cohort-loaded-setup-end" { exit 1 }' \
+  "$loaded_idle_memory_log"
 test "$(head -1 "$memory_log" | awk -F '\t' '{print $18}')" = \
   decode-cohort-measurement-start
 test "$(tail -1 "$memory_log" | awk -F '\t' '{print $18}')" = \

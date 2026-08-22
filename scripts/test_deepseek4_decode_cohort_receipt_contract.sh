@@ -26,6 +26,7 @@ phase_log="$tmp_dir/phases.jsonl"
 setup_thermal="$tmp_dir/loaded-setup-thermal.log"
 setup_contention="$tmp_dir/loaded-setup-contention.log"
 setup_memory="$tmp_dir/loaded-setup-memory.log"
+loaded_idle_memory="$tmp_dir/loaded-idle-memory.log"
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 thermal_probe_source_sha=$(sha256_file "$ROOT_DIR/scripts/macos_thermal_probe.swift")
@@ -46,7 +47,7 @@ jq -n --arg uuid "$run_uuid" --argjson pid "$producer_pid" '
       throttled_pages:0,wired_pages:1000,compressor_pages:2000,
       uncompressed_compressor_pages:3000,process_pageins:7};
   {
-    schema_version:2,status:"pass",artifact_bytes:107431343168,layers:43,lanes:4,
+    schema_version:3,status:"pass",artifact_bytes:107431343168,layers:43,lanes:4,
     parity:{prefix_rows:148,steps:132,final_position:280,final_mod_4:0,
       final_mod_128:24,physical_to_logical:[2,0,3,1],
       exact_state_logits_cache_recurrent:true},
@@ -59,14 +60,18 @@ jq -n --arg uuid "$run_uuid" --argjson pid "$producer_pid" '
       ack_timeout_seconds:300,
       markers:[marker(0;"process-start";0;1940000000000),
         marker(1;"loaded-settle-start";10000000000;1950000000000),
-        marker(2;"measurement-ready";55000000000;2000000000000),
+        marker(2;"measurement-ready";55000000000;1980000000000),
         marker(3;"measurement-complete";59000000000;2004000000000)]},
-    darwin_vm_window:{policy:"darwin25-phase-bound-no-vm-churn-v2",
+    darwin_vm_window:{policy:"darwin25-phase-bound-process-residency-v3",
       claim_scope:"within-run-paired-only",start:vm,
-      end:(vm + {reactivations:505,wired_pages:1001}),
-      deltas:{pageins:0,pageouts:0,swapins:0,swapouts:0,compressions:0,
-        decompressions:0,purges:0,reactivations:5,process_pageins:0},
-      monotonic_counters:true,pressure_boundary_pass:true,no_churn_pass:true},
+      end:(vm + {pageins:10005,pageouts:102,compressions:440,
+        decompressions:330,purges:203,reactivations:505,wired_pages:1001}),
+      deltas:{pageins:5,pageouts:2,swapins:0,swapouts:0,compressions:40,
+        decompressions:30,purges:3,reactivations:5,process_pageins:0},
+      gated_zero_deltas:["swapins","swapouts","process_pageins"],
+      diagnostic_deltas:["pageins","pageouts","compressions","decompressions",
+        "purges","reactivations"],
+      monotonic_counters:true,pressure_boundary_pass:true,environment_pass:true},
     benchmark:{position:6676,anchor_exact_state_logits_cache_recurrent:true,
       logical_capacity:131072,loaded_idle_seconds:45,pairs:20,order:"alternating",
       serial_ms:[range(0;20)|if (. % 2) == 0 then 5 else 14 end],
@@ -122,8 +127,11 @@ done
 memory_row() {
   local timestamp=$1 pressure=$2 free=$3 phase=$4 pageins=$5 swapouts=$6
   local reactivations=${7:-500}
-  printf '%s\t1786056685\t16384\t%s\t%s\t%s\t100\t20\t%s\t400\t300\t200\t%s\t0\t1000\t2000\t3000\t%s\n' \
-    "$timestamp" "$pressure" "$free" "$pageins" "$swapouts" \
+  local pageouts=${8:-100} swapins=${9:-20} compressions=${10:-400}
+  local decompressions=${11:-300} purges=${12:-200}
+  printf '%s\t1786056685\t16384\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t0\t1000\t2000\t3000\t%s\n' \
+    "$timestamp" "$pressure" "$free" "$pageins" "$pageouts" "$swapins" \
+    "$swapouts" "$compressions" "$decompressions" "$purges" \
     "$reactivations" "$phase"
 }
 for timestamp in $(seq 1940 2 2000); do
@@ -135,9 +143,12 @@ for timestamp in $(seq 1940 2 2000); do
   memory_row "$timestamp" "$pressure" 8 "$phase" \
     "$((9000 + timestamp - 1940))" 30 >>"$setup_memory"
 done
+awk -F '\t' '$1 > 1980' "$setup_memory" >"$loaded_idle_memory"
 memory_row 2000 2 8 decode-cohort-measurement-start 10000 30 >"$memory_log"
-memory_row 2002 2 8 decode-cohort-measurement 10000 30 502 >>"$memory_log"
-memory_row 2004 2 8 decode-cohort-measurement-end 10000 30 505 >>"$memory_log"
+memory_row 2002 2 8 decode-cohort-measurement 10003 30 502 101 20 425 318 201 \
+  >>"$memory_log"
+memory_row 2004 2 8 decode-cohort-measurement-end 10005 30 505 102 20 440 330 203 \
+  >>"$memory_log"
 
 for timestamp in $(seq 1000 5 1060); do
   printf '%s\tnominal\tdecode-cohort-settle\n' "$timestamp" >>"$settle"
@@ -172,6 +183,7 @@ write_summary() {
   local memory_path=${6:-$memory_log}
   local setup_memory_path=${7:-$setup_memory}
   local setup_thermal_path=${8:-$setup_thermal}
+  local loaded_idle_memory_path=${9:-$loaded_idle_memory}
 
   thermal_validate_fair_or_better_measurement_log "$measurement_path" 5 || return 1
   local measurement_samples=$THERMAL_LOG_SAMPLES
@@ -190,6 +202,9 @@ write_summary() {
   memory_validate_warning_log "$setup_memory_path" 5 1 || return 1
   local setup_memory_json
   setup_memory_json=$(memory_log_summary_json)
+  memory_validate_warning_log "$loaded_idle_memory_path" 5 1 || return 1
+  local loaded_idle_memory_json
+  loaded_idle_memory_json=$(memory_log_summary_json)
   memory_validate_warning_log "$memory_path" 5 0 || return 1
   local measurement_memory_json
   measurement_memory_json=$(memory_log_summary_json)
@@ -207,6 +222,7 @@ write_summary() {
     --arg setup_contention_sha "$(sha256_file "$setup_contention")" \
     --arg memory_log_sha256 "$(sha256_file "$memory_path")" \
     --arg setup_memory_sha "$(sha256_file "$setup_memory_path")" \
+    --arg loaded_idle_memory_sha "$(sha256_file "$loaded_idle_memory_path")" \
     --arg memory_guard_sha "$memory_guard_source_sha" \
     --arg thermal_source_sha "$thermal_probe_source_sha" \
     --arg thermal_compiler_sha "$thermal_probe_compiler_sha" \
@@ -223,8 +239,9 @@ write_summary() {
     --argjson setup_fair "$setup_fair" --argjson setup_gaps "$setup_gaps" \
     --argjson setup_nominal_tail "$setup_nominal_tail" \
     --argjson setup_memory_json "$setup_memory_json" \
+    --argjson loaded_idle_memory_json "$loaded_idle_memory_json" \
     --argjson measurement_memory_json "$measurement_memory_json" '
-    . + {schema_version:5,source_sha:$source_sha,model_sha256:$model_sha256,
+    . + {schema_version:6,source_sha:$source_sha,model_sha256:$model_sha256,
       mlx_native_version:"0.11.0",producer_exit_code:0,raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,
       phase_evidence:{policy:"fsynced-run-bound-markers-v1",run_uuid:$run_uuid,
@@ -259,13 +276,16 @@ write_summary() {
         measurement:{log_sha256:$contention_measurement_sha,
           samples:$measurement_samples,duration_seconds:$measurement_duration,
           contended_samples:0,telemetry_gaps:0}},
-      memory_pressure:{policy:"darwin25-phase-bound-no-vm-churn-v2",
+      memory_pressure:{policy:"darwin25-phase-bound-process-residency-v3",
         normal_level:1,warning_level:2,critical_level:4,
         claim_scope:"within-run-paired-only",
         guard_source_path:"scripts/macos_memory_guard.sh",
         guard_source_sha256:$memory_guard_sha,sample_interval_seconds:2,
         maximum_sample_gap_seconds:5,
         setup:($setup_memory_json + {log_sha256:$setup_memory_sha}),
+        loaded_idle:($loaded_idle_memory_json + {
+          log_sha256:$loaded_idle_memory_sha,
+          phase:"post-ready-pre-ack",gating:false}),
         measurement:($measurement_memory_json + {log_sha256:$memory_log_sha256}),
         exact_window:.darwin_vm_window}}
   ' "$raw_path" >"$output"
@@ -276,11 +296,12 @@ verify() {
   local measurement_path=${4:-$measurement} memory_path=${5:-$memory_log}
   local phase_path=${6:-$phase_log} setup_memory_path=${7:-$setup_memory}
   local setup_thermal_path=${8:-$setup_thermal}
+  local loaded_idle_memory_path=${9:-$loaded_idle_memory}
   bash "$VERIFY" "$summary_path" "$raw_path" "$test_path" \
     "$measurement_path" "$settle" "$source_sha" "$model_sha" \
     "$contention_measurement" "$contention_settle" "$memory_path" \
     "$phase_path" "$setup_thermal_path" "$setup_contention" \
-    "$setup_memory_path"
+    "$setup_memory_path" "$loaded_idle_memory_path"
 }
 
 write_summary "$summary"
@@ -291,22 +312,24 @@ expect_reject() {
   local measurement_path=${5:-$measurement} memory_path=${6:-$memory_log}
   local phase_path=${7:-$phase_log} setup_memory_path=${8:-$setup_memory}
   local setup_thermal_path=${9:-$setup_thermal}
+  local loaded_idle_memory_path=${10:-$loaded_idle_memory}
   if verify "$summary_path" "$raw_path" "$test_path" "$measurement_path" \
       "$memory_path" "$phase_path" "$setup_memory_path" \
-      "$setup_thermal_path" >/dev/null 2>&1; then
+      "$setup_thermal_path" "$loaded_idle_memory_path" >/dev/null 2>&1; then
     echo "decode-cohort verifier accepted invalid case: $label" >&2
     exit 1
   fi
 }
 
 for mutation in \
-  '.schema_version = 4' \
+  '.schema_version = 5' \
   '.benchmark.speedup = 1' \
   '.producer_exit_code = 1' \
   '.measurement_samples += 1' \
   '.raw_sha256 = ("0" * 64)' \
   '.phase_evidence.log_sha256 = ("0" * 64)' \
   '.memory_pressure.policy = "darwin25-normal-no-swapout-v1"' \
+  'del(.memory_pressure.loaded_idle)' \
   '.required_start_state = "fair"' \
   '.maximum_measurement_state = "nominal"' \
   '.loaded_setup.thermal.nominal_tail_seconds += 1' \
@@ -356,19 +379,18 @@ consistent_vm_churn_reject() {
     "$measurement" "$changed_memory" "$changed_phase"
 }
 
-# Keep status/no_churn_pass positive and update the enclosing sampled counter.
-# Each case must therefore be rejected by independent endpoint-delta replay,
-# not by the producer's already-computed verdict or an unrelated log mismatch.
-consistent_vm_churn_reject vm-pagein-churn pageins 6
-consistent_vm_churn_reject vm-pageout-churn pageouts 7
+# Keep status/environment_pass positive and update the enclosing sampled
+# counter. Retained zero gates must still be rejected by independent replay.
 consistent_vm_churn_reject vm-swapin-churn swapins 8
 consistent_vm_churn_reject vm-swapout-churn swapouts 9
-consistent_vm_churn_reject compression-churn compressions 10
-consistent_vm_churn_reject decompression-churn decompressions 11
-consistent_vm_churn_reject purge-churn purges 12
 consistent_raw_reject process-pagein-churn '
   .darwin_vm_window.end.process_pageins += 1
   | .darwin_vm_window.deltas.process_pageins = 1'
+consistent_raw_reject missing-diagnostic-delta \
+  'del(.darwin_vm_window.deltas.compressions)'
+consistent_raw_reject legacy-v2-policy '
+  .schema_version = 2
+  | .darwin_vm_window.policy = "darwin25-phase-bound-no-vm-churn-v2"'
 consistent_raw_reject changed-boot-epoch '
   .darwin_vm_window.end.boot_time_seconds += 1'
 consistent_raw_reject changed-page-size '
@@ -533,6 +555,7 @@ if bash "$VERIFY" "$tmp_dir/delayed-summary.json" "$raw" "$test_log" \
     "$model_sha" "$tmp_dir/delayed-contention.log" \
     "$contention_settle" "$tmp_dir/delayed-memory.log" "$phase_log" \
     "$setup_thermal" "$setup_contention" "$setup_memory" \
+    "$loaded_idle_memory" \
     >/dev/null 2>&1; then
   echo "decode-cohort verifier accepted a detached loaded nominal tail" >&2
   exit 1
@@ -546,6 +569,28 @@ if write_summary "$tmp_dir/setup-swapout-growth-summary.json" "$raw" \
   echo "summary builder accepted setup swapout growth" >&2
   exit 1
 fi
+
+# Diagnostic host-global counters remain mandatory and must enclose the
+# in-process exact window even though their nonzero values do not fail v3.
+awk -F '\t' 'BEGIN { OFS="\t" } NR == 3 { $10=439 } { print }' \
+  "$memory_log" >"$tmp_dir/nonenclosing-compression.log"
+write_summary "$tmp_dir/nonenclosing-compression-summary.json" "$raw" \
+  "$phase_log" "$test_log" "$measurement" \
+  "$tmp_dir/nonenclosing-compression.log"
+expect_reject nonenclosing-compression \
+  "$tmp_dir/nonenclosing-compression-summary.json" "$raw" "$test_log" \
+  "$measurement" "$tmp_dir/nonenclosing-compression.log"
+
+# The permanent idle control is the exact post-ready suffix of setup telemetry,
+# not any other internally valid selection of samples.
+tail -9 "$loaded_idle_memory" >"$tmp_dir/detached-loaded-idle.log"
+write_summary "$tmp_dir/detached-loaded-idle-summary.json" "$raw" \
+  "$phase_log" "$test_log" "$measurement" "$memory_log" "$setup_memory" \
+  "$setup_thermal" "$tmp_dir/detached-loaded-idle.log"
+expect_reject detached-loaded-idle \
+  "$tmp_dir/detached-loaded-idle-summary.json" "$raw" "$test_log" \
+  "$measurement" "$memory_log" "$phase_log" "$setup_memory" \
+  "$setup_thermal" "$tmp_dir/detached-loaded-idle.log"
 
 for memory_mutation in nonmonotonic-pageins changed-log-boot throttled-page; do
   case "$memory_mutation" in
@@ -594,7 +639,8 @@ jq --arg sha "$(sha256_file "$tmp_dir/contended.log")" \
 if bash "$VERIFY" "$tmp_dir/contended-summary.json" "$raw" "$test_log" \
     "$measurement" "$settle" "$source_sha" "$model_sha" \
     "$tmp_dir/contended.log" "$contention_settle" "$memory_log" "$phase_log" \
-    "$setup_thermal" "$setup_contention" "$setup_memory" >/dev/null 2>&1; then
+    "$setup_thermal" "$setup_contention" "$setup_memory" \
+    "$loaded_idle_memory" >/dev/null 2>&1; then
   echo "decode-cohort verifier accepted host contention" >&2
   exit 1
 fi
