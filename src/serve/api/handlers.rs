@@ -8445,6 +8445,75 @@ hf2q_qwen_anchor_post_admission_prefill_failures_total {}\n",
             .post_admission_prefill_failures_total
             .load(Ordering::Relaxed),
     );
+    let gemma_anchor = &super::gemma4_anchor_store::TELEMETRY;
+    let gemma_anchor_block = format!(
+        "# HELP hf2q_gemma4_anchor_captures_total Slot-local Gemma boundary captures attempted.\n\
+# TYPE hf2q_gemma4_anchor_captures_total counter\n\
+hf2q_gemma4_anchor_captures_total {}\n\
+# HELP hf2q_gemma4_anchor_capture_budget_skips_total Gemma captures skipped by exact committed-plus-pending byte preflight.\n\
+# TYPE hf2q_gemma4_anchor_capture_budget_skips_total counter\n\
+hf2q_gemma4_anchor_capture_budget_skips_total {}\n\
+# HELP hf2q_gemma4_anchor_capture_seconds_total Wall time spent copying family-native Gemma payloads.\n\
+# TYPE hf2q_gemma4_anchor_capture_seconds_total counter\n\
+hf2q_gemma4_anchor_capture_seconds_total {:.9}\n\
+# HELP hf2q_gemma4_anchor_restore_attempts_total Gemma anchor restore attempts.\n\
+# TYPE hf2q_gemma4_anchor_restore_attempts_total counter\n\
+hf2q_gemma4_anchor_restore_attempts_total {}\n\
+# HELP hf2q_gemma4_anchor_restore_hits_total Epoch-valid Gemma anchor restores.\n\
+# TYPE hf2q_gemma4_anchor_restore_hits_total counter\n\
+hf2q_gemma4_anchor_restore_hits_total {}\n\
+# HELP hf2q_gemma4_anchor_restore_misses_total Gemma restore failures or invalid layouts.\n\
+# TYPE hf2q_gemma4_anchor_restore_misses_total counter\n\
+hf2q_gemma4_anchor_restore_misses_total {}\n\
+# HELP hf2q_gemma4_anchor_tokens_saved_total Prompt tokens skipped by Gemma anchor restoration.\n\
+# TYPE hf2q_gemma4_anchor_tokens_saved_total counter\n\
+hf2q_gemma4_anchor_tokens_saved_total {}\n\
+# HELP hf2q_gemma4_anchor_descendants_pruned_total Stale Gemma descendants removed after rewind or cancellation.\n\
+# TYPE hf2q_gemma4_anchor_descendants_pruned_total counter\n\
+hf2q_gemma4_anchor_descendants_pruned_total {}\n\
+# HELP hf2q_gemma4_anchor_evictions_total Positional keep-newest-K Gemma evictions.\n\
+# TYPE hf2q_gemma4_anchor_evictions_total counter\n\
+hf2q_gemma4_anchor_evictions_total {}\n\
+# HELP hf2q_gemma4_anchor_cancellations_total Gemma requests whose anchor lineage was reconciled on cancellation.\n\
+# TYPE hf2q_gemma4_anchor_cancellations_total counter\n\
+hf2q_gemma4_anchor_cancellations_total {}\n\
+# HELP hf2q_gemma4_anchor_lineage_clears_total Full Gemma anchor-store invalidations.\n\
+# TYPE hf2q_gemma4_anchor_lineage_clears_total counter\n\
+hf2q_gemma4_anchor_lineage_clears_total {}\n\
+# HELP hf2q_gemma4_anchor_peak_committed_pending_bytes Peak reclaimable Gemma anchor bytes in one slot.\n\
+# TYPE hf2q_gemma4_anchor_peak_committed_pending_bytes gauge\n\
+hf2q_gemma4_anchor_peak_committed_pending_bytes {}\n\
+# HELP hf2q_gemma4_anchor_aggregate_peak_committed_pending_bytes Peak reclaimable Gemma anchor bytes across slots.\n\
+# TYPE hf2q_gemma4_anchor_aggregate_peak_committed_pending_bytes gauge\n\
+hf2q_gemma4_anchor_aggregate_peak_committed_pending_bytes {}\n\
+# HELP hf2q_gemma4_anchor_aggregate_budget_bytes Aggregate Gemma anchor-owned byte budget.\n\
+# TYPE hf2q_gemma4_anchor_aggregate_budget_bytes gauge\n\
+hf2q_gemma4_anchor_aggregate_budget_bytes {}\n\
+# HELP hf2q_gemma4_anchor_configured_slots Configured Gemma SlotAware concurrency.\n\
+# TYPE hf2q_gemma4_anchor_configured_slots gauge\n\
+hf2q_gemma4_anchor_configured_slots {}\n",
+        gemma_anchor.captures_total.load(Ordering::Relaxed),
+        gemma_anchor
+            .capture_budget_skips_total
+            .load(Ordering::Relaxed),
+        gemma_anchor.capture_nanos_total.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        gemma_anchor.restore_attempts_total.load(Ordering::Relaxed),
+        gemma_anchor.restore_hits_total.load(Ordering::Relaxed),
+        gemma_anchor.restore_misses_total.load(Ordering::Relaxed),
+        gemma_anchor.tokens_saved_total.load(Ordering::Relaxed),
+        gemma_anchor.descendants_pruned_total.load(Ordering::Relaxed),
+        gemma_anchor.evictions_total.load(Ordering::Relaxed),
+        gemma_anchor.cancellations_total.load(Ordering::Relaxed),
+        gemma_anchor.lineage_clears_total.load(Ordering::Relaxed),
+        gemma_anchor
+            .peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        gemma_anchor
+            .aggregate_peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        gemma_anchor.aggregate_budget_bytes.load(Ordering::Relaxed),
+        gemma_anchor.configured_slots.load(Ordering::Relaxed),
+    );
     let qwen_mtp_fallback_reasons = format!(
         "# HELP hf2q_qwen_mtp_fallback_requests_by_reason_total Compatibility aggregate of exact Qwen speculation fallbacks by closed reason.\n\
 # TYPE hf2q_qwen_mtp_fallback_requests_by_reason_total counter\n\
@@ -8654,6 +8723,7 @@ hf2q_qwen_mtp_fallback_requests_total {qwen_mtp_fallbacks}\n\
 hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
 {qwen_speculation_proposers}\
 {qwen_anchor_block}\
+{gemma_anchor_block}\
 ",
         uptime = state.uptime_seconds(),
         ready = ready,
@@ -8687,6 +8757,7 @@ hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
         qwen_mtp_resets = qwen_mtp.conversation_resets.load(Ordering::Relaxed),
         qwen_speculation_proposers = qwen_speculation_proposers,
         qwen_anchor_block = qwen_anchor_block,
+        gemma_anchor_block = gemma_anchor_block,
     );
     // Prometheus exposition format: text/plain with a versioned content-type.
     let mut resp = (StatusCode::OK, body).into_response();

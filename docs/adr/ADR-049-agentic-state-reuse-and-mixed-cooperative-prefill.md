@@ -1,16 +1,23 @@
 # ADR-049: Agentic state reuse (multi-anchor) and Mixed-phase cooperative prefill
 
-- Status: Accepted; execution in progress (qwen35-family model-free Lane A
-  proof complete at rev 6, real-artifact gates and cross-family phases open)
+- Status: Accepted; execution in progress (qwen35-family and Gemma4 model-free
+  Lane A proof complete at rev 7; real-artifact gates and DeepSeek4 parity open)
 - Date: 2026-08-22
-- Updated: 2026-08-22 (rev 6, qwen35-family post-admission failure gate)
+- Updated: 2026-08-22 (rev 7, Gemma4 multi-anchor parity milestone)
   — implementation commit `95d618c8`, based on main `32181b61`: explicit
   per-slot AnchorStore,
   linear-lineage pruning, fail-atomic restore preflight, exact payload
   ownership/accounting, terminal publication, A.8 logs/metrics, idle audit,
   independent reference-model + 17-mutation battery, and Lane C corrections.
   Qwen3.6/Qwen3.8 hardware receipts are intentionally not claimed here; see
-  the execution ledger below.
+  the execution ledger below. Gemma4 parity in this revision is based on main
+  `2c6bcb61`: the model-neutral state machine is extracted into
+  `src/serve/api/anchor_store.rs`; Gemma retains its family-native sliding-KV
+  payload, image fingerprint matching, independent byte policy, and telemetry.
+  Its model-free gates prove fail-atomic all-layer restore preflight, terminal
+  pending publication, cancellation, lineage rewind, exact owned bytes, and
+  native equality hits. Gemma real-artifact unary/SSE and multi-slot receipts
+  remain an explicit acceptance gate, not a claim of this milestone.
 - Owners: hf2q serving engine (execution: the active qwen35/qwen38 serving-lane session; plan authored by the FreeToken research session)
 - Code pins: planning review at hf2q `242882e8`; rev-6 execution based on
   merged main `32181b61`; mlx-native `0.11.2`. Anchors were authored at
@@ -86,6 +93,34 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 3. A decode-time anchor (not in this ADR's scope) may only snapshot after accept/rollback settles — never from optimistic post-verify state; any capture sharing the LA arena must extract its rows before `clear_la_capture`/re-arm. The arena's true size is ≈1.96 GiB at the 32-token SerialFifo window (30 layers × 67 MiB), 4× the stale in-code comment — Lane A does NOT use this arena (boundary capture reads live state) and MUST NOT replicate it per slot.
 
 **A.6 — Family parity (REQUIRED phases per the scope directive, same invariants):** gemma4 (`Gemma4PromptAnchor` is structurally identical; retire serial-path `live_prefix_tokens` special-casing where subsumed), then deepseek4 (its two-anchor pending/committed pair generalizes to the store; wire `Deepseek4CacheSnapshot::resident_bytes()` — currently zero callers — into the same accounting). The ADR does not reach Implemented until every supported serving family carries the anchor store.
+
+Gemma4 model-free milestone (rev 7): COMPLETE. The single
+`Option<Gemma4PromptAnchor>` is replaced by `AnchorStore<Gemma4PromptAnchor>`
+without changing Gemma's existing dense/MoE execution or mixed-prefill row
+aggregation. Checkpoints remain the family-native `GemmaHybridSlotAnchor` plus
+the rendered token prefix and vision fingerprint. Restore now preflights every
+layer, optional buffer, destination span, and cursor before the first write;
+single- and multi-slot failures clear the whole store and hard-reset rather
+than trying a shallower checkpoint. Captures stage at the stable boundary but
+remain invisible until terminal retained-token publication; cancellation
+discards pending state while preserving only physically reachable committed
+ancestors. Production metrics expose capture cost/skips, hit/miss/tokens saved,
+descendant pruning, eviction/cancellation/lineage clears, per-slot and aggregate
+peak bytes, configured slots, and the immutable aggregate grant.
+
+Proof at base `2c6bcb61` (model-free/synthetic, no model artifact):
+`cargo check --locked --bin hf2q --no-default-features`; 24/24 focused generic
+and Qwen wrapper tests via `cargo test --locked --bin hf2q anchor_store
+--no-default-features`; and 5/5 Gemma tests via `cargo test --locked --bin hf2q
+gemma_anchor --no-default-features`. The battery includes A→B→C rewind and old
+descendant rejection, request cancellation with an unchanged committed set,
+failed-restore full-store invalidation, exact family-owned byte conservation,
+pending invisibility until terminal publication, image-fingerprint equality,
+and a two-layer late-layout fault proving no earlier byte or cursor mutates
+before all-layer preflight succeeds. Open acceptance gate: run Gemma dense and
+MoE real artifacts through unary/SSE exact-retry, continuation, divergence,
+cancellation, failed-restore injection, and N>1 concurrency before marking the
+family phase hardware-proven.
 
 **A.7 — Open hypotheses: the spikes that decide them** (not "deferred" — each is a live question whose data collection is already scheduled or cheap):
 - *Cross-slot / restart-surviving registry tier*. Hypothesis: foreign-slot landings and restart warm-up are frequent enough on the real workload to justify a shared CoW prefix store. Deciding data: A.8 telemetry — slot-affinity foreign-landing counts and restart-cold counts over production use. If confirmed → its own ADR (needs a slot-parameterized `restore_partial` — the current one is copy-owning and rewrites every sequence cursor, kv_cache.rs:3435, :3493 — plus an ownership answer to the `b44b92ed` tenant-isolation pin; FreeToken's donate-not-copy/CoW/dual-currency eviction is that ADR's design vocabulary). Meanwhile the SerialFifo `LcpRegistry` + disk hydrate remains the restart-hydrate tier.
