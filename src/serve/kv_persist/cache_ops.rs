@@ -235,6 +235,7 @@ pub fn clear_namespace_all_quants(
     for q in [
         QuantType::Q8_0,
         QuantType::Q6_K,
+        QuantType::Q5_K_M,
         QuantType::Q4_K_M,
         QuantType::Q3_K_M,
     ] {

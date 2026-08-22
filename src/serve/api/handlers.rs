@@ -43,6 +43,7 @@ use crate::serve::multi_model::{
     AdmissionOutcome, AdmissionPlan, EngineConfig, HotSwapError, LoadedEngine, NonEvictingLoad,
     PoolError,
 };
+#[cfg(test)]
 use crate::serve::quant_select::QuantType;
 
 use super::{DIAGNOSTIC_NO_EVICT_HEADER, DIAGNOSTIC_NO_EVICT_VALUE};
@@ -260,7 +261,21 @@ async fn resolve_engine_for_request(
         .repo_id
         .clone()
         .unwrap_or_else(|| crate::serve::pool_key_for_path(&resolved.gguf_path));
-    let pool_quant = resolved.quant.unwrap_or(QuantType::Q4_K_M);
+    let pool_quant = match resolved.quant {
+        Some(quant) => quant,
+        None => match crate::serve::quant_select::quant_type_from_gguf_path(&resolved.gguf_path) {
+            Ok(quant) => quant,
+            Err(error) => {
+                tracing::warn!(
+                    model = %model_arg,
+                    gguf = %resolved.gguf_path.display(),
+                    error = %error,
+                    "refusing model whose exact GGUF quant identity is unsupported"
+                );
+                return Err(ApiError::model_not_loaded(&model_arg).into_response());
+            }
+        },
+    };
 
     // 4. Slow path: load through the manager.  `load_or_get` is
     //    mutating + serializes on the write-lock.  Concurrent requests

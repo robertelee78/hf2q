@@ -474,22 +474,7 @@ pub fn download_hub_gguf(artifact: &HubGgufArtifact) -> Result<PathBuf, Download
         });
     }
     validate_repo_filename(&artifact.filename)?;
-    let identity_valid = artifact.filename.to_ascii_lowercase().ends_with(".gguf")
-        && artifact.bytes > 0
-        && artifact.revision.len() == 40
-        && artifact
-            .revision
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-        && artifact.sha256.len() == 64
-        && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && artifact.quant_hint.as_deref().is_some_and(|quant| {
-            matches!(
-                quant.to_ascii_uppercase().as_str(),
-                "Q3_K_M" | "Q4_K_M" | "Q6_K" | "Q8_0"
-            )
-        });
-    if !identity_valid {
+    if !hosted_gguf_identity_valid(artifact) {
         return Err(DownloadError::InvalidRepositoryInventory {
             reason: "hosted GGUF identity is incomplete or malformed".to_owned(),
         });
@@ -519,6 +504,25 @@ pub fn download_hub_gguf(artifact: &HubGgufArtifact) -> Result<PathBuf, Download
     Ok(path)
 }
 
+fn hosted_gguf_identity_valid(artifact: &HubGgufArtifact) -> bool {
+    let (inferred_role, inferred_quant, unavailable_reason) = classify_hub_gguf(&artifact.filename);
+    artifact.filename.to_ascii_lowercase().ends_with(".gguf")
+        && artifact.selectable
+        && artifact.unavailable_reason.is_none()
+        && artifact.bytes > 0
+        && artifact.revision.len() == 40
+        && artifact
+            .revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && artifact.sha256.len() == 64
+        && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && inferred_role == "text_model"
+        && unavailable_reason.is_none()
+        && inferred_quant == artifact.quant_hint
+        && artifact.role == inferred_role
+}
+
 fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<String>) {
     let lower = filename.to_ascii_lowercase();
     let basename = lower.rsplit('/').next().unwrap_or(&lower);
@@ -544,16 +548,6 @@ fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<St
         );
     }
     let quant_hint = infer_filename_quant(stem);
-    if quant_hint.as_deref() == Some("Q5_K_M") {
-        return (
-            "text_model",
-            quant_hint,
-            Some(
-                "Q5_K_M hosted activation is deferred until GGUF file type is separated from conversion policy"
-                    .to_owned(),
-            ),
-        );
-    }
     if quant_hint.as_deref() == Some("BF16") {
         return (
             "text_model",
@@ -1444,6 +1438,7 @@ mod tests {
         for (filename, quant) in [
             ("gguf/model-q3_k_m.gguf", "Q3_K_M"),
             ("gguf/model-q4_k_m.gguf", "Q4_K_M"),
+            ("gguf/model-q5_k_m.gguf", "Q5_K_M"),
             ("gguf/model-q6_k.gguf", "Q6_K"),
             ("gguf/model-q8_0.gguf", "Q8_0"),
         ] {
@@ -1452,17 +1447,6 @@ mod tests {
                 ("text_model", Some(quant.to_owned()), None)
             );
         }
-        assert_eq!(
-            classify_hub_gguf("gguf/model-q5_k_m.gguf"),
-            (
-                "text_model",
-                Some("Q5_K_M".to_owned()),
-                Some(
-                    "Q5_K_M hosted activation is deferred until GGUF file type is separated from conversion policy"
-                        .to_owned()
-                )
-            )
-        );
         let mmproj = classify_hub_gguf("gguf/mmproj-model-f16.gguf");
         assert_eq!(mmproj.0, "companion");
         assert!(mmproj.2.unwrap().contains("not a text model"));
@@ -1512,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_q5_transfer_is_rejected_before_hub_access() {
+    fn hosted_q5_transfer_identity_is_admitted_before_hub_access() {
         let artifact = HubGgufArtifact {
             repository: "owner/model".to_owned(),
             revision: "a".repeat(40),
@@ -1524,10 +1508,11 @@ mod tests {
             selectable: true,
             unavailable_reason: None,
         };
-        let error = download_hub_gguf(&artifact).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("identity is incomplete or malformed"));
+        assert!(hosted_gguf_identity_valid(&artifact));
+
+        let mut forged = artifact.clone();
+        forged.quant_hint = Some("Q6_K".to_owned());
+        assert!(!hosted_gguf_identity_valid(&forged));
     }
 
     /// Metadata-only regression proof for the mixed repository that exposed
@@ -1539,10 +1524,12 @@ mod tests {
             eprintln!("skipping network test (set HF2Q_NETWORK_TESTS=1 to run)");
             return;
         }
+        const REVISION: &str = "0a72776892f98db49381fdf69f4b9982222ec9dc";
         let reference =
-            HfModelReference::parse("jenerallee78/Qwen3.8-27B-Abliterated-SFT", None).unwrap();
+            HfModelReference::parse("jenerallee78/Qwen3.8-27B-Abliterated-SFT", Some(REVISION))
+                .unwrap();
         let catalog = resolve_hub_gguf_catalog(reference).unwrap();
-        assert_eq!(catalog.revision, "fe1ff12a900bcb7021872a901a920dc6713ac583");
+        assert_eq!(catalog.revision, REVISION);
         let selectable = catalog
             .artifacts
             .iter()
@@ -1552,6 +1539,8 @@ mod tests {
         assert_eq!(
             selectable,
             vec![
+                "gguf/qwen38-abliterated-sft-hf2q-q4_k_m.gguf",
+                "gguf/qwen38-abliterated-sft-q5_k_m.gguf",
                 "gguf/qwen38-abliterated-sft-q6_k.gguf",
                 "gguf/qwen38-abliterated-sft-q8_0.gguf",
             ]

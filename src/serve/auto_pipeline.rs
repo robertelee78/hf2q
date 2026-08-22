@@ -26,12 +26,9 @@
 //!   convert/ tree is the OOM session's territory (see CLAUDE.md fence
 //!   list), and a subprocess boundary keeps the auto-pipeline's failure
 //!   modes — non-zero exit, stderr — uniformly observable.
-//! - **K-quant emit gap (ADR-014 P7)**: the W51 selection table returns
-//!   `Q8_0 / Q6_K / Q4_K_M / Q3_K_M`, but the convert CLI surface today
-//!   only exposes `q4` / `q8` / etc.  K-quant emit is mid-port (ADR-014
-//!   P7).  Until P7 closes, [`map_quant_to_cli`] degrades K-quant table
-//!   outputs to the closest available legacy quant and logs the choice
-//!   verbatim so an operator can see it in `info` logs.
+//! - **Exact quant selection**: the hardware-selected quant maps to the
+//!   matching conversion selector. The cache and pool identity therefore
+//!   describe the bytes that were actually emitted.
 //! - **HF cache reuse**: when the source has already been downloaded by
 //!   `hf-hub`, the auto-pipeline detects the snapshot via
 //!   [`crate::serve::cache::ModelCache::detect_hf_hub_source`] and skips
@@ -43,7 +40,7 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 
 use super::cache::{cache_model_path, ModelCache, QuantEntry, SourcePointer};
-use super::quant_select::{select_quant, GpuInfo, QuantType};
+use super::quant_select::{quant_type_from_gguf_path, select_quant, GpuInfo, QuantType};
 use crate::core::hardware::HardwareProfile;
 use crate::core::provenance::{self, compute_source_bundle_sha256, Provenance};
 use crate::core::sha256::sha256_file;
@@ -117,30 +114,15 @@ pub fn looks_like_hf_repo_id(arg: &str) -> bool {
 /// Map the W51 selection table's `QuantType` to the convert CLI's
 /// `--quant <name>` argument.
 ///
-/// Until ADR-014 P7 closes (K-quant emit on CLI), K-quant table outputs
-/// degrade to the closest available legacy quant.  The choice is logged
-/// at `info` so operators can see what's happening and we keep a record
-/// for the cutover when P7 lands.
-///
-/// Returned `&'static str` matches the values clap's `QuantMethod`
-/// `value_enum` accepts (or its `alias =` short form): `q4` (= Q4_0),
-/// `q8` (= Q8_0).
+/// Returned `&'static str` matches the exact selectors accepted by the
+/// conversion CLI.
 fn map_quant_to_cli(quant: QuantType) -> &'static str {
     match quant {
-        // Q8_0 maps cleanly — same byte layout, same name.
-        QuantType::Q8_0 => "q8",
-        // Q6_K is not on the convert CLI yet (ADR-014 P7); Q8_0 is the
-        // closest fidelity available today.  Bigger files than the
-        // table assumes, but never lower fidelity than the operator
-        // would tolerate.
-        QuantType::Q6_K => "q8",
-        // Q4_K_M is the K-quant trajectory for Q4_0 today.  Same 4 bpw
-        // ballpark, same dispatch in external GGUF readers.
-        QuantType::Q4_K_M => "q4",
-        // Q3_K_M is < 4 bpw — there is no legacy 3-bit quant on the
-        // convert CLI.  Q4_0 is the safe minimum until P7 lands Q3_K
-        // emit.
-        QuantType::Q3_K_M => "q4",
+        QuantType::Q8_0 => "q8_0",
+        QuantType::Q6_K => "q6_k",
+        QuantType::Q5_K_M => "q5_k_m",
+        QuantType::Q4_K_M => "q4_k_m",
+        QuantType::Q3_K_M => "q3_k_m",
     }
 }
 
@@ -244,6 +226,12 @@ fn run_auto_pipeline(
             .with_context(|| format!("create quant dir: {}", parent.display()))?;
     }
     run_convert_subprocess(&snapshot.local_dir, &target_gguf, quant, no_integrity)?;
+    verify_quant_identity(&target_gguf, quant).with_context(|| {
+        format!(
+            "verify converted GGUF quant identity for {repo_id}@{}",
+            quant.as_str()
+        )
+    })?;
 
     // Step 3: hash + record + flush manifest.
     let bytes = std::fs::metadata(&target_gguf)
@@ -339,6 +327,12 @@ fn lookup_and_verify(
             }
         }
     }
+    verify_quant_identity(&path, quant).with_context(|| {
+        format!(
+            "verify cached GGUF quant identity for {repo_id}@{}",
+            quant.as_str()
+        )
+    })?;
     tracing::info!(
         repo = repo_id,
         quant = quant.as_str(),
@@ -351,6 +345,20 @@ fn lookup_and_verify(
         quant: Some(quant),
         from_cache: true,
     }))
+}
+
+fn verify_quant_identity(path: &Path, expected: QuantType) -> Result<()> {
+    let actual = quant_type_from_gguf_path(path)?;
+    if actual != expected {
+        return Err(anyhow!(
+            "GGUF quant identity mismatch at {}: cache/conversion selected {} but general.file_type={} identifies {}",
+            path.display(),
+            expected.as_str(),
+            actual.gguf_file_type(),
+            actual.as_str(),
+        ));
+    }
+    Ok(())
 }
 
 /// Outcome of the integrity check after eliminating `--no-integrity`.
@@ -556,14 +564,6 @@ fn run_convert_subprocess(
             .unwrap_or_else(|_| "hf2q".to_string())
     });
     let cli_quant = map_quant_to_cli(quant);
-    if cli_quant_was_degraded(quant) {
-        tracing::info!(
-            table_quant = quant.as_str(),
-            cli_quant,
-            "auto-pipeline: K-quant emit not yet on CLI (ADR-014 P7); \
-             degrading to closest available legacy quant"
-        );
-    }
     let mut cmd = Command::new(&bin);
     cmd.arg("convert")
         .arg("--input")
@@ -622,18 +622,6 @@ fn run_convert_subprocess(
         "auto-pipeline: convert subprocess complete"
     );
     Ok(())
-}
-
-/// Did the static map send a K-quant table output to a legacy CLI quant?
-/// Used to emit the cutover-tracking log line; flips to all-false once
-/// ADR-014 P7 wires K-quant emit through clap.
-fn cli_quant_was_degraded(quant: QuantType) -> bool {
-    match quant {
-        QuantType::Q8_0 => false,  // Q8 maps clean
-        QuantType::Q6_K => true,   // → q8 (Q8_0)
-        QuantType::Q4_K_M => true, // → q4 (Q4_0)
-        QuantType::Q3_K_M => true, // → q4 (Q4_0)
-    }
 }
 
 fn secs_since_epoch() -> u64 {
@@ -756,19 +744,12 @@ mod tests {
     // ── map_quant_to_cli ────────────────────────────────────────────────
 
     #[test]
-    fn map_quant_q8_clean() {
-        assert_eq!(map_quant_to_cli(QuantType::Q8_0), "q8");
-        assert!(!cli_quant_was_degraded(QuantType::Q8_0));
-    }
-
-    #[test]
-    fn map_quant_kquants_degrade_until_p7() {
-        assert_eq!(map_quant_to_cli(QuantType::Q6_K), "q8");
-        assert_eq!(map_quant_to_cli(QuantType::Q4_K_M), "q4");
-        assert_eq!(map_quant_to_cli(QuantType::Q3_K_M), "q4");
-        assert!(cli_quant_was_degraded(QuantType::Q6_K));
-        assert!(cli_quant_was_degraded(QuantType::Q4_K_M));
-        assert!(cli_quant_was_degraded(QuantType::Q3_K_M));
+    fn map_quant_uses_exact_conversion_selectors() {
+        assert_eq!(map_quant_to_cli(QuantType::Q8_0), "q8_0");
+        assert_eq!(map_quant_to_cli(QuantType::Q6_K), "q6_k");
+        assert_eq!(map_quant_to_cli(QuantType::Q5_K_M), "q5_k_m");
+        assert_eq!(map_quant_to_cli(QuantType::Q4_K_M), "q4_k_m");
+        assert_eq!(map_quant_to_cli(QuantType::Q3_K_M), "q3_k_m");
     }
 
     // ── resolve_or_prepare_model — pass-through for filesystem paths ────
@@ -840,7 +821,7 @@ mod tests {
         // Drop the cached GGUF on disk, hash it, record it.
         let gguf = cache_model_path(cache.root(), repo_id, quant).unwrap();
         std::fs::create_dir_all(gguf.parent().unwrap()).unwrap();
-        std::fs::write(&gguf, b"FAKE GGUF BYTES - only the SHA matters here").unwrap();
+        std::fs::write(&gguf, build_gguf_with_string_metadata(quant, &[])).unwrap();
         let sha = sha256_file(&gguf).unwrap();
         let bytes = std::fs::metadata(&gguf).unwrap().len();
         cache
@@ -921,12 +902,61 @@ mod tests {
         let hit = lookup_and_verify(&cache, repo_id, quant, false).expect("must not error");
         assert!(hit.is_none(), "corrupted cache must fall through");
 
-        // With --no-integrity, the same call returns the (unsafe!) hit.
-        let hit_unsafe = lookup_and_verify(&cache, repo_id, quant, true).expect("must not error");
+        // --no-integrity skips the full-file hash, but it cannot waive the
+        // artifact-identity boundary. An unreadable header is still refused.
+        let error = lookup_and_verify(&cache, repo_id, quant, true)
+            .expect_err("unreadable GGUF identity must fail closed");
         assert!(
-            hit_unsafe.is_some(),
-            "--no-integrity must skip the SHA check"
+            format!("{error:#}").contains("GGUF"),
+            "identity error must name the GGUF boundary: {error:#}"
         );
+    }
+
+    #[test]
+    fn lookup_rejects_manifest_and_header_quant_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = ModelCache::open_at(tmp.path()).unwrap();
+        let repo_id = "identity/mismatch";
+        let selected = QuantType::Q8_0;
+        cache
+            .record_source(
+                repo_id,
+                "rev",
+                SourcePointer::Local {
+                    path: tmp.path().join("source"),
+                    sha256: "n/a".into(),
+                },
+            )
+            .unwrap();
+        let gguf = cache_model_path(cache.root(), repo_id, selected).unwrap();
+        std::fs::create_dir_all(gguf.parent().unwrap()).unwrap();
+        std::fs::write(
+            &gguf,
+            build_gguf_with_string_metadata(QuantType::Q5_K_M, &[]),
+        )
+        .unwrap();
+        let bytes = std::fs::metadata(&gguf).unwrap().len();
+        let sha256 = sha256_file(&gguf).unwrap();
+        cache
+            .record_quantized(
+                repo_id,
+                QuantEntry {
+                    quant_type: selected.as_str().into(),
+                    gguf_path: gguf.clone(),
+                    mmproj_path: None,
+                    bytes,
+                    sha256,
+                    quantized_at_secs: 0,
+                    quantized_by_version: "test".into(),
+                },
+            )
+            .unwrap();
+
+        let error = lookup_and_verify(&cache, repo_id, selected, false)
+            .expect_err("matching SHA must not hide a quant identity mismatch");
+        let message = format!("{error:#}");
+        assert!(message.contains("quant identity mismatch"), "{message}");
+        assert!(message.contains("Q8_0") && message.contains("Q5_K_M"));
     }
 
     // ── ADR-005 Phase 4 iter-207 — provenance short-circuit ────────────
@@ -960,12 +990,17 @@ mod tests {
     /// Build a self-contained GGUF byte buffer with zero tensors and
     /// the supplied (key, value) string metadata pairs.  Produced
     /// bytes parse cleanly via `mlx_native::gguf::GgufFile::open`.
-    fn build_gguf_with_string_metadata(pairs: &[(&str, &str)]) -> Vec<u8> {
+    fn build_gguf_with_string_metadata(quant: QuantType, pairs: &[(&str, &str)]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"GGUF");
         buf.extend_from_slice(&3u32.to_le_bytes()); // version
         buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
-        buf.extend_from_slice(&(pairs.len() as u64).to_le_bytes()); // metadata_kv_count
+        buf.extend_from_slice(&((pairs.len() + 1) as u64).to_le_bytes()); // metadata_kv_count
+        let file_type_key = b"general.file_type";
+        buf.extend_from_slice(&(file_type_key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(file_type_key);
+        buf.extend_from_slice(&4u32.to_le_bytes()); // GGUF_TYPE_UINT32
+        buf.extend_from_slice(&quant.gguf_file_type().to_le_bytes());
         for (k, v) in pairs {
             write_str_kv(&mut buf, k, v);
         }
@@ -1090,10 +1125,13 @@ mod tests {
         let bundle_sha = compute_source_bundle_sha256(&shards)
             .expect("synthetic shards must produce a bundle SHA");
 
-        let gguf_bytes = build_gguf_with_string_metadata(&[
-            ("hf2q.producer_version", "hf2q 0.1.0-test"),
-            ("hf2q.source_sha256", &bundle_sha),
-        ]);
+        let gguf_bytes = build_gguf_with_string_metadata(
+            quant,
+            &[
+                ("hf2q.producer_version", "hf2q 0.1.0-test"),
+                ("hf2q.source_sha256", &bundle_sha),
+            ],
+        );
         // Manifest SHA is GARBAGE — verify_quantized would fail if
         // the short-circuit didn't fire.
         let bogus_manifest_sha = "0".repeat(64);
@@ -1125,10 +1163,10 @@ mod tests {
         let repo_id = "iter207/external-pass";
         let quant = QuantType::Q8_0;
 
-        let gguf_bytes = build_gguf_with_string_metadata(&[
-            ("general.architecture", "qwen35"),
-            ("general.name", "test"),
-        ]);
+        let gguf_bytes = build_gguf_with_string_metadata(
+            quant,
+            &[("general.architecture", "qwen35"), ("general.name", "test")],
+        );
         let real_sha = {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
@@ -1158,7 +1196,8 @@ mod tests {
         let repo_id = "iter207/external-fail";
         let quant = QuantType::Q8_0;
 
-        let gguf_bytes = build_gguf_with_string_metadata(&[("general.architecture", "qwen35")]);
+        let gguf_bytes =
+            build_gguf_with_string_metadata(quant, &[("general.architecture", "qwen35")]);
         let bogus_sha = "f".repeat(64);
         let (cache, _) = fab_cache_with_provenance(
             tmp.path(),
@@ -1191,10 +1230,13 @@ mod tests {
         let _real_bundle_sha = compute_source_bundle_sha256(&shards).unwrap();
         let claimed_bundle_sha = "9".repeat(64); // deliberately wrong
 
-        let gguf_bytes = build_gguf_with_string_metadata(&[
-            ("hf2q.producer_version", "hf2q 0.1.0-test"),
-            ("hf2q.source_sha256", &claimed_bundle_sha),
-        ]);
+        let gguf_bytes = build_gguf_with_string_metadata(
+            quant,
+            &[
+                ("hf2q.producer_version", "hf2q 0.1.0-test"),
+                ("hf2q.source_sha256", &claimed_bundle_sha),
+            ],
+        );
         // Manifest SHA happens to match the on-disk bytes (proves we
         // wouldn't have fallen through to verify_quantized success
         // either — the mismatch is the operative gate).
@@ -1235,10 +1277,13 @@ mod tests {
         let repo_id = "iter207/no-shards";
         let quant = QuantType::Q8_0;
 
-        let gguf_bytes = build_gguf_with_string_metadata(&[
-            ("hf2q.producer_version", "hf2q 0.1.0"),
-            ("hf2q.source_sha256", &"7".repeat(64)),
-        ]);
+        let gguf_bytes = build_gguf_with_string_metadata(
+            quant,
+            &[
+                ("hf2q.producer_version", "hf2q 0.1.0"),
+                ("hf2q.source_sha256", &"7".repeat(64)),
+            ],
+        );
         let real_sha = {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();

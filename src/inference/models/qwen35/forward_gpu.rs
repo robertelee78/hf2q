@@ -18,10 +18,10 @@
 //!
 //! # Embedding and output head
 //!
-//! `embed_tokens_gpu` uploads the token rows from the CPU embedding table
-//! directly (one gather on CPU, then upload).  The final output head is
-//! equally simple: RMSNorm + GEMM, both done in the same GPU pass via the
-//! existing `apply_linear_projection_f32` + `dispatch_rms_norm` primitives.
+//! Production GGUF models gather selected rows directly from the artifact's
+//! native embedding blocks; synthetic fixtures retain the CPU F32 path. The
+//! final output head applies RMSNorm and a projection against the exact native
+//! GGUF tensor (or the explicit F32 synthetic/replacement representation).
 //!
 //! # KV-cache slot indexing
 //!
@@ -681,11 +681,130 @@ struct OutputHeadGpu {
 
 /// Gather token embeddings into a caller-owned F32 GPU buffer.
 ///
-/// GGUF-backed production models dispatch directly against the exact native
-/// Q4_K table. Synthetic/lazy F32 models retain the CPU gather used by their
-/// fixtures. No quantized table is expanded or re-encoded here.
+/// GGUF-backed production models dispatch directly against their exact native
+/// embedding table. Synthetic/lazy F32 models retain the CPU gather used by
+/// their fixtures. No quantized table is expanded or re-encoded here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeEmbeddingRoute {
+    Q2K,
+    Q4K,
+    Q5K,
+    Q6K,
+    Q8_0,
+    F32,
+}
+
+impl NativeEmbeddingRoute {
+    fn for_type(kind: GgmlType) -> Result<Self> {
+        match kind {
+            GgmlType::Q2_K => Ok(Self::Q2K),
+            GgmlType::Q4_K => Ok(Self::Q4K),
+            GgmlType::Q5_K => Ok(Self::Q5K),
+            GgmlType::Q6_K => Ok(Self::Q6K),
+            GgmlType::Q8_0 => Ok(Self::Q8_0),
+            GgmlType::F32 => Ok(Self::F32),
+            other => Err(anyhow!(
+                "native token_embd.weight uses unsupported direct-gather type {other:?}; \
+                 inference refuses to dequantize and substitute another format"
+            )),
+        }
+    }
+
+    const fn capability_route(self) -> Option<mlx_native::GgmlKernelRoute> {
+        match self {
+            Self::Q2K => Some(mlx_native::GgmlKernelRoute::EmbeddingQ2K),
+            Self::Q4K => Some(mlx_native::GgmlKernelRoute::EmbeddingQ4K),
+            Self::Q5K => Some(mlx_native::GgmlKernelRoute::EmbeddingQ5K),
+            Self::Q6K => Some(mlx_native::GgmlKernelRoute::EmbeddingQ6K),
+            Self::Q8_0 => Some(mlx_native::GgmlKernelRoute::EmbeddingQ8_0),
+            Self::F32 => None,
+        }
+    }
+}
+
+pub(super) fn ensure_native_embedding_admitted(native: &MlxQWeight) -> Result<()> {
+    let route = NativeEmbeddingRoute::for_type(native.info.ggml_dtype)?;
+    ensure!(
+        native.affine.is_none(),
+        "native token_embd.weight carries affine metadata instead of exact GGUF blocks"
+    );
+    let expected_bytes = match route {
+        NativeEmbeddingRoute::F32 => native
+            .info
+            .rows
+            .checked_mul(native.info.cols)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+            .context("native F32 token_embd.weight byte length overflow")?,
+        _ => usize::try_from(
+            mlx_native::ggml_matrix_bytes(
+                native.info.ggml_dtype,
+                u32::try_from(native.info.rows)
+                    .context("native token_embd row count exceeds packed geometry")?,
+                u32::try_from(native.info.cols)
+                    .context("native token_embd column count exceeds packed geometry")?,
+            )
+            .context("derive native token_embd packed byte extent")?,
+        )
+        .context("native token_embd packed byte extent exceeds usize")?,
+    };
+    let expected_dtype = if route == NativeEmbeddingRoute::F32 {
+        DType::F32
+    } else {
+        DType::U8
+    };
+    ensure!(
+        native.buffer.dtype() == expected_dtype,
+        "native token_embd.weight type {:?} requires {:?} storage, got {:?}",
+        native.info.ggml_dtype,
+        expected_dtype,
+        native.buffer.dtype()
+    );
+    ensure!(
+        native.buffer.data_byte_len() == expected_bytes,
+        "native token_embd.weight type {:?} shape [{}, {}] requires exactly {} logical bytes, got {}",
+        native.info.ggml_dtype,
+        native.info.rows,
+        native.info.cols,
+        expected_bytes,
+        native.buffer.data_byte_len()
+    );
+    let Some(expected_capability_route) = route.capability_route() else {
+        return Ok(());
+    };
+    let n_tokens = 1;
+    let vocab_size = u32::try_from(native.info.rows)
+        .context("native token_embd row count exceeds capability dimensions")?;
+    let embed_dim = u32::try_from(native.info.cols)
+        .context("native token_embd column count exceeds capability dimensions")?;
+    let capability = mlx_native::ggml_capability(mlx_native::GgmlCapabilityRequest {
+        schema_version: mlx_native::GGML_CAPABILITY_SCHEMA_VERSION,
+        invocation: mlx_native::GgmlInvocation::EmbeddingGather {
+            n_tokens,
+            vocab_size,
+            embed_dim,
+        },
+        ggml_type: native.info.ggml_dtype,
+        workload: mlx_native::GgmlWorkloadClass::Embedding,
+        routing: mlx_native::GgmlRoutingPolicy::default(),
+    });
+    ensure!(
+        capability.executable,
+        "native token_embd.weight uses unsupported direct-gather type {:?}: {}",
+        native.info.ggml_dtype,
+        capability.diagnostic
+    );
+    ensure!(
+        capability.route == Some(expected_capability_route),
+        "native token_embd.weight capability route mismatch for {:?}: expected {:?}, got {:?}",
+        native.info.ggml_dtype,
+        expected_capability_route,
+        capability.route
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
-fn embed_tokens_gpu_into(
+pub(super) fn embed_tokens_gpu_into(
     tokens: &[u32],
     token_embd: &[f32],
     token_embd_native: Option<&MlxQWeight>,
@@ -726,8 +845,8 @@ fn embed_tokens_gpu_into(
         let mut enc = device
             .command_encoder()
             .context("native token embedding encoder")?;
-        match native.info.ggml_dtype {
-            GgmlType::Q2_K => {
+        match NativeEmbeddingRoute::for_type(native.info.ggml_dtype)? {
+            NativeEmbeddingRoute::Q2K => {
                 mlx_native::ops::embedding_q2_k::register(registry);
                 mlx_native::embedding_gather_q2_k(
                     &mut enc,
@@ -744,7 +863,7 @@ fn embed_tokens_gpu_into(
                 )
                 .context("native Q2_K embedding gather")?;
             }
-            GgmlType::Q4_K => {
+            NativeEmbeddingRoute::Q4K => {
                 mlx_native::ops::embedding_q4_k::register(registry);
                 mlx_native::embedding_gather_q4_k(
                     &mut enc,
@@ -761,7 +880,41 @@ fn embed_tokens_gpu_into(
                 )
                 .context("native Q4_K embedding gather")?;
             }
-            GgmlType::Q8_0 => {
+            NativeEmbeddingRoute::Q5K => {
+                mlx_native::ops::embedding_kquant::register(registry);
+                mlx_native::embedding_gather_q5_k(
+                    &mut enc,
+                    registry,
+                    device,
+                    &native.buffer,
+                    &ids,
+                    output,
+                    &mlx_native::EmbeddingQ5KParams {
+                        vocab_size: native.info.rows,
+                        embed_dim: hidden,
+                        n_tokens: tokens.len(),
+                    },
+                )
+                .context("native Q5_K embedding gather")?;
+            }
+            NativeEmbeddingRoute::Q6K => {
+                mlx_native::ops::embedding_kquant::register(registry);
+                mlx_native::embedding_gather_q6_k(
+                    &mut enc,
+                    registry,
+                    device,
+                    &native.buffer,
+                    &ids,
+                    output,
+                    &mlx_native::EmbeddingQ6KParams {
+                        vocab_size: native.info.rows,
+                        embed_dim: hidden,
+                        n_tokens: tokens.len(),
+                    },
+                )
+                .context("native Q6_K embedding gather")?;
+            }
+            NativeEmbeddingRoute::Q8_0 => {
                 mlx_native::ops::embedding_q8_0::register(registry);
                 mlx_native::embedding_gather_q8_0(
                     &mut enc,
@@ -778,7 +931,7 @@ fn embed_tokens_gpu_into(
                 )
                 .context("native Q8_0 embedding gather")?;
             }
-            GgmlType::F32 => {
+            NativeEmbeddingRoute::F32 => {
                 let table = native
                     .buffer
                     .as_slice::<f32>()
@@ -786,12 +939,6 @@ fn embed_tokens_gpu_into(
                 let rows = embed_tokens(tokens, table, native.info.rows as u32, hidden_size);
                 return upload_f32_into(&rows, output)
                     .context("upload selected native F32 embedding rows");
-            }
-            other => {
-                return Err(anyhow!(
-                    "native token_embd.weight uses unsupported direct-gather type {other:?}; \
-                     inference refuses to dequantize and substitute another format"
-                ));
             }
         }
         // The consuming Qwen/MTP forward is submitted to the same Metal
@@ -7650,6 +7797,45 @@ mod tests {
         default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant,
     };
     use mlx_native::MlxDevice;
+
+    #[test]
+    fn native_embedding_route_table_is_the_dispatch_and_admission_authority() {
+        for (kind, route, capability_route) in [
+            (
+                GgmlType::Q2_K,
+                NativeEmbeddingRoute::Q2K,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingQ2K),
+            ),
+            (
+                GgmlType::Q4_K,
+                NativeEmbeddingRoute::Q4K,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingQ4K),
+            ),
+            (
+                GgmlType::Q5_K,
+                NativeEmbeddingRoute::Q5K,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingQ5K),
+            ),
+            (
+                GgmlType::Q6_K,
+                NativeEmbeddingRoute::Q6K,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingQ6K),
+            ),
+            (
+                GgmlType::Q8_0,
+                NativeEmbeddingRoute::Q8_0,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingQ8_0),
+            ),
+            (GgmlType::F32, NativeEmbeddingRoute::F32, None),
+        ] {
+            assert_eq!(NativeEmbeddingRoute::for_type(kind).unwrap(), route);
+            assert_eq!(route.capability_route(), capability_route);
+        }
+
+        let error = NativeEmbeddingRoute::for_type(GgmlType::F16)
+            .expect_err("F16 has no direct embedding route");
+        assert!(error.to_string().contains("refuses to dequantize"));
+    }
 
     #[test]
     fn output_head_commit_context_preserves_typed_mlx_failure() {

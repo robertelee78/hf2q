@@ -5,6 +5,12 @@
 **Phase 0 Verdict:** Framework-overhead-dominated (86 vs 105 tok/s gap is GPU pipelining, not kernel speed)
 **Target:** >= 102 tok/s decode, Gemma 4 26B MoE DWQ, M5 Max, coherence preserved
 
+> **Status (2026-08-21): historical migration plan.** The migration is complete.
+> Current source, `docs/ARCHITECTURE.md`, and the model-family ADRs define the
+> production contract. In particular, inference retains each GGUF tensor's
+> packed representation; it does not dequantize and re-encode weights into a
+> convenient runtime codec.
+
 ---
 
 ## 1. Design Principles
@@ -37,7 +43,7 @@ These are load-bearing constraints. Every design decision below must satisfy all
 | `src/serve/rope_kernel.rs` (runtime MSL compile + candle encoder dispatch) | Replaced by mlx-native's `rope_*` kernels |
 | `src/serve/moe_kernel.rs` (candle `call_quantized_matmul_mv_id_t`) | Replaced by `mlx_native::quantized_matmul_id` |
 | `src/serve/lm_head_kernel.rs` (candle F16 gemm path) | Replaced by mlx-native F16 GEMM op |
-| `Cargo.toml` entries for `candle-core`, `candle-nn`, `candle-metal-kernels`, `objc2-metal` | Replaced by single `mlx-native = { path = "/opt/mlx-native" }` dependency |
+| `Cargo.toml` entries for `candle-core`, `candle-nn`, `candle-metal-kernels`, `objc2-metal` | Replaced by one exact published `mlx-native` crate pin |
 | `[patch.crates-io]` section in `Cargo.toml` | No vendor patches needed |
 | All `#[cfg(feature = "metal")]` guards around kernel mode dispatch | mlx-native is always-Metal; no dual-backend gates |
 | `DispatchCounters` atomic increment sites throughout forward path | Replaced by mlx-native's global `dispatch_count()` / `sync_count()` counters |
@@ -318,7 +324,11 @@ The bridge works because:
 
 1. **SDPA byte-offset bug.** The candle SDPA vendor patch (`vendor/candle-nn/src/ops.rs`) fixes a start_offset-in-elements vs bytes confusion. mlx-native's SDPA kernel must get this right from day one. The unit test MUST exercise a non-zero start_offset case (KV cache at current_len > sliding_window).
 
-2. **Quantized weight layout.** candle's `QStorage::Metal` stores quantized blocks in GGML block order. mlx-native's `quantized_matmul` uses MLX's affine quantization (4-bit packed uint32 with bf16 scales/biases). These are DIFFERENT formats. The GGUF loader must produce `MlxBuffer` in whichever format the target kernel expects. For Phase 3 borrowed kernels (candle's vendored GGML kernels), the GGML block format is correct. For mlx-native's own kernels, a requantization step may be needed.
+2. **Quantized weight layout.** GGUF block bytes are an execution contract, not
+   an intermediate suggestion. The production loader retains those bytes and
+   dispatches a kernel for the tensor's recorded GGML type. If the type or
+   shape has no exact native route, model admission fails before readiness;
+   inference never expands and re-encodes the tensor as another quant type.
 
 3. **MoE 3D weight buffer layout.** The fused `kernel_mul_mv_id` kernel expects a specific `[num_experts, n, k]` byte-contiguous layout. The current code builds this by concatenating per-expert quantized bytes in `MoeBlock` load. The same construction must produce an `MlxBuffer` with identical byte layout.
 
@@ -367,10 +377,10 @@ Target: `mlx-native` (one crate, ~2000 LOC, depends only on `metal` and `bytemuc
 
 ## 8. Open Questions
 
-**Q1. GGML block format vs MLX affine format.** mlx-native's existing `quantized_matmul` uses MLX-style affine quantization (packed uint32 with bf16 scales/biases per group). candle's borrowed kernels (the `kernel_mul_mv_q*_f32` family) use GGML block format (block_q4_0, block_q6_K, etc.). Which format does the target architecture standardize on? Options:
-- (a) Keep GGML block format, borrow candle's kernel MSL source into mlx-native. Simpler migration, but the kernels are an older llama.cpp snapshot.
-- (b) Requantize GGUF weights to MLX affine format at load time. Uses mlx-native's own kernels, but adds a one-time conversion cost and must prove bitwise-equivalent dequantization.
-- Decision needed before Phase 3 starts.
+**Q1. GGML block format vs MLX affine format — resolved.** Existing GGUF
+artifacts execute from their recorded packed GGML representation. Quantization
+is an hf2q conversion operation over source weights, not an inference-time
+format substitution. A missing direct route is an explicit capability failure.
 
 **Q2. Prefill path.** This document focuses on decode (seq_len=1, the speed-critical path). The prefill path (seq_len > 1) uses different SDPA kernels (full attention, not vector), different MoE dispatch shapes, and may benefit from batched matmul. Does the same single-encoder approach work for prefill, or does prefill need a different dispatch strategy? The Phase 0 data is decode-only.
 

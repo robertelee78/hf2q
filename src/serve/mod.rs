@@ -4645,12 +4645,17 @@ pub fn cmd_serve(
             let stub_for_spiller: Arc<Mutex<dyn crate::serve::kv_persist::KvCacheSpill>> =
                 Arc::new(Mutex::new(StubGemma4Spill));
             let stub_for_registry: Arc<dyn crate::serve::kv_persist::EngineBindable> = stub.clone();
-            // Keys: derive a synthetic (repo, quant) the same way
-            // the pre-warm path will (so the spiller's lookup hits
-            // when load_or_get fires). Phase D's GGUF-derived
-            // (repo, quant) lands later.
+            // Keys must match the artifact that the pre-warm path will
+            // admit so spill and lifecycle lookup cannot alias distinct
+            // quantizations under a convenient default.
             let pool_repo = pool_key_for_path(&PathBuf::from(model_arg));
-            let pool_quant = quant_select::QuantType::Q4_K_M;
+            let pool_quant = if Path::new(model_arg).exists() {
+                quant_select::quant_type_from_gguf_path(Path::new(model_arg))?
+            } else {
+                quant_select::select_quant(&quant_select::GpuInfo::from_hardware_profile(
+                    state.hardware.as_ref(),
+                ))?
+            };
             spiller.register_family(pool_repo.clone(), pool_quant, stub_for_spiller);
             registry.register(pool_repo.clone(), pool_quant, stub_for_registry);
             tracing::info!(
@@ -4858,10 +4863,8 @@ pub fn cmd_serve(
     // startup keeps Decision #15 (fail-fast on bad weights) intact and
     // guarantees /readyz returns 200 with a usable pooled engine.
     //
-    // Filesystem-path passthrough uses the file stem as the pool's
-    // `repo` key + a synthetic `Q4_K_M` quant (the on-disk quant is
-    // baked into the file; the pool key just needs determinism per
-    // identical input).
+    // Filesystem-path passthrough uses the file stem as the pool's `repo`
+    // key and the exact `general.file_type` as its quant identity.
     let mut startup_engine_for_banner: Option<api::engine::Engine> = None;
     if let Some(model_arg) = default_model_arg.as_ref() {
         let mut cache_guard = state
@@ -4899,7 +4902,11 @@ pub fn cmd_serve(
             .repo_id
             .clone()
             .unwrap_or_else(|| pool_key_for_path(&resolved.gguf_path));
-        let pool_quant = resolved.quant.unwrap_or(quant_select::QuantType::Q4_K_M);
+        let pool_quant = match resolved.quant {
+            Some(quant) => quant,
+            None => quant_select::quant_type_from_gguf_path(&resolved.gguf_path)
+                .context("derive exact pool quant from --model GGUF")?,
+        };
         let engine_config = multi_model::EngineConfig {
             tokenizer_path: args.tokenizer.clone(),
             config_path: args.config.clone(),

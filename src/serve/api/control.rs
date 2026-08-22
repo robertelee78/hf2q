@@ -346,26 +346,11 @@ enum ActivationPayload {
 }
 
 const fn diagnostic_gguf_file_type(quant: QuantType) -> u32 {
-    use crate::quantize::ggml_quants::GgufFtype;
-
-    match quant {
-        QuantType::Q8_0 => GgufFtype::MostlyQ8_0 as u32,
-        QuantType::Q6_K => GgufFtype::MostlyQ6_K as u32,
-        QuantType::Q4_K_M => GgufFtype::MostlyQ4_K_M as u32,
-        QuantType::Q3_K_M => GgufFtype::MostlyQ3_K_M as u32,
-    }
+    quant.gguf_file_type()
 }
 
 fn diagnostic_quant_from_file_type(file_type: u32) -> Option<QuantType> {
-    use crate::quantize::ggml_quants::GgufFtype;
-
-    match GgufFtype::try_from(file_type).ok()? {
-        GgufFtype::MostlyQ8_0 => Some(QuantType::Q8_0),
-        GgufFtype::MostlyQ6_K => Some(QuantType::Q6_K),
-        GgufFtype::MostlyQ4_K_M => Some(QuantType::Q4_K_M),
-        GgufFtype::MostlyQ3_K_M => Some(QuantType::Q3_K_M),
-        _ => None,
-    }
+    QuantType::from_gguf_file_type(file_type)
 }
 
 struct ActivationTarget {
@@ -1252,13 +1237,14 @@ mod tests {
         for (quant, file_type) in [
             (QuantType::Q3_K_M, 12),
             (QuantType::Q4_K_M, 15),
+            (QuantType::Q5_K_M, 17),
             (QuantType::Q6_K, 18),
             (QuantType::Q8_0, 7),
         ] {
             assert_eq!(diagnostic_gguf_file_type(quant), file_type);
             assert_eq!(diagnostic_quant_from_file_type(file_type), Some(quant));
         }
-        assert_eq!(diagnostic_quant_from_file_type(17), None);
+        assert_eq!(diagnostic_quant_from_file_type(0), None);
     }
 
     #[tokio::test]
@@ -1294,7 +1280,8 @@ mod tests {
                     quant: Some(QuantType::Q4_K_M),
                     selectable: true,
                     unavailable_reason: None,
-                    provenance: super::super::local_artifacts::LocalArtifactProvenance::ConversionReceipt,
+                    provenance:
+                        super::super::local_artifacts::LocalArtifactProvenance::ConversionReceipt,
                 }],
                 warnings: Vec::new(),
             })
@@ -1307,12 +1294,11 @@ mod tests {
         assert!(!target.request_model.contains(&"b".repeat(64)));
         assert!(target.request_model.contains(candidate_id));
 
-        let response = match resolve_activation_target(&state, "other/model", Some(candidate_id))
-            .await
-        {
-            Ok(_) => panic!("candidate must be bound to its repository"),
-            Err(response) => response,
-        };
+        let response =
+            match resolve_activation_target(&state, "other/model", Some(candidate_id)).await {
+                Ok(_) => panic!("candidate must be bound to its repository"),
+                Err(response) => response,
+            };
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

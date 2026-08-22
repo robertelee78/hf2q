@@ -528,15 +528,7 @@ fn is_hex(value: &str, length: usize) -> bool {
 }
 
 pub(super) fn quant_from_file_type(file_type: u32) -> Option<QuantType> {
-    use crate::quantize::ggml_quants::GgufFtype;
-
-    match GgufFtype::try_from(file_type).ok()? {
-        GgufFtype::MostlyQ8_0 => Some(QuantType::Q8_0),
-        GgufFtype::MostlyQ6_K => Some(QuantType::Q6_K),
-        GgufFtype::MostlyQ4_K_M => Some(QuantType::Q4_K_M),
-        GgufFtype::MostlyQ3_K_M => Some(QuantType::Q3_K_M),
-        _ => None,
-    }
+    QuantType::from_gguf_file_type(file_type)
 }
 
 #[cfg(test)]

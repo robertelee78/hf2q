@@ -23,7 +23,7 @@
 //!         ├── source/                            # source pointer or local copy
 //!         │   └── source_pointer.json
 //!         └── quantized/
-//!             └── <quant>/                       # Q8_0, Q6_K, Q4_K_M, Q3_K_M
+//!             └── <quant>/                       # Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q3_K_M
 //!                 ├── model.gguf                 # quantized GGUF (atomic-renamed)
 //!                 ├── mmproj.gguf                # optional vision projector
 //!                 └── manifest.json              # per-quant manifest
@@ -2355,6 +2355,7 @@ mod tests {
         for q in [
             QuantType::Q8_0,
             QuantType::Q6_K,
+            QuantType::Q5_K_M,
             QuantType::Q4_K_M,
             QuantType::Q3_K_M,
         ] {

@@ -48,9 +48,8 @@ metadata access explicit. Paths, receipt-recorded paths, and output digests
 never enter the TUI.
 
 If hosted browsing is selected, the current bridge selects Q3_K_M, Q4_K_M,
-Q6_K, and Q8_0. Q5_K_M remains visible but disabled until artifact file type is
-separated from ADR-005's conversion-policy identity; BF16, split GGUFs, and
-mmproj companions are also shown with an unavailable reason. The catalog's
+Q5_K_M, Q6_K, and Q8_0. BF16, split GGUFs, and mmproj companions are shown
+with an unavailable reason. The catalog's
 quant is a filename-derived hint, not a compatibility claim. After selection,
 hf2q verifies local artifacts against their full receipt/cache SHA-256, or
 verifies hosted downloads against pinned Hub commit, filename, byte size, LFS

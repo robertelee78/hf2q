@@ -333,6 +333,8 @@ impl Qwen35Model {
         let token_embd_native =
             crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "token_embd.weight", &device)
                 .context("load native token_embd.weight")?;
+        super::forward_gpu::ensure_native_embedding_admitted(&token_embd_native)
+            .context("admit native token_embd.weight execution")?;
         super::weight_pool::register_weight_buffer(&device, &token_embd_native.buffer)
             .context("register native token_embd.weight")?;
         #[cfg(test)]
@@ -1322,17 +1324,36 @@ mod tests {
     }
 
     fn native_test_qweight(device: &MlxDevice, rows: usize, cols: usize) -> MlxQWeight {
+        native_test_qweight_for_type(device, rows, cols, mlx_native::GgmlType::Q8_0)
+    }
+
+    fn native_test_qweight_for_type(
+        device: &MlxDevice,
+        rows: usize,
+        cols: usize,
+        kind: mlx_native::GgmlType,
+    ) -> MlxQWeight {
         use crate::serve::gpu::QuantWeightInfo;
-        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
         use mlx_native::DType;
 
-        let bytes = rows * cols / 32 * 34;
+        let (dtype, bytes) = if kind == mlx_native::GgmlType::F32 {
+            (DType::F32, rows * cols * std::mem::size_of::<f32>())
+        } else {
+            (
+                DType::U8,
+                usize::try_from(
+                    mlx_native::ggml_matrix_bytes(kind, rows as u32, cols as u32)
+                        .expect("derive exact test GGUF bytes"),
+                )
+                .expect("test GGUF bytes fit usize"),
+            )
+        };
         MlxQWeight {
             buffer: device
-                .alloc_buffer(bytes, DType::U8, vec![bytes])
-                .expect("allocate test Q8_0 blocks"),
+                .alloc_buffer(bytes, dtype, vec![bytes / dtype.size_of()])
+                .expect("allocate exact test embedding blocks"),
             info: QuantWeightInfo {
-                ggml_dtype: GgmlType::Q8_0,
+                ggml_dtype: kind,
                 rows,
                 cols,
             },
@@ -1340,6 +1361,38 @@ mod tests {
             f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         }
+    }
+
+    #[test]
+    fn native_embedding_admission_checks_exact_storage_when_metal_is_available() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        for kind in [
+            mlx_native::GgmlType::Q2_K,
+            mlx_native::GgmlType::Q4_K,
+            mlx_native::GgmlType::Q5_K,
+            mlx_native::GgmlType::Q6_K,
+            mlx_native::GgmlType::Q8_0,
+            mlx_native::GgmlType::F32,
+        ] {
+            let weight = native_test_qweight_for_type(&device, 256, 256, kind);
+            crate::inference::models::qwen35::forward_gpu::ensure_native_embedding_admitted(
+                &weight,
+            )
+            .unwrap_or_else(|error| panic!("{kind:?} must be admitted: {error:#}"));
+        }
+        let mut weight = native_test_qweight(&device, 256, 256);
+        weight.info.ggml_dtype = mlx_native::GgmlType::F16;
+        let error =
+            crate::inference::models::qwen35::forward_gpu::ensure_native_embedding_admitted(
+                &weight,
+            )
+            .expect_err("F16 has no native embedding route");
+        assert!(error
+            .to_string()
+            .contains("unsupported direct-gather type F16"));
     }
 
     fn zero_layer_native_gguf(output_rows: Option<usize>) -> tempfile::NamedTempFile {
