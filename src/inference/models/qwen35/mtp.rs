@@ -191,90 +191,26 @@ impl MtpWeights {
             "MTP dedicated embedding must be a native [vocab,{hidden_size}] GGUF tensor"
         );
         let vocab = dedicated.info.rows;
-        let output = device
+        let mut output = device
             .alloc_buffer(
                 tokens.len() * hidden_size * 4,
                 DType::F32,
                 vec![tokens.len(), hidden_size],
             )
             .map_err(|e| anyhow!("MTP alloc dedicated embeddings: {e}"))?;
-        let mut enc = device
-            .command_encoder()
-            .context("MTP dedicated embedding gather")?;
-        match dedicated.info.ggml_dtype {
-            GgmlType::Q4_K | GgmlType::Q8_0 => {
-                let mut ids = device
-                    .alloc_buffer(tokens.len() * 4, DType::U32, vec![tokens.len()])
-                    .map_err(|e| anyhow!("MTP allocate dedicated embedding IDs: {e}"))?;
-                ids.as_mut_slice::<u32>()
-                    .map_err(|e| anyhow!("MTP map dedicated embedding IDs: {e}"))?
-                    .copy_from_slice(tokens);
-                match dedicated.info.ggml_dtype {
-                    GgmlType::Q4_K => {
-                        mlx_native::ops::embedding_q4_k::register(registry);
-                        mlx_native::embedding_gather_q4_k(
-                            &mut enc,
-                            registry,
-                            device,
-                            &dedicated.buffer,
-                            &ids,
-                            &output,
-                            &mlx_native::EmbeddingQ4KParams {
-                                vocab_size: vocab,
-                                embed_dim: hidden_size,
-                                n_tokens: tokens.len(),
-                            },
-                        )
-                        .context("MTP dedicated Q4_K embedding gather")?;
-                    }
-                    GgmlType::Q8_0 => {
-                        mlx_native::ops::embedding_q8_0::register(registry);
-                        mlx_native::embedding_gather_q8_0(
-                            &mut enc,
-                            registry,
-                            device,
-                            &dedicated.buffer,
-                            &ids,
-                            &output,
-                            &mlx_native::EmbeddingQ8_0Params {
-                                vocab_size: vocab,
-                                embed_dim: hidden_size,
-                                n_tokens: tokens.len(),
-                            },
-                        )
-                        .context("MTP dedicated Q8_0 embedding gather")?;
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            GgmlType::F32 => {
-                for (row, &token) in tokens.iter().enumerate() {
-                    ensure!(
-                        (token as usize) < vocab,
-                        "MTP dedicated embedding token {token} outside vocab {vocab}"
-                    );
-                    dispatch_copy_f32(
-                        &mut enc,
-                        registry,
-                        device.metal_device(),
-                        &dedicated.buffer,
-                        &output,
-                        token as usize * hidden_size,
-                        row * hidden_size,
-                        hidden_size,
-                    )
-                    .context("MTP dedicated F32 embedding row copy")?;
-                }
-            }
-            other => {
-                return Err(anyhow!(
-                    "MTP dedicated embedding uses unsupported direct-gather type {other:?}; \
-                     refusing to substitute another storage format"
-                ));
-            }
-        }
-        enc.commit_and_wait_labeled("mtp.dedicated_embedding_gather")
-            .context("MTP dedicated embedding completion")?;
+        let vocab_u32 =
+            u32::try_from(vocab).context("MTP dedicated embedding vocab exceeds u32")?;
+        super::forward_gpu::embed_tokens_gpu_into(
+            tokens,
+            &[],
+            Some(dedicated),
+            vocab_u32,
+            self.hidden_size,
+            device,
+            registry,
+            &mut output,
+        )
+        .context("MTP dedicated native embedding gather")?;
         Ok(output)
     }
 

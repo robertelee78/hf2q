@@ -440,7 +440,7 @@ jq --arg source_sha "$expected_source_sha" \
   --argjson loaded_idle_memory "$loaded_idle_memory_summary" \
   --argjson measurement_memory "$measurement_memory_summary" '
   . + {schema_version:6,source_sha:$source_sha,model_sha256:$model_sha256,
-    mlx_native_version:"0.11.0",producer_exit_code:$producer_exit_code,
+    mlx_native_version:"0.11.2",producer_exit_code:$producer_exit_code,
     raw_sha256:$raw_sha256,test_log_sha256:$test_log_sha256,
     phase_evidence:{policy:"fsynced-run-bound-markers-v1",run_uuid:$run_uuid,
       producer_pid:$producer_pid,test_spawned_at:$test_spawned_at,

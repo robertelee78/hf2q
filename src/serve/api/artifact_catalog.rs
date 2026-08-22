@@ -280,16 +280,16 @@ mod tests {
             repository: "owner/model".into(),
             revision: "a".repeat(40),
             filename: if selectable {
-                "model-q6_k.gguf".into()
-            } else {
                 "model-q5_k_m.gguf".into()
+            } else {
+                "model-bf16.gguf".into()
             },
             bytes: 42,
             sha256: "b".repeat(64),
-            quant_hint: Some(if selectable { "Q6_K" } else { "Q5_K_M" }.into()),
+            quant_hint: Some(if selectable { "Q5_K_M" } else { "BF16" }.into()),
             role: "text_model".into(),
             selectable,
-            unavailable_reason: (!selectable).then(|| "deferred".into()),
+            unavailable_reason: (!selectable).then(|| "unsupported".into()),
         }
     }
 

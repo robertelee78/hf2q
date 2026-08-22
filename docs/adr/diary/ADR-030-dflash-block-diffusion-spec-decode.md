@@ -663,7 +663,7 @@ Spec-decode must clear gate at **all three regimes** at temp=0, with the standin
 ### 4.2 Negative
 
 - **Cold-start cost**: first request after model load incurs draft snapshot_download (~300MB from HF) + draft weight load (~200ms). Mitigation: pre-cache via `hf2q init --download-draft`; default-cache after first run.
-- **VRAM/unified-memory cost**: draft adds ~300MB resident. On 128GB M5 Max this is negligible (target Q5_K_M is ~16GB); on smaller hardware (96GB M5 Pro, 64GB M5) it eats into headroom.
+- **VRAM/unified-memory cost**: draft adds ~300MB resident. On 128GB M5 Max this is small beside the current qualified Qwen3.8 Q5_K_M artifact (19,535,701,568 bytes / 18.194 GiB); on smaller hardware (96GB M5 Pro, 64GB M5) it eats into headroom.
 - **Acceptance variance**: per oMLX 87.2% on math/reasoning prompts is the high end; on long-context "needle-haystack" or non-English prompts acceptance may drop to 40-60%, partially erasing the speedup. Mitigation: §3.5's needle-haystack gate measures this; if acceptance < 50% on production prompts, drafter retraining (out of scope) is the long-term fix.
 - **F16-V regime dependency**: the speedup is measured against the F16-V regime; at hf2q's TQ-HB-V regime (where we are already 2.4× peer per `feedback_decode_gap_is_TQ_dequant_not_kernel_quality`), DFlash adds *on top* of that advantage — the multiplier compounds in the right direction but the exact regime delta needs Phase 1 measurement.
 - **New code surface**: ~1,810 LOC + tests = ~3,200 LOC total. Maintenance cost: ongoing tracking of z-lab DFlash releases (currently active development, last commit 3 days ago at `/opt/dflash`).

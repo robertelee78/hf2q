@@ -57,43 +57,19 @@ pub(super) use source_teacher::{
 
 /// Per-full-attention-layer KV slot.
 pub struct FullAttnKvSlot {
-    /// Keys buffer `[head_dim, n_kv_heads, max_seq_len, n_seqs]` f32.
-    ///
-    /// **ADR-027 Phase B iter-29 (sub-sub-iter 23c-α) + iter-34
-    /// (sub-sub-iter 23c-β.5):** wrapped in `Option` so the
-    /// `alloc_full_attn_slot` constructor can skip the F32 K/V
-    /// allocation entirely when the cache is constructed with
-    /// `tq_kv_active=true`. iter-29 (this struct field) was the
-    /// structural prep; iter-34 actually flipped alloc to emit
-    /// `None` in TQ-active mode for the **realized 3.94× per-slot
-    /// memory savings** (regression-pin
-    /// `full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_32k`).
-    /// Consumers handle Optional via `.as_ref().expect("...iter-34
-    /// alloc/SDPA gating invariant regressed...")` at F32 read sites
-    /// (gated by `slot.tq.is_none()` in iter-15's
-    /// `dispatch_decode_sdpa_with_optional_tq` for decode; routed to
-    /// iter-33's `apply_flash_attn_prefill_seq_major_resume_via_tq_cache`
-    /// for prefill resume) and via `if let Some` at reset / snapshot /
-    /// persist sites.
+    /// Conventional keys buffer
+    /// `[n_seqs, n_kv_heads, max_seq_len, head_dim]` F32. Present only
+    /// when TQ KV is disabled; production TQ slots do not retain an F32
+    /// shadow copy.
     pub k: Option<MlxBuffer>,
     /// Values buffer — same shape and dtype as `k`.
     pub v: Option<MlxBuffer>,
     /// Per-seq write cursor. `current_len[s]` = number of tokens already
     /// stored for sequence s.
     pub current_len: Vec<u32>,
-    /// ADR-027 Phase B iter-8 — TQ-active K/V buffers. `Some` when the
-    /// containing `HybridKvCache` was constructed via
-    /// `new_with_options(.., tq_kv_active = true)` (production path:
-    /// `HF2Q_TQ_KV=1`); `None` in the legacy F32-only path (default,
-    /// preserves all 71 existing `HybridKvCache::new(...)` callers).
-    ///
-    /// **Iter-8 scope (this commit):** allocator branching only. The
-    /// SDPA dispatch + KV write branches that consume these buffers
-    /// are iter-9 scope. In iter-8, when `tq.is_some()` the F32 `k` /
-    /// `v` are STILL allocated alongside (shadow-cache pattern;
-    /// mirrors Gemma's `dense_kvs` + `leg_hb_encoded` co-existence at
-    /// `forward_mlx.rs:739+824`).  iter-11 (post-NRMSE-parity) drops
-    /// the F32 backing in TQ mode for the full 3.94× memory savings.
+    /// Production TQ K/V buffers. `Some` when the cache is constructed
+    /// with `tq_kv_active = true` (the default and canonical-launcher
+    /// path); `None` for the explicit `HF2Q_TQ_KV=0` F32 control path.
     pub tq: Option<TqFullAttnKvBuffers>,
 }
 
@@ -3697,8 +3673,7 @@ fn alloc_full_attn_slot(
         });
     }
 
-    // Legacy F32 path (tq_kv_active=false, default — preserves all 71
-    // existing HybridKvCache::new(...) callers' behavior bit-identically).
+    // Conventional F32 control path (`HF2Q_TQ_KV=0`).
     // Layout: [n_seqs, n_kv_heads, max_seq_len, head_dim] — matches SDPA kernel's
     // expected K/V layout: [batch, n_kv_heads, kv_seq_len, head_dim] (head_dim innermost).
     // kv_capacity = max_seq_len; kv_seq_len = current_len at forward time.
@@ -3797,24 +3772,11 @@ fn alloc_linear_attn_slot(
 // ADR-027 Phase B iter-7 — TQ-active full-attn KV buffer infra (additive)
 // ──────────────────────────────────────────────────────────────────────────
 //
-// Mirrors mlx-native `forward_mlx.rs::HbKvBuffers` (Gemma 4 TQ-active path)
-// shape contract, extended with the qwen35 `n_seqs` axis. Iter-7 ships only
-// the buffer types + allocator + tests so iter-8's SDPA dispatch (via
-// `flash_attn_vec_tq_hb` from mlx-native) has a stable target.
-//
-// **Iter-7 scope (this file region):**
-// - `TqFullAttnKvBuffers` struct (parallel to `FullAttnKvSlot` in TQ mode).
-// - `tq_norms_per_pos_for(head_dim) -> u32` (1 for head_dim=256; 2 for
-//   head_dim=512; mirror of `forward_mlx.rs:2326`).
-// - `alloc_tq_full_attn_buffers(cfg, device, max_seq_len, n_seqs)` —
-//   returns a virtually reserved TQ buffer set with U8 packed indices +
-//   F32 norms written before cursor-visible reads.
-// - Tests prove byte-count parity (~3.94× smaller than F32 at qwen36 APEX
-//   shape) + correct shape per qwen35 cache layout.
-//
-// **NOT yet wired into `HybridKvCache::new`** — that's iter-8 along with
-// the SDPA dispatch branch. Iter-7 keeps the existing F32 path completely
-// untouched (Chesterton's fence on the live serve path).
+// Qwen full-attention TQ storage extends the native three-axis kernel layout
+// with an outer sequence/agent axis. The production allocator, cache writer,
+// decode attention, prefill resume, and persistence paths all consume this
+// representation directly; F32 buffers exist only in the explicit opt-out
+// regime.
 
 /// ADR-027 Phase B iter-7 — TQ-active K/V buffer set for one full-attn
 /// slot (qwen35). Holds Hadamard-rotated 8-bit-quantized K/V indices and
@@ -3826,8 +3788,8 @@ fn alloc_linear_attn_slot(
 /// the inner three axes `[n_kv_heads, max_seq_len, head_dim]` per
 /// sequence; the n_seqs outer dimension is consumed at the call site.
 ///
-/// Constructed by [`alloc_tq_full_attn_buffers`]. Iter-8 wires this into
-/// the `HybridKvCache::new` allocator branch + the SDPA dispatch.
+/// Constructed by [`alloc_tq_full_attn_buffers`] and installed by the
+/// `HybridKvCache` allocator when TQ mode is active.
 pub struct TqFullAttnKvBuffers {
     /// Byte-packed K indices `[n_seqs, n_kv_heads, max_seq_len, head_dim]`
     /// U8.  One byte per element (8-bit Lloyd-Max codebook index).

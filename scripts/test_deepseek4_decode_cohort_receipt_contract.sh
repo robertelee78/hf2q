@@ -242,7 +242,7 @@ write_summary() {
     --argjson loaded_idle_memory_json "$loaded_idle_memory_json" \
     --argjson measurement_memory_json "$measurement_memory_json" '
     . + {schema_version:6,source_sha:$source_sha,model_sha256:$model_sha256,
-      mlx_native_version:"0.11.0",producer_exit_code:0,raw_sha256:$raw_sha256,
+      mlx_native_version:"0.11.2",producer_exit_code:0,raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,
       phase_evidence:{policy:"fsynced-run-bound-markers-v1",run_uuid:$run_uuid,
         producer_pid:$producer_pid,test_spawned_at:1940,log_sha256:$phase_log_sha256},

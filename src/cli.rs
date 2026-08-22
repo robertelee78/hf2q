@@ -1023,6 +1023,8 @@ pub enum DiagnosticQuantArg {
     Q8Zero,
     #[value(name = "Q6_K")]
     Q6K,
+    #[value(name = "Q5_K_M")]
+    Q5KM,
     #[value(name = "Q4_K_M")]
     Q4KM,
     #[value(name = "Q3_K_M")]
@@ -1034,6 +1036,7 @@ impl DiagnosticQuantArg {
         match self {
             Self::Q8Zero => "Q8_0",
             Self::Q6K => "Q6_K",
+            Self::Q5KM => "Q5_K_M",
             Self::Q4KM => "Q4_K_M",
             Self::Q3KM => "Q3_K_M",
         }
@@ -1640,6 +1643,7 @@ mod tests {
         assert!(completion.contains("chat"));
         assert!(completion.contains("--quant"));
         assert!(completion.contains("Q4_K_M"));
+        assert!(completion.contains("Q5_K_M"));
         assert!(completion.contains("--artifact"));
         assert!(completion.contains("--keep-serving"));
     }

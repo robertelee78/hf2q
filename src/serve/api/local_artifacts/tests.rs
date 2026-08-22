@@ -9,7 +9,7 @@ use crate::serve::cache::{CacheManifest, ModelEntry, QuantEntry};
 use std::collections::BTreeMap;
 use std::io::Write;
 
-fn write_q4_k_m_gguf(path: &Path) {
+fn write_quant_gguf(path: &Path, file_type: u32) {
     let key = b"general.file_type";
     let mut gguf = Vec::new();
     gguf.extend_from_slice(b"GGUF");
@@ -19,9 +19,13 @@ fn write_q4_k_m_gguf(path: &Path) {
     gguf.extend_from_slice(&(key.len() as u64).to_le_bytes());
     gguf.extend_from_slice(key);
     gguf.extend_from_slice(&4_u32.to_le_bytes());
-    gguf.extend_from_slice(&15_u32.to_le_bytes());
+    gguf.extend_from_slice(&file_type.to_le_bytes());
     gguf.resize(256, 0);
     fs::write(path, gguf).unwrap();
+}
+
+fn write_q4_k_m_gguf(path: &Path) {
+    write_quant_gguf(path, 15);
 }
 
 fn receipt_for(artifact: &Path, repository: &str) -> ConversionReceipt {
@@ -84,6 +88,22 @@ fn schema_v3_receipt_discovers_nested_local_gguf_for_exact_repository() {
     assert_eq!(found.quant, Some(QuantType::Q4_K_M));
     assert!(found.selectable);
     assert_eq!(found.provenance, LocalArtifactProvenance::ConversionReceipt);
+}
+
+#[test]
+fn qwen38_q5_k_m_receipt_is_selectable_with_exact_header_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let artifact = root.path().join("model-q5_k_m.gguf");
+    write_quant_gguf(&artifact, 17);
+    let mut receipt = receipt_for(&artifact, "owner/model");
+    receipt.quant_selector = "q5_k_m".into();
+    write_receipt(&artifact, &receipt);
+
+    let catalog = LocalArtifactInventory::for_test(vec![root.path().to_path_buf()])
+        .discover(Some("owner/model"), None);
+    assert_eq!(catalog.artifacts.len(), 1);
+    assert_eq!(catalog.artifacts[0].quant, Some(QuantType::Q5_K_M));
+    assert!(catalog.artifacts[0].selectable);
 }
 
 #[test]

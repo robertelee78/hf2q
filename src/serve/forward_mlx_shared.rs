@@ -245,17 +245,18 @@ pub(crate) fn load_gguf_qweight(
     let info = gguf
         .tensor_info(&full_name)
         .ok_or_else(|| crate::serve::load_diagnostic::MissingGgufTensor::new(full_name.clone()))?;
+    anyhow::ensure!(
+        info.shape.len() == 2,
+        "native GGUF weight {full_name} must be rank 2, got shape {:?}",
+        info.shape
+    );
     let buffer = gguf
         .load_tensor(&full_name, device)
         .map_err(|e| anyhow::anyhow!("load {}: {e}", full_name))?;
 
     // Shape: [rows, cols] for 2D weight matrices.
-    let rows = info.shape.first().copied().unwrap_or(1);
-    let cols = if info.shape.len() > 1 {
-        info.shape[1]
-    } else {
-        1
-    };
+    let rows = info.shape[0];
+    let cols = info.shape[1];
 
     Ok(MlxQWeight {
         buffer,

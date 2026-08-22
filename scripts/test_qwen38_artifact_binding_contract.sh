@@ -7,6 +7,8 @@ set -euo pipefail
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 spec_runner="$root_dir/scripts/qwen38_speculation_ab.sh"
 long_runner="$root_dir/scripts/qwen38_long_decode_ab.sh"
+matched_runner="$root_dir/scripts/qwen38_matched_reference_abba.sh"
+matched_contract="$root_dir/scripts/qwen38_matched_reference_contract.sh"
 workflow="$root_dir/.github/workflows/cache-lifecycle.yml"
 
 readonly paired_model_path='/opt/hf2q/models/qwen3.8/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf'
@@ -60,10 +62,55 @@ grep -Fq 'model_verification_mode=provided_receipt' "$spec_runner" || {
   echo "Qwen3.8 speculation receipt mislabels parent-provided verification" >&2
   exit 1
 }
+if ! grep -Fq 'MODEL_ID=${MODEL_ID:-}' "$spec_runner" \
+  || ! grep -Fq 'resolve_loaded_model_id' "$spec_runner"; then
+  echo "Qwen3.8 speculation runner still assumes a stale display model id" >&2
+  exit 1
+fi
+
+for needle in \
+  'HF2Q_SHA256=${HF2Q_SHA256:?HF2Q_SHA256 is required}' \
+  'MIN_HF2Q_RATIO must be >= 1.0' \
+  'readonly MIN_SUSTAINED_WARMUP_TOKENS=512' \
+  'readonly MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT=5' \
+  'readonly MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT=10' \
+  "readonly QUALIFIED_MODEL_SHA256='4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e'" \
+  'readonly THERMAL_SETTLE_SECONDS=120' \
+  'verify_executable_identity hf2q' \
+  'verify_executable_identity reference' \
+  'for reference_trial in 2 3' \
+  'run_stream_ttft' \
+  'contract_sha256:$contract_sha' \
+  'request_manifest_sha256' \
+  'evidence_manifest_sha256' \
+  'required_energy_mode:"automatic-or-high"' \
+  'required_process_state:"quiet"' \
+  'matched_measurement_stability_json "$rows_file"' \
+  '.observed_band_dominance == true' \
+  'sustained_warmup:$warmup_diagnostics'; do
+  grep -Fq "$needle" "$matched_runner" || {
+    echo "matched Q5_K_M runner lost required evidence contract: $needle" >&2
+    exit 1
+  }
+done
+grep -Fq '.status.value == "loaded"' "$matched_contract" || {
+  echo "matched Q5_K_M contract lost the reference loaded-state parser" >&2
+  exit 1
+}
+[[ "$(grep -cF 'hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256"' \
+  "$matched_runner")" -ge 2 ]] || {
+  echo "matched Q5_K_M runner does not revalidate model identity" >&2
+  exit 1
+}
+if grep -Eq '^THERMAL_(SETTLE|SAMPLE).*\$\{THERMAL_' "$matched_runner"; then
+  echo "matched Q5_K_M calibration timings became caller-overridable" >&2
+  exit 1
+fi
 
 for artifact_consumer in \
   "$spec_runner" \
   "$long_runner" \
+  "$matched_runner" \
   "$root_dir/src/inference/models/qwen35/spec_decode.rs"; do
   if grep -Fq 'Qwen3.8-27B-Q4_K_M.gguf' "$artifact_consumer"; then
     echo "Qwen3.8 execution path still names the removed vanilla artifact: $artifact_consumer" >&2

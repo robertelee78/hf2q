@@ -152,11 +152,13 @@ selectability, unavailable reason, and a filename-derived `quant_hint`.
 Catalog metadata does not claim the actual GGUF header type or loader
 compatibility.
 
-The narrow hosted bridge makes Q3_K_M, Q4_K_M, Q6_K, and Q8_0 selectable.
-Q5_K_M is recognized and displayed but unavailable until artifact file type is
-separated from ADR-005's conversion-policy identity. BF16, split GGUFs, and
-`mmproj` companions are likewise visible with explicit reasons. Catalog
-resolution transfers no model payload.
+The narrow hosted bridge makes Q3_K_M, Q4_K_M, Q5_K_M, Q6_K, and Q8_0
+selectable. The server binds Q5_K_M to GGUF file type 17 instead of reusing a
+conversion-policy default. BF16, split GGUFs, and `mmproj` companions remain
+visible with explicit reasons. Catalog resolution transfers no model payload.
+Transfer admission reuses the catalog classifier instead of maintaining a
+second quant allowlist, and activation compares the downloaded GGUF header to
+the selected exact file type before model loading.
 
 ### Receipt-backed local artifact discovery amendment (2026-08-21)
 
@@ -400,9 +402,10 @@ Implementation is not complete until all of the following are proven:
    reaps preparation before HTTP drain, and pipe-retaining descendants make
    shutdown fail closed; and
 10. hosted-selection tests prove immutable candidate binding across mutable
-    branch changes, bounded metadata/transfer concurrency, Q5/BF16/split/mmproj
-    rejection, zero transfer on conflict or stale switch, authoritative
-    request identity, and no implicit safetensors conversion; and
+    branch changes, bounded metadata/transfer concurrency, exact Q5_K_M file
+    type 17 selection, BF16/split/mmproj rejection, zero transfer on conflict
+    or stale switch, authoritative request identity, and no implicit
+    safetensors conversion; and
 11. local-selection tests prove schema-v3 and canonical-cache discovery,
     bounded/symlink-safe traversal, no path or digest serialization, local-first
     selector behavior with zero Hub work, repository-bound opaque authority,
