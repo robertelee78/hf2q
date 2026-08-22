@@ -2208,19 +2208,43 @@ environment observation is corrected:
   contract. Run 5 remains a v2 failure and justifies the amendment only; a fresh
   protected run from a committed v3 producer and verifier is required for
   acceptance;
+- the 2026-08-22 v3 proof campaign preserved two invalid attempts rather than
+  weakening the gate. Attempt 1 failed during loaded setup when the concurrently
+  developed Qwen lane started Cargo and Rustc after DeepSeek had reserved the
+  host. Attempt 2 failed on 15,980 pages of setup-phase swap-out growth while
+  macOS was still reclaiming state from the first model load. An idle spike then
+  showed pressure Normal, 90--91% free memory, and both swap directions flat for
+  four consecutive samples over 40 seconds before the next attempt. Neither
+  invalid attempt opened an accepted measurement receipt;
+- the fresh committed v3 producer and verifier at source
+  `006174ab87742e2fc1a457a9e7a8b04b826e5de4` then passed against the
+  107,431,343,168-byte artifact with SHA-256
+  `936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`.
+  Run UUID `7cf8081f-544b-47ca-b38a-984efc85cb87` completed all 20
+  conditioned pairs with exact recurrent state/logits/cache and exact residency
+  shape. Conditioned B=4 measured 115.419 ms versus 119.441 ms serial
+  (`1.0348x`), with both alternating order strata positive (`1.0368x` and
+  `1.0324x`). The exact 19-second VM window recorded zero swap-ins, zero
+  swap-outs, zero process `ri_pageins`, zero throttled pages, and pressure
+  Normal-to-Warning; all ten wrapper samples were uncontended and thermally
+  Nominal. The mandatory diagnostic deltas were 8,488 page-ins, 141 page-outs,
+  8,180,313 compressions, 8,262,262 decompressions, 10,120 purges, and 438,803
+  reactivations. The non-gating loaded-idle control remained attached and
+  hash-bound. The raw receipt SHA-256 is
+  `b265f06c3653af5659b7a2fe173bb2393ab0eae5371574c84caa73d2ecfd66f3`;
+  the verified schema-v6 summary SHA-256 is
+  `4cd5c4743ae4971abee0173dda4934ec5ba85eec6265eda99217de414f39e424`;
 - the verifier independently recomputes marker order and the at-least-45-second
   loaded-settle span, matches marker objects to the raw receipt, replays every
   gated-zero/epoch/residency rule from raw values, hashes all telemetry, and
   rejects missing, duplicate, truncated, reordered, wrong-run, or wrong-process
   evidence.
 
-If a fresh v3 protected experiment passes, the conditioned protocol replaces
-the switch-contaminated performance verdict after the receipt/verifier contract
-and product gates pass. If it fails, same-topology priming is rejected as a
-harness explanation; the positive-median gate is not waived, and the next work
-is a real B=4 implementation optimization. No result from a contended,
-thermally invalid, critically memory-pressured, swapping, process-refaulting, or
-unreceipted run is admissible.
+The passing fresh v3 experiment accepts the conditioned protocol and replaces
+the switch-contaminated performance verdict. The positive-median requirement
+was not waived. No result from a contended, thermally invalid, critically
+memory-pressured, swapping, process-refaulting, or unreceipted run is
+admissible.
 
 Run `32344447013` then exposed a receipt-verifier defect rather than a hardware
 defect.
