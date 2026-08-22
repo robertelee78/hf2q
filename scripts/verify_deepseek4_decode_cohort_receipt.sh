@@ -65,7 +65,7 @@ jq -e --slurpfile raw "$raw" \
     and $receipt.schema_version == 1
     and .schema_version == 3 and .status == "pass"
     and .source_sha == $source_sha and .model_sha256 == $model_sha256
-    and .mlx_native_version == "0.11.1"
+    and .mlx_native_version == "0.11.2"
     and .thermal_probe.implementation == "compiled-foundation-helper"
     and .thermal_probe.source_path == "scripts/macos_thermal_probe.swift"
     and (.thermal_probe.source_sha256 | test("^[0-9a-f]{64}$"))

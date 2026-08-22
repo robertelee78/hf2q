@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.88+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | hf2q 0.1.10 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.1`. Public availability is authoritative only when the `v0.1.10` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | hf2q 0.1.10 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.10` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 # Convert a HuggingFace model to a Q4_K_M GGUF (auto-downloads via --repo)
@@ -527,7 +527,7 @@ to the eight-token/two-window interactive budget above.
 
 Large DeepSeek MoE prefills also pair the routed expert gate and up
 projections through the family-neutral schedule primitive introduced in
-`mlx-native 0.10.9` and retained by the pinned `mlx-native 0.11.1`.
+`mlx-native 0.10.9` and retained by the pinned `mlx-native 0.11.2`.
 That primitive constructs the expert routing schedule once, then encodes the
 two existing quantized projections; it is not a new approximate arithmetic
 kernel. Decode-sized work, forced matvec/slotted diagnostics, calls without
@@ -568,7 +568,7 @@ The Qwen watchdog acceptance scripts are reproducible operator gates, not
 startup defaults. Existing receipts are causal local dependency-spike evidence;
 they are not final hf2q distribution authority. Changes to those model or
 serving paths require rerunning the applicable gates from a clean hf2q package
-resolving published `mlx-native 0.11.1`:
+resolving published `mlx-native 0.11.2`:
 
 - `scripts/test_qwen36_prefill_watchdog.sh` enqueues the deterministic
   552-token SSE lane immediately before the public 87,972-token/347-tool lane,
