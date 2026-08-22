@@ -94,20 +94,20 @@ pub(crate) fn architecture_names(current: &OsStr) -> Vec<CompletionCandidate> {
     )
 }
 
-/// Complete `serve --model` from hf2q's managed model directory by default.
+/// Complete a decoder-model path from hf2q's managed model directory by default.
 /// An explicit path (`/`, `./`, `../`, `~/`, or any value containing a path
 /// separator) remains anchored to the caller's filesystem instead.
-pub(crate) fn serve_model_paths(current: &OsStr) -> Vec<CompletionCandidate> {
-    model_paths(current, ModelPathKind::Decoder)
+pub(crate) fn decoder_model_paths(current: &OsStr) -> Vec<CompletionCandidate> {
+    complete_model_paths(current, ModelPathKind::Decoder)
 }
 
-/// Complete `serve --mmproj` with the same root policy as `--model`, while
+/// Complete an mmproj path with the same root policy as decoder models, while
 /// limiting final file candidates to conventionally named projector GGUFs.
-pub(crate) fn serve_mmproj_paths(current: &OsStr) -> Vec<CompletionCandidate> {
-    model_paths(current, ModelPathKind::Mmproj)
+pub(crate) fn mmproj_model_paths(current: &OsStr) -> Vec<CompletionCandidate> {
+    complete_model_paths(current, ModelPathKind::Mmproj)
 }
 
-fn model_paths(current: &OsStr, kind: ModelPathKind) -> Vec<CompletionCandidate> {
+fn complete_model_paths(current: &OsStr, kind: ModelPathKind) -> Vec<CompletionCandidate> {
     if is_bare_name(current) {
         if let Some(root) = canonical_model_root() {
             let candidates = complete_from_root(current, &root, &root, kind);

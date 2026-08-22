@@ -5,7 +5,8 @@
   shipped on 2026-08-21, and channel-aware standalone/Cargo/source lifecycle
   plus explicit purge landed the same day; the issue-146 guide contract was
   corrected after a post-landing regression review; installed completion
-  ownership was restored on 2026-08-21; distinct-account proof remains
+  ownership was restored on 2026-08-21 and managed-model completion scope was
+  corrected on 2026-08-22; distinct-account proof remains
 - Date: 2026-08-17
 - Updated: 2026-08-22
 - Owners: hf2q release engineering and operator experience
@@ -531,11 +532,16 @@ The resulting contract is:
   process-lifeline surfaces are absent structurally;
 - the exact `clap_complete` protocol version is pinned, with protected Bash,
   Zsh, and Fish adapters and semantic quant/architecture candidates;
-- dynamic `serve --model` and `--mmproj` completion prefers the canonical
-  `${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models` tree for an empty or bare
-  value, filters decoder and projector GGUF filenames separately, and returns
-  to ordinary filesystem completion as soon as the operator supplies an
-  explicit path or no managed bare-name candidate exists;
+- dynamic completion for every user-facing local GGUF model path prefers the
+  canonical `${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models` tree for an
+  empty or bare value. This includes `chat --model`, `generate --model`,
+  `generate --mmproj`, `serve --model`, `serve --embedding-model`, `serve
+  --mmproj`, and both parity `--model` arguments. Decoder and projector GGUF
+  filenames are filtered separately, and ordinary filesystem completion
+  resumes as soon as the operator supplies an explicit path or no managed
+  bare-name candidate exists. Chat remains a hybrid surface: explicit endpoint
+  model IDs and Hugging Face repository IDs remain valid even though local
+  managed paths are suggested;
 - the standalone installer suppresses reconciliation in the temporary
   candidate and invokes the stable installed binary after activation; Cargo
   provisions on first invocation because Cargo has no post-install hook;
@@ -831,10 +837,13 @@ published bytes.
   Fish, PowerShell, and Zsh requests contain no hidden surface.
 - Quant and architecture candidates are drawn from the shipped parser and
   architecture registry; reserved quant names are never advertised.
-- Empty or bare `serve --model` and `--mmproj` values enumerate the canonical
-  managed-model root in stable name order, while explicit relative, home, and
-  absolute paths remain available. Decoder completion excludes conventional
-  mmproj filenames and projector completion excludes decoder filenames.
+- Empty or bare values for every user-facing local GGUF model/projector path
+  enumerate the canonical managed-model root in stable name order, while
+  explicit relative, home, and absolute paths remain available. Tests cover
+  chat, generate, serve model/embedding/projector, and both parity model
+  surfaces. Repository-ID-only `cache clear --model` is not given local-path
+  candidates. Decoder completion excludes conventional mmproj filenames and
+  projector completion excludes decoder filenames.
 - Completion requests produce stdout-only protocol data and perform no
   reconciliation. Ordinary source/debug runs without explicit destinations
   perform no completion or startup writes.
@@ -874,7 +883,8 @@ What exists:
 - ownership-gated dynamic Bash/Zsh/Fish completion with stable installer
   activation, Cargo first-run activation, protected public-only adapters, and
   receipt-bound lifecycle cleanup, including canonical managed-model and
-  mmproj path candidates; and
+  mmproj path candidates across chat, generation, serving, embeddings, and
+  parity; and
 - explicit non-mutating config/cache purge previews whose execution preserves
   unknown state siblings, cache locks, external model/Hugging Face data,
   persistent-KV roots, and logs.

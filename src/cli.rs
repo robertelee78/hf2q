@@ -796,7 +796,11 @@ pub struct CompletionsArgs {
 #[derive(clap::Args, Debug)]
 pub struct GenerateArgs {
     /// Path to GGUF model file
-    #[arg(long)]
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        add = clap_complete::ArgValueCompleter::new(complete::decoder_model_paths)
+    )]
     pub model: PathBuf,
 
     /// Path to tokenizer.json (if not alongside GGUF)
@@ -833,7 +837,11 @@ pub struct GenerateArgs {
     /// loads the projector weights onto the Metal device, and surfaces
     /// the file in the load banner (`vision = <path> (sha256 ...)`).
     /// Mirror of `serve --mmproj`.
-    #[arg(long)]
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        add = clap_complete::ArgValueCompleter::new(complete::mmproj_model_paths)
+    )]
     pub mmproj: Option<PathBuf>,
 
     /// Path to an input image (PNG / JPEG / WebP). Requires `--mmproj`.
@@ -963,7 +971,11 @@ pub struct ChatArgs {
 
     /// Model id to request. If omitted, chat selects from the endpoint's
     /// advertised models.
-    #[arg(long, value_name = "MODEL")]
+    #[arg(
+        long,
+        value_name = "MODEL",
+        add = clap_complete::ArgValueCompleter::new(complete::decoder_model_paths)
+    )]
     pub model: Option<String>,
 
     /// Select one hosted GGUF quant from a mixed Hugging Face repository.
@@ -1052,7 +1064,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         value_hint = clap::ValueHint::FilePath,
-        add = clap_complete::ArgValueCompleter::new(complete::serve_model_paths)
+        add = clap_complete::ArgValueCompleter::new(complete::decoder_model_paths)
     )]
     pub model: Option<PathBuf>,
 
@@ -1127,7 +1139,11 @@ pub struct ServeArgs {
     /// (`pooling`, `context_length`, `hidden_size`). The forward pass
     /// that backs `/v1/embeddings` requests lands in a later iter
     /// (ADR-005 Phase 2b, Task #13).
-    #[arg(long)]
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        add = clap_complete::ArgValueCompleter::new(complete::decoder_model_paths)
+    )]
     pub embedding_model: Option<PathBuf>,
 
     /// Path to a multimodal projector GGUF (mmproj). When supplied, the
@@ -1139,7 +1155,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         value_hint = clap::ValueHint::FilePath,
-        add = clap_complete::ArgValueCompleter::new(complete::serve_mmproj_paths)
+        add = clap_complete::ArgValueCompleter::new(complete::mmproj_model_paths)
     )]
     pub mmproj: Option<PathBuf>,
 
@@ -1296,7 +1312,11 @@ pub enum ParityCommand {
     /// `<prompt>_tq_quality.json` fixture).
     Check {
         /// Path to GGUF model file
-        #[arg(long)]
+        #[arg(
+            long,
+            value_hint = clap::ValueHint::FilePath,
+            add = clap_complete::ArgValueCompleter::new(complete::decoder_model_paths)
+        )]
         model: PathBuf,
 
         /// Eval prompt name (sourdough, short_hello, sliding_wrap)
@@ -1367,7 +1387,11 @@ pub enum ParityCommand {
     /// described in ADR-007 §853-866.
     Capture {
         /// Path to GGUF model file
-        #[arg(long)]
+        #[arg(
+            long,
+            value_hint = clap::ValueHint::FilePath,
+            add = clap_complete::ArgValueCompleter::new(complete::decoder_model_paths)
+        )]
         model: PathBuf,
 
         /// Output directory for captured references
