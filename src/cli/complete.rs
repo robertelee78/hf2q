@@ -4,11 +4,20 @@
 //! model loading, Metal initialization, or diagnostics are allowed here.
 
 use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use clap::CommandFactory as _;
 use clap_complete::CompletionCandidate;
 
 use super::Cli;
+
+const MAX_MODEL_PATH_CANDIDATES: usize = 256;
+
+#[derive(Clone, Copy)]
+enum ModelPathKind {
+    Decoder,
+    Mmproj,
+}
 
 /// Build the public completion grammar. Clap's `hide = true` is a help policy,
 /// not a reliable completion boundary: AOT generators traverse hidden nodes,
@@ -85,6 +94,166 @@ pub(crate) fn architecture_names(current: &OsStr) -> Vec<CompletionCandidate> {
     )
 }
 
+/// Complete `serve --model` from hf2q's managed model directory by default.
+/// An explicit path (`/`, `./`, `../`, `~/`, or any value containing a path
+/// separator) remains anchored to the caller's filesystem instead.
+pub(crate) fn serve_model_paths(current: &OsStr) -> Vec<CompletionCandidate> {
+    model_paths(current, ModelPathKind::Decoder)
+}
+
+/// Complete `serve --mmproj` with the same root policy as `--model`, while
+/// limiting final file candidates to conventionally named projector GGUFs.
+pub(crate) fn serve_mmproj_paths(current: &OsStr) -> Vec<CompletionCandidate> {
+    model_paths(current, ModelPathKind::Mmproj)
+}
+
+fn model_paths(current: &OsStr, kind: ModelPathKind) -> Vec<CompletionCandidate> {
+    if is_bare_name(current) {
+        if let Some(root) = canonical_model_root() {
+            let candidates = complete_from_root(current, &root, &root, kind);
+            if !candidates.is_empty() {
+                return candidates;
+            }
+        }
+    }
+
+    complete_explicit_path(current, kind)
+}
+
+fn canonical_model_root() -> Option<PathBuf> {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".local/share"))
+        })?;
+    Some(data_home.join("hf2q/models"))
+}
+
+fn is_bare_name(current: &OsStr) -> bool {
+    current != OsStr::new("~")
+        && Path::new(current).components().count() <= 1
+        && !current
+            .as_encoded_bytes()
+            .iter()
+            .any(|byte| std::path::is_separator(*byte as char))
+}
+
+fn complete_explicit_path(current: &OsStr, kind: ModelPathKind) -> Vec<CompletionCandidate> {
+    let current_path = Path::new(current);
+    let (typed_parent, file_prefix) = if current == OsStr::new("~") {
+        (current_path, OsStr::new(""))
+    } else {
+        split_file_name(current_path)
+    };
+
+    let search_root = if typed_parent.is_absolute() {
+        typed_parent.to_path_buf()
+    } else if typed_parent.iter().next() == Some(OsStr::new("~")) {
+        let Some(home) = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+        else {
+            return Vec::new();
+        };
+        home.join(typed_parent.strip_prefix("~").unwrap_or(typed_parent))
+    } else {
+        let Some(cwd) = std::env::current_dir().ok() else {
+            return Vec::new();
+        };
+        cwd.join(typed_parent)
+    };
+
+    complete_from_root(file_prefix, &search_root, typed_parent, kind)
+}
+
+fn complete_from_root(
+    file_prefix: &OsStr,
+    search_root: &Path,
+    output_parent: &Path,
+    kind: ModelPathKind,
+) -> Vec<CompletionCandidate> {
+    let Ok(entries) = std::fs::read_dir(search_root) else {
+        return Vec::new();
+    };
+
+    let mut candidates = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            if !name
+                .as_encoded_bytes()
+                .starts_with(file_prefix.as_encoded_bytes())
+            {
+                return None;
+            }
+
+            let path = entry.path();
+            let mut suggestion = output_parent.join(&name);
+            if path.is_dir() {
+                suggestion.push("");
+            } else if !kind.wants_file(&path) {
+                return None;
+            }
+
+            Some(
+                CompletionCandidate::new(suggestion.into_os_string())
+                    .hide(name.as_encoded_bytes().starts_with(b".")),
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.truncate(MAX_MODEL_PATH_CANDIDATES);
+    candidates
+}
+
+impl ModelPathKind {
+    fn wants_file(self, path: &Path) -> bool {
+        if !path.is_file()
+            || !path
+                .extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        {
+            return false;
+        }
+
+        let is_mmproj = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.to_ascii_lowercase().contains("mmproj"));
+        match self {
+            Self::Decoder => !is_mmproj,
+            Self::Mmproj => is_mmproj,
+        }
+    }
+}
+
+fn split_file_name(path: &Path) -> (&Path, &OsStr) {
+    if path_has_name(path) {
+        (
+            path.parent().unwrap_or_else(|| Path::new("")),
+            path.file_name().expect("path with a name"),
+        )
+    } else {
+        (path, OsStr::new(""))
+    }
+}
+
+fn path_has_name(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|byte| !std::path::is_separator(*byte as char))
+        && path.file_name().is_some()
+}
+
 fn prefixed_candidates<'a>(
     current: &OsStr,
     values: impl IntoIterator<Item = &'a str>,
@@ -144,5 +313,30 @@ mod tests {
                     .contains(&reserved)
             );
         }
+    }
+
+    #[test]
+    fn model_path_candidates_are_globally_sorted_before_truncation() {
+        let root = tempfile::tempdir().expect("model root");
+        for index in (0..1_100).rev() {
+            std::fs::create_dir(root.path().join(format!("model-{index:04}")))
+                .expect("model directory");
+        }
+
+        let candidates = complete_from_root(
+            OsStr::new("model-"),
+            root.path(),
+            root.path(),
+            ModelPathKind::Decoder,
+        );
+        assert_eq!(candidates.len(), MAX_MODEL_PATH_CANDIDATES);
+        assert_eq!(
+            candidates.first().unwrap().get_value(),
+            root.path().join("model-0000/").as_os_str()
+        );
+        assert_eq!(
+            candidates.last().unwrap().get_value(),
+            root.path().join("model-0255/").as_os_str()
+        );
     }
 }

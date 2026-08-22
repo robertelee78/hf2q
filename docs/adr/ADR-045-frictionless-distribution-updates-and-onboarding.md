@@ -7,7 +7,7 @@
   corrected after a post-landing regression review; installed completion
   ownership was restored on 2026-08-21; distinct-account proof remains
 - Date: 2026-08-17
-- Updated: 2026-08-21
+- Updated: 2026-08-22
 - Owners: hf2q release engineering and operator experience
 - Related: `docs/shipping-contract.md`,
   `docs/adr/diary/ADR-005-inference-server.md`,
@@ -531,6 +531,11 @@ The resulting contract is:
   process-lifeline surfaces are absent structurally;
 - the exact `clap_complete` protocol version is pinned, with protected Bash,
   Zsh, and Fish adapters and semantic quant/architecture candidates;
+- dynamic `serve --model` and `--mmproj` completion prefers the canonical
+  `${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models` tree for an empty or bare
+  value, filters decoder and projector GGUF filenames separately, and returns
+  to ordinary filesystem completion as soon as the operator supplies an
+  explicit path or no managed bare-name candidate exists;
 - the standalone installer suppresses reconciliation in the temporary
   candidate and invokes the stable installed binary after activation; Cargo
   provisions on first invocation because Cargo has no post-install hook;
@@ -826,6 +831,10 @@ published bytes.
   Fish, PowerShell, and Zsh requests contain no hidden surface.
 - Quant and architecture candidates are drawn from the shipped parser and
   architecture registry; reserved quant names are never advertised.
+- Empty or bare `serve --model` and `--mmproj` values enumerate the canonical
+  managed-model root in stable name order, while explicit relative, home, and
+  absolute paths remain available. Decoder completion excludes conventional
+  mmproj filenames and projector completion excludes decoder filenames.
 - Completion requests produce stdout-only protocol data and perform no
   reconciliation. Ordinary source/debug runs without explicit destinations
   perform no completion or startup writes.
@@ -864,7 +873,8 @@ What exists:
   resolution, including direct-argv Cargo update/uninstall delegation;
 - ownership-gated dynamic Bash/Zsh/Fish completion with stable installer
   activation, Cargo first-run activation, protected public-only adapters, and
-  receipt-bound lifecycle cleanup; and
+  receipt-bound lifecycle cleanup, including canonical managed-model and
+  mmproj path candidates; and
 - explicit non-mutating config/cache purge previews whose execution preserves
   unknown state siblings, cache locks, external model/Hugging Face data,
   persistent-KV roots, and logs.

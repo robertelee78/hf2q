@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12] — 2026-08-22
+
+### Changed
+
+- Prefer `${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models` when dynamically
+  completing an empty or bare `hf2q serve --model` or `--mmproj` value. Decoder
+  and projector GGUFs are filtered separately, while explicit relative,
+  home-relative, and absolute customer paths retain normal filesystem
+  completion.
+
 ## [0.1.11] — 2026-08-22
 
 ### Added
@@ -989,7 +999,8 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
-[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/robertelee78/hf2q/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/robertelee78/hf2q/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/robertelee78/hf2q/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/robertelee78/hf2q/compare/v0.1.8...v0.1.9

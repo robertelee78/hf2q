@@ -1049,7 +1049,11 @@ pub struct ServeArgs {
     /// exposes /health, /readyz, /v1/models; required once /v1/chat and
     /// /v1/embeddings route. Fail-fast on bad weights is preserved: if
     /// --model is supplied, the GGUF header is validated at startup.
-    #[arg(long)]
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        add = clap_complete::ArgValueCompleter::new(complete::serve_model_paths)
+    )]
     pub model: Option<PathBuf>,
 
     /// Additional server-local directory to search for schema-v3 hf2q
@@ -1132,7 +1136,11 @@ pub struct ServeArgs {
     /// Required for `image_url` content parts in `/v1/chat/completions`.
     /// Without it, the server is text-only and rejects image parts with
     /// 400 `no_mmproj_loaded` (ADR-005 Phase 2c Task #14).
-    #[arg(long)]
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        add = clap_complete::ArgValueCompleter::new(complete::serve_mmproj_paths)
+    )]
     pub mmproj: Option<PathBuf>,
 
     /// Legacy ADR-020 experimental overlay for a compatible mlx-affine

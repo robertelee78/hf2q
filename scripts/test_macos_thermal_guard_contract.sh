@@ -203,7 +203,11 @@ thermal_read_state() {
 }
 thermal_wait_for_nominal "$tmp_dir/contention-reset-thermal.log" \
   contention-reset 2 10 0 "$tmp_dir/contention-reset-host.log" 100
-test "$(wc -l <"$tmp_dir/contention-reset-host.log" | tr -d '[:space:]')" = 5
+# Bash's special SECONDS value includes real wall time. A loaded hosted runner
+# can therefore satisfy the final two-second quiet window on the fourth sample,
+# while a fast runner advances only through the test seam and needs five.
+contention_reset_samples=$(wc -l <"$tmp_dir/contention-reset-host.log")
+((contention_reset_samples >= 4 && contention_reset_samples <= 5))
 test "$(awk -F '\t' '$2 == "contended" { count++ } END { print count+0 }' \
   "$tmp_dir/contention-reset-host.log")" = 1
 
