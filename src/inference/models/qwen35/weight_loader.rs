@@ -1633,6 +1633,22 @@ mod tests {
     }
 
     #[test]
+    fn qwen38_linked_quantized_text_artifact_routes_retain_native_blocks() {
+        for ggml_type in [
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::Q8_0,
+        ] {
+            assert_eq!(
+                dense_ffn_storage(0, ggml_type, ggml_type, ggml_type)
+                    .expect("linked quantized text artifact must retain native blocks"),
+                DenseFfnStorage::Quantized
+            );
+        }
+    }
+
+    #[test]
     fn dense_scalar_fixtures_keep_native_storage() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         for storage in [GgmlType::F32, GgmlType::F16, GgmlType::BF16] {

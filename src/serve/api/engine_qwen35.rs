@@ -42,7 +42,7 @@ use super::engine::{
 };
 use super::engine_supervisor::EngineSupervisor;
 
-const QWEN35_WORKER_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const QWEN35_WORKER_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Canonical Qwen3 chat-template stop tokens.
 ///
@@ -284,11 +284,7 @@ impl Qwen35LoadedModel {
         for (key, value) in [("HF2Q_DECODE_MVN", "0"), ("HF2Q_DECODE_MV_EXT", "1")] {
             if std::env::var_os(key).is_none() {
                 std::env::set_var(key, value);
-                tracing::info!(
-                    key,
-                    value,
-                    "applied Qwen3.8-qualified decode route default"
-                );
+                tracing::info!(key, value, "applied Qwen3.8-qualified decode route default");
             }
         }
     }
@@ -3367,6 +3363,17 @@ pub(crate) struct Qwen35TickOutcome {
     pub finished: bool,
 }
 
+/// One slot's row in an ordinary physical target batch. Creating this value
+/// advances only request-local forced-reasoning bookkeeping; KV/state changes
+/// remain owned by the subsequent model invocation.
+pub(crate) struct Qwen35OrdinaryDecodeInput {
+    pub token: u32,
+    pub positions: [i32; 4],
+    pub forced_token: Option<u32>,
+    suspended_history_lookup: Option<HistoryLookupIndex>,
+    generated_before: usize,
+}
+
 /// One bounded, scheduler-visible Qwen prompt transaction.
 ///
 /// Slot-aware serving previously forwarded the entire uncached prompt inside
@@ -4175,6 +4182,19 @@ fn may_route_history_miss_to_mtp(mtp_available: bool, cost: &SpeculationCostCont
     mtp_available && cost.may_speculate()
 }
 
+fn history_tick_is_plain_ordinary(
+    history_may_speculate: bool,
+    lookup_is_synchronized: bool,
+    proposal_is_empty: bool,
+    mtp_present: bool,
+    mtp_may_speculate: bool,
+) -> bool {
+    if !history_may_speculate {
+        return !mtp_present;
+    }
+    lookup_is_synchronized && proposal_is_empty && (!mtp_present || !mtp_may_speculate)
+}
+
 fn mtp_cursor_for_slot(kv_cache: &HybridKvCache, slot_id: SlotId) -> Result<u32> {
     kv_cache
         .mtp_slot
@@ -4803,6 +4823,156 @@ impl Qwen35DecodeState {
         (work, work, rate)
     }
 
+    /// True only when this tick resolves to the plain ordinary greedy target
+    /// that the physical width-N path implements. A history proposer with a
+    /// known miss may suspend its request-local index across the target call;
+    /// actual history verification and every live MTP transaction stay scalar.
+    pub(crate) fn ordinary_physical_batch_ready(&self) -> bool {
+        let plain_greedy = self.finish_reason == "length"
+            && self.step < self.max_tokens
+            && self.is_greedy
+            && !self.want_logprobs
+            && self.pending_speculation_output.is_empty();
+        if !plain_greedy {
+            return false;
+        }
+        let Some(lookup) = self.history_lookup.as_ref() else {
+            return self.mtp.is_none();
+        };
+        let expected_len = self.prompt_tokens.len() + self.generated_tokens.len();
+        let history_may_speculate = self.history_cost.may_speculate();
+        history_tick_is_plain_ordinary(
+            history_may_speculate,
+            lookup.verified_len() == expected_len,
+            !history_may_speculate || lookup.propose().is_empty(),
+            self.mtp.is_some(),
+            self.mtp_cost.may_speculate(),
+        )
+    }
+
+    pub(crate) fn prepare_ordinary_physical_batch(&mut self) -> Qwen35OrdinaryDecodeInput {
+        debug_assert!(
+            self.ordinary_physical_batch_ready(),
+            "Qwen ordinary physical batch preparation requires prior admission"
+        );
+        let pos = self.decode_position_base + self.step - 1;
+        let pos_i32 = pos as i32;
+        let forced_token = self
+            .thinking_budget
+            .as_mut()
+            .and_then(Qwen35ThinkingBudgetState::next_forced_token);
+        if forced_token.is_some_and(|(_, started)| started) {
+            tracing::warn!(
+                slot = self.slot_id.0,
+                budget = self.params.thinking_token_budget,
+                generated_tokens = self.generated_tokens.len(),
+                "Qwen35 thinking token budget reached; forcing reasoning close and continuing answer"
+            );
+        }
+        let suspended_history_lookup = self.history_lookup.take();
+        if suspended_history_lookup.is_some() && self.history_cost.may_speculate() {
+            super::qwen35_speculation::record_history_lookup_no_match();
+            if self.mtp.is_some() {
+                debug_assert!(
+                    !self.mtp_cost.may_speculate(),
+                    "physical history miss must not overtake an admitted MTP round"
+                );
+                self.mtp = None;
+            }
+        }
+        Qwen35OrdinaryDecodeInput {
+            token: *self
+                .generated_tokens
+                .last()
+                .expect("live Qwen decode state always has a generated token"),
+            positions: [pos_i32; 4],
+            forced_token: forced_token.map(|(token, _)| token),
+            suspended_history_lookup,
+            generated_before: self.generated_tokens.len(),
+        }
+    }
+
+    pub(crate) fn finish_ordinary_physical_batch(
+        &mut self,
+        qwen: &Qwen35LoadedModel,
+        predicted: u32,
+        mut input: Qwen35OrdinaryDecodeInput,
+        ordinary_target_elapsed: Duration,
+    ) -> Qwen35TickOutcome {
+        let tok = input.forced_token.unwrap_or(predicted);
+        let outcome = self.finish_ordinary_target(qwen, tok, ordinary_target_elapsed);
+        if let Some(mut lookup) = input.suspended_history_lookup.take() {
+            if self.generated_tokens.len() > input.generated_before {
+                lookup.extend_verified(&self.generated_tokens[input.generated_before..]);
+            }
+            self.history_lookup = Some(lookup);
+        }
+        outcome
+    }
+
+    fn finish_ordinary_target(
+        &mut self,
+        qwen: &Qwen35LoadedModel,
+        tok: u32,
+        ordinary_target_elapsed: Duration,
+    ) -> Qwen35TickOutcome {
+        self.mtp_cost
+            .observe_ordinary_target(ordinary_target_elapsed);
+        self.history_cost
+            .observe_ordinary_target(ordinary_target_elapsed);
+        advance_qwen35_grammar(&mut self.grammar_runtime, &self.params, tok);
+        if qwen.eos_token_ids.contains(&tok) {
+            self.finish_reason = "stop";
+            return Qwen35TickOutcome {
+                fragment: String::new(),
+                is_reasoning: false,
+                finished: true,
+            };
+        }
+        if qwen35_grammar_terminal_token(self.grammar_runtime.as_ref(), &self.params, tok) {
+            self.finish_reason = "stop";
+            return Qwen35TickOutcome {
+                fragment: String::new(),
+                is_reasoning: false,
+                finished: true,
+            };
+        }
+        self.generated_tokens.push(tok);
+        qwen35_observe_sampling_history(&mut self.sampling_history, tok);
+        let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
+        self.decoded_text.push_str(&frag);
+        let mut tool_opened = false;
+        if let Some(splitter) = self.tool_splitter.as_mut() {
+            let marker_events = splitter.feed(&frag);
+            tool_opened = marker_events
+                .iter()
+                .any(|event| matches!(event, ToolCallEvent::ToolCallOpen));
+            if tool_opened {
+                if let Some(runtime) = self.grammar_runtime.as_mut() {
+                    runtime.trigger();
+                }
+            }
+        }
+        if let Some(budget) = self.thinking_budget.as_mut() {
+            budget.observe_generated(&self.generated_tokens, tool_opened);
+        }
+        if qwen35_hit_stop_string(&self.decoded_text, &self.stop_strings) {
+            qwen35_strip_trailing_stop(&mut self.decoded_text, &self.stop_strings);
+            self.finish_reason = "stop";
+            return Qwen35TickOutcome {
+                fragment: frag,
+                is_reasoning: false,
+                finished: true,
+            };
+        }
+        self.step += 1;
+        Qwen35TickOutcome {
+            fragment: frag,
+            is_reasoning: false,
+            finished: self.step >= self.max_tokens,
+        }
+    }
+
     /// Advance this slot by exactly one decode token — mirror of the serial
     /// ref's `while` body engine_qwen35.rs:2410-2468 for ONE iteration.
     pub(super) fn decode_tick(
@@ -4851,6 +5021,8 @@ impl Qwen35DecodeState {
             );
         }
         let tok = if self.is_greedy && !self.want_logprobs {
+            let command_buffers_created_before = mlx_native::cmd_buf_count();
+            let command_buffer_submissions_before = mlx_native::commit_count();
             let lease =
                 supervisor.arm("Qwen35 decode greedy", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
             let forward =
@@ -4886,8 +5058,16 @@ impl Qwen35DecodeState {
                     "Qwen35 ordinary greedy post-target failpoint",
                 );
             }
+            crate::inference::models::qwen35::decode_observation::observe_target_forward(
+                1,
+                1,
+                mlx_native::cmd_buf_count().saturating_sub(command_buffers_created_before),
+                mlx_native::commit_count().saturating_sub(command_buffer_submissions_before),
+            );
             forced_token.map_or(predicted, |(token, _)| token)
         } else {
+            let command_buffers_created_before = mlx_native::cmd_buf_count();
+            let command_buffer_submissions_before = mlx_native::commit_count();
             let lease =
                 supervisor.arm("Qwen35 decode logits", QWEN35_WORKER_TRANSACTION_TIMEOUT)?;
             let forward =
@@ -4936,6 +5116,12 @@ impl Qwen35DecodeState {
                     "Qwen35 ordinary logits shape",
                 );
             }
+            crate::inference::models::qwen35::decode_observation::observe_target_forward(
+                1,
+                1,
+                mlx_native::cmd_buf_count().saturating_sub(command_buffers_created_before),
+                mlx_native::commit_count().saturating_sub(command_buffer_submissions_before),
+            );
             let (token, logprob) = if let Some((token, _)) = forced_token {
                 (token, self.want_logprobs.then_some(0.0))
             } else {
@@ -4965,62 +5151,7 @@ impl Qwen35DecodeState {
             token
         };
         let ordinary_target_elapsed = ordinary_target_started.elapsed();
-        self.mtp_cost
-            .observe_ordinary_target(ordinary_target_elapsed);
-        self.history_cost
-            .observe_ordinary_target(ordinary_target_elapsed);
-        advance_qwen35_grammar(&mut self.grammar_runtime, &self.params, tok);
-        if qwen.eos_token_ids.contains(&tok) {
-            self.finish_reason = "stop";
-            return Ok(Qwen35TickOutcome {
-                fragment: String::new(),
-                is_reasoning: false,
-                finished: true,
-            });
-        }
-        if qwen35_grammar_terminal_token(self.grammar_runtime.as_ref(), &self.params, tok) {
-            self.finish_reason = "stop";
-            return Ok(Qwen35TickOutcome {
-                fragment: String::new(),
-                is_reasoning: false,
-                finished: true,
-            });
-        }
-        self.generated_tokens.push(tok);
-        qwen35_observe_sampling_history(&mut self.sampling_history, tok);
-        let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
-        self.decoded_text.push_str(&frag);
-        let mut tool_opened = false;
-        if let Some(splitter) = self.tool_splitter.as_mut() {
-            let marker_events = splitter.feed(&frag);
-            tool_opened = marker_events
-                .iter()
-                .any(|event| matches!(event, ToolCallEvent::ToolCallOpen));
-            if tool_opened {
-                if let Some(runtime) = self.grammar_runtime.as_mut() {
-                    runtime.trigger();
-                }
-            }
-        }
-        if let Some(budget) = self.thinking_budget.as_mut() {
-            budget.observe_generated(&self.generated_tokens, tool_opened);
-        }
-        if qwen35_hit_stop_string(&self.decoded_text, &self.stop_strings) {
-            qwen35_strip_trailing_stop(&mut self.decoded_text, &self.stop_strings);
-            self.finish_reason = "stop";
-            return Ok(Qwen35TickOutcome {
-                fragment: frag,
-                is_reasoning: false,
-                finished: true,
-            });
-        }
-        self.step += 1;
-        let finished = self.step >= self.max_tokens;
-        Ok(Qwen35TickOutcome {
-            fragment: frag,
-            is_reasoning: false,
-            finished,
-        })
+        Ok(self.finish_ordinary_target(qwen, tok, ordinary_target_elapsed))
     }
 
     /// Target-verified request-history speculation. The lookup may return up
@@ -9680,6 +9811,58 @@ mod tests {
     };
     use mlx_native::{MlxBuffer, MlxDevice};
     use std::cell::Cell;
+
+    #[test]
+    fn scalar_ordinary_targets_measure_native_commits_not_encoder_creation() {
+        let src = include_str!("engine_qwen35.rs");
+        let decode_start = src.find("pub(super) fn decode_tick(").expect("decode_tick");
+        let decode_end = decode_start
+            + src[decode_start..]
+                .find("\n    fn decode_tick_history_lookup(")
+                .expect("history decode follows ordinary decode");
+        let decode = &src[decode_start..decode_end];
+        assert_eq!(
+            decode
+                .matches("let command_buffer_submissions_before = mlx_native::commit_count();")
+                .count(),
+            2,
+            "greedy and sampled ordinary targets must snapshot native commits"
+        );
+        assert_eq!(
+            decode
+                .matches(
+                    "mlx_native::commit_count().saturating_sub(command_buffer_submissions_before)"
+                )
+                .count(),
+            2,
+            "greedy and sampled ordinary targets must report actual commit deltas"
+        );
+    }
+
+    #[test]
+    fn physical_history_admission_only_takes_plain_ordinary_misses() {
+        assert!(history_tick_is_plain_ordinary(
+            false, false, false, false, false
+        ));
+        assert!(!history_tick_is_plain_ordinary(
+            false, false, false, true, false
+        ));
+        assert!(history_tick_is_plain_ordinary(
+            true, true, true, false, false
+        ));
+        assert!(history_tick_is_plain_ordinary(
+            true, true, true, true, false
+        ));
+        assert!(!history_tick_is_plain_ordinary(
+            true, true, true, true, true
+        ));
+        assert!(!history_tick_is_plain_ordinary(
+            true, true, false, false, false
+        ));
+        assert!(!history_tick_is_plain_ordinary(
+            true, false, true, false, false
+        ));
+    }
 
     fn thinking_budget_params(limit: usize) -> SamplingParams {
         SamplingParams {

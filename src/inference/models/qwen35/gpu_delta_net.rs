@@ -64,6 +64,7 @@ use mlx_native::ops::chunk_gated_delta_rule::{
     ChunkGatedDeltaRuleParams, ChunkInternalArena, FIXED_BT,
 };
 use mlx_native::ops::compute_g_beta::dispatch_compute_g_beta;
+use mlx_native::ops::copy::dispatch_copy_f32;
 use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, scalar_mul_f32, CastDirection};
@@ -103,6 +104,7 @@ use super::delta_net::DeltaNetLayerWeights;
 use super::encoder_stage::LayerEncoder;
 use super::execution_dispatch::quantized_matmul_ggml;
 use super::gpu_full_attn::{download_f32, upload_f32, upload_f32_weight, upload_q4_0_from_f32};
+use super::kv_cache::LinearAttnStateSlot;
 use crate::debug::INVESTIGATION_ENV;
 use crate::serve::multi_seq_kv::SlotId;
 
@@ -4785,6 +4787,402 @@ pub fn build_delta_net_layer_decode_into(
     Ok(output)
 }
 
+/// Decode one independent token per physical slot through a single DeltaNet
+/// layer invocation.
+///
+/// The fused recurrent kernel already has an `n_seqs` axis, but serving slots
+/// may be sparse and each slot has independent ping-pong parity. This wrapper
+/// gathers the selected CURRENT state rows into contiguous `[N, ...]` scratch,
+/// executes one `n_tokens=1, n_seqs=N` convolution and recurrent dispatch, and
+/// scatters the resulting rows into each slot's parity-correct WRITE target.
+/// The caller flips exactly those slots only after this function succeeds.
+#[allow(clippy::too_many_arguments)]
+pub fn build_delta_net_layer_decode_batched_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DeltaNetWeightsGpu,
+    state_slot: &LinearAttnStateSlot,
+    slot_ids: &[SlotId],
+    hidden_size: u32,
+    n_k_heads: u32,
+    n_v_heads: u32,
+    d_k: u32,
+    d_v: u32,
+    k_width: u32,
+    rms_norm_eps: f32,
+) -> Result<MlxBuffer> {
+    let n_seqs = u32::try_from(slot_ids.len()).context("Qwen batched DeltaNet width overflow")?;
+    anyhow::ensure!(
+        n_seqs >= 2,
+        "Qwen batched DeltaNet requires at least two slots"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for slot_id in slot_ids {
+        anyhow::ensure!(
+            (slot_id.0 as usize) < state_slot.pp_flipped.len(),
+            "Qwen batched DeltaNet slot {} outside parity axis {}",
+            slot_id.0,
+            state_slot.pp_flipped.len()
+        );
+        anyhow::ensure!(
+            seen.insert(slot_id.0),
+            "Qwen batched DeltaNet received duplicate slot {}",
+            slot_id.0
+        );
+    }
+
+    let qkv_channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
+    let z_channels = n_v_heads * d_v;
+    let q_span = n_k_heads * d_k;
+    let k_span = n_k_heads * d_k;
+    let seq_len = n_seqs;
+    let nv = n_v_heads as usize;
+    let dk = d_k as usize;
+    let dv = d_v as usize;
+    let q_sp = q_span as usize;
+    let k_sp = k_span as usize;
+    let v_sp = nv * dv;
+    let conv_per_seq = (qkv_channels as usize) * ((k_width - 1) as usize);
+    let recurrent_per_seq = dk * dv * nv;
+
+    let alloc_f32 = |elements: usize, label: &str| -> Result<MlxBuffer> {
+        super::decode_pool::pooled_alloc_buffer(
+            device,
+            elements * std::mem::size_of::<f32>(),
+            DType::F32,
+            vec![elements],
+        )
+        .map_err(|error| anyhow!("Qwen batched DeltaNet {label} allocation: {error}"))
+    };
+    let batch_conv_in = alloc_f32(slot_ids.len() * conv_per_seq, "conv input")?;
+    let batch_conv_out = alloc_f32(slot_ids.len() * conv_per_seq, "conv output")?;
+    let batch_recurrent_in = alloc_f32(slot_ids.len() * recurrent_per_seq, "recurrent input")?;
+    let batch_recurrent_out = alloc_f32(slot_ids.len() * recurrent_per_seq, "recurrent output")?;
+
+    for (row, slot_id) in slot_ids.iter().copied().enumerate() {
+        let (conv_current, _) = state_slot.conv_bufs_for_slot(slot_id);
+        let (recurrent_current, _) = state_slot.recurrent_bufs_for_slot(slot_id);
+        let (conv_offset, conv_elements) =
+            slot_conv_state_region(slot_id, qkv_channels, k_width - 1);
+        let (recurrent_offset, recurrent_elements) =
+            slot_recurrent_region(slot_id, d_k, d_v, n_v_heads);
+        let conv_view = conv_current.slice_view(conv_offset, conv_elements);
+        let recurrent_view = recurrent_current.slice_view(recurrent_offset, recurrent_elements);
+        dispatch_copy_f32(
+            enc,
+            registry,
+            device.metal_device(),
+            &conv_view,
+            &batch_conv_in,
+            0,
+            row * conv_per_seq,
+            conv_per_seq,
+        )
+        .context("gather Qwen batched DeltaNet conv state")?;
+        dispatch_copy_f32(
+            enc,
+            registry,
+            device.metal_device(),
+            &recurrent_view,
+            &batch_recurrent_in,
+            0,
+            row * recurrent_per_seq,
+            recurrent_per_seq,
+        )
+        .context("gather Qwen batched DeltaNet recurrent state")?;
+    }
+    enc.memory_barrier();
+
+    let qkv_conv = alloc_f32(slot_ids.len() * qkv_channels as usize, "QKV conv")?;
+    let q_gpu = alloc_f32(slot_ids.len() * q_sp, "Q split")?;
+    let k_gpu = alloc_f32(slot_ids.len() * k_sp, "K split")?;
+    let v_gpu = alloc_f32(slot_ids.len() * v_sp, "V split")?;
+    let mut ssm_params_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        4 * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![4],
+    )
+    .map_err(|error| anyhow!("Qwen batched DeltaNet SSM params allocation: {error}"))?;
+    ssm_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched DeltaNet SSM params: {error}"))?
+        .copy_from_slice(&[qkv_channels, 1, n_seqs, k_width]);
+    let ssm_conv_params = SsmConvParams {
+        channels: qkv_channels,
+        n_tokens: 1,
+        n_seqs,
+        k_width,
+    };
+
+    let x_norm = apply_pre_norm(
+        enc,
+        registry,
+        device,
+        x,
+        &weights.attn_norm,
+        seq_len,
+        hidden_size,
+        rms_norm_eps,
+    )?;
+    enc.memory_barrier();
+    let qkv_raw = apply_proj_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.attn_qkv,
+        weights.attn_qkv_ggml_type,
+        seq_len,
+        hidden_size,
+        qkv_channels,
+    )?;
+    let z = apply_proj_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.attn_gate,
+        weights.attn_gate_ggml_type,
+        seq_len,
+        hidden_size,
+        z_channels,
+    )?;
+    enc.memory_barrier();
+    dispatch_ssm_conv(
+        enc,
+        registry,
+        device.metal_device(),
+        &qkv_raw,
+        &weights.ssm_conv1d,
+        &batch_conv_in,
+        &batch_conv_out,
+        &qkv_conv,
+        &ssm_params_buf,
+        ssm_conv_params,
+    )
+    .context("Qwen batched DeltaNet convolution")?;
+    enc.memory_barrier();
+    dispatch_qkv_split_f32(
+        enc,
+        registry,
+        device.metal_device(),
+        &qkv_conv,
+        &q_gpu,
+        &k_gpu,
+        &v_gpu,
+        &QkvSplitParams {
+            seq: seq_len,
+            q_sp: q_span,
+            k_sp: k_span,
+            v_sp: v_sp as u32,
+        },
+    )
+    .map_err(|error| anyhow!("Qwen batched DeltaNet QKV split: {error}"))?;
+    for (row, slot_id) in slot_ids.iter().copied().enumerate() {
+        let (_, conv_write) = state_slot.conv_bufs_for_slot(slot_id);
+        let (conv_offset, conv_elements) =
+            slot_conv_state_region(slot_id, qkv_channels, k_width - 1);
+        let conv_write = conv_write.slice_view(conv_offset, conv_elements);
+        dispatch_copy_f32(
+            enc,
+            registry,
+            device.metal_device(),
+            &batch_conv_out,
+            &conv_write,
+            row * conv_per_seq,
+            0,
+            conv_per_seq,
+        )
+        .context("scatter Qwen batched DeltaNet conv state")?;
+    }
+    enc.memory_barrier();
+
+    let q_l2 = apply_l2_norm_per_head(
+        enc,
+        registry,
+        device,
+        &q_gpu,
+        seq_len,
+        n_k_heads,
+        d_k,
+        rms_norm_eps,
+    )?;
+    let k_normed = apply_l2_norm_per_head(
+        enc,
+        registry,
+        device,
+        &k_gpu,
+        seq_len,
+        n_k_heads,
+        d_k,
+        rms_norm_eps,
+    )?;
+    let alpha_logit_buf = apply_proj_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.ssm_alpha,
+        weights.ssm_alpha_ggml_type,
+        seq_len,
+        hidden_size,
+        n_v_heads,
+    )?;
+    let beta_logit_buf = apply_proj_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.ssm_beta,
+        weights.ssm_beta_ggml_type,
+        seq_len,
+        hidden_size,
+        n_v_heads,
+    )?;
+    enc.memory_barrier();
+
+    let n_q_elems = (seq_len * n_k_heads * d_k) as usize;
+    let q_scaled = alloc_f32(n_q_elems, "scaled Q")?;
+    let g_n = (seq_len * n_v_heads) as usize;
+    let g_buf = alloc_f32(g_n, "g")?;
+    let beta_buf = alloc_f32(g_n, "beta")?;
+    let mut g_params_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        2 * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![2],
+    )
+    .map_err(|error| anyhow!("Qwen batched DeltaNet g/beta params allocation: {error}"))?;
+    g_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched DeltaNet g/beta params: {error}"))?
+        .copy_from_slice(&[n_v_heads, seq_len]);
+    scalar_mul_f32(
+        enc,
+        registry,
+        device.metal_device(),
+        &q_l2,
+        &q_scaled,
+        n_q_elems,
+        1.0 / (dk as f32).sqrt(),
+    )
+    .context("Qwen batched DeltaNet Q scale")?;
+    dispatch_compute_g_beta(
+        enc,
+        registry,
+        device.metal_device(),
+        &alpha_logit_buf,
+        &beta_logit_buf,
+        &weights.ssm_dt_bias,
+        &weights.ssm_a,
+        &g_buf,
+        &beta_buf,
+        &g_params_buf,
+        seq_len,
+        n_v_heads,
+    )
+    .context("Qwen batched DeltaNet g/beta")?;
+    enc.memory_barrier();
+
+    let attn_out_buf = alloc_f32(slot_ids.len() * v_sp, "recurrent output activations")?;
+    let gdn_params = GatedDeltaNetParams {
+        d_k,
+        d_v,
+        n_k_heads,
+        n_v_heads,
+        n_tokens: 1,
+        n_seqs,
+    };
+    let mut gdn_params_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        9 * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![9],
+    )
+    .map_err(|error| anyhow!("Qwen batched DeltaNet recurrent params allocation: {error}"))?;
+    gdn_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched DeltaNet recurrent params: {error}"))?
+        .copy_from_slice(&[d_k, d_v, n_k_heads, n_v_heads, 1, n_seqs, 0, 0, 0]);
+    dispatch_gated_delta_net_decode(
+        enc,
+        registry,
+        device.metal_device(),
+        &q_scaled,
+        &k_normed,
+        &v_gpu,
+        &g_buf,
+        &beta_buf,
+        &batch_recurrent_in,
+        &attn_out_buf,
+        &batch_recurrent_out,
+        &gdn_params_buf,
+        gdn_params,
+    )
+    .context("Qwen batched DeltaNet recurrent update")?;
+    enc.memory_barrier();
+    for (row, slot_id) in slot_ids.iter().copied().enumerate() {
+        let (_, recurrent_write) = state_slot.recurrent_bufs_for_slot(slot_id);
+        let (recurrent_offset, recurrent_elements) =
+            slot_recurrent_region(slot_id, d_k, d_v, n_v_heads);
+        let recurrent_write = recurrent_write.slice_view(recurrent_offset, recurrent_elements);
+        dispatch_copy_f32(
+            enc,
+            registry,
+            device.metal_device(),
+            &batch_recurrent_out,
+            &recurrent_write,
+            row * recurrent_per_seq,
+            0,
+            recurrent_per_seq,
+        )
+        .context("scatter Qwen batched DeltaNet recurrent state")?;
+    }
+    enc.memory_barrier();
+
+    let rows_op8 = seq_len * n_v_heads;
+    let gated_buf = alloc_f32((rows_op8 * d_v) as usize, "gated output")?;
+    let mut op8_params = super::decode_pool::pooled_alloc_buffer(
+        device,
+        2 * std::mem::size_of::<f32>(),
+        DType::F32,
+        vec![2],
+    )
+    .map_err(|error| anyhow!("Qwen batched DeltaNet norm/gate params allocation: {error}"))?;
+    op8_params
+        .as_mut_slice::<f32>()
+        .map_err(|error| anyhow!("Qwen batched DeltaNet norm/gate params: {error}"))?
+        .copy_from_slice(&[rms_norm_eps, d_v as f32]);
+    dispatch_ssm_norm_gate(
+        enc,
+        registry,
+        device.metal_device(),
+        &attn_out_buf,
+        &weights.ssm_norm,
+        &z,
+        &gated_buf,
+        &op8_params,
+        rows_op8,
+        d_v,
+    )
+    .context("Qwen batched DeltaNet norm/gate")?;
+    enc.memory_barrier();
+    apply_proj_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &gated_buf,
+        &weights.ssm_out,
+        weights.ssm_out_ggml_type,
+        seq_len,
+        z_channels,
+        hidden_size,
+    )
+}
+
 // ================================================================
 // Tests
 // ================================================================
@@ -4819,6 +5217,35 @@ mod tests {
             d_v: 8,
             conv_kernel: 4,
             rms_norm_eps: 1e-6,
+        }
+    }
+
+    #[test]
+    fn physical_batch_slot_regions_are_disjoint_and_byte_addressed() {
+        let qkv_channels = 128_u32;
+        let k_minus_one = 3_u32;
+        let d_k = 32_u32;
+        let d_v = 64_u32;
+        let n_v_heads = 4_u32;
+        let conv_elements = (qkv_channels * k_minus_one) as usize;
+        let recurrent_elements = (d_k * d_v * n_v_heads) as usize;
+
+        for slot in [0_u32, 3, 15] {
+            let (conv_offset, conv_len) =
+                slot_conv_state_region(SlotId(slot), qkv_channels, k_minus_one);
+            assert_eq!(conv_len, conv_elements);
+            assert_eq!(
+                conv_offset,
+                slot as u64 * conv_elements as u64 * std::mem::size_of::<f32>() as u64
+            );
+
+            let (recurrent_offset, recurrent_len) =
+                slot_recurrent_region(SlotId(slot), d_k, d_v, n_v_heads);
+            assert_eq!(recurrent_len, recurrent_elements);
+            assert_eq!(
+                recurrent_offset,
+                slot as u64 * recurrent_elements as u64 * std::mem::size_of::<f32>() as u64
+            );
         }
     }
 

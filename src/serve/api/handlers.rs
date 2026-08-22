@@ -8224,6 +8224,53 @@ fn build_kv_counter_block(
 ///   - `hf2q_sse_cancellations`           (counter)
 ///   - `hf2q_decode_tokens_total`         (counter)
 ///   - `hf2q_prompt_tokens_total`         (counter)
+fn format_qwen_decode_physical_metrics(
+    qwen_decode: crate::inference::models::qwen35::decode_observation::Qwen35DecodeObservationSnapshot,
+) -> String {
+    format!(
+        "# HELP hf2q_qwen_decode_scheduler_steps_total Qwen scheduler decode steps observed.\n\
+# TYPE hf2q_qwen_decode_scheduler_steps_total counter\n\
+hf2q_qwen_decode_scheduler_steps_total {}\n\
+# HELP hf2q_qwen_decode_scheduler_handles_total Qwen decode handles selected by scheduler steps; this does not imply physical GPU batching.\n\
+# TYPE hf2q_qwen_decode_scheduler_handles_total counter\n\
+hf2q_qwen_decode_scheduler_handles_total {}\n\
+# HELP hf2q_qwen_decode_scheduler_max_width Largest Qwen scheduler decode-handle set observed.\n\
+# TYPE hf2q_qwen_decode_scheduler_max_width gauge\n\
+hf2q_qwen_decode_scheduler_max_width {}\n\
+# HELP hf2q_qwen_decode_ordinary_target_forwards_total Physical ordinary Qwen target forward invocations; speculative verification is excluded.\n\
+# TYPE hf2q_qwen_decode_ordinary_target_forwards_total counter\n\
+hf2q_qwen_decode_ordinary_target_forwards_total {}\n\
+# HELP hf2q_qwen_decode_ordinary_target_body_rows_total Rows encoded by physical ordinary Qwen target-body forwards.\n\
+# TYPE hf2q_qwen_decode_ordinary_target_body_rows_total counter\n\
+hf2q_qwen_decode_ordinary_target_body_rows_total {}\n\
+# HELP hf2q_qwen_decode_ordinary_target_body_max_width Largest physical ordinary Qwen target-body row width observed.\n\
+# TYPE hf2q_qwen_decode_ordinary_target_body_max_width gauge\n\
+hf2q_qwen_decode_ordinary_target_body_max_width {}\n\
+# HELP hf2q_qwen_decode_ordinary_target_head_rows_total Rows encoded by physical ordinary Qwen output-head forwards.\n\
+# TYPE hf2q_qwen_decode_ordinary_target_head_rows_total counter\n\
+hf2q_qwen_decode_ordinary_target_head_rows_total {}\n\
+# HELP hf2q_qwen_decode_ordinary_target_head_max_width Largest physical ordinary Qwen output-head row width observed.\n\
+# TYPE hf2q_qwen_decode_ordinary_target_head_max_width gauge\n\
+hf2q_qwen_decode_ordinary_target_head_max_width {}\n\
+# HELP hf2q_qwen_decode_ordinary_command_buffers_created_total Metal command buffers created by observed ordinary Qwen target forwards; this is not a submission count.\n\
+# TYPE hf2q_qwen_decode_ordinary_command_buffers_created_total counter\n\
+hf2q_qwen_decode_ordinary_command_buffers_created_total {}\n\
+# HELP hf2q_qwen_decode_ordinary_command_buffer_submissions_total Metal command buffers actually committed during observed ordinary Qwen target forwards.\n\
+# TYPE hf2q_qwen_decode_ordinary_command_buffer_submissions_total counter\n\
+hf2q_qwen_decode_ordinary_command_buffer_submissions_total {}\n",
+        qwen_decode.scheduler_steps,
+        qwen_decode.scheduler_handles,
+        qwen_decode.scheduler_max_width,
+        qwen_decode.target_forwards,
+        qwen_decode.target_body_rows,
+        qwen_decode.target_body_max_width,
+        qwen_decode.target_head_rows,
+        qwen_decode.target_head_max_width,
+        qwen_decode.command_buffers_created,
+        qwen_decode.command_buffer_submissions,
+    )
+}
+
 pub async fn metrics(State(state): State<AppState>) -> Response {
     use std::sync::atomic::Ordering;
     let m = &state.metrics;
@@ -8473,6 +8520,9 @@ hf2q_qwen_history_lookup_no_match_total {}\n",
             / 1_000_000_000.0,
         qwen_mtp.history_lookup_no_match.load(Ordering::Relaxed),
     );
+    let qwen_decode_physical = format_qwen_decode_physical_metrics(
+        crate::inference::models::qwen35::decode_observation::snapshot(),
+    );
 
     let body = format!(
         "\
@@ -8562,6 +8612,7 @@ hf2q_qwen_mtp_fallback_requests_total {qwen_mtp_fallbacks}\n\
 # TYPE hf2q_qwen_mtp_conversation_resets_total counter\n\
 hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
 {qwen_speculation_proposers}\
+{qwen_decode_physical}\
 ",
         uptime = state.uptime_seconds(),
         ready = ready,
@@ -8594,6 +8645,7 @@ hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
         qwen_mtp_fallback_reasons = qwen_mtp_fallback_reasons,
         qwen_mtp_resets = qwen_mtp.conversation_resets.load(Ordering::Relaxed),
         qwen_speculation_proposers = qwen_speculation_proposers,
+        qwen_decode_physical = qwen_decode_physical,
     );
     // Prometheus exposition format: text/plain with a versioned content-type.
     let mut resp = (StatusCode::OK, body).into_response();
@@ -9202,6 +9254,34 @@ pub(crate) fn test_scan(dir: &Path) -> std::io::Result<Vec<ModelObject>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_physical_metrics_keep_creation_and_submission_counts_distinct() {
+        let rendered = format_qwen_decode_physical_metrics(
+            crate::inference::models::qwen35::decode_observation::Qwen35DecodeObservationSnapshot {
+                scheduler_steps: 1,
+                scheduler_handles: 4,
+                scheduler_max_width: 4,
+                target_forwards: 1,
+                target_body_rows: 4,
+                target_body_max_width: 4,
+                target_head_rows: 4,
+                target_head_max_width: 4,
+                command_buffers_created: 6,
+                command_buffer_submissions: 2,
+            },
+        );
+        assert!(rendered.contains("hf2q_qwen_decode_ordinary_command_buffers_created_total 6\n"));
+        assert!(rendered.contains("hf2q_qwen_decode_ordinary_command_buffer_submissions_total 2\n"));
+        assert!(
+            rendered.contains("this is not a submission count"),
+            "HELP text must distinguish creation from submission"
+        );
+        assert!(
+            rendered.contains("actually committed"),
+            "submission metric must be bound to the commit primitive"
+        );
+    }
 
     #[test]
     fn prefill_rate_counts_only_uncached_work() {

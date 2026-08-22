@@ -50,8 +50,8 @@ use super::encoder_stage::LayerEncoder;
 use super::ffn::{DenseFfnShape, MoeFfnShape};
 use super::full_attn::FullAttnShape;
 use super::gpu_delta_net::{
-    build_delta_net_layer, build_delta_net_layer_decode_into, build_delta_net_layer_with_arena,
-    DeltaNetWeightsGpu,
+    build_delta_net_layer, build_delta_net_layer_decode_batched_into,
+    build_delta_net_layer_decode_into, build_delta_net_layer_with_arena, DeltaNetWeightsGpu,
 };
 use super::gpu_ffn::{
     build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into,
@@ -61,9 +61,10 @@ use super::gpu_ffn::{
     MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
-    apply_gated_attn_layer_decode_into, apply_linear_projection_f32_into_with_ggml_type,
-    apply_linear_projection_f32_with_ggml_type, build_gated_attn_layer, download_f32, upload_f32,
-    upload_f32_into, upload_f32_weight, FullAttnWeightsGpu,
+    apply_gated_attn_layer_decode_batched_into, apply_gated_attn_layer_decode_into,
+    apply_linear_projection_f32_into_with_ggml_type, apply_linear_projection_f32_with_ggml_type,
+    build_gated_attn_layer, download_f32, upload_f32, upload_f32_into, upload_f32_weight,
+    FullAttnWeightsGpu,
 };
 use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
@@ -279,17 +280,19 @@ enum OutputHeadMode {
     },
 }
 
-/// Pre-allocated decode buffers for `forward_gpu_greedy` (seq_len == 1).
+/// Pre-allocated decode buffers for one physical greedy target width.
 ///
-/// All buffers have fixed shape `[1, hidden_size]` for single-token decode.
-/// Reusing these across decode tokens eliminates ~80 Metal `newBuffer` calls
-/// per token (2 per layer × 40 layers), saving ~1ms/token CPU overhead.
+/// The cache is rebuilt only when the active physical width changes. Reusing
+/// it at a stable width eliminates the per-step Metal allocations for both the
+/// scalar path and the width-N ordinary-decode path.
 struct DecodeBuffers {
-    /// Token embedding scratch: `[1, hidden_size]` F32 (CPU gather → upload here).
+    /// Exact physical row width represented by every row-shaped buffer.
+    width: usize,
+    /// Token embedding scratch: `[width, hidden_size]` F32.
     /// Avoids one Metal `newBuffer` + `memcpy` per decode token for embedding.
     embed_buf: MlxBuffer,
     /// Per-layer scratch pair (ffn_input_buf, ffn_residual_buf).
-    /// One pair per layer: `layer_scratch[i] = ([1,H], [1,H])`.
+    /// One pair per layer: `layer_scratch[i] = ([width,H], [width,H])`.
     /// These are safe to pre-allocate per-layer because each layer's
     /// fused_norm writes into layer_scratch[i].0/.1, then FFN reads
     /// only from layer_scratch[i].0 (and adds layer_scratch[i].1 as
@@ -297,17 +300,17 @@ struct DecodeBuffers {
     /// writes into layer_scratch[i+1].0/.1 while layer i's FFN is
     /// still executing — these are DIFFERENT buffers, so no conflict.
     layer_scratch: Vec<(MlxBuffer, MlxBuffer)>,
-    /// Output-head normed: `[1, hidden_size]` F32.
+    /// Output-head normed: `[width, hidden_size]` F32.
     norm_out_buf: MlxBuffer,
-    /// Argmax output index: `[1]` U32.
+    /// Argmax output index: `[width]` U32.
     argmax_index_buf: MlxBuffer,
-    /// Argmax output value: `[1]` F32.
+    /// Argmax output value: `[width]` F32.
     argmax_value_buf: MlxBuffer,
     /// Argmax params: `[1]` U32 (holds vocab_size).
     argmax_params_buf: MlxBuffer,
     /// Output norm params: `[2]` F32 (eps, hidden_size_f32).
     norm_params_buf: MlxBuffer,
-    /// Logits scratch: `[1, vocab_size]` F32 — lm_head output.
+    /// Logits scratch: `[width, vocab_size]` F32 — lm_head output.
     /// Pre-allocated to avoid ~600KB Metal `newBuffer` per decode token.
     logits_buf: MlxBuffer,
 }
@@ -1966,6 +1969,7 @@ fn apply_output_head_gpu_greedy(
         head,
         hidden_size,
         vocab_size,
+        1,
         normed,
         norm_params,
         &out_index,
@@ -2004,6 +2008,47 @@ fn apply_output_head_gpu_greedy(
     Ok(token_id)
 }
 
+fn apply_output_head_gpu_greedy_batched(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    hidden_size: u32,
+    vocab_size: u32,
+    bufs: &DecodeBuffers,
+) -> Result<Vec<u32>> {
+    let width = u32::try_from(bufs.width).context("Qwen batched output-head width overflow")?;
+    anyhow::ensure!(width >= 2, "Qwen batched output head requires width >= 2");
+    let logits_buf = logits_buf_mut(bufs);
+    apply_output_head_gpu_greedy_into(
+        None,
+        device,
+        registry,
+        hidden,
+        head,
+        hidden_size,
+        vocab_size,
+        width,
+        &bufs.norm_out_buf,
+        &bufs.norm_params_buf,
+        &bufs.argmax_index_buf,
+        &bufs.argmax_value_buf,
+        &bufs.argmax_params_buf,
+        logits_buf,
+    )?;
+    let indices = bufs
+        .argmax_index_buf
+        .as_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched argmax index read: {error}"))?;
+    anyhow::ensure!(
+        indices.len() >= bufs.width,
+        "Qwen batched argmax returned {} rows for width {}",
+        indices.len(),
+        bufs.width
+    );
+    Ok(indices[..bufs.width].to_vec())
+}
+
 /// Caller-driven single-CB output head (norm + lm_head + argmax).
 ///
 /// ADR-015 P3 Stage 1 (S1): when `caller_enc` is `Some`, the dispatches
@@ -2028,6 +2073,7 @@ fn apply_output_head_gpu_greedy_into(
     head: &OutputHeadGpu,
     hidden_size: u32,
     vocab_size: u32,
+    seq_len: u32,
     normed: &MlxBuffer,
     norm_params: &MlxBuffer,
     out_index: &MlxBuffer,
@@ -2035,8 +2081,6 @@ fn apply_output_head_gpu_greedy_into(
     argmax_params: &MlxBuffer,
     logits_buf: &mut MlxBuffer,
 ) -> Result<()> {
-    let seq_len = 1u32;
-
     // Helper: encode the 3-stage output head into a given encoder.
     fn encode_into(
         enc: &mut mlx_native::CommandEncoder,
@@ -2089,18 +2133,28 @@ fn apply_output_head_gpu_greedy_into(
         // legacy CB boundary at forward_gpu.rs:410→:413.
         enc.memory_barrier();
 
-        // Stage 3: argmax → out_index, out_value.
-        dispatch_argmax_f32(
-            enc,
-            registry,
-            device.metal_device(),
-            logits_buf,
-            out_index,
-            out_value,
-            argmax_params,
-            vocab_size,
-        )
-        .context("dispatch_argmax_f32 greedy (single-CB)")?;
+        // Stage 3: one independent argmax per physical row. The output-head
+        // projection above remains one true `m=seq_len` operation; these tiny
+        // reductions preserve the scalar kernel's exact tie-break.
+        for row in 0..seq_len as usize {
+            let logits_row = logits_buf.slice_view(
+                (row * vocab_size as usize * std::mem::size_of::<f32>()) as u64,
+                vocab_size as usize,
+            );
+            let index_row = out_index.slice_view((row * std::mem::size_of::<u32>()) as u64, 1);
+            let value_row = out_value.slice_view((row * std::mem::size_of::<f32>()) as u64, 1);
+            dispatch_argmax_f32(
+                enc,
+                registry,
+                device.metal_device(),
+                &logits_row,
+                &index_row,
+                &value_row,
+                argmax_params,
+                vocab_size,
+            )
+            .context("dispatch_argmax_f32 greedy row")?;
+        }
         Ok(())
     }
 
@@ -6180,6 +6234,58 @@ impl Qwen35Model {
     /// callsites receive `slot_id` verbatim; the kernel-dispatcher
     /// bounds check inherited from B4a-cont fires BEFORE any GPU
     /// allocation runs.
+    /// Side-effect-free admission gate for the first physical multi-slot
+    /// target path. Unsupported cohorts must remain on independent scalar
+    /// forwards; in particular this path never widens capture/speculative
+    /// state or non-native cache/FFN variants implicitly.
+    pub fn can_forward_gpu_greedy_multi_slot(
+        &self,
+        kv_cache: &HybridKvCache,
+        slot_ids: &[SlotId],
+    ) -> bool {
+        if !(2..=16).contains(&slot_ids.len())
+            || kv_cache.la_capture_active()
+            || self.cfg.moe.is_some()
+            || !matches!(self.cfg.head_dim, 256 | 512)
+            || std::env::var_os("HF2Q_LEGACY_PER_LAYER_CB")
+                .map(|value| value == "1")
+                .unwrap_or(false)
+            || self.layers.iter().any(|layer| {
+                !matches!(
+                    layer.ffn(),
+                    Qwen35FfnWeights::DenseQ(_) | Qwen35FfnWeights::Dense(_)
+                )
+            })
+            || kv_cache.full_attn.is_empty()
+            || kv_cache.full_attn.iter().any(|slot| slot.tq.is_none())
+        {
+            return false;
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut common_cursor = None;
+        for slot_id in slot_ids {
+            let slot_idx = slot_id.0 as usize;
+            if slot_id.0 >= kv_cache.n_seqs || !seen.insert(slot_id.0) {
+                return false;
+            }
+            for full in &kv_cache.full_attn {
+                let Some(&cursor) = full.current_len.get(slot_idx) else {
+                    return false;
+                };
+                if cursor >= kv_cache.max_seq_len {
+                    return false;
+                }
+                match common_cursor {
+                    None => common_cursor = Some(cursor),
+                    Some(expected) if expected == cursor => {}
+                    Some(_) => return false,
+                }
+            }
+        }
+        true
+    }
+
     pub fn forward_gpu_greedy(
         &self,
         tokens: &[u32],
@@ -6191,13 +6297,70 @@ impl Qwen35Model {
         // :5380 + :5716) now receive `slot_id` verbatim.
         slot_id: SlotId,
     ) -> Result<u32> {
-        debug_assert_eq!(
-            tokens.len(),
-            1,
-            "forward_gpu_greedy: tokens must be length 1"
+        let mut output = self.forward_gpu_greedy_multi_slot(
+            tokens,
+            positions_flat,
+            kv_cache,
+            std::slice::from_ref(&slot_id),
+        )?;
+        anyhow::ensure!(
+            output.len() == 1,
+            "Qwen scalar greedy forward returned {} tokens",
+            output.len()
         );
+        Ok(output.remove(0))
+    }
+
+    /// One ordinary greedy target invocation over independent physical slots.
+    ///
+    /// Width one is exactly the established scalar path. Widths two through
+    /// sixteen use one `[N, hidden]` body and one `[N, vocab]` output projection.
+    /// Full-attention and DeltaNet state are selected by the explicit
+    /// `slot_ids` row map; unsupported cache/FFN/cursor shapes return before
+    /// any GPU allocation or cache mutation so the server can fall back to
+    /// scalar decode.
+    pub fn forward_gpu_greedy_multi_slot(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        slot_ids: &[SlotId],
+    ) -> Result<Vec<u32>> {
         if tokens.is_empty() {
-            return Err(anyhow!("forward_gpu_greedy: tokens must be non-empty"));
+            return Err(anyhow!(
+                "forward_gpu_greedy_multi_slot: tokens must be non-empty"
+            ));
+        }
+        anyhow::ensure!(
+            tokens.len() == slot_ids.len(),
+            "forward_gpu_greedy_multi_slot: tokens {} != slot_ids {}",
+            tokens.len(),
+            slot_ids.len()
+        );
+        anyhow::ensure!(
+            tokens.len() <= 16,
+            "forward_gpu_greedy_multi_slot: width {} exceeds proven maximum 16",
+            tokens.len()
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for slot_id in slot_ids {
+            anyhow::ensure!(
+                slot_id.0 < kv_cache.n_seqs,
+                "forward_gpu_greedy_multi_slot: slot {} outside n_seqs {}",
+                slot_id.0,
+                kv_cache.n_seqs
+            );
+            anyhow::ensure!(
+                seen.insert(slot_id.0),
+                "forward_gpu_greedy_multi_slot: duplicate slot {}",
+                slot_id.0
+            );
+        }
+        if tokens.len() > 1 {
+            anyhow::ensure!(
+                self.can_forward_gpu_greedy_multi_slot(kv_cache, slot_ids),
+                "forward_gpu_greedy_multi_slot: physical batch preconditions not met"
+            );
         }
         // Reset the thread-local arena pool at the top of every decode token.
         // Layer dispatch helpers (build_delta_net_layer, build_moe_ffn_layer_gpu_q,
@@ -6211,7 +6374,7 @@ impl Qwen35Model {
         let expected_pos_len = 4 * seq_len as usize;
         if positions_flat.len() != expected_pos_len {
             return Err(anyhow!(
-                "forward_gpu_greedy: positions_flat.len() = {} != 4 * seq_len = {}",
+                "forward_gpu_greedy_multi_slot: positions_flat.len() = {} != 4 * seq_len = {}",
                 positions_flat.len(),
                 expected_pos_len
             ));
@@ -6280,40 +6443,44 @@ impl Qwen35Model {
             Ok(())
         })?;
 
-        // ---- Lazy-init decode buffer pool (first greedy call only) ----
-        // Pre-allocates fixed-shape buffers reused every decode token:
+        // ---- Lazy-init decode buffer pool (first call at this width) ----
+        // Pre-allocates fixed-shape buffers reused while physical width is stable:
         //   embed_buf, ffn_input_buf, ffn_residual_buf, norm_out_buf,
         //   argmax_index, argmax_value, argmax_params, norm_params.
         // Eliminates ~80 Metal newBuffer calls per token (~1ms CPU overhead).
         GPU_CACHE.with(|cell| -> Result<()> {
             let mut cache = cell.borrow_mut();
             let c = cache.as_mut().unwrap();
-            if c.decode_bufs.is_none() {
+            let width = tokens.len();
+            if c.decode_bufs.as_ref().map(|bufs| bufs.width) != Some(width) {
                 let h = cfg.hidden_size as usize;
                 let vocab_size = cfg.vocab_size as u32;
                 let n_layers = self.layers.len();
+                let rows_h = width
+                    .checked_mul(h)
+                    .ok_or_else(|| anyhow!("decode buffer width overflow"))?;
                 let alloc4 =
                     |dev: &MlxDevice, elem: usize, shape: Vec<usize>| -> Result<MlxBuffer> {
                         dev.alloc_buffer(elem * 4, DType::F32, shape)
                             .map_err(|e| anyhow!("alloc decode buf: {e}"))
                     };
                 // Embedding scratch: CPU gather writes here each decode token.
-                let embed_buf = alloc4(&c.device, h, vec![1, h])?;
+                let embed_buf = alloc4(&c.device, rows_h, vec![width, h])?;
                 // Per-layer scratch: one (ffn_input, ffn_residual) pair per layer.
                 let mut layer_scratch = Vec::with_capacity(n_layers);
                 for _ in 0..n_layers {
-                    let fi = alloc4(&c.device, h, vec![1, h])?;
-                    let fr = alloc4(&c.device, h, vec![1, h])?;
+                    let fi = alloc4(&c.device, rows_h, vec![width, h])?;
+                    let fr = alloc4(&c.device, rows_h, vec![width, h])?;
                     layer_scratch.push((fi, fr));
                 }
-                let norm_out_buf = alloc4(&c.device, h, vec![1, h])?;
+                let norm_out_buf = alloc4(&c.device, rows_h, vec![width, h])?;
                 let argmax_index_buf = c
                     .device
-                    .alloc_buffer(4, DType::U32, vec![1])
+                    .alloc_buffer(width * 4, DType::U32, vec![width])
                     .map_err(|e| anyhow!("alloc argmax_index: {e}"))?;
                 let argmax_value_buf = c
                     .device
-                    .alloc_buffer(4, DType::F32, vec![1])
+                    .alloc_buffer(width * 4, DType::F32, vec![width])
                     .map_err(|e| anyhow!("alloc argmax_value: {e}"))?;
                 let mut argmax_params_buf = c
                     .device
@@ -6334,9 +6501,13 @@ impl Qwen35Model {
                     s[1] = cfg.hidden_size as f32;
                 }
                 // Logits scratch: pre-allocate once to avoid ~600KB newBuffer per decode token.
-                let logits_buf =
-                    alloc4(&c.device, vocab_size as usize, vec![1, vocab_size as usize])?;
+                let logits_buf = alloc4(
+                    &c.device,
+                    width * vocab_size as usize,
+                    vec![width, vocab_size as usize],
+                )?;
                 c.decode_bufs = Some(DecodeBuffers {
+                    width,
                     embed_buf,
                     layer_scratch,
                     norm_out_buf,
@@ -6683,129 +6854,157 @@ impl Qwen35Model {
                         };
                         let max_seq = kv_cache.max_seq_len;
                         let slot = &mut kv_cache.full_attn[full_attn_rank];
-                        apply_gated_attn_layer_decode_into(
-                            enc,
-                            &device,
-                            &mut registry,
-                            &hidden,
-                            &pos_buf,
-                            attn,
-                            slot,
-                            max_seq,
-                            seq_len,
-                            shape.hidden_size,
-                            shape.n_head,
-                            shape.n_kv,
-                            shape.head_dim,
-                            shape.rotary_dim,
-                            shape.rope_theta,
-                            shape.mrope_section,
-                            shape.rms_norm_eps,
-                            // ADR-040 Phase B4d (2026-05-30, this iter)
-                            // — greedy decode-entry FA dispatch now
-                            // routes through `slot_id` (was hard-coded
-                            // SlotId(0) per B4a-cont/B4b deferral).
-                            // `SlotId(0)` is byte-identical to pre-B4d
-                            // (pinned by H168); `SlotId(N>0)` rebases
-                            // the per-layer K/V slot via the
-                            // B4a-cont's `slice_view` discipline at
-                            // `gpu_full_attn.rs::slot_k_v_region_for_full_attn`.
-                            slot_id,
-                        )
-                        .with_context(|| format!("full_attn single-cb layer {layer_idx}"))?
+                        if seq_len == 1 {
+                            apply_gated_attn_layer_decode_into(
+                                enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                &pos_buf,
+                                attn,
+                                slot,
+                                max_seq,
+                                seq_len,
+                                shape.hidden_size,
+                                shape.n_head,
+                                shape.n_kv,
+                                shape.head_dim,
+                                shape.rotary_dim,
+                                shape.rope_theta,
+                                shape.mrope_section,
+                                shape.rms_norm_eps,
+                                slot_ids[0],
+                            )
+                            .with_context(|| format!("full_attn single-cb layer {layer_idx}"))?
+                        } else {
+                            apply_gated_attn_layer_decode_batched_into(
+                                enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                &pos_buf,
+                                attn,
+                                slot,
+                                max_seq,
+                                slot_ids,
+                                shape.hidden_size,
+                                shape.n_head,
+                                shape.n_kv,
+                                shape.head_dim,
+                                shape.rotary_dim,
+                                shape.rope_theta,
+                                shape.mrope_section,
+                                shape.rms_norm_eps,
+                            )
+                            .with_context(|| {
+                                format!("full_attn physical batch layer {layer_idx}")
+                            })?
+                        }
                     }
                     LayerWeightsGpu::LinearAttn { attn, .. } => {
                         let shape = DeltaNetLayerShape::from_config(cfg);
-                        let km1 = (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
-                        let qkv_channels = shape.qkv_channels() as usize;
-                        let rec_size = (cfg.linear_key_head_dim
-                            * cfg.linear_value_head_dim
-                            * cfg.linear_num_value_heads)
-                            as usize;
-
-                        let linear_slot_idx = match kv_cache.slot_index_for_layer(layer_idx as u32)
-                        {
-                            Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
-                            _ => usize::MAX,
-                        };
-
-                        let zero_conv_in: MlxBuffer;
-                        let zero_conv_out: MlxBuffer;
-                        let zero_rec_buf_in: MlxBuffer;
-                        let zero_rec_buf_out: MlxBuffer;
-                        let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref): (
-                            &MlxBuffer,
-                            &MlxBuffer,
-                            &MlxBuffer,
-                            &MlxBuffer,
-                        ) = if linear_slot_idx != usize::MAX {
-                            let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            // ADR-040 M-QWEN: parity-aware per-slot
-                            // (current, scratch) selection — the named
-                            // fields are NOT necessarily "current" for
-                            // this slot.
-                            let (conv_cur, conv_scr) = slot.conv_bufs_for_slot(slot_id);
-                            let (rec_cur, rec_scr) = slot.recurrent_bufs_for_slot(slot_id);
-                            (conv_cur, conv_scr, rec_cur, rec_scr)
-                        } else {
-                            let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
-                            let zero_rec_cpu = vec![0.0f32; rec_size];
-                            zero_conv_in = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_in")?;
-                            zero_conv_out = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_out")?;
-                            zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_in")?;
-                            zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_out")?;
-                            (
-                                &zero_conv_in,
-                                &zero_conv_out,
-                                &zero_rec_buf_in,
-                                &zero_rec_buf_out,
+                        if seq_len == 1 {
+                            let slot_id = slot_ids[0];
+                            let km1 =
+                                (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
+                            let qkv_channels = shape.qkv_channels() as usize;
+                            let rec_size = (cfg.linear_key_head_dim
+                                * cfg.linear_value_head_dim
+                                * cfg.linear_num_value_heads)
+                                as usize;
+                            let linear_slot_idx =
+                                match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                                    Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                                    _ => usize::MAX,
+                                };
+                            let zero_conv_in: MlxBuffer;
+                            let zero_conv_out: MlxBuffer;
+                            let zero_rec_buf_in: MlxBuffer;
+                            let zero_rec_buf_out: MlxBuffer;
+                            let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref) =
+                                if linear_slot_idx != usize::MAX {
+                                    let slot = &kv_cache.linear_attn[linear_slot_idx];
+                                    let (conv_cur, conv_scr) = slot.conv_bufs_for_slot(slot_id);
+                                    let (rec_cur, rec_scr) = slot.recurrent_bufs_for_slot(slot_id);
+                                    (conv_cur, conv_scr, rec_cur, rec_scr)
+                                } else {
+                                    let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
+                                    let zero_rec_cpu = vec![0.0f32; rec_size];
+                                    zero_conv_in = upload_f32(&zero_conv_cpu, &device)
+                                        .context("alloc zero conv state_in")?;
+                                    zero_conv_out = upload_f32(&zero_conv_cpu, &device)
+                                        .context("alloc zero conv state_out")?;
+                                    zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
+                                        .context("alloc zero recurrent state_in")?;
+                                    zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
+                                        .context("alloc zero recurrent state_out")?;
+                                    (
+                                        &zero_conv_in,
+                                        &zero_conv_out,
+                                        &zero_rec_buf_in,
+                                        &zero_rec_buf_out,
+                                    )
+                                };
+                            let out = build_delta_net_layer_decode_into(
+                                enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                attn,
+                                conv_in_ref,
+                                conv_out_ref,
+                                state_in_ref,
+                                state_out_ref,
+                                seq_len,
+                                shape.hidden_size,
+                                shape.n_k_heads,
+                                shape.n_v_heads,
+                                shape.d_k,
+                                shape.d_v,
+                                shape.conv_kernel,
+                                shape.rms_norm_eps,
+                                slot_id,
                             )
-                        };
-                        let out = build_delta_net_layer_decode_into(
-                            enc,
-                            &device,
-                            &mut registry,
-                            &hidden,
-                            attn,
-                            conv_in_ref,
-                            conv_out_ref,
-                            state_in_ref,
-                            state_out_ref,
-                            seq_len,
-                            shape.hidden_size,
-                            shape.n_k_heads,
-                            shape.n_v_heads,
-                            shape.d_k,
-                            shape.d_v,
-                            shape.conv_kernel,
-                            shape.rms_norm_eps,
-                            // ADR-040 Phase B4d (2026-05-30, this iter)
-                            // — greedy decode-entry DN dispatch now
-                            // routes through `slot_id` (was hard-coded
-                            // SlotId(0) per A2b-cont/B4d deferral).
-                            // `SlotId(0)` is byte-identical to pre-B4d
-                            // via A2b-cont's `narrow_la_ping_pong_to_slot`
-                            // helper (zero-copy `slice_view` at
-                            // offset 0 for slot 0); `SlotId(N>0)`
-                            // rebases the recurrent + conv_state
-                            // regions to slot N's per-slot byte offset.
-                            slot_id,
-                        )
-                        .with_context(|| format!("delta_net single-cb layer {layer_idx}"))?;
-
-                        if linear_slot_idx != usize::MAX {
+                            .with_context(|| format!("delta_net single-cb layer {layer_idx}"))?;
+                            if linear_slot_idx != usize::MAX {
+                                kv_cache.linear_attn[linear_slot_idx].swap_for_slot(slot_id);
+                            }
+                            out
+                        } else {
+                            let linear_slot_idx =
+                                match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                                    Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                                    _ => usize::MAX,
+                                };
+                            anyhow::ensure!(
+                                linear_slot_idx != usize::MAX,
+                                "physical Qwen decode requires a DeltaNet cache slot for layer {layer_idx}"
+                            );
                             let slot = &mut kv_cache.linear_attn[linear_slot_idx];
-                            // ADR-040 M-QWEN: per-slot parity flip (was a whole-buffer swap
-
-                            // that corrupted every OTHER active slot at N>=2 concurrent).
-
-                            slot.swap_for_slot(slot_id);
+                            let out = build_delta_net_layer_decode_batched_into(
+                                enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                attn,
+                                slot,
+                                slot_ids,
+                                shape.hidden_size,
+                                shape.n_k_heads,
+                                shape.n_v_heads,
+                                shape.d_k,
+                                shape.d_v,
+                                shape.conv_kernel,
+                                shape.rms_norm_eps,
+                            )
+                            .with_context(|| {
+                                format!("delta_net physical batch layer {layer_idx}")
+                            })?;
+                            for slot_id in slot_ids.iter().copied() {
+                                slot.swap_for_slot(slot_id);
+                            }
+                            out
                         }
-                        out
                     }
                 };
 
@@ -7010,151 +7209,210 @@ impl Qwen35Model {
                         };
                         let max_seq = kv_cache.max_seq_len;
                         let slot = &mut kv_cache.full_attn[full_attn_rank];
-                        build_gated_attn_layer(
-                            &device,
-                            &mut registry,
-                            &hidden,
-                            &pos_buf,
-                            attn,
-                            Some(slot),
-                            max_seq,
-                            seq_len,
-                            shape.hidden_size,
-                            shape.n_head,
-                            shape.n_kv,
-                            shape.head_dim,
-                            shape.rotary_dim,
-                            shape.rope_theta,
-                            shape.mrope_section,
-                            shape.rms_norm_eps,
-                            None,
-                            None,
-                            // iter92: decode path doesn't need K-batch
-                            // hold-vec (per-token GPU sync; no in-flight CB
-                            // spans the function-return boundary).
-                            None,
-                            // iter91: forward_gpu_greedy is the decode path
-                            // (seq_len == 1) and never engages the multi-layer
-                            // borrowed-session chain.  Pass None to take the
-                            // Plain CommandEncoder shape — byte-identical to
-                            // pre-iter91 behavior.
-                            None,
-                            // ADR-040 Phase B4d (2026-05-30, this iter)
-                            // — greedy legacy-FA dispatch now routes
-                            // through `slot_id` (was hard-coded
-                            // SlotId(0) per B4a-cont/B4d deferral).
-                            // Same `slice_view` discipline as the
-                            // single-CB FA path at :5302.
-                            slot_id,
-                        )
-                        .with_context(|| format!("full_attn legacy greedy layer {layer_idx}"))?
+                        if seq_len == 1 {
+                            build_gated_attn_layer(
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                &pos_buf,
+                                attn,
+                                Some(slot),
+                                max_seq,
+                                seq_len,
+                                shape.hidden_size,
+                                shape.n_head,
+                                shape.n_kv,
+                                shape.head_dim,
+                                shape.rotary_dim,
+                                shape.rope_theta,
+                                shape.mrope_section,
+                                shape.rms_norm_eps,
+                                None,
+                                None,
+                                None,
+                                None,
+                                slot_ids[0],
+                            )
+                            .with_context(|| format!("full_attn legacy greedy layer {layer_idx}"))?
+                        } else {
+                            let mut enc = device.command_encoder().with_context(|| {
+                                format!("enc full_attn physical batch layer {layer_idx}")
+                            })?;
+                            let out = apply_gated_attn_layer_decode_batched_into(
+                                &mut enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                &pos_buf,
+                                attn,
+                                slot,
+                                max_seq,
+                                slot_ids,
+                                shape.hidden_size,
+                                shape.n_head,
+                                shape.n_kv,
+                                shape.head_dim,
+                                shape.rotary_dim,
+                                shape.rope_theta,
+                                shape.mrope_section,
+                                shape.rms_norm_eps,
+                            )
+                            .with_context(|| {
+                                format!("full_attn physical batch layer {layer_idx}")
+                            })?;
+                            enc.commit_labeled("layer.full_attn.physical_batch");
+                            out
+                        }
                     }
                     LayerWeightsGpu::LinearAttn { attn, .. } => {
                         let shape = DeltaNetLayerShape::from_config(cfg);
-                        let km1 = (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
-                        let qkv_channels = shape.qkv_channels() as usize;
-                        let rec_size = (cfg.linear_key_head_dim
-                            * cfg.linear_value_head_dim
-                            * cfg.linear_num_value_heads)
-                            as usize;
-
-                        let linear_slot_idx = match kv_cache.slot_index_for_layer(layer_idx as u32)
-                        {
-                            Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
-                            _ => usize::MAX,
-                        };
-
-                        let zero_conv_in: MlxBuffer;
-                        let zero_conv_out: MlxBuffer;
-                        let zero_rec_buf_in: MlxBuffer;
-                        let zero_rec_buf_out: MlxBuffer;
-                        let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref): (
-                            &MlxBuffer,
-                            &MlxBuffer,
-                            &MlxBuffer,
-                            &MlxBuffer,
-                        ) = if linear_slot_idx != usize::MAX {
-                            let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            // ADR-040 M-QWEN: parity-aware per-slot
-                            // (current, scratch) selection — the named
-                            // fields are NOT necessarily "current" for
-                            // this slot.
-                            let (conv_cur, conv_scr) = slot.conv_bufs_for_slot(slot_id);
-                            let (rec_cur, rec_scr) = slot.recurrent_bufs_for_slot(slot_id);
-                            (conv_cur, conv_scr, rec_cur, rec_scr)
-                        } else {
-                            let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
-                            let zero_rec_cpu = vec![0.0f32; rec_size];
-                            zero_conv_in = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_in")?;
-                            zero_conv_out = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_out")?;
-                            zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_in")?;
-                            zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_out")?;
-                            (
-                                &zero_conv_in,
-                                &zero_conv_out,
-                                &zero_rec_buf_in,
-                                &zero_rec_buf_out,
-                            )
-                        };
-                        // ADR-034 task #90 Step 3+4c — same capture wire
-                        // as the main decode path above.
-                        let (state_capture_view, conv_capture_view): (
-                            Option<MlxBuffer>,
-                            Option<MlxBuffer>,
-                        ) = if linear_slot_idx != usize::MAX && kv_cache.la_capture_active() {
-                            let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            (
-                                slot.capture_states.clone(),
-                                slot.conv_capture_states.clone(),
-                            )
-                        } else {
-                            (None, None)
-                        };
-                        let state_capture_ref = state_capture_view.as_ref();
-                        let conv_capture_ref = conv_capture_view.as_ref();
-                        let out = build_delta_net_layer(
-                            &device,
-                            &mut registry,
-                            &hidden,
-                            attn,
-                            conv_in_ref,
-                            conv_out_ref,
-                            state_in_ref,
-                            state_out_ref,
-                            seq_len,
-                            shape.hidden_size,
-                            shape.n_k_heads,
-                            shape.n_v_heads,
-                            shape.d_k,
-                            shape.d_v,
-                            shape.conv_kernel,
-                            shape.rms_norm_eps,
-                            state_capture_ref,
-                            conv_capture_ref,
-                            // ADR-040 Phase B4d (2026-05-30, this iter)
-                            // — greedy legacy-DN dispatch now routes
-                            // through `slot_id` (was hard-coded
-                            // SlotId(0) per A2b-cont/B4d deferral).
-                            // Same `narrow_la_ping_pong_to_slot`
-                            // discipline as the single-CB DN path at
-                            // :5380.
-                            slot_id,
-                        )
-                        .with_context(|| format!("delta_net legacy greedy layer {layer_idx}"))?;
-
-                        if linear_slot_idx != usize::MAX {
+                        if seq_len > 1 {
+                            let linear_slot_idx =
+                                match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                                    Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                                    other => {
+                                        return Err(anyhow!(
+                                        "layer {layer_idx}: expected DeltaNet slot, got {other:?}"
+                                    ))
+                                    }
+                                };
                             let slot = &mut kv_cache.linear_attn[linear_slot_idx];
-                            // ADR-040 M-QWEN: per-slot parity flip (was a whole-buffer swap
+                            let mut enc = device.command_encoder().with_context(|| {
+                                format!("enc delta_net physical batch layer {layer_idx}")
+                            })?;
+                            let out = build_delta_net_layer_decode_batched_into(
+                                &mut enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                attn,
+                                slot,
+                                slot_ids,
+                                shape.hidden_size,
+                                shape.n_k_heads,
+                                shape.n_v_heads,
+                                shape.d_k,
+                                shape.d_v,
+                                shape.conv_kernel,
+                                shape.rms_norm_eps,
+                            )
+                            .with_context(|| {
+                                format!("delta_net physical batch layer {layer_idx}")
+                            })?;
+                            enc.commit_labeled("layer.delta_net.physical_batch");
+                            for slot_id in slot_ids.iter().copied() {
+                                slot.swap_for_slot(slot_id);
+                            }
+                            out
+                        } else {
+                            let km1 =
+                                (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
+                            let qkv_channels = shape.qkv_channels() as usize;
+                            let rec_size = (cfg.linear_key_head_dim
+                                * cfg.linear_value_head_dim
+                                * cfg.linear_num_value_heads)
+                                as usize;
 
-                            // that corrupted every OTHER active slot at N>=2 concurrent).
+                            let linear_slot_idx =
+                                match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                                    Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                                    _ => usize::MAX,
+                                };
 
-                            slot.swap_for_slot(slot_id);
+                            let zero_conv_in: MlxBuffer;
+                            let zero_conv_out: MlxBuffer;
+                            let zero_rec_buf_in: MlxBuffer;
+                            let zero_rec_buf_out: MlxBuffer;
+                            let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref): (
+                                &MlxBuffer,
+                                &MlxBuffer,
+                                &MlxBuffer,
+                                &MlxBuffer,
+                            ) = if linear_slot_idx != usize::MAX {
+                                let slot = &kv_cache.linear_attn[linear_slot_idx];
+                                // ADR-040 M-QWEN: parity-aware per-slot
+                                // (current, scratch) selection — the named
+                                // fields are NOT necessarily "current" for
+                                // this slot.
+                                let (conv_cur, conv_scr) = slot.conv_bufs_for_slot(slot_ids[0]);
+                                let (rec_cur, rec_scr) = slot.recurrent_bufs_for_slot(slot_ids[0]);
+                                (conv_cur, conv_scr, rec_cur, rec_scr)
+                            } else {
+                                let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
+                                let zero_rec_cpu = vec![0.0f32; rec_size];
+                                zero_conv_in = upload_f32(&zero_conv_cpu, &device)
+                                    .context("alloc zero conv state_in")?;
+                                zero_conv_out = upload_f32(&zero_conv_cpu, &device)
+                                    .context("alloc zero conv state_out")?;
+                                zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
+                                    .context("alloc zero recurrent state_in")?;
+                                zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
+                                    .context("alloc zero recurrent state_out")?;
+                                (
+                                    &zero_conv_in,
+                                    &zero_conv_out,
+                                    &zero_rec_buf_in,
+                                    &zero_rec_buf_out,
+                                )
+                            };
+                            // ADR-034 task #90 Step 3+4c — same capture wire
+                            // as the main decode path above.
+                            let (state_capture_view, conv_capture_view): (
+                                Option<MlxBuffer>,
+                                Option<MlxBuffer>,
+                            ) = if linear_slot_idx != usize::MAX && kv_cache.la_capture_active() {
+                                let slot = &kv_cache.linear_attn[linear_slot_idx];
+                                (
+                                    slot.capture_states.clone(),
+                                    slot.conv_capture_states.clone(),
+                                )
+                            } else {
+                                (None, None)
+                            };
+                            let state_capture_ref = state_capture_view.as_ref();
+                            let conv_capture_ref = conv_capture_view.as_ref();
+                            let out = build_delta_net_layer(
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                attn,
+                                conv_in_ref,
+                                conv_out_ref,
+                                state_in_ref,
+                                state_out_ref,
+                                seq_len,
+                                shape.hidden_size,
+                                shape.n_k_heads,
+                                shape.n_v_heads,
+                                shape.d_k,
+                                shape.d_v,
+                                shape.conv_kernel,
+                                shape.rms_norm_eps,
+                                state_capture_ref,
+                                conv_capture_ref,
+                                // ADR-040 Phase B4d (2026-05-30, this iter)
+                                // — greedy legacy-DN dispatch now routes
+                                // through `slot_id` (was hard-coded
+                                // SlotId(0) per A2b-cont/B4d deferral).
+                                // Same `narrow_la_ping_pong_to_slot`
+                                // discipline as the single-CB DN path at
+                                // :5380.
+                                slot_ids[0],
+                            )
+                            .with_context(|| {
+                                format!("delta_net legacy greedy layer {layer_idx}")
+                            })?;
+
+                            if linear_slot_idx != usize::MAX {
+                                let slot = &mut kv_cache.linear_attn[linear_slot_idx];
+                                // ADR-040 M-QWEN: per-slot parity flip (was a whole-buffer swap
+
+                                // that corrupted every OTHER active slot at N>=2 concurrent).
+
+                                slot.swap_for_slot(slot_ids[0]);
+                            }
+                            out
                         }
-                        out
                     }
                 };
 
@@ -7437,8 +7695,19 @@ impl Qwen35Model {
         } else {
             None
         };
-        let token_id = if legacy_per_layer_cb {
-            apply_output_head_gpu_greedy_legacy(
+        let token_ids = if seq_len > 1 {
+            apply_output_head_gpu_greedy_batched(
+                &device,
+                &mut registry,
+                &hidden,
+                &output_head,
+                h,
+                cfg.vocab_size,
+                &decode_bufs,
+            )
+            .context("apply_output_head_gpu_greedy_batched")?
+        } else if legacy_per_layer_cb {
+            vec![apply_output_head_gpu_greedy_legacy(
                 &device,
                 &mut registry,
                 &hidden,
@@ -7448,9 +7717,9 @@ impl Qwen35Model {
                 eps,
                 &decode_bufs,
             )
-            .context("apply_output_head_gpu_greedy_legacy")?
+            .context("apply_output_head_gpu_greedy_legacy")?]
         } else {
-            apply_output_head_gpu_greedy(
+            vec![apply_output_head_gpu_greedy(
                 &device,
                 &mut registry,
                 &hidden,
@@ -7460,7 +7729,7 @@ impl Qwen35Model {
                 eps,
                 &decode_bufs,
             )
-            .context("apply_output_head_gpu_greedy")?
+            .context("apply_output_head_gpu_greedy")?]
         };
         if let Some(t) = t_output_head {
             eprintln!(
@@ -7473,7 +7742,7 @@ impl Qwen35Model {
         // Profile mode is slow because labeled async commits become syncs.
         print_and_reset_cb_profile("forward_gpu_greedy");
 
-        Ok(token_id)
+        Ok(token_ids)
     }
 
     /// Upload all per-layer weights to GPU once, returning the GPU bundle vec.
@@ -8228,7 +8497,10 @@ mod tests {
 
     /// Build a tiny model with deterministic non-zero weights.
     fn tiny_hybrid_model_nonzero() -> Qwen35Model {
-        let cfg = tiny_hybrid_cfg();
+        deterministic_dense_model(tiny_hybrid_cfg())
+    }
+
+    fn deterministic_dense_model(cfg: Qwen35Config) -> Qwen35Model {
         let mut m = Qwen35Model::empty_from_cfg(cfg.clone());
 
         let mut seed = 0x1A2B_u32;
@@ -8343,6 +8615,162 @@ mod tests {
             }
         }
         flat
+    }
+
+    fn physical_batch_hybrid_cfg() -> Qwen35Config {
+        Qwen35Config {
+            variant: Qwen35Variant::Dense,
+            hidden_size: 256,
+            num_hidden_layers: 2,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 256,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            layer_types: vec![
+                Qwen35LayerKind::LinearAttention,
+                Qwen35LayerKind::FullAttention,
+            ],
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            rotary_dim: 64,
+            mrope_section: [16, 8, 8, 0],
+            mrope_interleaved: true,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 128,
+            vocab_size: 128,
+            attn_output_gate: true,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: true,
+            intermediate_size: Some(64),
+            moe: None,
+        }
+    }
+
+    #[test]
+    fn ordinary_physical_widths_match_independent_scalar_token_trajectories() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        if std::env::var_os("HF2Q_LEGACY_PER_LAYER_CB").is_some() {
+            return;
+        }
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let cfg = physical_batch_hybrid_cfg();
+        let model = deterministic_dense_model(cfg.clone());
+
+        for width in [2_usize, 4, 8, 16] {
+            let slot_ids: Vec<SlotId> = (0..width as u32).map(SlotId).collect();
+            let initial: Vec<u32> = (0..width as u32)
+                .map(|row| 3 + (row * 7) % (cfg.vocab_size - 3))
+                .collect();
+            let mut scalar_cache =
+                HybridKvCache::new_with_options(&cfg, &device, 32, width as u32, true)
+                    .expect("scalar TQ cache");
+            let mut scalar_inputs = initial.clone();
+            let mut scalar_steps = Vec::new();
+            for position in 0..3_i32 {
+                let mut predicted = Vec::with_capacity(width);
+                for row in 0..width {
+                    predicted.push(
+                        model
+                            .forward_gpu_greedy(
+                                &[scalar_inputs[row]],
+                                &[position; 4],
+                                &mut scalar_cache,
+                                slot_ids[row],
+                            )
+                            .expect("independent scalar target"),
+                    );
+                }
+                scalar_inputs.clone_from(&predicted);
+                scalar_steps.push(predicted);
+            }
+
+            let mut batch_cache =
+                HybridKvCache::new_with_options(&cfg, &device, 32, width as u32, true)
+                    .expect("physical TQ cache");
+            assert!(model.can_forward_gpu_greedy_multi_slot(&batch_cache, &slot_ids));
+            let mut batch_inputs = initial;
+            for position in 0..3_i32 {
+                let positions = vec![position; 4 * width];
+                let predicted = model
+                    .forward_gpu_greedy_multi_slot(
+                        &batch_inputs,
+                        &positions,
+                        &mut batch_cache,
+                        &slot_ids,
+                    )
+                    .expect("physical width-N target");
+                assert_eq!(
+                    predicted, scalar_steps[position as usize],
+                    "physical width {width} diverged at decode position {position}"
+                );
+                batch_inputs = predicted;
+            }
+
+            for (scalar, physical) in scalar_cache.full_attn.iter().zip(&batch_cache.full_attn) {
+                assert_eq!(scalar.current_len, physical.current_len);
+            }
+            for (scalar, physical) in scalar_cache
+                .linear_attn
+                .iter()
+                .zip(&batch_cache.linear_attn)
+            {
+                assert_eq!(scalar.pp_flipped, physical.pp_flipped);
+                let qkv_channels = 2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
+                    + cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+                let conv_per_slot =
+                    (qkv_channels * cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
+                let recurrent_per_slot = (cfg.linear_key_head_dim
+                    * cfg.linear_value_head_dim
+                    * cfg.linear_num_value_heads) as usize;
+                for slot_id in slot_ids.iter().copied() {
+                    let compare_current =
+                        |label: &str,
+                         scalar_buf: &MlxBuffer,
+                         physical_buf: &MlxBuffer,
+                         elements: usize| {
+                            let offset = slot_id.0 as u64
+                                * elements as u64
+                                * std::mem::size_of::<f32>() as u64;
+                            let scalar_view = scalar_buf.slice_view(offset, elements);
+                            let scalar_values =
+                                scalar_view.as_slice::<f32>().expect("scalar state view");
+                            let physical_view = physical_buf.slice_view(offset, elements);
+                            let physical_values = physical_view
+                                .as_slice::<f32>()
+                                .expect("physical state view");
+                            let max_abs = scalar_values
+                                .iter()
+                                .zip(physical_values)
+                                .map(|(left, right)| (left - right).abs())
+                                .fold(0.0_f32, f32::max);
+                            assert!(
+                                max_abs <= 5e-3,
+                                "physical width {width} slot {} {label} state drift {max_abs}",
+                                slot_id.0
+                            );
+                        };
+                    let (scalar_conv, _) = scalar.conv_bufs_for_slot(slot_id);
+                    let (physical_conv, _) = physical.conv_bufs_for_slot(slot_id);
+                    compare_current("convolution", scalar_conv, physical_conv, conv_per_slot);
+                    let (scalar_recurrent, _) = scalar.recurrent_bufs_for_slot(slot_id);
+                    let (physical_recurrent, _) = physical.recurrent_bufs_for_slot(slot_id);
+                    compare_current(
+                        "recurrent",
+                        scalar_recurrent,
+                        physical_recurrent,
+                        recurrent_per_slot,
+                    );
+                }
+            }
+        }
     }
 
     /// Zero-model smoke: `forward_gpu` returns the correct logits shape and

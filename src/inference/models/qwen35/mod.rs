@@ -27,6 +27,7 @@ use mlx_native::gguf::{GgufFile, MetadataValue};
 
 pub mod activation_capture_real;
 pub mod chunk_allocs_arena;
+pub(crate) mod decode_observation;
 pub mod decode_pool;
 pub mod delta_net;
 pub mod dense;
