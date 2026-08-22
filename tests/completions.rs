@@ -282,6 +282,86 @@ fn dynamic_protocol_is_public_semantic_and_side_effect_free() {
 }
 
 #[test]
+fn serve_model_completion_prefers_managed_models_and_keeps_explicit_paths() {
+    let home = IsolatedHome::new();
+    let models = home.path().join(".local/share/hf2q/models");
+    let qwen36 = models.join("qwen3.6");
+    let qwen38 = models.join("qwen3.8");
+    fs::create_dir_all(&qwen36).unwrap();
+    fs::create_dir_all(&qwen38).unwrap();
+
+    let decoder = qwen38.join("qwen38-hf2q-q4_k_m.gguf");
+    let projector = qwen38.join("qwen38-hf2q-q4_k_m-mmproj.gguf");
+    fs::write(&decoder, b"decoder").unwrap();
+    fs::write(&projector, b"projector").unwrap();
+
+    let directories = dynamic(&home, "zsh", 3, &["hf2q", "serve", "--model", ""]);
+    let directory_values = directories
+        .lines()
+        .map(dynamic_candidate_name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        directory_values,
+        [
+            format!("{}/", qwen36.display()),
+            format!("{}/", qwen38.display()),
+        ],
+        "{directories}"
+    );
+
+    let qwen38_prefix = format!("{}/", qwen38.display());
+    let model_files = dynamic(
+        &home,
+        "bash",
+        3,
+        &["hf2q", "serve", "--model", &qwen38_prefix],
+    );
+    let decoder = decoder.display().to_string();
+    let projector = projector.display().to_string();
+    assert!(
+        model_files.lines().any(|line| line == decoder.as_str()),
+        "{model_files}"
+    );
+    assert!(!model_files.contains("mmproj"), "{model_files}");
+
+    let mmproj_files = dynamic(
+        &home,
+        "fish",
+        3,
+        &["hf2q", "serve", "--mmproj", &qwen38_prefix],
+    );
+    assert!(
+        mmproj_files.lines().any(|line| line == projector.as_str()),
+        "{mmproj_files}"
+    );
+    assert!(!mmproj_files.lines().any(|line| line == decoder.as_str()));
+
+    let customer_dir = home.path().join("Desktop/customer-model");
+    fs::create_dir_all(&customer_dir).unwrap();
+    let customer_model = customer_dir.join("customer.gguf");
+    fs::write(&customer_model, b"customer").unwrap();
+    let customer_prefix = format!("{}/", customer_dir.display());
+    let customer_files = dynamic(
+        &home,
+        "powershell",
+        3,
+        &["hf2q", "serve", "--model", &customer_prefix],
+    );
+    assert!(
+        customer_files
+            .lines()
+            .any(|line| line == customer_model.display().to_string()),
+        "{customer_files}"
+    );
+
+    for path in home.registrations() {
+        assert!(!path.exists(), "completion wrote {}", path.display());
+    }
+    assert!(!home.receipt().exists());
+    assert!(!home.path().join(".zshrc").exists());
+}
+
+#[test]
 fn installed_bash_and_zsh_adapters_execute_real_tab_dispatch() {
     let home = IsolatedHome::new();
     let provision = home.command().arg("--version").output().unwrap();

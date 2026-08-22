@@ -12,6 +12,22 @@ new commands and values. Hidden installer, transfer, source-teacher, and
 process-lifeline surfaces are removed structurally before either dynamic or
 static completion is generated.
 
+For `hf2q serve --model` and `--mmproj`, an empty or bare-name completion starts
+under `${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models` rather than the shell's
+working directory. Directory candidates are ordered by name; decoder completion
+offers non-projector `.gguf` files, while projector completion offers `.gguf`
+files whose conventional filename contains `mmproj`. Returned candidates carry
+the full path, so selecting `qwen3.8/` produces a value that is valid from any
+working directory.
+
+An explicit path remains explicit. Values containing a path separator, including
+`Desktop/`, `./`, `../`, `~/`, and absolute paths, complete from that location.
+A bare name with no managed-model match falls back to the working directory.
+Completion only performs a bounded directory read: it does not create the model
+root, inspect GGUF contents, access the network, or initialize the inference
+runtime. Static completion snapshots retain ordinary shell filesystem completion;
+the managed-model preference is provided by hf2q's dynamic adapters.
+
 ## Managed locations
 
 - Bash: `${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}/completions/hf2q`.
