@@ -23,10 +23,11 @@ working directory.
 An explicit path remains explicit. Values containing a path separator, including
 `Desktop/`, `./`, `../`, `~/`, and absolute paths, complete from that location.
 A bare name with no managed-model match falls back to the working directory.
-Completion only performs a bounded directory read: it does not create the model
-root, inspect GGUF contents, access the network, or initialize the inference
-runtime. Static completion snapshots retain ordinary shell filesystem completion;
-the managed-model preference is provided by hf2q's dynamic adapters.
+Completion reads only the selected directory and returns at most 256 globally
+name-sorted candidates: it does not recurse, create the model root, inspect GGUF
+contents, access the network, or initialize the inference runtime. Static
+completion snapshots retain ordinary shell filesystem completion; the
+managed-model preference is provided by hf2q's dynamic adapters.
 
 ## Managed locations
 

@@ -11,7 +11,6 @@ use clap_complete::CompletionCandidate;
 
 use super::Cli;
 
-const MAX_MODEL_PATH_SCAN_ENTRIES: usize = 1_024;
 const MAX_MODEL_PATH_CANDIDATES: usize = 256;
 
 #[derive(Clone, Copy)]
@@ -137,7 +136,8 @@ fn canonical_model_root() -> Option<PathBuf> {
 }
 
 fn is_bare_name(current: &OsStr) -> bool {
-    Path::new(current).components().count() <= 1
+    current != OsStr::new("~")
+        && Path::new(current).components().count() <= 1
         && !current
             .as_encoded_bytes()
             .iter()
@@ -146,7 +146,11 @@ fn is_bare_name(current: &OsStr) -> bool {
 
 fn complete_explicit_path(current: &OsStr, kind: ModelPathKind) -> Vec<CompletionCandidate> {
     let current_path = Path::new(current);
-    let (typed_parent, file_prefix) = split_file_name(current_path);
+    let (typed_parent, file_prefix) = if current == OsStr::new("~") {
+        (current_path, OsStr::new(""))
+    } else {
+        split_file_name(current_path)
+    };
 
     let search_root = if typed_parent.is_absolute() {
         typed_parent.to_path_buf()
@@ -180,7 +184,6 @@ fn complete_from_root(
     };
 
     let mut candidates = entries
-        .take(MAX_MODEL_PATH_SCAN_ENTRIES)
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name();
@@ -310,5 +313,30 @@ mod tests {
                     .contains(&reserved)
             );
         }
+    }
+
+    #[test]
+    fn model_path_candidates_are_globally_sorted_before_truncation() {
+        let root = tempfile::tempdir().expect("model root");
+        for index in (0..1_100).rev() {
+            std::fs::create_dir(root.path().join(format!("model-{index:04}")))
+                .expect("model directory");
+        }
+
+        let candidates = complete_from_root(
+            OsStr::new("model-"),
+            root.path(),
+            root.path(),
+            ModelPathKind::Decoder,
+        );
+        assert_eq!(candidates.len(), MAX_MODEL_PATH_CANDIDATES);
+        assert_eq!(
+            candidates.first().unwrap().get_value(),
+            root.path().join("model-0000/").as_os_str()
+        );
+        assert_eq!(
+            candidates.last().unwrap().get_value(),
+            root.path().join("model-0255/").as_os_str()
+        );
     }
 }

@@ -34,6 +34,7 @@ impl IsolatedHome {
         let mut command = Command::cargo_bin("hf2q").expect("hf2q binary");
         command
             .env("HOME", self.path())
+            .env("XDG_DATA_HOME", self.path().join(".local/share"))
             .env("XDG_STATE_HOME", self.path().join("state"))
             .env("SHELL", "/bin/zsh")
             .env("BASH_COMPLETION_USER_DIR", self.path().join("bash"))
@@ -353,6 +354,18 @@ fn serve_model_completion_prefers_managed_models_and_keeps_explicit_paths() {
             .any(|line| line == customer_model.display().to_string()),
         "{customer_files}"
     );
+
+    let home_model = home.path().join("home-model.gguf");
+    fs::write(&home_model, b"home model").unwrap();
+    fs::create_dir(models.join("~managed-shadow")).unwrap();
+    let home_files = dynamic(&home, "zsh", 3, &["hf2q", "serve", "--model", "~"]);
+    assert!(
+        home_files
+            .lines()
+            .any(|line| dynamic_candidate_name(line) == "~/home-model.gguf"),
+        "{home_files}"
+    );
+    assert!(!home_files.contains("~managed-shadow"), "{home_files}");
 
     for path in home.registrations() {
         assert!(!path.exists(), "completion wrote {}", path.display());
