@@ -3722,6 +3722,16 @@ impl Qwen35Model {
         })
     }
 
+    /// Detach a logical tensor view from any larger transient parent
+    /// allocation while keeping it on the verifier's residency-enabled
+    /// device. Stable prompt anchors use this for the one-row MTP boundary.
+    pub(crate) fn copy_logical_buffer_owned(&self, src: &MlxBuffer) -> Result<MlxBuffer> {
+        self.ensure_gpu_cache_primed()?;
+        self.with_gpu_cache_mut(|device, _registry| {
+            super::kv_cache::deep_copy_logical_buffer(device, src)
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn loaded_candidate_executed_catalog(
         &self,

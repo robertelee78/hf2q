@@ -8329,6 +8329,53 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     // keep history verification distinct from the native MTP head; the older
     // `hf2q_qwen_mtp_*` names remain compatibility aggregates below.
     let qwen_mtp = &super::qwen35_speculation::TELEMETRY;
+    let qwen_anchor = &super::qwen35_anchor_store::TELEMETRY;
+    let qwen_anchor_block = format!(
+        "# HELP hf2q_qwen_anchor_captures_total Slot-local anchor captures attempted.\n\
+# TYPE hf2q_qwen_anchor_captures_total counter\n\
+hf2q_qwen_anchor_captures_total {}\n\
+# HELP hf2q_qwen_anchor_capture_budget_skips_total Anchor captures skipped by the committed-plus-pending byte preflight.\n\
+# TYPE hf2q_qwen_anchor_capture_budget_skips_total counter\n\
+hf2q_qwen_anchor_capture_budget_skips_total {}\n\
+# HELP hf2q_qwen_anchor_capture_seconds_total Wall time spent producing slot-local anchor payloads.\n\
+# TYPE hf2q_qwen_anchor_capture_seconds_total counter\n\
+hf2q_qwen_anchor_capture_seconds_total {:.9}\n\
+# HELP hf2q_qwen_anchor_restore_attempts_total Prompt divergences that attempted or required anchor restoration.\n\
+# TYPE hf2q_qwen_anchor_restore_attempts_total counter\n\
+hf2q_qwen_anchor_restore_attempts_total {}\n\
+# HELP hf2q_qwen_anchor_restore_hits_total Epoch-valid slot-local anchor restores.\n\
+# TYPE hf2q_qwen_anchor_restore_hits_total counter\n\
+hf2q_qwen_anchor_restore_hits_total {}\n\
+# HELP hf2q_qwen_anchor_restore_misses_total Divergences or restore failures that could not reuse an anchor.\n\
+# TYPE hf2q_qwen_anchor_restore_misses_total counter\n\
+hf2q_qwen_anchor_restore_misses_total {}\n\
+# HELP hf2q_qwen_anchor_tokens_saved_total Prompt tokens skipped by anchor restoration.\n\
+# TYPE hf2q_qwen_anchor_tokens_saved_total counter\n\
+hf2q_qwen_anchor_tokens_saved_total {}\n\
+# HELP hf2q_qwen_anchor_descendants_pruned_total Stale descendants removed before writes on a restored lineage.\n\
+# TYPE hf2q_qwen_anchor_descendants_pruned_total counter\n\
+hf2q_qwen_anchor_descendants_pruned_total {}\n\
+# HELP hf2q_qwen_anchor_evictions_total Positional keep-newest-K anchor evictions.\n\
+# TYPE hf2q_qwen_anchor_evictions_total counter\n\
+hf2q_qwen_anchor_evictions_total {}\n\
+# HELP hf2q_qwen_anchor_peak_committed_pending_bytes Peak reclaimable anchor payload bytes in one slot store.\n\
+# TYPE hf2q_qwen_anchor_peak_committed_pending_bytes gauge\n\
+hf2q_qwen_anchor_peak_committed_pending_bytes {}\n",
+        qwen_anchor.captures_total.load(Ordering::Relaxed),
+        qwen_anchor
+            .capture_budget_skips_total
+            .load(Ordering::Relaxed),
+        qwen_anchor.capture_nanos_total.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        qwen_anchor.restore_attempts_total.load(Ordering::Relaxed),
+        qwen_anchor.restore_hits_total.load(Ordering::Relaxed),
+        qwen_anchor.restore_misses_total.load(Ordering::Relaxed),
+        qwen_anchor.tokens_saved_total.load(Ordering::Relaxed),
+        qwen_anchor.descendants_pruned_total.load(Ordering::Relaxed),
+        qwen_anchor.evictions_total.load(Ordering::Relaxed),
+        qwen_anchor
+            .peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+    );
     let qwen_mtp_fallback_reasons = format!(
         "# HELP hf2q_qwen_mtp_fallback_requests_by_reason_total Compatibility aggregate of exact Qwen speculation fallbacks by closed reason.\n\
 # TYPE hf2q_qwen_mtp_fallback_requests_by_reason_total counter\n\
@@ -8537,6 +8584,7 @@ hf2q_qwen_mtp_fallback_requests_total {qwen_mtp_fallbacks}\n\
 # TYPE hf2q_qwen_mtp_conversation_resets_total counter\n\
 hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
 {qwen_speculation_proposers}\
+{qwen_anchor_block}\
 ",
         uptime = state.uptime_seconds(),
         ready = ready,
@@ -8569,6 +8617,7 @@ hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
         qwen_mtp_fallback_reasons = qwen_mtp_fallback_reasons,
         qwen_mtp_resets = qwen_mtp.conversation_resets.load(Ordering::Relaxed),
         qwen_speculation_proposers = qwen_speculation_proposers,
+        qwen_anchor_block = qwen_anchor_block,
     );
     // Prometheus exposition format: text/plain with a versioned content-type.
     let mut resp = (StatusCode::OK, body).into_response();

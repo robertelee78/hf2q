@@ -42,6 +42,13 @@ use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
 
 use super::engine_supervisor::EngineSupervisor;
+use super::qwen35_anchor_store::{
+    record_capture as record_qwen35_anchor_capture,
+    record_evictions as record_qwen35_anchor_evictions,
+    record_restore_hit as record_qwen35_anchor_restore_hit,
+    record_restore_miss as record_qwen35_anchor_restore_miss, AnchorEntry, AnchorStore,
+    DEFAULT_MAX_COMMITTED_ANCHORS,
+};
 
 const SLOT_AWARE_GPU_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 // The preserved Gemma cold-prefill baseline is roughly 388 seconds for
@@ -2277,12 +2284,9 @@ pub struct GemmaLoadedModel {
     /// payload to `Vec<Arc<DenseKvBuffers>>` and conditionally honors
     /// the cached prefix.
     ///
-    /// Capacity = 16 entries — covers /cfa Phase 2 fan-out (≤8
-    /// workers sharing one system prompt) and multi-turn chat (last
-    /// 16 turns visible). Iter-3 may make this env-tunable via
-    /// `HF2Q_KV_LCP_CAPACITY`. Iter-3 swaps the marker payload `()`
-    /// out for `crate::inference::models::gemma4::DenseKvBuffers`: the
-    /// registry now stores per-layer Arc clones of the actual
+    /// The registry is byte-budgeted; `with_byte_budget` uses an unbounded
+    /// entry-count ceiling and evicts by exact payload bytes. It stores
+    /// per-layer Arc clones of the actual
     /// post-prefill KV state, ready for in-place reuse on a
     /// partial-prefix hit when `HF2Q_KV_LCP_RESUME=1` (default OFF).
     /// "gemma-hybrid-lcp" (2026-08-03): payload is now the
@@ -2297,8 +2301,8 @@ pub struct GemmaLoadedModel {
     /// ADR-017 Phase E.a iter-2 — handle to the AppState-owned
     /// `KvSpillCounters` so per-request LCP probes bump the same Arc
     /// the `/metrics` handler reads. `None` for tests / standalone
-    /// engine constructions / Qwen35 path (whose worker arm
-    /// short-circuits to 501 before any LCP probe could fire).
+    /// engine constructions. Qwen35 has its own live metrics sink and serving
+    /// worker, so this Gemma field does not own Qwen probes.
     /// Set by `serve::load_engine` from `EngineConfig.kv_metrics_sink`
     /// BEFORE `Engine::spawn` moves the loaded model into the worker.
     pub kv_metrics_sink:
@@ -3567,8 +3571,6 @@ impl GemmaLoadedModel {
             load_duration,
             prompt_cache: PromptCache::new(),
             live_prefix_tokens: Vec::new(),
-            // ADR-017 Phase E.a — LCP registry. Capacity = 1 for v1.
-            //
             // ADR-017 Phase E.a default-on — byte-budget LcpRegistry.
             //
             // Pre-iter-3 the payload was marker `()` (~0 bytes); iter-2
@@ -16343,7 +16345,7 @@ fn recover_qwen35_slot_after_cancellation(
     handle: SlotHandle,
     kv_bytes_per_token: u64,
     retained_tokens: &mut Qwen35RetainedPrefix,
-    prompt_anchor: &mut Option<Qwen35PromptAnchor>,
+    prompt_anchor: &mut Qwen35AnchorStore,
     preserve_unmodified_live_prefix: bool,
 ) -> Result<()> {
     let kv = guard.kv.as_mut().expect("kv Some during loop");
@@ -16351,6 +16353,16 @@ fn recover_qwen35_slot_after_cancellation(
         kv.sequence_len_for_slot(handle.slot_id)
             .context("read Qwen35 live cursor before cancellation recovery")? as usize;
     record_retained_slot_kv(scheduler, handle, live_tokens, kv_bytes_per_token);
+    let cancellation_prune = prompt_anchor.cancel_request_at_cursor(live_tokens);
+    tracing::info!(
+        target: "hf2q::serve::api::qwen35_anchor",
+        slot = handle.slot_id.0,
+        live_tokens,
+        descendant_prune_count = cancellation_prune.pruned,
+        pending_discarded = cancellation_prune.pending_discarded,
+        anchor_owned_bytes = prompt_anchor.owned_bytes(),
+        "Qwen anchor cancellation cleanup"
+    );
 
     if preserve_unmodified_live_prefix
         && !retained_tokens.is_empty()
@@ -16377,55 +16389,80 @@ fn recover_qwen35_slot_after_cancellation(
         return Ok(());
     }
 
-    if let Some(anchor) = prompt_anchor.as_ref() {
+    if let Some(anchor_index) = prompt_anchor.newest_committed_at_or_before(live_tokens) {
+        let anchor = prompt_anchor
+            .committed(anchor_index)
+            .expect("selected cancellation anchor is epoch-valid");
         let anchor_tokens = anchor.prompt_tokens.len();
         if anchor_tokens > 0 {
             match kv.restore_slot_anchor(handle.slot_id, &anchor.kv) {
                 Ok(()) => {
-                    let restored = kv
-                        .sequence_len_for_slot(handle.slot_id)
-                        .context("read Qwen35 cursor after cancellation rollback")?
-                        as usize;
-                    anyhow::ensure!(
-                        restored == anchor_tokens,
-                        "Qwen35 cancellation rollback cursor {} != anchor tokens {}",
-                        restored,
-                        anchor_tokens
-                    );
-                    retained_tokens.tokens.clone_from(&anchor.prompt_tokens);
-                    retained_tokens.spec = match anchor.spec.clone() {
-                        Some(spec)
-                            if spec.token_count == anchor_tokens
-                                && kv
-                                    .validate_speculative_cursors_for_slot(
-                                        handle.slot_id,
-                                        spec.token_count,
-                                    )
-                                    .is_ok() =>
-                        {
-                            Some(spec)
-                        }
-                        Some(_) => {
+                    let restored = match kv.sequence_len_for_slot(handle.slot_id) {
+                        Ok(restored) if restored as usize == anchor_tokens => restored as usize,
+                        Ok(restored) => {
                             tracing::warn!(
                                 slot = handle.slot_id.0,
-                                cached_tokens = anchor_tokens,
-                                "Qwen35 cancellation restored an anchor without valid speculative metadata; preserving ordinary anchor state"
+                                restored,
+                                anchor_tokens,
+                                "Qwen cancellation restore produced a mismatched cursor; invalidating slot"
                             );
-                            super::qwen35_speculation::record_fallback(
-                                super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable,
-                            );
-                            None
+                            0
                         }
-                        None => None,
+                        Err(error) => {
+                            tracing::warn!(
+                                slot = handle.slot_id.0,
+                                error = %error,
+                                "Qwen cancellation could not validate the restored cursor; invalidating slot"
+                            );
+                            0
+                        }
                     };
-                    tracing::info!(
-                        slot = handle.slot_id.0,
-                        cached_tokens = anchor_tokens,
-                        "Qwen35 cancellation restored verified prompt checkpoint"
-                    );
-                    return Ok(());
+                    if restored != 0 {
+                        retained_tokens.tokens.clone_from(&anchor.prompt_tokens);
+                        retained_tokens.vision_fingerprint = anchor.vision_fingerprint;
+                        retained_tokens.spec = match anchor.spec.clone() {
+                            Some(spec)
+                                if spec.token_count == anchor_tokens
+                                    && kv
+                                        .validate_speculative_cursors_for_slot(
+                                            handle.slot_id,
+                                            spec.token_count,
+                                        )
+                                        .is_ok() =>
+                            {
+                                Some(spec)
+                            }
+                            Some(_) => {
+                                tracing::warn!(
+                                    slot = handle.slot_id.0,
+                                    cached_tokens = anchor_tokens,
+                                    "Qwen35 cancellation restored an anchor without valid speculative metadata; preserving ordinary anchor state"
+                                );
+                                super::qwen35_speculation::record_fallback(
+                                    super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable,
+                                );
+                                None
+                            }
+                            None => None,
+                        };
+                        record_qwen35_anchor_restore_hit(anchor_tokens, cancellation_prune.pruned);
+                        tracing::info!(
+                            target: "hf2q::serve::api::qwen35_anchor",
+                            slot = handle.slot_id.0,
+                            cached_tokens = anchor_tokens,
+                            hit_depth = anchor_index + 1,
+                            tokens_saved = anchor_tokens,
+                            descendant_prune_count = cancellation_prune.pruned,
+                            capture_ms = anchor.capture_duration.as_secs_f64() * 1000.0,
+                            peak_committed_pending_bytes = prompt_anchor.owned_bytes(),
+                            "Qwen35 cancellation restored verified prompt checkpoint"
+                        );
+                        return Ok(());
+                    }
+                    record_qwen35_anchor_restore_miss();
                 }
                 Err(error) => {
+                    record_qwen35_anchor_restore_miss();
                     tracing::warn!(
                         slot = handle.slot_id.0,
                         error = %error,
@@ -16436,10 +16473,17 @@ fn recover_qwen35_slot_after_cancellation(
         }
     }
 
+    retained_tokens.clear_all();
+    let cleared = prompt_anchor.clear_all();
+    tracing::warn!(
+        target: "hf2q::serve::api::qwen35_anchor",
+        slot = handle.slot_id.0,
+        committed_cleared = cleared.committed,
+        pending_discarded = cleared.pending_discarded,
+        "Qwen cancellation recovery cleared the slot anchor lineage"
+    );
     kv.reset_for_slot(handle.slot_id)
         .context("reset Qwen35 slot after cancellation rollback miss")?;
-    retained_tokens.clear_all();
-    *prompt_anchor = None;
     Ok(())
 }
 
@@ -16449,7 +16493,7 @@ fn recover_qwen35_slot_after_cancellation_for_reply(
     handle: SlotHandle,
     kv_bytes_per_token: u64,
     retained_tokens: &mut Qwen35RetainedPrefix,
-    prompt_anchor: &mut Option<Qwen35PromptAnchor>,
+    prompt_anchor: &mut Qwen35AnchorStore,
     preserve_unmodified_live_prefix: bool,
     reply: SlotReply,
 ) -> std::result::Result<SlotReply, Qwen35FatalFailure> {
@@ -16868,12 +16912,53 @@ struct Qwen35PromptAnchor {
     prefill_logits: Vec<f32>,
     vision_fingerprint: Option<[u8; 32]>,
     spec: Option<super::engine_qwen35::Qwen35SpecPrefixBoundary>,
+    capture_duration: Duration,
+    lineage_epoch: u64,
 }
+
+impl AnchorEntry for Qwen35PromptAnchor {
+    fn token_count(&self) -> usize {
+        self.prompt_tokens.len()
+    }
+
+    fn lineage_epoch(&self) -> u64 {
+        self.lineage_epoch
+    }
+
+    fn set_lineage_epoch(&mut self, epoch: u64) {
+        self.lineage_epoch = epoch;
+    }
+
+    fn owned_bytes(&self) -> u64 {
+        (self.prompt_tokens.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<u32>() as u64)
+            .saturating_add(self.kv.owned_bytes())
+            .saturating_add(
+                (self.prefill_logits.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<f32>() as u64),
+            )
+            .saturating_add(
+                self.spec
+                    .as_ref()
+                    .map(super::engine_qwen35::Qwen35SpecPrefixBoundary::owned_bytes)
+                    .unwrap_or(0),
+            )
+    }
+}
+
+type Qwen35AnchorStore = AnchorStore<Qwen35PromptAnchor>;
+
+// Five simultaneously-owned Qwen3.8 anchors (K=4 committed + one pending)
+// fit below this per-slot reclaimable envelope using allocation-derived bytes.
+// Smaller models naturally retain K=4; larger future configs reduce effective
+// depth by failing the byte preflight rather than overcommitting unified RAM.
+const QWEN35_ANCHOR_SLOT_BUDGET_BYTES: u64 = 768 * 1024 * 1024;
 
 #[derive(Default)]
 struct Qwen35RetainedPrefix {
     tokens: Vec<u32>,
     spec: Option<super::engine_qwen35::Qwen35SpecPrefixBoundary>,
+    vision_fingerprint: Option<[u8; 32]>,
 }
 
 impl std::ops::Deref for Qwen35RetainedPrefix {
@@ -16894,6 +16979,7 @@ impl Qwen35RetainedPrefix {
     fn clear_all(&mut self) {
         self.tokens.clear();
         self.spec = None;
+        self.vision_fingerprint = None;
     }
 }
 
@@ -16913,29 +16999,132 @@ fn qwen35_cached_spec_for_decision<T>(
 
 fn install_qwen35_stable_prompt_checkpoint(
     handle: SlotHandle,
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     checkpoint: super::engine_qwen35::Qwen35StablePromptCheckpoint,
 ) {
-    tracing::info!(
-        slot = handle.slot_id.0,
-        prompt_tokens = checkpoint.prompt_tokens.len(),
-        checkpoint_bytes = checkpoint.kv.total_bytes(),
-        "Qwen35 slot-local stable prompt boundary captured"
-    );
-    prompt_anchors[handle.slot_id.0 as usize] = Some(Qwen35PromptAnchor {
+    let slot_idx = handle.slot_id.0 as usize;
+    let capture_duration = checkpoint.capture_duration;
+    let prompt_token_count = checkpoint.prompt_tokens.len();
+    let anchor = Qwen35PromptAnchor {
         prompt_tokens: checkpoint.prompt_tokens,
         kv: checkpoint.kv,
         prefill_logits: checkpoint.prefill_logits,
         vision_fingerprint: checkpoint.vision_fingerprint,
         spec: checkpoint.spec,
-    });
+        capture_duration,
+        lineage_epoch: 0,
+    };
+    let anchor_bytes = anchor.owned_bytes();
+    let outcome = prompt_anchors[slot_idx].stage_pending(
+        anchor,
+        DEFAULT_MAX_COMMITTED_ANCHORS,
+        QWEN35_ANCHOR_SLOT_BUDGET_BYTES,
+    );
+    record_qwen35_anchor_capture(
+        outcome,
+        capture_duration,
+        prompt_anchors[slot_idx].owned_bytes(),
+    );
+    tracing::info!(
+        target: "hf2q::serve::api::qwen35_anchor",
+        slot = handle.slot_id.0,
+        prompt_tokens = prompt_token_count,
+        anchor_bytes,
+        capture_ms = capture_duration.as_secs_f64() * 1000.0,
+        peak_committed_pending_bytes = prompt_anchors[slot_idx].owned_bytes(),
+        outcome = ?outcome,
+        "Qwen slot-local stable boundary capture preflight"
+    );
+}
+
+fn publish_qwen35_pending_anchor(handle: SlotHandle, store: &mut Qwen35AnchorStore) {
+    if !store.has_pending() {
+        return;
+    }
+    match store.publish_pending(DEFAULT_MAX_COMMITTED_ANCHORS) {
+        Ok(publication) => {
+            record_qwen35_anchor_evictions(publication.evicted);
+            tracing::info!(
+                target: "hf2q::serve::api::qwen35_anchor",
+                slot = handle.slot_id.0,
+                committed_anchors = store.committed_len(),
+                anchor_owned_bytes = store.owned_bytes(),
+                eviction_reason = if publication.evicted > 0 {
+                    "positional_keep_newest_k"
+                } else if publication.replaced_equal_depth {
+                    "replace_equal_depth"
+                } else {
+                    "none"
+                },
+                evicted = publication.evicted,
+                "Qwen pending anchor published after terminal cache and ledger commit"
+            );
+        }
+        Err(error) => {
+            let cleared = store.clear_all();
+            tracing::error!(
+                target: "hf2q::serve::api::qwen35_anchor",
+                slot = handle.slot_id.0,
+                error = %error,
+                committed_cleared = cleared.committed,
+                "Qwen pending anchor publication violated its state-machine invariant; lineage cleared"
+            );
+        }
+    }
+}
+
+fn audit_qwen35_idle_anchor_conservation(
+    scheduler: &InflightBatchedScheduler,
+    stores: &[Qwen35AnchorStore],
+) -> Result<u64> {
+    let mut anchor_owned_bytes = 0u64;
+    for (slot, store) in stores.iter().enumerate() {
+        store
+            .validate()
+            .with_context(|| format!("validate Qwen anchor store for idle slot {slot}"))?;
+        anyhow::ensure!(
+            !store.has_pending(),
+            "Qwen idle slot {slot} retained a request-local pending anchor"
+        );
+        anchor_owned_bytes = anchor_owned_bytes
+            .checked_add(store.owned_bytes())
+            .context("Qwen aggregate anchor-owned byte overflow")?;
+    }
+    let anchor_grant = QWEN35_ANCHOR_SLOT_BUDGET_BYTES
+        .checked_mul(stores.len() as u64)
+        .context("Qwen aggregate anchor grant overflow")?;
+    let anchor_free = anchor_grant
+        .checked_sub(anchor_owned_bytes)
+        .context("Qwen anchor-owned bytes exceed aggregate reclaimable grant")?;
+    anyhow::ensure!(
+        anchor_owned_bytes.checked_add(anchor_free) == Some(anchor_grant),
+        "Qwen idle anchor conservation mismatch"
+    );
+
+    let kv_grant = scheduler.total_kv_budget_bytes();
+    let kv_resident = scheduler.resident_high_water_bytes();
+    let kv_reserved = scheduler.reserved_high_water_bytes();
+    anyhow::ensure!(
+        kv_reserved == kv_resident,
+        "Qwen idle scheduler retained reservations: reserved={kv_reserved} resident={kv_resident}"
+    );
+    if kv_grant > 0 {
+        let kv_free = kv_grant
+            .checked_sub(kv_resident)
+            .context("Qwen resident KV high-water exceeds grant at idle")?;
+        anyhow::ensure!(
+            kv_resident.checked_add(kv_free) == Some(kv_grant),
+            "Qwen idle KV conservation mismatch"
+        );
+    }
+    Ok(anchor_owned_bytes)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Qwen35SlotPreference {
     slot: SlotId,
     cached_tokens: usize,
-    restore_prompt_anchor: bool,
+    restore_anchor_index: Option<usize>,
     use_prefill_logits: bool,
 }
 
@@ -16973,7 +17162,15 @@ fn finish_qwen35_operator_request(handle: SlotHandle, outcome: &'static str) {
 }
 
 fn qwen35_slot_affinity<'a>(
-    candidates: impl IntoIterator<Item = (usize, &'a [u32], Option<&'a [u32]>, Option<&'a [u32]>, bool)>,
+    candidates: impl IntoIterator<
+        Item = (
+            usize,
+            &'a [u32],
+            Option<(usize, &'a [u32])>,
+            Option<&'a [u32]>,
+            bool,
+        ),
+    >,
     prompt_tokens: &[u32],
 ) -> Option<Qwen35SlotAffinity> {
     let mut best = None;
@@ -16983,8 +17180,8 @@ fn qwen35_slot_affinity<'a>(
             && prompt_tokens.starts_with(retained))
         .then_some(retained.len());
         let anchor_tokens = anchor
-            .filter(|anchor| !anchor.is_empty() && prompt_tokens.starts_with(anchor))
-            .map(<[u32]>::len);
+            .filter(|(_, anchor)| !anchor.is_empty() && prompt_tokens.starts_with(anchor))
+            .map(|(index, anchor)| (index, anchor.len()));
         let active_tokens = active_prompt
             .filter(|active_prompt| {
                 !active_prompt.is_empty() && prompt_tokens.starts_with(active_prompt)
@@ -16992,22 +17189,22 @@ fn qwen35_slot_affinity<'a>(
             .map(<[u32]>::len);
 
         let reusable = match (live_tokens, anchor_tokens) {
-            (Some(live), Some(anchor)) if live >= anchor => Some(Qwen35SlotPreference {
+            (Some(live), Some((_, anchor))) if live >= anchor => Some(Qwen35SlotPreference {
                 slot: SlotId(index as u32),
                 cached_tokens: live,
-                restore_prompt_anchor: false,
+                restore_anchor_index: None,
                 use_prefill_logits: false,
             }),
-            (_, Some(anchor)) => Some(Qwen35SlotPreference {
+            (_, Some((anchor_index, anchor))) => Some(Qwen35SlotPreference {
                 slot: SlotId(index as u32),
                 cached_tokens: anchor,
-                restore_prompt_anchor: true,
+                restore_anchor_index: Some(anchor_index),
                 use_prefill_logits: anchor == prompt_tokens.len(),
             }),
             (Some(live), None) => Some(Qwen35SlotPreference {
                 slot: SlotId(index as u32),
                 cached_tokens: live,
-                restore_prompt_anchor: false,
+                restore_anchor_index: None,
                 use_prefill_logits: false,
             }),
             (None, None) => None,
@@ -17015,7 +17212,7 @@ fn qwen35_slot_affinity<'a>(
         let active_candidate = active_tokens.map(|cached_tokens| Qwen35SlotPreference {
             slot: SlotId(index as u32),
             cached_tokens,
-            restore_prompt_anchor: false,
+            restore_anchor_index: None,
             use_prefill_logits: false,
         });
         let candidate = match (reusable, active_candidate) {
@@ -17047,7 +17244,15 @@ fn qwen35_slot_affinity<'a>(
 }
 
 fn preferred_qwen35_slot<'a>(
-    candidates: impl IntoIterator<Item = (usize, &'a [u32], Option<&'a [u32]>, Option<&'a [u32]>, bool)>,
+    candidates: impl IntoIterator<
+        Item = (
+            usize,
+            &'a [u32],
+            Option<(usize, &'a [u32])>,
+            Option<&'a [u32]>,
+            bool,
+        ),
+    >,
     prompt_tokens: &[u32],
 ) -> Option<Qwen35SlotPreference> {
     match qwen35_slot_affinity(candidates, prompt_tokens) {
@@ -17334,7 +17539,7 @@ fn qwen35_pending_request_is_ready(
     request: &Request,
     prompt_caches: &[PromptCache],
     retained_tokens: &[Qwen35RetainedPrefix],
-    prompt_anchors: &[Option<Qwen35PromptAnchor>],
+    prompt_anchors: &[Qwen35AnchorStore],
     slots: &[Option<Qwen35Slot>],
 ) -> bool {
     let response_cache_hit = qwen35_request_has_response_cache_hit(request, prompt_caches);
@@ -17399,7 +17604,7 @@ fn deepseek4_pending_request_is_ready(
 
 fn active_qwen35_slot_affinity(
     retained_tokens: &[Qwen35RetainedPrefix],
-    prompt_anchors: &[Option<Qwen35PromptAnchor>],
+    prompt_anchors: &[Qwen35AnchorStore],
     slots: &[Option<Qwen35Slot>],
     prompt_tokens: &[u32],
     vision_fingerprint: Option<[u8; 32]>,
@@ -17410,24 +17615,30 @@ fn active_qwen35_slot_affinity(
             .zip(prompt_anchors.iter())
             .zip(slots.iter())
             .enumerate()
-            .map(|(index, ((retained, anchor), active))| {
-                let anchor_matches = anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.vision_fingerprint == vision_fingerprint);
+            .map(|(index, ((retained, anchors), active))| {
+                let anchor = anchors
+                    .deepest_matching_index(|anchor| {
+                        anchor.vision_fingerprint == vision_fingerprint
+                            && prompt_tokens.starts_with(&anchor.prompt_tokens)
+                    })
+                    .and_then(|anchor_index| {
+                        anchors
+                            .committed(anchor_index)
+                            .map(|anchor| (anchor_index, anchor))
+                    });
                 let active_matches = active
                     .as_ref()
                     .is_some_and(|(work, _, _)| work.vision_fingerprint() == vision_fingerprint);
                 (
                     index,
-                    if anchor_matches {
+                    if retained.vision_fingerprint == vision_fingerprint {
                         retained.as_slice()
                     } else {
                         &[]
                     },
-                    anchor
-                        .as_ref()
-                        .filter(|_| anchor_matches)
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    anchor.map(|(anchor_index, anchor)| {
+                        (anchor_index, anchor.prompt_tokens.as_slice())
+                    }),
                     active
                         .as_ref()
                         .filter(|_| active_matches)
@@ -17811,7 +18022,8 @@ fn run_slot_aware_qwen35(
         .map(|_| Qwen35RetainedPrefix::default())
         .collect();
     let mut prompt_caches: Vec<PromptCache> = (0..n_slots).map(|_| PromptCache::new()).collect();
-    let mut prompt_anchors: Vec<Option<Qwen35PromptAnchor>> = (0..n_slots).map(|_| None).collect();
+    let mut prompt_anchors: Vec<Qwen35AnchorStore> =
+        (0..n_slots).map(|_| Qwen35AnchorStore::default()).collect();
 
     let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut g) = snap.lock() {
@@ -18181,6 +18393,31 @@ fn run_slot_aware_qwen35(
         };
         match step {
             SchedulerStep::Idle => {
+                match audit_qwen35_idle_anchor_conservation(&scheduler, &prompt_anchors) {
+                    Ok(anchor_owned_bytes) => tracing::debug!(
+                        target: "hf2q::serve::api::qwen35_anchor",
+                        anchor_owned_bytes,
+                        kv_resident_high_water_bytes = scheduler.resident_high_water_bytes(),
+                        "Qwen idle cache conservation audit passed"
+                    ),
+                    Err(error) => {
+                        fail_qwen35_worker_after_gpu_fatal(
+                            &supervisor,
+                            &mut rx,
+                            &mut pending,
+                            &mut slots,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            Qwen35FatalFailure {
+                                handle: None,
+                                reply: Qwen35FatalReply::None,
+                                error,
+                                kind: Qwen35WorkerFatalKind::Invariant,
+                            },
+                        );
+                        break 'worker;
+                    }
+                }
                 if shutdown_requested {
                     continue;
                 }
@@ -18340,7 +18577,7 @@ fn admit_qwen35_slot(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
@@ -18395,32 +18632,35 @@ fn admit_qwen35_slot(
             .zip(prompt_anchors.iter())
             .zip(slots.iter())
             .enumerate()
-            .map(|(index, ((retained, anchor), active))| {
-                let exact_anchor_matches = anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.vision_fingerprint == request_vision_fingerprint);
-                let anchor_matches = anchor.as_ref().is_some_and(|anchor| {
-                    qwen35_anchor_vision_compatible(
-                        anchor.vision_fingerprint,
-                        anchor.prompt_tokens.len(),
-                        request_vision_fingerprint,
-                        text_anchor_reuse_limit,
-                    )
-                });
+            .map(|(index, ((retained, anchors), active))| {
+                let anchor = anchors
+                    .deepest_matching_index(|anchor| {
+                        prompt_tokens.starts_with(&anchor.prompt_tokens)
+                            && qwen35_anchor_vision_compatible(
+                                anchor.vision_fingerprint,
+                                anchor.prompt_tokens.len(),
+                                request_vision_fingerprint,
+                                text_anchor_reuse_limit,
+                            )
+                    })
+                    .and_then(|anchor_index| {
+                        anchors
+                            .committed(anchor_index)
+                            .map(|anchor| (anchor_index, anchor))
+                    });
                 let active_matches = active.as_ref().is_some_and(|(work, _, _)| {
                     work.vision_fingerprint() == request_vision_fingerprint
                 });
                 (
                     index,
-                    if exact_anchor_matches {
+                    if retained.vision_fingerprint == request_vision_fingerprint {
                         retained.as_slice()
                     } else {
                         &[]
                     },
-                    anchor
-                        .as_ref()
-                        .filter(|_| anchor_matches)
-                        .map(|anchor| anchor.prompt_tokens.as_slice()),
+                    anchor.map(|(anchor_index, anchor)| {
+                        (anchor_index, anchor.prompt_tokens.as_slice())
+                    }),
                     active
                         .as_ref()
                         .filter(|_| active_matches)
@@ -18506,6 +18746,16 @@ fn admit_qwen35_slot(
         return None;
     };
     reply.accept_stream_admission();
+    let admission_slot_idx = handle.slot_id.0 as usize;
+    tracing::debug!(
+        target: "hf2q::serve::api::qwen35_anchor",
+        slot = handle.slot_id.0,
+        committed_anchors = prompt_anchors[admission_slot_idx].committed_len(),
+        pending_anchor = prompt_anchors[admission_slot_idx].has_pending(),
+        anchor_owned_bytes = prompt_anchors[admission_slot_idx].owned_bytes(),
+        anchor_budget_bytes = QWEN35_ANCHOR_SLOT_BUDGET_BYTES,
+        "Qwen admission reclaimable anchor accounting"
+    );
     let operator_request_id = qwen35_operator_request_id(handle);
     crate::serve::operator_ui::request_started(
         "qwen35",
@@ -18521,7 +18771,9 @@ fn admit_qwen35_slot(
     );
 
     let selected_preference = preferred.filter(|preference| preference.slot == handle.slot_id);
-    let anchor_hit = selected_preference.is_some_and(|preference| preference.restore_prompt_anchor);
+    let restore_anchor_index =
+        selected_preference.and_then(|preference| preference.restore_anchor_index);
+    let anchor_hit = restore_anchor_index.is_some();
     let cached_tokens = selected_preference
         .map(|preference| preference.cached_tokens)
         .unwrap_or(0);
@@ -18531,22 +18783,50 @@ fn admit_qwen35_slot(
         cached_tokens,
         prompt_tokens.len().saturating_sub(cached_tokens),
     );
+    let observed_divergence_prefix = (cached_tokens == 0)
+        .then(|| {
+            retained_tokens
+                .iter()
+                .filter(|retained| retained.vision_fingerprint == request_vision_fingerprint)
+                .map(|retained| {
+                    retained
+                        .iter()
+                        .zip(prompt_tokens.iter())
+                        .take_while(|(left, right)| left == right)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
     if cached_tokens == 0 {
         retained_tokens[handle.slot_id.0 as usize].clear_all();
-        prompt_anchors[handle.slot_id.0 as usize] = None;
+        prompt_anchors[handle.slot_id.0 as usize].clear_all();
     }
 
     let (cached_prefill_logits, cached_spec_candidate) = if anchor_hit {
         let slot_idx = handle.slot_id.0 as usize;
+        let anchor_index = restore_anchor_index.expect("anchor hit has an index");
         let anchor = prompt_anchors[slot_idx]
-            .as_ref()
+            .committed(anchor_index)
             .expect("anchor_preferred matched an existing Qwen prompt anchor");
+        let old_retained_len = retained_tokens[slot_idx].len();
+        let common = retained_tokens[slot_idx]
+            .iter()
+            .zip(prompt_tokens.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let divergence_distance = old_retained_len.saturating_sub(common);
+        let anchor_capture_duration = anchor.capture_duration;
         if let Err(e) = guard
             .kv
             .as_mut()
             .expect("kv Some during loop")
             .restore_slot_anchor(handle.slot_id, &anchor.kv)
         {
+            record_qwen35_anchor_restore_miss();
+            retained_tokens[slot_idx].clear_all();
+            let cleared = prompt_anchors[slot_idx].clear_all();
             reply = match reset_qwen35_slot_for_reply(
                 guard,
                 scheduler,
@@ -18557,8 +18837,20 @@ fn admit_qwen35_slot(
                 Ok(reply) => reply,
                 Err(fatal) => return Some(fatal),
             };
-            retained_tokens[slot_idx].clear_all();
-            prompt_anchors[slot_idx] = None;
+            tracing::warn!(
+                target: "hf2q::serve::api::qwen35_anchor",
+                slot = handle.slot_id.0,
+                attempted_hit_depth = anchor_index + 1,
+                divergence_position = common,
+                divergence_distance,
+                tokens_saved = 0,
+                descendant_prune_count = 0,
+                capture_ms = anchor_capture_duration.as_secs_f64() * 1000.0,
+                peak_committed_pending_bytes = 0,
+                committed_cleared = cleared.committed,
+                pending_discarded = cleared.pending_discarded,
+                "Qwen anchor restore failed; hard reset cleared the full lineage"
+            );
             scheduler.release(handle);
             finish_qwen35_operator_request(handle, "failed");
             slot_fire_done(
@@ -18568,15 +18860,55 @@ fn admit_qwen35_slot(
             );
             return None;
         }
+        let anchor_prompt_tokens = anchor.prompt_tokens.clone();
+        let anchor_spec = anchor.spec.clone();
+        let anchor_logits = selected_preference
+            .filter(|preference| preference.use_prefill_logits)
+            .map(|_| anchor.prefill_logits.clone());
+        let checkpoint_bytes = anchor.owned_bytes();
+        let prune = match prompt_anchors[slot_idx].prune_descendants_after_restore(anchor_index) {
+            Ok(prune) => prune,
+            Err(error) => {
+                retained_tokens[slot_idx].clear_all();
+                prompt_anchors[slot_idx].clear_all();
+                reply = match reset_qwen35_slot_for_reply(
+                    guard,
+                    scheduler,
+                    handle,
+                    kv_bytes_per_token,
+                    reply,
+                ) {
+                    Ok(reply) => reply,
+                    Err(fatal) => return Some(fatal),
+                };
+                scheduler.release(handle);
+                finish_qwen35_operator_request(handle, "failed");
+                slot_fire_done(
+                    reply,
+                    Err(error.context("Qwen anchor descendant prune before write")),
+                    false,
+                );
+                return None;
+            }
+        };
+        record_qwen35_anchor_restore_hit(cached_tokens, prune.pruned);
         tracing::info!(
+            target: "hf2q::serve::api::qwen35_anchor",
             slot = handle.slot_id.0,
             prompt_tokens = prompt_tokens.len(),
             cached_tokens,
+            hit_depth = anchor_index + 1,
+            divergence_position = common,
+            divergence_distance,
+            tokens_saved = cached_tokens,
+            descendant_prune_count = prune.pruned,
+            capture_ms = anchor_capture_duration.as_secs_f64() * 1000.0,
             suffix_tokens = prompt_tokens.len().saturating_sub(cached_tokens),
-            checkpoint_bytes = anchor.kv.total_bytes(),
+            checkpoint_bytes,
+            anchor_owned_bytes = prompt_anchors[slot_idx].owned_bytes(),
             "Qwen35 slot-local prompt-boundary cache hit"
         );
-        let spec_candidate = anchor.spec.clone();
+        let spec_candidate = anchor_spec;
         let cached_spec = spec_candidate.clone().filter(|spec| {
             spec.token_count == cached_tokens
                 && guard
@@ -18586,9 +18918,6 @@ fn admit_qwen35_slot(
                     .validate_speculative_cursors_for_slot(handle.slot_id, spec.token_count)
                     .is_ok()
         });
-        let cached_logits = selected_preference
-            .filter(|preference| preference.use_prefill_logits)
-            .map(|_| anchor.prefill_logits.clone());
         if spec_candidate.is_some() && cached_spec.is_none() {
             tracing::warn!(
                 slot = handle.slot_id.0,
@@ -18598,14 +18927,30 @@ fn admit_qwen35_slot(
             super::qwen35_speculation::record_fallback(
                 super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable,
             );
-            prompt_anchors[slot_idx]
-                .as_mut()
-                .expect("Qwen anchor exists after restore")
-                .spec = None;
+            if let Some(anchor) = prompt_anchors[slot_idx].committed_mut(anchor_index) {
+                anchor.spec = None;
+            }
         }
-        (cached_logits, cached_spec)
+        retained_tokens[slot_idx].tokens = anchor_prompt_tokens;
+        retained_tokens[slot_idx].spec = cached_spec.clone();
+        retained_tokens[slot_idx].vision_fingerprint = request_vision_fingerprint;
+        (anchor_logits, cached_spec)
     } else {
         let slot_idx = handle.slot_id.0 as usize;
+        if cached_tokens == 0 {
+            if observed_divergence_prefix > 0 {
+                record_qwen35_anchor_restore_miss();
+                tracing::info!(
+                    target: "hf2q::serve::api::qwen35_anchor",
+                    slot = handle.slot_id.0,
+                    divergence_position = observed_divergence_prefix,
+                    divergence_distance = prompt_tokens.len().saturating_sub(observed_divergence_prefix),
+                    tokens_saved = 0,
+                    reason = "no_epoch_valid_boundary_anchor",
+                    "Qwen prompt divergence missed the retained anchor set"
+                );
+            }
+        }
         let spec_candidate = retained_tokens[slot_idx].spec.clone();
         let live_spec = spec_candidate.clone().filter(|spec| {
             spec.token_count == cached_tokens
@@ -18665,6 +19010,8 @@ fn admit_qwen35_slot(
     ) {
         Ok(state) => state,
         Err(error) => {
+            retained_tokens[handle.slot_id.0 as usize].clear_all();
+            prompt_anchors[handle.slot_id.0 as usize].clear_all();
             reply = match reset_qwen35_slot_for_reply(
                 guard,
                 scheduler,
@@ -18675,8 +19022,6 @@ fn admit_qwen35_slot(
                 Ok(reply) => reply,
                 Err(fatal) => return Some(fatal),
             };
-            retained_tokens[handle.slot_id.0 as usize].clear_all();
-            prompt_anchors[handle.slot_id.0 as usize] = None;
             scheduler.release(handle);
             if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
                 *snapshot = scheduler.stats();
@@ -18724,7 +19069,7 @@ fn advance_qwen35_prefill(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     handle: SlotHandle,
@@ -18930,6 +19275,8 @@ fn advance_qwen35_prefill(
             // A failed slice is not resumable: full-attention cursors and
             // recurrent ping-pong state mutate during the forward call. Do
             // not advance the scheduler token ledger for this slice.
+            retained_tokens[slot_idx].clear_all();
+            prompt_anchors[slot_idx].clear_all();
             reply = match reset_qwen35_slot_for_reply(
                 guard,
                 scheduler,
@@ -18940,8 +19287,6 @@ fn advance_qwen35_prefill(
                 Ok(reply) => reply,
                 Err(fatal) => return Some(fatal),
             };
-            retained_tokens[slot_idx].clear_all();
-            prompt_anchors[slot_idx] = None;
             scheduler.release(handle);
             finish_qwen35_operator_request(handle, "failed");
             slot_fire_done(reply, Err(error), false);
@@ -18988,7 +19333,7 @@ fn finish_qwen35_prefill(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     handle: SlotHandle,
     mut state: super::engine_qwen35::Qwen35DecodeState,
@@ -19024,10 +19369,16 @@ fn finish_qwen35_prefill(
     let desired_anchor_tokens = stable_boundary
         .map(|boundary| &prompt_tokens[..boundary])
         .unwrap_or(prompt_tokens.as_slice());
-    let already_anchored = prompt_anchors[slot_idx].as_ref().is_some_and(|anchor| {
-        anchor.prompt_tokens == desired_anchor_tokens
-            && anchor.vision_fingerprint == params.vision_fingerprint
-    });
+    let already_anchored = prompt_anchors[slot_idx]
+        .deepest_matching_index(|anchor| {
+            anchor.prompt_tokens == desired_anchor_tokens
+                && anchor.vision_fingerprint == params.vision_fingerprint
+        })
+        .is_some()
+        || prompt_anchors[slot_idx].pending().is_some_and(|anchor| {
+            anchor.prompt_tokens == desired_anchor_tokens
+                && anchor.vision_fingerprint == params.vision_fingerprint
+        });
     if stable_boundary.is_some() && !already_anchored {
         // This is safe for generation—the full prompt has committed—but the
         // request must not publish an unusable post-cue checkpoint. The
@@ -19038,9 +19389,10 @@ fn finish_qwen35_prefill(
             stable_boundary,
             "Qwen35 stable prompt checkpoint missing after bounded prefill"
         );
-        prompt_anchors[slot_idx] = None;
+        prompt_anchors[slot_idx].discard_pending();
     } else if !already_anchored {
-        let spec = state
+        let capture_started = Instant::now();
+        let spec_candidate = state
             .spec_prefix_candidate(prompt_tokens.len())
             .filter(|spec| {
                 guard
@@ -19050,6 +19402,20 @@ fn finish_qwen35_prefill(
                     .validate_speculative_cursors_for_slot(handle.slot_id, spec.token_count)
                     .is_ok()
             });
+        let spec = spec_candidate.and_then(|spec| match spec.clone_owned(&guard.model.model) {
+            Ok(spec) => Some(spec),
+            Err(error) => {
+                tracing::warn!(
+                    slot = handle.slot_id.0,
+                    error = %error,
+                    "Qwen full-prompt checkpoint dropped speculative metadata because its hidden row could not be detached"
+                );
+                super::qwen35_speculation::record_fallback(
+                    super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable,
+                );
+                None
+            }
+        });
         let anchor = guard
             .kv
             .as_ref()
@@ -19057,21 +19423,41 @@ fn finish_qwen35_prefill(
             .snapshot_slot_anchor(handle.slot_id, prompt_tokens.len());
         match anchor {
             Ok(kv) => {
-                tracing::info!(
-                    slot = handle.slot_id.0,
-                    prompt_tokens = prompt_tokens.len(),
-                    checkpoint_bytes = kv.total_bytes(),
-                    "Qwen35 slot-local prompt boundary captured"
-                );
-                prompt_anchors[slot_idx] = Some(Qwen35PromptAnchor {
+                let capture_duration = capture_started.elapsed();
+                let anchor = Qwen35PromptAnchor {
                     prompt_tokens: prompt_tokens.clone(),
                     kv,
                     prefill_logits,
                     vision_fingerprint: params.vision_fingerprint,
                     spec,
-                });
+                    capture_duration,
+                    lineage_epoch: 0,
+                };
+                let anchor_bytes = anchor.owned_bytes();
+                let outcome = prompt_anchors[slot_idx].stage_pending(
+                    anchor,
+                    DEFAULT_MAX_COMMITTED_ANCHORS,
+                    QWEN35_ANCHOR_SLOT_BUDGET_BYTES,
+                );
+                record_qwen35_anchor_capture(
+                    outcome,
+                    capture_duration,
+                    prompt_anchors[slot_idx].owned_bytes(),
+                );
+                tracing::info!(
+                    target: "hf2q::serve::api::qwen35_anchor",
+                    slot = handle.slot_id.0,
+                    prompt_tokens = prompt_tokens.len(),
+                    anchor_bytes,
+                    capture_ms = capture_duration.as_secs_f64() * 1000.0,
+                    peak_committed_pending_bytes = prompt_anchors[slot_idx].owned_bytes(),
+                    outcome = ?outcome,
+                    "Qwen full-prompt boundary capture preflight"
+                );
             }
             Err(error) => {
+                retained_tokens[slot_idx].clear_all();
+                prompt_anchors[slot_idx].clear_all();
                 reply = match reset_qwen35_slot_for_reply(
                     guard,
                     scheduler,
@@ -19082,8 +19468,6 @@ fn finish_qwen35_prefill(
                     Ok(reply) => reply,
                     Err(fatal) => return Some(fatal),
                 };
-                retained_tokens[slot_idx].clear_all();
-                prompt_anchors[slot_idx] = None;
                 scheduler.release(handle);
                 finish_qwen35_operator_request(handle, "failed");
                 slot_fire_done(
@@ -19177,6 +19561,8 @@ fn finish_qwen35_prefill(
             retained_tokens[slot_idx].len(),
             kv_bytes_per_token,
         );
+        retained_tokens[slot_idx].vision_fingerprint = params.vision_fingerprint;
+        publish_qwen35_pending_anchor(handle, &mut prompt_anchors[slot_idx]);
         scheduler.advance_after_decode(handle);
         scheduler.release(handle);
         finish_qwen35_operator_request(handle, "complete");
@@ -19201,7 +19587,7 @@ fn embed_qwen35_inline(
     guard: &mut Qwen35KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
     retained_tokens: &mut [Qwen35RetainedPrefix],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
     per_slot_kv_budget_bytes: u64,
     kv_bytes_per_token: u64,
@@ -19246,7 +19632,7 @@ fn embed_qwen35_inline(
     // can never advertise an anchor whose underlying cursor was reset.
     let slot_idx = handle.slot_id.0 as usize;
     retained_tokens[slot_idx].clear_all();
-    prompt_anchors[slot_idx] = None;
+    prompt_anchors[slot_idx].clear_all();
     let result = supervised_gpu_call(supervisor, "qwen35_slot_embed", || {
         super::engine_qwen35::embed_qwen35_slot_aware(
             guard.model,
@@ -19294,7 +19680,7 @@ fn decode_batch_qwen35(
     slots: &mut [Option<Qwen35Slot>],
     retained_tokens: &mut [Qwen35RetainedPrefix],
     prompt_caches: &mut [PromptCache],
-    prompt_anchors: &mut [Option<Qwen35PromptAnchor>],
+    prompt_anchors: &mut [Qwen35AnchorStore],
     registration: Option<&super::registry::ModelRegistration>,
     handles: &[SlotHandle],
     kv_bytes_per_token: u64,
@@ -19393,6 +19779,8 @@ fn decode_batch_qwen35(
                         kind: Qwen35WorkerFatalKind::Gpu,
                     });
                 }
+                retained_tokens[slot_idx].clear_all();
+                prompt_anchors[slot_idx].clear_all();
                 reply = match reset_qwen35_slot_for_reply(
                     guard,
                     scheduler,
@@ -19403,8 +19791,6 @@ fn decode_batch_qwen35(
                     Ok(reply) => reply,
                     Err(fatal) => return Some(fatal),
                 };
-                retained_tokens[slot_idx].clear_all();
-                prompt_anchors[slot_idx] = None;
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
                 continue;
@@ -19485,6 +19871,9 @@ fn decode_batch_qwen35(
                 retained_tokens[slot_idx].len(),
                 kv_bytes_per_token,
             );
+            retained_tokens[slot_idx].vision_fingerprint =
+                state.prompt_cache_identity().1.vision_fingerprint;
+            publish_qwen35_pending_anchor(handle, &mut prompt_anchors[slot_idx]);
         }
         scheduler.advance_after_decode(handle);
 
@@ -43328,7 +43717,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
                 (
                     1,
                     divergent_live_tail.as_slice(),
-                    Some(old_prompt.as_slice()),
+                    Some((0, old_prompt.as_slice())),
                     None,
                     false,
                 ),
@@ -43341,7 +43730,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
 
         assert_eq!(preference.slot, SlotId(1));
         assert_eq!(preference.cached_tokens, 99_007);
-        assert!(preference.restore_prompt_anchor);
+        assert_eq!(preference.restore_anchor_index, Some(0));
         assert!(
             !preference.use_prefill_logits,
             "continuations must prefill their suffix instead of replaying old logits"
@@ -43352,27 +43741,39 @@ mod qwen35_bounded_prefill_watchdog_tests {
     fn qwen_slot_preference_uses_exact_logits_and_longest_live_prefix() {
         let prompt = vec![11_u32; 32];
         let exact = preferred_qwen35_slot(
-            [(0, &prompt[..20], Some(prompt.as_slice()), None, false)],
+            [(0, &prompt[..20], Some((0, prompt.as_slice())), None, false)],
             &prompt,
         )
         .expect("exact prompt-boundary retry");
         assert_eq!(exact.cached_tokens, prompt.len());
-        assert!(exact.restore_prompt_anchor);
+        assert_eq!(exact.restore_anchor_index, Some(0));
         assert!(exact.use_prefill_logits);
 
         let mut followup = prompt.clone();
         followup.extend([12, 13, 14, 15]);
         let longer_live = preferred_qwen35_slot(
             [
-                (0, &followup[..34], Some(prompt.as_slice()), None, false),
-                (1, &followup[..33], Some(prompt.as_slice()), None, false),
+                (
+                    0,
+                    &followup[..34],
+                    Some((0, prompt.as_slice())),
+                    None,
+                    false,
+                ),
+                (
+                    1,
+                    &followup[..33],
+                    Some((0, prompt.as_slice())),
+                    None,
+                    false,
+                ),
             ],
             &followup,
         )
         .expect("longest live continuation");
         assert_eq!(longer_live.slot, SlotId(0));
         assert_eq!(longer_live.cached_tokens, 34);
-        assert!(!longer_live.restore_prompt_anchor);
+        assert_eq!(longer_live.restore_anchor_index, None);
         assert!(!longer_live.use_prefill_logits);
     }
 
@@ -43448,11 +43849,14 @@ mod qwen35_bounded_prefill_watchdog_tests {
     fn qwen_continuation_waits_for_the_strongest_active_anchor() {
         let prompt = vec![21_u32; 64];
         assert_eq!(
-            qwen35_slot_affinity([(0, &[][..], Some(prompt.as_slice()), None, true)], &prompt,),
+            qwen35_slot_affinity(
+                [(0, &[][..], Some((0, prompt.as_slice())), None, true)],
+                &prompt,
+            ),
             Some(Qwen35SlotAffinity::Active(Qwen35SlotPreference {
                 slot: SlotId(0),
                 cached_tokens: prompt.len(),
-                restore_prompt_anchor: true,
+                restore_anchor_index: Some(0),
                 use_prefill_logits: true,
             }))
         );
@@ -43463,8 +43867,8 @@ mod qwen35_bounded_prefill_watchdog_tests {
         let prompt = vec![22_u32; 64];
         let affinity = qwen35_slot_affinity(
             [
-                (0, &[][..], Some(prompt.as_slice()), None, true),
-                (1, &[][..], Some(prompt.as_slice()), None, false),
+                (0, &[][..], Some((0, prompt.as_slice())), None, true),
+                (1, &[][..], Some((0, prompt.as_slice())), None, false),
             ],
             &prompt,
         )
@@ -43475,7 +43879,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
             Qwen35SlotAffinity::Idle(Qwen35SlotPreference {
                 slot: SlotId(1),
                 cached_tokens: prompt.len(),
-                restore_prompt_anchor: true,
+                restore_anchor_index: Some(0),
                 use_prefill_logits: true,
             })
         );
@@ -43486,8 +43890,8 @@ mod qwen35_bounded_prefill_watchdog_tests {
         let prompt = vec![23_u32; 100_000];
         let affinity = qwen35_slot_affinity(
             [
-                (0, &[][..], Some(&prompt[..99_000]), None, true),
-                (1, &[][..], Some(&prompt[..2_048]), None, false),
+                (0, &[][..], Some((2, &prompt[..99_000])), None, true),
+                (1, &[][..], Some((0, &prompt[..2_048])), None, false),
             ],
             &prompt,
         )
@@ -43512,7 +43916,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
             Some(Qwen35SlotAffinity::Active(Qwen35SlotPreference {
                 slot: SlotId(0),
                 cached_tokens: prompt.len(),
-                restore_prompt_anchor: false,
+                restore_anchor_index: None,
                 use_prefill_logits: false,
             }))
         );
@@ -43533,7 +43937,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
         let preference = Qwen35SlotPreference {
             slot: SlotId(0),
             cached_tokens: 64,
-            restore_prompt_anchor: true,
+            restore_anchor_index: Some(0),
             use_prefill_logits: true,
         };
         let (cold_reply, _cold_rx) = oneshot::channel();

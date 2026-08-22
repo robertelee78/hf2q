@@ -2123,7 +2123,9 @@ mod tests {
         }
     }
 
-    fn canonical_qwen36_27b_config() -> crate::inference::models::qwen35::Qwen35Config {
+    /// Qwen3.8-27B fixture includes its appended MTP full-attention layer.
+    /// Omitting it understates token-linear admission by 1/16 (6.25%).
+    fn canonical_qwen38_27b_config() -> crate::inference::models::qwen35::Qwen35Config {
         use crate::inference::models::qwen35::{default_layer_types, Qwen35Config, Qwen35Variant};
         Qwen35Config {
             variant: Qwen35Variant::Dense,
@@ -2148,8 +2150,8 @@ mod tests {
             max_position_embeddings: 262_144,
             vocab_size: 248_320,
             attn_output_gate: true,
-            mtp_num_hidden_layers: 0,
-            mtp_use_dedicated_embeddings: false,
+            mtp_num_hidden_layers: 1,
+            mtp_use_dedicated_embeddings: true,
             intermediate_size: Some(17_408),
             moe: None,
         }
@@ -2198,12 +2200,12 @@ mod tests {
     }
 
     #[test]
-    fn qwen36_slot_kv_bytes_per_token_counts_only_full_attention_tq_rows() {
-        let cfg = canonical_qwen36_27b_config();
-        // 16 full layers. Per layer: two packed U8 tensors of 4*256 bytes
+    fn qwen38_slot_kv_bytes_per_token_counts_full_attention_and_mtp_tq_rows() {
+        let cfg = canonical_qwen38_27b_config();
+        // 16 target full layers plus one MTP layer. Per layer: two packed U8 tensors of 4*256 bytes
         // plus two F32 norm tensors of 4*1 elements = 2,080 bytes/token.
-        assert_eq!(super::qwen35_slot_kv_bytes_per_token(&cfg, true), 33_280);
-        assert_eq!(super::qwen35_slot_kv_bytes_per_token(&cfg, false), 131_072);
+        assert_eq!(super::qwen35_slot_kv_bytes_per_token(&cfg, true), 35_360);
+        assert_eq!(super::qwen35_slot_kv_bytes_per_token(&cfg, false), 139_264);
         assert!(
             (cfg.max_position_embeddings as u64 + 8_192)
                 * super::qwen35_slot_kv_bytes_per_token(&cfg, true)
