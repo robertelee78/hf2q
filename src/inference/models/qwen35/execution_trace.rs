@@ -1,7 +1,7 @@
 //! Opaque validation of host-side GGML command-encoding observations.
 //!
 //! This catalog binds the exact loaded/executed weight bytes to typed
-//! mlx-native 0.11.0 requests, capability decisions, and resolved Metal
+//! mlx-native 0.11.1 requests, capability decisions, and resolved Metal
 //! dispatches. It proves encoding only. It does not prove command-buffer
 //! submission/completion, numerical correctness, latency, or cost authority.
 
@@ -21,7 +21,7 @@ use super::execution_observation::{
     ExecutedTensorObservation, LoadedTensorCodec, VerifiedExecutedTensorCatalog,
 };
 
-const MLX_NATIVE_TRACE_VERSION: &str = "0.11.0";
+const MLX_NATIVE_TRACE_VERSION: &str = "0.11.1";
 
 pub(crate) struct VerifiedEncodedDispatchCatalog {
     executed_catalog_sha256: String,

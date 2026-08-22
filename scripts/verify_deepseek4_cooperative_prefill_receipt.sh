@@ -85,7 +85,7 @@ jq -e --slurpfile raw "$raw" \
     and $raw_receipt.schema_version == 1
     and .schema_version == 2 and .status == "pass"
     and .source_sha == $source_sha and .model_sha256 == $model_sha256
-    and .mlx_native_version == "0.11.0"
+    and .mlx_native_version == "0.11.1"
     and .artifact_bytes == 107431343168 and .layers == 43
     and .prefix_rows == 148 and .prefix_mod_128 == 20 and .prefix_mod_4 == 0
     and [.parity_shapes[] | [.sequences,.rows_per_lane,.aggregate_rows]]

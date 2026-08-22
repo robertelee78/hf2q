@@ -194,7 +194,7 @@ fn build_official_work(
         hf2q_version: env!("CARGO_PKG_VERSION").into(),
         hf2q_git_commit: crate::convert::receipt::require_converter_git_commit()
             .context("official source-teacher build lacks an exact git commit")?,
-        mlx_native_version: "0.11.0",
+        mlx_native_version: "0.11.1",
         host_os: sysinfo::System::long_os_version().unwrap_or_else(|| std::env::consts::OS.into()),
         host_arch: std::env::consts::ARCH,
         source_manifest_id,

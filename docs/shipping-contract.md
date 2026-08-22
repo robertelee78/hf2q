@@ -88,7 +88,7 @@ cache, or forward graph.
   pre-request turn anchor; poisoned or inconsistent state resets fully.
   The 0.1.7 release also pairs large automatic MoE gate/up
   projections through the routing-schedule primitive introduced in
-  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.11.0`.
+  `mlx-native 0.10.10` and retained by the pinned `mlx-native 0.11.1`.
   Decode-sized and forced diagnostic routes remain independent;
   native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
@@ -136,7 +136,7 @@ checkout-disjoint `CARGO_HOME` and target directory, clears Rust toolchain,
 compiler, documentation, flags, wrapper, target, and profile override
 variables, and rejects Cargo config anywhere in the packed root's ancestry.
 Its dependency receipt binds the packed `Cargo.lock` and raw `cargo metadata`
-bytes, including the exact `mlx-native 0.11.0` crates.io source and checksum.
+bytes, including the exact `mlx-native 0.11.1` crates.io source and checksum.
 The protected release workflow rehashes and revalidates those downloaded raw
 files, then requires its newly packed `Cargo.lock` to be byte-identical before
 publishing.

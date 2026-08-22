@@ -578,7 +578,7 @@ jq -e '
 ' "$cooperative_raw" >/dev/null
 jq --arg source_sha "$EXPECTED_SHA" \
   --arg model_sha256 "$DEEPSEEK_MODEL_SHA256" \
-  --arg mlx_native_version "0.11.0" \
+  --arg mlx_native_version "0.11.1" \
   --arg raw_sha256 "$(sha256_file "$cooperative_raw")" \
   --arg test_log_sha256 "$(sha256_file "$cooperative_log")" \
   --arg measurement_log_sha256 "$(sha256_file "$cooperative_thermal_log")" \
@@ -1656,10 +1656,10 @@ jq -e '
   and .dependency_provenance.build.cargo_target_checkout_disjoint == true
   and .dependency_provenance.build.rust_build_override_env_cleared == true
   and .dependency_provenance.dependency.name == "mlx-native"
-  and .dependency_provenance.dependency.version == "0.11.0"
+  and .dependency_provenance.dependency.version == "0.11.1"
   and .dependency_provenance.dependency.source
     == "registry+https://github.com/rust-lang/crates.io-index"
   and .dependency_provenance.dependency.checksum
-    == "f9e25280262b20fd2894acc90229a7d2f695a1d818451473f95ef40125962cd8"
+    == "6f2fd765e3288d4e59a55eceaf11d978d45f40ef1fb34794a273636b69de05b7"
 ' "$OUT_ROOT/manifest.json" >/dev/null
 jq . "$OUT_ROOT/manifest.json"
