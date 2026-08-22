@@ -216,18 +216,20 @@ for call in \
   'matched_reference_speculation_totals "$rows_file"' \
   'matched_validate_host_observation_log ' \
   'matched_publish_result '; do
-    rg -Fq "$call" "$runner" \
+    grep -Fq "$call" "$runner" \
       || fail "production runner does not invoke tested predicate: $call"
 done
-model_id_init_line=$(rg -n '^if \[\[ -n "\$MODEL_ID" \]\]; then$' "$runner" \
+# shellcheck disable=SC2016
+model_id_init_line=$(grep -nE '^if \[\[ -n "\$MODEL_ID" \]\]; then$' "$runner" \
   | cut -d: -f1)
-trial_loop_line=$(rg -n '^for engine in \$TRIAL_ORDER; do$' "$runner" | cut -d: -f1)
+# shellcheck disable=SC2016
+trial_loop_line=$(grep -nE '^for engine in \$TRIAL_ORDER; do$' "$runner" | cut -d: -f1)
 [[ "$model_id_init_line" =~ ^[0-9]+$ && "$trial_loop_line" =~ ^[0-9]+$
   && model_id_init_line -lt trial_loop_line ]] \
   || fail "caller-provided MODEL_ID is not initialized before trials"
-[[ "$(rg -c '^matched_publish_result ' "$runner")" == 1 ]] \
+[[ "$(grep -c '^matched_publish_result ' "$runner")" == 1 ]] \
   || fail "passing summary does not have one audited publication path"
-if rg -q '^mv .*summary\.json' "$runner"; then
+if grep -Eq '^mv .*summary\.json' "$runner"; then
     fail "production runner bypasses summary-last publication"
 fi
 

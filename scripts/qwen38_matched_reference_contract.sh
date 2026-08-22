@@ -173,7 +173,8 @@ matched_validate_host_observation_log() {
       && gaps == 0 && invalid == 0)) || return 1
     if ((minimum_samples >= 3)); then
         ((starts == 1 && ends == 1)) || return 1
-        rg -q $'\tmeasurement$' "$host_log"
+        awk -F '\t' '$4 == "measurement" { found = 1 }
+          END { exit !found }' "$host_log"
     fi
 }
 
