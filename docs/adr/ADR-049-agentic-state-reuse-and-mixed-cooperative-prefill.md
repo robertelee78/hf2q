@@ -1,10 +1,20 @@
 # ADR-049: Agentic state reuse (multi-anchor) and Mixed-phase cooperative prefill
 
-- Status: Proposed
+- Status: Accepted; execution in progress (qwen35-family model-free Lane A
+  proof complete at rev 4, real-artifact gates and cross-family phases open)
 - Date: 2026-08-22
-- Updated: 2026-08-22 (rev 3, merged) — executor-audit corrections incorporated (payload-ownership rule for `pending_target_hidden` parent-allocation retention; per-model budgets + K-excludes-pending semantics; full-store invalidation on reset/poison/failed-restore; preflight-all-then-mutate restore contract; A.5 rewritten around the LIVE slot-aware MTP/target transactional rollback while H38 still pins `rollback_la_to`; B.0 publisher corrected to `publish_prefill_cohort_after_gate`; registry wording narrowed). Robert's framings integrated: the cross-family benefit directive governs ALL lanes (Lane A parity phases + Lane B §B.2 generalization + future families at bring-up), and every non-committed item is framed as FALSIFIED-with-evidence or OPEN HYPOTHESIS with a named deciding spike — never silently parked scope. Rebased onto `242882e8`.
+- Updated: 2026-08-22 (rev 4, qwen35-family model-free execution milestone)
+  — implementation commit `95d618c8`, based on main `32181b61`: explicit
+  per-slot AnchorStore,
+  linear-lineage pruning, fail-atomic restore preflight, exact payload
+  ownership/accounting, terminal publication, A.8 logs/metrics, idle audit,
+  independent reference-model + 17-mutation battery, and Lane C corrections.
+  Qwen3.6/Qwen3.8 hardware receipts are intentionally not claimed here; see
+  the execution ledger below.
 - Owners: hf2q serving engine (execution: the active qwen35/qwen38 serving-lane session; plan authored by the FreeToken research session)
-- Code pins: hf2q `242882e8` (= origin/main at this revision), mlx-native `0.11.2`. Anchors were authored at `815bd48d`; every correction-touched anchor was re-verified at `242882e8`. Re-verify anchors after any pull before editing.
+- Code pins: planning review at hf2q `242882e8`; rev-4 execution based on
+  merged main `32181b61`; mlx-native `0.11.2`. Anchors were authored at
+  `815bd48d`; every correction-touched anchor was re-verified before editing.
 - Provenance: full paper+code study of FreeToken (arXiv 2608.16157, "FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution") mapped onto hf2q/mlx-native by a nine-agent research swarm, then adversarially reviewed by two independent external models (Kimi K3 via opencode; gpt-5.6-sol via codex, 516k-token source-grounded review). Both reviews' MUST-FIX items are incorporated; the gpt-5.6-sol review found and this ADR closes a stale-KV lineage coherence bug in the original draft (§A.2).
 
 ## Context
@@ -88,7 +98,17 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 1. Byte-identity: anchor-restore-plus-suffix-prefill output vs cold full prefill, at every anchor depth, at both transaction widths {2,048 multi-slot, 4,096 single-slot}, boundary at slice edge and mid-slice-clamped.
 2. The A.2 lineage regression (A→B→C / rewind / old-C-must-not-restore).
 3. Cancellation: cancel mid-prefill after ≥2 anchors installed; committed list must equal the pre-request list.
-4. A **new** SlotAware divergence gate script: explicit `--scheduler inflight-batched --max-slots 4`, truly concurrent clients, covering equality hits, divergent rewrites, cancellation, failed prefill, speculative-state carry, stale-descendant rejection — and it must exit non-zero on any miss. (`bench_lcp_resume_speedup.sh` is NOT a gate for this feature: it drives the stride registry, issues its "4-worker" load sequentially, does not select the slot-aware scheduler, and exits 0 on a failed speedup — bench_lcp_resume_speedup.sh:303, :442. `test_agentic_cache_lifecycle.sh` covers cancellation/isolation, not multi-depth lineage; keep it, extend nothing into it.)
+4. `scripts/test_qwen35_slot_anchor_divergence.sh`: explicit
+   `--scheduler inflight-batched --max-slots 4`, truly concurrent clients,
+   equality hits, divergent rewrites, cancellation, failed prefill,
+   speculative-state carry, and stale-descendant rejection. It exits nonzero
+   on every miss and refuses to run when the listener process arguments do not
+   prove the required scheduler shape. (`bench_lcp_resume_speedup.sh` is NOT a
+   gate for this feature: it drives the stride registry, issues its "4-worker"
+   load sequentially, does not select the slot-aware scheduler, and exits 0 on
+   a failed speedup — bench_lcp_resume_speedup.sh:303, :442.
+   `test_agentic_cache_lifecycle.sh` covers cancellation/isolation, not
+   multi-depth lineage; keep it, extend nothing into it.)
 5. Perf acceptance: on the divergent-edit scenario, TTFT strictly better than cold; on append-only scenarios, byte-stable and within noise of today. Quiet box, receipts.
 6. `cargo test --bin hf2q` (never `--lib`), 40-module GPU lock intact.
 
@@ -110,6 +130,40 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 1. Correct the stale docs that actively misled this research: engine_qwen35.rs:169-170 ("capacity = 1" — live registry is byte-budgeted, capacity `usize::MAX` via `with_byte_budget`, :523-526); kv_cache.rs:127-128 (`n_v_heads=8`/"~60-90 MB" arena — real: n_v=32, ≈1.96 GiB); engine.rs:2300-2301 (qwen35 "501 short-circuit" — stale since 2026-05); lcp_registry.rs:781-783 (chunk_pos "in params_hash" — it is mangled into tenant_id); investigation_env.rs:553-556 ("~96 MB per 27B checkpoint" — real ≈149.6 MiB); load_info.rs:2151 fixture note (missing MTP layer → 6.25% admission undercount for Qwen3.8-27B).
 2. Document (not fix, this ADR) the two budget hazards: two independent 5%-of-RAM LCP budgets (engine.rs:3595-3597, engine_qwen35.rs:523-525 — same `default_lcp_byte_budget()` instantiated twice); `HF2Q_KV_PERSIST` carries THREE meanings (path — serve/mod.rs:974; `"0"` disable — :4457-4485; `"1"`/`"on"` enable — kv_persist/families/gemma4_dense.rs:21, kv_persist/index.rs:9). State the registry end-state: the SerialFifo registry + disk hydrate is the *permanent restart-hydrate tier* until the A.7 follow-on ADR replaces it — documented scope, not a stub.
 3. Import FreeToken's evaluation discipline into release evidence: report worst-case (tail) TTFT against client watchdog ceilings, not just means; an agentic-stability criterion (decode rate within a fixed % of single-turn under the N=4 workload); the A.4 strict-equality idle conservation audit; a reference-model invariant battery over the AnchorStore state machine (injected-mutation style — FreeToken's equivalent suite caught 17/17).
+
+### Qwen execution ledger — rev 4
+
+Model-free evidence at implementation commit `95d618c8`:
+
+- `qwen35_anchor_store` has an independent reference state machine and eight
+  focused tests. The mutation battery rejects 17/17 injected corruptions;
+  A→B→C/rewind removes B and C before branch X can write; pending state is
+  affinity-invisible; eviction is positional keep-newest-K; accounting charges
+  four committed payloads plus one pending payload exactly.
+- `slot_anchor_restore_preflights_every_payload_before_mutation` was added as
+  a falsifier before the restore refactor and failed against the interleaved
+  implementation: an invalid final recurrent payload left the cursor rewound
+  from 14 to 9. After the two-phase preflight/mutate refactor, the same test
+  proves all cursors, recurrent bytes, conv bytes, and parity remain unchanged
+  on validation failure.
+- `logical_buffer_copy_does_not_retain_chunk_sized_parent` proves the
+  speculative hidden row owns a fresh logical-size allocation after the
+  chunk-sized parent drops. Store accounting includes token/logit capacities,
+  every nested recurrent/conv allocation, cursor tables, and the detached
+  hidden row.
+- The SlotAware worker now stages captures as pending, publishes only after
+  the retained cache/ledger commit, selects the deepest epoch-valid match,
+  prunes descendants before the first divergent write, and clears the full
+  store before hard reset after failed restore, poison, or cold reset. A.8
+  fields emit in structured logs and Prometheus counters.
+
+Open proof work is concrete rather than implied by these unit results: run the
+new concurrent SlotAware divergence gate plus every-depth cold byte comparison
+on both Qwen3.6-35B-A3B and Qwen3.8-27B at 2,048- and 4,096-token transaction
+widths; record cancellation, failed-prefill, speculative-state, tail-TTFT,
+append-only-no-regression, and N=4 stability receipts. The release driver owns
+that hardware window. Gemma4/deepseek4 parity and Lane B remain required by the
+scope directive.
 
 ## Falsified findings and open hypotheses (studied, decided, documented)
 
