@@ -6243,21 +6243,22 @@ impl Qwen35Model {
         kv_cache: &HybridKvCache,
         slot_ids: &[SlotId],
     ) -> bool {
+        let ffn_storage_matches_family = self.layers.iter().all(|layer| {
+            matches!(
+                (self.cfg.moe.is_some(), layer.ffn()),
+                (true, Qwen35FfnWeights::MoeQ(_))
+                    | (false, Qwen35FfnWeights::DenseQ(_))
+                    | (false, Qwen35FfnWeights::DenseNative(_))
+                    | (false, Qwen35FfnWeights::Dense(_))
+            )
+        });
         if !(2..=16).contains(&slot_ids.len())
             || kv_cache.la_capture_active()
-            || self.cfg.moe.is_some()
             || !matches!(self.cfg.head_dim, 256 | 512)
             || std::env::var_os("HF2Q_LEGACY_PER_LAYER_CB")
                 .map(|value| value == "1")
                 .unwrap_or(false)
-            || self.layers.iter().any(|layer| {
-                !matches!(
-                    layer.ffn(),
-                    Qwen35FfnWeights::DenseQ(_)
-                        | Qwen35FfnWeights::DenseNative(_)
-                        | Qwen35FfnWeights::Dense(_)
-                )
-            })
+            || !ffn_storage_matches_family
             || kv_cache.full_attn.is_empty()
             || kv_cache.full_attn.iter().any(|slot| slot.tq.is_none())
         {
@@ -8111,7 +8112,7 @@ mod tests {
     use crate::inference::models::qwen35::forward_cpu::text_positions;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
     use crate::inference::models::qwen35::{
-        default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant,
+        default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant,
     };
     use mlx_native::MlxDevice;
 
@@ -8559,13 +8560,30 @@ mod tests {
                             w.up = mk_rand(&mut seed, m_size * h, 0.02);
                             w.down = mk_rand(&mut seed, h * m_size, 0.02);
                         }
+                        Qwen35FfnWeights::Moe(w) => {
+                            let moe = cfg.moe.as_ref().expect("MoE config");
+                            let ne = moe.num_experts as usize;
+                            let m_moe = moe.moe_intermediate_size as usize;
+                            let m_shared = moe.shared_expert_intermediate_size as usize;
+                            // Equal router rows exercise the production lowest-index
+                            // tie rule while the expert/shared projections remain
+                            // non-zero, so scalar-vs-batched parity is meaningful.
+                            w.router.fill(0.0);
+                            w.expert_gate = mk_rand(&mut seed, ne * m_moe * h, 0.02);
+                            w.expert_up = mk_rand(&mut seed, ne * m_moe * h, 0.02);
+                            w.expert_down = mk_rand(&mut seed, ne * h * m_moe, 0.02);
+                            w.shared_gate_logit = mk_rand(&mut seed, h, 0.02);
+                            w.shared_gate = mk_rand(&mut seed, m_shared * h, 0.02);
+                            w.shared_up = mk_rand(&mut seed, m_shared * h, 0.02);
+                            w.shared_down = mk_rand(&mut seed, h * m_shared, 0.02);
+                        }
                         // DenseQ cannot be mutated in tests (Metal buffers are immutable);
                         // test models always use Dense (F32) weights via empty_from_cfg.
                         Qwen35FfnWeights::DenseNative(_) | Qwen35FfnWeights::DenseQ(_) => {
                             panic!("unexpected native dense FFN in mutable test fixture");
                         }
-                        Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_) => {
-                            panic!("unexpected MoE in dense cfg");
+                        Qwen35FfnWeights::MoeQ(_) => {
+                            panic!("unexpected quantized MoE in mutable test fixture");
                         }
                     }
                 }
@@ -8598,11 +8616,25 @@ mod tests {
                             w.up = mk_rand(&mut seed, m_size * h, 0.02);
                             w.down = mk_rand(&mut seed, h * m_size, 0.02);
                         }
+                        Qwen35FfnWeights::Moe(w) => {
+                            let moe = cfg.moe.as_ref().expect("MoE config");
+                            let ne = moe.num_experts as usize;
+                            let m_moe = moe.moe_intermediate_size as usize;
+                            let m_shared = moe.shared_expert_intermediate_size as usize;
+                            w.router.fill(0.0);
+                            w.expert_gate = mk_rand(&mut seed, ne * m_moe * h, 0.02);
+                            w.expert_up = mk_rand(&mut seed, ne * m_moe * h, 0.02);
+                            w.expert_down = mk_rand(&mut seed, ne * h * m_moe, 0.02);
+                            w.shared_gate_logit = mk_rand(&mut seed, h, 0.02);
+                            w.shared_gate = mk_rand(&mut seed, m_shared * h, 0.02);
+                            w.shared_up = mk_rand(&mut seed, m_shared * h, 0.02);
+                            w.shared_down = mk_rand(&mut seed, h * m_shared, 0.02);
+                        }
                         Qwen35FfnWeights::DenseNative(_) | Qwen35FfnWeights::DenseQ(_) => {
                             panic!("unexpected native dense FFN in mutable test fixture");
                         }
-                        Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_) => {
-                            panic!("unexpected MoE in dense cfg");
+                        Qwen35FfnWeights::MoeQ(_) => {
+                            panic!("unexpected quantized MoE in mutable test fixture");
                         }
                     }
                 }
@@ -8661,6 +8693,343 @@ mod tests {
             mtp_use_dedicated_embeddings: true,
             intermediate_size: Some(64),
             moe: None,
+        }
+    }
+
+    fn physical_batch_hybrid_moe_cfg() -> Qwen35Config {
+        let mut cfg = physical_batch_hybrid_cfg();
+        cfg.variant = Qwen35Variant::Moe;
+        cfg.intermediate_size = None;
+        cfg.moe = Some(Qwen35MoeConfig {
+            moe_intermediate_size: 32,
+            num_experts: 16,
+            num_experts_per_tok: 8,
+            shared_expert_intermediate_size: 32,
+        });
+        cfg
+    }
+
+    /// Build a small native-GGML MoE fixture for this GPU test only.
+    /// Production inference loads the artifact's declared expert buffers
+    /// unchanged; it never enters this synthetic helper.
+    fn quantize_test_moe_experts_to_q8_0(
+        mut model: Qwen35Model,
+        device: &MlxDevice,
+    ) -> Qwen35Model {
+        use super::super::in_memory_loader::quantize_f32_to_q8_0_buffer;
+        use super::super::weight_loader::MoeFfnWeightsQ;
+
+        let cfg = model.cfg.clone();
+        let moe = cfg.moe.as_ref().expect("MoE config");
+        let ne = moe.num_experts as usize;
+        let m = moe.moe_intermediate_size as usize;
+        let h = cfg.hidden_size as usize;
+        for layer in &mut model.layers {
+            let quantized = match layer.ffn() {
+                Qwen35FfnWeights::Moe(weights) => MoeFfnWeightsQ {
+                    router: weights.router.clone(),
+                    expert_gate_q: quantize_f32_to_q8_0_buffer(
+                        &weights.expert_gate,
+                        vec![ne, m, h],
+                        device,
+                    )
+                    .expect("quantize test expert gate"),
+                    expert_up_q: quantize_f32_to_q8_0_buffer(
+                        &weights.expert_up,
+                        vec![ne, m, h],
+                        device,
+                    )
+                    .expect("quantize test expert up"),
+                    expert_down_q: quantize_f32_to_q8_0_buffer(
+                        &weights.expert_down,
+                        vec![ne, h, m],
+                        device,
+                    )
+                    .expect("quantize test expert down"),
+                    ggml_type_gate_up: GgmlType::Q8_0,
+                    ggml_type_down: GgmlType::Q8_0,
+                    shared_gate_logit: weights.shared_gate_logit.clone(),
+                    shared_gate: weights.shared_gate.clone(),
+                    shared_up: weights.shared_up.clone(),
+                    shared_down: weights.shared_down.clone(),
+                    expert_gate_affine: None,
+                    expert_up_affine: None,
+                    expert_down_affine: None,
+                },
+                other => panic!(
+                    "expected synthetic F32 MoE weights, got {}",
+                    other.variant()
+                ),
+            };
+            *layer.ffn_mut() = Qwen35FfnWeights::MoeQ(quantized);
+        }
+        model
+    }
+
+    #[test]
+    fn qwen35moe_router_ties_choose_lowest_experts_for_every_batch_row() {
+        use mlx_native::ops::moe_softmax_topk::{dispatch_moe_softmax_topk, register};
+
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        const N_TOKENS: usize = 4;
+        const N_EXPERTS: usize = 16;
+        const TOP_K: usize = 8;
+        let logits =
+            upload_f32(&vec![0.0; N_TOKENS * N_EXPERTS], &device).expect("equal router logits");
+        let ids = device
+            .alloc_buffer(
+                N_TOKENS * TOP_K * std::mem::size_of::<u32>(),
+                DType::U32,
+                vec![N_TOKENS, TOP_K],
+            )
+            .expect("router ids");
+        let weights = device
+            .alloc_buffer(
+                N_TOKENS * TOP_K * std::mem::size_of::<f32>(),
+                DType::F32,
+                vec![N_TOKENS, TOP_K],
+            )
+            .expect("router weights");
+        let mut registry = KernelRegistry::new();
+        register(&mut registry);
+        let mut enc = device.command_encoder().expect("router encoder");
+        dispatch_moe_softmax_topk(
+            &mut enc,
+            &mut registry,
+            &device,
+            &logits,
+            &ids,
+            &weights,
+            N_TOKENS as u32,
+            N_EXPERTS as u32,
+            TOP_K as u32,
+        )
+        .expect("router dispatch");
+        enc.commit_and_wait_labeled("test.qwen35moe.lowest-index-ties")
+            .expect("router completion");
+
+        let ids = ids.as_slice::<u32>().expect("router ids readable");
+        let weights = weights.as_slice::<f32>().expect("router weights readable");
+        for row in 0..N_TOKENS {
+            assert_eq!(
+                &ids[row * TOP_K..(row + 1) * TOP_K],
+                &(0..TOP_K as u32).collect::<Vec<_>>(),
+                "router tie order changed in row {row}"
+            );
+            for &weight in &weights[row * TOP_K..(row + 1) * TOP_K] {
+                assert!((weight - 1.0 / TOP_K as f32).abs() <= f32::EPSILON);
+            }
+        }
+    }
+
+    #[test]
+    fn qwen35moe_physical_widths_match_scalar_and_keep_three_id_projections_per_layer() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        if std::env::var_os("HF2Q_LEGACY_PER_LAYER_CB").is_some() {
+            return;
+        }
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let cfg = physical_batch_hybrid_moe_cfg();
+        let unquantized = deterministic_dense_model(cfg.clone());
+        let admission_cache =
+            HybridKvCache::new_with_options(&cfg, &device, 32, 2, true).expect("admission cache");
+        assert!(
+            !unquantized
+                .can_forward_gpu_greedy_multi_slot(&admission_cache, &[SlotId(0), SlotId(1)]),
+            "synthetic F32 MoE must remain on its parity-only scalar path"
+        );
+        let mut model = quantize_test_moe_experts_to_q8_0(unquantized, &device);
+        // Keep the greedy head deliberately margin-stable so the test proves
+        // the physical body through its live cache state instead of turning a
+        // one-ULP logit near-tie into a spurious token mismatch. Equal logits
+        // have the same lowest-index contract as the router test above.
+        model.output_weight.fill(0.0);
+
+        // N=1 pins the established scalar contract; N=2/4/8/16 pin the
+        // physical route and make the call-count assertion below fail if it
+        // ever regresses to a per-slot loop.
+        for width in [1_usize, 2, 4, 8, 16] {
+            let slot_ids: Vec<SlotId> = (0..width as u32).map(SlotId).collect();
+            let initial: Vec<u32> = (0..width as u32)
+                .map(|row| 3 + (row * 7) % (cfg.vocab_size - 3))
+                .collect();
+            let mut scalar_cache =
+                HybridKvCache::new_with_options(&cfg, &device, 32, width as u32, true)
+                    .expect("scalar MoE TQ cache");
+            let mut scalar_inputs = initial.clone();
+            let mut scalar_steps = Vec::new();
+            for position in 0..2_i32 {
+                let mut predicted = Vec::with_capacity(width);
+                for row in 0..width {
+                    predicted.push(
+                        model
+                            .forward_gpu_greedy(
+                                &[scalar_inputs[row]],
+                                &[position; 4],
+                                &mut scalar_cache,
+                                slot_ids[row],
+                            )
+                            .expect("independent scalar MoE target"),
+                    );
+                }
+                scalar_inputs.clone_from(&predicted);
+                scalar_steps.push(predicted);
+            }
+
+            let mut batch_cache =
+                HybridKvCache::new_with_options(&cfg, &device, 32, width as u32, true)
+                    .expect("physical MoE TQ cache");
+            if width > 1 {
+                assert!(model.can_forward_gpu_greedy_multi_slot(&batch_cache, &slot_ids));
+            }
+            let mut batch_inputs = initial;
+            for position in 0..2_i32 {
+                let positions = vec![position; 4 * width];
+                super::super::gpu_ffn::reset_test_moe_id_projection_calls();
+                let predicted = model
+                    .forward_gpu_greedy_multi_slot(
+                        &batch_inputs,
+                        &positions,
+                        &mut batch_cache,
+                        &slot_ids,
+                    )
+                    .expect("physical width-N MoE target");
+                assert_eq!(
+                    predicted, scalar_steps[position as usize],
+                    "physical MoE width {width} diverged at decode position {position}"
+                );
+                assert!(
+                    predicted.iter().all(|&token| token == 0),
+                    "equal output logits must choose the lowest token index"
+                );
+                assert_eq!(
+                    super::super::gpu_ffn::test_moe_id_projection_calls(),
+                    3 * cfg.num_hidden_layers as u64,
+                    "physical MoE width {width} introduced per-expert host dispatches"
+                );
+                batch_inputs = predicted;
+            }
+
+            for (scalar, physical) in scalar_cache.full_attn.iter().zip(&batch_cache.full_attn) {
+                assert_eq!(scalar.current_len, physical.current_len);
+            }
+            let mut registry = KernelRegistry::new();
+            for (layer, (scalar, physical)) in scalar_cache
+                .full_attn
+                .iter()
+                .zip(&batch_cache.full_attn)
+                .enumerate()
+            {
+                for slot_id in slot_ids.iter().copied() {
+                    for (label, is_k) in [("K", true), ("V", false)] {
+                        let mut enc = device.command_encoder().expect("TQ compare encoder");
+                        let scalar_values = scalar
+                            .dequant_seq_to_temp_f32_unrotated_for_slot(
+                                is_k,
+                                2,
+                                0,
+                                scalar_cache.max_seq_len,
+                                cfg.num_key_value_heads,
+                                cfg.head_dim,
+                                slot_id,
+                                &mut enc,
+                                &mut registry,
+                                &device,
+                            )
+                            .expect("dequant scalar TQ cache");
+                        let physical_values = physical
+                            .dequant_seq_to_temp_f32_unrotated_for_slot(
+                                is_k,
+                                2,
+                                0,
+                                batch_cache.max_seq_len,
+                                cfg.num_key_value_heads,
+                                cfg.head_dim,
+                                slot_id,
+                                &mut enc,
+                                &mut registry,
+                                &device,
+                            )
+                            .expect("dequant physical TQ cache");
+                        enc.commit_and_wait_labeled("test.qwen35moe.tq-state-parity")
+                            .expect("TQ compare completion");
+                        let scalar_values = scalar_values
+                            .as_slice::<f32>()
+                            .expect("scalar dequantized TQ values");
+                        let physical_values = physical_values
+                            .as_slice::<f32>()
+                            .expect("physical dequantized TQ values");
+                        let max_abs = scalar_values
+                            .iter()
+                            .zip(physical_values)
+                            .map(|(left, right)| (left - right).abs())
+                            .fold(0.0_f32, f32::max);
+                        assert!(
+                            max_abs <= 1e-2,
+                            "physical MoE width {width} slot {} full-attn layer {layer} {label} state drift {max_abs}",
+                            slot_id.0
+                        );
+                    }
+                }
+            }
+            for (scalar, physical) in scalar_cache
+                .linear_attn
+                .iter()
+                .zip(&batch_cache.linear_attn)
+            {
+                assert_eq!(scalar.pp_flipped, physical.pp_flipped);
+                let qkv_channels = 2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
+                    + cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+                let conv_per_slot =
+                    (qkv_channels * cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
+                let recurrent_per_slot = (cfg.linear_key_head_dim
+                    * cfg.linear_value_head_dim
+                    * cfg.linear_num_value_heads) as usize;
+                for slot_id in slot_ids.iter().copied() {
+                    let compare_current =
+                        |label: &str,
+                         scalar_buf: &MlxBuffer,
+                         physical_buf: &MlxBuffer,
+                         elements: usize| {
+                            let offset = slot_id.0 as u64
+                                * elements as u64
+                                * std::mem::size_of::<f32>() as u64;
+                            let scalar_view = scalar_buf.slice_view(offset, elements);
+                            let scalar_values =
+                                scalar_view.as_slice::<f32>().expect("scalar state view");
+                            let physical_view = physical_buf.slice_view(offset, elements);
+                            let physical_values = physical_view
+                                .as_slice::<f32>()
+                                .expect("physical state view");
+                            let max_abs = scalar_values
+                                .iter()
+                                .zip(physical_values)
+                                .map(|(left, right)| (left - right).abs())
+                                .fold(0.0_f32, f32::max);
+                            assert!(
+                                max_abs <= 5e-3,
+                                "physical MoE width {width} slot {} {label} state drift {max_abs}",
+                                slot_id.0
+                            );
+                        };
+                    let (scalar_conv, _) = scalar.conv_bufs_for_slot(slot_id);
+                    let (physical_conv, _) = physical.conv_bufs_for_slot(slot_id);
+                    compare_current("convolution", scalar_conv, physical_conv, conv_per_slot);
+                    let (scalar_recurrent, _) = scalar.recurrent_bufs_for_slot(slot_id);
+                    let (physical_recurrent, _) = physical.recurrent_bufs_for_slot(slot_id);
+                    compare_current(
+                        "recurrent",
+                        scalar_recurrent,
+                        physical_recurrent,
+                        recurrent_per_slot,
+                    );
+                }
+            }
         }
     }
 
