@@ -14,7 +14,7 @@ use crate::serve::api::registry::{
 };
 use crate::serve::api::sse::{DeltaKind, GenerationEvent, StreamStats};
 
-use super::progress::RequestProgress;
+use super::progress::{LatencyGapReceipt, RequestProgress};
 use super::sampling::{
     accepted_single_tool_call_is_terminal, decode_token_limit, grammar_runtime, sample,
     sampler_config,
@@ -57,12 +57,21 @@ fn send_visible(
     events: &mpsc::Sender<GenerationEvent>,
     event: GenerationEvent,
     request_started: Instant,
-    first_visible_at: &mut Option<Duration>,
+    semantic_sse: &mut LatencyGapReceipt,
+) -> Result<()> {
+    send_visible_at(events, event, request_started.elapsed(), semantic_sse)
+}
+
+fn send_visible_at(
+    events: &mpsc::Sender<GenerationEvent>,
+    event: GenerationEvent,
+    visible_at: Duration,
+    semantic_sse: &mut LatencyGapReceipt,
 ) -> Result<()> {
     events
         .blocking_send(event)
         .map_err(|_| anyhow::anyhow!("DeepSeek-V4 SSE client disconnected"))?;
-    first_visible_at.get_or_insert_with(|| request_started.elapsed());
+    semantic_sse.observe(visible_at)?;
     Ok(())
 }
 
@@ -71,7 +80,7 @@ fn emit_or_buffer_content(
     pending_whitespace: &mut String,
     events: &mpsc::Sender<GenerationEvent>,
     request_started: Instant,
-    first_visible_at: &mut Option<Duration>,
+    semantic_sse: &mut LatencyGapReceipt,
 ) -> Result<()> {
     if text.is_empty() {
         return Ok(());
@@ -89,7 +98,7 @@ fn emit_or_buffer_content(
                 text,
             },
             request_started,
-            first_visible_at,
+            semantic_sse,
         )
     } else {
         let mut visible = std::mem::take(pending_whitespace);
@@ -101,7 +110,7 @@ fn emit_or_buffer_content(
                 text: visible,
             },
             request_started,
-            first_visible_at,
+            semantic_sse,
         )
     }
 }
@@ -112,7 +121,7 @@ fn emit_tool_block(
     events: &mpsc::Sender<GenerationEvent>,
     next_index: &mut usize,
     request_started: Instant,
-    first_visible_at: &mut Option<Duration>,
+    semantic_sse: &mut LatencyGapReceipt,
 ) -> Result<bool> {
     let calls = registry::parse_tool_call_bodies(registration, body)
         .with_context(|| format!("parse DeepSeek-V4 DSML tool call block: body={body:?}"))?;
@@ -129,7 +138,7 @@ fn emit_tool_block(
                 arguments: Some(call.arguments_json),
             },
             request_started,
-            first_visible_at,
+            semantic_sse,
         )?;
         *next_index += 1;
     }
@@ -181,7 +190,7 @@ fn route_tool_content(
     registration: Option<&ModelRegistration>,
     events: &mpsc::Sender<GenerationEvent>,
     request_started: Instant,
-    first_visible_at: &mut Option<Duration>,
+    semantic_sse: &mut LatencyGapReceipt,
 ) -> Result<()> {
     if text.is_empty() {
         return Ok(());
@@ -194,7 +203,7 @@ fn route_tool_content(
                 text,
             },
             request_started,
-            first_visible_at,
+            semantic_sse,
         )?;
         return Ok(());
     };
@@ -205,7 +214,7 @@ fn route_tool_content(
                 pending_whitespace,
                 events,
                 request_started,
-                first_visible_at,
+                semantic_sse,
             )?,
             ToolCallEvent::ToolCallOpen => {
                 // DSML commonly begins with formatting newlines. They are not
@@ -227,7 +236,7 @@ fn route_tool_content(
                     events,
                     index,
                     request_started,
-                    first_visible_at,
+                    semantic_sse,
                 )?;
             }
         }
@@ -248,7 +257,7 @@ fn route_stream_fragment(
     registration: Option<&ModelRegistration>,
     events: &mpsc::Sender<GenerationEvent>,
     request_started: Instant,
-    first_visible_at: &mut Option<Duration>,
+    semantic_sse: &mut LatencyGapReceipt,
 ) -> Result<()> {
     if let Some(splitter) = reasoning.as_mut() {
         for (slot, text) in splitter.feed(fragment) {
@@ -260,7 +269,7 @@ fn route_stream_fragment(
                         text,
                     },
                     request_started,
-                    first_visible_at,
+                    semantic_sse,
                 )?,
                 SplitSlot::Content => route_tool_content(
                     text,
@@ -273,7 +282,7 @@ fn route_stream_fragment(
                     registration,
                     events,
                     request_started,
-                    first_visible_at,
+                    semantic_sse,
                 )?,
             }
         }
@@ -289,7 +298,7 @@ fn route_stream_fragment(
             registration,
             events,
             request_started,
-            first_visible_at,
+            semantic_sse,
         )?;
     }
     Ok(())
@@ -306,7 +315,7 @@ pub(super) struct StreamRouter {
     tool_index: usize,
     saw_tool: bool,
     request_started: Instant,
-    first_visible_at: Option<Duration>,
+    semantic_sse: LatencyGapReceipt,
 }
 
 impl StreamRouter {
@@ -325,7 +334,7 @@ impl StreamRouter {
             tool_index: 0,
             saw_tool: false,
             request_started,
-            first_visible_at: None,
+            semantic_sse: LatencyGapReceipt::default(),
         }
     }
 
@@ -350,7 +359,7 @@ impl StreamRouter {
             registration,
             events,
             self.request_started,
-            &mut self.first_visible_at,
+            &mut self.semantic_sse,
         )
     }
 
@@ -370,7 +379,7 @@ impl StreamRouter {
                             text,
                         },
                         self.request_started,
-                        &mut self.first_visible_at,
+                        &mut self.semantic_sse,
                     )?,
                     SplitSlot::Content => route_tool_content(
                         text,
@@ -383,7 +392,7 @@ impl StreamRouter {
                         registration,
                         events,
                         self.request_started,
-                        &mut self.first_visible_at,
+                        &mut self.semantic_sse,
                     )?,
                 }
             }
@@ -396,7 +405,7 @@ impl StreamRouter {
                         &mut self.pending_content_whitespace,
                         events,
                         self.request_started,
-                        &mut self.first_visible_at,
+                        &mut self.semantic_sse,
                     )?,
                     ToolCallEvent::ToolCallText(text) => {
                         self.tool_body.push_str(&text);
@@ -414,14 +423,18 @@ impl StreamRouter {
                     text: std::mem::take(&mut self.pending_content_whitespace),
                 },
                 self.request_started,
-                &mut self.first_visible_at,
+                &mut self.semantic_sse,
             )?;
         }
         Ok(self.saw_tool)
     }
 
     pub(super) fn first_visible_at(&self) -> Option<Duration> {
-        self.first_visible_at
+        self.semantic_sse.first()
+    }
+
+    pub(super) fn semantic_sse_receipt(&self) -> LatencyGapReceipt {
+        self.semantic_sse
     }
 }
 
@@ -460,7 +473,7 @@ pub(in crate::serve::api) fn generate_stream(
         let mut pending_content_whitespace = String::new();
         let mut tool_index = 0usize;
         let mut saw_tool = false;
-        let mut first_visible_at = None;
+        let mut semantic_sse = LatencyGapReceipt::default();
         let max_tokens = decode_token_limit(
             params.max_tokens,
             prompt_tokens.len(),
@@ -517,9 +530,9 @@ pub(in crate::serve::api) fn generate_stream(
                     registration,
                     events,
                     request_started,
-                    &mut first_visible_at,
+                    &mut semantic_sse,
                 )?;
-                if let Some(ttft) = first_visible_at {
+                if let Some(ttft) = semantic_sse.first() {
                     progress.first_semantic_token(ttft);
                 }
             }
@@ -553,7 +566,7 @@ pub(in crate::serve::api) fn generate_stream(
                             text,
                         },
                         request_started,
-                        &mut first_visible_at,
+                        &mut semantic_sse,
                     )?,
                     SplitSlot::Content => route_tool_content(
                         text,
@@ -566,7 +579,7 @@ pub(in crate::serve::api) fn generate_stream(
                         registration,
                         events,
                         request_started,
-                        &mut first_visible_at,
+                        &mut semantic_sse,
                     )?,
                 }
             }
@@ -579,7 +592,7 @@ pub(in crate::serve::api) fn generate_stream(
                         &mut pending_content_whitespace,
                         events,
                         request_started,
-                        &mut first_visible_at,
+                        &mut semantic_sse,
                     )?,
                     ToolCallEvent::ToolCallText(text) => {
                         tool_body.push_str(&text);
@@ -597,14 +610,16 @@ pub(in crate::serve::api) fn generate_stream(
                     text: std::mem::take(&mut pending_content_whitespace),
                 },
                 request_started,
-                &mut first_visible_at,
+                &mut semantic_sse,
             )?;
         }
         if saw_tool {
             finish_reason = "tool_calls";
         }
         let decode_duration = decode_started.elapsed();
-        let semantic_ttft = first_visible_at.unwrap_or_else(|| request_started.elapsed());
+        let semantic_ttft = semantic_sse
+            .first()
+            .unwrap_or_else(|| request_started.elapsed());
         events
             .blocking_send(GenerationEvent::Done {
                 finish_reason,
@@ -663,8 +678,9 @@ pub(in crate::serve::api) fn generate_stream(
 
 #[cfg(test)]
 mod tests {
+    use super::super::progress::LatencyGapReceipt;
     use super::{
-        finish_cancellation_cache_recovery, route_tool_content, send_visible,
+        finish_cancellation_cache_recovery, route_tool_content, send_visible_at,
         trigger_tool_grammar_on_raw_marker, CancellationCacheRecovery,
     };
     use crate::serve::api::engine_supervisor::EngineSupervisor;
@@ -702,40 +718,39 @@ mod tests {
     }
 
     #[test]
-    fn semantic_ttft_is_recorded_once_on_the_first_visible_event() {
+    fn semantic_sse_receipt_records_first_event_and_maximum_gap() {
         let (events, mut receiver) = mpsc::channel(1);
-        let request_started = Instant::now();
-        let mut first_visible_at = None;
+        let mut semantic_sse = LatencyGapReceipt::default();
 
-        send_visible(
+        send_visible_at(
             &events,
             GenerationEvent::Delta {
                 kind: DeltaKind::Content,
                 text: "first".into(),
             },
-            request_started,
-            &mut first_visible_at,
+            Duration::from_millis(5),
+            &mut semantic_sse,
         )
         .expect("send first visible event");
         assert!(matches!(
             receiver.blocking_recv(),
             Some(GenerationEvent::Delta { text, .. }) if text == "first"
         ));
-        let first = first_visible_at.expect("first visible timestamp");
+        let first = semantic_sse.first().expect("first visible timestamp");
 
-        send_visible(
+        send_visible_at(
             &events,
             GenerationEvent::Delta {
                 kind: DeltaKind::Content,
                 text: "second".into(),
             },
-            request_started
-                .checked_sub(Duration::from_secs(1))
-                .expect("earlier instant"),
-            &mut first_visible_at,
+            Duration::from_millis(18),
+            &mut semantic_sse,
         )
         .expect("send second visible event");
-        assert_eq!(first_visible_at, Some(first));
+        assert_eq!(semantic_sse.first(), Some(first));
+        assert_eq!(semantic_sse.observations(), 2);
+        assert_eq!(semantic_sse.max_gap(), Duration::from_millis(13));
     }
 
     #[test]
@@ -749,7 +764,7 @@ mod tests {
         let mut saw = false;
         let mut runtime = None;
         let (events, mut receiver) = mpsc::channel(4);
-        let mut first_visible_at = None;
+        let mut semantic_sse = LatencyGapReceipt::default();
         let raw = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/Cargo.toml</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
 
         route_tool_content(
@@ -763,7 +778,7 @@ mod tests {
             Some(&registration),
             &events,
             Instant::now(),
-            &mut first_visible_at,
+            &mut semantic_sse,
         )
         .expect("route DSML tool call");
 

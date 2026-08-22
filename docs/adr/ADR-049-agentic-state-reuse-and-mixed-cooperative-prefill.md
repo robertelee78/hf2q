@@ -1,11 +1,11 @@
 # ADR-049: Agentic state reuse (multi-anchor) and Mixed-phase cooperative prefill
 
 - Status: Accepted; execution in progress (qwen35-family, Gemma4, and
-  DeepSeek4 model-free Lane A proof complete at rev 8; real-artifact gates
-  remain open)
+  DeepSeek4 model-free Lane A proof plus the DeepSeek4 B.1 candidate are
+  integrated at rev 10; real-artifact gates remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-22 (rev 9, cross-family multi-anchor parity plus B.0
-  coherence milestone)
+- Updated: 2026-08-22 (rev 10, cross-family multi-anchor parity plus B.1
+  implementation candidate)
   — the Qwen implementation lineage begins at `95d618c8`, based on main
   `32181b61`: explicit per-slot AnchorStore,
   linear-lineage pruning, fail-atomic restore preflight, exact payload
@@ -28,8 +28,11 @@
   The model-free B.0 Mixed-step spike also passed both cooperative-prefill
   commit and poison paths without changing any concurrently decoding peer
   cursor or cache/compressor byte; the exact ownership ledger and test names
-  are recorded in §B.0. That result opens B.1 for implementation but does not
-  by itself accept the scheduler policy.
+  are recorded in §B.0. B.1 now attempts a FIFO-prefix cooperative prefill
+  capped at 128 rows per lane while retaining the two-window serial fallback
+  and recovery-tail priority. Its model-free cap/workload gates and
+  production-event latency receipts are recorded in §B.1; hardware latency,
+  artifact parity/performance, thermal, and memory acceptance remain open.
 - Owners: hf2q serving engine (execution: the active qwen35/qwen38 serving-lane session; plan authored by the FreeToken research session)
 - Code pins: planning review at hf2q `242882e8`; rev-6 execution based on
   merged main `32181b61`; mlx-native `0.11.2`. Anchors were authored at
@@ -222,10 +225,18 @@ and N>1 concurrency before marking the family phase hardware-proven.
 
 The executable proof is `mixed_prefill_commit_preserves_decode_lane_cursor_and_cache_bytes` plus `mixed_prefill_poison_preserves_decode_lane_cursor_and_cache_bytes` in `src/inference/models/deepseek4/mixed_coherence_tests.rs`. Both build six independent warm caches (two aligned prefill lanes and four live decode lanes), execute the real decode publisher first to mirror a Mixed step, then execute cooperative-prefill publication. The first accepts the prefill commit; the second rejects its supervisor gate and poisons the two prefill caches. Both byte-compare every decode lane's complete attention/KV backing, indexer storage, and all four compressor accumulators, and require its cursor to remain exactly at the one position published by its own decode step. Result: 2 passed, 0 failed. The bypass is not load-bearing for cache-state isolation; B.1 remains responsible for scheduler/SSE latency and product-performance contracts.
 
-**B.1 — Mixed cohort policy (only after B.0 passes).** Treat this as a new scheduler policy, not the removal of one bypass: cohort planning under a runnable decode must honor a per-lane row cap AND the aggregate cap while preserving FIFO-prefix compatibility, identical-plan/reply-class requirements, and recovery-tail behavior (planner engine.rs:9601-9687; lane clamp slots.rs:224-242; `MIN_MATRIX_APPEND_TOKENS = 33`, verifier_forward.rs:25; recovery tail engine_deepseek4.rs:48).
+**B.1 — Mixed cohort policy (only after B.0 passes).** Treat this as a new scheduler policy, not the removal of one bypass: cohort planning under a runnable decode must honor a per-lane row cap AND the aggregate cap while preserving FIFO-prefix compatibility, identical-plan/reply-class requirements, and recovery-tail behavior (`plan_deepseek4_prefill_cohort`; `Deepseek4PrefillState::plan_cooperative_prefill`; `MIN_MATRIX_APPEND_TOKENS`; `RECOVERY_TAIL_TOKENS`).
 - Rows-per-lane parameterized ∈ {128, 256}; **default 4×128** (halves F payments per aggregate progress while keeping GPU occupancy nearest today's serial Mixed slice); promote to 4×256 only on hardware measurement with contract margin. Projected walls for the canonical four ~3,520-token warm-suffix workload: serial Mixed ≈ 75 s of aggregate prefill work; 4×256 ≈ 31 s; 4×128 ≈ 46 s with near-serial per-slice occupancy.
 - Dual latency contract, both fail-closed: (i) scheduler decode-visit gap bound; (ii) client-visible **semantic SSE gap** bound per active decoder. Numbers to be fixed in the spike branch from measured baselines, recorded in this ADR at execution time.
 - New required workload test: four prefills + active streaming decoders, measuring decoder starvation behind Mixed prefill — the existing B4 artifact proof is a pure 132-step decode comparison after prefixes are installed (real_artifact_decode_cohort_tests.rs:309) and does not cover this.
+
+**B.1 implementation-candidate evidence (2026-08-22; hardware acceptance still OPEN).** `deepseek4_mixed_work_budget` now supplies two independent Mixed limits whenever decode is runnable: the existing two-window serial limit and a 128-row cooperative per-lane limit. `advance_deepseek4_prefill_quantum` attempts the cooperative plan even when the serial fallback is bounded; `plan_deepseek4_prefill_cohort` intersects the per-lane limit with the unchanged `MAX_COOPERATIVE_PREFILL_ROWS = 2_048` aggregate ceiling and accepts only the registered `{128, 256}` policy values. The scheduler-selected oldest prefill remains the cooperative primary, so the existing FIFO-prefix, identical-plan, reply-class, cold-wave-width, and client-open checks remain authoritative. The round-robin choice is only the serial fallback. A selected recovery tail still suppresses decode for its bounded replay and bypasses cohort execution, preserving the established cursor-alignment rule.
+
+The execution still makes one `supervised_verifier_prefill_cohort` call over the combined row set and uses the existing `forward_ffn_rows`/`mm_id` path; B.1 adds no per-expert loop or dispatch. Pure-prefill calls pass no lane cap and therefore retain their previous aggregate-cap row allocation. No product ceiling or `MAX_COOPERATIVE_PREFILL_ROWS` changed.
+
+Two receipts are now bound to production events for every successful SlotAware DeepSeek request: `scheduler_decode_max_gap_ms` is observed once at actual decode-batch entry (the first gap begins when decode becomes runnable), while `semantic_sse_max_gap_ms` is observed only after an actual content/reasoning/tool delta is accepted by the SSE channel. Empty role frames and token-generation proxies cannot satisfy the semantic receipt. Both carry observation counts and first-event timestamps under the same request id; the model-free bound verifier rejects missing observations, a gap above its bound, or a non-monotonic trace. The hardware spike must set the numeric bounds from quiet-box baselines and apply the same fail-closed rules before either latency contract can be accepted.
+
+Model-free proof at this candidate: `deepseek_mixed_cohort_rows_fail_closed_on_lane_and_aggregate_caps` pins the 2,048 aggregate ceiling, shipping 4×128 shape, optional 4×256 shape, pure-prefill allocation, and rejection of sub-window/unregistered caps. `deepseek4_four_prefills_and_live_decoders_visit_every_mixed_turn` drives an eight-slot scheduler for five Mixed turns and proves the same four decoders are visited every turn in stable FIFO order while the same four-prefill FIFO prefix advances by exactly 128 rows/lane (512 aggregate). `latency_gap_receipt_is_measurable_and_fails_closed` proves missing-observation, over-bound, and non-monotonic traces reject; `semantic_sse_receipt_records_first_event_and_maximum_gap` proves the actual semantic send path records every event and the exact maximum gap. Focused result: 138 passed, 0 failed, 8 artifact/hardware tests ignored. This is implementation evidence, not the required real-artifact performance/parity, semantic-SSE ceiling, thermal, or peak-RSS evidence.
 
 **B.2 — Family generalization (scope directive).** Row-aggregation economics are not DeepSeek-specific: every MoE family pays a per-slice fixed cost ≈ one full expert-weight read. DeepSeek4 already carries the aggregation machinery — it is Lane B's first implementation, not an omission from this list — while cross-slot aggregation is deepseek4-only machinery at HEAD (`src/serve/forward_prefill_batched.rs` batches within one sequence; its own doc records the slot-aware N/A at :400-426). Hypothesis: qwen35-family and gemma4 MoE slot-aware prefill show the same F-dominance and would benefit from cooperative suffix aggregation. Deciding spike: measure per-slice fixed cost vs rows on those families' slot-aware prefill using the ADR-042 receipt methodology. If confirmed, cooperative aggregation for those families becomes a REQUIRED phase under this ADR (new code — qwen35 is the in-repo per-slot-KV reference for concurrency-correct forwards); if refuted (e.g. smaller expert pools make F negligible there), record the falsification here with the measurements.
 
@@ -329,7 +340,7 @@ Framing (Robert): items below are either FALSIFIED with evidence in hand, or OPE
 - [ ] A.2 lineage regression and the new SlotAware divergence gate exist in `scripts/` and fail closed.
 - [ ] Telemetry (A.8) emitting in production logs.
 - [ ] Lane C doc corrections merged; budget hazards + registry end-state documented in operating-kv-cache.md; ADR-017-per-family-status row updated.
-- [ ] B.0 spike verdict recorded here (pass → B.1 executed with contracts; fail → linked successor ADR).
+- [x] B.0 spike verdict recorded here (PASS; B.1 implementation candidate executed, hardware contracts still open).
 - [ ] This ADR's Status flipped to Implemented (or Superseded-in-part with links), with Updated stamps at each landing.
 
 ## Consequences

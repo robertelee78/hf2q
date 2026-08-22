@@ -7892,11 +7892,14 @@ fn deepseek4_reconcile_cold_cohort(
 }
 
 // DeepSeek's native matrix window is 128 tokens. During a lopsided mixed turn,
-// two windows keep the peer-visible silence well below the measured 6–7
-// second 2,048-token transaction while retaining enough matrix work to
-// amortize submission overhead. Solo prefill remains uncapped; runnable decode
-// always bounds the competing prefill slice.
+// two serial windows keep the peer-visible silence well below the measured
+// 6–7 second 2,048-token transaction. Compatible FIFO-prefix lanes instead
+// share one 128-row transaction per lane: four lanes make 512 aggregate rows
+// without widening either the lane-local or global transaction ceiling.
+// Solo prefill remains uncapped; runnable decode always bounds the competing
+// prefill slice.
 const DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS: usize = 2;
+const DEEPSEEK4_MIXED_COHORT_ROWS_PER_LANE: usize = 128;
 // Eight is the canonical interactive DeepSeek decode quantum. Cold unary
 // lanes retain the configured bulk quantum; warm and streaming work yield at
 // most every eight tokens.
@@ -7906,6 +7909,7 @@ const DEEPSEEK4_INTERACTIVE_DECODE_QUANTUM_MAX: usize = 8;
 struct Deepseek4MixedWorkBudget {
     decode_quantum: usize,
     max_prefill_windows: Option<usize>,
+    max_cooperative_rows_per_lane: Option<usize>,
 }
 
 fn deepseek4_mixed_work_budget(
@@ -7920,6 +7924,8 @@ fn deepseek4_mixed_work_budget(
             configured_decode_quantum.clamp(1, DEEPSEEK4_INTERACTIVE_DECODE_QUANTUM_MAX)
         },
         max_prefill_windows: has_runnable_decode.then_some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS),
+        max_cooperative_rows_per_lane: has_runnable_decode
+            .then_some(DEEPSEEK4_MIXED_COHORT_ROWS_PER_LANE),
     }
 }
 
@@ -8523,6 +8529,29 @@ fn deepseek4_cooperative_prefill_widths(
     (maximum_width >= minimum_width).then_some(minimum_width..=maximum_width)
 }
 
+fn deepseek4_cooperative_prefill_lane_rows(
+    width: usize,
+    sliding_window: usize,
+    max_rows_per_lane: Option<usize>,
+) -> Option<usize> {
+    if width == 0 || sliding_window == 0 {
+        return None;
+    }
+    let aggregate_cap = crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS;
+    let aggregate_lane_cap = aggregate_cap.checked_div(width)?;
+    let lane_cap = match max_rows_per_lane {
+        Some(cap @ (128 | 256)) => cap.min(aggregate_lane_cap),
+        Some(_) => return None,
+        None => aggregate_lane_cap,
+    };
+    let lane_rows = lane_cap / sliding_window * sliding_window;
+    (lane_rows >= sliding_window
+        && lane_rows
+            .checked_mul(width)
+            .is_some_and(|rows| rows <= aggregate_cap))
+    .then_some(lane_rows)
+}
+
 fn choose_full_context_slot(
     reusable_prefix_lengths: &[usize],
     empty_sessions: &[bool],
@@ -8560,12 +8589,14 @@ fn choose_full_context_slot(
 /// compressed KV and recurrent state. Cold matrix prefill yields only after an
 /// atomic cache+ledger commit. One bounded cohort admits four active cold
 /// prefills. Lopsided `Mixed` work advances a visible decoder between
-/// two-window prefill slices. Terminal cold lanes retain one scheduler tick
-/// until their unfinished cold peers drain, publishing the cohort together.
-/// Recovery tails align before decode; complete four-request cold matrix waves
-/// and compatible warm waves may share cooperative prefill. Larger lopsided
-/// tool-result prefills remain interleavable. No more than one prefill
-/// transaction owns the shared scratch arena at any instant.
+/// prefill transactions: compatible FIFO prefixes share at most 128 rows per
+/// lane, while incompatible lanes retain the two-window serial slice. Terminal
+/// cold lanes retain one scheduler tick until their unfinished cold peers
+/// drain, publishing the cohort together. Recovery tails align before decode;
+/// complete four-request cold matrix waves and compatible warm waves may share
+/// cooperative prefill. Larger lopsided tool-result prefills remain
+/// interleavable. No more than one prefill transaction owns the shared scratch
+/// arena at any instant.
 #[allow(clippy::too_many_arguments)]
 fn run_slot_aware_deepseek4(
     mut model: super::engine_deepseek4::Deepseek4LoadedModel,
@@ -9099,6 +9130,7 @@ fn run_slot_aware_deepseek4(
                             serial_fallback,
                             kv_bytes_per_token,
                             None,
+                            None,
                             &supervisor,
                         );
                         (fatal, used_serial_fallback, serial_fallback)
@@ -9131,13 +9163,14 @@ fn run_slot_aware_deepseek4(
                 let active_cold_prefills = deepseek4_cold_prefill_active(&slots);
                 let has_runnable_decode = deepseek4_has_runnable_decode(&slots, &decode_handles);
                 let cold_unary_only = deepseek4_only_cold_unary_decode(&slots, &decode_handles);
-                let prefill = next_deepseek4_mixed_prefill_handle(&slots, last_prefill_slot)
-                    .unwrap_or(prefill);
+                let serial_fallback =
+                    next_deepseek4_mixed_prefill_handle(&slots, last_prefill_slot)
+                        .unwrap_or(prefill);
                 let recovery_tail_selected = slots
-                    .get(prefill.slot_id.0 as usize)
+                    .get(serial_fallback.slot_id.0 as usize)
                     .and_then(Option::as_ref)
                     .is_some_and(|(work, _, installed)| {
-                        *installed == prefill
+                        *installed == serial_fallback
                             && matches!(work, Deepseek4SlotWork::Prefill(state) if state.is_recovery_tail())
                     });
                 let decode_handles = if recovery_tail_selected {
@@ -9181,18 +9214,42 @@ fn run_slot_aware_deepseek4(
                     );
                     break 'worker;
                 }
-                last_prefill_slot = Some(prefill.slot_id);
-                if let Some(fatal) = advance_deepseek4_prefill(
-                    &mut model,
-                    &mut sessions,
-                    &mut slots,
-                    &mut scheduler,
-                    registration.as_ref(),
-                    prefill,
-                    kv_bytes_per_token,
-                    mixed_budget.max_prefill_windows,
-                    &supervisor,
-                ) {
+                let (fatal, used_serial_fallback) = if recovery_tail_selected {
+                    (
+                        advance_deepseek4_prefill(
+                            &mut model,
+                            &mut sessions,
+                            &mut slots,
+                            &mut scheduler,
+                            registration.as_ref(),
+                            serial_fallback,
+                            kv_bytes_per_token,
+                            mixed_budget.max_prefill_windows,
+                            &supervisor,
+                        ),
+                        true,
+                    )
+                } else {
+                    advance_deepseek4_prefill_quantum(
+                        &mut model,
+                        &mut sessions,
+                        &mut slots,
+                        &mut scheduler,
+                        registration.as_ref(),
+                        prefill,
+                        serial_fallback,
+                        kv_bytes_per_token,
+                        mixed_budget.max_prefill_windows,
+                        mixed_budget.max_cooperative_rows_per_lane,
+                        &supervisor,
+                    )
+                };
+                record_deepseek4_serial_prefill_fallback(
+                    &mut last_prefill_slot,
+                    serial_fallback,
+                    used_serial_fallback,
+                );
+                if let Some(fatal) = fatal {
                     fail_stop_deepseek4_worker(
                         &supervisor,
                         &mut rx,
@@ -9641,6 +9698,7 @@ fn plan_deepseek4_prefill_cohort(
     slots: &[Option<Deepseek4Slot>],
     scheduler: &InflightBatchedScheduler,
     primary: SlotHandle,
+    max_rows_per_lane: Option<usize>,
 ) -> Result<Option<Vec<Deepseek4CooperativeCandidate>>> {
     let handles = scheduler.prefill_handles_fifo();
     anyhow::ensure!(
@@ -9661,14 +9719,11 @@ fn plan_deepseek4_prefill_cohort(
         return Ok(None);
     };
     for width in widths.rev() {
-        let lane_rows = crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS
-            .checked_div(width)
-            .unwrap_or(0)
-            / sliding_window
-            * sliding_window;
-        if lane_rows == 0 {
+        let Some(lane_rows) =
+            deepseek4_cooperative_prefill_lane_rows(width, sliding_window, max_rows_per_lane)
+        else {
             continue;
-        }
+        };
         let mut candidates = Vec::with_capacity(width);
         let mut expected_plan = None;
         let mut expected_reply_class = None;
@@ -9748,26 +9803,17 @@ fn advance_deepseek4_prefill_quantum(
     serial_fallback: SlotHandle,
     kv_bytes_per_token: u64,
     max_matrix_prefill_windows: Option<usize>,
+    max_cooperative_rows_per_lane: Option<usize>,
     supervisor: &EngineSupervisor,
 ) -> (Option<SlotAwareGpuFatal>, bool) {
-    if max_matrix_prefill_windows.is_some() {
-        return (
-            advance_deepseek4_prefill(
-                model,
-                sessions,
-                slots,
-                scheduler,
-                registration,
-                serial_fallback,
-                kv_bytes_per_token,
-                max_matrix_prefill_windows,
-                supervisor,
-            ),
-            true,
-        );
-    }
-    let candidates = match plan_deepseek4_prefill_cohort(model, sessions, slots, scheduler, primary)
-    {
+    let candidates = match plan_deepseek4_prefill_cohort(
+        model,
+        sessions,
+        slots,
+        scheduler,
+        primary,
+        max_cooperative_rows_per_lane,
+    ) {
         Ok(Some(candidates)) => candidates,
         Ok(None) => {
             return (
@@ -9779,7 +9825,7 @@ fn advance_deepseek4_prefill_quantum(
                     registration,
                     serial_fallback,
                     kv_bytes_per_token,
-                    None,
+                    max_matrix_prefill_windows,
                     supervisor,
                 ),
                 true,
@@ -9864,7 +9910,7 @@ fn advance_deepseek4_prefill_quantum(
                 registration,
                 serial_fallback,
                 kv_bytes_per_token,
-                None,
+                max_matrix_prefill_windows,
                 supervisor,
             ),
             true,
@@ -10146,6 +10192,22 @@ fn try_decode_batch_deepseek4_cohort(
             completed_ticks: 0,
             tick_error: None,
         });
+    }
+
+    if let Some((lane_index, error)) = lanes.iter_mut().enumerate().find_map(|(index, lane)| {
+        lane.state
+            .begin_scheduler_decode_visit()
+            .err()
+            .map(|error| (index, error))
+    }) {
+        let first = lanes.swap_remove(lane_index);
+        let mut fatal = SlotAwareGpuFatal::invariant_slot(first.handle, first.reply, error);
+        fatal.extend_slots(
+            lanes
+                .into_iter()
+                .map(|lane| (Some(lane.handle), lane.reply)),
+        );
+        return Deepseek4DecodeCohortRun::Handled(Some(fatal));
     }
 
     tracing::info!(
@@ -10475,6 +10537,9 @@ fn decode_batch_deepseek4(
             SlotReply::Unary(_) => None,
             SlotReply::Stream { events, .. } => Some(events),
         };
+        if let Err(error) = state.begin_scheduler_decode_visit() {
+            return Some(SlotAwareGpuFatal::invariant_slot(handle, reply, error));
+        }
         let mut completed_ticks = deferred_decode_ticks;
         let mut tick_error = None;
         let mut client_closed = false;
@@ -30812,6 +30877,7 @@ mod tests {
             Deepseek4MixedWorkBudget {
                 decode_quantum: 8,
                 max_prefill_windows: Some(2),
+                max_cooperative_rows_per_lane: Some(128),
             },
             "the wider pure-decode default must not widen interactive Mixed work"
         );
@@ -30963,6 +31029,59 @@ mod tests {
         assert_eq!(deepseek4_cooperative_prefill_widths(4, false), Some(2..=4));
         assert_eq!(deepseek4_cooperative_prefill_widths(3, true), None);
         assert_eq!(deepseek4_cooperative_prefill_widths(4, true), Some(4..=4));
+    }
+
+    #[test]
+    fn deepseek_mixed_cohort_rows_fail_closed_on_lane_and_aggregate_caps() {
+        let aggregate_cap = crate::inference::models::deepseek4::MAX_COOPERATIVE_PREFILL_ROWS;
+        assert_eq!(
+            aggregate_cap, 2_048,
+            "B.1 must not widen the product ceiling"
+        );
+        assert_eq!(
+            deepseek4_cooperative_prefill_lane_rows(4, 128, Some(128)),
+            Some(128),
+            "the shipping Mixed policy is 4x128"
+        );
+        assert_eq!(
+            deepseek4_cooperative_prefill_lane_rows(4, 128, Some(256)),
+            Some(256),
+            "the deciding spike may exercise 4x256 without changing the default"
+        );
+        assert_eq!(
+            deepseek4_cooperative_prefill_lane_rows(4, 128, None),
+            Some(512),
+            "pure prefill retains its existing aggregate-cap allocation"
+        );
+        for width in 2..=4 {
+            let rows = deepseek4_cooperative_prefill_lane_rows(width, 128, Some(128))
+                .expect("128 rows fit every supported width");
+            assert_eq!(rows, 128);
+            assert!(rows * width <= aggregate_cap);
+        }
+        assert_eq!(
+            deepseek4_cooperative_prefill_lane_rows(4, 128, Some(127)),
+            None,
+            "a sub-window lane cap must fail closed instead of widening"
+        );
+        assert_eq!(
+            deepseek4_cooperative_prefill_lane_rows(4, 128, Some(255)),
+            None,
+            "an unregistered intermediate policy must not round into service"
+        );
+        assert_eq!(
+            deepseek4_cooperative_prefill_lane_rows(4, 128, Some(384)),
+            None,
+            "the policy surface is restricted to the ADR's 128/256 rows"
+        );
+        assert_eq!(
+            deepseek4_cooperative_prefill_lane_rows(0, 128, Some(128)),
+            None
+        );
+        assert_eq!(
+            deepseek4_cooperative_prefill_lane_rows(4, 0, Some(128)),
+            None
+        );
     }
 
     #[test]
@@ -31294,6 +31413,7 @@ mod tests {
             Deepseek4MixedWorkBudget {
                 decode_quantum: 8,
                 max_prefill_windows: Some(2),
+                max_cooperative_rows_per_lane: Some(128),
             }
         );
         assert_eq!(
@@ -31316,6 +31436,11 @@ mod tests {
         assert_eq!(
             deepseek4_mixed_work_budget(8, false, false).max_prefill_windows,
             None
+        );
+        assert_eq!(
+            deepseek4_mixed_work_budget(8, false, false).max_cooperative_rows_per_lane,
+            None,
+            "pure prefill must not inherit the Mixed lane cap"
         );
         assert!(deepseek4_should_park_completion(true, 1));
         assert!(!deepseek4_should_park_completion(true, 0));
@@ -31377,6 +31502,88 @@ mod tests {
     }
 
     #[test]
+    fn deepseek4_four_prefills_and_live_decoders_visit_every_mixed_turn() {
+        let request = |prompt_tokens, max_tokens| AdmitRequest {
+            prompt_tokens,
+            max_tokens,
+            kv_bytes_needed: 0,
+            prompt_kv_bytes: 0,
+            preferred_slot: None,
+        };
+        let mut scheduler = InflightBatchedScheduler::new_with_kv_budget(8, 8, 0);
+        scheduler.set_prefill_chunk_tokens(u32::MAX);
+        let mut decoders = Vec::new();
+        for _ in 0..4 {
+            let handle = scheduler
+                .admit(request(552, 512))
+                .expect("admit live streaming decoder")
+                .handle
+                .expect("decoder handle");
+            scheduler.advance_after_prefill(handle, 552);
+            decoders.push(handle);
+        }
+        let mut prefills = Vec::new();
+        for _ in 0..4 {
+            prefills.push(
+                scheduler
+                    .admit(request(8_192, 64))
+                    .expect("admit concurrent prefill")
+                    .handle
+                    .expect("prefill handle"),
+            );
+        }
+
+        let mixed_budget = deepseek4_mixed_work_budget(64, true, false);
+        assert_eq!(mixed_budget.decode_quantum, 8);
+        assert_eq!(mixed_budget.max_cooperative_rows_per_lane, Some(128));
+        let mut last_visit = vec![None; decoders.len()];
+        let mut maximum_visit_gap = vec![0usize; decoders.len()];
+        for turn in 0..5 {
+            let (primary, visited) = match scheduler.step().expect("Mixed scheduler turn") {
+                SchedulerStep::Mixed {
+                    prefill,
+                    decode_handles,
+                    ..
+                } => (prefill, decode_handles),
+                other => panic!("expected four-prefill Mixed turn, got {other:?}"),
+            };
+            assert_eq!(primary, prefills[0], "cohort primary remains the FIFO head");
+            assert_eq!(
+                visited, decoders,
+                "every live decoder is visited every turn"
+            );
+            for (lane, handle) in decoders.iter().enumerate() {
+                let visit_index = visited
+                    .iter()
+                    .position(|candidate| candidate == handle)
+                    .expect("active decoder visit");
+                assert_eq!(visit_index, lane, "decoder FIFO order remains stable");
+                if let Some(previous) = last_visit[lane].replace(turn) {
+                    maximum_visit_gap[lane] = maximum_visit_gap[lane].max(turn - previous);
+                }
+                for _ in 0..mixed_budget.decode_quantum {
+                    scheduler.advance_after_decode(*handle);
+                }
+            }
+
+            let cohort = scheduler.prefill_handles_fifo();
+            assert_eq!(&cohort[..4], prefills.as_slice(), "cohort is a FIFO prefix");
+            let lane_rows = deepseek4_cooperative_prefill_lane_rows(
+                cohort.len().min(4),
+                128,
+                mixed_budget.max_cooperative_rows_per_lane,
+            )
+            .expect("shipping 4x128 cohort shape");
+            assert_eq!(lane_rows, 128);
+            assert_eq!(lane_rows * 4, 512);
+            for handle in cohort.into_iter().take(4) {
+                scheduler.advance_after_prefill(handle, lane_rows as u32);
+            }
+        }
+        assert_eq!(maximum_visit_gap, vec![1; 4]);
+    }
+
+    #[test]
     fn deepseek4_saturated_cold_unary_wave_restores_bulk_prefill_until_last_prefill() {
         let request = |prompt_tokens, max_tokens| AdmitRequest {
             prompt_tokens,
@@ -31427,6 +31634,7 @@ mod tests {
             Deepseek4MixedWorkBudget {
                 decode_quantum: 64,
                 max_prefill_windows: Some(2),
+                max_cooperative_rows_per_lane: Some(128),
             },
             "cold unary decode retains its completion-sized quantum until a recovery tail drains"
         );
