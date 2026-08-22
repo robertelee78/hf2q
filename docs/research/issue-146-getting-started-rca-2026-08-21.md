@@ -193,6 +193,29 @@ The root `GGUFs.md`, checksum file, and machine-readable manifest distinguish
 this pair from the existing peer-engine/L40 artifacts. The text model embeds the
 required projector digest and mixed pairs fail closed.
 
+### Completed Q5_K_M runtime correction
+
+The author-hosted Q5_K_M file is no longer rejected at first forward. Native
+inference now admits direct packed Q5_K and Q6_K embedding gathers through one
+typed routing authority. It validates the artifact's packed byte geometry,
+storage type, capability, and resolved route, and fails closed for unsupported
+representations. It does not dequantize the embedding or output head and
+re-encode either tensor into a convenient runtime format.
+
+The exact 19,535,701,568-byte artifact at immutable revision
+`0a72776892f98db49381fdf69f4b9982222ec9dc` has SHA-256
+`4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e`.
+The real Apple-Silicon gate proves its Q5_K embedding, Q5_K MTP projection,
+Q6_K output head, native quantized target layers, and exact target/MTP
+output-head allocation sharing. It also proves four-position speculative
+verification remains decision-equivalent to serial target decoding.
+
+hf2q pins the published registry release `mlx-native 0.11.2`, checksum
+`22f4bd6661e77994c6f26a79fdd2c188f3d5252aa7e51616f5feb080b22da8e0`.
+That release additionally makes equal-logit GPU argmax choose the lowest token
+index, matching the CPU greedy contract. Full matched Q5 throughput remains a
+separate acceptance gate and is not inferred from this correctness result.
+
 ### Completed guide correction
 
 The replacement guide:
