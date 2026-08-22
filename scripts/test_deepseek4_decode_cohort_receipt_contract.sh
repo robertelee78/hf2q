@@ -15,6 +15,7 @@ measurement="$tmp_dir/measurement.log"
 settle="$tmp_dir/settle.log"
 contention_measurement="$tmp_dir/measurement-contention.log"
 contention_settle="$tmp_dir/settle-contention.log"
+memory_log="$tmp_dir/memory-pressure.log"
 
 jq -n '
   def counter($cb;$sync):
@@ -24,15 +25,35 @@ jq -n '
     parity:{prefix_rows:148,steps:132,final_position:280,final_mod_4:0,
       final_mod_128:24,physical_to_logical:[2,0,3,1],
       exact_state_logits_cache_recurrent:true},
-    benchmark:{position:6676,logical_capacity:131072,loaded_idle_seconds:45,
-      pairs:10,order:"alternating",
-      serial_ms:[20,20,20,20,20,20,20,20,20,20],
-      cohort_ms:[10,10,10,10,10,10,10,10,10,10],
-      serial_median_ms:20,cohort_median_ms:10,speedup:2,
-      serial_counters:[range(0;10)|counter(92;4)],
-      cohort_counters:[range(0;10)|counter(23;1)],
+    residency:{weight_bytes:100,serial_live_cache_bytes:20,
+      cohort_live_cache_bytes:20,serial_snapshot_bytes:10,
+      cohort_snapshot_bytes:10,tracked_total_bytes:160},
+    benchmark:{position:6676,anchor_exact_state_logits_cache_recurrent:true,
+      logical_capacity:131072,loaded_idle_seconds:45,pairs:20,order:"alternating",
+      serial_ms:[range(0;20)|if (. % 2) == 0 then 5 else 14 end],
+      cohort_ms:[range(0;20)|10],
+      serial_median_ms:9.5,cohort_median_ms:10,speedup:0.95,
+      unconditioned_order_signature:{
+        historical_signature:"even_delta_negative_odd_delta_positive",
+        even_delta_median_ms:-5,odd_delta_median_ms:4,
+        observed:true,gating:false},
+      conditioned:{protocol:"same-topology-prime-restore-measure",
+        primes_per_measurement:1,
+        serial_prime_ms:[range(0;20)|21],cohort_prime_ms:[range(0;20)|11],
+        serial_ms:[range(0;20)|20],cohort_ms:[range(0;20)|10],
+        serial_median_ms:20,cohort_median_ms:10,speedup:2,
+        even_order_speedup:2,odd_order_speedup:2,
+        even_order_paired_delta_median_ms:10,
+        odd_order_paired_delta_median_ms:10,performance_pass:true,
+        serial_prime_counters:[range(0;20)|counter(92;4)],
+        cohort_prime_counters:[range(0;20)|counter(23;1)],
+        serial_counters:[range(0;20)|counter(92;4)],
+        cohort_counters:[range(0;20)|counter(23;1)]},
+      serial_counters:[range(0;20)|counter(92;4)],
+      cohort_counters:[range(0;20)|counter(23;1)],
       serial_command_buffers_per_pair:92,cohort_command_buffers_per_pair:23,
-      serial_synchronizations_per_pair:4,cohort_synchronizations_per_pair:1},
+      serial_synchronizations_per_pair:4,cohort_synchronizations_per_pair:1,
+      topology_pass:true,topology_errors:[]},
     benchmark_environment:{profile:"clean-hf2q-mlx-metal-v1",
       override_variables_absent:true,unexpected_override_variables:[]}
   }
@@ -42,7 +63,7 @@ printf '%s\n' \
   'DeepSeek-V4 B=4 decode spike: exact_state_logits_cache_recurrent=true' \
   'ok' \
   '' \
-  'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4653 filtered out; finished in 202.59s' >"$test_log"
+  'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4653 filtered out; finished in 4.00s' >"$test_log"
 printf '2000\tnominal\tdecode-cohort-measurement-start\n' >"$measurement"
 printf '2002\tfair\tdecode-cohort-measurement\n' >>"$measurement"
 printf '2004\tfair\tdecode-cohort-measurement-end\n' >>"$measurement"
@@ -52,6 +73,12 @@ printf '2002\tquiet\tdecode-cohort-measurement\t100\t-\n' \
   >>"$contention_measurement"
 printf '2004\tquiet\tdecode-cohort-measurement-end\t100\t-\n' \
   >>"$contention_measurement"
+printf '2000\t1\t1000\t0\t92\tdecode-cohort-measurement-start\n' \
+  >"$memory_log"
+printf '2002\t1\t1000\t0\t91\tdecode-cohort-measurement\n' \
+  >>"$memory_log"
+printf '2004\t1\t1000\t0\t91\tdecode-cohort-measurement-end\n' \
+  >>"$memory_log"
 for timestamp in $(seq 1000 5 1060); do
   printf '%s\tnominal\tdecode-cohort-settle\n' "$timestamp" >>"$settle"
   printf '%s\tquiet\tdecode-cohort-settle\t100\t-\n' "$timestamp" \
@@ -62,14 +89,20 @@ sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 thermal_probe_source_sha=$(sha256_file "$ROOT_DIR/scripts/macos_thermal_probe.swift")
 thermal_probe_compiler_sha=abababababababababababababababababababababababababababababababab
 thermal_probe_binary_sha=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+memory_guard_source_sha=$(sha256_file "$ROOT_DIR/scripts/macos_memory_guard.sh")
 write_summary() {
   local output=$1
   local measurement_path=${2:-$measurement}
   local settle_path=${3:-$settle}
   local test_log_path=${4:-$test_log}
+  local raw_path=${5:-$raw}
+  local memory_path=${6:-$memory_log}
   local measurement_samples measurement_duration_seconds
   local non_nominal_measurement_samples fair_measurement_samples
   local over_limit_measurement_samples telemetry_gaps
+  local memory_samples memory_duration_seconds memory_initial_swapouts
+  local memory_final_swapouts memory_swapout_delta memory_min_free_percentage
+  local memory_max_pressure_level memory_max_throttled_pages
   IFS=$'\t' read -r measurement_samples measurement_duration_seconds \
     non_nominal_measurement_samples fair_measurement_samples \
     over_limit_measurement_samples telemetry_gaps <<<"$(awk -F '\t' '
@@ -87,8 +120,26 @@ write_summary() {
       END { print samples "\t" last-first "\t" non_nominal "\t" fair \
         "\t" over "\t" gaps }
     ' "$measurement_path")"
+  IFS=$'\t' read -r memory_samples memory_duration_seconds \
+    memory_initial_swapouts memory_final_swapouts memory_swapout_delta \
+    memory_min_free_percentage memory_max_pressure_level \
+    memory_max_throttled_pages <<<"$(awk -F '\t' '
+      NR == 1 {
+        first_time=$1; first_swapouts=$3; min_free=$5
+        max_pressure=$2; max_throttled=$4
+      }
+      $5 < min_free { min_free=$5 }
+      $2 > max_pressure { max_pressure=$2 }
+      $4 > max_throttled { max_throttled=$4 }
+      { samples++; last_time=$1; last_swapouts=$3 }
+      END {
+        print samples "\t" last_time-first_time "\t" first_swapouts "\t" \
+          last_swapouts "\t" last_swapouts-first_swapouts "\t" min_free \
+          "\t" max_pressure "\t" max_throttled
+      }
+    ' "$memory_path")"
   jq --arg source_sha "$source_sha" --arg model_sha256 "$model_sha" \
-    --arg raw_sha256 "$(sha256_file "$raw")" \
+    --arg raw_sha256 "$(sha256_file "$raw_path")" \
     --arg test_log_sha256 "$(sha256_file "$test_log_path")" \
     --arg measurement_log_sha256 "$(sha256_file "$measurement_path")" \
     --arg settle_log_sha256 "$(sha256_file "$settle_path")" \
@@ -96,6 +147,8 @@ write_summary() {
       "$(sha256_file "$contention_measurement")" \
     --arg contention_settle_log_sha256 \
       "$(sha256_file "$contention_settle")" \
+    --arg memory_log_sha256 "$(sha256_file "$memory_path")" \
+    --arg memory_guard_source_sha256 "$memory_guard_source_sha" \
     --arg thermal_probe_source_sha256 "$thermal_probe_source_sha" \
     --arg thermal_probe_compiler_sha256 "$thermal_probe_compiler_sha" \
     --arg thermal_probe_binary_sha256 "$thermal_probe_binary_sha" \
@@ -106,8 +159,16 @@ write_summary() {
     --argjson fair_measurement_samples "$fair_measurement_samples" \
     --argjson over_limit_measurement_samples \
       "$over_limit_measurement_samples" \
-    --argjson telemetry_gaps "$telemetry_gaps" '
-    . + {schema_version:3,source_sha:$source_sha,model_sha256:$model_sha256,
+    --argjson telemetry_gaps "$telemetry_gaps" \
+    --argjson memory_samples "$memory_samples" \
+    --argjson memory_duration_seconds "$memory_duration_seconds" \
+    --argjson memory_initial_swapouts "$memory_initial_swapouts" \
+    --argjson memory_final_swapouts "$memory_final_swapouts" \
+    --argjson memory_swapout_delta "$memory_swapout_delta" \
+    --argjson memory_min_free_percentage "$memory_min_free_percentage" \
+    --argjson memory_max_pressure_level "$memory_max_pressure_level" \
+    --argjson memory_max_throttled_pages "$memory_max_throttled_pages" '
+    . + {schema_version:4,source_sha:$source_sha,model_sha256:$model_sha256,
       mlx_native_version:"0.11.0",raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
       required_start_state:"nominal",maximum_measurement_state:"fair",
@@ -133,14 +194,27 @@ write_summary() {
         settle:{log_sha256:$contention_settle_log_sha256,samples:13,
           duration_seconds:60,contended_samples:0,telemetry_gaps:0},
         measurement:{log_sha256:$contention_measurement_log_sha256,samples:3,
-          duration_seconds:4,contended_samples:0,telemetry_gaps:0}}}
-  ' "$raw" >"$output"
+          duration_seconds:4,contended_samples:0,telemetry_gaps:0}},
+      memory_pressure:{policy:"darwin25-normal-no-swapout-v1",normal_level:1,
+        log_sha256:$memory_log_sha256,
+        guard_source_path:"scripts/macos_memory_guard.sh",
+        guard_source_sha256:$memory_guard_source_sha256,
+        sample_interval_seconds:2,maximum_sample_gap_seconds:5,
+        samples:$memory_samples,duration_seconds:$memory_duration_seconds,
+        initial_swapouts:$memory_initial_swapouts,
+        final_swapouts:$memory_final_swapouts,
+        swapout_delta:$memory_swapout_delta,
+        min_free_percentage:$memory_min_free_percentage,
+        max_pressure_level:$memory_max_pressure_level,
+        max_throttled_pages:$memory_max_throttled_pages}}
+  ' "$raw_path" >"$output"
 }
 
 write_summary "$summary"
 
 bash "$VERIFY" "$summary" "$raw" "$test_log" "$measurement" "$settle" \
-  "$source_sha" "$model_sha" "$contention_measurement" "$contention_settle"
+  "$source_sha" "$model_sha" "$contention_measurement" "$contention_settle" \
+  "$memory_log"
 
 expect_reject() {
   local label=$1
@@ -148,13 +222,28 @@ expect_reject() {
   local measurement_path=${3:-$measurement}
   local settle_path=${4:-$settle}
   local test_log_path=${5:-$test_log}
-  if bash "$VERIFY" "$mutated" "$raw" "$test_log_path" "$measurement_path" \
+  local raw_path=${6:-$raw}
+  local memory_path=${7:-$memory_log}
+  if bash "$VERIFY" "$mutated" "$raw_path" "$test_log_path" "$measurement_path" \
       "$settle_path" \
       "$source_sha" "$model_sha" "$contention_measurement" \
-      "$contention_settle" >/dev/null 2>&1; then
+      "$contention_settle" "$memory_path" >/dev/null 2>&1; then
     echo "decode-cohort verifier accepted invalid case: $label" >&2
     exit 1
   fi
+}
+
+expect_consistent_raw_reject() {
+  local label=$1
+  local filter=$2
+  local mutated_raw="$tmp_dir/$label-raw.json"
+  local mutated_summary="$tmp_dir/$label-summary.json"
+
+  jq "$filter" "$raw" >"$mutated_raw"
+  write_summary "$mutated_summary" "$measurement" "$settle" "$test_log" \
+    "$mutated_raw" "$memory_log"
+  expect_reject "$label" "$mutated_summary" "$measurement" "$settle" \
+    "$test_log" "$mutated_raw" "$memory_log"
 }
 
 jq '.benchmark.speedup = 1' "$summary" >"$tmp_dir/bad-speedup.json"
@@ -198,6 +287,14 @@ write_summary "$tmp_dir/missing-test-name-summary.json" "$measurement" \
   "$settle" "$tmp_dir/missing-test-name.log"
 expect_reject missing-test-name "$tmp_dir/missing-test-name-summary.json" \
   "$measurement" "$settle" "$tmp_dir/missing-test-name.log"
+
+sed 's/finished in 4.00s/finished in 200.00s/' "$test_log" \
+  >"$tmp_dir/uncovered-test-runtime.log"
+write_summary "$tmp_dir/uncovered-test-runtime-summary.json" "$measurement" \
+  "$settle" "$tmp_dir/uncovered-test-runtime.log"
+expect_reject uncovered-test-runtime \
+  "$tmp_dir/uncovered-test-runtime-summary.json" "$measurement" "$settle" \
+  "$tmp_dir/uncovered-test-runtime.log"
 
 printf '%s\n' \
   'test inference::models::deepseek4::real_artifact_decode_cohort_tests::official_artifact_b4_decode_body_is_exact_and_measured ... DeepSeek-V4 B=4 benchmark loaded-idle settle: position=6676 logical_capacity=131072 seconds=45' \
@@ -275,8 +372,44 @@ jq --arg sha "$(sha256_file "$tmp_dir/contended-host.log")" \
   "$summary" >"$tmp_dir/contended-host-summary.json"
 if bash "$VERIFY" "$tmp_dir/contended-host-summary.json" "$raw" "$test_log" \
     "$measurement" "$settle" "$source_sha" "$model_sha" \
-    "$tmp_dir/contended-host.log" "$contention_settle" >/dev/null 2>&1; then
+    "$tmp_dir/contended-host.log" "$contention_settle" "$memory_log" \
+    >/dev/null 2>&1; then
   echo "decode-cohort verifier accepted host contention" >&2
+  exit 1
+fi
+
+jq '.benchmark.conditioned.even_order_paired_delta_median_ms = 0' \
+  "$summary" >"$tmp_dir/bad-conditioned-stratum.json"
+expect_reject bad-conditioned-stratum "$tmp_dir/bad-conditioned-stratum.json"
+
+expect_consistent_raw_reject consistent-failed-status '.status = "fail"'
+expect_consistent_raw_reject consistent-conditioned-stratum \
+  '.benchmark.conditioned.even_order_paired_delta_median_ms = 0'
+expect_consistent_raw_reject consistent-topology-failure \
+  '.benchmark.topology_pass = false
+   | .benchmark.topology_errors = ["synthetic topology failure"]'
+expect_consistent_raw_reject consistent-residency-mismatch \
+  '.residency.tracked_total_bytes += 1'
+
+head -2 "$memory_log" >"$tmp_dir/truncated-memory.log"
+write_summary "$tmp_dir/truncated-memory-summary.json" "$measurement" \
+  "$settle" "$test_log" "$raw" "$tmp_dir/truncated-memory.log"
+expect_reject truncated-memory "$tmp_dir/truncated-memory-summary.json" \
+  "$measurement" "$settle" "$test_log" "$raw" \
+  "$tmp_dir/truncated-memory.log"
+
+awk -F '\t' 'BEGIN { OFS="\t" } NR == 2 { $3++ } { print }' \
+  "$memory_log" >"$tmp_dir/swapout-growth.log"
+jq --arg sha "$(sha256_file "$tmp_dir/swapout-growth.log")" \
+  '.memory_pressure.log_sha256 = $sha
+   | .memory_pressure.final_swapouts = 1001
+   | .memory_pressure.swapout_delta = 1' \
+  "$summary" >"$tmp_dir/swapout-growth-summary.json"
+if bash "$VERIFY" "$tmp_dir/swapout-growth-summary.json" "$raw" "$test_log" \
+    "$measurement" "$settle" "$source_sha" "$model_sha" \
+    "$contention_measurement" "$contention_settle" \
+    "$tmp_dir/swapout-growth.log" >/dev/null 2>&1; then
+  echo "decode-cohort verifier accepted swapout growth" >&2
   exit 1
 fi
 

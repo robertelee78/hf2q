@@ -2050,7 +2050,61 @@ and measured `510.182875` versus `347.0996665` ms
 (`1.4698454773652168x`) with 95 samples, 28 Fair samples, no Serious or
 Critical sample, and zero gaps.
 
-That run then exposed a receipt-verifier defect rather than a hardware defect.
+#### Predeclared `mlx-native` 0.11 B=4 conditioning experiment (2026-08-21)
+
+The first protected `mlx-native` 0.11.0 remeasurement did not reproduce that
+positive timing result. Run `32536030587` retained bit-exact arithmetic and the
+92-to-23 command-buffer/four-to-one synchronization topology, but measured
+serial and B=4 medians of `217.870` and `218.040` ms. Earlier raw receipts also
+showed a large alternating-order signature: repeating one topology was fast,
+while the first serial transaction after B=4 work and the first B=4 transaction
+after serial work inherited different deferred buffer/residency costs. Because
+the production scheduler executes up to the 64-token decode quantum on one B=4
+cohort rather than alternating serial and cohort topology every token, the
+current alternating microbenchmark may be measuring topology switches rather
+than steady-state product work. This is a hypothesis, not an accepted fix.
+
+Before another protected run, the experiment is fixed as follows:
+
+- retain the 148-token prefix plus 132 exact serial-versus-B=4 steps, then add
+  one state/logit/cache/recurrent exactness comparison at the actual 6,676-token
+  benchmark anchor;
+- use four serial and four cohort caches at logical capacity 131,072, preserve
+  independent anchor snapshots for all eight, record weight/live-cache/snapshot
+  resident bytes, and separate setup from timing with the existing 45-second
+  loaded-idle interval;
+- retain the old unconditioned alternating series only as a diagnostic. Its
+  historical even/odd order signature is recorded but cannot accept or reject
+  the experiment;
+- for each measured arm, restore its anchor, execute and drain one untimed
+  transaction of that same topology, restore the same anchor again, then time
+  the identical token transaction. Record both prime and measured durations;
+- execute 20 paired trials in alternating serial-then-cohort/cohort-then-serial
+  order. Accept the conditioning hypothesis only if the overall conditioned
+  median and both order-stratified paired-delta medians favor B=4. A ratio or
+  paired delta equal to zero fails; no latency or topology threshold is widened;
+- derive expected command-buffer counts from the artifact's declared layer
+  count, retain nonzero dispatch/barrier and exact synchronization checks for
+  every prime and measurement, and publish raw timing/topology evidence before
+  asserting failure;
+- during the protected run, require the target host's calibrated normal macOS
+  memory-pressure signal for every sample and zero increase in the cumulative
+  swapout counter. The kernel signal and swap delta govern; no invented free-RAM
+  threshold is substituted. Free percentage remains diagnostic. The runner
+  binds that telemetry to the receipt, and the verifier requires matching
+  measurement start/end phases plus a telemetry span consistent with the
+  named test runtime. The Rust producer accounts for model, live-cache, and
+  snapshot bytes.
+
+If that predeclared experiment passes, the conditioned protocol replaces the
+switch-contaminated performance verdict after the receipt/verifier contract and
+product gates pass. If it fails, same-topology priming is rejected as a harness
+explanation; the positive-median gate is not waived, and the next work is a real
+B=4 implementation optimization. No result from a contended, thermally invalid,
+memory-pressured, swapped, or unreceipted run is admissible.
+
+Run `32344447013` then exposed a receipt-verifier defect rather than a hardware
+defect.
 The verifier required the literal substring
 `official_artifact_b4_decode_body_is_exact_and_measured ... ok`, but Rust's
 `--nocapture` output inserted the benchmark diagnostics between the test name

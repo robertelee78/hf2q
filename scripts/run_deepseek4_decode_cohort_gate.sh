@@ -10,6 +10,8 @@ expected_model_sha=${5:?expected model SHA-256 is required}
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
+# shellcheck source=scripts/macos_memory_guard.sh
+source "$ROOT_DIR/scripts/macos_memory_guard.sh"
 
 if [[ ${HF2Q_THERMAL_SWIFTC_BIN+x} || ${HF2Q_THERMAL_PROBE_BIN+x} \
   || ${HF2Q_THERMAL_PROBE_SOURCE+x} ]]; then
@@ -35,8 +37,9 @@ measurement_log="$out_dir/thermal.log"
 settle_log="$out_dir/settle.log"
 contention_measurement_log="$out_dir/measurement-contention.log"
 contention_settle_log="$out_dir/settle-contention.log"
+memory_log="$out_dir/memory-pressure.log"
 rm -f "$raw" "$test_log" "$measurement_log" "$settle_log" \
-  "$contention_measurement_log" "$contention_settle_log"
+  "$contention_measurement_log" "$contention_settle_log" "$memory_log"
 
 test_pid=""
 cleanup() {
@@ -63,6 +66,7 @@ thermal_prepare_probe
 thermal_probe_source_sha=$(sha256_file "$THERMAL_PROBE_SOURCE")
 thermal_probe_compiler_sha=$(sha256_file "$THERMAL_PROBE_COMPILER")
 thermal_probe_binary_sha=$(sha256_file "$THERMAL_PROBE_BIN")
+memory_guard_source_sha=$(sha256_file "$ROOT_DIR/scripts/macos_memory_guard.sh")
 thermal_wait_for_nominal "$settle_log" decode-cohort-settle 60 900 5 \
   "$contention_settle_log" "$$"
 : >"$measurement_log"
@@ -72,6 +76,36 @@ test "$THERMAL_STATE" = nominal
 host_contention_sample "$contention_measurement_log" \
   decode-cohort-measurement-start "$$" "$THERMAL_SAMPLED_AT"
 host_contention_require_quiet decode-cohort-measurement-start
+: >"$memory_log"
+memory_sample "$memory_log" decode-cohort-measurement-start
+initial_swapouts=$MEMORY_SWAPOUTS
+
+monitor_decode_measurement() {
+  local producer_pid=$1
+  local producer_state
+
+  while :; do
+    thermal_read_process_state "$producer_pid" || return 1
+    producer_state=$THERMAL_PROCESS_STATE
+    if [[ -z "$producer_state" || "$producer_state" == Z* ]]; then
+      return 0
+    fi
+    thermal_sample "$measurement_log" decode-cohort-measurement || return 1
+    host_contention_sample "$contention_measurement_log" \
+      decode-cohort-measurement "$$" "$THERMAL_SAMPLED_AT" || return 1
+    host_contention_require_quiet decode-cohort-measurement || return 1
+    case "$THERMAL_STATE" in
+      nominal|fair) ;;
+      *)
+        echo "decode-cohort measurement exceeded fair thermal state: $THERMAL_STATE" >&2
+        return 1
+        ;;
+    esac
+    memory_sample "$memory_log" decode-cohort-measurement \
+      "$initial_swapouts" || return 1
+    sleep 2
+  done
+}
 
 env -i \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin \
@@ -83,9 +117,7 @@ env -i \
 test_pid=$!
 set +e
 thermal_rc=0
-thermal_monitor_fair_or_better_while_pid "$measurement_log" \
-  decode-cohort-measurement "$test_pid" 2 \
-  "$contention_measurement_log" "$$"
+monitor_decode_measurement "$test_pid"
 thermal_rc=$?
 if ((thermal_rc != 0)); then
   kill -TERM "$test_pid" 2>/dev/null || true
@@ -101,6 +133,7 @@ thermal_sample "$measurement_log" decode-cohort-measurement-end
 host_contention_sample "$contention_measurement_log" \
   decode-cohort-measurement-end "$$" "$THERMAL_SAMPLED_AT"
 host_contention_require_quiet decode-cohort-measurement-end
+memory_sample "$memory_log" decode-cohort-measurement-end "$initial_swapouts"
 
 thermal_validate_fair_or_better_measurement_log "$measurement_log" 5
 measurement_samples=$THERMAL_LOG_SAMPLES
@@ -127,6 +160,16 @@ host_contention_validate_thermal_alignment "$measurement_log" \
   "$contention_measurement_log"
 host_contention_validate_thermal_alignment "$settle_log" \
   "$contention_settle_log"
+memory_validate_normal_no_swapout_log "$memory_log" 5
+memory_validate_measurement_coverage "$memory_log" "$measurement_log" 5
+memory_samples=$MEMORY_LOG_SAMPLES
+memory_duration_seconds=$MEMORY_LOG_DURATION_SECONDS
+memory_initial_swapouts=$MEMORY_LOG_INITIAL_SWAPOUTS
+memory_final_swapouts=$MEMORY_LOG_FINAL_SWAPOUTS
+memory_swapout_delta=$MEMORY_LOG_SWAPOUT_DELTA
+memory_min_free_percentage=$MEMORY_LOG_MIN_FREE_PERCENTAGE
+memory_max_pressure_level=$MEMORY_LOG_MAX_PRESSURE_LEVEL
+memory_max_throttled_pages=$MEMORY_LOG_MAX_THROTTLED_PAGES
 
 jq --arg source_sha "$expected_source_sha" \
   --arg model_sha256 "$expected_model_sha" \
@@ -139,6 +182,9 @@ jq --arg source_sha "$expected_source_sha" \
     "$(sha256_file "$contention_measurement_log")" \
   --arg contention_settle_log_sha256 \
     "$(sha256_file "$contention_settle_log")" \
+  --arg memory_policy "$MEMORY_PRESSURE_POLICY" \
+  --arg memory_log_sha256 "$(sha256_file "$memory_log")" \
+  --arg memory_guard_source_sha256 "$memory_guard_source_sha" \
   --arg thermal_probe_source_sha256 "$thermal_probe_source_sha" \
   --arg thermal_probe_compiler_path "$THERMAL_PROBE_COMPILER" \
   --arg thermal_probe_compiler_sha256 "$thermal_probe_compiler_sha" \
@@ -164,8 +210,17 @@ jq --arg source_sha "$expected_source_sha" \
     "$contention_measurement_duration_seconds" \
   --argjson contention_measurement_contended_samples \
     "$contention_measurement_contended_samples" \
-  --argjson contention_measurement_gaps "$contention_measurement_gaps" '
-  . + {schema_version:3,source_sha:$source_sha,model_sha256:$model_sha256,
+  --argjson contention_measurement_gaps "$contention_measurement_gaps" \
+  --argjson memory_normal_level "$MEMORY_PRESSURE_NORMAL_LEVEL" \
+  --argjson memory_samples "$memory_samples" \
+  --argjson memory_duration_seconds "$memory_duration_seconds" \
+  --argjson memory_initial_swapouts "$memory_initial_swapouts" \
+  --argjson memory_final_swapouts "$memory_final_swapouts" \
+  --argjson memory_swapout_delta "$memory_swapout_delta" \
+  --argjson memory_min_free_percentage "$memory_min_free_percentage" \
+  --argjson memory_max_pressure_level "$memory_max_pressure_level" \
+  --argjson memory_max_throttled_pages "$memory_max_throttled_pages" '
+  . + {schema_version:4,source_sha:$source_sha,model_sha256:$model_sha256,
     mlx_native_version:"0.11.0",raw_sha256:$raw_sha256,
     test_log_sha256:$test_log_sha256,thermal_status:"fair_or_better",
     required_start_state:"nominal",maximum_measurement_state:"fair",
@@ -199,11 +254,23 @@ jq --arg source_sha "$expected_source_sha" \
         samples:$contention_measurement_samples,
         duration_seconds:$contention_measurement_duration_seconds,
         contended_samples:$contention_measurement_contended_samples,
-        telemetry_gaps:$contention_measurement_gaps}}}
+        telemetry_gaps:$contention_measurement_gaps}},
+    memory_pressure:{policy:$memory_policy,normal_level:$memory_normal_level,
+      log_sha256:$memory_log_sha256,
+      guard_source_path:"scripts/macos_memory_guard.sh",
+      guard_source_sha256:$memory_guard_source_sha256,
+      sample_interval_seconds:2,maximum_sample_gap_seconds:5,
+      samples:$memory_samples,duration_seconds:$memory_duration_seconds,
+      initial_swapouts:$memory_initial_swapouts,
+      final_swapouts:$memory_final_swapouts,
+      swapout_delta:$memory_swapout_delta,
+      min_free_percentage:$memory_min_free_percentage,
+      max_pressure_level:$memory_max_pressure_level,
+      max_throttled_pages:$memory_max_throttled_pages}}
 ' "$raw" >"$out_dir/summary.json.tmp"
 mv "$out_dir/summary.json.tmp" "$out_dir/summary.json"
 bash "$ROOT_DIR/scripts/verify_deepseek4_decode_cohort_receipt.sh" \
   "$out_dir/summary.json" "$raw" "$test_log" "$measurement_log" \
   "$settle_log" "$expected_source_sha" "$expected_model_sha" \
-  "$contention_measurement_log" "$contention_settle_log"
+  "$contention_measurement_log" "$contention_settle_log" "$memory_log"
 sha256_file "$out_dir/summary.json" >"$out_dir/summary.json.sha256"
