@@ -1710,8 +1710,8 @@ impl HybridKvCache {
             self.n_seqs
         );
         anyhow::ensure!(
-            anchor.prompt_len <= self.max_seq_len as usize,
-            "restore_slot_anchor: prompt_len={} exceeds max_seq_len={}",
+            anchor.prompt_len > 0 && anchor.prompt_len <= self.max_seq_len as usize,
+            "restore_slot_anchor: prompt_len={} outside 1..={}",
             anchor.prompt_len,
             self.max_seq_len
         );
@@ -1735,6 +1735,11 @@ impl HybridKvCache {
             .zip(anchor.full_attn_current_len.iter())
             .enumerate()
         {
+            anyhow::ensure!(
+                saved_cursor as usize == anchor.prompt_len,
+                "restore_slot_anchor: full_attn[{layer_idx}] saved cursor {saved_cursor} != anchor prompt_len={}",
+                anchor.prompt_len
+            );
             let live_cursor = full.current_len.get(slot_idx).ok_or_else(|| {
                 anyhow!("restore_slot_anchor: full_attn[{layer_idx}] cursor missing")
             })?;
@@ -11999,6 +12004,26 @@ mod tests {
             assert_eq!(linear.recurrent.as_slice::<u8>().unwrap(), recurrent);
             assert_eq!(linear.pp_flipped[target.0 as usize], *flipped);
         }
+    }
+
+    #[test]
+    fn slot_anchor_restore_rejects_cursor_payload_inconsistent_with_prompt_depth() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
+        let target = SlotId(1);
+        cache.append_for_seq(target, 9).expect("prompt cursor");
+        let mut anchor = cache
+            .snapshot_slot_anchor(target, 9)
+            .expect("slot-local anchor");
+        cache.append_for_seq(target, 5).expect("decode cursor");
+        anchor.full_attn_current_len[0] = 8;
+
+        assert!(cache.restore_slot_anchor(target, &anchor).is_err());
+        cache
+            .validate_sequence_len_for_slot(target, 14)
+            .expect("corrupt saved cursor must not partially rewind the live slot");
     }
 
     #[test]

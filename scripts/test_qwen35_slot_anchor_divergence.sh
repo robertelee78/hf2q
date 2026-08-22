@@ -3,11 +3,11 @@ set -euo pipefail
 
 # ADR-049 Lane A fail-closed hardware gate for an already-running Qwen
 # SlotAware server. Run once per served artifact. The script proves the server
-# process really uses `--scheduler inflight-batched --max-slots 4`, builds an
-# A->B->C checkpoint lineage, rewinds to A for branch X, and rejects reuse of
+# process really uses `--scheduler inflight-batched` and the expected slot
+# count, builds an A->B->C checkpoint lineage, rewinds to A for branch X, and rejects reuse of
 # stale B/C descendants. It also overlaps four clients, cancels the owner,
-# verifies rollback reuse, exercises a rejected oversized prefill, and requires
-# speculative cached-state reuse to remain live.
+# verifies rollback reuse, and requires speculative cached-state reuse to
+# remain live.
 
 BASE_URL=${BASE_URL:-http://127.0.0.1:8081}
 MODEL=${MODEL:-}
@@ -19,6 +19,7 @@ ACTIVE_MAX_TOKENS=${ACTIVE_MAX_TOKENS:-2048}
 OVERFLOW_WORDS=${OVERFLOW_WORDS:-300000}
 CURL_MAX_TIME_SECONDS=${CURL_MAX_TIME_SECONDS:-900}
 SEMANTIC_WAIT_SECONDS=${SEMANTIC_WAIT_SECONDS:-180}
+EXPECTED_MAX_SLOTS=${EXPECTED_MAX_SLOTS:-4}
 
 for command in awk curl jq lsof ps rg sed; do
   command -v "$command" >/dev/null || {
@@ -27,7 +28,7 @@ for command in awk curl jq lsof ps rg sed; do
   }
 done
 for setting in CONTEXT_LINES ACTIVE_MAX_TOKENS OVERFLOW_WORDS \
-  CURL_MAX_TIME_SECONDS SEMANTIC_WAIT_SECONDS; do
+  CURL_MAX_TIME_SECONDS SEMANTIC_WAIT_SECONDS EXPECTED_MAX_SLOTS; do
   value=${!setting}
   if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
     echo "$setting must be a positive integer (got: $value)" >&2
@@ -47,12 +48,12 @@ fi
   exit 2
 }
 server_command=$(ps -p "$SERVER_PID" -o command=)
-[[ "$server_command" == *"--scheduler inflight-batched"* ]] || {
+[[ " $server_command " == *" --scheduler inflight-batched "* ]] || {
   echo "server is not provably using --scheduler inflight-batched: $server_command" >&2
   exit 2
 }
-[[ "$server_command" == *"--max-slots 4"* ]] || {
-  echo "server is not provably using --max-slots 4: $server_command" >&2
+[[ " $server_command " == *" --max-slots $EXPECTED_MAX_SLOTS "* ]] || {
+  echo "server is not provably using exact --max-slots $EXPECTED_MAX_SLOTS: $server_command" >&2
   exit 2
 }
 
@@ -108,6 +109,7 @@ captures_before=$(metric hf2q_qwen_anchor_captures_total)
 hits_before=$(metric hf2q_qwen_anchor_restore_hits_total)
 pruned_before=$(metric hf2q_qwen_anchor_descendants_pruned_total)
 spec_cached_before=$(metric hf2q_qwen_speculation_cached_tokens_total)
+spec_anchor_cached_before=$(metric hf2q_qwen_anchor_spec_boundary_restore_tokens_total)
 
 jq -n --arg model "$MODEL" --arg run "$RUN_ID" --rawfile context "$context_file" '{
   model: $model,
@@ -190,8 +192,8 @@ x_equality_cached=$(cached_tokens "$response_x_equality_probe")
 jq '.max_tokens = 35' "$request_c" >"$request_old_c"
 post_json "$request_old_c" "$response_old_c"
 old_c_cached=$(cached_tokens "$response_old_c")
-(( old_c_cached > 0 && old_c_cached < c_cached )) || {
-  echo "stale old-C descendant was reused (retry=$old_c_cached prior-deep=$c_cached)" >&2
+(( old_c_cached == 0 || old_c_cached == x_cached )) || {
+  echo "stale old-C descendant was reused (retry=$old_c_cached surviving-A=$x_cached prior-deep=$c_cached)" >&2
   exit 1
 }
 
@@ -288,9 +290,8 @@ done
 sibling_pids=()
 
 # A request too large for the served context must be rejected and must not
-# disturb the committed lineage. This is a public-API failed-prefill guard;
-# internal GPU-prefill fault injection remains covered by model-free reset
-# tests and the worker's full-store-clear path.
+# disturb the committed lineage. This is an admission-isolation check only;
+# it deliberately does not claim to exercise a post-admission GPU failure.
 overflow_text="$OUT_DIR/overflow.txt"
 awk -v words="$OVERFLOW_WORDS" 'BEGIN { for (i = 0; i < words; i++) printf "overflow " }' >"$overflow_text"
 overflow_request="$OUT_DIR/overflow.request.json"
@@ -322,12 +323,34 @@ captures_after=$(metric hf2q_qwen_anchor_captures_total)
 hits_after=$(metric hf2q_qwen_anchor_restore_hits_total)
 pruned_after=$(metric hf2q_qwen_anchor_descendants_pruned_total)
 spec_cached_after=$(metric hf2q_qwen_speculation_cached_tokens_total)
+spec_anchor_cached_after=$(metric hf2q_qwen_anchor_spec_boundary_restore_tokens_total)
+effective_depth=$(metric hf2q_qwen_anchor_effective_committed_depth)
+pending_capacity_slots=$(metric hf2q_qwen_anchor_simultaneous_pending_capacity_slots)
+configured_slots=$(metric hf2q_qwen_anchor_configured_slots)
+aggregate_anchor_budget=$(metric hf2q_qwen_anchor_aggregate_budget_bytes)
+aggregate_anchor_peak=$(metric hf2q_qwen_anchor_aggregate_peak_committed_pending_bytes)
 
 (( captures_after > captures_before )) || { echo "anchor capture telemetry did not move" >&2; exit 1; }
 (( hits_after >= hits_before + 4 )) || { echo "too few anchor restore hits" >&2; exit 1; }
 (( pruned_after >= pruned_before + 2 )) || { echo "descendant-prune telemetry did not prove B/C invalidation" >&2; exit 1; }
-(( spec_cached_after > spec_cached_before )) || {
-  echo "speculative cached-state carry did not execute" >&2
+(( spec_anchor_cached_after > spec_anchor_cached_before )) || {
+  echo "SlotAware speculative anchor-state carry did not execute" >&2
+  exit 1
+}
+(( configured_slots == EXPECTED_MAX_SLOTS )) || {
+  echo "anchor telemetry slot count $configured_slots != expected $EXPECTED_MAX_SLOTS" >&2
+  exit 1
+}
+(( effective_depth > 0 && effective_depth <= 4 )) || {
+  echo "anchor effective committed depth is invalid: $effective_depth" >&2
+  exit 1
+}
+(( pending_capacity_slots >= 0 && pending_capacity_slots <= EXPECTED_MAX_SLOTS )) || {
+  echo "anchor simultaneous pending capacity is invalid: $pending_capacity_slots" >&2
+  exit 1
+}
+(( aggregate_anchor_peak <= aggregate_anchor_budget )) || {
+  echo "aggregate anchor peak exceeded budget ($aggregate_anchor_peak > $aggregate_anchor_budget)" >&2
   exit 1
 }
 
@@ -343,7 +366,13 @@ jq -n \
   --argjson rejected_prefill_http "$overflow_status" \
   --argjson restore_hits_delta "$((hits_after - hits_before))" \
   --argjson descendants_pruned_delta "$((pruned_after - pruned_before))" \
-  --argjson speculative_cached_tokens_delta "$((spec_cached_after - spec_cached_before))" '{
+  --argjson speculative_cached_tokens_delta "$((spec_cached_after - spec_cached_before))" \
+  --argjson slotaware_spec_anchor_tokens_delta "$((spec_anchor_cached_after - spec_anchor_cached_before))" \
+  --argjson configured_slots "$configured_slots" \
+  --argjson effective_committed_depth "$effective_depth" \
+  --argjson pending_capacity_slots "$pending_capacity_slots" \
+  --argjson aggregate_anchor_budget_bytes "$aggregate_anchor_budget" \
+  --argjson aggregate_anchor_peak_bytes "$aggregate_anchor_peak" '{
     status: $status, model: $model, run_id: $run_id,
     a_to_b_cached: $a_to_b_cached,
     b_equality_cached: $b_equality_cached,
@@ -352,10 +381,18 @@ jq -n \
     stale_old_c_cached: $stale_old_c_cached,
     concurrent_clients: 4,
     cancellation_siblings: $cancellation_siblings,
-    rejected_prefill_http: $rejected_prefill_http,
+    rejected_admission_http: $rejected_prefill_http,
     restore_hits_delta: $restore_hits_delta,
     descendants_pruned_delta: $descendants_pruned_delta,
-    speculative_cached_tokens_delta: $speculative_cached_tokens_delta
+    speculative_cached_tokens_delta: $speculative_cached_tokens_delta,
+    slotaware_spec_anchor_tokens_delta: $slotaware_spec_anchor_tokens_delta,
+    configured_slots: $configured_slots,
+    effective_committed_depth: $effective_committed_depth,
+    simultaneous_pending_capacity_slots: $pending_capacity_slots,
+    full_pending_concurrency_available: ($pending_capacity_slots == $configured_slots),
+    full_depth_available: ($effective_committed_depth == 4),
+    aggregate_anchor_budget_bytes: $aggregate_anchor_budget_bytes,
+    aggregate_anchor_peak_bytes: $aggregate_anchor_peak_bytes
   }' >"$summary"
 
 jq . "$summary"

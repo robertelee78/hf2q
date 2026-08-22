@@ -579,11 +579,11 @@ pub fn qwen35_fixed_kv_bytes_per_slot(cfg: &crate::inference::models::qwen35::Qw
         .saturating_mul(4)
         .saturating_mul(2);
     let live_scaffold = linear_layers.saturating_mul(conv.saturating_add(recurrent));
-    // Each prompt anchor owns one copy of the current (not scratch) conv and
-    // recurrent state. Anchor replacement briefly retains old + new, which is
-    // exactly another full live-scaffold equivalent. Round to a 16 MiB page /
-    // metadata boundary; the canonical Qwen3.6 artifact becomes 256 MiB.
-    round_up_bytes(live_scaffold.saturating_mul(2), 16 * 1024 * 1024)
+    // This scheduler charge covers only the live ping-pong DeltaNet scaffold.
+    // Reclaimable prompt anchors have an independent aggregate anchor-owned byte
+    // budget and must not inflate the scheduler's monotonic Metal allocation
+    // high-water. Round the live allocation to a 16 MiB metadata boundary.
+    round_up_bytes(live_scaffold, 16 * 1024 * 1024)
 }
 
 /// Fixed DeepSeek-V4 window/compressor state plus the compact recovery anchor.
@@ -2151,7 +2151,7 @@ mod tests {
             vocab_size: 248_320,
             attn_output_gate: true,
             mtp_num_hidden_layers: 1,
-            mtp_use_dedicated_embeddings: true,
+            mtp_use_dedicated_embeddings: false,
             intermediate_size: Some(17_408),
             moe: None,
         }
@@ -2223,8 +2223,8 @@ mod tests {
             fixed.saturating_add(u64::from(cfg.max_position_embeddings).saturating_mul(linear));
         let budget = 48 * 1024 * 1024 * 1024_u64;
         assert_eq!(linear, 10_400);
-        assert_eq!(fixed, 256 * 1024 * 1024);
-        assert_eq!(full_slot, 2_994_733_056);
+        assert_eq!(fixed, 128 * 1024 * 1024);
+        assert_eq!(full_slot, 2_860_515_328);
         assert!(full_slot.saturating_mul(4) < budget);
         assert!(full_slot.saturating_mul(8) < budget);
     }
