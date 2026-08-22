@@ -7884,6 +7884,142 @@ mod tests {
     }
 
     #[test]
+    fn qwen38_width_q8_0_native_embedding_gather_is_bit_exact() {
+        use crate::serve::gpu::QuantWeightInfo;
+        use half::f16;
+
+        const HIDDEN: usize = 5_120;
+        const VOCAB: usize = 3;
+        const QK8_0: usize = 32;
+        const BLOCK_BYTES: usize = 34;
+
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let blocks_per_row = HIDDEN / QK8_0;
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let mut packed = vec![0_u8; VOCAB * row_bytes];
+        for row in 0..VOCAB {
+            for block in 0..blocks_per_row {
+                let offset = row * row_bytes + block * BLOCK_BYTES;
+                let scale = 2.0_f32.powi(-((block % 8) as i32 + 2));
+                packed[offset..offset + 2]
+                    .copy_from_slice(&f16::from_f32(scale).to_bits().to_le_bytes());
+                for lane in 0..QK8_0 {
+                    let quant = ((row * 41 + block * 17 + lane * 7) % 255) as i16 - 127;
+                    packed[offset + 2 + lane] = (quant as i8) as u8;
+                }
+            }
+        }
+
+        let mut weight = device
+            .alloc_buffer(packed.len(), DType::U8, vec![packed.len()])
+            .expect("packed Q8_0 embedding table");
+        weight
+            .as_mut_slice::<u8>()
+            .expect("packed Q8_0 embedding bytes")
+            .copy_from_slice(&packed);
+        let native = MlxQWeight {
+            buffer: weight,
+            info: QuantWeightInfo {
+                ggml_dtype: GgmlType::Q8_0,
+                rows: VOCAB,
+                cols: HIDDEN,
+            },
+            affine: None,
+            f16_shadow: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        };
+        ensure_native_embedding_admitted(&native).expect("admit exact Q8_0 storage");
+
+        let token_ids = [2_u32, 0, 1, 2];
+        let mut output = device
+            .alloc_buffer(
+                token_ids.len() * HIDDEN * DType::F32.size_of(),
+                DType::F32,
+                vec![token_ids.len(), HIDDEN],
+            )
+            .expect("Q8_0 embedding output");
+        let mut registry = KernelRegistry::new();
+        embed_tokens_gpu_into(
+            &token_ids,
+            &[],
+            Some(&native),
+            VOCAB as u32,
+            HIDDEN as u32,
+            &device,
+            &mut registry,
+            &mut output,
+        )
+        .expect("production Q8_0 embedding route");
+        device
+            .command_encoder()
+            .expect("queue fence")
+            .commit_and_wait_labeled("test.qwen38.embedding.q8_0")
+            .expect("Q8_0 embedding completion");
+
+        let expected_rows: Vec<Vec<f32>> = (0..VOCAB)
+            .map(|row| {
+                let mut values = vec![0.0_f32; HIDDEN];
+                mlx_native::gguf::test_only_dequantize(
+                    &packed[row * row_bytes..(row + 1) * row_bytes],
+                    GgmlType::Q8_0,
+                    &mut values,
+                )
+                .expect("independent CPU Q8_0 dequantization");
+                values
+            })
+            .collect();
+        for (token_index, (actual, &row)) in output
+            .as_slice::<f32>()
+            .expect("Q8_0 embedding result")
+            .chunks_exact(HIDDEN)
+            .zip(token_ids.iter())
+            .enumerate()
+        {
+            for (column, (&got, &want)) in actual
+                .iter()
+                .zip(expected_rows[row as usize].iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "Q8_0 token {token_index}, row {row}, column {column}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_short_d256_prefill_executes_without_non_finite_logits() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let mut cfg = tiny_dense_full_attn_cfg_4layer_for_b4a();
+        cfg.num_attention_heads = 1;
+        cfg.num_key_value_heads = 1;
+        cfg.head_dim = 256;
+        cfg.rotary_dim = 64;
+        cfg.mrope_section = [16, 16, 0, 0];
+        let model = Qwen35Model::empty_from_cfg(cfg.clone());
+        let mut cache = HybridKvCache::new(&cfg, &device, 32, 1).expect("small D=256 cache");
+        let tokens = vec![1_u32; 8];
+        let positions = positions_to_flat(&text_positions(tokens.len() as u32));
+
+        let logits = model
+            .forward_gpu(&tokens, &positions, &mut cache, SlotId(0))
+            .expect("fresh short D=256 prefill must have an executable route");
+        assert!(logits.iter().all(|value| value.is_finite()));
+        assert!(cache
+            .full_attn
+            .iter()
+            .all(|slot| slot.current_len == vec![tokens.len() as u32]));
+    }
+
+    #[test]
     fn output_head_commit_context_preserves_typed_mlx_failure() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let error = context_output_head_commit(

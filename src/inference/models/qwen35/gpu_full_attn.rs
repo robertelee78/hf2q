@@ -5371,6 +5371,17 @@ pub(super) fn apply_tq_prefill_seq_major_resume_direct(
 // KV-cache-aware SDPA
 // ================================================================
 
+/// Whether a fresh short D=256 row must use the F32 vector-attention route.
+///
+/// Both tiled prefill kernels have partial-tile defects for qL=2..15. These
+/// rows are evaluated as a bounded series of proven qL=1 causal vector
+/// dispatches over the just-produced Q/K/V chunk, without reading back or
+/// expanding the persistent cache representation.
+#[inline]
+fn uses_fresh_short_vec_path(seq_len: u32, cur_len: u32, head_dim: u32) -> bool {
+    head_dim == 256 && cur_len == 0 && (2..16).contains(&seq_len)
+}
+
 /// Apply SDPA with a pre-allocated KV cache.
 ///
 /// Writes the current K/V tokens (from `k_seq_major`, `v_seq_major`) into the
@@ -5629,6 +5640,54 @@ pub fn apply_sdpa_with_kv_cache(
         //   src layout: [seq * n_kv_heads, head_dim] = seq-major
         //   dst layout: slot.k/v = [n_kv_heads, max_seq_len, head_dim] = head-major
         //   slot = (cur_len + t) for full-attn (capacity == max_seq_len, no wrap)
+        //
+        // Preserve a stable dense copy of a fresh short chunk before the
+        // persistent-cache encoder runs. TQ encoding is an independent
+        // representation write and must never influence the exact attention
+        // result for the same fresh row.
+        let fresh_short_kv = if uses_fresh_short_vec_path(seq_len, cur_len as u32, head_dim) {
+            let nkv = n_kv_heads as usize;
+            let scratch_capacity = 16_usize;
+            let k_hm = device
+                .alloc_buffer(
+                    scratch_capacity * nkv * d * 4,
+                    DType::F32,
+                    vec![nkv, scratch_capacity, d],
+                )
+                .map_err(|e| anyhow!("fresh-short vec: alloc k_hm: {e}"))?;
+            let v_hm = device
+                .alloc_buffer(
+                    scratch_capacity * nkv * d * 4,
+                    DType::F32,
+                    vec![nkv, scratch_capacity, d],
+                )
+                .map_err(|e| anyhow!("fresh-short vec: alloc v_hm: {e}"))?;
+            let mut enc = device
+                .command_encoder()
+                .context("fresh-short vec: preserve K/V encoder")?;
+            dispatch_kv_cache_copy_seq_f32_dual(
+                &mut enc,
+                registry,
+                device.metal_device(),
+                k_seq_major,
+                v_seq_major,
+                &k_hm,
+                &v_hm,
+                n_kv_heads,
+                head_dim,
+                scratch_capacity as u32,
+                0,
+                seq_len,
+                0,
+            )
+            .context("fresh-short vec: preserve K/V")?;
+            enc.commit_and_wait_labeled("layer.full_attn.fresh_short_vec.preserve_kv")
+                .context("fresh-short vec: preserve K/V commit")?;
+            Some((k_hm, v_hm))
+        } else {
+            None
+        };
+
         if kv_write_tokens > 0 {
             let _w5b9_kv_dl_copy = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaKvDownloadCopy,
@@ -5714,16 +5773,12 @@ pub fn apply_sdpa_with_kv_cache(
         //   Bisection: qL=15 NaN, qL=17 coherent.  HF2Q_DUMP_LAYER=ALL
         //   masks via dense flush_gpu sync points (see ADR-005 iter-19).
         //
-        // So qL ∈ [1, 15] has no known-good path on this kernel set:
-        //   * FA: dim=10 NaN at qL < 16
-        //   * Legacy SDPA: all-NaN at qL <= 15
-        //   * decode (flash_attn_vec): only fires at qL == 1
+        // So fresh qL ∈ [2, 15] bypasses both tiled kernels and uses
+        // flash_attn_vec directly from the fresh F32 Q/K/V chunk below.
         //
         // The qL=16-31 range becomes coherent under the new >= 16 gate
         // (was previously routed to broken legacy SDPA when gate was
         // >= 32).  Long-prefill perf preserved (FA always fires).
-        // qL ∈ [2, 15] remains broken — workaround is the user
-        // padding their prompt up to qL >= 16.
         let new_path_eligible = head_dim == 256 && cur_len == 0 && seq_len >= 16;
         // ADR-028 iter-177: trace branch eligibility for K=1 batched-verify
         // bug bisect. HF2Q_FA_TRACE=1 prints all booleans + actual branch.
@@ -5764,6 +5819,63 @@ pub fn apply_sdpa_with_kv_cache(
             let new_len = kv_seq_len;
             slot.current_len[slot_id.0 as usize] = new_len;
             return Ok(out_uploaded);
+        }
+
+        // Fresh D=256 qL=2..15 correctness fallback. This uses bounded qL=1
+        // vector dispatches over the current chunk. It is independent of
+        // whether the persistent cache is F32 or TQ: the normal cache write
+        // above still records the chunk in its native representation for
+        // later decode.
+        if uses_fresh_short_vec_path(seq_len, cur_len as u32, head_dim) {
+            let _w5b10_kernel = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaSdpaKernel,
+            );
+            let (k_hm, v_hm) = fresh_short_kv
+                .expect("fresh-short route must preserve dense K/V before cache encoding");
+            let tmp_bytes = flash_attn_vec_tmp_bytes(n_heads, head_dim);
+            let tmp_buf = device
+                .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+                .map_err(|e| anyhow!("fresh-short vec: alloc tmp: {e}"))?;
+
+            let mut enc = device
+                .command_encoder()
+                .context("fresh-short vec: command_encoder")?;
+            // The batched qL>1 vector kernel is not finite at every short
+            // row (qL=5 is a model-free reproducer). Execute the bounded
+            // fallback as qL=1 causal steps instead. Each query token is
+            // contiguous in the seq-major source, and qL=1 makes that layout
+            // identical to the head-major layout expected by the kernel.
+            let query_elems = nh * d;
+            for query in 0..seq {
+                let query_offset = (query * query_elems * 4) as u64;
+                let q_token = q_seq_major.slice_view(query_offset, query_elems);
+                let out_token = out_buf.slice_view(query_offset, query_elems);
+                let params = FlashAttnVecParams {
+                    num_heads: n_heads,
+                    num_kv_heads: n_kv_heads,
+                    head_dim,
+                    kv_seq_len: (query + 1) as u32,
+                    kv_capacity: 16,
+                    scale: 1.0 / (d as f32).sqrt(),
+                    mask_type: 1,
+                    sliding_window: 0,
+                    softcap: 0.0,
+                    q_seq_len: 1,
+                };
+                flash_attn_vec(
+                    &mut enc, registry, device, &q_token, &k_hm, &v_hm, &out_token, &tmp_buf,
+                    &params,
+                )
+                .with_context(|| format!("fresh-short vec: query {query} dispatch"))?;
+                // Consecutive queries reuse tmp_buf. Keep their write/reduce
+                // phases ordered inside the concurrent compute encoder.
+                enc.memory_barrier();
+            }
+            enc.commit_and_wait_labeled("layer.full_attn.fresh_short_vec")
+                .context("fresh-short vec: commit")?;
+
+            slot.current_len[slot_id.0 as usize] = kv_seq_len;
+            return Ok(out_buf);
         }
 
         // ── ADR-034 task #89 Step 3a (2026-05-21): vec_small_path ──
@@ -6336,7 +6448,7 @@ pub fn build_gated_attn_layer(
                 // cur_len==0: existing fresh-prefill path.
                 // cur_len>0 + seq_len<16 + head_dim==256 + slot.k/v F32:
                 //   new vec-small path inside fused encoder.
-                cur == 0
+                (cur == 0 && seq_len >= 16)
                     || (allow_vec_small_in_fused
                         && cur > 0
                         && seq_len < 16
@@ -7962,6 +8074,170 @@ pub fn apply_gated_attn_layer_decode_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_short_d256_prefill_selects_finite_vector_route() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for seq_len in 2..16 {
+            assert!(uses_fresh_short_vec_path(seq_len, 0, 256));
+        }
+
+        assert!(!uses_fresh_short_vec_path(1, 0, 256));
+        assert!(!uses_fresh_short_vec_path(16, 0, 256));
+        assert!(!uses_fresh_short_vec_path(8, 32, 256));
+        assert!(!uses_fresh_short_vec_path(8, 0, 512));
+    }
+
+    fn cpu_fresh_causal_gqa(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        let heads_per_kv = n_heads / n_kv_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut output = vec![0.0_f32; seq * n_heads * head_dim];
+        for query in 0..seq {
+            for head in 0..n_heads {
+                let kv_head = head / heads_per_kv;
+                let q_base = (query * n_heads + head) * head_dim;
+                let mut scores = Vec::with_capacity(query + 1);
+                for key_pos in 0..=query {
+                    let k_base = (key_pos * n_kv_heads + kv_head) * head_dim;
+                    let mut dot = 0.0_f64;
+                    for col in 0..head_dim {
+                        dot += q[q_base + col] as f64 * k[k_base + col] as f64;
+                    }
+                    scores.push(dot as f32 * scale);
+                }
+                let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let normalizer = scores
+                    .iter()
+                    .map(|score| (*score - max_score).exp())
+                    .sum::<f32>();
+                let out_base = (query * n_heads + head) * head_dim;
+                for col in 0..head_dim {
+                    let mut value = 0.0_f32;
+                    for (key_pos, score) in scores.iter().enumerate() {
+                        let weight = (*score - max_score).exp() / normalizer;
+                        let v_base = (key_pos * n_kv_heads + kv_head) * head_dim;
+                        value += weight * v[v_base + col];
+                    }
+                    output[out_base + col] = value;
+                }
+            }
+        }
+        output
+    }
+
+    fn fresh_short_d256_cfg() -> super::super::Qwen35Config {
+        use super::super::{Qwen35LayerKind, Qwen35Variant};
+        super::super::Qwen35Config {
+            variant: Qwen35Variant::Dense,
+            hidden_size: 512,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 256,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_key_head_dim: 256,
+            linear_value_head_dim: 256,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 1,
+            layer_types: vec![Qwen35LayerKind::FullAttention],
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            rotary_dim: 64,
+            mrope_section: [16, 16, 0, 0],
+            mrope_interleaved: true,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 32,
+            vocab_size: 32,
+            attn_output_gate: true,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: true,
+            intermediate_size: Some(512),
+            moe: None,
+        }
+    }
+
+    #[test]
+    fn fresh_short_d256_executes_finite_exact_semantics_for_f32_and_tq_cache() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let cfg = fresh_short_d256_cfg();
+        let mut registry = KernelRegistry::new();
+        let mut seed = 0xD256_0002_u32;
+
+        for seq_len in 2_u32..16 {
+            let seq = seq_len as usize;
+            let q = mk_rand(&mut seed, seq * 2 * 256, 0.2);
+            let k = mk_rand(&mut seed, seq * 256, 0.2);
+            let v = mk_rand(&mut seed, seq * 256, 0.2);
+            let expected = cpu_fresh_causal_gqa(&q, &k, &v, seq, 2, 1, 256);
+            let q_buf = upload_f32(&q, &device).expect("upload fresh-short Q");
+            let k_buf = upload_f32(&k, &device).expect("upload fresh-short K");
+            let v_buf = upload_f32(&v, &device).expect("upload fresh-short V");
+            let mut representations = Vec::new();
+
+            for tq_active in [false, true] {
+                let mut cache = super::super::kv_cache::HybridKvCache::new_with_options(
+                    &cfg, &device, 16, 1, tq_active,
+                )
+                .expect("allocate fresh-short cache");
+                let actual_buf = apply_sdpa_with_kv_cache(
+                    &device,
+                    &mut registry,
+                    &q_buf,
+                    &k_buf,
+                    &v_buf,
+                    &mut cache.full_attn[0],
+                    seq_len,
+                    2,
+                    1,
+                    256,
+                    16,
+                    None,
+                    SlotId(0),
+                )
+                .expect("fresh-short vector attention must execute");
+                let actual = actual_buf
+                    .as_slice::<f32>()
+                    .expect("fresh-short output")
+                    .to_vec();
+                assert_eq!(cache.full_attn[0].current_len, vec![seq_len]);
+                for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(
+                        got.is_finite(),
+                        "qL={seq_len} tq={tq_active} output[{index}]={got}"
+                    );
+                    assert!(
+                        (got - want).abs() <= 1e-2,
+                        "qL={seq_len} tq={tq_active} output[{index}]={got} expected={want}"
+                    );
+                }
+                representations.push(actual);
+            }
+
+            assert_eq!(
+                representations[0]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                representations[1]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "qL={seq_len}: attention result must not depend on persistent cache representation"
+            );
+        }
+    }
 
     #[test]
     fn native_f32_projection_qwen_m4_is_deterministic() {

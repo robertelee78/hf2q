@@ -21,7 +21,7 @@ use mlx_native::MlxBuffer;
 use tokenizers::Tokenizer;
 
 use crate::inference::models::qwen35::kv_cache::{
-    HybridKvCache, HybridKvCacheSnapshot, HybridKvSlotAnchor,
+    HybridKvCache, HybridKvCacheSnapshot, HybridKvSlotAnchor, HybridKvSlotTransaction,
 };
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::inference::spec_decode::cost_controller::SpeculationCostController;
@@ -3799,6 +3799,8 @@ impl Qwen35PrefillState {
             );
             let chunk_start = self.next_token_index;
             let chunk = &self.prompt_tokens[self.next_token_index..end];
+            let transaction =
+                begin_slot_state_transaction(kv_cache, self.slot_id, chunk_start as u32)?;
             let vision_chunk = self
                 .vision
                 .as_ref()
@@ -3895,6 +3897,7 @@ impl Qwen35PrefillState {
                                 hidden.element_count() == qwen.model.cfg.hidden_size as usize,
                                 "Qwen SlotAware MTP prefill hidden must be one row"
                             );
+                            qwen35_state_failpoint(Qwen35StateFailpoint::PrefillMtpCatchup)?;
                             Ok(hidden)
                         })();
                         match catchup {
@@ -3917,13 +3920,11 @@ impl Qwen35PrefillState {
                                 super::qwen35_speculation::record_fallback(
                                     super::qwen35_speculation::QwenSpeculationDecision::RuntimeUnavailable,
                                 );
-                                rollback_slot_mtp_transaction(
-                                    kv_cache,
-                                    self.slot_id,
-                                    chunk_start as u32,
-                                    chunk_start as u32,
-                                )
-                                .context("Qwen SlotAware MTP prompt-catch-up bounded rollback")?;
+                                kv_cache
+                                    .rollback_slot_transaction(self.slot_id, &transaction)
+                                    .context(
+                                        "Qwen SlotAware MTP prompt-catch-up bounded rollback",
+                                    )?;
                                 self.mtp_pending_hidden = None;
                                 self.speculation_unavailable = true;
                                 (
@@ -3946,12 +3947,45 @@ impl Qwen35PrefillState {
                     None,
                 )
             };
-            lease.finish()?;
-            let logits = forward
-                .context("Qwen35Model::forward_gpu_last_logits (slot-aware bounded prefill)")?;
-            kv_cache
-                .validate_sequence_len_for_slot(self.slot_id, end)
-                .context("validate Qwen35 slot cursors after bounded prefill")?;
+            if let Err(error) = lease.finish() {
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen35 bounded prefill supervision",
+                );
+            }
+            let logits = match forward {
+                Ok(logits) => logits,
+                Err(error) => {
+                    return rollback_slot_state_error(
+                        kv_cache,
+                        self.slot_id,
+                        &transaction,
+                        error,
+                        "Qwen35 bounded prefill forward",
+                    );
+                }
+            };
+            if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::PrefillTarget) {
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen35 bounded prefill post-target failpoint",
+                );
+            }
+            if let Err(error) = kv_cache.validate_sequence_len_for_slot(self.slot_id, end) {
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "validate Qwen35 slot cursors after bounded prefill",
+                );
+            }
             tracing::info!(
                 slot = self.slot_id.0,
                 chunk_start,
@@ -3971,11 +4005,21 @@ impl Qwen35PrefillState {
                             token_count: end,
                             pending_target_hidden: hidden.clone(),
                         });
+                let kv = match kv_cache.snapshot_slot_anchor(self.slot_id, end) {
+                    Ok(kv) => kv,
+                    Err(error) => {
+                        return rollback_slot_state_error(
+                            kv_cache,
+                            self.slot_id,
+                            &transaction,
+                            error,
+                            "capture Qwen35 stable prompt boundary",
+                        );
+                    }
+                };
                 Some(Qwen35StablePromptCheckpoint {
                     prompt_tokens: self.prompt_tokens[..end].to_vec(),
-                    kv: kv_cache
-                        .snapshot_slot_anchor(self.slot_id, end)
-                        .context("capture Qwen35 stable prompt boundary")?,
+                    kv,
                     prefill_logits: logits.clone(),
                     vision_fingerprint: self.params.vision_fingerprint,
                     spec,
@@ -4139,110 +4183,64 @@ fn mtp_cursor_for_slot(kv_cache: &HybridKvCache, slot_id: SlotId) -> Result<u32>
         .context("Qwen SlotAware MTP cursor missing")
 }
 
-fn rollback_slot_mtp_transaction(
-    kv_cache: &mut HybridKvCache,
-    slot_id: SlotId,
-    target_cursor: u32,
-    mtp_cursor: u32,
-) -> Result<()> {
-    let mut failures = Vec::new();
-    if let Err(error) = kv_cache.truncate_full_attn_to_for_slot(slot_id, target_cursor) {
-        failures.push(format!("full attention: {error:#}"));
-    }
-    if let Err(error) = kv_cache.rewind_la_ping_pong_for_slot(slot_id) {
-        failures.push(format!("linear attention: {error:#}"));
-    }
-    if let Err(error) = kv_cache.truncate_mtp_to_for_slot(slot_id, mtp_cursor) {
-        failures.push(format!("MTP cursor: {error:#}"));
-    }
-    if failures.is_empty() {
-        return Ok(());
-    }
-    // A request whose exact cursor restoration failed must never return its
-    // partially advanced slot to the scheduler. Reset is the fail-closed
-    // recovery; preserve every rollback/reset failure in the diagnostic.
-    if let Err(error) = kv_cache.reset_for_slot(slot_id) {
-        failures.push(format!("fail-closed slot reset: {error:#}"));
-    }
-    anyhow::bail!(
-        "Qwen SlotAware MTP rollback failed: {}",
-        failures.join("; ")
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Qwen35StateFailpoint {
+    OrdinaryTarget = 1,
+    HistoryTarget = 2,
+    HistoryMtpCatchup = 3,
+    HistoryCommit = 4,
+    MtpDraft = 5,
+    MtpTarget = 6,
+    MtpCatchup = 7,
+    MtpCommit = 8,
+    WarmupTarget = 9,
+    WarmupMtpCatchup = 10,
+    PrefillTarget = 11,
+    PrefillMtpCatchup = 12,
 }
 
-fn rollback_slot_target_transaction(
-    kv_cache: &mut HybridKvCache,
-    slot_id: SlotId,
-    target_cursor: u32,
-) -> Result<()> {
-    let mut failures = Vec::new();
-    if let Err(error) = kv_cache.truncate_full_attn_to_for_slot(slot_id, target_cursor) {
-        failures.push(format!("full attention: {error:#}"));
+#[cfg(test)]
+static QWEN35_STATE_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[inline]
+fn qwen35_state_failpoint(point: Qwen35StateFailpoint) -> Result<()> {
+    #[cfg(test)]
+    if QWEN35_STATE_FAILPOINT.load(std::sync::atomic::Ordering::SeqCst) == point as u8 {
+        anyhow::bail!("injected Qwen state failure after {point:?}");
     }
-    if let Err(error) = kv_cache.rewind_la_ping_pong_for_slot(slot_id) {
-        failures.push(format!("linear attention: {error:#}"));
-    }
-    if failures.is_empty() {
-        return Ok(());
-    }
-    if let Err(error) = kv_cache.reset_for_slot(slot_id) {
-        failures.push(format!("fail-closed slot reset: {error:#}"));
-    }
-    anyhow::bail!(
-        "Qwen SlotAware target rollback failed: {}",
-        failures.join("; ")
-    )
+    #[cfg(not(test))]
+    let _ = point;
+    Ok(())
 }
 
-fn rollback_slot_mtp_draft_error<T>(
+fn begin_slot_state_transaction(
+    kv_cache: &HybridKvCache,
+    slot_id: SlotId,
+    target_cursor: u32,
+) -> Result<HybridKvSlotTransaction> {
+    kv_cache
+        .begin_slot_transaction(slot_id, target_cursor)
+        .context("capture exact Qwen slot state transaction")
+}
+
+fn rollback_slot_state_error<T>(
     kv_cache: &mut HybridKvCache,
     slot_id: SlotId,
-    mtp_cursor: u32,
+    transaction: &HybridKvSlotTransaction,
     error: anyhow::Error,
     context: &'static str,
 ) -> Result<T> {
     let original = error.context(context);
-    match kv_cache.truncate_mtp_to_for_slot(slot_id, mtp_cursor) {
+    kv_cache.clear_la_capture();
+    match kv_cache.rollback_slot_transaction(slot_id, transaction) {
         Ok(()) => Err(original),
         Err(rollback) => {
             let reset = kv_cache.reset_for_slot(slot_id);
             Err(anyhow::anyhow!(
-                "{original:#}; MTP draft rollback failure: {rollback:#}; fail-closed reset: {reset:?}"
+                "{original:#}; exact slot-state rollback failure: {rollback:#}; fail-closed reset: {reset:?}"
             ))
         }
-    }
-}
-
-fn rollback_slot_target_error<T>(
-    kv_cache: &mut HybridKvCache,
-    slot_id: SlotId,
-    target_cursor: u32,
-    error: anyhow::Error,
-    context: &'static str,
-) -> Result<T> {
-    let original = error.context(context);
-    match rollback_slot_target_transaction(kv_cache, slot_id, target_cursor) {
-        Ok(()) => Err(original),
-        Err(rollback) => Err(anyhow::anyhow!(
-            "{original:#}; rollback failure: {rollback:#}"
-        )),
-    }
-}
-
-fn rollback_slot_mtp_error<T>(
-    kv_cache: &mut HybridKvCache,
-    slot_id: SlotId,
-    target_cursor: u32,
-    mtp_cursor: u32,
-    error: anyhow::Error,
-    context: &'static str,
-) -> Result<T> {
-    let original = error.context(context);
-    match rollback_slot_mtp_transaction(kv_cache, slot_id, target_cursor, mtp_cursor) {
-        Ok(()) => Err(original),
-        Err(rollback) => Err(anyhow::anyhow!(
-            "{original:#}; rollback failure: {rollback:#}"
-        )),
     }
 }
 
@@ -4833,6 +4831,8 @@ impl Qwen35DecodeState {
         if self.mtp.is_some() {
             return self.decode_tick_mtp_k3(qwen, kv_cache, supervisor);
         }
+        let prior_target = kv_cache.sequence_len_for_slot(self.slot_id)?;
+        let transaction = begin_slot_state_transaction(kv_cache, self.slot_id, prior_target)?;
         let ordinary_target_started = Instant::now();
         let pos = self.decode_position_base + self.step - 1;
         let pos_i32 = pos as i32;
@@ -4856,14 +4856,36 @@ impl Qwen35DecodeState {
             let forward =
                 qwen.model
                     .forward_gpu_greedy(last_input, &positions, kv_cache, self.slot_id);
-            lease.finish()?;
-            let predicted = forward.with_context(|| {
-                format!(
-                    "Qwen35Model::forward_gpu_greedy (slot-aware decode step {}; \
-                         ADR-040 Phase F M1)",
-                    self.step
-                )
-            })?;
+            if let Err(error) = lease.finish() {
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen35 ordinary greedy supervision",
+                );
+            }
+            let predicted = match forward {
+                Ok(predicted) => predicted,
+                Err(error) => {
+                    return rollback_slot_state_error(
+                        kv_cache,
+                        self.slot_id,
+                        &transaction,
+                        error,
+                        "Qwen35 ordinary greedy forward",
+                    );
+                }
+            };
+            if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::OrdinaryTarget) {
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen35 ordinary greedy post-target failpoint",
+                );
+            }
             forced_token.map_or(predicted, |(token, _)| token)
         } else {
             let lease =
@@ -4871,30 +4893,71 @@ impl Qwen35DecodeState {
             let forward =
                 qwen.model
                     .forward_gpu_last_logits(last_input, &positions, kv_cache, self.slot_id);
-            lease.finish()?;
-            let logits = forward.with_context(|| {
-                format!(
-                    "Qwen35Model::forward_gpu_last_logits (slot-aware decode step {})",
-                    self.step
-                )
-            })?;
-            anyhow::ensure!(
-                logits.len() == qwen.vocab_size,
-                "qwen35 slot-aware decode logits len {} != vocab_size {}",
-                logits.len(),
-                qwen.vocab_size
-            );
+            if let Err(error) = lease.finish() {
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen35 ordinary logits supervision",
+                );
+            }
+            let logits = match forward {
+                Ok(logits) => logits,
+                Err(error) => {
+                    return rollback_slot_state_error(
+                        kv_cache,
+                        self.slot_id,
+                        &transaction,
+                        error,
+                        "Qwen35 ordinary logits forward",
+                    );
+                }
+            };
+            if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::OrdinaryTarget) {
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen35 ordinary logits post-target failpoint",
+                );
+            }
+            if logits.len() != qwen.vocab_size {
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    anyhow::anyhow!(
+                        "qwen35 slot-aware decode logits len {} != vocab_size {}",
+                        logits.len(),
+                        qwen.vocab_size
+                    ),
+                    "Qwen35 ordinary logits shape",
+                );
+            }
             let (token, logprob) = if let Some((token, _)) = forced_token {
                 (token, self.want_logprobs.then_some(0.0))
             } else {
                 let mut logits = logits;
-                sample_logits_qwen35_constrained(
+                match sample_logits_qwen35_constrained(
                     &mut logits,
                     &self.params,
                     &self.sampling_history,
                     self.grammar_runtime.as_ref(),
                     self.want_logprobs,
-                )?
+                ) {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        return rollback_slot_state_error(
+                            kv_cache,
+                            self.slot_id,
+                            &transaction,
+                            error,
+                            "Qwen35 ordinary canonical decision",
+                        );
+                    }
+                }
             };
             if let (Some(values), Some(logprob)) = (self.logprobs_vec.as_mut(), logprob) {
                 values.push(logprob);
@@ -5056,6 +5119,7 @@ impl Qwen35DecodeState {
             next_pos,
             verify_rows,
         );
+        let transaction = begin_slot_state_transaction(kv_cache, self.slot_id, prior_target_len)?;
         let lease = match supervisor.arm(
             "Qwen35 SlotAware history block verify",
             QWEN35_WORKER_TRANSACTION_TIMEOUT,
@@ -5080,43 +5144,60 @@ impl Qwen35DecodeState {
                     .err()
                     .or_else(|| forward.err())
                     .expect("failed history verification has an error");
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen history verifier fail-closed reset")?;
-                return Err(error.context("Qwen history block verify"));
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen history block verify",
+                );
             }
         };
+        if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::HistoryTarget) {
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                error,
+                "Qwen history post-target failpoint",
+            );
+        }
         let vocab = qwen.vocab_size;
         if verify_logits.element_count() != verify_rows * vocab
             || verify_hidden.element_count() != verify_rows * qwen.model.cfg.hidden_size as usize
         {
-            kv_cache.clear_la_capture();
-            kv_cache
-                .reset_for_slot(self.slot_id)
-                .context("Qwen history verify shape reset")?;
-            anyhow::bail!("Qwen history verify output shape mismatch");
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                anyhow::anyhow!("Qwen history verify output shape mismatch"),
+                "Qwen history verify output shape",
+            );
         }
 
         if let (Some(mtp_state), Some(prior_mtp_len)) = (self.mtp.as_ref(), prior_mtp_len) {
             let shared_embed_rows = match qwen.model.embed_tokens_gpu(&verify_input) {
                 Ok(rows) => rows,
                 Err(error) => {
-                    kv_cache.clear_la_capture();
-                    kv_cache
-                        .reset_for_slot(self.slot_id)
-                        .context("Qwen history MTP embedding reset")?;
-                    return Err(error.context("Qwen history MTP embeddings"));
+                    return rollback_slot_state_error(
+                        kv_cache,
+                        self.slot_id,
+                        &transaction,
+                        error,
+                        "Qwen history MTP embeddings",
+                    );
                 }
             };
             let mtp = match qwen.model.mtp.as_ref() {
                 Some(mtp) => mtp,
                 None => {
-                    kv_cache.clear_la_capture();
-                    kv_cache
-                        .reset_for_slot(self.slot_id)
-                        .context("Qwen history missing-MTP reset")?;
-                    anyhow::bail!("Qwen history MTP state exists without weights");
+                    return rollback_slot_state_error(
+                        kv_cache,
+                        self.slot_id,
+                        &transaction,
+                        anyhow::anyhow!("Qwen history MTP state exists without weights"),
+                        "Qwen history MTP lookup",
+                    );
                 }
             };
             let lease = match supervisor.arm(
@@ -5125,11 +5206,13 @@ impl Qwen35DecodeState {
             ) {
                 Ok(lease) => lease,
                 Err(error) => {
-                    kv_cache.clear_la_capture();
-                    kv_cache
-                        .reset_for_slot(self.slot_id)
-                        .context("Qwen history MTP catch-up admission reset")?;
-                    return Err(error.context("Qwen history MTP catch-up admission"));
+                    return rollback_slot_state_error(
+                        kv_cache,
+                        self.slot_id,
+                        &transaction,
+                        error,
+                        "Qwen history MTP catch-up admission",
+                    );
                 }
             };
             let caught_up = qwen.model.with_gpu_cache_mut(|device, registry| {
@@ -5147,11 +5230,22 @@ impl Qwen35DecodeState {
                 )
             });
             if let Err(error) = lease.finish().and(caught_up) {
-                kv_cache.clear_la_capture();
-                kv_cache.reset_for_slot(self.slot_id).with_context(|| {
-                    format!("Qwen history MTP catch-up failed ({error:#}); fail-closed reset")
-                })?;
-                return Err(error.context("Qwen history MTP catch-up"));
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen history MTP catch-up",
+                );
+            }
+            if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::HistoryMtpCatchup) {
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen history post-MTP-catch-up failpoint",
+                );
             }
             debug_assert_eq!(prior_mtp_len, prior_target_len);
         }
@@ -5159,11 +5253,13 @@ impl Qwen35DecodeState {
         let verify_logits = match verify_logits.as_mut_slice::<f32>() {
             Ok(logits) => logits,
             Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen history logits view failure reset")?;
-                return Err(anyhow::anyhow!("{error}").context("Qwen history logits view"));
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    anyhow::anyhow!("{error}"),
+                    "Qwen history logits view",
+                );
             }
         };
         let mut semantic = Qwen35SpecSemanticState::from_decode(self);
@@ -5177,11 +5273,13 @@ impl Qwen35DecodeState {
         }) {
             Ok(plan) => plan,
             Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen history semantic failure reset")?;
-                return Err(error.context("Qwen history canonical accept walk"));
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen history canonical accept walk",
+                );
             }
         };
         let committed_cursor = prior_target_len + plan.valid_input_tokens as u32;
@@ -5205,11 +5303,22 @@ impl Qwen35DecodeState {
             Ok(())
         })();
         if let Err(error) = state_result {
-            kv_cache.clear_la_capture();
-            kv_cache
-                .reset_for_slot(self.slot_id)
-                .context("Qwen history commit failure reset")?;
-            return Err(error.context("Qwen history commit verified prefix"));
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                error,
+                "Qwen history commit verified prefix",
+            );
+        }
+        if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::HistoryCommit) {
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                error,
+                "Qwen history post-commit failpoint",
+            );
         }
         if let Some(mtp_state) = self.mtp.as_mut() {
             mtp_state.verifier_hidden =
@@ -5220,10 +5329,13 @@ impl Qwen35DecodeState {
                 ) {
                     Ok(hidden) => hidden,
                     Err(error) => {
-                        kv_cache
-                            .reset_for_slot(self.slot_id)
-                            .context("Qwen history carry-hidden failure reset")?;
-                        return Err(error.context("Qwen history carry hidden"));
+                        return rollback_slot_state_error(
+                            kv_cache,
+                            self.slot_id,
+                            &transaction,
+                            error,
+                            "Qwen history carry hidden",
+                        );
                     }
                 };
         }
@@ -5330,6 +5442,7 @@ impl Qwen35DecodeState {
             kv_cache.clear_la_capture();
             return Err(error);
         }
+        let transaction = begin_slot_state_transaction(kv_cache, self.slot_id, prior_target_len)?;
         let draft_lease = match supervisor.arm(
             "Qwen35 SlotAware MTP K3 draft",
             QWEN35_WORKER_TRANSACTION_TIMEOUT,
@@ -5373,22 +5486,29 @@ impl Qwen35DecodeState {
                 .map(|_| ())
                 .map_err(|e| anyhow::anyhow!("{e:#}")),
         ) {
-            kv_cache.clear_la_capture();
-            return rollback_slot_mtp_draft_error(
+            return rollback_slot_state_error(
                 kv_cache,
                 self.slot_id,
-                prior_mtp_len,
+                &transaction,
                 error,
                 "Qwen SlotAware MTP K3 draft",
             );
         }
         let drafts = drafted.expect("draft result checked above");
-        if let Err(error) = kv_cache.truncate_mtp_to_for_slot(self.slot_id, prior_mtp_len) {
-            kv_cache.clear_la_capture();
-            return rollback_slot_mtp_draft_error(
+        if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::MtpDraft) {
+            return rollback_slot_state_error(
                 kv_cache,
                 self.slot_id,
-                prior_mtp_len,
+                &transaction,
+                error,
+                "Qwen SlotAware MTP K3 post-draft failpoint",
+            );
+        }
+        if let Err(error) = kv_cache.truncate_mtp_to_for_slot(self.slot_id, prior_mtp_len) {
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
                 error,
                 "Qwen SlotAware MTP K3 discard speculative draft cache",
             );
@@ -5408,8 +5528,13 @@ impl Qwen35DecodeState {
         ) {
             Ok(lease) => lease,
             Err(error) => {
-                kv_cache.clear_la_capture();
-                return Err(error.context("Qwen SlotAware MTP K3 verify admission"));
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen SlotAware MTP K3 verify admission",
+                );
             }
         };
         let verify_started = Instant::now();
@@ -5427,13 +5552,24 @@ impl Qwen35DecodeState {
                     .err()
                     .or_else(|| forward.err())
                     .expect("failed verification has an error");
-                kv_cache.clear_la_capture();
-                kv_cache.reset_for_slot(self.slot_id).with_context(|| {
-                    format!("Qwen SlotAware MTP K3 verify failed ({error:#}); fail-closed reset")
-                })?;
-                return Err(error.context("Qwen SlotAware MTP K3 verify"));
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen SlotAware MTP K3 verify",
+                );
             }
         };
+        if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::MtpTarget) {
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                error,
+                "Qwen SlotAware MTP K3 post-target failpoint",
+            );
+        }
         let verify_elapsed = verify_started.elapsed();
         let vocab = qwen.vocab_size;
         if verify_logits.element_count() != VERIFY_ROWS * vocab
@@ -5446,22 +5582,26 @@ impl Qwen35DecodeState {
                 verify_hidden.element_count(),
                 VERIFY_ROWS * qwen.model.cfg.hidden_size as usize,
             );
-            kv_cache.clear_la_capture();
-            kv_cache
-                .reset_for_slot(self.slot_id)
-                .context("Qwen SlotAware MTP K3 shape failure reset")?;
-            return Err(error);
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                error,
+                "Qwen SlotAware MTP K3 verify shape",
+            );
         }
 
         let embed_started = Instant::now();
         let shared_embed_rows = match qwen.model.embed_tokens_gpu(&verify_input) {
             Ok(rows) => rows,
             Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 embedding failure reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 verifier embeddings"));
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen SlotAware MTP K3 verifier embeddings",
+                );
             }
         };
         let embed_elapsed = embed_started.elapsed();
@@ -5471,11 +5611,13 @@ impl Qwen35DecodeState {
         ) {
             Ok(lease) => lease,
             Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 catch-up admission reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 catch-up admission"));
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen SlotAware MTP K3 catch-up admission",
+                );
             }
         };
         let catchup_started = Instant::now();
@@ -5495,22 +5637,35 @@ impl Qwen35DecodeState {
         });
         let catchup_supervision = catchup_lease.finish();
         if let Err(error) = catchup_supervision.and(caught_up) {
-            kv_cache.clear_la_capture();
-            kv_cache.reset_for_slot(self.slot_id).with_context(|| {
-                format!("Qwen SlotAware MTP K3 catch-up failed ({error:#}); fail-closed reset")
-            })?;
-            return Err(error.context("Qwen SlotAware MTP K3 target catch-up"));
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                error,
+                "Qwen SlotAware MTP K3 target catch-up",
+            );
+        }
+        if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::MtpCatchup) {
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                error,
+                "Qwen SlotAware MTP K3 post-catch-up failpoint",
+            );
         }
         let catchup_elapsed = catchup_started.elapsed();
 
         let verify_logits = match verify_logits.as_mut_slice::<f32>() {
             Ok(logits) => logits,
             Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 logits view failure reset")?;
-                return Err(anyhow::anyhow!("{error}").context("Qwen SlotAware MTP K3 logits view"));
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    anyhow::anyhow!("{error}"),
+                    "Qwen SlotAware MTP K3 logits view",
+                );
             }
         };
         let semantic_started = Instant::now();
@@ -5525,11 +5680,13 @@ impl Qwen35DecodeState {
         }) {
             Ok(plan) => plan,
             Err(error) => {
-                kv_cache.clear_la_capture();
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 semantic failure reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 canonical accept walk"));
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen SlotAware MTP K3 canonical accept walk",
+                );
             }
         };
         let semantic_elapsed = semantic_started.elapsed();
@@ -5559,11 +5716,22 @@ impl Qwen35DecodeState {
         })();
         let state_elapsed = state_started.elapsed();
         if let Err(error) = state_result {
-            kv_cache.clear_la_capture();
-            kv_cache.reset_for_slot(self.slot_id).with_context(|| {
-                format!("Qwen SlotAware MTP K3 commit failed ({error:#}); fail-closed reset")
-            })?;
-            return Err(error);
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                error,
+                "Qwen SlotAware MTP K3 commit verified prefix",
+            );
+        }
+        if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::MtpCommit) {
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                error,
+                "Qwen SlotAware MTP K3 post-commit failpoint",
+            );
         }
 
         let carry_hidden = match crate::inference::models::qwen35::spec_decode::nth_hidden_row(
@@ -5573,10 +5741,13 @@ impl Qwen35DecodeState {
         ) {
             Ok(hidden) => hidden,
             Err(error) => {
-                kv_cache
-                    .reset_for_slot(self.slot_id)
-                    .context("Qwen SlotAware MTP K3 carry-hidden failure reset")?;
-                return Err(error.context("Qwen SlotAware MTP K3 carry hidden"));
+                return rollback_slot_state_error(
+                    kv_cache,
+                    self.slot_id,
+                    &transaction,
+                    error,
+                    "Qwen SlotAware MTP K3 carry hidden",
+                );
             }
         };
         self.mtp
@@ -5673,6 +5844,7 @@ impl Qwen35DecodeState {
             prior_target == prior_mtp,
             "Qwen coherent ordinary decode cursor mismatch (target={prior_target}, mtp={prior_mtp})"
         );
+        let transaction = begin_slot_state_transaction(kv_cache, self.slot_id, prior_target)?;
         let pending_hidden = self
             .mtp
             .as_ref()
@@ -5696,11 +5868,10 @@ impl Qwen35DecodeState {
             self.slot_id,
         );
         if let Err(error) = lease.finish() {
-            return rollback_slot_mtp_error(
+            return rollback_slot_state_error(
                 kv_cache,
                 self.slot_id,
-                prior_target,
-                prior_mtp,
+                &transaction,
                 error,
                 "Qwen coherent ordinary target supervision",
             );
@@ -5708,24 +5879,31 @@ impl Qwen35DecodeState {
         let (mut logits, nextn_hidden) = match forward {
             Ok(value) => value,
             Err(error) => {
-                return rollback_slot_mtp_error(
+                return rollback_slot_state_error(
                     kv_cache,
                     self.slot_id,
-                    prior_target,
-                    prior_mtp,
+                    &transaction,
                     error,
                     "Qwen coherent ordinary target",
                 );
             }
         };
+        if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::WarmupTarget) {
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                error,
+                "Qwen coherent ordinary post-target failpoint",
+            );
+        }
         let shared_embed = match qwen.model.embed_tokens_gpu(&[next_token]) {
             Ok(embed) => embed,
             Err(error) => {
-                return rollback_slot_mtp_error(
+                return rollback_slot_state_error(
                     kv_cache,
                     self.slot_id,
-                    prior_target,
-                    prior_mtp,
+                    &transaction,
                     error,
                     "Qwen coherent ordinary shared embedding",
                 );
@@ -5734,11 +5912,10 @@ impl Qwen35DecodeState {
         let mtp = match qwen.model.mtp.as_ref() {
             Some(mtp) => mtp,
             None => {
-                return rollback_slot_mtp_error(
+                return rollback_slot_state_error(
                     kv_cache,
                     self.slot_id,
-                    prior_target,
-                    prior_mtp,
+                    &transaction,
                     anyhow::anyhow!("Qwen coherent ordinary decode MTP weights missing"),
                     "Qwen coherent ordinary MTP lookup",
                 );
@@ -5750,11 +5927,10 @@ impl Qwen35DecodeState {
         ) {
             Ok(lease) => lease,
             Err(error) => {
-                return rollback_slot_mtp_error(
+                return rollback_slot_state_error(
                     kv_cache,
                     self.slot_id,
-                    prior_target,
-                    prior_mtp,
+                    &transaction,
                     error,
                     "Qwen coherent ordinary MTP catch-up admission",
                 );
@@ -5775,23 +5951,30 @@ impl Qwen35DecodeState {
             )
         });
         if let Err(error) = lease.finish().and(caught_up) {
-            return rollback_slot_mtp_error(
+            return rollback_slot_state_error(
                 kv_cache,
                 self.slot_id,
-                prior_target,
-                prior_mtp,
+                &transaction,
                 error,
                 "Qwen coherent ordinary MTP catch-up",
+            );
+        }
+        if let Err(error) = qwen35_state_failpoint(Qwen35StateFailpoint::WarmupMtpCatchup) {
+            return rollback_slot_state_error(
+                kv_cache,
+                self.slot_id,
+                &transaction,
+                error,
+                "Qwen coherent ordinary post-MTP-catch-up failpoint",
             );
         }
         if let Err(error) = kv_cache
             .validate_speculative_cursors_for_slot(self.slot_id, (prior_target + 1) as usize)
         {
-            return rollback_slot_mtp_error(
+            return rollback_slot_state_error(
                 kv_cache,
                 self.slot_id,
-                prior_target,
-                prior_mtp,
+                &transaction,
                 error,
                 "Qwen coherent ordinary committed cursor equality",
             );
@@ -5803,11 +5986,10 @@ impl Qwen35DecodeState {
         ) {
             Ok(hidden) => hidden,
             Err(error) => {
-                return rollback_slot_mtp_error(
+                return rollback_slot_state_error(
                     kv_cache,
                     self.slot_id,
-                    prior_target,
-                    prior_mtp,
+                    &transaction,
                     error,
                     "Qwen coherent ordinary carry hidden",
                 );
@@ -5822,11 +6004,10 @@ impl Qwen35DecodeState {
         let decision = match semantic.select_and_observe(qwen, &self.params, &mut logits) {
             Ok(decision) => decision,
             Err(error) => {
-                return rollback_slot_mtp_error(
+                return rollback_slot_state_error(
                     kv_cache,
                     self.slot_id,
-                    prior_target,
-                    prior_mtp,
+                    &transaction,
                     error,
                     "Qwen coherent ordinary canonical decision",
                 );
@@ -9990,21 +10171,149 @@ mod tests {
     }
 
     #[test]
-    fn mtp_transaction_rollback_restores_target_and_drafter_cursors() {
+    fn every_post_mutation_failpoint_restores_state_buffers_and_cursors() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut cfg = moe_cfg_40layer_for_cache_test();
         cfg.mtp_num_hidden_layers = 1;
-        let mut kv = HybridKvCache::new(&cfg, &device, 16, 1).expect("kv");
-        for slot in &mut kv.full_attn {
-            slot.current_len[0] = 7;
+        let phases = [
+            Qwen35StateFailpoint::OrdinaryTarget,
+            Qwen35StateFailpoint::HistoryTarget,
+            Qwen35StateFailpoint::HistoryMtpCatchup,
+            Qwen35StateFailpoint::HistoryCommit,
+            Qwen35StateFailpoint::MtpDraft,
+            Qwen35StateFailpoint::MtpTarget,
+            Qwen35StateFailpoint::MtpCatchup,
+            Qwen35StateFailpoint::MtpCommit,
+            Qwen35StateFailpoint::WarmupTarget,
+            Qwen35StateFailpoint::WarmupMtpCatchup,
+            Qwen35StateFailpoint::PrefillTarget,
+            Qwen35StateFailpoint::PrefillMtpCatchup,
+        ];
+
+        fn fill_slot(buf: &mut MlxBuffer, slot: usize, n_seqs: usize, byte: u8) {
+            let bytes = buf.as_mut_slice::<u8>().expect("state buffer");
+            let per_slot = bytes.len() / n_seqs;
+            bytes[slot * per_slot..(slot + 1) * per_slot].fill(byte);
         }
-        kv.mtp_slot.as_mut().expect("MTP slot").current_len[0] = 7;
+        fn read_slot(buf: &MlxBuffer, slot: usize, n_seqs: usize) -> Vec<u8> {
+            let bytes = buf.as_slice::<u8>().expect("state buffer");
+            let per_slot = bytes.len() / n_seqs;
+            bytes[slot * per_slot..(slot + 1) * per_slot].to_vec()
+        }
 
-        rollback_slot_mtp_transaction(&mut kv, SlotId(0), 4, 4).expect("rollback");
+        for phase in phases {
+            let mut kv = HybridKvCache::new(&cfg, &device, 16, 2).expect("kv");
+            for slot in &mut kv.full_attn {
+                slot.current_len = vec![4, 3];
+            }
+            kv.mtp_slot.as_mut().expect("MTP slot").current_len = vec![4, 3];
+            for linear in &mut kv.linear_attn {
+                fill_slot(&mut linear.conv_state, 0, 2, 0x11);
+                fill_slot(&mut linear.recurrent, 0, 2, 0x22);
+                fill_slot(&mut linear.conv_state_scratch, 0, 2, 0xa1);
+                fill_slot(&mut linear.recurrent_scratch, 0, 2, 0xa2);
+                fill_slot(&mut linear.conv_state, 1, 2, 0x31);
+                fill_slot(&mut linear.recurrent, 1, 2, 0x32);
+                fill_slot(&mut linear.conv_state_scratch, 1, 2, 0xb1);
+                fill_slot(&mut linear.recurrent_scratch, 1, 2, 0xb2);
+            }
+            let target_before = kv
+                .linear_attn
+                .iter()
+                .map(|linear| {
+                    let (conv, _) = linear.conv_bufs_for_slot(SlotId(0));
+                    let (recurrent, _) = linear.recurrent_bufs_for_slot(SlotId(0));
+                    (read_slot(conv, 0, 2), read_slot(recurrent, 0, 2))
+                })
+                .collect::<Vec<_>>();
+            let peer_before = kv
+                .linear_attn
+                .iter()
+                .map(|linear| {
+                    let (conv, _) = linear.conv_bufs_for_slot(SlotId(1));
+                    let (recurrent, _) = linear.recurrent_bufs_for_slot(SlotId(1));
+                    (read_slot(conv, 1, 2), read_slot(recurrent, 1, 2))
+                })
+                .collect::<Vec<_>>();
+            let transaction =
+                begin_slot_state_transaction(&kv, SlotId(0), 4).expect("capture transaction");
 
-        assert!(kv.full_attn.iter().all(|slot| slot.current_len[0] == 4));
-        assert_eq!(kv.mtp_slot.as_ref().expect("MTP slot").current_len[0], 4);
+            for slot in &mut kv.full_attn {
+                slot.current_len[0] = 7;
+            }
+            kv.mtp_slot.as_mut().expect("MTP slot").current_len[0] = 7;
+            for linear in &mut kv.linear_attn {
+                fill_slot(&mut linear.conv_state_scratch, 0, 2, phase as u8);
+                fill_slot(
+                    &mut linear.recurrent_scratch,
+                    0,
+                    2,
+                    (phase as u8).wrapping_add(0x40),
+                );
+                linear.swap_for_slot(SlotId(0));
+            }
+
+            QWEN35_STATE_FAILPOINT.store(phase as u8, std::sync::atomic::Ordering::SeqCst);
+            let injected = qwen35_state_failpoint(phase).expect_err("failpoint must fire");
+            QWEN35_STATE_FAILPOINT.store(0, std::sync::atomic::Ordering::SeqCst);
+            let error = rollback_slot_state_error::<()>(
+                &mut kv,
+                SlotId(0),
+                &transaction,
+                injected,
+                "model-free rollback proof",
+            )
+            .expect_err("injected transaction returns its error after rollback");
+            assert!(error.to_string().contains("model-free rollback proof"));
+
+            assert!(kv
+                .full_attn
+                .iter()
+                .all(|slot| slot.current_len == vec![4, 3]));
+            assert_eq!(
+                kv.mtp_slot.as_ref().expect("MTP slot").current_len,
+                vec![4, 3]
+            );
+            for (layer_idx, linear) in kv.linear_attn.iter().enumerate() {
+                let (target_conv, _) = linear.conv_bufs_for_slot(SlotId(0));
+                let (target_recurrent, _) = linear.recurrent_bufs_for_slot(SlotId(0));
+                assert_eq!(read_slot(target_conv, 0, 2), target_before[layer_idx].0);
+                assert_eq!(
+                    read_slot(target_recurrent, 0, 2),
+                    target_before[layer_idx].1
+                );
+                let (peer_conv, _) = linear.conv_bufs_for_slot(SlotId(1));
+                let (peer_recurrent, _) = linear.recurrent_bufs_for_slot(SlotId(1));
+                assert_eq!(read_slot(peer_conv, 1, 2), peer_before[layer_idx].0);
+                assert_eq!(read_slot(peer_recurrent, 1, 2), peer_before[layer_idx].1);
+            }
+        }
+    }
+
+    #[test]
+    fn every_declared_state_failpoint_is_wired_to_a_mutation_boundary() {
+        let source = include_str!("engine_qwen35.rs");
+        for name in [
+            "OrdinaryTarget",
+            "HistoryTarget",
+            "HistoryMtpCatchup",
+            "HistoryCommit",
+            "MtpDraft",
+            "MtpTarget",
+            "MtpCatchup",
+            "MtpCommit",
+            "WarmupTarget",
+            "WarmupMtpCatchup",
+            "PrefillTarget",
+            "PrefillMtpCatchup",
+        ] {
+            let needle = format!("qwen35_state_failpoint(Qwen35StateFailpoint::{name})");
+            assert!(
+                source.contains(&needle),
+                "missing runtime failpoint wiring for {name}"
+            );
+        }
     }
 
     fn initialized_prompt_cache_snapshot(
