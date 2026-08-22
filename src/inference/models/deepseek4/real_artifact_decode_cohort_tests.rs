@@ -6,7 +6,7 @@ use mlx_native::{
     barrier_count, cmd_buf_count, dispatch_count, reset_counters, sync_count, MlxBuffer,
 };
 
-use super::cache::Deepseek4Cache;
+use super::cache::{Deepseek4Cache, Deepseek4CacheSnapshot};
 use super::model::Deepseek4Model;
 use super::real_artifact_tests::official_artifact;
 
@@ -303,7 +303,57 @@ fn timed_cohort(
 
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
-    (values[values.len() / 2 - 1] + values[values.len() / 2]) / 2.0
+    if values.len() % 2 == 0 {
+        (values[values.len() / 2 - 1] + values[values.len() / 2]) / 2.0
+    } else {
+        values[values.len() / 2]
+    }
+}
+
+fn order_stratum(values: &[f64], parity: usize) -> Vec<f64> {
+    values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &value)| (index % 2 == parity).then_some(value))
+        .collect()
+}
+
+fn restore_caches(
+    caches: &mut [Deepseek4Cache],
+    snapshots: &[Deepseek4CacheSnapshot],
+    label: &str,
+) {
+    for (cache, snapshot) in caches.iter_mut().zip(snapshots) {
+        cache
+            .restore(snapshot)
+            .unwrap_or_else(|error| panic!("restore {label} cache: {error:#}"));
+    }
+}
+
+fn timed_serial_conditioned(
+    model: &mut Deepseek4Model,
+    caches: &mut [Deepseek4Cache],
+    snapshots: &[Deepseek4CacheSnapshot],
+    tokens: [u32; LANES],
+) -> (TrialCounters, f64, TrialCounters) {
+    restore_caches(caches, snapshots, "conditioned serial prime");
+    let (_, prime_counters) = timed_serial(model, caches, tokens);
+    restore_caches(caches, snapshots, "conditioned serial timing");
+    let (elapsed, measured_counters) = timed_serial(model, caches, tokens);
+    (prime_counters, elapsed, measured_counters)
+}
+
+fn timed_cohort_conditioned(
+    model: &mut Deepseek4Model,
+    caches: &mut [Deepseek4Cache],
+    snapshots: &[Deepseek4CacheSnapshot],
+    tokens: [u32; LANES],
+) -> (TrialCounters, f64, TrialCounters) {
+    restore_caches(caches, snapshots, "conditioned cohort prime");
+    let (_, prime_counters) = timed_cohort(model, caches, tokens);
+    restore_caches(caches, snapshots, "conditioned cohort timing");
+    let (elapsed, measured_counters) = timed_cohort(model, caches, tokens);
+    (prime_counters, elapsed, measured_counters)
 }
 
 #[test]
@@ -512,8 +562,48 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         }
     }
 
+    // Diagnostic control for topology-conditioned transient lifetime work.
+    // Every measured arm follows an untimed execution of that same arm from
+    // the exact benchmark snapshot. The second restore keeps the measured
+    // cache/token work identical while preventing a serial trial from
+    // inheriting cohort pool geometry (and vice versa).
+    let mut conditioned_serial_ms = Vec::with_capacity(BENCHMARK_PAIRS);
+    let mut conditioned_cohort_ms = Vec::with_capacity(BENCHMARK_PAIRS);
+    let mut conditioned_serial_prime_counters = Vec::with_capacity(BENCHMARK_PAIRS);
+    let mut conditioned_cohort_prime_counters = Vec::with_capacity(BENCHMARK_PAIRS);
+    let mut conditioned_serial_counters = Vec::with_capacity(BENCHMARK_PAIRS);
+    let mut conditioned_cohort_counters = Vec::with_capacity(BENCHMARK_PAIRS);
+    for pair in 0..BENCHMARK_PAIRS {
+        let tokens = supplied_tokens(pair + 1);
+        if pair % 2 == 0 {
+            let (prime_counters, elapsed, counters) =
+                timed_serial_conditioned(&mut model, &mut serial_caches, &serial_snapshots, tokens);
+            conditioned_serial_prime_counters.push(prime_counters);
+            conditioned_serial_ms.push(elapsed);
+            conditioned_serial_counters.push(counters);
+            let (prime_counters, elapsed, counters) =
+                timed_cohort_conditioned(&mut model, &mut cohort_caches, &cohort_snapshots, tokens);
+            conditioned_cohort_prime_counters.push(prime_counters);
+            conditioned_cohort_ms.push(elapsed);
+            conditioned_cohort_counters.push(counters);
+        } else {
+            let (prime_counters, elapsed, counters) =
+                timed_cohort_conditioned(&mut model, &mut cohort_caches, &cohort_snapshots, tokens);
+            conditioned_cohort_prime_counters.push(prime_counters);
+            conditioned_cohort_ms.push(elapsed);
+            conditioned_cohort_counters.push(counters);
+            let (prime_counters, elapsed, counters) =
+                timed_serial_conditioned(&mut model, &mut serial_caches, &serial_snapshots, tokens);
+            conditioned_serial_prime_counters.push(prime_counters);
+            conditioned_serial_ms.push(elapsed);
+            conditioned_serial_counters.push(counters);
+        }
+    }
+
     assert_eq!(serial_ms.len(), BENCHMARK_PAIRS);
     assert_eq!(cohort_ms.len(), BENCHMARK_PAIRS);
+    assert_eq!(conditioned_serial_ms.len(), BENCHMARK_PAIRS);
+    assert_eq!(conditioned_cohort_ms.len(), BENCHMARK_PAIRS);
     let body_command_buffers = 43_u64.div_ceil(2);
     let expected_serial_command_buffers = LANES as u64 * (body_command_buffers + 1);
     let expected_cohort_command_buffers = body_command_buffers + 1;
@@ -534,19 +624,62 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         assert!(serial_counters[pair].barriers > 0);
         assert!(cohort_counters[pair].dispatches > 0);
         assert!(cohort_counters[pair].barriers > 0);
+        assert_eq!(
+            conditioned_serial_counters[pair].command_buffers, expected_serial_command_buffers,
+            "pair {pair} conditioned serial command-buffer topology drift: {:?}",
+            conditioned_serial_counters[pair]
+        );
+        assert_eq!(
+            conditioned_cohort_counters[pair].command_buffers, expected_cohort_command_buffers,
+            "pair {pair} conditioned B=4 command-buffer topology drift: {:?}",
+            conditioned_cohort_counters[pair]
+        );
+        assert_eq!(
+            conditioned_serial_counters[pair].synchronizations,
+            LANES as u64
+        );
+        assert_eq!(conditioned_cohort_counters[pair].synchronizations, 1);
+        assert!(conditioned_serial_counters[pair].dispatches > 0);
+        assert!(conditioned_serial_counters[pair].barriers > 0);
+        assert!(conditioned_cohort_counters[pair].dispatches > 0);
+        assert!(conditioned_cohort_counters[pair].barriers > 0);
+        assert_eq!(
+            conditioned_serial_prime_counters[pair].command_buffers,
+            expected_serial_command_buffers
+        );
+        assert_eq!(
+            conditioned_serial_prime_counters[pair].synchronizations,
+            LANES as u64
+        );
+        assert_eq!(
+            conditioned_cohort_prime_counters[pair].command_buffers,
+            expected_cohort_command_buffers
+        );
+        assert_eq!(conditioned_cohort_prime_counters[pair].synchronizations, 1);
     }
     let serial_median = median(serial_ms.clone());
     let cohort_median = median(cohort_ms.clone());
-    assert!(
-        serial_median.is_finite()
-            && cohort_median.is_finite()
-            && serial_median > cohort_median
-            && cohort_median > 0.0,
-        "exact B=4 decode must retain a positive alternating-pair median: serial={serial_median:.3}ms cohort={cohort_median:.3}ms"
-    );
     let speedup = serial_median / cohort_median;
+    let conditioned_serial_median = median(conditioned_serial_ms.clone());
+    let conditioned_cohort_median = median(conditioned_cohort_ms.clone());
+    let conditioned_serial_even_median = median(order_stratum(&conditioned_serial_ms, 0));
+    let conditioned_cohort_even_median = median(order_stratum(&conditioned_cohort_ms, 0));
+    let conditioned_serial_odd_median = median(order_stratum(&conditioned_serial_ms, 1));
+    let conditioned_cohort_odd_median = median(order_stratum(&conditioned_cohort_ms, 1));
+    let conditioned_speedup = conditioned_serial_median / conditioned_cohort_median;
+    let conditioned_even_speedup = conditioned_serial_even_median / conditioned_cohort_even_median;
+    let conditioned_odd_speedup = conditioned_serial_odd_median / conditioned_cohort_odd_median;
+    let unconditioned_deltas = serial_ms
+        .iter()
+        .zip(&cohort_ms)
+        .map(|(&serial, &cohort)| serial - cohort)
+        .collect::<Vec<_>>();
+    let unconditioned_even_delta_median = median(order_stratum(&unconditioned_deltas, 0));
+    let unconditioned_odd_delta_median = median(order_stratum(&unconditioned_deltas, 1));
+    let unconditioned_order_signature =
+        unconditioned_even_delta_median < 0.0 && unconditioned_odd_delta_median > 0.0;
     eprintln!(
-        "DeepSeek-V4 B=4 decode spike: artifact={} parity_prefix={} parity_steps={} benchmark_position={} benchmark_logical_capacity={} loaded_idle_seconds={} permutation={:?} pairs={} order=alternating exact_state_logits_cache_recurrent=true serial_ms={:?} cohort_ms={:?} serial_median_ms={:.3} cohort_median_ms={:.3} speedup={:.4}x serial_counters={:?} cohort_counters={:?}",
+        "DeepSeek-V4 B=4 decode spike: artifact={} parity_prefix={} parity_steps={} benchmark_position={} benchmark_logical_capacity={} loaded_idle_seconds={} permutation={:?} pairs={} order=alternating exact_state_logits_cache_recurrent=true serial_ms={:?} cohort_ms={:?} serial_median_ms={:.3} cohort_median_ms={:.3} speedup={:.4}x unconditioned_even_delta_median_ms={:.3} unconditioned_odd_delta_median_ms={:.3} unconditioned_order_signature={} conditioned_serial_ms={:?} conditioned_cohort_ms={:?} conditioned_serial_median_ms={:.3} conditioned_cohort_median_ms={:.3} conditioned_speedup={:.4}x conditioned_even_speedup={:.4}x conditioned_odd_speedup={:.4}x serial_counters={:?} cohort_counters={:?} conditioned_serial_prime_counters={:?} conditioned_cohort_prime_counters={:?} conditioned_serial_counters={:?} conditioned_cohort_counters={:?}",
         path.display(),
         PREFIX_ROWS,
         DECODE_STEPS,
@@ -560,9 +693,30 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         serial_median,
         cohort_median,
         speedup,
+        unconditioned_even_delta_median,
+        unconditioned_odd_delta_median,
+        unconditioned_order_signature,
+        conditioned_serial_ms,
+        conditioned_cohort_ms,
+        conditioned_serial_median,
+        conditioned_cohort_median,
+        conditioned_speedup,
+        conditioned_even_speedup,
+        conditioned_odd_speedup,
         serial_counters,
         cohort_counters,
+        conditioned_serial_prime_counters,
+        conditioned_cohort_prime_counters,
+        conditioned_serial_counters,
+        conditioned_cohort_counters,
     );
+    let conditioned_pass = unconditioned_order_signature
+        && conditioned_serial_median.is_finite()
+        && conditioned_cohort_median.is_finite()
+        && conditioned_serial_median > conditioned_cohort_median
+        && conditioned_cohort_median > 0.0
+        && conditioned_even_speedup > 1.0
+        && conditioned_odd_speedup > 1.0;
 
     if let Some(receipt_path) = std::env::var_os(RECEIPT_ENV).map(PathBuf::from) {
         let artifact_bytes = std::fs::metadata(&path)
@@ -583,7 +737,7 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
         };
         let receipt = serde_json::json!({
             "schema_version": 1,
-            "status": "pass",
+            "status": if conditioned_pass { "pass" } else { "fail" },
             "artifact_bytes": artifact_bytes,
             "layers": model.cfg.num_hidden_layers,
             "lanes": LANES,
@@ -607,6 +761,27 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
                 "serial_median_ms": serial_median,
                 "cohort_median_ms": cohort_median,
                 "speedup": speedup,
+                "unconditioned_order_signature": {
+                    "expected": "even_delta_negative_odd_delta_positive",
+                    "even_delta_median_ms": unconditioned_even_delta_median,
+                    "odd_delta_median_ms": unconditioned_odd_delta_median,
+                    "confirmed": unconditioned_order_signature,
+                },
+                "conditioned": {
+                    "protocol": "same-topology-prime-restore-measure",
+                    "primes_per_measurement": 1,
+                    "serial_ms": conditioned_serial_ms,
+                    "cohort_ms": conditioned_cohort_ms,
+                    "serial_median_ms": conditioned_serial_median,
+                    "cohort_median_ms": conditioned_cohort_median,
+                    "speedup": conditioned_speedup,
+                    "even_order_speedup": conditioned_even_speedup,
+                    "odd_order_speedup": conditioned_odd_speedup,
+                    "serial_prime_counters": counters_json(&conditioned_serial_prime_counters),
+                    "cohort_prime_counters": counters_json(&conditioned_cohort_prime_counters),
+                    "serial_counters": counters_json(&conditioned_serial_counters),
+                    "cohort_counters": counters_json(&conditioned_cohort_counters),
+                },
                 "serial_counters": counters_json(&serial_counters),
                 "cohort_counters": counters_json(&cohort_counters),
                 "serial_command_buffers_per_pair": expected_serial_command_buffers,
@@ -646,4 +821,8 @@ fn official_artifact_b4_decode_body_is_exact_and_measured() {
             )
         });
     }
+    assert!(
+        conditioned_pass,
+        "exact B=4 decode lifecycle hypothesis and self-conditioned medians must pass: unconditioned_even_delta={unconditioned_even_delta_median:.3}ms unconditioned_odd_delta={unconditioned_odd_delta_median:.3}ms serial={conditioned_serial_median:.3}ms cohort={conditioned_cohort_median:.3}ms even={conditioned_even_speedup:.4}x odd={conditioned_odd_speedup:.4}x"
+    );
 }
