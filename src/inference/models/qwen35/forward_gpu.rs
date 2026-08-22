@@ -6316,9 +6316,8 @@ impl Qwen35Model {
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
         // ADR-040 Phase B4d (2026-05-30) — see B4b §6.1.20 for the
-        // `slot_id` contract on the decode-entry surface; the
-        // greedy-fast-path siblings (FA at :5293 + :5612 + DN at
-        // :5380 + :5716) now receive `slot_id` verbatim.
+        // `slot_id` contract on the decode-entry surface. The scalar entry
+        // delegates to the row-mapped physical-batch body with this exact slot.
         slot_id: SlotId,
     ) -> Result<u32> {
         let mut output = self.forward_gpu_greedy_multi_slot(
@@ -12309,15 +12308,14 @@ mod tests {
     //
     // Lifts the typed deferrals stamped at §6.1.20 (B4b) +
     // §6.1.40 (A2b-cont sub-deferral "iter-A2b-cont-forward-gpu-greedy"):
-    //   * `forward_gpu_greedy(.., slot_id: SlotId)` (NEW signature)
+    //   * `forward_gpu_greedy(.., slot_id: SlotId)` (scalar wrapper)
     //   * `forward_gpu_with_hidden_dflash(.., slot_id: SlotId)` (NEW)
     //   * `SpecDecode::with_slot_id` / `new_with_eos_set_and_slot`
     //   * `Qwen35DFlashTarget::new_with_slot` + `with_slot_id`
     //   * `HybridKvCache::truncate_full_attn_to_for_slot` / `truncate_mtp_to_for_slot`
     //
-    // H167: source-grep — production-side `forward_gpu_greedy` body now
-    //       routes `slot_id` to all 4 internal dispatch sites
-    //       (FA decode/legacy + DN decode/legacy).
+    // H167: source-grep — `forward_gpu_greedy` routes the caller's slot into
+    //       the physical-batch row map without a slot-zero substitution.
     // H168: functional — `forward_gpu_greedy(.., SlotId(0))` at `n_seqs=4`
     //       is BIT-IDENTICAL to the same call at `n_seqs=1` on the
     //       FA-only fixture (SerialFifo byte-equivalence pin).
@@ -12344,7 +12342,7 @@ mod tests {
     /// The four historical scalar dispatch sites no longer exist: full
     /// attention and DeltaNet are selected inside the row-mapped batched body.
     #[test]
-    fn h167_forward_gpu_greedy_threads_slot_id_to_all_4_internal_sites_2026_05_30() {
+    fn h167_forward_gpu_greedy_preserves_slot_through_physical_batch_2026_05_30() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let body = std::fs::read_to_string("src/inference/models/qwen35/forward_gpu.rs")
             .expect("read forward_gpu.rs");
