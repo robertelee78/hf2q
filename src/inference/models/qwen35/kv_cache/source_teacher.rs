@@ -301,8 +301,15 @@ pub(in crate::inference::models::qwen35) fn prepare_qwen35_base_text_cache(
             .all(|record| record.byte_len <= device.metal_device().max_buffer_length() as u64),
         "source teacher cache buffer exceeds the Metal device limit"
     );
-    let mut cache =
-        HybridKvCache::allocate_with_profile(config, device, max_sequence_tokens, 1, false, false)?;
+    let mut cache = HybridKvCache::allocate_with_profile(
+        config,
+        device,
+        max_sequence_tokens,
+        1,
+        false,
+        false,
+        None,
+    )?;
     cache
         .reset_for_slot(SlotId(0))
         .context("initialize source teacher base-text cache")?;
