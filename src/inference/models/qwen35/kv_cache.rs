@@ -1002,6 +1002,20 @@ pub struct HybridKvSlotAnchor {
     linear_recurrent: Vec<Vec<u8>>,
 }
 
+/// Lightweight rollback point for one target forward transaction.
+///
+/// A Qwen target forward writes each DeltaNet layer into the inactive
+/// ping-pong buffer exactly once and then flips that slot's parity. The prior
+/// state bytes therefore remain intact until another target forward begins.
+/// Capturing cursors plus the selected buffer for each layer is sufficient to
+/// restore an exact pre-forward boundary without copying the large recurrent
+/// matrices on every decode tick.
+pub(crate) struct HybridKvSlotTransaction {
+    full_attn_current_len: Vec<u32>,
+    mtp_current_len: Option<u32>,
+    linear_pp_flipped: Vec<bool>,
+}
+
 impl HybridKvSlotAnchor {
     /// Physical bytes retained outside the live cache for this checkpoint.
     pub fn total_bytes(&self) -> usize {
@@ -1530,6 +1544,136 @@ fn copy_slot_region_in_preflighted(
 pub const DELTA_NET_CONV_K: u32 = 4;
 
 impl HybridKvCache {
+    /// Capture the exact cursor and DeltaNet buffer-selection boundary before
+    /// at most one target forward mutates this slot.
+    pub(crate) fn begin_slot_transaction(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        target_cursor: u32,
+    ) -> Result<HybridKvSlotTransaction> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "begin_slot_transaction: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        let mut full_attn_current_len = Vec::with_capacity(self.full_attn.len());
+        for (layer_idx, full) in self.full_attn.iter().enumerate() {
+            let cursor = full.current_len.get(slot_idx).copied().ok_or_else(|| {
+                anyhow!("begin_slot_transaction: full_attn[{layer_idx}] cursor missing")
+            })?;
+            anyhow::ensure!(
+                cursor == target_cursor,
+                "begin_slot_transaction: full_attn[{layer_idx}] cursor={cursor} != target_cursor={target_cursor}"
+            );
+            full_attn_current_len.push(cursor);
+        }
+        let mtp_current_len = self
+            .mtp_slot
+            .as_ref()
+            .map(|mtp| {
+                mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
+                    anyhow!(
+                        "begin_slot_transaction: MTP cursor missing for slot {}",
+                        slot.0
+                    )
+                })
+            })
+            .transpose()?;
+        let linear_pp_flipped = self
+            .linear_attn
+            .iter()
+            .enumerate()
+            .map(|(layer_idx, linear)| {
+                linear.pp_flipped.get(slot_idx).copied().ok_or_else(|| {
+                    anyhow!(
+                        "begin_slot_transaction: linear_attn[{layer_idx}] parity missing for slot {}",
+                        slot.0
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(HybridKvSlotTransaction {
+            full_attn_current_len,
+            mtp_current_len,
+            linear_pp_flipped,
+        })
+    }
+
+    /// Restore a transaction captured by [`Self::begin_slot_transaction`].
+    ///
+    /// This must run before another target forward reuses the inactive
+    /// DeltaNet buffers. Appended full-attention/MTP K/V rows are left in
+    /// place and made unobservable by rewinding their cursors.
+    pub(crate) fn rollback_slot_transaction(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        transaction: &HybridKvSlotTransaction,
+    ) -> Result<()> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "rollback_slot_transaction: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(
+            transaction.full_attn_current_len.len() == self.full_attn.len(),
+            "rollback_slot_transaction: full-attention layer count mismatch"
+        );
+        anyhow::ensure!(
+            transaction.linear_pp_flipped.len() == self.linear_attn.len(),
+            "rollback_slot_transaction: linear-attention layer count mismatch"
+        );
+        for (layer_idx, (full, &saved)) in self
+            .full_attn
+            .iter_mut()
+            .zip(&transaction.full_attn_current_len)
+            .enumerate()
+        {
+            let live = full.current_len.get_mut(slot_idx).ok_or_else(|| {
+                anyhow!("rollback_slot_transaction: full_attn[{layer_idx}] cursor missing")
+            })?;
+            anyhow::ensure!(
+                *live >= saved,
+                "rollback_slot_transaction: full_attn[{layer_idx}] live cursor {} is behind saved cursor {saved}",
+                *live
+            );
+            *live = saved;
+        }
+        match (self.mtp_slot.as_mut(), transaction.mtp_current_len) {
+            (Some(mtp), Some(saved)) => {
+                let live = mtp.current_len.get_mut(slot_idx).ok_or_else(|| {
+                    anyhow!(
+                        "rollback_slot_transaction: MTP cursor missing for slot {}",
+                        slot.0
+                    )
+                })?;
+                anyhow::ensure!(
+                    *live >= saved,
+                    "rollback_slot_transaction: MTP live cursor {} is behind saved cursor {saved}",
+                    *live
+                );
+                *live = saved;
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("rollback_slot_transaction: MTP presence mismatch"),
+        }
+        for (layer_idx, (linear, &saved)) in self
+            .linear_attn
+            .iter_mut()
+            .zip(&transaction.linear_pp_flipped)
+            .enumerate()
+        {
+            let parity = linear.pp_flipped.get_mut(slot_idx).ok_or_else(|| {
+                anyhow!("rollback_slot_transaction: linear_attn[{layer_idx}] parity missing")
+            })?;
+            *parity = saved;
+        }
+        Ok(())
+    }
+
     /// Authoritative number of valid full-attention tokens for one physical
     /// agent slot. Bytes at or above this cursor are not observable.
     pub(crate) fn sequence_len_for_slot(

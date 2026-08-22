@@ -62,6 +62,7 @@ fn codec_ggml_type(codec: &LoadedTensorCodec) -> Result<GgmlType> {
             ("q4_0", 2) => Ok(GgmlType::Q4_0),
             ("q8_0", 8) => Ok(GgmlType::Q8_0),
             ("q4_k", 12) => Ok(GgmlType::Q4_K),
+            ("q5_k", 13) => Ok(GgmlType::Q5_K),
             ("q6_k", 14) => Ok(GgmlType::Q6_K),
             _ => bail!(
                 "GGML codec {type_name}/{wire_type_id} is outside the dense-Qwen trace profile"
@@ -70,6 +71,35 @@ fn codec_ggml_type(codec: &LoadedTensorCodec) -> Result<GgmlType> {
         LoadedTensorCodec::DenseF32 => {
             bail!("dense F32 execution input cannot be bound to a GGML dispatch")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_qwen_trace_codec_catalog_covers_native_q5_k() {
+        assert_eq!(
+            codec_ggml_type(&LoadedTensorCodec::Ggml {
+                type_name: "q5_k".into(),
+                wire_type_id: 13,
+            })
+            .expect("Q5_K is a native dense-Qwen execution type"),
+            GgmlType::Q5_K
+        );
+    }
+
+    #[test]
+    fn dense_qwen_trace_codec_catalog_rejects_mismatched_q5_k_wire_id() {
+        let error = codec_ggml_type(&LoadedTensorCodec::Ggml {
+            type_name: "q5_k".into(),
+            wire_type_id: 12,
+        })
+        .expect_err("a Q5_K name with a Q4_K wire ID must fail closed");
+        assert!(error
+            .to_string()
+            .contains("outside the dense-Qwen trace profile"));
     }
 }
 
