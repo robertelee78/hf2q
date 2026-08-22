@@ -12,9 +12,10 @@
 //! transition first obtains the exact conflict receipt, then submits that
 //! receipt as an explicit switch.
 //!
-//! The proof is family-neutral. `*_KIND_{A,B}=chat` uses the chat endpoint;
-//! `embedding` uses the embeddings endpoint. It asserts exact A-result replay
-//! after reload, a different resident generation for the reloaded A, one
+//! The proof covers pool-resident generative engines. Dedicated BERT/Nomic
+//! embedding models have a separate process-global lifecycle and are not
+//! counted by this gate. It asserts exact A-result replay after reload, a
+//! different resident generation for the reloaded A, one
 //! resident model throughout, load latency on both switch legs, and process
 //! RSS/physical-footprint/wired-memory reclamation with no double-residency
 //! peak. This is intentionally a real-hardware gate, not a hosted-safe smoke.
@@ -59,8 +60,6 @@ use std::time::{Duration, Instant};
 const ENV_GATE: &str = "HF2Q_HOT_SWAP_E2E";
 const ENV_MODEL_A: &str = "HF2Q_HOT_SWAP_E2E_MODEL_A";
 const ENV_MODEL_B: &str = "HF2Q_HOT_SWAP_E2E_MODEL_B";
-const ENV_KIND_A: &str = "HF2Q_HOT_SWAP_E2E_KIND_A";
-const ENV_KIND_B: &str = "HF2Q_HOT_SWAP_E2E_KIND_B";
 const ENV_MAX_SECS: &str = "HF2Q_HOT_SWAP_E2E_MAX_SECS";
 
 /// High-numbered fixed port distinct from the openwebui suite (52334),
@@ -86,22 +85,6 @@ const REQUEST_BUDGET_SECS: u64 = 180;
 const SWAP_BUDGET_SECS: u64 = 10;
 const GIB: u64 = 1024 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug)]
-enum ProbeKind {
-    Chat,
-    Embedding,
-}
-
-impl ProbeKind {
-    fn from_env(name: &str) -> Self {
-        match std::env::var(name).as_deref() {
-            Ok("embedding") => Self::Embedding,
-            Ok("chat") | Err(_) => Self::Chat,
-            Ok(other) => panic!("{name} must be `chat` or `embedding`, got {other:?}"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct MemorySnapshot {
     rss_bytes: u64,
@@ -124,7 +107,7 @@ fn skip_unless_gated(name: &str) -> bool {
     eprintln!(
         "[skip] {name} — set {ENV_GATE}=1 to run the real A -> B -> A model-swap harness. \
          Required: {ENV_MODEL_A} and {ENV_MODEL_B} must name distinct physical GGUFs. \
-         Optional: {ENV_KIND_A}/{ENV_KIND_B}=chat|embedding and {ENV_MAX_SECS}."
+         Optional: {ENV_MAX_SECS}."
     );
     true
 }
@@ -384,30 +367,18 @@ async fn fetch_canonical_model_id(client: &reqwest::Client) -> String {
 async fn post_inference(
     client: &reqwest::Client,
     model: &str,
-    kind: ProbeKind,
 ) -> (u16, serde_json::Value, Duration) {
-    let (path, body) = match kind {
-        ProbeKind::Chat => (
-            "/v1/chat/completions",
-            serde_json::json!({
-                "model": model,
-                "messages": [{
-                    "role": "user",
-                    "content": "Reply with a short deterministic acknowledgement of: café 東京 model swap."
-                }],
-                "max_tokens": 16,
-                "temperature": 0,
-                "stream": false,
-            }),
-        ),
-        ProbeKind::Embedding => (
-            "/v1/embeddings",
-            serde_json::json!({
-                "model": model,
-                "input": "café 東京 model swap identity probe"
-            }),
-        ),
-    };
+    let path = "/v1/chat/completions";
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": "Reply with a short deterministic acknowledgement of: café 東京 model swap."
+        }],
+        "max_tokens": 16,
+        "temperature": 0,
+        "stream": false,
+    });
     let t0 = Instant::now();
     let resp = client
         .post(format!("{}{path}", base_url()))
@@ -423,11 +394,8 @@ async fn post_inference(
     (status, json, elapsed)
 }
 
-fn canonical_result(body: &serde_json::Value, kind: ProbeKind) -> serde_json::Value {
-    match kind {
-        ProbeKind::Chat => body["choices"][0]["message"].clone(),
-        ProbeKind::Embedding => body["data"][0]["embedding"].clone(),
-    }
+fn canonical_result(body: &serde_json::Value) -> serde_json::Value {
+    body["choices"][0]["message"].clone()
 }
 
 async fn fetch_runtime(client: &reqwest::Client) -> serde_json::Value {
@@ -585,18 +553,10 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
     let bytes_b = std::fs::metadata(&canonical_b)
         .expect("MODEL_B metadata")
         .len();
-    let kind_a = ProbeKind::from_env(ENV_KIND_A);
-    let kind_b = ProbeKind::from_env(ENV_KIND_B);
-    let ((model_a, bytes_a, kind_a), (model_b, bytes_b, kind_b)) = if bytes_a >= bytes_b {
-        (
-            (canonical_a, bytes_a, kind_a),
-            (canonical_b, bytes_b, kind_b),
-        )
+    let ((model_a, bytes_a), (model_b, bytes_b)) = if bytes_a >= bytes_b {
+        ((canonical_a, bytes_a), (canonical_b, bytes_b))
     } else {
-        (
-            (canonical_b, bytes_b, kind_b),
-            (canonical_a, bytes_a, kind_a),
-        )
+        ((canonical_b, bytes_b), (canonical_a, bytes_a))
     };
     let artifact_delta = bytes_a - bytes_b;
     assert!(
@@ -611,7 +571,7 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
     );
 
     eprintln!(
-        "model_swap: A={} ({bytes_a} bytes, {kind_a:?}), B={} ({bytes_b} bytes, {kind_b:?}), \
+        "model_swap: A={} ({bytes_a} bytes), B={} ({bytes_b} bytes), \
          pool_budget={bytes_a}, swap_budget={swap_budget:?}",
         model_a.display(),
         model_b.display()
@@ -627,9 +587,9 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
     let resident_a1 = one_resident(&initial_runtime);
     assert_eq!(resident_a1.bytes_resident, bytes_a);
     let (status_a1, body_a1, inference_a1) =
-        rt.block_on(post_inference(&client, &initial_model_id, kind_a));
+        rt.block_on(post_inference(&client, &initial_model_id));
     assert_eq!(status_a1, 200, "initial A inference failed: {body_a1}");
-    let result_a1 = canonical_result(&body_a1, kind_a);
+    let result_a1 = canonical_result(&body_a1);
     assert!(!result_a1.is_null(), "initial A result missing: {body_a1}");
     let memory_a1 = settled_memory_snapshot(server.0.id());
 
@@ -665,15 +625,13 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
         "warmup policy changed across A -> B"
     );
     assert_eq!(
-        resident_b.engine_config["kv_metrics_sink"],
-        resident_a1.engine_config["kv_metrics_sink"],
+        resident_b.engine_config["kv_metrics_sink"], resident_a1.engine_config["kv_metrics_sink"],
         "KV metrics wiring changed across A -> B"
     );
-    let (status_b, body_b, inference_b) =
-        rt.block_on(post_inference(&client, request_model_b, kind_b));
+    let (status_b, body_b, inference_b) = rt.block_on(post_inference(&client, request_model_b));
     assert_eq!(status_b, 200, "B inference failed: {body_b}");
     assert!(
-        !canonical_result(&body_b, kind_b).is_null(),
+        !canonical_result(&body_b).is_null(),
         "B result missing: {body_b}"
     );
     let memory_b = settled_memory_snapshot(server.0.id());
@@ -750,10 +708,9 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
         resident_a2.engine_config, resident_a1.engine_config,
         "A reload changed scheduler, KV budget, queue, sidecar, or overlay identity"
     );
-    let (status_a2, body_a2, inference_a2) =
-        rt.block_on(post_inference(&client, request_model_a2, kind_a));
+    let (status_a2, body_a2, inference_a2) = rt.block_on(post_inference(&client, request_model_a2));
     assert_eq!(status_a2, 200, "reloaded A inference failed: {body_a2}");
-    let result_a2 = canonical_result(&body_a2, kind_a);
+    let result_a2 = canonical_result(&body_a2);
     assert_eq!(
         result_a2, result_a1,
         "A result changed after A -> B -> A; stale model/template/tokenizer/cache state or nondeterminism"

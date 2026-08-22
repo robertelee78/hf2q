@@ -1,6 +1,6 @@
 # ADR-047: Diagnostic chat over the native inference server
 
-- **Status:** Accepted; corrected A -> B -> A lifecycle proof passed
+- **Status:** Accepted; text-engine A -> B -> A proof passed; embedding and projector lifecycle execution active
 - **Date:** 2026-08-20
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
 
@@ -339,8 +339,24 @@ the larger artifact to the smaller one, and absence of a double-residency peak.
 macOS `footprint` output is retained as a diagnostic only: the 2026-08-22 spike
 showed that its process physical-footprint charge can rise while both RSS and
 host wired pages fall, so it is not an authority for current Metal residency.
-Chat and embedding families use their native OpenAI endpoint for the replay
-probe; family-specific cache and template state must never cross the switch.
+This corrected gate covers pool-resident generative engines through their
+native chat endpoint. It does not count `/v1/embeddings` as proof for the
+dedicated BERT/Nomic subsystem: those models are process-global in the current
+source, while `/v1/embeddings` against a pool-resident generative engine uses
+that engine's last-state pooling path. Dedicated embedding-model lifecycle is
+a separate required implementation and hardware gate, not evidence supplied
+by this test. Family-specific cache and template state must never cross a
+switch.
+
+Likewise, the startup vision projector is process-global in the current
+source. Strongly bound incompatible swaps fail closed, but a shape-compatible
+external vision model without source/projector digests can inherit and execute
+the wrong startup projector; projector weights and its vision cache are also
+outside pool accounting. The required correction makes one resident
+generation own an atomic text/projector pair, resolves and warms the complete
+pair before publication, leases both from that same generation, and accounts
+the pair's unique allocations and cache bytes in admission/eviction. This work
+is an active correctness lane and cannot be credited to the text-only gate.
 
 The runtime capability also advertises the exact
 `x-hf2q-diagnostic-no-evict: 1` request header. After activation, diagnostic
@@ -427,11 +443,18 @@ Implementation is not complete until all of the following are proven:
     selector behavior with zero Hub work, repository-bound opaque authority,
     post-catalog digest/header rejection before loading, verifier cancellation
     and reaping, and successful activation of a real hf2q-produced GGUF; and
-12. real macOS A -> B -> A tests use distinct GGUF bytes and exact conflict
+12. real macOS pool-resident generative A -> B -> A tests use distinct GGUF
+    bytes and exact conflict
     receipts, keep one resident generation, bound both load-and-warm legs,
     measure process RSS and host wired memory across each transition, reject a
     double-residency peak, publish a fresh A generation, and reproduce A's
-    deterministic chat message or embedding vector exactly after reload.
+    deterministic chat message exactly after reload; and
+13. dedicated BERT/Nomic A -> B -> A tests prove model/tokenizer/registry
+    replacement, exact embedding replay, generation isolation, memory
+    reclamation, and no double-residency peak; and
+14. multimodal A+P_A -> text B -> C+P_C -> A+P_A tests prove the projector and
+    vision cache are generation-owned, admission-accounted, reclaimed with the
+    text engine, and never inherited by an unbound shape-compatible model.
 
 ## Validation evidence
 
