@@ -56,6 +56,20 @@ matched_validate_reference_model_alias \
 expect_failure reference-model-alias matched_validate_reference_model_alias \
   "$fixture_dir/reference-models.json" wrong-model
 
+# Current reference servers expose loaded entries directly in `.data` without
+# the older nested `status.value`; identity remains exact through id/aliases.
+jq -n '{object:"list",data:[{
+  id:"Release Qwen38 E2",aliases:["Release Qwen38 E2"],object:"model"
+}]}' >"$fixture_dir/reference-models-current.json"
+matched_validate_reference_model_alias \
+  "$fixture_dir/reference-models-current.json" 'Release Qwen38 E2'
+jq -n '{data:[{
+  id:"Release Qwen38 E2",aliases:["Release Qwen38 E2"],
+  status:{value:"unloaded"}
+}]}' >"$fixture_dir/reference-models-unloaded.json"
+expect_failure reference-model-unloaded matched_validate_reference_model_alias \
+  "$fixture_dir/reference-models-unloaded.json" 'Release Qwen38 E2'
+
 # The streamed TTFT parser must ignore role-only events, require semantic
 # content, require exactly one DONE, and compare the complete streamed text.
 started_at=$(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \

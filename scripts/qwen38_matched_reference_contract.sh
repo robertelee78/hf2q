@@ -17,7 +17,7 @@ matched_validate_reference_model_alias() {
     local expected=$2
     jq -e --arg expected "$expected" '
       [.data[]
-        | select(.status.value == "loaded")
+        | select((.status? == null) or (.status.value == "loaded"))
         | select(.id == $expected
             or any((.aliases // [])[]; . == $expected))]
       | length == 1
