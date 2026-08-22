@@ -173,12 +173,21 @@ Agentic Kit, and the local search/fetch/crawl/extract stack.
 space, optional RuVector backend); run it after `cargo install` if
 anything misbehaves.
 
-Shell completion is explicit. Generate the current clap grammar with
-`hf2q completions --shell <bash|zsh|fish>` and install or source that output
-through the shell or package manager that owns it. Ordinary hf2q invocations,
-including `--help`, `--version`, and `setup`, do not write completion files or
-shell startup configuration. Generated scripts are static snapshots, so
-regenerate them after upgrading when a new command such as `chat` is added.
+Tab completion is automatic for standalone and Cargo installations. The
+standalone installer activates it against the stable installed binary; a Cargo
+install activates it on the first `hf2q` invocation. hf2q keeps dynamic,
+public-command-only adapters current for Bash, Zsh, and Fish, so newly added
+commands and quant/architecture values appear without regenerating snapshots.
+Open a new shell after the first activation when hf2q reports that setup was
+updated.
+
+Source/debug and unmanaged binaries never modify normal shell state. Set
+`HF2Q_NO_COMPLETION_INSTALL=1` to opt out for a distro-managed or read-only
+home. The explicit
+`hf2q completions --shell <bash|elvish|fish|powershell|zsh>` surface remains
+available for package maintainers and custom shell setups; that output is a
+static snapshot. See [Shell completion](docs/shell-completion.md) for exact
+paths, lifecycle cleanup, overrides, and troubleshooting.
 
 ## CLI subcommands
 

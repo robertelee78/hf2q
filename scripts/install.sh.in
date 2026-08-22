@@ -149,15 +149,20 @@ main() {
   fi
 
   chmod 0555 "$candidate"
-  [ "$("$candidate" --version </dev/null)" = "hf2q $release_version" ] \
+  [ "$(HF2Q_NO_COMPLETION_INSTALL=1 "$candidate" --version </dev/null)" = "hf2q $release_version" ] \
     || fail 'candidate version does not match the immutable release'
 
-  "$candidate" __standalone-install \
+  HF2Q_NO_COMPLETION_INSTALL=1 "$candidate" __standalone-install \
     --install-dir "$install_dir" \
     --candidate "$candidate" \
     --size "$release_size" \
     --sha256 "$release_sha256" \
     </dev/null
+
+  # Provision against the stable installed path, never the temporary download
+  # that is deleted when this script exits. This is intentionally a distinct
+  # invocation so the install bootstrap's opt-out cannot leak into activation.
+  "$install_dir/hf2q" --version >/dev/null </dev/null
 
   case ":${PATH:-}:" in
     *:"$install_dir":*) ;;

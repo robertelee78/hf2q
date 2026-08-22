@@ -4,8 +4,8 @@
   release gate simplified, the first public cross-version standalone journey
   shipped on 2026-08-21, and channel-aware standalone/Cargo/source lifecycle
   plus explicit purge landed the same day; the issue-146 guide contract was
-  corrected after a post-landing regression review; distinct-account proof
-  remains
+  corrected after a post-landing regression review; installed completion
+  ownership was restored on 2026-08-21; distinct-account proof remains
 - Date: 2026-08-17
 - Updated: 2026-08-21
 - Owners: hf2q release engineering and operator experience
@@ -69,7 +69,7 @@ The implementation disposition is therefore:
 | Custom TUF client/spike, transport sealed to it, TUF metadata journal, first-activation graph, custom archive/Mach-O preparation, and their structural CI sentinels | **Removed** | They had no production caller and did not participate in the shipped installer or updater. Their experiments remain in git history. |
 | Setup's read-only installation-identity coupling | **Removed** | It was reachable from setup, but required an identity tree that no shipped installation path created or used. Setup retains its own descriptor-bound root, lock, config, and race checks. |
 | Reachable standalone record, Apple signature/notarization checks, and atomic publication mechanics | **Keep** | These are the small mechanisms used by the real signed installer, updater, rollback, and uninstaller. |
-| Automatic shell-completion mutation on ordinary CLI startup | **Remove** | Completion installation belongs to an explicit setup choice or the owning package/installer, not an unrelated command invocation. Explicit completion generation remains useful. |
+| Installation-owned shell completion | **Keep narrowly under ADR-045** | The standalone/Cargo installation owns dynamic public completion, refresh, and exact cleanup. Proven installed release binaries may reconcile it on startup because Cargo has no post-install hook; source/debug/unmanaged/root binaries remain non-mutating unless explicit isolated destinations are supplied. |
 
 Removing dormant code does not erase its history. Git and the project decision
 ledger retain the experiments and their evidence. Main should carry the
@@ -498,7 +498,63 @@ or lock name owned by the same installation. Missing or inconsistent channel
 ownership fails closed. Configuration and model data are not even inputs to
 the default uninstall implementation.
 
-### 7. Keep hf2q.us truthful and product-led
+### 7. Make installed Tab completion automatic and lifecycle-owned
+
+The earlier removal made a correct observation—an arbitrary source binary must
+not edit an operator's shell—but drew the wrong product boundary. It left the
+standalone installer and Cargo channel with no completion installation owner,
+made the only public surface a stale static snapshot, and contradicted the
+required install-and-use experience. The governing distinction is installation
+ownership, not whether the process was launched as an ordinary command.
+
+The 2026-08-21 investigation tested three hypotheses:
+
+1. Raw static and dynamic Clap generation were sufficient. Falsified: neither
+   installs or refreshes itself, and raw generation retained hidden internal
+   subcommands/arguments in the completion grammar.
+2. The standalone candidate could provision completion before activation.
+   Falsified: `install.sh` executed a temporary download and deleted it after
+   publication, leaving generated adapters pinned to a dead path.
+3. The installed binary can safely self-provision when installation ownership
+   is proven. Confirmed by the existing fail-closed ADR-045 standalone/Cargo
+   resolver and by the protected dynamic-adapter pattern in `/opt/repo-to-cve`.
+   The reusable result is the shell protocol, binding, atomic-update, and
+   startup-block mechanism; r2c-specific command-domain filtering is not
+   copied.
+
+The resulting contract is:
+
+- dynamic completion is the first side-effect-free process branch and exits
+  before logging, configuration, cache, network, Metal, or model work;
+- both dynamic and explicit static generation use a recursively projected
+  public Clap command, so hidden installer, transfer, source-teacher, and
+  process-lifeline surfaces are absent structurally;
+- the exact `clap_complete` protocol version is pinned, with protected Bash,
+  Zsh, and Fish adapters and semantic quant/architecture candidates;
+- the standalone installer suppresses reconciliation in the temporary
+  candidate and invokes the stable installed binary after activation; Cargo
+  provisions on first invocation because Cargo has no post-install hook;
+- automatic destinations require a non-root release binary proven as
+  standalone- or Cargo-owned. Source/debug/unmanaged/ambiguous binaries are
+  inert unless the caller gives completion-specific isolated destinations;
+- registration files and preferred Bash/Zsh startup blocks are reconciled
+  atomically. Foreign regular files are backed up before adoption; symlinks,
+  non-regular entries, and ambiguous marker layouts are preserved;
+- a private bounded receipt binds exact registration bytes and exact managed
+  startup blocks. Update activates the new binary, rollback removes old
+  bindings then activates the restored binary, and uninstall removes only
+  unchanged receipt-bound artifacts. Operator-modified artifacts are preserved
+  and reported; and
+- `HF2Q_NO_COMPLETION_INSTALL` is the presence-based opt-out. Explicit static
+  Bash, Elvish, Fish, PowerShell, and Zsh generation remains for package-owned
+  snapshots.
+
+The unavoidable activation boundary is documented: a child cannot alter its
+already-running parent shell. Bash/Fish loaders can discover their managed
+files, while the one-time notice tells the operator to open a new shell; Zsh's
+verified startup block makes the next shell deterministic.
+
+### 8. Keep hf2q.us truthful and product-led
 
 The website will use hf2q's own identity while adopting the useful install
 selector pattern: one exact primary command, direct-release and Cargo/source
@@ -761,6 +817,23 @@ published bytes.
 - Uninstall removes only channel-owned release files by default; explicit
   purge previews and removes only exact hf2q-owned data.
 
+### Shell completion
+
+- A standalone install provisions against the stable installed binary, never
+  the temporary candidate; Cargo provisions on the first normal invocation.
+- Bash 3.2 and Zsh 5.9 literal dispatch execute the generated adapters and
+  return public command candidates. Static and direct dynamic Bash, Elvish,
+  Fish, PowerShell, and Zsh requests contain no hidden surface.
+- Quant and architecture candidates are drawn from the shipped parser and
+  architecture registry; reserved quant names are never advertised.
+- Completion requests produce stdout-only protocol data and perform no
+  reconciliation. Ordinary source/debug runs without explicit destinations
+  perform no completion or startup writes.
+- Reconciliation is idempotent, handles broken pipes as success, preserves
+  foreign/symlink/non-regular/racing targets, and records exact ownership.
+- Update, rollback, and uninstall tests prove refresh or exact cleanup;
+  modified artifacts survive and are named to the operator.
+
 ### Traceability
 
 - The website, README, guide, CLI help, release notes, and
@@ -788,7 +861,10 @@ What exists:
   `hf2q update`/`hf2q update --rollback`, and marker-gated
   `hf2q uninstall --yes` implementation;
 - fail-closed standalone, Cargo, source-development, and unmanaged ownership
-  resolution, including direct-argv Cargo update/uninstall delegation; and
+  resolution, including direct-argv Cargo update/uninstall delegation;
+- ownership-gated dynamic Bash/Zsh/Fish completion with stable installer
+  activation, Cargo first-run activation, protected public-only adapters, and
+  receipt-bound lifecycle cleanup; and
 - explicit non-mutating config/cache purge previews whose execution preserves
   unknown state siblings, cache locks, external model/Hugging Face data,
   persistent-KV roots, and logs.
@@ -828,7 +904,7 @@ runner invalidated a performance phase after signing and notarization had
 already succeeded. The rail is now split into a short standalone candidate
 workflow, the distribution release, and optional model qualification. Only the
 first two govern publication of unchanged CLI bytes. The release's unpacked
-crate check is correspondingly limited to compilation, explicit completions,
+crate check is correspondingly limited to compilation, installed and explicit completions,
 setup, standalone distribution, and installed CLI behavior. Main CI owns broad
 source regressions; model workflows own family-specific correctness, quality,
 cache, and performance qualification. That trust separation no longer creates
@@ -926,8 +1002,11 @@ data-preserving uninstall. The updater accepts exact HTTP `200` only.
 The unreachable second managed-session store, its runtime authorization, and
 the provisional session-cache setup field have been removed. `hf2q setup` does
 not create or authorize a separate `cache/sessions` hierarchy.
-Automatic shell-completion mutation on ordinary startup has also been removed;
-`hf2q completions --shell <shell>` remains the explicit generation surface.
+The former unconditional shell-completion experiment was removed because it
+could not distinguish a live install from an ephemeral source binary. The
+2026-08-21 amendment restores the capability behind ADR-045's proven
+standalone/Cargo ownership boundary, adds exact lifecycle cleanup, and retains
+`hf2q completions --shell <shell>` as the explicit static generation surface.
 The dormant no-options model recipe, preparation plan, paired-artifact
 publication, prepared-profile registry, retention, and calibration-pending
 state have been removed as well. Generic remote conversion remains owned by

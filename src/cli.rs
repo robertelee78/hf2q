@@ -8,6 +8,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
+pub(crate) mod complete;
+pub(crate) mod completion_install;
+pub(crate) mod completion_receipt;
+pub(crate) mod completion_startup;
+
 /// hf2q — Pure Rust CLI for converting HuggingFace models to hardware-optimized formats.
 #[derive(Parser, Debug)]
 #[command(name = "hf2q", version, about, long_about = None)]
@@ -30,7 +35,12 @@ pub struct Cli {
 
     /// Absolute hf2q state root containing config.toml. Defaults to
     /// `$HOME/.hf2q`. Setup writes this file; convert and serve read it.
-    #[arg(long, value_name = "ABSOLUTE_PATH", global = true)]
+    #[arg(
+        long,
+        value_name = "ABSOLUTE_PATH",
+        value_hint = clap::ValueHint::DirPath,
+        global = true
+    )]
     pub state_root: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -252,7 +262,12 @@ pub struct UpdateArgs {
 #[derive(clap::Args, Debug, Clone)]
 pub struct SetupArgs {
     /// Default quant selector used by `hf2q convert` when `--quant` is omitted.
-    #[arg(long, value_name = "QUANT")]
+    #[arg(
+        long,
+        value_name = "QUANT",
+        value_hint = clap::ValueHint::Other,
+        add = clap_complete::ArgValueCompleter::new(complete::quant_names)
+    )]
     pub default_quant: Option<String>,
 
     /// Default serve bind host. Setup accepts only 127.0.0.1 or 0.0.0.0.
@@ -447,7 +462,11 @@ pub struct ConvertCliArgs {
     /// `hf2q setup` is used; without either source, conversion fails and
     /// asks the operator to choose. Per
     /// [[feedback-no-backwards-compat-2026-05-18]]: no legacy aliases.
-    #[arg(long)]
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::Other,
+        add = clap_complete::ArgValueCompleter::new(complete::quant_names)
+    )]
     pub quant: Option<String>,
 
     /// Destination GGUF file. Existing files are overwritten.
@@ -705,11 +724,20 @@ pub enum CacheAction {
 #[derive(clap::Args, Debug, Clone)]
 pub struct SmokeArgs {
     /// Arch key as registered in `src/arch/` (qwen35, qwen35moe)
-    #[arg(long)]
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::Other,
+        add = clap_complete::ArgValueCompleter::new(complete::architecture_names)
+    )]
     pub arch: String,
 
     /// Quant method to smoke-test
-    #[arg(long, default_value = "q4_0")]
+    #[arg(
+        long,
+        default_value = "q4_0",
+        value_hint = clap::ValueHint::Other,
+        add = clap_complete::ArgValueCompleter::new(complete::quant_names)
+    )]
     pub quant: String,
 
     /// Also exercise the --emit-vision-tower path (dense variants with vision_config)

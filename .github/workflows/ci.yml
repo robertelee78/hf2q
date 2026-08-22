@@ -110,10 +110,17 @@ jobs:
             src/distribution/standalone.rs \
             src/distribution/standalone/update.rs \
             src/distribution/standalone_tests.rs \
+            src/cli/complete.rs \
+            src/cli/completion_install.rs \
+            src/cli/completion_install_tests.rs \
+            src/cli/completion_receipt.rs \
+            src/cli/completion_startup.rs \
+            src/cli/completion_startup_tests.rs \
             scripts/install.sh.in \
             scripts/sign_notarize_standalone_release.sh \
             scripts/test_standalone_installer.sh \
             scripts/test_standalone_release_signing_contract.sh \
+            docs/shell-completion.md \
             docs/adr/ADR-045-frictionless-distribution-updates-and-onboarding.md
           do
             grep -Fqx -- "$required" <<<"$package_list"
