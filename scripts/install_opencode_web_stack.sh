@@ -20,6 +20,17 @@ case "$ACTION" in
         ;;
 esac
 
+# Piped execution (`curl ... | bash`) leaves BASH_SOURCE unset on macOS's
+# bash 3.2 and makes $0 the meaningless "bash". Detect that once: the asset
+# lookup falls back to downloading, and operator-facing messages name a
+# command that actually works when pasted back.
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
+    SELF_CMD="bash $SCRIPT_SOURCE"
+else
+    SELF_CMD="curl -fsSL https://raw.githubusercontent.com/robertelee78/hf2q/main/scripts/install_opencode_web_stack.sh | bash -s --"
+fi
+
 STATE_DIR="$HOME/.local/state"
 FETCH_DIR="$HOME/.local/opt/crawl4ai-server"
 SEARX_DIR="$HOME/.local/opt/searxng"
@@ -191,7 +202,8 @@ command -v uv >/dev/null 2>&1 || {
     exit 2
 }
 
-if SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; then
+if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]] \
+    && SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" 2>/dev/null && pwd)"; then
     :
 else
     SCRIPT_DIR="$PWD"
@@ -419,12 +431,12 @@ for _ in 1 2 3; do
 done
 [[ "$SEARCH_OK" -eq 1 ]] || {
     echo "SearXNG returned no results after 3 attempts; engines may be rate-limiting." >&2
-    echo "Re-check later with: $0 --status" >&2
+    echo "Re-check later with: $SELF_CMD --status" >&2
     exit 1
 }
 
 echo
 echo "OpenCode web stack installed and verified."
-echo "Re-check at any time with: $0 --status"
+echo "Re-check at any time with: $SELF_CMD --status"
 echo "Restart OpenCode, then use: web_search, web_fetch, web_crawl, web_extract."
 echo "Ruflo aliases are also present: WebSearch, WebFetch, WebCrawl, WebExtract."

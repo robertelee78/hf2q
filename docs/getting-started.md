@@ -94,25 +94,34 @@ something real — a good answer here is the proof that serving works.
 Still in terminal 2:
 
 ```bash
-RED_PNG="iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAABEElEQVR4Ae3AA6AkWZbG8f937o3IzKdyS2Oubdu2bdu2bdu2bWmMnpZKr54yMyLu+Xa3anqmhztr1a8+5ZZb+F+M4H83gv/dCP53I/jfjeB/N4L/3Qj+dyP4343gfzeC/90I/ncj+N+N4H83gv/dCP53I/jfjeB/N4L/3Qj+dyP4343gfzeC/90I/ncj+N+N4H83gv/dCP53I/jfjeB/N4L/3Qj+dyP4343gfzeC/90I/ncj+N+N4H83gv/dCP53I/jfjeB/N4L/3Qj+dyP4343gfzeC/90I/ncj+N+N4H83gv/dCP534x8BmV0Bmx29tGQAAAAASUVORK5CYII="
+RED_PNG="iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC"
 MODEL_ID="$(curl -fsS http://127.0.0.1:8081/v1/models |
-  jq -er '.data | map(select(.loaded == true)) | .[0].id')"
-jq -n --arg model "$MODEL_ID" --arg image "data:image/png;base64,$RED_PNG" '{
+  jq -r '[.data[] | select(.loaded == true) | .id] | first // ""')"
+if [ -z "$MODEL_ID" ]; then
+  echo "no loaded model yet — wait for terminal 1 to report the model is ready" >&2
+  exit 1
+fi
+RESPONSE="$(jq -n --arg model "$MODEL_ID" --arg image "data:image/png;base64,$RED_PNG" '{
   model: $model,
   messages: [{role: "user", content: [
     {type: "text", text: "What is the dominant color? One word."},
     {type: "image_url", image_url: {url: $image}}
   ]}],
   temperature: 0, max_tokens: 16, stream: false, hf2q_enable_thinking: false
-}' | curl -fsS http://127.0.0.1:8081/v1/chat/completions \
-  -H 'Content-Type: application/json' -d @- |
-  jq -er '.choices[0].message.content' | grep -i red
+}' | curl -sS http://127.0.0.1:8081/v1/chat/completions \
+  -H 'Content-Type: application/json' -d @-)"
+echo "$RESPONSE" | jq -er '.choices[0].message.content' | grep -i red || {
+  echo "vision check failed; the server said:" >&2
+  echo "$RESPONSE" | jq -r '.error.message // .' >&2
+  exit 1
+}
+echo "vision check passed: $MODEL_ID saw red"
 ```
 
-It must print an answer containing `red`. If it does, text, streaming, and
+It must end with `vision check passed`. If it does, text, streaming, and
 vision are all proven. Do not continue until both this and the previous
-section pass; otherwise read the server output in terminal 1 and fix that
-first — a retrying client hides the original error.
+section pass; on failure the block prints the server's own error message —
+read that and the server output in terminal 1 before retrying.
 
 ## 6. Install OpenCode
 
@@ -159,8 +168,10 @@ jq --arg model_id "$MODEL_ID" '
 ```
 
 Try it: `opencode --model "hf2q/$MODEL_ID"`, then ask the agent to list the
-current directory. The transcript must show a real Bash tool call and its
-result — a prose claim that tools exist is not proof.
+current directory. The first launch downloads the provider package
+(`@ai-sdk/openai-compatible`), which can take a minute on a fresh machine;
+later launches reuse it. The transcript must show a real Bash tool call and
+its result — a prose claim that tools exist is not proof.
 
 ## 8. Install Agentic Kit
 
