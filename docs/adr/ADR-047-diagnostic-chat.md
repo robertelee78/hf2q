@@ -1,6 +1,6 @@
 # ADR-047: Diagnostic chat over the native inference server
 
-- **Status:** Accepted and implemented
+- **Status:** Accepted; text-engine A -> B -> A proof passed; embedding and projector lifecycle execution active
 - **Date:** 2026-08-20
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
 
@@ -326,6 +326,38 @@ request and worker lifecycles:
 This preserves the existing serve process and endpoint. It does not kill a
 manually started process.
 
+Model swap is a first-class serving operation, not merely a diagnostic-chat
+convenience. Its hardware proof must use two distinct physical artifacts and
+the production revision-bound switch route. A second pool key for a symlink to
+the same GGUF does not exercise model, tokenizer, template, cache, teardown, or
+reload behavior and is not swap evidence. The required sequence is A -> B -> A
+under a budget that permits either artifact alone but not both together. It
+must prove one resident generation after every transition, a fresh generation
+when A returns, exact deterministic A-result replay, bounded load-and-warm time
+on both legs, process-RSS and host-wired-memory reclamation when moving from
+the larger artifact to the smaller one, and absence of a double-residency peak.
+macOS `footprint` output is retained as a diagnostic only: the 2026-08-22 spike
+showed that its process physical-footprint charge can rise while both RSS and
+host wired pages fall, so it is not an authority for current Metal residency.
+This corrected gate covers pool-resident generative engines through their
+native chat endpoint. It does not count `/v1/embeddings` as proof for the
+dedicated BERT/Nomic subsystem: those models are process-global in the current
+source, while `/v1/embeddings` against a pool-resident generative engine uses
+that engine's last-state pooling path. Dedicated embedding-model lifecycle is
+a separate required implementation and hardware gate, not evidence supplied
+by this test. Family-specific cache and template state must never cross a
+switch.
+
+Likewise, the startup vision projector is process-global in the current
+source. Strongly bound incompatible swaps fail closed, but a shape-compatible
+external vision model without source/projector digests can inherit and execute
+the wrong startup projector; projector weights and its vision cache are also
+outside pool accounting. The required correction makes one resident
+generation own an atomic text/projector pair, resolves and warms the complete
+pair before publication, leases both from that same generation, and accounts
+the pair's unique allocations and cache bytes in admission/eviction. This work
+is an active correctness lane and cannot be credited to the text-only gate.
+
 The runtime capability also advertises the exact
 `x-hf2q-diagnostic-no-evict: 1` request header. After activation, diagnostic
 chat sends that header on OpenAI chat requests. If another client changes
@@ -410,7 +442,19 @@ Implementation is not complete until all of the following are proven:
     bounded/symlink-safe traversal, no path or digest serialization, local-first
     selector behavior with zero Hub work, repository-bound opaque authority,
     post-catalog digest/header rejection before loading, verifier cancellation
-    and reaping, and successful activation of a real hf2q-produced GGUF.
+    and reaping, and successful activation of a real hf2q-produced GGUF; and
+12. real macOS pool-resident generative A -> B -> A tests use distinct GGUF
+    bytes and exact conflict
+    receipts, keep one resident generation, bound both load-and-warm legs,
+    measure process RSS and host wired memory across each transition, reject a
+    double-residency peak, publish a fresh A generation, and reproduce A's
+    deterministic chat message exactly after reload; and
+13. dedicated BERT/Nomic A -> B -> A tests prove model/tokenizer/registry
+    replacement, exact embedding replay, generation isolation, memory
+    reclamation, and no double-residency peak; and
+14. multimodal A+P_A -> text B -> C+P_C -> A+P_A tests prove the projector and
+    vision cache are generation-owned, admission-accounted, reclaimed with the
+    text engine, and never inherited by an unbound shape-compatible model.
 
 ## Validation evidence
 
@@ -612,6 +656,46 @@ was connected. The corrected implementation is based on `origin/main`
   `local://` request identity and external lifecycle. `/quit` left that
   manually launched server healthy and resident; explicit Ctrl-C then stopped
   the server and left no listener or model process.
+
+### A -> B -> A proof correction spike (2026-08-22)
+
+Source inspection invalidated the old `tests/multi_model_swap.rs` claim before
+new implementation work began. It admitted a differently named symlink to the
+same GGUF alongside the original engine, expected two resident pool entries,
+and never evicted or reloaded A. That was alias admission, not model swap.
+
+The first replacement spike used the production explicit-switch route with the
+20,576,631,488-byte Gemma artifact and the 16,810,714,944-byte Qwen artifact
+under a 20,576,631,488-byte pool budget. A -> B loaded in 2.64 seconds and
+B -> A in 3.31 seconds. The deterministic A response replayed exactly; process
+RSS fell from 29,735,092,224 to 24,981,094,400 bytes before returning to
+29,820,174,336 bytes. The spike nevertheless was not acceptable: logs proved
+startup A used `SlotAware { max_slots: 4 }` while reloaded A silently used
+`SerialFifo`. Both diagnostic activation and ordinary request-time loading had
+reconstructed an incomplete `EngineConfig` with a hard-coded scheduler.
+
+The same run falsified process `footprint` as a Metal-residency authority. A
+later fail-first run charged B 59,033,797,192 physical-footprint bytes even as
+RSS fell to 22,028,140,544 bytes and host wired memory fell from
+35,143,843,840 to 7,180,435,456 bytes. The corrected gate therefore samples
+process RSS and `vm_stat` host wired pages during both switch transactions to
+bound transient double residency; it records `footprint` only for diagnosis.
+The engine configuration correction stores one process-wide dynamic-load
+template plus canonical-artifact overrides for explicit tokenizer, config, and
+overlay paths, and exposes a path-free configuration identity in the local
+runtime view.
+
+The post-fix hardware gate passed on the same M5 Max with both reloads using
+`SlotAware { max_slots: 4 }`. Gemma -> Qwen loaded in 2.277 seconds and
+Qwen -> Gemma in 4.249 seconds. Process RSS was 29,743,431,680 bytes for the
+first Gemma generation, 22,017,998,848 bytes for Qwen after eviction, and
+30,837,932,032 bytes for the reloaded Gemma generation. Host wired memory was
+35,074,883,584, 7,182,794,752, and 35,095,085,056 bytes respectively. The
+sampled transition peaks were 29,743,513,600 / 35,074,899,968 bytes (RSS / host
+wired) for Gemma -> Qwen and 31,998,066,688 / 36,528,816,128 bytes for
+Qwen -> Gemma, both within the gate's no-double-residency bound. The reloaded
+Gemma engine published a fresh generation, retained the exact path-free engine
+configuration identity, and reproduced its deterministic response exactly.
 
 ## Consequences
 

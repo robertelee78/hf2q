@@ -1118,6 +1118,7 @@ mod tests {
             bytes_resident: 1 << 30,
             loaded_at: SystemTime::now(),
             generation: 1,
+            config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),
         })
     }
 

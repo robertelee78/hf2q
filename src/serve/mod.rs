@@ -4439,6 +4439,18 @@ pub fn cmd_serve(
         default_model_arg.clone(),
     )?
     .with_local_artifacts(local_artifacts);
+    let dynamic_kv_metrics_sink = std::sync::Arc::clone(&state.kv_spill_counters)
+        as std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>;
+    state = state.with_engine_config_template(multi_model::EngineConfig {
+        tokenizer_path: None,
+        config_path: None,
+        queue_capacity: config.queue_capacity,
+        warmup_synchronously: true,
+        kv_metrics_sink: Some(dynamic_kv_metrics_sink),
+        dwq_overlay_path: None,
+        engine_mode,
+        kv_cache_budget_bytes,
+    });
 
     // --- ADR-017 Phase C.1 — optional persistent block-prefix KV cache ---
     // When `--kv-persist=PATH` is set, replace the AppState's
@@ -4907,27 +4919,11 @@ pub fn cmd_serve(
             None => quant_select::quant_type_from_gguf_path(&resolved.gguf_path)
                 .context("derive exact pool quant from --model GGUF")?,
         };
-        let engine_config = multi_model::EngineConfig {
-            tokenizer_path: args.tokenizer.clone(),
-            config_path: args.config.clone(),
-            queue_capacity: config.queue_capacity,
-            warmup_synchronously: true,
-            // ADR-017 Phase E.a iter-2: cmd_serve startup pre-warm
-            // path. Thread the same AppState counters Arc here so the
-            // initial pre-warmed engine has the same LCP-probe sink
-            // wiring as engines admitted later via the auto-pipeline.
-            kv_metrics_sink: Some(std::sync::Arc::clone(&state.kv_spill_counters)
-                as std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
-            // ADR-020 AC#5 Iter D — propagate `--dwq-overlay` flag.
-            dwq_overlay_path: args.dwq_overlay.clone(),
-            // ADR-040 Phase C iter-4 (C4) — propagate the parsed
-            // `EngineMode` so `load_engine` calls
-            // `Engine::spawn_with_mode` with the operator's chosen
-            // scheduler policy. Default `SerialFifo` keeps the
-            // ADR-005 byte-equivalence pledge when no flag/env is set.
-            engine_mode,
-            kv_cache_budget_bytes,
-        };
+        let mut engine_config = state.engine_config_template.clone();
+        engine_config.tokenizer_path = args.tokenizer.clone();
+        engine_config.config_path = args.config.clone();
+        engine_config.dwq_overlay_path = args.dwq_overlay.clone();
+        state.register_engine_config_for_path(&resolved.gguf_path, engine_config.clone())?;
         // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for
         // the about-to-fire load_or_get. Synchronous contract — see
         // loader_wrapper.rs's module docs.
