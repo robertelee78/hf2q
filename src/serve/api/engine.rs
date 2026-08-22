@@ -10283,7 +10283,11 @@ fn try_decode_batch_deepseek4_cohort(
                 Ok(completion) => {
                     let delivered = fire_deepseek4_completion(lane.reply, completion);
                     if delivered {
-                        sessions[lane.slot_index].commit_request_anchor();
+                        if let Err(error) = sessions[lane.slot_index].commit_request_anchor() {
+                            let mut fatal = SlotAwareGpuFatal::invariant_handle(lane.handle, error);
+                            fatal.extend_slots(owned.map(|lane| (Some(lane.handle), lane.reply)));
+                            return Deepseek4DecodeCohortRun::Handled(Some(fatal));
+                        }
                     } else {
                         if let Err(error) = sessions[lane.slot_index].recover_after_cancellation() {
                             let mut fatal = SlotAwareGpuFatal::invariant_handle(lane.handle, error);
@@ -10619,7 +10623,9 @@ fn decode_batch_deepseek4(
                     Ok(completion) => {
                         let delivered = fire_deepseek4_completion(reply, completion);
                         if delivered {
-                            sessions[slot_index].commit_request_anchor();
+                            if let Err(error) = sessions[slot_index].commit_request_anchor() {
+                                return Some(SlotAwareGpuFatal::invariant_handle(handle, error));
+                            }
                         } else {
                             if let Err(error) = sessions[slot_index].recover_after_cancellation() {
                                 return Some(SlotAwareGpuFatal::invariant_handle(handle, error));

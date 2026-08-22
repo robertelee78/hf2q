@@ -419,6 +419,7 @@ mod tests {
             "hf2q_requests_total",
             "hf2q_chat_completions_started",
             "hf2q_decode_tokens_total",
+            "hf2q_deepseek4_anchor_aggregate_owned_bytes",
             "# HELP",
             "# TYPE",
         ] {

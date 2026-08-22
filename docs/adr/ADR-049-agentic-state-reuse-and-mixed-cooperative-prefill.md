@@ -1,11 +1,12 @@
 # ADR-049: Agentic state reuse (multi-anchor) and Mixed-phase cooperative prefill
 
-- Status: Accepted; execution in progress (qwen35-family and Gemma4 model-free
-  Lane A proof complete at rev 7; real-artifact gates and DeepSeek4 parity open)
+- Status: Accepted; execution in progress (qwen35-family, Gemma4, and
+  DeepSeek4 model-free Lane A proof complete at rev 8; real-artifact gates
+  remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-22 (rev 7, Gemma4 multi-anchor parity milestone)
-  — implementation commit `95d618c8`, based on main `32181b61`: explicit
-  per-slot AnchorStore,
+- Updated: 2026-08-22 (rev 8, DeepSeek4 multi-anchor parity milestone)
+  — the Qwen implementation lineage begins at `95d618c8`, based on main
+  `32181b61`: explicit per-slot AnchorStore,
   linear-lineage pruning, fail-atomic restore preflight, exact payload
   ownership/accounting, terminal publication, A.8 logs/metrics, idle audit,
   independent reference-model + 17-mutation battery, and Lane C corrections.
@@ -17,7 +18,12 @@
   Its model-free gates prove fail-atomic all-layer restore preflight, terminal
   pending publication, cancellation, lineage rewind, exact owned bytes, and
   native equality hits. Gemma real-artifact unary/SSE and multi-slot receipts
-  remain an explicit acceptance gate, not a claim of this milestone.
+  remain an explicit acceptance gate, not a claim of this milestone. DeepSeek4
+  parity in rev 8 is based on the generic AnchorStore checkpoint `234fb394`:
+  recovery-tail snapshots are capacity-portable across cache growth, every
+  committed and pending payload is preflighted before the live cache migrates
+  once, and strict-prefix-only anchor matching preserves the family-native
+  live-logit equality path. DeepSeek4 real-artifact receipts remain open too.
 - Owners: hf2q serving engine (execution: the active qwen35/qwen38 serving-lane session; plan authored by the FreeToken research session)
 - Code pins: planning review at hf2q `242882e8`; rev-6 execution based on
   merged main `32181b61`; mlx-native `0.11.2`. Anchors were authored at
@@ -84,7 +90,14 @@ Mandatory regression (must exist before any restore path merges): build lineage 
   | Qwen3.6-35B-A3B (30 DeltaNet layers) | 62.8 MiB | ≈63.5 MiB | ≈1.02 GiB | ≈2.03 GiB | ≈4.06 GiB |
   | Qwen3.8-27B (48 layers) | 149.6 MiB | ≈150.3 MiB | ≈2.35 GiB | ≈4.70 GiB | ≈9.39 GiB |
 
-  Gemma4/DeepSeek4 rows are computed the same way when their parity phases open.
+  DeepSeek4's mature-boundary snapshot owns 49,299,456 bytes (47.015625 MiB)
+  before token identity and small control allocations: 43 × 128 × 512 BF16
+  circular-window rows, 21 ratio-4 layers of main+indexer F32 compressor state,
+  and 20 ratio-128 layers of main F32 compressor state. Prompt identity adds
+  exactly `4 × token_count` bytes per anchor. Thus K=4 base snapshot payload is
+  ≈0.735/1.469/2.938 GiB at N=4/8/16; at a 100K-token boundary those become
+  ≈0.741/1.481/2.962 GiB. Gemma4 uses the same exact family-owned accounting
+  discipline rather than this DeepSeek-specific formula.
 - Idle conservation invariant: at scheduler idle, first prove every physical target cursor equals its retained ledger and every retained spec boundary has matching target+MTP cursors. Then audit the scheduler-accounted cursor bytes, monotonic allocation slack, KV free bytes, exact host-owned anchor bytes, and anchor free bytes against their two grants. The equalities are not substitutes for the cursor comparisons.
 
 **A.5 — Speculation interplay (LIVE requirements — corrected after the executor audit; verified at `242882e8`).** Slot-aware speculative rollback is live on main via its own transactional functions — `rollback_slot_mtp_transaction` (engine_qwen35.rs:4142) and `rollback_slot_target_transaction` (:4173), with fail-closed slot reset if a rollback itself fails (:4197-4226). H38 (engine.rs:44835-44897) still pins `rollback_la_to` — and with it the per-token DeltaNet capture arena — out of the slot-aware worker. The rules below bind NOW and are co-designed with the speculation lane:
@@ -121,6 +134,41 @@ before all-layer preflight succeeds. Open acceptance gate: run Gemma dense and
 MoE real artifacts through unary/SSE exact-retry, continuation, divergence,
 cancellation, failed-restore injection, and N>1 concurrency before marking the
 family phase hardware-proven.
+
+DeepSeek4 model-free milestone (rev 8): COMPLETE. Its previous single
+committed plus single pending recovery pair is now the same model-neutral
+`AnchorStore<Deepseek4PromptAnchor>` state machine, while the payload and match
+rules remain family-native. Anchors own compact circular-window tails and
+recurrent compressor state, deliberately do not own logits, and therefore
+match only strict prompt prefixes; exact live-prompt equality still uses the
+live ledger and live logits without replay. Selection is deepest-surviving
+linear lineage. Restoring A prunes every deeper anchor before divergent writes.
+Cold reset, poison, or any failed restore clears the entire store before a hard
+reset; restore itself validates every layer, shape, dtype, destination span,
+and cursor before the first copy or cursor mutation.
+
+Cache growth no longer rewrites one privileged snapshot. Every committed and
+pending snapshot is preflighted against the source and destination plans, the
+live cache migrates once, and immutable snapshots from any prefix-compatible
+growth ancestor remain restorable. This avoids both stale anchors and an
+O(anchor-count) device-copy tax during session growth. Exact aggregate
+accounting charges the preallocated store controls, every committed and pending
+snapshot allocation, cloned cache-plan controls, and `4 × prompt_tokens`; an
+immutable worker grant covers all configured stores and reports effective K
+plus simultaneous-pending capacity. DeepSeek4 has no live speculative-prefix
+payload at this revision, so the family adds no parallel speculative boundary
+state; any future DeepSeek speculation must extend this same anchor payload.
+
+Proof on base `234fb394` (model-free/synthetic, no model artifact): 20/20
+DeepSeek cache tests, including a late-layer restore fault that leaves every
+earlier byte and cursor unchanged and multi-anchor capacity growth; 19/19
+DeepSeek serving tests, including A→B→C rewind, pending invisibility,
+cancellation, reset/poison invalidation, failed-restore hard-reset+clear,
+two-slot family isolation, native equality, and aggregate-byte conservation;
+and `cargo check --locked --all-targets --no-default-features`. Open acceptance
+gate: run the served DeepSeek artifact through unary/SSE strict-prefix reuse,
+live equality, divergence, cancellation, failed-restore injection, cache growth,
+and N>1 concurrency before marking the family phase hardware-proven.
 
 **A.7 — Open hypotheses: the spikes that decide them** (not "deferred" — each is a live question whose data collection is already scheduled or cheap):
 - *Cross-slot / restart-surviving registry tier*. Hypothesis: foreign-slot landings and restart warm-up are frequent enough on the real workload to justify a shared CoW prefix store. Deciding data: A.8 telemetry — slot-affinity foreign-landing counts and restart-cold counts over production use. If confirmed → its own ADR (needs a slot-parameterized `restore_partial` — the current one is copy-owning and rewrites every sequence cursor, kv_cache.rs:3435, :3493 — plus an ownership answer to the `b44b92ed` tenant-isolation pin; FreeToken's donate-not-copy/CoW/dual-currency eviction is that ADR's design vocabulary). Meanwhile the SerialFifo `LcpRegistry` + disk hydrate remains the restart-hydrate tier.
@@ -230,8 +278,8 @@ widths; execute and record cancellation, post-admission failed-prefill,
 speculative-state,
 tail-TTFT,
 append-only-no-regression, and N=4 stability receipts. The release driver owns
-that hardware window. Gemma4/deepseek4 parity and Lane B remain required by the
-scope directive.
+that hardware window. Gemma4 and DeepSeek4 model-free parity are complete;
+their artifact gates and Lane B remain required by the scope directive.
 
 ## Falsified findings and open hypotheses (studied, decided, documented)
 

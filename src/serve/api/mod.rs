@@ -29,6 +29,7 @@ mod anchor_store;
 pub mod artifact_catalog;
 pub mod cancellation;
 pub mod control;
+mod deepseek4_anchor_store;
 pub mod embedding_pool;
 pub mod engine;
 pub mod engine_deepseek4;
