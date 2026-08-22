@@ -10,10 +10,13 @@ use std::time::Duration;
 
 /// Explicit server policy selected with `HF2Q_QWEN_SPECULATION`.
 ///
-/// `off` is the process default when no policy is supplied. The canonical
-/// Qwen3.8 launcher explicitly exports `auto`, which admits eligible exact
-/// requests and selects request-history lookup before an available MTP
-/// proposer.
+/// `auto` is the default for the qwen35 server engine when no policy is
+/// supplied (ADR-044, updated 2026-08-21): the policy was already the
+/// canonical Qwen3.8 launcher choice, and every admission path fails
+/// closed — unsupported semantics, prompt-cache hits, unavailable
+/// proposers, and measured-unprofitable rounds all stay on ordinary
+/// target decode, so the worst case for a default-on `auto` is ordinary
+/// decode plus telemetry. An explicit `off` remains the operator escape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QwenSpeculationPolicy {
     Off,
@@ -31,14 +34,26 @@ impl QwenSpeculationPolicy {
         }
     }
 
-    pub fn from_environment() -> Self {
-        match Self::parse(std::env::var("HF2Q_QWEN_SPECULATION").ok().as_deref()) {
-            Ok(policy) => policy,
-            Err(message) => {
-                tracing::warn!(%message, "disabling Qwen speculation");
-                Self::Off
-            }
+    /// Server-side resolution for the qwen35 engine: an absent variable
+    /// defaults to `auto`; a present variable is parsed strictly and an
+    /// invalid value warns and fails closed to `off`. Kept pure (the
+    /// caller passes the env read) so the default is unit-testable
+    /// without mutating process state.
+    pub fn resolve_server_policy(value: Option<&str>) -> Self {
+        match value {
+            None => Self::Auto,
+            Some(_) => match Self::parse(value) {
+                Ok(policy) => policy,
+                Err(message) => {
+                    tracing::warn!(%message, "disabling Qwen speculation");
+                    Self::Off
+                }
+            },
         }
+    }
+
+    pub fn from_environment() -> Self {
+        Self::resolve_server_policy(std::env::var("HF2Q_QWEN_SPECULATION").ok().as_deref())
     }
 }
 
@@ -347,6 +362,31 @@ mod tests {
             Ok(QwenSpeculationPolicy::Auto)
         );
         assert!(QwenSpeculationPolicy::parse(Some("always")).is_err());
+    }
+
+    #[test]
+    fn server_policy_defaults_to_auto_and_preserves_explicit_off() {
+        assert_eq!(
+            QwenSpeculationPolicy::resolve_server_policy(None),
+            QwenSpeculationPolicy::Auto
+        );
+        assert_eq!(
+            QwenSpeculationPolicy::resolve_server_policy(Some("auto")),
+            QwenSpeculationPolicy::Auto
+        );
+        assert_eq!(
+            QwenSpeculationPolicy::resolve_server_policy(Some("1")),
+            QwenSpeculationPolicy::Auto
+        );
+        assert_eq!(
+            QwenSpeculationPolicy::resolve_server_policy(Some("off")),
+            QwenSpeculationPolicy::Off
+        );
+        // Invalid values fail closed rather than inheriting the default.
+        assert_eq!(
+            QwenSpeculationPolicy::resolve_server_policy(Some("always")),
+            QwenSpeculationPolicy::Off
+        );
     }
 
     #[test]

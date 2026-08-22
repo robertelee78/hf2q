@@ -161,13 +161,13 @@ to a sibling checkout.
   to start below `disk_floor_gb + 10`.
 
 For the complete first-run path, use
-**[hf2q + Qwen3.8 + AK + search/fetch: complete setup](docs/getting-started.md)**.
-It installs
-the signed binary; downloads hf2q's checksum-pinned Q4_K_M text GGUF and its
-source-matched F16 vision projector for
-`jenerallee78/Qwen3.8-27B-Abliterated-SFT`; proves unary, SSE, and image
-generation; and configures a stock tool-enabled OpenCode Build agent, full
-Agentic Kit, and a durable local search/fetch/crawl/extract stack.
+**[Getting started: hf2q + OpenCode + local web research](docs/getting-started.md)**.
+It installs the signed binary; downloads hf2q's checksum-pinned Q4_K_M text
+GGUF and its source-matched F16 vision projector for
+`jenerallee78/Qwen3.8-27B-Abliterated-SFT`; serves the multimodal pair in the
+foreground with one command; proves generation with `hf2q chat` plus one
+image request; and then connects a stock tool-enabled OpenCode agent, full
+Agentic Kit, and the local search/fetch/crawl/extract stack.
 
 `hf2q doctor` enumerates the runtime checks (hardware detection, disk
 space, optional RuVector backend); run it after `cargo install` if
@@ -346,10 +346,11 @@ rendered prompts and sampling settings reproduce across worker threads.
 The qualified Qwen3.8 onboarding path uses the exact published, checksum-pinned
 text/projector pair for
 `jenerallee78/Qwen3.8-27B-Abliterated-SFT`. Follow the
-[complete Qwen3.8 + AK + search/fetch guide](docs/getting-started.md)
-for download, multimodal serve, API proof, stock OpenCode Build, full Agentic
-Kit, research tools, and cleanup. General source-conversion examples elsewhere
-in this repository are not a substitute for that qualified artifact pair.
+[getting-started guide](docs/getting-started.md)
+for download, one-command multimodal serve, chat and image proof, OpenCode,
+Agentic Kit, and the local research stack. General source-conversion examples
+elsewhere in this repository are not a substitute for that qualified artifact
+pair.
 
 Native text conversion and serving are accepted. Vision is a separate
 candidate surface: hf2q converts the 333-tensor tower into a paired projector,
@@ -833,8 +834,9 @@ catalog + smoke prompt before any forward-pass code lands.
 
 ## Documentation index
 
-- `docs/getting-started.md` — canonical verified Qwen3.8, OpenCode, full AK,
-  and local research setup.
+- `docs/getting-started.md` — canonical first-run path: verified Qwen3.8
+  pair, foreground serve, chat and vision proof, OpenCode, full Agentic Kit,
+  and the local research stack.
 - `docs/ARCHITECTURE.md` — source-grounded architecture map.
 - `docs/converting-a-model.md` — generic convert reference.
 - `docs/converting-qwen35.md` — Qwen 3.5/3.6 specifics.

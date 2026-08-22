@@ -80,6 +80,12 @@ pub(super) fn resolve_preferences<R: BufRead, W: Write>(
         };
         if selected.serve.scheduler == ConfiguredScheduler::FifoSerial {
             selected.serve.max_slots = 1;
+            selected.serve.clear_agentic_profile();
+        } else {
+            // The answer that selects the batched scheduler also persists
+            // the qualified agentic serving profile, so `hf2q serve`
+            // inherits it from config instead of a launcher environment.
+            selected.serve.apply_agentic_profile();
         }
     }
 
@@ -163,8 +169,13 @@ fn apply_explicit(args: &SetupArgs, selected: &mut OperatorConfigV2) {
             SchedulerArg::FifoSerial => ConfiguredScheduler::FifoSerial,
             SchedulerArg::InflightBatched => ConfiguredScheduler::InflightBatched,
         };
-        if scheduler == SchedulerArg::FifoSerial && args.serve_max_slots.is_none() {
-            selected.serve.max_slots = 1;
+        if scheduler == SchedulerArg::FifoSerial {
+            if args.serve_max_slots.is_none() {
+                selected.serve.max_slots = 1;
+            }
+            selected.serve.clear_agentic_profile();
+        } else {
+            selected.serve.apply_agentic_profile();
         }
     }
     if let Some(max_slots) = args.serve_max_slots {
