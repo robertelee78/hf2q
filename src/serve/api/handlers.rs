@@ -8514,6 +8514,91 @@ hf2q_gemma4_anchor_configured_slots {}\n",
         gemma_anchor.aggregate_budget_bytes.load(Ordering::Relaxed),
         gemma_anchor.configured_slots.load(Ordering::Relaxed),
     );
+    let deepseek_anchor = &super::deepseek4_anchor_store::TELEMETRY;
+    let deepseek_anchor_block = format!(
+        "# HELP hf2q_deepseek4_anchor_captures_total Slot-local DeepSeek recovery-tail captures attempted.\n\
+# TYPE hf2q_deepseek4_anchor_captures_total counter\n\
+hf2q_deepseek4_anchor_captures_total {}\n\
+# HELP hf2q_deepseek4_anchor_capture_budget_skips_total DeepSeek captures skipped by aggregate byte or publication preflight.\n\
+# TYPE hf2q_deepseek4_anchor_capture_budget_skips_total counter\n\
+hf2q_deepseek4_anchor_capture_budget_skips_total {}\n\
+# HELP hf2q_deepseek4_anchor_capture_seconds_total Wall time spent producing compact DeepSeek snapshots.\n\
+# TYPE hf2q_deepseek4_anchor_capture_seconds_total counter\n\
+hf2q_deepseek4_anchor_capture_seconds_total {:.9}\n\
+# HELP hf2q_deepseek4_anchor_restore_attempts_total DeepSeek anchor restore attempts and cold misses.\n\
+# TYPE hf2q_deepseek4_anchor_restore_attempts_total counter\n\
+hf2q_deepseek4_anchor_restore_attempts_total {}\n\
+# HELP hf2q_deepseek4_anchor_restore_hits_total Epoch-valid DeepSeek anchor restores.\n\
+# TYPE hf2q_deepseek4_anchor_restore_hits_total counter\n\
+hf2q_deepseek4_anchor_restore_hits_total {}\n\
+# HELP hf2q_deepseek4_anchor_restore_misses_total DeepSeek divergences that could not reuse an anchor.\n\
+# TYPE hf2q_deepseek4_anchor_restore_misses_total counter\n\
+hf2q_deepseek4_anchor_restore_misses_total {}\n\
+# HELP hf2q_deepseek4_anchor_tokens_saved_total Prompt tokens skipped by DeepSeek anchor restoration.\n\
+# TYPE hf2q_deepseek4_anchor_tokens_saved_total counter\n\
+hf2q_deepseek4_anchor_tokens_saved_total {}\n\
+# HELP hf2q_deepseek4_anchor_descendants_pruned_total Stale DeepSeek descendants removed after rewind or cancellation.\n\
+# TYPE hf2q_deepseek4_anchor_descendants_pruned_total counter\n\
+hf2q_deepseek4_anchor_descendants_pruned_total {}\n\
+# HELP hf2q_deepseek4_anchor_evictions_total Positional keep-newest-K DeepSeek evictions.\n\
+# TYPE hf2q_deepseek4_anchor_evictions_total counter\n\
+hf2q_deepseek4_anchor_evictions_total {}\n\
+# HELP hf2q_deepseek4_anchor_cancellations_total DeepSeek requests reconciled to a committed recovery anchor.\n\
+# TYPE hf2q_deepseek4_anchor_cancellations_total counter\n\
+hf2q_deepseek4_anchor_cancellations_total {}\n\
+# HELP hf2q_deepseek4_anchor_lineage_clears_total Full DeepSeek anchor-store invalidations.\n\
+# TYPE hf2q_deepseek4_anchor_lineage_clears_total counter\n\
+hf2q_deepseek4_anchor_lineage_clears_total {}\n\
+# HELP hf2q_deepseek4_anchor_peak_committed_pending_bytes Peak reclaimable DeepSeek anchor bytes in one store.\n\
+# TYPE hf2q_deepseek4_anchor_peak_committed_pending_bytes gauge\n\
+hf2q_deepseek4_anchor_peak_committed_pending_bytes {}\n\
+# HELP hf2q_deepseek4_anchor_aggregate_peak_committed_pending_bytes Peak reclaimable DeepSeek anchor bytes across stores.\n\
+# TYPE hf2q_deepseek4_anchor_aggregate_peak_committed_pending_bytes gauge\n\
+hf2q_deepseek4_anchor_aggregate_peak_committed_pending_bytes {}\n\
+# HELP hf2q_deepseek4_anchor_aggregate_owned_bytes Current exact reclaimable DeepSeek anchor bytes across stores.\n\
+# TYPE hf2q_deepseek4_anchor_aggregate_owned_bytes gauge\n\
+hf2q_deepseek4_anchor_aggregate_owned_bytes {}\n\
+# HELP hf2q_deepseek4_anchor_aggregate_budget_bytes Immutable aggregate DeepSeek anchor-owned byte grant.\n\
+# TYPE hf2q_deepseek4_anchor_aggregate_budget_bytes gauge\n\
+hf2q_deepseek4_anchor_aggregate_budget_bytes {}\n\
+# HELP hf2q_deepseek4_anchor_configured_slots Configured DeepSeek SlotAware concurrency.\n\
+# TYPE hf2q_deepseek4_anchor_configured_slots gauge\n\
+hf2q_deepseek4_anchor_configured_slots {}\n\
+# HELP hf2q_deepseek4_anchor_effective_committed_depth Effective committed depth for the most recent DeepSeek capture.\n\
+# TYPE hf2q_deepseek4_anchor_effective_committed_depth gauge\n\
+hf2q_deepseek4_anchor_effective_committed_depth {}\n\
+# HELP hf2q_deepseek4_anchor_simultaneous_pending_capacity_slots Slots with pending capacity after the reported committed depth.\n\
+# TYPE hf2q_deepseek4_anchor_simultaneous_pending_capacity_slots gauge\n\
+hf2q_deepseek4_anchor_simultaneous_pending_capacity_slots {}\n",
+        deepseek_anchor.captures_total.load(Ordering::Relaxed),
+        deepseek_anchor
+            .capture_budget_skips_total
+            .load(Ordering::Relaxed),
+        deepseek_anchor.capture_nanos_total.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        deepseek_anchor.restore_attempts_total.load(Ordering::Relaxed),
+        deepseek_anchor.restore_hits_total.load(Ordering::Relaxed),
+        deepseek_anchor.restore_misses_total.load(Ordering::Relaxed),
+        deepseek_anchor.tokens_saved_total.load(Ordering::Relaxed),
+        deepseek_anchor.descendants_pruned_total.load(Ordering::Relaxed),
+        deepseek_anchor.evictions_total.load(Ordering::Relaxed),
+        deepseek_anchor.cancellations_total.load(Ordering::Relaxed),
+        deepseek_anchor.lineage_clears_total.load(Ordering::Relaxed),
+        deepseek_anchor
+            .peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        deepseek_anchor
+            .aggregate_peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        deepseek_anchor.aggregate_owned_bytes.load(Ordering::Relaxed),
+        deepseek_anchor.aggregate_budget_bytes.load(Ordering::Relaxed),
+        deepseek_anchor.configured_slots.load(Ordering::Relaxed),
+        deepseek_anchor
+            .effective_committed_depth
+            .load(Ordering::Relaxed),
+        deepseek_anchor
+            .simultaneous_pending_capacity_slots
+            .load(Ordering::Relaxed),
+    );
     let qwen_mtp_fallback_reasons = format!(
         "# HELP hf2q_qwen_mtp_fallback_requests_by_reason_total Compatibility aggregate of exact Qwen speculation fallbacks by closed reason.\n\
 # TYPE hf2q_qwen_mtp_fallback_requests_by_reason_total counter\n\
@@ -8724,6 +8809,7 @@ hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
 {qwen_speculation_proposers}\
 {qwen_anchor_block}\
 {gemma_anchor_block}\
+{deepseek_anchor_block}\
 ",
         uptime = state.uptime_seconds(),
         ready = ready,
@@ -8758,6 +8844,7 @@ hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
         qwen_speculation_proposers = qwen_speculation_proposers,
         qwen_anchor_block = qwen_anchor_block,
         gemma_anchor_block = gemma_anchor_block,
+        deepseek_anchor_block = deepseek_anchor_block,
     );
     // Prometheus exposition format: text/plain with a versioned content-type.
     let mut resp = (StatusCode::OK, body).into_response();

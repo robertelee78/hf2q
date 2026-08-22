@@ -630,7 +630,7 @@ pub(in crate::serve::api) fn generate_stream(
                 },
             })
             .map_err(|_| anyhow::anyhow!("DeepSeek-V4 SSE client disconnected"))?;
-        loaded.commit_request_anchor();
+        loaded.commit_request_anchor()?;
         progress.complete(finish_reason, generated.len(), Some(semantic_ttft));
         Ok(())
     })();
