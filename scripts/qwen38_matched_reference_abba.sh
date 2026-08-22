@@ -1118,7 +1118,11 @@ matched_measurement_stability_json "$rows_file" \
   "$MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT" >"$stability_json"
 jq -e '.stable == true' "$stability_json" >/dev/null || {
     echo "matched performance calibration is unstable; no speed verdict is valid" >&2
-    jq '{maximum_group_spread_percent,maximum_case_spread_percent,
+    jq --argjson maximum_group_spread_percent \
+      "$MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT" \
+      --argjson maximum_case_spread_percent \
+      "$MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT" \
+      '{maximum_group_spread_percent,maximum_case_spread_percent,
       cases:[.cases[] | select(
         .wall_spread_percent > $maximum_case_spread_percent or
         .decode_tps_spread_percent > $maximum_case_spread_percent)],
