@@ -1970,3 +1970,41 @@ mod tests {
         assert!(out.n_y_token > out.n_x_token, "portrait → n_y > n_x");
     }
 }
+
+#[cfg(test)]
+mod guide_fixture_tests {
+    /// The getting-started guide's embedded red-PNG fixture must decode
+    /// through the strict PNG path hf2q serves with. The original fixture
+    /// was a truncated "smallest-PNG" whose declared IDAT length exceeded
+    /// the file: tolerant decoders (CoreGraphics) rendered it, the strict
+    /// `png`-crate path returned UnexpectedEof, and the guide's vision
+    /// check failed with HTTP 400 on a healthy server (2026-08-21).
+    const GUIDE_RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC";
+
+    #[test]
+    fn guide_red_png_decodes_to_64x64() {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(GUIDE_RED_PNG_B64)
+            .expect("base64 decode");
+        // The fixture must be a complete, checksum-valid PNG — not merely
+        // decodable by lenient renderers. A well-formed PNG ends with the
+        // 12-byte IEND trailer; the original truncated fixture lacked it.
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "PNG magic");
+        assert_eq!(
+            &bytes[bytes.len() - 12..],
+            &[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82],
+            "PNG IEND trailer"
+        );
+        let img = image::load_from_memory(&bytes).expect("image decode");
+        assert_eq!(
+            image::GenericImageView::dimensions(&img),
+            (64, 64),
+            "guide fixture dimensions"
+        );
+        // Solid red as far as the model is concerned.
+        let rgb = img.to_rgb8();
+        let px = rgb.get_pixel(32, 32);
+        assert_eq!(px.0, [255, 0, 0], "center pixel is red");
+    }
+}
