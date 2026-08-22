@@ -2353,6 +2353,7 @@ mod tests {
     #[test]
     fn quant_type_round_trip_via_from_canonical_str() {
         for q in [
+            QuantType::Q2_K,
             QuantType::Q8_0,
             QuantType::Q6_K,
             QuantType::Q5_K_M,

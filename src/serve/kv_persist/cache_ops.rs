@@ -233,6 +233,7 @@ pub fn clear_namespace_all_quants(
 
     let mut outcomes = Vec::new();
     for q in [
+        QuantType::Q2_K,
         QuantType::Q8_0,
         QuantType::Q6_K,
         QuantType::Q5_K_M,

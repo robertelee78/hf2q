@@ -45,6 +45,9 @@ use anyhow::{anyhow, Context, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum QuantType {
+    /// 2-bit K-quant. Used by explicit-path runtimes such as DeepSeek;
+    /// never selected by the generic hardware table.
+    Q2_K,
     /// 8-bit per weight, K-block-free legacy quant. Best fidelity in the table.
     Q8_0,
     /// 6.5 bpw K-quant.
@@ -62,6 +65,7 @@ impl QuantType {
     /// `src/backends/gguf.rs:1038-1057`).
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Q2_K => "Q2_K",
             Self::Q8_0 => "Q8_0",
             Self::Q6_K => "Q6_K",
             Self::Q5_K_M => "Q5_K_M",
@@ -81,13 +85,14 @@ impl QuantType {
     /// for every variant.
     pub fn from_canonical_str(name: &str) -> std::result::Result<Self, String> {
         match name.to_ascii_uppercase().as_str() {
+            "Q2_K" => Ok(Self::Q2_K),
             "Q8_0" => Ok(Self::Q8_0),
             "Q6_K" => Ok(Self::Q6_K),
             "Q5_K_M" => Ok(Self::Q5_K_M),
             "Q4_K_M" => Ok(Self::Q4_K_M),
             "Q3_K_M" => Ok(Self::Q3_K_M),
             other => Err(format!(
-                "unknown quant type {other:?}: supported = Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q3_K_M"
+                "unknown quant type {other:?}: supported = Q2_K, Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q3_K_M"
             )),
         }
     }
@@ -97,6 +102,7 @@ impl QuantType {
         use crate::quantize::ggml_quants::GgufFtype;
 
         match GgufFtype::try_from(file_type).ok()? {
+            GgufFtype::MostlyQ2_K => Some(Self::Q2_K),
             GgufFtype::MostlyQ8_0 => Some(Self::Q8_0),
             GgufFtype::MostlyQ6_K => Some(Self::Q6_K),
             GgufFtype::MostlyQ5_K_M => Some(Self::Q5_K_M),
@@ -111,6 +117,7 @@ impl QuantType {
         use crate::quantize::ggml_quants::GgufFtype;
 
         match self {
+            Self::Q2_K => GgufFtype::MostlyQ2_K as u32,
             Self::Q8_0 => GgufFtype::MostlyQ8_0 as u32,
             Self::Q6_K => GgufFtype::MostlyQ6_K as u32,
             Self::Q5_K_M => GgufFtype::MostlyQ5_K_M as u32,
@@ -387,6 +394,7 @@ mod tests {
         // Names must match `quant_name_to_ggml_type` in
         // src/backends/gguf.rs:1038-1057 so downstream serializers can
         // round-trip without a translation table.
+        assert_eq!(QuantType::Q2_K.as_str(), "Q2_K");
         assert_eq!(QuantType::Q8_0.as_str(), "Q8_0");
         assert_eq!(QuantType::Q6_K.as_str(), "Q6_K");
         assert_eq!(QuantType::Q5_K_M.as_str(), "Q5_K_M");
@@ -403,6 +411,12 @@ mod tests {
     fn qwen38_q5_k_m_file_type_round_trips_exactly() {
         assert_eq!(QuantType::Q5_K_M.gguf_file_type(), 17);
         assert_eq!(QuantType::from_gguf_file_type(17), Some(QuantType::Q5_K_M));
+    }
+
+    #[test]
+    fn deepseek_q2_k_file_type_round_trips_exactly() {
+        assert_eq!(QuantType::Q2_K.gguf_file_type(), 10);
+        assert_eq!(QuantType::from_gguf_file_type(10), Some(QuantType::Q2_K));
     }
 
     #[test]
@@ -424,6 +438,28 @@ mod tests {
         assert_eq!(
             quant_type_from_gguf_path(file.path()).unwrap(),
             QuantType::Q5_K_M
+        );
+    }
+
+    #[test]
+    fn deepseek_q2_k_path_identity_comes_from_the_gguf_header() {
+        let key = b"general.file_type";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&10_u32.to_le_bytes());
+        bytes.resize(256, 0);
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), bytes).unwrap();
+        assert_eq!(
+            quant_type_from_gguf_path(file.path()).unwrap(),
+            QuantType::Q2_K
         );
     }
 
