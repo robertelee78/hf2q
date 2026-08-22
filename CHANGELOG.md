@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] — 2026-08-22
+
+### Added
+
+- Execute packed Qwen3.8 Q5_K/Q6_K embedding rows directly on Metal while
+  preserving native GGUF storage for embeddings, projections, output heads,
+  and the shared MTP head. Invalid native routing or storage geometry now
+  fails model admission before readiness.
+
+### Changed
+
+- Pin the published, checksum-bound `mlx-native 0.11.2` dependency and bind
+  Qwen hosted, cache, and pool identity to exact GGUF file type 17.
+- Replace DeepSeek-V4's falsified host-global zero-page acceptance rule with
+  phase-bound process residency evidence. The release gate retains fail-closed
+  swap, process-page-in, pressure, thermal, phase, and contention checks while
+  recording host-global VM counters as diagnostics rather than inventing
+  thresholds for them.
+
+### Fixed
+
+- Preserve the required-tool answer capacity for Qwen agentic requests and
+  make equal-logit greedy argmax deterministic at the lowest token index.
+- Replace the getting-started guide's truncated PNG with a strictly valid
+  vision fixture, surface vision-server error bodies, and make the web-stack
+  installer quiet and actionable under `curl | bash` on macOS Bash 3.2.
+
 ## [0.1.10] — 2026-08-22
 
 ### Changed
@@ -962,7 +989,8 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
-[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/robertelee78/hf2q/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/robertelee78/hf2q/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/robertelee78/hf2q/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/robertelee78/hf2q/compare/v0.1.7...v0.1.8
