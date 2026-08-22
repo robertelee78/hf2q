@@ -405,6 +405,14 @@ pub struct InvestigationEnv {
     /// gated by `env_eq_one("HF2Q_UNSAFE_EXPERIMENTS")`.
     pub chunk_scan_prefill: bool,
 
+    /// `HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS=N` —
+    /// one-shot ADR-049 acceptance fault. After a matching Qwen SlotAware
+    /// request completes its first non-empty GPU prefill slice, the worker
+    /// routes it through the ordinary failed-prefill reset path before
+    /// publishing the slice to the scheduler ledger. `N` must be positive.
+    /// Effective only with `HF2Q_UNSAFE_EXPERIMENTS=1`.
+    pub qwen_post_admission_prefill_failure_max_tokens: Option<usize>,
+
     // ========================================================================
     // Wave 5b.20 `gqa_expand_legacy` field + `HF2Q_GQA_EXPAND_LEGACY` env gate
     // removed in W-5b.21 after a 30/30 cross-path determinism audit at PP4106
@@ -784,6 +792,7 @@ struct RawAckIntent {
     skip_v_norm: bool,
     lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
+    qwen_post_admission_prefill_failure_max_tokens: Option<usize>,
 }
 
 impl InvestigationEnv {
@@ -812,6 +821,10 @@ impl InvestigationEnv {
             skip_v_norm: env_eq_one("HF2Q_SKIP_V_NORM"),
             lmhead_rerank_disabled: matches!(env::var("HF2Q_LMHEAD_RERANK").as_deref(), Ok("0")),
             chunk_scan_prefill: env_eq_one("HF2Q_CHUNK_SCAN_PREFILL"),
+            qwen_post_admission_prefill_failure_max_tokens: env_usize(
+                "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS",
+            )
+            .filter(|&value| value > 0),
         };
         let ack = env_eq_one("HF2Q_UNSAFE_EXPERIMENTS");
 
@@ -841,6 +854,9 @@ impl InvestigationEnv {
             skip_v_norm: raw.skip_v_norm && ack,
             lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
+            qwen_post_admission_prefill_failure_max_tokens: ack
+                .then_some(raw.qwen_post_admission_prefill_failure_max_tokens)
+                .flatten(),
 
             // Warn-only — no gate.
             graph_opt: env_eq_one("HF2Q_GRAPH_OPT"),
@@ -1105,6 +1121,15 @@ impl InvestigationEnv {
                  sourdough/walk-bar parity validation pending",
             ));
         }
+        if self
+            .qwen_post_admission_prefill_failure_max_tokens
+            .is_some()
+        {
+            active_unsafe.push((
+                "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS=N",
+                "one-shot ADR-049 post-admission failed-prefill lifecycle gate",
+            ));
+        }
 
         // Refused (user set ack-required toggle but HF2Q_UNSAFE_EXPERIMENTS=1 missing).
         let mut refused: Vec<(&str, &str)> = Vec::new();
@@ -1138,6 +1163,19 @@ impl InvestigationEnv {
         if self.raw.chunk_scan_prefill && !self.chunk_scan_prefill {
             refused.push((
                 "HF2Q_CHUNK_SCAN_PREFILL=1",
+                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
+            ));
+        }
+        if self
+            .raw
+            .qwen_post_admission_prefill_failure_max_tokens
+            .is_some()
+            && self
+                .qwen_post_admission_prefill_failure_max_tokens
+                .is_none()
+        {
+            refused.push((
+                "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS=N",
                 "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
             ));
         }
@@ -1743,6 +1781,53 @@ mod tests {
                 !InvestigationEnv::from_env().chunk_scan_prefill,
                 "value {:?} must not enable chunk_scan_prefill",
                 bad
+            );
+        }
+    }
+
+    #[test]
+    fn qwen_post_admission_prefill_failure_requires_positive_value_and_unsafe_ack() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&[
+            "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS",
+            "HF2Q_UNSAFE_EXPERIMENTS",
+        ]);
+
+        assert_eq!(
+            InvestigationEnv::from_env().qwen_post_admission_prefill_failure_max_tokens,
+            None
+        );
+
+        guard.set(
+            "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS",
+            "39",
+        );
+        let refused = InvestigationEnv::from_env();
+        assert_eq!(
+            refused.qwen_post_admission_prefill_failure_max_tokens, None,
+            "a request-mutating test fault must be inert without explicit unsafe ack"
+        );
+        assert_eq!(
+            refused.raw.qwen_post_admission_prefill_failure_max_tokens,
+            Some(39),
+            "raw intent remains visible for the startup REFUSED banner"
+        );
+
+        guard.set("HF2Q_UNSAFE_EXPERIMENTS", "1");
+        assert_eq!(
+            InvestigationEnv::from_env().qwen_post_admission_prefill_failure_max_tokens,
+            Some(39)
+        );
+
+        for invalid in ["0", "not-a-number", "-1"] {
+            guard.set(
+                "HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS",
+                invalid,
+            );
+            assert_eq!(
+                InvestigationEnv::from_env().qwen_post_admission_prefill_failure_max_tokens,
+                None,
+                "invalid trigger {invalid:?} must fail closed"
             );
         }
     }

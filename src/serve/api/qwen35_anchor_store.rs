@@ -22,6 +22,7 @@ pub(crate) struct AnchorTelemetry {
     pub simultaneous_pending_capacity_slots: AtomicU64,
     pub partial_capacity_captures_total: AtomicU64,
     pub spec_boundary_restore_tokens_total: AtomicU64,
+    pub post_admission_prefill_failures_total: AtomicU64,
 }
 
 pub(crate) static TELEMETRY: AnchorTelemetry = AnchorTelemetry {
@@ -42,7 +43,51 @@ pub(crate) static TELEMETRY: AnchorTelemetry = AnchorTelemetry {
     simultaneous_pending_capacity_slots: AtomicU64::new(0),
     partial_capacity_captures_total: AtomicU64::new(0),
     spec_boundary_restore_tokens_total: AtomicU64::new(0),
+    post_admission_prefill_failures_total: AtomicU64::new(0),
 };
+
+/// One-shot acceptance fault for ADR-049's post-admission recovery gate.
+///
+/// The trigger is immutable for the worker lifetime. It can fire only after
+/// a matching request completed a non-empty GPU prefill slice, so equality
+/// hits and pre-admission validation failures cannot satisfy the gate by
+/// accident. Normal serving constructs this with `None` unless the centrally
+/// parsed, unsafe-acknowledged investigation variable is active.
+#[derive(Debug, Default)]
+pub(crate) struct PostAdmissionPrefillFailure {
+    trigger_max_tokens: Option<usize>,
+    fired: bool,
+}
+
+impl PostAdmissionPrefillFailure {
+    pub(crate) fn new(trigger_max_tokens: Option<usize>) -> Self {
+        Self {
+            trigger_max_tokens,
+            fired: false,
+        }
+    }
+
+    pub(crate) fn should_fail(
+        &mut self,
+        request_max_tokens: usize,
+        advanced_tokens: usize,
+    ) -> bool {
+        if self.fired || advanced_tokens == 0 {
+            return false;
+        }
+        if self.trigger_max_tokens != Some(request_max_tokens) {
+            return false;
+        }
+        self.fired = true;
+        true
+    }
+}
+
+pub(crate) fn record_post_admission_prefill_failure() {
+    TELEMETRY
+        .post_admission_prefill_failures_total
+        .fetch_add(1, Ordering::Relaxed);
+}
 
 pub(crate) fn record_configuration(configured_slots: usize, aggregate_budget_bytes: u64) {
     TELEMETRY
@@ -551,7 +596,7 @@ impl<A: AnchorEntry> AnchorStore<A> {
 mod tests {
     use super::{
         effective_committed_depth, simultaneous_pending_capacity_slots, AnchorEntry, AnchorStore,
-        StagePending,
+        PostAdmissionPrefillFailure, StagePending,
     };
 
     #[derive(Default)]
@@ -1004,5 +1049,29 @@ mod tests {
             }
         }
         assert_eq!(caught, 17, "every injected state mutation must fail closed");
+    }
+
+    #[test]
+    fn post_admission_prefill_fault_requires_a_real_matching_slice_and_fires_once() {
+        let mut fault = PostAdmissionPrefillFailure::new(Some(39));
+
+        assert!(!fault.should_fail(39, 0), "an equality hit did no GPU work");
+        assert!(
+            !fault.should_fail(38, 128),
+            "a different request must not consume the one-shot fault"
+        );
+        assert!(fault.should_fail(39, 128), "the matching GPU slice fires");
+        assert!(
+            !fault.should_fail(39, 128),
+            "the process must recover after exactly one injected request failure"
+        );
+    }
+
+    #[test]
+    fn disabled_post_admission_prefill_fault_cannot_change_serving() {
+        let mut fault = PostAdmissionPrefillFailure::new(None);
+        for max_tokens in [1, 39, usize::MAX] {
+            assert!(!fault.should_fail(max_tokens, 2_048));
+        }
     }
 }

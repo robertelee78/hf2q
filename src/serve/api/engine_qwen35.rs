@@ -3685,6 +3685,13 @@ impl Qwen35PrefillState {
         self.params.vision_fingerprint
     }
 
+    /// Immutable response budget used only to select the explicit ADR-049
+    /// post-admission failure acceptance request. Normal serving never arms
+    /// that one-shot worker fault.
+    pub(crate) fn requested_max_tokens(&self) -> usize {
+        self.params.max_tokens
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         prompt_tokens: Vec<u32>,

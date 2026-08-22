@@ -242,6 +242,7 @@ compatibility writers, and replay remain test-only or unavailable.
 | `HF2Q_F16_KV` | Known-worse KV cache representation; separate bug vs F32 path. |
 | `HF2Q_SKIP_TQ_ENCODE` | Bisection scaffolding; produces garbage output. |
 | `HF2Q_SKIP_TQ_SDPA` | Bisection scaffolding; produces garbage output. |
+| `HF2Q_TEST_QWEN_POST_ADMISSION_PREFILL_FAILURE_MAX_TOKENS` | Positive integer selecting one Qwen SlotAware request for the ADR-049 hardware gate. After that request completes a non-empty GPU prefill slice, a one-shot request failure is injected before scheduler publication so the real reset/AnchorStore invalidation lifecycle can be proven. Requires `HF2Q_UNSAFE_EXPERIMENTS=1`; never active in ordinary serving. |
 
 **Warn-on-activation, no ack (ineffective but safe):**
 
