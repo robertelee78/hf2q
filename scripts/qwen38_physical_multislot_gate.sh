@@ -12,6 +12,7 @@ set -euo pipefail
 BINARY_PATH=${BINARY_PATH:?BINARY_PATH is required}
 MODEL_PATH=${MODEL_PATH:?MODEL_PATH is required}
 MODEL_SHA256=${MODEL_SHA256:?MODEL_SHA256 is required}
+MODEL_FORMAT=${MODEL_FORMAT:?MODEL_FORMAT is required}
 OUT_DIR=${OUT_DIR:?OUT_DIR is required and must be fresh}
 PORT=${PORT:-18092}
 MAX_TOKENS=${MAX_TOKENS:-64}
@@ -23,6 +24,8 @@ DECODE_MV_EXT=${HF2Q_DECODE_MV_EXT:-1}
 readonly WIDTHS=(1 2 4 8 16)
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/qwen38_artifact_contract.sh
+source "$script_dir/qwen38_artifact_contract.sh"
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 # shellcheck source=scripts/qwen38_physical_multislot_contract.sh
@@ -97,6 +100,13 @@ binary_sha256=$(shasum -a 256 "$BINARY_PATH" | awk '{print $1}')
 binary_snapshot=$(hf2q_release_model_snapshot "$BINARY_PATH")
 model_bytes=$(stat -f '%z' "$MODEL_PATH" 2>/dev/null \
     || stat -c '%s' "$MODEL_PATH")
+artifact_record=$(qwen38_artifact_record "$MODEL_FORMAT")
+IFS=$'\t' read -r qualified_model_format qualified_model_file \
+    _qualified_model_bytes _qualified_model_sha256 qualified_model_file_type \
+    <<<"$artifact_record"
+[[ "$qualified_model_format" == "$MODEL_FORMAT" ]]
+qwen38_validate_artifact_identity "$MODEL_FORMAT" "$MODEL_SHA256" \
+    "$model_bytes" "$qualified_model_file_type"
 server_pid=''
 
 monotonic_seconds() {
@@ -215,7 +225,7 @@ run_width() {
     local loaded_model_id wave_start wave_end wave_wall
     local request_start_file="$width_dir/start"
     local failed=0
-    local index lane response request curl_metrics output
+    local index lane response request curl_metrics output scalar_response
     local pid
     local clients_json total_completion_tokens max_decode_seconds
     local summed_user_decode_tps aggregate_decode_tps aggregate_wave_tps
@@ -223,7 +233,8 @@ run_width() {
     local -a request_pids=()
     local -a responses=()
 
-    mkdir -p "$width_dir/requests" "$width_dir/responses"
+    mkdir -p "$width_dir/requests" "$width_dir/responses" \
+        "$width_dir/scalar-responses"
     if [[ -n "$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)" ]]; then
         echo "127.0.0.1:$PORT remained occupied before width $width" >&2
         return 1
@@ -299,7 +310,6 @@ run_width() {
         "$BINARY_PATH" "$MODEL_PATH" "$width"
     curl --fail --silent --show-error --max-time 10 \
         "http://127.0.0.1:$PORT/metrics" >"$width_dir/metrics-after.txt"
-    stop_server
     (( failed == 0 )) || {
         echo "one or more width-$width requests failed" >&2
         sed -n '1,260p' "$log_path" >&2
@@ -333,6 +343,28 @@ run_width() {
     qwen38_physical_validate_metrics \
         "$width" "$width_dir/metrics-before.txt" "$width_dir/metrics-after.txt"
 
+    # Replay each exact request alone after the concurrent wave. Width
+    # telemetry plus non-empty JSON does not prove slot isolation; exact
+    # greedy semantics against scalar execution does.
+    for ((index = 1; index <= width; index++)); do
+        request="$width_dir/requests/lane-$index.json"
+        response="$width_dir/responses/lane-$index.json"
+        scalar_response="$width_dir/scalar-responses/lane-$index.json"
+        curl --fail --silent --show-error \
+            --max-time "$REQUEST_TIMEOUT_SECONDS" \
+            --header 'Content-Type: application/json' \
+            --data-binary "@$request" \
+            "http://127.0.0.1:$PORT/v1/chat/completions" \
+            >"$scalar_response"
+        qwen38_physical_validate_response "$scalar_response" "$loaded_model_id"
+        qwen38_physical_validate_scalar_parity "$response" "$scalar_response"
+    done
+    qwen36_bind_server_process \
+        "http://127.0.0.1:$PORT" "$server_pid" \
+        "$BINARY_PATH" "$MODEL_PATH" "$width"
+    stop_server
+    qwen36_reject_fatal_log "$log_path"
+
     clients_json=$(for ((index = 1; index <= width; index++)); do
         response="$width_dir/responses/lane-$index.json"
         curl_metrics="$width_dir/responses/lane-$index.curl"
@@ -340,6 +372,7 @@ run_width() {
         jq -n \
             --argjson lane "$index" \
             --arg response_path "responses/lane-$index.json" \
+            --arg scalar_response_path "scalar-responses/lane-$index.json" \
             --arg output_path "responses/lane-$index.txt" \
             --arg output_sha256 "$(shasum -a 256 "$output" | awk '{print $1}')" \
             --argjson wall_seconds "$(sed -n 's/^total_seconds=//p' "$curl_metrics")" \
@@ -349,7 +382,9 @@ run_width() {
             --argjson decode_seconds "$(jq -er .x_hf2q_timing.decode_time_secs "$response")" \
             --argjson decode_tokens_per_second "$(jq -er .x_hf2q_timing.decode_tokens_per_sec "$response")" \
             --argjson time_to_first_token_ms "$(jq -er .x_hf2q_timing.time_to_first_token_ms "$response")" \
-            '{lane:$lane,response_path:$response_path,output_path:$output_path,
+            '{lane:$lane,response_path:$response_path,
+              scalar_response_path:$scalar_response_path,scalar_parity:true,
+              output_path:$output_path,
               output_sha256:$output_sha256,wall_seconds:$wall_seconds,
               prompt_tokens:$prompt_tokens,completion_tokens:$completion_tokens,
               cached_tokens:$cached_tokens,decode_seconds:$decode_seconds,
@@ -411,7 +446,8 @@ run_width() {
         --argjson metrics "$metrics_json" '{
           schema:1,verdict:"pass",width:$width,model_id:$model_id,
           request:{temperature:0,thinking:false,speculation:"off",
-            stream:false,max_tokens:$max_tokens,distinct_equal_token_prompts:true},
+            stream:false,max_tokens:$max_tokens,distinct_equal_token_prompts:true,
+            exact_scalar_replay_per_lane:true},
           wave:{wall_seconds:$wave_wall_seconds,
             total_completion_tokens:$total_completion_tokens,
             aggregate_decode_tokens_per_second:$aggregate_decode_tokens_per_second,
@@ -434,6 +470,8 @@ width_summaries=$(jq -s . "${summary_paths[@]}")
 jq -e '[.[].width] | sort == [1,2,4,8,16]' <<<"$width_summaries" >/dev/null
 hf2q_release_verify_model \
     "$MODEL_PATH" "$MODEL_SHA256" "$model_verification_receipt"
+qwen38_validate_artifact_identity "$MODEL_FORMAT" "$MODEL_SHA256" \
+    "$model_bytes" "$qualified_model_file_type"
 [[ "$(hf2q_release_model_snapshot "$BINARY_PATH")" == "$binary_snapshot" ]] || {
     echo "hf2q binary changed before the physical-width summary" >&2
     exit 1
@@ -442,10 +480,15 @@ jq -n \
     --arg binary_path "$BINARY_PATH" \
     --arg binary_sha256 "$binary_sha256" \
     --arg model_path "$MODEL_PATH" \
+    --arg model_format "$MODEL_FORMAT" \
+    --arg model_repository "$QWEN38_QUALIFIED_MODEL_REPOSITORY" \
+    --arg model_revision "$QWEN38_QUALIFIED_MODEL_REVISION" \
+    --arg model_file "$qualified_model_file" \
     --arg model_sha256 "$MODEL_SHA256" \
     --arg model_file_snapshot "$model_file_snapshot" \
     --arg model_verification "$model_verification_mode" \
     --argjson model_bytes "$model_bytes" \
+    --argjson model_file_type "$qualified_model_file_type" \
     --argjson max_tokens "$MAX_TOKENS" \
     --argjson kv_cache_budget_bytes "$KV_CACHE_BUDGET_BYTES" \
     --argjson decode_mvn "$DECODE_MVN" \
@@ -453,14 +496,33 @@ jq -n \
     --argjson widths "$width_summaries" '{
       schema:1,verdict:"pass",gate:"qwen38-physical-multislot",
       binary:{path:$binary_path,sha256:$binary_sha256},
-      model:{path:$model_path,sha256:$model_sha256,bytes:$model_bytes,
+      model:{path:$model_path,format:$model_format,
+        repository:$model_repository,revision:$model_revision,file:$model_file,
+        gguf_file_type:$model_file_type,sha256:$model_sha256,bytes:$model_bytes,
         file_snapshot:$model_file_snapshot,verification:$model_verification},
       workload:{widths:[1,2,4,8,16],temperature:0,thinking:false,
         speculation:"off",stream:false,max_tokens:$max_tokens,
+        exact_scalar_replay_per_lane:true,
         server_restart_per_width:true,
         kv_cache_budget_bytes:$kv_cache_budget_bytes,
         routing:{decode_mvn:$decode_mvn,decode_mv_ext:$decode_mv_ext}},
       results:$widths
     }' >"$OUT_DIR/summary.json.tmp"
+jq -e '
+  .schema == 1 and .verdict == "pass"
+  and .workload.widths == [1,2,4,8,16]
+  and .workload.exact_scalar_replay_per_lane == true
+  and ([.results[].width] == [1,2,4,8,16])
+  and all(.results[];
+    .verdict == "pass"
+    and .request.exact_scalar_replay_per_lane == true
+    and (.clients | length) == .width
+    and all(.clients[]; .scalar_parity == true))
+  and ((.model.format == "BF16" and .model.gguf_file_type == 32)
+    or (.model.format == "Q4_K_M" and .model.gguf_file_type == 15)
+    or (.model.format == "Q5_K_M" and .model.gguf_file_type == 17)
+    or (.model.format == "Q6_K" and .model.gguf_file_type == 18)
+    or (.model.format == "Q8_0" and .model.gguf_file_type == 7))
+' "$OUT_DIR/summary.json.tmp" >/dev/null
 mv "$OUT_DIR/summary.json.tmp" "$OUT_DIR/summary.json"
 jq . "$OUT_DIR/summary.json"

@@ -80,6 +80,31 @@ qwen38_physical_validate_equal_prompt_tokens() {
     }
 }
 
+qwen38_physical_validate_scalar_parity() {
+    local concurrent_path=$1
+    local scalar_path=$2
+    local concurrent_semantics scalar_semantics
+
+    concurrent_semantics=$(jq -Sce '{
+      message:.choices[0].message,
+      finish_reason:.choices[0].finish_reason,
+      prompt_tokens:.usage.prompt_tokens,
+      completion_tokens:.usage.completion_tokens
+    }' "$concurrent_path") || return 1
+    scalar_semantics=$(jq -Sce '{
+      message:.choices[0].message,
+      finish_reason:.choices[0].finish_reason,
+      prompt_tokens:.usage.prompt_tokens,
+      completion_tokens:.usage.completion_tokens
+    }' "$scalar_path") || return 1
+    [[ "$concurrent_semantics" == "$scalar_semantics" ]] || {
+        echo "physical-width response diverged from its scalar replay" >&2
+        echo "concurrent=$concurrent_semantics" >&2
+        echo "scalar=$scalar_semantics" >&2
+        return 1
+    }
+}
+
 qwen38_physical_validate_metrics() {
     local width=$1
     local before_path=$2
