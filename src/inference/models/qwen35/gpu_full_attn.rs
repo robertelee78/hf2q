@@ -8067,6 +8067,341 @@ pub fn apply_gated_attn_layer_decode_into(
     Ok(out)
 }
 
+/// Decode one independent token for each physical cache slot in a single
+/// `[N, hidden]` full-attention layer invocation.
+///
+/// This is intentionally narrower than sequence prefill: every input row is a
+/// different request, selected by `slot_ids`. The canonical TQ cache kernels
+/// consume the complete multi-sequence allocation plus explicit row-to-slot
+/// and row-to-position maps, so no row can observe another request's KV.
+/// Cursor lengths must currently be equal; this keeps every row in the same
+/// flash-attention execution bucket. Callers must fall back to scalar forwards
+/// when that precondition is not met.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_gated_attn_layer_decode_batched_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    positions: &MlxBuffer,
+    weights_gpu: &FullAttnWeightsGpu,
+    slot: &mut FullAttnKvSlot,
+    max_seq_len: u32,
+    slot_ids: &[SlotId],
+    hidden_size: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    freq_base: f32,
+    mrope_section: [u32; 4],
+    rms_norm_eps: f32,
+) -> Result<MlxBuffer> {
+    let n = u32::try_from(slot_ids.len()).context("Qwen batched full-attention width overflow")?;
+    ensure!(
+        n >= 2,
+        "Qwen batched full-attention requires at least two slots"
+    );
+    ensure!(
+        head_dim == 256 || head_dim == 512,
+        "Qwen batched full-attention requires TQ-supported head_dim, got {head_dim}"
+    );
+    let tq = slot
+        .tq
+        .as_ref()
+        .ok_or_else(|| anyhow!("Qwen batched full-attention requires the canonical TQ cache"))?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut current_len = None;
+    for slot_id in slot_ids {
+        ensure!(
+            seen.insert(slot_id.0),
+            "Qwen batched full-attention received duplicate slot {}",
+            slot_id.0
+        );
+        let cursor = *slot.current_len.get(slot_id.0 as usize).ok_or_else(|| {
+            anyhow!(
+                "Qwen batched full-attention slot {} outside cursor axis {}",
+                slot_id.0,
+                slot.current_len.len()
+            )
+        })?;
+        ensure!(
+            cursor < max_seq_len,
+            "Qwen batched full-attention slot {} cursor {} reached max_seq_len {}",
+            slot_id.0,
+            cursor,
+            max_seq_len
+        );
+        if let Some(expected) = current_len {
+            ensure!(
+                cursor == expected,
+                "Qwen batched full-attention requires equal cursors; slot {} has {}, expected {}",
+                slot_id.0,
+                cursor,
+                expected
+            );
+        } else {
+            current_len = Some(cursor);
+        }
+    }
+    let current_len = current_len.expect("non-empty slot_ids checked above");
+
+    let q_total = n_heads * head_dim;
+    let kv_total = n_kv_heads * head_dim;
+
+    let x_norm = apply_pre_attn_rms_norm(
+        enc,
+        registry,
+        device,
+        x,
+        weights_gpu,
+        n,
+        hidden_size,
+        rms_norm_eps,
+    )?;
+    enc.memory_barrier();
+    let (q_flat, gate_flat) = apply_q_gate_projection_f32(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.q_gate,
+        n,
+        n_heads,
+        head_dim,
+        hidden_size,
+    )?;
+    let k_flat = apply_linear_projection_f32_pooled_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.wk,
+        weights_gpu.wk_ggml_type,
+        n,
+        hidden_size,
+        kv_total,
+    )?;
+    let v_flat = apply_linear_projection_f32_pooled_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights_gpu.wv,
+        weights_gpu.wv_ggml_type,
+        n,
+        hidden_size,
+        kv_total,
+    )?;
+    enc.memory_barrier();
+    let q_normed = apply_q_or_k_per_head_rms_norm(
+        enc,
+        registry,
+        device,
+        &q_flat,
+        &weights_gpu.attn_q_norm,
+        n,
+        n_heads,
+        head_dim,
+        rms_norm_eps,
+    )?;
+    let k_normed = apply_q_or_k_per_head_rms_norm(
+        enc,
+        registry,
+        device,
+        &k_flat,
+        &weights_gpu.attn_k_norm,
+        n,
+        n_kv_heads,
+        head_dim,
+        rms_norm_eps,
+    )?;
+    enc.memory_barrier();
+    let q_rope = apply_imrope(
+        enc,
+        registry,
+        device,
+        &q_normed,
+        positions,
+        n,
+        n_heads,
+        head_dim,
+        rotary_dim,
+        freq_base,
+        mrope_section,
+    )?;
+    let k_rope = apply_imrope(
+        enc,
+        registry,
+        device,
+        &k_normed,
+        positions,
+        n,
+        n_kv_heads,
+        head_dim,
+        rotary_dim,
+        freq_base,
+        mrope_section,
+    )?;
+    enc.memory_barrier();
+
+    let mut slot_id_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        slot_ids.len() * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![slot_ids.len()],
+    )
+    .map_err(|error| anyhow!("Qwen batched full-attention slot map allocation: {error}"))?;
+    for (dst, slot_id) in slot_id_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched full-attention slot map: {error}"))?
+        .iter_mut()
+        .zip(slot_ids)
+    {
+        *dst = slot_id.0;
+    }
+    let mut position_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        slot_ids.len() * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![slot_ids.len()],
+    )
+    .map_err(|error| anyhow!("Qwen batched full-attention position map allocation: {error}"))?;
+    position_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched full-attention position map: {error}"))?
+        .fill(current_len);
+
+    let codebook_bits = crate::debug::INVESTIGATION_ENV.tq_codebook_bits;
+    let codebook_bits = if matches!(codebook_bits, 5 | 6 | 8) {
+        codebook_bits
+    } else {
+        8
+    };
+    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
+        enc,
+        registry,
+        device.metal_device(),
+        &k_rope,
+        &tq.k_packed,
+        &tq.k_norms,
+        &slot_id_buf,
+        &position_buf,
+        n,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
+        false,
+        1.0,
+        codebook_bits,
+    )
+    .map_err(|error| anyhow!("Qwen batched TQ K encode: {error}"))?;
+    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
+        enc,
+        registry,
+        device.metal_device(),
+        &v_flat,
+        &tq.v_packed,
+        &tq.v_norms,
+        &slot_id_buf,
+        &position_buf,
+        n,
+        n_kv_heads,
+        head_dim,
+        max_seq_len,
+        false,
+        1.0,
+        codebook_bits,
+    )
+    .map_err(|error| anyhow!("Qwen batched TQ V encode: {error}"))?;
+    mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
+        enc,
+        registry,
+        device.metal_device(),
+        &q_rope,
+        n * n_heads,
+        head_dim,
+    )
+    .context("Qwen batched TQ query pre-rotation")?;
+    enc.memory_barrier();
+
+    let output_elems = (n as usize) * (n_heads as usize) * (head_dim as usize);
+    let attn_out = super::decode_pool::pooled_alloc_buffer(
+        device,
+        output_elems * std::mem::size_of::<f32>(),
+        DType::F32,
+        vec![n as usize, n_heads as usize, head_dim as usize],
+    )
+    .map_err(|error| anyhow!("Qwen batched attention output allocation: {error}"))?;
+    let tmp_bytes = mlx_native::ops::flash_attn_vec_tq_hb::tmp_buffer_bytes(n * n_heads, head_dim);
+    let tmp = super::decode_pool::pooled_alloc_buffer(
+        device,
+        tmp_bytes,
+        DType::F32,
+        vec![tmp_bytes / std::mem::size_of::<f32>()],
+    )
+    .map_err(|error| anyhow!("Qwen batched attention scratch allocation: {error}"))?;
+    let kv_seq_len = current_len + 1;
+    let params = mlx_native::ops::flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
+        num_heads: n_heads,
+        num_kv_heads: n_kv_heads,
+        head_dim,
+        kv_seq_len,
+        kv_capacity: max_seq_len,
+        scale: 1.0 / (head_dim as f32).sqrt(),
+        mask_type: 0,
+        sliding_window: 0,
+        softcap: 0.0,
+        ring_start: 0,
+        scale_factor_d512: 1.0,
+        codebook_bits,
+        fuse_fwht_pre: 0,
+        nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(kv_seq_len),
+    };
+    mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_batched(
+        enc,
+        registry,
+        device,
+        n,
+        &q_rope,
+        &tq.k_packed,
+        &tq.k_norms,
+        &tq.v_packed,
+        &tq.v_norms,
+        &attn_out,
+        &tmp,
+        &slot_id_buf,
+        &position_buf,
+        &params,
+    )
+    .map_err(|error| anyhow!("Qwen batched TQ attention: {error}"))?;
+    // The batched TQ dispatcher is the fused-reduce-and-undo entry point:
+    // its output is already back in the model domain for both NWG=1 and
+    // NWG>1. A second FWHT undo here would rotate the result again and make
+    // physical width-N diverge from N scalar attention calls.
+    enc.memory_barrier();
+
+    let gated =
+        apply_sigmoid_gate_multiply(enc, registry, device, &attn_out, &gate_flat, n * q_total)?;
+    enc.memory_barrier();
+    let out = apply_linear_projection_f32_pooled_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &gated,
+        &weights_gpu.wo,
+        weights_gpu.wo_ggml_type,
+        n,
+        q_total,
+        hidden_size,
+    )?;
+
+    for slot_id in slot_ids {
+        slot.current_len[slot_id.0 as usize] = kv_seq_len;
+    }
+    Ok(out)
+}
+
 // ================================================================
 // Tests
 // ================================================================
@@ -8237,6 +8572,27 @@ mod tests {
                 "qL={seq_len}: attention result must not depend on persistent cache representation"
             );
         }
+    }
+
+    #[test]
+    fn physical_batch_uses_the_batched_tq_dispatchers_fused_undo_contract() {
+        let source = include_str!("gpu_full_attn.rs");
+        let start = source
+            .find("pub fn apply_gated_attn_layer_decode_batched_into(")
+            .expect("physical-batch full-attention function");
+        let end = start
+            + source[start..]
+                .find(
+                    "// ================================================================\n// Tests",
+                )
+                .expect("tests follow physical-batch full-attention function");
+        let physical = &source[start..end];
+        assert!(physical.contains("dispatch_hadamard_quantize_kv_hb_batched("));
+        assert!(physical.contains("flash_attn_vec_tq_hb_batched("));
+        assert!(
+            !physical.contains("dispatch_fwht_sign_undo_f32("),
+            "batched TQ attention already returns model-domain output"
+        );
     }
 
     #[test]

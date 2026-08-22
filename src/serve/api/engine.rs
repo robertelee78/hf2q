@@ -20433,6 +20433,11 @@ fn embed_qwen35_inline(
     None
 }
 
+#[inline]
+fn qwen35_physical_decode_width_supported(width: usize) -> bool {
+    matches!(width, 2 | 4 | 8 | 16)
+}
+
 fn decode_batch_qwen35(
     guard: &mut Qwen35KvGuard<'_>,
     scheduler: &mut InflightBatchedScheduler,
@@ -20446,6 +20451,117 @@ fn decode_batch_qwen35(
     anchor_aggregate_budget_bytes: u64,
     supervisor: &EngineSupervisor,
 ) -> Option<Qwen35FatalFailure> {
+    crate::inference::models::qwen35::decode_observation::observe_scheduler_step(handles.len());
+    let mut physical_ticks: Vec<Option<super::engine_qwen35::Qwen35TickOutcome>> =
+        (0..slots.len()).map(|_| None).collect();
+    let physical_width = qwen35_physical_decode_width_supported(handles.len());
+    let ordinary_cohort = physical_width
+        && handles.iter().all(|handle| {
+            slots
+                .get(handle.slot_id.0 as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|(work, reply, installed)| {
+                    installed == handle
+                        && !reply.client_closed()
+                        && matches!(
+                            work,
+                            Qwen35SlotWork::Decode(state)
+                                if state.ordinary_physical_batch_ready()
+                        )
+                })
+        });
+    if ordinary_cohort {
+        let slot_ids: Vec<SlotId> = handles.iter().map(|handle| handle.slot_id).collect();
+        let batch_admitted = guard.model.model.can_forward_gpu_greedy_multi_slot(
+            guard.kv.as_ref().expect("kv Some during Qwen decode"),
+            &slot_ids,
+        );
+        if batch_admitted {
+            let mut inputs = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let state = match slots[handle.slot_id.0 as usize]
+                    .as_mut()
+                    .map(|(work, _, _)| work)
+                {
+                    Some(Qwen35SlotWork::Decode(state)) => state,
+                    _ => unreachable!("ordinary cohort was validated before preparation"),
+                };
+                inputs.push(state.prepare_ordinary_physical_batch());
+            }
+            let tokens: Vec<u32> = inputs.iter().map(|input| input.token).collect();
+            let mut positions = Vec::with_capacity(4 * inputs.len());
+            for axis in 0..4 {
+                positions.extend(inputs.iter().map(|input| input.positions[axis]));
+            }
+            let command_buffers_created_before = mlx_native::cmd_buf_count();
+            let command_buffer_submissions_before = mlx_native::commit_count();
+            let target_started = std::time::Instant::now();
+            let batch_result = (|| -> Result<Vec<u32>> {
+                let lease = supervisor.arm(
+                    "Qwen35 physical ordinary decode",
+                    super::engine_qwen35::QWEN35_WORKER_TRANSACTION_TIMEOUT,
+                )?;
+                let forward = guard.model.model.forward_gpu_greedy_multi_slot(
+                    &tokens,
+                    &positions,
+                    guard.kv.as_mut().expect("kv Some during Qwen decode"),
+                    &slot_ids,
+                );
+                lease.finish()?;
+                forward.context("Qwen35Model::forward_gpu_greedy_multi_slot")
+            })();
+            let predicted = match batch_result {
+                Ok(predicted) => predicted,
+                Err(error) => {
+                    return Some(Qwen35FatalFailure {
+                        handle: None,
+                        reply: Qwen35FatalReply::None,
+                        error,
+                        kind: Qwen35WorkerFatalKind::Gpu,
+                    });
+                }
+            };
+            if predicted.len() != handles.len() {
+                return Some(Qwen35FatalFailure {
+                    handle: None,
+                    reply: Qwen35FatalReply::None,
+                    error: anyhow::anyhow!(
+                        "Qwen physical target returned {} rows for {} slots",
+                        predicted.len(),
+                        handles.len()
+                    ),
+                    kind: Qwen35WorkerFatalKind::Invariant,
+                });
+            }
+            let target_elapsed = target_started.elapsed();
+            crate::inference::models::qwen35::decode_observation::observe_target_forward(
+                handles.len(),
+                handles.len(),
+                mlx_native::cmd_buf_count().saturating_sub(command_buffers_created_before),
+                mlx_native::commit_count().saturating_sub(command_buffer_submissions_before),
+            );
+            for ((predicted, handle), input) in predicted
+                .into_iter()
+                .zip(handles.iter())
+                .zip(inputs.into_iter())
+            {
+                let state = match slots[handle.slot_id.0 as usize]
+                    .as_mut()
+                    .map(|(work, _, _)| work)
+                {
+                    Some(Qwen35SlotWork::Decode(state)) => state,
+                    _ => unreachable!("ordinary cohort state disappeared after target forward"),
+                };
+                physical_ticks[handle.slot_id.0 as usize] =
+                    Some(state.finish_ordinary_physical_batch(
+                        guard.model,
+                        predicted,
+                        input,
+                        target_elapsed,
+                    ));
+            }
+        }
+    }
     for &handle in handles {
         let slot_idx = handle.slot_id.0 as usize;
         let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
@@ -20516,11 +20632,16 @@ fn decode_batch_qwen35(
             continue;
         }
 
-        let qtick = match state.decode_tick(
-            guard.model,
-            guard.kv.as_mut().expect("kv Some during loop"),
-            supervisor,
-        ) {
+        let qtick_result = if let Some(tick) = physical_ticks[slot_idx].take() {
+            Ok(tick)
+        } else {
+            state.decode_tick(
+                guard.model,
+                guard.kv.as_mut().expect("kv Some during loop"),
+                supervisor,
+            )
+        };
+        let qtick = match qtick_result {
             Ok(t) => t,
             Err(e) => {
                 if !supervisor.is_healthy() {
@@ -57935,7 +58056,10 @@ mod qwen38_slot_decode_telemetry_tests {
 
     use tracing_subscriber::prelude::*;
 
-    use super::{log_qwen35_slot_decode_complete, GenerationResult, SlotReply};
+    use super::{
+        log_qwen35_slot_decode_complete, qwen35_physical_decode_width_supported, GenerationResult,
+        SlotReply,
+    };
 
     #[derive(Clone, Default)]
     struct RecordingLayer {
@@ -58097,5 +58221,42 @@ mod qwen38_slot_decode_telemetry_tests {
                 .expect("worker_run follows decode_batch_qwen35");
         let decode = &src[decode_start..decode_end];
         assert!(decode.contains(decode_call));
+    }
+
+    #[test]
+    fn qwen38_physical_decode_widths_are_explicit_and_scalar_stays_scalar() {
+        for width in [2, 4, 8, 16] {
+            assert!(qwen35_physical_decode_width_supported(width));
+        }
+        for width in [0, 1, 3, 5, 15, 17] {
+            assert!(!qwen35_physical_decode_width_supported(width));
+        }
+    }
+
+    #[test]
+    fn qwen38_scheduler_composes_the_physical_body_and_head_path() {
+        let src = include_str!("engine.rs");
+        let decode_start = src
+            .find("fn decode_batch_qwen35(")
+            .expect("decode_batch_qwen35");
+        let decode_end = decode_start
+            + src[decode_start..]
+                .find("\nfn worker_run(")
+                .expect("worker_run follows decode_batch_qwen35");
+        let decode = &src[decode_start..decode_end];
+        for required in [
+            "ordinary_physical_batch_ready()",
+            "can_forward_gpu_greedy_multi_slot(",
+            "forward_gpu_greedy_multi_slot(",
+            "finish_ordinary_physical_batch(",
+            "observe_target_forward(\n                handles.len(),\n                handles.len(),",
+            "let command_buffer_submissions_before = mlx_native::commit_count();",
+            "mlx_native::commit_count().saturating_sub(command_buffer_submissions_before),",
+        ] {
+            assert!(
+                decode.contains(required),
+                "Qwen physical scheduler composition lost {required:?}"
+            );
+        }
     }
 }
