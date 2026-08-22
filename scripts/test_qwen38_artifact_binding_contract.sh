@@ -75,7 +75,7 @@ for needle in \
   'readonly MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT=5' \
   'readonly MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT=10' \
   "readonly QUALIFIED_MODEL_SHA256='4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e'" \
-  'readonly THERMAL_SETTLE_SECONDS=30' \
+  'readonly THERMAL_SETTLE_SECONDS=120' \
   'verify_executable_identity hf2q' \
   'verify_executable_identity reference' \
   'for reference_trial in 2 3' \

@@ -37,7 +37,7 @@ readonly QUALIFIED_MODEL_REPOSITORY='jenerallee78/Qwen3.8-27B-Abliterated-SFT'
 readonly QUALIFIED_MODEL_REVISION='0a72776892f98db49381fdf69f4b9982222ec9dc'
 readonly QUALIFIED_MODEL_FILE='gguf/qwen38-abliterated-sft-q5_k_m.gguf'
 readonly QUALIFIED_MODEL_SHA256='4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e'
-readonly THERMAL_SETTLE_SECONDS=30
+readonly THERMAL_SETTLE_SECONDS=120
 readonly THERMAL_SETTLE_TIMEOUT_SECONDS=900
 readonly THERMAL_SAMPLE_SECONDS=2
 readonly MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT=5
@@ -377,7 +377,8 @@ launch_settings_sha=''
 write_launch_settings() {
     jq -n --arg model_id "$MODEL_ID" --argjson port "$PORT" \
       --argjson max_tokens "$MAX_TOKENS" \
-      --argjson ttft_max_tokens "$TTFT_MAX_TOKENS" '{
+      --argjson ttft_max_tokens "$TTFT_MAX_TOKENS" \
+      --argjson thermal_settle_seconds "$THERMAL_SETTLE_SECONDS" '{
       schema:1,
       common:{model_id:$model_id,port:$port,temperature:0,
         repetition_penalty:1.05,thinking:false,seed:null,
@@ -395,7 +396,7 @@ write_launch_settings() {
         draft_backend_sampling:true},
       host_calibration:{power:"ac",energy_mode:"automatic-or-high",
         thermal:"nominal",sample_seconds:2,
-        settle_seconds:30,
+        settle_seconds:$thermal_settle_seconds,
         forbidden_processes:["hf2q","llama-server","llama-cli","llama-bench",
           "cargo","rustc","ollama","mlx-lm","mlx_lm","swift-frontend",
           "python model-generation/inference workloads"]}
@@ -1294,6 +1295,7 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --argjson hardware_memory_bytes "$hardware_memory_bytes" \
   --argjson maximum_group_spread "$MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT" \
   --argjson maximum_case_spread "$MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT" \
+  --argjson thermal_settle_seconds "$THERMAL_SETTLE_SECONDS" \
   --argjson runtime_diagnostics "$runtime_diagnostics" \
   --argjson ttft_diagnostics "$ttft_diagnostics" \
   --argjson warmup_diagnostics "$warmup_diagnostics" \
@@ -1363,7 +1365,8 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
     stability:$stability[0],
     calibration:{required_state:"nominal",required_power:"ac",
       required_energy_mode:"automatic-or-high",
-      required_process_state:"quiet",settle_seconds:30,sample_seconds:2,
+      required_process_state:"quiet",settle_seconds:$thermal_settle_seconds,
+      sample_seconds:2,
       trial_logs:16,manifest_sha256:$calibration_manifest_sha},
     evidence:{script_sha256:$script_sha,contract_sha256:$contract_sha,
       request_manifest_sha256:$request_manifest_sha,
