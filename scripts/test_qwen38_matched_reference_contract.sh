@@ -165,6 +165,18 @@ printf '%s\n' $'100\tac\tquiet\tmeasurement-start' \
 expect_failure host-sampling-gap matched_validate_host_observation_log \
   "$fixture_dir/host-gap.tsv" 2 4 3
 
+# The production host-contention parser must execute under the platform awk,
+# exclude the current server PID, and distinguish Python model work from an
+# unrelated Python utility. This catches syntax that GNU awk accepts but the
+# macOS implementation rejects before a timed trial can start.
+scripted_offenders=$(printf '%s\n' \
+  '101 /usr/bin/python3 teacher_model_gen.py' \
+  '202 /usr/bin/python3 calendar_export.py' \
+  '303 /opt/venv/bin/python inference.py' \
+  | matched_find_scripted_model_work 303)
+[[ "$scripted_offenders" == '101:python-model-work' ]] \
+  || fail "portable Python model-work matcher returned: $scripted_offenders"
+
 # A seal-publication failure must not expose summary.json. A successful call
 # publishes a self-consistent result manifest and the passing summary last.
 prepare_seal_fixture() {
@@ -214,6 +226,7 @@ for call in \
   'matched_validate_hf2q_telemetry "$response"' \
   'matched_validate_reference_telemetry "$response"' \
   'matched_reference_speculation_totals "$rows_file"' \
+  'matched_find_scripted_model_work "$allowed_pid"' \
   'matched_validate_host_observation_log ' \
   'matched_publish_result '; do
     grep -Fq "$call" "$runner" \

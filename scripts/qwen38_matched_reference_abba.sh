@@ -492,18 +492,8 @@ require_no_foreign_heavy_work() {
         }
       }
     ')
-    scripted_offenders=$(/bin/ps -axo pid=,command= | awk -v allowed="$allowed_pid" '
-      {
-        pid = $1
-        $1 = ""
-        sub(/^[[:space:]]+/, "", $0)
-        command = tolower($0)
-        if (pid != allowed && command ~ /(^|\/)python(3([.][0-9]+)?)?([[:space:]]|$)/
-          && command ~ /(mlx|torch|transformers|teacher|model[-_ ]?gen|inference|vllm)/) {
-          print pid ":python-model-work"
-        }
-      }
-    ')
+    scripted_offenders=$(/bin/ps -axo pid=,command= \
+      | matched_find_scripted_model_work "$allowed_pid")
     if [[ -n "$scripted_offenders" ]]; then
         offenders=${offenders:+$offenders$'\n'}$scripted_offenders
     fi

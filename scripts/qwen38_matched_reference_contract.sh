@@ -178,6 +178,25 @@ matched_validate_host_observation_log() {
     fi
 }
 
+# Read `ps -axo pid=,command=` rows from stdin and report Python processes
+# whose command line identifies model work. Keep this parser in the sourced
+# contract so the macOS awk implementation used by production is exercised by
+# the hosted-safe behavioral test as well.
+matched_find_scripted_model_work() {
+    local allowed_pid=$1
+    awk -v allowed="$allowed_pid" '
+      {
+        pid = $1
+        $1 = ""
+        sub(/^[[:space:]]+/, "", $0)
+        command = tolower($0)
+        if (pid != allowed && command ~ /(^|\/)python(3([.][0-9]+)?)?([[:space:]]|$)/ && command ~ /(mlx|torch|transformers|teacher|model[-_ ]?gen|inference|vllm)/) {
+          print pid ":python-model-work"
+        }
+      }
+    '
+}
+
 matched_validate_calibration_alignment() {
     local thermal_log=$1
     local host_log=$2
