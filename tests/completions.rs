@@ -283,7 +283,7 @@ fn dynamic_protocol_is_public_semantic_and_side_effect_free() {
 }
 
 #[test]
-fn serve_model_completion_prefers_managed_models_and_keeps_explicit_paths() {
+fn model_completion_covers_every_local_gguf_surface_and_keeps_explicit_paths() {
     let home = IsolatedHome::new();
     let models = home.path().join(".local/share/hf2q/models");
     let qwen36 = models.join("qwen3.6");
@@ -296,18 +296,66 @@ fn serve_model_completion_prefers_managed_models_and_keeps_explicit_paths() {
     fs::write(&decoder, b"decoder").unwrap();
     fs::write(&projector, b"projector").unwrap();
 
-    let directories = dynamic(&home, "zsh", 3, &["hf2q", "serve", "--model", ""]);
-    let directory_values = directories
-        .lines()
-        .map(dynamic_candidate_name)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        directory_values,
-        [
-            format!("{}/", qwen36.display()),
-            format!("{}/", qwen38.display()),
-        ],
-        "{directories}"
+    let expected_directories = [
+        format!("{}/", qwen36.display()),
+        format!("{}/", qwen38.display()),
+    ];
+    let decoder_surfaces: &[(&str, usize, &[&str])] = &[
+        ("chat --model", 3, &["hf2q", "chat", "--model", ""]),
+        ("generate --model", 3, &["hf2q", "generate", "--model", ""]),
+        ("serve --model", 3, &["hf2q", "serve", "--model", ""]),
+        (
+            "serve --embedding-model",
+            3,
+            &["hf2q", "serve", "--embedding-model", ""],
+        ),
+        (
+            "parity check --model",
+            4,
+            &["hf2q", "parity", "check", "--model", ""],
+        ),
+        (
+            "parity capture --model",
+            4,
+            &["hf2q", "parity", "capture", "--model", ""],
+        ),
+    ];
+    for (surface, index, words) in decoder_surfaces {
+        let directories = dynamic(&home, "zsh", *index, words);
+        let directory_values = directories
+            .lines()
+            .map(dynamic_candidate_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            directory_values, expected_directories,
+            "{surface}: {directories}"
+        );
+    }
+
+    let projector_surfaces: &[(&str, usize, &[&str])] = &[
+        (
+            "generate --mmproj",
+            3,
+            &["hf2q", "generate", "--mmproj", ""],
+        ),
+        ("serve --mmproj", 3, &["hf2q", "serve", "--mmproj", ""]),
+    ];
+    for (surface, index, words) in projector_surfaces {
+        let directories = dynamic(&home, "fish", *index, words);
+        let directory_values = directories
+            .lines()
+            .map(dynamic_candidate_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            directory_values, expected_directories,
+            "{surface}: {directories}"
+        );
+    }
+
+    let cache_repo_ids = dynamic(&home, "zsh", 4, &["hf2q", "cache", "clear", "--model", ""]);
+    assert!(
+        !cache_repo_ids.contains("qwen3.6") && !cache_repo_ids.contains("qwen3.8"),
+        "repository-id --model was incorrectly given local paths: {cache_repo_ids}"
     );
 
     let qwen38_prefix = format!("{}/", qwen38.display());
