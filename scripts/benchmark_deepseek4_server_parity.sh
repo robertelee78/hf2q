@@ -429,8 +429,8 @@ run_arm() {
     local warmup_request="$OUTPUT_DIR/requests/${runtime}-warmup.json"
     local warmup_response="$OUTPUT_DIR/responses/${runtime}-warmup.json"
     assert_no_runtime
-    MODEL="$MODEL" HF2Q_BIN="$HF2Q_BIN" CONTEXT_LEN="$CONTEXT_LEN" \
-      CHECK_ONLY=1 PORT="$PORT" "$ROOT_DIR/scripts/serve_deepseek4_opencode.sh"
+    MODEL="$MODEL" HF2Q_BIN="$HF2Q_BIN" CHECK_ONLY=1 PORT="$PORT" \
+      "$ROOT_DIR/scripts/serve_deepseek4_opencode.sh" --ctx "$CONTEXT_LEN"
 
     echo "starting $runtime..." >&2
     local -a runtime_env=(
@@ -449,13 +449,13 @@ run_arm() {
     fi
     if [[ "$runtime" == "hf2q" ]]; then
         "${runtime_env[@]}" \
-          MODEL="$MODEL" HF2Q_BIN="$HF2Q_BIN" CONTEXT_LEN="$CONTEXT_LEN" \
+          MODEL="$MODEL" HF2Q_BIN="$HF2Q_BIN" \
           HF2Q_DEEPSEEK_GRAPH_REORDER="$HF2Q_DEEPSEEK_GRAPH_REORDER" \
           HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB="$HF2Q_DEEPSEEK_GRAPH_LAYERS_PER_CB" \
           PREFILL_WINDOWS="$hf2q_prefill_env" \
           MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS="$MLX_NATIVE_RESIDENCY_KEEP_ALIVE_SECONDS" \
           REP_PENALTY=1.0 HOST="$HOST" PORT="$PORT" \
-          "$ROOT_DIR/scripts/serve_deepseek4_opencode.sh" \
+          "$ROOT_DIR/scripts/serve_deepseek4_opencode.sh" --ctx "$CONTEXT_LEN" \
           >"$OUTPUT_DIR/logs/${runtime}.stdout" \
           2>"$OUTPUT_DIR/logs/${runtime}.stderr" &
     else

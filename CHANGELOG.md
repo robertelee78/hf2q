@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add `hf2q info --model <GGUF> [--mmproj <GGUF>]` for a static preview that
+  does not decode/upload tensor payloads or initialize Metal, covering model
+  family, declared and effective context, tokenizer/template capabilities,
+  vision pairing, tensor catalog, memory planning, and the exact reason
+  serving would be rejected.
+- Add typed `serve --ctx <TOKENS>` and `serve --kv-cache-budget <SIZE>`
+  controls, with matching optional `[serve]` configuration keys. Omitted
+  context uses the GGUF declaration; an explicit over-limit context fails
+  before tensor loading.
+- Add `serve --kv-persist-budget <SIZE>`, `[serve] kv_persist_budget`, and
+  `setup --serve-kv-persist-budget` for a human-readable, fail-loud disk
+  ceiling shared by the generic and Qwen persistent-KV stores.
+
+### Changed
+
+- Keep every admitted agent slot logically capable of the complete effective
+  context while applying one shared physical KV-residency budget. Context is
+  never divided by `--max-slots`.
+- Replace hidden environment-variable serving defaults with typed Clap/config
+  controls for scheduler, slots, active-KV budget, persistent-KV disk budget,
+  repetition penalty, and thinking budgets. CLI values override configuration;
+  shell state no longer disables an explicit `--kv-persist` path.
+- Extend generated Bash, Zsh, Fish, Elvish, and PowerShell completion plus
+  dynamic GGUF completion to the `info` command and all new planning flags.
+
+### Fixed
+
+- Make explicit `generate --kv-bits` reach runtime policy without mutating the
+  process environment, and reject the removed `--max-seq-len` and raw
+  `--kv-cache-budget-bytes` surfaces instead of accepting inert controls.
+
 ## [0.1.13] — 2026-08-22
 
 ### Fixed

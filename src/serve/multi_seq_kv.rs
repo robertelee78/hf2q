@@ -369,8 +369,8 @@ pub trait MultiSeqKvCache {
 
     /// Number of physical slots the cache is provisioned for.  Valid
     /// `SlotId`s are `0..slot_count`.  Set at engine construction time
-    /// from the `max_slots` knob (ADR-040 §3.4 default 4, env override
-    /// `HF2Q_MAX_SLOTS`).
+    /// from `--max-slots` or `[serve].max_slots` (ADR-040 §3.4 default 4
+    /// when no setup config exists).
     fn slot_count(&self) -> u32;
 
     /// Current sequence length stored in `slot`.  Returns

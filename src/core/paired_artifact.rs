@@ -434,18 +434,47 @@ impl PairReadGuard {
         })
     }
 
+    /// Acquire the writer-coordinated text-inode lock without creating a
+    /// sibling lock file. Read-only commands such as `hf2q info` use this
+    /// path so inspection cannot mutate the model directory.
+    pub(crate) fn acquire_read_only(
+        text: &Path,
+        projector: &Path,
+    ) -> Result<Self, PairArtifactError> {
+        Ok(Self {
+            _lock: PairReadLock::Text {
+                _lock: PairTextLock::shared(text)?,
+            },
+            text: canonical_parent(text)?.join(file_name(text)?),
+            projector: canonical_parent(projector)?.join(file_name(projector)?),
+        })
+    }
+
     pub(crate) fn validate(
         &self,
         text_gguf: &GgufFile,
         projector_gguf: &GgufFile,
         projector_sha256: &str,
     ) -> Result<(), PairArtifactError> {
+        self.validate_static(text_gguf, projector_gguf, Some(projector_sha256))
+    }
+
+    /// Validate the same pair-generation and transaction contract for a
+    /// header-only preflight. The caller may omit the projector digest only
+    /// when the text GGUF does not declare one; digest-bound pairs remain
+    /// fail-closed and require the exact hash.
+    pub(crate) fn validate_static(
+        &self,
+        text_gguf: &GgufFile,
+        projector_gguf: &GgufFile,
+        projector_sha256: Option<&str>,
+    ) -> Result<(), PairArtifactError> {
         let text_generation = metadata_nonempty(text_gguf, KEY_PAIR_GENERATION);
         let projector_generation = metadata_nonempty(projector_gguf, KEY_PAIR_GENERATION);
         let text_schema = metadata_nonempty(text_gguf, KEY_PAIR_SCHEMA_VERSION);
         let projector_schema = metadata_nonempty(projector_gguf, KEY_PAIR_SCHEMA_VERSION);
         let expected_projector = metadata_nonempty(text_gguf, KEY_MMPROJ_SHA256);
-        validate_metadata_values(
+        validate_metadata_values_optional(
             text_generation.as_deref(),
             projector_generation.as_deref(),
             text_schema.as_deref(),
@@ -521,6 +550,7 @@ pub(crate) fn read_pair_journal(path: &Path) -> Result<PairTransactionJournal, P
     Ok(journal)
 }
 
+#[cfg(test)]
 fn validate_metadata_values(
     text_generation: Option<&str>,
     projector_generation: Option<&str>,
@@ -528,6 +558,24 @@ fn validate_metadata_values(
     projector_schema: Option<&str>,
     expected_projector: Option<&str>,
     projector_sha256: &str,
+) -> Result<(), PairArtifactError> {
+    validate_metadata_values_optional(
+        text_generation,
+        projector_generation,
+        text_schema,
+        projector_schema,
+        expected_projector,
+        Some(projector_sha256),
+    )
+}
+
+fn validate_metadata_values_optional(
+    text_generation: Option<&str>,
+    projector_generation: Option<&str>,
+    text_schema: Option<&str>,
+    projector_schema: Option<&str>,
+    expected_projector: Option<&str>,
+    projector_sha256: Option<&str>,
 ) -> Result<(), PairArtifactError> {
     match (text_generation, projector_generation) {
         (None, None) => {
@@ -561,6 +609,11 @@ fn validate_metadata_values(
 
     if let Some(expected) = expected_projector {
         validate_sha256(expected)?;
+        let projector_sha256 = projector_sha256.ok_or_else(|| {
+            PairArtifactError::Invalid(
+                "projector digest is required to validate the text GGUF binding".into(),
+            )
+        })?;
         if !expected.eq_ignore_ascii_case(projector_sha256) {
             return Err(PairArtifactError::Invalid(
                 "projector digest does not match the text GGUF binding".into(),
@@ -717,6 +770,13 @@ mod tests {
             validate_metadata_values(None, None, None, None, Some(&expected), &"b".repeat(64),)
                 .is_err()
         );
+        assert!(
+            validate_metadata_values_optional(None, None, None, None, Some(&expected), None)
+                .is_err(),
+            "static inspection must not approve a digest-bound pair without hashing it"
+        );
+        validate_metadata_values_optional(None, None, None, None, None, None)
+            .expect("an unbound external pair remains header-only");
     }
 
     #[test]
@@ -757,6 +817,19 @@ mod tests {
         let guard = PairReadGuard::acquire(&text, &projector).unwrap();
 
         assert!(matches!(guard._lock, PairReadLock::Text { .. }));
+    }
+
+    #[test]
+    fn read_only_pair_guard_does_not_create_a_sibling_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("model.gguf");
+        let projector = dir.path().join("mmproj.gguf");
+        std::fs::write(&text, b"text").unwrap();
+        std::fs::write(&projector, b"projector").unwrap();
+
+        let guard = PairReadGuard::acquire_read_only(&text, &projector).unwrap();
+        assert!(matches!(guard._lock, PairReadLock::Text { .. }));
+        assert!(!lock_path(&text).exists());
     }
 
     #[test]

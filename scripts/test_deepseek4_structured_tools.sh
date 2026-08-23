@@ -159,13 +159,16 @@ build_request() {
     local tool_choice=${5:-required}
     local prompt
     local bad_arguments
+    local final_recovery_instruction
 
     if [[ "$tool_name" == "question" ]]; then
         prompt='Call question exactly once. Ask which output format to use. Supply one concise header, one complete question, and exactly two options with nonempty labels and descriptions.'
         bad_arguments='{"questions":[{"header":null,"question":"Which output format?","options":[{"label":"JSON","description":"Machine-readable"},{"label":"Text","description":"Human-readable"}]}]}'
+        final_recovery_instruction='Tool validation failed again: required strings cannot be null. Make one corrected question call now, preserving the original requirement of exactly one question with exactly two options.'
     else
         prompt='Call todowrite exactly once. Create two todos with nonempty content strings. Use pending then in_progress status, and high then medium priority.'
         bad_arguments='{"todos":[{"content":null,"status":"pending","priority":"high"}]}'
+        final_recovery_instruction='Tool validation failed again: required strings cannot be null. Make one corrected todowrite call now, preserving the original requirement of exactly two todos with pending/high then in_progress/medium.'
     fi
 
     jq -n \
@@ -173,6 +176,7 @@ build_request() {
       --arg tool_name "$tool_name" \
       --arg prompt "$prompt" \
       --arg bad_arguments "$bad_arguments" \
+      --arg final_recovery_instruction "$final_recovery_instruction" \
       --arg tool_choice "$tool_choice" \
       --arg reasoning_effort "$REASONING_EFFORT" \
       --argjson tool "$tool_json" \
@@ -225,7 +229,7 @@ build_request() {
             {
               role: "tool",
               tool_call_id: "failed_call_2",
-              content: "Tool validation failed again: required strings cannot be null. Make one corrected call now."
+              content: $final_recovery_instruction
             }
           ]
         else . end
@@ -350,7 +354,16 @@ fi
 
 continuation_request="$work_dir/continuation-request.json"
 continuation_response="$work_dir/continuation-response.json"
-jq -n --slurpfile base "$question_request" --slurpfile prior "$question_response" '
+selected_label=$(jq -er '
+  .choices[0].message.tool_calls[0].function.arguments
+  | fromjson
+  | .questions[0].options[0].label
+  | select(type == "string" and length > 0)
+' "$question_response")
+jq -n \
+  --arg selected_label "$selected_label" \
+  --slurpfile base "$question_request" \
+  --slurpfile prior "$question_response" '
   $base[0]
   | .messages += [
       {
@@ -361,7 +374,7 @@ jq -n --slurpfile base "$question_request" --slurpfile prior "$question_response
       {
         role: "tool",
         tool_call_id: $prior[0].choices[0].message.tool_calls[0].id,
-        content: "User selected JSON."
+        content: ("User selected " + $selected_label + ".")
       }
     ]
   | .tool_choice = "auto"

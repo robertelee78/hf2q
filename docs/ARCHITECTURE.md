@@ -156,6 +156,10 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │
 ├── src/serve/           HTTP API, KV-cache, multi-model
 │   ├── discovery.rs             macOS LocalOnly DNS-SD advertise/browse
+│   ├── info.rs                  static GGUF serve-capability preflight
+│   ├── info_catalog.rs          header-only family tensor-catalog checks
+│   ├── info_report.rs           human-readable static-preflight rendering
+│   ├── operator_settings.rs     typed CLI/config/GGUF plan resolution
 │   ├── api/                   axum router + handlers + state
 │   │   ├── artifact_catalog.rs        bounded opaque hosted-artifact authority
 │   │   ├── cancellation.rs            request/root preparation + commit supervision

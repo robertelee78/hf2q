@@ -192,11 +192,16 @@ threshold or a latency rebaseline.
 User-facing escape hatches. Stable in the contractual sense: we will
 not remove or silently change them without an ADR.
 
+ADR-050 removes ordinary serving configuration from this environment table.
+Context, scheduler, max active slots, shared KV residency, repetition penalty,
+and thinking defaults are typed CLI/config state with CLI precedence. The
+complete lexical audit and remaining promotion/internalization queue are in
+`docs/env-var-inventory.md`; a canonical-launcher variable is not considered
+good operator UX merely because a release script exports it.
+
 | Var | Values | Purpose |
 |---|---|---|
 | `HF2Q_LMHEAD_Q8` | `1`, `0`, unset | Force Q8 on, force F16, or auto-select. Escape hatch for models the auto heuristic classifies incorrectly. |
-| `HF2Q_DEFAULT_THINKING_TOKEN_BUDGET` | non-negative integer, unset | Operator default for Qwen reasoning when a request omits `thinking_token_budget`; the qualified agentic profile uses 2,048 and is persisted into `config.toml` by `hf2q setup` (applied by `hf2q serve` only when this variable is absent). The handler still reserves answer capacity. `0` disables the default. Explicit request budgets take precedence. |
-| `HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET` | non-negative integer, unset | Operator ceiling for the first Qwen tool-result continuation; the qualified agentic profile uses 512 (persisted into `config.toml` by `hf2q setup`, applied only when this variable is absent) and deeper cycles reduce to a 256-token floor. `0` disables this override. |
 | `HF2Q_QWEN_SPECULATION` | `off`, `auto` | Live Qwen SlotAware speculation policy. The qwen35 server engine defaults to `auto` when the variable is unset (since 2026-08-21; previously the default was off outside the canonical Qwen3.8 launcher). Auto preserves the target sampler/grammar state, requires coherent request-owned cache metadata, and cost-gates history lookup and fixed-K3 MTP independently. Unsupported semantics and runtime failures fail closed to ordinary decode or invalidate the affected slot; invalid values warn and resolve to off. Explicit `off` remains the escape hatch. |
 | `HF2Q_DECODE_MVN` | `0`, `1` | Exact-tree Q4_K/Q6_K multi-column matvec routing. The global default is `1`; loading a Qwen3.8-identified model applies `0` at engine load (previously only via the canonical Qwen3.8 launcher) because its K=3 verifier is qualified on the weight-amortized width-four route. Explicit values always win. |
 | `HF2Q_DECODE_MV_EXT` | `0`, `1` | Weight-amortized multi-column matvec routing. The global default is `0`; loading a Qwen3.8-identified model applies `1` at engine load (previously only via the canonical Qwen3.8 launcher). K-quants route only at widths 4–8; legacy Q4_0/Q8_0 route at widths 2–8. Unlike the byte-exact default-on mvN route, `mul_mv_ext` is not bit-exact, so the default remains Qwen3.8-scoped. |

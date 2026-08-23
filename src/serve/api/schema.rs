@@ -123,13 +123,13 @@ impl ApiError {
     /// [`crate::serve::api::engine::EngineMode::SerialFifo`] (= the
     /// [`crate::serve::scheduler::SchedulerPolicy::FifoSerial`] scheduler).
     /// **ADR-005 Phase 2 Decision #19** — under FifoSerial (default at
-    /// engine spawn unless overridden by `HF2Q_SCHEDULER` or
-    /// `--scheduler`), `queue_full` fires when the bounded mpsc channel
+    /// engine spawn unless overridden by `--scheduler` or setup config),
+    /// `queue_full` fires when the bounded mpsc channel
     /// (`Engine::spawn(queue_capacity)`) is at hard cap.
     ///
     /// **ADR-040 Phase C C4** (SHIPPED 2026-05-23, cf. ADR-040 §6.1.9)
-    /// added explicit `SchedulerPolicy` selection via the
-    /// `HF2Q_SCHEDULER` env / `--scheduler` CLI flag. There are TWO
+    /// added explicit `SchedulerPolicy` selection. It is now configured by
+    /// `--scheduler` or `[serve].scheduler`. There are TWO
     /// distinct enums at play (and the docstring + test below pin
     /// both — cfa-iter-A5b MAJOR #1 fixed a pre-iter-A5b docstring
     /// bug that referenced a nonexistent variant on the wrong enum;
@@ -514,7 +514,8 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: i64,
     pub owned_by: &'static str,
-    /// Maximum context length in tokens (non-standard, widely supported).
+    /// Effective context length in tokens for this loaded engine
+    /// (non-standard, widely supported).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<usize>,
     /// GGUF quant type (`Q4_K_M`, `Q6_K`, `Q8_0`, `F16`, etc.).
@@ -539,10 +540,9 @@ pub struct ModelObject {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
     /// Maximum context length declared by the GGUF
-    /// (`{arch}.context_length`). Distinct from `context_length` (which
-    /// historically reflects the cache-scanner-derived value); this field
-    /// is the live-engine LoadInfo source of truth and is `Some` only on
-    /// engine-backed entries.
+    /// (`{arch}.context_length`). Distinct from `context_length`, which is
+    /// the effective operator-capped value for a live engine. This field is
+    /// `Some` only on engine-backed entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_context_length: Option<u64>,
     /// Provenance label — `"hf2q"` for hf2q-emitted GGUFs, `"external"`

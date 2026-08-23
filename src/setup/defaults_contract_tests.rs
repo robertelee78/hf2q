@@ -8,6 +8,9 @@ fn operator_config_v2_is_canonical_strict_and_uses_the_guide_defaults() {
     assert_eq!(config.serve.port, 8081);
     assert_eq!(config.serve.scheduler, ConfiguredScheduler::InflightBatched);
     assert_eq!(config.serve.max_slots, 1);
+    assert_eq!(config.serve.ctx, None);
+    assert_eq!(config.serve.kv_cache_budget, None);
+    assert_eq!(config.serve.kv_persist_budget, None);
     // The guide journey answers the agentic-serving question with its
     // default yes, so the qualified profile is part of the default config.
     assert_eq!(config.serve.repetition_penalty, Some(1.05));
@@ -42,6 +45,9 @@ fn operator_config_v2_rejects_incoherent_fifo_slots_and_invalid_quant() {
             port: 8081,
             scheduler: ConfiguredScheduler::InflightBatched,
             max_slots: 1,
+            ctx: None,
+            kv_cache_budget: None,
+            kv_persist_budget: None,
             repetition_penalty: None,
             thinking_token_budget: None,
             tool_thinking_token_budget: None,
@@ -58,6 +64,9 @@ fn operator_config_v2_rejects_incoherent_fifo_slots_and_invalid_quant() {
             port: 8081,
             scheduler: ConfiguredScheduler::FifoSerial,
             max_slots: 2,
+            ctx: None,
+            kv_cache_budget: None,
+            kv_persist_budget: None,
             repetition_penalty: None,
             thinking_token_budget: None,
             tool_thinking_token_budget: None,
@@ -101,9 +110,44 @@ max_slots = 4
 "#;
     let config = OperatorConfigV2::parse(legacy).expect("legacy v2 config parses");
     assert_eq!(config.serve.max_slots, 4);
+    assert_eq!(config.serve.ctx, None);
+    assert_eq!(config.serve.kv_cache_budget, None);
+    assert_eq!(config.serve.kv_persist_budget, None);
     assert_eq!(config.serve.repetition_penalty, None);
     assert_eq!(config.serve.thinking_token_budget, None);
     assert_eq!(config.serve.tool_thinking_token_budget, None);
+}
+
+#[test]
+fn operator_config_accepts_explicit_context_and_human_kv_budget() {
+    let configured = r#"kind = "hf2q.config"
+schema_version = 2
+package = "hf2q"
+
+[convert]
+quant = "q4_k_m"
+
+[serve]
+host = "127.0.0.1"
+port = 8081
+scheduler = "inflight_batched"
+max_slots = 4
+ctx = 262144
+kv_cache_budget = "8GiB"
+kv_persist_budget = "32GiB"
+"#;
+    let config = OperatorConfigV2::parse(configured.as_bytes()).expect("operator controls parse");
+    assert_eq!(config.serve.ctx, Some(262_144));
+    assert_eq!(config.serve.kv_cache_budget.as_deref(), Some("8GiB"));
+    assert_eq!(config.serve.kv_persist_budget.as_deref(), Some("32GiB"));
+
+    for invalid in [
+        configured.replace("ctx = 262144", "ctx = 0"),
+        configured.replace("8GiB", "eight-ish"),
+        configured.replace("32GiB", "lots"),
+    ] {
+        assert!(OperatorConfigV2::parse(invalid.as_bytes()).is_err());
+    }
 }
 
 #[test]

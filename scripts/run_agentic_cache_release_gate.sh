@@ -326,14 +326,17 @@ start_server() {
     return 1
   fi
   launcher_env=(MODEL="$model" PORT="$port" HF2Q_BIN="$HF2Q_BIN" MAX_SLOTS="$max_slots")
-  [[ -z "$context_len" ]] || launcher_env+=(CONTEXT_LEN="$context_len")
   [[ -z "$kv_budget" ]] || launcher_env+=(KV_CACHE_BUDGET_BYTES="$kv_budget")
   if [[ "$family" == gemma ]]; then
     local disabled_mmproj="$current_dir/mmproj-disabled"
     [[ ! -e "$disabled_mmproj" ]] || return 1
     launcher_env+=(MMPROJ="$disabled_mmproj")
   fi
-  env "${launcher_env[@]}" "$launcher" >"$current_log" 2>&1 &
+  if [[ -n "$context_len" ]]; then
+    env "${launcher_env[@]}" "$launcher" --ctx "$context_len" >"$current_log" 2>&1 &
+  else
+    env "${launcher_env[@]}" "$launcher" >"$current_log" 2>&1 &
+  fi
   server_pid=$!
   wait_ready "$current_url" "$current_log"
 }

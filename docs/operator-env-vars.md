@@ -14,8 +14,12 @@ Qwen 3.5/3.6 GGUF):
     1.31× AHEAD at tg200 — TQ-V active by default.
 - No flags required — the defaults are the ones you want.
 
-The env vars below are escape hatches and experimental toggles. In
-normal operation none of them need to be set.
+The env vars below are escape hatches and experimental toggles. In normal
+operation none of them need to be set. Ordinary serving controls—context,
+scheduler, slots, shared KV budget, repetition penalty, and thinking
+defaults—are typed CLI/config fields, not hidden environment variables. See
+[ADR-050](adr/ADR-050-operator-context-and-static-info.md) and the
+[complete source inventory](env-var-inventory.md).
 
 ---
 
@@ -50,28 +54,34 @@ rerank logic.
 | Var | Default | Values | Effect |
 |---|---|---|---|
 | `HF2Q_BATCHED_PREFILL` | on | `0`/`false`/`off` | Batched prefill (`forward_prefill_batched`) — the production path since ADR-028 iter-344 (default-flipped from per-token, which was 14-45× slower than peer at pp512–pp4096).  Coherence intact at every tested length up to pp3813 (4× sliding_window). Opt-out via `0`/`false`/`off` reverts to per-token prefill for parity diagnostics only. |
-| `HF2Q_CROSS_SLOT_ADMIT` | off globally; `1` in the canonical Gemma launcher | `1` | Allows the Gemma SlotAware admission loop to coalesce one contiguous FIFO class into a multi-sequence prefill. The engine applies one shared 4,096-row transaction cap across all lanes; it does not multiply the cap by slot count. Leave this launcher-owned setting unchanged outside a controlled parity diagnostic. |
-| `HF2Q_ADMIT_COALESCE_US` | `25000` in the canonical Gemma launcher | positive integer microseconds | Maximum first-cohort collection window used only with cross-slot admission. A larger value may improve initial batching at the cost of admission latency; it does not relax FIFO, transaction-row, context, or KV-budget checks. |
+| `HF2Q_CROSS_SLOT_ADMIT` | off globally; `1` in the canonical Gemma launcher | `1` | Allows the Gemma SlotAware admission loop to coalesce one contiguous FIFO class into a multi-sequence prefill. The engine applies one shared 4,096-row transaction cap across all lanes; it does not multiply the cap by slot count. This launcher-owned production policy is queued for typed internalization by ADR-050; it is not acceptable ordinary shell UX. |
+| `HF2Q_ADMIT_COALESCE_US` | `25000` in the canonical Gemma launcher | positive integer microseconds | Maximum first-cohort collection window used only with cross-slot admission. A larger value may improve initial batching at the cost of admission latency; it does not relax FIFO, transaction-row, context, or KV-budget checks. This is part of the same typed-admission follow-up, not a recommended user knob. |
 | `HF2Q_F16_KV` | off | `1` | Allocate the dense KV cache as F16 instead of F32. Experimental — the current F16 path has a separate bug worse than F32; per ADR-009 the default F32 path is preferred. |
 | `HF2Q_NO_FA` | off | `1`/`true`/`on` | Diagnostic A/B knob.  When set, routes the global D=512 attention path through F32 tensor-mm instead of flash-attention.  Forced off at `seq_len < 32` (the dense-matmul kernel requires K ≥ 32).  Per ADR-032 the FA path is the production default — peer-aligned with llama.cpp's `kernel_flash_attn_ext_*_dk512_dv512`.  This flag exists for bisection work against the tensor-mm reference, not for production use. |
 | `HF2Q_FA_F16` | on | `0`/`false`/`off` | F16 (`half`, 10-bit mantissa) Q/K/V in flash-attention shared memory.  Matches llama.cpp's default `FA_TYPES` template specialisation for F16 KV cache (the standard production path).  Per ADR-032 this is the peer-aligned default — Q-shmem precision is the binding constraint on argmax stability at D=512 global layers (BF16's 7-bit mantissa accumulates ~9% relative error over a 512-element dot product, flipping argmax on narrow-margin greedy decode).  Opt-out reverts to BF16 (`bfloat`, 7-bit mantissa) shmem — peer's `FA_TYPES_BF` specialisation, only used in llama.cpp when KV cache is explicitly BF16.  Provided for diagnostic A/B against the BF16 instantiation; not for production. |
 
 ## Qwen reasoning and decode
 
-Precedence for the three behavioral defaults below is: an explicitly
-exported environment variable wins; otherwise `hf2q serve` applies the
-values persisted in `config.toml` by `hf2q setup`; otherwise the built-in
-default applies. `hf2q setup` writes the qualified agentic-coding profile
-(repetition penalty `1.05`, thinking budget `2048`, tool-continuation
-budget `512`) whenever the operator optimizes for long agent and tool-use
-prompts, so neither the canonical launchers nor a shell environment are
-required to get the qualified behavior.
+The three request-omission defaults are no longer environment variables:
+
+| CLI | `config.toml` | Built-in | Effect |
+|---|---|---|---|
+| `--default-repetition-penalty` | `[serve] repetition_penalty` | `1.0` | Server default only when the request omits `repetition_penalty`; explicit requests win. |
+| `--default-thinking-token-budget` | `[serve] thinking_token_budget` | unset | Qwen reasoning ceiling when the request omits it; `0` disables the configured default. |
+| `--default-tool-thinking-token-budget` | `[serve] tool_thinking_token_budget` | unset | First tool-continuation/required-tool ceiling; `0` disables the continuation override. |
+
+CLI wins over setup config, which wins over the built-in. `hf2q setup` writes
+the qualified agentic profile (`1.05`, `2048`, `512`) when the operator chooses
+long agent/tool serving. The former `HF2Q_DEFAULT_*` readers and process bridge
+were removed because they were both poor UX and initialization-order unsafe.
+
+The remaining Qwen rows are technical routing escape hatches. ADR-050's
+inventory marks speculation and process-global decode routing for typed backend
+policy: their current environment implementation is not the final multi-model
+architecture.
 
 | Var | Default | Values | Effect |
 |---|---|---|---|
-| `HF2Q_DEFAULT_REPETITION_PENALTY` | `1.0` (off); `1.05` via the setup-persisted agentic profile | finite positive number | Server-wide repetition penalty applied only when the client omits the field (loop mitigation for long agentic sessions). Client-supplied values always win; pure-greedy requests never reach a sampler. |
-| `HF2Q_DEFAULT_THINKING_TOKEN_BUDGET` | unset; `2048` via the setup-persisted agentic profile | non-negative integer tokens | Server-default ceiling for Qwen reasoning when the request omits `thinking_token_budget`. `0` disables the default. The handler still reserves answer capacity inside `max_tokens`; an explicit request budget remains exact and takes precedence. |
-| `HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET` | unset; `512` via the setup-persisted agentic profile | non-negative integer tokens | Ceiling for the first tool-result continuation when the request omits an explicit budget. Deeper tool cycles reduce deterministically to a 256-token floor. `0` disables the continuation override. |
 | `HF2Q_QWEN_SPECULATION` | `auto` | `off`, `auto` | Controls the live SlotAware Qwen server path. Default `auto` since 2026-08-21 (previously `off` outside the canonical Qwen3.8 launcher): `auto` measures ordinary decode first, tries exact request-history lookup (6-12-token match, up to three draft tokens), then fixed-K3 native MTP when available; each proposer disables itself for the generation after two consecutive four-round windows are not better than equivalent ordinary output. Stochastic sampling, logprobs, stop strings, logit bias, frequency/presence/min-p, parallel tool calls, and unsupported tool policy stay on ordinary target decode. Invalid values warn and fail safe to `off`. Explicit `off` remains the escape hatch. |
 | `HF2Q_DECODE_MVN` | `1`; `0` applied automatically when loading a Qwen3.8-identified model | `0`, `1` | Controls exact-tree Q4_K/Q6_K multi-column matvec routing. The Qwen3.8-qualified route disables it because the K=3 verifier is qualified on the weight-amortized width-four route. Previously only `serve_qwen38_opencode.sh` applied this; `hf2q serve` now applies it at engine load for Qwen3.8-identified models. |
 | `HF2Q_DECODE_MV_EXT` | `0`; `1` applied automatically when loading a Qwen3.8-identified model | `0`, `1` | Enables weight-amortized multi-column matvec. K-quants route only at widths 4-8; legacy Q4_0/Q8_0 retain widths 2-8. Enabled after the real-model four-position decision, hybrid-cache cursor, and eight-step continuation gate. Unlike the byte-exact default-on mvN route, `mul_mv_ext` is not bit-exact, so the default stays Qwen3.8-scoped — no other family carries the qualifying receipt. |

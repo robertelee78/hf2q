@@ -25,8 +25,8 @@ pub(crate) struct ConvertDefaultsV2 {
 
 /// Qualified agentic-coding serving profile (OpenCode acceptance host,
 /// 2026-08-21). Persisted by `hf2q setup` when the operator optimizes for
-/// long agent and tool-use prompts; applied by `hf2q serve` as process
-/// defaults without overriding explicit operator environment.
+/// long agent and tool-use prompts; applied by `hf2q serve` after explicit
+/// CLI behavior flags and before built-in defaults.
 pub(crate) const AGENTIC_PROFILE_REPETITION_PENALTY: f64 = 1.05;
 pub(crate) const AGENTIC_PROFILE_THINKING_BUDGET: u32 = 2048;
 pub(crate) const AGENTIC_PROFILE_TOOL_THINKING_BUDGET: u32 = 512;
@@ -38,18 +38,27 @@ pub(crate) struct ServeDefaultsV2 {
     pub(crate) port: u16,
     pub(crate) scheduler: ConfiguredScheduler,
     pub(crate) max_slots: u32,
-    /// Server-wide repetition penalty for clients that omit the field
-    /// (`HF2Q_DEFAULT_REPETITION_PENALTY`). `None` leaves the built-in
-    /// default (1.0 = off).
+    /// Optional per-slot logical context cap. Omission means each model uses
+    /// the maximum declared by its GGUF metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ctx: Option<u32>,
+    /// Optional aggregate physical KV-cache residency ceiling. Human-readable
+    /// units such as `8GiB` are accepted; omission means no explicit ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kv_cache_budget: Option<String>,
+    /// Optional on-disk ceiling for persistent KV data. Human-readable units
+    /// such as `32GiB` are accepted; omission/zero means no explicit ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kv_persist_budget: Option<String>,
+    /// Server-wide repetition penalty for clients that omit the field.
+    /// `None` leaves the built-in default (1.0 = off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repetition_penalty: Option<f64>,
-    /// Default Qwen thinking budget (`HF2Q_DEFAULT_THINKING_TOKEN_BUDGET`).
-    /// `None` leaves thinking unbounded.
+    /// Default Qwen thinking budget. `None` leaves thinking unbounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) thinking_token_budget: Option<u32>,
-    /// Tool-continuation thinking budget override
-    /// (`HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET`). `None` leaves the
-    /// adaptive derivation from `thinking_token_budget`.
+    /// Tool-continuation thinking budget override. `None` leaves the adaptive
+    /// derivation from `thinking_token_budget`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tool_thinking_token_budget: Option<u32>,
 }
@@ -118,6 +127,9 @@ impl OperatorConfigV2 {
             port: 8081,
             scheduler: ConfiguredScheduler::InflightBatched,
             max_slots: 1,
+            ctx: None,
+            kv_cache_budget: None,
+            kv_persist_budget: None,
             repetition_penalty: None,
             thinking_token_budget: None,
             tool_thinking_token_budget: None,
@@ -199,7 +211,7 @@ impl ServeDefaultsV2 {
     /// Persist the qualified agentic-coding profile. Called when the
     /// operator answers yes to "Optimize serving for long agent and
     /// tool-use prompts?" (the default answer), so a plain `hf2q serve`
-    /// picks up the same behavior the canonical OpenCode launchers export.
+    /// picks up the same behavior the canonical OpenCode launchers request.
     pub(crate) fn apply_agentic_profile(&mut self) {
         self.repetition_penalty = Some(AGENTIC_PROFILE_REPETITION_PENALTY);
         self.thinking_token_budget = Some(AGENTIC_PROFILE_THINKING_BUDGET);
@@ -232,6 +244,21 @@ impl ServeDefaultsV2 {
             return Err(SetupError::InvalidConfig(
                 "serve.max_slots must be 1 for fifo_serial".to_owned(),
             ));
+        }
+        if self.ctx == Some(0) {
+            return Err(SetupError::InvalidConfig(
+                "serve.ctx must be positive; omit it to use the GGUF maximum".to_owned(),
+            ));
+        }
+        if let Some(value) = self.kv_cache_budget.as_deref() {
+            crate::serve::operator_settings::parse_byte_size(value).map_err(|error| {
+                SetupError::InvalidConfig(format!("serve.kv_cache_budget is invalid: {error}"))
+            })?;
+        }
+        if let Some(value) = self.kv_persist_budget.as_deref() {
+            crate::serve::operator_settings::parse_byte_size(value).map_err(|error| {
+                SetupError::InvalidConfig(format!("serve.kv_persist_budget is invalid: {error}"))
+            })?;
         }
         if let Some(penalty) = self.repetition_penalty {
             if !penalty.is_finite() || penalty <= 0.0 {

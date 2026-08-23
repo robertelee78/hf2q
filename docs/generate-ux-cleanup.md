@@ -225,7 +225,7 @@ Rationale for each choice:
 - `without_time()`: current output has no timestamps; AC-5 requires reproducing current output modulo format-wrapper differences. Timestamps would change every line.
 - `RUST_LOG` wins at verbosity 0: if the user sets `RUST_LOG=hf2q=debug` without `-v`, they get debug output. `-v` only kicks in if they pass it explicitly.
 - Default level `hf2q=warn`: silent in default mode. The three header lines bypass tracing entirely (they are product output).
-- **`INVESTIGATION_ENV.activate()` runs before `Cli::parse`** — it uses direct `eprintln!` (see §2.6), so it doesn't depend on the subscriber. Ordering preserves the current contract: investigation-var warnings render even on `--help` / `--version` early exit.
+- **Clap is parsed fallibly before `INVESTIGATION_ENV.activate()` on valid commands** — this lets typed CLI overrides initialize before the read-once development snapshot. Clap's `--help`, `--version`, and error exits explicitly activate the snapshot before exiting, preserving the existing warning contract. Activation still uses direct `eprintln!` (see §2.6), so it does not depend on the subscriber.
 
 ### 4.3 `-v` contract (phase markers)
 Shows high-level phase markers only (tracing `info!` events): init start, backend name, GGUF load, weight-load start/end, quantization decisions, forward-pass start, prompt token count. Cleaner than today's default. ~8–10 lines on a typical run.
@@ -292,7 +292,7 @@ Before any boot-path reclassification, run `hf2q generate <model> --max-tokens 8
 
 **Step 1 — Tracing subscriber scaffold. [DONE]**
 - `-v` flag already on `Cli` (cli.rs:14-17) pre-existing.
-- Reordered `main.rs`: `INVESTIGATION_ENV.activate()` → `Cli::parse()` → `tracing-subscriber` init with verbosity-aware `EnvFilter`.
+- `main.rs` uses fallible Clap parsing: valid commands apply typed overrides before `INVESTIGATION_ENV.activate()`, while help/version/error exits activate diagnostics before exiting; tracing initialization remains verbosity-aware.
 - No behavior change at verbosity 0 (`hf2q=warn` default, all existing `eprintln!` still fire as before).
 - Step 0's fixture capture can happen after Step 1 (Step 1 doesn't change any boot-path `eprintln!` output).
 

@@ -453,9 +453,9 @@ impl Default for SamplingParams {
 
 /// Effective repetition penalty for sampling (2026-08-03 loop mitigation).
 ///
-/// Client-supplied values (≠ 1.0) always win.  When the client omits
-/// `repetition_penalty` (handler default `1.0`), fall back to the
-/// server-wide `HF2Q_DEFAULT_REPETITION_PENALTY` (default `1.0` = off).
+/// The request handler has already resolved an omitted value against the
+/// typed server configuration. Engine samplers consume that resolved value
+/// directly and never reread process environment.
 ///
 /// Shared by every arch's sampler-construction site (gemma engine.rs,
 /// engine_qwen35.rs, engine_qwen3vl.rs) so the semantics are uniform
@@ -470,11 +470,7 @@ impl Default for SamplingParams {
 /// untouched.  Penalty scope downstream is the response's generated
 /// tokens only, never the prompt — safe for code.
 pub fn effective_repetition_penalty(params: &SamplingParams) -> f64 {
-    if params.repetition_penalty != 1.0 {
-        params.repetition_penalty as f64
-    } else {
-        crate::debug::INVESTIGATION_ENV.default_repetition_penalty as f64
-    }
+    params.repetition_penalty as f64
 }
 
 /// Configure a tool grammar whose enforcement begins at a native boundary.
@@ -814,8 +810,8 @@ impl Default for EngineMode {
 ///   - **iter-2c (Gemma 4 worker arm)** does the same for the Gemma 4
 ///     family on top of B4c's `forward_prefill.rs` + `forward_prefill_
 ///     batched.rs` slot-id threading.
-/// Until both per-family arms land, `--scheduler inflight_batched` /
-/// `HF2Q_SCHEDULER=inflight_batched` will surface this error via
+/// A family that cannot honor `--scheduler inflight-batched` surfaces this
+/// error via
 /// `load_engine`'s `anyhow::Error` wrapper and `cmd_serve` will exit
 /// non-zero before binding the listener (fail-loud per §7 mantra; no
 /// silent fallback to SerialFifo).
@@ -835,8 +831,7 @@ pub enum EngineSpawnError {
          (worker_run + FifoSchedulerAdapter wiring); SlotAware runtime gated \
          on iter-2b (Qwen35 worker arm, B4b decode-slot threading) + iter-2c \
          (Gemma 4 worker arm, B4c prefill-slot threading). \
-         Use `--scheduler fifo_serial` (or unset `HF2Q_SCHEDULER`), or wait \
-         for Phase {iter_required}."
+         Use `--scheduler fifo-serial`, or wait for Phase {iter_required}."
     )]
     ModeNotYetWired {
         /// The iter that introduced the API surface (e.g. `"C2b"`).
@@ -1923,7 +1918,7 @@ struct EngineInner {
     /// [`crate::serve::scheduler::FifoSchedulerAdapter::per_slot_kv_budget_bytes`]:
     /// no enforcement at any admit path. Under SerialFifo the shared pool has
     /// one consumer, so an operator who
-    /// does NOT pass `--kv-cache-budget-bytes` retains the pre-A5
+    /// does NOT pass `--kv-cache-budget` retains the pre-A5
     /// "unbounded" semantics verbatim.
     per_slot_kv_budget_bytes: u64,
     /// **ADR-040 §3.5 iter-A5b** — cached per-token KV byte cost
@@ -2428,6 +2423,51 @@ pub struct GemmaLoadedModel {
 }
 
 impl LoadedModel {
+    /// Reject unsupported or not-yet-servable architectures using the same
+    /// header-only dispatch contract before context metadata is interpreted.
+    /// An unknown family has no trustworthy family-specific context key, so
+    /// its architecture rejection must remain the primary diagnostic.
+    pub(crate) fn validate_architecture_for_load(arch: &str, model_path: &Path) -> Result<()> {
+        use crate::inference::models::qwen35::{is_qwen3_vl_arch, is_qwen3_vl_moe_arch};
+
+        if is_qwen3_vl_arch(arch) {
+            if is_qwen3_vl_moe_arch(arch) {
+                anyhow::bail!(
+                    "Qwen3-VL (MoE, general.architecture = {arch:?}) GGUFs are recognized \
+                     but no convert pipeline currently emits this variant; the dense Qwen3-VL \
+                     LM loader is iter-228a scope and cannot consume an MoE GGUF structurally. \
+                     For dense Qwen3-VL today, use a `qwen3_vl` / `qwen3vl` GGUF (e.g. \
+                     `Qwen/Qwen3-VL-2B-Instruct`). Model: {}",
+                    model_path.display(),
+                );
+            }
+            anyhow::bail!(
+                "Qwen3-VL (dense, general.architecture = {arch:?}) is recognized and its \
+                 text-LM forward is implemented (iter-8a-2), but the serve engine seam is \
+                 not wired yet (ADR-041 iter-9b): every chat / embeddings / soft-token \
+                 request would return HTTP 501. Refusing at load rather than reporting a \
+                 ready server that cannot serve (fail-closed guarantee). For text-only \
+                 chat today use a Qwen3.5/3.6 GGUF; for chat + images use a Gemma 4 \
+                 GGUF. Model: {}",
+                model_path.display(),
+            );
+        }
+
+        match arch {
+            "qwen35" | "qwen35moe" | "gemma4" | "deepseek4" => Ok(()),
+            "" => anyhow::bail!(
+                "GGUF is missing required `general.architecture`; refusing to guess Gemma. \
+                 Model: {}",
+                model_path.display()
+            ),
+            other => anyhow::bail!(
+                "unsupported GGUF general.architecture={other:?}; supported runtimes in this \
+                 build are gemma4, qwen35, qwen35moe, dense qwen3_vl, and deepseek4. Model: {}",
+                model_path.display()
+            ),
+        }
+    }
+
     pub fn model_id(&self) -> &str {
         match self {
             LoadedModel::Gemma(g) => &g.model_id,
@@ -3167,9 +3207,12 @@ pub struct LoadOptions {
     /// store call sites write through to disk on insert (per-cfg
     /// fingerprint subdirs); the first prefill of any new cfg lazily
     /// hydrates pre-existing snapshots into the in-memory registry.
-    /// Sourced from `HF2Q_KV_PERSIST` env at cmd_serve / cmd_generate
-    /// startup; `None` keeps the legacy in-process-only behavior.
+    /// `serve` supplies this from typed `--kv-persist`; the development-only
+    /// generate path may still use its historical environment activation.
+    /// `None` keeps the legacy in-process-only behavior.
     pub kv_persist_dir: Option<PathBuf>,
+    /// Typed on-disk persistent-KV ceiling. Zero means unlimited.
+    pub kv_persist_budget_bytes: u64,
 }
 
 impl LoadedModel {
@@ -3183,6 +3226,17 @@ impl LoadedModel {
     /// before this constructor for qwen35 / qwen35moe arches; iter-215
     /// replaces that wedge with actual dispatch.
     pub fn load(opts: &LoadOptions) -> Result<Self> {
+        Self::load_with_context(opts, None)
+    }
+
+    /// Load with an already validated effective per-slot context. The serve
+    /// path resolves this against the GGUF-declared maximum before any family
+    /// can allocate context-linear KV storage; non-serving callers retain the
+    /// model-declared maximum through [`Self::load`].
+    pub(crate) fn load_with_context(
+        opts: &LoadOptions,
+        effective_context: Option<u32>,
+    ) -> Result<Self> {
         let model_path = &opts.model_path;
         anyhow::ensure!(
             model_path.exists(),
@@ -3196,69 +3250,24 @@ impl LoadedModel {
             .metadata_string("general.architecture")
             .map(|s| s.to_string())
             .unwrap_or_default();
-        // Wedge-4 / iter-227 (2026-05-02): originally a runtime
-        // actionable-error dispatch shim that bailed on Qwen3-VL
-        // arches because the LM forward path wasn't wired yet.
-        //
-        // **iter-228a (2026-05-02)** replaces the bail with a real
-        // dispatch arm: dense Qwen3-VL GGUFs now route through
-        // `Qwen3VlTextLoadedModel::load` (load surface lands; chat
-        // arm continues to short-circuit to 501 via the
-        // `QWEN3VL_TEXT_FORWARD_PENDING_SENTINEL` until iter-228b
-        // wires the actual transformer forward).
-        //
-        // MoE Qwen3-VL still bails at this site (no convert pipeline
-        // emits it; the dense-only loader cannot consume an MoE GGUF
-        // structurally), with the same operator-actionable message.
-        //
-        // **Guarantees tune-up item 1 (2026-08-20)**: iter-228a's
-        // load-then-501 state violated the published fail-closed
-        // guarantee — the server reported ready while every chat /
-        // embed / soft-token request 501'd (forward landed iter-8a-2;
-        // engine seam is ADR-041 iter-9b scope). The dense arm bails
-        // at spawn again until ADR-041 wires the seam; ADR-041
-        // iter-9b-4 deletes this bail in the same commit that lands
-        // the real worker dispatch. The loader + forward stay covered
-        // by tests/qwen3vl_text_lm_forward.rs.
-        use crate::inference::models::qwen35::{is_qwen3_vl_arch, is_qwen3_vl_moe_arch};
-        if is_qwen3_vl_arch(arch.as_str()) {
-            if is_qwen3_vl_moe_arch(arch.as_str()) {
-                anyhow::bail!(
-                    "Qwen3-VL (MoE, general.architecture = {arch:?}) GGUFs are recognized \
-                     but no convert pipeline currently emits this variant; the dense Qwen3-VL \
-                     LM loader is iter-228a scope and cannot consume an MoE GGUF structurally. \
-                     For dense Qwen3-VL today, use a `qwen3_vl` / `qwen3vl` GGUF (e.g. \
-                     `Qwen/Qwen3-VL-2B-Instruct`). Model: {}",
-                    model_path.display(),
-                );
-            }
-            // Dense Qwen3-VL — refuse at spawn until ADR-041 wires the
-            // engine seam (guarantees tune-up item 1, 2026-08-20).
-            // Refusing BEFORE `Qwen3VlTextLoadedModel::load` also avoids
-            // streaming gigabytes of tensors for a server that could not
-            // serve a single request.
-            anyhow::bail!(
-                "Qwen3-VL (dense, general.architecture = {arch:?}) is recognized and its \
-                 text-LM forward is implemented (iter-8a-2), but the serve engine seam is \
-                 not wired yet (ADR-041 iter-9b): every chat / embeddings / soft-token \
-                 request would return HTTP 501. Refusing at load rather than reporting a \
-                 ready server that cannot serve (fail-closed guarantee). For text-only \
-                 chat today use a Qwen3.5/3.6 GGUF; for chat + images use a Gemma 4 \
-                 GGUF. Model: {}",
-                model_path.display(),
-            );
-        }
+        Self::validate_architecture_for_load(&arch, model_path)?;
         match arch.as_str() {
             "qwen35" | "qwen35moe" => {
-                let q = super::engine_qwen35::Qwen35LoadedModel::load(opts)?;
+                let q = super::engine_qwen35::Qwen35LoadedModel::load_with_context(
+                    opts,
+                    effective_context,
+                )?;
                 Ok(LoadedModel::Qwen35(q))
             }
             "gemma4" => {
-                let g = GemmaLoadedModel::load(opts)?;
+                let g = GemmaLoadedModel::load_with_context(opts, effective_context)?;
                 Ok(LoadedModel::Gemma(g))
             }
             "deepseek4" => {
-                let d = super::engine_deepseek4::Deepseek4LoadedModel::load(opts)?;
+                let d = super::engine_deepseek4::Deepseek4LoadedModel::load_with_context(
+                    opts,
+                    effective_context,
+                )?;
                 Ok(LoadedModel::Deepseek4(d))
             }
             "" => anyhow::bail!(
@@ -3299,6 +3308,10 @@ impl GemmaLoadedModel {
     /// Any future change to the load path belongs in a shared helper rather
     /// than duplicated here — maintainers: if you touch one, touch both.
     pub fn load(opts: &LoadOptions) -> Result<Self> {
+        Self::load_with_context(opts, None)
+    }
+
+    fn load_with_context(opts: &LoadOptions, effective_context: Option<u32>) -> Result<Self> {
         let load_start = Instant::now();
         // ADR-028 iter-461: opt-in sub-phase timing via HF2Q_LOAD_TIMING=1.
         // Surfaces where the 2.91 sec load_wall_clock is spent (per iter-460).
@@ -3343,8 +3356,11 @@ impl GemmaLoadedModel {
             t_phase = Instant::now();
         }
 
-        let config = Gemma4Config::from_gguf(&gguf)
+        let mut config = Gemma4Config::from_gguf(&gguf)
             .context("Failed to derive Gemma4Config from GGUF metadata")?;
+        if let Some(context) = effective_context {
+            config.max_position_embeddings = context as usize;
+        }
         if load_timing {
             tracing::info!(
                 "[LOAD_TIMING] config_parse={:.0}ms",
@@ -3377,12 +3393,15 @@ impl GemmaLoadedModel {
 
         // Context length: arch-prefixed metadata key.
         let arch = gguf.metadata_string("general.architecture").unwrap_or("");
-        let context_length = if arch.is_empty() {
+        let declared_context_length = if arch.is_empty() {
             None
         } else {
             gguf.metadata_u32(&format!("{arch}.context_length"))
                 .map(|v| v as usize)
         };
+        let context_length = effective_context
+            .map(|context| context as usize)
+            .or(declared_context_length);
 
         // Quant label: dominant non-fp tensor type. Promoted to
         // `crate::serve::load_info::infer_quant_label` per ADR-018 C1
@@ -3845,13 +3864,8 @@ impl GemmaLoadedModel {
         // of Phase 1's env-read discipline applied to the cb_bits gate.
         // `norms_per_pos = (hd / 256).max(1)` matches the legacy alloc
         // site at `gemma4/model.rs:1273`.
-        let cb_bits_provision: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
-            Ok("4") => 0,
-            Ok("5") => 5,
-            Ok("6") => 6,
-            Ok("8") => 8,
-            _ => 8, // DEFAULT: 8-bit (matches forward_prefill.rs line 835)
-        };
+        let cb_bits_provision =
+            crate::serve::api::tq_packed_descriptor::effective_gemma_tq_codebook_bits();
         if cb_bits_provision == 0 {
             let mut multi_seq_mlx: Vec<
                 crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache,
@@ -3939,7 +3953,9 @@ impl LoadInfoBuilder for GemmaLoadedModel {
             // misleading the load banner to say "full_attn_every=none"
             // when gemma actually has 5 of 30 Full-attention layers.
             full_attention_interval: self.config.full_attention_interval(),
-            max_context_length: self.context_length.map(|v| v as u32),
+            max_context_length: crate::serve::operator_settings::declared_context_length(gguf)
+                .ok()
+                .or_else(|| self.context_length.map(|v| v as u32)),
             moe,
             quant_label: self.quant_type.clone(),
             quant_bpw: load_info::compute_bpw(gguf),
@@ -4211,7 +4227,7 @@ impl Engine {
         // ADR-040 §3.5 iter-A5b — physical KV byte budget. Under
         // SerialFifo there is one slot; `None` ⇒ `0` ⇒ enforcement
         // disabled (pre-A5 byte-equivalence preserved for operators
-        // who do not set `--kv-cache-budget-bytes`). The same field
+        // who do not set `--kv-cache-budget`). The same field
         // also flows to the worker thread so the scheduler-side
         // FifoSchedulerAdapter::new_with_kv_budget enforces at admit.
         let initial_per_slot_kv_budget_bytes: u64 = kv_cache_budget_bytes.unwrap_or(0);
@@ -4387,16 +4403,7 @@ impl Engine {
                 // the SAME typed error at the SAME `max_slots`
                 // threshold, regardless of which per-arch provisioner
                 // would have run.
-                let threshold = read_continuous_batching_max_slots(|name| std::env::var(name).ok());
-                let allow_oversized =
-                    read_spec_decode_allow_oversized(|name| std::env::var(name).ok());
-                if max_slots > threshold && !allow_oversized {
-                    return Err(EngineSpawnError::SpecDecodeMaxSlotsAboveBatchedThreshold {
-                        max_slots,
-                        threshold,
-                        cite: ADR040_A4_DOSSIER_CITE,
-                    });
-                }
+                Self::validate_slot_aware_capacity(max_slots)?;
                 Self::spawn_with_mode_slot_aware_arch_dispatch(
                     loaded,
                     queue_capacity,
@@ -4405,6 +4412,24 @@ impl Engine {
                 )
             }
         }
+    }
+
+    /// Apply the environment-backed experimental oversized-slot gate without
+    /// loading a model. `hf2q info` calls the same authority so its static
+    /// verdict matches the later engine spawn.
+    pub(crate) fn validate_slot_aware_capacity(
+        max_slots: u32,
+    ) -> std::result::Result<(), EngineSpawnError> {
+        let threshold = read_continuous_batching_max_slots(|name| std::env::var(name).ok());
+        let allow_oversized = read_spec_decode_allow_oversized(|name| std::env::var(name).ok());
+        if max_slots > threshold && !allow_oversized {
+            return Err(EngineSpawnError::SpecDecodeMaxSlotsAboveBatchedThreshold {
+                max_slots,
+                threshold,
+                cite: ADR040_A4_DOSSIER_CITE,
+            });
+        }
+        Ok(())
     }
 
     /// ADR-040 Phase A4 iter-1 (2026-05-30) — per-arch dispatch helper
@@ -4782,7 +4807,8 @@ impl Engine {
         let initial_kv_fixed_bytes_per_slot_cached: u64 = info.kv_fixed_bytes_per_slot();
         tracing::info!(
             max_slots,
-            logical_context_tokens_per_slot = ?info.max_context_length,
+            logical_context_tokens_per_slot = ?context_length,
+            gguf_max_context_tokens = ?info.max_context_length,
             shared_physical_kv_budget_bytes = initial_per_slot_kv_budget_bytes,
             kv_bytes_per_token = initial_kv_bytes_per_token_cached,
             kv_fixed_bytes_per_slot = initial_kv_fixed_bytes_per_slot_cached,
@@ -4967,7 +4993,7 @@ impl Engine {
     /// compatibility; the returned value is not divided by `max_slots`.
     ///
     /// `0` means enforcement is disabled (operator did not set
-    /// `--kv-cache-budget-bytes`, or the synthetic-fixture
+    /// `--kv-cache-budget`, or the synthetic-fixture
     /// loader path). Exposed for handler-side pre-stream admit checks
     /// + Prometheus exposition.
     pub fn per_slot_kv_budget_bytes(&self) -> u64 {
@@ -5004,7 +5030,7 @@ impl Engine {
     /// Behaviour:
     /// - `per_slot_kv_budget_bytes == 0` ⇒ `Ok(())` (enforcement
     ///   disabled; preserves pre-A5 byte-equivalence for operators
-    ///   who did not set `--kv-cache-budget-bytes`).
+    ///   who did not set `--kv-cache-budget`).
     /// - `kv_bytes_per_token == 0` ⇒ `Ok(())` (synthetic fixture /
     ///   LoadInfo arch facts missing — treat as "do not enforce" to
     ///   match the scheduler-side opt-out contract).
@@ -19613,7 +19639,7 @@ fn worker_run(
     // ADR-040 §0.0 — scheduler-side shared physical KV budget wiring.
     // The legacy field name remains wire-compatible. A zero value means "enforcement
     // disabled" (preserves pre-A5 byte-equivalence for operators who
-    // do not set `--kv-cache-budget-bytes`).  The wrap helper
+    // do not set `--kv-cache-budget`).  The wrap helper
     // `new_with_kv_budget` accepts `0` and is byte-equivalent to
     // `new(queue_capacity)` in that case (per scheduler.rs tests).
     // ADR-040 Phase C iter-2c (C2c): switch from concrete
@@ -20898,7 +20924,7 @@ fn worker_run(
                 // prompts at admit. `kv_bytes_per_token == 0` or
                 // `per_slot_kv_budget_bytes == 0` opts out (synthetic
                 // fixtures + operators who didn't set
-                // `--kv-cache-budget-bytes`).
+                // `--kv-cache-budget`).
                 let needed_bytes_admit: u64 =
                     if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
                         0
@@ -21303,7 +21329,7 @@ fn worker_run(
                 // for the vision-aware generate path. Shares the same
                 // (prompt_tokens + max_tokens) × kv_bytes_per_token
                 // formula as the text-only Generate arm. `0` opts out
-                // (synthetic fixtures + unset --kv-cache-budget-bytes).
+                // (synthetic fixtures + unset --kv-cache-budget).
                 let needed_bytes_admit: u64 =
                     if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
                         0
@@ -32097,7 +32123,7 @@ assistant:
     #[test]
     fn a5b_try_admit_budget_returns_ok_when_only_per_token_set() {
         // Per-token set but budget = 0 ⇒ Ok (operator didn't pass
-        // --kv-cache-budget-bytes; preserves pre-A5 byte-equivalence).
+        // --kv-cache-budget; preserves pre-A5 byte-equivalence).
         let engine = make_test_engine_with_worker_arch_and_budget(
             LoadedArch::Gemma,
             0,
@@ -34130,6 +34156,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let loaded_a = LoadedModel::load(&load_opts).expect("LoadedModel::load (a)");
         let loaded_b = LoadedModel::load(&load_opts).expect("LoadedModel::load (b)");
@@ -34380,6 +34407,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         // Fixed prompt set (the same prompts the N=4 parity + interleave
         // tests use, so golden ↔ parity are directly comparable).
@@ -34440,6 +34468,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -34484,6 +34513,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         // Two DISTINCT prompts so cross-slot contamination is visible.
         let p0: Vec<u32> = vec![1u32, 2, 3, 4, 5];
@@ -34696,6 +34726,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -34755,6 +34786,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let params = SamplingParams {
@@ -35046,6 +35078,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_tokens = 16usize;
@@ -35290,6 +35323,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_tokens = 16usize;
@@ -35554,6 +35588,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
 
         // Four distinct greedy prompts.
@@ -35648,6 +35683,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let eager_prompt = vec![42u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize];
         let resumed_prompt = vec![43u32; GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize * 2 + 1];
@@ -35779,6 +35815,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
 
         // IDENTICAL prompt in all four slots. Serial ref at the LONGEST budget so
@@ -35909,6 +35946,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
 
         // Eight distinct greedy prompts (the N=4 set + four more distinct ones).
@@ -36068,6 +36106,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let prompt = vec![1u32, 2, 3];
         let params = SamplingParams {
@@ -36105,6 +36144,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let prompt = vec![1u32, 2, 3];
         let params = SamplingParams {
@@ -36177,6 +36217,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
 
         // Eight distinct greedy prompts (same shape as the gemma4 N=8 gate).
@@ -36288,6 +36329,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
 
         let prompt_len: usize = std::env::var("HF2Q_S019_PROMPT_LEN")
@@ -36417,6 +36459,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
 
         // N=1 mechanism gate: a single 70-token prompt exercising the full
@@ -36551,6 +36594,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let lens = [26u32, 40, 13, 55, 70, 19, 33, 48];
         let mk = |i: u32, l: u32| -> Vec<u32> {
@@ -36672,6 +36716,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         // Every request is at or above the conservative tiny-prefill boundary,
         // so this test continues to prove that the eligible multi-seq path
@@ -36803,6 +36848,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         // A len configurable via HF2Q_BISECT_ALEN (default 2 → B offset 2 ≡2 mod4).
         // B len via HF2Q_BISECT_BLEN (default 10). Use larger to hit tensor-mm (>64).
@@ -36960,6 +37006,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         // HF2Q_BENCH_TOKENS = decode length per stream (default 128).
         let bench_tokens: usize = std::env::var("HF2Q_BENCH_TOKENS")
@@ -37318,6 +37365,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
 
         // Same prompt, divergent max_tokens (5 / 50 / 200) so slots finish
@@ -37419,6 +37467,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
         let max_decode = 1usize; // first-token prefill logits only
@@ -37768,6 +37817,7 @@ assistant:
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let loaded_a = LoadedModel::load(&load_opts).expect("LoadedModel::load (a, H2)");
         let loaded_b = LoadedModel::load(&load_opts).expect("LoadedModel::load (b, H2)");
@@ -41460,7 +41510,7 @@ mod adr040_phase_c_iter1_engine_mode_tests {
     use super::*;
 
     /// AC-3 pin — `EngineMode::default()` is `SerialFifo`. This is the
-    /// production-default contract under §3.6: with `HF2Q_SCHEDULER` unset,
+    /// production-default contract under §3.6: with no CLI/config scheduler,
     /// the engine behaves byte-for-byte as pre-ADR-040.
     #[test]
     fn engine_mode_default_is_serial_fifo() {
@@ -42684,6 +42734,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let loaded =
             LoadedModel::load(&opts).expect("H21: LoadedModel::load must succeed for Gemma 4 GGUF");
@@ -42749,6 +42800,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let loaded = LoadedModel::load(&opts).expect("H22: load Gemma 4 GGUF");
         let mut g = match loaded {
@@ -42822,6 +42874,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let loaded = LoadedModel::load(&opts).expect("H23: load Gemma 4 GGUF");
         let g = match loaded {
@@ -42887,6 +42940,7 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let loaded = LoadedModel::load(&opts).expect("H24: load Gemma 4 GGUF");
         let engine =
@@ -47575,7 +47629,7 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
 // explicitly") is NOT MET today. Per the decision matrix in §3.6, the
 // production default REMAINS [`EngineMode::SerialFifo`]; SlotAware
 // stays opt-in behind `--engine-mode=slot-aware` / `--scheduler
-// inflight_batched` + `HF2Q_SCHEDULER=inflight_batched`. The
+// inflight-batched`. The
 // kernel-level lifts (iter-A2b-cont, iter-C2d-cont-kernel,
 // iter-B4c-kernel) survive as TYPED DEFERRALS pinned by H38 + H43
 // label strings, ready to fire when the reopen trigger lands.
@@ -47691,18 +47745,16 @@ mod adr040_phase_e1_closure_tests {
         );
     }
 
-    /// **H47 (skip-mode)** — SlotAware is opt-in via BOTH `--scheduler
-    /// inflight_batched` (CLI flag, per §6.1.9 C4) and
-    /// `HF2Q_SCHEDULER=inflight_batched` (env, per §6.1.9 C4).
-    /// Source-grep over `cli.rs` for the flag declaration + over
-    /// `serve/mod.rs` for the env wiring.
+    /// **H47 (skip-mode)** — SlotAware is opt-in via the typed
+    /// `--scheduler inflight-batched` CLI/config contract. There is no
+    /// hidden environment fallback.
     ///
     /// This is the operator-facing forward runbook: when the reopen
     /// trigger fires, the operator does NOT need a new release — the
     /// opt-in surface is already there. Drift here would mean the
     /// runbook is broken before the trigger lands.
     #[test]
-    fn h47_slot_aware_is_opt_in_via_cli_flag_and_env_per_c4() {
+    fn h47_slot_aware_is_opt_in_via_cli_and_config_per_operator_contract() {
         // CLI flag — `cli.rs` declares the `--scheduler` flag with
         // a `SchedulerArg` value enum + the `--max-slots` companion
         // flag.
@@ -47732,25 +47784,21 @@ mod adr040_phase_e1_closure_tests {
              discriminant is gone."
         );
 
-        // Env wiring — `serve/mod.rs` reads `HF2Q_SCHEDULER` +
-        // `HF2Q_MAX_SLOTS` via `parse_scheduler_config`.
+        // Runtime wiring — one shared resolver consumes the Clap planning
+        // object and optional setup defaults. Process env is not a control
+        // plane for scheduler or slot count.
         let mod_src = include_str!("../mod.rs");
         assert!(
-            mod_src.contains("HF2Q_SCHEDULER"),
-            "H47 FALSIFIED: `serve/mod.rs` no longer reads the \
-             `HF2Q_SCHEDULER` env var — env-side opt-in is gone."
+            mod_src.contains("operator_settings::resolve_scheduler"),
+            "H47 FALSIFIED: serve no longer uses the shared typed scheduler resolver."
         );
         assert!(
-            mod_src.contains("HF2Q_MAX_SLOTS"),
-            "H47 FALSIFIED: `serve/mod.rs` no longer reads the \
-             `HF2Q_MAX_SLOTS` env var — operator can't tune slot \
-             count via env."
+            !mod_src.contains("std::env::var(\"HF2Q_SCHEDULER\")"),
+            "H47 FALSIFIED: hidden scheduler env fallback returned."
         );
         assert!(
-            mod_src.contains("parse_scheduler_config"),
-            "H47 FALSIFIED: `serve/mod.rs` no longer threads \
-             `parse_scheduler_config` — the CLI + env join point \
-             is gone."
+            !mod_src.contains("std::env::var(\"HF2Q_MAX_SLOTS\")"),
+            "H47 FALSIFIED: hidden max-slots env fallback returned."
         );
     }
 

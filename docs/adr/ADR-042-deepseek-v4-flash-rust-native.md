@@ -4,6 +4,8 @@
 
 - **Status:** Accepted for hf2q 0.1.2; full-context four-agent serving and
   cache growth revalidated 2026-08-08
+- **Context operator surface:** superseded by
+  [ADR-050](ADR-050-operator-context-and-static-info.md) on 2026-08-23
 - **Updated:** 2026-08-22 — the four-agent workload is bound to an immutable
   insertion-ordered prompt contract and historical tool-result payload;
   `mlx-native =0.10.12` fixes non-aligned D512 tail loads; warm compatible
@@ -63,9 +65,10 @@ matrix transaction so an agentic follow-up does not degrade into full
 decode-style replay. The 2K bound is measured: 4K prefill exceeded the Metal
 command-buffer working-set limit beside the 100.05 GiB artifact, while 2K
 preserved matrix prefill without OOM. The OpenAI server context is configured
-with `HF2Q_DEEPSEEK_MAX_SEQ_LEN` and capped by checkpoint metadata. The separate
-DSpark draft artifact remains follow-up work and is never silently represented
-as part of the base GGUF.
+with `serve --ctx <TOKENS>` (or `[serve] ctx`). Omission uses the GGUF-declared
+maximum, while an explicit value above that declaration is rejected before
+tensor loading. The separate DSpark draft artifact remains follow-up work and
+is never silently represented as part of the base GGUF.
 
 Agentic serving is stateful. A growing rendered transcript reuses the exact
 live native KV/recurrent prefix and evaluates only its suffix. Because the
@@ -497,7 +500,7 @@ changes. The measured candidate is
 | Tool semantics | The curl/OpenAI-compatible harness made required and automatic choice both select `read_file` with exactly `/opt/hf2q/Cargo.toml`; unary and SSE returned valid OpenAI `tool_calls` and `finish_reason: "tool_calls"`. The source-argument regression also returned `fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result` byte-for-byte in one `emit_source` call (4 s response), proving the formerly truncated `<` syntax through the real model. A real OpenCode two-turn run issued five tool calls on its first turn and two on its second, changed the requested source, and passed the named oracle/regression checks in the same session. |
 | Tool-result continuation | With tools enabled in `auto` mode, the model consumed the Cargo result and returned the requested sentinel without another call. The real OpenCode continuation consumed prior tool results, issued the next required calls, and reused the same live session. |
 | Prefix reuse | The current checked-in gate used a 6,262-token prompt and reused 6,254 tokens on repeated, automatic, SSE, and post-tool turns. Cold TTFT was 9.564 s and cached TTFT was 227 ms; every required/automatic tool, source-argument, tool-result, unary, and SSE assertion passed. |
-| Canonical launcher | `scripts/serve_deepseek4_opencode.sh` passed the curl agentic gate, the real OpenCode coding run, the four-agent full-context gate, and the 120K cache-growth gate. It advertises 524,288 tokens for every slot and demand-allocates 131K initially. Memory/port preflight refuses an unsafe 100 GiB load before model mapping. The 131K-to-262K boundary is proven; a near-512K physical allocation remains unproven on this 128 GiB host. |
+| Canonical launcher | `scripts/serve_deepseek4_opencode.sh` passed the curl agentic gate, the real OpenCode coding run, the four-agent full-context gate, and the 120K cache-growth gate. The recorded gate advertised 524,288 tokens for every slot and demand-allocated 131K initially. ADR-050 changes the launcher default to an explicit 262,144-token per-slot cap and makes `CHECK_ONLY=1` run the matching static `hf2q info` plan after the host-memory checks. The 131K-to-262K boundary is proven; a near-512K physical allocation remains unproven on this 128 GiB host. |
 | Ordinary agentic prompt | On the same approximately 5.9K-token README coding prompt, hf2q warm prefill was about 518 tok/s and median decode was 32.1 tok/s; peer build 10293 reported 399.4 prompt tok/s and 31.7 generation tok/s. |
 | 120K cold prompt | `scripts/test_deepseek4_long_context_cache.sh` produced the exact required tool call for 119,808 prompt tokens in 321.034 s TTFT (373.194 tok/s); decode was 23.869 tok/s. The same source-bound prompt and artifact under peer build 10298 processed 119,807 tokens in 749.015 s (159.953 tok/s) and decoded at 19.565 tok/s. hf2q was 2.33x the reference prompt rate and 1.22x its decode rate for these source-bound runs. |
 | 120K continuation cache | Appending the real tool result produced a 119,907-token request that reused 119,800 tokens (99.91%), evaluated only a 107-token suffix, returned its first semantic event in 1.113 s, and emitted the exact requested sentinel. |
@@ -1649,11 +1652,11 @@ and compact JSON. A boundary regression proves the space-prefixed opening quote
 remains sampleable, while null required strings and malformed nested bodies
 remain rejected.
 
-The canonical launcher also defaults `HF2Q_DEFAULT_REPETITION_PENALTY` to
-`1.0`. Its former hidden `1.05` value distorted constrained strings and did not
-prevent client-side action loops. Operators may still opt into a measured
-non-default value; hf2q does not silently change a stock client's sampling
-request.
+The canonical launcher also passes `--default-repetition-penalty 1.0`. The
+former hidden `1.05` value distorted constrained strings and did not prevent
+client-side action loops. Operators may still opt into a measured non-default
+value through the typed flag or `[serve] repetition_penalty`; hf2q does
+not silently change a stock client's sampling request.
 
 The exact 107,431,343,168-byte artifact (SHA-256
 `936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`) then

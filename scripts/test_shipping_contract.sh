@@ -6,6 +6,8 @@ contract="$repo_root/docs/shipping-contract.md"
 readme="$repo_root/README.md"
 manifest="$repo_root/Cargo.toml"
 arch_catalog="$repo_root/src/quantize/ggml_quants/tensor_ref.rs"
+deepseek_launcher="$repo_root/scripts/serve_deepseek4_opencode.sh"
+deepseek_parity="$repo_root/scripts/benchmark_deepseek4_server_parity.sh"
 
 fail() {
     echo "shipping-contract check failed: $*" >&2
@@ -75,6 +77,14 @@ require_literal "$contract" "ADR-041"
 reject_literal "$contract" "Qwen SlotAware soft-token, deepstack, and 3D-position generation"
 reject_literal "$readme" "vision (\`qwen3vl\`)"
 require_literal "$readme" "Standalone Qwen3-VL generation and serving fail closed"
+
+# The canonical DeepSeek launcher and matched peer benchmark share the real
+# typed context surface. A benchmark-local CONTEXT_LEN remains valid input to
+# the harness, but it must reach hf2q as --ctx rather than a dead launcher env.
+require_literal "$deepseek_launcher" '--ctx "$CONTEXT_TOKENS"'
+reject_literal "$deepseek_launcher" 'CONTEXT_LEN'
+require_literal "$deepseek_parity" 'serve_deepseek4_opencode.sh" --ctx "$CONTEXT_LEN"'
+reject_literal "$deepseek_parity" 'HF2Q_BIN="$HF2Q_BIN" CONTEXT_LEN='
 
 bash "$repo_root/scripts/test_getting_started_guide.sh"
 

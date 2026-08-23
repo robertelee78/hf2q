@@ -181,7 +181,7 @@ pub struct Qwen35LoadedModel {
 
     /// ADR-027 Phase A iter-6b.2 — disk back-end for cold-process LCP
     /// resume. `Some` iff `LoadOptions.kv_persist_dir` was set
-    /// (sourced from `HF2Q_KV_PERSIST` env). When present,
+    /// (typed `serve --kv-persist` on the server path). When present,
     /// `store_lcp_with_disk_writeback` writes through to disk on every
     /// successful `lcp_registry.store`, ensuring snapshots persist
     /// across process crashes / restarts. `None` keeps the legacy
@@ -284,16 +284,23 @@ impl Qwen35LoadedModel {
         for (key, value) in [("HF2Q_DECODE_MVN", "0"), ("HF2Q_DECODE_MV_EXT", "1")] {
             if std::env::var_os(key).is_none() {
                 std::env::set_var(key, value);
-                tracing::info!(
-                    key,
-                    value,
-                    "applied Qwen3.8-qualified decode route default"
-                );
+                tracing::info!(key, value, "applied Qwen3.8-qualified decode route default");
             }
         }
     }
 
     pub fn load(opts: &LoadOptions) -> Result<Self> {
+        Self::load_with_context(opts, None)
+    }
+
+    /// Load the weights and apply an already header-validated serving
+    /// context before any Qwen KV cache can be provisioned. Qwen's caches are
+    /// lazy, but keeping the cap inside the family loader prevents a future
+    /// allocation from accidentally observing the intrinsic GGUF maximum.
+    pub(crate) fn load_with_context(
+        opts: &LoadOptions,
+        effective_context: Option<u32>,
+    ) -> Result<Self> {
         let load_start = Instant::now();
         let model_path = &opts.model_path;
         Self::apply_qwen38_qualified_decode_route(model_path);
@@ -350,6 +357,9 @@ impl Qwen35LoadedModel {
         );
         let mut model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
             .context("Qwen35Model::load_from_gguf")?;
+        if let Some(context) = effective_context {
+            model.cfg.max_position_embeddings = context;
+        }
         // ADR-018 C3: legacy `tracing::info!("Qwen35 SERVE load: weights loaded ({} layers, variant={:?})", ...)`
         // was deleted here. `emit_tracing(&info)` surfaces both `n_layers`
         // and architecture facts as structured fields.
@@ -527,33 +537,18 @@ impl Qwen35LoadedModel {
             // Wired by AppState via LoadedModel::generate at request
             // time; None by default.
             kv_metrics_sink: None,
-            // ADR-027 Phase A iter-6b.2: construct disk persistor when
-            // HF2Q_KV_PERSIST is set. Failure to mkdir → log + None
+            // ADR-027 Phase A iter-6b.2: construct the disk persistor when
+            // the typed serve plan supplies --kv-persist. Failure to mkdir → log + None
             // (graceful fallback to in-process-only; do NOT bail engine
             // load on persistence-layer failure — degrades to legacy
             // behavior, doesn't break inference).
             disk_persistor: opts.kv_persist_dir.as_ref().and_then(|cache_dir| {
-                // ADR-027 sub-iter 23d-γ: wire HF2Q_KV_PERSIST_BUDGET_BYTES
-                // into the qwen35 LCP persistor (same env + parse
-                // semantics as the block-store budget at
-                // `serve/mod.rs:4208`; 0 = unlimited). Without this the
+                // ADR-027 sub-iter 23d-γ: wire the same typed disk budget as
+                // the generic block store into the qwen35 LCP persistor.
+                // Zero means unlimited. Without this the
                 // write-through path grew unbudgeted — 105 GB observed
                 // for a single ~100K-token agentic session.
-                let budget_bytes: u64 = match std::env::var("HF2Q_KV_PERSIST_BUDGET_BYTES") {
-                    Ok(raw) => match raw.trim().parse::<u64>() {
-                        Ok(parsed) => parsed,
-                        Err(err) => {
-                            tracing::warn!(
-                                raw = %raw,
-                                error = %err,
-                                "ADR-027 23d-γ: HF2Q_KV_PERSIST_BUDGET_BYTES parse failed; \
-                                 defaulting to 0 (unlimited)"
-                            );
-                            0
-                        }
-                    },
-                    Err(_) => 0,
-                };
+                let budget_bytes = opts.kv_persist_budget_bytes;
                 match crate::serve::kv_persist::families::qwen35_disk_persistor::Qwen35DiskPersistor::new_with_budget(cache_dir.clone(), budget_bytes) {
                     Ok(p) => {
                         tracing::info!(
@@ -617,7 +612,7 @@ impl Qwen35LoadedModel {
         // warnings that described both combinations as unimplemented.
         if loaded.tq_kv_active && opts.kv_persist_dir.is_some() {
             tracing::info!(
-                "ADR-027 sub-iter 23d-γ: HF2Q_TQ_KV=1 + HF2Q_KV_PERSIST both active — \
+                "ADR-027 sub-iter 23d-γ: TQ KV + typed persistent-KV path both active — \
                  persist snapshots round-trip the compact TQ substrate (codec v5); \
                  fingerprint is capacity-independent and substrate-namespaced so \
                  cross-mode hydration is a clean miss."
@@ -753,7 +748,7 @@ impl Qwen35LoadedModel {
     /// prefill looks for stride-aligned matches.
     ///
     /// No-ops cleanly when:
-    /// - `disk_persistor` is None (HF2Q_KV_PERSIST not set)
+    /// - `disk_persistor` is None (no typed persistent-KV path supplied)
     /// - this cfg-fingerprint has already been hydrated this process
     /// - the on-disk per-cfg subdir doesn't exist yet (clean cold start)
     ///
@@ -768,7 +763,7 @@ impl Qwen35LoadedModel {
     ) {
         let persistor = match &self.disk_persistor {
             Some(p) => std::sync::Arc::clone(p),
-            None => return, // HF2Q_KV_PERSIST not set — nothing to hydrate
+            None => return, // no typed persistent-KV path — nothing to hydrate
         };
         let cfg = match crate::serve::kv_persist::families::qwen35_hybrid_persistor::cfg_from_cache(
             kv_cache,
@@ -961,7 +956,9 @@ impl LoadInfoBuilder for Qwen35LoadedModel {
             head_dim: cfg.head_dim,
             sliding_window: None,
             full_attention_interval: Some(cfg.full_attention_interval),
-            max_context_length: self.context_length.map(|v| v as u32),
+            max_context_length: crate::serve::operator_settings::declared_context_length(gguf)
+                .ok()
+                .or_else(|| self.context_length.map(|v| v as u32)),
             moe: cfg.moe.as_ref().map(|m| MoeShape {
                 n_experts: m.num_experts,
                 n_experts_per_tok: m.num_experts_per_tok,
@@ -1961,7 +1958,8 @@ fn generate_qwen35_once_ordinary(
 
     // ADR-027 iter-6b.3: cold-start hydrate of in-memory LcpRegistry
     // from disk-persisted snapshots.  Idempotent + cheap on hot path
-    // (HashSet lookup) — no-op when HF2Q_KV_PERSIST is unset, when
+    // (HashSet lookup) — no-op when no typed persistent-KV path was
+    // supplied, when
     // this cfg has already been hydrated this process, or when the
     // cfg-subdir is empty.
     qwen.hydrate_lcp_registry_from_disk(&kv_cache, &device);
@@ -2433,7 +2431,7 @@ fn generate_qwen35_once_ordinary(
                                 .map(|s| s.recurrent.byte_len())
                                 .unwrap_or(0);
                             // ADR-027 iter-6b.2: route store through the
-                            // disk-write-through helper so HF2Q_KV_PERSIST
+                            // disk-write-through helper so typed persistent-KV
                             // sessions persist mid-prefill snapshots.
                             // Helper falls back to bare in-memory store
                             // when disk_persistor is None (zero-cost).
@@ -10440,6 +10438,7 @@ mod tests {
             config_path: None,
             dwq_overlay_path: None,
             kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let res = Qwen35LoadedModel::load(&opts);
         assert!(res.is_err());

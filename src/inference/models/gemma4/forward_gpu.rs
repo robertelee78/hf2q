@@ -469,11 +469,11 @@ impl MlxModelWeights {
         // forward_prefill may have already allocated this; if not, do it here.
         // We read from the INVESTIGATION_ENV LazyLock (parsed once at process start).
         {
-            // ADR-007 post-close correction 2026-04-24: TQ-8-bit is the default when
-            // env is unset. Explicit HF2Q_TQ_CODEBOOK_BITS=4 selects the legacy 4-bit
-            // native flash_attn_vec_tq path (127-byte sourdough ceiling, not shippable
-            // as default). Explicit =5/=6 select intermediate HB-SDPA. This MUST match
-            // the primary gate at tq_codebook_bits below.
+            // ADR-007 post-close correction 2026-04-24: TQ-8-bit is the default.
+            // An effective 4-bit selection chooses the legacy native
+            // flash_attn_vec_tq path (127-byte sourdough ceiling, not shippable as
+            // default); 5/6 choose intermediate HB-SDPA. This MUST match the primary
+            // gate at tq_codebook_bits below.
             // ADR-005 wave-1 T1.2: read from INVESTIGATION_ENV LazyLock (parsed once at
             // process start) instead of calling std::env::var per forward_decode call.
             let cb_bits: u32 = INVESTIGATION_ENV.tq_codebook_bits;
@@ -610,7 +610,7 @@ impl MlxModelWeights {
         // TQ-packed K/V directly with no F32 shadow-cache round-trip.
 
         // iter-21 Track B + 2026-04-24 post-close default correction.
-        // HF2Q_TQ_CODEBOOK_BITS selects the KV codebook width.
+        // The effective typed/development setting selects the KV codebook width.
         //   unset  (DEFAULT) = 8-bit native HB SDPA (2× memory savings vs F16, 0.017 PPL
         //                      absolute / 1.24% delta, cosine 0.9998 — meets TurboQuant
         //                      paper + KIVI + KVQuant + AmesianX + vLLM published gates)
@@ -622,25 +622,25 @@ impl MlxModelWeights {
         let tq_codebook_bits: u32 = {
             static CODEBOOK_BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
             *CODEBOOK_BITS.get_or_init(|| {
-                match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
-                    Ok("4") => {
-                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] 4-bit legacy TQ (opt-in; 127-byte sourdough ceiling)");
+                match crate::serve::api::tq_packed_descriptor::effective_tq_codebook_bits() {
+                    4 => {
+                        eprintln!("[TQ KV] 4-bit legacy TQ (opt-in; 127-byte sourdough ceiling)");
                         0u32
                     }
-                    Ok("5") => {
-                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] 5-bit Lloyd-Max native HB SDPA");
+                    5 => {
+                        eprintln!("[TQ KV] 5-bit Lloyd-Max native HB SDPA");
                         5u32
                     }
-                    Ok("6") => {
-                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] 6-bit Lloyd-Max native HB SDPA");
+                    6 => {
+                        eprintln!("[TQ KV] 6-bit Lloyd-Max native HB SDPA");
                         6u32
                     }
-                    Ok("8") | Err(_) => {
-                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] 8-bit Lloyd-Max native HB SDPA (default)");
+                    8 => {
+                        eprintln!("[TQ KV] 8-bit Lloyd-Max native HB SDPA (default)");
                         8u32
                     }
-                    Ok(other) => {
-                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] unknown value {:?}; defaulting to 8-bit", other);
+                    other => {
+                        eprintln!("[TQ KV] unknown value {:?}; defaulting to 8-bit", other);
                         8u32
                     }
                 }

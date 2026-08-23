@@ -39,11 +39,6 @@ use self::progress::RequestProgress;
 use super::engine::LoadOptions;
 use super::engine_supervisor::EngineSupervisor;
 
-/// First practical OpenCode target: enough headroom for the ~100K-token
-/// sessions already used by the repository's Qwen serving harness. Operators
-/// can lower/raise it with `HF2Q_DEEPSEEK_MAX_SEQ_LEN`; model metadata remains
-/// authoritative.
-pub const DEFAULT_CONTEXT_LENGTH: usize = 131_072;
 const INITIAL_CACHE_LENGTH: usize = 131_072;
 const RECOVERY_TAIL_TOKENS: usize = 8;
 
@@ -707,6 +702,13 @@ impl Deepseek4LoadedModel {
     }
 
     pub fn load(opts: &LoadOptions) -> Result<Self> {
+        Self::load_with_context(opts, None)
+    }
+
+    pub(crate) fn load_with_context(
+        opts: &LoadOptions,
+        effective_context: Option<u32>,
+    ) -> Result<Self> {
         let started = Instant::now();
         let gguf = GgufFile::open(&opts.model_path)
             .map_err(|error| anyhow::anyhow!("GGUF open: {error}"))?;
@@ -744,17 +746,9 @@ impl Deepseek4LoadedModel {
             mapped_weight_segments = model.weights.mapped_segment_count(),
             "DeepSeek-V4 weight residency established"
         );
-        let requested_context = std::env::var("HF2Q_DEEPSEEK_MAX_SEQ_LEN")
-            .ok()
-            .map(|value| {
-                value.parse::<usize>().with_context(|| {
-                    format!("HF2Q_DEEPSEEK_MAX_SEQ_LEN must be a positive integer, got {value:?}")
-                })
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_CONTEXT_LENGTH);
-        anyhow::ensure!(requested_context > 0, "DeepSeek-V4 context must be nonzero");
-        let context_length = requested_context.min(model.cfg.max_position_embeddings as usize);
+        let context_length =
+            effective_context.unwrap_or(model.cfg.max_position_embeddings) as usize;
+        anyhow::ensure!(context_length > 0, "DeepSeek-V4 context must be nonzero");
         anyhow::ensure!(
             context_length >= model.cfg.sliding_window as usize,
             "DeepSeek-V4 serving context {context_length} must be at least the {}-token native window",
@@ -1609,7 +1603,9 @@ impl LoadInfoBuilder for Deepseek4LoadedModel {
             head_dim: self.model.cfg.head_dim,
             sliding_window: Some(self.model.cfg.sliding_window),
             full_attention_interval: None,
-            max_context_length: self.context_length.map(|value| value as u32),
+            max_context_length: crate::serve::operator_settings::declared_context_length(gguf)
+                .ok()
+                .or_else(|| self.context_length.map(|value| value as u32)),
             moe: Some(MoeShape {
                 n_experts: self.model.cfg.num_experts,
                 n_experts_per_tok: self.model.cfg.num_experts_per_tok,

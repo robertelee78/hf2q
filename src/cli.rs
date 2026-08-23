@@ -107,7 +107,7 @@ pub enum Command {
     /// Patch an existing GGUF file's metadata without changing tensor bytes
     GgufPatch(GgufPatchArgs),
 
-    /// Inspect model metadata before converting
+    /// Preview how a local GGUF would be served without loading tensor data
     Info(InfoArgs),
 
     /// Run the pinned Qwen3.8 source-teacher evidence canary.
@@ -285,6 +285,11 @@ pub struct SetupArgs {
     /// Default active-request slots for inflight-batched serving.
     #[arg(long, value_name = "N")]
     pub serve_max_slots: Option<u32>,
+
+    /// Default disk ceiling for persistent KV data. Accepts bytes or units
+    /// such as `32GiB`; `0` means no explicit ceiling.
+    #[arg(long, value_name = "SIZE")]
+    pub serve_kv_persist_budget: Option<String>,
 
     /// Accept the displayed values without prompting. A fresh config uses the
     /// canonical Qwen3.8 guide defaults; a rerun retains current values.
@@ -777,13 +782,25 @@ pub struct SmokeArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct InfoArgs {
-    /// Local safetensors directory
-    #[arg(long, conflicts_with = "repo")]
-    pub input: Option<PathBuf>,
+    /// Path to the text-model GGUF to inspect.
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        add = clap_complete::ArgValueCompleter::new(complete::decoder_model_paths)
+    )]
+    pub model: PathBuf,
 
-    /// HuggingFace repo ID
-    #[arg(long, conflicts_with = "input")]
-    pub repo: Option<String>,
+    /// Exact multimodal projector GGUF that the matching serve invocation
+    /// would use. No sibling-file discovery is performed.
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        add = clap_complete::ArgValueCompleter::new(complete::mmproj_model_paths)
+    )]
+    pub mmproj: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub planning: ServePlanningArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -900,9 +917,9 @@ pub struct GenerateArgs {
     /// it is structurally redundant with F16 dense (`HF2Q_USE_DENSE=1`)
     /// and adds no compression benefit. See ADR §F-2 finding.
     ///
-    /// When unset, falls back to `HF2Q_TQ_CODEBOOK_BITS` env var (default 8).
-    /// When set, this flag wins and pre-populates the env var before the
-    /// engine initializes.
+    /// When unset, defaults to 8. `HF2Q_TQ_CODEBOOK_BITS` remains a
+    /// development-only fallback; this typed flag wins without mutating the
+    /// process environment.
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["4", "5", "6", "8"]))]
     pub kv_bits: Option<String>,
 
@@ -1100,10 +1117,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub port: Option<u16>,
 
-    /// Maximum sequence length (reserved for future iterations — context
-    /// length is read from GGUF metadata).
-    #[arg(long, default_value = "4096")]
-    pub max_seq_len: usize,
+    #[command(flatten)]
+    pub planning: ServePlanningArgs,
+
+    #[command(flatten)]
+    pub behavior: ServeBehaviorArgs,
 
     /// Bearer token required on every request (Decision #8). Unset = no auth.
     /// Also read from `HF2Q_AUTH_TOKEN` env var if --auth-token is absent
@@ -1194,75 +1212,76 @@ pub struct ServeArgs {
     /// disables that check; corruption silently passes through.
     #[arg(long, default_value_t = false)]
     pub no_integrity: bool,
+}
 
-    /// ADR-017 Phase C.1 — enable persistent block-prefix KV cache to
-    /// disk. The argument is the cache directory (e.g.
-    /// `/tmp/hf2q-kv-persist` or `$HOME/.cache/hf2q/kv-persist`). The
-    /// directory is created if missing; the recovery scan runs at
-    /// startup to rebuild the in-memory `BlockIndex` from any
-    /// previously-written envelopes.
-    ///
-    /// When unset (default), the engine wires `NoopKvSpiller` and
-    /// behaves byte-identical to the pre-ADR-017 path. When set, the
-    /// engine wires `BlockPrefixCacheSpiller` + a per-loaded-family
-    /// `EngineBindable` registration so the spiller's `pre_evict` /
-    /// `post_admit` triggers route through the on-disk lifecycle.
-    ///
-    /// C.1 ships the WIRING substrate. The actual sourdough byte-exact
-    /// coherence run + perf-validation matrix lands in Phase D after
-    /// B-dense.2's round-trip parity matrix on real GGUF; until then,
-    /// the C.1 default registration uses `StubGemma4Spill` (always
-    /// `Skipped` on snapshot/restore) so the on-path is observable
-    /// but functionally inert.
-    #[arg(long = "kv-persist", value_name = "PATH")]
-    pub kv_persist_path: Option<PathBuf>,
+/// Operator controls shared by `serve` and the static `info` preview.
+/// Keeping one Clap definition prevents parsing, help, and completions from
+/// drifting between the command that previews a model and the command that
+/// loads it.
+#[derive(clap::Args, Debug, Clone)]
+pub struct ServePlanningArgs {
+    /// Logical context limit for every conversation slot. Overrides
+    /// `[serve] ctx`; when neither is set, hf2q uses the maximum declared by
+    /// the model GGUF. A value above that maximum is an error, and the
+    /// context is never divided by --max-slots.
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
+    pub ctx: Option<u32>,
 
-    /// ADR-040 Phase C iter-4 (C4) — scheduler-policy selection for the
-    /// in-process [`serve::api::engine::Engine`].
-    ///
-    /// `fifo_serial` (default) preserves the ADR-005 Decision #2 + #19
-    /// production contract byte-for-byte: one mpsc channel, one worker
-    /// thread, serialized FIFO dispatch, 429 + Retry-After on queue
-    /// overflow. This is the value the operator gets when the flag and
-    /// the `HF2Q_SCHEDULER` env var are BOTH unset (ADR-040 §3.6
-    /// backward-compat pledge).
-    ///
-    /// `inflight_batched` activates ADR-040's slot-aware path
-    /// ([`EngineMode::SlotAware`]). Supported families provision independent
-    /// full-context cache sessions and interleave active requests. Unsupported
-    /// families fail at spawn rather than silently sharing cache state.
-    ///
-    /// Also read from `HF2Q_SCHEDULER` if `--scheduler` is absent.
-    /// CLI flag wins on conflict (mirrors `--auth-token` semantics).
-    #[arg(long = "scheduler", value_name = "POLICY", value_enum)]
+    /// Request scheduler. Overrides `[serve] scheduler`. `fifo-serial` serves
+    /// one active conversation; `inflight-batched` interleaves independent
+    /// conversation slots.
+    #[arg(long, value_name = "POLICY", value_enum)]
     pub scheduler: Option<SchedulerArg>,
 
-    /// ADR-040 Phase C iter-4 (C4) — `max_slots` for
-    /// [`EngineMode::SlotAware`].
-    ///
-    /// Honored ONLY when `--scheduler inflight_batched` is selected; with
-    /// the default `fifo_serial` policy the engine's `max_slots` is
-    /// hard-pinned to `1` (one worker, one in-flight request). Default
-    /// `4` per ADR-040 §3.4 — half the reopen-trigger threshold of `8`
-    /// to ship the first ramp with headroom.
-    ///
-    /// `0` is rejected with a clear operator-facing error at parse time
-    /// (mirrors ADR-040 iter-2.5 F3a `.max(1)` discipline applied
-    /// upstream of the scheduler — refuse the misconfiguration loudly
-    /// rather than silently coerce). Range: `1..=u32::MAX`.
-    ///
-    /// Also read from `HF2Q_MAX_SLOTS` if `--max-slots` is absent.
-    #[arg(long = "max-slots", value_name = "N")]
+    /// Maximum concurrent active conversations under `inflight-batched`.
+    /// Overrides `[serve] max_slots`. “Maximum” means slots are admitted on
+    /// demand; this does not divide the context available to each slot.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub max_slots: Option<u32>,
 
-    /// Aggregate physical KV-cache residency budget shared by every
-    /// full-context SlotAware agent. This value never divides or truncates a
-    /// slot's logical context; admission charges each slot's retained
-    /// high-water growth against the shared total. `0` or omission disables
-    /// the physical-budget gate. Also read from
-    /// `HF2Q_KV_CACHE_BUDGET_BYTES`; the CLI flag wins.
-    #[arg(long = "kv-cache-budget-bytes", value_name = "BYTES")]
-    pub kv_cache_budget_bytes: Option<u64>,
+    /// Aggregate physical KV-cache residency ceiling shared by all slots.
+    /// Overrides `[serve] kv_cache_budget` and accepts bytes or units such as
+    /// `8GiB`. Unlike --ctx, this controls admission pressure rather than a
+    /// conversation's logical token limit. `0` or omission means no explicit
+    /// ceiling.
+    #[arg(long, value_name = "SIZE")]
+    pub kv_cache_budget: Option<String>,
+
+    /// Directory for persistent KV recovery and writeback. Serve creates and
+    /// scans it before model load; info only previews the path. Omit this flag
+    /// to disable disk persistence.
+    #[arg(long = "kv-persist", value_name = "PATH", value_hint = clap::ValueHint::DirPath)]
+    pub kv_persist_path: Option<PathBuf>,
+
+    /// Disk ceiling for data written under --kv-persist. Overrides
+    /// `[serve] kv_persist_budget` and accepts bytes or units such as `32GiB`.
+    /// `0` or omission means no explicit ceiling. This is independent of the
+    /// in-memory --kv-cache-budget.
+    #[arg(long, value_name = "SIZE", requires = "kv_persist_path")]
+    pub kv_persist_budget: Option<String>,
+}
+
+/// Typed server defaults used only when an API request omits the matching
+/// field. These replace the former process-environment bridge.
+#[derive(clap::Args, Debug, Clone)]
+pub struct ServeBehaviorArgs {
+    /// Default repetition penalty for requests that omit it. Overrides
+    /// `[serve] repetition_penalty`; `1.0` disables the penalty, and an
+    /// explicit request value always wins.
+    #[arg(long, value_name = "FLOAT")]
+    pub default_repetition_penalty: Option<f32>,
+
+    /// Default Qwen thinking-token budget. Overrides
+    /// `[serve] thinking_token_budget`; `0` disables the default, and an
+    /// explicit request value always wins.
+    #[arg(long, value_name = "TOKENS")]
+    pub default_thinking_token_budget: Option<u32>,
+
+    /// Default tool-continuation/required-tool thinking-token budget.
+    /// Overrides `[serve] tool_thinking_token_budget`; `0` disables the
+    /// continuation override, and an explicit request value always wins.
+    #[arg(long, value_name = "TOKENS")]
+    pub default_tool_thinking_token_budget: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1283,13 +1302,8 @@ pub enum OverflowPolicyArg {
 
 /// ADR-040 Phase C iter-4 (C4) — CLI-facing scheduler-policy selector.
 ///
-/// Mirrors the on-disk env-var values `fifo_serial` and `inflight_batched`
-/// — both are accepted case-insensitively by the env-var parser (per
-/// `serve::mod::parse_scheduler_config_from_env`). clap's `ValueEnum` is
-/// case-insensitive by default (`rename_all = "snake_case"` is the
-/// implicit default for snake-case Rust variant names), so the operator
-/// can type any of `fifo_serial`, `FIFO_SERIAL`, `inflight_batched`,
-/// `INFLIGHT_BATCHED` at the command line.
+/// The on-disk config uses serde's snake_case form; Clap exposes the normal
+/// kebab-case spellings shown in `--help` and generated completions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum SchedulerArg {
     /// ADR-005 Decision #2 + #19 production path. One mpsc channel, one
@@ -1426,7 +1440,180 @@ pub struct ParityArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn serve_and_info_share_the_operator_planning_contract() {
+        let serve = Cli::parse_from([
+            "hf2q",
+            "serve",
+            "--model",
+            "/tmp/model.gguf",
+            "--ctx",
+            "262144",
+            "--scheduler",
+            "inflight-batched",
+            "--max-slots",
+            "4",
+            "--kv-cache-budget",
+            "8GiB",
+            "--kv-persist",
+            "/tmp/hf2q-kv",
+            "--kv-persist-budget",
+            "32GiB",
+            "--default-repetition-penalty",
+            "1.05",
+            "--default-thinking-token-budget",
+            "2048",
+            "--default-tool-thinking-token-budget",
+            "512",
+        ]);
+        let Command::Serve(serve) = serve.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(serve.planning.ctx, Some(262_144));
+        assert_eq!(
+            serve.planning.scheduler,
+            Some(SchedulerArg::InflightBatched)
+        );
+        assert_eq!(serve.planning.max_slots, Some(4));
+        assert_eq!(serve.planning.kv_cache_budget.as_deref(), Some("8GiB"));
+        assert_eq!(
+            serve.planning.kv_persist_path.as_deref(),
+            Some(std::path::Path::new("/tmp/hf2q-kv"))
+        );
+        assert_eq!(serve.planning.kv_persist_budget.as_deref(), Some("32GiB"));
+        assert_eq!(serve.behavior.default_repetition_penalty, Some(1.05));
+        assert_eq!(serve.behavior.default_thinking_token_budget, Some(2048));
+        assert_eq!(serve.behavior.default_tool_thinking_token_budget, Some(512));
+
+        let info = Cli::parse_from([
+            "hf2q",
+            "info",
+            "--model",
+            "/tmp/model.gguf",
+            "--mmproj",
+            "/tmp/mmproj.gguf",
+            "--ctx",
+            "262144",
+            "--scheduler",
+            "inflight-batched",
+            "--max-slots",
+            "4",
+            "--kv-cache-budget",
+            "8GiB",
+            "--kv-persist",
+            "/tmp/hf2q-kv",
+            "--kv-persist-budget",
+            "32GiB",
+        ]);
+        let Command::Info(info) = info.command else {
+            panic!("expected info");
+        };
+        assert_eq!(info.model, PathBuf::from("/tmp/model.gguf"));
+        assert_eq!(info.mmproj, Some(PathBuf::from("/tmp/mmproj.gguf")));
+        assert_eq!(info.planning.ctx, Some(262_144));
+        assert_eq!(info.planning.scheduler, Some(SchedulerArg::InflightBatched));
+        assert_eq!(info.planning.max_slots, Some(4));
+        assert_eq!(info.planning.kv_cache_budget.as_deref(), Some("8GiB"));
+        assert_eq!(
+            info.planning.kv_persist_path.as_deref(),
+            Some(std::path::Path::new("/tmp/hf2q-kv"))
+        );
+        assert_eq!(info.planning.kv_persist_budget.as_deref(), Some("32GiB"));
+    }
+
+    #[test]
+    fn removed_context_and_legacy_info_flags_fail_visibly() {
+        for args in [
+            vec!["hf2q", "serve", "--max-seq-len", "262144"],
+            vec!["hf2q", "serve", "--kv-cache-budget-bytes", "1024"],
+            vec!["hf2q", "info", "--input", "/tmp/model"],
+            vec!["hf2q", "info", "--repo", "org/model"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(Cli::try_parse_from(["hf2q", "serve", "--ctx", "0"]).is_err());
+        assert!(Cli::try_parse_from(["hf2q", "serve", "--kv-persist-budget", "32GiB"]).is_err());
+        assert!(Cli::try_parse_from([
+            "hf2q",
+            "info",
+            "--model",
+            "/tmp/model.gguf",
+            "--kv-persist-budget",
+            "32GiB",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["hf2q", "info"]).is_err());
+    }
+
+    #[test]
+    fn serve_and_info_help_explain_context_slots_and_budget() {
+        let mut command = Cli::command();
+        let serve_help = command
+            .find_subcommand_mut("serve")
+            .expect("serve command")
+            .render_long_help()
+            .to_string();
+        for flag in [
+            "--ctx",
+            "--scheduler",
+            "--max-slots",
+            "--kv-cache-budget",
+            "--kv-persist",
+            "--kv-persist-budget",
+        ] {
+            assert!(
+                serve_help.contains(flag),
+                "serve help omitted {flag}: {serve_help}"
+            );
+        }
+        for flag in [
+            "--default-repetition-penalty",
+            "--default-thinking-token-budget",
+            "--default-tool-thinking-token-budget",
+        ] {
+            assert!(
+                serve_help.contains(flag),
+                "serve help omitted {flag}: {serve_help}"
+            );
+        }
+        assert!(serve_help.contains("never divided"), "{serve_help}");
+        assert!(serve_help.contains("GGUF"), "{serve_help}");
+        assert!(!serve_help.contains("--max-seq-len"), "{serve_help}");
+        assert!(
+            !serve_help.contains("--kv-cache-budget-bytes"),
+            "{serve_help}"
+        );
+
+        let mut command = Cli::command();
+        let info_help = command
+            .find_subcommand_mut("info")
+            .expect("info command")
+            .render_long_help()
+            .to_string();
+        for flag in [
+            "--model",
+            "--mmproj",
+            "--ctx",
+            "--scheduler",
+            "--max-slots",
+            "--kv-cache-budget",
+            "--kv-persist",
+            "--kv-persist-budget",
+        ] {
+            assert!(
+                info_help.contains(flag),
+                "info help omitted {flag}: {info_help}"
+            );
+        }
+        assert!(!info_help.contains("--input"), "{info_help}");
+        assert!(!info_help.contains("--repo"), "{info_help}");
+        assert!(
+            !info_help.contains("--default-repetition-penalty"),
+            "{info_help}"
+        );
+    }
 
     #[test]
     fn serve_no_integrity_default_false() {
@@ -1880,8 +2067,12 @@ mod tests {
         assert_eq!(args.model, Some(PathBuf::from(model)));
         assert!(args.host.is_none());
         assert!(args.port.is_none());
-        assert!(args.scheduler.is_none());
-        assert!(args.max_slots.is_none());
+        assert!(args.planning.ctx.is_none());
+        assert!(args.planning.scheduler.is_none());
+        assert!(args.planning.max_slots.is_none());
+        assert!(args.planning.kv_cache_budget.is_none());
+        assert!(args.planning.kv_persist_path.is_none());
+        assert!(args.planning.kv_persist_budget.is_none());
         assert!(args.mmproj.is_none());
 
         let endpoint = "http://127.0.0.1:8081/v1";

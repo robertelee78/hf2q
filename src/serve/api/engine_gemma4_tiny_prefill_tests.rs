@@ -27,6 +27,7 @@ fn gemma_n8_decode_then_tiny_cold_prefill_is_repeat_invariant() {
         config_path: None,
         dwq_overlay_path: None,
         kv_persist_dir: None,
+        kv_persist_budget_bytes: 0,
     };
     let prompts: Vec<Vec<u32>> = vec![
         vec![1, 2, 3],

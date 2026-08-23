@@ -16,14 +16,25 @@ For every user-facing argument that accepts a local GGUF model or projector,
 an empty or bare-name completion starts under
 `${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models` rather than the shell's
 working directory. This covers `chat --model`, `generate --model`/`--mmproj`,
-`serve --model`/`--embedding-model`/`--mmproj`, and both parity `--model`
-arguments. Directory candidates are ordered by name; decoder completion offers
-non-projector `.gguf` files, while projector completion offers `.gguf` files
-whose conventional filename contains `mmproj`. Returned candidates carry the
-full path, so selecting `qwen3.8/` produces a value that is valid from any
-working directory. `chat --model` remains free to accept endpoint model IDs and
-Hugging Face repository IDs, while `cache clear --model` remains a repository
-selector and does not receive local-path candidates.
+`serve --model`/`--embedding-model`/`--mmproj`,
+`info --model`/`--mmproj`, and both parity `--model` arguments. Directory
+candidates are ordered by name; decoder completion offers non-projector
+`.gguf` files, while projector completion offers `.gguf` files whose
+conventional filename contains `mmproj`. Returned candidates carry the full
+path, so selecting `qwen3.8/` produces a value that is valid from any working
+directory. `chat --model` remains free to accept endpoint model IDs and Hugging
+Face repository IDs, while `cache clear --model` remains a repository selector
+and does not receive local-path candidates.
+
+Because the adapters project the live public Clap grammar, both `serve` and
+`info` complete `--ctx`, `--scheduler`, `--max-slots`, and
+`--kv-cache-budget` plus the independent disk-backed
+`--kv-persist` / `--kv-persist-budget` pair. Setup completes
+`--serve-kv-persist-budget`. Serve
+additionally completes its typed behavior-default
+flags. Removed `--max-seq-len`, `--kv-cache-budget-bytes`, and old
+`info --input`/`--repo` spellings are absent from dynamic and regenerated
+static output; they are not retained as silent aliases.
 
 An explicit path remains explicit. Values containing a path separator, including
 `Desktop/`, `./`, `../`, `~/`, and absolute paths, complete from that location.

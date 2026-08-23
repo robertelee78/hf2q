@@ -139,6 +139,26 @@ pub(super) fn resolve_preferences<R: BufRead, W: Write>(
         }
     }
 
+    if args.serve_kv_persist_budget.is_none() {
+        let current = selected
+            .serve
+            .kv_persist_budget
+            .as_deref()
+            .unwrap_or("0 (unlimited)");
+        write!(
+            output,
+            "Persistent KV disk budget, for example 32GiB [{current}]: "
+        )?;
+        output.flush()?;
+        let Some(answer) = read_prompt_line(input)? else {
+            return Ok(PreferenceResolution::Cancelled);
+        };
+        if !answer.is_empty() {
+            crate::serve::operator_settings::parse_byte_size(&answer).map_err(SetupError::Input)?;
+            selected.serve.kv_persist_budget = Some(answer);
+        }
+    }
+
     Ok(PreferenceResolution::Selected(OperatorConfigV2::new(
         selected.convert,
         selected.serve,
@@ -180,6 +200,9 @@ fn apply_explicit(args: &SetupArgs, selected: &mut OperatorConfigV2) {
     }
     if let Some(max_slots) = args.serve_max_slots {
         selected.serve.max_slots = max_slots;
+    }
+    if let Some(budget) = &args.serve_kv_persist_budget {
+        selected.serve.kv_persist_budget = Some(budget.clone());
     }
 }
 

@@ -3,6 +3,11 @@
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
 - **Status**: 🟢 **FULL-CONTEXT THREE-FAMILY WORKLOAD SERVED (2026-08-08)** — every configured agent slot receives the complete logical model context; aggregate physical KV is governed by one shared high-water budget. Gemma 4, Qwen 3.6, and DeepSeek-V4 passed real four-agent OpenCode gates with native templates, tools, SSE, tool-result continuation, and retained prefix state. The historical 2026-07-01 8×32K result remains below as provenance for the fused batching work.
+>   - **Operator surface corrected (2026-08-23).** [ADR-050](ADR-050-operator-context-and-static-info.md)
+>     names these independent axes `--ctx`, `--max-slots`, and
+>     `--kv-cache-budget`. Omitted `--ctx` uses the GGUF-declared maximum;
+>     every admitted slot sees that same logical limit, never a quotient of
+>     the slot count.
 >   - **Qwen3.6 public-fixture insertion-order calibration repaired (2026-08-18).** Exact-main release-gate run `32163242804` stopped before model load because the 347-tool fixture still asserted its historical key-sorted padding count after `serde_json/preserve_order` became the production wire contract in `d4874792`. Preserving each tool's three-property schema adds exactly 28 rendered tokens per tool (`28 × 347 = 9,716`), so the deterministic one-token padding is recalibrated from 56,122 to 46,406 and the canonical request SHA-256 is rebound to `3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e`. The accepted 87,972-token target, 87,965-token stable boundary, template digest, and short 552-token lane are unchanged. The failed run is not release authority; a new exact-main packed cross-family run remains mandatory.
 >   - **Gemma N=8 tiny-prefill containment pending exact packed proof (2026-08-14, §6.1.65).** Exact-main run `31823149737` reached Gemma's release-profile N=8 parity test after every preceding DeepSeek and Gemma hardware gate had passed, then exposed an intermittent all-non-finite logit row after batched decode followed by a 2–5-token cold slot-mounted prefill. Cold text work below 32 tokens now uses the linear slot-aware path; tiny retained-prefix suffixes append through the one-token primitive; initial, installed, and stable cross-slot admission cannot bypass that boundary. The fallback also exposed a separate pinned-`mlx-native` dense-vector tail-read defect: physical linear KV capacity now rounds through each final 32-row tile, and a one-token budget terminates at the prefill seed. The original tiny batched-prefill cause is not claimed solved, and a new exact-packed run remains mandatory.
 >   - **Decode: campaign CLOSED at practical floor (2026-06-30).** 255 t/s aggregate N=8 short-ctx = **1.14× peer**; GPU-busy at parity; §21–§26 + iter-I/J/K/L/M levers landed; iter-O refuted the residual host gap.
@@ -42,7 +47,7 @@ superseded. It conflated two independent limits:
 2. **Physical KV residency** is the unified-memory cost of positions actually
    written across all slots. It is governed by one shared byte budget.
 
-`--max-slots 4 --ctx-size 524288` therefore means four agent slots, each
+`--max-slots 4 --ctx 524288` therefore means four agent slots, each
 logically capable of 524288 tokens. It never means four 131072-token slots.
 The server does not promise that all four slots can simultaneously fill their
 entire logical capacity on finite hardware. When aggregate physical KV demand
@@ -960,7 +965,7 @@ The 2.45x over-shoot is documented honestly per cfa-finding (Claude `major_findi
 
 ### 3.2 Scheduler: FIFO adapter first, inflight-batched second
 
-**Decision**: `SchedulerPolicy::FifoSerial` (default) wraps the existing mpsc-channel + single-worker behavior under the new `Scheduler` trait — byte-equivalent to today. `SchedulerPolicy::InflightBatched` is the new behavior, opt-in via `HF2Q_SCHEDULER=inflight_batched` (off by default until Phase E1).
+**Decision**: `SchedulerPolicy::FifoSerial` wraps the existing mpsc-channel + single-worker behavior under the new `Scheduler` trait. `SchedulerPolicy::InflightBatched` interleaves independent conversation slots. ADR-050 supersedes the original hidden-environment selection: operators now choose the policy with typed `--scheduler` or `[serve] scheduler`, with CLI taking precedence over config.
 
 **Why**: Preserves the ADR-005 Phase 2 production contract during the entire multi-week arc. Enables apples-to-apples A/B benchmarking at any point.
 
@@ -983,21 +988,21 @@ The 2.45x over-shoot is documented honestly per cfa-finding (Claude `major_findi
 
 ### 3.4 Slot count default
 
-**Decision**: `max_slots = 4` default, configurable via `HF2Q_MAX_SLOTS` env or `--max-slots` CLI flag. The ADR-005 reopen trigger names `≥8` as the demand-side threshold; serving capacity defaults to half that so the first ramp deploys with headroom.
+**Decision**: `max_slots = 4` is the built-in inflight default, configurable through typed `--max-slots` or `[serve] max_slots`. The ADR-005 reopen trigger names `≥8` as the demand-side threshold; serving capacity defaults to half that so the first ramp deploys with headroom. ADR-050 removes the former `HF2Q_MAX_SLOTS` production reader.
 
 **Alternatives considered**:
 - `max_slots = 1` (current behavior) — rejected: would make `InflightBatched` policy identical to `FifoSerial` and the benchmark trivial.
 - `max_slots = 8` (matches reopen trigger) — rejected: full memory commitment from day one before benchmark; better to ship 4 and ramp.
 
-### 3.5 KV cache budget per slot
+### 3.5 Shared KV-cache budget
 
-**Decision**: `kv_cache_budget_bytes` (existing field on `Engine::spawn`) divides equally across slots in SeparateSlots layout. Per-slot budget = `total / max_slots`. Per-slot OOM returns 429 to the admitting handler (Decision #19 contract preserved).
+**Decision**: `--kv-cache-budget` / `[serve] kv_cache_budget` is one aggregate physical-residency ceiling shared by every slot. It is never divided by `max_slots` and never shortens a slot's logical `--ctx`. Admission charges the request's family-specific fixed floor and context-growing rows against retained cross-slot high-water. A request that cannot fit by itself returns terminal HTTP 400; transient aggregate pressure returns HTTP 429 as amended by §7.KV-BUDGET-SPLIT.
 
-**Why**: The existing `kv_cache_budget_bytes` knob already exists; this just changes its denominator. No new operator surface.
+**Why**: Logical context, concurrency, and physical residency are independent axes (§0.0). Dividing bytes or tokens by slot count recreates the superseded shortened-context contract and cannot represent demand-grown sparse Metal residency.
 
 ### 3.6 Backward compatibility contract
 
-**Decision**: With `HF2Q_SCHEDULER` unset (or `=fifo_serial`), every byte of `Engine` behaviour is bit-equivalent to pre-ADR-040. The Phase 1b sourdough gate + the per-family parity gates pin this regression boundary.
+**Decision**: When typed CLI/config resolution selects `fifo_serial`, every byte of `Engine` behaviour remains on the pre-ADR-040 single-worker path. The Phase 1b sourdough gate + the per-family parity gates pin this regression boundary.
 
 **Why**: ADR-005 Phase 2 has been in production since 2026-04. A scheduler refactor that breaks single-request behaviour would invalidate every benchmark and every customer integration. Phase C iter-1 ships a dedicated regression test `engine_serial_fifo_byte_equivalent_to_pre_phase_c`.
 
@@ -1196,7 +1201,7 @@ All four Phase iter-1 scaffolding tracks landed in parallel under goal-mode dire
 | Scheduler refactor breaks Phase 2 single-request behaviour | Low (regression test pins) | High | C iter-1 ships the byte-equivalence regression test BEFORE C iter-2 touches `Engine`. |
 | Spec-decode incompatible with multi-slot (EAGLE-3 drafter cache + multi-seq verifier interaction) | Medium | Medium (Phase 5 nice-to-have, not Phase E1 gate) | Phase A iter-4 ships research-quality only; Phase E1 doesn't require it. |
 | KV-spill (ADR-017) breaks under multi-slot | Medium | Medium | Phase A iter-5 explicitly tests spill+restore at N>1. ADR-017's per-model spiller surface inherits naturally because the per-slot KV lives inside the per-model cache. |
-| Per-slot OOM under aggregate budget pressure causes thrashing | Low | Low | §3.5: per-slot OOM → 429 to admitting handler; no cross-slot eviction. |
+| Aggregate retained high-water causes admission thrashing | Low | Low | §3.5 + §7.KV-BUDGET-SPLIT: recycle eligible idle state before admission; permanent never-fits requests return 400, while genuinely transient pressure returns 429. |
 | Peer `-cb` admission semantics don't match our forward-path assumptions | Low | Medium | Phase B iter-3 explicitly cites the peer file:line being mirrored; deviations documented inline. |
 | Mantra violation: shipping `FifoSerial` + `InflightBatched` both produces "fallback" code | Low | Low | §3.6: `FifoSerial` is the explicit production default + Phase E1 gate decides the cutover. Both paths are first-class, not one-is-a-fallback. |
 

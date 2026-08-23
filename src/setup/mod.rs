@@ -176,6 +176,15 @@ fn execute<P: HostProbe, R: BufRead, W: Write>(
         config.serve.scheduler.as_str(),
         config.serve.max_slots
     )?;
+    writeln!(
+        output,
+        "Persistent KV disk budget: {}.",
+        config
+            .serve
+            .kv_persist_budget
+            .as_deref()
+            .unwrap_or("no explicit ceiling")
+    )?;
     if let (Some(penalty), Some(budget)) = (
         config.serve.repetition_penalty,
         config.serve.thinking_token_budget,

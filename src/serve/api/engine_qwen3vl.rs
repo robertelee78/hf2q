@@ -446,7 +446,9 @@ impl LoadInfoBuilder for Qwen3VlTextLoadedModel {
             head_dim: cfg.head_dim,
             sliding_window: None,
             full_attention_interval: None,
-            max_context_length: self.context_length.map(|v| v as u32),
+            max_context_length: crate::serve::operator_settings::declared_context_length(gguf)
+                .ok()
+                .or_else(|| self.context_length.map(|v| v as u32)),
             moe: None,
             quant_label: self.quant_type.clone(),
             quant_bpw: load_info::compute_bpw(gguf),
