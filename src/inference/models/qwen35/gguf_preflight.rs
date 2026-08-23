@@ -104,15 +104,14 @@ fn require_f32(
     Ok(())
 }
 
-fn ensure_dense_capability(name: &str, info: &TensorInfo) -> Result<()> {
-    let [rows, cols] = info.shape.as_slice() else {
-        bail!(
-            "Qwen GGUF preflight: dense tensor '{name}' must be rank 2, got {:?}",
-            info.shape
-        );
-    };
-    let n = u32::try_from(*rows).context("Qwen dense projection rows exceed u32")?;
-    let k = u32::try_from(*cols).context("Qwen dense projection cols exceed u32")?;
+fn ensure_dense_capability_dims(
+    name: &str,
+    info: &TensorInfo,
+    rows: usize,
+    cols: usize,
+) -> Result<()> {
+    let n = u32::try_from(rows).context("Qwen dense projection rows exceed u32")?;
+    let k = u32::try_from(cols).context("Qwen dense projection cols exceed u32")?;
     for (m, workload) in REQUIRED_MATRIX_WIDTHS {
         let capability = mlx_native::ggml_capability(GgmlCapabilityRequest {
             schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
@@ -131,6 +130,16 @@ fn ensure_dense_capability(name: &str, info: &TensorInfo) -> Result<()> {
     Ok(())
 }
 
+fn ensure_dense_capability(name: &str, info: &TensorInfo) -> Result<()> {
+    let [rows, cols] = info.shape.as_slice() else {
+        bail!(
+            "Qwen GGUF preflight: dense tensor '{name}' must be rank 2, got {:?}",
+            info.shape
+        );
+    };
+    ensure_dense_capability_dims(name, info, *rows, *cols)
+}
+
 fn require_projection(
     gguf: &GgufFile,
     name: &str,
@@ -139,6 +148,19 @@ fn require_projection(
 ) -> Result<()> {
     let info = require_tensor(gguf, name, shape, TensorRole::DenseProjection, receipt)?;
     ensure_dense_capability(name, info)
+}
+
+/// The shared-expert sigmoid gate is the sole Qwen matrix role whose GGUF
+/// schema is a rank-1 row vector. It executes as logical `[1, hidden]` but the
+/// stored payload stays exact; rank-2 or any other squeeze is rejected here.
+fn require_row_projection(
+    gguf: &GgufFile,
+    name: &str,
+    cols: usize,
+    receipt: &mut Qwen35GgufPreflightReceipt,
+) -> Result<()> {
+    let info = require_tensor(gguf, name, &[cols], TensorRole::DenseProjection, receipt)?;
+    ensure_dense_capability_dims(name, info, 1, cols)
 }
 
 fn require_embedding(
@@ -295,10 +317,10 @@ fn require_moe_ffn(
         &[experts, hidden],
         receipt,
     )?;
-    require_projection(
+    require_row_projection(
         gguf,
         &format!("{p}.ffn_gate_inp_shexp.weight"),
-        &[1, hidden],
+        hidden,
         receipt,
     )?;
     require_projection(

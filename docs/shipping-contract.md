@@ -62,8 +62,10 @@ cache, or forward graph.
   within the endpoint-based no-double-residency and reload memory bounds.
 - **Artifact-native Qwen3.5-family matrix storage.** Before Metal allocation,
   the loader admits every embedding, head, dense, MoE, and MTP matrix codec and
-  all serving widths. One model-scoped GGUF mapping owns the exact rank-2 and
-  rank-3 matrix views; only elementwise/state tensors may materialize F32.
+  all serving widths. One model-scoped GGUF mapping owns exact rank-2 matrices,
+  rank-3 expert stacks, and the single schema-declared rank-1 shared-expert
+  gate exposed as a zero-copy logical row. No other implicit squeeze is
+  admitted; only elementwise/state tensors may materialize F32.
   Router and shared-expert matrices are not decoded and uploaded as BF16, and
   tied/shared heads are aliases rather than duplicate allocations. Runtime
   unique-view count and bytes must exactly equal the independent preflight

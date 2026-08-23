@@ -158,6 +158,35 @@ impl MlxQWeight {
         })
     }
 
+    /// Retain an explicitly declared GGUF row vector as a logical `[1, K]`
+    /// projection without copying or reshaping its payload. This is narrower
+    /// than [`Self::from_mapped_gguf_tensor`]: only exact rank-1 `[K]` storage
+    /// is admitted, so ordinary matrices cannot acquire implicit squeeze
+    /// semantics through this constructor.
+    pub fn from_mapped_gguf_row_vector(
+        mapped: &mlx_native::gguf::GgufMappedTensorSet<'_>,
+        info: &mlx_native::gguf::TensorInfo,
+        expected_cols: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            expected_cols > 0 && info.shape.as_slice() == [expected_cols],
+            "native GGUF row vector '{}' must be exact rank 1 [{expected_cols}], got {:?}",
+            info.name,
+            info.shape
+        );
+        let buffer = map_native_gguf_tensor_view(mapped, info)?;
+        Ok(Self {
+            buffer,
+            info: QuantWeightInfo {
+                ggml_dtype: info.ggml_type,
+                rows: 1,
+                cols: expected_cols,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        })
+    }
+
     /// Build `GgmlQuantizedMatmulParams` for a mat-vec dispatch.
     ///
     /// `m` is the number of input tokens (1 for decode).

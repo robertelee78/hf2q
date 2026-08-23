@@ -113,9 +113,13 @@ The file-backed assertion was the sole failure. The reformulated contract is:
   creates one model-scoped GGUF tensor mapping, and derives all production
   matrix views from it. Attention, DeltaNet projections, dense FFNs, token
   embeddings, explicit or tied output heads, and MTP use rank-2 native views.
-  MoE router/shared-expert matrices use those same views; rank-3 expert stacks
-  use exact slices of the same mapping. Norms, convolution/state vectors, and
-  other elementwise inputs are the only tensors materialized as F32.
+  MoE router/shared-expert matrices use those same views except for the schema's
+  shared-expert sigmoid gate, whose exact rank-1 `[hidden]` payload is admitted
+  explicitly as a logical `[1, hidden]` zero-copy row view. Rank-2 storage may
+  not enter that exception, and ordinary matrices may not be squeezed. Rank-3
+  expert stacks use exact slices of the same mapping. Norms,
+  convolution/state vectors, and other elementwise inputs are the only tensors
+  materialized as F32.
 - Admission covers decode M=1, continuous widths 2/3/4/8, and prompt widths
   9/16/17 for every dense matrix. Expert stacks independently prove the same
   widths through their production pooled entry point and exact input layout.

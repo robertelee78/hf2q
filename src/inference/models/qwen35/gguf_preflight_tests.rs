@@ -1,6 +1,29 @@
 use mlx_native::GgmlType;
 
 use super::*;
+use crate::backends::gguf::writer::GgufWriter;
+use crate::quantize::ggml_quants::GgmlType as WriterGgmlType;
+
+fn row_projection_fixture(dimensions: &[u64]) -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().expect("row projection fixture");
+    let sink = std::fs::File::create(file.path()).expect("create row projection fixture");
+    let mut writer = GgufWriter::new(sink);
+    writer.write_header(1, 0).expect("header");
+    let tensor = writer
+        .reserve_tensor_info(
+            "blk.0.ffn_gate_inp_shexp.weight",
+            dimensions,
+            WriterGgmlType::F32,
+        )
+        .expect("tensor info");
+    writer.pad_to_alignment().expect("alignment");
+    let elements = dimensions.iter().product::<u64>() as usize;
+    writer
+        .stream_tensor_payload(tensor, &vec![0; elements * 4])
+        .expect("tensor payload");
+    writer.finalize().expect("finalize");
+    file
+}
 
 #[derive(Clone, Copy)]
 struct ProfileEntry {
@@ -152,6 +175,34 @@ fn production_matrix_preflight_retains_non_power_and_prompt_boundaries() {
     );
     assert_eq!(REQUIRED_MATRIX_WIDTHS[5].1, GgmlWorkloadClass::Prompt);
     assert_eq!(REQUIRED_MATRIX_WIDTHS[7].1, GgmlWorkloadClass::Prompt);
+}
+
+#[test]
+fn shared_expert_gate_preflight_accepts_only_exact_rank_one_storage() {
+    let cols = 256usize;
+    let exact_file = row_projection_fixture(&[cols as u64]);
+    let exact = GgufFile::open(exact_file.path()).expect("open exact row vector");
+    let mut receipt = Qwen35GgufPreflightReceipt::default();
+    require_row_projection(
+        &exact,
+        "blk.0.ffn_gate_inp_shexp.weight",
+        cols,
+        &mut receipt,
+    )
+    .expect("exact rank-one shared gate must be admitted");
+    assert_eq!(receipt.matrix_tensor_count, 1);
+    assert_eq!(receipt.matrix_bytes, (cols * 4) as u64);
+
+    let squeezed_file = row_projection_fixture(&[cols as u64, 1]);
+    let squeezed = GgufFile::open(squeezed_file.path()).expect("open rank-two row");
+    let error = require_row_projection(
+        &squeezed,
+        "blk.0.ffn_gate_inp_shexp.weight",
+        cols,
+        &mut Qwen35GgufPreflightReceipt::default(),
+    )
+    .expect_err("rank-two storage must not acquire implicit squeeze semantics");
+    assert!(error.to_string().contains("shape [1, 256]"));
 }
 
 /// Header-only gate for an exact pinned artifact. It parses the tensor
