@@ -193,6 +193,7 @@ write_request() {
           ],
           max_tokens:$max_tokens,
           temperature:0,
+          seed:0,
           repetition_penalty:1.0,
           stream:false,
           hf2q_enable_thinking:false

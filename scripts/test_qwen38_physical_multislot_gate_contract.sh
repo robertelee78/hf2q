@@ -158,6 +158,8 @@ grep -Fq 'readonly WIDTHS=(1 2 4 8 16)' \
 grep -Fq 'qwen38_physical_validate_scalar_parity "$response" "$scalar_response"' \
     "$script_dir/qwen38_physical_multislot_gate.sh" || \
     fail "physical-width runner does not compare every lane to scalar execution"
+grep -Fq 'seed:0' "$script_dir/qwen38_physical_multislot_gate.sh" || \
+    fail "physical-width requests do not bypass terminal-response replay"
 grep -Fq 'qwen38_validate_artifact_identity' \
     "$script_dir/qwen38_physical_multislot_gate.sh" || \
     fail "physical-width runner does not bind the qualified artifact format"
