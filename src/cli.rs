@@ -191,7 +191,9 @@ pub struct FetchHubGgufArgs {
     #[arg(long)]
     pub sha256: String,
     #[arg(long)]
-    pub quant: String,
+    pub quant: Option<String>,
+    #[arg(long, default_value = "text_model")]
+    pub role: String,
 }
 
 #[derive(clap::Args, Debug)]

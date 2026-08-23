@@ -1,7 +1,8 @@
 # ADR-047: Diagnostic chat over the native inference server
 
-- **Status:** Accepted; text-engine A -> B -> A proof passed; embedding and projector lifecycle execution active
+- **Status:** Accepted; text-engine A -> B -> A proof passed; embedding lifecycle execution active; generation-owned projector implementation candidate under validation; exact pair hardware gate active
 - **Date:** 2026-08-20
+- **Updated:** 2026-08-22
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
 
 ## Context
@@ -348,11 +349,11 @@ a separate required implementation and hardware gate, not evidence supplied
 by this test. Family-specific cache and template state must never cross a
 switch.
 
-Likewise, the startup vision projector is process-global in the current
-source. Strongly bound incompatible swaps fail closed, but a shape-compatible
+At the time of this decision, the startup vision projector was process-global.
+Strongly bound incompatible swaps failed closed, but a shape-compatible
 external vision model without source/projector digests can inherit and execute
 the wrong startup projector; projector weights and its vision cache are also
-outside pool accounting. The required correction makes one resident
+outside pool accounting. The correction recorded below makes one resident
 generation own an atomic text/projector pair, resolves and warms the complete
 pair before publication, leases both from that same generation, and accounts
 the pair's unique allocations and cache bytes in admission/eviction. This work
@@ -582,7 +583,7 @@ receipt. On the macOS 26.5 M5 Max release host:
   Its immutable `hf://` identity, not the mutable repository name, became the
   pool and request identity;
 - direct native generation from those bytes returned exactly
-  `HF2Q_TIED_OK`. The pinned peer at
+  `HF2Q_TIED_OK`. The pinned comparison baseline at
   `521a64cd01979bb5b1a466152c576a9d809b068d`
   returned the identical content from the same file, prompt, 16-token limit,
   greedy decoding, and reasoning-off settings;
@@ -696,6 +697,133 @@ wired) for Gemma -> Qwen and 31,998,066,688 / 36,528,816,128 bytes for
 Qwen -> Gemma, both within the gate's no-double-residency bound. The reloaded
 Gemma engine published a fresh generation, retained the exact path-free engine
 configuration identity, and reproduced its deterministic response exactly.
+
+### Generation-owned text/projector lifecycle correction (2026-08-22)
+
+Source inspection found that the multimodal projector was process-global even
+though the text engine was pool- and generation-owned. Exact text metadata
+usually rejected a wrong projector, but an external shape-compatible text
+artifact without source/projector digests could advertise and consume the
+startup projector after a swap. Projector weights and the 512 MiB embedding
+cache were also absent from pool admission and eviction accounting. The
+startup order was correct (text warmup before projector GPU work), but its
+ownership boundary was not.
+
+The implementation candidate makes each `LoadedEngine` generation own its
+complete optional pair. Admission preflights and charges the text GGUF estimate, a
+conservative projector-mapping bound (rounded file plus worst-case alignment
+slack for every possible mapped segment), and the full projector-cache
+reservation. The projector digest is checked against the text artifact's
+binding before the text engine loads, avoiding an expensive doomed warmup.
+Text loads and warms first; the projector then re-hashes, validates
+the transactional pair, checks the text consumer contract, validates the
+complete tensor inventory, creates one shared file mapping, loads typed views,
+and warms. F16 matrices plus F32 bias, norm, positional, and scalar tensors
+are the current truthful projector storage contract. Quantized, BF16, integer,
+and role-mismatched F16/F32 projector tensors fail before Metal allocation;
+the loader never widens them through a dequantized F32 shadow. The typed views
+retain their shared Metal segment and `Arc<Mmap>` after the scoped mapping set
+and GGUF parser are dropped. After load, the conservative bound is replaced by
+the exact deduplicated file-backed plus anonymous byte count in the published
+pool charge; both values remain visible in the path-free receipt. Only the
+complete pair is published. Any failure drops both unpublished halves.
+Every chat handler and `/v1/models` listing leases the projector from the same
+`Arc<LoadedEngine>` as the text engine; `AppState` has no projector field.
+Resident hits fail closed when pair presence, path, digest, allocation, or
+cache policy differs. Eviction and in-flight request leases therefore reclaim
+or retain text, projector, and cache as one generation.
+
+Automatic local resolution is equality-preserving. A text artifact with an
+`hf2q.mmproj_sha256` binding selects only its non-symlink
+`<text-stem>-mmproj.gguf` companion. Managed-cache pairing remains explicit;
+an unbound external sibling is never guessed. The conversion auto-pipeline now
+records the companion emitted by the current automatic paired converter
+instead of writing `mmproj_path: null`. Direct/local diagnostic activation
+includes pair weights and cache in both the pre-transfer and post-materialize
+admission receipts. Hosted schema v2 remains unchanged: the public activation
+unit is still one opaque text candidate. The server-private authority retained
+with that candidate contains every same-revision non-selectable projector
+companion. The metadata-only Hub inventory knows each immutable object's size
+and SHA-256, but it cannot know which companion the text binds or the
+projector's mapped-storage admission bound: `hf2q.mmproj_sha256`, tensor count,
+and tensor dtypes live inside the GGUF headers. Guessing from filenames or
+charging an arbitrary companion would violate equality and could select the
+wrong eviction set.
+
+An unresolved hosted `action=load` is therefore the one-time discovery
+transaction. It authenticates the text object, reads its binding, fetches and
+preflights only the digest-equal companion, and records an immutable path-free
+`HostedPairResolution` under the opaque candidate before producing the exact
+admission receipt. A text-only lower bound may reject an already-impossible
+candidate, but an unresolved `WouldEvict` result is not exposed as an exact
+receipt. An unresolved direct `action=switch` fails before transfer and asks
+the client to perform discovery; it cannot invent or relax a victim list.
+Active discovery holds a non-cloneable catalog lease, so TTL pruning and
+bounded-catalog replacement cannot expire its authority during a large
+authenticated transfer. Rebinding the same candidate to a
+different text digest, companion digest, or byte contract fails closed.
+
+Once resolved, admission includes text, conservative mapped-projector bytes,
+and the full projector-cache reservation before transfer. Text and projector
+fetch concurrently using the cached digest, then the text header, projector
+digest, native tensor inventory, and exact byte contract are checked again.
+Either transfer or preflight failure returns before `lifecycle.switch`, so the
+current generation is never drained. The existing exact revision/victim
+validator runs after materialization and before drain; there is no prefix or
+superset victim-plan exception. Clients never receive a projector candidate id
+and cannot construct a mismatched pair; text plus optional projector is
+materialized, admitted, and published atomically.
+
+Hosted-safe fail-first coverage proves:
+
+- A+P_A -> text B -> C+P_C -> A+P_A uses fresh generations, B inherits no
+  projector, A/C projectors are reclaimed, and the pool conserves the exact
+  component sum;
+- a late projector load/warmup failure publishes neither text nor projector;
+- the live tokenizer serialization and chat-template bytes are hashed before
+  publication into a path-free, generation-local semantic receipt; a receipt
+  failure publishes no generation, distinct engines do not inherit the prior
+  identity, and an A reload reproduces A's exact identity;
+- a resident generation rejects wrong-digest and text-only alias requests;
+- hosted discovery begins unresolved, records one path-free exact admission
+  authority, rejects wrong-text and changed-resolution rebinding, and leaves
+  public artifact schema v2 free of companion identity and aggregate bytes;
+- an activation lease survives forced TTL expiry, catalog pressure cannot
+  evict pinned candidates or partially mutate on capacity failure, and either
+  concurrent pair-transfer failure cancels and joins its sibling before the
+  handler returns;
+- mapped and fused/sliced projector tensor views charge each shared backing
+  once, report file-backed and anonymous bytes separately, retain data after
+  the GGUF parser is dropped, and prove production has zero anonymous weight
+  copies; and
+- runtime configuration/pair receipts contain exact projector, tokenizer, and
+  chat-template digests, pair generation, profile, pre-load admission bound,
+  and exact byte components without serializing server paths.
+
+The real acceptance gate is checked into `tests/multi_model_swap.rs` as
+`model_projector_pair_swap_reclaims_replays_and_never_inherits_e2e`. It
+requires two digest-bound hf2q vision pairs and one text-only artifact, forces
+the exact A+P_A -> B -> C+P_C -> A+P_A revision-bound sequence, runs real image
+preprocessing/ViT and SSE generation, and reports separately:
+
+- drain/shutdown/commit (unload), replacement load-ready, complete switch
+  phase, raw engine load, text post-warm, projector post-warm,
+  complete-generation post-warm, and client-observed switch load-ready latency
+  as separate receipts;
+- total switch-to-first-semantic-token latency;
+- first and steady semantic-token/total response latency;
+- deterministic A image-result replay plus template/tokenizer/cache isolation;
+- one-generation logical component conservation; and
+- settled and sampled peak RSS and host-wired memory for every transition.
+
+The gate is not satisfied by a skip. The required invocation is printed by the
+test and uses `HF2Q_PROJECTOR_PAIR_SWAP_E2E=1` plus exact A/P_A/B/C/P_C paths
+and an explicit one-generation pool budget. A and C must be distinct complete
+hf2q conversion transactions: each text GGUF records the SHA-256 of its own
+distinct, non-symlink `<text-stem>-mmproj.gguf`; B is a third, distinct
+text-only artifact. The budget must fit every individual generation but force
+each adjacent pair to conflict so the confirmed unload path runs. Hardware
+acceptance remains open until that non-skipped receipt is recorded here.
 
 ## Consequences
 

@@ -58,14 +58,23 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
+
 const ENV_GATE: &str = "HF2Q_HOT_SWAP_E2E";
 const ENV_MODEL_A: &str = "HF2Q_HOT_SWAP_E2E_MODEL_A";
 const ENV_MODEL_B: &str = "HF2Q_HOT_SWAP_E2E_MODEL_B";
 const ENV_MAX_SECS: &str = "HF2Q_HOT_SWAP_E2E_MAX_SECS";
+const ENV_PAIR_GATE: &str = "HF2Q_PROJECTOR_PAIR_SWAP_E2E";
+const ENV_PAIR_MODEL_A: &str = "HF2Q_PROJECTOR_PAIR_MODEL_A";
+const ENV_PAIR_PROJECTOR_A: &str = "HF2Q_PROJECTOR_PAIR_PROJECTOR_A";
+const ENV_PAIR_MODEL_B: &str = "HF2Q_PROJECTOR_PAIR_MODEL_B";
+const ENV_PAIR_MODEL_C: &str = "HF2Q_PROJECTOR_PAIR_MODEL_C";
+const ENV_PAIR_PROJECTOR_C: &str = "HF2Q_PROJECTOR_PAIR_PROJECTOR_C";
+const ENV_PAIR_POOL_BUDGET: &str = "HF2Q_PROJECTOR_PAIR_POOL_BUDGET_BYTES";
 
-/// High-numbered fixed port distinct from the openwebui suite (52334),
-/// `mmproj_llama_cpp_compat.rs` (52226), and `vision_e2e_vs_mlx_vlm.rs`
-/// (18181).  Test runs under `--test-threads=1` per the OOM directive,
+/// High-numbered fixed port distinct from the existing chat (52334), vision
+/// compatibility (52226), and vision parity (18181) suites. Test runs under
+/// `--test-threads=1` per the OOM directive,
 /// so collisions are operator error, not the harness's problem.
 const PORT: u16 = 52337;
 const HOST: &str = "127.0.0.1";
@@ -113,6 +122,19 @@ fn skip_unless_gated(name: &str) -> bool {
     true
 }
 
+fn skip_unless_pair_gated(name: &str) -> bool {
+    if std::env::var(ENV_PAIR_GATE).as_deref() == Ok("1") {
+        return false;
+    }
+    eprintln!(
+        "[skip] {name} — set {ENV_PAIR_GATE}=1 and provide {ENV_PAIR_MODEL_A}, \
+         {ENV_PAIR_PROJECTOR_A}, {ENV_PAIR_MODEL_B}, {ENV_PAIR_MODEL_C}, \
+         {ENV_PAIR_PROJECTOR_C}, and {ENV_PAIR_POOL_BUDGET}. The A/C projector \
+         must be the digest-bound <text-stem>-mmproj.gguf companion emitted by hf2q."
+    );
+    true
+}
+
 /// Locate the `hf2q` binary the cargo test runner just built.
 fn hf2q_binary_path() -> PathBuf {
     if let Some(path) = option_env!("CARGO_BIN_EXE_hf2q") {
@@ -146,6 +168,27 @@ impl ServerGuard {
                 "serve",
                 "--model",
                 gguf,
+                "--host",
+                HOST,
+                "--port",
+                &PORT.to_string(),
+            ])
+            .env("HF2Q_POOL_BUDGET_BYTES", pool_budget_bytes.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        Ok(Self(child))
+    }
+
+    fn spawn_pair(gguf: &str, projector: &str, pool_budget_bytes: u64) -> std::io::Result<Self> {
+        let bin = hf2q_binary_path();
+        let child = Command::new(bin)
+            .args([
+                "serve",
+                "--model",
+                gguf,
+                "--mmproj",
+                projector,
                 "--host",
                 HOST,
                 "--port",
@@ -395,6 +438,129 @@ async fn post_inference(
     (status, json, elapsed)
 }
 
+#[derive(Debug)]
+struct SemanticTiming {
+    content: String,
+    first_semantic: Duration,
+    total: Duration,
+}
+
+const ONE_PIXEL_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nWQAAAAASUVORK5CYII=";
+
+async fn post_vision_stream(client: &reqwest::Client, model: &str) -> SemanticTiming {
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this image in one short deterministic phrase."},
+                {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG}}
+            ]
+        }],
+        "max_tokens": 16,
+        "temperature": 0,
+        "seed": 7,
+        "stream": true,
+    });
+    let started = Instant::now();
+    let response = client
+        .post(format!("{}/v1/chat/completions", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .expect("vision SSE request failed");
+    assert_eq!(response.status().as_u16(), 200, "vision SSE status");
+    let mut stream = response.bytes_stream();
+    let mut pending = Vec::<u8>::new();
+    let mut content = String::new();
+    let mut first_semantic = None;
+    while let Some(chunk) = stream.next().await {
+        pending.extend_from_slice(&chunk.expect("vision SSE body chunk"));
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = pending.drain(..=newline).collect::<Vec<_>>();
+            while line
+                .last()
+                .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+            {
+                line.pop();
+            }
+            let Some(data) = line.strip_prefix(b"data: ") else {
+                continue;
+            };
+            if data == b"[DONE]" {
+                continue;
+            }
+            let event: serde_json::Value = serde_json::from_slice(data)
+                .unwrap_or_else(|error| panic!("invalid vision SSE JSON: {error}: {data:?}"));
+            if let Some(delta) = event["choices"][0]["delta"]["content"].as_str() {
+                if !delta.is_empty() {
+                    first_semantic.get_or_insert_with(|| started.elapsed());
+                    content.push_str(delta);
+                }
+            }
+        }
+    }
+    SemanticTiming {
+        content,
+        first_semantic: first_semantic.expect("vision SSE emitted no semantic content"),
+        total: started.elapsed(),
+    }
+}
+
+async fn post_text_stream(client: &reqwest::Client, model: &str) -> SemanticTiming {
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with exactly: TEXT_SWAP_OK"}],
+        "max_tokens": 16,
+        "temperature": 0,
+        "seed": 7,
+        "stream": true,
+    });
+    let started = Instant::now();
+    let response = client
+        .post(format!("{}/v1/chat/completions", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .expect("text SSE request failed");
+    assert_eq!(response.status().as_u16(), 200, "text SSE status");
+    let mut stream = response.bytes_stream();
+    let mut pending = Vec::<u8>::new();
+    let mut content = String::new();
+    let mut first_semantic = None;
+    while let Some(chunk) = stream.next().await {
+        pending.extend_from_slice(&chunk.expect("text SSE body chunk"));
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = pending.drain(..=newline).collect::<Vec<_>>();
+            while line
+                .last()
+                .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+            {
+                line.pop();
+            }
+            let Some(data) = line.strip_prefix(b"data: ") else {
+                continue;
+            };
+            if data == b"[DONE]" {
+                continue;
+            }
+            let event: serde_json::Value =
+                serde_json::from_slice(data).expect("valid text SSE JSON");
+            if let Some(delta) = event["choices"][0]["delta"]["content"].as_str() {
+                if !delta.is_empty() {
+                    first_semantic.get_or_insert_with(|| started.elapsed());
+                    content.push_str(delta);
+                }
+            }
+        }
+    }
+    SemanticTiming {
+        content,
+        first_semantic: first_semantic.expect("text SSE emitted no semantic content"),
+        total: started.elapsed(),
+    }
+}
+
 fn canonical_result(body: &serde_json::Value) -> serde_json::Value {
     body["choices"][0]["message"].clone()
 }
@@ -475,6 +641,39 @@ async fn explicit_switch(
     assert_eq!(switch_status, 200, "explicit switch failed: {receipt}");
     assert_eq!(receipt["status"], "switched", "wrong switch receipt");
     (receipt, elapsed)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SwitchPhaseTimings {
+    drain_shutdown_commit_ms: u64,
+    replacement_load_ready_ms: u64,
+    switch_phase_load_ready_ms: u64,
+}
+
+fn switch_phase_timings(receipt: &serde_json::Value) -> SwitchPhaseTimings {
+    let timings = receipt["timings"]
+        .as_object()
+        .expect("switch receipt timings");
+    let parsed = SwitchPhaseTimings {
+        drain_shutdown_commit_ms: timings["drain_shutdown_commit_ms"]
+            .as_u64()
+            .expect("drain/shutdown/commit ms"),
+        replacement_load_ready_ms: timings["replacement_load_ready_ms"]
+            .as_u64()
+            .expect("replacement load-ready ms"),
+        switch_phase_load_ready_ms: timings["switch_phase_load_ready_ms"]
+            .as_u64()
+            .expect("switch phase load-ready ms"),
+    };
+    assert!(
+        parsed.switch_phase_load_ready_ms >= parsed.drain_shutdown_commit_ms,
+        "complete switch phase must include drain/shutdown/commit"
+    );
+    assert!(
+        parsed.switch_phase_load_ready_ms >= parsed.replacement_load_ready_ms,
+        "complete switch phase must include replacement load"
+    );
+    parsed
 }
 
 fn settled_memory_snapshot(pid: u32) -> MemorySnapshot {
@@ -598,6 +797,12 @@ struct ResidentIdentity {
     generation: u64,
     bytes_resident: u64,
     engine_config: serde_json::Value,
+    text_semantic_identity: serde_json::Value,
+    resident_components: serde_json::Value,
+    engine_load_ms: u64,
+    text_post_warm_ms: u64,
+    generation_post_warm_ms: u64,
+    projector_load_ms: Option<u64>,
 }
 
 fn one_resident(runtime: &serde_json::Value) -> ResidentIdentity {
@@ -618,6 +823,16 @@ fn one_resident(runtime: &serde_json::Value) -> ResidentIdentity {
         generation: rows[0]["generation"].as_u64().expect("resident generation"),
         bytes_resident: rows[0]["bytes_resident"].as_u64().expect("resident bytes"),
         engine_config: rows[0]["engine_config"].clone(),
+        text_semantic_identity: rows[0]["text_semantic_identity"].clone(),
+        resident_components: rows[0]["resident_components"].clone(),
+        engine_load_ms: rows[0]["engine_load_ms"].as_u64().expect("engine load ms"),
+        text_post_warm_ms: rows[0]["text_post_warm_ms"]
+            .as_u64()
+            .expect("text post-warm ms"),
+        generation_post_warm_ms: rows[0]["generation_post_warm_ms"]
+            .as_u64()
+            .expect("generation post-warm ms"),
+        projector_load_ms: rows[0]["projector_load_ms"].as_u64(),
     }
 }
 
@@ -745,27 +960,15 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
     );
     let ttft_b = semantic_ttft(&body_b);
     let memory_b = settled_memory_snapshot(server.0.id());
-    // Detect the resident representation from OS ownership evidence. A future
-    // native-mapped B automatically enters the file-backed branch and must be
-    // absent again after B -> A. A copied B has no file map; in that case its
-    // fresh generation, successful model-specific inference, and exact pool
-    // byte accounting are the explicit anonymous-storage proof.
-    let mappings_b = assert_artifact_mapping_state(server.0.id(), &model_b, &model_a, "B", false);
+    // Every served text artifact remains file-backed after load. Anonymous
+    // weight shadows are not an accepted swap representation.
+    let mappings_b = assert_artifact_mapping_state(server.0.id(), &model_b, &model_a, "B", true);
 
     assert_eq!(
         runtime_b["pool"]["total_resident_bytes"].as_u64(),
         Some(bytes_b),
         "logical pool accounting must name only B: {runtime_b}"
     );
-    let b_storage_contract = if mappings_b.0.is_live() {
-        "file_backed"
-    } else {
-        assert!(
-            memory_b.rss_bytes > 0 && memory_b.physical_footprint_bytes > 0,
-            "anonymous B storage has no physical-memory accounting: {memory_b:?}"
-        );
-        "anonymous_accounted"
-    };
     let peak_margin = memory_a1
         .rss_bytes
         .max(memory_b.rss_bytes)
@@ -889,8 +1092,375 @@ fn model_swap_a_b_a_reclaims_and_replays_e2e() {
         memory_a2.system_wired_bytes,
     );
     eprintln!("model_swap peaks: A -> B={peak_a_to_b:?}; B -> A={peak_b_to_a:?}");
+    eprintln!("model_swap mappings: A1={mappings_a1:?}; B={mappings_b:?}; A2={mappings_a2:?}");
+}
+
+fn expected_projector_companion(model: &std::path::Path) -> PathBuf {
+    let name = model
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("UTF-8 model filename");
+    let stem = name
+        .strip_suffix(".gguf")
+        .or_else(|| name.strip_suffix(".GGUF"))
+        .expect("model filename ends in .gguf");
+    model.with_file_name(format!("{stem}-mmproj.gguf"))
+}
+
+fn assert_pair_accounting(identity: &ResidentIdentity, expects_projector: bool) {
+    let components = &identity.resident_components;
+    let text = components["text_gguf_bytes"].as_u64().expect("text bytes");
+    let weights = components["projector_weight_bytes"]
+        .as_u64()
+        .expect("projector weight bytes");
+    let file_backed = components["projector_file_backed_weight_bytes"]
+        .as_u64()
+        .expect("projector file-backed weight bytes");
+    let anonymous = components["projector_anonymous_weight_bytes"]
+        .as_u64()
+        .expect("projector anonymous weight bytes");
+    let cache_budget = components["projector_cache_budget_bytes"]
+        .as_u64()
+        .expect("projector cache budget bytes");
+    assert_eq!(
+        text.saturating_add(weights).saturating_add(cache_budget),
+        identity.bytes_resident,
+        "one-generation component total must equal pool charge"
+    );
+    assert_eq!(
+        file_backed.saturating_add(anonymous),
+        weights,
+        "projector charge components must conserve"
+    );
+    assert_eq!(
+        anonymous, 0,
+        "production projector weights must stay mapped"
+    );
+    assert_eq!(file_backed > 0, expects_projector);
+    let exact_file_backed = components["projector_file_backed_resident_bytes"]
+        .as_u64()
+        .expect("exact file-backed residency");
+    let exact_anonymous = components["projector_anonymous_resident_bytes"]
+        .as_u64()
+        .expect("exact anonymous residency");
+    assert_eq!(exact_anonymous, 0);
+    assert_eq!(exact_file_backed > 0, expects_projector);
+    assert_eq!(exact_file_backed, file_backed);
+    assert_eq!(weights > 0 && cache_budget > 0, expects_projector);
+    assert_eq!(identity.projector_load_ms.is_some(), expects_projector);
+    assert!(identity.text_post_warm_ms >= identity.engine_load_ms);
+    assert!(identity.generation_post_warm_ms >= identity.text_post_warm_ms);
+    if let Some(projector_ms) = identity.projector_load_ms {
+        assert!(identity.generation_post_warm_ms >= projector_ms);
+    }
+    assert_eq!(
+        identity.engine_config["projector"].is_object(),
+        expects_projector
+    );
+    if expects_projector {
+        assert!(
+            identity.engine_config["projector"]["admission_weight_bytes"]
+                .as_u64()
+                .is_some_and(|bound| bound >= weights),
+            "pre-load projector admission bound must cover exact published backing"
+        );
+    }
+}
+
+fn assert_text_semantic_identity(identity: &ResidentIdentity) {
+    let semantic = identity
+        .text_semantic_identity
+        .as_object()
+        .expect("production generation must publish text semantic identity");
+    for field in [
+        "model_id",
+        "architecture",
+        "tokenizer_source",
+        "chat_template_source",
+    ] {
+        assert!(
+            semantic[field]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "semantic identity field {field} must be non-empty: {semantic:?}"
+        );
+    }
+    for field in ["tokenizer_sha256", "chat_template_sha256"] {
+        let digest = semantic[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("semantic identity field {field}: {semantic:?}"));
+        assert_eq!(digest.len(), 64, "{field} must be SHA-256");
+        assert!(
+            digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{field} must be hexadecimal"
+        );
+    }
+    for field in ["tokenizer_source", "chat_template_source"] {
+        let source = semantic[field].as_str().expect("source string");
+        assert!(
+            !source.contains('/') && !source.contains('\\'),
+            "semantic source must be path-free: {source}"
+        );
+    }
+}
+
+fn assert_no_double_residency_peak(
+    before: MemorySnapshot,
+    after: MemorySnapshot,
+    peak: MemoryPeak,
+) {
+    let margin = (before.rss_bytes.max(after.rss_bytes) / 10).max(2 * GIB);
+    assert!(
+        peak.rss_bytes <= before.rss_bytes.max(after.rss_bytes).saturating_add(margin),
+        "pair switch crossed process-RSS double-residency bound: before={before:?}, after={after:?}, peak={peak:?}"
+    );
+    assert!(
+        peak.system_wired_bytes
+            <= before
+                .system_wired_bytes
+                .max(after.system_wired_bytes)
+                .saturating_add(margin),
+        "pair switch crossed host-wired double-residency bound: before={before:?}, after={after:?}, peak={peak:?}"
+    );
+}
+
+/// Generation-owned projector proof: A+P_A -> B -> C+P_C -> A+P_A.
+///
+/// The gate is intentionally exact-artifact and hardware-only. It exercises
+/// actual image preprocessing/ViT projection, records switch-to-first-semantic
+/// latency and first/steady SSE timing separately, and samples RSS + wired
+/// memory across every switch. The pool budget must fit each individual pair
+/// but force every adjacent transition through the revision-bound switch path.
+#[test]
+fn model_projector_pair_swap_reclaims_replays_and_never_inherits_e2e() {
+    if skip_unless_pair_gated("model_projector_pair_swap_reclaims_replays_and_never_inherits_e2e") {
+        return;
+    }
+    let canonical = |name: &str| {
+        let requested = PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name}")));
+        std::fs::canonicalize(&requested)
+            .unwrap_or_else(|error| panic!("cannot resolve {}: {error}", requested.display()))
+    };
+    let model_a = canonical(ENV_PAIR_MODEL_A);
+    let projector_a = canonical(ENV_PAIR_PROJECTOR_A);
+    let model_b = canonical(ENV_PAIR_MODEL_B);
+    let model_c = canonical(ENV_PAIR_MODEL_C);
+    let projector_c = canonical(ENV_PAIR_PROJECTOR_C);
+    assert_eq!(projector_a, expected_projector_companion(&model_a));
+    assert_eq!(projector_c, expected_projector_companion(&model_c));
+    assert!(model_a != model_b && model_b != model_c && model_a != model_c);
+    assert_ne!(
+        projector_a, projector_c,
+        "A and C must use distinct physical projector artifacts"
+    );
+    let pool_budget = std::env::var(ENV_PAIR_POOL_BUDGET)
+        .expect(ENV_PAIR_POOL_BUDGET)
+        .parse::<u64>()
+        .expect("parse pair pool budget");
+    let switch_budget = Duration::from_secs(
+        std::env::var(ENV_MAX_SECS)
+            .ok()
+            .map(|raw| raw.parse::<u64>().expect("parse swap seconds"))
+            .unwrap_or(SWAP_BUDGET_SECS),
+    );
+
+    let startup_started = std::time::Instant::now();
+    let server = ServerGuard::spawn_pair(
+        &model_a.to_string_lossy(),
+        &projector_a.to_string_lossy(),
+        pool_budget,
+    )
+    .expect("spawn pair-owned hf2q serve");
+    wait_for_readyz();
+    let startup_load_ready = startup_started.elapsed();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let client = build_client();
+    let model_id_a1 = rt.block_on(fetch_canonical_model_id(&client));
+    let runtime_a1_cold = rt.block_on(fetch_runtime(&client));
+    let resident_a1 = one_resident(&runtime_a1_cold);
+    assert_pair_accounting(&resident_a1, true);
+    assert_text_semantic_identity(&resident_a1);
+    assert_eq!(
+        resident_a1.resident_components["projector_cache_resident_bytes"].as_u64(),
+        Some(0),
+        "new A generation must start with an empty vision cache"
+    );
+    let vision_a1_first = rt.block_on(post_vision_stream(&client, &model_id_a1));
+    let vision_a1_steady = rt.block_on(post_vision_stream(&client, &model_id_a1));
+    assert_eq!(vision_a1_steady.content, vision_a1_first.content);
+    let runtime_a1 = rt.block_on(fetch_runtime(&client));
+    assert!(
+        one_resident(&runtime_a1).resident_components["projector_cache_resident_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "A vision request must populate only A's generation-owned cache"
+    );
+    let memory_a1 = settled_memory_snapshot(server.0.id());
+
+    let (stop_ab, sampler_ab) = start_peak_sampler(server.0.id());
+    let (receipt_b, switch_ab) = rt.block_on(explicit_switch(&client, &model_b));
+    let switch_ab_phases = switch_phase_timings(&receipt_b);
+    let request_b = receipt_b["request_model"]
+        .as_str()
+        .expect("B request model");
+    let semantic_b = rt.block_on(post_text_stream(&client, request_b));
+    stop_ab.store(true, std::sync::atomic::Ordering::Release);
+    let peak_ab = sampler_ab.join().expect("A->B sampler");
+    assert!(
+        switch_ab < switch_budget,
+        "A -> B load-ready exceeded budget"
+    );
+    let runtime_b = rt.block_on(fetch_runtime(&client));
+    let resident_b = one_resident(&runtime_b);
+    assert_pair_accounting(&resident_b, false);
+    assert_text_semantic_identity(&resident_b);
+    assert_ne!(
+        resident_b.text_semantic_identity, resident_a1.text_semantic_identity,
+        "B must own its own tokenizer/template/model identity"
+    );
+    assert!(resident_b.engine_config["projector"].is_null());
+    let memory_b = settled_memory_snapshot(server.0.id());
+    assert_no_double_residency_peak(memory_a1, memory_b, peak_ab);
+
+    let (stop_bc, sampler_bc) = start_peak_sampler(server.0.id());
+    let (receipt_c, switch_bc) = rt.block_on(explicit_switch(&client, &model_c));
+    let switch_bc_phases = switch_phase_timings(&receipt_c);
+    let request_c = receipt_c["request_model"]
+        .as_str()
+        .expect("C request model");
+    let runtime_c_cold = rt.block_on(fetch_runtime(&client));
+    let resident_c = one_resident(&runtime_c_cold);
+    assert_pair_accounting(&resident_c, true);
+    assert_text_semantic_identity(&resident_c);
+    assert_ne!(
+        resident_c.text_semantic_identity, resident_b.text_semantic_identity,
+        "C must not retain B's tokenizer/template/model identity"
+    );
+    assert_eq!(
+        resident_c.resident_components["projector_cache_resident_bytes"].as_u64(),
+        Some(0),
+        "C must not inherit A's populated vision cache"
+    );
+    let vision_c_first = rt.block_on(post_vision_stream(&client, request_c));
+    let vision_c_steady = rt.block_on(post_vision_stream(&client, request_c));
+    assert_eq!(vision_c_first.content, vision_c_steady.content);
+    stop_bc.store(true, std::sync::atomic::Ordering::Release);
+    let peak_bc = sampler_bc.join().expect("B->C sampler");
+    assert!(
+        switch_bc < switch_budget,
+        "B -> C load-ready exceeded budget"
+    );
+    let runtime_c = rt.block_on(fetch_runtime(&client));
+    assert!(
+        one_resident(&runtime_c).resident_components["projector_cache_resident_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    let memory_c = settled_memory_snapshot(server.0.id());
+    assert_no_double_residency_peak(memory_b, memory_c, peak_bc);
+
+    let (stop_ca, sampler_ca) = start_peak_sampler(server.0.id());
+    let (receipt_a2, switch_ca) = rt.block_on(explicit_switch(&client, &model_a));
+    let switch_ca_phases = switch_phase_timings(&receipt_a2);
+    let request_a2 = receipt_a2["request_model"]
+        .as_str()
+        .expect("A2 request model");
+    let runtime_a2_cold = rt.block_on(fetch_runtime(&client));
+    let resident_a2 = one_resident(&runtime_a2_cold);
+    assert_pair_accounting(&resident_a2, true);
+    assert_text_semantic_identity(&resident_a2);
+    assert_ne!(resident_a2.generation, resident_a1.generation);
+    assert_eq!(resident_a2.pool_key, resident_a1.pool_key);
+    assert_eq!(resident_a2.engine_config, resident_a1.engine_config);
+    assert_eq!(
+        resident_a2.text_semantic_identity, resident_a1.text_semantic_identity,
+        "A reload must exactly restore A's tokenizer/template/model identity"
+    );
+    assert_eq!(
+        resident_a2.resident_components["projector_cache_resident_bytes"].as_u64(),
+        Some(0),
+        "reloaded A must own a fresh empty cache"
+    );
+    let vision_a2_first = rt.block_on(post_vision_stream(&client, request_a2));
+    let vision_a2_steady = rt.block_on(post_vision_stream(&client, request_a2));
+    stop_ca.store(true, std::sync::atomic::Ordering::Release);
+    let peak_ca = sampler_ca.join().expect("C->A sampler");
+    assert!(
+        switch_ca < switch_budget,
+        "C -> A load-ready exceeded budget"
+    );
+    assert_eq!(vision_a2_first.content, vision_a1_first.content);
+    assert_eq!(vision_a2_steady.content, vision_a1_steady.content);
+    let memory_a2 = settled_memory_snapshot(server.0.id());
+    assert_no_double_residency_peak(memory_c, memory_a2, peak_ca);
+    let reload_margin = (memory_a1.rss_bytes / 10).max(2 * GIB);
+    assert!(memory_a2.rss_bytes <= memory_a1.rss_bytes.saturating_add(reload_margin));
+    assert!(
+        memory_a2.system_wired_bytes <= memory_a1.system_wired_bytes.saturating_add(reload_margin)
+    );
+
     eprintln!(
-        "model_swap mappings: A1={mappings_a1:?}; B_contract={b_storage_contract} \
-         B={mappings_b:?}; A2={mappings_a2:?}"
+        "projector_pair_swap PASS: load-ready startup={startup_load_ready:?} \
+         A->B={switch_ab:?} B->C={switch_bc:?} C->A={switch_ca:?}; \
+         drain-shutdown-commit AB/BC/CA={}ms/{}ms/{}ms \
+         replacement-load-ready={}ms/{}ms/{}ms switch-phase={}ms/{}ms/{}ms; \
+         post-warm generation A1/B/C/A2={}ms/{}ms/{}ms/{}ms \
+         text={}ms/{}ms/{}ms/{}ms projector={:?}ms/{:?}ms/{:?}ms/{:?}ms \
+         raw-engine={}ms/{}ms/{}ms/{}ms; \
+         switch-to-first-semantic startup-A1={:?} A->B={:?} B->C={:?} C->A={:?}; \
+         first/steady A1={:?}/{:?} B={:?} C={:?}/{:?} A2={:?}/{:?}; \
+         total A1={:?}/{:?} B={:?} C={:?}/{:?} A2={:?}/{:?}; \
+         RSS A1/B/C/A2={}/{}/{}/{} wired={}/{}/{}/{}; peaks AB={peak_ab:?} BC={peak_bc:?} CA={peak_ca:?}",
+        switch_ab_phases.drain_shutdown_commit_ms,
+        switch_bc_phases.drain_shutdown_commit_ms,
+        switch_ca_phases.drain_shutdown_commit_ms,
+        switch_ab_phases.replacement_load_ready_ms,
+        switch_bc_phases.replacement_load_ready_ms,
+        switch_ca_phases.replacement_load_ready_ms,
+        switch_ab_phases.switch_phase_load_ready_ms,
+        switch_bc_phases.switch_phase_load_ready_ms,
+        switch_ca_phases.switch_phase_load_ready_ms,
+        resident_a1.generation_post_warm_ms,
+        resident_b.generation_post_warm_ms,
+        resident_c.generation_post_warm_ms,
+        resident_a2.generation_post_warm_ms,
+        resident_a1.text_post_warm_ms,
+        resident_b.text_post_warm_ms,
+        resident_c.text_post_warm_ms,
+        resident_a2.text_post_warm_ms,
+        resident_a1.projector_load_ms,
+        resident_b.projector_load_ms,
+        resident_c.projector_load_ms,
+        resident_a2.projector_load_ms,
+        resident_a1.engine_load_ms,
+        resident_b.engine_load_ms,
+        resident_c.engine_load_ms,
+        resident_a2.engine_load_ms,
+        startup_load_ready + vision_a1_first.first_semantic,
+        switch_ab + semantic_b.first_semantic,
+        switch_bc + vision_c_first.first_semantic,
+        switch_ca + vision_a2_first.first_semantic,
+        vision_a1_first.first_semantic,
+        vision_a1_steady.first_semantic,
+        semantic_b.first_semantic,
+        vision_c_first.first_semantic,
+        vision_c_steady.first_semantic,
+        vision_a2_first.first_semantic,
+        vision_a2_steady.first_semantic,
+        vision_a1_first.total,
+        vision_a1_steady.total,
+        semantic_b.total,
+        vision_c_first.total,
+        vision_c_steady.total,
+        vision_a2_first.total,
+        vision_a2_steady.total,
+        memory_a1.rss_bytes,
+        memory_b.rss_bytes,
+        memory_c.rss_bytes,
+        memory_a2.rss_bytes,
+        memory_a1.system_wired_bytes,
+        memory_b.system_wired_bytes,
+        memory_c.system_wired_bytes,
+        memory_a2.system_wired_bytes,
     );
 }

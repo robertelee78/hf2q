@@ -2,17 +2,17 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, Query, State};
-use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::extract::{Extension, Query, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 
 use super::artifact_catalog::{
-    ArtifactCatalogCoordinator, CatalogError, StoredArtifact, ARTIFACT_CATALOG_SCHEMA,
-    LOCAL_ARTIFACT_CATALOG_SCHEMA,
+    ARTIFACT_CATALOG_SCHEMA, ArtifactCatalogCoordinator, CatalogError,
+    LOCAL_ARTIFACT_CATALOG_SCHEMA, StoredArtifact,
 };
 use super::cancellation::{
-    run_consistent_result_task, run_preparation_command, PreparationError, PreparationLimits,
+    PreparationError, PreparationLimits, run_consistent_result_task, run_preparation_command,
 };
 use super::handlers::map_hotswap_error_to_response;
 use super::lifecycle::{LifecycleError, SwitchConfirmation};
@@ -131,7 +131,11 @@ fn engine_config_identity_json(
             "source_sha256": projector.source_sha256,
             "pair_generation": projector.pair_generation,
             "profile": projector.profile,
+            "admission_weight_bytes": projector.admission_weight_bytes,
             "weight_bytes": projector.weight_bytes,
+            "file_backed_weight_bytes": projector.file_backed_weight_bytes,
+            "anonymous_weight_bytes": projector.anonymous_weight_bytes,
+            "mapped_segment_count": projector.mapped_segment_count,
             "cache_budget_bytes": projector.cache_budget_bytes,
         })
     });
@@ -145,6 +149,21 @@ fn engine_config_identity_json(
         "explicit_config": identity.explicit_config,
         "dwq_overlay": identity.dwq_overlay,
         "projector": projector,
+    })
+}
+
+fn text_semantic_identity_json(
+    identity: Option<&crate::serve::multi_model::TextSemanticIdentity>,
+) -> serde_json::Value {
+    identity.map_or(serde_json::Value::Null, |identity| {
+        serde_json::json!({
+            "model_id": identity.model_id,
+            "architecture": identity.architecture,
+            "tokenizer_source": identity.tokenizer_source,
+            "tokenizer_sha256": identity.tokenizer_sha256,
+            "chat_template_source": identity.chat_template_source,
+            "chat_template_sha256": identity.chat_template_sha256,
+        })
     })
 }
 
@@ -196,13 +215,22 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
                 "resident_components": {
                     "text_gguf_bytes": engine.resident_bytes.text_gguf_bytes,
                     "projector_weight_bytes": engine.resident_bytes.projector_weight_bytes,
+                    "projector_file_backed_weight_bytes": engine.resident_bytes.projector_file_backed_weight_bytes,
+                    "projector_anonymous_weight_bytes": engine.resident_bytes.projector_anonymous_weight_bytes,
+                    "projector_file_backed_resident_bytes": engine.projector.as_ref().map_or(0, |projector| projector.weights_file_backed_bytes),
+                    "projector_anonymous_resident_bytes": engine.projector.as_ref().map_or(0, |projector| projector.weights_anonymous_bytes),
                     "projector_cache_budget_bytes": engine.resident_bytes.projector_cache_budget_bytes,
                     "projector_cache_resident_bytes": projector_cache_resident_bytes,
                 },
                 "projector_load_ms": projector_load_ms,
                 "generation": engine.generation,
                 "engine_load_ms": engine.engine.info().load_wall_clock.as_millis() as u64,
+                "text_post_warm_ms": engine.text_post_warm_ms,
+                "generation_post_warm_ms": engine.generation_post_warm_ms,
                 "engine_config": engine_config_identity_json(&engine.config_identity),
+                "text_semantic_identity": text_semantic_identity_json(
+                    engine.text_semantic_identity.as_ref()
+                ),
             })
         })
         .collect::<Vec<_>>();
@@ -250,7 +278,7 @@ pub async fn local_gguf_catalog(
     let repository = match query.model.as_deref() {
         Some(model) if model.trim().is_empty() => {
             return ApiError::invalid_request("model must not be empty", Some("model".into()))
-                .into_response()
+                .into_response();
         }
         Some(model) => match normalize_hub_repository(model) {
             Ok(Some(repository)) => Some(repository),
@@ -259,7 +287,7 @@ pub async fn local_gguf_catalog(
                     "local artifact filtering requires an owner/repository model id",
                     Some("model".into()),
                 )
-                .into_response()
+                .into_response();
             }
             Err(response) => return response,
         },
@@ -316,7 +344,7 @@ pub async fn hub_gguf_catalog(
                 "hosted artifact catalog requires an owner/repository model id",
                 Some("model".into()),
             )
-            .into_response()
+            .into_response();
         }
         Err(response) => return response,
     };
@@ -353,7 +381,7 @@ pub async fn hub_gguf_catalog(
             return ApiError::generation_error(format!(
                 "hosted artifact catalog helper failed: {error}"
             ))
-            .into_response()
+            .into_response();
         }
     };
     if !output.status.success() {
@@ -397,8 +425,15 @@ fn activation_engine_config(
 
 enum ActivationPayload {
     ExplicitLocal(std::path::PathBuf),
-    VerifiedLocal(super::local_artifacts::LocalGgufArtifact),
-    Hosted(crate::input::hf_download::HubGgufArtifact),
+    VerifiedLocal {
+        artifact: super::local_artifacts::LocalGgufArtifact,
+        catalog_lease: super::artifact_catalog::ArtifactCandidateLease,
+    },
+    Hosted {
+        candidate_id: String,
+        pair: super::artifact_catalog::HostedArtifactPair,
+        catalog_lease: super::artifact_catalog::ArtifactCandidateLease,
+    },
 }
 
 const fn diagnostic_gguf_file_type(quant: QuantType) -> u32 {
@@ -412,7 +447,9 @@ fn diagnostic_quant_from_file_type(file_type: u32) -> Option<QuantType> {
 struct ActivationTarget {
     repo: String,
     quant: QuantType,
+    text_bytes: u64,
     bytes: u64,
+    admission_bytes_exact: bool,
     request_model: String,
     projector: Option<crate::serve::multi_model::ProjectorLoadSpec>,
     payload: ActivationPayload,
@@ -421,7 +458,7 @@ struct ActivationTarget {
 impl ActivationTarget {
     fn verified_local_path(&self) -> Option<&std::path::Path> {
         match &self.payload {
-            ActivationPayload::VerifiedLocal(artifact) => Some(&artifact.path),
+            ActivationPayload::VerifiedLocal { artifact, .. } => Some(&artifact.path),
             _ => None,
         }
     }
@@ -445,9 +482,12 @@ impl ActivationTarget {
         Response,
     > {
         let mut projector = self.projector;
-        let (path, validate_catalog_type) = match self.payload {
-            ActivationPayload::ExplicitLocal(path) => (path, false),
-            ActivationPayload::VerifiedLocal(artifact) => {
+        let (path, validate_catalog_type, hosted_authority, catalog_lease) = match self.payload {
+            ActivationPayload::ExplicitLocal(path) => (path, false, None, None),
+            ActivationPayload::VerifiedLocal {
+                artifact,
+                catalog_lease,
+            } => {
                 let permit = catalog.try_local_verify_slot().map_err(|error| match error {
                     CatalogError::LocalVerifyBusy => (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -461,10 +501,16 @@ impl ActivationTarget {
                     verify_local_gguf_cancellable(&artifact, cancellation, supervisor, permit)
                         .await?,
                     false,
+                    None,
+                    Some(catalog_lease),
                 )
             }
-            ActivationPayload::Hosted(artifact) => {
-                let permit = catalog.try_transfer_slot().map_err(|error| match error {
+            ActivationPayload::Hosted {
+                candidate_id,
+                pair,
+                catalog_lease,
+            } => {
+                let text_permit = catalog.try_transfer_slot().map_err(|error| match error {
                     CatalogError::TransferBusy => (
                         StatusCode::SERVICE_UNAVAILABLE,
                         [(header::RETRY_AFTER, "1")],
@@ -473,9 +519,137 @@ impl ActivationTarget {
                         .into_response(),
                     _ => ApiError::internal_error().into_response(),
                 })?;
+                let known_companion = pair
+                    .resolution
+                    .as_ref()
+                    .and_then(|resolution| resolution.companion_sha256())
+                    .map(|digest| {
+                        hosted_companion_by_digest(&pair, digest)
+                            .map(|companion| (companion, digest.to_owned()))
+                            .ok_or_else(|| {
+                                ApiError::invalid_request(
+                                    "resolved hosted projector is absent from its immutable catalog authority",
+                                    Some("artifact".into()),
+                                )
+                                .into_response()
+                            })
+                    })
+                    .transpose()?;
+                // Once discovery has bound an exact companion digest, fetch
+                // both immutable objects concurrently. The text header is
+                // still reopened and checked below; cached authority improves
+                // latency but never replaces pair revalidation.
+                let (text_path, prefetched_projector) = if let Some((companion, digest)) =
+                    known_companion
+                {
+                    let companion_permit =
+                            catalog.try_transfer_slot().map_err(|error| match error {
+                                CatalogError::TransferBusy => (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    [(header::RETRY_AFTER, "1")],
+                                    Json(serde_json::json!({"error":{"message":error.to_string(),"type":"server_busy","code":"artifact_transfer_busy"}})),
+                                )
+                                    .into_response(),
+                                _ => ApiError::internal_error().into_response(),
+                            })?;
+                    let text_fetch = fetch_hub_gguf_cancellable(
+                        &pair.text,
+                        cancellation.clone(),
+                        supervisor.clone(),
+                        text_permit,
+                        false,
+                    );
+                    let projector_fetch = fetch_hub_gguf_cancellable(
+                        companion,
+                        cancellation.clone(),
+                        supervisor.clone(),
+                        companion_permit,
+                        true,
+                    );
+                    let (text_path, projector_path) =
+                        run_paired_preparations(&cancellation, text_fetch, projector_fetch).await?;
+                    (
+                        text_path,
+                        Some((projector_path, digest.to_ascii_lowercase())),
+                    )
+                } else {
+                    (
+                        fetch_hub_gguf_cancellable(
+                            &pair.text,
+                            cancellation.clone(),
+                            supervisor.clone(),
+                            text_permit,
+                            false,
+                        )
+                        .await?,
+                        None,
+                    )
+                };
+                let text_gguf = mlx_native::gguf::GgufFile::open(&text_path).map_err(|error| {
+                    ApiError::invalid_request(
+                        format!("selected artifact is not a loadable GGUF: {error}"),
+                        Some("artifact".into()),
+                    )
+                    .into_response()
+                })?;
+                let expected_projector = text_gguf
+                    .metadata_string(crate::core::provenance::KEY_MMPROJ_SHA256)
+                    .map(str::to_owned);
+                drop(text_gguf);
+                match (expected_projector, prefetched_projector) {
+                    (Some(expected), Some((projector_path, discovered_digest))) => {
+                        if !expected.eq_ignore_ascii_case(&discovered_digest) {
+                            return Err(ApiError::invalid_request(
+                                "hosted text/projector binding changed after immutable pair discovery",
+                                Some("artifact".into()),
+                            )
+                            .into_response());
+                        }
+                        projector = Some(preflight_hosted_projector(projector_path, expected)?);
+                    }
+                    (Some(expected), None) => {
+                        let companion = hosted_companion_by_digest(&pair, &expected)
+                            .ok_or_else(|| {
+                                ApiError::invalid_request(
+                                    "selected text GGUF declares a projector digest that is absent from its immutable hosted catalog",
+                                    Some("artifact".into()),
+                                )
+                                .into_response()
+                            })?;
+                        let companion_permit =
+                            catalog.try_transfer_slot().map_err(|error| match error {
+                                CatalogError::TransferBusy => (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    [(header::RETRY_AFTER, "1")],
+                                    Json(serde_json::json!({"error":{"message":error.to_string(),"type":"server_busy","code":"artifact_transfer_busy"}})),
+                                )
+                                    .into_response(),
+                                _ => ApiError::internal_error().into_response(),
+                            })?;
+                        let projector_path = fetch_hub_gguf_cancellable(
+                            companion,
+                            cancellation,
+                            supervisor,
+                            companion_permit,
+                            true,
+                        )
+                        .await?;
+                        projector = Some(preflight_hosted_projector(projector_path, expected)?);
+                    }
+                    (None, Some(_)) => {
+                        return Err(ApiError::invalid_request(
+                            "hosted text artifact no longer declares its resolved projector binding",
+                            Some("artifact".into()),
+                        )
+                        .into_response());
+                    }
+                    (None, None) => {}
+                }
                 (
-                    fetch_hub_gguf_cancellable(&artifact, cancellation, supervisor, permit).await?,
+                    text_path,
                     true,
+                    Some((candidate_id, pair.clone())),
+                    Some(catalog_lease),
                 )
             }
         };
@@ -509,10 +683,43 @@ impl ActivationTarget {
             .into_response());
         }
         if projector.is_none() {
-            let (resolved, _) = activation_projector_spec(&path, self.bytes)?;
+            let (resolved, _) = activation_projector_spec(&path, self.text_bytes)?;
             projector = resolved;
         }
-        let bytes = activation_pair_bytes(self.bytes, projector.as_ref())?;
+        let bytes = activation_pair_bytes(self.text_bytes, projector.as_ref())?;
+        if let Some((candidate_id, authority)) = hosted_authority {
+            let text_bytes = authority.text.bytes;
+            let resolution = match projector.as_ref() {
+                Some(projector) => super::artifact_catalog::HostedPairResolution::projector(
+                    text_bytes,
+                    projector.artifact_sha256.clone(),
+                    projector.projected_weight_bytes,
+                    projector.cache_budget_bytes,
+                ),
+                None => Ok(super::artifact_catalog::HostedPairResolution::text_only(
+                    text_bytes,
+                )),
+            }
+            .map_err(|error| {
+                ApiError::invalid_request(
+                    format!("hosted model/projector admission authority is invalid: {error}"),
+                    Some("artifact".into()),
+                )
+                .into_response()
+            })?;
+            catalog
+                .record_hosted_resolution(&candidate_id, &authority, resolution)
+                .map_err(|error| {
+                    ApiError::invalid_request(
+                        format!(
+                            "hosted model/projector admission authority changed during preparation: {error}"
+                        ),
+                        Some("artifact".into()),
+                    )
+                    .into_response()
+                })?;
+        }
+        drop(catalog_lease);
         Ok((
             self.repo,
             self.quant,
@@ -522,6 +729,69 @@ impl ActivationTarget {
             projector,
         ))
     }
+}
+
+/// Run the two authenticated halves of a known hosted pair concurrently. The
+/// first failure cancels and then awaits the sibling helper, so an activation
+/// error cannot leave a detached transfer consuming resources after the
+/// catalog lease and handler return.
+async fn run_paired_preparations<L, R, E, LF, RF>(
+    cancellation: &super::cancellation::CancellationSignal,
+    left: LF,
+    right: RF,
+) -> Result<(L, R), E>
+where
+    LF: std::future::Future<Output = Result<L, E>>,
+    RF: std::future::Future<Output = Result<R, E>>,
+{
+    tokio::pin!(left);
+    tokio::pin!(right);
+    tokio::select! {
+        left_result = &mut left => match left_result {
+            Ok(left_value) => Ok((left_value, right.await?)),
+            Err(error) => {
+                cancellation.cancel();
+                let _ = right.await;
+                Err(error)
+            }
+        },
+        right_result = &mut right => match right_result {
+            Ok(right_value) => Ok((left.await?, right_value)),
+            Err(error) => {
+                cancellation.cancel();
+                let _ = left.await;
+                Err(error)
+            }
+        },
+    }
+}
+
+fn preflight_hosted_projector(
+    projector_path: std::path::PathBuf,
+    expected_sha256: String,
+) -> std::result::Result<crate::serve::multi_model::ProjectorLoadSpec, Response> {
+    crate::serve::multi_model::ProjectorLoadSpec::preflight(
+        projector_path,
+        Some(expected_sha256),
+        crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES as u64,
+    )
+    .map_err(|error| {
+        ApiError::invalid_request(
+            format!("hosted projector preflight failed: {error}"),
+            Some("artifact".into()),
+        )
+        .into_response()
+    })
+}
+
+fn hosted_companion_by_digest<'a>(
+    pair: &'a super::artifact_catalog::HostedArtifactPair,
+    expected_sha256: &str,
+) -> Option<&'a crate::input::hf_download::HubGgufArtifact> {
+    pair.companions
+        .iter()
+        .filter(|candidate| candidate.sha256.eq_ignore_ascii_case(expected_sha256))
+        .min_by(|left, right| left.filename.cmp(&right.filename))
 }
 
 fn activation_projector_spec(
@@ -537,32 +807,20 @@ fn activation_projector_spec(
             .into_response()
         })?;
     let projector = match projector_path {
-        Some(path) => {
-            let text = mlx_native::gguf::GgufFile::open(text_path).map_err(|error| {
+        Some(path) => Some(
+            crate::serve::multi_model::ProjectorLoadSpec::preflight_for_text(
+                text_path,
+                path,
+                crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES as u64,
+            )
+            .map_err(|error| {
                 ApiError::invalid_request(
-                    format!("cannot open text artifact for pair identity: {error}"),
+                    format!("projector preflight failed: {error}"),
                     Some("model".into()),
                 )
                 .into_response()
-            })?;
-            let expected = text
-                .metadata_string(crate::core::provenance::KEY_MMPROJ_SHA256)
-                .map(str::to_owned);
-            Some(
-                crate::serve::multi_model::ProjectorLoadSpec::preflight(
-                    path,
-                    expected,
-                    crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES as u64,
-                )
-                .map_err(|error| {
-                    ApiError::invalid_request(
-                        format!("projector preflight failed: {error}"),
-                        Some("model".into()),
-                    )
-                    .into_response()
-                })?,
-            )
-        }
+            })?,
+        ),
         None => None,
     };
     let bytes = activation_pair_bytes(text_bytes, projector.as_ref())?;
@@ -574,9 +832,10 @@ fn activation_pair_bytes(
     projector: Option<&crate::serve::multi_model::ProjectorLoadSpec>,
 ) -> std::result::Result<u64, Response> {
     let components = match projector {
-        Some(projector) => crate::serve::multi_model::ResidentByteComponents::new(
+        Some(projector) => crate::serve::multi_model::ResidentByteComponents::mapped_projector(
             text_bytes,
             projector.projected_weight_bytes,
+            0,
             projector.cache_budget_bytes,
         ),
         None => Ok(crate::serve::multi_model::ResidentByteComponents::text_only(text_bytes)),
@@ -662,13 +921,18 @@ async fn fetch_hub_gguf_cancellable(
     cancellation: super::cancellation::CancellationSignal,
     supervisor: super::cancellation::PreparationSupervisor,
     permit: tokio::sync::OwnedSemaphorePermit,
+    companion: bool,
 ) -> std::result::Result<std::path::PathBuf, Response> {
     let executable =
         std::env::current_exe().map_err(|_| ApiError::internal_error().into_response())?;
-    let quant = artifact.quant_hint.as_deref().ok_or_else(|| {
-        ApiError::invalid_request("selected artifact has no quant", Some("artifact".into()))
-            .into_response()
-    })?;
+    let quant = artifact.quant_hint.as_deref();
+    if !companion && quant.is_none() {
+        return Err(ApiError::invalid_request(
+            "selected artifact has no quant",
+            Some("artifact".into()),
+        )
+        .into_response());
+    }
     let mut command = tokio::process::Command::new(executable);
     command.args([
         "__fetch-hub-gguf",
@@ -682,9 +946,12 @@ async fn fetch_hub_gguf_cancellable(
         &artifact.bytes.to_string(),
         "--sha256",
         &artifact.sha256,
-        "--quant",
-        quant,
+        "--role",
+        if companion { "companion" } else { "text_model" },
     ]);
+    if let Some(quant) = quant {
+        command.args(["--quant", quant]);
+    }
     let output = run_preparation_command(
         command,
         cancellation,
@@ -738,7 +1005,10 @@ async fn resolve_activation_target(
     }
     let hub_repository = normalize_hub_repository(model)?;
     if let Some(candidate_id) = candidate_id {
-        let artifact = state.artifact_catalog.resolve(candidate_id).map_err(|error| {
+        let (artifact, catalog_lease) = state
+            .artifact_catalog
+            .resolve_pinned(candidate_id)
+            .map_err(|error| {
             let status = match error {
                 CatalogError::Gone => StatusCode::GONE,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -748,10 +1018,10 @@ async fn resolve_activation_target(
                 Json(serde_json::json!({"error":{"message":error.to_string(),"type":"invalid_request_error","code":"artifact_selection_gone"}})),
             )
                 .into_response()
-        })?;
+            })?;
         return match artifact {
-            StoredArtifact::Hosted(artifact) => {
-                if hub_repository.as_deref() != Some(artifact.repository.as_str()) {
+            StoredArtifact::Hosted(pair) => {
+                if hub_repository.as_deref() != Some(pair.text.repository.as_str()) {
                     return Err(ApiError::invalid_request(
                         "artifact selection does not belong to requested model",
                         Some("candidate_id".into()),
@@ -759,18 +1029,28 @@ async fn resolve_activation_target(
                     .into_response());
                 }
                 let quant = QuantType::from_canonical_str(
-                    artifact.quant_hint.as_deref().unwrap_or_default(),
+                    pair.text.quant_hint.as_deref().unwrap_or_default(),
                 )
                 .map_err(|error| {
                     ApiError::invalid_request(error, Some("candidate_id".into())).into_response()
                 })?;
+                let resolution = pair.resolution.as_ref();
+                let bytes = resolution
+                    .map(|resolution| resolution.activation_bytes())
+                    .unwrap_or(pair.text.bytes);
                 Ok(ActivationTarget {
-                    repo: artifact.request_model(),
+                    repo: pair.text.request_model(),
                     quant,
-                    bytes: artifact.bytes,
-                    request_model: artifact.request_model(),
+                    text_bytes: pair.text.bytes,
+                    bytes,
+                    admission_bytes_exact: resolution.is_some(),
+                    request_model: pair.text.request_model(),
                     projector: None,
-                    payload: ActivationPayload::Hosted(artifact),
+                    payload: ActivationPayload::Hosted {
+                        candidate_id: candidate_id.to_owned(),
+                        pair,
+                        catalog_lease,
+                    },
                 })
             }
             StoredArtifact::Local(artifact) => {
@@ -796,10 +1076,15 @@ async fn resolve_activation_target(
                 Ok(ActivationTarget {
                     repo: request_model.clone(),
                     quant,
+                    text_bytes: artifact.bytes,
                     bytes,
+                    admission_bytes_exact: true,
                     request_model,
                     projector,
-                    payload: ActivationPayload::VerifiedLocal(artifact),
+                    payload: ActivationPayload::VerifiedLocal {
+                        artifact,
+                        catalog_lease,
+                    },
                 })
             }
         };
@@ -847,7 +1132,7 @@ async fn resolve_activation_target(
             .into_response())
         }
     };
-    let bytes = std::fs::metadata(&gguf_path)
+    let text_bytes = std::fs::metadata(&gguf_path)
         .map_err(|error| {
             tracing::error!(
                 path = %gguf_path.display(),
@@ -860,13 +1145,15 @@ async fn resolve_activation_target(
             .into_response()
         })?
         .len();
-    let (projector, bytes) = activation_projector_spec(&gguf_path, bytes)?;
+    let (projector, bytes) = activation_projector_spec(&gguf_path, text_bytes)?;
     let repo = crate::serve::pool_key_for_path(&gguf_path);
     Ok(ActivationTarget {
         request_model: repo.clone(),
         repo,
         quant,
+        text_bytes,
         bytes,
+        admission_bytes_exact: true,
         projector,
         payload: ActivationPayload::ExplicitLocal(gguf_path),
     })
@@ -1018,6 +1305,7 @@ pub async fn activate_model(
     let repo = target.repo.clone();
     let quant = target.quant;
     let bytes = target.bytes;
+    let admission_bytes_exact = target.admission_bytes_exact;
     if let Some(local_path) = target.verified_local_path() {
         if let Ok(manager) = state.pool.read() {
             if let Some(engine) = manager
@@ -1079,7 +1367,7 @@ pub async fn activate_model(
                     AdmissionOutcome::WouldEvict {
                         victims,
                         projected_bytes,
-                    } => {
+                    } if admission_bytes_exact => {
                         let victim_keys = victims
                             .iter()
                             .map(|victim| victim.repo_id.as_str())
@@ -1254,6 +1542,18 @@ pub async fn activate_model(
             }
         }
         ModelActivationAction::Switch => {
+            if !admission_bytes_exact {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "schema_version": HF2Q_ACTIVATION_SCHEMA,
+                        "status": "pair_resolution_required",
+                        "code": "pair_resolution_required",
+                        "message": "hosted candidate pair admission is not resolved; submit action=load once to authenticate the text header and receive an exact switch receipt",
+                    })),
+                )
+                    .into_response();
+            }
             let Some(expected_revision) = request.expected_revision else {
                 return ApiError::invalid_request(
                     "expected_revision is required for action=switch",
@@ -1312,6 +1612,11 @@ pub async fn activate_model(
             let target_repo = repo.clone();
             let lifecycle = Arc::clone(&state.model_lifecycle);
             let switch_pool = Arc::clone(&state.pool);
+            let switch_phase_started = std::time::Instant::now();
+            let drain_shutdown_commit_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let replacement_load_ready_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let drain_shutdown_commit_for_load = Arc::clone(&drain_shutdown_commit_ms);
+            let replacement_load_ready_for_load = Arc::clone(&replacement_load_ready_ms);
             let result = run_consistent_result_task(
                 state.preparations.clone(),
                 async move {
@@ -1322,7 +1627,12 @@ pub async fn activate_model(
                             std::time::Duration::from_secs(60),
                             |loaded| async move { loaded.engine.shutdown().await },
                             move |pool| async move {
-                                tokio::task::spawn_blocking(move || {
+                                drain_shutdown_commit_for_load.store(
+                                    switch_phase_started.elapsed().as_millis() as u64,
+                                    std::sync::atomic::Ordering::Release,
+                                );
+                                let replacement_started = std::time::Instant::now();
+                                let loaded = tokio::task::spawn_blocking(move || {
                                     let mut manager = pool.write().map_err(|error| {
                                         HotSwapError::LoaderFailed(anyhow::anyhow!(
                                             "pool rwlock poisoned: {error}"
@@ -1340,7 +1650,12 @@ pub async fn activate_model(
                                     HotSwapError::LoaderFailed(anyhow::anyhow!(
                                         "replacement model load task failed: {error}"
                                     ))
-                                })?
+                                })?;
+                                replacement_load_ready_for_load.store(
+                                    replacement_started.elapsed().as_millis() as u64,
+                                    std::sync::atomic::Ordering::Release,
+                                );
+                                loaded
                             },
                         )
                         .await
@@ -1362,6 +1677,17 @@ pub async fn activate_model(
                             "status": "switched",
                             "pool_revision": revision,
                             "request_model": request_model,
+                            "timings": {
+                                "drain_shutdown_commit_ms": drain_shutdown_commit_ms.load(
+                                    std::sync::atomic::Ordering::Acquire
+                                ),
+                                "replacement_load_ready_ms": replacement_load_ready_ms.load(
+                                    std::sync::atomic::Ordering::Acquire
+                                ),
+                                "switch_phase_load_ready_ms": switch_phase_started
+                                    .elapsed()
+                                    .as_millis() as u64,
+                            },
                             "candidate": activation_candidate_json(
                                 &request.model, &repo, quant, bytes
                             ),
@@ -1422,7 +1748,11 @@ mod tests {
                 source_sha256: Some("b".repeat(64)),
                 pair_generation: Some("pair-generation-7".into()),
                 profile: "qwen3vl_siglip".into(),
+                admission_weight_bytes: 128,
                 weight_bytes: 123,
+                file_backed_weight_bytes: 120,
+                anonymous_weight_bytes: 0,
+                mapped_segment_count: 1,
                 cache_budget_bytes: 456,
             }),
             ..crate::serve::multi_model::EngineConfigIdentity::default()
@@ -1431,11 +1761,142 @@ mod tests {
         assert_eq!(receipt["projector"]["artifact_sha256"], "a".repeat(64));
         assert_eq!(receipt["projector"]["source_sha256"], "b".repeat(64));
         assert_eq!(receipt["projector"]["pair_generation"], "pair-generation-7");
+        assert_eq!(receipt["projector"]["admission_weight_bytes"], 128);
         assert_eq!(receipt["projector"]["weight_bytes"], 123);
+        assert_eq!(receipt["projector"]["file_backed_weight_bytes"], 120);
+        assert_eq!(receipt["projector"]["anonymous_weight_bytes"], 0);
+        assert_eq!(receipt["projector"]["mapped_segment_count"], 1);
         assert_eq!(receipt["projector"]["cache_budget_bytes"], 456);
         let encoded = serde_json::to_string(&receipt).unwrap();
         assert!(!encoded.contains("/opt/"));
         assert!(!encoded.contains(".gguf"));
+    }
+
+    #[test]
+    fn hosted_pair_resolves_only_the_digest_bound_companion() {
+        let companion = |filename: &str, digest: &str| crate::input::hf_download::HubGgufArtifact {
+            repository: "owner/model".into(),
+            revision: "a".repeat(40),
+            filename: filename.into(),
+            bytes: 42,
+            sha256: digest.into(),
+            quant_hint: None,
+            role: "companion".into(),
+            selectable: false,
+            unavailable_reason: Some("vision projector companion; not a text model".into()),
+        };
+        let pair = super::super::artifact_catalog::HostedArtifactPair {
+            text: crate::input::hf_download::HubGgufArtifact {
+                repository: "owner/model".into(),
+                revision: "a".repeat(40),
+                filename: "model-q5_k_m.gguf".into(),
+                bytes: 100,
+                sha256: "b".repeat(64),
+                quant_hint: Some("Q5_K_M".into()),
+                role: "text_model".into(),
+                selectable: true,
+                unavailable_reason: None,
+            },
+            companions: vec![
+                companion("z-mmproj.gguf", &"c".repeat(64)),
+                companion("a-mmproj.gguf", &"c".repeat(64)),
+                companion("other-mmproj.gguf", &"d".repeat(64)),
+            ],
+            resolution: None,
+        };
+
+        let selected = hosted_companion_by_digest(&pair, &"C".repeat(64)).unwrap();
+        assert_eq!(selected.filename, "a-mmproj.gguf");
+        assert!(hosted_companion_by_digest(&pair, &"e".repeat(64)).is_none());
+    }
+
+    #[tokio::test]
+    async fn hosted_pair_admission_becomes_exact_only_after_private_discovery() {
+        let state = AppState::new(super::super::state::ServerConfig::default());
+        let text = crate::input::hf_download::HubGgufArtifact {
+            repository: "owner/model".into(),
+            revision: "a".repeat(40),
+            filename: "model-q5_k_m.gguf".into(),
+            bytes: 100,
+            sha256: "b".repeat(64),
+            quant_hint: Some("Q5_K_M".into()),
+            role: "text_model".into(),
+            selectable: true,
+            unavailable_reason: None,
+        };
+        let companion = crate::input::hf_download::HubGgufArtifact {
+            repository: "owner/model".into(),
+            revision: "a".repeat(40),
+            filename: "model-q5_k_m-mmproj.gguf".into(),
+            bytes: 42,
+            sha256: "c".repeat(64),
+            quant_hint: None,
+            role: "companion".into(),
+            selectable: false,
+            unavailable_reason: Some("vision projector companion; not a text model".into()),
+        };
+        let view = state
+            .artifact_catalog
+            .register_hosted(crate::input::hf_download::HubGgufCatalog {
+                schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+                repository: "owner/model".into(),
+                revision: "a".repeat(40),
+                artifacts: vec![text, companion],
+            })
+            .unwrap();
+        let id = view.candidates[0].candidate_id.as_deref().unwrap();
+
+        let unresolved = resolve_activation_target(&state, "owner/model", Some(id))
+            .await
+            .unwrap();
+        assert!(!unresolved.admission_bytes_exact);
+        assert_eq!(unresolved.bytes, 100);
+        let authority = match state.artifact_catalog.resolve(id).unwrap() {
+            super::super::artifact_catalog::StoredArtifact::Hosted(pair) => pair,
+            _ => panic!("expected hosted authority"),
+        };
+
+        state
+            .artifact_catalog
+            .record_hosted_resolution(
+                id,
+                &authority,
+                super::super::artifact_catalog::HostedPairResolution::projector(
+                    100,
+                    "c".repeat(64),
+                    200,
+                    512,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let resolved = resolve_activation_target(&state, "owner/model", Some(id))
+            .await
+            .unwrap();
+        assert!(resolved.admission_bytes_exact);
+        assert_eq!(resolved.bytes, 812);
+    }
+
+    #[tokio::test]
+    async fn paired_preparation_failure_cancels_and_joins_the_sibling() {
+        let cancellation = super::super::cancellation::CancellationSignal::default();
+        let sibling_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sibling_finished_task = Arc::clone(&sibling_finished);
+        let sibling_cancellation = cancellation.clone();
+        let result = run_paired_preparations(
+            &cancellation,
+            async { Err::<(), _>("text transfer failed") },
+            async move {
+                sibling_cancellation.cancelled().await;
+                sibling_finished_task.store(true, std::sync::atomic::Ordering::Release);
+                Err::<(), _>("projector transfer cancelled")
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), "text transfer failed");
+        assert!(cancellation.is_cancelled());
+        assert!(sibling_finished.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]

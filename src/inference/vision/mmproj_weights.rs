@@ -1,85 +1,65 @@
 //! mmproj GGUF weight loader (ADR-005 Phase 2c, Task #15 iter 31).
 //!
 //! Reads every required tensor from a parsed `GgufFile` onto the Metal
-//! device as F32 buffers, dequantizing Q-type tensors on the CPU first
-//! via `mlx_native::gguf::GgufFile::load_tensor_f32`. The produced
-//! `LoadedMmprojWeights` holds one `MlxBuffer` per tensor keyed by its
-//! GGUF name (e.g. `"v.patch_embd.weight"`).
+//! device without changing its storage representation. The production
+//! projector contract currently admits native F16 and F32 tensors only;
+//! quantized, BF16, and integer projector tensors fail preflight before
+//! any device allocation. The produced `LoadedMmprojWeights` holds one
+//! `MlxBuffer` per tensor keyed by its GGUF name (for example,
+//! `"v.patch_embd.weight"`).
 //!
-//! # Sequencing vs iter 30's validator
+//! # Sequencing
 //!
-//! Iter 30 (`validate_tensor_set`) proves the tensors EXIST at startup
-//! before the expensive load runs. Iter 31 (this module) actually
-//! reads them onto the GPU. Caller should invoke the validator first
-//! and bail early on missing tensors — that keeps the operator's
-//! error message specific (missing list) rather than a generic
-//! "tensor not found" from mid-load.
+//! `validate_tensor_set` proves the required architecture-specific tensors
+//! exist. This module then validates the complete dtype/role inventory before
+//! creating any mapping. Callers run both before publishing a generation.
 //!
 //! # GPU cost
 //!
-//! Gemma 4 vision tower ≈ 400 MB of F32 after dequant (221 tensors).
-//! The load sequentially dispatches a small allocation per tensor;
-//! total time on M5 Max ≈ 150-300ms for a cold-page-cache load of the
-//! Gemma 4 mmproj. Deliberately NOT parallelized: mlx-native's
-//! `load_tensor_f32` serializes through the GGUF `BufReader` mutex,
-//! and the cost is already dominated by the page-cache fill rather
-//! than CPU dequant.
+//! Projector tensors are views over a small number of shared file-backed
+//! Metal mappings. The loader maps the GGUF tensor region once, creates no
+//! anonymous matrix copies, and accounts each shared segment once even when
+//! several tensors or fused-QKV slices reference it.
 //!
-//! # Not in this iter
-//!
-//! - Handler wiring. The loader is usable in isolation; the
-//!   `process_multimodal_content` short-circuit at 501 is unchanged.
-//!   iter 32+ threads the loaded weights through `patch_embed_forward`
-//!   etc. as the ViT forward pass ports block-by-block.
-//! - Lazy tensor loading. Every required tensor is loaded eagerly at
-//!   `load()` time. A future iter can add a per-layer lazy mode if a
-//!   memory-constrained deployment needs it.
-
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use mlx_native::gguf::GgufFile;
 use mlx_native::metal::foreign_types::ForeignType;
 use mlx_native::{MlxBuffer, MlxDevice};
 
-// W59 ADR-005 Phase 2c iter-128: route F16-stored mmproj tensors through
-// `gguf.load_tensor` (native dtype-preserving) instead of
-// `gguf.load_tensor_f32` (CPU-dequant to F32). Every Gemma 4 ViT weight
-// is GGML F16 in storage; pre-iter-128 the load path dequantized to F32
-// at upload, then `vit_linear_gpu` re-cast F32→BF16 inside the matmul,
-// costing 8x the per-element rounding budget vs peer's F16 staging
-// (W58 iter-127 numerical bisect, ADR-005 iter-127 entry).
-//
-// This module uses `mlx_native::gguf::tensor_info(name).ggml_type` to
-// gate the load branch — F16 tensors keep their native `DType::F16`
-// MlxBuffer, every other type still dequants to F32 (norms, embeddings,
-// scalars, and any non-F16 weight a future producer might emit).
+// Projector matrices remain F16 and elementwise/norm/bias inputs remain F32
+// from GGUF storage through the runtime. The complete inventory is validated
+// before a shared file mapping is created, so no dequantized or re-encoded
+// projector shadow can appear. Other storage types remain unsupported until
+// the whole projector graph has matching native kernels.
 //
 // `vit_linear_gpu` reads the resulting buffer's `dtype()` and dispatches
 // the matching tensor-core kernel:
 //   - DType::F16  -> mlx_native::dense_matmul_f16_f32_tensor (NEW, 0.4.8)
 //   - DType::BF16 -> existing dense_matmul_bf16_f32_tensor
-//   - DType::F32  -> existing F32->BF16 cast + BF16 matmul (legacy path,
-//                    kept for non-F16-stored weight types).
+//   - DType::F32  -> elementwise/norm/bias kernels and the existing dense
+//                    fallback where a supported graph explicitly requires it.
 //
 // Dispatch is determined by the buffer's storage dtype — natural,
 // deterministic, no env-gated fallback (per the iter-128 prompt
 // constraint and `feedback_no_shortcuts.md`).
 use mlx_native::GgmlType;
 
-use super::mmproj::{vit_layer_tensor, MmprojConfig};
+use super::mmproj::{MmprojConfig, vit_layer_tensor};
 
-/// Collection of mmproj tensors loaded onto a Metal device as F32.
+/// Collection of mmproj tensors loaded onto a Metal device in their admitted
+/// native GGUF storage type.
 ///
 /// Cheap to move; cloning requires the caller to pay the GPU-alloc
 /// cost again (not implemented here — if a use case needs cheap
 /// cloning, wrap in `Arc` at the call site).
 pub struct LoadedMmprojWeights {
-    /// Keyed by the tensor's GGUF name. Values are F32 `MlxBuffer`s
-    /// with shape preserved from the source GGUF.
+    /// Keyed by the tensor's GGUF name, with shape and storage dtype
+    /// preserved from the source GGUF.
     tensors: HashMap<String, MlxBuffer>,
     /// Device handle kept alive for the lifetime of the buffers.
     /// Held for RAII even though public accessors go through `tensors`.
@@ -95,89 +75,72 @@ impl std::fmt::Debug for LoadedMmprojWeights {
 }
 
 impl LoadedMmprojWeights {
-    /// Exact Metal allocation bytes the current loader will create for the
-    /// projector's original GGUF tensor inventory, before any zero-copy slice
-    /// views are installed. F16 stays native; every other supported storage
-    /// type follows `load_tensor_f32` and therefore expands to four bytes per
-    /// logical element.
-    pub fn projected_unique_owned_bytes(gguf: &GgufFile) -> Result<u64> {
+    /// Validate the complete projector inventory before Metal allocation and
+    /// return the exact logical tensor payload bytes in the GGUF.
+    ///
+    /// F16 and F32 are the only end-to-end projector storage contracts today.
+    /// Rejecting every other type here is intentional: `load_tensor_f32`
+    /// would make a quantized or BF16 file appear supported by silently
+    /// creating a transformed F32 shadow.
+    pub fn preflight_native_storage_bytes(gguf: &GgufFile) -> Result<u64> {
         gguf.tensor_names()
             .into_iter()
             .try_fold(0u64, |total, name| {
                 let info = gguf.tensor_info(name).ok_or_else(|| {
                     anyhow!("mmproj tensor inventory changed during preflight: {name}")
                 })?;
-                let bytes = if info.ggml_type == GgmlType::F16 {
-                    u64::try_from(info.byte_len)
-                        .map_err(|_| anyhow!("mmproj F16 tensor byte length exceeds u64: {name}"))?
-                } else {
-                    let elements =
-                        info.shape.iter().try_fold(1u64, |n, dim| {
-                            n.checked_mul(u64::try_from(*dim).map_err(|_| {
-                                anyhow!("mmproj tensor dimension exceeds u64: {name}")
-                            })?)
-                            .ok_or_else(|| anyhow!("mmproj tensor element count overflow: {name}"))
-                        })?;
-                    elements
-                        .checked_mul(std::mem::size_of::<f32>() as u64)
-                        .ok_or_else(|| anyhow!("mmproj F32 tensor byte count overflow: {name}"))?
-                };
+                let expected = native_storage_for_projector_role(name)?;
+                anyhow::ensure!(
+                    info.ggml_type == expected,
+                    "mmproj tensor '{name}' has storage {:?}, but its runtime role requires {expected:?}; native projector admission refuses dtype/role conversion and transformed shadows before Metal allocation",
+                    info.ggml_type,
+                );
+                let bytes = u64::try_from(info.byte_len)
+                    .map_err(|_| anyhow!("mmproj tensor byte length exceeds u64: {name}"))?;
                 total
                     .checked_add(bytes)
                     .ok_or_else(|| anyhow!("mmproj projected resident-byte count overflow"))
             })
     }
 
-    /// Load every tensor from the GGUF file onto the supplied device
-    /// as F32. Arch-agnostic — walks `gguf.tensor_names()` and doesn't
-    /// assume a particular naming convention, so it transparently
-    /// handles both Gemma 4's SigLIP-style tower AND classic CLIP
-    /// producers. Callers should run `validate_tensor_set` + detect
-    /// `ArchProfile` first to know what the forward-pass dispatch
-    /// branch needs.
+    /// Load every tensor from the GGUF file onto the supplied device in its
+    /// native admitted dtype. The explicit role table covers every tensor in
+    /// the supported Gemma 4, Qwen3-VL, SigLIP, and classic CLIP inventories.
+    /// Callers run `validate_tensor_set` and detect `ArchProfile` first to
+    /// select the forward-pass branch.
     ///
-    /// `_cfg` is accepted but currently unused — kept in the signature
-    /// because a future lazy/tiered loader will partition tensor loads
-    /// by cfg (e.g., load only stem + first few blocks on cold start,
-    /// lazy-load remaining blocks on first request).
+    /// `cfg` supplies the exact hidden/layer geometry used to expose fused
+    /// QKV tensors as zero-copy split views after the shared mapping is built.
     pub fn load(gguf: &GgufFile, cfg: &MmprojConfig, device: MlxDevice) -> Result<Self> {
+        // Validate the entire inventory before the first allocation. A late
+        // unsupported tensor must not leave an already-allocated prefix of a
+        // transformed or partially loaded projector generation.
+        Self::preflight_native_storage_bytes(gguf)?;
         let names = gguf.tensor_names();
+        // Map the complete tensor region once. Every typed tensor below is a
+        // view whose shared MlxBufferStorage owns the segment Metal resource
+        // and Arc<Mmap>; the views remain valid after this scoped mapping set
+        // and the parsed GgufFile are dropped.
+        let mapped = gguf
+            .map_tensor_data(&device)
+            .map_err(|e| anyhow!("mmproj shared GGUF tensor mapping: {e}"))?;
         let mut tensors = HashMap::with_capacity(names.len());
         for name in &names {
-            // W59 ADR-005 Phase 2c iter-128: route F16-stored tensors
-            // through `load_tensor` (native F16 MlxBuffer, no CPU
-            // dequant) so the downstream matmul can dispatch the
-            // matching mlx-native 0.4.8 F16 tensor-core kernel without
-            // a lossy F16 -> F32 -> BF16 round-trip. Every other ggml
-            // type (F32, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, I16) keeps the
-            // legacy F32-dequant path — those are non-weight tensors
-            // (norms, embeddings, scalars) where F32 is the right
-            // intermediate, OR weight types this loader doesn't yet
-            // wire to a non-BF16 kernel.
-            //
-            // GGUF tensor_info() returns None only when the lookup name
-            // doesn't exist — but we're iterating gguf.tensor_names() so
-            // every name is guaranteed present. The else-branch on
-            // tensor_info absence is defensive only; falls back to the
-            // F32 dequant path so a future GGUF format change can't
-            // silently break the loader.
-            let info = gguf.tensor_info(*name);
-            let is_f16 = info.map(|i| i.ggml_type == GgmlType::F16).unwrap_or(false);
-            let buf = if is_f16 {
-                gguf.load_tensor(*name, &device)
-                    .map_err(|e| anyhow!("mmproj load_tensor (F16-native) '{}': {e}", name))?
-            } else {
-                gguf.load_tensor_f32(*name, &device)
-                    .map_err(|e| anyhow!("mmproj load_tensor_f32 '{}': {e}", name))?
-            };
+            let buf = mapped
+                .load_tensor(*name)
+                .map_err(|e| anyhow!("mmproj mapped tensor view '{}': {e}", name))?;
+            anyhow::ensure!(
+                buf.is_file_backed(),
+                "mmproj mapped tensor view '{name}' unexpectedly owns anonymous storage"
+            );
             tensors.insert((*name).to_string(), buf);
         }
 
         // -------------------------------------------------------------------
         // Wedge-4c.5: fused `attn_qkv` → split `attn_q/k/v` slice views.
         //
-        // The peer's HF converter emits Qwen3-VL's ViT QKV as a single
-        // fused tensor named `v.blk.{N}.attn_qkv.weight`
+        // Qwen3-VL ViT QKV may be stored as a single fused tensor named
+        // `v.blk.{N}.attn_qkv.weight`
         // (and optional `.bias`).
         // The runtime forward consumer at vit_gpu_qwen3vl.rs requests split
         // tensors by name (`attn_q.weight`, `attn_k.weight`, `attn_v.weight`)
@@ -185,7 +148,7 @@ impl LoadedMmprojWeights {
         // buffers under those split names. The slice views share the
         // fused tensor's underlying Metal buffer; no extra copy is paid.
         //
-        // Layout (matches the peer's fused-QKV convention):
+        // Canonical fused-QKV layout:
         //   fused weight `[3*hidden, hidden]` row-major (output dim first
         //   per hf2q's vit_linear_gpu convention) — Q rows are
         //   `[0..hidden][0..hidden]`, K rows `[hidden..2*hidden][0..hidden]`,
@@ -249,7 +212,7 @@ impl LoadedMmprojWeights {
             }
             if !has_fused_w {
                 continue; // split-only block (or no QKV at all — that's a
-                          // validator job). Nothing to slice.
+                // validator job). Nothing to slice.
             }
 
             // The fused-only path. Slice the weight.
@@ -263,11 +226,11 @@ impl LoadedMmprojWeights {
             // Anything else means the converter wrote an off-spec shape; we
             // refuse rather than silently slice the wrong region.
             let expected_bytes = 3 * chunk_bytes;
-            if fused_buf.byte_len() < expected_bytes {
+            if fused_buf.data_byte_len() != expected_bytes {
                 return Err(anyhow!(
-                    "mmproj loader: fused '{fused_w}' byte_len {} < expected 3*hidden*hidden*{}={} \
+                    "mmproj loader: fused '{fused_w}' logical byte length {} != expected 3*hidden*hidden*{}={} \
                      (hidden={hidden}, dtype={:?}); converter likely wrote a wrong shape",
-                    fused_buf.byte_len(),
+                    fused_buf.data_byte_len(),
                     elem_size,
                     expected_bytes,
                     fused_buf.dtype(),
@@ -291,11 +254,11 @@ impl LoadedMmprojWeights {
                 let bias_elem = fused_bias_buf.dtype().size_of();
                 let bias_chunk_bytes = hidden * bias_elem;
                 let bias_expected = 3 * bias_chunk_bytes;
-                if fused_bias_buf.byte_len() < bias_expected {
+                if fused_bias_buf.data_byte_len() != bias_expected {
                     return Err(anyhow!(
-                        "mmproj loader: fused '{fused_b}' byte_len {} < expected 3*hidden*{}={} \
+                        "mmproj loader: fused '{fused_b}' logical byte length {} != expected 3*hidden*{}={} \
                          (hidden={hidden}, dtype={:?})",
-                        fused_bias_buf.byte_len(),
+                        fused_bias_buf.data_byte_len(),
                         bias_elem,
                         bias_expected,
                         fused_bias_buf.dtype(),
@@ -378,8 +341,8 @@ impl LoadedMmprojWeights {
     }
 
     /// Build an empty `LoadedMmprojWeights` with no tensors. Useful for
-    /// tests that need an `AppState.mmproj` shape but don't need to
-    /// drive a forward pass. The shortcut accessors all return `Err`
+    /// tests that need a generation-local projector shape but don't drive a
+    /// forward pass. The shortcut accessors all return `Err`
     /// (as the real accessors would on a broken-producer file).
     pub fn empty(device: MlxDevice) -> Self {
         Self {
@@ -391,7 +354,7 @@ impl LoadedMmprojWeights {
     /// Test-only: build a `LoadedMmprojWeights` from a pre-populated
     /// tensor map. Used by parity tests that synthesize block weights
     /// in-process rather than load a real GGUF (which would require a
-    /// fixture file on disk and the full 400 MB dequant cost).
+    /// fixture file on disk and the full mapped projector payload).
     #[cfg(test)]
     pub fn from_tensors_for_test(tensors: HashMap<String, MlxBuffer>, device: MlxDevice) -> Self {
         Self {
@@ -414,23 +377,70 @@ impl LoadedMmprojWeights {
     /// Sum unique Metal backing allocations owned by this projector.
     ///
     /// `LoadedMmprojWeights` may install multiple logical tensor views over
-    /// one fused QKV allocation, and future mapped loading may expose several
-    /// tensors through one large mapped Metal buffer. `byte_len()` describes
+    /// one fused QKV allocation, while mapped loading exposes several tensors
+    /// through one shared Metal segment. `byte_len()` describes
     /// the backing allocation, so deduplicating by the stable Metal object
     /// pointer counts either representation exactly once.
     pub fn unique_owned_bytes(&self) -> Result<u64> {
+        let (file_backed, anonymous) = self.unique_backing_bytes_by_kind()?;
+        file_backed
+            .checked_add(anonymous)
+            .ok_or_else(|| anyhow!("mmproj unique resident-byte count overflow"))
+    }
+
+    /// Unique shared file-mapping bytes retained by all projector tensor
+    /// views. Fused QKV slices and tensors sharing one mapped segment are
+    /// counted once by their Metal storage identity.
+    pub fn file_backed_bytes(&self) -> Result<u64> {
+        self.unique_backing_bytes_by_kind().map(|(file, _)| file)
+    }
+
+    /// Unique anonymous Metal allocation bytes retained by the projector.
+    /// Production mapped loading requires this to be zero; synthetic tests may
+    /// intentionally build anonymous buffers.
+    pub fn anonymous_bytes(&self) -> Result<u64> {
+        self.unique_backing_bytes_by_kind()
+            .map(|(_, anonymous)| anonymous)
+    }
+
+    /// Number of distinct shared file-backed Metal segments retained by the
+    /// tensor views.
+    pub fn mapped_segment_count(&self) -> usize {
         let mut seen = std::collections::HashSet::with_capacity(self.tensors.len());
-        self.tensors.values().try_fold(0u64, |total, buffer| {
-            let allocation = buffer.metal_buffer().as_ptr() as usize;
-            if !seen.insert(allocation) {
-                return Ok(total);
-            }
-            let bytes = u64::try_from(buffer.byte_len())
-                .map_err(|_| anyhow!("mmproj Metal allocation length exceeds u64"))?;
-            total
-                .checked_add(bytes)
-                .ok_or_else(|| anyhow!("mmproj unique resident-byte count overflow"))
-        })
+        self.tensors
+            .values()
+            .filter(|buffer| buffer.is_file_backed())
+            .filter(|buffer| seen.insert(buffer.metal_buffer().as_ptr() as usize))
+            .count()
+    }
+
+    fn unique_backing_bytes_by_kind(&self) -> Result<(u64, u64)> {
+        let mut seen = std::collections::HashSet::with_capacity(self.tensors.len());
+        self.tensors
+            .values()
+            .try_fold((0u64, 0u64), |(file, anonymous), buffer| {
+                let allocation = buffer.metal_buffer().as_ptr() as usize;
+                if !seen.insert(allocation) {
+                    return Ok((file, anonymous));
+                }
+                let bytes = u64::try_from(buffer.byte_len())
+                    .map_err(|_| anyhow!("mmproj Metal allocation length exceeds u64"))?;
+                if buffer.is_file_backed() {
+                    Ok((
+                        file.checked_add(bytes).ok_or_else(|| {
+                            anyhow!("mmproj file-backed resident-byte count overflow")
+                        })?,
+                        anonymous,
+                    ))
+                } else {
+                    Ok((
+                        file,
+                        anonymous.checked_add(bytes).ok_or_else(|| {
+                            anyhow!("mmproj anonymous resident-byte count overflow")
+                        })?,
+                    ))
+                }
+            })
     }
 
     // -----------------------------------------------------------------------
@@ -501,10 +511,10 @@ impl LoadedMmprojWeights {
         // Buffer-element-count cross-check: 2 * pos_size * hidden f32s.
         let expected_bytes =
             2usize * (pos_size as usize) * (hidden as usize) * std::mem::size_of::<f32>();
-        if buf.byte_len() < expected_bytes {
+        if buf.data_byte_len() != expected_bytes {
             return Err(anyhow!(
-                "v.position_embd.weight: byte_len {} < expected {} (2 * {} * {} * 4)",
-                buf.byte_len(),
+                "v.position_embd.weight: logical byte length {} != expected {} (2 * {} * {} * 4)",
+                buf.data_byte_len(),
                 expected_bytes,
                 pos_size,
                 hidden
@@ -524,16 +534,14 @@ impl LoadedMmprojWeights {
     /// `suffix` is the block-relative name ("attn_q.weight",
     /// "ffn_down.weight", etc. — see `BLOCK_REQUIRED_SUFFIXES`).
     ///
-    /// W41 iter-116i: vision-namespace tensor names migrated to
-    /// the peer's short-form convention in W34 iter-116e (writer
-    /// side) but the runtime forward path still uses the
-    /// pre-migration suffixes. `block_tensor` accepts both: if the
+    /// Vision-namespace tensor names migrated to the canonical short form,
+    /// while some runtime callers retain the pre-migration suffixes.
+    /// `block_tensor` accepts both: if the
     /// caller asks for a legacy name we fall back to the canonical
     /// short form. The mapping is bidirectional so a producer
     /// emitting either convention loads cleanly.
     ///
-    /// Mappings (legacy ↔ canonical short form, per the peer's mmproj
-    /// naming):
+    /// Mappings (legacy ↔ canonical short form):
     ///   - `attn_output.{w,b}`  ↔ `attn_out.{w,b}`
     ///   - `post_ffw_norm.{w,b}` ↔ `ffn_post_norm.{w,b}`
     pub fn block_tensor(&self, layer_idx: usize, suffix: &str) -> Result<&MlxBuffer> {
@@ -566,10 +574,9 @@ impl LoadedMmprojWeights {
     ///
     /// W41 iter-116i: looks up the CLIP-classic name `mm.0.weight` first,
     /// then falls back to gemma4v's `mm.input_projection.weight`.
-    /// Both name back the same logical tensor — the writer chose the
-    /// projector-specific base per the peer's convention (which
-    /// hard-requires `mm.input_projection` for the gemma4v projector
-    /// type), and the runtime forward path uses whichever is present.
+    /// Both names back the same logical tensor. Gemma4v uses the
+    /// `mm.input_projection` base; the runtime selects whichever supported
+    /// name is present.
     ///
     /// The accessor name is preserved (`mm_0_weight`) for source-compat
     /// across `vit_gpu.rs` callers; the fallback is invisible to them.
@@ -641,8 +648,7 @@ impl LoadedMmprojWeights {
 
     /// Read the `mm.0.input_min` (or gemma4v's `mm.input_projection.input_min`)
     /// scalar bound (clamp BEFORE matmul). `None` when absent OR
-    /// mis-shaped — caller treats absence as `f32::NEG_INFINITY` (no-op)
-    /// per the peer's default.
+    /// mis-shaped — caller treats absence as `f32::NEG_INFINITY` (no-op).
     pub fn mm_0_input_min(&self) -> Option<f32> {
         self.read_projector_scalar("input_min")
     }
@@ -672,19 +678,132 @@ impl LoadedMmprojWeights {
     }
 }
 
+/// Exact storage contract for every tensor role in the currently supported
+/// CLIP/SigLIP, Gemma 4, and Qwen3-VL projector graphs.
+///
+/// Elementwise, bias, norm, positional, and scalar inputs are consumed by F32
+/// kernels or CPU readers. Matrix inputs are consumed directly by the F16
+/// tensor kernels. This list deliberately mirrors the emitted and consumed
+/// runtime inventories rather than treating every `*.weight` as a matrix;
+/// unknown roles fail closed instead of being guessed.
+fn native_storage_for_projector_role(name: &str) -> Result<GgmlType> {
+    match name {
+        "v.patch_embd.weight" | "v.patch_embd.weight.1" => return Ok(GgmlType::F16),
+        "v.patch_embd.bias"
+        | "v.position_embd.weight"
+        | "v.std_bias"
+        | "v.std_scale"
+        | "v.pre_ln.weight"
+        | "v.pre_ln.bias"
+        | "v.post_ln.weight"
+        | "v.post_ln.bias"
+        | "mm.soft_emb_norm.weight"
+        | "mm.input_norm.weight"
+        | "mm.input_norm.bias" => return Ok(GgmlType::F32),
+        "mm.0.weight" | "mm.2.weight" | "mm.input_projection.weight" => return Ok(GgmlType::F16),
+        "mm.0.bias"
+        | "mm.2.bias"
+        | "mm.input_projection.bias"
+        | "mm.0.input_min"
+        | "mm.0.input_max"
+        | "mm.0.output_min"
+        | "mm.0.output_max"
+        | "mm.input_projection.input_min"
+        | "mm.input_projection.input_max"
+        | "mm.input_projection.output_min"
+        | "mm.input_projection.output_max" => return Ok(GgmlType::F32),
+        _ => {}
+    }
+
+    if let Some(suffix) = indexed_tensor_suffix(name, "v.blk.") {
+        let matrix = matches!(
+            suffix,
+            "attn_q.weight"
+                | "attn_k.weight"
+                | "attn_v.weight"
+                | "attn_qkv.weight"
+                | "attn_out.weight"
+                | "attn_output.weight"
+                | "ffn_gate.weight"
+                | "ffn_up.weight"
+                | "ffn_down.weight"
+        );
+        if matrix {
+            return Ok(GgmlType::F16);
+        }
+        let f32 = matches!(
+            suffix,
+            "attn_q.bias"
+                | "attn_k.bias"
+                | "attn_v.bias"
+                | "attn_qkv.bias"
+                | "attn_out.bias"
+                | "attn_output.bias"
+                | "ffn_gate.bias"
+                | "ffn_up.bias"
+                | "ffn_down.bias"
+                | "ln1.weight"
+                | "ln1.bias"
+                | "ln2.weight"
+                | "ln2.bias"
+                | "attn_norm.weight"
+                | "attn_norm.bias"
+                | "attn_q_norm.weight"
+                | "attn_q_norm.bias"
+                | "attn_k_norm.weight"
+                | "attn_k_norm.bias"
+                | "attn_post_norm.weight"
+                | "attn_post_norm.bias"
+                | "ffn_norm.weight"
+                | "ffn_norm.bias"
+                | "post_ffw_norm.weight"
+                | "post_ffw_norm.bias"
+                | "ffn_post_norm.weight"
+                | "ffn_post_norm.bias"
+        );
+        if f32 {
+            return Ok(GgmlType::F32);
+        }
+    }
+
+    if let Some(suffix) = indexed_tensor_suffix(name, "v.deepstack.") {
+        return match suffix {
+            "fc1.weight" | "fc2.weight" => Ok(GgmlType::F16),
+            "fc1.bias" | "fc2.bias" | "norm.weight" | "norm.bias" => Ok(GgmlType::F32),
+            _ => Err(anyhow!(
+                "mmproj tensor '{name}' has no supported native runtime storage role"
+            )),
+        };
+    }
+
+    Err(anyhow!(
+        "mmproj tensor '{name}' has no supported native runtime storage role"
+    ))
+}
+
+fn indexed_tensor_suffix<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = name.strip_prefix(prefix)?;
+    let (index, suffix) = rest.split_once('.')?;
+    (!index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())).then_some(suffix)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
+    use crate::backends::gguf::writer::GgufWriter;
+    use crate::quantize::ggml_quants::GgmlType as WriterGgmlType;
+
     use super::super::mmproj::ProjectorType;
     use super::*;
 
     /// Gemma 4 26B mmproj — present on this dev machine. Tests gate on
     /// existence so CI without the fixture skips them cleanly.
-    const GEMMA4_MMPROJ_PATH: &str =
-        "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf";
+    const GEMMA4_MMPROJ_PATH: &str = "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf";
 
     #[test]
     fn unique_owned_bytes_counts_shared_slice_backing_once() {
@@ -704,6 +823,191 @@ mod tests {
         assert_eq!(weights.unique_owned_bytes().unwrap(), allocation_bytes);
     }
 
+    fn write_storage_contract_fixture(
+        path: &Path,
+        tensors: &[(&str, WriterGgmlType, &[u64], Vec<u8>)],
+    ) {
+        let file = File::create(path).expect("create projector fixture");
+        let mut writer = GgufWriter::new(file);
+        writer
+            .write_header(tensors.len() as u64, 0)
+            .expect("write header");
+        let mut indexes = Vec::with_capacity(tensors.len());
+        for (name, ty, dims, _) in tensors {
+            indexes.push(
+                writer
+                    .reserve_tensor_info(name, dims, *ty)
+                    .expect("reserve tensor"),
+            );
+        }
+        writer.pad_to_alignment().expect("align payload");
+        for (index, (_, _, _, payload)) in indexes.into_iter().zip(tensors.iter()) {
+            writer
+                .stream_tensor_payload(index, payload)
+                .expect("write payload");
+        }
+        writer.finalize().expect("finalize fixture");
+    }
+
+    #[test]
+    fn native_projector_storage_has_no_transformed_shadow() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("native-projector.gguf");
+        let f16 = vec![0x00, 0x3c, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44];
+        let f32 = [1.0f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        write_storage_contract_fixture(
+            &path,
+            &[
+                ("v.patch_embd.weight", WriterGgmlType::F16, &[4], f16),
+                ("v.patch_embd.bias", WriterGgmlType::F32, &[4], f32),
+            ],
+        );
+        let gguf = GgufFile::open(&path).expect("open fixture");
+        assert_eq!(
+            LoadedMmprojWeights::preflight_native_storage_bytes(&gguf).unwrap(),
+            24
+        );
+
+        let device = MlxDevice::new().expect("device");
+        let cfg = synth_qwen3vl_loader_cfg(4, 0);
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("native load");
+        drop(gguf);
+        let native_f16 = weights.get("v.patch_embd.weight").unwrap();
+        let native_f32 = weights.get("v.patch_embd.bias").unwrap();
+        assert_eq!(native_f16.dtype(), mlx_native::DType::F16);
+        assert_eq!(native_f16.data_byte_len(), 8);
+        assert_eq!(native_f32.dtype(), mlx_native::DType::F32);
+        assert_eq!(native_f32.data_byte_len(), 16);
+        assert!(native_f16.is_file_backed());
+        assert!(native_f32.is_file_backed());
+        assert_eq!(weights.anonymous_bytes().unwrap(), 0);
+        assert_eq!(weights.mapped_segment_count(), 1);
+        assert_eq!(
+            weights.file_backed_bytes().unwrap(),
+            weights.unique_owned_bytes().unwrap()
+        );
+        assert!(weights.file_backed_bytes().unwrap() >= 24);
+
+        // Source canary: this loader must never regain a widening loader arm.
+        let source = include_str!("mmproj_weights.rs");
+        let forbidden = [".load_tensor_", "f32("].concat();
+        assert!(!source.contains(&forbidden));
+        assert!(source.contains(".map_tensor_data(&device)"));
+    }
+
+    #[test]
+    fn unsupported_projector_storage_fails_preflight_before_device_allocation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (label, name, ty, dims, bytes) in [
+            (
+                "quantized-matrix",
+                "v.patch_embd.weight",
+                WriterGgmlType::Q4_0,
+                vec![32],
+                18,
+            ),
+            (
+                "bf16-matrix",
+                "v.patch_embd.weight",
+                WriterGgmlType::BF16,
+                vec![4],
+                8,
+            ),
+            (
+                "f32-matrix-shadow",
+                "v.patch_embd.weight",
+                WriterGgmlType::F32,
+                vec![4],
+                16,
+            ),
+            (
+                "f16-bias-shadow",
+                "v.patch_embd.bias",
+                WriterGgmlType::F16,
+                vec![4],
+                8,
+            ),
+        ] {
+            let path = temp.path().join(format!("{label}-projector.gguf"));
+            write_storage_contract_fixture(&path, &[(name, ty, &dims, vec![0; bytes])]);
+            let gguf = GgufFile::open(&path).expect("open fixture");
+            let error = LoadedMmprojWeights::preflight_native_storage_bytes(&gguf).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains(name));
+            assert!(message.contains(&format!("{ty:?}")));
+            assert!(message.contains("runtime role requires"));
+            assert!(message.contains("before Metal allocation"));
+        }
+    }
+
+    #[test]
+    fn mapped_fused_qkv_validation_uses_logical_view_length_not_shared_segment_length() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("undersized-fused-projector.gguf");
+        write_storage_contract_fixture(
+            &path,
+            &[
+                (
+                    "v.blk.0.attn_qkv.weight",
+                    WriterGgmlType::F16,
+                    &[4],
+                    vec![0; 8],
+                ),
+                (
+                    "v.position_embd.weight",
+                    WriterGgmlType::F32,
+                    &[64],
+                    vec![0; 256],
+                ),
+            ],
+        );
+        let gguf = GgufFile::open(&path).expect("open fixture");
+        let cfg = synth_qwen3vl_loader_cfg(2, 1);
+        let error = LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("device"))
+            .expect_err("undersized fused tensor must fail despite a larger shared segment");
+        assert!(
+            error
+                .to_string()
+                .contains("logical byte length 8 != expected")
+        );
+    }
+
+    #[test]
+    fn native_projector_storage_roles_are_explicit() {
+        assert_eq!(
+            native_storage_for_projector_role("v.blk.0.attn_q.weight").unwrap(),
+            GgmlType::F16
+        );
+        assert_eq!(
+            native_storage_for_projector_role("v.blk.0.ln1.weight").unwrap(),
+            GgmlType::F32
+        );
+        assert_eq!(
+            native_storage_for_projector_role("v.blk.0.attn_post_norm.weight").unwrap(),
+            GgmlType::F32
+        );
+        assert_eq!(
+            native_storage_for_projector_role("v.deepstack.5.norm.bias").unwrap(),
+            GgmlType::F32
+        );
+        assert_eq!(
+            native_storage_for_projector_role("mm.soft_emb_norm.weight").unwrap(),
+            GgmlType::F32
+        );
+        assert_eq!(
+            native_storage_for_projector_role("mm.0.input_min").unwrap(),
+            GgmlType::F32
+        );
+        assert!(native_storage_for_projector_role("v.blk.zero.attn_q.weight").is_err());
+        assert!(native_storage_for_projector_role("v.blk.0.unknown.weight").is_err());
+        assert!(native_storage_for_projector_role("v.unknown_table").is_err());
+    }
+
     #[test]
     fn load_gemma4_mmproj_populates_arch_tensors() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
@@ -711,7 +1015,7 @@ mod tests {
         //   5 non-block (patch_embd, pos_embd, std_bias, std_scale, mm.0.weight)
         //   13/block × 27 blocks = 351
         //   No v.post_ln.weight, no mm.2.weight.
-        // See /opt/hf2q/docs/ADR-005 iter 31 for the real tensor manifest.
+        // See the checked-in vision architecture record for the real manifest.
         let path = Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
             eprintln!(
@@ -727,9 +1031,8 @@ mod tests {
         assert_eq!(cfg.image_size, 224);
         assert_eq!(cfg.patch_size, 16);
         assert_eq!(cfg.hidden_size, 1152);
-        // W41 iter-116i: hf2q-emitted gemma4 mmproj writes
-        // `clip.projector_type = "gemma4v"` (matches the peer's
-        // projector-type literal).
+        // hf2q-emitted Gemma4 mmproj writes the canonical
+        // `clip.projector_type = "gemma4v"` literal.
         // Pre-iter-116i the loader parsed this to `Other("gemma4v")`
         // and `is_supported()` returned false, blocking serve startup.
         assert_eq!(cfg.projector, ProjectorType::Gemma4v);
@@ -748,10 +1051,9 @@ mod tests {
         assert!(weights.post_ln_weight().is_err());
         assert!(weights.mm_2_weight().is_err());
         // Every layer's arch-agnostic QKV+output suffixes present.
-        // W41/W42 iter-116i: vision-namespace short-form `attn_out`
-        // (`v.blk.{N}.attn_out.*` per the peer's naming); W34 iter-116e
-        // fixed the writer to emit this short form and `validate_tensor_set`
-        // requires the same. The pre-iter-116e long-form
+        // Vision-namespace short-form `attn_out`
+        // (`v.blk.{N}.attn_out.*`) is emitted by the writer and required by
+        // `validate_tensor_set`. The pre-migration long-form
         // `attn_output.weight` is no longer present.
         for layer_idx in 0..27 {
             for suffix in [
@@ -773,16 +1075,13 @@ mod tests {
         // `v.patch_embd.weight` in Gemma 4 is a 2D tensor [hidden,
         // 3*patch*patch] = [1152, 768] = 884,736 elements. The GGUF
         // stores it as F16 (per W58 iter-127 audit + gguf_dump.py
-        // verification); pre-iter-128 the loader dequantized to F32 at
-        // upload, post-iter-128 the loader keeps F16 native so the
-        // matmul can dispatch the mlx-native 0.4.8 F16 tensor-core
+        // verification); the loader keeps F16 native so the matmul can
+        // dispatch the mlx-native F16 tensor-core
         // kernel (8x tighter per-element rounding than BF16 staging,
         // closes the 1.16x/block ViT cascade compound).
         //
-        // This test asserts shape (element count) AND non-trivial
-        // content (non-zero patch weights) without depending on the
-        // storage dtype — works whether the loader keeps F16 native or
-        // dequantizes to F32.
+        // This test asserts the admitted F16 storage, shape (element count),
+        // and non-trivial content (non-zero patch weights).
         let path = Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
             eprintln!(
@@ -798,19 +1097,18 @@ mod tests {
         let patch = weights.patch_embd_weight().expect("patch_embd");
         let expected_elems =
             (cfg.hidden_size as usize) * 3 * (cfg.patch_size as usize) * (cfg.patch_size as usize);
-        // Element-count check is dtype-agnostic via element_count(); it
-        // matches expected_elems regardless of F16/F32 storage.
+        assert_eq!(patch.dtype(), mlx_native::DType::F16);
+        // Element-count check remains independent of byte-level layout.
         assert_eq!(
             patch.element_count(),
             expected_elems,
             "patch_embd element count"
         );
-        // Non-zero sanity: read the underlying bytes (works for both
-        // F16 and F32). For F16 storage, every f16 has ≥1 nonzero bit
-        // when its value is nonzero; for F32 the same holds. A patch
+        // Non-zero sanity: read the underlying native F16 bytes. Every f16
+        // has at least one nonzero bit when its value is nonzero. A patch
         // weight tensor with the first 1024 elements all zero would be
         // a load bug — assert that fewer than 95% of the first 2048
-        // bytes (= 1024 f16 OR 512 f32) are zero.
+        // bytes (= 1024 f16 values) are zero.
         let raw: &[u8] = patch.as_slice().expect("as_slice raw bytes");
         let scan = raw.len().min(2048);
         let nonzero = raw[..scan].iter().filter(|&&b| b != 0).count();
@@ -819,11 +1117,6 @@ mod tests {
             "patch_embd loads to mostly-zero bytes (probable load bug): \
              {nonzero}/{scan} nonzero in first {scan} bytes"
         );
-        // Dtype-specific spot-check: the gemma4v patch_embd is F16 in
-        // storage; if the iter-128 path is wired correctly the buffer
-        // dtype reflects that. (For SigLIP / classic CLIP producers
-        // the tensor may be F32 instead — both paths are valid here;
-        // we just print so the test record shows which one was loaded.)
         eprintln!(
             "patch_embd dtype: {:?}, element_count: {}",
             patch.dtype(),
@@ -1117,7 +1410,7 @@ mod tests {
         assert_eq!(q.byte_offset(), 0);
         assert_eq!(k.byte_offset(), 64); // 16 floats × 4 bytes.
         assert_eq!(v.byte_offset(), 128); // 32 floats × 4 bytes.
-                                          // shape was flattened to a 1-D view of n_elements = hidden*hidden.
+        // shape was flattened to a 1-D view of n_elements = hidden*hidden.
         assert_eq!(q.element_count(), 16);
         assert_eq!(k.element_count(), 16);
         assert_eq!(v.element_count(), 16);

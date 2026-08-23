@@ -1080,7 +1080,12 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "mmproj".into());
-                let weights_resident_bytes = weights.unique_owned_bytes()?;
+                let weights_file_backed_bytes = weights.file_backed_bytes()?;
+                let weights_anonymous_bytes = weights.anonymous_bytes()?;
+                let mapped_segment_count = weights.mapped_segment_count();
+                let weights_resident_bytes = weights_file_backed_bytes
+                    .checked_add(weights_anonymous_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("projector residency total overflow"))?;
                 tracing::info!(
                     path = %mmp_path.display(),
                     image_size = mmp_config.image_size,
@@ -1110,7 +1115,11 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 pair_generation: mmp_gguf
                     .metadata_string(crate::core::paired_artifact::KEY_PAIR_GENERATION)
                     .map(str::to_owned),
+                weights_admission_bytes: weights_resident_bytes,
                 weights_resident_bytes,
+                weights_file_backed_bytes,
+                weights_anonymous_bytes,
+                mapped_segment_count,
                 cache_budget_bytes:
                     crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES as u64,
                 load_duration_ms: 0,
@@ -3958,7 +3967,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         // warmup) happens.  This is iter-103's fix for the
         // chat-warmup-logits-go-NaN bug surfaced when `--mmproj` is
         // supplied: bisection showed loading the mmproj weights
-        // (~1 GB of fresh F16-→F32 dequant'd Metal buffers) corrupts
+        // (~1 GB of additional projector mappings and GPU work) corrupts
         // the chat-model's pre-warmup state somehow (likely Metal-
         // driver buffer interleaving on Apple Silicon unified memory),
         // making every chat-model logit NaN at first decode.  Running
@@ -4063,15 +4072,25 @@ pub(crate) fn load_serving_projector(
         crate::inference::vision::mmproj_weights::LoadedMmprojWeights::load(&gguf, &config, device)
             .map_err(|error| anyhow::anyhow!("mmproj weight load: {error}"))?
     };
-    let weights_resident_bytes = weights.unique_owned_bytes()?;
+    let weights_file_backed_bytes = weights.file_backed_bytes()?;
+    let weights_anonymous_bytes = weights.anonymous_bytes()?;
+    let mapped_segment_count = weights.mapped_segment_count();
+    let exact_weight_bytes = weights_file_backed_bytes
+        .checked_add(weights_anonymous_bytes)
+        .ok_or_else(|| anyhow::anyhow!("projector residency total overflow"))?;
     if !skip_load {
         anyhow::ensure!(
-            weights_resident_bytes == spec.projected_weight_bytes,
-            "projector resident-byte preflight changed during load: projected {}, loaded {}",
+            weights_anonymous_bytes == 0,
+            "projector production load created {weights_anonymous_bytes} anonymous weight bytes"
+        );
+        anyhow::ensure!(
+            exact_weight_bytes <= spec.projected_weight_bytes,
+            "projector mapped residency exceeded its conservative admission charge: charged {}, loaded {}",
             spec.projected_weight_bytes,
-            weights_resident_bytes
+            exact_weight_bytes
         );
     }
+    let weights_resident_bytes = exact_weight_bytes;
     if !skip_warmup {
         crate::inference::vision::vit_gpu::warmup_vit_gpu(
             &weights,
@@ -4106,7 +4125,11 @@ pub(crate) fn load_serving_projector(
         artifact_sha256,
         source_sha256,
         pair_generation,
+        weights_admission_bytes: spec.projected_weight_bytes,
         weights_resident_bytes,
+        weights_file_backed_bytes,
+        weights_anonymous_bytes,
+        mapped_segment_count,
         cache_budget_bytes: spec.cache_budget_bytes,
         load_duration_ms: load_started.elapsed().as_millis() as u64,
         vision_cache: std::sync::Arc::new(
@@ -4116,7 +4139,11 @@ pub(crate) fn load_serving_projector(
     tracing::info!(
         path = %loaded.gguf_path.display(),
         pair_generation = ?loaded.pair_generation,
+        weights_admission_bytes = loaded.weights_admission_bytes,
         weights_resident_bytes = loaded.weights_resident_bytes,
+        weights_file_backed_bytes = loaded.weights_file_backed_bytes,
+        weights_anonymous_bytes = loaded.weights_anonymous_bytes,
+        mapped_segment_count = loaded.mapped_segment_count,
         cache_budget_bytes = loaded.cache_budget_bytes,
         elapsed_ms = loaded.load_duration_ms,
         "Loaded generation-owned vision projector"
@@ -5066,9 +5093,9 @@ pub fn cmd_serve(
         engine_config.config_path = args.config.clone();
         engine_config.dwq_overlay_path = args.dwq_overlay.clone();
         if let Some(projector_path) = args.mmproj.as_ref().or(resolved.mmproj_path.as_ref()) {
-            engine_config.projector = Some(multi_model::ProjectorLoadSpec::preflight(
+            engine_config.projector = Some(multi_model::ProjectorLoadSpec::preflight_for_text(
+                &resolved.gguf_path,
                 projector_path,
-                None,
                 crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES as u64,
             )?);
         }

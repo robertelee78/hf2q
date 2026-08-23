@@ -19,14 +19,111 @@ const LOCAL_VERIFY_CONCURRENCY: usize = 1;
 
 #[derive(Clone, Debug)]
 pub enum StoredArtifact {
-    Hosted(HubGgufArtifact),
+    Hosted(HostedArtifactPair),
     Local(LocalGgufArtifact),
+}
+
+/// Server-private atomic activation authority. The client selects only the
+/// text candidate. After the immutable text bytes are fetched, its exact
+/// projector digest selects at most one companion from this same-revision
+/// inventory; clients can never construct an invalid pair.
+#[derive(Clone, Debug)]
+pub struct HostedArtifactPair {
+    pub text: HubGgufArtifact,
+    pub companions: Vec<HubGgufArtifact>,
+    /// Path-free private result of inspecting this immutable text artifact and
+    /// its digest-bound projector, if any. Hub inventory metadata does not
+    /// expose GGUF header keys or tensor layout, so this begins unresolved and
+    /// is recorded after the first authenticated materialization.
+    pub resolution: Option<HostedPairResolution>,
+}
+
+/// Immutable, path-free admission authority discovered from a hosted pair.
+/// This stays server-private; public artifact schema v2 continues to expose
+/// one opaque text candidate and the text object's transfer size only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedPairResolution {
+    companion_sha256: Option<String>,
+    projected_weight_bytes: u64,
+    cache_budget_bytes: u64,
+    activation_bytes: u64,
+}
+
+impl HostedPairResolution {
+    pub fn text_only(text_bytes: u64) -> Self {
+        Self {
+            companion_sha256: None,
+            projected_weight_bytes: 0,
+            cache_budget_bytes: 0,
+            activation_bytes: text_bytes,
+        }
+    }
+
+    pub fn projector(
+        text_bytes: u64,
+        companion_sha256: String,
+        projected_weight_bytes: u64,
+        cache_budget_bytes: u64,
+    ) -> Result<Self, CatalogError> {
+        if companion_sha256.len() != 64
+            || !companion_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CatalogError::AuthorityMismatch);
+        }
+        let activation_bytes = text_bytes
+            .checked_add(projected_weight_bytes)
+            .and_then(|bytes| bytes.checked_add(cache_budget_bytes))
+            .ok_or(CatalogError::AuthorityMismatch)?;
+        Ok(Self {
+            companion_sha256: Some(companion_sha256.to_ascii_lowercase()),
+            projected_weight_bytes,
+            cache_budget_bytes,
+            activation_bytes,
+        })
+    }
+
+    pub fn activation_bytes(&self) -> u64 {
+        self.activation_bytes
+    }
+
+    pub fn companion_sha256(&self) -> Option<&str> {
+        self.companion_sha256.as_deref()
+    }
+
+    pub fn projected_weight_bytes(&self) -> u64 {
+        self.projected_weight_bytes
+    }
+
+    pub fn cache_budget_bytes(&self) -> u64 {
+        self.cache_budget_bytes
+    }
 }
 
 #[derive(Clone, Debug)]
 struct StoredCandidate {
     artifact: StoredArtifact,
     issued_at: Instant,
+    active_leases: usize,
+}
+
+/// Keeps one already-resolved opaque candidate alive across authenticated
+/// verification or transfer. The token is server-private and non-cloneable.
+#[derive(Debug)]
+pub struct ArtifactCandidateLease {
+    candidate_id: String,
+    state: Arc<Mutex<CatalogState>>,
+}
+
+impl Drop for ArtifactCandidateLease {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(candidate) = state.candidates.get_mut(&self.candidate_id) {
+                candidate.active_leases = candidate.active_leases.saturating_sub(1);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +165,8 @@ pub enum CatalogError {
     Gone,
     #[error("artifact catalog state is unavailable")]
     State,
+    #[error("hosted model/projector authority does not match its immutable candidate")]
+    AuthorityMismatch,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -138,9 +237,7 @@ impl ArtifactCatalogCoordinator {
     ) -> Result<ArtifactCatalogView, CatalogError> {
         let now = Instant::now();
         let mut state = self.state.lock().map_err(|_| CatalogError::State)?;
-        state
-            .candidates
-            .retain(|_, candidate| now.duration_since(candidate.issued_at) < CANDIDATE_TTL);
+        prune_expired(&mut state, now);
         let issued = catalog
             .artifacts
             .iter()
@@ -149,18 +246,38 @@ impl ArtifactCatalogCoordinator {
         if issued > MAX_CANDIDATES {
             return Err(CatalogError::State);
         }
+        if !can_make_room(&state.candidates, issued) {
+            return Err(CatalogError::State);
+        }
         while state.candidates.len() + issued > MAX_CANDIDATES {
-            remove_oldest(&mut state.candidates);
+            if !remove_oldest(&mut state.candidates) {
+                return Err(CatalogError::State);
+            }
         }
         let mut candidates = Vec::with_capacity(catalog.artifacts.len());
-        for artifact in catalog.artifacts {
+        for artifact in catalog.artifacts.iter().cloned() {
             let candidate_id = if artifact.selectable {
+                let companions = catalog
+                    .artifacts
+                    .iter()
+                    .filter(|companion| {
+                        companion.role == "companion"
+                            && companion.repository == artifact.repository
+                            && companion.revision == artifact.revision
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let id = uuid::Uuid::new_v4().to_string();
                 state.candidates.insert(
                     id.clone(),
                     StoredCandidate {
-                        artifact: StoredArtifact::Hosted(artifact.clone()),
+                        artifact: StoredArtifact::Hosted(HostedArtifactPair {
+                            text: artifact.clone(),
+                            companions,
+                            resolution: None,
+                        }),
                         issued_at: now,
+                        active_leases: 0,
                     },
                 );
                 Some(id)
@@ -200,8 +317,13 @@ impl ArtifactCatalogCoordinator {
         if issued > MAX_CANDIDATES {
             return Err(CatalogError::State);
         }
+        if !can_make_room(&state.candidates, issued) {
+            return Err(CatalogError::State);
+        }
         while state.candidates.len() + issued > MAX_CANDIDATES {
-            remove_oldest(&mut state.candidates);
+            if !remove_oldest(&mut state.candidates) {
+                return Err(CatalogError::State);
+            }
         }
         let mut candidates = Vec::with_capacity(catalog.artifacts.len());
         for artifact in catalog.artifacts {
@@ -212,6 +334,7 @@ impl ArtifactCatalogCoordinator {
                     StoredCandidate {
                         artifact: StoredArtifact::Local(artifact.clone()),
                         issued_at: now,
+                        active_leases: 0,
                     },
                 );
                 Some(id)
@@ -243,9 +366,14 @@ impl ArtifactCatalogCoordinator {
         let mut state = self.state.lock().map_err(|_| CatalogError::State)?;
         let candidate = state
             .candidates
-            .get(candidate_id)
+            .get_mut(candidate_id)
             .filter(|candidate| now.duration_since(candidate.issued_at) < CANDIDATE_TTL)
-            .cloned();
+            .map(|candidate| {
+                // A successful non-transactional access refreshes the opaque
+                // candidate. Activation uses `resolve_pinned` below.
+                candidate.issued_at = now;
+                candidate.clone()
+            });
         if candidate.is_none() {
             state.candidates.remove(candidate_id);
         }
@@ -253,22 +381,123 @@ impl ArtifactCatalogCoordinator {
             .map(|candidate| candidate.artifact)
             .ok_or(CatalogError::Gone)
     }
+
+    /// Resolve and pin a candidate for one in-flight activation transaction.
+    /// Catalog TTL pruning and bounded-capacity replacement skip pinned
+    /// candidates until the returned token is dropped.
+    pub fn resolve_pinned(
+        &self,
+        candidate_id: &str,
+    ) -> Result<(StoredArtifact, ArtifactCandidateLease), CatalogError> {
+        let now = Instant::now();
+        let artifact = {
+            let mut state = self.state.lock().map_err(|_| CatalogError::State)?;
+            let candidate = state
+                .candidates
+                .get_mut(candidate_id)
+                .filter(|candidate| now.duration_since(candidate.issued_at) < CANDIDATE_TTL);
+            let Some(candidate) = candidate else {
+                state.candidates.remove(candidate_id);
+                return Err(CatalogError::Gone);
+            };
+            candidate.issued_at = now;
+            candidate.active_leases = candidate
+                .active_leases
+                .checked_add(1)
+                .ok_or(CatalogError::State)?;
+            candidate.artifact.clone()
+        };
+        Ok((
+            artifact,
+            ArtifactCandidateLease {
+                candidate_id: candidate_id.to_owned(),
+                state: Arc::clone(&self.state),
+            },
+        ))
+    }
+
+    /// Bind one authenticated, header-derived resolution to its opaque
+    /// candidate. Re-observing the identical resolution is idempotent; any
+    /// different text identity, companion, or byte contract fails closed.
+    pub fn record_hosted_resolution(
+        &self,
+        candidate_id: &str,
+        immutable_authority: &HostedArtifactPair,
+        resolution: HostedPairResolution,
+    ) -> Result<(), CatalogError> {
+        let now = Instant::now();
+        let mut state = self.state.lock().map_err(|_| CatalogError::State)?;
+        let candidate = state
+            .candidates
+            .get_mut(candidate_id)
+            .ok_or(CatalogError::Gone)?;
+        let StoredArtifact::Hosted(pair) = &mut candidate.artifact else {
+            return Err(CatalogError::AuthorityMismatch);
+        };
+        if pair.text != immutable_authority.text
+            || pair.companions != immutable_authority.companions
+        {
+            return Err(CatalogError::AuthorityMismatch);
+        }
+        match resolution.companion_sha256() {
+            Some(digest)
+                if !pair
+                    .companions
+                    .iter()
+                    .any(|companion| companion.sha256.eq_ignore_ascii_case(digest)) =>
+            {
+                return Err(CatalogError::AuthorityMismatch);
+            }
+            None if resolution.projected_weight_bytes() != 0
+                || resolution.cache_budget_bytes() != 0 =>
+            {
+                return Err(CatalogError::AuthorityMismatch);
+            }
+            _ => {}
+        }
+        if pair
+            .resolution
+            .as_ref()
+            .is_some_and(|current| current != &resolution)
+        {
+            return Err(CatalogError::AuthorityMismatch);
+        }
+        pair.resolution = Some(resolution);
+        candidate.issued_at = now;
+        Ok(())
+    }
 }
 
 fn prune_expired(state: &mut CatalogState, now: Instant) {
-    state
-        .candidates
-        .retain(|_, candidate| now.duration_since(candidate.issued_at) < CANDIDATE_TTL);
+    state.candidates.retain(|_, candidate| {
+        candidate.active_leases > 0 || now.duration_since(candidate.issued_at) < CANDIDATE_TTL
+    });
 }
 
-fn remove_oldest(candidates: &mut HashMap<String, StoredCandidate>) {
+fn remove_oldest(candidates: &mut HashMap<String, StoredCandidate>) -> bool {
     let oldest = candidates
         .iter()
+        .filter(|(_, candidate)| candidate.active_leases == 0)
         .map(|(id, candidate)| (candidate.issued_at, id.clone()))
         .min_by_key(|(issued_at, _)| *issued_at);
     if let Some((_, id)) = oldest {
         candidates.remove(&id);
+        true
+    } else {
+        false
     }
+}
+
+fn can_make_room(candidates: &HashMap<String, StoredCandidate>, additional: usize) -> bool {
+    let required_evictions = candidates
+        .len()
+        .saturating_add(additional)
+        .saturating_sub(MAX_CANDIDATES);
+    candidates
+        .values()
+        .filter(|candidate| candidate.active_leases == 0)
+        .count()
+        >= required_evictions
 }
 
 #[cfg(test)]
@@ -298,6 +527,20 @@ mod tests {
         }
     }
 
+    fn companion() -> HubGgufArtifact {
+        HubGgufArtifact {
+            repository: "owner/model".into(),
+            revision: "a".repeat(40),
+            filename: "model-q5_k_m-mmproj.gguf".into(),
+            bytes: 24,
+            sha256: "c".repeat(64),
+            quant_hint: None,
+            role: "companion".into(),
+            selectable: false,
+            unavailable_reason: Some("vision projector companion; not a text model".into()),
+        }
+    }
+
     #[test]
     fn only_server_selectable_candidates_receive_opaque_ids() {
         let coordinator = ArtifactCatalogCoordinator::default();
@@ -313,8 +556,176 @@ mod tests {
         let StoredArtifact::Hosted(selected) = coordinator.resolve(selected).unwrap() else {
             panic!("expected hosted authority");
         };
-        assert_eq!(selected.sha256, "b".repeat(64));
+        assert_eq!(selected.text.sha256, "b".repeat(64));
+        assert_eq!(selected.companions.len(), 1);
+        assert_eq!(selected.companions[0].role, "companion");
         assert!(view.candidates[1].candidate_id.is_none());
+    }
+
+    #[test]
+    fn one_opaque_text_candidate_retains_server_private_companion_authority() {
+        let coordinator = ArtifactCatalogCoordinator::default();
+        let mut cross_revision = companion();
+        cross_revision.revision = "d".repeat(40);
+        let view = coordinator
+            .register_hosted(HubGgufCatalog {
+                schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+                repository: "owner/model".into(),
+                revision: "a".repeat(40),
+                artifacts: vec![artifact(true), companion(), cross_revision],
+            })
+            .unwrap();
+        let text_id = view.candidates[0].candidate_id.as_deref().unwrap();
+        assert!(view.candidates[1].candidate_id.is_none());
+        assert!(view.candidates[2].candidate_id.is_none());
+        let StoredArtifact::Hosted(pair) = coordinator.resolve(text_id).unwrap() else {
+            panic!("expected hosted pair authority");
+        };
+        assert_eq!(pair.text.role, "text_model");
+        assert_eq!(pair.companions.len(), 1);
+        assert_eq!(pair.companions[0].sha256, "c".repeat(64));
+        assert_eq!(pair.companions[0].revision, pair.text.revision);
+        assert!(pair.resolution.is_none());
+    }
+
+    #[test]
+    fn hosted_pair_discovery_is_path_free_immutable_and_refreshes_exact_admission() {
+        let coordinator = ArtifactCatalogCoordinator::default();
+        let view = coordinator
+            .register_hosted(HubGgufCatalog {
+                schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+                repository: "owner/model".into(),
+                revision: "a".repeat(40),
+                artifacts: vec![artifact(true), companion()],
+            })
+            .unwrap();
+        let id = view.candidates[0].candidate_id.as_deref().unwrap();
+        let StoredArtifact::Hosted(authority) = coordinator.resolve(id).unwrap() else {
+            panic!("expected hosted authority");
+        };
+        let resolution = HostedPairResolution::projector(42, "c".repeat(64), 100, 512).unwrap();
+        coordinator
+            .record_hosted_resolution(id, &authority, resolution.clone())
+            .unwrap();
+
+        let StoredArtifact::Hosted(pair) = coordinator.resolve(id).unwrap() else {
+            panic!("expected hosted pair authority");
+        };
+        assert_eq!(pair.resolution, Some(resolution));
+        assert_eq!(pair.resolution.unwrap().activation_bytes(), 654);
+        // The public v2 candidate remains the opaque text activation unit.
+        let encoded = serde_json::to_string(&view).unwrap();
+        assert!(!encoded.contains(&"c".repeat(64)));
+        assert!(!encoded.contains("654"));
+    }
+
+    #[test]
+    fn hosted_pair_discovery_rejects_wrong_text_or_rebinding() {
+        let coordinator = ArtifactCatalogCoordinator::default();
+        let view = coordinator
+            .register_hosted(HubGgufCatalog {
+                schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+                repository: "owner/model".into(),
+                revision: "a".repeat(40),
+                artifacts: vec![artifact(true), companion()],
+            })
+            .unwrap();
+        let id = view.candidates[0].candidate_id.as_deref().unwrap();
+        let StoredArtifact::Hosted(authority) = coordinator.resolve(id).unwrap() else {
+            panic!("expected hosted authority");
+        };
+        let resolution = HostedPairResolution::projector(42, "c".repeat(64), 100, 512).unwrap();
+        let mut wrong_text = authority.clone();
+        wrong_text.text.sha256 = "d".repeat(64);
+        assert!(matches!(
+            coordinator.record_hosted_resolution(id, &wrong_text, resolution.clone()),
+            Err(CatalogError::AuthorityMismatch)
+        ));
+        coordinator
+            .record_hosted_resolution(id, &authority, resolution)
+            .unwrap();
+        assert!(matches!(
+            coordinator.record_hosted_resolution(
+                id,
+                &authority,
+                HostedPairResolution::text_only(42)
+            ),
+            Err(CatalogError::AuthorityMismatch)
+        ));
+    }
+
+    #[test]
+    fn activation_lease_prevents_ttl_prune_until_materialization_finishes() {
+        let coordinator = ArtifactCatalogCoordinator::default();
+        let view = coordinator
+            .register_hosted(HubGgufCatalog {
+                schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+                repository: "owner/model".into(),
+                revision: "a".repeat(40),
+                artifacts: vec![artifact(true), companion()],
+            })
+            .unwrap();
+        let id = view.candidates[0].candidate_id.as_deref().unwrap();
+        let (_artifact, lease) = coordinator.resolve_pinned(id).unwrap();
+        {
+            let mut state = coordinator.state.lock().unwrap();
+            state.candidates.get_mut(id).unwrap().issued_at =
+                Instant::now() - CANDIDATE_TTL - Duration::from_secs(1);
+            prune_expired(&mut state, Instant::now());
+            assert_eq!(state.candidates.get(id).unwrap().active_leases, 1);
+        }
+
+        drop(lease);
+        let mut state = coordinator.state.lock().unwrap();
+        prune_expired(&mut state, Instant::now());
+        assert!(!state.candidates.contains_key(id));
+    }
+
+    #[test]
+    fn catalog_pressure_cannot_evict_pinned_activations_or_partially_mutate() {
+        let coordinator = ArtifactCatalogCoordinator::default();
+        let view = coordinator
+            .register_hosted(HubGgufCatalog {
+                schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+                repository: "owner/model".into(),
+                revision: "a".repeat(40),
+                artifacts: vec![artifact(true), companion()],
+            })
+            .unwrap();
+        let id = view.candidates[0].candidate_id.as_deref().unwrap();
+        let (_artifact, _lease) = coordinator.resolve_pinned(id).unwrap();
+        let before = {
+            let mut state = coordinator.state.lock().unwrap();
+            let template = state.candidates.get(id).unwrap().clone();
+            for index in 1..MAX_CANDIDATES {
+                state
+                    .candidates
+                    .insert(format!("pinned-{index:03}"), template.clone());
+            }
+            let mut keys = state.candidates.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            keys
+        };
+
+        assert!(matches!(
+            coordinator.register_hosted(HubGgufCatalog {
+                schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+                repository: "owner/other".into(),
+                revision: "d".repeat(40),
+                artifacts: vec![artifact(true)],
+            }),
+            Err(CatalogError::State)
+        ));
+        let mut after = coordinator
+            .state
+            .lock()
+            .unwrap()
+            .candidates
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        after.sort();
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -345,8 +756,8 @@ mod tests {
         let StoredArtifact::Hosted(selected) = coordinator.resolve(first_id).unwrap() else {
             panic!("expected hosted authority");
         };
-        assert_eq!(selected.revision, "a".repeat(40));
-        assert_eq!(selected.sha256, "b".repeat(64));
+        assert_eq!(selected.text.revision, "a".repeat(40));
+        assert_eq!(selected.text.sha256, "b".repeat(64));
     }
 
     #[test]

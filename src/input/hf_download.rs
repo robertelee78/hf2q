@@ -468,17 +468,32 @@ pub fn resolve_hub_gguf_catalog(
 /// Download and authenticate exactly one artifact previously returned by
 /// [`resolve_hub_gguf_catalog`]. No source weights or sibling GGUFs are read.
 pub fn download_hub_gguf(artifact: &HubGgufArtifact) -> Result<PathBuf, DownloadError> {
-    if !artifact.selectable || artifact.role != "text_model" {
+    if !hosted_gguf_identity_valid(artifact, "text_model") {
         return Err(DownloadError::InvalidRepositoryInventory {
             reason: format!("GGUF artifact `{}` is not selectable", artifact.filename),
         });
     }
-    validate_repo_filename(&artifact.filename)?;
-    if !hosted_gguf_identity_valid(artifact) {
+    download_hub_artifact(artifact)
+}
+
+/// Download an immutable projector companion retained server-side as part of
+/// one opaque text-model candidate. Companions are intentionally not public
+/// selectable models; their exact digest must be chosen from the text GGUF's
+/// `hf2q.mmproj_sha256` binding before this function is called.
+pub fn download_hub_gguf_companion(artifact: &HubGgufArtifact) -> Result<PathBuf, DownloadError> {
+    if !hosted_gguf_identity_valid(artifact, "companion") {
         return Err(DownloadError::InvalidRepositoryInventory {
-            reason: "hosted GGUF identity is incomplete or malformed".to_owned(),
+            reason: format!(
+                "GGUF artifact `{}` is not a valid projector companion",
+                artifact.filename
+            ),
         });
     }
+    download_hub_artifact(artifact)
+}
+
+fn download_hub_artifact(artifact: &HubGgufArtifact) -> Result<PathBuf, DownloadError> {
+    validate_repo_filename(&artifact.filename)?;
     let cache_dir = resolve_hf_cache_dir();
     check_artifact_disk_preflight(&artifact.repository, &cache_dir, artifact.bytes)?;
     let api = build_hub_api(&cache_dir, false)?;
@@ -504,11 +519,10 @@ pub fn download_hub_gguf(artifact: &HubGgufArtifact) -> Result<PathBuf, Download
     Ok(path)
 }
 
-fn hosted_gguf_identity_valid(artifact: &HubGgufArtifact) -> bool {
+fn hosted_gguf_identity_valid(artifact: &HubGgufArtifact, expected_role: &str) -> bool {
     let (inferred_role, inferred_quant, unavailable_reason) = classify_hub_gguf(&artifact.filename);
     artifact.filename.to_ascii_lowercase().ends_with(".gguf")
-        && artifact.selectable
-        && artifact.unavailable_reason.is_none()
+        && (expected_role == "text_model") == artifact.selectable
         && artifact.bytes > 0
         && artifact.revision.len() == 40
         && artifact
@@ -517,9 +531,10 @@ fn hosted_gguf_identity_valid(artifact: &HubGgufArtifact) -> bool {
             .all(|byte| byte.is_ascii_hexdigit())
         && artifact.sha256.len() == 64
         && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && inferred_role == "text_model"
-        && unavailable_reason.is_none()
+        && inferred_role == expected_role
+        && (expected_role != "text_model" || unavailable_reason.is_none())
         && inferred_quant == artifact.quant_hint
+        && unavailable_reason == artifact.unavailable_reason
         && artifact.role == inferred_role
 }
 
@@ -1481,9 +1496,7 @@ mod tests {
             unavailable_reason: None,
         };
         let error = download_hub_gguf(&artifact).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("identity is incomplete or malformed"));
+        assert!(error.to_string().contains("is not selectable"));
     }
 
     #[test]
@@ -1499,11 +1512,35 @@ mod tests {
             selectable: true,
             unavailable_reason: None,
         };
-        assert!(hosted_gguf_identity_valid(&artifact));
+        assert!(hosted_gguf_identity_valid(&artifact, "text_model"));
 
         let mut forged = artifact.clone();
         forged.quant_hint = Some("Q6_K".to_owned());
-        assert!(!hosted_gguf_identity_valid(&forged));
+        assert!(!hosted_gguf_identity_valid(&forged, "text_model"));
+    }
+
+    #[test]
+    fn hosted_projector_companion_identity_is_exact_and_non_selectable() {
+        let artifact = HubGgufArtifact {
+            repository: "owner/model".to_owned(),
+            revision: "a".repeat(40),
+            filename: "model-qwen-mmproj.gguf".to_owned(),
+            bytes: 42,
+            sha256: "b".repeat(64),
+            quant_hint: None,
+            role: "companion".to_owned(),
+            selectable: false,
+            unavailable_reason: Some("vision projector companion; not a text model".to_owned()),
+        };
+        assert!(hosted_gguf_identity_valid(&artifact, "companion"));
+
+        let mut client_selectable = artifact.clone();
+        client_selectable.selectable = true;
+        assert!(!hosted_gguf_identity_valid(&client_selectable, "companion"));
+
+        let mut forged_role = artifact;
+        forged_role.role = "text_model".to_owned();
+        assert!(!hosted_gguf_identity_valid(&forged_role, "companion"));
     }
 
     /// Metadata-only regression proof for the mixed repository that exposed

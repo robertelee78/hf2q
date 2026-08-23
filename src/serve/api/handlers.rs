@@ -298,9 +298,9 @@ async fn resolve_engine_for_request(
     };
     if let Some(projector_path) = resolved.mmproj_path.as_ref() {
         engine_config.projector = Some(
-            crate::serve::multi_model::ProjectorLoadSpec::preflight(
+            crate::serve::multi_model::ProjectorLoadSpec::preflight_for_text(
+                &resolved.gguf_path,
                 projector_path,
-                None,
                 crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES as u64,
             )
             .map_err(|error| {
@@ -8287,11 +8287,15 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     let pool_stats_for_metrics = state.pool.read().ok().map(|manager| {
         let stats = manager.pool_stats();
         let components = manager.snapshot_engines().into_iter().fold(
-            (0u64, 0u64, 0u64, 0u64),
-            |(text, weights, cache_budget, cache_resident), engine| {
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64),
+            |(text, weights, file_backed, anonymous, cache_budget, cache_resident), engine| {
                 (
                     text.saturating_add(engine.resident_bytes.text_gguf_bytes),
                     weights.saturating_add(engine.resident_bytes.projector_weight_bytes),
+                    file_backed
+                        .saturating_add(engine.resident_bytes.projector_file_backed_weight_bytes),
+                    anonymous
+                        .saturating_add(engine.resident_bytes.projector_anonymous_weight_bytes),
                     cache_budget.saturating_add(engine.resident_bytes.projector_cache_budget_bytes),
                     cache_resident.saturating_add(
                         engine
@@ -8312,6 +8316,8 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         pool_memory_budget_bytes,
         pool_text_bytes,
         pool_projector_weight_bytes,
+        pool_projector_file_backed_weight_bytes,
+        pool_projector_anonymous_weight_bytes,
         pool_projector_cache_budget_bytes,
         pool_projector_cache_resident_bytes,
     ) = match pool_stats_for_metrics {
@@ -8324,8 +8330,10 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
             components.1,
             components.2,
             components.3,
+            components.4,
+            components.5,
         ),
-        None => (0, 0, 0, 0, 0, 0, 0, 0),
+        None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     };
     // ADR-005 Phase 4 reopen iter-213 (AC 5472): build the KV-spill /
     // KV-restore counter blocks.  Cardinality: four outcome labels per
@@ -8821,6 +8829,12 @@ hf2q_pool_text_gguf_bytes {pool_text}\n\
 # HELP hf2q_pool_projector_weight_bytes Unique projector backing bytes charged to resident generations.\n\
 # TYPE hf2q_pool_projector_weight_bytes gauge\n\
 hf2q_pool_projector_weight_bytes {pool_projector_weights}\n\
+# HELP hf2q_pool_projector_file_backed_weight_bytes File-backed projector weight bytes charged to resident generations.\n\
+# TYPE hf2q_pool_projector_file_backed_weight_bytes gauge\n\
+hf2q_pool_projector_file_backed_weight_bytes {pool_projector_file_backed_weights}\n\
+# HELP hf2q_pool_projector_anonymous_weight_bytes Anonymous projector weight bytes charged to resident generations.\n\
+# TYPE hf2q_pool_projector_anonymous_weight_bytes gauge\n\
+hf2q_pool_projector_anonymous_weight_bytes {pool_projector_anonymous_weights}\n\
 # HELP hf2q_pool_projector_cache_budget_bytes Projector cache reservation charged to resident generations.\n\
 # TYPE hf2q_pool_projector_cache_budget_bytes gauge\n\
 hf2q_pool_projector_cache_budget_bytes {pool_projector_cache_budget}\n\
@@ -8910,6 +8924,8 @@ hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
         pool_resident = pool_resident_bytes,
         pool_text = pool_text_bytes,
         pool_projector_weights = pool_projector_weight_bytes,
+        pool_projector_file_backed_weights = pool_projector_file_backed_weight_bytes,
+        pool_projector_anonymous_weights = pool_projector_anonymous_weight_bytes,
         pool_projector_cache_budget = pool_projector_cache_budget_bytes,
         pool_projector_cache_resident = pool_projector_cache_resident_bytes,
         pool_budget = pool_memory_budget_bytes,
@@ -9431,8 +9447,8 @@ fn model_object_from_load_info(
     }
 }
 
-/// Advertise image input only after the process projector has passed the
-/// same text/projector binding contract enforced by request handling.
+/// Advertise image input only after this engine generation's projector has
+/// passed the same text/projector binding contract enforced by request handling.
 fn advertise_bound_vision(model: &mut ModelObject, projector_id: &str) {
     model.input_modalities = Some(vec!["text", "image"]);
     model.output_modalities = Some(vec!["text"]);
@@ -10031,7 +10047,11 @@ mod multimodal_tests {
             artifact_sha256: "0".repeat(64),
             source_sha256: None,
             pair_generation: None,
+            weights_admission_bytes: 0,
             weights_resident_bytes: 0,
+            weights_file_backed_bytes: 0,
+            weights_anonymous_bytes: 0,
+            mapped_segment_count: 0,
             cache_budget_bytes: 0,
             load_duration_ms: 0,
             vision_cache: Arc::new(
@@ -10189,7 +10209,11 @@ mod multimodal_tests {
             artifact_sha256: "0".repeat(64),
             source_sha256: None,
             pair_generation: None,
+            weights_admission_bytes: 0,
             weights_resident_bytes: 0,
+            weights_file_backed_bytes: 0,
+            weights_anonymous_bytes: 0,
+            mapped_segment_count: 0,
             cache_budget_bytes: 0,
             load_duration_ms: 0,
             vision_cache: Arc::new(
@@ -11116,6 +11140,9 @@ mod readiness_guard_tests {
             loaded_at: SystemTime::now(),
             generation: 1,
             config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),
+            text_semantic_identity: None,
+            text_post_warm_ms: 0,
+            generation_post_warm_ms: 0,
         });
         let resolver = move |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
             let loaded = Arc::clone(&loaded);
@@ -11422,6 +11449,9 @@ mod iter215_qwen35_chat_501_tests {
             loaded_at: SystemTime::now(),
             generation: 1,
             config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),
+            text_semantic_identity: None,
+            text_post_warm_ms: 0,
+            generation_post_warm_ms: 0,
         });
         let resolver_le = loaded_engine.clone();
         let resolver = move |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
@@ -12278,6 +12308,9 @@ mod a5d_handler_429_tests {
             loaded_at: SystemTime::now(),
             generation: 1,
             config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),
+            text_semantic_identity: None,
+            text_post_warm_ms: 0,
+            generation_post_warm_ms: 0,
         });
         let mut params = SamplingParams::default();
         params.max_tokens = max_tokens;

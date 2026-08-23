@@ -759,8 +759,8 @@ impl EmbeddingModel {
 /// (iter 31), the loaded-on-GPU weights wrapped in `Arc` for cheap
 /// clone, and a stable `model_id` (file stem).
 ///
-/// Weights are loaded eagerly at server startup so the first
-/// multimodal request doesn't pay the ~10s mmap/dequant cost. The
+/// Weights are mapped eagerly at server startup so the first multimodal
+/// request does not pay mapping and warmup cost. The
 /// `Arc` makes `LoadedMmproj` cheap to clone across handler calls
 /// while keeping the GPU buffers singly-owned behind the Arc.
 #[derive(Debug, Clone)]
@@ -775,9 +775,17 @@ pub struct LoadedMmproj {
     /// Durable converter transaction identity when both pair members carry
     /// hf2q pair metadata. External explicitly paired artifacts may omit it.
     pub pair_generation: Option<String>,
-    /// Unique Metal backing allocations owned by `weights` (slice/mapped
-    /// aliases counted once).
+    /// Conservative pre-load bound used to decide whether mapping may begin.
+    pub weights_admission_bytes: u64,
+    /// Exact unique Metal backing bytes retained by this projector.
     pub weights_resident_bytes: u64,
+    /// Exact unique file-backed Metal segment bytes retained by the mapped
+    /// tensor views, with shared/sliced backing counted once.
+    pub weights_file_backed_bytes: u64,
+    /// Exact unique anonymous Metal bytes retained by projector weights.
+    /// Production mapped loading requires this to be zero.
+    pub weights_anonymous_bytes: u64,
+    pub mapped_segment_count: usize,
     /// Cache memory reserved in pool admission for this projector.
     pub cache_budget_bytes: u64,
     /// Projector-only header/weight/warmup load duration.
@@ -794,7 +802,11 @@ impl LoadedMmproj {
             source_sha256: self.source_sha256.clone(),
             pair_generation: self.pair_generation.clone(),
             profile: self.arch.as_str().to_owned(),
+            admission_weight_bytes: self.weights_admission_bytes,
             weight_bytes: self.weights_resident_bytes,
+            file_backed_weight_bytes: self.weights_file_backed_bytes,
+            anonymous_weight_bytes: self.weights_anonymous_bytes,
+            mapped_segment_count: self.mapped_segment_count,
             cache_budget_bytes: self.cache_budget_bytes,
         }
     }
@@ -836,7 +848,11 @@ impl LoadedMmproj {
             artifact_sha256,
             source_sha256: None,
             pair_generation: None,
+            weights_admission_bytes: weight_bytes,
             weights_resident_bytes: weight_bytes,
+            weights_file_backed_bytes: 0,
+            weights_anonymous_bytes: weight_bytes,
+            mapped_segment_count: 0,
             cache_budget_bytes,
             load_duration_ms: 0,
             vision_cache: Arc::new(

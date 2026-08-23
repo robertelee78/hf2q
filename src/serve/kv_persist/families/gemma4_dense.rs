@@ -1820,6 +1820,9 @@ mod tests {
             loaded_at: SystemTime::now(),
             generation: 1,
             config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),
+            text_semantic_identity: None,
+            text_post_warm_ms: 0,
+            generation_post_warm_ms: 0,
         })
     }
 

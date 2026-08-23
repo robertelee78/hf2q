@@ -93,18 +93,25 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::core::hardware::HardwareProfile;
+use sha2::{Digest, Sha256};
 
 /// Memory charged to one atomic text/projector generation.
 ///
 /// Text remains a GGUF-file-size estimate because the engine does not yet
-/// expose exact weight/KV/scratch allocation totals. Projector weights are
-/// measured from their unique Metal backing allocations, and the projector
-/// cache is charged at its full configured budget so an on-demand cache fill
-/// cannot push the pool past its admission ceiling after publication.
+/// expose exact weight/KV/scratch allocation totals. A published projector
+/// generation charges its exact unique file-backed and anonymous Metal bytes;
+/// pre-load planning uses a separate conservative estimate. The projector
+/// cache is charged at its full configured budget so an on-demand fill cannot
+/// push the pool past its admission ceiling after publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResidentByteComponents {
     pub text_gguf_bytes: u64,
+    /// Exact unique projector backing bytes charged to the published
+    /// generation. This equals the sum of the file-backed and anonymous
+    /// components below.
     pub projector_weight_bytes: u64,
+    pub projector_file_backed_weight_bytes: u64,
+    pub projector_anonymous_weight_bytes: u64,
     pub projector_cache_budget_bytes: u64,
     total_bytes: u64,
 }
@@ -122,6 +129,31 @@ impl ResidentByteComponents {
         Ok(Self {
             text_gguf_bytes,
             projector_weight_bytes,
+            projector_file_backed_weight_bytes: 0,
+            projector_anonymous_weight_bytes: projector_weight_bytes,
+            projector_cache_budget_bytes,
+            total_bytes,
+        })
+    }
+
+    pub fn mapped_projector(
+        text_gguf_bytes: u64,
+        projector_file_backed_weight_bytes: u64,
+        projector_anonymous_weight_bytes: u64,
+        projector_cache_budget_bytes: u64,
+    ) -> anyhow::Result<Self> {
+        let projector_weight_bytes = projector_file_backed_weight_bytes
+            .checked_add(projector_anonymous_weight_bytes)
+            .ok_or_else(|| anyhow::anyhow!("projector resident-byte total overflow"))?;
+        let total_bytes = text_gguf_bytes
+            .checked_add(projector_weight_bytes)
+            .and_then(|total| total.checked_add(projector_cache_budget_bytes))
+            .ok_or_else(|| anyhow::anyhow!("model/projector resident-byte total overflow"))?;
+        Ok(Self {
+            text_gguf_bytes,
+            projector_weight_bytes,
+            projector_file_backed_weight_bytes,
+            projector_anonymous_weight_bytes,
             projector_cache_budget_bytes,
             total_bytes,
         })
@@ -131,6 +163,8 @@ impl ResidentByteComponents {
         Self {
             text_gguf_bytes,
             projector_weight_bytes: 0,
+            projector_file_backed_weight_bytes: 0,
+            projector_anonymous_weight_bytes: 0,
             projector_cache_budget_bytes: 0,
             total_bytes: text_gguf_bytes,
         }
@@ -153,6 +187,22 @@ pub struct ProjectorLoadSpec {
 }
 
 impl ProjectorLoadSpec {
+    /// Preflight a projector against the exact binding declared by its text
+    /// artifact before loading either generation. Unbound external text GGUFs
+    /// retain the explicit-pair behavior (`expected_artifact_sha256 = None`).
+    pub fn preflight_for_text(
+        text_path: &std::path::Path,
+        projector_path: impl Into<PathBuf>,
+        cache_budget_bytes: u64,
+    ) -> anyhow::Result<Self> {
+        let text = mlx_native::gguf::GgufFile::open(text_path)
+            .map_err(|error| anyhow::anyhow!("text GGUF pair preflight failed: {error}"))?;
+        let expected = text
+            .metadata_string(crate::core::provenance::KEY_MMPROJ_SHA256)
+            .map(str::to_owned);
+        Self::preflight(projector_path, expected, cache_budget_bytes)
+    }
+
     pub fn preflight(
         path: impl Into<PathBuf>,
         expected_artifact_sha256: Option<String>,
@@ -175,10 +225,30 @@ impl ProjectorLoadSpec {
                 "projector digest does not match the text artifact binding"
             );
         }
+        crate::inference::vision::mmproj_weights::LoadedMmprojWeights::preflight_native_storage_bytes(
+            &gguf,
+        )?;
+        // Mapped Metal resources are page-rounded independently for every
+        // segment. A single segment cannot exceed the rounded file size; each
+        // additional split can introduce one leading and one trailing page of
+        // alignment slack. Tensor count is a device-independent upper bound
+        // on segment count, so this estimate is conservative before device
+        // mapping. Published pool accounting is replaced with exact unique
+        // mapped segment bytes after load.
+        let file_bytes = std::fs::metadata(&path)
+            .map_err(|error| anyhow::anyhow!("projector size preflight failed: {error}"))?
+            .len();
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        anyhow::ensure!(
+            page_size > 0,
+            "cannot determine host page size for projector admission"
+        );
+        let page_size =
+            u64::try_from(page_size).map_err(|_| anyhow::anyhow!("host page size exceeds u64"))?;
+        let tensor_count = u64::try_from(gguf.tensor_names().len())
+            .map_err(|_| anyhow::anyhow!("projector tensor count exceeds u64"))?;
         let projected_weight_bytes =
-            crate::inference::vision::mmproj_weights::LoadedMmprojWeights::projected_unique_owned_bytes(
-                &gguf,
-            )?;
+            conservative_mapped_projector_bytes(file_bytes, page_size, tensor_count)?;
         Ok(Self {
             path,
             artifact_sha256,
@@ -195,8 +265,41 @@ pub struct ProjectorConfigIdentity {
     pub source_sha256: Option<String>,
     pub pair_generation: Option<String>,
     pub profile: String,
+    /// Conservative pre-load bound used to decide whether mapping may begin.
+    pub admission_weight_bytes: u64,
+    /// Exact unique backing bytes retained by the published generation.
     pub weight_bytes: u64,
+    pub file_backed_weight_bytes: u64,
+    pub anonymous_weight_bytes: u64,
+    pub mapped_segment_count: usize,
     pub cache_budget_bytes: u64,
+}
+
+fn conservative_mapped_projector_bytes(
+    file_bytes: u64,
+    page_size: u64,
+    tensor_count: u64,
+) -> anyhow::Result<u64> {
+    anyhow::ensure!(
+        page_size > 0,
+        "projector mapping page size must be non-zero"
+    );
+    anyhow::ensure!(
+        tensor_count > 0,
+        "projector GGUF must contain at least one tensor"
+    );
+    let rounded_file = file_bytes
+        .checked_add(page_size - 1)
+        .map(|bytes| bytes / page_size * page_size)
+        .ok_or_else(|| anyhow::anyhow!("projector mapped admission charge overflow"))?;
+    let split_slack = tensor_count
+        .checked_sub(1)
+        .and_then(|splits| splits.checked_mul(2))
+        .and_then(|pages| pages.checked_mul(page_size))
+        .ok_or_else(|| anyhow::anyhow!("projector mapped segment slack overflow"))?;
+    rounded_file
+        .checked_add(split_slack)
+        .ok_or_else(|| anyhow::anyhow!("projector mapped admission charge overflow"))
 }
 
 /// Configuration consumed by [`crate::serve::load_engine`] (and by extension
@@ -304,6 +407,52 @@ pub struct EngineConfigIdentity {
     pub explicit_config: bool,
     pub dwq_overlay: bool,
     pub projector: Option<ProjectorConfigIdentity>,
+}
+
+/// Path-free identity of the tokenizer and prompt protocol actually owned by
+/// one loaded text-engine generation. Hashing the live tokenizer
+/// serialization and chat-template bytes proves that a swap did not retain a
+/// prior generation's request semantics without exposing local sidecar paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSemanticIdentity {
+    pub model_id: String,
+    pub architecture: String,
+    pub tokenizer_source: String,
+    pub tokenizer_sha256: String,
+    pub chat_template_source: String,
+    pub chat_template_sha256: String,
+}
+
+impl TextSemanticIdentity {
+    fn from_engine(engine: &Engine) -> anyhow::Result<Self> {
+        use crate::serve::load_info::{ChatTemplateSource, TokenizerSource};
+
+        let tokenizer_json = engine
+            .tokenizer()
+            .to_string(false)
+            .map_err(|error| anyhow::anyhow!("serialize loaded tokenizer: {error}"))?;
+        let tokenizer_source = match &engine.info().tokenizer_source {
+            TokenizerSource::GgufEmbedded => "gguf_embedded".to_string(),
+            TokenizerSource::HfTokenizerJson { .. } => "hf_tokenizer_json".to_string(),
+        };
+        let chat_template_source = match &engine.info().chat_template_source {
+            ChatTemplateSource::GgufEmbedded => "gguf_embedded".to_string(),
+            ChatTemplateSource::CliOverride => "cli_override".to_string(),
+            ChatTemplateSource::HardcodedFallback { name } => {
+                format!("hardcoded_fallback:{name}")
+            }
+            ChatTemplateSource::NativeEncoding { name } => format!("native_encoding:{name}"),
+            ChatTemplateSource::None => "none".to_string(),
+        };
+        Ok(Self {
+            model_id: engine.info().model_id.clone(),
+            architecture: engine.info().arch_str.clone(),
+            tokenizer_source,
+            tokenizer_sha256: hex::encode(Sha256::digest(tokenizer_json.as_bytes())),
+            chat_template_source,
+            chat_template_sha256: hex::encode(Sha256::digest(engine.chat_template().as_bytes())),
+        })
+    }
 }
 
 impl Default for EngineConfigIdentity {
@@ -886,6 +1035,21 @@ pub struct LoadedEngine<E> {
     pub generation: u64,
     /// Path-free identity of the exact load policy used for this generation.
     pub config_identity: EngineConfigIdentity,
+    /// Path-free digest receipt for the live tokenizer and prompt protocol.
+    /// Production generations always publish `Some`; synthetic tests may use
+    /// `None` unless their loader is explicitly exercising semantic identity.
+    pub text_semantic_identity: Option<TextSemanticIdentity>,
+    /// Text engine load plus synchronous text warmup, before projector work.
+    pub text_post_warm_ms: u64,
+    /// Complete text plus optional projector load/warm duration immediately
+    /// before atomic generation publication.
+    pub generation_post_warm_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GenerationLoadTimings {
+    text_post_warm_ms: u64,
+    generation_post_warm_ms: u64,
 }
 
 /// Trait for loading a GGUF into a live engine of type `E`.
@@ -907,6 +1071,13 @@ pub trait ModelLoader<E>: Send + Sync {
     /// chat-template resolution, or warmup; the manager treats any error
     /// as a load-failure and does NOT admit a partial entry.
     fn load(&self, path: &Path, config: &EngineConfig) -> anyhow::Result<E>;
+
+    /// Derive a path-free identity from the live engine after text warmup but
+    /// before atomic generation publication. Loaders for synthetic fixtures
+    /// may leave this absent; the production loader must return an identity.
+    fn text_semantic_identity(&self, _engine: &E) -> anyhow::Result<Option<TextSemanticIdentity>> {
+        Ok(None)
+    }
 
     /// Load and warm the projector explicitly configured for this text
     /// artifact. The manager invokes this only after text warmup succeeds and
@@ -932,6 +1103,13 @@ pub struct DefaultModelLoader;
 impl ModelLoader<Engine> for DefaultModelLoader {
     fn load(&self, path: &Path, config: &EngineConfig) -> anyhow::Result<Engine> {
         crate::serve::load_engine(path, config)
+    }
+
+    fn text_semantic_identity(
+        &self,
+        engine: &Engine,
+    ) -> anyhow::Result<Option<TextSemanticIdentity>> {
+        TextSemanticIdentity::from_engine(engine).map(Some)
     }
 
     fn load_projector(
@@ -1368,12 +1546,53 @@ impl<E> HotSwapManager<E> {
             })?
             .len();
         match config.projector.as_ref() {
-            Some(projector) => ResidentByteComponents::new(
+            Some(projector) => ResidentByteComponents::mapped_projector(
                 text_gguf_bytes,
                 projector.projected_weight_bytes,
+                0,
                 projector.cache_budget_bytes,
             )
             .map_err(HotSwapError::LoaderFailed),
+            None => Ok(ResidentByteComponents::text_only(text_gguf_bytes)),
+        }
+    }
+
+    fn resident_components_for_loaded(
+        gguf_path: &Path,
+        projector: Option<&crate::serve::api::state::LoadedMmproj>,
+    ) -> Result<ResidentByteComponents, HotSwapError> {
+        let text_gguf_bytes = std::fs::metadata(gguf_path)
+            .map_err(|source| HotSwapError::FileSize {
+                path: gguf_path.to_path_buf(),
+                source,
+            })?
+            .len();
+        match projector {
+            Some(projector) => {
+                let exact_weight_bytes = projector
+                    .weights_file_backed_bytes
+                    .checked_add(projector.weights_anonymous_bytes)
+                    .ok_or_else(|| {
+                        HotSwapError::LoaderFailed(anyhow::anyhow!(
+                            "loaded projector resident-byte total overflow"
+                        ))
+                    })?;
+                if exact_weight_bytes != projector.weights_resident_bytes {
+                    return Err(HotSwapError::LoaderFailed(anyhow::anyhow!(
+                        "loaded projector exact backing receipt does not conserve: total {}, file-backed {}, anonymous {}",
+                        projector.weights_resident_bytes,
+                        projector.weights_file_backed_bytes,
+                        projector.weights_anonymous_bytes,
+                    )));
+                }
+                ResidentByteComponents::mapped_projector(
+                    text_gguf_bytes,
+                    projector.weights_file_backed_bytes,
+                    projector.weights_anonymous_bytes,
+                    projector.cache_budget_bytes,
+                )
+                .map_err(HotSwapError::LoaderFailed)
+            }
             None => Ok(ResidentByteComponents::text_only(text_gguf_bytes)),
         }
     }
@@ -1391,6 +1610,12 @@ impl<E> HotSwapManager<E> {
             match (config.projector.as_ref(), loaded.projector.as_deref()) {
                 (None, None) => {}
                 (Some(spec), Some(projector)) => {
+                    let exact_weight_bytes = projector
+                        .weights_file_backed_bytes
+                        .checked_add(projector.weights_anonymous_bytes)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("resident projector backing-byte overflow")
+                        })?;
                     anyhow::ensure!(
                         projector.gguf_path == spec.path,
                         "resident model generation owns a different projector artifact"
@@ -1400,7 +1625,8 @@ impl<E> HotSwapManager<E> {
                         "resident model generation owns a different projector digest"
                     );
                     anyhow::ensure!(
-                        projector.weights_resident_bytes == spec.projected_weight_bytes
+                        projector.weights_admission_bytes == spec.projected_weight_bytes
+                            && projector.weights_resident_bytes == exact_weight_bytes
                             && projector.cache_budget_bytes == spec.cache_budget_bytes,
                         "resident model generation projector accounting differs from the request"
                     );
@@ -1421,10 +1647,25 @@ impl<E> HotSwapManager<E> {
         &self,
         gguf_path: &Path,
         config: &EngineConfig,
-    ) -> Result<(E, Option<Arc<crate::serve::api::state::LoadedMmproj>>), HotSwapError> {
+    ) -> Result<
+        (
+            E,
+            Option<Arc<crate::serve::api::state::LoadedMmproj>>,
+            Option<TextSemanticIdentity>,
+            GenerationLoadTimings,
+        ),
+        HotSwapError,
+    > {
+        let generation_started = std::time::Instant::now();
+        let text_started = std::time::Instant::now();
         let engine = self
             .loader
             .load(gguf_path, config)
+            .map_err(HotSwapError::LoaderFailed)?;
+        let text_post_warm_ms = text_started.elapsed().as_millis() as u64;
+        let text_semantic_identity = self
+            .loader
+            .text_semantic_identity(&engine)
             .map_err(HotSwapError::LoaderFailed)?;
         let projector = match config.projector.as_ref() {
             Some(spec) => Some(Arc::new(
@@ -1434,7 +1675,15 @@ impl<E> HotSwapManager<E> {
             )),
             None => None,
         };
-        Ok((engine, projector))
+        Ok((
+            engine,
+            projector,
+            text_semantic_identity,
+            GenerationLoadTimings {
+                text_post_warm_ms,
+                generation_post_warm_ms: generation_started.elapsed().as_millis() as u64,
+            },
+        ))
     }
 
     /// Construct a new manager from a pool + a loader.  Production
@@ -1549,6 +1798,9 @@ impl<E> HotSwapManager<E> {
             loaded_at: SystemTime::now(),
             generation: self.allocate_generation(),
             config_identity: EngineConfigIdentity::default(),
+            text_semantic_identity: None,
+            text_post_warm_ms: 0,
+            generation_post_warm_ms: 0,
         });
         let handle = LoadedHandle {
             repo_id: k.clone(),
@@ -1794,14 +2046,22 @@ impl<E> HotSwapManager<E> {
             return Ok(NonEvictingLoad::Resident(existing));
         }
 
-        let resident_bytes = Self::resident_components_for_path(gguf_path, config)?;
-        let bytes_resident = resident_bytes.total_bytes();
-        let plan = self.admission_plan(repo, quant, bytes_resident);
+        let admission_resident_bytes = Self::resident_components_for_path(gguf_path, config)?;
+        let admission_bytes = admission_resident_bytes.total_bytes();
+        let plan = self.admission_plan(repo, quant, admission_bytes);
         if !matches!(plan.outcome, AdmissionOutcome::FitsAlongside { .. }) {
             return Ok(NonEvictingLoad::Conflict(plan));
         }
 
-        let (engine, projector) = self.load_generation(gguf_path, config)?;
+        let (engine, projector, text_semantic_identity, timings) =
+            self.load_generation(gguf_path, config)?;
+        let resident_bytes = Self::resident_components_for_loaded(gguf_path, projector.as_deref())?;
+        let bytes_resident = resident_bytes.total_bytes();
+        if bytes_resident > admission_bytes {
+            return Err(HotSwapError::LoaderFailed(anyhow::anyhow!(
+                "loaded model/projector residency {bytes_resident} exceeded pre-load admission bound {admission_bytes}"
+            )));
+        }
         let config_identity = EngineConfigIdentity::from_loaded(config, projector.as_deref());
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
@@ -1814,6 +2074,9 @@ impl<E> HotSwapManager<E> {
             loaded_at: SystemTime::now(),
             generation: self.allocate_generation(),
             config_identity,
+            text_semantic_identity,
+            text_post_warm_ms: timings.text_post_warm_ms,
+            generation_post_warm_ms: timings.generation_post_warm_ms,
         });
         let handle = LoadedHandle {
             repo_id: k.clone(),
@@ -1880,9 +2143,17 @@ impl<E> HotSwapManager<E> {
         // fails fast without driving the loader (which would itself
         // bail at header-open time, but a clean upfront error is
         // better tracing).
-        let resident_bytes = Self::resident_components_for_path(gguf_path, config)?;
+        let admission_resident_bytes = Self::resident_components_for_path(gguf_path, config)?;
+        let admission_bytes = admission_resident_bytes.total_bytes();
+        let (engine, projector, text_semantic_identity, timings) =
+            self.load_generation(gguf_path, config)?;
+        let resident_bytes = Self::resident_components_for_loaded(gguf_path, projector.as_deref())?;
         let bytes_resident = resident_bytes.total_bytes();
-        let (engine, projector) = self.load_generation(gguf_path, config)?;
+        if bytes_resident > admission_bytes {
+            return Err(HotSwapError::LoaderFailed(anyhow::anyhow!(
+                "loaded model/projector residency {bytes_resident} exceeded pre-load admission bound {admission_bytes}"
+            )));
+        }
         let config_identity = EngineConfigIdentity::from_loaded(config, projector.as_deref());
 
         let loaded_engine = Arc::new(LoadedEngine {
@@ -1896,6 +2167,9 @@ impl<E> HotSwapManager<E> {
             loaded_at: SystemTime::now(),
             generation: self.allocate_generation(),
             config_identity,
+            text_semantic_identity,
+            text_post_warm_ms: timings.text_post_warm_ms,
+            generation_post_warm_ms: timings.generation_post_warm_ms,
         });
 
         // Admit to the pool.  May evict LRU entries; we drop the
@@ -1996,6 +2270,21 @@ mod tests {
         assert_eq!(components.projector_weight_bytes, 240);
         assert_eq!(components.projector_cache_budget_bytes, 512);
         assert_eq!(components.total_bytes(), 1_752);
+    }
+
+    #[test]
+    fn mapped_projector_preload_bound_covers_per_segment_page_slack() {
+        assert_eq!(
+            conservative_mapped_projector_bytes(16_385, 16_384, 1).unwrap(),
+            32_768
+        );
+        assert_eq!(
+            conservative_mapped_projector_bytes(16_385, 16_384, 3).unwrap(),
+            98_304
+        );
+        assert!(conservative_mapped_projector_bytes(u64::MAX, 16_384, 2).is_err());
+        assert!(conservative_mapped_projector_bytes(1, 0, 1).is_err());
+        assert!(conservative_mapped_projector_bytes(1, 16_384, 0).is_err());
     }
 
     #[test]
@@ -2321,8 +2610,8 @@ mod tests {
         let mut p = LoadedPool::with_capacity_and_budget(2, 800);
         let _ = p.insert(h("a/1", 400)).unwrap();
         let _ = p.insert(h("b/2", 400)).unwrap(); // total 800, capacity 2/2
-                                                  // Third: capacity pass evicts a/1 → total 400, len 1.  Budget
-                                                  // pass: 400+500=900 > 800 → evict b/2 → total 0.  +500 = 500.
+        // Third: capacity pass evicts a/1 → total 400, len 1.  Budget
+        // pass: 400+500=900 > 800 → evict b/2 → total 0.  +500 = 500.
         let evicted = p.insert(h("c/3", 500)).unwrap();
         assert_eq!(evicted.len(), 2);
         let names: Vec<&str> = evicted.iter().map(|h| h.repo_id.as_str()).collect();
@@ -2393,9 +2682,9 @@ mod tests {
         let _ = p.insert(h("a/1", 100)).unwrap(); // LRU
         let _ = p.insert(h("b/2", 200)).unwrap();
         let _ = p.insert(h("c/3", 300)).unwrap(); // MRU
-                                                  // Re-insert a/1 with new bytes 1500: it should NOT be evicted,
-                                                  // total goes 100→1500 = +1400, no other eviction (well under
-                                                  // budget).  a/1 promotes to MRU.
+        // Re-insert a/1 with new bytes 1500: it should NOT be evicted,
+        // total goes 100→1500 = +1400, no other eviction (well under
+        // budget).  a/1 promotes to MRU.
         let evicted = p.insert(h("a/1", 1500)).unwrap();
         assert!(evicted.is_empty(), "re-insert must not self-evict");
         let order: Vec<&str> = p.iter().map(|h| h.repo_id.as_str()).collect();
@@ -2551,9 +2840,77 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct SemanticMockEngine {
+        artifact_name: String,
+    }
+
+    struct SemanticMockLoader {
+        fail_identity: bool,
+    }
+
+    impl ModelLoader<SemanticMockEngine> for SemanticMockLoader {
+        fn load(&self, path: &Path, _config: &EngineConfig) -> anyhow::Result<SemanticMockEngine> {
+            Ok(SemanticMockEngine {
+                artifact_name: path
+                    .file_name()
+                    .expect("synthetic artifact filename")
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+        }
+
+        fn text_semantic_identity(
+            &self,
+            engine: &SemanticMockEngine,
+        ) -> anyhow::Result<Option<TextSemanticIdentity>> {
+            if self.fail_identity {
+                anyhow::bail!("synthetic semantic identity failure");
+            }
+            let digest = hex::encode(Sha256::digest(engine.artifact_name.as_bytes()));
+            Ok(Some(TextSemanticIdentity {
+                model_id: engine.artifact_name.clone(),
+                architecture: "synthetic".into(),
+                tokenizer_source: "gguf_embedded".into(),
+                tokenizer_sha256: digest.clone(),
+                chat_template_source: "gguf_embedded".into(),
+                chat_template_sha256: digest,
+            }))
+        }
+    }
+
     struct ProjectorFailLoader {
         text_calls: std::sync::atomic::AtomicU64,
         projector_calls: std::sync::atomic::AtomicU64,
+    }
+
+    struct ProjectorExactAccountingLoader;
+
+    impl ModelLoader<MockEngine> for ProjectorExactAccountingLoader {
+        fn load(&self, _path: &Path, _config: &EngineConfig) -> anyhow::Result<MockEngine> {
+            Ok(MockEngine { load_serial: 1 })
+        }
+
+        fn load_projector(
+            &self,
+            _text_path: &Path,
+            _engine: &MockEngine,
+            spec: &ProjectorLoadSpec,
+        ) -> anyhow::Result<crate::serve::api::state::LoadedMmproj> {
+            let projector = crate::serve::api::state::LoadedMmproj::empty_for_test(
+                "projector-exact",
+                spec.artifact_sha256.clone(),
+                120,
+                spec.cache_budget_bytes,
+            );
+            let mut projector =
+                Arc::try_unwrap(projector).expect("synthetic projector has one owner");
+            projector.gguf_path = spec.path.clone();
+            projector.weights_admission_bytes = spec.projected_weight_bytes;
+            projector.weights_file_backed_bytes = 120;
+            projector.weights_anonymous_bytes = 0;
+            Ok(projector)
+        }
     }
 
     impl ModelLoader<MockEngine> for ProjectorFailLoader {
@@ -2636,6 +2993,90 @@ mod tests {
         assert_eq!(mgr.pool_stats().loaded_count, 0);
         assert_eq!(mgr.pool_stats().total_resident_bytes, 0);
         assert!(mgr.try_get("model/a", QuantType::Q4_K_M).is_none());
+    }
+
+    #[test]
+    fn text_semantic_identity_is_generation_local_and_fail_atomic() {
+        let a = synthetic_gguf(1_000);
+        let b = synthetic_gguf(900);
+        let pool = LoadedPool::with_capacity_and_budget(1, 2_000);
+        let mut manager = HotSwapManager::<SemanticMockEngine>::new(
+            pool,
+            Arc::new(SemanticMockLoader {
+                fail_identity: false,
+            }),
+        );
+
+        let a1 = manager
+            .load_or_get("model/a", QuantType::Q4_K_M, a.path(), &empty_config())
+            .expect("load A");
+        let a_identity = a1
+            .text_semantic_identity
+            .clone()
+            .expect("A semantic identity");
+        drop(a1);
+        let b1 = manager
+            .load_or_get("model/b", QuantType::Q4_K_M, b.path(), &empty_config())
+            .expect("load B");
+        assert_ne!(b1.text_semantic_identity.as_ref(), Some(&a_identity));
+        drop(b1);
+        let a2 = manager
+            .load_or_get("model/a", QuantType::Q4_K_M, a.path(), &empty_config())
+            .expect("reload A");
+        assert_eq!(a2.text_semantic_identity.as_ref(), Some(&a_identity));
+
+        let failed_pool = LoadedPool::with_capacity_and_budget(1, 2_000);
+        let mut failed = HotSwapManager::<SemanticMockEngine>::new(
+            failed_pool,
+            Arc::new(SemanticMockLoader {
+                fail_identity: true,
+            }),
+        );
+        let error = failed
+            .load_or_get("model/a", QuantType::Q4_K_M, a.path(), &empty_config())
+            .expect_err("semantic identity failure must prevent publication");
+        assert!(format!("{error}").contains("semantic identity failure"));
+        assert_eq!(failed.pool_stats().loaded_count, 0);
+        assert!(failed.try_get("model/a", QuantType::Q4_K_M).is_none());
+    }
+
+    #[test]
+    fn published_pair_charges_exact_backing_not_preload_bound() {
+        let pool = LoadedPool::with_capacity_and_budget(2, 10_000);
+        let mut manager =
+            HotSwapManager::<MockEngine>::new(pool, Arc::new(ProjectorExactAccountingLoader));
+        let text = synthetic_gguf(1_000);
+        let config = EngineConfig {
+            projector: Some(ProjectorLoadSpec {
+                path: PathBuf::from("/synthetic/projector-exact.gguf"),
+                artifact_sha256: "a".repeat(64),
+                projected_weight_bytes: 200,
+                cache_budget_bytes: 300,
+            }),
+            ..EngineConfig::default()
+        };
+
+        let loaded = manager
+            .load_or_get("model/a", QuantType::Q4_K_M, text.path(), &config)
+            .expect("load exact-accounted pair");
+        assert_eq!(loaded.resident_bytes.text_gguf_bytes, 1_000);
+        assert_eq!(loaded.resident_bytes.projector_weight_bytes, 120);
+        assert_eq!(
+            loaded.resident_bytes.projector_file_backed_weight_bytes,
+            120
+        );
+        assert_eq!(loaded.resident_bytes.projector_anonymous_weight_bytes, 0);
+        assert_eq!(loaded.bytes_resident, 1_420);
+        assert_eq!(manager.pool_stats().total_resident_bytes, 1_420);
+        assert_eq!(
+            loaded
+                .config_identity
+                .projector
+                .as_ref()
+                .expect("projector identity")
+                .admission_weight_bytes,
+            200
+        );
     }
 
     #[test]
@@ -3169,8 +3610,7 @@ mod tests {
     // system unified memory").  The four tests below close the testing
     // *gap* the W-B1 audit surfaced — production behavior under memory
     // pressure WAS exercised at the pool-primitive level, but four
-    // manager-surface invariants the Wave-2 W-2 peer reference
-    // calls out were not asserted through
+    // manager-surface invariants were not asserted through
     // `HotSwapManager`'s public API:
     //
     //   1. **Multi-evict-in-one-load** (`hotswap_chains_multiple_evictions_in_one_load`):
@@ -3199,9 +3639,8 @@ mod tests {
     //   4. **TOCTOU-safe under shared lock** (`hotswap_concurrent_load_or_get_serializes_under_mutex`):
     //      `HotSwapManager` itself is not internally synchronized
     //      (struct doc lines 676-681 + AppState line 202 wrap it in
-    //      `Arc<RwLock<...>>`).  The peer's
-    //      server model-loader re-checks capacity
-    //      under the load-lock to defeat the
+    //      `Arc<RwLock<...>>`). Capacity must remain checked under the
+    //      load lock to defeat the
     //      check-budget → release-lock → load → re-acquire window.
     //      Our wrapper holds a single std::sync RwLock write-guard for
     //      the entire `load_or_get` call (file-stat + loader invoke +
@@ -3214,9 +3653,8 @@ mod tests {
     //      `total_resident_bytes <= memory_budget_bytes` holds at every
     //      observable point post-join (the budget invariant never tears).
     //
-    // Reference:  the peer's canonical LRU+TOCTOU pattern (our
-    // equivalent is the
-    // single-lock-guard wrapping the entire `load_or_get` call).
+    // The single lock guard wrapping the complete `load_or_get` call is the
+    // local LRU+TOCTOU invariant.
     // ─────────────────────────────────────────────────────────────────────
 
     /// W-B1 test 1/4: a single `load_or_get` can evict multiple LRU
@@ -3421,9 +3859,8 @@ mod tests {
     /// wrapper (mirrors `AppState::pool` at `src/serve/api/state.rs:202`,
     /// which uses `Arc<RwLock<...>>` — Mutex is conceptually the same
     /// for the write-only path `load_or_get` exercises) must NOT race
-    /// past the budget gate.  The peer's reference
-    /// re-checks capacity under the load-lock
-    /// for the same reason; our defense is structural — a single lock
+    /// past the budget gate. Capacity remains under the load lock; the
+    /// defense is structural — a single lock
     /// guard wraps file-stat + loader invocation + pool insert.
     ///
     /// Invariants asserted post-join:

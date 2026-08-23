@@ -216,19 +216,30 @@ fn run(cli: Cli) -> Result<(), AppError> {
 }
 
 fn cmd_fetch_hub_gguf(args: cli::FetchHubGgufArgs) -> Result<(), AppError> {
+    let is_companion = args.role == "companion";
+    if !is_companion && args.role != "text_model" {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "internal hosted GGUF role must be text_model or companion"
+        )));
+    }
     let artifact = input::hf_download::HubGgufArtifact {
         repository: args.repository,
         revision: args.revision,
         filename: args.artifact,
         bytes: args.bytes,
         sha256: args.sha256,
-        quant_hint: Some(args.quant),
-        role: "text_model".to_owned(),
-        selectable: true,
-        unavailable_reason: None,
+        quant_hint: args.quant,
+        role: args.role,
+        selectable: !is_companion,
+        unavailable_reason: is_companion
+            .then(|| "vision projector companion; not a text model".to_owned()),
     };
-    let path = input::hf_download::download_hub_gguf(&artifact)
-        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+    let path = if is_companion {
+        input::hf_download::download_hub_gguf_companion(&artifact)
+    } else {
+        input::hf_download::download_hub_gguf(&artifact)
+    }
+    .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
     println!("{}", path.display());
     Ok(())
 }

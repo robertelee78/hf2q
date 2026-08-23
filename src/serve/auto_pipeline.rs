@@ -395,9 +395,15 @@ pub(crate) fn resolve_projector_companion(
     let Some(candidate) = candidate else {
         return Ok(None);
     };
+    let metadata = std::fs::symlink_metadata(&candidate).with_context(|| {
+        format!(
+            "text/projector pair is incomplete: projector missing at {}",
+            candidate.display()
+        )
+    })?;
     anyhow::ensure!(
-        candidate.is_file(),
-        "text/projector pair is incomplete: projector missing at {}",
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "projector companion must be a non-symlink regular file: {}",
         candidate.display()
     );
     Ok(Some(candidate))
@@ -1063,6 +1069,75 @@ mod tests {
             write_str_kv(&mut buf, k, v);
         }
         buf
+    }
+
+    #[test]
+    fn unbound_text_never_guesses_a_shape_compatible_sibling_projector() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("model.gguf");
+        let sibling = dir.path().join("model-mmproj.gguf");
+        std::fs::write(
+            &text,
+            build_gguf_with_string_metadata(QuantType::Q4_K_M, &[]),
+        )
+        .unwrap();
+        std::fs::write(&sibling, b"shape-compatible but unbound").unwrap();
+
+        assert_eq!(resolve_projector_companion(&text, None).unwrap(), None);
+        assert_eq!(
+            resolve_projector_companion(&text, Some(&sibling)).unwrap(),
+            Some(sibling),
+            "an operator-explicit external pair remains supported"
+        );
+    }
+
+    #[test]
+    fn bound_text_requires_its_exact_sibling_companion() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("model.gguf");
+        let sibling = dir.path().join("model-mmproj.gguf");
+        let digest = "a".repeat(64);
+        std::fs::write(
+            &text,
+            build_gguf_with_string_metadata(
+                QuantType::Q4_K_M,
+                &[(crate::core::provenance::KEY_MMPROJ_SHA256, &digest)],
+            ),
+        )
+        .unwrap();
+
+        let missing = resolve_projector_companion(&text, None).unwrap_err();
+        assert!(missing.to_string().contains("pair is incomplete"));
+        std::fs::write(&sibling, b"bound projector").unwrap();
+        assert_eq!(
+            resolve_projector_companion(&text, None).unwrap(),
+            Some(sibling)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_bound_projector_rejects_a_symlink_before_preflight() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("model.gguf");
+        let sibling = dir.path().join("model-mmproj.gguf");
+        let target = dir.path().join("projector-target.gguf");
+        let digest = "b".repeat(64);
+        std::fs::write(
+            &text,
+            build_gguf_with_string_metadata(
+                QuantType::Q4_K_M,
+                &[(crate::core::provenance::KEY_MMPROJ_SHA256, &digest)],
+            ),
+        )
+        .unwrap();
+        std::fs::write(&target, b"projector target").unwrap();
+        symlink(&target, &sibling).unwrap();
+
+        let error = resolve_projector_companion(&text, None).unwrap_err();
+        assert!(error.to_string().contains("non-symlink regular file"));
     }
 
     /// Produce a list of source shards whose canonical bundle SHA we
