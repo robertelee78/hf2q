@@ -59,7 +59,7 @@
 //!
 //! P9b complete: both paths wired, parity tests pass.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
@@ -129,8 +129,6 @@ fn dispatch_moe_id_routed(
     output: &MlxBuffer,
     legacy_params: &GgmlQuantizedMatmulIdParams,
     pool_slot: super::decode_pool::MmIdSlot,
-    pool_n_experts: u32,
-    pool_rows: u32,
     label: &str,
     // ADR-033 §Pi Phase B Stage 3b.2 — imatrix intercept hint
     // (Layered{tag,layer} for GGML-quant MoE expert tensors, or None
@@ -217,8 +215,8 @@ fn dispatch_moe_id_routed(
         super::decode_pool::with_id_mm_scratch(
             pool_slot,
             device,
-            pool_n_experts,
-            pool_rows,
+            legacy_params.n_experts,
+            legacy_params.n_tokens,
             |scratch| {
                 quantized_matmul_id_ggml_pooled(
                     enc,
@@ -237,9 +235,22 @@ fn dispatch_moe_id_routed(
     }
 }
 
-use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeFfnShape, MoeFfnWeights};
+use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeExpertGeometry, MoeFfnShape, MoeFfnWeights};
 use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32, upload_f32_weight};
 use super::weight_loader::{DenseFfnWeightsNative, DenseFfnWeightsQ};
+
+fn checked_matrix_bytes(
+    rows: usize,
+    columns: usize,
+    element_bytes: usize,
+    label: &str,
+) -> Result<usize> {
+    rows.checked_mul(columns)
+        .and_then(|elements| elements.checked_mul(element_bytes))
+        .ok_or_else(|| {
+            anyhow!("{label} byte count overflows usize: {rows} * {columns} * {element_bytes}")
+        })
+}
 
 // ================================================================
 // GPU weight containers
@@ -2604,12 +2615,22 @@ pub fn build_moe_ffn_layer_gpu_q_into(
     // no layer context (test-only path) passes 0.
     layer_idx: usize,
 ) -> Result<MlxBuffer> {
-    let h = shape.hidden_size as usize;
-    let _ne = shape.num_experts as usize;
-    let topk = shape.num_experts_per_tok as usize;
-    let m_moe = shape.moe_intermediate_size as usize;
-    let seq_len = (x.element_count() / h) as u32;
-    let seq = seq_len as usize;
+    let h = usize::try_from(shape.hidden_size).context("MoE hidden size exceeds usize")?;
+    ensure!(h > 0, "MoE hidden size must be non-zero");
+    ensure!(
+        x.element_count() % h == 0,
+        "MoE input element count {} is not divisible by hidden size {h}",
+        x.element_count()
+    );
+    let expert_geometry =
+        MoeExpertGeometry::checked(x.element_count() / h, shape.num_experts_per_tok)
+            .context("Qwen MoE production expert geometry")?;
+    let seq_len = expert_geometry.source_rows;
+    let seq = usize::try_from(seq_len).context("MoE source rows exceed usize")?;
+    let total_rows =
+        usize::try_from(expert_geometry.routed_rows).context("MoE routed rows exceed usize")?;
+    let m_moe = usize::try_from(shape.moe_intermediate_size)
+        .context("MoE intermediate size exceeds usize")?;
 
     let h32 = shape.hidden_size;
     let ne32 = shape.num_experts;
@@ -2640,25 +2661,29 @@ pub fn build_moe_ffn_layer_gpu_q_into(
     // allocation through the thread-local arena pool.  These buffers' lifetimes
     // are bounded by `build_moe_ffn_layer_gpu_q`; `forward_gpu_greedy`'s
     // top-of-token `reset_decode_pool` recycles them on the next token.
-    let total_rows = seq * topk;
     let _w5b_ffn_alloc = super::wave5b8_profile::Section::start(
         super::wave5b8_profile::SectionKind::FfnAllocScratch,
     );
     let ids_buf = super::decode_pool::pooled_alloc_buffer(
         device,
-        total_rows * DType::U32.size_of(),
+        checked_matrix_bytes(total_rows, 1, DType::U32.size_of(), "MoE ids")?,
         DType::U32,
         vec![total_rows],
     )
     .map_err(|e| anyhow!("alloc ids_buf: {e}"))?;
     let weights_buf = super::decode_pool::pooled_alloc_buffer(
         device,
-        total_rows * DType::F32.size_of(),
+        checked_matrix_bytes(total_rows, 1, DType::F32.size_of(), "MoE route weights")?,
         DType::F32,
         vec![total_rows],
     )
     .map_err(|e| anyhow!("alloc weights_buf: {e}"))?;
-    let gate_all_bytes = total_rows * m_moe * 4;
+    let gate_all_bytes = checked_matrix_bytes(
+        total_rows,
+        m_moe,
+        DType::F32.size_of(),
+        "MoE expert gate output",
+    )?;
     let mut gate_all_buf = super::decode_pool::pooled_alloc_buffer(
         device,
         gate_all_bytes,
@@ -2666,7 +2691,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         vec![total_rows, m_moe],
     )
     .map_err(|e| anyhow!("alloc gate_all: {e}"))?;
-    let up_all_bytes = total_rows * m_moe * 4;
+    let up_all_bytes = gate_all_bytes;
     let mut up_all_buf = super::decode_pool::pooled_alloc_buffer(
         device,
         up_all_bytes,
@@ -2674,15 +2699,28 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         vec![total_rows, m_moe],
     )
     .map_err(|e| anyhow!("alloc up_all: {e}"))?;
-    let n_h_all = (total_rows * m_moe) as u32;
+    let n_h_all = expert_geometry
+        .routed_rows
+        .checked_mul(m_moe32)
+        .ok_or_else(|| {
+            anyhow!(
+                "MoE routed activation count overflows u32: {} * {m_moe32}",
+                expert_geometry.routed_rows
+            )
+        })?;
     let h_all_buf = super::decode_pool::pooled_alloc_buffer(
         device,
-        n_h_all as usize * 4,
+        gate_all_bytes,
         DType::F32,
         vec![total_rows, m_moe],
     )
     .map_err(|e| anyhow!("alloc h_all: {e}"))?;
-    let y_all_bytes = total_rows * h * 4;
+    let y_all_bytes = checked_matrix_bytes(
+        total_rows,
+        h,
+        DType::F32.size_of(),
+        "MoE expert down output",
+    )?;
     let mut y_all_buf = super::decode_pool::pooled_alloc_buffer(
         device,
         y_all_bytes,
@@ -2690,16 +2728,18 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         vec![total_rows, h],
     )
     .map_err(|e| anyhow!("alloc y_all: {e}"))?;
-    let m_sh = m_sh32 as usize;
-    let n_h_s = (seq * m_sh) as u32;
+    let m_sh = usize::try_from(m_sh32).context("MoE shared width exceeds usize")?;
+    let n_h_s = seq_len.checked_mul(m_sh32).ok_or_else(|| {
+        anyhow!("MoE shared activation count overflows u32: {seq_len} * {m_sh32}")
+    })?;
     let h_s_buf = super::decode_pool::pooled_alloc_buffer(
         device,
-        n_h_s as usize * 4,
+        checked_matrix_bytes(seq, m_sh, DType::F32.size_of(), "MoE shared activation")?,
         DType::F32,
         vec![seq, m_sh],
     )
     .map_err(|e| anyhow!("alloc h_s: {e}"))?;
-    let out_bytes = seq * h * 4;
+    let out_bytes = checked_matrix_bytes(seq, h, DType::F32.size_of(), "MoE output")?;
     // ADR-015 iter40 — bug fix: when this `out_buf` becomes the residual stream
     // for the NEXT layer (prefill MoE FFN with add_residual=Some), it must NOT
     // be pool-allocated.  The W-5b.15 per-layer arena reset
@@ -2836,7 +2876,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 &weights_buf,
                 seq_len,
                 ne32,
-                shape.num_experts_per_tok,
+                expert_geometry.gate_up.top_k,
             )
             .map_err(|e| anyhow!("moe_softmax_topk: {e}"))?;
             dispatch_silu_mul(
@@ -2883,8 +2923,8 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         // the legacy code path; see W-5b.18 → W-5b.19a precedent for
         // sister-test deletion alongside gate removal).
         let gate_params = GgmlQuantizedMatmulIdParams {
-            n_tokens: seq_len,
-            top_k: shape.num_experts_per_tok,
+            n_tokens: expert_geometry.gate_up.n_tokens,
+            top_k: expert_geometry.gate_up.top_k,
             n: m_moe32,
             k: h32,
             n_experts: ne32,
@@ -2921,7 +2961,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             )
             && weights.expert_gate_affine.is_none()
             && weights.expert_up_affine.is_none()
-            && (shape.num_experts_per_tok == 1 || shape.num_experts_per_tok == 8);
+            && matches!(expert_geometry.gate_up.top_k, 1 | 8);
         let fused_moe_mm_id_on = fused_moe_mm_id_eligible
             && std::env::var("HF2Q_FUSED_MOE_GATE_UP_MM_ID").as_deref() == Ok("1");
 
@@ -2936,8 +2976,8 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 // serving (no imatrix capture mode interaction).
                 let fused_dispatch_params =
                     mlx_native::ops::quantized_matmul_id_ggml::GgmlIdMmDispatchParams {
-                        n_tokens: seq_len,
-                        top_k: shape.num_experts_per_tok,
+                        n_tokens: expert_geometry.gate_up.n_tokens,
+                        top_k: expert_geometry.gate_up.top_k,
                         n: m_moe32,
                         k: h32,
                         n_experts: ne32,
@@ -2948,7 +2988,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                     super::decode_pool::MmIdSlot::Gate,
                     device,
                     ne32,
-                    seq_len * shape.num_experts_per_tok,
+                    fused_dispatch_params.n_tokens,
                     |scratch| {
                         mlx_native::ops::quantized_matmul_id_ggml::dispatch_id_mm_fused_gate_up_silu_for_test(
                             enc,
@@ -2978,8 +3018,6 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                     &mut gate_all_buf,
                     &gate_params,
                     super::decode_pool::MmIdSlot::Gate,
-                    ne32,
-                    seq_len * shape.num_experts_per_tok,
                     "gate_all",
                     crate::quantize::imatrix::ImatrixHint::Layered {
                         tag: "ffn_gate_exps",
@@ -2997,8 +3035,6 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                     &mut up_all_buf,
                     &up_params,
                     super::decode_pool::MmIdSlot::Up,
-                    ne32,
-                    seq_len * shape.num_experts_per_tok,
                     "up_all",
                     crate::quantize::imatrix::ImatrixHint::Layered {
                         tag: "ffn_up_exps",
@@ -3078,8 +3114,8 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         // the gate/up scratches (different slots), and within this call
         // map0→mm has its own internal barrier inside the dispatch.
         let down_params = GgmlQuantizedMatmulIdParams {
-            n_tokens: total_rows as u32,
-            top_k: 1,
+            n_tokens: expert_geometry.down.n_tokens,
+            top_k: expert_geometry.down.top_k,
             n: h32,
             k: m_moe32,
             n_experts: ne32,
@@ -3103,8 +3139,6 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 &mut y_all_buf,
                 &down_params,
                 super::decode_pool::MmIdSlot::Down,
-                ne32,
-                total_rows as u32,
                 "y_all_decode",
                 crate::quantize::imatrix::ImatrixHint::Layered {
                     tag: "ffn_down_exps",
@@ -3137,7 +3171,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 residual_ref,
                 &mut out_buf,
                 seq_len,
-                shape.num_experts_per_tok,
+                expert_geometry.gate_up.top_k,
                 h32,
                 add_residual.is_some(),
             )
@@ -3187,12 +3221,17 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
     // `build_moe_ffn_layer_gpu_q_into` for full rationale.
     layer_idx: usize,
 ) -> Result<MlxBuffer> {
-    let h = shape.hidden_size as usize;
-    let _ne = shape.num_experts as usize;
-    let topk = shape.num_experts_per_tok as usize;
-    let m_moe = shape.moe_intermediate_size as usize;
-    let seq_len = (x.element_count() / h) as u32;
-    let seq = seq_len as usize;
+    let h = usize::try_from(shape.hidden_size).context("MoE hidden size exceeds usize")?;
+    ensure!(h > 0, "MoE hidden size must be non-zero");
+    ensure!(
+        x.element_count() % h == 0,
+        "MoE input element count {} is not divisible by hidden size {h}",
+        x.element_count()
+    );
+    let expert_geometry =
+        MoeExpertGeometry::checked(x.element_count() / h, shape.num_experts_per_tok)
+            .context("Qwen MoE production expert geometry")?;
+    let seq_len = expert_geometry.source_rows;
 
     let h32 = shape.hidden_size;
     let ne32 = shape.num_experts;
@@ -3204,14 +3243,13 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
         .validate_fits(
             seq_len,
             h32,
-            shape.num_experts_per_tok,
+            expert_geometry.gate_up.top_k,
             m_moe32,
             m_sh32,
             ne32,
         )
         .context("MoeFfnArena shape mismatch")?;
 
-    let total_rows = seq * topk;
     let _w5b_ffn_alloc = super::wave5b8_profile::Section::start(
         super::wave5b8_profile::SectionKind::FfnAllocScratch,
     );
@@ -3223,15 +3261,21 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
     // output buffer ARC while its CB was still in flight.  The ring's
     // persistent ARC retain prevents the drop.  See
     // [`super::MoeFfnOutputRingBuffer`] for the lifetime contract.
-    let _ = h;
-    let _ = topk;
-
     // silu params writes — done once per layer, but they share with the
     // arena's pre-allocated buffer.  Same `n_h_all` value every layer at
     // a given seq_len.
-    let n_h_all = (total_rows * m_moe) as u32;
-    let m_sh = m_sh32 as usize;
-    let n_h_s = (seq * m_sh) as u32;
+    let n_h_all = expert_geometry
+        .routed_rows
+        .checked_mul(m_moe32)
+        .ok_or_else(|| {
+            anyhow!(
+                "MoE routed activation count overflows u32: {} * {m_moe32}",
+                expert_geometry.routed_rows
+            )
+        })?;
+    let n_h_s = seq_len.checked_mul(m_sh32).ok_or_else(|| {
+        anyhow!("MoE shared activation count overflows u32: {seq_len} * {m_sh32}")
+    })?;
     arena
         .silu_params_buf
         .as_mut_slice::<u32>()
@@ -3331,7 +3375,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 &arena.weights_buf,
                 seq_len,
                 ne32,
-                shape.num_experts_per_tok,
+                expert_geometry.gate_up.top_k,
             )
             .map_err(|e| anyhow!("moe_softmax_topk: {e}"))?;
             dispatch_silu_mul(
@@ -3357,8 +3401,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
 
         // ---- Phase C: expert gate+up matmuls + shared down proj ----
         let gate_params = GgmlQuantizedMatmulIdParams {
-            n_tokens: seq_len,
-            top_k: shape.num_experts_per_tok,
+            n_tokens: expert_geometry.gate_up.n_tokens,
+            top_k: expert_geometry.gate_up.top_k,
             n: m_moe32,
             k: h32,
             n_experts: ne32,
@@ -3380,7 +3424,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             )
             && weights.expert_gate_affine.is_none()
             && weights.expert_up_affine.is_none()
-            && (shape.num_experts_per_tok == 1 || shape.num_experts_per_tok == 8);
+            && matches!(expert_geometry.gate_up.top_k, 1 | 8);
         let fused_moe_mm_id_on_pf = fused_moe_mm_id_eligible_pf
             && std::env::var("HF2Q_FUSED_MOE_GATE_UP_MM_ID").as_deref() == Ok("1");
 
@@ -3391,8 +3435,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             if fused_moe_mm_id_on_pf {
                 let fused_dispatch_params =
                     mlx_native::ops::quantized_matmul_id_ggml::GgmlIdMmDispatchParams {
-                        n_tokens: seq_len,
-                        top_k: shape.num_experts_per_tok,
+                        n_tokens: expert_geometry.gate_up.n_tokens,
+                        top_k: expert_geometry.gate_up.top_k,
                         n: m_moe32,
                         k: h32,
                         n_experts: ne32,
@@ -3403,7 +3447,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     super::decode_pool::MmIdSlot::Gate,
                     device,
                     ne32,
-                    seq_len * shape.num_experts_per_tok,
+                    fused_dispatch_params.n_tokens,
                     |scratch| {
                         mlx_native::ops::quantized_matmul_id_ggml::dispatch_id_mm_fused_gate_up_silu_for_test(
                             enc,
@@ -3433,8 +3477,6 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     &mut arena.gate_all_buf,
                     &gate_params,
                     super::decode_pool::MmIdSlot::Gate,
-                    ne32,
-                    seq_len * shape.num_experts_per_tok,
                     "gate_all_pf",
                     crate::quantize::imatrix::ImatrixHint::Layered {
                         tag: "ffn_gate_exps",
@@ -3452,8 +3494,6 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     &mut arena.up_all_buf,
                     &up_params,
                     super::decode_pool::MmIdSlot::Up,
-                    ne32,
-                    seq_len * shape.num_experts_per_tok,
                     "up_all_pf",
                     crate::quantize::imatrix::ImatrixHint::Layered {
                         tag: "ffn_up_exps",
@@ -3512,8 +3552,8 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
 
         // ---- Phase E: y_all = expert_down(h_all) ----
         let down_params = GgmlQuantizedMatmulIdParams {
-            n_tokens: total_rows as u32,
-            top_k: 1,
+            n_tokens: expert_geometry.down.n_tokens,
+            top_k: expert_geometry.down.top_k,
             n: h32,
             k: m_moe32,
             n_experts: ne32,
@@ -3535,8 +3575,6 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 &mut arena.y_all_buf,
                 &down_params,
                 super::decode_pool::MmIdSlot::Down,
-                ne32,
-                total_rows as u32,
                 "y_all_pf",
                 crate::quantize::imatrix::ImatrixHint::Layered {
                     tag: "ffn_down_exps",

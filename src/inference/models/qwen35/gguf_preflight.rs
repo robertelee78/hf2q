@@ -14,6 +14,7 @@ use mlx_native::{
     GgmlRoutingPolicy, GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
 };
 
+use super::ffn::MoeExpertGeometry;
 use super::{Qwen35Config, Qwen35LayerKind, Qwen35Variant};
 
 mod contract;
@@ -382,29 +383,22 @@ fn expert_capability_request(
     execution: ExpertExecution,
     routing: GgmlRoutingPolicy,
 ) -> Result<GgmlCapabilityRequest> {
-    let (n_tokens, top_k, workload) = match execution {
-        ExpertExecution::SharedPerSourceToken => (
-            source_tokens,
-            configured_top_k,
-            workload_for_runtime_rows(source_tokens),
-        ),
-        ExpertExecution::FlattenedRoutedRows => {
-            let n_tokens = source_tokens.checked_mul(configured_top_k).ok_or_else(|| {
-                anyhow!(
-                    "Qwen expert down runtime row count overflows u32: {source_tokens} * {configured_top_k}"
-                )
-            })?;
-            (n_tokens, 1, workload_for_runtime_rows(n_tokens))
-        }
+    let source_rows =
+        usize::try_from(source_tokens).context("Qwen expert source row count exceeds usize")?;
+    let geometry = MoeExpertGeometry::checked(source_rows, configured_top_k)
+        .map_err(|error| anyhow!("Qwen expert production geometry: {error}"))?;
+    let call = match execution {
+        ExpertExecution::SharedPerSourceToken => geometry.gate_up,
+        ExpertExecution::FlattenedRoutedRows => geometry.down,
     };
     Ok(GgmlCapabilityRequest {
         schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
         invocation: GgmlInvocation::ExpertPooled {
             shape: GgmlExpertShape {
-                n_tokens,
+                n_tokens: call.n_tokens,
                 n,
                 k,
-                top_k,
+                top_k: call.top_k,
                 n_experts,
                 expert_stride_bytes,
                 ids_are_distinct_per_token: true,
@@ -413,7 +407,7 @@ fn expert_capability_request(
             input_layout: GgmlExpertInputLayout::SharedPerToken,
         },
         ggml_type,
-        workload,
+        workload: workload_for_runtime_rows(call.n_tokens),
         routing,
     })
 }
