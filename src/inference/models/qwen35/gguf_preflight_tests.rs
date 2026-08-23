@@ -175,6 +175,10 @@ fn production_matrix_preflight_retains_non_power_and_prompt_boundaries() {
     );
     assert_eq!(REQUIRED_MATRIX_WIDTHS[5].1, GgmlWorkloadClass::Prompt);
     assert_eq!(REQUIRED_MATRIX_WIDTHS[7].1, GgmlWorkloadClass::Prompt);
+    let scheduler = include_str!("../../../serve/api/engine.rs");
+    assert!(scheduler.contains("const QWEN35_SLOT_PREFILL_CHUNK_TOKENS: u32 = 2_048;"));
+    assert!(scheduler.contains("const QWEN35_SINGLE_SLOT_PREFILL_CHUNK_CEILING: u32 = 4_096;"));
+    assert_eq!(REQUIRED_EXPERT_SCHEDULER_WIDTHS, [2_048, 4_096]);
 }
 
 #[test]
@@ -187,6 +191,7 @@ fn qwen_expert_down_preflight_matches_flattened_runtime_rows() {
     const Q6_K_BLOCK_BYTES: u64 = 210;
     let expert_stride =
         u64::from(HIDDEN) * u64::from(EXPERT_WIDTH) / Q6_K_BLOCK_VALUES * Q6_K_BLOCK_BYTES;
+    let routing = GgmlRoutingPolicy::default();
 
     let decode = expert_capability_request(
         GgmlType::Q6_K,
@@ -196,8 +201,8 @@ fn qwen_expert_down_preflight_matches_flattened_runtime_rows() {
         EXPERTS,
         expert_stride,
         1,
-        GgmlWorkloadClass::DecodeSingle,
         ExpertExecution::FlattenedRoutedRows,
+        routing,
     )
     .expect("decode down request");
     let GgmlInvocation::ExpertPooled {
@@ -222,25 +227,48 @@ fn qwen_expert_down_preflight_matches_flattened_runtime_rows() {
         Some(mlx_native::GgmlKernelRoute::ExpertMv | mlx_native::GgmlKernelRoute::ExpertMvNr2)
     ));
 
-    let prompt = expert_capability_request(
+    let last_mv = expert_capability_request(
         GgmlType::Q6_K,
         HIDDEN,
         EXPERT_WIDTH,
         TOP_K,
         EXPERTS,
         expert_stride,
-        8,
-        GgmlWorkloadClass::ContinuousWidth,
+        4,
         ExpertExecution::FlattenedRoutedRows,
+        routing,
     )
-    .expect("prompt down request");
-    let GgmlInvocation::ExpertPooled { shape, .. } = prompt.invocation else {
+    .expect("last matvec down request");
+    let GgmlInvocation::ExpertPooled { shape, .. } = last_mv.invocation else {
         panic!("down request must use the pooled expert entry point")
     };
-    assert_eq!(shape.n_tokens, 64);
+    assert_eq!(shape.n_tokens, routing.expert_mm_threshold);
     assert_eq!(shape.top_k, 1);
-    assert_eq!(prompt.workload, GgmlWorkloadClass::Prompt);
-    let prompt_capability = mlx_native::ggml_capability(prompt);
+    let last_mv_capability = mlx_native::ggml_capability(last_mv);
+    assert!(matches!(
+        last_mv_capability.route,
+        Some(mlx_native::GgmlKernelRoute::ExpertMv | mlx_native::GgmlKernelRoute::ExpertMvNr2)
+    ));
+
+    let first_mm = expert_capability_request(
+        GgmlType::Q6_K,
+        HIDDEN,
+        EXPERT_WIDTH,
+        TOP_K,
+        EXPERTS,
+        expert_stride,
+        5,
+        ExpertExecution::FlattenedRoutedRows,
+        routing,
+    )
+    .expect("first mm_id down request");
+    let GgmlInvocation::ExpertPooled { shape, .. } = first_mm.invocation else {
+        panic!("down request must use the pooled expert entry point")
+    };
+    assert_eq!(shape.n_tokens, 40);
+    assert_eq!(shape.top_k, 1);
+    assert_eq!(first_mm.workload, GgmlWorkloadClass::Prompt);
+    let prompt_capability = mlx_native::ggml_capability(first_mm);
     assert!(
         prompt_capability.executable,
         "flattened prompt rows must use the supported mm_id route: {}",
@@ -274,6 +302,112 @@ fn qwen_expert_down_preflight_matches_flattened_runtime_rows() {
 }
 
 #[test]
+fn qwen_expert_gate_up_proves_q5_k_exact_mv_to_mm_boundary() {
+    let routing = GgmlRoutingPolicy::default();
+    assert_eq!(routing.expert_mm_threshold, 32);
+    let expert_stride = 720_896;
+    for (source_tokens, expected_mm) in [(32, false), (33, true)] {
+        let request = expert_capability_request(
+            GgmlType::Q5_K,
+            512,
+            2_048,
+            8,
+            256,
+            expert_stride,
+            source_tokens,
+            ExpertExecution::SharedPerSourceToken,
+            routing,
+        )
+        .expect("Q5_K gate/up request");
+        let capability = mlx_native::ggml_capability(request);
+        assert!(capability.executable, "{}", capability.diagnostic);
+        let mm_route = matches!(
+            capability.route,
+            Some(
+                mlx_native::GgmlKernelRoute::ExpertPooledMmSimdgroup
+                    | mlx_native::GgmlKernelRoute::ExpertPooledMmDeviceSelected
+            )
+        );
+        assert_eq!(
+            mm_route, expected_mm,
+            "source M={source_tokens} must respect strict > threshold routing"
+        );
+    }
+}
+
+#[test]
+fn qwen_expert_widths_follow_active_policy_and_scheduler_maxima() {
+    let default = GgmlRoutingPolicy::default();
+    let gate_up = required_expert_source_widths(ExpertExecution::SharedPerSourceToken, 8, default)
+        .expect("default gate/up widths");
+    for width in [31, 32, 33, 2_048, 4_096] {
+        assert!(gate_up.contains(&width), "missing gate/up M={width}");
+    }
+    let down = required_expert_source_widths(ExpertExecution::FlattenedRoutedRows, 8, default)
+        .expect("default down widths");
+    for width in [4, 5, 2_048, 4_096] {
+        assert!(down.contains(&width), "missing down source M={width}");
+    }
+
+    let overridden = GgmlRoutingPolicy {
+        expert_mm_threshold: 77,
+        ..default
+    };
+    let gate_up =
+        required_expert_source_widths(ExpertExecution::SharedPerSourceToken, 8, overridden)
+            .expect("overridden gate/up widths");
+    for width in [76, 77, 78] {
+        assert!(gate_up.contains(&width), "missing overridden M={width}");
+    }
+    assert!(!gate_up.contains(&33));
+    let down = required_expert_source_widths(ExpertExecution::FlattenedRoutedRows, 8, overridden)
+        .expect("overridden down widths");
+    assert!(down.contains(&9));
+    assert!(down.contains(&10));
+
+    let force_mv = GgmlRoutingPolicy {
+        expert_mm_threshold: u32::MAX,
+        ..default
+    };
+    for execution in [
+        ExpertExecution::SharedPerSourceToken,
+        ExpertExecution::FlattenedRoutedRows,
+    ] {
+        let widths = required_expert_source_widths(execution, 8, force_mv)
+            .expect("force-MV widths must remain representable");
+        assert_eq!(widths.last(), Some(&4_096));
+        assert!(widths.iter().all(|width| *width <= 4_096));
+        for source_tokens in widths {
+            let request = expert_capability_request(
+                GgmlType::Q5_K,
+                512,
+                2_048,
+                8,
+                256,
+                720_896,
+                source_tokens,
+                execution,
+                force_mv,
+            )
+            .expect("force-MV request geometry");
+            let capability = mlx_native::ggml_capability(request);
+            assert!(
+                capability.executable,
+                "force-MV source M={source_tokens} rejected: {}",
+                capability.diagnostic
+            );
+            assert!(matches!(
+                capability.route,
+                Some(
+                    mlx_native::GgmlKernelRoute::ExpertMv
+                        | mlx_native::GgmlKernelRoute::ExpertMvNr2
+                )
+            ));
+        }
+    }
+}
+
+#[test]
 fn qwen_expert_down_preflight_keeps_slotted_and_overflow_canaries_closed() {
     let mut slotted = expert_capability_request(
         GgmlType::Q6_K,
@@ -283,8 +417,8 @@ fn qwen_expert_down_preflight_keeps_slotted_and_overflow_canaries_closed() {
         256,
         860_160,
         1,
-        GgmlWorkloadClass::DecodeSingle,
         ExpertExecution::FlattenedRoutedRows,
+        GgmlRoutingPolicy::default(),
     )
     .expect("decode down request");
     let GgmlInvocation::ExpertPooled { input_layout, .. } = &mut slotted.invocation else {
@@ -309,8 +443,8 @@ fn qwen_expert_down_preflight_keeps_slotted_and_overflow_canaries_closed() {
         256,
         860_160,
         u32::MAX,
-        GgmlWorkloadClass::Prompt,
         ExpertExecution::FlattenedRoutedRows,
+        GgmlRoutingPolicy::default(),
     )
     .expect_err("flattened routed-row overflow must fail before capability evaluation");
     assert!(error.to_string().contains("row count overflows u32"));
