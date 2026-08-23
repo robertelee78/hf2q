@@ -25,6 +25,7 @@ pub mod inference;
 pub mod input;
 pub mod intelligence;
 pub mod ir;
+mod model_spec;
 pub mod models;
 pub mod progress;
 pub mod quantize;
@@ -512,16 +513,13 @@ fn cmd_convert(
     operator_config: Option<&setup::OperatorConfigV2>,
 ) -> Result<(), AppError> {
     use crate::convert::{
-        run_convert, ConvertArgs, ConvertError, ConvertMode, QuantSelector, RemoteConversionSource,
+        run_convert, ConvertArgs, ConvertError, ConvertMode, RemoteConversionSource,
     };
 
     // QuantSelector parses both standard ftypes (`q5_k_m`, `q8_0`, ...)
     // and Apex tiers (`apex-balanced`, `apex-i-quality`, ...). Reserved
     // names (`dwq`, bare `apex`, `tq1_0`, `tq2_0`) surface as typed
     // errors per ADR §6 reserved-name stubs.
-    let quant = resolve_convert_quant(args.quant.as_deref(), operator_config)?;
-    let selector =
-        QuantSelector::from_name(quant).map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
     let source_repo = args.source_repo.clone();
     let source_revision = args.source_revision.clone();
 
@@ -532,9 +530,50 @@ fn cmd_convert(
     // survives any future plumbing change that bypasses clap.
     let input = classify_convert_input(args.hf_dir, args.repo, args.revision.as_deref())
         .map_err(|error| AppError::Input(anyhow::anyhow!("{error}")))?;
+    let operand_quant = match &input {
+        ConvertInput::Local(_) => None,
+        ConvertInput::Remote { operand_quant, .. } => operand_quant.as_deref(),
+    };
+    let selector = resolve_convert_selector(args.quant.as_deref(), operand_quant, operator_config)?;
+    let quant_name = selector.receipt_name();
+    let implicit_output = args.output.is_none();
+    if source_repo.is_none() {
+        if let ConvertInput::Remote { reference, .. } = &input {
+            let (expected_output, resolved_revision) =
+                remote_conversion_output_for_noop(reference, &quant_name, args.output.as_deref())
+                    .map_err(AppError::Conversion)?;
+            if verified_conversion_identity_matches(
+                &expected_output,
+                reference.repo_id(),
+                &resolved_revision,
+                &quant_name,
+            )
+            .map_err(AppError::Conversion)?
+                && existing_conversion_mode_complete(
+                    &expected_output,
+                    args.text_only,
+                    args.mmproj,
+                    args.mmproj_output.as_deref(),
+                )
+                .map_err(AppError::Conversion)?
+            {
+                println!(
+                    "Using existing verified hf2q conversion: {}",
+                    expected_output.display()
+                );
+                return Ok(());
+            }
+            if implicit_output && expected_output.exists() {
+                return Err(AppError::Input(anyhow::anyhow!(
+                    "managed conversion destination already exists without a matching verified hf2q receipt: {}",
+                    expected_output.display()
+                )));
+            }
+        }
+    }
     let (hf_dir, mut remote_source) = match input {
         ConvertInput::Local(path) => (path, None),
-        ConvertInput::Remote(reference) => {
+        ConvertInput::Remote { reference, .. } => {
             let progress = crate::progress::ProgressReporter::new();
             let downloaded =
                 crate::input::hf_download::download_model_reference(reference, &progress)
@@ -578,6 +617,74 @@ fn cmd_convert(
         );
     }
 
+    let output = match remote_source.as_ref() {
+        Some(source) => {
+            let reference = source.reference();
+            let default = crate::model_spec::default_convert_output(
+                &crate::model_spec::managed_model_root().map_err(AppError::Input)?,
+                reference.repo_id(),
+                reference.revision(),
+                &quant_name,
+            )
+            .map_err(AppError::Input)?;
+            crate::model_spec::resolve_output_path(args.output.as_deref(), default)
+                .map_err(AppError::Input)?
+        }
+        None => {
+            let explicit = args.output.ok_or_else(|| {
+                AppError::Input(anyhow::anyhow!(
+                    "convert of a local source directory requires --output FILE_OR_DIR"
+                ))
+            })?;
+            if explicit.is_dir() {
+                let source_name = hf_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        AppError::Input(anyhow::anyhow!(
+                            "local source directory has no UTF-8 model name"
+                        ))
+                    })?;
+                explicit.join(format!(
+                    "{source_name}-hf2q-{}.gguf",
+                    quant_name.to_ascii_lowercase()
+                ))
+            } else {
+                explicit
+            }
+        }
+    };
+
+    if let Some(source) = remote_source.as_ref() {
+        if verified_conversion_identity_matches(
+            &output,
+            source.reference().repo_id(),
+            source.reference().revision(),
+            &quant_name,
+        )
+        .map_err(AppError::Conversion)?
+            && existing_conversion_mode_complete(
+                &output,
+                args.text_only,
+                args.mmproj,
+                args.mmproj_output.as_deref(),
+            )
+            .map_err(AppError::Conversion)?
+        {
+            println!(
+                "Using existing verified hf2q conversion: {}",
+                output.display()
+            );
+            return Ok(());
+        }
+        if implicit_output && output.exists() {
+            return Err(AppError::Input(anyhow::anyhow!(
+                "managed conversion destination already exists without a matching verified hf2q receipt: {}",
+                output.display()
+            )));
+        }
+    }
+
     let mode = if args.mmproj {
         ConvertMode::ProjectorOnly
     } else if args.text_only {
@@ -590,7 +697,7 @@ fn cmd_convert(
     let resolved = ConvertArgs {
         hf_dir,
         selector,
-        output: args.output,
+        output,
         dry_run: args.dry_run,
         imatrix: args.imatrix,
         imatrix_corpus: args.imatrix_corpus,
@@ -627,23 +734,49 @@ fn cmd_convert(
     })
 }
 
-fn resolve_convert_quant<'a>(
-    explicit: Option<&'a str>,
-    operator_config: Option<&'a setup::OperatorConfigV2>,
-) -> Result<&'a str, AppError> {
-    explicit
-        .or_else(|| operator_config.map(|config| config.convert.quant.as_str()))
-        .ok_or_else(|| {
-            AppError::Input(anyhow::anyhow!(
-                "convert requires --quant unless a default was recorded by `hf2q setup`"
-            ))
-        })
+fn resolve_convert_selector(
+    explicit: Option<&str>,
+    operand: Option<&str>,
+    operator_config: Option<&setup::OperatorConfigV2>,
+) -> Result<crate::convert::QuantSelector, AppError> {
+    let parse = |name: &str| {
+        crate::convert::QuantSelector::from_name(name)
+            .or_else(|_| crate::convert::QuantSelector::from_name(&name.to_ascii_lowercase()))
+            .map_err(|error| AppError::Input(anyhow::anyhow!("{error}")))
+    };
+    let explicit = explicit.map(parse).transpose()?;
+    let operand = operand.map(parse).transpose()?;
+    if let (Some(flag), Some(suffix)) = (&explicit, &operand) {
+        if flag != suffix {
+            return Err(AppError::Input(anyhow::anyhow!(
+                "model quant suffix {} conflicts with --quant {}",
+                suffix.receipt_name(),
+                flag.receipt_name()
+            )));
+        }
+    }
+    if let Some(selected) = explicit.or(operand) {
+        return Ok(selected);
+    }
+    if let Some(config) = operator_config {
+        return parse(&config.convert.quant);
+    }
+    let hardware = crate::core::hardware::HardwareProfiler::detect()
+        .map_err(|error| AppError::Conversion(anyhow::anyhow!("detect hardware: {error}")))?;
+    let quant = crate::serve::quant_select::select_quant(
+        &crate::serve::quant_select::GpuInfo::from_hardware_profile(&hardware),
+    )
+    .map_err(AppError::Input)?;
+    parse(quant.as_str())
 }
 
 #[derive(Debug)]
 enum ConvertInput {
     Local(PathBuf),
-    Remote(crate::input::hf_reference::HfModelReference),
+    Remote {
+        reference: crate::input::hf_reference::HfModelReference,
+        operand_quant: Option<String>,
+    },
 }
 
 fn classify_convert_input(
@@ -654,9 +787,15 @@ fn classify_convert_input(
     match (positional, repo) {
         (Some(_), Some(_)) => Err(crate::convert::ConvertError::RepoAndDirMutuallyExclusive),
         (None, None) => Err(crate::convert::ConvertError::MissingInput),
-        (None, Some(reference)) => Ok(ConvertInput::Remote(
-            crate::input::hf_reference::HfModelReference::parse(&reference, revision)?,
-        )),
+        (None, Some(raw)) => {
+            let (reference, quant) = crate::model_spec::split_repository_quant_suffix(&raw);
+            Ok(ConvertInput::Remote {
+                reference: crate::input::hf_reference::HfModelReference::parse(
+                    reference, revision,
+                )?,
+                operand_quant: quant.map(str::to_owned),
+            })
+        }
         (Some(path), None) if is_explicit_local_path(&path) => {
             if revision.is_some() {
                 Err(crate::convert::ConvertError::RevisionRequiresRemote)
@@ -672,11 +811,191 @@ fn classify_convert_input(
                     },
                 )
             })?;
-            Ok(ConvertInput::Remote(
-                crate::input::hf_reference::HfModelReference::parse(input, revision)?,
-            ))
+            let (reference, quant) = crate::model_spec::split_repository_quant_suffix(input);
+            Ok(ConvertInput::Remote {
+                reference: crate::input::hf_reference::HfModelReference::parse(
+                    reference, revision,
+                )?,
+                operand_quant: quant.map(str::to_owned),
+            })
         }
     }
+}
+
+fn verified_conversion_identity_matches(
+    output: &std::path::Path,
+    repository: &str,
+    revision: &str,
+    quant_name: &str,
+) -> anyhow::Result<bool> {
+    use crate::convert::receipt::{
+        receipt_path, ConversionReceipt, CONVERSION_RECEIPT_SCHEMA_VERSION,
+    };
+
+    let metadata = match std::fs::symlink_metadata(output) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let receipt_path = receipt_path(output);
+    let receipt_metadata = match std::fs::symlink_metadata(&receipt_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if receipt_metadata.len() > 1024 * 1024 {
+        return Ok(false);
+    }
+    let receipt: ConversionReceipt = serde_json::from_slice(&std::fs::read(&receipt_path)?)?;
+    if receipt.schema_version != CONVERSION_RECEIPT_SCHEMA_VERSION
+        || receipt.converter.package != "hf2q"
+        || receipt.source.repository_id != repository
+        || !receipt.source.revision.eq_ignore_ascii_case(revision)
+        || receipt.quant_selector.to_ascii_lowercase() != quant_name.to_ascii_lowercase()
+        || receipt.output.size != metadata.len()
+    {
+        return Ok(false);
+    }
+    Ok(crate::core::sha256::compute_file_sha256(output)?
+        .eq_ignore_ascii_case(&receipt.output.sha256))
+}
+
+fn remote_conversion_output_for_noop(
+    reference: &crate::input::hf_reference::HfModelReference,
+    quant_name: &str,
+    explicit_output: Option<&std::path::Path>,
+) -> anyhow::Result<(PathBuf, String)> {
+    let revision = match reference.requested_revision() {
+        Some(requested)
+            if requested.len() == 40 && requested.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            requested.to_ascii_lowercase()
+        }
+        _ => crate::input::hf_download::resolve_model_reference(reference.clone())?
+            .reference()
+            .revision()
+            .to_owned(),
+    };
+    let default = crate::model_spec::default_convert_output(
+        &crate::model_spec::managed_model_root()?,
+        reference.repo_id(),
+        &revision,
+        quant_name,
+    )?;
+    Ok((
+        crate::model_spec::resolve_output_path(explicit_output, default)?,
+        revision,
+    ))
+}
+
+fn existing_conversion_mode_complete(
+    text_output: &std::path::Path,
+    text_only: bool,
+    projector_only: bool,
+    projector_override: Option<&std::path::Path>,
+) -> anyhow::Result<bool> {
+    if projector_only {
+        return Ok(false);
+    }
+    if text_only {
+        return Ok(true);
+    }
+    if !crate::serve::managed_artifacts::text_requires_projector(text_output)? {
+        return Ok(projector_override.is_none());
+    }
+    let text_receipt = match read_conversion_receipt_for_verified_output(text_output)? {
+        Some(receipt) => receipt,
+        None => return Ok(false),
+    };
+    let projector = match projector_override {
+        Some(path) => path.to_path_buf(),
+        None => default_conversion_projector_output(text_output)?,
+    };
+    let (projector_receipt, projector_sha256) = match read_verified_conversion_receipt(&projector)?
+    {
+        Some(receipt) => receipt,
+        None => return Ok(false),
+    };
+    if projector_receipt.source.repository_id != text_receipt.source.repository_id
+        || projector_receipt.source.revision != text_receipt.source.revision
+        || !projector_receipt
+            .quant_selector
+            .eq_ignore_ascii_case("f16-mmproj")
+    {
+        return Ok(false);
+    }
+    let guard = match crate::core::paired_artifact::PairReadGuard::acquire_read_only(
+        text_output,
+        &projector,
+    ) {
+        Ok(guard) => guard,
+        Err(_) => return Ok(false),
+    };
+    let text = mlx_native::gguf::GgufFile::open(text_output)?;
+    let projector_gguf = mlx_native::gguf::GgufFile::open(&projector)?;
+    Ok(guard
+        .validate(&text, &projector_gguf, &projector_sha256)
+        .is_ok())
+}
+
+fn read_verified_conversion_receipt(
+    output: &std::path::Path,
+) -> anyhow::Result<Option<(crate::convert::receipt::ConversionReceipt, String)>> {
+    let Some(receipt) = read_conversion_receipt_for_verified_output(output)? else {
+        return Ok(None);
+    };
+    let sha256 = crate::core::sha256::compute_file_sha256(output)?;
+    if !sha256.eq_ignore_ascii_case(&receipt.output.sha256) {
+        return Ok(None);
+    }
+    Ok(Some((receipt, sha256)))
+}
+
+fn read_conversion_receipt_for_verified_output(
+    output: &std::path::Path,
+) -> anyhow::Result<Option<crate::convert::receipt::ConversionReceipt>> {
+    use crate::convert::receipt::{
+        receipt_path, ConversionReceipt, CONVERSION_RECEIPT_SCHEMA_VERSION,
+    };
+
+    let metadata = match std::fs::symlink_metadata(output) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        _ => return Ok(None),
+    };
+    let receipt_path = receipt_path(output);
+    let receipt_metadata = match std::fs::symlink_metadata(&receipt_path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() <= 1024 * 1024 =>
+        {
+            metadata
+        }
+        _ => return Ok(None),
+    };
+    let _ = receipt_metadata;
+    let receipt: ConversionReceipt = serde_json::from_slice(&std::fs::read(receipt_path)?)?;
+    if receipt.schema_version != CONVERSION_RECEIPT_SCHEMA_VERSION
+        || receipt.converter.package != "hf2q"
+        || receipt.output.size != metadata.len()
+    {
+        return Ok(None);
+    }
+    Ok(Some(receipt))
+}
+
+fn default_conversion_projector_output(text_output: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let file_name = text_output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("text conversion output must have a UTF-8 filename")?;
+    let stem = file_name
+        .strip_suffix(".gguf")
+        .or_else(|| file_name.strip_suffix(".GGUF"))
+        .context("automatic paired conversion output must end in .gguf")?;
+    Ok(text_output.with_file_name(format!("{stem}-mmproj.gguf")))
 }
 
 fn is_explicit_local_path(path: &std::path::Path) -> bool {
@@ -795,11 +1114,26 @@ mod tests {
         ] {
             let classified =
                 classify_convert_input(Some(PathBuf::from(remote)), None, None).unwrap();
-            let ConvertInput::Remote(reference) = classified else {
+            let ConvertInput::Remote { reference, .. } = classified else {
                 panic!("expected remote reference");
             };
             assert_eq!(reference.repo_id(), "Qwen/Qwen3.8-27B");
         }
+    }
+
+    #[test]
+    fn convert_source_classifier_extracts_exact_quant_suffix() {
+        let classified =
+            classify_convert_input(Some(PathBuf::from("owner/model:Q8_0")), None, None).unwrap();
+        let ConvertInput::Remote {
+            reference,
+            operand_quant,
+        } = classified
+        else {
+            panic!("expected remote reference");
+        };
+        assert_eq!(reference.repo_id(), "owner/model");
+        assert_eq!(operand_quant.as_deref(), Some("Q8_0"));
     }
 
     #[test]
@@ -812,7 +1146,7 @@ mod tests {
             Some("main"),
         )
         .unwrap();
-        assert!(matches!(classified, ConvertInput::Remote(_)));
+        assert!(matches!(classified, ConvertInput::Remote { .. }));
         assert!(classify_convert_input(
             Some(PathBuf::from(
                 "https://huggingface.co/Qwen/Qwen3.8-27B/tree/main",
@@ -832,17 +1166,47 @@ mod tests {
     }
 
     #[test]
-    fn convert_config_quant_is_used_and_explicit_quant_wins() {
+    fn convert_quant_suffix_flag_config_and_conflict_are_deterministic() {
         let config = setup::OperatorConfigV2::guide_defaults().unwrap();
         assert_eq!(
-            resolve_convert_quant(None, Some(&config)).unwrap(),
+            resolve_convert_selector(None, None, Some(&config))
+                .unwrap()
+                .receipt_name(),
             "q4_k_m"
         );
         assert_eq!(
-            resolve_convert_quant(Some("q5_k_m"), Some(&config)).unwrap(),
+            resolve_convert_selector(Some("q5_k_m"), Some("Q5_K_M"), Some(&config))
+                .unwrap()
+                .receipt_name(),
             "q5_k_m"
         );
-        assert!(resolve_convert_quant(None, None).is_err());
+        assert!(resolve_convert_selector(Some("q5_k_m"), Some("Q8_0"), Some(&config)).is_err());
+    }
+
+    #[test]
+    fn convert_noop_uses_exact_revision_without_network_resolution() {
+        let reference = crate::input::hf_reference::HfModelReference::parse(
+            "owner/model",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (output, revision) =
+            remote_conversion_output_for_noop(&reference, "q6_k", Some(directory.path())).unwrap();
+        assert_eq!(revision, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(output, directory.path().join("model-hf2q-q6_k.gguf"));
+    }
+
+    #[test]
+    fn convert_default_projector_output_is_a_stable_sibling() {
+        assert_eq!(
+            default_conversion_projector_output(std::path::Path::new("/models/model-q6_k.gguf"))
+                .unwrap(),
+            PathBuf::from("/models/model-q6_k-mmproj.gguf")
+        );
+        assert!(
+            default_conversion_projector_output(std::path::Path::new("/models/model.bin")).is_err()
+        );
     }
 
     #[test]

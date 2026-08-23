@@ -33,14 +33,14 @@ Metal kernels we own end-to-end.
 | **Status** | hf2q 0.1.14 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.14` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
-# Convert a HuggingFace model to a Q4_K_M GGUF (auto-downloads via --repo)
-hf2q convert \
-  --repo google/gemma-4-26b-it \
-  --quant q4_k_m \
-  --output models/gemma-4-26b-it-q4_k_m/out.gguf
+curl -fsSL https://hf2q.us/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+hf2q setup
+hf2q doctor
 
-# Serve it over an OpenAI-compatible HTTP API
-hf2q serve --model models/gemma-4-26b-it-q4_k_m/out.gguf --port 8080
+# Reuse an exact local Q4_K_M when present; otherwise download and verify it,
+# start an owned local server, and open chat.
+hf2q chat jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M
 ```
 
 ---
@@ -201,12 +201,12 @@ paths, lifecycle cleanup, overrides, and troubleshooting.
 | `hf2q setup` | Learn the Apple-Silicon host and record defaults consumed by `convert` and `serve`. |
 | `hf2q update` | Check or update through the detected standalone or Cargo channel; source checkouts receive non-mutating instructions. Standalone `--rollback` restores one retained version. |
 | `hf2q uninstall` | Preview or remove channel-owned release files while preserving configuration, caches, and models unless explicit purge flags are confirmed. |
-| `hf2q convert` | HuggingFace safetensors → GGUF (streaming convert, ADR-033 unified pipeline). |
+| `hf2q convert` | HuggingFace safetensors → GGUF; `repo[:quant]` derives hardware defaults and a managed output. |
 | `hf2q gguf-patch` | Rewrite a GGUF's metadata in place (e.g. inject a chat template). |
 | `hf2q info` | Preview static GGUF serving support and the resolved context/memory plan without loading tensor data or Metal. |
 | `hf2q generate` | Single-shot text generation from a GGUF on the local GPU. |
-| `hf2q chat` | Minimal diagnostic terminal chat over an OpenAI-compatible server. |
-| `hf2q serve` | OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/embeddings`). |
+| `hf2q chat` | Minimal diagnostic terminal chat; a model operand prepares and starts its owned local server. |
+| `hf2q serve` | Local-first `repo[:quant]` preparation plus an OpenAI-compatible HTTP API. |
 | `hf2q parity` | ADR-009 parity validation against locked reference outputs. |
 | `hf2q smoke` | ADR-012 end-gate smoke test for a registered architecture. |
 | `hf2q cache` | Manage `~/.cache/hf2q/` (list / size / clear). |
@@ -272,6 +272,46 @@ Reserved names surface as typed errors with actionable hints:
 `--quant tq1_0`/`tq2_0` → "recognized ftype but out of v1 scope".
 
 ## Quick start: convert + serve a model
+
+For a repository that already publishes a supported GGUF, conversion is not
+required. These commands share one local-first resolver:
+
+```bash
+# Show receipt-backed, managed, cached, and loose local GGUF options.
+hf2q serve list                    # `hf2q chat list` is identical
+
+# Exact quant: reuse verified local bytes, adopt an exact manual download, or
+# download that hosted quant into the managed XDG data directory.
+hf2q serve owner/repository:Q4_K_M
+
+# No quant: use the most recently used compatible local artifact. With no
+# local candidate, choose the setup/live hardware recommendation and nearest
+# lower hosted tier. Native source conversion is the final fallback only when
+# the repository has no supported hosted GGUF.
+hf2q serve owner/repository
+
+# Chat uses the same preparation path and owns the server it starts.
+hf2q chat owner/repository:Q4_K_M
+```
+
+For supported multimodal text GGUFs, serve automatically uses an exact bound
+local projector or downloads the one unambiguous matching hosted `mmproj`.
+If no valid companion exists it warns and serves text-only; an explicit
+`--mmproj` remains fail-closed.
+An explicit local text-GGUF path likewise reuses a valid managed/receipt-bound,
+digest-bound, or unambiguous present sibling projector without Hub access.
+
+When you specifically need an hf2q-produced conversion, the remote form can
+derive both quant and revision-bound output from setup and hardware:
+
+```bash
+hf2q convert owner/repository
+hf2q convert owner/repository:Q8_0
+```
+
+Hosted GGUF bytes never satisfy `convert`; it always runs the Rust-native
+source conversion path. A matching schema-v3 hf2q conversion receipt makes a
+repeat invocation an integrity-verified no-op.
 
 The `hf2q convert` pipeline reads a Hugging Face model directory
 (`config.json` + safetensors + tokenizer assets) and emits a text GGUF that

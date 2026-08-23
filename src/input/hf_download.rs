@@ -473,14 +473,35 @@ pub fn download_hub_gguf(artifact: &HubGgufArtifact) -> Result<PathBuf, Download
             reason: format!("GGUF artifact `{}` is not selectable", artifact.filename),
         });
     }
+    download_hub_artifact(artifact, "text_model")
+}
+
+/// Download and authenticate one projector companion returned by the exact
+/// hosted catalog. Companions are deliberately not `selectable` text models,
+/// so they require this role-specific entry point.
+pub fn download_hub_companion(artifact: &HubGgufArtifact) -> Result<PathBuf, DownloadError> {
+    if artifact.role != "companion" || artifact.selectable {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "GGUF artifact `{}` is not a projector companion",
+                artifact.filename
+            ),
+        });
+    }
+    download_hub_artifact(artifact, "companion")
+}
+
+fn download_hub_artifact(
+    artifact: &HubGgufArtifact,
+    expected_role: &str,
+) -> Result<PathBuf, DownloadError> {
     validate_repo_filename(&artifact.filename)?;
-    if !hosted_gguf_identity_valid(artifact) {
+    if !hosted_gguf_identity_valid_for_role(artifact, expected_role) {
         return Err(DownloadError::InvalidRepositoryInventory {
             reason: "hosted GGUF identity is incomplete or malformed".to_owned(),
         });
     }
     let cache_dir = resolve_hf_cache_dir();
-    check_artifact_disk_preflight(&artifact.repository, &cache_dir, artifact.bytes)?;
     let api = build_hub_api(&cache_dir, false)?;
     let repo = api.repo(hf_hub::Repo::with_revision(
         artifact.repository.clone(),
@@ -499,16 +520,31 @@ pub fn download_hub_gguf(artifact: &HubGgufArtifact) -> Result<PathBuf, Download
             ),
         });
     }
+    if let Some(path) = cached_hub_artifact_path(&cache_dir, artifact) {
+        verify_shard(&artifact.repository, &artifact.revision, &path, &record)?;
+        return Ok(path);
+    }
+    check_artifact_disk_preflight(&artifact.repository, &cache_dir, artifact.bytes)?;
     let path = download_file(&repo, &artifact.repository, &artifact.filename)?;
     verify_shard(&artifact.repository, &artifact.revision, &path, &record)?;
     Ok(path)
 }
 
-fn hosted_gguf_identity_valid(artifact: &HubGgufArtifact) -> bool {
+fn cached_hub_artifact_path(cache_dir: &Path, artifact: &HubGgufArtifact) -> Option<PathBuf> {
+    let cache = hf_hub::Cache::new(cache_dir.to_path_buf());
+    let repo = cache.repo(hf_hub::Repo::with_revision(
+        artifact.repository.clone(),
+        hf_hub::RepoType::Model,
+        artifact.revision.clone(),
+    ));
+    let path = repo.get(&artifact.filename)?;
+    let metadata = path.metadata().ok()?;
+    (metadata.is_file() && metadata.len() == artifact.bytes).then_some(path)
+}
+
+fn hosted_gguf_identity_valid_for_role(artifact: &HubGgufArtifact, expected_role: &str) -> bool {
     let (inferred_role, inferred_quant, unavailable_reason) = classify_hub_gguf(&artifact.filename);
     artifact.filename.to_ascii_lowercase().ends_with(".gguf")
-        && artifact.selectable
-        && artifact.unavailable_reason.is_none()
         && artifact.bytes > 0
         && artifact.revision.len() == 40
         && artifact
@@ -517,10 +553,76 @@ fn hosted_gguf_identity_valid(artifact: &HubGgufArtifact) -> bool {
             .all(|byte| byte.is_ascii_hexdigit())
         && artifact.sha256.len() == 64
         && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && inferred_role == "text_model"
-        && unavailable_reason.is_none()
+        && inferred_role == expected_role
         && inferred_quant == artifact.quant_hint
         && artifact.role == inferred_role
+        && match expected_role {
+            "text_model" => {
+                artifact.selectable
+                    && artifact.unavailable_reason.is_none()
+                    && unavailable_reason.is_none()
+            }
+            "companion" => {
+                !artifact.selectable
+                    && artifact.quant_hint.is_none()
+                    && artifact.unavailable_reason.is_some()
+            }
+            _ => false,
+        }
+}
+
+/// Exact-byte disk preflight for materializing a hosted artifact outside the
+/// hf-hub cache (for example into the canonical XDG data directory).
+pub fn check_hub_artifact_destination(
+    repo_id: &str,
+    destination: &Path,
+    artifact_bytes: u64,
+) -> Result<(), DownloadError> {
+    check_artifact_disk_preflight(repo_id, destination, artifact_bytes)
+}
+
+/// Preflight the complete hosted-artifact plan before payload transfer.
+/// The Hub cache always needs room for uncached bytes. The managed destination
+/// needs a second full copy only when it is on another filesystem; same-volume
+/// materialization is a hard link and consumes no second model-sized extent.
+pub fn check_hub_artifact_plan(
+    artifact: &HubGgufArtifact,
+    destination: &Path,
+) -> Result<(), DownloadError> {
+    let cache_dir = resolve_hf_cache_dir();
+    if cached_hub_artifact_path(&cache_dir, artifact).is_none() {
+        check_artifact_disk_preflight(&artifact.repository, &cache_dir, artifact.bytes)?;
+    }
+    if !same_filesystem(&cache_dir, destination) {
+        check_artifact_disk_preflight(&artifact.repository, destination, artifact.bytes)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_filesystem(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    existing_ancestor(left)
+        .and_then(|left| left.metadata().ok())
+        .zip(existing_ancestor(right).and_then(|right| right.metadata().ok()))
+        .is_some_and(|(left, right)| left.dev() == right.dev())
+}
+
+#[cfg(not(unix))]
+fn same_filesystem(_left: &Path, _right: &Path) -> bool {
+    false
+}
+
+fn existing_ancestor(path: &Path) -> Option<&Path> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
 }
 
 fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<String>) {
@@ -566,7 +668,7 @@ fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<St
 }
 
 fn infer_filename_quant(stem: &str) -> Option<String> {
-    ["q3_k_m", "q4_k_m", "q5_k_m", "q6_k", "q8_0", "bf16"]
+    ["q2_k", "q3_k_m", "q4_k_m", "q5_k_m", "q6_k", "q8_0", "bf16"]
         .into_iter()
         .find(|quant| stem.ends_with(quant))
         .map(|quant| quant.to_ascii_uppercase())
@@ -1436,6 +1538,7 @@ mod tests {
     #[test]
     fn mixed_repository_ggufs_are_classified_without_source_fallback() {
         for (filename, quant) in [
+            ("gguf/model-q2_k.gguf", "Q2_K"),
             ("gguf/model-q3_k_m.gguf", "Q3_K_M"),
             ("gguf/model-q4_k_m.gguf", "Q4_K_M"),
             ("gguf/model-q5_k_m.gguf", "Q5_K_M"),
@@ -1455,6 +1558,26 @@ mod tests {
         assert!(bf16.2.unwrap().contains("not supported"));
         let split = classify_hub_gguf("model-q6_k-00001-of-00002.gguf");
         assert!(split.2.unwrap().contains("split GGUF"));
+    }
+
+    #[test]
+    fn hosted_companion_identity_is_role_specific_and_not_text_selectable() {
+        let companion = HubGgufArtifact {
+            repository: "owner/model".into(),
+            revision: "a".repeat(40),
+            filename: "gguf/mmproj-model-f16.gguf".into(),
+            bytes: 1024,
+            sha256: "b".repeat(64),
+            quant_hint: None,
+            role: "companion".into(),
+            selectable: false,
+            unavailable_reason: Some("vision projector companion; not a text model".into()),
+        };
+        assert!(hosted_gguf_identity_valid_for_role(&companion, "companion"));
+        assert!(!hosted_gguf_identity_valid_for_role(
+            &companion,
+            "text_model"
+        ));
     }
 
     #[test]
@@ -1508,11 +1631,11 @@ mod tests {
             selectable: true,
             unavailable_reason: None,
         };
-        assert!(hosted_gguf_identity_valid(&artifact));
+        assert!(hosted_gguf_identity_valid_for_role(&artifact, "text_model"));
 
         let mut forged = artifact.clone();
         forged.quant_hint = Some("Q6_K".to_owned());
-        assert!(!hosted_gguf_identity_valid(&forged));
+        assert!(!hosted_gguf_identity_valid_for_role(&forged, "text_model"));
     }
 
     /// Metadata-only regression proof for the mixed repository that exposed

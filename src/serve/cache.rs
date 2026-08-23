@@ -911,7 +911,9 @@ fn ensure_layout(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_manifest(path: &Path) -> Result<CacheManifest> {
+/// Read and validate a cache manifest without creating or repairing cache
+/// directories. Read-only inventory commands use this instead of `open_at`.
+pub(crate) fn read_manifest(path: &Path) -> Result<CacheManifest> {
     let text =
         fs::read_to_string(path).with_context(|| format!("read manifest: {}", path.display()))?;
     let mut m: CacheManifest = serde_json::from_str(&text)

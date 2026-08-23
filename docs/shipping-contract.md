@@ -40,6 +40,36 @@ Variants and operations absent from this matrix are unsupported and must fail
 closed rather than entering an approximately compatible loader, template,
 cache, or forward graph.
 
+### Repository model operands and managed local artifacts
+
+The next-release candidate accepts `owner/repository[:QUANT]` as the common
+model operand for `convert`, `serve`, and `chat`, as governed by ADR-051.
+`serve` and model-targeted `chat` prefer exact verified local authority,
+including manually downloaded bytes that match immutable Hub metadata. They
+then use a compatible hosted GGUF and fall back to hf2q-native source
+conversion only when the repository has no supported hosted GGUF. An explicit
+quant selects exactly that quant; an unqualified request prefers the most
+recently used compatible local quant, then the newest compatible local
+materialization, then the setup/live hardware recommendation and nearest lower
+hosted tier.
+
+`convert` never uses a hosted pre-quantized GGUF as its result: it downloads
+source weights and executes hf2q's native conversion and quantization. Without
+`--output`, remote conversion writes beneath
+`${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models/<owner>__<repository>/<immutable-revision>/`.
+The quant suffix and `--quant` are equivalent and conflicting values fail
+before payload transfer. A matching verified hf2q conversion is an idempotent
+success.
+
+For a selected supported multimodal text artifact, `serve` and model-targeted
+`chat` automatically reuse or retrieve one unambiguous revision-matched
+projector and run the existing pair-admission checks. Automatic projector
+failure warns and continues text-only; explicit `--mmproj` remains fail-closed.
+An explicit local text-GGUF path also auto-loads a valid bound or unambiguous
+present sibling projector without contacting the Hub.
+`hf2q serve list` and `hf2q chat list` show the read-only local inventory
+without Hub traffic or full-payload hashing.
+
 - Batched `forward_prefill_batched` (default-on since ADR-028
   iter-344; per-token `forward_prefill` was 14-45× slower than peer).
   Opt out to per-token via `HF2Q_BATCHED_PREFILL=0` for parity

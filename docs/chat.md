@@ -6,6 +6,13 @@ the way. It keeps ordinary shell scrollback and holds conversation context
 only until the process exits.
 
 ```bash
+# Prepare one exact quant with the shared serve resolver, start an owned local
+# server, and chat. Existing verified bytes win before Hub access.
+hf2q chat owner/model:Q4_K_M
+
+# Show the same read-only local inventory as `hf2q serve list`.
+hf2q chat list
+
 # Discover a live local hf2q server, or start one when none is available
 hf2q chat
 
@@ -56,6 +63,20 @@ verifies hosted downloads against pinned Hub commit, filename, byte size, LFS
 SHA-256, and GGUF header, before pool publication. Source conversion remains
 outside this diagnostic flow and is never its silent default.
 
+The positional `owner/model[:QUANT]` path is simpler and intentionally
+different from remote diagnostic switching: chat starts its own server with
+that operand, and serve performs local receipt/cache/managed discovery, exact
+manual-download adoption, hosted GGUF selection, and native source-conversion
+fallback. The TUI does not implement a second downloader. The compatibility
+`--model` / `--quant` / `--artifact` controls remain available for selecting
+through an already running hf2q endpoint.
+
+Targeted chat always owns a fresh loopback server. DNS-SD does not advertise
+the immutable repository, revision, quant, and artifact digest needed to prove
+that an existing resident process is the same requested model. The child
+prints a status heartbeat every 30 seconds while first-use preparation is
+still running; its private diagnostic log remains isolated from the terminal.
+
 A unique resident repository match connects without disk or Hub access.
 Receipt-backed and canonical managed-cache candidates are next. Legacy cache
 metadata without canonical emitted-artifact authority remains excluded.
@@ -75,8 +96,10 @@ or template arguments. Optional `--system`, `--temperature`, `--top-p`,
 `--max-tokens`, `--seed`, and `--reasoning-effort` flags add exactly the named
 request fields. `HF2Q_AUTH_TOKEN`, when set, is used as the bearer token but is
 never published in discovery metadata. Because machine-local DNS-SD candidates
-are not authenticated, automatic discovery is disabled while that variable is
-set; use `--url` to explicitly name the endpoint that may receive the token.
+are not authenticated, untargeted automatic discovery is disabled while that
+variable is set; use `--url` for an existing server. A targeted repository/path
+chat may use the token because it sends credentials only after matching
+discovery to the exact child PID it spawned.
 
 When the endpoint advertises hf2q's diagnostic capability, chat adds the
 capability-declared `x-hf2q-diagnostic-no-evict: 1` HTTP header. This does not

@@ -20,7 +20,7 @@ mod verification;
 pub use verification::{verify_local_artifact, LocalVerificationReceipt, LocalVerificationRequest};
 
 const RECEIPT_SUFFIX: &str = ".gguf.receipt.json";
-const MAX_ROOTS: usize = 8;
+const MAX_ROOTS: usize = 9;
 const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
 const MAX_SCAN_DEPTH: usize = 6;
 const MAX_DIRECTORY_ENTRIES: usize = 4096;
@@ -91,13 +91,18 @@ impl LocalArtifactInventory {
     /// configured roots. A conventional root may be created after startup;
     /// explicit roots must already be safe directories so typos fail loudly.
     pub fn for_serve(explicit_roots: &[PathBuf]) -> Result<Self> {
-        if explicit_roots.len() + 1 > MAX_ROOTS {
+        if explicit_roots.len() + 2 > MAX_ROOTS {
             bail!("at most {} local model roots may be configured", MAX_ROOTS);
         }
         let cwd = std::env::current_dir().context("resolve server working directory")?;
-        let mut roots = vec![LocalArtifactRoot {
-            path: lexical_absolute(&cwd.join("models"), &cwd)?,
-        }];
+        let mut roots = vec![
+            LocalArtifactRoot {
+                path: lexical_absolute(&cwd.join("models"), &cwd)?,
+            },
+            LocalArtifactRoot {
+                path: lexical_absolute(&crate::model_spec::managed_model_root()?, &cwd)?,
+            },
+        ];
         for path in explicit_roots {
             let absolute = lexical_absolute(path, &cwd)?;
             validate_existing_root(&absolute)?;

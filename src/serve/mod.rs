@@ -26,6 +26,7 @@ pub mod layer_ctx;
 pub(crate) mod load_diagnostic;
 #[allow(dead_code)]
 pub mod load_info;
+pub(crate) mod managed_artifacts;
 #[allow(dead_code)]
 pub mod multi_model;
 // ADR-040 Phase A iter-1 scaffolding — MultiSeqKvCache trait + types.
@@ -4115,6 +4116,28 @@ pub fn cmd_serve(
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
 
+    let mut args = args;
+    let mut repository_spec = None;
+    if let Some(target) = args.target.take() {
+        match crate::model_spec::parse_model_spec(&target)? {
+            crate::model_spec::ModelSpec::List => {
+                return managed_artifacts::print_inventory(&args.model_dirs)
+            }
+            crate::model_spec::ModelSpec::Path(path) => args.model = Some(path),
+            crate::model_spec::ModelSpec::Repository(spec) => repository_spec = Some(spec),
+        }
+    } else if let Some(model) = args.model.as_ref().filter(|path| !path.exists()) {
+        if let Ok(crate::model_spec::ModelSpec::Repository(spec)) =
+            crate::model_spec::parse_model_spec(&model.to_string_lossy())
+        {
+            repository_spec = Some(spec);
+            args.model = None;
+        }
+    }
+    if repository_spec.is_none() && args.output.is_some() {
+        anyhow::bail!("serve --output requires a repository MODEL operand");
+    }
+
     if let Some(fd) = args.chat_parent_lifeline_fd {
         start_chat_parent_lifeline(fd)?;
     }
@@ -4213,17 +4236,11 @@ pub fn cmd_serve(
     // empty `HotSwapManager<Engine>` sized off the unified-memory budget
     // per ADR-005 line 929 (80% default).  The same `cache` + `hardware`
     // are shared with request-time auto_pipeline resolution.
-    let default_model_arg = args
+    let mut default_model_arg = args
         .model
         .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
-    let pair_read_guard = match (args.model.as_ref(), args.mmproj.as_ref()) {
-        (Some(text), Some(projector)) => Some(
-            crate::core::paired_artifact::PairReadGuard::acquire(text, projector)
-                .map_err(|error| anyhow::anyhow!(error))?,
-        ),
-        _ => None,
-    };
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| repository_spec.as_ref().map(|spec| spec.repository.clone()));
     let local_artifacts =
         api::local_artifacts::LocalArtifactInventory::for_serve(&args.model_dirs)?;
     let mut state = api::AppState::new_for_serve(
@@ -4248,6 +4265,81 @@ pub fn cmd_serve(
         kv_persist_dir: kv_persist_dir.clone(),
         kv_persist_budget_bytes,
     });
+
+    let mut automatic_mmproj = false;
+    let mut startup_managed_identity = None;
+    if let Some(spec) = repository_spec.as_ref() {
+        let mut cache_guard = state.cache.lock().map_err(|error| {
+            anyhow::anyhow!("cache mutex poisoned during model resolution: {error}")
+        })?;
+        let resolved = managed_artifacts::resolve_repository(
+            spec,
+            args.output.as_deref(),
+            &args.model_dirs,
+            &mut cache_guard,
+            state.hardware.as_ref(),
+            args.mmproj.is_none(),
+        )?;
+        drop(cache_guard);
+        for warning in &resolved.warnings {
+            tracing::warn!("{warning}");
+            eprintln!("Warning: {warning}");
+        }
+        tracing::info!(
+            repository = %resolved.repository,
+            revision = %resolved.revision,
+            quant = %resolved.quant,
+            origin = %resolved.origin,
+            path = %resolved.gguf_path.display(),
+            "ADR-051 local-first model resolution complete"
+        );
+        args.model = Some(resolved.gguf_path.clone());
+        default_model_arg = Some(resolved.gguf_path.to_string_lossy().into_owned());
+        startup_managed_identity = Some((
+            resolved.repository.clone(),
+            resolved.quant,
+            resolved.gguf_path.clone(),
+        ));
+        if args.mmproj.is_none() {
+            automatic_mmproj = resolved.mmproj_path.is_some();
+            args.mmproj = resolved.mmproj_path;
+        }
+    }
+
+    if repository_spec.is_none() && args.mmproj.is_none() {
+        if let Some(model) = args.model.as_ref() {
+            match managed_artifacts::resolve_local_path_projector(model) {
+                Ok(Some(projector)) => {
+                    automatic_mmproj = true;
+                    args.mmproj = Some(projector);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "automatic local-path mmproj resolution failed");
+                    eprintln!("Warning: automatic local-path mmproj resolution failed: {error}");
+                }
+            }
+        }
+    }
+
+    let pair_paths = args.model.clone().zip(args.mmproj.clone());
+    let pair_read_guard = match pair_paths {
+        Some((text, projector)) => {
+            match crate::core::paired_artifact::PairReadGuard::acquire(&text, &projector) {
+                Ok(guard) => Some(guard),
+                Err(error) if automatic_mmproj => {
+                    tracing::warn!(%error, "automatic mmproj pair lock rejected; continuing text-only");
+                    eprintln!(
+                        "Warning: automatic mmproj pair could not be locked; serving text-only: {error}"
+                    );
+                    args.mmproj = None;
+                    None
+                }
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            }
+        }
+        None => None,
+    };
 
     // --- ADR-017 Phase C.1 — optional persistent block-prefix KV cache ---
     // When `--kv-persist=PATH` is set, replace the AppState's
@@ -4655,14 +4747,18 @@ pub fn cmd_serve(
             );
         }
 
-        let pool_repo = resolved
-            .repo_id
-            .clone()
+        let pool_repo = startup_managed_identity
+            .as_ref()
+            .map(|(repository, _, _)| repository.clone())
+            .or_else(|| resolved.repo_id.clone())
             .unwrap_or_else(|| pool_key_for_path(&resolved.gguf_path));
-        let pool_quant = match resolved.quant {
-            Some(quant) => quant,
-            None => quant_select::quant_type_from_gguf_path(&resolved.gguf_path)
-                .context("derive exact pool quant from --model GGUF")?,
+        let pool_quant = if let Some((_, quant, _)) = startup_managed_identity.as_ref() {
+            *quant
+        } else if let Some(quant) = resolved.quant {
+            quant
+        } else {
+            quant_select::quant_type_from_gguf_path(&resolved.gguf_path)
+                .context("derive exact pool quant from --model GGUF")?
         };
         let mut engine_config = state.engine_config_template.clone();
         engine_config.tokenizer_path = args.tokenizer.clone();
@@ -4810,7 +4906,11 @@ pub fn cmd_serve(
     // pass (ADR-005 Phase 2c Task #15). Fail fast if the file is absent
     // or malformed so the server never advertises multimodal capability
     // it can't back.
-    let (mmproj, startup_vision_projector) = if let Some(mmp_path) = args.mmproj.as_ref() {
+    let load_startup_mmproj = || -> Result<(
+        Option<api::state::LoadedMmproj>,
+        Option<load_info::VisionProjector>,
+    )> {
+        if let Some(mmp_path) = args.mmproj.as_ref() {
         anyhow::ensure!(
             mmp_path.exists(),
             "mmproj not found: {}",
@@ -4969,7 +5069,7 @@ pub fn cmd_serve(
                 "ViT GPU warmup complete"
             );
         }
-        (
+        Ok((
             Some(api::state::LoadedMmproj {
                 gguf_path: mmp_path.clone(),
                 config: mmp_config,
@@ -4988,9 +5088,19 @@ pub fn cmd_serve(
                 mmproj_path: mmp_path.clone(),
                 mmproj_sha256: Some(mmproj_sha256),
             }),
-        )
-    } else {
-        (None, None)
+        ))
+        } else {
+            Ok((None, None))
+        }
+    };
+    let (mmproj, startup_vision_projector) = match load_startup_mmproj() {
+        Ok(loaded) => loaded,
+        Err(error) if automatic_mmproj => {
+            tracing::warn!(%error, "automatic mmproj rejected; continuing text-only");
+            eprintln!("Warning: automatic mmproj was rejected; serving text-only: {error:#}");
+            (None, None)
+        }
+        Err(error) => return Err(error),
     };
     drop(pair_read_guard);
 
@@ -5102,6 +5212,29 @@ pub fn cmd_serve(
         } else {
             None
         };
+        if let Some((repository, quant, path)) = startup_managed_identity.as_ref() {
+            match state_for_warmup.cache.lock() {
+                Ok(mut cache_guard) => {
+                    if let Err(error) = managed_artifacts::mark_successful_use(
+                        repository,
+                        *quant,
+                        path,
+                        &mut cache_guard,
+                    ) {
+                        tracing::warn!(%error, "model started but successful-use history could not be persisted");
+                        eprintln!(
+                            "Warning: model started, but its local-use history could not be persisted: {error}"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "model started but cache history mutex was poisoned");
+                    eprintln!(
+                        "Warning: model started, but its local-use history could not be persisted: {error}"
+                    );
+                }
+            }
+        }
 
         // Iter-209: warmup ran SYNCHRONOUSLY at pre-warm time (when
         // `--model` was supplied) inside `pool.load_or_get` →

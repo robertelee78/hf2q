@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Accept `owner/repository[:QUANT]` directly in `convert`, `serve`, and `chat`.
+  Model-targeted serve/chat reuse verified local artifacts first, adopt exact
+  matching manual downloads without another payload transfer, download the
+  requested compatible hosted GGUF when needed, and use native source
+  conversion only when no supported hosted GGUF exists.
+- Add `hf2q serve list` and `hf2q chat list` as read-only local model
+  inventories, and automatically prepare a revision-matched projector for
+  supported multimodal repository models or a valid present projector beside
+  an explicit local GGUF, while retaining explicit `--mmproj` fail-closed
+  behavior.
+
+### Changed
+
+- Make `convert` output optional for remote repositories. It now selects the
+  setup/live hardware quant when unspecified, writes revision-bound artifacts
+  below the canonical hf2q data directory, treats `repo:QUANT` and
+  `--quant QUANT` equivalently, and reuses only a receipt-verified native hf2q
+  conversion.
+- Make targeted chat own and authenticate the exact server child it starts,
+  with periodic first-use preparation heartbeats, while keeping credentials
+  away from untrusted discovery candidates.
+
 ## [0.1.14] — 2026-08-23
 
 ### Added

@@ -555,7 +555,7 @@ fn run_convert_subprocess(
     snapshot_dir: &Path,
     target_gguf: &Path,
     quant: QuantType,
-    no_integrity: bool,
+    _no_integrity: bool,
 ) -> Result<()> {
     let bin = std::env::var("CARGO_BIN_EXE_hf2q").unwrap_or_else(|_| {
         // Production fallback: same-binary self-spawn.  `current_exe` is
@@ -567,25 +567,11 @@ fn run_convert_subprocess(
     let cli_quant = map_quant_to_cli(quant);
     let mut cmd = Command::new(&bin);
     cmd.arg("convert")
-        .arg("--input")
         .arg(snapshot_dir)
-        .arg("--format")
-        .arg("gguf")
         .arg("--quant")
         .arg(cli_quant)
         .arg("--output")
-        .arg(target_gguf)
-        .arg("--yes")
-        // The subprocess re-downloads nothing — `--input` is local.  But
-        // it does run quality measurement by default; skip for the
-        // auto-pipeline path because (a) we already verified the source
-        // bytes via integrity and (b) quality measurement allocates an
-        // extra ~F32 round-trip that doubles peak memory (see
-        // `project_phase45_quality_oom.md`).
-        .arg("--skip-quality");
-    if no_integrity {
-        cmd.arg("--no-integrity");
-    }
+        .arg(target_gguf);
 
     tracing::info!(
         bin = %bin,

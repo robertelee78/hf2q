@@ -195,6 +195,14 @@ jobs:
             input::hf_download_plan_tests::repository_info_seals_a_mutable_request_to_the_returned_exact_commit \
             input::hf_download_plan_tests::immutable_file_metadata_is_checked_before_transfer \
             input::hf_download_plan_tests::metadata_transfer_caps_are_explicit_and_exact \
+            model_spec::tests::repository_quant_suffix_is_case_insensitive_and_exact \
+            cli::tests::frictionless_convert_accepts_repo_quant_without_output \
+            cli::tests::frictionless_serve_operand_accepts_repo_quant_and_list \
+            cli::tests::frictionless_chat_operand_accepts_repo_quant_and_list \
+            serve::managed_artifacts::tests::actual_local_selection_prefers_successful_use_and_exact_quant_ignores_low_memory \
+            serve::managed_artifacts::tests::destination_preflight_reuses_exact_bytes_and_rejects_conflict_before_transfer \
+            serve::managed_artifacts::tests::verified_conversion_pair_is_reused_and_published_as_managed_authority \
+            chat::local::tests::owned_candidate_verification_uses_authorization_after_pid_match \
             inference::models::qwen35::source_precision::operator::tests::embedded_qwen38_source_manifest_projects_exact_offline_inventory \
             convert::cli_driver::tests::deepseek_tiny_official_layout_converts_to_q2_k_s_end_to_end \
             input::integrity::tests::safetensors_index_entry_cap_is_exact \
@@ -206,6 +214,10 @@ jobs:
           done
           cargo test --locked --bin hf2q --all-features input::hf_reference_tests::
           cargo test --locked --bin hf2q --all-features input::hf_download_plan_tests::
+          cargo test --locked --bin hf2q --all-features model_spec::tests::
+          cargo test --locked --bin hf2q --all-features cli::tests::frictionless_
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::
+          cargo test --locked --bin hf2q --all-features chat::local::tests::
           cargo test --locked --bin hf2q --all-features inference::models::qwen35::source_precision::operator::tests::embedded_qwen38_source_manifest_projects_exact_offline_inventory -- --exact
           cargo test --locked --bin hf2q --all-features input::integrity::tests:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features convert::cli_driver::tests::deepseek_tiny_official_layout_converts_to_q2_k_s_end_to_end -- --exact
@@ -231,6 +243,7 @@ jobs:
           cargo test --locked --bin hf2q --all-features public_watchdog_fixture_consumers_share_the_canonical_digests -- --test-threads=1
           cargo test --locked --bin hf2q --all-features readiness_guard_tests -- --test-threads=1
           bash -n scripts/qwen36_watchdog_validate.sh \
+            scripts/test_getting_started_guide.sh \
             scripts/test_shipping_contract.sh \
             scripts/serve_qwen38_opencode.sh \
             scripts/test_qwen36_prefill_watchdog.sh \
@@ -281,6 +294,7 @@ jobs:
             scripts/test_gemma4_long_short_overlap_contract.sh \
             scripts/run_agentic_cache_release_gate.sh
           bash scripts/test_qwen36_watchdog_harness_contract.sh
+          bash scripts/test_getting_started_guide.sh
           bash scripts/test_shipping_contract.sh
           bash scripts/test_deepseek4_cached_suffix_contract.sh
           bash scripts/test_deepseek4_agentic_fixture_contract.sh
