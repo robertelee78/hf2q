@@ -237,6 +237,40 @@ pub(super) fn load_native_projection(
     Ok((buffer, info.ggml_type))
 }
 
+fn load_native_row_projection(
+    gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
+    name: &str,
+    cols: usize,
+    device: &MlxDevice,
+) -> Result<MlxQWeight> {
+    let info = gguf
+        .tensor_info(name)
+        .ok_or_else(|| anyhow!("native Qwen row projection '{name}' not found"))?;
+    anyhow::ensure!(
+        cols > 0 && cols % info.ggml_type.block_values() as usize == 0,
+        "native Qwen row projection '{name}' width {cols} is not aligned to {:?}'s {}-value blocks",
+        info.ggml_type,
+        info.ggml_type.block_values()
+    );
+    let expected = (cols / info.ggml_type.block_values() as usize)
+        .checked_mul(info.ggml_type.block_bytes() as usize)
+        .ok_or_else(|| anyhow!("native Qwen row projection '{name}' byte length overflow"))?;
+    anyhow::ensure!(
+        info.byte_len == expected,
+        "native Qwen row projection '{name}' byte length {} != expected {expected} for {:?}",
+        info.byte_len,
+        info.ggml_type
+    );
+    let weight = MlxQWeight::from_mapped_gguf_row_vector(mapped, info, cols)
+        .with_context(|| format!("retain native Qwen row projection '{name}'"))?;
+    super::weight_pool::register_weight_buffer(device, &weight.buffer)
+        .map_err(|error| anyhow!("register_weight_buffer({name}): {error}"))?;
+    #[cfg(test)]
+    super::execution_observation::observe_loaded_ggml(name, &weight.buffer)?;
+    Ok(weight)
+}
+
 /// Load one full-attention block with the conversion-emitted quantized
 /// representation intact. The fused Q/gate matrix stays fused and native;
 /// inference projects it once and deinterleaves only the F32 activation.
@@ -1361,7 +1395,13 @@ pub fn load_moe_ffn_quantized(
         Ok(weight)
     };
     let router = load_matrix(&format!("{p}.ffn_gate_inp.weight"), ne, h)?;
-    let shared_gate_logit = load_matrix(&format!("{p}.ffn_gate_inp_shexp.weight"), 1, h)?;
+    let shared_gate_logit = load_native_row_projection(
+        gguf,
+        mapped,
+        &format!("{p}.ffn_gate_inp_shexp.weight"),
+        h,
+        device,
+    )?;
     let shared_gate = load_matrix(&format!("{p}.ffn_gate_shexp.weight"), shared, h)?;
     let shared_up = load_matrix(&format!("{p}.ffn_up_shexp.weight"), shared, h)?;
     let shared_down = load_matrix(&format!("{p}.ffn_down_shexp.weight"), h, shared)?;
@@ -1779,6 +1819,74 @@ mod tests {
             "production Qwen matrices must be views of the scoped GGUF mapping"
         );
         assert_eq!(projection.data_byte_len(), payload.len() * 4);
+    }
+
+    #[test]
+    fn production_shared_gate_retains_exact_rank_one_row_view_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Some(device) = MlxDevice::new().ok() else {
+            eprintln!("[skip] Metal device unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("qwen-native-row-vector.gguf");
+        let cols = 256usize;
+        let payload = vec![0u8; cols * 4];
+        {
+            let file = std::fs::File::create(&path).expect("create GGUF");
+            let mut writer = GgufWriter::new(file);
+            writer.write_header(2, 0).expect("header");
+            let row = writer
+                .reserve_tensor_info(
+                    "blk.0.ffn_gate_inp_shexp.weight",
+                    &[cols as u64],
+                    WriterGgmlType::F32,
+                )
+                .expect("row tensor info");
+            let rank_two = writer
+                .reserve_tensor_info(
+                    "blk.0.rank_two.weight",
+                    &[cols as u64, 1],
+                    WriterGgmlType::F32,
+                )
+                .expect("rank-two tensor info");
+            writer.pad_to_alignment().expect("alignment");
+            writer
+                .stream_tensor_payload(row, &payload)
+                .expect("row payload");
+            writer
+                .stream_tensor_payload(rank_two, &payload)
+                .expect("rank-two payload");
+            writer.finalize().expect("finalize");
+        }
+
+        let gguf = GgufFile::open(&path).expect("open GGUF");
+        let mapped = gguf.map_tensor_data(&device).expect("map GGUF");
+        let row = load_native_row_projection(
+            &gguf,
+            &mapped,
+            "blk.0.ffn_gate_inp_shexp.weight",
+            cols,
+            &device,
+        )
+        .expect("load exact rank-one row projection");
+        assert_eq!((row.info.rows, row.info.cols), (1, cols));
+        assert!(row.buffer.is_file_backed());
+        assert_eq!(row.buffer.data_byte_len(), payload.len());
+
+        let ordinary_error = MlxQWeight::from_mapped_gguf_tensor(
+            &mapped,
+            gguf.tensor_info("blk.0.ffn_gate_inp_shexp.weight").unwrap(),
+        )
+        .err()
+        .expect("ordinary native matrices must remain rank two");
+        assert!(ordinary_error.to_string().contains("must be rank 2"));
+
+        let squeeze_error =
+            load_native_row_projection(&gguf, &mapped, "blk.0.rank_two.weight", cols, &device)
+                .err()
+                .expect("rank-two storage must not be implicitly squeezed");
+        assert!(format!("{squeeze_error:#}").contains("must be exact rank 1"));
     }
 
     #[test]
