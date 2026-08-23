@@ -44,6 +44,16 @@ async fn post_embedding_text(app: &axum::Router, model: &str, input: &str) -> (V
     assert_eq!(response.status(), StatusCode::OK);
     let value: serde_json::Value =
         serde_json::from_str(&body_string(response).await).expect("embedding JSON");
+    assert_eq!(
+        value["model"], model,
+        "embedding response must be bound to the requested active generation"
+    );
+    assert!(
+        value["usage"]["prompt_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens > 0),
+        "embedding response must report nonzero prompt-token usage"
+    );
     let vector = value["data"][0]["embedding"]
         .as_array()
         .expect("embedding vector")
@@ -51,6 +61,26 @@ async fn post_embedding_text(app: &axum::Router, model: &str, input: &str) -> (V
         .map(|value| value.as_f64().expect("finite embedding component"))
         .collect();
     (vector, started.elapsed())
+}
+
+async fn assert_embedding_model_unavailable(app: &axum::Router, model: &str, phase: &str) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"model": model, "input": "hello"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("unavailable embedding response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{phase}");
+    let body = body_string(response).await;
+    assert!(body.contains("model_not_loaded"), "{phase}: {body}");
 }
 
 async fn activate_embedding_candidate(
@@ -253,11 +283,7 @@ fn embedding_artifact_mapping(path: &Path) -> EmbeddingArtifactMapping {
     );
     let vmmap_stdout = String::from_utf8_lossy(&vmmap.stdout);
     let path_text = path.to_string_lossy();
-    let vmmap_live = vmmap_stdout.contains(path_text.as_ref())
-        || path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|name| vmmap_stdout.contains(name));
+    let vmmap_live = vmmap_stdout.contains(path_text.as_ref());
     EmbeddingArtifactMapping {
         path,
         inode,
@@ -704,6 +730,7 @@ async fn dedicated_embedding_real_bert_nomic_bert_replays_and_reclaims() {
     .await;
     assert_eq!(probe_b_status, StatusCode::OK);
     assert_eq!(probe_b["status"], "resident");
+    assert_embedding_model_unavailable(&app, &model_a_id, "B must reject evicted A identity").await;
 
     let (stop_a2, peak_a2_thread) = start_embedding_rss_peak_sampler();
     let switch_a2_started = Instant::now();
@@ -790,6 +817,8 @@ async fn dedicated_embedding_real_bert_nomic_bert_replays_and_reclaims() {
     assert_eq!(probe_old_b_status, StatusCode::NOT_FOUND);
     assert_eq!(probe_old_b["status"], "not_resident");
     assert_eq!(probe_old_b["embedding"]["generation"], a2_generation);
+    assert_embedding_model_unavailable(&app, &b_model_id, "A2 must reject evicted B identity")
+        .await;
     let reference_a = reference_embedding(&path_a, "cls", "hello");
     let reference_a_long = reference_embedding(&path_a, "cls", LONG_EMBED_PROMPT);
     let reference_b = reference_embedding(&path_b, "mean", "hello");
