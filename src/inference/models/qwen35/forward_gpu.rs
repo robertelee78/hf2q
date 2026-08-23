@@ -7795,30 +7795,19 @@ impl Qwen35Model {
                         .with_context(|| format!("upload moe_ffn layer {i}"))?,
                 ),
                 Qwen35FfnWeights::MoeQ(w) => {
-                    // Expert buffers already on Metal device; only router and
-                    // shared-expert F32 vecs need uploading.
+                    // Every production matrix is already an artifact-native
+                    // mapped view; construction only retains handles.
                     let moe_cfg = cfg
                         .moe
                         .as_ref()
                         .ok_or_else(|| anyhow!("layer {i}: MoeQ but no moe config"))?;
                     let mut moe_gpu = MoeFfnWeightsGpuQ::from_quantized(
-                        // Clone the Metal buffer handle (ARC retain — no data copy).
-                        w.expert_gate_q.clone(),
-                        w.expert_up_q.clone(),
-                        w.expert_down_q.clone(),
-                        w.ggml_type_gate_up,
-                        w.ggml_type_down,
+                        w,
                         moe_cfg.num_experts,
                         moe_cfg.moe_intermediate_size,
                         cfg.hidden_size,
-                        &w.router,
-                        &w.shared_gate_logit,
-                        &w.shared_gate,
-                        &w.shared_up,
-                        &w.shared_down,
-                        device,
                     )
-                    .with_context(|| format!("upload moe_ffn_q layer {i}"))?;
+                    .with_context(|| format!("retain moe_ffn_q layer {i}"))?;
                     // ADR-020 AC#5 Iter C2.4 #4 — propagate DWQ overlay
                     // affine stacks from MoeFfnWeightsQ into the GPU
                     // bundle.  Cheap clone (Arc-wrapped MlxBuffer).
@@ -8731,11 +8720,20 @@ mod tests {
         let moe = cfg.moe.as_ref().expect("MoE config");
         let ne = moe.num_experts as usize;
         let m = moe.moe_intermediate_size as usize;
+        let m_shared = moe.shared_expert_intermediate_size as usize;
         let h = cfg.hidden_size as usize;
+        let owned_f32 = |values: &[f32], rows: usize, cols: usize| {
+            crate::serve::forward_mlx_shared::MlxQWeight::from_test_buffer(
+                upload_f32(values, device).expect("upload synthetic MoE matrix"),
+                GgmlType::F32,
+                rows,
+                cols,
+            )
+        };
         for layer in &mut model.layers {
             let quantized = match layer.ffn() {
                 Qwen35FfnWeights::Moe(weights) => MoeFfnWeightsQ {
-                    router: weights.router.clone(),
+                    router: owned_f32(&weights.router, ne, h),
                     expert_gate_q: quantize_f32_to_q8_0_buffer(
                         &weights.expert_gate,
                         vec![ne, m, h],
@@ -8756,10 +8754,10 @@ mod tests {
                     .expect("quantize test expert down"),
                     ggml_type_gate_up: GgmlType::Q8_0,
                     ggml_type_down: GgmlType::Q8_0,
-                    shared_gate_logit: weights.shared_gate_logit.clone(),
-                    shared_gate: weights.shared_gate.clone(),
-                    shared_up: weights.shared_up.clone(),
-                    shared_down: weights.shared_down.clone(),
+                    shared_gate_logit: owned_f32(&weights.shared_gate_logit, 1, h),
+                    shared_gate: owned_f32(&weights.shared_gate, m_shared, h),
+                    shared_up: owned_f32(&weights.shared_up, m_shared, h),
+                    shared_down: owned_f32(&weights.shared_down, h, m_shared),
                     expert_gate_affine: None,
                     expert_up_affine: None,
                     expert_down_affine: None,

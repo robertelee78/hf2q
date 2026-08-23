@@ -56,8 +56,9 @@ pub struct MtpWeights {
     /// `None` when the MTP block shares the main verifier's `token_embd.weight`
     /// (Qwen3.6 27B + 35B-A3B convention; HF flag `False`). At draft time the
     /// caller of `forward_draft` already supplies the embedding (`embed_t`); the
-    /// verifier embedding table itself lives on `Qwen35Model::token_embd` and is
-    /// reused via the hot embed_tokens lookup path — no buffer duplication.
+    /// verifier embedding table itself lives in
+    /// `Qwen35Model::token_embd_native` and is reused through its exact mapped
+    /// buffer owner — no table or output-head duplication.
     #[allow(dead_code)]
     pub(super) embed_tokens: Option<MlxQWeight>,
     pub(super) shared_head_norm: MlxBuffer,

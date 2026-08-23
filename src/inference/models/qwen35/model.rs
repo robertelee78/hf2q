@@ -15,14 +15,16 @@ use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
 use super::gpu_delta_net::DeltaNetWeightsGpu;
-use super::gpu_full_attn::FullAttnWeightsGpu;
-use super::mtp::{load_mtp_weights_if_present_with_shared_head, MtpWeights};
+use super::gpu_full_attn::{FullAttnQGateWeightsGpu, FullAttnWeightsGpu};
+use super::mtp::{
+    load_mtp_weights_if_present_with_shared_head, MtpFfnWeightsGpu, MtpQGateWeightsGpu, MtpWeights,
+};
 use super::weight_loader::{DenseFfnWeightsNative, DenseFfnWeightsQ, MoeFfnWeightsQ};
 use super::{weight_loader, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
 use crate::serve::forward_mlx_shared::MlxQWeight;
 
 use mlx_native::gguf::GgufFile;
-use mlx_native::MlxDevice;
+use mlx_native::{MlxBuffer, MlxDevice};
 
 // ================================================================
 // Layer weight enums
@@ -169,6 +171,133 @@ pub struct Qwen35Model {
     pub(super) loaded_candidate_identity: Option<Qwen35LoadedCandidateIdentity>,
 }
 
+fn push_native_weight<'a>(weight: &'a MlxQWeight, buffers: &mut Vec<&'a MlxBuffer>) {
+    buffers.push(&weight.buffer);
+    if let Some(affine) = weight.affine.as_ref() {
+        buffers.push(&affine.scales);
+        buffers.push(&affine.biases);
+    }
+}
+
+fn push_q_gate<'a>(q_gate: &'a FullAttnQGateWeightsGpu, buffers: &mut Vec<&'a MlxBuffer>) {
+    match q_gate {
+        FullAttnQGateWeightsGpu::Split { wq, w_gate, .. } => {
+            buffers.push(wq);
+            buffers.push(w_gate);
+        }
+        FullAttnQGateWeightsGpu::Fused { weight, .. } => buffers.push(weight),
+    }
+}
+
+fn push_native_moe<'a>(weights: &'a MoeFfnWeightsQ, buffers: &mut Vec<&'a MlxBuffer>) {
+    push_native_weight(&weights.router, buffers);
+    buffers.extend([
+        &weights.expert_gate_q,
+        &weights.expert_up_q,
+        &weights.expert_down_q,
+    ]);
+    push_native_weight(&weights.shared_gate_logit, buffers);
+    push_native_weight(&weights.shared_gate, buffers);
+    push_native_weight(&weights.shared_up, buffers);
+    push_native_weight(&weights.shared_down, buffers);
+    for affine in [
+        weights.expert_gate_affine.as_ref(),
+        weights.expert_up_affine.as_ref(),
+        weights.expert_down_affine.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        buffers.extend([&affine.weight, &affine.scales, &affine.biases]);
+    }
+}
+
+fn push_gpu_moe<'a>(
+    weights: &'a super::gpu_ffn::MoeFfnWeightsGpuQ,
+    buffers: &mut Vec<&'a MlxBuffer>,
+) {
+    push_native_weight(&weights.router, buffers);
+    buffers.extend([
+        &weights.expert_gate_q,
+        &weights.expert_up_q,
+        &weights.expert_down_q,
+    ]);
+    push_native_weight(&weights.shared_gate_inp, buffers);
+    push_native_weight(&weights.shared_gate, buffers);
+    push_native_weight(&weights.shared_up, buffers);
+    push_native_weight(&weights.shared_down, buffers);
+    for affine in [
+        weights.expert_gate_affine.as_ref(),
+        weights.expert_up_affine.as_ref(),
+        weights.expert_down_affine.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        buffers.extend([&affine.weight, &affine.scales, &affine.biases]);
+    }
+}
+
+fn push_native_ffn<'a>(weights: &'a Qwen35FfnWeights, buffers: &mut Vec<&'a MlxBuffer>) {
+    match weights {
+        Qwen35FfnWeights::DenseNative(weights) => {
+            buffers.extend([&weights.gate, &weights.up, &weights.down]);
+        }
+        Qwen35FfnWeights::DenseQ(weights) => {
+            buffers.extend([&weights.gate_q, &weights.up_q, &weights.down_q]);
+        }
+        Qwen35FfnWeights::MoeQ(weights) => push_native_moe(weights, buffers),
+        Qwen35FfnWeights::Dense(_) | Qwen35FfnWeights::Moe(_) => {}
+    }
+}
+
+fn push_mtp_matrices<'a>(mtp: &'a MtpWeights, buffers: &mut Vec<&'a MlxBuffer>) {
+    buffers.push(&mtp.eh_proj);
+    if let Some(embed_tokens) = mtp.embed_tokens.as_ref() {
+        push_native_weight(embed_tokens, buffers);
+    }
+    buffers.push(&mtp.shared_head_head);
+    match &mtp.attn.q_gate {
+        MtpQGateWeightsGpu::Ungated { wq, .. } => buffers.push(wq),
+        MtpQGateWeightsGpu::Gated(q_gate) => push_q_gate(q_gate, buffers),
+    }
+    buffers.extend([&mtp.attn.wk, &mtp.attn.wv, &mtp.attn.wo]);
+    match &mtp.ffn {
+        MtpFfnWeightsGpu::Dense { weights, .. } => {
+            buffers.extend([&weights.gate, &weights.up, &weights.down]);
+        }
+        MtpFfnWeightsGpu::DenseQ { weights } => {
+            buffers.extend([&weights.gate_q, &weights.up_q, &weights.down_q]);
+        }
+        MtpFfnWeightsGpu::Moe { weights, .. } => push_gpu_moe(weights, buffers),
+    }
+}
+
+fn verify_native_matrix_storage(
+    storage: crate::serve::forward_mlx_shared::NativeMatrixStorageSummary,
+    expected_tensor_count: usize,
+    expected_bytes: u64,
+) -> Result<()> {
+    ensure!(
+        storage.unique_matrix_views == expected_tensor_count,
+        "production Qwen matrix visitor covered {} unique views, but preflight requires {} tensors",
+        storage.unique_matrix_views,
+        expected_tensor_count
+    );
+    ensure!(
+        storage.resident_bytes() == expected_bytes,
+        "production Qwen matrix visitor accounted {} bytes, but preflight requires {}",
+        storage.resident_bytes(),
+        expected_bytes
+    );
+    ensure!(
+        storage.anonymous_bytes == 0,
+        "production Qwen load created {} anonymous matrix bytes",
+        storage.anonymous_bytes
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) struct Qwen35LoadedCandidateIdentity {
     configuration: std::sync::Arc<super::execution_config::Qwen35ExecutionConfiguration>,
@@ -279,6 +408,44 @@ impl Qwen35Model {
             .map(|output| (output, "output.weight")))
     }
 
+    /// Exact logical-byte accounting for production matrix storage. Tied
+    /// heads and MTP aliases are de-duplicated by Metal allocation range;
+    /// elementwise norms/state are intentionally outside this matrix ledger.
+    pub fn native_matrix_storage_summary(
+        &self,
+    ) -> Result<crate::serve::forward_mlx_shared::NativeMatrixStorageSummary> {
+        let mut buffers = Vec::new();
+        if let Some(token_embedding) = self.token_embd_native.as_ref() {
+            push_native_weight(token_embedding, &mut buffers);
+        }
+        if let Some(output) = self.output_weight_native.as_ref() {
+            push_native_weight(output, &mut buffers);
+        }
+        for layer in &self.layers {
+            match layer {
+                Qwen35LayerWeights::NativeFullAttn { attn, .. } => {
+                    push_q_gate(&attn.q_gate, &mut buffers);
+                    buffers.extend([&attn.wk, &attn.wv, &attn.wo]);
+                }
+                Qwen35LayerWeights::NativeLinearAttn { attn, .. } => {
+                    buffers.extend([
+                        &attn.attn_qkv,
+                        &attn.attn_gate,
+                        &attn.ssm_alpha,
+                        &attn.ssm_beta,
+                        &attn.ssm_out,
+                    ]);
+                }
+                Qwen35LayerWeights::FullAttn { .. } | Qwen35LayerWeights::LinearAttn { .. } => {}
+            }
+            push_native_ffn(layer.ffn(), &mut buffers);
+        }
+        if let Some(mtp) = self.mtp.as_ref() {
+            push_mtp_matrices(mtp, &mut buffers);
+        }
+        crate::serve::forward_mlx_shared::summarize_native_matrix_storage(buffers)
+    }
+
     #[cfg(test)]
     pub(crate) fn loaded_candidate_cache_identity(&self) -> Option<(&str, &str, &str)> {
         let identity = self.loaded_candidate_identity.as_ref()?;
@@ -329,21 +496,22 @@ impl Qwen35Model {
     ) -> Result<Self> {
         let mut cfg = Self::load_config_only(gguf)?;
 
-        // Dense Qwen admission is tensor- and operation-specific. Run it
-        // before Metal device creation so an unsupported embedding, output
-        // head, projection, or FFN codec cannot partially allocate a model or
-        // trigger a storage substitution later in the load.
-        if cfg.variant == Qwen35Variant::Dense {
-            super::gguf_preflight::preflight_dense_qwen35_gguf(gguf, &cfg)
-                .context("preflight dense Qwen GGUF execution")?;
-        }
+        // Admission is tensor- and operation-specific for dense and MoE.
+        // Run it before Metal device creation so malformed geometry or an
+        // unsupported codec cannot partially allocate a model or trigger a
+        // storage substitution later in the load.
+        let preflight = super::gguf_preflight::preflight_qwen35_gguf(gguf, &cfg)
+            .context("preflight Qwen GGUF execution")?;
 
         let device =
             MlxDevice::new().map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
+        let mapped = gguf
+            .map_tensor_data(&device)
+            .context("map Qwen GGUF tensor data once for model-scoped native views")?;
 
         let token_embd = Vec::new();
         let token_embd_native =
-            crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "token_embd.weight", &device)
+            crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, &mapped, "token_embd.weight")
                 .context("load native token_embd.weight")?;
         super::forward_gpu::ensure_native_embedding_admitted(&token_embd_native)
             .context("admit native token_embd.weight execution")?;
@@ -362,7 +530,7 @@ impl Qwen35Model {
             None
         } else {
             let output =
-                crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "output.weight", &device)
+                crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, &mapped, "output.weight")
                     .context("load native output.weight")?;
             super::weight_pool::register_weight_buffer(&device, &output.buffer)
                 .context("register native output.weight")?;
@@ -403,9 +571,14 @@ impl Qwen35Model {
             cfg.vocab_size = output_head.info.rows as u32;
         }
 
-        let mtp =
-            load_mtp_weights_if_present_with_shared_head(gguf, &cfg, &device, Some(output_head))
-                .context("load_mtp_weights_if_present")?;
+        let mtp = load_mtp_weights_if_present_with_shared_head(
+            gguf,
+            &mapped,
+            &cfg,
+            &device,
+            Some(output_head),
+        )
+        .context("load_mtp_weights_if_present")?;
 
         // MoE experts must retain their GGUF-quantized representation. An
         // F16/F32 expert artifact would require a different native execution
@@ -439,17 +612,21 @@ impl Qwen35Model {
                 .get(i as usize)
                 .copied()
                 .ok_or_else(|| anyhow!("layer_idx {i} out of range"))?;
-            let ffn = weight_loader::load_ffn(gguf, &cfg, i, &device)
+            let ffn = weight_loader::load_ffn(gguf, &mapped, &cfg, i, &device)
                 .with_context(|| format!("load native FFN layer {i}"))?;
             let layer = match kind {
                 Qwen35LayerKind::FullAttention => Qwen35LayerWeights::NativeFullAttn {
-                    attn: weight_loader::load_full_attn_layer_native(gguf, &cfg, i, &device)
-                        .with_context(|| format!("load native full-attention layer {i}"))?,
+                    attn: weight_loader::load_full_attn_layer_native(
+                        gguf, &mapped, &cfg, i, &device,
+                    )
+                    .with_context(|| format!("load native full-attention layer {i}"))?,
                     ffn,
                 },
                 Qwen35LayerKind::LinearAttention => Qwen35LayerWeights::NativeLinearAttn {
-                    attn: weight_loader::load_delta_net_layer_native(gguf, &cfg, i, &device)
-                        .with_context(|| format!("load native DeltaNet layer {i}"))?,
+                    attn: weight_loader::load_delta_net_layer_native(
+                        gguf, &mapped, &cfg, i, &device,
+                    )
+                    .with_context(|| format!("load native DeltaNet layer {i}"))?,
                     ffn,
                 },
             };
@@ -461,7 +638,7 @@ impl Qwen35Model {
         // row. Mirrors the Gemma path's terminal-side hygiene.
         progress.finish();
 
-        Ok(Self {
+        let model = Self {
             cfg,
             layers,
             token_embd,
@@ -473,7 +650,22 @@ impl Qwen35Model {
             mtp,
             #[cfg(test)]
             loaded_candidate_identity: None,
-        })
+        };
+        let storage = model
+            .native_matrix_storage_summary()
+            .context("account Qwen native matrix storage")?;
+        verify_native_matrix_storage(
+            storage,
+            preflight.matrix_tensor_count,
+            preflight.matrix_bytes,
+        )?;
+        tracing::info!(
+            native_matrix_views = storage.unique_matrix_views,
+            native_matrix_file_backed_bytes = storage.file_backed_bytes,
+            native_matrix_anonymous_bytes = storage.anonymous_bytes,
+            "Qwen matrices retain exact scoped GGUF storage"
+        );
+        Ok(model)
     }
 
     /// Report the active FFN variant (Dense or Moe) determined by config.
@@ -1395,6 +1587,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_matrix_storage_gate_rejects_omitted_and_anonymous_roles() {
+        use crate::serve::forward_mlx_shared::NativeMatrixStorageSummary;
+
+        let omitted = verify_native_matrix_storage(
+            NativeMatrixStorageSummary {
+                unique_matrix_views: 1,
+                file_backed_bytes: 100,
+                anonymous_bytes: 0,
+            },
+            2,
+            200,
+        )
+        .expect_err("an omitted production matrix role must fail closed");
+        assert!(omitted.to_string().contains("covered 1 unique views"));
+
+        let wrong_bytes = verify_native_matrix_storage(
+            NativeMatrixStorageSummary {
+                unique_matrix_views: 2,
+                file_backed_bytes: 100,
+                anonymous_bytes: 0,
+            },
+            2,
+            200,
+        )
+        .expect_err("partial matrix byte coverage must fail closed");
+        assert!(wrong_bytes.to_string().contains("accounted 100 bytes"));
+
+        let anonymous = verify_native_matrix_storage(
+            NativeMatrixStorageSummary {
+                unique_matrix_views: 2,
+                file_backed_bytes: 100,
+                anonymous_bytes: 100,
+            },
+            2,
+            200,
+        )
+        .expect_err("implicit anonymous matrix storage must fail closed");
+        assert!(anonymous.to_string().contains("100 anonymous matrix bytes"));
+    }
+
     fn zero_layer_native_gguf(output_rows: Option<usize>) -> tempfile::NamedTempFile {
         use crate::backends::gguf::types::MetaValue;
         use crate::backends::gguf::writer::GgufWriter;
@@ -1505,6 +1738,10 @@ mod tests {
         assert_eq!(head.buffer.contents_ptr(), token.buffer.contents_ptr());
         assert_eq!(head.info.ggml_dtype, mlx_native::GgmlType::Q8_0);
         assert_eq!(model.cfg.vocab_size, 64);
+        let storage = model.native_matrix_storage_summary().unwrap();
+        assert_eq!(storage.unique_matrix_views, 1);
+        assert_eq!(storage.file_backed_bytes, 64 * 34);
+        assert_eq!(storage.anonymous_bytes, 0);
     }
 
     #[test]
@@ -1530,8 +1767,17 @@ mod tests {
         assert_eq!(source, "output.weight");
         assert_eq!(token.info.rows, 64);
         assert_eq!(head.info.rows, 48);
-        assert_ne!(head.buffer.contents_ptr(), token.buffer.contents_ptr());
+        assert_eq!(
+            head.buffer.contents_ptr(),
+            token.buffer.contents_ptr(),
+            "all Qwen matrix views share one scoped GGUF mapping owner"
+        );
+        assert_ne!(head.buffer.byte_offset(), token.buffer.byte_offset());
         assert_eq!(model.cfg.vocab_size, 48);
+        let storage = model.native_matrix_storage_summary().unwrap();
+        assert_eq!(storage.unique_matrix_views, 2);
+        assert_eq!(storage.file_backed_bytes, (64 + 48) * 34);
+        assert_eq!(storage.anonymous_bytes, 0);
     }
 
     #[test]

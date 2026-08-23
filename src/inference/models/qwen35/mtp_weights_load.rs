@@ -1,5 +1,5 @@
 use anyhow::{bail, ensure, Context, Result};
-use mlx_native::gguf::GgufFile;
+use mlx_native::gguf::{GgufFile, GgufMappedTensorSet};
 use mlx_native::{MlxBuffer, MlxDevice};
 
 use super::ffn::MoeFfnShape;
@@ -18,11 +18,15 @@ pub fn load_mtp_weights_if_present(
     cfg: &Qwen35Config,
     device: &MlxDevice,
 ) -> Result<Option<MtpWeights>> {
-    load_mtp_weights_if_present_with_shared_head(gguf, cfg, device, None)
+    let mapped = gguf
+        .map_tensor_data(device)
+        .context("map GGUF tensor data for standalone MTP load")?;
+    load_mtp_weights_if_present_with_shared_head(gguf, &mapped, cfg, device, None)
 }
 
 pub fn load_mtp_weights_if_present_with_shared_head(
     gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
     cfg: &Qwen35Config,
     device: &MlxDevice,
     main_output_head: Option<&MlxQWeight>,
@@ -73,7 +77,7 @@ pub fn load_mtp_weights_if_present_with_shared_head(
             info.shape
         );
         let buf =
-            crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, &embed_tokens_tname, device)
+            crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, mapped, &embed_tokens_tname)
                 .with_context(|| {
                     format!(
                         "MTP loader expected dedicated `{embed_tokens_tname}` because \
@@ -108,8 +112,14 @@ pub fn load_mtp_weights_if_present_with_shared_head(
         );
         None
     };
-    let (eh_proj, eh_proj_ggml_type) =
-        load_native_projection(gguf, &format!("{nextn}.eh_proj.weight"), h, 2 * h, device)?;
+    let (eh_proj, eh_proj_ggml_type) = load_native_projection(
+        gguf,
+        mapped,
+        &format!("{nextn}.eh_proj.weight"),
+        h,
+        2 * h,
+        device,
+    )?;
     let shared_head_norm =
         load_norm_gpu(gguf, &format!("{nextn}.shared_head_norm.weight"), h, device)?;
 
@@ -144,7 +154,7 @@ pub fn load_mtp_weights_if_present_with_shared_head(
         );
         let vocab = info.shape[0];
         let (buffer, ggml_type) =
-            load_native_projection(gguf, &shared_head_head_tname, vocab, h, device)?;
+            load_native_projection(gguf, mapped, &shared_head_head_tname, vocab, h, device)?;
         (
             buffer,
             ggml_type,
@@ -187,7 +197,8 @@ pub fn load_mtp_weights_if_present_with_shared_head(
                 info.shape
             );
             let vocab = info.shape[0];
-            let (buffer, ggml_type) = load_native_projection(gguf, main_lm, vocab, h, device)?;
+            let (buffer, ggml_type) =
+                load_native_projection(gguf, mapped, main_lm, vocab, h, device)?;
             (buffer, ggml_type, vocab as u32, main_lm.to_string())
         }
     };
@@ -197,8 +208,8 @@ pub fn load_mtp_weights_if_present_with_shared_head(
         vocab_size,
         "qwen35 MTP loader: shared_head_head resolved"
     );
-    let attn = load_mtp_attn(gguf, cfg, layer_index, device)?;
-    let (ffn, intermediate_size) = load_mtp_ffn(gguf, cfg, layer_index, device)?;
+    let attn = load_mtp_attn(gguf, mapped, cfg, layer_index, device)?;
+    let (ffn, intermediate_size) = load_mtp_ffn(gguf, mapped, cfg, layer_index, device)?;
 
     Ok(Some(MtpWeights {
         layer_index,
@@ -262,6 +273,7 @@ pub(super) fn mtp_tensor_names(gguf: &GgufFile, layer_index: u32) -> Vec<String>
 
 fn load_mtp_attn(
     gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
     cfg: &Qwen35Config,
     layer_index: u32,
     device: &MlxDevice,
@@ -280,10 +292,11 @@ fn load_mtp_attn(
         .tensor_info(&q_name)
         .ok_or_else(|| anyhow::anyhow!("{q_name} not found"))?;
     let q_gate = if q_info.shape.as_slice() == [q_total, h] {
-        let (q, q_type) = load_native_projection(gguf, &q_name, q_total, h, device)?;
+        let (q, q_type) = load_native_projection(gguf, mapped, &q_name, q_total, h, device)?;
         let gate_name = format!("{p}.attn_gate.weight");
         if gguf.tensor_info(&gate_name).is_some() {
-            let (gate, gate_type) = load_native_projection(gguf, &gate_name, q_total, h, device)?;
+            let (gate, gate_type) =
+                load_native_projection(gguf, mapped, &gate_name, q_total, h, device)?;
             MtpQGateWeightsGpu::Gated(FullAttnQGateWeightsGpu::Split {
                 wq: q,
                 wq_ggml_type: q_type,
@@ -297,7 +310,8 @@ fn load_mtp_attn(
             }
         }
     } else if q_info.shape.as_slice() == [2 * q_total, h] {
-        let (fused, q_type) = load_native_projection(gguf, &q_name, 2 * q_total, h, device)?;
+        let (fused, q_type) =
+            load_native_projection(gguf, mapped, &q_name, 2 * q_total, h, device)?;
         MtpQGateWeightsGpu::Gated(FullAttnQGateWeightsGpu::Fused {
             weight: fused,
             ggml_type: q_type,
@@ -310,12 +324,30 @@ fn load_mtp_attn(
         );
     };
 
-    let (wk, wk_ggml_type) =
-        load_native_projection(gguf, &format!("{p}.attn_k.weight"), kv_total, h, device)?;
-    let (wv, wv_ggml_type) =
-        load_native_projection(gguf, &format!("{p}.attn_v.weight"), kv_total, h, device)?;
-    let (wo, wo_ggml_type) =
-        load_native_projection(gguf, &format!("{p}.attn_output.weight"), h, q_total, device)?;
+    let (wk, wk_ggml_type) = load_native_projection(
+        gguf,
+        mapped,
+        &format!("{p}.attn_k.weight"),
+        kv_total,
+        h,
+        device,
+    )?;
+    let (wv, wv_ggml_type) = load_native_projection(
+        gguf,
+        mapped,
+        &format!("{p}.attn_v.weight"),
+        kv_total,
+        h,
+        device,
+    )?;
+    let (wo, wo_ggml_type) = load_native_projection(
+        gguf,
+        mapped,
+        &format!("{p}.attn_output.weight"),
+        h,
+        q_total,
+        device,
+    )?;
 
     Ok(MtpFullAttnWeightsGpu {
         attn_norm,
@@ -334,6 +366,7 @@ fn load_mtp_attn(
 
 fn load_mtp_ffn(
     gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
     cfg: &Qwen35Config,
     layer_index: u32,
     device: &MlxDevice,
@@ -344,8 +377,8 @@ fn load_mtp_ffn(
         .tensor_info(&format!("{p}.ffn_gate_exps.weight"))
         .is_some();
     match (has_dense, has_moe) {
-        (true, false) => load_mtp_dense_ffn(gguf, cfg, &p, device),
-        (false, true) => load_mtp_moe_ffn(gguf, cfg, layer_index, &p, device),
+        (true, false) => load_mtp_dense_ffn(gguf, mapped, cfg, &p, device),
+        (false, true) => load_mtp_moe_ffn(gguf, mapped, cfg, layer_index, &p, device),
         (true, true) => bail!(
             "qwen35 MTP loader: block {layer_index} has BOTH dense (`{p}.ffn_gate.weight`) and \
              MoE (`{p}.ffn_gate_exps.weight`) FFN tensors — GGUF is malformed"
@@ -359,6 +392,7 @@ fn load_mtp_ffn(
 
 fn load_mtp_dense_ffn(
     gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
     cfg: &Qwen35Config,
     p: &str,
     device: &MlxDevice,
@@ -367,7 +401,7 @@ fn load_mtp_dense_ffn(
     let (gate_type, up_type, down_type) = dense_ffn_tensor_types(gguf, layer_idx)?;
     match dense_ffn_storage(layer_idx, gate_type, up_type, down_type)? {
         DenseFfnStorage::Quantized => {
-            let weights_q = load_dense_ffn_quantized(gguf, layer_idx, cfg, device)
+            let weights_q = load_dense_ffn_quantized(gguf, mapped, layer_idx, cfg, device)
                 .with_context(|| format!("MTP native dense FFN {p}"))?;
             let intermediate_size = weights_q.intermediate_size;
             let dense_gpu = DenseFfnWeightsGpuQ::from_quantized(&weights_q);
@@ -377,7 +411,7 @@ fn load_mtp_dense_ffn(
             ))
         }
         DenseFfnStorage::NativeScalar => {
-            let weights_native = load_dense_ffn_native(gguf, layer_idx, cfg, device)
+            let weights_native = load_dense_ffn_native(gguf, mapped, layer_idx, cfg, device)
                 .with_context(|| format!("MTP native scalar dense FFN {p}"))?;
             let intermediate_size = weights_native.intermediate_size;
             let weights = DenseFfnWeightsGpu::from_native(&weights_native);
@@ -394,6 +428,7 @@ fn load_mtp_dense_ffn(
 
 fn load_mtp_moe_ffn(
     gguf: &GgufFile,
+    mapped: &GgufMappedTensorSet<'_>,
     cfg: &Qwen35Config,
     layer_index: u32,
     p: &str,
@@ -408,25 +443,15 @@ fn load_mtp_moe_ffn(
     // Load with the same quantized path used by every other MoE layer; this
     // keeps expert weights as native GGML blocks (no F32 expansion) and
     // matches what the verifier's main forward path consumes.
-    let weights_q = load_moe_ffn_quantized(gguf, layer_index, device)
+    let weights_q = load_moe_ffn_quantized(gguf, mapped, cfg, layer_index, device)
         .with_context(|| format!("MTP MoE FFN layer {layer_index}"))?;
     let moe_gpu = MoeFfnWeightsGpuQ::from_quantized(
-        weights_q.expert_gate_q.clone(),
-        weights_q.expert_up_q.clone(),
-        weights_q.expert_down_q.clone(),
-        weights_q.ggml_type_gate_up,
-        weights_q.ggml_type_down,
+        &weights_q,
         moe_cfg.num_experts,
         moe_cfg.moe_intermediate_size,
         cfg.hidden_size,
-        &weights_q.router,
-        &weights_q.shared_gate_logit,
-        &weights_q.shared_gate,
-        &weights_q.shared_up,
-        &weights_q.shared_down,
-        device,
     )
-    .with_context(|| format!("MTP MoE upload layer {layer_index}"))?;
+    .with_context(|| format!("MTP MoE retain layer {layer_index}"))?;
     let shape = MoeFfnShape {
         hidden_size: cfg.hidden_size,
         num_experts: moe_cfg.num_experts,

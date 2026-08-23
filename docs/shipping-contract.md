@@ -60,6 +60,17 @@ cache, or forward graph.
   A→B→A gate requires Gemma's live artifact mapping to disappear on eviction,
   reappear only for a fresh A generation, preserve exact A replay, and remain
   within the endpoint-based no-double-residency and reload memory bounds.
+- **Artifact-native Qwen3.5-family matrix storage.** Before Metal allocation,
+  the loader admits every embedding, head, dense, MoE, and MTP matrix codec and
+  all serving widths. One model-scoped GGUF mapping owns the exact rank-2 and
+  rank-3 matrix views; only elementwise/state tensors may materialize F32.
+  Router and shared-expert matrices are not decoded and uploaded as BF16, and
+  tied/shared heads are aliases rather than duplicate allocations. Runtime
+  unique-view count and bytes must exactly equal the independent preflight
+  matrix receipt with zero anonymous matrix bytes. Model swap applies the same
+  mapping-disappearance, fresh-generation, exact-replay, bounded-peak, and
+  reclaim contract described above; copied storage is not an accepted Qwen
+  matrix fallback.
 - **Public by 0.1.6; strengthened through the 0.1.8 release:**
   Qwen3.5/Qwen3.6 and Qwen3.8 generation and OpenAI-compatible
   serving use the shared autoregressive `qwen35`/`qwen35moe` graph by default.

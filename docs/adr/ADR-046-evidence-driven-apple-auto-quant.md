@@ -101,6 +101,51 @@ also requires matched prompt-token counts, greedy continuation equality,
 single-user decode medians, long-prefill medians, and the shipping Gemma gates
 on the exact artifact and pinned runtime dependency.
 
+### 2026-08-22 Qwen native-matrix execution amendment
+
+The same representation boundary applies to every production Qwen3.5-family
+loader, not only to the dense Qwen3.8 output head. A smallest production-loader
+spike on exact base `168d144c` proved that rank-2 projections preserved codec,
+shape, and byte length but copied their payload into anonymous Metal storage.
+The file-backed assertion was the sole failure. The reformulated contract is:
+
+- `Qwen35Model::load_from_gguf` performs complete header/capability preflight,
+  creates one model-scoped GGUF tensor mapping, and derives all production
+  matrix views from it. Attention, DeltaNet projections, dense FFNs, token
+  embeddings, explicit or tied output heads, and MTP use rank-2 native views.
+  MoE router/shared-expert matrices use those same views; rank-3 expert stacks
+  use exact slices of the same mapping. Norms, convolution/state vectors, and
+  other elementwise inputs are the only tensors materialized as F32.
+- Admission covers decode M=1, continuous widths 2/3/4/8, and prompt widths
+  9/16/17 for every dense matrix. Expert stacks independently prove the same
+  widths through their production pooled entry point and exact input layout.
+  Shape, payload-block geometry, per-expert stride divisibility, unsupported
+  codecs, and missing MTP/tied-head partners fail before model allocation.
+- Tied output and shared-MTP heads retain one exact matrix range. A dedicated
+  head is a different range under the same scoped mapping owner. Explicit
+  affine overlays keep their declared buffers and dispatch; base GGUF matrices
+  are never dequantized or re-encoded to accommodate an overlay.
+- The runtime matrix ledger de-duplicates aliases by Metal allocation and
+  logical byte range, then compares its unique-view count and exact byte total
+  against the independently derived pre-allocation GGUF receipt. Any omitted
+  production role, partial byte coverage, or anonymous matrix allocation fails
+  model load. This prevents a manually incomplete visitor from proving only
+  the subset it happened to observe.
+- Mapping ownership is model-local and path-independent. Dropping one model
+  releases its view owners; reloading A after B opens the current A artifact
+  and cannot reuse an anonymous or transformed process-global shadow. The
+  representation-sensitive A→B→A shipping gate classifies each resident from
+  OS mapping evidence, requires the evicted mapping to disappear, exact A
+  replay, fresh generations, bounded peaks, and endpoint reclaim.
+
+The red projection spike is green with exact file backing. Focused model-free
+and tiny-Metal gates cover stored-width admission, tied and dedicated owner
+ranges, omission/partial-byte/anonymous ledger canaries, mapped A→B→A
+path-independence, dense and MoE FFN parity, MTP sharing, and the QMoE verifier.
+Exact Q5_K/Q6_K full-model coherence, load/reclaim, and serving performance
+remain hardware acceptance gates; this amendment makes no full-model speed
+claim before those receipts exist.
+
 #### Native-matrix availability and performance evidence
 
 The 2026-08-22 Apple run used an M5 Max and exact artifact

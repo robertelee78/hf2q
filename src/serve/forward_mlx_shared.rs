@@ -9,15 +9,16 @@
 //! ADR-038 Step 3 retires `forward_mlx.rs`.
 
 use crate::core::mlx_safetensors_loader::MlxAffineLinear;
-use crate::quantize::imatrix::{ImatrixHint, intercept_qmatmul_with_hint};
+use crate::quantize::imatrix::{intercept_qmatmul_with_hint, ImatrixHint};
 use crate::serve::gpu::QuantWeightInfo;
 use anyhow::Result;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use mlx_native::{
-    GGML_CAPABILITY_SCHEMA_VERSION, GgmlCapabilityRequest, GgmlInvocation,
-    GgmlQuantizedMatmulParams, GgmlRoutingPolicy, GgmlWorkloadClass, GraphSession, MlxBuffer,
-    MlxDevice, ggml_capability,
+    ggml_capability, GgmlCapabilityRequest, GgmlInvocation, GgmlQuantizedMatmulParams,
+    GgmlRoutingPolicy, GgmlWorkloadClass, GraphSession, MlxBuffer, MlxDevice,
+    GGML_CAPABILITY_SCHEMA_VERSION,
 };
+use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
 // Cluster 1 — Quantized weight types
@@ -33,6 +34,7 @@ use mlx_native::{
 /// DWQ-trained safetensors.  Held as F32 buffers (cast at load time
 /// from BF16/F32 depending on the on-disk safetensors dtype) so the
 /// kernel can read them without an inline cast.
+#[derive(Clone)]
 pub struct MlxAffineExtra {
     /// Per-group scales, F32, shape `[N, K/group_size]`.
     pub scales: MlxBuffer,
@@ -77,6 +79,20 @@ pub struct MlxQWeight {
     pub decode_record_q6k_m1: std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
 }
 
+impl Clone for MlxQWeight {
+    fn clone(&self) -> Self {
+        Self {
+            buffer: self.buffer.clone(),
+            info: self.info,
+            affine: self.affine.clone(),
+            // Dispatch records are an execution cache, not matrix identity.
+            // A cloned model-local handle lazily bakes its own record while
+            // retaining the same underlying artifact-backed buffer owner.
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        }
+    }
+}
+
 /// How a head-major BF16 activation reached an ordinary native projection.
 /// Both routes retain the weight's declared storage bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +106,25 @@ pub enum HeadMajorQmatmulRoute {
 }
 
 impl MlxQWeight {
+    #[cfg(test)]
+    pub(crate) fn from_test_buffer(
+        buffer: MlxBuffer,
+        ggml_dtype: mlx_native::GgmlType,
+        rows: usize,
+        cols: usize,
+    ) -> Self {
+        Self {
+            buffer,
+            info: QuantWeightInfo {
+                ggml_dtype,
+                rows,
+                cols,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        }
+    }
+
     /// Retain one exact, file-backed matrix view from a mapped GGUF.
     ///
     /// Family loaders remain responsible for capability admission before
@@ -236,6 +271,57 @@ impl MlxQWeight {
     }
 }
 
+/// Exact logical-byte accounting for model-owned matrix views. Views that
+/// name the same Metal allocation range are counted once, so tied output
+/// heads and MTP aliases cannot inflate residency reporting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeMatrixStorageSummary {
+    pub unique_matrix_views: usize,
+    pub file_backed_bytes: u64,
+    pub anonymous_bytes: u64,
+}
+
+impl NativeMatrixStorageSummary {
+    pub fn resident_bytes(self) -> u64 {
+        self.file_backed_bytes + self.anonymous_bytes
+    }
+}
+
+/// Summarize the physical backing of exact model matrix views. The identity
+/// includes the underlying Metal resource and logical byte range: separate
+/// tensors in one scoped GGUF mapping remain distinct, while ARC clones of a
+/// tied tensor collapse to one entry.
+pub fn summarize_native_matrix_storage<'a>(
+    buffers: impl IntoIterator<Item = &'a MlxBuffer>,
+) -> Result<NativeMatrixStorageSummary> {
+    let mut seen = BTreeSet::new();
+    let mut summary = NativeMatrixStorageSummary::default();
+    for buffer in buffers {
+        let identity = (
+            buffer.contents_ptr() as usize,
+            buffer.byte_offset(),
+            buffer.data_byte_len(),
+        );
+        if !seen.insert(identity) {
+            continue;
+        }
+        let bytes = u64::try_from(buffer.data_byte_len())?;
+        summary.unique_matrix_views += 1;
+        if buffer.is_file_backed() {
+            summary.file_backed_bytes = summary
+                .file_backed_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow::anyhow!("file-backed matrix byte accounting overflow"))?;
+        } else {
+            summary.anonymous_bytes = summary
+                .anonymous_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow::anyhow!("anonymous matrix byte accounting overflow"))?;
+        }
+    }
+    Ok(summary)
+}
+
 /// Retain one exact, file-backed tensor view from a mapped GGUF.
 ///
 /// Rank-2 matrices normally use [`MlxQWeight::from_mapped_gguf_tensor`]. Expert
@@ -304,6 +390,13 @@ mod native_matrix_mapped_tests {
             drop(gguf);
             std::fs::remove_file(&path).unwrap();
 
+            let tied_head = weight.clone();
+            let storage =
+                summarize_native_matrix_storage([&weight.buffer, &tied_head.buffer]).unwrap();
+            assert_eq!(storage.unique_matrix_views, 1);
+            assert_eq!(storage.file_backed_bytes, (rows * cols * 4) as u64);
+            assert_eq!(storage.anonymous_bytes, 0);
+
             let retained = weight.buffer.as_slice::<f32>().unwrap();
             assert_eq!(retained[0], base);
             assert_eq!(retained[rows * cols - 1], base + (rows * cols - 1) as f32);
@@ -348,15 +441,11 @@ pub struct MlxAffineMoeStack {
     pub num_experts: usize,
 }
 
-/// Helper: load a GGUF tensor as raw quantized bytes into an MlxQWeight.
-///
-/// The tensor name is looked up in the GGUF file, its raw GGML block data
-/// is copied into a new MlxBuffer, and the `QuantWeightInfo` is derived
-/// from the tensor's metadata (shape and GGML type).
+/// Resolve a rank-2 GGUF matrix as an exact view of one scoped mapping.
 pub(crate) fn load_gguf_qweight(
     gguf: &mlx_native::gguf::GgufFile,
+    mapped: &mlx_native::gguf::GgufMappedTensorSet<'_>,
     name: &str,
-    device: &MlxDevice,
 ) -> Result<MlxQWeight> {
     let full_name = if name.ends_with(".weight") {
         name.to_string()
@@ -366,29 +455,8 @@ pub(crate) fn load_gguf_qweight(
     let info = gguf
         .tensor_info(&full_name)
         .ok_or_else(|| crate::serve::load_diagnostic::MissingGgufTensor::new(full_name.clone()))?;
-    anyhow::ensure!(
-        info.shape.len() == 2,
-        "native GGUF weight {full_name} must be rank 2, got shape {:?}",
-        info.shape
-    );
-    let buffer = gguf
-        .load_tensor(&full_name, device)
-        .map_err(|e| anyhow::anyhow!("load {}: {e}", full_name))?;
-
-    // Shape: [rows, cols] for 2D weight matrices.
-    let rows = info.shape[0];
-    let cols = info.shape[1];
-
-    Ok(MlxQWeight {
-        buffer,
-        info: QuantWeightInfo {
-            ggml_dtype: info.ggml_type,
-            rows,
-            cols,
-        },
-        affine: None,
-        decode_record_q6k_m1: std::sync::OnceLock::new(),
-    })
+    MlxQWeight::from_mapped_gguf_tensor(mapped, info)
+        .map_err(|error| anyhow::anyhow!("load {full_name} from scoped GGUF mapping: {error}"))
 }
 
 /// Whether a stored projection can consume head-major BF16 activations
@@ -1051,7 +1119,7 @@ pub fn dispatch_rms_norm_unit_perhead_dual_perm(
     seq_len: u32,
     dim: u32,
 ) -> Result<()> {
-    use mlx_native::ops::encode_helpers::{KernelArg, encode_threadgroups_with_args_and_shared};
+    use mlx_native::ops::encode_helpers::{encode_threadgroups_with_args_and_shared, KernelArg};
     let pipeline = registry
         .get_pipeline("rms_norm_no_scale_f32_dual_perm", device)
         .map_err(|e| anyhow::anyhow!("rms_norm_no_scale_f32_dual_perm pipeline: {e}"))?;
@@ -1741,7 +1809,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
     #[test]
     fn parse_dwq_moe_expert_role_covers_all_bases() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        use super::{MoeBaseRole, parse_dwq_moe_expert_role};
+        use super::{parse_dwq_moe_expert_role, MoeBaseRole};
         // Fused gate+up case (qwen3.5 GGUF).
         assert_eq!(
             parse_dwq_moe_expert_role("ffn_gate_up.0"),
@@ -1782,7 +1850,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
     #[test]
     fn parse_dwq_overlay_role_covers_all_dense_stems() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        use super::{DwqOverlayRole, parse_dwq_overlay_role};
+        use super::{parse_dwq_overlay_role, DwqOverlayRole};
         // Dense Linears.
         assert_eq!(parse_dwq_overlay_role("attn_q"), DwqOverlayRole::AttnQ);
         assert_eq!(parse_dwq_overlay_role("attn_k"), DwqOverlayRole::AttnK);
@@ -1869,7 +1937,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
     fn dwq_safetensors_metadata_roundtrip() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::core::mlx_safetensors_loader::{MlxAffineLinear, MlxAffineLinearBytes};
-        use safetensors::tensor::{Dtype, serialize};
+        use safetensors::tensor::{serialize, Dtype};
         use std::collections::HashMap;
 
         let n = 32usize;
