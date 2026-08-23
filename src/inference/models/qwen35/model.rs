@@ -1589,6 +1589,7 @@ mod tests {
 
     #[test]
     fn native_matrix_storage_gate_rejects_omitted_and_anonymous_roles() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::forward_mlx_shared::NativeMatrixStorageSummary;
 
         let omitted = verify_native_matrix_storage(

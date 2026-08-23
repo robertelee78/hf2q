@@ -178,6 +178,145 @@ fn production_matrix_preflight_retains_non_power_and_prompt_boundaries() {
 }
 
 #[test]
+fn qwen_expert_down_preflight_matches_flattened_runtime_rows() {
+    const EXPERTS: u32 = 256;
+    const TOP_K: u32 = 8;
+    const HIDDEN: u32 = 2_048;
+    const EXPERT_WIDTH: u32 = 512;
+    const Q6_K_BLOCK_VALUES: u64 = 256;
+    const Q6_K_BLOCK_BYTES: u64 = 210;
+    let expert_stride =
+        u64::from(HIDDEN) * u64::from(EXPERT_WIDTH) / Q6_K_BLOCK_VALUES * Q6_K_BLOCK_BYTES;
+
+    let decode = expert_capability_request(
+        GgmlType::Q6_K,
+        HIDDEN,
+        EXPERT_WIDTH,
+        TOP_K,
+        EXPERTS,
+        expert_stride,
+        1,
+        GgmlWorkloadClass::DecodeSingle,
+        ExpertExecution::FlattenedRoutedRows,
+    )
+    .expect("decode down request");
+    let GgmlInvocation::ExpertPooled {
+        shape,
+        input_layout,
+    } = decode.invocation
+    else {
+        panic!("down request must use the pooled expert entry point")
+    };
+    assert_eq!(shape.n_tokens, TOP_K);
+    assert_eq!(shape.top_k, 1);
+    assert_eq!(input_layout, GgmlExpertInputLayout::SharedPerToken);
+    assert_eq!(decode.workload, GgmlWorkloadClass::ContinuousWidth);
+    let decode_capability = mlx_native::ggml_capability(decode);
+    assert!(
+        decode_capability.executable,
+        "flattened decode rows must retain the production matvec route: {}",
+        decode_capability.diagnostic
+    );
+    assert!(matches!(
+        decode_capability.route,
+        Some(mlx_native::GgmlKernelRoute::ExpertMv | mlx_native::GgmlKernelRoute::ExpertMvNr2)
+    ));
+
+    let prompt = expert_capability_request(
+        GgmlType::Q6_K,
+        HIDDEN,
+        EXPERT_WIDTH,
+        TOP_K,
+        EXPERTS,
+        expert_stride,
+        8,
+        GgmlWorkloadClass::ContinuousWidth,
+        ExpertExecution::FlattenedRoutedRows,
+    )
+    .expect("prompt down request");
+    let GgmlInvocation::ExpertPooled { shape, .. } = prompt.invocation else {
+        panic!("down request must use the pooled expert entry point")
+    };
+    assert_eq!(shape.n_tokens, 64);
+    assert_eq!(shape.top_k, 1);
+    assert_eq!(prompt.workload, GgmlWorkloadClass::Prompt);
+    let prompt_capability = mlx_native::ggml_capability(prompt);
+    assert!(
+        prompt_capability.executable,
+        "flattened prompt rows must use the supported mm_id route: {}",
+        prompt_capability.diagnostic
+    );
+    assert!(matches!(
+        prompt_capability.route,
+        Some(
+            mlx_native::GgmlKernelRoute::ExpertPooledMmSimdgroup
+                | mlx_native::GgmlKernelRoute::ExpertPooledMmDeviceSelected
+        )
+    ));
+
+    let info = TensorInfo {
+        name: "blk.0.ffn_down_exps.weight".into(),
+        shape: vec![EXPERTS as usize, HIDDEN as usize, EXPERT_WIDTH as usize],
+        ggml_type: GgmlType::Q6_K,
+        offset: 0,
+        byte_len: usize::try_from(expert_stride * u64::from(EXPERTS)).unwrap(),
+    };
+    ensure_expert_capability(
+        &info.name,
+        &info,
+        HIDDEN as usize,
+        EXPERT_WIDTH as usize,
+        TOP_K,
+        EXPERTS,
+        ExpertExecution::FlattenedRoutedRows,
+    )
+    .expect("the complete production down-width matrix must be admitted");
+}
+
+#[test]
+fn qwen_expert_down_preflight_keeps_slotted_and_overflow_canaries_closed() {
+    let mut slotted = expert_capability_request(
+        GgmlType::Q6_K,
+        2_048,
+        512,
+        8,
+        256,
+        860_160,
+        1,
+        GgmlWorkloadClass::DecodeSingle,
+        ExpertExecution::FlattenedRoutedRows,
+    )
+    .expect("decode down request");
+    let GgmlInvocation::ExpertPooled { input_layout, .. } = &mut slotted.invocation else {
+        panic!("down request must use the pooled expert entry point")
+    };
+    *input_layout = GgmlExpertInputLayout::Slotted;
+    let rejected = mlx_native::ggml_capability(slotted);
+    assert!(!rejected.executable);
+    assert!(
+        rejected
+            .diagnostic
+            .contains("paired/slotted pooled expert entry point requires the mm_id route"),
+        "unexpected slotted rejection: {}",
+        rejected.diagnostic
+    );
+
+    let error = expert_capability_request(
+        GgmlType::Q6_K,
+        2_048,
+        512,
+        2,
+        256,
+        860_160,
+        u32::MAX,
+        GgmlWorkloadClass::Prompt,
+        ExpertExecution::FlattenedRoutedRows,
+    )
+    .expect_err("flattened routed-row overflow must fail before capability evaluation");
+    assert!(error.to_string().contains("row count overflows u32"));
+}
+
+#[test]
 fn shared_expert_gate_preflight_accepts_only_exact_rank_one_storage() {
     let cols = 256usize;
     let exact_file = row_projection_fixture(&[cols as u64]);
