@@ -121,15 +121,19 @@ The file-backed assertion was the sole failure. The reformulated contract is:
   convolution/state vectors, and other elementwise inputs are the only tensors
   materialized as F32.
 - Admission covers decode M=1, continuous widths 2/3/4/8, and prompt widths
-  9/16/17 for every dense matrix. Expert stacks independently prove the same
-  source widths through their exact production pooled geometry: gate/up use
-  one shared input row per source token with configured top-k, while down uses
-  the already-routed rows as `M = source_tokens * top_k`, runtime top-k 1, and
-  the shared-row entry point. The latter selects matvec for small routed-row
-  counts and `mm_id` above its routing threshold; it is not the slotted-only
-  entry point. Shape, routed-row overflow, payload-block geometry, per-expert
-  stride divisibility, unsupported codecs, and missing MTP/tied-head partners
-  fail before model allocation.
+  9/16/17 for every dense matrix. Expert stacks prove those source widths plus
+  the active routing policy's last-matvec/first-`mm_id` boundary and the exact
+  2,048-token multi-slot and 4,096-token single-slot scheduler maxima. Boundary
+  probes are capped at the scheduler maximum, so a high operator threshold
+  that deliberately keeps all served work on matvec cannot create impossible
+  admission shapes. Gate/up use one shared input row per source token with
+  configured top-k, while down uses the already-routed rows as
+  `M = source_tokens * top_k`, runtime top-k 1, and the shared-row entry point.
+  The latter selects matvec through its inclusive threshold and `mm_id` only
+  above it; it is not the slotted-only entry point. Shape, routed-row overflow,
+  maximum scratch geometry, payload-block geometry, per-expert stride
+  divisibility, unsupported codecs, and missing MTP/tied-head partners fail
+  before model allocation.
 - Tied output and shared-MTP heads retain one exact matrix range. A dedicated
   head is a different range under the same scoped mapping owner. Explicit
   affine overlays keep their declared buffers and dispatch; base GGUF matrices
@@ -153,8 +157,11 @@ declared the slotted pooled entry point. Source inspection of both production
 decode and prefill paths showed that no Qwen down call uses that ABI; both
 flatten routed rows and call the shared pooled dispatcher with top-k 1. The
 corrected model-free gate proves the exact M=1 transform (eight routed rows for
-top-k 8), the M=8 `mm_id` transform (64 routed rows), the retained rejection
-of an actually slotted small-M request, and checked row-count overflow.
+top-k 8), Q6_K down source M=4/M=5 as runtime M=32 matvec/M=40 `mm_id`,
+Q5_K gate/up source M=32/M=33 as matvec/`mm_id`, both scheduler maxima, the
+retained rejection of an actually slotted small-M request, checked row-count
+overflow, and a high-threshold canary whose source widths remain bounded by
+4,096.
 
 The red projection spike is green with exact file backing. Focused model-free
 and tiny-Metal gates cover stored-width admission, tied and dedicated owner

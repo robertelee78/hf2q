@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use mlx_native::gguf::{GgufFile, TensorInfo};
 use mlx_native::{
     GgmlCapabilityRequest, GgmlExpertInputLayout, GgmlExpertShape, GgmlInvocation,
-    GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
+    GgmlRoutingPolicy, GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
 };
 
 use super::{Qwen35Config, Qwen35LayerKind, Qwen35Variant};
@@ -37,6 +37,11 @@ const REQUIRED_MATRIX_WIDTHS: [(u32, GgmlWorkloadClass); 8] = [
     (16, GgmlWorkloadClass::Prompt),
     (17, GgmlWorkloadClass::Prompt),
 ];
+
+/// Exact largest source-token chunks admitted by Qwen serving: the multi-slot
+/// scheduler width and the single-slot ceiling. These are expert-only because
+/// routed scratch/row expansion must be checked at the graph's actual maximum.
+const REQUIRED_EXPERT_SCHEDULER_WIDTHS: [u32; 2] = [2_048, 4_096];
 
 fn checked_tensor_bytes(info: &TensorInfo) -> Result<usize> {
     let (&inner, outer) = info
@@ -265,7 +270,8 @@ fn ensure_expert_capability(
         .context("Qwen expert stride exceeds u64")?;
     let n = u32::try_from(n).context("Qwen expert output rows exceed u32")?;
     let k = u32::try_from(k).context("Qwen expert input cols exceed u32")?;
-    for (source_tokens, source_workload) in REQUIRED_MATRIX_WIDTHS {
+    let routing = mlx_native::ggml_routing_policy_from_environment();
+    for source_tokens in required_expert_source_widths(execution, top_k, routing)? {
         let request = expert_capability_request(
             info.ggml_type,
             n,
@@ -274,8 +280,8 @@ fn ensure_expert_capability(
             n_experts,
             expert_stride_bytes,
             source_tokens,
-            source_workload,
             execution,
+            routing,
         )?;
         let GgmlInvocation::ExpertPooled { shape, .. } = request.invocation else {
             unreachable!("Qwen expert preflight only constructs pooled requests")
@@ -312,6 +318,58 @@ fn workload_for_runtime_rows(rows: u32) -> GgmlWorkloadClass {
     }
 }
 
+/// Preserve every ordinary serving width, then add the exact expert route
+/// boundary under the active policy and both scheduler maxima. Down's route
+/// boundary is expressed in source tokens but derived from its expanded row
+/// count, so default top-k 8 proves source M=4 (runtime M=32) and M=5 (40).
+fn required_expert_source_widths(
+    execution: ExpertExecution,
+    configured_top_k: u32,
+    routing: GgmlRoutingPolicy,
+) -> Result<Vec<u32>> {
+    ensure!(configured_top_k > 0, "Qwen expert top-k must be non-zero");
+    ensure!(
+        routing.expert_mm_threshold > 0,
+        "Qwen expert MM routing threshold must be non-zero"
+    );
+    let mut widths = REQUIRED_MATRIX_WIDTHS
+        .iter()
+        .map(|(width, _)| *width)
+        .chain(REQUIRED_EXPERT_SCHEDULER_WIDTHS)
+        .collect::<Vec<_>>();
+    let scheduler_max = *REQUIRED_EXPERT_SCHEDULER_WIDTHS
+        .last()
+        .expect("expert scheduler widths are non-empty");
+    let mut add_if_served = |width: u32| {
+        if (1..=scheduler_max).contains(&width) {
+            widths.push(width);
+        }
+    };
+    match execution {
+        ExpertExecution::SharedPerSourceToken => {
+            if let Some(before) = routing.expert_mm_threshold.checked_sub(1) {
+                add_if_served(before);
+            }
+            add_if_served(routing.expert_mm_threshold);
+            if let Some(first_mm) = routing.expert_mm_threshold.checked_add(1) {
+                add_if_served(first_mm);
+            }
+        }
+        ExpertExecution::FlattenedRoutedRows => {
+            let last_mv_source = routing.expert_mm_threshold / configured_top_k;
+            add_if_served(last_mv_source);
+            if let Some(first_mm_source) = last_mv_source.checked_add(1) {
+                if first_mm_source.checked_mul(configured_top_k).is_some() {
+                    add_if_served(first_mm_source);
+                }
+            }
+        }
+    }
+    widths.sort_unstable();
+    widths.dedup();
+    Ok(widths)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn expert_capability_request(
     ggml_type: mlx_native::GgmlType,
@@ -321,11 +379,15 @@ fn expert_capability_request(
     n_experts: u32,
     expert_stride_bytes: u64,
     source_tokens: u32,
-    source_workload: GgmlWorkloadClass,
     execution: ExpertExecution,
+    routing: GgmlRoutingPolicy,
 ) -> Result<GgmlCapabilityRequest> {
     let (n_tokens, top_k, workload) = match execution {
-        ExpertExecution::SharedPerSourceToken => (source_tokens, configured_top_k, source_workload),
+        ExpertExecution::SharedPerSourceToken => (
+            source_tokens,
+            configured_top_k,
+            workload_for_runtime_rows(source_tokens),
+        ),
         ExpertExecution::FlattenedRoutedRows => {
             let n_tokens = source_tokens.checked_mul(configured_top_k).ok_or_else(|| {
                 anyhow!(
@@ -352,7 +414,7 @@ fn expert_capability_request(
         },
         ggml_type,
         workload,
-        routing: mlx_native::ggml_routing_policy_from_environment(),
+        routing,
     })
 }
 
