@@ -1,11 +1,11 @@
 # ADR-047: Diagnostic chat over the native inference server
 
-- **Status:** Accepted; text-engine A -> B -> A proof passed; embedding and projector lifecycle execution active
+- **Status:** Accepted; text-engine and dedicated-embedding lifecycle proofs passed; projector lifecycle execution active
 - **Date:** 2026-08-20
-- **Updated:** 2026-08-22 — exact-candidate embedding activation and the
-  synthetic public A -> B -> A lifecycle gate are green; the converted real
-  BERT -> Nomic-BERT -> BERT quality, mapping-reclaim, and latency receipt
-  remains an acceptance gate and is not claimed by this revision
+- **Updated:** 2026-08-22 — exact-candidate embedding activation, synthetic
+  lifecycle, and converted real BERT -> Nomic-BERT -> BERT public
+  quality/mapping/reclaim gates are green under the measured fail-closed
+  16 MiB settled-RSS/wired/peak-RSS replay bound below
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
 
 ## Context
@@ -732,6 +732,30 @@ wired) for Gemma -> Qwen and 31,998,066,688 / 36,528,816,128 bytes for
 Qwen -> Gemma, both within the gate's no-double-residency bound. The reloaded
 Gemma engine published a fresh generation, retained the exact path-free engine
 configuration identity, and reproduced its deterministic response exactly.
+
+The independent dedicated-embedding gate also passed on the M5 Max using
+hf2q-produced Q4_0 artifacts converted from pinned BERT and Nomic-BERT source
+safetensors. Every transition used the public schema-v3 activation route with
+an opaque exact candidate, and every embedding used the public OpenAI route.
+Cosine against the pinned reference was 0.999997/1.000000 for BERT
+short/long and 0.999997/0.999998 for Nomic short/long. Fresh BERT reproduced
+both vectors exactly. Exact weak references proved that model, tokenizer,
+vocabulary, and warmed registry were reclaimed before the next generation;
+`lsof` plus exact-path `vmmap` proved only the active GGUF mapping survived.
+An unloadable exact candidate left the dedicated domain unavailable, and a
+new explicit public activation recovered a fresh exact BERT generation.
+
+The original 20 ms subprocess peak sampler was falsified when it missed a
+short initial load. The accepted gate uses a start-handshaken, 1 ms in-process
+Mach task-info observer. Its A/B/fresh-A peaks were
+115,032,064/128,204,800/116,703,232 bytes; settled RSS was
+47,054,848/47,087,616/48,545,792 and wired bytes were
+134,217,728/125,829,120/134,217,728. Fresh A stayed inside the measured 16 MiB
+replay bound on all three quantities. Across three complete green runs,
+median load-or-switch-to-first-result was 142.980/208.931/100.837 ms for
+A/B/fresh-A, and median steady HTTP embedding latency was
+12.161/12.822/11.292 ms. These are small-artifact single-request lifecycle
+receipts, not language-model throughput claims.
 
 ## Consequences
 

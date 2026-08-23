@@ -420,6 +420,7 @@ mod tests {
 
     #[test]
     fn bert_manifest_fails_closed_before_nomic_payload_mapping() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("bert-named-as-nomic.gguf");
         write_fixture(&path, &bert_tensors(4, 0x88, 2), false);

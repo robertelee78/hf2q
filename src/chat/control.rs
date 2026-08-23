@@ -1104,11 +1104,7 @@ mod tests {
         assert!(output.contains("BF16"));
 
         let initial = control
-            .select_initial_local(
-                None,
-                &mut std::io::Cursor::new(Vec::<u8>::new()),
-                &mut Vec::new(),
-            )
+            .select_initial_local(None, &mut std::io::Cursor::new(b"1\n"), &mut Vec::new())
             .await
             .unwrap()
             .unwrap();
@@ -1177,7 +1173,9 @@ mod tests {
                 None,
                 None,
                 None,
-                &mut std::io::Cursor::new(b"2\n"),
+                // Two local artifacts precede the hosted-browse row. After
+                // the hosted catalog fails, select local Q4_K_M explicitly.
+                &mut std::io::Cursor::new(b"3\n1\n"),
                 &mut output,
             )
             .await

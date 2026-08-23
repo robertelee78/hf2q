@@ -245,6 +245,41 @@ The source-derived gate identities are fixed before measurement:
   `99d5c1378a62669cd0b199ae0506b91f81600d438f0bcb0cab37c4e733078e6a`.
   Neither gate GGUF was downloaded pre-quantized.
 
+The first quiet-host real lifecycle spike reached the complete public
+A -> B -> A path and the pinned reference-quality phase. Its cosine scores
+were 0.999997/1.000000 for BERT short/long and 0.999997/0.999998 for Nomic
+short/long. Initial-A versus fresh-A settled RSS differed by 1,556,480 bytes,
+wired bytes were equal. The next confirmation run falsified its 20 ms `ps`
+subprocess peak observer: it reported only 69,959,680 bytes for initial A but
+116,539,392 bytes for fresh A because the subprocess cadence missed a short
+initial allocation peak. Widening a threshold around that observer is
+rejected. The confirmation gate instead samples current RSS in-process through
+Mach task info every 1 ms. The measured settled-RSS and wired-byte contract,
+and the peak-RSS hypothesis under the corrected observer, require fresh A to
+return within 16 MiB of initial A. That allowance is smaller than either
+complete resident artifact (25,429,104 bytes for A and 83,093,376 bytes for
+B). Exact weak-reference reclamation, exact mapped-file replacement, and
+one-generation logical byte accounting remain independent mandatory checks;
+the numeric bound cannot substitute for them.
+
+The corrected-observer confirmation passed. In-process peak RSS was
+115,032,064/128,204,800/116,703,232 bytes for A/B/fresh-A, so fresh A returned
+within 1,671,168 bytes of its initial peak. Settled RSS was
+47,054,848/47,087,616/48,545,792 bytes and wired bytes were
+134,217,728/125,829,120/134,217,728. Across three complete green lifecycle
+runs, median activation-to-first-result was 142.980 ms for initial A,
+208.931 ms for A -> B, and 100.837 ms for B -> fresh A. Median first-result
+latency after publication was 12.830/13.557/12.685 ms; median steady HTTP
+latency was 12.161/12.822/11.292 ms. All three runs reproduced A exactly,
+kept tokenizer/config/registry generations isolated, and passed exact mapping
+and weak-ownership reclamation. The quality reference was
+`llama-embedding` build 10571 at source commit
+`9a286ac98d2cab74231bd3f1fc3f2b8bdf05422e`, binary SHA-256
+`8f0fbf63cade822e9de0735895f6228b0bceca704cefe6e5a02d96bb72e66fda`.
+The first harness attempt had passed `--log-disable`, which suppresses this
+binary's output-level `LOG(...)` semantic payload; that vacuous comparison was
+rejected, removed, and rerun before any quality claim was accepted.
+
 ## Context
 
 hf2q has three surfaces that have been called "auto" but do not form one

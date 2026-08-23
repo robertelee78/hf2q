@@ -12,6 +12,13 @@ use super::router::build_router;
 use super::state::{AppState, ServerConfig};
 
 const LONG_EMBED_PROMPT: &str = "A local inference server must preserve exact artifact identity, tokenizer configuration, native matrix storage, output coherence, and memory ownership while switching repeatedly between encoder families under realistic multi-token embedding requests. The returned vector should remain stable after unloading and reloading the original artifact, while another architecture uses its own vocabulary, dimensions, pooling behavior, kernel registry, and mapped weight generation without leaking state across requests.";
+// The first quiet-host real run measured fresh-A deltas of 1.49 MiB settled
+// RSS and zero wired-byte delta versus initial A. A 16 MiB bound leaves
+// allocator headroom without being wide enough to hide either complete
+// 25.4 MiB A or 83.1 MiB B artifact. Peak RSS uses the 1 ms in-process Mach
+// sampler below; the former 20 ms `ps` subprocess sampler was falsified after
+// it missed initial-A's short allocation peak.
+const EMBEDDING_REPLAY_MEMORY_TOLERANCE_BYTES: u64 = 16 * 1024 * 1024;
 
 fn state_default() -> AppState {
     AppState::new(ServerConfig::default())
@@ -313,17 +320,25 @@ fn assert_embedding_mapping_state(
 }
 
 fn current_process_rss_bytes() -> u64 {
-    let pid = std::process::id().to_string();
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid, "-o", "rss="])
-        .output()
-        .expect("read test-process RSS");
-    assert!(output.status.success());
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u64>()
-        .expect("RSS KiB")
-        .saturating_mul(1024)
+    let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info>::zeroed();
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    #[allow(deprecated)]
+    let task = unsafe { libc::mach_task_self() };
+    let status = unsafe {
+        libc::task_info(
+            task,
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast::<libc::integer_t>(),
+            &mut count,
+        )
+    };
+    assert_eq!(status, libc::KERN_SUCCESS, "read test-process Mach RSS");
+    assert_eq!(
+        count,
+        libc::MACH_TASK_BASIC_INFO_COUNT,
+        "Mach RSS info width"
+    );
+    unsafe { info.assume_init().resident_size }
 }
 
 fn current_process_memory() -> EmbeddingProcessMemory {
@@ -372,15 +387,32 @@ fn start_embedding_rss_peak_sampler() -> (
 ) {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
     let handle = std::thread::spawn(move || {
-        let mut peak = 0u64;
+        let mut peak = current_process_rss_bytes();
+        started_tx
+            .send(())
+            .expect("publish first embedding RSS sample");
         while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
             peak = peak.max(current_process_rss_bytes());
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(1));
         }
         peak.max(current_process_rss_bytes())
     });
+    started_rx
+        .recv()
+        .expect("embedding RSS sampler must take a baseline sample");
     (stop, handle)
+}
+
+#[test]
+fn embedding_mach_rss_peak_sampler_cannot_return_a_vacuous_zero() {
+    let (stop, handle) = start_embedding_rss_peak_sampler();
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    assert!(
+        handle.join().expect("embedding RSS peak sampler") > 1024 * 1024,
+        "the in-process Mach RSS observer must return a plausible live-process sample"
+    );
 }
 
 async fn steady_embedding_median(app: &axum::Router, model: &str) -> Duration {
@@ -801,6 +833,34 @@ async fn dedicated_embedding_real_bert_nomic_bert_replays_and_reclaims() {
     let a2_steady = steady_embedding_median(&app, &a2_model_id).await;
     let memory_a2 = current_process_memory();
     let mappings_a2 = assert_embedding_mapping_state(&path_a, &path_b, "A2");
+    assert!(
+        memory_a2.rss_bytes
+            <= memory_a
+                .rss_bytes
+                .saturating_add(EMBEDDING_REPLAY_MEMORY_TOLERANCE_BYTES),
+        "fresh A settled RSS must return within the measured replay bound: A={} A2={} tolerance={}",
+        memory_a.rss_bytes,
+        memory_a2.rss_bytes,
+        EMBEDDING_REPLAY_MEMORY_TOLERANCE_BYTES
+    );
+    assert!(
+        memory_a2.wired_bytes
+            <= memory_a
+                .wired_bytes
+                .saturating_add(EMBEDDING_REPLAY_MEMORY_TOLERANCE_BYTES),
+        "fresh A wired bytes must return within the measured replay bound: A={} A2={} tolerance={}",
+        memory_a.wired_bytes,
+        memory_a2.wired_bytes,
+        EMBEDDING_REPLAY_MEMORY_TOLERANCE_BYTES
+    );
+    assert!(
+        peak_a2_rss
+            <= peak_a_rss.saturating_add(EMBEDDING_REPLAY_MEMORY_TOLERANCE_BYTES),
+        "fresh A activation peak RSS must return within the measured replay bound: A={} A2={} tolerance={}",
+        peak_a_rss,
+        peak_a2_rss,
+        EMBEDDING_REPLAY_MEMORY_TOLERANCE_BYTES
+    );
     assert_eq!(first_a, second_a, "fresh BERT A must replay exactly");
     assert_eq!(
         first_a_long, second_a_long,
@@ -1016,7 +1076,11 @@ fn reference_embedding(path: &Path, pooling: &str, prompt: &str) -> Vec<f64> {
             "--embd-output-format",
             "raw",
             "--no-perf",
-            "--log-disable",
+            // The embedding binary writes its machine-readable payload through
+            // output-level `LOG(...)`, which is stdout. `--log-disable`
+            // suppresses that payload as well as diagnostics and makes the
+            // quality gate vacuous. Info/warning diagnostics use stderr, so
+            // leaving logging enabled preserves a numeric-only stdout stream.
             "--offline",
         ])
         .output()

@@ -560,8 +560,8 @@ fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<St
 
 fn infer_filename_quant(stem: &str) -> Option<String> {
     [
-        "q2_k", "q3_k_m", "q4_0", "q4_k_s", "q4_k_m", "q5_k_s", "q5_k_m", "q6_k", "q8_0", "f16",
-        "f32", "bf16",
+        "q2_k", "q3_k_m", "q4_0", "q4_k_s", "q4_k_m", "q5_k_s", "q5_k_m", "q6_k", "q8_0", "bf16",
+        "f16", "f32",
     ]
     .into_iter()
     .find(|quant| stem.ends_with(quant))

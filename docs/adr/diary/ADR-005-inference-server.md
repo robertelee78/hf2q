@@ -10558,3 +10558,28 @@ full_attn_bytes_breakdown_tq_on_drops_f32` invocation.
 (prefill 1.24×, decode 1.29× vs peer-FA) are operator-driven re-bench with
 no CI gate — re-verification on quiet hardware with documented commands is
 scheduled after the 0.1.7 release window as its own task.
+
+## 2026-08-22 — dedicated native embedding activation and real A -> B -> A proof
+
+BERT and Nomic-BERT now keep every matrix in its mapped GGUF representation
+through direct native embedding gather and quantized matmul; only named
+one-dimensional elementwise state expands to F32. Complete inventory, shape,
+and kernel-capability preflight runs before payload mapping or model-buffer
+allocation. The explicit public activation domain (`kind: "embedding"`) binds
+an opaque catalog candidate, source revision, digest, and generation; it never
+aliases by basename or falls through to the generative pool.
+
+The real public BERT -> Nomic-BERT -> BERT gate passed using hf2q-converted
+Q4_0 artifacts from pinned safetensors. Short/long cosine against the pinned
+reference was 0.999997/1.000000 for BERT and 0.999997/0.999998 for Nomic;
+fresh BERT replayed exactly. Model/tokenizer/vocabulary/registry weak ownership,
+mapped-file visibility, generation accounting, stale-model rejection,
+conflict receipts, failed-replacement unavailability, and explicit recovery
+all passed. A 20 ms subprocess peak observer was falsified and replaced by a
+start-handshaken 1 ms in-process Mach observer. Corrected A/B/fresh-A peak RSS
+was 115,032,064/128,204,800/116,703,232 bytes; settled RSS was
+47,054,848/47,087,616/48,545,792; wired bytes were
+134,217,728/125,829,120/134,217,728. Fresh A passed the 16 MiB replay bound on
+all three. Three-run median initial-A/A->B/B->A-to-first-result was
+142.980/208.931/100.837 ms. Governing details and artifact identities are in
+ADR-046 and ADR-047.
