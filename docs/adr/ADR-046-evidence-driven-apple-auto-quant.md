@@ -122,9 +122,14 @@ The file-backed assertion was the sole failure. The reformulated contract is:
   materialized as F32.
 - Admission covers decode M=1, continuous widths 2/3/4/8, and prompt widths
   9/16/17 for every dense matrix. Expert stacks independently prove the same
-  widths through their production pooled entry point and exact input layout.
-  Shape, payload-block geometry, per-expert stride divisibility, unsupported
-  codecs, and missing MTP/tied-head partners fail before model allocation.
+  source widths through their exact production pooled geometry: gate/up use
+  one shared input row per source token with configured top-k, while down uses
+  the already-routed rows as `M = source_tokens * top_k`, runtime top-k 1, and
+  the shared-row entry point. The latter selects matvec for small routed-row
+  counts and `mm_id` above its routing threshold; it is not the slotted-only
+  entry point. Shape, routed-row overflow, payload-block geometry, per-expert
+  stride divisibility, unsupported codecs, and missing MTP/tied-head partners
+  fail before model allocation.
 - Tied output and shared-MTP heads retain one exact matrix range. A dedicated
   head is a different range under the same scoped mapping owner. Explicit
   affine overlays keep their declared buffers and dispatch; base GGUF matrices
@@ -141,6 +146,15 @@ The file-backed assertion was the sole failure. The reformulated contract is:
   representation-sensitive A→B→A shipping gate classifies each resident from
   OS mapping evidence, requires the evicted mapping to disappear, exact A
   replay, fresh generations, bounded peaks, and endpoint reclaim.
+
+A subsequent real Qwen3.6 APEX header gate falsified the first expert-layout
+description: `ffn_down_exps` Q6_K was rejected at source M=1 because preflight
+declared the slotted pooled entry point. Source inspection of both production
+decode and prefill paths showed that no Qwen down call uses that ABI; both
+flatten routed rows and call the shared pooled dispatcher with top-k 1. The
+corrected model-free gate proves the exact M=1 transform (eight routed rows for
+top-k 8), the M=8 `mm_id` transform (64 routed rows), the retained rejection
+of an actually slotted small-M request, and checked row-count overflow.
 
 The red projection spike is green with exact file backing. Focused model-free
 and tiny-Metal gates cover stored-width admission, tied and dedicated owner

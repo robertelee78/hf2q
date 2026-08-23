@@ -253,7 +253,7 @@ fn ensure_expert_capability(
     k: usize,
     top_k: u32,
     n_experts: u32,
-    input_layout: GgmlExpertInputLayout,
+    execution: ExpertExecution,
 ) -> Result<()> {
     ensure!(n_experts > 0, "Qwen expert stack has zero experts");
     ensure!(
@@ -265,34 +265,95 @@ fn ensure_expert_capability(
         .context("Qwen expert stride exceeds u64")?;
     let n = u32::try_from(n).context("Qwen expert output rows exceed u32")?;
     let k = u32::try_from(k).context("Qwen expert input cols exceed u32")?;
-    for (n_tokens, workload) in REQUIRED_MATRIX_WIDTHS {
-        let capability = mlx_native::ggml_capability(GgmlCapabilityRequest {
-            schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
-            invocation: GgmlInvocation::ExpertPooled {
-                shape: GgmlExpertShape {
-                    n_tokens,
-                    n,
-                    k,
-                    top_k,
-                    n_experts,
-                    expert_stride_bytes,
-                    ids_are_distinct_per_token: true,
-                    ids_within_expert_range: true,
-                },
-                input_layout,
-            },
-            ggml_type: info.ggml_type,
-            workload,
-            routing: mlx_native::ggml_routing_policy_from_environment(),
-        });
+    for (source_tokens, source_workload) in REQUIRED_MATRIX_WIDTHS {
+        let request = expert_capability_request(
+            info.ggml_type,
+            n,
+            k,
+            top_k,
+            n_experts,
+            expert_stride_bytes,
+            source_tokens,
+            source_workload,
+            execution,
+        )?;
+        let GgmlInvocation::ExpertPooled { shape, .. } = request.invocation else {
+            unreachable!("Qwen expert preflight only constructs pooled requests")
+        };
+        let capability = mlx_native::ggml_capability(request);
         ensure!(
             capability.executable,
-            "Qwen GGUF preflight: expert tensor '{name}' type {:?} is not executable at M={n_tokens} ({workload:?}): {}",
+            "Qwen GGUF preflight: expert tensor '{name}' type {:?} is not executable at source M={source_tokens} (runtime M={}, top_k={}, {:?}): {}",
             info.ggml_type,
+            shape.n_tokens,
+            shape.top_k,
+            capability.request.workload,
             capability.diagnostic
         );
     }
     Ok(())
+}
+
+/// Exact input geometry used by the production pooled expert dispatcher.
+/// Gate/up read one shared row per source token and expand it by top-k. Down
+/// consumes the already-expanded `h_all` rows, so its pooled call is a normal
+/// shared-row invocation with `M = source_tokens * top_k` and runtime top-k 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertExecution {
+    SharedPerSourceToken,
+    FlattenedRoutedRows,
+}
+
+fn workload_for_runtime_rows(rows: u32) -> GgmlWorkloadClass {
+    match rows {
+        1 => GgmlWorkloadClass::DecodeSingle,
+        2..=8 => GgmlWorkloadClass::ContinuousWidth,
+        _ => GgmlWorkloadClass::Prompt,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expert_capability_request(
+    ggml_type: mlx_native::GgmlType,
+    n: u32,
+    k: u32,
+    configured_top_k: u32,
+    n_experts: u32,
+    expert_stride_bytes: u64,
+    source_tokens: u32,
+    source_workload: GgmlWorkloadClass,
+    execution: ExpertExecution,
+) -> Result<GgmlCapabilityRequest> {
+    let (n_tokens, top_k, workload) = match execution {
+        ExpertExecution::SharedPerSourceToken => (source_tokens, configured_top_k, source_workload),
+        ExpertExecution::FlattenedRoutedRows => {
+            let n_tokens = source_tokens.checked_mul(configured_top_k).ok_or_else(|| {
+                anyhow!(
+                    "Qwen expert down runtime row count overflows u32: {source_tokens} * {configured_top_k}"
+                )
+            })?;
+            (n_tokens, 1, workload_for_runtime_rows(n_tokens))
+        }
+    };
+    Ok(GgmlCapabilityRequest {
+        schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
+        invocation: GgmlInvocation::ExpertPooled {
+            shape: GgmlExpertShape {
+                n_tokens,
+                n,
+                k,
+                top_k,
+                n_experts,
+                expert_stride_bytes,
+                ids_are_distinct_per_token: true,
+                ids_within_expert_range: true,
+            },
+            input_layout: GgmlExpertInputLayout::SharedPerToken,
+        },
+        ggml_type,
+        workload,
+        routing: mlx_native::ggml_routing_policy_from_environment(),
+    })
 }
 
 fn require_moe_ffn(
@@ -379,7 +440,7 @@ fn require_moe_ffn(
         hidden,
         moe.num_experts_per_tok,
         moe.num_experts,
-        GgmlExpertInputLayout::SharedPerToken,
+        ExpertExecution::SharedPerSourceToken,
     )?;
     ensure_expert_capability(
         &up_name,
@@ -388,7 +449,7 @@ fn require_moe_ffn(
         hidden,
         moe.num_experts_per_tok,
         moe.num_experts,
-        GgmlExpertInputLayout::SharedPerToken,
+        ExpertExecution::SharedPerSourceToken,
     )?;
     ensure_expert_capability(
         &down_name,
@@ -397,7 +458,7 @@ fn require_moe_ffn(
         expert,
         moe.num_experts_per_tok,
         moe.num_experts,
-        GgmlExpertInputLayout::Slotted,
+        ExpertExecution::FlattenedRoutedRows,
     )
 }
 
