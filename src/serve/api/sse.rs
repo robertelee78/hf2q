@@ -81,8 +81,8 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures::StreamExt;
 use futures::stream::Stream;
+use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use super::schema::{
@@ -1010,11 +1010,9 @@ mod tests {
         assert!(reasoning["choices"][0]["delta"].get("content").is_none());
         let content: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
         assert_eq!(content["choices"][0]["delta"]["content"], "42");
-        assert!(
-            content["choices"][0]["delta"]
-                .get("reasoning_content")
-                .is_none()
-        );
+        assert!(content["choices"][0]["delta"]
+            .get("reasoning_content")
+            .is_none());
     }
 
     #[tokio::test]

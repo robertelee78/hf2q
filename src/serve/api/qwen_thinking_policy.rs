@@ -89,36 +89,18 @@ pub(super) struct QwenThinkingDefaults {
 }
 
 impl QwenThinkingDefaults {
-    pub(super) fn from_values(
-        base: Option<&str>,
-        continuation: Option<&str>,
-    ) -> Result<Self, String> {
-        fn parse(name: &str, value: Option<&str>) -> Result<Option<usize>, String> {
-            let Some(value) = value else {
-                return Ok(None);
-            };
-            let parsed = value
-                .parse::<usize>()
-                .map_err(|_| format!("{name} must be a non-negative integer"))?;
-            Ok((parsed > 0).then_some(parsed))
-        }
-
-        Ok(Self {
-            base: parse("HF2Q_DEFAULT_THINKING_TOKEN_BUDGET", base)?,
+    pub(super) const fn from_config(base: Option<u32>, continuation: Option<u32>) -> Self {
+        Self {
+            base: match base {
+                Some(value) if value > 0 => Some(value as usize),
+                _ => None,
+            },
             continuation_override: match continuation {
-                Some(value) => Some(parse(
-                    "HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET",
-                    Some(value),
-                )?),
+                Some(value) if value > 0 => Some(Some(value as usize)),
+                Some(_) => Some(None),
                 None => None,
             },
-        })
-    }
-
-    pub(super) fn from_env() -> Result<Self, String> {
-        let base = std::env::var("HF2Q_DEFAULT_THINKING_TOKEN_BUDGET").ok();
-        let continuation = std::env::var("HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET").ok();
-        Self::from_values(base.as_deref(), continuation.as_deref())
+        }
     }
 }
 
@@ -350,8 +332,8 @@ mod tests {
         let registration = registry::find_for("Qwen3.8").expect("Qwen registration");
         assert_eq!(registration.reasoning_close, Some("</think>"));
         for defaults in [
-            QwenThinkingDefaults::from_values(None, None).unwrap(),
-            QwenThinkingDefaults::from_values(Some("0"), Some("0")).unwrap(),
+            QwenThinkingDefaults::from_config(None, None),
+            QwenThinkingDefaults::from_config(Some(0), Some(0)),
         ] {
             for tool_choice in [
                 ToolChoiceValue::Required,
@@ -405,7 +387,7 @@ mod tests {
             None,
             128,
             QwenToolChainState::default(),
-            QwenThinkingDefaults::from_values(Some("0"), Some("0")).unwrap(),
+            QwenThinkingDefaults::from_config(Some(0), Some(0)),
             true,
             qwen_test_encode,
         )

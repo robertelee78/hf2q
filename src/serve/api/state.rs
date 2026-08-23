@@ -91,6 +91,13 @@ pub struct ServerConfig {
     /// system_fingerprint`. Defaults to `None`; production can set to
     /// `"hf2q-<short-git-sha>-mlx-native"`.
     pub system_fingerprint: Option<String>,
+    /// Server-wide sampling default used only when a request omits
+    /// `repetition_penalty`.
+    pub default_repetition_penalty: f32,
+    /// Default Qwen reasoning budget used only when a request omits it.
+    pub default_thinking_token_budget: Option<u32>,
+    /// Default continuation/required-tool reasoning budget.
+    pub default_tool_thinking_token_budget: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -108,6 +115,9 @@ impl Default for ServerConfig {
             default_overflow_policy: OverflowPolicy::Summarize,
             cache_dir: default_cache_dir(),
             system_fingerprint: None,
+            default_repetition_penalty: 1.0,
+            default_thinking_token_budget: None,
+            default_tool_thinking_token_budget: None,
         }
     }
 }
@@ -823,7 +833,10 @@ impl AppState {
                 as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
             dwq_overlay_path: None,
             engine_mode: super::engine::EngineMode::SerialFifo,
+            requested_context: None,
             kv_cache_budget_bytes: None,
+            kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         Ok(Self {
             config: Arc::new(config),
@@ -892,7 +905,10 @@ impl AppState {
                 as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
             dwq_overlay_path: None,
             engine_mode: super::engine::EngineMode::SerialFifo,
+            requested_context: None,
             kv_cache_budget_bytes: None,
+            kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         // Synthetic cache root in a per-process tempdir.  Tests that need
         // a specific cache state should construct via `new_for_serve` or

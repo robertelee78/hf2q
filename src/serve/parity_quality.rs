@@ -402,7 +402,8 @@ fn run_two_regime_decode(
     // STEP 1 — env-var setup for the OnceLock-driven knob.
     //
     // W39 iter-112b: `INVESTIGATION_ENV` is a `LazyLock` populated by
-    // `INVESTIGATION_ENV.activate()` at `main.rs::main` *before* `Cli::parse`,
+    // `INVESTIGATION_ENV.activate()` at `main.rs::main` immediately after
+    // `Cli::parse` (so typed CLI overrides can be installed first),
     // so setting `HF2Q_DUMP_DIR` / `HF2Q_DUMP_ALL_CACHE` here is too late —
     // those fields are already frozen at their pre-launch (default) values.
     // The fix is to use the per-instance `MlxModelWeights::set_dump_overrides`

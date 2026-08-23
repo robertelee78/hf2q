@@ -18,8 +18,8 @@
 //!
 //! 1. The loaded family is Gemma 4 / GemmaMoE (the operator-side
 //!    family resolver registers this hook only for those repos).
-//! 2. `HF2Q_KV_PERSIST=on` (Phase C.1's CLI flag wires the spiller
-//!    chain at startup; without it the hook never sees a trigger).
+//! 2. `--kv-persist PATH` wires the spiller chain at startup; without the
+//!    typed path the hook never sees a trigger.
 //! 3. `HF2Q_USE_DENSE=1` so the engine actually populates `dense_kvs`
 //!    at decode (the F32-dense regime). Under TQ-active decode the
 //!    hook still receives `post_admit` triggers but its restore is a

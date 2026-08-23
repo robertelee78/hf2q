@@ -157,10 +157,10 @@ jobs:
           cargo test --locked --bin hf2q --all-features setup:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features tests::convert_config_quant_is_used_and_explicit_quant_wins -- --exact
           cargo test --locked --bin hf2q --all-features tests::invalid_operator_config_fails_before_convert_source_or_serve_bind -- --exact
-          cargo test --locked --bin hf2q --all-features serve::tests::serve_config_defaults_are_used_and_cli_env_override_them -- --exact
+          cargo test --locked --bin hf2q --all-features serve::tests::serve_config_defaults_are_used_and_cli_overrides_them -- --exact
           cargo test --locked --bin hf2q --all-features serve::tests::configured_lan_requires_runtime_auth -- --exact
-          cargo test --locked --bin hf2q --all-features serve::tests::c4_scheduler_cli_wins_over_env -- --exact
-          cargo test --locked --bin hf2q --all-features serve::tests::c4_max_slots_cli_wins_over_env -- --exact
+          cargo test --locked --bin hf2q --all-features serve::operator_settings::tests::cli_planning_values_override_setup_config -- --exact
+          cargo test --locked --bin hf2q --all-features serve::operator_settings::tests::max_slots_is_not_silently_ignored_by_fifo -- --exact
           hf_source_tests="$(cargo test --locked --bin hf2q --all-features -- --list)"
           for required_test in \
             cli::tests::getting_started_qwen38_commands_parse_exactly \
@@ -180,10 +180,10 @@ jobs:
             setup::tests::named_performance_levels_accept_one_or_more_levels_and_reject_incoherent_facts \
             tests::convert_config_quant_is_used_and_explicit_quant_wins \
             tests::invalid_operator_config_fails_before_convert_source_or_serve_bind \
-            serve::tests::serve_config_defaults_are_used_and_cli_env_override_them \
+            serve::tests::serve_config_defaults_are_used_and_cli_overrides_them \
             serve::tests::configured_lan_requires_runtime_auth \
-            serve::tests::c4_scheduler_cli_wins_over_env \
-            serve::tests::c4_max_slots_cli_wins_over_env \
+            serve::operator_settings::tests::cli_planning_values_override_setup_config \
+            serve::operator_settings::tests::max_slots_is_not_silently_ignored_by_fifo \
             setup::tests::lock_contention_is_busy_and_mints_no_config \
             setup::tests::exact_read_rejects_leaf_replacement_after_reading_the_open_inode \
             setup::tests::partial_leaf_replacement_before_rename_is_rejected_without_publication \

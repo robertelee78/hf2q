@@ -7,21 +7,20 @@
 #
 # The DeepSeek cache is native and in-memory:
 #
-#   HF2Q_DEEPSEEK_MAX_SEQ_LEN=524288
-#                           Advertises a 512K serving limit while initially
+#   --ctx 262144           Advertises a 256K serving limit per slot while initially
 #                           allocating a 131K live cache (~877 MiB). Capacity
 #                           grows in 131K steps only when the transcript needs
 #                           it; the prompt-tail checkpoint stays ~17 MiB.
 #                           Growing transcripts prefill only their
 #                           suffix; reasoning canonicalization restores the
 #                           checkpoint and replays the rewritten tail.
-#   HF2Q_DEFAULT_REPETITION_PENALTY=1.0
+#   --default-repetition-penalty 1.0
 #                           No hidden repetition penalty. The previous 1.05
 #                           default distorted constrained tool strings and did
 #                           not prevent client-side action loops. Operators may
 #                           set REP_PENALTY only for a measured workload;
 #                           non-default request values still win.
-#   HF2Q_DEEPSEEK4_REQUIRED_TOOL_THINKING_TOKEN_BUDGET=8
+#   --default-tool-thinking-token-budget 8
 #                           Bounds forced-open reasoning for the narrow
 #                           single-tool required/named-tool path before the
 #                           constrained DSML tool call. Set
@@ -41,10 +40,10 @@
 #                           rewriting or truncating the transcript.
 #   --scheduler inflight-batched --max-slots 4
 #                           Four independent agent sessions make progress.
-#                           Every slot advertises CONTEXT_LEN; context is never
+#                           Every slot advertises 262144 tokens; context is never
 #                           divided by slot count. MAX_SLOTS=8 is the np8-like
 #                           operator setting after the hardware gate passes.
-#   --kv-cache-budget-bytes
+#   --kv-cache-budget
 #                           Shared physical KV high-water across those full-
 #                           context slots. This bounds residency; it is not a
 #                           per-slot logical context limit.
@@ -60,8 +59,8 @@
 # Usage:
 #   scripts/serve_deepseek4_opencode.sh             # foreground (default)
 #   PORT=8090 scripts/serve_deepseek4_opencode.sh   # override port
-#   CONTEXT_LEN=131072 scripts/serve_deepseek4_opencode.sh  # lower-memory
-#   CONTEXT_LEN=1048576 scripts/serve_deepseek4_opencode.sh # full trained window
+#   scripts/serve_deepseek4_opencode.sh --ctx 131072  # lower-memory preset
+#   scripts/serve_deepseek4_opencode.sh --ctx 1048576 # full trained window
 #   CHECK_ONLY=1 scripts/serve_deepseek4_opencode.sh        # preflight only
 #   MAX_SLOTS=8 scripts/serve_deepseek4_opencode.sh         # np8-like
 set -euo pipefail
@@ -75,12 +74,31 @@ source "$SCRIPT_DIR/hf2q_process_guard.sh"
 MODEL="${MODEL:-/opt/hf2q/models/deepseek4/DeepSeek-V4-Flash-0731-agentic-q2.gguf}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
-CONTEXT_LEN="${CONTEXT_LEN:-524288}"
+CONTEXT_TOKENS=262144
 HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
 MAX_SLOTS="${MAX_SLOTS:-4}"
 KV_CACHE_BUDGET_BYTES="${KV_CACHE_BUDGET_BYTES:-8589934592}" # 8 GiB shared
 REQUIRED_TOOL_THINKING_TOKEN_BUDGET="${REQUIRED_TOOL_THINKING_TOKEN_BUDGET:-8}"
+
+# Keep the wrapper's context override identical to the real hf2q flag. The
+# qualified launcher defaults to 262144, while direct `hf2q serve` omits
+# `--ctx` and therefore uses the GGUF maximum.
+case "${1:-}" in
+    --ctx)
+        [[ $# -ge 2 ]] || { echo "--ctx requires a token count" >&2; exit 2; }
+        CONTEXT_TOKENS=$2
+        shift 2
+        ;;
+    --ctx=*)
+        CONTEXT_TOKENS=${1#--ctx=}
+        shift
+        ;;
+esac
+if (( $# != 0 )); then
+    echo "unsupported launcher argument: $1 (supported: --ctx TOKENS)" >&2
+    exit 2
+fi
 
 # A ~100 GiB resident model leaves little margin on a 128 GiB host. Refuse a
 # load when prior inference has left the compressor/swap saturated or one
@@ -102,8 +120,8 @@ if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
     echo "PORT must be an integer from 1 through 65535 (got: $PORT)" >&2
     exit 3
 fi
-if ! [[ "$CONTEXT_LEN" =~ ^[0-9]+$ ]] || (( CONTEXT_LEN < 128 )); then
-    echo "CONTEXT_LEN must be an integer of at least 128 (got: $CONTEXT_LEN)" >&2
+if ! [[ "$CONTEXT_TOKENS" =~ ^[0-9]+$ ]] || (( CONTEXT_TOKENS < 128 )); then
+    echo "--ctx must be an integer of at least 128 for DeepSeek-V4 (got: $CONTEXT_TOKENS)" >&2
     exit 3
 fi
 for SETTING in CHECK_ONLY MAX_SWAP_USED_GIB MAX_COMPRESSOR_USED_GIB \
@@ -241,19 +259,24 @@ if (( MODEL_BYTES >= LARGE_MODEL_BYTES )); then
 fi
 
 if (( CHECK_ONLY == 1 )); then
-    echo "hf2q DeepSeek-V4 preflight passed: ${MAX_SLOTS} full-context slots, ${KV_CACHE_BUDGET_BYTES} shared KV bytes; no model was loaded"
+    "$HF2Q_BIN" info \
+        --model "$MODEL" \
+        --ctx "$CONTEXT_TOKENS" \
+        --scheduler inflight-batched \
+        --max-slots "$MAX_SLOTS" \
+        --kv-cache-budget "$KV_CACHE_BUDGET_BYTES"
+    echo "hf2q DeepSeek-V4 host and static serving preflight passed; no tensor payload was loaded"
     exit 0
 fi
 
-exec env \
-    HF2Q_DEEPSEEK_MAX_SEQ_LEN="$CONTEXT_LEN" \
-    HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.0}" \
-    HF2Q_DEEPSEEK4_REQUIRED_TOOL_THINKING_TOKEN_BUDGET="$REQUIRED_TOOL_THINKING_TOKEN_BUDGET" \
-    "$HF2Q_BIN" -v serve \
+exec "$HF2Q_BIN" -v serve \
         --model "$MODEL" \
         --host "$HOST" \
         --port "$PORT" \
+        --ctx "$CONTEXT_TOKENS" \
         --overflow-policy reject \
         --scheduler inflight-batched \
         --max-slots "$MAX_SLOTS" \
-        --kv-cache-budget-bytes "$KV_CACHE_BUDGET_BYTES"
+        --kv-cache-budget "$KV_CACHE_BUDGET_BYTES" \
+        --default-repetition-penalty "${REP_PENALTY:-1.0}" \
+        --default-tool-thinking-token-budget "$REQUIRED_TOOL_THINKING_TOKEN_BUDGET"

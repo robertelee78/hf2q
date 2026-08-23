@@ -93,7 +93,7 @@ Drives ADR-017 Phase D coherence + perf validation tests.
   --stress-duration SEC    Override stress duration in seconds (default 1800)
   --stress-budget-mb MB    Override stress on-disk cache budget in MB (default 4096
                            = §R-F5 spec). Threaded through to the spawned
-                           server's HF2Q_KV_PERSIST_BUDGET_BYTES so the
+                           server's --kv-persist-budget so the
                            writer's post-write LRU eviction has a budget to
                            enforce.
   --skip-process-audit     Bypass pre-bench process audit (NOT recommended)

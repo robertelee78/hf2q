@@ -12,7 +12,13 @@
     hydration. The canonical SlotAware launcher therefore omits the disk-LCP
     variables and `--kv-persist` flag.
   - **Operational follow-ons landed in the same pass (long-context agentic realities, measured on a ~97K-token opencode first turn):**
-    - **`Qwen35DiskPersistor` now enforces `HF2Q_KV_PERSIST_BUDGET_BYTES`** (`new_with_budget` + LRU-by-mtime eviction per cfg subdir; the just-written snapshot is never evicted). Pre-fix, one ~100K-token session wrote **105 GB** of chunk snapshots unbudgeted — a disk-exhaustion hazard. Test pin: `qh35_disk_budget_evicts_oldest_keeps_newest`.
+    - **`Qwen35DiskPersistor` enforces the typed persistent-KV disk budget**
+      (`serve --kv-persist-budget` / `[serve] kv_persist_budget`, superseding
+      the original environment-only spelling; `new_with_budget` + LRU-by-mtime
+      eviction per cfg subdir; the just-written snapshot is never evicted).
+      Pre-fix, one ~100K-token session wrote **105 GB** of chunk snapshots
+      unbudgeted — a disk-exhaustion hazard. Test pin:
+      `qh35_disk_budget_evicts_oldest_keeps_newest`.
     - **Historical SerialFifo stride guidance for long contexts:** each stride-1024 checkpoint snapshots the *entire* state at that position (~600 MB at 97K — full-attn TQ grows with position, DeltaNet ~constant), i.e. ~1.2 GB of snapshot+disk I/O per 1024 prefilled tokens. `HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=4096` quarters that cost at a worst-case resume-granularity loss of ~4095 tokens (~2 s at ~2K tok/s). It was the 2026-08-03 SerialFifo opencode launcher default; the current canonical SlotAware launcher omits disk-LCP configuration because that worker claims same-process affinity, not restart hydration. In-memory byte budget (`available×5%`, exact `ByteSized` accounting, no estimators) was verified sound — eviction uses true snapshot bytes, not the startup estimate.
     - **Historical 2026-08-03 concurrency measurement (fifo-serial):** 3 concurrent chat requests queued FIFO and serialized (total wall ≈ sequential total); each admitted request decoded at full single-stream speed (~125 tok/s); no 429s under queue cap 32; outputs were uncorrupted. The later bounded SlotAware design in this ADR supersedes the old claim that multi-slot Qwen lacked LCP/recurrent-cache coherence; the historical measurement remains useful only as a FIFO baseline.
 - **Date:** 2026-05-08

@@ -32,7 +32,32 @@
 //! its classification in `docs/shipping-contract.md`.
 
 use std::env;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
+
+static CLI_TQ_CODEBOOK_BITS: OnceLock<u32> = OnceLock::new();
+
+/// Install the already-Clap-validated `generate --kv-bits` value before the
+/// investigation snapshot initializes. This is a typed in-process override,
+/// not an environment mutation; the env variable remains a development-only
+/// fallback when the real CLI flag is absent.
+pub fn set_cli_tq_codebook_bits(bits: &str) -> Result<(), String> {
+    let parsed = match bits {
+        "4" => 4,
+        "5" => 5,
+        "6" => 6,
+        "8" => 8,
+        other => return Err(format!("unsupported --kv-bits value {other:?}")),
+    };
+    CLI_TQ_CODEBOOK_BITS
+        .set(parsed)
+        .map_err(|_| "--kv-bits was initialized more than once".to_owned())
+}
+
+/// Logical codebook width selected by the typed CLI, before the legacy
+/// internal `4 -> 0` sentinel conversion used by Gemma's HB allocation path.
+pub(crate) fn cli_tq_codebook_bits() -> Option<u32> {
+    CLI_TQ_CODEBOOK_BITS.get().copied()
+}
 
 /// Process-wide cache of investigation-only environment variables.
 ///
@@ -556,27 +581,6 @@ pub struct InvestigationEnv {
     /// ~768 MB per cached entry. Capacity=1 registry ⇒ bounded.
     pub kv_lcp_deltanet_checkpoint_stride: usize,
 
-    /// `HF2Q_DEFAULT_REPETITION_PENALTY` — default `1.0` (off) — the
-    /// server-wide repetition penalty applied when the client omits
-    /// `repetition_penalty` (handler default `1.0`).  Explicit
-    /// client-supplied values (≠ 1.0) always win.
-    ///
-    /// Motivation (2026-08-03 loop mitigation): opencode's
-    /// openai-compatible provider cannot send `repetition_penalty`, so
-    /// every agentic request sampled with penalty 1.0 — at 90-150K
-    /// context the model degenerated into repetition loops, and the
-    /// loop garbage then got baked into compacted history, re-priming
-    /// the loop on every later turn.
-    ///
-    /// Applied ONLY at sampler-construction boundaries via the shared
-    /// `engine::effective_repetition_penalty` helper (gemma engine.rs,
-    /// engine_qwen35.rs, engine_qwen3vl.rs — uniform semantics across
-    /// arches).  Penalty scope is the response's own generated tokens,
-    /// never the prompt (code-safe).  `SamplingParams` is never
-    /// mutated, so greedy/cache predicates, the T=0 GPU argmax path,
-    /// and LCP byte-identity tests are all unaffected.
-    pub default_repetition_penalty: f32,
-
     /// `HF2Q_LAYER_POLICY` — per-layer SDPA policy selector.
     ///   - "dense_all": all layers dense.
     ///   - "tq_all" / unset: all layers TQ (default).
@@ -867,13 +871,17 @@ impl InvestigationEnv {
             dump_prompt_tokens: env::var("HF2Q_DUMP_PROMPT_TOKENS").is_ok(),
 
             // TurboQuant codebook width (ADR-007 / iter-21 Track B).
-            tq_codebook_bits: match env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
-                Ok("4") => 0u32,
-                Ok("5") => 5u32,
-                Ok("6") => 6u32,
-                Ok("8") | Err(_) => 8u32,
-                Ok(_other) => 8u32,
-            },
+            tq_codebook_bits: cli_tq_codebook_bits()
+                .map(|bits| if bits == 4 { 0 } else { bits })
+                .unwrap_or_else(|| match env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+                    Ok("2") => 2u32,
+                    Ok("3") => 3u32,
+                    Ok("4") => 0u32,
+                    Ok("5") => 5u32,
+                    Ok("6") => 6u32,
+                    Ok("8") | Err(_) => 8u32,
+                    Ok(_other) => 8u32,
+                }),
 
             // ADR-028 Phase 10 (iter-347) / ADR-029 iter-13: hybrid F16-K + TQ-HB-V.
             // **Default ON** after ADR-029 iter-12 confirmation (3-trial fresh
@@ -922,15 +930,6 @@ impl InvestigationEnv {
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or(1024),
-
-            // Server-wide repetition-penalty default for clients that
-            // can't send one (see field doc). Default 1.0 = off,
-            // preserving exact pre-knob behavior when unset.
-            default_repetition_penalty: env::var("HF2Q_DEFAULT_REPETITION_PENALTY")
-                .ok()
-                .and_then(|s| s.parse::<f32>().ok())
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .unwrap_or(1.0),
 
             // Gate H release-check plumbing (ADR-007 §853-866; iter-108a).
             emit_nll: env_eq_one("HF2Q_EMIT_NLL"),
@@ -1215,7 +1214,7 @@ impl InvestigationEnv {
         if self.dump_prompt_tokens {
             diagnostics.push("HF2Q_DUMP_PROMPT_TOKENS".into());
         }
-        if self.tq_codebook_bits != 8 {
+        if self.tq_codebook_bits != 8 && CLI_TQ_CODEBOOK_BITS.get().is_none() {
             diagnostics.push(format!(
                 "HF2Q_TQ_CODEBOOK_BITS={} ({})",
                 if self.tq_codebook_bits == 0 {

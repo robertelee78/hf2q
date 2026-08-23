@@ -31,14 +31,14 @@
 #                           Four independent agent sessions make progress.
 #                           Every slot retains Gemma's full model context;
 #                           neither context nor KV capacity is divided by N.
-#   --kv-cache-budget-bytes Shared physical high-water across full-context
+#   --kv-cache-budget       Shared physical high-water across full-context
 #                           slots. MAX_SLOTS=8 is the np8-like setting.
 #   HF2Q_ADMIT_COALESCE_US=25000
 #                           When every slot is idle, wait at most 25 ms for
 #                           peer agent requests so their appended suffixes can
 #                           share one transformer-body pass. Active decode is
 #                           never delayed for collection.
-#   HF2Q_DEFAULT_REPETITION_PENALTY=1.05
+#   --default-repetition-penalty 1.05
 #                           Loop mitigation (2026-08-03), same knob as
 #                           serve_qwen36_opencode.sh — opencode cannot send
 #                           repetition_penalty, so omission-clients sampled
@@ -175,7 +175,6 @@ if [[ -f "$MMPROJ" ]]; then
         HF2Q_ADMIT_COALESCE_US="${ADMIT_COALESCE_US:-25000}" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
-        HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
             --mmproj "$MMPROJ" \
@@ -184,7 +183,8 @@ if [[ -f "$MMPROJ" ]]; then
             --overflow-policy reject \
             --scheduler inflight-batched \
             --max-slots "$MAX_SLOTS" \
-            --kv-cache-budget-bytes "$KV_CACHE_BUDGET_BYTES"
+            --kv-cache-budget "$KV_CACHE_BUDGET_BYTES" \
+            --default-repetition-penalty "${REP_PENALTY:-1.05}"
 else
     exec env \
         HF2Q_KV_LCP_RESUME=1 \
@@ -194,7 +194,6 @@ else
         HF2Q_ADMIT_COALESCE_US="${ADMIT_COALESCE_US:-25000}" \
         ${BATCHED_ENV:+HF2Q_SERVE_BATCHED_PREFILL="$BATCHED_ENV"} \
         ${BATCHED_ENV:+HF2Q_PREFILL_SLOT_BATCHED="$BATCHED_ENV"} \
-        HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
         "$HF2Q_BIN" -v serve \
             --model "$MODEL" \
             --host "$HOST" \
@@ -202,5 +201,6 @@ else
             --overflow-policy reject \
             --scheduler inflight-batched \
             --max-slots "$MAX_SLOTS" \
-            --kv-cache-budget-bytes "$KV_CACHE_BUDGET_BYTES"
+            --kv-cache-budget "$KV_CACHE_BUDGET_BYTES" \
+            --default-repetition-penalty "${REP_PENALTY:-1.05}"
 fi

@@ -89,8 +89,8 @@ pub struct DiskBlockStore {
     cache_root: PathBuf,
     index: BlockIndex,
     /// Operator-supplied byte budget (ADR-017 §R-F5). `0` disables the
-    /// budget check — useful for tests and for the `HF2Q_KV_PERSIST=1`
-    /// "uncapped pilot" mode. Production callers pass a real value.
+    /// budget check — useful for tests and for an explicitly uncapped typed
+    /// persistent store. Production callers pass the resolved CLI/config value.
     budget_bytes: AtomicU64,
     /// Per-store override of the §R-F11 oversized-block refusal ceiling.
     /// `0` means "use [`MAX_BLOCK_BYTES`]". Tests set this small so the
@@ -974,7 +974,7 @@ mod tests {
 
     /// ADR-017 P1-3: a non-zero budget set via the runtime mutator
     /// must round-trip through the getter. cmd_serve reads
-    /// `HF2Q_KV_PERSIST_BUDGET_BYTES`, parses to u64, and calls
+    /// `--kv-persist-budget` / `[serve] kv_persist_budget`, parses it, and calls
     /// `set_budget_bytes(parsed)` AFTER `new_with_index(..., 0)`; this
     /// test pins that contract.
     #[test]

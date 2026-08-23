@@ -55,6 +55,9 @@ const EXIT_INPUT_ERROR: u8 = 3;
 enum AppError {
     Input(anyhow::Error),
     Conversion(anyhow::Error),
+    /// The command already emitted its complete operator-facing diagnostic.
+    /// Preserve the nonzero classification without appending a second line.
+    ReportedInput,
     /// Smoke-subcommand exit codes per ADR-012 Decision 16 §preflight (2-8).
     /// Carries the smoke-specific code so the process exits with the
     /// documented value rather than the generic `EXIT_CONVERSION_ERROR=1`
@@ -72,6 +75,7 @@ impl AppError {
         match self {
             AppError::Input(_) => EXIT_INPUT_ERROR,
             AppError::Conversion(_) => EXIT_CONVERSION_ERROR,
+            AppError::ReportedInput => EXIT_INPUT_ERROR,
             AppError::Smoke { code, .. } => *code,
         }
     }
@@ -82,6 +86,7 @@ impl std::fmt::Display for AppError {
         match self {
             AppError::Input(e) => write!(f, "{:#}", e),
             AppError::Conversion(e) => write!(f, "{:#}", e),
+            AppError::ReportedInput => Ok(()),
             AppError::Smoke { msg, .. } => write!(f, "{:#}", msg),
         }
     }
@@ -102,14 +107,29 @@ fn main() -> ExitCode {
     cli::completion_install::reconcile(&raw_args);
     cli::completion_install::report_outcome();
 
-    // Emit one-shot warning / ack-gate summary for any investigation-only
-    // env vars that are set. Uses direct eprintln! (not tracing), so it
-    // runs correctly before the subscriber is installed. Placed before
-    // Cli::parse so the warning appears even when clap exits early on
-    // --help or --version.
-    debug::INVESTIGATION_ENV.activate();
+    let cli = match Cli::try_parse_from(raw_args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            // Preserve the established diagnostics contract for Clap's early
+            // --help/--version/error exits. Valid commands initialize typed
+            // overrides below before this read-once snapshot is activated.
+            debug::INVESTIGATION_ENV.activate();
+            error.exit();
+        }
+    };
 
-    let cli = Cli::parse_from(raw_args);
+    // Apply the typed generate override before the read-once investigation
+    // snapshot initializes. Clap has already validated the value set.
+    if let Command::Generate(args) = &cli.command {
+        if let Some(bits) = args.kv_bits.as_deref() {
+            debug::investigation_env::set_cli_tq_codebook_bits(bits)
+                .expect("Clap-validated --kv-bits must initialize once");
+        }
+    }
+
+    // Emit one-shot warning / ack-gate summary for development-only env
+    // controls. Real operator flags are already typed above.
+    debug::INVESTIGATION_ENV.activate();
 
     // Logging subscriber init. Priority:
     //   1. --log-level (explicit) overrides everything.
@@ -155,6 +175,7 @@ fn main() -> ExitCode {
 
     match run(cli) {
         Ok(()) => ExitCode::from(EXIT_SUCCESS),
+        Err(AppError::ReportedInput) => ExitCode::from(EXIT_INPUT_ERROR),
         Err(app_err) => {
             let exit_code = app_err.exit_code();
             error!("{}", app_err);
@@ -182,7 +203,17 @@ fn run(cli: Cli) -> Result<(), AppError> {
             }
         }),
         Command::GgufPatch(args) => cmd_gguf_patch(args),
-        Command::Info(args) => cmd_info(args).map_err(AppError::Input),
+        Command::Info(args) => {
+            let operator_config = match load_operator_config(state_root.as_deref()) {
+                Ok(config) => config,
+                Err(error) => {
+                    serve::print_info_early_rejection(&args.model, &error.to_string());
+                    return Err(AppError::ReportedInput);
+                }
+            };
+            serve::cmd_info(args, operator_config.as_ref().map(|config| &config.serve))
+                .map_err(|_| AppError::ReportedInput)
+        }
         Command::SourceTeacher(args) => cmd_source_teacher(args),
         Command::SourceTeacherReference(args) => cmd_source_teacher_reference(args),
         Command::SourceTeacherAcceptanceVerify(args) => cmd_source_teacher_acceptance_verify(args),
@@ -716,53 +747,6 @@ fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
             code,
             msg: anyhow::anyhow!("{}", rendered),
         })
-    }
-}
-
-/// Handle the `info` subcommand.
-fn cmd_info(args: cli::InfoArgs) -> Result<()> {
-    let input_dir = resolve_info_input(&args)?;
-
-    let config_path = input_dir.join("config.json");
-    if !config_path.exists() {
-        anyhow::bail!(
-            "No config.json found in {}. Is this a HuggingFace model directory?",
-            input_dir.display()
-        );
-    }
-
-    let metadata =
-        input::config_parser::parse_config(&config_path).context("Failed to parse model config")?;
-
-    println!();
-    println!("{}", console::style("Model Information").bold().green());
-    println!("{}", input::config_parser::format_info(&metadata));
-    println!();
-
-    Ok(())
-}
-
-/// Resolve the input directory for the info subcommand.
-fn resolve_info_input(args: &cli::InfoArgs) -> Result<PathBuf> {
-    match (&args.input, &args.repo) {
-        (Some(path), None) => {
-            if !path.exists() {
-                anyhow::bail!("Input directory does not exist: {}", path.display());
-            }
-            Ok(path.clone())
-        }
-        (None, Some(repo_id)) => {
-            let progress = progress::ProgressReporter::new();
-            let download_dir = input::hf_download::download_model(repo_id, &progress)
-                .context("Failed to download model from HuggingFace Hub")?;
-            Ok(download_dir)
-        }
-        (None, None) => {
-            anyhow::bail!("Either --input or --repo must be specified");
-        }
-        (Some(_), Some(_)) => {
-            anyhow::bail!("--input and --repo are mutually exclusive");
-        }
     }
 }
 

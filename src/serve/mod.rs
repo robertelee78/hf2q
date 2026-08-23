@@ -17,6 +17,9 @@ pub mod forward_prefill;
 pub mod forward_prefill_batched;
 pub mod gpu;
 pub mod header;
+mod info;
+mod info_catalog;
+mod info_report;
 #[allow(dead_code)]
 pub mod kv_persist;
 pub mod layer_ctx;
@@ -29,8 +32,10 @@ pub mod multi_model;
 // Production callsite activation gated on Phase A iter-2+ per-model impls.
 #[allow(dead_code)]
 pub mod multi_seq_kv;
-pub(crate) mod operator_profile;
+pub(crate) mod operator_settings;
 pub(crate) mod operator_ui;
+pub use info::cmd_info;
+pub(crate) use info::print_early_rejection as print_info_early_rejection;
 // ADR-040 Phase B iter-1 scaffolding — Scheduler trait + FifoSchedulerAdapter +
 // InflightBatchedScheduler signature stub. Production activation gated on
 // Phase B iter-3+ + Phase C iter-2 (Engine wiring).
@@ -839,16 +844,6 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         model_path.display()
     );
 
-    // ADR-007 Path C F-6.1: --kv-bits flag wins over env var. Set the env
-    // var BEFORE the engine accesses INVESTIGATION_ENV (LazyLock) so the
-    // `tq_codebook_bits` field is parsed from this value. Must run before
-    // any other module reads the env, hence early in cmd_generate.
-    if let Some(bits) = &args.kv_bits {
-        // clap's PossibleValuesParser already validated bits ∈ {"4","5","6","8"}.
-        std::env::set_var("HF2Q_TQ_CODEBOOK_BITS", bits);
-        tracing::info!("ADR-007 F-6.1: KV codebook bits set via --kv-bits {bits} (overrides HF2Q_TQ_CODEBOOK_BITS env)");
-    }
-
     // --- Architecture detection (fast: metadata-only GGUF open) ---
     {
         let gguf_peek = mlx_native::gguf::GgufFile::open(model_path)
@@ -975,6 +970,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             .ok()
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from),
+        kv_persist_budget_bytes: 0,
     };
     let load_start = std::time::Instant::now();
     let loaded =
@@ -2937,6 +2933,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             .ok()
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from),
+        kv_persist_budget_bytes: 0,
     };
     let load_start = std::time::Instant::now();
     let loaded = Qwen35LoadedModel::load(&load_opts).context("Qwen35LoadedModel::load")?;
@@ -3859,13 +3856,17 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     // the Qwen35 variant returns HTTP 501 with an operator-actionable
     // message (Wedge-3 deferred follow-up wires the live forward
     // pass).  See `LoadedModel::load` for the dispatch surface.
-    {
+    let resolved_context = {
         let gguf = mlx_native::gguf::GgufFile::open(path)
             .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
         let arch = gguf
             .metadata_string("general.architecture")
             .map(|s| s.to_string())
             .unwrap_or_default();
+        api::engine::LoadedModel::validate_architecture_for_load(&arch, path)?;
+        let resolved = operator_settings::resolve_context_for_gguf(&gguf, config.requested_context)
+            .map_err(anyhow::Error::msg)?;
+        info_catalog::validate_family_context_floor(&gguf, resolved).map_err(anyhow::Error::msg)?;
         tracing::info!(
             path = %path.display(),
             tensors = gguf.tensor_count(),
@@ -3873,7 +3874,8 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             arch = %arch,
             "Validated GGUF header"
         );
-    }
+        resolved
+    };
 
     let load_opts = api::engine::LoadOptions {
         model_path: path.to_path_buf(),
@@ -3882,13 +3884,15 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         // ADR-020 AC#5 Iter D — propagated from `cmd_serve`'s
         // `args.dwq_overlay` via `multi_model::EngineConfig`.
         dwq_overlay_path: config.dwq_overlay_path.clone(),
-        // ADR-027 Phase A iter-6b.2: cmd_serve honors HF2Q_KV_PERSIST.
-        kv_persist_dir: std::env::var("HF2Q_KV_PERSIST")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from),
+        // Serve persistence is one typed plan: the Qwen family uses the same
+        // root and disk ceiling as the generic block-prefix store.
+        kv_persist_dir: config.kv_persist_dir.clone(),
+        kv_persist_budget_bytes: config.kv_persist_budget_bytes,
     };
-    let mut loaded = api::engine::LoadedModel::load(&load_opts)?;
+    let mut loaded = api::engine::LoadedModel::load_with_context(
+        &load_opts,
+        Some(resolved_context.effective_tokens),
+    )?;
     // ADR-017 Phase E.a iter-2: thread the metrics sink onto the
     // GemmaLoadedModel BEFORE Engine::spawn moves `loaded` into the
     // worker. Qwen35 / Qwen3VlText variants don't yet have an LCP
@@ -3915,19 +3919,12 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         }
     }
     // ADR-040 Phase C iter-4 (C4) — route through `spawn_with_mode` so
-    // the operator-chosen `EngineMode` (parsed from `--scheduler` /
-    // `HF2Q_SCHEDULER` upstream in `cmd_serve`) reaches the worker
+    // the operator-chosen `EngineMode` (resolved from `--scheduler` /
+    // setup config upstream in `cmd_serve`) reaches the worker
     // thread. `EngineConfig::default()` carries `EngineMode::SerialFifo`,
     // which `spawn_with_mode` delegates byte-for-byte to the legacy
     // 3-arg `Engine::spawn` per iter-1.5 F1 (engine.rs:2723-2748) — so
-    // the env-absence path stays byte-equivalent per ADR-040 §3.6.
-    //
-    // SlotAware is rejected with `EngineSpawnError::ModeNotYetWired`
-    // until iter-2b (Qwen35 worker arm) + iter-2c (Gemma 4) land; we
-    // surface the typed error as an `anyhow::Error` carrying the
-    // ADR-040-prefixed Display string so `cmd_serve` can print it to
-    // stderr and exit non-zero (fail-loud per ADR-040 §7 mantra — no
-    // silent fallback to SerialFifo).
+    // the absent-config path stays byte-equivalent per ADR-040 §3.6.
     let engine = api::engine::Engine::spawn_with_mode(
         loaded,
         config.queue_capacity,
@@ -3936,10 +3933,9 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     )
     .map_err(|e| {
         anyhow::anyhow!(
-            "ADR-040 Phase C iter-4 (C4): Engine::spawn_with_mode rejected the \
-             requested EngineMode: {e}. Either select `--scheduler fifo_serial` \
-             (the default; ADR-005 byte-equivalent path), or wait for the iter \
-             named in the error message to land."
+            "Engine::spawn_with_mode rejected the requested scheduler: {e}. \
+             Select `--scheduler fifo-serial` for the single-slot path or use \
+             `hf2q info --model <GGUF>` to inspect static serve support."
         )
     })?;
     load_info::emit_tracing(engine.info());
@@ -3988,34 +3984,12 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
 /// the next iter with the engine wiring.
 ///
 /// Behavior:
-///   1. Build `ServerConfig` from CLI args + env vars.
+///   1. Build `ServerConfig` from CLI args + setup config.
 ///   2. If `--model` is supplied, validate the GGUF header opens cleanly
 ///      (fail-fast on bad weights, per Decision #15). No tensor data is
 ///      read — that happens when the engine loads in iter 3.
 ///   3. Build the axum router and bind the listener.
 ///   4. Serve until SIGINT / SIGTERM (graceful shutdown per Decision #17).
-/// ADR-017 §R-F1 startup-disable predicate: returns `true` iff the
-/// kv-persist substrate should be constructed at startup.
-///
-/// Contract:
-///   * `flag` — `--kv-persist=PATH` argument as a borrowed string slice
-///     (`None` = flag absent).
-///   * `env` — value of the `HF2Q_KV_PERSIST` env var (`None` = unset).
-///
-/// Rules:
-///   * No flag → never enable (matches pre-ADR-017 behavior).
-///   * Flag present + env unset / empty / any value other than `"0"`
-///     (after trim) → enable.
-///   * Flag present + env trims to exactly `"0"` → disable
-///     (operator emergency-override per `docs/operating-kv-cache.md` §10).
-///
-/// Env-driven semantics are process-scoped: operators restart
-/// `cmd_serve` to re-enable. The pure-function form keeps the policy
-/// trivially unit-testable without spinning up the binary.
-pub(crate) fn should_enable_kv_persist(flag: Option<&str>, env: Option<&str>) -> bool {
-    flag.is_some() && env.map(|v| v.trim()).unwrap_or("") != "0"
-}
-
 pub(crate) fn maybe_print_serve_banner<W: std::io::Write>(
     info: &load_info::LoadInfo,
     w: &mut W,
@@ -4027,163 +4001,6 @@ pub(crate) fn maybe_print_serve_banner<W: std::io::Write>(
     }
     Ok(())
 }
-
-/// ADR-040 Phase C iter-4 (C4) — central authority for resolving the
-/// operator's `--scheduler` / `--max-slots` CLI selection against the
-/// corresponding `HF2Q_SCHEDULER` / `HF2Q_MAX_SLOTS` env vars into a
-/// concrete [`api::engine::EngineMode`].
-///
-/// # Backward-compat contract (ADR-040 §3.6)
-///
-/// When BOTH `scheduler` arguments are `None` (CLI flag absent AND env
-/// var unset / empty), this function returns
-/// [`api::engine::EngineMode::SerialFifo`] — preserving the ADR-005
-/// Decision #2 + #19 production path byte-for-byte. The `max_slots`
-/// inputs are IGNORED on the SerialFifo path (the legacy
-/// 3-arg `Engine::spawn` is single-slot by definition; `max_slots` is
-/// a SlotAware-only concept).
-///
-/// # Precedence
-///
-/// - `scheduler_cli` (Some) overrides `scheduler_env` (mirrors the
-///   `--auth-token` / `HF2Q_AUTH_TOKEN` precedence cmd_serve already
-///   uses for other knobs).
-/// - `max_slots_cli` (Some) overrides `max_slots_env`.
-/// - Whitespace-only env values are treated as unset (mirrors
-///   `should_enable_kv_persist`'s `.trim()` discipline).
-///
-/// # Case-insensitivity (env path)
-///
-/// The env-var path parses `fifo_serial` / `inflight_batched` /
-/// `FIFO_SERIAL` / `INFLIGHT_BATCHED` interchangeably — operators
-/// occasionally export env vars in upper-case by convention. The CLI
-/// path uses clap's `ValueEnum`, which is case-insensitive by default
-/// for snake-case Rust variants.
-///
-/// # Validation
-///
-/// Returns `Err(String)` (operator-facing message) on:
-/// - Unknown scheduler value at the env-var layer (the CLI is gated by
-///   clap so this can only fire via env).
-/// - `max_slots == 0` (per ADR-040 iter-2.5 F3a `.max(1)` discipline,
-///   refused loudly rather than coerced).
-/// - `HF2Q_MAX_SLOTS` env value that doesn't parse as `u32`.
-///
-/// # Pure function (no env reads / no I/O)
-///
-/// The caller threads the parsed CLI flag + the env-var value in.
-/// This keeps the function unit-testable without `std::env::set_var`
-/// races (the existing `should_enable_kv_persist` follows the same
-/// pattern for the same reason).
-#[cfg(test)]
-pub(crate) fn parse_scheduler_config(
-    scheduler_cli: Option<cli::SchedulerArg>,
-    scheduler_env: Option<&str>,
-    max_slots_cli: Option<u32>,
-    max_slots_env: Option<&str>,
-) -> std::result::Result<api::engine::EngineMode, String> {
-    parse_scheduler_config_with_defaults(
-        scheduler_cli,
-        scheduler_env,
-        max_slots_cli,
-        max_slots_env,
-        None,
-        None,
-    )
-}
-
-pub(crate) fn parse_scheduler_config_with_defaults(
-    scheduler_cli: Option<cli::SchedulerArg>,
-    scheduler_env: Option<&str>,
-    max_slots_cli: Option<u32>,
-    max_slots_env: Option<&str>,
-    scheduler_config: Option<cli::SchedulerArg>,
-    max_slots_config: Option<u32>,
-) -> std::result::Result<api::engine::EngineMode, String> {
-    use api::engine::EngineMode;
-
-    // ---- 1. Resolve scheduler choice ----
-    //
-    // CLI flag wins; env is the fallback. Whitespace-only env values
-    // are treated as unset (trim semantics match `should_enable_kv_persist`).
-    let scheduler_from_env: Option<cli::SchedulerArg> = if scheduler_cli.is_some() {
-        None
-    } else {
-        match scheduler_env.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            None => None,
-            Some(raw) => {
-                let lower = raw.to_ascii_lowercase();
-                match lower.as_str() {
-                    "fifo_serial" => Some(cli::SchedulerArg::FifoSerial),
-                    "inflight_batched" => Some(cli::SchedulerArg::InflightBatched),
-                    _ => {
-                        return Err(format!(
-                            "ADR-040 C4: HF2Q_SCHEDULER={raw:?} is not a recognized \
-                         scheduler policy. Supported values (case-insensitive): \
-                         `fifo_serial` (default; ADR-005 byte-equivalent path), \
-                         `inflight_batched` (ADR-040 slot-aware path, gated on \
-                         iter-2b/2c worker-arm landing). Unset the env var to \
-                         use the default."
-                        ));
-                    }
-                }
-            }
-        }
-    };
-    let scheduler = scheduler_cli.or(scheduler_from_env).or(scheduler_config);
-
-    // ---- 2. Resolve max_slots ----
-    //
-    // CLI flag wins; env is the fallback. `HF2Q_MAX_SLOTS=0` is
-    // refused loudly (per ADR-040 iter-2.5 F3a). Whitespace-only env
-    // values are treated as unset.
-    if matches!(scheduler, None | Some(cli::SchedulerArg::FifoSerial)) {
-        return Ok(EngineMode::SerialFifo);
-    }
-
-    let max_slots_from_env: Option<u32> = if max_slots_cli.is_some() {
-        None
-    } else {
-        match max_slots_env.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            None => None,
-            Some(raw) => match raw.parse::<u32>() {
-                Ok(parsed) => Some(parsed),
-                Err(err) => {
-                    return Err(format!(
-                        "ADR-040 C4: HF2Q_MAX_SLOTS={raw:?} does not parse as a \
-                     non-negative u32: {err}. Supply a positive integer (default \
-                     {}), or unset the env var.",
-                        DEFAULT_MAX_SLOTS_UNDER_INFLIGHT
-                    ));
-                }
-            },
-        }
-    };
-    let max_slots_requested = max_slots_cli.or(max_slots_from_env).or(max_slots_config);
-    if let Some(0) = max_slots_requested {
-        return Err(format!(
-            "ADR-040 C4: --max-slots=0 / HF2Q_MAX_SLOTS=0 is rejected per \
-             ADR-040 iter-2.5 F3a (FifoSchedulerAdapter `.max(1)` discipline \
-             applied at the CLI layer instead of silently coerced). Either \
-             omit the flag (defaults to {} when `--scheduler inflight_batched` \
-             is selected; ignored otherwise), or supply a positive integer.",
-            DEFAULT_MAX_SLOTS_UNDER_INFLIGHT
-        ));
-    }
-
-    // ---- 3. Build the EngineMode ----
-    let max_slots = max_slots_requested.unwrap_or(DEFAULT_MAX_SLOTS_UNDER_INFLIGHT);
-    // Defensive: parsed-zero already rejected above. The `.max(1)` here is a
-    // defense-in-depth pin for any future refactor that loses the zero-check.
-    Ok(EngineMode::SlotAware {
-        max_slots: max_slots.max(1),
-    })
-}
-
-/// ADR-040 §3.4 — default `max_slots` under `EngineMode::SlotAware`.
-/// Half the reopen-trigger threshold of `8`, so the first ramp deploys
-/// with headroom.
-pub(crate) const DEFAULT_MAX_SLOTS_UNDER_INFLIGHT: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedServeEndpoint {
@@ -4290,27 +4107,6 @@ fn validate_mmproj_diagnostic_mode(
     Ok(())
 }
 
-/// Resolve the shared physical KV budget without touching process-global env.
-/// CLI wins; zero and blank mean "no explicit ceiling". Keeping this pure
-/// prevents configuration tests from racing over `std::env`.
-pub(crate) fn parse_kv_cache_budget(
-    cli_bytes: Option<u64>,
-    env_bytes: Option<&str>,
-) -> std::result::Result<Option<u64>, String> {
-    match cli_bytes {
-        Some(0) => Ok(None),
-        Some(bytes) => Ok(Some(bytes)),
-        None => match env_bytes.map(str::trim).filter(|value| !value.is_empty()) {
-            None | Some("0") => Ok(None),
-            Some(value) => value.parse::<u64>().map(Some).map_err(|_| {
-                format!(
-                    "HF2Q_KV_CACHE_BUDGET_BYTES must be a non-negative integer (got: {value:?})"
-                )
-            }),
-        },
-    }
-}
-
 pub fn cmd_serve(
     args: cli::ServeArgs,
     log_format: cli::LogFormat,
@@ -4324,12 +4120,6 @@ pub fn cmd_serve(
     }
 
     operator_ui::validate_mode(args.operator_ui, matches!(log_format, cli::LogFormat::Text))?;
-
-    // Setup-persisted agentic serving profile -> process env defaults.
-    // Runs before the INVESTIGATION_ENV LazyLock snapshot and before any
-    // request handler reads the thinking-budget variables; explicit
-    // operator environment always wins (see operator_profile module docs).
-    operator_profile::apply_operator_serve_profile(operator_defaults);
 
     // --- Resolve config ---
     let auth_token = args.auth_token.clone().or_else(|| {
@@ -4352,41 +4142,42 @@ pub fn cmd_serve(
         .clone()
         .or_else(api::state::default_cache_dir);
 
-    // ADR-040 Phase C iter-4 (C4) — resolve `--scheduler` + `--max-slots`
-    // against `HF2Q_SCHEDULER` + `HF2Q_MAX_SLOTS` into a concrete
-    // `EngineMode`. The pure-function parser at
-    // `parse_scheduler_config` is unit-tested without env mutation; this
-    // call site is the only `std::env::var` lookup for these two knobs.
-    //
-    // Per ADR-040 §3.6 backward-compat: with the flag, env, and setup
-    // config all absent, this returns `EngineMode::SerialFifo` —
-    // byte-equivalent to pre-ADR-040. On a parse failure (bogus
-    // scheduler name, `max_slots=0`, non-u32 env), we propagate the
-    // operator-facing message via `anyhow!` so `cmd_serve` exits
-    // non-zero before binding the listener (fail-loud per §7 mantra).
-    let scheduler_env = std::env::var("HF2Q_SCHEDULER").ok();
-    let max_slots_env = std::env::var("HF2Q_MAX_SLOTS").ok();
-    let engine_mode = parse_scheduler_config_with_defaults(
-        args.scheduler,
-        scheduler_env.as_deref(),
-        args.max_slots,
-        max_slots_env.as_deref(),
-        operator_defaults.map(|defaults| defaults.scheduler.as_cli()),
-        operator_defaults.map(|defaults| defaults.max_slots),
+    let engine_mode = operator_settings::resolve_scheduler(&args.planning, operator_defaults)
+        .map_err(anyhow::Error::msg)?;
+    let requested_context =
+        operator_settings::requested_context(args.planning.ctx, operator_defaults)
+            .map_err(anyhow::Error::msg)?;
+    let kv_cache_budget = operator_settings::resolve_kv_cache_budget(
+        args.planning.kv_cache_budget.as_deref(),
+        operator_defaults,
     )
-    .map_err(|msg| anyhow::anyhow!("{msg}"))?;
-    let kv_cache_budget_env = std::env::var("HF2Q_KV_CACHE_BUDGET_BYTES").ok();
-    let kv_cache_budget_bytes =
-        parse_kv_cache_budget(args.kv_cache_budget_bytes, kv_cache_budget_env.as_deref())
-            .map_err(|message| anyhow::anyhow!(message))?;
+    .map_err(anyhow::Error::msg)?;
+    let kv_cache_budget_bytes = kv_cache_budget.bytes;
+    let kv_persist_budget = operator_settings::resolve_kv_persist_budget(
+        args.planning.kv_persist_budget.as_deref(),
+        operator_defaults,
+    )
+    .map_err(anyhow::Error::msg)?;
+    operator_settings::validate_kv_persist_plan(
+        args.planning.kv_persist_path.as_deref(),
+        kv_persist_budget,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let kv_persist_budget_bytes = kv_persist_budget.bytes.unwrap_or(0);
+    let kv_persist_dir = args.planning.kv_persist_path.clone();
+    let behavior = operator_settings::resolve_serve_behavior(&args.behavior, operator_defaults)
+        .map_err(anyhow::Error::msg)?;
     tracing::info!(
         engine_mode = ?engine_mode,
-        scheduler_cli = ?args.scheduler,
-        scheduler_env = ?scheduler_env,
-        max_slots_cli = ?args.max_slots,
-        max_slots_env = ?max_slots_env,
+        scheduler_cli = ?args.planning.scheduler,
+        max_slots_cli = ?args.planning.max_slots,
+        context_cli = ?args.planning.ctx,
+        requested_context = ?requested_context,
         kv_cache_budget_bytes,
-        "ADR-040 C4: resolved scheduler policy"
+        kv_cache_budget_origin = ?kv_cache_budget.origin,
+        kv_persist_budget_bytes,
+        kv_persist_budget_origin = ?kv_persist_budget.origin,
+        "resolved serving plan"
     );
 
     let config = ServerConfig {
@@ -4400,6 +4191,9 @@ pub fn cmd_serve(
         default_overflow_policy: overflow_policy,
         cache_dir,
         system_fingerprint: Some(system_fingerprint()),
+        default_repetition_penalty: behavior.repetition_penalty,
+        default_thinking_token_budget: behavior.thinking_token_budget,
+        default_tool_thinking_token_budget: behavior.tool_thinking_token_budget,
     };
 
     // Warn when exposing beyond localhost. Decision #7 + #13 — public-internet
@@ -4449,7 +4243,10 @@ pub fn cmd_serve(
         kv_metrics_sink: Some(dynamic_kv_metrics_sink),
         dwq_overlay_path: None,
         engine_mode,
+        requested_context,
         kv_cache_budget_bytes,
+        kv_persist_dir: kv_persist_dir.clone(),
+        kv_persist_budget_bytes,
     });
 
     // --- ADR-017 Phase C.1 — optional persistent block-prefix KV cache ---
@@ -4466,42 +4263,9 @@ pub fn cmd_serve(
     // runs synchronously here so a previously-written cache becomes
     // available before the optional pre-warm load_or_get fires.
     //
-    // ADR-017 §R-F1 startup-disable override: `HF2Q_KV_PERSIST=0`
-    // (exact match, after trim) overrides `--kv-persist=PATH` and
-    // leaves the NoopKvSpiller-backed AppState manager wired. This
-    // closes the operator-runbook §10 gap (`docs/operating-kv-cache.md`)
-    // — operators emergency-disable by setting the env var and
-    // restarting (env vars are process-scoped, so true mid-flight
-    // disable is restart-driven; that's the standard operator
-    // pattern for env-driven config). Restart without
-    // `HF2Q_KV_PERSIST=0` to re-enable. The decision predicate is
-    // factored into `should_enable_kv_persist` below for unit
-    // testing.
-    let kv_persist_env = std::env::var("HF2Q_KV_PERSIST").ok();
-    let kv_persist_flag_path = args.kv_persist_path.as_ref();
-    let kv_persist_enabled = should_enable_kv_persist(
-        kv_persist_flag_path.map(|p| p.to_string_lossy()).as_deref(),
-        kv_persist_env.as_deref(),
-    );
-    if !kv_persist_enabled && kv_persist_flag_path.is_some() {
-        // Flag was supplied but env override forced disable — surface
-        // a single warn line so operators see the override took
-        // effect without grepping logs for absent counters.
-        let path_for_log = kv_persist_flag_path
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        tracing::warn!(
-            kv_persist_path = %path_for_log,
-            "ADR-017 R-F1 override: HF2Q_KV_PERSIST=0 — disabling kv-persist \
-             despite --kv-persist={path_for_log}. Operator emergency-disable per \
-             operating-kv-cache.md §10. Restart without HF2Q_KV_PERSIST=0 to \
-             re-enable.",
-            path_for_log = path_for_log,
-        );
-    }
     let kv_persist_loader_wrapper: Option<
         std::sync::Arc<crate::serve::kv_persist::LoaderWrapper<api::engine::Engine>>,
-    > = if let Some(cache_dir) = args.kv_persist_path.as_ref().filter(|_| kv_persist_enabled) {
+    > = if let Some(cache_dir) = kv_persist_dir.as_ref() {
         use crate::serve::kv_persist::families::gemma4_dense::{
             Gemma4DenseConfig, Gemma4DenseSpillFactory,
         };
@@ -4558,36 +4322,19 @@ pub fn cmd_serve(
         // 3. DiskBlockStore — owns the read-path file I/O.
         //
         //    ADR-017 P1-3 (adversarial review fix): wire the on-disk
-        //    LRU budget from `HF2Q_KV_PERSIST_BUDGET_BYTES` (u64,
-        //    bytes). Default `0` = unlimited (matches the pre-P1-3
-        //    behavior so the env var is purely additive). Per
+        //    LRU budget from typed CLI/config. Default `0` = unlimited.
+        //    Per
         //    ADR-017 §R7 the intended future default is "10% of
         //    unified RAM" (~12.8 GiB on a 128-GiB M5 Max); that
         //    requires a `mlx_native::sysinfo::physical_ram_bytes()`
         //    helper which does not yet exist, and per the standing
         //    directive we do NOT add a new mlx-native dep just for
-        //    this. Operators set the env var explicitly until §R7's
-        //    helper lands.
+        //    this.
         //
         //    Construct via `new_with_index` (kept at 0 for
         //    source-compat with existing callers), then override
         //    through `set_budget_bytes` so the AtomicU64 holds the
         //    parsed value before any eviction call fires.
-        let kv_persist_budget_bytes: u64 = match std::env::var("HF2Q_KV_PERSIST_BUDGET_BYTES") {
-            Ok(raw) => match raw.trim().parse::<u64>() {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    tracing::warn!(
-                        raw = %raw,
-                        error = %err,
-                        "ADR-017 P1-3: HF2Q_KV_PERSIST_BUDGET_BYTES \
-                         parse failed; defaulting to 0 (unlimited)"
-                    );
-                    0
-                }
-            },
-            Err(_) => 0,
-        };
         let store = Arc::new(
             DiskBlockStore::new_with_index(cache_dir.clone(), recovered_index, 0).with_context(
                 || {
@@ -4610,7 +4357,7 @@ pub fn cmd_serve(
         state.kv_disk_store = Some(Arc::clone(&store));
         tracing::info!(
             budget_bytes = kv_persist_budget_bytes,
-            "ADR-017 P1-3: HF2Q_KV_PERSIST_BUDGET_BYTES wired (0 = unlimited)"
+            "ADR-017 P1-3: typed persistent-KV disk budget wired (0 = unlimited)"
         );
 
         // 4. AsyncWriterHandle — owns the write-path background
@@ -4772,11 +4519,9 @@ pub fn cmd_serve(
                     // this iter, the auto-LoaderWrapper-bind always
                     // delivers Arc<Engine>).
                     let bits = TqBitsPerCoord::new(
-                        crate::serve::api::tq_packed_descriptor::parse_tq_codebook_bits(
-                            std::env::var("HF2Q_TQ_CODEBOOK_BITS").ok().as_deref(),
-                        ),
+                        crate::serve::api::tq_packed_descriptor::effective_tq_codebook_bits(),
                     )
-                    .expect("HF2Q_TQ_CODEBOOK_BITS validated to be in {2,3,4,5,6,8}");
+                    .expect("effective TQ codebook width validated to be in {2,3,4,5,6,8}");
                     let tq_fallback_cfg = TqPackedConfig {
                         // Two layers minimum exercising the
                         // sliding/global split (mirrors the dense
@@ -6501,13 +6246,11 @@ mod tests {
     use super::{
         build_chat_template_env, detect_greedy_repetition_loop,
         detect_greedy_repetition_loop_with_text, find_special_token_stop, maybe_print_serve_banner,
-        parse_kv_cache_budget, parse_scheduler_config, parse_scheduler_config_with_defaults,
         peer_special_token_id_for_model, render_jinja_template, resolve_enable_thinking,
-        resolve_serve_endpoint, run_decode_loop, should_enable_kv_persist,
-        validate_configured_endpoint_auth, validate_greedy_only_speculative_cli_path,
-        validate_mmproj_diagnostic_mode, validate_mmproj_text_binding, DecodeStopReason,
-        RaisePolicy, DEFAULT_MAX_SLOTS_UNDER_INFLIGHT, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
-        FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        resolve_serve_endpoint, run_decode_loop, validate_configured_endpoint_auth,
+        validate_greedy_only_speculative_cli_path, validate_mmproj_diagnostic_mode,
+        validate_mmproj_text_binding, DecodeStopReason, RaisePolicy,
+        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::cli;
     use crate::core::chat_templates::QWEN3_CHATML;
@@ -6598,51 +6341,6 @@ mod tests {
         assert!(buf.is_empty());
     }
 
-    // ADR-017 §R-F1 startup-disable override regression guards.
-    // Closes operator-runbook §10 gap by pinning the predicate's
-    // truth table. Pure-function tests; no binary / env mutation.
-
-    #[test]
-    fn hf2q_kv_persist_zero_overrides_flag() {
-        assert!(!should_enable_kv_persist(Some("/path"), Some("0")));
-    }
-
-    #[test]
-    fn hf2q_kv_persist_unset_respects_flag_present() {
-        assert!(should_enable_kv_persist(Some("/path"), None));
-    }
-
-    #[test]
-    fn hf2q_kv_persist_one_respects_flag() {
-        assert!(should_enable_kv_persist(Some("/path"), Some("1")));
-    }
-
-    #[test]
-    fn hf2q_kv_persist_no_flag_means_disabled_regardless() {
-        assert!(!should_enable_kv_persist(None, None));
-        assert!(!should_enable_kv_persist(None, Some("0")));
-        assert!(!should_enable_kv_persist(None, Some("1")));
-    }
-
-    #[test]
-    fn hf2q_kv_persist_zero_with_whitespace_still_disables() {
-        // Trim semantics — operators occasionally export with
-        // trailing whitespace from copy-paste; `"  0  "` MUST still
-        // trigger the override.
-        assert!(!should_enable_kv_persist(Some("/path"), Some("  0  ")));
-        assert!(!should_enable_kv_persist(Some("/path"), Some("0\n")));
-    }
-
-    #[test]
-    fn hf2q_kv_persist_empty_or_other_values_respect_flag() {
-        // Empty / `"true"` / `"yes"` / arbitrary strings all
-        // respect the flag (only exact `"0"` after trim disables).
-        assert!(should_enable_kv_persist(Some("/path"), Some("")));
-        assert!(should_enable_kv_persist(Some("/path"), Some("true")));
-        assert!(should_enable_kv_persist(Some("/path"), Some("yes")));
-        assert!(should_enable_kv_persist(Some("/path"), Some("00")));
-    }
-
     /// iter-219b parity-gate fix (2026-05-01) regression guard. The CLI
     /// fallback chat template MUST NOT activate Gemma 4's thinking-mode
     /// via `<|think|>` system marker — that diverged from the peer's
@@ -6725,9 +6423,9 @@ mod tests {
     // assert the new dispatch routes to the correct LoadedModel variant.
 
     /// Write a minimal valid GGUF (magic + version + 0 tensors + N
-    /// string KVs) to a tempfile. Just enough structure for the
-    /// header-only parse to succeed and `metadata_string` to find
-    /// the keys.
+    /// metadata KVs) to a tempfile. The fixture declares both its
+    /// architecture and a family-scoped context maximum so dispatch tests do
+    /// not fail earlier on the independent context-metadata contract.
     fn write_minimal_gguf_with_arch(arch: &str) -> tempfile::NamedTempFile {
         use std::io::Write;
         let mut f = tempfile::Builder::new()
@@ -6738,7 +6436,7 @@ mod tests {
         buf.extend_from_slice(b"GGUF");
         buf.extend_from_slice(&3u32.to_le_bytes()); // version
         buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
-        buf.extend_from_slice(&1u64.to_le_bytes()); // metadata_kv_count = 1
+        buf.extend_from_slice(&2u64.to_le_bytes()); // metadata_kv_count = 2
                                                     // KV: key="general.architecture" value=<arch>
         let key = b"general.architecture";
         buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
@@ -6747,6 +6445,12 @@ mod tests {
         let val = arch.as_bytes();
         buf.extend_from_slice(&(val.len() as u64).to_le_bytes());
         buf.extend_from_slice(val);
+        // KV: key="<arch>.context_length" value=1,048,576 (GGUF u32).
+        let context_key = format!("{arch}.context_length");
+        buf.extend_from_slice(&(context_key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(context_key.as_bytes());
+        buf.extend_from_slice(&4u32.to_le_bytes()); // GGUF_TYPE_UINT32 = 4
+        buf.extend_from_slice(&1_048_576u32.to_le_bytes());
         f.write_all(&buf).expect("write");
         f.flush().expect("flush");
         f
@@ -6770,7 +6474,10 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            requested_context: None,
             kv_cache_budget_bytes: None,
+            kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         // 0-tensor GGUF can't fully load, but the FAILURE shape proves
@@ -6809,7 +6516,10 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            requested_context: None,
             kv_cache_budget_bytes: None,
+            kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "0-tensor synthetic GGUF must fail load");
@@ -6851,7 +6561,10 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            requested_context: None,
             kv_cache_budget_bytes: None,
+            kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
@@ -6903,7 +6616,10 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            requested_context: None,
             kv_cache_budget_bytes: None,
+            kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -6930,7 +6646,10 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            requested_context: None,
             kv_cache_budget_bytes: None,
+            kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -6957,7 +6676,10 @@ mod tests {
             // ADR-040 Phase C iter-4 (C4) — test path stays on the
             // SerialFifo default (the ADR-005 byte-equivalent route).
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            requested_context: None,
             kv_cache_budget_bytes: None,
+            kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "unknown architecture must fail dispatch");
@@ -6987,7 +6709,10 @@ mod tests {
             kv_metrics_sink: None,
             dwq_overlay_path: None,
             engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+            requested_context: None,
             kv_cache_budget_bytes: None,
+            kv_persist_dir: None,
+            kv_persist_budget_bytes: 0,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
@@ -6996,8 +6721,10 @@ mod tests {
         );
         let msg = format!("{:#}", result.err().unwrap());
         assert!(
-            msg.contains("DeepSeek-V4 tokenizer") || msg.contains("native DeepSeek-V4 model"),
-            "DeepSeek-V4 must reach its native loader; got: {msg}"
+            msg.contains("DeepSeek-V4 metadata/config validation failed")
+                || msg.contains("DeepSeek-V4 tokenizer")
+                || msg.contains("native DeepSeek-V4 model"),
+            "DeepSeek-V4 must reach its native header/config or loader path; got: {msg}"
         );
         assert!(
             !msg.contains("refusing to route it through Gemma")
@@ -7024,7 +6751,10 @@ mod tests {
                 // ADR-040 Phase C iter-4 (C4) — test path stays on the
                 // SerialFifo default (the ADR-005 byte-equivalent route).
                 engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
+                requested_context: None,
                 kv_cache_budget_bytes: None,
+                kv_persist_dir: None,
+                kv_persist_budget_bytes: 0,
             };
             let result = super::load_engine(tmp.path(), &cfg);
             assert!(
@@ -8283,7 +8013,7 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn serve_config_defaults_are_used_and_cli_env_override_them() {
+    fn serve_config_defaults_are_used_and_cli_overrides_them() {
         let config = crate::setup::OperatorConfigV2::guide_defaults().unwrap();
         let endpoint = resolve_serve_endpoint(None, None, Some(&config.serve));
         assert_eq!(endpoint.host, "127.0.0.1");
@@ -8295,13 +8025,16 @@ mod tests {
         assert_eq!(endpoint.port, 9090);
         assert!(!endpoint.host_from_config);
 
-        let configured = parse_scheduler_config_with_defaults(
-            None,
-            None,
-            None,
-            None,
-            Some(config.serve.scheduler.as_cli()),
-            Some(config.serve.max_slots),
+        let configured = crate::serve::operator_settings::resolve_scheduler(
+            &cli::ServePlanningArgs {
+                ctx: None,
+                scheduler: None,
+                max_slots: None,
+                kv_cache_budget: None,
+                kv_persist_path: None,
+                kv_persist_budget: None,
+            },
+            Some(&config.serve),
         )
         .unwrap();
         assert_eq!(
@@ -8309,31 +8042,37 @@ mod tests {
             crate::serve::api::engine::EngineMode::SlotAware { max_slots: 1 }
         );
 
-        let env_override = parse_scheduler_config_with_defaults(
-            None,
-            Some("inflight_batched"),
-            None,
-            Some("3"),
-            Some(config.serve.scheduler.as_cli()),
-            Some(config.serve.max_slots),
-        )
-        .unwrap();
-        assert_eq!(
-            env_override,
-            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 3 }
-        );
-
-        let cli_override = parse_scheduler_config_with_defaults(
-            Some(cli::SchedulerArg::FifoSerial),
-            Some("inflight_batched"),
-            Some(7),
-            Some("3"),
-            Some(config.serve.scheduler.as_cli()),
-            Some(config.serve.max_slots),
+        let cli_override = crate::serve::operator_settings::resolve_scheduler(
+            &cli::ServePlanningArgs {
+                ctx: None,
+                scheduler: Some(cli::SchedulerArg::InflightBatched),
+                max_slots: Some(3),
+                kv_cache_budget: None,
+                kv_persist_path: None,
+                kv_persist_budget: None,
+            },
+            Some(&config.serve),
         )
         .unwrap();
         assert_eq!(
             cli_override,
+            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 3 }
+        );
+
+        let fifo_override = crate::serve::operator_settings::resolve_scheduler(
+            &cli::ServePlanningArgs {
+                ctx: None,
+                scheduler: Some(cli::SchedulerArg::FifoSerial),
+                max_slots: None,
+                kv_cache_budget: None,
+                kv_persist_path: None,
+                kv_persist_budget: None,
+            },
+            Some(&config.serve),
+        )
+        .unwrap();
+        assert_eq!(
+            fifo_override,
             crate::serve::api::engine::EngineMode::SerialFifo
         );
     }
@@ -8362,290 +8101,6 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // ADR-040 Phase C iter-4 (C4) — CLI/env wiring for `HF2Q_SCHEDULER` +
-    // `--scheduler` / `HF2Q_MAX_SLOTS` + `--max-slots` (2026-05-23).
-    //
-    // These tests exercise the pure-function `parse_scheduler_config`
-    // helper that `cmd_serve` calls — no env mutation, no listener bind,
-    // no model load. The helper is the operator-facing contract surface:
-    // any future drift in defaults / precedence / validation falsifies
-    // here before the binary ships.
-    //
-    // Contract pinned (per ADR-040 §3.4 + §3.6):
-    //   - Env-absence (CLI + env both unset) → `EngineMode::SerialFifo`
-    //     (the ADR-005 byte-equivalent default).
-    //   - `fifo_serial` / `inflight_batched` parse case-insensitively
-    //     from the env-var layer.
-    //   - `max_slots` defaults to `DEFAULT_MAX_SLOTS_UNDER_INFLIGHT = 4`
-    //     under `inflight_batched`; ignored entirely under `fifo_serial`
-    //     (legacy single-slot worker).
-    //   - `max_slots == 0` (CLI or env) is REJECTED loudly with an
-    //     operator-actionable message (per ADR-040 iter-2.5 F3a
-    //     `.max(1)` discipline applied at the CLI layer instead of
-    //     silently coerced).
-    //   - Unknown scheduler value via env rejected with named-supported
-    //     diagnostic.
-    // ─────────────────────────────────────────────────────────────────────
-
-    /// ADR-040 §3.6 — backward-compat: with CLI + env both unset, the
-    /// resolved mode is `EngineMode::SerialFifo`. This is the
-    /// load-bearing pre-ADR-040 byte-equivalence pin at the CLI layer.
-    #[test]
-    fn c4_scheduler_env_unset_defaults_to_fifo_serial() {
-        let mode = parse_scheduler_config(None, None, None, None)
-            .expect("env-absence must yield SerialFifo, not an error");
-        assert_eq!(
-            mode,
-            crate::serve::api::engine::EngineMode::SerialFifo,
-            "ADR-040 §3.6: env-absence MUST be byte-equivalent to \
-             pre-ADR-040 (= EngineMode::SerialFifo). Got {mode:?}."
-        );
-    }
-
-    /// ADR-040 §3.6 — explicit `HF2Q_SCHEDULER=fifo_serial` matches the
-    /// default (lowercase canonical form).
-    #[test]
-    fn c4_scheduler_env_fifo_serial_lowercase_matches() {
-        let mode = parse_scheduler_config(None, Some("fifo_serial"), None, None)
-            .expect("HF2Q_SCHEDULER=fifo_serial must parse");
-        assert_eq!(mode, crate::serve::api::engine::EngineMode::SerialFifo);
-    }
-
-    /// `HF2Q_SCHEDULER=inflight_batched` resolves to
-    /// `EngineMode::SlotAware { max_slots: DEFAULT_MAX_SLOTS_UNDER_INFLIGHT }`
-    /// (the env-var layer accepts the same names clap exposes via
-    /// `--scheduler`, case-insensitive).
-    #[test]
-    fn c4_scheduler_env_inflight_batched_matches() {
-        let mode = parse_scheduler_config(None, Some("inflight_batched"), None, None)
-            .expect("HF2Q_SCHEDULER=inflight_batched must parse");
-        assert_eq!(
-            mode,
-            crate::serve::api::engine::EngineMode::SlotAware {
-                max_slots: DEFAULT_MAX_SLOTS_UNDER_INFLIGHT,
-            }
-        );
-    }
-
-    /// The env-var path is case-insensitive — operators occasionally
-    /// export env vars in upper-case by convention. Mirrors the
-    /// clap-`ValueEnum`-default case-insensitivity on the CLI side.
-    #[test]
-    fn c4_scheduler_env_case_insensitive() {
-        // Upper-case
-        let mode = parse_scheduler_config(None, Some("INFLIGHT_BATCHED"), None, None)
-            .expect("HF2Q_SCHEDULER=INFLIGHT_BATCHED must parse case-insensitively");
-        assert!(matches!(
-            mode,
-            crate::serve::api::engine::EngineMode::SlotAware { .. }
-        ));
-        // Mixed case
-        let mode = parse_scheduler_config(None, Some("FiFo_SeRiAl"), None, None)
-            .expect("HF2Q_SCHEDULER=FiFo_SeRiAl must parse case-insensitively");
-        assert_eq!(mode, crate::serve::api::engine::EngineMode::SerialFifo);
-        // Whitespace-only treated as unset → default SerialFifo
-        let mode = parse_scheduler_config(None, Some("   "), None, None)
-            .expect("HF2Q_SCHEDULER=`   ` must be treated as unset");
-        assert_eq!(mode, crate::serve::api::engine::EngineMode::SerialFifo);
-    }
-
-    /// Unknown values via the env-var path are REJECTED with a clear
-    /// operator-actionable message that names the supported set. The
-    /// CLI path is gated by clap's `ValueEnum` so this only fires from
-    /// env. Matches the "fail loudly, no silent fallback" stance ADR-040
-    /// §7 mantra demands.
-    #[test]
-    fn c4_scheduler_env_unknown_value_errors() {
-        let err = parse_scheduler_config(None, Some("foo"), None, None)
-            .expect_err("unknown HF2Q_SCHEDULER value must error");
-        assert!(err.contains("HF2Q_SCHEDULER"), "msg: {err}");
-        assert!(err.contains("foo"), "msg must echo bad value: {err}");
-        assert!(
-            err.contains("fifo_serial") && err.contains("inflight_batched"),
-            "msg must name supported values: {err}"
-        );
-    }
-
-    /// ADR-040 §3.4 — `max_slots` default = `4` under
-    /// `inflight_batched`. Operator deploys ramp 1 with headroom (half
-    /// the ≥8 reopen-trigger).
-    #[test]
-    fn c4_max_slots_env_unset_defaults_to_4_under_inflight() {
-        let mode = parse_scheduler_config(None, Some("inflight_batched"), None, None)
-            .expect("inflight_batched without HF2Q_MAX_SLOTS must default");
-        assert_eq!(
-            mode,
-            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 4 },
-            "ADR-040 §3.4: default max_slots under inflight_batched MUST be 4"
-        );
-        assert_eq!(
-            DEFAULT_MAX_SLOTS_UNDER_INFLIGHT, 4,
-            "ADR-040 §3.4: the named constant MUST hold the 4 default"
-        );
-    }
-
-    /// `max_slots` is IGNORED on the `fifo_serial` path (the legacy
-    /// 3-arg `Engine::spawn` is single-slot by definition; `max_slots`
-    /// is a SlotAware-only concept). Even if the operator supplies
-    /// `--max-slots 8 --scheduler fifo_serial`, the resolved mode is
-    /// `EngineMode::SerialFifo` with no `max_slots` field.
-    #[test]
-    fn c4_max_slots_env_unset_defaults_to_1_under_fifo_serial() {
-        // CLI says `--max-slots 8` but env+cli say SerialFifo → SerialFifo
-        // wins, max_slots is IGNORED.
-        let mode = parse_scheduler_config(Some(cli::SchedulerArg::FifoSerial), None, Some(8), None)
-            .expect("max_slots on fifo_serial must be ignored, not error");
-        assert_eq!(
-            mode,
-            crate::serve::api::engine::EngineMode::SerialFifo,
-            "ADR-040: under fifo_serial, max_slots is ignored — \
-             resolved mode MUST be SerialFifo (single-slot by definition). \
-             Got {mode:?}."
-        );
-
-        // Same conclusion when BOTH are unset (the default-default path).
-        let mode2 = parse_scheduler_config(None, None, None, None).expect("default ok");
-        assert_eq!(mode2, crate::serve::api::engine::EngineMode::SerialFifo);
-    }
-
-    /// ADR-040 iter-2.5 F3a discipline — `max_slots == 0` is REJECTED
-    /// at the CLI layer rather than silently coerced via `.max(1)`. The
-    /// fail-loud stance is the ADR-040 §7 mantra requirement; the
-    /// `.max(1)` defense-in-depth still lives in
-    /// `parse_scheduler_config`'s SlotAware arm in case a future
-    /// refactor loses this check.
-    #[test]
-    fn c4_max_slots_env_zero_normalizes_or_errors() {
-        // CLI-supplied --max-slots 0 → error
-        let err = parse_scheduler_config(
-            Some(cli::SchedulerArg::InflightBatched),
-            None,
-            Some(0),
-            None,
-        )
-        .expect_err("max_slots=0 must be rejected, not silently coerced");
-        assert!(err.contains("max-slots"), "msg: {err}");
-        assert!(err.contains('0'), "msg must echo the bad value: {err}");
-        assert!(
-            err.contains("F3a") || err.contains(".max(1)"),
-            "msg should cite the iter-2.5 F3a discipline: {err}"
-        );
-
-        // Env-supplied HF2Q_MAX_SLOTS=0 → error
-        let err = parse_scheduler_config(None, Some("inflight_batched"), None, Some("0"))
-            .expect_err("HF2Q_MAX_SLOTS=0 must be rejected, not silently coerced");
-        assert!(err.contains("max-slots"), "msg: {err}");
-
-        // Bonus: non-parseable env value also errors with named diag.
-        let err = parse_scheduler_config(
-            Some(cli::SchedulerArg::InflightBatched),
-            None,
-            None,
-            Some("not-a-number"),
-        )
-        .expect_err("non-u32 HF2Q_MAX_SLOTS must error");
-        assert!(err.contains("HF2Q_MAX_SLOTS"), "msg: {err}");
-        assert!(err.contains("u32"), "msg must name u32: {err}");
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Precedence + interaction pins — defense-in-depth around the
-    // CLI-wins-over-env contract. Not in the brief's required set, but
-    // they fall out of the same helper and pin behavior the operator
-    // would discover via surprise otherwise.
-    // ─────────────────────────────────────────────────────────────────────
-
-    /// CLI flag wins over env (mirrors `--auth-token` / `HF2Q_AUTH_TOKEN`
-    /// precedence cmd_serve already uses).
-    #[test]
-    fn c4_scheduler_cli_wins_over_env() {
-        // CLI says fifo_serial, env says inflight_batched → CLI wins.
-        let mode = parse_scheduler_config(
-            Some(cli::SchedulerArg::FifoSerial),
-            Some("inflight_batched"),
-            None,
-            None,
-        )
-        .expect("cli wins, must resolve to SerialFifo");
-        assert_eq!(mode, crate::serve::api::engine::EngineMode::SerialFifo);
-
-        // Reverse direction — CLI says inflight_batched, env says
-        // fifo_serial → CLI wins.
-        let mode = parse_scheduler_config(
-            Some(cli::SchedulerArg::InflightBatched),
-            Some("fifo_serial"),
-            Some(7),
-            None,
-        )
-        .expect("cli wins, must resolve to SlotAware{7}");
-        assert_eq!(
-            mode,
-            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 7 }
-        );
-
-        let mode = parse_scheduler_config(
-            Some(cli::SchedulerArg::FifoSerial),
-            Some("not-a-scheduler"),
-            None,
-            Some("not-a-number"),
-        )
-        .expect("irrelevant malformed env must not defeat explicit FIFO");
-        assert_eq!(mode, crate::serve::api::engine::EngineMode::SerialFifo);
-    }
-
-    /// CLI `--max-slots` wins over `HF2Q_MAX_SLOTS`.
-    #[test]
-    fn c4_max_slots_cli_wins_over_env() {
-        let mode = parse_scheduler_config(
-            Some(cli::SchedulerArg::InflightBatched),
-            None,
-            Some(2),
-            Some("16"),
-        )
-        .expect("cli max_slots wins over env");
-        assert_eq!(
-            mode,
-            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 2 }
-        );
-
-        let mode = parse_scheduler_config(
-            Some(cli::SchedulerArg::InflightBatched),
-            Some("not-a-scheduler"),
-            Some(2),
-            Some("not-a-number"),
-        )
-        .expect("explicit CLI values must bypass malformed lower-precedence env");
-        assert_eq!(
-            mode,
-            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 2 }
-        );
-    }
-
-    #[test]
-    fn c4_shared_kv_budget_cli_wins_and_is_never_divided() {
-        assert_eq!(
-            parse_kv_cache_budget(Some(48_000), Some("12")).expect("valid budget"),
-            Some(48_000)
-        );
-        assert_eq!(
-            parse_kv_cache_budget(None, Some(" 48000 ")).expect("trimmed env budget"),
-            Some(48_000)
-        );
-        // Slot count is intentionally absent from this parser: the value is
-        // an aggregate physical ceiling, not context/N or bytes/N.
-    }
-
-    #[test]
-    fn c4_shared_kv_budget_zero_blank_and_invalid_contract() {
-        assert_eq!(parse_kv_cache_budget(Some(0), Some("99")).unwrap(), None);
-        assert_eq!(parse_kv_cache_budget(None, Some("0")).unwrap(), None);
-        assert_eq!(parse_kv_cache_budget(None, Some("   ")).unwrap(), None);
-        let error = parse_kv_cache_budget(None, Some("8GiB"))
-            .expect_err("human suffix is not an integer byte count");
-        assert!(error.contains("HF2Q_KV_CACHE_BUDGET_BYTES"), "{error}");
-        assert!(error.contains("8GiB"), "{error}");
-    }
-
     #[test]
     fn vision_projector_binding_accepts_supported_exact_pairs() {
         use crate::inference::vision::mmproj::ArchProfile;

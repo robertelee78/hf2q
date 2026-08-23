@@ -6,8 +6,8 @@
 //!
 //! ## Restart recovery (ADR-017 §D8)
 //!
-//! On `cmd_serve` startup with `HF2Q_KV_PERSIST=1`, we walk the cache
-//! directory and rebuild the index:
+//! On `cmd_serve` startup with `--kv-persist PATH`, we walk the cache directory
+//! and rebuild the index:
 //!
 //!   1. Walk `<cache_root>/models/*/kv/*/*.safetensors`.
 //!   2. For each file, read the [`format::EnvelopeHeader`] and validate

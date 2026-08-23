@@ -115,11 +115,9 @@ fn first_invocation_provisions_all_shells_startup_and_receipt_idempotently() {
     let receipt_before = fs::read(home.receipt()).unwrap();
     let second = home.command().arg("--help").output().unwrap();
     assert!(second.status.success(), "{second:?}");
-    assert!(
-        !String::from_utf8(second.stderr)
-            .unwrap()
-            .contains("installed Tab completion")
-    );
+    assert!(!String::from_utf8(second.stderr)
+        .unwrap()
+        .contains("installed Tab completion"));
     for (path, expected) in registrations.iter().zip(before) {
         assert_eq!(fs::read(path).unwrap(), expected);
     }
@@ -168,6 +166,32 @@ fn static_generation_is_public_stdout_only_and_broken_pipe_safe() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains("convert"));
         assert!(stdout.contains("serve"));
+        assert!(stdout.contains("info"));
+        let renders_flag = |flag: &str| {
+            stdout.contains(flag)
+                || (shell == "fish"
+                    && stdout.contains(&format!("-l {}", flag.trim_start_matches("--"))))
+        };
+        for flag in [
+            "--ctx",
+            "--max-slots",
+            "--kv-cache-budget",
+            "--kv-persist",
+            "--kv-persist-budget",
+            "--mmproj",
+        ] {
+            assert!(renders_flag(flag), "{shell} omitted {flag}");
+        }
+        for flag in [
+            "--default-repetition-penalty",
+            "--default-thinking-token-budget",
+            "--default-tool-thinking-token-budget",
+        ] {
+            assert!(renders_flag(flag), "{shell} omitted serve flag {flag}");
+        }
+        for removed in ["--max-seq-len", "--kv-cache-budget-bytes"] {
+            assert!(!stdout.contains(removed), "{shell} retained {removed}");
+        }
         for hidden in HIDDEN {
             assert!(!stdout.contains(hidden), "{shell} leaked {hidden}");
         }
@@ -271,6 +295,65 @@ fn dynamic_protocol_is_public_semantic_and_side_effect_free() {
         "{arches}"
     );
 
+    for command in ["serve", "info"] {
+        let options = dynamic(&home, "bash", 2, &["hf2q", command, "--"]);
+        for flag in [
+            "--ctx",
+            "--scheduler",
+            "--max-slots",
+            "--kv-cache-budget",
+            "--kv-persist",
+            "--kv-persist-budget",
+        ] {
+            assert!(
+                options
+                    .lines()
+                    .map(dynamic_candidate_name)
+                    .any(|candidate| candidate == flag),
+                "{command} omitted {flag}: {options}"
+            );
+        }
+        for removed in [
+            "--max-seq-len",
+            "--kv-cache-budget-bytes",
+            "--input",
+            "--repo",
+        ] {
+            assert!(
+                !options.contains(removed),
+                "{command} retained {removed}: {options}"
+            );
+        }
+    }
+
+    let serve_options = dynamic(&home, "bash", 2, &["hf2q", "serve", "--"]);
+    for flag in [
+        "--default-repetition-penalty",
+        "--default-thinking-token-budget",
+        "--default-tool-thinking-token-budget",
+    ] {
+        assert!(
+            serve_options
+                .lines()
+                .map(dynamic_candidate_name)
+                .any(|candidate| candidate == flag),
+            "serve omitted {flag}: {serve_options}"
+        );
+    }
+    let info_options = dynamic(&home, "bash", 2, &["hf2q", "info", "--"]);
+    assert!(
+        !info_options.contains("--default-repetition-penalty"),
+        "info leaked serve-only behavior flags: {info_options}"
+    );
+    let setup_options = dynamic(&home, "bash", 2, &["hf2q", "setup", "--"]);
+    assert!(
+        setup_options
+            .lines()
+            .map(dynamic_candidate_name)
+            .any(|candidate| candidate == "--serve-kv-persist-budget"),
+        "setup omitted persistent budget: {setup_options}"
+    );
+
     for path in home.registrations() {
         assert!(
             !path.exists(),
@@ -304,6 +387,7 @@ fn model_completion_covers_every_local_gguf_surface_and_keeps_explicit_paths() {
         ("chat --model", 3, &["hf2q", "chat", "--model", ""]),
         ("generate --model", 3, &["hf2q", "generate", "--model", ""]),
         ("serve --model", 3, &["hf2q", "serve", "--model", ""]),
+        ("info --model", 3, &["hf2q", "info", "--model", ""]),
         (
             "serve --embedding-model",
             3,
@@ -339,6 +423,7 @@ fn model_completion_covers_every_local_gguf_surface_and_keeps_explicit_paths() {
             &["hf2q", "generate", "--mmproj", ""],
         ),
         ("serve --mmproj", 3, &["hf2q", "serve", "--mmproj", ""]),
+        ("info --mmproj", 3, &["hf2q", "info", "--mmproj", ""]),
     ];
     for (surface, index, words) in projector_surfaces {
         let directories = dynamic(&home, "fish", *index, words);

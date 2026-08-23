@@ -123,6 +123,7 @@ fn args(root: &Path) -> TestInvocation {
             serve_port: None,
             serve_scheduler: None,
             serve_max_slots: None,
+            serve_kv_persist_budget: None,
             accept_defaults: true,
         },
     }
@@ -245,6 +246,8 @@ fn cli_parses_the_closed_noninteractive_surface() {
         "inflight-batched",
         "--serve-max-slots",
         "1",
+        "--serve-kv-persist-budget",
+        "32GiB",
     ];
     let cli = Cli::try_parse_from(raw).unwrap();
     let Command::Setup(args) = cli.command else {
@@ -256,6 +259,7 @@ fn cli_parses_the_closed_noninteractive_surface() {
     assert_eq!(args.serve_port, Some(8081));
     assert_eq!(args.serve_scheduler, Some(SchedulerArg::InflightBatched));
     assert_eq!(args.serve_max_slots, Some(1));
+    assert_eq!(args.serve_kv_persist_budget.as_deref(), Some("32GiB"));
 
     let cli = Cli::try_parse_from([
         "hf2q",
@@ -327,7 +331,12 @@ fn interactive_setup_uses_current_values_and_records_explicit_operator_choices()
     let temp = TempDir::new().unwrap();
     let root = test_root(&temp, "state");
     execute_fake(args(&root), false, "").unwrap();
-    let output = execute_fake(prompt_args(&root), true, " q5_k_m \n n \n y \n 9090 \n").unwrap();
+    let output = execute_fake(
+        prompt_args(&root),
+        true,
+        " q5_k_m \n n \n y \n 9090 \n 24GiB \n",
+    )
+    .unwrap();
     assert!(output.contains("[Y/n]"));
     let config = OperatorConfigV2::parse(&fs::read(root.join("config.toml")).unwrap()).unwrap();
     assert_eq!(config.convert.quant, "q5_k_m");
@@ -335,6 +344,7 @@ fn interactive_setup_uses_current_values_and_records_explicit_operator_choices()
     assert_eq!(config.serve.max_slots, 1);
     assert_eq!(config.serve.host, "0.0.0.0");
     assert_eq!(config.serve.port, 9090);
+    assert_eq!(config.serve.kv_persist_budget.as_deref(), Some("24GiB"));
 }
 
 #[test]
@@ -415,11 +425,13 @@ fn noninteractive_setup_requires_complete_choices_or_accept_defaults() {
     explicit.args.serve_port = Some(9090);
     explicit.args.serve_scheduler = Some(SchedulerArg::InflightBatched);
     explicit.args.serve_max_slots = Some(2);
+    explicit.args.serve_kv_persist_budget = Some("16GiB".to_owned());
     execute_fake(explicit, false, "").unwrap();
     let parsed = OperatorConfigV2::parse(&fs::read(root.join("config.toml")).unwrap()).unwrap();
     assert_eq!(parsed.convert.quant, "q5_k_m");
     assert_eq!(parsed.serve.port, 9090);
     assert_eq!(parsed.serve.max_slots, 2);
+    assert_eq!(parsed.serve.kv_persist_budget.as_deref(), Some("16GiB"));
 
     let before = fs::read(root.join("config.toml")).unwrap();
     execute_fake(args(&root), false, "").unwrap();

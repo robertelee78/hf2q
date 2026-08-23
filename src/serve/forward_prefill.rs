@@ -1164,19 +1164,13 @@ impl MlxModelWeights {
         // `leg_hb_encoded` directly via inline-fused kernels.
 
         // iter-21 Track B + 2026-04-24 post-close default correction.
-        // HF2Q_TQ_CODEBOOK_BITS=5|6|8 (or unset) → allocate per-layer byte-packed HB buffers.
+        // Effective 5/6/8-bit TQ selection → allocate per-layer byte-packed HB buffers.
         // MUST stay in lockstep with forward_mlx.rs::tq_codebook_bits and cb_bits gates.
         //   unset (DEFAULT) = 8-bit native HB SDPA
         //   "4"             = legacy 4-bit (no HB buffers)
         //   "5" | "6" | "8" = corresponding HB bits
-        let tq_codebook_bits_prefill: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref()
-        {
-            Ok("4") => 0,
-            Ok("5") => 5,
-            Ok("6") => 6,
-            Ok("8") => 8,
-            _ => 8, // DEFAULT: 8-bit
-        };
+        let tq_codebook_bits_prefill =
+            crate::serve::api::tq_packed_descriptor::effective_gemma_tq_codebook_bits();
         if tq_codebook_bits_prefill >= 5 {
             // ADR-028 Phase 10c (iter-348): hybrid F16-K + TQ-HB-V routing,
             // mirrors forward_mlx.rs decode lazy-alloc.
@@ -3875,13 +3869,7 @@ impl MlxModelWeights {
         // CapabilityUnsupported names the specific sub-iter so operator
         // log greps + future-iter implementer can route to the right
         // pin pointer.
-        let cb_bits: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
-            Ok("4") => 0,
-            Ok("5") => 5,
-            Ok("6") => 6,
-            Ok("8") => 8,
-            _ => 8, // DEFAULT: 8-bit (matches sibling line 835)
-        };
+        let cb_bits = crate::serve::api::tq_packed_descriptor::effective_gemma_tq_codebook_bits();
         // HF2Q_USE_DENSE selects the dense F32 KV path (LCP-eligible).
         // INVESTIGATION_ENV.use_dense is the canonical reader; mirrors
         // forward_decode at `forward_gpu.rs:407`.
@@ -5491,13 +5479,7 @@ impl MlxModelWeights {
         // (HF2Q_USE_DENSE → cb_bits==0 → HF2Q_HYBRID_KV → default HB-encoded).
         // Each branch's typed `CapabilityUnsupported` names the specific
         // iter-2-decode-{B,C,D} sub-iter (one sub-iter per regime).
-        let cb_bits: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
-            Ok("4") => 0,
-            Ok("5") => 5,
-            Ok("6") => 6,
-            Ok("8") => 8,
-            _ => 8, // DEFAULT: 8-bit (matches sibling line 835)
-        };
+        let cb_bits = crate::serve::api::tq_packed_descriptor::effective_gemma_tq_codebook_bits();
         // ADR-040 iter-B4c-kernel iter-2-decode-D (2026-05-30) — DENSE F32
         // decode branch.  Architecture-disjoint structural fact:
         // `forward_decode` does NOT consume `self.dense_kvs` AT ALL

@@ -824,14 +824,8 @@ impl MlxModelWeights {
         // prefill returned — leaving the buffers zero-initialized for the
         // decode SDPA reads → garbage attention → gibberish tokens. See
         // ADR-010 §Status Log 2026-05-09 iter-63 smoking-gun localization.
-        let tq_codebook_bits_prefill: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref()
-        {
-            Ok("4") => 0,
-            Ok("5") => 5,
-            Ok("6") => 6,
-            Ok("8") => 8,
-            _ => 8, // DEFAULT: 8-bit (matches forward_prefill.rs)
-        };
+        let tq_codebook_bits_prefill =
+            crate::serve::api::tq_packed_descriptor::effective_gemma_tq_codebook_bits();
         let tq_scale_factor_d512: f32 = match std::env::var("HF2Q_SCALE_FORMULA").as_deref() {
             Ok("sqrt256") => 16.0_f32,
             Ok("sqrt512") => 512.0_f32.sqrt(),

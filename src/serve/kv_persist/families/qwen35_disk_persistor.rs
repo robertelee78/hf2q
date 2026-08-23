@@ -8,8 +8,9 @@
 //! the directory and deserializing each file.
 //!
 //! This module is the disk back-end ONLY — wiring into `Qwen35LoadedModel`
-//! and the `cmd_serve` / `cmd_generate_qwen35` env-toggle landed in
-//! iter-6 (gated separately because that touches the engine load path).
+//! and the serve/generate activation paths landed in iter-6 (gated separately
+//! because that touches the engine load path). Serving now uses the typed
+//! `--kv-persist PATH` authority; generation retains its development fallback.
 //!
 //! # File-on-disk contract
 //!
@@ -32,9 +33,8 @@
 //!
 //! - **Iter 5 (this commit)**: write / read / hydrate_registry surface
 //!   + 4 unit tests (round-trip via tempdir; no GPU model required).
-//! - **Iter 6**: thread `Qwen35DiskPersistor` into `Qwen35LoadedModel`
-//!   under `HF2Q_KV_PERSIST=<dir>` and validate cold-process LCP resume
-//!   on Qwen 3.6 35B-A3B-APEX-Q5_K_M.
+//! - **Iter 6**: thread `Qwen35DiskPersistor` into `Qwen35LoadedModel` and
+//!   validate cold-process LCP resume on Qwen 3.6 35B-A3B-APEX-Q5_K_M.
 
 use anyhow::{anyhow, ensure, Context, Result};
 use mlx_native::MlxDevice;
@@ -268,7 +268,7 @@ impl Drop for Qwen35DiskRequestGuard {
 /// Disk-backed cold-resume persistor for qwen35 hybrid snapshots.
 ///
 /// Constructed once per `cache_dir` at engine load; the `cache_dir`
-/// argument is sourced from `HF2Q_KV_PERSIST` env (iter-6).
+/// argument is sourced from the typed persistent-KV path for serving.
 /// `Qwen35HybridConfig` is passed PER-CALL on `write` / `read` /
 /// `hydrate_for_cfg` because cache shape (`max_seq_len`, `n_seqs`)
 /// is per-prefill, not load-time (kv_cache.rs:347+ — see ADR-027
@@ -288,7 +288,7 @@ pub struct Qwen35DiskPersistor {
     /// ADR-027 sub-iter 23d-γ — on-disk byte budget per cfg-fingerprint
     /// subdir, enforced LRU-by-mtime after every successful `write`.
     /// `0` = unlimited (back-compat default for `new`). Production
-    /// serve wires `HF2Q_KV_PERSIST_BUDGET_BYTES` through
+    /// serve wires the typed persistent-KV disk budget through
     /// [`Self::new_with_budget`].
     ///
     /// Rationale: before this knob, a single ~100K-token agentic
@@ -1684,8 +1684,8 @@ mod tests {
     }
 
     /// Defensive: a registry hydrated from a disk persistor with an
-    /// EMPTY cfg-subdir (clean cold start on a brand-new HF2Q_KV_PERSIST
-    /// dir) stays empty and lookups miss cleanly. No I/O errors, no
+    /// EMPTY cfg-subdir (clean cold start under a brand-new persistent-KV
+    /// directory) stays empty and lookups miss cleanly. No I/O errors, no
     /// partial state, no false-positive hits.
     #[test]
     fn qh35_disk_clean_cold_start_yields_empty_hydrate() {

@@ -2239,12 +2239,8 @@ impl MlxModelWeights {
             Ok("sqrt512") => 512.0_f32.sqrt(),
             _ => 1.0,
         };
-        let tq_codebook_bits: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
-            Ok("4") => 0,
-            Ok("5") => 5,
-            Ok("6") => 6,
-            _ => 8,
-        };
+        let tq_codebook_bits =
+            crate::serve::api::tq_packed_descriptor::effective_gemma_tq_codebook_bits();
 
         let (exec, reg) = gpu.split();
         let dev = exec.device();

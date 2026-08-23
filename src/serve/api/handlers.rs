@@ -1204,6 +1204,10 @@ fn deepseek_required_tool_thinking_eligible(
         && explicit_thinking_budget.is_none()
 }
 
+fn enabled_default_thinking_budget(value: Option<u32>) -> Option<usize> {
+    value.and_then(|value| (value > 0).then_some(value as usize))
+}
+
 fn repeated_tool_result_signature(
     messages: &[ChatMessage],
     threshold: usize,
@@ -1375,6 +1379,9 @@ mod qwen_thinking_budget_tests {
             false,
             None,
         ));
+        assert_eq!(enabled_default_thinking_budget(Some(512)), Some(512));
+        assert_eq!(enabled_default_thinking_budget(Some(0)), None);
+        assert_eq!(enabled_default_thinking_budget(None), None);
     }
 
     fn message(role: &str, reasoning: Option<&str>) -> ChatMessage {
@@ -1976,9 +1983,10 @@ where
         }
     }
     let qwen_defaults = if explicit_thinking_budget.is_none() && qwen_thinking_mode {
-        QwenThinkingDefaults::from_env().map_err(|message| {
-            ApiError::invalid_request(message, Some("thinking_token_budget".into())).into_response()
-        })?
+        QwenThinkingDefaults::from_config(
+            state.config.default_thinking_token_budget,
+            state.config.default_tool_thinking_token_budget,
+        )
     } else {
         QwenThinkingDefaults::default()
     };
@@ -2004,20 +2012,7 @@ where
     })?;
     let qwen_required_tool_thinking_mode = qwen_resolution.required_tool_mode;
     let deepseek_default_thinking_budget = if deepseek_required_tool_thinking_mode {
-        match std::env::var("HF2Q_DEEPSEEK4_REQUIRED_TOOL_THINKING_TOKEN_BUDGET") {
-            Ok(value) => match value.parse::<usize>() {
-                Ok(0) => None,
-                Ok(value) => Some(value),
-                Err(_) => {
-                    return Err(ApiError::invalid_request(
-                        "HF2Q_DEEPSEEK4_REQUIRED_TOOL_THINKING_TOKEN_BUDGET must be a non-negative integer",
-                        Some("thinking_token_budget".into()),
-                    )
-                    .into_response());
-                }
-            },
-            Err(_) => None,
-        }
+        enabled_default_thinking_budget(state.config.default_tool_thinking_token_budget)
     } else {
         None
     };
@@ -2223,7 +2218,9 @@ where
         temperature: req.temperature.unwrap_or(0.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k.map(|v| v as usize).unwrap_or(0),
-        repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
+        repetition_penalty: req
+            .repetition_penalty
+            .unwrap_or(state.config.default_repetition_penalty),
         max_tokens,
         stop_strings,
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
@@ -8799,11 +8796,14 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
         let model = match models.iter_mut().find(|m| m.id == loaded_id) {
             Some(m) => {
                 m.loaded = true;
-                enrich_model_object_from_load_info(m, info);
+                enrich_model_object_from_load_info(m, info, le.engine.context_length());
                 m
             }
             None => {
-                models.insert(0, model_object_from_load_info(loaded_id, info, true));
+                models.insert(
+                    0,
+                    model_object_from_load_info(loaded_id, info, true, le.engine.context_length()),
+                );
                 &mut models[0]
             }
         };
@@ -8881,10 +8881,19 @@ pub async fn get_model(
             .into_iter()
             .find(|model| model.id == model_id)
             .unwrap_or_else(|| {
-                model_object_from_load_info(model_id.clone(), entry.engine.info(), true)
+                model_object_from_load_info(
+                    model_id.clone(),
+                    entry.engine.info(),
+                    true,
+                    entry.engine.context_length(),
+                )
             });
         model.loaded = true;
-        enrich_model_object_from_load_info(&mut model, entry.engine.info());
+        enrich_model_object_from_load_info(
+            &mut model,
+            entry.engine.info(),
+            entry.engine.context_length(),
+        );
         if let Some(projector) = bound_projector_for_engine(&state, &entry.engine) {
             advertise_bound_vision(&mut model, &projector.model_id);
         }
@@ -9022,7 +9031,8 @@ fn inspect_gguf(path: &Path) -> Option<ModelObject> {
 /// Field derivation:
 /// * `quant_type`         ← `info.quant_label` (cloned)
 /// * `quant_bpw`          ← `info.quant_bpw`
-/// * `context_length`     ← `info.max_context_length` (downcast to usize)
+/// * `context_length`     ← effective engine context, falling back to
+///   `info.max_context_length` when the engine does not expose one
 /// * `arch`               ← `info.arch_str` (cloned)
 /// * `max_context_length` ← `info.max_context_length` (widened to u64)
 /// * `provenance`         ← [`provenance_label`]
@@ -9034,13 +9044,15 @@ fn model_object_from_load_info(
     id: String,
     info: &crate::serve::load_info::LoadInfo,
     loaded: bool,
+    effective_context_length: Option<usize>,
 ) -> ModelObject {
     ModelObject {
         id,
         object: "model",
         created: chrono_seconds(),
         owned_by: "hf2q",
-        context_length: info.max_context_length.map(|v| v as usize),
+        context_length: effective_context_length
+            .or_else(|| info.max_context_length.map(|v| v as usize)),
         quant_type: info.quant_label.clone(),
         backend: Some("mlx-native"),
         loaded,
@@ -9092,16 +9104,20 @@ fn bound_projector_for_engine<'a>(
 ///
 /// Used by `list_models` when the cache scan already produced an entry
 /// for this model_id and the loaded engine adds the live snapshot.
-/// `id`, `object`, `created`, `owned_by`, `context_length`, `quant_type`,
-/// `backend`, `loaded` are left untouched (the cache scan picked them up
-/// and the caller has already flipped `loaded=true`); only the new C5
-/// optional fields are populated. This keeps cache-scan-derived
-/// timestamps stable (operators relying on `created` for pinning aren't
-/// surprised when the model is hot-loaded).
+/// `id`, `object`, `created`, `owned_by`, `quant_type`, `backend`, and
+/// `loaded` are left untouched (the cache scan picked them up and the caller
+/// has already flipped `loaded=true`). `context_length` is deliberately
+/// replaced with the live engine's effective cap, while the intrinsic GGUF
+/// value is preserved separately in `max_context_length`. This keeps
+/// cache-scan-derived timestamps stable without misadvertising the active
+/// serving limit.
 fn enrich_model_object_from_load_info(
     m: &mut ModelObject,
     info: &crate::serve::load_info::LoadInfo,
+    effective_context_length: Option<usize>,
 ) {
+    m.context_length =
+        effective_context_length.or_else(|| info.max_context_length.map(|value| value as usize));
     m.arch = Some(info.arch_str.clone());
     m.max_context_length = info.max_context_length.map(u64::from);
     m.provenance = Some(provenance_label(&info.provenance));
@@ -9377,7 +9393,7 @@ mod tests {
     #[test]
     fn model_object_from_load_info_populates_qwen35_moe_fields() {
         let info = populated_qwen35_load_info();
-        let m = model_object_from_load_info("Qwen3.6-27B-A3B-DWQ46-MoE".into(), &info, true);
+        let m = model_object_from_load_info("Qwen3.6-27B-A3B-DWQ46-MoE".into(), &info, true, None);
 
         // Identity + legacy-shape carry-over.
         assert_eq!(m.id, "Qwen3.6-27B-A3B-DWQ46-MoE");
@@ -9408,9 +9424,22 @@ mod tests {
     }
 
     #[test]
+    fn model_object_distinguishes_effective_context_from_gguf_maximum() {
+        let info = populated_qwen35_load_info();
+        let model =
+            model_object_from_load_info("qwen-context-cap".into(), &info, true, Some(131_072));
+        assert_eq!(model.context_length, Some(131_072));
+        assert_eq!(model.max_context_length, Some(262_144));
+
+        let encoded = serde_json::to_value(&model).unwrap();
+        assert_eq!(encoded["context_length"], 131_072);
+        assert_eq!(encoded["max_context_length"], 262_144);
+    }
+
+    #[test]
     fn model_object_from_load_info_populates_gemma4_dense_fields() {
         let info = populated_gemma4_load_info();
-        let m = model_object_from_load_info("gemma-4-27b-it-Q4_K_M".into(), &info, true);
+        let m = model_object_from_load_info("gemma-4-27b-it-Q4_K_M".into(), &info, true, None);
 
         assert_eq!(m.id, "gemma-4-27b-it-Q4_K_M");
         assert_eq!(m.arch.as_deref(), Some("gemma4"));
@@ -9463,13 +9492,14 @@ mod tests {
             vision_projector: None,
         };
         let info = populated_qwen35_load_info();
-        enrich_model_object_from_load_info(&mut m, &info);
+        enrich_model_object_from_load_info(&mut m, &info, None);
 
-        // Identity / legacy fields untouched (created stays cache-scan
-        // value, NOT overwritten with `chrono_seconds()`).
+        // Identity and cache-derived fields stay untouched (created remains
+        // the cache-scan value). Context is the intentional exception: the
+        // live effective cap replaces the stale cache-scanned value.
         assert_eq!(m.id, "Qwen3.6-27B-A3B-DWQ46-MoE");
         assert_eq!(m.created, preexisting_created);
-        assert_eq!(m.context_length, Some(131_072));
+        assert_eq!(m.context_length, Some(262_144));
         assert!(m.loaded);
         assert_eq!(m.quant_type.as_deref(), Some("Q4_K"));
 
@@ -9509,7 +9539,7 @@ mod tests {
             vision_projector: None,
         };
         let info = populated_qwen35_load_info();
-        enrich_model_object_from_load_info(&mut m, &info);
+        enrich_model_object_from_load_info(&mut m, &info, None);
         assert_eq!(m.quant_type.as_deref(), Some("Q4_K"));
     }
 
@@ -9521,7 +9551,7 @@ mod tests {
         // helper's `Some(_)` propagation actually compose at the
         // serializer level.
         let info = populated_gemma4_load_info();
-        let m = model_object_from_load_info("gemma-4-27b-it-Q4_K_M".into(), &info, true);
+        let m = model_object_from_load_info("gemma-4-27b-it-Q4_K_M".into(), &info, true, None);
         let v = serde_json::to_value(&m).expect("serialize ModelObject");
         assert_eq!(v["id"], "gemma-4-27b-it-Q4_K_M");
         assert_eq!(v["arch"], "gemma4");
@@ -9547,7 +9577,7 @@ mod tests {
     #[test]
     fn model_advertisement_contract_bound_vision_is_on_chat_model() {
         let info = populated_qwen35_load_info();
-        let mut model = model_object_from_load_info("qwen-vision".into(), &info, true);
+        let mut model = model_object_from_load_info("qwen-vision".into(), &info, true, None);
         advertise_bound_vision(&mut model, "mmproj-qwen");
         let wire = serde_json::to_value(model).expect("serialize advertised vision model");
         assert_eq!(

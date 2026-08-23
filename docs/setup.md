@@ -21,7 +21,8 @@ shell, `RLIMIT_NOFILE`, and containing-volume capacity. It then asks for:
 - whether serving should favor long agent/tool prompts or short direct use;
 - the maximum simultaneous active requests for inflight serving;
 - localhost-only or LAN binding; and
-- the default API port.
+- the default API port; and
+- an optional persistent-KV disk ceiling.
 
 Enter retains the displayed recommendation or the current configured value on
 a rerun. EOF or interrupted input cancels successfully without changing the
@@ -46,7 +47,8 @@ hf2q setup \
   --serve-host 127.0.0.1 \
   --serve-port 8081 \
   --serve-scheduler inflight-batched \
-  --serve-max-slots 1
+  --serve-max-slots 1 \
+  --serve-kv-persist-budget 32GiB
 ```
 
 A fresh non-interactive invocation requires `--accept-defaults` or a complete
@@ -89,12 +91,39 @@ tool_thinking_token_budget = 512
 
 The three profile keys are present when serving is optimized for long agent
 and tool-use prompts (the default answer); answering no omits them. They are
-the qualified agentic-coding profile: `hf2q serve` applies them as process
-defaults for `HF2Q_DEFAULT_REPETITION_PENALTY`,
-`HF2Q_DEFAULT_THINKING_TOKEN_BUDGET`, and
-`HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET` — but only to variables the operator
-has not exported, so an explicit environment always wins. Configs written
-before the profile keys existed keep loading unchanged.
+the qualified agentic-coding profile: `hf2q serve` passes them through typed
+server configuration when a request omits the matching field. Explicit serve
+flags override them; the old `HF2Q_DEFAULT_*` environment bridge has been
+removed. Configs written before the profile keys existed keep loading
+unchanged.
+
+Setup intentionally omits logical context and both KV budgets when accepting
+defaults. That lets each model use the maximum context declared by its own
+GGUF and avoids writing a
+universal value that could exceed another model's capability. Interactive
+setup prompts for the persistent-store disk ceiling, and non-interactive setup
+accepts `--serve-kv-persist-budget <SIZE>`. An operator may also add the keys
+deliberately:
+
+```toml
+[serve]
+ctx = 262144
+kv_cache_budget = "8GiB"
+kv_persist_budget = "32GiB"
+```
+
+`ctx` applies to every conversation slot and is never divided by `max_slots`.
+An explicit value above a model's GGUF maximum fails before tensor loading.
+`kv_cache_budget` is instead an aggregate physical-residency ceiling shared by
+the slots; a bare byte count or a checked SI/IEC value such as `8GB` or `8GiB`
+is accepted.
+`kv_persist_budget` caps bytes written beneath `serve --kv-persist PATH`; it is
+independent of the active-slot residency budget. CLI
+`--kv-persist-budget <SIZE>` overrides the config value and requires
+`--kv-persist PATH` in that invocation, so a command-line ceiling can never be
+silently inactive. A config value may remain dormant until an invocation
+enables a store. Zero or omission is unlimited, while malformed explicit
+values fail setup or serve.
 
 Model identity, revision, output path, cache location, source retention, auth
 tokens, hardware snapshots, and calibration state remain explicit or owned by
@@ -114,12 +143,16 @@ continues to require an explicit `--quant`; hf2q does not invent a hidden
 quantization default. Source, revision, and output remain explicit.
 
 For serving host and port, precedence is CLI, config, then the pre-setup safe
-built-ins. Scheduler and active-slot precedence is:
+built-ins. Scheduler, active slots, context, shared KV budget, repetition
+penalty, and thinking-default precedence is:
 
 1. explicit CLI arguments;
-2. existing `HF2Q_SCHEDULER` and `HF2Q_MAX_SLOTS` environment overrides;
-3. setup config; and
-4. the pre-setup safe built-ins.
+2. setup config; and
+3. the pre-setup safe built-ins or, for context, the model GGUF maximum.
+
+The public serving plan does not fall back to hidden `HF2Q_*` variables.
+`HF2Q_AUTH_TOKEN` remains the intentional secret-injection exception and is
+equivalent to `--auth-token` when that flag is absent.
 
 An invalid config fails before source download, model load, or listener bind.
 If setup records LAN binding (`0.0.0.0`), serve also requires `--auth-token` or

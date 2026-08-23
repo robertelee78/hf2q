@@ -180,9 +180,9 @@ public-command-only adapters current for Bash, Zsh, and Fish, so newly added
 commands and quant/architecture values appear without regenerating snapshots.
 For every user-facing local GGUF argument, an empty or bare value prefers
 `${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models`. That includes decoder models
-for `chat`, `generate`, `serve`, and `parity`, plus projectors for `generate` and
-`serve`; typing an explicit relative, home-relative, or absolute path keeps
-normal filesystem completion.
+for `chat`, `generate`, `serve`, `info`, and `parity`, plus projectors for
+`generate`, `serve`, and `info`; typing an explicit relative, home-relative, or
+absolute path keeps normal filesystem completion.
 Open a new shell after the first activation when hf2q reports that setup was
 updated.
 
@@ -203,7 +203,7 @@ paths, lifecycle cleanup, overrides, and troubleshooting.
 | `hf2q uninstall` | Preview or remove channel-owned release files while preserving configuration, caches, and models unless explicit purge flags are confirmed. |
 | `hf2q convert` | HuggingFace safetensors → GGUF (streaming convert, ADR-033 unified pipeline). |
 | `hf2q gguf-patch` | Rewrite a GGUF's metadata in place (e.g. inject a chat template). |
-| `hf2q info` | Inspect a GGUF model without loading weights. |
+| `hf2q info` | Preview static GGUF serving support and the resolved context/memory plan without loading tensor data or Metal. |
 | `hf2q generate` | Single-shot text generation from a GGUF on the local GPU. |
 | `hf2q chat` | Minimal diagnostic terminal chat over an OpenAI-compatible server. |
 | `hf2q serve` | OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/embeddings`). |
@@ -214,6 +214,46 @@ paths, lifecycle cleanup, overrides, and troubleshooting.
 | `hf2q completions` | Generate shell completions. |
 
 Run `hf2q <command> --help` for the full flag surface.
+
+### Inspect and plan a serve
+
+Preview the exact local artifacts and planning controls before committing RAM
+to a model load:
+
+```bash
+hf2q info \
+  --model deepseek.gguf \
+  --ctx 262144 \
+  --scheduler inflight-batched \
+  --max-slots 4 \
+  --kv-cache-budget 8GiB \
+  --kv-persist /var/cache/hf2q/kv \
+  --kv-persist-budget 32GiB
+```
+
+`info` reports the detected family, quantization, GGUF maximum and effective
+context, scheduler, concurrent-slot cap, estimated KV residency, tokenizer and
+tensor-directory validation, a model-file-plus-full-slot-KV planning estimate,
+vision capability, and either `Serve support: ready` or the exact static
+rejection reason. Add `--mmproj path.gguf` to check one explicit vision pair;
+hf2q never guesses a sibling projector. The command does not load tensor
+payloads, initialize Metal, or claim a successful runtime warmup; scratch and
+allocator overhead remain outside the static estimate.
+
+`--ctx` is a logical token cap for **each** conversation slot. It is never
+divided by `--max-slots`. `--kv-cache-budget` is different: it is one shared
+physical-residency ceiling used for admission as active slots retain KV state.
+Thus `--ctx 262144 --max-slots 4` advertises 262,144 tokens to every slot, while
+`--kv-cache-budget 8GiB` limits their aggregate physical growth.
+`--kv-persist-budget 32GiB` is a third, independent limit: it caps disk data
+written when `serve --kv-persist PATH` is enabled. It does not change context
+or active-slot memory.
+
+The precedence is CLI, `[serve]` in `$HOME/.hf2q/config.toml`, then the model or
+built-in default. When both `--ctx` and `[serve] ctx` are absent, hf2q uses the
+maximum declared by that model's GGUF. A requested context above the declared
+maximum fails before tensor loading; it is never silently clamped. Setup leaves
+`ctx` absent unless the operator intentionally edits in a global cap.
 
 ### Quantization variants
 
@@ -391,11 +431,17 @@ Point the client's OpenAI-compatible base URL at the selected launcher's
 `http://127.0.0.1:<port>/v1` endpoint and select the model ID returned by
 `/v1/models` (normally the GGUF file stem). Set `MAX_SLOTS=1` for one agent or
 `MAX_SLOTS=8` for an eight-slot hardware experiment; four is the
-release-validated default. DeepSeek's `CONTEXT_LEN` override changes the full
-logical context of each slot; Gemma and Qwen use the context declared by their
-GGUF. `KV_CACHE_BUDGET_BYTES` independently caps aggregate physical KV
-high-water. Requests that cannot safely fit wait or fail explicitly instead of
-silently receiving a shorter context.
+release-validated launcher default. The DeepSeek launcher uses an explicit
+262,144-token `--ctx` preset; pass `--ctx <TOKENS>` to that launcher to change
+it. A direct `hf2q serve` uses the selected config cap or, when absent, the
+model's GGUF maximum for DeepSeek, Gemma, and Qwen alike.
+`--kv-cache-budget <SIZE>` independently caps aggregate physical KV high-water.
+`--kv-persist-budget <SIZE>` caps the separate on-disk persistent-KV store
+selected by `--kv-persist PATH`; it is also available as
+`[serve] kv_persist_budget` and through `hf2q setup`.
+Requests that cannot safely fit wait or fail explicitly instead of silently
+receiving a shorter context. A live `/v1/models` entry reports the effective
+limit as `context_length` and the GGUF capability as `max_context_length`.
 
 Use `/readyz`, not merely `/health` or `/v1/models`, as the generation
 readiness probe. `/health` is process liveness. Present by public 0.1.5 and
@@ -477,11 +523,12 @@ rejecting `null` for required strings. This covers nested `question` and
 `todowrite` payloads in required and automatic tool-choice modes, including
 recovery after prior invalid calls, SSE, and tool-result continuation.
 
-The canonical launcher does not inject a repetition penalty when the client
-omits one (`HF2Q_DEFAULT_REPETITION_PENALTY=1.0`). The former hidden `1.05`
-default distorted constrained strings and did not stop client-side action
-loops. Set `REP_PENALTY` only for a measured workload; an explicit request
-value still wins.
+The canonical DeepSeek launcher explicitly requests
+`--default-repetition-penalty 1.0`, so it does not inject a penalty when the
+client omits one. The former hidden `1.05` default distorted constrained
+strings and did not stop client-side action loops. Set `REP_PENALTY` only for a
+measured launcher workload, or pass the typed serve flag directly; an explicit
+request value still wins.
 
 With an already-running DeepSeek server, run the focused real-model gate:
 

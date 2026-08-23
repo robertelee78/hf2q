@@ -21,12 +21,11 @@
 > proven only for SerialFifo; the canonical SlotAware launcher provides
 > same-process retained-prefix affinity and does not enable this disk path.
 > Current SerialFifo operator shape:
-> `HF2Q_KV_LCP_RESUME=1 HF2Q_KV_PERSIST=<dir>
-> HF2Q_KV_PERSIST_BUDGET_BYTES=<n> hf2q serve --scheduler fifo_serial --model <qwen3.6.gguf>
-> --kv-persist <dir> --overflow-policy reject`
-> (note: the qwen35 disk persistor is bound from the `HF2Q_KV_PERSIST`
-> ENV var, while `--kv-persist` wires the hot-swap spiller substrate —
-> set BOTH to the same path). The rest of this runbook remains accurate
+> `HF2Q_KV_LCP_RESUME=1 hf2q serve --scheduler fifo-serial
+> --model <qwen3.6.gguf> --kv-persist <dir>
+> --kv-persist-budget 32GiB --overflow-policy reject`.
+> The typed path and budget now feed both the qwen35 disk persistor and the
+> generic hot-swap spiller substrate. The rest of this runbook remains accurate
 > for the Gemma-4 spiller substrate it was written against.
 
 > **State of truth (2026-05-01, preserved for provenance).** This runbook documents only what is implemented in the
@@ -46,15 +45,11 @@
 hf2q serve --model <gguf-or-repo> --kv-persist /var/cache/hf2q/kv-persist
 ```
 
-Flag: `src/cli.rs:565` (`--kv-persist=PATH`, field `kv_persist_path:
-Option<PathBuf>` at `cli.rs:566`). Without the flag the engine wires
-`NoopKvSpiller` and behavior is byte-identical to the pre-ADR-017 path
-(`cli.rs:553-557`).
-
-**No env var** toggles persistence at this commit. Doc-strings reference
-`HF2Q_KV_PERSIST=1`, `HF2Q_KV_WRITER_CAPACITY`,
-`HF2Q_KV_PERSIST_BUDGET_BYTES`; grep confirms none are read. Reserved
-for future use — see §11.
+`--kv-persist PATH` is the typed serve authority. Without it, serving does not
+construct a persistent store, and no environment variable overrides an
+explicit path. The disk ceiling is the typed
+`--kv-persist-budget` / `[serve] kv_persist_budget` control. The former
+`HF2Q_KV_PERSIST_BUDGET_BYTES` production readers are removed.
 
 ---
 
@@ -66,7 +61,8 @@ When `--kv-persist=PATH` is set, `cmd_serve`:
 - Runs a synchronous `recover_from_disk(...)` scan
   (`src/serve/mod.rs:1743`; impl `src/serve/kv_persist/recovery.rs:110`)
   rebuilding the in-memory `BlockIndex`.
-- Builds `DiskBlockStore` with `budget_bytes = 0` — uncapped pilot mode
+- Builds `DiskBlockStore` with the resolved `--kv-persist-budget` /
+  `[serve] kv_persist_budget` value (`0` means unlimited)
   (`src/serve/mod.rs:1764`, `block_store.rs:90-93`).
 - Spawns `AsyncWriterHandle` with `DEFAULT_CHANNEL_CAPACITY = 8`
   (`writer.rs:218`, `mod.rs:1779`).
@@ -336,13 +332,17 @@ The writer thread uses a `mpsc::sync_channel(8)` (`writer.rs:60-61`,
 and returns `SpillOutcome::Error(IoErr)` (`spiller.rs:370-375`). The
 inference path is never blocked by disk back-pressure.
 
-There is **no on-disk byte budget** at this commit. `DiskBlockStore` is
-constructed with `budget_bytes = 0` at `src/serve/mod.rs:1764`, which
-disables eviction (`src/serve/kv_persist/block_store.rs:319-323`). The
-ADR-017 §R-F5 default of "10% of unified RAM" and the env var
-`HF2Q_KV_CACHE_BUDGET_BYTES` / `HF2Q_KV_PERSIST_BUDGET_BYTES` are
-`[NOT YET IMPLEMENTED — ADR-017 §R-F5 + R7]`. Operator must monitor disk
-and remove `<PATH>` manually.
+The original 2026-05-01 implementation had no on-disk byte budget. That gap
+has since landed and been promoted: `--kv-persist-budget <SIZE>` (or
+`[serve] kv_persist_budget`) is wired to both persistent stores and enforced
+with post-write LRU eviction. Unset or `0` means unlimited. A malformed value
+fails before serving; setup also exposes `--serve-kv-persist-budget`. The CLI
+budget requires `--kv-persist PATH`; a configured budget remains dormant on
+serve invocations that do not enable a persistent store.
+
+This disk limit is unrelated to `serve --kv-cache-budget <SIZE>`. The latter
+governs the shared in-memory KV residency of active slots; it does not cap the
+persistent-cache directory.
 
 ### d. System crash mid-write (`kill -9` proof)
 
@@ -372,10 +372,11 @@ Operator-visible behavior after a crash:
 
 ## 8. Sizing guidance
 
-`[PARTIALLY NOT YET IMPLEMENTED — ADR-017 §R-F5]` There is no operator
-knob for the cache budget at this commit. `DiskBlockStore::set_budget_bytes`
-exists (`src/serve/kv_persist/block_store.rs:163-166`) but no caller wires
-it; cmd_serve hard-codes `0` (uncapped) at `src/serve/mod.rs:1764`.
+The persistent-store budget is `--kv-persist-budget <SIZE>` or
+`[serve] kv_persist_budget` (unset or `0` is uncapped). It is enforced after
+successful writes through LRU eviction. It must not be confused with
+`serve --kv-cache-budget`, which sizes shared in-memory KV residency for active
+conversations.
 
 **Per-block size ceiling:** `MAX_BLOCK_BYTES = 256 * 1024 * 1024`
 (256 MiB) — `src/serve/kv_persist/block_store.rs:62`. Writes whose body
@@ -472,54 +473,18 @@ panic signal: enqueues return `TrySendError::Disconnected` (mapped to
 
 ## 10. Disabling / removing
 
-### Startup disable via `HF2Q_KV_PERSIST=0` (ADR-017 §R-F1)
+### Startup disable
 
-Set `HF2Q_KV_PERSIST=0` (exact match, after trim) at process start to
-override `--kv-persist=PATH` and skip kv-persist construction entirely.
-The `NoopKvSpiller`-backed `AppState` manager stays wired (off-path is
-byte-identical to pre-ADR-017). Use this when you need to launch
-`cmd_serve` with the same launch command an orchestrator templated
-(e.g. systemd unit, k8s manifest) but want the persistence layer
-disabled without editing the unit.
-
-```bash
-HF2Q_KV_PERSIST=0 hf2q serve --model <PATH> --kv-persist /var/cache/hf2q/kv
-```
-
-Predicate (`src/serve/mod.rs::should_enable_kv_persist`):
-
-| `--kv-persist` | `HF2Q_KV_PERSIST` | enabled? |
-|----------------|-------------------|----------|
-| absent         | (any)             | no       |
-| present        | unset / empty     | yes      |
-| present        | `"1"` / `"true"`  | yes      |
-| present        | `"0"` (trimmed)   | **no**   |
-
-When the override fires, a single `tracing::warn!` line emits at
-startup citing the flag path and pointing back to this section:
-
-```
-ADR-017 R-F1 override: HF2Q_KV_PERSIST=0 — disabling kv-persist
-despite --kv-persist=<PATH>. Operator emergency-disable per
-operating-kv-cache.md §10. Restart without HF2Q_KV_PERSIST=0 to
-re-enable.
-```
-
-Env vars are process-scoped — the override is **startup-only**. To
-re-enable, stop the process, unset the env var (or set it to anything
-other than `"0"`), and restart. Regression-pinned by
-`hf2q_kv_persist_*` tests in `src/serve/mod.rs::tests`.
+Omit `--kv-persist PATH` from the serve invocation. The explicit flag is the
+single authority: shell state cannot silently disable a path shown in the
+command line. To change a templated systemd or Kubernetes launch, change its
+typed argument and restart the process.
 
 ### Mid-flight disable
 
-Not supported as a live toggle (env vars are process-scoped). To
-disable an already-running serve: stop `cmd_serve`, either drop
-`--kv-persist=PATH` or relaunch with `HF2Q_KV_PERSIST=0`, restart.
-The runbook used to flag mid-flight disable as
-`[NOT YET IMPLEMENTED — ADR-017 §R-F1 / §R-O1]`; §R-F1 is now
-implemented as the startup-disable override above. True mid-flight
-disable (without restart) remains intentionally out-of-scope per the
-process-scoped env-var contract.
+Not supported as a live toggle. To disable an already-running serve, stop
+`cmd_serve`, drop `--kv-persist=PATH`, and restart. True mid-flight disable
+(without restart) remains intentionally out of scope.
 
 ### Migration off the persistence path
 
@@ -539,16 +504,16 @@ default in `AppState::new_for_serve` is restored on next start
 Each entry cites the ADR section. None are wired in source at commit
 `7c6c160`.
 
-1. **Env-var enable / disable** (§R-F1). **LANDED** — `HF2Q_KV_PERSIST=0`
-   startup-disable override wired via
-   `src/serve/mod.rs::should_enable_kv_persist`; see §10 for the truth
-   table + warn-line semantics. `=1` / unset / any other value defers
-   to `--kv-persist=PATH`. True mid-flight (no-restart) disable remains
-   out-of-scope per the process-scoped env-var contract.
-2. **On-disk byte budget** (§R-F5). cmd_serve hard-codes `budget_bytes = 0`
-   at `src/serve/mod.rs:1764`. `DiskBlockStore::set_budget_bytes`
-   (`block_store.rs:163-166`) is unwired. No
-   `HF2Q_KV_CACHE_BUDGET_BYTES` reader.
+1. **Typed enable / disable** (§R-F1). **LANDED** — `--kv-persist PATH`
+   enables the store and omission disables it. Production serving has no
+   environment override. True mid-flight (no-restart) disable remains
+   out of scope.
+2. **On-disk byte budget** (§R-F5). **LANDED** —
+   `--kv-persist-budget` / `[serve] kv_persist_budget` reaches
+   `DiskBlockStore` and the Qwen-family disk persistor, and successful writes
+   enforce the limit with LRU eviction. `0` / unset remains unlimited and
+   malformed explicit values fail. This is not the in-memory
+   `--kv-cache-budget` control.
 3. **Writer-capacity knob** (`HF2Q_KV_WRITER_CAPACITY`, doc-comment at
    `writer.rs:217`). cmd_serve hard-codes `DEFAULT_CHANNEL_CAPACITY = 8`
    at `src/serve/mod.rs:1779`.
@@ -574,6 +539,5 @@ Each entry cites the ADR section. None are wired in source at commit
 10. **TQ-active codec family** (Phase B-tq). Not present.
 11. **Quarantine bound** (§R-F9). Quarantine dir grows unbounded; the
     "delete oldest when budget exceeded" rule is not enforced.
-12. **Mid-flight `HF2Q_KV_PERSIST=0`** (§R-O1). Intentionally
-    out-of-scope — env vars are process-scoped, so the §R-F1 landing
-    is startup-disable + restart, not a live toggle. See §10.
+12. **Mid-flight persistence disable** (§R-O1). Intentionally out of scope;
+    change the typed launch arguments and restart. See §10.

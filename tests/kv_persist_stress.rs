@@ -219,6 +219,8 @@ mod stress_driver {
                 &port.to_string(),
                 "--kv-persist",
                 &cache_dir.to_string_lossy(),
+                "--kv-persist-budget",
+                &budget_bytes.to_string(),
             ])
             .env("HF2Q_USE_DENSE", "1")
             // ADR-017 §R-F5 (closure iter-11 2026-05-05): wire the
@@ -227,7 +229,6 @@ mod stress_driver {
             // actually fires. Pre-iter-11 budget_bytes was set on
             // the store but `evict_lru_until_under_budget` had no
             // production caller — the cache grew unbounded.
-            .env("HF2Q_KV_PERSIST_BUDGET_BYTES", budget_bytes.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -869,7 +870,7 @@ fn kv_persist_stress_24h() {
     // ---- Spawn server ----
     // ADR-017 §R-F5 (closure iter-11 2026-05-05): pass the stress
     // test's budget_mb through as the server's
-    // HF2Q_KV_PERSIST_BUDGET_BYTES so post-write LRU eviction
+    // typed --kv-persist-budget so post-write LRU eviction
     // actually fires and the cache_kb assertion below has a
     // matching server-side enforcement layer.
     let budget_bytes_for_server = budget_mb.saturating_mul(1024 * 1024);

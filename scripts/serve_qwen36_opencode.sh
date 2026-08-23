@@ -9,7 +9,7 @@
 #
 #   Qwen3.6 autoregressive dispatch is the production default. No
 #   investigation-only activation variable is required.
-#   HF2Q_DEFAULT_REPETITION_PENALTY=1.05
+#   --default-repetition-penalty 1.05
 #                           Loop mitigation (2026-08-03). opencode's
 #                           openai-compatible provider cannot send
 #                           repetition_penalty, so without this every
@@ -23,7 +23,7 @@
 #                           never to the T=0 greedy argmax path. 1.05 is
 #                           the gentle coding-safe setting; raise toward
 #                           1.1 if loops persist on creative workloads.
-#   HF2Q_DEFAULT_THINKING_TOKEN_BUDGET=2048
+#   --default-thinking-token-budget 2048
 #                           Caps a Qwen thinking span, forces the native
 #                           reasoning close sequence at the boundary, and
 #                           continues decoding the answer. For shorter client
@@ -33,7 +33,7 @@
 #                           ordinary/automatic ceiling. Required and named
 #                           tool calls retain a response-local forced-close
 #                           ceiling so the required call can complete.
-#   HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET=512
+#   --default-tool-thinking-token-budget 512
 #                           Smaller default for tool-result continuations.
 #                           Deeper tool-result turns in one user tool chain
 #                           reduce this deterministically to a 256-token
@@ -64,7 +64,7 @@
 #   HF2Q_TQ_KV=1           TQ K/V stays active for every agent slot. The
 #                           packed/norm buffers carry an outer slot axis and
 #                           zero-copy Metal views select the active agent.
-#   --kv-cache-budget-bytes Shared physical high-water across the full-context
+#   --kv-cache-budget       Shared physical high-water across the full-context
 #                           slots. MAX_SLOTS=8 is the np8-like setting.
 #
 # Family contract and prefix-cache stack:
@@ -186,13 +186,13 @@ HF2Q_SERVE_ARGS+=(
     --overflow-policy reject
     --scheduler inflight-batched
     --max-slots "$MAX_SLOTS"
-    --kv-cache-budget-bytes "$KV_CACHE_BUDGET_BYTES"
+    --kv-cache-budget "$KV_CACHE_BUDGET_BYTES"
+    --default-repetition-penalty "${REP_PENALTY:-1.05}"
+    --default-thinking-token-budget "$THINKING_TOKEN_BUDGET"
+    --default-tool-thinking-token-budget "$TOOL_THINKING_TOKEN_BUDGET"
 )
 
 exec env \
-    HF2Q_DEFAULT_REPETITION_PENALTY="${REP_PENALTY:-1.05}" \
-    HF2Q_DEFAULT_THINKING_TOKEN_BUDGET="$THINKING_TOKEN_BUDGET" \
-    HF2Q_DEFAULT_TOOL_THINKING_TOKEN_BUDGET="$TOOL_THINKING_TOKEN_BUDGET" \
     HF2Q_TQ_KV=1 \
     HF2Q_ENCODER_SESSION=1 \
     HF2Q_FFN_TERMINAL_K_BATCH=8 \

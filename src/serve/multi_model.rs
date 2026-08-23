@@ -146,20 +146,27 @@ pub struct EngineConfig {
     ///
     /// `EngineMode::SerialFifo` (the [`Default`] impl) preserves the
     /// ADR-005 Decision #2 + #19 contract byte-for-byte per ADR-040
-    /// §3.6. When `cmd_serve` parses `--scheduler inflight_batched` (or
-    /// `HF2Q_SCHEDULER=inflight_batched`), this becomes
+    /// §3.6. When `cmd_serve` resolves `--scheduler inflight-batched` (or
+    /// the matching setup config), this becomes
     /// `EngineMode::SlotAware { max_slots: N }` and `load_engine` calls
     /// [`Engine::spawn_with_mode`] instead of [`Engine::spawn`]. The
-    /// downstream `Engine::spawn_with_mode` returns
-    /// [`EngineSpawnError::ModeNotYetWired`] until iter-2b/2c land the
-    /// per-family slot-aware worker arms — `load_engine` surfaces that
-    /// as an `anyhow::Error` and `cmd_serve` aborts startup with a
-    /// non-zero exit code (fail-loud per ADR-040 §7 mantra).
+    /// downstream `Engine::spawn_with_mode` provisions the family-specific
+    /// full-context slot cache and fails startup rather than falling back if
+    /// that family cannot honor the requested mode.
     pub engine_mode: crate::serve::api::engine::EngineMode,
+    /// Optional operator-requested per-slot context cap. `None` means resolve
+    /// each loaded model to the maximum declared in that model's GGUF.
+    pub requested_context: Option<crate::serve::operator_settings::RequestedContext>,
     /// Aggregate physical KV-cache budget for SlotAware full-context slots.
     /// Logical context capacity is independent of this value. `None`/zero
     /// preserves the unbounded legacy behavior.
     pub kv_cache_budget_bytes: Option<u64>,
+    /// Typed persistent-KV root selected by `serve --kv-persist`. Keeping it
+    /// in the engine configuration makes model swaps use the same exact path
+    /// as the generic block store instead of rereading process environment.
+    pub kv_persist_dir: Option<PathBuf>,
+    /// On-disk persistent-KV ceiling. Zero preserves unlimited behavior.
+    pub kv_persist_budget_bytes: u64,
 }
 
 impl std::fmt::Debug for EngineConfig {
@@ -175,7 +182,10 @@ impl std::fmt::Debug for EngineConfig {
             // scheduler-policy selection so operator log greps + test
             // assertions see what mode the engine spawn will request.
             .field("engine_mode", &self.engine_mode)
+            .field("requested_context", &self.requested_context)
             .field("kv_cache_budget_bytes", &self.kv_cache_budget_bytes)
+            .field("kv_persist_dir", &self.kv_persist_dir)
+            .field("kv_persist_budget_bytes", &self.kv_persist_budget_bytes)
             .finish()
     }
 }
@@ -190,7 +200,10 @@ pub struct EngineConfigIdentity {
     pub warmup_synchronously: bool,
     pub kv_metrics_sink: bool,
     pub engine_mode: crate::serve::api::engine::EngineMode,
+    pub requested_context_tokens: Option<u32>,
     pub kv_cache_budget_bytes: Option<u64>,
+    pub kv_persist_enabled: bool,
+    pub kv_persist_budget_bytes: u64,
     pub explicit_tokenizer: bool,
     pub explicit_config: bool,
     pub dwq_overlay: bool,
@@ -209,7 +222,10 @@ impl From<&EngineConfig> for EngineConfigIdentity {
             warmup_synchronously: config.warmup_synchronously,
             kv_metrics_sink: config.kv_metrics_sink.is_some(),
             engine_mode: config.engine_mode,
+            requested_context_tokens: config.requested_context.map(|request| request.tokens),
             kv_cache_budget_bytes: config.kv_cache_budget_bytes,
+            kv_persist_enabled: config.kv_persist_dir.is_some(),
+            kv_persist_budget_bytes: config.kv_persist_budget_bytes,
             explicit_tokenizer: config.tokenizer_path.is_some(),
             explicit_config: config.config_path.is_some(),
             dwq_overlay: config.dwq_overlay_path.is_some(),

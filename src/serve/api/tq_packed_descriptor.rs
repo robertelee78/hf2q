@@ -24,10 +24,11 @@
 //! ## Read-only on `MlxModelWeights`
 //!
 //! `from_gemma_loaded_model_tq` reads `weights.kv_caches[i].{k_packed
-//! shape}` for shape derivation and the operator-time
-//! `HF2Q_TQ_CODEBOOK_BITS` env for the bit-width.  It does NOT mutate
-//! the weights and does NOT touch `forward_mlx.rs` — the only
-//! references it keeps are the read-only shape fields.
+//! shape}` for shape derivation and the process-wide effective codebook width
+//! (typed `generate --kv-bits` first, development environment fallback
+//! otherwise). It does NOT mutate the weights and does NOT touch
+//! `forward_mlx.rs` — the only references it keeps are the read-only shape
+//! fields.
 
 use crate::serve::api::kv_spill_descriptor::KvSpillProvenance;
 use crate::serve::kv_persist::families::tq_packed::{flags, TqBitsPerCoord};
@@ -41,9 +42,9 @@ use crate::serve::kv_persist::families::tq_packed::{flags, TqBitsPerCoord};
 /// construction without round-tripping through the worker channel.
 #[derive(Debug, Clone)]
 pub struct TqPackedSpillDescriptor {
-    /// Lloyd-Max bit width per coordinate.  Reads
-    /// `HF2Q_TQ_CODEBOOK_BITS` env at engine spawn (default `8` per
-    /// ADR-007 §1234 production default).
+    /// Lloyd-Max bit width per coordinate. Captured from the effective typed
+    /// or development setting at engine spawn (default `8` per ADR-007
+    /// §1234 production default).
     pub bits_per_coord: TqBitsPerCoord,
     /// Number of attention layers — equals
     /// `weights.kv_caches.len()`.
@@ -83,11 +84,10 @@ impl TqPackedSpillDescriptor {
     /// runtime always shapes the buffer this way at
     /// `forward_mlx.rs:1285+1679`).
     ///
-    /// `bits_per_coord` is read from the operator-time
-    /// `HF2Q_TQ_CODEBOOK_BITS` env at spawn time (default `8`).  The
-    /// descriptor is captured ONCE at spawn (not per-request) so
-    /// toggling the env mid-process doesn't re-shape the descriptor.
-    /// This matches `KvSpillDescriptor`'s `kv_dtype` capture pattern.
+    /// `bits_per_coord` is read from the effective process-wide selection at
+    /// spawn time (default `8`). The descriptor is captured ONCE at spawn
+    /// (not per-request), so mutable shell state cannot re-shape it. This
+    /// matches `KvSpillDescriptor`'s `kv_dtype` capture pattern.
     ///
     /// `provenance` is captured by the caller from
     /// `serve::provenance::detect(&gguf)` and the GGUF-embedded
@@ -98,7 +98,7 @@ impl TqPackedSpillDescriptor {
         weights: &crate::inference::models::gemma4::MlxModelWeights,
         provenance: KvSpillProvenance,
     ) -> Option<Self> {
-        let bits = read_tq_codebook_bits_env();
+        let bits = effective_tq_codebook_bits();
         let bits_per_coord = TqBitsPerCoord::new(bits).ok()?;
 
         // **B-tq.7** — at bits >= 5 the runtime stores K/V in
@@ -156,13 +156,36 @@ pub(crate) fn parse_tq_codebook_bits(env: Option<&str>) -> u32 {
     }
 }
 
-/// Read `HF2Q_TQ_CODEBOOK_BITS` env (default `8` per ADR-007 §1234
-/// production default).  Validates the value is one of {2, 3, 4, 5, 6,
-/// 8}; on parse failure or out-of-range, falls back to `8`.
-///
-/// Thin wrapper around [`parse_tq_codebook_bits`] for production use.
-pub(crate) fn read_tq_codebook_bits_env() -> u32 {
-    parse_tq_codebook_bits(std::env::var("HF2Q_TQ_CODEBOOK_BITS").ok().as_deref())
+#[cfg(test)]
+fn resolve_tq_codebook_bits(cli_bits: Option<u32>, env: Option<&str>) -> u32 {
+    cli_bits.unwrap_or_else(|| parse_tq_codebook_bits(env))
+}
+
+/// Resolve the typed `generate --kv-bits` value before the development-only
+/// environment fallback. The result is the logical bit width (including
+/// literal `4`); callers using Gemma's legacy `4 -> 0` sentinel convert only
+/// at that internal boundary.
+pub(crate) fn effective_tq_codebook_bits() -> u32 {
+    crate::debug::investigation_env::cli_tq_codebook_bits().unwrap_or_else(|| {
+        // The development fallback is captured once with the rest of the
+        // investigation surface. Downstream consumers must not independently
+        // reread mutable process environment and disagree with one another.
+        match crate::debug::INVESTIGATION_ENV.tq_codebook_bits {
+            0 => 4,
+            bits => bits,
+        }
+    })
+}
+
+/// Gemma's historical runtime representation uses `0` for the legacy 4-bit
+/// path and supports 5/6/8-bit HB buffers. Keep that representation at one
+/// explicit boundary while the public/descriptor value remains literal.
+pub(crate) fn effective_gemma_tq_codebook_bits() -> u32 {
+    match effective_tq_codebook_bits() {
+        4 => 0,
+        bits @ (5 | 6 | 8) => bits,
+        _ => 8,
+    }
 }
 
 /// Pure parsing logic for `HF2Q_TQ_KV`: takes the env value (as
@@ -244,6 +267,13 @@ mod tests {
         for bad in ["", "0", "1", "7", "9", "16", "garbage", "  "] {
             assert_eq!(parse_tq_codebook_bits(Some(bad)), 8, "bad={:?}", bad);
         }
+    }
+
+    #[test]
+    fn typed_codebook_width_wins_over_the_development_environment_fallback() {
+        assert_eq!(resolve_tq_codebook_bits(Some(5), Some("8")), 5);
+        assert_eq!(resolve_tq_codebook_bits(Some(4), Some("6")), 4);
+        assert_eq!(resolve_tq_codebook_bits(None, Some("6")), 6);
     }
 
     /// `parse_tq_active_mode` is default-on (matches `env_default_true`
