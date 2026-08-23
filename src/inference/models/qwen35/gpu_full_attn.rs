@@ -10399,7 +10399,6 @@ mod tests {
                 cols: k as usize,
             },
             affine: None,
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         };
 

@@ -8220,7 +8220,6 @@ mod tests {
                 cols: HIDDEN,
             },
             affine: None,
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         };
         ensure_native_embedding_admitted(&native).expect("admit exact Q8_0 storage");

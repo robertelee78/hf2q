@@ -24,21 +24,6 @@ use crate::serve::forward_mlx_shared::MlxQWeight;
 use mlx_native::gguf::GgufFile;
 use mlx_native::MlxDevice;
 
-/// Qwen consumes exact native GGUF blocks and never opts into the shared
-/// F16-shadow optimization. Keep this assertion at the architecture boundary
-/// so a future change to the generic weight constructor cannot silently add a
-/// dequantized shadow to Qwen weights.
-pub(super) fn ensure_qwen_native_weight_has_no_f16_shadow(
-    tensor_name: &str,
-    weight: &MlxQWeight,
-) -> Result<()> {
-    ensure!(
-        weight.f16_shadow.is_none(),
-        "Qwen native tensor '{tensor_name}' unexpectedly carries a dequantized F16 shadow"
-    );
-    Ok(())
-}
-
 // ================================================================
 // Layer weight enums
 // ================================================================
@@ -360,7 +345,6 @@ impl Qwen35Model {
         let token_embd_native =
             crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "token_embd.weight", &device)
                 .context("load native token_embd.weight")?;
-        ensure_qwen_native_weight_has_no_f16_shadow("token_embd.weight", &token_embd_native)?;
         super::forward_gpu::ensure_native_embedding_admitted(&token_embd_native)
             .context("admit native token_embd.weight execution")?;
         super::weight_pool::register_weight_buffer(&device, &token_embd_native.buffer)
@@ -380,7 +364,6 @@ impl Qwen35Model {
             let output =
                 crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "output.weight", &device)
                     .context("load native output.weight")?;
-            ensure_qwen_native_weight_has_no_f16_shadow("output.weight", &output)?;
             super::weight_pool::register_weight_buffer(&device, &output.buffer)
                 .context("register native output.weight")?;
             #[cfg(test)]

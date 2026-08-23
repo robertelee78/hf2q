@@ -1826,15 +1826,6 @@ mod tests {
             .expect("native token embedding")
             .info
             .ggml_dtype;
-        assert!(
-            model
-                .token_embd_native
-                .as_ref()
-                .expect("native token embedding")
-                .f16_shadow
-                .is_none(),
-            "Qwen native embedding must never carry a dequantized F16 shadow"
-        );
         assert_eq!(embedding_type, expected_primary_type);
         assert_eq!(
             model
@@ -1844,15 +1835,6 @@ mod tests {
                 .info
                 .ggml_dtype,
             expected_output_type
-        );
-        assert!(
-            model
-                .output_weight_native
-                .as_ref()
-                .expect("native output head")
-                .f16_shadow
-                .is_none(),
-            "Qwen native output head must never carry a dequantized F16 shadow"
         );
         let is_artifact_storage = |kind: GgmlType| match artifact_format.as_str() {
             "Q4_K_M" => matches!(kind, GgmlType::Q4_K | GgmlType::Q6_K),

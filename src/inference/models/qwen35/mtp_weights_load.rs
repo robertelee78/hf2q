@@ -80,7 +80,6 @@ pub fn load_mtp_weights_if_present_with_shared_head(
                  mtp_use_dedicated_embeddings=True"
                     )
                 })?;
-        super::model::ensure_qwen_native_weight_has_no_f16_shadow(&embed_tokens_tname, &buf)?;
         super::forward_gpu::ensure_native_embedding_admitted(&buf)
             .with_context(|| format!("admit direct execution for {embed_tokens_tname}"))?;
         super::weight_pool::register_weight_buffer(device, &buf.buffer)
