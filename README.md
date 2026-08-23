@@ -178,9 +178,11 @@ standalone installer activates it against the stable installed binary; a Cargo
 install activates it on the first `hf2q` invocation. hf2q keeps dynamic,
 public-command-only adapters current for Bash, Zsh, and Fish, so newly added
 commands and quant/architecture values appear without regenerating snapshots.
-For `serve --model` and `--mmproj`, an empty or bare value prefers
-`${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models`; typing an explicit relative,
-home-relative, or absolute path keeps normal filesystem completion.
+For every user-facing local GGUF argument, an empty or bare value prefers
+`${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models`. That includes decoder models
+for `chat`, `generate`, `serve`, and `parity`, plus projectors for `generate` and
+`serve`; typing an explicit relative, home-relative, or absolute path keeps
+normal filesystem completion.
 Open a new shell after the first activation when hf2q reports that setup was
 updated.
 
