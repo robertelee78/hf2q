@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use super::{is_hex, quant_from_file_type};
-use crate::serve::quant_select::QuantType;
+use super::is_hex;
 
 #[derive(Debug)]
 pub struct LocalVerificationRequest<'a> {
@@ -12,7 +11,7 @@ pub struct LocalVerificationRequest<'a> {
     pub artifact: &'a Path,
     pub bytes: u64,
     pub sha256: &'a str,
-    pub quant: QuantType,
+    pub file_type: u32,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -55,12 +54,8 @@ pub fn verify_local_artifact(
     }
     let header = mlx_native::gguf::GgufFile::open(&canonical)
         .context("open selected local GGUF after hashing")?;
-    if header
-        .metadata_u32("general.file_type")
-        .and_then(quant_from_file_type)
-        != Some(request.quant)
-    {
-        bail!("selected local artifact GGUF quant no longer matches its hf2q authority");
+    if header.metadata_u32("general.file_type") != Some(request.file_type) {
+        bail!("selected local artifact GGUF file type no longer matches its hf2q authority");
     }
     let after = fs::symlink_metadata(&canonical).context("re-stat selected local artifact")?;
     if !same_file_snapshot(&before, &after) || after.len() != request.bytes {

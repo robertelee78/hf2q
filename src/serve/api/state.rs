@@ -586,19 +586,11 @@ pub struct AppState {
     /// string so the auto-pipeline classifies it the same way the
     /// startup pre-warm did.
     pub default_model: Option<String>,
-    /// BERT embedding model config (from `--embedding-model <path>`).
-    /// `None` when no embedding model was supplied. Validated at startup
-    /// via `BertConfig::from_gguf` — the forward pass that consumes this
-    /// lands in a later iter (ADR-005 Phase 2b).
-    pub embedding_config: Option<EmbeddingModel>,
-    /// Persistent kernel registry for embedding forwards. Pre-warmed at
-    /// server boot via one warmup forward so all needed pipelines are
-    /// compiled and cached. Per-request handlers lock briefly, dispatch
-    /// against the cached registry, release. Eliminates the ~150 ms
-    /// per-request shader-compile cost the iter-82 benchmark surfaced
-    /// (kept registry per-request → recompiled every shader; HTTP-path
-    /// hit ~190 ms vs in-process ~8 ms forward floor).
-    pub embedding_registry: Option<Arc<std::sync::Mutex<mlx_native::KernelRegistry>>>,
+    /// Dedicated encoder-model lifecycle.  A lease owns the model, tokenizer,
+    /// and warmed kernel registry as one generation so a request can never
+    /// combine state from two model loads.  Replacement fails while a lease is
+    /// live and drops the old generation before invoking the next loader.
+    pub embedding_slot: Arc<std::sync::RwLock<EmbeddingModelSlot>>,
     /// Multimodal projector (mmproj GGUF) loaded at startup from
     /// `--mmproj <path>`. When `Some`, the chat handler accepts
     /// `image_url` content parts and routes them through the vision
@@ -650,33 +642,44 @@ pub struct AppState {
     >,
 }
 
-/// BERT embedding model, discovered from `--embedding-model <path>` at
-/// startup. Holds the config + the GGUF path so later iters can load
-/// weights on demand.
-/// Loaded BERT embedding model, discovered from `--embedding-model <path>`
-/// at startup. Holds the config + vocab + a ready-to-use WordPiece
-/// tokenizer so embedding requests tokenize without re-parsing the GGUF
-/// metadata. Weights load on-demand in the forward-pass iter.
+/// Loaded BERT-family embedding generation. Config, native mapped weights,
+/// tokenizer, vocabulary, and warmed registry are admitted atomically so a
+/// request cannot observe a mixture of two model loads.
 ///
 /// Shared via `Arc` so multiple handler calls can tokenize concurrently
 /// against the same immutable tokenizer.
-#[derive(Clone)]
 pub struct EmbeddingModel {
     pub gguf_path: PathBuf,
     pub vocab: Arc<crate::inference::models::bert::BertVocab>,
-    /// Peer-compatible WordPiece tokenizer (uses ▁-prefix word
-    /// starters, matches the bge / nomic / mxbai GGUF format byte-for-
-    /// byte). Shared across BERT-family architectures because all of
-    /// them use the same WPM vocab convention in GGUF (per
-    /// the peer's WPM tokenizer).
+    /// WordPiece tokenizer using the GGUF BERT convention (`▁`-prefixed word
+    /// starters). Shared across explicit BERT-family architectures.
     pub tokenizer: Arc<crate::inference::models::bert::BertWpmTokenizer>,
-    /// Model id (file stem) — surfaced via `/v1/models`.
+    /// Generation identity. Startup uses the configured artifact identity;
+    /// public activation replaces it with the exact catalog-bound selection.
     pub model_id: String,
+    /// Registry compiled for exactly this model generation. Keeping it inside
+    /// the model closes the former independently-swappable model/registry pair.
+    pub registry: Arc<std::sync::Mutex<mlx_native::KernelRegistry>>,
+    /// Load-phase timing captured by the production loader. This stays with
+    /// the generation it describes, so a swap receipt cannot accidentally
+    /// report timings from the previous model.
+    pub load_timing: EmbeddingLoadTiming,
     /// Architecture variant. Carries the per-arch config + weights so
     /// the handler dispatches the correct forward pass. Optional only
     /// in the test-scaffolding path that bypasses real weight loading;
     /// production always populates this via `cmd_serve`.
     pub arch: Option<EmbeddingArch>,
+}
+
+/// Production embedding admission timing. `weight_load_elapsed` includes
+/// header/config parsing plus mapped native-weight construction;
+/// `registry_warm_elapsed` is the first forward used to compile the exact
+/// generation's kernels; `total_elapsed` covers both plus bookkeeping.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmbeddingLoadTiming {
+    pub weight_load_elapsed: std::time::Duration,
+    pub registry_warm_elapsed: std::time::Duration,
+    pub total_elapsed: std::time::Duration,
 }
 
 /// Per-arch config + weights bundle. The handler matches on this enum
@@ -736,6 +739,15 @@ impl EmbeddingArch {
             Self::NomicBert { .. } => "nomic-bert",
         }
     }
+
+    pub fn storage_stats(
+        &self,
+    ) -> crate::inference::models::bert::native_storage::NativeStorageStats {
+        match self {
+            Self::Bert { weights, .. } => weights.storage_stats(),
+            Self::NomicBert { weights, .. } => weights.storage_stats(),
+        }
+    }
 }
 
 impl std::fmt::Debug for EmbeddingModel {
@@ -751,12 +763,281 @@ impl std::fmt::Debug for EmbeddingModel {
 }
 
 impl EmbeddingModel {
-    /// Convenience: tokenize a single input string using the embedded
-    /// WordPiece tokenizer. Returns the token-id vector. Matches
-    /// the peer's WPM tokenizer; pass `add_special_tokens=true` to
-    /// wrap the output in `[CLS] ... [SEP]`.
+    /// Tokenize one input from this generation's embedded vocabulary. Pass
+    /// `add_special_tokens=true` to wrap it in `[CLS] ... [SEP]`.
     pub fn encode(&self, input: &str, add_special_tokens: bool) -> Vec<u32> {
         self.tokenizer.encode(input, add_special_tokens)
+    }
+
+    pub fn resident_bytes(&self) -> u64 {
+        self.arch
+            .as_ref()
+            .map(EmbeddingArch::storage_stats)
+            .map(|stats| stats.resident_bytes)
+            .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn load_synthetic_native_embedding_model(
+    path: &std::path::Path,
+    model_id: &str,
+    hello_id: usize,
+) -> anyhow::Result<EmbeddingModel> {
+    use crate::inference::models::bert::bert_gpu::{
+        apply_bert_full_forward_gpu, register_bert_custom_shaders,
+    };
+    use crate::inference::models::bert::native_storage::test_support::bert_cfg;
+    use crate::inference::models::bert::{BertSpecialTokens, BertVocab};
+    use mlx_native::{DType, KernelRegistry, MlxDevice};
+
+    let config = bert_cfg(6);
+    let weights = Arc::new(LoadedBertWeights::load_from_path(path, &config)?);
+    let mut tokens = vec![
+        "[UNK]".into(),
+        "[CLS]".into(),
+        "[SEP]".into(),
+        "[PAD]".into(),
+        "unused-a".into(),
+        "unused-b".into(),
+    ];
+    tokens[hello_id] = "\u{2581}hello".into();
+    let vocab = BertVocab {
+        tokens,
+        specials: BertSpecialTokens {
+            cls: 1,
+            sep: 2,
+            pad: 3,
+            unk: 0,
+            mask: 0,
+        },
+    };
+    let tokenizer = Arc::new(crate::inference::models::bert::BertWpmTokenizer::new(
+        &vocab,
+    ));
+
+    // Match production admission: the registry belongs to this generation
+    // and is warmed before the model becomes acquirable.
+    let device = MlxDevice::new().map_err(|error| anyhow::anyhow!("test device: {error}"))?;
+    let mut registry = KernelRegistry::new();
+    register_bert_custom_shaders(&mut registry);
+    let mut ids = device
+        .alloc_buffer(32 * 4, DType::U32, vec![32])
+        .map_err(|error| anyhow::anyhow!("test ids: {error}"))?;
+    ids.as_mut_slice::<u32>()?.fill(3);
+    ids.as_mut_slice::<u32>()?[..3].copy_from_slice(&[1, hello_id as u32, 2]);
+    let mut encoder = device.command_encoder()?;
+    let _ = apply_bert_full_forward_gpu(
+        &mut encoder,
+        &mut registry,
+        &device,
+        &ids,
+        None,
+        &weights,
+        &config,
+        32,
+        3,
+    )?;
+    encoder.commit_and_wait()?;
+
+    Ok(EmbeddingModel {
+        gguf_path: path.to_path_buf(),
+        vocab: Arc::new(vocab),
+        tokenizer,
+        model_id: model_id.into(),
+        registry: Arc::new(std::sync::Mutex::new(registry)),
+        load_timing: EmbeddingLoadTiming::default(),
+        arch: Some(EmbeddingArch::Bert { config, weights }),
+    })
+}
+
+/// Request-bound view of one dedicated embedding generation.
+pub struct EmbeddingModelLease {
+    pub model: Arc<EmbeddingModel>,
+    pub generation: u64,
+}
+
+/// Successful no-double-residency replacement receipt.
+#[derive(Debug, Clone)]
+pub struct EmbeddingSwapReceipt {
+    pub generation: u64,
+    pub old_model_id: Option<String>,
+    pub new_model_id: String,
+    pub new_arch: Option<&'static str>,
+    pub load_timing: EmbeddingLoadTiming,
+    pub reclaimed_bytes: u64,
+    pub resident_bytes: u64,
+    pub unload_elapsed: std::time::Duration,
+    pub load_elapsed: std::time::Duration,
+}
+
+/// Read-only lifecycle view used by the authenticated runtime and activation
+/// endpoints.  Model-local tokenizer and registry handles never escape this
+/// snapshot; they remain owned by the same [`EmbeddingModel`] generation.
+#[derive(Debug, Clone)]
+pub struct EmbeddingModelSnapshot {
+    /// `None` only while the replacement lock is held; the successful or
+    /// failed transaction publishes the exact generation immediately after.
+    pub generation: Option<u64>,
+    pub configured: bool,
+    pub loading: bool,
+    pub model_id: Option<String>,
+    pub gguf_path: Option<PathBuf>,
+    pub arch: Option<&'static str>,
+    pub resident_bytes: u64,
+    pub last_load_error: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EmbeddingSwapError {
+    #[error("embedding generation changed: expected {expected}, current generation is {current}")]
+    StaleGeneration { expected: u64, current: u64 },
+    #[error(
+        "embedding model '{model_id}' has {active_leases} active request lease(s); refusing a double-resident swap"
+    )]
+    ActiveLeases {
+        model_id: String,
+        active_leases: usize,
+    },
+    #[error("embedding replacement load failed: {0}")]
+    Load(#[source] anyhow::Error),
+}
+
+/// Single-slot lifecycle for a dedicated BERT-family encoder.
+///
+/// The next loader is called only after the prior model has been uniquely
+/// owned and dropped. This deliberately trades temporary unavailability on a
+/// failed load for bounded unified-memory use during model swaps.
+#[derive(Default)]
+pub struct EmbeddingModelSlot {
+    active: Option<Arc<EmbeddingModel>>,
+    generation: u64,
+    configured: bool,
+    last_load_error: Option<String>,
+}
+
+impl EmbeddingModelSlot {
+    pub fn acquire(&self) -> Option<EmbeddingModelLease> {
+        self.active.as_ref().map(|model| EmbeddingModelLease {
+            model: Arc::clone(model),
+            generation: self.generation,
+        })
+    }
+
+    pub fn install_initial(&mut self, model: EmbeddingModel) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            self.active.is_none(),
+            "embedding slot already has an active model"
+        );
+        self.generation = self.generation.saturating_add(1);
+        self.configured = true;
+        self.last_load_error = None;
+        self.active = Some(Arc::new(model));
+        Ok(self.generation)
+    }
+
+    pub fn was_configured(&self) -> bool {
+        self.configured
+    }
+
+    pub fn last_load_error(&self) -> Option<&str> {
+        self.last_load_error.as_deref()
+    }
+
+    pub fn logical_resident_bytes(&self) -> u64 {
+        self.active
+            .as_ref()
+            .map(|model| model.resident_bytes())
+            .unwrap_or(0)
+    }
+
+    pub fn snapshot(&self) -> EmbeddingModelSnapshot {
+        EmbeddingModelSnapshot {
+            generation: Some(self.generation),
+            configured: self.configured,
+            loading: false,
+            model_id: self.active.as_ref().map(|model| model.model_id.clone()),
+            gguf_path: self.active.as_ref().map(|model| model.gguf_path.clone()),
+            arch: self
+                .active
+                .as_ref()
+                .and_then(|model| model.arch.as_ref())
+                .map(EmbeddingArch::arch_name),
+            resident_bytes: self.logical_resident_bytes(),
+            last_load_error: self.last_load_error.clone(),
+        }
+    }
+
+    pub fn try_replace_after_evict<F>(&mut self, loader: F) -> anyhow::Result<EmbeddingSwapReceipt>
+    where
+        F: FnOnce() -> anyhow::Result<EmbeddingModel>,
+    {
+        self.try_replace_after_evict_at_generation(self.generation, loader)
+            .map_err(anyhow::Error::new)
+    }
+
+    pub fn try_replace_after_evict_at_generation<F>(
+        &mut self,
+        expected_generation: u64,
+        loader: F,
+    ) -> Result<EmbeddingSwapReceipt, EmbeddingSwapError>
+    where
+        F: FnOnce() -> anyhow::Result<EmbeddingModel>,
+    {
+        if self.generation != expected_generation {
+            return Err(EmbeddingSwapError::StaleGeneration {
+                expected: expected_generation,
+                current: self.generation,
+            });
+        }
+        if let Some(active) = self.active.as_ref() {
+            let owners = Arc::strong_count(active);
+            if owners != 1 {
+                return Err(EmbeddingSwapError::ActiveLeases {
+                    model_id: active.model_id.clone(),
+                    active_leases: owners - 1,
+                });
+            }
+        }
+
+        self.configured = true;
+        self.last_load_error = None;
+        let old = self.active.take();
+        let old_model_id = old.as_ref().map(|model| model.model_id.clone());
+        let reclaimed_bytes = old
+            .as_ref()
+            .map(|model| model.resident_bytes())
+            .unwrap_or(0);
+        let unload_started = Instant::now();
+        drop(old);
+        let unload_elapsed = unload_started.elapsed();
+
+        let load_started = Instant::now();
+        let next = match loader() {
+            Ok(next) => next,
+            Err(error) => {
+                self.last_load_error = Some(error.to_string());
+                return Err(EmbeddingSwapError::Load(error));
+            }
+        };
+        let load_elapsed = load_started.elapsed();
+        let new_model_id = next.model_id.clone();
+        let new_arch = next.arch.as_ref().map(EmbeddingArch::arch_name);
+        let load_timing = next.load_timing;
+        let resident_bytes = next.resident_bytes();
+        self.generation = self.generation.saturating_add(1);
+        self.active = Some(Arc::new(next));
+        Ok(EmbeddingSwapReceipt {
+            generation: self.generation,
+            old_model_id,
+            new_model_id,
+            new_arch,
+            load_timing,
+            reclaimed_bytes,
+            resident_bytes,
+            unload_elapsed,
+            load_elapsed,
+        })
     }
 }
 
@@ -846,8 +1127,7 @@ impl AppState {
             engine_config_template,
             engine_config_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
             default_model,
-            embedding_config: None,
-            embedding_registry: None,
+            embedding_slot: Arc::new(std::sync::RwLock::new(EmbeddingModelSlot::default())),
             mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
             kv_spill_counters,
@@ -928,8 +1208,7 @@ impl AppState {
             engine_config_template,
             engine_config_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
             default_model: None,
-            embedding_config: None,
-            embedding_registry: None,
+            embedding_slot: Arc::new(std::sync::RwLock::new(EmbeddingModelSlot::default())),
             mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
             kv_spill_counters: kv_spill_counters_test,
@@ -1046,23 +1325,73 @@ impl AppState {
     /// Attach a BERT embedding model config. Cheap (clones internal
     /// references). Called by `cmd_serve` after validating the supplied
     /// GGUF header.
-    pub fn with_embedding_model(mut self, em: EmbeddingModel) -> Self {
-        self.embedding_config = Some(em);
+    pub fn with_embedding_model(self, em: EmbeddingModel) -> Self {
+        self.embedding_slot
+            .write()
+            .expect("embedding slot poisoned during construction")
+            .install_initial(em)
+            .expect("embedding model installed twice during construction");
         self
     }
 
-    /// Attach a pre-warmed kernel registry for embedding forwards.
-    /// Caller is responsible for registering the right kernels for the
-    /// loaded arch (BERT custom shaders + mlx-native rope + silu_mul as
-    /// appropriate) and running one warmup forward to compile every
-    /// pipeline before stashing. Per-request handlers lock the inner
-    /// `Mutex` briefly, dispatch against cached pipelines, release.
-    pub fn with_embedding_registry(
-        mut self,
-        registry: Arc<std::sync::Mutex<mlx_native::KernelRegistry>>,
-    ) -> Self {
-        self.embedding_registry = Some(registry);
-        self
+    pub fn acquire_embedding_model(&self) -> Option<EmbeddingModelLease> {
+        // A public activation holds the write lock while it drops the old
+        // generation and warms the replacement.  Request handlers must fail
+        // closed during that interval rather than block an async worker on a
+        // model load.
+        self.embedding_slot.try_read().ok()?.acquire()
+    }
+
+    pub fn embedding_model_was_configured(&self) -> bool {
+        self.embedding_slot
+            .try_read()
+            .map(|slot| slot.was_configured())
+            // A contended lock means a configured replacement is in flight.
+            // Treat it as unavailable dedicated state, never as permission to
+            // fall back to a chat-model embedding path.
+            .unwrap_or(true)
+    }
+
+    pub fn embedding_model_snapshot(&self) -> EmbeddingModelSnapshot {
+        match self.embedding_slot.try_read() {
+            Ok(slot) => slot.snapshot(),
+            Err(_) => EmbeddingModelSnapshot {
+                generation: None,
+                configured: true,
+                loading: true,
+                model_id: None,
+                gguf_path: None,
+                arch: None,
+                resident_bytes: 0,
+                last_load_error: None,
+            },
+        }
+    }
+
+    pub fn try_swap_embedding_model<F>(&self, loader: F) -> anyhow::Result<EmbeddingSwapReceipt>
+    where
+        F: FnOnce() -> anyhow::Result<EmbeddingModel>,
+    {
+        self.embedding_slot
+            .write()
+            .map_err(|_| anyhow::anyhow!("embedding lifecycle lock poisoned"))?
+            .try_replace_after_evict(loader)
+    }
+
+    pub fn try_swap_embedding_model_at_generation<F>(
+        &self,
+        expected_generation: u64,
+        loader: F,
+    ) -> Result<EmbeddingSwapReceipt, EmbeddingSwapError>
+    where
+        F: FnOnce() -> anyhow::Result<EmbeddingModel>,
+    {
+        self.embedding_slot
+            .write()
+            .map_err(|_| {
+                EmbeddingSwapError::Load(anyhow::anyhow!("embedding lifecycle lock poisoned"))
+            })?
+            .try_replace_after_evict_at_generation(expected_generation, loader)
     }
 
     /// Attach an mmproj descriptor. Called by `cmd_serve` after validating
@@ -1202,12 +1531,169 @@ mod tests {
                 &vocab,
             )),
             model_id: "synthetic-embed".into(),
+            registry: Arc::new(std::sync::Mutex::new(mlx_native::KernelRegistry::new())),
+            load_timing: EmbeddingLoadTiming::default(),
             arch: None,
         };
         let _ = tokenizer; // legacy HF tokenizer no longer used; kept for shape only
         let ids = em.encode("hello world", false);
         assert!(ids.contains(&4), "expected 'hello'=4 in {:?}", ids);
         assert!(ids.contains(&5), "expected 'world'=5 in {:?}", ids);
+    }
+
+    fn synthetic_embedding_model(model_id: &str, hello_id: usize) -> EmbeddingModel {
+        use crate::inference::models::bert::{BertSpecialTokens, BertVocab};
+        let mut tokens = vec![
+            "[UNK]".into(),
+            "[CLS]".into(),
+            "[SEP]".into(),
+            "[PAD]".into(),
+            "unused-a".into(),
+            "unused-b".into(),
+        ];
+        tokens[hello_id] = "\u{2581}hello".into();
+        let vocab = BertVocab {
+            tokens,
+            specials: BertSpecialTokens {
+                cls: 1,
+                sep: 2,
+                pad: 3,
+                unk: 0,
+                mask: 0,
+            },
+        };
+        EmbeddingModel {
+            gguf_path: format!("/tmp/{model_id}.gguf").into(),
+            tokenizer: Arc::new(crate::inference::models::bert::BertWpmTokenizer::new(
+                &vocab,
+            )),
+            vocab: Arc::new(vocab),
+            model_id: model_id.into(),
+            registry: Arc::new(std::sync::Mutex::new(mlx_native::KernelRegistry::new())),
+            load_timing: EmbeddingLoadTiming::default(),
+            arch: None,
+        }
+    }
+
+    #[test]
+    fn embedding_slot_a_b_a_is_isolated_and_never_double_resident() {
+        let mut slot = EmbeddingModelSlot::default();
+        assert_eq!(
+            slot.install_initial(synthetic_embedding_model("a-1", 4))
+                .expect("install A"),
+            1
+        );
+        let lease = slot.acquire().expect("A lease");
+        assert_eq!(lease.generation, 1);
+        assert_eq!(lease.model.encode("hello", false), vec![4]);
+        let a_registry = Arc::downgrade(&lease.model.registry);
+        let attempted = Arc::new(AtomicBool::new(false));
+        let attempted_in_loader = Arc::clone(&attempted);
+        let error = slot
+            .try_replace_after_evict(move || {
+                attempted_in_loader.store(true, Ordering::SeqCst);
+                Ok(synthetic_embedding_model("b", 5))
+            })
+            .expect_err("live lease must make swap busy");
+        assert!(error.to_string().contains("1 active request lease"));
+        assert!(
+            !attempted.load(Ordering::SeqCst),
+            "busy swap must not load B"
+        );
+
+        let weak_a = Arc::downgrade(&lease.model);
+        drop(lease);
+        let receipt_b = slot
+            .try_replace_after_evict(|| {
+                assert!(
+                    weak_a.upgrade().is_none(),
+                    "A must be dropped before B loads"
+                );
+                Ok(synthetic_embedding_model("b", 5))
+            })
+            .expect("swap A to B");
+        assert_eq!(receipt_b.generation, 2);
+        assert_eq!(receipt_b.old_model_id.as_deref(), Some("a-1"));
+        assert_eq!(receipt_b.new_model_id, "b");
+        let lease_b = slot.acquire().expect("B lease");
+        assert_eq!(lease_b.model.encode("hello", false), vec![5]);
+        assert!(a_registry.upgrade().is_none());
+
+        let weak_b = Arc::downgrade(&lease_b.model);
+        drop(lease_b);
+        let receipt_a2 = slot
+            .try_replace_after_evict(|| {
+                assert!(
+                    weak_b.upgrade().is_none(),
+                    "B must be dropped before A reloads"
+                );
+                Ok(synthetic_embedding_model("a-2", 4))
+            })
+            .expect("swap B to fresh A");
+        assert_eq!(receipt_a2.generation, 3);
+        let lease_a2 = slot.acquire().expect("fresh A lease");
+        assert_eq!(lease_a2.model.encode("hello", false), vec![4]);
+        assert!(a_registry.upgrade().is_none());
+        assert_eq!(slot.logical_resident_bytes(), 0);
+    }
+
+    #[test]
+    fn stale_embedding_generation_never_evicts_or_calls_loader() {
+        let mut slot = EmbeddingModelSlot::default();
+        slot.install_initial(synthetic_embedding_model("a", 4))
+            .expect("install A");
+        let attempted = Arc::new(AtomicBool::new(false));
+        let attempted_in_loader = Arc::clone(&attempted);
+        let error = slot
+            .try_replace_after_evict_at_generation(0, move || {
+                attempted_in_loader.store(true, Ordering::SeqCst);
+                Ok(synthetic_embedding_model("b", 5))
+            })
+            .expect_err("stale generation must fail closed");
+        assert!(matches!(
+            error,
+            EmbeddingSwapError::StaleGeneration {
+                expected: 0,
+                current: 1
+            }
+        ));
+        assert!(!attempted.load(Ordering::SeqCst));
+        let lease = slot.acquire().expect("A remains resident");
+        assert_eq!(lease.generation, 1);
+        assert_eq!(lease.model.model_id, "a");
+    }
+
+    #[test]
+    fn failed_embedding_replacement_stays_configured_and_unavailable() {
+        let mut slot = EmbeddingModelSlot::default();
+        slot.install_initial(synthetic_embedding_model("a", 4))
+            .expect("install A");
+        let weak_a = Arc::downgrade(&slot.acquire().expect("A lease").model);
+        // The temporary lease above is dropped at the end of the statement,
+        // leaving the slot as the sole owner before replacement.
+        let error = slot
+            .try_replace_after_evict(|| {
+                assert!(
+                    weak_a.upgrade().is_none(),
+                    "A must be gone before loading B"
+                );
+                Err(anyhow::anyhow!("synthetic B load failed"))
+            })
+            .expect_err("replacement must surface loader failure");
+        assert!(error.to_string().contains("synthetic B load failed"));
+        assert!(slot.was_configured());
+        assert!(
+            slot.acquire().is_none(),
+            "failed replacement leaves no stale model"
+        );
+        assert_eq!(slot.last_load_error(), Some("synthetic B load failed"));
+
+        let receipt = slot
+            .try_replace_after_evict(|| Ok(synthetic_embedding_model("b", 5)))
+            .expect("a later explicit replacement may recover the slot");
+        assert_eq!(receipt.generation, 2);
+        assert_eq!(receipt.old_model_id, None);
+        assert_eq!(slot.last_load_error(), None);
     }
 
     #[test]

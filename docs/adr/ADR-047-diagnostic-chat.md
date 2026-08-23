@@ -2,6 +2,10 @@
 
 - **Status:** Accepted; text-engine A -> B -> A proof passed; embedding and projector lifecycle execution active
 - **Date:** 2026-08-20
+- **Updated:** 2026-08-22 — exact-candidate embedding activation and the
+  synthetic public A -> B -> A lifecycle gate are green; the converted real
+  BERT -> Nomic-BERT -> BERT quality, mapping-reclaim, and latency receipt
+  remains an acceptance gate and is not claimed by this revision
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
 
 ## Context
@@ -340,13 +344,45 @@ macOS `footprint` output is retained as a diagnostic only: the 2026-08-22 spike
 showed that its process physical-footprint charge can rise while both RSS and
 host wired pages fall, so it is not an authority for current Metal residency.
 This corrected gate covers pool-resident generative engines through their
-native chat endpoint. It does not count `/v1/embeddings` as proof for the
-dedicated BERT/Nomic subsystem: those models are process-global in the current
-source, while `/v1/embeddings` against a pool-resident generative engine uses
-that engine's last-state pooling path. Dedicated embedding-model lifecycle is
-a separate required implementation and hardware gate, not evidence supplied
-by this test. Family-specific cache and template state must never cross a
-switch.
+native chat endpoint. It does not count `/v1/embeddings` as that proof:
+pool-resident generative embeddings use the text engine's last-state pooling
+path. The dedicated BERT/Nomic subsystem instead owns a separate
+single-generation slot binding its mapped weights, tokenizer, vocabulary, and
+warmed registry. It refuses replacement while a request lease is live, drops
+the old generation before invoking the new loader, and remains
+dedicated-but-unavailable after a load failure rather than falling through to
+the generative embedding path. Model activation schema v3 adds an explicit
+`kind: "embedding"` domain to the existing authenticated activation route;
+omitting `kind` retains the v2 generative-pool behavior. The server never
+infers this domain from a filename or GGUF architecture. `action: "load"`
+returns a conflict receipt when another encoder generation is resident, and
+`action: "switch"` requires that receipt's exact embedding generation through
+`expected_revision`. The success receipt publishes the exact candidate
+selection, new generation, architecture, logical resident bytes, reclaimed
+bytes, and `load_ready`/`post_warm` timing milestones without exposing a local
+path.
+Artifact catalog queries accept the same explicit kind. Local hf2q conversion
+receipts classify `bert` and `nomic-bert` artifacts as `embedding_model` and
+retain the exact source revision, artifact SHA-256, GGUF file type, and private
+path behind an opaque candidate id. This identity is deliberately not routed
+through the narrower generative `QuantType` enum: doing so would reject valid
+Q4_0/F16/BF16 encoder artifacts. The child verifier authenticates the digest
+and exact file type before the public switch invokes the native loader.
+Embedding load and switch require that opaque `candidate_id`; a bare local
+path remains startup-only through `--embedding-model`. Catalog-driven
+residency compares the exact published identity, so two artifacts with the
+same basename cannot alias. A candidate-free probe may inspect the configured
+startup path, but it has no mutation authority.
+The runtime capability view reports the same slot state, including a
+fail-closed load error or in-progress replacement. Its independent A -> B -> A
+hardware gate must drive all three A -> B -> A activations through this public
+route, prove exact embedding replay plus process-RSS and wired-memory
+reclamation, and include conflict, load-ready, post-warm, first-semantic, and
+steady-state latency. It must also prove that an exact-candidate load failure
+leaves the dedicated route unavailable and that an explicit public recovery
+publishes a fresh coherent generation. Direct calls to an internal swap helper
+are not evidence. The generative switch gate is not evidence for it.
+Family-specific cache and template state must never cross a switch.
 
 Likewise, the startup vision projector is process-global in the current
 source. Strongly bound incompatible swaps fail closed, but a shape-compatible

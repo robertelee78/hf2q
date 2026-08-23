@@ -4063,6 +4063,44 @@ Phase 2 closes when 2a + 2b + 2c all pass.
 - [ ] MTEB 5-task sanity suite recovers published scores within ±1 pt per supported model **Blocker: no MTEB harness implementation exists; zero git commits against this AC; genuinely open. Pooling forward pass landed wave-2 T1.9 (see below); MTEB harness still ops-deferred (no Python integration; needs separate harness implementation).**
 - [x] Unsupported embedding-model format → clear error naming the day-one supported list **Closed iter-81 2026-04-26 (src/serve/mod.rs:1352 emits "embedding GGUF general.architecture='{other}' is not supported. Phase 2b day-one models: 'bert' (bge / mxbai) and 'nomic-bert' (nomic-embed-text-v1.5)"; commit 3213d54).**
 
+##### 2026-08-22 native storage and dedicated swap correction
+
+The earlier closure evidence above proves F16/BF16 quality, but its loader
+description is no longer authoritative. Production BERT and Nomic-BERT
+loaders no longer expand every matrix to F32 or retain BF16 matrix shadows.
+All matrix tensors remain exact, file-backed GGUF views behind `MlxQWeight`;
+only explicit vector state expands to F32. Header-only inventory, shape, and
+kernel-regime preflight completes before the first payload mapping. Native
+embedding gather covers F32/F16/BF16/Q4_0/Q8_0/Q2_K/Q4_K/Q5_K/Q6_K; other
+formats fail closed before allocation.
+
+The dedicated embedding model is now a generation-bound slot containing its
+weights, tokenizer, and warmed registry together. Replacement refuses live
+request leases and drops the old generation before invoking the next loader,
+so the supported no-double-residency contract trades rollback-to-old for an
+empty, dedicated-but-unavailable slot when a new load fails; requests never
+fall through to a chat-model approximation. The non-vacuous server gate sends
+real `/v1/embeddings` requests across synthetic native Q4_0 A -> B -> fresh A,
+requires exact A output replay, distinct B output, isolated tokenizer and
+registry identities, reclamation before each loader, one-generation byte
+accounting, and measured switch-to-first-embedding latency.
+
+Public embedding load and switch require an opaque `candidate_id` from an
+explicit embedding catalog query. Bare local paths remain valid only for the
+startup `--embedding-model` option; candidate-free public requests may probe
+that startup identity but cannot replace it. Catalog-driven residency is
+decided by exact candidate-bound identity, not a basename or payload-path
+shortcut, closing the same-basename alias failure mode.
+
+A measured Nomic full-matrix QKV hypothesis was rejected rather than shipped:
+at `m=32`, `h=768`, packed Q4_0, 21 alternating warm samples, one `[3h,h]`
+dispatch plus activation slices was 696 microseconds median versus 427
+microseconds for three native zero-copy stored-row views. Production uses the
+faster three-view route while retaining one mapped fused tensor. The old real
+F16 artifacts are absent from the current host, so this amendment does not
+claim refreshed real-model cosine, MTEB, load latency, or Q4 quality evidence;
+those gates must run on new GGUFs produced by hf2q from pinned safetensors.
+
 #### Phase 2c AC — Vision (absorbed from old Phase 3, 2026-04-23)
 - [x] `hf2q generate --model ./models/gemma4/ --prompt "describe this" --image photo.jpg` produces correct image-aware output **Closed iter-132 W63 (cites iter-121-131 chain — peer-precision-parity at F16 budget; smoke "Four black squares, white background." is image-aware; zero peer-deviation in audit; F16 weight bytes byte-identical to peer GGUF; macro stats match peer within 1%).**
 - [x] Open WebUI with image uploads: full multi-turn vision chat works end-to-end **Closed iter-211 W79: tests/openwebui_vision.rs::scenario4_image_url_multi_turn LIVE PASS at HF2Q_OPENWEBUI_E2E=1; Gemma 4 26B + mmproj on four_dots_in_corners_128x128.png fixture; turn 1 image-aware response ("The image is a square composition consisting of a white background with four small black squares positioned at the corners.") matches peer-overlap word `square`; turn 2 multi-turn referencing image preserved ("I counted **5** objects in total: 1. The large white square (the background/frame). 2. The four small black squares"); T=0 byte-identical determinism on turn 1; SSE protocol (role chunk → content deltas → finish_reason → DONE) verified; recorded fixture at `tests/fixtures/openwebui_multiturn/scenario4_vision_chunks.txt`. Production fix-forward (commit 0350675): `Request::GenerateStream` extended with `soft_tokens: Vec<SoftTokenData>`; worker routes through `forward_prefill_with_soft_tokens`; chat handler removes the prior 400 stream-not-supported-with-images guard. Text-only behavior byte-identical (empty soft-tokens slice = identity over text-only prefill — see `src/serve/forward_prefill.rs:117`).**

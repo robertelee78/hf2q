@@ -226,7 +226,7 @@ impl ArtifactCatalogCoordinator {
                 bytes: artifact.bytes,
                 quant_hint: artifact.quant_hint,
                 origin: artifact.provenance.as_str().to_owned(),
-                role: "text_model".into(),
+                role: artifact.role,
                 selectable: artifact.selectable,
                 unavailable_reason: artifact.unavailable_reason,
             });
@@ -365,7 +365,9 @@ mod tests {
                     bytes: 42,
                     sha256: "b".repeat(64),
                     quant_hint: "Q4_K_M".into(),
+                    file_type: 15,
                     quant: Some(crate::serve::quant_select::QuantType::Q4_K_M),
+                    role: "text_model".into(),
                     selectable: true,
                     unavailable_reason: None,
                     provenance: crate::serve::api::local_artifacts::LocalArtifactProvenance::ConversionReceipt,

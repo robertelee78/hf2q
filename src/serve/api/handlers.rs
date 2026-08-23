@@ -7624,7 +7624,7 @@ const BERT_MIN_SEQ_LEN: usize = 32;
 /// model, usage}`.
 ///
 /// Failure modes:
-///   - No `--embedding-model` was supplied at startup → 503
+///   - No dedicated embedding generation is resident → 400
 ///     `model_not_loaded` naming the requested id.
 ///   - `req.model` doesn't match the loaded embedding model id → 400
 ///     `model_not_loaded`.
@@ -7637,7 +7637,7 @@ pub async fn embeddings(
 ) -> Response {
     // --- Chat-model embeddings fast path (Phase 2a Task #8, iter-92) ---
     //
-    // When no `--embedding-model` was supplied at startup but a chat
+    // When no dedicated embedding model has ever been configured but a chat
     // model is loaded AND the request's `model` matches the chat
     // engine's id, route through `Engine::embed` (Last pooling on the
     // chat-model's last-layer hidden state).  This lets users embed
@@ -7650,7 +7650,14 @@ pub async fn embeddings(
     // encoder, faster + more accurate than chat-model Last pool).  The
     // chat-model path is the fallback for users who only loaded a chat
     // model.
-    if state.embedding_config.is_none() {
+    let embedding_lease = state.acquire_embedding_model();
+    if embedding_lease.is_none() {
+        if state.embedding_model_was_configured() {
+            // A dedicated encoder was configured but is unavailable (for
+            // example, a replacement load failed after the old generation
+            // was reclaimed). Never approximate it through a chat model.
+            return ApiError::model_not_loaded(&req.model).into_response();
+        }
         // Iter-209: pool-routed chat-model embeddings.  Resolve the
         // requested model through the same auto-swap surface chat
         // completions uses; on success, route through Engine::embed
@@ -7666,8 +7673,8 @@ pub async fn embeddings(
     }
 
     // --- Dedicated embedding model path (--embedding-model) ---
-    let em = match state.embedding_config.as_ref() {
-        Some(em) => em.clone(),
+    let em = match embedding_lease {
+        Some(lease) => lease.model,
         None => {
             return ApiError::model_not_loaded(&req.model).into_response();
         }
@@ -7737,11 +7744,11 @@ pub async fn embeddings(
     // --- Run the forward pass per input ---
     // The blocking GPU dispatch runs inside spawn_blocking so the tokio
     // runtime is not held up while the per-input forward (~ms-scale)
-    // executes. Each input gets its own GraphSession + KernelRegistry —
-    // amortizing kernel-compile across requests is iter-63's perf work.
+    // executes. The request borrows the warmed registry owned by the same
+    // immutable model generation as its tokenizer and weights.
     let model_id = em.model_id.clone();
     let tokenizer = em.tokenizer.clone();
-    let shared_registry = state.embedding_registry.clone();
+    let shared_registry = Arc::clone(&em.registry);
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<EmbeddingResponse> {
         use crate::inference::models::bert::bert_gpu::apply_bert_full_forward_gpu;
@@ -7763,9 +7770,7 @@ pub async fn embeddings(
         // No fallback path: the registry MUST be populated before any
         // /v1/embeddings request reaches this handler — populated by
         // `cmd_serve` immediately after weight load.
-        let registry_arc = shared_registry.ok_or_else(|| {
-            anyhow::anyhow!("embedding registry not pre-warmed (server boot did not initialize it)")
-        })?;
+        let registry_arc = shared_registry;
 
         let mut data: Vec<EmbeddingObject> = Vec::with_capacity(inputs.len());
         let mut total_tokens: usize = 0;
@@ -9114,15 +9119,17 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
             advertise_bound_vision(model, &projector.model_id);
         }
     }
-    // Prepend the embedding model if one was supplied via --embedding-model.
-    // Listed with `loaded: true` since the config is resident in memory even
-    // if the forward-pass path isn't wired yet.
+    // Prepend the current dedicated embedding generation, whether it was
+    // installed by `--embedding-model` or the explicit public activation
+    // domain. A lease keeps model/tokenizer/registry identity atomic while
+    // this response is assembled.
     //
     // ADR-018 C5: the embedding model has no `LoadInfo` snapshot today
     // (it's wired through `EmbeddingModel`, not `Engine`), so the new
     // optional fields stay `None` here — backward-compatible with pre-C5
     // consumers.
-    if let Some(em) = state.embedding_config.as_ref() {
+    if let Some(lease) = state.acquire_embedding_model() {
+        let em = lease.model;
         if !models.iter().any(|m| m.id == em.model_id) {
             models.insert(
                 0,
@@ -9132,10 +9139,9 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
                     created: chrono_seconds(),
                     owned_by: "hf2q",
                     context_length: em.arch.as_ref().map(|a| a.max_position_embeddings()),
-                    // Embedding GGUFs are typically F16/F32 — we don't
-                    // run infer_quant_type for them because they're
-                    // identified via the --embedding-model flag, not the
-                    // cache scan.
+                    // Encoder tensor mixes are reported by their own native
+                    // storage inventory; the generative pool QuantType enum
+                    // is intentionally not reused here.
                     quant_type: None,
                     backend: Some("mlx-native"),
                     loaded: true,

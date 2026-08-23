@@ -38,7 +38,8 @@ fi
 
 if [[ ! -f "$EMBED_GGUF" ]]; then
     echo "[smoke] Embedding GGUF not found: $EMBED_GGUF" >&2
-    echo "[smoke] Download via: curl -L https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf/resolve/main/bge-small-en-v1.5-f16.gguf -o $EMBED_GGUF" >&2
+    echo "[smoke] Build from pinned safetensors with hf2q:" >&2
+    echo "[smoke]   hf2q convert https://huggingface.co/BAAI/bge-small-en-v1.5/tree/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a --quant q4_0 --output $EMBED_GGUF" >&2
     exit 1
 fi
 

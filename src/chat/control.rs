@@ -9,7 +9,8 @@ use super::client::{decode_json_bounded, read_text_bounded};
 use super::endpoint::Endpoint;
 
 const RUNTIME_SCHEMA: &str = "hf2q.runtime.v1";
-const ACTIVATION_SCHEMA: &str = "hf2q.model-activation.v2";
+const ACTIVATION_SCHEMA: &str = "hf2q.model-activation.v3";
+const LEGACY_ACTIVATION_SCHEMA: &str = "hf2q.model-activation.v2";
 const ARTIFACT_SCHEMA: &str = "hf2q.artifact-resolution.v2";
 const LOCAL_ARTIFACT_SCHEMA: &str = "hf2q.local-artifact-resolution.v1";
 pub(crate) const NON_EVICTING_HEADER: &str = "x-hf2q-diagnostic-no-evict";
@@ -162,6 +163,10 @@ enum ActivationResult {
     Conflict(ActivationConflict),
 }
 
+fn compatible_activation_schema(schema: &str) -> bool {
+    schema == ACTIVATION_SCHEMA || schema == LEGACY_ACTIVATION_SCHEMA
+}
+
 impl Hf2qControl {
     pub(crate) async fn detect(
         http: &reqwest::Client,
@@ -210,7 +215,7 @@ impl Hf2qControl {
             Err(error) => return Err(error),
         };
         if view.schema_version != RUNTIME_SCHEMA
-            || view.capabilities.model_activation != ACTIVATION_SCHEMA
+            || !compatible_activation_schema(&view.capabilities.model_activation)
             || !view.capabilities.non_evicting_load
             || !view
                 .capabilities
@@ -498,7 +503,7 @@ impl Hf2qControl {
         }
         let success: ActivationSuccess =
             decode_json_bounded(response, "hf2q resident probe").await?;
-        if success.schema_version != ACTIVATION_SCHEMA || success.status != "resident" {
+        if !compatible_activation_schema(&success.schema_version) || success.status != "resident" {
             bail!("hf2q returned an incompatible resident probe response");
         }
         Ok(success.request_model)
@@ -537,7 +542,7 @@ impl Hf2qControl {
                 ))
             }
             ActivationResult::Conflict(conflict) => {
-                if conflict.schema_version != ACTIVATION_SCHEMA
+                if !compatible_activation_schema(&conflict.schema_version)
                     || conflict.status != "conflict"
                     || !conflict.requires_explicit_switch
                 {
@@ -619,7 +624,7 @@ impl Hf2qControl {
         if status.is_success() {
             let success: ActivationSuccess =
                 decode_json_bounded(response, "hf2q activation response").await?;
-            if success.schema_version != ACTIVATION_SCHEMA {
+            if !compatible_activation_schema(&success.schema_version) {
                 bail!("hf2q returned an incompatible activation response");
             }
             return Ok(ActivationResult::Ready(success));

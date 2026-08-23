@@ -68,8 +68,9 @@ struct LayerNormParams {
 // Two-pass: pass 1 computes the row mean via parallel reduction, pass 2
 // computes the variance via the same reduction pattern using the mean
 // from pass 1, then a final write applies the affine transform. F32
-// throughout — BERT weights are F16 in GGUF but every dequant target
-// is F32 in this loader for parity with the CPU reference.
+// throughout. Matrix weights keep their exact GGUF representation and execute
+// through native gather/matmul kernels; only LayerNorm's one-dimensional
+// gamma/beta state is expanded to F32 for this elementwise operation.
 kernel void bert_layer_norm_f32(
     device const float* input  [[buffer(0)]],
     device const float* gamma  [[buffer(1)]],
@@ -354,6 +355,7 @@ pub fn register_bert_custom_shaders(registry: &mut KernelRegistry) {
     mlx_native::ops::sigmoid_mul::register(registry);
     mlx_native::ops::gather::register(registry);
     mlx_native::ops::l2_norm::register(registry);
+    super::native_gpu::register_native_embedding_shaders(registry);
 }
 
 // ---------------------------------------------------------------------------
@@ -1920,7 +1922,8 @@ pub fn bert_l2_normalize_gpu(
 /// Inputs:
 /// - `input_ids`        U32 `[seq_len]`
 /// - `type_ids_opt`     U32 `[seq_len]` (None → no segment embedding)
-/// - `weights`          parsed BERT GGUF tensors (F32 on device)
+/// - `weights`          matrices in their stored GGUF representation plus
+///                      explicit F32 vector state
 /// - `cfg`              architecture config (drives layer count, hidden
 ///                      sizes, pooling kind, eps)
 ///
@@ -1949,6 +1952,9 @@ pub fn apply_bert_full_forward_gpu(
     valid_token_count: u32,
 ) -> Result<MlxBuffer> {
     use super::config::PoolingType;
+    use super::native_gpu::{
+        apply_bert_encoder_block_native_gpu, bert_embeddings_native_gpu, NativeBertEncoderBlock,
+    };
 
     let pool_kind = match cfg.pooling_type {
         PoolingType::Mean => BertPoolKind::Mean,
@@ -2014,7 +2020,7 @@ pub fn apply_bert_full_forward_gpu(
         None
     };
 
-    let mut hidden_states = bert_embeddings_gpu(
+    let mut hidden_states = bert_embeddings_native_gpu(
         encoder,
         registry,
         device,
@@ -2054,25 +2060,25 @@ pub fn apply_bert_full_forward_gpu(
 
     // --- N encoder blocks ---
     for layer_idx in 0..cfg.num_hidden_layers {
-        let tensors = BertEncoderBlockTensors {
-            q_w: weights.block_required(layer_idx, "attn_q.weight")?,
+        let tensors = NativeBertEncoderBlock {
+            q_w: weights.block_matrix(layer_idx, "attn_q.weight")?,
             q_b: weights.block_optional(layer_idx, "attn_q.bias"),
-            k_w: weights.block_required(layer_idx, "attn_k.weight")?,
+            k_w: weights.block_matrix(layer_idx, "attn_k.weight")?,
             k_b: weights.block_optional(layer_idx, "attn_k.bias"),
-            v_w: weights.block_required(layer_idx, "attn_v.weight")?,
+            v_w: weights.block_matrix(layer_idx, "attn_v.weight")?,
             v_b: weights.block_optional(layer_idx, "attn_v.bias"),
-            o_w: weights.block_required(layer_idx, "attn_output.weight")?,
+            o_w: weights.block_matrix(layer_idx, "attn_output.weight")?,
             o_b: weights.block_optional(layer_idx, "attn_output.bias"),
-            attn_norm_gamma: weights.block_required(layer_idx, "attn_output_norm.weight")?,
-            attn_norm_beta: weights.block_required(layer_idx, "attn_output_norm.bias")?,
-            up_w: weights.block_required(layer_idx, "ffn_up.weight")?,
+            attn_norm_weight: weights.block_required(layer_idx, "attn_output_norm.weight")?,
+            attn_norm_bias: weights.block_required(layer_idx, "attn_output_norm.bias")?,
+            up_w: weights.block_matrix(layer_idx, "ffn_up.weight")?,
             up_b: weights.block_optional(layer_idx, "ffn_up.bias"),
-            down_w: weights.block_required(layer_idx, "ffn_down.weight")?,
+            down_w: weights.block_matrix(layer_idx, "ffn_down.weight")?,
             down_b: weights.block_optional(layer_idx, "ffn_down.bias"),
-            ffn_norm_gamma: weights.block_required(layer_idx, "layer_output_norm.weight")?,
-            ffn_norm_beta: weights.block_required(layer_idx, "layer_output_norm.bias")?,
+            output_norm_weight: weights.block_required(layer_idx, "layer_output_norm.weight")?,
+            output_norm_bias: weights.block_required(layer_idx, "layer_output_norm.bias")?,
         };
-        hidden_states = apply_bert_encoder_block_gpu(
+        hidden_states = apply_bert_encoder_block_native_gpu(
             encoder,
             registry,
             device,

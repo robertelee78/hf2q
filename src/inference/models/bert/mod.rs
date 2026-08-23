@@ -36,6 +36,8 @@
 
 pub mod bert_gpu;
 pub mod config;
+pub(crate) mod native_gpu;
+pub(crate) mod native_storage;
 pub mod tokenizer;
 pub mod weights;
 #[allow(unused_imports)]

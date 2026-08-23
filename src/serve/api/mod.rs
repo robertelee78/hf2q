@@ -30,6 +30,7 @@ pub mod artifact_catalog;
 pub mod cancellation;
 pub mod control;
 mod deepseek4_anchor_store;
+mod embedding_activation;
 pub mod embedding_pool;
 pub mod engine;
 pub mod engine_deepseek4;
@@ -52,6 +53,9 @@ pub mod schema;
 pub mod sse;
 pub mod state;
 pub mod tq_packed_descriptor;
+
+#[cfg(test)]
+mod embedding_lifecycle_tests;
 
 #[cfg(test)]
 mod qwen36_watchdog_fixture_tests;

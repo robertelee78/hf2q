@@ -468,7 +468,7 @@ pub fn resolve_hub_gguf_catalog(
 /// Download and authenticate exactly one artifact previously returned by
 /// [`resolve_hub_gguf_catalog`]. No source weights or sibling GGUFs are read.
 pub fn download_hub_gguf(artifact: &HubGgufArtifact) -> Result<PathBuf, DownloadError> {
-    if !artifact.selectable || artifact.role != "text_model" {
+    if !artifact.selectable || !matches!(artifact.role.as_str(), "text_model" | "embedding_model") {
         return Err(DownloadError::InvalidRepositoryInventory {
             reason: format!("GGUF artifact `{}` is not selectable", artifact.filename),
         });
@@ -520,7 +520,7 @@ fn hosted_gguf_identity_valid(artifact: &HubGgufArtifact) -> bool {
         && inferred_role == "text_model"
         && unavailable_reason.is_none()
         && inferred_quant == artifact.quant_hint
-        && artifact.role == inferred_role
+        && matches!(artifact.role.as_str(), "text_model" | "embedding_model")
 }
 
 fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<String>) {
@@ -559,10 +559,13 @@ fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<St
 }
 
 fn infer_filename_quant(stem: &str) -> Option<String> {
-    ["q3_k_m", "q4_k_m", "q5_k_m", "q6_k", "q8_0", "bf16"]
-        .into_iter()
-        .find(|quant| stem.ends_with(quant))
-        .map(|quant| quant.to_ascii_uppercase())
+    [
+        "q2_k", "q3_k_m", "q4_0", "q4_k_s", "q4_k_m", "q5_k_s", "q5_k_m", "q6_k", "q8_0", "f16",
+        "f32", "bf16",
+    ]
+    .into_iter()
+    .find(|quant| stem.ends_with(quant))
+    .map(|quant| quant.to_ascii_uppercase())
 }
 
 fn check_artifact_disk_preflight(
@@ -1429,12 +1432,18 @@ mod tests {
     #[test]
     fn mixed_repository_ggufs_are_classified_without_source_fallback() {
         for (filename, quant) in [
-            ("gguf/model-bf16.gguf", "BF16"),
+            ("gguf/model-q2_k.gguf", "Q2_K"),
             ("gguf/model-q3_k_m.gguf", "Q3_K_M"),
+            ("gguf/model-q4_0.gguf", "Q4_0"),
+            ("gguf/model-q4_k_s.gguf", "Q4_K_S"),
             ("gguf/model-q4_k_m.gguf", "Q4_K_M"),
+            ("gguf/model-q5_k_s.gguf", "Q5_K_S"),
             ("gguf/model-q5_k_m.gguf", "Q5_K_M"),
             ("gguf/model-q6_k.gguf", "Q6_K"),
             ("gguf/model-q8_0.gguf", "Q8_0"),
+            ("gguf/model-f16.gguf", "F16"),
+            ("gguf/model-f32.gguf", "F32"),
+            ("gguf/model-bf16.gguf", "BF16"),
         ] {
             assert_eq!(
                 classify_hub_gguf(filename),
@@ -1465,6 +1474,9 @@ mod tests {
         assert!(identity.contains("owner/model@aaaaaaaa"));
         assert!(identity.contains("gguf/model-q6_k.gguf"));
         assert!(identity.ends_with(&"b".repeat(64)));
+        let mut embedding = artifact;
+        embedding.role = "embedding_model".into();
+        assert!(hosted_gguf_identity_valid(&embedding));
     }
 
     #[test]

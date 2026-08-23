@@ -722,8 +722,13 @@ pub fn build_tokenizer_metadata(
                 kv.push(("tokenizer.ggml.add_bos_token".into(), MetaValue::Bool(v)));
             }
         }
-    } else if arch == ArchName::Bert {
-        // BERT (BAAI bge / similar WordPiece encoders) canonical emit
+    } else if matches!(arch, ArchName::Bert | ArchName::NomicBert) {
+        // BERT-family WordPiece encoders (BAAI bge, NomicBert v1.5,
+        // and similar models) emit the same canonical contract. The
+        // NomicBert Unigram/v2-MoE variant was handled by the first
+        // branch above and must not enter this WordPiece path.
+        //
+        // Canonical emit
         // order:
         //   add_token_type_count(type_vocab_size)
         //   phantom-prefix transform on tokens (▁ for normal, strip ##
@@ -1635,6 +1640,70 @@ mod tests {
         let kv = build_tokenizer_metadata(tmp.path(), ArchName::Qwen35Moe).unwrap();
         assert_eq!(lookup_str(&kv, "tokenizer.ggml.model"), "gpt2");
         assert_eq!(lookup_str(&kv, "tokenizer.ggml.pre"), "qwen35");
+    }
+
+    #[test]
+    fn nomic_bert_wordpiece_emits_token_type_and_special_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tokenizer_json = serde_json::json!({
+            "model": {
+                "type": "WordPiece",
+                "vocab": {
+                    "[PAD]": 0,
+                    "[UNK]": 1,
+                    "[CLS]": 2,
+                    "[SEP]": 3,
+                    "[MASK]": 4,
+                    "hello": 5,
+                    "##world": 6
+                }
+            },
+            "added_tokens": [
+                {"id": 0, "content": "[PAD]", "special": true},
+                {"id": 1, "content": "[UNK]", "special": true},
+                {"id": 2, "content": "[CLS]", "special": true},
+                {"id": 3, "content": "[SEP]", "special": true},
+                {"id": 4, "content": "[MASK]", "special": true}
+            ]
+        });
+        fs::write(
+            tmp.path().join("tokenizer.json"),
+            serde_json::to_vec(&tokenizer_json).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("tokenizer_config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "pad_token": "[PAD]",
+                "unk_token": "[UNK]",
+                "cls_token": "[CLS]",
+                "sep_token": "[SEP]",
+                "mask_token": "[MASK]"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "model_type": "nomic_bert",
+                "vocab_size": 7,
+                "type_vocab_size": 2
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let kv = build_tokenizer_metadata(tmp.path(), ArchName::NomicBert).unwrap();
+        assert_eq!(lookup_str(&kv, "tokenizer.ggml.model"), "bert");
+        assert_eq!(lookup_str(&kv, "tokenizer.ggml.pre"), "default");
+        assert_eq!(lookup_u32(&kv, "tokenizer.ggml.token_type_count"), 2);
+        assert_eq!(lookup_u32(&kv, "tokenizer.ggml.bos_token_id"), 2);
+        assert_eq!(lookup_u32(&kv, "tokenizer.ggml.eos_token_id"), 3);
+        assert_eq!(lookup_u32(&kv, "tokenizer.ggml.unknown_token_id"), 1);
+        assert_eq!(lookup_u32(&kv, "tokenizer.ggml.padding_token_id"), 0);
+        assert_eq!(lookup_u32(&kv, "tokenizer.ggml.seperator_token_id"), 3);
+        assert_eq!(lookup_u32(&kv, "tokenizer.ggml.mask_token_id"), 4);
     }
 
     #[test]

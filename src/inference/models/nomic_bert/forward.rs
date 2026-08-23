@@ -1,7 +1,6 @@
 //! nomic-bert encoder forward pass on Metal GPU (ADR-005 Phase 2b, Task #16).
 //!
-//! Composes the per-block topology that matches the peer's `llm_build_bert`
-//! with `arch == LLM_ARCH_NOMIC_BERT`:
+//! Composes the NomicBert per-block topology:
 //!
 //! ```text
 //!   inpL  = LayerNorm(token_embd[ids] + maybe token_types[type_ids])
@@ -29,13 +28,12 @@
 //!    `position_embd` lookup at the embed stage.
 //! 2. **MLP.** `silu(gate(x)) * up(x) → down`. Three linears per block
 //!    (`ffn_up`, `ffn_gate`, `ffn_down`). BERT uses two with GeLU.
-//! 3. **Tensor manifest.** Fused `attn_qkv.weight [hidden, 3*hidden]`
-//!    instead of separate `attn_q/k/v.weight`. Split via `MlxBuffer::slice_view`
-//!    + three independent `bert_linear_gpu` calls — each cast-to-bf16 +
-//!    matmul produces its own logical Q / K / V projection.
+//! 3. **Tensor manifest.** Fused `attn_qkv.weight [3*hidden, hidden]`
+//!    instead of separate `attn_q/k/v.weight`. The stored matrix remains one
+//!    mapping; Q/K/V are zero-copy row views dispatched in its native format.
 //!
-//! GPU primitives are reused from `bert::bert_gpu` (linear, layer_norm,
-//! attention with mask, residual_add, embed_gather, pool, l2_normalize).
+//! GPU primitives are reused from the BERT lane (normalization, attention,
+//! residual, pooling) while embeddings and matrices use native dispatch.
 //! mlx-native ops are imported directly: `dispatch_rope_neox_f32` for the
 //! RoPE step, `dispatch_silu_mul` for the SwiGLU step, `cast` is internal
 //! to `bert_linear_gpu`.
@@ -48,7 +46,7 @@
 //! pre-write garbage. This composer inserts barriers at every RAW point;
 //! callers MUST preserve them when refactoring.
 
-#![allow(dead_code)] // handler wiring lands in iter 77+
+#![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
 
@@ -62,13 +60,15 @@ use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::super::bert::bert_gpu::{
-    bert_embed_gather_gpu, bert_l2_normalize_gpu, bert_layer_norm_gpu, bert_linear_bf16_gpu,
-    bert_linear_gpu, bert_pool_gpu, bert_residual_add_gpu, bert_residual_layer_norm_gpu,
-    register_bert_custom_shaders, BertPoolKind,
+    bert_embed_gather_gpu, bert_l2_normalize_gpu, bert_layer_norm_gpu, bert_pool_gpu,
+    bert_residual_add_gpu, bert_residual_layer_norm_gpu, register_bert_custom_shaders,
+    BertPoolKind,
 };
 use super::super::bert::config::PoolingType;
+use super::super::bert::native_gpu::{bert_embed_gather_native_gpu, bert_linear_native_gpu};
 use super::config::NomicBertConfig;
 use super::weights::LoadedNomicBertWeights;
+use crate::serve::forward_mlx_shared::MlxQWeight;
 
 // ---------------------------------------------------------------------------
 // Kernel registration
@@ -97,6 +97,9 @@ pub fn register_nomic_bert_kernels(registry: &mut KernelRegistry) {
 // Embedding stage (no position embedding)
 // ---------------------------------------------------------------------------
 
+/// Legacy dense-buffer NomicBert embedding primitive retained for focused
+/// F32 tests. Production uses `nomic_bert_embeddings_native_gpu` below.
+///
 /// nomic-bert embedding stage:
 /// `out = LayerNorm(token_embd[input_ids] + maybe token_types[type_ids])`.
 ///
@@ -197,6 +200,57 @@ pub fn nomic_bert_embeddings_gpu(
     .context("nomic embeddings: post-sum LayerNorm")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn nomic_bert_embeddings_native_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_ids: &MlxBuffer,
+    type_ids: Option<&MlxBuffer>,
+    token_embd: &MlxQWeight,
+    token_types: Option<&MlxQWeight>,
+    norm_weight: &MlxBuffer,
+    norm_bias: &MlxBuffer,
+    eps: f32,
+    seq_len: u32,
+    hidden: u32,
+    vocab: u32,
+    type_vocab: u32,
+) -> Result<MlxBuffer> {
+    if type_ids.is_some() != token_types.is_some() {
+        return Err(anyhow!("nomic native embedding type ids/table mismatch"));
+    }
+    let token = bert_embed_gather_native_gpu(
+        encoder, registry, device, token_embd, input_ids, vocab, hidden, seq_len,
+    )?;
+    encoder.memory_barrier();
+    let elements = seq_len
+        .checked_mul(hidden)
+        .ok_or_else(|| anyhow!("nomic native embedding element overflow"))?;
+    let summed = if let (Some(ids), Some(table)) = (type_ids, token_types) {
+        let segment = bert_embed_gather_native_gpu(
+            encoder, registry, device, table, ids, type_vocab, hidden, seq_len,
+        )?;
+        encoder.memory_barrier();
+        let output = bert_residual_add_gpu(encoder, registry, device, &token, &segment, elements)?;
+        encoder.memory_barrier();
+        output
+    } else {
+        token
+    };
+    bert_layer_norm_gpu(
+        encoder,
+        registry,
+        device,
+        &summed,
+        norm_weight,
+        norm_bias,
+        eps,
+        seq_len,
+        hidden,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Position-id + RoPE-params helpers
 // ---------------------------------------------------------------------------
@@ -261,8 +315,8 @@ fn alloc_rope_params(
 
 /// Build a BF16 padding mask of shape `[seq_len, seq_len]` for
 /// `flash_attn_prefill_bf16_d64` SeqMajor.  Attended positions hold `0.0`,
-/// masked positions hold `-INFINITY` (the peer's convention — see
-/// `flash_attn_prefill.rs` module doc).
+/// masked positions hold `-INFINITY` as required by the flash-attention
+/// kernel contract.
 ///
 /// Built once per request from `valid_token_count`; broadcast across heads
 /// + batch via the dispatcher's rank-2 stride detection.  Replaces the
@@ -308,6 +362,97 @@ fn alloc_silu_mul_params(device: &MlxDevice, n: u32) -> Result<MlxBuffer> {
     Ok(buf)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn split_qkv_native_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxQWeight,
+    bias: Option<&MlxBuffer>,
+    seq_len: u32,
+    hidden: u32,
+) -> Result<(MlxBuffer, MlxBuffer, MlxBuffer)> {
+    anyhow::ensure!(
+        weight.info.rows == 3 * hidden as usize && weight.info.cols == hidden as usize,
+        "nomic fused QKV metadata [{}, {}] != expected [{}, {}]",
+        weight.info.rows,
+        weight.info.cols,
+        3 * hidden,
+        hidden
+    );
+    anyhow::ensure!(
+        weight.buffer.data_byte_len() % 3 == 0,
+        "nomic fused QKV stored byte length {} is not divisible by three",
+        weight.buffer.data_byte_len()
+    );
+    let matrix_bytes = weight.buffer.data_byte_len() / 3;
+    let element_bytes = weight.buffer.dtype().size_of();
+    anyhow::ensure!(
+        matrix_bytes % element_bytes == 0,
+        "nomic QKV projection byte length {matrix_bytes} is not aligned to {element_bytes}-byte elements"
+    );
+    let matrix_elements = matrix_bytes / element_bytes;
+    let projection = |index: usize| MlxQWeight {
+        buffer: weight
+            .buffer
+            .slice_view((index * matrix_bytes) as u64, matrix_elements),
+        info: crate::serve::gpu::QuantWeightInfo {
+            ggml_dtype: weight.info.ggml_dtype,
+            rows: hidden as usize,
+            cols: hidden as usize,
+        },
+        affine: None,
+        decode_record_q6k_m1: std::sync::OnceLock::new(),
+    };
+    let (q_bias, k_bias, v_bias) = match bias {
+        Some(fused) => (
+            Some(fused.slice_view(0, hidden as usize)),
+            Some(fused.slice_view((hidden as usize * 4) as u64, hidden as usize)),
+            Some(fused.slice_view((2 * hidden as usize * 4) as u64, hidden as usize)),
+        ),
+        None => (None, None, None),
+    };
+    let q_weight = projection(0);
+    let k_weight = projection(1);
+    let v_weight = projection(2);
+    let q = bert_linear_native_gpu(
+        encoder,
+        registry,
+        device,
+        input,
+        &q_weight,
+        q_bias.as_ref(),
+        seq_len,
+        hidden,
+        hidden,
+    )?;
+    let k = bert_linear_native_gpu(
+        encoder,
+        registry,
+        device,
+        input,
+        &k_weight,
+        k_bias.as_ref(),
+        seq_len,
+        hidden,
+        hidden,
+    )?;
+    let v = bert_linear_native_gpu(
+        encoder,
+        registry,
+        device,
+        input,
+        &v_weight,
+        v_bias.as_ref(),
+        seq_len,
+        hidden,
+        hidden,
+    )?;
+    encoder.memory_barrier();
+    Ok((q, k, v))
+}
+
 // ---------------------------------------------------------------------------
 // Per-block tensor bundle
 // ---------------------------------------------------------------------------
@@ -316,36 +461,24 @@ fn alloc_silu_mul_params(device: &MlxDevice, n: u32) -> Result<MlxBuffer> {
 /// Caller pulls each tensor from `LoadedNomicBertWeights`. Biases are
 /// optional (nomic-embed-text-v1.5 ships zero biases on its linears).
 pub struct NomicBertEncoderBlockTensors<'a> {
-    /// Fused QKV projection: `[3*hidden, hidden]` F32 weight + optional
-    /// `[3*hidden]` bias. Splitting happens at use site via `slice_view`.
-    pub qkv_w: &'a MlxBuffer,
+    /// Fused stored QKV tensor retained as one mapping. Projection rows are
+    /// zero-copy views and execute in the matrix's native representation.
+    pub qkv_w: &'a MlxQWeight,
     pub qkv_b: Option<&'a MlxBuffer>,
-    /// Pre-cast BF16 fused QKV weight (`[3*hidden, hidden]`, 2 bytes/elem).
-    /// When `Some`, the composer slices this BF16 buffer for Q/K/V and
-    /// dispatches `bert_linear_bf16_gpu` (no per-call cast). When `None`,
-    /// falls back to the F32 path via `bert_linear_gpu`. Iter-83 perf
-    /// optimization — populated by `LoadedNomicBertWeights::block_weight_bf16`.
-    pub qkv_w_bf16: Option<&'a MlxBuffer>,
-    /// Attention output projection: `[hidden, hidden]` F32 + optional bias.
-    pub o_w: &'a MlxBuffer,
+    pub o_w: &'a MlxQWeight,
     pub o_b: Option<&'a MlxBuffer>,
-    /// Pre-cast BF16 attention output weight (`[hidden, hidden]`).
-    pub o_w_bf16: Option<&'a MlxBuffer>,
     /// Post-attention LayerNorm γ, β. Both `[hidden]` F32.
     pub attn_norm_gamma: &'a MlxBuffer,
     pub attn_norm_beta: &'a MlxBuffer,
     /// FFN up projection: `[intermediate, hidden]` F32 + optional bias.
-    pub up_w: &'a MlxBuffer,
+    pub up_w: &'a MlxQWeight,
     pub up_b: Option<&'a MlxBuffer>,
-    pub up_w_bf16: Option<&'a MlxBuffer>,
     /// FFN gate projection: `[intermediate, hidden]` F32 + optional bias.
-    pub gate_w: &'a MlxBuffer,
+    pub gate_w: &'a MlxQWeight,
     pub gate_b: Option<&'a MlxBuffer>,
-    pub gate_w_bf16: Option<&'a MlxBuffer>,
     /// FFN down projection: `[hidden, intermediate]` F32 + optional bias.
-    pub down_w: &'a MlxBuffer,
+    pub down_w: &'a MlxQWeight,
     pub down_b: Option<&'a MlxBuffer>,
-    pub down_w_bf16: Option<&'a MlxBuffer>,
     /// Post-FFN LayerNorm γ, β. Both `[hidden]` F32.
     pub ffn_norm_gamma: &'a MlxBuffer,
     pub ffn_norm_beta: &'a MlxBuffer,
@@ -420,110 +553,21 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     let head_dim = hidden / num_heads;
     let n_hidden_elems = (seq_len as usize) * (hidden as usize);
 
-    // ---- 1. Fused QKV projection: split via slice_view + 3 matmuls ----
-    //
-    // GGUF layout for fused QKV: weight shape `[3*hidden, hidden]` with
-    // out_dim contiguous in memory (out_dim 0..hidden = Q, hidden..2*hidden
-    // = K, 2*hidden..3*hidden = V). Per-block sub-slice:
-    //   Q weight = bytes [0 .. hidden*hidden*4)
-    //   K weight = bytes [hidden*hidden*4 .. 2*hidden*hidden*4)
-    //   V weight = bytes [2*hidden*hidden*4 .. 3*hidden*hidden*4)
-    //
-    // `MlxBuffer::slice_view` returns a sub-buffer that, when bound to a
-    // kernel, passes the byte offset via `setBuffer:offset:atIndex:`.
-    // The matmul kernel reads `out_features × in_features` from the
-    // bound buffer and stays within the slice region.
-    // **Iter 83 perf fast path: BF16 pre-cast.** When `qkv_w_bf16` is
-    // present (production lane via `LoadedNomicBertWeights::load`), slice
-    // it directly into Q/K/V BF16 sub-views and dispatch
-    // `bert_linear_bf16_gpu` (no per-call cast, no per-call BF16 alloc).
-    // Eliminates 3 × 12 = 36 cast dispatches per request for the QKV
-    // step alone. Falls back to F32 path when BF16 is absent (test
-    // scaffolding only). Slice math: BF16 is 2 bytes/elem so per-block
-    // byte offsets are half the F32 ones, while element counts stay
-    // the same.
-    //
-    // **Iter 80 enabling fix (mlx-native v0.4.3+):** `MlxBuffer::slice_view`
-    // now propagates `byte_offset` through `KernelArg::Buffer` (was
-    // hardcoded 0 pre-fix), making the documented slice contract honored
-    // end-to-end through the matmul kernel.
-    let weight_elems_per_block = (hidden as usize) * (hidden as usize);
-    let weight_bytes_per_block_f32 = weight_elems_per_block * 4;
-    let weight_bytes_per_block_bf16 = weight_elems_per_block * 2;
-
-    let q_w = tensors.qkv_w.slice_view(0, weight_elems_per_block);
-    let k_w = tensors
-        .qkv_w
-        .slice_view(weight_bytes_per_block_f32 as u64, weight_elems_per_block);
-    let v_w = tensors.qkv_w.slice_view(
-        (2 * weight_bytes_per_block_f32) as u64,
-        weight_elems_per_block,
-    );
-
-    // Optional bias also slices three ways (each is `[hidden]` of the
-    // `[3*hidden]` fused bias). nomic-embed-text-v1.5 has none, but a
-    // future variant might.
-    let (q_b, k_b, v_b) = match tensors.qkv_b {
-        None => (None, None, None),
-        Some(qkvb) => {
-            let q = qkvb.slice_view(0, hidden as usize);
-            let k = qkvb.slice_view((hidden as usize * 4) as u64, hidden as usize);
-            let v = qkvb.slice_view((2 * hidden as usize * 4) as u64, hidden as usize);
-            (Some(q), Some(k), Some(v))
-        }
-    };
-    let q_b_ref = q_b.as_ref();
-    let k_b_ref = k_b.as_ref();
-    let v_b_ref = v_b.as_ref();
-
-    // Dispatch QKV via BF16 fast path when pre-cast is available; else
-    // F32 (the cast happens inside bert_linear_gpu per-call).
-    let (q_proj, k_proj, v_proj) = if let Some(qkv_bf16) = tensors.qkv_w_bf16 {
-        let q_w_bf16 = qkv_bf16.slice_view(0, weight_elems_per_block);
-        let k_w_bf16 =
-            qkv_bf16.slice_view(weight_bytes_per_block_bf16 as u64, weight_elems_per_block);
-        let v_w_bf16 = qkv_bf16.slice_view(
-            (2 * weight_bytes_per_block_bf16) as u64,
-            weight_elems_per_block,
-        );
-        // Iter-87 perf: Q/K/V matmuls all read `input` and write to
-        // disjoint output buffers (q_proj, k_proj, v_proj). No RAW
-        // hazard between them — Metal's MTLDispatchType::Concurrent
-        // can overlap their execution. The single barrier AFTER V is
-        // sufficient: it gates the RoPE/attention reads of all three
-        // outputs that follow. Removing the inter-QKV barriers lets
-        // the GPU schedule the three matmuls concurrently when
-        // hardware resources allow.
-        let q = bert_linear_bf16_gpu(
-            encoder, registry, device, input, &q_w_bf16, q_b_ref, seq_len, hidden, hidden,
-        )
-        .context("nomic block: q_proj bf16 linear")?;
-        let k = bert_linear_bf16_gpu(
-            encoder, registry, device, input, &k_w_bf16, k_b_ref, seq_len, hidden, hidden,
-        )
-        .context("nomic block: k_proj bf16 linear")?;
-        let v = bert_linear_bf16_gpu(
-            encoder, registry, device, input, &v_w_bf16, v_b_ref, seq_len, hidden, hidden,
-        )
-        .context("nomic block: v_proj bf16 linear")?;
-        encoder.memory_barrier();
-        (q, k, v)
-    } else {
-        let q = bert_linear_gpu(
-            encoder, registry, device, input, &q_w, q_b_ref, seq_len, hidden, hidden,
-        )
-        .context("nomic block: q_proj linear (f32 fallback)")?;
-        let k = bert_linear_gpu(
-            encoder, registry, device, input, &k_w, k_b_ref, seq_len, hidden, hidden,
-        )
-        .context("nomic block: k_proj linear (f32 fallback)")?;
-        let v = bert_linear_gpu(
-            encoder, registry, device, input, &v_w, v_b_ref, seq_len, hidden, hidden,
-        )
-        .context("nomic block: v_proj linear (f32 fallback)")?;
-        encoder.memory_barrier();
-        (q, k, v)
-    };
+    // ---- 1. Native Q/K/V projections over zero-copy stored-row views ----
+    // A full-matrix dispatch plus activation copies was measured slower for
+    // the packed Q4_0 production shape. Three projection dispatches retain
+    // the single mapped tensor without expanding or copying its bytes.
+    let (q_proj, k_proj, v_proj) = split_qkv_native_gpu(
+        encoder,
+        registry,
+        device,
+        input,
+        tensors.qkv_w,
+        tensors.qkv_b,
+        seq_len,
+        hidden,
+    )
+    .context("nomic block: native QKV projections")?;
 
     // ---- 2. RoPE-NeoX on Q and K (V unrotated) ----
     //
@@ -717,33 +761,18 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     encoder.memory_barrier();
 
     // ---- 4. Output projection ----
-    let attn_proj = if let Some(o_w_bf16) = tensors.o_w_bf16 {
-        bert_linear_bf16_gpu(
-            encoder,
-            registry,
-            device,
-            &attn_out,
-            o_w_bf16,
-            tensors.o_b,
-            seq_len,
-            hidden,
-            hidden,
-        )
-        .context("nomic block: attention output bf16 projection")?
-    } else {
-        bert_linear_gpu(
-            encoder,
-            registry,
-            device,
-            &attn_out,
-            tensors.o_w,
-            tensors.o_b,
-            seq_len,
-            hidden,
-            hidden,
-        )
-        .context("nomic block: attention output projection (f32 fallback)")?
-    };
+    let attn_proj = bert_linear_native_gpu(
+        encoder,
+        registry,
+        device,
+        &attn_out,
+        tensors.o_w,
+        tensors.o_b,
+        seq_len,
+        hidden,
+        hidden,
+    )
+    .context("nomic block: native attention output projection")?;
     encoder.memory_barrier();
 
     // ---- 5. Fused residual + post-attention LayerNorm ----
@@ -785,61 +814,31 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     // gate_proj). No RAW between them — Metal can overlap the two
     // matmuls. Single barrier AFTER both gates the silu_mul read of
     // both outputs that follows.
-    let up_proj = if let Some(up_w_bf16) = tensors.up_w_bf16 {
-        bert_linear_bf16_gpu(
-            encoder,
-            registry,
-            device,
-            &after_attn_norm,
-            up_w_bf16,
-            tensors.up_b,
-            seq_len,
-            hidden,
-            intermediate,
-        )
-        .context("nomic block: ffn_up bf16 linear")?
-    } else {
-        bert_linear_gpu(
-            encoder,
-            registry,
-            device,
-            &after_attn_norm,
-            tensors.up_w,
-            tensors.up_b,
-            seq_len,
-            hidden,
-            intermediate,
-        )
-        .context("nomic block: ffn_up linear (f32 fallback)")?
-    };
+    let up_proj = bert_linear_native_gpu(
+        encoder,
+        registry,
+        device,
+        &after_attn_norm,
+        tensors.up_w,
+        tensors.up_b,
+        seq_len,
+        hidden,
+        intermediate,
+    )
+    .context("nomic block: native ffn_up linear")?;
 
-    let gate_proj = if let Some(gate_w_bf16) = tensors.gate_w_bf16 {
-        bert_linear_bf16_gpu(
-            encoder,
-            registry,
-            device,
-            &after_attn_norm,
-            gate_w_bf16,
-            tensors.gate_b,
-            seq_len,
-            hidden,
-            intermediate,
-        )
-        .context("nomic block: ffn_gate bf16 linear")?
-    } else {
-        bert_linear_gpu(
-            encoder,
-            registry,
-            device,
-            &after_attn_norm,
-            tensors.gate_w,
-            tensors.gate_b,
-            seq_len,
-            hidden,
-            intermediate,
-        )
-        .context("nomic block: ffn_gate linear (f32 fallback)")?
-    };
+    let gate_proj = bert_linear_native_gpu(
+        encoder,
+        registry,
+        device,
+        &after_attn_norm,
+        tensors.gate_w,
+        tensors.gate_b,
+        seq_len,
+        hidden,
+        intermediate,
+    )
+    .context("nomic block: native ffn_gate linear")?;
     encoder.memory_barrier();
 
     let silu_gated = device
@@ -871,33 +870,18 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     .map_err(|e| anyhow!("nomic block: silu_mul: {e}"))?;
     encoder.memory_barrier();
 
-    let down_proj = if let Some(down_w_bf16) = tensors.down_w_bf16 {
-        bert_linear_bf16_gpu(
-            encoder,
-            registry,
-            device,
-            &silu_gated,
-            down_w_bf16,
-            tensors.down_b,
-            seq_len,
-            intermediate,
-            hidden,
-        )
-        .context("nomic block: ffn_down bf16 linear")?
-    } else {
-        bert_linear_gpu(
-            encoder,
-            registry,
-            device,
-            &silu_gated,
-            tensors.down_w,
-            tensors.down_b,
-            seq_len,
-            intermediate,
-            hidden,
-        )
-        .context("nomic block: ffn_down linear (f32 fallback)")?
-    };
+    let down_proj = bert_linear_native_gpu(
+        encoder,
+        registry,
+        device,
+        &silu_gated,
+        tensors.down_w,
+        tensors.down_b,
+        seq_len,
+        intermediate,
+        hidden,
+    )
+    .context("nomic block: native ffn_down linear")?;
     encoder.memory_barrier();
 
     // ---- 7. Fused residual + post-FFN LayerNorm ----
@@ -1026,7 +1010,7 @@ pub fn apply_nomic_bert_full_forward_gpu(
         None
     };
 
-    let mut hidden_states = nomic_bert_embeddings_gpu(
+    let mut hidden_states = nomic_bert_embeddings_native_gpu(
         encoder,
         registry,
         device,
@@ -1057,23 +1041,18 @@ pub fn apply_nomic_bert_full_forward_gpu(
     // ---- N encoder blocks ----
     for layer_idx in 0..cfg.num_hidden_layers {
         let tensors = NomicBertEncoderBlockTensors {
-            qkv_w: weights.block_required(layer_idx, "attn_qkv.weight")?,
+            qkv_w: weights.block_matrix(layer_idx, "attn_qkv.weight")?,
             qkv_b: weights.block_optional(layer_idx, "attn_qkv.bias"),
-            qkv_w_bf16: weights.block_weight_bf16(layer_idx, "attn_qkv.weight"),
-            o_w: weights.block_required(layer_idx, "attn_output.weight")?,
+            o_w: weights.block_matrix(layer_idx, "attn_output.weight")?,
             o_b: weights.block_optional(layer_idx, "attn_output.bias"),
-            o_w_bf16: weights.block_weight_bf16(layer_idx, "attn_output.weight"),
             attn_norm_gamma: weights.block_required(layer_idx, "attn_output_norm.weight")?,
             attn_norm_beta: weights.block_required(layer_idx, "attn_output_norm.bias")?,
-            up_w: weights.block_required(layer_idx, "ffn_up.weight")?,
+            up_w: weights.block_matrix(layer_idx, "ffn_up.weight")?,
             up_b: weights.block_optional(layer_idx, "ffn_up.bias"),
-            up_w_bf16: weights.block_weight_bf16(layer_idx, "ffn_up.weight"),
-            gate_w: weights.block_required(layer_idx, "ffn_gate.weight")?,
+            gate_w: weights.block_matrix(layer_idx, "ffn_gate.weight")?,
             gate_b: weights.block_optional(layer_idx, "ffn_gate.bias"),
-            gate_w_bf16: weights.block_weight_bf16(layer_idx, "ffn_gate.weight"),
-            down_w: weights.block_required(layer_idx, "ffn_down.weight")?,
+            down_w: weights.block_matrix(layer_idx, "ffn_down.weight")?,
             down_b: weights.block_optional(layer_idx, "ffn_down.bias"),
-            down_w_bf16: weights.block_weight_bf16(layer_idx, "ffn_down.weight"),
             ffn_norm_gamma: weights.block_required(layer_idx, "layer_output_norm.weight")?,
             ffn_norm_beta: weights.block_required(layer_idx, "layer_output_norm.bias")?,
         };
@@ -1165,6 +1144,72 @@ pub(crate) mod tests {
             pooling_type: PoolingType::Mean,
             rope_freq_base: 1000.0,
             causal_attention: false,
+        }
+    }
+
+    #[test]
+    fn native_qkv_uses_three_zero_copy_projection_views() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let hidden = 64usize;
+        let rows = 2usize;
+        let mut input = device
+            .alloc_buffer(rows * hidden * 4, DType::F32, vec![rows, hidden])
+            .expect("input");
+        for (index, value) in input.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+            *value = (index as f32 + 1.0) / 128.0;
+        }
+        let mut weight = device
+            .alloc_buffer(
+                3 * hidden * hidden * 4,
+                DType::F32,
+                vec![3 * hidden, hidden],
+            )
+            .expect("weight");
+        weight.as_mut_slice::<f32>().unwrap().fill(0.0);
+        for projection in 0..3 {
+            for column in 0..hidden {
+                let output_row = projection * hidden + column;
+                weight.as_mut_slice::<f32>().unwrap()[output_row * hidden + column] =
+                    (projection + 1) as f32;
+            }
+        }
+        let qweight = crate::inference::models::bert::native_storage::f32_qweight_for_test(
+            weight,
+            3 * hidden,
+            hidden,
+        );
+        let mut registry = KernelRegistry::new();
+        register_nomic_bert_kernels(&mut registry);
+        mlx_native::reset_counters();
+        let mut encoder = device.command_encoder().expect("encoder");
+        let (q, k, v) = split_qkv_native_gpu(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input,
+            &qweight,
+            None,
+            rows as u32,
+            hidden as u32,
+        )
+        .expect("native QKV");
+        assert_eq!(
+            mlx_native::dispatch_count(),
+            3,
+            "contract is three native matrix dispatches over zero-copy stored-row views"
+        );
+        encoder.commit_and_wait().expect("complete");
+        let source = input.as_slice::<f32>().unwrap();
+        for (projection, output) in [(1.0, q), (2.0, k), (3.0, v)] {
+            for (actual, expected) in output
+                .as_slice::<f32>()
+                .unwrap()
+                .iter()
+                .zip(source.iter().map(|value| value * projection))
+            {
+                assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+            }
         }
     }
 
@@ -1291,7 +1336,7 @@ pub(crate) mod tests {
         // The helper pre-casts the supplied tensors through this handle.
         // Clone the owner so its queue and residency set match the buffers.
         let weights_device = device.clone();
-        let weights = LoadedNomicBertWeights::from_tensors_for_test(tensors, weights_device);
+        let weights = LoadedNomicBertWeights::from_tensors_for_test(tensors, &cfg, weights_device);
 
         // 32 input ids in vocab range [0, 100).
         let seq_len: u32 = 32;
@@ -1387,7 +1432,7 @@ pub(crate) mod tests {
         // Match the owning device even on this precondition-only path; the
         // test helper pre-casts linear tensors before the forward rejects.
         let weights_device = device.clone();
-        let weights = LoadedNomicBertWeights::from_tensors_for_test(tensors, weights_device);
+        let weights = LoadedNomicBertWeights::from_tensors_for_test(tensors, &cfg, weights_device);
 
         let seq_len: u32 = 32;
         let input_ids = device

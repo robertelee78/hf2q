@@ -27,12 +27,25 @@ use crate::serve::multi_model::{
 use crate::serve::quant_select::QuantType;
 
 const HF2Q_RUNTIME_SCHEMA: &str = "hf2q.runtime.v1";
-const HF2Q_ACTIVATION_SCHEMA: &str = "hf2q.model-activation.v2";
+pub(super) const HF2Q_ACTIVATION_SCHEMA: &str = "hf2q.model-activation.v3";
+
+pub(super) fn control_helper_executable() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("HF2Q_TEST_CONTROL_HELPER_BIN") {
+        return Ok(path.into());
+    }
+    std::env::current_exe()
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelActivationRequest {
     pub model: String,
+    /// Lifecycle domain. Omitted requests retain the historical generative
+    /// pool behavior; dedicated encoder replacement is never inferred from a
+    /// GGUF architecture or model name.
+    #[serde(default)]
+    pub kind: ModelActivationKind,
     /// Opaque server-issued id for an exact revision/size/SHA artifact.
     #[serde(default)]
     pub candidate_id: Option<String>,
@@ -43,18 +56,30 @@ pub struct ModelActivationRequest {
     pub victims: Vec<ModelActivationVictim>,
 }
 
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelActivationKind {
+    #[default]
+    Generation,
+    Embedding,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct HubGgufCatalogQuery {
     pub model: String,
+    #[serde(default)]
+    pub kind: ModelActivationKind,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub struct LocalGgufCatalogQuery {
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub kind: ModelActivationKind,
 }
 
-#[derive(Debug, Default, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelActivationAction {
     #[default]
@@ -71,7 +96,9 @@ pub struct ModelActivationVictim {
     pub generation: u64,
 }
 
-fn normalize_hub_repository(model: &str) -> std::result::Result<Option<String>, Response> {
+pub(super) fn normalize_hub_repository(
+    model: &str,
+) -> std::result::Result<Option<String>, Response> {
     let model = model.trim();
     if !model.contains("://") && !auto_pipeline::looks_like_hf_repo_id(model) {
         return Ok(None);
@@ -160,6 +187,7 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
         .metrics
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let embedding = state.embedding_model_snapshot();
     let manager = match state.pool.read() {
         Ok(manager) => manager,
         Err(_) => return ApiError::internal_error().into_response(),
@@ -194,6 +222,8 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
                 },
                 "explicit_revision_bound_switch": true,
                 "request_generation_leases": true,
+                "explicit_embedding_activation_kind": true,
+                "embedding_generation_leases": true,
             },
             "pool": {
                 "revision": stats.revision,
@@ -202,7 +232,8 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
                 "total_resident_bytes": stats.total_resident_bytes,
                 "memory_budget_bytes": stats.memory_budget_bytes,
                 "resident": resident,
-            }
+            },
+            "embedding": super::embedding_activation::snapshot_json(&embedding),
         })),
     )
         .into_response()
@@ -260,7 +291,14 @@ pub async fn local_gguf_catalog(
         Err(_) => return ApiError::internal_error().into_response(),
     };
     match state.artifact_catalog.register_local(catalog) {
-        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Ok(mut view) => {
+            let role = match query.kind {
+                ModelActivationKind::Generation => "text_model",
+                ModelActivationKind::Embedding => "embedding_model",
+            };
+            view.candidates.retain(|candidate| candidate.role == role);
+            (StatusCode::OK, Json(view)).into_response()
+        }
         Err(_) => ApiError::internal_error().into_response(),
     }
 }
@@ -304,7 +342,7 @@ pub async fn hub_gguf_catalog(
         }
         Err(_) => return ApiError::internal_error().into_response(),
     };
-    let executable = match std::env::current_exe() {
+    let executable = match control_helper_executable() {
         Ok(executable) => executable,
         Err(_) => return ApiError::internal_error().into_response(),
     };
@@ -343,13 +381,40 @@ pub async fn hub_gguf_catalog(
         )
         .into_response();
     }
-    let catalog: crate::input::hf_download::HubGgufCatalog =
+    let mut catalog: crate::input::hf_download::HubGgufCatalog =
         match serde_json::from_slice(&output.stdout) {
             Ok(catalog) => catalog,
             Err(_) => return ApiError::internal_error().into_response(),
         };
     if catalog.schema_version != "hf2q.hub-gguf-catalog.v2" {
         return ApiError::internal_error().into_response();
+    }
+    for artifact in &mut catalog.artifacts {
+        let supported = match query.kind {
+            ModelActivationKind::Generation => artifact
+                .quant_hint
+                .as_deref()
+                .is_some_and(|quant| QuantType::from_canonical_str(quant).is_ok()),
+            ModelActivationKind::Embedding => artifact
+                .quant_hint
+                .as_deref()
+                .is_some_and(embedding_catalog_quant_supported),
+        };
+        artifact.selectable &= supported;
+        artifact.role = match query.kind {
+            ModelActivationKind::Generation => "text_model".into(),
+            ModelActivationKind::Embedding => "embedding_model".into(),
+        };
+        if !supported && artifact.unavailable_reason.is_none() {
+            artifact.unavailable_reason = Some(match query.kind {
+                ModelActivationKind::Generation => {
+                    "GGUF quant is not supported by the generative activation domain".into()
+                }
+                ModelActivationKind::Embedding => {
+                    "GGUF quant has no direct native embedding execution route".into()
+                }
+            });
+        }
     }
     match state.artifact_catalog.register_hosted(catalog) {
         Ok(view) => (StatusCode::OK, Json(view)).into_response(),
@@ -381,6 +446,12 @@ fn diagnostic_quant_from_file_type(file_type: u32) -> Option<QuantType> {
     QuantType::from_gguf_file_type(file_type)
 }
 
+fn embedding_catalog_quant_supported(quant: &str) -> bool {
+    crate::quantize::ggml_quants::GgufFtype::from_name(&quant.to_ascii_lowercase()).is_some_and(
+        crate::inference::models::bert::native_storage::native_embedding_file_type_supported,
+    )
+}
+
 struct ActivationTarget {
     repo: String,
     quant: QuantType,
@@ -394,6 +465,14 @@ impl ActivationTarget {
         match &self.payload {
             ActivationPayload::VerifiedLocal(artifact) => Some(&artifact.path),
             _ => None,
+        }
+    }
+
+    fn known_local_path(&self) -> Option<&std::path::Path> {
+        match &self.payload {
+            ActivationPayload::ExplicitLocal(path) => Some(path),
+            ActivationPayload::VerifiedLocal(artifact) => Some(&artifact.path),
+            ActivationPayload::Hosted(_) => None,
         }
     }
 }
@@ -465,21 +544,14 @@ impl ActivationTarget {
     }
 }
 
-async fn verify_local_gguf_cancellable(
+pub(super) async fn verify_local_gguf_cancellable(
     artifact: &super::local_artifacts::LocalGgufArtifact,
     cancellation: super::cancellation::CancellationSignal,
     supervisor: super::cancellation::PreparationSupervisor,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> std::result::Result<std::path::PathBuf, Response> {
     let executable =
-        std::env::current_exe().map_err(|_| ApiError::internal_error().into_response())?;
-    let quant = artifact.quant.ok_or_else(|| {
-        ApiError::invalid_request(
-            "selected local artifact has no supported quant",
-            Some("artifact".into()),
-        )
-        .into_response()
-    })?;
+        control_helper_executable().map_err(|_| ApiError::internal_error().into_response())?;
     let mut command = tokio::process::Command::new(executable);
     command
         .arg("__verify-local-gguf")
@@ -491,8 +563,8 @@ async fn verify_local_gguf_cancellable(
         .arg(artifact.bytes.to_string())
         .arg("--sha256")
         .arg(&artifact.sha256)
-        .arg("--quant")
-        .arg(quant.as_str());
+        .arg("--file-type")
+        .arg(artifact.file_type.to_string());
     let output = run_preparation_command(
         command,
         cancellation,
@@ -531,14 +603,14 @@ async fn verify_local_gguf_cancellable(
     Ok(receipt.path)
 }
 
-async fn fetch_hub_gguf_cancellable(
+pub(super) async fn fetch_hub_gguf_cancellable(
     artifact: &crate::input::hf_download::HubGgufArtifact,
     cancellation: super::cancellation::CancellationSignal,
     supervisor: super::cancellation::PreparationSupervisor,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> std::result::Result<std::path::PathBuf, Response> {
     let executable =
-        std::env::current_exe().map_err(|_| ApiError::internal_error().into_response())?;
+        control_helper_executable().map_err(|_| ApiError::internal_error().into_response())?;
     let quant = artifact.quant_hint.as_deref().ok_or_else(|| {
         ApiError::invalid_request("selected artifact has no quant", Some("artifact".into()))
             .into_response()
@@ -558,6 +630,8 @@ async fn fetch_hub_gguf_cancellable(
         &artifact.sha256,
         "--quant",
         quant,
+        "--role",
+        &artifact.role,
     ]);
     let output = run_preparation_command(
         command,
@@ -792,8 +866,10 @@ fn lifecycle_error_response(error: LifecycleError) -> Response {
         .into_response()
 }
 
-/// Non-evicting diagnostic activation, plus an explicit revision-bound switch
-/// action. Ordinary OpenAI requests retain ADR-005 auto-swap semantics.
+/// Non-evicting diagnostic activation, plus explicit revision/generation-bound
+/// switches. The omitted kind is the historical generative pool; dedicated
+/// encoder replacement requires `kind=embedding` and is never inferred.
+/// Ordinary OpenAI requests retain ADR-005 auto-swap semantics.
 pub async fn activate_model(
     State(state): State<AppState>,
     Extension(cancellation): Extension<RequestCancellation>,
@@ -803,6 +879,10 @@ pub async fn activate_model(
         .metrics
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    if request.kind == ModelActivationKind::Embedding {
+        return super::embedding_activation::activate(state, cancellation, request).await;
+    }
 
     let normalized_hub = match normalize_hub_repository(&request.model) {
         Ok(repository) => repository,
@@ -1258,6 +1338,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn activation_kind_is_explicit_and_generation_remains_the_default() {
+        let default: ModelActivationRequest =
+            serde_json::from_value(serde_json::json!({"model":"model.gguf"}))
+                .expect("legacy activation request");
+        assert_eq!(default.kind, ModelActivationKind::Generation);
+
+        let embedding: ModelActivationRequest = serde_json::from_value(serde_json::json!({
+            "model":"encoder.gguf",
+            "kind":"embedding",
+            "action":"switch",
+            "expected_revision":7
+        }))
+        .expect("explicit embedding activation request");
+        assert_eq!(embedding.kind, ModelActivationKind::Embedding);
+        assert_eq!(embedding.action, ModelActivationAction::Switch);
+        assert_eq!(embedding.expected_revision, Some(7));
+
+        assert!(
+            serde_json::from_value::<ModelActivationRequest>(serde_json::json!({
+                "model":"encoder.gguf",
+                "kind":"bert"
+            }))
+            .is_err(),
+            "family names must not heuristically select the embedding lifecycle"
+        );
+    }
+
+    #[test]
     fn canonical_hugging_face_base_url_normalizes_to_repository_id() {
         assert_eq!(
             normalize_hub_repository("https://huggingface.co/owner/model").unwrap(),
@@ -1311,7 +1419,9 @@ mod tests {
                     bytes: 12,
                     sha256: "b".repeat(64),
                     quant_hint: "Q4_K_M".into(),
+                    file_type: 15,
                     quant: Some(QuantType::Q4_K_M),
+                    role: "text_model".into(),
                     selectable: true,
                     unavailable_reason: None,
                     provenance:

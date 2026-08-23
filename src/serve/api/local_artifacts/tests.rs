@@ -28,6 +28,27 @@ fn write_q4_k_m_gguf(path: &Path) {
     write_quant_gguf(path, 15);
 }
 
+fn write_embedding_gguf(path: &Path, file_type: u32, arch: &str) {
+    let file_type_key = b"general.file_type";
+    let arch_key = b"general.architecture";
+    let mut gguf = Vec::new();
+    gguf.extend_from_slice(b"GGUF");
+    gguf.extend_from_slice(&3_u32.to_le_bytes());
+    gguf.extend_from_slice(&0_u64.to_le_bytes());
+    gguf.extend_from_slice(&2_u64.to_le_bytes());
+    gguf.extend_from_slice(&(file_type_key.len() as u64).to_le_bytes());
+    gguf.extend_from_slice(file_type_key);
+    gguf.extend_from_slice(&4_u32.to_le_bytes());
+    gguf.extend_from_slice(&file_type.to_le_bytes());
+    gguf.extend_from_slice(&(arch_key.len() as u64).to_le_bytes());
+    gguf.extend_from_slice(arch_key);
+    gguf.extend_from_slice(&8_u32.to_le_bytes());
+    gguf.extend_from_slice(&(arch.len() as u64).to_le_bytes());
+    gguf.extend_from_slice(arch.as_bytes());
+    gguf.resize(256, 0);
+    fs::write(path, gguf).unwrap();
+}
+
 fn receipt_for(artifact: &Path, repository: &str) -> ConversionReceipt {
     ConversionReceipt {
         schema_version: CONVERSION_RECEIPT_SCHEMA_VERSION,
@@ -123,6 +144,49 @@ fn qwen38_bf16_receipt_is_selectable_with_exact_header_identity() {
 }
 
 #[test]
+fn q4_0_bert_receipt_is_an_exact_embedding_candidate() {
+    let root = tempfile::tempdir().unwrap();
+    let artifact = root.path().join("bge-small-q4_0.gguf");
+    write_embedding_gguf(&artifact, 2, "bert");
+    let mut receipt = receipt_for(&artifact, "owner/bert-model");
+    receipt.quant_selector = "q4_0".into();
+    write_receipt(&artifact, &receipt);
+
+    let catalog = LocalArtifactInventory::for_test(vec![root.path().to_path_buf()])
+        .discover(Some("owner/bert-model"), None);
+    assert_eq!(catalog.artifacts.len(), 1);
+    let artifact = &catalog.artifacts[0];
+    assert_eq!(artifact.file_type, 2);
+    assert_eq!(artifact.quant, None);
+    assert_eq!(artifact.role, "embedding_model");
+    assert!(artifact.selectable);
+}
+
+#[test]
+fn unsupported_bert_embedding_codec_is_visible_but_not_selectable() {
+    let root = tempfile::tempdir().unwrap();
+    let artifact = root.path().join("bert-q3_k_m.gguf");
+    let file_type = u32::from(
+        crate::quantize::ggml_quants::GgufFtype::from_name("q3_k_m").expect("Q3_K_M ftype"),
+    );
+    write_embedding_gguf(&artifact, file_type, "bert");
+    let mut receipt = receipt_for(&artifact, "owner/bert-model");
+    receipt.quant_selector = "q3_k_m".into();
+    write_receipt(&artifact, &receipt);
+
+    let catalog = LocalArtifactInventory::for_test(vec![root.path().to_path_buf()])
+        .discover(Some("owner/bert-model"), None);
+    assert_eq!(catalog.artifacts.len(), 1);
+    let artifact = &catalog.artifacts[0];
+    assert_eq!(artifact.role, "embedding_model");
+    assert!(!artifact.selectable);
+    assert!(artifact
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("direct native embedding")));
+}
+
+#[test]
 fn stale_size_wrong_repo_and_symlinks_never_become_candidates() {
     let root = tempfile::tempdir().unwrap();
     let wrong_repo = root.path().join("wrong.gguf");
@@ -169,7 +233,12 @@ fn recorded_output_path_is_never_dereferenced() {
 fn unsupported_receipt_quant_is_visible_but_not_selectable() {
     let root = tempfile::tempdir().unwrap();
     let artifact = root.path().join("model-iq3_xxs.gguf");
-    write_q4_k_m_gguf(&artifact);
+    write_quant_gguf(
+        &artifact,
+        u32::from(
+            crate::quantize::ggml_quants::GgufFtype::from_name("iq3_xxs").expect("IQ3_XXS ftype"),
+        ),
+    );
     let mut receipt = receipt_for(&artifact, "owner/model");
     receipt.quant_selector = "iq3_xxs".into();
     write_receipt(&artifact, &receipt);
@@ -183,7 +252,7 @@ fn unsupported_receipt_quant_is_visible_but_not_selectable() {
         .unavailable_reason
         .as_deref()
         .unwrap()
-        .contains("mlx-native"));
+        .contains("generative"));
 }
 
 #[test]
@@ -236,7 +305,7 @@ fn verifier_rejects_post_catalog_digest_and_quant_changes() {
         artifact: &artifact,
         bytes,
         sha256: &sha,
-        quant: QuantType::Q4_K_M,
+        file_type: QuantType::Q4_K_M.gguf_file_type(),
     })
     .unwrap();
 
@@ -251,7 +320,7 @@ fn verifier_rejects_post_catalog_digest_and_quant_changes() {
         artifact: &artifact,
         bytes,
         sha256: &sha,
-        quant: QuantType::Q4_K_M,
+        file_type: QuantType::Q4_K_M.gguf_file_type(),
     })
     .unwrap_err();
     assert!(error.to_string().contains("SHA-256"));

@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::convert::receipt::{ConversionReceipt, CONVERSION_RECEIPT_SCHEMA_VERSION};
+use crate::quantize::ggml_quants::GgufFtype;
 use crate::serve::cache::{cache_model_path, CacheManifest, ModelEntry};
 use crate::serve::quant_select::QuantType;
 
@@ -62,7 +63,12 @@ pub struct LocalGgufArtifact {
     pub bytes: u64,
     pub sha256: String,
     pub quant_hint: String,
+    /// Exact `general.file_type` retained from the receipt-bound GGUF header.
+    /// This is broader than the generative pool's [`QuantType`] identity
+    /// because native embedding artifacts also admit F16/BF16/Q4_0.
+    pub file_type: u32,
     pub quant: Option<QuantType>,
+    pub role: String,
     pub selectable: bool,
     pub unavailable_reason: Option<String>,
     pub provenance: LocalArtifactProvenance,
@@ -333,26 +339,40 @@ fn inspect_receipt(
     // `output.path` is deliberately not dereferenced: receipts are movable
     // beside their exact digest-bound GGUF. The sibling filename, root
     // containment, size, and deferred SHA authority define activation.
-    let receipt_quant = QuantType::from_canonical_str(&receipt.quant_selector).ok();
     let quant_hint = bounded_quant_hint(&receipt.quant_selector)?;
-    let (quant, selectable, unavailable_reason) = match receipt_quant {
-        Some(expected) => {
-            let header = mlx_native::gguf::GgufFile::open(&canonical)
-                .context("cannot parse supported GGUF header")?;
-            let actual = header
-                .metadata_u32("general.file_type")
-                .and_then(quant_from_file_type);
-            if actual != Some(expected) {
-                bail!("receipt quant does not match GGUF header");
-            }
-            (Some(expected), true, None)
-        }
-        None => (
-            None,
-            false,
-            Some("GGUF quant is not supported by the current mlx-native diagnostic loader".into()),
-        ),
-    };
+    let expected_ftype = GgufFtype::from_name(&receipt.quant_selector.to_ascii_lowercase())
+        .context("receipt quant selector has no exact GGUF file type")?;
+    let expected_file_type = u32::from(expected_ftype);
+    let header = mlx_native::gguf::GgufFile::open(&canonical)
+        .context("cannot parse supported GGUF header")?;
+    let file_type = header
+        .metadata_u32("general.file_type")
+        .context("GGUF has no general.file_type")?;
+    if file_type != expected_file_type {
+        bail!("receipt quant does not match GGUF header");
+    }
+    let arch = header.metadata_string("general.architecture").unwrap_or("");
+    let embedding = matches!(arch, "bert" | "nomic-bert");
+    let quant = QuantType::from_gguf_file_type(file_type);
+    let (role, selectable, unavailable_reason) =
+        if embedding {
+            let supported = crate::inference::models::bert::native_storage::
+                native_embedding_file_type_supported(expected_ftype);
+            (
+                "embedding_model".to_owned(),
+                supported,
+                (!supported)
+                    .then(|| "GGUF quant has no direct native embedding execution route".into()),
+            )
+        } else if quant.is_some() {
+            ("text_model".to_owned(), true, None)
+        } else {
+            (
+                "text_model".to_owned(),
+                false,
+                Some("GGUF quant is not supported by the generative diagnostic loader".into()),
+            )
+        };
     Ok(Some(LocalGgufArtifact {
         repository: receipt.source.repository_id,
         revision: receipt.source.revision.to_ascii_lowercase(),
@@ -362,7 +382,9 @@ fn inspect_receipt(
         bytes: receipt.output.size,
         sha256: receipt.output.sha256.to_ascii_lowercase(),
         quant_hint,
+        file_type,
         quant,
+        role,
         selectable,
         unavailable_reason,
         provenance: LocalArtifactProvenance::ConversionReceipt,
@@ -451,7 +473,9 @@ fn discover_cache_model(
                 bytes: entry.bytes,
                 sha256: entry.sha256.to_ascii_lowercase(),
                 quant_hint: quant.as_str().to_owned(),
+                file_type: quant.gguf_file_type(),
                 quant: Some(quant),
+                role: "text_model".into(),
                 selectable: true,
                 unavailable_reason: None,
                 provenance: LocalArtifactProvenance::ManagedCache,

@@ -53,12 +53,11 @@ use crate::debug::INVESTIGATION_ENV;
 /// Build a `KernelRegistry` with every shader the embedding forward
 /// path needs registered AND compiled. One warmup forward is run
 /// against the loaded weights so every `get_pipeline()` call hits the
-/// cache thereafter. Returns the warmed registry; caller wraps it in
-/// `Arc<Mutex<>>` and stashes in `AppState::embedding_registry` so
-/// per-request handlers reuse the cached pipelines instead of paying
-/// ~150 ms of shader-compile cost on every `/v1/embeddings` call.
+/// cache thereafter. The returned registry becomes part of the same
+/// `EmbeddingModel` generation as its tokenizer and mapped weights.
 fn build_warmed_embedding_registry(
-    em: &api::state::EmbeddingModel,
+    arch: &api::state::EmbeddingArch,
+    tokenizer: &crate::inference::models::bert::BertWpmTokenizer,
 ) -> Result<mlx_native::KernelRegistry> {
     use crate::inference::models::bert::bert_gpu::{
         apply_bert_full_forward_gpu, register_bert_custom_shaders,
@@ -69,11 +68,6 @@ fn build_warmed_embedding_registry(
     use api::state::EmbeddingArch;
     use mlx_native::{DType, KernelRegistry, MlxDevice};
 
-    let arch = em
-        .arch
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("registry warmup: EmbeddingModel has no arch"))?;
-
     let device =
         MlxDevice::new().map_err(|e| anyhow::anyhow!("registry warmup: MlxDevice::new: {e}"))?;
     let mut registry = KernelRegistry::new();
@@ -83,7 +77,7 @@ fn build_warmed_embedding_registry(
     // kernel through one full forward so all pipelines compile. Using
     // pad_id (which is in-vocab) keeps gather happy.
     let seq_len: u32 = 32;
-    let pad_id = em.tokenizer.specials().pad;
+    let pad_id = tokenizer.specials().pad;
     let ids: Vec<u32> = vec![pad_id; seq_len as usize];
     let ids_buf = device
         .alloc_buffer((seq_len as usize) * 4, DType::U32, vec![seq_len as usize])
@@ -141,6 +135,107 @@ fn build_warmed_embedding_registry(
     );
 
     Ok(registry)
+}
+
+pub(crate) fn load_embedding_model_from_path(
+    emb_path: &Path,
+) -> Result<api::state::EmbeddingModel> {
+    let total_started = std::time::Instant::now();
+    anyhow::ensure!(
+        emb_path.exists(),
+        "Embedding model not found: {}",
+        emb_path.display()
+    );
+    let gguf = mlx_native::gguf::GgufFile::open(emb_path)
+        .map_err(|e| anyhow::anyhow!("Embedding GGUF header parse failed: {e}"))?;
+    let arch_str = gguf
+        .metadata_string("general.architecture")
+        .ok_or_else(|| anyhow::anyhow!("Embedding GGUF missing general.architecture"))?
+        .to_string();
+    let vocab = crate::inference::models::bert::BertVocab::from_gguf(&gguf)
+        .map_err(|e| anyhow::anyhow!("Embedding GGUF vocab parse failed: {e}"))?;
+    let tokenizer = crate::inference::models::bert::BertWpmTokenizer::new(&vocab);
+    let model_id = emb_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "embedding-model".into());
+    let device = mlx_native::MlxDevice::new()
+        .map_err(|e| anyhow::anyhow!("create MlxDevice for embedding load: {e}"))?;
+
+    let arch = match arch_str.as_str() {
+        "bert" => {
+            let config = crate::inference::models::bert::BertConfig::from_gguf(&gguf)
+                .map_err(|e| anyhow::anyhow!("BERT GGUF config parse failed: {e}"))?;
+            let weights = crate::inference::models::bert::weights::LoadedBertWeights::load(
+                &gguf, &config, device,
+            )
+            .map_err(|e| anyhow::anyhow!("BERT weights load failed: {e}"))?;
+            tracing::info!(
+                path = %emb_path.display(),
+                arch = "bert",
+                hidden = config.hidden_size,
+                layers = config.num_hidden_layers,
+                pooling = ?config.pooling_type,
+                vocab_size = vocab.len(),
+                tensor_count = weights.len(),
+                storage = ?weights.storage_stats(),
+                "Loaded native embedding model"
+            );
+            api::state::EmbeddingArch::Bert {
+                config,
+                weights: std::sync::Arc::new(weights),
+            }
+        }
+        "nomic-bert" => {
+            let config = crate::inference::models::nomic_bert::NomicBertConfig::from_gguf(&gguf)
+                .map_err(|e| anyhow::anyhow!("nomic-bert GGUF config parse failed: {e}"))?;
+            let weights = crate::inference::models::nomic_bert::LoadedNomicBertWeights::load(
+                &gguf, &config, device,
+            )
+            .map_err(|e| anyhow::anyhow!("nomic-bert weights load failed: {e}"))?;
+            tracing::info!(
+                path = %emb_path.display(),
+                arch = "nomic-bert",
+                hidden = config.hidden_size,
+                layers = config.num_hidden_layers,
+                pooling = ?config.pooling_type,
+                rope_freq_base = config.rope_freq_base,
+                vocab_size = vocab.len(),
+                tensor_count = weights.len(),
+                storage = ?weights.storage_stats(),
+                "Loaded native embedding model"
+            );
+            api::state::EmbeddingArch::NomicBert {
+                config,
+                weights: std::sync::Arc::new(weights),
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "embedding GGUF general.architecture='{other}' is not supported; expected 'bert' or 'nomic-bert'. File: {}",
+                emb_path.display()
+            );
+        }
+    };
+    let weight_load_elapsed = total_started.elapsed();
+    let warm_started = std::time::Instant::now();
+    let registry =
+        build_warmed_embedding_registry(&arch, &tokenizer).context("warm embedding registry")?;
+    let registry_warm_elapsed = warm_started.elapsed();
+    let total_elapsed = total_started.elapsed();
+    Ok(api::state::EmbeddingModel {
+        gguf_path: emb_path.to_path_buf(),
+        vocab: std::sync::Arc::new(vocab),
+        tokenizer: std::sync::Arc::new(tokenizer),
+        model_id,
+        registry: std::sync::Arc::new(std::sync::Mutex::new(registry)),
+        load_timing: api::state::EmbeddingLoadTiming {
+            weight_load_elapsed,
+            registry_warm_elapsed,
+            total_elapsed,
+        },
+        arch: Some(arch),
+    })
 }
 
 /// Resolve a tokenizer sidecar for legacy paths that still consume one.
@@ -4947,118 +5042,11 @@ pub fn cmd_serve(
         );
     }
 
-    // --- Optionally validate + load the BERT embedding model config ---
-    // Decision: load config only (header parse), NOT weights. Per
-    // ADR-005 Phase 2b iter 16: the forward pass that consumes weights
-    // lands when live-model validation is possible (OOM-blocked today).
-    // The startup failure path still works: a bad GGUF at this path fails
-    // the server boot cleanly.
-    let embedding_model = if let Some(emb_path) = args.embedding_model.as_ref() {
-        anyhow::ensure!(
-            emb_path.exists(),
-            "Embedding model not found: {}",
-            emb_path.display()
-        );
-        let gguf = mlx_native::gguf::GgufFile::open(emb_path)
-            .map_err(|e| anyhow::anyhow!("Embedding GGUF header parse failed: {e}"))?;
-
-        // Sniff the architecture so we dispatch the correct loader +
-        // forward path. Per ADR-005 Phase 2b: bge/mxbai are arch="bert"
-        // (separate Q/K/V, position_embd, GeLU MLP, optionally CLS pool);
-        // nomic-embed-text-v1.5 is arch="nomic-bert" (fused QKV, RoPE,
-        // SwiGLU, Mean pool — see `inference::models::nomic_bert`).
-        let arch_str = gguf
-            .metadata_string("general.architecture")
-            .ok_or_else(|| anyhow::anyhow!("Embedding GGUF missing general.architecture"))?
-            .to_string();
-
-        // Vocab + tokenizer are shared across the BERT family — both
-        // archs serialize their WPM vocab the same way per the peer's
-        // WPM tokenizer. Iter-79 cross-lane
-        // edit added bos→cls / eos→sep fallbacks so nomic GGUFs parse
-        // through the BertVocab path unchanged.
-        let vocab = crate::inference::models::bert::BertVocab::from_gguf(&gguf)
-            .map_err(|e| anyhow::anyhow!("Embedding GGUF vocab parse failed: {e}"))?;
-        let tokenizer = crate::inference::models::bert::BertWpmTokenizer::new(&vocab);
-        let model_id = emb_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "embedding-model".into());
-
-        let device = mlx_native::MlxDevice::new()
-            .map_err(|e| anyhow::anyhow!("create MlxDevice for embedding load: {e}"))?;
-
-        let arch = match arch_str.as_str() {
-            "bert" => {
-                let cfg = crate::inference::models::bert::BertConfig::from_gguf(&gguf)
-                    .map_err(|e| anyhow::anyhow!("BERT GGUF config parse failed: {e}"))?;
-                crate::inference::models::bert::weights::validate_tensor_set(&gguf, &cfg)
-                    .map_err(|e| anyhow::anyhow!("BERT GGUF tensor validation: {e}"))?;
-                let weights = crate::inference::models::bert::weights::LoadedBertWeights::load(
-                    &gguf, &cfg, device,
-                )
-                .map_err(|e| anyhow::anyhow!("BERT weights load failed: {e}"))?;
-                tracing::info!(
-                    path = %emb_path.display(),
-                    arch = "bert",
-                    hidden = cfg.hidden_size,
-                    layers = cfg.num_hidden_layers,
-                    pooling = ?cfg.pooling_type,
-                    vocab_size = vocab.len(),
-                    tensor_count = weights.len(),
-                    "Validated embedding GGUF + loaded weights onto device"
-                );
-                api::state::EmbeddingArch::Bert {
-                    config: cfg,
-                    weights: std::sync::Arc::new(weights),
-                }
-            }
-            "nomic-bert" => {
-                let cfg =
-                    crate::inference::models::nomic_bert::NomicBertConfig::from_gguf(&gguf)
-                        .map_err(|e| anyhow::anyhow!("nomic-bert GGUF config parse failed: {e}"))?;
-                crate::inference::models::nomic_bert::validate_tensor_set(&gguf, &cfg)
-                    .map_err(|e| anyhow::anyhow!("nomic-bert GGUF tensor validation: {e}"))?;
-                let weights = crate::inference::models::nomic_bert::LoadedNomicBertWeights::load(
-                    &gguf, &cfg, device,
-                )
-                .map_err(|e| anyhow::anyhow!("nomic-bert weights load failed: {e}"))?;
-                tracing::info!(
-                    path = %emb_path.display(),
-                    arch = "nomic-bert",
-                    hidden = cfg.hidden_size,
-                    layers = cfg.num_hidden_layers,
-                    pooling = ?cfg.pooling_type,
-                    rope_freq_base = cfg.rope_freq_base,
-                    vocab_size = vocab.len(),
-                    tensor_count = weights.len(),
-                    "Validated embedding GGUF + loaded weights onto device"
-                );
-                api::state::EmbeddingArch::NomicBert {
-                    config: cfg,
-                    weights: std::sync::Arc::new(weights),
-                }
-            }
-            other => {
-                anyhow::bail!(
-                    "embedding GGUF general.architecture='{other}' is not supported. \
-                     Phase 2b day-one models: 'bert' (bge / mxbai) and 'nomic-bert' \
-                     (nomic-embed-text-v1.5). File: {}",
-                    emb_path.display()
-                );
-            }
-        };
-
-        Some(api::state::EmbeddingModel {
-            gguf_path: emb_path.clone(),
-            vocab: std::sync::Arc::new(vocab),
-            tokenizer: std::sync::Arc::new(tokenizer),
-            model_id,
-            arch: Some(arch),
-        })
-    } else {
-        None
-    };
+    let embedding_model = args
+        .embedding_model
+        .as_deref()
+        .map(load_embedding_model_from_path)
+        .transpose()?;
 
     // --- Optionally validate + load the mmproj (multimodal projector) ---
     // Header parse only; weight loading lands alongside the ViT forward
@@ -5255,17 +5243,7 @@ pub fn cmd_serve(
     // (when supplied).  Here we attach the embedding model + mmproj
     // descriptors before the router takes ownership.
     if let Some(em) = embedding_model {
-        // Pre-warm a persistent kernel registry: register all kernels
-        // the arch needs + run one warmup forward against the loaded
-        // weights so every Metal pipeline compiles and caches before
-        // the first /v1/embeddings request. Eliminates the ~150 ms
-        // per-request shader-compile cost surfaced by iter-82
-        // benchmarking. Stashes the registry behind an Arc<Mutex<>>
-        // for handler dispatch.
-        let registry = build_warmed_embedding_registry(&em).context("warm embedding registry")?;
-        state = state
-            .with_embedding_model(em)
-            .with_embedding_registry(std::sync::Arc::new(std::sync::Mutex::new(registry)));
+        state = state.with_embedding_model(em);
     }
     if let Some(m) = mmproj {
         state = state.with_mmproj(m);

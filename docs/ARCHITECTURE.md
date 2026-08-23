@@ -161,6 +161,7 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   │   ├── cancellation.rs            request/root preparation + commit supervision
 │   │   ├── control.rs                 versioned diagnostic lifecycle and
 │   │   │                              metadata-only Hub GGUF catalog API
+│   │   ├── embedding_activation/      exact-candidate dedicated encoder activation
 │   │   ├── lifecycle.rs               generation leases + safe model switch
 │   │   ├── schema.rs                  OpenAI wire types
 │   │   ├── handlers.rs                /v1/* request handlers
@@ -422,14 +423,16 @@ markers.
 | `GET /hf2q/v1/runtime` | `control::hf2q_runtime` — versioned capabilities and pool state |
 | `GET /hf2q/v1/models/local-artifacts` | `control::local_gguf_catalog` — bounded server-local receipt/cache inventory with opaque activation IDs |
 | `GET /hf2q/v1/models/catalog` | `control::hub_gguf_catalog` — metadata-only hosted GGUF inventory |
-| `POST /hf2q/v1/models/activate` | `control::activate_model` — non-evicting load or explicit revision-bound switch |
+| `POST /hf2q/v1/models/activate` | `control::activate_model` — explicit-kind, exact-candidate load or revision-bound switch |
 | `POST /shutdown` | `handlers::shutdown` (auth-gated) |
 
 `AppState` (`serve/api/state.rs`) carries the engine handle, the
 multi-model registry, generation-bound request lifecycle coordinator, the
-embedding pool, and a warmed
-`KernelRegistry` for `/v1/embeddings` so handlers never pay
-shader-compile latency.
+dedicated generation-bound embedding slot, and its atomically owned model,
+tokenizer, native mappings, and warmed `KernelRegistry` for `/v1/embeddings`.
+An embedding replacement drops the complete old slot value before allocating
+the next generation, so tokenizer/registry state cannot cross a switch and
+the two model mappings are not intentionally co-resident.
 
 Middleware (`serve/api/middleware.rs`) layers CORS, optional Bearer
 auth, and request-id propagation. SSE encoding lives in

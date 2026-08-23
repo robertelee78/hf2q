@@ -1,12 +1,8 @@
 //! BERT GGUF weight loader (ADR-005 Phase 2b, Task #13).
 //!
-//! Reads every tensor from a parsed `GgufFile` onto the Metal device as
-//! F32 buffers, dequantizing Q-type tensors on the CPU first via
-//! `mlx_native::gguf::GgufFile::load_tensor_f32`. Mirrors the Phase 2c
-//! `LoadedMmprojWeights` pattern: arch-agnostic walk of
-//! `gguf.tensor_names()`, per-tensor `MlxBuffer`s keyed by GGUF name,
-//! shortcut accessors for the stem + per-block tensors that the encoder
-//! forward pass needs.
+//! Matrix tensors retain their exact GGUF bytes in file-backed Metal views.
+//! Only declared vector state (normalization parameters and biases) expands
+//! to F32.  Shape and kernel capability checks complete before mapping.
 //!
 //! # Sequencing
 //!
@@ -16,10 +12,9 @@
 //!    tensor name is present BEFORE the expensive load. Saves operators
 //!    from waiting through a multi-GB load only to fail on a missing
 //!    `blk.5.attn_q.weight`.
-//! 3. `LoadedBertWeights::load` — pull every tensor onto the device as
-//!    F32. Total cost dominated by file read + dequant; ~50–500 MB
-//!    depending on the model.
-//! 4. (future iter) `bert_forward.rs` — encoder forward pass + pooling.
+//! 3. `LoadedBertWeights::load` — map every matrix in its native GGUF
+//!    representation and expand only declared vector state to F32.
+//! 4. `bert_gpu.rs` — native encoder forward pass + pooling.
 //!
 //! # Day-one supported models (per ADR-005 Phase 2b)
 //!
@@ -27,11 +22,10 @@
 //! - `mxbai-embed-large-v1` (335M params, hidden=1024, layers=24)
 //! - `bge-small-en-v1.5` (33M params, hidden=384, layers=12)
 //!
-//! All three share the peer's `bert.*` GGUF metadata convention and
-//! the per-layer tensor names below. Variants (e.g. nomic's RoPE-based
-//! version of BERT, or mxbai's v2 with longer context) are validated as
-//! day-one models surface; the loader is structured so adding a new BERT
-//! variant is a tensor-set diff, not a rewrite.
+//! bge and mxbai share the `bert.*` GGUF metadata convention and the
+//! per-layer tensor names below. Nomic's RoPE/fused-QKV graph has its own
+//! explicit loader under `nomic_bert`; it is never approximated through this
+//! plain-BERT tensor catalog.
 //!
 //! # Optional tensors
 //!
@@ -42,14 +36,22 @@
 //! branch on presence. The required minimum is the LayerNorm + linear
 //! weight set that every BERT variant ships.
 
-#![allow(dead_code)] // forward pass + handler wiring lands in iter 56+
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use mlx_native::gguf::GgufFile;
+use mlx_native::metal::foreign_types::ForeignType;
 use mlx_native::{MlxBuffer, MlxDevice};
+
+use crate::serve::forward_mlx_shared::MlxQWeight;
+
+use super::native_storage::{
+    mapped_qweight, preflight_embedding, preflight_linear, preflight_state, MatrixPlan,
+    NativeStorageStats, StatePlan,
+};
 
 use super::config::{
     bert_layer_tensor, BertConfig, TENSOR_EMBED_NORM_BIAS, TENSOR_EMBED_NORM_WEIGHT,
@@ -145,17 +147,16 @@ pub fn validate_tensor_set(gguf: &GgufFile, cfg: &BertConfig) -> Result<()> {
 // LoadedBertWeights
 // ---------------------------------------------------------------------------
 
-/// Collection of BERT tensors loaded onto a Metal device as F32.
+/// BERT matrices retained as native mapped GGUF views plus explicit F32
+/// vector state.
 ///
-/// Cheap to move; cloning requires the caller to pay the GPU-alloc cost
-/// again (not implemented here — wrap in `Arc` at the call site if
-/// cheap-cloning is needed). Field access goes through the named
-/// shortcut methods; `get(name)` is the escape hatch for tensors not
-/// covered by a shortcut.
+/// Wrap one loaded generation in `Arc` for request sharing; reloading creates
+/// a fresh mapping and explicit state allocation. Field access goes through
+/// named shortcuts, with `get(name)` retained for diagnostics/tests.
 pub struct LoadedBertWeights {
-    /// Keyed by the tensor's GGUF name. Values are F32 `MlxBuffer`s
-    /// with shape preserved from the source GGUF.
-    tensors: HashMap<String, MlxBuffer>,
+    matrices: HashMap<String, MlxQWeight>,
+    states: HashMap<String, MlxBuffer>,
+    stats: NativeStorageStats,
     /// Device handle kept alive for the lifetime of the buffers. Held
     /// for RAII even though public accessors go through `tensors`.
     _device: MlxDevice,
@@ -164,29 +165,62 @@ pub struct LoadedBertWeights {
 impl std::fmt::Debug for LoadedBertWeights {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoadedBertWeights")
-            .field("tensor_count", &self.tensors.len())
+            .field("matrix_count", &self.matrices.len())
+            .field("state_count", &self.states.len())
+            .field("storage", &self.stats)
             .finish()
     }
 }
 
 impl LoadedBertWeights {
-    /// Load every tensor from the GGUF onto the supplied device as F32.
-    /// Arch-agnostic — walks `gguf.tensor_names()` rather than driving
-    /// off a hardcoded list, so optional tensors and any extra
-    /// debug-only tensors a producer might emit are loaded transparently.
-    /// Caller should run `validate_tensor_set` first to fail fast on a
-    /// missing required tensor.
-    pub fn load(gguf: &GgufFile, _cfg: &BertConfig, device: MlxDevice) -> Result<Self> {
-        let names = gguf.tensor_names();
-        let mut tensors = HashMap::with_capacity(names.len());
-        for name in &names {
-            let buf = gguf
-                .load_tensor_f32(*name, &device)
-                .map_err(|e| anyhow!("BERT load_tensor_f32('{}'): {e}", name))?;
-            tensors.insert((*name).to_string(), buf);
+    pub fn load(gguf: &GgufFile, cfg: &BertConfig, device: MlxDevice) -> Result<Self> {
+        validate_tensor_set(gguf, cfg)?;
+        let (matrix_plans, state_plans) = preflight_plans(gguf, cfg)?;
+
+        // This is the first payload operation. Every required name, shape,
+        // storage type, and execution regime has already passed above.
+        let mapped = gguf
+            .map_tensor_data(&device)
+            .map_err(|e| anyhow!("map BERT GGUF tensor payload: {e}"))?;
+        let mut matrices = HashMap::with_capacity(matrix_plans.len());
+        let mut mapped_resources = std::collections::HashSet::new();
+        let mut file_backed_bytes = 0u64;
+        for plan in &matrix_plans {
+            let info = gguf
+                .tensor_info(&plan.name)
+                .ok_or_else(|| anyhow!("BERT native tensor '{}' disappeared", plan.name))?;
+            let weight = mapped_qweight(plan, &mapped, info)
+                .map_err(|e| anyhow!("map BERT native tensor '{}': {e}", plan.name))?;
+            mapped_resources.insert(weight.buffer.metal_buffer().as_ptr() as usize);
+            file_backed_bytes = file_backed_bytes
+                .checked_add(plan.byte_len as u64)
+                .ok_or_else(|| anyhow!("BERT file-backed byte accounting overflow"))?;
+            matrices.insert(plan.name.clone(), weight);
         }
+
+        let mut states = HashMap::with_capacity(state_plans.len());
+        let mut anonymous_state_bytes = 0u64;
+        for plan in &state_plans {
+            let buffer = gguf
+                .load_tensor_f32(&plan.name, &device)
+                .map_err(|e| anyhow!("load BERT F32 state '{}': {e}", plan.name))?;
+            anonymous_state_bytes = anonymous_state_bytes
+                .checked_add((plan.elements as u64) * 4)
+                .ok_or_else(|| anyhow!("BERT state byte accounting overflow"))?;
+            states.insert(plan.name.clone(), buffer);
+        }
+        let resident_bytes = file_backed_bytes
+            .checked_add(anonymous_state_bytes)
+            .ok_or_else(|| anyhow!("BERT resident byte accounting overflow"))?;
         Ok(Self {
-            tensors,
+            matrices,
+            states,
+            stats: NativeStorageStats {
+                resident_bytes,
+                file_backed_bytes,
+                anonymous_state_bytes,
+                mapped_segment_count: mapped_resources.len(),
+            },
             _device: device,
         })
     }
@@ -208,7 +242,9 @@ impl LoadedBertWeights {
     /// returns `Err` on this instance; `get()` returns `None`.
     pub fn empty(device: MlxDevice) -> Self {
         Self {
-            tensors: HashMap::new(),
+            matrices: HashMap::new(),
+            states: HashMap::new(),
+            stats: NativeStorageStats::default(),
             _device: device,
         }
     }
@@ -224,25 +260,47 @@ impl LoadedBertWeights {
         tensors: HashMap<String, MlxBuffer>,
         device: MlxDevice,
     ) -> Self {
+        let mut matrices = HashMap::new();
+        let mut states = HashMap::new();
+        for (name, buffer) in tensors {
+            if buffer.shape().len() == 2 {
+                let rows = buffer.shape()[0];
+                let cols = buffer.shape()[1];
+                matrices.insert(
+                    name,
+                    super::native_storage::f32_qweight_for_test(buffer, rows, cols),
+                );
+            } else {
+                states.insert(name, buffer);
+            }
+        }
         Self {
-            tensors,
+            matrices,
+            states,
+            stats: NativeStorageStats::default(),
             _device: device,
         }
     }
 
     /// Total tensor count.
     pub fn len(&self) -> usize {
-        self.tensors.len()
+        self.matrices.len() + self.states.len()
     }
 
     /// Empty when no tensors loaded (only possible from `Self::empty`).
     pub fn is_empty(&self) -> bool {
-        self.tensors.is_empty()
+        self.matrices.is_empty() && self.states.is_empty()
     }
 
     /// Look up a tensor by exact GGUF name. `None` when absent.
     pub fn get(&self, name: &str) -> Option<&MlxBuffer> {
-        self.tensors.get(name)
+        self.states
+            .get(name)
+            .or_else(|| self.matrices.get(name).map(|weight| &weight.buffer))
+    }
+
+    pub fn storage_stats(&self) -> NativeStorageStats {
+        self.stats
     }
 
     // -----------------------------------------------------------------------
@@ -250,31 +308,31 @@ impl LoadedBertWeights {
     // so a forward-pass failure is debuggable from the log alone.
     // -----------------------------------------------------------------------
 
-    pub fn token_embd_weight(&self) -> Result<&MlxBuffer> {
-        self.tensors
+    pub fn token_embd_weight(&self) -> Result<&MlxQWeight> {
+        self.matrices
             .get(TENSOR_TOKEN_EMBD)
             .ok_or_else(|| anyhow!("BERT missing '{}'", TENSOR_TOKEN_EMBD))
     }
 
-    pub fn position_embd_weight(&self) -> Result<&MlxBuffer> {
-        self.tensors
+    pub fn position_embd_weight(&self) -> Result<&MlxQWeight> {
+        self.matrices
             .get(TENSOR_POS_EMBD)
             .ok_or_else(|| anyhow!("BERT missing '{}'", TENSOR_POS_EMBD))
     }
 
     /// Optional — returns `None` when the model has no segment table.
-    pub fn token_types_weight(&self) -> Option<&MlxBuffer> {
-        self.tensors.get(TENSOR_TOKEN_TYPES)
+    pub fn token_types_weight(&self) -> Option<&MlxQWeight> {
+        self.matrices.get(TENSOR_TOKEN_TYPES)
     }
 
     pub fn embed_norm_weight(&self) -> Result<&MlxBuffer> {
-        self.tensors
+        self.states
             .get(TENSOR_EMBED_NORM_WEIGHT)
             .ok_or_else(|| anyhow!("BERT missing '{}'", TENSOR_EMBED_NORM_WEIGHT))
     }
 
     pub fn embed_norm_bias(&self) -> Result<&MlxBuffer> {
-        self.tensors
+        self.states
             .get(TENSOR_EMBED_NORM_BIAS)
             .ok_or_else(|| anyhow!("BERT missing '{}'", TENSOR_EMBED_NORM_BIAS))
     }
@@ -286,7 +344,7 @@ impl LoadedBertWeights {
     /// Required per-block tensor (errors if missing).
     pub fn block_required(&self, layer_idx: usize, suffix: &str) -> Result<&MlxBuffer> {
         let key = bert_layer_tensor(layer_idx, suffix);
-        self.tensors
+        self.states
             .get(&key)
             .ok_or_else(|| anyhow!("BERT missing '{}'", key))
     }
@@ -295,8 +353,101 @@ impl LoadedBertWeights {
     /// bias-free model, or `attn_q.bias` on a fused-attention variant).
     pub fn block_optional(&self, layer_idx: usize, suffix: &str) -> Option<&MlxBuffer> {
         let key = bert_layer_tensor(layer_idx, suffix);
-        self.tensors.get(&key)
+        self.states.get(&key)
     }
+
+    pub fn block_matrix(&self, layer_idx: usize, suffix: &str) -> Result<&MlxQWeight> {
+        let key = bert_layer_tensor(layer_idx, suffix);
+        self.matrices
+            .get(&key)
+            .ok_or_else(|| anyhow!("BERT missing native matrix '{}'", key))
+    }
+}
+
+fn preflight_plans(gguf: &GgufFile, cfg: &BertConfig) -> Result<(Vec<MatrixPlan>, Vec<StatePlan>)> {
+    let h = cfg.hidden_size;
+    let i = cfg.intermediate_size;
+    let mut matrices = vec![
+        preflight_embedding(
+            gguf,
+            TENSOR_TOKEN_EMBD,
+            cfg.vocab_size,
+            h,
+            cfg.max_position_embeddings,
+        )?,
+        preflight_embedding(
+            gguf,
+            TENSOR_POS_EMBD,
+            cfg.max_position_embeddings,
+            h,
+            cfg.max_position_embeddings,
+        )?,
+    ];
+    if gguf.tensor_info(TENSOR_TOKEN_TYPES).is_some() {
+        matrices.push(preflight_embedding(
+            gguf,
+            TENSOR_TOKEN_TYPES,
+            cfg.type_vocab_size,
+            h,
+            cfg.max_position_embeddings,
+        )?);
+    }
+    let mut states = vec![
+        preflight_state(gguf, TENSOR_EMBED_NORM_WEIGHT, h)?,
+        preflight_state(gguf, TENSOR_EMBED_NORM_BIAS, h)?,
+    ];
+    for layer in 0..cfg.num_hidden_layers {
+        for suffix in [
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+        ] {
+            matrices.push(preflight_linear(
+                gguf,
+                bert_layer_tensor(layer, suffix),
+                h,
+                h,
+                cfg.max_position_embeddings,
+            )?);
+        }
+        matrices.push(preflight_linear(
+            gguf,
+            bert_layer_tensor(layer, "ffn_up.weight"),
+            i,
+            h,
+            cfg.max_position_embeddings,
+        )?);
+        matrices.push(preflight_linear(
+            gguf,
+            bert_layer_tensor(layer, "ffn_down.weight"),
+            h,
+            i,
+            cfg.max_position_embeddings,
+        )?);
+        for suffix in [
+            "attn_output_norm.weight",
+            "attn_output_norm.bias",
+            "layer_output_norm.weight",
+            "layer_output_norm.bias",
+        ] {
+            states.push(preflight_state(gguf, bert_layer_tensor(layer, suffix), h)?);
+        }
+        for (suffix, elements) in [
+            ("attn_q.bias", h),
+            ("attn_k.bias", h),
+            ("attn_v.bias", h),
+            ("attn_output.bias", h),
+            ("ffn_up.bias", i),
+            ("ffn_down.bias", h),
+        ] {
+            let name = bert_layer_tensor(layer, suffix);
+            if gguf.tensor_info(&name).is_some() {
+                states.push(preflight_state(gguf, name, elements)?);
+            }
+        }
+    }
+    Ok((matrices, states))
 }
 
 // ---------------------------------------------------------------------------

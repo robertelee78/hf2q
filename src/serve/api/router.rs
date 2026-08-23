@@ -580,8 +580,8 @@ mod tests {
 
     #[tokio::test]
     async fn embeddings_route_returns_400_when_no_embedding_model_loaded() {
-        // Server has no `--embedding-model` configured → embedding_config
-        // is None → handler must return `model_not_loaded` (400).
+        // Server has no `--embedding-model` configured, so the dedicated
+        // embedding slot is empty and the handler returns model_not_loaded.
         let app = build_router(state_default());
         let body = r#"{"model": "any", "input": "hello"}"#;
         let req = Request::builder()
@@ -599,6 +599,44 @@ mod tests {
         // 400-on-config-issue shape).
         assert_eq!(v["error"]["type"], "invalid_request_error");
         assert_eq!(v["error"]["code"], "model_not_loaded");
+    }
+
+    #[tokio::test]
+    async fn embedding_activation_rejects_bare_same_basename_artifacts() {
+        let app = build_router(state_default());
+        let root = tempfile::tempdir().unwrap();
+        let first_dir = root.path().join("first");
+        let second_dir = root.path().join("second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let first = first_dir.join("encoder.gguf");
+        let second = second_dir.join("encoder.gguf");
+        std::fs::write(&first, b"GGUF").unwrap();
+        std::fs::write(&second, b"GGUF").unwrap();
+
+        for path in [&first, &second] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/hf2q/v1/models/activate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": path,
+                        "kind": "embedding",
+                        "action": "load"
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = body_string(response).await;
+            assert!(body.contains("candidate_id"), "{body}");
+            assert!(
+                !body.contains(path.to_string_lossy().as_ref()),
+                "private local path leaked in rejection: {body}"
+            );
+        }
     }
 
     #[tokio::test]

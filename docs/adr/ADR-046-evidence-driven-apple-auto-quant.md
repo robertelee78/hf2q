@@ -6,7 +6,8 @@
 - Updated: 2026-08-22 — the current release boundary pins exact published
   `mlx-native = 0.12.1` (registry SHA-256
   `1ac31334d9d6c74286451a0860b029b527a45d9264098301f98cd866f9e1147e`),
-  including direct execution of packed Q4_0/Q5_K/Q6_K embedding rows and
+  source commit `6148d846752e749fd95f3168d1e5b6eb757d5325`, including
+  direct execution of packed Q4_0/Q5_K/Q6_K embedding rows and
   mapped GGUF tensor ownership; the first official source-teacher gate below
   remains historical evidence from exact `0.10.16`. The backend-independent
   exact-teacher target storage and model-free allocation binding cannot invoke
@@ -165,6 +166,84 @@ A1/B/A2 RSS was 2.938/22.027/3.110 GB and physical footprint was
 views at A1, absent at B, and visible again at A2; the B artifact was classified
 `anonymous_accounted` and absent after eviction. This final run used the
 published registry package and exact lock checksum above.
+
+### 2026-08-22 encoder native-storage amendment
+
+BERT and Nomic-BERT production inference now follows the same representation
+boundary required of generative families: every matrix, including token and
+position embeddings, stays in its exact GGUF representation. Loaders preflight
+the complete required tensor inventory, shapes, and execution capabilities for
+single-row, continuous-width, and prompt regimes before mapping the payload.
+The resulting `MlxQWeight` objects are file-backed and carry neither an affine
+overlay nor an expanded shadow. Only named one-dimensional biases and
+normalization state expand to F32 compute buffers. Unsupported matrix or
+embedding encodings fail during header preflight, before payload mapping or
+model-buffer allocation.
+
+The accepted direct embedding formats are F32, F16, BF16, Q4_0, Q8_0, Q2_K,
+Q4_K, Q5_K, and Q6_K. Q4_0 native gather comes from the published exact
+mlx-native revision above; no ignored local Cargo patch participates in the
+landing proof.
+
+The initial Nomic hypothesis was one full `[3h,h]` native QKV dispatch followed
+by three activation slices. A packed Q4_0 spike at `m=32`, `h=768`, after
+warmup, alternated 21 samples per arm and produced bit-identical Q/K/V outputs,
+but the medians were 696 microseconds fused versus 427 microseconds for three
+native zero-copy stored-row views. The full-matrix route was therefore
+falsified (62.9% slower) and removed. Production retains one mapped fused
+tensor and executes three native views without copying or expanding its bytes.
+
+Dedicated embedding-model lifecycle is also generation-bound. Model weights,
+tokenizer, and warmed kernel registry are one atomic slot value. A switch with
+a live request lease fails before calling the new loader; after drain, the old
+generation is dropped before the next loader may allocate. A loader failure
+leaves the dedicated slot configured but unavailable rather than restoring
+incompatible state or falling through to a chat-model embedding path. Logical
+byte accounting reports exactly the active generation. Activation is operator-
+reachable through `POST /hf2q/v1/models/activate` only when the request names
+`kind: "embedding"`; the default remains the generative pool, and architecture
+sniffing never changes lifecycle domains. A resident encoder returns a
+generation-bound conflict receipt before `action: "switch"` may replace it.
+Embedding load and switch mutations require the opaque `candidate_id` issued
+by an explicit `kind=embedding` catalog query; a bare local path is accepted
+only by the startup `--embedding-model` configuration. Candidate-driven
+residency is equality on the catalog-bound model identity, never on a file
+basename or an incidental payload path. A probe without `candidate_id` may
+inspect the explicitly configured startup path, but cannot mutate the slot.
+The receipt identifies the exact opaque revision/SHA authority without
+serializing its private path. Its timing milestones name `load_ready` as the
+end of native storage/config/tokenizer construction and `post_warm` as the end
+of the same generation's registry warm forward; component and transaction
+durations remain present for diagnosis.
+Exact embedding candidates retain GGUF file-type identity independently of
+the narrower generative `QuantType` enum, so Q4_0/F16/BF16 artifacts are not
+rejected merely because the text-engine pool does not expose those admission
+labels. Header architecture and native per-tensor capability preflight still
+fail unsupported artifacts before model-buffer allocation.
+The deterministic synthetic server gate performs HTTP embedding inference
+through A -> B -> fresh A, requires exact A replay, distinct B output,
+tokenizer and registry isolation, reclamation before each load, and records
+load plus switch-to-first-embedding latency. The mandatory real-model gate
+must drive every A -> B -> A leg through the public activation route using
+exact candidates converted by hf2q from pinned safetensors sources. It records
+first-semantic and steady HTTP embedding latency after each activation, and
+exercises an exact-candidate load failure, dedicated-slot unavailability, and
+explicit recovery. Direct invocation of the slot helper is not release
+evidence.
+
+The source-derived gate identities are fixed before measurement:
+
+- `BAAI/bge-small-en-v1.5` at
+  `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`, source safetensors SHA-256
+  `3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad`,
+  hf2q Q4_0 GGUF SHA-256
+  `1e55ff235dc9e7ea1d0fb1f5e588b3c774b316ba272365d668403b9e457549d6`;
+- `nomic-ai/nomic-embed-text-v1.5` at
+  `e9b6763023c676ca8431644204f50c2b100d9aab`, source safetensors SHA-256
+  `9e7d262b1fe5ea350782829496efa831901b77486bbde1cea54a4c822d010d5c`,
+  hf2q Q4_0 GGUF SHA-256
+  `99d5c1378a62669cd0b199ae0506b91f81600d438f0bcb0cab37c4e733078e6a`.
+  Neither gate GGUF was downloaded pre-quantized.
 
 ## Context
 

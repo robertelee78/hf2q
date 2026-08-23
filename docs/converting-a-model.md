@@ -50,6 +50,31 @@ Exactly one source is required:
 
 Run `hf2q convert --help` for the complete current flag surface.
 
+## Encoder embedding artifacts
+
+Build embedding GGUFs from pinned Hugging Face safetensors rather than
+downloading a pre-quantized artifact. These small canonical sources are the
+real-model gates for the BERT and Nomic-BERT native-storage paths:
+
+```bash
+hf2q convert \
+  https://huggingface.co/BAAI/bge-small-en-v1.5/tree/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a \
+  --quant q4_0 \
+  --output /opt/hf2q/models/bert-test/bge-small-en-v1.5-q4_0.gguf
+
+hf2q convert \
+  https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/tree/e9b6763023c676ca8431644204f50c2b100d9aab \
+  --quant q4_0 \
+  --output /opt/hf2q/models/bert-test/nomic-embed-text-v1.5-q4_0.gguf
+```
+
+Q4_0 matrix and embedding tensors remain packed and file-backed during
+serving; biases and normalization vectors expand to F32 compute state. Run the
+OpenAI SDK smoke with `EMBED_GGUF=<output> scripts/smoke_openai_sdk_embeddings.sh`.
+The Nomic artifact additionally runs through `scripts/bench_embedding.sh` via
+`NOMIC_GGUF=<output>`. Keep the revision and conversion receipt with every
+quality or latency result.
+
 ## Local and remote source classification
 
 An existing path, absolute path, `./...`, `../...`, `.` or `..` is local.

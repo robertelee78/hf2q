@@ -223,7 +223,7 @@ fn cmd_fetch_hub_gguf(args: cli::FetchHubGgufArgs) -> Result<(), AppError> {
         bytes: args.bytes,
         sha256: args.sha256,
         quant_hint: Some(args.quant),
-        role: "text_model".to_owned(),
+        role: args.role,
         selectable: true,
         unavailable_reason: None,
     };
@@ -245,15 +245,13 @@ fn cmd_catalog_hub_gguf(args: cli::CatalogHubGgufArgs) -> Result<(), AppError> {
 }
 
 fn cmd_verify_local_gguf(args: cli::VerifyLocalGgufArgs) -> Result<(), AppError> {
-    let quant = serve::quant_select::QuantType::from_canonical_str(&args.quant)
-        .map_err(|error| AppError::Input(anyhow::anyhow!(error)))?;
     let receipt = serve::api::local_artifacts::verify_local_artifact(
         serve::api::local_artifacts::LocalVerificationRequest {
             root: &args.root,
             artifact: &args.artifact,
             bytes: args.bytes,
             sha256: &args.sha256,
-            quant,
+            file_type: args.file_type,
         },
     )
     .map_err(AppError::Input)?;

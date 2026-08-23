@@ -112,6 +112,14 @@ pre-existing server. Local verification is bounded to one active child;
 metadata helpers and hosted transfers are independently bounded to two, and
 opaque activation selections expire after ten minutes.
 
+Embedding activation is explicit. Query either artifact route with
+`kind=embedding`, then call the activation route with `kind: "embedding"`, the
+returned `candidate_id`, and the exact `model` repository. `action: "switch"`
+also requires the resident embedding generation as `expected_revision`.
+Load/switch never accept a bare local path; `--embedding-model` is the
+startup-only path surface. Omitting `kind` preserves generative activation and
+never infers embedding behavior from a filename or architecture.
+
 Shell completion files are generated snapshots of the clap grammar. After
 upgrading from a build that predates `chat`, regenerate and re-source them with
 `hf2q completions --shell zsh` (or `bash`/`fish`).

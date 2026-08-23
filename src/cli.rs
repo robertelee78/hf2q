@@ -192,6 +192,8 @@ pub struct FetchHubGgufArgs {
     pub sha256: String,
     #[arg(long)]
     pub quant: String,
+    #[arg(long, default_value = "text_model")]
+    pub role: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -211,7 +213,7 @@ pub struct VerifyLocalGgufArgs {
     #[arg(long)]
     pub sha256: String,
     #[arg(long)]
-    pub quant: String,
+    pub file_type: u32,
 }
 
 #[derive(clap::Args, Debug, Clone)]
