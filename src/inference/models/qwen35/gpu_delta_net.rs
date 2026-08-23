@@ -458,11 +458,11 @@ fn qkv_channels_for(n_k_heads: u32, n_v_heads: u32, d_k: u32, d_v: u32) -> u32 {
 
 /// GPU-side weight handles for a single Qwen3.5 Gated DeltaNet layer.
 ///
-/// Large projection weights (attn_qkv, attn_gate, ssm_alpha, ssm_beta,
-/// ssm_out) are pre-cast to BF16 at load time to avoid per-inference
-/// F32→BF16 casts in `apply_proj` (previously ~69ms per token across
-/// 30 delta-net layers). Small weights (norms, conv, dt_bias, ssm_a)
-/// stay F32 because they are consumed by custom kernels that require F32.
+/// Production GGUF projection weights (attn_qkv, attn_gate, ssm_alpha,
+/// ssm_beta, ssm_out) retain their exact mapped artifact representation.
+/// Explicit synthetic constructors own their declared replacement buffers.
+/// Small weights (norms, conv, dt_bias, ssm_a) stay F32 because custom
+/// elementwise/state kernels require F32.
 /// `ssm_conv1d_gpu` is stored transposed relative to the CPU/GGUF format
 /// (see module-level layout notes).
 #[derive(Clone)]

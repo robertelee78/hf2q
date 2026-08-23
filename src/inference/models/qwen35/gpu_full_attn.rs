@@ -4159,7 +4159,7 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
     moe_weights: &super::gpu_ffn::MoeFfnWeightsGpuQ,
     shape: Qwen35TreeVerifyFullLayerShapeQMoe,
 ) -> Result<MlxBuffer> {
-    // ── STEP 0a: ggml_type + BF16 dtype validation (INV-QMoE-ggml-type-validation) ──
+    // ── STEP 0a: expert-codec + native dense metadata validation ──
     // MUST fire BEFORE shape.validate() — defense-in-depth ordering.
     if moe_weights.ggml_type_gate_up != GgmlType::Q4_0 {
         return Err(anyhow!(
@@ -4177,40 +4177,18 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
             moe_weights.ggml_type_down
         ));
     }
-    if moe_weights.router.dtype() != mlx_native::DType::BF16 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: router dtype must be BF16 \
-             (got {:?}). MoeFfnWeightsGpuQ::from_quantized always uploads router as BF16.",
-            moe_weights.router.dtype()
-        ));
-    }
-    if moe_weights.shared_gate_inp.dtype() != mlx_native::DType::BF16 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_gate_inp dtype must be BF16 \
-             (got {:?}).",
-            moe_weights.shared_gate_inp.dtype()
-        ));
-    }
-    if moe_weights.shared_gate.dtype() != mlx_native::DType::BF16 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_gate dtype must be BF16 \
-             (got {:?}).",
-            moe_weights.shared_gate.dtype()
-        ));
-    }
-    if moe_weights.shared_up.dtype() != mlx_native::DType::BF16 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_up dtype must be BF16 \
-             (got {:?}).",
-            moe_weights.shared_up.dtype()
-        ));
-    }
-    if moe_weights.shared_down.dtype() != mlx_native::DType::BF16 {
-        return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_down dtype must be BF16 \
-             (got {:?}).",
-            moe_weights.shared_down.dtype()
-        ));
+    for (name, weight) in [
+        ("router", &moe_weights.router),
+        ("shared_gate_inp", &moe_weights.shared_gate_inp),
+        ("shared_gate", &moe_weights.shared_gate),
+        ("shared_up", &moe_weights.shared_up),
+        ("shared_down", &moe_weights.shared_down),
+    ] {
+        if weight.affine.is_some() {
+            return Err(anyhow!(
+                "qwen35_tree_verify_full_layer_q_moe: {name} unexpectedly uses affine overlay metadata"
+            ));
+        }
     }
 
     // ── STEP 0b: Validate full-layer shape ───────────────────────────────
@@ -4222,19 +4200,13 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
     let m_sh = shape.moe.shared_intermediate_size as usize;
 
     // ── STEP 0c: shape↔weights cross-check (INV-QMoE-shape-weights-cross-check) ──
-    // Router: [num_experts, hidden_size] BF16 → element_count == num_experts * hidden_size.
-    let expected_router_elems = ne.checked_mul(h).ok_or_else(|| {
-        anyhow!("qwen35_tree_verify_full_layer_q_moe: router element count overflows usize")
-    })?;
-    if moe_weights.router.element_count() != expected_router_elems {
+    // Router and shared matrices retain their declared GGUF codec, so shape
+    // metadata—not encoded element_count—is authoritative.
+    if (moe_weights.router.info.rows, moe_weights.router.info.cols) != (ne, h) {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: router has {} BF16 elements, \
-             expected {} (num_experts={} * hidden_size={}). \
-             Shape and weights were built from different model configs.",
-            moe_weights.router.element_count(),
-            expected_router_elems,
-            ne,
-            h
+            "qwen35_tree_verify_full_layer_q_moe: router shape [{},{}] != [{ne},{h}]",
+            moe_weights.router.info.rows,
+            moe_weights.router.info.cols
         ));
     }
     if moe_weights.num_experts != shape.moe.num_experts {
@@ -4311,50 +4283,48 @@ pub fn qwen35_tree_verify_full_layer_q_moe(
             ne, h, m_moe, ne, h, down_blocks_per_row
         ));
     }
-    // Shared expert weight element counts (BF16 → element_count == num_BF16_elements).
-    // shared_gate_inp: [1, hidden_size] → h elements
-    if moe_weights.shared_gate_inp.element_count() != h {
+    if (
+        moe_weights.shared_gate_inp.info.rows,
+        moe_weights.shared_gate_inp.info.cols,
+    ) != (1, h)
+    {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_gate_inp has {} BF16 elements, \
-             expected {} (hidden_size={})",
-            moe_weights.shared_gate_inp.element_count(),
-            h,
-            h
+            "qwen35_tree_verify_full_layer_q_moe: shared_gate_inp shape [{},{}] != [1,{h}]",
+            moe_weights.shared_gate_inp.info.rows,
+            moe_weights.shared_gate_inp.info.cols
         ));
     }
-    // shared_gate: [shared_intermediate, hidden_size] → m_sh * h elements
-    let shared_proj_expected = m_sh.checked_mul(h).ok_or_else(|| {
-        anyhow!("qwen35_tree_verify_full_layer_q_moe: shared_gate element count overflows usize")
-    })?;
-    if moe_weights.shared_gate.element_count() != shared_proj_expected {
+    if (
+        moe_weights.shared_gate.info.rows,
+        moe_weights.shared_gate.info.cols,
+    ) != (m_sh, h)
+    {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_gate has {} BF16 elements, \
-             expected {} (shared_intermediate={} * hidden_size={})",
-            moe_weights.shared_gate.element_count(),
-            shared_proj_expected,
-            m_sh,
-            h
+            "qwen35_tree_verify_full_layer_q_moe: shared_gate shape [{},{}] != [{m_sh},{h}]",
+            moe_weights.shared_gate.info.rows,
+            moe_weights.shared_gate.info.cols
         ));
     }
-    if moe_weights.shared_up.element_count() != shared_proj_expected {
+    if (
+        moe_weights.shared_up.info.rows,
+        moe_weights.shared_up.info.cols,
+    ) != (m_sh, h)
+    {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_up has {} BF16 elements, \
-             expected {} (shared_intermediate={} * hidden_size={})",
-            moe_weights.shared_up.element_count(),
-            shared_proj_expected,
-            m_sh,
-            h
+            "qwen35_tree_verify_full_layer_q_moe: shared_up shape [{},{}] != [{m_sh},{h}]",
+            moe_weights.shared_up.info.rows,
+            moe_weights.shared_up.info.cols
         ));
     }
-    // shared_down: [hidden_size, shared_intermediate] → h * m_sh elements (same count)
-    if moe_weights.shared_down.element_count() != shared_proj_expected {
+    if (
+        moe_weights.shared_down.info.rows,
+        moe_weights.shared_down.info.cols,
+    ) != (h, m_sh)
+    {
         return Err(anyhow!(
-            "qwen35_tree_verify_full_layer_q_moe: shared_down has {} BF16 elements, \
-             expected {} (hidden_size={} * shared_intermediate={})",
-            moe_weights.shared_down.element_count(),
-            shared_proj_expected,
-            h,
-            m_sh
+            "qwen35_tree_verify_full_layer_q_moe: shared_down shape [{},{}] != [{h},{m_sh}]",
+            moe_weights.shared_down.info.rows,
+            moe_weights.shared_down.info.cols
         ));
     }
 
@@ -8498,6 +8468,17 @@ pub fn apply_gated_attn_layer_decode_batched_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_native_weight(
+        buffer: MlxBuffer,
+        ggml_type: GgmlType,
+        rows: usize,
+        cols: usize,
+    ) -> crate::serve::forward_mlx_shared::MlxQWeight {
+        crate::serve::forward_mlx_shared::MlxQWeight::from_test_buffer(
+            buffer, ggml_type, rows, cols,
+        )
+    }
 
     #[test]
     fn tq_decode_execution_buckets_pin_geometry_boundaries() {
@@ -14703,7 +14684,12 @@ mod tests {
         };
 
         let gpu_weights = super::super::gpu_ffn::MoeFfnWeightsGpuQ {
-            router: upload_bf16_from_f32(&router_f32, device).expect("upload router bf16"),
+            router: test_native_weight(
+                upload_bf16_from_f32(&router_f32, device).expect("upload router bf16"),
+                GgmlType::BF16,
+                ne,
+                h,
+            ),
             expert_gate_q: make_u8_buf(&gate_q4),
             expert_up_q: make_u8_buf(&up_q4),
             expert_down_q: make_u8_buf(&down_q4),
@@ -14713,11 +14699,30 @@ mod tests {
             expert_up_stride: gate_stride,
             expert_down_stride: down_stride,
             num_experts: ne as u32,
-            shared_gate_inp: upload_bf16_from_f32(&shared_gate_logit_f32, device)
-                .expect("sh_gate_inp"),
-            shared_gate: upload_bf16_from_f32(&shared_gate_f32, device).expect("sh_gate"),
-            shared_up: upload_bf16_from_f32(&shared_up_f32, device).expect("sh_up"),
-            shared_down: upload_bf16_from_f32(&shared_down_f32, device).expect("sh_down"),
+            shared_gate_inp: test_native_weight(
+                upload_bf16_from_f32(&shared_gate_logit_f32, device).expect("sh_gate_inp"),
+                GgmlType::BF16,
+                1,
+                h,
+            ),
+            shared_gate: test_native_weight(
+                upload_bf16_from_f32(&shared_gate_f32, device).expect("sh_gate"),
+                GgmlType::BF16,
+                m_sh,
+                h,
+            ),
+            shared_up: test_native_weight(
+                upload_bf16_from_f32(&shared_up_f32, device).expect("sh_up"),
+                GgmlType::BF16,
+                m_sh,
+                h,
+            ),
+            shared_down: test_native_weight(
+                upload_bf16_from_f32(&shared_down_f32, device).expect("sh_down"),
+                GgmlType::BF16,
+                h,
+                m_sh,
+            ),
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,
@@ -15112,13 +15117,13 @@ mod tests {
         };
 
         // Helper: build a MoeFfnWeightsGpuQ from base, substituting a single field.
-        let make_weights = |router: MlxBuffer,
+        let make_weights = |router: crate::serve::forward_mlx_shared::MlxQWeight,
                             expert_gate_q: MlxBuffer,
                             expert_up_q: MlxBuffer,
                             expert_down_q: MlxBuffer,
                             ggml_type_gate_up: GgmlType,
                             ggml_type_down: GgmlType,
-                            shared_gate_inp: MlxBuffer|
+                            shared_gate_inp: crate::serve::forward_mlx_shared::MlxQWeight|
          -> super::super::gpu_ffn::MoeFfnWeightsGpuQ {
             super::super::gpu_ffn::MoeFfnWeightsGpuQ {
                 router,
@@ -15209,11 +15214,11 @@ mod tests {
             );
         }
 
-        // neg_3: router uploaded as F32 (not BF16) → Err with 'router dtype must be BF16'.
+        // neg_3: router native-matrix metadata disagrees with the graph shape.
         {
             let router_f32_buf = upload_f32(&mk_rand(&mut seed, ne * h, 0.3), &device).unwrap();
             let bad_weights = make_weights(
-                router_f32_buf, // F32 instead of BF16
+                test_native_weight(router_f32_buf, GgmlType::F32, ne + 1, h),
                 base_moe_weights.expert_gate_q.clone(),
                 base_moe_weights.expert_up_q.clone(),
                 base_moe_weights.expert_down_q.clone(),
@@ -15238,10 +15243,7 @@ mod tests {
             )
             .unwrap_err();
             let msg = err.to_string();
-            assert!(
-                msg.contains("router dtype must be BF16"),
-                "neg_3: wrong message: {msg}"
-            );
+            assert!(msg.contains("router shape"), "neg_3: wrong message: {msg}");
         }
 
         // neg_4: shape.attn.hidden_size != router element count (shape=2048 but router=128*4=512).
@@ -15870,7 +15872,7 @@ mod tests {
         // by ~7 * scale (sentinel magnitude) on many elements.
         // We keep experts 0 and 1 with normal random weights.
         let routed_moe = super::super::gpu_ffn::MoeFfnWeightsGpuQ {
-            router: router_bf16,
+            router: test_native_weight(router_bf16, GgmlType::BF16, ne, h),
             expert_gate_q: base_moe.expert_gate_q.clone(),
             expert_up_q: base_moe.expert_up_q.clone(),
             expert_down_q: base_moe.expert_down_q.clone(),
@@ -15984,7 +15986,12 @@ mod tests {
             expert_up_stride: base_moe.expert_up_stride,
             expert_down_stride: base_moe.expert_down_stride,
             num_experts: base_moe.num_experts,
-            shared_gate_inp: upload_bf16_from_f32(&sh_gate_on_f32, &device).expect("sh_gate_on"),
+            shared_gate_inp: test_native_weight(
+                upload_bf16_from_f32(&sh_gate_on_f32, &device).expect("sh_gate_on"),
+                GgmlType::BF16,
+                1,
+                h,
+            ),
             shared_gate: base_moe.shared_gate.clone(),
             shared_up: base_moe.shared_up.clone(),
             shared_down: base_moe.shared_down.clone(),
@@ -16027,7 +16034,12 @@ mod tests {
             expert_up_stride: base_moe.expert_up_stride,
             expert_down_stride: base_moe.expert_down_stride,
             num_experts: base_moe.num_experts,
-            shared_gate_inp: upload_bf16_from_f32(&sh_gate_off_f32, &device).expect("sh_gate_off"),
+            shared_gate_inp: test_native_weight(
+                upload_bf16_from_f32(&sh_gate_off_f32, &device).expect("sh_gate_off"),
+                GgmlType::BF16,
+                1,
+                h,
+            ),
             shared_gate: base_moe.shared_gate.clone(),
             shared_up: base_moe.shared_up.clone(),
             shared_down: base_moe.shared_down.clone(),

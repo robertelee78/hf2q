@@ -381,9 +381,16 @@ fn mtp_shared_head_borrows_the_supplied_main_buffer_without_a_second_allocation(
         decode_record_q6k_m1: std::sync::OnceLock::new(),
     };
     let supplied_ptr = supplied.buffer.metal_buffer().as_ptr();
-    let mtp = load_mtp_weights_if_present_with_shared_head(&gguf, &cfg, &device, Some(&supplied))
-        .expect("supplied main head is valid")
-        .expect("MTP weights");
+    let mapped = gguf.map_tensor_data(&device).expect("map GGUF");
+    let mtp = load_mtp_weights_if_present_with_shared_head(
+        &gguf,
+        &mapped,
+        &cfg,
+        &device,
+        Some(&supplied),
+    )
+    .expect("supplied main head is valid")
+    .expect("MTP weights");
 
     assert_eq!(mtp.shared_head_head.metal_buffer().as_ptr(), supplied_ptr);
     assert_eq!(mtp.shared_head_head_ggml_type, GgmlType::Q8_0);

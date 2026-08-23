@@ -10,7 +10,8 @@
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use mlx_native::gguf::{GgufFile, TensorInfo};
 use mlx_native::{
-    GgmlCapabilityRequest, GgmlInvocation, GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
+    GgmlCapabilityRequest, GgmlExpertInputLayout, GgmlExpertShape, GgmlInvocation,
+    GgmlWorkloadClass, GGML_CAPABILITY_SCHEMA_VERSION,
 };
 
 use super::{Qwen35Config, Qwen35LayerKind, Qwen35Variant};
@@ -20,6 +21,22 @@ use contract::{
     admit_mtp_tensor_presence, admit_storage_for_role, Qwen35GgufPreflightReceipt, TensorRole,
     TensorStorage,
 };
+
+/// Every matrix width exercised by the production scheduler. Keep the
+/// non-power-of-two continuous/prompt widths and the first prompt width above
+/// 16 in
+/// preflight so admission cannot succeed on a narrower kernel contract than
+/// serving uses.
+const REQUIRED_MATRIX_WIDTHS: [(u32, GgmlWorkloadClass); 8] = [
+    (1, GgmlWorkloadClass::DecodeSingle),
+    (2, GgmlWorkloadClass::ContinuousWidth),
+    (3, GgmlWorkloadClass::ContinuousWidth),
+    (4, GgmlWorkloadClass::ContinuousWidth),
+    (8, GgmlWorkloadClass::ContinuousWidth),
+    (9, GgmlWorkloadClass::Prompt),
+    (16, GgmlWorkloadClass::Prompt),
+    (17, GgmlWorkloadClass::Prompt),
+];
 
 fn checked_tensor_bytes(info: &TensorInfo) -> Result<usize> {
     let (&inner, outer) = info
@@ -73,7 +90,7 @@ fn require_tensor<'a>(
         info.shape
     );
     admit_storage_for_role(name, role, TensorStorage::Parsed(info.ggml_type))?;
-    receipt.record(role, TensorStorage::Parsed(info.ggml_type));
+    receipt.record_tensor(role, TensorStorage::Parsed(info.ggml_type), expected_bytes)?;
     Ok(info)
 }
 
@@ -96,14 +113,7 @@ fn ensure_dense_capability(name: &str, info: &TensorInfo) -> Result<()> {
     };
     let n = u32::try_from(*rows).context("Qwen dense projection rows exceed u32")?;
     let k = u32::try_from(*cols).context("Qwen dense projection cols exceed u32")?;
-    for (m, workload) in [
-        (1, GgmlWorkloadClass::DecodeSingle),
-        (2, GgmlWorkloadClass::ContinuousWidth),
-        (4, GgmlWorkloadClass::ContinuousWidth),
-        (8, GgmlWorkloadClass::ContinuousWidth),
-        (16, GgmlWorkloadClass::Prompt),
-        (17, GgmlWorkloadClass::Prompt),
-    ] {
+    for (m, workload) in REQUIRED_MATRIX_WIDTHS {
         let capability = mlx_native::ggml_capability(GgmlCapabilityRequest {
             schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
             invocation: GgmlInvocation::DenseAuto { m, n, k },
@@ -212,6 +222,161 @@ fn require_dense_ffn(
         ensure_dense_capability(name, info)?;
     }
     Ok(())
+}
+
+fn ensure_expert_capability(
+    name: &str,
+    info: &TensorInfo,
+    n: usize,
+    k: usize,
+    top_k: u32,
+    n_experts: u32,
+    input_layout: GgmlExpertInputLayout,
+) -> Result<()> {
+    ensure!(n_experts > 0, "Qwen expert stack has zero experts");
+    ensure!(
+        info.byte_len % n_experts as usize == 0,
+        "Qwen expert tensor '{name}' byte length {} is not divisible by {n_experts} experts",
+        info.byte_len
+    );
+    let expert_stride_bytes = u64::try_from(info.byte_len / n_experts as usize)
+        .context("Qwen expert stride exceeds u64")?;
+    let n = u32::try_from(n).context("Qwen expert output rows exceed u32")?;
+    let k = u32::try_from(k).context("Qwen expert input cols exceed u32")?;
+    for (n_tokens, workload) in REQUIRED_MATRIX_WIDTHS {
+        let capability = mlx_native::ggml_capability(GgmlCapabilityRequest {
+            schema_version: GGML_CAPABILITY_SCHEMA_VERSION,
+            invocation: GgmlInvocation::ExpertPooled {
+                shape: GgmlExpertShape {
+                    n_tokens,
+                    n,
+                    k,
+                    top_k,
+                    n_experts,
+                    expert_stride_bytes,
+                    ids_are_distinct_per_token: true,
+                    ids_within_expert_range: true,
+                },
+                input_layout,
+            },
+            ggml_type: info.ggml_type,
+            workload,
+            routing: mlx_native::ggml_routing_policy_from_environment(),
+        });
+        ensure!(
+            capability.executable,
+            "Qwen GGUF preflight: expert tensor '{name}' type {:?} is not executable at M={n_tokens} ({workload:?}): {}",
+            info.ggml_type,
+            capability.diagnostic
+        );
+    }
+    Ok(())
+}
+
+fn require_moe_ffn(
+    gguf: &GgufFile,
+    cfg: &Qwen35Config,
+    layer_index: u32,
+    receipt: &mut Qwen35GgufPreflightReceipt,
+) -> Result<()> {
+    let moe = cfg
+        .moe
+        .as_ref()
+        .context("Qwen MoE GGUF preflight requires MoE configuration")?;
+    let p = format!("blk.{layer_index}");
+    let hidden = cfg.hidden_size as usize;
+    let experts = moe.num_experts as usize;
+    let expert = moe.moe_intermediate_size as usize;
+    let shared = moe.shared_expert_intermediate_size as usize;
+
+    require_projection(
+        gguf,
+        &format!("{p}.ffn_gate_inp.weight"),
+        &[experts, hidden],
+        receipt,
+    )?;
+    require_projection(
+        gguf,
+        &format!("{p}.ffn_gate_inp_shexp.weight"),
+        &[1, hidden],
+        receipt,
+    )?;
+    require_projection(
+        gguf,
+        &format!("{p}.ffn_gate_shexp.weight"),
+        &[shared, hidden],
+        receipt,
+    )?;
+    require_projection(
+        gguf,
+        &format!("{p}.ffn_up_shexp.weight"),
+        &[shared, hidden],
+        receipt,
+    )?;
+    require_projection(
+        gguf,
+        &format!("{p}.ffn_down_shexp.weight"),
+        &[hidden, shared],
+        receipt,
+    )?;
+
+    let gate_name = format!("{p}.ffn_gate_exps.weight");
+    let up_name = format!("{p}.ffn_up_exps.weight");
+    let down_name = format!("{p}.ffn_down_exps.weight");
+    let gate = require_tensor(
+        gguf,
+        &gate_name,
+        &[experts, expert, hidden],
+        TensorRole::ExpertStack,
+        receipt,
+    )?;
+    let up = require_tensor(
+        gguf,
+        &up_name,
+        &[experts, expert, hidden],
+        TensorRole::ExpertStack,
+        receipt,
+    )?;
+    let down = require_tensor(
+        gguf,
+        &down_name,
+        &[experts, hidden, expert],
+        TensorRole::ExpertStack,
+        receipt,
+    )?;
+    ensure!(
+        gate.ggml_type == up.ggml_type,
+        "Qwen GGUF preflight: layer {layer_index} expert gate/up codecs differ ({:?} vs {:?})",
+        gate.ggml_type,
+        up.ggml_type
+    );
+    ensure_expert_capability(
+        &gate_name,
+        gate,
+        expert,
+        hidden,
+        moe.num_experts_per_tok,
+        moe.num_experts,
+        GgmlExpertInputLayout::SharedPerToken,
+    )?;
+    ensure_expert_capability(
+        &up_name,
+        up,
+        expert,
+        hidden,
+        moe.num_experts_per_tok,
+        moe.num_experts,
+        GgmlExpertInputLayout::SharedPerToken,
+    )?;
+    ensure_expert_capability(
+        &down_name,
+        down,
+        hidden,
+        expert,
+        moe.num_experts_per_tok,
+        moe.num_experts,
+        GgmlExpertInputLayout::Slotted,
+    )
 }
 
 fn require_full_attention(
@@ -352,7 +517,6 @@ fn require_linear_attention(
 fn require_mtp(
     gguf: &GgufFile,
     cfg: &Qwen35Config,
-    intermediate: usize,
     receipt: &mut Qwen35GgufPreflightReceipt,
 ) -> Result<()> {
     ensure!(
@@ -408,21 +572,27 @@ fn require_mtp(
     }
 
     require_full_attention(gguf, cfg, layer, true, receipt)?;
-    require_dense_ffn(gguf, layer, hidden, intermediate, receipt)
+    match cfg.variant {
+        Qwen35Variant::Dense => require_dense_ffn(
+            gguf,
+            layer,
+            hidden,
+            cfg.intermediate_size
+                .context("dense Qwen MTP preflight requires feed_forward_length")?
+                as usize,
+            receipt,
+        ),
+        Qwen35Variant::Moe => require_moe_ffn(gguf, cfg, layer, receipt),
+    }
 }
 
-/// Validate every tensor consumed by the dense Qwen graph before creating a
+/// Validate every tensor consumed by the Qwen graph before creating a
 /// Metal device or reading any tensor payload.
-pub(super) fn preflight_dense_qwen35_gguf(gguf: &GgufFile, cfg: &Qwen35Config) -> Result<()> {
-    ensure!(
-        cfg.variant == Qwen35Variant::Dense,
-        "dense Qwen GGUF preflight received {:?}",
-        cfg.variant
-    );
+pub(super) fn preflight_qwen35_gguf(
+    gguf: &GgufFile,
+    cfg: &Qwen35Config,
+) -> Result<Qwen35GgufPreflightReceipt> {
     let hidden = cfg.hidden_size as usize;
-    let intermediate =
-        cfg.intermediate_size
-            .context("dense Qwen GGUF preflight requires feed_forward_length")? as usize;
     let mut receipt = Qwen35GgufPreflightReceipt::default();
 
     let embedding_rows = require_embedding(gguf, "token_embd.weight", hidden, &mut receipt)?;
@@ -466,22 +636,46 @@ pub(super) fn preflight_dense_qwen35_gguf(gguf: &GgufFile, cfg: &Qwen35Config) -
                 require_linear_attention(gguf, cfg, layer_index, &mut receipt)?
             }
         }
-        require_dense_ffn(gguf, layer_index, hidden, intermediate, &mut receipt)?;
+        match cfg.variant {
+            Qwen35Variant::Dense => require_dense_ffn(
+                gguf,
+                layer_index,
+                hidden,
+                cfg.intermediate_size
+                    .context("dense Qwen GGUF preflight requires feed_forward_length")?
+                    as usize,
+                &mut receipt,
+            )?,
+            Qwen35Variant::Moe => require_moe_ffn(gguf, cfg, layer_index, &mut receipt)?,
+        }
     }
 
     match cfg.mtp_num_hidden_layers {
         0 => {}
-        1 => require_mtp(gguf, cfg, intermediate, &mut receipt)?,
+        1 => require_mtp(gguf, cfg, &mut receipt)?,
         count => bail!("Qwen GGUF preflight supports at most one MTP layer, got {count}"),
     }
 
     tracing::debug!(
         required_tensors = receipt.required_tensor_count,
+        matrix_tensors = receipt.matrix_tensor_count,
+        matrix_bytes = receipt.matrix_bytes,
         roles = ?receipt.role_counts,
         storage = ?receipt.storage_counts,
-        "dense Qwen GGUF execution preflight passed"
+        variant = ?cfg.variant,
+        "Qwen GGUF execution preflight passed"
     );
-    Ok(())
+    Ok(receipt)
+}
+
+#[cfg(test)]
+pub(super) fn preflight_dense_qwen35_gguf(gguf: &GgufFile, cfg: &Qwen35Config) -> Result<()> {
+    ensure!(
+        cfg.variant == Qwen35Variant::Dense,
+        "dense Qwen GGUF preflight received {:?}",
+        cfg.variant
+    );
+    preflight_qwen35_gguf(gguf, cfg).map(|_| ())
 }
 
 #[cfg(test)]

@@ -64,7 +64,7 @@ use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
-use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
+use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
@@ -74,7 +74,7 @@ use mlx_native::ops::quantized_matmul_id_ggml::{
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
-use crate::serve::forward_mlx_shared::MlxAffineMoeStack;
+use crate::serve::forward_mlx_shared::{MlxAffineMoeStack, MlxQWeight};
 
 use super::execution_dispatch::{
     dense_gate_up_fusion_enabled, dense_q_arena_reset_enabled, dispatch_fused_gate_up_silu_iq4_nl,
@@ -396,11 +396,11 @@ impl MoeFfnWeightsGpu {
 ///   Q5_K+Q6_K path: ~0.78 GB per layer
 ///   Savings per layer: ~2.4 GB; across 40 MoE layers: ~96 GB
 ///
-/// Router (`[num_experts, hidden]`) and shared-expert weights are kept
-/// as F32 because they are small: router ≈ 2 MB, shared ≈ 8 MB.
+/// Router and shared-expert matrices retain their own declared GGUF codecs;
+/// production never expands them to F32 and uploads a BF16 shadow.
 pub struct MoeFfnWeightsGpuQ {
-    /// Router F32 projection: `[num_experts, hidden_size]`.
-    pub router: MlxBuffer,
+    /// Router projection: `[num_experts, hidden_size]`.
+    pub router: MlxQWeight,
     /// Stacked expert gate projections, raw GGML blocks.
     pub expert_gate_q: MlxBuffer,
     /// Stacked expert up projections, raw GGML blocks.
@@ -417,14 +417,14 @@ pub struct MoeFfnWeightsGpuQ {
     pub expert_down_stride: u64,
     /// Number of experts.
     pub num_experts: u32,
-    /// Shared-expert sigmoid gate: `[1, hidden_size]` F32.
-    pub shared_gate_inp: MlxBuffer,
-    /// Shared-expert gate_proj: `[shared_intermediate, hidden_size]` F32.
-    pub shared_gate: MlxBuffer,
-    /// Shared-expert up_proj: `[shared_intermediate, hidden_size]` F32.
-    pub shared_up: MlxBuffer,
-    /// Shared-expert down_proj: `[hidden_size, shared_intermediate]` F32.
-    pub shared_down: MlxBuffer,
+    /// Shared-expert sigmoid gate: `[1, hidden_size]` native matrix.
+    pub shared_gate_inp: MlxQWeight,
+    /// Shared-expert gate_proj: `[shared_intermediate, hidden_size]`.
+    pub shared_gate: MlxQWeight,
+    /// Shared-expert up_proj: `[shared_intermediate, hidden_size]`.
+    pub shared_up: MlxQWeight,
+    /// Shared-expert down_proj: `[hidden_size, shared_intermediate]`.
+    pub shared_down: MlxQWeight,
     /// ADR-020 AC#5 Iter C2.4 #4 — DWQ-overlay mlx-affine expert
     /// stacks (cloned from the originating `MoeFfnWeightsQ` after the
     /// overlay was applied at load time).  When `Some`, the matching
@@ -453,30 +453,17 @@ fn ggml_type_stride(t: GgmlType, rows: usize, cols: usize) -> Result<u64> {
 impl MoeFfnWeightsGpuQ {
     /// Construct from pre-loaded quantized Metal buffers.
     ///
-    /// `expert_{gate,up,down}_q` are already on the Metal device (loaded via
-    /// `GgufFile::load_tensor`).  Router and shared-expert weights are f32
-    /// vecs that need uploading.
-    #[allow(clippy::too_many_arguments)]
+    /// Every handle is already a native view retained by the model loader.
     pub fn from_quantized(
-        expert_gate_q: MlxBuffer,
-        expert_up_q: MlxBuffer,
-        expert_down_q: MlxBuffer,
-        ggml_type_gate_up: GgmlType,
-        ggml_type_down: GgmlType,
+        weights: &super::weight_loader::MoeFfnWeightsQ,
         num_experts: u32,
         moe_intermediate_size: u32,
         hidden_size: u32,
-        router_f32: &[f32],
-        shared_gate_inp_f32: &[f32],
-        shared_gate_f32: &[f32],
-        shared_up_f32: &[f32],
-        shared_down_f32: &[f32],
-        device: &MlxDevice,
     ) -> Result<Self> {
         // Gate/up: [num_experts, moe_intermediate_size, hidden_size]
         // Each expert slice: moe_intermediate_size rows × hidden_size cols.
         let gate_stride = ggml_type_stride(
-            ggml_type_gate_up,
+            weights.ggml_type_gate_up,
             moe_intermediate_size as usize,
             hidden_size as usize,
         )
@@ -485,38 +472,30 @@ impl MoeFfnWeightsGpuQ {
         // Down: [num_experts, hidden_size, moe_intermediate_size]
         // Each expert slice: hidden_size rows × moe_intermediate_size cols.
         let down_stride = ggml_type_stride(
-            ggml_type_down,
+            weights.ggml_type_down,
             hidden_size as usize,
             moe_intermediate_size as usize,
         )
         .context("down stride")?;
 
         Ok(Self {
-            // Router is small (~2MB) but also benefits from pre-cast since
-            // `proj()` now checks dtype — keep BF16 for consistency.
-            router: upload_bf16_from_f32(router_f32, device).context("upload router bf16")?,
-            expert_gate_q,
-            expert_up_q,
-            expert_down_q,
-            ggml_type_gate_up,
-            ggml_type_down,
+            router: weights.router.clone(),
+            expert_gate_q: weights.expert_gate_q.clone(),
+            expert_up_q: weights.expert_up_q.clone(),
+            expert_down_q: weights.expert_down_q.clone(),
+            ggml_type_gate_up: weights.ggml_type_gate_up,
+            ggml_type_down: weights.ggml_type_down,
             expert_gate_stride: gate_stride,
             expert_up_stride: gate_stride, // gate and up have the same dimensions
             expert_down_stride: down_stride,
             num_experts,
-            // Pre-cast shared expert weights to BF16 to avoid per-inference
-            // F32→BF16 cast in proj() (~46MB each × 40 layers).
-            shared_gate_inp: upload_bf16_from_f32(shared_gate_inp_f32, device)
-                .context("upload shared_gate_inp bf16")?,
-            shared_gate: upload_bf16_from_f32(shared_gate_f32, device)
-                .context("upload shared_gate bf16")?,
-            shared_up: upload_bf16_from_f32(shared_up_f32, device)
-                .context("upload shared_up bf16")?,
-            shared_down: upload_bf16_from_f32(shared_down_f32, device)
-                .context("upload shared_down bf16")?,
-            expert_gate_affine: None,
-            expert_up_affine: None,
-            expert_down_affine: None,
+            shared_gate_inp: weights.shared_gate_logit.clone(),
+            shared_gate: weights.shared_gate.clone(),
+            shared_up: weights.shared_up.clone(),
+            shared_down: weights.shared_down.clone(),
+            expert_gate_affine: weights.expert_gate_affine.clone(),
+            expert_up_affine: weights.expert_up_affine.clone(),
+            expert_down_affine: weights.expert_down_affine.clone(),
         })
     }
 
@@ -663,154 +642,292 @@ fn proj(
 /// `byte_len`, so the bucket-rounded tail is never read.  The pool's
 /// per-token arena lifecycle (reset_decode_pool at top of decode token)
 /// keeps the safety contract.
+/// Pooled-output projection through an artifact-native matrix. Only the
+/// activation/output are transient; the weight remains in its mapped GGUF
+/// representation for F32/F16/BF16 and every admitted block codec.
 #[allow(clippy::too_many_arguments)]
-fn proj_pooled(
+fn proj_pooled_native(
     encoder: &mut mlx_native::CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     input: &MlxBuffer,
-    weight: &MlxBuffer,
+    weight: &MlxQWeight,
     seq_len: u32,
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
-    let n_w = (out_features * in_features) as usize;
-
-    // Same weight-bf16 cast logic as `proj`.  In apex production the
-    // weight is pre-cast to BF16 at model load (per
-    // `MoeFfnWeightsGpuQ::from_cpu` line 309-327 — `upload_bf16_from_f32`),
-    // so this branch never fires for the q_into callers; we keep it for
-    // call-site flexibility with non-production fixtures (tests / CI).
-    let weight_bf16_owned: MlxBuffer;
-    let weight_bf16: &MlxBuffer = if weight.dtype() == DType::BF16 {
-        weight
-    } else {
-        let buf = super::decode_pool::pooled_alloc_buffer(
-            device,
-            n_w * 2,
-            DType::BF16,
-            vec![out_features as usize, in_features as usize],
-        )
-        .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
-        cast(
-            encoder,
-            registry,
-            device.metal_device(),
-            weight,
-            &buf,
-            n_w,
-            CastDirection::F32ToBF16,
-        )
-        .context("cast weight F32→BF16")?;
-        encoder.memory_barrier();
-        weight_bf16_owned = buf;
-        &weight_bf16_owned
-    };
-
+    anyhow::ensure!(
+        weight.affine.is_none(),
+        "Qwen MoE base router/shared projection cannot consume an affine overlay"
+    );
+    anyhow::ensure!(
+        weight.info.rows == out_features as usize && weight.info.cols == in_features as usize,
+        "Qwen MoE native projection shape [{},{}] != [{out_features},{in_features}]",
+        weight.info.rows,
+        weight.info.cols
+    );
     let out_bytes = (seq_len * out_features) as usize * 4;
-    let mut dst = super::decode_pool::pooled_alloc_buffer(
+    let dst = super::decode_pool::pooled_alloc_buffer(
         device,
         out_bytes,
         DType::F32,
         vec![seq_len as usize, out_features as usize],
     )
-    .map_err(|e| anyhow!("alloc proj dst (pooled): {e}"))?;
+    .map_err(|error| anyhow!("alloc native proj dst (pooled): {error}"))?;
 
-    let params = DenseMmBf16F32Params {
-        m: seq_len,
-        n: out_features,
-        k: in_features,
-        src0_batch: 1,
-        src1_batch: 1,
-    };
-    if seq_len == 1 {
-        dense_gemv_bf16_f32(
+    match weight.info.ggml_dtype {
+        GgmlType::F32 => {
+            if seq_len == 1 {
+                mlx_native::ops::dense_gemm::dispatch_dense_matvec_f32(
+                    encoder,
+                    registry,
+                    device.metal_device(),
+                    input,
+                    &weight.buffer,
+                    &dst,
+                    &mlx_native::ops::dense_gemm::DenseGemmF16Params {
+                        m: seq_len,
+                        n: out_features,
+                        k: in_features,
+                    },
+                )
+                .context("native F32 MoE projection M=1")?;
+            } else {
+                dense_matmul_f32_f32_tensor(
+                    encoder,
+                    registry,
+                    device,
+                    &weight.buffer,
+                    input,
+                    &dst,
+                    &DenseMmF32F32Params {
+                        m: seq_len,
+                        n: out_features,
+                        k: in_features,
+                        src0_batch: 1,
+                        src1_batch: 1,
+                    },
+                )
+                .context("native F32 MoE projection M>1")?;
+            }
+        }
+        GgmlType::F16 => {
+            if seq_len == 1 {
+                mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
+                    encoder,
+                    registry,
+                    device.metal_device(),
+                    input,
+                    &weight.buffer,
+                    &dst,
+                    &mlx_native::ops::dense_gemm::DenseGemmF16Params {
+                        m: seq_len,
+                        n: out_features,
+                        k: in_features,
+                    },
+                )
+                .context("native F16 MoE projection M=1")?;
+            } else {
+                mlx_native::ops::quantized_matmul_ggml::dispatch_mm_v2_f16(
+                    encoder,
+                    registry,
+                    device,
+                    &weight.buffer,
+                    input,
+                    &dst,
+                    seq_len,
+                    out_features,
+                    in_features,
+                )
+                .context("native F16 MoE projection M>1")?;
+            }
+        }
+        GgmlType::BF16 => {
+            let params = DenseMmBf16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            if seq_len == 1 {
+                dense_gemv_bf16_f32(
+                    encoder,
+                    registry,
+                    device,
+                    &weight.buffer,
+                    input,
+                    &dst,
+                    &params,
+                )
+                .context("native BF16 MoE projection M=1")?;
+            } else {
+                dense_matmul_bf16_f32_tensor(
+                    encoder,
+                    registry,
+                    device,
+                    &weight.buffer,
+                    input,
+                    &dst,
+                    &params,
+                )
+                .context("native BF16 MoE projection M>1")?;
+            }
+        }
+        ggml_type => quantized_matmul_ggml(
             encoder,
             registry,
             device,
-            weight_bf16,
             input,
-            &mut dst,
-            &params,
+            &weight.buffer,
+            &dst,
+            &GgmlQuantizedMatmulParams {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                ggml_type,
+            },
         )
-        .context("dense_gemv_bf16_f32 proj_pooled M=1")?;
-    } else {
-        dense_matmul_bf16_f32_tensor(
-            encoder,
-            registry,
-            device,
-            weight_bf16,
-            input,
-            &mut dst,
-            &params,
-        )
-        .context("dense_matmul_bf16_f32_tensor")?;
+        .context("native block MoE projection")?,
     }
     Ok(dst)
 }
 
-/// ADR-019 Phase 2 iter90b H5b — arena-anchored variant of [`proj_pooled`].
-///
-/// Writes the projection into a CALLER-PROVIDED `dst: &mut MlxBuffer`
-/// instead of allocating from the thread-local decode pool.  The caller
-/// is expected to pass an arena-anchored buffer (e.g.
-/// `MoeFfnArena::logits_buf`) that outlives the entire prefill.  This
-/// eliminates the helper-local `MlxBuffer` lifetime that Codex finding
-/// #2 flagged on iter90.
-///
-/// # Production-only — BF16 weight required
-///
-/// Unlike [`proj_pooled`], this helper does NOT include the BF16 cast
-/// branch.  The apex production path pre-casts MoE projection weights
-/// to BF16 at model load (see `MoeFfnWeightsGpuQ::from_cpu`
-/// `gpu_ffn.rs:309-327` — `upload_bf16_from_f32`), so the cast branch
-/// in `proj_pooled` is decorative for production.  Test fixtures that
-/// require F32 weights should keep using `proj_pooled`.  The bf16
-/// requirement is asserted in debug; release just propagates the
-/// downstream `dense_matmul_bf16_f32_tensor` error if the weight dtype
-/// is wrong.
-///
-/// # Caller contract
-///
-/// `dst` must be:
-///   - DType `F32`
-///   - byte_len ≥ `seq_len * out_features * 4`
-///   - shape compatible with `[seq_len, out_features]`
-/// The arena allocation is the canonical source for these constraints.
+/// Caller-owned-output variant of [`proj_pooled_native`] for the persistent
+/// prefill arena. The weight is always the exact mapped GGUF matrix; only the
+/// activation and caller-provided F32 output are transient.
 #[allow(clippy::too_many_arguments)]
-fn proj_into(
+fn proj_into_native(
     encoder: &mut mlx_native::CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     input: &MlxBuffer,
-    weight: &MlxBuffer,
+    weight: &MlxQWeight,
     dst: &mut MlxBuffer,
     seq_len: u32,
     in_features: u32,
     out_features: u32,
 ) -> Result<()> {
-    debug_assert_eq!(
-        weight.dtype(),
-        DType::BF16,
-        "proj_into: production weight must be BF16 (preacast at MoE load); \
-         got {:?}",
-        weight.dtype()
+    anyhow::ensure!(
+        weight.affine.is_none()
+            && weight.info.rows == out_features as usize
+            && weight.info.cols == in_features as usize,
+        "invalid Qwen MoE native projection metadata"
     );
-
-    let params = DenseMmBf16F32Params {
-        m: seq_len,
-        n: out_features,
-        k: in_features,
-        src0_batch: 1,
-        src1_batch: 1,
-    };
-
-    if seq_len == 1 {
-        dense_gemv_bf16_f32(encoder, registry, device, weight, input, dst, &params)
-            .context("dense_gemv_bf16_f32 proj_into M=1")?;
-    } else {
-        dense_matmul_bf16_f32_tensor(encoder, registry, device, weight, input, dst, &params)
-            .context("dense_matmul_bf16_f32_tensor proj_into")?;
+    match weight.info.ggml_dtype {
+        GgmlType::F32 => {
+            if seq_len == 1 {
+                mlx_native::ops::dense_gemm::dispatch_dense_matvec_f32(
+                    encoder,
+                    registry,
+                    device.metal_device(),
+                    input,
+                    &weight.buffer,
+                    dst,
+                    &mlx_native::ops::dense_gemm::DenseGemmF16Params {
+                        m: seq_len,
+                        n: out_features,
+                        k: in_features,
+                    },
+                )
+                .context("native F32 MoE arena projection M=1")?;
+            } else {
+                dense_matmul_f32_f32_tensor(
+                    encoder,
+                    registry,
+                    device,
+                    &weight.buffer,
+                    input,
+                    dst,
+                    &DenseMmF32F32Params {
+                        m: seq_len,
+                        n: out_features,
+                        k: in_features,
+                        src0_batch: 1,
+                        src1_batch: 1,
+                    },
+                )
+                .context("native F32 MoE arena projection M>1")?;
+            }
+        }
+        GgmlType::F16 => {
+            if seq_len == 1 {
+                mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
+                    encoder,
+                    registry,
+                    device.metal_device(),
+                    input,
+                    &weight.buffer,
+                    dst,
+                    &mlx_native::ops::dense_gemm::DenseGemmF16Params {
+                        m: seq_len,
+                        n: out_features,
+                        k: in_features,
+                    },
+                )
+                .context("native F16 MoE arena projection M=1")?;
+            } else {
+                mlx_native::ops::quantized_matmul_ggml::dispatch_mm_v2_f16(
+                    encoder,
+                    registry,
+                    device,
+                    &weight.buffer,
+                    input,
+                    dst,
+                    seq_len,
+                    out_features,
+                    in_features,
+                )
+                .context("native F16 MoE arena projection M>1")?;
+            }
+        }
+        GgmlType::BF16 => {
+            let params = DenseMmBf16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            if seq_len == 1 {
+                dense_gemv_bf16_f32(
+                    encoder,
+                    registry,
+                    device,
+                    &weight.buffer,
+                    input,
+                    dst,
+                    &params,
+                )
+                .context("native BF16 MoE arena projection M=1")?;
+            } else {
+                dense_matmul_bf16_f32_tensor(
+                    encoder,
+                    registry,
+                    device,
+                    &weight.buffer,
+                    input,
+                    dst,
+                    &params,
+                )
+                .context("native BF16 MoE arena projection M>1")?;
+            }
+        }
+        ggml_type => quantized_matmul_ggml(
+            encoder,
+            registry,
+            device,
+            input,
+            &weight.buffer,
+            dst,
+            &GgmlQuantizedMatmulParams {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                ggml_type,
+            },
+        )
+        .context("native block MoE arena projection")?,
     }
     Ok(())
 }
@@ -2654,7 +2771,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseAProj,
             );
-            let logits_buf = proj_pooled(
+            let logits_buf = proj_pooled_native(
                 enc,
                 registry,
                 device,
@@ -2664,7 +2781,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 h32,
                 ne32,
             )?;
-            let sh_logit_buf = proj_pooled(
+            let sh_logit_buf = proj_pooled_native(
                 enc,
                 registry,
                 device,
@@ -2674,7 +2791,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 h32,
                 1,
             )?;
-            let a_s_buf = proj_pooled(
+            let a_s_buf = proj_pooled_native(
                 enc,
                 registry,
                 device,
@@ -2684,7 +2801,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 h32,
                 m_sh32,
             )?;
-            let b_s_buf = proj_pooled(
+            let b_s_buf = proj_pooled_native(
                 enc,
                 registry,
                 device,
@@ -2891,7 +3008,7 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             }
             // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
             // dispatch_moe_weighted_reduce, no CPU download).
-            proj_pooled(
+            proj_pooled_native(
                 enc,
                 registry,
                 device,
@@ -3146,7 +3263,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseAProj,
             );
-            proj_into(
+            proj_into_native(
                 enc,
                 registry,
                 device,
@@ -3157,7 +3274,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 h32,
                 ne32,
             )?;
-            proj_into(
+            proj_into_native(
                 enc,
                 registry,
                 device,
@@ -3168,7 +3285,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 h32,
                 1,
             )?;
-            proj_into(
+            proj_into_native(
                 enc,
                 registry,
                 device,
@@ -3179,7 +3296,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 h32,
                 m_sh32,
             )?;
-            proj_into(
+            proj_into_native(
                 enc,
                 registry,
                 device,
@@ -3344,7 +3461,7 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                     },
                 )?;
             }
-            proj_pooled(
+            proj_pooled_native(
                 enc,
                 registry,
                 device,
@@ -4426,9 +4543,17 @@ mod tests {
         let expert_gate_buf = make_buf(&gate_q4);
         let expert_up_buf = make_buf(&up_q4);
         let expert_down_buf = make_buf(&down_q4);
+        let test_f32 = |values: &[f32], rows: usize, cols: usize| {
+            MlxQWeight::from_test_buffer(
+                upload_f32(values, &device).expect("upload test native matrix"),
+                GgmlType::F32,
+                rows,
+                cols,
+            )
+        };
 
         let weights_q = MoeFfnWeightsGpuQ {
-            router: upload_f32(&router_f32, &device).expect("router"),
+            router: test_f32(&router_f32, ne, h),
             expert_gate_q: expert_gate_buf,
             expert_up_q: expert_up_buf,
             expert_down_q: expert_down_buf,
@@ -4438,10 +4563,10 @@ mod tests {
             expert_up_stride: gate_stride,
             expert_down_stride: down_stride,
             num_experts: ne as u32,
-            shared_gate_inp: upload_f32(&shared_gate_logit, &device).expect("sh_gate_inp"),
-            shared_gate: upload_f32(&shared_gate_f32, &device).expect("sh_gate"),
-            shared_up: upload_f32(&shared_up_f32, &device).expect("sh_up"),
-            shared_down: upload_f32(&shared_down_f32, &device).expect("sh_down"),
+            shared_gate_inp: test_f32(&shared_gate_logit, 1, h),
+            shared_gate: test_f32(&shared_gate_f32, ms, h),
+            shared_up: test_f32(&shared_up_f32, ms, h),
+            shared_down: test_f32(&shared_down_f32, h, ms),
             expert_gate_affine: None,
             expert_up_affine: None,
             expert_down_affine: None,

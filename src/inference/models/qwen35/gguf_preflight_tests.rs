@@ -142,6 +142,18 @@ fn pinned_qwen38_dense_kernel_regimes_are_available_without_a_device() {
     }
 }
 
+#[test]
+fn production_matrix_preflight_retains_non_power_and_prompt_boundaries() {
+    let widths = REQUIRED_MATRIX_WIDTHS.map(|(width, _)| width);
+    assert_eq!(widths, [1, 2, 3, 4, 8, 9, 16, 17]);
+    assert_eq!(
+        REQUIRED_MATRIX_WIDTHS[2].1,
+        GgmlWorkloadClass::ContinuousWidth
+    );
+    assert_eq!(REQUIRED_MATRIX_WIDTHS[5].1, GgmlWorkloadClass::Prompt);
+    assert_eq!(REQUIRED_MATRIX_WIDTHS[7].1, GgmlWorkloadClass::Prompt);
+}
+
 /// Header-only gate for an exact pinned artifact. It parses the tensor
 /// directory and runs the allocation-free preflight; it never creates a
 /// Metal device or reads model tensor payloads.
