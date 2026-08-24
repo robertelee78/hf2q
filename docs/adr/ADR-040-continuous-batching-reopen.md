@@ -250,7 +250,16 @@ Weight amortization — the entire source of the throughput win — happens in t
 
 **Success bar:** *match or beat peer engines on the same hardware.* The DoD is a **comparative** benchmark on this M5 Max — aggregate tok/s at matched concurrency N vs. (a) the peer server (`-np N` continuous batching) and (b) `mlx-lm` / `vllm-mlx`. "As fast or faster than peers" replaces the old fixed "≥1.5× at N=4" bar (which becomes a *floor*, not the target). Same silicon → no excuse to be slower.
 
-**Quant scope (mantra: no fallback).** The fused `batch=N` decode path must cover **every ftype mlx-native can run as an inference matmul** — `Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q5_1, IQ4_NL, IQ4_XS` (the dispatcher's supported set, `mlx-native/src/ops/quantized_matmul_ggml.rs:87,:404`). **There is no per-slot "fallback" tier:** if a quant is inference-supported, it gets the fused kernel — full stop. A surviving per-slot mv path for *some* inference-supported ftype would be exactly the degraded fallback the mantra forbids, so v1 is not done until all eight have the fused decode path. Converter-only ftypes that mlx-native does **not** yet inference-support (`Q4_1, Q5_0, Q2_K, Q3_K`) are a separate matter: they are not servable today at all (no inference matmul), so they are out of scope for *this* ADR and tracked as their own "add mlx-native inference support" work — **not** silently absorbed as a Phase-F fallback. (Distinction per codex review: converter-supported ≠ inference-supported.)
+**Quant scope (mantra: no fallback).** The fused `batch=N` decode path must
+cover every storage route that the locked mlx-native runtime admits for the
+tensor role using it. mlx-native 0.11.2 includes Q2_K and Q3_K projection and
+routed-expert matmul routes; the earlier statement that both ftypes had no
+inference matmul is obsolete. End-to-end admission remains role-specific: for
+example, the direct embedding-gather set is narrower, so a Q3_K embedding is
+rejected even when Q3_K projections are executable. **There is no per-slot
+"fallback" tier:** an artifact is servable only when every tensor role has a
+complete route, and every admitted decode route must receive the fused path.
+Converter support by itself still does not imply end-to-end inference support.
 
 ### 0.6 Repo boundary — target state + existing debt
 

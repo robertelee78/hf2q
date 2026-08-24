@@ -30,12 +30,18 @@ reject_literal() {
 # There is exactly one guide. Do not reintroduce a core/complete split.
 [[ ! -e "$extra_guide" ]] || fail "second onboarding guide must not exist"
 
-# --- Issue-146 prevention rules: bind the exact tested artifact and proof ---
-require_literal "$guide" "40d771ee15d826017f297261f5bedcf2c32cf4c2"
-require_literal "$guide" "qwen38-abliterated-sft-hf2q-q4_k_m.gguf"
-require_literal "$guide" "qwen38-abliterated-sft-hf2q-q4_k_m-mmproj.gguf"
-require_literal "$guide" "shasum -a 256 -c hf2q-q4_k_m-SHA256SUMS.txt"
-require_literal "$guide" "--mmproj"
+# --- Issue-146 prevention rules: bind the tested resolver journey and proof ---
+# The public guide deliberately has no artifact-filename/download ritual. The
+# exact repository + quant is the operator contract; hf2q resolves one immutable
+# revision, verifies the selected payload, and prepares its matching projector.
+model_operand="jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M"
+require_literal "$guide" "hf2q serve $model_operand"
+require_literal "$guide" "hf2q chat $model_operand"
+require_literal "$guide" "hf2q serve list"
+require_literal "$guide" "hf2q chat list"
+require_literal "$guide" "resolves the repository to one immutable"
+require_literal "$guide" "loads it automatically"
+require_literal "$guide" '<owner>__<repo>/<commit>/'
 # Generation is proven by a real client conversation, not by /readyz alone.
 require_literal "$guide" "hf2q chat"
 # Multimodal is served and proven with one simple image request.
@@ -82,9 +88,14 @@ reject_literal "$guide" '| .default_agent ='
 reject_literal "$guide" '"tools": { "*": false }'
 reject_literal "$guide" '"permission": "deny"'
 reject_literal "$guide" "ak setup --minimal --opencode"
-# No unproved conversion substitute for the published verified pair.
+# No source conversion is presented as the fast hosted-artifact journey.
 reject_literal "$guide" "hf2q convert jenerallee78/Qwen3.8-27B-Abliterated-SFT"
 reject_literal "$guide" "Optional: convert the pair yourself"
+# The former manually pinned payload ritual must not creep back into the
+# first-run path. Exact bytes remain receipt-bound by the resolver itself.
+reject_literal "$guide" "40d771ee15d826017f297261f5bedcf2c32cf4c2"
+reject_literal "$guide" "qwen38-abliterated-sft-hf2q-q4_k_m.gguf"
+reject_literal "$guide" "shasum -a 256 -c hf2q-q4_k_m-SHA256SUMS.txt"
 
 # --- README entry point stays pointed at the one guide ---
 reject_literal "$readme" "downloads the model author's pinned Q5_K_M GGUF"

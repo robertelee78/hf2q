@@ -35,59 +35,55 @@ answer can be changed later by rerunning it:
 Non-interactive shells can run `hf2q setup --accept-defaults` instead.
 `hf2q doctor` confirms the installation is healthy before you download 17 GiB.
 
-## 2. Download the verified model
-
-The model repository also hosts additional GGUFs, but they are not the
-source-matched text/projector pair qualified for this multimodal journey. Use
-only the two hf2q-named files from this pinned, checksummed artifact commit:
+## 2. Prepare and serve the model (terminal 1)
 
 ```bash
-MODEL_DIR="$HOME/.local/share/hf2q/models/qwen3.8"
-HF_REV="40d771ee15d826017f297261f5bedcf2c32cf4c2"
-HF_BASE="https://huggingface.co/jenerallee78/Qwen3.8-27B-Abliterated-SFT/resolve/$HF_REV/gguf"
-mkdir -p "$MODEL_DIR"
-
-for FILE in \
-  qwen38-abliterated-sft-hf2q-q4_k_m.gguf \
-  qwen38-abliterated-sft-hf2q-q4_k_m-mmproj.gguf \
-  hf2q-q4_k_m-SHA256SUMS.txt
-do
-  curl -fL -C - -o "$MODEL_DIR/$FILE" "$HF_BASE/$FILE"
-done
-
-(
-  cd "$MODEL_DIR"
-  shasum -a 256 -c hf2q-q4_k_m-SHA256SUMS.txt
-)
+hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M
 ```
 
-Both lines must print `OK`. The download resumes if interrupted; if a hash
-fails, delete that one file and rerun the block. The text GGUF embeds the
-projector's digest, so hf2q also rejects a mixed or damaged pair at load.
+That is the whole model preparation command. hf2q first looks for an exact
+verified local Q4_K_M—including a manually downloaded file under the managed
+model directory. If none exists, it resolves the repository to one immutable
+commit, checks disk space, downloads and verifies the exact hosted GGUF, and
+stores it below
+`$HOME/.local/share/hf2q/models/<owner>__<repo>/<commit>/`.
 
-## 3. Serve the model (terminal 1)
+For this multimodal model, hf2q also reuses or downloads the one matching
+`mmproj`, verifies the pair, and loads it automatically. If a valid projector
+cannot be established, the server warns and remains available text-only.
+Host, port, scheduler, and slot count come from your `hf2q setup` answers.
+Leave this foreground terminal open and wait for the listening message.
 
-```bash
-hf2q serve \
-  --model "$HOME/.local/share/hf2q/models/qwen3.8/qwen38-abliterated-sft-hf2q-q4_k_m.gguf" \
-  --mmproj "$HOME/.local/share/hf2q/models/qwen3.8/qwen38-abliterated-sft-hf2q-q4_k_m-mmproj.gguf"
-```
+Use `hf2q serve list` at any time to inspect local receipt-backed, managed,
+cached, and loose GGUF options without contacting the Hub.
 
-That is the whole command. Host, port, scheduler, and slot count come from
-your `hf2q setup` answers; `--mmproj` adds vision. The server runs in the
-foreground — leave this terminal open and stop it later with Ctrl-C.
-
-Wait until the log reports the model loaded and listening before continuing.
-
-## 4. Chat with the model (terminal 2)
+## 3. Chat with the model (terminal 2)
 
 ```bash
 hf2q chat
 ```
 
 Chat discovers the running server on this machine and connects. Ask it
-something real — a good answer here is the proof that serving works.
-`/status` shows the endpoint and token statistics; `/quit` exits.
+something real—this is the first inference proof. `/status` shows the endpoint
+and token statistics; `/quit` exits.
+
+For a one-command standalone check, this performs the same preparation and
+starts an owned loopback server automatically. A targeted chat deliberately
+owns its exact server even when another local server is already advertised:
+
+```bash
+hf2q chat jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M
+```
+
+## 4. Confirm the managed artifact
+
+```bash
+hf2q chat list
+```
+
+The Q4_K_M row must name the canonical repository and immutable revision. A
+second `serve` or model-targeted `chat` invocation reuses those verified bytes
+instead of transferring the payload again.
 
 ## 5. Prove vision with one request
 
@@ -238,8 +234,10 @@ model, hf2q, OpenCode, and Agentic Kit are untouched).
 - **Port 8081 already in use** — something else is listening; inspect with
   `lsof -nP -iTCP:8081 -sTCP:LISTEN`, or rerun `hf2q setup` and pick another
   port (use the same port in section 7's `baseURL`).
-- **Projector binding failed** — re-download both hf2q-named files from the
-  pinned commit in section 2; do not substitute other GGUFs from that repo.
+- **Projector binding failed** — read the automatic-projector warning, then run
+  `hf2q serve list`. Repeating the model-targeted serve command rechecks local
+  authority and the exact repository revision; it never guesses a projector
+  from an unrelated file.
 - **OpenCode has no tools** — run `opencode debug config` and remove any
   agent-level `permission: "deny"` or `tools: {"*": false}` left by other
   configuration; this guide writes neither.

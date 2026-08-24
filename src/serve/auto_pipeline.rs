@@ -246,6 +246,7 @@ fn run_auto_pipeline(
         bytes,
         sha256,
         quantized_at_secs: secs_since_epoch(),
+        last_used_at_secs: 0,
         quantized_by_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     cache
@@ -555,7 +556,7 @@ fn run_convert_subprocess(
     snapshot_dir: &Path,
     target_gguf: &Path,
     quant: QuantType,
-    no_integrity: bool,
+    _no_integrity: bool,
 ) -> Result<()> {
     let bin = std::env::var("CARGO_BIN_EXE_hf2q").unwrap_or_else(|_| {
         // Production fallback: same-binary self-spawn.  `current_exe` is
@@ -566,26 +567,7 @@ fn run_convert_subprocess(
     });
     let cli_quant = map_quant_to_cli(quant);
     let mut cmd = Command::new(&bin);
-    cmd.arg("convert")
-        .arg("--input")
-        .arg(snapshot_dir)
-        .arg("--format")
-        .arg("gguf")
-        .arg("--quant")
-        .arg(cli_quant)
-        .arg("--output")
-        .arg(target_gguf)
-        .arg("--yes")
-        // The subprocess re-downloads nothing — `--input` is local.  But
-        // it does run quality measurement by default; skip for the
-        // auto-pipeline path because (a) we already verified the source
-        // bytes via integrity and (b) quality measurement allocates an
-        // extra ~F32 round-trip that doubles peak memory (see
-        // `project_phase45_quality_oom.md`).
-        .arg("--skip-quality");
-    if no_integrity {
-        cmd.arg("--no-integrity");
-    }
+    cmd.args(convert_command_args(snapshot_dir, target_gguf, quant));
 
     tracing::info!(
         bin = %bin,
@@ -623,6 +605,21 @@ fn run_convert_subprocess(
         "auto-pipeline: convert subprocess complete"
     );
     Ok(())
+}
+
+fn convert_command_args(
+    snapshot_dir: &Path,
+    target_gguf: &Path,
+    quant: QuantType,
+) -> Vec<std::ffi::OsString> {
+    vec![
+        "convert".into(),
+        snapshot_dir.as_os_str().to_owned(),
+        "--quant".into(),
+        map_quant_to_cli(quant).into(),
+        "--output".into(),
+        target_gguf.as_os_str().to_owned(),
+    ]
 }
 
 fn secs_since_epoch() -> u64 {
@@ -754,6 +751,25 @@ mod tests {
         assert_eq!(map_quant_to_cli(QuantType::Q3_K_M), "q3_k_m");
     }
 
+    #[test]
+    fn self_spawned_convert_arguments_parse_on_the_current_cli() {
+        use clap::Parser;
+
+        let mut argv = vec![std::ffi::OsString::from("hf2q")];
+        argv.extend(convert_command_args(
+            Path::new("/tmp/exact-source"),
+            Path::new("/tmp/exact-output.gguf"),
+            QuantType::Q4_K_M,
+        ));
+        let parsed = crate::cli::Cli::try_parse_from(argv).expect("self-spawn argv must parse");
+        let crate::cli::Command::Convert(args) = parsed.command else {
+            panic!("expected convert command");
+        };
+        assert_eq!(args.hf_dir, Some(PathBuf::from("/tmp/exact-source")));
+        assert_eq!(args.quant.as_deref(), Some("q4_k_m"));
+        assert_eq!(args.output, Some(PathBuf::from("/tmp/exact-output.gguf")));
+    }
+
     // ── resolve_or_prepare_model — pass-through for filesystem paths ────
 
     #[test]
@@ -836,6 +852,7 @@ mod tests {
                     bytes,
                     sha256: sha,
                     quantized_at_secs: secs_since_epoch(),
+                    last_used_at_secs: 0,
                     quantized_by_version: env!("CARGO_PKG_VERSION").to_string(),
                 },
             )
@@ -889,6 +906,7 @@ mod tests {
                     bytes: 8,
                     sha256: real_sha,
                     quantized_at_secs: 0,
+                    last_used_at_secs: 0,
                     quantized_by_version: "test".into(),
                 },
             )
@@ -949,6 +967,7 @@ mod tests {
                     bytes,
                     sha256,
                     quantized_at_secs: 0,
+                    last_used_at_secs: 0,
                     quantized_by_version: "test".into(),
                 },
             )
@@ -1080,6 +1099,7 @@ mod tests {
                     bytes: gguf_bytes.len() as u64,
                     sha256: manifest_sha.into(),
                     quantized_at_secs: 0,
+                    last_used_at_secs: 0,
                     quantized_by_version: "test-iter207".into(),
                 },
             )
@@ -1318,6 +1338,7 @@ mod tests {
                     bytes: gguf_bytes.len() as u64,
                     sha256: real_sha,
                     quantized_at_secs: 0,
+                    last_used_at_secs: 0,
                     quantized_by_version: "test".into(),
                 },
             )

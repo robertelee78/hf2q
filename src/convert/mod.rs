@@ -32,16 +32,17 @@ pub mod source_reader;
 pub mod tensor_lineage;
 pub mod tokenizer;
 
-pub use cli_driver::{ConvertArgs, ConvertError, ConvertMode, run_convert};
+pub(crate) use cli_driver::recover_conversion_publication;
+pub use cli_driver::{run_convert, ConvertArgs, ConvertError, ConvertMode};
 pub use orchestrator::{
     ConvertOrchestrator, OrchestratorError, PlanEntry, PlannedSizeSummary, PlannedTypeSize,
     StreamingWriter,
 };
-pub use quant_selector::{QuantSelector, QuantSelectorError, approximate_for_apex};
+pub use quant_selector::{approximate_for_apex, QuantSelector, QuantSelectorError};
 pub use receipt::{ReceiptError, RemoteConversionSource};
 pub use source_reader::{HfModelSource, HfTensor, SourceError, TensorMeta};
 pub use tensor_lineage::{ConversionSourceDisposition, VerifiedConversionEvidenceContext};
-pub use tokenizer::{TokenizerError, build_tokenizer_metadata};
+pub use tokenizer::{build_tokenizer_metadata, TokenizerError};
 
 #[cfg(test)]
 mod tests {

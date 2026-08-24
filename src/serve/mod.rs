@@ -26,6 +26,7 @@ pub mod layer_ctx;
 pub(crate) mod load_diagnostic;
 #[allow(dead_code)]
 pub mod load_info;
+pub(crate) mod managed_artifacts;
 #[allow(dead_code)]
 pub mod multi_model;
 // ADR-040 Phase A iter-1 scaffolding — MultiSeqKvCache trait + types.
@@ -4111,13 +4112,51 @@ pub fn cmd_serve(
     args: cli::ServeArgs,
     log_format: cli::LogFormat,
     operator_defaults: Option<&crate::setup::ServeDefaultsV2>,
+    configured_quant: Option<&str>,
 ) -> Result<()> {
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
 
-    if let Some(fd) = args.chat_parent_lifeline_fd {
-        start_chat_parent_lifeline(fd)?;
+    let mut args = args;
+    let mut repository_spec = None;
+    if let Some(target) = args.target.take() {
+        match crate::model_spec::parse_model_spec(&target)? {
+            crate::model_spec::ModelSpec::List => {
+                return managed_artifacts::print_inventory(&args.model_dirs)
+            }
+            crate::model_spec::ModelSpec::Path(path) => args.model = Some(path),
+            crate::model_spec::ModelSpec::Repository(spec) => repository_spec = Some(spec),
+        }
+    } else if let Some(model) = args.model.as_ref().filter(|path| !path.exists()) {
+        if let Ok(crate::model_spec::ModelSpec::Repository(spec)) =
+            crate::model_spec::parse_model_spec(&model.to_string_lossy())
+        {
+            repository_spec = Some(spec);
+            args.model = None;
+        }
     }
+    if repository_spec.is_none() && args.output.is_some() {
+        anyhow::bail!("serve --output requires a repository MODEL operand");
+    }
+
+    let (mut chat_parent_lifeline, chat_owned_listener) =
+        match (args.chat_parent_lifeline_fd, args.chat_owned_listener_fd) {
+            (Some(lifeline_fd), Some(listener_fd)) => {
+                anyhow::ensure!(
+                    lifeline_fd != listener_fd,
+                    "chat lifeline and listener descriptors must be distinct"
+                );
+                let listener = start_chat_owned_listener(listener_fd)?;
+                (
+                    Some(start_chat_parent_lifeline(lifeline_fd)?),
+                    Some(listener),
+                )
+            }
+            (None, None) => (None, None),
+            _ => anyhow::bail!(
+            "chat-owned serve requires both the private lifeline and pre-bound listener descriptors"
+        ),
+        };
 
     operator_ui::validate_mode(args.operator_ui, matches!(log_format, cli::LogFormat::Text))?;
 
@@ -4128,6 +4167,18 @@ pub fn cmd_serve(
             .filter(|s| !s.is_empty())
     });
     let endpoint = resolve_serve_endpoint(args.host.as_deref(), args.port, operator_defaults);
+    if let Some(listener) = chat_owned_listener.as_ref() {
+        let address = listener
+            .local_addr()
+            .context("read inherited chat-owned listener address")?;
+        anyhow::ensure!(
+            endpoint.host == "127.0.0.1" && endpoint.port == address.port(),
+            "inherited chat-owned listener {} does not match resolved endpoint {}:{}",
+            address,
+            endpoint.host,
+            endpoint.port
+        );
+    }
     validate_configured_endpoint_auth(&endpoint, auth_token.as_deref())
         .map_err(|message| anyhow::anyhow!(message))?;
 
@@ -4213,17 +4264,11 @@ pub fn cmd_serve(
     // empty `HotSwapManager<Engine>` sized off the unified-memory budget
     // per ADR-005 line 929 (80% default).  The same `cache` + `hardware`
     // are shared with request-time auto_pipeline resolution.
-    let default_model_arg = args
+    let mut default_model_arg = args
         .model
         .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
-    let pair_read_guard = match (args.model.as_ref(), args.mmproj.as_ref()) {
-        (Some(text), Some(projector)) => Some(
-            crate::core::paired_artifact::PairReadGuard::acquire(text, projector)
-                .map_err(|error| anyhow::anyhow!(error))?,
-        ),
-        _ => None,
-    };
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| repository_spec.as_ref().map(|spec| spec.repository.clone()));
     let local_artifacts =
         api::local_artifacts::LocalArtifactInventory::for_serve(&args.model_dirs)?;
     let mut state = api::AppState::new_for_serve(
@@ -4248,6 +4293,82 @@ pub fn cmd_serve(
         kv_persist_dir: kv_persist_dir.clone(),
         kv_persist_budget_bytes,
     });
+
+    let mut automatic_mmproj = false;
+    let mut startup_managed_identity = None;
+    if let Some(spec) = repository_spec.as_ref() {
+        let mut cache_guard = state.cache.lock().map_err(|error| {
+            anyhow::anyhow!("cache mutex poisoned during model resolution: {error}")
+        })?;
+        let resolved = managed_artifacts::resolve_repository(
+            spec,
+            args.output.as_deref(),
+            &args.model_dirs,
+            &mut cache_guard,
+            state.hardware.as_ref(),
+            args.mmproj.is_none(),
+            configured_quant,
+        )?;
+        drop(cache_guard);
+        for warning in &resolved.warnings {
+            tracing::warn!("{warning}");
+            eprintln!("Warning: {warning}");
+        }
+        tracing::info!(
+            repository = %resolved.repository,
+            revision = %resolved.revision,
+            quant = %resolved.quant,
+            origin = %resolved.origin,
+            path = %resolved.gguf_path.display(),
+            "ADR-051 local-first model resolution complete"
+        );
+        args.model = Some(resolved.gguf_path.clone());
+        default_model_arg = Some(resolved.gguf_path.to_string_lossy().into_owned());
+        startup_managed_identity = Some((
+            resolved.repository.clone(),
+            resolved.quant,
+            resolved.gguf_path.clone(),
+        ));
+        if args.mmproj.is_none() {
+            automatic_mmproj = resolved.mmproj_path.is_some();
+            args.mmproj = resolved.mmproj_path;
+        }
+    }
+
+    if repository_spec.is_none() && args.mmproj.is_none() {
+        if let Some(model) = args.model.as_ref() {
+            match managed_artifacts::resolve_local_path_projector(model) {
+                Ok(Some(projector)) => {
+                    automatic_mmproj = true;
+                    args.mmproj = Some(projector);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "automatic local-path mmproj resolution failed");
+                    eprintln!("Warning: automatic local-path mmproj resolution failed: {error}");
+                }
+            }
+        }
+    }
+
+    let pair_paths = args.model.clone().zip(args.mmproj.clone());
+    let pair_read_guard = match pair_paths {
+        Some((text, projector)) => {
+            match crate::core::paired_artifact::PairReadGuard::acquire(&text, &projector) {
+                Ok(guard) => Some(guard),
+                Err(error) if automatic_mmproj => {
+                    tracing::warn!(%error, "automatic mmproj pair lock rejected; continuing text-only");
+                    eprintln!(
+                        "Warning: automatic mmproj pair could not be locked; serving text-only: {error}"
+                    );
+                    args.mmproj = None;
+                    None
+                }
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            }
+        }
+        None => None,
+    };
 
     // --- ADR-017 Phase C.1 — optional persistent block-prefix KV cache ---
     // When `--kv-persist=PATH` is set, replace the AppState's
@@ -4655,14 +4776,18 @@ pub fn cmd_serve(
             );
         }
 
-        let pool_repo = resolved
-            .repo_id
-            .clone()
+        let pool_repo = startup_managed_identity
+            .as_ref()
+            .map(|(repository, _, _)| repository.clone())
+            .or_else(|| resolved.repo_id.clone())
             .unwrap_or_else(|| pool_key_for_path(&resolved.gguf_path));
-        let pool_quant = match resolved.quant {
-            Some(quant) => quant,
-            None => quant_select::quant_type_from_gguf_path(&resolved.gguf_path)
-                .context("derive exact pool quant from --model GGUF")?,
+        let pool_quant = if let Some((_, quant, _)) = startup_managed_identity.as_ref() {
+            *quant
+        } else if let Some(quant) = resolved.quant {
+            quant
+        } else {
+            quant_select::quant_type_from_gguf_path(&resolved.gguf_path)
+                .context("derive exact pool quant from --model GGUF")?
         };
         let mut engine_config = state.engine_config_template.clone();
         engine_config.tokenizer_path = args.tokenizer.clone();
@@ -4810,7 +4935,11 @@ pub fn cmd_serve(
     // pass (ADR-005 Phase 2c Task #15). Fail fast if the file is absent
     // or malformed so the server never advertises multimodal capability
     // it can't back.
-    let (mmproj, startup_vision_projector) = if let Some(mmp_path) = args.mmproj.as_ref() {
+    let load_startup_mmproj = || -> Result<(
+        Option<api::state::LoadedMmproj>,
+        Option<load_info::VisionProjector>,
+    )> {
+        if let Some(mmp_path) = args.mmproj.as_ref() {
         anyhow::ensure!(
             mmp_path.exists(),
             "mmproj not found: {}",
@@ -4969,7 +5098,7 @@ pub fn cmd_serve(
                 "ViT GPU warmup complete"
             );
         }
-        (
+        Ok((
             Some(api::state::LoadedMmproj {
                 gguf_path: mmp_path.clone(),
                 config: mmp_config,
@@ -4988,9 +5117,19 @@ pub fn cmd_serve(
                 mmproj_path: mmp_path.clone(),
                 mmproj_sha256: Some(mmproj_sha256),
             }),
-        )
-    } else {
-        (None, None)
+        ))
+        } else {
+            Ok((None, None))
+        }
+    };
+    let (mmproj, startup_vision_projector) = match load_startup_mmproj() {
+        Ok(loaded) => loaded,
+        Err(error) if automatic_mmproj => {
+            tracing::warn!(%error, "automatic mmproj rejected; continuing text-only");
+            eprintln!("Warning: automatic mmproj was rejected; serving text-only: {error:#}");
+            (None, None)
+        }
+        Err(error) => return Err(error),
     };
     drop(pair_read_guard);
 
@@ -5030,12 +5169,19 @@ pub fn cmd_serve(
 
     rt.block_on(async move {
         let bind = format!("{}:{}", config.host, config.port);
-        let listener = tokio::net::TcpListener::bind(&bind)
-            .await
-            .with_context(|| format!("binding to {bind}"))?;
+        let listener = match chat_owned_listener {
+            Some(listener) => tokio::net::TcpListener::from_std(listener)
+                .context("adopt inherited chat-owned listener into tokio")?,
+            None => tokio::net::TcpListener::bind(&bind)
+                .await
+                .with_context(|| format!("binding to {bind}"))?,
+        };
         let local_addr = listener
             .local_addr()
             .context("reading bound hf2q HTTP address")?;
+        if let Some(lifeline) = chat_parent_lifeline.as_mut() {
+            lifeline.publish_ready(local_addr.port())?;
+        }
         tracing::info!(
             addr = %local_addr,
             "hf2q HTTP server listening"
@@ -5102,6 +5248,29 @@ pub fn cmd_serve(
         } else {
             None
         };
+        if let Some((repository, quant, path)) = startup_managed_identity.as_ref() {
+            match state_for_warmup.cache.lock() {
+                Ok(mut cache_guard) => {
+                    if let Err(error) = managed_artifacts::mark_successful_use(
+                        repository,
+                        *quant,
+                        path,
+                        &mut cache_guard,
+                    ) {
+                        tracing::warn!(%error, "model started but successful-use history could not be persisted");
+                        eprintln!(
+                            "Warning: model started, but its local-use history could not be persisted: {error}"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "model started but cache history mutex was poisoned");
+                    eprintln!(
+                        "Warning: model started, but its local-use history could not be persisted: {error}"
+                    );
+                }
+            }
+        }
 
         // Iter-209: warmup ran SYNCHRONOUSLY at pre-warm time (when
         // `--model` was supplied) inside `pool.load_or_get` →
@@ -5273,9 +5442,119 @@ pub fn cmd_serve(
 /// fact before arming the watcher and marks the descriptor close-on-exec so
 /// descendants cannot consume detach or prolong lifetime.
 pub(crate) const CHAT_LIFELINE_DETACH_FRAME: &[u8] = b"HF2Q-L1:DETACH\n";
+pub(crate) const CHAT_LIFELINE_READY_PREFIX: &str = "HF2Q-L1:READY:";
 
 #[cfg(unix)]
-fn start_chat_parent_lifeline(fd: i32) -> Result<()> {
+struct ChatParentLifeline {
+    readiness: std::os::unix::net::UnixStream,
+}
+
+#[cfg(not(unix))]
+struct ChatParentLifeline;
+
+#[cfg(unix)]
+impl ChatParentLifeline {
+    fn publish_ready(&mut self, port: u16) -> Result<()> {
+        use std::io::Write;
+
+        anyhow::ensure!(port != 0, "chat-owned listener cannot publish port 0");
+        write!(self.readiness, "{CHAT_LIFELINE_READY_PREFIX}{port}\n")
+            .context("publish chat-owned READY frame")?;
+        self.readiness
+            .flush()
+            .context("flush chat-owned READY frame")
+    }
+}
+
+#[cfg(unix)]
+fn validate_chat_parent_lifeline_socket(fd: i32) -> Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect inherited chat parent lifeline descriptor");
+    }
+    // SAFETY: fstat succeeded and initialized the structure.
+    let mode = unsafe { stat.assume_init() }.st_mode;
+    anyhow::ensure!(
+        mode & libc::S_IFMT == libc::S_IFSOCK,
+        "chat parent lifeline descriptor must be a private Unix socket"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn start_chat_owned_listener(fd: i32) -> Result<std::net::TcpListener> {
+    use std::os::fd::FromRawFd;
+
+    if fd < 3 {
+        anyhow::bail!("chat-owned listener descriptor must not alias stdin/stdout/stderr");
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect inherited chat-owned listener descriptor");
+    }
+    let mode = unsafe { stat.assume_init() }.st_mode;
+    anyhow::ensure!(
+        mode & libc::S_IFMT == libc::S_IFSOCK,
+        "chat-owned listener descriptor must be a socket"
+    );
+    let socket_option = |name: libc::c_int| -> Result<libc::c_int> {
+        let mut value = 0_i32;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                name,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("inspect inherited chat-owned listener socket option");
+        }
+        Ok(value)
+    };
+    anyhow::ensure!(
+        socket_option(libc::SO_TYPE)? == libc::SOCK_STREAM,
+        "chat-owned listener must be a TCP stream socket"
+    );
+    // macOS exposes SO_ACCEPTCONN in headers but getsockopt rejects it with
+    // ENOPROTOOPT. Re-applying listen is portable and idempotent for the
+    // already-listening socket retained by the parent; it also fails for a
+    // connected stream descriptor before any model work begins.
+    if unsafe { libc::listen(fd, 128) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("chat-owned listener socket is not listening");
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("make inherited chat-owned listener close-on-exec");
+    }
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    listener
+        .set_nonblocking(true)
+        .context("make inherited chat-owned listener nonblocking")?;
+    let address = listener
+        .local_addr()
+        .context("read inherited chat-owned listener address")?;
+    anyhow::ensure!(
+        matches!(address, std::net::SocketAddr::V4(address) if address.ip().is_loopback() && address.port() != 0),
+        "chat-owned listener must be a nonzero IPv4 loopback address"
+    );
+    Ok(listener)
+}
+
+#[cfg(not(unix))]
+fn start_chat_owned_listener(_fd: i32) -> Result<std::net::TcpListener> {
+    anyhow::bail!("chat-owned server listeners are unsupported on this platform; use --url")
+}
+
+#[cfg(unix)]
+fn start_chat_parent_lifeline(fd: i32) -> Result<ChatParentLifeline> {
     use std::os::fd::FromRawFd;
 
     if fd < 3 {
@@ -5288,6 +5567,7 @@ fn start_chat_parent_lifeline(fd: i32) -> Result<()> {
             "refusing chat parent lifeline outside an isolated process group (pid={pid}, pgrp={process_group})"
         );
     }
+    validate_chat_parent_lifeline_socket(fd)?;
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
         return Err(std::io::Error::last_os_error())
@@ -5297,19 +5577,12 @@ fn start_chat_parent_lifeline(fd: i32) -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .context("make chat parent lifeline close-on-exec");
     }
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("inspect inherited chat parent lifeline descriptor");
-    }
-    // SAFETY: fstat succeeded and initialized the structure.
-    let mode = unsafe { stat.assume_init() }.st_mode;
-    if mode & libc::S_IFMT != libc::S_IFSOCK && mode & libc::S_IFMT != libc::S_IFIFO {
-        anyhow::bail!("chat parent lifeline descriptor must be a private socket or pipe");
-    }
     // SAFETY: `fd` was validated above and ownership transfers exactly once
     // into the watcher thread. The launcher retains only the peer socket.
-    let mut lifeline = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut lifeline = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    let readiness = lifeline
+        .try_clone()
+        .context("clone chat parent lifeline for private READY handoff")?;
     std::thread::Builder::new()
         .name("hf2q-chat-lifeline".to_owned())
         .spawn(move || {
@@ -5326,11 +5599,11 @@ fn start_chat_parent_lifeline(fd: i32) -> Result<()> {
             }
         })
         .context("spawn diagnostic chat parent-lifetime watcher")?;
-    Ok(())
+    Ok(ChatParentLifeline { readiness })
 }
 
 #[cfg(not(unix))]
-fn start_chat_parent_lifeline(_fd: i32) -> Result<()> {
+fn start_chat_parent_lifeline(_fd: i32) -> Result<ChatParentLifeline> {
     anyhow::bail!("chat-owned server lifelines are unsupported on this platform; use --url")
 }
 
@@ -6243,14 +6516,16 @@ fn cmd_parity_capture(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::start_chat_owned_listener;
     use super::{
         build_chat_template_env, detect_greedy_repetition_loop,
         detect_greedy_repetition_loop_with_text, find_special_token_stop, maybe_print_serve_banner,
         peer_special_token_id_for_model, render_jinja_template, resolve_enable_thinking,
-        resolve_serve_endpoint, run_decode_loop, validate_configured_endpoint_auth,
-        validate_greedy_only_speculative_cli_path, validate_mmproj_diagnostic_mode,
-        validate_mmproj_text_binding, DecodeStopReason, RaisePolicy,
-        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        resolve_serve_endpoint, run_decode_loop, validate_chat_parent_lifeline_socket,
+        validate_configured_endpoint_auth, validate_greedy_only_speculative_cli_path,
+        validate_mmproj_diagnostic_mode, validate_mmproj_text_binding, DecodeStopReason,
+        RaisePolicy, FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::cli;
     use crate::core::chat_templates::QWEN3_CHATML;
@@ -8264,5 +8539,32 @@ mod tests {
         assert!(validate_mmproj_diagnostic_mode(true, true, false).is_err());
         validate_mmproj_diagnostic_mode(true, true, true).expect("explicit diagnostic ack");
         validate_mmproj_diagnostic_mode(false, true, false).expect("warmup-only skip");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_lifeline_transport_accepts_only_unix_sockets() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        validate_chat_parent_lifeline_socket(socket.as_raw_fd()).unwrap();
+
+        let mut pipe = [0_i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let error = validate_chat_parent_lifeline_socket(pipe[0]).unwrap_err();
+        assert!(error.to_string().contains("private Unix socket"), "{error}");
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+
+        let (connected, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let error = start_chat_owned_listener(connected.as_raw_fd()).unwrap_err();
+        assert!(error.to_string().contains("not listening"), "{error}");
+
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let adopted = start_chat_owned_listener(listener.into_raw_fd()).unwrap();
+        assert_eq!(adopted.local_addr().unwrap(), address);
     }
 }

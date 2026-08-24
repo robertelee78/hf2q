@@ -14,7 +14,7 @@ use super::{
     detect_arch, run_convert_internal, ConvertArgs, ConvertError, ConvertMode, PairBinding,
 };
 use crate::convert::quant_selector::QuantSelector;
-use crate::convert::receipt::{receipt_path, ConversionReceipt};
+use crate::convert::receipt::{receipt_path, ConversionReceipt, RemoteConversionSource};
 use crate::convert::tensor_lineage::tensor_conversion_receipt_path;
 use crate::convert::HfModelSource;
 use crate::core::paired_artifact::{
@@ -34,7 +34,7 @@ enum ProjectorEmitter {
 pub(super) fn run(mut args: ConvertArgs) -> Result<(), ConvertError> {
     let requested_projector_output = match &args.mode {
         ConvertMode::TextOnly | ConvertMode::ProjectorOnly => {
-            return run_convert_internal(args, None, PairBinding::default()).map(|_| ());
+            return run_convert_internal(args, None, PairBinding::default(), true).map(|_| ());
         }
         ConvertMode::Paired { projector_output } => projector_output.clone(),
     };
@@ -58,7 +58,7 @@ pub(super) fn run(mut args: ConvertArgs) -> Result<(), ConvertError> {
             ));
         }
         args.mode = ConvertMode::TextOnly;
-        return run_convert_internal(args, None, PairBinding::default()).map(|_| ());
+        return run_convert_internal(args, None, PairBinding::default(), true).map(|_| ());
     }
 
     if !has_vision_tensors {
@@ -94,7 +94,7 @@ pub(super) fn run(mut args: ConvertArgs) -> Result<(), ConvertError> {
             "multimodal dry run plans a text + projector pair; no output is written"
         );
         args.mode = ConvertMode::TextOnly;
-        return run_convert_internal(args, None, PairBinding::default()).map(|_| ());
+        return run_convert_internal(args, None, PairBinding::default(), true).map(|_| ());
     }
 
     drop(source);
@@ -192,6 +192,13 @@ fn run_pair(args: ConvertArgs, projector_output: PathBuf) -> Result<(), ConvertE
     let staged_projector = workspace.staged_path(PairMemberRole::Projector);
     let staged_text = workspace.staged_path(PairMemberRole::Text);
 
+    preflight_pair_plan(
+        &args,
+        workspace.transaction_id(),
+        &staged_text,
+        &canonical_text_output,
+    )?;
+
     let result = run_pair_in_workspace(
         &args,
         &workspace,
@@ -236,6 +243,7 @@ fn run_pair_in_workspace(
             projector_sha256: None,
             generation: Some(workspace.transaction_id()),
         },
+        true,
     )?;
     let staged_projector_receipt = retarget_receipt(staged_projector, projector_output)?;
     let projector_sha256 = fresh_artifact_sha256(
@@ -255,6 +263,7 @@ fn run_pair_in_workspace(
             projector_sha256: Some(&projector_sha256),
             generation: Some(workspace.transaction_id()),
         },
+        true,
     )?;
     let staged_text_receipt = retarget_receipt(staged_text, text_output)?;
     validate_bound_text(staged_text, &projector_sha256, workspace.transaction_id())?;
@@ -288,9 +297,15 @@ fn run_pair_in_workspace(
         ),
         (PairMemberRole::Text, canonical_text_output.to_path_buf()),
     ];
-    workspace
-        .publish(&destinations)
-        .map_err(|error| pair_error(error.to_string()))?;
+    if args.no_clobber {
+        workspace
+            .publish_no_clobber(&destinations)
+            .map_err(|error| pair_error(error.to_string()))?;
+    } else {
+        workspace
+            .publish(&destinations)
+            .map_err(|error| pair_error(error.to_string()))?;
+    }
 
     tracing::info!(
         target: "convert",
@@ -300,6 +315,47 @@ fn run_pair_in_workspace(
         "published source-bound multimodal text + projector pair"
     );
     Ok(())
+}
+
+fn preflight_pair_plan(
+    args: &ConvertArgs,
+    generation: &str,
+    staged_text: &Path,
+    destination: &Path,
+) -> Result<(), ConvertError> {
+    let planned_projector = crate::models::vit::planned_vision_tower_output_bytes(
+        &args.hf_dir,
+        args.remote_source
+            .as_ref()
+            .map(RemoteConversionSource::source_sha256),
+        Some(generation),
+    )?;
+    let placeholder_projector_sha = "0".repeat(64);
+    let mut text_plan_args = args.clone();
+    text_plan_args.output = staged_text.to_path_buf();
+    text_plan_args.mode = ConvertMode::TextOnly;
+    text_plan_args.dry_run = true;
+    text_plan_args.imatrix_out = None;
+    let planned_text = run_convert_internal(
+        text_plan_args,
+        None,
+        PairBinding {
+            projector_sha256: Some(&placeholder_projector_sha),
+            generation: Some(generation),
+        },
+        false,
+    )?
+    .planned_output_bytes;
+    let total = planned_text
+        .checked_add(planned_projector)
+        .ok_or_else(|| pair_error("paired conversion output plan exceeds u64"))?;
+    let label = args
+        .remote_source
+        .as_ref()
+        .map(|source| source.reference().repo_id())
+        .unwrap_or("local multimodal model");
+    crate::input::hf_download::check_conversion_output_preflight(label, destination, total)
+        .map_err(ConvertError::HfDownload)
 }
 
 fn retarget_receipt(
@@ -441,6 +497,7 @@ mod tests {
             hf_dir: PathBuf::from("/cache/exact-source"),
             selector: QuantSelector::Standard(GgufFtype::MostlyQ8_0),
             output,
+            no_clobber: false,
             dry_run: false,
             imatrix: None,
             imatrix_corpus: None,

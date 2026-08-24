@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -11,10 +11,10 @@ use crate::core::provenance::tensor_execution::ArtifactEvidence;
 use crate::intelligence::measured_auto_quant::SourceIdentity;
 
 use super::{
-    ConversionSourceDisposition, ExcludedSourceTensorEvidence, MaterializedDirectTensorRecord,
-    MaterializedSourceTensorEvidence, Qwen35DenseBakeStepEvidence,
-    STORED_TENSOR_CONVERSION_RECEIPT_SCHEMA_VERSION, VerifiedConversionEvidenceContext,
-    VerifiedStoredTensorCatalog, verify_source_to_stored_continuity,
+    verify_source_to_stored_continuity, ConversionSourceDisposition, ExcludedSourceTensorEvidence,
+    MaterializedDirectTensorRecord, MaterializedSourceTensorEvidence, Qwen35DenseBakeStepEvidence,
+    VerifiedConversionEvidenceContext, VerifiedStoredTensorCatalog,
+    STORED_TENSOR_CONVERSION_RECEIPT_SCHEMA_VERSION,
 };
 
 pub(crate) const STORED_TENSOR_CONVERSION_SCOPE: &str =
@@ -470,12 +470,31 @@ pub(crate) fn prepare_tensor_conversion_receipt(
 
 pub(crate) fn promote_tensor_conversion_receipt(
     prepared: PreparedTensorConversionReceipt,
+    no_clobber: bool,
 ) -> Result<PathBuf> {
+    if no_clobber {
+        prepared
+            .temporary
+            .persist_noclobber(&prepared.path)
+            .map_err(|error| error.error)?;
+    } else {
+        prepared
+            .temporary
+            .persist(&prepared.path)
+            .map_err(|error| error.error)?;
+    }
+    Ok(prepared.path)
+}
+
+pub(crate) fn stage_tensor_conversion_receipt(
+    prepared: PreparedTensorConversionReceipt,
+    staging: &Path,
+) -> Result<()> {
     prepared
         .temporary
-        .persist(&prepared.path)
+        .persist_noclobber(staging)
         .map_err(|error| error.error)?;
-    Ok(prepared.path)
+    Ok(())
 }
 
 pub(crate) fn clear_stale_tensor_conversion_receipt(output: &Path) -> Result<()> {

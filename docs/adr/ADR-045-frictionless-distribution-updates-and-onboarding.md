@@ -609,6 +609,12 @@ If one of those outcomes is needed, it requires its own governing decision or
 the already applicable ADR. It must not be smuggled into onboarding as an
 implementation detail.
 
+ADR-051 subsequently supplies that separate governing decision for the first
+two bullets: repository model operands, managed local authority, local-first
+resolution, hosted-GGUF preparation, native-conversion fallback, and local
+inventory are now an explicit product surface. The remaining ADR-045
+non-goals and all installation/distribution decisions above are unchanged.
+
 ## Configuration precedence
 
 The schema-2 setup slice freezes the governing precedence as:

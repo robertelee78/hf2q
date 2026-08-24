@@ -127,7 +127,11 @@ pub(crate) struct OwnedServerProcess {
     child: Child,
     lifeline: Option<ParentLifeline>,
     #[cfg(unix)]
+    readiness_frame: Vec<u8>,
+    #[cfg(unix)]
     process_group: libc::pid_t,
+    #[cfg(unix)]
+    listener_guard: Option<std::net::TcpListener>,
     server_log: ServerLog,
 }
 
@@ -148,6 +152,7 @@ impl OwnedServerProcess {
         mut child: Child,
         lifeline: ParentLifeline,
         server_log: tempfile::NamedTempFile,
+        #[cfg(unix)] listener_guard: Option<std::net::TcpListener>,
     ) -> Result<Self> {
         #[cfg(unix)]
         let process_group = child.id() as libc::pid_t;
@@ -161,12 +166,19 @@ impl OwnedServerProcess {
                     "chat-owned server did not enter its isolated process group (pid={process_group}, pgrp={actual})"
                 );
             }
+            lifeline
+                .set_nonblocking(true)
+                .context("make chat-owned readiness channel nonblocking")?;
         }
         Ok(Self {
             child,
             lifeline: Some(lifeline),
             #[cfg(unix)]
+            readiness_frame: Vec::new(),
+            #[cfg(unix)]
             process_group,
+            #[cfg(unix)]
+            listener_guard,
             server_log: ServerLog::new(server_log),
         })
     }
@@ -181,6 +193,57 @@ impl OwnedServerProcess {
 
     pub(crate) fn leader_exited_unreaped(&mut self) -> Result<bool> {
         leader_exited_unreaped(&mut self.child)
+    }
+
+    /// Read the bound loopback port from the private inherited Unix socket.
+    /// DNS-SD PID/TXT hints are deliberately not accepted as child identity.
+    #[cfg(unix)]
+    pub(crate) fn poll_ready_port(&mut self) -> Result<Option<u16>> {
+        use std::io::Read;
+
+        const MAX_FRAME_BYTES: usize = 64;
+        let Some(lifeline) = self.lifeline.as_mut() else {
+            bail!("chat-owned readiness channel is no longer available");
+        };
+        let mut chunk = [0_u8; MAX_FRAME_BYTES];
+        match lifeline.read(&mut chunk) {
+            Ok(0) => bail!("chat-owned server closed its readiness channel before READY"),
+            Ok(read) => self.readiness_frame.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error).context("read chat-owned READY frame"),
+        }
+        if self.readiness_frame.len() > MAX_FRAME_BYTES {
+            bail!("chat-owned READY frame exceeds the bounded protocol size");
+        }
+        let Some(newline) = self.readiness_frame.iter().position(|byte| *byte == b'\n') else {
+            return Ok(None);
+        };
+        if newline + 1 != self.readiness_frame.len() {
+            bail!("chat-owned readiness channel sent trailing data");
+        }
+        let frame = std::str::from_utf8(&self.readiness_frame[..newline])
+            .context("chat-owned READY frame is not UTF-8")?;
+        let port = frame
+            .strip_prefix(crate::serve::CHAT_LIFELINE_READY_PREFIX)
+            .context("chat-owned readiness channel sent an invalid frame")?
+            .parse::<u16>()
+            .context("chat-owned READY frame has an invalid port")?;
+        if port == 0 {
+            bail!("chat-owned READY frame reported port 0");
+        }
+        if let Some(listener) = self.listener_guard.as_ref() {
+            let expected = listener
+                .local_addr()
+                .context("read retained chat-owned listener address")?
+                .port();
+            if port != expected {
+                bail!(
+                    "chat-owned READY port {port} does not match retained listener port {expected}"
+                );
+            }
+        }
+        self.readiness_frame.clear();
+        Ok(Some(port))
     }
 
     fn detach_lifeline(&mut self) -> Result<PathBuf> {
@@ -582,8 +645,13 @@ mod tests {
             let mut frame = vec![0u8; crate::serve::CHAT_LIFELINE_DETACH_FRAME.len()];
             let _ = peer.read_exact(&mut frame);
         });
-        OwnedServerProcess::from_spawned(command_builder.spawn().unwrap(), lifeline, server_log)
-            .unwrap()
+        OwnedServerProcess::from_spawned(
+            command_builder.spawn().unwrap(),
+            lifeline,
+            server_log,
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -594,6 +662,48 @@ mod tests {
             endpoint.route("/v1/models"),
             "http://127.0.0.1:9123/v1/models"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_listener_rejects_ready_mismatch_and_prevents_exit_rebind() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (lifeline, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut process = OwnedServerProcess::from_spawned(
+            child,
+            lifeline,
+            tempfile::NamedTempFile::new().unwrap(),
+            Some(listener),
+        )
+        .unwrap();
+        writeln!(
+            peer,
+            "{}{}",
+            crate::serve::CHAT_LIFELINE_READY_PREFIX,
+            address.port().saturating_add(1)
+        )
+        .unwrap();
+        peer.flush().unwrap();
+        let error = process.poll_ready_port().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match retained listener"));
+
+        process.force_stop().unwrap();
+        let rebind = std::net::TcpListener::bind(address).unwrap_err();
+        assert_eq!(rebind.kind(), std::io::ErrorKind::AddrInUse);
+        drop(process);
+        std::net::TcpListener::bind(address)
+            .expect("port is released only with endpoint authority");
     }
 
     #[test]

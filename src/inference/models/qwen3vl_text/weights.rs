@@ -52,6 +52,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::gguf::GgufFile;
+use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{MlxBuffer, MlxDevice};
 
 use crate::serve::header::LoadProgress;
@@ -89,26 +90,33 @@ pub struct Qwen3VlTextLayerWeights {
     pub attn_norm: MlxBuffer,
     /// Q projection weight, shape `[hidden_size, hidden_size]`, Q4_0.
     pub attn_q: MlxBuffer,
+    pub attn_q_type: GgmlType,
     /// K projection weight, shape `[n_kv_heads * head_dim, hidden_size]`, Q4_0.
     pub attn_k: MlxBuffer,
+    pub attn_k_type: GgmlType,
     /// V projection weight, shape `[n_kv_heads * head_dim, hidden_size]`, Q4_0.
     pub attn_v: MlxBuffer,
+    pub attn_v_type: GgmlType,
     /// Per-head Q RMSNorm weight, shape `[head_dim]`, F32.
     pub attn_q_norm: MlxBuffer,
     /// Per-head K RMSNorm weight, shape `[head_dim]`, F32.
     pub attn_k_norm: MlxBuffer,
     /// Output projection weight, shape `[hidden_size, hidden_size]`, Q4_0.
     pub attn_output: MlxBuffer,
+    pub attn_output_type: GgmlType,
 
     // -------------------- FFN --------------------
     /// Post-attention RMSNorm weight, shape `[hidden_size]`, F32.
     pub ffn_norm: MlxBuffer,
     /// FFN gate projection (SiLU branch), shape `[intermediate_size, hidden_size]`, Q4_0.
     pub ffn_gate: MlxBuffer,
+    pub ffn_gate_type: GgmlType,
     /// FFN up projection (linear branch), shape `[intermediate_size, hidden_size]`, Q4_0.
     pub ffn_up: MlxBuffer,
+    pub ffn_up_type: GgmlType,
     /// FFN down projection, shape `[hidden_size, intermediate_size]`, Q4_0.
     pub ffn_down: MlxBuffer,
+    pub ffn_down_type: GgmlType,
 }
 
 /// All weights for the Qwen3-VL text LM.
@@ -133,6 +141,7 @@ pub struct Qwen3VlTextWeights {
     /// `None` iff [`Qwen3VlTextConfig::tied_word_embeddings`] is `true`
     /// (the LM head re-uses [`Self::token_embd`]).
     pub output: Option<MlxBuffer>,
+    pub output_type: Option<GgmlType>,
     /// Mirror of [`Qwen3VlTextConfig::tied_word_embeddings`] — kept in
     /// the weights struct so the forward path can dispatch on it
     /// without needing the config back.
@@ -209,14 +218,15 @@ impl Qwen3VlTextWeights {
             .map_err(|e| anyhow!("output_norm.weight load: {e}"))?;
         validate_shape("output_norm.weight", &output_norm, &[hidden])?;
 
-        let output = if cfg.tied_word_embeddings {
-            None
+        let (output, output_type) = if cfg.tied_word_embeddings {
+            (None, None)
         } else {
+            let output_type = validate_quantized_proj_type(gguf, "output.weight")?;
             let buf = gguf
                 .load_tensor("output.weight", device)
                 .map_err(|e| anyhow!("output.weight load: {e}"))?;
             validate_shape("output.weight", &buf, &[vocab, hidden])?;
-            Some(buf)
+            (Some(buf), Some(output_type))
         };
 
         // -------------------- Per-layer tensors --------------------
@@ -235,6 +245,7 @@ impl Qwen3VlTextWeights {
             layers,
             output_norm,
             output,
+            output_type,
             tied_word_embeddings: cfg.tied_word_embeddings,
             hidden_size: hidden,
             vocab_size: vocab,
@@ -274,21 +285,45 @@ fn validate_shape(name: &str, buf: &MlxBuffer, expected: &[usize]) -> Result<()>
 ///   - Embedding (token_embd, output): F16 OR Q4_0 OR another quantized
 ///     type — operator may convert via different quants. Anything
 ///     gguf::load_tensor accepts is fine.
-fn validate_quantized_proj_type(gguf: &mlx_native::gguf::GgufFile, name: &str) -> Result<()> {
-    use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+fn validate_quantized_proj_type(gguf: &mlx_native::gguf::GgufFile, name: &str) -> Result<GgmlType> {
     let info = gguf
         .tensor_info(name)
         .ok_or_else(|| anyhow!("{name}: tensor info missing (loader can't validate ggml_type)"))?;
-    match info.ggml_type {
-        GgmlType::Q4_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0 => {
-            Ok(())
-        }
-        other => Err(anyhow!(
+    if qwen3vl_projection_type_supported(info.ggml_type) {
+        Ok(info.ggml_type)
+    } else {
+        let other = info.ggml_type;
+        Err(anyhow!(
             "{name}: ggml_type {other:?} is not a quantized projection \
-             type (expected Q4_0/Q4_K/Q5_K/Q6_K/Q8_0). Loading would \
+             type (expected Q2_K/Q3_K/Q4_0/Q4_K/Q5_K/Q6_K/Q8_0). Loading would \
              route through the wrong qmatmul kernel and produce garbage."
-        )),
+        ))
     }
+}
+
+pub(crate) fn qwen3vl_projection_type_supported(ggml_type: GgmlType) -> bool {
+    matches!(
+        ggml_type,
+        GgmlType::Q2_K
+            | GgmlType::Q3_K
+            | GgmlType::Q4_0
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::Q8_0
+    )
+}
+
+pub(crate) fn qwen3vl_ffn_dispatch_types(
+    gate: GgmlType,
+    up: GgmlType,
+    down: GgmlType,
+) -> Result<(GgmlType, GgmlType)> {
+    anyhow::ensure!(
+        gate == up,
+        "Qwen3-VL FFN gate/up GGML types differ ({gate:?} vs {up:?}); both buffers share one dispatch type"
+    );
+    Ok((gate, down))
 }
 
 fn load_layer(
@@ -306,21 +341,21 @@ fn load_layer(
     validate_shape("attn_norm", &attn_norm, &[hidden])?;
 
     let attn_q_name = format!("blk.{il}.attn_q.weight");
-    validate_quantized_proj_type(gguf, &attn_q_name)?;
+    let attn_q_type = validate_quantized_proj_type(gguf, &attn_q_name)?;
     let attn_q = gguf
         .load_tensor(&attn_q_name, device)
         .map_err(|e| anyhow!("{attn_q_name}: {e}"))?;
     validate_shape("attn_q", &attn_q, &[hidden, hidden])?;
 
     let attn_k_name = format!("blk.{il}.attn_k.weight");
-    validate_quantized_proj_type(gguf, &attn_k_name)?;
+    let attn_k_type = validate_quantized_proj_type(gguf, &attn_k_name)?;
     let attn_k = gguf
         .load_tensor(&attn_k_name, device)
         .map_err(|e| anyhow!("{attn_k_name}: {e}"))?;
     validate_shape("attn_k", &attn_k, &[kv_dim, hidden])?;
 
     let attn_v_name = format!("blk.{il}.attn_v.weight");
-    validate_quantized_proj_type(gguf, &attn_v_name)?;
+    let attn_v_type = validate_quantized_proj_type(gguf, &attn_v_name)?;
     let attn_v = gguf
         .load_tensor(&attn_v_name, device)
         .map_err(|e| anyhow!("{attn_v_name}: {e}"))?;
@@ -337,7 +372,7 @@ fn load_layer(
     validate_shape("attn_k_norm", &attn_k_norm, &[head_dim])?;
 
     let attn_output_name = format!("blk.{il}.attn_output.weight");
-    validate_quantized_proj_type(gguf, &attn_output_name)?;
+    let attn_output_type = validate_quantized_proj_type(gguf, &attn_output_name)?;
     let attn_output = gguf
         .load_tensor(&attn_output_name, device)
         .map_err(|e| anyhow!("{attn_output_name}: {e}"))?;
@@ -349,38 +384,47 @@ fn load_layer(
     validate_shape("ffn_norm", &ffn_norm, &[hidden])?;
 
     let ffn_gate_name = format!("blk.{il}.ffn_gate.weight");
-    validate_quantized_proj_type(gguf, &ffn_gate_name)?;
+    let ffn_gate_type = validate_quantized_proj_type(gguf, &ffn_gate_name)?;
     let ffn_gate = gguf
         .load_tensor(&ffn_gate_name, device)
         .map_err(|e| anyhow!("{ffn_gate_name}: {e}"))?;
     validate_shape("ffn_gate", &ffn_gate, &[intermediate, hidden])?;
 
     let ffn_up_name = format!("blk.{il}.ffn_up.weight");
-    validate_quantized_proj_type(gguf, &ffn_up_name)?;
+    let ffn_up_type = validate_quantized_proj_type(gguf, &ffn_up_name)?;
     let ffn_up = gguf
         .load_tensor(&ffn_up_name, device)
         .map_err(|e| anyhow!("{ffn_up_name}: {e}"))?;
     validate_shape("ffn_up", &ffn_up, &[intermediate, hidden])?;
 
     let ffn_down_name = format!("blk.{il}.ffn_down.weight");
-    validate_quantized_proj_type(gguf, &ffn_down_name)?;
+    let ffn_down_type = validate_quantized_proj_type(gguf, &ffn_down_name)?;
     let ffn_down = gguf
         .load_tensor(&ffn_down_name, device)
         .map_err(|e| anyhow!("{ffn_down_name}: {e}"))?;
     validate_shape("ffn_down", &ffn_down, &[hidden, intermediate])?;
+    qwen3vl_ffn_dispatch_types(ffn_gate_type, ffn_up_type, ffn_down_type)
+        .with_context(|| format!("Qwen3-VL layer {il}: invalid FFN dispatch types"))?;
 
     Ok(Qwen3VlTextLayerWeights {
         attn_norm,
         attn_q,
+        attn_q_type,
         attn_k,
+        attn_k_type,
         attn_v,
+        attn_v_type,
         attn_q_norm,
         attn_k_norm,
         attn_output,
+        attn_output_type,
         ffn_norm,
         ffn_gate,
+        ffn_gate_type,
         ffn_up,
+        ffn_up_type,
         ffn_down,
+        ffn_down_type,
     })
 }
 
@@ -395,6 +439,22 @@ mod tests {
     //! `HF2Q_QWEN3VL_LM_LOAD=1`.
 
     use super::*;
+
+    #[test]
+    fn q2_q3_projection_types_are_bound_to_their_exact_forward_routes() {
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+
+        assert!(qwen3vl_projection_type_supported(GgmlType::Q2_K));
+        assert!(qwen3vl_projection_type_supported(GgmlType::Q3_K));
+        assert!(!qwen3vl_projection_type_supported(GgmlType::F16));
+        assert_eq!(
+            qwen3vl_ffn_dispatch_types(GgmlType::Q2_K, GgmlType::Q2_K, GgmlType::Q3_K).unwrap(),
+            (GgmlType::Q2_K, GgmlType::Q3_K)
+        );
+        assert!(
+            qwen3vl_ffn_dispatch_types(GgmlType::Q2_K, GgmlType::Q3_K, GgmlType::Q4_K,).is_err()
+        );
+    }
 
     #[test]
     fn load_real_qwen3vl_2b_gguf_when_operator_gated() {

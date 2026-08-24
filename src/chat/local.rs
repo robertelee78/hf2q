@@ -2,8 +2,9 @@
 //!
 //! DNS-SD provides only untrusted candidates. Every candidate is forced to
 //! loopback by `serve::discovery`, then verified over HTTP before selection.
-//! Process lifecycle authority is created only for the concrete child this
-//! module spawns; discovery PID hints are used solely to correlate its advert.
+//! Process lifecycle and endpoint authority are created only for the concrete
+//! child this module spawns. Its bound port arrives over a private inherited
+//! Unix socket; DNS-SD PID/TXT hints never receive credentials or authority.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -24,7 +25,9 @@ use super::wire::Model;
 
 const EXISTING_DISCOVERY_WINDOW: Duration = Duration::from_secs(2);
 const STARTUP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const MODEL_STARTUP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const MODEL_STARTUP_HEARTBEAT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct VerifiedServer {
@@ -33,7 +36,17 @@ struct VerifiedServer {
     models: Vec<Model>,
 }
 
-pub(crate) struct AutomaticEndpointResolver;
+pub(crate) struct AutomaticEndpointResolver {
+    state_root: Option<std::path::PathBuf>,
+}
+
+impl AutomaticEndpointResolver {
+    pub(crate) fn new(state_root: Option<&std::path::Path>) -> Self {
+        Self {
+            state_root: state_root.map(std::path::Path::to_path_buf),
+        }
+    }
+}
 
 impl EndpointResolver for AutomaticEndpointResolver {
     fn resolve(&mut self, args: &ChatArgs) -> Result<EndpointSession> {
@@ -43,7 +56,9 @@ impl EndpointResolver for AutomaticEndpointResolver {
         let auth_token = std::env::var("HF2Q_AUTH_TOKEN")
             .ok()
             .filter(|token| !token.is_empty());
-        require_credentialless_automatic_discovery(auth_token.as_deref())?;
+        if args.target.is_none() {
+            require_credentialless_automatic_discovery(auth_token.as_deref())?;
+        }
         if !discovery::is_supported() {
             bail!("automatic local hf2q discovery is unavailable on this platform; use --url");
         }
@@ -56,7 +71,13 @@ impl EndpointResolver for AutomaticEndpointResolver {
         let stdout = std::io::stdout();
         let mut input = stdin.lock();
         let mut output = stdout.lock();
-        runtime.block_on(resolve_local(args, &mut input, &mut output))
+        runtime.block_on(resolve_local(
+            args,
+            &mut input,
+            &mut output,
+            auth_token.as_deref(),
+            self.state_root.as_deref(),
+        ))
     }
 }
 
@@ -64,6 +85,8 @@ async fn resolve_local(
     args: &ChatArgs,
     input: &mut impl BufRead,
     output: &mut impl Write,
+    owned_auth_token: Option<&str>,
+    state_root: Option<&std::path::Path>,
 ) -> Result<EndpointSession> {
     let http = reqwest::Client::builder()
         .connect_timeout(HTTP_PROBE_TIMEOUT)
@@ -71,21 +94,42 @@ async fn resolve_local(
         .build()
         .context("build local server probe client")?;
 
-    let mut browser = LocalDiscoveryBrowser::start().context("start local hf2q discovery")?;
-    let existing = collect_verified(&mut browser, &http, EXISTING_DISCOVERY_WINDOW).await?;
-    if !existing.is_empty() {
-        let selected = select_server(&existing, args.model.as_deref(), input, output)?;
-        return Ok(EndpointSession::discovered_hf2q(selected.endpoint.clone()));
+    if args.target.is_none() {
+        let mut browser = LocalDiscoveryBrowser::start().context("start local hf2q discovery")?;
+        let existing = collect_verified(&mut browser, &http, EXISTING_DISCOVERY_WINDOW).await?;
+        if !existing.is_empty() {
+            let selected = select_server(&existing, args.model.as_deref(), input, output)?;
+            return Ok(EndpointSession::discovered_hf2q(selected.endpoint.clone()));
+        }
     }
 
-    writeln!(output, "no local hf2q server found; starting one")?;
+    if args.target.is_some() {
+        writeln!(
+            output,
+            "starting an owned hf2q server for the requested model"
+        )?;
+        writeln!(
+            output,
+            "preparing the requested model; local verification, download, or native conversion may take time on first use"
+        )?;
+    } else {
+        writeln!(output, "no local hf2q server found; starting one")?;
+    }
     output.flush()?;
-    let mut startup_browser =
-        LocalDiscoveryBrowser::start().context("start owned-server discovery")?;
-    let mut child = spawn_server().context("start hf2q serve")?;
-    let child_pid = child.child_mut().id().to_string();
-    let startup =
-        wait_for_spawned_server(&mut startup_browser, &http, &mut child, &child_pid).await;
+    let mut child = spawn_server(args.target.as_deref(), state_root).context("start hf2q serve")?;
+    let startup = wait_for_spawned_server(
+        &http,
+        &mut child,
+        if args.target.is_some() {
+            MODEL_STARTUP_DISCOVERY_TIMEOUT
+        } else {
+            STARTUP_DISCOVERY_TIMEOUT
+        },
+        owned_auth_token,
+        output,
+        args.target.is_some(),
+    )
+    .await;
     match startup {
         Ok(server) => Ok(EndpointSession::spawned_loopback(
             endpoint_port(&server.endpoint)?,
@@ -126,11 +170,24 @@ fn require_credentialless_automatic_discovery(auth_token: Option<&str>) -> Resul
 }
 
 #[cfg(unix)]
-fn spawn_server() -> Result<OwnedServerProcess> {
+fn spawn_server(
+    target: Option<&str>,
+    state_root: Option<&std::path::Path>,
+) -> Result<OwnedServerProcess> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
     let executable = std::env::current_exe().context("locate current hf2q executable")?;
+    let listener_guard = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .context("pre-bind private chat-owned loopback listener")?;
+    listener_guard
+        .set_nonblocking(true)
+        .context("make private chat-owned listener nonblocking")?;
+    let listener_port = listener_guard
+        .local_addr()
+        .context("read private chat-owned listener address")?
+        .port();
+    let listener_fd = listener_guard.as_raw_fd();
     let (parent_lifeline, child_lifeline) = std::os::unix::net::UnixStream::pair()
         .context("create private chat parent-lifetime channel")?;
     let child_fd = child_lifeline.as_raw_fd();
@@ -143,10 +200,15 @@ fn spawn_server() -> Result<OwnedServerProcess> {
         .reopen()
         .context("open chat-owned server log writer")?;
     let mut command = Command::new(executable);
+    append_owned_server_args(
+        &mut command,
+        target,
+        state_root,
+        child_fd,
+        listener_fd,
+        listener_port,
+    );
     command
-        .args(["serve", "--host", "127.0.0.1", "--port", "0", "--quiet"])
-        .args(["--operator-ui", "plain", "--chat-parent-lifeline-fd"])
-        .arg(child_fd.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr))
@@ -156,9 +218,11 @@ fn spawn_server() -> Result<OwnedServerProcess> {
     // any model-transfer or conversion descendants.
     unsafe {
         command.pre_exec(move || {
-            let flags = libc::fcntl(child_fd, libc::F_GETFD);
-            if flags < 0 || libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                return Err(std::io::Error::last_os_error());
+            for fd in [child_fd, listener_fd] {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
@@ -167,11 +231,40 @@ fn spawn_server() -> Result<OwnedServerProcess> {
         .spawn()
         .context("spawn current executable as hf2q serve")?;
     drop(child_lifeline);
-    OwnedServerProcess::from_spawned(child, parent_lifeline, server_log)
+    OwnedServerProcess::from_spawned(child, parent_lifeline, server_log, Some(listener_guard))
+}
+
+#[cfg(unix)]
+fn append_owned_server_args(
+    command: &mut Command,
+    target: Option<&str>,
+    state_root: Option<&std::path::Path>,
+    child_fd: std::os::fd::RawFd,
+    listener_fd: std::os::fd::RawFd,
+    listener_port: u16,
+) {
+    if let Some(state_root) = state_root {
+        command.arg("--state-root").arg(state_root);
+    }
+    command.arg("serve");
+    if let Some(target) = target {
+        command.arg(target);
+    }
+    command
+        .args(["--host", "127.0.0.1", "--port"])
+        .arg(listener_port.to_string())
+        .arg("--quiet")
+        .args(["--operator-ui", "plain", "--chat-parent-lifeline-fd"])
+        .arg(child_fd.to_string())
+        .arg("--chat-owned-listener-fd")
+        .arg(listener_fd.to_string());
 }
 
 #[cfg(not(unix))]
-fn spawn_server() -> Result<OwnedServerProcess> {
+fn spawn_server(
+    _target: Option<&str>,
+    _state_root: Option<&std::path::Path>,
+) -> Result<OwnedServerProcess> {
     bail!("automatic chat-owned server lifecycle is unavailable on this platform; use --url")
 }
 
@@ -190,7 +283,7 @@ async fn collect_verified(
         match browser.next_event(remaining).await? {
             None => break,
             Some(LocalDiscoveryEvent::Added(candidate)) => {
-                if let Some(server) = verify_candidate(http, candidate).await {
+                if let Some(server) = verify_candidate(http, candidate, None).await {
                     servers.insert(server.identity.clone(), server);
                 }
             }
@@ -206,12 +299,17 @@ async fn collect_verified(
 }
 
 async fn wait_for_spawned_server(
-    browser: &mut LocalDiscoveryBrowser,
     http: &reqwest::Client,
     process: &mut OwnedServerProcess,
-    child_pid: &str,
+    timeout: Duration,
+    auth_token: Option<&str>,
+    output: &mut impl Write,
+    show_preparation_progress: bool,
 ) -> Result<VerifiedServer> {
-    let deadline = tokio::time::Instant::now() + STARTUP_DISCOVERY_TIMEOUT;
+    let started = tokio::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut next_heartbeat = started + MODEL_STARTUP_HEARTBEAT;
+    let mut ready_port = None;
     loop {
         if process.leader_exited_unreaped()? {
             bail!("chat-started hf2q serve exited before discovery");
@@ -219,42 +317,92 @@ async fn wait_for_spawned_server(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             bail!(
-                "chat-started hf2q serve was not discovered and HTTP-verified within {:?}",
-                STARTUP_DISCOVERY_TIMEOUT
+                "chat-started hf2q serve did not publish a private READY frame and pass HTTP verification within {:?}",
+                timeout
             );
         }
-        let event = browser
-            .next_event(remaining.min(Duration::from_millis(500)))
-            .await?;
-        let Some(LocalDiscoveryEvent::Added(candidate)) = event else {
-            continue;
-        };
-        if candidate.hints.pid_hint.as_deref() != Some(child_pid) {
-            continue;
+        if show_preparation_progress && tokio::time::Instant::now() >= next_heartbeat {
+            let elapsed = tokio::time::Instant::now().duration_since(started);
+            write_model_startup_heartbeat(output, elapsed)?;
+            next_heartbeat += MODEL_STARTUP_HEARTBEAT;
         }
-        if let Some(server) = verify_candidate(http, candidate).await {
-            return Ok(server);
+        if ready_port.is_none() {
+            ready_port = process.poll_ready_port()?;
         }
+        if let Some(port) = ready_port {
+            // Credentials are sent only to the port delivered by the exact
+            // child over the private inherited ownership socket.
+            if let Some(server) = verify_owned_endpoint(http, port, auth_token).await {
+                return Ok(server);
+            }
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
     }
+}
+
+fn write_model_startup_heartbeat(output: &mut impl Write, elapsed: Duration) -> Result<()> {
+    writeln!(
+        output,
+        "still preparing the requested model ({}s elapsed); first use may be downloading or converting",
+        elapsed.as_secs()
+    )?;
+    output.flush()?;
+    Ok(())
 }
 
 async fn verify_candidate(
     http: &reqwest::Client,
     candidate: UntrustedDiscoveryCandidate,
+    auth_token: Option<&str>,
 ) -> Option<VerifiedServer> {
     let endpoint = Endpoint::discovered_loopback(candidate.endpoint.port());
-    let response = match http.get(endpoint.route("/health")).send().await {
+    verify_endpoint(http, candidate.identity, endpoint, auth_token).await
+}
+
+async fn verify_owned_endpoint(
+    http: &reqwest::Client,
+    port: u16,
+    auth_token: Option<&str>,
+) -> Option<VerifiedServer> {
+    let endpoint = Endpoint::discovered_loopback(port);
+    let identity = DiscoveryIdentity {
+        service_name: format!("hf2q-owned-{port}"),
+        service_type: discovery::SERVICE_TYPE.to_owned(),
+        domain: "private-lifeline".to_owned(),
+    };
+    verify_endpoint(http, identity, endpoint, auth_token).await
+}
+
+async fn verify_endpoint(
+    http: &reqwest::Client,
+    identity: DiscoveryIdentity,
+    endpoint: Endpoint,
+    auth_token: Option<&str>,
+) -> Option<VerifiedServer> {
+    let mut request = http.get(endpoint.route("/health"));
+    if let Some(token) = auth_token {
+        request = request.bearer_auth(token);
+    }
+    let response = match request.send().await {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
             if matches!(
                 response.status(),
                 reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
             ) {
-                tracing::warn!(
-                    url = %endpoint.base_url(),
-                    status = %response.status(),
-                    "authenticated local hf2q servers require an explicit --url so credentials are never sent to an untrusted discovery candidate"
-                );
+                if auth_token.is_some() {
+                    tracing::warn!(
+                        url = %endpoint.base_url(),
+                        status = %response.status(),
+                        "chat-owned hf2q server rejected HF2Q_AUTH_TOKEN"
+                    );
+                } else {
+                    tracing::warn!(
+                        url = %endpoint.base_url(),
+                        status = %response.status(),
+                        "authenticated local hf2q servers require an explicit --url so credentials are never sent to an untrusted discovery candidate"
+                    );
+                }
             } else {
                 tracing::debug!(url = %endpoint.base_url(), status = %response.status(), "ignored unhealthy local discovery candidate");
             }
@@ -266,7 +414,7 @@ async fn verify_candidate(
         }
     };
     drop(response);
-    let models = match fetch_models(http, &endpoint, None).await {
+    let models = match fetch_models(http, &endpoint, auth_token).await {
         Ok(models) => models,
         Err(error) => {
             tracing::debug!(url = %endpoint.base_url(), %error, "ignored local discovery candidate without a usable model API");
@@ -274,7 +422,7 @@ async fn verify_candidate(
         }
     };
     Some(VerifiedServer {
-        identity: candidate.identity,
+        identity,
         endpoint,
         models,
     })
@@ -391,9 +539,11 @@ mod tests {
         }
     }
 
-    async fn serve(router: Router) -> (u16, oneshot::Sender<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+    async fn serve(router: Router) -> (u16, oneshot::Sender<()>, std::net::TcpListener) {
+        let guard = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        guard.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(guard.try_clone().unwrap()).unwrap();
+        let port = guard.local_addr().unwrap().port();
         let (stop_tx, stop_rx) = oneshot::channel();
         tokio::spawn(async move {
             axum::serve(listener, router)
@@ -403,7 +553,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        (port, stop_tx)
+        (port, stop_tx, guard)
     }
 
     #[test]
@@ -449,6 +599,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn targeted_chat_propagates_the_selected_state_root_to_owned_serve() {
+        let mut command = std::process::Command::new("hf2q");
+        append_owned_server_args(
+            &mut command,
+            Some("owner/model:Q4_K_M"),
+            Some(std::path::Path::new("/tmp/operator-state")),
+            42,
+            43,
+            9123,
+        );
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &args[..5],
+            [
+                "--state-root",
+                "/tmp/operator-state",
+                "serve",
+                "owner/model:Q4_K_M",
+                "--host"
+            ]
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--chat-parent-lifeline-fd", "42"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn failed_startup_stops_child_and_retains_path_without_echoing_private_log() {
         let directory = tempfile::tempdir().unwrap();
         let mut log = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
@@ -464,7 +645,8 @@ mod tests {
             .spawn()
             .unwrap();
         let child_pid = child.id() as libc::pid_t;
-        let mut process = OwnedServerProcess::from_spawned(child, parent_lifeline, log).unwrap();
+        let mut process =
+            OwnedServerProcess::from_spawned(child, parent_lifeline, log, None).unwrap();
 
         let error = finalize_failed_startup(anyhow::anyhow!("startup probe failed"), &mut process);
         let rendered = format!("{error:#}");
@@ -503,8 +685,8 @@ mod tests {
             .route("/health", get(record))
             .route("/v1/models", get(record))
             .with_state(recorded.clone());
-        let (port, stop) = serve(router).await;
-        let verified = verify_candidate(&reqwest::Client::new(), candidate(port))
+        let (port, stop, _guard) = serve(router).await;
+        let verified = verify_candidate(&reqwest::Client::new(), candidate(port), None)
             .await
             .expect("healthy candidate must verify");
         assert_eq!(
@@ -515,16 +697,91 @@ mod tests {
         let _ = stop.send(());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_private_ready_handoff_binds_authorized_endpoint() {
+        #[derive(Clone, Default)]
+        struct Recorded(Arc<Mutex<Vec<Option<String>>>>);
+
+        async fn record(
+            State(recorded): State<Recorded>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            recorded.0.lock().unwrap().push(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+            );
+            Json(serde_json::json!({"status":"ok","data":[]}))
+        }
+
+        let recorded = Recorded::default();
+        let router = Router::new()
+            .route("/health", get(record))
+            .route("/v1/models", get(record))
+            .with_state(recorded.clone());
+        let (port, stop, guard) = serve(router).await;
+        let (parent_lifeline, mut child_lifeline) = std::os::unix::net::UnixStream::pair().unwrap();
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let mut process =
+            OwnedServerProcess::from_spawned(child, parent_lifeline, log, Some(guard)).unwrap();
+        write!(
+            child_lifeline,
+            "{}{port}\n",
+            crate::serve::CHAT_LIFELINE_READY_PREFIX
+        )
+        .unwrap();
+        child_lifeline.flush().unwrap();
+        let mut output = Vec::new();
+        let verified = wait_for_spawned_server(
+            &reqwest::Client::new(),
+            &mut process,
+            Duration::from_secs(2),
+            Some("secret"),
+            &mut output,
+            false,
+        )
+        .await
+        .expect("private READY port should become the only authorized endpoint");
+        assert_eq!(
+            verified.endpoint.base_url(),
+            format!("http://127.0.0.1:{port}")
+        );
+        assert_eq!(
+            *recorded.0.lock().unwrap(),
+            vec![Some("Bearer secret".into()), Some("Bearer secret".into())]
+        );
+        process.force_stop().unwrap();
+        let _ = stop.send(());
+    }
+
+    #[test]
+    fn model_startup_heartbeat_is_operator_visible_without_private_log_content() {
+        let mut output = Vec::new();
+        write_model_startup_heartbeat(&mut output, Duration::from_secs(61)).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("61s elapsed"));
+        assert!(output.contains("downloading or converting"));
+    }
+
     #[tokio::test]
     async fn unhealthy_http_candidate_is_rejected() {
         let router = Router::new().route(
             "/health",
             get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "not ready") }),
         );
-        let (port, stop) = serve(router).await;
-        assert!(verify_candidate(&reqwest::Client::new(), candidate(port))
-            .await
-            .is_none());
+        let (port, stop, _guard) = serve(router).await;
+        assert!(
+            verify_candidate(&reqwest::Client::new(), candidate(port), None)
+                .await
+                .is_none()
+        );
         let _ = stop.send(());
     }
 }

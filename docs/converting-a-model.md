@@ -16,10 +16,16 @@ Resolve a public Hub repository to an immutable commit, download and verify
 the exact source inventory, then convert it:
 
 ```bash
-hf2q convert google/gemma-4-26b-a4b-it \
-  --quant q4_k_m \
-  --output models/gemma-4-26b-a4b-it-q4_k_m.gguf
+hf2q convert google/gemma-4-26b-a4b-it
+
+# An exact suffix is equivalent to --quant q4_k_m.
+hf2q convert google/gemma-4-26b-a4b-it:Q4_K_M
 ```
+
+The setup-selected quant is used when present; otherwise hf2q selects from
+live hardware. The output defaults to
+`${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models/<owner>__<repo>/<commit>/`.
+Use `--output FILE_OR_EXISTING_DIR` to override it.
 
 Convert an existing local directory by using an existing path or explicit
 path syntax:
@@ -38,7 +44,7 @@ SHA-256 values, converter commit, selected quantization, and output bytes.
 ## Synopsis
 
 ```text
-hf2q convert [OPTIONS] --quant <QUANT> --output <OUTPUT> [HF_DIR]
+hf2q convert [OPTIONS] [HF_DIR]
 ```
 
 Exactly one source is required:
@@ -56,6 +62,10 @@ An existing path, absolute path, `./...`, `../...`, `.` or `..` is local.
 Non-path positional text is parsed as a Hugging Face model reference. Use
 explicit path syntax for a local directory that does not exist yet; otherwise
 `owner/repo` intentionally means a remote identity.
+
+A simple repository may end in `:QUANT`. The suffix is case-insensitive and
+is equivalent to `--quant`; conflicting values fail before network access.
+Canonical Hugging Face URLs keep their existing URL grammar.
 
 Accepted remote forms are:
 
@@ -128,7 +138,9 @@ commit before transfer.
 
 ## Quantization
 
-`--quant` is currently required. Supported standard names include:
+Quant precedence is an exact operand suffix or `--quant`, then the default
+recorded by `hf2q setup`, then live hardware selection. Supported standard
+names include:
 
 ```text
 f32 f16 bf16 q4_0 q4_1 q5_0 q5_1 q8_0
@@ -148,7 +160,10 @@ has landed. See `hf2q convert --help` for the exact supported corpus surface.
 
 ## Output and projector mode
 
-`--output <PATH>` names the text GGUF and is required. For a supported
+For a remote repository, omitted output uses the immutable revision-bound
+managed model directory. A local source directory still requires
+`--output FILE_OR_EXISTING_DIR`; an existing directory receives a derived
+filename. For a supported
 multimodal source, the default command also writes an F16 projector beside it
 as `<output-stem>-mmproj.gguf`. `--mmproj-output <PATH>` selects a different
 name in the same directory. Each remote-source artifact has its own receipt,
@@ -194,9 +209,7 @@ hf2q never deletes source data from the shared Hub cache.
 
 The canonical identity parser, immutable resolution, exact selected download,
 integrity checks, receipt schema v3, and automatic source-bound multimodal
-pairs have landed. Model selection, revision, and text output path remain
-explicit operator choices; the projector path is deterministic unless
-overridden. Setup can provide a default quant selector, but it does not
-download, convert, register, retain, or delete model files. Unsupported inputs
-fail visibly rather than being routed through an implicit orchestration or
-external tool path.
+pairs are the authority. Remote output and quant may be derived, but conversion
+still never accepts a hosted pre-quantized GGUF as its result. A matching
+verified schema-v3 conversion is reused; unsupported inputs fail visibly
+rather than being routed through an external tool path.

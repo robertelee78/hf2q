@@ -133,6 +133,59 @@ pub fn convert_vision_tower_to_path_with_source_and_pair(
     source_sha256: Option<&str>,
     pair_generation: Option<&str>,
 ) -> Result<(), VitConvertError> {
+    let (vision_config, tensors) = load_vision_conversion_inputs(hf_repo_dir)?;
+
+    let output_dir = output.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(output_dir)
+        .map_err(|e| VitConvertError::GgufEmit(format!("mkdir output_dir: {e}")))?;
+
+    let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
+    let temporary_path = temporary.into_temp_path();
+    gguf_emit::write_mmproj_gguf_with_provenance_and_pair(
+        &temporary_path,
+        &vision_config,
+        &tensors,
+        source_sha256,
+        pair_generation,
+    )?;
+    std::fs::File::open(&temporary_path)?.sync_all()?;
+    temporary_path
+        .persist(output)
+        .map_err(|error| VitConvertError::Io(error.error))?;
+
+    Ok(())
+}
+
+pub(crate) fn planned_vision_tower_output_bytes(
+    hf_repo_dir: &Path,
+    source_sha256: Option<&str>,
+    pair_generation: Option<&str>,
+) -> Result<u64, VitConvertError> {
+    let vision_config = load_vision_config(hf_repo_dir)?;
+    let tensors = convert::plan_vision_tensors(hf_repo_dir, &vision_config)?;
+    gguf_emit::planned_mmproj_gguf_bytes_from_layout(
+        &vision_config,
+        &tensors,
+        source_sha256,
+        pair_generation,
+    )
+}
+
+fn load_vision_conversion_inputs(
+    hf_repo_dir: &Path,
+) -> Result<
+    (
+        VisionConfig,
+        std::collections::HashMap<String, convert::VitTensor>,
+    ),
+    VitConvertError,
+> {
+    let vision_config = load_vision_config(hf_repo_dir)?;
+    let tensors = convert::load_vision_tensors(hf_repo_dir, &vision_config)?;
+    Ok((vision_config, tensors))
+}
+
+fn load_vision_config(hf_repo_dir: &Path) -> Result<VisionConfig, VitConvertError> {
     let config_path = hf_repo_dir.join("config.json");
     let raw = std::fs::read_to_string(&config_path)
         .map_err(|e| VitConvertError::Config(VisionConfigError::Io(e.to_string())))?;
@@ -166,26 +219,7 @@ pub fn convert_vision_tower_to_path_with_source_and_pair(
         )));
     }
 
-    let output_dir = output.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| VitConvertError::GgufEmit(format!("mkdir output_dir: {e}")))?;
-
-    let tensors = convert::load_vision_tensors(hf_repo_dir, &vision_config)?;
-    let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
-    let temporary_path = temporary.into_temp_path();
-    gguf_emit::write_mmproj_gguf_with_provenance_and_pair(
-        &temporary_path,
-        &vision_config,
-        &tensors,
-        source_sha256,
-        pair_generation,
-    )?;
-    std::fs::File::open(&temporary_path)?.sync_all()?;
-    temporary_path
-        .persist(output)
-        .map_err(|error| VitConvertError::Io(error.error))?;
-
-    Ok(())
+    Ok(vision_config)
 }
 
 /// Derive a filesystem-safe slug for the mmproj filename.

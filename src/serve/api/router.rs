@@ -1414,6 +1414,9 @@ mod tests {
                 schema_version: "hf2q.hub-gguf-catalog.v2".into(),
                 repository: "owner/hosted".into(),
                 revision: "a".repeat(40),
+                requires_projector: false,
+                source_weight_bytes: None,
+                source_uncached_weight_bytes: None,
                 artifacts: vec![crate::input::hf_download::HubGgufArtifact {
                     repository: "owner/hosted".into(),
                     revision: "a".repeat(40),

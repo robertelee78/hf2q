@@ -722,31 +722,94 @@ impl NativeEmbeddingRoute {
     }
 }
 
+pub(crate) fn qwen35_native_embedding_type_supported(kind: GgmlType) -> bool {
+    NativeEmbeddingRoute::for_type(kind).is_ok()
+}
+
+/// Descriptor-only direct-gather admission shared by hosted preflight and
+/// the runtime buffer boundary.
+pub(crate) fn validate_native_embedding_descriptor(
+    name: &str,
+    kind: GgmlType,
+    rows: usize,
+    cols: usize,
+    byte_len: usize,
+) -> Result<()> {
+    let route = NativeEmbeddingRoute::for_type(kind).map_err(|_| {
+        anyhow!(
+            "native {name} uses unsupported direct-gather type {kind:?}; inference refuses to dequantize and substitute another format"
+        )
+    })?;
+    let expected_bytes = match route {
+        NativeEmbeddingRoute::F32 => rows
+            .checked_mul(cols)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+            .with_context(|| format!("native F32 {name} byte length overflow"))?,
+        _ => usize::try_from(
+            mlx_native::ggml_matrix_bytes(
+                kind,
+                u32::try_from(rows)
+                    .with_context(|| format!("native {name} row count exceeds packed geometry"))?,
+                u32::try_from(cols).with_context(|| {
+                    format!("native {name} column count exceeds packed geometry")
+                })?,
+            )
+            .with_context(|| format!("derive native {name} packed byte extent"))?,
+        )
+        .with_context(|| format!("native {name} packed byte extent exceeds usize"))?,
+    };
+    ensure!(
+        byte_len == expected_bytes,
+        "native {name} type {:?} shape [{rows}, {cols}] requires exactly {expected_bytes} logical bytes, got {byte_len}",
+        kind,
+    );
+    let Some(expected_capability_route) = route.capability_route() else {
+        return Ok(());
+    };
+    let capability = mlx_native::ggml_capability(mlx_native::GgmlCapabilityRequest {
+        schema_version: mlx_native::GGML_CAPABILITY_SCHEMA_VERSION,
+        invocation: mlx_native::GgmlInvocation::EmbeddingGather {
+            n_tokens: 1,
+            vocab_size: u32::try_from(rows).with_context(|| {
+                format!("native {name} row count exceeds capability dimensions")
+            })?,
+            embed_dim: u32::try_from(cols).with_context(|| {
+                format!("native {name} column count exceeds capability dimensions")
+            })?,
+        },
+        ggml_type: kind,
+        workload: mlx_native::GgmlWorkloadClass::Embedding,
+        routing: mlx_native::GgmlRoutingPolicy::default(),
+    });
+    ensure!(
+        capability.executable,
+        "native {name} uses unsupported direct-gather type {:?}: {}",
+        kind,
+        capability.diagnostic
+    );
+    ensure!(
+        capability.route == Some(expected_capability_route),
+        "native {name} capability route mismatch for {:?}: expected {:?}, got {:?}",
+        kind,
+        expected_capability_route,
+        capability.route
+    );
+    Ok(())
+}
+
 pub(super) fn ensure_native_embedding_admitted(native: &MlxQWeight) -> Result<()> {
     let route = NativeEmbeddingRoute::for_type(native.info.ggml_dtype)?;
     ensure!(
         native.affine.is_none(),
         "native token_embd.weight carries affine metadata instead of exact GGUF blocks"
     );
-    let expected_bytes = match route {
-        NativeEmbeddingRoute::F32 => native
-            .info
-            .rows
-            .checked_mul(native.info.cols)
-            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
-            .context("native F32 token_embd.weight byte length overflow")?,
-        _ => usize::try_from(
-            mlx_native::ggml_matrix_bytes(
-                native.info.ggml_dtype,
-                u32::try_from(native.info.rows)
-                    .context("native token_embd row count exceeds packed geometry")?,
-                u32::try_from(native.info.cols)
-                    .context("native token_embd column count exceeds packed geometry")?,
-            )
-            .context("derive native token_embd packed byte extent")?,
-        )
-        .context("native token_embd packed byte extent exceeds usize")?,
-    };
+    validate_native_embedding_descriptor(
+        "token_embd.weight",
+        native.info.ggml_dtype,
+        native.info.rows,
+        native.info.cols,
+        native.buffer.data_byte_len(),
+    )?;
     let expected_dtype = if route == NativeEmbeddingRoute::F32 {
         DType::F32
     } else {
@@ -758,47 +821,6 @@ pub(super) fn ensure_native_embedding_admitted(native: &MlxQWeight) -> Result<()
         native.info.ggml_dtype,
         expected_dtype,
         native.buffer.dtype()
-    );
-    ensure!(
-        native.buffer.data_byte_len() == expected_bytes,
-        "native token_embd.weight type {:?} shape [{}, {}] requires exactly {} logical bytes, got {}",
-        native.info.ggml_dtype,
-        native.info.rows,
-        native.info.cols,
-        expected_bytes,
-        native.buffer.data_byte_len()
-    );
-    let Some(expected_capability_route) = route.capability_route() else {
-        return Ok(());
-    };
-    let n_tokens = 1;
-    let vocab_size = u32::try_from(native.info.rows)
-        .context("native token_embd row count exceeds capability dimensions")?;
-    let embed_dim = u32::try_from(native.info.cols)
-        .context("native token_embd column count exceeds capability dimensions")?;
-    let capability = mlx_native::ggml_capability(mlx_native::GgmlCapabilityRequest {
-        schema_version: mlx_native::GGML_CAPABILITY_SCHEMA_VERSION,
-        invocation: mlx_native::GgmlInvocation::EmbeddingGather {
-            n_tokens,
-            vocab_size,
-            embed_dim,
-        },
-        ggml_type: native.info.ggml_dtype,
-        workload: mlx_native::GgmlWorkloadClass::Embedding,
-        routing: mlx_native::GgmlRoutingPolicy::default(),
-    });
-    ensure!(
-        capability.executable,
-        "native token_embd.weight uses unsupported direct-gather type {:?}: {}",
-        native.info.ggml_dtype,
-        capability.diagnostic
-    );
-    ensure!(
-        capability.route == Some(expected_capability_route),
-        "native token_embd.weight capability route mismatch for {:?}: expected {:?}, got {:?}",
-        native.info.ggml_dtype,
-        expected_capability_route,
-        capability.route
     );
     Ok(())
 }

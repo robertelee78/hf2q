@@ -20,8 +20,19 @@ use local::AutomaticEndpointResolver;
 use render::StreamRenderer;
 use wire::{Model, RequestOptions, ThinkingMode};
 
-pub(crate) fn cmd_chat(args: ChatArgs) -> Result<()> {
-    let mut resolver = AutomaticEndpointResolver;
+pub(crate) fn cmd_chat(args: ChatArgs, state_root: Option<&std::path::Path>) -> Result<()> {
+    if args.target.as_deref() == Some("list") {
+        return crate::serve::managed_artifacts::print_inventory(&[]);
+    }
+    if let Some(target) = args.target.as_deref() {
+        if matches!(
+            crate::model_spec::parse_model_spec(target)?,
+            crate::model_spec::ModelSpec::List
+        ) {
+            return crate::serve::managed_artifacts::print_inventory(&[]);
+        }
+    }
+    let mut resolver = AutomaticEndpointResolver::new(state_root);
     cmd_chat_with_resolver(args, &mut resolver)
 }
 
@@ -123,6 +134,7 @@ async fn run_session(
                 session,
                 control.as_ref(),
                 auth_token.as_deref(),
+                args.target.is_some(),
                 input,
                 output,
             )
@@ -206,13 +218,20 @@ async fn choose_initial_model(
     session: &EndpointSession,
     control: Option<&Hf2qControl>,
     auth_token: Option<&str>,
+    prefer_single_resident: bool,
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<(String, Option<String>)> {
     let mut models = fetch_models(http, session.endpoint(), auth_token).await?;
     if !models.is_empty() {
         models.sort_by_key(|model| (!model.loaded.unwrap_or(false), model.id.clone()));
-        let model = if models.len() == 1 {
+        let resident = models
+            .iter()
+            .filter(|model| model.loaded.unwrap_or(false))
+            .collect::<Vec<_>>();
+        let model = if prefer_single_resident && resident.len() == 1 {
+            resident[0].id.clone()
+        } else if models.len() == 1 {
             models.remove(0).id
         } else {
             pick_model(&models, input, output)?
@@ -379,8 +398,16 @@ async fn handle_command(
                 }
                 (model.to_owned(), None)
             } else {
-                choose_initial_model(client.http(), session, control, auth_token, input, output)
-                    .await?
+                choose_initial_model(
+                    client.http(),
+                    session,
+                    control,
+                    auth_token,
+                    false,
+                    input,
+                    output,
+                )
+                .await?
             };
             if let Some(control) = control {
                 let activated = match preselected_candidate.as_deref() {
@@ -508,7 +535,7 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log)
+        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log, None)
             .expect("verified isolated child");
         let mut session = EndpointSession::spawned_loopback(9, process);
 
@@ -568,7 +595,7 @@ mod tests {
             .spawn()
             .unwrap();
         let child_pid = child.id() as libc::pid_t;
-        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log)
+        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log, None)
             .expect("verified isolated child");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -599,6 +626,7 @@ mod tests {
         let mut resolver = FixedResolver(Some(EndpointSession::spawned_loopback(port, process)));
         let error = cmd_chat_with_resolver(
             ChatArgs {
+                target: None,
                 url: None,
                 model: Some("/fixture/invalid.gguf".into()),
                 quant: None,

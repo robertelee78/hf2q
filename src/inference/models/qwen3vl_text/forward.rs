@@ -84,13 +84,14 @@ use crate::inference::models::qwen35::gpu_ffn::{
     build_dense_ffn_layer_gpu_q_into, DenseFfnWeightsGpuQ,
 };
 use crate::inference::models::qwen35::gpu_full_attn::{
-    apply_imrope, apply_linear_projection_f32, apply_q_or_k_per_head_rms_norm,
+    apply_imrope, apply_linear_projection_f32_with_ggml_type, apply_q_or_k_per_head_rms_norm,
     apply_sdpa_causal_from_seq_major, download_f32, upload_f32,
 };
 use crate::inference::models::qwen35::io_heads::embed_tokens;
 use crate::inference::vision::image_token_residual_add::image_token_residual_add_gpu;
 use crate::serve::forward_prefill::{DeepstackInjection, SoftTokenInjection};
 
+use super::weights::qwen3vl_ffn_dispatch_types;
 use super::Qwen3VlTextModel;
 
 // ---------------------------------------------------------------------------
@@ -488,34 +489,37 @@ pub fn forward_text_prefill_logits_last(
             // RAW: Q/K/V projections read attn_normed.
             enc.memory_barrier();
 
-            let q_seq = apply_linear_projection_f32(
+            let q_seq = apply_linear_projection_f32_with_ggml_type(
                 enc,
                 registry,
                 device,
                 &attn_normed,
                 &lw.attn_q,
+                lw.attn_q_type,
                 seq_len,
                 hidden,
                 hidden,
             )
             .with_context(|| format!("layer {il}: Q proj"))?;
-            let k_seq = apply_linear_projection_f32(
+            let k_seq = apply_linear_projection_f32_with_ggml_type(
                 enc,
                 registry,
                 device,
                 &attn_normed,
                 &lw.attn_k,
+                lw.attn_k_type,
                 seq_len,
                 hidden,
                 kv_dim,
             )
             .with_context(|| format!("layer {il}: K proj"))?;
-            let v_seq = apply_linear_projection_f32(
+            let v_seq = apply_linear_projection_f32_with_ggml_type(
                 enc,
                 registry,
                 device,
                 &attn_normed,
                 &lw.attn_v,
+                lw.attn_v_type,
                 seq_len,
                 hidden,
                 kv_dim,
@@ -624,12 +628,13 @@ pub fn forward_text_prefill_logits_last(
                 .with_context(|| format!("layer {il}: begin Phase C session"))?;
             let enc = session_c.encoder_mut();
 
-            let attn_proj = apply_linear_projection_f32(
+            let attn_proj = apply_linear_projection_f32_with_ggml_type(
                 enc,
                 registry,
                 device,
                 &attn_out,
                 &lw.attn_output,
+                lw.attn_output_type,
                 seq_len,
                 hidden,
                 hidden,
@@ -667,23 +672,15 @@ pub fn forward_text_prefill_logits_last(
 
             // SwiGLU SiLU FFN with built-in residual add.
             //
-            // **iter-8a-2 limitation**: assumes Q4_0 for gate/up/down.
-            // The canonical Qwen3-VL-2B/4B Instruct GGUF emitted by
-            // hf2q's converter ships uniformly Q4_0 across all FFN
-            // tensors (verified gguf-dump 2026-05-07: 168 Q4_0 + 28 F32
-            // exactly = 6 Q4_0 attn + 3 Q4_0 ffn × 28 layers + 6 F32
-            // norms × 28 layers; no mixed-quant variants in tree).
-            // iter-9a should extend [`super::Qwen3VlTextLayerWeights`]
-            // with `ggml_type_*: GgmlType` fields recorded at load time
-            // (mirrors `qwen35::weight_loader::DenseFfnWeightsQ::ggml_type_*`)
-            // so future mixed-quant Qwen3-VL variants (e.g. Q5_K gate/up
-            // + Q6_K down) load + run without a forward-path code change.
+            let (ffn_gate_up_type, ffn_down_type) =
+                qwen3vl_ffn_dispatch_types(lw.ffn_gate_type, lw.ffn_up_type, lw.ffn_down_type)
+                    .with_context(|| format!("layer {il}: bind exact FFN dispatch types"))?;
             let ffn_weights = DenseFfnWeightsGpuQ {
                 gate_q: lw.ffn_gate.clone(),
                 up_q: lw.ffn_up.clone(),
                 down_q: lw.ffn_down.clone(),
-                ggml_type_gate_up: GgmlType::Q4_0,
-                ggml_type_down: GgmlType::Q4_0,
+                ggml_type_gate_up: ffn_gate_up_type,
+                ggml_type_down: ffn_down_type,
                 intermediate_size: intermediate,
                 hidden_size: hidden,
             };
@@ -799,15 +796,20 @@ pub fn forward_text_prefill_logits_last(
     // Our `weights.output` is `Some(buf)` for untied, `None` for tied
     // (matching the post-load `Qwen3VlTextConfig::tied_word_embeddings`
     // signal). For tied, we re-use `weights.token_embd` as the head.
-    let lm_head_weight: &MlxBuffer = if tied {
-        &weights.token_embd
+    let (lm_head_weight, lm_head_type): (&MlxBuffer, GgmlType) = if tied {
+        (&weights.token_embd, GgmlType::F32)
     } else {
-        weights.output.as_ref().ok_or_else(|| {
-            anyhow!(
-                "Qwen3-VL text-LM weights inconsistent: tied_word_embeddings=false but \
-                     output is None — config and weights disagree"
-            )
-        })?
+        (
+            weights.output.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "Qwen3-VL text-LM weights inconsistent: tied_word_embeddings=false but \
+                         output is None — config and weights disagree"
+                )
+            })?,
+            weights.output_type.ok_or_else(|| {
+                anyhow!("Qwen3-VL text-LM weights inconsistent: untied output has no GGML type")
+            })?,
+        )
     };
 
     let logits_buf = {
@@ -829,12 +831,13 @@ pub fn forward_text_prefill_logits_last(
         // RAW: LM head matmul reads final_normed.
         enc.memory_barrier();
 
-        let logits_buf = apply_linear_projection_f32(
+        let logits_buf = apply_linear_projection_f32_with_ggml_type(
             enc,
             registry,
             device,
             &final_normed,
             lm_head_weight,
+            lm_head_type,
             1,
             hidden,
             vocab,

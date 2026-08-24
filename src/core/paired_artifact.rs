@@ -186,11 +186,6 @@ impl PairTransactionJournal {
             roles.push(member.role);
             names.push(member.final_name.clone());
         }
-        if !roles.contains(&PairMemberRole::Projector) {
-            return Err(PairArtifactError::Invalid(
-                "pair journal has no projector member".into(),
-            ));
-        }
         Ok(())
     }
 
@@ -261,6 +256,51 @@ pub(crate) struct PairLock {
     _file: File,
 }
 
+/// Destination-scoped lease held across remote source transfer and native
+/// conversion. It is deliberately distinct from the shorter pair-publication
+/// lock so a waiter can recheck the completed receipt before doing expensive
+/// work without recursively acquiring the same flock in one process.
+pub(crate) struct ConversionOperationLock {
+    _lock: PairLock,
+}
+
+pub(crate) struct ConversionOperationLocks {
+    _locks: Vec<ConversionOperationLock>,
+}
+
+impl ConversionOperationLock {
+    pub(crate) fn exclusive(output: &Path) -> Result<Self, PairArtifactError> {
+        let parent = output
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|source| io(parent, source))?;
+        let operation_identity = append_suffix(output, ".conversion-operation");
+        Ok(Self {
+            _lock: PairLock::exclusive(&operation_identity)?,
+        })
+    }
+}
+
+impl ConversionOperationLocks {
+    /// Acquire every destination lease in bytewise path order. Sorting makes
+    /// overlapping text/projector requests deadlock-free, and locking both
+    /// members prevents two conversions with different text outputs from
+    /// racing on one explicit projector destination.
+    pub(crate) fn exclusive(
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, PairArtifactError> {
+        let mut paths = paths.into_iter().collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        let mut locks = Vec::with_capacity(paths.len());
+        for path in paths {
+            locks.push(ConversionOperationLock::exclusive(&path)?);
+        }
+        Ok(Self { _locks: locks })
+    }
+}
+
 impl PairLock {
     pub(crate) fn shared(text: &Path) -> Result<Self, PairArtifactError> {
         Self::acquire(text, FlockOperation::LockShared)
@@ -286,31 +326,50 @@ impl PairLock {
                 created = true;
                 file
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&path)
-                .map_err(|error| io(&path, error))?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&path)
+                {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        created = true;
+                        repair_owned_empty_lock(&path, &parent)?
+                    }
+                    Err(error) => return Err(io(&path, error)),
+                }
+            }
             Err(error) => return Err(io(&path, error)),
         };
-        if created {
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| io(&path, error))?;
-            full_sync(&file).map_err(|error| io(&path, error))?;
-            sync_directory(&parent)?;
-        }
-        let metadata = file.metadata().map_err(|error| io(&path, error))?;
+        let mut metadata = file.metadata().map_err(|error| io(&path, error))?;
         let parent_metadata = fs::metadata(&parent).map_err(|error| io(&parent, error))?;
         if !metadata.is_file()
             || metadata.uid() != rustix::process::geteuid().as_raw()
             || metadata.nlink() != 1
             || metadata.dev() != parent_metadata.dev()
             || metadata.len() != 0
-            || metadata.mode() & 0o7777 != 0o600
         {
             return Err(PairArtifactError::Invalid(format!(
                 "pair lock is not an owned private regular file: {}",
+                path.display()
+            )));
+        }
+        if created || metadata.mode() & 0o7777 != 0o600 {
+            // The create mode is filtered by umask. If a process dies before
+            // the normalizing chmod, retry may encounter an owner-unreadable
+            // zero-byte lock. The invariants above distinguish that safe
+            // crash state from a substituted path before repairing it.
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| io(&path, error))?;
+            full_sync(&file).map_err(|error| io(&path, error))?;
+            sync_directory(&parent)?;
+            metadata = file.metadata().map_err(|error| io(&path, error))?;
+        }
+        if metadata.mode() & 0o7777 != 0o600 {
+            return Err(PairArtifactError::Invalid(format!(
+                "pair lock could not be normalized to an owned private file: {}",
                 path.display()
             )));
         }
@@ -329,6 +388,39 @@ impl PairLock {
         }
         Ok(Self { _file: file })
     }
+}
+
+fn repair_owned_empty_lock(path: &Path, parent: &Path) -> Result<File, PairArtifactError> {
+    let before = fs::symlink_metadata(path).map_err(|error| io(path, error))?;
+    let parent_metadata = fs::metadata(parent).map_err(|error| io(parent, error))?;
+    if !before.is_file()
+        || before.file_type().is_symlink()
+        || before.uid() != rustix::process::geteuid().as_raw()
+        || before.nlink() != 1
+        || before.dev() != parent_metadata.dev()
+        || before.len() != 0
+    {
+        return Err(PairArtifactError::Invalid(format!(
+            "pair lock is not an owned empty regular file: {}",
+            path.display()
+        )));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| io(path, error))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| io(path, error))?;
+    let after = file.metadata().map_err(|error| io(path, error))?;
+    if after.dev() != before.dev() || after.ino() != before.ino() {
+        return Err(PairArtifactError::Invalid(format!(
+            "pair lock changed while repairing its crash state: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
 }
 
 /// Advisory lock on the current text GGUF inode.
@@ -760,6 +852,45 @@ mod tests {
             journal_path(Path::new("/models/model.gguf")),
             PathBuf::from("/models/model.gguf.pair.txn.json")
         );
+    }
+
+    #[test]
+    fn pair_lock_repairs_an_owned_empty_prechmod_umask_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let text = directory.path().join("model.gguf");
+        let lock = lock_path(&text);
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let guard = PairLock::exclusive(&text).unwrap();
+
+        assert_eq!(fs::metadata(&lock).unwrap().mode() & 0o7777, 0o600);
+        drop(guard);
+    }
+
+    #[test]
+    fn conversion_operation_locks_serialize_a_shared_explicit_projector() {
+        let directory = tempfile::tempdir().unwrap();
+        let text_a = directory.path().join("a.gguf");
+        let text_b = directory.path().join("b.gguf");
+        let projector = directory.path().join("shared-mmproj.gguf");
+        let first = ConversionOperationLocks::exclusive([text_a, projector.clone()]).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _second = ConversionOperationLocks::exclusive([text_b, projector]).unwrap();
+            sender.send(()).unwrap();
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a conversion sharing only the projector destination must wait"
+        );
+        drop(first);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        waiter.join().unwrap();
     }
 
     #[test]

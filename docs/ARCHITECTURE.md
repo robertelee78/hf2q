@@ -160,6 +160,9 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   ├── info_catalog.rs          header-only family tensor-catalog checks
 │   ├── info_report.rs           human-readable static-preflight rendering
 │   ├── operator_settings.rs     typed CLI/config/GGUF plan resolution
+│   ├── managed_artifacts.rs     ADR-051 shared types and public resolver surface
+│   ├── managed_artifacts/       local/hosted resolution, storage/adoption,
+│   │                            projector pairing, inventory, and tests
 │   ├── api/                   axum router + handlers + state
 │   │   ├── artifact_catalog.rs        bounded opaque hosted-artifact authority
 │   │   ├── cancellation.rs            request/root preparation + commit supervision
@@ -614,6 +617,7 @@ ADRs under `docs/`. The most architecturally consequential ones:
 | **ADR-046** | Evidence-driven Apple-Silicon auto quantization and the hf2q/mlx-native ownership seam. |
 | **ADR-047** | Minimal diagnostic chat, LocalOnly discovery, telemetry, and explicit safe model switching. |
 | **ADR-048** | Warning-free release boundary and operator-reachability rule for ADR-046 validation code. |
+| **ADR-051** | Shared local-first `repo[:quant]` resolution, managed artifacts, and automatic multimodal companions. |
 
 Each ADR carries phase status, acceptance tests, and a "what comes
 next" section. ADRs are append-only; superseded ones are linked
@@ -627,7 +631,7 @@ forward rather than deleted.
 |---|---|
 | Follow the supported first-run journey | `docs/getting-started.md` |
 | Read the public CLI surface | `src/cli.rs` |
-| Trace a `convert` request | `src/serve/mod.rs` → `cmd_generate` is the wrong one; `src/main.rs` dispatches `Command::Convert` into `quantize::cmd_convert`. |
+| Trace a `convert` request | `src/main.rs::cmd_convert` resolves identity/defaults, then `src/convert/cli_driver.rs` owns conversion. |
 | Trace a serve chat request | `src/serve/api/handlers.rs::chat_completions` → `engine*.rs` → `inference/models/<arch>/forward.rs` |
 | Trace the diagnostic chat client | `src/chat/mod.rs` → `local.rs` / `control.rs` / `client.rs` |
 | Add a new model family | `docs/arch-onboarding.md` |

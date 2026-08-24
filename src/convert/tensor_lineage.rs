@@ -11,18 +11,18 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use mlx_native::gguf::GgufFile;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::core::provenance::tensor_execution::{ArtifactEvidence, logical_f32_sha256};
-use crate::input::integrity::{VerifiedSourceManifest, verify_conversion_manifest};
-use crate::intelligence::dynamic_allocator::TensorAllocationUnit;
+use crate::core::provenance::tensor_execution::{logical_f32_sha256, ArtifactEvidence};
+use crate::input::integrity::{verify_conversion_manifest, VerifiedSourceManifest};
 use crate::intelligence::dynamic_allocator::producer::{
-    NonVariableDisposition, TensorPartitionManifest, VerifiedSourceTensorInventory,
-    validate_tensor_partition,
+    validate_tensor_partition, NonVariableDisposition, TensorPartitionManifest,
+    VerifiedSourceTensorInventory,
 };
+use crate::intelligence::dynamic_allocator::TensorAllocationUnit;
 use crate::intelligence::measured_auto_quant::SourceIdentity;
 
 use super::orchestrator::TensorWriteEvidence;
@@ -36,11 +36,12 @@ mod receipt;
 #[cfg(test)]
 pub(crate) use receipt::stored_tensor_conversion_receipt_sha256;
 pub(crate) use receipt::{
-    MAX_STORED_TENSOR_CONVERSION_RECEIPT_BYTES, StoredTensorConversionReceipt,
-    VerifiedSourceToStoredConversion, build_verified_source_to_stored_conversion,
-    clear_stale_tensor_conversion_receipt, prepare_tensor_conversion_receipt,
-    promote_tensor_conversion_receipt, tensor_conversion_receipt_path,
-    validate_stored_tensor_conversion_receipt,
+    build_verified_source_to_stored_conversion, clear_stale_tensor_conversion_receipt,
+    prepare_tensor_conversion_receipt, promote_tensor_conversion_receipt,
+    stage_tensor_conversion_receipt, tensor_conversion_receipt_path,
+    validate_stored_tensor_conversion_receipt, PreparedTensorConversionReceipt,
+    StoredTensorConversionReceipt, VerifiedSourceToStoredConversion,
+    MAX_STORED_TENSOR_CONVERSION_RECEIPT_BYTES,
 };
 
 pub const STORED_TENSOR_CONVERSION_RECEIPT_SCHEMA_VERSION: u32 = 1;
@@ -1206,33 +1207,27 @@ mod tests {
         variable_mtp
             .dispositions
             .insert("mtp.weight".into(), ConversionSourceDisposition::Variable);
-        assert!(
-            variable_mtp
-                .validate_dense_qwen_source_coverage(
-                    ["base.weight", "mtp.weight"],
-                    &["model.visual.weight".into()],
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("must be fixed or protected")
-        );
-        assert!(
-            context
-                .validate_dense_qwen_source_coverage(
-                    ["base.weight"],
-                    &["mtp.weight".into(), "model.visual.weight".into()],
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("mtp.weight")
-        );
-        assert!(
-            context
-                .validate_dense_qwen_source_coverage(
-                    ["base.weight", "mtp.weight", "model.visual.weight"],
-                    &[],
-                )
-                .is_err()
-        );
+        assert!(variable_mtp
+            .validate_dense_qwen_source_coverage(
+                ["base.weight", "mtp.weight"],
+                &["model.visual.weight".into()],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("must be fixed or protected"));
+        assert!(context
+            .validate_dense_qwen_source_coverage(
+                ["base.weight"],
+                &["mtp.weight".into(), "model.visual.weight".into()],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("mtp.weight"));
+        assert!(context
+            .validate_dense_qwen_source_coverage(
+                ["base.weight", "mtp.weight", "model.visual.weight"],
+                &[],
+            )
+            .is_err());
     }
 }

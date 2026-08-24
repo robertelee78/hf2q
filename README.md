@@ -30,17 +30,17 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.88+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | hf2q 0.1.14 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.14` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | hf2q 0.1.15 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.15` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
-# Convert a HuggingFace model to a Q4_K_M GGUF (auto-downloads via --repo)
-hf2q convert \
-  --repo google/gemma-4-26b-it \
-  --quant q4_k_m \
-  --output models/gemma-4-26b-it-q4_k_m/out.gguf
+curl -fsSL https://hf2q.us/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+hf2q setup
+hf2q doctor
 
-# Serve it over an OpenAI-compatible HTTP API
-hf2q serve --model models/gemma-4-26b-it-q4_k_m/out.gguf --port 8080
+# Reuse an exact local Q4_K_M when present; otherwise download and verify it,
+# start an owned local server, and open chat.
+hf2q chat jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M
 ```
 
 ---
@@ -201,12 +201,12 @@ paths, lifecycle cleanup, overrides, and troubleshooting.
 | `hf2q setup` | Learn the Apple-Silicon host and record defaults consumed by `convert` and `serve`. |
 | `hf2q update` | Check or update through the detected standalone or Cargo channel; source checkouts receive non-mutating instructions. Standalone `--rollback` restores one retained version. |
 | `hf2q uninstall` | Preview or remove channel-owned release files while preserving configuration, caches, and models unless explicit purge flags are confirmed. |
-| `hf2q convert` | HuggingFace safetensors → GGUF (streaming convert, ADR-033 unified pipeline). |
+| `hf2q convert` | HuggingFace safetensors → GGUF; `repo[:quant]` derives hardware defaults and a managed output. |
 | `hf2q gguf-patch` | Rewrite a GGUF's metadata in place (e.g. inject a chat template). |
 | `hf2q info` | Preview static GGUF serving support and the resolved context/memory plan without loading tensor data or Metal. |
 | `hf2q generate` | Single-shot text generation from a GGUF on the local GPU. |
-| `hf2q chat` | Minimal diagnostic terminal chat over an OpenAI-compatible server. |
-| `hf2q serve` | OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/embeddings`). |
+| `hf2q chat` | Minimal diagnostic terminal chat; a model operand prepares and starts its owned local server. |
+| `hf2q serve` | Local-first `repo[:quant]` preparation plus an OpenAI-compatible HTTP API. |
 | `hf2q parity` | ADR-009 parity validation against locked reference outputs. |
 | `hf2q smoke` | ADR-012 end-gate smoke test for a registered architecture. |
 | `hf2q cache` | Manage `~/.cache/hf2q/` (list / size / clear). |
@@ -273,6 +273,51 @@ Reserved names surface as typed errors with actionable hints:
 
 ## Quick start: convert + serve a model
 
+For a repository that already publishes a supported GGUF, conversion is not
+required. These commands share one local-first resolver:
+
+```bash
+# Show receipt-backed, managed, cached, and loose local GGUF options.
+hf2q serve list                    # `hf2q chat list` is identical
+
+# Exact quant: reuse verified local bytes, adopt an exact manual download, or
+# download that hosted quant into the managed XDG data directory.
+hf2q serve owner/repository:Q4_K_M
+
+# No quant: use the most recently used compatible local artifact, otherwise
+# the newest compatible local artifact. Only with no local candidate, choose
+# the setup/live hardware recommendation and nearest lower hosted tier. Native
+# source conversion is the final fallback when no admitted hosted GGUF exists.
+hf2q serve owner/repository
+
+# Chat uses the same preparation path and owns the server it starts.
+hf2q chat owner/repository:Q4_K_M
+```
+
+For supported multimodal text GGUFs, serve automatically uses an exact bound
+local projector or downloads the one unambiguous matching hosted `mmproj`.
+If no valid companion exists it warns and serves text-only; an explicit
+`--mmproj` remains fail-closed.
+An explicit local text-GGUF path likewise reuses a valid managed/receipt-bound,
+digest-bound, or unambiguous present sibling projector without Hub access.
+
+When you specifically need an hf2q-produced conversion, the remote form can
+derive both quant and revision-bound output from setup and hardware:
+
+```bash
+hf2q convert owner/repository
+hf2q convert owner/repository:Q8_0
+```
+
+Hosted GGUF bytes never satisfy `convert`; it always runs the Rust-native
+source conversion path. A matching schema-v3 hf2q conversion receipt makes a
+repeat invocation an integrity-verified no-op.
+
+The v0.1.15 hosted fast path has a closed tensor-layout admission contract for
+Qwen3.5/Qwen3.8 GGUF architecture identifiers. Other supported source
+families automatically take the native conversion fallback until their hosted
+GGUF layouts have an equally complete admission contract.
+
 The `hf2q convert` pipeline reads a Hugging Face model directory
 (`config.json` + safetensors + tokenizer assets) and emits a text GGUF that
 loads in the stock peer engine and in `hf2q serve`. Supported multimodal
@@ -285,11 +330,15 @@ inventory, and writes a schema-v3 conversion receipt. It never invokes Python,
 `hf`, or `huggingface-cli`.
 
 At serve time, Qwen3.5/Qwen3.6 reads its tokenizer and chat template from
-the GGUF metadata; a sibling `tokenizer.json` is not required. Vision uses a
-separate projector GGUF. Compatible externally produced text/projector pairs
-are accepted from standard architecture, multimodal-token, profile, width,
-tensor, and forward-warmup checks. When exact source or artifact hashes are
-present, hf2q additionally requires those identities to match.
+the GGUF metadata; a sibling `config.json` or `tokenizer.json` is not required
+or copied into the managed directory. Exact-revision Hub `config.json`
+inspection is only an optional bounded multimodal marker lookup for source
+repositories whose GGUF lacks a marker; the GGUF remains serving authority.
+Vision uses a separate projector GGUF. Compatible externally produced
+text/projector pairs are accepted from standard architecture,
+multimodal-token, profile, width, tensor, and forward-warmup checks. When exact
+source or artifact hashes are present, hf2q additionally requires those
+identities to match.
 
 When `serve --mmproj` successfully binds that projector to the loaded chat
 model, `/v1/models` advertises `input_modalities: ["text", "image"]` and the
@@ -657,7 +706,7 @@ are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/adr/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.14 serving release
+#### Test the 0.1.15 serving release
 
 Build and verify the exact checkout before loading a model:
 

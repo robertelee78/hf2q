@@ -25,7 +25,7 @@
 //! tensors (norms, biases) are 1-D and drop in directly.
 
 use anyhow::{anyhow, Context, Result};
-use mlx_native::gguf::GgufFile;
+use mlx_native::gguf::{GgufFile, TensorInfo};
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::{DType as MlxDType, MlxBuffer, MlxDevice};
 use std::collections::BTreeMap;
@@ -168,31 +168,7 @@ pub(super) fn load_native_projection(
     let info = gguf
         .tensor_info(name)
         .ok_or_else(|| anyhow!("native Qwen projection '{name}' not found"))?;
-    anyhow::ensure!(
-        info.shape.as_slice() == [rows, cols],
-        "native Qwen projection '{name}' shape {:?} != [{rows}, {cols}]",
-        info.shape
-    );
-    anyhow::ensure!(
-        info.ggml_type != GgmlType::F16,
-        "native Qwen projection '{name}' is F16; the encoder lacks a direct F16 projection and inference refuses to substitute another storage format"
-    );
-    anyhow::ensure!(
-        cols % info.ggml_type.block_values() as usize == 0,
-        "native Qwen projection '{name}' row width {cols} is not aligned to {:?}'s {}-value blocks",
-        info.ggml_type,
-        info.ggml_type.block_values()
-    );
-    let expected = rows
-        .checked_mul(cols / info.ggml_type.block_values() as usize)
-        .and_then(|v| v.checked_mul(info.ggml_type.block_bytes() as usize))
-        .ok_or_else(|| anyhow!("native Qwen projection '{name}' byte length overflow"))?;
-    anyhow::ensure!(
-        info.byte_len == expected,
-        "native Qwen projection '{name}' byte length {} != expected {expected} for {:?}",
-        info.byte_len,
-        info.ggml_type
-    );
+    let expected = validate_native_projection_info(name, info, rows, cols)?;
     let buffer = load_tensor_with_residency(gguf, name, device)?;
     let loaded_bytes = match info.ggml_type {
         GgmlType::F32 => {
@@ -224,6 +200,61 @@ pub(super) fn load_native_projection(
         "native Qwen projection '{name}' loaded byte length {loaded_bytes} != {expected}"
     );
     Ok((buffer, info.ggml_type))
+}
+
+/// Descriptor-only admission shared by hosted preflight and the production
+/// projection loader. It deliberately validates the exact packed extent as
+/// well as shape and dispatch type, before any Metal buffer is allocated.
+pub(crate) fn validate_native_projection_info(
+    name: &str,
+    info: &TensorInfo,
+    rows: usize,
+    cols: usize,
+) -> Result<usize> {
+    anyhow::ensure!(
+        info.shape.as_slice() == [rows, cols],
+        "native Qwen projection '{name}' shape {:?} != [{rows}, {cols}]",
+        info.shape
+    );
+    anyhow::ensure!(
+        qwen35_native_projection_type_supported(info.ggml_type),
+        "native Qwen projection '{name}' uses {:?}, which has no complete scalar decode/prefill route",
+        info.ggml_type
+    );
+    anyhow::ensure!(
+        cols % info.ggml_type.block_values() as usize == 0,
+        "native Qwen projection '{name}' row width {cols} is not aligned to {:?}'s {}-value blocks",
+        info.ggml_type,
+        info.ggml_type.block_values()
+    );
+    let expected = rows
+        .checked_mul(cols / info.ggml_type.block_values() as usize)
+        .and_then(|v| v.checked_mul(info.ggml_type.block_bytes() as usize))
+        .ok_or_else(|| anyhow!("native Qwen projection '{name}' byte length overflow"))?;
+    anyhow::ensure!(
+        info.byte_len == expected,
+        "native Qwen projection '{name}' byte length {} != expected {expected} for {:?}",
+        info.byte_len,
+        info.ggml_type
+    );
+    Ok(expected)
+}
+
+pub(crate) fn qwen35_native_projection_type_supported(t: GgmlType) -> bool {
+    matches!(
+        t,
+        GgmlType::F32
+            | GgmlType::Q2_K
+            | GgmlType::Q3_K
+            | GgmlType::Q4_0
+            | GgmlType::Q5_1
+            | GgmlType::Q8_0
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::IQ4_NL
+            | GgmlType::IQ4_XS
+    )
 }
 
 /// Load one full-attention block with the conversion-emitted quantized
@@ -1319,42 +1350,22 @@ pub fn load_moe_ffn_quantized(
         .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_down_exps not found in GGUF"))?;
     let ggml_type_down = down_info.ggml_type;
 
-    let supported = |t: GgmlType| {
-        matches!(
-            t,
-            GgmlType::Q4_0
-            | GgmlType::Q5_1
-            | GgmlType::Q8_0
-            | GgmlType::Q4_K
-            | GgmlType::Q5_K
-            | GgmlType::Q6_K
-            | GgmlType::IQ4_NL
-            // ADR-033 §Pi Task #18 2026-05-22 — IQ4_XS mv_id ported
-            // at mlx-native@ff13e58. Required for apex-quality /
-            // apex-i-quality MoE GGUFs (mudler's canonical mid-layer
-            // expert quant).
-            | GgmlType::IQ4_XS
-        )
-    };
+    let supported = qwen35_moe_expert_type_supported;
 
     // Validate that the types are supported by quantized_matmul_id_ggml.
-    // Per `mlx-native/src/ops/quantized_matmul_id_ggml.rs`:
-    //  - Q4_K/Q5_K use mv_id (decode) + mm_id (prefill ports landed ADR-022 Phase 2)
-    //  - Q4_0/Q8_0/Q6_K use mv_id (decode) + mm_id (prefill > 8 tok)
-    //  - Q5_1 / IQ4_NL: mv_id + mm_id + mm_id_tensor all ported (ADR-022 Phase 1).
-    //  - IQ4_XS: mv_id ported (ADR-033 §Pi Task #16); mm_id pending —
-    //    prefill at m > 8 will surface a typed dispatch error (fail-loud).
+    // The locked mlx-native 0.11.2 route covers Q2_K/Q3_K in decode,
+    // prefill, tensor, and routed expert kernels.
     if !supported(ggml_type_gate_up) {
         return Err(anyhow!(
             "layer {layer_idx}: gate/up expert weights have unsupported quant type {:?} \
-             (expected Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, or IQ4_XS)",
+             (expected Q2_K, Q3_K, Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, or IQ4_XS)",
             ggml_type_gate_up
         ));
     }
     if !supported(ggml_type_down) {
         return Err(anyhow!(
             "layer {layer_idx}: down expert weights have unsupported quant type {:?} \
-             (expected Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, or IQ4_XS)",
+             (expected Q2_K, Q3_K, Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, or IQ4_XS)",
             ggml_type_down
         ));
     }
@@ -1376,6 +1387,26 @@ pub fn load_moe_ffn_quantized(
     })
 }
 
+pub(crate) fn qwen35_moe_expert_type_supported(t: GgmlType) -> bool {
+    matches!(
+        t,
+        GgmlType::Q2_K
+            | GgmlType::Q3_K
+            | GgmlType::Q4_0
+            | GgmlType::Q5_1
+            | GgmlType::Q8_0
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::IQ4_NL
+            // ADR-033 §Pi Task #18 2026-05-22 — IQ4_XS mv_id ported
+            // at mlx-native@ff13e58. Required for apex-quality /
+            // apex-i-quality MoE GGUFs (mudler's canonical mid-layer
+            // expert quant).
+            | GgmlType::IQ4_XS
+    )
+}
+
 /// Load a dense FFN layer's weights.
 pub fn load_dense_ffn(
     gguf: &GgufFile,
@@ -1395,6 +1426,23 @@ pub(super) enum DenseFfnStorage {
     Quantized,
 }
 
+pub(crate) fn qwen35_dense_ffn_type_supported(t: GgmlType) -> bool {
+    matches!(t, GgmlType::F16 | GgmlType::F32) || qwen35_dense_ffn_quant_type_supported(t)
+}
+
+fn qwen35_dense_ffn_quant_type_supported(t: GgmlType) -> bool {
+    matches!(
+        t,
+        GgmlType::Q2_K
+            | GgmlType::Q3_K
+            | GgmlType::Q4_0
+            | GgmlType::Q8_0
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+    )
+}
+
 pub(super) fn dense_ffn_storage(
     layer_idx: u32,
     gate: GgmlType,
@@ -1402,12 +1450,7 @@ pub(super) fn dense_ffn_storage(
     down: GgmlType,
 ) -> Result<DenseFfnStorage> {
     let is_float = |t: GgmlType| matches!(t, GgmlType::F16 | GgmlType::F32);
-    let is_supported_quant = |t: GgmlType| {
-        matches!(
-            t,
-            GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
-        )
-    };
+    let is_supported_quant = qwen35_dense_ffn_quant_type_supported;
 
     if is_float(gate) && is_float(up) && is_float(down) {
         return Ok(DenseFfnStorage::Float);
@@ -1425,6 +1468,18 @@ pub(super) fn dense_ffn_storage(
         "layer {layer_idx}: unsupported or mixed dense FFN storage: \
          gate={gate:?}, up={up:?}, down={down:?}; refusing a silent F32 expansion"
     ))
+}
+
+/// Shared admission boundary for bounded hosted preflight and the runtime
+/// loader. Keeping the relation here prevents either caller from accepting a
+/// gate/up dispatch mismatch or rejecting the all-float fixture/runtime path.
+pub(crate) fn validate_qwen35_dense_ffn_storage(
+    layer_idx: u32,
+    gate: GgmlType,
+    up: GgmlType,
+    down: GgmlType,
+) -> Result<()> {
+    dense_ffn_storage(layer_idx, gate, up, down).map(|_| ())
 }
 
 pub(super) fn dense_ffn_tensor_types(
@@ -1582,6 +1637,22 @@ mod tests {
                 .expect("Q4_K gate/up with Q6_K down is a supported dense layout"),
             DenseFfnStorage::Quantized
         );
+    }
+
+    #[test]
+    fn qwen38_q2_q3_dense_and_moe_storage_stays_quantized() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for (gate_up, down) in [
+            (GgmlType::Q2_K, GgmlType::Q3_K),
+            (GgmlType::Q3_K, GgmlType::Q4_K),
+        ] {
+            assert_eq!(
+                dense_ffn_storage(0, gate_up, gate_up, down).unwrap(),
+                DenseFfnStorage::Quantized
+            );
+            assert!(qwen35_moe_expert_type_supported(gate_up));
+            assert!(qwen35_moe_expert_type_supported(down));
+        }
     }
 
     #[test]

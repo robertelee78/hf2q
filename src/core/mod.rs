@@ -47,6 +47,7 @@
 // helpers.  `SourceShard` + `compute_source_bundle_sha256` deferred to
 // B1.3 (alongside `integrity` migration — SourceShard's `from_integrity`
 // adapter depends on ShardIntegrity from `src/input/integrity`).
+pub(crate) mod bounded_file;
 pub mod chat_template_resolver;
 pub mod chat_templates;
 pub mod deepseek_v4_encoding;
@@ -55,8 +56,8 @@ pub mod integrity;
 pub mod kernel_parity;
 pub mod mlx_safetensors_loader;
 pub mod model_arch;
-pub mod provenance;
 pub(crate) mod paired_artifact;
+pub mod provenance;
 pub mod sha256;
 pub mod tokenizer_adapter;
 pub mod traits;

@@ -24,7 +24,7 @@ use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 
 use super::config::VisionConfig;
-use super::convert::VitTensor;
+use super::convert::{VitTensor, VitTensorPlan};
 use super::VitConvertError;
 use crate::core::paired_artifact::{
     KEY_PAIR_GENERATION, KEY_PAIR_SCHEMA_VERSION, PAIR_METADATA_SCHEMA_VERSION,
@@ -94,7 +94,76 @@ pub fn write_mmproj_gguf_with_provenance_and_pair(
     let file = File::create(output)
         .map_err(|e| VitConvertError::GgufEmit(format!("create {:?}: {}", output, e)))?;
     let mut w = BufWriter::new(file);
+    write_mmproj_to(
+        &mut w,
+        vision_config,
+        tensors,
+        source_sha256,
+        pair_generation,
+    )?;
+    w.flush()
+        .map_err(|e| VitConvertError::GgufEmit(format!("flush: {}", e)))?;
+    Ok(())
+}
 
+pub(super) fn planned_mmproj_gguf_bytes_from_layout(
+    vision_config: &VisionConfig,
+    tensors: &HashMap<String, VitTensorPlan>,
+    source_sha256: Option<&str>,
+    pair_generation: Option<&str>,
+) -> Result<u64, VitConvertError> {
+    let mut sizing = SizingWriter::default();
+    write_mmproj_to(
+        &mut sizing,
+        vision_config,
+        tensors,
+        source_sha256,
+        pair_generation,
+    )?;
+    Ok(sizing.position)
+}
+
+trait MmprojTensorLayout {
+    fn shape(&self) -> &[usize];
+    fn dtype(&self) -> &crate::ir::DType;
+    fn data(&self) -> Option<&[u8]>;
+}
+
+impl MmprojTensorLayout for VitTensor {
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn dtype(&self) -> &crate::ir::DType {
+        &self.dtype
+    }
+
+    fn data(&self) -> Option<&[u8]> {
+        Some(&self.data)
+    }
+}
+
+impl MmprojTensorLayout for VitTensorPlan {
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn dtype(&self) -> &crate::ir::DType {
+        &self.dtype
+    }
+
+    fn data(&self) -> Option<&[u8]> {
+        None
+    }
+}
+
+fn write_mmproj_to<W: Write + Seek, T: MmprojTensorLayout>(
+    w: &mut W,
+    vision_config: &VisionConfig,
+    tensors: &HashMap<String, T>,
+    source_sha256: Option<&str>,
+    pair_generation: Option<&str>,
+) -> Result<(), VitConvertError> {
     // Sort tensor names for deterministic output (same-input byte-identical).
     let mut names: Vec<&String> = tensors.keys().collect();
     names.sort();
@@ -132,7 +201,7 @@ pub fn write_mmproj_gguf_with_provenance_and_pair(
 
     // --- Metadata KV ---
     for (key, value) in &metadata {
-        write_kv(&mut w, key, value)?;
+        write_kv(w, key, value)?;
     }
 
     // --- Pass 1: compute tensor data offsets (writes info entries) ---
@@ -152,13 +221,23 @@ pub fn write_mmproj_gguf_with_provenance_and_pair(
     let mut running_offset: u64 = 0;
     for name in &names {
         let t = &tensors[*name];
-        let numel: u64 = t.shape.iter().product::<usize>() as u64;
+        let numel = t.shape().iter().try_fold(1_u64, |product, dimension| {
+            let dimension = u64::try_from(*dimension).map_err(|_| {
+                VitConvertError::GgufEmit(format!(
+                    "tensor {:?} dimension does not fit in u64",
+                    name
+                ))
+            })?;
+            product.checked_mul(dimension).ok_or_else(|| {
+                VitConvertError::GgufEmit(format!("tensor {:?} element count overflows u64", name))
+            })
+        })?;
         // ADR-021 iter-11b: honor per-tensor dtype set by the converter
         // (norms + biases are F32; weights are F16). Pre-fix this loop
         // hardcoded F16 + 2-byte size, which produced 210 wrong-dtype
         // tensors and crashed the stock peer's `clip_model_loader::warmup`
         // on `GGML_ASSERT(a->type == GGML_TYPE_F32)`.
-        let (gguf_dtype, bytes_per_elem) = match t.dtype {
+        let (gguf_dtype, bytes_per_elem) = match t.dtype() {
             crate::ir::DType::F32 => (GGML_TYPE_F32, 4u64),
             crate::ir::DType::F16 => (GGML_TYPE_F16, 2u64),
             ref other => {
@@ -169,21 +248,28 @@ pub fn write_mmproj_gguf_with_provenance_and_pair(
                 )));
             }
         };
-        let size = numel * bytes_per_elem;
+        let size = numel.checked_mul(bytes_per_elem).ok_or_else(|| {
+            VitConvertError::GgufEmit(format!("tensor {:?} byte length overflows u64", name))
+        })?;
         infos.push(Info {
             name: name.as_str(),
-            shape: &t.shape,
+            shape: t.shape(),
             dtype: gguf_dtype,
             size,
             offset: running_offset,
         });
         // Align each tensor's payload to 32 bytes.
-        running_offset = align_up(running_offset + size, ALIGNMENT);
+        running_offset = running_offset
+            .checked_add(size)
+            .map(|offset| align_up(offset, ALIGNMENT))
+            .ok_or_else(|| {
+                VitConvertError::GgufEmit("mmproj tensor data offsets overflow u64".into())
+            })?;
     }
 
     for info in &infos {
         // name (gguf-string: u64 len, utf8 bytes)
-        write_gguf_string(&mut w, info.name)?;
+        write_gguf_string(w, info.name)?;
         // n_dims u32
         w.write_all(&(info.shape.len() as u32).to_le_bytes())?;
         // shape u64 × n_dims (reverse to innermost-first per GGUF convention)
@@ -197,7 +283,7 @@ pub fn write_mmproj_gguf_with_provenance_and_pair(
     }
 
     // --- Align to 32 bytes before tensor data ---
-    let header_end = current_pos(&mut w)?;
+    let header_end = current_pos(w)?;
     let data_start = align_up(header_end, ALIGNMENT);
     for _ in header_end..data_start {
         w.write_all(&[0u8])?;
@@ -206,7 +292,25 @@ pub fn write_mmproj_gguf_with_provenance_and_pair(
     // --- Pass 2: write tensor data with inter-tensor alignment ---
     for (i, info) in infos.iter().enumerate() {
         let t = &tensors[info.name];
-        w.write_all(&t.data)?;
+        if let Some(data) = t.data() {
+            if data.len() as u64 != info.size {
+                return Err(VitConvertError::GgufEmit(format!(
+                    "tensor {:?} payload is {} bytes, planned {}",
+                    info.name,
+                    data.len(),
+                    info.size
+                )));
+            }
+            w.write_all(data)?;
+        } else {
+            let delta = i64::try_from(info.size).map_err(|_| {
+                VitConvertError::GgufEmit(format!(
+                    "tensor {:?} planned payload exceeds i64",
+                    info.name
+                ))
+            })?;
+            w.seek(std::io::SeekFrom::Current(delta))?;
+        }
         // Align to next tensor's offset boundary unless last.
         if i + 1 < infos.len() {
             let next_expected = infos[i + 1].offset;
@@ -217,9 +321,39 @@ pub fn write_mmproj_gguf_with_provenance_and_pair(
         }
     }
 
-    w.flush()
-        .map_err(|e| VitConvertError::GgufEmit(format!("flush: {}", e)))?;
     Ok(())
+}
+
+#[derive(Default)]
+struct SizingWriter {
+    position: u64,
+}
+
+impl Write for SizingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.position = self
+            .position
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("planned mmproj size overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for SizingWriter {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        let next = match position {
+            std::io::SeekFrom::Start(position) => Some(position),
+            std::io::SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+            std::io::SeekFrom::End(_) => None,
+        }
+        .ok_or_else(|| std::io::Error::other("invalid planned mmproj sizing seek"))?;
+        self.position = next;
+        Ok(next)
+    }
 }
 
 fn align_up(n: u64, to: u64) -> u64 {
@@ -231,7 +365,7 @@ fn align_up(n: u64, to: u64) -> u64 {
     }
 }
 
-fn current_pos(w: &mut BufWriter<File>) -> std::io::Result<u64> {
+fn current_pos(w: &mut (impl Write + Seek)) -> std::io::Result<u64> {
     // BufWriter<File> implements Seek (transitive over W: Write + Seek), and
     // `stream_position()` flushes any buffered bytes before delegating to the
     // underlying file's position cursor. Without this real implementation the
@@ -579,6 +713,42 @@ mod tests {
         assert_eq!(&bytes[0..4], &GGUF_MAGIC);
         let tensor_count = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         assert_eq!(tensor_count, 0);
+    }
+
+    #[test]
+    fn planned_mmproj_bytes_match_real_nonempty_aligned_output() {
+        let tensors = tiny_tensors();
+        let plans = tensors
+            .iter()
+            .map(|(name, tensor)| {
+                (
+                    name.clone(),
+                    VitTensorPlan {
+                        gguf_name: tensor.gguf_name.clone(),
+                        shape: tensor.shape.clone(),
+                        dtype: tensor.dtype.clone(),
+                    },
+                )
+            })
+            .collect();
+        let source = "a".repeat(64);
+        let planned = planned_mmproj_gguf_bytes_from_layout(
+            &tiny_config(),
+            &plans,
+            Some(&source),
+            Some("pair-generation"),
+        )
+        .unwrap();
+        let output = tempfile::NamedTempFile::new().unwrap();
+        write_mmproj_gguf_with_provenance_and_pair(
+            output.path(),
+            &tiny_config(),
+            &tensors,
+            Some(&source),
+            Some("pair-generation"),
+        )
+        .unwrap();
+        assert_eq!(std::fs::metadata(output.path()).unwrap().len(), planned);
     }
 
     #[allow(dead_code)]

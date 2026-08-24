@@ -464,8 +464,8 @@ pub struct ConvertCliArgs {
     ///
     /// Parsed via `QuantSelector::from_name`; unrecognized values
     /// surface as input errors. When omitted, the value recorded by
-    /// `hf2q setup` is used; without either source, conversion fails and
-    /// asks the operator to choose. Per
+    /// `hf2q setup` is used; without either source, hf2q selects from the
+    /// live hardware profile. Per
     /// [[feedback-no-backwards-compat-2026-05-18]]: no legacy aliases.
     #[arg(
         long,
@@ -474,9 +474,15 @@ pub struct ConvertCliArgs {
     )]
     pub quant: Option<String>,
 
-    /// Destination GGUF file. Existing files are overwritten.
+    /// Destination GGUF file or existing directory. Remote models default to
+    /// the managed hf2q model directory when omitted. Existing conflicting
+    /// files are never overwritten implicitly.
     #[arg(short, long)]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
+
+    /// Internal no-replace publication contract used by managed conversion.
+    #[arg(long, hide = true, default_value_t = false)]
+    pub no_clobber: bool,
 
     /// Build and report the exact tensor/type/byte plan without creating the
     /// output GGUF. Source download or provenance hashing may still read the
@@ -981,6 +987,15 @@ pub struct GenerateArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct ChatArgs {
+    /// Local model path, `owner/repository[:QUANT]`, or `list`. Repository
+    /// operands start an owned local server and use the same preparation path
+    /// as `hf2q serve`.
+    #[arg(
+        value_name = "MODEL",
+        conflicts_with_all = ["url", "model", "quant", "artifact"]
+    )]
+    pub target: Option<String>,
+
     /// OpenAI-compatible server base URL. Without this flag, the automatic
     /// local discovery integration selects a registered hf2q server.
     #[arg(long, value_name = "URL")]
@@ -1074,10 +1089,15 @@ impl DiagnosticQuantArg {
 
 #[derive(clap::Args, Debug)]
 pub struct ServeArgs {
-    /// Path to GGUF model file. Optional in the iter-2 backbone which only
-    /// exposes /health, /readyz, /v1/models; required once /v1/chat and
-    /// /v1/embeddings route. Fail-fast on bad weights is preserved: if
-    /// --model is supplied, the GGUF header is validated at startup.
+    /// Local GGUF path, `owner/repository[:QUANT]`, or `list`. A repository
+    /// resolves verified local bytes first, then a compatible hosted GGUF,
+    /// then native source conversion when no supported hosted artifact exists.
+    #[arg(value_name = "MODEL", conflicts_with = "model")]
+    pub target: Option<String>,
+
+    /// Compatibility spelling for a GGUF path or
+    /// `owner/repository[:QUANT]`. Prefer the positional MODEL operand.
+    /// Fail-fast on bad weights is preserved at startup.
     #[arg(
         long,
         value_hint = clap::ValueHint::FilePath,
@@ -1085,16 +1105,36 @@ pub struct ServeArgs {
     )]
     pub model: Option<PathBuf>,
 
+    /// Destination file or existing directory for a repository artifact.
+    /// Omit to use the canonical managed model directory.
+    #[arg(short, long, value_name = "FILE_OR_DIR")]
+    pub output: Option<PathBuf>,
+
     /// Additional server-local directory to search for schema-v3 hf2q
     /// conversion receipts. Repeatable; roots are bounded and never exposed.
     #[arg(long = "model-dir", value_name = "DIR")]
     pub model_dirs: Vec<PathBuf>,
 
-    /// Internal inherited descriptor for a server owned by `hf2q chat`.
+    /// Internal inherited Unix socket for a server owned by `hf2q chat`.
     /// The server accepts it only while leading an isolated process group;
-    /// EOF terminates that group and `D` explicitly detaches it.
-    #[arg(long, hide = true, value_name = "FD")]
+    /// EOF terminates that group and a bounded frame explicitly detaches it.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "FD",
+        requires = "chat_owned_listener_fd"
+    )]
     pub chat_parent_lifeline_fd: Option<i32>,
+
+    /// Internal pre-bound loopback listener retained by the owning chat
+    /// process for the full credentialed endpoint lifetime.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "FD",
+        requires = "chat_parent_lifeline_fd"
+    )]
+    pub chat_owned_listener_fd: Option<i32>,
 
     /// Path to tokenizer.json (if not alongside GGUF).
     #[arg(long)]
@@ -1852,6 +1892,39 @@ mod tests {
     }
 
     #[test]
+    fn frictionless_chat_operand_accepts_repo_quant_and_list() {
+        let cli = Cli::try_parse_from([
+            "hf2q",
+            "chat",
+            "jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M",
+        ])
+        .expect("chat should accept a repository with an exact quant suffix");
+        let Command::Chat(args) = cli.command else {
+            panic!("expected Chat");
+        };
+        assert_eq!(
+            args.target.as_deref(),
+            Some("jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M")
+        );
+
+        let cli = Cli::try_parse_from(["hf2q", "chat", "list"])
+            .expect("chat list should be a first-class local inventory command");
+        let Command::Chat(args) = cli.command else {
+            panic!("expected Chat");
+        };
+        assert_eq!(args.target.as_deref(), Some("list"));
+
+        assert!(Cli::try_parse_from([
+            "hf2q",
+            "chat",
+            "owner/model:Q4_K_M",
+            "--model",
+            "legacy-endpoint-model",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn generated_zsh_completion_contains_chat_and_diagnostic_selectors() {
         use clap::CommandFactory;
 
@@ -1950,6 +2023,74 @@ mod tests {
         };
         assert_eq!(args.revision.as_deref(), Some("main"));
         assert_eq!(args.hf_dir, Some(PathBuf::from("Qwen/Qwen3.8-27B")));
+    }
+
+    #[test]
+    fn frictionless_convert_accepts_repo_quant_without_output() {
+        let cli = Cli::try_parse_from([
+            "hf2q",
+            "convert",
+            "jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q8_0",
+        ])
+        .expect("convert should derive quant and managed output from the model operand");
+        let Command::Convert(args) = cli.command else {
+            panic!("expected Convert");
+        };
+        assert_eq!(
+            args.hf_dir,
+            Some(PathBuf::from(
+                "jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q8_0"
+            ))
+        );
+        assert!(args.output.is_none());
+    }
+
+    #[test]
+    fn frictionless_serve_operand_accepts_repo_quant_and_list() {
+        let cli = Cli::try_parse_from([
+            "hf2q",
+            "serve",
+            "jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q8_0",
+        ])
+        .expect("serve should accept a repository with an exact quant suffix");
+        let Command::Serve(args) = cli.command else {
+            panic!("expected Serve");
+        };
+        assert_eq!(
+            args.target.as_deref(),
+            Some("jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q8_0")
+        );
+
+        let cli = Cli::try_parse_from(["hf2q", "serve", "list"])
+            .expect("serve list should be a first-class local inventory command");
+        let Command::Serve(args) = cli.command else {
+            panic!("expected Serve");
+        };
+        assert_eq!(args.target.as_deref(), Some("list"));
+
+        let cli = Cli::try_parse_from([
+            "hf2q",
+            "serve",
+            "--model",
+            "owner/model:Q6_K",
+            "--output",
+            "/tmp/models",
+        ])
+        .expect("compatibility --model repository spelling should honor --output");
+        let Command::Serve(args) = cli.command else {
+            panic!("expected Serve");
+        };
+        assert_eq!(args.model, Some(PathBuf::from("owner/model:Q6_K")));
+        assert_eq!(args.output, Some(PathBuf::from("/tmp/models")));
+
+        assert!(Cli::try_parse_from([
+            "hf2q",
+            "serve",
+            "owner/model:Q8_0",
+            "--model",
+            "/tmp/model.gguf",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -2058,7 +2199,7 @@ mod tests {
         );
         assert_eq!(args.revision.as_deref(), Some(revision));
         assert_eq!(args.quant.as_deref(), Some("q4_k_m"));
-        assert_eq!(args.output, PathBuf::from(model));
+        assert_eq!(args.output, Some(PathBuf::from(model)));
 
         let cli = Cli::parse_from(["hf2q", "serve", "--model", model]);
         let Command::Serve(args) = cli.command else {

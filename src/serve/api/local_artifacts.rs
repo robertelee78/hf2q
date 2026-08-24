@@ -12,15 +12,16 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::convert::receipt::{ConversionReceipt, CONVERSION_RECEIPT_SCHEMA_VERSION};
-use crate::serve::cache::{cache_model_path, CacheManifest, ModelEntry};
+use crate::serve::cache::{cache_model_path, CacheManifest, ModelEntry, QuantEntry};
 use crate::serve::quant_select::QuantType;
 
 mod verification;
 
+pub(crate) use verification::verify_retained_local_artifact;
 pub use verification::{verify_local_artifact, LocalVerificationReceipt, LocalVerificationRequest};
 
 const RECEIPT_SUFFIX: &str = ".gguf.receipt.json";
-const MAX_ROOTS: usize = 8;
+const MAX_ROOTS: usize = 9;
 const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
 const MAX_SCAN_DEPTH: usize = 6;
 const MAX_DIRECTORY_ENTRIES: usize = 4096;
@@ -91,13 +92,18 @@ impl LocalArtifactInventory {
     /// configured roots. A conventional root may be created after startup;
     /// explicit roots must already be safe directories so typos fail loudly.
     pub fn for_serve(explicit_roots: &[PathBuf]) -> Result<Self> {
-        if explicit_roots.len() + 1 > MAX_ROOTS {
+        if explicit_roots.len() + 2 > MAX_ROOTS {
             bail!("at most {} local model roots may be configured", MAX_ROOTS);
         }
         let cwd = std::env::current_dir().context("resolve server working directory")?;
-        let mut roots = vec![LocalArtifactRoot {
-            path: lexical_absolute(&cwd.join("models"), &cwd)?,
-        }];
+        let mut roots = vec![
+            LocalArtifactRoot {
+                path: lexical_absolute(&cwd.join("models"), &cwd)?,
+            },
+            LocalArtifactRoot {
+                path: lexical_absolute(&crate::model_spec::managed_model_root()?, &cwd)?,
+            },
+        ];
         for path in explicit_roots {
             let absolute = lexical_absolute(path, &cwd)?;
             validate_existing_root(&absolute)?;
@@ -298,7 +304,10 @@ fn inspect_receipt(
     receipt_path: &Path,
     expected_repository: Option<&str>,
 ) -> Result<Option<LocalGgufArtifact>> {
-    let bytes = fs::read(receipt_path).context("read receipt")?;
+    let bytes =
+        crate::core::bounded_file::read_bounded_regular_nofollow(receipt_path, MAX_RECEIPT_BYTES)
+            .context("read receipt")?
+            .context("receipt is not one stable bounded regular file")?;
     let receipt: ConversionReceipt =
         serde_json::from_slice(&bytes).context("invalid JSON/schema")?;
     if receipt.schema_version != CONVERSION_RECEIPT_SCHEMA_VERSION
@@ -422,10 +431,20 @@ fn discover_cache_model(
         let Ok(canonical) = entry.gguf_path.canonicalize() else {
             continue;
         };
-        if canonical != expected {
+        let legacy =
+            crate::serve::cache::legacy_cache_model_path(&canonical_root, &model.repo_id, quant);
+        if canonical != expected && canonical != legacy {
             push_warning(
                 warnings,
                 "ignored a managed-cache artifact outside canonical layout",
+            );
+            continue;
+        }
+        if canonical == legacy && !legacy_cache_authority_matches(&legacy, model, quant_name, entry)
+        {
+            push_warning(
+                warnings,
+                "ignored a legacy cache artifact without matching repository and quant companions",
             );
             continue;
         }
@@ -459,6 +478,40 @@ fn discover_cache_model(
             warnings,
         );
     }
+}
+
+fn legacy_cache_authority_matches(
+    artifact: &Path,
+    model: &ModelEntry,
+    quant_name: &str,
+    entry: &QuantEntry,
+) -> bool {
+    const MAX_CACHE_COMPANION_BYTES: u64 = 1024 * 1024;
+    let Some(quant_dir) = artifact.parent() else {
+        return false;
+    };
+    let Some(model_dir) = quant_dir.parent().and_then(Path::parent) else {
+        return false;
+    };
+    let repo_meta = crate::core::bounded_file::read_bounded_regular_nofollow(
+        &model_dir.join("repo_meta.json"),
+        MAX_CACHE_COMPANION_BYTES,
+    )
+    .ok()
+    .flatten()
+    .and_then(|bytes| serde_json::from_slice::<ModelEntry>(&bytes).ok());
+    let quant_meta = crate::core::bounded_file::read_bounded_regular_nofollow(
+        &quant_dir.join("manifest.json"),
+        MAX_CACHE_COMPANION_BYTES,
+    )
+    .ok()
+    .flatten()
+    .and_then(|bytes| serde_json::from_slice::<QuantEntry>(&bytes).ok());
+    repo_meta.is_some_and(|authority| {
+        authority.repo_id == model.repo_id
+            && authority.revision == model.revision
+            && authority.quantizations.get(quant_name) == Some(entry)
+    }) && quant_meta.as_ref() == Some(entry)
 }
 
 fn insert_artifact(

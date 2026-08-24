@@ -157,7 +157,9 @@ pub(crate) fn run_convert_with_stored_evidence(
             converter_git_commit,
         }),
         PairBinding::default(),
+        true,
     )?
+    .verified_conversion
     .ok_or_else(|| {
         ConvertError::Source(SourceError::Safetensors(
             "stored-evidence conversion did not produce a verified catalog".into(),

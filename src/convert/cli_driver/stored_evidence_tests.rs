@@ -322,6 +322,7 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                 hf_dir: dir.path().into(),
                 selector,
                 output: output.clone(),
+                no_clobber: false,
                 dry_run: false,
                 imatrix: None,
                 imatrix_corpus: None,

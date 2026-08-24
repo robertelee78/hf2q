@@ -95,9 +95,12 @@ use crate::core::provenance::SourceShard;
 ///   for ADR-005 Phase 3 item 3/4 (HF integrity).  v1 manifests load
 ///   transparently — missing field defaults to empty Vec — and are
 ///   re-written as v2 on the next mutation.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+/// - **v3**: adds quant-specific `QuantEntry::last_used_at_secs`, so bare
+///   repository resolution does not confuse a model-level eviction touch
+///   with successful use of every cached quantization.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
 /// Lowest schema version the loader still understands.  v1 manifests are
-/// migrated in-place to v2 on read (no field invalidation).
+/// migrated in-place to v3 on read (all added fields are defaulted).
 pub const MANIFEST_SCHEMA_MIN_SUPPORTED: u32 = 1;
 
 /// Env var that (if set + non-empty) overrides every other root resolution
@@ -185,6 +188,11 @@ pub struct QuantEntry {
     /// Seconds since epoch when the quantization completed (atomic
     /// `finalize` time).
     pub quantized_at_secs: u64,
+    /// Seconds since epoch when this exact quant was last loaded
+    /// successfully. This is selection history; model-level
+    /// `last_accessed_secs` remains the eviction LRU for all sibling quants.
+    #[serde(default)]
+    pub last_used_at_secs: u64,
     /// `hf2q` semver that produced this quant (read from
     /// `env!("CARGO_PKG_VERSION")`).
     pub quantized_by_version: String,
@@ -224,9 +232,9 @@ pub fn default_root() -> Result<PathBuf> {
     ))
 }
 
-/// Encode an HF repo_id (`org/repo` or `user/repo-name`) as a single
-/// directory component.  `/` → `__`.  Reversible round-trip via
-/// [`unslug_repo_id`].
+/// Encode a validated HF repo_id as one case-fold-stable, injective directory
+/// component. The 96-byte HF limit becomes at most 195 bytes (`v2-` + hex),
+/// below the 255-byte component limit used by supported filesystems.
 ///
 /// Rejects empty input and inputs with characters that are filesystem-unsafe
 /// on macOS / Linux (`\0`, embedded `/` after replacement is fine).  Unicode
@@ -245,13 +253,28 @@ pub fn slug_repo_id(repo_id: &str) -> Result<String> {
             repo_id
         ));
     }
-    Ok(repo_id.replace('/', "__"))
+    if !repo_id.is_ascii() || repo_id.len() > crate::input::hf_reference::MAX_HF_REPO_ID_BYTES {
+        return Err(anyhow!(
+            "repo_id is not a bounded ASCII Hugging Face identity"
+        ));
+    }
+    Ok(format!("v2-{}", hex::encode(repo_id.as_bytes())))
 }
 
-/// Reverse of [`slug_repo_id`].  Panics never; returns the slug back if the
-/// shape doesn't match the canonical encoding.
+/// Reverse of [`slug_repo_id`]. Panics never; malformed v2 input is returned
+/// unchanged rather than being interpreted as a different repository.
 pub fn unslug_repo_id(slug: &str) -> String {
-    slug.replace("__", "/")
+    let Some(encoded) = slug.strip_prefix("v2-") else {
+        return slug.replace("__", "/");
+    };
+    hex::decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| slug.to_owned())
+}
+
+fn legacy_slug_repo_id(repo_id: &str) -> String {
+    repo_id.replace('/', "__")
 }
 
 /// `repo_id` + `quant` → on-disk path of the cached `model.gguf`.
@@ -267,6 +290,14 @@ pub fn cache_model_path(root: &Path, repo_id: &str, quant: QuantType) -> Result<
         .join("quantized")
         .join(quant.as_str())
         .join("model.gguf"))
+}
+
+pub(crate) fn legacy_cache_model_path(root: &Path, repo_id: &str, quant: QuantType) -> PathBuf {
+    root.join("models")
+        .join(legacy_slug_repo_id(repo_id))
+        .join("quantized")
+        .join(quant.as_str())
+        .join("model.gguf")
 }
 
 /// Companion to [`cache_model_path`] for the optional `mmproj.gguf`.
@@ -292,7 +323,7 @@ pub fn cache_mmproj_path(root: &Path, repo_id: &str, quant: QuantType) -> Result
 /// is dropped.
 pub struct CacheLock {
     /// Held to keep the fd alive; cleanup happens in `Drop`.
-    file: Option<File>,
+    files: Vec<File>,
 }
 
 impl CacheLock {
@@ -318,7 +349,7 @@ impl CacheLock {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("flock LOCK_EX: {}", path.display()));
         }
-        Ok(Self { file: Some(file) })
+        Ok(Self { files: vec![file] })
     }
 
     /// Try to acquire the lock without blocking.  Returns `Ok(Some)` if
@@ -338,7 +369,7 @@ impl CacheLock {
         let fd = file.as_raw_fd();
         let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
         if ret == 0 {
-            Ok(Some(Self { file: Some(file) }))
+            Ok(Some(Self { files: vec![file] }))
         } else {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
@@ -348,11 +379,37 @@ impl CacheLock {
             }
         }
     }
+
+    fn acquire_all(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
+        let mut paths = paths.into_iter().collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut lock = Self::acquire(&path)?;
+            files.append(&mut lock.files);
+        }
+        Ok(Self { files })
+    }
+
+    fn try_acquire_all(paths: impl IntoIterator<Item = PathBuf>) -> Result<Option<Self>> {
+        let mut paths = paths.into_iter().collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let Some(mut lock) = Self::try_acquire(&path)? else {
+                return Ok(None);
+            };
+            files.append(&mut lock.files);
+        }
+        Ok(Some(Self { files }))
+    }
 }
 
 impl Drop for CacheLock {
     fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
+        for file in self.files.drain(..) {
             let fd = file.as_raw_fd();
             unsafe {
                 libc::flock(fd, libc::LOCK_UN);
@@ -449,6 +506,8 @@ impl ModelCache {
     ) -> Result<()> {
         // Validate slug now so we don't write a half-valid entry.
         let _ = slug_repo_id(repo_id)?;
+        let _manifest_lock = self.lock_manifest()?;
+        self.reload_manifest()?;
 
         let now = secs_since_epoch();
         let entry = self
@@ -484,6 +543,8 @@ impl ModelCache {
     /// only updates the manifest + per-quant manifest companion.
     pub fn record_quantized(&mut self, repo_id: &str, entry: QuantEntry) -> Result<()> {
         let _ = slug_repo_id(repo_id)?;
+        let _manifest_lock = self.lock_manifest()?;
+        self.reload_manifest()?;
         let model = self
             .manifest
             .models
@@ -525,6 +586,8 @@ impl ModelCache {
         shards: Vec<crate::core::integrity::ShardIntegrity>,
     ) -> Result<()> {
         let _ = slug_repo_id(repo_id)?;
+        let _manifest_lock = self.lock_manifest()?;
+        self.reload_manifest()?;
 
         let now = secs_since_epoch();
         let entry = self
@@ -604,8 +667,34 @@ impl ModelCache {
     /// Update `last_accessed_secs` for a model (LRU touch).  No-op if the
     /// model isn't cached.  Flushes the manifest on success.
     pub fn touch(&mut self, repo_id: &str) -> Result<()> {
+        let _manifest_lock = self.lock_manifest()?;
+        self.reload_manifest()?;
         if let Some(m) = self.manifest.models.get_mut(repo_id) {
             m.last_accessed_secs = secs_since_epoch();
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Record successful use of one exact quant while also touching the
+    /// repository-level eviction LRU. No-op if the model or quant is absent.
+    pub fn touch_quant(&mut self, repo_id: &str, quant: QuantType) -> Result<()> {
+        let _manifest_lock = self.lock_manifest()?;
+        self.reload_manifest()?;
+        if let Some(model) = self.manifest.models.get_mut(repo_id) {
+            let now = secs_since_epoch();
+            model.last_accessed_secs = now;
+            if let Some(entry) = model.quantizations.get_mut(quant.as_str()) {
+                entry.last_used_at_secs = now;
+                let companion = entry
+                    .gguf_path
+                    .parent()
+                    .ok_or_else(|| {
+                        anyhow!("gguf_path has no parent: {}", entry.gguf_path.display())
+                    })?
+                    .join("manifest.json");
+                write_json_atomic(&companion, entry)?;
+            }
             self.flush()?;
         }
         Ok(())
@@ -674,6 +763,8 @@ impl ModelCache {
     /// - `unknown_quant` if the model entry has no `quant` quantization.
     pub fn invalidate(&mut self, repo_id: &str, quant: QuantType) -> Result<u64> {
         let _lock = self.lock_quant(repo_id, quant)?;
+        let _manifest_lock = self.lock_manifest()?;
+        self.reload_manifest()?;
         let model = self.manifest.models.get(repo_id).ok_or_else(|| {
             anyhow!(
                 "invalidate: unknown_repo: no manifest entry for {}",
@@ -747,6 +838,8 @@ impl ModelCache {
                     .join(format!("{}__{}.lock", slug_repo_id(repo_id)?, q));
             locks.push(CacheLock::acquire(&lock_path)?);
         }
+        let _manifest_lock = self.lock_manifest()?;
+        self.reload_manifest()?;
 
         let slug = slug_repo_id(repo_id)?;
         let model_dir = self.root.join("models").join(&slug);
@@ -774,6 +867,8 @@ impl ModelCache {
     /// Returns the total bytes freed.  Idempotent: running twice
     /// returns `0` on the second call.
     pub fn purge(&mut self) -> Result<u64> {
+        let _manifest_lock = self.lock_manifest()?;
+        self.reload_manifest()?;
         let models_dir = self.root.join("models");
         let freed = dir_total_bytes(&models_dir);
 
@@ -812,32 +907,53 @@ impl ModelCache {
     }
 
     /// Atomically persist the manifest to `<root>/manifest.json`.
-    pub fn flush(&self) -> Result<()> {
+    fn flush(&self) -> Result<()> {
         let path = self.root.join("manifest.json");
         write_json_atomic(&path, &self.manifest)
+    }
+
+    /// Serialize every read-modify-write of the shared manifest. Callers that
+    /// also need per-quant locks acquire those first, then this lock.
+    fn lock_manifest(&self) -> Result<CacheLock> {
+        CacheLock::acquire(&self.root.join("locks").join("manifest.lock"))
+    }
+
+    /// Refresh the in-memory snapshot after acquiring the manifest lock so a
+    /// stale process cannot erase another process's completed mutation.
+    fn reload_manifest(&mut self) -> Result<()> {
+        let path = self.root.join("manifest.json");
+        self.manifest = if path.exists() {
+            read_manifest(&path)?
+        } else {
+            CacheManifest::default()
+        };
+        Ok(())
     }
 
     /// Acquire an exclusive cross-process lock for `(repo_id, quant)`.
     /// Blocks until granted.  Lock file lives at
     /// `<root>/locks/<slug>__<quant>.lock` and is created if missing.
     pub fn lock_quant(&self, repo_id: &str, quant: QuantType) -> Result<CacheLock> {
-        let path = self.lock_path(repo_id, quant)?;
-        CacheLock::acquire(&path)
+        CacheLock::acquire_all(self.lock_paths(repo_id, quant)?)
     }
 
     /// Non-blocking variant of [`lock_quant`].  Returns `Ok(None)` if
     /// another process holds the lock.
     pub fn try_lock_quant(&self, repo_id: &str, quant: QuantType) -> Result<Option<CacheLock>> {
-        let path = self.lock_path(repo_id, quant)?;
-        CacheLock::try_acquire(&path)
+        CacheLock::try_acquire_all(self.lock_paths(repo_id, quant)?)
     }
 
-    fn lock_path(&self, repo_id: &str, quant: QuantType) -> Result<PathBuf> {
-        let slug = slug_repo_id(repo_id)?;
-        Ok(self
-            .root
-            .join("locks")
-            .join(format!("{slug}__{}.lock", quant.as_str())))
+    fn lock_paths(&self, repo_id: &str, quant: QuantType) -> Result<Vec<PathBuf>> {
+        let canonical = slug_repo_id(repo_id)?;
+        let legacy = legacy_slug_repo_id(repo_id);
+        Ok([canonical, legacy]
+            .into_iter()
+            .map(|slug| {
+                self.root
+                    .join("locks")
+                    .join(format!("{slug}__{}.lock", quant.as_str()))
+            })
+            .collect())
     }
 
     /// Detect a pre-existing HuggingFace hub cache for `repo_id` (no copy).
@@ -911,17 +1027,17 @@ fn ensure_layout(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_manifest(path: &Path) -> Result<CacheManifest> {
+/// Read and validate a cache manifest without creating or repairing cache
+/// directories. Read-only inventory commands use this instead of `open_at`.
+pub(crate) fn read_manifest(path: &Path) -> Result<CacheManifest> {
     let text =
         fs::read_to_string(path).with_context(|| format!("read manifest: {}", path.display()))?;
     let mut m: CacheManifest = serde_json::from_str(&text)
         .with_context(|| format!("parse manifest JSON: {}", path.display()))?;
-    // Schema range: any version in [MIN_SUPPORTED, CURRENT] loads.  v1
-    // manifests work because `source_shards` is `#[serde(default)]` —
-    // missing field deserializes as empty Vec.  We then bump the
+    // Schema range: any version in [MIN_SUPPORTED, CURRENT] loads.  Older
+    // manifests work because added fields are `#[serde(default)]`. We bump the
     // in-memory `schema_version` to the current value so the next flush
-    // persists a v2-compliant file (forward migration is one-way; we
-    // never write a v1 manifest after a v2 has loaded).
+    // persists a current-schema file (forward migration is one-way).
     if m.schema_version < MANIFEST_SCHEMA_MIN_SUPPORTED
         || m.schema_version > MANIFEST_SCHEMA_VERSION
     {
@@ -934,9 +1050,8 @@ fn read_manifest(path: &Path) -> Result<CacheManifest> {
         ));
     }
     if m.schema_version < MANIFEST_SCHEMA_VERSION {
-        // Migrate in memory.  No field invalidation v1 → v2 since we
-        // only added a defaulted field — but be explicit so the next
-        // schema bump has a hook to extend.
+        // Migrate in memory. No field invalidation is required because every
+        // field added after v1 has a serde default.
         m.schema_version = MANIFEST_SCHEMA_VERSION;
     }
     Ok(m)
@@ -1119,18 +1234,50 @@ mod tests {
 
     #[test]
     fn slug_simple_repo() {
-        assert_eq!(
-            slug_repo_id("google/gemma-4-27b-it").unwrap(),
-            "google__gemma-4-27b-it"
-        );
+        let id = "google/gemma-4-27b-it";
+        assert_eq!(slug_repo_id(id).unwrap(), format!("v2-{}", hex::encode(id)));
     }
 
     #[test]
     fn slug_unslug_roundtrip() {
         let id = "mistralai/Mistral-7B-Instruct-v0.3";
         let slug = slug_repo_id(id).unwrap();
-        assert_eq!(slug, "mistralai__Mistral-7B-Instruct-v0.3");
+        assert!(slug.starts_with("v2-"));
         assert_eq!(unslug_repo_id(&slug), id);
+    }
+
+    #[test]
+    fn slug_is_injective_for_literal_double_underscores() {
+        let left = "a__b/c";
+        let right = "a/b__c";
+        let left_slug = slug_repo_id(left).unwrap();
+        let right_slug = slug_repo_id(right).unwrap();
+        assert_ne!(left_slug, right_slug);
+        assert!(left_slug.starts_with("v2-"));
+        assert!(right_slug.starts_with("v2-"));
+        assert_eq!(unslug_repo_id(&left_slug), left);
+        assert_eq!(unslug_repo_id(&right_slug), right);
+    }
+
+    #[test]
+    fn slug_is_injective_at_legacy_boundaries_and_under_case_folding() {
+        for (left, right) in [("a_/b", "a/_b"), ("Owner/Model", "owner/model")] {
+            let left_slug = slug_repo_id(left).unwrap();
+            let right_slug = slug_repo_id(right).unwrap();
+            assert_ne!(left_slug, right_slug);
+            assert_ne!(
+                left_slug.to_ascii_lowercase(),
+                right_slug.to_ascii_lowercase()
+            );
+            assert_eq!(unslug_repo_id(&left_slug), left);
+            assert_eq!(unslug_repo_id(&right_slug), right);
+        }
+    }
+
+    #[test]
+    fn malformed_v2_slug_is_not_reinterpreted() {
+        assert_eq!(unslug_repo_id("v2-not-hex"), "v2-not-hex");
+        assert_eq!(unslug_repo_id("v2-ff"), "v2-ff");
     }
 
     #[test]
@@ -1152,19 +1299,15 @@ mod tests {
 
     #[test]
     fn slug_long_repo_id() {
-        // 200-char repo id (unrealistic but bounds-safe)
+        // Invalid identities cannot grow beyond a filesystem component.
         let long = format!("{}/{}", "a".repeat(100), "b".repeat(100));
-        let slug = slug_repo_id(&long).unwrap();
-        assert_eq!(slug.len(), 100 + 2 + 100); // 100 'a' + "__" + 100 'b'
-        assert_eq!(unslug_repo_id(&slug), long);
+        assert!(slug_repo_id(&long).is_err());
     }
 
     #[test]
     fn slug_unicode_repo_id() {
         let id = "用户/模型-v1";
-        let slug = slug_repo_id(id).unwrap();
-        assert!(slug.contains("__"));
-        assert_eq!(unslug_repo_id(&slug), id);
+        assert!(slug_repo_id(id).is_err());
     }
 
     // ── cache_model_path / cache_mmproj_path ──────────────────────────
@@ -1175,7 +1318,10 @@ mod tests {
         let p = cache_model_path(root, "google/gemma-4-27b-it", QuantType::Q4_K_M).unwrap();
         assert_eq!(
             p,
-            Path::new("/tmp/hf2q/models/google__gemma-4-27b-it/quantized/Q4_K_M/model.gguf")
+            Path::new("/tmp/hf2q")
+                .join("models")
+                .join(slug_repo_id("google/gemma-4-27b-it").unwrap())
+                .join("quantized/Q4_K_M/model.gguf")
         );
     }
 
@@ -1185,7 +1331,10 @@ mod tests {
         let p = cache_mmproj_path(root, "google/gemma-4-27b-it", QuantType::Q8_0).unwrap();
         assert_eq!(
             p,
-            Path::new("/tmp/hf2q/models/google__gemma-4-27b-it/quantized/Q8_0/mmproj.gguf")
+            Path::new("/tmp/hf2q")
+                .join("models")
+                .join(slug_repo_id("google/gemma-4-27b-it").unwrap())
+                .join("quantized/Q8_0/mmproj.gguf")
         );
     }
 
@@ -1305,7 +1454,7 @@ mod tests {
         assert!(tmp
             .path()
             .join("models")
-            .join("google__gemma-4-27b-it")
+            .join(slug_repo_id("google/gemma-4-27b-it").unwrap())
             .join("repo_meta.json")
             .is_file());
     }
@@ -1339,6 +1488,7 @@ mod tests {
             bytes: 16,
             sha256: sha256_file(&gguf).unwrap(),
             quantized_at_secs: secs_since_epoch(),
+            last_used_at_secs: 0,
             quantized_by_version: env!("CARGO_PKG_VERSION").to_string(),
         };
 
@@ -1367,6 +1517,7 @@ mod tests {
             bytes: 4,
             sha256: "0".repeat(64),
             quantized_at_secs: 0,
+            last_used_at_secs: 0,
             quantized_by_version: "0.1.0".into(),
         };
         // No `record_source` first → must error.
@@ -1845,11 +1996,13 @@ mod tests {
                 )
                 .unwrap();
         }
-        // Reread on cold disk; schema_version is now 2.
+        // Reread on cold disk; schema_version is now current.
         let raw = fs::read_to_string(tmp.path().join("manifest.json")).unwrap();
+        let spaced = format!(r#""schema_version": {}"#, MANIFEST_SCHEMA_VERSION);
+        let compact = format!(r#""schema_version":{}"#, MANIFEST_SCHEMA_VERSION);
         assert!(
-            raw.contains(r#""schema_version": 2"#) || raw.contains(r#""schema_version":2"#),
-            "v2 manifest must persist schema_version=2: {raw}"
+            raw.contains(&spaced) || raw.contains(&compact),
+            "manifest must persist schema_version={MANIFEST_SCHEMA_VERSION}: {raw}"
         );
     }
 
@@ -1973,6 +2126,7 @@ mod tests {
             bytes: contents.len() as u64,
             sha256: sha256_file(&gguf).unwrap(),
             quantized_at_secs: secs_since_epoch(),
+            last_used_at_secs: 0,
             quantized_by_version: env!("CARGO_PKG_VERSION").to_string(),
         };
         cache.record_quantized(repo, entry).unwrap();
@@ -2065,6 +2219,7 @@ mod tests {
                     bytes: 21,
                     sha256: sha256_file(&g4).unwrap(),
                     quantized_at_secs: secs_since_epoch(),
+                    last_used_at_secs: 0,
                     quantized_by_version: env!("CARGO_PKG_VERSION").to_string(),
                 },
             )
@@ -2083,11 +2238,48 @@ mod tests {
                     bytes: 26,
                     sha256: sha256_file(&g8).unwrap(),
                     quantized_at_secs: secs_since_epoch(),
+                    last_used_at_secs: 0,
                     quantized_by_version: env!("CARGO_PKG_VERSION").to_string(),
                 },
             )
             .unwrap();
         (cache, g4, g8)
+    }
+
+    #[test]
+    fn concurrent_cross_quant_touches_merge_stale_snapshots_under_manifest_lock() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let repository = "org/m";
+        let (cache, _, _) = fab_two_quants(&root, repository);
+        drop(cache);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for quant in [QuantType::Q4_K_M, QuantType::Q8_0] {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                // Both handles deliberately load the same stale pre-touch
+                // snapshot before either mutation is permitted to continue.
+                let mut stale = ModelCache::open_at(root).unwrap();
+                barrier.wait();
+                let _quant_lock = stale.lock_quant(repository, quant).unwrap();
+                stale.touch_quant(repository, quant).unwrap();
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let merged = ModelCache::open_at(&root).unwrap();
+        for quant in [QuantType::Q4_K_M, QuantType::Q8_0] {
+            assert!(
+                merged.lookup(repository, quant).unwrap().last_used_at_secs > 0,
+                "the other quant's successful-use update must not be lost"
+            );
+        }
     }
 
     #[test]
@@ -2315,6 +2507,7 @@ mod tests {
                     bytes: 4,
                     sha256: sha256_file(&g_b).unwrap(),
                     quantized_at_secs: secs_since_epoch(),
+                    last_used_at_secs: 0,
                     quantized_by_version: env!("CARGO_PKG_VERSION").to_string(),
                 },
             )
