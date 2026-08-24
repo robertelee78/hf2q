@@ -3,6 +3,8 @@ use super::*;
 
 pub(super) struct ExactHostedLocal {
     pub(super) artifact: HubGgufArtifact,
+    #[cfg(test)]
+    pub(super) path: PathBuf,
     pub(super) materialized: SystemTime,
     pub(super) requires_projector: bool,
     pub(super) retained: crate::core::bounded_file::StableRegularFile,
@@ -173,6 +175,8 @@ fn find_best_matching_loose_stable(
                 Ok(requires_projector) => {
                     return Ok(Some(ExactHostedLocal {
                         artifact,
+                        #[cfg(test)]
+                        path,
                         materialized: retained
                             .try_clone()?
                             .metadata()?
@@ -292,6 +296,8 @@ fn find_best_matching_cached_hub_stable(
             Ok(requires_projector) => {
                 return Ok(Some(ExactHostedLocal {
                     artifact,
+                    #[cfg(test)]
+                    path,
                     materialized,
                     requires_projector,
                     retained,
