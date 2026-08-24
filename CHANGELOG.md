@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15] — 2026-08-24
+
 ### Added
 
 - Accept `owner/repository[:QUANT]` directly in `convert`, `serve`, and `chat`.
@@ -28,8 +30,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--quant QUANT` equivalently, and reuses only a receipt-verified native hf2q
   conversion.
 - Make targeted chat own and authenticate the exact server child it starts,
-  with periodic first-use preparation heartbeats, while keeping credentials
-  away from untrusted discovery candidates.
+  propagate the selected setup state root, retain its prebound loopback TCP
+  listener, and require a matching private inherited READY message plus
+  periodic first-use preparation heartbeats while keeping credentials away
+  from untrusted discovery candidates.
+- Admit hosted and exact manually downloaded Qwen GGUFs from bounded GGUF
+  metadata, tokenizer, operational-scalar, normal-layer and supported
+  one-layer MTP/NextN topology, packed-byte geometry, and storage-role checks
+  before adoption or payload transfer. Serving does not require or copy a
+  sibling `config.json`.
+- Preflight exact uncached source, quantized text, and F16 projector extents as
+  one native-conversion plan, and recover no-clobber paired publication from
+  both pre-journal and journaled crashes.
+- Use collision-resistant managed repository directories with bounded legacy
+  receipt migration, retain verified source descriptors through independent
+  CoW/copy publication, and serialize text/projector conversion destinations
+  without rejecting extensionless text-only outputs.
 
 ## [0.1.14] — 2026-08-23
 
@@ -1068,7 +1084,8 @@ First public release.
   150 GB (Qwen 3.5 MoE). Smoke preflight refuses to start below
   `disk_floor_gb + 10`.
 
-[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/robertelee78/hf2q/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/robertelee78/hf2q/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/robertelee78/hf2q/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/robertelee78/hf2q/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/robertelee78/hf2q/compare/v0.1.11...v0.1.12

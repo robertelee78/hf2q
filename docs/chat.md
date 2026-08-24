@@ -73,13 +73,17 @@ through an already running hf2q endpoint.
 
 Targeted chat always owns a fresh loopback server. DNS-SD does not advertise
 the immutable repository, revision, quant, and artifact digest needed to prove
-that an existing resident process is the same requested model. The child
-prints a status heartbeat every 30 seconds while first-use preparation is
-still running; its private diagnostic log remains isolated from the terminal.
+that an existing resident process is the same requested model. The parent
+prebinds and retains the loopback listener while the child adopts it, closing
+the preparation-time port-rebind race. The child prints a status heartbeat
+every 30 seconds while first-use preparation is still running; its private
+diagnostic log remains isolated from the terminal.
 
-A unique resident repository match connects without disk or Hub access.
-Receipt-backed and canonical managed-cache candidates are next. Legacy cache
-metadata without canonical emitted-artifact authority remains excluded.
+Within that owned server's resolver, a verified local repository artifact wins
+without a payload transfer, followed by exact manual-byte adoption, a
+compatible hosted GGUF, and native source conversion. A global `--state-root`
+is propagated to the child so it consumes the same setup quant and serve
+defaults as direct `hf2q serve`.
 
 ## Session controls
 
@@ -98,8 +102,9 @@ request fields. `HF2Q_AUTH_TOKEN`, when set, is used as the bearer token but is
 never published in discovery metadata. Because machine-local DNS-SD candidates
 are not authenticated, untargeted automatic discovery is disabled while that
 variable is set; use `--url` for an existing server. A targeted repository/path
-chat may use the token because it sends credentials only after matching
-discovery to the exact child PID it spawned.
+chat may use the token only after the child reports the same retained loopback
+port over a private inherited Unix READY socket. DNS-SD PID/TXT hints are never
+endpoint authority and never receive credentials.
 
 When the endpoint advertises hf2q's diagnostic capability, chat adds the
 capability-declared `x-hf2q-diagnostic-no-evict: 1` HTTP header. This does not

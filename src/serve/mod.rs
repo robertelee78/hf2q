@@ -4112,6 +4112,7 @@ pub fn cmd_serve(
     args: cli::ServeArgs,
     log_format: cli::LogFormat,
     operator_defaults: Option<&crate::setup::ServeDefaultsV2>,
+    configured_quant: Option<&str>,
 ) -> Result<()> {
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
@@ -4138,9 +4139,24 @@ pub fn cmd_serve(
         anyhow::bail!("serve --output requires a repository MODEL operand");
     }
 
-    if let Some(fd) = args.chat_parent_lifeline_fd {
-        start_chat_parent_lifeline(fd)?;
-    }
+    let (mut chat_parent_lifeline, chat_owned_listener) =
+        match (args.chat_parent_lifeline_fd, args.chat_owned_listener_fd) {
+            (Some(lifeline_fd), Some(listener_fd)) => {
+                anyhow::ensure!(
+                    lifeline_fd != listener_fd,
+                    "chat lifeline and listener descriptors must be distinct"
+                );
+                let listener = start_chat_owned_listener(listener_fd)?;
+                (
+                    Some(start_chat_parent_lifeline(lifeline_fd)?),
+                    Some(listener),
+                )
+            }
+            (None, None) => (None, None),
+            _ => anyhow::bail!(
+            "chat-owned serve requires both the private lifeline and pre-bound listener descriptors"
+        ),
+        };
 
     operator_ui::validate_mode(args.operator_ui, matches!(log_format, cli::LogFormat::Text))?;
 
@@ -4151,6 +4167,18 @@ pub fn cmd_serve(
             .filter(|s| !s.is_empty())
     });
     let endpoint = resolve_serve_endpoint(args.host.as_deref(), args.port, operator_defaults);
+    if let Some(listener) = chat_owned_listener.as_ref() {
+        let address = listener
+            .local_addr()
+            .context("read inherited chat-owned listener address")?;
+        anyhow::ensure!(
+            endpoint.host == "127.0.0.1" && endpoint.port == address.port(),
+            "inherited chat-owned listener {} does not match resolved endpoint {}:{}",
+            address,
+            endpoint.host,
+            endpoint.port
+        );
+    }
     validate_configured_endpoint_auth(&endpoint, auth_token.as_deref())
         .map_err(|message| anyhow::anyhow!(message))?;
 
@@ -4279,6 +4307,7 @@ pub fn cmd_serve(
             &mut cache_guard,
             state.hardware.as_ref(),
             args.mmproj.is_none(),
+            configured_quant,
         )?;
         drop(cache_guard);
         for warning in &resolved.warnings {
@@ -5140,12 +5169,19 @@ pub fn cmd_serve(
 
     rt.block_on(async move {
         let bind = format!("{}:{}", config.host, config.port);
-        let listener = tokio::net::TcpListener::bind(&bind)
-            .await
-            .with_context(|| format!("binding to {bind}"))?;
+        let listener = match chat_owned_listener {
+            Some(listener) => tokio::net::TcpListener::from_std(listener)
+                .context("adopt inherited chat-owned listener into tokio")?,
+            None => tokio::net::TcpListener::bind(&bind)
+                .await
+                .with_context(|| format!("binding to {bind}"))?,
+        };
         let local_addr = listener
             .local_addr()
             .context("reading bound hf2q HTTP address")?;
+        if let Some(lifeline) = chat_parent_lifeline.as_mut() {
+            lifeline.publish_ready(local_addr.port())?;
+        }
         tracing::info!(
             addr = %local_addr,
             "hf2q HTTP server listening"
@@ -5406,9 +5442,119 @@ pub fn cmd_serve(
 /// fact before arming the watcher and marks the descriptor close-on-exec so
 /// descendants cannot consume detach or prolong lifetime.
 pub(crate) const CHAT_LIFELINE_DETACH_FRAME: &[u8] = b"HF2Q-L1:DETACH\n";
+pub(crate) const CHAT_LIFELINE_READY_PREFIX: &str = "HF2Q-L1:READY:";
 
 #[cfg(unix)]
-fn start_chat_parent_lifeline(fd: i32) -> Result<()> {
+struct ChatParentLifeline {
+    readiness: std::os::unix::net::UnixStream,
+}
+
+#[cfg(not(unix))]
+struct ChatParentLifeline;
+
+#[cfg(unix)]
+impl ChatParentLifeline {
+    fn publish_ready(&mut self, port: u16) -> Result<()> {
+        use std::io::Write;
+
+        anyhow::ensure!(port != 0, "chat-owned listener cannot publish port 0");
+        write!(self.readiness, "{CHAT_LIFELINE_READY_PREFIX}{port}\n")
+            .context("publish chat-owned READY frame")?;
+        self.readiness
+            .flush()
+            .context("flush chat-owned READY frame")
+    }
+}
+
+#[cfg(unix)]
+fn validate_chat_parent_lifeline_socket(fd: i32) -> Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect inherited chat parent lifeline descriptor");
+    }
+    // SAFETY: fstat succeeded and initialized the structure.
+    let mode = unsafe { stat.assume_init() }.st_mode;
+    anyhow::ensure!(
+        mode & libc::S_IFMT == libc::S_IFSOCK,
+        "chat parent lifeline descriptor must be a private Unix socket"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn start_chat_owned_listener(fd: i32) -> Result<std::net::TcpListener> {
+    use std::os::fd::FromRawFd;
+
+    if fd < 3 {
+        anyhow::bail!("chat-owned listener descriptor must not alias stdin/stdout/stderr");
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect inherited chat-owned listener descriptor");
+    }
+    let mode = unsafe { stat.assume_init() }.st_mode;
+    anyhow::ensure!(
+        mode & libc::S_IFMT == libc::S_IFSOCK,
+        "chat-owned listener descriptor must be a socket"
+    );
+    let socket_option = |name: libc::c_int| -> Result<libc::c_int> {
+        let mut value = 0_i32;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                name,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("inspect inherited chat-owned listener socket option");
+        }
+        Ok(value)
+    };
+    anyhow::ensure!(
+        socket_option(libc::SO_TYPE)? == libc::SOCK_STREAM,
+        "chat-owned listener must be a TCP stream socket"
+    );
+    // macOS exposes SO_ACCEPTCONN in headers but getsockopt rejects it with
+    // ENOPROTOOPT. Re-applying listen is portable and idempotent for the
+    // already-listening socket retained by the parent; it also fails for a
+    // connected stream descriptor before any model work begins.
+    if unsafe { libc::listen(fd, 128) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("chat-owned listener socket is not listening");
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("make inherited chat-owned listener close-on-exec");
+    }
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    listener
+        .set_nonblocking(true)
+        .context("make inherited chat-owned listener nonblocking")?;
+    let address = listener
+        .local_addr()
+        .context("read inherited chat-owned listener address")?;
+    anyhow::ensure!(
+        matches!(address, std::net::SocketAddr::V4(address) if address.ip().is_loopback() && address.port() != 0),
+        "chat-owned listener must be a nonzero IPv4 loopback address"
+    );
+    Ok(listener)
+}
+
+#[cfg(not(unix))]
+fn start_chat_owned_listener(_fd: i32) -> Result<std::net::TcpListener> {
+    anyhow::bail!("chat-owned server listeners are unsupported on this platform; use --url")
+}
+
+#[cfg(unix)]
+fn start_chat_parent_lifeline(fd: i32) -> Result<ChatParentLifeline> {
     use std::os::fd::FromRawFd;
 
     if fd < 3 {
@@ -5421,6 +5567,7 @@ fn start_chat_parent_lifeline(fd: i32) -> Result<()> {
             "refusing chat parent lifeline outside an isolated process group (pid={pid}, pgrp={process_group})"
         );
     }
+    validate_chat_parent_lifeline_socket(fd)?;
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
         return Err(std::io::Error::last_os_error())
@@ -5430,19 +5577,12 @@ fn start_chat_parent_lifeline(fd: i32) -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .context("make chat parent lifeline close-on-exec");
     }
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("inspect inherited chat parent lifeline descriptor");
-    }
-    // SAFETY: fstat succeeded and initialized the structure.
-    let mode = unsafe { stat.assume_init() }.st_mode;
-    if mode & libc::S_IFMT != libc::S_IFSOCK && mode & libc::S_IFMT != libc::S_IFIFO {
-        anyhow::bail!("chat parent lifeline descriptor must be a private socket or pipe");
-    }
     // SAFETY: `fd` was validated above and ownership transfers exactly once
     // into the watcher thread. The launcher retains only the peer socket.
-    let mut lifeline = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut lifeline = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    let readiness = lifeline
+        .try_clone()
+        .context("clone chat parent lifeline for private READY handoff")?;
     std::thread::Builder::new()
         .name("hf2q-chat-lifeline".to_owned())
         .spawn(move || {
@@ -5459,11 +5599,11 @@ fn start_chat_parent_lifeline(fd: i32) -> Result<()> {
             }
         })
         .context("spawn diagnostic chat parent-lifetime watcher")?;
-    Ok(())
+    Ok(ChatParentLifeline { readiness })
 }
 
 #[cfg(not(unix))]
-fn start_chat_parent_lifeline(_fd: i32) -> Result<()> {
+fn start_chat_parent_lifeline(_fd: i32) -> Result<ChatParentLifeline> {
     anyhow::bail!("chat-owned server lifelines are unsupported on this platform; use --url")
 }
 
@@ -6376,14 +6516,16 @@ fn cmd_parity_capture(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::start_chat_owned_listener;
     use super::{
         build_chat_template_env, detect_greedy_repetition_loop,
         detect_greedy_repetition_loop_with_text, find_special_token_stop, maybe_print_serve_banner,
         peer_special_token_id_for_model, render_jinja_template, resolve_enable_thinking,
-        resolve_serve_endpoint, run_decode_loop, validate_configured_endpoint_auth,
-        validate_greedy_only_speculative_cli_path, validate_mmproj_diagnostic_mode,
-        validate_mmproj_text_binding, DecodeStopReason, RaisePolicy,
-        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        resolve_serve_endpoint, run_decode_loop, validate_chat_parent_lifeline_socket,
+        validate_configured_endpoint_auth, validate_greedy_only_speculative_cli_path,
+        validate_mmproj_diagnostic_mode, validate_mmproj_text_binding, DecodeStopReason,
+        RaisePolicy, FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::cli;
     use crate::core::chat_templates::QWEN3_CHATML;
@@ -8397,5 +8539,32 @@ mod tests {
         assert!(validate_mmproj_diagnostic_mode(true, true, false).is_err());
         validate_mmproj_diagnostic_mode(true, true, true).expect("explicit diagnostic ack");
         validate_mmproj_diagnostic_mode(false, true, false).expect("warmup-only skip");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_lifeline_transport_accepts_only_unix_sockets() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        validate_chat_parent_lifeline_socket(socket.as_raw_fd()).unwrap();
+
+        let mut pipe = [0_i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let error = validate_chat_parent_lifeline_socket(pipe[0]).unwrap_err();
+        assert!(error.to_string().contains("private Unix socket"), "{error}");
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+
+        let (connected, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let error = start_chat_owned_listener(connected.as_raw_fd()).unwrap_err();
+        assert!(error.to_string().contains("not listening"), "{error}");
+
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let adopted = start_chat_owned_listener(listener.into_raw_fd()).unwrap();
+        assert_eq!(adopted.local_addr().unwrap(), address);
     }
 }

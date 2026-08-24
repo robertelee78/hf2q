@@ -46,11 +46,11 @@ use crate::core::provenance::tensor_execution::LogicalF32Hasher;
 use crate::quantize::ggml_quants::apex::{ApexError, ApexPolicy};
 use crate::quantize::ggml_quants::quantizer::Quantizer;
 use crate::quantize::ggml_quants::standard_policy::{
-    HParams, LlmType, QsState, StandardPolicy, TensorCategory, tensor_type_fallback,
+    tensor_type_fallback, HParams, LlmType, QsState, StandardPolicy, TensorCategory,
 };
 use crate::quantize::ggml_quants::{
-    ArchName, Deepseek4AgenticQ2Policy, GgmlType, GgufFtype, QuantizeError, SourceDtype,
-    TensorRef, is_audio_tensor_pattern, is_vision_tensor_pattern, quantizer_for,
+    is_audio_tensor_pattern, is_vision_tensor_pattern, quantizer_for, ArchName,
+    Deepseek4AgenticQ2Policy, GgmlType, GgufFtype, QuantizeError, SourceDtype, TensorRef,
 };
 
 /// Errors raised by [`ConvertOrchestrator::plan_tensors`] /
@@ -249,6 +249,38 @@ pub struct PlannedSizeSummary {
     pub payload_bytes: u64,
     pub aligned_payload_bytes: u64,
     pub by_type: Vec<PlannedTypeSize>,
+}
+
+#[derive(Default)]
+struct SizingSink {
+    position: u64,
+}
+
+impl Write for SizingSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.position = self
+            .position
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("planned GGUF size overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for SizingSink {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        let next = match position {
+            std::io::SeekFrom::Start(position) => Some(position),
+            std::io::SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+            std::io::SeekFrom::End(_) => None,
+        }
+        .ok_or_else(|| std::io::Error::other("invalid planned GGUF sizing seek"))?;
+        self.position = next;
+        Ok(next)
+    }
 }
 
 /// Pipeline driver for the new ADR-033 convert path. See module-level
@@ -747,6 +779,26 @@ impl ConvertOrchestrator {
             aligned_payload_bytes,
             by_type,
         })
+    }
+
+    /// Exact final GGUF length for the metadata and tensor plan, including
+    /// the header, tensor-info table, and every required alignment byte.
+    pub fn planned_output_bytes(&self) -> Result<u64, OrchestratorError> {
+        let payload = self.planned_size_summary()?.aligned_payload_bytes;
+        let mut writer = GgufWriter::new(SizingSink::default());
+        writer.write_header(self.planned.len() as u64, self.metadata.len() as u64)?;
+        for (key, value) in &self.metadata {
+            writer.write_metadata_kv(key, value)?;
+        }
+        for tensor in &self.planned {
+            writer.reserve_tensor_info(&tensor.name, &tensor.dims_gguf, tensor.ggml_type)?;
+        }
+        writer.pad_to_alignment()?;
+        writer
+            .into_inner()
+            .position
+            .checked_add(payload)
+            .ok_or_else(|| OrchestratorError::StreamProtocol("planned GGUF size overflow".into()))
     }
 
     /// Open the GGUF writer in streaming mode.
@@ -1605,11 +1657,8 @@ mod tests {
     ///   - the policy-picked types match expectations for Q5_K_M.
     #[test]
     fn smoke_q5_k_m_round_trip_via_reader() {
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ5_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        );
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Llama3, default_hparams());
 
         orch.add_metadata(
             "general.architecture".to_string(),
@@ -1855,11 +1904,8 @@ mod tests {
     /// demoting to F16.
     #[test]
     fn unquantizable_row_surfaces_typed_error() {
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ5_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        );
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Llama3, default_hparams());
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("llama".into()),
@@ -1889,11 +1935,8 @@ mod tests {
     /// `stream_tensor` rejects out-of-order calls.
     #[test]
     fn stream_tensor_rejects_out_of_order() {
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ5_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        );
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Llama3, default_hparams());
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("llama".into()),
@@ -1928,11 +1971,8 @@ mod tests {
     /// `stream_tensor` rejects wrong data length.
     #[test]
     fn stream_tensor_rejects_wrong_length() {
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ5_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        );
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Llama3, default_hparams());
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("llama".into()),
@@ -2252,11 +2292,8 @@ mod tests {
     /// `finalize` rejects incomplete streaming.
     #[test]
     fn finalize_rejects_incomplete_stream() {
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ5_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        );
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Llama3, default_hparams());
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("llama".into()),
@@ -2350,8 +2387,7 @@ mod tests {
             n_layer: N_LAYER,
             n_mtp_layers: 0,
         };
-        let mut orch =
-            ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Gemma4, hparams);
+        let mut orch = ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Gemma4, hparams);
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("gemma4".into()),
@@ -2445,8 +2481,7 @@ mod tests {
             n_layer: N_LAYER,
             n_mtp_layers: 0,
         };
-        let mut orch =
-            ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Gemma4, hparams);
+        let mut orch = ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Gemma4, hparams);
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("gemma4".into()),
@@ -2502,12 +2537,10 @@ mod tests {
 
     #[test]
     fn empty_conversion_writes_header_only_gguf() {
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ5_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        );
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ5_K_M, ArchName::Llama3, default_hparams());
         orch.plan_tensors(Vec::new()).expect("plan empty");
+        let planned_bytes = orch.planned_output_bytes().expect("exact output plan");
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
             let mut f = std::fs::File::create(tmp.path()).unwrap();
@@ -2516,8 +2549,78 @@ mod tests {
             f.flush().unwrap();
         }
         let gguf = mlx_native::gguf::GgufFile::open(tmp.path()).expect("parse");
+        assert_eq!(std::fs::metadata(tmp.path()).unwrap().len(), planned_bytes);
         assert_eq!(gguf.tensor_count(), 0);
         assert_eq!(gguf.metadata_count(), 0);
+    }
+
+    #[test]
+    fn planned_output_bytes_matches_multiple_unaligned_tensor_payloads() {
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::AllF32, ArchName::Llama3, default_hparams());
+        orch.plan_tensors(vec![
+            PlanEntry {
+                name: "blk.0.attn_norm.weight".into(),
+                shape: vec![3, 1],
+                source_dtype: SourceDtype::F32,
+                layer_index: None,
+            },
+            PlanEntry {
+                name: "output_norm.weight".into(),
+                shape: vec![5, 1],
+                source_dtype: SourceDtype::F32,
+                layer_index: None,
+            },
+        ])
+        .unwrap();
+        let planned = orch.planned_output_bytes().unwrap();
+        let output = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(output.path()).unwrap();
+            let mut writer = orch.begin_write(file).unwrap();
+            writer.stream_tensor(0, &[1.0, 2.0, 3.0]).unwrap();
+            writer.stream_tensor(1, &[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+            writer.finalize().unwrap();
+        }
+        assert_eq!(std::fs::metadata(output.path()).unwrap().len(), planned);
+    }
+
+    #[test]
+    fn pretransfer_native_bound_covers_actual_f32_kept_storage_plans() {
+        let elements = 1_048_576_u64;
+        let cases = [
+            (SourceDtype::F16, elements * 2, serde_json::json!({})),
+            (
+                SourceDtype::Fp8E4M3,
+                elements,
+                serde_json::json!({"quantization_config": {"quant_method": "fp8"}}),
+            ),
+            (
+                SourceDtype::Mxfp4E2M1,
+                elements.div_ceil(2),
+                serde_json::json!({"quantization_config": {"quant_method": "mxfp4"}}),
+            ),
+        ];
+        for (source_dtype, source_payload_bytes, config) in cases {
+            let mut orch =
+                ConvertOrchestrator::new(GgufFtype::AllF32, ArchName::Llama3, default_hparams());
+            orch.plan_tensors(vec![PlanEntry {
+                name: "output_norm.weight".into(),
+                shape: vec![elements as usize],
+                source_dtype,
+                layer_index: None,
+            }])
+            .unwrap();
+            let actual_plan = orch.planned_output_bytes().unwrap();
+            let pretransfer_bound = crate::input::hf_download::native_output_upper_bound_bytes(
+                source_payload_bytes,
+                &config,
+            );
+            assert!(
+                actual_plan <= pretransfer_bound,
+                "{source_dtype:?} F32-kept plan {actual_plan} exceeded {pretransfer_bound}"
+            );
+        }
     }
 
     // ----------------------------------------------------------------
@@ -2816,12 +2919,9 @@ mod tests {
             .collect();
 
         // Construct an empty StreamingWriter just to exercise the helper.
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ4_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        )
-        .with_imatrix(Some(imatrix));
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ4_K_M, ArchName::Llama3, default_hparams())
+                .with_imatrix(Some(imatrix));
         orch.plan_tensors(Vec::new()).expect("plan empty");
         let mut buf = Vec::<u8>::new();
         let sw = orch
@@ -2871,12 +2971,9 @@ mod tests {
             *v *= inv_total;
         }
 
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ4_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        )
-        .with_imatrix(Some(imatrix));
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ4_K_M, ArchName::Llama3, default_hparams())
+                .with_imatrix(Some(imatrix));
         orch.plan_tensors(Vec::new()).expect("plan empty");
         let mut buf = Vec::<u8>::new();
         let sw = orch
@@ -2906,12 +3003,9 @@ mod tests {
     #[test]
     fn p4b_tensor_imatrix_missing_returns_none_mismatch_returns_err() {
         let imatrix = make_dense_imatrix("blk.0.attn_q.weight", 16, 7);
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ4_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        )
-        .with_imatrix(Some(imatrix));
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ4_K_M, ArchName::Llama3, default_hparams())
+                .with_imatrix(Some(imatrix));
         orch.plan_tensors(Vec::new()).expect("plan empty");
         let mut buf = Vec::<u8>::new();
         let sw = orch
@@ -2947,11 +3041,8 @@ mod tests {
     /// every lookup — proves the no-imatrix path is intact.
     #[test]
     fn p4b_no_imatrix_attached_returns_none_for_everything() {
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ4_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        );
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ4_K_M, ArchName::Llama3, default_hparams());
         orch.plan_tensors(Vec::new()).expect("plan empty");
         let mut buf = Vec::<u8>::new();
         let sw = orch
@@ -3000,12 +3091,9 @@ mod tests {
             },
         };
 
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ4_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        )
-        .with_imatrix(Some(imatrix));
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ4_K_M, ArchName::Llama3, default_hparams())
+                .with_imatrix(Some(imatrix));
         orch.plan_tensors(vec![PlanEntry {
             name: tensor_name.into(),
             shape: vec![model_n_per_row, 1],
@@ -3050,12 +3138,9 @@ mod tests {
 
         let imatrix = make_dense_imatrix(covered, n_per_row, 123);
 
-        let mut orch = ConvertOrchestrator::new(
-            GgufFtype::MostlyQ4_K_M,
-            ArchName::Llama3,
-            default_hparams(),
-        )
-        .with_imatrix(Some(imatrix));
+        let mut orch =
+            ConvertOrchestrator::new(GgufFtype::MostlyQ4_K_M, ArchName::Llama3, default_hparams())
+                .with_imatrix(Some(imatrix));
         orch.plan_tensors(vec![
             PlanEntry {
                 name: covered.into(),

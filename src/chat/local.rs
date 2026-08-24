@@ -2,8 +2,9 @@
 //!
 //! DNS-SD provides only untrusted candidates. Every candidate is forced to
 //! loopback by `serve::discovery`, then verified over HTTP before selection.
-//! Process lifecycle authority is created only for the concrete child this
-//! module spawns; discovery PID hints are used solely to correlate its advert.
+//! Process lifecycle and endpoint authority are created only for the concrete
+//! child this module spawns. Its bound port arrives over a private inherited
+//! Unix socket; DNS-SD PID/TXT hints never receive credentials or authority.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -35,7 +36,17 @@ struct VerifiedServer {
     models: Vec<Model>,
 }
 
-pub(crate) struct AutomaticEndpointResolver;
+pub(crate) struct AutomaticEndpointResolver {
+    state_root: Option<std::path::PathBuf>,
+}
+
+impl AutomaticEndpointResolver {
+    pub(crate) fn new(state_root: Option<&std::path::Path>) -> Self {
+        Self {
+            state_root: state_root.map(std::path::Path::to_path_buf),
+        }
+    }
+}
 
 impl EndpointResolver for AutomaticEndpointResolver {
     fn resolve(&mut self, args: &ChatArgs) -> Result<EndpointSession> {
@@ -65,6 +76,7 @@ impl EndpointResolver for AutomaticEndpointResolver {
             &mut input,
             &mut output,
             auth_token.as_deref(),
+            self.state_root.as_deref(),
         ))
     }
 }
@@ -74,6 +86,7 @@ async fn resolve_local(
     input: &mut impl BufRead,
     output: &mut impl Write,
     owned_auth_token: Option<&str>,
+    state_root: Option<&std::path::Path>,
 ) -> Result<EndpointSession> {
     let http = reqwest::Client::builder()
         .connect_timeout(HTTP_PROBE_TIMEOUT)
@@ -103,15 +116,10 @@ async fn resolve_local(
         writeln!(output, "no local hf2q server found; starting one")?;
     }
     output.flush()?;
-    let mut startup_browser =
-        LocalDiscoveryBrowser::start().context("start owned-server discovery")?;
-    let mut child = spawn_server(args.target.as_deref()).context("start hf2q serve")?;
-    let child_pid = child.child_mut().id().to_string();
+    let mut child = spawn_server(args.target.as_deref(), state_root).context("start hf2q serve")?;
     let startup = wait_for_spawned_server(
-        &mut startup_browser,
         &http,
         &mut child,
-        &child_pid,
         if args.target.is_some() {
             MODEL_STARTUP_DISCOVERY_TIMEOUT
         } else {
@@ -162,11 +170,24 @@ fn require_credentialless_automatic_discovery(auth_token: Option<&str>) -> Resul
 }
 
 #[cfg(unix)]
-fn spawn_server(target: Option<&str>) -> Result<OwnedServerProcess> {
+fn spawn_server(
+    target: Option<&str>,
+    state_root: Option<&std::path::Path>,
+) -> Result<OwnedServerProcess> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
     let executable = std::env::current_exe().context("locate current hf2q executable")?;
+    let listener_guard = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .context("pre-bind private chat-owned loopback listener")?;
+    listener_guard
+        .set_nonblocking(true)
+        .context("make private chat-owned listener nonblocking")?;
+    let listener_port = listener_guard
+        .local_addr()
+        .context("read private chat-owned listener address")?
+        .port();
+    let listener_fd = listener_guard.as_raw_fd();
     let (parent_lifeline, child_lifeline) = std::os::unix::net::UnixStream::pair()
         .context("create private chat parent-lifetime channel")?;
     let child_fd = child_lifeline.as_raw_fd();
@@ -179,14 +200,15 @@ fn spawn_server(target: Option<&str>) -> Result<OwnedServerProcess> {
         .reopen()
         .context("open chat-owned server log writer")?;
     let mut command = Command::new(executable);
-    command.arg("serve");
-    if let Some(target) = target {
-        command.arg(target);
-    }
+    append_owned_server_args(
+        &mut command,
+        target,
+        state_root,
+        child_fd,
+        listener_fd,
+        listener_port,
+    );
     command
-        .args(["--host", "127.0.0.1", "--port", "0", "--quiet"])
-        .args(["--operator-ui", "plain", "--chat-parent-lifeline-fd"])
-        .arg(child_fd.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr))
@@ -196,9 +218,11 @@ fn spawn_server(target: Option<&str>) -> Result<OwnedServerProcess> {
     // any model-transfer or conversion descendants.
     unsafe {
         command.pre_exec(move || {
-            let flags = libc::fcntl(child_fd, libc::F_GETFD);
-            if flags < 0 || libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                return Err(std::io::Error::last_os_error());
+            for fd in [child_fd, listener_fd] {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
@@ -207,11 +231,40 @@ fn spawn_server(target: Option<&str>) -> Result<OwnedServerProcess> {
         .spawn()
         .context("spawn current executable as hf2q serve")?;
     drop(child_lifeline);
-    OwnedServerProcess::from_spawned(child, parent_lifeline, server_log)
+    OwnedServerProcess::from_spawned(child, parent_lifeline, server_log, Some(listener_guard))
+}
+
+#[cfg(unix)]
+fn append_owned_server_args(
+    command: &mut Command,
+    target: Option<&str>,
+    state_root: Option<&std::path::Path>,
+    child_fd: std::os::fd::RawFd,
+    listener_fd: std::os::fd::RawFd,
+    listener_port: u16,
+) {
+    if let Some(state_root) = state_root {
+        command.arg("--state-root").arg(state_root);
+    }
+    command.arg("serve");
+    if let Some(target) = target {
+        command.arg(target);
+    }
+    command
+        .args(["--host", "127.0.0.1", "--port"])
+        .arg(listener_port.to_string())
+        .arg("--quiet")
+        .args(["--operator-ui", "plain", "--chat-parent-lifeline-fd"])
+        .arg(child_fd.to_string())
+        .arg("--chat-owned-listener-fd")
+        .arg(listener_fd.to_string());
 }
 
 #[cfg(not(unix))]
-fn spawn_server(_target: Option<&str>) -> Result<OwnedServerProcess> {
+fn spawn_server(
+    _target: Option<&str>,
+    _state_root: Option<&std::path::Path>,
+) -> Result<OwnedServerProcess> {
     bail!("automatic chat-owned server lifecycle is unavailable on this platform; use --url")
 }
 
@@ -246,10 +299,8 @@ async fn collect_verified(
 }
 
 async fn wait_for_spawned_server(
-    browser: &mut LocalDiscoveryBrowser,
     http: &reqwest::Client,
     process: &mut OwnedServerProcess,
-    child_pid: &str,
     timeout: Duration,
     auth_token: Option<&str>,
     output: &mut impl Write,
@@ -258,6 +309,7 @@ async fn wait_for_spawned_server(
     let started = tokio::time::Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
     let mut next_heartbeat = started + MODEL_STARTUP_HEARTBEAT;
+    let mut ready_port = None;
     loop {
         if process.leader_exited_unreaped()? {
             bail!("chat-started hf2q serve exited before discovery");
@@ -265,7 +317,7 @@ async fn wait_for_spawned_server(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             bail!(
-                "chat-started hf2q serve was not discovered and HTTP-verified within {:?}",
+                "chat-started hf2q serve did not publish a private READY frame and pass HTTP verification within {:?}",
                 timeout
             );
         }
@@ -274,20 +326,17 @@ async fn wait_for_spawned_server(
             write_model_startup_heartbeat(output, elapsed)?;
             next_heartbeat += MODEL_STARTUP_HEARTBEAT;
         }
-        let event = browser
-            .next_event(remaining.min(Duration::from_millis(500)))
-            .await?;
-        let Some(LocalDiscoveryEvent::Added(candidate)) = event else {
-            continue;
-        };
-        if candidate.hints.pid_hint.as_deref() != Some(child_pid) {
-            continue;
+        if ready_port.is_none() {
+            ready_port = process.poll_ready_port()?;
         }
-        // Credentials are sent only after the discovery PID has been matched
-        // to the exact child process this chat invocation spawned.
-        if let Some(server) = verify_candidate(http, candidate, auth_token).await {
-            return Ok(server);
+        if let Some(port) = ready_port {
+            // Credentials are sent only to the port delivered by the exact
+            // child over the private inherited ownership socket.
+            if let Some(server) = verify_owned_endpoint(http, port, auth_token).await {
+                return Ok(server);
+            }
         }
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
     }
 }
 
@@ -307,6 +356,29 @@ async fn verify_candidate(
     auth_token: Option<&str>,
 ) -> Option<VerifiedServer> {
     let endpoint = Endpoint::discovered_loopback(candidate.endpoint.port());
+    verify_endpoint(http, candidate.identity, endpoint, auth_token).await
+}
+
+async fn verify_owned_endpoint(
+    http: &reqwest::Client,
+    port: u16,
+    auth_token: Option<&str>,
+) -> Option<VerifiedServer> {
+    let endpoint = Endpoint::discovered_loopback(port);
+    let identity = DiscoveryIdentity {
+        service_name: format!("hf2q-owned-{port}"),
+        service_type: discovery::SERVICE_TYPE.to_owned(),
+        domain: "private-lifeline".to_owned(),
+    };
+    verify_endpoint(http, identity, endpoint, auth_token).await
+}
+
+async fn verify_endpoint(
+    http: &reqwest::Client,
+    identity: DiscoveryIdentity,
+    endpoint: Endpoint,
+    auth_token: Option<&str>,
+) -> Option<VerifiedServer> {
     let mut request = http.get(endpoint.route("/health"));
     if let Some(token) = auth_token {
         request = request.bearer_auth(token);
@@ -350,7 +422,7 @@ async fn verify_candidate(
         }
     };
     Some(VerifiedServer {
-        identity: candidate.identity,
+        identity,
         endpoint,
         models,
     })
@@ -467,9 +539,11 @@ mod tests {
         }
     }
 
-    async fn serve(router: Router) -> (u16, oneshot::Sender<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+    async fn serve(router: Router) -> (u16, oneshot::Sender<()>, std::net::TcpListener) {
+        let guard = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        guard.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(guard.try_clone().unwrap()).unwrap();
+        let port = guard.local_addr().unwrap().port();
         let (stop_tx, stop_rx) = oneshot::channel();
         tokio::spawn(async move {
             axum::serve(listener, router)
@@ -479,7 +553,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        (port, stop_tx)
+        (port, stop_tx, guard)
     }
 
     #[test]
@@ -525,6 +599,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn targeted_chat_propagates_the_selected_state_root_to_owned_serve() {
+        let mut command = std::process::Command::new("hf2q");
+        append_owned_server_args(
+            &mut command,
+            Some("owner/model:Q4_K_M"),
+            Some(std::path::Path::new("/tmp/operator-state")),
+            42,
+            43,
+            9123,
+        );
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &args[..5],
+            [
+                "--state-root",
+                "/tmp/operator-state",
+                "serve",
+                "owner/model:Q4_K_M",
+                "--host"
+            ]
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--chat-parent-lifeline-fd", "42"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn failed_startup_stops_child_and_retains_path_without_echoing_private_log() {
         let directory = tempfile::tempdir().unwrap();
         let mut log = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
@@ -540,7 +645,8 @@ mod tests {
             .spawn()
             .unwrap();
         let child_pid = child.id() as libc::pid_t;
-        let mut process = OwnedServerProcess::from_spawned(child, parent_lifeline, log).unwrap();
+        let mut process =
+            OwnedServerProcess::from_spawned(child, parent_lifeline, log, None).unwrap();
 
         let error = finalize_failed_startup(anyhow::anyhow!("startup probe failed"), &mut process);
         let rendered = format!("{error:#}");
@@ -579,7 +685,7 @@ mod tests {
             .route("/health", get(record))
             .route("/v1/models", get(record))
             .with_state(recorded.clone());
-        let (port, stop) = serve(router).await;
+        let (port, stop, _guard) = serve(router).await;
         let verified = verify_candidate(&reqwest::Client::new(), candidate(port), None)
             .await
             .expect("healthy candidate must verify");
@@ -591,8 +697,9 @@ mod tests {
         let _ = stop.send(());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn owned_candidate_verification_uses_authorization_after_pid_match() {
+    async fn owned_private_ready_handoff_binds_authorized_endpoint() {
         #[derive(Clone, Default)]
         struct Recorded(Arc<Mutex<Vec<Option<String>>>>);
 
@@ -614,16 +721,43 @@ mod tests {
             .route("/health", get(record))
             .route("/v1/models", get(record))
             .with_state(recorded.clone());
-        let (port, stop) = serve(router).await;
-        assert!(
-            verify_candidate(&reqwest::Client::new(), candidate(port), Some("secret"))
-                .await
-                .is_some()
+        let (port, stop, guard) = serve(router).await;
+        let (parent_lifeline, mut child_lifeline) = std::os::unix::net::UnixStream::pair().unwrap();
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let mut process =
+            OwnedServerProcess::from_spawned(child, parent_lifeline, log, Some(guard)).unwrap();
+        write!(
+            child_lifeline,
+            "{}{port}\n",
+            crate::serve::CHAT_LIFELINE_READY_PREFIX
+        )
+        .unwrap();
+        child_lifeline.flush().unwrap();
+        let mut output = Vec::new();
+        let verified = wait_for_spawned_server(
+            &reqwest::Client::new(),
+            &mut process,
+            Duration::from_secs(2),
+            Some("secret"),
+            &mut output,
+            false,
+        )
+        .await
+        .expect("private READY port should become the only authorized endpoint");
+        assert_eq!(
+            verified.endpoint.base_url(),
+            format!("http://127.0.0.1:{port}")
         );
         assert_eq!(
             *recorded.0.lock().unwrap(),
             vec![Some("Bearer secret".into()), Some("Bearer secret".into())]
         );
+        process.force_stop().unwrap();
         let _ = stop.send(());
     }
 
@@ -642,7 +776,7 @@ mod tests {
             "/health",
             get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "not ready") }),
         );
-        let (port, stop) = serve(router).await;
+        let (port, stop, _guard) = serve(router).await;
         assert!(
             verify_candidate(&reqwest::Client::new(), candidate(port), None)
                 .await

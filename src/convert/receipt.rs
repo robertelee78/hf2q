@@ -90,6 +90,21 @@ impl RemoteConversionSource {
         })
     }
 
+    pub(crate) fn from_planning_identity(
+        reference: ResolvedHfModelReference,
+        source_sha256: String,
+    ) -> Result<Self, ReceiptError> {
+        if source_sha256.len() != 64 || !source_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ReceiptError::SourceBundleUnavailable);
+        }
+        Ok(Self {
+            reference,
+            source_sha256: source_sha256.to_ascii_lowercase(),
+            files: Vec::new(),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(reference: ResolvedHfModelReference, source_sha256: String) -> Self {
         Self {
@@ -305,12 +320,33 @@ fn prepare_success_receipt_at(
     })
 }
 
-pub fn promote_success_receipt(prepared: PreparedSuccessReceipt) -> Result<PathBuf, ReceiptError> {
+pub fn promote_success_receipt(
+    prepared: PreparedSuccessReceipt,
+    no_clobber: bool,
+) -> Result<PathBuf, ReceiptError> {
+    if no_clobber {
+        prepared
+            .temporary
+            .persist_noclobber(&prepared.path)
+            .map_err(|error| error.error)?;
+    } else {
+        prepared
+            .temporary
+            .persist(&prepared.path)
+            .map_err(|error| error.error)?;
+    }
+    Ok(prepared.path)
+}
+
+pub(crate) fn stage_success_receipt(
+    prepared: PreparedSuccessReceipt,
+    staging: &Path,
+) -> Result<(), ReceiptError> {
     prepared
         .temporary
-        .persist(&prepared.path)
+        .persist_noclobber(staging)
         .map_err(|error| error.error)?;
-    Ok(prepared.path)
+    Ok(())
 }
 
 fn build_git_commit() -> Option<String> {
@@ -432,7 +468,7 @@ mod tests {
             },
         )
         .unwrap();
-        let path = promote_success_receipt(prepared).unwrap();
+        let path = promote_success_receipt(prepared, false).unwrap();
         let parsed: ConversionReceipt = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(parsed.quant_selector, "q4_k_m");
         assert_eq!(parsed.schema_version, CONVERSION_RECEIPT_SCHEMA_VERSION);

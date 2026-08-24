@@ -5,10 +5,13 @@
 //! rename becomes the commit marker only after its destination and source
 //! directories have both been synchronized.
 
+use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+use rustix::fs::{self as rustix_fs, RenameFlags};
 
 use crate::core::paired_artifact::{
     canonical_parent, file_name, journal_path, path_entry_exists, read_pair_journal,
@@ -22,6 +25,8 @@ pub(super) enum PublishFailpoint {
     AfterBackup(PairMemberRole),
     AfterPromoteRename(PairMemberRole),
     AfterPromote(PairMemberRole),
+    #[cfg(test)]
+    InjectConflictBeforePromote(PairMemberRole),
 }
 
 pub(super) struct PairWorkspace {
@@ -29,19 +34,29 @@ pub(super) struct PairWorkspace {
     parent: PathBuf,
     root: PathBuf,
     text: PathBuf,
+    lock: RefCell<Option<PairLock>>,
 }
 
 impl PairWorkspace {
     pub(super) fn create(text: &Path) -> Result<Self, PairArtifactError> {
-        recover_pending(text)?;
         let parent = canonical_parent(text)?;
         let text = parent.join(file_name(text)?);
+        let lock = PairLock::exclusive(&text)?;
+        let text_lock = PairTextLock::exclusive_if_present(&text)?;
+        recover_locked(&text, &parent)?;
+        drop(text_lock);
+        recover_unpublished_intent(&text, &parent)?;
         let transaction_id = uuid::Uuid::new_v4().to_string();
         let root = parent.join(format!(".hf2q-pair-{transaction_id}"));
-        fs::create_dir(&root).map_err(|source| PairArtifactError::Io {
-            path: root.clone(),
-            source,
-        })?;
+        write_workspace_intent(&text, &parent, &transaction_id)?;
+        let mut root_builder = fs::DirBuilder::new();
+        root_builder.mode(0o700);
+        root_builder
+            .create(&root)
+            .map_err(|source| PairArtifactError::Io {
+                path: root.clone(),
+                source,
+            })?;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|source| {
             PairArtifactError::Io {
                 path: root.clone(),
@@ -49,10 +64,14 @@ impl PairWorkspace {
             }
         })?;
         let backup = root.join("backup");
-        fs::create_dir(&backup).map_err(|source| PairArtifactError::Io {
-            path: backup.clone(),
-            source,
-        })?;
+        let mut backup_builder = fs::DirBuilder::new();
+        backup_builder.mode(0o700);
+        backup_builder
+            .create(&backup)
+            .map_err(|source| PairArtifactError::Io {
+                path: backup.clone(),
+                source,
+            })?;
         fs::set_permissions(&backup, fs::Permissions::from_mode(0o700)).map_err(|source| {
             PairArtifactError::Io {
                 path: backup.clone(),
@@ -66,6 +85,7 @@ impl PairWorkspace {
             parent,
             root,
             text,
+            lock: RefCell::new(Some(lock)),
         })
     }
 
@@ -82,6 +102,9 @@ impl PairWorkspace {
             if let Err(error) = remove_transaction_root(&self.parent, &self.root) {
                 tracing::warn!(error = %error, root = %self.root.display(), "could not remove unpublished pair workspace");
             }
+            if let Err(error) = remove_workspace_intent(&self.text, &self.parent) {
+                tracing::warn!(error = %error, text = %self.text.display(), "could not remove unpublished workspace intent");
+            }
         }
     }
 
@@ -89,7 +112,14 @@ impl PairWorkspace {
         &self,
         destinations: &[(PairMemberRole, PathBuf)],
     ) -> Result<(), PairArtifactError> {
-        self.publish_inner(destinations, None, false)
+        self.publish_inner(destinations, None, false, false)
+    }
+
+    pub(super) fn publish_no_clobber(
+        &self,
+        destinations: &[(PairMemberRole, PathBuf)],
+    ) -> Result<(), PairArtifactError> {
+        self.publish_inner(destinations, None, false, true)
     }
 
     #[cfg(test)]
@@ -98,7 +128,30 @@ impl PairWorkspace {
         destinations: &[(PairMemberRole, PathBuf)],
         failpoint: PublishFailpoint,
     ) -> Result<(), PairArtifactError> {
-        self.publish_inner(destinations, Some(failpoint), true)
+        self.publish_inner(destinations, Some(failpoint), true, false)
+    }
+
+    #[cfg(test)]
+    fn publish_no_clobber_with_conflict_at(
+        &self,
+        destinations: &[(PairMemberRole, PathBuf)],
+        role: PairMemberRole,
+    ) -> Result<(), PairArtifactError> {
+        self.publish_inner(
+            destinations,
+            Some(PublishFailpoint::InjectConflictBeforePromote(role)),
+            false,
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    fn publish_no_clobber_crash_at(
+        &self,
+        destinations: &[(PairMemberRole, PathBuf)],
+        failpoint: PublishFailpoint,
+    ) -> Result<(), PairArtifactError> {
+        self.publish_inner(destinations, Some(failpoint), true, true)
     }
 
     fn publish_inner(
@@ -106,8 +159,13 @@ impl PairWorkspace {
         destinations: &[(PairMemberRole, PathBuf)],
         failpoint: Option<PublishFailpoint>,
         simulate_crash: bool,
+        no_clobber: bool,
     ) -> Result<(), PairArtifactError> {
-        let _lock = PairLock::exclusive(&self.text)?;
+        if self.lock.borrow().is_none() {
+            return Err(PairArtifactError::Invalid(
+                "conversion workspace no longer owns its publication lock".into(),
+            ));
+        }
         let pre_recovery_text_lock = PairTextLock::exclusive_if_present(&self.text)?;
         recover_locked(&self.text, &self.parent)?;
         // Recovery may replace the final text inode (candidate -> prior) or
@@ -170,6 +228,12 @@ impl PairWorkspace {
             }
             let final_path = self.parent.join(file_name(destination)?);
             let prior = FileIdentity::from_path(&final_path)?;
+            if no_clobber && prior.is_some() {
+                return Err(PairArtifactError::Invalid(format!(
+                    "no-clobber pair destination already exists: {}",
+                    final_path.display()
+                )));
+            }
             if let Some(prior_metadata) = fs::symlink_metadata(&final_path).ok() {
                 if !prior_metadata.is_file()
                     || prior_metadata.file_type().is_symlink()
@@ -211,6 +275,7 @@ impl PairWorkspace {
         };
         journal.validate()?;
         write_journal(&journal_file, &journal)?;
+        remove_workspace_intent(&self.text, &self.parent)?;
 
         let mut text_commit_durable = false;
         let mut candidate_text_lock = None;
@@ -252,10 +317,38 @@ impl PairWorkspace {
                     // visibility gap for read-only/cross-user readers.
                     candidate_text_lock = Some(PairTextLock::exclusive(&staged)?);
                 }
-                fs::rename(&staged, &final_path).map_err(|source| PairArtifactError::Io {
-                    path: final_path.clone(),
-                    source,
-                })?;
+                #[cfg(test)]
+                if failpoint == Some(PublishFailpoint::InjectConflictBeforePromote(member.role)) {
+                    fs::write(&final_path, b"operator-race").map_err(|source| {
+                        PairArtifactError::Io {
+                            path: final_path.clone(),
+                            source,
+                        }
+                    })?;
+                }
+                if no_clobber {
+                    // Atomically remove the private name and create the final
+                    // name only when absent. A hard-link-then-unlink sequence
+                    // would leave two names for one inode across a crash and
+                    // make ownership-based recovery ambiguous.
+                    rustix_fs::renameat_with(
+                        rustix_fs::CWD,
+                        &staged,
+                        rustix_fs::CWD,
+                        &final_path,
+                        RenameFlags::NOREPLACE,
+                    )
+                    .map_err(std::io::Error::from)
+                    .map_err(|source| PairArtifactError::Io {
+                        path: final_path.clone(),
+                        source,
+                    })?;
+                } else {
+                    fs::rename(&staged, &final_path).map_err(|source| PairArtifactError::Io {
+                        path: final_path.clone(),
+                        source,
+                    })?;
+                }
                 if failpoint == Some(PublishFailpoint::AfterPromoteRename(member.role)) {
                     return Err(PairArtifactError::Invalid(format!(
                         "injected failure after pair {:?} rename",
@@ -278,8 +371,15 @@ impl PairWorkspace {
         })();
 
         if let Err(error) = mutation_result {
+            if simulate_crash {
+                // Unit failpoints model process death; release the kernel lock
+                // before the test invokes a fresh recovery owner.
+                self.lock.borrow_mut().take();
+            }
             if !simulate_crash {
-                let recovery = if text_commit_durable {
+                let recovery = if no_clobber && !text_commit_durable {
+                    abort_no_clobber(&journal_file, &self.parent, &journal)
+                } else if text_commit_durable {
                     cleanup_committed(&journal_file, &self.parent, &journal)
                 } else {
                     rollback(&journal_file, &self.parent, &journal)
@@ -310,7 +410,193 @@ pub(super) fn recover_pending(text: &Path) -> Result<(), PairArtifactError> {
     let text = parent.join(file_name(text)?);
     let _lock = PairLock::exclusive(&text)?;
     let _text_lock = PairTextLock::exclusive_if_present(&text)?;
-    recover_locked(&text, &parent)
+    recover_locked(&text, &parent)?;
+    recover_unpublished_intent(&text, &parent)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceIntent {
+    schema_version: u32,
+    transaction_id: String,
+    transaction_root: String,
+    text_name: String,
+}
+
+fn workspace_intent_path(text: &Path) -> PathBuf {
+    let mut path = text.as_os_str().to_os_string();
+    path.push(".pair.intent.json");
+    PathBuf::from(path)
+}
+
+fn write_workspace_intent(
+    text: &Path,
+    parent: &Path,
+    transaction_id: &str,
+) -> Result<(), PairArtifactError> {
+    let intent = WorkspaceIntent {
+        schema_version: 1,
+        transaction_id: transaction_id.to_owned(),
+        transaction_root: format!(".hf2q-pair-{transaction_id}"),
+        text_name: file_name(text)?
+            .to_str()
+            .ok_or_else(|| {
+                PairArtifactError::Invalid("conversion output name is not UTF-8".into())
+            })?
+            .to_owned(),
+    };
+    let final_path = workspace_intent_path(text);
+    if path_entry_exists(&final_path)? {
+        return Err(PairArtifactError::Invalid(
+            "workspace intent still exists after recovery".into(),
+        ));
+    }
+    let temporary = parent.join(format!(".hf2q-pair-intent-{transaction_id}.partial"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&temporary)
+        .map_err(|source| PairArtifactError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+    serde_json::to_writer(&mut file, &intent)?;
+    file.write_all(b"\n")
+        .map_err(|source| PairArtifactError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+    file.sync_all().map_err(|source| PairArtifactError::Io {
+        path: temporary.clone(),
+        source,
+    })?;
+    drop(file);
+    fs::rename(&temporary, &final_path).map_err(|source| PairArtifactError::Io {
+        path: final_path.clone(),
+        source,
+    })?;
+    sync_directory(parent)
+}
+
+fn recover_unpublished_intent(text: &Path, parent: &Path) -> Result<(), PairArtifactError> {
+    let path = workspace_intent_path(text);
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(PairArtifactError::Io { path, source }),
+    };
+    let metadata = file.metadata().map_err(|source| PairArtifactError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let parent_metadata = fs::metadata(parent).map_err(|source| PairArtifactError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.nlink() != 1
+        || metadata.dev() != parent_metadata.dev()
+        || metadata.len() == 0
+        || metadata.len() > 4096
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(PairArtifactError::Invalid(
+            "workspace intent is not one bounded owned private regular file".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|source| PairArtifactError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    let intent: WorkspaceIntent = serde_json::from_slice(&bytes)?;
+    let expected_text_name = file_name(text)?
+        .to_str()
+        .ok_or_else(|| PairArtifactError::Invalid("conversion output name is not UTF-8".into()))?;
+    if intent.schema_version != 1
+        || uuid::Uuid::parse_str(&intent.transaction_id).is_err()
+        || intent.transaction_root != format!(".hf2q-pair-{}", intent.transaction_id)
+        || intent.text_name != expected_text_name
+    {
+        return Err(PairArtifactError::Invalid(
+            "workspace intent is not bound to this conversion output".into(),
+        ));
+    }
+    remove_unpublished_transaction_root(parent, &parent.join(&intent.transaction_root))?;
+    remove_workspace_intent(text, parent)
+}
+
+fn remove_unpublished_transaction_root(
+    parent: &Path,
+    root: &Path,
+) -> Result<(), PairArtifactError> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(PairArtifactError::Io {
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let parent_metadata = fs::metadata(parent).map_err(|source| PairArtifactError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.dev() != parent_metadata.dev()
+    {
+        return Err(PairArtifactError::Invalid(
+            "refusing to repair an unowned pre-journal pair transaction directory".into(),
+        ));
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode != 0o700 {
+        // DirBuilderExt::mode is filtered through the process umask. A crash
+        // between mkdir and the normalizing chmod can therefore leave any
+        // owner-controlled mode, including 0000. The durable UUID-bound
+        // intent proves this exact root belongs to the interrupted operation.
+        // Normalize first so an owner-unreadable directory can be inspected,
+        // then accept only the empty pre-chmod state.
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            PairArtifactError::Io {
+                path: root.to_path_buf(),
+                source,
+            }
+        })?;
+        let empty = fs::read_dir(root)
+            .map_err(|source| PairArtifactError::Io {
+                path: root.to_path_buf(),
+                source,
+            })?
+            .next()
+            .is_none();
+        if !empty {
+            return Err(PairArtifactError::Invalid(
+                "refusing to repair a non-private nonempty pair transaction directory".into(),
+            ));
+        }
+    }
+    remove_transaction_root(parent, root)
+}
+
+fn remove_workspace_intent(text: &Path, parent: &Path) -> Result<(), PairArtifactError> {
+    let path = workspace_intent_path(text);
+    match fs::remove_file(&path) {
+        Ok(()) => sync_directory(parent),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(PairArtifactError::Io { path, source }),
+    }
 }
 
 fn recover_locked(text: &Path, parent: &Path) -> Result<(), PairArtifactError> {
@@ -450,6 +736,31 @@ fn rollback(
     cleanup_terminal(journal_file, parent, journal)
 }
 
+fn abort_no_clobber(
+    journal_file: &Path,
+    parent: &Path,
+    journal: &PairTransactionJournal,
+) -> Result<(), PairArtifactError> {
+    if journal.members.iter().any(|member| member.prior.is_some()) {
+        return Err(PairArtifactError::Invalid(
+            "no-clobber abort encountered a non-empty baseline".into(),
+        ));
+    }
+    for member in journal.members.iter().rev() {
+        let final_path = journal.final_path(parent, member);
+        if FileIdentity::from_path(&final_path)?.as_ref() == member.candidate.as_ref() {
+            fs::remove_file(&final_path).map_err(|source| PairArtifactError::Io {
+                path: final_path,
+                source,
+            })?;
+            sync_directory(parent)?;
+        }
+    }
+    // Unknown final identities belong to a non-cooperating writer that won a
+    // no-clobber race. Preserve them while removing only our private state.
+    cleanup_terminal(journal_file, parent, journal)
+}
+
 fn cleanup_committed(
     journal_file: &Path,
     parent: &Path,
@@ -569,12 +880,9 @@ fn validate_destination_order(
 ) -> Result<(), PairArtifactError> {
     if destinations.is_empty()
         || destinations.last().map(|(role, _)| *role) != Some(PairMemberRole::Text)
-        || !destinations
-            .iter()
-            .any(|(role, _)| *role == PairMemberRole::Projector)
     {
         return Err(PairArtifactError::Invalid(
-            "pair publication requires projector and text-last ordering".into(),
+            "conversion publication requires text-last ordering".into(),
         ));
     }
     Ok(())
@@ -693,7 +1001,7 @@ mod tests {
             let destinations = destinations(dir.path());
             seed_old_and_new(&workspace, &destinations);
             workspace
-                .publish_inner(&destinations, Some(failpoint), false)
+                .publish_inner(&destinations, Some(failpoint), false, false)
                 .unwrap_err();
             for (role, final_path) in &destinations {
                 assert_eq!(
@@ -750,6 +1058,143 @@ mod tests {
         recover_pending(&text).unwrap();
         for (_, final_path) in &destinations {
             assert!(!final_path.exists());
+        }
+    }
+
+    #[test]
+    fn no_clobber_pair_race_preserves_operator_file_and_removes_our_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("model.gguf");
+        let workspace = PairWorkspace::create(&text).unwrap();
+        let destinations = destinations(dir.path());
+        for (role, _) in &destinations {
+            write(
+                &workspace.staged_path(*role),
+                format!("new-{role:?}").as_bytes(),
+            );
+        }
+        let error = workspace
+            .publish_no_clobber_with_conflict_at(&destinations, PairMemberRole::Projector)
+            .unwrap_err();
+        assert!(error.to_string().contains("pair I/O"), "{error}");
+        for (role, final_path) in &destinations {
+            if *role == PairMemberRole::Projector {
+                assert_eq!(fs::read(final_path).unwrap(), b"operator-race");
+            } else {
+                assert!(!final_path.exists(), "unexpected {role:?} publication");
+            }
+        }
+        assert!(!journal_path(&text).exists());
+    }
+
+    #[test]
+    fn no_clobber_crash_after_atomic_projector_rename_recovers_to_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("model.gguf");
+        let workspace = PairWorkspace::create(&text).unwrap();
+        let destinations = destinations(dir.path());
+        for (role, _) in &destinations {
+            write(
+                &workspace.staged_path(*role),
+                format!("new-{role:?}").as_bytes(),
+            );
+        }
+
+        workspace
+            .publish_no_clobber_crash_at(
+                &destinations,
+                PublishFailpoint::AfterPromoteRename(PairMemberRole::Projector),
+            )
+            .unwrap_err();
+        recover_pending(&text).unwrap();
+
+        for (_, final_path) in &destinations {
+            assert!(!final_path.exists(), "unexpected recovered publication");
+        }
+        assert!(!journal_path(&text).exists());
+    }
+
+    #[test]
+    fn single_output_retry_recovers_after_receipt_publication_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("model.gguf");
+        let workspace = PairWorkspace::create(&text).unwrap();
+        let destinations = vec![
+            (
+                PairMemberRole::TextReceipt,
+                dir.path().join("model.gguf.receipt.json"),
+            ),
+            (PairMemberRole::Text, text.clone()),
+        ];
+        write(
+            &workspace.staged_path(PairMemberRole::TextReceipt),
+            b"receipt",
+        );
+        write(&workspace.staged_path(PairMemberRole::Text), b"gguf");
+
+        workspace
+            .publish_no_clobber_crash_at(
+                &destinations,
+                PublishFailpoint::AfterPromoteRename(PairMemberRole::TextReceipt),
+            )
+            .unwrap_err();
+        assert!(
+            destinations[0].1.exists(),
+            "crash must expose the receipt edge"
+        );
+
+        recover_pending(&text).unwrap();
+        for (_, path) in &destinations {
+            assert!(!path.exists(), "retry recovery left {}", path.display());
+        }
+        assert!(!journal_path(&text).exists());
+        let retry = PairWorkspace::create(&text).unwrap();
+        retry.discard_unpublished();
+    }
+
+    #[test]
+    fn retry_removes_a_crashed_prejournal_workspace_under_exclusive_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("model.gguf");
+        let workspace = PairWorkspace::create(&text).unwrap();
+        let root = workspace.root.clone();
+        write(
+            &workspace.staged_path(PairMemberRole::Text),
+            b"partially-produced-gguf",
+        );
+        assert!(workspace_intent_path(&text).is_file());
+
+        drop(workspace);
+        assert!(root.is_dir(), "simulated crash must leave staged bytes");
+        recover_pending(&text).unwrap();
+
+        assert!(!root.exists());
+        assert!(!workspace_intent_path(&text).exists());
+        assert!(!journal_path(&text).exists());
+    }
+
+    #[test]
+    fn prejournal_recovery_handles_empty_root_before_or_after_private_mode() {
+        for mode in [0o755, 0o700, 0o600, 0o500, 0o000] {
+            let dir = tempfile::tempdir().unwrap();
+            let text = dir.path().join("model.gguf");
+            let transaction_id = uuid::Uuid::new_v4().to_string();
+            write_workspace_intent(&text, dir.path(), &transaction_id).unwrap();
+            let root = dir.path().join(format!(".hf2q-pair-{transaction_id}"));
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(mode)).unwrap();
+
+            recover_pending(&text).unwrap();
+            assert!(!root.exists(), "mode {mode:o} crash root survived");
+            assert!(!workspace_intent_path(&text).exists());
+
+            let retry = PairWorkspace::create(&text).unwrap();
+            assert_eq!(fs::metadata(&retry.root).unwrap().mode() & 0o7777, 0o700);
+            assert_eq!(
+                fs::metadata(retry.root.join("backup")).unwrap().mode() & 0o7777,
+                0o700
+            );
+            retry.discard_unpublished();
         }
     }
 
@@ -894,6 +1339,7 @@ mod tests {
             ],
         };
         write_journal(&journal_path(&text), &journal).unwrap();
+        drop(workspace);
 
         let error = recover_pending(&text).unwrap_err().to_string();
 

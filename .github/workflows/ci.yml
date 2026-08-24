@@ -120,6 +120,8 @@ jobs:
             scripts/sign_notarize_standalone_release.sh \
             scripts/test_standalone_installer.sh \
             scripts/test_standalone_release_signing_contract.sh \
+            tests/frictionless_cli.rs \
+            scripts/test_frictionless_binary.sh \
             docs/shell-completion.md \
             docs/adr/ADR-045-frictionless-distribution-updates-and-onboarding.md
           do
@@ -149,14 +151,45 @@ jobs:
           cargo test --locked --test build_script_contract --all-features
           cargo test --locked --test completions --all-features
           cargo test --locked --test convert_integration --all-features
+          cargo test --locked --test frictionless_cli --all-features
           cargo test --locked --test lcp_registry_unit --all-features
           cargo test --locked --bin hf2q --all-features convert::orchestrator::tests::
           cargo test --locked --bin hf2q --all-features distribution::standalone:: -- --test-threads=1
           scripts/test_standalone_installer.sh
           scripts/test_standalone_release_signing_contract.sh
           cargo test --locked --bin hf2q --all-features setup:: -- --test-threads=1
-          cargo test --locked --bin hf2q --all-features tests::convert_config_quant_is_used_and_explicit_quant_wins -- --exact
+          cargo test --locked --bin hf2q --all-features tests::convert_quant_suffix_flag_config_and_conflict_are_deterministic -- --exact
           cargo test --locked --bin hf2q --all-features tests::invalid_operator_config_fails_before_convert_source_or_serve_bind -- --exact
+          cargo test --locked --bin hf2q --all-features tests::concurrent_remote_convert_waiter_reuses_winner_without_entering_conversion -- --exact
+          cargo test --locked --bin hf2q --all-features tests::conversion_noop_receipt_reads_are_bounded_nofollow_snapshots -- --exact
+          cargo test --locked --bin hf2q --all-features tests::automatic_pair_lock_plan_defers_extension_validation_until_multimodal_detection -- --exact
+          cargo test --locked --bin hf2q --all-features tests::extensionless_conditional_pair_conflict_checks_text_without_inventing_a_projector -- --exact
+          cargo test --locked --bin hf2q --all-features chat::endpoint::tests::retained_listener_rejects_ready_mismatch_and_prevents_exit_rebind -- --exact
+          cargo test --locked --bin hf2q --all-features serve::tests::chat_lifeline_transport_accepts_only_unix_sockets -- --exact
+          cargo test --locked --bin hf2q --all-features serve::cache::tests::concurrent_cross_quant_touches_merge_stale_snapshots_under_manifest_lock -- --exact
+          cargo test --locked --bin hf2q --all-features input::hf_download::tests::complete_qwen_mtp_prefix_admits_the_same_one_layer_topology_as_runtime -- --exact
+          cargo test --locked --bin hf2q --all-features input::hf_download::tests::mtp_hosted_admission_rejects_shape_correct_non_executable_storage -- --exact
+          cargo test --locked --bin hf2q --all-features input::hf_download::tests::hosted_multimodal_pair_is_admitted_as_one_pretransfer_extent -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::actual_local_selection_prefers_successful_use_and_exact_quant_ignores_low_memory -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::newer_same_quant_hub_cache_revision_is_not_shadowed_by_post_lock_old_binding -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::automatic_projector_preflight_failure_keeps_text_plan_and_suppresses_retry -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::explicit_local_output_projector_conflict_warns_and_materializes_text_only -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::prepared_existing_projector_rejects_same_inode_mutation_before_activation -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::retained_adoption_has_an_independent_inode_and_source_alias_mutation_isolated -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::retained_materialization_creates_independent_bytes_and_refuses_conflicts -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::concurrent_exact_destination_winner_is_rechecked_and_reused -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::inventory::inventory_output_tests::hub_cache_queued_directory_replacement_cannot_escape_snapshot -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::inventory::inventory_output_tests::hub_cache_snapshot_retarget_after_parse_is_not_listed -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::inventory::inventory_output_tests::hub_cache_model_ancestor_replacement_cannot_redirect_snapshot_authority -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::local_pair_source_and_destination_parent_replacement_refuses_before_first_write -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::older_local_multimodal_candidate_requests_its_exact_revision_not_head_projector -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::markerless_local_multimodal_uses_candidate_revision_config_and_companion -- --exact
+          cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::retained_exact_destination_replacement_after_preflight_refuses_activation -- --exact
+          cargo test --locked --bin hf2q --all-features input::hf_download::tests::retained_cross_device_pair_preflight_aggregates_on_destination_authority -- --exact
+          cargo test --locked --bin hf2q --all-features input::hf_download::tests::authenticated_sparse_source_fetches_only_safetensors_headers -- --exact
+          cargo test --locked --bin hf2q --all-features core::paired_artifact::tests::conversion_operation_locks_serialize_a_shared_explicit_projector -- --exact
+          cargo test --locked --bin hf2q --all-features input::hf_download::tests::exact_transfer_preflight_fails_closed_on_unknown_or_zero_capacity -- --exact
+          cargo test --locked --bin hf2q --all-features convert::cli_driver::paired_transaction::tests::prejournal_recovery_handles_empty_root_before_or_after_private_mode -- --exact
           cargo test --locked --bin hf2q --all-features serve::tests::serve_config_defaults_are_used_and_cli_overrides_them -- --exact
           cargo test --locked --bin hf2q --all-features serve::tests::configured_lan_requires_runtime_auth -- --exact
           cargo test --locked --bin hf2q --all-features serve::operator_settings::tests::cli_planning_values_override_setup_config -- --exact
@@ -178,8 +211,16 @@ jobs:
             setup::tests::cancelled_or_interrupted_interactive_setup_creates_nothing \
             setup::tests::noninteractive_setup_requires_complete_choices_or_accept_defaults \
             setup::tests::named_performance_levels_accept_one_or_more_levels_and_reject_incoherent_facts \
-            tests::convert_config_quant_is_used_and_explicit_quant_wins \
+            tests::convert_quant_suffix_flag_config_and_conflict_are_deterministic \
             tests::invalid_operator_config_fails_before_convert_source_or_serve_bind \
+            tests::concurrent_remote_convert_waiter_reuses_winner_without_entering_conversion \
+            tests::conversion_noop_receipt_reads_are_bounded_nofollow_snapshots \
+            tests::automatic_pair_lock_plan_defers_extension_validation_until_multimodal_detection \
+            tests::extensionless_conditional_pair_conflict_checks_text_without_inventing_a_projector \
+            tests::remote_pair_paths_and_explicit_no_clobber_conflicts_fail_before_source_planning \
+            chat::endpoint::tests::retained_listener_rejects_ready_mismatch_and_prevents_exit_rebind \
+            serve::tests::chat_lifeline_transport_accepts_only_unix_sockets \
+            serve::cache::tests::concurrent_cross_quant_touches_merge_stale_snapshots_under_manifest_lock \
             serve::tests::serve_config_defaults_are_used_and_cli_overrides_them \
             serve::tests::configured_lan_requires_runtime_auth \
             serve::operator_settings::tests::cli_planning_values_override_setup_config \
@@ -200,9 +241,68 @@ jobs:
             cli::tests::frictionless_serve_operand_accepts_repo_quant_and_list \
             cli::tests::frictionless_chat_operand_accepts_repo_quant_and_list \
             serve::managed_artifacts::tests::actual_local_selection_prefers_successful_use_and_exact_quant_ignores_low_memory \
+            serve::managed_artifacts::tests::cache_selection_tracks_the_exact_quant_used_not_the_repository_lru \
+            serve::managed_artifacts::tests::cached_hub_q8_is_selected_locally_before_a_q4_fallback_tier \
+            serve::managed_artifacts::tests::exact_loose_digest_adopts_misnamed_bytes_and_hashes_once \
+            serve::managed_artifacts::tests::newer_same_quant_hub_cache_revision_is_not_shadowed_by_post_lock_old_binding \
+            serve::managed_artifacts::tests::text_only_local_projector_resolution_stops_before_any_hub_lookup \
+            serve::managed_artifacts::tests::authenticated_gguf_vision_marker_overrides_absent_repository_config_marker \
+            serve::managed_artifacts::tests::automatic_projector_preflight_failure_keeps_text_plan_and_suppresses_retry \
+            serve::managed_artifacts::tests::explicit_local_output_projector_conflict_warns_and_materializes_text_only \
+            serve::managed_artifacts::tests::local_pair_extent_refusal_suppresses_projector_retry_after_text_materialization \
+            serve::managed_artifacts::tests::incompatible_newest_loose_digest_continues_to_older_compatible_local_bytes \
+            serve::managed_artifacts::tests::local_candidate_mutated_during_catalog_latency_is_discarded_for_fallback \
+            serve::managed_artifacts::tests::non_runtime_setup_quant_fails_only_when_remote_fallback_is_needed \
             serve::managed_artifacts::tests::destination_preflight_reuses_exact_bytes_and_rejects_conflict_before_transfer \
             serve::managed_artifacts::tests::verified_conversion_pair_is_reused_and_published_as_managed_authority \
-            chat::local::tests::owned_candidate_verification_uses_authorization_after_pid_match \
+            serve::managed_artifacts::tests::automatic_native_selection_steps_down_using_exact_product_sizes \
+            serve::managed_artifacts::tests::prepared_existing_projector_rejects_same_inode_mutation_before_activation \
+            serve::managed_artifacts::tests::cached_projector_snapshot_symlink_is_retained_from_its_repo_blob \
+            serve::managed_artifacts::tests::retained_adoption_has_an_independent_inode_and_source_alias_mutation_isolated \
+            serve::managed_artifacts::tests::retained_materialization_creates_independent_bytes_and_refuses_conflicts \
+            serve::managed_artifacts::tests::concurrent_exact_destination_winner_is_rechecked_and_reused \
+            serve::managed_artifacts::tests::local_pair_source_and_destination_parent_replacement_refuses_before_first_write \
+            serve::managed_artifacts::tests::older_local_multimodal_candidate_requests_its_exact_revision_not_head_projector \
+            serve::managed_artifacts::tests::markerless_local_multimodal_uses_candidate_revision_config_and_companion \
+            serve::managed_artifacts::tests::retained_exact_destination_replacement_after_preflight_refuses_activation \
+            serve::managed_artifacts::inventory::inventory_output_tests::hub_cache_queued_directory_replacement_cannot_escape_snapshot \
+            serve::managed_artifacts::inventory::inventory_output_tests::hub_cache_snapshot_retarget_after_parse_is_not_listed \
+            serve::managed_artifacts::inventory::inventory_output_tests::hub_cache_model_ancestor_replacement_cannot_redirect_snapshot_authority \
+            chat::local::tests::owned_private_ready_handoff_binds_authorized_endpoint \
+            chat::local::tests::targeted_chat_propagates_the_selected_state_root_to_owned_serve \
+            convert::cli_driver::tests::temporary_conversion_creates_a_fresh_managed_revision_parent \
+            convert::cli_driver::paired_transaction::tests::retry_removes_a_crashed_prejournal_workspace_under_exclusive_intent \
+            convert::cli_driver::paired_transaction::tests::prejournal_recovery_handles_empty_root_before_or_after_private_mode \
+            convert::cli_driver::paired_transaction::tests::single_output_retry_recovers_after_receipt_publication_crash \
+            convert::orchestrator::tests::planned_output_bytes_matches_multiple_unaligned_tensor_payloads \
+            convert::orchestrator::tests::pretransfer_native_bound_covers_actual_f32_kept_storage_plans \
+            input::hf_download::gguf_probe::tests::malicious_counts_and_lengths_fail_before_allocation \
+            input::hf_download::tests::complete_qwen_prefix_admits_runtime_metadata_tokenizer_and_tensor_topology \
+            input::hf_download::tests::complete_qwen_mtp_prefix_admits_the_same_one_layer_topology_as_runtime \
+            input::hf_download::tests::qwen_admission_rejects_embedding_tables_smaller_than_selected_heads \
+            input::hf_download::tests::mtp_hosted_admission_rejects_shape_correct_non_executable_storage \
+            input::hf_download::tests::exact_revision_hub_cache_lookup_reuses_an_existing_quant_without_transfer \
+            input::hf_download::tests::hosted_multimodal_pair_is_admitted_as_one_pretransfer_extent \
+            input::hf_download::tests::native_projector_planning_fails_closed_when_exact_config_inspection_fails \
+            input::hf_download::tests::native_output_bound_covers_kept_f32_fp16_fp8_and_mxfp4_sources \
+            input::hf_download::tests::exact_local_text_projector_destinations_require_zero_new_extent \
+            input::hf_download::tests::exact_transfer_preflight_fails_closed_on_unknown_or_zero_capacity \
+            input::hf_download::tests::retained_cross_device_pair_preflight_aggregates_on_destination_authority \
+            input::hf_download::gguf_probe::tests::gguf_vision_profile_is_authoritative_for_projector_planning \
+            input::hf_download::tests::exact_owned_hub_bytes_use_local_compatibility_admission_without_a_range_request \
+            input::hf_download::tests::incomplete_qwen_prefix_is_rejected_before_payload_transfer \
+            input::hf_download::tests::qwen_dense_hosted_admission_is_isomorphic_to_runtime_storage \
+            input::hf_download::tests::qwen_operational_scalars_reject_non_executable_runtime_configs \
+            input::hf_download::tests::native_conversion_preflight_uses_exact_plan_plus_safety_headroom \
+            input::hf_download::tests::native_source_and_output_are_admitted_as_one_shared_filesystem_extent \
+            input::hf_download::tests::native_metadata_stage_preflights_before_first_cache_write \
+            input::hf_download::tests::authenticated_sparse_source_fetches_only_safetensors_headers \
+            input::hf_download::tests::mixed_local_text_hosted_projector_extents_are_aggregated_by_filesystem \
+            core::paired_artifact::tests::conversion_operation_locks_serialize_a_shared_explicit_projector \
+            models::vit::gguf_emit::tests::planned_mmproj_bytes_match_real_nonempty_aligned_output \
+            serve::managed_artifacts::tests::native_multimodal_disk_plan_includes_the_f16_projector_before_transfer \
+            serve::managed_artifacts::tests::source_only_native_fallback_refuses_an_upper_bound_that_does_not_fit \
+            serve::auto_pipeline::tests::self_spawned_convert_arguments_parse_on_the_current_cli \
             inference::models::qwen35::source_precision::operator::tests::embedded_qwen38_source_manifest_projects_exact_offline_inventory \
             convert::cli_driver::tests::deepseek_tiny_official_layout_converts_to_q2_k_s_end_to_end \
             input::integrity::tests::safetensors_index_entry_cap_is_exact \
@@ -218,6 +318,12 @@ jobs:
           cargo test --locked --bin hf2q --all-features cli::tests::frictionless_
           cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::
           cargo test --locked --bin hf2q --all-features chat::local::tests::
+          cargo test --locked --bin hf2q --all-features input::hf_download::tests::
+          cargo test --locked --bin hf2q --all-features input::hf_download::gguf_probe::tests::
+          cargo test --locked --bin hf2q --all-features serve::auto_pipeline::tests::
+          cargo test --locked --bin hf2q --all-features convert::cli_driver::paired_transaction::tests::
+          cargo test --locked --bin hf2q --all-features convert::cli_driver::tests::temporary_conversion_creates_a_fresh_managed_revision_parent -- --exact
+          cargo test --locked --bin hf2q --all-features models::vit::gguf_emit::tests::planned_mmproj_bytes_match_real_nonempty_aligned_output -- --exact
           cargo test --locked --bin hf2q --all-features inference::models::qwen35::source_precision::operator::tests::embedded_qwen38_source_manifest_projects_exact_offline_inventory -- --exact
           cargo test --locked --bin hf2q --all-features input::integrity::tests:: -- --test-threads=1
           cargo test --locked --bin hf2q --all-features convert::cli_driver::tests::deepseek_tiny_official_layout_converts_to_q2_k_s_end_to_end -- --exact

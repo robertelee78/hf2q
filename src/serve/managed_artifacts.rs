@@ -9,17 +9,38 @@ mod storage;
 
 pub(crate) use inventory::print_inventory;
 use inventory::{find_matching_loose, scan_roots, visit_files};
-use local::{find_best_matching_loose, select_local};
-use materialize::materialize_preverified_exact;
+#[cfg(test)]
+use local::local_candidate_eligible;
+use local::{find_best_matching_cached_hub, find_best_matching_loose, select_local};
+#[cfg(test)]
+use local::{
+    find_best_matching_cached_hub_with, find_best_matching_loose_with,
+    find_best_matching_loose_with_hash,
+};
+#[cfg(test)]
+use materialize::clone_requires_copy;
 use materialize::verify_or_refuse_existing_destination;
+use materialize::{
+    materialize_preverified_exact, materialize_retained_exact, PreparedLocalArtifact,
+};
+use projector::{
+    best_effort_projector_with_catalog, materialize_prepared_projector, prepare_projector_action,
+    select_projector_companion, PreparedProjectorSource,
+};
 #[cfg(test)]
-use materialize::{materialize_exact, materialize_exact_with_link};
-#[cfg(test)]
-use projector::select_projector_companion;
-use projector::{best_effort_projector_with_catalog, resolve_projector};
+use projector::{resolve_projector, resolve_projector_with_catalog, retain_cached_projector_at};
+pub(crate) use resolution::planned_native_product_bytes;
 pub(crate) use resolution::resolve_repository;
 #[cfg(test)]
-use resolution::{prepare_selected_local, select_hosted};
+use resolution::{
+    admit_automatic_projector_preflight, automatic_artifact_admissible,
+    bound_candidate_is_at_least_as_recent, exact_local_projector_catalog_reference,
+    hosted_pair_requires_projector, native_convert, post_lock_local_candidate_wins,
+    prepare_local_candidate_with_catalog_resolver, prepare_selected_local,
+    prepare_selected_local_decision_with_preflight, repository_recommended_quant,
+    reverify_candidate_after_catalog, select_compatible_hosted, select_hosted,
+    select_native_fallback_quant, select_native_quant_from_exact_plans,
+};
 #[cfg(test)]
 use storage::validate_binding;
 use storage::{
@@ -29,7 +50,7 @@ use storage::{
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,15 +59,20 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::api::local_artifacts::{
-    verify_local_artifact, LocalArtifactInventory, LocalArtifactProvenance,
+    verify_retained_local_artifact, LocalArtifactInventory, LocalArtifactProvenance,
     LocalVerificationRequest,
 };
 use super::cache::{CacheLock, ModelCache};
-use super::quant_select::{quant_type_from_gguf_path, select_quant, GpuInfo, QuantType};
+use super::multi_model::LoadedPool;
+use super::quant_select::{quant_type_from_gguf_file, select_quant, GpuInfo, QuantType};
 use crate::core::hardware::HardwareProfile;
 use crate::input::hf_download::{
-    check_hub_artifact_destination, check_hub_artifact_plan, download_hub_companion,
-    download_hub_gguf, resolve_hub_gguf_catalog, HubGgufArtifact, HubGgufCatalog,
+    cached_hub_gguf_path, check_hosted_text_local_projector_plan_with_device,
+    check_hub_artifact_destination, check_hub_artifact_pair_plan_from_state,
+    check_hub_artifact_plan, check_local_artifact_pair_plan_with_authorities,
+    check_local_text_hosted_projector_plan_with_authorities, download_hub_companion,
+    download_hub_gguf, resolve_hub_gguf_catalog, validate_hub_gguf_header_compatibility,
+    validate_retained_local_hub_gguf_compatibility, DownloadError, HubGgufArtifact, HubGgufCatalog,
 };
 use crate::input::hf_reference::HfModelReference;
 use crate::model_spec::{
@@ -111,15 +137,149 @@ pub(crate) struct ResolvedManagedModel {
     pub(crate) warnings: Vec<String>,
 }
 
-fn verify_candidate(candidate: &Candidate) -> Result<()> {
-    verify_local_artifact(LocalVerificationRequest {
-        root: &candidate.root,
-        artifact: &candidate.path,
-        bytes: candidate.bytes,
-        sha256: &candidate.sha256,
-        quant: candidate.quant,
-    })?;
+fn verify_candidate(
+    candidate: &Candidate,
+) -> Result<crate::core::bounded_file::StableFileIdentity> {
+    #[cfg(test)]
+    VERIFY_CANDIDATE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let retained =
+        crate::core::bounded_file::StableRegularFile::open_exact(&candidate.path, candidate.bytes)?
+            .context("local candidate changed before verification")?;
+    let verified = verify_retained_local_artifact(
+        LocalVerificationRequest {
+            root: &candidate.root,
+            artifact: &candidate.path,
+            bytes: candidate.bytes,
+            sha256: &candidate.sha256,
+            quant: candidate.quant,
+        },
+        retained,
+    )?;
+    validate_retained_local_runtime_tensor_layout(&verified.retained)?;
+    Ok(verified.retained.identity())
+}
+
+#[cfg(test)]
+thread_local! {
+    static VERIFY_CANDIDATE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_verify_candidate_calls() {
+    VERIFY_CANDIDATE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn verify_candidate_calls() -> usize {
+    VERIFY_CANDIDATE_CALLS.with(std::cell::Cell::get)
+}
+
+fn validate_retained_local_runtime_tensor_layout(
+    retained: &crate::core::bounded_file::StableRegularFile,
+) -> Result<()> {
+    let gguf = mlx_native::gguf::GgufFile::from_file(retained.try_clone()?)?;
+    let arch = gguf.metadata_string("general.architecture").unwrap_or("");
+    for name in gguf.tensor_names() {
+        let info = gguf
+            .tensor_info(name)
+            .expect("tensor name returned by GGUF must have tensor info");
+        if let Some(reason) = local_runtime_tensor_incompatibility(arch, name, info.ggml_type) {
+            bail!("GGUF tensor layout is not executable by this build: {reason}");
+        }
+    }
+    crate::input::hf_download::validate_qwen_runtime_admission(&gguf)
+        .map_err(|reason| anyhow!("GGUF runtime admission failed: {reason}"))?;
+    if !retained.is_stable()? {
+        bail!("local GGUF changed during runtime layout admission");
+    }
     Ok(())
+}
+
+fn local_runtime_tensor_incompatibility(
+    arch: &str,
+    name: &str,
+    ggml_type: mlx_native::ops::quantized_matmul_ggml::GgmlType,
+) -> Option<String> {
+    use crate::inference::models::qwen35::forward_gpu::qwen35_native_embedding_type_supported;
+    use crate::inference::models::qwen35::weight_loader::{
+        qwen35_dense_ffn_type_supported, qwen35_moe_expert_type_supported,
+        qwen35_native_projection_type_supported,
+    };
+    use crate::inference::models::qwen3vl_text::weights::qwen3vl_projection_type_supported;
+
+    if matches!(arch, "qwen35" | "qwen35moe") {
+        let supported = if name == "token_embd.weight" {
+            qwen35_native_embedding_type_supported(ggml_type)
+        } else if qwen35_dense_ffn_name(name) {
+            qwen35_dense_ffn_type_supported(ggml_type)
+        } else if qwen35_moe_expert_name(name) {
+            qwen35_moe_expert_type_supported(ggml_type)
+        } else if qwen35_native_projection_name(name) {
+            qwen35_native_projection_type_supported(ggml_type)
+        } else {
+            true
+        };
+        if !supported {
+            return Some(format!(
+                "{name} uses unsupported {ggml_type:?} storage for {arch}"
+            ));
+        }
+    } else if (arch == "qwen3_vl" || arch == "qwen3vl")
+        && qwen3vl_projection_name(name)
+        && !qwen3vl_projection_type_supported(ggml_type)
+    {
+        return Some(format!(
+            "{name} uses unsupported {ggml_type:?} storage for {arch}"
+        ));
+    }
+    None
+}
+
+fn qwen35_native_projection_name(name: &str) -> bool {
+    name == "output.weight"
+        || [
+            ".attn_q.weight",
+            ".attn_k.weight",
+            ".attn_v.weight",
+            ".attn_output.weight",
+            ".attn_qkv.weight",
+            ".attn_gate.weight",
+            ".ssm_alpha.weight",
+            ".ssm_beta.weight",
+            ".ssm_out.weight",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+fn qwen35_dense_ffn_name(name: &str) -> bool {
+    [".ffn_gate.weight", ".ffn_up.weight", ".ffn_down.weight"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+fn qwen35_moe_expert_name(name: &str) -> bool {
+    [
+        ".ffn_gate_exps.weight",
+        ".ffn_up_exps.weight",
+        ".ffn_down_exps.weight",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
+}
+
+fn qwen3vl_projection_name(name: &str) -> bool {
+    [
+        ".attn_q.weight",
+        ".attn_k.weight",
+        ".attn_v.weight",
+        ".attn_output.weight",
+        ".ffn_gate.weight",
+        ".ffn_up.weight",
+        ".ffn_down.weight",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
 }
 
 fn verify_candidate_projector(candidate: &Candidate) -> Result<Option<PathBuf>> {
@@ -134,7 +294,10 @@ fn verify_candidate_projector(candidate: &Candidate) -> Result<Option<PathBuf>> 
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != *bytes {
         return Ok(None);
     }
-    let actual = crate::core::sha256::compute_file_sha256(path)?;
+    let Some(actual) = crate::core::bounded_file::sha256_regular_nofollow_exact(path, *bytes)?
+    else {
+        return Ok(None);
+    };
     if !actual.eq_ignore_ascii_case(sha256) {
         return Ok(None);
     }
@@ -185,12 +348,16 @@ pub(crate) fn mark_successful_use(
     }
     // Reload under the quant lock so an old in-memory snapshot cannot flush
     // over another process's completed manifest update.
-    ModelCache::open_at(cache.root())?.touch(repository)?;
+    ModelCache::open_at(cache.root())?.touch_quant(repository, quant)?;
     Ok(())
 }
 
 pub(crate) fn text_requires_projector(path: &Path) -> Result<bool> {
     let gguf = mlx_native::gguf::GgufFile::open(path)?;
+    Ok(text_gguf_requires_projector(&gguf))
+}
+
+pub(crate) fn text_gguf_requires_projector(gguf: &mlx_native::gguf::GgufFile) -> bool {
     let arch = gguf.metadata_string("general.architecture").unwrap_or("");
     if arch == "gemma4"
         || arch.contains("qwen3vl")
@@ -198,7 +365,7 @@ pub(crate) fn text_requires_projector(path: &Path) -> Result<bool> {
             .metadata_string("hf2q.vision.projector_profile")
             .is_some()
     {
-        return Ok(true);
+        return true;
     }
     let markers = ["<|vision_start|>", "<|image_pad|>", "<|vision_end|>"];
     let present = gguf.metadata("tokenizer.ggml.tokens").is_some_and(|value| {
@@ -208,7 +375,7 @@ pub(crate) fn text_requires_projector(path: &Path) -> Result<bool> {
             false
         }
     });
-    Ok(present)
+    present
 }
 
 /// Resolve a projector already present beside an explicitly supplied local
@@ -263,14 +430,14 @@ pub(crate) fn resolve_local_path_projector(path: &Path) -> Result<Option<PathBuf
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
             _ => continue,
         };
-        let _ = metadata;
-        candidates.push(candidate);
+        candidates.push((candidate, metadata.len()));
     }
-    candidates.sort();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
 
     if let Some(expected) = expected_projector_sha256(path)? {
-        for candidate in candidates {
-            if crate::core::sha256::compute_file_sha256(&candidate)?.eq_ignore_ascii_case(&expected)
+        for (candidate, bytes) in candidates {
+            if crate::core::bounded_file::sha256_regular_nofollow_exact(&candidate, bytes)?
+                .is_some_and(|digest| digest.eq_ignore_ascii_case(&expected))
             {
                 return Ok(Some(candidate));
             }
@@ -278,11 +445,13 @@ pub(crate) fn resolve_local_path_projector(path: &Path) -> Result<Option<PathBuf
         bail!("multimodal local GGUF has no sibling matching its bound projector digest");
     }
 
-    if let Some(paired) = paired_projector_path(path).filter(|paired| candidates.contains(paired)) {
+    if let Some(paired) = paired_projector_path(path)
+        .filter(|paired| candidates.iter().any(|(candidate, _)| candidate == paired))
+    {
         return Ok(Some(paired));
     }
     match candidates.as_slice() {
-        [candidate] => Ok(Some(candidate.clone())),
+        [(candidate, _)] => Ok(Some(candidate.clone())),
         [] => bail!("multimodal local GGUF has no projector beside it; serving text-only"),
         _ => bail!(
             "multimodal local GGUF has multiple unbound projector siblings; serving text-only"

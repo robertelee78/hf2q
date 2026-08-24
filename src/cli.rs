@@ -480,6 +480,10 @@ pub struct ConvertCliArgs {
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
+    /// Internal no-replace publication contract used by managed conversion.
+    #[arg(long, hide = true, default_value_t = false)]
+    pub no_clobber: bool,
+
     /// Build and report the exact tensor/type/byte plan without creating the
     /// output GGUF. Source download or provenance hashing may still read the
     /// complete input; no tensor payload is materialized by the converter.
@@ -1111,11 +1115,26 @@ pub struct ServeArgs {
     #[arg(long = "model-dir", value_name = "DIR")]
     pub model_dirs: Vec<PathBuf>,
 
-    /// Internal inherited descriptor for a server owned by `hf2q chat`.
+    /// Internal inherited Unix socket for a server owned by `hf2q chat`.
     /// The server accepts it only while leading an isolated process group;
-    /// EOF terminates that group and `D` explicitly detaches it.
-    #[arg(long, hide = true, value_name = "FD")]
+    /// EOF terminates that group and a bounded frame explicitly detaches it.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "FD",
+        requires = "chat_owned_listener_fd"
+    )]
     pub chat_parent_lifeline_fd: Option<i32>,
+
+    /// Internal pre-bound loopback listener retained by the owning chat
+    /// process for the full credentialed endpoint lifetime.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "FD",
+        requires = "chat_parent_lifeline_fd"
+    )]
+    pub chat_owned_listener_fd: Option<i32>,
 
     /// Path to tokenizer.json (if not alongside GGUF).
     #[arg(long)]

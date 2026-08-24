@@ -188,6 +188,7 @@ fn managed_cache_path_must_equal_canonical_layout() {
                 bytes: fs::metadata(outside.path()).unwrap().len(),
                 sha256: compute_file_sha256(outside.path()).unwrap(),
                 quantized_at_secs: 1,
+                last_used_at_secs: 0,
                 quantized_by_version: "0.1.7".into(),
             },
         )]),
@@ -338,6 +339,7 @@ fn canonical_managed_cache_artifact_is_selectable() {
                 bytes: fs::metadata(&artifact).unwrap().len(),
                 sha256: compute_file_sha256(&artifact).unwrap(),
                 quantized_at_secs: 1,
+                last_used_at_secs: 0,
                 quantized_by_version: "0.1.7".into(),
             },
         )]),
@@ -357,4 +359,51 @@ fn canonical_managed_cache_artifact_is_selectable() {
         LocalArtifactProvenance::ManagedCache
     );
     assert!(catalog.artifacts[0].selectable);
+
+    let legacy_root = tempfile::tempdir().unwrap();
+    let legacy = crate::serve::cache::legacy_cache_model_path(
+        legacy_root.path(),
+        "owner/model",
+        QuantType::Q4_K_M,
+    );
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    write_q4_k_m_gguf(&legacy);
+    let mut legacy_manifest = manifest.clone();
+    let legacy_entry = legacy_manifest
+        .models
+        .get_mut("owner/model")
+        .unwrap()
+        .quantizations
+        .get_mut("Q4_K_M")
+        .unwrap();
+    legacy_entry.gguf_path = legacy.clone();
+    legacy_entry.bytes = fs::metadata(&legacy).unwrap().len();
+    legacy_entry.sha256 = compute_file_sha256(&legacy).unwrap();
+    fs::write(
+        legacy.parent().unwrap().join("manifest.json"),
+        serde_json::to_vec_pretty(legacy_entry).unwrap(),
+    )
+    .unwrap();
+    let legacy_model = legacy_manifest.models.get("owner/model").unwrap();
+    fs::write(
+        legacy
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("repo_meta.json"),
+        serde_json::to_vec_pretty(legacy_model).unwrap(),
+    )
+    .unwrap();
+    let catalog = LocalArtifactInventory::default().discover(
+        Some("owner/model"),
+        Some((legacy_root.path(), &legacy_manifest)),
+    );
+    assert_eq!(
+        catalog.artifacts.len(),
+        1,
+        "manifest-bound legacy cache bytes remain discoverable"
+    );
 }

@@ -1,6 +1,6 @@
 # ADR-051: Frictionless local-first model resolution
 
-- **Status:** Accepted; implementation validated on the feature branch,
+- **Status:** Accepted; implementation under final branch validation,
   release activation pending
 - **Date:** 2026-08-23
 - **Related:** ADR-005, ADR-018, ADR-033, ADR-045, ADR-046, ADR-047
@@ -92,7 +92,7 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models
 Repository artifacts live under:
 
 ```text
-<root>/<owner>__<repository>/<immutable-revision>/<artifact>
+<root>/v2-<lowercase-hex(owner/repository)>/<immutable-revision>/<artifact>
 ```
 
 Each adopted, downloaded, or converted artifact has bounded sidecar authority
@@ -101,6 +101,11 @@ quant identity, origin, materialization time, and last successful use. A
 projector binding additionally records its own immutable filename, bytes, and
 SHA-256. Schema-v3 conversion receipts and the existing canonical `ModelCache`
 remain valid authorities and are merged into the same inventory.
+The v2 slug is injective and stable under case-folding filesystems. Legacy
+`owner__repository` directories remain read-compatible only when bounded
+receipt/manifest authority proves the exact repository and revision; writes
+always use v2. Resolution locks both legacy and v2 lock names in sorted order
+so old and new binaries cannot publish the same quant concurrently.
 Inventory admits a sidecar row only while its text artifact remains a
 non-symlink regular file of the recorded size; projector availability uses the
 same cheap physical check. Listing does not hash payloads.
@@ -118,12 +123,17 @@ Resolution is deterministic:
    receipts, managed-artifact sidecars, and the canonical `ModelCache`.
 2. If an exact quant was requested, use only that quant. Otherwise prefer the
    compatible candidate with the newest successful-use timestamp; if none has
-   use history, prefer the newest verified materialization timestamp.
-3. Scan bounded configured roots for loose GGUFs. A loose artifact is adopted
+   use history, prefer the newest verified materialization timestamp. A
+   successfully used bound candidate returns immediately after its one locked
+   verification; it is not rehashed while scanning loose or Hub-cache bytes.
+3. Scan bounded configured roots and exact-revision canonical hf-hub snapshots
+   for loose GGUFs. A loose or cached artifact is adopted
    only after exact Hub metadata supplies an immutable revision, filename,
    byte length, and strong SHA-256 and a complete local digest matches. A
    filename, substring, modification time, or quant-looking suffix is never
-   authority.
+   authority. Once the digest proves the local file is those exact Hub bytes,
+   compatibility admission reads the local GGUF and does not download its
+   header prefix again.
 4. If no local candidate wins, query hosted metadata. An exact quant downloads
    exactly that supported quant after disk preflight. An unqualified request
    chooses the setup/live hardware recommendation, then the nearest lower
@@ -132,22 +142,38 @@ Resolution is deterministic:
 5. If no supported hosted GGUF exists, `serve` and owned local `chat` fall back
    to hf2q native source conversion. `convert` always uses this source path.
 
-Adoption never moves or deletes operator bytes. hf2q hard-links into the
-managed layout when possible, copies atomically across filesystems, then writes
-authority only after destination size and SHA-256 pass. A matching existing
-destination is reused. A conflicting destination fails closed and is never
-overwritten implicitly.
+Adoption never moves, deletes, or hard-links operator bytes into managed
+authority. hf2q retains the descriptor that passed complete digest and GGUF
+admission, creates an independent CoW clone on a supported Apple filesystem,
+or performs a copy-and-hash fallback. It publishes through one retained,
+canonical destination-parent descriptor with atomic `NOREPLACE`, then writes
+authority only after the retained source, staged inode, final path, exact size,
+and SHA-256 proof agree. A matching existing destination is retained and
+revalidated at activation. A conflicting destination fails closed and is
+never overwritten implicitly.
 
-Hosted disk preflight models the actual materialization plan. Hub cache and
-managed destination on one filesystem require one model-sized allocation and
-use a hard link; cross-filesystem placement preflights the second allocation
-before payload transfer. An already cached exact-size artifact does not fail a
+Hosted disk preflight models the actual materialization plan. Hub cache and an
+APFS managed destination on one filesystem require one model-sized allocation
+plus a CoW clone; cross-filesystem placement preflights the second allocation
+before payload transfer. A clone-unsupported filesystem falls back only after
+a fresh exact copy preflight. An already cached exact artifact does not fail a
 new-download space check merely because the cache is now relatively full.
 
 Compatibility means the current runtime supports the GGUF architecture and
 file type, the artifact passes header and integrity checks, and existing disk,
 memory/admission, and pair preflights accept it. Recency never overrides those
 checks.
+
+For Qwen hosted or manually adopted artifacts, bounded admission uses the same
+GGUF metadata/tokenizer parser and validates executable scalar values, every
+normal-layer tensor topology and shape, supported one-layer MTP/NextN topology,
+exact packed byte geometry, and storage-role support before payload transfer
+or managed publication. The v0.1.15 hosted fast path is closed-admitted for
+Qwen3.5/Qwen3.8 GGUF architecture identifiers; other source families use
+native conversion until they gain their own complete hosted admission
+contract. A semantic incompatibility tries the next compatible hosted tier and
+ultimately native source conversion; transport or immutable-identity failures
+remain fatal.
 
 ### 4. Quant defaults and idempotent conversion
 
@@ -164,12 +190,44 @@ generation/binding contract verify; a prior text-only output cannot silently
 satisfy the paired default. An external or hosted GGUF is never reclassified
 as a completed conversion.
 
+Conversion operation locking follows the conditional product plan. The text
+destination is always locked; an explicit projector destination or a
+derivable `.gguf` sibling is locked with it. An extensionless text destination
+does not fail before source inspection because a text-only model has no
+projector product. If that source proves multimodal, the paired driver still
+rejects the non-`.gguf` text name before writing either artifact.
+
+Before the first source-weight transfer, remote conversion resolves and HEADs
+the complete immutable inventory, aggregates the exact uncached metadata
+extent, and stages verified bounded metadata before any weight write. It then
+range-fetches only authenticated safetensors headers, builds private sparse
+logical-length shards, and runs the production converter in dry-run mode to
+obtain exact text and projector product sizes for each candidate quant. The
+selected source-cache plus exact product plan is preflighted before weight
+transfer; after download, the production plan must match before output
+creation. Automatic native fallback steps down through admissible tiers using
+those exact product sizes. An exact `repo:QUANT` remains authoritative but
+does not bypass disk preflight. Unsupported projector storage fails during
+the sparse production plan, before payload transfer.
+
 ### 5. Multimodal companion behavior
 
-After selecting text GGUF bytes, hf2q determines whether the model declares a
-supported multimodal architecture. A trustworthy locally bound matching
-projector is loaded automatically. If it is absent and the exact repository
-revision exposes one unambiguous matching `mmproj` companion, hf2q downloads,
+Before transferring a selected hosted text payload, authenticated bounded GGUF
+metadata/token markers determine whether the model declares a supported
+multimodal architecture and cause text plus projector to be admitted as one
+aggregate cache/destination disk plan. For markerless source repositories
+only, hf2q may additionally inspect the exact revision's bounded
+`config.json` metadata for a `vision_config` marker. That optional metadata is
+not copied into the managed directory and is never required to serve an
+existing GGUF. For a selected local artifact, this fallback is resolved at
+the candidate's bound revision; a mutable repository-HEAD catalog is never
+used to select its companion. A trustworthy locally bound matching projector
+is loaded automatically. If it is absent and the exact repository
+revision exposes one unambiguous matching `mmproj` companion, hf2q prepares one
+owned action containing the exact revision, filename, size, digest, final
+destination, and either a retained local/cache descriptor or an exact hosted
+download. The aggregate pair preflight returns that action; text publication
+consumes it without companion reselection or filesystem rediscovery, then
 verifies, binds, and loads it before inference.
 
 Automatic companion failure is a visible warning followed by text-only
@@ -191,27 +249,46 @@ show repository, revision, quant, origin, recency, projector availability, and
 path. Listing performs no Hub request and no full-file hashing.
 
 `hf2q chat owner/repository[:QUANT]` uses the same preparation resolver as
-serve by starting an owned loopback server with that exact operand. Existing
+serve by prebinding and retaining the exact loopback TCP listener, then
+starting an owned server child with that listener and exact operand. Existing
 DNS-SD advertisements do not carry immutable repository/revision/quant
 identity, so targeted chat deliberately does not risk reusing an unrelated
 large resident model. Plain `hf2q chat` still discovers and reuses existing
-servers. The owned child inherits `HF2Q_AUTH_TOKEN`; chat sends that token only
-after the discovery PID matches its own child, and prints a bounded heartbeat
-while first-use download or conversion continues. The TUI does not create a
-second downloader or converter.
+servers. A selected global `--state-root` is passed to the owned `serve` child,
+so setup-selected quant and serving defaults are identical for direct serve
+and targeted chat. The child inherits `HF2Q_AUTH_TOKEN`; its actual bound
+loopback port is authorized only when its READY message matches that retained
+listener on a private inherited Unix socket. DNS-SD PID/TXT hints never
+receive credentials or endpoint authority. Chat prints a bounded heartbeat while first-use download or
+conversion continues. The TUI does not create a second downloader or
+converter.
 
 ### 7. Concurrency and failure safety
 
 Per-repository/revision/quant locks cover adoption, download, conversion, and
-sidecar publication. Successful-use publication reloads the cache manifest
-under that lock rather than flushing a stale process snapshot. Shared
+sidecar publication. A global manifest lock plus reload/merge protects every
+cache-manifest mutation, while per-quant successful-use timestamps prevent
+two quant processes from publishing stale repository-level state. Shared
 projector publication rechecks an exact destination after a concurrent
 `EEXIST` winner. Every expensive path rechecks after acquiring its lock.
 Downloads and copies use same-directory temporary files and atomic rename.
 Disk space is checked before transfer using the exact hosted byte count or the
-native conversion plan. Interrupted work leaves no authoritative partial
-artifact. Zero-byte, symlinked, non-regular, digest-mismatched, stale-revision,
-or unsupported candidates never win resolution.
+exact aggregate native source/product plan. Native conversion publishes with
+no-clobber semantics under an exclusive intent, then a durable journal covers
+text, projector, receipts, and pair binding. Retry recovers a crash before
+journal creation and terminal committed or rolled-back journal state.
+Interrupted work leaves no authoritative partial artifact. Zero-byte,
+symlinked, non-regular, digest-mismatched, stale-revision, or unsupported
+candidates never win resolution.
+
+Hub-cache inventory retains the Hub root, model, snapshots, revision, and blob
+directories and descends with no-follow `openat` authorities; replacing any
+public ancestor cannot redirect a scan. Local adoption likewise retains the
+verified text/projector files and canonical destination directories before
+aggregate disk admission. Device identity and available capacity come from
+those descriptors, publication consumes the same authorities, and both an
+already-exact destination and a new destination parent are revalidated before
+the first pair write.
 
 ## Acceptance gates
 
@@ -219,15 +296,18 @@ or unsupported candidates never win resolution.
   failures, and no-output conversion parsing.
 - Pure resolver tests prove exact-quant selection, use/materialization recency,
   local-over-hosted precedence, ambiguity, and nearest-lower hosted fallback.
-- Filesystem tests prove bounded loose discovery, exact digest adoption,
-  same-filesystem hard-link, cross-filesystem copy fallback, atomic sidecars,
+- Filesystem tests prove bounded descriptor-relative discovery, exact digest
+  adoption, independent-inode CoW/copy publication, source-hardlink mutation
+  isolation, clone-unsupported copy fallback, Hub-ancestor replacement
+  exclusion, retained cross-device pair accounting, exact-destination and
+  destination-parent replacement refusal, atomic sidecars,
   conflicting-destination refusal, and interrupted-partial exclusion.
 - Download tests prove immutable metadata revalidation, exact quant, disk
   preflight, full SHA-256, and unique companion selection without payload on
   ambiguous or declined paths.
 - Conversion tests prove setup/live quant precedence, suffix/flag conflict,
-  managed revision output, receipt-backed no-op, and that hosted GGUF never
-  satisfies convert.
+  conditional pair-lock planning, managed revision output, receipt-backed
+  no-op, and that hosted GGUF never satisfies convert.
 - Serve/chat tests prove one shared inventory, owned-chat reuse of serve
   preparation, automatic projector load, text-only warning fallback, and
   explicit-projector fail-closed behavior.
@@ -247,11 +327,13 @@ without weakening integrity. The managed sidecar is additional indexed state,
 not a trust shortcut: source-bound conversion receipts, exact Hub metadata,
 and complete digests remain the authority.
 
-Metadata lookup may be required to adopt a manually downloaded loose artifact.
-That small request is intentional because avoiding payload duplication without
-inventing identity from filenames requires remote immutable evidence. If the
-Hub is unavailable, already-bound artifacts remain usable while unbound loose
-files stay visible but ineligible.
+Metadata lookup may be required to establish the immutable identity of a
+manually downloaded loose artifact. That small request is intentional because
+avoiding payload duplication without inventing identity from filenames
+requires remote revision/size/digest evidence. After identity matches, header
+and runtime compatibility are read from the local file without another range
+request. If the Hub is unavailable, already-bound artifacts remain usable
+while unbound loose files stay visible but ineligible.
 
 ADR-047's explicit diagnostic activation remains supported for remote or
 pre-existing endpoints. This ADR adds the simpler owned-local path; it does not
@@ -259,25 +341,25 @@ weaken multi-model admission, process ownership, or OpenAI compatibility.
 
 ## Validation evidence
 
-The pre-refinement Apple Silicon spike used the immutable Qwen3.8 repository
-revision `0a72776892f98db49381fdf69f4b9982222ec9dc`. A bare repository operand
-selected the newest verified local Q6 artifact, adopted it into the canonical
-managed directory without moving the operator file, retrieved and loaded the
-matching projector, and reached readiness. The managed text and projector
-were hard links to the already-owned exact inodes. `serve list` and `chat
-list` reported the bound Q6 plus the other locally owned unbound quants without
-Hub traffic.
+The pre-refinement Apple Silicon inventory spike used immutable Qwen3.8
+repository revision `0a72776892f98db49381fdf69f4b9982222ec9dc` and established
+that the operator already owned exact Q5, Q6, and Q8 text bytes plus a matching
+projector. It proved the identity/adoption hypothesis and preserved those
+artifacts, but an earlier release-binary chat attempt did not complete a valid
+new runtime proof; this ADR does not count that attempt as acceptance evidence.
 
-That loaded artifact passed the canonical Qwen multi-turn agentic tool/cache
-script and the first-image-after-text vision script. The post-review branch
-adds blocking focused tests for operand parsing, exact/nearest-lower quant
-selection including Q2, local recency, loose-digest disambiguation,
-destination reuse/conflict, receipt-backed pair reuse, direct-path projector
-resolution, concurrent publication, hard-link mutation detection, targeted
-chat authentication/heartbeat, and stale inventory exclusion. Exact final
-commands and release SHA are recorded by the release workflow rather than
-claimed by this ADR before publication. Focused Rust coverage from
-`cargo llvm-cov --locked --bin hf2q --all-features --json --summary-only --
-serve::managed_artifacts::tests::` ran all 18 resolver tests; the directly
-exercised managed-artifact modules reported nonzero line coverage ranging from
-22.81% for inventory formatting to 92.71% for receipt/storage validation.
+The current branch has blocking focused tests for operand parsing,
+setup/exact/live quant precedence, exact/nearest-lower selection including Q2,
+local recency, local-only loose-byte compatibility, bounded hostile GGUF
+parsing, complete Qwen metadata/tokenizer/normal-layer/MTP topology and storage
+admission, canonical hf-hub cache reuse, aggregate source/text/projector disk
+planning, destination reuse/conflict, durable
+pre-journal and journal recovery, receipt-backed pair reuse, direct-path
+projector resolution, exact prepared-projector action consumption, concurrent
+publication, markerless candidate-revision config/projector selection,
+existing-projector hard-link mutation detection,
+independent-inode retained adoption, authenticated sparse native planning,
+retained-listener/private-READY targeted-chat authentication, state-root
+propagation, malformed-config read-only list parity, heartbeat, and stale
+inventory exclusion. Exact final commands, real-model proof, and release SHA
+are recorded only after the immutable release candidate passes those gates.

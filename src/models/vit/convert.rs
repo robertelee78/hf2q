@@ -26,6 +26,99 @@ pub struct VitTensor {
     pub data: Vec<u8>,
 }
 
+/// Metadata-only GGUF tensor layout used for destination planning. Building
+/// this catalog never materializes safetensors payload pages.
+#[derive(Debug, Clone)]
+pub struct VitTensorPlan {
+    pub gguf_name: String,
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+}
+
+fn mapped_vit_name(name: &str) -> Option<String> {
+    hf_vit_name_to_gguf(name).or_else(|| {
+        if let Some(stripped) = name.strip_prefix("model.") {
+            hf_vit_name_to_gguf(stripped)
+        } else {
+            hf_vit_name_to_gguf(&format!("model.{name}"))
+        }
+    })
+}
+
+/// Plan the exact emitted names, shapes, and dtypes from lazy safetensors
+/// metadata. No tensor payload is materialized.
+pub fn plan_vision_tensors(
+    hf_repo_dir: &Path,
+    vision_config: &VisionConfig,
+) -> Result<HashMap<String, VitTensorPlan>, VitConvertError> {
+    let progress = ProgressReporter::new();
+    let tensor_map = safetensors::read_tensors_lazy(hf_repo_dir, &progress)
+        .map_err(|e| VitConvertError::Safetensors(e.to_string()))?;
+    let deepstack_indexes = vision_config
+        .deepstack_visual_indexes
+        .clone()
+        .unwrap_or_default();
+    let mut out = HashMap::new();
+    for (name, lazy) in tensor_map.iter() {
+        if let Some(gguf_name) = hf_qwen3vl_deepstack_to_gguf(name, &deepstack_indexes) {
+            let dtype = if vit_emission_is_f32(&gguf_name) {
+                DType::F32
+            } else {
+                DType::F16
+            };
+            out.insert(
+                gguf_name.clone(),
+                VitTensorPlan {
+                    gguf_name,
+                    shape: lazy.shape().to_vec(),
+                    dtype,
+                },
+            );
+            continue;
+        }
+        let is_patch = (name == "model.visual.patch_embed.proj.weight"
+            || name == "visual.patch_embed.proj.weight")
+            && lazy.shape().len() == 5;
+        if is_patch {
+            let shape = lazy.shape();
+            if shape[2] != 2 {
+                return Err(VitConvertError::Safetensors(format!(
+                    "Qwen vision patch temporal dimension must be 2, got {}",
+                    shape[2]
+                )));
+            }
+            let split_shape = vec![shape[0], shape[1], shape[3], shape[4]];
+            for gguf_name in ["v.patch_embd.weight", "v.patch_embd.weight.1"] {
+                out.insert(
+                    gguf_name.to_owned(),
+                    VitTensorPlan {
+                        gguf_name: gguf_name.to_owned(),
+                        shape: split_shape.clone(),
+                        dtype: DType::F16,
+                    },
+                );
+            }
+            continue;
+        }
+        if let Some(gguf_name) = mapped_vit_name(name) {
+            let dtype = if vit_emission_is_f32(&gguf_name) {
+                DType::F32
+            } else {
+                DType::F16
+            };
+            out.insert(
+                gguf_name.clone(),
+                VitTensorPlan {
+                    gguf_name,
+                    shape: lazy.shape().to_vec(),
+                    dtype,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// Map an HF tensor name to its GGUF mmproj equivalent.
 ///
 /// Returns `None` when the HF name does not belong to the vision path
@@ -409,12 +502,7 @@ pub fn load_vision_tensors(
         let is_qwen3vl_patch_5d = (name == "model.visual.patch_embed.proj.weight"
             || name == "visual.patch_embed.proj.weight")
             && lazy.shape().len() == 5;
-        let is_mapped = hf_vit_name_to_gguf(&name).is_some()
-            || name
-                .strip_prefix("model.")
-                .and_then(hf_vit_name_to_gguf)
-                .is_some()
-            || hf_vit_name_to_gguf(&format!("model.{name}")).is_some();
+        let is_mapped = mapped_vit_name(&name).is_some();
         if !is_deepstack && !is_qwen3vl_patch_5d && !is_mapped {
             continue;
         }
@@ -490,19 +578,7 @@ pub fn load_vision_tensors(
         // (`visual.*`) forms — real Qwen3-VL HF strips the `model.`
         // prefix from the visual tower (mirrors line-4908-4909 in
         // convert_hf_to_gguf.py); synthetic fixtures keep it.
-        let mapped = hf_vit_name_to_gguf(&name).or_else(|| {
-            if let Some(stripped) = name.strip_prefix("model.") {
-                // Re-add the `model.` prefix when calling into
-                // `hf_vit_name_to_gguf` so we don't accidentally
-                // double-strip; instead probe by building back the
-                // full-form variant from a stripped input. The bare
-                // strip path lets `visual.*` sources hit the static
-                // map by re-adding `model.`.
-                hf_vit_name_to_gguf(stripped)
-            } else {
-                hf_vit_name_to_gguf(&format!("model.{name}"))
-            }
-        });
+        let mapped = mapped_vit_name(&name);
 
         if let Some(gguf_name) = mapped {
             // ADR-021 iter-11b: route F32 (norms + biases) through the

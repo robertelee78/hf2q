@@ -45,25 +45,27 @@ use crate::convert::orchestrator::PlanEntry;
 use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
 use crate::convert::receipt::{
     clear_stale_receipt, prepare_success_receipt, promote_success_receipt,
-    require_converter_git_commit, PeakChunkBoundReceipt, ReceiptError, RemoteConversionSource,
+    require_converter_git_commit, stage_success_receipt, PeakChunkBoundReceipt, ReceiptError,
+    RemoteConversionSource,
 };
 use crate::convert::source_reader::{SourceError, TensorMeta};
 use crate::convert::tensor_lineage::{
     apply_qwen35_dense_bake_with_evidence, build_verified_source_to_stored_conversion,
     clear_stale_tensor_conversion_receipt, prepare_tensor_conversion_receipt,
-    promote_tensor_conversion_receipt, verify_complete_conversion_source,
-    verify_open_artifact_identity, verify_promoted_stored_catalog,
-    verify_source_to_stored_continuity, verify_source_weight_artifacts,
-    verify_written_tensor_evidence_file, verify_written_tensor_evidence_open,
-    MaterializedDirectTensorEvidence, MaterializedDirectTensorRecord,
-    VerifiedConversionEvidenceContext, VerifiedSourceToStoredConversion,
+    promote_tensor_conversion_receipt, stage_tensor_conversion_receipt,
+    verify_complete_conversion_source, verify_open_artifact_identity,
+    verify_promoted_stored_catalog, verify_source_to_stored_continuity,
+    verify_source_weight_artifacts, verify_written_tensor_evidence_file,
+    verify_written_tensor_evidence_open, MaterializedDirectTensorEvidence,
+    MaterializedDirectTensorRecord, VerifiedConversionEvidenceContext,
+    VerifiedSourceToStoredConversion,
 };
 use crate::convert::tokenizer::TokenizerError;
 use crate::convert::{
     build_tokenizer_metadata, ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError,
 };
 use crate::core::paired_artifact::{
-    KEY_PAIR_GENERATION, KEY_PAIR_SCHEMA_VERSION, PAIR_METADATA_SCHEMA_VERSION,
+    PairMemberRole, KEY_PAIR_GENERATION, KEY_PAIR_SCHEMA_VERSION, PAIR_METADATA_SCHEMA_VERSION,
 };
 use crate::core::provenance::{KEY_MMPROJ_SHA256, KEY_PRODUCER_VERSION, KEY_SOURCE_SHA256};
 use crate::input::integrity::VerifiedSourceManifest;
@@ -78,6 +80,7 @@ use crate::quantize::ggml_quants::{ArchName, GgufFtype};
 mod paired;
 #[path = "cli_driver/paired_transaction.rs"]
 mod paired_transaction;
+use paired_transaction::PairWorkspace;
 #[path = "cli_driver/stored_evidence.rs"]
 mod stored_evidence;
 #[cfg(test)]
@@ -113,8 +116,12 @@ pub struct ConvertArgs {
     /// Resolved `--quant <name>` selector. Standard ftypes route through
     /// `StandardPolicy`; Apex tiers route through `ApexPolicy`.
     pub selector: QuantSelector,
-    /// Destination GGUF path. Existing files are overwritten.
+    /// Destination GGUF path. Existing files are overwritten only when
+    /// `no_clobber` is false.
     pub output: PathBuf,
+    /// Publish every final artifact with create-if-absent semantics. This is
+    /// mandatory for implicit managed destinations.
+    pub no_clobber: bool,
     /// Report the metadata-only quantization plan and predicted payload size
     /// without materializing source tensors or creating an output file.
     pub dry_run: bool,
@@ -473,6 +480,57 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     paired::run(args)
 }
 
+/// Run the production metadata/quant-policy planning path without opening any
+/// tensor payload or creating an output. The caller supplies an exact remote
+/// identity so GGUF metadata length is byte-identical to the eventual remote
+/// conversion.
+pub(crate) fn plan_standard_text_output_bytes(
+    hf_dir: &Path,
+    ftype: GgufFtype,
+    reference: crate::input::hf_reference::ResolvedHfModelReference,
+    source_sha256: String,
+    paired: bool,
+) -> Result<u64, ConvertError> {
+    let remote_source = RemoteConversionSource::from_planning_identity(reference, source_sha256)?;
+    let projector_sha256 = paired.then(|| "0".repeat(64));
+    let pair_generation = paired.then(|| "00000000-0000-0000-0000-000000000000".to_owned());
+    let outcome = run_convert_internal(
+        ConvertArgs {
+            hf_dir: hf_dir.to_path_buf(),
+            selector: QuantSelector::Standard(ftype),
+            output: hf_dir.join("unused-planning-output.gguf"),
+            no_clobber: true,
+            dry_run: true,
+            imatrix: None,
+            imatrix_corpus: None,
+            imatrix_out: None,
+            imatrix_n_ctx: None,
+            mode: ConvertMode::TextOnly,
+            remote_source: Some(remote_source),
+        },
+        None,
+        PairBinding {
+            projector_sha256: projector_sha256.as_deref(),
+            generation: pair_generation.as_deref(),
+        },
+        false,
+    )?;
+    Ok(outcome.planned_output_bytes)
+}
+
+pub(crate) fn recover_conversion_publication(output: &Path) -> Result<(), ConvertError> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.exists() {
+        return Ok(());
+    }
+    paired_transaction::recover_pending(output).map_err(|error| ConvertError::Pair {
+        detail: format!("recover conversion publication: {error}"),
+    })
+}
+
 struct StoredEvidenceRequest {
     verified_source: VerifiedSourceManifest,
     context: VerifiedConversionEvidenceContext,
@@ -486,11 +544,17 @@ struct PairBinding<'a> {
     generation: Option<&'a str>,
 }
 
+struct ConvertRunOutcome {
+    verified_conversion: Option<VerifiedSourceToStoredConversion>,
+    planned_output_bytes: u64,
+}
+
 fn run_convert_internal(
     args: ConvertArgs,
     evidence_request: Option<StoredEvidenceRequest>,
     pair_binding: PairBinding<'_>,
-) -> Result<Option<VerifiedSourceToStoredConversion>, ConvertError> {
+    emit_dry_run_summary: bool,
+) -> Result<ConvertRunOutcome, ConvertError> {
     // ----- 1. Open source (mmap, metadata-only) ---------------------------
     // Per ADR-033 §"Open Issues / Real-Model Findings" 2026-05-18: the
     // source reader does NOT load every safetensors shard into RAM. It
@@ -552,10 +616,34 @@ fn run_convert_internal(
             });
         }
 
-        clear_stale_conversion_receipts_before_replacement(&args.output)?;
+        ensure_output_parent(&args.output)?;
+        let planned_output_bytes = crate::models::vit::planned_vision_tower_output_bytes(
+            &args.hf_dir,
+            args.remote_source
+                .as_ref()
+                .map(RemoteConversionSource::source_sha256),
+            pair_binding.generation,
+        )?;
+        let preflight_label = args
+            .remote_source
+            .as_ref()
+            .map(|source| source.reference().repo_id())
+            .unwrap_or("local multimodal model");
+        crate::input::hf_download::check_conversion_output_preflight(
+            preflight_label,
+            &args.output,
+            planned_output_bytes,
+        )
+        .map_err(ConvertError::HfDownload)?;
+        if args.no_clobber {
+            ensure_conversion_destinations_absent(&args.output)?;
+        } else {
+            clear_stale_conversion_receipts_before_replacement(&args.output)?;
+        }
+        let temporary_output = create_temporary_output(&args.output)?;
         crate::models::vit::convert_vision_tower_to_path_with_source_and_pair(
             &args.hf_dir,
-            &args.output,
+            temporary_output.path(),
             args.remote_source
                 .as_ref()
                 .map(RemoteConversionSource::source_sha256),
@@ -570,7 +658,7 @@ fn run_convert_internal(
                 ..PeakChunkBoundReceipt::default()
             };
             let prepared = prepare_success_receipt(
-                &args.output,
+                temporary_output.path(),
                 &args.output,
                 remote,
                 &converter_git_commit,
@@ -578,11 +666,34 @@ fn run_convert_internal(
                 excluded_dspark_count,
                 peak,
             )?;
-            promote_success_receipt(prepared)?;
+            if args.no_clobber {
+                ensure_conversion_destinations_absent(&args.output)?;
+                publish_fresh_conversion_transaction(
+                    temporary_output,
+                    &args.output,
+                    Some(prepared),
+                    None,
+                )?;
+            } else {
+                clear_stale_conversion_receipts_before_replacement(&args.output)?;
+                promote_temporary_output(temporary_output, &args.output, false)?;
+                promote_success_receipt(prepared, false)?;
+            }
         } else {
+            if args.no_clobber {
+                ensure_conversion_destinations_absent(&args.output)?;
+            } else {
+                clear_stale_conversion_receipts_before_replacement(&args.output)?;
+            }
+            promote_temporary_output(temporary_output, &args.output, args.no_clobber)?;
+        }
+        if !args.no_clobber && args.remote_source.is_none() {
             clear_conversion_receipt(&args.output)?;
         }
-        return Ok(None);
+        return Ok(ConvertRunOutcome {
+            verified_conversion: None,
+            planned_output_bytes,
+        });
     }
     // `--mmproj` overrides arch routing to the vision-projector sidecar
     // mapper. Mirrors canonical `convert_hf_to_gguf.py:223,229,233` —
@@ -966,28 +1077,47 @@ fn run_convert_internal(
     let plan_entries: Vec<PlanEntry> = plan.steps.iter().map(|s| s.plan_entry()).collect();
     orch.plan_tensors(plan_entries)?;
 
+    let planned_output_bytes = orch.planned_output_bytes()?;
     if args.dry_run {
         let summary = orch.planned_size_summary()?;
-        eprintln!(
-            "hf2q convert dry-run: selector={} tensors={} payload={} bytes ({:.3} GiB) aligned={} bytes ({:.3} GiB)",
-            args.selector.receipt_name(),
-            summary.tensor_count,
-            summary.payload_bytes,
-            summary.payload_bytes as f64 / 1024_f64.powi(3),
-            summary.aligned_payload_bytes,
-            summary.aligned_payload_bytes as f64 / 1024_f64.powi(3),
-        );
-        for entry in summary.by_type {
+        if emit_dry_run_summary {
             eprintln!(
-                "  {:<8} tensors={:<5} payload={} bytes ({:.3} GiB)",
-                entry.ggml_type.name(),
-                entry.tensor_count,
-                entry.payload_bytes,
-                entry.payload_bytes as f64 / 1024_f64.powi(3),
+                "hf2q convert dry-run: selector={} tensors={} payload={} bytes ({:.3} GiB) aligned={} bytes ({:.3} GiB)",
+                args.selector.receipt_name(),
+                summary.tensor_count,
+                summary.payload_bytes,
+                summary.payload_bytes as f64 / 1024_f64.powi(3),
+                summary.aligned_payload_bytes,
+                summary.aligned_payload_bytes as f64 / 1024_f64.powi(3),
             );
+            for entry in summary.by_type {
+                eprintln!(
+                    "  {:<8} tensors={:<5} payload={} bytes ({:.3} GiB)",
+                    entry.ggml_type.name(),
+                    entry.tensor_count,
+                    entry.payload_bytes,
+                    entry.payload_bytes as f64 / 1024_f64.powi(3),
+                );
+            }
         }
-        return Ok(None);
+        return Ok(ConvertRunOutcome {
+            verified_conversion: None,
+            planned_output_bytes,
+        });
     }
+
+    ensure_output_parent(&args.output)?;
+    let preflight_label = args
+        .remote_source
+        .as_ref()
+        .map(|source| source.reference().repo_id())
+        .unwrap_or("local model");
+    crate::input::hf_download::check_conversion_output_preflight(
+        preflight_label,
+        &args.output,
+        planned_output_bytes,
+    )
+    .map_err(ConvertError::HfDownload)?;
 
     let converter_git_commit = if let Some(request) = evidence_request.as_ref() {
         Some(request.converter_git_commit.clone())
@@ -1182,42 +1312,55 @@ fn run_convert_internal(
                 "prepare stored conversion receipt failed: {error}"
             )))
         })?;
-    // Remove older sidecars before replacing the artifact. If either removal
-    // fails, the previous artifact remains untouched; after promotion there
-    // can therefore never be a stale receipt beside new GGUF bytes.
-    clear_stale_conversion_receipts_before_replacement(&args.output)?;
-    promote_temporary_output(temporary_output, &args.output)?;
-    if let Some(catalog) = stored_catalog.as_ref() {
-        if let Err(error) = verify_promoted_stored_catalog(&args.output, catalog) {
-            clear_stale_conversion_receipts_before_replacement(&args.output)?;
-            return Err(ConvertError::Source(SourceError::Safetensors(format!(
-                "promoted GGUF evidence verification failed: {error}"
-            ))));
-        }
-    }
-    if let Some(receipt) = prepared_tensor_receipt {
-        if let Err(error) = promote_tensor_conversion_receipt(receipt) {
-            clear_stale_conversion_receipts_before_replacement(&args.output)?;
-            return Err(ConvertError::Source(SourceError::Safetensors(format!(
-                "promote stored conversion receipt failed: {error}"
-            ))));
-        }
-    }
-    if let Some(receipt) = prepared_receipt {
-        if let Err(error) = promote_success_receipt(receipt) {
-            // The GGUF rename has already succeeded. Remove any older sidecar
-            // so complete new bytes can never be mistaken for the artifact it
-            // described; the caller still receives the promotion failure and
-            // must rerun conversion to obtain a provenance-complete result.
-            clear_stale_conversion_receipts_before_replacement(&args.output)?;
-            return Err(error.into());
+    if args.no_clobber {
+        ensure_conversion_destinations_absent(&args.output)?;
+        publish_fresh_conversion_transaction(
+            temporary_output,
+            &args.output,
+            prepared_receipt,
+            prepared_tensor_receipt,
+        )?;
+        if let Some(catalog) = stored_catalog.as_ref() {
+            if let Err(error) = verify_promoted_stored_catalog(&args.output, catalog) {
+                return Err(ConvertError::Source(SourceError::Safetensors(format!(
+                    "promoted GGUF evidence verification failed: {error}"
+                ))));
+            }
         }
     } else {
-        // A local conversion has no verified remote-source identity. Never
-        // leave a sidecar from an older remote artifact beside new bytes.
-        clear_conversion_receipt(&args.output)?;
+        // Remove older sidecars before replacing the artifact. If either
+        // removal fails, the previous artifact remains untouched.
+        clear_stale_conversion_receipts_before_replacement(&args.output)?;
+        promote_temporary_output(temporary_output, &args.output, false)?;
+        if let Some(catalog) = stored_catalog.as_ref() {
+            if let Err(error) = verify_promoted_stored_catalog(&args.output, catalog) {
+                clear_stale_conversion_receipts_before_replacement(&args.output)?;
+                return Err(ConvertError::Source(SourceError::Safetensors(format!(
+                    "promoted GGUF evidence verification failed: {error}"
+                ))));
+            }
+        }
+        if let Some(receipt) = prepared_tensor_receipt {
+            if let Err(error) = promote_tensor_conversion_receipt(receipt, false) {
+                clear_stale_conversion_receipts_before_replacement(&args.output)?;
+                return Err(ConvertError::Source(SourceError::Safetensors(format!(
+                    "promote stored conversion receipt failed: {error}"
+                ))));
+            }
+        }
+        if let Some(receipt) = prepared_receipt {
+            if let Err(error) = promote_success_receipt(receipt, false) {
+                clear_stale_conversion_receipts_before_replacement(&args.output)?;
+                return Err(error.into());
+            }
+        } else {
+            clear_conversion_receipt(&args.output)?;
+        }
     }
-    Ok(verified_conversion)
+    Ok(ConvertRunOutcome {
+        verified_conversion,
+        planned_output_bytes,
+    })
 }
 
 fn clear_stale_stored_conversion_receipt(output: &Path) -> Result<(), ConvertError> {
@@ -1231,6 +1374,78 @@ fn clear_stale_stored_conversion_receipt(output: &Path) -> Result<(), ConvertErr
 fn clear_stale_conversion_receipts_before_replacement(output: &Path) -> Result<(), ConvertError> {
     clear_conversion_receipt(output)?;
     clear_stale_stored_conversion_receipt(output)
+}
+
+fn ensure_conversion_destinations_absent(output: &Path) -> Result<(), ConvertError> {
+    let paths = [
+        output.to_path_buf(),
+        crate::convert::receipt::receipt_path(output),
+        crate::convert::tensor_lineage::tensor_conversion_receipt_path(output),
+    ];
+    if let Some(path) = paths
+        .iter()
+        .find(|path| std::fs::symlink_metadata(path).is_ok())
+    {
+        return Err(ConvertError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "no-clobber conversion destination exists: {}",
+                path.display()
+            ),
+        )));
+    }
+    Ok(())
+}
+
+fn publish_fresh_conversion_transaction(
+    temporary_output: tempfile::NamedTempFile,
+    output: &Path,
+    success_receipt: Option<crate::convert::receipt::PreparedSuccessReceipt>,
+    tensor_receipt: Option<crate::convert::tensor_lineage::PreparedTensorConversionReceipt>,
+) -> Result<(), ConvertError> {
+    let workspace = PairWorkspace::create(output).map_err(|error| ConvertError::Pair {
+        detail: format!("create conversion publication transaction: {error}"),
+    })?;
+    let result = (|| {
+        temporary_output.as_file().sync_all()?;
+        temporary_output
+            .persist_noclobber(workspace.staged_path(PairMemberRole::Text))
+            .map_err(|error| ConvertError::Io(error.error))?;
+
+        let mut destinations = Vec::new();
+        if let Some(receipt) = success_receipt {
+            stage_success_receipt(receipt, &workspace.staged_path(PairMemberRole::TextReceipt))?;
+            destinations.push((
+                PairMemberRole::TextReceipt,
+                crate::convert::receipt::receipt_path(output),
+            ));
+        }
+        if let Some(receipt) = tensor_receipt {
+            stage_tensor_conversion_receipt(
+                receipt,
+                &workspace.staged_path(PairMemberRole::TextTensorReceipt),
+            )
+            .map_err(|error| {
+                ConvertError::Source(SourceError::Safetensors(format!(
+                    "stage stored conversion receipt failed: {error}"
+                )))
+            })?;
+            destinations.push((
+                PairMemberRole::TextTensorReceipt,
+                crate::convert::tensor_lineage::tensor_conversion_receipt_path(output),
+            ));
+        }
+        destinations.push((PairMemberRole::Text, output.to_path_buf()));
+        workspace
+            .publish_no_clobber(&destinations)
+            .map_err(|error| ConvertError::Pair {
+                detail: format!("publish conversion transaction: {error}"),
+            })
+    })();
+    if result.is_err() {
+        workspace.discard_unpublished();
+    }
+    result
 }
 
 fn clear_conversion_receipt(output: &Path) -> Result<(), ReceiptError> {
@@ -1257,6 +1472,7 @@ fn conversion_model_basename(args: &ConvertArgs) -> Option<String> {
 }
 
 fn create_temporary_output(output: &Path) -> Result<tempfile::NamedTempFile, ConvertError> {
+    ensure_output_parent(output)?;
     let parent = output
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1264,14 +1480,36 @@ fn create_temporary_output(output: &Path) -> Result<tempfile::NamedTempFile, Con
     Ok(tempfile::NamedTempFile::new_in(parent)?)
 }
 
+fn ensure_output_parent(output: &Path) -> Result<(), ConvertError> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    if !std::fs::metadata(parent)?.is_dir() {
+        return Err(ConvertError::Io(std::io::Error::other(format!(
+            "conversion output parent is not a directory: {}",
+            parent.display()
+        ))));
+    }
+    Ok(())
+}
+
 fn promote_temporary_output(
     temporary: tempfile::NamedTempFile,
     output: &Path,
+    no_clobber: bool,
 ) -> Result<(), ConvertError> {
     temporary.as_file().sync_all()?;
-    temporary
-        .persist(output)
-        .map_err(|error| ConvertError::Io(error.error))?;
+    if no_clobber {
+        temporary
+            .persist_noclobber(output)
+            .map_err(|error| ConvertError::Io(error.error))?;
+    } else {
+        temporary
+            .persist(output)
+            .map_err(|error| ConvertError::Io(error.error))?;
+    }
     Ok(())
 }
 
@@ -3051,6 +3289,7 @@ mod tests {
             hf_dir: PathBuf::from(hf_dir),
             selector: QuantSelector::Standard(GgufFtype::MostlyQ8_0),
             output: PathBuf::from("out.gguf"),
+            no_clobber: false,
             dry_run: true,
             imatrix: None,
             imatrix_corpus: None,
@@ -3131,8 +3370,46 @@ mod tests {
 
         let mut complete = create_temporary_output(&output).unwrap();
         complete.write_all(b"complete-new-artifact").unwrap();
-        promote_temporary_output(complete, &output).unwrap();
+        promote_temporary_output(complete, &output, false).unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), b"complete-new-artifact");
+    }
+
+    #[test]
+    fn temporary_conversion_creates_a_fresh_managed_revision_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root
+            .path()
+            .join("owner__model")
+            .join("a".repeat(40))
+            .join("model-hf2q-q4_k_m.gguf");
+        assert!(!output.parent().unwrap().exists());
+        let temporary = create_temporary_output(&output).unwrap();
+        assert!(output.parent().unwrap().is_dir());
+        assert_eq!(temporary.path().parent(), output.parent());
+    }
+
+    #[test]
+    fn no_clobber_promotion_preserves_a_conflict_created_after_precheck() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("managed.gguf");
+        ensure_conversion_destinations_absent(&output).unwrap();
+        let mut temporary = create_temporary_output(&output).unwrap();
+        temporary.write_all(b"hf2q-candidate").unwrap();
+
+        std::fs::write(&output, b"operator-race-winner").unwrap();
+        let error = promote_temporary_output(temporary, &output, true).unwrap_err();
+        assert!(matches!(error, ConvertError::Io(_)));
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            b"operator-race-winner",
+            "create-if-absent promotion must never replace the race winner"
+        );
+
+        std::fs::remove_file(&output).unwrap();
+        let receipt = crate::convert::receipt::receipt_path(&output);
+        std::fs::write(&receipt, b"operator-sidecar").unwrap();
+        assert!(ensure_conversion_destinations_absent(&output).is_err());
+        assert_eq!(std::fs::read(receipt).unwrap(), b"operator-sidecar");
     }
 
     #[test]
@@ -3978,11 +4255,55 @@ mod tests {
         )
         .unwrap();
 
+        let resolved = crate::input::hf_reference::HfModelReference::parse(
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            Some(&"a".repeat(40)),
+        )
+        .unwrap()
+        .resolve(&"a".repeat(40))
+        .unwrap();
+        let expected_plan = plan_standard_text_output_bytes(
+            dir.path(),
+            GgufFtype::MostlyQ2_K_S,
+            resolved.clone(),
+            "b".repeat(64),
+            false,
+        )
+        .unwrap();
+        let sparse = tempfile::tempdir().unwrap();
+        for metadata in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
+            std::fs::copy(dir.path().join(metadata), sparse.path().join(metadata)).unwrap();
+        }
+        let source_safetensors = std::fs::read(dir.path().join("model.safetensors")).unwrap();
+        let header_bytes = u64::from_le_bytes(source_safetensors[..8].try_into().unwrap());
+        let prefix_end = usize::try_from(8 + header_bytes).unwrap();
+        let mut sparse_file =
+            std::fs::File::create(sparse.path().join("model.safetensors")).unwrap();
+        sparse_file
+            .write_all(&source_safetensors[..prefix_end])
+            .unwrap();
+        sparse_file
+            .set_len(source_safetensors.len() as u64)
+            .unwrap();
+        let sparse_plan = plan_standard_text_output_bytes(
+            sparse.path(),
+            GgufFtype::MostlyQ2_K_S,
+            resolved,
+            "b".repeat(64),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            sparse_plan, expected_plan,
+            "authenticated sparse headers must drive the exact production plan"
+        );
+
         let output = dir.path().join("tiny-q2-k-s.gguf");
         run_convert(ConvertArgs {
             hf_dir: dir.path().to_path_buf(),
             selector: QuantSelector::Standard(GgufFtype::MostlyQ2_K_S),
             output: output.clone(),
+            no_clobber: false,
             dry_run: false,
             imatrix: None,
             imatrix_corpus: None,
@@ -3993,6 +4314,7 @@ mod tests {
         })
         .unwrap();
         let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(bytes.len() as u64, expected_plan);
         assert_eq!(&bytes[..4], b"GGUF");
         assert!(bytes
             .windows(b"blk.0.ffn_gate_exps.weight".len())

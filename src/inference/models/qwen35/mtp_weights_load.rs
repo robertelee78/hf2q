@@ -8,7 +8,8 @@ use super::gpu_full_attn::{upload_f32_weight, FullAttnQGateWeightsGpu};
 use super::mtp::{MtpFfnWeightsGpu, MtpFullAttnWeightsGpu, MtpQGateWeightsGpu, MtpWeights};
 use super::weight_loader::{
     dense_ffn_storage, dense_ffn_tensor_types, load_dense_ffn_quantized, load_f32_tensor,
-    load_moe_ffn_quantized, load_native_projection, DenseFfnStorage,
+    load_moe_ffn_quantized, load_native_projection, qwen35_moe_expert_type_supported,
+    validate_native_projection_info, DenseFfnStorage,
 };
 use super::Qwen35Config;
 use crate::serve::forward_mlx_shared::MlxQWeight;
@@ -30,20 +31,10 @@ pub fn load_mtp_weights_if_present_with_shared_head(
     if cfg.mtp_num_hidden_layers == 0 {
         return Ok(None);
     }
-    if cfg.mtp_num_hidden_layers != 1 {
-        bail!(
-            "qwen35 MTP loader supports exactly one nextn layer, got {}",
-            cfg.mtp_num_hidden_layers
-        );
-    }
+    validate_mtp_tensor_topology(gguf, cfg)?;
 
     let layer_index = cfg.num_hidden_layers;
     let loaded_tensor_names = mtp_tensor_names(gguf, layer_index);
-    if loaded_tensor_names.is_empty() {
-        bail!(
-            "qwen35 metadata advertises nextn_predict_layers=1 but no blk.{layer_index}.nextn.* or blk.{layer_index}.* MTP tensors were found"
-        );
-    }
 
     let h = cfg.hidden_size as usize;
     let p = format!("blk.{layer_index}");
@@ -213,6 +204,233 @@ pub fn load_mtp_weights_if_present_with_shared_head(
         attn,
         ffn,
     }))
+}
+
+/// Descriptor-only MTP contract shared by bounded hosted admission and the
+/// production loader. It validates every required tensor name/shape and the
+/// dense-vs-MoE exclusivity/storage relation without touching tensor payloads.
+pub(crate) fn validate_mtp_tensor_topology(gguf: &GgufFile, cfg: &Qwen35Config) -> Result<()> {
+    if cfg.mtp_num_hidden_layers == 0 {
+        return Ok(());
+    }
+    ensure!(
+        cfg.mtp_num_hidden_layers == 1,
+        "qwen35 MTP loader supports exactly one nextn layer, got {}",
+        cfg.mtp_num_hidden_layers
+    );
+    let layer = cfg.num_hidden_layers;
+    ensure!(
+        !mtp_tensor_names(gguf, layer).is_empty(),
+        "qwen35 metadata advertises nextn_predict_layers=1 but no blk.{layer}.nextn.* or blk.{layer}.* MTP tensors were found"
+    );
+    let h = cfg.hidden_size as usize;
+    let q = (cfg.num_attention_heads as usize)
+        .checked_mul(cfg.head_dim as usize)
+        .context("MTP Q projection dimension overflow")?;
+    let kv = (cfg.num_key_value_heads as usize)
+        .checked_mul(cfg.head_dim as usize)
+        .context("MTP KV projection dimension overflow")?;
+    let d = cfg.head_dim as usize;
+    let p = format!("blk.{layer}");
+    let nextn = format!("{p}.nextn");
+    let require_shape = |name: &str, expected: &[usize]| -> Result<()> {
+        let info = gguf
+            .tensor_info(name)
+            .ok_or_else(|| anyhow::anyhow!("required MTP tensor `{name}` is missing"))?;
+        ensure!(
+            info.shape.as_slice() == expected,
+            "MTP tensor `{name}` shape {:?} != {expected:?}",
+            info.shape
+        );
+        Ok(())
+    };
+    for name in [
+        format!("{nextn}.enorm.weight"),
+        format!("{nextn}.hnorm.weight"),
+        format!("{nextn}.shared_head_norm.weight"),
+        format!("{p}.attn_norm.weight"),
+        format!("{p}.post_attention_norm.weight"),
+    ] {
+        require_shape(&name, &[h])?;
+    }
+    let eh_name = format!("{nextn}.eh_proj.weight");
+    let eh_info = gguf
+        .tensor_info(&eh_name)
+        .ok_or_else(|| anyhow::anyhow!("required MTP tensor `{eh_name}` is missing"))?;
+    validate_native_projection_info(&eh_name, eh_info, h, 2 * h)?;
+
+    let embed = format!("{nextn}.embed_tokens.weight");
+    let embedding_rows = match (cfg.mtp_use_dedicated_embeddings, gguf.tensor_info(&embed)) {
+        (true, Some(info)) => {
+            ensure!(
+                info.shape.len() == 2 && info.shape[1] == h,
+                "MTP dedicated embedding tensor `{embed}` shape {:?} is not [vocab,{h}]",
+                info.shape
+            );
+            super::forward_gpu::validate_native_embedding_descriptor(
+                &embed,
+                info.ggml_type,
+                info.shape[0],
+                h,
+                info.byte_len,
+            )?;
+            info.shape[0]
+        }
+        (true, None) => bail!("MTP dedicated embedding tensor `{embed}` is missing"),
+        (false, Some(_)) => {
+            bail!("qwen35 MTP loader: mtp_use_dedicated_embeddings=False but `{embed}` is present")
+        }
+        (false, None) => {
+            gguf.tensor_info("token_embd.weight")
+                .context("MTP shared embedding tensor `token_embd.weight` is missing")?
+                .shape[0]
+        }
+    };
+    let head = format!("{nextn}.shared_head_head.weight");
+    let head_rows = if let Some(info) = gguf.tensor_info(&head) {
+        ensure!(
+            info.shape.len() == 2,
+            "MTP shared head tensor `{head}` is not a matrix"
+        );
+        validate_native_projection_info(&head, info, info.shape[0], h)?;
+        info.shape[0]
+    } else {
+        ensure!(
+            !cfg.mtp_use_dedicated_embeddings,
+            "qwen35 MTP loader: `{head}` is missing while dedicated embeddings are enabled"
+        );
+        let main_head = if gguf.tensor_info("output.weight").is_some() {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        let info = gguf
+            .tensor_info(main_head)
+            .ok_or_else(|| anyhow::anyhow!("MTP shared main head `{main_head}` is missing"))?;
+        ensure!(
+            info.shape.len() == 2,
+            "MTP shared main head `{main_head}` is not a matrix"
+        );
+        validate_native_projection_info(main_head, info, info.shape[0], h)?;
+        info.shape[0]
+    };
+    ensure!(
+        embedding_rows >= head_rows,
+        "MTP embedding rows {embedding_rows} cannot cover selected MTP head rows {head_rows}"
+    );
+
+    for (name, rows, cols) in [
+        (format!("{p}.attn_k.weight"), kv, h),
+        (format!("{p}.attn_v.weight"), kv, h),
+        (format!("{p}.attn_output.weight"), h, q),
+    ] {
+        let info = gguf
+            .tensor_info(&name)
+            .ok_or_else(|| anyhow::anyhow!("required MTP tensor `{name}` is missing"))?;
+        validate_native_projection_info(&name, info, rows, cols)?;
+    }
+    require_shape(&format!("{p}.attn_q_norm.weight"), &[d])?;
+    require_shape(&format!("{p}.attn_k_norm.weight"), &[d])?;
+    let q_name = format!("{p}.attn_q.weight");
+    let q_info = gguf
+        .tensor_info(&q_name)
+        .ok_or_else(|| anyhow::anyhow!("required MTP tensor `{q_name}` is missing"))?;
+    ensure!(
+        q_info.shape.as_slice() == [q, h] || q_info.shape.as_slice() == [2 * q, h],
+        "MTP tensor `{q_name}` shape {:?} is neither [{q},{h}] nor [{},{h}]",
+        q_info.shape,
+        2 * q
+    );
+    validate_native_projection_info(&q_name, q_info, q_info.shape[0], h)?;
+    if q_info.shape.as_slice() == [q, h] {
+        let gate_name = format!("{p}.attn_gate.weight");
+        if let Some(gate_info) = gguf.tensor_info(&gate_name) {
+            validate_native_projection_info(&gate_name, gate_info, q, h)?;
+        }
+    } else {
+        ensure!(
+            gguf.tensor_info(&format!("{p}.attn_gate.weight")).is_none(),
+            "MTP fused Q+gate tensor cannot also have a split attn_gate tensor"
+        );
+    }
+
+    let has_dense = gguf.tensor_info(&format!("{p}.ffn_gate.weight")).is_some();
+    let has_moe = gguf
+        .tensor_info(&format!("{p}.ffn_gate_exps.weight"))
+        .is_some();
+    ensure!(
+        has_dense ^ has_moe,
+        "qwen35 MTP block {layer} must have exactly one dense or MoE FFN layout"
+    );
+    if has_dense {
+        let gate = gguf
+            .tensor_info(&format!("{p}.ffn_gate.weight"))
+            .expect("presence checked above");
+        ensure!(
+            gate.shape.len() == 2 && gate.shape[1] == h,
+            "MTP dense gate shape {:?} is not [intermediate,{h}]",
+            gate.shape
+        );
+        let intermediate = gate.shape[0];
+        require_shape(&format!("{p}.ffn_up.weight"), &[intermediate, h])?;
+        require_shape(&format!("{p}.ffn_down.weight"), &[h, intermediate])?;
+        let (gate_type, up_type, down_type) = dense_ffn_tensor_types(gguf, layer)?;
+        dense_ffn_storage(layer, gate_type, up_type, down_type)?;
+    } else {
+        let moe = cfg
+            .moe
+            .as_ref()
+            .context("MTP MoE tensors require MoE runtime metadata")?;
+        let experts = moe.num_experts as usize;
+        let intermediate = moe.moe_intermediate_size as usize;
+        let shared = moe.shared_expert_intermediate_size as usize;
+        require_shape(&format!("{p}.ffn_gate_inp.weight"), &[experts, h])?;
+        require_shape(
+            &format!("{p}.ffn_gate_exps.weight"),
+            &[experts, intermediate, h],
+        )?;
+        require_shape(
+            &format!("{p}.ffn_up_exps.weight"),
+            &[experts, intermediate, h],
+        )?;
+        require_shape(
+            &format!("{p}.ffn_down_exps.weight"),
+            &[experts, h, intermediate],
+        )?;
+        require_shape(&format!("{p}.ffn_gate_inp_shexp.weight"), &[1, h])?;
+        require_shape(&format!("{p}.ffn_gate_shexp.weight"), &[shared, h])?;
+        require_shape(&format!("{p}.ffn_up_shexp.weight"), &[shared, h])?;
+        require_shape(&format!("{p}.ffn_down_shexp.weight"), &[h, shared])?;
+        let gate_name = format!("{p}.ffn_gate_exps.weight");
+        let up_name = format!("{p}.ffn_up_exps.weight");
+        let down_name = format!("{p}.ffn_down_exps.weight");
+        let gate = gguf
+            .tensor_info(&gate_name)
+            .expect("MTP MoE gate presence checked above");
+        let up = gguf
+            .tensor_info(&up_name)
+            .expect("MTP MoE up shape checked above");
+        let down = gguf
+            .tensor_info(&down_name)
+            .expect("MTP MoE down shape checked above");
+        ensure!(
+            gate.ggml_type == up.ggml_type,
+            "MTP MoE gate/up quant types differ ({:?} vs {:?}); both buffers share one dispatch type",
+            gate.ggml_type,
+            up.ggml_type
+        );
+        ensure!(
+            qwen35_moe_expert_type_supported(gate.ggml_type),
+            "MTP MoE gate/up expert weights use unsupported {:?} storage",
+            gate.ggml_type
+        );
+        ensure!(
+            qwen35_moe_expert_type_supported(down.ggml_type),
+            "MTP MoE down expert weights use unsupported {:?} storage",
+            down.ggml_type
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn mtp_tensor_names(gguf: &GgufFile, layer_index: u32) -> Vec<String> {

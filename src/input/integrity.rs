@@ -139,7 +139,7 @@ pub fn required_weight_shards(local_dir: &Path) -> Result<Vec<String>, Integrity
     Ok(vec!["model.safetensors".to_owned()])
 }
 
-fn required_weight_shards_from_bytes(
+pub(crate) fn required_weight_shards_from_bytes(
     raw: &[u8],
     index_path: &Path,
 ) -> Result<Vec<String>, IntegrityError> {

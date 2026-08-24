@@ -6,9 +6,15 @@ pub(super) fn scan_bindings(
 ) -> Result<Vec<Candidate>> {
     let mut candidates = Vec::new();
     for root in scan_roots(model_dirs)? {
-        visit_files(&root, |path, _| {
+        visit_files(&root, |path, _, mut file| {
             if path.to_string_lossy().ends_with(SIDECAR_SUFFIX) {
-                if let Ok(Some(binding)) = read_binding(path) {
+                if let Ok(Some(bytes)) = file.read_bounded(MAX_SIDECAR_BYTES) {
+                    let Ok(binding) = serde_json::from_slice::<ManagedBinding>(&bytes) else {
+                        return Ok(());
+                    };
+                    if validate_binding(&binding).is_err() {
+                        return Ok(());
+                    }
                     if repository.is_none_or(|expected| expected == binding.repository) {
                         if let Ok(candidate) = candidate_from_binding(
                             binding,
@@ -166,38 +172,22 @@ pub(super) fn projector_authority_from_receipt(
 fn read_conversion_receipt(
     path: &Path,
 ) -> Result<Option<crate::convert::receipt::ConversionReceipt>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata)
-            if metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.len() <= MAX_CONVERSION_RECEIPT_BYTES =>
-        {
-            metadata
-        }
-        _ => return Ok(None),
+    let Some(bytes) = crate::core::bounded_file::read_bounded_regular_nofollow(
+        path,
+        MAX_CONVERSION_RECEIPT_BYTES,
+    )?
+    else {
+        return Ok(None);
     };
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    fs::File::open(path)?
-        .take(MAX_CONVERSION_RECEIPT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
 pub(super) fn read_binding(path: &Path) -> Result<Option<ManagedBinding>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata)
-            if metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.len() <= MAX_SIDECAR_BYTES =>
-        {
-            metadata
-        }
-        _ => return Ok(None),
+    let Some(bytes) =
+        crate::core::bounded_file::read_bounded_regular_nofollow(path, MAX_SIDECAR_BYTES)?
+    else {
+        return Ok(None);
     };
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    fs::File::open(path)?
-        .take(MAX_SIDECAR_BYTES + 1)
-        .read_to_end(&mut bytes)?;
     let binding: ManagedBinding = serde_json::from_slice(&bytes)?;
     validate_binding(&binding)?;
     Ok(Some(binding))
@@ -207,12 +197,46 @@ pub(super) fn write_binding(path: &Path, binding: &ManagedBinding) -> Result<()>
     validate_binding(binding)?;
     let parent = path.parent().context("managed binding has no parent")?;
     fs::create_dir_all(parent)?;
+    let _lock = crate::core::paired_artifact::PairLock::exclusive(path)
+        .context("lock managed binding publication")?;
+    let existing = match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let existing = read_binding(path)?
+                .context("refusing to replace an invalid or non-regular managed binding")?;
+            if !same_binding_authority(&existing, binding) {
+                bail!("refusing to replace a managed binding for different artifact authority");
+            }
+            Some(existing)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer_pretty(&mut temporary, binding)?;
     temporary.write_all(b"\n")?;
     temporary.as_file_mut().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
+    if existing.is_some() {
+        temporary.persist(path).map_err(|error| error.error)?;
+    } else {
+        temporary
+            .persist_noclobber(path)
+            .map_err(|error| error.error)?;
+    }
     Ok(())
+}
+
+fn same_binding_authority(left: &ManagedBinding, right: &ManagedBinding) -> bool {
+    left.schema_version == right.schema_version
+        && left.repository == right.repository
+        && left.revision.eq_ignore_ascii_case(&right.revision)
+        && left.quant.eq_ignore_ascii_case(&right.quant)
+        && left.artifact.local_filename == right.artifact.local_filename
+        && left.artifact.hub_filename == right.artifact.hub_filename
+        && left.artifact.bytes == right.artifact.bytes
+        && left
+            .artifact
+            .sha256
+            .eq_ignore_ascii_case(&right.artifact.sha256)
 }
 
 pub(super) fn validate_binding(binding: &ManagedBinding) -> Result<()> {

@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(
             default,
             root.path().join(format!(
-                "owner__My-Model/{REVISION}/My-Model-hf2q-q4_k_m.gguf"
+                "v2-6f776e65722f4d792d4d6f64656c/{REVISION}/My-Model-hf2q-q4_k_m.gguf"
             ))
         );
         let destination = tempfile::tempdir().unwrap();

@@ -20,7 +20,7 @@ use local::AutomaticEndpointResolver;
 use render::StreamRenderer;
 use wire::{Model, RequestOptions, ThinkingMode};
 
-pub(crate) fn cmd_chat(args: ChatArgs) -> Result<()> {
+pub(crate) fn cmd_chat(args: ChatArgs, state_root: Option<&std::path::Path>) -> Result<()> {
     if args.target.as_deref() == Some("list") {
         return crate::serve::managed_artifacts::print_inventory(&[]);
     }
@@ -32,7 +32,7 @@ pub(crate) fn cmd_chat(args: ChatArgs) -> Result<()> {
             return crate::serve::managed_artifacts::print_inventory(&[]);
         }
     }
-    let mut resolver = AutomaticEndpointResolver;
+    let mut resolver = AutomaticEndpointResolver::new(state_root);
     cmd_chat_with_resolver(args, &mut resolver)
 }
 
@@ -535,7 +535,7 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log)
+        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log, None)
             .expect("verified isolated child");
         let mut session = EndpointSession::spawned_loopback(9, process);
 
@@ -595,7 +595,7 @@ mod tests {
             .spawn()
             .unwrap();
         let child_pid = child.id() as libc::pid_t;
-        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log)
+        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log, None)
             .expect("verified isolated child");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -152,13 +152,32 @@ impl std::fmt::Display for QuantType {
 pub fn quant_type_from_gguf_path(path: &Path) -> Result<QuantType> {
     let gguf = mlx_native::gguf::GgufFile::open(path)
         .with_context(|| format!("open GGUF header for pool identity: {}", path.display()))?;
+    quant_type_from_gguf(&gguf, &path.display().to_string())
+}
+
+pub(crate) fn quant_type_from_gguf_file(
+    file: std::fs::File,
+    display_path: &Path,
+) -> Result<QuantType> {
+    let gguf = mlx_native::gguf::GgufFile::from_file(file).with_context(|| {
+        format!(
+            "open retained GGUF header for pool identity: {}",
+            display_path.display()
+        )
+    })?;
+    quant_type_from_gguf(&gguf, &display_path.display().to_string())
+}
+
+fn quant_type_from_gguf(
+    gguf: &mlx_native::gguf::GgufFile,
+    display_path: &str,
+) -> Result<QuantType> {
     let file_type = gguf
         .metadata_u32("general.file_type")
-        .ok_or_else(|| anyhow!("GGUF {} has no general.file_type", path.display()))?;
+        .ok_or_else(|| anyhow!("GGUF {display_path} has no general.file_type"))?;
     QuantType::from_gguf_file_type(file_type).ok_or_else(|| {
         anyhow!(
-            "GGUF {} uses unsupported general.file_type {} for pool identity",
-            path.display(),
+            "GGUF {display_path} uses unsupported general.file_type {} for pool identity",
             file_type
         )
     })

@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.88+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | hf2q 0.1.14 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.14` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | hf2q 0.1.15 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.15` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
@@ -284,10 +284,10 @@ hf2q serve list                    # `hf2q chat list` is identical
 # download that hosted quant into the managed XDG data directory.
 hf2q serve owner/repository:Q4_K_M
 
-# No quant: use the most recently used compatible local artifact. With no
-# local candidate, choose the setup/live hardware recommendation and nearest
-# lower hosted tier. Native source conversion is the final fallback only when
-# the repository has no supported hosted GGUF.
+# No quant: use the most recently used compatible local artifact, otherwise
+# the newest compatible local artifact. Only with no local candidate, choose
+# the setup/live hardware recommendation and nearest lower hosted tier. Native
+# source conversion is the final fallback when no admitted hosted GGUF exists.
 hf2q serve owner/repository
 
 # Chat uses the same preparation path and owns the server it starts.
@@ -313,6 +313,11 @@ Hosted GGUF bytes never satisfy `convert`; it always runs the Rust-native
 source conversion path. A matching schema-v3 hf2q conversion receipt makes a
 repeat invocation an integrity-verified no-op.
 
+The v0.1.15 hosted fast path has a closed tensor-layout admission contract for
+Qwen3.5/Qwen3.8 GGUF architecture identifiers. Other supported source
+families automatically take the native conversion fallback until their hosted
+GGUF layouts have an equally complete admission contract.
+
 The `hf2q convert` pipeline reads a Hugging Face model directory
 (`config.json` + safetensors + tokenizer assets) and emits a text GGUF that
 loads in the stock peer engine and in `hf2q serve`. Supported multimodal
@@ -325,11 +330,15 @@ inventory, and writes a schema-v3 conversion receipt. It never invokes Python,
 `hf`, or `huggingface-cli`.
 
 At serve time, Qwen3.5/Qwen3.6 reads its tokenizer and chat template from
-the GGUF metadata; a sibling `tokenizer.json` is not required. Vision uses a
-separate projector GGUF. Compatible externally produced text/projector pairs
-are accepted from standard architecture, multimodal-token, profile, width,
-tensor, and forward-warmup checks. When exact source or artifact hashes are
-present, hf2q additionally requires those identities to match.
+the GGUF metadata; a sibling `config.json` or `tokenizer.json` is not required
+or copied into the managed directory. Exact-revision Hub `config.json`
+inspection is only an optional bounded multimodal marker lookup for source
+repositories whose GGUF lacks a marker; the GGUF remains serving authority.
+Vision uses a separate projector GGUF. Compatible externally produced
+text/projector pairs are accepted from standard architecture,
+multimodal-token, profile, width, tensor, and forward-warmup checks. When exact
+source or artifact hashes are present, hf2q additionally requires those
+identities to match.
 
 When `serve --mmproj` successfully binds that projector to the loaded chat
 model, `/v1/models` advertises `input_modalities: ["text", "image"]` and the
@@ -697,7 +706,7 @@ are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/adr/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.14 serving release
+#### Test the 0.1.15 serving release
 
 Build and verify the exact checkout before loading a model:
 

@@ -1,5 +1,213 @@
 use super::*;
 
+pub(super) enum PreparedProjectorSource {
+    Existing(crate::core::bounded_file::StableRegularFile),
+    Local(inventory::ExactLooseFile),
+    Hosted,
+}
+
+pub(super) struct PreparedProjector {
+    pub(super) artifact: HubGgufArtifact,
+    pub(super) destination: PathBuf,
+    pub(super) source: PreparedProjectorSource,
+    destination_parent: Option<crate::core::bounded_file::StableDirectory>,
+    destination_name: std::ffi::OsString,
+}
+
+pub(super) fn prepare_projector_action(
+    artifact: HubGgufArtifact,
+    destination: PathBuf,
+    model_dirs: &[PathBuf],
+) -> Result<PreparedProjector> {
+    let source =
+        if verify_or_refuse_existing_destination(&destination, artifact.bytes, &artifact.sha256)? {
+            let mut retained = crate::core::bounded_file::StableRegularFile::open_exact(
+                &destination,
+                artifact.bytes,
+            )?
+            .context("exact projector destination changed after planning")?;
+            if !retained
+                .sha256()?
+                .is_some_and(|digest| digest.eq_ignore_ascii_case(&artifact.sha256))
+            {
+                bail!("exact projector destination changed after planning");
+            }
+            PreparedProjectorSource::Existing(retained)
+        } else if let Some(local) = retain_cached_projector(&artifact)? {
+            PreparedProjectorSource::Local(local)
+        } else if let Some(local) = find_matching_loose(&artifact, model_dirs)? {
+            PreparedProjectorSource::Local(local)
+        } else {
+            PreparedProjectorSource::Hosted
+        };
+    let destination_name = destination
+        .file_name()
+        .context("projector destination has no filename")?
+        .to_os_string();
+    let destination_parent = if matches!(source, PreparedProjectorSource::Existing(_)) {
+        None
+    } else {
+        Some(crate::core::bounded_file::StableDirectory::create_and_open(
+            destination
+                .parent()
+                .context("projector destination has no parent")?,
+        )?)
+    };
+    Ok(PreparedProjector {
+        artifact,
+        destination,
+        source,
+        destination_parent,
+        destination_name,
+    })
+}
+
+impl PreparedProjector {
+    pub(super) fn source_device_id(&self) -> Option<u64> {
+        match &self.source {
+            PreparedProjectorSource::Local(source) => Some(source.retained.device_id()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn destination_device_id(&self) -> Option<u64> {
+        match (&self.source, &self.destination_parent) {
+            (PreparedProjectorSource::Existing(retained), _) => Some(retained.device_id()),
+            (_, Some(destination)) => Some(destination.device_id()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn destination_available_bytes(&self) -> Option<u64> {
+        self.destination_parent
+            .as_ref()
+            .and_then(|destination| destination.available_bytes())
+    }
+
+    pub(super) fn destination_is_exact(&self) -> bool {
+        matches!(self.source, PreparedProjectorSource::Existing(_))
+    }
+
+    pub(super) fn is_current(&self) -> Result<bool> {
+        let source_current = match &self.source {
+            PreparedProjectorSource::Existing(retained) => retained.is_stable()?,
+            PreparedProjectorSource::Local(source) => source.retained.is_stable()?,
+            PreparedProjectorSource::Hosted => true,
+        };
+        Ok(source_current
+            && self
+                .destination_parent
+                .as_ref()
+                .map_or(Ok(true), |destination| destination.is_current())?)
+    }
+}
+
+fn retain_cached_projector(
+    artifact: &HubGgufArtifact,
+) -> Result<Option<inventory::ExactLooseFile>> {
+    let Some(snapshot_path) = cached_hub_gguf_path(artifact) else {
+        return Ok(None);
+    };
+    retain_cached_projector_at(artifact, &snapshot_path).map(Some)
+}
+
+pub(super) fn retain_cached_projector_at(
+    artifact: &HubGgufArtifact,
+    snapshot_path: &Path,
+) -> Result<inventory::ExactLooseFile> {
+    let revision_dir = snapshot_path
+        .ancestors()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(&artifact.revision))
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "snapshots")
+        })
+        .context("cached projector is outside an exact-revision snapshot")?;
+    let repository_cache = revision_dir
+        .parent()
+        .and_then(Path::parent)
+        .context("cached projector snapshot has no repository cache root")?;
+    let blob_root = repository_cache
+        .join("blobs")
+        .canonicalize()
+        .context("cached projector repository has no canonical blob root")?;
+    let canonical = snapshot_path
+        .canonicalize()
+        .context("resolve exact cached projector blob")?;
+    if !canonical.starts_with(&blob_root) || canonical == blob_root {
+        bail!(
+            "cached projector snapshot escapes its repository blob store: {}",
+            snapshot_path.display()
+        );
+    }
+    let mut retained =
+        crate::core::bounded_file::StableRegularFile::open_exact(&canonical, artifact.bytes)?
+            .context("exact Hub-cache projector changed before planning")?;
+    let digest = retained
+        .sha256()?
+        .context("exact Hub-cache projector changed while hashing")?;
+    if !digest.eq_ignore_ascii_case(&artifact.sha256) {
+        bail!(
+            "exact Hub-cache projector failed SHA-256 verification: {}",
+            snapshot_path.display()
+        );
+    }
+    Ok(inventory::ExactLooseFile {
+        path: canonical,
+        retained,
+    })
+}
+
+pub(super) fn materialize_prepared_projector(
+    plan: PreparedProjector,
+    candidate: &mut Candidate,
+    warnings: &mut Vec<String>,
+) -> Result<PathBuf> {
+    if !plan.is_current()? {
+        bail!("prepared projector authority changed before activation");
+    }
+    match plan.source {
+        PreparedProjectorSource::Existing(retained) => {
+            if !retained.is_stable()? {
+                bail!("exact projector destination changed before activation");
+            }
+        }
+        PreparedProjectorSource::Local(source) => materialize::materialize_retained_exact_at(
+            source.retained,
+            plan.destination_parent
+                .context("prepared local projector has no destination authority")?,
+            &plan.destination_name,
+            &plan.artifact.repository,
+            plan.artifact.bytes,
+            &plan.artifact.sha256,
+        )?,
+        PreparedProjectorSource::Hosted => {
+            let source = download_hub_companion(&plan.artifact)?;
+            materialize::materialize_preverified_exact_at(
+                &source,
+                plan.destination_parent
+                    .context("prepared hosted projector has no destination authority")?,
+                &plan.destination_name,
+                &plan.artifact.repository,
+                plan.artifact.bytes,
+                &plan.artifact.sha256,
+            )?;
+        }
+    }
+    candidate.projector = Some((
+        plan.destination.clone(),
+        plan.artifact.bytes,
+        plan.artifact.sha256.clone(),
+    ));
+    persist_candidate_projector(candidate, &plan.destination, &plan.artifact, warnings);
+    Ok(plan.destination)
+}
+
+#[cfg(test)]
 pub(super) fn resolve_projector(
     candidate: &mut Candidate,
     model_dirs: &[PathBuf],
@@ -18,7 +226,11 @@ pub(super) fn resolve_projector(
     let reference = HfModelReference::parse(&candidate.repository, Some(&candidate.revision))?;
     match resolve_hub_gguf_catalog(reference) {
         Ok(catalog) => Ok(best_effort_projector_with_catalog(
-            candidate, model_dirs, &catalog, warnings,
+            candidate,
+            model_dirs,
+            &catalog,
+            catalog.requires_projector,
+            warnings,
         )),
         Err(error) => {
             warnings.push(format!(
@@ -33,9 +245,16 @@ pub(super) fn best_effort_projector_with_catalog(
     candidate: &mut Candidate,
     model_dirs: &[PathBuf],
     catalog: &HubGgufCatalog,
+    repository_requires_projector: bool,
     warnings: &mut Vec<String>,
 ) -> Option<PathBuf> {
-    match resolve_projector_with_catalog(candidate, model_dirs, catalog, warnings) {
+    match resolve_projector_with_catalog_requirement(
+        candidate,
+        model_dirs,
+        catalog,
+        repository_requires_projector,
+        warnings,
+    ) {
         Ok(path) => path,
         Err(error) => {
             warnings.push(format!(
@@ -46,13 +265,30 @@ pub(super) fn best_effort_projector_with_catalog(
     }
 }
 
-fn resolve_projector_with_catalog(
+#[cfg(test)]
+pub(super) fn resolve_projector_with_catalog(
     candidate: &mut Candidate,
     model_dirs: &[PathBuf],
     catalog: &HubGgufCatalog,
     warnings: &mut Vec<String>,
 ) -> Result<Option<PathBuf>> {
-    if !text_requires_projector(&candidate.path)? {
+    resolve_projector_with_catalog_requirement(
+        candidate,
+        model_dirs,
+        catalog,
+        catalog.requires_projector,
+        warnings,
+    )
+}
+
+fn resolve_projector_with_catalog_requirement(
+    candidate: &mut Candidate,
+    model_dirs: &[PathBuf],
+    catalog: &HubGgufCatalog,
+    repository_requires_projector: bool,
+    warnings: &mut Vec<String>,
+) -> Result<Option<PathBuf>> {
+    if !repository_requires_projector && !text_requires_projector(&candidate.path)? {
         return Ok(None);
     }
     if let Some(path) = verify_candidate_projector(candidate)? {
@@ -81,14 +317,25 @@ fn resolve_projector_with_catalog(
     let destination = parent.join(safe_basename(&artifact.filename)?);
     if !verify_or_refuse_existing_destination(&destination, artifact.bytes, &artifact.sha256)? {
         let source = match find_matching_loose(&artifact, model_dirs)? {
-            Some(path) => path,
+            Some(source) => source,
             None => {
                 check_hub_artifact_plan(&artifact, &destination)?;
-                download_hub_companion(&artifact)?
+                let path = download_hub_companion(&artifact)?;
+                materialize_preverified_exact(
+                    &path,
+                    &destination,
+                    &artifact.repository,
+                    artifact.bytes,
+                    &artifact.sha256,
+                )?;
+                candidate.projector =
+                    Some((destination.clone(), artifact.bytes, artifact.sha256.clone()));
+                persist_candidate_projector(candidate, &destination, &artifact, warnings);
+                return Ok(Some(destination));
             }
         };
-        materialize_preverified_exact(
-            &source,
+        materialize_retained_exact(
+            source.retained,
             &destination,
             &artifact.repository,
             artifact.bytes,
@@ -96,7 +343,20 @@ fn resolve_projector_with_catalog(
         )?;
     }
     candidate.projector = Some((destination.clone(), artifact.bytes, artifact.sha256.clone()));
-    if let Some(sidecar) = candidate.sidecar.as_ref() {
+    persist_candidate_projector(candidate, &destination, &artifact, warnings);
+    Ok(Some(destination))
+}
+
+fn persist_candidate_projector(
+    candidate: &Candidate,
+    destination: &Path,
+    artifact: &HubGgufArtifact,
+    warnings: &mut Vec<String>,
+) {
+    let Some(sidecar) = candidate.sidecar.as_ref() else {
+        return;
+    };
+    let persist = || -> Result<()> {
         let mut binding = read_binding(sidecar)?.context("managed text binding disappeared")?;
         binding.projector = Some(ArtifactBinding {
             local_filename: destination
@@ -104,13 +364,17 @@ fn resolve_projector_with_catalog(
                 .and_then(|name| name.to_str())
                 .context("mmproj filename is not UTF-8")?
                 .to_owned(),
-            hub_filename: artifact.filename,
+            hub_filename: artifact.filename.clone(),
             bytes: artifact.bytes,
-            sha256: artifact.sha256,
+            sha256: artifact.sha256.clone(),
         });
-        write_binding(sidecar, &binding)?;
+        write_binding(sidecar, &binding)
+    };
+    if let Err(error) = persist() {
+        warnings.push(format!(
+            "verified mmproj will be loaded, but its use history could not be persisted: {error}"
+        ));
     }
-    Ok(Some(destination))
 }
 
 pub(super) fn select_projector_companion(
