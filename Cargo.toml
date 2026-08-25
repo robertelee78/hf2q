@@ -1,6 +1,6 @@
 [package]
 name = "hf2q"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 rust-version = "1.88.0"
 build = "src/build_script.rs"
@@ -36,6 +36,7 @@ exclude = [
     "!tests/completions.rs",
     "!tests/continuous_batching_throughput.rs",
     "!tests/convert_integration.rs",
+    "!tests/distribution_cli.rs",
     "!tests/frictionless_cli.rs",
     "!tests/info_integration.rs",
     "!tests/lcp_partial_prefill_byte_identity.rs",
@@ -249,6 +250,18 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # `futures` is a runtime dep but only re-exports a subset; `futures-util` is
 # the canonical home for `StreamExt::next`.
 futures-util = "0.3"
+# `tests/build_script_contract.rs` imports the build script as a normal test
+# module, so its exact-logo compiler dependency must also be visible there.
+resvg = { version = "=0.47.0", default-features = false }
+
+[build-dependencies]
+# ADR-051 compiles the exact hf2q.us SVG into deterministic native-protocol
+# and ANSI raster assets. Keeping resvg out of the runtime path avoids adding
+# logo rendering latency to every interactive hf2q invocation. The logo has
+# paths only, so text/fonts and embedded raster formats remain disabled. 0.47
+# supports the crate's Rust 1.88 floor (0.48 requires 1.89).
+resvg = { version = "=0.47.0", default-features = false }
+base64 = "0.22"
 
 # ADR-008: vendored candle patches removed (candle no longer used for inference).
 

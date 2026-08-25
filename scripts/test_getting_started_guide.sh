@@ -41,7 +41,7 @@ require_literal "$guide" "hf2q serve list"
 require_literal "$guide" "hf2q chat list"
 require_literal "$guide" "resolves the repository to one immutable"
 require_literal "$guide" "loads it automatically"
-require_literal "$guide" '<owner>__<repo>/<commit>/'
+require_literal "$guide" 'v2-<hex(owner/repo)>/<commit>/'
 # Generation is proven by a real client conversation, not by /readyz alone.
 require_literal "$guide" "hf2q chat"
 # Multimodal is served and proven with one simple image request.

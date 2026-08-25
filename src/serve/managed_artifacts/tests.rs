@@ -37,8 +37,57 @@ fn write_quant_gguf_with_metadata(path: &Path, file_type: u32, strings: &[(&str,
         gguf.extend_from_slice(&8_u32.to_le_bytes());
         write_string(&mut gguf, value);
     }
-    gguf.resize(256, 0);
+    let padded = ((gguf.len().max(256) + 31) / 32) * 32;
+    gguf.resize(padded, 0);
     fs::write(path, gguf).unwrap();
+}
+
+fn write_structurally_valid_mmproj(path: &Path) {
+    use crate::ir::DType;
+    use crate::models::vit::convert::VitTensor;
+    use crate::models::vit::VisionConfig;
+    use std::collections::HashMap;
+
+    let config = VisionConfig {
+        hidden_size: 4,
+        num_hidden_layers: 1,
+        num_attention_heads: 1,
+        patch_size: 2,
+        image_size: 4,
+        intermediate_size: 8,
+        layer_norm_eps: 1e-5,
+        projector_type: "mlp".into(),
+        projection_dim: Some(4),
+        image_mean: [0.5; 3],
+        image_std: [0.5; 3],
+        image_min_pixels: None,
+        image_max_pixels: None,
+        spatial_merge_size: None,
+        deepstack_visual_indexes: None,
+        temporal_patch_size: None,
+    };
+    let mut tensors = HashMap::new();
+    for name in [
+        "v.patch_embd.weight",
+        "v.position_embd.weight",
+        "v.blk.0.attn_q.weight",
+        "v.blk.0.attn_k.weight",
+        "v.blk.0.attn_v.weight",
+        "v.blk.0.attn_out.weight",
+        "v.blk.0.attn_norm.weight",
+        "mm.0.weight",
+    ] {
+        tensors.insert(
+            name.to_owned(),
+            VitTensor {
+                gguf_name: name.to_owned(),
+                shape: vec![1],
+                dtype: DType::F16,
+                data: vec![0_u8; 2],
+            },
+        );
+    }
+    crate::models::vit::gguf_emit::write_mmproj_gguf(path, &config, &tensors).unwrap();
 }
 
 fn conversion_receipt(
@@ -398,6 +447,1761 @@ fn local_qwen_tensor_layout_admission_matches_runtime_role_support() {
 }
 
 #[test]
+fn production_manual_structural_admission_never_hashes_the_text_payload() {
+    use std::os::unix::fs::symlink;
+
+    let library = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    let text = model.path().join("APEX-Q4_K_M.gguf");
+    let bytes = crate::input::hf_download::tests::write_complete_qwen_test_gguf(&text);
+    symlink(model.path(), library.path().join("qwen3.6")).unwrap();
+
+    // A deliberately incorrect catalog digest proves that the interactive
+    // structural-admission path neither computes nor compares full SHA-256.
+    // Publication through explicit --output retains the exact-digest gate.
+    let mut artifact = hosted(QuantType::Q4_K_M, "gguf/APEX-Q4_K_M.gguf");
+    artifact.bytes = bytes;
+    artifact.sha256 = "0".repeat(64);
+    let mut warnings = Vec::new();
+    let mut events = Vec::new();
+    let selected = find_best_matching_loose_with_progress(
+        &[artifact],
+        Some(QuantType::Q4_K_M),
+        &[library.path().to_path_buf()],
+        &[],
+        &mut warnings,
+        &mut |event| events.push(event),
+    )
+    .unwrap()
+    .expect("compatible GGUF under a direct model-directory link must be reused");
+
+    assert_eq!(selected.path, text.canonicalize().unwrap());
+    assert_eq!(selected.artifact.sha256, "0".repeat(64));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StartupEvent::LocalCandidate {
+            origin: StartupOrigin::ManualStructuralMatch,
+            ..
+        }
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        StartupEvent::VerifyStart { .. } | StartupEvent::VerifyProgress { .. }
+    )));
+}
+
+#[test]
+fn production_structural_admission_rejects_same_quant_size_ambiguity_even_on_filename_match() {
+    let directory = tempfile::tempdir().unwrap();
+    let local = directory.path().join("preferred-q4_k_m.gguf");
+    let bytes = crate::input::hf_download::tests::write_complete_qwen_test_gguf(&local);
+    let mut preferred = hosted(QuantType::Q4_K_M, "preferred-q4_k_m.gguf");
+    preferred.bytes = bytes;
+    let mut other = hosted(QuantType::Q4_K_M, "other-q4_k_m.gguf");
+    other.bytes = bytes;
+    other.sha256 = "c".repeat(64);
+
+    let mut warnings = Vec::new();
+    let selected = find_best_matching_loose_with_progress(
+        &[preferred, other],
+        Some(QuantType::Q4_K_M),
+        &[directory.path().to_path_buf()],
+        &[],
+        &mut warnings,
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert!(selected.is_none());
+    assert!(warnings.iter().any(|warning| {
+        warning.contains("structurally ambiguous")
+            && warning.contains("filenames are hints, not identity authority")
+    }));
+}
+
+#[test]
+fn malformed_projector_binding_is_a_warning_and_text_only_fallback() {
+    let directory = tempfile::tempdir().unwrap();
+    let text = directory.path().join("model-q4_k_m.gguf");
+    write_quant_gguf_with_metadata(
+        &text,
+        15,
+        &[
+            ("general.architecture", "qwen3vl"),
+            ("hf2q.mmproj_sha256", "not-a-sha256"),
+        ],
+    );
+    let candidate = Candidate {
+        repository: "owner/model".into(),
+        revision: "a".repeat(40),
+        root: directory.path().to_path_buf(),
+        bytes: fs::metadata(&text).unwrap().len(),
+        sha256: "0".repeat(64),
+        path: text.clone(),
+        quant: QuantType::Q4_K_M,
+        origin: "manual_structural".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 0,
+        projector: None,
+        sidecar: None,
+        receipt_target_identity: None,
+    };
+    let mut candidate = candidate;
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: "owner/model".into(),
+        revision: "a".repeat(40),
+        requires_projector: true,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: vec![],
+    };
+    let mut warnings = Vec::new();
+    let resolved = best_effort_projector_with_catalog(
+        &mut candidate,
+        &[directory.path().to_path_buf()],
+        &catalog,
+        true,
+        &mut warnings,
+    );
+
+    assert!(resolved.is_none());
+    assert!(warnings.iter().any(|warning| {
+        warning.contains("automatic mmproj preparation failed")
+            && warning.contains("hf2q.mmproj_sha256 must be exactly 64 hexadecimal characters")
+    }));
+}
+
+#[test]
+fn in_place_markerless_structural_match_prepares_exact_catalog_projector() {
+    use std::os::unix::fs::symlink;
+
+    let library = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    let companions = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let text = model.path().join("APEX-Q4_K_M.gguf");
+    let text_bytes = crate::input::hf_download::tests::write_complete_qwen_test_gguf(&text);
+    symlink(model.path(), library.path().join("qwen3.6")).unwrap();
+
+    let projector_source = companions.path().join("operator-mmproj.gguf");
+    fs::write(&projector_source, b"exact projector fixture").unwrap();
+    let projector_bytes = fs::metadata(&projector_source).unwrap().len();
+    let projector_sha = crate::core::sha256::compute_file_sha256(&projector_source).unwrap();
+    let revision = "a".repeat(40);
+    let text_artifact = HubGgufArtifact {
+        repository: "owner/model".into(),
+        revision: revision.clone(),
+        filename: "gguf/APEX-Q4_K_M.gguf".into(),
+        bytes: text_bytes,
+        // Text serving is structural, so this intentionally need not match.
+        sha256: "0".repeat(64),
+        quant_hint: Some("Q4_K_M".into()),
+        role: "text_model".into(),
+        selectable: true,
+        unavailable_reason: None,
+    };
+    let projector_artifact = HubGgufArtifact {
+        repository: "owner/model".into(),
+        revision: revision.clone(),
+        filename: "gguf/mmproj-qwen36-F16.gguf".into(),
+        bytes: projector_bytes,
+        sha256: projector_sha,
+        quant_hint: None,
+        role: "companion".into(),
+        selectable: false,
+        unavailable_reason: Some("vision projector companion; not a text model".into()),
+    };
+    let expected_projector_sha = projector_artifact.sha256.clone();
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: "owner/model".into(),
+        revision,
+        requires_projector: true,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: vec![text_artifact, projector_artifact],
+    };
+    let hardware = HardwareProfile {
+        chip_model: "test-host".into(),
+        total_memory_bytes: 128 << 30,
+        available_memory_bytes: 64 << 30,
+        performance_cores: 1,
+        efficiency_cores: 1,
+        total_cores: 2,
+        memory_bandwidth_gbs: 1.0,
+    };
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    let mut events = Vec::new();
+    let mut catalog = Some(catalog);
+    let resolved = resolve_repository_with_progress_and_catalog(
+        &RepositoryModelSpec {
+            repository: "owner/model".into(),
+            quant: Some(QuantType::Q4_K_M),
+        },
+        None,
+        &[
+            library.path().to_path_buf(),
+            companions.path().to_path_buf(),
+        ],
+        &mut cache,
+        &hardware,
+        true,
+        None,
+        &mut |event| events.push(event),
+        |_| Ok(catalog.take().expect("catalog resolver is called once")),
+    )
+    .unwrap();
+
+    assert_eq!(resolved.gguf_path, text.canonicalize().unwrap());
+    let prepared_projector = model.path().join("mmproj-qwen36-F16.gguf");
+    assert_eq!(
+        resolved.mmproj_path.as_deref(),
+        Some(prepared_projector.canonicalize().unwrap().as_path())
+    );
+    assert_eq!(
+        fs::read(prepared_projector).unwrap(),
+        b"exact projector fixture"
+    );
+    assert!(!resolved.track_success_history);
+    assert!(resolved.activation_authority.is_some());
+    assert_eq!(
+        resolved.mmproj_sha256.as_deref(),
+        Some(expected_projector_sha.as_str())
+    );
+    assert!(resolved.mmproj_activation_authority.is_some());
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StartupEvent::ProjectorPrepare { filename, bytes }
+            if filename == "mmproj-qwen36-F16.gguf" && *bytes == projector_bytes
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        StartupEvent::VerifyStart { artifact, .. } if artifact == "text GGUF"
+    )));
+}
+
+#[test]
+fn fresh_hosted_projector_snapshot_is_retained_from_its_exact_blob() {
+    use sha2::Digest;
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let text = directory.path().join("model-q4_k_m.gguf");
+    write_quant_gguf_with_metadata(&text, 15, &[("general.architecture", "qwen3vl")]);
+    let revision = "a".repeat(40);
+    let projector_bytes = b"fresh hosted projector";
+    let projector_sha = hex::encode(sha2::Sha256::digest(projector_bytes));
+    let repository_cache = directory.path().join("models--owner--model");
+    let blob = repository_cache.join("blobs").join(&projector_sha);
+    let snapshot = repository_cache
+        .join("snapshots")
+        .join(&revision)
+        .join("gguf")
+        .join("mmproj-model-f16.gguf");
+    fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+    fs::write(&blob, projector_bytes).unwrap();
+    symlink(Path::new("../../../blobs").join(&projector_sha), &snapshot).unwrap();
+
+    let mut candidate = Candidate {
+        repository: "owner/model".into(),
+        revision: revision.clone(),
+        root: directory.path().to_path_buf(),
+        bytes: fs::metadata(&text).unwrap().len(),
+        sha256: "0".repeat(64),
+        path: text.clone(),
+        quant: QuantType::Q4_K_M,
+        origin: "hf_hub_cache_structural".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 0,
+        projector: None,
+        sidecar: None,
+        receipt_target_identity: None,
+    };
+    let text_authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &text,
+        fs::metadata(&text).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: "owner/model".into(),
+        revision: revision.clone(),
+        requires_projector: true,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: vec![HubGgufArtifact {
+            repository: "owner/model".into(),
+            revision,
+            filename: "gguf/mmproj-model-f16.gguf".into(),
+            bytes: projector_bytes.len() as u64,
+            sha256: projector_sha.clone(),
+            quant_hint: None,
+            role: "companion".into(),
+            selectable: false,
+            unavailable_reason: Some("vision projector companion".into()),
+        }],
+    };
+    let mut events = Vec::new();
+    let prepared = prepare_cached_projector_in_place_with_sources(
+        &mut candidate,
+        &text_authority,
+        &catalog,
+        &mut |event| events.push(event),
+        |_| None,
+        |_| Ok(snapshot.clone()),
+    )
+    .unwrap()
+    .expect("fresh snapshot must authenticate into its retained blob");
+
+    assert_eq!(prepared, blob.canonicalize().unwrap());
+    assert!(!fs::symlink_metadata(&prepared)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        candidate
+            .projector
+            .as_ref()
+            .map(|binding| binding.2.as_str()),
+        Some(projector_sha.as_str())
+    );
+    assert!(crate::core::bounded_file::StableRegularFile::open_exact(
+        &prepared,
+        projector_bytes.len() as u64,
+    )
+    .unwrap()
+    .is_some());
+}
+
+#[test]
+fn in_place_manual_structural_match_reuses_present_sibling_mmproj() {
+    use std::os::unix::fs::symlink;
+
+    let library = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let text = model.path().join("Qwen3.8-Q4_K_M.gguf");
+    let text_bytes = crate::input::hf_download::tests::write_complete_qwen_test_gguf(&text);
+    let projector = model.path().join("mmproj-Qwen3.8-F16.gguf");
+    write_structurally_valid_mmproj(&projector);
+    let projector_sha = crate::core::sha256::compute_file_sha256(&projector).unwrap();
+    symlink(model.path(), library.path().join("qwen3.8")).unwrap();
+    let revision = "a".repeat(40);
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: "owner/model".into(),
+        revision: revision.clone(),
+        requires_projector: true,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: vec![HubGgufArtifact {
+            repository: "owner/model".into(),
+            revision,
+            filename: "Qwen3.8-Q4_K_M.gguf".into(),
+            bytes: text_bytes,
+            sha256: "0".repeat(64),
+            quant_hint: Some("Q4_K_M".into()),
+            role: "text_model".into(),
+            selectable: true,
+            unavailable_reason: None,
+        }],
+    };
+    let hardware = HardwareProfile {
+        chip_model: "test-host".into(),
+        total_memory_bytes: 128 << 30,
+        available_memory_bytes: 64 << 30,
+        performance_cores: 1,
+        efficiency_cores: 1,
+        total_cores: 2,
+        memory_bandwidth_gbs: 1.0,
+    };
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    let mut catalog = Some(catalog);
+    let resolved = resolve_repository_with_progress_and_catalog(
+        &RepositoryModelSpec {
+            repository: "owner/model".into(),
+            quant: Some(QuantType::Q4_K_M),
+        },
+        None,
+        &[library.path().to_path_buf()],
+        &mut cache,
+        &hardware,
+        true,
+        None,
+        &mut |_| {},
+        |_| Ok(catalog.take().unwrap()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolved.mmproj_path.as_deref(),
+        Some(projector.canonicalize().unwrap().as_path())
+    );
+    assert_eq!(
+        resolved.mmproj_sha256.as_deref(),
+        Some(projector_sha.as_str())
+    );
+    assert!(resolved.mmproj_activation_authority.is_some());
+    assert!(resolved.warnings.is_empty());
+}
+
+#[test]
+fn direct_file_symlink_pair_is_discovered_and_retained_in_place() {
+    use std::os::unix::fs::symlink;
+
+    let library = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let text_target = payloads.path().join("Qwen3.8-Q4_K_M.gguf");
+    let text_bytes = crate::input::hf_download::tests::write_complete_qwen_test_gguf(&text_target);
+    let projector_target = payloads.path().join("mmproj-Qwen3.8-F16.gguf");
+    write_structurally_valid_mmproj(&projector_target);
+    let text = library.path().join("Qwen3.8-Q4_K_M.gguf");
+    let projector = library.path().join("mmproj-Qwen3.8-F16.gguf");
+    symlink(&text_target, &text).unwrap();
+    symlink(&projector_target, &projector).unwrap();
+    let projector_sha = crate::core::sha256::compute_file_sha256(&projector_target).unwrap();
+    let revision = "a".repeat(40);
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: "owner/model".into(),
+        revision: revision.clone(),
+        requires_projector: true,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: vec![HubGgufArtifact {
+            repository: "owner/model".into(),
+            revision,
+            filename: "Qwen3.8-Q4_K_M.gguf".into(),
+            bytes: text_bytes,
+            sha256: "0".repeat(64),
+            quant_hint: Some("Q4_K_M".into()),
+            role: "text_model".into(),
+            selectable: true,
+            unavailable_reason: None,
+        }],
+    };
+    let hardware = HardwareProfile {
+        chip_model: "test-host".into(),
+        total_memory_bytes: 128 << 30,
+        available_memory_bytes: 64 << 30,
+        performance_cores: 1,
+        efficiency_cores: 1,
+        total_cores: 2,
+        memory_bandwidth_gbs: 1.0,
+    };
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    let mut catalog = Some(catalog);
+    let resolved = resolve_repository_with_progress_and_catalog(
+        &RepositoryModelSpec {
+            repository: "owner/model".into(),
+            quant: Some(QuantType::Q4_K_M),
+        },
+        None,
+        &[library.path().to_path_buf()],
+        &mut cache,
+        &hardware,
+        true,
+        None,
+        &mut |_| {},
+        |_| Ok(catalog.take().unwrap()),
+    )
+    .unwrap();
+
+    assert_eq!(resolved.gguf_path, text);
+    assert_eq!(resolved.mmproj_path.as_deref(), Some(projector.as_path()));
+    assert_eq!(
+        resolved.mmproj_sha256.as_deref(),
+        Some(projector_sha.as_str())
+    );
+    assert!(resolved.activation_authority.is_some());
+    assert!(resolved.mmproj_activation_authority.is_some());
+}
+
+#[test]
+fn symlinked_conversion_receipt_wins_without_hosted_gguf_artifacts() {
+    use std::os::unix::fs::symlink;
+
+    let library = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let repository = "owner/model";
+    let revision = "a".repeat(40);
+    let text_target = payloads.path().join("converted-q4_k_m.gguf");
+    crate::input::hf_download::tests::write_complete_qwen_test_gguf(&text_target);
+    let projector_target = payloads.path().join("converted-q4_k_m-mmproj.gguf");
+    write_structurally_valid_mmproj(&projector_target);
+    write_conversion_receipt(
+        &text_target,
+        &conversion_receipt(&text_target, repository, &revision, "q4_k_m"),
+    );
+    write_conversion_receipt(
+        &projector_target,
+        &conversion_receipt(&projector_target, repository, &revision, "f16-mmproj"),
+    );
+    let text = library.path().join("linked-q4_k_m.gguf");
+    let projector = library.path().join("linked-q4_k_m-mmproj.gguf");
+    symlink(&text_target, &text).unwrap();
+    symlink(&projector_target, &projector).unwrap();
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    let text_authority = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        &text,
+        fs::metadata(&text).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    mark_successful_use(
+        repository,
+        &revision,
+        QuantType::Q4_K_M,
+        &text,
+        &text_authority,
+        &mut cache,
+    )
+    .unwrap();
+    let usage_sidecar = sidecar_path(&text);
+    assert!(usage_sidecar.is_file());
+    let bound = scan_bindings(&[library.path().to_path_buf()], Some(repository)).unwrap();
+    let [bound] = bound.as_slice() else {
+        panic!("one receipt-bound logical model expected: {bound:?}");
+    };
+    assert_eq!(bound.path, text);
+    assert!(bound.last_used_at_secs > 0);
+    assert!(bound.sidecar.is_none());
+
+    let hardware = HardwareProfile {
+        chip_model: "test-host".into(),
+        total_memory_bytes: 128 << 30,
+        available_memory_bytes: 64 << 30,
+        performance_cores: 1,
+        efficiency_cores: 1,
+        total_cores: 2,
+        memory_bandwidth_gbs: 1.0,
+    };
+    let mut events = Vec::new();
+    let resolved = resolve_repository_with_progress_and_catalog(
+        &RepositoryModelSpec {
+            repository: repository.into(),
+            quant: Some(QuantType::Q4_K_M),
+        },
+        None,
+        &[library.path().to_path_buf()],
+        &mut cache,
+        &hardware,
+        true,
+        None,
+        &mut |event| events.push(event),
+        |_| panic!("successfully used receipt-bound symlink must not query Hub metadata"),
+    )
+    .unwrap();
+
+    assert_eq!(resolved.gguf_path, text);
+    assert_eq!(resolved.mmproj_path.as_deref(), Some(projector.as_path()));
+    assert_eq!(resolved.origin, "local_receipt");
+    assert!(resolved.activation_authority.is_some());
+    assert!(resolved.mmproj_activation_authority.is_some());
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        StartupEvent::HubMetadata { .. }
+            | StartupEvent::HostedDownload { .. }
+            | StartupEvent::NativeConversion { .. }
+    )));
+}
+
+#[test]
+fn receipt_history_sidecar_hub_filename_cannot_select_projector() {
+    use std::os::unix::fs::symlink;
+
+    let models = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let repository = "owner/model";
+    let revision = "a".repeat(40);
+    let target = payloads.path().join("converted-q4_k_m.gguf");
+    write_quant_gguf(&target, 15);
+    write_conversion_receipt(
+        &target,
+        &conversion_receipt(&target, repository, &revision, "q4_k_m"),
+    );
+    let logical = models.path().join("linked-q4_k_m.gguf");
+    symlink(&target, &logical).unwrap();
+    let target_sha = crate::core::sha256::compute_file_sha256(&target).unwrap();
+    write_binding(
+        &sidecar_path(&logical),
+        &ManagedBinding {
+            schema_version: SCHEMA_VERSION,
+            repository: repository.into(),
+            revision: revision.clone(),
+            quant: "Q4_K_M".into(),
+            origin: "local_receipt".into(),
+            materialized_at_secs: 1,
+            last_used_at_secs: 42,
+            artifact: ArtifactBinding {
+                local_filename: "linked-q4_k_m.gguf".into(),
+                hub_filename: "forged-text.gguf".into(),
+                bytes: fs::metadata(&target).unwrap().len(),
+                sha256: target_sha,
+            },
+            projector: None,
+        },
+    )
+    .unwrap();
+
+    let candidates = scan_bindings(&[models.path().to_path_buf()], Some(repository)).unwrap();
+    let [candidate] = candidates.as_slice() else {
+        panic!("one receipt-bound candidate expected: {candidates:?}");
+    };
+    assert_eq!(candidate.last_used_at_secs, 42);
+    assert!(candidate.sidecar.is_none());
+
+    let companion = |filename: &str| HubGgufArtifact {
+        repository: repository.into(),
+        revision: revision.clone(),
+        filename: filename.into(),
+        bytes: 1,
+        sha256: "f".repeat(64),
+        quant_hint: None,
+        role: "companion".into(),
+        selectable: false,
+        unavailable_reason: Some("vision projector companion; not a text model".into()),
+    };
+    let forged_match = companion("forged-text-mmproj.gguf");
+    let other = companion("another-text-mmproj.gguf");
+    assert!(
+        select_projector_companion(candidate, vec![&forged_match, &other], None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn symlinked_conversion_receipt_explicit_output_clears_source_identity() {
+    use std::os::unix::fs::symlink;
+
+    let library = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let repository = "owner/model";
+    let revision = "a".repeat(40);
+    let text_target = payloads.path().join("converted-q4_k_m.gguf");
+    crate::input::hf_download::tests::write_complete_qwen_test_gguf(&text_target);
+    write_conversion_receipt(
+        &text_target,
+        &conversion_receipt(&text_target, repository, &revision, "q4_k_m"),
+    );
+    let text = library.path().join("linked-q4_k_m.gguf");
+    let output = library.path().join("published-q4_k_m.gguf");
+    symlink(&text_target, &text).unwrap();
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: repository.into(),
+        revision: revision.clone(),
+        requires_projector: false,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: Vec::new(),
+    };
+    let hardware = HardwareProfile {
+        chip_model: "test-host".into(),
+        total_memory_bytes: 128 << 30,
+        available_memory_bytes: 64 << 30,
+        performance_cores: 1,
+        efficiency_cores: 1,
+        total_cores: 2,
+        memory_bandwidth_gbs: 1.0,
+    };
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    let mut events = Vec::new();
+    let mut catalog = Some(catalog);
+    let resolved = resolve_repository_with_progress_and_catalog(
+        &RepositoryModelSpec {
+            repository: repository.into(),
+            quant: Some(QuantType::Q4_K_M),
+        },
+        Some(&output),
+        &[library.path().to_path_buf()],
+        &mut cache,
+        &hardware,
+        false,
+        None,
+        &mut |event| events.push(event),
+        |_| Ok(catalog.take().unwrap()),
+    )
+    .unwrap();
+
+    assert_eq!(resolved.gguf_path, output);
+    assert_eq!(resolved.origin, "local_adoption");
+    assert!(resolved.activation_authority.is_some());
+    assert!(resolved.mmproj_activation_authority.is_none());
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        StartupEvent::HostedDownload { .. } | StartupEvent::NativeConversion { .. }
+    )));
+}
+
+#[test]
+fn symlinked_managed_sidecar_is_not_local_authority() {
+    use std::os::unix::fs::symlink;
+
+    let models = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let text = models.path().join("model-q4_k_m.gguf");
+    write_quant_gguf(&text, 15);
+    let binding = ManagedBinding {
+        schema_version: SCHEMA_VERSION,
+        repository: "owner/model".into(),
+        revision: "a".repeat(40),
+        quant: "Q4_K_M".into(),
+        origin: "forged-link".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 2,
+        artifact: ArtifactBinding {
+            local_filename: "model-q4_k_m.gguf".into(),
+            hub_filename: "model-q4_k_m.gguf".into(),
+            bytes: fs::metadata(&text).unwrap().len(),
+            sha256: "0".repeat(64),
+        },
+        projector: None,
+    };
+    let outside_sidecar = outside.path().join("binding.json");
+    write_binding(&outside_sidecar, &binding).unwrap();
+    symlink(&outside_sidecar, sidecar_path(&text)).unwrap();
+
+    assert!(
+        scan_bindings(&[models.path().to_path_buf()], Some("owner/model"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn symlinked_conversion_receipt_for_another_repository_cannot_win() {
+    use std::os::unix::fs::symlink;
+
+    let models = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let target = payloads.path().join("other-model-q4_k_m.gguf");
+    write_quant_gguf(&target, 15);
+    write_conversion_receipt(
+        &target,
+        &conversion_receipt(&target, "owner/other-model", &"b".repeat(40), "q4_k_m"),
+    );
+    symlink(&target, models.path().join("linked-q4_k_m.gguf")).unwrap();
+
+    assert!(scan_bindings(
+        &[models.path().to_path_buf()],
+        Some("owner/requested-model"),
+    )
+    .unwrap()
+    .is_empty());
+}
+
+#[test]
+fn symlinked_receipt_target_retarget_is_rejected_before_activation() {
+    use std::os::unix::fs::symlink;
+
+    let models = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let first = payloads.path().join("first-q4_k_m.gguf");
+    let second = payloads.path().join("second-q4_k_m.gguf");
+    write_quant_gguf(&first, 15);
+    write_quant_gguf(&second, 15);
+    write_conversion_receipt(
+        &first,
+        &conversion_receipt(&first, "owner/model", &"a".repeat(40), "q4_k_m"),
+    );
+    let logical = models.path().join("linked-q4_k_m.gguf");
+    symlink(&first, &logical).unwrap();
+    let mut candidates =
+        scan_bindings(&[models.path().to_path_buf()], Some("owner/model")).unwrap();
+    let candidate = candidates.pop().expect("receipt-bound candidate");
+    fs::remove_file(&logical).unwrap();
+    symlink(&second, &logical).unwrap();
+
+    let error = match verify_candidate(&candidate) {
+        Ok(_) => panic!("retargeted receipt-bound candidate must not verify"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("linked conversion target changed after receipt authentication"));
+}
+
+#[test]
+fn malformed_adjacent_conversion_receipt_does_not_abort_other_candidates() {
+    use crate::convert::receipt::receipt_path;
+
+    let models = tempfile::tempdir().unwrap();
+    let malformed = models.path().join("malformed-q4_k_m.gguf");
+    let valid = models.path().join("valid-q4_k_m.gguf");
+    write_quant_gguf(&malformed, 15);
+    write_quant_gguf(&valid, 15);
+    fs::write(receipt_path(&malformed), b"{not-json").unwrap();
+    write_conversion_receipt(
+        &valid,
+        &conversion_receipt(&valid, "owner/model", &"a".repeat(40), "q4_k_m"),
+    );
+
+    let candidates = scan_bindings(&[models.path().to_path_buf()], Some("owner/model"))
+        .expect("one malformed receipt must remain candidate-local");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].path, valid);
+}
+
+#[test]
+fn receipt_bridge_rejects_non_model_and_malformed_schema_v3_identities() {
+    use std::os::unix::fs::symlink;
+
+    for (index, mutate) in [
+        0_u8, // non-model repository type
+        1_u8, // malformed source bundle digest
+        2_u8, // malformed converter commit
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let models = tempfile::tempdir().unwrap();
+        let payloads = tempfile::tempdir().unwrap();
+        let target = payloads
+            .path()
+            .join(format!("converted-{index}-q4_k_m.gguf"));
+        write_quant_gguf(&target, 15);
+        let mut receipt = conversion_receipt(&target, "owner/model", &"a".repeat(40), "q4_k_m");
+        match mutate {
+            0 => receipt.source.repository_type = "dataset".into(),
+            1 => receipt.source.bundle_sha256 = "not-a-digest".into(),
+            2 => receipt.converter.git_commit = "not-a-commit".into(),
+            _ => unreachable!(),
+        }
+        write_conversion_receipt(&target, &receipt);
+        symlink(
+            &target,
+            models.path().join(format!("linked-{index}-q4_k_m.gguf")),
+        )
+        .unwrap();
+
+        assert!(
+            scan_bindings(&[models.path().to_path_buf()], Some("owner/model"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn mismatched_logical_sidecars_do_not_import_receipt_use_history() {
+    use std::os::unix::fs::symlink;
+
+    let models = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let target = payloads.path().join("converted-q4_k_m.gguf");
+    write_quant_gguf(&target, 15);
+    let revision = "a".repeat(40);
+    write_conversion_receipt(
+        &target,
+        &conversion_receipt(&target, "owner/model", &revision, "q4_k_m"),
+    );
+    let bytes = fs::metadata(&target).unwrap().len();
+    let sha256 = crate::core::sha256::compute_file_sha256(&target).unwrap();
+    for index in 0..4 {
+        let filename = format!("linked-{index}-q4_k_m.gguf");
+        let logical = models.path().join(&filename);
+        symlink(&target, &logical).unwrap();
+        let mut binding = ManagedBinding {
+            schema_version: SCHEMA_VERSION,
+            repository: "owner/model".into(),
+            revision: revision.clone(),
+            quant: "Q4_K_M".into(),
+            origin: "local_receipt".into(),
+            materialized_at_secs: 1,
+            last_used_at_secs: 99,
+            artifact: ArtifactBinding {
+                local_filename: filename,
+                hub_filename: "converted-q4_k_m.gguf".into(),
+                bytes,
+                sha256: sha256.clone(),
+            },
+            projector: None,
+        };
+        match index {
+            0 => binding.repository = "owner/other".into(),
+            1 => binding.revision = "b".repeat(40),
+            2 => binding.quant = "Q8_0".into(),
+            3 => binding.artifact.sha256 = "f".repeat(64),
+            _ => unreachable!(),
+        }
+        write_binding(&sidecar_path(&logical), &binding).unwrap();
+    }
+
+    let candidates = scan_bindings(&[models.path().to_path_buf()], Some("owner/model")).unwrap();
+    assert_eq!(candidates.len(), 4);
+    assert!(candidates
+        .iter()
+        .all(|candidate| candidate.last_used_at_secs == 0 && candidate.sidecar.is_none()));
+}
+
+#[test]
+fn receipt_success_history_is_created_for_links_and_regular_outputs_and_selects_last_used() {
+    use std::os::unix::fs::symlink;
+
+    let models = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let repository = "owner/model";
+    let old_revision = "a".repeat(40);
+    let new_revision = "b".repeat(40);
+    let old_target = payloads.path().join("old-q4_k_m.gguf");
+    let new_target = payloads.path().join("new-q4_k_m.gguf");
+    write_quant_gguf(&old_target, 15);
+    write_quant_gguf(&new_target, 15);
+    write_conversion_receipt(
+        &old_target,
+        &conversion_receipt(&old_target, repository, &old_revision, "q4_k_m"),
+    );
+    write_conversion_receipt(
+        &new_target,
+        &conversion_receipt(&new_target, repository, &new_revision, "q4_k_m"),
+    );
+    let old_link = models.path().join("old-link-q4_k_m.gguf");
+    let new_link = models.path().join("new-link-q4_k_m.gguf");
+    symlink(&old_target, &old_link).unwrap();
+    symlink(&new_target, &new_link).unwrap();
+    let old_authority = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        &old_link,
+        fs::metadata(&old_link).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    mark_successful_use(
+        repository,
+        &old_revision,
+        QuantType::Q4_K_M,
+        &old_link,
+        &old_authority,
+        &mut cache,
+    )
+    .unwrap();
+
+    let spec = RepositoryModelSpec {
+        repository: repository.into(),
+        quant: None,
+    };
+    let mut warnings = Vec::new();
+    let (selected, _, _) = select_local(
+        &spec,
+        &[models.path().to_path_buf()],
+        &cache,
+        None,
+        16 << 30,
+        16 << 30,
+        &mut warnings,
+    )
+    .unwrap()
+    .expect("receipt-backed local candidate");
+    assert_eq!(selected.path, old_link);
+    assert!(selected.last_used_at_secs > 0);
+
+    let regular = models.path().join("regular-q4_k_m.gguf");
+    write_quant_gguf(&regular, 15);
+    let regular_revision = "c".repeat(40);
+    write_conversion_receipt(
+        &regular,
+        &conversion_receipt(&regular, repository, &regular_revision, "q4_k_m"),
+    );
+    let regular_authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &regular,
+        fs::metadata(&regular).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    mark_successful_use(
+        repository,
+        &regular_revision,
+        QuantType::Q4_K_M,
+        &regular,
+        &regular_authority,
+        &mut cache,
+    )
+    .unwrap();
+    let regular_candidate = scan_bindings(&[models.path().to_path_buf()], Some(repository))
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.path == regular)
+        .expect("regular receipt-backed candidate");
+    assert!(regular_candidate.last_used_at_secs > 0);
+}
+
+#[test]
+fn receipt_success_history_never_touches_a_different_manifest_artifact() {
+    use crate::serve::cache::{QuantEntry, SourcePointer};
+
+    let models = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let repository = "owner/model";
+    let loaded_revision = "a".repeat(40);
+
+    let loaded = models.path().join("loaded-q4_k_m.gguf");
+    write_quant_gguf(&loaded, 15);
+    write_conversion_receipt(
+        &loaded,
+        &conversion_receipt(&loaded, repository, &loaded_revision, "q4_k_m"),
+    );
+    let loaded_authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &loaded,
+        fs::metadata(&loaded).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+
+    let manifest_artifact =
+        crate::serve::cache::cache_model_path(cache_root.path(), repository, QuantType::Q4_K_M)
+            .unwrap();
+    fs::create_dir_all(manifest_artifact.parent().unwrap()).unwrap();
+    write_quant_gguf(&manifest_artifact, 15);
+    let manifest_bytes = fs::metadata(&manifest_artifact).unwrap().len();
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    cache
+        .record_source(
+            repository,
+            &loaded_revision,
+            SourcePointer::Local {
+                path: cache_root.path().join("source"),
+                sha256: "0".repeat(64),
+            },
+        )
+        .unwrap();
+    cache
+        .record_quantized(
+            repository,
+            QuantEntry {
+                quant_type: QuantType::Q4_K_M.as_str().into(),
+                gguf_path: manifest_artifact,
+                mmproj_path: None,
+                bytes: manifest_bytes,
+                sha256: "f".repeat(64),
+                quantized_at_secs: 1,
+                last_used_at_secs: 0,
+                quantized_by_version: env!("CARGO_PKG_VERSION").into(),
+            },
+        )
+        .unwrap();
+
+    mark_successful_use(
+        repository,
+        &loaded_revision,
+        QuantType::Q4_K_M,
+        &loaded,
+        &loaded_authority,
+        &mut cache,
+    )
+    .unwrap();
+
+    assert!(
+        read_binding(&sidecar_path(&loaded))
+            .unwrap()
+            .unwrap()
+            .last_used_at_secs
+            > 0
+    );
+    let current = ModelCache::open_at(cache_root.path()).unwrap();
+    assert_eq!(
+        current
+            .lookup(repository, QuantType::Q4_K_M)
+            .unwrap()
+            .last_used_at_secs,
+        0,
+        "a different manifest artifact must not inherit successful-use recency"
+    );
+}
+
+#[test]
+fn receipt_success_history_rejects_retarget_to_another_valid_revision() {
+    use std::os::unix::fs::symlink;
+
+    let models = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let repository = "owner/model";
+    let loaded_revision = "a".repeat(40);
+    let replacement_revision = "b".repeat(40);
+    let loaded = payloads.path().join("loaded-q4_k_m.gguf");
+    let replacement = payloads.path().join("replacement-q4_k_m.gguf");
+    write_quant_gguf(&loaded, 15);
+    write_quant_gguf(&replacement, 15);
+    write_conversion_receipt(
+        &loaded,
+        &conversion_receipt(&loaded, repository, &loaded_revision, "q4_k_m"),
+    );
+    write_conversion_receipt(
+        &replacement,
+        &conversion_receipt(&replacement, repository, &replacement_revision, "q4_k_m"),
+    );
+    let logical = models.path().join("model-q4_k_m.gguf");
+    symlink(&loaded, &logical).unwrap();
+    let loaded_authority = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        &logical,
+        fs::metadata(&logical).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    fs::remove_file(&logical).unwrap();
+    symlink(&replacement, &logical).unwrap();
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    let error = mark_successful_use(
+        repository,
+        &loaded_revision,
+        QuantType::Q4_K_M,
+        &logical,
+        &loaded_authority,
+        &mut cache,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("changed before successful-use publication"));
+    assert!(!sidecar_path(&logical).exists());
+}
+
+#[test]
+fn regular_receipt_output_never_promotes_a_stale_sidecar_or_forged_projector() {
+    let models = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let repository = "owner/model";
+    let revision = "a".repeat(40);
+    let artifact = models.path().join("regular-q4_k_m.gguf");
+    write_quant_gguf(&artifact, 15);
+    write_conversion_receipt(
+        &artifact,
+        &conversion_receipt(&artifact, repository, &revision, "q4_k_m"),
+    );
+    let stale = ManagedBinding {
+        schema_version: SCHEMA_VERSION,
+        repository: repository.into(),
+        revision: revision.clone(),
+        quant: "Q4_K_M".into(),
+        origin: "stale-managed-sidecar".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 0,
+        artifact: ArtifactBinding {
+            local_filename: "regular-q4_k_m.gguf".into(),
+            hub_filename: "regular-q4_k_m.gguf".into(),
+            bytes: fs::metadata(&artifact).unwrap().len(),
+            sha256: "f".repeat(64),
+        },
+        projector: Some(ArtifactBinding {
+            local_filename: "forged-mmproj.gguf".into(),
+            hub_filename: "forged-mmproj.gguf".into(),
+            bytes: 1,
+            sha256: "e".repeat(64),
+        }),
+    };
+    write_binding(&sidecar_path(&artifact), &stale).unwrap();
+    let authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &artifact,
+        fs::metadata(&artifact).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    let error = mark_successful_use(
+        repository,
+        &revision,
+        QuantType::Q4_K_M,
+        &artifact,
+        &authority,
+        &mut cache,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("artifact changed"));
+
+    let candidates = scan_bindings(&[models.path().to_path_buf()], Some(repository)).unwrap();
+    let [candidate] = candidates.as_slice() else {
+        panic!("one receipt-authoritative candidate expected: {candidates:?}");
+    };
+    assert_eq!(candidate.origin, "local_receipt");
+    assert_eq!(candidate.last_used_at_secs, 0);
+    assert!(candidate.projector.is_none());
+    assert!(candidate.sidecar.is_none());
+}
+
+#[test]
+fn exact_receipt_history_clears_forged_sidecar_projector_and_prefers_receipt_pair() {
+    let models = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let repository = "owner/model";
+    let revision = "a".repeat(40);
+    let text = models.path().join("model-q4_k_m.gguf");
+    write_quant_gguf_with_metadata(&text, 15, &[("general.architecture", "qwen3vl")]);
+    let receipt_projector = models.path().join("model-q4_k_m-mmproj.gguf");
+    let forged_projector = models.path().join("forged-mmproj.gguf");
+    write_structurally_valid_mmproj(&receipt_projector);
+    write_structurally_valid_mmproj(&forged_projector);
+    write_conversion_receipt(
+        &text,
+        &conversion_receipt(&text, repository, &revision, "q4_k_m"),
+    );
+    write_conversion_receipt(
+        &receipt_projector,
+        &conversion_receipt(&receipt_projector, repository, &revision, "f16-mmproj"),
+    );
+    let text_sha = crate::core::sha256::compute_file_sha256(&text).unwrap();
+    let forged_sha = crate::core::sha256::compute_file_sha256(&forged_projector).unwrap();
+    write_binding(
+        &sidecar_path(&text),
+        &ManagedBinding {
+            schema_version: SCHEMA_VERSION,
+            repository: repository.into(),
+            revision: revision.clone(),
+            quant: "Q4_K_M".into(),
+            origin: "forged-managed-sidecar".into(),
+            materialized_at_secs: 1,
+            last_used_at_secs: 0,
+            artifact: ArtifactBinding {
+                local_filename: "model-q4_k_m.gguf".into(),
+                hub_filename: "model-q4_k_m.gguf".into(),
+                bytes: fs::metadata(&text).unwrap().len(),
+                sha256: text_sha,
+            },
+            projector: Some(ArtifactBinding {
+                local_filename: "forged-mmproj.gguf".into(),
+                hub_filename: "forged-mmproj.gguf".into(),
+                bytes: fs::metadata(&forged_projector).unwrap().len(),
+                sha256: forged_sha,
+            }),
+        },
+    )
+    .unwrap();
+    let authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &text,
+        fs::metadata(&text).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    mark_successful_use(
+        repository,
+        &revision,
+        QuantType::Q4_K_M,
+        &text,
+        &authority,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(read_binding(&sidecar_path(&text))
+        .unwrap()
+        .unwrap()
+        .projector
+        .is_none());
+    assert_eq!(
+        resolve_local_path_projector_required(&text)
+            .unwrap()
+            .as_deref(),
+        Some(receipt_projector.as_path())
+    );
+}
+
+#[test]
+fn logical_projector_alias_satisfies_generation_marked_pair_guard() {
+    use std::os::unix::fs::symlink;
+
+    let models = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let generation = "123e4567-e89b-12d3-a456-426614174000";
+    let projector_target = payloads.path().join("converted-q4_k_m-mmproj.gguf");
+    write_quant_gguf_with_metadata(
+        &projector_target,
+        1,
+        &[
+            ("hf2q.pair_generation", generation),
+            ("hf2q.pair_schema_version", "1"),
+        ],
+    );
+    let projector_sha = crate::core::sha256::compute_file_sha256(&projector_target).unwrap();
+    let text_target = payloads.path().join("converted-q4_k_m.gguf");
+    write_quant_gguf_with_metadata(
+        &text_target,
+        15,
+        &[
+            ("hf2q.pair_generation", generation),
+            ("hf2q.pair_schema_version", "1"),
+            ("hf2q.mmproj_sha256", &projector_sha),
+        ],
+    );
+    let revision = "a".repeat(40);
+    write_conversion_receipt(
+        &text_target,
+        &conversion_receipt(&text_target, "owner/model", &revision, "q4_k_m"),
+    );
+    write_conversion_receipt(
+        &projector_target,
+        &conversion_receipt(&projector_target, "owner/model", &revision, "f16-mmproj"),
+    );
+    let text = models.path().join("linked-q4_k_m.gguf");
+    let projector = models.path().join("linked-q4_k_m-mmproj.gguf");
+    symlink(&text_target, &text).unwrap();
+    symlink(&projector_target, &projector).unwrap();
+
+    let candidates = scan_bindings(&[models.path().to_path_buf()], Some("owner/model")).unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.path == text)
+        .expect("receipt-bound text candidate");
+    assert_eq!(
+        candidate
+            .projector
+            .as_ref()
+            .map(|binding| binding.0.as_path()),
+        Some(projector.as_path())
+    );
+    let guard = crate::core::paired_artifact::PairReadGuard::acquire(&text, &projector).unwrap();
+    let text_gguf = mlx_native::gguf::GgufFile::open(&text).unwrap();
+    let projector_gguf = mlx_native::gguf::GgufFile::open(&projector).unwrap();
+    guard
+        .validate_static(&text_gguf, &projector_gguf, Some(&projector_sha))
+        .unwrap();
+}
+
+#[test]
+fn retained_target_pair_guard_uses_adjacent_receipt_projector_without_a_logical_alias() {
+    use std::os::unix::fs::symlink;
+
+    let models = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let generation = "123e4567-e89b-12d3-a456-426614174000";
+    let projector_target = payloads.path().join("converted-q4_k_m-mmproj.gguf");
+    write_quant_gguf_with_metadata(
+        &projector_target,
+        1,
+        &[
+            ("hf2q.pair_generation", generation),
+            ("hf2q.pair_schema_version", "1"),
+        ],
+    );
+    let projector_sha = crate::core::sha256::compute_file_sha256(&projector_target).unwrap();
+    let text_target = payloads.path().join("converted-q4_k_m.gguf");
+    write_quant_gguf_with_metadata(
+        &text_target,
+        15,
+        &[
+            ("hf2q.pair_generation", generation),
+            ("hf2q.pair_schema_version", "1"),
+            ("hf2q.mmproj_sha256", &projector_sha),
+        ],
+    );
+    let revision = "a".repeat(40);
+    write_conversion_receipt(
+        &text_target,
+        &conversion_receipt(&text_target, "owner/model", &revision, "q4_k_m"),
+    );
+    write_conversion_receipt(
+        &projector_target,
+        &conversion_receipt(&projector_target, "owner/model", &revision, "f16-mmproj"),
+    );
+    let text = models.path().join("linked-q4_k_m.gguf");
+    symlink(&text_target, &text).unwrap();
+
+    let candidate = scan_bindings(&[models.path().to_path_buf()], Some("owner/model"))
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.path == text)
+        .expect("receipt-bound text candidate");
+    assert_eq!(
+        candidate
+            .projector
+            .as_ref()
+            .map(|(path, _, _)| path.as_path()),
+        Some(projector_target.canonicalize().unwrap().as_path())
+    );
+    let text_authority = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        &text,
+        fs::metadata(&text).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    let projector_authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &projector_target,
+        fs::metadata(&projector_target).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    let (text_guard_path, projector_guard_path) =
+        crate::serve::automatic_pair_guard_authority_paths(&text_authority, &projector_authority)
+            .unwrap()
+            .expect("target-adjacent receipt pair must use its conversion namespace");
+    let guard = crate::core::paired_artifact::PairReadGuard::acquire(
+        &text_guard_path,
+        &projector_guard_path,
+    )
+    .unwrap();
+    let text_gguf =
+        mlx_native::gguf::GgufFile::from_file(text_authority.try_clone().unwrap()).unwrap();
+    let projector_gguf =
+        mlx_native::gguf::GgufFile::from_file(projector_authority.try_clone().unwrap()).unwrap();
+    guard
+        .validate_static(&text_gguf, &projector_gguf, Some(&projector_sha))
+        .unwrap();
+
+    let replacement = payloads.path().join("replacement.gguf");
+    fs::write(&replacement, fs::read(&text_target).unwrap()).unwrap();
+    fs::remove_file(&text).unwrap();
+    symlink(&replacement, &text).unwrap();
+    assert!(text_authority
+        .canonical_path_for_identity()
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn hosted_projector_beside_logical_text_keeps_the_logical_pair_namespace() {
+    use std::os::unix::fs::symlink;
+
+    let models = tempfile::tempdir().unwrap();
+    let payloads = tempfile::tempdir().unwrap();
+    let generation = "123e4567-e89b-12d3-a456-426614174000";
+    let projector = models.path().join("downloaded-mmproj.gguf");
+    write_quant_gguf_with_metadata(
+        &projector,
+        1,
+        &[
+            ("hf2q.pair_generation", generation),
+            ("hf2q.pair_schema_version", "1"),
+        ],
+    );
+    let projector_sha = crate::core::sha256::compute_file_sha256(&projector).unwrap();
+    let text_target = payloads.path().join("converted-q4_k_m.gguf");
+    write_quant_gguf_with_metadata(
+        &text_target,
+        15,
+        &[
+            ("hf2q.pair_generation", generation),
+            ("hf2q.pair_schema_version", "1"),
+            ("hf2q.mmproj_sha256", &projector_sha),
+        ],
+    );
+    let text = models.path().join("linked-q4_k_m.gguf");
+    symlink(&text_target, &text).unwrap();
+    let text_authority = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        &text,
+        fs::metadata(&text).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    let projector_authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &projector,
+        fs::metadata(&projector).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(crate::serve::automatic_pair_guard_authority_paths(
+        &text_authority,
+        &projector_authority,
+    )
+    .unwrap()
+    .is_none());
+    let guard = crate::core::paired_artifact::PairReadGuard::acquire(&text, &projector).unwrap();
+    let text_gguf =
+        mlx_native::gguf::GgufFile::from_file(text_authority.try_clone().unwrap()).unwrap();
+    let projector_gguf =
+        mlx_native::gguf::GgufFile::from_file(projector_authority.try_clone().unwrap()).unwrap();
+    guard
+        .validate_static(&text_gguf, &projector_gguf, Some(&projector_sha))
+        .unwrap();
+}
+
+#[test]
+fn structurally_valid_wrong_local_sibling_falls_through_to_exact_hosted_projector() {
+    use std::os::unix::fs::symlink;
+
+    let library = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    let companions = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let text = model.path().join("Qwen3.8-Q4_K_M.gguf");
+    let text_bytes = crate::input::hf_download::tests::write_complete_qwen_test_gguf(&text);
+    let wrong_local = model.path().join("mmproj-wrong.gguf");
+    write_structurally_valid_mmproj(&wrong_local);
+    let mut wrong_bytes = fs::read(&wrong_local).unwrap();
+    *wrong_bytes.last_mut().unwrap() ^= 1;
+    fs::write(&wrong_local, wrong_bytes).unwrap();
+    let hosted_projector = companions.path().join("exact-hosted-mmproj.gguf");
+    write_structurally_valid_mmproj(&hosted_projector);
+    let projector_bytes = fs::metadata(&hosted_projector).unwrap().len();
+    let projector_sha = crate::core::sha256::compute_file_sha256(&hosted_projector).unwrap();
+    symlink(model.path(), library.path().join("qwen3.8")).unwrap();
+    let revision = "a".repeat(40);
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: "owner/model".into(),
+        revision: revision.clone(),
+        requires_projector: true,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: vec![
+            HubGgufArtifact {
+                repository: "owner/model".into(),
+                revision: revision.clone(),
+                filename: "Qwen3.8-Q4_K_M.gguf".into(),
+                bytes: text_bytes,
+                sha256: "0".repeat(64),
+                quant_hint: Some("Q4_K_M".into()),
+                role: "text_model".into(),
+                selectable: true,
+                unavailable_reason: None,
+            },
+            HubGgufArtifact {
+                repository: "owner/model".into(),
+                revision,
+                filename: "exact-hosted-mmproj.gguf".into(),
+                bytes: projector_bytes,
+                sha256: projector_sha.clone(),
+                quant_hint: None,
+                role: "companion".into(),
+                selectable: false,
+                unavailable_reason: Some("vision projector companion".into()),
+            },
+        ],
+    };
+    let hardware = HardwareProfile {
+        chip_model: "test-host".into(),
+        total_memory_bytes: 128 << 30,
+        available_memory_bytes: 64 << 30,
+        performance_cores: 1,
+        efficiency_cores: 1,
+        total_cores: 2,
+        memory_bandwidth_gbs: 1.0,
+    };
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    let mut catalog = Some(catalog);
+    let resolved = resolve_repository_with_progress_and_catalog(
+        &RepositoryModelSpec {
+            repository: "owner/model".into(),
+            quant: Some(QuantType::Q4_K_M),
+        },
+        None,
+        &[
+            library.path().to_path_buf(),
+            companions.path().to_path_buf(),
+        ],
+        &mut cache,
+        &hardware,
+        true,
+        None,
+        &mut |_| {},
+        |_| Ok(catalog.take().unwrap()),
+    )
+    .unwrap();
+
+    let prepared = model.path().join("exact-hosted-mmproj.gguf");
+    assert_eq!(
+        resolved.mmproj_path.as_deref(),
+        Some(prepared.canonicalize().unwrap().as_path())
+    );
+    assert_eq!(
+        resolved.mmproj_sha256.as_deref(),
+        Some(projector_sha.as_str())
+    );
+    assert!(resolved.mmproj_activation_authority.is_some());
+    assert!(resolved.warnings.iter().any(|warning| {
+        warning.contains("ignored structurally compatible local sibling mmproj")
+            && warning.contains("does not match exact hosted companion")
+    }));
+}
+
+#[test]
+fn malformed_local_projector_is_rejected_before_binding() {
+    let directory = tempfile::tempdir().unwrap();
+    let text = directory.path().join("model-q4_k_m.gguf");
+    let projector = directory.path().join("mmproj-corrupt.gguf");
+    write_quant_gguf(&text, 15);
+    fs::write(&projector, b"not a GGUF").unwrap();
+    let mut candidate = Candidate {
+        repository: "owner/model".into(),
+        revision: "a".repeat(40),
+        root: directory.path().to_path_buf(),
+        path: text,
+        bytes: 256,
+        sha256: "0".repeat(64),
+        quant: QuantType::Q4_K_M,
+        origin: "manual_structural".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 0,
+        projector: None,
+        sidecar: None,
+        receipt_target_identity: None,
+    };
+
+    assert!(bind_existing_local_projector(&mut candidate, projector)
+        .unwrap_err()
+        .to_string()
+        .contains("not a readable GGUF"));
+    assert!(candidate.projector.is_none());
+}
+
+#[test]
+fn disappearing_automatic_sibling_mmproj_degrades_to_text_only() {
+    use std::os::unix::fs::symlink;
+
+    let library = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let text = model.path().join("Qwen3.8-Q4_K_M.gguf");
+    let text_bytes = crate::input::hf_download::tests::write_complete_qwen_test_gguf(&text);
+    let projector = model.path().join("mmproj-Qwen3.8-F16.gguf");
+    write_structurally_valid_mmproj(&projector);
+    symlink(model.path(), library.path().join("qwen3.8")).unwrap();
+    let revision = "a".repeat(40);
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: "owner/model".into(),
+        revision: revision.clone(),
+        requires_projector: true,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: vec![HubGgufArtifact {
+            repository: "owner/model".into(),
+            revision,
+            filename: "Qwen3.8-Q4_K_M.gguf".into(),
+            bytes: text_bytes,
+            sha256: "0".repeat(64),
+            quant_hint: Some("Q4_K_M".into()),
+            role: "text_model".into(),
+            selectable: true,
+            unavailable_reason: None,
+        }],
+    };
+    let remove = projector.canonicalize().unwrap();
+    let _hook = set_after_automatic_projector_prepared(move |path| {
+        assert_eq!(path, remove);
+        fs::remove_file(path).unwrap();
+    });
+    let hardware = HardwareProfile {
+        chip_model: "test-host".into(),
+        total_memory_bytes: 128 << 30,
+        available_memory_bytes: 64 << 30,
+        performance_cores: 1,
+        efficiency_cores: 1,
+        total_cores: 2,
+        memory_bandwidth_gbs: 1.0,
+    };
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    let mut catalog = Some(catalog);
+    let resolved = resolve_repository_with_progress_and_catalog(
+        &RepositoryModelSpec {
+            repository: "owner/model".into(),
+            quant: Some(QuantType::Q4_K_M),
+        },
+        None,
+        &[library.path().to_path_buf()],
+        &mut cache,
+        &hardware,
+        true,
+        None,
+        &mut |_| {},
+        |_| Ok(catalog.take().unwrap()),
+    )
+    .unwrap();
+
+    assert!(resolved.mmproj_path.is_none());
+    assert!(resolved.mmproj_sha256.is_none());
+    assert!(resolved.mmproj_activation_authority.is_none());
+    assert!(resolved.warnings.iter().any(|warning| {
+        warning.contains("changed or no longer matches") && warning.contains("serving text-only")
+    }));
+}
+
+#[test]
+fn same_size_projector_replacement_after_hash_admission_degrades_to_text_only() {
+    use std::os::unix::fs::symlink;
+
+    let library = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let text = model.path().join("Qwen3.8-Q4_K_M.gguf");
+    let text_bytes = crate::input::hf_download::tests::write_complete_qwen_test_gguf(&text);
+    let projector = model.path().join("mmproj-Qwen3.8-F16.gguf");
+    let replacement = model.path().join("replacement-mmproj.bin");
+    let parked = model.path().join("parked-mmproj.gguf");
+    write_structurally_valid_mmproj(&projector);
+    let mut replacement_bytes = fs::read(&projector).unwrap();
+    *replacement_bytes.last_mut().unwrap() ^= 1;
+    fs::write(&replacement, replacement_bytes).unwrap();
+    assert_eq!(
+        fs::metadata(&projector).unwrap().len(),
+        fs::metadata(&replacement).unwrap().len()
+    );
+    symlink(model.path(), library.path().join("qwen3.8")).unwrap();
+    let revision = "a".repeat(40);
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: "owner/model".into(),
+        revision: revision.clone(),
+        requires_projector: true,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: vec![HubGgufArtifact {
+            repository: "owner/model".into(),
+            revision,
+            filename: "Qwen3.8-Q4_K_M.gguf".into(),
+            bytes: text_bytes,
+            sha256: "0".repeat(64),
+            quant_hint: Some("Q4_K_M".into()),
+            role: "text_model".into(),
+            selectable: true,
+            unavailable_reason: None,
+        }],
+    };
+    let swap_projector = projector.canonicalize().unwrap();
+    let _hook = set_after_automatic_projector_prepared(move |path| {
+        assert_eq!(path, swap_projector);
+        fs::rename(path, &parked).unwrap();
+        fs::rename(&replacement, path).unwrap();
+    });
+    let hardware = HardwareProfile {
+        chip_model: "test-host".into(),
+        total_memory_bytes: 128 << 30,
+        available_memory_bytes: 64 << 30,
+        performance_cores: 1,
+        efficiency_cores: 1,
+        total_cores: 2,
+        memory_bandwidth_gbs: 1.0,
+    };
+    let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
+    let mut catalog = Some(catalog);
+    let resolved = resolve_repository_with_progress_and_catalog(
+        &RepositoryModelSpec {
+            repository: "owner/model".into(),
+            quant: Some(QuantType::Q4_K_M),
+        },
+        None,
+        &[library.path().to_path_buf()],
+        &mut cache,
+        &hardware,
+        true,
+        None,
+        &mut |_| {},
+        |_| Ok(catalog.take().unwrap()),
+    )
+    .unwrap();
+
+    assert!(resolved.mmproj_path.is_none());
+    assert!(resolved.mmproj_sha256.is_none());
+    assert!(resolved.mmproj_activation_authority.is_none());
+    assert!(
+        resolved.warnings.iter().any(|warning| {
+            warning.contains("serving text-only")
+                && (warning.contains("changed") || warning.contains("no longer matches"))
+        }),
+        "warnings: {:?}",
+        resolved.warnings
+    );
+}
+
+#[test]
 fn exact_loose_digest_adopts_misnamed_bytes_and_hashes_once() {
     use std::cell::Cell;
 
@@ -535,6 +2339,7 @@ fn candidate_recency_prefers_use_history_then_materialization() {
         last_used_at_secs: used,
         projector: None,
         sidecar: None,
+        receipt_target_identity: None,
     };
     assert!(candidate_recency(&candidate(5, 1)) > candidate_recency(&candidate(0, 100)));
     assert!(candidate_recency(&candidate(0, 10)) > candidate_recency(&candidate(0, 9)));
@@ -560,6 +2365,7 @@ fn newer_same_quant_hub_cache_revision_is_not_shadowed_by_post_lock_old_binding(
         last_used_at_secs: 0,
         projector: None,
         sidecar: None,
+        receipt_target_identity: None,
     };
     assert!(
         !post_lock_local_candidate_wins(&old_bound, Some(20)),
@@ -589,6 +2395,7 @@ fn admissible_recent_local_quant_is_not_capped_by_the_hardware_recommendation() 
         last_used_at_secs: 20,
         projector: None,
         sidecar: None,
+        receipt_target_identity: None,
     };
     let spec = RepositoryModelSpec {
         repository: "owner/model".into(),
@@ -619,6 +2426,7 @@ fn projector_pairing_prefers_exact_text_stem_then_one_generic_companion() {
         last_used_at_secs: 0,
         projector: None,
         sidecar: None,
+        receipt_target_identity: None,
     };
     let companion = |filename: &str| HubGgufArtifact {
         repository: "owner/model".into(),
@@ -677,6 +2485,7 @@ fn older_local_multimodal_candidate_requests_its_exact_revision_not_head_project
         last_used_at_secs: 2,
         projector: None,
         sidecar: None,
+        receipt_target_identity: None,
     };
     let head_catalog = HubGgufCatalog {
         schema_version: "hf2q.hub-gguf-catalog.v2".into(),
@@ -729,7 +2538,14 @@ fn markerless_local_multimodal_uses_candidate_revision_config_and_companion() {
         last_used_at_secs: 2,
         projector: None,
         sidecar: None,
+        receipt_target_identity: None,
     };
+    let text_authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &text,
+        fs::metadata(&text).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
     assert!(!text_requires_projector(&candidate.path).unwrap());
     let head_catalog = HubGgufCatalog {
         schema_version: "hf2q.hub-gguf-catalog.v2".into(),
@@ -765,11 +2581,13 @@ fn markerless_local_multimodal_uses_candidate_revision_config_and_companion() {
 
     let (prepared, projector) = prepare_local_candidate_with_catalog_resolver(
         candidate,
+        &text_authority,
         Some(text_root.path()),
         &[loose_root.path().to_path_buf()],
         &head_catalog,
         true,
         &mut warnings,
+        &mut |_| {},
         |reference| {
             resolver_calls.set(resolver_calls.get() + 1);
             assert_eq!(reference.repo_id(), "owner/model");
@@ -810,6 +2628,7 @@ fn hosted_projector_is_materialized_and_ambiguity_falls_back_text_only() {
         last_used_at_secs: 0,
         projector: None,
         sidecar: None,
+        receipt_target_identity: None,
     };
     let companion_artifact = HubGgufArtifact {
         repository: "owner/model".into(),
@@ -910,6 +2729,7 @@ fn prepared_existing_projector_rejects_same_inode_mutation_before_activation() {
         last_used_at_secs: 0,
         projector: None,
         sidecar: None,
+        receipt_target_identity: None,
     };
     let error = materialize_prepared_projector(plan, &mut candidate, &mut Vec::new())
         .unwrap_err()
@@ -1000,6 +2820,7 @@ fn verified_projector_load_survives_sidecar_history_persistence_failure() {
         last_used_at_secs: 0,
         projector: None,
         sidecar: Some(invalid_sidecar),
+        receipt_target_identity: None,
     };
     let artifact = HubGgufArtifact {
         repository: "owner/model".into(),
@@ -1059,6 +2880,7 @@ fn text_only_qwen_does_not_load_a_digest_valid_stale_projector() {
             crate::core::sha256::compute_file_sha256(&projector).unwrap(),
         )),
         sidecar: None,
+        receipt_target_identity: None,
     };
     let catalog = HubGgufCatalog {
         schema_version: "hf2q.hub-gguf-catalog.v2".into(),
@@ -1097,6 +2919,7 @@ fn text_only_local_projector_resolution_stops_before_any_hub_lookup() {
         last_used_at_secs: 0,
         projector: None,
         sidecar: None,
+        receipt_target_identity: None,
     };
     let mut warnings = Vec::new();
     assert!(resolve_projector(&mut candidate, &[], &mut warnings)
@@ -1380,6 +3203,7 @@ fn explicit_output_is_honored_for_an_existing_verified_local_candidate() {
             last_used_at_secs: 0,
             projector: None,
             sidecar: None,
+            receipt_target_identity: None,
         },
         Some(output_directory.path()),
         &mut warnings,
@@ -1404,7 +3228,7 @@ fn explicit_local_output_projector_conflict_warns_and_materializes_text_only() {
     let source = source_directory.path().join("model-q4_k_m.gguf");
     let projector = source_directory.path().join("model-mmproj.gguf");
     write_quant_gguf(&source, 15);
-    fs::write(&projector, b"verified projector").unwrap();
+    write_structurally_valid_mmproj(&projector);
     let projector_destination = output_directory.path().join("model-mmproj.gguf");
     fs::write(&projector_destination, b"conflicting bytes").unwrap();
     let mut warnings = Vec::new();
@@ -1426,6 +3250,7 @@ fn explicit_local_output_projector_conflict_warns_and_materializes_text_only() {
                 crate::core::sha256::compute_file_sha256(&projector).unwrap(),
             )),
             sidecar: None,
+            receipt_target_identity: None,
         },
         Some(output_directory.path()),
         &mut warnings,
@@ -1457,7 +3282,7 @@ fn local_pair_extent_refusal_suppresses_projector_retry_after_text_materializati
     let source = source_directory.path().join("model-q4_k_m.gguf");
     let projector = source_directory.path().join("model-mmproj.gguf");
     write_quant_gguf(&source, 15);
-    fs::write(&projector, b"verified projector").unwrap();
+    write_structurally_valid_mmproj(&projector);
     let pair_preflights = Cell::new(0_u8);
     let mut warnings = Vec::new();
     let (prepared, suppress_projector) = prepare_selected_local_decision_with_preflight(
@@ -1478,6 +3303,7 @@ fn local_pair_extent_refusal_suppresses_projector_retry_after_text_materializati
                 crate::core::sha256::compute_file_sha256(&projector).unwrap(),
             )),
             sidecar: None,
+            receipt_target_identity: None,
         },
         Some(output_directory.path()),
         &mut warnings,
@@ -1527,7 +3353,7 @@ fn local_pair_source_and_destination_parent_replacement_refuses_before_first_wri
     let parked_source = source_directory.path().join("parked-model.gguf");
     let projector = source_directory.path().join("model-mmproj.gguf");
     write_quant_gguf(&source, 15);
-    fs::write(&projector, b"verified projector").unwrap();
+    write_structurally_valid_mmproj(&projector);
     let original_source = fs::read(&source).unwrap();
     let mut warnings = Vec::new();
 
@@ -1549,6 +3375,7 @@ fn local_pair_source_and_destination_parent_replacement_refuses_before_first_wri
                 crate::core::sha256::compute_file_sha256(&projector).unwrap(),
             )),
             sidecar: None,
+            receipt_target_identity: None,
         },
         Some(&output_directory),
         &mut warnings,
@@ -1576,6 +3403,7 @@ fn local_pair_source_and_destination_parent_replacement_refuses_before_first_wri
 fn managed_binding_round_trips_atomically_and_touches_only_after_success() {
     let directory = tempfile::tempdir().unwrap();
     let artifact = directory.path().join("model.gguf");
+    fs::write(&artifact, b"x").unwrap();
     let sidecar = sidecar_path(&artifact);
     let binding = ManagedBinding {
         schema_version: SCHEMA_VERSION,
@@ -1600,7 +3428,18 @@ fn managed_binding_round_trips_atomically_and_touches_only_after_success() {
 
     let cache_root = tempfile::tempdir().unwrap();
     let mut cache = ModelCache::open_at(cache_root.path()).unwrap();
-    mark_successful_use("owner/model", QuantType::Q4_K_M, &artifact, &mut cache).unwrap();
+    let authority = crate::core::bounded_file::StableRegularFile::open_exact(&artifact, 1)
+        .unwrap()
+        .unwrap();
+    mark_successful_use(
+        "owner/model",
+        &"a".repeat(40),
+        QuantType::Q4_K_M,
+        &artifact,
+        &authority,
+        &mut cache,
+    )
+    .unwrap();
     assert!(read_binding(&sidecar).unwrap().unwrap().last_used_at_secs > 0);
 }
 
@@ -1629,6 +3468,7 @@ fn local_adoption_preserves_a_conflicting_operator_sidecar() {
             last_used_at_secs: 0,
             projector: None,
             sidecar: None,
+            receipt_target_identity: None,
         },
         Some(output_directory.path()),
         &mut warnings,
@@ -1686,7 +3526,7 @@ fn verified_conversion_pair_is_reused_and_published_as_managed_authority() {
     let revision = "a".repeat(40);
     let text = directory.path().join("model-q4_k_m.gguf");
     let projector = directory.path().join("model-q4_k_m-mmproj.gguf");
-    fs::write(&projector, b"projector bytes").unwrap();
+    write_structurally_valid_mmproj(&projector);
     let projector_digest = crate::core::sha256::compute_file_sha256(&projector).unwrap();
     write_quant_gguf_with_metadata(
         &text,
@@ -1802,9 +3642,409 @@ fn projector_receipt_and_text_digest_mismatches_fail_closed() {
             crate::core::sha256::compute_file_sha256(&projector).unwrap(),
         )),
         sidecar: None,
+        receipt_target_identity: None,
     };
     assert!(verify_candidate_projector(&candidate).unwrap().is_none());
     assert!(resolve_local_path_projector(&text).is_err());
+}
+
+#[test]
+fn bound_projector_digest_is_authenticated_before_it_can_suppress_hosted_repair() {
+    let directory = tempfile::tempdir().unwrap();
+    let revision = "a".repeat(40);
+    let text = directory.path().join("model-q4_k_m.gguf");
+    let projector = directory.path().join("model-q4_k_m-mmproj.gguf");
+    write_quant_gguf(&text, 15);
+    write_structurally_valid_mmproj(&projector);
+    let projector_bytes = fs::metadata(&projector).unwrap().len();
+    let projector_sha = crate::core::sha256::compute_file_sha256(&projector).unwrap();
+
+    let managed = Candidate {
+        repository: "owner/model".into(),
+        revision: revision.clone(),
+        path: text.clone(),
+        root: directory.path().to_path_buf(),
+        bytes: fs::metadata(&text).unwrap().len(),
+        sha256: crate::core::sha256::compute_file_sha256(&text).unwrap(),
+        quant: QuantType::Q4_K_M,
+        origin: "managed".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 1,
+        projector: Some((projector.clone(), projector_bytes, "f".repeat(64))),
+        sidecar: None,
+        receipt_target_identity: None,
+    };
+    assert_ne!(projector_sha, "f".repeat(64));
+    assert!(verify_candidate_projector(&managed).unwrap().is_none());
+
+    write_conversion_receipt(
+        &text,
+        &conversion_receipt(&text, "owner/model", &revision, "q4_k_m"),
+    );
+    write_conversion_receipt(
+        &projector,
+        &conversion_receipt(&projector, "owner/model", &revision, "f16-mmproj"),
+    );
+    let mut mutated = fs::read(&projector).unwrap();
+    *mutated.last_mut().unwrap() ^= 1;
+    fs::write(&projector, mutated).unwrap();
+    let receipt_bound = conversion_authority(&text)
+        .unwrap()
+        .expect("text receipt authority");
+    assert!(receipt_bound.projector.is_some());
+    assert!(verify_candidate_projector(&receipt_bound)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn retained_text_descriptor_drives_projector_metadata_through_public_swap_and_restore() {
+    let directory = tempfile::tempdir().unwrap();
+    let text = directory.path().join("model-q4_k_m.gguf");
+    let parked = directory.path().join("model-original.gguf");
+    let alternate = directory.path().join("model-alternate.gguf");
+    let displaced = directory.path().join("model-displaced.gguf");
+    let projector_sha = "d".repeat(64);
+    write_quant_gguf_with_metadata(
+        &text,
+        15,
+        &[
+            ("general.architecture", "qwen3vl"),
+            ("hf2q.mmproj_sha256", &projector_sha),
+        ],
+    );
+    write_quant_gguf_with_metadata(&alternate, 15, &[("general.architecture", "llama")]);
+    let authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &text,
+        fs::metadata(&text).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    fs::rename(&text, &parked).unwrap();
+    fs::rename(&alternate, &text).unwrap();
+    let hook_text = text.clone();
+    let hook_parked = parked.clone();
+    let hook_displaced = displaced.clone();
+    let _hook = set_after_retained_text_projector_metadata(move || {
+        fs::rename(&hook_text, &hook_displaced).unwrap();
+        fs::rename(&hook_parked, &hook_text).unwrap();
+    });
+
+    let error = retained_text_projector_contract(&authority)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("changed during retained projector planning"));
+}
+
+#[test]
+fn hub_cache_loose_projector_selection_uses_retained_text_through_swap_restore() {
+    let directory = tempfile::tempdir().unwrap();
+    let text = directory.path().join("model-q4_k_m.gguf");
+    let parked = directory.path().join("model-original.gguf");
+    let alternate = directory.path().join("model-alternate.gguf");
+    let displaced = directory.path().join("model-displaced.gguf");
+    let expected_sha = "d".repeat(64);
+    let alternate_sha = "e".repeat(64);
+    write_quant_gguf_with_metadata(
+        &text,
+        15,
+        &[
+            ("general.architecture", "qwen3vl"),
+            ("hf2q.mmproj_sha256", &expected_sha),
+        ],
+    );
+    write_quant_gguf_with_metadata(
+        &alternate,
+        15,
+        &[
+            ("general.architecture", "qwen3vl"),
+            ("hf2q.mmproj_sha256", &alternate_sha),
+        ],
+    );
+    let authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &text,
+        fs::metadata(&text).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    let mut candidate = Candidate {
+        repository: "owner/model".into(),
+        revision: "a".repeat(40),
+        path: text.clone(),
+        root: directory.path().to_path_buf(),
+        bytes: fs::metadata(&text).unwrap().len(),
+        sha256: "f".repeat(64),
+        quant: QuantType::Q4_K_M,
+        origin: "hf_hub_cache_structural".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 0,
+        projector: None,
+        sidecar: None,
+        receipt_target_identity: None,
+    };
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: "owner/model".into(),
+        revision: "a".repeat(40),
+        requires_projector: true,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: vec![
+            HubGgufArtifact {
+                repository: "owner/model".into(),
+                revision: "a".repeat(40),
+                filename: "mmproj-expected.gguf".into(),
+                bytes: 10,
+                sha256: expected_sha,
+                quant_hint: None,
+                role: "companion".into(),
+                selectable: false,
+                unavailable_reason: Some("companion".into()),
+            },
+            HubGgufArtifact {
+                repository: "owner/model".into(),
+                revision: "a".repeat(40),
+                filename: "mmproj-alternate.gguf".into(),
+                bytes: 11,
+                sha256: alternate_sha,
+                quant_hint: None,
+                role: "companion".into(),
+                selectable: false,
+                unavailable_reason: Some("companion".into()),
+            },
+        ],
+    };
+    fs::rename(&text, &parked).unwrap();
+    fs::rename(&alternate, &text).unwrap();
+    let hook_text = text.clone();
+    let hook_parked = parked.clone();
+    let hook_displaced = displaced.clone();
+    let _hook = set_after_retained_text_projector_metadata(move || {
+        fs::rename(&hook_text, &hook_displaced).unwrap();
+        fs::rename(&hook_parked, &hook_text).unwrap();
+    });
+    let mut selected = None;
+    let error = prepare_cached_projector_in_place_with_sources(
+        &mut candidate,
+        &authority,
+        &catalog,
+        &mut |_| {},
+        |_| None,
+        |artifact| {
+            selected = Some(artifact.filename.clone());
+            bail!("stop after retained selection")
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("changed during retained projector planning"));
+    assert!(
+        selected.is_none(),
+        "no projector transfer may start after a text authority swap"
+    );
+}
+
+#[test]
+fn manual_loose_sibling_selection_uses_retained_text_through_swap_restore() {
+    let directory = tempfile::tempdir().unwrap();
+    let text = directory.path().join("model-q4_k_m.gguf");
+    let parked = directory.path().join("model-original.gguf");
+    let alternate = directory.path().join("model-alternate.gguf");
+    let displaced = directory.path().join("model-displaced.gguf");
+    let exact_projector = directory.path().join("mmproj-exact.gguf");
+    let alternate_projector = directory.path().join("mmproj-alternate.gguf");
+    write_structurally_valid_mmproj(&exact_projector);
+    write_structurally_valid_mmproj(&alternate_projector);
+    let mut alternate_bytes = fs::read(&alternate_projector).unwrap();
+    *alternate_bytes.last_mut().unwrap() ^= 1;
+    fs::write(&alternate_projector, alternate_bytes).unwrap();
+    let exact_sha = crate::core::sha256::compute_file_sha256(&exact_projector).unwrap();
+    let alternate_sha = crate::core::sha256::compute_file_sha256(&alternate_projector).unwrap();
+    write_quant_gguf_with_metadata(
+        &text,
+        15,
+        &[
+            ("general.architecture", "qwen3vl"),
+            ("hf2q.mmproj_sha256", &exact_sha),
+        ],
+    );
+    write_quant_gguf_with_metadata(
+        &alternate,
+        15,
+        &[
+            ("general.architecture", "qwen3vl"),
+            ("hf2q.mmproj_sha256", &alternate_sha),
+        ],
+    );
+    let authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &text,
+        fs::metadata(&text).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    let mut candidate = Candidate {
+        repository: "owner/model".into(),
+        revision: "a".repeat(40),
+        path: text.clone(),
+        root: directory.path().to_path_buf(),
+        bytes: fs::metadata(&text).unwrap().len(),
+        sha256: "f".repeat(64),
+        quant: QuantType::Q4_K_M,
+        origin: "manual_structural".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 0,
+        projector: None,
+        sidecar: None,
+        receipt_target_identity: None,
+    };
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: "owner/model".into(),
+        revision: "a".repeat(40),
+        requires_projector: true,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: vec![HubGgufArtifact {
+            repository: "owner/model".into(),
+            revision: "a".repeat(40),
+            filename: "mmproj-exact.gguf".into(),
+            bytes: fs::metadata(&exact_projector).unwrap().len(),
+            sha256: exact_sha,
+            quant_hint: None,
+            role: "companion".into(),
+            selectable: false,
+            unavailable_reason: Some("companion".into()),
+        }],
+    };
+    fs::rename(&text, &parked).unwrap();
+    fs::rename(&alternate, &text).unwrap();
+    let hook_text = text.clone();
+    let hook_parked = parked.clone();
+    let hook_displaced = displaced.clone();
+    let _hook = set_after_retained_text_projector_metadata(move || {
+        fs::rename(&hook_text, &hook_displaced).unwrap();
+        fs::rename(&hook_parked, &hook_text).unwrap();
+    });
+    let mut warnings = Vec::new();
+    let selected = best_effort_manual_projector_with_catalog(
+        &mut candidate,
+        &authority,
+        &[directory.path().to_path_buf()],
+        &catalog,
+        &mut warnings,
+        &mut |_| {},
+    );
+    assert!(selected.is_none());
+    assert!(warnings.iter().any(|warning| {
+        warning.contains("text authority changed") && warning.contains("serving text-only")
+    }));
+}
+
+#[test]
+fn manual_loose_hosted_fallback_keeps_retained_digest_after_public_swap() {
+    let text_root = tempfile::tempdir().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let text = text_root.path().join("model-q4_k_m.gguf");
+    let parked = text_root.path().join("model-original.gguf");
+    let alternate = text_root.path().join("model-alternate.gguf");
+    let displaced = text_root.path().join("model-displaced.gguf");
+    let exact_source = sources.path().join("mmproj-exact.gguf");
+    let alternate_source = sources.path().join("mmproj-alternate.gguf");
+    fs::write(&exact_source, b"exact-projector").unwrap();
+    fs::write(&alternate_source, b"other-projector").unwrap();
+    let exact_sha = crate::core::sha256::compute_file_sha256(&exact_source).unwrap();
+    let alternate_sha = crate::core::sha256::compute_file_sha256(&alternate_source).unwrap();
+    write_quant_gguf_with_metadata(
+        &text,
+        15,
+        &[
+            ("general.architecture", "qwen3vl"),
+            ("hf2q.mmproj_sha256", &exact_sha),
+        ],
+    );
+    write_quant_gguf_with_metadata(
+        &alternate,
+        15,
+        &[
+            ("general.architecture", "qwen3vl"),
+            ("hf2q.mmproj_sha256", &alternate_sha),
+        ],
+    );
+    let authority = crate::core::bounded_file::StableRegularFile::open_exact(
+        &text,
+        fs::metadata(&text).unwrap().len(),
+    )
+    .unwrap()
+    .unwrap();
+    let mut candidate = Candidate {
+        repository: "owner/model".into(),
+        revision: "a".repeat(40),
+        path: text.clone(),
+        root: text_root.path().to_path_buf(),
+        bytes: fs::metadata(&text).unwrap().len(),
+        sha256: "f".repeat(64),
+        quant: QuantType::Q4_K_M,
+        origin: "manual_structural".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 0,
+        projector: None,
+        sidecar: None,
+        receipt_target_identity: None,
+    };
+    let catalog = HubGgufCatalog {
+        schema_version: "hf2q.hub-gguf-catalog.v2".into(),
+        repository: "owner/model".into(),
+        revision: "a".repeat(40),
+        requires_projector: true,
+        source_weight_bytes: None,
+        source_uncached_weight_bytes: None,
+        artifacts: vec![
+            HubGgufArtifact {
+                repository: "owner/model".into(),
+                revision: "a".repeat(40),
+                filename: "mmproj-exact.gguf".into(),
+                bytes: fs::metadata(&exact_source).unwrap().len(),
+                sha256: exact_sha,
+                quant_hint: None,
+                role: "companion".into(),
+                selectable: false,
+                unavailable_reason: Some("companion".into()),
+            },
+            HubGgufArtifact {
+                repository: "owner/model".into(),
+                revision: "a".repeat(40),
+                filename: "mmproj-alternate.gguf".into(),
+                bytes: fs::metadata(&alternate_source).unwrap().len(),
+                sha256: alternate_sha,
+                quant_hint: None,
+                role: "companion".into(),
+                selectable: false,
+                unavailable_reason: Some("companion".into()),
+            },
+        ],
+    };
+    let hook_text = text.clone();
+    let hook_parked = parked.clone();
+    let hook_alternate = alternate.clone();
+    let _hook = set_before_manual_hosted_projector_fallback(move || {
+        fs::rename(&hook_text, &hook_parked).unwrap();
+        fs::rename(&hook_alternate, &hook_text).unwrap();
+    });
+    let mut warnings = Vec::new();
+    let selected = best_effort_manual_projector_with_catalog(
+        &mut candidate,
+        &authority,
+        &[sources.path().to_path_buf()],
+        &catalog,
+        &mut warnings,
+        &mut |_| {},
+    );
+    assert_eq!(
+        selected.as_deref(),
+        Some(text_root.path().join("mmproj-exact.gguf").as_path())
+    );
+    fs::rename(&text, &displaced).unwrap();
+    fs::rename(&parked, &text).unwrap();
 }
 
 #[test]
@@ -1865,7 +4105,7 @@ fn actual_local_selection_prefers_successful_use_and_exact_quant_ignores_low_mem
     assert_eq!(
         verify_candidate_calls(),
         1,
-        "a successfully-used bound quant must be hashed exactly once on repeat serve"
+        "a successfully-used bound quant must receive one bounded GGUF metadata admission"
     );
 
     let bare_spec = RepositoryModelSpec {
@@ -1889,6 +4129,146 @@ fn actual_local_selection_prefers_successful_use_and_exact_quant_ignores_low_mem
     .expect("verified admissible local bytes must win before setup fallback parsing");
     assert_eq!(resolved.gguf_path, paths[1]);
     assert_eq!(verify_candidate_calls(), 1);
+}
+
+#[test]
+fn successfully_used_managed_pair_returns_before_hub_download_or_native_conversion() {
+    use std::cell::Cell;
+
+    let models = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let repository = "owner/model";
+    let revision = "a".repeat(40);
+    let text = models.path().join("model-q4_k_m.gguf");
+    let projector = models.path().join("mmproj-model-f16.gguf");
+    write_quant_gguf_with_metadata(
+        &text,
+        15,
+        &[("hf2q.vision.projector_profile", "test-vision")],
+    );
+    write_structurally_valid_mmproj(&projector);
+    let binding = ManagedBinding {
+        schema_version: SCHEMA_VERSION,
+        repository: repository.into(),
+        revision: revision.clone(),
+        quant: "Q4_K_M".into(),
+        origin: "manual_adoption".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 2,
+        artifact: ArtifactBinding {
+            local_filename: "model-q4_k_m.gguf".into(),
+            hub_filename: "gguf/model-q4_k_m.gguf".into(),
+            bytes: fs::metadata(&text).unwrap().len(),
+            sha256: crate::core::sha256::compute_file_sha256(&text).unwrap(),
+        },
+        projector: Some(ArtifactBinding {
+            local_filename: "mmproj-model-f16.gguf".into(),
+            hub_filename: "gguf/mmproj-model-f16.gguf".into(),
+            bytes: fs::metadata(&projector).unwrap().len(),
+            sha256: crate::core::sha256::compute_file_sha256(&projector).unwrap(),
+        }),
+    };
+    write_binding(&sidecar_path(&text), &binding).unwrap();
+    let mut cache = ModelCache::open_at(cache_dir.path()).unwrap();
+    let hardware = HardwareProfile {
+        chip_model: "test-host".into(),
+        total_memory_bytes: 128 << 30,
+        available_memory_bytes: 64 << 30,
+        performance_cores: 1,
+        efficiency_cores: 1,
+        total_cores: 2,
+        memory_bandwidth_gbs: 1.0,
+    };
+    let mut events = Vec::new();
+    let catalog_calls = Cell::new(0_u8);
+    reset_verify_candidate_calls();
+    reset_verify_projector_calls();
+    let resolved = resolve_repository_with_progress_and_catalog(
+        &RepositoryModelSpec {
+            repository: repository.into(),
+            quant: None,
+        },
+        None,
+        &[models.path().to_path_buf()],
+        &mut cache,
+        &hardware,
+        true,
+        None,
+        &mut |event| events.push(event),
+        |_| {
+            catalog_calls.set(catalog_calls.get() + 1);
+            panic!("a successfully-used verified pair must not query Hub metadata")
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resolved.gguf_path, text);
+    assert_eq!(resolved.mmproj_path.as_deref(), Some(projector.as_path()));
+    assert_eq!(resolved.repository, repository);
+    assert_eq!(resolved.revision, revision);
+    assert_eq!(resolved.quant, QuantType::Q4_K_M);
+    assert_eq!(resolved.origin, "manual_adoption");
+    assert!(resolved.warnings.is_empty());
+    assert!(resolved.activation_authority.is_some());
+    assert!(resolved.mmproj_activation_authority.is_some());
+    assert_eq!(catalog_calls.get(), 0);
+    assert_eq!(verify_candidate_calls(), 1);
+    assert_eq!(verify_projector_calls(), 1);
+    assert!(matches!(
+        events.first(),
+        Some(StartupEvent::LocalSearch { .. })
+    ));
+    assert!(matches!(
+        events.last(),
+        Some(StartupEvent::LocalReady { .. })
+    ));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        StartupEvent::VerifyStart { .. } | StartupEvent::VerifyProgress { .. }
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        StartupEvent::HubMetadata { .. }
+            | StartupEvent::HostedDownload { .. }
+            | StartupEvent::NativeConversion { .. }
+    )));
+}
+
+#[test]
+fn managed_candidate_same_quant_swap_after_verification_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("model-q4_k_m.gguf");
+    let replacement = directory.path().join("replacement-q4_k_m.gguf");
+    let prior = directory.path().join("prior-q4_k_m.gguf");
+    write_quant_gguf(&path, 15);
+    write_quant_gguf(&replacement, 15);
+    let bytes = fs::metadata(&path).unwrap().len();
+    let candidate = Candidate {
+        repository: "owner/model".into(),
+        revision: "a".repeat(40),
+        root: directory.path().to_path_buf(),
+        path: path.clone(),
+        bytes,
+        sha256: "0".repeat(64),
+        quant: QuantType::Q4_K_M,
+        origin: "managed".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 2,
+        projector: None,
+        sidecar: None,
+        receipt_target_identity: None,
+    };
+    let authority = verify_candidate(&candidate).unwrap();
+    fs::rename(&path, &prior).unwrap();
+    fs::rename(&replacement, &path).unwrap();
+
+    let error = match candidate.into_resolved(None, Vec::new(), Some(authority)) {
+        Ok(_) => panic!("same-quant replacement must not replace the verified activation inode"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("changed after bounded verification"));
 }
 
 #[test]
@@ -1922,7 +4302,7 @@ fn first_use_bound_candidate_hashes_once_across_catalog_and_loose_scan() {
     let cache = ModelCache::open_at(cache_dir.path()).unwrap();
     let mut warnings = Vec::new();
     reset_verify_candidate_calls();
-    let (candidate, identity, lock) = select_local(
+    let (candidate, authority, lock) = select_local(
         &RepositoryModelSpec {
             repository: "owner/model".into(),
             quant: Some(QuantType::Q4_K_M),
@@ -1937,6 +4317,7 @@ fn first_use_bound_candidate_hashes_once_across_catalog_and_loose_scan() {
     .unwrap()
     .expect("bound first-use candidate");
     drop(lock);
+    let identity = authority.identity();
     assert_eq!(verify_candidate_calls(), 1);
 
     let mut hosted_artifact = hosted(QuantType::Q4_K_M, "model-q4_k_m.gguf");
@@ -1959,7 +4340,7 @@ fn first_use_bound_candidate_hashes_once_across_catalog_and_loose_scan() {
     assert_eq!(
         verify_candidate_calls(),
         1,
-        "catalog lookup, the bound path, and a hard-link alias must not trigger another full hash"
+        "catalog lookup, the bound path, and a hard-link alias must not repeat GGUF admission"
     );
 }
 
@@ -1981,6 +4362,7 @@ fn local_candidate_mutated_during_catalog_latency_is_discarded_for_fallback() {
         last_used_at_secs: 0,
         projector: None,
         sidecar: None,
+        receipt_target_identity: None,
     };
     let identity =
         crate::core::bounded_file::StableRegularFile::open_exact(&candidate.path, candidate.bytes)
@@ -2075,7 +4457,7 @@ fn cache_selection_tracks_the_exact_quant_used_not_the_repository_lru() {
         &mut warnings,
     )
     .unwrap()
-    .unwrap_or_else(|| panic!("one verified local quant must be selected: {warnings:?}"))
+    .unwrap_or_else(|| panic!("one compatible local quant must be selected: {warnings:?}"))
     .0;
     assert_eq!(selected.quant, QuantType::Q4_K_M);
     assert_eq!(

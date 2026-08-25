@@ -514,6 +514,7 @@ mod tests {
         (
             std::path::PathBuf::from("/dev/null/synthetic.gguf"),
             EngineConfig {
+                operator_model_path: None,
                 tokenizer_path: None,
                 config_path: None,
                 queue_capacity: 32,

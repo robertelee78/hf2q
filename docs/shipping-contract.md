@@ -2,11 +2,10 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
-Current published release: `v0.1.15`. Public availability is authoritative
+Current published release: `v0.1.16`. Public availability is authoritative
 only after exact-artifact release proof completes.
 
-This document defines the public hf2q product surface and the **next-release
-candidate** where explicitly marked. It also defines
+This document defines the public hf2q product surface for `v0.1.16`. It also defines
 the policy each environment variable is classified under. Per-variable
 effects live in `docs/operator-env-vars.md`; this document sits one level above
 and defines *what is supported*.
@@ -18,7 +17,7 @@ does not imply native generation or serving support.
 
 ---
 
-## Category 1 — Production contract and next-release candidate
+## Category 1 — Production contract
 
 What the default release binary does with **no environment variables set**.
 The exact model-family surface is explicit below; no family inherits another
@@ -43,10 +42,13 @@ cache, or forward graph.
 
 ### Repository model operands and managed local artifacts
 
-The next-release candidate accepts `owner/repository[:QUANT]` as the common
+hf2q `v0.1.16` accepts `owner/repository[:QUANT]` as the common
 model operand for `convert`, `serve`, and `chat`, as governed by ADR-051.
-`serve` and model-targeted `chat` prefer exact verified local authority,
-including manually downloaded bytes that match immutable Hub metadata. They
+`serve` and model-targeted `chat` prefer hf2q-bound local authority, then a
+unique compatible structural match among manually downloaded or canonical
+hf-hub-cache bytes. Structural matching uses catalog quant/size plus bounded
+GGUF metadata, tokenizer, tensor layout, and runtime support; it intentionally
+does not claim immutable payload identity or hash the full model. They
 then use a compatible hosted GGUF and fall back to hf2q-native source
 conversion only when the repository has no supported hosted GGUF. An explicit
 quant selects exactly that quant; an unqualified request prefers the most
@@ -57,9 +59,11 @@ hosted tier.
 `convert` never uses a hosted pre-quantized GGUF as its result: it downloads
 source weights and executes hf2q's native conversion and quantization. Without
 `--output`, remote conversion writes beneath
-`${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models/<owner>__<repository>/<immutable-revision>/`.
+`${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models/v2-<hex(UTF-8 repository)>/<immutable-revision>/`.
+The injective encoded directory is the only new-write layout;
+`<owner>__<repository>` remains read-only legacy compatibility.
 The quant suffix and `--quant` are equivalent and conflicting values fail
-before payload transfer. A matching verified hf2q conversion is an idempotent
+before payload transfer. A matching receipt-verified hf2q conversion is an idempotent
 success.
 
 For a selected supported multimodal text artifact, `serve` and model-targeted

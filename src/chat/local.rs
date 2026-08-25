@@ -21,6 +21,7 @@ use crate::serve::discovery::{
 
 use super::client::fetch_models;
 use super::endpoint::{Endpoint, EndpointResolver, EndpointSession, OwnedServerProcess};
+use super::startup_ui::{interactive_startup_enabled, StartupOutput, StartupUi};
 use super::wire::Model;
 
 const EXISTING_DISCOVERY_WINDOW: Duration = Duration::from_secs(2);
@@ -28,6 +29,7 @@ const STARTUP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const MODEL_STARTUP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const MODEL_STARTUP_HEARTBEAT: Duration = Duration::from_secs(30);
+const MAX_STARTUP_EVENTS_PER_TICK: usize = 32;
 
 #[derive(Debug)]
 struct VerifiedServer {
@@ -70,13 +72,15 @@ impl EndpointResolver for AutomaticEndpointResolver {
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
         let mut input = stdin.lock();
-        let mut output = stdout.lock();
+        let interactive = interactive_startup_enabled(std::io::IsTerminal::is_terminal(&stdout));
+        let mut output = stdout;
         runtime.block_on(resolve_local(
             args,
             &mut input,
             &mut output,
             auth_token.as_deref(),
             self.state_root.as_deref(),
+            interactive,
         ))
     }
 }
@@ -87,13 +91,14 @@ async fn resolve_local(
     output: &mut impl Write,
     owned_auth_token: Option<&str>,
     state_root: Option<&std::path::Path>,
+    interactive: bool,
 ) -> Result<EndpointSession> {
     let http = reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(HTTP_PROBE_TIMEOUT)
         .timeout(HTTP_PROBE_TIMEOUT)
         .build()
         .context("build local server probe client")?;
-
     if args.target.is_none() {
         let mut browser = LocalDiscoveryBrowser::start().context("start local hf2q discovery")?;
         let existing = collect_verified(&mut browser, &http, EXISTING_DISCOVERY_WINDOW).await?;
@@ -103,19 +108,8 @@ async fn resolve_local(
         }
     }
 
-    if args.target.is_some() {
-        writeln!(
-            output,
-            "starting an owned hf2q server for the requested model"
-        )?;
-        writeln!(
-            output,
-            "preparing the requested model; local verification, download, or native conversion may take time on first use"
-        )?;
-    } else {
-        writeln!(output, "no local hf2q server found; starting one")?;
-    }
-    output.flush()?;
+    let mut startup_ui = StartupUi::new(output, interactive, StartupOutput::Stdout);
+    startup_ui.announce_owned(args.target.is_some())?;
     let mut child = spawn_server(args.target.as_deref(), state_root).context("start hf2q serve")?;
     let startup = wait_for_spawned_server(
         &http,
@@ -126,7 +120,7 @@ async fn resolve_local(
             STARTUP_DISCOVERY_TIMEOUT
         },
         owned_auth_token,
-        output,
+        &mut startup_ui,
         args.target.is_some(),
     )
     .await;
@@ -191,6 +185,9 @@ fn spawn_server(
     let (parent_lifeline, child_lifeline) = std::os::unix::net::UnixStream::pair()
         .context("create private chat parent-lifetime channel")?;
     let child_fd = child_lifeline.as_raw_fd();
+    let (startup_progress, child_startup_progress) = std::os::unix::net::UnixDatagram::pair()
+        .context("create private chat startup-progress channel")?;
+    let startup_progress_fd = child_startup_progress.as_raw_fd();
     let server_log = tempfile::Builder::new()
         .prefix("hf2q-chat-server-")
         .suffix(".log")
@@ -205,6 +202,7 @@ fn spawn_server(
         target,
         state_root,
         child_fd,
+        startup_progress_fd,
         listener_fd,
         listener_port,
     );
@@ -218,7 +216,7 @@ fn spawn_server(
     // any model-transfer or conversion descendants.
     unsafe {
         command.pre_exec(move || {
-            for fd in [child_fd, listener_fd] {
+            for fd in [child_fd, startup_progress_fd, listener_fd] {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                     return Err(std::io::Error::last_os_error());
@@ -231,7 +229,14 @@ fn spawn_server(
         .spawn()
         .context("spawn current executable as hf2q serve")?;
     drop(child_lifeline);
-    OwnedServerProcess::from_spawned(child, parent_lifeline, server_log, Some(listener_guard))
+    drop(child_startup_progress);
+    OwnedServerProcess::from_spawned(
+        child,
+        parent_lifeline,
+        Some(startup_progress),
+        server_log,
+        Some(listener_guard),
+    )
 }
 
 #[cfg(unix)]
@@ -240,6 +245,7 @@ fn append_owned_server_args(
     target: Option<&str>,
     state_root: Option<&std::path::Path>,
     child_fd: std::os::fd::RawFd,
+    startup_progress_fd: std::os::fd::RawFd,
     listener_fd: std::os::fd::RawFd,
     listener_port: u16,
 ) {
@@ -256,6 +262,8 @@ fn append_owned_server_args(
         .arg("--quiet")
         .args(["--operator-ui", "plain", "--chat-parent-lifeline-fd"])
         .arg(child_fd.to_string())
+        .arg("--chat-startup-progress-fd")
+        .arg(startup_progress_fd.to_string())
         .arg("--chat-owned-listener-fd")
         .arg(listener_fd.to_string());
 }
@@ -303,7 +311,7 @@ async fn wait_for_spawned_server(
     process: &mut OwnedServerProcess,
     timeout: Duration,
     auth_token: Option<&str>,
-    output: &mut impl Write,
+    startup_ui: &mut StartupUi<'_, impl Write>,
     show_preparation_progress: bool,
 ) -> Result<VerifiedServer> {
     let started = tokio::time::Instant::now();
@@ -321,9 +329,12 @@ async fn wait_for_spawned_server(
                 timeout
             );
         }
+        if show_preparation_progress {
+            drain_startup_events(process, startup_ui)?;
+        }
         if show_preparation_progress && tokio::time::Instant::now() >= next_heartbeat {
             let elapsed = tokio::time::Instant::now().duration_since(started);
-            write_model_startup_heartbeat(output, elapsed)?;
+            startup_ui.heartbeat(elapsed)?;
             next_heartbeat += MODEL_STARTUP_HEARTBEAT;
         }
         if ready_port.is_none() {
@@ -333,6 +344,14 @@ async fn wait_for_spawned_server(
             // Credentials are sent only to the port delivered by the exact
             // child over the private inherited ownership socket.
             if let Some(server) = verify_owned_endpoint(http, port, auth_token).await {
+                // The child can publish its final load/projector milestone
+                // immediately before READY. Drain one more bounded batch so a
+                // fast startup does not replace that durable milestone with
+                // the endpoint-ready row.
+                if show_preparation_progress {
+                    drain_startup_events(process, startup_ui)?;
+                }
+                startup_ui.ready(server.endpoint.base_url())?;
                 return Ok(server);
             }
         }
@@ -340,14 +359,26 @@ async fn wait_for_spawned_server(
     }
 }
 
-fn write_model_startup_heartbeat(output: &mut impl Write, elapsed: Duration) -> Result<()> {
-    writeln!(
-        output,
-        "still preparing the requested model ({}s elapsed); first use may be downloading or converting",
-        elapsed.as_secs()
-    )?;
-    output.flush()?;
-    Ok(())
+fn drain_startup_events(
+    process: &OwnedServerProcess,
+    startup_ui: &mut StartupUi<'_, impl Write>,
+) -> Result<usize> {
+    drain_startup_event_source(|| process.poll_startup_event(), startup_ui)
+}
+
+fn drain_startup_event_source(
+    mut next: impl FnMut() -> Option<crate::serve::startup_progress::StartupEvent>,
+    startup_ui: &mut StartupUi<'_, impl Write>,
+) -> Result<usize> {
+    let mut drained = 0;
+    for _ in 0..MAX_STARTUP_EVENTS_PER_TICK {
+        let Some(event) = next() else {
+            break;
+        };
+        startup_ui.event(event)?;
+        drained += 1;
+    }
+    Ok(drained)
 }
 
 async fn verify_candidate(
@@ -607,6 +638,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/operator-state")),
             42,
             43,
+            44,
             9123,
         );
         let args = command
@@ -626,6 +658,9 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--chat-parent-lifeline-fd", "42"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--chat-startup-progress-fd", "43"]));
     }
 
     #[cfg(unix)]
@@ -646,7 +681,7 @@ mod tests {
             .unwrap();
         let child_pid = child.id() as libc::pid_t;
         let mut process =
-            OwnedServerProcess::from_spawned(child, parent_lifeline, log, None).unwrap();
+            OwnedServerProcess::from_spawned(child, parent_lifeline, None, log, None).unwrap();
 
         let error = finalize_failed_startup(anyhow::anyhow!("startup probe failed"), &mut process);
         let rendered = format!("{error:#}");
@@ -730,7 +765,8 @@ mod tests {
             .unwrap();
         let log = tempfile::NamedTempFile::new().unwrap();
         let mut process =
-            OwnedServerProcess::from_spawned(child, parent_lifeline, log, Some(guard)).unwrap();
+            OwnedServerProcess::from_spawned(child, parent_lifeline, None, log, Some(guard))
+                .unwrap();
         write!(
             child_lifeline,
             "{}{port}\n",
@@ -739,12 +775,13 @@ mod tests {
         .unwrap();
         child_lifeline.flush().unwrap();
         let mut output = Vec::new();
+        let mut startup_ui = StartupUi::new(&mut output, false, StartupOutput::Stdout);
         let verified = wait_for_spawned_server(
             &reqwest::Client::new(),
             &mut process,
             Duration::from_secs(2),
             Some("secret"),
-            &mut output,
+            &mut startup_ui,
             false,
         )
         .await
@@ -764,10 +801,38 @@ mod tests {
     #[test]
     fn model_startup_heartbeat_is_operator_visible_without_private_log_content() {
         let mut output = Vec::new();
-        write_model_startup_heartbeat(&mut output, Duration::from_secs(61)).unwrap();
+        {
+            let mut startup_ui = StartupUi::new(&mut output, false, StartupOutput::Stdout);
+            startup_ui
+                .event(crate::serve::startup_progress::StartupEvent::VerifyStart {
+                    artifact: "text GGUF".into(),
+                    bytes: 100,
+                    filename: "model.gguf".into(),
+                })
+                .unwrap();
+            startup_ui.heartbeat(Duration::from_secs(61)).unwrap();
+        }
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("61s elapsed"));
-        assert!(output.contains("downloading or converting"));
+        assert!(output.contains("verifying immutable payload bytes"));
+    }
+
+    #[test]
+    fn startup_event_drain_is_bounded_per_poll_tick() {
+        let event = crate::serve::startup_progress::StartupEvent::TextReady { elapsed_ms: 1 };
+        let mut events =
+            std::collections::VecDeque::from(vec![event; MAX_STARTUP_EVENTS_PER_TICK + 1]);
+
+        let mut output = Vec::new();
+        let mut startup_ui = StartupUi::new(&mut output, false, StartupOutput::Stdout);
+        assert_eq!(
+            drain_startup_event_source(|| events.pop_front(), &mut startup_ui).unwrap(),
+            MAX_STARTUP_EVENTS_PER_TICK
+        );
+        assert_eq!(
+            drain_startup_event_source(|| events.pop_front(), &mut startup_ui).unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

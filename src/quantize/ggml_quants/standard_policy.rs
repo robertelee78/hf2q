@@ -22,8 +22,8 @@
 //!    mirrored 1:1 so the downstream P1 byte-cmp gate has a chance.
 
 use super::error::QuantizeError;
-use super::ggml_type::GgmlType;
 use super::ftype::GgufFtype;
+use super::ggml_type::GgmlType;
 use super::tensor_ref::{ArchName, TensorRef};
 
 /// Mirrors the peer's `tensor_category` enum. Decides which
@@ -508,8 +508,7 @@ impl StandardPolicy {
             } else if category == TensorCategory::FfnDown {
                 // C:497-502
                 if qs.i_ffn_down < qs.n_ffn_down / 8 {
-                    new_type = if matches!(ftype, GgufFtype::MostlyIQ2_S | GgufFtype::MostlyIQ2_M)
-                    {
+                    new_type = if matches!(ftype, GgufFtype::MostlyIQ2_S | GgufFtype::MostlyIQ2_M) {
                         GgmlType::IQ3_S
                     } else {
                         GgmlType::Q2_K

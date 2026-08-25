@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
@@ -19,6 +20,8 @@ mod render;
 use render::{draw, enter_terminal, restore_terminal};
 
 const EVENT_CAPACITY: usize = 256;
+const STARTUP_LOG_CAPACITY: usize = 256;
+const STARTUP_LOG_LINE_BYTES: usize = 8192;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(200);
 const FINISHED_RETENTION: Duration = Duration::from_secs(4);
 const MAX_LOG_LINES: usize = 4;
@@ -36,6 +39,79 @@ const STRUCTURED_PROGRESS_MESSAGES: &[&str] = &[
 ];
 
 static EVENT_SINK: Mutex<Option<SyncSender<Event>>> = Mutex::new(None);
+static EVENT_SINK_STOPPING: AtomicBool = AtomicBool::new(false);
+static STARTUP_LOG_SINK: Mutex<Option<StartupLogBuffer>> = Mutex::new(None);
+
+struct StartupLogBuffer {
+    lines: VecDeque<String>,
+    dropped: usize,
+}
+
+/// Keeps tracing from painting through the direct-serve startup progress row.
+/// The bounded buffer is flushed after the row is cleared, or on early-error
+/// drop, so verbose diagnostics remain available without corrupting the TUI.
+pub(crate) struct StartupLogGuard {
+    active: bool,
+}
+
+pub(crate) fn begin_startup_log_capture() -> StartupLogGuard {
+    let active = STARTUP_LOG_SINK.lock().is_ok_and(|mut sink| {
+        if sink.is_some() {
+            false
+        } else {
+            *sink = Some(StartupLogBuffer {
+                lines: VecDeque::with_capacity(STARTUP_LOG_CAPACITY),
+                dropped: 0,
+            });
+            true
+        }
+    });
+    StartupLogGuard { active }
+}
+
+impl StartupLogGuard {
+    pub(crate) fn finish(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        flush_startup_logs()
+    }
+}
+
+impl Drop for StartupLogGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            let _ = flush_startup_logs();
+        }
+    }
+}
+
+fn flush_startup_logs() -> io::Result<()> {
+    let buffer = STARTUP_LOG_SINK
+        .lock()
+        .ok()
+        .and_then(|mut sink| sink.take());
+    let Some(buffer) = buffer else {
+        return Ok(());
+    };
+    let mut stderr = io::stderr().lock();
+    for line in buffer.lines {
+        stderr.write_all(line.as_bytes())?;
+        if !line.ends_with('\n') {
+            stderr.write_all(b"\n")?;
+        }
+    }
+    if buffer.dropped > 0 {
+        writeln!(
+            stderr,
+            "hf2q: {count} verbose startup log lines were omitted from the bounded TUI buffer",
+            count = buffer.dropped
+        )?;
+    }
+    stderr.flush()
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct RequestKey {
@@ -78,6 +154,7 @@ enum Event {
         outcome: &'static str,
     },
     Unhealthy(String),
+    HttpReady,
     Log(String),
     Stop,
 }
@@ -121,6 +198,7 @@ struct DashboardState {
     requests: BTreeMap<RequestKey, RequestView>,
     logs: VecDeque<String>,
     unhealthy: Option<String>,
+    http_ready: bool,
 }
 
 pub(crate) struct OperatorUiGuard {
@@ -130,18 +208,22 @@ pub(crate) struct OperatorUiGuard {
 
 impl Drop for OperatorUiGuard {
     fn drop(&mut self) {
-        if let Ok(mut sink) = EVENT_SINK.lock() {
-            *sink = None;
-        }
+        // Keep presentation ownership until the renderer has restored the
+        // terminal. Teardown-time logs are deliberately discarded instead of
+        // painting through an alternate screen that is still active.
+        EVENT_SINK_STOPPING.store(true, Ordering::Release);
         if let Some(sender) = self.sender.take() {
-            // Never let a saturated presentation queue delay server shutdown.
-            // Dropping the last sender also terminates the renderer after it
-            // drains any events already in flight when Stop cannot be queued.
+            // Best-effort wakeup; the stopping flag is authoritative when a
+            // saturated presentation queue cannot accept the control event.
             let _ = sender.try_send(Event::Stop);
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        if let Ok(mut sink) = EVENT_SINK.lock() {
+            *sink = None;
+        }
+        EVENT_SINK_STOPPING.store(false, Ordering::Release);
     }
 }
 
@@ -159,11 +241,15 @@ impl Drop for TerminalGuard {
 /// dashboard channel instead of painting through the live screen.
 pub(crate) struct LogLineWriter {
     bytes: Vec<u8>,
+    truncated: bool,
 }
 
 impl Write for LogLineWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.bytes.extend_from_slice(buf);
+        let remaining = STARTUP_LOG_LINE_BYTES.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&buf[..buf.len().min(remaining)]);
+        self.truncated |= buf.len() > remaining;
         Ok(buf.len())
     }
 
@@ -177,14 +263,44 @@ impl Drop for LogLineWriter {
         if self.bytes.is_empty() {
             return;
         }
-        let line = String::from_utf8_lossy(&self.bytes).into_owned();
-        if publish(Event::Log(line)) {
+        let line = bounded_log_line(&self.bytes, self.truncated);
+        if publish(Event::Log(line.clone())) {
             return;
         }
+        if let Ok(mut sink) = STARTUP_LOG_SINK.lock() {
+            if let Some(buffer) = sink.as_mut() {
+                if buffer.lines.len() == STARTUP_LOG_CAPACITY {
+                    buffer.lines.pop_front();
+                    buffer.dropped = buffer.dropped.saturating_add(1);
+                }
+                buffer.lines.push_back(line);
+                return;
+            }
+        }
         let mut stderr = io::stderr().lock();
-        let _ = stderr.write_all(&self.bytes);
+        let _ = stderr.write_all(line.as_bytes());
         let _ = stderr.flush();
     }
+}
+
+fn bounded_log_line(bytes: &[u8], truncated: bool) -> String {
+    let mut line = String::from_utf8_lossy(bytes).into_owned();
+    if !truncated {
+        return line;
+    }
+    // A byte cap can land inside an ANSI control sequence. Remove terminal
+    // controls from truncated events, then append an explicit marker so the
+    // next line cannot inherit a half-written style or cursor command.
+    line = console::strip_ansi_codes(&line).into_owned();
+    const SUFFIX: &str = " … [truncated]\n";
+    let maximum = STARTUP_LOG_LINE_BYTES.saturating_sub(SUFFIX.len());
+    let mut end = line.len().min(maximum);
+    while !line.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    line.truncate(end);
+    line.push_str(SUFFIX);
+    line
 }
 
 #[derive(Clone, Copy)]
@@ -194,7 +310,10 @@ impl<'a> MakeWriter<'a> for LogMakeWriter {
     type Writer = LogLineWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        LogLineWriter { bytes: Vec::new() }
+        LogLineWriter {
+            bytes: Vec::with_capacity(STARTUP_LOG_LINE_BYTES),
+            truncated: false,
+        }
     }
 }
 
@@ -212,15 +331,25 @@ pub(crate) fn start(
     }
 
     let (sender, receiver) = mpsc::sync_channel(EVENT_CAPACITY);
-    let thread = std::thread::Builder::new()
-        .name("hf2q-operator-ui".into())
-        .spawn(move || render_loop(receiver, model, family, endpoint, max_slots))
-        .context("spawn hf2q operator dashboard")?;
     let mut sink = EVENT_SINK
         .lock()
         .map_err(|_| anyhow::anyhow!("operator dashboard event sink poisoned"))?;
     anyhow::ensure!(sink.is_none(), "operator dashboard already active");
     *sink = Some(sender.clone());
+    EVENT_SINK_STOPPING.store(false, Ordering::Release);
+    drop(sink);
+    let thread = match std::thread::Builder::new()
+        .name("hf2q-operator-ui".into())
+        .spawn(move || render_loop(receiver, model, family, endpoint, max_slots))
+    {
+        Ok(thread) => thread,
+        Err(error) => {
+            if let Ok(mut sink) = EVENT_SINK.lock() {
+                *sink = None;
+            }
+            return Err(error).context("spawn hf2q operator dashboard");
+        }
+    };
     Ok(Some(OperatorUiGuard {
         sender: Some(sender),
         thread: Some(thread),
@@ -367,6 +496,12 @@ pub(crate) fn engine_unhealthy(reason: String) {
     let _ = publish(Event::Unhealthy(reason));
 }
 
+/// Transition the dashboard from listener-bound startup to an HTTP-ready
+/// state. Callers emit this only after a real `/health` response succeeds.
+pub(crate) fn http_ready() {
+    let _ = publish(Event::HttpReady);
+}
+
 /// Returns true whenever a dashboard owns the log line, including when its
 /// bounded queue is full and the line is deliberately dropped.
 fn publish(event: Event) -> bool {
@@ -376,6 +511,9 @@ fn publish(event: Event) -> bool {
     let Some(sender) = sink.as_ref() else {
         return false;
     };
+    if EVENT_SINK_STOPPING.load(Ordering::Acquire) {
+        return true;
+    }
     match sender.try_send(event) {
         Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
         Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -401,17 +539,21 @@ fn render_loop(
         requests: BTreeMap::new(),
         logs: VecDeque::new(),
         unhealthy: None,
+        http_ready: false,
     };
     enter_terminal();
     let _terminal = TerminalGuard;
     let mut running = true;
-    while running {
+    while running && !EVENT_SINK_STOPPING.load(Ordering::Acquire) {
         match receiver.recv_timeout(REDRAW_INTERVAL) {
             Ok(event) => running = apply_event(&mut state, event),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        while let Ok(event) = receiver.try_recv() {
+        while !EVENT_SINK_STOPPING.load(Ordering::Acquire) {
+            let Ok(event) = receiver.try_recv() else {
+                break;
+            };
             if !apply_event(&mut state, event) {
                 running = false;
                 break;
@@ -516,6 +658,7 @@ fn apply_event(state: &mut DashboardState, event: Event) -> bool {
             }
         }
         Event::Unhealthy(reason) => state.unhealthy = Some(reason),
+        Event::HttpReady => state.http_ready = true,
         Event::Log(line) => {
             let line = console::strip_ansi_codes(&line).trim().to_owned();
             if !line.is_empty() && operator_log_is_not_request_progress(&line) {
@@ -600,6 +743,23 @@ mod tests {
     }
 
     #[test]
+    fn tracing_event_storage_is_bounded_utf8_and_terminal_safe() {
+        let mut writer = LogLineWriter {
+            bytes: Vec::with_capacity(STARTUP_LOG_LINE_BYTES),
+            truncated: false,
+        };
+        let payload = format!("\u{1b}[31m{}é", "x".repeat(STARTUP_LOG_LINE_BYTES * 2));
+        assert_eq!(writer.write(payload.as_bytes()).unwrap(), payload.len());
+        assert_eq!(writer.bytes.len(), STARTUP_LOG_LINE_BYTES);
+        assert!(writer.truncated);
+        let line = bounded_log_line(&writer.bytes, writer.truncated);
+        assert!(line.len() <= STARTUP_LOG_LINE_BYTES);
+        assert!(!line.contains('\u{1b}'));
+        assert!(line.ends_with("[truncated]\n"));
+        writer.bytes.clear();
+    }
+
+    #[test]
     fn state_tracks_cached_suffix_progress_without_log_lines() {
         let mut state = DashboardState {
             model: "test".into(),
@@ -610,6 +770,7 @@ mod tests {
             requests: BTreeMap::new(),
             logs: VecDeque::new(),
             unhealthy: None,
+            http_ready: false,
         };
         let key = RequestKey {
             family: "qwen35",
@@ -696,5 +857,33 @@ mod tests {
             state.unhealthy.as_deref(),
             Some("engine_unhealthy: restart required")
         );
+    }
+
+    #[test]
+    fn dashboard_requires_an_explicit_http_health_transition() {
+        let mut state = DashboardState {
+            model: "test".into(),
+            family: "qwen35".into(),
+            endpoint: "http://127.0.0.1:8081".into(),
+            max_slots: 4,
+            started: Instant::now(),
+            requests: BTreeMap::new(),
+            logs: VecDeque::new(),
+            unhealthy: None,
+            http_ready: false,
+        };
+        assert!(!state.http_ready);
+        assert!(apply_event(&mut state, Event::HttpReady));
+        assert!(state.http_ready);
+    }
+
+    #[test]
+    fn dashboard_text_neutralizes_escape_newline_and_bidi_controls() {
+        let rendered = super::render::truncate("name\u{1b}[31m\n\u{202e}\u{2066}", 80);
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\u{2066}'));
+        assert_eq!(rendered, "name�[31m���");
     }
 }

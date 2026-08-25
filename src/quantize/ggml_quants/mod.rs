@@ -17,10 +17,10 @@ pub mod apex;
 pub mod common;
 pub mod deepseek4_agentic;
 pub mod error;
+pub mod ftype;
 pub mod ggml_type;
 pub mod iq4_nl;
 pub mod iq4_xs;
-pub mod ftype;
 pub mod q2_k;
 pub mod q3_k;
 pub mod q4_0;
@@ -41,8 +41,8 @@ pub use deepseek4_agentic::{
     Deepseek4AgenticQ2Policy, DEEPSEEK4_AGENTIC_Q2_METADATA_KEY, DEEPSEEK4_AGENTIC_Q2_NAME,
 };
 pub use error::QuantizeError;
-pub use ggml_type::GgmlType;
 pub use ftype::GgufFtype;
+pub use ggml_type::GgmlType;
 pub use quantizer::{quantizer_for, GgmlQuantizer, Quantizer};
 pub use standard_policy::{tensor_type_fallback, StandardPolicy, TensorCategory};
 pub use tensor_ref::{ArchName, SourceDtype, TensorRef};

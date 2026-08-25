@@ -81,14 +81,10 @@ fn resolve_token_id(
     tokenizer: &tokenizers::Tokenizer,
     metadata_key: &str,
 ) -> Option<u32> {
-    peer_special_token_id(gguf, metadata_key)
-        .and_then(|id| tokenizer.id_to_token(id).map(|_| id))
+    peer_special_token_id(gguf, metadata_key).and_then(|id| tokenizer.id_to_token(id).map(|_| id))
 }
 
-fn peer_special_token_id(
-    gguf: &mlx_native::gguf::GgufFile,
-    metadata_key: &str,
-) -> Option<u32> {
+fn peer_special_token_id(gguf: &mlx_native::gguf::GgufFile, metadata_key: &str) -> Option<u32> {
     if let Some(id) = gguf.metadata_u32(metadata_key) {
         return Some(id);
     }

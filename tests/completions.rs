@@ -13,6 +13,7 @@ const HIDDEN: &[&str] = &[
     "source-teacher-reference",
     "source-teacher-acceptance-verify",
     "--chat-parent-lifeline-fd",
+    "--chat-startup-progress-fd",
 ];
 
 struct IsolatedHome {
@@ -65,7 +66,7 @@ fn source_debug_binary_without_explicit_destinations_is_nonmutating() {
         .env("HOME", home.path())
         .env("XDG_STATE_HOME", home.path().join("state"))
         .env("SHELL", "/bin/zsh")
-        .arg("--version")
+        .args(["serve", "list"])
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -75,16 +76,28 @@ fn source_debug_binary_without_explicit_destinations_is_nonmutating() {
 }
 
 #[test]
-fn first_invocation_provisions_all_shells_startup_and_receipt_idempotently() {
+fn first_real_command_provisions_all_shells_after_protocol_clean_version() {
     let home = IsolatedHome::new();
     fs::write(home.path().join(".zshrc"), b"operator-owned startup\n").unwrap();
 
     let first = home.command().arg("--version").output().unwrap();
     assert!(first.status.success(), "{first:?}");
-    let stderr = String::from_utf8(first.stderr).unwrap();
     assert!(
-        stderr.contains("installed Tab completion for bash, fish, zsh"),
-        "{stderr}"
+        first.stderr.is_empty(),
+        "early --version must remain protocol-clean: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    for path in home.registrations() {
+        assert!(!path.exists(), "--version provisioned {}", path.display());
+    }
+    assert!(!home.receipt().exists());
+
+    let provision = home.command().args(["serve", "list"]).output().unwrap();
+    assert!(provision.status.success(), "{provision:?}");
+    let provision_stderr = String::from_utf8(provision.stderr).unwrap();
+    assert!(
+        provision_stderr.contains("installed Tab completion for bash, fish, zsh"),
+        "{provision_stderr}"
     );
 
     let registrations = home.registrations();
@@ -135,7 +148,7 @@ fn opt_out_is_presence_based_and_prevents_every_write() {
         let output = home
             .command()
             .env("HF2Q_NO_COMPLETION_INSTALL", value)
-            .arg("--version")
+            .args(["serve", "list"])
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
@@ -510,8 +523,14 @@ fn model_completion_covers_every_local_gguf_surface_and_keeps_explicit_paths() {
 #[test]
 fn installed_bash_and_zsh_adapters_execute_real_tab_dispatch() {
     let home = IsolatedHome::new();
-    let provision = home.command().arg("--version").output().unwrap();
+    let provision = home.command().args(["serve", "list"]).output().unwrap();
     assert!(provision.status.success(), "{provision:?}");
+    assert!(
+        String::from_utf8_lossy(&provision.stderr)
+            .contains("installed Tab completion for bash, fish, zsh"),
+        "{}",
+        String::from_utf8_lossy(&provision.stderr)
+    );
 
     if Path::new("/bin/bash").is_file() {
         let output = ProcessCommand::new("/bin/bash")

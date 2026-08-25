@@ -1,5 +1,226 @@
 use super::*;
 
+fn report_local_ready(candidate: &Candidate, progress: &mut StartupProgress<'_>) {
+    progress(StartupEvent::LocalReady {
+        quant: candidate.quant.as_str().to_owned(),
+        origin: StartupOrigin::from_internal(&candidate.origin),
+        filename: display_filename(&candidate.path),
+    })
+}
+
+fn report_model_prepared(candidate: &Candidate, progress: &mut StartupProgress<'_>) {
+    progress(StartupEvent::ModelPrepared {
+        quant: candidate.quant.as_str().to_owned(),
+        origin: StartupOrigin::from_internal(&candidate.origin),
+        filename: display_filename(&candidate.path),
+    })
+}
+
+fn prepare_cached_projector_in_place(
+    candidate: &mut Candidate,
+    text_authority: &crate::core::bounded_file::StableRegularFile,
+    catalog: &HubGgufCatalog,
+    progress: &mut StartupProgress<'_>,
+) -> Result<Option<PathBuf>> {
+    prepare_cached_projector_in_place_with_sources(
+        candidate,
+        text_authority,
+        catalog,
+        progress,
+        cached_hub_gguf_path,
+        |artifact| Ok(download_hub_companion(artifact)?),
+    )
+}
+
+pub(super) fn prepare_cached_projector_in_place_with_sources(
+    candidate: &mut Candidate,
+    text_authority: &crate::core::bounded_file::StableRegularFile,
+    catalog: &HubGgufCatalog,
+    progress: &mut StartupProgress<'_>,
+    mut cached: impl FnMut(&HubGgufArtifact) -> Option<PathBuf>,
+    mut download: impl FnMut(&HubGgufArtifact) -> Result<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let expected = retained_expected_projector_sha256(text_authority)?;
+    let companions = catalog
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.role == "companion")
+        .filter(|artifact| {
+            expected
+                .as_deref()
+                .is_none_or(|sha| artifact.sha256.eq_ignore_ascii_case(sha))
+        })
+        .collect::<Vec<_>>();
+    let Some(projector) = select_projector_companion(candidate, companions, expected.as_deref())?
+    else {
+        return Ok(None);
+    };
+    progress(StartupEvent::ProjectorPrepare {
+        filename: display_filename(Path::new(&projector.filename)),
+        bytes: projector.bytes,
+    });
+    // hf-hub returns a snapshot symlink after a fresh download. Authenticate
+    // both cached and freshly downloaded pointers into the exact-revision
+    // repository blob store before O_NOFOLLOW retained activation.
+    let snapshot = match cached(&projector) {
+        Some(snapshot) => snapshot,
+        None => download(&projector)?,
+    };
+    let path = retain_cached_projector_at(&projector, &snapshot)?.path;
+    candidate.projector = Some((path.clone(), projector.bytes, projector.sha256.clone()));
+    Ok(Some(path))
+}
+
+pub(super) fn bind_existing_local_projector(
+    candidate: &mut Candidate,
+    path: PathBuf,
+) -> Result<PathBuf> {
+    let metadata = fs::metadata(&path)?;
+    if !metadata.is_file() {
+        bail!("automatic local mmproj does not resolve to a regular file");
+    }
+    let bytes = metadata.len();
+    let mut retained =
+        crate::core::bounded_file::StableRegularFile::open_operator_path_exact(&path, bytes)?
+            .context("automatic local mmproj changed before retained hashing")?;
+    let sha256 = retained
+        .sha256()?
+        .context("automatic local mmproj changed while hashing")?;
+    let gguf = mlx_native::gguf::GgufFile::from_file(retained.try_clone()?)
+        .context("automatic local mmproj is not a readable GGUF")?;
+    let config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&gguf)
+        .context("automatic local mmproj has unsupported projector metadata")?;
+    let tensor_names = gguf.tensor_names();
+    crate::inference::vision::mmproj::validate_tensor_set(&config, &tensor_names)
+        .context("automatic local mmproj has an incomplete projector tensor set")?;
+    let profile = crate::inference::vision::mmproj::detect_arch_profile_with_projector(
+        &config.projector,
+        &tensor_names,
+    );
+    if !profile.is_supported() {
+        bail!("automatic local mmproj has no supported runtime architecture profile");
+    }
+    if !retained.is_stable()? {
+        bail!("automatic local mmproj changed during structural admission");
+    }
+    candidate.projector = Some((path.clone(), bytes, sha256));
+    Ok(path)
+}
+
+pub(super) fn best_effort_manual_projector_with_catalog(
+    candidate: &mut Candidate,
+    text_authority: &crate::core::bounded_file::StableRegularFile,
+    model_dirs: &[PathBuf],
+    catalog: &HubGgufCatalog,
+    warnings: &mut Vec<String>,
+    progress: &mut StartupProgress<'_>,
+) -> Option<PathBuf> {
+    let expected = match retained_expected_projector_sha256(text_authority) {
+        Ok(expected) => expected,
+        Err(error) => {
+            warnings.push(format!(
+                "local text authority changed during mmproj planning; serving text-only: {error}"
+            ));
+            return None;
+        }
+    };
+    let exact_companion = select_projector_companion(
+        candidate,
+        catalog
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.role == "companion")
+            .filter(|artifact| {
+                expected
+                    .as_deref()
+                    .is_none_or(|sha| artifact.sha256.eq_ignore_ascii_case(sha))
+            })
+            .collect(),
+        expected.as_deref(),
+    )
+    .ok()
+    .flatten()
+    .map(|artifact| {
+        (
+            artifact.filename.clone(),
+            artifact.bytes,
+            artifact.sha256.clone(),
+        )
+    });
+    if let Some((filename, bytes, _)) = exact_companion.as_ref() {
+        progress(StartupEvent::ProjectorPrepare {
+            filename: display_filename(Path::new(filename)),
+            bytes: *bytes,
+        });
+    }
+    let local_error = match resolve_local_path_projector_required_with_expected(
+        &candidate.path,
+        expected.as_deref(),
+    ) {
+        Ok(Some(path)) => match bind_existing_local_projector(candidate, path) {
+            Ok(path) => {
+                let local_sha = candidate
+                    .projector
+                    .as_ref()
+                    .map(|(_, _, sha256)| sha256.as_str());
+                if let Some((filename, _, expected_sha)) = exact_companion.as_ref() {
+                    if local_sha.is_none_or(|sha| !sha.eq_ignore_ascii_case(expected_sha)) {
+                        warnings.push(format!(
+                            "ignored structurally compatible local sibling mmproj because it does not match exact hosted companion {filename}"
+                        ));
+                        candidate.projector = None;
+                        None
+                    } else {
+                        return Some(path);
+                    }
+                } else {
+                    if let Some((bound, bytes, _)) = candidate.projector.as_ref() {
+                        progress(StartupEvent::ProjectorPrepare {
+                            filename: display_filename(bound),
+                            bytes: *bytes,
+                        });
+                    }
+                    return Some(path);
+                }
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "ignored incompatible local sibling mmproj before hosted fallback: {error}"
+                ));
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    run_before_manual_hosted_projector_fallback();
+    let hosted = projector::best_effort_projector_with_catalog_expected(
+        candidate,
+        model_dirs,
+        catalog,
+        true,
+        expected.as_deref(),
+        warnings,
+    );
+    if exact_companion.is_none() && hosted.is_some() {
+        if let Some((bound, bytes, _)) = candidate.projector.as_ref() {
+            progress(StartupEvent::ProjectorPrepare {
+                filename: display_filename(bound),
+                bytes: *bytes,
+            });
+        }
+    }
+    if hosted.is_none() {
+        if let Some(error) = local_error {
+            warnings.push(format!(
+                "automatic local sibling mmproj preparation failed; serving text-only: {error}"
+            ));
+        }
+    }
+    hosted
+}
+
+#[cfg(test)]
 pub(crate) fn resolve_repository(
     spec: &RepositoryModelSpec,
     explicit_output: Option<&Path>,
@@ -9,9 +230,60 @@ pub(crate) fn resolve_repository(
     prepare_projector: bool,
     configured_quant: Option<&str>,
 ) -> Result<ResolvedManagedModel> {
+    let mut silent = |_| {};
+    resolve_repository_with_progress(
+        spec,
+        explicit_output,
+        model_dirs,
+        cache,
+        hardware,
+        prepare_projector,
+        configured_quant,
+        &mut silent,
+    )
+}
+
+pub(crate) fn resolve_repository_with_progress(
+    spec: &RepositoryModelSpec,
+    explicit_output: Option<&Path>,
+    model_dirs: &[PathBuf],
+    cache: &mut ModelCache,
+    hardware: &HardwareProfile,
+    prepare_projector: bool,
+    configured_quant: Option<&str>,
+    progress: &mut StartupProgress<'_>,
+) -> Result<ResolvedManagedModel> {
+    resolve_repository_with_progress_and_catalog(
+        spec,
+        explicit_output,
+        model_dirs,
+        cache,
+        hardware,
+        prepare_projector,
+        configured_quant,
+        progress,
+        resolve_hub_gguf_catalog,
+    )
+}
+
+pub(super) fn resolve_repository_with_progress_and_catalog(
+    spec: &RepositoryModelSpec,
+    explicit_output: Option<&Path>,
+    model_dirs: &[PathBuf],
+    cache: &mut ModelCache,
+    hardware: &HardwareProfile,
+    prepare_projector: bool,
+    configured_quant: Option<&str>,
+    progress: &mut StartupProgress<'_>,
+    mut resolve_catalog: impl FnMut(HfModelReference) -> Result<HubGgufCatalog, DownloadError>,
+) -> Result<ResolvedManagedModel> {
+    progress(StartupEvent::LocalSearch {
+        repository: spec.repository.clone(),
+        requested_quant: spec.quant.map(|quant| quant.as_str().to_owned()),
+    });
     let pool_budget_bytes = LoadedPool::from_hardware(hardware).memory_budget_bytes();
     let mut warnings = Vec::new();
-    let initial_local = select_local(
+    let initial_local = select_local_with_progress(
         spec,
         model_dirs,
         cache,
@@ -19,6 +291,7 @@ pub(crate) fn resolve_repository(
         hardware.available_memory_bytes,
         pool_budget_bytes,
         &mut warnings,
+        progress,
     )?;
     // A successfully used managed quant is the strongest automatic-choice
     // signal. It cannot be displaced by a merely newer loose/Hub-cache file,
@@ -26,55 +299,69 @@ pub(crate) fn resolve_repository(
     // select_local. This avoids catalog latency and tens of GiB of duplicate
     // hashing on the normal repeat-serve path.
     let initial_local = match initial_local {
-        Some((mut candidate, identity, local_lock)) if candidate.last_used_at_secs > 0 => {
-            let needs_hosted_projector_plan = if prepare_projector {
-                match verify_candidate_projector(&candidate) {
-                    Ok(Some(_)) => false,
-                    Ok(None) => true,
+        Some((mut candidate, authority, local_lock)) if candidate.last_used_at_secs > 0 => {
+            let verified_projector = if prepare_projector {
+                match verify_candidate_projector_with_progress(&candidate, progress) {
+                    Ok(projector) => projector,
                     Err(error) => {
                         warnings.push(format!(
                             "local mmproj verification failed before catalog planning: {error}"
                         ));
-                        true
+                        None
                     }
                 }
             } else {
-                false
+                None
             };
+            let needs_hosted_projector_plan = prepare_projector && verified_projector.is_none();
             if needs_hosted_projector_plan {
                 drop(local_lock);
-                Some((candidate, identity))
+                Some((candidate, authority))
             } else {
                 let (prepared, suppress_projector) =
                     prepare_selected_local_decision(candidate, explicit_output, &mut warnings)?;
                 candidate = prepared;
                 let mmproj = if prepare_projector && !suppress_projector {
-                    verify_candidate_projector(&candidate)?
+                    if verified_projector.as_ref().is_some_and(|verified| {
+                        candidate
+                            .projector
+                            .as_ref()
+                            .is_some_and(|(path, _, _)| path == verified)
+                    }) {
+                        verified_projector
+                    } else {
+                        verify_candidate_projector_with_progress(&candidate, progress)?
+                    }
                 } else {
                     None
                 };
+                report_local_ready(&candidate, progress);
                 drop(local_lock);
-                return Ok(candidate.into_resolved(mmproj, warnings));
+                let authority = explicit_output.is_none().then_some(authority);
+                return candidate.into_resolved(mmproj, warnings, authority);
             }
         }
-        Some((candidate, identity, lock)) => {
+        Some((candidate, authority, lock)) => {
             drop(lock);
-            Some((candidate, identity))
+            Some((candidate, authority))
         }
         None => None,
     };
 
+    progress(StartupEvent::HubMetadata {
+        repository: spec.repository.clone(),
+    });
     let reference = HfModelReference::parse(&spec.repository, None)?;
-    let mut catalog = match resolve_hub_gguf_catalog(reference) {
+    let mut catalog = match resolve_catalog(reference) {
         Ok(catalog) => catalog,
         Err(error) => {
-            let Some((mut candidate, identity)) = initial_local else {
+            let Some((mut candidate, authority)) = initial_local else {
                 return Err(error).with_context(|| {
                     format!("resolve hosted GGUF metadata for {}", spec.repository)
                 });
             };
             let _lock = cache.lock_quant(&spec.repository, candidate.quant)?;
-            if !reverify_candidate_after_catalog(&candidate, identity, &mut warnings) {
+            if !reverify_candidate_after_catalog(&candidate, authority.identity(), &mut warnings) {
                 return Err(error).context("local fallback changed during repository resolution");
             }
             let (prepared, suppress_projector) =
@@ -82,7 +369,7 @@ pub(crate) fn resolve_repository(
             candidate = prepared;
             let mmproj = if prepare_projector
                 && !suppress_projector
-                && text_requires_projector(&candidate.path)?
+                && retained_text_requires_projector(&authority)?
             {
                 match verify_candidate_projector(&candidate) {
                     Ok(Some(path)) => Some(path),
@@ -102,7 +389,9 @@ pub(crate) fn resolve_repository(
             } else {
                 None
             };
-            return Ok(candidate.into_resolved(mmproj, warnings));
+            report_local_ready(&candidate, progress);
+            let authority = explicit_output.is_none().then_some(authority);
+            return candidate.into_resolved(mmproj, warnings, authority);
         }
     };
     let selectable = catalog
@@ -132,41 +421,59 @@ pub(crate) fn resolve_repository(
         })
         .collect::<Vec<_>>();
 
-    let excluded = initial_local
+    let excluded_identity = initial_local
         .as_ref()
-        .map(|(_, identity)| std::slice::from_ref(identity))
+        .map(|(_, authority)| authority.identity());
+    let excluded = excluded_identity
+        .as_ref()
+        .map(std::slice::from_ref)
         .unwrap_or(&[]);
-    let manual =
-        find_best_matching_loose(&selectable, spec.quant, model_dirs, excluded, &mut warnings)?;
-    let cached = find_best_matching_cached_hub(&selectable, spec.quant, &mut warnings)?;
+    let manual = find_best_matching_loose_with_progress(
+        &selectable,
+        spec.quant,
+        model_dirs,
+        excluded,
+        &mut warnings,
+        progress,
+    )?;
+    let cached = find_best_matching_cached_hub_with_progress(
+        &selectable,
+        spec.quant,
+        &mut warnings,
+        progress,
+    )?;
     let materialized =
         |candidate: &local::ExactHostedLocal| system_time_secs(candidate.materialized);
-    let (loose, loose_origin) = match (manual, cached) {
+    let (mut loose, loose_origin) = match (manual, cached) {
         (Some(manual), Some(cached)) if materialized(&cached) > materialized(&manual) => {
-            (Some(cached), "hf_hub_cache_adoption")
+            (Some(cached), "hf_hub_cache_structural")
         }
-        (Some(manual), Some(_)) => (Some(manual), "manual_adoption"),
-        (Some(manual), None) => (Some(manual), "manual_adoption"),
-        (None, Some(cached)) => (Some(cached), "hf_hub_cache_adoption"),
+        (Some(manual), Some(_)) => (Some(manual), "manual_structural"),
+        (Some(manual), None) => (Some(manual), "manual_structural"),
+        (None, Some(cached)) => (Some(cached), "hf_hub_cache_structural"),
         (None, None) => (None, "manual_adoption"),
     };
-    if let Some((candidate, identity)) = initial_local {
+    if let Some((candidate, authority)) = initial_local {
         let loose_recency = loose
             .as_ref()
             .map(|candidate| (false, 0, materialized(candidate)))
             .unwrap_or((false, 0, 0));
         if loose.is_none() || bound_candidate_is_at_least_as_recent(&candidate, loose_recency.2) {
             let _lock = cache.lock_quant(&spec.repository, candidate.quant)?;
-            if reverify_candidate_after_catalog(&candidate, identity, &mut warnings) {
+            if reverify_candidate_after_catalog(&candidate, authority.identity(), &mut warnings) {
                 let (candidate, mmproj) = prepare_local_candidate_with_catalog(
                     candidate,
+                    &authority,
                     explicit_output,
                     model_dirs,
                     &catalog,
                     prepare_projector,
                     &mut warnings,
+                    progress,
                 )?;
-                return Ok(candidate.into_resolved(mmproj, warnings));
+                report_local_ready(&candidate, progress);
+                let authority = explicit_output.is_none().then_some(authority);
+                return candidate.into_resolved(mmproj, warnings, authority);
             }
         }
     }
@@ -180,9 +487,9 @@ pub(crate) fn resolve_repository(
             || repository_recommended_quant(spec.quant, configured_quant, hardware),
             Ok,
         )?;
-    // Digest-bound loose bytes can disambiguate repositories that publish
-    // more than one filename for the same quant. Do not reject on filename
-    // ambiguity before checking bytes the operator already owns.
+    // Structurally admitted loose bytes already match one unique catalog row
+    // by quant, byte length, and (when needed) basename. Do not make an
+    // automatic recommendation displace compatible bytes the operator owns.
     let mut selected_requires_projector = false;
     let selected = if loose.is_none() {
         select_compatible_hosted(
@@ -247,7 +554,7 @@ pub(crate) fn resolve_repository(
                 spec.repository, target_quant
             )
         })?;
-    if let Some((candidate, _identity, _local_lock)) = select_local(
+    if let Some((candidate, authority, _local_lock)) = select_local_with_progress(
         spec,
         model_dirs,
         cache,
@@ -255,24 +562,175 @@ pub(crate) fn resolve_repository(
         hardware.available_memory_bytes,
         pool_budget_bytes,
         &mut warnings,
+        progress,
     )? {
         let selected_loose_materialized_at =
             loose.as_ref().map(|candidate| materialized(candidate));
         if post_lock_local_candidate_wins(&candidate, selected_loose_materialized_at) {
             let (candidate, mmproj) = prepare_local_candidate_with_catalog(
                 candidate,
+                &authority,
                 explicit_output,
                 model_dirs,
                 &catalog,
                 prepare_projector,
                 &mut warnings,
+                progress,
             )?;
-            return Ok(candidate.into_resolved(mmproj, warnings));
+            report_local_ready(&candidate, progress);
+            let authority = explicit_output.is_none().then_some(authority);
+            return candidate.into_resolved(mmproj, warnings, authority);
+        }
+    }
+    if loose.is_some() && explicit_output.is_none() {
+        let loose = loose
+            .take()
+            .context("local GGUF selection disappeared before activation")?;
+        if !loose.retained.is_stable()? {
+            bail!("local GGUF changed after bounded metadata admission");
+        }
+        let quant = loose
+            .artifact
+            .quant_hint
+            .as_deref()
+            .and_then(|value| QuantType::from_canonical_str(value).ok())
+            .context("local GGUF has no supported quant identity")?;
+        let projector_required = prepare_projector
+            && hosted_pair_requires_projector(catalog.requires_projector, loose.requires_projector);
+        let mut candidate = Candidate {
+            repository: loose.artifact.repository,
+            revision: loose.artifact.revision,
+            root: loose
+                .path
+                .parent()
+                .context("manual local GGUF has no parent directory")?
+                .to_path_buf(),
+            path: loose.path,
+            bytes: loose.artifact.bytes,
+            sha256: loose.artifact.sha256,
+            quant,
+            origin: loose_origin.into(),
+            materialized_at_secs: system_time_secs(loose.materialized),
+            last_used_at_secs: 0,
+            projector: None,
+            sidecar: None,
+            receipt_target_identity: None,
+        };
+        let mut mmproj = if projector_required && loose_origin == "hf_hub_cache_structural" {
+            match prepare_cached_projector_in_place(
+                &mut candidate,
+                &loose.retained,
+                &catalog,
+                progress,
+            ) {
+                Ok(Some(path)) => Some(path),
+                Ok(None) => {
+                    warnings.push(
+                        "multimodal text model has no unambiguous exact-revision mmproj; serving text-only"
+                            .into(),
+                    );
+                    None
+                }
+                Err(error) => {
+                    warnings.push(format!(
+                        "automatic exact-revision mmproj preparation failed; serving text-only: {error}"
+                    ));
+                    None
+                }
+            }
+        } else if projector_required {
+            best_effort_manual_projector_with_catalog(
+                &mut candidate,
+                &loose.retained,
+                model_dirs,
+                &catalog,
+                &mut warnings,
+                progress,
+            )
+        } else {
+            None
+        };
+        let projector_binding = mmproj.as_ref().and_then(|path| {
+            candidate
+                .projector
+                .as_ref()
+                .filter(|(bound, _, _)| bound == path)
+                .map(|(path, bytes, sha256)| (path.clone(), *bytes, sha256.clone()))
+        });
+        let (mmproj_sha256, mmproj_activation_authority) = match projector_binding {
+            Some((path, bytes, sha256)) => {
+                run_after_automatic_projector_prepared(&path);
+                match retain_verified_projector_authority(&path, bytes, &sha256) {
+                    Ok(Some(authority)) => (Some(sha256), Some(authority)),
+                    Ok(None) => {
+                        warnings.push(
+                            "automatic mmproj changed or no longer matches its digest before retained activation; serving text-only"
+                                .into(),
+                        );
+                        mmproj = None;
+                        (None, None)
+                    }
+                    Err(error) => {
+                        warnings.push(format!(
+                            "automatic mmproj retention failed; serving text-only: {error}"
+                        ));
+                        mmproj = None;
+                        (None, None)
+                    }
+                }
+            }
+            None if mmproj.is_some() => {
+                warnings.push(
+                    "automatic mmproj has no retained digest binding; serving text-only".into(),
+                );
+                mmproj = None;
+                (None, None)
+            }
+            None => (None, None),
+        };
+        report_local_ready(&candidate, progress);
+        return Ok(ResolvedManagedModel {
+            gguf_path: candidate.path,
+            mmproj_path: mmproj,
+            repository: candidate.repository,
+            revision: candidate.revision,
+            quant: candidate.quant,
+            origin: candidate.origin,
+            warnings,
+            track_success_history: false,
+            activation_authority: Some(loose.retained),
+            mmproj_sha256,
+            mmproj_activation_authority,
+        });
+    }
+    // Publication is different from serving in place: before copying bytes
+    // to an explicit destination, bind their complete immutable Hub digest.
+    // This is intentionally the only local-discovery branch that performs a
+    // model-sized hash.
+    if explicit_output.is_some() {
+        if let Some(loose) = loose.as_mut() {
+            let actual = hash_hosted_local_candidate(
+                &loose.path,
+                loose.artifact.bytes,
+                loose
+                    .artifact
+                    .quant_hint
+                    .as_deref()
+                    .and_then(|value| QuantType::from_canonical_str(value).ok()),
+                StartupOrigin::from_internal(loose_origin),
+                &mut loose.retained,
+                progress,
+            )?;
+            if !actual.eq_ignore_ascii_case(&loose.artifact.sha256) {
+                bail!(
+                    "the structurally compatible local GGUF does not match the immutable hosted payload required for explicit --output publication"
+                );
+            }
         }
     }
     let mut suppress_automatic_projector = false;
     let mut prepared_projector = None;
-    let mut candidate = if let Some(loose) = loose {
+    let (mut candidate, prepared_here) = if let Some(loose) = loose {
         let artifact = &loose.artifact;
         let destination = hosted_destination(artifact, explicit_output)?;
         let text_plan = PreparedLocalArtifact::prepare_retained(
@@ -430,7 +888,7 @@ pub(crate) fn resolve_repository(
             },
         )?;
         prepared_projector = projector_plan;
-        candidate
+        (candidate, false)
     } else if let Some(artifact) = selected {
         let destination = hosted_destination(&artifact, explicit_output)?;
         let text_destination_exact =
@@ -522,17 +980,22 @@ pub(crate) fn resolve_repository(
         let candidate = if text_destination_exact {
             bind_hosted_destination(&destination, &artifact, "existing_destination")?
         } else {
+            progress(StartupEvent::HostedDownload {
+                filename: display_filename(Path::new(&artifact.filename)),
+                bytes: artifact.bytes,
+            });
             let cached = download_hub_gguf(&artifact)?;
             materialize_hosted(&cached, &artifact, explicit_output, "hosted_download")?
         };
         prepared_projector = projector_plan;
-        candidate
+        (candidate, !text_destination_exact)
     } else {
-        native_convert(
+        native_convert_with_progress(
             &catalog,
             native_fallback_quant,
             explicit_output,
             native_product_bytes,
+            progress,
         )?
     };
     let (prepared, local_suppress_projector) =
@@ -565,7 +1028,12 @@ pub(crate) fn resolve_repository(
             })
             .flatten()
     };
-    Ok(candidate.into_resolved(mmproj, warnings))
+    if prepared_here {
+        report_model_prepared(&candidate, progress);
+    } else {
+        report_local_ready(&candidate, progress);
+    }
+    candidate.into_resolved(mmproj, warnings, None)
 }
 
 fn plan_native_quant_products(
@@ -686,6 +1154,7 @@ fn planned_hosted_projector(
         last_used_at_secs: 0,
         projector: None,
         sidecar: None,
+        receipt_target_identity: None,
     };
     let companions = catalog
         .artifacts
@@ -704,6 +1173,7 @@ fn planned_hosted_projector(
 
 fn planned_local_projector(
     candidate: &Candidate,
+    text_authority: &crate::core::bounded_file::StableRegularFile,
     text_destination: &Path,
     catalog: &HubGgufCatalog,
     required: bool,
@@ -711,7 +1181,7 @@ fn planned_local_projector(
     if !required {
         return Ok(None);
     }
-    let expected = expected_projector_sha256(&candidate.path)?;
+    let expected = retained_expected_projector_sha256(text_authority)?;
     let companions = catalog
         .artifacts
         .iter()
@@ -735,30 +1205,36 @@ fn planned_local_projector(
 
 fn prepare_local_candidate_with_catalog(
     candidate: Candidate,
+    text_authority: &crate::core::bounded_file::StableRegularFile,
     explicit_output: Option<&Path>,
     model_dirs: &[PathBuf],
     catalog: &HubGgufCatalog,
     prepare_projector: bool,
     warnings: &mut Vec<String>,
+    progress: &mut StartupProgress<'_>,
 ) -> Result<(Candidate, Option<PathBuf>)> {
     prepare_local_candidate_with_catalog_resolver(
         candidate,
+        text_authority,
         explicit_output,
         model_dirs,
         catalog,
         prepare_projector,
         warnings,
+        progress,
         resolve_hub_gguf_catalog,
     )
 }
 
 pub(super) fn prepare_local_candidate_with_catalog_resolver(
     mut candidate: Candidate,
+    text_authority: &crate::core::bounded_file::StableRegularFile,
     explicit_output: Option<&Path>,
     model_dirs: &[PathBuf],
     catalog: &HubGgufCatalog,
     prepare_projector: bool,
     warnings: &mut Vec<String>,
+    progress: &mut StartupProgress<'_>,
     mut resolve_catalog: impl FnMut(HfModelReference) -> Result<HubGgufCatalog, DownloadError>,
 ) -> Result<(Candidate, Option<PathBuf>)> {
     if !prepare_projector {
@@ -811,7 +1287,7 @@ pub(super) fn prepare_local_candidate_with_catalog_resolver(
     } else {
         catalog
     };
-    let text_projector_required = text_requires_projector(&candidate.path)?;
+    let text_projector_required = retained_text_requires_projector(text_authority)?;
     let projector_required =
         hosted_pair_requires_projector(catalog.requires_projector, text_projector_required);
     if !projector_required {
@@ -838,16 +1314,25 @@ pub(super) fn prepare_local_candidate_with_catalog_resolver(
         &candidate.sha256,
     )?;
     let text_destination_exact = !text_plan.needs_copy();
-    let projector_plan =
-        planned_local_projector(&candidate, &text_destination, catalog, projector_required)
-            .and_then(|plan| {
-                plan.map(|(artifact, destination)| {
-                    prepare_projector_action(artifact, destination, model_dirs)
-                })
-                .transpose()
-            });
+    let projector_plan = planned_local_projector(
+        &candidate,
+        text_authority,
+        &text_destination,
+        catalog,
+        projector_required,
+    )
+    .and_then(|plan| {
+        plan.map(|(artifact, destination)| {
+            prepare_projector_action(artifact, destination, model_dirs)
+        })
+        .transpose()
+    });
     let projector_plan = match projector_plan {
         Ok(Some(plan)) => {
+            progress(StartupEvent::ProjectorPrepare {
+                filename: display_filename(Path::new(&plan.artifact.filename)),
+                bytes: plan.artifact.bytes,
+            });
             let pair_preflight = match &plan.source {
                 PreparedProjectorSource::Existing(_) => {
                     check_local_artifact_pair_plan_with_authorities(
@@ -947,6 +1432,7 @@ pub(super) fn prepare_local_candidate_with_catalog_resolver(
         candidate.materialized_at_secs = now_secs();
         candidate.origin = "local_adoption".to_owned();
         candidate.sidecar = None;
+        candidate.receipt_target_identity = None;
     }
     let projector = match projector_plan {
         Some(plan) => match materialize_prepared_projector(plan, &mut candidate, warnings) {
@@ -1455,6 +1941,7 @@ pub(super) fn prepare_selected_local_decision_with_preflight(
             candidate.origin = "local_adoption".to_owned();
             candidate.projector = projector;
             candidate.sidecar = None;
+            candidate.receipt_target_identity = None;
         }
     }
 
@@ -1517,12 +2004,31 @@ fn binding_from_candidate(candidate: &Candidate) -> Result<ManagedBinding> {
     })
 }
 
+#[cfg(test)]
 pub(super) fn native_convert(
     catalog: &HubGgufCatalog,
     quant: QuantType,
     explicit_output: Option<&Path>,
     exact_product_bytes: Option<u64>,
 ) -> Result<Candidate> {
+    let mut silent = |_| {};
+    native_convert_with_progress(
+        catalog,
+        quant,
+        explicit_output,
+        exact_product_bytes,
+        &mut silent,
+    )
+    .map(|(candidate, _)| candidate)
+}
+
+pub(super) fn native_convert_with_progress(
+    catalog: &HubGgufCatalog,
+    quant: QuantType,
+    explicit_output: Option<&Path>,
+    exact_product_bytes: Option<u64>,
+    progress: &mut StartupProgress<'_>,
+) -> Result<(Candidate, bool)> {
     let default = default_convert_output(
         &managed_model_root()?,
         &catalog.repository,
@@ -1552,8 +2058,12 @@ pub(super) fn native_convert(
             );
         }
         verify_candidate(&authority)?;
-        return Ok(authority);
+        return Ok((authority, false));
     }
+    progress(StartupEvent::NativeConversion {
+        repository: catalog.repository.clone(),
+        quant: quant.as_str().to_owned(),
+    });
     let source_plan = crate::input::hf_download::resolve_native_source_plan(
         HfModelReference::parse(&catalog.repository, Some(&catalog.revision))?,
     )?;
@@ -1576,20 +2086,32 @@ pub(super) fn native_convert(
         &output,
         planned_product_bytes,
     )?;
-    let status = Command::new(std::env::current_exe().context("resolve current hf2q executable")?)
-        .arg("convert")
-        .arg(&catalog.repository)
-        .arg("--revision")
-        .arg(&catalog.revision)
-        .arg("--quant")
-        .arg(quant.as_str().to_ascii_lowercase())
-        .arg("--output")
-        .arg(&output)
-        .arg("--no-clobber")
-        .status()
-        .context("launch native hf2q conversion")?;
-    if !status.success() {
-        bail!("native hf2q conversion failed with {status}");
+    let child_output =
+        Command::new(std::env::current_exe().context("resolve current hf2q executable")?)
+            .arg("--terminal-graphics")
+            .arg("off")
+            .arg("convert")
+            .arg(&catalog.repository)
+            .arg("--revision")
+            .arg(&catalog.revision)
+            .arg("--quant")
+            .arg(quant.as_str().to_ascii_lowercase())
+            .arg("--output")
+            .arg(&output)
+            .arg("--no-clobber")
+            .output()
+            .context("launch native hf2q conversion")?;
+    if !child_output.status.success() {
+        let detail = bounded_child_stderr(&child_output.stderr);
+        bail!(
+            "native hf2q conversion failed with {}{}",
+            child_output.status,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        );
     }
     let authority =
         conversion_authority(&output)?.context("native conversion emitted no valid receipt")?;
@@ -1600,5 +2122,15 @@ pub(super) fn native_convert(
         bail!("native conversion receipt does not match the requested repository/revision/quant");
     }
     verify_candidate(&authority)?;
-    Ok(authority)
+    Ok((authority, true))
+}
+
+fn bounded_child_stderr(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+        .take(4096)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }

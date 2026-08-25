@@ -1094,9 +1094,10 @@ pub fn validate_hub_gguf_header_compatibility(
     })
 }
 
-/// Apply the hosted GGUF admission contract to exact Hub bytes the operator
-/// already owns. The caller has bound size and SHA-256 to `artifact`; this
-/// reads only the local header and never performs a Hub range request.
+/// Apply the hosted GGUF admission contract to exact-size bytes the operator
+/// already owns. This is a bounded structural/runtime check, not an immutable
+/// payload proof: callers that publish or copy the bytes must separately bind
+/// the complete SHA-256. No Hub range request is performed here.
 pub fn validate_local_hub_gguf_compatibility(
     path: &Path,
     artifact: &HubGgufArtifact,
@@ -1912,8 +1913,9 @@ fn download_hub_artifact(
 }
 
 /// Return exact-revision Hub-cache bytes for a catalog-bound GGUF without
-/// performing metadata or payload I/O. Size is checked here; callers bind the
-/// complete digest before adopting the bytes as runtime authority.
+/// performing metadata or payload I/O. Size is checked here. Serve/chat may
+/// admit the retained file structurally in place; publication and copying
+/// still require callers to bind the complete digest.
 pub(crate) fn cached_hub_gguf_path(artifact: &HubGgufArtifact) -> Option<PathBuf> {
     cached_hub_artifact_path_in(&resolve_hf_cache_dir(), artifact)
 }
@@ -3368,7 +3370,7 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn write_test_gguf(path: &Path, arch: &str, file_type: u32) -> u64 {
@@ -3404,7 +3406,7 @@ mod tests {
         bytes.len() as u64
     }
 
-    fn write_complete_qwen_test_gguf(path: &Path) -> u64 {
+    pub(crate) fn write_complete_qwen_test_gguf(path: &Path) -> u64 {
         use crate::quantize::ggml_quants::GgmlType;
 
         write_complete_qwen_test_gguf_with_dense_types(

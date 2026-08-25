@@ -270,17 +270,17 @@ fn report_completion_cleanup(cleanup: &crate::cli::completion_receipt::Completio
 
 fn refresh_completion(executable: &Path) {
     let result = std::process::Command::new(executable)
-        .arg("--version")
+        .args(["completions", "--shell", "zsh"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status();
     match result {
         Ok(status) if status.success() => {}
         Ok(status) => eprintln!(
-            "hf2q: updated successfully, but completion refresh exited with {status}; run `hf2q --version` once to retry"
+            "hf2q: updated successfully, but completion refresh exited with {status}; run `hf2q serve list` once to retry"
         ),
         Err(error) => eprintln!(
-            "hf2q: updated successfully, but completion refresh could not start: {error}; run `hf2q --version` once to retry"
+            "hf2q: updated successfully, but completion refresh could not start: {error}; run `hf2q serve list` once to retry"
         ),
     }
 }

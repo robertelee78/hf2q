@@ -9,6 +9,12 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+
+const TERMINAL_RASTER_WIDTH: u32 = 224;
+const ANSI_RASTER_WIDTH: u32 = 20;
+const SITE_CANVAS_RGBA: (u8, u8, u8, u8) = (0x0b, 0x0c, 0x0e, 0xff);
+
 fn exact_git_sha(value: &str) -> Option<String> {
     let value = value.trim();
     (value.len() == 40 && value.chars().all(|character| character.is_ascii_hexdigit()))
@@ -29,6 +35,71 @@ fn packaged_vcs_sha(path: &Path) -> Option<String> {
     exact_git_sha(value)
 }
 
+fn render_svg(
+    svg: &[u8],
+    width: u32,
+    even_height: bool,
+) -> Result<resvg::tiny_skia::Pixmap, String> {
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(svg, &options)
+        .map_err(|error| format!("parse assets/head.svg: {error}"))?;
+    let source_size = tree.size();
+    let scale = width as f32 / source_size.width();
+    let scaled_height = source_size.height() * scale;
+    let mut height = if even_height {
+        scaled_height.round() as u32
+    } else {
+        scaled_height.ceil() as u32
+    };
+    if even_height && height % 2 != 0 {
+        height += 1;
+    }
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| format!("allocate {width}x{height} head.svg raster"))?;
+    // The authoritative SVG is transparent white/black artwork. hf2q.us
+    // presents it on this fixed canvas; baking that canvas keeps the exact
+    // mark visible on both light and dark terminal themes without recoloring.
+    pixmap.fill(resvg::tiny_skia::Color::from_rgba8(
+        SITE_CANVAS_RGBA.0,
+        SITE_CANVAS_RGBA.1,
+        SITE_CANVAS_RGBA.2,
+        SITE_CANVAS_RGBA.3,
+    ));
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    Ok(pixmap)
+}
+
+fn compile_terminal_assets(manifest_dir: &Path, out_dir: &Path) -> Result<(), String> {
+    let source = manifest_dir.join("assets/head.svg.base64");
+    println!("cargo:rerun-if-changed={}", source.display());
+    let encoded = fs::read_to_string(&source)
+        .map_err(|error| format!("read {}: {error}", source.display()))?;
+    let svg = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|error| format!("decode exact head.svg asset: {error}"))?;
+    fs::write(out_dir.join("hf2q-head.svg"), &svg)
+        .map_err(|error| format!("write compiled exact head SVG: {error}"))?;
+
+    let native = render_svg(&svg, TERMINAL_RASTER_WIDTH, false)?;
+    let png = native
+        .encode_png()
+        .map_err(|error| format!("encode terminal head PNG: {error}"))?;
+    fs::write(out_dir.join("hf2q-head.png"), png)
+        .map_err(|error| format!("write compiled terminal head PNG: {error}"))?;
+
+    // tiny-skia's byte representation is premultiplied RGBA. It is retained
+    // verbatim and unpremultiplied only for the handful of visible ANSI cells
+    // at runtime, avoiding PNG decode/resampling on every process start.
+    let ansi = render_svg(&svg, ANSI_RASTER_WIDTH, true)?;
+    fs::write(out_dir.join("hf2q-head-ansi.rgba"), ansi.data())
+        .map_err(|error| format!("write compiled ANSI head raster: {error}"))?;
+    Ok(())
+}
+
 fn main() {
     for name in ["GIT_COMMIT_SHA", "VERGEN_GIT_SHA", "GITHUB_SHA"] {
         println!("cargo:rerun-if-env-changed={name}");
@@ -39,6 +110,14 @@ fn main() {
         .filter_map(|name| env::var(name).ok())
         .find_map(|value| exact_git_sha(&value));
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(std::path::PathBuf::from);
+    let out_dir = env::var_os("OUT_DIR").map(std::path::PathBuf::from);
+    compile_terminal_assets(
+        manifest_dir
+            .as_deref()
+            .expect("Cargo must provide CARGO_MANIFEST_DIR"),
+        out_dir.as_deref().expect("Cargo must provide OUT_DIR"),
+    )
+    .expect("compile exact hf2q terminal logo assets");
     let packaged_vcs_info = manifest_dir.as_deref().and_then(packaged_vcs_info_path);
 
     // Cargo treats a missing `rerun-if-changed` input as perpetually stale.

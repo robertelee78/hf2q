@@ -4,7 +4,8 @@ hf2q installs Tab completion as part of the normal installed experience. There
 is no separate completion command to remember after the standalone installer:
 the installer invokes the stable installed binary once. Cargo has no
 post-install hook, so `cargo install hf2q` provisions completion on the first
-normal `hf2q` invocation.
+accepted normal `hf2q` command. Help, version, and parse-error exits are
+deliberately non-mutating.
 
 The managed adapters are dynamic. Each Tab asks the installed hf2q binary for
 candidates from the current public Clap grammar, so upgrades immediately expose
@@ -103,7 +104,7 @@ Static snapshots must be regenerated after an hf2q upgrade.
 
 ## Troubleshooting
 
-1. Run `hf2q --version` once and read any `completion setup incomplete`
+1. Run `hf2q serve list` once and read any `completion setup incomplete`
    message on stderr.
 2. Start a new shell. For Zsh, confirm the managed block is present in the
    effective `${ZDOTDIR:-$HOME}/.zshrc`; hf2q probes shell-local `ZDOTDIR`
@@ -111,6 +112,6 @@ Static snapshots must be regenerated after an hf2q upgrade.
 3. Check that a destination is a current-user-owned regular file or safe
    directory. hf2q never writes through a completion-file symlink or replaces
    a non-regular occupant.
-4. If an installed binary moved, run the new `hf2q --version`. Managed adapters
+4. If an installed binary moved, run the new `hf2q serve list`. Managed adapters
    also fall back to the executable currently found on `PATH` when their pinned
    executable disappears.

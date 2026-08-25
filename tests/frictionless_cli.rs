@@ -71,6 +71,48 @@ fn released_cli_parses_repository_quant_surfaces_without_network() {
     }
 }
 
+#[test]
+fn json_mode_failure_stderr_is_json_lines_only() {
+    let root = tempfile::tempdir().unwrap();
+    let output = isolated_command(root.path())
+        .env("HF2Q_DEBUG_TQ_RMS", "1")
+        .args(["--log-format", "json", "info", "--model"])
+        .arg(root.path().join("missing.gguf"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("Error:"), "{stderr}");
+    let lines = stderr.lines().collect::<Vec<_>>();
+    assert!(!lines.is_empty(), "JSON failure emitted no diagnostic");
+    for line in lines {
+        let value: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {line}"));
+        assert!(value.is_object(), "{line}");
+    }
+}
+
+#[test]
+fn json_terminal_failure_survives_rust_log_off_as_one_object() {
+    let root = tempfile::tempdir().unwrap();
+    let output = isolated_command(root.path())
+        .env("RUST_LOG", "off")
+        .args(["--log-format", "json", "info", "--model"])
+        .arg(root.path().join("missing.gguf"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let lines = stderr.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{stderr}");
+    let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(value["level"], "ERROR");
+    assert_eq!(value["target"], "hf2q");
+    assert_eq!(value["fields"]["exit_code"], 3);
+}
+
 #[cfg(unix)]
 #[test]
 fn packed_server_adopts_the_inherited_listener_and_retains_port_authority() {
@@ -90,6 +132,9 @@ fn packed_server_adopts_the_inherited_listener_and_retains_port_authority() {
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
     let child_fd = child_lifeline.as_raw_fd();
+    let (_startup_progress, child_startup_progress) =
+        std::os::unix::net::UnixDatagram::pair().unwrap();
+    let startup_progress_fd = child_startup_progress.as_raw_fd();
     let binary = assert_cmd::cargo::cargo_bin!("hf2q");
     let mut command = std::process::Command::new(binary);
     command
@@ -106,6 +151,8 @@ fn packed_server_adopts_the_inherited_listener_and_retains_port_authority() {
         ])
         .arg("--chat-parent-lifeline-fd")
         .arg(child_fd.to_string())
+        .arg("--chat-startup-progress-fd")
+        .arg(startup_progress_fd.to_string())
         .arg("--chat-owned-listener-fd")
         .arg(listener_fd.to_string())
         .env("HOME", root.path().join("home"))
@@ -118,7 +165,7 @@ fn packed_server_adopts_the_inherited_listener_and_retains_port_authority() {
         .process_group(0);
     unsafe {
         command.pre_exec(move || {
-            for fd in [child_fd, listener_fd] {
+            for fd in [child_fd, startup_progress_fd, listener_fd] {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                     return Err(std::io::Error::last_os_error());
@@ -129,6 +176,7 @@ fn packed_server_adopts_the_inherited_listener_and_retains_port_authority() {
     }
     let mut child = command.spawn().unwrap();
     drop(child_lifeline);
+    drop(child_startup_progress);
 
     let mut ready = String::new();
     BufReader::new(parent_lifeline.try_clone().unwrap())

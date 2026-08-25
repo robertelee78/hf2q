@@ -46,7 +46,11 @@ pub(super) struct StaticInspection {
     pub(super) support: std::result::Result<&'static str, String>,
 }
 
-pub fn cmd_info(args: cli::InfoArgs, operator_defaults: Option<&ServeDefaultsV2>) -> Result<()> {
+pub fn cmd_info(
+    args: cli::InfoArgs,
+    operator_defaults: Option<&ServeDefaultsV2>,
+    report_rejection: bool,
+) -> Result<()> {
     match inspect(&args, operator_defaults) {
         Ok(report) => {
             super::info_report::print_report(&report);
@@ -56,7 +60,9 @@ pub fn cmd_info(args: cli::InfoArgs, operator_defaults: Option<&ServeDefaultsV2>
             }
         }
         Err(error) => {
-            print_early_rejection(&args.model, &format!("{error:#}"));
+            if report_rejection {
+                print_early_rejection(&args.model, &format!("{error:#}"));
+            }
             Err(error)
         }
     }

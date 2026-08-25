@@ -4,6 +4,7 @@ pub(crate) mod endpoint;
 mod local;
 mod render;
 mod sse;
+pub(crate) mod startup_ui;
 mod transcript;
 mod wire;
 
@@ -37,7 +38,7 @@ pub(crate) fn cmd_chat(args: ChatArgs, state_root: Option<&std::path::Path>) -> 
 }
 
 /// Injection seam used by the discovery/activation integration lane. The
-/// resolver supplies a verified endpoint and, only when it launched that
+/// resolver supplies an HTTP-verified endpoint and, only when it launched that
 /// endpoint itself, an owned Child handle in the EndpointSession.
 pub(crate) fn cmd_chat_with_resolver(
     args: ChatArgs,
@@ -535,8 +536,9 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log, None)
-            .expect("verified isolated child");
+        let process =
+            endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, None, log, None)
+                .expect("verified isolated child");
         let mut session = EndpointSession::spawned_loopback(9, process);
 
         let error = with_failure_diagnostics(anyhow::anyhow!("safe public error"), &mut session);
@@ -595,8 +597,9 @@ mod tests {
             .spawn()
             .unwrap();
         let child_pid = child.id() as libc::pid_t;
-        let process = endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, log, None)
-            .expect("verified isolated child");
+        let process =
+            endpoint::OwnedServerProcess::from_spawned(child, parent_lifeline, None, log, None)
+                .expect("verified isolated child");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();

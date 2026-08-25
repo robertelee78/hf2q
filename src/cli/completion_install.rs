@@ -185,6 +185,7 @@ fn public_record(record: &str) -> bool {
         "source-teacher-reference",
         "source-teacher-acceptance-verify",
         "--chat-parent-lifeline-fd",
+        "--chat-startup-progress-fd",
     ];
     !HIDDEN.iter().any(|hidden| {
         record == *hidden
@@ -765,10 +766,11 @@ static LAST_OUTCOME: OnceLock<Vec<(&'static str, Outcome)>> = OnceLock::new();
 /// discover standard destinations, while every unproven binary requires
 /// explicit destination environment variables.
 ///
-/// Called once, early in `main`, before argv parsing — so it fires for every
-/// real invocation (including `--help`/`--version`/parse-error exits) except a
-/// completion run. Never panics, never returns an error to the caller; each
-/// shell's provisioning succeeds or is swallowed independently.
+/// Called once after Clap accepts a real command. Help, version, and parse-error
+/// exits stay protocol-clean, while accepted commands reconcile unless they
+/// are a dynamic-completion request. Never panics, never returns an error to
+/// the caller; each shell's provisioning succeeds or is swallowed
+/// independently.
 pub fn reconcile(raw_args: &[OsString]) {
     let outcomes: Vec<(&'static str, Outcome)> = if completion_trigger_active() {
         vec![("completion", Outcome::CompletionRun)]

@@ -10,11 +10,11 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use safetensors::{SafeTensors, tensor::Dtype};
+use safetensors::{tensor::Dtype, SafeTensors};
 use sha2::{Digest, Sha256};
 
 use crate::core::mlx_safetensors_loader::read_floats_to_f32;
-use crate::input::integrity::{VerifiedSourceManifest, verify_conversion_manifest};
+use crate::input::integrity::{verify_conversion_manifest, VerifiedSourceManifest};
 use crate::quantize::ggml_quants::SourceDtype;
 
 use super::source_reader::{HfTensor, RawSourceTensorEvidence, SourceError, TensorMeta};
@@ -245,7 +245,7 @@ mod tests {
     use half::f16;
     use safetensors::tensor::TensorView;
 
-    use crate::core::integrity::{ShardIntegrity, compute_git_blob_sha1};
+    use crate::core::integrity::{compute_git_blob_sha1, ShardIntegrity};
 
     use super::*;
 

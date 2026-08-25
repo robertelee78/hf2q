@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use super::{DashboardState, Phase, RequestView};
+use crate::serve::startup_progress::terminal_safe_text;
 
 pub(super) fn draw(state: &DashboardState) {
     let width = usize::from(console::Term::stderr().size().1).clamp(72, 160);
@@ -15,16 +16,21 @@ pub(super) fn draw(state: &DashboardState) {
     if let Some(reason) = state.unhealthy.as_deref() {
         frame.push_str(&format!(
             "\x1b[31m● unhealthy — restart required\x1b[0m  {}  ·  up {}\n",
-            state.endpoint,
+            terminal_safe_text(&state.endpoint),
             format_duration(state.started.elapsed())
         ));
         frame.push_str(&format!("  {}\n", truncate(reason, inner)));
-    } else {
+    } else if state.http_ready {
         frame.push_str(&format!(
             "\x1b[32m● ready\x1b[0m  {}  ·  {} slots  ·  up {}\n",
-            state.endpoint,
+            terminal_safe_text(&state.endpoint),
             state.max_slots,
             format_duration(state.started.elapsed())
+        ));
+    } else {
+        frame.push_str(&format!(
+            "\x1b[33m● starting\x1b[0m  {}  ·  listener bound; awaiting HTTP health\n",
+            terminal_safe_text(&state.endpoint)
         ));
     }
     frame.push_str(&format!("{}\n", "─".repeat(width.min(160))));
@@ -49,7 +55,7 @@ pub(super) fn draw(state: &DashboardState) {
     }
     frame.push_str(&format!(
         "\x1b[2m{} · Ctrl-C shuts down cleanly\x1b[0m",
-        state.family
+        terminal_safe_text(&state.family)
     ));
     let mut stderr = io::stderr().lock();
     let _ = stderr.write_all(frame.as_bytes());
@@ -157,8 +163,9 @@ pub(super) fn format_duration(duration: Duration) -> String {
     }
 }
 
-fn truncate(value: &str, width: usize) -> String {
-    let mut chars = value.chars();
+pub(super) fn truncate(value: &str, width: usize) -> String {
+    let safe = terminal_safe_text(value);
+    let mut chars = safe.chars();
     let mut out: String = chars.by_ref().take(width).collect();
     if chars.next().is_some() && width > 1 {
         out.pop();

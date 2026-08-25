@@ -33,6 +33,8 @@ case "${1:-}" in
     cp "$0" "$install_dir/hf2q"
     chmod 0555 "$install_dir/hf2q"
     ;;
+  completions)
+    ;;
   *)
     exit 91
     ;;

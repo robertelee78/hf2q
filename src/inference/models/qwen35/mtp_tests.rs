@@ -270,10 +270,15 @@ fn mtp_loads_with_shared_embeddings_when_flag_false_and_tensor_absent() {
     let Some(device) = try_device() else { return };
     // tiny_tensors() includes the dedicated embed_tokens tensor; strip it for
     // the shared-embeddings scenario.
-    let tensors: Vec<TestTensor> = tiny_tensors()
+    let mut tensors: Vec<TestTensor> = tiny_tensors()
         .into_iter()
         .filter(|t| t.name != "blk.2.nextn.embed_tokens.weight")
         .collect();
+    tensors.push(TestTensor {
+        name: "token_embd.weight",
+        dims: vec![32, 64],
+        data: zeros(64 * 32),
+    });
     let tmp = std::env::temp_dir().join(format!("mtp_shared_{}.gguf", std::process::id()));
     write_gguf(&tmp, &tensors);
     let gguf = GgufFile::open(&tmp).expect("open");
@@ -345,13 +350,18 @@ fn mtp_shared_head_borrows_the_supplied_main_buffer_without_a_second_allocation(
     let Some(device) = try_device() else { return };
     let h = 32usize;
     let vocab = 64usize;
-    let tensors: Vec<TestTensor> = tiny_tensors()
+    let mut tensors: Vec<TestTensor> = tiny_tensors()
         .into_iter()
         .filter(|tensor| {
             tensor.name != "blk.2.nextn.embed_tokens.weight"
                 && tensor.name != "blk.2.nextn.shared_head_head.weight"
         })
         .collect();
+    tensors.push(TestTensor {
+        name: "token_embd.weight",
+        dims: vec![h as u64, vocab as u64],
+        data: zeros(vocab * h),
+    });
     let tmp = std::env::temp_dir().join(format!("mtp_supplied_head_{}.gguf", std::process::id()));
     write_gguf(&tmp, &tensors);
     let gguf = GgufFile::open(&tmp).expect("open");
