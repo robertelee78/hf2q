@@ -126,6 +126,7 @@ jobs:
             scripts/test_standalone_release_signing_contract.sh \
             tests/frictionless_cli.rs \
             scripts/test_frictionless_binary.sh \
+            scripts/test_frictionless_diagnostics_contract.sh \
             docs/shell-completion.md \
             docs/adr/ADR-045-frictionless-distribution-updates-and-onboarding.md
           do
@@ -523,6 +524,7 @@ jobs:
           bash scripts/test_release_dependency_provenance_contract.sh
           bash scripts/test_release_gate_process_group_contract.sh
           bash scripts/test_release_tag_recovery_contract.sh
+          bash scripts/test_frictionless_diagnostics_contract.sh
           bash scripts/test_gemma4_long_short_overlap_contract.sh
           cargo test --locked --bin hf2q --all-features deepseek4 -- \
             --skip attention_forward_tests \
