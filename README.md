@@ -217,6 +217,8 @@ paths, lifecycle cleanup, overrides, and troubleshooting.
 Run `hf2q <command> --help` for the full flag surface.
 
 Interactive human commands show the exact hf2q.us rabbit mark once on stderr.
+The bare `hf2q` command is the branded interactive overview; explicit
+`--help` and `--version` requests remain protocol-clean.
 cmux, Ghostty, Kitty, and other positively detected Kitty-capable terminals
 receive the native PNG raster; iTerm2-compatible terminals receive their native
 inline image; Alacritty and Apple's Terminal receive an ANSI truecolor pixel
@@ -224,7 +226,7 @@ raster compiled from the same exact packaged SVG. hf2q never substitutes a
 hand-drawn rabbit or rerasterizes it during command startup. Use global
 `--terminal-graphics auto|kitty|iterm2|ansi|off` to override rendering; `off`
 suppresses the complete logo and wordmark banner.
-Help/version, completions, pipes, CI, `serve --quiet`, hidden helpers, and
+Explicit help/version, completions, pipes, CI, `serve --quiet`, hidden helpers, and
 `--log-format json` stay protocol-clean.
 
 ### Inspect and plan a serve

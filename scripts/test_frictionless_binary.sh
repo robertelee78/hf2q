@@ -34,13 +34,31 @@ run_isolated --state-root "$test_root/state" chat list \
 cmp "$test_root/serve.list" "$test_root/chat.list"
 test ! -e "$test_root/data/hf2q/models"
 
+# A redirected bare invocation remains a clean Clap diagnostic: no graphics
+# or wordmark leak into either output stream.
+set +e
+run_isolated > "$test_root/bare.stdout" 2> "$test_root/bare.stderr"
+bare_redirected_exit=$?
+set -e
+test "$bare_redirected_exit" -eq 2
+test ! -s "$test_root/bare.stdout"
+grep -Fq 'Usage: hf2q' "$test_root/bare.stderr"
+! grep -Fq 'Hugging Face → native GGUF → Apple Silicon' \
+  "$test_root/bare.stderr"
+
 # Exercise the exact installed artifact through a real macOS PTY. The global
 # rabbit banner is scrollback-safe and must never enter the alternate screen;
 # every structured/noninteractive suppression branch stays banner-free.
 pty_run() {
   local output=$1
   shift
-  /usr/bin/script -q "$output" /usr/bin/env -u CI \
+  /usr/bin/script -q "$output" /usr/bin/env \
+    -u CI \
+    -u CMUX_SURFACE_ID \
+    -u KITTY_WINDOW_ID \
+    -u GHOSTTY_RESOURCES_DIR \
+    -u LC_TERMINAL \
+    -u TMUX \
     HOME="$test_root/home" \
     XDG_DATA_HOME="$test_root/data" \
     XDG_CACHE_HOME="$test_root/cache" \
@@ -59,6 +77,59 @@ test "$(grep -aFc 'Hugging Face → native GGUF → Apple Silicon' \
 grep -aFq $'\033[38;2;' "$test_root/banner.pty"
 ! grep -aFq $'\033[?1049h' "$test_root/banner.pty"
 ! grep -aFq $'\033[?1049l' "$test_root/banner.pty"
+
+# Bare `hf2q` is the interactive landing surface, not an explicit help
+# protocol request. It must brand the command overview before Clap exits.
+# Pin each operator-supported terminal identity instead of inheriting the
+# outer test runner's multiplexer hints.
+set +e
+pty_run "$test_root/bare.pty" "$binary"
+bare_exit=$?
+set -e
+test "$bare_exit" -eq 2
+test "$(grep -aFc 'Hugging Face → native GGUF → Apple Silicon' \
+  "$test_root/bare.pty")" -eq 1
+grep -aFq $'\033[38;2;' "$test_root/bare.pty"
+grep -aFq 'Usage: hf2q' "$test_root/bare.pty"
+! grep -aFq $'\033[?1049h' "$test_root/bare.pty"
+! grep -aFq $'\033[?1049l' "$test_root/bare.pty"
+
+set +e
+pty_run "$test_root/bare-alacritty.pty" /usr/bin/env TERM_PROGRAM=Alacritty \
+  "$binary"
+bare_alacritty_exit=$?
+set -e
+test "$bare_alacritty_exit" -eq 2
+test "$(grep -aFc 'Hugging Face → native GGUF → Apple Silicon' \
+  "$test_root/bare-alacritty.pty")" -eq 1
+grep -aFq $'\033[38;2;' "$test_root/bare-alacritty.pty"
+! grep -aFq $'\033[?1049h' "$test_root/bare-alacritty.pty"
+! grep -aFq $'\033[?1049l' "$test_root/bare-alacritty.pty"
+
+set +e
+pty_run "$test_root/bare-cmux.pty" /usr/bin/env CMUX_SURFACE_ID=hf2q-test \
+  "$binary"
+bare_cmux_exit=$?
+set -e
+test "$bare_cmux_exit" -eq 2
+test "$(grep -aFc 'Hugging Face → native GGUF → Apple Silicon' \
+  "$test_root/bare-cmux.pty")" -eq 1
+/usr/bin/perl -0777 -ne \
+  'while (/\e_G[^;]*;([A-Za-z0-9+\/=]+)\e\\/g) { print $1 }' \
+  "$test_root/bare-cmux.pty" | base64 -D > "$test_root/bare-cmux-rabbit.png"
+test "$(shasum -a 256 "$test_root/bare-cmux-rabbit.png" | awk '{print $1}')" = \
+  fe8cc15cc2693c38ab8510724566a22455b2d33bc7332229deedb88bc5e28aad
+! grep -aFq $'\033[?1049h' "$test_root/bare-cmux.pty"
+! grep -aFq $'\033[?1049l' "$test_root/bare-cmux.pty"
+
+set +e
+pty_run "$test_root/bare-ci.pty" /usr/bin/env CI=1 "$binary"
+bare_ci_exit=$?
+set -e
+test "$bare_ci_exit" -eq 2
+grep -aFq 'Usage: hf2q' "$test_root/bare-ci.pty"
+! grep -aFq 'Hugging Face → native GGUF → Apple Silicon' \
+  "$test_root/bare-ci.pty"
 
 pty_run "$test_root/kitty.pty" \
   "$binary" --terminal-graphics kitty --state-root "$test_root/state" serve list

@@ -99,13 +99,21 @@ fn main() -> ExitCode {
     cli::completion_install::complete_env();
 
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let bare_invocation = raw_args.len() == 1;
 
     let cli = match Cli::try_parse_from(raw_args) {
         Ok(cli) => cli,
         Err(error) => {
-            // Preserve the established diagnostics contract for Clap's early
-            // --help/--version/error exits. Valid commands initialize typed
-            // overrides below before this read-once snapshot is activated.
+            // Bare `hf2q` is the interactive command overview and therefore
+            // owns the same exact global brand as accepted human commands.
+            // Explicit --help/--version and malformed invocations remain
+            // protocol-clean because they are not the bare landing surface.
+            if bare_invocation {
+                operator_ui::print_bare_invocation_banner();
+            }
+            // Preserve the established diagnostics contract for every other
+            // Clap early exit. Valid commands initialize typed overrides
+            // below before this read-once snapshot is activated.
             debug::INVESTIGATION_ENV.activate(false);
             error.exit();
         }
