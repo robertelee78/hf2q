@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.88+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | hf2q 0.1.16 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.16` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | hf2q 0.1.17 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.17` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
@@ -217,6 +217,8 @@ paths, lifecycle cleanup, overrides, and troubleshooting.
 Run `hf2q <command> --help` for the full flag surface.
 
 Interactive human commands show the exact hf2q.us rabbit mark once on stderr.
+The bare `hf2q` command is the branded interactive overview; explicit
+`--help` and `--version` requests remain protocol-clean.
 cmux, Ghostty, Kitty, and other positively detected Kitty-capable terminals
 receive the native PNG raster; iTerm2-compatible terminals receive their native
 inline image; Alacritty and Apple's Terminal receive an ANSI truecolor pixel
@@ -224,7 +226,7 @@ raster compiled from the same exact packaged SVG. hf2q never substitutes a
 hand-drawn rabbit or rerasterizes it during command startup. Use global
 `--terminal-graphics auto|kitty|iterm2|ansi|off` to override rendering; `off`
 suppresses the complete logo and wordmark banner.
-Help/version, completions, pipes, CI, `serve --quiet`, hidden helpers, and
+Explicit help/version, completions, pipes, CI, `serve --quiet`, hidden helpers, and
 `--log-format json` stay protocol-clean.
 
 ### Inspect and plan a serve
@@ -746,7 +748,7 @@ are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/adr/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.16 serving release
+#### Test the 0.1.17 serving release
 
 Build and verify the exact checkout before loading a model:
 

@@ -105,6 +105,22 @@ pub(crate) fn print_global_banner(cli: &Cli) {
     let _ = render_banner(&mut stderr, cli.terminal_graphics, &facts);
 }
 
+/// Brand the interactive bare-command overview before Clap exits.
+///
+/// There is no parsed [`Cli`] on this path because its required subcommand is
+/// deliberately absent. The bare invocation has no operator overrides, so it
+/// uses the documented defaults while retaining every TTY/CI suppression
+/// boundary used by accepted commands.
+pub(crate) fn print_bare_invocation_banner() {
+    let facts = TerminalFacts::current();
+    if !interactive_banner_enabled(LogFormat::Text, TerminalGraphicsArg::Auto, &facts) {
+        return;
+    }
+
+    let mut stderr = io::stderr().lock();
+    let _ = render_banner(&mut stderr, TerminalGraphicsArg::Auto, &facts);
+}
+
 fn render_banner(
     output: &mut impl Write,
     requested: TerminalGraphicsArg,
@@ -151,12 +167,7 @@ fn render_banner(
 }
 
 fn banner_enabled(cli: &Cli, facts: &TerminalFacts) -> bool {
-    facts.stdout_tty
-        && facts.stderr_tty
-        && !facts.ci
-        && facts.term.as_deref() != Some("dumb")
-        && matches!(cli.log_format, LogFormat::Text)
-        && cli.terminal_graphics != TerminalGraphicsArg::Off
+    interactive_banner_enabled(cli.log_format, cli.terminal_graphics, facts)
         && !matches!(
             cli.command,
             Command::StandaloneInstall(_)
@@ -169,6 +180,19 @@ fn banner_enabled(cli: &Cli, facts: &TerminalFacts) -> bool {
                 | Command::Completions(_)
         )
         && !matches!(&cli.command, Command::Serve(args) if args.quiet)
+}
+
+fn interactive_banner_enabled(
+    log_format: LogFormat,
+    terminal_graphics: TerminalGraphicsArg,
+    facts: &TerminalFacts,
+) -> bool {
+    facts.stdout_tty
+        && facts.stderr_tty
+        && !facts.ci
+        && facts.term.as_deref() != Some("dumb")
+        && matches!(log_format, LogFormat::Text)
+        && terminal_graphics != TerminalGraphicsArg::Off
 }
 
 fn select_protocol(

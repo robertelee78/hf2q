@@ -1,7 +1,7 @@
 # ADR-051: Frictionless local-first model resolution
 
-- **Status:** Accepted; implementation under final branch validation,
-  release activation pending
+- **Status:** Accepted; v0.1.17 corrective release under final validation,
+  stable-channel activation pending
 - **Date:** 2026-08-23
 - **Related:** ADR-005, ADR-018, ADR-033, ADR-045, ADR-046, ADR-047
 - **Supersedes in part:** ADR-045's statement that onboarding does not create a
@@ -386,12 +386,15 @@ banner. No selector overrides non-TTY, redirected-output, CI, quiet,
 completion, internal-helper, or structured-log suppression.
 
 The banner is written to interactive stderr so stdout remains a stable command
-data boundary. It appears once per top-level invocation, including `setup`,
-`doctor`, `convert`, `serve`, `chat`, and inventory commands. Owned chat server
-children use the existing quiet/plain arguments and do not print a second
-banner. Clap help/version exits, completion protocols, hidden helper commands,
-redirected output, `serve --quiet`, and `--log-format json` remain free of
-graphics and wordmarks.
+data boundary. It appears once per top-level invocation, including the bare
+`hf2q` command overview, `setup`, `doctor`, `convert`, `serve`, `chat`, and
+inventory commands. Bare `hf2q` is an interactive landing surface and emits
+the banner before Clap's missing-subcommand overview exits; it is not treated
+as an explicit help protocol request. Owned chat server children use the
+existing quiet/plain arguments and do not print a second banner. Explicit Clap
+`--help`/`--version` exits, completion protocols, malformed invocations, hidden
+helper commands, redirected output, `serve --quiet`, and `--log-format json`
+remain free of graphics and wordmarks.
 
 Direct `serve` uses the same preparation milestones on interactive stderr.
 While its single startup row is live, tracing output is retained in a bounded
@@ -418,6 +421,26 @@ with the native Kitty transfer. Each run used `/usr/bin/script -q /dev/null`
 to preserve a real TTY while discarding emitted bytes. The remaining native
 delta is bounded terminal image transport; ANSI is effectively at the
 no-graphics process baseline.
+
+The first v0.1.16 release proof exercised normal commands through real PTYs but
+did not exercise the literal bare `hf2q` journey. That omission allowed Clap's
+missing-subcommand exit to bypass the post-parse banner hook even though
+`serve list`, Apple Terminal ANSI, explicit Kitty, and suppression cases were
+green. Stable-channel activation was held at v0.1.15 after the operator found
+the defect. The corrective hypothesis was that only the early bare-command
+control flow differed. A regression run against the released v0.1.16 binary
+failed because its captured bare PTY contained no tagline or raster. The
+v0.1.17 implementation emits the default banner before that one Clap exit and
+keeps explicit help/version, malformed arguments, redirected output, CI,
+completion, and structured paths clean. The accepted packed-binary proof pins
+Apple Terminal and Alacritty to source-derived ANSI pixels, pins cmux to Kitty,
+extracts the cmux PNG and matches its SHA-256 to the compiled exact-rabbit
+asset, and rejects alternate-screen entry on every branded path. The first
+corrective PR gate (Actions run `32805771272`) then rejected stale `v0.1.16`
+declarations in the README and shipping contract even though all Rust tests
+shown before the assertion passed. The v0.1.17 candidate therefore updates
+those authoritative release declarations in the same correction and must pass
+that hosted shipping-contract assertion before merge.
 
 ### 8. Concurrency and failure safety
 
