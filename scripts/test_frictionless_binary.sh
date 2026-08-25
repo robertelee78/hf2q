@@ -83,6 +83,10 @@ pty_run() {
   shift
   /usr/bin/script -q "$output" /usr/bin/env \
     -u CI \
+    -u NO_COLOR \
+    -u CLICOLOR \
+    -u CLICOLOR_FORCE \
+    -u FORCE_COLOR \
     -u CMUX_SURFACE_ID \
     -u KITTY_WINDOW_ID \
     -u GHOSTTY_RESOURCES_DIR \
@@ -97,6 +101,24 @@ pty_run() {
     TERM_PROGRAM=Apple_Terminal \
     COLUMNS=100 \
     "$@" >/dev/null
+}
+
+# PTY captures contain presentation bytes. Compare operator-visible text only
+# after removing CSI controls and carriage returns; raw-byte assertions remain
+# below for terminal protocol and alternate-screen behavior.
+normalize_terminal_text() {
+  local input=$1
+  local output=$2
+  /usr/bin/perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\r//g' \
+    "$input" > "$output"
+}
+
+usage_line_has_csi() {
+  local input=$1
+  /usr/bin/perl -ne '
+    $found = 1 if /Usage:/ && /hf2q/ && /\e\[[0-?]*[ -\/]*[@-~]/;
+    END { exit($found ? 0 : 1) }
+  ' "$input"
 }
 
 pty_run "$test_root/banner.pty" \
@@ -119,9 +141,33 @@ test "$bare_exit" -eq 2
 test "$(grep -aFc 'Hugging Face → native GGUF → Apple Silicon' \
   "$test_root/bare.pty")" -eq 1
 grep -aFq $'\033[38;2;' "$test_root/bare.pty"
-grep -aFq 'Usage: hf2q' "$test_root/bare.pty"
+normalize_terminal_text "$test_root/bare.pty" "$test_root/bare.text"
+grep -Fq 'Usage: hf2q' "$test_root/bare.text"
 ! grep -aFq $'\033[?1049h' "$test_root/bare.pty"
 ! grep -aFq $'\033[?1049l' "$test_root/bare.pty"
+
+# Exercise both sides of Clap's color contract explicitly. The styled capture
+# reproduces GitHub's PTY environment; the NO_COLOR capture proves that an
+# outer shell preference cannot accidentally select which branch is tested.
+set +e
+pty_run "$test_root/bare-clap-color.pty" \
+  "$binary" --terminal-graphics off
+bare_clap_color_exit=$?
+set -e
+test "$bare_clap_color_exit" -eq 2
+usage_line_has_csi "$test_root/bare-clap-color.pty"
+normalize_terminal_text "$test_root/bare-clap-color.pty" \
+  "$test_root/bare-clap-color.text"
+grep -Fq 'Usage: hf2q' "$test_root/bare-clap-color.text"
+
+set +e
+pty_run "$test_root/bare-clap-no-color.pty" /usr/bin/env NO_COLOR=1 \
+  "$binary" --terminal-graphics off
+bare_clap_no_color_exit=$?
+set -e
+test "$bare_clap_no_color_exit" -eq 2
+! grep -aFq $'\033[' "$test_root/bare-clap-no-color.pty"
+grep -aFq 'Usage: hf2q' "$test_root/bare-clap-no-color.pty"
 
 set +e
 pty_run "$test_root/bare-alacritty.pty" /usr/bin/env TERM_PROGRAM=Alacritty \
@@ -156,7 +202,8 @@ pty_run "$test_root/bare-ci.pty" /usr/bin/env CI=1 "$binary"
 bare_ci_exit=$?
 set -e
 test "$bare_ci_exit" -eq 2
-grep -aFq 'Usage: hf2q' "$test_root/bare-ci.pty"
+normalize_terminal_text "$test_root/bare-ci.pty" "$test_root/bare-ci.text"
+grep -Fq 'Usage: hf2q' "$test_root/bare-ci.text"
 ! grep -aFq 'Hugging Face → native GGUF → Apple Silicon' \
   "$test_root/bare-ci.pty"
 
