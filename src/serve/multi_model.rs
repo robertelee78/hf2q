@@ -110,6 +110,10 @@ use crate::core::hardware::HardwareProfile;
 /// next-to-the-GGUF lookup performed inside `LoadedModel::load`.
 #[derive(Clone, Default)]
 pub struct EngineConfig {
+    /// Stable operator-facing path for a model opened through a retained
+    /// descriptor such as `/dev/fd/N`. The loader uses the descriptor for
+    /// bytes while load telemetry continues to name this logical path.
+    pub operator_model_path: Option<PathBuf>,
     /// Optional explicit `tokenizer.json` path for families that consume a
     /// sidecar. Qwen3.5/Qwen3.6 deliberately ignore it and build from the
     /// GGUF-embedded tokenizer metadata.
@@ -172,6 +176,7 @@ pub struct EngineConfig {
 impl std::fmt::Debug for EngineConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EngineConfig")
+            .field("operator_model_path", &self.operator_model_path)
             .field("tokenizer_path", &self.tokenizer_path)
             .field("config_path", &self.config_path)
             .field("queue_capacity", &self.queue_capacity)
@@ -803,7 +808,11 @@ pub struct DefaultModelLoader;
 
 impl ModelLoader<Engine> for DefaultModelLoader {
     fn load(&self, path: &Path, config: &EngineConfig) -> anyhow::Result<Engine> {
-        crate::serve::load_engine(path, config)
+        let engine = crate::serve::load_engine(path, config)?;
+        Ok(match config.operator_model_path.as_deref() {
+            Some(logical) => engine.with_operator_model_path(logical),
+            None => engine,
+        })
     }
 }
 
@@ -1626,6 +1635,23 @@ impl<E> HotSwapManager<E> {
         gguf_path: &Path,
         config: &EngineConfig,
     ) -> Result<Arc<LoadedEngine<E>>, HotSwapError> {
+        self.load_or_get_from_authority(repo, quant, gguf_path, gguf_path, config)
+    }
+
+    /// Load through a retained descriptor path while publishing the stable
+    /// operator path as the resident identity. This closes the pathname
+    /// swap-and-restore window for structurally admitted manual artifacts
+    /// without changing pool keys or API paths. Byte accounting comes from
+    /// the same activation authority as the loader, never the mutable public
+    /// name.
+    pub fn load_or_get_from_authority(
+        &mut self,
+        repo: &str,
+        quant: QuantType,
+        gguf_path: &Path,
+        activation_path: &Path,
+        config: &EngineConfig,
+    ) -> Result<Arc<LoadedEngine<E>>, HotSwapError> {
         let k = pool_key(repo, quant);
 
         // Fast path: already loaded.  Touch the LRU and clone the Arc.
@@ -1638,16 +1664,29 @@ impl<E> HotSwapManager<E> {
         // fails fast without driving the loader (which would itself
         // bail at header-open time, but a clean upfront error is
         // better tracing).
-        let bytes_resident = std::fs::metadata(gguf_path)
+        let bytes_resident = std::fs::metadata(activation_path)
             .map_err(|source| HotSwapError::FileSize {
                 path: gguf_path.to_path_buf(),
                 source,
             })?
             .len();
 
+        let mut loader_config = config.clone();
+        if activation_path != gguf_path {
+            loader_config.operator_model_path = Some(gguf_path.to_path_buf());
+            if loader_config.tokenizer_path.is_none() {
+                let sibling = gguf_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("tokenizer.json");
+                if sibling.is_file() {
+                    loader_config.tokenizer_path = Some(sibling);
+                }
+            }
+        }
         let engine = self
             .loader
-            .load(gguf_path, config)
+            .load(activation_path, &loader_config)
             .map_err(HotSwapError::LoaderFailed)?;
 
         let loaded_engine = Arc::new(LoadedEngine {
@@ -2271,6 +2310,103 @@ mod tests {
         let stats = mgr.pool_stats();
         assert_eq!(stats.loaded_count, 1);
         assert_eq!(stats.total_resident_bytes, 1_000);
+    }
+
+    #[test]
+    fn retained_activation_path_loads_bytes_but_publishes_operator_path() {
+        struct PathLoader(std::sync::Mutex<Option<(PathBuf, Option<PathBuf>)>>);
+        impl ModelLoader<MockEngine> for PathLoader {
+            fn load(&self, path: &Path, config: &EngineConfig) -> anyhow::Result<MockEngine> {
+                *self.0.lock().unwrap() =
+                    Some((path.to_path_buf(), config.operator_model_path.clone()));
+                Ok(MockEngine { load_serial: 1 })
+            }
+        }
+
+        let logical = synthetic_gguf(1_000);
+        let authority =
+            crate::core::bounded_file::StableRegularFile::open_exact(logical.path(), 1_000)
+                .unwrap()
+                .unwrap();
+        let activation = authority.activation_path().unwrap();
+        let loader = Arc::new(PathLoader(std::sync::Mutex::new(None)));
+        let pool = LoadedPool::with_capacity_and_budget(1, 2_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let loaded = manager
+            .load_or_get_from_authority(
+                "owner/model",
+                QuantType::Q4_K_M,
+                logical.path(),
+                &activation,
+                &empty_config(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            loader.0.lock().unwrap().as_ref(),
+            Some(&(activation, Some(logical.path().to_path_buf())))
+        );
+        assert_eq!(loaded.gguf_path, logical.path());
+        assert_eq!(loaded.bytes_resident, 1_000);
+
+        let display_engine = crate::serve::api::engine::make_synthetic_engine_for_test(
+            crate::serve::api::engine::LoadedArch::Gemma,
+        )
+        .with_operator_model_path(logical.path());
+        assert_eq!(display_engine.info().model_path, logical.path());
+        assert!(!display_engine.info().model_path.starts_with("/dev/fd"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_activation_size_drives_budget_when_public_symlink_is_swapped_and_restored() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let large = synthetic_gguf(1_000);
+        let small = synthetic_gguf(100);
+        let logical = directory.path().join("operator-model.gguf");
+        symlink(large.path(), &logical).unwrap();
+        let authority =
+            crate::core::bounded_file::StableRegularFile::open_operator_path_exact(&logical, 1_000)
+                .unwrap()
+                .unwrap();
+        let activation = authority.activation_path().unwrap();
+
+        std::fs::remove_file(&logical).unwrap();
+        symlink(small.path(), &logical).unwrap();
+
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 500);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let error = manager
+            .load_or_get_from_authority(
+                "owner/model",
+                QuantType::Q4_K_M,
+                &logical,
+                &activation,
+                &empty_config(),
+            )
+            .expect_err("retained 1,000-byte model must exceed the 500-byte budget");
+
+        std::fs::remove_file(&logical).unwrap();
+        symlink(large.path(), &logical).unwrap();
+
+        assert!(matches!(
+            error,
+            HotSwapError::PoolRefused(PoolError::OversizedHandle {
+                handle_bytes: 1_000,
+                budget_bytes: 500,
+                ..
+            })
+        ));
+        assert_eq!(loader.call_count(), 1);
+        assert_eq!(manager.pool_stats().loaded_count, 0);
+        assert_eq!(manager.pool_stats().total_resident_bytes, 0);
+        assert!(
+            !authority.is_stable().unwrap(),
+            "swap-and-restore must remain detectable even though accounting used the retained bytes"
+        );
     }
 
     #[test]

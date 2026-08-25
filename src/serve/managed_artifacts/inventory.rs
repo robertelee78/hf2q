@@ -7,6 +7,11 @@ pub(super) struct ExactLooseFile {
     pub(super) retained: crate::core::bounded_file::StableRegularFile,
 }
 
+pub(super) struct ScanRoot {
+    path: PathBuf,
+    directory: fs::File,
+}
+
 pub(super) fn find_matching_loose(
     artifact: &HubGgufArtifact,
     model_dirs: &[PathBuf],
@@ -59,6 +64,10 @@ pub(crate) fn print_inventory(model_dirs: &[PathBuf]) -> Result<()> {
     println!("REPOSITORY\tREVISION\tQUANT\tORIGIN\tLAST_USED\tMMPROJ\tPATH");
     let mut paths = BTreeSet::new();
     for candidate in managed {
+        if is_projector_path(&candidate.path) {
+            paths.insert(candidate.path);
+            continue;
+        }
         paths.insert(candidate.path.clone());
         println!(
             "{}",
@@ -78,6 +87,10 @@ pub(crate) fn print_inventory(model_dirs: &[PathBuf]) -> Result<()> {
         );
     }
     for artifact in local.artifacts {
+        if is_projector_path(&artifact.path) {
+            paths.insert(artifact.path);
+            continue;
+        }
         if paths.insert(artifact.path.clone()) {
             let last_used = cache_manifest
                 .as_ref()
@@ -121,6 +134,7 @@ pub(crate) fn print_inventory(model_dirs: &[PathBuf]) -> Result<()> {
     for root in scan_roots(model_dirs)? {
         visit_files(&root, |path, _, file| {
             if paths.contains(path)
+                || is_projector_path(path)
                 || path
                     .extension()
                     .and_then(|v| v.to_str())
@@ -355,6 +369,10 @@ fn print_hub_snapshot_inventory_from_authority(
                 .extension()
                 .and_then(|value| value.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
+            if gguf_name && is_projector_path(&display_path) {
+                paths.insert(display_path);
+                continue;
+            }
             match rustix::fs::openat(
                 &directory_fd,
                 &name,
@@ -512,6 +530,13 @@ fn print_hub_row(repository: &str, revision: &str, quant: QuantType, path: &Path
     );
 }
 
+fn is_projector_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|name| name.starts_with("mmproj") || name.contains("-mmproj"))
+}
+
 fn resolve_hub_blob_target(
     revision: &str,
     relative_directory: &Path,
@@ -600,11 +625,14 @@ fn escape_inventory_field(field: &str) -> String {
             '\t' => escaped.push_str("\\t"),
             '\r' => escaped.push_str("\\r"),
             '\n' => escaped.push_str("\\n"),
-            character if character.is_control() && (character as u32) <= 0xff => {
+            character
+                if crate::serve::startup_progress::unsafe_display_char(character)
+                    && (character as u32) <= 0xff =>
+            {
                 use std::fmt::Write as _;
                 let _ = write!(escaped, "\\x{:02X}", character as u32);
             }
-            character if character.is_control() => {
+            character if crate::serve::startup_progress::unsafe_display_char(character) => {
                 use std::fmt::Write as _;
                 let _ = write!(escaped, "\\u{{{:X}}}", character as u32);
             }
@@ -617,8 +645,9 @@ fn escape_inventory_field(field: &str) -> String {
 #[cfg(test)]
 mod inventory_output_tests {
     use super::{
-        directory_names, escape_inventory_field, inventory_row, open_directory_at,
-        print_hub_snapshot_inventory_from_authority, print_hub_snapshot_inventory_with_hooks,
+        directory_names, escape_inventory_field, inventory_row, is_projector_path,
+        open_directory_at, print_hub_snapshot_inventory_from_authority,
+        print_hub_snapshot_inventory_with_hooks, scan_roots, visit_files,
         visit_files_with_directory_hook,
     };
     use std::collections::BTreeSet;
@@ -645,16 +674,127 @@ mod inventory_output_tests {
     fn inventory_fields_escape_row_and_terminal_control_characters() {
         let row = inventory_row([
             "owner/model".to_owned(),
-            "artifact\tname\n\u{1b}\u{009b}[31m.gguf".to_owned(),
+            "artifact\tname\n\u{1b}\u{009b}[31m\u{061c}\u{202e}evil\u{2066}.gguf".to_owned(),
         ]);
         assert_eq!(row.lines().count(), 1);
         assert_eq!(row.matches('\t').count(), 1);
         assert!(!row.contains('\u{1b}'));
         assert!(!row.contains('\u{009b}'));
+        assert!(!row.contains('\u{061c}'));
+        assert!(!row.contains('\u{202e}'));
+        assert!(!row.contains('\u{2066}'));
+        assert!(row.contains("\\u{61C}"));
+        assert!(row.contains("\\u{202E}"));
+        assert!(row.contains("\\u{2066}"));
         assert_eq!(
             escape_inventory_field("artifact\\name\r\n\t\u{1b}"),
             "artifact\\\\name\\r\\n\\t\\x1B"
         );
+    }
+
+    #[test]
+    fn inventory_classifies_projector_companions_as_non_models() {
+        assert!(is_projector_path(Path::new("mmproj-model-f16.gguf")));
+        assert!(is_projector_path(Path::new("model-q4_k_m-mmproj.gguf")));
+        assert!(is_projector_path(Path::new("MODEL-Q4_K_M-MMPROJ.GGUF")));
+        assert!(!is_projector_path(Path::new("model-q4_k_m.gguf")));
+        assert!(!is_projector_path(Path::new(
+            "vision-projection-model.gguf"
+        )));
+    }
+
+    #[test]
+    fn direct_model_directory_symlink_is_a_bounded_scan_root() {
+        let library = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::write(target.path().join("already-downloaded.gguf"), b"GGUF").unwrap();
+        symlink(target.path(), library.path().join("qwen3.6")).unwrap();
+        symlink(
+            target.path().join("already-downloaded.gguf"),
+            library.path().join("file-link.gguf"),
+        )
+        .unwrap();
+
+        let roots = scan_roots(&[library.path().to_path_buf()]).unwrap();
+        let canonical_target = target.path().canonicalize().unwrap();
+        assert!(roots.iter().any(|root| root.path == canonical_target));
+
+        let mut visited = Vec::new();
+        for root in roots
+            .into_iter()
+            .filter(|root| root.path == canonical_target)
+        {
+            visit_files(&root, |path, _, _| {
+                if path.starts_with(&canonical_target) {
+                    visited.push(path.file_name().unwrap().to_owned());
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(visited, vec![OsString::from("already-downloaded.gguf")]);
+    }
+
+    #[test]
+    fn direct_file_symlink_is_discovered_without_traversing_a_linked_tree() {
+        let library = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let payload = target.path().join("downloaded.gguf");
+        fs::write(&payload, b"GGUF payload").unwrap();
+        let link = library.path().join("model-q4_k_m.gguf");
+        symlink(&payload, &link).unwrap();
+
+        let roots = scan_roots(&[library.path().to_path_buf()]).unwrap();
+        let retained = roots
+            .iter()
+            .find(|root| root.path == library.path())
+            .unwrap();
+        let mut visited = Vec::new();
+        visit_files(retained, |path, metadata, file| {
+            visited.push((
+                path.to_path_buf(),
+                metadata.len(),
+                file.is_stable().unwrap(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(visited, vec![(link, 12, true)]);
+    }
+
+    #[test]
+    fn retained_direct_model_symlink_root_cannot_be_retargeted_into_another_tree() {
+        let library = tempfile::tempdir().unwrap();
+        let original = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(original.path().join("owned.gguf"), b"owned").unwrap();
+        fs::write(outside.path().join("escape.gguf"), b"escape").unwrap();
+        let link = library.path().join("qwen3.6");
+        symlink(original.path(), &link).unwrap();
+
+        let roots = scan_roots(&[library.path().to_path_buf()]).unwrap();
+        let original_path = original.path().canonicalize().unwrap();
+        let retained = roots
+            .iter()
+            .find(|root| root.path == original_path)
+            .unwrap();
+
+        fs::remove_file(&link).unwrap();
+        symlink(outside.path(), &link).unwrap();
+
+        let mut visited = Vec::new();
+        visit_files(retained, |path, _, file| {
+            visited.push((
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                file.is_stable().unwrap(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(visited, vec![("owned.gguf".to_owned(), true)]);
+        assert!(!visited.iter().any(|(name, _)| name == "escape.gguf"));
     }
 
     #[test]
@@ -668,8 +808,13 @@ mod inventory_output_tests {
 
         let mut replaced = false;
         let mut visited = Vec::new();
+        let roots = scan_roots(&[root.path().to_path_buf()]).unwrap();
+        let scan_root = roots
+            .iter()
+            .find(|candidate| candidate.path == root.path())
+            .unwrap();
         visit_files_with_directory_hook(
-            root.path(),
+            scan_root,
             |path, _, file| {
                 visited.push((
                     path.file_name().unwrap().to_string_lossy().into_owned(),
@@ -822,26 +967,122 @@ mod inventory_output_tests {
     }
 }
 
-pub(super) fn scan_roots(model_dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut roots = vec![
+pub(super) fn scan_roots(model_dirs: &[PathBuf]) -> Result<Vec<ScanRoot>> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+
+    const MAX_LINKED_MODEL_ROOTS: usize = 64;
+
+    let mut configured = vec![
         managed_model_root()?,
         std::env::current_dir()?.join("models"),
     ];
-    roots.extend(model_dirs.iter().cloned());
-    roots.sort();
-    roots.dedup();
+    configured.extend(model_dirs.iter().cloned());
+    configured.sort();
+    configured.dedup();
+
+    let mut roots = Vec::new();
+    let mut identities = BTreeSet::new();
+    let mut configured_roots = Vec::new();
+    for root in configured {
+        let Ok(directory) = rustix::fs::open(
+            &root,
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(fs::File::from) else {
+            continue;
+        };
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || !identities.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
+        configured_roots.push(ScanRoot {
+            path: root.clone(),
+            directory: directory.try_clone()?,
+        });
+        roots.push(ScanRoot {
+            path: root,
+            directory,
+        });
+    }
+
+    // Operators commonly organize large artifacts as one directory symlink
+    // per model beneath ~/.local/share/hf2q/models. Enumerate each configured
+    // directory through its retained descriptor, follow only direct child
+    // directory links, and retain the opened target descriptor immediately.
+    // Later retargeting therefore cannot redirect this scan. Final file-leaf
+    // links are admitted by the retained walker below; nested directory-link
+    // forests remain out of scope.
+    let mut linked = 0_usize;
+    for configured in configured_roots {
+        let Ok(entries) = rustix::fs::Dir::read_from(&configured.directory) else {
+            continue;
+        };
+        let mut names = entries
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_type() == FileType::Symlink)
+            .map(|entry| OsString::from_vec(entry.file_name().to_bytes().to_vec()))
+            .filter(|name| !matches!(name.as_bytes(), b"." | b".."))
+            .collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            if linked >= MAX_LINKED_MODEL_ROOTS {
+                break;
+            }
+            let Ok(directory) = rustix::fs::openat(
+                &configured.directory,
+                &name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(fs::File::from) else {
+                continue;
+            };
+            let metadata = directory.metadata()?;
+            if !metadata.is_dir() || !identities.insert((metadata.dev(), metadata.ino())) {
+                continue;
+            }
+            let link_path = configured.path.join(&name);
+            let Ok(target) = link_path.canonicalize() else {
+                continue;
+            };
+            let Ok(target_metadata) = fs::metadata(&target) else {
+                continue;
+            };
+            if !target_metadata.is_dir()
+                || target_metadata.dev() != metadata.dev()
+                || target_metadata.ino() != metadata.ino()
+            {
+                // The direct link was retargeted between descriptor open and
+                // display-path resolution. Keep neither authority rather than
+                // pairing one directory's FD with another directory's path.
+                continue;
+            }
+            roots.push(ScanRoot {
+                path: target,
+                directory,
+            });
+            linked += 1;
+        }
+    }
+    roots.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(roots)
 }
 
 pub(super) fn visit_files(
-    root: &Path,
+    root: &ScanRoot,
     visit: impl FnMut(&Path, &fs::Metadata, crate::core::bounded_file::StableRegularFile) -> Result<()>,
 ) -> Result<()> {
     visit_files_with_directory_hook(root, visit, |_| {})
 }
 
 fn visit_files_with_directory_hook(
-    root: &Path,
+    root: &ScanRoot,
     mut visit: impl FnMut(
         &Path,
         &fs::Metadata,
@@ -851,16 +1092,9 @@ fn visit_files_with_directory_hook(
 ) -> Result<()> {
     use rustix::fs::{Mode, OFlags};
 
-    let root_fd = match rustix::fs::open(
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fs::File::from(fd),
-        Err(_) => return Ok(()),
-    };
+    let root_fd = root.directory.try_clone()?;
     let root_authority = root_fd.try_clone()?;
-    let root_path = root.to_path_buf();
+    let root_path = root.path.clone();
     let mut queue =
         std::collections::VecDeque::from([(root_path.clone(), PathBuf::new(), root_fd, 0usize)]);
     let mut visited = 0usize;
@@ -889,7 +1123,24 @@ fn visit_files_with_directory_hook(
                 Mode::empty(),
             ) {
                 Ok(fd) => fs::File::from(fd),
-                _ => continue,
+                Err(_) => {
+                    let path = directory.join(&name);
+                    let relative = relative_directory.join(&name);
+                    let Some(stable) = crate::core::bounded_file::open_walked_operator_symlink(
+                        root_authority.try_clone()?,
+                        root_path.clone(),
+                        relative,
+                        &directory_fd,
+                        &name,
+                        &path,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let metadata = stable.try_clone()?.metadata()?;
+                    visit(&path, &metadata, stable)?;
+                    continue;
+                }
             };
             let metadata = match entry_fd.metadata() {
                 Ok(metadata) => metadata,

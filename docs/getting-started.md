@@ -42,11 +42,17 @@ hf2q serve jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M
 ```
 
 That is the whole model preparation command. hf2q first looks for an exact
-verified local Q4_K_M—including a manually downloaded file under the managed
-model directory. If none exists, it resolves the repository to one immutable
+hf2q-bound Q4_K_M or one uniquely compatible manually downloaded GGUF under
+the managed model directory. Manual files are admitted from bounded GGUF
+metadata, tokenizer, tensor layout, size, and runtime support while a retained
+descriptor keeps the selected file stable; the multi-gigabyte tensor payload
+is not hashed before serving. This includes a final file symlink such as a
+GGUF linked from another local model library: hf2q retains the target and
+revalidates both link and target identities without traversing linked
+directories. If none exists, hf2q resolves the repository to one immutable
 commit, checks disk space, downloads and verifies the exact hosted GGUF, and
 stores it below
-`$HOME/.local/share/hf2q/models/<owner>__<repo>/<commit>/`.
+`$HOME/.local/share/hf2q/models/v2-<hex(owner/repo)>/<commit>/`.
 
 For this multimodal model, hf2q also reuses or downloads the one matching
 `mmproj`, verifies the pair, and loads it automatically. If a valid projector
@@ -82,8 +88,8 @@ hf2q chat list
 ```
 
 The Q4_K_M row must name the canonical repository and immutable revision. A
-second `serve` or model-targeted `chat` invocation reuses those verified bytes
-instead of transferring the payload again.
+second `serve` or model-targeted `chat` invocation reuses those local bytes
+instead of transferring or hashing the full payload again.
 
 ## 5. Prove vision with one request
 

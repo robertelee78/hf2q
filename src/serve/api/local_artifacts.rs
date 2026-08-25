@@ -17,7 +17,6 @@ use crate::serve::quant_select::QuantType;
 
 mod verification;
 
-pub(crate) use verification::verify_retained_local_artifact;
 pub use verification::{verify_local_artifact, LocalVerificationReceipt, LocalVerificationRequest};
 
 const RECEIPT_SUFFIX: &str = ".gguf.receipt.json";
@@ -378,7 +377,7 @@ fn inspect_receipt(
     }))
 }
 
-fn validate_receipt_identity(receipt: &ConversionReceipt) -> Result<()> {
+pub(crate) fn validate_receipt_identity(receipt: &ConversionReceipt) -> Result<()> {
     if receipt.source.repository_type != "model"
         || receipt.converter.package != "hf2q"
         || !crate::serve::auto_pipeline::looks_like_hf_repo_id(&receipt.source.repository_id)

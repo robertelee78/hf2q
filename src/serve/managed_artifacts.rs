@@ -11,11 +11,14 @@ pub(crate) use inventory::print_inventory;
 use inventory::{find_matching_loose, scan_roots, visit_files};
 #[cfg(test)]
 use local::local_candidate_eligible;
-use local::{find_best_matching_cached_hub, find_best_matching_loose, select_local};
 #[cfg(test)]
 use local::{
-    find_best_matching_cached_hub_with, find_best_matching_loose_with,
-    find_best_matching_loose_with_hash,
+    find_best_matching_cached_hub_with, find_best_matching_loose, find_best_matching_loose_with,
+    find_best_matching_loose_with_hash, select_local,
+};
+use local::{
+    find_best_matching_cached_hub_with_progress, find_best_matching_loose_with_progress,
+    hash_hosted_local_candidate, select_local_with_progress,
 };
 #[cfg(test)]
 use materialize::clone_requires_copy;
@@ -25,19 +28,23 @@ use materialize::{
 };
 use projector::{
     best_effort_projector_with_catalog, materialize_prepared_projector, prepare_projector_action,
-    select_projector_companion, PreparedProjectorSource,
+    retain_cached_projector_at, select_projector_companion, PreparedProjectorSource,
 };
 #[cfg(test)]
-use projector::{resolve_projector, resolve_projector_with_catalog, retain_cached_projector_at};
+use projector::{resolve_projector, resolve_projector_with_catalog};
 pub(crate) use resolution::planned_native_product_bytes;
+#[cfg(test)]
 pub(crate) use resolution::resolve_repository;
+pub(crate) use resolution::resolve_repository_with_progress;
 #[cfg(test)]
 use resolution::{
     admit_automatic_projector_preflight, automatic_artifact_admissible,
+    best_effort_manual_projector_with_catalog, bind_existing_local_projector,
     bound_candidate_is_at_least_as_recent, exact_local_projector_catalog_reference,
     hosted_pair_requires_projector, native_convert, post_lock_local_candidate_wins,
-    prepare_local_candidate_with_catalog_resolver, prepare_selected_local,
-    prepare_selected_local_decision_with_preflight, repository_recommended_quant,
+    prepare_cached_projector_in_place_with_sources, prepare_local_candidate_with_catalog_resolver,
+    prepare_selected_local, prepare_selected_local_decision_with_preflight,
+    repository_recommended_quant, resolve_repository_with_progress_and_catalog,
     reverify_candidate_after_catalog, select_compatible_hosted, select_hosted,
     select_native_fallback_quant, select_native_quant_from_exact_plans,
 };
@@ -58,13 +65,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::api::local_artifacts::{
-    verify_retained_local_artifact, LocalArtifactInventory, LocalArtifactProvenance,
-    LocalVerificationRequest,
-};
+use super::api::local_artifacts::{LocalArtifactInventory, LocalArtifactProvenance};
 use super::cache::{CacheLock, ModelCache};
 use super::multi_model::LoadedPool;
 use super::quant_select::{quant_type_from_gguf_file, select_quant, GpuInfo, QuantType};
+use super::startup_progress::{StartupEvent, StartupOrigin};
 use crate::core::hardware::HardwareProfile;
 use crate::input::hf_download::{
     cached_hub_gguf_path, check_hosted_text_local_projector_plan_with_device,
@@ -124,9 +129,9 @@ struct Candidate {
     last_used_at_secs: u64,
     projector: Option<(PathBuf, u64, String)>,
     sidecar: Option<PathBuf>,
+    receipt_target_identity: Option<crate::core::bounded_file::StableFileIdentity>,
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct ResolvedManagedModel {
     pub(crate) gguf_path: PathBuf,
     pub(crate) mmproj_path: Option<PathBuf>,
@@ -135,33 +140,65 @@ pub(crate) struct ResolvedManagedModel {
     pub(crate) quant: QuantType,
     pub(crate) origin: String,
     pub(crate) warnings: Vec<String>,
+    pub(crate) track_success_history: bool,
+    pub(crate) activation_authority: Option<crate::core::bounded_file::StableRegularFile>,
+    pub(crate) mmproj_sha256: Option<String>,
+    pub(crate) mmproj_activation_authority: Option<crate::core::bounded_file::StableRegularFile>,
 }
 
-fn verify_candidate(
+type StartupProgress<'a> = dyn FnMut(StartupEvent) + 'a;
+
+fn verify_candidate(candidate: &Candidate) -> Result<crate::core::bounded_file::StableRegularFile> {
+    let mut silent = |_| {};
+    verify_candidate_with_progress(candidate, &mut silent)
+}
+
+fn verify_candidate_with_progress(
     candidate: &Candidate,
-) -> Result<crate::core::bounded_file::StableFileIdentity> {
+    progress: &mut StartupProgress<'_>,
+) -> Result<crate::core::bounded_file::StableRegularFile> {
     #[cfg(test)]
     VERIFY_CANDIDATE_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let retained =
-        crate::core::bounded_file::StableRegularFile::open_exact(&candidate.path, candidate.bytes)?
-            .context("local candidate changed before verification")?;
-    let verified = verify_retained_local_artifact(
-        LocalVerificationRequest {
-            root: &candidate.root,
-            artifact: &candidate.path,
-            bytes: candidate.bytes,
-            sha256: &candidate.sha256,
-            quant: candidate.quant,
-        },
-        retained,
-    )?;
-    validate_retained_local_runtime_tensor_layout(&verified.retained)?;
-    Ok(verified.retained.identity())
+    progress(StartupEvent::LocalCandidate {
+        quant: candidate.quant.as_str().to_owned(),
+        origin: StartupOrigin::from_internal(&candidate.origin),
+        bytes: candidate.bytes,
+        filename: display_filename(&candidate.path),
+    });
+    let retained = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        &candidate.path,
+        candidate.bytes,
+    )?
+    .context("local candidate changed before verification")?;
+    if candidate
+        .receipt_target_identity
+        .is_some_and(|expected| retained.identity() != expected)
+    {
+        bail!("linked conversion target changed after receipt authentication");
+    }
+    let actual_quant = quant_type_from_gguf_file(retained.try_clone()?, &candidate.path)
+        .context("read local GGUF quant metadata")?;
+    if actual_quant != candidate.quant {
+        bail!(
+            "local GGUF metadata quant {} does not match bound quant {}",
+            actual_quant,
+            candidate.quant
+        );
+    }
+    validate_retained_local_runtime_tensor_layout(&retained)?;
+    Ok(retained)
 }
 
 #[cfg(test)]
 thread_local! {
     static VERIFY_CANDIDATE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static VERIFY_PROJECTOR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AFTER_AUTOMATIC_PROJECTOR_PREPARED: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        std::cell::RefCell::new(None);
+    static AFTER_RETAINED_TEXT_PROJECTOR_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static BEFORE_MANUAL_HOSTED_PROJECTOR_FALLBACK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -173,6 +210,106 @@ fn reset_verify_candidate_calls() {
 fn verify_candidate_calls() -> usize {
     VERIFY_CANDIDATE_CALLS.with(std::cell::Cell::get)
 }
+
+#[cfg(test)]
+fn reset_verify_projector_calls() {
+    VERIFY_PROJECTOR_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn verify_projector_calls() -> usize {
+    VERIFY_PROJECTOR_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+struct AutomaticProjectorHookGuard;
+
+#[cfg(test)]
+impl Drop for AutomaticProjectorHookGuard {
+    fn drop(&mut self) {
+        AFTER_AUTOMATIC_PROJECTOR_PREPARED.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn set_after_automatic_projector_prepared(
+    hook: impl FnOnce(&Path) + 'static,
+) -> AutomaticProjectorHookGuard {
+    AFTER_AUTOMATIC_PROJECTOR_PREPARED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    AutomaticProjectorHookGuard
+}
+
+#[cfg(test)]
+fn run_after_automatic_projector_prepared(path: &Path) {
+    AFTER_AUTOMATIC_PROJECTOR_PREPARED.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_after_automatic_projector_prepared(_path: &Path) {}
+
+#[cfg(test)]
+struct RetainedTextProjectorMetadataHookGuard;
+
+#[cfg(test)]
+impl Drop for RetainedTextProjectorMetadataHookGuard {
+    fn drop(&mut self) {
+        AFTER_RETAINED_TEXT_PROJECTOR_METADATA.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn set_after_retained_text_projector_metadata(
+    hook: impl FnOnce() + 'static,
+) -> RetainedTextProjectorMetadataHookGuard {
+    AFTER_RETAINED_TEXT_PROJECTOR_METADATA.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    RetainedTextProjectorMetadataHookGuard
+}
+
+#[cfg(test)]
+fn run_after_retained_text_projector_metadata() {
+    AFTER_RETAINED_TEXT_PROJECTOR_METADATA.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_after_retained_text_projector_metadata() {}
+
+#[cfg(test)]
+struct ManualHostedProjectorFallbackHookGuard;
+
+#[cfg(test)]
+impl Drop for ManualHostedProjectorFallbackHookGuard {
+    fn drop(&mut self) {
+        BEFORE_MANUAL_HOSTED_PROJECTOR_FALLBACK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn set_before_manual_hosted_projector_fallback(
+    hook: impl FnOnce() + 'static,
+) -> ManualHostedProjectorFallbackHookGuard {
+    BEFORE_MANUAL_HOSTED_PROJECTOR_FALLBACK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    ManualHostedProjectorFallbackHookGuard
+}
+
+#[cfg(test)]
+fn run_before_manual_hosted_projector_fallback() {
+    BEFORE_MANUAL_HOSTED_PROJECTOR_FALLBACK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_manual_hosted_projector_fallback() {}
 
 fn validate_retained_local_runtime_tensor_layout(
     retained: &crate::core::bounded_file::StableRegularFile,
@@ -283,40 +420,143 @@ fn qwen3vl_projection_name(name: &str) -> bool {
 }
 
 fn verify_candidate_projector(candidate: &Candidate) -> Result<Option<PathBuf>> {
-    let Some((path, bytes, sha256)) = candidate.projector.as_ref() else {
+    let mut silent = |_| {};
+    verify_candidate_projector_with_progress(candidate, &mut silent)
+}
+
+fn verify_candidate_projector_with_progress(
+    candidate: &Candidate,
+    _progress: &mut StartupProgress<'_>,
+) -> Result<Option<PathBuf>> {
+    let Some((path, bytes, expected_sha256)) = candidate.projector.as_ref() else {
         return Ok(None);
     };
-    let metadata = match fs::symlink_metadata(path) {
+    #[cfg(test)]
+    VERIFY_PROJECTOR_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != *bytes {
+    if !metadata.is_file() || metadata.len() != *bytes {
         return Ok(None);
     }
-    let Some(actual) = crate::core::bounded_file::sha256_regular_nofollow_exact(path, *bytes)?
+    let Some(mut retained) =
+        crate::core::bounded_file::StableRegularFile::open_operator_path_exact(path, *bytes)?
     else {
         return Ok(None);
     };
-    if !actual.eq_ignore_ascii_case(sha256) {
+    let Some(actual_sha256) = retained.sha256()? else {
+        return Ok(None);
+    };
+    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) || !retained.is_stable()? {
         return Ok(None);
     }
-    if expected_projector_sha256(&candidate.path)?
-        .as_deref()
-        .is_some_and(|expected| !actual.eq_ignore_ascii_case(expected))
-    {
+    let gguf = match mlx_native::gguf::GgufFile::from_file(retained.try_clone()?) {
+        Ok(gguf) => gguf,
+        Err(_) => return Ok(None),
+    };
+    if gguf.tensor_names().is_empty() || !retained.is_stable()? {
         return Ok(None);
     }
     Ok(Some(path.clone()))
 }
 
+fn retain_verified_projector_authority(
+    path: &Path,
+    bytes: u64,
+    expected_sha256: &str,
+) -> Result<Option<crate::core::bounded_file::StableRegularFile>> {
+    let Some(mut authority) =
+        crate::core::bounded_file::StableRegularFile::open_operator_path_exact(path, bytes)?
+    else {
+        return Ok(None);
+    };
+    let Some(actual_sha256) = authority.sha256()? else {
+        return Ok(None);
+    };
+    Ok(
+        (actual_sha256.eq_ignore_ascii_case(expected_sha256) && authority.is_stable()?)
+            .then_some(authority),
+    )
+}
+
+fn display_filename(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unnamed GGUF>".into())
+}
+
 impl Candidate {
     fn into_resolved(
         self,
-        mmproj_path: Option<PathBuf>,
-        warnings: Vec<String>,
-    ) -> ResolvedManagedModel {
-        ResolvedManagedModel {
+        mut mmproj_path: Option<PathBuf>,
+        mut warnings: Vec<String>,
+        verified_activation: Option<crate::core::bounded_file::StableRegularFile>,
+    ) -> Result<ResolvedManagedModel> {
+        // Final activation admission retains the exact inode that passed the
+        // bounded quant/runtime check. Managed bindings do not pay a second
+        // full-payload hash merely to close the resolve-to-load pathname gap.
+        let activation_authority = match verified_activation {
+            Some(authority) => {
+                if !authority.is_stable()? {
+                    bail!("managed text GGUF changed after bounded verification");
+                }
+                authority
+            }
+            None => verify_candidate(&self)
+                .context("managed text GGUF changed before retained activation")?,
+        };
+        let mmproj_sha256 = mmproj_path.as_ref().and_then(|path| {
+            self.projector
+                .as_ref()
+                .filter(|(bound, _, _)| bound == path)
+                .map(|(_, _, sha256)| sha256.clone())
+        });
+        let mut mmproj_sha256 = mmproj_sha256;
+        let mmproj_activation_authority = match mmproj_path.as_ref().and_then(|path| {
+            self.projector
+                .as_ref()
+                .filter(|(bound, _, _)| bound == path)
+                .map(|(path, bytes, _)| (path, *bytes))
+        }) {
+            Some((path, bytes)) => {
+                let expected_sha256 = mmproj_sha256
+                    .as_deref()
+                    .context("automatic managed mmproj lost its digest binding")?;
+                match retain_verified_projector_authority(path, bytes, expected_sha256) {
+                    Ok(Some(authority)) => Some(authority),
+                    Ok(None) => {
+                        warnings.push(
+                            "automatic managed mmproj changed or no longer matches its digest before retained activation; serving text-only"
+                                .into(),
+                        );
+                        mmproj_path = None;
+                        mmproj_sha256 = None;
+                        None
+                    }
+                    Err(error) => {
+                        warnings.push(format!(
+                            "automatic managed mmproj retention failed; serving text-only: {error}"
+                        ));
+                        mmproj_path = None;
+                        mmproj_sha256 = None;
+                        None
+                    }
+                }
+            }
+            None if mmproj_path.is_some() => {
+                warnings.push(
+                    "automatic managed mmproj has no retained digest binding; serving text-only"
+                        .into(),
+                );
+                mmproj_path = None;
+                mmproj_sha256 = None;
+                None
+            }
+            None => None,
+        };
+        Ok(ResolvedManagedModel {
             gguf_path: self.path,
             mmproj_path,
             repository: self.repository,
@@ -324,32 +564,164 @@ impl Candidate {
             quant: self.quant,
             origin: self.origin,
             warnings,
-        }
+            track_success_history: true,
+            activation_authority: Some(activation_authority),
+            mmproj_sha256,
+            mmproj_activation_authority,
+        })
     }
 }
 
 pub(crate) fn mark_successful_use(
     repository: &str,
+    revision: &str,
     quant: QuantType,
     path: &Path,
+    expected_authority: &crate::core::bounded_file::StableRegularFile,
     cache: &mut ModelCache,
 ) -> Result<()> {
     let now = now_secs();
     let _lock = cache
         .lock_quant(repository, quant)
         .with_context(|| format!("lock successful-use publication for {repository}:{quant}"))?;
+    if !expected_authority.is_stable()?
+        || !crate::core::bounded_file::regular_path_matches_identity(
+            path,
+            expected_authority.identity(),
+        )?
+    {
+        bail!("managed model changed before successful-use publication");
+    }
     let sidecar = sidecar_path(path);
-    if let Some(mut binding) = read_binding(&sidecar)? {
-        if binding.repository != repository || binding.quant != quant.as_str() {
+    let receipt_binding =
+        receipt_usage_binding(path, repository, revision, quant, expected_authority, now)?;
+    let mut binding = match (read_binding(&sidecar)?, receipt_binding) {
+        (Some(existing), Some(mut receipt)) => {
+            if !usage_binding_matches_receipt(&existing, &receipt) {
+                bail!("managed binding artifact changed before successful-use publication");
+            }
+            // Receipt-backed sidecars are recency-only. Preserve the existing
+            // text authority spelling so atomic replacement remains allowed,
+            // but clear any projector/origin fields the sidecar tried to add.
+            receipt.artifact.hub_filename = existing.artifact.hub_filename;
+            Some(receipt)
+        }
+        (None, Some(receipt)) => Some(receipt),
+        (Some(existing), None) => Some(existing),
+        (None, None) => None,
+    };
+    if let Some(binding) = binding.as_mut() {
+        if binding.repository != repository
+            || !binding.revision.eq_ignore_ascii_case(revision)
+            || binding.quant != quant.as_str()
+        {
             bail!("managed binding repository changed before successful-use publication");
         }
         binding.last_used_at_secs = now;
-        write_binding(&sidecar, &binding)?;
+        write_binding(&sidecar, binding)?;
     }
     // Reload under the quant lock so an old in-memory snapshot cannot flush
     // over another process's completed manifest update.
-    ModelCache::open_at(cache.root())?.touch_quant(repository, quant)?;
+    ModelCache::open_at(cache.root())?.touch_quant_if_matches(
+        repository,
+        revision,
+        quant,
+        expected_authority.identity(),
+    )?;
     Ok(())
+}
+
+fn usage_binding_matches_receipt(existing: &ManagedBinding, receipt: &ManagedBinding) -> bool {
+    existing.schema_version == receipt.schema_version
+        && existing.repository == receipt.repository
+        && existing.revision.eq_ignore_ascii_case(&receipt.revision)
+        && existing.quant.eq_ignore_ascii_case(&receipt.quant)
+        && existing.artifact.local_filename == receipt.artifact.local_filename
+        && existing.artifact.bytes == receipt.artifact.bytes
+        && existing
+            .artifact
+            .sha256
+            .eq_ignore_ascii_case(&receipt.artifact.sha256)
+}
+
+/// Build a recency-only binding for a regular conversion output or final-leaf
+/// symlink whose retained target is authenticated by an hf2q conversion
+/// receipt. The receipt remains repository/revision/artifact authority; this
+/// sidecar is imported only when every immutable field still matches.
+fn receipt_usage_binding(
+    logical_path: &Path,
+    repository: &str,
+    revision: &str,
+    quant: QuantType,
+    expected_authority: &crate::core::bounded_file::StableRegularFile,
+    last_used_at_secs: u64,
+) -> Result<Option<ManagedBinding>> {
+    match fs::symlink_metadata(logical_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let target = expected_authority
+        .canonical_path_for_identity()?
+        .context("successful-use activation authority no longer has one exact path")?;
+    let Some(candidate) = conversion_authority(&target)? else {
+        return Ok(None);
+    };
+    if candidate.repository != repository
+        || !candidate.revision.eq_ignore_ascii_case(revision)
+        || candidate.quant != quant
+    {
+        bail!("receipt-bound model identity changed before successful-use publication");
+    }
+    let Some(logical) = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        logical_path,
+        candidate.bytes,
+    )?
+    else {
+        bail!("receipt-bound model changed before successful-use publication");
+    };
+    let Some(target_authority) =
+        crate::core::bounded_file::StableRegularFile::open_exact(&target, candidate.bytes)?
+    else {
+        bail!("receipt-bound conversion target changed before successful-use publication");
+    };
+    if logical.identity() != expected_authority.identity()
+        || target_authority.identity() != expected_authority.identity()
+        || !expected_authority.is_stable()?
+        || !logical.is_stable()?
+        || !target_authority.is_stable()?
+    {
+        bail!("receipt-bound model target changed before successful-use publication");
+    }
+    let local_filename = logical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("receipt-bound logical filename is not UTF-8")?
+        .to_owned();
+    let hub_filename = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("receipt-bound target filename is not UTF-8")?
+        .to_owned();
+    Ok(Some(ManagedBinding {
+        schema_version: SCHEMA_VERSION,
+        repository: candidate.repository,
+        revision: candidate.revision.to_ascii_lowercase(),
+        quant: candidate.quant.as_str().to_owned(),
+        origin: candidate.origin,
+        materialized_at_secs: candidate.materialized_at_secs,
+        last_used_at_secs,
+        artifact: ArtifactBinding {
+            local_filename,
+            hub_filename,
+            bytes: candidate.bytes,
+            sha256: candidate.sha256.to_ascii_lowercase(),
+        },
+        // A recency sidecar never grants projector authority. The conversion
+        // receipts beside the exact text/projector targets do that.
+        projector: None,
+    }))
 }
 
 pub(crate) fn text_requires_projector(path: &Path) -> Result<bool> {
@@ -386,20 +758,55 @@ pub(crate) fn resolve_local_path_projector(path: &Path) -> Result<Option<PathBuf
     if !text_requires_projector(path)? {
         return Ok(None);
     }
+    resolve_local_path_projector_required(path)
+}
 
+/// Resolve a local projector when repository or authenticated GGUF metadata
+/// has already established that the text artifact is multimodal.
+pub(crate) fn resolve_local_path_projector_required(path: &Path) -> Result<Option<PathBuf>> {
+    let expected = expected_projector_sha256(path)?;
+    resolve_local_path_projector_required_with_expected(path, expected.as_deref())
+}
+
+fn resolve_local_path_projector_required_with_expected(
+    path: &Path,
+    expected_projector_sha256: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    let receipt_candidate = conversion_authority(path)?;
+    if let Some(candidate) = receipt_candidate.as_ref() {
+        if let Some(projector) = verify_candidate_projector(candidate)? {
+            let matches = candidate
+                .projector
+                .as_ref()
+                .is_some_and(|(bound, _, sha256)| {
+                    bound == &projector
+                        && expected_projector_sha256
+                            .is_none_or(|expected| sha256.eq_ignore_ascii_case(expected))
+                });
+            if matches {
+                return Ok(Some(projector));
+            }
+        }
+    }
     let sidecar = sidecar_path(path);
-    if let Some(binding) = read_binding(&sidecar)? {
-        let candidate = candidate_from_binding(binding, path.to_path_buf(), sidecar)?;
-        if let Some(projector) = verify_candidate_projector(&candidate)? {
-            return Ok(Some(projector));
+    if receipt_candidate.is_none() {
+        if let Some(binding) = read_binding(&sidecar)? {
+            let candidate = candidate_from_binding(binding, path.to_path_buf(), sidecar)?;
+            if let Some(projector) = verify_candidate_projector(&candidate)? {
+                let matches = candidate
+                    .projector
+                    .as_ref()
+                    .is_some_and(|(bound, _, sha256)| {
+                        bound == &projector
+                            && expected_projector_sha256
+                                .is_none_or(|expected| sha256.eq_ignore_ascii_case(expected))
+                    });
+                if matches {
+                    return Ok(Some(projector));
+                }
+            }
         }
     }
-    if let Some(candidate) = conversion_authority(path)? {
-        if let Some(projector) = verify_candidate_projector(&candidate)? {
-            return Ok(Some(projector));
-        }
-    }
-
     let parent = path.parent().context("local text GGUF has no parent")?;
     let mut candidates = Vec::new();
     for (index, entry) in fs::read_dir(parent)?.enumerate() {
@@ -426,18 +833,18 @@ pub(crate) fn resolve_local_path_projector(path: &Path) -> Result<Option<PathBuf
         if !name.starts_with("mmproj") && !name.contains("-mmproj") {
             continue;
         }
-        let metadata = match fs::symlink_metadata(&candidate) {
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        let metadata = match fs::metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => metadata,
             _ => continue,
         };
         candidates.push((candidate, metadata.len()));
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
 
-    if let Some(expected) = expected_projector_sha256(path)? {
+    if let Some(expected) = expected_projector_sha256 {
         for (candidate, bytes) in candidates {
-            if crate::core::bounded_file::sha256_regular_nofollow_exact(&candidate, bytes)?
-                .is_some_and(|digest| digest.eq_ignore_ascii_case(&expected))
+            if crate::core::bounded_file::sha256_operator_path_exact(&candidate, bytes)?
+                .is_some_and(|digest| digest.eq_ignore_ascii_case(expected))
             {
                 return Ok(Some(candidate));
             }
@@ -462,6 +869,32 @@ pub(crate) fn resolve_local_path_projector(path: &Path) -> Result<Option<PathBuf
 fn expected_projector_sha256(path: &Path) -> Result<Option<String>> {
     crate::core::provenance::projector_sha256(&mlx_native::gguf::GgufFile::open(path)?)
         .map_err(|error| anyhow!(error))
+}
+
+fn retained_text_requires_projector(
+    authority: &crate::core::bounded_file::StableRegularFile,
+) -> Result<bool> {
+    retained_text_projector_contract(authority).map(|(required, _)| required)
+}
+
+fn retained_expected_projector_sha256(
+    authority: &crate::core::bounded_file::StableRegularFile,
+) -> Result<Option<String>> {
+    retained_text_projector_contract(authority).map(|(_, expected)| expected)
+}
+
+fn retained_text_projector_contract(
+    authority: &crate::core::bounded_file::StableRegularFile,
+) -> Result<(bool, Option<String>)> {
+    let gguf = mlx_native::gguf::GgufFile::from_file(authority.try_clone()?)?;
+    let required = text_gguf_requires_projector(&gguf);
+    let expected =
+        crate::core::provenance::projector_sha256(&gguf).map_err(|error| anyhow!(error))?;
+    run_after_retained_text_projector_metadata();
+    if !authority.is_stable()? {
+        bail!("local text GGUF changed during retained projector planning");
+    }
+    Ok((required, expected))
 }
 
 fn paired_projector_path(text: &Path) -> Option<PathBuf> {

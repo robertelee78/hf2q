@@ -43,6 +43,13 @@ pub struct Cli {
     )]
     pub state_root: Option<PathBuf>,
 
+    /// Terminal raster protocol for the exact hf2q rabbit logo. `auto`
+    /// conservatively detects Kitty/Ghostty or iTerm2-compatible terminals;
+    /// `off` suppresses the entire brand banner. Machine-readable, piped,
+    /// and non-TTY output always suppresses the banner.
+    #[arg(long, value_enum, global = true, default_value = "auto")]
+    pub terminal_graphics: TerminalGraphicsArg,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -54,6 +61,16 @@ pub enum LogFormat {
     Text,
     /// One JSON object per log event (structured ingest).
     Json,
+}
+
+/// Native terminal graphics protocol used for the exact hf2q brand asset.
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum TerminalGraphicsArg {
+    Auto,
+    Kitty,
+    Iterm2,
+    Ansi,
+    Off,
 }
 
 /// Log level override (Decision #11). When `None`, `-v` flag controls it.
@@ -1090,7 +1107,7 @@ impl DiagnosticQuantArg {
 #[derive(clap::Args, Debug)]
 pub struct ServeArgs {
     /// Local GGUF path, `owner/repository[:QUANT]`, or `list`. A repository
-    /// resolves verified local bytes first, then a compatible hosted GGUF,
+    /// resolves compatible local bytes first, then a compatible hosted GGUF,
     /// then native source conversion when no supported hosted artifact exists.
     #[arg(value_name = "MODEL", conflicts_with = "model")]
     pub target: Option<String>,
@@ -1135,6 +1152,16 @@ pub struct ServeArgs {
         requires = "chat_parent_lifeline_fd"
     )]
     pub chat_owned_listener_fd: Option<i32>,
+
+    /// Internal best-effort Unix datagram channel for bounded startup events
+    /// from a server owned by `hf2q chat`.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "FD",
+        requires = "chat_parent_lifeline_fd"
+    )]
+    pub chat_startup_progress_fd: Option<i32>,
 
     /// Path to tokenizer.json (if not alongside GGUF).
     #[arg(long)]

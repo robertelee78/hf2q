@@ -248,11 +248,30 @@ pub(super) fn best_effort_projector_with_catalog(
     repository_requires_projector: bool,
     warnings: &mut Vec<String>,
 ) -> Option<PathBuf> {
+    best_effort_projector_with_catalog_expected(
+        candidate,
+        model_dirs,
+        catalog,
+        repository_requires_projector,
+        None,
+        warnings,
+    )
+}
+
+pub(super) fn best_effort_projector_with_catalog_expected(
+    candidate: &mut Candidate,
+    model_dirs: &[PathBuf],
+    catalog: &HubGgufCatalog,
+    repository_requires_projector: bool,
+    retained_expected_projector_sha256: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Option<PathBuf> {
     match resolve_projector_with_catalog_requirement(
         candidate,
         model_dirs,
         catalog,
         repository_requires_projector,
+        retained_expected_projector_sha256,
         warnings,
     ) {
         Ok(path) => path,
@@ -277,6 +296,7 @@ pub(super) fn resolve_projector_with_catalog(
         model_dirs,
         catalog,
         catalog.requires_projector,
+        None,
         warnings,
     )
 }
@@ -286,15 +306,32 @@ fn resolve_projector_with_catalog_requirement(
     model_dirs: &[PathBuf],
     catalog: &HubGgufCatalog,
     repository_requires_projector: bool,
+    retained_expected_projector_sha256: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> Result<Option<PathBuf>> {
     if !repository_requires_projector && !text_requires_projector(&candidate.path)? {
         return Ok(None);
     }
     if let Some(path) = verify_candidate_projector(candidate)? {
-        return Ok(Some(path));
+        let matches = candidate
+            .projector
+            .as_ref()
+            .is_some_and(|(bound, _, sha256)| {
+                bound == &path
+                    && retained_expected_projector_sha256
+                        .is_none_or(|expected| sha256.eq_ignore_ascii_case(expected))
+            });
+        if matches {
+            return Ok(Some(path));
+        }
+        candidate.projector = None;
     }
-    let expected = expected_projector_sha256(&candidate.path)?;
+    let expected = retained_expected_projector_sha256
+        .map(str::to_owned)
+        .map_or_else(
+            || expected_projector_sha256(&candidate.path),
+            |value| Ok(Some(value)),
+        )?;
     let companions = catalog
         .artifacts
         .iter()

@@ -39,7 +39,15 @@ pub fn verify_local_artifact(
 
 pub(crate) fn verify_retained_local_artifact(
     request: LocalVerificationRequest<'_>,
+    opened: crate::core::bounded_file::StableRegularFile,
+) -> Result<VerifiedLocalArtifact> {
+    verify_retained_local_artifact_with_progress(request, opened, |_| {})
+}
+
+pub(crate) fn verify_retained_local_artifact_with_progress(
+    request: LocalVerificationRequest<'_>,
     mut opened: crate::core::bounded_file::StableRegularFile,
+    mut progress: impl FnMut(u64),
 ) -> Result<VerifiedLocalArtifact> {
     if !is_hex(request.sha256, 64) {
         bail!("expected local artifact SHA-256 is malformed");
@@ -60,7 +68,7 @@ pub(crate) fn verify_retained_local_artifact(
         bail!("local artifact escaped its configured root");
     }
     let actual_sha = opened
-        .sha256()
+        .sha256_with_progress(&mut progress)
         .context("hash selected local artifact")?
         .context("selected local artifact changed while it was being hashed")?;
     if !actual_sha.eq_ignore_ascii_case(request.sha256) {

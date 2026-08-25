@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use crate::quantize::ggml_quants::apex::{ApexTier, SUPPORTED_APEX_TIERS};
-use crate::quantize::ggml_quants::{DEEPSEEK4_AGENTIC_Q2_NAME, GgufFtype};
+use crate::quantize::ggml_quants::{GgufFtype, DEEPSEEK4_AGENTIC_Q2_NAME};
 
 /// One resolved `--quant <name>` selector.
 ///

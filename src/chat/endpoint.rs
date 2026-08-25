@@ -132,6 +132,8 @@ pub(crate) struct OwnedServerProcess {
     process_group: libc::pid_t,
     #[cfg(unix)]
     listener_guard: Option<std::net::TcpListener>,
+    #[cfg(unix)]
+    startup_progress: Option<std::os::unix::net::UnixDatagram>,
     server_log: ServerLog,
 }
 
@@ -151,6 +153,7 @@ impl OwnedServerProcess {
     pub(crate) fn from_spawned(
         mut child: Child,
         lifeline: ParentLifeline,
+        #[cfg(unix)] startup_progress: Option<std::os::unix::net::UnixDatagram>,
         server_log: tempfile::NamedTempFile,
         #[cfg(unix)] listener_guard: Option<std::net::TcpListener>,
     ) -> Result<Self> {
@@ -169,6 +172,11 @@ impl OwnedServerProcess {
             lifeline
                 .set_nonblocking(true)
                 .context("make chat-owned readiness channel nonblocking")?;
+            if let Some(progress) = startup_progress.as_ref() {
+                progress
+                    .set_nonblocking(true)
+                    .context("make chat-owned startup-progress channel nonblocking")?;
+            }
         }
         Ok(Self {
             child,
@@ -179,6 +187,8 @@ impl OwnedServerProcess {
             process_group,
             #[cfg(unix)]
             listener_guard,
+            #[cfg(unix)]
+            startup_progress,
             server_log: ServerLog::new(server_log),
         })
     }
@@ -244,6 +254,38 @@ impl OwnedServerProcess {
         }
         self.readiness_frame.clear();
         Ok(Some(port))
+    }
+
+    /// Receive one best-effort progress datagram. Progress is informational:
+    /// it never carries endpoint authority and malformed frames are ignored.
+    #[cfg(unix)]
+    pub(crate) fn poll_startup_event(
+        &self,
+    ) -> Option<crate::serve::startup_progress::StartupEvent> {
+        let socket = self.startup_progress.as_ref()?;
+        let mut bytes = [0_u8; crate::serve::CHAT_STARTUP_PROGRESS_MAX_BYTES + 1];
+        let read = match socket.recv(&mut bytes) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return None,
+            Err(error) => {
+                tracing::debug!(%error, "ignored chat-owned startup-progress receive failure");
+                return None;
+            }
+        };
+        if read == 0 || read > crate::serve::CHAT_STARTUP_PROGRESS_MAX_BYTES {
+            return None;
+        }
+        let payload = bytes[..read].strip_prefix(crate::serve::CHAT_STARTUP_PROGRESS_PREFIX)?;
+        serde_json::from_slice::<crate::serve::startup_progress::StartupEvent>(payload)
+            .ok()
+            .filter(crate::serve::startup_progress::StartupEvent::wire_valid)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn poll_startup_event(
+        &self,
+    ) -> Option<crate::serve::startup_progress::StartupEvent> {
+        None
     }
 
     fn detach_lifeline(&mut self) -> Result<PathBuf> {
@@ -648,10 +690,40 @@ mod tests {
         OwnedServerProcess::from_spawned(
             command_builder.spawn().unwrap(),
             lifeline,
+            None,
             server_log,
             None,
         )
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn owned_sleep_process_with_progress() -> (OwnedServerProcess, std::os::unix::net::UnixDatagram)
+    {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "exec sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let (lifeline, mut lifeline_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut frame = vec![0u8; crate::serve::CHAT_LIFELINE_DETACH_FRAME.len()];
+            let _ = lifeline_peer.read_exact(&mut frame);
+        });
+        let (progress, progress_peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let process = OwnedServerProcess::from_spawned(
+            command.spawn().unwrap(),
+            lifeline,
+            Some(progress),
+            tempfile::NamedTempFile::new().unwrap(),
+            None,
+        )
+        .unwrap();
+        (process, progress_peer)
     }
 
     #[test]
@@ -681,6 +753,7 @@ mod tests {
         let mut process = OwnedServerProcess::from_spawned(
             child,
             lifeline,
+            None,
             tempfile::NamedTempFile::new().unwrap(),
             Some(listener),
         )
@@ -704,6 +777,40 @@ mod tests {
         drop(process);
         std::net::TcpListener::bind(address)
             .expect("port is released only with endpoint authority");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_progress_accepts_only_bounded_valid_non_authoritative_events() {
+        let (mut process, peer) = owned_sleep_process_with_progress();
+
+        peer.send(b"not-an-hf2q-frame").unwrap();
+        assert!(process.poll_startup_event().is_none());
+
+        let oversized = vec![b'x'; crate::serve::CHAT_STARTUP_PROGRESS_MAX_BYTES + 1];
+        peer.send(&oversized).unwrap();
+        assert!(process.poll_startup_event().is_none());
+
+        peer.send(b"HF2Q-P1:{\"phase\":\"ready\",\"port\":9123}")
+            .unwrap();
+        assert!(process.poll_startup_event().is_none());
+
+        peer.send(
+            b"HF2Q-P1:{\"phase\":\"local_search\",\"repository\":\"owner\\n/repo\",\"requested_quant\":null}",
+        )
+        .unwrap();
+        assert!(process.poll_startup_event().is_none());
+
+        let expected = crate::serve::startup_progress::StartupEvent::LocalSearch {
+            repository: "owner/repo".into(),
+            requested_quant: Some("Q6_K".into()),
+        };
+        let mut frame = crate::serve::CHAT_STARTUP_PROGRESS_PREFIX.to_vec();
+        frame.extend(serde_json::to_vec(&expected).unwrap());
+        peer.send(&frame).unwrap();
+        assert_eq!(process.poll_startup_event(), Some(expected));
+
+        process.force_stop().unwrap();
     }
 
     #[test]

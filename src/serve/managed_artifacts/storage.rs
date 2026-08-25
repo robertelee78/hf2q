@@ -8,6 +8,9 @@ pub(super) fn scan_bindings(
     for root in scan_roots(model_dirs)? {
         visit_files(&root, |path, _, mut file| {
             if path.to_string_lossy().ends_with(SIDECAR_SUFFIX) {
+                if file.has_operator_symlink_leaf() {
+                    return Ok(());
+                }
                 if let Ok(Some(bytes)) = file.read_bounded(MAX_SIDECAR_BYTES) {
                     let Ok(binding) = serde_json::from_slice::<ManagedBinding>(&bytes) else {
                         return Ok(());
@@ -16,20 +19,136 @@ pub(super) fn scan_bindings(
                         return Ok(());
                     }
                     if repository.is_none_or(|expected| expected == binding.repository) {
-                        if let Ok(candidate) = candidate_from_binding(
-                            binding,
-                            sibling_from_sidecar(path)?,
-                            path.to_owned(),
-                        ) {
+                        let artifact = sibling_from_sidecar(path)?;
+                        // A regular conversion output keeps its schema-v3
+                        // receipt as repository/artifact authority. Its
+                        // sidecar may contribute recency only in the receipt
+                        // branch below; never admit it as a second managed
+                        // candidate with projector authority.
+                        if conversion_authority(&artifact).ok().flatten().is_some() {
+                            return Ok(());
+                        }
+                        if let Ok(candidate) =
+                            candidate_from_binding(binding, artifact, path.to_owned())
+                        {
                             candidates.push(candidate);
                         }
                     }
+                }
+            } else if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+            {
+                // A final-leaf symlink may point at an hf2q conversion in an
+                // operator library. Authenticate the small adjacent receipt
+                // at the exact retained target, but preserve the logical link
+                // as the displayed/managed model path. The text payload is
+                // not hashed on this serve-in-place path.
+                let Some(authority_path) = file.canonical_path_for_identity()? else {
+                    return Ok(());
+                };
+                let Ok(Some(mut candidate)) = conversion_authority(&authority_path) else {
+                    return Ok(());
+                };
+                {
+                    if file.canonical_path_for_identity()?.as_deref()
+                        != Some(authority_path.as_path())
+                    {
+                        return Ok(());
+                    }
+                    if repository.is_some_and(|expected| expected != candidate.repository.as_str())
+                    {
+                        return Ok(());
+                    }
+                    if let Some((projector_target, bytes, sha256)) = candidate.projector.clone() {
+                        if let Some(logical_projector) =
+                            logical_alias_for_target(path, &projector_target, bytes)?
+                        {
+                            candidate.projector = Some((logical_projector, bytes, sha256));
+                        }
+                    }
+                    candidate.path = path.to_path_buf();
+                    candidate.receipt_target_identity = Some(file.identity());
+                    candidate.root = path
+                        .parent()
+                        .context("linked conversion artifact has no parent")?
+                        .to_path_buf();
+                    let usage_sidecar = sidecar_path(path);
+                    if let Ok(Some(binding)) = read_binding(&usage_sidecar) {
+                        if binding.repository == candidate.repository
+                            && binding.revision.eq_ignore_ascii_case(&candidate.revision)
+                            && binding.quant.eq_ignore_ascii_case(candidate.quant.as_str())
+                            && path.file_name().and_then(|name| name.to_str())
+                                == Some(binding.artifact.local_filename.as_str())
+                            && binding.artifact.bytes == candidate.bytes
+                            && binding
+                                .artifact
+                                .sha256
+                                .eq_ignore_ascii_case(&candidate.sha256)
+                        {
+                            candidate.last_used_at_secs = binding.last_used_at_secs;
+                        }
+                    }
+                    candidates.push(candidate);
                 }
             }
             Ok(())
         })?;
     }
     Ok(candidates)
+}
+
+fn logical_alias_for_target(
+    logical_text: &Path,
+    target: &Path,
+    expected_bytes: u64,
+) -> Result<Option<PathBuf>> {
+    let Some(expected) =
+        crate::core::bounded_file::StableRegularFile::open_exact(target, expected_bytes)?
+    else {
+        return Ok(None);
+    };
+    let parent = logical_text
+        .parent()
+        .context("linked text artifact has no parent")?;
+    let paired = paired_projector_path(logical_text);
+    let mut matches = Vec::new();
+    for (index, entry) in fs::read_dir(parent)?.enumerate() {
+        if index >= 512 {
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path == logical_text
+            || path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_none_or(|extension| !extension.eq_ignore_ascii_case("gguf"))
+        {
+            continue;
+        }
+        let Some(alias) = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+            &path,
+            expected_bytes,
+        )?
+        else {
+            continue;
+        };
+        if alias.identity() == expected.identity() && alias.is_stable()? {
+            matches.push(path);
+        }
+    }
+    matches.sort();
+    if let Some(paired) = paired.filter(|path| matches.iter().any(|candidate| candidate == path)) {
+        return Ok(Some(paired));
+    }
+    Ok(match matches.as_slice() {
+        [path] => Some(path.clone()),
+        _ => None,
+    })
 }
 
 pub(super) fn candidate_from_binding(
@@ -76,6 +195,7 @@ pub(super) fn candidate_from_binding(
         last_used_at_secs: binding.last_used_at_secs,
         projector,
         sidecar: Some(sidecar),
+        receipt_target_identity: None,
     })
 }
 
@@ -89,11 +209,8 @@ pub(super) fn conversion_authority(path: &Path) -> Result<Option<Candidate>> {
         return Ok(None);
     };
     if receipt.schema_version != CONVERSION_RECEIPT_SCHEMA_VERSION
-        || receipt.converter.package != "hf2q"
+        || crate::serve::api::local_artifacts::validate_receipt_identity(&receipt).is_err()
         || receipt.output.size != artifact_metadata.len()
-        || !crate::serve::auto_pipeline::looks_like_hf_repo_id(&receipt.source.repository_id)
-        || !is_hex(&receipt.source.revision, 40)
-        || !is_hex(&receipt.output.sha256, 64)
     {
         return Ok(None);
     }
@@ -133,6 +250,7 @@ pub(super) fn conversion_authority(path: &Path) -> Result<Option<Candidate>> {
         last_used_at_secs: 0,
         projector,
         sidecar: None,
+        receipt_target_identity: None,
     }))
 }
 
@@ -150,7 +268,7 @@ pub(super) fn projector_authority_from_receipt(
         return Ok(None);
     };
     if receipt.schema_version != CONVERSION_RECEIPT_SCHEMA_VERSION
-        || receipt.converter.package != "hf2q"
+        || crate::serve::api::local_artifacts::validate_receipt_identity(&receipt).is_err()
         || receipt.source.repository_id != expected_repository
         || !receipt
             .source
@@ -158,7 +276,6 @@ pub(super) fn projector_authority_from_receipt(
             .eq_ignore_ascii_case(expected_revision)
         || !receipt.quant_selector.eq_ignore_ascii_case("f16-mmproj")
         || receipt.output.size != metadata.len()
-        || !is_hex(&receipt.output.sha256, 64)
     {
         return Ok(None);
     }

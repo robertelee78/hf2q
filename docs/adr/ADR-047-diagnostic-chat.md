@@ -531,6 +531,28 @@ admission write gate; irreversible lifecycle transactions finish under server
 supervision; and shutdown returns before engine teardown if HTTP or supervised
 work has not reached a terminal state.
 
+### Owned-startup telemetry amendment (2026-08-24)
+
+Keeping the owned child's arbitrary stderr private is still mandatory, but a
+generic periodic heartbeat does not tell an operator whether hf2q found local
+bytes or began a transfer. The child therefore receives a third inherited
+private descriptor: a nonblocking Unix datagram pair used only for bounded,
+typed startup events. It reports local search/candidate/verification,
+metadata-only Hub lookup, hosted selection, native conversion, text
+load/warmup, projector load/warmup, and text-only projector fallback. The
+parent renders those events as one scrollback-safe live row plus durable
+milestones, or stable non-TTY lines. Only measured completed/total byte counts
+produce a byte bar and ETA.
+
+This telemetry channel is deliberately non-authoritative and fail-open.
+Unknown, invalid, overlong, malformed, and oversized frames are ignored;
+closed or backpressured presentation never delays model work. One parent tick
+drains at most 32 events. The event schema has no READY variant. Endpoint
+authority remains exclusively on the separate lifeline stream, must match the
+retained listener, and becomes operator-visible readiness only after `/health`
+and `/v1/models` verify over loopback. The server's private error log remains
+private and is not replayed through telemetry.
+
 The first small real-artifact spike then exposed a separate Qwen3.5 inference
 defect: the selected hosted ggml-org 0.8B Q8_0 GGUF legally ties its output
 projection to `token_embd.weight`, while hf2q required a separate

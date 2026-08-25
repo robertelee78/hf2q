@@ -825,6 +825,7 @@ impl AppState {
         let mut manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
         manager.set_kv_counters(Arc::clone(&kv_spill_counters));
         let engine_config_template = EngineConfig {
+            operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
             queue_capacity: engine_queue_capacity,
@@ -897,6 +898,7 @@ impl AppState {
         let mut manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
         manager.set_kv_counters(Arc::clone(&kv_spill_counters_test));
         let engine_config_template = EngineConfig {
+            operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
             queue_capacity: 32,

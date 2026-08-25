@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.88+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | hf2q 0.1.15 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.15` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | hf2q 0.1.16 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.16` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
@@ -175,7 +175,8 @@ anything misbehaves.
 
 Tab completion is automatic for standalone and Cargo installations. The
 standalone installer activates it against the stable installed binary; a Cargo
-install activates it on the first `hf2q` invocation. hf2q keeps dynamic,
+install activates it on the first accepted normal `hf2q` command. Help,
+version, and parse-error exits remain non-mutating. hf2q keeps dynamic,
 public-command-only adapters current for Bash, Zsh, and Fish, so newly added
 commands and quant/architecture values appear without regenerating snapshots.
 For every user-facing local GGUF argument, an empty or bare value prefers
@@ -214,6 +215,17 @@ paths, lifecycle cleanup, overrides, and troubleshooting.
 | `hf2q completions` | Generate shell completions. |
 
 Run `hf2q <command> --help` for the full flag surface.
+
+Interactive human commands show the exact hf2q.us rabbit mark once on stderr.
+cmux, Ghostty, Kitty, and other positively detected Kitty-capable terminals
+receive the native PNG raster; iTerm2-compatible terminals receive their native
+inline image; Alacritty and Apple's Terminal receive an ANSI truecolor pixel
+raster compiled from the same exact packaged SVG. hf2q never substitutes a
+hand-drawn rabbit or rerasterizes it during command startup. Use global
+`--terminal-graphics auto|kitty|iterm2|ansi|off` to override rendering; `off`
+suppresses the complete logo and wordmark banner.
+Help/version, completions, pipes, CI, `serve --quiet`, hidden helpers, and
+`--log-format json` stay protocol-clean.
 
 ### Inspect and plan a serve
 
@@ -280,8 +292,8 @@ required. These commands share one local-first resolver:
 # Show receipt-backed, managed, cached, and loose local GGUF options.
 hf2q serve list                    # `hf2q chat list` is identical
 
-# Exact quant: reuse verified local bytes, adopt an exact manual download, or
-# download that hosted quant into the managed XDG data directory.
+# Exact quant: reuse an hf2q-bound artifact or compatible local structural
+# match, or download that exact hosted quant into the managed XDG data store.
 hf2q serve owner/repository:Q4_K_M
 
 # No quant: use the most recently used compatible local artifact, otherwise
@@ -293,6 +305,34 @@ hf2q serve owner/repository
 # Chat uses the same preparation path and owns the server it starts.
 hf2q chat owner/repository:Q4_K_M
 ```
+
+Inventory rows are runnable text-model choices. Projector-only GGUFs are
+reported through the selected text row's `MMPROJ` column, not repeated as
+standalone models.
+
+Large model libraries may be linked into the managed model directory one
+model directory at a time. hf2q resolves a direct child directory link to a
+bounded canonical scan root, but never trusts its filenames: reuse still
+requires a unique quant/byte-length catalog match plus bounded GGUF metadata,
+tensor-directory, tokenizer, and runtime-support admission (or an existing
+hf2q receipt/binding). The large tensor payload is not hashed before serving.
+A symlink is also accepted when it is the final regular-file leaf, which
+supports individually linked GGUF and `mmproj` files. hf2q retains the target
+descriptor and revalidates both link and target identities before activation;
+it never traverses a symlink as a nested directory. An hf2q conversion receipt
+beside that exact target supplies repository identity even when the source
+repository has no hosted GGUF; authority files themselves are never followed
+through symlinks.
+
+Owned chat reports what first use is actually doing: local-store discovery,
+the exact local candidate and bounded GGUF inspection, immutable Hub
+metadata, hosted download selection, native conversion fallback, text
+load/warmup, projector load/warmup, and finally an authenticated ready
+endpoint. A compatible local structural hit explicitly says
+`no model download or full-file hash needed`.
+Spinners are used for work without real byte counters; byte bars and ETA appear
+only when measured completed/total bytes exist. Non-TTY output carries the same
+facts as stable lines, without ANSI or a live dashboard.
 
 For supported multimodal text GGUFs, serve automatically uses an exact bound
 local projector or downloads the one unambiguous matching hosted `mmproj`.
@@ -706,7 +746,7 @@ are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/adr/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.15 serving release
+#### Test the 0.1.16 serving release
 
 Build and verify the exact checkout before loading a model:
 

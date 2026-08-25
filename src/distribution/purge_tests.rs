@@ -3,6 +3,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 
 use super::purge::{execute_cache_purge, prepare_cache_purge_at};
+use crate::serve::cache::MANIFEST_SCHEMA_VERSION;
 
 fn private_dir(path: &Path) {
     fs::create_dir_all(path).unwrap();
@@ -55,7 +56,7 @@ fn cache_purge_removes_only_models_and_resets_manifest() {
     assert_eq!(fs::read(root.join("locks/preserve.lock")).unwrap(), b"lock");
     let value: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["schema_version"], MANIFEST_SCHEMA_VERSION);
     assert_eq!(value["models"], serde_json::json!({}));
 }
 

@@ -7,7 +7,7 @@ only until the process exits.
 
 ```bash
 # Prepare one exact quant with the shared serve resolver, start an owned local
-# server, and chat. Existing verified bytes win before Hub access.
+# server, and chat. Existing compatible local bytes win before Hub transfer.
 hf2q chat owner/model:Q4_K_M
 
 # Show the same read-only local inventory as `hf2q serve list`.
@@ -75,15 +75,21 @@ Targeted chat always owns a fresh loopback server. DNS-SD does not advertise
 the immutable repository, revision, quant, and artifact digest needed to prove
 that an existing resident process is the same requested model. The parent
 prebinds and retains the loopback listener while the child adopts it, closing
-the preparation-time port-rebind race. The child prints a status heartbeat
-every 30 seconds while first-use preparation is still running; its private
-diagnostic log remains isolated from the terminal.
+the preparation-time port-rebind race. The child sends bounded typed progress
+events over a private inherited datagram channel; the parent renders the exact
+local-search, verification, download/conversion, model/projector load, and
+ready-adjacent state. It also prints a truthful 30-second heartbeat if the
+current phase has not advanced. The child's private diagnostic log remains
+isolated from the terminal.
 
-Within that owned server's resolver, a verified local repository artifact wins
-without a payload transfer, followed by exact manual-byte adoption, a
-compatible hosted GGUF, and native source conversion. A global `--state-root`
-is propagated to the child so it consumes the same setup quant and serve
-defaults as direct `hf2q serve`.
+Within that owned server's resolver, an hf2q-bound local repository artifact
+wins without a payload transfer. It next admits a unique manual or canonical
+hf-hub-cache candidate by catalog quant/size plus bounded GGUF metadata,
+tokenizer, tensor layout, and runtime support. That candidate is served through
+a retained descriptor without a model-sized hash. A compatible hosted GGUF
+and native source conversion are the subsequent fallbacks. A global
+`--state-root` is propagated to the child so it consumes the same setup quant
+and serve defaults as direct `hf2q serve`.
 
 ## Session controls
 

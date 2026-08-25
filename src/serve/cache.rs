@@ -700,6 +700,62 @@ impl ModelCache {
         Ok(())
     }
 
+    /// Record successful use only when the current manifest still names the
+    /// exact revision and retained GGUF inode that was loaded. A concurrent
+    /// replacement for the same `(repository, quant)` must not inherit the
+    /// loaded artifact's recency.
+    pub(crate) fn touch_quant_if_matches(
+        &mut self,
+        repo_id: &str,
+        revision: &str,
+        quant: QuantType,
+        expected_identity: crate::core::bounded_file::StableFileIdentity,
+    ) -> Result<bool> {
+        let _manifest_lock = self.lock_manifest()?;
+        self.reload_manifest()?;
+        let candidate_path = self
+            .manifest
+            .models
+            .get(repo_id)
+            .filter(|model| model.revision.eq_ignore_ascii_case(revision))
+            .and_then(|model| model.quantizations.get(quant.as_str()))
+            .filter(|entry| {
+                entry.quant_type.eq_ignore_ascii_case(quant.as_str())
+                    && entry.bytes == expected_identity.length()
+            })
+            .map(|entry| entry.gguf_path.clone());
+        let Some(candidate_path) = candidate_path else {
+            return Ok(false);
+        };
+        if !crate::core::bounded_file::regular_path_matches_identity(
+            &candidate_path,
+            expected_identity,
+        )? {
+            return Ok(false);
+        }
+
+        let now = secs_since_epoch();
+        let model = self
+            .manifest
+            .models
+            .get_mut(repo_id)
+            .expect("matching model was checked above");
+        model.last_accessed_secs = now;
+        let entry = model
+            .quantizations
+            .get_mut(quant.as_str())
+            .expect("matching quant was checked above");
+        entry.last_used_at_secs = now;
+        let companion = entry
+            .gguf_path
+            .parent()
+            .ok_or_else(|| anyhow!("gguf_path has no parent: {}", entry.gguf_path.display()))?
+            .join("manifest.json");
+        write_json_atomic(&companion, entry)?;
+        self.flush()?;
+        Ok(true)
+    }
+
     // ────────────────────────────────────────────────────────────────
     // Invalidation surface (ADR-005 Phase 3 iter-205, AC line 5351)
     //

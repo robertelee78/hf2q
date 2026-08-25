@@ -3,13 +3,13 @@ use super::*;
 
 pub(super) struct ExactHostedLocal {
     pub(super) artifact: HubGgufArtifact,
-    #[cfg(test)]
     pub(super) path: PathBuf,
     pub(super) materialized: SystemTime,
     pub(super) requires_projector: bool,
     pub(super) retained: crate::core::bounded_file::StableRegularFile,
 }
 
+#[cfg(test)]
 pub(super) fn find_best_matching_loose(
     artifacts: &[HubGgufArtifact],
     exact: Option<QuantType>,
@@ -17,25 +17,129 @@ pub(super) fn find_best_matching_loose(
     excluded: &[crate::core::bounded_file::StableFileIdentity],
     warnings: &mut Vec<String>,
 ) -> Result<Option<ExactHostedLocal>> {
-    find_best_matching_loose_stable(
+    let mut silent = |_| {};
+    find_best_matching_loose_with_progress(
         artifacts,
         exact,
         model_dirs,
         excluded,
         warnings,
-        |_, artifact, retained| {
-            let compatibility = validate_retained_local_hub_gguf_compatibility(retained, artifact)
-                .map_err(|error| error.to_string())?;
-            validate_retained_local_runtime_tensor_layout(retained)
-                .map_err(|error| error.to_string())?;
-            Ok(compatibility.requires_projector)
-        },
-        |_, retained| {
-            retained
-                .sha256()?
-                .context("manual GGUF changed or ceased to be a stable regular file")
-        },
+        &mut silent,
     )
+}
+
+pub(super) fn find_best_matching_loose_with_progress(
+    artifacts: &[HubGgufArtifact],
+    exact: Option<QuantType>,
+    model_dirs: &[PathBuf],
+    excluded: &[crate::core::bounded_file::StableFileIdentity],
+    warnings: &mut Vec<String>,
+    progress: &mut StartupProgress<'_>,
+) -> Result<Option<ExactHostedLocal>> {
+    find_best_matching_loose_structural(artifacts, model_dirs, exact, excluded, warnings, progress)
+}
+
+fn find_best_matching_loose_structural(
+    artifacts: &[HubGgufArtifact],
+    model_dirs: &[PathBuf],
+    exact: Option<QuantType>,
+    excluded: &[crate::core::bounded_file::StableFileIdentity],
+    warnings: &mut Vec<String>,
+    progress: &mut StartupProgress<'_>,
+) -> Result<Option<ExactHostedLocal>> {
+    let eligible = artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact
+                .quant_hint
+                .as_deref()
+                .and_then(|value| QuantType::from_canonical_str(value).ok())
+                .is_some_and(|quant| exact.is_none_or(|expected| expected == quant))
+        })
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    let mut seen = Vec::new();
+    for root in scan_roots(model_dirs)? {
+        visit_files(&root, |path, metadata, retained| {
+            if excluded
+                .iter()
+                .any(|identity| identity.same_inode(retained.identity()))
+                || seen
+                    .iter()
+                    .any(|identity: &crate::core::bounded_file::StableFileIdentity| {
+                        identity.same_inode(retained.identity())
+                    })
+                || path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_none_or(|extension| !extension.eq_ignore_ascii_case("gguf"))
+            {
+                return Ok(());
+            }
+            seen.push(retained.identity());
+            let matching = eligible
+                .iter()
+                .filter(|artifact| artifact.bytes == metadata.len())
+                .copied()
+                .collect::<Vec<_>>();
+            let [artifact] = matching.as_slice() else {
+                if matching.len() > 1 {
+                    warnings.push(format!(
+                        "ignored structurally ambiguous local GGUF {}: multiple repository artifacts have the same quant and byte length; filenames are hints, not identity authority",
+                        path.display()
+                    ));
+                }
+                return Ok(());
+            };
+            candidates.push((
+                metadata.modified().unwrap_or(UNIX_EPOCH),
+                path.to_path_buf(),
+                (**artifact).clone(),
+                retained,
+            ));
+            Ok(())
+        })?;
+    }
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    for (materialized, path, artifact, retained) in candidates {
+        let quant = artifact
+            .quant_hint
+            .as_deref()
+            .and_then(|value| QuantType::from_canonical_str(value).ok())
+            .context("structurally matched local GGUF has no supported quant")?;
+        progress(StartupEvent::LocalCandidate {
+            quant: quant.as_str().to_owned(),
+            origin: StartupOrigin::ManualStructuralMatch,
+            bytes: artifact.bytes,
+            filename: display_filename(&path),
+        });
+        let compatibility =
+            match validate_retained_local_hub_gguf_compatibility(&retained, &artifact) {
+                Ok(compatibility) => compatibility,
+                Err(error) => {
+                    warnings.push(format!(
+                        "ignored unsupported local GGUF {}: {error}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+        if let Err(error) = validate_retained_local_runtime_tensor_layout(&retained) {
+            warnings.push(format!(
+                "ignored non-executable local GGUF {}: {error}",
+                path.display()
+            ));
+            continue;
+        }
+        return Ok(Some(ExactHostedLocal {
+            artifact,
+            path,
+            materialized,
+            requires_projector: compatibility.requires_projector,
+            retained,
+        }));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -53,7 +157,7 @@ pub(super) fn find_best_matching_loose_with(
         &[],
         warnings,
         |path, artifact, _| admit(path, artifact).map(|_| false),
-        |_, retained| {
+        |_, retained, _| {
             retained
                 .sha256()?
                 .context("manual GGUF changed or ceased to be a stable regular file")
@@ -78,11 +182,12 @@ pub(super) fn find_best_matching_loose_with_hash(
         &[],
         warnings,
         |path, artifact, _| admit(path, artifact).map(|_| false),
-        |path, retained| hash(path, retained.try_clone()?.metadata()?.len()),
+        |path, retained, _| hash(path, retained.try_clone()?.metadata()?.len()),
     )
     .map(|selected| selected.map(|selected| (selected.artifact, selected.path)))
 }
 
+#[cfg(test)]
 fn find_best_matching_loose_stable(
     artifacts: &[HubGgufArtifact],
     exact: Option<QuantType>,
@@ -94,7 +199,11 @@ fn find_best_matching_loose_stable(
         &HubGgufArtifact,
         &crate::core::bounded_file::StableRegularFile,
     ) -> std::result::Result<bool, String>,
-    mut hash: impl FnMut(&Path, &mut crate::core::bounded_file::StableRegularFile) -> Result<String>,
+    mut hash: impl FnMut(
+        &Path,
+        &mut crate::core::bounded_file::StableRegularFile,
+        &[HubGgufArtifact],
+    ) -> Result<String>,
 ) -> Result<Option<ExactHostedLocal>> {
     let eligible = artifacts
         .iter()
@@ -146,7 +255,7 @@ fn find_best_matching_loose_stable(
     }
     candidates.sort_by(|left, right| right.0.cmp(&left.0));
     for (_, path, artifacts, mut retained) in candidates {
-        let digest = match hash(&path, &mut retained) {
+        let digest = match hash(&path, &mut retained, &artifacts) {
             Ok(digest) => digest,
             Err(error) => {
                 warnings.push(format!(
@@ -175,7 +284,6 @@ fn find_best_matching_loose_stable(
                 Ok(requires_projector) => {
                     return Ok(Some(ExactHostedLocal {
                         artifact,
-                        #[cfg(test)]
                         path,
                         materialized: retained
                             .try_clone()?
@@ -196,32 +304,109 @@ fn find_best_matching_loose_stable(
     Ok(None)
 }
 
-pub(super) fn find_best_matching_cached_hub(
+pub(super) fn find_best_matching_cached_hub_with_progress(
     artifacts: &[HubGgufArtifact],
     exact: Option<QuantType>,
     warnings: &mut Vec<String>,
+    progress: &mut StartupProgress<'_>,
 ) -> Result<Option<ExactHostedLocal>> {
-    find_best_matching_cached_hub_stable(
-        artifacts,
-        exact,
-        warnings,
-        |artifact| {
-            let path = cached_hub_gguf_path(artifact)?;
-            let materialized = path
-                .metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .unwrap_or(UNIX_EPOCH);
-            Some((path, materialized))
-        },
-        |_, artifact, retained| {
-            let compatibility = validate_retained_local_hub_gguf_compatibility(retained, artifact)
-                .map_err(|error| error.to_string())?;
-            validate_retained_local_runtime_tensor_layout(retained)
-                .map_err(|error| error.to_string())?;
-            Ok(compatibility.requires_projector)
-        },
-    )
+    let mut candidates = Vec::new();
+    for artifact in artifacts {
+        let quant = artifact
+            .quant_hint
+            .as_deref()
+            .and_then(|value| QuantType::from_canonical_str(value).ok());
+        let Some(quant) = quant else {
+            continue;
+        };
+        if exact.is_some_and(|expected| expected != quant) {
+            continue;
+        }
+        let Some(local) = retain_cached_hub_artifact(artifact)? else {
+            continue;
+        };
+        let materialized = local
+            .retained
+            .try_clone()?
+            .metadata()?
+            .modified()
+            .unwrap_or(UNIX_EPOCH);
+        candidates.push((materialized, artifact.clone(), local, quant));
+    }
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    for (materialized, artifact, local, quant) in candidates {
+        let path = local.path;
+        let retained = local.retained;
+        progress(StartupEvent::LocalCandidate {
+            quant: quant.as_str().to_owned(),
+            origin: StartupOrigin::HuggingFaceCacheStructuralMatch,
+            bytes: artifact.bytes,
+            filename: display_filename(&path),
+        });
+        let compatibility =
+            match validate_retained_local_hub_gguf_compatibility(&retained, &artifact) {
+                Ok(compatibility) => compatibility,
+                Err(error) => {
+                    warnings.push(format!(
+                        "ignored unsupported Hugging Face cache GGUF {}: {error}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+        if let Err(error) = validate_retained_local_runtime_tensor_layout(&retained) {
+            warnings.push(format!(
+                "ignored non-executable Hugging Face cache GGUF {}: {error}",
+                path.display()
+            ));
+            continue;
+        }
+        return Ok(Some(ExactHostedLocal {
+            artifact,
+            path,
+            materialized,
+            requires_projector: compatibility.requires_projector,
+            retained,
+        }));
+    }
+    Ok(None)
+}
+
+pub(super) fn retain_cached_hub_artifact(
+    artifact: &HubGgufArtifact,
+) -> Result<Option<inventory::ExactLooseFile>> {
+    let Some(snapshot_path) = cached_hub_gguf_path(artifact) else {
+        return Ok(None);
+    };
+    let revision_dir = snapshot_path.ancestors().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(&artifact.revision))
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "snapshots")
+    });
+    let Some(repository_cache) = revision_dir.and_then(Path::parent).and_then(Path::parent) else {
+        return Ok(None);
+    };
+    let blob_root = match repository_cache.join("blobs").canonicalize() {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let canonical = match snapshot_path.canonicalize() {
+        Ok(path) if path.starts_with(&blob_root) && path != blob_root => path,
+        _ => return Ok(None),
+    };
+    let Some(retained) =
+        crate::core::bounded_file::StableRegularFile::open_exact(&canonical, artifact.bytes)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(inventory::ExactLooseFile {
+        path: canonical,
+        retained,
+    }))
 }
 
 #[cfg(test)]
@@ -238,10 +423,16 @@ pub(super) fn find_best_matching_cached_hub_with(
         warnings,
         &mut lookup,
         |path, artifact, _| admit(path, artifact).map(|_| false),
+        |_, _, retained| {
+            retained
+                .sha256()?
+                .context("Hub-cache GGUF changed while it was being verified")
+        },
     )
     .map(|selected| selected.map(|selected| (selected.artifact, selected.path)))
 }
 
+#[cfg(test)]
 fn find_best_matching_cached_hub_stable(
     artifacts: &[HubGgufArtifact],
     exact: Option<QuantType>,
@@ -252,6 +443,11 @@ fn find_best_matching_cached_hub_stable(
         &HubGgufArtifact,
         &crate::core::bounded_file::StableRegularFile,
     ) -> std::result::Result<bool, String>,
+    mut hash: impl FnMut(
+        &Path,
+        &HubGgufArtifact,
+        &mut crate::core::bounded_file::StableRegularFile,
+    ) -> Result<String>,
 ) -> Result<Option<ExactHostedLocal>> {
     let mut candidates = artifacts
         .iter()
@@ -278,12 +474,15 @@ fn find_best_matching_cached_hub_stable(
             ));
             continue;
         };
-        let Some(digest) = retained.sha256()? else {
-            warnings.push(format!(
-                "ignored unstable Hub-cache artifact {}",
-                path.display()
-            ));
-            continue;
+        let digest = match hash(&path, &artifact, &mut retained) {
+            Ok(digest) => digest,
+            Err(error) => {
+                warnings.push(format!(
+                    "ignored unstable Hub-cache artifact {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
         };
         if !digest.eq_ignore_ascii_case(&artifact.sha256) {
             warnings.push(format!(
@@ -296,7 +495,6 @@ fn find_best_matching_cached_hub_stable(
             Ok(requires_projector) => {
                 return Ok(Some(ExactHostedLocal {
                     artifact,
-                    #[cfg(test)]
                     path,
                     materialized,
                     requires_projector,
@@ -312,6 +510,47 @@ fn find_best_matching_cached_hub_stable(
     Ok(None)
 }
 
+pub(super) fn hash_hosted_local_candidate(
+    path: &Path,
+    bytes: u64,
+    quant: Option<QuantType>,
+    origin: StartupOrigin,
+    retained: &mut crate::core::bounded_file::StableRegularFile,
+    progress: &mut StartupProgress<'_>,
+) -> Result<String> {
+    if let Some(quant) = quant {
+        progress(StartupEvent::LocalCandidate {
+            quant: quant.as_str().to_owned(),
+            origin,
+            bytes,
+            filename: display_filename(path),
+        });
+    } else {
+        progress(StartupEvent::VerifyStart {
+            artifact: "text GGUF".into(),
+            bytes,
+            filename: display_filename(path),
+        });
+    }
+    let started = std::time::Instant::now();
+    let step = (bytes / 20).max(256 * 1024 * 1024);
+    let mut next_report = step.min(bytes);
+    retained
+        .sha256_with_progress(|completed_bytes| {
+            if completed_bytes >= next_report || completed_bytes == bytes {
+                progress(StartupEvent::VerifyProgress {
+                    artifact: "text GGUF".into(),
+                    completed_bytes,
+                    total_bytes: bytes,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                });
+                next_report = completed_bytes.saturating_add(step).min(bytes);
+            }
+        })?
+        .context("local GGUF changed or ceased to be a stable regular file")
+}
+
+#[cfg(test)]
 pub(super) fn select_local(
     spec: &RepositoryModelSpec,
     model_dirs: &[PathBuf],
@@ -323,7 +562,36 @@ pub(super) fn select_local(
 ) -> Result<
     Option<(
         Candidate,
-        crate::core::bounded_file::StableFileIdentity,
+        crate::core::bounded_file::StableRegularFile,
+        Option<CacheLock>,
+    )>,
+> {
+    let mut silent = |_| {};
+    select_local_with_progress(
+        spec,
+        model_dirs,
+        cache,
+        held_quant_lock,
+        available_memory_bytes,
+        pool_budget_bytes,
+        warnings,
+        &mut silent,
+    )
+}
+
+pub(super) fn select_local_with_progress(
+    spec: &RepositoryModelSpec,
+    model_dirs: &[PathBuf],
+    cache: &ModelCache,
+    held_quant_lock: Option<QuantType>,
+    available_memory_bytes: u64,
+    pool_budget_bytes: u64,
+    warnings: &mut Vec<String>,
+    progress: &mut StartupProgress<'_>,
+) -> Result<
+    Option<(
+        Candidate,
+        crate::core::bounded_file::StableRegularFile,
         Option<CacheLock>,
     )>,
 > {
@@ -385,6 +653,7 @@ pub(super) fn select_local(
             last_used_at_secs: last_used,
             projector,
             sidecar: None,
+            receipt_target_identity: None,
         });
     }
     candidates.retain(|candidate| {
@@ -433,8 +702,8 @@ pub(super) fn select_local(
                     })?,
             )
         };
-        match verify_candidate(&candidate) {
-            Ok(identity) => return Ok(Some((candidate, identity, local_lock))),
+        match verify_candidate_with_progress(&candidate, progress) {
+            Ok(authority) => return Ok(Some((candidate, authority, local_lock))),
             Err(error) => {
                 warnings.push(format!(
                     "ignored invalid local {} {}: {error}",

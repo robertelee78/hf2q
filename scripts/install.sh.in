@@ -162,7 +162,7 @@ main() {
   # Provision against the stable installed path, never the temporary download
   # that is deleted when this script exits. This is intentionally a distinct
   # invocation so the install bootstrap's opt-out cannot leak into activation.
-  "$install_dir/hf2q" --version >/dev/null </dev/null
+  "$install_dir/hf2q" completions --shell zsh >/dev/null </dev/null
 
   case ":${PATH:-}:" in
     *:"$install_dir":*) ;;

@@ -113,6 +113,7 @@ printf 'pipeline bytes must not reach candidate\n' | \
   /bin/sh "$probe_installer" >/dev/null
 grep -Fx 'eof:--version' "$probe_log"
 grep -Fx 'eof:__standalone-install' "$probe_log"
+grep -Fx 'eof:completions' "$probe_log"
 if grep -Fq 'captured:' "$probe_log"; then
   echo 'candidate inherited installer stdin' >&2
   exit 1

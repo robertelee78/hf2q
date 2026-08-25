@@ -35,6 +35,7 @@ pub mod multi_model;
 pub mod multi_seq_kv;
 pub(crate) mod operator_settings;
 pub(crate) mod operator_ui;
+pub(crate) mod startup_progress;
 pub use info::cmd_info;
 pub(crate) use info::print_early_rejection as print_info_early_rejection;
 // ADR-040 Phase B iter-1 scaffolding — Scheduler trait + FifoSchedulerAdapter +
@@ -51,8 +52,9 @@ pub mod scheduler;
 pub mod spec_decode_cli;
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::chat::startup_ui::{interactive_startup_enabled, StartupOutput, StartupUi};
 use crate::cli;
 use crate::debug::INVESTIGATION_ENV;
 
@@ -3857,9 +3859,10 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
     // the Qwen35 variant returns HTTP 501 with an operator-actionable
     // message (Wedge-3 deferred follow-up wires the live forward
     // pass).  See `LoadedModel::load` for the dispatch surface.
-    let resolved_context = {
+    let (resolved_context, model_id_uses_filename_fallback) = {
         let gguf = mlx_native::gguf::GgufFile::open(path)
             .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
+        let model_id_uses_filename_fallback = gguf.metadata_string("general.name").is_none();
         let arch = gguf
             .metadata_string("general.architecture")
             .map(|s| s.to_string())
@@ -3875,7 +3878,7 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             arch = %arch,
             "Validated GGUF header"
         );
-        resolved
+        (resolved, model_id_uses_filename_fallback)
     };
 
     let load_opts = api::engine::LoadOptions {
@@ -3894,6 +3897,11 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
         &load_opts,
         Some(resolved_context.effective_tokens),
     )?;
+    if model_id_uses_filename_fallback {
+        if let Some(logical_path) = config.operator_model_path.as_deref() {
+            loaded.apply_operator_model_id(logical_path);
+        }
+    }
     // ADR-017 Phase E.a iter-2: thread the metrics sink onto the
     // GemmaLoadedModel BEFORE Engine::spawn moves `loaded` into the
     // worker. Qwen35 / Qwen3VlText variants don't yet have an LCP
@@ -4003,6 +4011,53 @@ pub(crate) fn maybe_print_serve_banner<W: std::io::Write>(
     Ok(())
 }
 
+fn direct_health_url(address: std::net::SocketAddr) -> String {
+    let ip = if address.ip().is_unspecified() {
+        if address.is_ipv6() {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        }
+    } else {
+        address.ip()
+    };
+    format!(
+        "http://{}/health",
+        std::net::SocketAddr::new(ip, address.port())
+    )
+}
+
+async fn await_direct_http_health(
+    address: std::net::SocketAddr,
+    auth_token: Option<&str>,
+) -> Result<()> {
+    let url = direct_health_url(address);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_millis(250))
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .context("build direct serve health client")?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut request = client.get(&url);
+        if let Some(token) = auth_token {
+            request = request.bearer_auth(token);
+        }
+        if request
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("bound HTTP service did not answer /health within 5s at {url}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedServeEndpoint {
     pub(crate) host: String,
@@ -4108,6 +4163,23 @@ fn validate_mmproj_diagnostic_mode(
     Ok(())
 }
 
+fn automatic_pair_guard_authority_paths(
+    text_authority: &crate::core::bounded_file::StableRegularFile,
+    projector_authority: &crate::core::bounded_file::StableRegularFile,
+) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    let text = text_authority
+        .canonical_path_for_identity()?
+        .context("automatic text authority changed before pair lock")?;
+    let projector = projector_authority
+        .canonical_path_for_identity()?
+        .context("automatic mmproj authority changed before pair lock")?;
+    // A receipt-bound converted pair shares its target namespace and must use
+    // that generation journal. A separately downloaded exact projector lives
+    // beside the logical text link; retain both FDs, but use the logical
+    // shared pair namespace instead of unrelated canonical parents.
+    Ok((text.parent() == projector.parent()).then_some((text, projector)))
+}
+
 pub fn cmd_serve(
     args: cli::ServeArgs,
     log_format: cli::LogFormat,
@@ -4139,22 +4211,28 @@ pub fn cmd_serve(
         anyhow::bail!("serve --output requires a repository MODEL operand");
     }
 
-    let (mut chat_parent_lifeline, chat_owned_listener) =
-        match (args.chat_parent_lifeline_fd, args.chat_owned_listener_fd) {
-            (Some(lifeline_fd), Some(listener_fd)) => {
+    let (mut chat_parent_lifeline, chat_owned_listener, mut chat_startup_progress) = match (
+        args.chat_parent_lifeline_fd,
+        args.chat_owned_listener_fd,
+        args.chat_startup_progress_fd,
+    ) {
+            (Some(lifeline_fd), Some(listener_fd), Some(progress_fd)) => {
                 anyhow::ensure!(
-                    lifeline_fd != listener_fd,
-                    "chat lifeline and listener descriptors must be distinct"
+                    lifeline_fd != listener_fd
+                        && lifeline_fd != progress_fd
+                        && listener_fd != progress_fd,
+                    "chat lifeline, listener, and startup-progress descriptors must be distinct"
                 );
                 let listener = start_chat_owned_listener(listener_fd)?;
                 (
                     Some(start_chat_parent_lifeline(lifeline_fd)?),
                     Some(listener),
+                    Some(start_chat_startup_progress(progress_fd)?),
                 )
             }
-            (None, None) => (None, None),
+            (None, None, None) => (None, None, None),
             _ => anyhow::bail!(
-            "chat-owned serve requires both the private lifeline and pre-bound listener descriptors"
+            "chat-owned serve requires private lifeline, pre-bound listener, and startup-progress descriptors"
         ),
         };
 
@@ -4281,6 +4359,7 @@ pub fn cmd_serve(
     let dynamic_kv_metrics_sink = std::sync::Arc::clone(&state.kv_spill_counters)
         as std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>;
     state = state.with_engine_config_template(multi_model::EngineConfig {
+        operator_model_path: None,
         tokenizer_path: None,
         config_path: None,
         queue_capacity: config.queue_capacity,
@@ -4295,12 +4374,42 @@ pub fn cmd_serve(
     });
 
     let mut automatic_mmproj = false;
+    let human_startup_progress = !args.quiet && matches!(log_format, cli::LogFormat::Text);
+    let interactive_startup = human_startup_progress
+        && interactive_startup_enabled(std::io::IsTerminal::is_terminal(&std::io::stderr()));
+    let mut startup_log_capture = interactive_startup.then(operator_ui::begin_startup_log_capture);
+    let mut startup_stderr = std::io::stderr();
+    let mut direct_startup_ui = human_startup_progress.then(|| {
+        StartupUi::new(
+            &mut startup_stderr,
+            interactive_startup,
+            StartupOutput::Stderr,
+        )
+    });
+    if let Some(ui) = direct_startup_ui.as_mut() {
+        let target = repository_spec
+            .as_ref()
+            .map(|spec| spec.repository.as_str())
+            .or_else(|| args.model.as_deref().and_then(Path::to_str));
+        let _ = ui.announce_direct(target);
+    }
     let mut startup_managed_identity = None;
+    let mut startup_history_identity = None;
+    let mut startup_model_authority = None;
+    let mut startup_mmproj_sha256 = None;
+    let mut startup_mmproj_authority = None;
     if let Some(spec) = repository_spec.as_ref() {
         let mut cache_guard = state.cache.lock().map_err(|error| {
             anyhow::anyhow!("cache mutex poisoned during model resolution: {error}")
         })?;
-        let resolved = managed_artifacts::resolve_repository(
+        let mut report = |event| {
+            emit_startup_event(
+                chat_startup_progress.as_mut(),
+                direct_startup_ui.as_mut(),
+                event,
+            )
+        };
+        let mut resolved = managed_artifacts::resolve_repository_with_progress(
             spec,
             args.output.as_deref(),
             &args.model_dirs,
@@ -4308,11 +4417,19 @@ pub fn cmd_serve(
             state.hardware.as_ref(),
             args.mmproj.is_none(),
             configured_quant,
+            &mut report,
         )?;
+        drop(report);
         drop(cache_guard);
         for warning in &resolved.warnings {
             tracing::warn!("{warning}");
-            eprintln!("Warning: {warning}");
+            if let Some(reason) = text_only_reason(warning) {
+                emit_startup_event(
+                    chat_startup_progress.as_mut(),
+                    direct_startup_ui.as_mut(),
+                    startup_progress::StartupEvent::TextOnlyFallback { reason },
+                );
+            }
         }
         tracing::info!(
             repository = %resolved.repository,
@@ -4329,6 +4446,17 @@ pub fn cmd_serve(
             resolved.quant,
             resolved.gguf_path.clone(),
         ));
+        if resolved.track_success_history {
+            startup_history_identity = Some((
+                resolved.repository.clone(),
+                resolved.revision.clone(),
+                resolved.quant,
+                resolved.gguf_path.clone(),
+            ));
+        }
+        startup_model_authority = resolved.activation_authority.take();
+        startup_mmproj_sha256 = resolved.mmproj_sha256.take();
+        startup_mmproj_authority = resolved.mmproj_activation_authority.take();
         if args.mmproj.is_none() {
             automatic_mmproj = resolved.mmproj_path.is_some();
             args.mmproj = resolved.mmproj_path;
@@ -4345,7 +4473,13 @@ pub fn cmd_serve(
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(%error, "automatic local-path mmproj resolution failed");
-                    eprintln!("Warning: automatic local-path mmproj resolution failed: {error}");
+                    emit_startup_event(
+                        chat_startup_progress.as_mut(),
+                        direct_startup_ui.as_mut(),
+                        startup_progress::StartupEvent::TextOnlyFallback {
+                            reason: startup_progress::TextOnlyReason::ProjectorUnavailable,
+                        },
+                    );
                 }
             }
         }
@@ -4354,12 +4488,39 @@ pub fn cmd_serve(
     let pair_paths = args.model.clone().zip(args.mmproj.clone());
     let pair_read_guard = match pair_paths {
         Some((text, projector)) => {
-            match crate::core::paired_artifact::PairReadGuard::acquire(&text, &projector) {
+            let acquire_pair_guard = || -> anyhow::Result<_> {
+                let authority_paths = if automatic_mmproj {
+                    startup_model_authority
+                        .as_ref()
+                        .zip(startup_mmproj_authority.as_ref())
+                        .map(|(text_authority, projector_authority)| {
+                            automatic_pair_guard_authority_paths(
+                                text_authority,
+                                projector_authority,
+                            )
+                        })
+                        .transpose()?
+                        .flatten()
+                } else {
+                    None
+                };
+                let (guard_text, guard_projector) = authority_paths
+                    .as_ref()
+                    .map(|(text, projector)| (text.as_path(), projector.as_path()))
+                    .unwrap_or((text.as_path(), projector.as_path()));
+                crate::core::paired_artifact::PairReadGuard::acquire(guard_text, guard_projector)
+                    .map_err(anyhow::Error::from)
+            };
+            match acquire_pair_guard() {
                 Ok(guard) => Some(guard),
                 Err(error) if automatic_mmproj => {
                     tracing::warn!(%error, "automatic mmproj pair lock rejected; continuing text-only");
-                    eprintln!(
-                        "Warning: automatic mmproj pair could not be locked; serving text-only: {error}"
+                    emit_startup_event(
+                        chat_startup_progress.as_mut(),
+                        direct_startup_ui.as_mut(),
+                        startup_progress::StartupEvent::TextOnlyFallback {
+                            reason: startup_progress::TextOnlyReason::ProjectorPairRejected,
+                        },
                     );
                     args.mmproj = None;
                     None
@@ -4801,15 +4962,69 @@ pub fn cmd_serve(
             wrapper.set_pending_bind(pool_repo.clone(), pool_quant);
         }
 
+        let text_load_started = std::time::Instant::now();
+        emit_startup_event(
+            chat_startup_progress.as_mut(),
+            direct_startup_ui.as_mut(),
+            startup_progress::StartupEvent::TextLoad {
+                quant: pool_quant.as_str().to_owned(),
+                bytes: std::fs::metadata(&resolved.gguf_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+                filename: resolved
+                    .gguf_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<unnamed GGUF>".into()),
+            },
+        );
         let mut pool_guard = state
             .pool
             .write()
             .map_err(|e| anyhow::anyhow!("pool rwlock poisoned at startup: {e}"))?;
+        if let Some(authority) = startup_model_authority.as_ref() {
+            anyhow::ensure!(
+                authority.is_stable()?
+                    && crate::core::bounded_file::regular_path_matches_identity(
+                        &resolved.gguf_path,
+                        authority.identity(),
+                    )?,
+                "locally discovered GGUF changed before runtime activation"
+            );
+        }
+        let activation_path = startup_model_authority
+            .as_ref()
+            .map(|authority| authority.activation_path())
+            .transpose()?
+            .unwrap_or_else(|| resolved.gguf_path.clone());
         let loaded_engine = pool_guard
-            .load_or_get(&pool_repo, pool_quant, &resolved.gguf_path, &engine_config)
+            .load_or_get_from_authority(
+                &pool_repo,
+                pool_quant,
+                &resolved.gguf_path,
+                &activation_path,
+                &engine_config,
+            )
             .map_err(|e| anyhow::anyhow!("startup pre-warm: {e}"))?;
+        if let Some(authority) = startup_model_authority.as_ref() {
+            anyhow::ensure!(
+                authority.is_stable()?
+                    && crate::core::bounded_file::regular_path_matches_identity(
+                        &resolved.gguf_path,
+                        authority.identity(),
+                    )?,
+                "locally discovered GGUF changed during runtime activation"
+            );
+        }
         startup_engine_for_banner = Some(loaded_engine.engine.clone());
         drop(pool_guard);
+        emit_startup_event(
+            chat_startup_progress.as_mut(),
+            direct_startup_ui.as_mut(),
+            startup_progress::StartupEvent::TextReady {
+                elapsed_ms: text_load_started.elapsed().as_millis() as u64,
+            },
+        );
         tracing::info!(
             repo = %pool_repo,
             quant = %pool_quant.as_str(),
@@ -4935,26 +5150,61 @@ pub fn cmd_serve(
     // pass (ADR-005 Phase 2c Task #15). Fail fast if the file is absent
     // or malformed so the server never advertises multimodal capability
     // it can't back.
-    let load_startup_mmproj = || -> Result<(
+    let mut load_startup_mmproj = || -> Result<(
         Option<api::state::LoadedMmproj>,
         Option<load_info::VisionProjector>,
     )> {
         if let Some(mmp_path) = args.mmproj.as_ref() {
+        let mmproj_activation_path = startup_mmproj_authority
+            .as_ref()
+            .map(|authority| authority.activation_path())
+            .transpose()?
+            .unwrap_or_else(|| mmp_path.clone());
         anyhow::ensure!(
-            mmp_path.exists(),
+            mmproj_activation_path.exists(),
             "mmproj not found: {}",
             mmp_path.display()
         );
-        let gguf = mlx_native::gguf::GgufFile::open(mmp_path)
+        if let Some(authority) = startup_mmproj_authority.as_ref() {
+            anyhow::ensure!(
+                authority.is_stable()?
+                    && crate::core::bounded_file::regular_path_matches_identity(
+                        mmp_path,
+                        authority.identity(),
+                    )?,
+                "automatically selected mmproj changed before runtime activation"
+            );
+        }
+        // On macOS, opening /dev/fd/N duplicates the same open-file
+        // description and therefore shares its seek offset. Hash the retained
+        // authority first (which rewinds and stability-checks it), then let
+        // the GGUF reader seek its fresh activation descriptor.
+        let mmproj_sha256 = match startup_mmproj_authority.as_mut() {
+            Some(authority) => authority
+                .sha256()?
+                .context("automatically selected mmproj changed while hashing")?,
+            None => crate::core::sha256::compute_file_sha256(&mmproj_activation_path)
+                .with_context(|| format!("hash vision projector '{}'", mmp_path.display()))?,
+        };
+        if let Some(expected) = startup_mmproj_sha256.as_deref() {
+            anyhow::ensure!(
+                mmproj_sha256.eq_ignore_ascii_case(expected),
+                "automatically selected mmproj no longer matches the exact repository catalog"
+            );
+        }
+        let gguf = mlx_native::gguf::GgufFile::open(&mmproj_activation_path)
             .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
-        let mmproj_sha256 = crate::core::sha256::compute_file_sha256(mmp_path)
-            .with_context(|| format!("hash vision projector '{}'", mmp_path.display()))?;
         let text_path = args.model.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "--mmproj requires --model so hf2q can lock and validate the complete pair"
             )
         })?;
-        let text_gguf = mlx_native::gguf::GgufFile::open(text_path)
+        let text_activation_path = startup_model_authority
+            .as_ref()
+            .map(|authority| authority.activation_path())
+            .transpose()?
+            .unwrap_or_else(|| text_path.clone());
+        let text_gguf = mlx_native::gguf::GgufFile::open(&text_activation_path)
             .map_err(|error| anyhow::anyhow!("text GGUF pair preflight failed: {error}"))?;
         pair_read_guard
             .as_ref()
@@ -5062,6 +5312,16 @@ pub fn cmd_serve(
             tensors_loaded = mmp_weights.len(),
             "Loaded mmproj GGUF header + tensor set + weights"
         );
+        if let Some(authority) = startup_mmproj_authority.as_ref() {
+            anyhow::ensure!(
+                authority.is_stable()?
+                    && crate::core::bounded_file::regular_path_matches_identity(
+                        mmp_path,
+                        authority.identity(),
+                    )?,
+                "automatically selected mmproj changed during runtime activation"
+            );
+        }
         // Iter 53: ViT GPU warmup — runs one synthetic full forward
         // to trigger Metal kernel pipeline compilation. Drops first
         // user-visible multimodal request from ~5–10s (cold compile)
@@ -5122,15 +5382,48 @@ pub fn cmd_serve(
             Ok((None, None))
         }
     };
+    let projector_started = args.mmproj.as_ref().map(|path| {
+        emit_startup_event(
+            chat_startup_progress.as_mut(),
+            direct_startup_ui.as_mut(),
+            startup_progress::StartupEvent::ProjectorLoad {
+                bytes: std::fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+                filename: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<unnamed projector>".into()),
+            },
+        );
+        std::time::Instant::now()
+    });
     let (mmproj, startup_vision_projector) = match load_startup_mmproj() {
         Ok(loaded) => loaded,
         Err(error) if automatic_mmproj => {
             tracing::warn!(%error, "automatic mmproj rejected; continuing text-only");
-            eprintln!("Warning: automatic mmproj was rejected; serving text-only: {error:#}");
+            emit_startup_event(
+                chat_startup_progress.as_mut(),
+                direct_startup_ui.as_mut(),
+                startup_progress::StartupEvent::TextOnlyFallback {
+                    reason: startup_progress::TextOnlyReason::ProjectorLoadRejected,
+                },
+            );
             (None, None)
         }
         Err(error) => return Err(error),
     };
+    if mmproj.is_some() {
+        if let Some(started) = projector_started {
+            emit_startup_event(
+                chat_startup_progress.as_mut(),
+                direct_startup_ui.as_mut(),
+                startup_progress::StartupEvent::ProjectorReady {
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                },
+            );
+        }
+    }
     drop(pair_read_guard);
 
     // --- Build router ---
@@ -5165,6 +5458,7 @@ pub fn cmd_serve(
 
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let quiet = args.quiet;
+    let suppress_human_banner = quiet || matches!(log_format, cli::LogFormat::Json);
     let operator_ui_mode = args.operator_ui;
 
     rt.block_on(async move {
@@ -5208,20 +5502,44 @@ pub fn cmd_serve(
         } else {
             None
         };
+        let serving_endpoint = format!("http://{local_addr}");
+        if let Some(ui) = direct_startup_ui.as_mut() {
+            // This is deliberately not an HTTP-ready claim. The listener is
+            // bound and the model is prepared, but `axum::serve` has not yet
+            // begun polling. Owned chat publishes authoritative readiness on
+            // its private lifeline and then performs a parent-side HTTP check.
+            let _ = ui.listener_bound(&serving_endpoint, startup_engine_for_banner.is_some());
+        }
+        drop(direct_startup_ui);
+        if let Some(capture) = startup_log_capture.as_mut() {
+            let _ = capture.finish();
+        }
         if let Some(engine) = startup_engine_for_banner.as_ref() {
             let mut stdout = std::io::stdout();
             let mut banner_info = engine.info().clone();
             banner_info.vision_projector = startup_vision_projector.clone();
-            maybe_print_serve_banner(&banner_info, &mut stdout, stdout_is_tty, quiet)
-                .context("print serve load banner")?;
+            if let Err(error) = maybe_print_serve_banner(
+                &banner_info,
+                &mut stdout,
+                stdout_is_tty,
+                suppress_human_banner,
+            ) {
+                tracing::warn!(%error, "serve load banner unavailable; HTTP serving continues");
+            }
         }
-        let operator_identity = startup_engine_for_banner.as_ref().map(|engine| {
-            (
-                engine.info().model_id.clone(),
-                engine.info().arch_family.as_str().to_owned(),
-                engine.max_slots(),
-            )
-        });
+        let operator_identity = startup_engine_for_banner
+            .as_ref()
+            .map(|engine| {
+                (
+                    engine.info().model_id.clone(),
+                    engine.info().arch_family.as_str().to_owned(),
+                    engine.max_slots(),
+                )
+            })
+            .or_else(|| {
+                matches!(operator_ui_mode, cli::OperatorUiArg::Dashboard)
+                    .then(|| ("no model preloaded".into(), "none".into(), 0))
+            });
         // ADR-017 Closure iter-10 (2026-05-05): drop the banner-only
         // Engine clone NOW. Without this, the clone (an `Arc<EngineInner>`
         // ref) lived for the entire `rt.block_on` async block — i.e. the
@@ -5235,39 +5553,47 @@ pub fn cmd_serve(
         // which is a `&LoadInfo` borrow — we don't need the engine
         // afterwards.
         drop(startup_engine_for_banner);
-        eprintln!("hf2q serving on http://{}", local_addr);
         let _operator_ui = if let Some((model, family, max_slots)) = operator_identity {
-            operator_ui::start(
+            match operator_ui::start(
                 operator_ui_mode,
                 matches!(log_format, cli::LogFormat::Text),
                 model,
                 family,
                 format!("http://{local_addr}"),
                 max_slots,
-            )?
+            ) {
+                Ok(ui) => ui,
+                Err(error) if matches!(operator_ui_mode, cli::OperatorUiArg::Auto) => {
+                    tracing::warn!(%error, "automatic operator dashboard unavailable; plain HTTP serving continues");
+                    None
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
-        if let Some((repository, quant, path)) = startup_managed_identity.as_ref() {
+        if let Some((repository, revision, quant, path)) = startup_history_identity.as_ref() {
             match state_for_warmup.cache.lock() {
                 Ok(mut cache_guard) => {
-                    if let Err(error) = managed_artifacts::mark_successful_use(
-                        repository,
-                        *quant,
-                        path,
-                        &mut cache_guard,
-                    ) {
+                    let history_result = startup_model_authority
+                        .as_ref()
+                        .context("successful-use activation authority disappeared")
+                        .and_then(|authority| {
+                            managed_artifacts::mark_successful_use(
+                                repository,
+                                revision,
+                                *quant,
+                                path,
+                                authority,
+                                &mut cache_guard,
+                            )
+                        });
+                    if let Err(error) = history_result {
                         tracing::warn!(%error, "model started but successful-use history could not be persisted");
-                        eprintln!(
-                            "Warning: model started, but its local-use history could not be persisted: {error}"
-                        );
                     }
                 }
                 Err(error) => {
                     tracing::warn!(%error, "model started but cache history mutex was poisoned");
-                    eprintln!(
-                        "Warning: model started, but its local-use history could not be persisted: {error}"
-                    );
                 }
             }
         }
@@ -5290,7 +5616,7 @@ pub fn cmd_serve(
                     capacity = stats.capacity_models,
                     bytes_resident = stats.total_resident_bytes,
                     bytes_budget = stats.memory_budget_bytes,
-                    "hf2q ready (pool-backed; pre-warm complete if --model supplied)"
+                    "model pool prewarm complete; HTTP loop not yet started"
                 );
             }
         }
@@ -5310,16 +5636,30 @@ pub fn cmd_serve(
                 shutdown_for_server.notify_one();
             }),
         ));
-        let http_result: anyhow::Result<()> = tokio::select! {
-            result = &mut server => result.context("axum::serve"),
-            _ = shutdown_observed.notified() => {
-                match tokio::time::timeout(std::time::Duration::from_secs(150), &mut server).await {
-                    Ok(result) => result.context("axum::serve graceful shutdown"),
-                    Err(_) => Err(anyhow::anyhow!(
-                        "http_shutdown_timeout: in-flight handlers did not drain within 150s; process restart required"
-                    )),
-                }
+        let early_http_result = tokio::select! {
+            result = &mut server => Some(result.context("axum::serve before health confirmation")),
+            health = await_direct_http_health(local_addr, config.auth_token.as_deref()) => {
+                health?;
+                None
             }
+        };
+        if early_http_result.is_none() {
+            operator_ui::http_ready();
+            tracing::info!(addr = %local_addr, "hf2q HTTP health confirmed; server ready");
+        }
+        let http_result: anyhow::Result<()> = match early_http_result {
+            Some(result) => result,
+            None => tokio::select! {
+                result = &mut server => result.context("axum::serve"),
+                _ = shutdown_observed.notified() => {
+                    match tokio::time::timeout(std::time::Duration::from_secs(150), &mut server).await {
+                        Ok(result) => result.context("axum::serve graceful shutdown"),
+                        Err(_) => Err(anyhow::anyhow!(
+                            "http_shutdown_timeout: in-flight handlers did not drain within 150s; process restart required"
+                        )),
+                    }
+                }
+            },
         };
         let http_failure = http_result.err();
         state_for_warmup.preparations.cancel_all();
@@ -5443,6 +5783,8 @@ pub fn cmd_serve(
 /// descendants cannot consume detach or prolong lifetime.
 pub(crate) const CHAT_LIFELINE_DETACH_FRAME: &[u8] = b"HF2Q-L1:DETACH\n";
 pub(crate) const CHAT_LIFELINE_READY_PREFIX: &str = "HF2Q-L1:READY:";
+pub(crate) const CHAT_STARTUP_PROGRESS_PREFIX: &[u8] = b"HF2Q-P1:";
+pub(crate) const CHAT_STARTUP_PROGRESS_MAX_BYTES: usize = 1024;
 
 #[cfg(unix)]
 struct ChatParentLifeline {
@@ -5451,6 +5793,79 @@ struct ChatParentLifeline {
 
 #[cfg(not(unix))]
 struct ChatParentLifeline;
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ChatStartupProgress {
+    socket: std::os::unix::net::UnixDatagram,
+}
+
+#[cfg(not(unix))]
+struct ChatStartupProgress;
+
+#[cfg(not(unix))]
+impl ChatStartupProgress {
+    fn publish(&self, _event: &startup_progress::StartupEvent) {}
+}
+
+#[cfg(unix)]
+impl ChatStartupProgress {
+    /// Telemetry is explicitly non-authoritative. A closed or backpressured
+    /// parent must never make otherwise-valid model preparation fail.
+    fn publish(&self, event: &startup_progress::StartupEvent) {
+        let Ok(payload) = serde_json::to_vec(event) else {
+            tracing::debug!("ignored startup-progress serialization failure");
+            return;
+        };
+        let frame_len = CHAT_STARTUP_PROGRESS_PREFIX
+            .len()
+            .saturating_add(payload.len());
+        if frame_len > CHAT_STARTUP_PROGRESS_MAX_BYTES {
+            tracing::debug!(frame_len, "ignored oversized startup-progress frame");
+            return;
+        }
+        let mut frame = Vec::with_capacity(frame_len);
+        frame.extend_from_slice(CHAT_STARTUP_PROGRESS_PREFIX);
+        frame.extend_from_slice(&payload);
+        match self.socket.send(&frame) {
+            Ok(written) if written == frame.len() => {}
+            Ok(written) => tracing::debug!(
+                written,
+                expected = frame.len(),
+                "ignored truncated startup-progress datagram"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                tracing::debug!(
+                    "dropped startup-progress event because the parent is not keeping up"
+                )
+            }
+            Err(error) => tracing::debug!(%error, "ignored startup-progress send failure"),
+        }
+    }
+}
+
+fn emit_startup_event(
+    progress: Option<&mut ChatStartupProgress>,
+    direct_ui: Option<&mut StartupUi<'_, std::io::Stderr>>,
+    event: startup_progress::StartupEvent,
+) {
+    if let Some(progress) = progress {
+        progress.publish(&event);
+    }
+    if let Some(ui) = direct_ui {
+        let _ = ui.event(event);
+    }
+}
+
+fn text_only_reason(warning: &str) -> Option<startup_progress::TextOnlyReason> {
+    warning.contains("serving text-only").then(|| {
+        if warning.contains("pair preflight") || warning.contains("pair lock") {
+            startup_progress::TextOnlyReason::ProjectorPairRejected
+        } else {
+            startup_progress::TextOnlyReason::ProjectorUnavailable
+        }
+    })
+}
 
 #[cfg(unix)]
 impl ChatParentLifeline {
@@ -5605,6 +6020,62 @@ fn start_chat_parent_lifeline(fd: i32) -> Result<ChatParentLifeline> {
 #[cfg(not(unix))]
 fn start_chat_parent_lifeline(_fd: i32) -> Result<ChatParentLifeline> {
     anyhow::bail!("chat-owned server lifelines are unsupported on this platform; use --url")
+}
+
+#[cfg(unix)]
+fn start_chat_startup_progress(fd: i32) -> Result<ChatStartupProgress> {
+    use std::os::fd::FromRawFd;
+
+    if fd < 3 {
+        anyhow::bail!("chat startup-progress descriptor must not alias stdin/stdout/stderr");
+    }
+    validate_chat_parent_lifeline_socket(fd)
+        .context("validate inherited chat startup-progress descriptor")?;
+    let mut socket_type = 0_i32;
+    let mut socket_type_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut socket_type as *mut libc::c_int).cast(),
+            &mut socket_type_len,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect chat startup-progress socket type");
+    }
+    anyhow::ensure!(
+        socket_type == libc::SOCK_DGRAM,
+        "chat startup-progress descriptor must be a Unix datagram socket"
+    );
+    let mut peer = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut peer_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    if unsafe { libc::getpeername(fd, peer.as_mut_ptr().cast(), &mut peer_len) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect chat startup-progress socket peer");
+    }
+    let peer = unsafe { peer.assume_init() };
+    anyhow::ensure!(
+        peer.ss_family as libc::c_int == libc::AF_UNIX,
+        "chat startup-progress descriptor must use AF_UNIX"
+    );
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("make chat startup-progress descriptor close-on-exec");
+    }
+    let socket = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(fd) };
+    socket
+        .set_nonblocking(true)
+        .context("make chat startup-progress channel nonblocking")?;
+    Ok(ChatStartupProgress { socket })
+}
+
+#[cfg(not(unix))]
+fn start_chat_startup_progress(_fd: i32) -> Result<ChatStartupProgress> {
+    anyhow::bail!("chat startup-progress channels are unsupported on this platform; use --url")
 }
 
 /// Build the server's `system_fingerprint` — `hf2q-<short-git-sha-or-ver>-mlx-native`.
@@ -6516,17 +6987,18 @@ fn cmd_parity_capture(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::start_chat_owned_listener;
     use super::{
         build_chat_template_env, detect_greedy_repetition_loop,
-        detect_greedy_repetition_loop_with_text, find_special_token_stop, maybe_print_serve_banner,
-        peer_special_token_id_for_model, render_jinja_template, resolve_enable_thinking,
-        resolve_serve_endpoint, run_decode_loop, validate_chat_parent_lifeline_socket,
-        validate_configured_endpoint_auth, validate_greedy_only_speculative_cli_path,
-        validate_mmproj_diagnostic_mode, validate_mmproj_text_binding, DecodeStopReason,
-        RaisePolicy, FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        detect_greedy_repetition_loop_with_text, direct_health_url, find_special_token_stop,
+        maybe_print_serve_banner, peer_special_token_id_for_model, render_jinja_template,
+        resolve_enable_thinking, resolve_serve_endpoint, run_decode_loop,
+        validate_chat_parent_lifeline_socket, validate_configured_endpoint_auth,
+        validate_greedy_only_speculative_cli_path, validate_mmproj_diagnostic_mode,
+        validate_mmproj_text_binding, DecodeStopReason, RaisePolicy,
+        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
+    #[cfg(unix)]
+    use super::{start_chat_owned_listener, start_chat_startup_progress, ChatStartupProgress};
     use crate::cli;
     use crate::core::chat_templates::QWEN3_CHATML;
     use crate::core::provenance::Provenance;
@@ -6614,6 +7086,18 @@ mod tests {
         let mut buf = Vec::new();
         maybe_print_serve_banner(&info, &mut buf, true, true).expect("skip quiet serve banner");
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn direct_health_probe_uses_loopback_for_unspecified_bind_addresses() {
+        assert_eq!(
+            direct_health_url("0.0.0.0:8123".parse().unwrap()),
+            "http://127.0.0.1:8123/health"
+        );
+        assert_eq!(
+            direct_health_url("[::]:8123".parse().unwrap()),
+            "http://[::1]:8123/health"
+        );
     }
 
     /// iter-219b parity-gate fix (2026-05-01) regression guard. The CLI
@@ -6740,6 +7224,7 @@ mod tests {
     fn load_engine_routes_qwen35_to_qwen35_loaded_model() {
         let tmp = write_minimal_gguf_with_arch("qwen35");
         let cfg = super::multi_model::EngineConfig {
+            operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
             queue_capacity: 4,
@@ -6782,6 +7267,7 @@ mod tests {
     fn load_engine_routes_qwen35moe_to_qwen35_loaded_model() {
         let tmp = write_minimal_gguf_with_arch("qwen35moe");
         let cfg = super::multi_model::EngineConfig {
+            operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
             queue_capacity: 4,
@@ -6827,6 +7313,7 @@ mod tests {
     fn load_engine_refuses_dense_qwen3vl_until_adr041_engine_seam() {
         let tmp = write_minimal_gguf_with_arch("qwen3_vl");
         let cfg = super::multi_model::EngineConfig {
+            operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
             queue_capacity: 4,
@@ -6882,6 +7369,7 @@ mod tests {
     fn load_engine_refuses_dense_qwen3vl_upstream_arch_until_adr041_engine_seam() {
         let tmp = write_minimal_gguf_with_arch("qwen3vl");
         let cfg = super::multi_model::EngineConfig {
+            operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
             queue_capacity: 4,
@@ -6912,6 +7400,7 @@ mod tests {
     fn iter227_load_engine_rejects_qwen3vlmoe_with_moe_specific_error() {
         let tmp = write_minimal_gguf_with_arch("qwen3vlmoe");
         let cfg = super::multi_model::EngineConfig {
+            operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
             queue_capacity: 4,
@@ -6942,6 +7431,7 @@ mod tests {
     fn load_engine_rejects_unknown_arch_without_gemma_fallback() {
         let tmp = write_minimal_gguf_with_arch("totally-fake-arch-name");
         let cfg = super::multi_model::EngineConfig {
+            operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
             queue_capacity: 4,
@@ -6977,6 +7467,7 @@ mod tests {
     fn load_engine_routes_deepseek4_to_native_loader_without_gemma_fallback() {
         let tmp = write_minimal_gguf_with_arch("deepseek4");
         let cfg = super::multi_model::EngineConfig {
+            operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
             queue_capacity: 4,
@@ -7017,6 +7508,7 @@ mod tests {
         for arch in &["qwen35", "qwen35moe"] {
             let tmp = write_minimal_gguf_with_arch(arch);
             let cfg = super::multi_model::EngineConfig {
+                operator_model_path: None,
                 tokenizer_path: None,
                 config_path: None,
                 queue_capacity: 4,
@@ -8566,5 +9058,47 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let adopted = start_chat_owned_listener(listener.into_raw_fd()).unwrap();
         assert_eq!(adopted.local_addr().unwrap(), address);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_progress_requires_datagrams_and_publishes_bounded_typed_frames() {
+        use std::os::fd::IntoRawFd;
+
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let stream_fd = stream.into_raw_fd();
+        let error = start_chat_startup_progress(stream_fd).unwrap_err();
+        assert!(error.to_string().contains("datagram"), "{error}");
+        unsafe { libc::close(stream_fd) };
+
+        let (socket, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let progress = start_chat_startup_progress(socket.into_raw_fd()).unwrap();
+        progress.publish(&super::startup_progress::StartupEvent::LocalSearch {
+            repository: "owner/repo".into(),
+            requested_quant: Some("Q4_K_M".into()),
+        });
+        let mut frame = [0_u8; super::CHAT_STARTUP_PROGRESS_MAX_BYTES + 1];
+        let read = peer.recv(&mut frame).unwrap();
+        assert!(read <= super::CHAT_STARTUP_PROGRESS_MAX_BYTES);
+        let payload = frame[..read]
+            .strip_prefix(super::CHAT_STARTUP_PROGRESS_PREFIX)
+            .unwrap();
+        let event: super::startup_progress::StartupEvent = serde_json::from_slice(payload).unwrap();
+        assert!(event.wire_valid());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_or_backpressured_startup_progress_never_blocks_model_preparation() {
+        let (socket, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        drop(peer);
+        let progress = ChatStartupProgress { socket };
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            progress.publish(&super::startup_progress::StartupEvent::TextReady { elapsed_ms: 1 });
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

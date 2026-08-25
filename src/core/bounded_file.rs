@@ -3,6 +3,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Result, Seek, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +16,14 @@ pub(crate) struct StableFileIdentity {
     mtime_nsec: i64,
     ctime: i64,
     ctime_nsec: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StableLinkIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    mode: u32,
 }
 
 fn snapshot(metadata: &fs::Metadata) -> StableFileIdentity {
@@ -30,11 +39,30 @@ fn snapshot(metadata: &fs::Metadata) -> StableFileIdentity {
     }
 }
 
+fn link_snapshot(metadata: &fs::Metadata) -> StableLinkIdentity {
+    StableLinkIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        mode: metadata.mode(),
+    }
+}
+
+fn link_snapshot_stat(metadata: &rustix::fs::Stat) -> StableLinkIdentity {
+    StableLinkIdentity {
+        device: metadata.st_dev as u64,
+        inode: metadata.st_ino as u64,
+        length: metadata.st_size.max(0) as u64,
+        mode: metadata.st_mode as u32,
+    }
+}
+
 pub(crate) struct StableRegularFile {
     file: fs::File,
     path: std::path::PathBuf,
     identity: StableFileIdentity,
     namespace: Option<WalkedNamespace>,
+    direct_symlink: Option<StableLinkIdentity>,
 }
 
 pub(crate) struct StableDirectory {
@@ -42,6 +70,23 @@ pub(crate) struct StableDirectory {
     public_path: std::path::PathBuf,
     canonical_path: std::path::PathBuf,
     identity: StableFileIdentity,
+}
+
+impl StableRegularFile {
+    /// Pathname that reopens this retained descriptor rather than the public
+    /// filesystem name. The descriptor must outlive every open through this
+    /// path. macOS and the supported Unix development hosts expose `/dev/fd`.
+    pub(crate) fn activation_path(&self) -> Result<std::path::PathBuf> {
+        // macOS implements /dev/fd opens as descriptor duplication, so the
+        // new handle shares this open-file description's seek offset. Reset
+        // immediately before handing out the activation name.
+        let mut shared = self.file.try_clone()?;
+        shared.rewind()?;
+        Ok(std::path::PathBuf::from(format!(
+            "/dev/fd/{}",
+            self.file.as_raw_fd()
+        )))
+    }
 }
 
 impl StableDirectory {
@@ -134,6 +179,7 @@ struct WalkedNamespace {
     root: fs::File,
     root_path: std::path::PathBuf,
     relative: std::path::PathBuf,
+    leaf_symlink: Option<StableLinkIdentity>,
 }
 
 impl StableRegularFile {
@@ -151,6 +197,7 @@ impl StableRegularFile {
             path: path.to_path_buf(),
             identity: snapshot(&metadata),
             namespace: None,
+            direct_symlink: None,
         }))
     }
 
@@ -170,6 +217,46 @@ impl StableRegularFile {
             Err(error) => return Err(error),
         };
         Self::from_open_file(file, path, expected_bytes)
+    }
+
+    /// Open one operator-placed regular file or direct file symlink while
+    /// retaining both the target descriptor and the symlink identity. Receipt
+    /// and publication authorities continue to use strict [`Self::open_exact`].
+    pub(crate) fn open_operator_path_exact(
+        path: &Path,
+        expected_bytes: u64,
+    ) -> Result<Option<Self>> {
+        let before = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => link_snapshot(&metadata),
+            Ok(metadata) if metadata.is_file() => return Self::open_exact(path, expected_bytes),
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let target = file.metadata()?;
+        let after = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => link_snapshot(&metadata),
+            _ => return Ok(None),
+        };
+        if before != after || !target.is_file() || target.len() != expected_bytes {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            file,
+            path: path.to_path_buf(),
+            identity: snapshot(&target),
+            namespace: None,
+            direct_symlink: Some(before),
+        }))
     }
 
     pub(crate) fn from_walked_file(
@@ -192,7 +279,35 @@ impl StableRegularFile {
                 root,
                 root_path,
                 relative,
+                leaf_symlink: None,
             }),
+            direct_symlink: None,
+        }))
+    }
+
+    fn from_walked_symlink(
+        root: fs::File,
+        root_path: std::path::PathBuf,
+        relative: std::path::PathBuf,
+        path: &Path,
+        file: fs::File,
+        link_identity: StableLinkIdentity,
+    ) -> Result<Option<Self>> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            file,
+            path: path.to_path_buf(),
+            identity: snapshot(&metadata),
+            namespace: Some(WalkedNamespace {
+                root,
+                root_path,
+                relative,
+                leaf_symlink: Some(link_identity),
+            }),
+            direct_symlink: None,
         }))
     }
 
@@ -202,6 +317,40 @@ impl StableRegularFile {
 
     pub(crate) fn identity(&self) -> StableFileIdentity {
         self.identity
+    }
+
+    pub(crate) fn has_operator_symlink_leaf(&self) -> bool {
+        self.direct_symlink.is_some()
+            || self
+                .namespace
+                .as_ref()
+                .is_some_and(|namespace| namespace.leaf_symlink.is_some())
+    }
+
+    /// Canonical public name for the exact retained inode. This is used only
+    /// to discover small authority files adjacent to an operator-linked GGUF;
+    /// activation continues through the retained descriptor.
+    pub(crate) fn canonical_path_for_identity(&self) -> Result<Option<std::path::PathBuf>> {
+        if !self.is_stable()? {
+            return Ok(None);
+        }
+        // Resolve the name from the retained descriptor, not by following the
+        // mutable public symlink again. Otherwise a swap to a same-inode
+        // hardlink namespace could redirect adjacent receipt/pair-journal
+        // authority without changing the retained payload identity.
+        let canonical = match descriptor_identity_path(&self.file) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let metadata = match fs::symlink_metadata(&canonical) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+            _ => return Ok(None),
+        };
+        if snapshot(&metadata) != self.identity || !self.is_stable()? {
+            return Ok(None);
+        }
+        Ok(Some(canonical))
     }
 
     pub(crate) fn device_id(&self) -> u64 {
@@ -256,8 +405,11 @@ impl StableRegularFile {
         (&mut self.file)
             .take(maximum.saturating_add(1))
             .read_to_end(&mut bytes)?;
-        self.is_stable()
-            .map(|stable| (stable && bytes.len() as u64 == self.identity.length).then_some(bytes))
+        let result = self
+            .is_stable()
+            .map(|stable| (stable && bytes.len() as u64 == self.identity.length).then_some(bytes));
+        self.file.rewind()?;
+        result
     }
 
     pub(crate) fn is_stable(&self) -> Result<bool> {
@@ -273,6 +425,17 @@ impl StableRegularFile {
                 }
                 snapshot(&metadata)
             }
+            _ if self.direct_symlink.is_some() => {
+                let Some(reopened) =
+                    Self::open_operator_path_exact(&self.path, self.identity.length)?
+                else {
+                    return Ok(false);
+                };
+                if reopened.direct_symlink != self.direct_symlink {
+                    return Ok(false);
+                }
+                snapshot(&reopened.file.metadata()?)
+            }
             _ => match fs::symlink_metadata(&self.path) {
                 Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
                     snapshot(&metadata)
@@ -284,12 +447,25 @@ impl StableRegularFile {
     }
 
     pub(crate) fn sha256(&mut self) -> Result<Option<String>> {
-        self.sha256_with_hook(|| {})
+        self.sha256_with_progress(|_| {})
     }
 
+    #[cfg(test)]
     pub(crate) fn sha256_with_hook(
         &mut self,
         after_first_chunk: impl FnOnce(),
+    ) -> Result<Option<String>> {
+        let mut hook = Some(after_first_chunk);
+        self.sha256_with_progress(|_| {
+            if let Some(hook) = hook.take() {
+                hook();
+            }
+        })
+    }
+
+    pub(crate) fn sha256_with_progress(
+        &mut self,
+        mut after_chunk: impl FnMut(u64),
     ) -> Result<Option<String>> {
         use sha2::{Digest, Sha256};
 
@@ -297,7 +473,6 @@ impl StableRegularFile {
         let mut hasher = Sha256::new();
         let mut buffer = vec![0_u8; 1024 * 1024];
         let mut total = 0_u64;
-        let mut hook = Some(after_first_chunk);
         let mut limited = (&mut self.file).take(self.identity.length.saturating_add(1));
         loop {
             let read = limited.read(&mut buffer)?;
@@ -306,13 +481,13 @@ impl StableRegularFile {
             }
             hasher.update(&buffer[..read]);
             total = total.saturating_add(read as u64);
-            if let Some(hook) = hook.take() {
-                hook();
-            }
+            after_chunk(total);
         }
-        self.is_stable().map(|stable| {
+        let result = self.is_stable().map(|stable| {
             (stable && total == self.identity.length).then(|| hex::encode(hasher.finalize()))
-        })
+        });
+        self.file.rewind()?;
+        result
     }
 
     pub(crate) fn copy_and_hash(
@@ -335,16 +510,50 @@ impl StableRegularFile {
             hasher.update(&buffer[..read]);
             total = total.saturating_add(read as u64);
         }
-        self.is_stable().map(|stable| {
+        let result = self.is_stable().map(|stable| {
             (stable && total == self.identity.length)
                 .then(|| (total, hex::encode(hasher.finalize())))
-        })
+        });
+        self.file.rewind()?;
+        result
     }
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_identity_path(file: &fs::File) -> Result<std::path::PathBuf> {
+    fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(target_os = "macos")]
+fn descriptor_identity_path(file: &fs::File) -> Result<std::path::PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buffer = [0_i8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes to this live buffer and
+    // does not retain the pointer. The descriptor is owned for the call.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful F_GETPATH call returns one NUL-terminated path in
+    // the PATH_MAX-sized output buffer.
+    let bytes = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn descriptor_identity_path(file: &fs::File) -> Result<std::path::PathBuf> {
+    fs::read_link(format!("/dev/fd/{}", file.as_raw_fd()))
 }
 
 impl StableFileIdentity {
     pub(crate) fn same_inode(self, other: Self) -> bool {
         self.device == other.device && self.inode == other.inode
+    }
+
+    pub(crate) fn length(self) -> u64 {
+        self.length
     }
 }
 
@@ -352,14 +561,14 @@ pub(crate) fn regular_path_matches_identity(
     path: &Path,
     expected: StableFileIdentity,
 ) -> Result<bool> {
-    let Some(file) = StableRegularFile::open_exact(path, expected.length)? else {
+    let Some(file) = StableRegularFile::open_operator_path_exact(path, expected.length)? else {
         return Ok(false);
     };
     Ok(file.identity == expected && file.is_stable()?)
 }
 
 fn reopen_walked_path(namespace: &WalkedNamespace) -> Result<Option<fs::File>> {
-    use rustix::fs::{Mode, OFlags};
+    use rustix::fs::{AtFlags, Mode, OFlags};
 
     let root_now = match rustix::fs::open(
         &namespace.root_path,
@@ -384,6 +593,34 @@ fn reopen_walked_path(namespace: &WalkedNamespace) -> Result<Option<fs::File>> {
         if !last {
             flags |= OFlags::DIRECTORY;
         }
+        if last {
+            if let Some(expected_link) = namespace.leaf_symlink {
+                let before = match rustix::fs::statat(&directory, *name, AtFlags::SYMLINK_NOFOLLOW)
+                {
+                    Ok(metadata) => link_snapshot_stat(&metadata),
+                    Err(_) => return Ok(None),
+                };
+                if before != expected_link
+                    || before.mode & libc::S_IFMT as u32 != libc::S_IFLNK as u32
+                {
+                    return Ok(None);
+                }
+                let opened = match rustix::fs::openat(
+                    &directory,
+                    *name,
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => fs::File::from(fd),
+                    Err(_) => return Ok(None),
+                };
+                let after = match rustix::fs::statat(&directory, *name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(metadata) => link_snapshot_stat(&metadata),
+                    Err(_) => return Ok(None),
+                };
+                return Ok((after == before && opened.metadata()?.is_file()).then_some(opened));
+            }
+        }
         let opened = match rustix::fs::openat(&directory, *name, flags, Mode::empty()) {
             Ok(fd) => fs::File::from(fd),
             Err(_) => return Ok(None),
@@ -394,6 +631,43 @@ fn reopen_walked_path(namespace: &WalkedNamespace) -> Result<Option<fs::File>> {
         directory = opened;
     }
     Ok(None)
+}
+
+pub(crate) fn open_walked_operator_symlink(
+    root: fs::File,
+    root_path: std::path::PathBuf,
+    relative: std::path::PathBuf,
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> Result<Option<StableRegularFile>> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+
+    let before = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) => link_snapshot_stat(&metadata),
+        Err(_) => return Ok(None),
+    };
+    if before.mode & libc::S_IFMT as u32 != libc::S_IFLNK as u32 {
+        return Ok(None);
+    }
+    let file = match rustix::fs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fs::File::from(fd),
+        Err(_) => return Ok(None),
+    };
+    let target = file.metadata()?;
+    let after = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) => link_snapshot_stat(&metadata),
+        Err(_) => return Ok(None),
+    };
+    if before != after || !target.is_file() {
+        return Ok(None);
+    }
+    StableRegularFile::from_walked_symlink(root, root_path, relative, path, file, before)
 }
 
 pub(crate) fn walked_directory_is_current(
@@ -442,6 +716,16 @@ pub(crate) fn sha256_regular_nofollow_exact(
     expected_bytes: u64,
 ) -> Result<Option<String>> {
     let Some(mut file) = StableRegularFile::open_exact(path, expected_bytes)? else {
+        return Ok(None);
+    };
+    file.sha256()
+}
+
+pub(crate) fn sha256_operator_path_exact(
+    path: &Path,
+    expected_bytes: u64,
+) -> Result<Option<String>> {
+    let Some(mut file) = StableRegularFile::open_operator_path_exact(path, expected_bytes)? else {
         return Ok(None);
     };
     file.sha256()
@@ -556,6 +840,11 @@ mod tests {
         let mut opened = StableRegularFile::open_exact(&model, 17).unwrap().unwrap();
         fs::rename(&model, &prior_model).unwrap();
         fs::write(&model, b"other model bytes").unwrap();
+        assert_eq!(
+            fs::read(opened.activation_path().unwrap()).unwrap(),
+            b"exact model bytes",
+            "activation must reopen the retained inode, not the replaced pathname"
+        );
         assert!(opened.sha256().unwrap().is_none());
 
         let growing = directory.path().join("growing.gguf");
@@ -570,5 +859,82 @@ mod tests {
             })
             .unwrap();
         assert!(unstable.is_none(), "append during hash must fail bounded");
+    }
+
+    #[test]
+    fn retained_sha256_rewinds_after_a_shared_descriptor_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let projector = directory.path().join("mmproj.gguf");
+        let bytes = b"complete retained projector bytes";
+        fs::write(&projector, bytes).unwrap();
+        let expected = crate::core::sha256::compute_file_sha256(&projector).unwrap();
+        let mut retained = StableRegularFile::open_exact(&projector, bytes.len() as u64)
+            .unwrap()
+            .unwrap();
+        let mut shared = retained.try_clone().unwrap();
+        let mut prefix = [0_u8; 9];
+        shared.read_exact(&mut prefix).unwrap();
+
+        assert_eq!(
+            retained.sha256().unwrap().as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn direct_operator_file_symlink_retains_target_and_detects_retargeting() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.gguf");
+        let second = directory.path().join("second.gguf");
+        let link = directory.path().join("model.gguf");
+        fs::write(&first, b"first-model").unwrap();
+        fs::write(&second, b"other-model").unwrap();
+        symlink(&first, &link).unwrap();
+
+        let retained = StableRegularFile::open_operator_path_exact(&link, 11)
+            .unwrap()
+            .expect("direct file symlink");
+        assert_eq!(
+            fs::read(retained.activation_path().unwrap()).unwrap(),
+            b"first-model"
+        );
+        assert!(retained.is_stable().unwrap());
+
+        fs::remove_file(&link).unwrap();
+        symlink(&second, &link).unwrap();
+        assert!(!retained.is_stable().unwrap());
+        assert_eq!(
+            fs::read(retained.activation_path().unwrap()).unwrap(),
+            b"first-model",
+            "activation must remain pinned to the admitted target inode"
+        );
+    }
+
+    #[test]
+    fn descriptor_identity_path_cannot_be_redirected_to_a_hardlink_namespace_by_swap_restore() {
+        let original = tempfile::tempdir().unwrap();
+        let alternate = tempfile::tempdir().unwrap();
+        let target = original.path().join("model.gguf");
+        let alias = alternate.path().join("model.gguf");
+        let link = original.path().join("logical.gguf");
+        let parked_link = original.path().join("logical.parked");
+        fs::write(&target, b"same retained inode").unwrap();
+        fs::hard_link(&target, &alias).unwrap();
+        symlink(&target, &link).unwrap();
+        let retained = StableRegularFile::open_operator_path_exact(&link, 19)
+            .unwrap()
+            .unwrap();
+
+        fs::rename(&link, &parked_link).unwrap();
+        symlink(&alias, &link).unwrap();
+        fs::remove_file(&link).unwrap();
+        fs::rename(&parked_link, &link).unwrap();
+
+        let expected = target.canonicalize().unwrap();
+        assert_eq!(
+            retained.canonical_path_for_identity().unwrap().as_deref(),
+            Some(expected.as_path()),
+            "adjacent authority must stay in the descriptor's original target namespace"
+        );
     }
 }

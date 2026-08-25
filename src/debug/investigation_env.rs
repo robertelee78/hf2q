@@ -1063,7 +1063,7 @@ impl InvestigationEnv {
     ///   — they take effect but carry known caveats.
     /// - **DIAGNOSTICS:** read-only / timing toggles — listed for
     ///   visibility, no behavioral implication.
-    pub fn activate(&self) {
+    pub fn activate(&self, json_output: bool) {
         // Active ack-required (user set toggle AND ack was present).
         let mut active_unsafe: Vec<(&str, &str)> = Vec::new();
         if self.f16_kv {
@@ -1268,45 +1268,63 @@ impl InvestigationEnv {
             return;
         }
 
-        eprintln!();
-        eprintln!("hf2q: investigation-only environment variables detected");
-        eprintln!("      (not part of the shipping contract — see docs/shipping-contract.md)");
+        let mut lines = vec![
+            "hf2q: investigation-only environment variables detected".to_owned(),
+            "      (not part of the shipping contract — see docs/shipping-contract.md)".to_owned(),
+        ];
 
         if !active_unsafe.is_empty() {
-            eprintln!();
-            eprintln!("  UNSAFE (ack-required, activated):");
+            lines.push(String::new());
+            lines.push("  UNSAFE (ack-required, activated):".to_owned());
             for (name, note) in &active_unsafe {
-                eprintln!("    {name:<30}  {note}");
+                lines.push(format!("    {name:<30}  {note}"));
             }
         }
 
         if !refused.is_empty() {
-            eprintln!();
-            eprintln!("  REFUSED (ack-required, HF2Q_UNSAFE_EXPERIMENTS=1 not set):");
+            lines.push(String::new());
+            lines.push("  REFUSED (ack-required, HF2Q_UNSAFE_EXPERIMENTS=1 not set):".to_owned());
             for (name, note) in &refused {
-                eprintln!("    {name:<30}  {note}");
+                lines.push(format!("    {name:<30}  {note}"));
             }
-            eprintln!();
-            eprintln!("  The REFUSED toggles above are DISABLED for this run.");
+            lines.push(String::new());
+            lines.push("  The REFUSED toggles above are DISABLED for this run.".to_owned());
         }
 
         if !active_safe.is_empty() {
-            eprintln!();
-            eprintln!("  ACTIVE (investigation, safe):");
+            lines.push(String::new());
+            lines.push("  ACTIVE (investigation, safe):".to_owned());
             for (name, note) in &active_safe {
-                eprintln!("    {name:<30}  {note}");
+                lines.push(format!("    {name:<30}  {note}"));
             }
         }
 
         if !diagnostics.is_empty() {
-            eprintln!();
-            eprintln!("  DIAGNOSTICS (read-only / timing):");
+            lines.push(String::new());
+            lines.push("  DIAGNOSTICS (read-only / timing):".to_owned());
             for name in &diagnostics {
-                eprintln!("    {name}");
+                lines.push(format!("    {name}"));
             }
         }
-
-        eprintln!();
+        if json_output {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "level": "WARN",
+                    "target": "hf2q::debug::investigation_env",
+                    "fields": {
+                        "message": "investigation-only environment variables detected",
+                        "details": lines,
+                    }
+                })
+            );
+        } else {
+            eprintln!();
+            for line in lines {
+                eprintln!("{line}");
+            }
+            eprintln!();
+        }
     }
 }
 

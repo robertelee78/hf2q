@@ -543,8 +543,10 @@ The resulting contract is:
   model IDs and Hugging Face repository IDs remain valid even though local
   managed paths are suggested;
 - the standalone installer suppresses reconciliation in the temporary
-  candidate and invokes the stable installed binary after activation; Cargo
-  provisions on first invocation because Cargo has no post-install hook;
+  candidate and invokes an accepted, side-effect-light command on the stable
+  installed binary after activation; Cargo provisions on its first accepted
+  normal command because Cargo has no post-install hook. Clap help, version,
+  and parse-error exits remain protocol-clean and non-mutating;
 - automatic destinations require a non-root release binary proven as
   standalone- or Cargo-owned. Source/debug/unmanaged/ambiguous binaries are
   inert unless the caller gives completion-specific isolated destinations;
@@ -837,7 +839,8 @@ published bytes.
 ### Shell completion
 
 - A standalone install provisions against the stable installed binary, never
-  the temporary candidate; Cargo provisions on the first normal invocation.
+  the temporary candidate; Cargo provisions on the first accepted normal
+  command. Help, version, and parse-error exits remain non-mutating.
 - Bash 3.2 and Zsh 5.9 literal dispatch execute the generated adapters and
   return public command candidates. Static and direct dynamic Bash, Elvish,
   Fish, PowerShell, and Zsh requests contain no hidden surface.
@@ -850,13 +853,16 @@ published bytes.
   surfaces. Repository-ID-only `cache clear --model` is not given local-path
   candidates. Decoder completion excludes conventional mmproj filenames and
   projector completion excludes decoder filenames.
-- Completion requests produce stdout-only protocol data and perform no
-  reconciliation. Ordinary source/debug runs without explicit destinations
-  perform no completion or startup writes.
+- Dynamic completion protocol requests produce stdout-only data and perform no
+  reconciliation. Package-owned static snapshots use the documented opt-out;
+  ordinary source/debug runs without explicit destinations perform no
+  completion or startup writes.
 - Reconciliation is idempotent, handles broken pipes as success, preserves
   foreign/symlink/non-regular/racing targets, and records exact ownership.
 - Update, rollback, and uninstall tests prove refresh or exact cleanup;
-  modified artifacts survive and are named to the operator.
+  modified artifacts survive and are named to the operator. The rollback
+  regression is included in the published crate and runs against the unpacked
+  release artifact, not only the source worktree.
 
 ### Traceability
 

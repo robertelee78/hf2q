@@ -51,6 +51,8 @@ registry (`src/arch/`). Conversion-family implementations live under
 ```
 hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/main.rs          process entry, exit-code classification
+├── src/operator_ui.rs   global exact-SVG-derived brand emitter:
+│                        Kitty/iTerm2/ANSI, stderr-only and scrollback-safe
 ├── src/lib.rs           narrow library facade (kv-persist only,
 │                        for tests under `tests/`)
 ├── src/cli.rs           clap derive — every subcommand + arg
@@ -58,7 +60,7 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 ├── src/chat/            ADR-047 diagnostic terminal client: discovery,
 │                        OpenAI SSE, session transcript, explicit model
 │                        activation, receipt-backed local/hosted GGUF
-│                        selection, telemetry, and
+│                        selection, typed startup-event telemetry, and
 │                        process-group/parent-lifetime child supervision
 ├── src/setup/           `hf2q setup` host inventory, strict operator-default
 │                        schema/loader, interactive policy, and private
@@ -518,6 +520,31 @@ every new arch paid pre-`src/arch/`. The canonical reference is
   request exposes family-local identity, slot, phase, cache/new-token split,
   prefill completion/rate/ETA, and decode rate without exposing prompt or tool
   contents. Pipes, CI, services, and JSON logging retain plain output.
+- **Global brand.** `--terminal-graphics auto|kitty|iterm2|ansi|off` renders
+  deterministic raster assets compiled from the exact packaged hf2q.us
+  `head.svg` once on interactive stderr. cmux uses its Ghostty/Kitty raster
+  path; Alacritty and Apple Terminal use a source-derived ANSI half-block
+  raster; `off` suppresses the entire banner. This surface never enters raw or
+  alternate-screen mode, never rerasterizes at process start, and never
+  touches stdout protocol data. Redirection of either data stream suppresses
+  the banner rather than leaking branding beside piped output.
+- **Owned-chat startup.** A private bounded Unix datagram channel carries
+  typed, non-authoritative local-search, verification, download/conversion,
+  load/warmup, projector, text-only-fallback, and ready-adjacent milestones.
+  READY authority remains on the distinct inherited lifeline socket and is
+  accepted only after HTTP verification. Closed/backpressured presentation is
+  fail-open for model preparation; malformed or oversized events are ignored.
+- **Direct-serve startup.** The same typed milestones drive one scrollback-safe
+  stderr row until requested model preparation completes (if any) and the HTTP
+  listener is bound. A
+  bounded tracing buffer prevents logs from painting through that row; the row
+  is cleared with the truthful `listener bound; starting HTTP service` state,
+  buffered logs are flushed, and only then may the long-lived alternate-screen
+  dashboard take ownership. The dashboard remains in a starting state until
+  the concurrently polled HTTP service answers an authenticated `/health`
+  request. Direct serve never labels the endpoint verified
+  before `axum::serve` begins polling; owned chat performs the HTTP health
+  verification in its parent process.
 - **Progress.** `indicatif` bars at convert time; suppressed when
   stderr is not a TTY.
 - **Metrics.** Prometheus exposition on `GET /metrics` covering

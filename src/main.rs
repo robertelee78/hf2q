@@ -27,6 +27,7 @@ pub mod intelligence;
 pub mod ir;
 mod model_spec;
 pub mod models;
+mod operator_ui;
 pub mod progress;
 pub mod quantize;
 mod serve;
@@ -37,8 +38,6 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::error;
-
 use cli::{Cli, Command};
 
 /// Exit codes.
@@ -101,23 +100,23 @@ fn main() -> ExitCode {
 
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
 
-    // Proven standalone/Cargo release installations keep their owned Bash,
-    // Zsh, and Fish adapters synchronized with this exact binary. Other
-    // binaries require explicit isolated destinations; protocol calls never
-    // reconcile.
-    cli::completion_install::reconcile(&raw_args);
-    cli::completion_install::report_outcome();
-
     let cli = match Cli::try_parse_from(raw_args) {
         Ok(cli) => cli,
         Err(error) => {
             // Preserve the established diagnostics contract for Clap's early
             // --help/--version/error exits. Valid commands initialize typed
             // overrides below before this read-once snapshot is activated.
-            debug::INVESTIGATION_ENV.activate();
+            debug::INVESTIGATION_ENV.activate(false);
             error.exit();
         }
     };
+
+    // Proven standalone/Cargo release installations keep their owned Bash,
+    // Zsh, and Fish adapters synchronized with this exact binary. Reconcile
+    // only after Clap accepts a real command: --help/--version/error exits
+    // must neither mutate shell state nor consume the one activation notice.
+    let accepted_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    cli::completion_install::reconcile(&accepted_args);
 
     // Apply the typed generate override before the read-once investigation
     // snapshot initializes. Clap has already validated the value set.
@@ -130,7 +129,7 @@ fn main() -> ExitCode {
 
     // Emit one-shot warning / ack-gate summary for development-only env
     // controls. Real operator flags are already typed above.
-    debug::INVESTIGATION_ENV.activate();
+    debug::INVESTIGATION_ENV.activate(matches!(cli.log_format, cli::LogFormat::Json));
 
     // Logging subscriber init. Priority:
     //   1. --log-level (explicit) overrides everything.
@@ -174,16 +173,47 @@ fn main() -> ExitCode {
         }
     }
 
+    // One global, scrollback-safe operator banner. It is suppressed for
+    // protocol/structured/non-interactive paths and for quiet owned children.
+    operator_ui::print_global_banner(&cli);
+
+    // Completion reconciliation can produce human-actionable notices. Keep
+    // them out of Clap's protocol-clean early exits and JSON log streams.
+    if matches!(cli.log_format, cli::LogFormat::Text) {
+        cli::completion_install::report_outcome();
+    }
+
+    let log_format = cli.log_format;
     match run(cli) {
         Ok(()) => ExitCode::from(EXIT_SUCCESS),
         Err(AppError::ReportedInput) => ExitCode::from(EXIT_INPUT_ERROR),
         Err(app_err) => {
             let exit_code = app_err.exit_code();
-            error!("{}", app_err);
-            eprintln!("Error: {}", app_err);
+            match log_format {
+                cli::LogFormat::Text => eprintln!("Error: {}", app_err),
+                cli::LogFormat::Json => emit_terminal_json_error(&app_err, exit_code),
+            }
             ExitCode::from(exit_code)
         }
     }
+}
+
+/// Emit the terminal command failure independently of the tracing filter.
+///
+/// `--log-format json` is a machine protocol: even `RUST_LOG=off` must leave
+/// one parseable, nonzero-exit diagnostic instead of suppressing the only
+/// explanation for failure.
+fn emit_terminal_json_error(error: &AppError, exit_code: u8) {
+    let diagnostic = serde_json::json!({
+        "level": "ERROR",
+        "target": "hf2q",
+        "fields": {
+            "message": "hf2q command failed",
+            "error": error.to_string(),
+            "exit_code": exit_code,
+        }
+    });
+    eprintln!("{diagnostic}");
 }
 
 fn run(cli: Cli) -> Result<(), AppError> {
@@ -205,15 +235,29 @@ fn run(cli: Cli) -> Result<(), AppError> {
         }),
         Command::GgufPatch(args) => cmd_gguf_patch(args),
         Command::Info(args) => {
+            let report_rejection = matches!(log_format, cli::LogFormat::Text);
             let operator_config = match load_operator_config(state_root.as_deref()) {
                 Ok(config) => config,
                 Err(error) => {
-                    serve::print_info_early_rejection(&args.model, &error.to_string());
-                    return Err(AppError::ReportedInput);
+                    if report_rejection {
+                        serve::print_info_early_rejection(&args.model, &error.to_string());
+                        return Err(AppError::ReportedInput);
+                    }
+                    return Err(error);
                 }
             };
-            serve::cmd_info(args, operator_config.as_ref().map(|config| &config.serve))
-                .map_err(|_| AppError::ReportedInput)
+            serve::cmd_info(
+                args,
+                operator_config.as_ref().map(|config| &config.serve),
+                report_rejection,
+            )
+            .map_err(|error| {
+                if report_rejection {
+                    AppError::ReportedInput
+                } else {
+                    AppError::Input(error)
+                }
+            })
         }
         Command::SourceTeacher(args) => cmd_source_teacher(args),
         Command::SourceTeacherReference(args) => cmd_source_teacher_reference(args),

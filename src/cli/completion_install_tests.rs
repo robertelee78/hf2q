@@ -10,6 +10,7 @@ fn public_filter_removes_every_internal_command_and_argument_record() {
         "source-teacher-reference",
         "source-teacher-acceptance-verify",
         "--chat-parent-lifeline-fd",
+        "--chat-startup-progress-fd",
     ] {
         assert!(!public_record(hidden), "{hidden} leaked");
         assert!(

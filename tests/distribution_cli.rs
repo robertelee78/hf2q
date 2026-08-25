@@ -92,7 +92,7 @@ fn standalone_uninstall_preview_and_explicit_purge_are_exact() {
     private_file(&cache_root.join("locks/preserve.lock"), b"lock");
     private_file(&cache_root.join("operator-note"), b"preserve cache\n");
 
-    let completion_activation = run(&installed, &["--version"], &cache_root);
+    let completion_activation = run(&installed, &["serve", "list"], &cache_root);
     assert!(
         completion_activation.status.success(),
         "completion activation failed: {}",
@@ -190,7 +190,7 @@ fn standalone_uninstall_preview_and_explicit_purge_are_exact() {
     );
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(cache_root.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["schema_version"], 3);
     assert_eq!(manifest["models"], serde_json::json!({}));
 }
 
@@ -225,7 +225,7 @@ fn standalone_uninstall_preserves_and_reports_modified_completion() {
     let installed = install_dir.join("hf2q");
     let cache_root = temp_root.join("cache");
     private_dir(&cache_root);
-    let provision = run(&installed, &["--version"], &cache_root);
+    let provision = run(&installed, &["serve", "list"], &cache_root);
     assert!(provision.status.success(), "{provision:?}");
     let completion_home = temp_root.join("completion-home");
     let bash = completion_home.join("bash/completions/hf2q");
@@ -284,7 +284,7 @@ fn standalone_rollback_rebuilds_completion_from_the_restored_binary() {
     let installed = install_dir.join("hf2q");
     let cache_root = temp_root.join("cache");
     private_dir(&cache_root);
-    let provision = run(&installed, &["--version"], &cache_root);
+    let provision = run(&installed, &["serve", "list"], &cache_root);
     assert!(provision.status.success(), "{provision:?}");
 
     let completion_home = temp_root.join("completion-home");
@@ -306,8 +306,10 @@ fn standalone_rollback_rebuilds_completion_from_the_restored_binary() {
     for path in &registrations {
         assert!(
             path.is_file(),
-            "rollback did not recreate {}",
-            path.display()
+            "rollback did not recreate {}: stdout={} stderr={}",
+            path.display(),
+            String::from_utf8_lossy(&rollback.stdout),
+            String::from_utf8_lossy(&rollback.stderr)
         );
     }
     assert!(completion_home.join(".zshrc").is_file());

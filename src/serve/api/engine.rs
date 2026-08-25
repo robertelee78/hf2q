@@ -2476,6 +2476,22 @@ impl LoadedModel {
             LoadedModel::Deepseek4(d) => &d.model_id,
         }
     }
+
+    /// Replace a filename-derived fallback ID before `Engine::spawn` captures
+    /// model registration and moves the loaded model into its worker. Byte
+    /// access remains bound to `model_path`; only the operator identity used
+    /// for family/tool/reasoning routing comes from the stable logical path.
+    pub(crate) fn apply_operator_model_id(&mut self, logical_path: &Path) {
+        let Some(model_id) = operator_model_id_for_retained_path(true, logical_path) else {
+            return;
+        };
+        match self {
+            LoadedModel::Gemma(model) => model.model_id = model_id,
+            LoadedModel::Qwen35(model) => model.model_id = model_id,
+            LoadedModel::Qwen3VlText(model) => model.model_id = model_id,
+            LoadedModel::Deepseek4(model) => model.model_id = model_id,
+        }
+    }
     pub fn context_length(&self) -> Option<usize> {
         match self {
             LoadedModel::Gemma(g) => g.context_length,
@@ -2612,6 +2628,18 @@ impl LoadedModel {
             LoadedModel::Deepseek4(_) => None,
         }
     }
+}
+
+fn operator_model_id_for_retained_path(
+    filename_fallback: bool,
+    logical_path: &Path,
+) -> Option<String> {
+    if !filename_fallback {
+        return None;
+    }
+    logical_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
 }
 
 /// Generation-affecting parameters that must all match for a cache hit.
@@ -5093,6 +5121,21 @@ impl Engine {
     /// Unified load snapshot for this engine.
     pub fn info(&self) -> &LoadInfo {
         &self.inner.info
+    }
+
+    /// Replace only the immutable operator-facing load snapshot path after
+    /// loading through a retained descriptor. The worker keeps the retained
+    /// `/dev/fd` path as its byte authority; banners and APIs show the stable
+    /// logical model location selected by the operator.
+    pub(crate) fn with_operator_model_path(mut self, logical_path: &Path) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("newly loaded engine is uniquely owned before pool publication");
+        let info = Arc::make_mut(&mut inner.info);
+        info.model_path = logical_path.to_path_buf();
+        info.on_disk_bytes = std::fs::metadata(logical_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(info.on_disk_bytes);
+        self
     }
 
     pub fn vision_consumer_contract(&self) -> Option<VisionConsumerContract> {
@@ -29669,6 +29712,24 @@ mod gemma4_tiny_prefill_tests;
 mod tests {
     use super::super::schema::{ChatMessage, ContentPart, ImageUrl, MessageContent};
     use super::*;
+
+    #[test]
+    fn retained_no_general_name_uses_logical_id_for_tool_registration() {
+        let logical = Path::new("/models/jenerallee78/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf");
+        let model_id = operator_model_id_for_retained_path(true, logical)
+            .expect("descriptor-derived fallback must be replaced before spawn");
+        let registration = super::super::registry::find_for(&model_id)
+            .expect("logical Qwen3.8 identity must select its family registration");
+
+        assert_eq!(model_id, "Qwen3.8-27B-Abliterated-SFT-Q4_K_M");
+        assert_eq!(registration.family, "qwen35");
+        assert!(registration.has_reasoning());
+        assert!(registration.has_tools());
+        assert!(
+            operator_model_id_for_retained_path(false, logical).is_none(),
+            "embedded general.name remains authoritative"
+        );
+    }
 
     #[test]
     fn gemma_padding_is_a_generation_stop_without_becoming_eos() {

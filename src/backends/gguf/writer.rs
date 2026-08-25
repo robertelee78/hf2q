@@ -41,7 +41,7 @@
 use std::io::{Seek, SeekFrom, Write};
 
 use super::types::{
-    ALIGNMENT, GGUF_MAGIC, GGUF_VERSION, MetaValue, align_up, write_gguf_string, write_metadata_kv,
+    align_up, write_gguf_string, write_metadata_kv, MetaValue, ALIGNMENT, GGUF_MAGIC, GGUF_VERSION,
 };
 use crate::quantize::ggml_quants::GgmlType;
 

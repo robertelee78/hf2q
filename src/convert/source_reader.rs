@@ -43,7 +43,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
-use safetensors::{SafeTensors, tensor::Dtype};
+use safetensors::{tensor::Dtype, SafeTensors};
 
 use crate::convert::source_dtype::{fp8, mxfp4};
 use crate::core::mlx_safetensors_loader::{discover_shards, read_floats_to_f32};

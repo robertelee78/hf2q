@@ -210,7 +210,8 @@ pub struct LoadInfo {
     pub arch_str: String,
     /// Coarse dispatch bucket — see [`ArchFamily`].
     pub arch_family: ArchFamily,
-    /// Filesystem path to the GGUF actually opened.
+    /// Stable operator-facing GGUF path. Retained structural activation may
+    /// open the same inode through `/dev/fd/N` without exposing that alias.
     pub model_path: PathBuf,
     /// On-disk GGUF size in bytes, as reported by
     /// `std::fs::metadata(...).len()`.
