@@ -435,7 +435,12 @@ keeps explicit help/version, malformed arguments, redirected output, CI,
 completion, and structured paths clean. The accepted packed-binary proof pins
 Apple Terminal and Alacritty to source-derived ANSI pixels, pins cmux to Kitty,
 extracts the cmux PNG and matches its SHA-256 to the compiled exact-rabbit
-asset, and rejects alternate-screen entry on every branded path.
+asset, and rejects alternate-screen entry on every branded path. The first
+corrective PR gate (Actions run `32805771272`) then rejected stale `v0.1.16`
+declarations in the README and shipping contract even though all Rust tests
+shown before the assertion passed. The v0.1.17 candidate therefore updates
+those authoritative release declarations in the same correction and must pass
+that hosted shipping-contract assertion before merge.
 
 ### 8. Concurrency and failure safety
 
