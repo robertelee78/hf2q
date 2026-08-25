@@ -139,6 +139,22 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --locked
 
+      # Run the packed/public binary's complete PTY contract before audit and
+      # the long hosted-safe suite. Conflicting outer color preferences prove
+      # that the smoke owns its terminal environment rather than inheriting
+      # whichever branch a developer shell happened to select.
+      - name: Frictionless exact-binary preflight
+        shell: bash
+        env:
+          NO_COLOR: "1"
+          CLICOLOR: "0"
+          CLICOLOR_FORCE: "1"
+          FORCE_COLOR: "1"
+        run: |
+          bash scripts/test_frictionless_binary.sh \
+            "$GITHUB_WORKSPACE/target/release/hf2q" \
+            "$RUNNER_TEMP/hf2q-pr-frictionless"
+
       - name: cargo audit
         run: |
           cargo install cargo-audit --locked --version 0.22.2 --no-default-features

@@ -456,6 +456,24 @@ test drives `/usr/bin/false` through the inventory phase and proves that the
 diagnostic survives. The protected release must be rerun from a new exact
 merged-main SHA; a passing local retry alone cannot activate v0.1.17.
 
+That retry (Actions run `32814223369`, exact merged-main SHA
+`55d88d0ddfeeb325b1639103e672bc6ffb78001a`) failed in the newly identified
+`terminal-banner-matrix` phase. Its retained packed-artifact capture contained
+the correct rabbit and command overview, but Clap's styled PTY output inserted
+SGR controls between `Usage:` and `hf2q`; the smoke incorrectly searched the
+raw capture for the contiguous bytes `Usage: hf2q`. The developer shell had
+`NO_COLOR=1`, so the same raw-byte assertion passed locally. Removing that
+variable reproduced the hosted failure against the already-built artifact and
+falsified the hypothesis that the runner or product output was intermittent.
+
+Terminal proof is therefore hermetic and split by concern. PTY helpers remove
+ambient color controls, the matrix explicitly exercises styled and
+`NO_COLOR` Clap branches, semantic text assertions strip CSI presentation
+controls, and protocol assertions continue to inspect raw bytes. Every PR runs
+this exact release-binary journey immediately after `cargo build --release`,
+before audit and the long hosted-safe suite; the protected release is final
+confirmation rather than first discovery for this class of failure.
+
 ### 8. Concurrency and failure safety
 
 Per-repository/revision/quant locks cover adoption, download, conversion, and
