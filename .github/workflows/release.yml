@@ -141,8 +141,10 @@ jobs:
               scripts/verify_standalone_candidate.sh \
               scripts/sign_notarize_standalone_release.sh \
               scripts/test_standalone_release_signing_contract.sh \
-              scripts/test_standalone_installer.sh
-            bash -n scripts/test_frictionless_binary.sh
+              scripts/test_standalone_installer.sh \
+              scripts/test_frictionless_binary.sh \
+              scripts/test_frictionless_diagnostics_contract.sh
+            bash scripts/test_frictionless_diagnostics_contract.sh
             bash scripts/test_release_dependency_provenance_contract.sh
             HF2Q_BIN="$package_root/target/debug/hf2q" \
               scripts/test_standalone_installer.sh
@@ -272,6 +274,7 @@ jobs:
             "$setup_config_sha"
           test "$(shasum -a 256 "$proof_state/models/model.gguf" | awk '{print $1}')" = \
             "$model_sha"
+
           echo "STANDALONE_STAGE=$standalone_stage" >> "$GITHUB_ENV"
 
       - name: Create draft release and attach exact assets once
@@ -535,3 +538,12 @@ jobs:
             "$setup_config_sha"
           test "$(shasum -a 256 "$proof_state/models/model.gguf" | awk '{print $1}')" = \
             "$model_sha"
+
+      - name: Upload frictionless smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: frictionless-smoke-${{ github.run_id }}
+          path: ${{ runner.temp }}/hf2q-*frictionless.*
+          if-no-files-found: warn
+          retention-days: 7

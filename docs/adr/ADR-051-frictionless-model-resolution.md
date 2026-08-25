@@ -442,6 +442,20 @@ shown before the assertion passed. The v0.1.17 candidate therefore updates
 those authoritative release declarations in the same correction and must pass
 that hosted shipping-contract assertion before merge.
 
+The first protected v0.1.17 release attempt (Actions run `32809448201`) passed
+the exact-SHA CI binding, package, audit, signed candidate, and notarization
+stages, then failed closed in the packed installed-binary smoke before any tag,
+release, or registry mutation. The original smoke used bare `set -e`
+assertions, so the hosted log identified neither the failing phase nor the
+command; the same Cargo-installed artifact path passed locally both with and
+without `CI=1`. The reformulated release-gate requirement is fail-closed *and*
+evidence-preserving: every frictionless smoke names its active phase, reports
+the exact failed line, status, and command, retains its isolated files on
+failure, and the release workflow uploads those files. A negative contract
+test drives `/usr/bin/false` through the inventory phase and proves that the
+diagnostic survives. The protected release must be rerun from a new exact
+merged-main SHA; a passing local retry alone cannot activate v0.1.17.
+
 ### 8. Concurrency and failure safety
 
 Per-repository/revision/quant locks cover adoption, download, conversion, and

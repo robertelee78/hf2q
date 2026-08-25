@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Exact-binary, no-network smoke for the frictionless repository UX.
-set -euo pipefail
+set -Eeuo pipefail
 
 if [[ $# -ne 2 ]]; then
   echo "usage: $0 <hf2q-binary> <temporary-root-prefix>" >&2
@@ -13,7 +13,33 @@ test -x "$binary"
 binary_dir=$(cd "$(dirname "$binary")" && pwd -P)
 binary="$binary_dir/$(basename "$binary")"
 test_root=$(mktemp -d "${root_prefix}.XXXXXX")
-trap 'rm -rf -- "$test_root"' EXIT
+current_phase=bootstrap
+
+report_error() {
+  local exit_code=$?
+  local line=${1:-unknown}
+  local command=${2:-unknown}
+
+  # Expected non-zero commands are run with errexit disabled so their exit
+  # status can be asserted explicitly below.
+  [[ $- == *e* ]] || return 0
+
+  printf 'frictionless smoke failed: phase=%s line=%s status=%s command=%q\n' \
+    "$current_phase" "$line" "$exit_code" "$command" >&2
+}
+
+cleanup() {
+  local exit_code=$?
+  if [[ $exit_code -eq 0 ]]; then
+    rm -rf -- "$test_root"
+  else
+    echo "frictionless smoke diagnostics retained at $test_root" >&2
+    find "$test_root" -maxdepth 2 -type f -print >&2 || true
+  fi
+}
+
+trap 'report_error "$LINENO" "$BASH_COMMAND"' ERR
+trap cleanup EXIT
 mkdir -p "$test_root/home" "$test_root/data" "$test_root/cache" \
   "$test_root/state" "$test_root/server-state"
 printf 'this = [is not toml\n' > "$test_root/state/config.toml"
@@ -27,6 +53,7 @@ run_isolated() {
     "$binary" "$@"
 }
 
+current_phase=local-inventory
 run_isolated --state-root "$test_root/state" serve list \
   > "$test_root/serve.list"
 run_isolated --state-root "$test_root/state" chat list \
@@ -36,6 +63,7 @@ test ! -e "$test_root/data/hf2q/models"
 
 # A redirected bare invocation remains a clean Clap diagnostic: no graphics
 # or wordmark leak into either output stream.
+current_phase=redirected-bare-invocation
 set +e
 run_isolated > "$test_root/bare.stdout" 2> "$test_root/bare.stderr"
 bare_redirected_exit=$?
@@ -49,6 +77,7 @@ grep -Fq 'Usage: hf2q' "$test_root/bare.stderr"
 # Exercise the exact installed artifact through a real macOS PTY. The global
 # rabbit banner is scrollback-safe and must never enter the alternate screen;
 # every structured/noninteractive suppression branch stays banner-free.
+current_phase=terminal-banner-matrix
 pty_run() {
   local output=$1
   shift
@@ -192,6 +221,7 @@ HF2Q_PTY_BIN="$binary" HF2Q_PTY_STDERR="$test_root/redirected.stderr" \
 # startup row, post-poll HTTP readiness transition, alternate-screen
 # dashboard, SIGINT drain, and one-time terminal restoration. No model bytes,
 # network, or Metal device are needed for this lifecycle proof.
+current_phase=dashboard-sigint-lifecycle
 HF2Q_PTY_BIN="$binary" \
 HF2Q_PTY_CAPTURE="$test_root/dashboard.pty" \
 HF2Q_PTY_PIDFILE="$test_root/dashboard.pid" \
@@ -250,6 +280,7 @@ if kill -0 "$dashboard_pid" 2>/dev/null; then
 fi
 
 # The API-triggered normal shutdown path has a separate restoration contract.
+current_phase=dashboard-api-shutdown
 HF2Q_PTY_BIN="$binary" \
 HF2Q_PTY_CAPTURE="$test_root/dashboard-shutdown.pty" \
 HF2Q_PTY_PIDFILE="$test_root/dashboard-shutdown.pid" \
@@ -310,6 +341,7 @@ fi
 
 # Owned chat preparation is scrollback-only, even when offline resolution
 # fails. It must never take alternate-screen ownership from the chat client.
+current_phase=offline-chat-startup
 pty_run "$test_root/chat-startup-failure.pty" \
   "$binary" --terminal-graphics off --state-root "$test_root/server-state" \
     chat owner/model:Q4_K_M || true
@@ -319,7 +351,9 @@ grep -aEq 'Inspecting local (model stores|stores for owner/model)|chat-started h
   "$test_root/chat-startup-failure.pty"
 
 for command in serve chat convert; do
+  current_phase="help-${command}"
   run_isolated "$command" owner/model:Q4_K_M --help >/dev/null
   run_isolated "$command" owner/model --help >/dev/null
 done
+current_phase=final-cache-invariant
 test ! -e "$test_root/data/hf2q/models"
