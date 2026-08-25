@@ -47,6 +47,10 @@ require_literal "$guide" "hf2q chat"
 # Multimodal is served and proven with one simple image request.
 require_literal "$guide" "image_url"
 require_literal "$guide" "grep -i red"
+# A failed pasteable proof must not exit the reader's interactive shell.
+require_literal "$guide" $'(\nRED_PNG="'
+require_literal "$guide" $'echo "vision check passed: $MODEL_ID saw red"\n)'
+require_literal "$guide" "without closing your terminal"
 # Full Agentic Kit: machine + project setup, OpenCode host wiring, then
 # converge-and-verify. --minimal is never presented as equivalent.
 require_literal "$guide" "ak setup"

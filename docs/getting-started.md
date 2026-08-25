@@ -93,9 +93,12 @@ instead of transferring or hashing the full payload again.
 
 ## 5. Prove vision with one request
 
-Still in terminal 2:
+Still in terminal 2, after `/quit` returns you to the shell. The surrounding
+parentheses run this check in a subshell, so a failed proof reports its error
+without closing your terminal:
 
 ```bash
+(
 RED_PNG="iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC"
 MODEL_ID="$(curl -fsS http://127.0.0.1:8081/v1/models |
   jq -r '[.data[] | select(.loaded == true) | .id] | first // ""')"
@@ -118,6 +121,7 @@ echo "$RESPONSE" | jq -er '.choices[0].message.content' | grep -i red || {
   exit 1
 }
 echo "vision check passed: $MODEL_ID saw red"
+)
 ```
 
 It must end with `vision check passed`. If it does, text, streaming, and
