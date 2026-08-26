@@ -12,8 +12,15 @@ set -euo pipefail
 # semantically exact, and non-inferior.
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [[ ${HF2Q_GEMMA_B2_GATE_ISOLATED:-0} != 1 ]]; then
+    exec "$script_dir/run_release_gate_process_group.sh" env \
+        HF2Q_GEMMA_B2_GATE_ISOLATED=1 "$0" "$@"
+fi
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$script_dir/macos_thermal_guard.sh"
+readonly HOST_CONTENTION_GATE_OWNER_PID=$$
+host_contention_require_isolated_gate_owner \
+    "$HOST_CONTENTION_GATE_OWNER_PID"
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 # shellcheck source=scripts/qwen38_matched_reference_contract.sh
@@ -900,20 +907,24 @@ run_all() {
 }
 
 thermal_prepare_probe
-qwen36_start_power_guard "$$" "$OUT_DIR/caffeinate.log"
+qwen36_start_power_guard "$HOST_CONTENTION_GATE_OWNER_PID" \
+    "$OUT_DIR/caffeinate.log"
 power_guard_started=true
 thermal_wait_for_nominal "$settle_log" adr049-b2-gemma-ab-settle \
     "$THERMAL_SETTLE_SECONDS" 900 5 \
-    "$contention_settle_log" "$$"
+    "$contention_settle_log" "$HOST_CONTENTION_GATE_OWNER_PID"
 thermal_sample "$measurement_log" adr049-b2-gemma-ab-start
-host_contention_sample "$contention_measurement_log" adr049-b2-gemma-ab-start "$$" "$THERMAL_SAMPLED_AT"
+host_contention_sample "$contention_measurement_log" \
+    adr049-b2-gemma-ab-start "$HOST_CONTENTION_GATE_OWNER_PID" \
+    "$THERMAL_SAMPLED_AT"
 host_contention_require_quiet adr049-b2-gemma-ab-start
 run_all &
 producer_pid=$!
 monitor_status=0
 thermal_monitor_fair_or_better_while_pid "$measurement_log" \
     adr049-b2-gemma-ab-measurement "$producer_pid" "$THERMAL_SAMPLE_SECONDS" \
-    "$contention_measurement_log" "$$" || monitor_status=$?
+    "$contention_measurement_log" "$HOST_CONTENTION_GATE_OWNER_PID" \
+    || monitor_status=$?
 if ((monitor_status != 0)); then
     kill -TERM "$producer_pid" 2>/dev/null || true
     wait "$producer_pid" 2>/dev/null || true
@@ -928,7 +939,9 @@ producer_pid=""
     exit "$producer_status"
 }
 thermal_sample "$measurement_log" adr049-b2-gemma-ab-end
-host_contention_sample "$contention_measurement_log" adr049-b2-gemma-ab-end "$$" "$THERMAL_SAMPLED_AT"
+host_contention_sample "$contention_measurement_log" \
+    adr049-b2-gemma-ab-end "$HOST_CONTENTION_GATE_OWNER_PID" \
+    "$THERMAL_SAMPLED_AT"
 host_contention_require_quiet adr049-b2-gemma-ab-end
 assert_identity
 qwen36_assert_power_guard
@@ -942,6 +955,11 @@ jq -n --slurpfile processes "$process_bindings" \
     --argjson model_bytes "$EXPECTED_MODEL_BYTES" --arg model_snapshot "$model_snapshot" \
     --arg launcher_path "$launcher" --arg launcher_sha "$launcher_sha256" \
     --arg power_mode "$power_mode" --arg power_mode_code "$power_mode_code" \
+    --arg host_contention_policy "$HOST_CONTENTION_POLICY" \
+    --argjson host_contention_max_foreign_cpu_percent \
+      "$HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT" \
+    --argjson host_contention_owner_pgid \
+      "$HOST_CONTENTION_GATE_OWNER_PID" \
     --argjson min_lower_speedup "$MIN_LOWER_95_SPEEDUP" \
     --argjson max_fallback_regression "$MAX_FALLBACK_PRODUCT_REGRESSION" \
     --arg model_verification_sha "$model_verification_sha256" \
@@ -986,7 +1004,11 @@ jq -n --slurpfile processes "$process_bindings" \
         operator_launcher_path:$launcher_path,operator_launcher_sha256:$launcher_sha},
       environment:{power:"ac",power_mode:$power_mode,power_mode_code:$power_mode_code,
         thermal:"nominal-settle-and-fair-or-better-measurement",
-        host_contention:"quiet",clean_process_environment:true},
+        host_contention:{policy:$host_contention_policy,
+          maximum_foreign_cpu_percent:$host_contention_max_foreign_cpu_percent,
+          owner_scope:"release-gate-process-group",
+          owner_pgid:$host_contention_owner_pgid,continuous:true},
+        clean_process_environment:true},
       processes:$processes,
       files:{samples:{path:"samples.jsonl",sha256:$samples_sha},
         model_verification:{path:"model-verification.json",sha256:$model_verification_sha},

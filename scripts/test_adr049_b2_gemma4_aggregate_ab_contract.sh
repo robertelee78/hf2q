@@ -41,7 +41,13 @@ grep -Fq "minimum_fallback_lower_95_ratio_exclusive:(1 / \$max_fallback_regressi
 grep -Fq 'order_stratified_bootstrap_samples:10000' "$runner"
 grep -Fq "\"\$launcher\"" "$runner"
 grep -Fq "env -i PATH=\"\$RUNTIME_PATH\"" "$runner"
-grep -Fq 'qwen36_start_power_guard "$$"' "$runner"
+# shellcheck disable=SC2016
+grep -Fq 'qwen36_start_power_guard "$HOST_CONTENTION_GATE_OWNER_PID"' "$runner"
+grep -Fq 'HF2Q_GEMMA_B2_GATE_ISOLATED=1' "$runner"
+grep -Fq 'host_contention_require_isolated_gate_owner' "$runner"
+grep -Fq 'owner_scope:"release-gate-process-group"' "$runner"
+# shellcheck disable=SC2016
+grep -Fq 'owner_pgid:$host_contention_owner_pgid,continuous:true' "$runner"
 # shellcheck disable=SC2016
 grep -Fq 'observed_source=$(resolve_live_power_source)' "$runner"
 if grep -Fq 'pmset -g batt | rg -q' "$runner"; then
@@ -81,6 +87,15 @@ if env -i PATH=/usr/bin:/bin bash "$runner" >"$missing_env_log" 2>&1; then
     exit 1
 fi
 grep -Fq 'absolute clean source worktree is required' "$missing_env_log"
+
+inherited_group_log="$pycache/inherited-group.log"
+if env -i PATH=/usr/bin:/bin HF2Q_GEMMA_B2_GATE_ISOLATED=1 \
+    bash "$runner" >"$inherited_group_log" 2>&1; then
+    echo "runner accepted a forced sentinel in an inherited process group" >&2
+    exit 1
+fi
+grep -Fq 'calibrated leaf does not own an isolated process group' \
+    "$inherited_group_log"
 
 git -C "$source_root" diff --check
 echo "ADR-049 B.2 Gemma aggregation model-free shell contract passed"

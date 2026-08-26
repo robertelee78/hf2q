@@ -271,7 +271,9 @@ def parse_tsv(path: Path, fields: int) -> list[list[str]]:
     return rows
 
 
-def verify_environment(process_dir: Path, summary: dict[str, Any]) -> tuple[str, str]:
+def verify_environment(
+    process_dir: Path, summary: dict[str, Any], owner_pgid: int
+) -> tuple[str, str]:
     settle = parse_tsv(process_dir / "thermal-settle.tsv", 3)
     require(all(row[1] == "nominal" for row in settle), "settle was not continuously nominal")
     require(int(settle[-1][0]) - int(settle[0][0]) >= 60, "settle was shorter than 60 seconds")
@@ -286,9 +288,10 @@ def verify_environment(process_dir: Path, summary: dict[str, Any]) -> tuple[str,
         require([row[0] for row in thermal] == [row[0] for row in contention],
                 f"thermal/contention timestamps differ: {process_dir}")
         require(all(row[1] == "quiet"
+                    and row[3] == str(owner_pgid)
                     and math.isfinite(float(row[4])) and 0 <= float(row[4]) < 100
                     and row[5] == "-" for row in contention),
-                f"host contention observed: {process_dir}")
+                f"host contention or owner drift observed: {process_dir}")
     power_settle = parse_tsv(process_dir / "power-settle.tsv", 5)
     require(len(power_settle) >= 2
             and int(power_settle[-1][0]) - int(power_settle[0][0]) >= 60,
@@ -634,7 +637,7 @@ def verify_process(root: Path, label: str, evidence: dict[str, Any]) -> dict[str
             and startup[0].get("mixed_cohort_selection") == f"explicit-{arm}"
             and startup[0].get("mixed_cohort_rows_per_lane") == "128",
             f"startup policy event does not prove the selected arm: {label}")
-    power_mode = verify_environment(process_dir, summary)
+    power_mode = verify_environment(process_dir, summary, evidence["owner_pgid"])
     waves = [verify_wave(process_dir, arm, trial, model_id)
              for trial in range(1, TRIALS + 1)]
     walls = [wave["wall"] for wave in waves]
@@ -676,8 +679,21 @@ def verify(
                           "max_tokens": DECODER_PRIME_MAX_TOKENS,
                           "stable_prompt_required": True,
                           "cache_reuse_required": True},
-        "host_contention_policy": "process-group-cpu-v2",
     }, "workload contract drift")
+    environment = receipt.get("environment")
+    require(isinstance(environment, dict) and set(environment) == {"host_contention"},
+            "environment contract schema drift")
+    host_contention = environment["host_contention"]
+    require(isinstance(host_contention, dict) and host_contention == {
+        "policy": "process-group-cpu-v2",
+        "maximum_foreign_cpu_percent": 100,
+        "owner_scope": "release-gate-process-group",
+        "owner_pgid": host_contention.get("owner_pgid"),
+        "continuous": True,
+    }, "environment host contention policy drift")
+    owner_pgid = host_contention.get("owner_pgid")
+    require(type(owner_pgid) is int and owner_pgid > 0,
+            "environment host contention owner drift")
     require(receipt.get("thresholds") == {
         "scheduler_decode_gap_ms": SCHEDULER_GAP_MS,
         "semantic_sse_gap_ms": SEMANTIC_SSE_GAP_MS,
@@ -743,6 +759,7 @@ def verify(
             "binary_path": str(binary), "binary_sha256": source["sha256"],
             "model_path": str(model_path), "model_sha256": expected_model_sha256,
             "host": endpoint["host"], "port": endpoint["port"],
+            "owner_pgid": owner_pgid,
         }
         for label in PROCESS_ORDER
     }

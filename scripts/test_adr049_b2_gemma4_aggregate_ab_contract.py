@@ -604,7 +604,14 @@ def make_fixture(
         "environment": {"power": "ac", "power_mode": "automatic",
                         "power_mode_code": "0",
                         "thermal": "nominal-settle-and-fair-or-better-measurement",
-                        "host_contention": "quiet", "clean_process_environment": True},
+                        "host_contention": {
+                            "policy": "process-group-cpu-v2",
+                            "maximum_foreign_cpu_percent": 100,
+                            "owner_scope": "release-gate-process-group",
+                            "owner_pgid": 100,
+                            "continuous": True,
+                        },
+                        "clean_process_environment": True},
         "processes": bindings, "files": files,
     })
 
@@ -1192,7 +1199,42 @@ def main() -> None:
         run_verify(identity_drift, success=False, reason="live operator launcher drifted")
         rejected += 1
 
-    assert rejected == 32
+        for name, key, value in (
+            ("contention-policy", "policy", "process-group-v1"),
+            ("contention-threshold", "maximum_foreign_cpu_percent", 101),
+            ("contention-owner", "owner_pgid", 0),
+            ("contention-continuous", "continuous", False),
+        ):
+            mutation = clone(valid, parent, name)
+            manifest_path = mutation / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["environment"]["host_contention"][key] = value
+            write_json(manifest_path, manifest)
+            run_verify(
+                mutation,
+                success=False,
+                reason=("environment host contention owner is invalid"
+                        if key == "owner_pgid"
+                        else "environment host contention policy is invalid"),
+            )
+            rejected += 1
+
+        raw_owner = clone(valid, parent, "contention-raw-owner")
+        contention_path = raw_owner / "contention-measurement.log"
+        contention_rows = contention_path.read_text(encoding="utf-8").splitlines()
+        fields = contention_rows[1].split("\t")
+        fields[3] = "101"
+        contention_rows[1] = "\t".join(fields)
+        contention_path.write_text("\n".join(contention_rows) + "\n", encoding="utf-8")
+        reseal_top(raw_owner, "contention_measurement")
+        run_verify(
+            raw_owner,
+            success=False,
+            reason="measurement telemetry reports contention or alignment drift",
+        )
+        rejected += 1
+
+    assert rejected == 37
     print(
         "ADR-049 B.2 Gemma stable cached A/B contract passed; "
         f"mutation battery {rejected}/{rejected} rejected"

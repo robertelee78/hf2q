@@ -10,8 +10,15 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(cd "$script_dir/.." && pwd)
+if [[ ${HF2Q_DEEPSEEK_B1_GATE_ISOLATED:-0} != 1 ]]; then
+    exec "$script_dir/run_release_gate_process_group.sh" env \
+      HF2Q_DEEPSEEK_B1_GATE_ISOLATED=1 "$0" "$@"
+fi
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$script_dir/macos_thermal_guard.sh"
+readonly HOST_CONTENTION_GATE_OWNER_PID=$$
+host_contention_require_isolated_gate_owner \
+  "$HOST_CONTENTION_GATE_OWNER_PID"
 # shellcheck source=scripts/macos_memory_guard.sh
 source "$script_dir/macos_memory_guard.sh"
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
@@ -508,7 +515,8 @@ run_process() {
     (
       thermal_wait_for_nominal "$engine_dir/thermal-settle.tsv" "$label-settle" \
         "$THERMAL_SETTLE_SECONDS" "$THERMAL_SETTLE_TIMEOUT_SECONDS" "$SAMPLE_SECONDS" \
-        "$engine_dir/contention-settle.tsv" "$server_pid"
+        "$engine_dir/contention-settle.tsv" \
+        "$HOST_CONTENTION_GATE_OWNER_PID" "$server_pid"
     ) &
     settle_pid=$!
     power_monitor_while_pid "$settle_pid" "$engine_dir/power-settle.tsv" "$label-settle" &
@@ -516,7 +524,8 @@ run_process() {
     wait "$settle_pid"; wait "$power_pid"
     thermal_sample "$engine_dir/thermal-measurement.tsv" "$label-measurement-start"
     host_contention_sample "$engine_dir/contention-measurement.tsv" \
-      "$label-measurement-start" "$server_pid" "$THERMAL_SAMPLED_AT"
+      "$label-measurement-start" "$HOST_CONTENTION_GATE_OWNER_PID" \
+      "$THERMAL_SAMPLED_AT" "$server_pid"
     host_contention_require_quiet "$label-measurement-start"
     (run_measurements "$label" "$arm" "$model" "$engine_dir") &
     producer_pid=$!
@@ -524,13 +533,15 @@ run_process() {
     resource_pid=$!
     thermal_monitor_fair_or_better_while_pid "$engine_dir/thermal-measurement.tsv" \
       "$label-measurement" "$producer_pid" "$SAMPLE_SECONDS" \
-      "$engine_dir/contention-measurement.tsv" "$server_pid" || monitor_status=$?
+      "$engine_dir/contention-measurement.tsv" \
+      "$HOST_CONTENTION_GATE_OWNER_PID" "$server_pid" || monitor_status=$?
     wait "$producer_pid" || producer_status=$?
     wait "$resource_pid" || monitor_status=1
     ((producer_status == 0 && monitor_status == 0)) || return 1
     thermal_sample "$engine_dir/thermal-measurement.tsv" "$label-measurement-end"
     host_contention_sample "$engine_dir/contention-measurement.tsv" \
-      "$label-measurement-end" "$server_pid" "$THERMAL_SAMPLED_AT"
+      "$label-measurement-end" "$HOST_CONTENTION_GATE_OWNER_PID" \
+      "$THERMAL_SAMPLED_AT" "$server_pid"
     host_contention_require_quiet "$label-measurement-end"
     thermal_validate_settle_log "$engine_dir/thermal-settle.tsv" \
       "$THERMAL_SETTLE_SECONDS" "$MAX_SAMPLE_GAP_SECONDS"
@@ -586,7 +597,8 @@ run_process() {
 }
 
 thermal_prepare_probe
-qwen36_start_power_guard "$$" "$OUT_DIR/caffeinate.log"
+qwen36_start_power_guard "$HOST_CONTENTION_GATE_OWNER_PID" \
+  "$OUT_DIR/caffeinate.log"
 caffeinate_started=true
 HF2Q_MODEL_VERIFICATION_BINARY="$HF2Q_BIN" hf2q_release_prepare_model_verification \
   "$MODEL_PATH" "$MODEL_SHA256" "$OUT_DIR/model-verification.json" \
@@ -680,6 +692,9 @@ jq -n --arg source_root "$SOURCE_ROOT" --arg commit "$source_commit" \
   --argjson max_rss "$MAX_PEAK_RSS_BYTES" \
   --argjson min_speedup "$MIN_WAVE_SPEEDUP" \
   --arg contention_policy "$HOST_CONTENTION_POLICY" \
+  --argjson contention_max_foreign_cpu_percent \
+    "$HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT" \
+  --argjson contention_owner_pgid "$HOST_CONTENTION_GATE_OWNER_PID" \
   --argjson neighbor_a "$neighbor_a" --argjson neighbor_b "$neighbor_b" \
   --argjson off_samples "$(jq -Rsc 'split("\n")|map(select(length>0)|tonumber)' "$off_samples")" \
   --argjson on_samples "$(jq -Rsc 'split("\n")|map(select(length>0)|tonumber)' "$on_samples")" \
@@ -699,7 +714,11 @@ jq -n --arg source_root "$SOURCE_ROOT" --arg commit "$source_commit" \
       trials_per_process:5,max_slots:8,live_decoders:4,prefillers:4,
       mixed_rows_per_lane:$mixed_rows,temperature:0,seed:42,
       decoder_prime:{lanes:4,max_tokens:1,stable_prompt_required:true,
-        cache_reuse_required:true},host_contention_policy:$contention_policy},
+        cache_reuse_required:true}},
+    environment:{host_contention:{policy:$contention_policy,
+      maximum_foreign_cpu_percent:$contention_max_foreign_cpu_percent,
+      owner_scope:"release-gate-process-group",
+      owner_pgid:$contention_owner_pgid,continuous:true}},
     thresholds:{scheduler_decode_gap_ms:$scheduler_gap,semantic_sse_gap_ms:$semantic_gap,
       max_prefill_wall_seconds:$prefill_wall,max_peak_rss_bytes:$max_rss,
       min_wave_speedup:$min_speedup},

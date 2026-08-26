@@ -203,10 +203,22 @@ def validate_environment(root: Path, manifest: dict) -> None:
         "host_contention", "clean_process_environment",
     }:
         fail("environment contract schema drifted")
+    contention_contract = environment.get("host_contention")
+    if not isinstance(contention_contract, dict) or contention_contract != {
+        "policy": "process-group-cpu-v2",
+        "maximum_foreign_cpu_percent": 100,
+        "owner_scope": "release-gate-process-group",
+        "owner_pgid": contention_contract.get("owner_pgid"),
+        "continuous": True,
+    }:
+        fail("environment host contention policy is invalid")
+    owner_pgid = contention_contract.get("owner_pgid")
+    if not isinstance(owner_pgid, int) or isinstance(owner_pgid, bool) \
+            or owner_pgid <= 0:
+        fail("environment host contention owner is invalid")
     if environment["power"] != "ac" or environment["power_mode"] == "low" \
             or not environment["power_mode"] or not environment["power_mode_code"] \
             or environment["thermal"] != "nominal-settle-and-fair-or-better-measurement" \
-            or environment["host_contention"] != "quiet" \
             or environment["clean_process_environment"] is not True:
         fail("environment contract is not acceptable")
     files = manifest["files"]
@@ -246,6 +258,7 @@ def validate_environment(root: Path, manifest: dict) -> None:
         for thermal_row, contention_row in zip(thermal, contention):
             if contention_row[0] != thermal_row[0] or contention_row[2] != thermal_row[2] \
                     or contention_row[1] != "quiet" or not contention_row[3] \
+                    or contention_row[3] != str(owner_pgid) \
                     or not math.isfinite(float(contention_row[4])) \
                     or not 0 <= float(contention_row[4]) < 100 \
                     or contention_row[5] != "-":

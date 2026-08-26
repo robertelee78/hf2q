@@ -4,10 +4,13 @@ set -euo pipefail
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 verifier="$root_dir/scripts/verify_deepseek4_mixed_policy_receipt.py"
 runner="$root_dir/scripts/bench_deepseek4_mixed_policy_abba.sh"
+mutations="$root_dir/scripts/test_deepseek4_mixed_policy_receipt_mutations.sh"
 launcher="$root_dir/scripts/serve_deepseek4_opencode.sh"
 engine="$root_dir/src/serve/api/engine.rs"
 tmp_dir=$(mktemp -d "${TMPDIR:-/var/tmp}/deepseek-b1-contract.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT
+
+bash -n "$runner" "$mutations" "$0"
 
 cat >"$tmp_dir/valid.timed-sse" <<'EOF'
 1.000000000	data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}
@@ -112,11 +115,27 @@ rg -q 'prefills were not admitted before the first live decoder completed' "$ver
 rg -Fq 'row.get("bounded_mixed") in ("true", "false")' "$verifier"
 rg -q 'observed_source=[$][(]matched_parse_live_power_source' "$runner"
 rg -q 'bounded_mixed = max_cooperative_rows_per_lane.is_some()' "$engine"
-rg -Fq 'host_contention_policy:$contention_policy' "$runner"
-rg -Fq '"host_contention_policy": "process-group-cpu-v2"' "$verifier"
+rg -Fq 'host_contention:{policy:$contention_policy' "$runner"
+rg -Fq 'HF2Q_DEEPSEEK_B1_GATE_ISOLATED=1' "$runner"
+rg -Fq 'host_contention_require_isolated_gate_owner' "$runner"
+rg -Fq 'owner_scope:"release-gate-process-group"' "$runner"
+rg -Fq 'owner_pgid:$contention_owner_pgid,continuous:true' "$runner"
+rg -Fq '"policy": "process-group-cpu-v2"' "$verifier"
+rg -Fq 'row[3] == str(owner_pgid)' "$verifier"
+rg -Fq 'rebound-contention-row-owner mutate_contention_raw_owner' "$mutations"
+rg -Fq '23/23 (22 REJECTED, 1 ACCEPTED)' "$mutations"
 if rg -Fq 'pmset -g batt | rg -q' "$runner"; then
     echo "DeepSeek B.1 runner retains the early-match AC probe" >&2
     exit 1
 fi
+
+inherited_group_log="$tmp_dir/inherited-group.log"
+if env -i PATH=/usr/bin:/bin HF2Q_DEEPSEEK_B1_GATE_ISOLATED=1 \
+    bash "$runner" >"$inherited_group_log" 2>&1; then
+    echo "DeepSeek B.1 runner accepted a forced sentinel in an inherited process group" >&2
+    exit 1
+fi
+rg -Fq 'calibrated leaf does not own an isolated process group' \
+  "$inherited_group_log"
 
 echo "DeepSeek-V4 Mixed policy model-free contract: PASS"

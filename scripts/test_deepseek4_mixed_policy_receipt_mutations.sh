@@ -252,9 +252,26 @@ mutate_prime_prompt() {
     seal_process "$copy" off-a
 }
 
+mutate_contention_raw_owner() {
+    local copy=$1
+    local path="$copy/on-a/contention-measurement.tsv"
+    awk -F '\t' 'BEGIN { OFS="\t" } NR == 2 { $4 = $4 + 1 } { print }' \
+      "$path" >"$path.tmp"
+    mv "$path.tmp" "$path"
+    seal_process "$copy" on-a
+}
+
 expect_reject verdict-skip mutate_top '.verdict="skip"'
 expect_reject threshold-widen mutate_top '.thresholds.semantic_sse_gap_ms=999999'
-expect_reject stale-contention-policy mutate_top '.workload.host_contention_policy="process-group-v1"'
+expect_reject stale-contention-policy mutate_top \
+  '.environment.host_contention.policy="process-group-v1"'
+expect_reject stale-contention-threshold mutate_top \
+  '.environment.host_contention.maximum_foreign_cpu_percent=101'
+expect_reject missing-contention-owner mutate_top \
+  '.environment.host_contention.owner_pgid=0'
+expect_reject noncontinuous-contention mutate_top \
+  '.environment.host_contention.continuous=false'
+expect_reject rebound-contention-row-owner mutate_contention_raw_owner
 expect_reject false-speedup mutate_top '.result.wave_speedup=99'
 expect_reject false-semantic-hash mutate_top '.equality.semantic_and_token_sha256=("f"*64)'
 expect_reject false-summary-hash mutate_top \
@@ -273,4 +290,4 @@ expect_reject rebound-prefill-admission-loss mutate_prefill_admission
 expect_reject rebound-prime-prompt-drift mutate_prime_prompt
 expect_accept rebound-legitimate-pure-cohort add_legitimate_pure_cohort
 
-echo "DeepSeek-V4 Mixed policy receipt mutations: 19/19 (18 REJECTED, 1 ACCEPTED)"
+echo "DeepSeek-V4 Mixed policy receipt mutations: 23/23 (22 REJECTED, 1 ACCEPTED)"
