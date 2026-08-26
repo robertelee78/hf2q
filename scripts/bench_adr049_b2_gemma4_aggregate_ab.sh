@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Direct production-route discriminator for Gemma4 cold cross-slot admission.
+# Direct production-route discriminator for Gemma4 cached stable cross-slot admission.
 # Every OFF/ON arm gets a fresh process. Pair order alternates to distribute
-# load/thermal drift, while each process serves the same three four-lane cold
-# waves. Raw requests, responses, timings, trace slices, and process logs are
-# sealed before the independent verifier computes any speedup.
+# load/thermal drift. Each measured wave first installs four distinct, equal-
+# width, long-history tool-call anchors. The timed follow-ups carry the exact
+# assistant tool call plus its matching tool result; two lanes are unary and
+# two are SSE. Raw requests, responses, timings, trace slices, and process logs
+# are sealed before the independent verifier computes any speedup.
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -16,8 +18,14 @@ source "$script_dir/qwen36_watchdog_validate.sh"
 source "$script_dir/qwen38_matched_reference_contract.sh"
 
 readonly PAIRS=8
-readonly WIDTHS=(128 256 512)
+readonly WIDTHS=(64 128 256)
 readonly LANES=4
+readonly PRIME_HISTORY_WORDS=1200
+readonly MIN_PRIME_AGGREGATE_TOKENS=4097
+readonly PRIME_MAX_TOKENS=96
+readonly CONTINUATION_MAX_TOKENS=32
+readonly TOOL_RESULT_WORD_ADJUSTMENT=40
+readonly SENTINEL=ADR049_GEMMA_STABLE_OK
 readonly HOST=127.0.0.1
 readonly READY_TIMEOUT_SECONDS=300
 readonly REQUEST_TIMEOUT_SECONDS=300
@@ -26,9 +34,8 @@ readonly THERMAL_SETTLE_SECONDS=60
 readonly THERMAL_SAMPLE_SECONDS=2
 readonly POWER_PROBE_ATTEMPTS=3
 readonly MIN_LOWER_95_SPEEDUP=1.05
-readonly PAYLOAD_WORD_ADJUSTMENT=40
 readonly MAX_TARGET_ROW_DRIFT=4
-readonly TRACE_NAME='[PREFILL_TIMING] BATCHED 4 seqs in '
+readonly TRACE_NAME='[PREFILL_TIMING] STABLE BATCHED 4 seqs x '
 readonly RUNTIME_PATH=/usr/bin:/bin:/usr/sbin:/sbin
 readonly RUNTIME_TMPDIR=/var/tmp
 
@@ -232,24 +239,108 @@ cleanup() {
 }
 trap cleanup EXIT
 
-build_request() {
-    local model_id=$1 pair=$2 target=$3 lane=$4 output=$5 content payload_words
-    payload_words=$((target - PAYLOAD_WORD_ADJUSTMENT))
-    ((payload_words > 0)) || {
-        echo "rendered-prompt adjustment exhausts target row bin: $target" >&2
-        return 1
-    }
-    content=$(awk -v pair="$pair" -v nominal="$target" -v words="$payload_words" \
-        -v lane="$lane" 'BEGIN {
-        printf "adr049-b2-gemma-p%02d-w%03d-l%d ", pair, nominal, lane
-        for (i = 1; i <= words; i++) printf "measurement "
-        printf "Reply with one word."
+build_prime_request() {
+    local model_id=$1 pair=$2 target=$3 lane=$4 output=$5 content expected_path
+    expected_path=$(printf '/tmp/adr049-p%02d-w%03d-l%d.txt' "$pair" "$target" "$lane")
+    content=$(awk -v pair="$pair" -v nominal="$target" \
+        -v words="$PRIME_HISTORY_WORDS" -v lane="$lane" -v path="$expected_path" 'BEGIN {
+        printf "Long agent history for pair %02d width %03d lane %d. ", pair, nominal, lane
+        for (i = 1; i <= words; i++) printf "history "
+        printf "Call read_note exactly once with path %s. After the tool result, reply exactly ADR049_GEMMA_STABLE_OK.", path
     }')
+    jq -n --arg model "$model_id" --arg content "$content" \
+        --argjson max_tokens "$PRIME_MAX_TOKENS" '{
+      model:$model,messages:[{role:"user",content:$content}],
+      tools:[{type:"function",function:{name:"read_note",
+        description:"Read one exact local note",
+        parameters:{type:"object",properties:{path:{type:"string"}},
+          required:["path"],additionalProperties:false}}}],
+      tool_choice:"required",
+      max_tokens:$max_tokens,seed:42,temperature:0,repetition_penalty:1,stream:false,
+      hf2q_enable_thinking:false,chat_template_kwargs:{enable_thinking:false}
+    }' >"$output"
+}
+
+build_warmup_request() {
+    local model_id=$1 pair=$2 lane=$3 output=$4 content
+    content=$(printf 'adr049-gemma-stable-warmup-p%02d-l%d Reply with OK.' "$pair" "$lane")
     jq -n --arg model "$model_id" --arg content "$content" '{
       model:$model,messages:[{role:"user",content:$content}],
       max_tokens:1,seed:42,temperature:0,repetition_penalty:1,stream:false,
       hf2q_enable_thinking:false,chat_template_kwargs:{enable_thinking:false}
     }' >"$output"
+}
+
+build_continuation_request() {
+    local prime_request=$1 prime_response=$2 target=$3 stream=$4 output=$5 payload_words tool_result
+    payload_words=$((target - TOOL_RESULT_WORD_ADJUSTMENT))
+    ((payload_words > 0)) || {
+        echo "tool-result adjustment exhausts target row bin: $target" >&2
+        return 1
+    }
+    tool_result=$(awk -v words="$payload_words" 'BEGIN {
+        printf "read_note succeeded. "
+        for (i = 1; i <= words; i++) printf "measurement "
+        printf "Now reply exactly ADR049_GEMMA_STABLE_OK."
+    }')
+    jq -n --slurpfile base "$prime_request" --slurpfile prior "$prime_response" \
+        --arg tool_result "$tool_result" --argjson stream "$stream" \
+        --argjson max_tokens "$CONTINUATION_MAX_TOKENS" '
+      $base[0]
+      | .messages += [
+          {role:"assistant",content:$prior[0].choices[0].message.content,
+            tool_calls:$prior[0].choices[0].message.tool_calls},
+          {role:"tool",tool_call_id:$prior[0].choices[0].message.tool_calls[0].id,
+            content:$tool_result}
+        ]
+      | .tool_choice = "auto"
+      | .max_tokens = $max_tokens
+      | .stream = $stream
+      | if $stream then .stream_options = {include_usage:true}
+        else del(.stream_options) end
+    ' >"$output"
+}
+
+normalize_generated_call_ids() {
+    local input=$1 output=$2
+    jq -S '
+      (.messages[]?.tool_calls[]?.id) = "<generated-call-id>"
+      | (.messages[]? | select(.role == "tool") | .tool_call_id) = "<generated-call-id>"
+      | (.choices[]?.message.tool_calls[]?.id) = "<generated-call-id>"
+    ' "$input" >"$output"
+}
+
+canonicalize_response() {
+    local protocol=$1 wire=$2 events=$3 output=$4
+    if [[ "$protocol" == unary ]]; then
+        jq -S '{choices:[{message:.choices[0].message,
+          finish_reason:.choices[0].finish_reason}],usage,
+          x_hf2q_timing}' "$wire" >"$output"
+        : >"$events"
+        return
+    fi
+    [[ "$(grep -c '^data: \[DONE\]$' "$wire" || true)" == 1 \
+        && "$(grep '^data: ' "$wire" | tail -1)" == 'data: [DONE]' ]] || {
+        echo "SSE continuation did not terminate with exactly one [DONE]" >&2
+        return 1
+    }
+    sed -n 's/^data: //p' "$wire" | grep -v '^\[DONE\]$' >"$events"
+    jq -e -s 'length > 0 and all(.[]; type == "object")
+      and ([.[] | .choices[]?.delta.tool_calls[]?] | length) == 0
+      and ([.[] | .choices[]? | .finish_reason // empty] | last) == "stop"
+      and ([.[] | .usage? | select(. != null)] | length) == 1
+      and ([.[] | .x_hf2q_timing? | select(. != null)] | length) == 1' \
+        "$events" >/dev/null || {
+        echo "SSE continuation event semantics are invalid" >&2
+        return 1
+    }
+    jq -S -s '{
+      choices:[{message:{role:([.[] | .choices[]?.delta.role? | select(. != null)] | first),
+        content:([.[] | .choices[]?.delta.content? | select(. != null)] | join(""))},
+        finish_reason:([.[] | .choices[]? | .finish_reason // empty] | last)}],
+      usage:([.[] | .usage? | select(. != null)] | last),
+      x_hf2q_timing:([.[] | .x_hf2q_timing? | select(. != null)] | last)
+    }' "$events" >"$output"
 }
 
 stop_server() {
@@ -265,33 +356,116 @@ stop_server() {
     STOP_WAIT_STATUS=$wait_status
 }
 
+run_prime_wave() {
+    local pair=$1 target=$2 model_id=$3 sample_dir=$4 lane request response barrier prompt
+    local expected_path prime_aggregate=0 first_prompt="" prompt_widths
+    local -a prime_pids
+    barrier="$sample_dir/prime.start.barrier"
+    prime_pids=()
+    rm -f "$barrier"
+    for ((lane = 0; lane < LANES; lane++)); do
+        request="$sample_dir/prime-lane-$lane.request.json"
+        response="$sample_dir/prime-lane-$lane.response.json"
+        build_prime_request "$model_id" "$pair" "$target" "$lane" "$request"
+        (
+            while [[ ! -e "$barrier" ]]; do sleep 0.001; done
+            curl --fail-with-body --silent --show-error --connect-timeout 5 \
+                --max-time "$REQUEST_TIMEOUT_SECONDS" -H 'Content-Type: application/json' \
+                --data-binary "@$request" -o "$response" \
+                "http://$HOST:$PORT/v1/chat/completions"
+        ) &
+        prime_pids+=("$!")
+    done
+    : >"$barrier"
+    for request_pid in "${prime_pids[@]}"; do wait "$request_pid"; done
+
+    for ((lane = 0; lane < LANES; lane++)); do
+        request="$sample_dir/prime-lane-$lane.request.json"
+        response="$sample_dir/prime-lane-$lane.response.json"
+        expected_path=$(printf '/tmp/adr049-p%02d-w%03d-l%d.txt' "$pair" "$target" "$lane")
+        jq -e --arg expected "$expected_path" '
+          (.choices | length) == 1
+          and .choices[0].finish_reason == "tool_calls"
+          and ((.choices[0].message.content // "") | type == "string")
+          and ((.choices[0].message.tool_calls // []) | length) == 1
+          and .choices[0].message.tool_calls[0].type == "function"
+          and .choices[0].message.tool_calls[0].function.name == "read_note"
+          and ((.choices[0].message.tool_calls[0].function.arguments | fromjson).path == $expected)
+          and (.usage.prompt_tokens | numbers) > 0
+          and .usage.prompt_tokens_details.cached_tokens == 0
+          and (.usage.completion_tokens | numbers) > 0
+        ' "$response" >/dev/null || {
+            echo "pair $pair width $target lane $lane prime was not one exact cold tool call" >&2
+            return 1
+        }
+        prompt=$(jq -er '.usage.prompt_tokens' "$response")
+        if [[ -z "$first_prompt" ]]; then first_prompt=$prompt; fi
+        [[ "$prompt" == "$first_prompt" ]] || {
+            echo "pair $pair width $target prime lanes were not equal-token-width" >&2
+            return 1
+        }
+        prime_aggregate=$((prime_aggregate + prompt))
+        jq -S '
+          {choice:.choices[0],completion_tokens:.usage.completion_tokens}
+          | (.choice.message.tool_calls[]?.id) = "<generated-call-id>"
+        ' "$response" >"$sample_dir/prime-lane-$lane.normalized.json"
+    done
+    ((prime_aggregate >= MIN_PRIME_AGGREGATE_TOKENS)) || {
+        echo "pair $pair width $target prime aggregate $prime_aggregate did not exceed 4096 tokens" >&2
+        return 1
+    }
+    printf '%s\n' "$prime_aggregate" >"$sample_dir/prime.aggregate-tokens"
+    prompt_widths=$(for ((lane = 0; lane < LANES; lane++)); do
+        jq -r '.usage.prompt_tokens' "$sample_dir/prime-lane-$lane.response.json"
+    done | sort -u | wc -l | tr -d ' ')
+    [[ "$prompt_widths" == 1 ]] || {
+        echo "pair $pair width $target prime width proof was not singular" >&2
+        return 1
+    }
+}
+
 run_wave() {
     local pair=$1 position=$2 arm=$3 target=$4 model_id=$5 process_dir=$6
     local width_position sample_dir log_before log_after wave_started wave_ended wave_seconds wave_ms
-    local trace event_count trace_requests trace_elapsed lanes_file lane request response wall normalized timing
-    local prompt cached work prefill_ms ttft_ms wall_ms aggregate_rows=0
-    local barrier launch_skew latest_start earliest_finish actual_overlap
+    local trace event_count trace_requests trace_rows trace_elapsed trace_batch_count
+    local lanes_file lane request request_normalized wire events canonical normalized wall timing protocol stream
+    local prompt cached work prefill_ms ttft_ms wall_ms aggregate_rows=0 prime_aggregate
+    local prime_request prime_response prime_normalized prime_prompt prime_cached
+    local barrier launch_skew latest_start earliest_finish actual_overlap lane_started lane_finished
+    local expected_work="" expected_cached=""
     local -a request_pids
-    case "$target" in 128) width_position=0 ;; 256) width_position=1 ;; 512) width_position=2 ;; esac
+    case "$target" in 64) width_position=0 ;; 128) width_position=1 ;; 256) width_position=2 ;; esac
     sample_dir="$process_dir/wave-$target"
     mkdir -p "$sample_dir"
+
+    # The primer is deliberately outside the timed and trace slices. It must
+    # install four distinct cold anchors whose aggregate history exceeds the
+    # obsolete 4,096-row admission cap.
+    run_prime_wave "$pair" "$target" "$model_id" "$sample_dir"
+    prime_aggregate=$(<"$sample_dir/prime.aggregate-tokens")
     log_before=$(file_bytes "$process_dir/server.stderr")
-    wave_started=$(perl -MTime::HiRes=time -e 'printf "%.9f\n", time')
-    request_pids=()
+
     barrier="$sample_dir/start.barrier"
+    request_pids=()
     rm -f "$barrier"
+    wave_started=$(perl -MTime::HiRes=time -e 'printf "%.9f\n", time')
     for ((lane = 0; lane < LANES; lane++)); do
+        prime_request="$sample_dir/prime-lane-$lane.request.json"
+        prime_response="$sample_dir/prime-lane-$lane.response.json"
         request="$sample_dir/lane-$lane.request.json"
-        response="$sample_dir/lane-$lane.response.json"
+        request_normalized="$sample_dir/lane-$lane.request.normalized.json"
+        wire="$sample_dir/lane-$lane.response.wire"
         wall="$sample_dir/lane-$lane.wall"
         timing="$sample_dir/lane-$lane.timing"
-        build_request "$model_id" "$pair" "$target" "$lane" "$request"
+        if ((lane < 2)); then protocol=unary; stream=false; else protocol=sse; stream=true; fi
+        build_continuation_request "$prime_request" "$prime_response" "$target" "$stream" "$request"
+        normalize_generated_call_ids "$request" "$request_normalized"
         (
             while [[ ! -e "$barrier" ]]; do sleep 0.001; done
             lane_started=$(perl -MTime::HiRes=time -e 'printf "%.9f\n", time')
-            curl --fail-with-body --silent --show-error --connect-timeout 5 \
+            curl --fail-with-body --silent --show-error --no-buffer --connect-timeout 5 \
                 --max-time "$REQUEST_TIMEOUT_SECONDS" -H 'Content-Type: application/json' \
-                --data-binary "@$request" -o "$response" -w '%{time_total}\n' \
+                --data-binary "@$request" -o "$wire" -w '%{time_total}\n' \
                 "http://$HOST:$PORT/v1/chat/completions" >"$wall"
             lane_finished=$(perl -MTime::HiRes=time -e 'printf "%.9f\n", time')
             printf '%s\t%s\n' "$lane_started" "$lane_finished" >"$timing"
@@ -304,6 +478,7 @@ run_wave() {
     wave_seconds=$(awk -v start="$wave_started" -v end="$wave_ended" 'BEGIN {printf "%.9f", end-start}')
     wave_ms=$(awk -v seconds="$wave_seconds" 'BEGIN {printf "%.9f", seconds*1000}')
     printf '%s\n' "$wave_seconds" >"$sample_dir/wave.wall"
+
     launch_skew=$(awk -F '\t' '
       NR == 1 {minimum=$1; maximum=$1}
       $1 < minimum {minimum=$1} $1 > maximum {maximum=$1}
@@ -320,6 +495,7 @@ run_wave() {
         echo "pair $pair $arm width $target lacked a <=100ms overlapping launch" >&2
         return 1
     }
+
     log_after=$(file_bytes "$process_dir/server.stderr")
     ((log_after >= log_before)) || { echo "server log shrank during wave" >&2; return 1; }
     trace="$sample_dir/server.trace.log"
@@ -329,100 +505,160 @@ run_wave() {
         dd if="$process_dir/server.stderr" of="$trace" bs=1 skip="$log_before" \
             count="$((log_after - log_before))" 2>/dev/null
     fi
+
     lanes_file="$sample_dir/lanes.jsonl"
     : >"$lanes_file"
     for ((lane = 0; lane < LANES; lane++)); do
+        prime_request="$sample_dir/prime-lane-$lane.request.json"
+        prime_response="$sample_dir/prime-lane-$lane.response.json"
+        prime_normalized="$sample_dir/prime-lane-$lane.normalized.json"
         request="$sample_dir/lane-$lane.request.json"
-        response="$sample_dir/lane-$lane.response.json"
+        request_normalized="$sample_dir/lane-$lane.request.normalized.json"
+        wire="$sample_dir/lane-$lane.response.wire"
+        events="$sample_dir/lane-$lane.response.events.jsonl"
+        canonical="$sample_dir/lane-$lane.response.canonical.json"
+        normalized="$sample_dir/lane-$lane.normalized.json"
         wall="$sample_dir/lane-$lane.wall"
         timing="$sample_dir/lane-$lane.timing"
-        normalized="$sample_dir/lane-$lane.normalized.json"
-        jq -e '
-          (.choices | length) == 1 and (.choices[0].message | type) == "object"
-          and (.choices[0].finish_reason | type) == "string"
+        if ((lane < 2)); then protocol=unary; else protocol=sse; fi
+        canonicalize_response "$protocol" "$wire" "$events" "$canonical"
+        jq -e --arg sentinel "$SENTINEL" '
+          (.choices | length) == 1
+          and .choices[0].finish_reason == "stop"
+          and .choices[0].message.role == "assistant"
+          and .choices[0].message.content == $sentinel
+          and ((.choices[0].message.tool_calls // []) | length) == 0
           and (.usage.prompt_tokens | numbers) > 0
-          and .usage.prompt_tokens_details.cached_tokens == 0
-          and (.usage.completion_tokens | numbers) == 1
+          and (.usage.prompt_tokens_details.cached_tokens | numbers) > 0
+          and (.usage.completion_tokens | numbers) > 0
           and (.x_hf2q_timing.prefill_time_secs | numbers) > 0
           and (.x_hf2q_timing.time_to_first_token_ms | numbers) > 0
-        ' "$response" >/dev/null
-        prompt=$(jq -er '.usage.prompt_tokens' "$response")
-        cached=$(jq -er '.usage.prompt_tokens_details.cached_tokens' "$response")
+        ' "$canonical" >/dev/null || {
+            echo "pair $pair $arm width $target lane $lane continuation semantics failed" >&2
+            return 1
+        }
+        prompt=$(jq -er '.usage.prompt_tokens' "$canonical")
+        cached=$(jq -er '.usage.prompt_tokens_details.cached_tokens' "$canonical")
         work=$((prompt - cached))
-        ((work >= target - MAX_TARGET_ROW_DRIFT \
+        ((work >= 32 && work <= 256 \
+            && work >= target - MAX_TARGET_ROW_DRIFT \
             && work <= target + MAX_TARGET_ROW_DRIFT)) || {
-            echo "pair $pair $arm width $target lane $lane missed target bin: $work" >&2
+            echo "pair $pair $arm width $target lane $lane missed stable suffix bin: $work" >&2
+            return 1
+        }
+        if [[ -z "$expected_work" ]]; then
+            expected_work=$work
+            expected_cached=$cached
+        fi
+        [[ "$work" == "$expected_work" && "$cached" == "$expected_cached" ]] || {
+            echo "pair $pair $arm width $target stable lanes were not equal-shaped" >&2
             return 1
         }
         aggregate_rows=$((aggregate_rows + work))
-        prefill_ms=$(jq -er '.x_hf2q_timing.prefill_time_secs * 1000' "$response")
-        ttft_ms=$(jq -er '.x_hf2q_timing.time_to_first_token_ms' "$response")
+        prefill_ms=$(jq -er '.x_hf2q_timing.prefill_time_secs * 1000' "$canonical")
+        ttft_ms=$(jq -er '.x_hf2q_timing.time_to_first_token_ms' "$canonical")
         wall_ms=$(awk '{printf "%.9f", $1*1000}' "$wall")
         jq -S '{message:.choices[0].message,finish_reason:.choices[0].finish_reason,
-          usage:(.usage|{prompt_tokens,completion_tokens,total_tokens,
-            prompt_tokens_details})}' "$response" >"$normalized"
-        jq -cn --argjson lane "$lane" --argjson prompt "$prompt" \
-            --argjson cached "$cached" --argjson work "$work" \
+          usage}' "$canonical" >"$normalized"
+        prime_prompt=$(jq -er '.usage.prompt_tokens' "$prime_response")
+        prime_cached=$(jq -er '.usage.prompt_tokens_details.cached_tokens' "$prime_response")
+        jq -cn --argjson lane "$lane" --arg protocol "$protocol" \
+            --argjson prime_prompt "$prime_prompt" --argjson prime_cached "$prime_cached" \
+            --argjson prompt "$prompt" --argjson cached "$cached" --argjson work "$work" \
             --argjson prefill "$prefill_ms" --argjson ttft "$ttft_ms" \
             --argjson wall_ms "$wall_ms" \
+            --arg prime_request "${prime_request#"$OUT_DIR/"}" \
+            --arg prime_request_sha "$(sha256_file "$prime_request")" \
+            --arg prime_response "${prime_response#"$OUT_DIR/"}" \
+            --arg prime_response_sha "$(sha256_file "$prime_response")" \
+            --arg prime_normalized "${prime_normalized#"$OUT_DIR/"}" \
+            --arg prime_normalized_sha "$(sha256_file "$prime_normalized")" \
             --arg request "${request#"$OUT_DIR/"}" --arg request_sha "$(sha256_file "$request")" \
-            --arg response "${response#"$OUT_DIR/"}" --arg response_sha "$(sha256_file "$response")" \
+            --arg request_normalized "${request_normalized#"$OUT_DIR/"}" \
+            --arg request_normalized_sha "$(sha256_file "$request_normalized")" \
+            --arg wire "${wire#"$OUT_DIR/"}" --arg wire_sha "$(sha256_file "$wire")" \
+            --arg events "${events#"$OUT_DIR/"}" --arg events_sha "$(sha256_file "$events")" \
+            --arg canonical "${canonical#"$OUT_DIR/"}" \
+            --arg canonical_sha "$(sha256_file "$canonical")" \
             --arg wall "${wall#"$OUT_DIR/"}" --arg wall_sha "$(sha256_file "$wall")" \
             --arg timing "${timing#"$OUT_DIR/"}" --arg timing_sha "$(sha256_file "$timing")" \
             --arg normalized "${normalized#"$OUT_DIR/"}" \
             --arg normalized_sha "$(sha256_file "$normalized")" '{
-              lane:$lane,prompt_tokens:$prompt,cached_tokens:$cached,work_rows:$work,
+              lane:$lane,protocol:$protocol,
+              prime_prompt_tokens:$prime_prompt,prime_cached_tokens:$prime_cached,
+              prompt_tokens:$prompt,cached_tokens:$cached,work_rows:$work,
               prefill_ms:$prefill,ttft_ms:$ttft,wall_ms:$wall_ms,
+              prime_request_path:$prime_request,prime_request_sha256:$prime_request_sha,
+              prime_response_path:$prime_response,prime_response_sha256:$prime_response_sha,
+              prime_normalized_path:$prime_normalized,
+              prime_normalized_sha256:$prime_normalized_sha,
               request_path:$request,request_sha256:$request_sha,
-              response_path:$response,response_sha256:$response_sha,
+              request_normalized_path:$request_normalized,
+              request_normalized_sha256:$request_normalized_sha,
+              wire_response_path:$wire,wire_response_sha256:$wire_sha,
+              sse_events_path:$events,sse_events_sha256:$events_sha,
+              canonical_response_path:$canonical,canonical_response_sha256:$canonical_sha,
               wall_path:$wall,wall_sha256:$wall_sha,
               timing_path:$timing,timing_sha256:$timing_sha,
               normalized_path:$normalized,normalized_sha256:$normalized_sha
             }' >>"$lanes_file"
     done
+
     event_count=$(grep -cF "$TRACE_NAME" "$trace" || true)
     trace_requests=null
+    trace_rows=null
     trace_elapsed=null
+    trace_batch_count=null
     if ((event_count == 1)); then
-        trace_requests=$(perl -ne 'print "$1\n" if /\[PREFILL_TIMING\] BATCHED ([0-9]+) seqs in/' "$trace")
-        trace_elapsed=$(perl -ne 'print "$1\n" if /\[PREFILL_TIMING\] BATCHED [0-9]+ seqs in ([0-9]+(?:\.[0-9]+)?) ms/' "$trace")
+        trace_requests=$(perl -ne 'print "$1\n" if /\[PREFILL_TIMING\] STABLE BATCHED ([0-9]+) seqs x/' "$trace")
+        trace_rows=$(perl -ne 'print "$1\n" if /\[PREFILL_TIMING\] STABLE BATCHED [0-9]+ seqs x ([0-9]+) boundary rows/' "$trace")
+        trace_elapsed=$(perl -ne 'print "$1\n" if /boundary rows in ([0-9]+(?:\.[0-9]+)?) ms count=/' "$trace")
+        trace_batch_count=$(perl -ne 'print "$1\n" if /boundary rows in [0-9]+(?:\.[0-9]+)? ms count=([0-9]+)/' "$trace")
     fi
     if [[ "$arm" == on ]]; then
         [[ "$event_count" == 1 && "$trace_requests" == 4 \
-            && -n "$trace_elapsed" ]] || {
-            echo "pair $pair ON width $target did not prove one four-lane aggregate" >&2
+            && "$trace_rows" == "$expected_work" && -n "$trace_elapsed" \
+            && "$trace_batch_count" =~ ^[1-9][0-9]*$ ]] || {
+            echo "pair $pair ON width $target did not prove exactly one B4 stable rectangle" >&2
             return 1
         }
     else
-        [[ "$event_count" == 0 ]] || { echo "OFF arm emitted aggregate trace" >&2; return 1; }
+        [[ "$event_count" == 0 ]] || {
+            echo "pair $pair OFF width $target emitted a stable rectangle" >&2
+            return 1
+        }
     fi
+
     jq -c -n --slurpfile lanes "$lanes_file" \
         --argjson pair "$pair" --argjson position "$position" --arg arm "$arm" \
         --argjson width_position "$width_position" --argjson target "$target" \
-        --argjson wave_ms "$wave_ms" \
+        --argjson wave_ms "$wave_ms" --argjson prime_aggregate "$prime_aggregate" \
         --arg wall "${sample_dir#"$OUT_DIR/"}/wave.wall" \
         --arg wall_sha "$(sha256_file "$sample_dir/wave.wall")" \
         --arg trace "${trace#"$OUT_DIR/"}" --arg trace_sha "$(sha256_file "$trace")" \
         --arg lanes_path "${lanes_file#"$OUT_DIR/"}" --arg lanes_sha "$(sha256_file "$lanes_file")" \
         --argjson events "$event_count" --argjson trace_requests "$trace_requests" \
-        --argjson trace_elapsed "$trace_elapsed" --argjson aggregate_rows "$aggregate_rows" \
+        --argjson trace_rows "$trace_rows" --argjson trace_elapsed "$trace_elapsed" \
+        --argjson trace_batch_count "$trace_batch_count" \
+        --argjson aggregate_rows "$aggregate_rows" \
         --argjson launch_skew "$launch_skew" --argjson latest_start "$latest_start" \
         --argjson earliest_finish "$earliest_finish" \
         --argjson actual_overlap "$actual_overlap" '{
-          schema_version:1,pair:$pair,process_position:$position,arm:$arm,
+          schema_version:2,pair:$pair,process_position:$position,arm:$arm,
           width_position:$width_position,target_rows:$target,wave_ms:$wave_ms,
+          prime_aggregate_prompt_tokens:$prime_aggregate,
           wave_wall_path:$wall,wave_wall_sha256:$wall_sha,
           trace_path:$trace,trace_sha256:$trace_sha,trace_event_count:$events,
-          trace_requests:$trace_requests,trace_elapsed_ms:$trace_elapsed,
+          trace_requests:$trace_requests,trace_boundary_rows:$trace_rows,
+          trace_elapsed_ms:$trace_elapsed,trace_batch_count:$trace_batch_count,
           aggregate_work_rows:$aggregate_rows,launch_skew_seconds:$launch_skew,
           latest_start:$latest_start,earliest_finish:$earliest_finish,
           actual_overlap:$actual_overlap,lanes_path:$lanes_path,
           lanes_sha256:$lanes_sha,lanes:$lanes
         }' >>"$samples"
 }
-
 run_warmup_waves() {
-    local pair=$1 model_id=$2 warmup_dir warmup lane barrier pid request response wall prompt
+    local pair=$1 model_id=$2 warmup_dir warmup lane barrier pid request response wall
     local -a warmup_pids
     warmup_dir=$(mktemp -d "$RUNTIME_TMPDIR/gemma-b2-warmup.XXXXXX")
     for warmup in 1 2; do
@@ -432,7 +668,7 @@ run_warmup_waves() {
             request="$warmup_dir/$warmup-$lane.request.json"
             response="$warmup_dir/$warmup-$lane.response.json"
             wall="$warmup_dir/$warmup-$lane.wall"
-            build_request "$model_id" "$((pair + 100 + warmup))" 256 "$lane" "$request"
+            build_warmup_request "$model_id" "$((pair + 100 + warmup))" "$lane" "$request"
             (
                 while [[ ! -e "$barrier" ]]; do sleep 0.001; done
                 curl --fail-with-body --silent --show-error --connect-timeout 5 \
@@ -449,13 +685,6 @@ run_warmup_waves() {
             jq -e '.usage.prompt_tokens_details.cached_tokens == 0
               and (.usage.completion_tokens | numbers) == 1' \
                 "$warmup_dir/$warmup-$lane.response.json" >/dev/null
-            prompt=$(jq -er '.usage.prompt_tokens' \
-                "$warmup_dir/$warmup-$lane.response.json")
-            ((prompt >= 256 - MAX_TARGET_ROW_DRIFT \
-                && prompt <= 256 + MAX_TARGET_ROW_DRIFT)) || {
-                echo "pair $pair warmup $warmup lane $lane missed calibrated bin: $prompt" >&2
-                return 1
-            }
         done
     done
     rm -R "$warmup_dir"
@@ -538,7 +767,7 @@ run_arm() {
         --arg models "${process_dir#"$OUT_DIR/"}/models.json" --arg models_sha "$(sha256_file "$process_dir/models.json")" \
         --arg stdout "${process_dir#"$OUT_DIR/"}/server.stdout" --arg stdout_sha "$(sha256_file "$process_dir/server.stdout")" \
         --arg stderr "${process_dir#"$OUT_DIR/"}/server.stderr" --arg stderr_sha "$(sha256_file "$process_dir/server.stderr")" '{
-          schema_version:1,status:"stopped",pair:$pair,position:$position,arm:$arm,pid:$pid,
+          schema_version:2,status:"stopped",pair:$pair,position:$position,arm:$arm,pid:$pid,
           command:$command,model_id:$model_id,max_slots:4,
           runtime:{clean_environment:true,home:$runtime_home,
             path:"/usr/bin:/bin:/usr/sbin:/sbin",tmpdir:"/var/tmp",
@@ -627,14 +856,21 @@ jq -n --slurpfile processes "$process_bindings" \
     --arg power_events_baseline_sha "$(sha256_file "$OUT_DIR/caffeinate.log.power-events.baseline")" \
     --arg power_events_final_sha "$(sha256_file "$OUT_DIR/caffeinate.log.power-events.final")" \
     --arg power_events_new_sha "$(sha256_file "$OUT_DIR/caffeinate.log.power-events.new")" '{
-      schema_version:1,status:"measured",
-      configuration:{pairs:8,width_targets:[128,256,512],lanes:4,
+      schema_version:2,status:"measured",
+      configuration:{pairs:8,width_targets:[64,128,256],lanes:4,
         pair_order:"off-on-even_on-off-odd",
         warmup_waves_per_process:2,measured_waves_per_process:3,
-        payload_word_adjustment:40,maximum_target_row_drift:4,
+        prime_turns_per_wave:4,prime_history_words:1200,
+        minimum_prime_aggregate_tokens:4097,
+        continuation_protocols:["unary","unary","sse","sse"],
+        tool_result_word_adjustment:40,maximum_target_row_drift:4,
         off_env:{HF2Q_CROSS_SLOT_ADMIT:"0",HF2Q_ADMIT_COALESCE_US:"0"},
         on_env:{HF2Q_CROSS_SLOT_ADMIT:"1",HF2Q_ADMIT_COALESCE_US:"25000"},
-        request:{max_tokens:1,seed:42,temperature:0,repetition_penalty:1,stream:false,thinking:false},
+        prime_request:{max_tokens:96,seed:42,temperature:0,repetition_penalty:1,
+          stream:false,thinking:false,tool_choice:"required"},
+        continuation_request:{max_tokens:32,seed:42,temperature:0,
+          repetition_penalty:1,tool_choice:"auto",thinking:false},
+        semantic_normalization:"generated-call-ids-only",
         analysis:{statistic:"median paired OFF/ON wave speedup",
           order_stratified_bootstrap_samples:10000,bootstrap_seed:49004,
           lower_confidence_percentile:2.5,

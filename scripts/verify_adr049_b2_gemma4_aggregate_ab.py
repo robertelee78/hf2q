@@ -14,18 +14,20 @@ import sys
 from pathlib import Path
 from typing import NoReturn
 
-SCHEMA = 1
+SCHEMA = 2
 PAIRS = 8
-WIDTHS = [128, 256, 512]
+WIDTHS = [64, 128, 256]
 LANES = 4
+PRIME_HISTORY_WORDS = 1200
+MIN_PRIME_AGGREGATE_TOKENS = 4097
 BOOTSTRAPS = 10_000
 BOOTSTRAP_SEED = 49_004
 MIN_LOWER_CI = 1.05
-PAYLOAD_WORD_ADJUSTMENT = 40
+TOOL_RESULT_WORD_ADJUSTMENT = 40
 MAX_TARGET_ROW_DRIFT = 4
 TRACE_RE = re.compile(
-    r"\[PREFILL_TIMING\] BATCHED ([0-9]+) seqs in "
-    r"([0-9]+(?:\.[0-9]+)?) ms \(one multi-seq forward, iter-G\(a\)\)"
+    r"\[PREFILL_TIMING\] STABLE BATCHED ([0-9]+) seqs x "
+    r"([0-9]+) boundary rows in ([0-9]+(?:\.[0-9]+)?) ms count=([0-9]+)"
 )
 FATAL_RE = re.compile(
     r"GPU Timeout|SubmissionsIgnored|Command buffer error|Generation error|"
@@ -274,12 +276,20 @@ def expected_configuration() -> dict:
         "pairs": PAIRS, "width_targets": WIDTHS, "lanes": LANES,
         "pair_order": "off-on-even_on-off-odd", "warmup_waves_per_process": 2,
         "measured_waves_per_process": 3,
-        "payload_word_adjustment": PAYLOAD_WORD_ADJUSTMENT,
+        "prime_turns_per_wave": 4, "prime_history_words": PRIME_HISTORY_WORDS,
+        "minimum_prime_aggregate_tokens": MIN_PRIME_AGGREGATE_TOKENS,
+        "continuation_protocols": ["unary", "unary", "sse", "sse"],
+        "tool_result_word_adjustment": TOOL_RESULT_WORD_ADJUSTMENT,
         "maximum_target_row_drift": MAX_TARGET_ROW_DRIFT,
         "off_env": {"HF2Q_CROSS_SLOT_ADMIT": "0", "HF2Q_ADMIT_COALESCE_US": "0"},
         "on_env": {"HF2Q_CROSS_SLOT_ADMIT": "1", "HF2Q_ADMIT_COALESCE_US": "25000"},
-        "request": {"max_tokens": 1, "seed": 42, "temperature": 0,
-                    "repetition_penalty": 1, "stream": False, "thinking": False},
+        "prime_request": {"max_tokens": 96, "seed": 42, "temperature": 0,
+                          "repetition_penalty": 1, "stream": False,
+                          "thinking": False, "tool_choice": "required"},
+        "continuation_request": {"max_tokens": 32, "seed": 42, "temperature": 0,
+                                 "repetition_penalty": 1, "tool_choice": "auto",
+                                 "thinking": False},
+        "semantic_normalization": "generated-call-ids-only",
         "analysis": {"statistic": "median paired OFF/ON wave speedup",
                      "order_stratified_bootstrap_samples": BOOTSTRAPS,
                      "bootstrap_seed": BOOTSTRAP_SEED,
@@ -389,19 +399,184 @@ def validate_manifest(root: Path, manifest: dict) -> tuple[list[dict], dict[tupl
     return read_jsonl(samples_path), process_map
 
 
-def normalize_response(response: dict) -> dict:
+def normalized_call_ids(value: dict) -> dict:
+    normalized = json.loads(json.dumps(value))
+    for message in normalized.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+        for call in message.get("tool_calls") or []:
+            if isinstance(call, dict) and "id" in call:
+                call["id"] = "<generated-call-id>"
+        if message.get("role") == "tool" and "tool_call_id" in message:
+            message["tool_call_id"] = "<generated-call-id>"
+    for choice in normalized.get("choices", []):
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            continue
+        for call in choice["message"].get("tool_calls") or []:
+            if isinstance(call, dict) and "id" in call:
+                call["id"] = "<generated-call-id>"
+    return normalized
+
+
+def prime_content(pair: int, target: int, lane: int) -> str:
+    path = f"/tmp/adr049-p{pair:02d}-w{target:03d}-l{lane}.txt"
+    return (
+        f"Long agent history for pair {pair:02d} width {target:03d} lane {lane}. "
+        + "history " * PRIME_HISTORY_WORDS
+        + f"Call read_note exactly once with path {path}. "
+        + "After the tool result, reply exactly ADR049_GEMMA_STABLE_OK."
+    )
+
+
+def expected_prime_request(model_id: str, pair: int, target: int, lane: int) -> dict:
+    return {
+        "model": model_id,
+        "messages": [{"role": "user", "content": prime_content(pair, target, lane)}],
+        "tools": [{"type": "function", "function": {
+            "name": "read_note", "description": "Read one exact local note",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
+                           "required": ["path"], "additionalProperties": False},
+        }}],
+        "tool_choice": "required",
+        "max_tokens": 96, "seed": 42, "temperature": 0, "repetition_penalty": 1,
+        "stream": False, "hf2q_enable_thinking": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+
+def validate_prime_response(response: dict, pair: int, target: int, lane: int) -> tuple[int, int]:
+    expected_path = f"/tmp/adr049-p{pair:02d}-w{target:03d}-l{lane}.txt"
     try:
-        return {"message": response["choices"][0]["message"],
-                "finish_reason": response["choices"][0]["finish_reason"],
-                "usage": {key: response["usage"].get(key) for key in (
-                    "prompt_tokens", "completion_tokens", "total_tokens",
-                    "prompt_tokens_details",
-                )}}
+        choices = response["choices"]
+        choice = choices[0]
+        message = choice["message"]
+        calls = message["tool_calls"]
+        call = calls[0]
+        arguments = json.loads(call["function"]["arguments"])
+        usage = response["usage"]
+        prompt = usage["prompt_tokens"]
+        cached = usage["prompt_tokens_details"]["cached_tokens"]
+        completion = usage["completion_tokens"]
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        fail(f"prime pair {pair} width {target} lane {lane} response is malformed")
+    if len(choices) != 1 or choice.get("finish_reason") != "tool_calls" \
+            or not (message.get("content") is None
+                    or isinstance(message.get("content"), str)) or len(calls) != 1 \
+            or not isinstance(call.get("id"), str) or not call["id"] \
+            or call.get("type") != "function" or call["function"].get("name") != "read_note" \
+            or arguments != {"path": expected_path} \
+            or not isinstance(prompt, int) or isinstance(prompt, bool) or prompt <= 0 \
+            or cached != 0 or not isinstance(completion, int) or completion <= 0:
+        fail(f"prime pair {pair} width {target} lane {lane} is not one exact cold tool call")
+    return prompt, cached
+
+
+def expected_prime_normalized(response: dict) -> dict:
+    wrapped = normalized_call_ids({"choices": [response["choices"][0]]})
+    return {
+        "choice": wrapped["choices"][0],
+        "completion_tokens": response["usage"]["completion_tokens"],
+    }
+
+
+def tool_result_content(target: int) -> str:
+    words = target - TOOL_RESULT_WORD_ADJUSTMENT
+    if words <= 0:
+        fail(f"target {target} exhausts tool-result word adjustment")
+    return (
+        "read_note succeeded. "
+        + "measurement " * words
+        + "Now reply exactly ADR049_GEMMA_STABLE_OK."
+    )
+
+
+def expected_continuation_request(
+    prime_request: dict, prime_response: dict, target: int, stream: bool
+) -> dict:
+    expected = json.loads(json.dumps(prime_request))
+    prior = prime_response["choices"][0]["message"]
+    expected["messages"].extend([
+        {"role": "assistant", "content": prior["content"], "tool_calls": prior["tool_calls"]},
+        {"role": "tool", "tool_call_id": prior["tool_calls"][0]["id"],
+         "content": tool_result_content(target)},
+    ])
+    expected["tool_choice"] = "auto"
+    expected["max_tokens"] = 32
+    expected["stream"] = stream
+    if stream:
+        expected["stream_options"] = {"include_usage": True}
+    else:
+        expected.pop("stream_options", None)
+    return expected
+
+
+def canonical_unary(wire: dict) -> dict:
+    try:
+        return {
+            "choices": [{"message": wire["choices"][0]["message"],
+                         "finish_reason": wire["choices"][0]["finish_reason"]}],
+            "usage": wire["usage"],
+            "x_hf2q_timing": wire["x_hf2q_timing"],
+        }
+    except (KeyError, IndexError, TypeError):
+        fail("unary wire response lacks canonical fields")
+
+
+def canonical_sse(wire_path: Path, events_path: Path) -> dict:
+    try:
+        lines = wire_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        fail(f"cannot read SSE wire response: {error}")
+    data_lines = [line[len("data: "):] for line in lines if line.startswith("data: ")]
+    if any(line and not line.startswith("data: ") for line in lines) \
+            or data_lines.count("[DONE]") != 1 or not data_lines \
+            or data_lines[-1] != "[DONE]":
+        fail("SSE wire did not end with exactly one [DONE]")
+    try:
+        events = [json.loads(payload) for payload in data_lines[:-1]]
+    except json.JSONDecodeError:
+        fail("SSE wire contains malformed JSON")
+    if not events or any(not isinstance(event, dict) for event in events) \
+            or read_jsonl(events_path) != events:
+        fail("SSE events are not raw-derived")
+    choices = [choice for event in events for choice in event.get("choices", [])
+               if isinstance(choice, dict)]
+    deltas = [choice.get("delta", {}) for choice in choices]
+    if any(delta.get("tool_calls") for delta in deltas if isinstance(delta, dict)):
+        fail("SSE continuation emitted a tool call")
+    roles = [delta["role"] for delta in deltas
+             if isinstance(delta, dict) and delta.get("role") is not None]
+    contents = [delta["content"] for delta in deltas
+                if isinstance(delta, dict) and delta.get("content") is not None]
+    finishes = [choice["finish_reason"] for choice in choices
+                if choice.get("finish_reason") is not None]
+    usages = [event["usage"] for event in events if event.get("usage") is not None]
+    timings = [event["x_hf2q_timing"] for event in events
+               if event.get("x_hf2q_timing") is not None]
+    if roles != ["assistant"] or finishes != ["stop"] or len(usages) != 1 or len(timings) != 1:
+        fail("SSE role/finish/usage/timing contract drifted")
+    return {
+        "choices": [{"message": {"role": "assistant", "content": "".join(contents)},
+                     "finish_reason": "stop"}],
+        "usage": usages[0],
+        "x_hf2q_timing": timings[0],
+    }
+
+
+def semantic_response(response: dict) -> dict:
+    try:
+        return {
+            "message": response["choices"][0]["message"],
+            "finish_reason": response["choices"][0]["finish_reason"],
+            "usage": response["usage"],
+        }
     except (KeyError, IndexError, TypeError):
         fail("response lacks normalized semantic fields")
 
 
-def validate_samples(root: Path, rows: list[dict], processes: dict[tuple[int, str], dict]) -> dict[tuple[int, int, str], dict]:
+def validate_samples(
+    root: Path, rows: list[dict], processes: dict[tuple[int, str], dict]
+) -> dict[tuple[int, int, str], dict]:
     if len(rows) != PAIRS * 2 * len(WIDTHS):
         fail("wave sample count is invalid")
     samples: dict[tuple[int, int, str], dict] = {}
@@ -413,97 +588,217 @@ def validate_samples(root: Path, rows: list[dict], processes: dict[tuple[int, st
             for width_position, target in enumerate(WIDTHS):
                 row = rows[cursor]
                 cursor += 1
-                required = {"schema_version", "pair", "process_position", "arm", "width_position",
-                            "target_rows", "wave_ms", "wave_wall_path", "wave_wall_sha256",
-                            "trace_path", "trace_sha256", "trace_event_count", "trace_requests",
-                            "trace_elapsed_ms", "aggregate_work_rows", "launch_skew_seconds",
-                            "latest_start", "earliest_finish", "actual_overlap",
-                            "lanes_path", "lanes_sha256", "lanes"}
+                required = {
+                    "schema_version", "pair", "process_position", "arm", "width_position",
+                    "target_rows", "wave_ms", "prime_aggregate_prompt_tokens",
+                    "wave_wall_path", "wave_wall_sha256", "trace_path", "trace_sha256",
+                    "trace_event_count", "trace_requests", "trace_boundary_rows",
+                    "trace_elapsed_ms", "trace_batch_count", "aggregate_work_rows",
+                    "launch_skew_seconds", "latest_start", "earliest_finish",
+                    "actual_overlap", "lanes_path", "lanes_sha256", "lanes",
+                }
                 if set(row) != required or row["schema_version"] != SCHEMA \
-                        or (row["pair"], row["process_position"], row["arm"], row["width_position"], row["target_rows"]) \
+                        or (row["pair"], row["process_position"], row["arm"],
+                            row["width_position"], row["target_rows"]) \
                         != (pair, position, arm, width_position, target):
                     fail(f"wave {cursor} schema or execution order drifted")
                 wave_ms = finite(row["wave_ms"], f"wave {cursor} wall")
-                wall_path = bind_file(root, row["wave_wall_path"], row["wave_wall_sha256"], f"wave {cursor} wall")
+                wall_path = bind_file(
+                    root, row["wave_wall_path"], row["wave_wall_sha256"], f"wave {cursor} wall"
+                )
                 try:
                     raw_wall_ms = float(wall_path.read_text(encoding="utf-8").strip()) * 1000
                 except (OSError, UnicodeError, ValueError):
                     fail(f"wave {cursor} wall file is invalid")
                 if abs(raw_wall_ms - wave_ms) > 1e-6:
                     fail(f"wave {cursor} wall is not raw-bound")
-                trace_path = bind_file(root, row["trace_path"], row["trace_sha256"], f"wave {cursor} trace")
-                trace_values = [(int(a), float(b)) for a, b in TRACE_RE.findall(trace_path.read_text(encoding="utf-8"))]
+
+                trace_path = bind_file(
+                    root, row["trace_path"], row["trace_sha256"], f"wave {cursor} trace"
+                )
+                trace_values = [
+                    (int(requests), int(boundary), float(elapsed), int(count))
+                    for requests, boundary, elapsed, count
+                    in TRACE_RE.findall(trace_path.read_text(encoding="utf-8"))
+                ]
                 expected_events = 1 if arm == "on" else 0
-                if row["trace_event_count"] != expected_events or len(trace_values) != expected_events:
-                    fail(f"wave {cursor} aggregate reachability count is invalid")
-                lanes_path = bind_file(root, row["lanes_path"], row["lanes_sha256"], f"wave {cursor} lanes")
+                if row["trace_event_count"] != expected_events \
+                        or len(trace_values) != expected_events:
+                    fail(f"wave {cursor} stable-route reachability count is invalid")
+
+                lanes_path = bind_file(
+                    root, row["lanes_path"], row["lanes_sha256"], f"wave {cursor} lanes"
+                )
                 lanes = row["lanes"]
-                if not isinstance(lanes, list) or len(lanes) != LANES or read_jsonl(lanes_path) != lanes:
+                if not isinstance(lanes, list) or len(lanes) != LANES \
+                        or read_jsonl(lanes_path) != lanes:
                     fail(f"wave {cursor} does not contain four raw-bound lanes")
-                starts, finishes, aggregate_rows = [], [], 0
+                starts: list[float] = []
+                finishes: list[float] = []
+                aggregate_rows = 0
+                prime_prompts: list[int] = []
+                cached_shapes: list[int] = []
+                work_shapes: list[int] = []
+                prime_request_hashes: set[str] = set()
+
                 for lane_index, lane in enumerate(lanes):
-                    lane_required = {"lane", "prompt_tokens", "cached_tokens", "work_rows", "prefill_ms",
-                                     "ttft_ms", "wall_ms", "request_path", "request_sha256", "response_path",
-                                     "response_sha256", "wall_path", "wall_sha256", "timing_path", "timing_sha256",
-                                     "normalized_path", "normalized_sha256"}
-                    if set(lane) != lane_required or lane["lane"] != lane_index:
-                        fail(f"wave {cursor} lane {lane_index} schema is invalid")
-                    prompt, cached, work = lane["prompt_tokens"], lane["cached_tokens"], lane["work_rows"]
-                    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (prompt, cached, work)) \
-                            or cached != 0 or work != prompt \
-                            or abs(work - target) > MAX_TARGET_ROW_DRIFT:
-                        fail(f"wave {cursor} lane {lane_index} is not cold in its target bin")
+                    protocol = "unary" if lane_index < 2 else "sse"
+                    lane_required = {
+                        "lane", "protocol", "prime_prompt_tokens", "prime_cached_tokens",
+                        "prompt_tokens", "cached_tokens", "work_rows", "prefill_ms",
+                        "ttft_ms", "wall_ms", "prime_request_path", "prime_request_sha256",
+                        "prime_response_path", "prime_response_sha256",
+                        "prime_normalized_path", "prime_normalized_sha256",
+                        "request_path", "request_sha256", "request_normalized_path",
+                        "request_normalized_sha256", "wire_response_path",
+                        "wire_response_sha256", "sse_events_path", "sse_events_sha256",
+                        "canonical_response_path", "canonical_response_sha256",
+                        "wall_path", "wall_sha256", "timing_path", "timing_sha256",
+                        "normalized_path", "normalized_sha256",
+                    }
+                    if set(lane) != lane_required or lane["lane"] != lane_index \
+                            or lane["protocol"] != protocol:
+                        fail(f"wave {cursor} lane {lane_index} schema/protocol is invalid")
+
+                    prime_request_path = bind_file(
+                        root, lane["prime_request_path"], lane["prime_request_sha256"],
+                        "prime request",
+                    )
+                    prime_response_path = bind_file(
+                        root, lane["prime_response_path"], lane["prime_response_sha256"],
+                        "prime response",
+                    )
+                    prime_normalized_path = bind_file(
+                        root, lane["prime_normalized_path"], lane["prime_normalized_sha256"],
+                        "prime normalized",
+                    )
+                    prime_request = read_json(prime_request_path)
+                    prime_response = read_json(prime_response_path)
+                    if prime_request != expected_prime_request(
+                        process["model_id"], pair, target, lane_index
+                    ):
+                        fail(f"wave {cursor} lane {lane_index} prime request drifted")
+                    prime_prompt, prime_cached = validate_prime_response(
+                        prime_response, pair, target, lane_index
+                    )
+                    if (lane["prime_prompt_tokens"], lane["prime_cached_tokens"]) \
+                            != (prime_prompt, prime_cached):
+                        fail(f"wave {cursor} lane {lane_index} prime usage is not raw-bound")
+                    if read_json(prime_normalized_path) != expected_prime_normalized(prime_response):
+                        fail(f"wave {cursor} lane {lane_index} prime normalization drifted")
+                    prime_prompts.append(prime_prompt)
+                    prime_request_hashes.add(lane["prime_request_sha256"])
+
+                    request_path = bind_file(
+                        root, lane["request_path"], lane["request_sha256"], "continuation request"
+                    )
+                    request_normalized_path = bind_file(
+                        root, lane["request_normalized_path"],
+                        lane["request_normalized_sha256"], "continuation normalized request",
+                    )
+                    request = read_json(request_path)
+                    stream = protocol == "sse"
+                    if request != expected_continuation_request(
+                        prime_request, prime_response, target, stream
+                    ):
+                        fail(f"wave {cursor} lane {lane_index} continuation does not carry "
+                             "the exact prior assistant and matching tool result")
+                    if read_json(request_normalized_path) != normalized_call_ids(request):
+                        fail(f"wave {cursor} lane {lane_index} request normalization drifted")
+
+                    wire_path = bind_file(
+                        root, lane["wire_response_path"], lane["wire_response_sha256"],
+                        "wire response",
+                    )
+                    events_path = bind_file(
+                        root, lane["sse_events_path"], lane["sse_events_sha256"], "SSE events"
+                    )
+                    canonical_path = bind_file(
+                        root, lane["canonical_response_path"],
+                        lane["canonical_response_sha256"], "canonical response",
+                    )
+                    canonical = read_json(canonical_path)
+                    if protocol == "unary":
+                        if events_path.read_text(encoding="utf-8"):
+                            fail(f"wave {cursor} unary lane carries SSE events")
+                        derived = canonical_unary(read_json(wire_path))
+                    else:
+                        derived = canonical_sse(wire_path, events_path)
+                    if canonical != derived:
+                        fail(f"wave {cursor} lane {lane_index} canonical response is not wire-derived")
+                    try:
+                        choice = canonical["choices"][0]
+                        message = choice["message"]
+                        usage = canonical["usage"]
+                        prompt = usage["prompt_tokens"]
+                        cached = usage["prompt_tokens_details"]["cached_tokens"]
+                        completion = usage["completion_tokens"]
+                        timing = canonical["x_hf2q_timing"]
+                        response_prefill = timing["prefill_time_secs"] * 1000
+                        response_ttft = timing["time_to_first_token_ms"]
+                    except (KeyError, IndexError, TypeError):
+                        fail(f"wave {cursor} lane {lane_index} response timing is malformed")
+                    work = prompt - cached
+                    if choice.get("finish_reason") != "stop" \
+                            or message.get("role") != "assistant" \
+                            or message.get("content") != "ADR049_GEMMA_STABLE_OK" \
+                            or message.get("tool_calls") not in (None, []) \
+                            or not all(isinstance(value, int) and not isinstance(value, bool)
+                                       for value in (prompt, cached, completion)) \
+                            or cached <= 0 or completion <= 0 \
+                            or work < 32 or work > 256 \
+                            or abs(work - target) > MAX_TARGET_ROW_DRIFT \
+                            or (lane["prompt_tokens"], lane["cached_tokens"], lane["work_rows"]) \
+                            != (prompt, cached, work):
+                        fail(f"wave {cursor} lane {lane_index} is not a cached stable "
+                             "tool-result continuation in its target bin")
+                    cached_shapes.append(cached)
+                    work_shapes.append(work)
                     aggregate_rows += work
                     for name in ("prefill_ms", "ttft_ms", "wall_ms"):
                         finite(lane[name], f"wave {cursor} lane {lane_index} {name}")
-                    request_path = bind_file(root, lane["request_path"], lane["request_sha256"], "lane request")
-                    response_path = bind_file(root, lane["response_path"], lane["response_sha256"], "lane response")
-                    lane_wall_path = bind_file(root, lane["wall_path"], lane["wall_sha256"], "lane wall")
-                    timing_path = bind_file(root, lane["timing_path"], lane["timing_sha256"], "lane timing")
-                    normalized_path = bind_file(root, lane["normalized_path"], lane["normalized_sha256"], "lane normalized")
-                    request = read_json(request_path)
-                    messages = request.get("messages")
-                    expected_prefix = f"adr049-b2-gemma-p{pair:02d}-w{target:03d}-l{lane_index} "
-                    expected_content = (
-                        expected_prefix
-                        + "measurement " * (target - PAYLOAD_WORD_ADJUSTMENT)
-                        + "Reply with one word."
-                    )
-                    if request.get("model") != process["model_id"] or request.get("max_tokens") != 1 \
-                            or request.get("seed") != 42 or request.get("temperature") != 0 \
-                            or request.get("repetition_penalty") != 1 or request.get("stream") is not False \
-                            or request.get("hf2q_enable_thinking") is not False \
-                            or request.get("chat_template_kwargs") != {"enable_thinking": False} \
-                            or not isinstance(messages, list) or len(messages) != 1 \
-                            or not isinstance(messages[0], dict) or messages[0].get("role") != "user" \
-                            or messages[0].get("content") != expected_content:
-                        fail(f"wave {cursor} lane {lane_index} request drifted")
-                    response = read_json(response_path)
-                    try:
-                        response_prompt = response["usage"]["prompt_tokens"]
-                        response_cached = response["usage"]["prompt_tokens_details"]["cached_tokens"]
-                        response_completion = response["usage"]["completion_tokens"]
-                        response_prefill = response["x_hf2q_timing"]["prefill_time_secs"] * 1000
-                        response_ttft = response["x_hf2q_timing"]["time_to_first_token_ms"]
-                    except (KeyError, TypeError):
-                        fail(f"wave {cursor} lane {lane_index} response timing is malformed")
-                    if response_prompt != prompt or response_cached != cached or response_completion != 1 \
-                            or abs(float(response_prefill) - float(lane["prefill_ms"])) > 1e-9 \
+                    if abs(float(response_prefill) - float(lane["prefill_ms"])) > 1e-9 \
                             or abs(float(response_ttft) - float(lane["ttft_ms"])) > 1e-9:
-                        fail(f"wave {cursor} lane {lane_index} response is not raw-bound")
+                        fail(f"wave {cursor} lane {lane_index} response timing is not raw-bound")
+
+                    lane_wall_path = bind_file(
+                        root, lane["wall_path"], lane["wall_sha256"], "lane wall"
+                    )
+                    timing_path = bind_file(
+                        root, lane["timing_path"], lane["timing_sha256"], "lane timing"
+                    )
+                    normalized_path = bind_file(
+                        root, lane["normalized_path"], lane["normalized_sha256"],
+                        "lane normalized",
+                    )
                     try:
                         lane_wall = float(lane_wall_path.read_text(encoding="utf-8").strip()) * 1000
-                        start_text, finish_text = timing_path.read_text(encoding="utf-8").strip().split("\t")
+                        start_text, finish_text = timing_path.read_text(
+                            encoding="utf-8"
+                        ).strip().split("\t")
                         start, finish = float(start_text), float(finish_text)
                     except (OSError, UnicodeError, ValueError):
                         fail(f"wave {cursor} lane {lane_index} timing file is malformed")
-                    if abs(lane_wall - float(lane["wall_ms"])) > 1e-6 or not math.isfinite(start) \
-                            or not math.isfinite(finish) or start <= 0 or finish <= start:
+                    if abs(lane_wall - float(lane["wall_ms"])) > 1e-6 \
+                            or not math.isfinite(start) or not math.isfinite(finish) \
+                            or start <= 0 or finish <= start:
                         fail(f"wave {cursor} lane {lane_index} timing is not raw-bound")
                     starts.append(start)
                     finishes.append(finish)
-                    if read_json(normalized_path) != normalize_response(response):
+                    if read_json(normalized_path) != semantic_response(canonical):
                         fail(f"wave {cursor} lane {lane_index} normalized result is not derived")
+
+                if len(prime_request_hashes) != LANES:
+                    fail(f"wave {cursor} did not prime four distinct conversations")
+                if len(set(prime_prompts)) != 1:
+                    fail(f"wave {cursor} prime turns were not equal-token-width")
+                prime_aggregate = sum(prime_prompts)
+                if prime_aggregate < MIN_PRIME_AGGREGATE_TOKENS \
+                        or row["prime_aggregate_prompt_tokens"] != prime_aggregate:
+                    fail(f"wave {cursor} did not prove a >4096-token aggregate prime history")
+                if len(set(cached_shapes)) != 1 or len(set(work_shapes)) != 1:
+                    fail(f"wave {cursor} stable continuations were not equal-shaped")
+
                 skew, latest, earliest = max(starts) - min(starts), max(starts), min(finishes)
                 if row["actual_overlap"] is not True or skew > 0.100 or latest >= earliest \
                         or abs(float(row["launch_skew_seconds"]) - skew) > 1e-6 \
@@ -513,22 +808,34 @@ def validate_samples(root: Path, rows: list[dict], processes: dict[tuple[int, st
                 if row["aggregate_work_rows"] != aggregate_rows:
                     fail(f"wave {cursor} aggregate work is not lane-bound")
                 if arm == "on":
-                    requests, elapsed = trace_values[0]
-                    if requests != LANES or elapsed <= 0 or row["trace_requests"] != requests \
-                            or abs(float(row["trace_elapsed_ms"]) - elapsed) > 1e-9:
-                        fail(f"wave {cursor} did not reach one four-lane multi-seq forward")
-                elif row["trace_requests"] is not None or row["trace_elapsed_ms"] is not None:
-                    fail(f"wave {cursor} OFF arm fabricated reachability fields")
+                    requests, boundary, elapsed, count = trace_values[0]
+                    if requests != LANES or boundary != work_shapes[0] or elapsed <= 0 \
+                            or count <= 0 or row["trace_requests"] != requests \
+                            or row["trace_boundary_rows"] != boundary \
+                            or abs(float(row["trace_elapsed_ms"]) - elapsed) > 1e-9 \
+                            or row["trace_batch_count"] != count:
+                        fail(f"wave {cursor} did not reach exactly one B4 stable rectangle")
+                elif any(row[key] is not None for key in (
+                    "trace_requests", "trace_boundary_rows", "trace_elapsed_ms",
+                    "trace_batch_count",
+                )):
+                    fail(f"wave {cursor} OFF arm fabricated stable-route fields")
                 samples[(pair, target, arm)] = row
+
     for pair in range(PAIRS):
         for target in WIDTHS:
             off, on = samples[(pair, target, "off")], samples[(pair, target, "on")]
-            if [lane["request_sha256"] for lane in off["lanes"]] != [lane["request_sha256"] for lane in on["lanes"]]:
-                fail(f"pair {pair} width {target} request bytes differ")
-            if [lane["normalized_sha256"] for lane in off["lanes"]] != [lane["normalized_sha256"] for lane in on["lanes"]]:
-                fail(f"pair {pair} width {target} canonical results differ")
+            for lane_index, (off_lane, on_lane) in enumerate(zip(off["lanes"], on["lanes"])):
+                if off_lane["prime_request_sha256"] != on_lane["prime_request_sha256"]:
+                    fail(f"pair {pair} width {target} lane {lane_index} prime bytes differ")
+                if off_lane["prime_normalized_sha256"] != on_lane["prime_normalized_sha256"]:
+                    fail(f"pair {pair} width {target} lane {lane_index} prime results differ")
+                if off_lane["request_normalized_sha256"] \
+                        != on_lane["request_normalized_sha256"]:
+                    fail(f"pair {pair} width {target} lane {lane_index} normalized continuation requests differ")
+                if off_lane["normalized_sha256"] != on_lane["normalized_sha256"]:
+                    fail(f"pair {pair} width {target} lane {lane_index} canonical results differ")
     return samples
-
 
 def analyze(samples: dict[tuple[int, int, str], dict]) -> dict:
     rng = random.Random(BOOTSTRAP_SEED)
