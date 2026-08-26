@@ -334,7 +334,7 @@ jq -e --slurpfile raw "$raw" \
     and .over_limit_measurement_samples == 0
     and .non_nominal_measurement_samples == .fair_measurement_samples
     and .settle_telemetry_gaps == 0 and .telemetry_gaps == 0
-    and .host_contention.policy == "process-group-v1"
+    and .host_contention.policy == "process-group-cpu-v2"
     and (.host_contention.settle.log_sha256 | test("^[0-9a-f]{64}$"))
     and (.host_contention.settle.samples | type) == "number"
     and .host_contention.settle.samples > 0

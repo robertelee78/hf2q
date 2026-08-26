@@ -118,11 +118,11 @@ jq -cS '.phase_contract.markers[]' "$raw" >"$phase_log"
 printf '2000\tnominal\tdecode-cohort-measurement-start\n' >"$measurement"
 printf '2002\tfair\tdecode-cohort-measurement\n' >>"$measurement"
 printf '2004\tfair\tdecode-cohort-measurement-end\n' >>"$measurement"
-printf '2000\tquiet\tdecode-cohort-measurement-start\t100\t-\n' \
+printf '2000\tquiet\tdecode-cohort-measurement-start\t100\t0.0\t-\n' \
   >"$contention_measurement"
-printf '2002\tquiet\tdecode-cohort-measurement\t100\t-\n' \
+printf '2002\tquiet\tdecode-cohort-measurement\t100\t0.0\t-\n' \
   >>"$contention_measurement"
-printf '2004\tquiet\tdecode-cohort-measurement-end\t100\t-\n' \
+printf '2004\tquiet\tdecode-cohort-measurement-end\t100\t0.0\t-\n' \
   >>"$contention_measurement"
 
 for timestamp in $(seq 1940 2 2000); do
@@ -132,7 +132,7 @@ for timestamp in $(seq 1940 2 2000); do
   state=nominal
   ((timestamp >= 1950 && timestamp < 1970)) && state=fair
   printf '%s\t%s\t%s\n' "$timestamp" "$state" "$phase" >>"$setup_thermal"
-  printf '%s\tquiet\t%s\t100\t-\n' "$timestamp" "$phase" \
+  printf '%s\tquiet\t%s\t100\t0.0\t-\n' "$timestamp" "$phase" \
     >>"$setup_contention"
 done
 
@@ -164,7 +164,7 @@ memory_row 2004 2 8 decode-cohort-measurement-end 10005 30 505 102 20 440 330 20
 
 for timestamp in $(seq 1000 5 1060); do
   printf '%s\tnominal\tdecode-cohort-settle\n' "$timestamp" >>"$settle"
-  printf '%s\tquiet\tdecode-cohort-settle\t100\t-\n' "$timestamp" \
+  printf '%s\tquiet\tdecode-cohort-settle\t100\t0.0\t-\n' "$timestamp" \
     >>"$contention_settle"
 done
 
@@ -284,7 +284,7 @@ write_summary() {
       non_nominal_measurement_samples:$measurement_non_nominal,
       fair_measurement_samples:$measurement_fair,
       over_limit_measurement_samples:$measurement_over,telemetry_gaps:$measurement_gaps,
-      host_contention:{policy:"process-group-v1",
+      host_contention:{policy:"process-group-cpu-v2",
         settle:{log_sha256:$contention_settle_sha,samples:13,duration_seconds:60,
           contended_samples:0,telemetry_gaps:0},
         measurement:{log_sha256:$contention_measurement_sha,
@@ -646,7 +646,8 @@ expect_reject critical-memory-verifier \
   "$tmp_dir/critical-verifier-summary.json" "$raw" "$test_log" \
   "$measurement" "$tmp_dir/critical-memory.log"
 
-awk -F '\t' 'BEGIN { OFS="\t" } NR == 2 { $2="contended"; $5="9:9:rustc" }
+awk -F '\t' 'BEGIN { OFS="\t" }
+  NR == 2 { $2="contended"; $5="0.0"; $6="9:9:rustc" }
   { print }' "$contention_measurement" >"$tmp_dir/contended.log"
 jq --arg sha "$(sha256_file "$tmp_dir/contended.log")" \
   '.host_contention.measurement.log_sha256=$sha

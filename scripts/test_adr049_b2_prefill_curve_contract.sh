@@ -100,14 +100,14 @@ make_fixture() {
     : >"$destination/contention-settle.log"
     for timestamp in 1000 1005 1010 1015 1020 1025 1030 1035 1040 1045 1050 1055 1060; do
         printf '%s\tnominal\tadr049-b2-settle\n' "$timestamp" >>"$destination/thermal-settle.log"
-        printf '%s\tquiet\tadr049-b2-settle\t100\t-\n' "$timestamp" >>"$destination/contention-settle.log"
+        printf '%s\tquiet\tadr049-b2-settle\t100\t0.0\t-\n' "$timestamp" >>"$destination/contention-settle.log"
     done
     printf '2000\tnominal\tadr049-b2-measurement-start\n' >"$destination/thermal-measurement.log"
     printf '2002\tfair\tadr049-b2-measurement\n' >>"$destination/thermal-measurement.log"
     printf '2004\tfair\tadr049-b2-measurement-end\n' >>"$destination/thermal-measurement.log"
-    printf '2000\tquiet\tadr049-b2-measurement-start\t100\t-\n' >"$destination/contention-measurement.log"
-    printf '2002\tquiet\tadr049-b2-measurement\t100\t-\n' >>"$destination/contention-measurement.log"
-    printf '2004\tquiet\tadr049-b2-measurement-end\t100\t-\n' >>"$destination/contention-measurement.log"
+    printf '2000\tquiet\tadr049-b2-measurement-start\t100\t0.0\t-\n' >"$destination/contention-measurement.log"
+    printf '2002\tquiet\tadr049-b2-measurement\t100\t0.0\t-\n' >>"$destination/contention-measurement.log"
+    printf '2004\tquiet\tadr049-b2-measurement-end\t100\t0.0\t-\n' >>"$destination/contention-measurement.log"
     jq -n '{data:[{id:"fixture-model"}]}' >"$destination/models.json"
     jq -n --arg family "$family" --arg trace_kind "$trace_kind" --argjson trials "$trials" \
         --arg samples "$(sha256_file "$destination/samples.jsonl")" \

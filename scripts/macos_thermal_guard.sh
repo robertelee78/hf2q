@@ -12,9 +12,11 @@ THERMAL_PROBE_COMPILER_VERSION=""
 THERMAL_SAMPLED_AT=""
 # This sourced global is consumed by receipt producers.
 # shellcheck disable=SC2034
-HOST_CONTENTION_POLICY="process-group-v1"
+HOST_CONTENTION_POLICY="process-group-cpu-v2"
+HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT="100.0"
 HOST_CONTENTION_STATE=""
 HOST_CONTENTION_OWNER_PGID=""
+HOST_CONTENTION_FOREIGN_CPU_PERCENT=""
 HOST_CONTENTION_OFFENDERS=""
 
 # Emit a normalized process snapshot for the calibrated host-contention guard.
@@ -23,19 +25,21 @@ HOST_CONTENTION_OFFENDERS=""
 host_contention_process_snapshot() {
   local snapshot
 
-  snapshot=$(/bin/ps -axo pid=,pgid=,comm= 2>/dev/null | awk '
+  snapshot=$(/bin/ps -axo pid=,pgid=,%cpu=,comm= 2>/dev/null | awk '
     {
       pid = $1
       pgid = $2
+      cpu = $3
       $1 = ""
       $2 = ""
+      $3 = ""
       sub(/^[[:space:]]+/, "", $0)
       if (pid !~ /^[1-9][0-9]*$/ || pgid !~ /^[1-9][0-9]*$/ \
-          || length($0) == 0) {
+          || cpu !~ /^[0-9]+([.][0-9]+)?$/ || length($0) == 0) {
         exit 2
       }
       gsub(/\t/, " ", $0)
-      printf "%s\t%s\t%s\n", pid, pgid, $0
+      printf "%s\t%s\t%s\t%s\n", pid, pgid, cpu, $0
     }
   ') || {
     echo "failed to read a normalized host process snapshot" >&2
@@ -68,11 +72,13 @@ host_contention_sample() {
     return 2
   }
   snapshot=$(host_contention_process_snapshot) || return 1
-  classification=$(awk -F '\t' -v owner="$owner_pid" '
+  classification=$(awk -F '\t' -v owner="$owner_pid" \
+    -v maximum="$HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT" '
     BEGIN { invalid = 0; count = 0 }
     {
-      if (NF != 3 || $1 !~ /^[1-9][0-9]*$/ \
-          || $2 !~ /^[1-9][0-9]*$/ || length($3) == 0 \
+      if (NF != 4 || $1 !~ /^[1-9][0-9]*$/ \
+          || $2 !~ /^[1-9][0-9]*$/ \
+          || $3 !~ /^[0-9]+([.][0-9]+)?$/ || length($4) == 0 \
           || seen[$1]++) {
         invalid = 1
         next
@@ -81,15 +87,19 @@ host_contention_sample() {
       pid[count] = $1
       pgid[count] = $2
       pgid_by_pid[$1] = $2
-      command[count] = $3
+      cpu[count] = $3 + 0
+      command[count] = $4
     }
     END {
-      if (invalid || count == 0 || !(owner in pgid_by_pid)) exit 2
+      if (invalid || count == 0 || !(owner in pgid_by_pid) \
+          || maximum !~ /^[0-9]+([.][0-9]+)?$/ || maximum + 0 <= 0) exit 2
       owner_pgid = pgid_by_pid[owner]
       offenders = ""
+      foreign_cpu = 0
       for (i = 1; i <= count; i++) {
         name = command[i]
         sub(/^.*\//, "", name)
+        if (pgid[i] != owner_pgid) foreign_cpu += cpu[i]
         forbidden = (name ~ /^(cargo|rustc|llama-cli|llama-server)(-|$)/) \
           || (name ~ /^hf2q(-|$)/ && pgid[i] != owner_pgid)
         if (forbidden) {
@@ -98,30 +108,28 @@ host_contention_sample() {
           offenders = offenders == "" ? item : offenders "," item
         }
       }
-      printf "%s\t%s\n", owner_pgid, \
+      state = (offenders != "" || foreign_cpu >= maximum + 0) ? "contended" : "quiet"
+      printf "%s\t%.1f\t%s\t%s\n", owner_pgid, foreign_cpu, state, \
         (offenders == "" ? "-" : offenders)
     }
   ' <<<"$snapshot") || {
     echo "host contention snapshot was malformed or omitted owner pid $owner_pid" >&2
     return 1
   }
-  IFS=$'\t' read -r HOST_CONTENTION_OWNER_PGID HOST_CONTENTION_OFFENDERS \
-    <<<"$classification"
-  if [[ "$HOST_CONTENTION_OFFENDERS" == - ]]; then
-    HOST_CONTENTION_STATE=quiet
-  else
-    HOST_CONTENTION_STATE=contended
-  fi
-  printf '%s\t%s\t%s\t%s\t%s\n' "$sampled_at" \
+  IFS=$'\t' read -r HOST_CONTENTION_OWNER_PGID \
+    HOST_CONTENTION_FOREIGN_CPU_PERCENT HOST_CONTENTION_STATE \
+    HOST_CONTENTION_OFFENDERS <<<"$classification"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sampled_at" \
     "$HOST_CONTENTION_STATE" "$phase" "$HOST_CONTENTION_OWNER_PGID" \
-    "$HOST_CONTENTION_OFFENDERS" >>"$log_file"
+    "$HOST_CONTENTION_FOREIGN_CPU_PERCENT" "$HOST_CONTENTION_OFFENDERS" \
+    >>"$log_file"
 }
 
 host_contention_require_quiet() {
   local phase=$1
 
   [[ "$HOST_CONTENTION_STATE" == quiet ]] || {
-    echo "calibrated phase $phase observed forbidden host work: ${HOST_CONTENTION_OFFENDERS:-<unknown>}" >&2
+    echo "calibrated phase $phase observed foreign_cpu_pct=${HOST_CONTENTION_FOREIGN_CPU_PERCENT:-<unknown>} offenders=${HOST_CONTENTION_OFFENDERS:-<unknown>}" >&2
     return 1
   }
 }
@@ -564,15 +572,21 @@ host_contention_validate_measurement_log() {
   local stats
 
   [[ "$maximum_gap_seconds" =~ ^[0-9]+$ ]] || return 2
-  stats=$(awk -F '\t' -v maximum="$maximum_gap_seconds" '
+  stats=$(awk -F '\t' -v maximum="$maximum_gap_seconds" \
+    -v cpu_max="$HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT" '
     BEGIN { invalid = 0; gaps = 0; contended = 0; owner_pgid = "" }
     {
-      if (NF != 5 || $1 !~ /^[0-9]+$/ \
+      if (NF != 6 || $1 !~ /^[0-9]+$/ \
           || $2 !~ /^(quiet|contended)$/ || length($3) == 0 \
           || $4 !~ /^[1-9][0-9]*$/ \
-          || ($2 == "quiet" && $5 != "-") \
+          || $5 !~ /^[0-9]+([.][0-9]+)?$/ \
+          || cpu_max !~ /^[0-9]+([.][0-9]+)?$/ || cpu_max + 0 <= 0 \
+          || ($2 == "quiet" && ($5 + 0 >= cpu_max + 0 || $6 != "-")) \
           || ($2 == "contended" \
-            && $5 !~ /^[0-9]+:[0-9]+:[A-Za-z0-9._+-]+(,[0-9]+:[0-9]+:[A-Za-z0-9._+-]+)*$/)) {
+            && $5 + 0 < cpu_max + 0 \
+            && $6 !~ /^[0-9]+:[0-9]+:[A-Za-z0-9._+-]+(,[0-9]+:[0-9]+:[A-Za-z0-9._+-]+)*$/) \
+          || ($6 != "-" \
+            && $6 !~ /^[0-9]+:[0-9]+:[A-Za-z0-9._+-]+(,[0-9]+:[0-9]+:[A-Za-z0-9._+-]+)*$/)) {
         invalid++
         next
       }
@@ -609,18 +623,24 @@ host_contention_validate_settle_log() {
 
   [[ "$required_seconds" =~ ^[0-9]+$ ]] || return 2
   [[ "$maximum_gap_seconds" =~ ^[0-9]+$ ]] || return 2
-  stats=$(awk -F '\t' -v maximum="$maximum_gap_seconds" '
+  stats=$(awk -F '\t' -v maximum="$maximum_gap_seconds" \
+    -v cpu_max="$HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT" '
     BEGIN {
       invalid = 0; gaps = 0; contended = 0; quiet_since = -1
       owner_pgid = ""
     }
     {
-      if (NF != 5 || $1 !~ /^[0-9]+$/ \
+      if (NF != 6 || $1 !~ /^[0-9]+$/ \
           || $2 !~ /^(quiet|contended)$/ || length($3) == 0 \
           || $4 !~ /^[1-9][0-9]*$/ \
-          || ($2 == "quiet" && $5 != "-") \
+          || $5 !~ /^[0-9]+([.][0-9]+)?$/ \
+          || cpu_max !~ /^[0-9]+([.][0-9]+)?$/ || cpu_max + 0 <= 0 \
+          || ($2 == "quiet" && ($5 + 0 >= cpu_max + 0 || $6 != "-")) \
           || ($2 == "contended" \
-            && $5 !~ /^[0-9]+:[0-9]+:[A-Za-z0-9._+-]+(,[0-9]+:[0-9]+:[A-Za-z0-9._+-]+)*$/)) {
+            && $5 + 0 < cpu_max + 0 \
+            && $6 !~ /^[0-9]+:[0-9]+:[A-Za-z0-9._+-]+(,[0-9]+:[0-9]+:[A-Za-z0-9._+-]+)*$/) \
+          || ($6 != "-" \
+            && $6 !~ /^[0-9]+:[0-9]+:[A-Za-z0-9._+-]+(,[0-9]+:[0-9]+:[A-Za-z0-9._+-]+)*$/)) {
         invalid++
         next
       }
@@ -658,7 +678,7 @@ host_contention_validate_thermal_alignment() {
 
   cmp -s \
     <(awk -F '\t' 'NF == 3 { print $1 "\t" $3 }' "$thermal_log") \
-    <(awk -F '\t' 'NF == 5 { print $1 "\t" $3 }' "$contention_log")
+    <(awk -F '\t' 'NF == 6 { print $1 "\t" $3 }' "$contention_log")
 }
 
 thermal_validate_measurement_log() {

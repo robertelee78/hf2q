@@ -528,7 +528,7 @@ def make_fixture(
         for offset in range(0, 61, 5)
     ), encoding="utf-8")
     contention_settle.write_text("".join(
-        f"{1000 + offset}\tquiet\tadr049-b2-gemma-ab-settle\t100\t-\n"
+        f"{1000 + offset}\tquiet\tadr049-b2-gemma-ab-settle\t100\t0.0\t-\n"
         for offset in range(0, 61, 5)
     ), encoding="utf-8")
     measurement = root / "thermal-measurement.log"
@@ -538,9 +538,9 @@ def make_fixture(
         "2002\tfair\tadr049-b2-gemma-ab-measurement\n"
         "2004\tfair\tadr049-b2-gemma-ab-end\n", encoding="utf-8")
     contention_measurement.write_text(
-        "2000\tquiet\tadr049-b2-gemma-ab-start\t100\t-\n"
-        "2002\tquiet\tadr049-b2-gemma-ab-measurement\t100\t-\n"
-        "2004\tquiet\tadr049-b2-gemma-ab-end\t100\t-\n", encoding="utf-8")
+        "2000\tquiet\tadr049-b2-gemma-ab-start\t100\t0.0\t-\n"
+        "2002\tquiet\tadr049-b2-gemma-ab-measurement\t100\t0.0\t-\n"
+        "2004\tquiet\tadr049-b2-gemma-ab-end\t100\t0.0\t-\n", encoding="utf-8")
     guard_files = {}
     for key, name, content in (
         ("caffeinate_log", "caffeinate.log", ""),

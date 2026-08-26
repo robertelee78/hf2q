@@ -146,9 +146,15 @@ def validate_telemetry(receipt_dir: Path, manifest: dict) -> None:
         if len(rows) != len(thermal):
             fail(f"{path.name} is not aligned with thermal telemetry")
         for fields, thermal_row in zip(rows, thermal):
-            if len(fields) != 5 or fields[0] != str(thermal_row[0]) or fields[1] != "quiet":
+            if len(fields) != 6 or fields[0] != str(thermal_row[0]) or fields[1] != "quiet":
                 fail(f"{path.name} reports contention or timestamp drift")
-            if fields[2] != thermal_row[2] or fields[3] == "" or fields[4] != "-":
+            try:
+                foreign_cpu = float(fields[4])
+            except ValueError:
+                fail(f"{path.name} has malformed foreign CPU evidence")
+            if fields[2] != thermal_row[2] or fields[3] == "" \
+                    or not math.isfinite(foreign_cpu) or not 0 <= foreign_cpu < 100 \
+                    or fields[5] != "-":
                 fail(f"{path.name} has malformed contention evidence")
 
     contention(contention_settle, settle)

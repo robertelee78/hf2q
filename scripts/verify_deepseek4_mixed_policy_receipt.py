@@ -282,10 +282,12 @@ def verify_environment(process_dir: Path, summary: dict[str, Any]) -> tuple[str,
     for thermal_name, contention_name in (("thermal-settle.tsv", "contention-settle.tsv"),
                                            ("thermal-measurement.tsv", "contention-measurement.tsv")):
         thermal = parse_tsv(process_dir / thermal_name, 3)
-        contention = parse_tsv(process_dir / contention_name, 5)
+        contention = parse_tsv(process_dir / contention_name, 6)
         require([row[0] for row in thermal] == [row[0] for row in contention],
                 f"thermal/contention timestamps differ: {process_dir}")
-        require(all(row[1] == "quiet" and row[4] == "-" for row in contention),
+        require(all(row[1] == "quiet"
+                    and math.isfinite(float(row[4])) and 0 <= float(row[4]) < 100
+                    and row[5] == "-" for row in contention),
                 f"host contention observed: {process_dir}")
     power_settle = parse_tsv(process_dir / "power-settle.tsv", 5)
     require(len(power_settle) >= 2
@@ -674,6 +676,7 @@ def verify(
                           "max_tokens": DECODER_PRIME_MAX_TOKENS,
                           "stable_prompt_required": True,
                           "cache_reuse_required": True},
+        "host_contention_policy": "process-group-cpu-v2",
     }, "workload contract drift")
     require(receipt.get("thresholds") == {
         "scheduler_decode_gap_ms": SCHEDULER_GAP_MS,

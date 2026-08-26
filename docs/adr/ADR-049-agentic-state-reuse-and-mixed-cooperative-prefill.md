@@ -13,10 +13,23 @@
   1/2/4/8/16-slot matrix is green, and universal four-family two-cycle swap is
   hardware-sealed, while matched-reference acceptance remains open;
   the DeepSeek B.1 and Gemma/Qwen B.2 fail-closed hardware authorities are
-  now checked in and model-free green; Gemma B.2 is product-hardware accepted,
-  while the DeepSeek and Qwen real-artifact cells remain open)
+  now checked in and model-free green; Gemma and Qwen B.2 implementation and
+  coherence are accepted but all affected final performance receipts are
+  reopened under the v2 contention authority, while the DeepSeek and Qwen
+  current-head real-artifact cells remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 89 closes the pre-run proof audit for the reformed
+- Updated: 2026-08-26 (rev 90 closes a shared performance-proof falsifier
+  before the next model load: the process-group-v1 contention guard reported
+  `quiet` while an orphaned browser tree and unrelated analysis consumed
+  about 7.7 foreign CPU cores. The accepted process-group-cpu-v2 receipt
+  excludes the complete owned gate group, preserves unconditional compiler/
+  peer rejection, records aggregate foreign CPU, and treats one full foreign
+  core as contention. Model-free boundary, aggregation, schema, and stale-v1
+  mutations pass. Because the observed orphan predates the rev-86 Gemma and
+  affected August 25 Qwen measurements, those implementation/coherence
+  decisions remain accepted but their final performance authorities must
+  rerun under v2. Rev 89 closes the
+  pre-run proof audit for the reformed
   DeepSeek B.1 workload: every decoder now proves an exact warm-cache plan and
   matching client-visible cached-token usage; every long prefill proves a cold
   plan and zero client-visible reuse; all four runtime prefill admissions must
@@ -666,6 +679,32 @@ four prefills were admitted before the first decoder completed. The receipt
 mutation battery rejects cache-action, conservation, client-usage, cold-
 prefill, and admission-order substitutions, while an accept-preserving pure
 4x512 insertion proves that unbounded cooperation is intentionally ignored.
+
+Rev 90 rejects the shared `process-group-v1` host-contention receipt as
+insufficient performance authority. A live preflight observed roughly 600%
+CPU from a three-day orphaned headless-browser tree plus unrelated analysis,
+while the old name-only snapshot still emitted a valid `quiet` row because it
+recognized only compilers, peer binaries, and foreign hf2q processes. No model
+run or performance sample was started. `process-group-cpu-v2` adds `%cpu` to
+the normalized snapshot, excludes the gate's complete process group, sums all
+foreign CPU, and rejects a sample at `>= 100.0%` foreign CPU while retaining
+the prior unconditional named-process rules. The six-column receipt records
+that aggregate explicitly. The existing continuous 60-second quiet settle and
+first-contended-sample measurement failure are unchanged. GPU-only process
+attribution is not claimed: the available aggregate probes cannot distinguish
+owned inference from foreign work, and privileged process-GPU sampling needs
+its own overhead-calibration spike. The actual observed blocker is CPU-visible
+and is now fail-closed. DeepSeek B.1 binds the v2 policy in its top workload
+receipt; its mutation battery is 19/19 (18 rejected corruptions and one
+accept-preserving unbounded-pure event).
+The orphaned browser started on August 22, before both the rev-86 Gemma
+product run and the August 25 Qwen curve, rectangular, Q5, and matched-peer
+timing receipts. None of those v1 receipts can prove that its timing window
+was free of generic foreign CPU. Gemma and Qwen exact state/coherence gates
+and their shipped implementations are not reversed, but every affected speed
+acceptance and timing-derived policy conclusion is provisional until its
+lower-confidence bounds reproduce under v2. The historical raw measurements
+remain evidence; they are not uncontended performance authority.
 
 **B.2 — Family generalization (scope directive).** The earlier claim that
 cross-slot aggregation was DeepSeek-only drifted from code. Gemma SlotAware
@@ -2388,9 +2427,18 @@ Framing (Robert): items below are either FALSIFIED with evidence in hand, or OPE
   Gemma4, and DeepSeek4 are hardware-proven through rev 23.
 - [ ] B.1 DeepSeek four-prefill-plus-live-decoders hardware gate passes
   parity, semantic-SSE/scheduler-tail, thermal, memory, and speed contracts.
-- [ ] B.2 Qwen fixed-cost curve reaches a terminal decision and, if confirmed,
-  the beneficial aggregation lever ships; Gemma four-lane OFF/ON exact-result
-  trials retain a lower 95% speedup bound above 1.05×.
+- [x] B.2 Qwen aggregation and Gemma 128/192 aggregation plus 256 scalar
+  fallback shipped with exact-result/coherence proof.
+- [ ] Qwen's fixed-cost curve, rectangular speed bounds, Q5 timing cells, and
+  matched-peer performance are reproduced under process-group-cpu-v2; the
+  affected v1 timing receipts are historical evidence, not final uncontended
+  authority.
+- [ ] Gemma's accepted 128/192 product-speed bounds and 256 scalar fallback
+  are reproduced under process-group-cpu-v2; the older v1 timing receipt is
+  historical evidence, not final uncontended authority.
+- [ ] The joined current-head Qwen product matrix seals Qwen3.8 dense/MTP and
+  Qwen3.6 MoE/no-MTP rectangular ABBA, lifecycle/cache reuse, and live-decoder
+  plus four-prefill Mixed cells from one exact binary.
 - [x] Payload-ownership regression (no retained parent allocations) and the preflight-then-mutate `restore_slot_anchor` refactor landed.
 - [x] A.2 lineage regression and the new SlotAware divergence gate exist in `scripts/` and fail closed.
 - [x] Telemetry (A.8) emits one fixed-schema terminal outcome per restore attempt across Qwen, Gemma, and DeepSeek production paths; real-artifact telemetry receipts remain part of the family gates above.

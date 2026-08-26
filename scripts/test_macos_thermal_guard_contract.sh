@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
+test "$HOST_CONTENTION_POLICY" = process-group-cpu-v2
+test "$HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT" = 100.0
 
 tmp_dir=$(mktemp -d -t hf2q-thermal-guard.XXXXXX)
 cleanup() {
@@ -134,10 +136,10 @@ read_sequence_state() {
 # Calibrated host measurements distinguish the release gate's existing process
 # group from foreign compiler and hf2q work. The snapshot seam keeps this
 # contract deterministic without launching or killing any foreign process.
-contention_snapshot='100\t100\tbash
-101\t100\thf2q
-102\t100\thf2q-abcdef
-200\t200\tlaunchd'
+contention_snapshot='100\t100\t800.0\tbash
+101\t100\t0.0\thf2q
+102\t100\t0.0\thf2q-abcdef
+200\t200\t99.9\tlaunchd'
 host_contention_process_snapshot() {
   printf '%b\n' "$contention_snapshot"
 }
@@ -145,12 +147,13 @@ contention_log="$tmp_dir/contention.log"
 host_contention_sample "$contention_log" owned-baseline 100 5000
 test "$HOST_CONTENTION_STATE" = quiet
 test "$HOST_CONTENTION_OWNER_PGID" = 100
-test "$(tail -1 "$contention_log")" = $'5000\tquiet\towned-baseline\t100\t-'
+test "$HOST_CONTENTION_FOREIGN_CPU_PERCENT" = 99.9
+test "$(tail -1 "$contention_log")" = $'5000\tquiet\towned-baseline\t100\t99.9\t-'
 
 for foreign_name in cargo rustc llama-cli llama-server hf2q hf2q-deadbeef; do
-  contention_snapshot="100\\t100\\tbash
-101\\t100\\thf2q
-200\\t200\\t${foreign_name}"
+  contention_snapshot="100\\t100\\t0.0\\tbash
+101\\t100\\t0.0\\thf2q
+200\\t200\\t0.0\\t${foreign_name}"
   host_contention_sample "$contention_log" "foreign-$foreign_name" 100 5001
   test "$HOST_CONTENTION_STATE" = contended
   test "$HOST_CONTENTION_OFFENDERS" = "200:200:$foreign_name"
@@ -158,27 +161,48 @@ done
 
 # A compiler is never part of a calibrated interval, even if a future harness
 # accidentally launches one inside the owned process group.
-contention_snapshot='100\t100\tbash
-201\t100\tcargo'
+contention_snapshot='100\t100\t0.0\tbash
+201\t100\t0.0\tcargo'
 host_contention_sample "$contention_log" owned-cargo 100 5002
 test "$HOST_CONTENTION_STATE" = contended
 test "$HOST_CONTENTION_OFFENDERS" = '201:100:cargo'
 
-contention_snapshot='100\t100\tbash
-200\t200\tpython3'
+contention_snapshot='100\t100\t0.0\tbash
+200\t200\t99.9\tpython3'
 host_contention_sample "$contention_log" unrelated-process 100 5003
 test "$HOST_CONTENTION_STATE" = quiet
 
-contention_snapshot='200\t200\thf2q'
-if host_contention_sample "$contention_log" missing-owner 100 5004; then
+contention_snapshot='100\t100\t0.0\tbash
+200\t200\t60.0\tpython3
+201\t201\t45.0\tnode'
+host_contention_sample "$contention_log" aggregate-foreign-cpu 100 5004
+test "$HOST_CONTENTION_STATE" = contended
+test "$HOST_CONTENTION_FOREIGN_CPU_PERCENT" = 105.0
+test "$HOST_CONTENTION_OFFENDERS" = '-'
+
+contention_snapshot='100\t100\t0.0\tbash
+200\t200\t100.0\tpython3'
+host_contention_sample "$contention_log" threshold-foreign-cpu 100 5005
+test "$HOST_CONTENTION_STATE" = contended
+test "$HOST_CONTENTION_FOREIGN_CPU_PERCENT" = 100.0
+
+contention_snapshot='200\t200\t0.0\thf2q'
+if host_contention_sample "$contention_log" missing-owner 100 5006; then
   echo "host contention guard accepted a snapshot without its owner" >&2
   exit 1
 fi
-contention_snapshot='not-a-pid\t100\thf2q'
-if host_contention_sample "$contention_log" malformed-snapshot 100 5005; then
+contention_snapshot='not-a-pid\t100\t0.0\thf2q'
+if host_contention_sample "$contention_log" malformed-snapshot 100 5007; then
   echo "host contention guard accepted a malformed process snapshot" >&2
   exit 1
 fi
+for invalid_cpu in NaN -1; do
+  contention_snapshot="100\\t100\\t${invalid_cpu}\\tbash"
+  if host_contention_sample "$contention_log" malformed-cpu 100 5008; then
+    echo "host contention guard accepted malformed CPU telemetry: $invalid_cpu" >&2
+    exit 1
+  fi
+done
 
 # Settle requires a trailing continuous quiet window. A contended sample
 # resets the same monotonic window instead of producing a magic delay or
@@ -192,8 +216,8 @@ host_contention_process_snapshot() {
   contention_index=$(<"$contention_index_file")
   state=${contention_sequence[$contention_index]}
   printf '%s\n' "$((contention_index + 1))" >"$contention_index_file"
-  printf '100\t100\tbash\n'
-  [[ "$state" == quiet ]] || printf '200\t200\tcargo\n'
+  printf '100\t100\t800.0\tbash\n'
+  [[ "$state" == quiet ]] || printf '200\t200\t0.0\tcargo\n'
 }
 sequence=(nominal nominal nominal nominal nominal)
 sequence_index=0
@@ -232,26 +256,26 @@ wait "$supervised_pid" 2>/dev/null || true
 # while a settle receipt may contain an earlier rejected sample if its trailing
 # quiet window is long enough.
 printf '%s\n' \
-  $'100\tquiet\tphase\t100\t-' \
-  $'102\tquiet\tphase\t100\t-' \
-  $'104\tquiet\tphase\t100\t-' >"$tmp_dir/valid-contention.log"
+  $'100\tquiet\tphase\t100\t99.9\t-' \
+  $'102\tquiet\tphase\t100\t99.9\t-' \
+  $'104\tquiet\tphase\t100\t99.9\t-' >"$tmp_dir/valid-contention.log"
 host_contention_validate_measurement_log "$tmp_dir/valid-contention.log" 5
 test "$HOST_CONTENTION_LOG_SAMPLES" = 3
 test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = 0
 
 printf '%s\n' \
-  $'100\tquiet\tsettle\t100\t-' \
-  $'105\tcontended\tsettle\t100\t200:200:cargo' \
-  $'110\tquiet\tsettle\t100\t-' \
-  $'115\tquiet\tsettle\t100\t-' \
-  $'120\tquiet\tsettle\t100\t-' >"$tmp_dir/valid-contention-settle.log"
+  $'100\tquiet\tsettle\t100\t99.9\t-' \
+  $'105\tcontended\tsettle\t100\t0.0\t200:200:cargo' \
+  $'110\tquiet\tsettle\t100\t99.9\t-' \
+  $'115\tquiet\tsettle\t100\t99.9\t-' \
+  $'120\tquiet\tsettle\t100\t99.9\t-' >"$tmp_dir/valid-contention-settle.log"
 host_contention_validate_settle_log "$tmp_dir/valid-contention-settle.log" 10 8
 test "$HOST_CONTENTION_LOG_CONTENDED_SAMPLES" = 1
 test "$HOST_CONTENTION_LOG_DURATION_SECONDS" = 10
 
 printf '%s\n' \
-  $'100\tquiet\tphase\t100\t-' \
-  $'102\tcontended\tphase\t100\t200:200:rustc' \
+  $'100\tquiet\tphase\t100\t99.9\t-' \
+  $'102\tcontended\tphase\t100\t0.0\t200:200:rustc' \
   >"$tmp_dir/contended-measurement.log"
 if host_contention_validate_measurement_log \
   "$tmp_dir/contended-measurement.log" 5; then
@@ -259,17 +283,38 @@ if host_contention_validate_measurement_log \
   exit 1
 fi
 printf '%s\n' \
-  $'100\tquiet\tphase\t100\t-' \
-  $'106\tquiet\tphase\t100\t-' >"$tmp_dir/gapped-contention.log"
+  $'100\tquiet\tphase\t100\t99.9\t-' \
+  $'106\tquiet\tphase\t100\t99.9\t-' >"$tmp_dir/gapped-contention.log"
 if host_contention_validate_measurement_log "$tmp_dir/gapped-contention.log" 5; then
   echo "host validator accepted a contention telemetry gap" >&2
   exit 1
 fi
-printf '100\tquiet\tphase\tnot-a-pgid\t-\n' \
+printf '100\tquiet\tphase\tnot-a-pgid\t0.0\t-\n' \
   >"$tmp_dir/malformed-contention.log"
 if host_contention_validate_measurement_log \
   "$tmp_dir/malformed-contention.log" 5; then
   echo "host validator accepted malformed contention telemetry" >&2
+  exit 1
+fi
+printf '%s\n' \
+  $'100\tquiet\tphase\t100\t100.0\t-' \
+  $'102\tquiet\tphase\t100\t100.0\t-' >"$tmp_dir/quiet-high-cpu.log"
+if host_contention_validate_measurement_log "$tmp_dir/quiet-high-cpu.log" 5; then
+  echo "host validator accepted quiet foreign CPU at the contention threshold" >&2
+  exit 1
+fi
+printf '%s\n' \
+  $'100\tcontended\tphase\t100\t99.9\t-' \
+  $'102\tcontended\tphase\t100\t99.9\t-' >"$tmp_dir/unexplained-contention.log"
+if host_contention_validate_measurement_log "$tmp_dir/unexplained-contention.log" 5; then
+  echo "host validator accepted unexplained sub-threshold contention" >&2
+  exit 1
+fi
+printf '%s\n' \
+  $'100\tquiet\tphase\t100\t-' \
+  $'102\tquiet\tphase\t100\t-' >"$tmp_dir/stale-v1-contention.log"
+if host_contention_validate_measurement_log "$tmp_dir/stale-v1-contention.log" 5; then
+  echo "host validator accepted stale process-group-v1 telemetry" >&2
   exit 1
 fi
 
@@ -548,7 +593,7 @@ for epoch in $(seq 100 5 160); do
   printf '%s\tnominal\tdeepseek-wave-1-settle\n' "$epoch"
 done >"$receipt_dir/settle.log"
 for epoch in $(seq 100 5 160); do
-  printf '%s\tquiet\tdeepseek-wave-1-settle\t100\t-\n' "$epoch"
+  printf '%s\tquiet\tdeepseek-wave-1-settle\t100\t0.0\t-\n' "$epoch"
 done >"$receipt_dir/settle-contention.log"
 printf '200\tnominal\tdeepseek-wave-1-measurement-start\n' \
   >"$receipt_dir/measurement.log"
@@ -556,11 +601,11 @@ printf '202\tnominal\tdeepseek-wave-1-measurement\n' \
   >>"$receipt_dir/measurement.log"
 printf '204\tnominal\tdeepseek-wave-1-measurement-end\n' \
   >>"$receipt_dir/measurement.log"
-printf '200\tquiet\tdeepseek-wave-1-measurement-start\t100\t-\n' \
+printf '200\tquiet\tdeepseek-wave-1-measurement-start\t100\t0.0\t-\n' \
   >"$receipt_dir/measurement-contention.log"
-printf '202\tquiet\tdeepseek-wave-1-measurement\t100\t-\n' \
+printf '202\tquiet\tdeepseek-wave-1-measurement\t100\t0.0\t-\n' \
   >>"$receipt_dir/measurement-contention.log"
-printf '204\tquiet\tdeepseek-wave-1-measurement-end\t100\t-\n' \
+printf '204\tquiet\tdeepseek-wave-1-measurement-end\t100\t0.0\t-\n' \
   >>"$receipt_dir/measurement-contention.log"
 settle_sha=$(shasum -a 256 "$receipt_dir/settle.log" | awk '{print $1}')
 measurement_sha=$(shasum -a 256 "$receipt_dir/measurement.log" | awk '{print $1}')
@@ -590,7 +635,7 @@ jq -n --arg settle_sha "$settle_sha" --arg measurement_sha "$measurement_sha" \
     non_nominal_measurement_samples:0, settle_telemetry_gaps:0,
     telemetry_gaps:0, settle_log_sha256:$settle_sha,
     measurement_log_sha256:$measurement_sha,
-    host_contention:{policy:"process-group-v1",
+    host_contention:{policy:"process-group-cpu-v2",
       settle:{log_sha256:$contention_settle_sha,samples:13,
         duration_seconds:60,contended_samples:0,telemetry_gaps:0},
       measurement:{log_sha256:$contention_measurement_sha,samples:3,
@@ -671,7 +716,7 @@ if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
 fi
 
 awk -F '\t' 'BEGIN { OFS="\t" }
-  NR == 2 { $2="contended"; $5="200:200:hf2q" }
+  NR == 2 { $2="contended"; $5="0.0"; $6="200:200:hf2q" }
   { print }
 ' "$receipt_dir/measurement-contention.log" \
   >"$receipt_dir/contended-host.log"

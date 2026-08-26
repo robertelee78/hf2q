@@ -1,9 +1,10 @@
 # ADR-017 Per-Family Ship-Gate Status
 
-**Last updated:** 2026-08-22 (ADR-049 Lane C reconciliation: Qwen
+**Last updated:** 2026-08-26 (ADR-049 Lane A reconciliation: Qwen
 SerialFifo registry/disk hydrate is the restart tier; SlotAware uses a
-separate slot-local anchor store. Model-free anchor invariants are green;
-real-artifact divergence/coherence gates remain pending.)
+separate slot-local anchor store. Model-free invariants and Qwen3.6/Qwen3.8
+real-artifact divergence/coherence gates are green. Current-head product and
+matched-peer matrices remain separate ADR-049 Lane B authorities.)
 **Companion to:** [ADR-017](./ADR-017-persistent-block-prefix-cache.md)
 **Phase D §476 closure doc.**
 
@@ -28,7 +29,7 @@ requirements, §Performance requirements, §Kill-gates.
 | Family | Engine path | R-C1 | R-C3 | R-C4 | R-P4 | K1/K2/K3 | Phase D Status |
 |---|---|---|---|---|---|---|---|
 | Gemma 4 (dense, A4B variant) | `src/serve/kv_persist/families/gemma4_dense.rs` | PASS | PASS | PASS | PASS (ratio=0.000 @ L=32K) | All falsified | **GREEN** (primary; R-P5/R-P6 measured 44,500× / 1.00× post Phase D iter-5/6 + B.5; stress 24h smoke pass at iter-11/12) |
-| Qwen 3.5 / 3.6 / 3.8 (hybrid DeltaNet family) | SerialFifo: `engine_qwen35.rs::Qwen35LoadedModel::lcp_registry` + disk hydrate. SlotAware: `engine.rs::Qwen35AnchorStore` (same-process semantic boundaries; registry unused). | PASS for the SerialFifo LCP substrate (B.2-iso falsifier 0/131072); SlotAware anchor byte-identity pending hardware | n/a (neither Qwen reuse path uses the Phase D spiller contract) | PASS for SerialFifo stride-aligned/disk restore; SlotAware divergent-branch byte gate pending hardware | n/a (LCP benchmark and SlotAware TTFT gates are separate) | n/a (dense-only kill-gates do not apply) | **GREEN, SerialFifo persistence**; **MODEL-FREE GREEN / HARDWARE PENDING, SlotAware anchors**. `bench_lcp_resume_speedup.sh` is not the SlotAware gate. |
+| Qwen 3.5 / 3.6 / 3.8 (hybrid DeltaNet family) | SerialFifo: `engine_qwen35.rs::Qwen35LoadedModel::lcp_registry` + disk hydrate. SlotAware: `engine.rs::Qwen35AnchorStore` (same-process semantic boundaries; registry unused). | PASS for the SerialFifo LCP substrate (B.2-iso falsifier 0/131072) and SlotAware anchor byte identity on Qwen3.6/Qwen3.8 | n/a (neither Qwen reuse path uses the Phase D spiller contract) | PASS for SerialFifo stride-aligned/disk restore and SlotAware divergent branches, cancellation, retry, and failed publication | n/a (LCP benchmark and SlotAware product TTFT gates are separate) | n/a (dense-only kill-gates do not apply) | **GREEN, SerialFifo persistence and SlotAware anchors**. Exact real-artifact receipts are indexed by ADR-049 revs 20–23; current-head Lane B product/peer matrices remain open. `bench_lcp_resume_speedup.sh` is not the SlotAware gate. |
 | TQ-packed (codec_version=1 + codec_version=2 + bundle codec) | `src/serve/kv_persist/families/tq_packed.rs` (B-tq.1 v1 envelope + B-tq.2 `TqPackedSpill` hook + B-tq.3 v2 engine wiring + B-tq.4 iter-1+2+3 activation factory) + `src/serve/forward_mlx.rs::MlxModelWeights::tq_v2_*` + `src/serve/api/tq_packed_descriptor.rs` + `src/serve/api/engine.rs::tq_packed_v2_*` worker bridge + `src/serve/mod.rs::cmd_serve` single-mode factory registration + `tests/kv_persist_tq_packed_roundtrip.rs` AUTOMATED integration test (uses `tests/common/serve_driver.rs` shared driver via B-tq.5 extraction) | PASS (v1 + v2 round-trip byte-exact = R-C1 unit; cross-process R-C1 automated when `HF2Q_KV_PERSIST_TQ_E2E=1`) | n/a | PASS (D2 byte-exact rebuild → cosine = 1.0 = R-C2 trivially; v2 capture→restore byte-identity on synthetic `[nkv, capacity, hd_packed]` U8 + `[nkv, capacity]` F32 buffers) | n/a (no inference perf bench at substrate level) | n/a | **GREEN** (engine wiring + factory registration + automated integration test landed 2026-05-06 across B-tq.4 iter-1+2+3 + B-tq.5, commits `62bb8b5`+`b346425`+`69b3bc2`+`539e6f7`; live R-C1 measurement on a real GGUF is operator-driven post-merge work — harness drives the full subprocess round-trip when env-gated). NOT blocked on ADR-007 Path C; codec-freeze contract F-7 LANDED 2026-05-05 |
 
 Legend:
@@ -122,11 +123,14 @@ have different ownership and scheduler contracts:
 The model-free proof includes an independent reference state machine, a
 17-injected-mutation invariant battery, the A→B→C rewind regression,
 restore-no-partial-mutation, exact committed+pending accounting, and the
-right-sized speculative hidden-row ownership test. Those results do not
-substitute for the ADR-049 real-artifact gates: Qwen3.6 and Qwen3.8 still need
-the concurrent SlotAware divergence script, cold byte comparison at every
-anchor depth/transaction width, cancellation/failure/spec-state coverage,
-and matched TTFT receipts before the SlotAware milestone is called green.
+right-sized speculative hidden-row ownership test. ADR-049 revs 20–23 then
+closed the real-artifact Qwen3.6/Qwen3.8 anchor authorities: concurrent
+SlotAware divergence, cold byte comparison across anchor depths and physical
+widths, cancellation/failure/spec-state joins, exact continuation, and
+cached-token/TTFT receipts. That makes the SlotAware anchor milestone green.
+ADR-049 Lane B's joined rectangular/Mixed product matrix and current pinned-
+peer performance matrix remain open performance authorities; they do not
+reopen Lane A cache coherence.
 
 ---
 
@@ -152,9 +156,8 @@ Update this doc when:
 - a new bench is run on Gemma 4 (e.g. R-P5, R-P6, full matrix, 24h
   stress) — add a row under "Pending operator gates" with the
   bench-output cross-reference and date.
-- Qwen SlotAware real-artifact gates run — replace the hardware-pending text
-  with exact commit, artifact, prompt, settings, cached-token, byte-identity,
-  tail-TTFT, and N=4 stability receipts.
+- Qwen current-head Lane B matrices run — update the separate product and
+  matched-peer status without reopening the green SlotAware cache milestone.
 - a new family ships — add a section mirroring the Gemma 4 layout
   (engine path, descriptor closure, R-Cn / R-Pn rows, kill-gate
   status, production fixes, pending operator gates).

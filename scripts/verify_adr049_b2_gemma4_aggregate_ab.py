@@ -220,11 +220,11 @@ def validate_environment(root: Path, manifest: dict) -> None:
     )
     contention_settle = telemetry_rows(
         bind_file(root, **binding_args(files["contention_settle"], "contention settle")),
-        {"adr049-b2-gemma-ab-settle"}, 5,
+        {"adr049-b2-gemma-ab-settle"}, 6,
     )
     contention_measurement = telemetry_rows(
         bind_file(root, **binding_args(files["contention_measurement"], "contention measurement")),
-        {"adr049-b2-gemma-ab-start", "adr049-b2-gemma-ab-measurement", "adr049-b2-gemma-ab-end"}, 5,
+        {"adr049-b2-gemma-ab-start", "adr049-b2-gemma-ab-measurement", "adr049-b2-gemma-ab-end"}, 6,
     )
     if int(settle[-1][0]) - int(settle[0][0]) < 60 or any(row[1] != "nominal" for row in settle):
         fail("settle was not nominal for at least 60 seconds")
@@ -246,7 +246,9 @@ def validate_environment(root: Path, manifest: dict) -> None:
         for thermal_row, contention_row in zip(thermal, contention):
             if contention_row[0] != thermal_row[0] or contention_row[2] != thermal_row[2] \
                     or contention_row[1] != "quiet" or not contention_row[3] \
-                    or contention_row[4] != "-":
+                    or not math.isfinite(float(contention_row[4])) \
+                    or not 0 <= float(contention_row[4]) < 100 \
+                    or contention_row[5] != "-":
                 fail(f"{label} telemetry reports contention or alignment drift")
     guard = files["power_guard"]
     if set(guard) != {"caffeinate_log", "assertions", "events_baseline", "events_final", "events_new"}:

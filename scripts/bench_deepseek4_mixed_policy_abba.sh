@@ -679,6 +679,7 @@ jq -n --arg source_root "$SOURCE_ROOT" --arg commit "$source_commit" \
   --argjson prefill_wall "$MAX_PREFILL_WALL_SECONDS" \
   --argjson max_rss "$MAX_PEAK_RSS_BYTES" \
   --argjson min_speedup "$MIN_WAVE_SPEEDUP" \
+  --arg contention_policy "$HOST_CONTENTION_POLICY" \
   --argjson neighbor_a "$neighbor_a" --argjson neighbor_b "$neighbor_b" \
   --argjson off_samples "$(jq -Rsc 'split("\n")|map(select(length>0)|tonumber)' "$off_samples")" \
   --argjson on_samples "$(jq -Rsc 'split("\n")|map(select(length>0)|tonumber)' "$on_samples")" \
@@ -698,7 +699,7 @@ jq -n --arg source_root "$SOURCE_ROOT" --arg commit "$source_commit" \
       trials_per_process:5,max_slots:8,live_decoders:4,prefillers:4,
       mixed_rows_per_lane:$mixed_rows,temperature:0,seed:42,
       decoder_prime:{lanes:4,max_tokens:1,stable_prompt_required:true,
-        cache_reuse_required:true}},
+        cache_reuse_required:true},host_contention_policy:$contention_policy},
     thresholds:{scheduler_decode_gap_ms:$scheduler_gap,semantic_sse_gap_ms:$semantic_gap,
       max_prefill_wall_seconds:$prefill_wall,max_peak_rss_bytes:$max_rss,
       min_wave_speedup:$min_speedup},

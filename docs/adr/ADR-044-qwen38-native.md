@@ -4,7 +4,7 @@
   speculation re-opened after a longitudinal verifier-coherence failure;
   vision candidate is under exact-artifact acceptance
 - Date: 2026-08-16
-- Updated: 2026-08-25 — the canonical server owns fixed-K3 MTP and
+- Updated: 2026-08-26 — the canonical server owns fixed-K3 MTP and
   request-history speculation with per-proposer measured cost gates. GGUF
   inference preserves the artifact's declared weight encodings. A 508-decision
   scalar-versus-width-four real-artifact gate found that the Qwen3.8-local
@@ -71,6 +71,11 @@
   MVN-on/MV_EXT-off workload in every format, and seal the matched matrix's
   exact 48-GiB KV budget plus 100-ms launch-skew ceiling in both child and
   outer receipts. Ambient or cross-format weakening fails validation.
+  ADR-049 revs 66 and 72 subsequently sealed the corrected historical
+  Qwen3.6 MoE and BF16 replay cells, so those two admission defects are no
+  longer hardware-pending. A final current-head five-format/physical-width
+  rerun remains required for exact binary lineage and matched-peer authority;
+  it is not a claim that the historical corrected cells never passed.
 - Owners: hf2q conversion, quantization, inference, and serving
 
 ## Context

@@ -34,8 +34,8 @@ DeepSeek-V4 request started request_id=43 max_tokens=2560
 DeepSeek-V4 request started request_id=45 max_tokens=10
 unrelated request_id=44 max_tokens=256
 EOF
-# shellcheck disable=SC1090
 sed -n '/^extract_request_ids() {/,/^}/p' "$runner" >"$tmp_dir/extract-request-ids.sh"
+# shellcheck disable=SC1090,SC1091
 source "$tmp_dir/extract-request-ids.sh"
 decoder_ids=$(extract_request_ids "$tmp_dir/server.log" 256)
 prefill_ids=$(extract_request_ids "$tmp_dir/server.log" 8)
@@ -112,6 +112,8 @@ rg -q 'prefills were not admitted before the first live decoder completed' "$ver
 rg -Fq 'row.get("bounded_mixed") in ("true", "false")' "$verifier"
 rg -q 'observed_source=[$][(]matched_parse_live_power_source' "$runner"
 rg -q 'bounded_mixed = max_cooperative_rows_per_lane.is_some()' "$engine"
+rg -Fq 'host_contention_policy:$contention_policy' "$runner"
+rg -Fq '"host_contention_policy": "process-group-cpu-v2"' "$verifier"
 if rg -Fq 'pmset -g batt | rg -q' "$runner"; then
     echo "DeepSeek B.1 runner retains the early-match AC probe" >&2
     exit 1

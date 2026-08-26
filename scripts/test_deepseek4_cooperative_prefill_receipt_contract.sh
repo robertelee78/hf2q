@@ -18,6 +18,7 @@ if MLX_NATIVE_SKIP_METALLIB=1 \
   DEPENDENCY_PROVENANCE_DIR="$tmp_dir/dummy-dependency-provenance" \
   HF2Q_BIN=/bin/true \
   EXPECTED_BINARY_SHA256="$MODEL_SHA" \
+  HF2Q_SOURCE_ROOT="$ROOT_DIR" \
   DEEPSEEK_MODEL=/dev/null GEMMA_MODEL=/dev/null \
   QWEN_MODEL=/dev/null QWEN38_MODEL=/dev/null \
   DEEPSEEK_MODEL_SHA256="$MODEL_SHA" GEMMA_MODEL_SHA256="$MODEL_SHA" \
@@ -59,15 +60,15 @@ printf 'cooperative hardware test passed\n' >"$test_log"
 printf '2000\tnominal\tcooperative-prefill-measurement-start\n' >"$measurement"
 printf '2002\tfair\tcooperative-prefill-measurement\n' >>"$measurement"
 printf '2004\tfair\tcooperative-prefill-measurement-end\n' >>"$measurement"
-printf '2000\tquiet\tcooperative-prefill-measurement-start\t100\t-\n' \
+printf '2000\tquiet\tcooperative-prefill-measurement-start\t100\t0.0\t-\n' \
   >"$contention_measurement"
-printf '2002\tquiet\tcooperative-prefill-measurement\t100\t-\n' \
+printf '2002\tquiet\tcooperative-prefill-measurement\t100\t0.0\t-\n' \
   >>"$contention_measurement"
-printf '2004\tquiet\tcooperative-prefill-measurement-end\t100\t-\n' \
+printf '2004\tquiet\tcooperative-prefill-measurement-end\t100\t0.0\t-\n' \
   >>"$contention_measurement"
 for timestamp in 1000 1005 1010 1015 1020 1025 1030 1035 1040 1045 1050 1055 1060; do
   printf '%s\tnominal\tcooperative-prefill-settle\n' "$timestamp" >>"$settle"
-  printf '%s\tquiet\tcooperative-prefill-settle\t100\t-\n' "$timestamp" \
+  printf '%s\tquiet\tcooperative-prefill-settle\t100\t0.0\t-\n' "$timestamp" \
     >>"$contention_settle"
 done
 
@@ -140,7 +141,7 @@ write_summary() {
       fair_measurement_samples:$fair_measurement_samples,
       over_limit_measurement_samples:$over_limit_measurement_samples,
       telemetry_gaps:$telemetry_gaps,
-      host_contention:{policy:"process-group-v1",
+      host_contention:{policy:"process-group-cpu-v2",
         settle:{log_sha256:$contention_settle_log_sha256,samples:13,
           duration_seconds:60,contended_samples:0,telemetry_gaps:0},
         measurement:{log_sha256:$contention_measurement_log_sha256,samples:3,

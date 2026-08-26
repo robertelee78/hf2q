@@ -75,7 +75,7 @@ jq -e --arg phase "$phase" '
   and (.settle_log_sha256 | test("^[0-9a-f]{64}$"))
   and (.measurement_log_sha256 | type) == "string"
   and (.measurement_log_sha256 | test("^[0-9a-f]{64}$"))
-  and .host_contention.policy == "process-group-v1"
+  and .host_contention.policy == "process-group-cpu-v2"
   and (.host_contention.settle.log_sha256 | test("^[0-9a-f]{64}$"))
   and (.host_contention.settle.samples | type) == "number"
   and .host_contention.settle.samples > 0
