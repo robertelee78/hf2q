@@ -2996,16 +2996,37 @@ impl MlxModelWeights {
                     (2 * l.num_kv_heads * lcp_snap_cap_est * l.head_dim * kv_elem_bytes) as u64
                 })
                 .sum();
-            let hybrid: u64 = if self.hybrid_kv.is_some() {
-                self.layers
-                    .iter()
-                    .map(|l| {
-                        (l.num_kv_heads * lcp_snap_cap_est * (l.head_dim * 2 + l.head_dim + 4))
-                            as u64
-                    })
-                    .sum()
-            } else {
-                0
+            let hybrid: u64 = match self.hybrid_kv.as_ref() {
+                None => 0,
+                Some(live_hybrid) => {
+                    anyhow::ensure!(
+                        live_hybrid.len() == self.layers.len(),
+                        "hybrid LCP estimate layer count {} != model layers {}",
+                        live_hybrid.len(),
+                        self.layers.len()
+                    );
+                    live_hybrid.iter().enumerate().try_fold(
+                        0u64,
+                        |total, (layer_idx, live)| {
+                            let shape = live.k.shape();
+                            anyhow::ensure!(
+                                shape.len() == 3,
+                                "hybrid LCP estimate K L{layer_idx} must be rank 3, got {shape:?}"
+                            );
+                            let layer_bytes = crate::inference::models::gemma4::kv_cache::hybrid_lcp_snapshot_layer_bytes(
+                                shape[0],
+                                lcp_snap_cap_est,
+                                shape[2],
+                                live.norms_per_pos,
+                                live.k.dtype(),
+                                live.v_packed.dtype(),
+                            )?;
+                            total.checked_add(layer_bytes).ok_or_else(|| {
+                                anyhow::anyhow!("hybrid LCP estimate byte count overflow")
+                            })
+                        },
+                    )?
+                }
             };
             dense + hybrid
         };
@@ -3201,8 +3222,8 @@ impl MlxModelWeights {
             };
 
         // ADR-017 Phase E.a "gemma-hybrid-lcp" (2026-08-03) — end-of-
-        // prefill snapshot of the HYBRID leg (F16 K + TQ-HB V packed +
-        // norms), mirroring the dense snapshot above. Required for LCP
+        // prefill snapshot of the HYBRID leg (F16 K + dtype-authoritative V),
+        // mirroring the dense snapshot above. Required for LCP
         // resume under the production hybrid regime: decode reads
         // `hybrid_kv`, so restoring only the dense leg would leave the
         // decode cache zeroed over the prefix (silent corruption — the
@@ -3210,13 +3231,16 @@ impl MlxModelWeights {
         //
         // Capacity policy + per-head copy semantics mirror the dense
         // snapshot exactly (`snap_cap`, fast-path when live_cap ==
-        // snap_cap, strided per-head otherwise). v_norms' inner axis is
-        // `norms_per_pos` (1 at hd=256 production), with the live
-        // buffer's rank-2 `[nkv, cap]` / rank-3 `[nkv, cap, npp]` shape
-        // preserved on the snapshot side.
+        // snap_cap, strided per-head otherwise). The cache-owned helper keeps
+        // packed U8 V plus per-position norms and full-F16 V plus its canonical
+        // four-byte dummy on one shared serial/batched implementation.
         let hybrid_snapshot_for_lcp: Option<
             Vec<std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>>,
-        > = if crate::debug::INVESTIGATION_ENV.kv_lcp_resume && snapshot_safe && !slot_aware {
+        > = if crate::debug::INVESTIGATION_ENV.kv_lcp_resume
+            && snapshot_safe
+            && lcp_fits_budget
+            && !slot_aware
+        {
             match self.hybrid_kv.as_ref() {
                 None => None,
                 Some(live_hybrid) => {
@@ -3227,97 +3251,14 @@ impl MlxModelWeights {
                     let snap_cap = sw.max(gemma_flash_attn_vec_capacity(
                         seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 },
                     ));
-                    let mut hsnap: Vec<
-                        std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>,
-                    > = Vec::with_capacity(live_hybrid.len());
-                    for live_layer in live_hybrid.iter() {
-                        let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
-                        let live_cap_dim = live_layer
-                            .k
-                            .shape()
-                            .get(1)
-                            .copied()
-                            .unwrap_or(live_layer.capacity);
-                        let hd_dim = live_layer.k.shape().get(2).copied().unwrap_or(0);
-                        let npp = live_layer.norms_per_pos.max(1);
-                        // K: F16 (2 B/elem); v_packed: U8 (1 B/elem);
-                        // v_norms: F32 (4 B/elem, inner axis npp).
-                        let k_snap = dev
-                            .alloc_buffer(
-                                nkv_dim * snap_cap * hd_dim * 2,
-                                mlx_native::DType::F16,
-                                vec![nkv_dim, snap_cap, hd_dim],
-                            )
-                            .map_err(|e| anyhow::anyhow!("hybrid snapshot K alloc: {e}"))?;
-                        let vp_snap = dev
-                            .alloc_buffer(
-                                nkv_dim * snap_cap * hd_dim,
-                                mlx_native::DType::U8,
-                                vec![nkv_dim, snap_cap, hd_dim],
-                            )
-                            .map_err(|e| anyhow::anyhow!("hybrid snapshot V packed alloc: {e}"))?;
-                        let vn_shape = if npp == 1 {
-                            vec![nkv_dim, snap_cap]
-                        } else {
-                            vec![nkv_dim, snap_cap, npp]
-                        };
-                        let vn_snap = dev
-                            .alloc_buffer(
-                                nkv_dim * snap_cap * npp * 4,
-                                mlx_native::DType::F32,
-                                vn_shape,
-                            )
-                            .map_err(|e| anyhow::anyhow!("hybrid snapshot V norms alloc: {e}"))?;
-
-                        // Per-head prefix copy for one (src, dst, elem,
-                        // inner) quadruple — same two-branch structure
-                        // as the dense snapshot (fast path when shapes
-                        // match, strided otherwise).
-                        let copy_prefix = |src: &mlx_native::MlxBuffer,
-                                           dst: &mut mlx_native::MlxBuffer,
-                                           elem: usize,
-                                           inner: usize,
-                                           what: &str|
-                         -> anyhow::Result<()> {
-                            let s: &[u8] = src
-                                .as_slice()
-                                .map_err(|e| anyhow::anyhow!("hybrid snapshot {what} src: {e}"))?;
-                            let d: &mut [u8] = dst
-                                .as_mut_slice()
-                                .map_err(|e| anyhow::anyhow!("hybrid snapshot {what} dst: {e}"))?;
-                            let copy_len = seq_len * inner * elem;
-                            let src_stride = live_cap_dim * inner * elem;
-                            let dst_stride = snap_cap * inner * elem;
-                            for h in 0..nkv_dim {
-                                let so = h * src_stride;
-                                let do_ = h * dst_stride;
-                                d[do_..do_ + copy_len].copy_from_slice(&s[so..so + copy_len]);
-                            }
-                            Ok(())
-                        };
-                        let mut k_snap = k_snap;
-                        let mut vp_snap = vp_snap;
-                        let mut vn_snap = vn_snap;
-                        copy_prefix(&live_layer.k, &mut k_snap, 2, hd_dim, "K")?;
-                        copy_prefix(&live_layer.v_packed, &mut vp_snap, 1, hd_dim, "V packed")?;
-                        copy_prefix(&live_layer.v_norms, &mut vn_snap, 4, npp, "V norms")?;
-
-                        hsnap.push(std::sync::Arc::new(
-                            crate::inference::models::gemma4::kv_cache::HybridKvBuffers {
-                                k: k_snap,
-                                v_packed: vp_snap,
-                                v_norms: vn_snap,
-                                capacity: snap_cap,
-                                is_sliding: live_layer.is_sliding,
-                                norms_per_pos: live_layer.norms_per_pos,
-                                // xlen companions are decode-time lazy
-                                // scratch, never part of prefix state.
-                                bf16_xlen_k: None,
-                                bf16_xlen_v: None,
-                            },
-                        ));
-                    }
-                    Some(hsnap)
+                    Some(
+                        crate::inference::models::gemma4::kv_cache::snapshot_hybrid_kv_for_lcp(
+                            dev,
+                            live_hybrid,
+                            seq_len,
+                            snap_cap,
+                        )?,
+                    )
                 }
             }
         } else {

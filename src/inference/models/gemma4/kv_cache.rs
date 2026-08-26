@@ -905,6 +905,267 @@ impl crate::serve::kv_persist::lcp_registry::ByteSized for HybridKvBuffers {
     }
 }
 
+/// Exact bytes owned by one hybrid-KV LCP snapshot layer at `snapshot_capacity`.
+///
+/// The live buffer dtype is the representation authority. Packed V owns one
+/// U8 code per head-dimension element plus `norms_per_pos` F32 norms per
+/// position. Full-F16 V owns two bytes per element and the canonical shared
+/// four-byte norms dummy; it must not be charged as if the dummy had a token
+/// axis.
+pub(crate) fn hybrid_lcp_snapshot_layer_bytes(
+    num_kv_heads: usize,
+    snapshot_capacity: usize,
+    head_dim: usize,
+    norms_per_pos: usize,
+    k_dtype: DType,
+    v_dtype: DType,
+) -> Result<u64> {
+    anyhow::ensure!(
+        num_kv_heads > 0 && snapshot_capacity > 0 && head_dim > 0 && norms_per_pos > 0,
+        "hybrid LCP snapshot dimensions must be nonzero"
+    );
+    anyhow::ensure!(
+        k_dtype == DType::F16,
+        "hybrid LCP snapshot K must be F16, got {k_dtype:?}"
+    );
+    anyhow::ensure!(
+        matches!(v_dtype, DType::U8 | DType::F16),
+        "hybrid LCP snapshot V must be U8 or F16, got {v_dtype:?}"
+    );
+
+    let positions = u64::try_from(num_kv_heads)
+        .ok()
+        .and_then(|heads| heads.checked_mul(snapshot_capacity as u64))
+        .ok_or_else(|| anyhow!("hybrid LCP snapshot position count overflow"))?;
+    let elements = positions
+        .checked_mul(head_dim as u64)
+        .ok_or_else(|| anyhow!("hybrid LCP snapshot element count overflow"))?;
+    let k_bytes = elements
+        .checked_mul(k_dtype.size_of() as u64)
+        .ok_or_else(|| anyhow!("hybrid LCP snapshot K byte count overflow"))?;
+    let v_bytes = elements
+        .checked_mul(v_dtype.size_of() as u64)
+        .ok_or_else(|| anyhow!("hybrid LCP snapshot V byte count overflow"))?;
+    let norms_bytes = if v_dtype == DType::F16 {
+        std::mem::size_of::<f32>() as u64
+    } else {
+        positions
+            .checked_mul(norms_per_pos as u64)
+            .and_then(|norms| norms.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or_else(|| anyhow!("hybrid LCP snapshot V-norm byte count overflow"))?
+    };
+    k_bytes
+        .checked_add(v_bytes)
+        .and_then(|bytes| bytes.checked_add(norms_bytes))
+        .ok_or_else(|| anyhow!("hybrid LCP snapshot layer byte count overflow"))
+}
+
+/// Snapshot the populated prefix of every hybrid-KV layer without changing its
+/// stored V representation.
+///
+/// Serial and batched prefill use the same cache contract, so keeping this copy
+/// in the representation owner prevents their dtype and dummy-buffer handling
+/// from drifting apart again.
+pub(crate) fn snapshot_hybrid_kv_for_lcp(
+    dev: &MlxDevice,
+    live_hybrid: &[HybridKvBuffers],
+    sequence_len: usize,
+    snapshot_capacity: usize,
+) -> Result<Vec<std::sync::Arc<HybridKvBuffers>>> {
+    anyhow::ensure!(
+        sequence_len <= snapshot_capacity,
+        "hybrid LCP snapshot sequence {sequence_len} exceeds capacity {snapshot_capacity}"
+    );
+    let mut snapshot = Vec::with_capacity(live_hybrid.len());
+    for (layer_idx, live_layer) in live_hybrid.iter().enumerate() {
+        let shape = live_layer.k.shape();
+        anyhow::ensure!(
+            shape.len() == 3,
+            "hybrid LCP snapshot K L{layer_idx} must be rank 3, got {shape:?}"
+        );
+        let num_kv_heads = shape[0];
+        let live_capacity = shape[1];
+        let head_dim = shape[2];
+        anyhow::ensure!(
+            live_capacity == live_layer.capacity,
+            "hybrid LCP snapshot K L{layer_idx} shape capacity {live_capacity} != metadata {}",
+            live_layer.capacity
+        );
+        anyhow::ensure!(
+            sequence_len <= live_capacity,
+            "hybrid LCP snapshot sequence {sequence_len} exceeds live L{layer_idx} capacity {live_capacity}"
+        );
+        let norms_per_pos = live_layer.norms_per_pos;
+        let k_dtype = live_layer.k.dtype();
+        let v_dtype = live_layer.v_packed.dtype();
+        let _ = hybrid_lcp_snapshot_layer_bytes(
+            num_kv_heads,
+            snapshot_capacity,
+            head_dim,
+            norms_per_pos,
+            k_dtype,
+            v_dtype,
+        )?;
+        anyhow::ensure!(
+            live_layer.v_norms.dtype() == DType::F32,
+            "hybrid LCP snapshot V norms L{layer_idx} must be F32, got {:?}",
+            live_layer.v_norms.dtype()
+        );
+
+        let checked_elements = |capacity: usize, inner: usize, what: &str| -> Result<usize> {
+            num_kv_heads
+                .checked_mul(capacity)
+                .and_then(|elements| elements.checked_mul(inner))
+                .ok_or_else(|| anyhow!("hybrid LCP snapshot {what} L{layer_idx} extent overflow"))
+        };
+        let k_elements = checked_elements(snapshot_capacity, head_dim, "K")?;
+        let v_elements = checked_elements(snapshot_capacity, head_dim, "V")?;
+        let k_bytes = k_elements
+            .checked_mul(k_dtype.size_of())
+            .ok_or_else(|| anyhow!("hybrid LCP snapshot K L{layer_idx} byte overflow"))?;
+        let v_bytes = v_elements
+            .checked_mul(v_dtype.size_of())
+            .ok_or_else(|| anyhow!("hybrid LCP snapshot V L{layer_idx} byte overflow"))?;
+        let mut k_snapshot = dev
+            .alloc_buffer(
+                k_bytes,
+                k_dtype,
+                vec![num_kv_heads, snapshot_capacity, head_dim],
+            )
+            .map_err(|error| anyhow!("hybrid LCP snapshot K L{layer_idx} alloc: {error}"))?;
+        let mut v_snapshot = dev
+            .alloc_buffer(
+                v_bytes,
+                v_dtype,
+                vec![num_kv_heads, snapshot_capacity, head_dim],
+            )
+            .map_err(|error| anyhow!("hybrid LCP snapshot V L{layer_idx} alloc: {error}"))?;
+
+        let mut norms_snapshot = if v_dtype == DType::F16 {
+            anyhow::ensure!(
+                live_layer.v_norms.data_byte_len() == std::mem::size_of::<f32>(),
+                "hybrid LCP snapshot F16 V norms L{layer_idx} must be the canonical four-byte dummy, got {} bytes",
+                live_layer.v_norms.data_byte_len()
+            );
+            dev.alloc_buffer(std::mem::size_of::<f32>(), DType::F32, vec![1])
+                .map_err(|error| {
+                    anyhow!("hybrid LCP snapshot V norms dummy L{layer_idx} alloc: {error}")
+                })?
+        } else {
+            let norm_elements = checked_elements(snapshot_capacity, norms_per_pos, "V norms")?;
+            let norm_bytes = norm_elements
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| anyhow!("hybrid LCP snapshot V norms L{layer_idx} byte overflow"))?;
+            let norm_shape = if norms_per_pos == 1 {
+                vec![num_kv_heads, snapshot_capacity]
+            } else {
+                vec![num_kv_heads, snapshot_capacity, norms_per_pos]
+            };
+            dev.alloc_buffer(norm_bytes, DType::F32, norm_shape)
+                .map_err(|error| {
+                    anyhow!("hybrid LCP snapshot V norms L{layer_idx} alloc: {error}")
+                })?
+        };
+
+        let copy_prefix = |source: &MlxBuffer,
+                           destination: &mut MlxBuffer,
+                           element_bytes: usize,
+                           inner: usize,
+                           what: &str|
+         -> Result<()> {
+            let source: &[u8] = source.as_slice().map_err(|error| {
+                anyhow!("hybrid LCP snapshot {what} L{layer_idx} source: {error}")
+            })?;
+            let destination: &mut [u8] = destination.as_mut_slice().map_err(|error| {
+                anyhow!("hybrid LCP snapshot {what} L{layer_idx} destination: {error}")
+            })?;
+            let copy_len = sequence_len
+                .checked_mul(inner)
+                .and_then(|elements| elements.checked_mul(element_bytes))
+                .ok_or_else(|| {
+                    anyhow!("hybrid LCP snapshot {what} L{layer_idx} copy extent overflow")
+                })?;
+            let source_stride = live_capacity
+                .checked_mul(inner)
+                .and_then(|elements| elements.checked_mul(element_bytes))
+                .ok_or_else(|| {
+                    anyhow!("hybrid LCP snapshot {what} L{layer_idx} source stride overflow")
+                })?;
+            let destination_stride = snapshot_capacity
+                .checked_mul(inner)
+                .and_then(|elements| elements.checked_mul(element_bytes))
+                .ok_or_else(|| {
+                    anyhow!("hybrid LCP snapshot {what} L{layer_idx} destination stride overflow")
+                })?;
+            for head in 0..num_kv_heads {
+                let source_offset = head * source_stride;
+                let destination_offset = head * destination_stride;
+                let source_row = source
+                    .get(source_offset..source_offset + copy_len)
+                    .ok_or_else(|| {
+                        anyhow!("hybrid LCP snapshot {what} L{layer_idx} source is truncated")
+                    })?;
+                let destination_row = destination
+                    .get_mut(destination_offset..destination_offset + copy_len)
+                    .ok_or_else(|| {
+                        anyhow!("hybrid LCP snapshot {what} L{layer_idx} destination is truncated")
+                    })?;
+                destination_row.copy_from_slice(source_row);
+            }
+            Ok(())
+        };
+        copy_prefix(
+            &live_layer.k,
+            &mut k_snapshot,
+            k_dtype.size_of(),
+            head_dim,
+            "K",
+        )?;
+        copy_prefix(
+            &live_layer.v_packed,
+            &mut v_snapshot,
+            v_dtype.size_of(),
+            head_dim,
+            "V",
+        )?;
+        if v_dtype == DType::F16 {
+            let source: &[u8] = live_layer.v_norms.as_slice().map_err(|error| {
+                anyhow!("hybrid LCP snapshot V norms dummy L{layer_idx} source: {error}")
+            })?;
+            let destination: &mut [u8] = norms_snapshot.as_mut_slice().map_err(|error| {
+                anyhow!("hybrid LCP snapshot V norms dummy L{layer_idx} destination: {error}")
+            })?;
+            anyhow::ensure!(
+                source.len() == destination.len(),
+                "hybrid LCP snapshot V norms dummy L{layer_idx} extent changed ({} != {})",
+                source.len(),
+                destination.len()
+            );
+            destination.copy_from_slice(source);
+        } else {
+            copy_prefix(
+                &live_layer.v_norms,
+                &mut norms_snapshot,
+                std::mem::size_of::<f32>(),
+                norms_per_pos,
+                "V norms",
+            )?;
+        }
+
+        snapshot.push(std::sync::Arc::new(HybridKvBuffers {
+            k: k_snapshot,
+            v_packed: v_snapshot,
+            v_norms: norms_snapshot,
+            capacity: snapshot_capacity,
+            is_sliding: live_layer.is_sliding,
+            norms_per_pos,
+            bf16_xlen_k: None,
+            bf16_xlen_v: None,
+        }));
+    }
+    Ok(snapshot)
+}
+
 /// ADR-017 Phase E.a sub-iter "gemma-hybrid-lcp" (2026-08-03) — per-layer
 /// payload for Gemma 4's LCP partial-prefill registry across KV regimes.
 ///
@@ -7423,6 +7684,45 @@ mod tests {
     // -----------------------------------------------------------------
     // "gemma-hybrid-lcp" (2026-08-03) — GemmaLcpLayerKv payload contract
     // -----------------------------------------------------------------
+
+    #[test]
+    fn hybrid_lcp_snapshot_estimate_counts_packed_v_and_all_norm_blocks() {
+        let (num_kv_heads, capacity, head_dim, norms_per_pos) = (2usize, 10usize, 512usize, 2usize);
+        let bytes = hybrid_lcp_snapshot_layer_bytes(
+            num_kv_heads,
+            capacity,
+            head_dim,
+            norms_per_pos,
+            DType::F16,
+            DType::U8,
+        )
+        .expect("packed hybrid snapshot estimate");
+        let k = num_kv_heads * capacity * head_dim * DType::F16.size_of();
+        let v = num_kv_heads * capacity * head_dim * DType::U8.size_of();
+        let norms = num_kv_heads * capacity * norms_per_pos * std::mem::size_of::<f32>();
+        assert_eq!(bytes, (k + v + norms) as u64);
+    }
+
+    #[test]
+    fn hybrid_lcp_snapshot_estimate_counts_f16_v_and_one_dummy() {
+        let (num_kv_heads, capacity, head_dim, norms_per_pos) = (2usize, 10usize, 512usize, 2usize);
+        let bytes = hybrid_lcp_snapshot_layer_bytes(
+            num_kv_heads,
+            capacity,
+            head_dim,
+            norms_per_pos,
+            DType::F16,
+            DType::F16,
+        )
+        .expect("full-F16 hybrid snapshot estimate");
+        let k = num_kv_heads * capacity * head_dim * DType::F16.size_of();
+        let v = num_kv_heads * capacity * head_dim * DType::F16.size_of();
+        assert_eq!(
+            bytes,
+            (k + v + std::mem::size_of::<f32>()) as u64,
+            "full-F16 snapshot owns one canonical norms dummy, not a token-shaped norms buffer"
+        );
+    }
 
     /// ByteSized must sum both legs exactly (no estimation — the LCP
     /// registry's byte budget is enforced off this value).
