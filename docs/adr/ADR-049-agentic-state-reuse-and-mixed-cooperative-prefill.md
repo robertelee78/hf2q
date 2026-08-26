@@ -13,10 +13,13 @@
   1/2/4/8/16-slot matrix is green, and universal four-family two-cycle swap is
   hardware-sealed, while matched-reference acceptance remains open;
   the DeepSeek B.1 and Gemma/Qwen B.2 fail-closed hardware authorities are
-  now checked in and model-free green, while their real-artifact cells remain
-  open)
+  now checked in and model-free green; Gemma B.2 is product-hardware accepted,
+  while the DeepSeek and Qwen real-artifact cells remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 85 records the completed eight-pair Gemma product
+- Updated: 2026-08-26 (rev 86 records the accepted exact-lineage Gemma product
+  rerun: nominal 128/192 retain statistically supported product gains, while
+  nominal 256 proves the zero-rectangle scalar fallback exact and non-inferior.
+  Rev 85 recorded the completed eight-pair Gemma product
   falsifier and the resulting serving policy: nominal 128/192 cells passed the
   immutable 1.05 lower-confidence speed gate, while nominal 256 did not. The
   serving planner therefore caps stable rectangular boundary work at 192 rows
@@ -1959,6 +1962,24 @@ stable suffixes use the canonical scalar route. The next product gate keeps
 the 128/192 `>1.05` confidence requirement and turns nominal 256 into an
 explicit zero-rectangle semantic/no-regression fallback cell. Until that rerun
 passes, rev 85 is decisive policy evidence, not final product acceptance.
+
+Rev 86 completes the required exact-lineage rerun at source `1e10e752`. All 48
+waves again passed semantic, cache, route, identity, power, thermal, and host
+contention checks. Nominal 128 admitted exactly one B4 rectangle per ON wave
+and had median product speedup 1.106132 with order-stratified 95% CI
+`[1.099957,1.128067]`; nominal 192 likewise admitted exactly one B4 rectangle
+and had median 1.108905 with CI `[1.097661,1.154915]`. Both retain the
+predeclared lower-confidence requirement `>1.05`. Nominal 256 emitted zero
+rectangles in both OFF and ON, retained exact normalized tool semantics, and
+had median OFF/ON ratio 1.033734 with CI `[1.026559,1.040282]`, clearing the
+predeclared scalar-fallback non-inferiority bound `>1/1.05`. The independent
+summary is
+`/opt/hf2q-evidence/adr049-gemma-stable-1e10e752-20260826T133112Z/summary.json`
+(SHA-256 `9c43096f829227b7e58f4cadc47a917950a9848e5724dff69ee32336692fe8ab`);
+the manifest SHA-256 is
+`192fb85d9bd15045303a48d29e9aeb17abc6f4e923059f7725b565dd1e079e66`.
+This accepts the Gemma stable-boundary serving policy: aggregate B2/B4 work
+through 192 rows per lane and retain the canonical scalar route above it.
 
 The shared-weight native quantized-matmul hypothesis is falsified for this
 Gemma B.2 route. The primitive was published as `mlx-native 0.15.1` from exact
