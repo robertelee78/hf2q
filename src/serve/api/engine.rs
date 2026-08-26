@@ -9408,28 +9408,33 @@ fn run_slot_aware_deepseek4(
         }
 
         match scheduler.step() {
-            Ok(SchedulerStep::Idle) => match rx.blocking_recv() {
-                Some(Request::Shutdown) => {
-                    rx.close();
-                    shutdown_requested = true;
+            Ok(SchedulerStep::Idle) => {
+                if slotaware_idle_has_buffered_work(&pending) {
+                    continue 'worker;
                 }
-                Some(request) => enqueue_slotaware_pending(
-                    "DeepSeek-V4",
-                    &mut pending,
-                    rx.max_capacity(),
-                    request,
-                    |candidate| {
-                        deepseek4_pending_request_is_ready(
-                            candidate,
-                            &sessions,
-                            &slots,
-                            &reserved_slots,
-                            admission_open,
-                        )
-                    },
-                ),
-                None => shutdown_requested = true,
-            },
+                match rx.blocking_recv() {
+                    Some(Request::Shutdown) => {
+                        rx.close();
+                        shutdown_requested = true;
+                    }
+                    Some(request) => enqueue_slotaware_pending(
+                        "DeepSeek-V4",
+                        &mut pending,
+                        rx.max_capacity(),
+                        request,
+                        |candidate| {
+                            deepseek4_pending_request_is_ready(
+                                candidate,
+                                &sessions,
+                                &slots,
+                                &reserved_slots,
+                                admission_open,
+                            )
+                        },
+                    ),
+                    None => shutdown_requested = true,
+                }
+            }
             Ok(SchedulerStep::Decode { handles }) => {
                 if let Some(fatal) = decode_batch_deepseek4(
                     &mut model,
@@ -13327,6 +13332,9 @@ fn run_slot_aware_gemma4(
             SchedulerStep::Idle => {
                 if shutdown_requested {
                     continue;
+                }
+                if slotaware_idle_has_buffered_work(&pending) {
+                    continue 'worker;
                 }
                 // No work. Park until a request arrives, then re-loop to
                 // admit it. Disconnect ends the worker.
@@ -19458,6 +19466,15 @@ fn enqueue_slotaware_pending(
     pending.push_back(request);
 }
 
+/// A SlotAware worker owns two queues: the channel and its private admission
+/// deque. Once channel work has been transferred into `pending`, an idle
+/// scheduler must rerun admission before blocking on the channel again. The
+/// scheduler cannot see this deque, so `SchedulerStep::Idle` alone is not
+/// proof that the whole worker is idle.
+fn slotaware_idle_has_buffered_work<T>(pending: &VecDeque<T>) -> bool {
+    !pending.is_empty()
+}
+
 fn prune_closed_slotaware_pending(family: &'static str, pending: &mut VecDeque<Request>) {
     let mut live = VecDeque::with_capacity(pending.len());
     while let Some(request) = pending.pop_front() {
@@ -20498,6 +20515,9 @@ fn run_slot_aware_qwen35(
                 }
                 if shutdown_requested {
                     continue;
+                }
+                if slotaware_idle_has_buffered_work(&pending) {
+                    continue 'worker;
                 }
                 match rx.blocking_recv() {
                     Some(r) => enqueue_slotaware_pending(
@@ -47600,6 +47620,31 @@ mod qwen35_bounded_prefill_watchdog_tests {
                 restore_anchor_index: None,
                 use_prefill_logits: false,
             }))
+        );
+    }
+
+    #[test]
+    fn idle_slotaware_workers_rerun_admission_while_private_work_is_buffered() {
+        let mut pending = VecDeque::from([0_u8, 1, 2, 3]);
+        pending.pop_front();
+        pending.pop_front();
+        assert!(
+            slotaware_idle_has_buffered_work(&pending),
+            "two terminal inline admissions must not strand the remaining burst"
+        );
+        pending.clear();
+        assert!(!slotaware_idle_has_buffered_work(&pending));
+
+        let source = include_str!("engine.rs");
+        let production = source
+            .split("mod qwen35_bounded_prefill_watchdog_tests")
+            .next()
+            .expect("watchdog test module marker");
+        let call = ["slotaware_idle_has_buffered_work", "(&pending)"].concat();
+        assert_eq!(
+            production.matches(&call).count(),
+            3,
+            "DeepSeek, Gemma, and Qwen must share the channel/private-queue idle invariant"
         );
     }
 

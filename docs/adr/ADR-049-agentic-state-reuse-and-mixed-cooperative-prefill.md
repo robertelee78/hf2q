@@ -9,14 +9,15 @@
   the Qwen rectangular operator-lifecycle correction has exact native-Q5
   state proof, a completed Q5 fused-route falsifier, and a codec-wide exact
   Q4x4 implementation with Qwen3.8 quality/lifecycle and Qwen3.6 route proof;
-  its published dependency is pinned and the exact five-format physical
-  1/2/4/8/16-slot matrix is green, while swap and matched-reference
-  acceptance remain open;
+  its published dependency is pinned, the exact five-format physical
+  1/2/4/8/16-slot matrix is green, and universal four-family two-cycle swap is
+  hardware-sealed, while matched-reference acceptance remains open;
   the DeepSeek B.1 and Gemma/Qwen B.2 fail-closed hardware authorities are
   now checked in and model-free green, while their real-artifact cells remain
   open)
 - Date: 2026-08-22
-- Updated: 2026-08-25 (rev 71, exact five-format physical matrix green;
+- Updated: 2026-08-25 (rev 72, exact five-format physical matrix and universal
+  four-family swap green;
   cross-family swap harness identity race and post-drain rehash falsified;
   canonical schema-v2 preflight, isolated-Cargo, and source-dominant
   host-wired authorities are model-free green; exact-path mapped-artifact
@@ -1693,6 +1694,33 @@ RSS, physical footprint, and host-wired memory; and treats process-wired bytes
 as a nonnegative measurement. Serial fallback and negative-wired mutations are
 green. The complete captured runtime validates under this model-free contract;
 the exact-lineage rerun remains the hardware seal.
+
+Rev 72 seals that exact-lineage rerun at runtime commit `cb622acc`. One
+production four-slot process completed thirteen phases and twelve forced
+replacements across Qwen3.8 dense, Qwen3.6 MoE, Gemma4, and DeepSeek4. Every
+activation used a fresh generation, exact family replay and semantic canaries
+held, evicted artifacts had no live ownership, and the independent evidence
+seal revalidated. Switch time ranged from 0.560691 to 4.838193 seconds with a
+3.306021-second median, below the fixed 60-second product ceiling. The sealed
+matrix is
+`/opt/hf2q-evidence/universal-release-cb622acc-generative-swap/matrix.json`
+(SHA-256 `86e6739c476b9a4c0fc3ea2e28dced0fca5650d4ca85a1f6ff6ea1d434026bd6`).
+
+The next Gemma B.2 spike first falsified a literal shell continuation embedded
+inside a `jq` program; the runner parser and its model-free canary were fixed
+before any model load. At exact commit `a02e62e2`, the corrected OFF-arm
+warmup then exposed a real universal SlotAware liveness defect: four short
+terminal requests entered, two completed, and two timed out at the exact
+300-second watchdog. The worker had drained channel work into its private
+`pending` deque, yielded after inline GPU admission, observed an idle scheduler
+after the terminal seed released its slot, then blocked on the empty channel
+without consulting buffered work. Anchors had published and held no scheduler
+ownership, so they were exonerated. Qwen and DeepSeek shared the same unsafe
+idle shape. The reformulated invariant makes all three generative workers
+rerun admission whenever their private deque is nonempty and blocks on the
+channel only when both work domains are empty. Its model-free burst test is
+green and pins all three family call sites; the fresh Gemma hardware rerun is
+the deciding proof.
 
 **Lane B gates:** B.0 byte-identity (cohort+concurrent-decode); cooperative receipt regime (≥5 alternating serial/cooperative pairs, sustained median faster, peak RSS recorded, independent receipt verification); thermal contract (Nominal start, continuous Fair-or-better, no gap >5 s, fail-closed); memory H3 (≤116 GiB peak beside the 100 GiB artifact); product ceilings unchanged (60 s cold / 15 s cached-automatic-SSE / 35 s tool-result — never widened); B4 decode-cohort gate re-pass; the two B.1 latency contracts.
 

@@ -1,6 +1,6 @@
 # ADR-047: Diagnostic chat over the native inference server
 
-- **Status:** Accepted; model-swap proof-integrity corrections and the one-process universal generative-family source gate are implemented; its hardware matrix remains pending; the exact Qwen3.8 cross-format single-hash swap matrix is hardware-sealed; embedding and projector lifecycle execution remains separate
+- **Status:** Accepted; model-swap proof-integrity corrections and the one-process universal generative-family hardware matrix are sealed; the exact Qwen3.8 cross-format single-hash swap matrix is hardware-sealed; embedding and projector lifecycle execution remains separate
 - **Date:** 2026-08-20
 - **Updated:** 2026-08-25
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
@@ -882,6 +882,16 @@ process-wired bytes only as a nonnegative integer. New mutations reject serial
 fallback and negative wired data. The captured runtime validates under that
 reformulated model-free authority; the final exact-lineage rerun remains the
 hardware seal.
+
+The exact-lineage rerun passed at runtime commit `cb622acc`. One production
+four-slot process completed all thirteen phases and twelve forced replacements
+across Qwen3.8 dense, Qwen3.6 MoE, Gemma4, and DeepSeek4. Exact replay,
+semantic canaries, fresh generations, process-policy stability, eviction,
+mapping, and memory bounds all held. Switches measured 0.560691–4.838193
+seconds with a 3.306021-second median under the immutable 60-second ceiling.
+The independently revalidated matrix is
+`/opt/hf2q-evidence/universal-release-cb622acc-generative-swap/matrix.json`
+(SHA-256 `86e6739c476b9a4c0fc3ea2e28dced0fca5650d4ca85a1f6ff6ea1d434026bd6`).
 
 ### Exact Qwen3.8 cross-format swap matrix contract (2026-08-23)
 
