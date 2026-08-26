@@ -33024,6 +33024,10 @@ fn find_config(model_path: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
 mod gemma4_tiny_prefill_tests;
 
 #[cfg(test)]
+#[path = "engine_gemma4_rectangular_prefill_tests.rs"]
+mod gemma4_rectangular_prefill_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::schema::{ChatMessage, ContentPart, ImageUrl, MessageContent};
     use super::*;
