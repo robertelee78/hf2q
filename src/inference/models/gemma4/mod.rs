@@ -29,6 +29,7 @@ pub mod kv_persist;
 pub mod model;
 pub mod native_matrix;
 pub mod profile;
+pub(crate) mod rectangular_ffn;
 pub(crate) mod rectangular_prefill;
 pub mod tokenizer;
 

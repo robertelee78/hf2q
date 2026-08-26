@@ -1809,6 +1809,21 @@ impl MlxModelWeights {
         } else {
             None
         };
+        let rectangular_ffn_plans = rectangular_live_shape
+            .map(|shape| {
+                self.layers
+                    .iter()
+                    .map(|layer| {
+                        crate::inference::models::gemma4::rectangular_ffn::plan_rectangular_ffn(
+                            shape,
+                            self.hidden_size,
+                            layer.moe.moe_intermediate_size,
+                            layer.moe.top_k,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Metal-1 — begin/end programmatic GPU capture around the
@@ -5389,7 +5404,11 @@ impl MlxModelWeights {
                     None
                 };
                 let native_activation_epoch = self.native_activation_epoch()?;
-                let native_dispatched = crate::inference::models::gemma4::expert_dispatch::dispatch_native_scalar_expert(
+                let rectangular_ffn_plan = rectangular_ffn_plans
+                    .as_ref()
+                    .map(|plans| &plans[layer_idx]);
+                let native_dispatched = if let Some(plan) = rectangular_ffn_plan {
+                    crate::inference::models::gemma4::rectangular_ffn::dispatch_rectangular_native_gate_up(
                         &mut s,
                         reg,
                         dev,
@@ -5400,16 +5419,35 @@ impl MlxModelWeights {
                         &pf_moe_gate_up,
                         gate_up_affine,
                         ggml_type_gu,
-                        seq_len as u32,
-                        top_k as u32,
+                        plan,
                         (2 * moe_int) as u32,
                         hs as u32,
                         num_experts as u32,
                         self.layers[layer_idx].moe.gate_up_expert_stride,
-                        mlx_native::DenseMatmulIdInputLayout::SharedPerToken,
-                        crate::inference::models::gemma4::expert_dispatch::DenseExpertScratchSlot::GateUp,
-                        "Gemma batched-prefill gate/up",
-                    )?;
+                    )?
+                } else {
+                    crate::inference::models::gemma4::expert_dispatch::dispatch_native_scalar_expert(
+                            &mut s,
+                            reg,
+                            dev,
+                            native_activation_epoch,
+                            &pf_moe_norm_out,
+                            gu_w_buf,
+                            &pf_expert_ids,
+                            &pf_moe_gate_up,
+                            gate_up_affine,
+                            ggml_type_gu,
+                            seq_len as u32,
+                            top_k as u32,
+                            (2 * moe_int) as u32,
+                            hs as u32,
+                            num_experts as u32,
+                            self.layers[layer_idx].moe.gate_up_expert_stride,
+                            mlx_native::DenseMatmulIdInputLayout::SharedPerToken,
+                            crate::inference::models::gemma4::expert_dispatch::DenseExpertScratchSlot::GateUp,
+                            "Gemma batched-prefill gate/up",
+                        )?
+                };
                 if !gemma_moe_use_affine {
                     // ADR-033 §Pi Phase B Stage 3b — MoE intercept for
                     // `ffn_gate_up_exps`. Captures the shared per-token
@@ -5448,29 +5486,45 @@ impl MlxModelWeights {
                     })?;
 
                     if !native_dispatched {
-                        s.barrier_between(
-                            &[&pf_moe_norm_out, &pf_expert_ids, gu_w_buf],
-                            &[&pf_moe_gate_up],
-                        );
-                        s.quantized_matmul_id_ggml_pooled(
-                            reg,
-                            dev,
-                            &pf_moe_norm_out,
-                            self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                            &pf_expert_ids,
-                            &mut pf_moe_gate_up,
-                            &mut pf_moe_mm_scratch,
-                            &mlx_native::GgmlQuantizedMatmulIdParams {
-                                n_tokens: seq_len as u32,
-                                top_k: top_k as u32,
-                                n: (2 * moe_int) as u32,
-                                k: hs as u32,
-                                n_experts: num_experts as u32,
-                                expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
-                                ggml_type: ggml_type_gu,
-                            },
-                        )
-                        .map_err(|e| anyhow::anyhow!("batched gate_up_id L{layer_idx}: {e}"))?;
+                        let params = mlx_native::GgmlQuantizedMatmulIdParams {
+                            n_tokens: seq_len as u32,
+                            top_k: top_k as u32,
+                            n: (2 * moe_int) as u32,
+                            k: hs as u32,
+                            n_experts: num_experts as u32,
+                            expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
+                            ggml_type: ggml_type_gu,
+                        };
+                        if let Some(plan) = rectangular_ffn_plan {
+                            crate::inference::models::gemma4::rectangular_ffn::dispatch_rectangular_ggml_gate_up(
+                                &mut s,
+                                reg,
+                                dev,
+                                &pf_moe_norm_out,
+                                self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                                &pf_expert_ids,
+                                &pf_moe_gate_up,
+                                &mut pf_moe_mm_scratch,
+                                plan,
+                                params,
+                            )?;
+                        } else {
+                            s.barrier_between(
+                                &[&pf_moe_norm_out, &pf_expert_ids, gu_w_buf],
+                                &[&pf_moe_gate_up],
+                            );
+                            s.quantized_matmul_id_ggml_pooled(
+                                reg,
+                                dev,
+                                &pf_moe_norm_out,
+                                self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                                &pf_expert_ids,
+                                &mut pf_moe_gate_up,
+                                &mut pf_moe_mm_scratch,
+                                &params,
+                            )
+                            .map_err(|e| anyhow::anyhow!("batched gate_up_id L{layer_idx}: {e}"))?;
+                        }
                     }
                 }
                 if let Some(t0) = moe_gu_t0 {
