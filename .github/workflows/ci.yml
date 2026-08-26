@@ -199,10 +199,10 @@ jobs:
           cargo test --locked --bin hf2q --all-features core::bounded_file::tests::descriptor_identity_path_cannot_be_redirected_to_a_hardlink_namespace_by_swap_restore -- --exact
           cargo test --locked --bin hf2q --all-features serve::api::engine::tests::retained_no_general_name_uses_logical_id_for_tool_registration -- --exact
           cargo test --locked --bin hf2q --all-features serve::multi_model::tests::retained_activation_path_loads_bytes_but_publishes_operator_path -- --exact
-          cargo test --locked --bin hf2q --all-features serve::multi_model::tests::retained_activation_size_drives_budget_when_public_symlink_is_swapped_and_restored -- --exact
+          cargo test --locked --bin hf2q --all-features serve::multi_model::tests::retained_activation_rejects_public_symlink_swap_before_publication -- --exact
           cargo test --locked --bin hf2q --all-features serve::cache::tests::concurrent_cross_quant_touches_merge_stale_snapshots_under_manifest_lock -- --exact
           cargo test --locked --bin hf2q --all-features input::hf_download::tests::complete_qwen_mtp_prefix_admits_the_same_one_layer_topology_as_runtime -- --exact
-          cargo test --locked --bin hf2q --all-features input::hf_download::tests::mtp_hosted_admission_rejects_shape_correct_non_executable_storage -- --exact
+          cargo test --locked --bin hf2q --all-features input::hf_download::tests::mtp_hosted_admission_accepts_shape_correct_native_scalar_storage -- --exact
           cargo test --locked --bin hf2q --all-features input::hf_download::tests::hosted_multimodal_pair_is_admitted_as_one_pretransfer_extent -- --exact
           cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::actual_local_selection_prefers_successful_use_and_exact_quant_ignores_low_memory -- --exact
           cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::production_manual_structural_admission_never_hashes_the_text_payload -- --exact
@@ -301,7 +301,7 @@ jobs:
             core::bounded_file::tests::descriptor_identity_path_cannot_be_redirected_to_a_hardlink_namespace_by_swap_restore \
             serve::api::engine::tests::retained_no_general_name_uses_logical_id_for_tool_registration \
             serve::multi_model::tests::retained_activation_path_loads_bytes_but_publishes_operator_path \
-            serve::multi_model::tests::retained_activation_size_drives_budget_when_public_symlink_is_swapped_and_restored \
+            serve::multi_model::tests::retained_activation_rejects_public_symlink_swap_before_publication \
             serve::cache::tests::concurrent_cross_quant_touches_merge_stale_snapshots_under_manifest_lock \
             serve::tests::serve_config_defaults_are_used_and_cli_overrides_them \
             serve::tests::configured_lan_requires_runtime_auth \
@@ -402,7 +402,7 @@ jobs:
             input::hf_download::tests::complete_qwen_prefix_admits_runtime_metadata_tokenizer_and_tensor_topology \
             input::hf_download::tests::complete_qwen_mtp_prefix_admits_the_same_one_layer_topology_as_runtime \
             input::hf_download::tests::qwen_admission_rejects_embedding_tables_smaller_than_selected_heads \
-            input::hf_download::tests::mtp_hosted_admission_rejects_shape_correct_non_executable_storage \
+            input::hf_download::tests::mtp_hosted_admission_accepts_shape_correct_native_scalar_storage \
             input::hf_download::tests::exact_revision_hub_cache_lookup_reuses_an_existing_quant_without_transfer \
             input::hf_download::tests::hosted_multimodal_pair_is_admitted_as_one_pretransfer_extent \
             input::hf_download::tests::native_projector_planning_fails_closed_when_exact_config_inspection_fails \
@@ -432,7 +432,10 @@ jobs:
             convert::receipt::tests::explicit_receipt_destination_cannot_replace_the_artifact \
             tests::convert_source_classifier_reconciles_revision_and_rejects_ambiguity
           do
-            grep -Fq -- "$required_test: test" <<<"$hf_source_tests"
+            if ! grep -Fq -- "$required_test: test" <<<"$hf_source_tests"; then
+              echo "missing required test: $required_test" >&2
+              exit 1
+            fi
           done
           cargo test --locked --bin hf2q --all-features input::hf_reference_tests::
           cargo test --locked --bin hf2q --all-features input::hf_download_plan_tests::
