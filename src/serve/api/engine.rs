@@ -87,7 +87,7 @@ const QWEN35_GPU_WARMUP_TIMEOUT: Duration = Duration::from_secs(240);
 const ENGINE_SYNC_CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
 use crate::inference::models::gemma4::{
-    GEMMA4_SLOT_PREFILL_CHUNK_TOKENS, MlxModelWeights, MultiSeqPrefillOutput, ProfileAccumulator,
+    GEMMA4_SLOT_PREFILL_CHUNK_TOKENS, MlxModelWeights, ProfileAccumulator,
 };
 use crate::serve::config::Gemma4Config;
 use crate::serve::forward_prefill::SoftTokenInjection;
@@ -6381,7 +6381,12 @@ fn gemma4_cross_batch_eligible(
     prompt_tokens > 0
         && max_tokens > 0
         && u32::try_from(max_tokens).is_ok()
-        && prompt_tokens <= GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize
+        // Cold batching owns every rendered row, so its full prompt remains
+        // bounded here. Stable batching owns only the suffix after a selected
+        // slot-local anchor; that exact width cannot be known until the
+        // side-effect-free slot plan below and is bounded there instead.
+        && (require_stable_boundary
+            || prompt_tokens <= GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize)
         && !has_soft_tokens
         && has_stable_boundary == require_stable_boundary
 }
@@ -6393,6 +6398,33 @@ where
     rows.into_iter()
         .try_fold(0usize, |total, rows| total.checked_add(rows))
         .is_some_and(|total| total <= GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize)
+}
+
+/// Return the next equality-proven stable-resume slice.
+///
+/// Gemma's shared body is shape-sensitive, so a rectangle retains each lane's
+/// complete canonical scalar width. Chopping one scalar M into repeated M32
+/// calls changes quantized reduction geometry and is not coherent. A caller
+/// that cannot form one equal-start/equal-width B2/B4 transaction retains the
+/// canonical scalar route for the boundary and native cue.
+fn gemma4_stable_rectangular_slice_len(cursors: &[usize], boundaries: &[usize]) -> Option<usize> {
+    if !matches!(cursors.len(), 2 | 4) || boundaries.len() != cursors.len() {
+        return None;
+    }
+    let start = *cursors.first()?;
+    if !cursors.iter().all(|cursor| *cursor == start) {
+        return None;
+    }
+    let boundary = *boundaries.first()?;
+    if !boundaries.iter().all(|candidate| *candidate == boundary) {
+        return None;
+    }
+    let rows = boundary.checked_sub(start)?;
+    crate::inference::models::gemma4::rectangular_prefill::is_proven_rectangular_shape(
+        cursors.len(),
+        rows,
+    )
+    .then_some(rows)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6519,12 +6551,23 @@ where
         if class.is_some_and(|class| class != candidate_class) {
             break;
         }
-        let Some(next_total) = total.checked_add(rows) else {
-            break;
+        // A cold candidate contributes its complete rendered prompt to the
+        // one-forward Metal transaction. A Stable candidate carries the full
+        // prompt length only for classification; its actual work is the
+        // anchor-to-boundary suffix, which is not available until slot-local
+        // planning and is independently bounded by
+        // `gemma4_stable_rectangular_slice_len` before mutation.
+        let next_total = if candidate_class == Gemma4CrossBatchClass::Cold {
+            let Some(next_total) = total.checked_add(rows) else {
+                break;
+            };
+            if next_total > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize {
+                break;
+            }
+            next_total
+        } else {
+            total
         };
-        if next_total > GEMMA4_SLOT_PREFILL_CHUNK_TOKENS as usize {
-            break;
-        }
         class = Some(candidate_class);
         total = next_total;
         accepted += 1;
@@ -7252,7 +7295,13 @@ impl Gemma4DecodeState {
             &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
         >,
         supervisor: &EngineSupervisor,
-        cached_tokens: usize,
+        // Physical KV cursor to resume from. A rectangular stable batch may
+        // advance this beyond the request-start cache hit before calling the
+        // canonical scalar tail/cue path.
+        resume_cursor: usize,
+        // Prefix already present when this request was admitted. This is the
+        // cache credit reported to operators and clients.
+        request_cached_tokens: usize,
     ) -> Result<(
         Self,
         Option<(
@@ -7262,12 +7311,17 @@ impl Gemma4DecodeState {
     )> {
         let max_decode_tokens = params.max_tokens.max(1);
 
-        if cached_tokens > prompt_tokens.len() {
+        if resume_cursor > prompt_tokens.len() {
             anyhow::bail!(
-                "Gemma4DecodeState::prefill_seed: cached prefix {cached_tokens} exceeds prompt {}",
+                "Gemma4DecodeState::prefill_seed: resume cursor {resume_cursor} exceeds prompt {}",
                 prompt_tokens.len()
             );
         }
+        anyhow::ensure!(
+            request_cached_tokens <= resume_cursor,
+            "Gemma request cache credit {request_cached_tokens} exceeds physical resume cursor \
+             {resume_cursor}"
+        );
 
         // A cold admission owns the slot and resets its cursor. A compatible
         // continuation keeps the exact live prefix and processes only the
@@ -7281,7 +7335,7 @@ impl Gemma4DecodeState {
         // prefill reads provisioned garbage and diverges from SerialFifo.
         // Resets HB + hybrid (production-default regime); dense/mlx are
         // off-default and their forward paths defense-in-depth on absence.
-        if cached_tokens == 0 {
+        if resume_cursor == 0 {
             for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
                 buf.reset_for_slot(slot_id).map_err(|e| {
                     anyhow::anyhow!(
@@ -7306,13 +7360,13 @@ impl Gemma4DecodeState {
         // override list must be empty for that resume. Refuse any checkpoint
         // that ends inside an image span rather than silently mixing cached
         // and newly injected rows.
-        let soft_tokens_for_prefill = if cached_tokens > 0 && !soft_tokens.is_empty() {
+        let soft_tokens_for_prefill = if resume_cursor > 0 && !soft_tokens.is_empty() {
             anyhow::ensure!(
                 gemma4_cached_prefix_covers_soft_token_ranges(
-                    cached_tokens,
+                    resume_cursor,
                     soft_tokens.iter().map(|soft| &soft.range),
                 ),
-                "Gemma 4 vision cache boundary {cached_tokens} falls inside a soft-token range"
+                "Gemma 4 vision cache boundary {resume_cursor} falls inside a soft-token range"
             );
             &[][..]
         } else {
@@ -7330,8 +7384,8 @@ impl Gemma4DecodeState {
                 prompt_tokens.len()
             );
             anyhow::ensure!(
-                cached_tokens <= boundary,
-                "Gemma cached prefix {cached_tokens} extends beyond stable prompt boundary {boundary}"
+                resume_cursor <= boundary,
+                "Gemma resume cursor {resume_cursor} extends beyond stable prompt boundary {boundary}"
             );
         }
 
@@ -7339,8 +7393,8 @@ impl Gemma4DecodeState {
             // Advance only to the exact pre-generation boundary, checkpoint
             // the sliding ring there, then process the rewriteable generation
             // cue. This avoids heuristic ring rewind on the next tool turn.
-            if cached_tokens < boundary {
-                if cached_tokens == 0 {
+            if resume_cursor < boundary {
+                if resume_cursor == 0 {
                     let _ = supervised_gemma4_gpu_call(
                         supervisor,
                         "gemma4_prefill_stable_boundary",
@@ -7375,7 +7429,7 @@ impl Gemma4DecodeState {
                                     multi_seq_kv_hybrid.as_deref_mut(),
                                     multi_seq_kv_dense.as_deref_mut(),
                                     multi_seq_kv_mlx.as_deref_mut(),
-                                    cached_tokens,
+                                    resume_cursor,
                                 )
                         },
                     )?;
@@ -7412,7 +7466,7 @@ impl Gemma4DecodeState {
                 first_decode_token,
                 Some((anchor, capture_started.elapsed())),
             )
-        } else if cached_tokens == 0 {
+        } else if resume_cursor == 0 {
             (
                 supervised_gemma4_gpu_call(supervisor, "gemma4_prefill", || {
                     loaded.weights.forward_prefill_with_soft_tokens_slot_aware(
@@ -7444,7 +7498,7 @@ impl Gemma4DecodeState {
                             multi_seq_kv_hybrid.as_deref_mut(),
                             multi_seq_kv_dense.as_deref_mut(),
                             multi_seq_kv_mlx.as_deref_mut(),
-                            cached_tokens,
+                            resume_cursor,
                         )
                 })?,
                 None,
@@ -7474,7 +7528,7 @@ impl Gemma4DecodeState {
                 first_decode_token,
                 None,
                 prefill_duration,
-                cached_tokens,
+                request_cached_tokens,
             )?,
             prompt_anchor,
         ))
@@ -14153,6 +14207,7 @@ fn admit_gemma4_slot(
         guard.mlx.as_mut(),
         supervisor,
         cached_tokens,
+        cached_tokens,
     );
     let (state, stable_anchor) = match seed {
         Ok(seed) => seed,
@@ -15616,23 +15671,6 @@ fn admit_gemma4_slots_stable_batched(
         None
     };
 
-    // Both stable phases are multi-sequence Metal transactions. Conservatively
-    // cap the sum of full rendered rows; their actual boundary/cue suffix sums
-    // can only be smaller. This keeps each phase within the same 4,096-row
-    // watchdog boundary as ordinary Gemma prefill.
-    if !gemma4_batch_rows_within_transaction_limit(
-        requests.iter().map(|(prompt, _, _)| prompt.len()),
-    ) {
-        return fallback_single(
-            guard,
-            scheduler,
-            slots,
-            retained_tokens,
-            prompt_anchors,
-            requests,
-        );
-    }
-
     let max_seq_len = guard
         .model
         .context_length
@@ -15678,23 +15716,14 @@ fn admit_gemma4_slots_stable_batched(
     // stable batch, execute the entire contiguous group through the proven
     // single-request path in original FIFO order. A later cold/incompatible
     // lane must never run before an earlier cached lane has reserved its slot.
-    let has_tiny_phase =
-        requests
-            .iter()
-            .zip(plan.iter())
-            .any(|((prompt, _, _), (preference, boundary, _))| {
-                let boundary_work = boundary.saturating_sub(preference.cached_tokens);
-                let cue_work = prompt.len().saturating_sub(*boundary);
-                (boundary_work > 0
-                    && !crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
-                        boundary_work,
-                        false,
-                    ))
-                    || !crate::serve::forward_prefill::gemma_slot_prefill_batched_work_eligible(
-                        cue_work, false,
-                    )
-            });
-    if plan.len() != requests.len() || plan.len() < 2 || has_tiny_phase {
+    let initial_cursors: Vec<_> = plan
+        .iter()
+        .map(|(preference, _, _)| preference.cached_tokens)
+        .collect();
+    let stable_boundaries: Vec<_> = plan.iter().map(|(_, boundary, _)| *boundary).collect();
+    let has_exact_rectangular_prefix =
+        gemma4_stable_rectangular_slice_len(&initial_cursors, &stable_boundaries).is_some();
+    if plan.len() != requests.len() || plan.len() < 2 || !has_exact_rectangular_prefix {
         return fallback_single(
             guard,
             scheduler,
@@ -15817,7 +15846,21 @@ fn admit_gemma4_slots_stable_batched(
     }
     let mut admitted = live_admitted;
 
-    if admitted.len() < 2 {
+    // Admission can reject one lane, and a client can disconnect after the
+    // side-effect-free plan. Revalidate the actual surviving cohort before
+    // accepting streams or restoring any cache bytes. B4 -> B2 remains
+    // eligible when the exact rectangle survives; B4 -> B3 falls back.
+    let admitted_cursors: Vec<_> = admitted
+        .iter()
+        .map(|(_, _, _, _, preference, _)| preference.cached_tokens)
+        .collect();
+    let admitted_boundaries: Vec<_> = admitted
+        .iter()
+        .map(|(_, _, _, _, _, boundary)| *boundary)
+        .collect();
+    let admitted_has_exact_rectangle =
+        gemma4_stable_rectangular_slice_len(&admitted_cursors, &admitted_boundaries).is_some();
+    if !admitted_has_exact_rectangle {
         for (handle, prompt, params, reply, _, _) in admitted {
             // The stable batch did not execute, so this arena is unchanged.
             // Preserve only its prior measured high-water before retrying the
@@ -16015,17 +16058,25 @@ fn admit_gemma4_slots_stable_batched(
             stable_restore_prunes.push((handle.slot_id, anchor_index, prune));
         }
     }
-    for (slot_id, anchor_index, mut event) in stable_restore_events {
-        let (_, _, prune) = stable_restore_prunes
-            .iter()
-            .find(|(candidate_slot, candidate_index, _)| {
-                *candidate_slot == slot_id && *candidate_index == anchor_index
-            })
-            .expect("every stable restore event has one successful prune result");
-        event.descendant_prune_count = prune.pruned;
-        event.pending_discarded |= prune.pending_discarded;
-        record_gemma4_anchor_restore(event);
-    }
+    // Keep hit telemetry provisional until the whole cohort has completed its
+    // full-width rectangle, cue forwards, and cursor commit. A
+    // restored prefix that is subsequently cold-reset did not save tokens for
+    // a successful request.
+    let successful_restore_events: Vec<_> = stable_restore_events
+        .iter()
+        .map(|(slot_id, anchor_index, event)| {
+            let mut event = *event;
+            let (_, _, prune) = stable_restore_prunes
+                .iter()
+                .find(|(candidate_slot, candidate_index, _)| {
+                    candidate_slot == slot_id && candidate_index == anchor_index
+                })
+                .expect("every stable restore event has one successful prune result");
+            event.descendant_prune_count = prune.pruned;
+            event.pending_discarded |= prune.pending_discarded;
+            event
+        })
+        .collect();
 
     clear_gemma4_self_mounts(guard.model);
     let prefill_started = Instant::now();
@@ -16035,86 +16086,109 @@ fn admit_gemma4_slots_stable_batched(
         .max()
         .unwrap_or(1);
 
-    // Phase one advances only requests that have an appended conversation
-    // suffix before their exact native generation cue.
+    // Advance the complete equality-proven boundary suffix as one rectangle,
+    // retaining the scalar M of every lane. The model's native generation cue
+    // stays on the canonical per-slot path.
     let boundary_suffix_tokens: usize = admitted
         .iter()
         .map(|(_, _, _, _, preference, boundary)| boundary.saturating_sub(preference.cached_tokens))
         .sum();
-    let boundary_seqs: Vec<(Vec<u32>, SlotId, usize)> = admitted
+    let mut cursors: Vec<_> = admitted
         .iter()
-        .filter_map(|(handle, prompt, _, _, preference, boundary)| {
-            (preference.cached_tokens < *boundary).then(|| {
+        .map(|(_, _, _, _, preference, _)| preference.cached_tokens)
+        .collect();
+    let boundaries: Vec<_> = admitted
+        .iter()
+        .map(|(_, _, _, _, _, boundary)| *boundary)
+        .collect();
+    let mut rectangular_slices = 0usize;
+    let mut rectangular_rows_per_lane = 0usize;
+    let seed_result = (|| -> Result<Vec<(Gemma4DecodeState, Gemma4PromptAnchor)>> {
+        let rows = gemma4_stable_rectangular_slice_len(&cursors, &boundaries)
+            .ok_or_else(|| anyhow::anyhow!("Gemma stable batch lost its preflighted rectangle"))?;
+        let seqs: Vec<_> = admitted
+            .iter()
+            .zip(cursors.iter())
+            .map(|((handle, prompt, _, _, _, _), cursor)| {
                 (
-                    prompt[preference.cached_tokens..*boundary].to_vec(),
+                    prompt[*cursor..*cursor + rows].to_vec(),
                     handle.slot_id,
-                    preference.cached_tokens,
+                    *cursor,
                 )
             })
-        })
-        .collect();
-    let mut captured_anchors: Vec<(SlotId, Option<Gemma4PromptAnchor>)> =
-        Vec::with_capacity(admitted.len());
-    let forward_result = (|| -> Result<MultiSeqPrefillOutput> {
+            .collect();
         let scaffold = guard
             .hybrid
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Gemma stable batched resume lost hybrid KV"))?;
-        if !boundary_seqs.is_empty() {
-            let _ =
-                supervised_gemma4_gpu_call(supervisor, "gemma4_stable_prefill_boundary", || {
-                    guard.model.weights.forward_prefill_batched_multi_seq_live(
-                        &boundary_seqs,
-                        scaffold,
-                        max_decode,
-                        &mut guard.model.ctx,
-                    )
-                })?;
-            clear_gemma4_self_mounts(guard.model);
-        }
-
-        for (handle, prompt, _, _, _, boundary) in &admitted {
-            let capture_started = Instant::now();
-            let anchor =
-                crate::inference::models::gemma4::kv_cache::snapshot_gemma_hybrid_slot_anchor(
+            .ok_or_else(|| anyhow::anyhow!("Gemma stable rectangular resume lost hybrid KV"))?;
+        let _ = supervised_gemma4_gpu_call(
+            supervisor,
+            "gemma4_stable_rectangular_boundary",
+            || {
+                guard.model.weights.forward_prefill_batched_multi_seq_live(
+                    &seqs,
                     scaffold,
-                    handle.slot_id,
-                    *boundary,
-                )?;
-            let prompt_tokens = prompt[..*boundary].to_vec();
-            captured_anchors.push((
+                    max_decode,
+                    &mut guard.model.ctx,
+                )
+            },
+        )?;
+        clear_gemma4_self_mounts(guard.model);
+        for cursor in &mut cursors {
+            *cursor += rows;
+        }
+        rectangular_slices = 1;
+        rectangular_rows_per_lane = rows;
+
+        let mut seeded = Vec::with_capacity(admitted.len());
+        for (lane, (handle, prompt, params, _, preference, boundary)) in admitted.iter().enumerate()
+        {
+            let (state, anchor) = Gemma4DecodeState::prefill_seed(
+                guard.model,
+                prompt,
+                &[],
+                params,
+                registration,
                 handle.slot_id,
-                Some(Gemma4PromptAnchor {
-                    prompt_tokens,
-                    kv: anchor,
-                    vision_fingerprint: None,
-                    capture_duration: capture_started.elapsed(),
+                &mut guard.kv,
+                guard.hybrid.as_mut(),
+                guard.dense.as_mut(),
+                guard.mlx.as_mut(),
+                supervisor,
+                cursors[lane],
+                preference.cached_tokens,
+            )?;
+            clear_gemma4_self_mounts(guard.model);
+            let (kv, capture_duration) = anchor.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Gemma stable scalar tail did not capture boundary {} for slot {}",
+                    boundary,
+                    handle.slot_id.0
+                )
+            })?;
+            seeded.push((
+                state,
+                Gemma4PromptAnchor {
+                    prompt_tokens: prompt[..*boundary].to_vec(),
+                    kv,
+                    vision_fingerprint: params.vision_fingerprint,
+                    capture_duration,
                     lineage_epoch: 0,
                     publication_disposition: AnchorPublicationDisposition::Unpublished,
-                }),
+                },
             ));
         }
-
-        let cue_seqs: Vec<(Vec<u32>, SlotId, usize)> = admitted
-            .iter()
-            .map(|(handle, prompt, _, _, _, boundary)| {
-                (prompt[*boundary..].to_vec(), handle.slot_id, *boundary)
-            })
-            .collect();
-        supervised_gemma4_gpu_call(supervisor, "gemma4_stable_prefill_cue", || {
-            guard.model.weights.forward_prefill_batched_multi_seq_live(
-                &cue_seqs,
-                scaffold,
-                max_decode,
-                &mut guard.model.ctx,
-            )
-        })
+        Ok(seeded)
     })();
 
-    let output = match forward_result {
-        Ok(output) => {
+    let prefill_duration = prefill_started.elapsed();
+    let mut seeded = match seed_result {
+        Ok(mut seeded) => {
             clear_gemma4_self_mounts(guard.model);
-            output
+            for (state, _) in &mut seeded {
+                state.prefill_duration = prefill_duration;
+            }
+            seeded
         }
         Err(e) => {
             if is_worker_fatal(supervisor, &e) {
@@ -16131,7 +16205,7 @@ fn admit_gemma4_slots_stable_batched(
                 return Some(fatal);
             }
             clear_gemma4_self_mounts(guard.model);
-            return fail_gemma4_stable_batch(
+            let failure = fail_gemma4_stable_batch(
                 guard,
                 scheduler,
                 retained_tokens,
@@ -16139,19 +16213,17 @@ fn admit_gemma4_slots_stable_batched(
                 admitted,
                 kv_bytes_per_token,
                 e,
-            )
-            .fatal;
+            );
+            for event in gemma4_stable_failure_events(
+                &stable_restore_events,
+                &failure.per_slot,
+                &stable_restore_prunes,
+            ) {
+                record_gemma4_anchor_restore(event);
+            }
+            return failure.fatal;
         }
     };
-    let prefill_duration = prefill_started.elapsed();
-    GEMMA4_STABLE_RESUME_BATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    tracing::info!(
-        requests = admitted.len(),
-        suffix_tokens = boundary_suffix_tokens,
-        elapsed_ms = prefill_duration.as_secs_f64() * 1000.0,
-        "Gemma4 stable agent suffixes prefilled in one multi-slot body"
-    );
-
     let cursor_commits: Vec<(SlotId, usize, usize)> = admitted
         .iter()
         .map(|(handle, prompt, _, _, preference, _)| {
@@ -16171,59 +16243,35 @@ fn admit_gemma4_slots_stable_batched(
         );
         return Some(fatal);
     }
-
-    let mut installs = admitted.into_iter().zip(
-        output
-            .first_tokens
-            .into_iter()
-            .zip(output.logits.into_iter()),
+    let stable_batch_count = GEMMA4_STABLE_RESUME_BATCH_COUNT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    if std::env::var("HF2Q_PREFILL_TIMING").is_ok() {
+        eprintln!(
+            "[PREFILL_TIMING] STABLE BATCHED {} seqs x {} boundary rows in {:.1} ms count={}",
+            admitted.len(),
+            rectangular_rows_per_lane,
+            prefill_duration.as_secs_f64() * 1000.0,
+            stable_batch_count,
+        );
+    }
+    tracing::info!(
+        requests = admitted.len(),
+        suffix_tokens = boundary_suffix_tokens,
+        rectangular_slices,
+        rectangular_rows_per_lane,
+        stable_batch_count,
+        elapsed_ms = prefill_duration.as_secs_f64() * 1000.0,
+        "Gemma4 stable agent suffix used one full-width rectangle plus canonical cue"
     );
-    while let Some((
-        (handle, prompt, params, mut reply, preference, _),
-        (first_token, first_logits),
-    )) = installs.next()
+    for event in successful_restore_events {
+        record_gemma4_anchor_restore(event);
+    }
+
+    let mut installs = admitted.into_iter().zip(seeded.drain(..));
+    while let Some(((handle, prompt, _params, mut reply, _preference, _), (state, anchor))) =
+        installs.next()
     {
-        let state = match Gemma4DecodeState::from_first_token(
-            guard.model,
-            &prompt,
-            &params,
-            registration,
-            handle.slot_id,
-            first_token,
-            Some(&first_logits),
-            prefill_duration,
-            preference.cached_tokens,
-        ) {
-            Ok(state) => state,
-            Err(e) => {
-                reply = match reset_gemma4_slot_for_reply(
-                    guard,
-                    scheduler,
-                    handle,
-                    kv_bytes_per_token,
-                    reply,
-                ) {
-                    Ok(reply) => reply,
-                    Err(mut fatal) => {
-                        fatal.extend_slots(installs.map(
-                            |((remaining_handle, _, _, remaining_reply, _, _), _)| {
-                                (Some(remaining_handle), remaining_reply)
-                            },
-                        ));
-                        return Some(fatal);
-                    }
-                };
-                retained_tokens[handle.slot_id.0 as usize].clear();
-                clear_gemma4_anchor_store(
-                    &mut prompt_anchors[handle.slot_id.0 as usize],
-                    "stable-batch-install-failure",
-                    handle.slot_id,
-                );
-                scheduler.release(handle);
-                slot_fire_done(reply, Err(e), false);
-                continue;
-            }
-        };
         let (completed, work, rate) = state.operator_prefill_progress();
         crate::serve::operator_ui::prefill_progress(
             "gemma4",
@@ -16245,19 +16293,13 @@ fn admit_gemma4_slots_stable_batched(
             u32::try_from(prompt.len()).expect("Gemma stable batch request was validated"),
         );
         let budget = gemma4_anchor_aggregate_budget_bytes();
-        if let Some(anchor) = captured_anchors
-            .iter_mut()
-            .find(|(slot_id, _)| *slot_id == handle.slot_id)
-            .and_then(|(_, anchor)| anchor.take())
-        {
-            let _ = stage_gemma4_pending_anchor(
-                handle,
-                prompt_anchors,
-                anchor,
-                budget,
-                "stable_batched_prompt_boundary",
-            );
-        }
+        let _ = stage_gemma4_pending_anchor(
+            handle,
+            prompt_anchors,
+            anchor,
+            budget,
+            "stable_rectangular_prompt_boundary",
+        );
         if slot_emit_token(&mut reply, &state.seed_tick()) {
             let slot_idx = handle.slot_id.0 as usize;
             reply = match recover_gemma4_slot_after_cancellation_for_reply(
@@ -46203,6 +46245,14 @@ mod gemma4_bounded_prefill_tests {
 
         assert!(gemma4_cross_batch_eligible(4_096, 1, false, false, false));
         assert!(
+            !gemma4_cross_batch_eligible(4_097, 1, false, false, false),
+            "cold work must retain the full-prompt transaction ceiling"
+        );
+        assert!(
+            gemma4_cross_batch_eligible(200_192, 1, true, true, false),
+            "a long stable history is bounded by its planned suffix, not its full prompt"
+        );
+        assert!(
             !gemma4_cross_batch_eligible(4_096, 1, false, false, true),
             "multimodal streaming must never enter the plain-text batch arm"
         );
@@ -46300,6 +46350,16 @@ mod gemma4_bounded_prefill_tests {
             1,
             "one admission quantum contains one contiguous batch class"
         );
+        assert_eq!(
+            gemma4_bounded_batch_prefix_len([
+                Some((Stable, 200_192)),
+                Some((Stable, 200_192)),
+                Some((Stable, 200_192)),
+                Some((Stable, 200_192)),
+            ]),
+            4,
+            "stable grouping must not charge already-cached history as new Metal work"
+        );
 
         let mut collected = vec!["ready-a", "active-prefix", "ready-b", "ready-c"];
         let mut pending = VecDeque::from(["later-a", "later-b"]);
@@ -46322,6 +46382,52 @@ mod gemma4_bounded_prefill_tests {
                 prompt_tokens: 4_096,
                 max_tokens: 64,
             }
+        );
+
+        assert_eq!(
+            gemma4_stable_rectangular_slice_len(&[64, 64], &[121, 121]),
+            Some(57)
+        );
+        assert_eq!(
+            gemma4_stable_rectangular_slice_len(&[200_000; 4], &[200_128; 4]),
+            Some(128),
+            "long histories with a proven small suffix remain rectangular"
+        );
+        assert_eq!(
+            gemma4_stable_rectangular_slice_len(&[96, 96, 96, 96], &[121, 121, 121, 121]),
+            None,
+            "a sub-M32 boundary tail must stay scalar"
+        );
+        assert_eq!(
+            gemma4_stable_rectangular_slice_len(&[64, 65, 64, 64], &[121, 122, 121, 121]),
+            None,
+            "different logical starts cannot share a rectangle"
+        );
+        assert_eq!(
+            gemma4_stable_rectangular_slice_len(&[64, 64, 64], &[121, 121, 121]),
+            None,
+            "post-admission B4 -> B3 is outside the B2/B4 authority"
+        );
+        assert_eq!(
+            gemma4_stable_rectangular_slice_len(&[64, 64], &[121, 121]),
+            Some(57),
+            "post-admission B4 -> B2 retains the exact rectangle"
+        );
+
+        for remainder in [0usize, 1, 31] {
+            let boundary = 64 + 64 + remainder;
+            let cursors = vec![64usize; 4];
+            let boundaries = vec![boundary; 4];
+            assert_eq!(
+                gemma4_stable_rectangular_slice_len(&cursors, &boundaries),
+                Some(64 + remainder),
+                "the rectangle must retain the complete scalar M"
+            );
+        }
+        assert_eq!(
+            gemma4_stable_rectangular_slice_len(&[64; 4], &[1_089; 4]),
+            None,
+            "B4 must retain the 4,096-row transaction ceiling"
         );
     }
 }

@@ -63,8 +63,8 @@ fn lane_span(shape: RectangularPrefillShape, lane: usize, columns: usize) -> Res
     Ok(ElementSpan { offset, elements })
 }
 
-/// Build the only body shape admitted by the current deciding spike:
-/// two or four lanes, each retaining the canonical scalar prefill width 32.
+/// Build an exact lane-local plan while retaining each lane's complete scalar
+/// prefill width.
 pub(crate) fn plan_rectangular_ffn(
     shape: RectangularPrefillShape,
     hidden: usize,
@@ -72,13 +72,12 @@ pub(crate) fn plan_rectangular_ffn(
     top_k: usize,
 ) -> Result<RectangularFfnPlan> {
     ensure!(
-        matches!(shape.lanes, 2 | 4),
-        "rectangular Gemma FFN requires two or four lanes, got {}",
-        shape.lanes
-    );
-    ensure!(
-        shape.rows_per_lane == 32,
-        "rectangular Gemma FFN requires scalar width 32, got {}",
+        super::rectangular_prefill::is_proven_rectangular_shape(
+            shape.lanes,
+            shape.rows_per_lane,
+        ),
+        "rectangular Gemma FFN shape B{}xM{} exceeds its transaction contract",
+        shape.lanes,
         shape.rows_per_lane
     );
     ensure!(
@@ -224,8 +223,8 @@ pub(crate) fn dispatch_rectangular_native_gate_up(
 }
 
 /// Dispatch the block-quantized expert gate-up route once per physical lane,
-/// retaining the scalar M=32 mm-id plan and explicitly fencing shared routing
-/// scratch before every reuse.
+/// retaining each lane's complete scalar-M mm-id plan and explicitly fencing
+/// shared routing scratch before every reuse.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_rectangular_ggml_gate_up(
     session: &mut GraphSession<'_>,

@@ -45,6 +45,17 @@ fn plans_exact_b2_and_b4_m32_body_spans() {
             lanes * 32 * 8 * 2 * 1408,
         );
     }
+
+    let wide_shape = RectangularPrefillShape {
+        rows_per_lane: 95,
+        ..shape(4)
+    };
+    let wide = plan_rectangular_ffn(wide_shape, 4096, 1408, 8)
+        .expect("full scalar width remains lane-local");
+    assert!(wide
+        .lanes
+        .iter()
+        .all(|lane| lane.source_rows == 95 && lane.top_k == 8));
 }
 
 #[test]
@@ -57,6 +68,10 @@ fn rejects_unproven_body_shapes_and_dimension_overflow() {
         RectangularPrefillShape {
             rows_per_lane: 31,
             ..shape(2)
+        },
+        RectangularPrefillShape {
+            rows_per_lane: 1_025,
+            ..shape(4)
         },
     ] {
         assert!(plan_rectangular_ffn(bad_shape, 4096, 1408, 8).is_err());

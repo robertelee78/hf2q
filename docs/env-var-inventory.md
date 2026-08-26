@@ -202,8 +202,6 @@ this release:
 | `HF2Q_FALSIFIER_STAGGER_MS` | `development-only` | 3 |
 | `HF2Q_FA_F16` | `development-only` | 13 |
 | `HF2Q_FA_LAYER_CKSUM` | `development-only` | 1 |
-| `HF2Q_FA_PEER_PORT` | `development-only` | 7 |
-| `HF2Q_FA_PEER_PORT_NWG32` | `development-only` | 3 |
 | `HF2Q_FA_TRACE` | `development-only` | 2 |
 | `HF2Q_FFN_POOLED_LEGACY` | `development-only` | 2 |
 | `HF2Q_FFN_SPLIT` | `development-only` | 6 |
@@ -297,7 +295,7 @@ this release:
 | `HF2Q_PREFILL_CROSS_SLOT` | `promote-or-internalize` | 1 |
 | `HF2Q_PREFILL_DUMP` | `development-only` | 4 |
 | `HF2Q_PREFILL_SLOT_BATCHED` | `promote-or-internalize` | 4 |
-| `HF2Q_PREFILL_TIMING` | `development-only` | 2 |
+| `HF2Q_PREFILL_TIMING` | `development-only` | 3 |
 | `HF2Q_PROFILE_BUCKETS` | `development-only` | 10 |
 | `HF2Q_PROFILE_DENSE_Q_SPLIT_COMMITS` | `development-only` | 5 |
 | `HF2Q_PROFILE_FA` | `development-only` | 5 |

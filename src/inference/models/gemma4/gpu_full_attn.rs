@@ -1470,139 +1470,26 @@ impl MlxModelWeights {
                     fuse_fwht_pre: 0,
                     nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(hb_kv_seq_len),
                 };
-                // HF2Q_FA_PEER_PORT*: dispatch peer-port kernel variant instead of hybrid.
-                // Preconditions: head_dim==256, K dtype==F16, V dtype==F16.
-                //
-                // iter-137 — two variants:
-                //   HF2Q_FA_PEER_PORT       = NWG=1 verbatim port (iter-126).
-                //                             Falsified at tg5000 (-25%) because peer's
-                //                             actual runtime uses NWG=32 (iter-133 root
-                //                             cause). Kept for A/B + documentation;
-                //                             additionally gated on is_sliding so
-                //                             full-attn fallthrough to HYBRID.
-                //   HF2Q_FA_PEER_PORT_NWG32 = NWG=32 + reduce-kernel port (iters 134-137).
-                //                             Matches peer's actual runtime dispatch.
-                //                             Validated WIN +1.8-3.1pp at tg100/tg2000/tg5000
-                //                             vs HYBRID at PORT's f16-V regime (iter-138/140).
-                //                             Default-flipped ON iter-149 per operator
-                //                             approval: "best possible outcome for users —
-                //                             if coherent + TQ still enabled + marginally
-                //                             faster, of course default."
-                //                             Reuses existing sdpa_tmp buffer (identical
-                //                             size formula nrows*32*(dv+2)*4).
-                //
-                // PORT_NWG32 default ON; opt out via HF2Q_FA_PEER_PORT_NWG32=0.
-                // PORT (NWG=1, falsified) default OFF — explicit HF2Q_FA_PEER_PORT=1 only.
-                // The precondition `v_packed.dtype()==F16` means PORT_NWG32 ONLY fires when
-                // TQ-HB-V is bypassed (HF2Q_FULL_F16_KV=1 or otherwise F16-V regime).
-                // With default TQ-HB-V active, PORT_NWG32 gate falls through to hybrid —
-                // zero behavior change. With explicit F16-V request, PORT_NWG32 wins +2pp.
-                static FA_PEER_PORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let use_peer_port = *FA_PEER_PORT.get_or_init(|| {
-                    std::env::var("HF2Q_FA_PEER_PORT")
-                        .map(|v| v == "1")
-                        .unwrap_or(false)
-                });
-                static FA_PEER_PORT_NWG32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let use_peer_port_nwg32 = *FA_PEER_PORT_NWG32.get_or_init(|| {
-                    // env_default_true pattern (mirrors HF2Q_Q6K_MV_NR2 iter-326):
-                    // unset → ON; "0"/"false"/"off" → OFF; "1"/"true"/"on" → ON.
-                    match std::env::var("HF2Q_FA_PEER_PORT_NWG32").ok().as_deref() {
-                        None => true,
-                        Some(v)
-                            if v.eq_ignore_ascii_case("0")
-                                || v.eq_ignore_ascii_case("false")
-                                || v.eq_ignore_ascii_case("off") =>
-                        {
-                            false
-                        }
-                        Some(_) => true,
-                    }
-                });
-
-                if use_peer_port_nwg32
-                    && hd == 256
-                    && hybrid_kv[layer_idx].k.dtype() == mlx_native::DType::F16
-                    && hybrid_kv[layer_idx].v_packed.dtype() == mlx_native::DType::F16
-                {
-                    let p_peer =
-                        mlx_native::ops::flash_attn_vec_peer_port_f16::FlashAttnVecPeerPortParams {
-                            num_heads: nh as u32,
-                            num_kv_heads: nkv as u32,
-                            head_dim: hd as u32,
-                            kv_seq_len: hb_kv_seq_len,
-                            kv_capacity: hb_cap as u32,
-                            scale: 1.0,
-                            mask_type: if is_sliding { 2 } else { 1 },
-                            sliding_window: if is_sliding {
-                                self.sliding_window as u32
-                            } else {
-                                0
-                            },
-                            ring_start: ring_start_hb,
-                        };
-                    mlx_native::ops::flash_attn_vec_peer_port_f16::flash_attn_vec_peer_port_f16_nwg32(
-                                session.encoder_mut(), reg, dev,
-                                &self.activations.attn_q_normed,
-                                &hybrid_kv[layer_idx].k,
-                                &hybrid_kv[layer_idx].v_packed,
-                                &self.activations.sdpa_tmp,
-                                &self.activations.sdpa_out,
-                                &p_peer,
-                            ).map_err(|e| anyhow::anyhow!("flash_attn_vec_peer_port_f16_nwg32 L{layer_idx}: {e}"))?;
-                    *total_dispatches += 2; // vec + reduce
-                } else if use_peer_port
-                    && is_sliding
-                    && hd == 256
-                    && hybrid_kv[layer_idx].k.dtype() == mlx_native::DType::F16
-                    && hybrid_kv[layer_idx].v_packed.dtype() == mlx_native::DType::F16
-                {
-                    let p_peer =
-                        mlx_native::ops::flash_attn_vec_peer_port_f16::FlashAttnVecPeerPortParams {
-                            num_heads: nh as u32,
-                            num_kv_heads: nkv as u32,
-                            head_dim: hd as u32,
-                            kv_seq_len: hb_kv_seq_len,
-                            kv_capacity: hb_cap as u32,
-                            scale: 1.0,
-                            mask_type: if is_sliding { 2 } else { 1 },
-                            sliding_window: if is_sliding {
-                                self.sliding_window as u32
-                            } else {
-                                0
-                            },
-                            ring_start: ring_start_hb,
-                        };
-                    mlx_native::ops::flash_attn_vec_peer_port_f16::flash_attn_vec_peer_port_f16(
-                        session.encoder_mut(),
-                        reg,
-                        dev,
-                        &self.activations.attn_q_normed,
-                        &hybrid_kv[layer_idx].k,
-                        &hybrid_kv[layer_idx].v_packed,
-                        &self.activations.sdpa_out,
-                        &p_peer,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("flash_attn_vec_peer_port_f16 L{layer_idx}: {e}")
-                    })?;
-                    *total_dispatches += 1; // NWG=1: no reduce kernel
-                } else {
-                    mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
-                        session.encoder_mut(),
-                        reg,
-                        dev,
-                        &self.activations.attn_q_normed,
-                        &hybrid_kv[layer_idx].k,
-                        &hybrid_kv[layer_idx].v_packed,
-                        &hybrid_kv[layer_idx].v_norms,
-                        &self.activations.sdpa_out,
-                        &self.activations.sdpa_tmp,
-                        &p_hyb,
-                    )
-                    .map_err(|e| anyhow::anyhow!("flash_attn_vec_hybrid L{layer_idx}: {e}"))?;
-                    *total_dispatches += 2; // main + reduce (conservative)
-                }
+                // One dtype-specialized hybrid dispatcher is authoritative
+                // for both packed and full-F16 V. The retired F16-only port
+                // produced non-finite logits after a B2→B4 slot transition;
+                // a first-token check had not covered that stateful shape
+                // sequence. Keep representation selection inside the native
+                // dispatcher instead of forking request semantics here.
+                mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
+                    session.encoder_mut(),
+                    reg,
+                    dev,
+                    &self.activations.attn_q_normed,
+                    &hybrid_kv[layer_idx].k,
+                    &hybrid_kv[layer_idx].v_packed,
+                    &hybrid_kv[layer_idx].v_norms,
+                    &self.activations.sdpa_out,
+                    &self.activations.sdpa_tmp,
+                    &p_hyb,
+                )
+                .map_err(|e| anyhow::anyhow!("flash_attn_vec_hybrid L{layer_idx}: {e}"))?;
+                *total_dispatches += 2; // main + reduce (conservative)
                 // BUG-coherence fix (supersedes Phase 10e.5 iter-351):
                 // V is now FWHT-rotated then quantized (see V-encode site
                 // ~line 3724).  SDPA output is therefore in the FWHT domain

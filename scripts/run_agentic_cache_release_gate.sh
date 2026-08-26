@@ -1469,7 +1469,7 @@ write_gemma_transaction_receipt() {
   local out="$OUT_ROOT/gemma/transactions-$phase.json"
   local rows="$OUT_ROOT/gemma/transactions-$phase.rows"
   local max_rows multi_slot nonaligned
-  rg 'Gemma4 (bounded prefill transaction complete|installed prefills advanced in one aggregate-bounded transaction|stable agent suffixes prefilled in one multi-slot body)' \
+  rg 'Gemma4 (bounded prefill transaction complete|installed prefills advanced in one aggregate-bounded transaction|stable agent suffixes prefilled in one multi-slot body|stable agent suffix used one full-width rectangle plus canonical cue)' \
     "$log" >"$rows"
   [[ -s "$rows" ]] || return 1
   max_rows=$(sed -n -E 's/.*(advanced_tokens|suffix_tokens)=([0-9]+).*/\2/p' "$rows" |

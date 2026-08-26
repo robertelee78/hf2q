@@ -7,10 +7,17 @@ use std::collections::BTreeSet;
 use crate::quantize::imatrix::ImatrixHint;
 use crate::serve::forward_mlx_shared::{dispatch_qmatmul, MlxQWeight};
 
-const PROVEN_RECTANGULAR_ROWS_PER_LANE: usize = 32;
+pub(crate) const MIN_RECTANGULAR_ROWS_PER_LANE: usize = 32;
+pub(crate) const MAX_RECTANGULAR_ROWS_PER_LANE: usize = 256;
+pub(crate) const MAX_RECTANGULAR_AGGREGATE_ROWS: usize = 4_096;
 
-fn is_proven_rectangular_shape(lanes: usize, rows_per_lane: usize) -> bool {
-    matches!(lanes, 2 | 4) && rows_per_lane == PROVEN_RECTANGULAR_ROWS_PER_LANE
+pub(crate) fn is_proven_rectangular_shape(lanes: usize, rows_per_lane: usize) -> bool {
+    matches!(lanes, 2 | 4)
+        && rows_per_lane >= MIN_RECTANGULAR_ROWS_PER_LANE
+        && rows_per_lane <= MAX_RECTANGULAR_ROWS_PER_LANE
+        && lanes
+            .checked_mul(rows_per_lane)
+            .is_some_and(|rows| rows <= MAX_RECTANGULAR_AGGREGATE_ROWS)
 }
 
 /// Physical shape admitted by Gemma's equality-preserving multi-slot prefill.
@@ -82,12 +89,14 @@ pub(crate) fn validate_rectangular_prefill_layout(
 
 /// Classify a live multi-sequence descriptor without weakening validation.
 ///
-/// Only B2/B4 with M32 is a proven production geometry. Other lane counts,
-/// widths, unequal lane widths, or unequal logical starts retain the existing
-/// aggregate route. Once a descriptor claims proven rectangular eligibility,
-/// every remaining structural invariant is mandatory: malformed offsets,
-/// descriptor extents, or duplicate slots are propagated as errors instead of
-/// silently falling back to a known shape-sensitive aggregate projection.
+/// B2/B4 rectangles retain each lane's complete scalar operator width through
+/// the measured 32..=256 scheduling domain and the existing 4,096-row
+/// transaction ceiling. Other lane counts, widths, unequal lane widths, or
+/// unequal logical starts retain the existing route.
+/// Once a descriptor claims rectangular eligibility, every remaining
+/// structural invariant is mandatory: malformed offsets, descriptor extents,
+/// or duplicate slots are propagated as errors instead of silently falling
+/// back to a known shape-sensitive aggregate projection.
 pub(crate) fn rectangular_prefill_shape_if_eligible(
     seq_lens: &[usize],
     seq_offsets: &[usize],
@@ -177,11 +186,12 @@ pub(crate) fn checked_f32_lane_view(
 /// Execute a rectangular projection with the exact scalar per-sequence
 /// operator width while retaining a single graph session.
 ///
-/// This entry point independently enforces the proven B2/B4 M32 contract so a
+/// This entry point independently enforces the B2/B4 transaction contract so a
 /// future caller cannot bypass admission by constructing a shape directly.
 ///
 /// Each lane aliases its row-contiguous region of the shared activation
-/// buffers. Calling the canonical dispatcher with `m = rows_per_lane` keeps
+/// buffers. Calling the canonical dispatcher with the complete
+/// `m = rows_per_lane` keeps
 /// kernel selection and reduction order identical to one scalar sequence;
 /// only command-buffer ownership is shared across lanes.
 #[allow(clippy::too_many_arguments)]
@@ -199,7 +209,7 @@ pub(crate) fn dispatch_rectangular_qmatmul(
 ) -> Result<()> {
     ensure!(
         is_proven_rectangular_shape(shape.lanes, shape.rows_per_lane),
-        "rectangular projection shape B{}xM{} is outside the proven B2/B4 M32 contract",
+        "rectangular projection shape B{}xM{} is outside the B2/B4 transaction contract",
         shape.lanes,
         shape.rows_per_lane
     );
@@ -348,31 +358,42 @@ mod tests {
     }
 
     #[test]
-    fn eligibility_only_admits_proven_b2_b4_m32_shapes() {
+    fn eligibility_admits_b2_b4_scalar_widths_within_the_transaction_ceiling() {
         for lanes in [2usize, 4] {
-            let seq_lens = vec![32; lanes];
-            let seq_offsets = (0..lanes).map(|lane| lane * 32).collect::<Vec<_>>();
-            let start_positions = vec![96; lanes];
-            let slot_ids = (0..lanes)
-                .map(|lane| SlotId((lane * 3 + 1) as u32))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                rectangular_prefill_shape_if_eligible(
-                    &seq_lens,
-                    &seq_offsets,
-                    &start_positions,
-                    &slot_ids,
-                )
-                .expect("proven rectangle"),
-                Some(RectangularPrefillShape {
-                    lanes,
-                    rows_per_lane: 32,
-                    start_position: 96,
-                })
-            );
+            for rows in [32usize, 33, 57, 64, 65, 95, 127, 128, 129, 255, 256] {
+                let seq_lens = vec![rows; lanes];
+                let seq_offsets = (0..lanes).map(|lane| lane * rows).collect::<Vec<_>>();
+                let start_positions = vec![96; lanes];
+                let slot_ids = (0..lanes)
+                    .map(|lane| SlotId((lane * 3 + 1) as u32))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    rectangular_prefill_shape_if_eligible(
+                        &seq_lens,
+                        &seq_offsets,
+                        &start_positions,
+                        &slot_ids,
+                    )
+                    .expect("valid rectangle"),
+                    Some(RectangularPrefillShape {
+                        lanes,
+                        rows_per_lane: rows,
+                        start_position: 96,
+                    })
+                );
+            }
         }
 
-        for (lanes, rows) in [(3usize, 32usize), (8, 32), (2, 1), (2, 31), (4, 64)] {
+        for (lanes, rows) in [
+            (3usize, 32usize),
+            (8, 32),
+            (2, 1),
+            (2, 31),
+            (2, 2_049),
+            (4, 1_025),
+            (2, 257),
+            (4, 257),
+        ] {
             let seq_lens = vec![rows; lanes];
             let seq_offsets = (0..lanes).map(|lane| lane * rows).collect::<Vec<_>>();
             let start_positions = vec![96; lanes];

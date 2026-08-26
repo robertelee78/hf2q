@@ -1824,6 +1824,15 @@ impl MlxModelWeights {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
+        // The tiled-F16 live-attention route is a different numerical
+        // algorithm from the canonical compressed-KV hybrid resume. Exact
+        // M64 whole-route authority found the first divergence at layer-0
+        // SDPA even though norm and Q/K/V inputs were bit-identical. A
+        // rectangular stable cohort therefore keeps the scalar hybrid
+        // attention schedule per lane; only equality-preserving body work is
+        // shared across lanes.
+        let use_tiled_live_attention =
+            gemma_tiled_live_enabled() && rectangular_live_shape.is_none();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Metal-1 — begin/end programmatic GPU capture around the
@@ -1861,7 +1870,6 @@ impl MlxModelWeights {
             let is_sliding = layer.layer_type == LayerType::Sliding;
             let top_k = layer.moe.top_k;
             let moe_int = layer.moe.moe_intermediate_size;
-
             // ADR-040 §0.19 localization (HF2Q_S019_CKSUM=1): FNV-1a checksum of
             // the residual stream ENTERING this layer (= prev layer's output).
             // An empty session finish() commits+waits → on the in-order command
@@ -2418,7 +2426,7 @@ impl MlxModelWeights {
                             .expect("live SDPA tmp allocated with live resume");
                         let row_elems = nh * hd;
                         let ring_stage = if is_ring {
-                            let query_chunk = if gemma_tiled_live_enabled() {
+                            let query_chunk = if use_tiled_live_attention {
                                 GEMMA_LIVE_TILED_QUERY_CHUNK
                             } else {
                                 GEMMA_LIVE_QUERY_CHUNK
@@ -2476,7 +2484,7 @@ impl MlxModelWeights {
                             let start_i = ms.start_positions[seq_idx];
                             let mut local_start = 0usize;
                             while local_start < seq_len_i {
-                                let chunk_len = if gemma_tiled_live_enabled() {
+                                let chunk_len = if use_tiled_live_attention {
                                     if is_ring {
                                         (seq_len_i - local_start).min(GEMMA_LIVE_TILED_QUERY_CHUNK)
                                     } else {
@@ -2602,7 +2610,7 @@ impl MlxModelWeights {
                                         0u32,
                                     )
                                 };
-                                if gemma_tiled_live_enabled() && attn_v.dtype() != DType::F16 {
+                                if use_tiled_live_attention && attn_v.dtype() != DType::F16 {
                                     // Persistent V remains TQ-HB compressed. Expand only
                                     // this layer's active range, then use the same tiled F16
                                     // prefill kernel as the coherent cold path. Scratch is
@@ -2997,7 +3005,13 @@ impl MlxModelWeights {
                         let ring_stage = if is_ring {
                             let stage_capacity =
                                 cap.saturating_sub(1) + seq_len.min(GEMMA_LIVE_QUERY_CHUNK);
-                            let norms_per_pos = layer_kv.v_norms.element_count() / (nkv * cap);
+                            // Full-F16 V carries a four-byte ABI dummy in
+                            // `v_norms`, so its physical extent cannot encode
+                            // per-position geometry. The allocator-owned
+                            // metadata is authoritative for both F16 and
+                            // packed-V representations; F16 attention
+                            // specializes the staged norms read away.
+                            let norms_per_pos = layer_kv.norms_per_pos;
                             anyhow::ensure!(
                                 stage_capacity > 0 && norms_per_pos > 0,
                                 "live ring stage L{layer_idx} has invalid shape"
@@ -5599,26 +5613,26 @@ impl MlxModelWeights {
                 };
                 let native_activation_epoch = self.native_activation_epoch()?;
                 let native_dispatched = crate::inference::models::gemma4::expert_dispatch::dispatch_native_scalar_expert(
-                        &mut s,
-                        reg,
-                        dev,
-                        native_activation_epoch,
-                        &pf_moe_swiglu,
-                        dn_w_buf,
-                        &pf_expert_ids,
-                        &pf_moe_down,
-                        down_affine,
-                        ggml_type_dn,
-                        seq_len as u32,
-                        top_k as u32,
-                        hs as u32,
-                        moe_int as u32,
-                        num_experts as u32,
-                        self.layers[layer_idx].moe.down_expert_stride,
-                        mlx_native::DenseMatmulIdInputLayout::Slotted,
-                        crate::inference::models::gemma4::expert_dispatch::DenseExpertScratchSlot::Down,
-                        "Gemma batched-prefill down",
-                    )?;
+                            &mut s,
+                            reg,
+                            dev,
+                            native_activation_epoch,
+                            &pf_moe_swiglu,
+                            dn_w_buf,
+                            &pf_expert_ids,
+                            &pf_moe_down,
+                            down_affine,
+                            ggml_type_dn,
+                            seq_len as u32,
+                            top_k as u32,
+                            hs as u32,
+                            moe_int as u32,
+                            num_experts as u32,
+                            self.layers[layer_idx].moe.down_expert_stride,
+                            mlx_native::DenseMatmulIdInputLayout::Slotted,
+                            crate::inference::models::gemma4::expert_dispatch::DenseExpertScratchSlot::Down,
+                            "Gemma batched-prefill down",
+                        )?;
                 if !gemma_moe_use_affine {
                     // ADR-033 §Pi Phase B Stage 3b — MoE intercept for
                     // `ffn_down_exps`. Captures the post-SwiGLU input
@@ -6883,23 +6897,39 @@ impl MlxModelWeights {
                                 vec![nkv_dim, snap_cap, hd_dim],
                             )
                             .map_err(|e| anyhow::anyhow!("lcp hybrid snapshot K alloc: {e}"))?;
+                        let v_dtype = live_layer.v_packed.dtype();
+                        anyhow::ensure!(
+                            matches!(v_dtype, DType::U8 | DType::F16),
+                            "lcp hybrid snapshot V has unsupported dtype {v_dtype:?}"
+                        );
+                        let v_elem = v_dtype.size_of();
                         let mut vp_snap = dev
                             .alloc_buffer(
-                                nkv_dim * snap_cap * hd_dim,
-                                DType::U8,
+                                nkv_dim * snap_cap * hd_dim * v_elem,
+                                v_dtype,
                                 vec![nkv_dim, snap_cap, hd_dim],
                             )
                             .map_err(|e| anyhow::anyhow!("lcp hybrid snapshot V alloc: {e}"))?;
-                        let vn_shape = if npp == 1 {
-                            vec![nkv_dim, snap_cap]
+                        let mut vn_snap = if v_dtype == DType::F16 {
+                            // Full-F16 V does not consume norms. Preserve the
+                            // canonical four-byte ABI dummy instead of
+                            // manufacturing per-position rows that the live
+                            // representation does not own.
+                            dev.alloc_buffer(4, DType::F32, vec![1])
+                                .map_err(|e| {
+                                    anyhow::anyhow!("lcp hybrid snapshot V norms dummy alloc: {e}")
+                                })?
                         } else {
-                            vec![nkv_dim, snap_cap, npp]
+                            let vn_shape = if npp == 1 {
+                                vec![nkv_dim, snap_cap]
+                            } else {
+                                vec![nkv_dim, snap_cap, npp]
+                            };
+                            dev.alloc_buffer(nkv_dim * snap_cap * npp * 4, DType::F32, vn_shape)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("lcp hybrid snapshot V norms alloc: {e}")
+                                })?
                         };
-                        let mut vn_snap = dev
-                            .alloc_buffer(nkv_dim * snap_cap * npp * 4, DType::F32, vn_shape)
-                            .map_err(|e| {
-                                anyhow::anyhow!("lcp hybrid snapshot V norms alloc: {e}")
-                            })?;
                         let copy_prefix = |src: &MlxBuffer,
                                            dst: &mut MlxBuffer,
                                            elem: usize,
@@ -6923,8 +6953,37 @@ impl MlxModelWeights {
                             Ok(())
                         };
                         copy_prefix(&live_layer.k, &mut k_snap, 2, hd_dim, "K")?;
-                        copy_prefix(&live_layer.v_packed, &mut vp_snap, 1, hd_dim, "V packed")?;
-                        copy_prefix(&live_layer.v_norms, &mut vn_snap, 4, npp, "V norms")?;
+                        copy_prefix(
+                            &live_layer.v_packed,
+                            &mut vp_snap,
+                            v_elem,
+                            hd_dim,
+                            "V",
+                        )?;
+                        if v_dtype == DType::F16 {
+                            let source: &[u8] = live_layer.v_norms.as_slice().map_err(|e| {
+                                anyhow::anyhow!("lcp hybrid snapshot V norms dummy src: {e}")
+                            })?;
+                            let destination: &mut [u8] =
+                                vn_snap.as_mut_slice().map_err(|e| {
+                                    anyhow::anyhow!("lcp hybrid snapshot V norms dummy dst: {e}")
+                                })?;
+                            anyhow::ensure!(
+                                source.len() == destination.len(),
+                                "lcp hybrid snapshot V norms dummy extent changed ({} != {})",
+                                source.len(),
+                                destination.len()
+                            );
+                            destination.copy_from_slice(source);
+                        } else {
+                            copy_prefix(
+                                &live_layer.v_norms,
+                                &mut vn_snap,
+                                4,
+                                npp,
+                                "V norms",
+                            )?;
+                        }
                         hsnap.push(std::sync::Arc::new(
                             crate::inference::models::gemma4::kv_cache::HybridKvBuffers {
                                 k: k_snap,
