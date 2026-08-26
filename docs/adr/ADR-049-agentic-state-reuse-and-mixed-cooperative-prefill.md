@@ -18,7 +18,15 @@
   reopened under the v2 contention authority, while the DeepSeek and Qwen
   current-head real-artifact cells remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 93 closes three shell-semantic falsifiers before
+- Updated: 2026-08-26 (rev 94 re-anchors the still-open matched comparison to
+  the operator's current clean peer source at `5e6a37cb`, one commit beyond
+  the prior pin. The intervening upstream diff is Vulkan-only and therefore
+  does not change the Apple execution path, but exact source and runtime
+  closure remain part of performance authority. Build 10639 retains the same
+  launcher SHA-256, changes the complete Mach-O closure hash, and regenerates
+  all 24 quantizer fixtures byte-identically. No model measurement from the
+  older pin is accepted for current-head closure. Rev 93 closes three
+  shell-semantic falsifiers before
   spending the reopened current-head hardware run. The physical preflight's
   negated listener pipeline could fail and then return success after later
   quiet-host checks; both matched runners' calibration functions could also

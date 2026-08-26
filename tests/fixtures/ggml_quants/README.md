@@ -5,14 +5,15 @@ Byte-cmp ground truth for the per-`GgmlType` Rust quantizer ports under `src/qua
 ## Pins
 
 - Pinned peer: `data/llama_cpp_pin.txt` (currently
-  `bf942164697d2d62c2237a17b677dc2c017ea8e7`). On 2026-08-26, build
-  10638 from that exact clean source produced server SHA-256
+  `5e6a37cb115dc1074e274ac004373f5661909695`). On 2026-08-26, build
+  10639 from that exact clean source produced server SHA-256
   `b80b195eeee06559be44a3e666e8761627b8cc540edbc74e96e414f76bc90ce0`
   and non-system Mach-O runtime-manifest SHA-256
-  `321879ecadf4743c6c964badda36bd8443159b4afc73dfa12e0ee7bc8e4f608a`.
-  Regenerating all 12 types in both `im` and `noim` modes left every fixture
-  byte-identical. Commits `a14dba68`, `3f545bec`, `9a286ac9`, and `c060ca97`
-  remain historical evidence, not the current fixture identity.
+  `3a61fcb9245c0a1960d9510592a3e05fed04138e748f11f3e680828b03890753`.
+  The one-commit advance from `bf942164` changes only the Vulkan backend;
+  regenerating all 12 types in both `im` and `noim` modes left every fixture
+  byte-identical. Commits `bf942164`, `a14dba68`, `3f545bec`, `9a286ac9`, and
+  `c060ca97` remain historical evidence, not the current fixture identity.
 - Build flags: `GGML_NATIVE=ON` on `aarch64-apple-darwin` (NEON enabled — see ADR-033 §P0 acceptance finding I)
 - PRNG: mulberry32 with input_seed=1, imatrix_seed=2 (constants; changing them is an ADR amendment because all fixtures regenerate)
 

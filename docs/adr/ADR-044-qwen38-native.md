@@ -723,17 +723,19 @@ they retain raw API accounting as a diagnostic and do not claim normalized
 semantic-token throughput.
 
 The current pinned comparison source identity is
-`bf942164697d2d62c2237a17b677dc2c017ea8e7`, read from
+`5e6a37cb115dc1074e274ac004373f5661909695`, read from
 `data/llama_cpp_pin.txt` and verified against the upstream branch on
 2026-08-26. No performance receipt built from that pin has yet been accepted.
-Regeneration at build 10638 left all 24 quantizer fixtures byte-identical and
+This advances one commit from `bf942164`; its source diff is confined to the
+Vulkan backend and does not change the Apple execution path. Regeneration at
+build 10639 left all 24 quantizer fixtures byte-identical and
 bound the dynamically linked comparison server SHA-256
 `b80b195eeee06559be44a3e666e8761627b8cc540edbc74e96e414f76bc90ce0`
 to complete non-system Mach-O runtime-manifest SHA-256
-`321879ecadf4743c6c964badda36bd8443159b4afc73dfa12e0ee7bc8e4f608a`.
+`3a61fcb9245c0a1960d9510592a3e05fed04138e748f11f3e680828b03890753`.
 This remains necessary because the launcher executable alone can remain
 byte-identical across distinct engine dylibs. The earlier `a14dba68`/build-
-10610, `3f545bec`/build-10587, `9a286`, and `c060ca`
+10610, `bf942164`/build-10638, `3f545bec`/build-10587, `9a286`, and `c060ca`
 identities remain historical evidence only and cannot satisfy the current
 matched gate.
 
