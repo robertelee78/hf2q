@@ -196,6 +196,16 @@ qwen38_reject_cargo_configuration() {
                     return 1
                 }
                 ;;
+            CARGO_TERM_COLOR)
+                # Presentation-only; GitHub Actions and operator shells may
+                # select colored diagnostics without changing the artifact.
+                ;;
+            CARGO_INCREMENTAL)
+                [[ -z "$value" || "$value" == 0 ]] || {
+                    echo "exact-artifact gate rejects ambient build/toolchain override: $name" >&2
+                    return 1
+                }
+                ;;
             CARGO_*|RUST*)
                 [[ -z "$value" ]] || {
                     echo "exact-artifact gate rejects ambient build/toolchain override: $name" >&2

@@ -127,6 +127,11 @@ dependency_identity=$(qwen38_mlx_native_registry_identity "$dependency_root")
 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ]] \
   || fail "valid registry dependency identity was not preserved"
 qwen38_reject_cargo_configuration "$dependency_root" "$test_cargo_home"
+(
+    export CARGO_TERM_COLOR=always
+    export CARGO_INCREMENTAL=0
+    qwen38_reject_cargo_configuration "$dependency_root" "$test_cargo_home"
+) || fail "non-semantic Cargo presentation/determinism settings were rejected"
 foreign_cargo_home="$test_dir/foreign-cargo-home"
 mkdir -p "$foreign_cargo_home"
 (
@@ -147,6 +152,7 @@ mkdir -p "$foreign_cargo_home"
 for override in \
     CARGO_TARGET_DIR=/var/tmp/foreign-target \
     CARGO_BUILD_TARGET=aarch64-apple-darwin \
+    CARGO_INCREMENTAL=1 \
     CARGO_PROFILE_RELEASE_LTO=thin \
     RUSTUP_TOOLCHAIN=nightly \
     RUSTC_BOOTSTRAP=1; do
