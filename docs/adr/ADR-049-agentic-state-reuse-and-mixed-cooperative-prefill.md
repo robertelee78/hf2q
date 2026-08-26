@@ -18,7 +18,24 @@
   reopened under the v2 contention authority, while the DeepSeek and Qwen
   current-head real-artifact cells remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 94 re-anchors the still-open matched comparison to
+- Updated: 2026-08-26 (rev 95 closes an inherited-process-group proof defect
+  across the remaining Qwen rectangular/Mixed, Gemma B.2, and DeepSeek B.1
+  performance leaves before another model run. Each leaf now self-reexecs
+  through the release-gate supervisor, proves that its stable owner PID is its
+  process-group leader before model admission, and records that same owner in
+  every settle and measurement sample. Qwen and DeepSeek exempt only their
+  exact verified server PID; Gemma retains its fixed-grid multi-process
+  identity checks under the isolated owner group. The shared thermal helpers
+  now forward that optional exact-server identity. Every final receipt binds
+  process-group-cpu-v2, the 100% foreign-CPU ceiling, owner scope and PGID,
+  and continuous sampling; independent verification joins every raw
+  six-column contention row back to the sealed owner. Forced-sentinel tests
+  reject inherited groups before reading model arguments, and resealed policy,
+  threshold, owner, continuity, and middle-row-owner mutations all fail.
+  Qwen's model-free contracts, Gemma's 37-mutation battery, DeepSeek's
+  23-case battery, the shared thermal contract, and ShellCheck are green.
+  This revision changes proof authority, not model math, and admits no new
+  hardware timing. Rev 94 re-anchors the still-open matched comparison to
   the operator's current clean peer source at `5e6a37cb`, one commit beyond
   the prior pin. The intervening upstream diff is Vulkan-only and therefore
   does not change the Apple execution path, but exact source and runtime

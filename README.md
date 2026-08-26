@@ -509,16 +509,17 @@ fail closed to ordinary decode when their semantics or measured cost are not
 acceptable. Explicit `QWEN38_SPECULATION=off` remains the operator escape
 hatch.
 
-First-class model switching is likewise a current source contract, not yet a
-universal hardware result. The generative-family gate drives Qwen dense,
+First-class model switching is a hardware-sealed generative-family contract.
+The gate drives Qwen dense,
 Qwen MoE, Gemma, and DeepSeek through a fixed 13-phase, two-cycle sequence in
 one long-lived process, with DeepSeek as the eviction hub. It requires fresh
 generation identity, semantic family canaries, cold generation-local cache,
 exact replay, mapping disappearance, and bounded RSS/host-wired peaks at every
-transition. The source and mutation gates are checked in; the complete
-Apple-Silicon artifact run remains required before this can be called runtime
-acceptance or a performance result. BERT and Nomic keep their separate
-embedding-model lifecycle contract.
+transition. The exact Apple-Silicon run completed all 13 phases and 12 forced
+replacements with 0.561–4.838 second switches (3.306-second median), below the
+fixed 60-second ceiling; ADR-049 binds the immutable receipt. This is model-
+swap availability and coherence evidence, not a cross-stack decode-speed
+claim. BERT and Nomic keep their separate embedding-model lifecycle contract.
 
 Foreground launchers use the live operator dashboard automatically when
 stderr is an interactive terminal. Runtime work stays in place instead of

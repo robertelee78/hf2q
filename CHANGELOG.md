@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dense, Qwen MoE, Gemma, and DeepSeek through a fixed 13-phase, two-cycle
   sequence in one long-lived process. It binds semantic canaries, execution
   generations, cold generation-local cache, eviction, exact replay, and
-  independently recomputed RSS/host-wired bounds. The source gate is present;
-  the four-artifact Apple-Silicon execution remains required.
+  independently recomputed RSS/host-wired bounds. The exact four-artifact
+  Apple-Silicon run completed all 13 phases and 12 forced replacements with a
+  3.306-second median switch, below the fixed 60-second product ceiling.
 
 ### Changed
 
@@ -37,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace the stale fresh-server cross-family swap proof with an eviction-hub
   sequence whose every adjacent pair must replace under the fixed pool budget,
   so co-residency and process restart cannot masquerade as model-swap proof.
+- Make the Qwen rectangular/Mixed, Gemma B.2, and DeepSeek B.1 performance
+  leaves self-isolate in dedicated process groups, bind one stable owner and
+  the exact allowed server into continuous host-contention telemetry, and
+  reopen every raw row against the sealed v2 receipt. Inherited groups and
+  resealed owner/policy/threshold/continuity mutations now fail before model
+  timing can be accepted.
 
 ## [0.1.15] — 2026-08-24
 
