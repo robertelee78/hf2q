@@ -475,7 +475,7 @@ run_arm() {
     curl --fail --silent "http://$HOST:$PORT/v1/models" >"$process_dir/models.json"
     model_id=$(jq -er '[.data[] | select(.loaded == true)] | if length == 1 then .[0].id else error("expected one loaded model") end' "$process_dir/models.json")
     actual_arch=$(jq -er --arg id "$model_id" \
-        '[.data[] | select(.loaded == true and .id == $id)] \
+        '[.data[] | select(.loaded == true and .id == $id)]
          | if length == 1 then .[0].arch else error("expected one loaded architecture") end' \
         "$process_dir/models.json")
     [[ "$actual_arch" == gemma4 ]] || {

@@ -43,6 +43,11 @@ grep -Fq "HF2Q_MODEL_VERIFICATION_RECEIPT=\"\$model_verification_receipt\"" "$ru
 grep -Fq 'interval[0] > MIN_LOWER_CI' "$verifier"
 grep -Fq 'request bytes differ' "$verifier"
 grep -Fq 'canonical results differ' "$verifier"
+grep -Fq "[.data[] | select(.loaded == true and .id == \$id)]" "$runner"
+if grep -Fq "select(.loaded == true and .id == \$id)] \\" "$runner"; then
+    echo "Gemma B.2 runner passes a shell continuation into jq source" >&2
+    exit 1
+fi
 
 missing_env_log="$pycache/missing-env.log"
 if env -i PATH=/usr/bin:/bin bash "$runner" >"$missing_env_log" 2>&1; then
