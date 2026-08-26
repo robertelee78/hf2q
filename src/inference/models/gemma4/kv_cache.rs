@@ -7724,6 +7724,127 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hybrid_lcp_snapshot_copy_preserves_packed_and_f16_v_layouts() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Some(device) = skip_dev() else {
+            return;
+        };
+        const HEADS: usize = 2;
+        const LIVE_CAPACITY: usize = 4;
+        const SNAPSHOT_CAPACITY: usize = 6;
+        const SEQUENCE_LEN: usize = 3;
+        const HEAD_DIM: usize = 256;
+
+        let assert_head_prefixes = |source: &MlxBuffer,
+                                    snapshot: &MlxBuffer,
+                                    inner: usize,
+                                    element_bytes: usize| {
+            let source = source.as_slice::<u8>().expect("live snapshot source bytes");
+            let snapshot = snapshot
+                .as_slice::<u8>()
+                .expect("copied snapshot destination bytes");
+            let copy_bytes = SEQUENCE_LEN * inner * element_bytes;
+            let source_stride = LIVE_CAPACITY * inner * element_bytes;
+            let snapshot_stride = SNAPSHOT_CAPACITY * inner * element_bytes;
+            for head in 0..HEADS {
+                assert_eq!(
+                    &snapshot[head * snapshot_stride..head * snapshot_stride + copy_bytes],
+                    &source[head * source_stride..head * source_stride + copy_bytes],
+                    "head {head} populated prefix changed during LCP snapshot copy"
+                );
+            }
+        };
+
+        std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
+        for full_f16_v in [false, true] {
+            if full_f16_v {
+                std::env::set_var("HF2Q_FULL_F16_KV", "1");
+            } else {
+                std::env::remove_var("HF2Q_FULL_F16_KV");
+            }
+            let mut live = alloc_hybrid_kv_for_layer(
+                &device,
+                usize::from(full_f16_v),
+                HEADS,
+                HEAD_DIM,
+                LIVE_CAPACITY,
+                true,
+            )
+            .expect("allocate live hybrid layer");
+            for (index, byte) in live
+                .k
+                .as_mut_slice::<u8>()
+                .expect("live K bytes")
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = (index as u8).wrapping_mul(17).wrapping_add(3);
+            }
+            for (index, byte) in live
+                .v_packed
+                .as_mut_slice::<u8>()
+                .expect("live V bytes")
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = (index as u8).wrapping_mul(29).wrapping_add(5);
+            }
+            for (index, byte) in live
+                .v_norms
+                .as_mut_slice::<u8>()
+                .expect("live V norms bytes")
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = (index as u8).wrapping_mul(11).wrapping_add(7);
+            }
+
+            let copied = snapshot_hybrid_kv_for_lcp(
+                &device,
+                std::slice::from_ref(&live),
+                SEQUENCE_LEN,
+                SNAPSHOT_CAPACITY,
+            )
+            .expect("copy hybrid LCP snapshot");
+            assert_eq!(copied.len(), 1);
+            let copied = &copied[0];
+            assert_eq!(copied.k.dtype(), live.k.dtype());
+            assert_eq!(copied.v_packed.dtype(), live.v_packed.dtype());
+            assert_eq!(copied.v_norms.dtype(), DType::F32);
+            assert_eq!(copied.capacity, SNAPSHOT_CAPACITY);
+            assert_eq!(copied.is_sliding, live.is_sliding);
+            assert_eq!(copied.norms_per_pos, live.norms_per_pos);
+            assert_head_prefixes(
+                &live.k,
+                &copied.k,
+                HEAD_DIM,
+                live.k.dtype().size_of(),
+            );
+            assert_head_prefixes(
+                &live.v_packed,
+                &copied.v_packed,
+                HEAD_DIM,
+                live.v_packed.dtype().size_of(),
+            );
+            if full_f16_v {
+                assert_eq!(copied.v_norms.shape(), &[1]);
+                assert_eq!(
+                    copied.v_norms.as_slice::<u8>().expect("copied dummy bytes"),
+                    live.v_norms.as_slice::<u8>().expect("live dummy bytes")
+                );
+            } else {
+                assert_head_prefixes(
+                    &live.v_norms,
+                    &copied.v_norms,
+                    live.norms_per_pos,
+                    std::mem::size_of::<f32>(),
+                );
+            }
+        }
+        std::env::remove_var("HF2Q_FULL_F16_KV");
+    }
+
     /// ByteSized must sum both legs exactly (no estimation — the LCP
     /// registry's byte budget is enforced off this value).
     #[test]
