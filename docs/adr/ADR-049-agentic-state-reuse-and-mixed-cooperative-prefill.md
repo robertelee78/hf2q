@@ -16,13 +16,19 @@
   now checked in and model-free green, while their real-artifact cells remain
   open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 79, the minimal Gemma output-projection plus
+- Updated: 2026-08-26 (rev 80, the checked-in Gemma B2/B4 M32 authority now
+  proves exact final logits/tokens, direct byte equality for every selected
+  slot's complete logical hybrid-cache state and cursor/layout metadata, full
+  seeded unselected-slot preservation, and exact one-token continuation. The
+  B2 rectangle reduced measured suffix wall from 126.401 ms to 111.944 ms
+  (11.4%); B4 reduced 245.089 ms to 194.658 ms (20.6%). Product-serving and
+  matched-reference gates remain open. Rev 79 recorded that the minimal Gemma output-projection plus
   expert-gate/up lane correction is exact through final logits for the pinned
   B2 M32 Q5_K_M hardware oracle and improves the 64-token rectangle from
   125.6 ms of sequential scalar work to 103.8 ms, a 17.4% wall reduction and
   about 21.0% aggregate-throughput gain. The corrected first divergence also
   restores exact downstream expert-down/combine output without changing those
-  operators; B4, cache-continuation, and product-serving cells remain open.
+  operators; product-serving remained open.
   Rev 78 recorded that the Gemma live-rectangle stage bisection
   proves the existing production path exact through attention and proves the
   canonical per-lane output-projection candidate exact through post-attention
@@ -1851,8 +1857,20 @@ about 21.0% higher aggregate throughput for the exact oracle. The full log is
 `6061c3052e29fd27f147274331315578bc8b2940f187336e6cf4433f41d588a2`.
 Because final logits are exact, the earlier expert-down and weighted-combine
 differences were inherited from gate/up; those operators remain unchanged.
-The deciding next gates are B4, full selected/unselected cache bytes,
-one-token continuation, and realistic unary/SSE/tool serving.
+The checked-in ignored authority
+`gemma_live_rectangular_b2_b4_state_and_continuation_are_exact` then closed the
+B4/state gate on the same artifact. It uses fresh scalar and rectangular arms,
+noncontiguous selected slots surrounding a deterministically seeded canary
+slot, and direct byte-vector comparison rather than hash equality. Both B2 and
+B4 matched final logits/tokens, every selected slot's complete logically live
+hybrid-cache bytes plus cursor/layout metadata, the full physical unselected
+slot, and a subsequent one-token continuation. B2 suffix wall was 126.401 ms
+scalar versus 111.944 ms rectangular (11.4% lower); B4 was 245.089 ms versus
+194.658 ms (20.6% lower). The 1/1 authority completed in 7.88 seconds; log
+`/tmp/hf2q-gemma-rectangular-b2-b4-authority.log`, SHA-256
+`46435d5990bca8d6010c4fbf365554208f8d48e94abbff9cd2ba6e3022b8a8e4`.
+The deciding remaining coherence gate is realistic multi-token unary/SSE/tool
+serving; the checked-in B.2 product runner remains the performance authority.
 
 The shared-weight native quantized-matmul primitive remains a performance
 candidate for applicable dense projections, not a license to change their
