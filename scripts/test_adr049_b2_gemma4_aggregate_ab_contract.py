@@ -13,7 +13,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 RUNNER = SCRIPT_DIR / "bench_adr049_b2_gemma4_aggregate_ab.sh"
 VERIFY = SCRIPT_DIR / "verify_adr049_b2_gemma4_aggregate_ab.py"
-WIDTHS = [64, 128, 256]
+WIDTHS = [128, 192, 256]
 
 
 def digest(path: Path) -> str:
@@ -83,8 +83,12 @@ def assert_runner_shell_quoting_contract() -> None:
     assert single_quoted_line_continuations("jq '.a\nand .b' \\\nfile\n") == []
     assert "readonly PRIME_HISTORY_WORDS=1200" in runner_source
     assert "readonly MIN_PRIME_AGGREGATE_TOKENS=4097" in runner_source
-    assert "readonly TOOL_RESULT_WORD_ADJUSTMENT=40" in runner_source
-    assert "payload_words=$((target - TOOL_RESULT_WORD_ADJUSTMENT))" in runner_source
+    assert "readonly TOOL_TURN_FIXED_TOKENS=103" in runner_source
+    assert "readonly PAYLOAD_WORD_TOKENS=2" in runner_source
+    assert (
+        "payload_words=$(((target - TOOL_TURN_FIXED_TOKENS) / PAYLOAD_WORD_TOKENS))"
+        in runner_source
+    )
     assert "readonly MAX_TARGET_ROW_DRIFT=4" in runner_source
     assert "STABLE BATCHED 4 seqs x" in runner_source
     assert 'for (i = 1; i <= words; i++) printf "history "' in runner_source
@@ -100,7 +104,7 @@ def runner_function_source(name: str) -> str:
 
 
 def assert_runner_wire_helpers(valid: Path, scratch: Path) -> None:
-    wave = valid / "processes" / "pair-0-off" / "wave-64"
+    wave = valid / "processes" / "pair-0-off" / "wave-128"
     unary_output = scratch / "runner-unary.canonical.json"
     unary_events = scratch / "runner-unary.events.jsonl"
     sse_output = scratch / "runner-sse.canonical.json"
@@ -109,8 +113,8 @@ def assert_runner_wire_helpers(valid: Path, scratch: Path) -> None:
         "set -euo pipefail\n"
         + runner_function_source("validate_prime_response_wire")
         + runner_function_source("canonicalize_response")
-        + 'validate_prime_response_wire "$1" /tmp/adr049-p00-w064-l0.txt fixture-gemma4\n'
-        + 'validate_prime_response_wire "$2" /tmp/adr049-p00-w064-l1.txt fixture-gemma4\n'
+        + 'validate_prime_response_wire "$1" /tmp/adr049-p00-w128-l0.txt fixture-gemma4\n'
+        + 'validate_prime_response_wire "$2" /tmp/adr049-p00-w128-l1.txt fixture-gemma4\n'
         + 'canonicalize_response unary "$3" "$4" "$5" fixture-gemma4\n'
         + 'canonicalize_response sse "$6" "$7" "$8" fixture-gemma4\n'
     )
@@ -241,7 +245,7 @@ def continuation_request(prime: dict, response: dict, target: int, stream: bool)
     value = json.loads(json.dumps(prime))
     prior = json.loads(json.dumps(response["choices"][0]["message"]))
     tool_result = (
-        "read_note succeeded. " + "measurement " * (target - 40)
+        "read_note succeeded. " + "measurement " * ((target - 103) // 2)
         + "Now reply exactly ADR049_GEMMA_STABLE_OK."
     )
     value["messages"].extend([
@@ -558,7 +562,8 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
             "measured_waves_per_process": 3, "prime_turns_per_wave": 4,
             "prime_history_words": 1200, "minimum_prime_aggregate_tokens": 4097,
             "continuation_protocols": ["unary", "unary", "sse", "sse"],
-            "tool_result_word_adjustment": 40, "maximum_target_row_drift": 4,
+            "tool_turn_fixed_tokens": 103, "payload_word_tokens": 2,
+            "maximum_target_row_drift": 4,
             "off_env": {"HF2Q_CROSS_SLOT_ADMIT": "0", "HF2Q_ADMIT_COALESCE_US": "0"},
             "on_env": {"HF2Q_CROSS_SLOT_ADMIT": "1",
                        "HF2Q_ADMIT_COALESCE_US": "25000"},
@@ -718,10 +723,15 @@ def main() -> None:
         boundary_range = clone(valid, parent, "boundary-outside-range")
         rows = [json.loads(line) for line in
                 (boundary_range / "samples.jsonl").read_text().splitlines()]
-        row = next(row for row in rows if row["arm"] == "on" and row["target_rows"] == 64)
+        row = next(
+            row for row in rows
+            if row["arm"] == "on" and row["target_rows"] == WIDTHS[0]
+        )
         trace_path = boundary_range / row["trace_path"]
         trace_path.write_text(
-            trace_path.read_text().replace("x 59 boundary rows", "x 31 boundary rows"),
+            trace_path.read_text().replace(
+                f"x {WIDTHS[0] - 5} boundary rows", "x 31 boundary rows"
+            ),
             encoding="utf-8",
         )
         row["trace_boundary_rows"] = 31

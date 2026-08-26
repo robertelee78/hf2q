@@ -16,7 +16,22 @@
   now checked in and model-free green, while their real-artifact cells remain
   open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 82, the exact shared-weight broadcast matmul
+- Updated: 2026-08-26 (rev 84 records the second fail-closed Gemma product
+  calibration: one payload word rendered 105 uncached rows; combined with rev
+  83's 24-word/151-row receipt, the exact relation is 103 fixed tool-envelope
+  tokens plus two tokens per payload word. Nominal 128/192/256 cells therefore
+  render 127/191/255 rows and remain inside both the ±4 gate and the production
+  256-row ceiling. No performance sample has yet been accepted. Rev 83
+  recorded the clean-source Gemma stable-route
+  authority across both native KV representations and the first realistic
+  product-gate falsifier: packed-V and full-F16 each passed all 29 exact
+  B2/B4, tail, deep-cache, wrap, selected-state, unselected-slot, and
+  continuation cells, while the product producer rejected its first nominal
+  64-row sample because the hardened assistant-tool-call plus matching-result
+  envelope rendered 151 uncached rows. That first point disproved the stale
+  calibration and required the second point recorded by rev 84; the real
+  tool-turn cells must rerun before any product speed conclusion. Rev 82
+  recorded that the exact shared-weight broadcast matmul
   hypothesis is falsified and fully removed from hf2q: the published backend
   primitive preserved byte-exact B2 state and continuation but reduced the
   interleaved three-sample B2 median only 0.752%, from 109.708 ms to
@@ -1882,6 +1897,35 @@ scalar versus 111.944 ms rectangular (11.4% lower); B4 was 245.089 ms versus
 `46435d5990bca8d6010c4fbf365554208f8d48e94abbff9cd2ba6e3022b8a8e4`.
 The deciding remaining coherence gate is realistic multi-token unary/SSE/tool
 serving; the checked-in B.2 product runner remains the performance authority.
+
+Rev 83 expands that authority from the earlier M32 sample to the complete
+stable-route production matrix. At clean source `3e5d35e1`, packed-V and
+full-F16 KV each passed 29/29 cells: B2 and B4, rows per lane
+32/33/57/63/64/65/95/127/128/129/255/256, deep-cache starts at 500 and 1,000,
+and a start-1,008 sliding-window wrap. Every cell proved byte-exact cue logits,
+boundary-anchor restore, final logical cache, continuation, and full physical
+unselected-slot preservation. Packed-V completed in 946.98 seconds (log
+SHA-256 `a6dc2033b0f8a3b7203a540d4c9a06da18dcdf324707328c812c32eb7f1b45f2`);
+full-F16 completed in 1,306.47 seconds (log SHA-256
+`bb6860747580616c906691886fffc51087ef8e9ee9d64fbaeb36849647dfeacf`).
+
+The subsequent realistic product spike accepted no performance sample. Its
+first OFF continuation carried the exact generated assistant tool call and
+matching tool result, reused 1,320 cached tokens, and rendered 1,471 prompt
+tokens: 151 uncached rows, not the nominal 64. The earlier 40-token calibration
+predated the hardened tool-result workload and cannot describe this envelope.
+That first receipt alone could not distinguish fixed envelope from per-word
+tokenization, so a second fail-closed spike supplied the necessary second
+point: one payload word rendered 105 uncached rows. Together, the 24-word/151
+and one-word/105 measurements solve exactly to 103 fixed assistant-tool/result
+tokens plus two tokens per repeated payload word. A 64-row continuation is
+therefore impossible for this template. The producer and independent verifier
+target nominal 128/192/256 cells using 12/44/76 words, which render
+127/191/255 rows, retain the ±4 usage gate, and stay under the production
+256-row ceiling. The calibration is bound to exact model identity. Their
+model-free contract passes and rejects 29/29 mutations. A fresh exact-lineage
+product A/B is required; no speed claim is inferred from either rejected
+spike.
 
 The shared-weight native quantized-matmul hypothesis is falsified for this
 Gemma B.2 route. The primitive was published as `mlx-native 0.15.1` from exact

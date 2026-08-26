@@ -16,14 +16,15 @@ from typing import NoReturn
 
 SCHEMA = 2
 PAIRS = 8
-WIDTHS = [64, 128, 256]
+WIDTHS = [128, 192, 256]
 LANES = 4
 PRIME_HISTORY_WORDS = 1200
 MIN_PRIME_AGGREGATE_TOKENS = 4097
 BOOTSTRAPS = 10_000
 BOOTSTRAP_SEED = 49_004
 MIN_LOWER_CI = 1.05
-TOOL_RESULT_WORD_ADJUSTMENT = 40
+TOOL_TURN_FIXED_TOKENS = 103
+PAYLOAD_WORD_TOKENS = 2
 MAX_TARGET_ROW_DRIFT = 4
 TRACE_RE = re.compile(
     r"\[PREFILL_TIMING\] STABLE BATCHED ([0-9]+) seqs x "
@@ -279,7 +280,8 @@ def expected_configuration() -> dict:
         "prime_turns_per_wave": 4, "prime_history_words": PRIME_HISTORY_WORDS,
         "minimum_prime_aggregate_tokens": MIN_PRIME_AGGREGATE_TOKENS,
         "continuation_protocols": ["unary", "unary", "sse", "sse"],
-        "tool_result_word_adjustment": TOOL_RESULT_WORD_ADJUSTMENT,
+        "tool_turn_fixed_tokens": TOOL_TURN_FIXED_TOKENS,
+        "payload_word_tokens": PAYLOAD_WORD_TOKENS,
         "maximum_target_row_drift": MAX_TARGET_ROW_DRIFT,
         "off_env": {"HF2Q_CROSS_SLOT_ADMIT": "0", "HF2Q_ADMIT_COALESCE_US": "0"},
         "on_env": {"HF2Q_CROSS_SLOT_ADMIT": "1", "HF2Q_ADMIT_COALESCE_US": "25000"},
@@ -510,9 +512,9 @@ def expected_prime_normalized(response: dict) -> dict:
 
 
 def tool_result_content(target: int) -> str:
-    words = target - TOOL_RESULT_WORD_ADJUSTMENT
+    words = (target - TOOL_TURN_FIXED_TOKENS) // PAYLOAD_WORD_TOKENS
     if words <= 0:
-        fail(f"target {target} exhausts tool-result word adjustment")
+        fail(f"target {target} exhausts tool-turn calibration")
     return (
         "read_note succeeded. "
         + "measurement " * words

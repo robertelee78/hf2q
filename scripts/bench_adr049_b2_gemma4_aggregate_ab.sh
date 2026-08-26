@@ -18,13 +18,18 @@ source "$script_dir/qwen36_watchdog_validate.sh"
 source "$script_dir/qwen38_matched_reference_contract.sh"
 
 readonly PAIRS=8
-readonly WIDTHS=(64 128 256)
+readonly WIDTHS=(128 192 256)
 readonly LANES=4
 readonly PRIME_HISTORY_WORDS=1200
 readonly MIN_PRIME_AGGREGATE_TOKENS=4097
 readonly PRIME_MAX_TOKENS=96
 readonly CONTINUATION_MAX_TOKENS=32
-readonly TOOL_RESULT_WORD_ADJUSTMENT=40
+# Two exact-artifact spikes solve the rendered suffix relation as
+# `work_rows = 103 + 2 * payload_words`.  The model identity gate binds this
+# calibration, and the measured usage gate below rejects template/tokenizer
+# drift instead of silently timing a different suffix width.
+readonly TOOL_TURN_FIXED_TOKENS=103
+readonly PAYLOAD_WORD_TOKENS=2
 readonly SENTINEL=ADR049_GEMMA_STABLE_OK
 readonly HOST=127.0.0.1
 readonly READY_TIMEOUT_SECONDS=300
@@ -273,9 +278,9 @@ build_warmup_request() {
 
 build_continuation_request() {
     local prime_request=$1 prime_response=$2 target=$3 stream=$4 output=$5 payload_words tool_result
-    payload_words=$((target - TOOL_RESULT_WORD_ADJUSTMENT))
+    payload_words=$(((target - TOOL_TURN_FIXED_TOKENS) / PAYLOAD_WORD_TOKENS))
     ((payload_words > 0)) || {
-        echo "tool-result adjustment exhausts target row bin: $target" >&2
+        echo "tool-turn calibration exhausts target row bin: $target" >&2
         return 1
     }
     tool_result=$(awk -v words="$payload_words" 'BEGIN {
@@ -512,7 +517,7 @@ run_wave() {
     local actual_overlap lane_started lane_finished
     local expected_work="" expected_cached=""
     local -a request_pids
-    case "$target" in 64) width_position=0 ;; 128) width_position=1 ;; 256) width_position=2 ;; esac
+    case "$target" in 128) width_position=0 ;; 192) width_position=1 ;; 256) width_position=2 ;; esac
     sample_dir="$process_dir/wave-$target"
     mkdir -p "$sample_dir"
 
@@ -947,13 +952,13 @@ jq -n --slurpfile processes "$process_bindings" \
     --arg power_events_final_sha "$(sha256_file "$OUT_DIR/caffeinate.log.power-events.final")" \
     --arg power_events_new_sha "$(sha256_file "$OUT_DIR/caffeinate.log.power-events.new")" '{
       schema_version:2,status:"measured",
-      configuration:{pairs:8,width_targets:[64,128,256],lanes:4,
+      configuration:{pairs:8,width_targets:[128,192,256],lanes:4,
         pair_order:"off-on-even_on-off-odd",
         warmup_waves_per_process:2,measured_waves_per_process:3,
         prime_turns_per_wave:4,prime_history_words:1200,
         minimum_prime_aggregate_tokens:4097,
         continuation_protocols:["unary","unary","sse","sse"],
-        tool_result_word_adjustment:40,maximum_target_row_drift:4,
+        tool_turn_fixed_tokens:103,payload_word_tokens:2,maximum_target_row_drift:4,
         off_env:{HF2Q_CROSS_SLOT_ADMIT:"0",HF2Q_ADMIT_COALESCE_US:"0"},
         on_env:{HF2Q_CROSS_SLOT_ADMIT:"1",HF2Q_ADMIT_COALESCE_US:"25000"},
         prime_request:{max_tokens:96,seed:42,temperature:0,repetition_penalty:1,
