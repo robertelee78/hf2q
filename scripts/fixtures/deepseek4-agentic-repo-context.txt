@@ -83,12 +83,12 @@ hf2q serve --model models/gemma-4-26b-it-q4_k_m/out.gguf --port 8080
    speculative-or-vanilla decode on the GPU via `mlx-native`, expose
    it through an OpenAI-style `/v1/chat/completions`, `/v1/embeddings`
    and `/v1/models` HTTP API. Supports tools / function-calling,
-   streaming SSE, family-bound vision, grammar-constrained sampling,
+   streaming SSE, vision (`qwen3vl`), grammar-constrained sampling,
    and a persistent block-prefix KV cache.
 
 Supported architectures today: **Gemma 4 (dense + MoE)**, **Qwen 3.5 /
-3.6 / 3.8 (dense + MoE + multi-token-prediction)**, **DeepSeek-V4-Flash-0731
-(compressed-attention MoE)**, and **BERT /
+3.6 (dense + MoE + multi-token-prediction)**, **DeepSeek-V4-Flash-0731
+(compressed-attention MoE)**, **Qwen 3-VL (vision + text)**, and **BERT /
 Nomic-BERT** (embedding-only). Each lives under a single
 `src/inference/models/<arch>/` module — the arch-registry (`src/arch/`)
 is the single source of truth for tensor catalogs, quality thresholds,
