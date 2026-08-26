@@ -6,6 +6,11 @@ root_dir=$(cd "$script_dir/.." && pwd)
 # shellcheck source=scripts/qwen38_artifact_contract.sh
 source "$script_dir/qwen38_artifact_contract.sh"
 
+# Hosted runners export their own Cargo home. The positive baseline must be
+# hermetic; explicit mutations below prove that production still rejects a
+# foreign CARGO_HOME.
+unset CARGO_HOME
+
 qwen_module="$script_dir/../src/inference/models/qwen35/mod.rs"
 qwen_model="$script_dir/../src/inference/models/qwen35/model.rs"
 qwen_engine="$script_dir/../src/serve/api/engine_qwen35.rs"
@@ -122,6 +127,13 @@ dependency_identity=$(qwen38_mlx_native_registry_identity "$dependency_root")
 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ]] \
   || fail "valid registry dependency identity was not preserved"
 qwen38_reject_cargo_configuration "$dependency_root" "$test_cargo_home"
+foreign_cargo_home="$test_dir/foreign-cargo-home"
+mkdir -p "$foreign_cargo_home"
+(
+    export CARGO_HOME="$foreign_cargo_home"
+    expect_failure cargo-home-environment qwen38_reject_cargo_configuration \
+        "$dependency_root" "$test_cargo_home"
+)
 (
     export RUSTC_WRAPPER=sccache
     expect_failure cargo-rustc-wrapper qwen38_reject_cargo_configuration \
