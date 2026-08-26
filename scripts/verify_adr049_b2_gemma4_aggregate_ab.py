@@ -21,6 +21,8 @@ LANES = 4
 BOOTSTRAPS = 10_000
 BOOTSTRAP_SEED = 49_004
 MIN_LOWER_CI = 1.05
+PAYLOAD_WORD_ADJUSTMENT = 40
+MAX_TARGET_ROW_DRIFT = 4
 TRACE_RE = re.compile(
     r"\[PREFILL_TIMING\] BATCHED ([0-9]+) seqs in "
     r"([0-9]+(?:\.[0-9]+)?) ms \(one multi-seq forward, iter-G\(a\)\)"
@@ -272,6 +274,8 @@ def expected_configuration() -> dict:
         "pairs": PAIRS, "width_targets": WIDTHS, "lanes": LANES,
         "pair_order": "off-on-even_on-off-odd", "warmup_waves_per_process": 2,
         "measured_waves_per_process": 3,
+        "payload_word_adjustment": PAYLOAD_WORD_ADJUSTMENT,
+        "maximum_target_row_drift": MAX_TARGET_ROW_DRIFT,
         "off_env": {"HF2Q_CROSS_SLOT_ADMIT": "0", "HF2Q_ADMIT_COALESCE_US": "0"},
         "on_env": {"HF2Q_CROSS_SLOT_ADMIT": "1", "HF2Q_ADMIT_COALESCE_US": "25000"},
         "request": {"max_tokens": 1, "seed": 42, "temperature": 0,
@@ -446,7 +450,8 @@ def validate_samples(root: Path, rows: list[dict], processes: dict[tuple[int, st
                         fail(f"wave {cursor} lane {lane_index} schema is invalid")
                     prompt, cached, work = lane["prompt_tokens"], lane["cached_tokens"], lane["work_rows"]
                     if not all(isinstance(v, int) and not isinstance(v, bool) for v in (prompt, cached, work)) \
-                            or cached != 0 or work != prompt or not target * 0.75 <= work <= target * 1.25:
+                            or cached != 0 or work != prompt \
+                            or abs(work - target) > MAX_TARGET_ROW_DRIFT:
                         fail(f"wave {cursor} lane {lane_index} is not cold in its target bin")
                     aggregate_rows += work
                     for name in ("prefill_ms", "ttft_ms", "wall_ms"):
@@ -459,6 +464,11 @@ def validate_samples(root: Path, rows: list[dict], processes: dict[tuple[int, st
                     request = read_json(request_path)
                     messages = request.get("messages")
                     expected_prefix = f"adr049-b2-gemma-p{pair:02d}-w{target:03d}-l{lane_index} "
+                    expected_content = (
+                        expected_prefix
+                        + "measurement " * (target - PAYLOAD_WORD_ADJUSTMENT)
+                        + "Reply with one word."
+                    )
                     if request.get("model") != process["model_id"] or request.get("max_tokens") != 1 \
                             or request.get("seed") != 42 or request.get("temperature") != 0 \
                             or request.get("repetition_penalty") != 1 or request.get("stream") is not False \
@@ -466,7 +476,7 @@ def validate_samples(root: Path, rows: list[dict], processes: dict[tuple[int, st
                             or request.get("chat_template_kwargs") != {"enable_thinking": False} \
                             or not isinstance(messages, list) or len(messages) != 1 \
                             or not isinstance(messages[0], dict) or messages[0].get("role") != "user" \
-                            or not messages[0].get("content", "").startswith(expected_prefix):
+                            or messages[0].get("content") != expected_content:
                         fail(f"wave {cursor} lane {lane_index} request drifted")
                     response = read_json(response_path)
                     try:

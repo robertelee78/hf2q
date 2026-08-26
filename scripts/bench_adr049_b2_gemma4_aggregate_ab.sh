@@ -26,6 +26,8 @@ readonly THERMAL_SETTLE_SECONDS=60
 readonly THERMAL_SAMPLE_SECONDS=2
 readonly POWER_PROBE_ATTEMPTS=3
 readonly MIN_LOWER_95_SPEEDUP=1.05
+readonly PAYLOAD_WORD_ADJUSTMENT=40
+readonly MAX_TARGET_ROW_DRIFT=4
 readonly TRACE_NAME='[PREFILL_TIMING] BATCHED 4 seqs in '
 readonly RUNTIME_PATH=/usr/bin:/bin:/usr/sbin:/sbin
 readonly RUNTIME_TMPDIR=/var/tmp
@@ -231,10 +233,16 @@ cleanup() {
 trap cleanup EXIT
 
 build_request() {
-    local model_id=$1 pair=$2 target=$3 lane=$4 output=$5 content
-    content=$(awk -v pair="$pair" -v target="$target" -v lane="$lane" 'BEGIN {
-        printf "adr049-b2-gemma-p%02d-w%03d-l%d ", pair, target, lane
-        for (i = 1; i <= target; i++) printf "measurement "
+    local model_id=$1 pair=$2 target=$3 lane=$4 output=$5 content payload_words
+    payload_words=$((target - PAYLOAD_WORD_ADJUSTMENT))
+    ((payload_words > 0)) || {
+        echo "rendered-prompt adjustment exhausts target row bin: $target" >&2
+        return 1
+    }
+    content=$(awk -v pair="$pair" -v nominal="$target" -v words="$payload_words" \
+        -v lane="$lane" 'BEGIN {
+        printf "adr049-b2-gemma-p%02d-w%03d-l%d ", pair, nominal, lane
+        for (i = 1; i <= words; i++) printf "measurement "
         printf "Reply with one word."
     }')
     jq -n --arg model "$model_id" --arg content "$content" '{
@@ -341,7 +349,8 @@ run_wave() {
         prompt=$(jq -er '.usage.prompt_tokens' "$response")
         cached=$(jq -er '.usage.prompt_tokens_details.cached_tokens' "$response")
         work=$((prompt - cached))
-        ((work * 4 >= target * 3 && work * 4 <= target * 5)) || {
+        ((work >= target - MAX_TARGET_ROW_DRIFT \
+            && work <= target + MAX_TARGET_ROW_DRIFT)) || {
             echo "pair $pair $arm width $target lane $lane missed target bin: $work" >&2
             return 1
         }
@@ -413,7 +422,7 @@ run_wave() {
 }
 
 run_warmup_waves() {
-    local pair=$1 model_id=$2 warmup_dir warmup lane barrier pid request response wall
+    local pair=$1 model_id=$2 warmup_dir warmup lane barrier pid request response wall prompt
     local -a warmup_pids
     warmup_dir=$(mktemp -d "$RUNTIME_TMPDIR/gemma-b2-warmup.XXXXXX")
     for warmup in 1 2; do
@@ -440,6 +449,13 @@ run_warmup_waves() {
             jq -e '.usage.prompt_tokens_details.cached_tokens == 0
               and (.usage.completion_tokens | numbers) == 1' \
                 "$warmup_dir/$warmup-$lane.response.json" >/dev/null
+            prompt=$(jq -er '.usage.prompt_tokens' \
+                "$warmup_dir/$warmup-$lane.response.json")
+            ((prompt >= 256 - MAX_TARGET_ROW_DRIFT \
+                && prompt <= 256 + MAX_TARGET_ROW_DRIFT)) || {
+                echo "pair $pair warmup $warmup lane $lane missed calibrated bin: $prompt" >&2
+                return 1
+            }
         done
     done
     rm -R "$warmup_dir"
@@ -615,6 +631,7 @@ jq -n --slurpfile processes "$process_bindings" \
       configuration:{pairs:8,width_targets:[128,256,512],lanes:4,
         pair_order:"off-on-even_on-off-odd",
         warmup_waves_per_process:2,measured_waves_per_process:3,
+        payload_word_adjustment:40,maximum_target_row_drift:4,
         off_env:{HF2Q_CROSS_SLOT_ADMIT:"0",HF2Q_ADMIT_COALESCE_US:"0"},
         on_env:{HF2Q_CROSS_SLOT_ADMIT:"1",HF2Q_ADMIT_COALESCE_US:"25000"},
         request:{max_tokens:1,seed:42,temperature:0,repetition_penalty:1,stream:false,thinking:false},

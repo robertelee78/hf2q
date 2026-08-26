@@ -75,13 +75,19 @@ def single_quoted_line_continuations(source: str) -> list[int]:
 
 
 def assert_runner_shell_quoting_contract() -> None:
-    violations = single_quoted_line_continuations(RUNNER.read_text(encoding="utf-8"))
+    runner_source = RUNNER.read_text(encoding="utf-8")
+    violations = single_quoted_line_continuations(runner_source)
     assert not violations, (
         "runner embeds shell line continuations in single-quoted programs at lines "
         f"{violations}"
     )
     assert single_quoted_line_continuations("jq '.a \\\nand .b' file\n") == [1]
     assert single_quoted_line_continuations("jq '.a\nand .b' \\\nfile\n") == []
+    assert "readonly PAYLOAD_WORD_ADJUSTMENT=40" in runner_source
+    assert "payload_words=$((target - PAYLOAD_WORD_ADJUSTMENT))" in runner_source
+    assert "readonly MAX_TARGET_ROW_DRIFT=4" in runner_source
+    assert 'printf "adr049-b2-gemma-p%02d-w%03d-l%d ", pair, nominal, lane' in runner_source
+    assert 'for (i = 1; i <= words; i++) printf "measurement "' in runner_source
 
 
 def make_identity(root: Path) -> dict:
@@ -173,7 +179,11 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
                     wall = wave_dir / f"lane-{lane_index}.wall"
                     timing = wave_dir / f"lane-{lane_index}.timing"
                     normalized = wave_dir / f"lane-{lane_index}.normalized.json"
-                    content = f"adr049-b2-gemma-p{pair:02d}-w{target:03d}-l{lane_index} measurement Reply with one word."
+                    content = (
+                        f"adr049-b2-gemma-p{pair:02d}-w{target:03d}-l{lane_index} "
+                        + "measurement " * (target - 40)
+                        + "Reply with one word."
+                    )
                     write_json(request, {
                         "model": model_id, "messages": [{"role": "user", "content": content}],
                         "max_tokens": 1, "seed": 42, "temperature": 0,
@@ -318,6 +328,7 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
             "pairs": 8, "width_targets": WIDTHS, "lanes": 4,
             "pair_order": "off-on-even_on-off-odd", "warmup_waves_per_process": 2,
             "measured_waves_per_process": 3,
+            "payload_word_adjustment": 40, "maximum_target_row_drift": 4,
             "off_env": {"HF2Q_CROSS_SLOT_ADMIT": "0", "HF2Q_ADMIT_COALESCE_US": "0"},
             "on_env": {"HF2Q_CROSS_SLOT_ADMIT": "1", "HF2Q_ADMIT_COALESCE_US": "25000"},
             "request": {"max_tokens": 1, "seed": 42, "temperature": 0,
@@ -491,7 +502,7 @@ def main() -> None:
         write_jsonl(lanes_path, on_row["lanes"])
         on_row["lanes_sha256"] = digest(lanes_path)
         reseal_samples(request_drift, rows)
-        run_verify(request_drift, success=False, reason="request bytes differ")
+        run_verify(request_drift, success=False, reason="request drifted")
         rejected += 1
 
         no_overlap = clone(valid, parent, "no-overlap")
@@ -509,6 +520,32 @@ def main() -> None:
         row["actual_overlap"] = False
         reseal_samples(no_overlap, rows)
         run_verify(no_overlap, success=False, reason="simultaneous four-lane wave")
+        rejected += 1
+
+        target_drift = clone(valid, parent, "target-drift")
+        rows = [json.loads(line) for line in (target_drift / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        lane = row["lanes"][0]
+        response_path = target_drift / lane["response_path"]
+        response = json.loads(response_path.read_text())
+        response["usage"]["prompt_tokens"] += 5
+        response["usage"]["total_tokens"] += 5
+        write_json(response_path, response)
+        normalized_path = target_drift / lane["normalized_path"]
+        normalized = json.loads(normalized_path.read_text())
+        normalized["usage"]["prompt_tokens"] += 5
+        normalized["usage"]["total_tokens"] += 5
+        write_json(normalized_path, normalized)
+        lane["prompt_tokens"] += 5
+        lane["work_rows"] += 5
+        lane["response_sha256"] = digest(response_path)
+        lane["normalized_sha256"] = digest(normalized_path)
+        lanes_path = target_drift / row["lanes_path"]
+        write_jsonl(lanes_path, row["lanes"])
+        row["lanes_sha256"] = digest(lanes_path)
+        row["aggregate_work_rows"] += 5
+        reseal_samples(target_drift, rows)
+        run_verify(target_drift, success=False, reason="not cold in its target bin")
         rejected += 1
 
         power_drift = clone(valid, parent, "power-drift")
@@ -537,7 +574,7 @@ def main() -> None:
         run_verify(identity_drift, success=False, reason="live operator launcher drifted")
         rejected += 1
 
-    assert rejected == 10
+    assert rejected == 11
     print(f"ADR-049 B.2 Gemma aggregate A/B contract passed; mutation battery {rejected}/{rejected} rejected")
 
 

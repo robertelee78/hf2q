@@ -26,6 +26,8 @@ python3 "$python_contract"
 
 grep -Fq 'readonly PAIRS=8' "$runner"
 grep -Fq 'readonly MIN_LOWER_95_SPEEDUP=1.05' "$runner"
+grep -Fq 'readonly PAYLOAD_WORD_ADJUSTMENT=40' "$runner"
+grep -Fq 'readonly MAX_TARGET_ROW_DRIFT=4' "$runner"
 grep -Fq "minimum_lower_95_speedup_exclusive:\$min_lower_speedup" "$runner"
 grep -Fq 'order_stratified_bootstrap_samples:10000' "$runner"
 grep -Fq "\"\$launcher\"" "$runner"
