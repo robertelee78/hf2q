@@ -42,6 +42,15 @@ if grep -Fq 'pmset -g batt | rg -q' "$runner"; then
     exit 1
 fi
 grep -Fq "actual_overlap:\$actual_overlap" "$runner"
+grep -Fq "wave_seconds=\$(awk -v start=\"\$earliest_start\" -v end=\"\$latest_finish\"" "$runner"
+if grep -Fq 'wave_started=' "$runner"; then
+    echo "Gemma B.2 runner includes request construction in the measured wave" >&2
+    exit 1
+fi
+if grep -Fq "\"\$trace_rows\" == \"\$expected_work\"" "$runner"; then
+    echo "Gemma B.2 runner conflates trace boundary width with usage work" >&2
+    exit 1
+fi
 grep -Fq 'HF2Q_PREFILL_TIMING=1' "$runner"
 grep -Fq "HF2Q_MODEL_VERIFICATION_RECEIPT=\"\$model_verification_receipt\"" "$runner"
 grep -Fq 'interval[0] > MIN_LOWER_CI' "$verifier"
@@ -50,6 +59,7 @@ grep -Fq 'canonical results differ' "$verifier"
 grep -Fq 'did not reach exactly one B4 stable rectangle' "$verifier"
 grep -Fq 'SSE wire did not end with exactly one [DONE]' "$verifier"
 grep -Fq 'generated-call-ids-only' "$runner"
+grep -Fq 'exact-envelope-single-choice-no-reasoning-logprobs-or-continuation-tools' "$runner"
 grep -Fq "[.data[] | select(.loaded == true and .id == \$id)]" "$runner"
 if grep -Fq "select(.loaded == true and .id == \$id)] \\" "$runner"; then
     echo "Gemma B.2 runner passes a shell continuation into jq source" >&2

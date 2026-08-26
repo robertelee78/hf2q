@@ -290,6 +290,7 @@ def expected_configuration() -> dict:
                                  "repetition_penalty": 1, "tool_choice": "auto",
                                  "thinking": False},
         "semantic_normalization": "generated-call-ids-only",
+        "wire_validation": "exact-envelope-single-choice-no-reasoning-logprobs-or-continuation-tools",
         "analysis": {"statistic": "median paired OFF/ON wave speedup",
                      "order_stratified_bootstrap_samples": BOOTSTRAPS,
                      "bootstrap_seed": BOOTSTRAP_SEED,
@@ -444,8 +445,33 @@ def expected_prime_request(model_id: str, pair: int, target: int, lane: int) -> 
     }
 
 
-def validate_prime_response(response: dict, pair: int, target: int, lane: int) -> tuple[int, int]:
+def validate_envelope(
+    response: dict, *, required: set[str], optional: set[str], object_name: str,
+    model_id: str, label: str,
+) -> None:
+    keys = set(response) if isinstance(response, dict) else set()
+    if not required <= keys or keys - required - optional:
+        fail(f"{label} envelope drifted")
+    response_id, created = response.get("id"), response.get("created")
+    if not isinstance(response_id, str) or not response_id \
+            or not isinstance(created, int) or isinstance(created, bool) or created < 0 \
+            or response.get("object") != object_name or response.get("model") != model_id \
+            or ("system_fingerprint" in response
+                and not isinstance(response["system_fingerprint"], str)):
+        fail(f"{label} envelope drifted")
+
+
+def validate_prime_response(
+    response: dict, model_id: str, pair: int, target: int, lane: int
+) -> tuple[int, int]:
     expected_path = f"/tmp/adr049-p{pair:02d}-w{target:03d}-l{lane}.txt"
+    validate_envelope(
+        response,
+        required={"id", "object", "created", "model", "choices", "usage"},
+        optional={"system_fingerprint", "x_hf2q_timing"},
+        object_name="chat.completion", model_id=model_id,
+        label=f"prime pair {pair} width {target} lane {lane}",
+    )
     try:
         choices = response["choices"]
         choice = choices[0]
@@ -459,9 +485,13 @@ def validate_prime_response(response: dict, pair: int, target: int, lane: int) -
         completion = usage["completion_tokens"]
     except (KeyError, IndexError, TypeError, json.JSONDecodeError):
         fail(f"prime pair {pair} width {target} lane {lane} response is malformed")
-    if len(choices) != 1 or choice.get("finish_reason") != "tool_calls" \
-            or not (message.get("content") is None
-                    or isinstance(message.get("content"), str)) or len(calls) != 1 \
+    message_keys = set(message) if isinstance(message, dict) else set()
+    if len(choices) != 1 or set(choice) != {"index", "message", "finish_reason"} \
+            or choice.get("index") != 0 or choice.get("finish_reason") != "tool_calls" \
+            or message_keys not in ({"role", "tool_calls"}, {"role", "content", "tool_calls"}) \
+            or message.get("role") != "assistant" \
+            or ("content" in message and not isinstance(message["content"], str)) \
+            or len(calls) != 1 \
             or not isinstance(call.get("id"), str) or not call["id"] \
             or call.get("type") != "function" or call["function"].get("name") != "read_note" \
             or arguments != {"path": expected_path} \
@@ -494,9 +524,9 @@ def expected_continuation_request(
     prime_request: dict, prime_response: dict, target: int, stream: bool
 ) -> dict:
     expected = json.loads(json.dumps(prime_request))
-    prior = prime_response["choices"][0]["message"]
+    prior = json.loads(json.dumps(prime_response["choices"][0]["message"]))
     expected["messages"].extend([
-        {"role": "assistant", "content": prior["content"], "tool_calls": prior["tool_calls"]},
+        prior,
         {"role": "tool", "tool_call_id": prior["tool_calls"][0]["id"],
          "content": tool_result_content(target)},
     ])
@@ -510,11 +540,28 @@ def expected_continuation_request(
     return expected
 
 
-def canonical_unary(wire: dict) -> dict:
+def canonical_unary(wire: dict, model_id: str) -> dict:
+    validate_envelope(
+        wire,
+        required={"id", "object", "created", "model", "choices", "usage", "x_hf2q_timing"},
+        optional={"system_fingerprint"}, object_name="chat.completion",
+        model_id=model_id, label="unary wire response",
+    )
     try:
+        choices = wire["choices"]
+        choice = choices[0]
+        message = choice["message"]
+        if len(choices) != 1 or set(choice) != {"index", "message", "finish_reason"} \
+                or choice["index"] != 0 or choice["finish_reason"] != "stop" \
+                or set(message) != {"role", "content"} \
+                or message["role"] != "assistant" \
+                or not isinstance(message["content"], str) \
+                or not isinstance(wire["usage"], dict) \
+                or not isinstance(wire["x_hf2q_timing"], dict):
+            fail("unary wire response choice semantics drifted")
         return {
-            "choices": [{"message": wire["choices"][0]["message"],
-                         "finish_reason": wire["choices"][0]["finish_reason"]}],
+            "choices": [{"index": choice["index"], "message": message,
+                         "finish_reason": choice["finish_reason"]}],
             "usage": wire["usage"],
             "x_hf2q_timing": wire["x_hf2q_timing"],
         }
@@ -522,7 +569,7 @@ def canonical_unary(wire: dict) -> dict:
         fail("unary wire response lacks canonical fields")
 
 
-def canonical_sse(wire_path: Path, events_path: Path) -> dict:
+def canonical_sse(wire_path: Path, events_path: Path, model_id: str) -> dict:
     try:
         lines = wire_path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as error:
@@ -539,35 +586,63 @@ def canonical_sse(wire_path: Path, events_path: Path) -> dict:
     if not events or any(not isinstance(event, dict) for event in events) \
             or read_jsonl(events_path) != events:
         fail("SSE events are not raw-derived")
-    choices = [choice for event in events for choice in event.get("choices", [])
-               if isinstance(choice, dict)]
-    deltas = [choice.get("delta", {}) for choice in choices]
-    if any(delta.get("tool_calls") for delta in deltas if isinstance(delta, dict)):
-        fail("SSE continuation emitted a tool call")
-    roles = [delta["role"] for delta in deltas
-             if isinstance(delta, dict) and delta.get("role") is not None]
-    contents = [delta["content"] for delta in deltas
-                if isinstance(delta, dict) and delta.get("content") is not None]
-    finishes = [choice["finish_reason"] for choice in choices
-                if choice.get("finish_reason") is not None]
-    usages = [event["usage"] for event in events if event.get("usage") is not None]
-    timings = [event["x_hf2q_timing"] for event in events
-               if event.get("x_hf2q_timing") is not None]
-    if roles != ["assistant"] or finishes != ["stop"] or len(usages) != 1 or len(timings) != 1:
-        fail("SSE role/finish/usage/timing contract drifted")
+    if len(events) < 3:
+        fail("SSE event sequence is incomplete")
+    first = events[0]
+    required = {"id", "object", "created", "model", "choices"}
+    optional = {"system_fingerprint", "usage", "x_hf2q_timing"}
+    for event_index, event in enumerate(events):
+        validate_envelope(
+            event, required=required, optional=optional,
+            object_name="chat.completion.chunk", model_id=model_id,
+            label=f"SSE event {event_index}",
+        )
+        if event["id"] != first["id"] or event["created"] != first["created"] \
+                or event.get("system_fingerprint") != first.get("system_fingerprint"):
+            fail("SSE envelope identity drifted within stream")
+        choices = event.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1:
+            fail("SSE event choice cardinality drifted")
+        choice = choices[0]
+        if not isinstance(choice, dict) \
+                or set(choice) != {"index", "delta", "finish_reason"} \
+                or choice.get("index") != 0 or not isinstance(choice.get("delta"), dict):
+            fail("SSE event choice/index/logprobs semantics drifted")
+    first_choice = events[0]["choices"][0]
+    final_choice = events[-1]["choices"][0]
+    if set(first_choice["delta"]) != {"role"} \
+            or first_choice["delta"]["role"] != "assistant" \
+            or first_choice["finish_reason"] is not None \
+            or "usage" in events[0] or "x_hf2q_timing" in events[0]:
+        fail("SSE role event semantics drifted")
+    for event in events[1:-1]:
+        choice = event["choices"][0]
+        if set(choice["delta"]) != {"content"} \
+                or not isinstance(choice["delta"]["content"], str) \
+                or choice["finish_reason"] is not None \
+                or "usage" in event or "x_hf2q_timing" in event:
+            fail("SSE content event semantics drifted")
+    if final_choice["delta"] != {} or final_choice["finish_reason"] != "stop" \
+            or set(events[-1]) - required - optional \
+            or not isinstance(events[-1].get("usage"), dict) \
+            or not isinstance(events[-1].get("x_hf2q_timing"), dict) \
+            or sum("usage" in event for event in events) != 1 \
+            or sum("x_hf2q_timing" in event for event in events) != 1:
+        fail("SSE finish/usage/timing contract drifted")
+    contents = [event["choices"][0]["delta"]["content"] for event in events[1:-1]]
     return {
-        "choices": [{"message": {"role": "assistant", "content": "".join(contents)},
+        "choices": [{"index": 0,
+                     "message": {"role": "assistant", "content": "".join(contents)},
                      "finish_reason": "stop"}],
-        "usage": usages[0],
-        "x_hf2q_timing": timings[0],
+        "usage": events[-1]["usage"],
+        "x_hf2q_timing": events[-1]["x_hf2q_timing"],
     }
 
 
 def semantic_response(response: dict) -> dict:
     try:
         return {
-            "message": response["choices"][0]["message"],
-            "finish_reason": response["choices"][0]["finish_reason"],
+            "choice": response["choices"][0],
             "usage": response["usage"],
         }
     except (KeyError, IndexError, TypeError):
@@ -594,7 +669,8 @@ def validate_samples(
                     "wave_wall_path", "wave_wall_sha256", "trace_path", "trace_sha256",
                     "trace_event_count", "trace_requests", "trace_boundary_rows",
                     "trace_elapsed_ms", "trace_batch_count", "aggregate_work_rows",
-                    "launch_skew_seconds", "latest_start", "earliest_finish",
+                    "launch_skew_seconds", "earliest_start", "latest_start",
+                    "earliest_finish", "latest_finish",
                     "actual_overlap", "lanes_path", "lanes_sha256", "lanes",
                 }
                 if set(row) != required or row["schema_version"] != SCHEMA \
@@ -679,7 +755,7 @@ def validate_samples(
                     ):
                         fail(f"wave {cursor} lane {lane_index} prime request drifted")
                     prime_prompt, prime_cached = validate_prime_response(
-                        prime_response, pair, target, lane_index
+                        prime_response, process["model_id"], pair, target, lane_index
                     )
                     if (lane["prime_prompt_tokens"], lane["prime_cached_tokens"]) \
                             != (prime_prompt, prime_cached):
@@ -721,9 +797,9 @@ def validate_samples(
                     if protocol == "unary":
                         if events_path.read_text(encoding="utf-8"):
                             fail(f"wave {cursor} unary lane carries SSE events")
-                        derived = canonical_unary(read_json(wire_path))
+                        derived = canonical_unary(read_json(wire_path), process["model_id"])
                     else:
-                        derived = canonical_sse(wire_path, events_path)
+                        derived = canonical_sse(wire_path, events_path, process["model_id"])
                     if canonical != derived:
                         fail(f"wave {cursor} lane {lane_index} canonical response is not wire-derived")
                     try:
@@ -799,18 +875,29 @@ def validate_samples(
                 if len(set(cached_shapes)) != 1 or len(set(work_shapes)) != 1:
                     fail(f"wave {cursor} stable continuations were not equal-shaped")
 
-                skew, latest, earliest = max(starts) - min(starts), max(starts), min(finishes)
-                if row["actual_overlap"] is not True or skew > 0.100 or latest >= earliest \
+                earliest_start, latest_start = min(starts), max(starts)
+                earliest_finish, latest_finish = min(finishes), max(finishes)
+                skew = latest_start - earliest_start
+                measured_wave_ms = (latest_finish - earliest_start) * 1000
+                if row["actual_overlap"] is not True or skew > 0.100 \
+                        or latest_start >= earliest_finish \
                         or abs(float(row["launch_skew_seconds"]) - skew) > 1e-6 \
-                        or abs(float(row["latest_start"]) - latest) > 1e-6 \
-                        or abs(float(row["earliest_finish"]) - earliest) > 1e-6:
+                        or abs(float(row["earliest_start"]) - earliest_start) > 1e-6 \
+                        or abs(float(row["latest_start"]) - latest_start) > 1e-6 \
+                        or abs(float(row["earliest_finish"]) - earliest_finish) > 1e-6 \
+                        or abs(float(row["latest_finish"]) - latest_finish) > 1e-6:
                     fail(f"wave {cursor} did not prove a simultaneous four-lane wave")
+                if abs(wave_ms - measured_wave_ms) > 1e-6:
+                    fail(f"wave {cursor} wall is not derived from concurrent lane timestamps")
                 if row["aggregate_work_rows"] != aggregate_rows:
                     fail(f"wave {cursor} aggregate work is not lane-bound")
                 if arm == "on":
                     requests, boundary, elapsed, count = trace_values[0]
-                    if requests != LANES or boundary != work_shapes[0] or elapsed <= 0 \
-                            or count <= 0 or row["trace_requests"] != requests \
+                    if requests != LANES:
+                        fail(f"wave {cursor} did not reach exactly one B4 stable rectangle")
+                    if boundary < 32 or boundary > 256:
+                        fail(f"wave {cursor} stable boundary is outside proven 32..256 range")
+                    if elapsed <= 0 or count <= 0 or row["trace_requests"] != requests \
                             or row["trace_boundary_rows"] != boundary \
                             or abs(float(row["trace_elapsed_ms"]) - elapsed) > 1e-9 \
                             or row["trace_batch_count"] != count:

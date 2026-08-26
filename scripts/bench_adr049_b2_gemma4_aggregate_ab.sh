@@ -288,8 +288,7 @@ build_continuation_request() {
         --argjson max_tokens "$CONTINUATION_MAX_TOKENS" '
       $base[0]
       | .messages += [
-          {role:"assistant",content:$prior[0].choices[0].message.content,
-            tool_calls:$prior[0].choices[0].message.tool_calls},
+          $prior[0].choices[0].message,
           {role:"tool",tool_call_id:$prior[0].choices[0].message.tool_calls[0].id,
             content:$tool_result}
         ]
@@ -311,11 +310,33 @@ normalize_generated_call_ids() {
 }
 
 canonicalize_response() {
-    local protocol=$1 wire=$2 events=$3 output=$4
+    local protocol=$1 wire=$2 events=$3 output=$4 expected_model=$5
     if [[ "$protocol" == unary ]]; then
-        jq -S '{choices:[{message:.choices[0].message,
-          finish_reason:.choices[0].finish_reason}],usage,
-          x_hf2q_timing}' "$wire" >"$output"
+        jq -e --arg model "$expected_model" '
+          ((keys - ["system_fingerprint"]) | sort)
+            == ["choices","created","id","model","object","usage","x_hf2q_timing"]
+          and ((has("system_fingerprint") | not)
+            or (.system_fingerprint | type == "string"))
+          and (.id | type == "string" and length > 0)
+          and .object == "chat.completion"
+          and (.created | type == "number" and floor == . and . >= 0)
+          and .model == $model
+          and (.choices | type == "array" and length == 1)
+          and (.choices[0] | keys | sort) == ["finish_reason","index","message"]
+          and .choices[0].index == 0
+          and .choices[0].finish_reason == "stop"
+          and (.choices[0].message | keys | sort) == ["content","role"]
+          and .choices[0].message.role == "assistant"
+          and (.choices[0].message.content | type == "string")
+          and (.usage | type == "object")
+          and (.x_hf2q_timing | type == "object")
+        ' "$wire" >/dev/null || {
+            echo "unary continuation wire semantics are invalid" >&2
+            return 1
+        }
+        jq -S '{choices:[{index:.choices[0].index,message:.choices[0].message,
+          finish_reason:.choices[0].finish_reason}],usage,x_hf2q_timing}' \
+            "$wire" >"$output"
         : >"$events"
         return
     fi
@@ -325,18 +346,53 @@ canonicalize_response() {
         return 1
     }
     sed -n 's/^data: //p' "$wire" | grep -v '^\[DONE\]$' >"$events"
-    jq -e -s 'length > 0 and all(.[]; type == "object")
-      and ([.[] | .choices[]?.delta.tool_calls[]?] | length) == 0
-      and ([.[] | .choices[]? | .finish_reason // empty] | last) == "stop"
+    jq -e -s --arg model "$expected_model" '
+      . as $events
+      | length >= 3
+      and all($events[]; type == "object")
+      and ($events[0] as $first
+        | all($events[];
+            ((keys - ["system_fingerprint","usage","x_hf2q_timing"]) | sort)
+              == ["choices","created","id","model","object"]
+            and ((has("system_fingerprint") | not)
+              or (.system_fingerprint | type == "string"))
+            and (.id == $first.id)
+            and (.created == $first.created)
+            and (.model == $model and .model == $first.model)
+            and (.object == "chat.completion.chunk")
+            and ((.system_fingerprint // null)
+              == ($first.system_fingerprint // null))
+            and (.choices | type == "array" and length == 1)
+            and (.choices[0] | keys | sort) == ["delta","finish_reason","index"]
+            and .choices[0].index == 0))
+      and ($events[0].id | type == "string" and length > 0)
+      and ($events[0].created | type == "number" and floor == . and . >= 0)
+      and ($events[0].choices[0].delta | keys) == ["role"]
+      and $events[0].choices[0].delta.role == "assistant"
+      and $events[0].choices[0].finish_reason == null
+      and ($events[0] | has("usage") | not)
+      and ($events[0] | has("x_hf2q_timing") | not)
+      and all($events[1:-1][];
+          (.choices[0].delta | keys) == ["content"]
+          and (.choices[0].delta.content | type == "string")
+          and .choices[0].finish_reason == null
+          and (has("usage") | not)
+          and (has("x_hf2q_timing") | not))
+      and ($events[-1].choices[0].delta | keys | length) == 0
+      and $events[-1].choices[0].finish_reason == "stop"
+      and ($events[-1].usage | type == "object")
+      and ($events[-1].x_hf2q_timing | type == "object")
       and ([.[] | .usage? | select(. != null)] | length) == 1
-      and ([.[] | .x_hf2q_timing? | select(. != null)] | length) == 1' \
+      and ([.[] | .x_hf2q_timing? | select(. != null)] | length) == 1
+    ' \
         "$events" >/dev/null || {
         echo "SSE continuation event semantics are invalid" >&2
         return 1
     }
     jq -S -s '{
-      choices:[{message:{role:([.[] | .choices[]?.delta.role? | select(. != null)] | first),
-        content:([.[] | .choices[]?.delta.content? | select(. != null)] | join(""))},
+      choices:[{index:.[0].choices[0].index,
+        message:{role:.[0].choices[0].delta.role,
+        content:([.[1:-1][] | .choices[0].delta.content] | join(""))},
         finish_reason:([.[] | .choices[]? | .finish_reason // empty] | last)}],
       usage:([.[] | .usage? | select(. != null)] | last),
       x_hf2q_timing:([.[] | .x_hf2q_timing? | select(. != null)] | last)
@@ -354,6 +410,38 @@ stop_server() {
         server_pid=""
     fi
     STOP_WAIT_STATUS=$wait_status
+}
+
+validate_prime_response_wire() {
+    local response=$1 expected_path=$2 model_id=$3
+    jq -e --arg expected "$expected_path" --arg model "$model_id" '
+      ((keys - ["system_fingerprint","x_hf2q_timing"]) | sort)
+        == ["choices","created","id","model","object","usage"]
+      and ((has("system_fingerprint") | not)
+        or (.system_fingerprint | type == "string"))
+      and ((has("x_hf2q_timing") | not)
+        or (.x_hf2q_timing | type == "object"))
+      and (.id | type == "string" and length > 0)
+      and .object == "chat.completion"
+      and (.created | type == "number" and floor == . and . >= 0)
+      and .model == $model
+      and (.choices | length) == 1
+      and (.choices[0] | keys | sort) == ["finish_reason","index","message"]
+      and .choices[0].index == 0
+      and .choices[0].finish_reason == "tool_calls"
+      and (((.choices[0].message | keys | sort) == ["role","tool_calls"])
+        or ((.choices[0].message | keys | sort) == ["content","role","tool_calls"]))
+      and .choices[0].message.role == "assistant"
+      and ((.choices[0].message | has("content") | not)
+        or (.choices[0].message.content | type == "string"))
+      and ((.choices[0].message.tool_calls // []) | length) == 1
+      and .choices[0].message.tool_calls[0].type == "function"
+      and .choices[0].message.tool_calls[0].function.name == "read_note"
+      and ((.choices[0].message.tool_calls[0].function.arguments | fromjson).path == $expected)
+      and (.usage.prompt_tokens | numbers) > 0
+      and .usage.prompt_tokens_details.cached_tokens == 0
+      and (.usage.completion_tokens | numbers) > 0
+    ' "$response" >/dev/null
 }
 
 run_prime_wave() {
@@ -383,18 +471,7 @@ run_prime_wave() {
         request="$sample_dir/prime-lane-$lane.request.json"
         response="$sample_dir/prime-lane-$lane.response.json"
         expected_path=$(printf '/tmp/adr049-p%02d-w%03d-l%d.txt' "$pair" "$target" "$lane")
-        jq -e --arg expected "$expected_path" '
-          (.choices | length) == 1
-          and .choices[0].finish_reason == "tool_calls"
-          and ((.choices[0].message.content // "") | type == "string")
-          and ((.choices[0].message.tool_calls // []) | length) == 1
-          and .choices[0].message.tool_calls[0].type == "function"
-          and .choices[0].message.tool_calls[0].function.name == "read_note"
-          and ((.choices[0].message.tool_calls[0].function.arguments | fromjson).path == $expected)
-          and (.usage.prompt_tokens | numbers) > 0
-          and .usage.prompt_tokens_details.cached_tokens == 0
-          and (.usage.completion_tokens | numbers) > 0
-        ' "$response" >/dev/null || {
+        validate_prime_response_wire "$response" "$expected_path" "$model_id" || {
             echo "pair $pair width $target lane $lane prime was not one exact cold tool call" >&2
             return 1
         }
@@ -426,12 +503,13 @@ run_prime_wave() {
 
 run_wave() {
     local pair=$1 position=$2 arm=$3 target=$4 model_id=$5 process_dir=$6
-    local width_position sample_dir log_before log_after wave_started wave_ended wave_seconds wave_ms
+    local width_position sample_dir log_before log_after wave_seconds wave_ms
     local trace event_count trace_requests trace_rows trace_elapsed trace_batch_count
     local lanes_file lane request request_normalized wire events canonical normalized wall timing protocol stream
     local prompt cached work prefill_ms ttft_ms wall_ms aggregate_rows=0 prime_aggregate
     local prime_request prime_response prime_normalized prime_prompt prime_cached
-    local barrier launch_skew latest_start earliest_finish actual_overlap lane_started lane_finished
+    local barrier launch_skew earliest_start latest_start earliest_finish latest_finish
+    local actual_overlap lane_started lane_finished
     local expected_work="" expected_cached=""
     local -a request_pids
     case "$target" in 64) width_position=0 ;; 128) width_position=1 ;; 256) width_position=2 ;; esac
@@ -448,7 +526,6 @@ run_wave() {
     barrier="$sample_dir/start.barrier"
     request_pids=()
     rm -f "$barrier"
-    wave_started=$(perl -MTime::HiRes=time -e 'printf "%.9f\n", time')
     for ((lane = 0; lane < LANES; lane++)); do
         prime_request="$sample_dir/prime-lane-$lane.request.json"
         prime_response="$sample_dir/prime-lane-$lane.response.json"
@@ -474,20 +551,23 @@ run_wave() {
     done
     : >"$barrier"
     for request_pid in "${request_pids[@]}"; do wait "$request_pid"; done
-    wave_ended=$(perl -MTime::HiRes=time -e 'printf "%.9f\n", time')
-    wave_seconds=$(awk -v start="$wave_started" -v end="$wave_ended" 'BEGIN {printf "%.9f", end-start}')
-    wave_ms=$(awk -v seconds="$wave_seconds" 'BEGIN {printf "%.9f", seconds*1000}')
-    printf '%s\n' "$wave_seconds" >"$sample_dir/wave.wall"
-
     launch_skew=$(awk -F '\t' '
       NR == 1 {minimum=$1; maximum=$1}
       $1 < minimum {minimum=$1} $1 > maximum {maximum=$1}
       END {printf "%.9f", maximum-minimum}
     ' "$sample_dir"/lane-*.timing)
+    earliest_start=$(awk -F '\t' 'NR == 1 || $1 < value {value=$1} END {print value}' \
+        "$sample_dir"/lane-*.timing)
     latest_start=$(awk -F '\t' 'NR == 1 || $1 > value {value=$1} END {print value}' \
         "$sample_dir"/lane-*.timing)
     earliest_finish=$(awk -F '\t' 'NR == 1 || $2 < value {value=$2} END {print value}' \
         "$sample_dir"/lane-*.timing)
+    latest_finish=$(awk -F '\t' 'NR == 1 || $2 > value {value=$2} END {print value}' \
+        "$sample_dir"/lane-*.timing)
+    wave_seconds=$(awk -v start="$earliest_start" -v end="$latest_finish" \
+        'BEGIN {printf "%.9f", end-start}')
+    wave_ms=$(awk -v seconds="$wave_seconds" 'BEGIN {printf "%.9f", seconds*1000}')
+    printf '%s\n' "$wave_seconds" >"$sample_dir/wave.wall"
     actual_overlap=$(awk -v skew="$launch_skew" -v latest="$latest_start" \
         -v earliest="$earliest_finish" \
         'BEGIN {if (skew <= 0.100 && latest < earliest) print "true"; else print "false"}')
@@ -521,7 +601,7 @@ run_wave() {
         wall="$sample_dir/lane-$lane.wall"
         timing="$sample_dir/lane-$lane.timing"
         if ((lane < 2)); then protocol=unary; else protocol=sse; fi
-        canonicalize_response "$protocol" "$wire" "$events" "$canonical"
+        canonicalize_response "$protocol" "$wire" "$events" "$canonical" "$model_id"
         jq -e --arg sentinel "$SENTINEL" '
           (.choices | length) == 1
           and .choices[0].finish_reason == "stop"
@@ -558,7 +638,7 @@ run_wave() {
         prefill_ms=$(jq -er '.x_hf2q_timing.prefill_time_secs * 1000' "$canonical")
         ttft_ms=$(jq -er '.x_hf2q_timing.time_to_first_token_ms' "$canonical")
         wall_ms=$(awk '{printf "%.9f", $1*1000}' "$wall")
-        jq -S '{message:.choices[0].message,finish_reason:.choices[0].finish_reason,
+        jq -S '{choice:.choices[0],
           usage}' "$canonical" >"$normalized"
         prime_prompt=$(jq -er '.usage.prompt_tokens' "$prime_response")
         prime_cached=$(jq -er '.usage.prompt_tokens_details.cached_tokens' "$prime_response")
@@ -617,9 +697,17 @@ run_wave() {
     fi
     if [[ "$arm" == on ]]; then
         [[ "$event_count" == 1 && "$trace_requests" == 4 \
-            && "$trace_rows" == "$expected_work" && -n "$trace_elapsed" \
+            && "$trace_rows" =~ ^[0-9]+$ && -n "$trace_elapsed" \
             && "$trace_batch_count" =~ ^[1-9][0-9]*$ ]] || {
             echo "pair $pair ON width $target did not prove exactly one B4 stable rectangle" >&2
+            return 1
+        }
+        ((trace_rows >= 32 && trace_rows <= 256)) || {
+            echo "pair $pair ON width $target emitted boundary width outside 32..256" >&2
+            return 1
+        }
+        awk -v elapsed="$trace_elapsed" 'BEGIN {exit !(elapsed > 0)}' || {
+            echo "pair $pair ON width $target emitted a non-positive stable trace" >&2
             return 1
         }
     else
@@ -641,8 +729,9 @@ run_wave() {
         --argjson trace_rows "$trace_rows" --argjson trace_elapsed "$trace_elapsed" \
         --argjson trace_batch_count "$trace_batch_count" \
         --argjson aggregate_rows "$aggregate_rows" \
-        --argjson launch_skew "$launch_skew" --argjson latest_start "$latest_start" \
-        --argjson earliest_finish "$earliest_finish" \
+        --argjson launch_skew "$launch_skew" --argjson earliest_start "$earliest_start" \
+        --argjson latest_start "$latest_start" --argjson earliest_finish "$earliest_finish" \
+        --argjson latest_finish "$latest_finish" \
         --argjson actual_overlap "$actual_overlap" '{
           schema_version:2,pair:$pair,process_position:$position,arm:$arm,
           width_position:$width_position,target_rows:$target,wave_ms:$wave_ms,
@@ -652,7 +741,8 @@ run_wave() {
           trace_requests:$trace_requests,trace_boundary_rows:$trace_rows,
           trace_elapsed_ms:$trace_elapsed,trace_batch_count:$trace_batch_count,
           aggregate_work_rows:$aggregate_rows,launch_skew_seconds:$launch_skew,
-          latest_start:$latest_start,earliest_finish:$earliest_finish,
+          earliest_start:$earliest_start,latest_start:$latest_start,
+          earliest_finish:$earliest_finish,latest_finish:$latest_finish,
           actual_overlap:$actual_overlap,lanes_path:$lanes_path,
           lanes_sha256:$lanes_sha,lanes:$lanes
         }' >>"$samples"
@@ -871,6 +961,7 @@ jq -n --slurpfile processes "$process_bindings" \
         continuation_request:{max_tokens:32,seed:42,temperature:0,
           repetition_penalty:1,tool_choice:"auto",thinking:false},
         semantic_normalization:"generated-call-ids-only",
+        wire_validation:"exact-envelope-single-choice-no-reasoning-logprobs-or-continuation-tools",
         analysis:{statistic:"median paired OFF/ON wave speedup",
           order_stratified_bootstrap_samples:10000,bootstrap_seed:49004,
           lower_confidence_percentile:2.5,

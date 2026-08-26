@@ -90,6 +90,61 @@ def assert_runner_shell_quoting_contract() -> None:
     assert 'for (i = 1; i <= words; i++) printf "history "' in runner_source
 
 
+def runner_function_source(name: str) -> str:
+    lines = RUNNER.read_text(encoding="utf-8").splitlines()
+    start = lines.index(f"{name}() {{")
+    for end in range(start + 1, len(lines)):
+        if lines[end] == "}":
+            return "\n".join(lines[start:end + 1]) + "\n"
+    raise AssertionError(f"runner function {name} has no closing brace")
+
+
+def assert_runner_wire_helpers(valid: Path, scratch: Path) -> None:
+    wave = valid / "processes" / "pair-0-off" / "wave-64"
+    unary_output = scratch / "runner-unary.canonical.json"
+    unary_events = scratch / "runner-unary.events.jsonl"
+    sse_output = scratch / "runner-sse.canonical.json"
+    sse_events = scratch / "runner-sse.events.jsonl"
+    script = (
+        "set -euo pipefail\n"
+        + runner_function_source("validate_prime_response_wire")
+        + runner_function_source("canonicalize_response")
+        + 'validate_prime_response_wire "$1" /tmp/adr049-p00-w064-l0.txt fixture-gemma4\n'
+        + 'validate_prime_response_wire "$2" /tmp/adr049-p00-w064-l1.txt fixture-gemma4\n'
+        + 'canonicalize_response unary "$3" "$4" "$5" fixture-gemma4\n'
+        + 'canonicalize_response sse "$6" "$7" "$8" fixture-gemma4\n'
+    )
+    subprocess.run(
+        ["bash", "-s", "--",
+         str(wave / "prime-lane-0.response.json"),
+         str(wave / "prime-lane-1.response.json"),
+         str(wave / "lane-0.response.wire"), str(unary_events), str(unary_output),
+         str(wave / "lane-2.response.wire"), str(sse_events), str(sse_output)],
+        input=script, text=True, check=True,
+    )
+    assert json.loads(unary_output.read_text()) == json.loads(
+        (wave / "lane-0.response.canonical.json").read_text()
+    )
+    assert json.loads(sse_output.read_text()) == json.loads(
+        (wave / "lane-2.response.canonical.json").read_text()
+    )
+
+    invalid = scratch / "runner-invalid-unary.json"
+    wire = json.loads((wave / "lane-0.response.wire").read_text())
+    wire["choices"][0]["message"]["reasoning_content"] = "must fail closed"
+    write_json(invalid, wire)
+    negative_script = (
+        "set -euo pipefail\n" + runner_function_source("canonicalize_response")
+        + 'canonicalize_response unary "$1" "$2" "$3" fixture-gemma4\n'
+    )
+    rejected = subprocess.run(
+        ["bash", "-s", "--", str(invalid), str(scratch / "invalid.events"),
+         str(scratch / "invalid.canonical")],
+        input=negative_script, text=True, capture_output=True, check=False,
+    )
+    assert rejected.returncode != 0, "runner accepted unary reasoning_content drift"
+
+
 def make_identity(root: Path) -> dict:
     source = root / "identity" / "source"
     scripts = source / "scripts"
@@ -148,12 +203,21 @@ def prime_request(model_id: str, pair: int, target: int, lane: int) -> dict:
 
 def prime_response(pair: int, arm: str, target: int, lane: int) -> dict:
     expected_path = f"/tmp/adr049-p{pair:02d}-w{target:03d}-l{lane}.txt"
+    message = {
+        "role": "assistant",
+        "tool_calls": [{"id": f"call-{pair}-{arm}-{target}-{lane}",
+                        "type": "function",
+                        "function": {"name": "read_note",
+                                     "arguments": json.dumps({"path": expected_path})}}],
+    }
+    if lane % 2 == 0:
+        message["content"] = ""
     return {
-        "choices": [{"message": {"role": "assistant", "content": "",
-                                   "tool_calls": [{"id": f"call-{pair}-{arm}-{target}-{lane}",
-                                                   "type": "function",
-                                                   "function": {"name": "read_note",
-                                                                "arguments": json.dumps({"path": expected_path})}}]},
+        "id": f"prime-{pair}-{arm}-{target}-{lane}",
+        "object": "chat.completion", "created": 1700000000 + pair,
+        "model": "fixture-gemma4",
+        "choices": [{"index": 0,
+                     "message": message,
                      "finish_reason": "tool_calls"}],
         "usage": {"prompt_tokens": 1300, "completion_tokens": 12, "total_tokens": 1312,
                   "prompt_tokens_details": {"cached_tokens": 0}},
@@ -175,13 +239,13 @@ def normalize_call_ids(value: dict) -> dict:
 
 def continuation_request(prime: dict, response: dict, target: int, stream: bool) -> dict:
     value = json.loads(json.dumps(prime))
-    prior = response["choices"][0]["message"]
+    prior = json.loads(json.dumps(response["choices"][0]["message"]))
     tool_result = (
         "read_note succeeded. " + "measurement " * (target - 40)
         + "Now reply exactly ADR049_GEMMA_STABLE_OK."
     )
     value["messages"].extend([
-        {"role": "assistant", "content": prior["content"], "tool_calls": prior["tool_calls"]},
+        prior,
         {"role": "tool", "tool_call_id": prior["tool_calls"][0]["id"],
          "content": tool_result},
     ])
@@ -281,7 +345,8 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
                         "time_to_first_token_ms": ttft_ms,
                     }
                     canonical_value = {
-                        "choices": [{"message": {"role": "assistant",
+                        "choices": [{"index": 0,
+                                     "message": {"role": "assistant",
                                                  "content": "ADR049_GEMMA_STABLE_OK"},
                                      "finish_reason": "stop"}],
                         "usage": usage, "x_hf2q_timing": timing_value,
@@ -289,16 +354,30 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
                     wire = wave_dir / f"lane-{lane_index}.response.wire"
                     events = wave_dir / f"lane-{lane_index}.response.events.jsonl"
                     canonical = wave_dir / f"lane-{lane_index}.response.canonical.json"
+                    response_id = f"continuation-{pair}-{arm}-{target}-{lane_index}"
+                    created = 1800000000 + sequence
                     if protocol == "unary":
-                        write_json(wire, canonical_value)
+                        write_json(wire, {
+                            "id": response_id, "object": "chat.completion",
+                            "created": created, "model": model_id,
+                            **canonical_value,
+                        })
                         events.write_text("", encoding="utf-8")
                     else:
                         event_values = [
-                            {"choices": [{"delta": {"role": "assistant"},
-                                          "finish_reason": None}]},
-                            {"choices": [{"delta": {"content": "ADR049_GEMMA_STABLE_OK"},
-                                          "finish_reason": None}]},
-                            {"choices": [{"delta": {}, "finish_reason": "stop"}],
+                            {"id": response_id, "object": "chat.completion.chunk",
+                             "created": created, "model": model_id,
+                             "choices": [{"index": 0, "delta": {"role": "assistant"},
+                                           "finish_reason": None}]},
+                            {"id": response_id, "object": "chat.completion.chunk",
+                             "created": created, "model": model_id,
+                             "choices": [{"index": 0,
+                                           "delta": {"content": "ADR049_GEMMA_STABLE_OK"},
+                                           "finish_reason": None}]},
+                            {"id": response_id, "object": "chat.completion.chunk",
+                             "created": created, "model": model_id,
+                             "choices": [{"index": 0, "delta": {},
+                                           "finish_reason": "stop"}],
                              "usage": usage, "x_hf2q_timing": timing_value},
                         ]
                         wire.write_text(
@@ -312,14 +391,15 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
                     write_json(canonical, canonical_value)
                     normalized = wave_dir / f"lane-{lane_index}.normalized.json"
                     write_json(normalized, {
-                        "message": canonical_value["choices"][0]["message"],
-                        "finish_reason": "stop", "usage": usage,
+                        "choice": canonical_value["choices"][0], "usage": usage,
                     })
                     wall = wave_dir / f"lane-{lane_index}.wall"
                     timing = wave_dir / f"lane-{lane_index}.timing"
                     wall.write_text(f"{lane_wall_ms / 1000:.12f}\n", encoding="utf-8")
-                    start = 3000 + sequence * 2 + lane_index * 0.01
-                    finish = start + 0.5
+                    base_start = 3000 + sequence * 6
+                    start = base_start + lane_index * 0.01
+                    desired_wave_ms = (1000 + target) * (speedup if arm == "off" else 1.0)
+                    finish = base_start + desired_wave_ms / 1000
                     timing.write_text(f"{start:.9f}\t{finish:.9f}\n", encoding="utf-8")
                     starts.append(start)
                     finishes.append(finish)
@@ -354,19 +434,20 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
 
                 lanes_file = wave_dir / "lanes.jsonl"
                 write_jsonl(lanes_file, lanes)
-                wave_ms = (1000 + target) * (speedup if arm == "off" else 1.0)
+                wave_ms = (max(finishes) - min(starts)) * 1000
                 wave_wall = wave_dir / "wave.wall"
                 wave_wall.write_text(f"{wave_ms / 1000:.12f}\n", encoding="utf-8")
                 trace = wave_dir / "server.trace.log"
                 if arm == "on":
                     trace_count = sequence + 1
+                    boundary_rows = target - 5
                     line = (
-                        f"[PREFILL_TIMING] STABLE BATCHED 4 seqs x {target} "
+                        f"[PREFILL_TIMING] STABLE BATCHED 4 seqs x {boundary_rows} "
                         f"boundary rows in 10.5 ms count={trace_count}\n"
                     )
                     trace.write_text(line, encoding="utf-8")
                     stderr_lines.append(line)
-                    event_count, trace_requests, trace_rows = 1, 4, target
+                    event_count, trace_requests, trace_rows = 1, 4, boundary_rows
                     trace_elapsed, trace_batch_count = 10.5, trace_count
                 else:
                     trace.write_text("OFF stable scalar continuation\n", encoding="utf-8")
@@ -384,7 +465,8 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
                     "trace_batch_count": trace_batch_count,
                     "aggregate_work_rows": aggregate_rows,
                     "launch_skew_seconds": max(starts) - min(starts),
-                    "latest_start": max(starts), "earliest_finish": min(finishes),
+                    "earliest_start": min(starts), "latest_start": max(starts),
+                    "earliest_finish": min(finishes), "latest_finish": max(finishes),
                     "actual_overlap": True, "lanes_path": relative(root, lanes_file),
                     "lanes_sha256": digest(lanes_file), "lanes": lanes,
                 })
@@ -487,6 +569,7 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
                                      "repetition_penalty": 1, "tool_choice": "auto",
                                      "thinking": False},
             "semantic_normalization": "generated-call-ids-only",
+            "wire_validation": "exact-envelope-single-choice-no-reasoning-logprobs-or-continuation-tools",
             "analysis": {"statistic": "median paired OFF/ON wave speedup",
                          "order_stratified_bootstrap_samples": 10000,
                          "bootstrap_seed": 49004, "lower_confidence_percentile": 2.5,
@@ -533,6 +616,24 @@ def reseal_row(root: Path, rows: list[dict], row: dict) -> None:
     reseal_samples(root, rows)
 
 
+def rewrite_sse_events(
+    root: Path, rows: list[dict], row: dict, lane: dict, events: list[dict]
+) -> None:
+    events_path = root / lane["sse_events_path"]
+    wire_path = root / lane["wire_response_path"]
+    write_jsonl(events_path, events)
+    wire_path.write_text(
+        "".join(
+            f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+            for event in events
+        ) + "data: [DONE]\n\n",
+        encoding="utf-8",
+    )
+    lane["sse_events_sha256"] = digest(events_path)
+    lane["wire_response_sha256"] = digest(wire_path)
+    reseal_row(root, rows, row)
+
+
 def reseal_process(root: Path, index: int, record: dict) -> None:
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -576,6 +677,13 @@ def main() -> None:
         parent = Path(temporary)
         valid = parent / "valid"
         make_fixture(valid)
+        assert_runner_wire_helpers(valid, parent)
+        valid_rows = [json.loads(line) for line in
+                      (valid / "samples.jsonl").read_text().splitlines()]
+        assert all(
+            row["trace_boundary_rows"] != row["lanes"][0]["work_rows"]
+            for row in valid_rows if row["arm"] == "on"
+        ), "valid fixture must distinguish stable-boundary rows from usage work"
         summary = valid / "summary.json"
         subprocess.run([str(VERIFY), str(valid), str(summary)], check=True)
         result = json.loads(summary.read_text(encoding="utf-8"))
@@ -605,6 +713,171 @@ def main() -> None:
         on_row["trace_sha256"] = digest(trace_path)
         reseal_samples(bad_trace, rows)
         run_verify(bad_trace, success=False, reason="exactly one B4 stable rectangle")
+        rejected += 1
+
+        boundary_range = clone(valid, parent, "boundary-outside-range")
+        rows = [json.loads(line) for line in
+                (boundary_range / "samples.jsonl").read_text().splitlines()]
+        row = next(row for row in rows if row["arm"] == "on" and row["target_rows"] == 64)
+        trace_path = boundary_range / row["trace_path"]
+        trace_path.write_text(
+            trace_path.read_text().replace("x 59 boundary rows", "x 31 boundary rows"),
+            encoding="utf-8",
+        )
+        row["trace_boundary_rows"] = 31
+        row["trace_sha256"] = digest(trace_path)
+        reseal_samples(boundary_range, rows)
+        run_verify(
+            boundary_range, success=False,
+            reason="stable boundary is outside proven 32..256 range",
+        )
+        rejected += 1
+
+        wave_scope = clone(valid, parent, "wave-scope-drift")
+        rows = [json.loads(line) for line in
+                (wave_scope / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        row["wave_ms"] += 250
+        wall_path = wave_scope / row["wave_wall_path"]
+        wall_path.write_text(f"{row['wave_ms'] / 1000:.12f}\n", encoding="utf-8")
+        row["wave_wall_sha256"] = digest(wall_path)
+        reseal_samples(wave_scope, rows)
+        run_verify(
+            wave_scope, success=False,
+            reason="wall is not derived from concurrent lane timestamps",
+        )
+        rejected += 1
+
+        extra_choice = clone(valid, parent, "unary-extra-choice")
+        rows = [json.loads(line) for line in
+                (extra_choice / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        lane = row["lanes"][0]
+        wire_path = extra_choice / lane["wire_response_path"]
+        wire = json.loads(wire_path.read_text())
+        wire["choices"].append(json.loads(json.dumps(wire["choices"][0])))
+        write_json(wire_path, wire)
+        lane["wire_response_sha256"] = digest(wire_path)
+        reseal_row(extra_choice, rows, row)
+        run_verify(extra_choice, success=False, reason="choice semantics drifted")
+        rejected += 1
+
+        unary_reasoning = clone(valid, parent, "unary-reasoning")
+        rows = [json.loads(line) for line in
+                (unary_reasoning / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        lane = row["lanes"][0]
+        wire_path = unary_reasoning / lane["wire_response_path"]
+        wire = json.loads(wire_path.read_text())
+        wire["choices"][0]["message"]["reasoning_content"] = "hidden drift"
+        write_json(wire_path, wire)
+        lane["wire_response_sha256"] = digest(wire_path)
+        reseal_row(unary_reasoning, rows, row)
+        run_verify(unary_reasoning, success=False, reason="choice semantics drifted")
+        rejected += 1
+
+        unary_logprobs = clone(valid, parent, "unary-logprobs")
+        rows = [json.loads(line) for line in
+                (unary_logprobs / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        lane = row["lanes"][0]
+        wire_path = unary_logprobs / lane["wire_response_path"]
+        wire = json.loads(wire_path.read_text())
+        wire["choices"][0]["logprobs"] = {"content": []}
+        write_json(wire_path, wire)
+        lane["wire_response_sha256"] = digest(wire_path)
+        reseal_row(unary_logprobs, rows, row)
+        run_verify(unary_logprobs, success=False, reason="choice semantics drifted")
+        rejected += 1
+
+        unary_index = clone(valid, parent, "unary-index")
+        rows = [json.loads(line) for line in
+                (unary_index / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        lane = row["lanes"][0]
+        wire_path = unary_index / lane["wire_response_path"]
+        wire = json.loads(wire_path.read_text())
+        wire["choices"][0]["index"] = 1
+        write_json(wire_path, wire)
+        lane["wire_response_sha256"] = digest(wire_path)
+        reseal_row(unary_index, rows, row)
+        run_verify(unary_index, success=False, reason="choice semantics drifted")
+        rejected += 1
+
+        unary_envelope = clone(valid, parent, "unary-envelope")
+        rows = [json.loads(line) for line in
+                (unary_envelope / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        lane = row["lanes"][0]
+        wire_path = unary_envelope / lane["wire_response_path"]
+        wire = json.loads(wire_path.read_text())
+        wire["unsealed_transport_field"] = True
+        write_json(wire_path, wire)
+        lane["wire_response_sha256"] = digest(wire_path)
+        reseal_row(unary_envelope, rows, row)
+        run_verify(unary_envelope, success=False, reason="envelope drifted")
+        rejected += 1
+
+        prime_reasoning = clone(valid, parent, "prime-reasoning")
+        rows = [json.loads(line) for line in
+                (prime_reasoning / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        lane = row["lanes"][0]
+        prime_path = prime_reasoning / lane["prime_response_path"]
+        prime = json.loads(prime_path.read_text())
+        prime["choices"][0]["message"]["reasoning_content"] = "replay would discard me"
+        write_json(prime_path, prime)
+        lane["prime_response_sha256"] = digest(prime_path)
+        reseal_row(prime_reasoning, rows, row)
+        run_verify(prime_reasoning, success=False, reason="one exact cold tool call")
+        rejected += 1
+
+        sse_reasoning = clone(valid, parent, "sse-reasoning")
+        rows = [json.loads(line) for line in
+                (sse_reasoning / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        lane = row["lanes"][2]
+        events = [json.loads(line) for line in
+                  (sse_reasoning / lane["sse_events_path"]).read_text().splitlines()]
+        events[1]["choices"][0]["delta"]["reasoning_content"] = "hidden drift"
+        rewrite_sse_events(sse_reasoning, rows, row, lane, events)
+        run_verify(sse_reasoning, success=False, reason="content event semantics drifted")
+        rejected += 1
+
+        sse_logprobs = clone(valid, parent, "sse-logprobs")
+        rows = [json.loads(line) for line in
+                (sse_logprobs / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        lane = row["lanes"][2]
+        events = [json.loads(line) for line in
+                  (sse_logprobs / lane["sse_events_path"]).read_text().splitlines()]
+        events[1]["choices"][0]["logprobs"] = {"content": []}
+        rewrite_sse_events(sse_logprobs, rows, row, lane, events)
+        run_verify(sse_logprobs, success=False, reason="choice/index/logprobs semantics drifted")
+        rejected += 1
+
+        sse_index = clone(valid, parent, "sse-index")
+        rows = [json.loads(line) for line in
+                (sse_index / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        lane = row["lanes"][2]
+        events = [json.loads(line) for line in
+                  (sse_index / lane["sse_events_path"]).read_text().splitlines()]
+        events[1]["choices"][0]["index"] = 1
+        rewrite_sse_events(sse_index, rows, row, lane, events)
+        run_verify(sse_index, success=False, reason="choice/index/logprobs semantics drifted")
+        rejected += 1
+
+        sse_envelope = clone(valid, parent, "sse-envelope")
+        rows = [json.loads(line) for line in
+                (sse_envelope / "samples.jsonl").read_text().splitlines()]
+        row = rows[0]
+        lane = row["lanes"][2]
+        events = [json.loads(line) for line in
+                  (sse_envelope / lane["sse_events_path"]).read_text().splitlines()]
+        events[1]["id"] = "different-stream-id"
+        rewrite_sse_events(sse_envelope, rows, row, lane, events)
+        run_verify(sse_envelope, success=False, reason="identity drifted within stream")
         rejected += 1
 
         duplicate = clone(valid, parent, "duplicate-process")
@@ -840,7 +1113,7 @@ def main() -> None:
         run_verify(identity_drift, success=False, reason="live operator launcher drifted")
         rejected += 1
 
-    assert rejected == 17
+    assert rejected == 29
     print(
         "ADR-049 B.2 Gemma stable cached A/B contract passed; "
         f"mutation battery {rejected}/{rejected} rejected"
