@@ -437,7 +437,7 @@ run_warmup_waves() {
         : >"$barrier"
         for pid in "${warmup_pids[@]}"; do wait "$pid"; done
         for ((lane = 0; lane < LANES; lane++)); do
-            jq -e '.usage.prompt_tokens_details.cached_tokens == 0 \
+            jq -e '.usage.prompt_tokens_details.cached_tokens == 0
               and (.usage.completion_tokens | numbers) == 1' \
                 "$warmup_dir/$warmup-$lane.response.json" >/dev/null
         done

@@ -16,8 +16,10 @@
   now checked in and model-free green, while their real-artifact cells remain
   open)
 - Date: 2026-08-22
-- Updated: 2026-08-25 (rev 72, exact five-format physical matrix and universal
-  four-family swap green;
+- Updated: 2026-08-25 (rev 73, exact five-format physical matrix and universal
+  four-family swap green; universal SlotAware private-queue liveness is
+  hardware-proven for Gemma's four-slot burst and the Gemma B.2 runner now
+  rejects the full single-quoted continuation bug class;
   cross-family swap harness identity race and post-drain rehash falsified;
   canonical schema-v2 preflight, isolated-Cargo, and source-dominant
   host-wired authorities are model-free green; exact-path mapped-artifact
@@ -1707,8 +1709,8 @@ matrix is
 (SHA-256 `86e6739c476b9a4c0fc3ea2e28dced0fca5650d4ca85a1f6ff6ea1d434026bd6`).
 
 The next Gemma B.2 spike first falsified a literal shell continuation embedded
-inside a `jq` program; the runner parser and its model-free canary were fixed
-before any model load. At exact commit `a02e62e2`, the corrected OFF-arm
+inside a `jq` program; the runner parser and a targeted model-free canary were
+fixed before any model load. At exact commit `a02e62e2`, the corrected OFF-arm
 warmup then exposed a real universal SlotAware liveness defect: four short
 terminal requests entered, two completed, and two timed out at the exact
 300-second watchdog. The worker had drained channel work into its private
@@ -1719,8 +1721,16 @@ ownership, so they were exonerated. Qwen and DeepSeek shared the same unsafe
 idle shape. The reformulated invariant makes all three generative workers
 rerun admission whenever their private deque is nonempty and blocks on the
 channel only when both work domains are empty. Its model-free burst test is
-green and pins all three family call sites; the fresh Gemma hardware rerun is
-the deciding proof.
+green and pins all three family call sites. At exact commit `444c9ff0`, the
+fresh Gemma hardware rerun completed all four simultaneous cold warmup
+requests on slots 0, 1, 2, and 3 and shut down cleanly, hardware-confirming
+the liveness repair. The performance producer then stopped before its first
+sample because a second literal line-ending backslash remained inside a
+different single-quoted `jq` predicate. That is runner failure, not model or
+performance evidence. The reformulated contract lexes the complete runner and
+rejects every line-ending backslash while a shell single quote is open; the
+second defect is removed, the positive and injected-defect canaries are green,
+and a fresh exact-lineage performance run remains required.
 
 **Lane B gates:** B.0 byte-identity (cohort+concurrent-decode); cooperative receipt regime (≥5 alternating serial/cooperative pairs, sustained median faster, peak RSS recorded, independent receipt verification); thermal contract (Nominal start, continuous Fair-or-better, no gap >5 s, fail-closed); memory H3 (≤116 GiB peak beside the 100 GiB artifact); product ceilings unchanged (60 s cold / 15 s cached-automatic-SSE / 35 s tool-result — never widened); B4 decode-cohort gate re-pass; the two B.1 latency contracts.
 

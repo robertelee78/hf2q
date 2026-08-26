@@ -13,6 +13,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
+RUNNER = SCRIPT_DIR / "bench_adr049_b2_gemma4_aggregate_ab.sh"
 VERIFY = SCRIPT_DIR / "verify_adr049_b2_gemma4_aggregate_ab.py"
 WIDTHS = [128, 256, 512]
 
@@ -36,6 +37,51 @@ def write_jsonl(path: Path, values: list[dict]) -> None:
 
 def relative(root: Path, path: Path) -> str:
     return str(path.relative_to(root))
+
+
+def single_quoted_line_continuations(source: str) -> list[int]:
+    """Return lines where a literal backslash ends an open shell single quote."""
+    violations: list[int] = []
+    in_single = False
+    in_double = False
+    for line_number, line in enumerate(source.splitlines(), start=1):
+        escaped = False
+        for index, char in enumerate(line):
+            if in_single:
+                if char == "'":
+                    in_single = False
+                continue
+            if in_double:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_double = False
+                continue
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "'":
+                in_single = True
+            elif char == '"':
+                in_double = True
+            elif char == "#" and (index == 0 or line[index - 1] in " \t;|&("):
+                break
+        if in_single and line.endswith("\\"):
+            violations.append(line_number)
+    return violations
+
+
+def assert_runner_shell_quoting_contract() -> None:
+    violations = single_quoted_line_continuations(RUNNER.read_text(encoding="utf-8"))
+    assert not violations, (
+        "runner embeds shell line continuations in single-quoted programs at lines "
+        f"{violations}"
+    )
+    assert single_quoted_line_continuations("jq '.a \\\nand .b' file\n") == [1]
+    assert single_quoted_line_continuations("jq '.a\nand .b' \\\nfile\n") == []
 
 
 def make_identity(root: Path) -> dict:
@@ -352,6 +398,7 @@ def clone(source: Path, parent: Path, name: str) -> Path:
 
 
 def main() -> None:
+    assert_runner_shell_quoting_contract()
     engine_source = (ROOT / "src/serve/api/engine.rs").read_text(encoding="utf-8")
     function = engine_source.split("fn admit_gemma4_slots_batched(", 1)[1].split(
         "fn admit_gemma4_slots_stable_batched(", 1
