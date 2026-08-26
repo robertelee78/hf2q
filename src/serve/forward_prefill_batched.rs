@@ -6753,13 +6753,18 @@ impl MlxModelWeights {
         // the seq>sw guard — sliding layers were allocated LINEAR this
         // prefill, so the snapshot captures [0..seq) faithfully.
         let snapshot_safe = !any_sliding_layer || seq_len <= sw || kv_lcp_long_resume;
-        // Pre-copy budget gate (2026-08-03): estimate dual-leg entry
-        // bytes from shapes BEFORE the snapshot alloc+memcpy; skip when
-        // the entry cannot fit the registry budget (97K-token dual-leg
-        // ≈ 64 GB → swap-storm, measured live 2026-08-03).
+        // Pre-copy budget gate (2026-08-03): estimate a dual-leg entry only
+        // for the non-live route that can actually publish an LCP snapshot.
+        // Live prefix resume mounts the slot-banked rank-4 cache and captures
+        // its boundary through the slot-local anchor transaction instead; it
+        // must not be interpreted as a rank-3 LCP snapshot source.
+        // Skip when the entry cannot fit the registry budget (97K-token
+        // dual-leg ≈ 64 GB → swap-storm, measured live 2026-08-03).
         let snap_cap_est =
             sw.max(seq_len + max_decode_tokens + if kv_lcp_long_resume { 4096 } else { 0 });
-        let lcp_est_bytes: u64 = {
+        let lcp_est_bytes: u64 = if live_prefix_resume {
+            0
+        } else {
             let dense: u64 = self
                 .layers
                 .iter()
