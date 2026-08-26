@@ -17,7 +17,9 @@
   equal-logit argmax choose the lowest vocabulary index deterministically.
   A one-slot worker now uses the measured 4,096-token prefill quantum while
   multi-slot workers retain the 2,048-token fairness ceiling. The qualified
-  Q5_K_M one-slot workload now has a sealed, stable faster-than-baseline result.
+  Q5_K_M one-slot workload produced a stable faster-than-baseline result under
+  the superseded process-group-v1 contention guard; ADR-049 rev 90 reopens its
+  timing authority under process-group-cpu-v2 while preserving coherence.
   Universal Qwen3.8 acceptance now requires the same fail-closed correctness,
   physical-width, and matched-performance matrices over BF16, Q4_K_M, Q5_K_M,
   Q6_K, and Q8_0; individual cells do not authorize a universal claim. Exact
@@ -714,14 +716,17 @@ they retain raw API accounting as a diagnostic and do not claim normalized
 semantic-token throughput.
 
 The current pinned comparison source identity is
-`a14dba686aaafba3a2d6b5eb8820b0df5c5d2d92`, read from
+`bf942164697d2d62c2237a17b677dc2c017ea8e7`, read from
 `data/llama_cpp_pin.txt` and verified against the upstream branch on
-2026-08-24. No binary or performance receipt built from that pin has yet been
-accepted. Regeneration at build 10610 left all 24 quantizer fixtures
-byte-identical and bound the dynamically linked comparison runtime with a
-complete non-system Mach-O closure manifest, because the launcher executable
-alone remained byte-identical across distinct engine dylibs. The earlier
-`3f545bec`/build-10587, `9a286`, and `c060ca`
+2026-08-26. No performance receipt built from that pin has yet been accepted.
+Regeneration at build 10638 left all 24 quantizer fixtures byte-identical and
+bound the dynamically linked comparison server SHA-256
+`b80b195eeee06559be44a3e666e8761627b8cc540edbc74e96e414f76bc90ce0`
+to complete non-system Mach-O runtime-manifest SHA-256
+`321879ecadf4743c6c964badda36bd8443159b4afc73dfa12e0ee7bc8e4f608a`.
+This remains necessary because the launcher executable alone can remain
+byte-identical across distinct engine dylibs. The earlier `a14dba68`/build-
+10610, `3f545bec`/build-10587, `9a286`, and `c060ca`
 identities remain historical evidence only and cannot satisfy the current
 matched gate.
 

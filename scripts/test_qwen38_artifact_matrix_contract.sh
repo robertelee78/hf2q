@@ -301,7 +301,7 @@ expect_failure case-folded-format qwen38_artifact_record q5_k_m
 
 pin=$(qwen38_pinned_peer_commit)
 [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || fail "pinned peer commit is not exact: $pin"
-[[ "$pin" == "a14dba686aaafba3a2d6b5eb8820b0df5c5d2d92" ]] \
+[[ "$pin" == "bf942164697d2d62c2237a17b677dc2c017ea8e7" ]] \
     || fail "pinned peer commit drifted from regenerated fixture authority: $pin"
 qwen38_validate_pinned_peer_commit "$pin"
 expect_failure wrong-peer-commit qwen38_validate_pinned_peer_commit \
