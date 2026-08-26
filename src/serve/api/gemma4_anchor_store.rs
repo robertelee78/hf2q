@@ -115,6 +115,34 @@ pub(crate) fn record_capture(
     );
 }
 
+pub(crate) fn record_preflight_budget_skip(
+    outcome: StagePending,
+    slot_owned_bytes: u64,
+    aggregate_owned_bytes: u64,
+    effective_committed_depth: usize,
+    simultaneous_pending_capacity_slots: usize,
+) {
+    debug_assert!(matches!(
+        outcome,
+        StagePending::BudgetExceeded { .. } | StagePending::NoCommittedCapacity
+    ));
+    TELEMETRY
+        .capture_budget_skips_total
+        .fetch_add(1, Ordering::Relaxed);
+    TELEMETRY
+        .effective_committed_depth
+        .store(effective_committed_depth as u64, Ordering::Relaxed);
+    TELEMETRY.simultaneous_pending_capacity_slots.store(
+        simultaneous_pending_capacity_slots as u64,
+        Ordering::Relaxed,
+    );
+    raise_peak(&TELEMETRY.peak_committed_pending_bytes, slot_owned_bytes);
+    raise_peak(
+        &TELEMETRY.aggregate_peak_committed_pending_bytes,
+        aggregate_owned_bytes,
+    );
+}
+
 pub(crate) fn record_publication(publication: Publication) {
     TELEMETRY
         .evictions_total

@@ -669,6 +669,20 @@ fn run_whole_route_arm(
         } else {
             case.initial_cursor
         };
+        let anchor_bytes = prospective_gemma4_prompt_anchor_owned_bytes(
+            hybrid,
+            slot,
+            boundary,
+        )
+        .expect("prospective anchor bytes");
+        let anchor_admission = Gemma4AnchorCaptureAdmission {
+            outcome: StagePending::Staged,
+            effective_committed_depth: 4,
+            simultaneous_pending_capacity_slots: case.width,
+            aggregate_owned_bytes: 0,
+            slot_owned_bytes: 0,
+            slot_budget_bytes: u64::MAX,
+        };
         let (state, anchor) = Gemma4DecodeState::prefill_seed(
             g,
             &prompts[lane],
@@ -681,6 +695,7 @@ fn run_whole_route_arm(
             None,
             None,
             &supervisor,
+            Some((anchor_admission, anchor_bytes)),
             lane_resume,
             case.initial_cursor,
         )

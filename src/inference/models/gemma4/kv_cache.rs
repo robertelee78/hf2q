@@ -3,7 +3,7 @@
 //! Extracted from `src/serve/forward_mlx.rs` by ADR-038 Step 2.
 //! Mirrors the `qwen35/kv_cache.rs` pattern.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 
 /// Per-layer KV cache buffers for the mlx-native path (TurboQuant compressed).
@@ -1536,6 +1536,25 @@ fn gemma4_copy_slot_region_out(
     Ok(bytes[start..start + per_slot].to_vec())
 }
 
+fn gemma4_slot_region_owned_bytes(
+    buf: &MlxBuffer,
+    slot_idx: usize,
+    n_seqs: usize,
+    name: &str,
+) -> Result<u64> {
+    anyhow::ensure!(n_seqs > 0, "{name}: n_seqs must be positive");
+    anyhow::ensure!(
+        slot_idx < n_seqs,
+        "{name}: slot {slot_idx} outside {n_seqs}"
+    );
+    let bytes = buf.data_byte_len();
+    anyhow::ensure!(
+        bytes % n_seqs == 0,
+        "{name}: byte length {bytes} not divisible by n_seqs={n_seqs}"
+    );
+    Ok((bytes / n_seqs) as u64)
+}
+
 fn gemma4_copy_slot_region_in(
     src: &[u8],
     dst: &mut MlxBuffer,
@@ -1689,6 +1708,72 @@ pub(crate) fn preflight_gemma_hybrid_slot_anchor_restore(
         }
     }
     Ok(())
+}
+
+/// Capture one slot immediately after prompt prefill and before decode.
+pub fn prospective_gemma_hybrid_slot_anchor_owned_bytes(
+    scaffold: &[MultiSeqHybridKvBuffers],
+    slot: crate::serve::multi_seq_kv::SlotId,
+) -> Result<u64> {
+    let layer_table = (scaffold.len() as u64)
+        .checked_mul(std::mem::size_of::<Option<GemmaHybridSlidingLayerAnchor>>() as u64)
+        .context("Gemma slot anchor layer-table byte overflow")?;
+    scaffold
+        .iter()
+        .enumerate()
+        .try_fold(layer_table, |total, (layer_idx, buf)| {
+            let slot_idx = slot.0 as usize;
+            let n_seqs = buf.n_seqs as usize;
+            anyhow::ensure!(
+                slot_idx < n_seqs,
+                "Gemma slot anchor L{layer_idx}: slot {} outside n_seqs={n_seqs}",
+                slot.0
+            );
+            if !buf.is_sliding {
+                return Ok(total);
+            }
+            let mut layer_bytes = gemma4_slot_region_owned_bytes(
+                &buf.k,
+                slot_idx,
+                n_seqs,
+                &format!("Gemma slot anchor L{layer_idx} K"),
+            )?
+            .checked_add(gemma4_slot_region_owned_bytes(
+                &buf.v_packed,
+                slot_idx,
+                n_seqs,
+                &format!("Gemma slot anchor L{layer_idx} V"),
+            )?)
+            .context("Gemma slot anchor payload byte overflow")?;
+            if buf.v_norms.byte_len() != 4 {
+                layer_bytes = layer_bytes
+                    .checked_add(gemma4_slot_region_owned_bytes(
+                        &buf.v_norms,
+                        slot_idx,
+                        n_seqs,
+                        &format!("Gemma slot anchor L{layer_idx} V norms"),
+                    )?)
+                    .context("Gemma slot anchor payload byte overflow")?;
+            }
+            for (name, buffer) in [
+                ("xlen K", buf.bf16_xlen_k.as_ref()),
+                ("xlen V", buf.bf16_xlen_v.as_ref()),
+            ] {
+                if let Some(buffer) = buffer {
+                    layer_bytes = layer_bytes
+                        .checked_add(gemma4_slot_region_owned_bytes(
+                            buffer,
+                            slot_idx,
+                            n_seqs,
+                            &format!("Gemma slot anchor L{layer_idx} {name}"),
+                        )?)
+                        .context("Gemma slot anchor payload byte overflow")?;
+                }
+            }
+            total
+                .checked_add(layer_bytes)
+                .context("Gemma slot anchor payload byte overflow")
+        })
 }
 
 /// Capture one slot immediately after prompt prefill and before decode.
@@ -3471,6 +3556,15 @@ mod tests {
         let mut anchor =
             snapshot_gemma_hybrid_slot_anchor(&scaffold, crate::serve::multi_seq_kv::SlotId(0), 3)
                 .expect("snapshot");
+        assert_eq!(
+            prospective_gemma_hybrid_slot_anchor_owned_bytes(
+                &scaffold,
+                crate::serve::multi_seq_kv::SlotId(0),
+            )
+            .expect("prospective bytes"),
+            anchor.owned_bytes(),
+            "budget admission must know the exact payload before copying it"
+        );
 
         // Make layer zero visibly different from its checkpoint, then corrupt
         // only the final layer's saved layout. A write-before-full-preflight

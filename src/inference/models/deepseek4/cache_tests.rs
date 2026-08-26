@@ -644,8 +644,14 @@ fn compact_snapshot_restores_overwritten_window_state_and_position_without_alias
         cache.commit_step(step.position).unwrap();
     }
 
+    let prospective_snapshot_bytes = cache.prospective_snapshot_owned_bytes().unwrap();
     let snapshot = cache.snapshot().unwrap();
     assert_eq!(snapshot.position(), 7);
+    assert_eq!(
+        prospective_snapshot_bytes,
+        snapshot.owned_bytes(),
+        "budget admission must know the exact payload before allocating it"
+    );
     let expected_snapshot_bytes: u64 = plan
         .layers
         .iter()

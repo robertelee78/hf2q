@@ -38,7 +38,7 @@ use crate::serve::load_info::{
 use self::progress::RequestProgress;
 use super::anchor_store::{
     maybe_inject_anchor_restore_failure, AnchorDivergence, AnchorEntry, AnchorRestoreEvent,
-    AnchorRestoreFaultFamily, AnchorRestoreOutcome,
+    AnchorRestoreFaultFamily, AnchorRestoreOutcome, StagePending,
 };
 use super::deepseek4_anchor_store::{
     self as anchor_store_policy, Deepseek4AnchorBudget, Deepseek4AnchorStore,
@@ -52,6 +52,10 @@ const RECOVERY_TAIL_TOKENS: usize = 8;
 
 fn anchor_aggregate_budget_bytes() -> u64 {
     crate::serve::kv_persist::lcp_registry::default_lcp_byte_budget()
+}
+
+fn anchor_reprovision_budget_bytes(budget: &Deepseek4AnchorBudget) -> u64 {
+    budget.aggregate_budget_bytes()
 }
 
 fn anchor_control_capacity(configured_stores: usize, aggregate_budget_bytes: u64) -> usize {
@@ -87,6 +91,33 @@ fn resumable_matrix_prefill_chunk_len(
 enum ResumablePrefillChunk {
     Matrix(usize),
     Incremental(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShortRecoveryExecution {
+    Standard,
+    FullPromptOnly,
+    CapturePrepassThenFullPrompt,
+}
+
+fn plan_short_recovery_execution(
+    candidate: bool,
+    admission: Option<StagePending>,
+) -> Result<ShortRecoveryExecution> {
+    if !candidate {
+        return Ok(ShortRecoveryExecution::Standard);
+    }
+    match admission.context("DeepSeek-V4 short-recovery candidate is missing admission")? {
+        StagePending::Staged => Ok(ShortRecoveryExecution::CapturePrepassThenFullPrompt),
+        StagePending::NoCommittedCapacity | StagePending::BudgetExceeded { .. } => {
+            Ok(ShortRecoveryExecution::FullPromptOnly)
+        }
+        StagePending::PendingOccupied => {
+            anyhow::bail!(
+                "DeepSeek-V4 short-recovery anchor preflight found an occupied pending payload"
+            )
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -366,6 +397,62 @@ fn capture_anchor_candidate(
     ))
 }
 
+fn prospective_anchor_candidate_owned_bytes(
+    cache: &Deepseek4Cache,
+    prompt_tokens: usize,
+) -> Result<u64> {
+    cache
+        .prospective_snapshot_owned_bytes()
+        .context("preflight DeepSeek-V4 snapshot ownership")?
+        .checked_add(
+            (prompt_tokens as u64)
+                .checked_mul(std::mem::size_of::<u32>() as u64)
+                .context("DeepSeek-V4 anchor token-byte overflow")?,
+        )
+        .context("DeepSeek-V4 prospective anchor byte overflow")
+}
+
+fn preflight_anchor_capture(
+    cache: &Deepseek4Cache,
+    store: &Deepseek4AnchorStore,
+    budget: &Deepseek4AnchorBudget,
+    prompt_tokens: usize,
+) -> Result<(StagePending, u64)> {
+    let anchor_bytes = prospective_anchor_candidate_owned_bytes(cache, prompt_tokens)?;
+    Ok((budget.preflight_capture(store, anchor_bytes), anchor_bytes))
+}
+
+fn capture_turn_anchor_with_source(
+    cache: &Deepseek4Cache,
+    store: &mut Deepseek4AnchorStore,
+    budget: &Deepseek4AnchorBudget,
+    prompt_prefix: &[u32],
+    snapshot_context: &'static str,
+    capture_source: &'static str,
+) -> Result<bool> {
+    let (admission, anchor_bytes) =
+        preflight_anchor_capture(cache, store, budget, prompt_prefix.len())?;
+    let anchor = super::anchor_store::capture_if_anchor_admitted(admission, || {
+        capture_anchor_candidate(cache, prompt_prefix, snapshot_context)
+    })?;
+    let Some(anchor) = anchor else {
+        anchor_store_policy::record_preflight_budget_skip(
+            store,
+            budget,
+            anchor_bytes,
+            admission,
+            capture_source,
+        );
+        return Ok(false);
+    };
+    let outcome = anchor_store_policy::stage_pending(store, budget, anchor, capture_source)?;
+    anyhow::ensure!(
+        outcome == StagePending::Staged,
+        "DeepSeek-V4 anchor admission changed between preflight and staging: {outcome:?}"
+    );
+    Ok(true)
+}
+
 fn preflight_anchor_store_migration(
     destination: &Deepseek4Cache,
     source: &Deepseek4Cache,
@@ -506,19 +593,18 @@ impl Deepseek4Session {
         self.committed_tokens.extend_from_slice(tokens);
     }
 
-    pub(super) fn capture_cooperative_turn_anchor(&mut self, prompt_prefix: &[u32]) -> Result<()> {
-        let anchor = capture_anchor_candidate(
+    pub(super) fn capture_cooperative_turn_anchor(
+        &mut self,
+        prompt_prefix: &[u32],
+    ) -> Result<bool> {
+        capture_turn_anchor_with_source(
             &self.cache,
-            prompt_prefix,
-            "snapshot DeepSeek-V4 cooperative prompt-boundary cache",
-        )?;
-        anchor_store_policy::stage_pending(
             &mut self.anchor_store,
             &self.anchor_budget,
-            anchor,
+            prompt_prefix,
+            "snapshot DeepSeek-V4 cooperative prompt-boundary cache",
             "cooperative-prefill",
-        )?;
-        Ok(())
+        )
     }
 
     /// Return the longest prefix this retained slot can safely resume for the
@@ -1100,7 +1186,7 @@ impl Deepseek4LoadedModel {
             "DeepSeek-V4 SlotAware sessions must be provisioned before anchor publication"
         );
         let configured_stores = max_slots as usize + 1;
-        let aggregate_anchor_budget = anchor_aggregate_budget_bytes();
+        let aggregate_anchor_budget = anchor_reprovision_budget_bytes(&self.anchor_budget);
         let anchor_control_capacity =
             anchor_control_capacity(configured_stores, aggregate_anchor_budget);
         self.anchor_store = Deepseek4AnchorStore::with_committed_capacity(anchor_control_capacity);
@@ -1336,19 +1422,15 @@ impl Deepseek4LoadedModel {
         Ok(())
     }
 
-    fn capture_turn_anchor(&mut self, prompt_prefix: &[u32]) -> Result<()> {
-        let anchor = capture_anchor_candidate(
+    fn capture_turn_anchor(&mut self, prompt_prefix: &[u32]) -> Result<bool> {
+        capture_turn_anchor_with_source(
             &self.cache,
-            prompt_prefix,
-            "snapshot DeepSeek-V4 prompt-boundary cache",
-        )?;
-        anchor_store_policy::stage_pending(
             &mut self.anchor_store,
             &self.anchor_budget,
-            anchor,
+            prompt_prefix,
+            "snapshot DeepSeek-V4 prompt-boundary cache",
             "serial-or-swapped-prefill",
-        )?;
-        Ok(())
+        )
     }
 
     fn restore_committed_anchor(
@@ -1712,8 +1794,9 @@ impl Deepseek4LoadedModel {
                 "DeepSeek-V4 generation cancelled after committed incremental prefill"
             );
             if slice.capture_anchor_after {
-                self.capture_turn_anchor(&prompt_tokens[..plan.recovery_position])?;
-                progress.recovery_anchor_captured(plan.recovery_position);
+                if self.capture_turn_anchor(&prompt_tokens[..plan.recovery_position])? {
+                    progress.recovery_anchor_captured(plan.recovery_position);
+                }
             }
             if plan.cursor < prompt_tokens.len() {
                 drop(state);
@@ -1747,8 +1830,9 @@ impl Deepseek4LoadedModel {
         );
 
         if slice.capture_anchor_after {
-            self.capture_turn_anchor(&prompt_tokens[..plan.recovery_position])?;
-            progress.recovery_anchor_captured(plan.recovery_position);
+            if self.capture_turn_anchor(&prompt_tokens[..plan.recovery_position])? {
+                progress.recovery_anchor_captured(plan.recovery_position);
+            }
         }
         if plan.cursor < prompt_tokens.len() {
             drop(state);
@@ -1920,8 +2004,38 @@ impl Deepseek4LoadedModel {
         };
         let recovery_position = prompt_tokens.len().saturating_sub(RECOVERY_TAIL_TOKENS);
         let native_prefill_rows = self.model.cfg.sliding_window as usize;
-        let short_recovery_prepass =
+        let short_recovery_candidate =
             reset_from_scratch && recovery_position > 0 && recovery_position < native_prefill_rows;
+        let short_recovery_admission = short_recovery_candidate
+            .then(|| {
+                preflight_anchor_capture(
+                    &self.cache,
+                    &self.anchor_store,
+                    &self.anchor_budget,
+                    recovery_position,
+                )
+            })
+            .transpose()?;
+        let short_recovery_execution = plan_short_recovery_execution(
+            short_recovery_candidate,
+            short_recovery_admission.map(|(admission, _)| admission),
+        )?;
+        let short_recovery_prepass =
+            short_recovery_execution == ShortRecoveryExecution::CapturePrepassThenFullPrompt;
+        if let Some((admission, anchor_bytes)) = short_recovery_admission.filter(|(admission, _)| {
+            matches!(
+                admission,
+                StagePending::NoCommittedCapacity | StagePending::BudgetExceeded { .. }
+            )
+        }) {
+            anchor_store_policy::record_preflight_budget_skip(
+                &self.anchor_store,
+                &self.anchor_budget,
+                anchor_bytes,
+                admission,
+                "short-recovery-prepass",
+            );
+        }
         let work_tokens = prompt_tokens
             .len()
             .saturating_sub(cached_tokens)
@@ -1937,6 +2051,13 @@ impl Deepseek4LoadedModel {
                 .clone()
                 .map(|logits| (logits, cached_tokens))
                 .context("DeepSeek-V4 exact-prefix cache hit has no aligned live logits");
+        }
+
+        if short_recovery_execution == ShortRecoveryExecution::FullPromptOnly {
+            let final_state = self
+                .append_prompt_tokens(prompt_tokens, &cancelled, progress, supervisor)?
+                .context("DeepSeek-V4 prompt produced no verifier state")?;
+            return self.finish_prefill(final_state, 0, supervisor);
         }
 
         // Short position-zero prompts must execute as one verifier batch.
@@ -1966,12 +2087,16 @@ impl Deepseek4LoadedModel {
             let final_state = self
                 .append_prompt_tokens(prompt_tokens, &cancelled, progress, supervisor)?
                 .context("DeepSeek-V4 prompt produced no verifier state")?;
-            anchor_store_policy::stage_pending(
+            let outcome = anchor_store_policy::stage_pending(
                 &mut self.anchor_store,
                 &self.anchor_budget,
                 recovery_anchor,
                 "short-recovery-prepass",
             )?;
+            anyhow::ensure!(
+                outcome == StagePending::Staged,
+                "DeepSeek-V4 short-recovery admission changed before staging: {outcome:?}"
+            );
             progress.recovery_anchor_captured(recovery_position);
             return self.finish_prefill(final_state, 0, supervisor);
         }
@@ -1986,8 +2111,9 @@ impl Deepseek4LoadedModel {
                 supervisor,
             )?;
             cursor = recovery_position;
-            self.capture_turn_anchor(&prompt_tokens[..recovery_position])?;
-            progress.recovery_anchor_captured(recovery_position);
+            if self.capture_turn_anchor(&prompt_tokens[..recovery_position])? {
+                progress.recovery_anchor_captured(recovery_position);
+            }
         }
         final_state = self
             .append_prompt_tokens(&prompt_tokens[cursor..], &cancelled, progress, supervisor)?
@@ -2206,12 +2332,14 @@ mod tests {
         Deepseek4AnchorStore, Deepseek4PromptAnchor, DEFAULT_MAX_COMMITTED_ANCHORS,
     };
     use super::{
-        balance_fresh_three_chunk_prefill, cache_capacity_for_request, common_prefix_len,
-        deepseek4_cancellation_recovery, plan_resumable_prefill_chunk, prefer_matrix_prefill,
-        preflight_anchor_store_migration, resumable_matrix_prefill_chunk_len, select_prefix_reuse,
-        select_prefix_reuse_from_store, should_retain_decode_scratch, AnchorDivergence,
-        Deepseek4CancellationRecovery, Deepseek4Session, PrefixReuse, ResumablePrefillChunk,
-        ResumablePrefillSlice, TransientScratchStats, MIN_MATRIX_APPEND_TOKENS,
+        anchor_reprovision_budget_bytes, balance_fresh_three_chunk_prefill,
+        cache_capacity_for_request, common_prefix_len, deepseek4_cancellation_recovery,
+        plan_resumable_prefill_chunk, plan_short_recovery_execution, prefer_matrix_prefill,
+        preflight_anchor_store_migration,
+        resumable_matrix_prefill_chunk_len, select_prefix_reuse, select_prefix_reuse_from_store,
+        should_retain_decode_scratch, AnchorDivergence, Deepseek4CancellationRecovery,
+        Deepseek4Session, PrefixReuse, ResumablePrefillChunk, ResumablePrefillSlice,
+        ShortRecoveryExecution, TransientScratchStats, MIN_MATRIX_APPEND_TOKENS,
         RECOVERY_TAIL_TOKENS,
     };
 
@@ -2340,6 +2468,61 @@ mod tests {
             request_anchor_transaction_active: false,
             telemetry_slot: Some(7),
         }
+    }
+
+    #[test]
+    fn zero_depth_anchor_grant_skips_deepseek_snapshot_before_copy() {
+        let store = Deepseek4AnchorStore::with_committed_capacity(0);
+        let budget = Deepseek4AnchorBudget::new(4, 1_024, store.owned_bytes()).unwrap();
+        let admission = budget.preflight_capture(&store, 2_048);
+        assert_eq!(admission, StagePending::NoCommittedCapacity);
+
+        let mut called = false;
+        let captured = super::super::anchor_store::capture_if_anchor_admitted::<u64>(
+            admission,
+            || {
+                called = true;
+                Ok(99)
+            },
+        )
+        .unwrap();
+        assert_eq!(captured, None);
+        assert!(!called, "DeepSeek snapshot must not run at effective K=0");
+    }
+
+    #[test]
+    fn slot_reprovision_keeps_the_worker_lifetime_anchor_grant() {
+        let store = Deepseek4AnchorStore::with_committed_capacity(0);
+        let frozen_grant = 987_654_u64;
+        let budget = Deepseek4AnchorBudget::new(4, frozen_grant, store.owned_bytes()).unwrap();
+        assert_eq!(anchor_reprovision_budget_bytes(&budget), frozen_grant);
+    }
+
+    #[test]
+    fn short_recovery_capacity_only_changes_checkpoint_work() {
+        assert_eq!(
+            plan_short_recovery_execution(false, None).unwrap(),
+            ShortRecoveryExecution::Standard
+        );
+        assert_eq!(
+            plan_short_recovery_execution(
+                true,
+                Some(StagePending::NoCommittedCapacity),
+            )
+            .unwrap(),
+            ShortRecoveryExecution::FullPromptOnly,
+            "K=0 must retain one authoritative full-prompt append without a snapshot prepass"
+        );
+        assert_eq!(
+            plan_short_recovery_execution(true, Some(StagePending::Staged)).unwrap(),
+            ShortRecoveryExecution::CapturePrepassThenFullPrompt,
+            "admitted capture adds only the request-local prefix prepass"
+        );
+        assert!(plan_short_recovery_execution(
+            true,
+            Some(StagePending::PendingOccupied),
+        )
+        .is_err());
     }
 
     fn publish_current_anchor(session: &mut Deepseek4Session, tokens: &[u32]) {

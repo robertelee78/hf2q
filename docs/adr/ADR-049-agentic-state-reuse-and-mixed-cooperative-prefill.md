@@ -20,7 +20,27 @@
   reopened under the v2 contention authority, while the DeepSeek and Qwen
   current-head real-artifact cells remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 96 records and acts on the exact-head physical
+- Updated: 2026-08-26 (rev 97 closes the family-wide checkpoint-admission
+  audit opened by rev 96 without admitting a new hardware or speed claim.
+  Gemma4 and DeepSeek4 now compute the exact prospective family payload before
+  any snapshot allocation or copy; zero capacity suppresses only optional
+  capture. DeepSeek's short position-zero prompt therefore retains its one
+  authoritative full-prompt verifier append when capture is unavailable,
+  instead of drifting into two target appends. Its park/reactivate lifecycle
+  also reuses the worker-lifetime anchor grant frozen at initial load rather
+  than rerunning the available-memory heuristic. Gemma's aggregate ledger now
+  includes committed/pending stores, scalar-local rollback, installed bounded
+  prefill candidates, and candidates temporarily extracted into a multi-lane
+  transaction. Replacement releases exactly the current lane's prior
+  candidate before preflighting the new boundary, and the multi-lane ledger is
+  recomputed after every install. Stable B2/B4 virtual admission starts from
+  that complete live total. Focused source proof is green: 22 DeepSeek serving
+  tests, three cross-family capacity tests, and five Gemma anchor tests. The
+  complete locked binary suite passes 5,148 tests with 67 explicit real-model/
+  benchmark ignores, and `cargo check --locked --all-targets --all-features`
+  is green; exact-artifact physical and matched-current-peer timing receipts
+  remain open. Rev 96 records and
+  acts on the exact-head physical
   multi-slot falsifier at hf2q `08ef2e35`. BF16 passed scalar-equivalent
   1/2/4/8/16-slot execution and Q4_K_M passed 1/2/4/8, but Q4_K_M width 16
   returned HTTP 500 after a 2,435,398,041-byte immutable grant made
@@ -490,6 +510,14 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 - **Payload ownership rule (executor-audit finding):** every element of an anchor's payload must be host-owned or a dedicated right-sized allocation — NEVER a view/clone retaining a larger transient allocation. Today `pending_target_hidden` is an `MlxBuffer` captured by cloning a view whose parent is the prefill residual allocation (engine_qwen35.rs:3406, capture sites :3972/:4759): the logical row is ~20 KiB, but the clone retains the ~40 MiB (2,048-row) / ~80 MiB (4,096-row) parent Metal allocation — one per anchor. Capture must copy the row into a dedicated `[1, H]` allocation or host memory. Required regression: after capture, assert no chunk-sized parent allocation remains retained by any anchor (allocation-accounting check).
 - Budget: `HybridKvSlotAnchor::total_bytes()` (kv_cache.rs:1004) undercounts — it omits prompt tokens, the vocab-sized `prefill_logits`, the spec hidden row owned by `Qwen35PromptAnchor` (engine.rs:16865-16871, spec boundary struct engine_qwen35.rs:3404-3407), and the store's retained `Vec` control allocation. Account **all owned bytes** as a separate reclaimable `anchor_owned_bytes` line surfaced to admission — NOT added to scheduler high-water, which is deliberately monotonic allocation accounting and is not proof that overwrite-backed Metal pages are demand-resident. Host-owned evictable bytes charged there would never return. **K counts committed anchors only; every capture preflight charges the slot's committed payload plus one pending payload against the live aggregate.** Preflight fail-closed: a capture that would exceed the immutable worker-lifetime anchor grant is skipped, never partially taken.
 - The budget is aggregate across all slots, not `N × a per-slot constant`. `K_effective = min(4, floor(aggregate_budget / (N × anchor_bytes(model))))` is committed-depth capacity. The separate `simultaneous_pending_capacity_slots = floor((aggregate_budget - N × K_effective × anchor_bytes) / anchor_bytes)` makes concurrent pending availability explicit. If that value is below N, later simultaneous captures may skip fail-closed even though every slot can retain K committed anchors. Both values, N, aggregate owned bytes, peak bytes, skips, and the immutable grant are production telemetry; no N=16 receipt may claim full depth or full pending concurrency without those gauges proving it.
+- Rev 97 makes “aggregate” literal for every supported generative family.
+  Family-native prospective-byte functions must match the payload that would
+  be captured, and admission runs before snapshot allocation/copy. Payloads
+  temporarily owned outside `AnchorStore` during a bounded or rectangular
+  transaction remain charged to the same immutable worker ledger, including
+  extracted lanes. Replacing one transient boundary releases only that
+  boundary's charge before admitting its successor. Park/reactivate may
+  rebuild controls and sessions, but it may not discover a new grant.
 - Per-model anchor cost (computed from allocation code, never doc comments):
 
   | Model | recurrent+conv state | ≈ total w/ logits+tokens+hidden | K=4 × 4 slots | K=4 × 8 slots | K=4 × 16 slots |

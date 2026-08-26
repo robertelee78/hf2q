@@ -640,6 +640,48 @@ impl Deepseek4Cache {
 
     /// Capture exact prompt-boundary rollback state before generation mutates
     /// the circular window and recurrent compressor state.
+    pub fn prospective_snapshot_owned_bytes(&self) -> Result<u64, CacheError> {
+        if self.poisoned {
+            return Err(CacheError::Poisoned);
+        }
+        let mut resident_bytes = 0_u64;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let layer_bytes = std::iter::once(&layer.window_kv)
+                .chain(layer.main_kv_state.iter())
+                .chain(layer.main_score_state.iter())
+                .chain(layer.indexer_kv_state.iter())
+                .chain(layer.indexer_score_state.iter())
+                .try_fold(0_u64, |total, buffer| {
+                    u64::try_from(buffer.data_byte_len())
+                        .ok()
+                        .and_then(|bytes| total.checked_add(bytes))
+                })
+                .ok_or(CacheError::ByteOverflow {
+                    layer: layer_index,
+                    kind: CacheKind::WindowKv,
+                })?;
+            resident_bytes =
+                resident_bytes
+                    .checked_add(layer_bytes)
+                    .ok_or(CacheError::ByteOverflow {
+                        layer: layer_index,
+                        kind: CacheKind::WindowKv,
+                    })?;
+        }
+        resident_bytes
+            .checked_add(
+                (self.layers.len() as u64)
+                    .saturating_mul(std::mem::size_of::<LayerCacheSnapshot>() as u64),
+            )
+            .and_then(|bytes| bytes.checked_add(cache_plan_control_bytes(&self.plan)))
+            .ok_or(CacheError::ByteOverflow {
+                layer: self.layers.len().saturating_sub(1),
+                kind: CacheKind::WindowKv,
+            })
+    }
+
+    /// Capture exact prompt-boundary rollback state before generation mutates
+    /// the circular window and recurrent compressor state.
     pub fn snapshot(&self) -> Result<Deepseek4CacheSnapshot, CacheError> {
         if self.poisoned {
             return Err(CacheError::Poisoned);

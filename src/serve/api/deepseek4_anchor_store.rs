@@ -135,6 +135,18 @@ impl Deepseek4AnchorBudget {
         )
     }
 
+    pub(super) fn preflight_capture(
+        &self,
+        store: &Deepseek4AnchorStore,
+        anchor_bytes: u64,
+    ) -> StagePending {
+        store.preflight_stage_pending(
+            anchor_bytes,
+            self.effective_depth(anchor_bytes),
+            self.slot_budget(store.owned_bytes()),
+        )
+    }
+
     fn replace_store_charge(&self, before: u64, after: u64) -> Result<u64> {
         let aggregate_before = self.owned_bytes();
         ensure!(
@@ -202,6 +214,42 @@ pub(super) fn stage_pending(
         "DeepSeek-V4 slot-local boundary capture aggregate-budget preflight"
     );
     Ok(outcome)
+}
+
+pub(super) fn record_preflight_budget_skip(
+    store: &Deepseek4AnchorStore,
+    budget: &Deepseek4AnchorBudget,
+    anchor_bytes: u64,
+    outcome: StagePending,
+    capture_source: &'static str,
+) {
+    debug_assert!(matches!(
+        outcome,
+        StagePending::NoCommittedCapacity | StagePending::BudgetExceeded { .. }
+    ));
+    let effective_depth = budget.effective_depth(anchor_bytes);
+    let pending_capacity = budget.pending_capacity(anchor_bytes, effective_depth);
+    TELEMETRY
+        .capture_budget_skips_total
+        .fetch_add(1, Ordering::Relaxed);
+    TELEMETRY
+        .effective_committed_depth
+        .store(effective_depth as u64, Ordering::Relaxed);
+    TELEMETRY
+        .simultaneous_pending_capacity_slots
+        .store(pending_capacity as u64, Ordering::Relaxed);
+    tracing::info!(
+        target: "hf2q::serve::api::deepseek4_anchor",
+        anchor_bytes,
+        aggregate_owned_bytes = budget.owned_bytes(),
+        aggregate_budget_bytes = budget.aggregate_budget_bytes(),
+        slot_owned_bytes = store.owned_bytes(),
+        effective_committed_depth = effective_depth,
+        simultaneous_pending_capacity_slots = pending_capacity,
+        outcome = ?outcome,
+        capture_source,
+        "DeepSeek-V4 optional anchor capture skipped before payload allocation"
+    );
 }
 
 pub(super) fn publish_pending(

@@ -209,6 +209,19 @@ pub(crate) enum StagePending {
     },
 }
 
+pub(crate) fn capture_if_anchor_admitted<T>(
+    admission: StagePending,
+    capture: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    match admission {
+        StagePending::Staged => capture().map(Some),
+        StagePending::NoCommittedCapacity | StagePending::BudgetExceeded { .. } => Ok(None),
+        StagePending::PendingOccupied => {
+            anyhow::bail!("anchor capture preflight found an occupied pending payload")
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Publication {
     pub evicted: usize,
@@ -330,9 +343,9 @@ impl<A: AnchorEntry> AnchorStore<A> {
 
     /// Capture is request-local until terminal cache+ledger success. The
     /// budget is checked against committed K plus this one pending payload.
-    pub(crate) fn stage_pending(
-        &mut self,
-        mut anchor: A,
+    pub(crate) fn preflight_stage_pending(
+        &self,
+        anchor_owned_bytes: u64,
         max_committed: usize,
         byte_budget: u64,
     ) -> StagePending {
@@ -345,13 +358,31 @@ impl<A: AnchorEntry> AnchorStore<A> {
         if max_committed > self.committed.capacity() {
             return StagePending::NoCommittedCapacity;
         }
-        let needed_bytes = self.owned_bytes.saturating_add(anchor.owned_bytes());
+        let needed_bytes = self.owned_bytes.saturating_add(anchor_owned_bytes);
         if needed_bytes > byte_budget {
             return StagePending::BudgetExceeded {
                 needed_bytes,
                 budget_bytes: byte_budget,
             };
         }
+        StagePending::Staged
+    }
+
+    /// Capture is request-local until terminal cache+ledger success. The
+    /// budget is checked against committed K plus this one pending payload.
+    pub(crate) fn stage_pending(
+        &mut self,
+        mut anchor: A,
+        max_committed: usize,
+        byte_budget: u64,
+    ) -> StagePending {
+        let anchor_owned_bytes = anchor.owned_bytes();
+        let admission =
+            self.preflight_stage_pending(anchor_owned_bytes, max_committed, byte_budget);
+        if admission != StagePending::Staged {
+            return admission;
+        }
+        let needed_bytes = self.owned_bytes.saturating_add(anchor_owned_bytes);
         anchor.set_lineage_epoch(self.lineage_epoch);
         self.owned_bytes = needed_bytes;
         self.peak_owned_bytes = self.peak_owned_bytes.max(needed_bytes);
@@ -628,9 +659,9 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::{
-        consume_one_shot_restore_failure, emit_anchor_restore_event, AnchorDivergence, AnchorEntry,
-        AnchorPublicationDisposition, AnchorRestoreEvent, AnchorRestoreOutcome, AnchorStore,
-        StagePending,
+        capture_if_anchor_admitted, consume_one_shot_restore_failure, emit_anchor_restore_event,
+        AnchorDivergence, AnchorEntry, AnchorPublicationDisposition, AnchorRestoreEvent,
+        AnchorRestoreOutcome, AnchorStore, StagePending,
     };
 
     #[derive(Clone)]
@@ -684,6 +715,51 @@ mod tests {
             StagePending::Staged
         );
         store.publish_pending(4).expect("publish");
+    }
+
+    #[test]
+    fn pending_preflight_matches_stage_without_mutating_the_store() {
+        let mut store = AnchorStore::<FakeAnchor>::with_committed_capacity(4);
+        let owned_before = store.owned_bytes();
+
+        assert_eq!(
+            store.preflight_stage_pending(10, 4, owned_before + 9),
+            StagePending::BudgetExceeded {
+                needed_bytes: owned_before + 10,
+                budget_bytes: owned_before + 9,
+            }
+        );
+        assert_eq!(store.owned_bytes(), owned_before);
+        assert!(!store.has_pending());
+
+        assert_eq!(
+            store.preflight_stage_pending(10, 4, owned_before + 10),
+            StagePending::Staged
+        );
+        assert_eq!(store.owned_bytes(), owned_before);
+        assert!(!store.has_pending());
+        assert_eq!(
+            store.stage_pending(FakeAnchor::new(&[1], 10), 4, owned_before + 10),
+            StagePending::Staged
+        );
+    }
+
+    #[test]
+    fn optional_capture_never_calls_the_copy_after_a_capacity_rejection() {
+        let mut called = false;
+        let captured = capture_if_anchor_admitted::<u64>(
+            StagePending::NoCommittedCapacity,
+            || {
+                called = true;
+                Ok(99)
+            },
+        )
+        .unwrap();
+        assert_eq!(captured, None);
+        assert!(!called, "capacity rejection must happen before payload copying");
+
+        assert!(capture_if_anchor_admitted::<u64>(StagePending::PendingOccupied, || Ok(99))
+            .is_err());
     }
 
     #[test]
