@@ -16,13 +16,18 @@
   now checked in and model-free green, while their real-artifact cells remain
   open)
 - Date: 2026-08-22
-- Updated: 2026-08-25 (rev 75, exact five-format physical matrix and universal
+- Updated: 2026-08-25 (rev 77, exact five-format physical matrix and universal
   four-family swap green; universal SlotAware private-queue liveness is
   hardware-proven for Gemma's four-slot burst and the Gemma B.2 runner now
   rejects the full single-quoted continuation bug class;
   cross-family swap harness identity race and post-drain rehash falsified;
   canonical schema-v2 preflight, isolated-Cargo, and source-dominant
-  host-wired authorities are model-free green; exact-path mapped-artifact
+  host-wired authorities are model-free green; Gemma's canonical Stable-chat
+  aggregation route is now correctly classified as OPEN after two hardware
+  falsifiers rejected both tiny-cue batching and concat-shaped boundary
+  batching on coherence; a synchronized layer scan and exact binary row dump
+  now locate the first concat-shape divergence at layer zero's quantized output
+  projection; exact-path mapped-artifact
   classification is model-free green after falsifying a basename collision)
   — the Qwen implementation lineage begins at `95d618c8`, based on main
   `32181b61`: explicit per-slot AnchorStore,
@@ -552,9 +557,10 @@ already aggregates compatible installed lanes in
 `advance_gemma4_prefill_quantum` through
 `forward_prefill_batched_multi_seq{,_live}` under the canonical
 `HF2Q_CROSS_SLOT_ADMIT=1` launcher policy; ADR-040 records that shipment.
-Qwen MoE is the actual missing family. The deciding spike therefore measures
-Qwen's fixed-cost opportunity and revalidates Gemma's shipped policy rather
-than treating Gemma as unimplemented. The checked-in Qwen curve harness uses
+Qwen MoE was the first known missing family. The deciding spike therefore
+measures Qwen's fixed-cost opportunity and revalidates Gemma rather than
+assuming that source reachability proves coherent shipment. The checked-in
+Qwen curve harness uses
 cold, single-transaction HTTP requests at controlled row widths, exact
 binary/model/process/request/response/thermal/contention receipts, two warmups,
 an initial seven alternating sweeps, and a deterministic bootstrap fit of
@@ -563,9 +569,10 @@ with every other contract unchanged.
 Qwen opens implementation only when the lower 95% bound shows fixed-cost share
 above 50% at 128 rows and projected four-lane gain above 1.10×; it is falsified
 only when the upper bound is at most 25% or projected gain at most 1.05×.
-Intermediate evidence is inconclusive and triggers more measurement. Gemma's
-existing policy remains accepted only if direct OFF/ON order-balanced trials
-retain exact per-lane results and the lower 95% speedup bound exceeds 1.05×.
+Intermediate evidence is inconclusive and triggers more measurement. Gemma is
+OPEN until direct OFF/ON order-balanced trials retain exact per-lane results
+and the lower 95% speedup bound exceeds 1.05×; the former "existing policy"
+claim was withdrawn by the rev-76 canonical-route hardware falsifiers.
 The sequential curve harness cannot satisfy that distinct Gemma four-lane
 OFF/ON contract.
 
@@ -1755,6 +1762,61 @@ worker-lifetime conjunction—requested policy, hybrid scaffold, hybrid route,
 DFlash exclusion, effective enablement, and coalescing window—in one startup
 event. Its pure policy truth table is model-free; the event decides which
 capability operand, rather than admission timing, disabled the intended path.
+
+The startup event at `3b8feb62` then proved every frozen operand true:
+requested policy, hybrid scaffold, hybrid route, DFlash exclusion, effective
+enablement, and the 25 ms coalescing window. Source tracing found the actual
+route: ordinary Gemma chat is classified Stable with a measured 121-token
+boundary and seven-token cue. The Stable planner incorrectly applied the
+cold-prefill 32-row containment floor to that live cue and therefore forced
+the four prepared lanes through scalar admission.
+
+Two hardware falsifiers reject the obvious relaxation. First, an instrumented
+working tree based on `3b8feb62` compared the four-sequence live-resume cue
+against four scalar recurrent resumes at cue lengths 2, 3, 4, 5, 7, and 31.
+The five-token case selected different tokens in lanes zero and one, so tiny
+cue batching is not equality-preserving. Second, the reformulated split path
+batched only an eligible 32-row boundary extension and replayed each tiny cue
+through the proven recurrent path. Its four-slot Engine gate proved exact
+64-row reuse and one ON route event per wave, but the first post-cue logit row
+already differed from scalar by max absolute 1.9777224 and RMS 0.3709889; a
+16-token greedy continuation then diverged in text. Disabling the tiled-live
+attention branch did not restore distribution equality (max absolute
+3.0703387, RMS 0.6399542), even though that particular 16-token greedy sample
+remained token-equal. Both candidates are rejected: same first token or short
+greedy text cannot substitute for coherent logits under sampling, grammar, or
+tool constraints.
+
+The next synchronized spike, on the same artifact and `3b8feb62` working-tree
+lineage, compared two scalar 32-row forwards with one two-lane concat forward.
+The gated `iter_g_a_bisect_offset` test passed one qualified invocation. Its
+per-layer scan used `HF2Q_SYNC_PER_LAYER=1`; unlike the earlier unsynchronized
+host checksum, it proved both lanes exact at the layer-zero input and different
+at the layer-one input. Four separate layer-zero binary row captures then
+proved, with `cmp`, that the pre-layer hidden row, input norm, raw Q/K/V,
+normalized Q/K/V, and SDPA output were byte-identical for each scalar/multi
+pair. The first unequal stage in both lanes was `attn_out`, immediately after
+the quantized output projection. Residual, router, and MLP stages inherited the
+drift while expert IDs remained equal. This falsifies attention, cache
+addressing, embeddings, and Q/K/V projection as the first cause for this
+32-by-2 cold shape. It identifies the concat-width output projection as the
+first changed operator. The investigation-only arm selector and rejected
+runtime candidates were removed from the landing diff after the measurement.
+
+The deciding Gemma hypothesis is now an equality-preserving rectangular
+operator, not concatenation through `forward_prefill_batched_multi_seq_live`.
+It must retain each scalar 32-row operator identity while adding a physical
+lane axis and explicit slot/KV mapping. The first implementation spike is a
+shared-weight native quantized matmul with physical `[B,M,K]` activations and
+`[B,M,N]` output, weight batch one, and the scalar `M` route/tile unchanged for
+every lane. Its per-lane outputs and selected route must be byte-identical to
+canonical scalar calls before Gemma may consume it. Attention then uses an
+explicit lane batch and selected-slot cache mapping; expert work remains
+lane-local until an exact grouped implementation is independently proven.
+Only the smallest native rectangular slice that produces exact final logits,
+full hybrid-cache bytes, one-token continuation, and multi-token unary/SSE/tool
+parity proceeds to performance measurement. A failed exact gate removes the
+candidate; no tolerance or greedy-only exception can accept it.
 
 **Lane B gates:** B.0 byte-identity (cohort+concurrent-decode); cooperative receipt regime (≥5 alternating serial/cooperative pairs, sustained median faster, peak RSS recorded, independent receipt verification); thermal contract (Nominal start, continuous Fair-or-better, no gap >5 s, fail-closed); memory H3 (≤116 GiB peak beside the 100 GiB artifact); product ceilings unchanged (60 s cold / 15 s cached-automatic-SSE / 35 s tool-result — never widened); B4 decode-cohort gate re-pass; the two B.1 latency contracts.
 
