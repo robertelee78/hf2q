@@ -87,7 +87,13 @@ jq -e '
     kv_cache_budget_bytes:51539607552}
   and .environment.power == "ac"
   and .environment.thermal == "nominal-settle-and-fair-or-better-measurement"
-  and .environment.host_contention == "quiet"
+  and .environment.host_contention.policy == "process-group-cpu-v2"
+  and .environment.host_contention.maximum_foreign_cpu_percent == 100
+  and .environment.host_contention.owner_scope == "release-gate-process-group"
+  and (.environment.host_contention.owner_pgid | numbers) > 0
+  and .environment.host_contention.owner_pgid
+    == (.environment.host_contention.owner_pgid | floor)
+  and .environment.host_contention.continuous == true
   and .environment.clean_process_environment == true
   and .environment.serve_kv_persist == false
   and .thresholds == {min_mixed_speedup:1.01,min_semantic_events:3,
@@ -105,6 +111,8 @@ model_bytes=$(jq -er .model.bytes "$receipt")
 model_snapshot=$(jq -er .model.snapshot "$receipt")
 model_shape=$(jq -er .model.shape "$receipt")
 power_mode=$(jq -er .environment.power_mode "$receipt")
+host_contention_owner_pgid=$(jq -er \
+  '.environment.host_contention.owner_pgid' "$receipt")
 [[ -x "$binary" && ! -L "$binary" \
   && "$(shasum -a 256 "$binary" | awk '{print $1}')" == "$binary_sha" \
   && -f "$model" && ! -L "$model" \
@@ -171,6 +179,12 @@ for label in off-a on-a on-b off-b; do
     || fail "$label contention-measurement"
   host_contention_validate_thermal_alignment "$process/thermal-measurement.tsv" \
     "$process/contention-measurement.tsv" || fail "$label host-alignment"
+  for contention_log in contention-settle.tsv contention-measurement.tsv; do
+    awk -F '\t' -v owner="$host_contention_owner_pgid" '
+      NF != 6 || $4 != owner { bad++ }
+      END { exit !(NR > 0 && bad == 0) }
+    ' "$process/$contention_log" || fail "$label $contention_log owner binding"
+  done
   qwen35_mixed_validate_power_log "$power_mode" "$label" <"$process/power.tsv" \
     || fail "$label power"
   actual_model=$(jq -er '[.data[] | select(.loaded == true)]

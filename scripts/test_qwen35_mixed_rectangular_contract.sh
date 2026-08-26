@@ -87,11 +87,37 @@ rg -q '^readonly MAX_PREFILL_TAIL_MS=60000$' "$runner"
 [[ "$(rg -c 'run_qwen35_agentic_lifecycle_cell[.]sh' "$matrix")" == 2 ]]
 rg -q 'MODEL_SHAPE=qwen38-dense' "$matrix"
 rg -q 'MODEL_SHAPE=qwen36-moe' "$matrix"
-rg -q 'Qwen mixed rectangular receipt mutations: 11/11 REJECTED' "$mutation"
+rg -q 'Qwen mixed rectangular receipt mutations: 16/16 REJECTED' "$mutation"
+rg -q 'HF2Q_QWEN_MIXED_GATE_ISOLATED=1' "$runner"
+rg -q 'host_contention_require_isolated_gate_owner' "$runner"
+rg -q 'HOST_CONTENTION_GATE_OWNER_PID' "$runner"
+rg -q 'owner_scope == "release-gate-process-group"' \
+  "$script_dir/verify_qwen35_mixed_rectangular_receipt.sh"
+rg -q 'contention_log owner binding' \
+  "$script_dir/verify_qwen35_mixed_rectangular_receipt.sh"
 rg -q 'observed_source=[$][(]resolve_live_power_source[)]' "$runner"
 if rg -Fq 'pmset -g batt | rg -q' "$runner"; then
   echo "mixed Qwen runner retains the early-match AC probe" >&2
   exit 1
 fi
+
+if env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+  HF2Q_QWEN_MIXED_GATE_ISOLATED=1 \
+  bash "$runner" >"$tmp/inherited-group.log" 2>&1; then
+  echo "mixed Qwen runner accepted a forced inherited process group" >&2
+  exit 1
+fi
+rg -q 'calibrated leaf does not own an isolated process group' \
+  "$tmp/inherited-group.log"
+if rg -q 'MODEL_PATH is required' "$tmp/inherited-group.log"; then
+  echo "mixed Qwen runner reached model admission before ownership" >&2
+  exit 1
+fi
+if env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+  bash "$runner" >"$tmp/missing-env.log" 2>&1; then
+  echo "mixed Qwen runner accepted a missing exact model contract" >&2
+  exit 1
+fi
+rg -q 'MODEL_PATH is required' "$tmp/missing-env.log"
 
 echo "Qwen mixed rectangular model-free contract: PASS"

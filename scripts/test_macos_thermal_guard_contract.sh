@@ -825,4 +825,33 @@ if bash "$ROOT_DIR/scripts/verify_macos_thermal_receipt.sh" 1 \
   exit 1
 fi
 
+# Both calibrated helper loops must forward the exact owned server PID while
+# retaining the stable release-gate owner. A same-group peer name is rejected
+# unless that final argument reaches host_contention_sample.
+contention_snapshot='100\t100\t0.0\tbash
+101\t100\t95.0\tllama-server'
+host_contention_process_snapshot() {
+  printf '%b\n' "$contention_snapshot"
+}
+thermal_read_state() { THERMAL_STATE=nominal; }
+thermal_wait_for_nominal "$tmp_dir/owned-server-settle-thermal.log" \
+  owned-server-settle 0 1 0 "$tmp_dir/owned-server-settle-host.log" 100 101
+test "$(awk -F '\t' 'NR == 1 { print $4 }' \
+  "$tmp_dir/owned-server-settle-host.log")" = 100
+
+monitor_state_reads=0
+thermal_read_process_state() {
+  if ((monitor_state_reads == 0)); then
+    THERMAL_PROCESS_STATE=R
+  else
+    THERMAL_PROCESS_STATE=""
+  fi
+  monitor_state_reads=$((monitor_state_reads + 1))
+}
+thermal_monitor_fair_or_better_while_pid \
+  "$tmp_dir/owned-server-measurement-thermal.log" owned-server-measurement \
+  999 0 "$tmp_dir/owned-server-measurement-host.log" 100 101
+test "$(awk -F '\t' 'NR == 1 { print $4 }' \
+  "$tmp_dir/owned-server-measurement-host.log")" = 100
+
 echo "macOS thermal guard contract: pass"

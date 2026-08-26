@@ -360,6 +360,7 @@ thermal_wait_for_nominal() {
   local sample_seconds=$5
   local contention_log=${6:-}
   local contention_owner_pid=${7:-}
+  local contention_owned_server_pid=${8:-}
   local deadline
   local nominal_since
 
@@ -383,7 +384,8 @@ thermal_wait_for_nominal() {
     thermal_sample "$log_file" "$phase" || return 1
     if [[ -n "$contention_log" ]]; then
       host_contention_sample "$contention_log" "$phase" \
-        "$contention_owner_pid" "$THERMAL_SAMPLED_AT" || return 1
+        "$contention_owner_pid" "$THERMAL_SAMPLED_AT" \
+        "$contention_owned_server_pid" || return 1
     else
       HOST_CONTENTION_STATE=quiet
     fi
@@ -497,6 +499,7 @@ thermal_monitor_fair_or_better_while_pid() {
   local sample_seconds=$4
   local contention_log=${5:-}
   local contention_owner_pid=${6:-}
+  local contention_owned_server_pid=${7:-}
 
   [[ "$producer_pid" =~ ^[1-9][0-9]*$ ]] || {
     echo "thermal producer pid must be a positive integer" >&2
@@ -515,7 +518,8 @@ thermal_monitor_fair_or_better_while_pid() {
     if [[ -n "$contention_log" ]]; then
       [[ -n "$contention_owner_pid" ]] || return 2
       host_contention_sample "$contention_log" "$phase" \
-        "$contention_owner_pid" "$THERMAL_SAMPLED_AT" || return 1
+        "$contention_owner_pid" "$THERMAL_SAMPLED_AT" \
+        "$contention_owned_server_pid" || return 1
       host_contention_require_quiet "$phase" || return 1
     fi
     case "$THERMAL_STATE" in

@@ -110,7 +110,13 @@ jq -e '
   and .workload.kv_cache_budget_bytes == 51539607552
   and .environment.power == "ac"
   and .environment.thermal == "nominal-settle-and-fair-or-better-measurement"
-  and .environment.host_contention == "quiet"
+  and .environment.host_contention.policy == "process-group-cpu-v2"
+  and .environment.host_contention.maximum_foreign_cpu_percent == 100
+  and .environment.host_contention.owner_scope == "release-gate-process-group"
+  and (.environment.host_contention.owner_pgid | numbers) > 0
+  and .environment.host_contention.owner_pgid
+    == (.environment.host_contention.owner_pgid | floor)
+  and .environment.host_contention.continuous == true
   and .environment.clean_process_environment == true
   and .environment.serve_kv_persist == false
   and .thresholds == {min_wave_speedup:1.01,max_single_overhead_ms:50}
@@ -125,6 +131,8 @@ model_sha=$(jq -er '.model.sha256' "$receipt")
 model_bytes=$(jq -er '.model.bytes' "$receipt")
 model_shape=$(jq -er '.model.shape' "$receipt")
 power_mode=$(jq -er '.environment.power_mode' "$receipt")
+host_contention_owner_pgid=$(jq -er \
+    '.environment.host_contention.owner_pgid' "$receipt")
 [[ -x "$binary" && ! -L "$binary" \
     && "$(shasum -a 256 "$binary" | awk '{print $1}')" == "$binary_sha" \
     && -f "$model_path" && ! -L "$model_path" \
@@ -243,6 +251,13 @@ for label in off-a on-a on-b off-b; do
         "$process_dir/thermal-measurement.tsv" \
         "$process_dir/contention-measurement.tsv" \
         || fail "$label thermal/contention alignment"
+    for contention_log in contention-settle.tsv contention-measurement.tsv; do
+        awk -F '\t' -v owner="$host_contention_owner_pgid" '
+          NF != 6 || $4 != owner { bad++ }
+          END { exit !(NR > 0 && bad == 0) }
+        ' "$process_dir/$contention_log" \
+            || fail "$label $contention_log owner binding"
+    done
     validate_qwen35_rectangular_power_log "$power_mode" "$label" \
         <"$process_dir/power.tsv" || fail "$label AC/power continuity"
     actual_arch=$(jq -er '

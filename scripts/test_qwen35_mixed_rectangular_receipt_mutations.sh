@@ -39,7 +39,8 @@ rebind_process() {
   ' "$process/evidence.sha256"
   manifest_sha=$(shasum -a 256 "$process/evidence.sha256" | awk '{print $1}')
   filter="($summary_filter) | .evidence.manifest_sha256 = \$manifest"
-  jq --arg manifest "$manifest_sha" "$filter" "$process/summary.json" \
+  jq --arg manifest "$manifest_sha" --arg raw "$raw_sha" \
+    "$filter" "$process/summary.json" \
     >"$process/summary.json.tmp"
   mv "$process/summary.json.tmp" "$process/summary.json"
   summary_sha=$(shasum -a 256 "$process/summary.json" | awk '{print $1}')
@@ -56,6 +57,29 @@ mutate_receipt_and_reject widened-gap '.thresholds.max_semantic_gap_ms = 999999'
 mutate_receipt_and_reject false-canonical '.equality.canonical_sha256 = ("f" * 64)'
 mutate_receipt_and_reject summary-hash \
   '.evidence.processes["on-a"].summary_sha256 = ("0" * 64)'
+mutate_receipt_and_reject contention-policy \
+  '.environment.host_contention.policy = "process-group-cpu-v1"'
+mutate_receipt_and_reject contention-threshold \
+  '.environment.host_contention.maximum_foreign_cpu_percent = 999'
+mutate_receipt_and_reject contention-owner \
+  '.environment.host_contention.owner_pgid += 1'
+mutate_receipt_and_reject contention-continuous \
+  '.environment.host_contention.continuous = false'
+
+owner_copy="$tmp/rebound-contention-owner"
+cp -R "$root" "$owner_copy"
+awk -F '\t' 'BEGIN { OFS = "\t" } NR == 2 { $4 += 1 } { print }' \
+  "$owner_copy/on-a/contention-measurement.tsv" \
+  >"$owner_copy/on-a/contention-measurement.tsv.tmp"
+mv "$owner_copy/on-a/contention-measurement.tsv.tmp" \
+  "$owner_copy/on-a/contention-measurement.tsv"
+# shellcheck disable=SC2016
+rebind_process "$owner_copy" on-a contention-measurement.tsv \
+  '.evidence.contention_measurement_sha256 = $raw'
+if verify "$owner_copy/receipt.json" >/dev/null 2>&1; then
+  echo "mixed verifier trusted a rebound raw contention owner" >&2
+  exit 1
+fi
 
 raw_copy="$tmp/raw-sse"
 cp -R "$root" "$raw_copy"
@@ -129,4 +153,4 @@ if verify "$publication_copy/receipt.json" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Qwen mixed rectangular receipt mutations: 11/11 REJECTED"
+echo "Qwen mixed rectangular receipt mutations: 16/16 REJECTED"

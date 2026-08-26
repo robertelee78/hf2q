@@ -8,8 +8,15 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(cd "$script_dir/.." && pwd)
+if [[ ${HF2Q_QWEN_RECTANGULAR_POLICY_GATE_ISOLATED:-0} != 1 ]]; then
+    exec "$script_dir/run_release_gate_process_group.sh" env \
+        HF2Q_QWEN_RECTANGULAR_POLICY_GATE_ISOLATED=1 "$0" "$@"
+fi
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$script_dir/macos_thermal_guard.sh"
+readonly HOST_CONTENTION_GATE_OWNER_PID=$$
+host_contention_require_isolated_gate_owner \
+    "$HOST_CONTENTION_GATE_OWNER_PID"
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 # shellcheck source=scripts/qwen38_matched_reference_contract.sh
@@ -604,11 +611,13 @@ run_process() {
     record_power_contract "$engine_dir/power.tsv" "$label-loaded-warm"
     thermal_wait_for_nominal "$engine_dir/thermal-settle.tsv" "$label-settle" \
         "$THERMAL_SETTLE_SECONDS" "$THERMAL_SETTLE_TIMEOUT_SECONDS" \
-        "$THERMAL_SAMPLE_SECONDS" "$engine_dir/contention-settle.tsv" "$server_pid"
+        "$THERMAL_SAMPLE_SECONDS" "$engine_dir/contention-settle.tsv" \
+        "$HOST_CONTENTION_GATE_OWNER_PID" "$server_pid"
     record_power_contract "$engine_dir/power.tsv" "$label-measurement-start"
     thermal_sample "$engine_dir/thermal-measurement.tsv" "$label-measurement-start"
     host_contention_sample "$engine_dir/contention-measurement.tsv" \
-        "$label-measurement-start" "$server_pid" "$THERMAL_SAMPLED_AT"
+        "$label-measurement-start" "$HOST_CONTENTION_GATE_OWNER_PID" \
+        "$THERMAL_SAMPLED_AT" "$server_pid"
     host_contention_require_quiet "$label-measurement-start"
     (
         run_measurements "$label" "$arm" "$model_id" "$engine_dir"
@@ -619,14 +628,16 @@ run_process() {
     thermal_monitor_fair_or_better_while_pid \
         "$engine_dir/thermal-measurement.tsv" "$label-measurement" \
         "$producer_pid" "$THERMAL_SAMPLE_SECONDS" \
-        "$engine_dir/contention-measurement.tsv" "$server_pid" \
+        "$engine_dir/contention-measurement.tsv" \
+        "$HOST_CONTENTION_GATE_OWNER_PID" "$server_pid" \
         || monitor_status=$?
     wait "$producer_pid" || producer_status=$?
     wait "$rss_monitor_pid"
     ((producer_status == 0 && monitor_status == 0)) || return 1
     thermal_sample "$engine_dir/thermal-measurement.tsv" "$label-measurement-end"
     host_contention_sample "$engine_dir/contention-measurement.tsv" \
-        "$label-measurement-end" "$server_pid" "$THERMAL_SAMPLED_AT"
+        "$label-measurement-end" "$HOST_CONTENTION_GATE_OWNER_PID" \
+        "$THERMAL_SAMPLED_AT" "$server_pid"
     host_contention_require_quiet "$label-measurement-end"
     record_power_contract "$engine_dir/power.tsv" "$label-measurement-end"
     thermal_validate_settle_log "$engine_dir/thermal-settle.tsv" \
@@ -820,6 +831,10 @@ jq -n --arg source_commit "$source_commit" --arg binary "$HF2Q_BIN" \
     --arg model_path "$MODEL_PATH" --arg model_sha256 "$MODEL_SHA256" \
     --arg model_snapshot "$model_snapshot" --argjson model_bytes "$MODEL_BYTES" \
     --arg semantic_sha256 "$on_semantic_sha" --arg power_mode "$power_mode" \
+    --arg host_contention_policy "$HOST_CONTENTION_POLICY" \
+    --argjson host_contention_max_foreign_cpu_percent \
+        "$HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT" \
+    --argjson host_contention_owner_pgid "$HOST_CONTENTION_OWNER_PGID" \
     --argjson trials_per_process "$TRIALS" --argjson max_tokens "$MAX_TOKENS" \
     --argjson coalesce_us "$COALESCE_US" \
     --argjson min_wave_speedup "$MIN_WAVE_SPEEDUP" \
@@ -857,7 +872,11 @@ jq -n --arg source_commit "$source_commit" --arg binary "$HF2Q_BIN" \
         kv_cache_budget_bytes:51539607552},
       environment:{power:"ac",power_mode:$power_mode,
         thermal:"nominal-settle-and-fair-or-better-measurement",
-        host_contention:"quiet",clean_process_environment:true,
+        host_contention:{policy:$host_contention_policy,
+          maximum_foreign_cpu_percent:$host_contention_max_foreign_cpu_percent,
+          owner_scope:"release-gate-process-group",
+          owner_pgid:$host_contention_owner_pgid,continuous:true},
+        clean_process_environment:true,
         serve_kv_persist:false},
       equality:{semantic_and_token_sha256:$semantic_sha256},
       evidence:{processes:{

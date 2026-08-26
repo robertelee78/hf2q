@@ -118,6 +118,12 @@ require_text 'thermal_monitor_fair_or_better_while_pid' \
     'continuous thermal monitoring is absent'
 require_text 'host_contention_validate_measurement_log' \
     'host contention measurement is not validated'
+require_text 'HF2Q_QWEN_RECTANGULAR_POLICY_GATE_ISOLATED=1' \
+    'runner does not self-reexec through the isolated gate supervisor'
+require_text 'host_contention_require_isolated_gate_owner' \
+    'runner does not prove dedicated process-group ownership'
+require_text 'HOST_CONTENTION_GATE_OWNER_PID' \
+    'runner does not use one stable contention owner'
 require_text 'qwen36_bind_server_process' 'runtime PID/binary/model binding is absent'
 require_text 'qwen36_reject_fatal_log' 'fatal server logs are not rejected'
 # shellcheck disable=SC2016
@@ -201,12 +207,30 @@ grep -Fq 'raw/summary derivation' "$verifier" \
     || fail "verifier trusts process timing summaries"
 grep -Fq 'canonical semantic equality' "$verifier" \
     || fail "verifier does not recompute canonical equality"
-grep -Fq '8/8 REJECTED' "$mutation_test" \
+grep -Fq '13/13 REJECTED' "$mutation_test" \
     || fail "mutation battery cardinality drifted"
+grep -Fq 'owner_scope == "release-gate-process-group"' "$verifier" \
+    || fail "verifier does not bind the release-gate owner scope"
+grep -Fq 'contention_log owner binding' "$verifier" \
+    || fail "verifier does not join raw contention rows to the owner"
 
-missing_env_log=$(mktemp "${TMPDIR:-/var/tmp}/qwen-rectangular-contract.XXXXXX")
-trap 'rm -f "$missing_env_log"' EXIT
-if bash "$runner" >"$missing_env_log" 2>&1; then
+contract_tmp=$(mktemp -d "${TMPDIR:-/var/tmp}/qwen-rectangular-contract.XXXXXX")
+trap 'rm -rf "$contract_tmp"' EXIT
+inherited_group_log="$contract_tmp/inherited-group.log"
+if env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    HF2Q_QWEN_RECTANGULAR_POLICY_GATE_ISOLATED=1 \
+    bash "$runner" >"$inherited_group_log" 2>&1; then
+    fail "forced isolation sentinel accepted an inherited process group"
+fi
+grep -Fq 'calibrated leaf does not own an isolated process group' \
+    "$inherited_group_log" \
+    || fail "forced isolation sentinel did not fail at process-group ownership"
+! grep -Fq 'MODEL_PATH is required' "$inherited_group_log" \
+    || fail "forced isolation sentinel reached model admission before ownership"
+
+missing_env_log="$contract_tmp/missing-env.log"
+if env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    bash "$runner" >"$missing_env_log" 2>&1; then
     fail "runner accepted a missing exact model contract"
 fi
 grep -Fq 'MODEL_PATH is required' "$missing_env_log" \

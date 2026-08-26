@@ -37,6 +37,49 @@ mutate_json_and_reject summary-hash \
     '.evidence.processes["on-a"].summary_sha256 = ("0" * 64)'
 mutate_json_and_reject semantic-hash \
     '.equality.semantic_and_token_sha256 = ("f" * 64)'
+mutate_json_and_reject contention-policy \
+    '.environment.host_contention.policy = "process-group-cpu-v1"'
+mutate_json_and_reject contention-threshold \
+    '.environment.host_contention.maximum_foreign_cpu_percent = 999'
+mutate_json_and_reject contention-owner \
+    '.environment.host_contention.owner_pgid += 1'
+mutate_json_and_reject contention-continuous \
+    '.environment.host_contention.continuous = false'
+
+owner_copy="$tmp_dir/rebound-contention-owner"
+cp -R "$evidence_root" "$owner_copy"
+awk -F '\t' 'BEGIN { OFS = "\t" } NR == 2 { $4 += 1 } { print }' \
+    "$owner_copy/on-a/contention-measurement.tsv" \
+    >"$owner_copy/on-a/contention-measurement.tsv.tmp"
+mv "$owner_copy/on-a/contention-measurement.tsv.tmp" \
+    "$owner_copy/on-a/contention-measurement.tsv"
+owner_raw_sha=$(shasum -a 256 \
+    "$owner_copy/on-a/contention-measurement.tsv" | awk '{print $1}')
+REBOUND_RAW_SHA="$owner_raw_sha" perl -i -pe '
+  if (/  contention-measurement[.]tsv$/) {
+    s/^[0-9a-f]{64}/$ENV{REBOUND_RAW_SHA}/;
+    $seen++;
+  }
+  END {die "contention measurement absent from manifest\n" unless $seen == 1}
+' "$owner_copy/on-a/evidence.sha256"
+owner_manifest_sha=$(shasum -a 256 "$owner_copy/on-a/evidence.sha256" \
+    | awk '{print $1}')
+jq --arg raw "$owner_raw_sha" --arg manifest "$owner_manifest_sha" '
+  .environment.contention_measurement_sha256 = $raw
+  | .evidence_manifest_sha256 = $manifest
+' "$owner_copy/on-a/summary.json" >"$owner_copy/on-a/summary.json.tmp"
+mv "$owner_copy/on-a/summary.json.tmp" "$owner_copy/on-a/summary.json"
+owner_summary_sha=$(shasum -a 256 "$owner_copy/on-a/summary.json" \
+    | awk '{print $1}')
+jq --arg manifest "$owner_manifest_sha" --arg summary "$owner_summary_sha" '
+  .evidence.processes["on-a"].manifest_sha256 = $manifest
+  | .evidence.processes["on-a"].summary_sha256 = $summary
+' "$owner_copy/receipt.json" >"$owner_copy/receipt.json.tmp"
+mv "$owner_copy/receipt.json.tmp" "$owner_copy/receipt.json"
+if verify "$owner_copy/receipt.json" >/dev/null 2>&1; then
+    echo "receipt verifier trusted a rebound raw contention owner" >&2
+    exit 1
+fi
 
 raw_copy="$tmp_dir/raw-response"
 cp -R "$evidence_root" "$raw_copy"
@@ -116,4 +159,4 @@ if verify "$metric_copy/receipt.json" >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "Qwen rectangular policy receipt mutations: 8/8 REJECTED"
+echo "Qwen rectangular policy receipt mutations: 13/13 REJECTED"
