@@ -1794,6 +1794,22 @@ impl MlxModelWeights {
         // end of the function knows whether to call stop_capture.
         let mut capture_active: bool = false;
 
+        // Validate an admitted live rectangle before the first transformer or
+        // KV mutation, then reuse its Copy shape at every layer. Legitimate
+        // unequal-width/start cohorts keep the existing aggregate route.
+        let rectangular_live_shape = if live_prefix_resume {
+            self.multi_seq_prefill.as_ref().map_or(Ok(None), |state| {
+                crate::inference::models::gemma4::rectangular_prefill::rectangular_prefill_shape_if_eligible(
+                    &state.seq_lens,
+                    &state.seq_offsets,
+                    &state.start_positions,
+                    &state.slot_ids,
+                )
+            })?
+        } else {
+            None
+        };
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Metal-1 — begin/end programmatic GPU capture around the
             // configured layer range (HF2Q_METAL_CAPTURE_LAYERS).
@@ -4665,19 +4681,37 @@ impl MlxModelWeights {
                         &[&pf_sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
                         &[&pf_attn_out],
                     );
-                    dispatch_qmatmul(
-                        &mut s,
-                        reg,
-                        dev,
-                        &pf_sdpa_out,
-                        &self.layers[layer_idx].attn.o_proj,
-                        &mut pf_attn_out,
-                        seq_len as u32,
-                        crate::quantize::imatrix::ImatrixHint::Layered {
-                            tag: "attn_output",
-                            layer: layer_idx,
-                        },
-                    )?;
+                    if let Some(shape) = rectangular_live_shape {
+                        crate::inference::models::gemma4::rectangular_prefill::dispatch_rectangular_qmatmul(
+                            &mut s,
+                            reg,
+                            dev,
+                            &pf_sdpa_out,
+                            &self.layers[layer_idx].attn.o_proj,
+                            &pf_attn_out,
+                            shape,
+                            nh * hd,
+                            hs,
+                            crate::quantize::imatrix::ImatrixHint::Layered {
+                                tag: "attn_output",
+                                layer: layer_idx,
+                            },
+                        )?;
+                    } else {
+                        dispatch_qmatmul(
+                            &mut s,
+                            reg,
+                            dev,
+                            &pf_sdpa_out,
+                            &self.layers[layer_idx].attn.o_proj,
+                            &mut pf_attn_out,
+                            seq_len as u32,
+                            crate::quantize::imatrix::ImatrixHint::Layered {
+                                tag: "attn_output",
+                                layer: layer_idx,
+                            },
+                        )?;
+                    }
                 } else {
                     crate::serve::forward_mlx_shared::dispatch_qmatmul_head_major_bf16(
                         &mut s,
