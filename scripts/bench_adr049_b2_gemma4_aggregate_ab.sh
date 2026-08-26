@@ -7,7 +7,9 @@ set -euo pipefail
 # width, long-history tool-call anchors. The timed follow-ups carry the exact
 # assistant tool call plus its matching tool result; two lanes are unary and
 # two are SSE. Raw requests, responses, timings, trace slices, and process logs
-# are sealed before the independent verifier computes any speedup.
+# are sealed before the independent verifier applies the route-specific policy:
+# eligible 128/192 rectangles must speed up, while 256 must remain scalar,
+# semantically exact, and non-inferior.
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -39,6 +41,8 @@ readonly THERMAL_SETTLE_SECONDS=60
 readonly THERMAL_SAMPLE_SECONDS=2
 readonly POWER_PROBE_ATTEMPTS=3
 readonly MIN_LOWER_95_SPEEDUP=1.05
+readonly MAX_STABLE_BOUNDARY_ROWS=192
+readonly MAX_FALLBACK_PRODUCT_REGRESSION=1.05
 readonly MAX_TARGET_ROW_DRIFT=4
 readonly TRACE_NAME='[PREFILL_TIMING] STABLE BATCHED 4 seqs x '
 readonly RUNTIME_PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -700,15 +704,15 @@ run_wave() {
         trace_elapsed=$(perl -ne 'print "$1\n" if /boundary rows in ([0-9]+(?:\.[0-9]+)?) ms count=/' "$trace")
         trace_batch_count=$(perl -ne 'print "$1\n" if /boundary rows in [0-9]+(?:\.[0-9]+)? ms count=([0-9]+)/' "$trace")
     fi
-    if [[ "$arm" == on ]]; then
+    if [[ "$arm" == on && "$target" -le "$MAX_STABLE_BOUNDARY_ROWS" ]]; then
         [[ "$event_count" == 1 && "$trace_requests" == 4 \
             && "$trace_rows" =~ ^[0-9]+$ && -n "$trace_elapsed" \
             && "$trace_batch_count" =~ ^[1-9][0-9]*$ ]] || {
             echo "pair $pair ON width $target did not prove exactly one B4 stable rectangle" >&2
             return 1
         }
-        ((trace_rows >= 32 && trace_rows <= 256)) || {
-            echo "pair $pair ON width $target emitted boundary width outside 32..256" >&2
+        ((trace_rows >= 32 && trace_rows <= MAX_STABLE_BOUNDARY_ROWS)) || {
+            echo "pair $pair ON width $target emitted boundary width outside 32..192" >&2
             return 1
         }
         awk -v elapsed="$trace_elapsed" 'BEGIN {exit !(elapsed > 0)}' || {
@@ -717,7 +721,7 @@ run_wave() {
         }
     else
         [[ "$event_count" == 0 ]] || {
-            echo "pair $pair OFF width $target emitted a stable rectangle" >&2
+            echo "pair $pair $arm width $target emitted a forbidden stable rectangle" >&2
             return 1
         }
     fi
@@ -939,6 +943,7 @@ jq -n --slurpfile processes "$process_bindings" \
     --arg launcher_path "$launcher" --arg launcher_sha "$launcher_sha256" \
     --arg power_mode "$power_mode" --arg power_mode_code "$power_mode_code" \
     --argjson min_lower_speedup "$MIN_LOWER_95_SPEEDUP" \
+    --argjson max_fallback_regression "$MAX_FALLBACK_PRODUCT_REGRESSION" \
     --arg model_verification_sha "$model_verification_sha256" \
     --arg samples_sha "$(sha256_file "$samples")" \
     --arg processes_sha "$(sha256_file "$process_bindings")" \
@@ -953,6 +958,8 @@ jq -n --slurpfile processes "$process_bindings" \
     --arg power_events_new_sha "$(sha256_file "$OUT_DIR/caffeinate.log.power-events.new")" '{
       schema_version:2,status:"measured",
       configuration:{pairs:8,width_targets:[128,192,256],lanes:4,
+        stable_rectangular_eligible_widths:[128,192],scalar_fallback_widths:[256],
+        maximum_stable_boundary_rows:192,
         pair_order:"off-on-even_on-off-odd",
         warmup_waves_per_process:2,measured_waves_per_process:3,
         prime_turns_per_wave:4,prime_history_words:1200,
@@ -967,10 +974,12 @@ jq -n --slurpfile processes "$process_bindings" \
           repetition_penalty:1,tool_choice:"auto",thinking:false},
         semantic_normalization:"generated-call-ids-only",
         wire_validation:"exact-envelope-single-choice-no-reasoning-logprobs-or-continuation-tools",
-        analysis:{statistic:"median paired OFF/ON wave speedup",
+        analysis:{statistic:"route-specific median paired OFF/ON product-wave ratio",
           order_stratified_bootstrap_samples:10000,bootstrap_seed:49004,
           lower_confidence_percentile:2.5,
-          minimum_lower_95_speedup_exclusive:$min_lower_speedup}},
+          minimum_eligible_lower_95_speedup_exclusive:$min_lower_speedup,
+          maximum_fallback_product_regression_exclusive:$max_fallback_regression,
+          minimum_fallback_lower_95_ratio_exclusive:(1 / $max_fallback_regression)}},
       identity:{source_root:$source_root,source_sha:$source_sha,source_dirty:false,
         binary_path:$binary_path,binary_sha256:$binary_sha,model_path:$model_path,
         model_sha256:$model_sha,model_bytes:$model_bytes,model_snapshot:$model_snapshot,

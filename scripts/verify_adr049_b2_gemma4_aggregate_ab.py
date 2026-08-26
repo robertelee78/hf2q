@@ -17,12 +17,17 @@ from typing import NoReturn
 SCHEMA = 2
 PAIRS = 8
 WIDTHS = [128, 192, 256]
+ELIGIBLE_WIDTHS = [128, 192]
+FALLBACK_WIDTHS = [256]
 LANES = 4
 PRIME_HISTORY_WORDS = 1200
 MIN_PRIME_AGGREGATE_TOKENS = 4097
 BOOTSTRAPS = 10_000
 BOOTSTRAP_SEED = 49_004
 MIN_LOWER_CI = 1.05
+MAX_STABLE_BOUNDARY_ROWS = 192
+MAX_FALLBACK_PRODUCT_REGRESSION = 1.05
+MIN_FALLBACK_LOWER_CI = 1 / MAX_FALLBACK_PRODUCT_REGRESSION
 TOOL_TURN_FIXED_TOKENS = 103
 PAYLOAD_WORD_TOKENS = 2
 MAX_TARGET_ROW_DRIFT = 4
@@ -274,7 +279,11 @@ def validate_power(path: Path, pair: int, arm: str, environment: dict) -> None:
 
 def expected_configuration() -> dict:
     return {
-        "pairs": PAIRS, "width_targets": WIDTHS, "lanes": LANES,
+        "pairs": PAIRS, "width_targets": WIDTHS,
+        "stable_rectangular_eligible_widths": ELIGIBLE_WIDTHS,
+        "scalar_fallback_widths": FALLBACK_WIDTHS,
+        "maximum_stable_boundary_rows": MAX_STABLE_BOUNDARY_ROWS,
+        "lanes": LANES,
         "pair_order": "off-on-even_on-off-odd", "warmup_waves_per_process": 2,
         "measured_waves_per_process": 3,
         "prime_turns_per_wave": 4, "prime_history_words": PRIME_HISTORY_WORDS,
@@ -293,11 +302,15 @@ def expected_configuration() -> dict:
                                  "thinking": False},
         "semantic_normalization": "generated-call-ids-only",
         "wire_validation": "exact-envelope-single-choice-no-reasoning-logprobs-or-continuation-tools",
-        "analysis": {"statistic": "median paired OFF/ON wave speedup",
+        "analysis": {"statistic": "route-specific median paired OFF/ON product-wave ratio",
                      "order_stratified_bootstrap_samples": BOOTSTRAPS,
                      "bootstrap_seed": BOOTSTRAP_SEED,
                      "lower_confidence_percentile": 2.5,
-                     "minimum_lower_95_speedup_exclusive": MIN_LOWER_CI},
+                     "minimum_eligible_lower_95_speedup_exclusive": MIN_LOWER_CI,
+                     "maximum_fallback_product_regression_exclusive":
+                         MAX_FALLBACK_PRODUCT_REGRESSION,
+                     "minimum_fallback_lower_95_ratio_exclusive":
+                         MIN_FALLBACK_LOWER_CI},
     }
 
 
@@ -699,7 +712,7 @@ def validate_samples(
                     for requests, boundary, elapsed, count
                     in TRACE_RE.findall(trace_path.read_text(encoding="utf-8"))
                 ]
-                expected_events = 1 if arm == "on" else 0
+                expected_events = 1 if arm == "on" and target in ELIGIBLE_WIDTHS else 0
                 if row["trace_event_count"] != expected_events \
                         or len(trace_values) != expected_events:
                     fail(f"wave {cursor} stable-route reachability count is invalid")
@@ -893,12 +906,12 @@ def validate_samples(
                     fail(f"wave {cursor} wall is not derived from concurrent lane timestamps")
                 if row["aggregate_work_rows"] != aggregate_rows:
                     fail(f"wave {cursor} aggregate work is not lane-bound")
-                if arm == "on":
+                if arm == "on" and target in ELIGIBLE_WIDTHS:
                     requests, boundary, elapsed, count = trace_values[0]
                     if requests != LANES:
                         fail(f"wave {cursor} did not reach exactly one B4 stable rectangle")
-                    if boundary < 32 or boundary > 256:
-                        fail(f"wave {cursor} stable boundary is outside proven 32..256 range")
+                    if boundary < 32 or boundary > MAX_STABLE_BOUNDARY_ROWS:
+                        fail(f"wave {cursor} stable boundary is outside proven 32..192 range")
                     if elapsed <= 0 or count <= 0 or row["trace_requests"] != requests \
                             or row["trace_boundary_rows"] != boundary \
                             or abs(float(row["trace_elapsed_ms"]) - elapsed) > 1e-9 \
@@ -908,7 +921,7 @@ def validate_samples(
                     "trace_requests", "trace_boundary_rows", "trace_elapsed_ms",
                     "trace_batch_count",
                 )):
-                    fail(f"wave {cursor} OFF arm fabricated stable-route fields")
+                    fail(f"wave {cursor} scalar route fabricated stable-route fields")
                 samples[(pair, target, arm)] = row
 
     for pair in range(PAIRS):
@@ -943,15 +956,30 @@ def analyze(samples: dict[tuple[int, int, str], dict]) -> dict:
                 draw.extend(values[rng.randrange(len(values))] for _ in values)
             bootstrapped.append(statistics.median(draw))
         interval = [percentile(bootstrapped, 0.025), percentile(bootstrapped, 0.975)]
-        accepted = interval[0] > MIN_LOWER_CI
+        if target in ELIGIBLE_WIDTHS:
+            policy = "eligible_speedup"
+            accepted = interval[0] > MIN_LOWER_CI
+            acceptance = {"minimum_lower_95_ratio_exclusive": MIN_LOWER_CI}
+        else:
+            policy = "scalar_fallback_noninferiority"
+            accepted = interval[0] > MIN_FALLBACK_LOWER_CI
+            acceptance = {
+                "maximum_product_regression_exclusive": MAX_FALLBACK_PRODUCT_REGRESSION,
+                "minimum_lower_95_ratio_exclusive": MIN_FALLBACK_LOWER_CI,
+            }
         all_pass = all_pass and accepted
         widths.append({"target_rows": target, "paired_speedups": ratios,
+                       "route_policy": policy, "acceptance_contract": acceptance,
                        "median_speedup": statistics.median(ratios),
                        "order_stratified_95pct_ci": interval, "accepted": accepted})
     return {"decision": "confirmed" if all_pass else "not_confirmed", "accepted": all_pass,
-            "minimum_lower_ci_exclusive": MIN_LOWER_CI, "bootstrap_samples": BOOTSTRAPS,
+            "eligible_minimum_lower_ci_exclusive": MIN_LOWER_CI,
+            "fallback_maximum_product_regression_exclusive": MAX_FALLBACK_PRODUCT_REGRESSION,
+            "fallback_minimum_lower_ci_exclusive": MIN_FALLBACK_LOWER_CI,
+            "bootstrap_samples": BOOTSTRAPS,
             "bootstrap_seed": BOOTSTRAP_SEED,
-            "statistic": "median paired OFF/ON wave speedup; resampled independently within process-order strata",
+            "statistic": "route-specific median paired OFF/ON product-wave ratio; "
+                         "resampled independently within process-order strata",
             "widths": widths}
 
 
@@ -977,7 +1005,7 @@ def main() -> None:
     else:
         sys.stdout.write(rendered)
     if not analysis["accepted"]:
-        fail("one or more widths did not clear the immutable lower-95% speedup gate")
+        fail("one or more widths did not clear its immutable route-specific gate")
 
 
 if __name__ == "__main__":

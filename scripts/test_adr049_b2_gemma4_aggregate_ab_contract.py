@@ -14,6 +14,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 RUNNER = SCRIPT_DIR / "bench_adr049_b2_gemma4_aggregate_ab.sh"
 VERIFY = SCRIPT_DIR / "verify_adr049_b2_gemma4_aggregate_ab.py"
 WIDTHS = [128, 192, 256]
+ELIGIBLE_WIDTHS = [128, 192]
+FALLBACK_WIDTHS = [256]
+MAX_FALLBACK_PRODUCT_REGRESSION = 1.05
 
 
 def digest(path: Path) -> str:
@@ -90,6 +93,8 @@ def assert_runner_shell_quoting_contract() -> None:
         in runner_source
     )
     assert "readonly MAX_TARGET_ROW_DRIFT=4" in runner_source
+    assert "readonly MAX_STABLE_BOUNDARY_ROWS=192" in runner_source
+    assert "readonly MAX_FALLBACK_PRODUCT_REGRESSION=1.05" in runner_source
     assert "STABLE BATCHED 4 seqs x" in runner_source
     assert 'for (i = 1; i <= words; i++) printf "history "' in runner_source
 
@@ -261,7 +266,9 @@ def continuation_request(prime: dict, response: dict, target: int, stream: bool)
     return value
 
 
-def make_fixture(root: Path, speedup: float = 2.0) -> None:
+def make_fixture(
+    root: Path, speedup: float = 2.0, fallback_speedup: float = 1.0
+) -> None:
     root.mkdir()
     root = root.resolve()
     (root / "processes").mkdir()
@@ -402,7 +409,10 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
                     wall.write_text(f"{lane_wall_ms / 1000:.12f}\n", encoding="utf-8")
                     base_start = 3000 + sequence * 6
                     start = base_start + lane_index * 0.01
-                    desired_wave_ms = (1000 + target) * (speedup if arm == "off" else 1.0)
+                    target_speedup = speedup if target in ELIGIBLE_WIDTHS else fallback_speedup
+                    desired_wave_ms = (1000 + target) * (
+                        target_speedup if arm == "off" else 1.0
+                    )
                     finish = base_start + desired_wave_ms / 1000
                     timing.write_text(f"{start:.9f}\t{finish:.9f}\n", encoding="utf-8")
                     starts.append(start)
@@ -442,7 +452,7 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
                 wave_wall = wave_dir / "wave.wall"
                 wave_wall.write_text(f"{wave_ms / 1000:.12f}\n", encoding="utf-8")
                 trace = wave_dir / "server.trace.log"
-                if arm == "on":
+                if arm == "on" and target in ELIGIBLE_WIDTHS:
                     trace_count = sequence + 1
                     boundary_rows = target - 5
                     line = (
@@ -454,7 +464,9 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
                     event_count, trace_requests, trace_rows = 1, 4, boundary_rows
                     trace_elapsed, trace_batch_count = 10.5, trace_count
                 else:
-                    trace.write_text("OFF stable scalar continuation\n", encoding="utf-8")
+                    trace.write_text(
+                        f"{arm.upper()} stable scalar continuation\n", encoding="utf-8"
+                    )
                     event_count, trace_requests, trace_rows = 0, None, None
                     trace_elapsed, trace_batch_count = None, None
                 samples.append({
@@ -557,7 +569,10 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
     write_json(root / "manifest.json", {
         "schema_version": 2, "status": "measured",
         "configuration": {
-            "pairs": 8, "width_targets": WIDTHS, "lanes": 4,
+            "pairs": 8, "width_targets": WIDTHS,
+            "stable_rectangular_eligible_widths": ELIGIBLE_WIDTHS,
+            "scalar_fallback_widths": FALLBACK_WIDTHS,
+            "maximum_stable_boundary_rows": 192, "lanes": 4,
             "pair_order": "off-on-even_on-off-odd", "warmup_waves_per_process": 2,
             "measured_waves_per_process": 3, "prime_turns_per_wave": 4,
             "prime_history_words": 1200, "minimum_prime_aggregate_tokens": 4097,
@@ -575,10 +590,15 @@ def make_fixture(root: Path, speedup: float = 2.0) -> None:
                                      "thinking": False},
             "semantic_normalization": "generated-call-ids-only",
             "wire_validation": "exact-envelope-single-choice-no-reasoning-logprobs-or-continuation-tools",
-            "analysis": {"statistic": "median paired OFF/ON wave speedup",
+            "analysis": {
+                         "statistic": "route-specific median paired OFF/ON product-wave ratio",
                          "order_stratified_bootstrap_samples": 10000,
                          "bootstrap_seed": 49004, "lower_confidence_percentile": 2.5,
-                         "minimum_lower_95_speedup_exclusive": 1.05},
+                         "minimum_eligible_lower_95_speedup_exclusive": 1.05,
+                         "maximum_fallback_product_regression_exclusive":
+                             MAX_FALLBACK_PRODUCT_REGRESSION,
+                         "minimum_fallback_lower_95_ratio_exclusive":
+                             1 / MAX_FALLBACK_PRODUCT_REGRESSION},
         },
         "identity": identity,
         "environment": {"power": "ac", "power_mode": "automatic",
@@ -687,17 +707,41 @@ def main() -> None:
                       (valid / "samples.jsonl").read_text().splitlines()]
         assert all(
             row["trace_boundary_rows"] != row["lanes"][0]["work_rows"]
-            for row in valid_rows if row["arm"] == "on"
+            for row in valid_rows if row["trace_event_count"] == 1
         ), "valid fixture must distinguish stable-boundary rows from usage work"
+        assert all(
+            row["trace_event_count"] == 0 and row["trace_boundary_rows"] is None
+            for row in valid_rows if row["target_rows"] in FALLBACK_WIDTHS
+        ), "scalar fallback fixture must never emit a stable rectangle"
         summary = valid / "summary.json"
         subprocess.run([str(VERIFY), str(valid), str(summary)], check=True)
         result = json.loads(summary.read_text(encoding="utf-8"))
         assert result["status"] == "pass" and result["analysis"]["decision"] == "confirmed"
+        assert [row["route_policy"] for row in result["analysis"]["widths"]] == [
+            "eligible_speedup", "eligible_speedup", "scalar_fallback_noninferiority"
+        ]
         run_verify(valid, success=True)
 
         slow = parent / "slow"
         make_fixture(slow, speedup=1.02)
-        run_verify(slow, success=False, reason="immutable lower-95% speedup gate")
+        run_verify(slow, success=False, reason="immutable route-specific gate")
+        rejected += 1
+
+        fallback_regression = parent / "fallback-regression"
+        make_fixture(fallback_regression, fallback_speedup=0.94)
+        run_verify(
+            fallback_regression, success=False,
+            reason="immutable route-specific gate",
+        )
+        rejected += 1
+
+        route_policy = clone(valid, parent, "route-policy-drift")
+        manifest_path = route_policy / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["configuration"]["stable_rectangular_eligible_widths"] = [128, 192, 256]
+        manifest["configuration"]["scalar_fallback_widths"] = []
+        write_json(manifest_path, manifest)
+        run_verify(route_policy, success=False, reason="A/B configuration drifted")
         rejected += 1
 
         bad_hash = clone(valid, parent, "bad-hash")
@@ -720,6 +764,28 @@ def main() -> None:
         run_verify(bad_trace, success=False, reason="exactly one B4 stable rectangle")
         rejected += 1
 
+        fallback_trace = clone(valid, parent, "fallback-trace")
+        rows = [json.loads(line) for line in
+                (fallback_trace / "samples.jsonl").read_text().splitlines()]
+        row = next(
+            row for row in rows
+            if row["arm"] == "on" and row["target_rows"] in FALLBACK_WIDTHS
+        )
+        trace_path = fallback_trace / row["trace_path"]
+        trace_path.write_text(
+            "[PREFILL_TIMING] STABLE BATCHED 4 seqs x 192 "
+            "boundary rows in 10.5 ms count=1\n",
+            encoding="utf-8",
+        )
+        row.update({
+            "trace_event_count": 1, "trace_requests": 4,
+            "trace_boundary_rows": 192, "trace_elapsed_ms": 10.5,
+            "trace_batch_count": 1, "trace_sha256": digest(trace_path),
+        })
+        reseal_samples(fallback_trace, rows)
+        run_verify(fallback_trace, success=False, reason="reachability count is invalid")
+        rejected += 1
+
         boundary_range = clone(valid, parent, "boundary-outside-range")
         rows = [json.loads(line) for line in
                 (boundary_range / "samples.jsonl").read_text().splitlines()]
@@ -739,7 +805,7 @@ def main() -> None:
         reseal_samples(boundary_range, rows)
         run_verify(
             boundary_range, success=False,
-            reason="stable boundary is outside proven 32..256 range",
+            reason="stable boundary is outside proven 32..192 range",
         )
         rejected += 1
 
@@ -902,7 +968,10 @@ def main() -> None:
         output_drift = clone(valid, parent, "output-drift")
         rows = [json.loads(line) for line in
                 (output_drift / "samples.jsonl").read_text().splitlines()]
-        row = next(row for row in rows if row["arm"] == "on")
+        row = next(
+            row for row in rows
+            if row["arm"] == "on" and row["target_rows"] in FALLBACK_WIDTHS
+        )
         lane = row["lanes"][0]
         for key in ("wire_response_path", "canonical_response_path"):
             path = output_drift / lane[key]
@@ -1123,7 +1192,7 @@ def main() -> None:
         run_verify(identity_drift, success=False, reason="live operator launcher drifted")
         rejected += 1
 
-    assert rejected == 29
+    assert rejected == 32
     print(
         "ADR-049 B.2 Gemma stable cached A/B contract passed; "
         f"mutation battery {rejected}/{rejected} rejected"
