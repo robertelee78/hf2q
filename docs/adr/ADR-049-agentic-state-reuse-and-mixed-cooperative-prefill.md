@@ -16,7 +16,11 @@
   now checked in and model-free green, while their real-artifact cells remain
   open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 80, the checked-in Gemma B2/B4 M32 authority now
+- Updated: 2026-08-26 (rev 81, the direct production-route attention
+  performance hypothesis is falsified and fully removed: its first B2 global
+  D512 packed-TQ equality case differed from the current tiled-F16 route, so
+  no timing was taken and no production attention code survives. Rev 80
+  recorded that the checked-in Gemma B2/B4 M32 authority
   proves exact final logits/tokens, direct byte equality for every selected
   slot's complete logical hybrid-cache state and cursor/layout metadata, full
   seeded unselected-slot preservation, and exact one-token continuation. The
@@ -1879,7 +1883,7 @@ GGUF weight, the scalar `M` route/tile, and each lane's reduction tree. It may
 be consumed only after its per-lane route/output is byte-identical to canonical
 scalar calls from a published checksum-pinned backend.
 
-Production attention is not currently a correctness rewrite. The live
+Production attention is not a surviving candidate. The live
 hardware bisection proved layer-zero SDPA exact, and source review found that
 the existing global path already uses physical slot views while the sliding
 path already stages each lane chronologically before reuse. A proposed batched
@@ -1890,7 +1894,15 @@ a performance hypothesis under a direct production-route falsifier covering
 B=2/B=4, M=32, global/sliding-wrap, and TQ/F16 cache modes. It must match
 output and selected cache bytes, preserve unselected-slot canaries, and beat
 the current route by at least 5% in paired same-process timing; an exactness or
-speed miss removes the production candidate.
+speed miss removes the production candidate. The deciding spike failed its
+first equality cell: B2 M32, noncontiguous slots `[3,1]`, global D512 attention,
+packed-TQ V, start 32/capacity 96. The one-dispatch hybrid output differed from
+the current production TQ dequant-to-F16 tiled route, so the timing phase did
+not run. The disposable module and registration were deleted; no production
+attention change survived. Compile log SHA-256
+`3762671ec26eb670f97b74ed66231c3cc76b6878b03fb75f530a9117c2ca92e2`;
+equality-gate log SHA-256
+`ecace251935ba6ab1bf192e5aafef19b1e9d889e9c4a2d40e0b318a8848dc68a`.
 
 Only the smallest surviving rectangular slice that produces exact final
 logits, full hybrid-cache bytes, one-token continuation, and multi-token
