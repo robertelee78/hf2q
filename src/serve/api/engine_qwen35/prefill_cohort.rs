@@ -5,6 +5,7 @@
 //! together, checkpoints are validated before publication, and a caller may
 //! still roll the prepared cohort back when cancellation races GPU work.
 
+use super::super::anchor_store::StagePending;
 use super::*;
 
 const MAX_RECTANGULAR_PREFILL_ROWS: usize = 128;
@@ -48,11 +49,42 @@ pub(crate) struct Qwen35RectangularPrefillPlan {
     pub(crate) checkpoint_at_end: bool,
 }
 
+fn rectangular_execution_matches(
+    candidate: Qwen35RectangularPrefillPlan,
+    admitted: Qwen35RectangularPrefillPlan,
+) -> bool {
+    candidate.rows == admitted.rows
+        && candidate.mtp_prefill == admitted.mtp_prefill
+        && (!admitted.checkpoint_at_end || candidate.checkpoint_at_end)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Qwen35MtpPrefillOutcome {
     NotRequested,
     Succeeded,
     OrdinaryReplay,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Qwen35CheckpointStagingOutcome {
+    Staged,
+    CapacitySuppressed { lane: usize, outcome: StagePending },
+    InvariantViolation { lane: usize, outcome: StagePending },
+}
+
+fn checkpoint_staging_rejection(
+    lane: usize,
+    outcome: StagePending,
+) -> Option<Qwen35CheckpointStagingOutcome> {
+    match outcome {
+        StagePending::Staged => None,
+        StagePending::NoCommittedCapacity | StagePending::BudgetExceeded { .. } => {
+            Some(Qwen35CheckpointStagingOutcome::CapacitySuppressed { lane, outcome })
+        }
+        StagePending::PendingOccupied => {
+            Some(Qwen35CheckpointStagingOutcome::InvariantViolation { lane, outcome })
+        }
+    }
 }
 
 pub(crate) struct Qwen35PreparedPrefillCohort {
@@ -104,6 +136,19 @@ impl Qwen35PreparedPrefillCohort {
                 }
             })
             .collect()
+    }
+
+    pub(crate) fn stage_optional_checkpoints(
+        &mut self,
+        mut stage: impl FnMut(usize, Qwen35StablePromptCheckpoint) -> StagePending,
+    ) -> Result<Qwen35CheckpointStagingOutcome> {
+        for (lane, checkpoint) in self.take_checkpoints()?.into_iter().enumerate() {
+            let outcome = stage(lane, checkpoint);
+            if let Some(rejection) = checkpoint_staging_rejection(lane, outcome) {
+                return Ok(rejection);
+            }
+        }
+        Ok(Qwen35CheckpointStagingOutcome::Staged)
     }
 
     pub(crate) fn rollback_for_retry(
@@ -172,8 +217,9 @@ impl Qwen35PrefillState {
             "rectangular Qwen prefill state/reservation count mismatch"
         );
         for state in &states {
+            let candidate = state.rectangular_prefill_plan(qwen, kv_cache, plan.rows);
             anyhow::ensure!(
-                state.rectangular_prefill_plan(qwen, kv_cache, plan.rows) == Some(plan),
+                candidate.is_some_and(|candidate| rectangular_execution_matches(candidate, plan)),
                 "rectangular Qwen prefill state no longer matches its admitted plan"
             );
         }
@@ -638,7 +684,54 @@ fn catch_up_rectangular_mtp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::api::anchor_store::{AnchorEntry, AnchorPublicationDisposition, AnchorStore};
+    use crate::serve::api::qwen35_anchor_store::discard_cohort_pending;
     use mlx_native::MlxDevice;
+
+    #[derive(Clone, Debug)]
+    struct FakeAnchor {
+        token_count: usize,
+        epoch: u64,
+        bytes: u64,
+        publication_disposition: AnchorPublicationDisposition,
+    }
+
+    impl FakeAnchor {
+        fn new(token_count: usize, bytes: u64) -> Self {
+            Self {
+                token_count,
+                epoch: u64::MAX,
+                bytes,
+                publication_disposition: AnchorPublicationDisposition::Unpublished,
+            }
+        }
+    }
+
+    impl AnchorEntry for FakeAnchor {
+        fn token_count(&self) -> usize {
+            self.token_count
+        }
+
+        fn lineage_epoch(&self) -> u64 {
+            self.epoch
+        }
+
+        fn set_lineage_epoch(&mut self, epoch: u64) {
+            self.epoch = epoch;
+        }
+
+        fn owned_bytes(&self) -> u64 {
+            self.bytes
+        }
+
+        fn publication_disposition(&self) -> AnchorPublicationDisposition {
+            self.publication_disposition
+        }
+
+        fn set_publication_disposition(&mut self, disposition: AnchorPublicationDisposition) {
+            self.publication_disposition = disposition;
+        }
+    }
 
     fn rectangular_test_model_with_mtp(mtp_enabled: bool) -> Qwen35LoadedModel {
         let mut cfg =
@@ -810,6 +903,27 @@ mod tests {
     }
 
     #[test]
+    fn pending_occupied_is_an_invariant_not_capacity_pressure() {
+        assert_eq!(
+            checkpoint_staging_rejection(1, StagePending::PendingOccupied),
+            Some(Qwen35CheckpointStagingOutcome::InvariantViolation {
+                lane: 1,
+                outcome: StagePending::PendingOccupied,
+            })
+        );
+        assert!(matches!(
+            checkpoint_staging_rejection(
+                1,
+                StagePending::BudgetExceeded {
+                    needed_bytes: 2,
+                    budget_bytes: 1,
+                },
+            ),
+            Some(Qwen35CheckpointStagingOutcome::CapacitySuppressed { lane: 1, .. })
+        ));
+    }
+
+    #[test]
     fn all_lane_rollback_restores_selected_slots_and_not_the_peer() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
@@ -906,6 +1020,131 @@ mod tests {
             assert_eq!(
                 state.rectangular_prefill_plan(&qwen, &kv, 2_048),
                 Some(plan)
+            );
+        }
+    }
+
+    #[test]
+    fn rectangular_state_executor_keeps_the_cohort_when_checkpointing_is_suppressed() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let mut qwen = rectangular_test_model();
+        let mut kv =
+            HybridKvCache::new_with_options(&qwen.model.cfg, &device, 256, 3, true).expect("cache");
+        let slots = [SlotId(2), SlotId(0)];
+        let (states, mut plan, _) = rectangular_test_states(&qwen, &mut kv, &slots);
+        plan.checkpoint_at_end = false;
+        let reservations = vec![None; slots.len()];
+        let supervisor = EngineSupervisor::new();
+
+        let prepared = Qwen35PrefillState::advance_rectangular_prefill(
+            states,
+            plan,
+            &mut qwen,
+            &mut kv,
+            &reservations,
+            &supervisor,
+        )
+        .expect("checkpoint capacity is optional to rectangular execution");
+
+        for (advance, slot) in prepared.advances().iter().zip(slots) {
+            let Qwen35PrefillAdvance::Pending { checkpoint, .. } = advance else {
+                panic!("stable-boundary rectangular slice must remain pending");
+            };
+            assert!(checkpoint.is_none());
+            assert_eq!(
+                kv.sequence_len_for_slot(slot).expect("cursor"),
+                plan.rows as u32
+            );
+        }
+        assert_eq!(prepared.commit().len(), slots.len());
+    }
+
+    #[test]
+    fn partial_checkpoint_staging_preserves_lineage_and_commits_target_advances() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let mut qwen = rectangular_test_model();
+        let mut kv =
+            HybridKvCache::new_with_options(&qwen.model.cfg, &device, 256, 3, true).expect("cache");
+        let slots = [SlotId(2), SlotId(0)];
+        let (states, plan, reservations) = rectangular_test_states(&qwen, &mut kv, &slots);
+        let supervisor = EngineSupervisor::new();
+        let mut prepared = Qwen35PrefillState::advance_rectangular_prefill(
+            states,
+            plan,
+            &mut qwen,
+            &mut kv,
+            &reservations,
+            &supervisor,
+        )
+        .expect("prepare");
+
+        let mut stores = (0..slots.len())
+            .map(|_| AnchorStore::with_committed_capacity(4))
+            .collect::<Vec<AnchorStore<FakeAnchor>>>();
+        for (lane, store) in stores.iter_mut().enumerate() {
+            assert_eq!(
+                store.stage_pending(FakeAnchor::new(32 + lane, 40 + lane as u64), 4, 10_000),
+                StagePending::Staged
+            );
+            store.publish_pending(4).expect("seed committed lineage");
+        }
+        let committed_before = stores
+            .iter()
+            .map(|store| {
+                (
+                    store.committed_token_counts(),
+                    store.lineage_epoch(),
+                    store.owned_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let staging = prepared
+            .stage_optional_checkpoints(|lane, checkpoint| {
+                let budget = if lane == 0 {
+                    10_000
+                } else {
+                    stores[lane].owned_bytes()
+                };
+                stores[lane].stage_pending(
+                    FakeAnchor::new(checkpoint.prompt_tokens.len(), 73),
+                    4,
+                    budget,
+                )
+            })
+            .expect("checkpoint extraction");
+        assert!(matches!(
+            staging,
+            Qwen35CheckpointStagingOutcome::CapacitySuppressed {
+                lane: 1,
+                outcome: StagePending::BudgetExceeded { .. }
+            }
+        ));
+        assert!(stores[0].has_pending());
+        assert!(!stores[1].has_pending());
+        assert_eq!(
+            discard_cohort_pending(&mut stores, &[0, 1]).expect("cohort pending cleanup"),
+            1
+        );
+        for (store, expected) in stores.iter().zip(&committed_before) {
+            assert!(!store.has_pending());
+            assert_eq!(store.committed_token_counts(), expected.0);
+            assert_eq!(store.lineage_epoch(), expected.1);
+            assert_eq!(store.owned_bytes(), expected.2);
+        }
+
+        let advances = prepared.commit();
+        assert_eq!(advances.len(), slots.len());
+        for (advance, slot) in advances.iter().zip(slots) {
+            let Qwen35PrefillAdvance::Pending { checkpoint, .. } = advance else {
+                panic!("rectangular target advance must remain publishable");
+            };
+            assert!(checkpoint.is_none());
+            assert_eq!(
+                kv.sequence_len_for_slot(slot).expect("cursor"),
+                plan.rows as u32
             );
         }
     }

@@ -8526,7 +8526,10 @@ hf2q_qwen_anchor_post_admission_prefill_failures_total {}\n\
 hf2q_qwen_anchor_stable_boundary_compound_prefills_total {}\n\
 # HELP hf2q_qwen_rectangular_prefill_cohorts_total Successfully published multi-slot rectangular Qwen prefill transactions.\n\
 # TYPE hf2q_qwen_rectangular_prefill_cohorts_total counter\n\
-hf2q_qwen_rectangular_prefill_cohorts_total {}\n",
+hf2q_qwen_rectangular_prefill_cohorts_total {}\n\
+# HELP hf2q_qwen_anchor_cohort_staging_invariant_failures_total Rectangular checkpoint staging rejected a planner-prevalidated lane for a non-capacity reason.\n\
+# TYPE hf2q_qwen_anchor_cohort_staging_invariant_failures_total counter\n\
+hf2q_qwen_anchor_cohort_staging_invariant_failures_total {}\n",
         qwen_anchor.captures_total.load(Ordering::Relaxed),
         qwen_anchor
             .capture_budget_skips_total
@@ -8570,6 +8573,9 @@ hf2q_qwen_rectangular_prefill_cohorts_total {}\n",
             .load(Ordering::Relaxed),
         qwen_anchor
             .rectangular_prefill_cohorts_total
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .cohort_staging_invariant_failures_total
             .load(Ordering::Relaxed),
     );
     let gemma_anchor = &super::gemma4_anchor_store::TELEMETRY;

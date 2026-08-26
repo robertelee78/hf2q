@@ -61,8 +61,11 @@ use super::gemma4_anchor_store::{
 };
 use super::qwen35_anchor_store::{
     DEFAULT_MAX_COMMITTED_ANCHORS, PostAdmissionPrefillFailure,
+    discard_cohort_pending as discard_qwen35_cohort_pending,
     effective_committed_depth as qwen35_effective_committed_depth,
     record_capture as record_qwen35_anchor_capture,
+    record_cohort_staging_invariant_failure as record_qwen35_cohort_staging_invariant_failure,
+    record_committed_budget_skips as record_qwen35_committed_anchor_budget_skips,
     record_configuration as record_qwen35_anchor_configuration,
     record_evictions as record_qwen35_anchor_evictions,
     record_post_admission_prefill_failure as record_qwen35_post_admission_prefill_failure,
@@ -21458,6 +21461,15 @@ struct Qwen35PrefillCohortPlan {
     execution: super::engine_qwen35::prefill_cohort::Qwen35RectangularPrefillPlan,
     reservations: Vec<Option<super::engine_qwen35::Qwen35CompoundCheckpointReservation>>,
     request_max_tokens: Vec<usize>,
+    committed_budget_skip: Option<Qwen35CommittedBudgetSkip>,
+}
+
+#[derive(Clone, Copy)]
+struct Qwen35CommittedBudgetSkip {
+    aggregate_owned_bytes: u64,
+    effective_committed_depth: usize,
+    simultaneous_pending_capacity_slots: usize,
+    configured_slots: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -21492,9 +21504,49 @@ fn qwen35_matching_prefill_prefix(
         first.execution,
         prefix
             .iter()
-            .map(|candidate| candidate.expect("matching prefix was prevalidated").request_max_tokens)
+            .map(|candidate| {
+                candidate
+                    .expect("matching prefix was prevalidated")
+                    .request_max_tokens
+            })
             .collect(),
     ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Qwen35PrefillCohortCheckpointAdmission {
+    checkpoint_at_end: bool,
+    effective_committed_depth: usize,
+    simultaneous_pending_capacity_slots: usize,
+}
+
+fn qwen35_prefill_cohort_checkpoint_admission(
+    aggregate_budget_bytes: u64,
+    aggregate_owned_bytes: u64,
+    aggregate_control_bytes: u64,
+    configured_slots: usize,
+    retained_anchor_bytes: u64,
+    requested_peak_bytes: u64,
+) -> Qwen35PrefillCohortCheckpointAdmission {
+    let payload_budget = aggregate_budget_bytes.saturating_sub(aggregate_control_bytes);
+    let effective_committed_depth = qwen35_effective_committed_depth(
+        DEFAULT_MAX_COMMITTED_ANCHORS,
+        payload_budget,
+        configured_slots,
+        retained_anchor_bytes,
+    );
+    let simultaneous_pending_capacity_slots = qwen35_simultaneous_pending_capacity_slots(
+        payload_budget,
+        configured_slots,
+        retained_anchor_bytes,
+        effective_committed_depth,
+    );
+    let available_bytes = aggregate_budget_bytes.saturating_sub(aggregate_owned_bytes);
+    Qwen35PrefillCohortCheckpointAdmission {
+        checkpoint_at_end: effective_committed_depth > 0 && requested_peak_bytes <= available_bytes,
+        effective_committed_depth,
+        simultaneous_pending_capacity_slots,
+    }
 }
 
 fn plan_qwen35_prefill_cohort(
@@ -21534,7 +21586,7 @@ fn plan_qwen35_prefill_cohort(
         .collect::<Vec<_>>();
     for width in qwen35_prefill_cohort_widths(fifo.len()) {
         let handles = &fifo[..width];
-        let Some((execution, request_max_tokens)) =
+        let Some((mut execution, request_max_tokens)) =
             qwen35_matching_prefill_prefix(&candidates, width)
         else {
             continue;
@@ -21560,6 +21612,7 @@ fn plan_qwen35_prefill_cohort(
 
         let mut reservations = Vec::with_capacity(width);
         let mut requested_anchor_bytes = 0_u64;
+        let mut retained_anchor_bytes = 0_u64;
         for handle in handles {
             let state = match slots[handle.slot_id.0 as usize].as_ref() {
                 Some((Qwen35SlotWork::Prefill(state), _, _)) => state,
@@ -21593,35 +21646,71 @@ fn plan_qwen35_prefill_cohort(
                 break;
             };
             requested_anchor_bytes = total;
+            retained_anchor_bytes = retained_anchor_bytes.max(reservation.retained_bytes);
             reservations.push(Some(reservation));
         }
-        if reservations.len() != width {
-            continue;
-        }
         let aggregate_owned = qwen35_anchor_aggregate_owned_bytes(prompt_anchors).ok()?;
-        let available = anchor_aggregate_budget_bytes.saturating_sub(aggregate_owned);
-        if requested_anchor_bytes > available {
-            tracing::debug!(
+        let aggregate_control = qwen35_anchor_aggregate_control_bytes(prompt_anchors).ok()?;
+        let reservation_complete = reservations.len() == width;
+        let checkpoint_admission = reservation_complete.then(|| {
+            qwen35_prefill_cohort_checkpoint_admission(
+                anchor_aggregate_budget_bytes,
+                aggregate_owned,
+                aggregate_control,
+                prompt_anchors.len(),
+                retained_anchor_bytes,
+                requested_anchor_bytes,
+            )
+        });
+        let checkpoint_at_end =
+            checkpoint_admission.is_some_and(|admission| admission.checkpoint_at_end);
+        let mut committed_budget_skip = None;
+        if !checkpoint_at_end {
+            execution.checkpoint_at_end = false;
+            reservations = vec![None; width];
+            if let Some(admission) = checkpoint_admission {
+                committed_budget_skip = Some(Qwen35CommittedBudgetSkip {
+                    aggregate_owned_bytes: aggregate_owned,
+                    effective_committed_depth: admission.effective_committed_depth,
+                    simultaneous_pending_capacity_slots: admission
+                        .simultaneous_pending_capacity_slots,
+                    configured_slots: prompt_anchors.len(),
+                });
+                tracing::info!(
+                    lanes = width,
+                    rows = execution.rows,
+                    mtp_prefill = execution.mtp_prefill,
+                    requested_anchor_bytes,
+                    available_anchor_bytes = anchor_aggregate_budget_bytes
+                        .saturating_sub(aggregate_owned),
+                    effective_committed_depth = admission.effective_committed_depth,
+                    simultaneous_pending_capacity_slots =
+                        admission.simultaneous_pending_capacity_slots,
+                    "Qwen rectangular prefill admitted without an optional stable-boundary checkpoint"
+                );
+            } else {
+                tracing::warn!(
+                    lanes = width,
+                    rows = execution.rows,
+                    mtp_prefill = execution.mtp_prefill,
+                    "Qwen rectangular prefill admitted without a checkpoint because its reservation was unavailable"
+                );
+            }
+        } else {
+            tracing::info!(
                 lanes = width,
                 rows = execution.rows,
+                mtp_prefill = execution.mtp_prefill,
                 requested_anchor_bytes,
-                available_anchor_bytes = available,
-                "Qwen rectangular prefill retained scalar execution because the all-lane checkpoint reservation did not fit"
+                "Qwen rectangular stable-boundary prefill admitted"
             );
-            continue;
         }
-        tracing::info!(
-            lanes = width,
-            rows = execution.rows,
-            mtp_prefill = execution.mtp_prefill,
-            requested_anchor_bytes,
-            "Qwen rectangular stable-boundary prefill admitted"
-        );
         return Some(Qwen35PrefillCohortPlan {
             handles: handles.to_vec(),
             execution,
             reservations,
             request_max_tokens,
+            committed_budget_skip,
         });
     }
     None
@@ -21859,26 +21948,76 @@ fn advance_qwen35_prefill_cohort(
     let mut cancelled = lanes.iter().any(|(_, reply)| reply.client_closed());
     let mut staged_any = false;
     if abort_error.is_none() && !cancelled {
-        match prepared.take_checkpoints() {
-            Ok(checkpoints) => {
-                for ((handle, _), checkpoint) in lanes.iter().zip(checkpoints) {
-                    let outcome = stage_prevalidated_qwen35_stable_prompt_checkpoint(
-                        *handle,
-                        prompt_anchors,
-                        checkpoint,
-                        anchor_aggregate_budget_bytes,
-                    );
-                    staged_any |= outcome == StagePending::Staged;
-                    if outcome != StagePending::Staged {
-                        abort_error = Some(anyhow::anyhow!(
-                            "Qwen rectangular all-lane anchor staging rejected slot {}: {outcome:?}",
-                            handle.slot_id.0
-                        ));
-                        break;
-                    }
+        if plan.execution.checkpoint_at_end {
+            let staging = prepared.stage_optional_checkpoints(|lane, checkpoint| {
+                stage_prevalidated_qwen35_stable_prompt_checkpoint(
+                    lanes[lane].0,
+                    prompt_anchors,
+                    checkpoint,
+                    anchor_aggregate_budget_bytes,
+                )
+            });
+            match staging {
+                Ok(super::engine_qwen35::prefill_cohort::Qwen35CheckpointStagingOutcome::Staged) => {
+                    staged_any = true;
                 }
+                Ok(super::engine_qwen35::prefill_cohort::Qwen35CheckpointStagingOutcome::CapacitySuppressed {
+                    lane,
+                    outcome,
+                }) => {
+                    let slot_indices = plan
+                        .handles
+                        .iter()
+                        .map(|handle| handle.slot_id.0 as usize)
+                        .collect::<Vec<_>>();
+                    if let Err(error) =
+                        discard_qwen35_cohort_pending(prompt_anchors, &slot_indices)
+                    {
+                        abort_error = Some(error.context(
+                            "Qwen rectangular capacity suppression pending cleanup",
+                        ));
+                    }
+                    staged_any = false;
+                    tracing::warn!(
+                        slot = lanes[lane].0.slot_id.0,
+                        ?outcome,
+                        lanes = plan.handles.len(),
+                        rows = plan.execution.rows,
+                        "Qwen rectangular checkpoint capacity was suppressed without discarding valid target work"
+                    );
+                }
+                Ok(super::engine_qwen35::prefill_cohort::Qwen35CheckpointStagingOutcome::InvariantViolation {
+                    lane,
+                    outcome,
+                }) => {
+                    record_qwen35_cohort_staging_invariant_failure();
+                    let slot_indices = plan
+                        .handles
+                        .iter()
+                        .map(|handle| handle.slot_id.0 as usize)
+                        .collect::<Vec<_>>();
+                    let cleanup =
+                        discard_qwen35_cohort_pending(prompt_anchors, &slot_indices).map_err(
+                            |error| {
+                                error.context(
+                                    "Qwen rectangular invariant staging pending cleanup",
+                                )
+                            },
+                        );
+                    abort_error = Some(match cleanup {
+                        Ok(_) => anyhow::anyhow!(
+                            "Qwen rectangular checkpoint staging invariant at slot {}: {outcome:?}",
+                            lanes[lane].0.slot_id.0
+                        ),
+                        Err(error) => error.context(format!(
+                            "Qwen rectangular checkpoint staging invariant at slot {}: {outcome:?}",
+                            lanes[lane].0.slot_id.0
+                        )),
+                    });
+                    staged_any = false;
+                }
+                Err(error) => abort_error = Some(error),
             }
-            Err(error) => abort_error = Some(error),
         }
         cancelled = lanes.iter().any(|(_, reply)| reply.client_closed());
         let fifo = scheduler.prefill_handles_fifo();
@@ -22015,6 +22154,15 @@ fn advance_qwen35_prefill_cohort(
         scheduler.yield_prefill_turn(handle);
         slots[handle.slot_id.0 as usize] = Some((Qwen35SlotWork::Prefill(state), reply, handle));
     }
+    if let Some(skip) = plan.committed_budget_skip {
+        record_qwen35_committed_anchor_budget_skips(
+            plan.handles.len(),
+            skip.aggregate_owned_bytes,
+            skip.effective_committed_depth,
+            skip.simultaneous_pending_capacity_slots,
+            skip.configured_slots,
+        );
+    }
     record_qwen35_rectangular_prefill_cohort();
     tracing::info!(
         target: "hf2q::serve::api::qwen35_prefill_cohort",
@@ -22022,8 +22170,9 @@ fn advance_qwen35_prefill_cohort(
         rows_per_lane = plan.execution.rows,
         aggregate_rows = plan.handles.len() * plan.execution.rows,
         mtp_prefill = plan.execution.mtp_prefill,
+        checkpoint_at_end = plan.execution.checkpoint_at_end,
         mtp_outcome = ?mtp_outcome,
-        "Qwen rectangular stable-boundary prefill published"
+        "Qwen rectangular prefill published"
     );
     if let Ok(mut snapshot) = scheduler_stats_snapshot.lock() {
         *snapshot = scheduler.stats();
@@ -47369,14 +47518,44 @@ mod qwen35_bounded_prefill_watchdog_tests {
     }
 
     #[test]
+    fn qwen38_n16_marginal_anchor_grant_suppresses_only_the_checkpoint() {
+        let failed_physical_grant = 2_435_398_041;
+        let control_bytes = 18_944;
+        let anchor_bytes = 157_909_416;
+        let four_lane_peak = 645_195_936;
+
+        let admission = qwen35_prefill_cohort_checkpoint_admission(
+            failed_physical_grant,
+            control_bytes,
+            control_bytes,
+            16,
+            anchor_bytes,
+            four_lane_peak,
+        );
+        assert_eq!(admission.effective_committed_depth, 0);
+        assert!(!admission.checkpoint_at_end);
+
+        let passing_physical_grant = 2_690_267_545;
+        let admission = qwen35_prefill_cohort_checkpoint_admission(
+            passing_physical_grant,
+            control_bytes,
+            control_bytes,
+            16,
+            anchor_bytes,
+            four_lane_peak,
+        );
+        assert_eq!(admission.effective_committed_depth, 1);
+        assert!(admission.checkpoint_at_end);
+    }
+
+    #[test]
     fn qwen_rectangular_prefill_never_skips_an_incompatible_or_closed_middle_lane() {
-        let plan = |rows| {
-            crate::serve::api::engine_qwen35::prefill_cohort::Qwen35RectangularPrefillPlan {
-            rows,
-            mtp_prefill: false,
-            checkpoint_at_end: true,
-            }
-        };
+        let plan =
+            |rows| crate::serve::api::engine_qwen35::prefill_cohort::Qwen35RectangularPrefillPlan {
+                rows,
+                mtp_prefill: false,
+                checkpoint_at_end: true,
+            };
         let lane = |rows| {
             Some(Qwen35PrefillLaneCandidate {
                 execution: plan(rows),

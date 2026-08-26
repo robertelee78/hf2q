@@ -9,16 +9,43 @@
   the Qwen rectangular operator-lifecycle correction has exact native-Q5
   state proof, a completed Q5 fused-route falsifier, and a codec-wide exact
   Q4x4 implementation with Qwen3.8 quality/lifecycle and Qwen3.6 route proof;
-  its published dependency is pinned, the exact five-format physical
-  1/2/4/8/16-slot matrix is green, and universal four-family two-cycle swap is
-  hardware-sealed, while matched-reference acceptance remains open;
+  its published dependency is pinned, the exact five-format scalar/storage
+  matrix is green, and universal four-family two-cycle swap is hardware-sealed;
+  the current exact-head physical matrix is reopened after its Q4_K_M
+  16-slot cell exposed an optional-checkpoint admission defect, while
+  matched-reference acceptance remains open;
   the DeepSeek B.1 and Gemma/Qwen B.2 fail-closed hardware authorities are
   now checked in and model-free green; Gemma and Qwen B.2 implementation and
   coherence are accepted but all affected final performance receipts are
   reopened under the v2 contention authority, while the DeepSeek and Qwen
   current-head real-artifact cells remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 95 closes an inherited-process-group proof defect
+- Updated: 2026-08-26 (rev 96 records and acts on the exact-head physical
+  multi-slot falsifier at hf2q `08ef2e35`. BF16 passed scalar-equivalent
+  1/2/4/8/16-slot execution and Q4_K_M passed 1/2/4/8, but Q4_K_M width 16
+  returned HTTP 500 after a 2,435,398,041-byte immutable grant made
+  `K_effective=0`: the rectangular planner proved that four transient
+  checkpoint reservations fit the currently empty stores, then the staging
+  path applied the stricter all-configured-slot depth rule and rejected every
+  lane with `NoCommittedCapacity`. The synthetic checkpoint-suppressed
+  rectangular test failed at the executor's plan-identity guard, proving that
+  optional state reuse had been coupled to otherwise-valid target execution.
+  The corrected contract keeps checkpoint admission fail-closed without making
+  generation fail: capacity-aware planning suppresses capture before GPU work,
+  the same rectangular target transaction runs without a checkpoint, and an
+  unexpected post-submit staging rejection discards every cohort-local pending
+  checkpoint before committing the already-validated target advances when the
+  rejection is capacity-only. `PendingOccupied` is not capacity pressure: the
+  single-worker planner proved every selected store had no pending payload, so
+  that outcome increments an invariant-failure counter and rolls the cohort
+  back fail-closed. Planned capacity skips become capture telemetry only after
+  the rectangular target advances commit, preventing cancelled or rolled-back
+  work from creating phantom captures; the partial-capacity counter retains
+  its documented depth-or-simultaneous-pending predicate. It does
+  not reject the requested slot count, inflate the worker's logical grant, or
+  overpromise unreserved host memory across park/reactivate and model swap.
+  Exact-head physical and matched timing receipts remain open until this change
+  lands and the full chain is rerun. Rev 95 closes an inherited-process-group proof defect
   across the remaining Qwen rectangular/Mixed, Gemma B.2, and DeepSeek B.1
   performance leaves before another model run. Each leaf now self-reexecs
   through the release-gate supervisor, proves that its stable owner PID is its
@@ -360,17 +387,23 @@
   three, then two; it never waits for another lane or skips an incompatible
   earlier request. Admission is limited to cold text lanes with the same
   `16..=128` stable boundary, identical target/MTP route, cold target and MTP
-  cursors, and all-lane K+1 checkpoint reservations that fit the aggregate
-  anchor budget before mutation. One rectangular target transaction retains
+  cursors. Checkpoint capture is admitted independently: all-lane K+1
+  reservations must fit the aggregate anchor budget before mutation when
+  capture is enabled, while insufficient optional checkpoint capacity keeps
+  the same rectangular target transaction with capture disabled. One
+  rectangular target transaction retains
   aggregate dense/MoE projections; Qwen3.8 AUTO performs the existing exact
   MTP catch-up lane by lane under the same supervisor lease. A catch-up failure
   rewinds every target and MTP slot, marks every retry state speculation-
   unavailable, and replays one ordinary target cohort without hidden capture.
   The worker validates every checkpoint, stages every pending anchor, rechecks
   cancellation and FIFO ownership, and only then commits physical state and
-  advances scheduler ledgers. Any validation, staging, cancellation, or
-  injected post-checkpoint failure discards the complete pending set and rolls
-  every selected slot back. A cancellation terminates only closed lanes and
+  advances scheduler ledgers. A post-submit capacity rejection discards the
+  complete pending set but preserves the already-validated target advances;
+  a non-capacity staging result is an invariant failure. Any validation,
+  invariant staging failure, cancellation, or injected post-checkpoint failure
+  discards the complete pending set and rolls every selected slot back. A
+  cancellation terminates only closed lanes and
   reinstalls open peers cold without ledger advance; validation, staging, and
   injected failures fail closed after reset. The canonical Qwen3.6 launcher
   enables the policy by default and the Qwen3.8 launcher inherits it; setting

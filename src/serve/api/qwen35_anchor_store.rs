@@ -4,7 +4,9 @@ use std::time::Duration;
 pub(crate) use super::anchor_store::{
     effective_committed_depth, simultaneous_pending_capacity_slots, StagePending,
 };
-use super::anchor_store::{emit_anchor_restore_event, AnchorRestoreEvent};
+use super::anchor_store::{
+    emit_anchor_restore_event, AnchorEntry, AnchorRestoreEvent, AnchorStore,
+};
 
 pub(crate) const DEFAULT_MAX_COMMITTED_ANCHORS: usize = 4;
 
@@ -31,6 +33,7 @@ pub(crate) struct AnchorTelemetry {
     pub post_admission_prefill_failures_total: AtomicU64,
     pub stable_boundary_compound_prefills_total: AtomicU64,
     pub rectangular_prefill_cohorts_total: AtomicU64,
+    pub cohort_staging_invariant_failures_total: AtomicU64,
 }
 
 pub(crate) static TELEMETRY: AnchorTelemetry = AnchorTelemetry {
@@ -56,6 +59,7 @@ pub(crate) static TELEMETRY: AnchorTelemetry = AnchorTelemetry {
     post_admission_prefill_failures_total: AtomicU64::new(0),
     stable_boundary_compound_prefills_total: AtomicU64::new(0),
     rectangular_prefill_cohorts_total: AtomicU64::new(0),
+    cohort_staging_invariant_failures_total: AtomicU64::new(0),
 };
 
 /// One-shot acceptance fault for ADR-049's post-admission recovery gate.
@@ -110,6 +114,12 @@ pub(crate) fn record_stable_boundary_compound_prefill() {
 pub(crate) fn record_rectangular_prefill_cohort() {
     TELEMETRY
         .rectangular_prefill_cohorts_total
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_cohort_staging_invariant_failure() {
+    TELEMETRY
+        .cohort_staging_invariant_failures_total
         .fetch_add(1, Ordering::Relaxed);
 }
 
@@ -177,10 +187,11 @@ pub(crate) fn record_capture(
             .capture_budget_skips_total
             .fetch_add(1, Ordering::Relaxed);
     }
-    if effective_committed_depth < DEFAULT_MAX_COMMITTED_ANCHORS
-        || simultaneous_pending_capacity_slots
-            < TELEMETRY.configured_slots.load(Ordering::Relaxed) as usize
-    {
+    if has_partial_capacity(
+        effective_committed_depth,
+        simultaneous_pending_capacity_slots,
+        TELEMETRY.configured_slots.load(Ordering::Relaxed) as usize,
+    ) {
         TELEMETRY
             .partial_capacity_captures_total
             .fetch_add(1, Ordering::Relaxed);
@@ -197,6 +208,66 @@ pub(crate) fn record_capture(
         &TELEMETRY.aggregate_peak_committed_pending_bytes,
         aggregate_owned_bytes,
     );
+}
+
+fn has_partial_capacity(
+    effective_committed_depth: usize,
+    simultaneous_pending_capacity_slots: usize,
+    configured_slots: usize,
+) -> bool {
+    effective_committed_depth < DEFAULT_MAX_COMMITTED_ANCHORS
+        || simultaneous_pending_capacity_slots < configured_slots
+}
+
+pub(crate) fn record_committed_budget_skips(
+    skipped: usize,
+    aggregate_owned_bytes: u64,
+    effective_committed_depth: usize,
+    simultaneous_pending_capacity_slots: usize,
+    configured_slots: usize,
+) {
+    let skipped = skipped as u64;
+    TELEMETRY
+        .captures_total
+        .fetch_add(skipped, Ordering::Relaxed);
+    TELEMETRY
+        .capture_budget_skips_total
+        .fetch_add(skipped, Ordering::Relaxed);
+    if has_partial_capacity(
+        effective_committed_depth,
+        simultaneous_pending_capacity_slots,
+        configured_slots,
+    ) {
+        TELEMETRY
+            .partial_capacity_captures_total
+            .fetch_add(skipped, Ordering::Relaxed);
+    }
+    TELEMETRY
+        .effective_committed_depth
+        .store(effective_committed_depth as u64, Ordering::Relaxed);
+    TELEMETRY.simultaneous_pending_capacity_slots.store(
+        simultaneous_pending_capacity_slots as u64,
+        Ordering::Relaxed,
+    );
+    raise_peak(
+        &TELEMETRY.aggregate_peak_committed_pending_bytes,
+        aggregate_owned_bytes,
+    );
+}
+
+pub(crate) fn discard_cohort_pending<A: AnchorEntry>(
+    stores: &mut [AnchorStore<A>],
+    slot_indices: &[usize],
+) -> anyhow::Result<usize> {
+    let mut discarded = 0;
+    for &slot_idx in slot_indices {
+        let store = stores
+            .get_mut(slot_idx)
+            .ok_or_else(|| anyhow::anyhow!("Qwen cohort anchor slot {slot_idx} missing"))?;
+        discarded += usize::from(store.discard_pending());
+        store.validate()?;
+    }
+    Ok(discarded)
 }
 
 pub(crate) fn record_restore(event: AnchorRestoreEvent) {
@@ -235,7 +306,7 @@ pub(crate) fn record_evictions(evicted: usize) {
 mod tests {
     use super::super::anchor_store::{AnchorEntry, AnchorPublicationDisposition, AnchorStore};
     use super::{
-        effective_committed_depth, simultaneous_pending_capacity_slots,
+        effective_committed_depth, has_partial_capacity, simultaneous_pending_capacity_slots,
         PostAdmissionPrefillFailure, StagePending, DEFAULT_MAX_COMMITTED_ANCHORS,
     };
 
@@ -369,6 +440,13 @@ mod tests {
         );
         assert_eq!(store.lineage_epoch(), reference.lineage_epoch);
         assert_eq!(store.payload_owned_bytes(), reference.owned_bytes());
+    }
+
+    #[test]
+    fn partial_capacity_metric_matches_its_depth_or_pending_contract() {
+        assert!(!has_partial_capacity(4, 16, 16));
+        assert!(has_partial_capacity(3, 16, 16));
+        assert!(has_partial_capacity(4, 15, 16));
     }
 
     #[test]
