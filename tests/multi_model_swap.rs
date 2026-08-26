@@ -810,6 +810,40 @@ impl ArtifactMappingEvidence {
     }
 }
 
+fn vmmap_contains_exact_artifact(vmmap_stdout: &str, artifact: &std::path::Path) -> bool {
+    let artifact = artifact.to_string_lossy();
+    vmmap_stdout.lines().any(|line| {
+        let line = line.trim_end();
+        let Some(prefix) = line.strip_suffix(artifact.as_ref()) else {
+            return false;
+        };
+        prefix.is_empty()
+            || prefix
+                .as_bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+    })
+}
+
+#[test]
+fn vmmap_artifact_match_rejects_a_basename_embedded_in_another_artifact() {
+    let qwen = std::path::Path::new(
+        "/opt/hf2q/models/generative-swap-text-only-v1/qwen-moe/APEX-Q5_K_M.gguf",
+    );
+    let qwen_line = concat!(
+        "mapped file            104000000-108000000 [ 64.0M] r--/r-- SM=COW  ",
+        "/opt/hf2q/models/generative-swap-text-only-v1/qwen-moe/APEX-Q5_K_M.gguf"
+    );
+    let gemma_line = concat!(
+        "mapped file            104000000-108000000 [ 64.0M] r--/r-- SM=COW  ",
+        "/opt/hf2q/models/generative-swap-text-only-v1/gemma/",
+        "gemma4-ara-2pass-APEX-Q5_K_M.gguf"
+    );
+
+    assert!(vmmap_contains_exact_artifact(qwen_line, qwen));
+    assert!(!vmmap_contains_exact_artifact(gemma_line, qwen));
+}
+
 /// Query both the process file table and virtual-memory map for one physical
 /// artifact. A mapped GGUF may legitimately close its original file descriptor
 /// while retaining file-backed pages, so absence is proven only when both
@@ -848,12 +882,11 @@ fn artifact_mapping_evidence(pid: u32, artifact: &std::path::Path) -> ArtifactMa
         String::from_utf8_lossy(&vmmap.stderr)
     );
     let vmmap_stdout = String::from_utf8_lossy(&vmmap.stdout);
-    let path_text = path.to_string_lossy();
-    let vmmap_live = vmmap_stdout.contains(path_text.as_ref())
-        || path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|name| vmmap_stdout.contains(name));
+    // `vmmap -wide` prints the complete mapped-file path. Match that path as
+    // a whole trailing field: basename substring matching can otherwise call
+    // APEX-Q5_K_M.gguf live while the mapped file is the distinct
+    // gemma4-ara-2pass-APEX-Q5_K_M.gguf artifact.
+    let vmmap_live = vmmap_contains_exact_artifact(&vmmap_stdout, &path);
 
     ArtifactMappingEvidence {
         path,
@@ -1061,11 +1094,14 @@ fn single_resident_host_wired_bound(
     destination_artifact_bytes: u64,
     margin: u64,
 ) -> u64 {
-    previous
+    let destination_bound = previous
         .system_wired_bytes
         .min(current.system_wired_bytes)
         .saturating_add(destination_artifact_bytes)
-        .saturating_add(margin)
+        .saturating_add(margin);
+    let previous_bound = previous.system_wired_bytes.saturating_add(margin);
+    let current_bound = current.system_wired_bytes.saturating_add(margin);
+    destination_bound.max(previous_bound).max(current_bound)
 }
 
 fn replay_host_wired_bound(
@@ -1104,6 +1140,12 @@ fn host_wired_bound_allows_one_destination_artifact_but_not_two() {
         replay_host_wired_bound([9 * GIB, 8 * GIB], destination, margin),
         bound
     );
+
+    let source_dominant =
+        single_resident_host_wired_bound(snapshot(108 * GIB), snapshot(8 * GIB), 25 * GIB, margin);
+    assert_eq!(source_dominant, 110 * GIB);
+    assert!(108 * GIB <= source_dominant);
+    assert!(8 * GIB + 107 * GIB + 25 * GIB > source_dominant);
 }
 
 fn assert_chain_transition_memory(
@@ -1122,11 +1164,25 @@ fn assert_chain_transition_memory(
         single_resident_host_wired_bound(previous, current, destination_artifact_bytes, margin);
     assert!(
         peak.rss_bytes <= rss_bound,
-        "{phase}: process RSS crossed the no-double-residency bound"
+        "{phase}: process RSS crossed the no-double-residency bound: \
+         peak={} bound={} before={} after={} destination={} margin={}",
+        peak.rss_bytes,
+        rss_bound,
+        previous.rss_bytes,
+        current.rss_bytes,
+        destination_artifact_bytes,
+        margin,
     );
     assert!(
         peak.system_wired_bytes <= host_wired_bound,
-        "{phase}: host wired memory crossed the no-double-residency bound"
+        "{phase}: host wired memory crossed the no-double-residency bound: \
+         peak={} bound={} before={} after={} destination={} margin={}",
+        peak.system_wired_bytes,
+        host_wired_bound,
+        previous.system_wired_bytes,
+        current.system_wired_bytes,
+        destination_artifact_bytes,
+        margin,
     );
     (rss_bound, host_wired_bound)
 }
@@ -1327,7 +1383,7 @@ fn observe_generative_chain_phase(
     let q5_dispatches_before = runtime_q5_canonical_dispatches(&state_before, phase);
     assert_eq!(
         resident.bytes_resident, artifact.bytes,
-        "{phase}: resident bytes"
+        "{phase}: text-only generative gate admitted sidecar/projector bytes"
     );
     assert_eq!(
         state_before["pool"]["total_resident_bytes"].as_u64(),

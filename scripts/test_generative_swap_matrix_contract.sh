@@ -74,6 +74,38 @@ jq '.artifacts[0].path_env = "HF2Q_SWAP_ALTERNATE_PATH"' \
   "$manifest" >"$tmp/ambient-path.json"
 expect_manifest_rejected ambient-path "$tmp/ambient-path.json"
 
+# The evidence seal accepts exactly one current schema-v2 identity per
+# qualified artifact. Sparse files keep this model-free while still proving
+# the manifest byte lengths and portable snapshots fail closed.
+mkdir -p "$tmp/preflight" "$tmp/preflight-artifacts"
+while IFS=$'\t' read -r id path_env expected_file expected_bytes expected_sha; do
+    artifact_dir="$tmp/preflight-artifacts/$id"
+    mkdir -p "$artifact_dir"
+    artifact="$artifact_dir/$expected_file"
+    dd if=/dev/zero of="$artifact" bs=1 count=0 seek="$expected_bytes" 2>/dev/null
+    artifact=$(cd "$artifact_dir" && pwd -P)/$expected_file
+    printf -v "$path_env" '%s' "$artifact"
+    export "${path_env?}"
+    snapshot=$(stat -f '%d:%i:%z:%m:%c' "$artifact" 2>/dev/null \
+      || stat -c '%d:%i:%s:%Y:%Z' "$artifact")
+    jq -n --arg path "$artifact" --arg sha "$expected_sha" \
+      --arg snapshot "$snapshot" --argjson bytes "$expected_bytes" '{
+        schema_version:2,path:$path,sha256:$sha,file_snapshot:$snapshot,
+        file_stamp:{device:1,inode:1,bytes:$bytes,modified_seconds:1,
+          modified_nanoseconds:1,changed_seconds:1,changed_nanoseconds:1},
+        content_hash_verified:true,run_verification:"content_hash"
+      }' >"$tmp/preflight/$id.json"
+done < <(jq -r '.artifacts[] | [.id,.path_env,.file,.bytes,.sha256] | @tsv' \
+  "$manifest")
+hf2q_validate_generative_swap_preflight "$tmp/preflight" "$manifest"
+jq '.file_snapshot = "stale"' "$tmp/preflight/deepseek.json" \
+  >"$tmp/stale-preflight.json"
+mv "$tmp/stale-preflight.json" "$tmp/preflight/deepseek.json"
+if hf2q_validate_generative_swap_preflight "$tmp/preflight" "$manifest"; then
+    echo "stale preflight artifact identity unexpectedly passed" >&2
+    exit 1
+fi
+
 source_commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 binary_sha=$(printf 'b%.0s' {1..64})
 dependency_version=9.8.7
@@ -119,7 +151,7 @@ jq -n \
   def margin($bytes): ([($bytes/10|floor),2*$gib]|max);
   def process_policy: {
     schema_version:1,
-    scheduler:{mode:"serial_fifo"},
+    scheduler:{mode:"slot_aware",max_slots:4},
     requested_context_tokens:null,
     kv_cache_budget_bytes:null,
     queue_capacity:32,
@@ -177,7 +209,10 @@ jq -n \
       | {index:$index,from:$before.artifact.id,to:$after.artifact.id,load_seconds:1,
           peak_rss_bytes:$rss,peak_host_wired_bytes:$wired,
           rss_bound_bytes:($rss+$margin),
-          host_wired_bound_bytes:($wired+$after.artifact.bytes+$margin)}
+          host_wired_bound_bytes:([
+            $before.memory.host_wired_bytes+$margin,
+            $after.memory.host_wired_bytes+$margin,
+            $wired+$after.artifact.bytes+$margin] | max)}
     ] as $transitions
   | {
       schema:1,verdict:"pass",gate:"generative-cross-family-two-cycle",
@@ -213,6 +248,44 @@ validate_receipt() {
 }
 validate_receipt "$tmp/runtime.json"
 
+# macOS `footprint` can report a legitimate zero process-wired value for a
+# Metal-backed replacement even while RSS, physical footprint, and host-wired
+# accounting remain positive. Preserve zero as measured data, never a sentinel.
+jq --argjson gib "$gib" '
+  .phases |= map(.memory.wired_bytes = 0)
+  | .replay_bounds.wired_bytes = (2*$gib)
+' "$tmp/runtime.json" >"$tmp/zero-process-wired.json"
+validate_receipt "$tmp/zero-process-wired.json"
+
+# A large-source -> small-destination transition starts its sampler while the
+# valid source endpoint is still resident. Admit that endpoint plus margin,
+# but reject a peak large enough to contain both artifacts.
+jq --argjson gib "$gib" '
+  def margin($bytes): ([($bytes/10|floor),2*$gib]|max);
+  .phases[1].memory.host_wired_bytes = 108*$gib
+  | . as $receipt
+  | .transitions |= map(
+      . as $transition
+      | $receipt.phases[$transition.index] as $before
+      | $receipt.phases[$transition.index+1] as $after
+      | ([$before.memory.rss_bytes,$after.memory.rss_bytes]|max) as $rss
+      | ([$before.memory.host_wired_bytes,$after.memory.host_wired_bytes]|min) as $wired
+      | margin($rss) as $margin
+      | .host_wired_bound_bytes = ([
+          $before.memory.host_wired_bytes+$margin,
+          $after.memory.host_wired_bytes+$margin,
+          $wired+$after.artifact.bytes+$margin] | max)
+      | .peak_host_wired_bytes =
+          (if .index == 1 then $before.memory.host_wired_bytes else $wired end))
+' "$tmp/runtime.json" >"$tmp/source-dominant.json"
+validate_receipt "$tmp/source-dominant.json"
+jq --argjson gib "$gib" '.transitions[1].peak_host_wired_bytes = 140*$gib' \
+  "$tmp/source-dominant.json" >"$tmp/source-plus-destination.json"
+if validate_receipt "$tmp/source-plus-destination.json"; then
+    echo "source-plus-destination wired peak unexpectedly passed" >&2
+    exit 1
+fi
+
 expect_receipt_rejected() {
     local label=$1 filter=$2
     jq "$filter" "$tmp/runtime.json" >"$tmp/mutated.json"
@@ -236,6 +309,8 @@ expect_receipt_rejected wrong-pid '.phases[5].process_pid = 43'
 expect_receipt_rejected wrong-phase-label '.phases[5].phase = "P05-qwen-dense"'
 expect_receipt_rejected process-policy-drift '.phases[5].process_policy_sha256 = ("d" * 64)'
 expect_receipt_rejected typed-process-policy-drift '.phases[5].process_policy.queue_capacity = 99'
+expect_receipt_rejected serial-scheduler-fallback '.phases |= map(.process_policy.scheduler = {mode:"serial_fifo"})'
+expect_receipt_rejected negative-process-wired '.phases[1].memory.wired_bytes = -1'
 expect_receipt_rejected q5-route-not-observed '.phases[2].q5_route.route_observed = false'
 expect_receipt_rejected non-q5-route-claimed '.phases[0].q5_route = {policy_enabled:true,route:"dense_q5k_canonical_q4x4",route_observed:true}'
 expect_receipt_rejected q5-container-without-route-claimed '.phases[4].q5_route = {policy_enabled:true,route:"dense_q5k_canonical_q4x4",route_observed:true}'
@@ -277,8 +352,13 @@ fi
 
 grep -Fq 'generative_cross_family_two_cycle_e2e' "$runner"
 grep -Fq 'HF2Q_GENERATIVE_SWAP_CHAIN_RECEIPT' "$runner"
+grep -Fq 'hf2q_release_prepare_model_verification' "$runner"
+grep -Fq 'hf2q_validate_generative_swap_preflight' "$runner"
+# shellcheck disable=SC2016 # source-canary literal, not an expansion here
+grep -Fq 'HF2Q_MODEL_VERIFICATION_RECEIPT_DIR="$OUT_DIR/preflight"' "$runner"
+grep -Fq 'HF2Q_GENERATIVE_SWAP_CARGO_HOME' "$runner"
 # shellcheck disable=SC2016 # source-canary literals, not expansions here
-grep -Fq 'GIT_COMMIT_SHA="$source_commit" cargo build' "$runner"
+grep -Fq 'CARGO_HOME="$GATE_CARGO_HOME" GIT_COMMIT_SHA="$source_commit"' "$runner"
 # shellcheck disable=SC2016 # source-canary literals, not expansions here
 grep -Fq '"$binary" __build-info' "$runner"
 grep -Fq 'hf2q_validate_generative_swap_seal' "$runner"
@@ -291,6 +371,32 @@ grep -Fq 'process serving policy changed across family replacement' "$rust_gate"
 grep -Fq 'Q5_K_M inference encoded no canonical Q5 dispatch' "$rust_gate"
 grep -Fq 'MLX_DISP_BUCKET=1' "$runner"
 grep -Fq 'HF2Q_Q5K_CANONICAL_Q4X4=1' "$runner"
+# The real-model harness must never compile over the sealed candidate it is
+# about to execute and attest. These canaries pin the private-copy boundary
+# used by the already-qualified exact-swap gate.
+# These are intentionally literal source-code canaries, not shell expressions.
+# shellcheck disable=SC2016
+grep -Fq 'sealed_binary_dir=$(mktemp -d' "$runner"
+# shellcheck disable=SC2016
+grep -Fq 'cp "$binary" "$sealed_binary"' "$runner"
+# shellcheck disable=SC2016
+grep -Fq 'binary=$sealed_binary' "$runner"
+grep -Fq 'text-only swap artifact must be isolated from projector/other GGUF siblings' "$runner"
+# shellcheck disable=SC2016
+sealed_rebind_line=$(grep -nF 'binary=$sealed_binary' "$runner" | awk -F: 'NR == 1 { print $1 }')
+# shellcheck disable=SC2016
+binary_sha_line=$(grep -nF 'binary_sha=$(hf2q_generative_swap_sha256_file "$binary")' \
+  "$runner" | awk -F: 'NR == 1 { print $1 }')
+cargo_test_line=$(grep -nF 'cargo test --release --locked --test multi_model_swap' \
+  "$runner" | awk -F: 'NR == 1 { print $1 }')
+preflight_line=$(grep -nF 'hf2q_release_prepare_model_verification' \
+  "$runner" | awk -F: 'NR == 1 { print $1 }')
+((sealed_rebind_line < binary_sha_line \
+  && binary_sha_line < preflight_line \
+  && preflight_line < cargo_test_line)) || {
+    echo "sealed binary and artifact identities must be fixed before harness compilation" >&2
+    exit 1
+}
 if grep -Fq 'actual_sha=' "$runner"; then
     echo "runner must consume the retained load-time artifact digest" >&2
     exit 1

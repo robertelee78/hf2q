@@ -9,13 +9,18 @@
   the Qwen rectangular operator-lifecycle correction has exact native-Q5
   state proof, a completed Q5 fused-route falsifier, and a codec-wide exact
   Q4x4 implementation with Qwen3.8 quality/lifecycle and Qwen3.6 route proof;
-  its published dependency is pinned while multi-slot, swap, and
-  matched-reference acceptance remain open;
+  its published dependency is pinned and the exact five-format physical
+  1/2/4/8/16-slot matrix is green, while swap and matched-reference
+  acceptance remain open;
   the DeepSeek B.1 and Gemma/Qwen B.2 fail-closed hardware authorities are
   now checked in and model-free green, while their real-artifact cells remain
   open)
 - Date: 2026-08-22
-- Updated: 2026-08-25 (rev 65, width-invariant Q5 backend published and pinned)
+- Updated: 2026-08-25 (rev 71, exact five-format physical matrix green;
+  cross-family swap harness identity race and post-drain rehash falsified;
+  canonical schema-v2 preflight, isolated-Cargo, and source-dominant
+  host-wired authorities are model-free green; exact-path mapped-artifact
+  classification is model-free green after falsifying a basename collision)
   — the Qwen implementation lineage begins at `95d618c8`, based on main
   `32181b61`: explicit per-slot AnchorStore,
   linear-lineage pruning, fail-atomic restore preflight, exact payload
@@ -1595,11 +1600,99 @@ was not the first statement; both proof defects are fixed. The complete binary
 suite now passes 5,121 tests with 66 explicit ignores and zero failures.
 
 This is not the final hf2q release claim. Clean-source all-format four-
-position, physical multi-slot, model-swap, full agentic lifecycle, and matched-
-reference gates remain required. Those harnesses must reopen the actual frozen
-process-policy log, and the Q5 artifact must additionally join a real `r1=4`
-dispatch canary; an environment value or receipt field alone is not execution
-proof.
+position and physical multi-slot gates are now complete; model-swap, full
+agentic lifecycle, and matched-reference gates remain required. Those
+harnesses must reopen the actual frozen process-policy log; an environment
+value or receipt field alone is not execution proof.
+
+Rev 66 seals the clean-source Qwen3.8 artifact matrix at runtime commit
+`6fad526d687b7a8d4b9e9a1c95468468ee3c661e`. BF16, Q4_K_M, Q5_K_M, Q6_K,
+and Q8_0 each passed exact four-position/state continuation and real physical
+widths 1/2/4/8/16 with per-lane scalar replay. The Q5 receipt reopens the
+actual `kernel_mul_mv_ext_q5_K_f32_r1_4` dispatch canary. The immutable
+receipts are `/opt/hf2q-evidence/universal-release-6fad526d-four-position/matrix.json`
+and `/opt/hf2q-evidence/universal-release-6fad526d-physical-multislot/matrix.json`.
+
+The first cross-family swap spike then failed before model admission for a
+proof-integrity reason: the supplied sealed binary lived in the source Cargo
+target, and the gate's own `cargo test --release` replaced that pathname
+before the Rust harness checked its SHA-256. The observed digest mismatch was
+therefore a harness/candidate identity race, not a model-load result. The
+reformulated contract snapshots the already-validated candidate into a private
+temporary executable before hashing or harness compilation. The same path is
+then executed and re-hashed after the run, so Cargo cannot replace the bytes
+being attested. The cross-family real-artifact spike must be rerun from a new
+exact commit before its acceptance box can close.
+
+The corrected runner then reached the first real Qwen-dense admission and
+rejected 18,275,182,400 resident bytes against the qualified 16,810,714,944-
+byte text artifact. Source inspection showed that the selected local directory
+also contained the automatically paired projector: pool accounting correctly
+charged text bytes plus page-rounded projector mappings plus its complete
+vision-cache reservation. This was not an accounting regression. ADR-047's
+universal generative chain is the text-only gate; its distinct multimodal
+projector lifecycle has a separate acceptance row. The reformulated runner
+therefore requires each qualified text GGUF in an isolated artifact directory
+and rejects projector/other GGUF siblings before loading. The real rerun uses
+same-inode hard links in isolated directories, preserving the exact qualified
+text bytes without a copy or format rewrite.
+
+Rev 67 records the next swap falsifier without relaxing the product clock.
+The corrected text-only candidate passed its initial Qwen phase, but its first
+DeepSeek activation took 202.787 seconds. A live process sample placed the
+delay in `TextArtifactIdentity::inspect` after the Qwen engine had shut down;
+the actual DeepSeek map plus synchronous warmup was about 14.8 seconds. The
+universal runner, unlike the already-sealed exact-Qwen swap runner, had not
+prepared or passed the server's canonical schema-v2 verification-receipt
+directory. The server therefore performed the correct but availability-hostile
+107 GB content hash inside the replacement transaction.
+
+The reformulated runner hashes or cache-validates all four stable artifacts
+through the sealed binary before server startup, passes the closed receipt
+directory to the existing canonical-path identity registry, and seals every
+receipt in the evidence manifest. The contract rejects any missing, extra,
+legacy, wrong-path, wrong-digest, or stale-snapshot member; its explicit stale
+snapshot mutation is green. Transition time remains the complete
+client-observed activation under the fixed 60-second ceiling; no timing
+exclusion or new runtime hash path was added. This is source/model-free
+authority, not a real-artifact pass; the fresh 13-phase rerun remains required.
+
+The first exact-candidate invocation stopped before hashing or model admission
+because the runner inherited an operator Cargo configuration forbidden by its
+own exact-source policy. The runner now uses one absolute isolated Cargo home
+outside source and evidence trees for every build, metadata, and test command;
+the no-ambient-patch authority remains unchanged.
+
+The next exact run passed the formerly slow preverified DeepSeek transition
+and reached Qwen-MoE, then the host-wired gate rejected a 115,267,158,016-byte
+peak. Diagnostic replay showed that peak was below the 115,271,286,784-byte
+pre-switch DeepSeek endpoint; the old 34,967,713,792-byte bound had admitted
+only the smaller destination and therefore rejected the source at sampler
+start. The source/destination-symmetric contract now admits the maximum of
+either endpoint plus margin or the lower endpoint plus one destination and
+margin. It still rejects simultaneous DeepSeek plus Qwen-MoE residency. The
+source-dominant mutant and independent shell arithmetic are green; a fresh
+exact-chain rerun remains required.
+
+The fresh run then passed Qwen-Dense, Qwen-MoE, and DeepSeek before the Gemma
+phase exposed a proof-classification bug rather than a runtime ownership leak:
+`lsof` found no live Qwen-MoE descriptor, but the `vmmap` fallback searched
+`APEX-Q5_K_M.gguf` as a basename substring and therefore matched Gemma's
+distinct `gemma4-ara-2pass-APEX-Q5_K_M.gguf` path. The classifier now requires
+the exact canonical artifact path as a complete trailing `vmmap -wide` field;
+the focused collision mutant is green and the fail-closed eviction assertion
+is unchanged. The complete exact-chain rerun remains the hardware authority.
+
+That corrected runtime completed all thirteen phases and twelve forced family
+replacements, but the independent validator exposed two additional stale
+assumptions: it required `serial_fifo` despite the production process reporting
+the required four-slot `slot_aware` scheduler, and it rejected legitimate zero
+process-wired measurements from macOS `footprint`. The reformulated authority
+requires `slot_aware` with at least four slots; preserves strict positivity for
+RSS, physical footprint, and host-wired memory; and treats process-wired bytes
+as a nonnegative measurement. Serial fallback and negative-wired mutations are
+green. The complete captured runtime validates under this model-free contract;
+the exact-lineage rerun remains the hardware seal.
 
 **Lane B gates:** B.0 byte-identity (cohort+concurrent-decode); cooperative receipt regime (≥5 alternating serial/cooperative pairs, sustained median faster, peak RSS recorded, independent receipt verification); thermal contract (Nominal start, continuous Fair-or-better, no gap >5 s, fail-closed); memory H3 (≤116 GiB peak beside the 100 GiB artifact); product ceilings unchanged (60 s cold / 15 s cached-automatic-SSE / 35 s tool-result — never widened); B4 decode-cohort gate re-pass; the two B.1 latency contracts.
 

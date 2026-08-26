@@ -2,7 +2,7 @@
 
 - **Status:** Accepted; model-swap proof-integrity corrections and the one-process universal generative-family source gate are implemented; its hardware matrix remains pending; the exact Qwen3.8 cross-format single-hash swap matrix is hardware-sealed; embedding and projector lifecycle execution remains separate
 - **Date:** 2026-08-20
-- **Updated:** 2026-08-24
+- **Updated:** 2026-08-25
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
 
 ## Context
@@ -808,6 +808,81 @@ The structural and mutation gate is checked in. No 13-phase Apple-Silicon
 artifact receipt has been produced yet, so this is source authority only, not
 universal runtime acceptance or a performance claim.
 
+The first 2026-08-25 hardware spike reached Qwen-dense admission and correctly
+exposed an input-contract mismatch: the chosen text pathname had an automatic
+sibling projector, so the pool charged text bytes plus the projector's mapped
+physical bytes and full vision-cache reservation. Gate 12 is deliberately the
+text-only generative-family chain; gate 14 owns projector lifecycle. The gate
+now rejects projector/other GGUF siblings before model load, and qualified
+text artifacts are presented through isolated same-inode hard links. This
+preserves the immutable text identity while preventing a local directory's
+optional sidecar layout from silently changing Gate 12's resident-byte and
+eviction contract.
+
+The corrected text-only spike passed the initial Qwen phase, then the first
+DeepSeek activation took 202.787 seconds and exceeded the unchanged 60-second
+client-observed switch bound. A live process sample placed that interval in
+`TextArtifactIdentity::inspect` after the Qwen victim had already shut down;
+the subsequent DeepSeek mapping and synchronous warmup took about 14.8
+seconds. This was not a 107 GB model-load limit. The universal runner had
+omitted the already-implemented schema-v2 receipt directory used by the exact
+Qwen matrix, so the server correctly fell back to a full content hash during
+activation.
+
+The reformulated universal contract now creates or reuses one schema-v2
+receipt for each of its four exact artifacts before the server starts, admits
+the closed receipt directory through
+`HF2Q_MODEL_VERIFICATION_RECEIPT_DIR`, and seals all four receipts in the
+evidence manifest. The server remains the nanosecond-stamp authority and each
+transition is still timed end to end against 60 seconds; no authentication
+time is subtracted and no second runtime identity mechanism is introduced.
+The shell/static/mutation battery is green. A fresh 13-phase hardware receipt
+remains required before Gate 12 is accepted.
+
+The first exact-candidate invocation then stopped before hashing or model
+admission because the runner inherited an operator Cargo configuration that
+its own exact-source policy forbids. The runner now owns an absolute isolated
+Cargo home outside both source and evidence trees, rejects configuration there,
+and passes it to every build, metadata, and test command. This preserves the
+existing no-ambient-patch authority instead of requiring operators to alter
+their normal Cargo setup.
+
+The next exact run proved the preverified DeepSeek transition was inside its
+60-second budget, then failed at DeepSeek -> Qwen-MoE on host-wired memory.
+Diagnostic-only replay measured a 115,267,158,016-byte peak against a
+115,271,286,784-byte pre-switch DeepSeek endpoint and a 7,777,222,656-byte
+post-switch endpoint. The old destination-only formula produced a
+34,967,713,792-byte bound and therefore rejected the already-resident source
+at sampler start. The corrected source/destination-symmetric formula below
+admits either endpoint plus margin or one destination above the lower endpoint,
+while a simultaneous 107.4 GB source plus 25.0 GB destination remains over
+bound. The model-free source-dominant mutant and independent receipt arithmetic
+are green; the complete hardware chain reruns from a fresh exact candidate.
+
+That rerun passed Qwen-Dense, Qwen-MoE, and DeepSeek, then exposed a distinct
+proof-harness defect at the Gemma phase. `lsof` proved the evicted Qwen-MoE
+artifact closed, while the `vmmap` fallback called it live only because it
+searched the basename `APEX-Q5_K_M.gguf` as a substring of the current
+`gemma4-ara-2pass-APEX-Q5_K_M.gguf` filename. The probe now matches the exact
+canonical path as a complete trailing `vmmap -wide` field. A focused mutant
+proves that the exact Qwen path matches and the longer Gemma path does not;
+the eviction invariant itself remains fail-closed. The full chain still must
+pass from a freshly built exact candidate before this hardware gate closes.
+
+The corrected runtime then completed all thirteen phases and twelve forced
+family replacements in one production process. Its independent validator
+correctly refused to seal the receipt because two older proof assumptions had
+drifted from the production telemetry: it required `serial_fifo` even though
+the process reported the required `slot_aware` policy with four slots, and it
+required strictly positive process-wired bytes even though macOS `footprint`
+legitimately reported zero after several Metal-backed replacements. The
+authority now requires `slot_aware` with at least four slots, keeps RSS,
+physical-footprint, and host-wired measurements strictly positive, and accepts
+process-wired bytes only as a nonnegative integer. New mutations reject serial
+fallback and negative wired data. The captured runtime validates under that
+reformulated model-free authority; the final exact-lineage rerun remains the
+hardware seal.
+
 ### Exact Qwen3.8 cross-format swap matrix contract (2026-08-23)
 
 The prior Qwen3.8 artifact catalog and four-position gate proved immutable
@@ -950,13 +1025,15 @@ only with settled endpoints therefore rejected legitimate one-model loading
 and made the gate sampling-luck dependent.
 
 The corrected universal arithmetic retains the strict process-RSS endpoint
-bound. For system-wired memory it independently computes `min(before,
-after) + destination_artifact_bytes + margin`. This admits at most one fully
-wired destination above the lower host baseline and still rejects source plus
-destination double residency. Pairwise Qwen, the long-lived Qwen chain, and
-the cross-family generative chain use the same formula, and their contract
-validators recompute it from sealed artifact bytes rather than trusting the
-receipt's bound.
+bound. For system-wired memory it independently computes the maximum of
+`before + margin`, `after + margin`, and
+`min(before, after) + destination_artifact_bytes + margin`. The first two
+terms admit either measured single-resident endpoint; the third admits one
+destination becoming transiently wired above the lower host baseline. Source
+plus destination double residency still exceeds the bound. Pairwise Qwen, the
+long-lived Qwen chain, and the cross-family generative chain use the same
+formula, and their contract validators recompute it from sealed artifact bytes
+rather than trusting the receipt's bound.
 
 The first 17-phase hub run then completed every transition and failed only the
 old final host-wired replay ceiling, which still compared a potentially wired

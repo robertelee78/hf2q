@@ -169,6 +169,59 @@ hf2q_generative_swap_dependency_identity() {
     printf '%s\t%s\t%s\n' "$lock_version" "$lock_source" "$lock_checksum"
 }
 
+# Independently reopen the schema-v2 artifact identities supplied to the
+# server. The runtime is the final nanosecond-stamp authority; this shell gate
+# additionally binds the exact path, manifest digest, portable file snapshot,
+# and closed receipt-directory membership into the evidence seal.
+hf2q_validate_generative_swap_preflight() {
+    local directory=${1:?preflight receipt directory is required}
+    local manifest=${2:?matrix manifest is required}
+    local expected_entries actual_entries id path_env expected_file expected_bytes
+    local expected_sha path canonical receipt current_snapshot
+
+    hf2q_validate_generative_swap_matrix "$manifest" || return 1
+    [[ "$directory" == /* && -d "$directory" && ! -L "$directory" ]] || return 1
+    expected_entries=$(jq -r '.artifacts[].id + ".json"' "$manifest" | sort) \
+      || return 1
+    actual_entries=$(cd "$directory" \
+      && find . -mindepth 1 -maxdepth 1 -print | sed 's#^./##' | sort) \
+      || return 1
+    [[ "$actual_entries" == "$expected_entries" ]] || return 1
+
+    while IFS=$'\t' read -r id path_env expected_file expected_bytes expected_sha; do
+        path=${!path_env:-}
+        [[ "$path" == /* && -f "$path" && -r "$path" && ! -L "$path" ]] \
+          || return 1
+        canonical=$(cd "$(dirname "$path")" && pwd -P)/$(basename "$path") \
+          || return 1
+        [[ "$(basename "$canonical")" == "$expected_file" \
+          && "$(stat -f '%z' "$canonical" 2>/dev/null \
+            || stat -c '%s' "$canonical")" == "$expected_bytes" ]] || return 1
+        receipt="$directory/$id.json"
+        [[ -f "$receipt" && -r "$receipt" && ! -L "$receipt" ]] || return 1
+        jq -e --arg path "$canonical" --arg sha "$expected_sha" \
+          --argjson bytes "$expected_bytes" '
+          .schema_version == 2
+          and .path == $path
+          and .sha256 == $sha
+          and (.file_snapshot | type == "string" and length > 0)
+          and (.file_stamp | keys | sort) == ["bytes","changed_nanoseconds",
+            "changed_seconds","device","inode","modified_nanoseconds",
+            "modified_seconds"]
+          and (.file_stamp.bytes == $bytes)
+          and (all(.file_stamp[]; type == "number" and floor == .))
+          and .content_hash_verified == true
+          and (.run_verification
+            | IN("content_hash","cached_unchanged_file","upgraded_legacy_receipt"))
+        ' "$receipt" >/dev/null || return 1
+        current_snapshot=$(stat -f '%d:%i:%z:%m:%c' "$canonical" 2>/dev/null \
+          || stat -c '%d:%i:%s:%Y:%Z' "$canonical") || return 1
+        [[ "$(jq -er .file_snapshot "$receipt")" == "$current_snapshot" ]] \
+          || return 1
+    done < <(jq -r '.artifacts[] | [.id,.path_env,.file,.bytes,.sha256] | @tsv' \
+      "$manifest")
+}
+
 # Validate the execution receipt independently of the Rust producer. In
 # particular, transition and replay memory ceilings are recomputed from raw
 # phase samples instead of trusting producer-authored bound fields.
@@ -268,8 +321,10 @@ hf2q_validate_generative_swap_receipt() {
           "requested_context_tokens","scheduler","schema_version",
           "warmup_synchronously"] | sort)
         and $phase.process_policy.schema_version == 1
-        and ($phase.process_policy.scheduler | keys | sort) == ["mode"]
-        and $phase.process_policy.scheduler.mode == "serial_fifo"
+        and ($phase.process_policy.scheduler | keys | sort) == ["max_slots","mode"]
+        and $phase.process_policy.scheduler.mode == "slot_aware"
+        and ($phase.process_policy.scheduler.max_slots
+          | type == "number" and floor == . and . >= 4)
         and ($phase.process_policy.requested_context_tokens == null
           or ($phase.process_policy.requested_context_tokens | type == "number"))
         and ($phase.process_policy.kv_cache_budget_bytes == null
@@ -322,7 +377,18 @@ hf2q_validate_generative_swap_receipt() {
         and ($phase.memory | keys | sort) == ["host_wired_bytes",
           "physical_footprint_bytes","physical_footprint_peak_bytes","rss_bytes",
           "wired_bytes"]
-        and all($phase.memory[]; type == "number" and floor == . and . > 0))
+        and ($phase.memory.rss_bytes
+          | type == "number" and floor == . and . > 0)
+        and ($phase.memory.physical_footprint_bytes
+          | type == "number" and floor == . and . > 0)
+        and ($phase.memory.physical_footprint_peak_bytes
+          | type == "number" and floor == . and . > 0)
+        and ($phase.memory.host_wired_bytes
+          | type == "number" and floor == . and . > 0)
+        # `footprint` legitimately reports zero process-wired bytes after
+        # some Metal-backed family replacements. Zero is measured, not absent.
+        and ($phase.memory.wired_bytes
+          | type == "number" and floor == . and . >= 0))
       and ([.phases[].resident.generation] | unique | length)
         == ($matrix.sequence | length)
       and ([.phases[].resident.pool_key_sha256] | unique | length) == 4
@@ -344,18 +410,21 @@ hf2q_validate_generative_swap_receipt() {
         | ([$before.memory.rss_bytes, $after.memory.rss_bytes] | max) as $rss
         | ([$before.memory.host_wired_bytes, $after.memory.host_wired_bytes] | min) as $host_wired
         | margin($rss) as $memory_margin
-        | (keys | sort) == ["from","host_wired_bound_bytes","index","load_seconds",
-            "peak_host_wired_bytes","peak_rss_bytes","rss_bound_bytes","to"]
+        | ([$before.memory.host_wired_bytes + $memory_margin,
+            $after.memory.host_wired_bytes + $memory_margin,
+            $host_wired + $after.artifact.bytes + $memory_margin] | max)
+          as $host_wired_bound
+        | (keys | sort) == ["from","host_wired_bound_bytes","index",
+            "load_seconds","peak_host_wired_bytes","peak_rss_bytes",
+            "rss_bound_bytes","to"]
         and $transition.from == $before.artifact.id
         and $transition.to == $after.artifact.id
         and ($transition.load_seconds | type == "number" and . >= 0
           and . < $matrix.load_budget_seconds)
         and $transition.rss_bound_bytes == ($rss + $memory_margin)
-        and $transition.host_wired_bound_bytes
-          == ($host_wired + $after.artifact.bytes + $memory_margin)
+        and $transition.host_wired_bound_bytes == $host_wired_bound
         and $transition.peak_rss_bytes <= ($rss + $memory_margin)
-        and $transition.peak_host_wired_bytes
-          <= ($host_wired + $after.artifact.bytes + $memory_margin))
+        and $transition.peak_host_wired_bytes <= $host_wired_bound)
       and .replay_bounds == {
         rss_bytes:($receipt.phases[0].memory.rss_bytes
           + margin($receipt.phases[0].memory.rss_bytes)),
@@ -413,9 +482,10 @@ hf2q_validate_generative_swap_seal() {
     local matrix=${1:?matrix receipt is required}
     local manifest=${2:?matrix manifest is required}
     local source_root=${3:?exact source root is required}
-    local directory runtime evidence result
+    local directory runtime evidence result preflight
     local source_commit binary_sha dependency_version dependency_source dependency_checksum
     local runtime_sha runner_sha contract_sha manifest_sha expected_entries
+    local expected_evidence_paths actual_evidence_paths
 
     [[ -f "$matrix" && -r "$matrix" && ! -L "$matrix" \
       && "$(basename "$matrix")" == matrix.json ]] || return 1
@@ -423,12 +493,14 @@ hf2q_validate_generative_swap_seal() {
     runtime="$directory/runtime.json"
     evidence="$directory/evidence.sha256"
     result="$directory/result.sha256"
+    preflight="$directory/preflight"
     for path in "$runtime" "$evidence" "$result"; do
         [[ -f "$path" && -r "$path" && ! -L "$path" ]] || return 1
     done
-    expected_entries=$'evidence.sha256\nmatrix.json\nresult.sha256\nruntime.json\nruntime.log'
+    expected_entries=$'evidence.sha256\nmatrix.json\npreflight\nresult.sha256\nruntime.json\nruntime.log'
     [[ "$(find "$directory" -mindepth 1 -maxdepth 1 -print \
       | sed 's#^.*/##' | sort)" == "$expected_entries" ]] || return 1
+    hf2q_validate_generative_swap_preflight "$preflight" "$manifest" || return 1
 
     source_commit=$(jq -er '.binding.source_commit' "$matrix") || return 1
     binary_sha=$(jq -er '.binding.binary_sha256' "$matrix") || return 1
@@ -450,11 +522,10 @@ hf2q_validate_generative_swap_seal() {
       "$dependency_checksum" || return 1
     [[ "$(jq -Sc 'del(.evidence)' "$matrix")" == "$(jq -Sc . "$runtime")" ]] \
       || return 1
-    [[ "$(awk 'END { print NR }' "$evidence")" == 2 \
-      && "$(sed -n '1p' "$evidence")" == \
-        "$(hf2q_generative_swap_sha256_file "$runtime")  runtime.json" \
-      && "$(sed -n '2p' "$evidence")" == \
-        "$(hf2q_generative_swap_sha256_file "$directory/runtime.log")  runtime.log" \
+    expected_evidence_paths=$'preflight/deepseek.json\npreflight/gemma.json\npreflight/qwen-dense.json\npreflight/qwen-moe.json\nruntime.json\nruntime.log'
+    actual_evidence_paths=$(awk '{ print substr($0, 67) }' "$evidence" | sort) \
+      || return 1
+    [[ "$actual_evidence_paths" == "$expected_evidence_paths" \
       && "$(awk 'END { print NR }' "$result")" == 2 \
       && "$(sed -n '1p' "$result")" == \
         "$(hf2q_generative_swap_sha256_file "$matrix")  matrix.json" \
