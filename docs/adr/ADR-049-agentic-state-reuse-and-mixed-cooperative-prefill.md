@@ -16,7 +16,26 @@
   now checked in and model-free green, while their real-artifact cells remain
   open)
 - Date: 2026-08-22
-- Updated: 2026-08-25 (rev 77, exact five-format physical matrix and universal
+- Updated: 2026-08-26 (rev 79, the minimal Gemma output-projection plus
+  expert-gate/up lane correction is exact through final logits for the pinned
+  B2 M32 Q5_K_M hardware oracle and improves the 64-token rectangle from
+  125.6 ms of sequential scalar work to 103.8 ms, a 17.4% wall reduction and
+  about 21.0% aggregate-throughput gain. The corrected first divergence also
+  restores exact downstream expert-down/combine output without changing those
+  operators; B4, cache-continuation, and product-serving cells remain open.
+  Rev 78 recorded that the Gemma live-rectangle stage bisection
+  proves the existing production path exact through attention and proves the
+  canonical per-lane output-projection candidate exact through post-attention
+  state, all raw dense/router
+  projections, GELU, every top-k expert ID and routing-weight bit, and dense
+  down; the first changed operator is the aggregate expert gate/up `mm_id`
+  dispatch. The implementation hypothesis is therefore lane-width expert
+  gate/up first, with an explicit shared-scratch barrier, while expert down is
+  decided only after that correction. A proposed attention replacement has no
+  demonstrated correctness defect and its first TQ oracle did not reproduce
+  the live tiled route; it is reduced to a current-route exactness/performance
+  falsifier before any production code may survive. Rev 77 sealed the exact
+  five-format physical matrix and universal
   four-family swap green; universal SlotAware private-queue liveness is
   hardware-proven for Gemma's four-slot burst and the Gemma B.2 runner now
   rejects the full single-quoted continuation bug class;
@@ -1803,20 +1822,63 @@ addressing, embeddings, and Q/K/V projection as the first cause for this
 first changed operator. The investigation-only arm selector and rejected
 runtime candidates were removed from the landing diff after the measurement.
 
-The deciding Gemma hypothesis is now an equality-preserving rectangular
-operator, not concatenation through `forward_prefill_batched_multi_seq_live`.
-It must retain each scalar 32-row operator identity while adding a physical
-lane axis and explicit slot/KV mapping. The first implementation spike is a
-shared-weight native quantized matmul with physical `[B,M,K]` activations and
-`[B,M,N]` output, weight batch one, and the scalar `M` route/tile unchanged for
-every lane. Its per-lane outputs and selected route must be byte-identical to
-canonical scalar calls before Gemma may consume it. Attention then uses an
-explicit lane batch and selected-slot cache mapping; expert work remains
-lane-local until an exact grouped implementation is independently proven.
-Only the smallest native rectangular slice that produces exact final logits,
-full hybrid-cache bytes, one-token continuation, and multi-token unary/SSE/tool
-parity proceeds to performance measurement. A failed exact gate removes the
-candidate; no tolerance or greedy-only exception can accept it.
+The next exact stage bisection retained the scalar 32-row output-projection
+identity with zero-copy lane views. Layer-zero output-projection rows were
+bit-identical in both lanes, as were the following residual and all three
+pre-feed-forward norms. Raw dense gate, dense up, and router projections then
+matched per lane. The dense GELU-multiply output matched, and a complete dump
+of every token's top-eight expert IDs and routing-weight F32 bits matched.
+Dense down also remained exact. The first changed bytes were the raw expert
+gate/up `mm_id` output; expert down and weighted combine differed only after
+that first failure.
+
+The deciding Gemma implementation hypothesis is therefore smaller than a
+general body or attention rewrite. Preserve aggregate raw dense/router work,
+GELU, routing, and dense down. Execute expert gate/up through exact zero-copy
+lane spans at the canonical `M=32` scalar geometry, preserving ID order,
+top-k bits, native GGUF weight storage, and the existing `SharedPerToken`
+route. Because the two expert projections reuse mutable pooled routing
+scratch that GraphSession does not infer automatically, every lane after lane
+zero requires an explicit encoder memory barrier before reuse.
+
+That smallest candidate passed the pinned real-artifact B2 M32 oracle. Two
+fresh scalar lanes and one fresh rectangular arm produced identical selected
+tokens and every finite final-logit bit in both lanes. The rectangular arm
+processed 64 suffix tokens in 103.8 ms (616.5 token/s); the two scalar calls
+took 67.3 ms plus 58.3 ms, 125.6 ms combined. This is 17.4% lower wall time and
+about 21.0% higher aggregate throughput for the exact oracle. The full log is
+`/tmp/hf2q-gemma-live-o-gu-exact.log`, SHA-256
+`6061c3052e29fd27f147274331315578bc8b2940f187336e6cf4433f41d588a2`.
+Because final logits are exact, the earlier expert-down and weighted-combine
+differences were inherited from gate/up; those operators remain unchanged.
+The deciding next gates are B4, full selected/unselected cache bytes,
+one-token continuation, and realistic unary/SSE/tool serving.
+
+The shared-weight native quantized-matmul primitive remains a performance
+candidate for applicable dense projections, not a license to change their
+arithmetic. Its physical `[B,M,K]` input and `[B,M,N]` output keep one native
+GGUF weight, the scalar `M` route/tile, and each lane's reduction tree. It may
+be consumed only after its per-lane route/output is byte-identical to canonical
+scalar calls from a published checksum-pinned backend.
+
+Production attention is not currently a correctness rewrite. The live
+hardware bisection proved layer-zero SDPA exact, and source review found that
+the existing global path already uses physical slot views while the sliding
+path already stages each lane chronologically before reuse. A proposed batched
+hybrid replacement had no known failing production case and its TQ scalar
+oracle substituted hybrid-vector attention for the live dequant-to-F16 tiled
+route. That candidate is removed before compilation. Attention opens only as
+a performance hypothesis under a direct production-route falsifier covering
+B=2/B=4, M=32, global/sliding-wrap, and TQ/F16 cache modes. It must match
+output and selected cache bytes, preserve unselected-slot canaries, and beat
+the current route by at least 5% in paired same-process timing; an exactness or
+speed miss removes the production candidate.
+
+Only the smallest surviving rectangular slice that produces exact final
+logits, full hybrid-cache bytes, one-token continuation, and multi-token
+unary/SSE/tool parity proceeds to product performance measurement. A failed
+exact gate removes the candidate; no tolerance or greedy-only exception can
+accept it.
 
 **Lane B gates:** B.0 byte-identity (cohort+concurrent-decode); cooperative receipt regime (≥5 alternating serial/cooperative pairs, sustained median faster, peak RSS recorded, independent receipt verification); thermal contract (Nominal start, continuous Fair-or-better, no gap >5 s, fail-closed); memory H3 (≤116 GiB peak beside the 100 GiB artifact); product ceilings unchanged (60 s cold / 15 s cached-automatic-SSE / 35 s tool-result — never widened); B4 decode-cohort gate re-pass; the two B.1 latency contracts.
 
