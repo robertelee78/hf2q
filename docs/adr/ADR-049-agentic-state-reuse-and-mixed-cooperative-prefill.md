@@ -18,7 +18,35 @@
   reopened under the v2 contention authority, while the DeepSeek and Qwen
   current-head real-artifact cells remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 90 closes a shared performance-proof falsifier
+- Updated: 2026-08-26 (rev 92 closes three integration falsifiers found while
+  reviewing rev 91. A measured leaf no longer trusts an inherited process
+  group: it re-execs through the release-gate supervisor, proves its stable
+  owner PID is its PGID before reading model arguments, and uses that owner for
+  every sample while exempting only the exact live server PID. The sealed
+  summary binds that owner PGID and reopened validation joins every preflight,
+  settle, and measurement row to it. Both matrix validators now require the
+  exact process-group-cpu-v2 child contract; a relabeled 16-log legacy receipt,
+  weakened threshold, missing owner, or non-continuous policy cannot pass.
+  Finally, reopening is semantic rather than hash-only: all expected trial
+  paths and 24 or 120 calibration logs per child are revalidated for cadence,
+  state, alignment, owner identity, exact manifest membership, and non-symlink
+  evidence roots after their hashes pass. A mutation
+  changes a middle measurement row to `contended`, recomputes both seals,
+  proves the hash-only seal remains valid, and proves semantic reopening
+  rejects it. Current-head hardware acceptance remains open. Rev 91 closes
+  the same contention-proof gap in both
+  Qwen3.8 matched-reference authorities before spending the current-head
+  hardware run. Their 120-second nominal settle and continuous measurement
+  monitor still called the obsolete name-only heavy-work predicate, so a
+  generic browser or non-model CPU workload could again be mislabeled quiet.
+  Both the single-user and five-width physical ABBA runners now record
+  process-group-cpu-v2 samples on the exact thermal timestamps, require quiet
+  at measurement start, continuously, and at measurement end, validate the
+  settle/measurement logs and thermal alignment, and bind the 100% aggregate
+  foreign-CPU ceiling into their sealed summaries. The old name-only parser is
+  removed. Source mutations prove that stale policy, a weakened threshold, or
+  non-continuous sampling cannot seal; current-head hardware acceptance remains
+  open. Rev 90 closes a shared performance-proof falsifier
   before the next model load: the process-group-v1 contention guard reported
   `quiet` while an orphaned browser tree and unrelated analysis consumed
   about 7.7 foreign CPU cores. The accepted process-group-cpu-v2 receipt

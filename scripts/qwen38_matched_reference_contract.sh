@@ -470,67 +470,165 @@ matched_parse_live_power_source() {
     '
 }
 
-# Read `ps -axo pid=,command=` rows from stdin and report Python processes
-# whose command line identifies model work. Keep this parser in the sourced
-# contract so the macOS awk implementation used by production is exercised by
-# the hosted-safe behavioral test as well.
-matched_find_scripted_model_work() {
-    local allowed_pid=$1
-    awk -v allowed="$allowed_pid" '
-      {
-        pid = $1
-        $1 = ""
-        sub(/^[[:space:]]+/, "", $0)
-        command = tolower($0)
-        if (pid != allowed && command ~ /(^|\/)python(3([.][0-9]+)?)?([[:space:]]|$)/ && command ~ /(mlx|torch|transformers|teacher|model[-_ ]?gen|inference|vllm)/) {
-          print pid ":python-model-work"
-        }
-      }
-    '
-}
-
-# Read `ps -axo pid=,comm=` rows from stdin and identify native heavy work.
-# Keeping classification pure makes the macOS awk expression mutation-testable
-# without racing the live multi-agent host.
-matched_find_native_heavy_work() {
-    local allowed_pid=$1
-    awk -v allowed="$allowed_pid" '
-      {
-        pid = $1
-        $1 = ""
-        sub(/^[[:space:]]+/, "", $0)
-        name = tolower($0)
-        sub(/^.*\//, "", name)
-        if (pid != allowed && name ~ /^(hf2q|llama-server|llama-cli|llama-bench|cargo|rustc|ollama|mlx-lm|mlx_lm|swift-frontend)([0-9.-]|$)/) {
-          print pid ":" name
-        }
-      }
-    '
-}
-
-# Fail closed when calibrated hardware is shared with model, compiler, or
-# another inference process. The current server PID is the sole exception.
-require_no_foreign_heavy_work() {
-    local allowed_pid=$1 offenders scripted_offenders
-    offenders=$(/bin/ps -axo pid=,comm= \
-      | matched_find_native_heavy_work "$allowed_pid") || return 1
-    scripted_offenders=$(/bin/ps -axo pid=,command= \
-      | matched_find_scripted_model_work "$allowed_pid") || return 1
-    if [[ -n "$scripted_offenders" ]]; then
-        offenders=${offenders:+$offenders$'\n'}$scripted_offenders
-    fi
-    [[ -z "$offenders" ]] || {
-        echo "foreign calibrated-host work detected: $offenders" >&2
-        return 1
-    }
-}
-
 matched_validate_calibration_alignment() {
     local thermal_log=$1
     local host_log=$2
     cmp -s \
       <(awk -F '\t' 'NF == 3 { print $1 "\t" $3 }' "$thermal_log") \
       <(awk -F '\t' 'NF == 6 { print $1 "\t" $6 }' "$host_log")
+}
+
+matched_validate_contention_preflight_log() {
+    local log_path=$1 expected_rows=$2 expected_owner_pgid=$3
+    [[ -f "$log_path" && ! -L "$log_path" \
+      && "$expected_rows" =~ ^[1-9][0-9]*$ \
+      && "$expected_owner_pgid" =~ ^[1-9][0-9]*$ ]] || return 1
+    awk -F '\t' -v rows="$expected_rows" -v owner="$expected_owner_pgid" \
+      -v maximum="$HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT" '
+      BEGIN { invalid = 0 }
+      {
+        if (NF != 6 || $1 !~ /^[0-9]+$/ || $2 != "quiet" \
+            || $3 != "preflight" || $4 != owner \
+            || $5 !~ /^[0-9]+([.][0-9]+)?$/ || $5 + 0 >= maximum + 0 \
+            || $6 != "-") invalid++
+        count++
+      }
+      END { exit !(count == rows && invalid == 0) }
+    ' "$log_path"
+}
+
+matched_require_evidence_manifest_entry() {
+    local child_dir=$1 evidence_path=$2 relative_path
+    [[ "$evidence_path" == "$child_dir"/* ]] || return 1
+    relative_path=${evidence_path#"$child_dir"/}
+    awk -v expected="$relative_path" '
+      $2 == expected { matches++ }
+      END { exit !(matches == 1) }
+    ' "$child_dir/evidence.sha256"
+}
+
+matched_validate_reopened_trial_calibration() {
+    local trial_dir=$1 expected_owner_pgid=$2 settle_seconds=$3 maximum_gap=$4
+    local child_dir=$5
+    local thermal_settle="$trial_dir/thermal-settle.tsv"
+    local host_settle="$trial_dir/host-settle.tsv"
+    local contention_settle="$trial_dir/contention-settle.tsv"
+    local thermal_measurement="$trial_dir/thermal-measurement.tsv"
+    local host_measurement="$trial_dir/host-measurement.tsv"
+    local contention_measurement="$trial_dir/contention-measurement.tsv"
+    local path
+
+    [[ -d "$trial_dir" && ! -L "$trial_dir" \
+      && ! -e "$trial_dir/calibration-failure.txt" \
+      && "$expected_owner_pgid" =~ ^[1-9][0-9]*$ ]] || return 1
+    for path in "$thermal_settle" "$host_settle" "$contention_settle" \
+      "$thermal_measurement" "$host_measurement" "$contention_measurement"; do
+        [[ -f "$path" && -r "$path" && ! -L "$path" ]] || return 1
+        matched_require_evidence_manifest_entry "$child_dir" "$path" \
+          || return 1
+    done
+
+    thermal_validate_settle_log "$thermal_settle" "$settle_seconds" \
+      "$maximum_gap" || return 1
+    ((THERMAL_LOG_NON_NOMINAL_SAMPLES == 0)) || return 1
+    matched_validate_host_observation_log "$host_settle" 2 \
+      "$settle_seconds" "$maximum_gap" || return 1
+    matched_validate_calibration_alignment "$thermal_settle" "$host_settle" \
+      || return 1
+    host_contention_validate_settle_log "$contention_settle" \
+      "$settle_seconds" "$maximum_gap" || return 1
+    ((HOST_CONTENTION_LOG_CONTENDED_SAMPLES == 0)) || return 1
+    host_contention_validate_thermal_alignment "$thermal_settle" \
+      "$contention_settle" || return 1
+    awk -F '\t' -v owner="$expected_owner_pgid" '
+      NF != 6 || $3 != "loaded-idle" || $4 != owner { exit 1 }
+    ' "$contention_settle" || return 1
+
+    thermal_validate_measurement_log "$thermal_measurement" "$maximum_gap" \
+      || return 1
+    matched_validate_host_observation_log "$host_measurement" 3 1 \
+      "$maximum_gap" || return 1
+    matched_validate_calibration_alignment "$thermal_measurement" \
+      "$host_measurement" || return 1
+    host_contention_validate_measurement_log "$contention_measurement" \
+      "$maximum_gap" || return 1
+    host_contention_validate_thermal_alignment "$thermal_measurement" \
+      "$contention_measurement" || return 1
+    awk -F '\t' -v owner="$expected_owner_pgid" '
+      NF != 6 || $4 != owner \
+        || $3 !~ /^(measurement-start|measurement|measurement-end)$/ { exit 1 }
+    ' "$contention_measurement"
+}
+
+matched_require_result_seal() {
+    local child_dir=$1 summary_sha evidence_sha
+    [[ -d "$child_dir" && ! -L "$child_dir" \
+      && -f "$child_dir/summary.json" && ! -L "$child_dir/summary.json" \
+      && -f "$child_dir/evidence.sha256" && ! -L "$child_dir/evidence.sha256" \
+      && -f "$child_dir/result.sha256" && ! -L "$child_dir/result.sha256" ]] \
+      || return 1
+    qwen38_validate_evidence_manifest_paths "$child_dir/evidence.sha256" \
+      || return 1
+    [[ "$(awk 'END { print NR }' "$child_dir/result.sha256")" == 2 ]] \
+      || return 1
+    summary_sha=$(shasum -a 256 "$child_dir/summary.json" | awk '{print $1}') \
+      || return 1
+    evidence_sha=$(shasum -a 256 "$child_dir/evidence.sha256" \
+      | awk '{print $1}') || return 1
+    [[ "$(sed -n '1p' "$child_dir/result.sha256")" == \
+        "$summary_sha  summary.json" \
+      && "$(sed -n '2p' "$child_dir/result.sha256")" == \
+        "$evidence_sha  evidence.sha256" ]] || return 1
+    (cd "$child_dir" && shasum -a 256 -c evidence.sha256 >/dev/null \
+      && shasum -a 256 -c result.sha256 >/dev/null)
+}
+
+matched_terminate_owned_child() {
+    local child_pid=${1:-} deadline
+    [[ -n "$child_pid" ]] || return 0
+    [[ "$child_pid" =~ ^[1-9][0-9]*$ ]] || return 2
+    if kill -0 "$child_pid" 2>/dev/null; then
+        kill -TERM "$child_pid" 2>/dev/null || true
+        deadline=$((SECONDS + 15))
+        while kill -0 "$child_pid" 2>/dev/null && ((SECONDS < deadline)); do
+            sleep 1
+        done
+    fi
+    if kill -0 "$child_pid" 2>/dev/null; then
+        kill -KILL "$child_pid" 2>/dev/null || true
+    fi
+    wait "$child_pid" 2>/dev/null || true
+    ! kill -0 "$child_pid" 2>/dev/null
+}
+
+matched_validate_reopened_reference_child() {
+    local child_dir=$1 expected_owner trial_dir trial_index=0
+    local expected_engine
+    matched_require_result_seal "$child_dir" || return 1
+    expected_owner=$(jq -er '
+      .calibration.host_contention as $host
+      | select(.schema == 5 and .verdict == "pass"
+          and .calibration.trial_logs == 24
+          and $host.policy == "process-group-cpu-v2"
+          and $host.maximum_foreign_cpu_percent == 100
+          and $host.owner_scope == "release-gate-process-group"
+          and ($host.owner_pgid | type == "number" and floor == . and . > 0)
+          and $host.continuous == true)
+      | $host.owner_pgid
+    ' "$child_dir/summary.json") || return 1
+    matched_validate_contention_preflight_log \
+      "$child_dir/contention-preflight.tsv" 5 "$expected_owner" || return 1
+    matched_require_evidence_manifest_entry "$child_dir" \
+      "$child_dir/contention-preflight.tsv" || return 1
+    [[ -d "$child_dir/trials" && ! -L "$child_dir/trials" ]] || return 1
+    for expected_engine in hf2q reference reference hf2q; do
+        trial_index=$((trial_index + 1))
+        trial_dir="$child_dir/trials/trial-$trial_index-$expected_engine"
+        matched_validate_reopened_trial_calibration "$trial_dir" \
+          "$expected_owner" 120 5 "$child_dir" || return 1
+    done
+    [[ "$(find "$child_dir/trials" -mindepth 1 -maxdepth 1 -type d \
+      -name 'trial-*' | wc -l | tr -d '[:space:]')" == 4 ]]
 }
 
 # Emit a sealed-shape stability receipt for the two observations of every

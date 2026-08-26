@@ -52,18 +52,70 @@ host_contention_process_snapshot() {
   printf '%s\n' "$snapshot"
 }
 
+# Prove that a calibrated leaf owns a dedicated process group. Merely finding
+# the caller in some inherited PGID is insufficient because unrelated work in
+# that group would otherwise be excluded from foreign-CPU accounting.
+host_contention_require_isolated_gate_owner() {
+  local owner_pid=$1
+  local snapshot
+
+  [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || return 2
+  snapshot=$(host_contention_process_snapshot) || return 1
+  awk -F '\t' -v owner="$owner_pid" '
+    BEGIN { invalid = 0; count = 0 }
+    {
+      if (NF != 4 || $1 !~ /^[1-9][0-9]*$/ \
+          || $2 !~ /^[1-9][0-9]*$/ \
+          || $3 !~ /^[0-9]+([.][0-9]+)?$/ || length($4) == 0 \
+          || seen[$1]++) {
+        invalid = 1
+        next
+      }
+      count++
+      pgid_by_pid[$1] = $2
+      command_by_pid[$1] = $4
+    }
+    END {
+      if (invalid || count == 0 || !(owner in pgid_by_pid) \
+          || pgid_by_pid[owner] != owner) exit 1
+      for (pid in pgid_by_pid) {
+        if (pid != owner && pgid_by_pid[pid] == owner) {
+          name = command_by_pid[pid]
+          sub(/^.*\//, "", name)
+          # The snapshot itself briefly creates these descendants inside the
+          # fresh group. Any workload process is still a hard failure.
+          if (name !~ /^(bash|ps|awk)$/) foreign_members++
+        }
+      }
+      if (foreign_members != 0) exit 1
+    }
+  ' <<<"$snapshot" || {
+    echo "calibrated leaf does not own an isolated process group: $owner_pid" >&2
+    return 1
+  }
+}
+
 host_contention_sample() {
   local log_file=$1
   local phase=$2
   local owner_pid=$3
   local sampled_at=${4:-}
+  local owned_server_pid=${5:-}
   local snapshot
   local classification
+
+  # Matched-engine gates may exempt exactly their verified hf2q or
+  # llama-server PID. The PID must exist in the owner's process group; every
+  # other compiler/model process and all foreign CPU remain fail-closed.
 
   [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || {
     echo "host contention owner pid must be a positive integer" >&2
     return 2
   }
+  if [[ -n "$owned_server_pid" && ! "$owned_server_pid" =~ ^[1-9][0-9]*$ ]]; then
+    echo "owned server pid must be a positive integer" >&2
+    return 2
+  fi
   if [[ -z "$sampled_at" ]]; then
     sampled_at=$(date +%s) || return 1
   fi
@@ -73,6 +125,7 @@ host_contention_sample() {
   }
   snapshot=$(host_contention_process_snapshot) || return 1
   classification=$(awk -F '\t' -v owner="$owner_pid" \
+    -v allowed_owned="$owned_server_pid" \
     -v maximum="$HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT" '
     BEGIN { invalid = 0; count = 0 }
     {
@@ -89,19 +142,32 @@ host_contention_sample() {
       pgid_by_pid[$1] = $2
       cpu[count] = $3 + 0
       command[count] = $4
+      command_by_pid[$1] = $4
     }
     END {
       if (invalid || count == 0 || !(owner in pgid_by_pid) \
+          || (allowed_owned != "" \
+            && (!(allowed_owned in pgid_by_pid) \
+              || pgid_by_pid[allowed_owned] != pgid_by_pid[owner])) \
           || maximum !~ /^[0-9]+([.][0-9]+)?$/ || maximum + 0 <= 0) exit 2
       owner_pgid = pgid_by_pid[owner]
+      if (allowed_owned != "") {
+        allowed_name = command_by_pid[allowed_owned]
+        sub(/^.*\//, "", allowed_name)
+        if (allowed_name !~ /^(hf2q|llama-server)(-|$)/) exit 2
+      }
       offenders = ""
       foreign_cpu = 0
       for (i = 1; i <= count; i++) {
         name = command[i]
         sub(/^.*\//, "", name)
         if (pgid[i] != owner_pgid) foreign_cpu += cpu[i]
-        forbidden = (name ~ /^(cargo|rustc|llama-cli|llama-server)(-|$)/) \
-          || (name ~ /^hf2q(-|$)/ && pgid[i] != owner_pgid)
+        owned_server = allowed_owned != "" && pid[i] == allowed_owned \
+          && pgid[i] == owner_pgid \
+          && name ~ /^(hf2q|llama-server)(-|$)/
+        forbidden = !owned_server \
+          && ((name ~ /^(cargo|rustc|llama-cli|llama-server)(-|$)/) \
+            || (name ~ /^hf2q(-|$)/ && pgid[i] != owner_pgid))
         if (forbidden) {
           gsub(/[^A-Za-z0-9._+-]/, "_", name)
           item = pid[i] ":" pgid[i] ":" name

@@ -30,6 +30,20 @@ fail() {
     exit 1
 }
 
+unmarked_error="$fixture_dir/unmarked-bootstrap.err"
+if "$runner" >/dev/null 2>"$unmarked_error"; then
+    fail 'unconfigured matched runner unexpectedly succeeded'
+fi
+grep -Fq 'HF2Q_BIN is required' "$unmarked_error" \
+    || fail 'matched runner did not self-bootstrap before environment validation'
+marked_error="$fixture_dir/marked-bootstrap.err"
+if HF2Q_MATCHED_GATE_ISOLATED=1 "$runner" \
+    >/dev/null 2>"$marked_error"; then
+    fail 'forced isolation marker unexpectedly succeeded'
+fi
+grep -Fq 'does not own an isolated process group' "$marked_error" \
+    || fail 'forced isolation marker bypassed process-group leadership proof'
+
 expect_failure() {
     local label=$1
     shift
@@ -461,27 +475,6 @@ jq 'if .engine == "hf2q" and .trial == 4 and .name == "code-a"
 expect_failure completion-token-drift validate_stability_fixture \
   "$fixture_dir/stability-token-drift.jsonl"
 
-# The production host-contention parser must execute under the platform awk,
-# exclude the current server PID, and distinguish Python model work from an
-# unrelated Python utility. This catches syntax that GNU awk accepts but the
-# macOS implementation rejects before a timed trial can start.
-scripted_offenders=$(printf '%s\n' \
-  '101 /usr/bin/python3 teacher_model_gen.py' \
-  '202 /usr/bin/python3 calendar_export.py' \
-  '303 /opt/venv/bin/python inference.py' \
-  | matched_find_scripted_model_work 303)
-[[ "$scripted_offenders" == '101:python-model-work' ]] \
-  || fail "portable Python model-work matcher returned: $scripted_offenders"
-native_offenders=$(printf '%s\n' \
-  '101 /opt/hf2q/target/release/hf2q' \
-  '202 /usr/bin/curl' \
-  '303 /opt/llama.cpp/build/bin/llama-server' \
-  | matched_find_native_heavy_work 303)
-[[ "$native_offenders" == '101:hf2q' ]] \
-  || fail "portable native model-work matcher returned: $native_offenders"
-declare -F require_no_foreign_heavy_work >/dev/null \
-  || fail 'shared heavy-work gate is missing'
-
 # A seal-publication failure must not expose summary.json. A successful call
 # publishes a self-consistent result manifest and the passing summary last.
 prepare_seal_fixture() {
@@ -521,6 +514,26 @@ matched_publish_result "$fixture_dir/seal-success/summary.json.tmp" \
   "$fixture_dir/seal-success/result.sha256"
 (cd "$fixture_dir/seal-success" && shasum -a 256 -c result.sha256 >/dev/null)
 
+# Killing only a matrix-owned nested supervisor must reap its isolated leaf
+# and the leaf's long-lived model stand-in.
+nested_pid_file="$fixture_dir/nested-supervisor.pids"
+"$root_dir/scripts/run_release_gate_process_group.sh" bash -c '
+  sleep 300 & grandchild=$!
+  printf "%s %s\n" "$$" "$grandchild" >"$1"
+  wait "$grandchild"
+' _ "$nested_pid_file" &
+nested_supervisor=$!
+deadline=$((SECONDS + 10))
+while [[ ! -s "$nested_pid_file" && $SECONDS -lt $deadline ]]; do sleep 1; done
+[[ -s "$nested_pid_file" ]] || fail 'nested supervisor fixture did not start'
+read -r nested_leaf nested_grandchild <"$nested_pid_file"
+matched_terminate_owned_child "$nested_supervisor"
+for reaped_pid in "$nested_supervisor" "$nested_leaf" "$nested_grandchild"; do
+    if kill -0 "$reaped_pid" 2>/dev/null; then
+        fail "nested supervisor cancellation leaked PID $reaped_pid"
+    fi
+done
+
 # The production runner must call, rather than merely mention, each tested
 # predicate. A caller-provided model ID is initialized before any trial.
 [[ "$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4" == 1 ]] \
@@ -538,19 +551,40 @@ for call in \
   'matched_validate_hf2q_telemetry "$response"' \
   'matched_validate_reference_telemetry "$response"' \
   'matched_reference_speculation_totals "$rows_file"' \
-  'require_no_foreign_heavy_work ' \
   'matched_validate_host_observation_log ' \
   'matched_parse_ac_power_mode' \
   'matched_parse_live_power_mode_code' \
   'matched_measurement_stability_json "$rows_file"' \
   'hf2q_macos_verify_runtime_manifest "$REFERENCE_BIN"' \
-  'matched_publish_result '; do
+  'matched_publish_result ' \
+  'matched_validate_reopened_reference_child "$OUT_DIR"'; do
     grep -Fq "$call" "$runner" \
       || fail "production runner does not invoke tested predicate: $call"
 done
-grep -Fq "matched_find_native_heavy_work \"\$allowed_pid\"" \
-  "$root_dir/scripts/qwen38_matched_reference_contract.sh" \
-  || fail 'shared heavy-work gate does not classify native work'
+for contention_call in \
+  'host_contention_sample ' \
+  'host_contention_require_quiet ' \
+  'host_contention_validate_settle_log ' \
+  'host_contention_validate_measurement_log ' \
+  'host_contention_validate_thermal_alignment '; do
+  grep -Fq "$contention_call" "$runner" \
+    || fail "matched runner omits v2 contention authority: $contention_call"
+done
+grep -Fq '"$THERMAL_SAMPLED_AT" "$server_pid"' "$runner" \
+  || fail 'matched runner does not narrowly exempt its owned server PID'
+if grep -Fq 'require_no_foreign_heavy_work ' "$runner"; then
+  fail 'matched runner still uses the name-only contention predicate'
+fi
+grep -Fq 'policy:$host_contention_policy' "$runner" \
+  || fail 'matched summary omits its exact contention policy'
+grep -Fq 'HOST_CONTENTION_GATE_OWNER_PID' "$runner" \
+  || fail 'matched runner does not use one stable process-group owner'
+grep -Fq 'matched_terminate_owned_child "$child_pid"' \
+  "$root_dir/scripts/qwen38_matched_peer_matrix.sh" \
+  || fail 'matched peer matrix does not own nested leaf cleanup'
+grep -Fq "trap 'exit 130' INT TERM" \
+  "$root_dir/scripts/qwen38_matched_peer_matrix.sh" \
+  || fail 'matched peer matrix does not trap targeted cancellation'
 grep -Fq 'readonly MAX_TOKENS=256' "$runner" \
   || fail "matched code workload is not sized for complete source"
 grep -Fq 'quality_scope:"complete Rust compilation plus evaluator tests; exact repeat transcription"' \

@@ -772,6 +772,12 @@ matched_physical_validate_inner_summary() {
         and . > 0 and . == floor)
       and .acceptance.minimum_hf2q_ratio >= 1
       and .acceptance.maximum_launch_skew_seconds == $max_launch_skew
+      and .host_contention.policy == "process-group-cpu-v2"
+      and .host_contention.maximum_foreign_cpu_percent == 100
+      and .host_contention.owner_scope == "release-gate-process-group"
+      and (.host_contention.owner_pgid | type == "number"
+        and floor == . and . > 0)
+      and .host_contention.continuous == true
       and (.results | length) == 5
       and ([.results[].width] | sort) == [1,2,4,8,16]
       and all(.results[]; . as $result
@@ -930,22 +936,60 @@ matched_physical_extract_proof_json() {
 }
 
 matched_physical_require_child_seal() {
-    local child_dir=$1 summary_sha evidence_sha
-    [[ -f "$child_dir/summary.json" && ! -L "$child_dir/summary.json" \
-      && -f "$child_dir/evidence.sha256" && ! -L "$child_dir/evidence.sha256" \
-      && -f "$child_dir/result.sha256" && ! -L "$child_dir/result.sha256" ]] \
+    matched_require_result_seal "$1"
+}
+
+matched_physical_validate_reopened_child() {
+    local child_dir=$1 expected_owner width trial engine trial_dir
+    local width_count width_trial_count trial_count=0
+    matched_physical_require_child_seal "$child_dir" || return 1
+    matched_physical_validate_inner_summary "$child_dir/summary.json" || return 1
+    expected_owner=$(jq -er '.host_contention.owner_pgid' \
+      "$child_dir/summary.json") || return 1
+    matched_validate_contention_preflight_log \
+      "$child_dir/contention-preflight.tsv" 22 "$expected_owner" || return 1
+    matched_require_evidence_manifest_entry "$child_dir" \
+      "$child_dir/contention-preflight.tsv" || return 1
+    [[ -d "$child_dir/widths" && ! -L "$child_dir/widths" ]] || return 1
+    width_count=$(find "$child_dir/widths" -mindepth 1 -maxdepth 1 -type d \
+      -name 'width-*' | wc -l | tr -d '[:space:]') || return 1
+    [[ "$width_count" == 5 ]] || return 1
+    for width in 1 2 4 8 16; do
+        [[ -d "$child_dir/widths/width-$width" \
+          && ! -L "$child_dir/widths/width-$width" \
+          && -d "$child_dir/widths/width-$width/trials" \
+          && ! -L "$child_dir/widths/width-$width/trials" ]] || return 1
+        width_trial_count=$(find "$child_dir/widths/width-$width/trials" \
+          -mindepth 1 -maxdepth 1 -type d -name 'trial-*' \
+          | wc -l | tr -d '[:space:]') || return 1
+        [[ "$width_trial_count" == 4 ]] || return 1
+        trial=0
+        for engine in hf2q reference reference hf2q; do
+            trial=$((trial + 1))
+            trial_dir="$child_dir/widths/width-$width/trials/trial-$trial-$engine"
+            matched_validate_reopened_trial_calibration "$trial_dir" \
+              "$expected_owner" 120 5 "$child_dir" || return 1
+            trial_count=$((trial_count + 1))
+        done
+    done
+    [[ "$trial_count" == 20 ]]
+}
+
+matched_physical_validate_reopened_matrix() {
+    local matrix_dir=$1 child_path child_index=0 expected_path actual_summary
+    matched_require_result_seal "$matrix_dir" || return 1
+    [[ -d "$matrix_dir/artifacts" && ! -L "$matrix_dir/artifacts" ]] \
       || return 1
-    qwen38_validate_evidence_manifest_paths "$child_dir/evidence.sha256" \
+    qwen38_validate_matched_physical_matrix_receipt "$matrix_dir/summary.json" \
       || return 1
-    [[ "$(awk 'END { print NR }' "$child_dir/result.sha256")" == 2 ]] || return 1
-    summary_sha=$(shasum -a 256 "$child_dir/summary.json" | awk '{print $1}') \
-      || return 1
-    evidence_sha=$(shasum -a 256 "$child_dir/evidence.sha256" | awk '{print $1}') \
-      || return 1
-    [[ "$(sed -n '1p' "$child_dir/result.sha256")" == \
-        "$summary_sha  summary.json"
-      && "$(sed -n '2p' "$child_dir/result.sha256")" == \
-        "$evidence_sha  evidence.sha256" ]] || return 1
-    (cd "$child_dir" && shasum -a 256 -c evidence.sha256 >/dev/null \
-      && shasum -a 256 -c result.sha256 >/dev/null)
+    for expected_path in artifacts/bf16 artifacts/q4_k_m artifacts/q5_k_m \
+      artifacts/q6_k artifacts/q8_0; do
+        child_path="$matrix_dir/$expected_path"
+        matched_physical_validate_reopened_child "$child_path" || return 1
+        actual_summary=$(jq -S -c . "$child_path/summary.json") || return 1
+        [[ "$actual_summary" == "$(jq -S -c --argjson index "$child_index" \
+          '.results[$index]' "$matrix_dir/summary.json")" ]] || return 1
+        child_index=$((child_index + 1))
+    done
+    ((child_index == 5))
 }

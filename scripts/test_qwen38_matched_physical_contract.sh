@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=scripts/qwen38_artifact_contract.sh
 source "$ROOT_DIR/scripts/qwen38_artifact_contract.sh"
+# shellcheck source=scripts/macos_thermal_guard.sh
+source "$ROOT_DIR/scripts/macos_thermal_guard.sh"
+# shellcheck source=scripts/qwen38_matched_reference_contract.sh
+source "$ROOT_DIR/scripts/qwen38_matched_reference_contract.sh"
 # shellcheck source=scripts/qwen38_matched_physical_contract.sh
 source "$ROOT_DIR/scripts/qwen38_matched_physical_contract.sh"
 
@@ -416,11 +420,111 @@ jq -n --argjson results "$results" '{schema:2,verdict:"pass",
       unit:"canonical-semantic-output-token"},
     reference_parallelism_matches_width:true},
   acceptance:{minimum_hf2q_ratio:1,maximum_launch_skew_seconds:0.1},
+  host_contention:{policy:"process-group-cpu-v2",
+    maximum_foreign_cpu_percent:100,
+    owner_scope:"release-gate-process-group",owner_pgid:100,continuous:true},
   evidence:{reference_runtime_manifest_sha256:("e"*64),
     expected_reference_runtime_manifest_sha256:("e"*64),
     reference_pin_file_sha256:("f"*64)},results:$results}' \
   >"$TMP_DIR/summary.json"
 matched_physical_validate_inner_summary "$TMP_DIR/summary.json"
+
+# A coherent rehash cannot convert contended raw telemetry into performance
+# authority. Build all 20 expected trials, prove the reopened validator passes,
+# then mutate and fully reseal one middle measurement log.
+reopened_child="$TMP_DIR/reopened-child"
+mkdir -p "$reopened_child"
+cp "$TMP_DIR/summary.json" "$reopened_child/summary.json"
+: >"$reopened_child/contention-preflight.tsv"
+for sample in $(seq 1 22); do
+    printf '%s\tquiet\tpreflight\t100\t99.9\t-\n' "$sample" \
+      >>"$reopened_child/contention-preflight.tsv"
+done
+for width in 1 2 4 8 16; do
+    trial=0
+    for engine in hf2q reference reference hf2q; do
+        trial=$((trial + 1))
+        trial_dir="$reopened_child/widths/width-$width/trials/trial-$trial-$engine"
+        mkdir -p "$trial_dir/code/code-validation" "$trial_dir/repeat/responses"
+        : >"$trial_dir/thermal-settle.tsv"
+        : >"$trial_dir/host-settle.tsv"
+        : >"$trial_dir/contention-settle.tsv"
+        for sampled_at in $(seq 1000 5 1120); do
+            printf '%s\tnominal\tloaded-idle\n' "$sampled_at" \
+              >>"$trial_dir/thermal-settle.tsv"
+            printf '%s\tac\tquiet\tautomatic\t0\tloaded-idle\n' "$sampled_at" \
+              >>"$trial_dir/host-settle.tsv"
+            printf '%s\tquiet\tloaded-idle\t100\t99.9\t-\n' "$sampled_at" \
+              >>"$trial_dir/contention-settle.tsv"
+        done
+        : >"$trial_dir/thermal-measurement.tsv"
+        : >"$trial_dir/host-measurement.tsv"
+        : >"$trial_dir/contention-measurement.tsv"
+        for phase_row in '2000 measurement-start' '2002 measurement' \
+          '2004 measurement-end'; do
+            sampled_at=${phase_row%% *}
+            phase=${phase_row#* }
+            printf '%s\tnominal\t%s\n' "$sampled_at" "$phase" \
+              >>"$trial_dir/thermal-measurement.tsv"
+            printf '%s\tac\tquiet\tautomatic\t0\t%s\n' "$sampled_at" "$phase" \
+              >>"$trial_dir/host-measurement.tsv"
+            printf '%s\tquiet\t%s\t100\t99.9\t-\n' "$sampled_at" "$phase" \
+              >>"$trial_dir/contention-measurement.tsv"
+        done
+    done
+done
+seal_reopened_child() {
+    local root=$1 path
+    : >"$root/evidence.sha256"
+    while IFS= read -r path; do
+        printf '%s  %s\n' \
+          "$(shasum -a 256 "$root/$path" | awk '{print $1}')" "$path" \
+          >>"$root/evidence.sha256"
+    done < <(cd "$root" && find . -type f \
+      ! -name summary.json ! -name evidence.sha256 ! -name result.sha256 \
+      -print | sed 's#^./##' | sort)
+    printf '%s  summary.json\n%s  evidence.sha256\n' \
+      "$(shasum -a 256 "$root/summary.json" | awk '{print $1}')" \
+      "$(shasum -a 256 "$root/evidence.sha256" | awk '{print $1}')" \
+      >"$root/result.sha256"
+}
+seal_reopened_child "$reopened_child"
+matched_physical_validate_reopened_child "$reopened_child"
+ln -s "$reopened_child" "$TMP_DIR/reopened-child-symlink"
+expect_reject matched_physical_validate_reopened_child \
+  "$TMP_DIR/reopened-child-symlink"
+mutated_contention="$reopened_child/widths/width-8/trials/trial-3-reference/contention-measurement.tsv"
+awk -F '\t' 'BEGIN { OFS="\t" }
+  NR == 2 { $2="contended"; $5="100.0"; $6="999:888:browser" }
+  { print }' "$mutated_contention" >"$mutated_contention.tmp"
+mv "$mutated_contention.tmp" "$mutated_contention"
+seal_reopened_child "$reopened_child"
+matched_physical_require_child_seal "$reopened_child"
+expect_reject matched_physical_validate_reopened_child "$reopened_child"
+awk -F '\t' 'BEGIN { OFS="\t" }
+  { $2="quiet"; $4="100"; $5="99.9"; $6="-"; print }
+' "$mutated_contention" >"$mutated_contention.tmp"
+mv "$mutated_contention.tmp" "$mutated_contention"
+seal_reopened_child "$reopened_child"
+omitted_path='widths/width-8/trials/trial-3-reference/contention-measurement.tsv'
+awk -v omitted="$omitted_path" '$2 != omitted { print }' \
+  "$reopened_child/evidence.sha256" >"$reopened_child/evidence.sha256.tmp"
+mv "$reopened_child/evidence.sha256.tmp" "$reopened_child/evidence.sha256"
+printf '%s  summary.json\n%s  evidence.sha256\n' \
+  "$(shasum -a 256 "$reopened_child/summary.json" | awk '{print $1}')" \
+  "$(shasum -a 256 "$reopened_child/evidence.sha256" | awk '{print $1}')" \
+  >"$reopened_child/result.sha256"
+matched_physical_require_child_seal "$reopened_child"
+expect_reject matched_physical_validate_reopened_child "$reopened_child"
+awk -F '\t' 'BEGIN { OFS="\t" }
+  { $2="quiet"; $4="101"; $5="99.9"; $6="-"; print }
+' "$mutated_contention" >"$mutated_contention.tmp"
+mv "$mutated_contention.tmp" "$mutated_contention"
+host_contention_validate_measurement_log "$mutated_contention" 5
+seal_reopened_child "$reopened_child"
+matched_physical_require_child_seal "$reopened_child"
+expect_reject matched_physical_validate_reopened_child "$reopened_child"
+
 expected_runtime_closure=$(printf 'e%.0s' {1..64})
 matched_physical_validate_expected_reference_closure \
   "$TMP_DIR/summary.json" "$expected_runtime_closure"
@@ -431,7 +535,9 @@ for mutation in old-schema empty-clients lane-zero wrong-mode unsealed no-spec \
   live-tip-policy mutable-pin runtime-closure-drift semantic-tokenization \
   semantic-tokenization-binding wrong-hf2q-policy wrong-reference-policy \
   wrong-kv-budget wrong-reference-cache wrong-context-scope wrong-launch-skew \
-  wrong-effective-q5k wrong-width-effective-q5k; do
+  wrong-effective-q5k wrong-width-effective-q5k stale-contention-policy \
+  weak-contention-threshold invalid-contention-owner \
+  noncontinuous-contention; do
     case "$mutation" in
       old-schema) filter='.schema=1' ;;
       empty-clients) filter='.results[2].physical_proof.clients=[]' ;;
@@ -457,6 +563,10 @@ for mutation in old-schema empty-clients lane-zero wrong-mode unsealed no-spec \
       wrong-launch-skew) filter='.acceptance.maximum_launch_skew_seconds=0.2' ;;
       wrong-effective-q5k) filter='.hf2q.effective_routing_policy.dense_q5k_canonical_q4x4=0' ;;
       wrong-width-effective-q5k) filter='.results[2].hf2q_effective_routing_policy.dense_q5k_canonical_q4x4=0' ;;
+      stale-contention-policy) filter='.host_contention.policy="process-group-v1"' ;;
+      weak-contention-threshold) filter='.host_contention.maximum_foreign_cpu_percent=101' ;;
+      invalid-contention-owner) filter='.host_contention.owner_pgid=0' ;;
+      noncontinuous-contention) filter='.host_contention.continuous=false' ;;
     esac
     jq "$filter" "$TMP_DIR/summary.json" >"$TMP_DIR/$mutation.json"
     expect_reject matched_physical_validate_inner_summary "$TMP_DIR/$mutation.json"
@@ -510,6 +620,19 @@ expect_reject matched_physical_validate_matrix_reference_cohort \
 
 # Static order checks bind the source to the source-only contracts.
 runner="$ROOT_DIR/scripts/qwen38_matched_physical_abba.sh"
+unmarked_error="$TMP_DIR/unmarked-bootstrap.err"
+if "$runner" >/dev/null 2>"$unmarked_error"; then
+    fail 'unconfigured matched physical runner unexpectedly succeeded'
+fi
+grep -Fq 'HF2Q_BIN is required' "$unmarked_error" \
+    || fail 'matched physical runner did not self-bootstrap before environment validation'
+marked_error="$TMP_DIR/marked-bootstrap.err"
+if HF2Q_MATCHED_GATE_ISOLATED=1 "$runner" \
+    >/dev/null 2>"$marked_error"; then
+    fail 'forced physical isolation marker unexpectedly succeeded'
+fi
+grep -Fq 'does not own an isolated process group' "$marked_error" \
+    || fail 'forced physical isolation marker bypassed group leadership proof'
 matrix_runner="$ROOT_DIR/scripts/qwen38_matched_physical_matrix.sh"
 [[ "$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4" == 1 ]] \
   || fail 'matched physical Q5_K policy is not uniformly enabled'
@@ -552,6 +675,27 @@ if rg -q 'speculation:"shipping-auto"|policy:"shipping-auto"' "$runner" \
     fail 'undifferentiated speculation policy survived'
 fi
 rg -F 'matched_physical_validate_client_overlap' "$runner" >/dev/null
+rg -F 'HOST_CONTENTION_GATE_OWNER_PID' "$runner" >/dev/null \
+  || fail 'matched physical runner does not use one stable process-group owner'
+rg -F 'matched_physical_validate_reopened_child "$OUT_DIR"' "$runner" >/dev/null \
+  || fail 'matched physical runner does not semantically reopen its evidence'
+rg -F '[[ -d "$matrix_dir/artifacts" && ! -L "$matrix_dir/artifacts" ]]' \
+  "$ROOT_DIR/scripts/qwen38_matched_physical_contract.sh" >/dev/null \
+  || fail 'matched physical matrix reopener follows a symlinked artifact root'
+for contention_call in \
+  'host_contention_sample ' \
+  'host_contention_require_quiet ' \
+  'host_contention_validate_settle_log ' \
+  'host_contention_validate_measurement_log ' \
+  'host_contention_validate_thermal_alignment '; do
+    rg -F "$contention_call" "$runner" >/dev/null \
+      || fail "matched physical runner omits v2 contention authority: $contention_call"
+done
+rg -F '"$THERMAL_SAMPLED_AT" "$server_pid"' "$runner" >/dev/null \
+  || fail 'matched physical runner does not narrowly exempt its owned server PID'
+if rg -Fq 'require_no_foreign_heavy_work ' "$runner"; then
+    fail 'matched physical runner still uses the name-only contention predicate'
+fi
 rg -F 'hf2q_macos_verify_runtime_manifest "$REFERENCE_BIN"' "$runner" \
   >/dev/null
 rg -F 'runtime_manifest_sha256:$reference_runtime_manifest_sha' "$runner" \
@@ -602,7 +746,8 @@ publish_line=$(rg -n '^matched_publish_result ' "$matrix_runner" \
 policy_line=$(rg -n 'matched_validate_qwen_frozen_routing_policy_log "\$log"' \
   "$runner" | cut -d: -f1)
 ((stop_line < policy_line && policy_line < quality_line))
-[[ "$(rg -c 'matched_physical_require_child_seal "\$OUT_DIR"' \
-  "$ROOT_DIR/scripts/qwen38_matched_physical"*.sh | awk -F: '{sum += $2} END {print sum}')" == 2 ]]
+[[ "$(rg -c 'matched_physical_validate_reopened_(child|matrix) "\$OUT_DIR"' \
+  "$ROOT_DIR/scripts/qwen38_matched_physical"*.sh \
+  | awk -F: '{sum += $2} END {print sum}')" == 2 ]]
 
 echo 'matched physical source contract: pass'

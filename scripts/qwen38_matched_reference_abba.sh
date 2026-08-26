@@ -9,6 +9,15 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT_DIR="$ROOT_DIR/scripts"
+if [[ ${HF2Q_MATCHED_GATE_ISOLATED:-0} != 1 ]]; then
+    exec "$SCRIPT_DIR/run_release_gate_process_group.sh" env \
+      HF2Q_MATCHED_GATE_ISOLATED=1 "$0" "$@"
+fi
+# shellcheck source=scripts/macos_thermal_guard.sh
+source "$SCRIPT_DIR/macos_thermal_guard.sh"
+readonly HOST_CONTENTION_GATE_OWNER_PID=$$
+host_contention_require_isolated_gate_owner \
+  "$HOST_CONTENTION_GATE_OWNER_PID"
 # shellcheck source=scripts/qwen38_artifact_contract.sh
 source "$SCRIPT_DIR/qwen38_artifact_contract.sh"
 HF2Q_BIN=${HF2Q_BIN:?HF2Q_BIN is required}
@@ -57,8 +66,6 @@ readonly HF2Q_THERMAL_SWIFTC_BIN=/usr/bin/swiftc
 
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$SCRIPT_DIR/qwen36_watchdog_validate.sh"
-# shellcheck source=scripts/macos_thermal_guard.sh
-source "$SCRIPT_DIR/macos_thermal_guard.sh"
 # shellcheck source=scripts/macos_runtime_identity.sh
 source "$SCRIPT_DIR/macos_runtime_identity.sh"
 # shellcheck source=scripts/qwen38_matched_reference_contract.sh
@@ -465,7 +472,9 @@ assert_no_model_runtime() {
         lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2
         return 1
     fi
-    require_no_foreign_heavy_work 0
+    host_contention_sample "$OUT_DIR/contention-preflight.tsv" preflight \
+      "$HOST_CONTENTION_GATE_OWNER_PID"
+    host_contention_require_quiet preflight
 }
 
 require_ac_power() {
@@ -571,23 +580,23 @@ trap 'exit 1' INT TERM
 record_calibration_observation() {
     local thermal_log=$1
     local host_log=$2
-    local phase=$3
-    local sampled_at live_power_mode_code
+    local contention_log=$3
+    local phase=$4
+    local live_power_mode_code
 
     require_ac_power
-    require_no_foreign_heavy_work "$server_pid"
     live_power_mode_code=$(read_live_power_mode_code)
     [[ "$live_power_mode_code" == "$power_mode_code" ]] || {
         echo "numeric power-mode canary changed during calibration" >&2
         return 1
     }
-    thermal_read_state
-    sampled_at=$(date +%s)
-    [[ "$sampled_at" =~ ^[0-9]+$ ]]
-    printf '%s\t%s\t%s\n' "$sampled_at" "$THERMAL_STATE" "$phase" \
-      >>"$thermal_log"
-    printf '%s\tac\tquiet\t%s\t%s\t%s\n' "$sampled_at" \
-      "$power_mode_name" "$power_mode_code" "$phase" >>"$host_log"
+    thermal_sample "$thermal_log" "$phase"
+    host_contention_sample "$contention_log" "$phase" \
+      "$HOST_CONTENTION_GATE_OWNER_PID" \
+      "$THERMAL_SAMPLED_AT" "$server_pid"
+    printf '%s\tac\t%s\t%s\t%s\t%s\n' "$THERMAL_SAMPLED_AT" \
+      "$HOST_CONTENTION_STATE" "$power_mode_name" "$power_mode_code" \
+      "$phase" >>"$host_log"
 }
 
 wait_loaded_idle_calibration() {
@@ -596,11 +605,15 @@ wait_loaded_idle_calibration() {
     local nominal_since=-1
     local thermal_log="$trial_dir/thermal-settle.tsv"
     local host_log="$trial_dir/host-settle.tsv"
+    local contention_log="$trial_dir/contention-settle.tsv"
     : >"$thermal_log"
     : >"$host_log"
+    : >"$contention_log"
     while :; do
-        record_calibration_observation "$thermal_log" "$host_log" loaded-idle
-        if [[ "$THERMAL_STATE" == nominal ]]; then
+        record_calibration_observation "$thermal_log" "$host_log" \
+          "$contention_log" loaded-idle
+        if [[ "$THERMAL_STATE" == nominal \
+          && "$HOST_CONTENTION_STATE" == quiet ]]; then
             if ((nominal_since < 0)); then nominal_since=$SECONDS; fi
             if ((SECONDS - nominal_since >= THERMAL_SETTLE_SECONDS)); then
                 thermal_validate_measurement_log "$thermal_log" \
@@ -608,12 +621,17 @@ wait_loaded_idle_calibration() {
                 matched_validate_host_observation_log "$host_log" 2 \
                   "$THERMAL_SETTLE_SECONDS" "$((THERMAL_SAMPLE_SECONDS + 3))"
                 matched_validate_calibration_alignment "$thermal_log" "$host_log"
+                host_contention_validate_settle_log "$contention_log" \
+                  "$THERMAL_SETTLE_SECONDS" "$((THERMAL_SAMPLE_SECONDS + 3))"
+                host_contention_validate_thermal_alignment "$thermal_log" \
+                  "$contention_log"
                 return 0
             fi
         else
             nominal_since=-1
             : >"$thermal_log"
             : >"$host_log"
+            : >"$contention_log"
         fi
         if ((SECONDS >= deadline)); then
             echo "host did not remain nominal for ${THERMAL_SETTLE_SECONDS}s" >&2
@@ -629,9 +647,11 @@ monitor_measurement() {
     local stop_file=$3
     local thermal_log="$trial_dir/thermal-measurement.tsv"
     local host_log="$trial_dir/host-measurement.tsv"
+    local contention_log="$trial_dir/contention-measurement.tsv"
     while [[ ! -e "$stop_file" ]]; do
         if ! record_calibration_observation \
-          "$thermal_log" "$host_log" measurement \
+          "$thermal_log" "$host_log" "$contention_log" measurement \
+          || ! host_contention_require_quiet measurement \
           || [[ "$THERMAL_STATE" != nominal ]]; then
             echo "calibrated-host monitor failed" >"$trial_dir/calibration-failure.txt"
             kill -TERM "$parent_pid" 2>/dev/null || true
@@ -805,6 +825,7 @@ run_trial() {
     local log="$trial_dir/server.log"
     local measurement_log="$trial_dir/thermal-measurement.tsv"
     local host_measurement_log="$trial_dir/host-measurement.tsv"
+    local contention_measurement_log="$trial_dir/contention-measurement.tsv"
     local name group response elapsed content source_path
     local warmup_finished_at measurement_started_at warmup_delay
     mkdir -p "$trial_dir"
@@ -817,8 +838,10 @@ run_trial() {
     monitor_stop="$trial_dir/monitor.stop"
     : >"$measurement_log"
     : >"$host_measurement_log"
+    : >"$contention_measurement_log"
     record_calibration_observation "$measurement_log" "$host_measurement_log" \
-      measurement-start
+      "$contention_measurement_log" measurement-start
+    host_contention_require_quiet measurement-start
     [[ "$THERMAL_STATE" == nominal ]]
     monitor_measurement "$trial_dir" "$$" "$monitor_stop" &
     monitor_pid=$!
@@ -978,7 +1001,8 @@ run_trial() {
     monitor_pid=''
     monitor_stop=''
     record_calibration_observation "$measurement_log" "$host_measurement_log" \
-      measurement-end
+      "$contention_measurement_log" measurement-end
+    host_contention_require_quiet measurement-end
     [[ "$THERMAL_STATE" == nominal ]]
     thermal_validate_measurement_log "$measurement_log" \
       "$((THERMAL_SAMPLE_SECONDS + 3))"
@@ -986,6 +1010,10 @@ run_trial() {
       "$((THERMAL_SAMPLE_SECONDS + 3))"
     matched_validate_calibration_alignment "$measurement_log" \
       "$host_measurement_log"
+    host_contention_validate_measurement_log "$contention_measurement_log" \
+      "$((THERMAL_SAMPLE_SECONDS + 3))"
+    host_contention_validate_thermal_alignment "$measurement_log" \
+      "$contention_measurement_log"
     [[ ! -e "$trial_dir/calibration-failure.txt" ]]
     stop_server
     if [[ "$engine" == hf2q ]]; then
@@ -1040,10 +1068,11 @@ while IFS= read -r calibration_log; do
       "${calibration_log#"$OUT_DIR"/}" >>"$calibration_manifest"
 done < <(find "$OUT_DIR/trials" -type f \
   \( -name 'thermal-settle.tsv' -o -name 'thermal-measurement.tsv' \
-    -o -name 'host-settle.tsv' -o -name 'host-measurement.tsv' \) \
+    -o -name 'host-settle.tsv' -o -name 'host-measurement.tsv' \
+    -o -name 'contention-settle.tsv' -o -name 'contention-measurement.tsv' \) \
   -print | sort)
-[[ "$(awk 'END { print NR }' "$calibration_manifest")" == 16 ]] || {
-    echo "calibration manifest must bind four logs for each of four trials" >&2
+[[ "$(awk 'END { print NR }' "$calibration_manifest")" == 24 ]] || {
+    echo "calibration manifest must bind six logs for each of four trials" >&2
     exit 1
 }
 (cd "$OUT_DIR" && shasum -a 256 -c "$(basename "$calibration_manifest")" \
@@ -1325,6 +1354,11 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --argjson maximum_group_spread "$MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT" \
   --argjson maximum_case_spread "$MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT" \
   --argjson thermal_settle_seconds "$THERMAL_SETTLE_SECONDS" \
+  --arg host_contention_policy "$HOST_CONTENTION_POLICY" \
+  --argjson host_contention_max_foreign_cpu_percent \
+    "$HOST_CONTENTION_MAX_FOREIGN_CPU_PERCENT" \
+  --argjson host_contention_owner_pgid \
+    "$HOST_CONTENTION_GATE_OWNER_PID" \
   --argjson runtime_diagnostics "$runtime_diagnostics" \
   --argjson ttft_diagnostics "$ttft_diagnostics" \
   --argjson warmup_diagnostics "$warmup_diagnostics" \
@@ -1403,9 +1437,13 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
     stability:$stability[0],
     calibration:{required_state:"nominal",required_power:"ac",
       required_energy_mode:"automatic-or-high",
+      host_contention:{policy:$host_contention_policy,
+        maximum_foreign_cpu_percent:$host_contention_max_foreign_cpu_percent,
+        owner_scope:"release-gate-process-group",
+        owner_pgid:$host_contention_owner_pgid,continuous:true},
       required_process_state:"quiet",settle_seconds:$thermal_settle_seconds,
       sample_seconds:2,
-      trial_logs:16,manifest_sha256:$calibration_manifest_sha},
+      trial_logs:24,manifest_sha256:$calibration_manifest_sha},
     evidence:{script_sha256:$script_sha,contract_sha256:$contract_sha,
       artifact_contract_sha256:$artifact_contract_sha,
       request_manifest_sha256:$request_manifest_sha,
@@ -1415,7 +1453,7 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
       reference_runtime_manifest_sha256:$reference_runtime_manifest_sha,
       evidence_manifest_sha256:$evidence_manifest_sha}
   }' >"$OUT_DIR/summary.json.tmp"
-jq -e '
+jq -e --argjson expected_owner "$HOST_CONTENTION_GATE_OWNER_PID" '
   .schema == 5 and .verdict == "pass"
   and .quality.code.complete_rust == true
   and .quality.code.compiled == true
@@ -1448,7 +1486,14 @@ jq -e '
   and .streamed_semantic_ttft.hf2q.samples == 2
   and .streamed_semantic_ttft.reference.samples == 2
   and .sustained_warmup.pass == true
-  and .calibration.trial_logs == 16
+  and .calibration.trial_logs == 24
+  and .calibration.host_contention.policy == "process-group-cpu-v2"
+  and .calibration.host_contention.maximum_foreign_cpu_percent == 100
+  and .calibration.host_contention.owner_scope == "release-gate-process-group"
+  and (.calibration.host_contention.owner_pgid
+    | type == "number" and floor == . and . > 0)
+  and .calibration.host_contention.owner_pgid == $expected_owner
+  and .calibration.host_contention.continuous == true
   and (.evidence.evidence_manifest_sha256 | test("^[0-9a-f]{64}$"))
   and .reference.runtime_manifest_sha256
     == .evidence.reference_runtime_manifest_sha256
@@ -1456,4 +1501,8 @@ jq -e '
 ' "$OUT_DIR/summary.json.tmp" >/dev/null
 matched_publish_result "$OUT_DIR/summary.json.tmp" "$OUT_DIR/summary.json" \
   "$evidence_manifest" "$OUT_DIR/result.sha256"
+if ! matched_validate_reopened_reference_child "$OUT_DIR"; then
+  mv "$OUT_DIR/summary.json" "$OUT_DIR/summary.json.unsealed"
+  exit 1
+fi
 printf 'matched Qwen3.8 result sealed at %s\n' "$OUT_DIR/summary.json"

@@ -47,7 +47,14 @@
   matrix began; that result is retained as measured progress rather than
   current comparison authority. The matched gate now binds an externally
   frozen complete reference-runtime closure and records the clean exact gate
-  harness separately from the immutable hf2q candidate source commit. A
+  harness separately from the immutable hf2q candidate source commit. Both
+  the single-user and five-width matched ABBA authorities now use
+  process-group-cpu-v2 for the complete 120-second settle and measurement
+  window. Each measured leaf self-supervises in a dedicated process group,
+  proves its stable owner PID is the group leader, binds that owner PGID and
+  aggregate foreign-CPU ceiling into its receipt, and semantically reopens all
+  sealed telemetry. Rehashed contention, cross-trial owner drift, weakened
+  thresholds, and mutations back to the superseded name-only policy fail. A
   resumed packed-KV Stage-A/B fusion was also tested and rejected: it reduced
   an isolated verifier forward but did not improve the exact end-to-end server
   ABBA, so none of its runtime changes are part of this decision.

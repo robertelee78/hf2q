@@ -13,6 +13,8 @@ source "$SCRIPT_DIR/qwen38_artifact_contract.sh"
 source "$SCRIPT_DIR/qwen36_watchdog_validate.sh"
 # shellcheck source=scripts/macos_runtime_identity.sh
 source "$SCRIPT_DIR/macos_runtime_identity.sh"
+# shellcheck source=scripts/macos_thermal_guard.sh
+source "$SCRIPT_DIR/macos_thermal_guard.sh"
 # shellcheck source=scripts/qwen38_matched_reference_contract.sh
 source "$SCRIPT_DIR/qwen38_matched_reference_contract.sh"
 # shellcheck source=scripts/qwen38_matched_physical_contract.sh
@@ -194,7 +196,7 @@ for format in $(qwen38_artifact_formats); do
     wait "$child_pid" || child_rc=$?
     child_pid=''
     if ((child_rc != 0)); then exit "$child_rc"; fi
-    matched_physical_require_child_seal "$child_dir"
+    matched_physical_validate_reopened_child "$child_dir"
     matched_physical_validate_expected_reference_closure \
       "$child_dir/summary.json" "$REFERENCE_RUNTIME_MANIFEST_SHA256"
     child_summaries+=("$child_dir/summary.json")
@@ -300,7 +302,7 @@ mv "$evidence_manifest.tmp" "$evidence_manifest"
 (cd "$OUT_DIR" && shasum -a 256 -c evidence.sha256 >/dev/null)
 matched_publish_result "$OUT_DIR/summary.json.tmp" "$OUT_DIR/summary.json" \
   "$evidence_manifest" "$OUT_DIR/result.sha256"
-if ! matched_physical_require_child_seal "$OUT_DIR"; then
+if ! matched_physical_validate_reopened_matrix "$OUT_DIR"; then
     mv "$OUT_DIR/summary.json" "$OUT_DIR/summary.json.unsealed"
     exit 1
 fi

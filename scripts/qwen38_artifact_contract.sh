@@ -746,6 +746,14 @@ qwen38_validate_matched_peer_matrix_receipt() {
         and .quality.code.evaluator_tests_passed == true
         and .quality.repeat.exact_expected_content == true
         and .stability.stable == true
+        and .calibration.trial_logs == 24
+        and .calibration.host_contention.policy == "process-group-cpu-v2"
+        and .calibration.host_contention.maximum_foreign_cpu_percent == 100
+        and .calibration.host_contention.owner_scope ==
+          "release-gate-process-group"
+        and (.calibration.host_contention.owner_pgid | type == "number"
+          and floor == . and . > 0)
+        and .calibration.host_contention.continuous == true
         and .launch_settings.schema == 2
         and .launch_settings.hf2q.dense_decode_mvn == $decode_mvn
         and .launch_settings.hf2q.dense_decode_mv_ext == $decode_mv_ext
@@ -894,6 +902,12 @@ qwen38_validate_matched_physical_matrix_receipt() {
           $matrix.hf2q_effective_routing_policy
         and .acceptance.minimum_hf2q_ratio >= 1
         and .acceptance.maximum_launch_skew_seconds == $max_launch_skew
+        and .host_contention.policy == "process-group-cpu-v2"
+        and .host_contention.maximum_foreign_cpu_percent == 100
+        and .host_contention.owner_scope == "release-gate-process-group"
+        and (.host_contention.owner_pgid | type == "number"
+          and floor == . and . > 0)
+        and .host_contention.continuous == true
         and (.results | map(.width)) == [1,2,4,8,16]
         and all(.results[]; . as $cell
           | .schema == 2 and .verdict == "pass"

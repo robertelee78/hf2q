@@ -407,6 +407,11 @@ for format in "${expected_formats[@]}"; do
             gguf_file_type:$file_type},
           quality:{code:{evaluator_tests_passed:true},
             repeat:{exact_expected_content:true}},
+          calibration:{trial_logs:24,
+            host_contention:{policy:"process-group-cpu-v2",
+              maximum_foreign_cpu_percent:100,
+              owner_scope:"release-gate-process-group",owner_pgid:100,
+              continuous:true}},
           stability:{stable:true},acceptance:{minimum_hf2q_ratio:1},
           code:{hf2q_over_reference:1.01},repeat:{hf2q_over_reference:1.01}
         }' >>"$matched_cells"
@@ -724,6 +729,31 @@ jq '.results[2].schema = 4' "$test_dir/matched.json" \
 expect_failure matched-old-child-schema \
     qwen38_validate_matched_peer_matrix_receipt \
     "$test_dir/matched-old-child-schema.json"
+jq '.results[2].calibration.trial_logs = 16' "$test_dir/matched.json" \
+    >"$test_dir/matched-stale-contention-log-count.json"
+expect_failure matched-stale-contention-log-count \
+    qwen38_validate_matched_peer_matrix_receipt \
+    "$test_dir/matched-stale-contention-log-count.json"
+jq '.results[2].calibration.host_contention.policy = "process-group-v1"' \
+    "$test_dir/matched.json" >"$test_dir/matched-stale-contention-policy.json"
+expect_failure matched-stale-contention-policy \
+    qwen38_validate_matched_peer_matrix_receipt \
+    "$test_dir/matched-stale-contention-policy.json"
+jq '.results[2].calibration.host_contention.maximum_foreign_cpu_percent = 101' \
+    "$test_dir/matched.json" >"$test_dir/matched-weak-contention-threshold.json"
+expect_failure matched-weak-contention-threshold \
+    qwen38_validate_matched_peer_matrix_receipt \
+    "$test_dir/matched-weak-contention-threshold.json"
+jq '.results[2].calibration.host_contention.owner_pgid = 0' \
+    "$test_dir/matched.json" >"$test_dir/matched-invalid-contention-owner.json"
+expect_failure matched-invalid-contention-owner \
+    qwen38_validate_matched_peer_matrix_receipt \
+    "$test_dir/matched-invalid-contention-owner.json"
+jq '.results[2].calibration.host_contention.continuous = false' \
+    "$test_dir/matched.json" >"$test_dir/matched-noncontinuous-contention.json"
+expect_failure matched-noncontinuous-contention \
+    qwen38_validate_matched_peer_matrix_receipt \
+    "$test_dir/matched-noncontinuous-contention.json"
 jq '.results[0].code.hf2q_over_reference = 0.99' \
     "$test_dir/matched.json" >"$test_dir/matched-slower-cell.json"
 expect_failure matched-slower-cell qwen38_validate_matched_peer_matrix_receipt \
@@ -897,7 +927,11 @@ for index in "${!expected_formats[@]}"; do
               completion_tokens:100,unit:"canonical-semantic-output-token"},
             reference_parallelism_matches_width:true},
           acceptance:{minimum_hf2q_ratio:1,
-            maximum_launch_skew_seconds:0.1},results:$cells}' \
+            maximum_launch_skew_seconds:0.1},
+          host_contention:{policy:"process-group-cpu-v2",
+            maximum_foreign_cpu_percent:100,
+            owner_scope:"release-gate-process-group",owner_pgid:100,
+            continuous:true},results:$cells}' \
         >"$child_dir/summary.json"
     printf '%s\n' child-proof >"$child_dir/payload.txt"
     printf '%s  payload.txt\n' \
@@ -944,6 +978,42 @@ jq -n --arg repository "$QWEN38_QUALIFIED_MODEL_REPOSITORY" \
         artifact_contract_sha256:("9"*64),child_results_sealed:true,
         children:$children},results:$results}' >"$matched_root/summary.json.tmp"
 qwen38_validate_matched_physical_matrix_receipt "$matched_root/summary.json.tmp"
+
+# Re-seal coherent child mutations so rejection proves the outer validator
+# reads the v2 contention contract rather than merely noticing a stale hash.
+contention_child="$matched_root/artifacts/q5_k_m"
+cp "$contention_child/summary.json" "$test_dir/q5-child-summary.good"
+cp "$contention_child/result.sha256" "$test_dir/q5-child-result.good"
+for mutation in stale-policy weak-threshold invalid-owner noncontinuous; do
+    case "$mutation" in
+      stale-policy) filter='.host_contention.policy="process-group-v1"' ;;
+      weak-threshold) filter='.host_contention.maximum_foreign_cpu_percent=101' ;;
+      invalid-owner) filter='.host_contention.owner_pgid=0' ;;
+      noncontinuous) filter='.host_contention.continuous=false' ;;
+    esac
+    jq "$filter" "$test_dir/q5-child-summary.good" \
+        >"$contention_child/summary.json"
+    printf '%s  summary.json\n%s  evidence.sha256\n' \
+        "$(shasum -a 256 "$contention_child/summary.json" | awk '{print $1}')" \
+        "$(shasum -a 256 "$contention_child/evidence.sha256" | awk '{print $1}')" \
+        >"$contention_child/result.sha256"
+    mutated_summary_sha=$(shasum -a 256 "$contention_child/summary.json" \
+        | awk '{print $1}')
+    mutated_result_sha=$(shasum -a 256 "$contention_child/result.sha256" \
+        | awk '{print $1}')
+    jq --slurpfile child "$contention_child/summary.json" \
+        --arg summary "$mutated_summary_sha" --arg result "$mutated_result_sha" '
+      .results[2]=$child[0]
+      | .evidence.children[2].summary_sha256=$summary
+      | .evidence.children[2].result_seal_sha256=$result
+    ' "$matched_root/summary.json.tmp" \
+        >"$matched_root/resealed-contention-$mutation.json"
+    expect_failure "matched-physical-resealed-contention-$mutation" \
+        qwen38_validate_matched_physical_matrix_receipt \
+        "$matched_root/resealed-contention-$mutation.json"
+done
+cp "$test_dir/q5-child-summary.good" "$contention_child/summary.json"
+cp "$test_dir/q5-child-result.good" "$contention_child/result.sha256"
 
 for mutation in old-matrix-schema old-child-schema old-cell-schema \
     unsealed-physical wrong-physical-path lane-zero fake-cost-disable \
@@ -1129,9 +1199,9 @@ grep -Fq "qwen38_validate_physical_matrix_seal \"\$OUT_DIR/matrix.json\"" \
 grep -Fq "qwen38_validate_matched_physical_matrix_receipt \"\$OUT_DIR/summary.json.tmp\"" \
     "$script_dir/qwen38_matched_physical_matrix.sh" \
     || fail 'matched physical matrix does not execute its receipt validator'
-grep -Fq "matched_physical_require_child_seal \"\$OUT_DIR\"" \
+grep -Fq "matched_physical_validate_reopened_matrix \"\$OUT_DIR\"" \
     "$script_dir/qwen38_matched_physical_matrix.sh" \
-    || fail 'matched physical matrix does not reopen its final seal'
+    || fail 'matched physical matrix does not semantically reopen its final seal'
 # shellcheck disable=SC2016
 grep -Fq 'MAX_LAUNCH_SKEW_SECONDS="$MAX_LAUNCH_SKEW_SECONDS"' \
     "$script_dir/qwen38_matched_physical_matrix.sh" \

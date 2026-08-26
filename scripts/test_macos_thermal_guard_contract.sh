@@ -144,6 +144,27 @@ host_contention_process_snapshot() {
   printf '%b\n' "$contention_snapshot"
 }
 contention_log="$tmp_dir/contention.log"
+
+# The stable contention owner must lead a dedicated process group at leaf
+# entry. An inherited same-PGID process is a falsifier, not owned work.
+contention_snapshot='100\t100\t0.0\tbash'
+host_contention_require_isolated_gate_owner 100
+contention_snapshot='100\t100\t0.0\tbash
+101\t100\t0.0\tpython3'
+if host_contention_require_isolated_gate_owner 100; then
+  echo "contention guard accepted an inherited same-PGID process" >&2
+  exit 1
+fi
+contention_snapshot='100\t77\t0.0\tbash'
+if host_contention_require_isolated_gate_owner 100; then
+  echo "contention guard accepted a non-leader owner PID" >&2
+  exit 1
+fi
+
+contention_snapshot='100\t100\t800.0\tbash
+101\t100\t0.0\thf2q
+102\t100\t0.0\thf2q-abcdef
+200\t200\t99.9\tlaunchd'
 host_contention_sample "$contention_log" owned-baseline 100 5000
 test "$HOST_CONTENTION_STATE" = quiet
 test "$HOST_CONTENTION_OWNER_PGID" = 100
@@ -166,23 +187,51 @@ contention_snapshot='100\t100\t0.0\tbash
 host_contention_sample "$contention_log" owned-cargo 100 5002
 test "$HOST_CONTENTION_STATE" = contended
 test "$HOST_CONTENTION_OFFENDERS" = '201:100:cargo'
+if host_contention_sample "$contention_log" forged-owned-server 100 5002 201; then
+  echo "host contention guard accepted a compiler as an owned server" >&2
+  exit 1
+fi
+
+# A matched comparison may exempt exactly its verified owned server PID. The
+# exemption never applies to a second peer process, even with the same name.
+contention_snapshot='100\t100\t0.0\tbash
+101\t100\t95.0\tllama-server'
+host_contention_sample "$contention_log" owned-reference 100 5003 101
+test "$HOST_CONTENTION_STATE" = quiet
+test "$HOST_CONTENTION_OFFENDERS" = '-'
+contention_snapshot='100\t100\t0.0\tbash
+101\t101\t95.0\tllama-server'
+if host_contention_sample "$contention_log" escaped-owned-reference 100 5003 101; then
+  echo "host contention guard accepted a server outside the owned group" >&2
+  exit 1
+fi
+contention_snapshot='100\t100\t0.0\tbash
+101\t100\t95.0\tllama-server
+200\t200\t0.0\tllama-server'
+host_contention_sample "$contention_log" foreign-reference 100 5004 101
+test "$HOST_CONTENTION_STATE" = contended
+test "$HOST_CONTENTION_OFFENDERS" = '200:200:llama-server'
+if host_contention_sample "$contention_log" missing-owned-reference 100 5005 999; then
+  echo "host contention guard accepted an absent owned-server exemption" >&2
+  exit 1
+fi
 
 contention_snapshot='100\t100\t0.0\tbash
 200\t200\t99.9\tpython3'
-host_contention_sample "$contention_log" unrelated-process 100 5003
+host_contention_sample "$contention_log" unrelated-process 100 5006
 test "$HOST_CONTENTION_STATE" = quiet
 
 contention_snapshot='100\t100\t0.0\tbash
 200\t200\t60.0\tpython3
 201\t201\t45.0\tnode'
-host_contention_sample "$contention_log" aggregate-foreign-cpu 100 5004
+host_contention_sample "$contention_log" aggregate-foreign-cpu 100 5007
 test "$HOST_CONTENTION_STATE" = contended
 test "$HOST_CONTENTION_FOREIGN_CPU_PERCENT" = 105.0
 test "$HOST_CONTENTION_OFFENDERS" = '-'
 
 contention_snapshot='100\t100\t0.0\tbash
 200\t200\t100.0\tpython3'
-host_contention_sample "$contention_log" threshold-foreign-cpu 100 5005
+host_contention_sample "$contention_log" threshold-foreign-cpu 100 5008
 test "$HOST_CONTENTION_STATE" = contended
 test "$HOST_CONTENTION_FOREIGN_CPU_PERCENT" = 100.0
 

@@ -20,6 +20,10 @@ PORT=${PORT:-18086}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/qwen38_artifact_contract.sh
 source "$script_dir/qwen38_artifact_contract.sh"
+# shellcheck source=scripts/macos_thermal_guard.sh
+source "$script_dir/macos_thermal_guard.sh"
+# shellcheck source=scripts/qwen38_matched_reference_contract.sh
+source "$script_dir/qwen38_matched_reference_contract.sh"
 
 for command in awk find jq shasum stat tr; do
     command -v "$command" >/dev/null || {
@@ -41,6 +45,16 @@ done
     exit 2
 }
 qwen38_validate_pinned_peer_commit "$REFERENCE_COMMIT"
+
+child_pid=''
+cleanup_child() {
+    local original_rc=$?
+    trap - EXIT
+    matched_terminate_owned_child "$child_pid" || true
+    exit "$original_rc"
+}
+trap cleanup_child EXIT
+trap 'exit 130' INT TERM
 
 # Refuse a partial catalog before the first calibrated model load.
 for format in $(qwen38_artifact_formats); do
@@ -78,7 +92,13 @@ for format in $(qwen38_artifact_formats); do
     MODEL_BYTES="$bytes" \
     OUT_DIR="$format_out" \
     PORT="$PORT" \
-        "$script_dir/qwen38_matched_reference_abba.sh"
+        "$script_dir/qwen38_matched_reference_abba.sh" &
+    child_pid=$!
+    child_rc=0
+    wait "$child_pid" || child_rc=$?
+    child_pid=''
+    if ((child_rc != 0)); then exit "$child_rc"; fi
+    matched_validate_reopened_reference_child "$format_out"
     summary_paths+=("$format_out/summary.json")
 done
 
@@ -99,5 +119,9 @@ jq -n \
       formats:["BF16","Q4_K_M","Q5_K_M","Q6_K","Q8_0"],results:$results
     }' >"$OUT_DIR/matrix.json.tmp"
 qwen38_validate_matched_peer_matrix_receipt "$OUT_DIR/matrix.json.tmp"
+for format in $(qwen38_artifact_formats); do
+    format_slug=$(printf '%s' "$format" | tr '[:upper:]' '[:lower:]')
+    matched_validate_reopened_reference_child "$OUT_DIR/$format_slug"
+done
 mv "$OUT_DIR/matrix.json.tmp" "$OUT_DIR/matrix.json"
 jq . "$OUT_DIR/matrix.json"
