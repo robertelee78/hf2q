@@ -433,24 +433,15 @@ require_no_model_runtime() {
         echo "existing model runtime detected: $offenders" >&2
         return 1
     }
-    ! lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sed -n '2p' | rg -q .
+    matched_require_port_available "$PORT" || return 1
     host_contention_sample "$OUT_DIR/contention-preflight.tsv" preflight \
-      "$HOST_CONTENTION_GATE_OWNER_PID"
-    host_contention_require_quiet preflight
+      "$HOST_CONTENTION_GATE_OWNER_PID" || return 1
+    host_contention_require_quiet preflight || return 1
 }
 
 record_calibration_observation() {
-    local thermal_log=$1 host_log=$2 contention_log=$3 phase=$4 live_code
-    require_ac_power
-    live_code=$(read_live_power_mode_code)
-    [[ "$live_code" == "$power_mode_code" ]]
-    thermal_sample "$thermal_log" "$phase"
-    host_contention_sample "$contention_log" "$phase" \
-      "$HOST_CONTENTION_GATE_OWNER_PID" \
-      "$THERMAL_SAMPLED_AT" "$server_pid"
-    printf '%s\tac\t%s\t%s\t%s\t%s\n' "$THERMAL_SAMPLED_AT" \
-      "$HOST_CONTENTION_STATE" "$power_mode_name" "$power_mode_code" \
-      "$phase" >>"$host_log"
+    matched_record_calibration_observation "$1" "$2" "$3" "$4" \
+      "$HOST_CONTENTION_GATE_OWNER_PID" "$server_pid"
 }
 
 wait_loaded_idle_calibration() {

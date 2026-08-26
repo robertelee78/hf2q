@@ -3,6 +3,7 @@ set -euo pipefail
 
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 runner="$root_dir/scripts/qwen38_matched_reference_abba.sh"
+physical_runner="$root_dir/scripts/qwen38_matched_physical_abba.sh"
 
 # shellcheck source=scripts/qwen38_artifact_contract.sh
 source "$root_dir/scripts/qwen38_artifact_contract.sh"
@@ -51,6 +52,78 @@ expect_failure() {
         fail "negative matched-reference fixture passed: $label"
     fi
 }
+
+# Port availability and calibration sampling are shared fail-closed
+# predicates. Exercise their behavior directly so a caller's conditional
+# context cannot turn a failed probe into a successful observation.
+(
+    # shellcheck disable=SC2329
+    lsof() {
+        printf '%s\n' \
+          'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME' \
+          'hf2q 99 test 1u IPv4 0 0t0 TCP *:18086 (LISTEN)'
+    }
+    expect_failure occupied-port matched_require_port_available 18086
+)
+(
+    lsof() { return 1; }
+    matched_require_port_available 18086
+)
+
+calibration_dir="$fixture_dir/calibration"
+mkdir -p "$calibration_dir"
+(
+    power_mode_code=2
+    power_mode_name=automatic
+    require_ac_power() { return 0; }
+    read_live_power_mode_code() { printf '%s\n' 2; }
+    thermal_sample() {
+        THERMAL_SAMPLED_AT=101
+        THERMAL_STATE=nominal
+        printf '101\tnominal\tmeasurement\n' >>"$1"
+    }
+    host_contention_sample() {
+        HOST_CONTENTION_STATE=quiet
+        printf '101\tquiet\tmeasurement\t77\t0.0\t-\n' >>"$1"
+    }
+    matched_record_calibration_observation \
+      "$calibration_dir/thermal-success.tsv" \
+      "$calibration_dir/host-success.tsv" \
+      "$calibration_dir/contention-success.tsv" measurement 77 88
+    [[ "$(cat "$calibration_dir/host-success.tsv")" \
+      == $'101\tac\tquiet\tautomatic\t2\tmeasurement' ]]
+)
+for failed_step in ac power-read power-mismatch thermal contention host-write; do
+    (
+        power_mode_code=2
+        power_mode_name=automatic
+        require_ac_power() { return 0; }
+        read_live_power_mode_code() { printf '%s\n' 2; }
+        thermal_sample() {
+            THERMAL_SAMPLED_AT=101
+            THERMAL_STATE=nominal
+            return 0
+        }
+        host_contention_sample() {
+            HOST_CONTENTION_STATE=quiet
+            return 0
+        }
+        case "$failed_step" in
+            ac) require_ac_power() { return 91; } ;;
+            power-read) read_live_power_mode_code() { return 91; } ;;
+            power-mismatch) read_live_power_mode_code() { printf '%s\n' 1; } ;;
+            thermal) thermal_sample() { return 91; } ;;
+            contention) host_contention_sample() { return 91; } ;;
+        esac
+        host_path="$calibration_dir/host-$failed_step.tsv"
+        [[ "$failed_step" == host-write ]] && host_path="$calibration_dir"
+        if matched_record_calibration_observation \
+          "$calibration_dir/thermal-$failed_step.tsv" "$host_path" \
+          "$calibration_dir/contention-$failed_step.tsv" measurement 77 88; then
+            fail "calibration observation masked $failed_step failure"
+        fi
+    )
+done
 
 jq -n \
   --arg hf2q_speculation "$QWEN38_MATCHED_HF2Q_SPECULATION_POLICY" \
@@ -570,11 +643,19 @@ for contention_call in \
   grep -Fq "$contention_call" "$runner" \
     || fail "matched runner omits v2 contention authority: $contention_call"
 done
-grep -Fq '"$THERMAL_SAMPLED_AT" "$server_pid"' "$runner" \
-  || fail 'matched runner does not narrowly exempt its owned server PID'
+grep -Fq '"$THERMAL_SAMPLED_AT" "$owned_server_pid"' \
+  "$root_dir/scripts/qwen38_matched_reference_contract.sh" \
+  || fail 'shared calibration predicate does not narrowly exempt its owned server PID'
 if grep -Fq 'require_no_foreign_heavy_work ' "$runner"; then
   fail 'matched runner still uses the name-only contention predicate'
 fi
+grep -Fq 'matched_require_port_available "$PORT"' "$physical_runner" \
+  || fail 'matched physical runner bypasses the tested port predicate'
+for calibrated_runner in "$runner" "$physical_runner"; do
+  grep -Fq 'matched_record_calibration_observation "$1" "$2" "$3" "$4"' \
+    "$calibrated_runner" \
+    || fail 'matched runner bypasses the tested calibration predicate'
+done
 grep -Fq 'policy:$host_contention_policy' "$runner" \
   || fail 'matched summary omits its exact contention policy'
 grep -Fq 'HOST_CONTENTION_GATE_OWNER_PID' "$runner" \

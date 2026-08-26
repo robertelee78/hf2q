@@ -3,6 +3,43 @@
 # Pure, model-free predicates shared by the matched Qwen3.8 runner and its
 # hosted contract test. The caller owns `set -euo pipefail`.
 
+matched_require_port_available() {
+    local port=$1
+
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || return 2
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null \
+      | sed -n '2p' | rg -q .; then
+        echo "server listener already occupies port: $port" >&2
+        return 1
+    fi
+}
+
+# Record one thermal, contention, and host-power observation on the same
+# timestamp. Every step propagates failure explicitly because callers invoke
+# this helper from conditional monitor expressions, where Bash disables the
+# usual `errexit` behavior for the complete function body.
+matched_record_calibration_observation() {
+    local thermal_log=$1 host_log=$2 contention_log=$3 phase=$4
+    local owner_pid=$5 owned_server_pid=${6:-} live_power_mode_code
+
+    require_ac_power || return 1
+    live_power_mode_code=$(read_live_power_mode_code) || return 1
+    # Assigned by each runner's measured power-mode preflight.
+    # shellcheck disable=SC2154
+    [[ "$live_power_mode_code" == "$power_mode_code" ]] || {
+        echo "numeric power-mode canary changed during calibration" >&2
+        return 1
+    }
+    thermal_sample "$thermal_log" "$phase" || return 1
+    host_contention_sample "$contention_log" "$phase" "$owner_pid" \
+      "$THERMAL_SAMPLED_AT" "$owned_server_pid" || return 1
+    # Assigned by the same preflight as power_mode_code.
+    # shellcheck disable=SC2154
+    printf '%s\tac\t%s\t%s\t%s\t%s\n' "$THERMAL_SAMPLED_AT" \
+      "$HOST_CONTENTION_STATE" "$power_mode_name" "$power_mode_code" \
+      "$phase" >>"$host_log" || return 1
+}
+
 matched_validate_launch_settings() {
     local settings_path=$1 expected_mvn=$2 expected_mv_ext=$3 expected_q5k=$4
     local expected_hf2q_speculation=$5 expected_reference_speculation=$6

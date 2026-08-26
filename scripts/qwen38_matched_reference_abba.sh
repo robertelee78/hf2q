@@ -578,25 +578,8 @@ trap on_exit EXIT
 trap 'exit 1' INT TERM
 
 record_calibration_observation() {
-    local thermal_log=$1
-    local host_log=$2
-    local contention_log=$3
-    local phase=$4
-    local live_power_mode_code
-
-    require_ac_power
-    live_power_mode_code=$(read_live_power_mode_code)
-    [[ "$live_power_mode_code" == "$power_mode_code" ]] || {
-        echo "numeric power-mode canary changed during calibration" >&2
-        return 1
-    }
-    thermal_sample "$thermal_log" "$phase"
-    host_contention_sample "$contention_log" "$phase" \
-      "$HOST_CONTENTION_GATE_OWNER_PID" \
-      "$THERMAL_SAMPLED_AT" "$server_pid"
-    printf '%s\tac\t%s\t%s\t%s\t%s\n' "$THERMAL_SAMPLED_AT" \
-      "$HOST_CONTENTION_STATE" "$power_mode_name" "$power_mode_code" \
-      "$phase" >>"$host_log"
+    matched_record_calibration_observation "$1" "$2" "$3" "$4" \
+      "$HOST_CONTENTION_GATE_OWNER_PID" "$server_pid"
 }
 
 wait_loaded_idle_calibration() {

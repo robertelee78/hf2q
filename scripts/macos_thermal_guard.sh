@@ -25,7 +25,7 @@ HOST_CONTENTION_OFFENDERS=""
 host_contention_process_snapshot() {
   local snapshot
 
-  snapshot=$(/bin/ps -axo pid=,pgid=,%cpu=,comm= 2>/dev/null | awk '
+  snapshot=$(/bin/ps -axo pid=,pgid=,%cpu=,command= 2>/dev/null | awk '
     {
       pid = $1
       pgid = $2
@@ -81,6 +81,7 @@ host_contention_require_isolated_gate_owner() {
       for (pid in pgid_by_pid) {
         if (pid != owner && pgid_by_pid[pid] == owner) {
           name = command_by_pid[pid]
+          sub(/[[:space:]].*$/, "", name)
           sub(/^.*\//, "", name)
           # The snapshot itself briefly creates these descendants inside the
           # fresh group. Any workload process is still a hard failure.
@@ -153,24 +154,31 @@ host_contention_sample() {
       owner_pgid = pgid_by_pid[owner]
       if (allowed_owned != "") {
         allowed_name = command_by_pid[allowed_owned]
+        sub(/[[:space:]].*$/, "", allowed_name)
         sub(/^.*\//, "", allowed_name)
         if (allowed_name !~ /^(hf2q|llama-server)(-|$)/) exit 2
       }
       offenders = ""
       foreign_cpu = 0
       for (i = 1; i <= count; i++) {
-        name = command[i]
+        full_command = tolower(command[i])
+        name = full_command
+        sub(/[[:space:]].*$/, "", name)
         sub(/^.*\//, "", name)
         if (pgid[i] != owner_pgid) foreign_cpu += cpu[i]
         owned_server = allowed_owned != "" && pid[i] == allowed_owned \
           && pgid[i] == owner_pgid \
           && name ~ /^(hf2q|llama-server)(-|$)/
+        python_model_work = name ~ /^python(3([.][0-9]+)?)?$/ \
+          && full_command ~ /(mlx|torch|transformers|teacher|model[-_ ]?gen|inference|vllm)/
         forbidden = !owned_server \
-          && ((name ~ /^(cargo|rustc|llama-cli|llama-server)(-|$)/) \
-            || (name ~ /^hf2q(-|$)/ && pgid[i] != owner_pgid))
+          && ((name ~ /^(cargo|rustc|llama-cli|llama-server|llama-bench|ollama|mlx-lm|mlx_lm|swift-frontend)([0-9.-]|$)/) \
+            || (name ~ /^hf2q([0-9.-]|$)/ && pgid[i] != owner_pgid) \
+            || python_model_work)
         if (forbidden) {
-          gsub(/[^A-Za-z0-9._+-]/, "_", name)
-          item = pid[i] ":" pgid[i] ":" name
+          label = python_model_work ? "python-model-work" : name
+          gsub(/[^A-Za-z0-9._+-]/, "_", label)
+          item = pid[i] ":" pgid[i] ":" label
           offenders = offenders == "" ? item : offenders "," item
         }
       }

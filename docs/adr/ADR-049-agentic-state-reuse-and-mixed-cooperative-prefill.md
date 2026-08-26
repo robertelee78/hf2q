@@ -18,7 +18,22 @@
   reopened under the v2 contention authority, while the DeepSeek and Qwen
   current-head real-artifact cells remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 92 closes three integration falsifiers found while
+- Updated: 2026-08-26 (rev 93 closes three shell-semantic falsifiers before
+  spending the reopened current-head hardware run. The physical preflight's
+  negated listener pipeline could fail and then return success after later
+  quiet-host checks; both matched runners' calibration functions could also
+  mask a failed power, thermal, or contention sample when called beneath a
+  conditional because Bash suppresses `errexit` throughout that function
+  body. One shared port predicate and one shared calibration writer now
+  propagate every failure explicitly, with injected occupied-port, power,
+  thermal, contention, and output-write failures. Finally,
+  process-group-cpu-v2 again preserves all of the named prohibitions declared
+  by its launch receipt: compiler and native inference processes are rejected
+  unconditionally, full command capture distinguishes Python model work from
+  unrelated Python utilities, and aggregate foreign CPU remains independently
+  capped. Behavioral mutations cover every named runtime and both Python
+  outcomes. Current-head hardware acceptance remains open. Rev 92 closes
+  three integration falsifiers found while
   reviewing rev 91. A measured leaf no longer trusts an inherited process
   group: it re-execs through the release-gate supervisor, proves its stable
   owner PID is its PGID before reading model arguments, and uses that owner for

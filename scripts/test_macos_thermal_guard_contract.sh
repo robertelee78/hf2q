@@ -171,7 +171,8 @@ test "$HOST_CONTENTION_OWNER_PGID" = 100
 test "$HOST_CONTENTION_FOREIGN_CPU_PERCENT" = 99.9
 test "$(tail -1 "$contention_log")" = $'5000\tquiet\towned-baseline\t100\t99.9\t-'
 
-for foreign_name in cargo rustc llama-cli llama-server hf2q hf2q-deadbeef; do
+for foreign_name in cargo rustc llama-cli llama-server llama-bench ollama \
+    mlx-lm mlx_lm swift-frontend hf2q hf2q-deadbeef; do
   contention_snapshot="100\\t100\\t0.0\\tbash
 101\\t100\\t0.0\\thf2q
 200\\t200\\t0.0\\t${foreign_name}"
@@ -217,9 +218,20 @@ if host_contention_sample "$contention_log" missing-owned-reference 100 5005 999
 fi
 
 contention_snapshot='100\t100\t0.0\tbash
-200\t200\t99.9\tpython3'
+200\t200\t99.9\t/usr/bin/python3 calendar_export.py'
 host_contention_sample "$contention_log" unrelated-process 100 5006
 test "$HOST_CONTENTION_STATE" = quiet
+
+for python_model_command in \
+    '/usr/bin/python3 teacher_model_gen.py' \
+    '/opt/venv/bin/python inference.py' \
+    '/usr/bin/python3 -m mlx_lm.generate'; do
+  contention_snapshot="100\\t100\\t0.0\\tbash
+200\\t200\\t0.0\\t${python_model_command}"
+  host_contention_sample "$contention_log" python-model-work 100 5006
+  test "$HOST_CONTENTION_STATE" = contended
+  test "$HOST_CONTENTION_OFFENDERS" = '200:200:python-model-work'
+done
 
 contention_snapshot='100\t100\t0.0\tbash
 200\t200\t60.0\tpython3

@@ -691,8 +691,12 @@ for contention_call in \
     rg -F "$contention_call" "$runner" >/dev/null \
       || fail "matched physical runner omits v2 contention authority: $contention_call"
 done
-rg -F '"$THERMAL_SAMPLED_AT" "$server_pid"' "$runner" >/dev/null \
-  || fail 'matched physical runner does not narrowly exempt its owned server PID'
+rg -F 'matched_record_calibration_observation "$1" "$2" "$3" "$4"' \
+  "$runner" >/dev/null \
+  || fail 'matched physical runner bypasses the shared calibration predicate'
+rg -F '"$THERMAL_SAMPLED_AT" "$owned_server_pid"' \
+  "$ROOT_DIR/scripts/qwen38_matched_reference_contract.sh" >/dev/null \
+  || fail 'shared calibration predicate does not narrowly exempt its owned server PID'
 if rg -Fq 'require_no_foreign_heavy_work ' "$runner"; then
     fail 'matched physical runner still uses the name-only contention predicate'
 fi
