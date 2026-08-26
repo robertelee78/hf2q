@@ -29,6 +29,7 @@ MAX_SLOTS = 8
 LIVE_DECODERS = 4
 PREFILLERS = 4
 MIXED_ROWS = 128
+DECODER_PRIME_MAX_TOKENS = 1
 SCHEDULER_GAP_MS = 15_000.0
 SEMANTIC_SSE_GAP_MS = 15_000.0
 MAX_PREFILL_WALL_SECONDS = 60.0
@@ -207,6 +208,15 @@ def semantic_projection(canonical: dict[str, Any]) -> dict[str, Any]:
     )}
 
 
+def usage_cached_tokens(canonical: dict[str, Any], name: str) -> int:
+    details = canonical["usage"].get("prompt_tokens_details")
+    require(isinstance(details, dict), f"{name} omitted usage.prompt_tokens_details")
+    cached = details.get("cached_tokens")
+    require(type(cached) is int and cached >= 0,
+            f"{name} has invalid usage.prompt_tokens_details.cached_tokens")
+    return cached
+
+
 def verify_manifest(process_dir: Path) -> str:
     manifest = process_dir / "evidence.sha256"
     require(manifest.is_file() and not manifest.is_symlink(), f"missing manifest: {manifest}")
@@ -317,7 +327,12 @@ def verify_request(path: Path, kind: str, model_id: str) -> None:
             f"non-deterministic request: {path}")
     require(request.get("seed") == 42 and request.get("repetition_penalty") == 1,
             f"request sampling drift: {path}")
-    require(request.get("max_tokens") == (256 if kind == "decoder" else 8),
+    expected_max_tokens = {
+        "decoder-prime": DECODER_PRIME_MAX_TOKENS,
+        "decoder": 256,
+        "prefill": 8,
+    }.get(kind)
+    require(expected_max_tokens is not None and request.get("max_tokens") == expected_max_tokens,
             f"request role/max_tokens drift: {path}")
     require(isinstance(request.get("messages"), list) and len(request["messages"]) == 1,
             f"request message shape drift: {path}")
@@ -339,6 +354,56 @@ def request_timing(path: Path) -> tuple[float, float]:
     require(math.isfinite(started) and math.isfinite(finished) and 0 < started < finished,
             f"invalid request timing: {path}")
     return started, finished
+
+
+def verify_decoder_prime(process_dir: Path, model_id: str) -> list[dict[str, Any]]:
+    prime_dir = process_dir / "decoder-prime"
+    prime = load_json(prime_dir / "prime.json")
+    require(set(prime) == {"schema", "max_tokens", "request_ids"}
+            and prime["schema"] == 1
+            and prime["max_tokens"] == DECODER_PRIME_MAX_TOKENS,
+            f"decoder-prime identity drift: {process_dir.name}")
+    request_ids = prime.get("request_ids")
+    require(isinstance(request_ids, list) and len(request_ids) == LIVE_DECODERS
+            and len(set(request_ids)) == LIVE_DECODERS
+            and all(type(value) is int and value > 0 for value in request_ids),
+            f"decoder-prime request IDs are invalid: {process_dir.name}")
+    prime_requests: list[dict[str, Any]] = []
+    projections: list[dict[str, Any]] = []
+    for lane in range(1, LIVE_DECODERS + 1):
+        stem = f"decoder-{lane}"
+        prime_request_path = prime_dir / f"{stem}.request.json"
+        verify_request(prime_request_path, "decoder-prime", model_id)
+        prime_request = load_json(prime_request_path)
+        prime_requests.append(prime_request)
+        for trial in range(1, TRIALS + 1):
+            measured_request = load_json(
+                process_dir / "waves" / str(trial) / f"{stem}.request.json"
+            )
+            measured_request["max_tokens"] = DECODER_PRIME_MAX_TOKENS
+            require(measured_request == prime_request,
+                    f"measured decoder does not reuse its primed prompt: {stem}/{trial}")
+        request_timing(prime_dir / f"{stem}.timing.tsv")
+        raw = parse_timed_sse(prime_dir / f"{stem}.timed-sse")
+        require(load_json(prime_dir / f"{stem}.canonical.json") == raw,
+                f"decoder-prime canonical SSE drift: {stem}")
+        projections.append(semantic_projection(raw))
+    contents = [request["messages"][0]["content"] for request in prime_requests]
+    require(len(set(contents)) == LIVE_DECODERS,
+            f"decoder-prime lane prompts are not distinct: {process_dir.name}")
+    log = (prime_dir / "server.delta.log").read_text(encoding="utf-8")
+    starts = [fields(line) for line in log.splitlines()
+              if "DeepSeek-V4 request started" in line]
+    observed_ids = [int(row["request_id"]) for row in starts
+                    if row.get("max_tokens") == str(DECODER_PRIME_MAX_TOKENS)]
+    require(observed_ids == request_ids,
+            f"decoder-prime server identities drifted: {process_dir.name}")
+    completions = [fields(line) for line in log.splitlines()
+                   if "DeepSeek-V4 request complete" in line]
+    require(all(sum(row.get("request_id") == str(request_id) for row in completions) == 1
+                for request_id in request_ids),
+            f"decoder-prime completion receipt is incomplete: {process_dir.name}")
+    return projections
 
 
 def verify_wave(process_dir: Path, arm: str, trial: int, model_id: str) -> dict[str, Any]:
@@ -367,6 +432,7 @@ def verify_wave(process_dir: Path, arm: str, trial: int, model_id: str) -> dict[
     prefill_timings: list[tuple[float, float]] = []
     projections: list[dict[str, Any]] = []
     client_decoder_gaps: list[float] = []
+    client_cached_tokens: dict[str, list[int]] = {"decoder": [], "prefill": []}
     for kind, count, timings in (("decoder", 4, decoder_timings), ("prefill", 4, prefill_timings)):
         for lane in range(1, count + 1):
             stem = f"{kind}-{lane}"
@@ -377,6 +443,7 @@ def verify_wave(process_dir: Path, arm: str, trial: int, model_id: str) -> dict[
             sealed = load_json(wave_dir / f"{stem}.canonical.json")
             require(sealed == raw, f"producer canonical SSE drift: {stem}")
             projections.append(semantic_projection(raw))
+            client_cached_tokens[kind].append(usage_cached_tokens(raw, stem))
             if kind == "decoder":
                 require(raw["semantic_events"] >= 2, f"live decoder emitted fewer than two semantic events: {stem}")
                 client_decoder_gaps.append(float(raw["semantic_max_gap_ms"]))
@@ -404,10 +471,23 @@ def verify_wave(process_dir: Path, arm: str, trial: int, model_id: str) -> dict[
             starts_by_budget[int(row["max_tokens"])].append(int(row["request_id"]))
     require(starts_by_budget[256] == decoder_ids and starts_by_budget[8] == prefill_ids,
             f"server request identities disagree with wave receipt: {wave_dir}")
+    log_lines = log.splitlines()
+    prefill_start_positions = [index for index, line in enumerate(log_lines)
+                               if "DeepSeek-V4 request started" in line
+                               and fields(line).get("request_id") in {str(value) for value in prefill_ids}]
+    decoder_complete_positions = [index for index, line in enumerate(log_lines)
+                                  if "DeepSeek-V4 request complete" in line
+                                  and fields(line).get("request_id") in {str(value) for value in decoder_ids}]
+    require(len(prefill_start_positions) == PREFILLERS
+            and len(decoder_complete_positions) == LIVE_DECODERS
+            and max(prefill_start_positions) < min(decoder_complete_positions),
+            f"prefills were not admitted before the first live decoder completed: {wave_dir}")
 
     scheduler_gaps: list[float] = []
     server_sse_gaps: list[float] = []
     receipt_lines = [line for line in log.splitlines() if "DeepSeek-V4 slot latency receipt" in line]
+    prefill_plan_lines = [line for line in log.splitlines() if "DeepSeek-V4 prefill planned" in line]
+    decoder_plan_cached_tokens: list[int] = []
     for request_id in decoder_ids:
         matches = [fields(line) for line in receipt_lines
                    if fields(line).get("request_id") == str(request_id)]
@@ -419,17 +499,60 @@ def verify_wave(process_dir: Path, arm: str, trial: int, model_id: str) -> dict[
                                            "scheduler gap", minimum=0))
         server_sse_gaps.append(exact_number(float(row["semantic_sse_max_gap_ms"]),
                                             "server SSE gap", minimum=0))
+        plans = [fields(line) for line in prefill_plan_lines
+                 if fields(line).get("request_id") == str(request_id)]
+        require(len(plans) == 1, f"decoder cache-plan cardinality drift: {request_id}")
+        plan = plans[0]
+        cached_tokens = int(plan.get("cached_tokens", "0"))
+        prompt_tokens = int(plan.get("prompt_tokens", "0"))
+        work_tokens = int(plan.get("work_tokens", "-1"))
+        require(0 < cached_tokens <= prompt_tokens
+                and work_tokens == prompt_tokens - cached_tokens
+                and plan.get("cache") in {
+                    "live", "grow-live", "recovery-anchor", "grow-recovery-anchor",
+                },
+                f"decoder did not use its primed cache: {request_id}")
+        decoder_plan_cached_tokens.append(cached_tokens)
+
+    require(all(value > 0 for value in client_cached_tokens["decoder"])
+            and sorted(client_cached_tokens["decoder"]) == sorted(decoder_plan_cached_tokens),
+            f"decoder client usage disagrees with warm-cache plans: {wave_dir}")
+    for request_id in prefill_ids:
+        plans = [fields(line) for line in prefill_plan_lines
+                 if fields(line).get("request_id") == str(request_id)]
+        require(len(plans) == 1, f"prefill cache-plan cardinality drift: {request_id}")
+        plan = plans[0]
+        cached_tokens = int(plan.get("cached_tokens", "-1"))
+        prompt_tokens = int(plan.get("prompt_tokens", "0"))
+        work_tokens = int(plan.get("work_tokens", "-1"))
+        suffix_tokens = int(plan.get("suffix_tokens", "-1"))
+        require(cached_tokens == 0
+                and suffix_tokens == prompt_tokens
+                and prompt_tokens <= work_tokens < 2 * prompt_tokens
+                and plan.get("cache") in {"reset", "grow-reset"},
+                f"declared cold prefill reused cache state: {request_id}")
+    require(client_cached_tokens["prefill"] == [0] * PREFILLERS,
+            f"prefill client usage is not cold: {wave_dir}")
 
     cooperative: list[dict[str, str]] = [fields(line) for line in log.splitlines()
                                               if "DeepSeek-V4 cooperative prefill complete" in line]
+    require(all(row.get("bounded_mixed") in ("true", "false")
+                and row.get("rows_per_lane_cap") is not None for row in cooperative),
+            f"cooperative route discriminator is missing: {wave_dir}")
+    mixed_cooperative = [row for row in cooperative if row["bounded_mixed"] == "true"]
+    require(all(row.get("rows_per_lane_cap") == "128" for row in mixed_cooperative),
+            f"bounded Mixed cap drifted: {wave_dir}")
+    require(all(row.get("rows_per_lane_cap") == "0" for row in cooperative
+                if row["bounded_mixed"] == "false"),
+            f"pure-prefill cooperative cap drifted: {wave_dir}")
     if arm == "on":
-        require(cooperative, f"ON wave published no Mixed cohort: {wave_dir}")
+        require(mixed_cooperative, f"ON wave published no Mixed cohort: {wave_dir}")
         require(all(row.get("lanes") == "4" and row.get("rows_per_lane") == "128"
-                    and row.get("aggregate_rows") == "512" for row in cooperative),
+                    and row.get("aggregate_rows") == "512" for row in mixed_cooperative),
                 f"ON wave published a non-4x128 cohort: {wave_dir}")
     else:
-        require(not cooperative, f"OFF wave published a Mixed cohort: {wave_dir}")
-    require(wave["cooperative_transactions"] == len(cooperative),
+        require(not mixed_cooperative, f"OFF wave published a Mixed cohort: {wave_dir}")
+    require(wave["cooperative_transactions"] == len(mixed_cooperative),
             f"wave cooperative count is not raw-derived: {wave_dir}")
 
     prefill_walls = [finish - start for start, finish in prefill_timings]
@@ -446,7 +569,7 @@ def verify_wave(process_dir: Path, arm: str, trial: int, model_id: str) -> dict[
         "scheduler_gaps": scheduler_gaps,
         "server_sse_gaps": server_sse_gaps,
         "client_sse_gaps": client_decoder_gaps,
-        "cooperative": len(cooperative),
+        "cooperative": len(mixed_cooperative),
         "projections": projections,
     }
 
@@ -493,6 +616,7 @@ def verify_process(root: Path, label: str, evidence: dict[str, Any]) -> dict[str
             and isinstance(loaded[0].get("id"), str) and loaded[0]["id"],
             f"loaded model architecture receipt drift: {label}")
     model_id = loaded[0]["id"]
+    prime_projections = verify_decoder_prime(process_dir, model_id)
     startup_log = (process_dir / "server.stderr").read_text(encoding="utf-8")
     require(not re.search(
         r"GPU Timeout|SubmissionsIgnored|Command buffer error|Generation error|"
@@ -521,6 +645,7 @@ def verify_process(root: Path, label: str, evidence: dict[str, Any]) -> dict[str
     require(summary.get("cooperative_transactions") == sum(wave["cooperative"] for wave in waves),
             f"cooperative count is not raw-derived: {label}")
     return {"arm": arm, "walls": walls, "waves": waves,
+            "prime_projections": prime_projections,
             "power_mode": power_mode, "model_id": model_id}
 
 
@@ -545,6 +670,10 @@ def verify(
         "trials_per_process": TRIALS, "max_slots": MAX_SLOTS,
         "live_decoders": LIVE_DECODERS, "prefillers": PREFILLERS,
         "mixed_rows_per_lane": MIXED_ROWS, "temperature": 0, "seed": 42,
+        "decoder_prime": {"lanes": LIVE_DECODERS,
+                          "max_tokens": DECODER_PRIME_MAX_TOKENS,
+                          "stable_prompt_required": True,
+                          "cache_reuse_required": True},
     }, "workload contract drift")
     require(receipt.get("thresholds") == {
         "scheduler_decode_gap_ms": SCHEDULER_GAP_MS,
@@ -623,6 +752,15 @@ def verify(
     for replica in ("a", "b"):
         off = processes[f"off-{replica}"]["waves"]
         on = processes[f"on-{replica}"]["waves"]
+        require(processes[f"off-{replica}"]["prime_projections"]
+                == processes[f"on-{replica}"]["prime_projections"],
+                f"OFF/ON decoder-prime semantic parity failed for replica {replica}")
+        for lane in range(1, LIVE_DECODERS + 1):
+            for suffix in ("request.json", "canonical.json"):
+                relative = Path("decoder-prime") / f"decoder-{lane}.{suffix}"
+                require((root / f"off-{replica}" / relative).read_bytes()
+                        == (root / f"on-{replica}" / relative).read_bytes(),
+                        f"OFF/ON decoder-prime bytes drifted: {replica}/{relative}")
         require([wave["projections"] for wave in off] == [wave["projections"] for wave in on],
                 f"OFF/ON semantic or token parity failed for replica {replica}")
         for trial in range(1, TRIALS + 1):
@@ -634,7 +772,9 @@ def verify(
                             f"OFF/ON request bytes drifted: {replica}/{relative}")
     projections = []
     for replica in ("a", "b"):
-        projections.extend(wave["projections"] for wave in processes[f"on-{replica}"]["waves"])
+        projections.extend(processes[f"on-{replica}"]["prime_projections"])
+        for wave in processes[f"on-{replica}"]["waves"]:
+            projections.extend(wave["projections"])
     semantic_sha = hashlib.sha256(canonical_bytes(projections)).hexdigest()
     require(receipt.get("equality", {}).get("semantic_and_token_sha256") == semantic_sha,
             "semantic aggregate hash is not raw-derived")

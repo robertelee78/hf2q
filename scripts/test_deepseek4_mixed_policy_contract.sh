@@ -27,9 +27,11 @@ jq -e '
 # Execute the producer's exact request-id parser. A static source assertion did
 # not catch a literal shell-continuation backslash inside the Perl program.
 cat >"$tmp_dir/server.log" <<'EOF'
+DeepSeek-V4 request started request_id=40 max_tokens=1
 DeepSeek-V4 request started request_id=41 max_tokens=256
 DeepSeek-V4 request started max_tokens=8 request_id=42
 DeepSeek-V4 request started request_id=43 max_tokens=2560
+DeepSeek-V4 request started request_id=45 max_tokens=10
 unrelated request_id=44 max_tokens=256
 EOF
 # shellcheck disable=SC1090
@@ -37,7 +39,8 @@ sed -n '/^extract_request_ids() {/,/^}/p' "$runner" >"$tmp_dir/extract-request-i
 source "$tmp_dir/extract-request-ids.sh"
 decoder_ids=$(extract_request_ids "$tmp_dir/server.log" 256)
 prefill_ids=$(extract_request_ids "$tmp_dir/server.log" 8)
-[[ "$decoder_ids" == 41 && "$prefill_ids" == 42 ]] || {
+prime_ids=$(extract_request_ids "$tmp_dir/server.log" 1)
+[[ "$decoder_ids" == 41 && "$prefill_ids" == 42 && "$prime_ids" == 40 ]] || {
     echo "DeepSeek B.1 request-id parser drifted" >&2
     exit 1
 }
@@ -86,12 +89,29 @@ rg -q 'readonly MAX_SLOTS=8' "$runner"
 rg -q 'readonly LIVE_DECODERS=4' "$runner"
 rg -q 'readonly PREFILLERS=4' "$runner"
 rg -q 'readonly MIXED_ROWS=128' "$runner"
+rg -q 'readonly DECODER_PRIME_MAX_TOKENS=1' "$runner"
+rg -q '^prime_decoder_sessions()' "$runner"
+rg -Fq 'prime_decoder_sessions "$model" "$replica"' "$runner"
+rg -Fq 'local replica=${label##*-}' "$runner"
+rg -Fq 'run_wave "$arm" "$model" "$replica" "-$warmup"' "$runner"
+rg -q 'bounded_mixed=true' "$runner"
+[[ "$(rg -F -c 'DeepSeek-V4 cooperative prefill complete.*bounded_mixed=true' "$runner")" == 2 ]]
 rg -q 'readonly MAX_PEAK_RSS_BYTES=124554051584' "$runner"
 rg -Uq 'run_process off-a off\nrun_process on-a on\nrun_process on-b on\nrun_process off-b off' "$runner"
 [[ "$(rg -F -c 'BEGIN{exit !(value>minimum)}' "$runner")" == 3 ]]
 rg -q 'speedup > MIN_WAVE_SPEEDUP and all\(value > 1[.]0 for value in neighbors\)' "$verifier"
 rg -q 'MAX_PEAK_RSS_BYTES = 116 \* 1024\*\*3' "$verifier"
+rg -q '^def verify_decoder_prime' "$verifier"
+rg -q 'decoder did not use its primed cache' "$verifier"
+rg -Fq 'work_tokens == prompt_tokens - cached_tokens' "$verifier"
+rg -Fq 'sorted(client_cached_tokens["decoder"]) == sorted(decoder_plan_cached_tokens)' "$verifier"
+rg -q 'declared cold prefill reused cache state' "$verifier"
+rg -Fq 'prompt_tokens <= work_tokens < 2 * prompt_tokens' "$verifier"
+rg -Fq 'client_cached_tokens["prefill"] == [0] * PREFILLERS' "$verifier"
+rg -q 'prefills were not admitted before the first live decoder completed' "$verifier"
+rg -Fq 'row.get("bounded_mixed") in ("true", "false")' "$verifier"
 rg -q 'observed_source=[$][(]matched_parse_live_power_source' "$runner"
+rg -q 'bounded_mixed = max_cooperative_rows_per_lane.is_some()' "$engine"
 if rg -Fq 'pmset -g batt | rg -q' "$runner"; then
     echo "DeepSeek B.1 runner retains the early-match AC probe" >&2
     exit 1

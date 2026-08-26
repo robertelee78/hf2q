@@ -10488,6 +10488,8 @@ fn advance_deepseek4_prefill_quantum(
         rows_per_lane = completed_plan.token_count(),
         aggregate_rows = lanes.len().saturating_mul(completed_plan.token_count()),
         recovery_anchor = completed_plan.captures_anchor(),
+        bounded_mixed = max_cooperative_rows_per_lane.is_some(),
+        rows_per_lane_cap = max_cooperative_rows_per_lane.unwrap_or(0),
         "DeepSeek-V4 cooperative prefill complete"
     );
 

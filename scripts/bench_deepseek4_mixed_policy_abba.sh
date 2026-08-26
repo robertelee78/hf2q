@@ -2,9 +2,11 @@
 set -euo pipefail
 
 # Exact same-binary ADR-049 B.1 control/candidate comparison. Each measured
-# wave first establishes four semantic SSE decoders, then launches four long
-# prefills into the remaining slots. OFF disables only the Mixed cohort
-# attempt; pure-prefill cooperation and all model arithmetic stay identical.
+# process first primes four distinct stable decoder prefixes. Every measured
+# wave restores those caches, establishes four semantic SSE decoders, then
+# launches four long prefills into the remaining slots. OFF disables only the
+# bounded Mixed cohort attempt; pure-prefill cooperation and all model
+# arithmetic stay identical.
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(cd "$script_dir/.." && pwd)
@@ -34,6 +36,7 @@ readonly MAX_SLOTS=8
 readonly LIVE_DECODERS=4
 readonly PREFILLERS=4
 readonly MIXED_ROWS=128
+readonly DECODER_PRIME_MAX_TOKENS=1
 readonly DECODER_MAX_TOKENS=256
 readonly PREFILL_MAX_TOKENS=8
 readonly PREFILL_REPETITIONS=3520
@@ -221,13 +224,17 @@ assert_identity() {
 
 build_request() {
     local model=$1 replica=$2 trial=$3 kind=$4 lane=$5 output=$6 body max_tokens
-    if [[ "$kind" == decoder ]]; then
-        body=$(awk -v replica="$replica" -v trial="$trial" -v lane="$lane" 'BEGIN {
-          printf "replica-%s trial-%s decoder-%s. ", replica, trial, lane
+    if [[ "$kind" == decoder || "$kind" == decoder-prime ]]; then
+        body=$(awk -v replica="$replica" -v lane="$lane" 'BEGIN {
+          printf "replica-%s stable decoder-%s. ", replica, lane
           for (i=1; i<=128; i++) printf "sequence "
           printf "Write a long numbered sequence in words without commentary; continue until the response limit."
         }')
-        max_tokens=$DECODER_MAX_TOKENS
+        if [[ "$kind" == decoder ]]; then
+            max_tokens=$DECODER_MAX_TOKENS
+        else
+            max_tokens=$DECODER_PRIME_MAX_TOKENS
+        fi
     else
         body=$(awk -v replica="$replica" -v trial="$trial" -v lane="$lane" \
           -v repetitions="$PREFILL_REPETITIONS" 'BEGIN {
@@ -276,6 +283,49 @@ extract_request_ids() {
     local log=$1 budget=$2
     perl -ne 'if (/DeepSeek-V4 request started/ && /max_tokens='"$budget"'(?: |$)/
       && /request_id=([0-9]+)/) { print "$1\n" }' "$log"
+}
+
+prime_decoder_sessions() {
+    local model=$1 replica=$2 engine_dir=$3 log=$4 lane pid log_start log_end
+    local prime_dir="$engine_dir/decoder-prime" barrier="$engine_dir/decoder-prime/start"
+    local -a prime_pids=() prime_ids=()
+    mkdir -p "$prime_dir"
+    log_start=$(stat -f '%z' "$log" 2>/dev/null || stat -c '%s' "$log")
+    for ((lane=1; lane<=LIVE_DECODERS; lane++)); do
+        build_request "$model" "$replica" prime decoder-prime "$lane" \
+          "$prime_dir/decoder-$lane.request.json"
+        post_timed_sse "$prime_dir/decoder-$lane.request.json" \
+          "$prime_dir/decoder-$lane.timed-sse" "$prime_dir/decoder-$lane.timing.tsv" \
+          "$prime_dir/decoder-$lane.stderr" "$barrier" &
+        prime_pids+=("$!")
+    done
+    : >"$barrier"
+    for pid in "${prime_pids[@]}"; do wait "$pid"; done
+    for ((lane=1; lane<=LIVE_DECODERS; lane++)); do
+        python3 "$script_dir/verify_deepseek4_mixed_policy_receipt.py" \
+          --canonicalize "$prime_dir/decoder-$lane.timed-sse" \
+          "$prime_dir/decoder-$lane.canonical.json"
+    done
+    log_end=$(stat -f '%z' "$log" 2>/dev/null || stat -c '%s' "$log")
+    perl -e '
+      use strict; use warnings;
+      my ($path, $offset, $length) = @ARGV;
+      open my $stream, "<", $path or die "$path: $!";
+      binmode $stream; seek($stream, $offset, 0) or die "seek: $!";
+      my $read = read($stream, my $bytes, $length);
+      die "short read" unless defined($read) && $read == $length;
+      print $bytes;
+    ' "$log" "$log_start" "$((log_end - log_start))" >"$prime_dir/server.delta.log"
+    while IFS= read -r request_id; do
+        [[ -n "$request_id" ]] && prime_ids+=("$request_id")
+    done < <(extract_request_ids "$prime_dir/server.delta.log" "$DECODER_PRIME_MAX_TOKENS")
+    [[ ${#prime_ids[@]} == LIVE_DECODERS ]] || {
+        echo "decoder priming did not bind exactly four request IDs" >&2
+        return 1
+    }
+    jq -n --argjson request_ids \
+      "$(printf '%s\n' "${prime_ids[@]}" | jq -Rsc 'split("\n")|map(select(length>0)|tonumber)')" \
+      '{schema:1,max_tokens:1,request_ids:$request_ids}' >"$prime_dir/prime.json"
 }
 
 run_wave() {
@@ -349,7 +399,7 @@ run_wave() {
       END {printf "%.9f",max-min}' "$wave_dir"/prefill-*.timing.tsv)
     awk -v value="$decoder_skew" 'BEGIN{exit !(value<=0.100)}' || return 1
     awk -v value="$prefill_skew" 'BEGIN{exit !(value<=0.100)}' || return 1
-    cooperative=$(rg -c 'DeepSeek-V4 cooperative prefill complete' \
+    cooperative=$(rg -c 'DeepSeek-V4 cooperative prefill complete.*bounded_mixed=true' \
       "$wave_dir/server.delta.log" || true)
     cooperative=${cooperative:-0}
     if [[ "$arm" == on ]]; then
@@ -401,6 +451,7 @@ run_measurements() {
 
 run_process() {
     local label=$1 arm=$2 mixed=0 expected=false
+    local replica=${label##*-}
     local engine_dir="$OUT_DIR/$label"
     local expected_selection=explicit-off
     local model producer_pid settle_pid power_pid resource_pid monitor_status=0 producer_status=0
@@ -449,8 +500,9 @@ run_process() {
     printf '%s\n' "$server_pid" >"$engine_dir/server.pid"
     ps -ww -p "$server_pid" -o command= >"$engine_dir/server-command.txt"
     assert_identity
+    prime_decoder_sessions "$model" "$replica" "$engine_dir" "$engine_dir/server.stderr"
     for ((warmup=1; warmup<=WARMUPS; warmup++)); do
-        run_wave "$arm" "$model" "${label##*-}-warm" "-$warmup" \
+        run_wave "$arm" "$model" "$replica" "-$warmup" \
           "$engine_dir/waves/warmup-$warmup" "$engine_dir/server.stderr"
     done
     (
@@ -505,7 +557,7 @@ run_process() {
     done >"$engine_dir/wave-samples-seconds"
     peak_rss_bytes=$(sort -n "$engine_dir/rss-kib" | tail -1 | awk '{printf "%.0f",$1*1024}')
     ((peak_rss_bytes <= MAX_PEAK_RSS_BYTES)) || return 1
-    cooperative=$(rg 'DeepSeek-V4 cooperative prefill complete' \
+    cooperative=$(rg 'DeepSeek-V4 cooperative prefill complete.*bounded_mixed=true' \
       "$engine_dir"/waves/[1-5]/server.delta.log | wc -l | tr -d ' ' || true)
     cooperative=${cooperative:-0}
     jq -n --arg label "$label" --arg arm "$arm" --argjson pid "$measured_server_pid" \
@@ -545,6 +597,13 @@ run_process on-b on
 run_process off-b off
 
 for replica in a b; do
+    for relative in decoder-prime/decoder-{1,2,3,4}.request.json \
+      decoder-prime/decoder-{1,2,3,4}.canonical.json; do
+        cmp -s "$OUT_DIR/off-$replica/$relative" "$OUT_DIR/on-$replica/$relative" || {
+            echo "OFF/ON decoder-prime bytes differ: replica=$replica file=$relative" >&2
+            exit 1
+        }
+    done
     while IFS= read -r relative; do
         cmp -s "$OUT_DIR/off-$replica/$relative" "$OUT_DIR/on-$replica/$relative" || {
             echo "OFF/ON request bytes differ: replica=$replica file=$relative" >&2; exit 1; }
@@ -572,6 +631,9 @@ semantic_sha=$(python3 - "$OUT_DIR" <<'PY'
 import hashlib,json,pathlib,sys
 root=pathlib.Path(sys.argv[1]); values=[]
 for replica in ("a","b"):
+  for lane in range(1,5):
+    value=json.loads((root/f"on-{replica}/decoder-prime/decoder-{lane}.canonical.json").read_text())
+    values.append({k:value[k] for k in ("role_events","content","reasoning_content","tool_calls","finish_reason","usage","done_count")})
   for trial in range(1,6):
     for kind in ("decoder","prefill"):
       for lane in range(1,5):
@@ -634,7 +696,9 @@ jq -n --arg source_root "$SOURCE_ROOT" --arg commit "$source_commit" \
     endpoint:{host:$host,port:$port},
     workload:{process_order:["off-a","on-a","on-b","off-b"],same_binary:true,
       trials_per_process:5,max_slots:8,live_decoders:4,prefillers:4,
-      mixed_rows_per_lane:$mixed_rows,temperature:0,seed:42},
+      mixed_rows_per_lane:$mixed_rows,temperature:0,seed:42,
+      decoder_prime:{lanes:4,max_tokens:1,stable_prompt_required:true,
+        cache_reuse_required:true}},
     thresholds:{scheduler_decode_gap_ms:$scheduler_gap,semantic_sse_gap_ms:$semantic_gap,
       max_prefill_wall_seconds:$prefill_wall,max_peak_rss_bytes:$max_rss,
       min_wave_speedup:$min_speedup},

@@ -16,7 +16,20 @@
   now checked in and model-free green; Gemma B.2 is product-hardware accepted,
   while the DeepSeek and Qwen real-artifact cells remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 87 records the first DeepSeek B.1 hardware
+- Updated: 2026-08-26 (rev 89 closes the pre-run proof audit for the reformed
+  DeepSeek B.1 workload: every decoder now proves an exact warm-cache plan and
+  matching client-visible cached-token usage; every long prefill proves a cold
+  plan and zero client-visible reuse; all four runtime prefill admissions must
+  precede the first decoder completion; and rebound canaries exercise those
+  relations plus the bounded-Mixed/unbounded-pure discriminator. Rev 88
+  records the second DeepSeek B.1 hardware
+  falsifier: the corrected warmup proved that the nominal live decoders were
+  actually a cold cohort, so the cold-wave admission barrier correctly held
+  the following prefills until decode completion; the observed 4x512 event
+  was pure prefill, not an ignored OFF policy. No sample was admitted. The
+  rerun primes stable decoder prompts, requires nonzero cache reuse, and binds
+  cooperative receipts to bounded-Mixed versus unbounded-pure execution.
+  Rev 87 recorded the first DeepSeek B.1 hardware
   falsifier: the warmup reached the real eight-slot runtime, then the producer's
   request-id parser failed to compile because a shell-continuation backslash
   was embedded in its Perl program. No performance sample was admitted; the
@@ -624,6 +637,35 @@ performance sample. Removing the embedded backslash is the complete parser
 fix; the model-free shell contract now extracts and executes that exact
 function over representative 256-token, 8-token, near-match, and unrelated
 log rows. Hardware acceptance remains open pending a fresh receipt directory.
+
+The next exact invocation at source `d8ef4b28` passed that parser proof and
+reached the OFF warmup, then falsified the workload/discriminator before any
+sample. The four 160-token decoder requests formed a cold cohort. Although the
+four long-prefill HTTP requests arrived while those decoders streamed, the
+accepted cold-wave barrier intentionally retained them until the first cohort
+completed; their later 4x512 cooperative transactions were the canonical pure-
+prefill route, which remains enabled in both arms. Treating every cooperative
+event as Mixed therefore produced a false OFF failure. Rev 88 preserves the
+cold-wave policy and reforms the gate around stable per-lane decoder priming:
+each measured decoder must restore nonzero cached state, every prefill must
+overlap those warm decoders, and the runtime receipt labels whether a cohort
+was bounded by the 128-row Mixed cap. ON requires at least one labeled 4x128
+transaction; OFF requires zero. Later unbounded pure-prefill transactions are
+recorded but cannot satisfy or falsify the Mixed discriminator. Hardware
+acceptance remains open pending the fresh exact-lineage ABBA rerun. The same
+pre-run proof audit corrected the aggregate semantic digest from a nested
+per-wave verifier projection to the producer's flat per-response projection;
+the exact digest now also includes the four priming responses per replica.
+Rev 89 additionally binds the declared workload rather than its labels: each
+decoder plan must conserve `cached + work = prompt`, use an accepted live or
+recovery-anchor action, and match the client-visible cached-token multiset;
+each long prefill must use a reset action with `cached = 0`, a full uncached
+suffix, bounded cold work (allowing the existing recovery-checkpoint prepass),
+and zero client-visible cached tokens. Runtime request identities prove all
+four prefills were admitted before the first decoder completed. The receipt
+mutation battery rejects cache-action, conservation, client-usage, cold-
+prefill, and admission-order substitutions, while an accept-preserving pure
+4x512 insertion proves that unbounded cooperation is intentionally ignored.
 
 **B.2 — Family generalization (scope directive).** The earlier claim that
 cross-slot aggregation was DeepSeek-only drifted from code. Gemma SlotAware
