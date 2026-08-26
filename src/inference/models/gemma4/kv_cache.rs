@@ -7687,6 +7687,7 @@ mod tests {
 
     #[test]
     fn hybrid_lcp_snapshot_estimate_counts_packed_v_and_all_norm_blocks() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let (num_kv_heads, capacity, head_dim, norms_per_pos) = (2usize, 10usize, 512usize, 2usize);
         let bytes = hybrid_lcp_snapshot_layer_bytes(
             num_kv_heads,
@@ -7705,6 +7706,7 @@ mod tests {
 
     #[test]
     fn hybrid_lcp_snapshot_estimate_counts_f16_v_and_one_dummy() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let (num_kv_heads, capacity, head_dim, norms_per_pos) = (2usize, 10usize, 512usize, 2usize);
         let bytes = hybrid_lcp_snapshot_layer_bytes(
             num_kv_heads,
