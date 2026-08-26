@@ -22024,20 +22024,20 @@ fn qwen35_matching_prefill_prefix(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Qwen35PrefillCohortCheckpointAdmission {
+struct Qwen35PrefillCheckpointAdmission {
     checkpoint_at_end: bool,
     effective_committed_depth: usize,
     simultaneous_pending_capacity_slots: usize,
 }
 
-fn qwen35_prefill_cohort_checkpoint_admission(
+fn qwen35_prefill_checkpoint_admission(
     aggregate_budget_bytes: u64,
     aggregate_owned_bytes: u64,
     aggregate_control_bytes: u64,
     configured_slots: usize,
     retained_anchor_bytes: u64,
     requested_peak_bytes: u64,
-) -> Qwen35PrefillCohortCheckpointAdmission {
+) -> Qwen35PrefillCheckpointAdmission {
     let payload_budget = aggregate_budget_bytes.saturating_sub(aggregate_control_bytes);
     let effective_committed_depth = qwen35_effective_committed_depth(
         DEFAULT_MAX_COMMITTED_ANCHORS,
@@ -22052,11 +22052,78 @@ fn qwen35_prefill_cohort_checkpoint_admission(
         effective_committed_depth,
     );
     let available_bytes = aggregate_budget_bytes.saturating_sub(aggregate_owned_bytes);
-    Qwen35PrefillCohortCheckpointAdmission {
+    Qwen35PrefillCheckpointAdmission {
         checkpoint_at_end: effective_committed_depth > 0 && requested_peak_bytes <= available_bytes,
         effective_committed_depth,
         simultaneous_pending_capacity_slots,
     }
+}
+
+#[derive(Clone, Copy)]
+struct Qwen35ScalarCheckpointPreflight {
+    compound_reservation: Option<super::engine_qwen35::Qwen35CompoundCheckpointReservation>,
+    committed_budget_skip: Option<Qwen35CommittedBudgetSkip>,
+    aggregate_owned_bytes: u64,
+    requested_bytes: u64,
+    available_bytes: u64,
+    effective_committed_depth: usize,
+    simultaneous_pending_capacity_slots: usize,
+    pending_occupied: bool,
+}
+
+fn qwen35_scalar_checkpoint_preflight(
+    prompt_anchors: &[Qwen35AnchorStore],
+    slot_idx: usize,
+    aggregate_budget_bytes: u64,
+    reservation: super::engine_qwen35::Qwen35CompoundCheckpointReservation,
+) -> Result<Qwen35ScalarCheckpointPreflight> {
+    let pending_occupied = prompt_anchors
+        .get(slot_idx)
+        .context("Qwen scalar checkpoint slot outside AnchorStore set")?
+        .has_pending();
+    let aggregate_owned_bytes = qwen35_anchor_aggregate_owned_bytes(prompt_anchors)?;
+    let aggregate_control_bytes = qwen35_anchor_aggregate_control_bytes(prompt_anchors)?;
+    let requested_bytes = reservation
+        .retained_bytes
+        .checked_add(reservation.incremental_owned_peak_bytes)
+        .context("Qwen scalar checkpoint reservation byte overflow")?;
+    let admission = qwen35_prefill_checkpoint_admission(
+        aggregate_budget_bytes,
+        aggregate_owned_bytes,
+        aggregate_control_bytes,
+        prompt_anchors.len(),
+        reservation.retained_bytes,
+        requested_bytes,
+    );
+    let checkpoint_at_end = !pending_occupied && admission.checkpoint_at_end;
+    let committed_budget_skip = (!pending_occupied && !admission.checkpoint_at_end).then_some(
+        Qwen35CommittedBudgetSkip {
+            aggregate_owned_bytes,
+            effective_committed_depth: admission.effective_committed_depth,
+            simultaneous_pending_capacity_slots: admission.simultaneous_pending_capacity_slots,
+            configured_slots: prompt_anchors.len(),
+        },
+    );
+    Ok(Qwen35ScalarCheckpointPreflight {
+        compound_reservation: checkpoint_at_end.then_some(reservation),
+        committed_budget_skip,
+        aggregate_owned_bytes,
+        requested_bytes,
+        available_bytes: aggregate_budget_bytes.saturating_sub(aggregate_owned_bytes),
+        effective_committed_depth: admission.effective_committed_depth,
+        simultaneous_pending_capacity_slots: admission.simultaneous_pending_capacity_slots,
+        pending_occupied,
+    })
+}
+
+fn record_qwen35_scalar_committed_budget_skip(skip: Qwen35CommittedBudgetSkip) {
+    record_qwen35_committed_anchor_budget_skips(
+        1,
+        skip.aggregate_owned_bytes,
+        skip.effective_committed_depth,
+        skip.simultaneous_pending_capacity_slots,
+        skip.configured_slots,
+    );
 }
 
 fn plan_qwen35_prefill_cohort(
@@ -22163,7 +22230,7 @@ fn plan_qwen35_prefill_cohort(
         let aggregate_control = qwen35_anchor_aggregate_control_bytes(prompt_anchors).ok()?;
         let reservation_complete = reservations.len() == width;
         let checkpoint_admission = reservation_complete.then(|| {
-            qwen35_prefill_cohort_checkpoint_admission(
+            qwen35_prefill_checkpoint_admission(
                 anchor_aggregate_budget_bytes,
                 aggregate_owned,
                 aggregate_control,
@@ -22775,7 +22842,7 @@ fn advance_qwen35_prefill_scalar(
 
     let max_chunk_tokens = qwen35_prefill_transaction_tokens(requested_tokens);
     let request_max_tokens = state.requested_max_tokens();
-    let compound_reservation = match state.compound_checkpoint_reservation(
+    let (compound_reservation, committed_budget_skip) = match state.compound_checkpoint_reservation(
         guard
             .kv
             .as_ref()
@@ -22785,36 +22852,53 @@ fn advance_qwen35_prefill_scalar(
         guard.model.vocab_size,
     ) {
         Ok(Some(reservation)) => {
-            let aggregate_owned =
-                qwen35_anchor_aggregate_owned_bytes(prompt_anchors).unwrap_or(u64::MAX);
-            let available = anchor_aggregate_budget_bytes.saturating_sub(aggregate_owned);
-            let requested = reservation
-                .retained_bytes
-                .saturating_add(reservation.incremental_owned_peak_bytes);
-            let granted = !prompt_anchors[slot_idx].has_pending() && requested <= available;
-            tracing::info!(
-                target: "hf2q::serve::api::qwen35_anchor",
-                slot = handle.slot_id.0,
-                boundary = reservation.boundary,
-                retained_bytes = reservation.retained_bytes,
-                incremental_owned_peak_bytes = reservation.incremental_owned_peak_bytes,
-                requested_bytes = requested,
-                aggregate_owned_bytes = aggregate_owned,
-                aggregate_budget_bytes = anchor_aggregate_budget_bytes,
-                available_bytes = available,
-                granted,
-                "Qwen checkpoint K+1 pre-allocation reservation"
-            );
-            granted.then_some(reservation)
+            match qwen35_scalar_checkpoint_preflight(
+                prompt_anchors,
+                slot_idx,
+                anchor_aggregate_budget_bytes,
+                reservation,
+            ) {
+                Ok(preflight) => {
+                    tracing::info!(
+                        target: "hf2q::serve::api::qwen35_anchor",
+                        slot = handle.slot_id.0,
+                        boundary = reservation.boundary,
+                        retained_bytes = reservation.retained_bytes,
+                        incremental_owned_peak_bytes = reservation.incremental_owned_peak_bytes,
+                        requested_bytes = preflight.requested_bytes,
+                        aggregate_owned_bytes = preflight.aggregate_owned_bytes,
+                        aggregate_budget_bytes = anchor_aggregate_budget_bytes,
+                        available_bytes = preflight.available_bytes,
+                        effective_committed_depth = preflight.effective_committed_depth,
+                        simultaneous_pending_capacity_slots =
+                            preflight.simultaneous_pending_capacity_slots,
+                        pending_occupied = preflight.pending_occupied,
+                        granted = preflight.compound_reservation.is_some(),
+                        "Qwen checkpoint K+1 pre-allocation reservation"
+                    );
+                    (
+                        preflight.compound_reservation,
+                        preflight.committed_budget_skip,
+                    )
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        slot = handle.slot_id.0,
+                        error = %error,
+                        "Qwen checkpoint aggregate reservation preflight failed closed"
+                    );
+                    (None, None)
+                }
+            }
         }
-        Ok(None) => None,
+        Ok(None) => (None, None),
         Err(error) => {
             tracing::warn!(
                 slot = handle.slot_id.0,
                 error = %error,
                 "Qwen checkpoint reservation preflight failed closed"
             );
-            None
+            (None, None)
         }
     };
     let mut advance = state.advance(
@@ -22905,6 +22989,9 @@ fn advance_qwen35_prefill_scalar(
             } else {
                 scheduler.yield_prefill_turn(handle);
                 slots[slot_idx] = Some((Qwen35SlotWork::Prefill(state), reply, handle));
+                if let Some(skip) = committed_budget_skip {
+                    record_qwen35_scalar_committed_budget_skip(skip);
+                }
             }
         }
         Ok(super::engine_qwen35::Qwen35PrefillAdvance::Ready {
@@ -22970,6 +23057,9 @@ fn advance_qwen35_prefill_scalar(
                 anchor_aggregate_budget_bytes,
             ) {
                 return Some(fatal);
+            }
+            if let Some(skip) = committed_budget_skip {
+                record_qwen35_scalar_committed_budget_skip(skip);
             }
         }
         Err(error) => {
@@ -48034,7 +48124,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
         let anchor_bytes = 157_909_416;
         let four_lane_peak = 645_195_936;
 
-        let admission = qwen35_prefill_cohort_checkpoint_admission(
+        let admission = qwen35_prefill_checkpoint_admission(
             failed_physical_grant,
             control_bytes,
             control_bytes,
@@ -48046,7 +48136,7 @@ mod qwen35_bounded_prefill_watchdog_tests {
         assert!(!admission.checkpoint_at_end);
 
         let passing_physical_grant = 2_690_267_545;
-        let admission = qwen35_prefill_cohort_checkpoint_admission(
+        let admission = qwen35_prefill_checkpoint_admission(
             passing_physical_grant,
             control_bytes,
             control_bytes,
@@ -48056,6 +48146,97 @@ mod qwen35_bounded_prefill_watchdog_tests {
         );
         assert_eq!(admission.effective_committed_depth, 1);
         assert!(admission.checkpoint_at_end);
+    }
+
+    #[test]
+    fn qwen38_n16_scalar_prefill_rejects_compound_capture_before_execution() {
+        let aggregate_budget_bytes = 2_399_877_529_u64;
+        let stores = (0..16)
+            .map(|_| Qwen35AnchorStore::with_committed_capacity(4))
+            .collect::<Vec<_>>();
+        let aggregate_owned_bytes = qwen35_anchor_aggregate_owned_bytes(&stores).unwrap();
+        let aggregate_control_bytes = qwen35_anchor_aggregate_control_bytes(&stores).unwrap();
+        assert_eq!(aggregate_owned_bytes, 18_944);
+        assert_eq!(aggregate_control_bytes, 18_944);
+
+        let reservation = crate::serve::api::engine_qwen35::Qwen35CompoundCheckpointReservation {
+            boundary: 58,
+            retained_bytes: 157_909_544,
+            incremental_owned_peak_bytes: 3_676_160,
+        };
+        let requested_bytes = reservation.retained_bytes
+            + reservation.incremental_owned_peak_bytes;
+        assert_eq!(requested_bytes, 161_585_704);
+        assert!(
+            requested_bytes
+                <= aggregate_budget_bytes.saturating_sub(aggregate_owned_bytes),
+            "the old per-request-only check must accept this exact failed hardware tuple"
+        );
+
+        let preflight = qwen35_scalar_checkpoint_preflight(
+            &stores,
+            0,
+            aggregate_budget_bytes,
+            reservation,
+        )
+        .expect("scalar checkpoint preflight");
+        assert_eq!(preflight.effective_committed_depth, 0);
+        assert!(preflight.compound_reservation.is_none());
+        assert!(preflight.committed_budget_skip.is_some());
+
+        let slice = crate::serve::api::engine_qwen35::qwen35_prefill_slice_plan(
+            0,
+            65,
+            4_096,
+            Some(58),
+            false,
+            preflight.compound_reservation,
+        );
+        assert_eq!(slice.end, 58);
+        assert_eq!(slice.compound_boundary, None);
+    }
+
+    #[test]
+    fn qwen_scalar_prefill_retains_compound_capture_when_anchor_capacity_exists() {
+        let aggregate_budget_bytes = 2_690_267_545_u64;
+        let stores = (0..16)
+            .map(|_| Qwen35AnchorStore::with_committed_capacity(4))
+            .collect::<Vec<_>>();
+        let reservation = crate::serve::api::engine_qwen35::Qwen35CompoundCheckpointReservation {
+            boundary: 58,
+            retained_bytes: 157_909_544,
+            incremental_owned_peak_bytes: 3_676_160,
+        };
+
+        let preflight = qwen35_scalar_checkpoint_preflight(
+            &stores,
+            0,
+            aggregate_budget_bytes,
+            reservation,
+        )
+        .expect("scalar checkpoint preflight");
+        assert_eq!(preflight.effective_committed_depth, 1);
+        let admitted = preflight
+            .compound_reservation
+            .expect("K=1 must retain compound capture authority");
+        assert_eq!(admitted.boundary, reservation.boundary);
+        assert_eq!(admitted.retained_bytes, reservation.retained_bytes);
+        assert_eq!(
+            admitted.incremental_owned_peak_bytes,
+            reservation.incremental_owned_peak_bytes
+        );
+        assert!(preflight.committed_budget_skip.is_none());
+
+        let slice = crate::serve::api::engine_qwen35::qwen35_prefill_slice_plan(
+            0,
+            65,
+            4_096,
+            Some(58),
+            false,
+            preflight.compound_reservation,
+        );
+        assert_eq!(slice.end, 65);
+        assert_eq!(slice.compound_boundary, Some(58));
     }
 
     #[test]

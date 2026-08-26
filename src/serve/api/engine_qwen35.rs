@@ -3876,6 +3876,47 @@ fn qwen35_next_prefill_end(
     end
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Qwen35PrefillSlicePlan {
+    pub(crate) end: usize,
+    pub(crate) compound_boundary: Option<usize>,
+}
+
+/// Decide the scalar bounded-prefill route before any Metal work. A compound
+/// reservation is authority to cross the stable boundary only when it names
+/// that exact boundary; otherwise ordinary prefill stops there and no anchor
+/// snapshot can be materialized.
+pub(crate) fn qwen35_prefill_slice_plan(
+    cursor: usize,
+    prompt_len: usize,
+    max_chunk_tokens: usize,
+    stable_prompt_prefix_tokens: Option<usize>,
+    vision_present: bool,
+    compound_reservation: Option<Qwen35CompoundCheckpointReservation>,
+) -> Qwen35PrefillSlicePlan {
+    let bounded_end = cursor.saturating_add(max_chunk_tokens).min(prompt_len);
+    let candidate_boundary = stable_prompt_prefix_tokens
+        .filter(|&boundary| cursor < boundary && boundary < bounded_end);
+    let compound_boundary = candidate_boundary.filter(|&boundary| {
+        !vision_present
+            && compound_reservation.is_some_and(|reservation| reservation.boundary == boundary)
+    });
+    let end = if compound_boundary.is_some() {
+        bounded_end
+    } else {
+        qwen35_next_prefill_end(
+            cursor,
+            prompt_len,
+            max_chunk_tokens,
+            stable_prompt_prefix_tokens,
+        )
+    };
+    Qwen35PrefillSlicePlan {
+        end,
+        compound_boundary,
+    }
+}
+
 fn qwen35_compound_incremental_owned_peak_bytes(
     prefix_rows: usize,
     suffix_rows: usize,
@@ -4108,28 +4149,16 @@ impl Qwen35PrefillState {
             kv_cache
                 .validate_sequence_len_for_slot(self.slot_id, self.next_token_index)
                 .context("validate Qwen35 slot cursors before bounded prefill")?;
-            let bounded_end = self
-                .next_token_index
-                .saturating_add(max_chunk_tokens)
-                .min(self.prompt_tokens.len());
-            let candidate_boundary = self
-                .stable_prompt_prefix_tokens
-                .filter(|&boundary| self.next_token_index < boundary && boundary < bounded_end);
-            let compound_candidate = candidate_boundary.filter(|&boundary| {
-                self.vision.is_none()
-                    && compound_reservation
-                        .is_some_and(|reservation| reservation.boundary == boundary)
-            });
-            let end = if compound_candidate.is_some() {
-                bounded_end
-            } else {
-                qwen35_next_prefill_end(
-                    self.next_token_index,
-                    self.prompt_tokens.len(),
-                    max_chunk_tokens,
-                    self.stable_prompt_prefix_tokens,
-                )
-            };
+            let slice_plan = qwen35_prefill_slice_plan(
+                self.next_token_index,
+                self.prompt_tokens.len(),
+                max_chunk_tokens,
+                self.stable_prompt_prefix_tokens,
+                self.vision.is_some(),
+                compound_reservation,
+            );
+            let compound_candidate = slice_plan.compound_boundary;
+            let end = slice_plan.end;
             anyhow::ensure!(
                 end > self.next_token_index,
                 "Qwen35 bounded prefill has no suffix without cached logits"
