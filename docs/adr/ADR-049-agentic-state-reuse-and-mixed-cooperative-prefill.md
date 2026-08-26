@@ -16,7 +16,7 @@
   now checked in and model-free green, while their real-artifact cells remain
   open)
 - Date: 2026-08-22
-- Updated: 2026-08-25 (rev 74, exact five-format physical matrix and universal
+- Updated: 2026-08-25 (rev 75, exact five-format physical matrix and universal
   four-family swap green; universal SlotAware private-queue liveness is
   hardware-proven for Gemma's four-slot burst and the Gemma B.2 runner now
   rejects the full single-quoted continuation bug class;
@@ -1743,6 +1743,18 @@ four rows of target drift. The verifier reconstructs the exact payload word
 count and suffix rather than accepting a matching prefix, and warmups enforce
 the same calibrated bin. A dedicated +5-row evidence mutant and payload-shape
 mutant must now fail; the fresh exact-lineage A/B remains the deciding spike.
+
+The calibrated `d08d3e1f` rerun accepted all three OFF widths and proved the
+512-row request landed at exactly 512 cold tokens. Its first ON width then
+failed closed because no four-lane aggregate trace fired: four requests were
+prepared concurrently, but the worker executed four scalar prefills. A
+separate canonical-launcher probe proved the live process retained
+`HF2Q_CROSS_SLOT_ADMIT=1` and `HF2Q_ADMIT_COALESCE_US=25000`, with the
+incompatible DFlash xlen flag absent. The next smallest spike exposes the
+worker-lifetime conjunction—requested policy, hybrid scaffold, hybrid route,
+DFlash exclusion, effective enablement, and coalescing window—in one startup
+event. Its pure policy truth table is model-free; the event decides which
+capability operand, rather than admission timing, disabled the intended path.
 
 **Lane B gates:** B.0 byte-identity (cohort+concurrent-decode); cooperative receipt regime (≥5 alternating serial/cooperative pairs, sustained median faster, peak RSS recorded, independent receipt verification); thermal contract (Nominal start, continuous Fair-or-better, no gap >5 s, fail-closed); memory H3 (≤116 GiB peak beside the 100 GiB artifact); product ceilings unchanged (60 s cold / 15 s cached-automatic-SSE / 35 s tool-result — never widened); B4 decode-cohort gate re-pass; the two B.1 latency contracts.
 

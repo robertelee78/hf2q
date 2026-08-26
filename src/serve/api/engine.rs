@@ -6362,6 +6362,15 @@ fn gemma4_admission_budget(all_slots_idle: bool, free_slots: usize) -> usize {
     }
 }
 
+fn gemma4_cross_slot_admit_policy(
+    requested: bool,
+    hybrid_scaffold: bool,
+    hybrid_kv: bool,
+    dflash_xlen_sdpa: bool,
+) -> bool {
+    requested && hybrid_scaffold && hybrid_kv && !dflash_xlen_sdpa
+}
+
 fn gemma4_cross_batch_eligible(
     prompt_tokens: usize,
     max_tokens: usize,
@@ -12310,11 +12319,26 @@ fn run_slot_aware_gemma4(
     // + capability-gated (hybrid-KV regime, scaffold present, no BF16-xlen
     // verify cache). When off OR unsupported, the admit phase is BYTE-UNCHANGED
     // (the original one-request-per-slot loop). Stable across the worker's life.
-    let cross_slot_admit = std::env::var("HF2Q_CROSS_SLOT_ADMIT").as_deref() == Ok("1")
-        && guard.hybrid.is_some()
-        && crate::debug::INVESTIGATION_ENV.hybrid_kv
-        && std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1");
+    let cross_slot_requested = std::env::var("HF2Q_CROSS_SLOT_ADMIT").as_deref() == Ok("1");
+    let hybrid_scaffold = guard.hybrid.is_some();
+    let hybrid_kv = crate::debug::INVESTIGATION_ENV.hybrid_kv;
+    let dflash_xlen_sdpa = std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() == Ok("1");
+    let cross_slot_admit = gemma4_cross_slot_admit_policy(
+        cross_slot_requested,
+        hybrid_scaffold,
+        hybrid_kv,
+        dflash_xlen_sdpa,
+    );
     let cross_slot_coalesce = slotaware_cross_slot_coalesce_window();
+    tracing::info!(
+        requested = cross_slot_requested,
+        hybrid_scaffold,
+        hybrid_kv,
+        dflash_xlen_sdpa,
+        enabled = cross_slot_admit,
+        coalesce_us = cross_slot_coalesce.as_micros(),
+        "Gemma4 cross-slot admission policy frozen"
+    );
 
     // ADR-040 production profiling — zero the buckets at worker entry so the
     // worker-exit dump reflects THIS worker's lifetime, not leftover state.
@@ -46148,6 +46172,20 @@ mod gemma4_bounded_prefill_tests {
 
     #[test]
     fn gemma_inline_embed_and_multimodal_streams_fail_closed_at_the_gpu_boundary() {
+        assert!(gemma4_cross_slot_admit_policy(true, true, true, false));
+        for disabled in [
+            (false, true, true, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, true),
+        ] {
+            assert!(!gemma4_cross_slot_admit_policy(
+                disabled.0,
+                disabled.1,
+                disabled.2,
+                disabled.3,
+            ));
+        }
         assert!(validate_gemma4_embed_request(0, 262_144).is_err());
         assert_eq!(
             validate_gemma4_embed_request(4_096, 262_144).unwrap(),
