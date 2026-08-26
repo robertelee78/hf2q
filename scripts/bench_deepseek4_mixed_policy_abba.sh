@@ -274,7 +274,7 @@ wait_for_four_decoders() {
 
 extract_request_ids() {
     local log=$1 budget=$2
-    perl -ne 'if (/DeepSeek-V4 request started/ && /max_tokens='"$budget"'(?: |$)/ \
+    perl -ne 'if (/DeepSeek-V4 request started/ && /max_tokens='"$budget"'(?: |$)/
       && /request_id=([0-9]+)/) { print "$1\n" }' "$log"
 }
 

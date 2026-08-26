@@ -24,6 +24,24 @@ jq -e '
   and .usage == {prompt_tokens:2,completion_tokens:1,total_tokens:3}
 ' "$tmp_dir/valid.json" >/dev/null
 
+# Execute the producer's exact request-id parser. A static source assertion did
+# not catch a literal shell-continuation backslash inside the Perl program.
+cat >"$tmp_dir/server.log" <<'EOF'
+DeepSeek-V4 request started request_id=41 max_tokens=256
+DeepSeek-V4 request started max_tokens=8 request_id=42
+DeepSeek-V4 request started request_id=43 max_tokens=2560
+unrelated request_id=44 max_tokens=256
+EOF
+# shellcheck disable=SC1090
+sed -n '/^extract_request_ids() {/,/^}/p' "$runner" >"$tmp_dir/extract-request-ids.sh"
+source "$tmp_dir/extract-request-ids.sh"
+decoder_ids=$(extract_request_ids "$tmp_dir/server.log" 256)
+prefill_ids=$(extract_request_ids "$tmp_dir/server.log" 8)
+[[ "$decoder_ids" == 41 && "$prefill_ids" == 42 ]] || {
+    echo "DeepSeek B.1 request-id parser drifted" >&2
+    exit 1
+}
+
 expect_canonical_reject() {
     local name=$1
     if python3 "$verifier" --canonicalize "$tmp_dir/$name.timed-sse" \

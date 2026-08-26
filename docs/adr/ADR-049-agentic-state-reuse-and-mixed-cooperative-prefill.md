@@ -16,7 +16,12 @@
   now checked in and model-free green; Gemma B.2 is product-hardware accepted,
   while the DeepSeek and Qwen real-artifact cells remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 86 records the accepted exact-lineage Gemma product
+- Updated: 2026-08-26 (rev 87 records the first DeepSeek B.1 hardware
+  falsifier: the warmup reached the real eight-slot runtime, then the producer's
+  request-id parser failed to compile because a shell-continuation backslash
+  was embedded in its Perl program. No performance sample was admitted; the
+  parser is corrected and executed by the model-free contract before rerun.
+  Rev 86 recorded the accepted exact-lineage Gemma product
   rerun: nominal 128/192 retain statistically supported product gains, while
   nominal 256 proves the zero-rectangle scalar fallback exact and non-inferior.
   Rev 85 recorded the completed eight-pair Gemma product
@@ -609,6 +614,16 @@ The execution still makes one `supervised_verifier_prefill_cohort` call over the
 Two receipts are now bound to production events for every successful SlotAware DeepSeek request: `scheduler_decode_max_gap_ms` is observed once at actual decode-batch entry (the first gap begins when decode becomes runnable), while `semantic_sse_max_gap_ms` is observed only after an actual content/reasoning/tool delta is accepted by the SSE channel. Empty role frames and token-generation proxies cannot satisfy the semantic receipt. Both carry observation counts and first-event timestamps under the same request id; the model-free bound verifier rejects missing observations, a gap above its bound, or a non-monotonic trace. The hardware spike must set the numeric bounds from quiet-box baselines and apply the same fail-closed rules before either latency contract can be accepted.
 
 Model-free proof at this candidate: `deepseek_mixed_cohort_rows_fail_closed_on_lane_and_aggregate_caps` pins the 2,048 aggregate ceiling, shipping 4×128 shape, optional 4×256 shape, pure-prefill allocation, and rejection of sub-window/unregistered caps. `deepseek4_four_prefills_and_live_decoders_visit_every_mixed_turn` drives an eight-slot scheduler for five Mixed turns and proves the same four decoders are visited every turn in stable FIFO order while the same four-prefill FIFO prefix advances by exactly 128 rows/lane (512 aggregate). `latency_gap_receipt_is_measurable_and_fails_closed` proves missing-observation, over-bound, and non-monotonic traces reject; `semantic_sse_receipt_records_first_event_and_maximum_gap` proves the actual semantic send path records every event and the exact maximum gap. Focused result: 138 passed, 0 failed, 8 artifact/hardware tests ignored. This is implementation evidence, not the required real-artifact performance/parity, semantic-SSE ceiling, thermal, or peak-RSS evidence.
+
+**B.1 hardware falsifier (2026-08-26; no sample admitted).** The first exact
+ABBA invocation verified the 107.43-GB artifact and reached the real eight-slot
+OFF warmup, but `extract_request_ids` then passed a literal line-continuation
+backslash to Perl and both budget-specific regular expressions failed to
+compile. The producer rejected the warmup before thermal settlement or any
+performance sample. Removing the embedded backslash is the complete parser
+fix; the model-free shell contract now extracts and executes that exact
+function over representative 256-token, 8-token, near-match, and unrelated
+log rows. Hardware acceptance remains open pending a fresh receipt directory.
 
 **B.2 — Family generalization (scope directive).** The earlier claim that
 cross-slot aggregation was DeepSeek-only drifted from code. Gemma SlotAware
