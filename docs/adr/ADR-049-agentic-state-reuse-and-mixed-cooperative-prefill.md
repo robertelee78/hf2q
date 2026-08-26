@@ -16,8 +16,15 @@
   now checked in and model-free green, while their real-artifact cells remain
   open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 81, the direct production-route attention
-  performance hypothesis is falsified and fully removed: its first B2 global
+- Updated: 2026-08-26 (rev 82, the exact shared-weight broadcast matmul
+  hypothesis is falsified and fully removed from hf2q: the published backend
+  primitive preserved byte-exact B2 state and continuation but reduced the
+  interleaved three-sample B2 median only 0.752%, from 109.708 ms to
+  108.883 ms, missing the predeclared 5% gate. The dependency pin, production
+  branch, and spike-only tests were removed; the canonical rectangular route
+  remains the accepted implementation. Rev 81 recorded that the direct
+  production-route attention performance hypothesis is falsified and fully
+  removed: its first B2 global
   D512 packed-TQ equality case differed from the current tiled-F16 route, so
   no timing was taken and no production attention code survives. Rev 80
   recorded that the checked-in Gemma B2/B4 M32 authority
@@ -1876,12 +1883,26 @@ scalar versus 111.944 ms rectangular (11.4% lower); B4 was 245.089 ms versus
 The deciding remaining coherence gate is realistic multi-token unary/SSE/tool
 serving; the checked-in B.2 product runner remains the performance authority.
 
-The shared-weight native quantized-matmul primitive remains a performance
-candidate for applicable dense projections, not a license to change their
-arithmetic. Its physical `[B,M,K]` input and `[B,M,N]` output keep one native
-GGUF weight, the scalar `M` route/tile, and each lane's reduction tree. It may
-be consumed only after its per-lane route/output is byte-identical to canonical
-scalar calls from a published checksum-pinned backend.
+The shared-weight native quantized-matmul hypothesis is falsified for this
+Gemma B.2 route. The primitive was published as `mlx-native 0.15.1` from exact
+source commit `f92eb020c4d3f821700e648fbce15d6cf75c2cc6`; the crates.io and
+GitHub release archives were byte-identical at SHA-256
+`76ce4c8d5773c72554a98020aadd330e566792dd27f843451ac5dd567bb6b5dd`,
+and an independently downloaded crate passed its locked all-features suite.
+The real 19.5-GB Gemma Q5_K_M state gate then proved B2 and B4 final logits,
+selected state, unselected-slot canaries, and continuation byte-exact with the
+primitive active (30 eligible output-projection dispatches per width); log
+SHA-256 `3d32a5e64f64fef03afd39695e175bb7a521db20c46e0b5cf40ee5d3f19fe919`.
+The pre-registered interleaved `C-B-B-C-B-C` performance falsifier produced
+canonical B2 samples `[109669, 109863, 109708]` microseconds and broadcast
+samples `[109135, 108619, 108883]`, medians 109.708 ms and 108.883 ms: only
+0.752% lower wall, below the required 5%. The test failed closed before B4;
+log SHA-256 `80c1ccaa4e7f8c114140c6dc68f3f44b0f57541b1c051af7a9411be969dc5167`.
+Because the primitive does not earn its production complexity here, the hf2q
+dependency bump, broadcast branch, and spike-only tests are removed. Version
+0.15.1 remains a valid published backend release, but hf2q stays on 0.15.0
+until a surviving feature requires a new pin. The accepted canonical
+per-lane rectangle and its 11.4% B2 / 20.6% B4 gains are unchanged.
 
 Production attention is not a surviving candidate. The live
 hardware bisection proved layer-zero SDPA exact, and source review found that
