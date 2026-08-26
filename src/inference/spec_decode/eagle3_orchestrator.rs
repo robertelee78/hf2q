@@ -164,9 +164,13 @@ impl<'a> Eagle3Orchestrator<'a> {
         max_seq_len: usize,
     ) -> Result<Self> {
         cfg.validate(drafter_cfg)?;
+        let drafter_bf16 = drafter_tensors.native_bf16_matrices()?;
         model
-            .ensure_gpu_cache_primed()
-            .context("Eagle3Orchestrator::new ensure_gpu_cache_primed")?;
+            .activate_gpu_dense_routes(
+                crate::inference::models::qwen35::forward_gpu::QwenDenseBf16Provider::Eagle3,
+                &drafter_bf16,
+            )
+            .context("Eagle3Orchestrator::new activate target + MTP + drafter BF16 routes")?;
         let kv_cache = model.with_gpu_cache_mut(|device, _| {
             HybridKvCache::new(&model.cfg, device, max_seq_len as u32, 1)
                 .context("allocate EAGLE-3 verifier KV cache")
@@ -744,17 +748,13 @@ impl<'a> Gemma4Eagle3Orchestrator<'a> {
             let target_aux =
                 upload_f32_device(device, &target_aux_host, vec![1, target_aux_host.len()])
                     .context("Gemma4Eagle3Orchestrator: upload target_aux")?;
-            let embed_table: &[f32] = model
-                .embed_weight
-                .as_slice::<f32>()
-                .map_err(|e| anyhow!("Gemma4Eagle3Orchestrator: embed_weight slice: {e}"))?;
-            let mut drafter = GpuDrafter::new(
+            let mut drafter = GpuDrafter::new_with_native_embedding(
                 self.drafter_cfg,
                 self.drafter_tensors,
                 device,
                 registry,
                 &target_aux,
-                embed_table,
+                &model.embed_weight,
                 base_pos,
             )
             .context("Gemma4Eagle3Orchestrator: construct GpuDrafter")?;
@@ -1619,6 +1619,12 @@ mod g4_cfa5_redhatai_smoke {
             Eagle3DrafterTensors::upload(exec.device(), &drafter_cfg, &drafter_weights)
                 .unwrap_or_else(|e| panic!("[g4_cfa5 LayerB] Eagle3DrafterTensors::upload: {e}"))
         };
+        let drafter_bf16 = drafter_tensors
+            .native_bf16_matrices()
+            .expect("[g4_cfa5 LayerB] inventory native drafter routes");
+        target
+            .activate_native_routes(&mut gpu, &drafter_bf16)
+            .expect("[g4_cfa5 LayerB] activate target + drafter native routes");
 
         // ---- Tokenize a short prompt ----
         let tokenizer_path = {
@@ -2150,6 +2156,9 @@ mod g4_cfa5_redhatai_smoke {
         let mut progress = LoadProgress::new(false, 0, 0);
         let weights = MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut gpu, &mut progress)
             .unwrap_or_else(|e| panic!("[g4_cfa5e-m] load: {e}"));
+        weights
+            .activate_native_routes(&mut gpu, &[])
+            .expect("[g4_cfa5e-m] activate native routes");
 
         let tokenizer_path = gguf_path.parent().unwrap().join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
@@ -2258,6 +2267,9 @@ mod g4_cfa5_redhatai_smoke {
         let mut progress = LoadProgress::new(false, 0, 0);
         let mut weights = MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut gpu, &mut progress)
             .unwrap_or_else(|e| panic!("[g4_cfa5e] load: {e}"));
+        weights
+            .activate_native_routes(&mut gpu, &[])
+            .expect("[g4_cfa5e] activate native routes");
 
         // Tokenize the exact same prompt Layer B uses.
         let tokenizer_path = gguf_path.parent().unwrap().join("tokenizer.json");

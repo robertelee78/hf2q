@@ -1429,23 +1429,6 @@ fn validate_probed_gguf_header(
             ),
         });
     }
-    if matches!(arch, "qwen35" | "qwen35moe") {
-        if let Some(ggml_type) = header.token_embedding_type {
-            // Qwen3.5/Qwen3.8 performs a direct native embedding gather.
-            // mlx-native 0.11.2 has no Q3_K (or Q4_0/F16) gather route even
-            // though its matrix kernels support those types. Reject that
-            // per-tensor layout before downloading the payload; native hf2q
-            // conversion promotes its embedding to a supported type.
-            if !matches!(ggml_type, 0 | 8 | 10 | 12 | 13 | 14) {
-                return Err(DownloadError::IncompatibleHostedGguf {
-                    reason: format!(
-                        "selected GGUF `{}` uses unsupported Qwen native token embedding GGML type {ggml_type}",
-                        artifact.filename
-                    ),
-                });
-            }
-        }
-    }
     Ok(())
 }
 
@@ -1883,6 +1866,22 @@ fn download_hub_artifact(
             reason: "hosted GGUF identity is incomplete or malformed".to_owned(),
         });
     }
+    download_authenticated_hub_gguf(artifact)
+}
+
+/// Download one server-retained projector companion. Companions are never
+/// client-selectable; the authenticated text GGUF's embedded projector SHA
+/// is the sole selector.
+pub fn download_hub_gguf_companion(artifact: &HubGgufArtifact) -> Result<PathBuf, DownloadError> {
+    if !hosted_companion_identity_valid(artifact) {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: "hosted projector companion identity is incomplete or malformed".to_owned(),
+        });
+    }
+    download_authenticated_hub_gguf(artifact)
+}
+
+fn download_authenticated_hub_gguf(artifact: &HubGgufArtifact) -> Result<PathBuf, DownloadError> {
     let cache_dir = resolve_hf_cache_dir();
     let api = build_hub_api(&cache_dir, true)?;
     let repo = api.repo(hf_hub::Repo::with_revision(
@@ -2728,6 +2727,25 @@ fn existing_ancestor(path: &Path) -> Option<&Path> {
     None
 }
 
+fn hosted_companion_identity_valid(artifact: &HubGgufArtifact) -> bool {
+    let (inferred_role, inferred_quant, unavailable_reason) = classify_hub_gguf(&artifact.filename);
+    artifact.filename.to_ascii_lowercase().ends_with(".gguf")
+        && !artifact.selectable
+        && artifact.bytes > 0
+        && artifact.revision.len() == 40
+        && artifact
+            .revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && artifact.sha256.len() == 64
+        && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && inferred_role == "companion"
+        && inferred_quant.is_none()
+        && artifact.quant_hint.is_none()
+        && artifact.role == inferred_role
+        && artifact.unavailable_reason == unavailable_reason
+}
+
 fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<String>) {
     let lower = filename.to_ascii_lowercase();
     let basename = lower.rsplit('/').next().unwrap_or(&lower);
@@ -2753,13 +2771,6 @@ fn classify_hub_gguf(filename: &str) -> (&'static str, Option<String>, Option<St
         );
     }
     let quant_hint = infer_filename_quant(stem);
-    if quant_hint.as_deref() == Some("BF16") {
-        return (
-            "text_model",
-            quant_hint,
-            Some("BF16 GGUF weights are not supported by the current mlx-native loader".to_owned()),
-        );
-    }
     if quant_hint.is_none() {
         return (
             "text_model",
@@ -3735,7 +3746,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn mtp_hosted_admission_rejects_shape_correct_non_executable_storage() {
+    fn mtp_hosted_admission_accepts_shape_correct_native_scalar_storage() {
         use crate::quantize::ggml_quants::GgmlType;
 
         let directory = tempfile::tempdir().unwrap();
@@ -3751,8 +3762,8 @@ pub(crate) mod tests {
         );
         let prefix = std::fs::read(&projection).unwrap();
         let header = gguf_probe::parse_bounded_header(&prefix, projection_bytes).unwrap();
-        let error = validate_qwen_hosted_prefix(&prefix, &header).unwrap_err();
-        assert!(error.to_string().contains("eh_proj.weight"), "{error}");
+        validate_qwen_hosted_prefix(&prefix, &header)
+            .expect("F16 MTP projection executes without a storage rewrite");
 
         let embedding = directory.path().join("mtp-bad-embedding.gguf");
         let embedding_bytes = write_complete_qwen_test_gguf_with_options(
@@ -3766,8 +3777,8 @@ pub(crate) mod tests {
         );
         let prefix = std::fs::read(&embedding).unwrap();
         let header = gguf_probe::parse_bounded_header(&prefix, embedding_bytes).unwrap();
-        let error = validate_qwen_hosted_prefix(&prefix, &header).unwrap_err();
-        assert!(error.to_string().contains("embed_tokens.weight"), "{error}");
+        validate_qwen_hosted_prefix(&prefix, &header)
+            .expect("F16 MTP embedding executes through the native gather route");
     }
 
     #[test]
@@ -3803,11 +3814,8 @@ pub(crate) mod tests {
         let prefix = std::fs::read(mismatched).unwrap();
         let header = gguf_probe::parse_bounded_header(&prefix, logical_bytes).unwrap();
         assert!(header.incompatible_tensor.is_none());
-        let error = validate_qwen_hosted_prefix(&prefix, &header).unwrap_err();
-        assert!(
-            error.to_string().contains("gate/up quant types differ"),
-            "{error}"
-        );
+        validate_qwen_hosted_prefix(&prefix, &header)
+            .expect("mixed native dense projections retain and execute their own storage types");
     }
 
     #[test]
@@ -4547,6 +4555,7 @@ pub(crate) mod tests {
     fn mixed_repository_ggufs_are_classified_without_source_fallback() {
         for (filename, quant) in [
             ("gguf/model-q2_k.gguf", "Q2_K"),
+            ("gguf/model-bf16.gguf", "BF16"),
             ("gguf/model-q3_k_m.gguf", "Q3_K_M"),
             ("gguf/model-q4_k_m.gguf", "Q4_K_M"),
             ("gguf/model-q5_k_m.gguf", "Q5_K_M"),
@@ -4561,9 +4570,6 @@ pub(crate) mod tests {
         let mmproj = classify_hub_gguf("gguf/mmproj-model-f16.gguf");
         assert_eq!(mmproj.0, "companion");
         assert!(mmproj.2.unwrap().contains("not a text model"));
-        let bf16 = classify_hub_gguf("gguf/model-bf16.gguf");
-        assert_eq!(bf16.1.as_deref(), Some("BF16"));
-        assert!(bf16.2.unwrap().contains("not supported"));
         let split = classify_hub_gguf("model-q6_k-00001-of-00002.gguf");
         assert!(split.2.unwrap().contains("split GGUF"));
     }
@@ -4586,6 +4592,10 @@ pub(crate) mod tests {
             &companion,
             "text_model"
         ));
+        assert!(hosted_companion_identity_valid(&companion));
+        let mut client_selectable = companion.clone();
+        client_selectable.selectable = true;
+        assert!(!hosted_companion_identity_valid(&client_selectable));
     }
 
     #[test]

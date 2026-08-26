@@ -35,7 +35,8 @@ pub mod weights;
 
 pub use config::Deepseek4Config;
 pub(crate) use forward_support::{
-    decode_scratch_stats, prefill_scratch_stats, release_decode_scratch, release_prefill_scratch,
+    decode_scratch_stats, idle_runtime_scratch_bytes, prefill_scratch_stats,
+    release_decode_scratch, release_idle_runtime_scratch, release_prefill_scratch,
     TransientScratchStats,
 };
 pub use model::Deepseek4Model;
@@ -43,6 +44,26 @@ pub use residency::Deepseek4Weights;
 pub(crate) use verifier_forward::{
     matrix_prefill_chunk_len, MAX_COOPERATIVE_PREFILL_ROWS, MIN_MATRIX_APPEND_TOKENS,
 };
+
+/// Exact decode widths plus the scheduler's short/long matrix and cooperative
+/// row boundaries. Unlisted aggregate cohort widths remain admitted through
+/// the scalar primitive's width-independent Direct theorem.
+pub(crate) fn native_expert_activation_widths() -> Vec<u32> {
+    (1..=8)
+        .chain([32, 33, 128, 256, 384, 512, 2_048, 4_096])
+        .collect()
+}
+
+#[cfg(test)]
+mod native_route_width_tests {
+    #[test]
+    fn scalar_expert_widths_cover_decode_thresholds_and_prefill_boundaries() {
+        let widths = super::native_expert_activation_widths();
+        for width in [1, 8, 32, 33, 128, 256, 384, 512, 2_048, 4_096] {
+            assert!(widths.contains(&width), "missing source width {width}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod attention_forward_tests;
@@ -52,6 +73,8 @@ mod cache_tests;
 mod ffn_forward_tests;
 #[cfg(test)]
 mod forward_tests;
+#[cfg(test)]
+mod mixed_coherence_tests;
 #[cfg(test)]
 mod model_tests;
 #[cfg(test)]

@@ -124,7 +124,7 @@ pub(super) fn qwen_thinking_mode(
     reasoning_forced_open: bool,
 ) -> bool {
     reasoning_forced_open
-        && registration.is_some_and(|registration| registration.family == "qwen35")
+        && registration.is_some_and(registry::ModelRegistration::uses_qwen_protocol)
 }
 
 /// Resolve the complete Qwen reasoning-close policy consumed by the handler.
@@ -408,6 +408,29 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.param, "max_tokens");
         assert!(error.message.contains("too small"));
+    }
+
+    #[test]
+    fn accepts_explicit_lifecycle_budget_across_qwen_protocol_spellings() {
+        for model in ["Qwen3.5", "Qwen3.6", "Qwen3.7", "Qwen3.8"] {
+            let registration = registry::find_for(model).expect("Qwen registration");
+            let resolved = resolve_qwen_thinking_policy(
+                Some(&registration),
+                true,
+                &ToolChoiceValue::Auto,
+                Some(16),
+                64,
+                QwenToolChainState::default(),
+                QwenThinkingDefaults::from_config(Some(0), Some(0)),
+                true,
+                qwen_test_encode,
+            )
+            .unwrap();
+            assert!(!resolved.required_tool_mode, "{model}");
+            assert_eq!(resolved.default_budget, None, "{model}");
+            assert_eq!(resolved.effective_budget, Some(16), "{model}");
+            assert_eq!(resolved.end_tokens.as_deref().unwrap().len(), 8, "{model}");
+        }
     }
 
     #[test]

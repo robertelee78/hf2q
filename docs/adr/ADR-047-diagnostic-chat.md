@@ -1,7 +1,8 @@
 # ADR-047: Diagnostic chat over the native inference server
 
-- **Status:** Accepted; text-engine A -> B -> A proof passed; embedding and projector lifecycle execution active
+- **Status:** Accepted; model-swap proof-integrity corrections and the one-process universal generative-family source gate are implemented; its hardware matrix remains pending; the exact Qwen3.8 cross-format single-hash swap matrix is hardware-sealed; embedding and projector lifecycle execution remains separate
 - **Date:** 2026-08-20
+- **Updated:** 2026-08-24
 - **Related:** ADR-005, ADR-017, ADR-040, ADR-043
 
 ## Context
@@ -311,17 +312,26 @@ request and worker lifecycles:
 
 1. take the exclusive model-admission gate and revalidate the user-confirmed
    pool revision and exact victim plan;
-2. mark those victims draining so no new unary, embedding, or streaming
+2. before any drain mutation, reopen the materialized candidate and preflight
+   every model-allocation-free fact consumed by the selected family: GGUF extents,
+   architecture/config/context/quant identity, required tensor names and
+   shapes, exact native storage/route capability, chat template, tokenizer,
+   and configured DWQ/projector sidecars;
+3. mark those victims draining so no new unary, embedding, or streaming
    request lease can be acquired;
-3. wait for every request lease, including the response-body lifetime of SSE,
+4. wait for every request lease, including the response-body lifetime of SSE,
    to reach zero;
-4. run the existing pre-eviction KV-spill hook while each idle worker is
+5. run the existing pre-eviction KV-spill hook while each idle worker is
    alive;
-5. call `Engine::shutdown` and join each worker;
-6. commit pool removal only after shutdown succeeds;
-7. load and warm the requested model through the non-evicting path; and
-8. fail closed on a stale plan or drain/shutdown timeout, never loading the
-   replacement while a victim may still own its model memory.
+6. call `Engine::shutdown` for every confirmed worker. The first shutdown
+   call is the destructive boundary: continue attempting the complete victim
+   set even after an error, then commit removal of all confirmed victims so
+   the pool cannot advertise a potentially dead engine;
+7. if any shutdown failed, return restart-required without loading a
+   replacement; otherwise load and warm the requested model through the
+   non-evicting path; and
+8. fail closed on a stale plan or drain timeout, never loading the replacement
+   while a victim may still own its model memory.
 
 This preserves the existing serve process and endpoint. It does not kill a
 manually started process.
@@ -396,9 +406,12 @@ teacher-forced scoring, so neither is zero-interference diagnostic telemetry.
   contract.
 - An admission conflict never loads the candidate. A changed plan requires a
   new explicit confirmation.
-- A drain or worker-shutdown timeout leaves the model unavailable for new
-  leases and returns an actionable restart-required error. It does not risk a
-  second physical load.
+- A model-allocation-free candidate preflight failure happens before draining and
+  leaves the old generation callable. Once worker shutdown begins, an error
+  removes the entire confirmed victim set, leaves no dead engine advertised,
+  and returns restart-required without a second physical load. A drain timeout
+  leaves the victim unavailable for new leases and is likewise
+  restart-required.
 - A malformed, error-finished, or incomplete SSE response remains visible but
   is not appended to the transcript.
 
@@ -410,7 +423,9 @@ Implementation is not complete until all of the following are proven:
    impossible admission, no mutation, no loader call on conflict, and
    prediction/execution identity;
 2. lifecycle tests cover unary, embedding, queued work, SSE-body lease,
-   stale-plan rejection, spill-before-shutdown, commit-after-shutdown, and
+   stale-plan rejection, missing-required-tensor and wrong-native-type
+   preflight failures that preserve callable A, spill-before-shutdown,
+   commit-after-shutdown, a two-victim first-dead/second-error removal, and
    timeout fail-closed behavior;
 3. router tests prove authentication, capability discovery, non-evicting
    activation, conflict receipts, and explicit switch semantics;
@@ -443,18 +458,45 @@ Implementation is not complete until all of the following are proven:
     selector behavior with zero Hub work, repository-bound opaque authority,
     post-catalog digest/header rejection before loading, verifier cancellation
     and reaping, and successful activation of a real hf2q-produced GGUF; and
-12. real macOS pool-resident generative A -> B -> A tests use distinct GGUF
-    bytes and exact conflict
-    receipts, keep one resident generation, bound both load-and-warm legs,
-    measure process RSS and host wired memory across each transition, reject a
-    double-residency peak, publish a fresh A generation, and reproduce A's
-    deterministic chat message exactly after reload; and
+12. a real macOS pool-resident generative test executes the exact 13-phase
+    sequence in `data/generative_swap_matrix.v1.json` twice through one
+    long-lived server process: Qwen dense -> DeepSeek -> Qwen MoE -> DeepSeek
+    -> Gemma -> DeepSeek -> Qwen dense, then the same three spokes again. All
+    four artifacts are distinct physical files. DeepSeek is the eviction hub,
+    and the largest-artifact byte budget makes every adjacent pair require
+    replacement. Every response must join its family-specific semantic canary
+    and execution receipt to the fresh resident generation, expected
+    load-time SHA-256, and exact GGUF architecture; report zero cached tokens
+    for that generation; retain the same process and model policy; prove the
+    evicted mapping is absent; keep load-and-warm under the fixed 60-second
+    bound; remain inside independently recomputed RSS and host-wired memory
+    ceilings; and reproduce each returning family's deterministic result
+    exactly. A source/mutation pass is not this hardware result; and
 13. dedicated BERT/Nomic A -> B -> A tests prove model/tokenizer/registry
     replacement, exact embedding replay, generation isolation, memory
     reclamation, and no double-residency peak; and
 14. multimodal A+P_A -> text B -> C+P_C -> A+P_A tests prove the projector and
     vision cache are generation-owned, admission-accounted, reclaimed with the
     text engine, and never inherited by an unbound shape-compatible model.
+15. the sealed Qwen3.8 exact-artifact gate executes every directed A -> B -> A
+    diagnostic row in `data/qwen38_exact_swap_matrix.v1.json` and, as the
+    runtime authority, two complete
+    BF16 -> Q4_K_M -> Q5_K_M -> Q6_K -> Q8_0 -> BF16 cycles in one long-lived
+    server process. The build must embed the clean source commit and expose it
+    through `__build-info`; the verifier joins that commit, the executed binary
+    SHA-256, the crates.io `mlx-native` version/checksum, and all five immutable
+    artifact identities. Every activation must publish a fresh resident
+    generation, execute on that generation, return the exact
+    `HF2Q_SWAP_OK` assistant message with `stop`, report a nonzero completion
+    token count and zero generation-local cached tokens, complete load-and-warm
+    in less than the fixed ten-second budget, and prove eviction plus bounded
+    RSS and host-wired peaks. The verifier independently recomputes every
+    bound from measured endpoints, including replay bounds; coordinated
+    inflation of a claimed peak and its claimed bound is a failure. Both BF16
+    cycle returns must reproduce the original result and configuration. The
+    sealed matrix must be embedded by digest and value in the protected cache-
+    lifecycle manifest and accepted by its dedicated final verifier. Missing,
+    unsealed, pairwise-only, or unmanifested evidence is a failure.
 
 ## Validation evidence
 
@@ -703,9 +745,13 @@ RSS fell to 22,028,140,544 bytes and host wired memory fell from
 process RSS and `vm_stat` host wired pages during both switch transactions to
 bound transient double residency; it records `footprint` only for diagnosis.
 The engine configuration correction stores one process-wide dynamic-load
-template plus canonical-artifact overrides for explicit tokenizer, config, and
-overlay paths, and exposes a path-free configuration identity in the local
-runtime view.
+template plus canonical-artifact-and-filesystem-stamp overrides for explicit
+tokenizer, config, overlay, and projector policy. A replacement at the same
+pathname cannot inherit the old artifact's sidecars. Resident lookup compares
+only the inexpensive file stamp; it does not hash the multi-GB GGUF again. A
+stamp mismatch fails closed to the process template with every model-local
+path cleared. The local runtime view continues to expose only a path-free
+configuration identity.
 
 The post-fix hardware gate passed on the same M5 Max with both reloads using
 `SlotAware { max_slots: 4 }`. Gemma -> Qwen loaded in 2.277 seconds and
@@ -718,6 +764,242 @@ wired) for Gemma -> Qwen and 31,998,066,688 / 36,528,816,128 bytes for
 Qwen -> Gemma, both within the gate's no-double-residency bound. The reloaded
 Gemma engine published a fresh generation, retained the exact path-free engine
 configuration identity, and reproduced its deterministic response exactly.
+
+That run remains lifecycle and replay evidence, but its inference assertion
+accepted an HTTP 200 plus a separately sampled pool row. Source review on
+2026-08-23 showed that those observations did not prove the response executed
+the sampled generation. Successful unary and SSE chat responses now carry
+private `x-hf2q-execution-*` headers derived from the actual leased
+`LoadedEngine`: base64 pool key, generation, the already-retained load-time
+text-artifact SHA-256, coarse architecture family, and exact GGUF
+architecture. The response path compares the lease and engine identities
+before inference and never re-hashes resident weights. The hardware swap gate
+must join every A1/B/A2 response receipt to the contemporaneous resident row
+and expected artifact digest/architecture; HTTP success alone is invalid.
+
+At the end of the 2026-08-22 correction, the proposed
+`data/generative_swap_matrix.v1.json` contract used four separate directed
+A -> B -> A pairs. It had no family-matrix hardware receipt. That design is
+historical: source review showed that a max-artifact pool budget still permits
+several smaller pairs to co-reside, and fresh-server rows cannot reveal
+cumulative leaks or stale cross-family state.
+
+### One-process universal generative swap contract (2026-08-23)
+
+Commit `b2c760f8` replaces that proposed matrix with one fixed 13-phase chain:
+Qwen dense -> DeepSeek -> Qwen MoE -> DeepSeek -> Gemma -> DeepSeek -> Qwen
+dense, followed by the same three spokes a second time. DeepSeek is the
+eviction hub. Its artifact is the largest pool budget and every adjacent
+artifact pair exceeds that budget, so all twelve transitions must physically
+replace rather than co-reside. One server PID across both cycles exposes
+cumulative leaks, process-policy drift, stale generations, and family state
+that fresh-server rows would hide.
+
+The fail-closed receipt binds clean source, embedded binary commit and digest,
+the exact crates.io `mlx-native` identity, four immutable artifacts, all 13
+fresh generations, family-specific semantic canaries, zero generation-local
+cached tokens, execution-to-residency joins, process policy, eviction mapping
+absence, load time, and independently recomputed RSS/host-wired transition and
+replay bounds. The returning family result must replay exactly. BERT and Nomic
+remain explicitly excluded because acceptance gate 13 owns their separate
+process-global embedding lifecycle.
+
+The structural and mutation gate is checked in. No 13-phase Apple-Silicon
+artifact receipt has been produced yet, so this is source authority only, not
+universal runtime acceptance or a performance claim.
+
+### Exact Qwen3.8 cross-format swap matrix contract (2026-08-23)
+
+The prior Qwen3.8 artifact catalog and four-position gate proved immutable
+storage identity and per-artifact inference independently. The corrected
+Gemma -> Qwen -> Gemma run proved the pool lifecycle independently. Neither
+receipt proved that all five contracted Qwen3.8 formats can replace one
+another without stale generation, route, mapping, or result state. Treating
+those independent facts as a cross-format model-swap result would be a proof
+composition error.
+
+`data/qwen38_exact_swap_matrix.v1.json` seals a five-row directed cycle:
+BF16 -> Q4_K_M -> BF16, Q4_K_M -> Q5_K_M -> Q4_K_M, Q5_K_M -> Q6_K ->
+Q5_K_M, Q6_K -> Q8_0 -> Q6_K, and Q8_0 -> BF16 -> Q8_0. This is the smallest
+complete matrix in which every contracted artifact is both an evicted/replayed
+A and a loaded B. Those cells remain useful pairwise diagnostics, but they are
+not cumulative lifecycle authority because each cell starts a new server. The
+acceptance run additionally executes two BF16-hub cycles through the
+production revision-bound switch route in one server process: BF16 -> Q4_K_M
+-> BF16 -> Q5_K_M -> BF16 -> Q6_K -> BF16 -> Q8_0 -> BF16, then the same
+four spokes again. A max-artifact pool permits adjacent smaller formats to
+co-reside, so the earlier direct 11-phase sequence did not actually force
+replacement and was rejected by the gate. The five isolated cells retain the
+direct small-format edges; the 17-phase hub chain forces all 16 cumulative
+transitions and makes sub-threshold leaks, stale generation state, and
+cross-format residue visible.
+
+Before the first load, the runner requires a clean exact source tree, rejects
+ambient Cargo configuration, derives the crates.io `mlx-native` identity from
+the exact manifest and lock entry, and verifies the size and SHA-256 of all
+five immutable artifacts. It builds once with `GIT_COMMIT_SHA` set to the
+clean checkout commit, or consumes the protected signed candidate, then
+requires that exact executable's hidden `__build-info` receipt to report the
+same commit. Binary SHA-256, embedded commit, source commit, dependency
+identity, and artifact snapshots are rechecked through the run. The fixed
+load-and-warm budget is ten seconds; no inherited environment variable may
+raise it.
+
+Each activation publishes a path-free receipt joining the leased pool-key
+digest, generation, artifact digest, architecture, resident bytes, process
+identity, memory samples, and switch peaks. Generation coherence is semantic,
+not merely non-null JSON: greedy inference must return the exact assistant
+sentinel `HF2Q_SWAP_OK`, finish with `stop`, report at least one completion
+token, and report zero cached prompt tokens for the fresh generation. The
+long-lived chain requires seventeen unique generations, stable per-format pool
+and configuration identities, five distinct format pool identities, absence
+of every evicted artifact mapping, and exact BF16 replay at both cycle ends.
+
+The receipt may record bounds, but it is not authority for its own arithmetic.
+The shell contract independently derives each transition and replay margin
+from the endpoint RSS, process footprint, process wired, and host-wired
+measurements and rejects both a peak above the derived bound and a coordinated
+increase of peak plus recorded bound. Process `footprint` remains diagnostic;
+RSS and host wired memory remain residency authorities. The outer receipt
+embeds all five diagnostic cells and the long-lived chain, seals their logs,
+and is then embedded by exact digest and value in the protected cache-lifecycle
+manifest. A dedicated final verifier revalidates the seal against the exact
+checkout before the aggregate manifest can pass.
+
+An adversarial source review falsified six earlier proof assumptions: a binary
+SHA did not prove the binary contained the named source; an inherited swap-
+budget variable could relax the target; non-null output could be empty or
+incoherent and the generation cache was unchecked; pairwise server restarts
+could hide cumulative defects; the real runtime matrix was absent from the
+protected final manifest; and self-authored memory bounds allowed coordinated
+peak/bound inflation. The corrected source-only mutation suite now rejects
+each of those cases, plus missing formats or rows, self-swaps, artifact or
+execution-generation drift, BF16 replay divergence, changed process identity,
+and evidence-log tamper. It is blocking in hosted CI without loading a model.
+This establishes the contract and its failure semantics only; it is not a
+runtime acceptance result.
+
+At source commit `9768b3d0`, `Cargo.toml` required unpublished
+`mlx-native = 0.12.3` and the lock entry had no crates.io source or checksum.
+The production runner correctly failed closed before build or model load.
+That is retained as historical blocker evidence.
+
+The 2026-08-23 candidate resolved the blocker differently: `mlx-native 0.13.0`
+was published from commit `1d9073a5d31565bee79bf99a516b8781cab0a284`, and
+fail-closed workflow run `32685066084` verified its exact source, package,
+registry archive, crates.io bytes, tag, and GitHub release bytes. hf2q commit
+`1b1f3811` pins that registry package and checksum
+`19bc89cd60cd6416ce9d562ac51c50851d88f345059331cce8a4baca15265356`.
+The cross-format runner was therefore no longer registry-blocked at that
+boundary. Its five hardware rows, two long-lived cycles, and final seal had not
+yet executed; publication and pinning were prerequisites, not runtime
+acceptance.
+
+The current candidate now pins published `mlx-native 0.14.0` from exact commit
+`32f076c7502151e7ca9cb20c06d0f3fe5e1d5641`; fail-closed workflow run
+`32873363483` binds its source, packed crate, crates.io bytes, tag, and GitHub
+release to SHA-256
+`c7b359aa9ea2603f58b49151ba54e37ed1aac10e76faf530865ea30a95f051b4`.
+This updates the reproducible dependency boundary only; the swap matrix still
+requires its own exact-artifact execution seal.
+
+### Single-hash swap-catalog correction under validation (2026-08-24)
+
+The first exact-matrix hardware spike at hf2q commit `e323f878` failed before
+its first BF16 -> Q4_K_M cell. The runner authenticated all five artifacts,
+but the no-startup-model server had authority for none of those receipts.
+Explicit-local activation then replaced any registry evidence with an
+ordinary stamp-only binding, so the loader read the complete GGUF again. The
+BF16 startup did not become ready for roughly 100 seconds and the following
+Q4_K_M switch took 29.553 seconds, exceeding the immutable ten-second bound.
+This was duplicate integrity work, not model initialization throughput, and
+raising the bound would conceal the defect.
+
+The reformulated contract records one schema-v2 receipt per exact physical
+artifact in a bounded operator-owned directory before server launch. Server
+startup admits the directory atomically: it rejects relative or symlinked
+directories, empty or oversized catalogs, non-JSON or duplicate entries,
+legacy receipts, and any stale member. Each admitted identity enters the
+existing canonical-path plus full-file-stamp configuration registry. Both
+activation actions preserve that identity when their explicit-local payload
+does not carry a newer verified identity; same-path replacement still drops
+to the process template and cannot inherit the digest or model-local policy.
+The loader remains the final authority and revalidates the full stamp before
+using the retained digest. No client-provided digest, path alias, or coarse
+shell snapshot can authorize hash reuse.
+
+The exact runner now creates or reuses those five receipts through the same
+sealed binary recorder, passes their directory to every pairwise and
+long-lived server, and seals the receipts in its evidence manifest. The first
+post-correction attempt exposed a separate proof-integrity defect before its
+first cell could be accepted: `cargo test --release` replaced the supplied
+`target/release/hf2q` after the runner captured its digest. Startup reached
+ready in six seconds, but the executed bytes correctly failed the exact-binary
+assertion. The runner now copies the candidate to a private bounded temporary
+directory before any integration-test compilation, attests and executes only
+that immutable copy, and removes it on exit.
+
+The next run passed four pairwise cells and then falsified the original
+host-wired bound on Q8_0 -> BF16. Process RSS stayed near 4.4 GiB and both
+settled host-wired endpoints were about 8.5 GiB, while the 100 ms system
+sampler observed 60.88 GB during admission of the 54.66 GB BF16 destination.
+That peak is consistent with one destination artifact becoming temporarily
+wired; the rejected two-artifact case would add the 29.05 GB Q8_0 source and
+cross roughly 92 GB above the same host baseline. Comparing a transient peak
+only with settled endpoints therefore rejected legitimate one-model loading
+and made the gate sampling-luck dependent.
+
+The corrected universal arithmetic retains the strict process-RSS endpoint
+bound. For system-wired memory it independently computes `min(before,
+after) + destination_artifact_bytes + margin`. This admits at most one fully
+wired destination above the lower host baseline and still rejects source plus
+destination double residency. Pairwise Qwen, the long-lived Qwen chain, and
+the cross-family generative chain use the same formula, and their contract
+validators recompute it from sealed artifact bytes rather than trusting the
+receipt's bound.
+
+The first 17-phase hub run then completed every transition and failed only the
+old final host-wired replay ceiling, which still compared a potentially wired
+BF16 generation with its settled initial endpoint plus 2 GiB. Replay now uses
+the same independently recomputed one-resident rule: the lowest host-wired
+phase baseline plus the replay artifact bytes plus margin. Process RSS,
+process footprint/wired memory, semantic replay, mapping absence, and all
+transition bounds remain unchanged; adding any evicted source artifact to a
+fully wired replay still exceeds the ceiling.
+
+The following exact run passed all five pair cells and all 17 long-lived
+generations, then failed final sealing because the old seal allowlist did not
+include the new `preflight/` receipt directory. The seal now requires exactly
+five named schema-v2 receipts, binds each digest to its contracted format and
+artifact suffix, rejects any extra/missing/symlinked entry, and verifies their
+hashes through the evidence manifest. Runtime success without that evidence
+closure remains a failed gate.
+
+Commit `3c79d56f` with exact binary SHA-256
+`c64e11ba3f70f0c400b7858d9c1b5a3be535c590b260bab7cfb3c139ef6e2ea8`
+then passed and sealed the complete matrix. All five pair cells returned the
+exact `HF2Q_SWAP_OK` semantic result at A1/B/A2 with zero cached tokens and
+fresh generations. Nine of ten pair legs loaded in 0.368--0.391 seconds; the
+cold Q8_0 -> BF16 leg took 9.332 seconds and remains inside, but close to, the
+immutable ten-second ceiling. All 16 BF16-hub transitions in the single PID
+took 0.361--0.383 seconds, produced 17 unique generations, retained five
+stable format identities, removed every evicted mapping, and replayed BF16 at
+phases 8 and 16. The sealed `matrix.json` SHA-256 is
+`32a3327fa1c8372b88a58b88d67e0bdeaf50b90916932daeebb175e463eedf7e`;
+its evidence manifest SHA-256 is
+`be57f4d04e4ac773e179e0738b243f28104790353768be427e9cc4476dfc2b3b`.
+
+This accepts the exact cross-format swap lane. The later provenance-bound
+candidate at commit `9138cfaa`, binary SHA-256
+`3a3339a327224ea73e00351853a8237c053ad7302bc3320ad52d75f4caccfb76`,
+also sealed the five-format by five-width physical matrix with exact scalar
+replay. Its matrix SHA-256 is
+`d0f4d215a776a17a24cfc13df6c3ad09c3df9eed2ec835f589e8e1f2ecfc6800`.
+The same binary passed the matched Q4_K_M one-slot ABBA gate at 1.053834x for
+code and 1.159750x for exact repetition. The comparison pin then advanced, so
+the current universal acceptance gate remains the all-format, all-width
+matched-physical matrix built from the refreshed pin; no prior receipt is
+silently relabeled as current.
 
 ## Consequences
 

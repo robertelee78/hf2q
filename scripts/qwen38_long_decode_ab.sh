@@ -68,6 +68,7 @@ done
   echo "sealed hf2q binary is missing or non-executable: $BINARY_PATH" >&2
   exit 2
 }
+export HF2Q_MODEL_VERIFICATION_BINARY="$BINARY_PATH"
 [[ -f "$MODEL_PATH" ]] || {
   echo "Qwen3.8 GGUF is missing: $MODEL_PATH" >&2
   exit 2
@@ -105,6 +106,12 @@ if [[ -z "$model_verification_receipt" ]]; then
   hf2q_release_prepare_model_verification \
     "$MODEL_PATH" "$MODEL_SHA256" "$model_verification_receipt" \
     "$model_verification_cache_dir"
+else
+  supplied_model_verification_receipt=$model_verification_receipt
+  model_verification_receipt="$OUT_DIR/model-verification.json"
+  hf2q_release_materialize_model_verification \
+    "$MODEL_PATH" "$MODEL_SHA256" "$supplied_model_verification_receipt" \
+    "$model_verification_receipt"
 fi
 hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
   "$model_verification_receipt"
@@ -310,7 +317,8 @@ run_trial() {
     return 1
   fi
 
-  env MODEL="$MODEL_PATH" PORT="$PORT" HF2Q_BIN="$BINARY_PATH" MAX_SLOTS=1 \
+  env MODEL="$MODEL_PATH" PORT="$PORT" HF2Q_BIN="$BINARY_PATH" \
+    HF2Q_MODEL_VERIFICATION_RECEIPT="$model_verification_receipt" MAX_SLOTS=1 \
     QWEN38_VISION=off THINKING_TOKEN_BUDGET=0 REP_PENALTY=1.0 \
     HF2Q_QWEN_GQA_Q2="$mode" HF2Q_PIPELINE_PREWARM_LOG=1 \
     "$script_dir/serve_qwen38_opencode.sh" >"$server_log" 2>&1 &

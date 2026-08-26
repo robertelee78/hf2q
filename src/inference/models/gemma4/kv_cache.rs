@@ -1212,6 +1212,43 @@ impl GemmaHybridSlotAnchor {
             })
             .sum()
     }
+
+    /// Exact reclaimable heap ownership retained by this payload.
+    ///
+    /// The enclosing `AnchorStore` charges the top-level entry and committed
+    /// vector control storage. This method charges every allocation owned by
+    /// the opaque family payload, including spare `Vec` capacity and the
+    /// per-layer option table.
+    pub fn owned_bytes(&self) -> u64 {
+        let layer_table = (self.layers.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<Option<GemmaHybridSlidingLayerAnchor>>() as u64);
+        self.layers
+            .iter()
+            .flatten()
+            .fold(layer_table, |sum, layer| {
+                let vec_bytes = |bytes: &Vec<u8>| bytes.capacity() as u64;
+                sum.saturating_add(vec_bytes(&layer.k))
+                    .saturating_add(vec_bytes(&layer.v_packed))
+                    .saturating_add(layer.v_norms.as_ref().map(vec_bytes).unwrap_or(0))
+                    .saturating_add(layer.bf16_xlen_k.as_ref().map(vec_bytes).unwrap_or(0))
+                    .saturating_add(layer.bf16_xlen_v.as_ref().map(vec_bytes).unwrap_or(0))
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic(prompt_len: usize, layer_payload_bytes: &[usize]) -> Self {
+        let mut layers = Vec::with_capacity(layer_payload_bytes.len());
+        for &bytes in layer_payload_bytes {
+            layers.push(Some(GemmaHybridSlidingLayerAnchor {
+                k: vec![0; bytes],
+                v_packed: Vec::new(),
+                v_norms: None,
+                bf16_xlen_k: None,
+                bf16_xlen_v: None,
+            }));
+        }
+        Self { prompt_len, layers }
+    }
 }
 
 fn gemma4_copy_slot_region_out(
@@ -1266,6 +1303,130 @@ fn gemma4_copy_slot_region_in(
     );
     let start = slot_idx * per_slot;
     bytes[start..start + per_slot].copy_from_slice(src);
+    Ok(())
+}
+
+fn gemma4_preflight_slot_region_in(
+    src: &[u8],
+    dst: &MlxBuffer,
+    slot_idx: usize,
+    n_seqs: usize,
+    name: &str,
+) -> Result<()> {
+    anyhow::ensure!(n_seqs > 0, "{name}: n_seqs must be positive");
+    anyhow::ensure!(
+        slot_idx < n_seqs,
+        "{name}: slot {slot_idx} outside {n_seqs}"
+    );
+    let bytes = dst
+        .as_slice::<u8>()
+        .map_err(|e| anyhow!("{name}: as_slice<u8>: {e}"))?;
+    anyhow::ensure!(
+        bytes.len() % n_seqs == 0,
+        "{name}: byte length {} not divisible by n_seqs={n_seqs}",
+        bytes.len()
+    );
+    let per_slot = bytes.len() / n_seqs;
+    anyhow::ensure!(
+        src.len() == per_slot,
+        "{name}: checkpoint bytes {} != slot bytes {per_slot}",
+        src.len()
+    );
+    Ok(())
+}
+
+/// Validate every layer, optional buffer, and destination span before the
+/// restore mutates the first byte or cursor. A failed preflight therefore
+/// leaves the physical slot untouched and lets the caller hard-reset and
+/// invalidate the whole checkpoint lineage deterministically.
+pub(crate) fn preflight_gemma_hybrid_slot_anchor_restore(
+    scaffold: &[MultiSeqHybridKvBuffers],
+    slot: crate::serve::multi_seq_kv::SlotId,
+    anchor: &GemmaHybridSlotAnchor,
+    resume_len: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        resume_len <= anchor.prompt_len,
+        "Gemma slot anchor resume length {resume_len} exceeds checkpoint {}",
+        anchor.prompt_len
+    );
+    anyhow::ensure!(
+        scaffold.len() == anchor.layers.len(),
+        "Gemma slot anchor layer count mismatch: live={} saved={}",
+        scaffold.len(),
+        anchor.layers.len()
+    );
+    for (layer_idx, (buf, saved)) in scaffold.iter().zip(&anchor.layers).enumerate() {
+        let slot_idx = slot.0 as usize;
+        let n_seqs = buf.n_seqs as usize;
+        anyhow::ensure!(
+            slot_idx < n_seqs && slot_idx < buf.seq_lens.len(),
+            "Gemma slot anchor restore L{layer_idx}: slot {} outside n_seqs={n_seqs} / cursors={}",
+            slot.0,
+            buf.seq_lens.len()
+        );
+        match (buf.is_sliding, saved) {
+            (false, None) => {}
+            (true, Some(saved)) => {
+                gemma4_preflight_slot_region_in(
+                    &saved.k,
+                    &buf.k,
+                    slot_idx,
+                    n_seqs,
+                    &format!("Gemma slot anchor restore L{layer_idx} K"),
+                )?;
+                gemma4_preflight_slot_region_in(
+                    &saved.v_packed,
+                    &buf.v_packed,
+                    slot_idx,
+                    n_seqs,
+                    &format!("Gemma slot anchor restore L{layer_idx} V"),
+                )?;
+                match (&saved.v_norms, buf.v_norms.byte_len() == 4) {
+                    (Some(bytes), false) => gemma4_preflight_slot_region_in(
+                        bytes,
+                        &buf.v_norms,
+                        slot_idx,
+                        n_seqs,
+                        &format!("Gemma slot anchor restore L{layer_idx} V norms"),
+                    )?,
+                    (None, true) => {}
+                    _ => anyhow::bail!(
+                        "Gemma slot anchor restore L{layer_idx}: V-norm layout changed"
+                    ),
+                }
+                match (&saved.bf16_xlen_k, buf.bf16_xlen_k.as_ref()) {
+                    (Some(bytes), Some(dst)) => gemma4_preflight_slot_region_in(
+                        bytes,
+                        dst,
+                        slot_idx,
+                        n_seqs,
+                        &format!("Gemma slot anchor restore L{layer_idx} xlen K"),
+                    )?,
+                    (None, None) => {}
+                    _ => anyhow::bail!(
+                        "Gemma slot anchor restore L{layer_idx}: xlen K layout changed"
+                    ),
+                }
+                match (&saved.bf16_xlen_v, buf.bf16_xlen_v.as_ref()) {
+                    (Some(bytes), Some(dst)) => gemma4_preflight_slot_region_in(
+                        bytes,
+                        dst,
+                        slot_idx,
+                        n_seqs,
+                        &format!("Gemma slot anchor restore L{layer_idx} xlen V"),
+                    )?,
+                    (None, None) => {}
+                    _ => anyhow::bail!(
+                        "Gemma slot anchor restore L{layer_idx}: xlen V layout changed"
+                    ),
+                }
+            }
+            _ => {
+                anyhow::bail!("Gemma slot anchor restore L{layer_idx}: sliding/full layout changed")
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1356,17 +1517,7 @@ pub fn restore_gemma_hybrid_slot_anchor(
     anchor: &GemmaHybridSlotAnchor,
     resume_len: usize,
 ) -> Result<()> {
-    anyhow::ensure!(
-        resume_len <= anchor.prompt_len,
-        "Gemma slot anchor resume length {resume_len} exceeds checkpoint {}",
-        anchor.prompt_len
-    );
-    anyhow::ensure!(
-        scaffold.len() == anchor.layers.len(),
-        "Gemma slot anchor layer count mismatch: live={} saved={}",
-        scaffold.len(),
-        anchor.layers.len()
-    );
+    preflight_gemma_hybrid_slot_anchor_restore(scaffold, slot, anchor, resume_len)?;
     for (layer_idx, (buf, saved)) in scaffold.iter_mut().zip(&anchor.layers).enumerate() {
         let slot_idx = slot.0 as usize;
         let n_seqs = buf.n_seqs as usize;
@@ -3016,6 +3167,85 @@ mod tests {
                 None
             }
         }
+    }
+
+    #[test]
+    fn gemma_anchor_owned_bytes_charge_all_family_allocations() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let anchor = GemmaHybridSlotAnchor::synthetic(7, &[11, 13, 17]);
+        let layer_table = (anchor.layers.capacity() as u64)
+            * std::mem::size_of::<Option<GemmaHybridSlidingLayerAnchor>>() as u64;
+        let heap_payload: u64 = anchor
+            .layers
+            .iter()
+            .flatten()
+            .map(|layer| layer.k.capacity() as u64)
+            .sum();
+        assert_eq!(anchor.owned_bytes(), layer_table + heap_payload);
+        assert_eq!(anchor.total_bytes(), 41);
+    }
+
+    #[test]
+    fn gemma_anchor_restore_preflights_all_layers_before_first_mutation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Some(dev) = skip_dev() else {
+            return;
+        };
+        let mut scaffold = vec![
+            alloc_multi_seq_hybrid_kv_for_layer(&dev, 0, 2, 256, 4, true, 2).expect("layer zero"),
+            alloc_multi_seq_hybrid_kv_for_layer(&dev, 1, 2, 256, 4, true, 2).expect("layer one"),
+        ];
+        for layer in &mut scaffold {
+            layer.seq_lens[0] = 3;
+            layer.k.as_mut_slice::<u8>().unwrap().fill(0x11);
+            layer.v_packed.as_mut_slice::<u8>().unwrap().fill(0x22);
+            layer.v_norms.as_mut_slice::<u8>().unwrap().fill(0x33);
+            if let Some(buffer) = layer.bf16_xlen_k.as_mut() {
+                buffer.as_mut_slice::<u8>().unwrap().fill(0x44);
+            }
+            if let Some(buffer) = layer.bf16_xlen_v.as_mut() {
+                buffer.as_mut_slice::<u8>().unwrap().fill(0x55);
+            }
+        }
+        let mut anchor =
+            snapshot_gemma_hybrid_slot_anchor(&scaffold, crate::serve::multi_seq_kv::SlotId(0), 3)
+                .expect("snapshot");
+
+        // Make layer zero visibly different from its checkpoint, then corrupt
+        // only the final layer's saved layout. A write-before-full-preflight
+        // implementation would silently restore layer zero before failing.
+        scaffold[0].k.as_mut_slice::<u8>().unwrap().fill(0xA5);
+        let layer_zero_before = scaffold[0].k.as_slice::<u8>().unwrap().to_vec();
+        anchor.layers[1].as_mut().expect("sliding layer").k.pop();
+        let cursors_before: Vec<Vec<u32>> = scaffold
+            .iter()
+            .map(|layer| layer.seq_lens.clone())
+            .collect();
+
+        let error = restore_gemma_hybrid_slot_anchor(
+            &mut scaffold,
+            crate::serve::multi_seq_kv::SlotId(0),
+            &anchor,
+            2,
+        )
+        .expect_err("late-layer mismatch must fail");
+        assert!(
+            error.to_string().contains("L1 K"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            scaffold[0].k.as_slice::<u8>().unwrap(),
+            layer_zero_before,
+            "layer zero mutated before layer one failed preflight"
+        );
+        assert_eq!(
+            scaffold
+                .iter()
+                .map(|layer| &layer.seq_lens)
+                .collect::<Vec<_>>(),
+            cursors_before.iter().collect::<Vec<_>>(),
+            "no cursor may change on failed preflight"
+        );
     }
 
     #[test]

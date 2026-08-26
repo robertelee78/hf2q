@@ -13,12 +13,27 @@ use super::Deepseek4Config;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TensorRole {
-    /// Matmul operand kept in its on-disk GGML representation.
-    RawMatrix,
+    /// Token table consumed by an artifact-native embedding gather.
+    EmbeddingMatrix,
+    /// Ordinary two-dimensional projection consumed by dense matmul.
+    DenseMatrix,
+    /// Output-A matrix reinterpreted as one batch per output group.
+    GroupedMatrix,
+    /// Three-dimensional expert stack consumed through selected expert IDs.
+    ExpertStack,
     /// Elementwise state expanded to F32 when it becomes resident.
     ElementwiseF32,
     /// Hash-routing table kept as canonical signed I32 values.
     IntegerLookupI32,
+}
+
+impl TensorRole {
+    pub(super) fn is_native_matrix(self) -> bool {
+        matches!(
+            self,
+            Self::EmbeddingMatrix | Self::DenseMatrix | Self::GroupedMatrix | Self::ExpertStack
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,7 +67,15 @@ fn spec(name: impl Into<String>, shape: impl Into<Vec<usize>>, role: TensorRole)
 }
 
 fn matrix(name: impl Into<String>, rows: usize, columns: usize) -> TensorSpec {
-    spec(name, vec![rows, columns], TensorRole::RawMatrix)
+    spec(name, vec![rows, columns], TensorRole::DenseMatrix)
+}
+
+fn embedding(name: impl Into<String>, rows: usize, columns: usize) -> TensorSpec {
+    spec(name, vec![rows, columns], TensorRole::EmbeddingMatrix)
+}
+
+fn grouped_matrix(name: impl Into<String>, rows: usize, columns: usize) -> TensorSpec {
+    spec(name, vec![rows, columns], TensorRole::GroupedMatrix)
 }
 
 fn state(name: impl Into<String>, shape: impl Into<Vec<usize>>) -> TensorSpec {
@@ -77,7 +100,7 @@ pub fn required_tensor_specs(cfg: &Deepseek4Config) -> Vec<TensorSpec> {
     let hc_hidden = hc * hidden;
 
     let mut specs = vec![
-        matrix("token_embd.weight", vocab, hidden),
+        embedding("token_embd.weight", vocab, hidden),
         state("output_norm.weight", vec![hidden]),
         matrix("output.weight", vocab, hidden),
         matrix("output_hc_fn.weight", hc, hc_hidden),
@@ -114,7 +137,7 @@ pub fn required_tensor_specs(cfg: &Deepseek4Config) -> Vec<TensorSpec> {
             ),
             matrix(format!("{prefix}.attn_kv.weight"), head_dim, hidden),
             state(format!("{prefix}.attn_kv_a_norm.weight"), vec![head_dim]),
-            matrix(
+            grouped_matrix(
                 format!("{prefix}.attn_output_a.weight"),
                 o_groups * o_rank,
                 heads * head_dim / o_groups,
@@ -141,17 +164,17 @@ pub fn required_tensor_specs(cfg: &Deepseek4Config) -> Vec<TensorSpec> {
             spec(
                 format!("{prefix}.ffn_gate_exps.weight"),
                 vec![experts, expert_dim, hidden],
-                TensorRole::RawMatrix,
+                TensorRole::ExpertStack,
             ),
             spec(
                 format!("{prefix}.ffn_up_exps.weight"),
                 vec![experts, expert_dim, hidden],
-                TensorRole::RawMatrix,
+                TensorRole::ExpertStack,
             ),
             spec(
                 format!("{prefix}.ffn_down_exps.weight"),
                 vec![experts, hidden, expert_dim],
-                TensorRole::RawMatrix,
+                TensorRole::ExpertStack,
             ),
         ]);
 

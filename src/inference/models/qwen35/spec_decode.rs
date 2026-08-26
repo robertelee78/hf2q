@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 /// performs the same slice for the lm_head path.
 pub(crate) fn last_hidden_row(hidden: &MlxBuffer, hidden_size: u32) -> Result<MlxBuffer> {
     let h = hidden_size as usize;
+    ensure!(h > 0, "last_hidden_row: hidden_size must be nonzero");
     let total = hidden.element_count();
     ensure!(
         total % h == 0 && total >= h,
@@ -35,9 +36,14 @@ pub(crate) fn last_hidden_row(hidden: &MlxBuffer, hidden_size: u32) -> Result<Ml
         total,
         h
     );
-    let seq_len = (total / h) as u64;
-    let byte_offset = (seq_len - 1) * (h as u64) * 4; // F32 = 4 bytes
-    Ok(hidden.slice_view(byte_offset, h))
+    let seq_len = total / h;
+    crate::serve::forward_mlx_shared::exact_f32_row_view(
+        hidden,
+        seq_len,
+        h,
+        seq_len - 1,
+        "last_hidden_row",
+    )
 }
 
 /// ADR-028 iter-171: slice the Nth row out of a `[seq_len, hidden_size]`
@@ -46,6 +52,7 @@ pub(crate) fn last_hidden_row(hidden: &MlxBuffer, hidden_size: u32) -> Result<Ml
 /// the token-position-specific hidden state for next iter's MTP draft.
 pub(crate) fn nth_hidden_row(hidden: &MlxBuffer, hidden_size: u32, row: u64) -> Result<MlxBuffer> {
     let h = hidden_size as usize;
+    ensure!(h > 0, "nth_hidden_row: hidden_size must be nonzero");
     let total = hidden.element_count();
     ensure!(
         total % h == 0 && total >= h,
@@ -53,15 +60,15 @@ pub(crate) fn nth_hidden_row(hidden: &MlxBuffer, hidden_size: u32, row: u64) -> 
         total,
         h
     );
-    let seq_len = (total / h) as u64;
+    let seq_len = total / h;
+    let row = usize::try_from(row).context("nth_hidden_row: row exceeds usize")?;
     ensure!(
         row < seq_len,
         "nth_hidden_row: row {} out of range (seq_len {})",
         row,
         seq_len
     );
-    let byte_offset = row * (h as u64) * 4; // F32 = 4 bytes
-    Ok(hidden.slice_view(byte_offset, h))
+    crate::serve::forward_mlx_shared::exact_f32_row_view(hidden, seq_len, h, row, "nth_hidden_row")
 }
 
 fn trim_trailing_eos(tokens: &mut Vec<u32>, eos_token_ids: &[u32]) {
@@ -654,6 +661,10 @@ impl<'a> SpecDecode<'a> {
                                     // params/history at this position.
                                     let logits_cpu =
                                         super::gpu_full_attn::download_f32(&draft_logits)?;
+                                    crate::inference::argmax::validate_finite_logits(
+                                        &logits_cpu,
+                                        "Qwen stochastic MTP draft readback",
+                                    )?;
                                     let probs = sampler.probabilities(&logits_cpu, &draft_history);
                                     let t = sample_from_probs(&probs, rng_ref);
                                     out_probs.push(probs);
@@ -661,6 +672,10 @@ impl<'a> SpecDecode<'a> {
                                 } else if sampler.needs_cpu_greedy() {
                                     let logits_cpu =
                                         super::gpu_full_attn::download_f32(&draft_logits)?;
+                                    crate::inference::argmax::validate_finite_logits(
+                                        &logits_cpu,
+                                        "Qwen repetition-penalized MTP draft readback",
+                                    )?;
                                     sampler.greedy_token(&logits_cpu, &draft_history)
                                 } else {
                                     argmax_logits_gpu(device, registry, &draft_logits, mtp_vocab)?
@@ -1018,6 +1033,10 @@ impl<'a> SpecDecode<'a> {
                         .context("SpecDecode MTP forward_draft")?;
                     if needs_cpu_draft {
                         let logits_cpu = super::gpu_full_attn::download_f32(&draft_logits)?;
+                        crate::inference::argmax::validate_finite_logits(
+                            &logits_cpu,
+                            "Qwen MTP draft readback",
+                        )?;
                         Ok::<_, anyhow::Error>((None, Some(logits_cpu)))
                     } else {
                         let tok = argmax_logits_gpu(device, registry, &draft_logits, mtp_vocab)?;
@@ -1622,9 +1641,12 @@ pub(crate) fn argmax_logits_gpu(
     )
     .context("SpecDecode dispatch argmax")?;
     enc.commit_and_wait().context("SpecDecode commit argmax")?;
-    Ok(out_index
-        .as_slice::<u32>()
-        .map_err(|e| anyhow!("SpecDecode argmax index slice: {e}"))?[0])
+    crate::inference::argmax::read_finite_argmax_one(
+        &out_index,
+        &out_value,
+        vocab_size,
+        "Qwen speculative decode",
+    )
 }
 
 #[cfg(test)]
@@ -1728,45 +1750,51 @@ mod tests {
     ///
     /// This loads a full model artifact and is intentionally ignored by
     /// hosted tests. Run this exact ignored test with an explicit
-    /// `HF2Q_TEST_QWEN38_GGUF` path. Set
-    /// `HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN=1` to prove the exact Q4_K mvN route,
-    /// or `HF2Q_TEST_QWEN38_EXPECT_MV_EXT=1` with
-    /// `HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1` to prove the same width-four
-    /// qualified weight-amortized width-four route. Set
-    /// `HF2Q_TEST_QWEN38_EXPECT_Q5_K_M=1` with a Q5_K_M artifact path to bind
-    /// the storage assertions to file type 17, a Q5_K embedding/projection,
-    /// and the native Q6_K output head.
+    /// `HF2Q_TEST_QWEN38_GGUF` path and an exact
+    /// `HF2Q_TEST_QWEN38_FORMAT` value from BF16, Q4_K_M, Q5_K_M, Q6_K, or
+    /// Q8_0. Storage assertions bind the declared format to its exact GGUF
+    /// file type and native tensor representations. Set
+    /// `HF2Q_TEST_QWEN38_EXPECT_MVN_QTYPE` to `Q4_K`, `Q5_K`, or `Q6_K` to
+    /// prove that the selected width-four dense kernel actually executes.
+    /// The five-format matrix always runs the common trajectory,
+    /// cache-handoff, and no-storage-substitution proof.
     #[test]
     #[ignore = "requires an explicit full Qwen3.8 GGUF and Apple Metal"]
     fn qwen38_real_four_position_normal_forward_parity() {
-        let expect_q4k_mvn = std::env::var_os("HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN").is_some();
-        let expect_mv_ext = std::env::var_os("HF2Q_TEST_QWEN38_EXPECT_MV_EXT").is_some();
-        let expect_q5_k_m = std::env::var_os("HF2Q_TEST_QWEN38_EXPECT_Q5_K_M").is_some();
-        assert!(
-            !(expect_q4k_mvn && expect_mv_ext),
-            "Qwen3.8 qL4 route proof must select exactly one expected route"
+        let expected_mvn_qtype = std::env::var("HF2Q_TEST_QWEN38_EXPECT_MVN_QTYPE").ok();
+        let expect_canonical_q5 = !matches!(
+            std::env::var("HF2Q_Q5K_CANONICAL_Q4X4").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
         );
-        assert!(
-            !(expect_q5_k_m && (expect_q4k_mvn || expect_mv_ext)),
-            "Q5_K_M storage proof cannot request a Q4_K-only route assertion"
-        );
-        if expect_q4k_mvn || expect_mv_ext {
+        let artifact_format = std::env::var("HF2Q_TEST_QWEN38_FORMAT")
+            .expect("ignored Qwen3.8 parity gate requires HF2Q_TEST_QWEN38_FORMAT");
+        let expected_mvn_kernel = match expected_mvn_qtype.as_deref() {
+            None => None,
+            Some("Q4_K") => {
+                assert_eq!(artifact_format, "Q4_K_M", "Q4_K mvN proof requires Q4_K_M");
+                Some("kernel_mul_mv_q4_K_f32_mN_")
+            }
+            Some("Q5_K") => {
+                assert_eq!(artifact_format, "Q5_K_M", "Q5_K mvN proof requires Q5_K_M");
+                Some(if expect_canonical_q5 {
+                    "kernel_mul_mv_ext_q5_K_f32_"
+                } else {
+                    "kernel_mul_mv_q5_K_f32_mN_"
+                })
+            }
+            Some("Q6_K") => {
+                assert_eq!(artifact_format, "Q6_K", "Q6_K mvN proof requires Q6_K");
+                Some("kernel_mul_mv_q6_K_f32_mN_")
+            }
+            Some(other) => {
+                panic!("HF2Q_TEST_QWEN38_EXPECT_MVN_QTYPE must be Q4_K, Q5_K, or Q6_K, got {other}")
+            }
+        };
+        if expected_mvn_kernel.is_some() {
             assert_eq!(
                 std::env::var("MLX_DISP_BUCKET").as_deref(),
                 Ok("1"),
                 "Qwen3.8 qL4 route proof requires externally-set MLX_DISP_BUCKET=1"
-            );
-        }
-        if expect_mv_ext {
-            assert_eq!(
-                std::env::var("HF2Q_DECODE_MVN").as_deref(),
-                Ok("0"),
-                "Q4_K mv_ext route proof requires externally-set HF2Q_DECODE_MVN=0"
-            );
-            assert_eq!(
-                std::env::var("HF2Q_DECODE_MV_EXT").as_deref(),
-                Ok("1"),
-                "Q4_K mv_ext route proof requires externally-set HF2Q_DECODE_MV_EXT=1"
             );
         }
         let _gpu = crate::inference::hf2q_gpu_test_lock();
@@ -1784,21 +1812,35 @@ mod tests {
         use crate::serve::header::LoadProgress;
         use crate::serve::multi_seq_kv::SlotId;
         use mlx_native::gguf::GgufFile;
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 
         let gguf = GgufFile::open(&path).expect("open Qwen3.8 GGUF");
-        if expect_q5_k_m {
-            assert_eq!(
-                gguf.metadata_u32("general.file_type"),
-                Some(17),
-                "Q5_K_M proof requires exact GGUF file type 17"
-            );
-        }
+        let (expected_file_type, expected_primary_type, expected_output_type) =
+            match artifact_format.as_str() {
+                "BF16" => (32, GgmlType::BF16, GgmlType::BF16),
+                "Q4_K_M" => (15, GgmlType::Q4_K, GgmlType::Q6_K),
+                "Q5_K_M" => (17, GgmlType::Q5_K, GgmlType::Q6_K),
+                "Q6_K" => (18, GgmlType::Q6_K, GgmlType::Q6_K),
+                "Q8_0" => (7, GgmlType::Q8_0, GgmlType::Q8_0),
+                other => panic!(
+                    "unsupported HF2Q_TEST_QWEN38_FORMAT={other}; expected BF16, Q4_K_M, Q5_K_M, Q6_K, or Q8_0"
+                ),
+            };
+        assert_eq!(
+            gguf.metadata_u32("general.file_type"),
+            Some(expected_file_type),
+            "{artifact_format} proof requires its exact GGUF file type"
+        );
         let mut progress = LoadProgress::new(false, 1, 0);
         let model = Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen3.8 model");
+        assert_eq!(
+            model.ggml_routing_policy.dense_q5k_canonical_q4x4,
+            expect_canonical_q5,
+            "Qwen3.8 model did not freeze the requested Q5_K route"
+        );
         use crate::inference::models::qwen35::gpu_full_attn::FullAttnQGateWeightsGpu;
         use crate::inference::models::qwen35::model::{Qwen35FfnWeights, Qwen35LayerWeights};
         use crate::inference::models::qwen35::mtp::MtpFfnWeightsGpu;
-        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 
         // Inference consumes the conversion artifact as written. The accepted
         // GGUF must never fall back to an expanded CPU table or a runtime
@@ -1814,13 +1856,7 @@ mod tests {
             .expect("native token embedding")
             .info
             .ggml_dtype;
-        assert!(
-            matches!(embedding_type, GgmlType::Q4_K | GgmlType::Q5_K),
-            "unexpected native embedding type {embedding_type:?}"
-        );
-        if expect_q5_k_m {
-            assert_eq!(embedding_type, GgmlType::Q5_K);
-        }
+        assert_eq!(embedding_type, expected_primary_type);
         assert_eq!(
             model
                 .output_weight_native
@@ -1828,15 +1864,31 @@ mod tests {
                 .expect("native output head")
                 .info
                 .ggml_dtype,
-            GgmlType::Q6_K
+            expected_output_type
         );
-        let is_artifact_quant =
-            |kind: GgmlType| matches!(kind, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K);
+        let is_artifact_storage = |kind: GgmlType| match artifact_format.as_str() {
+            "Q4_K_M" => matches!(kind, GgmlType::Q4_K | GgmlType::Q6_K),
+            "Q5_K_M" => matches!(kind, GgmlType::Q5_K | GgmlType::Q6_K),
+            _ => kind == expected_primary_type,
+        };
         for (layer_index, layer) in model.layers.iter().enumerate() {
-            assert!(
-                matches!(layer.ffn(), Qwen35FfnWeights::DenseQ(_)),
-                "layer {layer_index} FFN did not retain native quantized storage"
-            );
+            match layer.ffn() {
+                Qwen35FfnWeights::DenseNative(weights) => {
+                    assert_eq!(artifact_format, "BF16");
+                    assert_eq!(weights.gate_type, GgmlType::BF16);
+                    assert_eq!(weights.up_type, GgmlType::BF16);
+                    assert_eq!(weights.down_type, GgmlType::BF16);
+                }
+                Qwen35FfnWeights::DenseQ(weights) => {
+                    assert_ne!(artifact_format, "BF16");
+                    assert!(is_artifact_storage(weights.ggml_type_gate));
+                    assert!(is_artifact_storage(weights.ggml_type_up));
+                    assert!(is_artifact_storage(weights.ggml_type_down));
+                }
+                _ => panic!(
+                    "layer {layer_index} FFN did not retain declared {artifact_format} storage"
+                ),
+            }
             match layer {
                 Qwen35LayerWeights::NativeFullAttn { attn, .. } => {
                     let q_type = match &attn.q_gate {
@@ -1845,10 +1897,10 @@ mod tests {
                             panic!("layer {layer_index} split/re-encoded native Q+gate")
                         }
                     };
-                    assert!(is_artifact_quant(q_type));
-                    assert!(is_artifact_quant(attn.wk_ggml_type));
-                    assert!(is_artifact_quant(attn.wv_ggml_type));
-                    assert!(is_artifact_quant(attn.wo_ggml_type));
+                    assert!(is_artifact_storage(q_type));
+                    assert!(is_artifact_storage(attn.wk_ggml_type));
+                    assert!(is_artifact_storage(attn.wv_ggml_type));
+                    assert!(is_artifact_storage(attn.wo_ggml_type));
                 }
                 Qwen35LayerWeights::NativeLinearAttn { attn, .. } => {
                     for kind in [
@@ -1859,7 +1911,7 @@ mod tests {
                         attn.ssm_out_ggml_type,
                     ] {
                         assert!(
-                            is_artifact_quant(kind),
+                            is_artifact_storage(kind),
                             "layer {layer_index} projection was rewritten as {kind:?}"
                         );
                     }
@@ -1874,15 +1926,8 @@ mod tests {
             mtp.embed_tokens.is_none(),
             "Qwen3.8 MTP must share embeddings"
         );
-        assert!(
-            matches!(mtp.eh_proj_ggml_type, GgmlType::Q4_K | GgmlType::Q5_K),
-            "Qwen3.8 MTP projection was rewritten as {:?}",
-            mtp.eh_proj_ggml_type
-        );
-        if expect_q5_k_m {
-            assert_eq!(mtp.eh_proj_ggml_type, GgmlType::Q5_K);
-        }
-        assert_eq!(mtp.shared_head_head_ggml_type, GgmlType::Q6_K);
+        assert_eq!(mtp.eh_proj_ggml_type, expected_primary_type);
+        assert_eq!(mtp.shared_head_head_ggml_type, expected_output_type);
         use mlx_native::metal::foreign_types::ForeignType;
         let main_head = model
             .output_weight_native
@@ -1898,7 +1943,11 @@ mod tests {
             main_head.buffer.byte_offset(),
             "Qwen3.8 MTP must borrow the exact main output-head view"
         );
-        assert!(matches!(&mtp.ffn, MtpFfnWeightsGpu::DenseQ { .. }));
+        if artifact_format == "BF16" {
+            assert!(matches!(&mtp.ffn, MtpFfnWeightsGpu::Dense { .. }));
+        } else {
+            assert!(matches!(&mtp.ffn, MtpFfnWeightsGpu::DenseQ { .. }));
+        }
         assert_eq!(model.cfg.head_dim, 256, "Qwen3.8 parity requires D=256");
         model
             .ensure_gpu_cache_primed()
@@ -1971,13 +2020,32 @@ mod tests {
                 last_logits(&logits, model.cfg.vocab_size).expect("sequential logits row"),
             ));
         }
-        if expect_q4k_mvn || expect_mv_ext {
+        if let Some(kernel_prefix) = expected_mvn_kernel {
+            let serial_buckets = mlx_native::pipeline_dispatch_buckets();
+            if expected_mvn_qtype.as_deref() == Some("Q5_K") && expect_canonical_q5 {
+                let expected_serial = format!("{kernel_prefix}r1_1");
+                assert!(
+                    serial_buckets
+                        .iter()
+                        .any(|(label, count)| *count > 0 && label.starts_with(&expected_serial)),
+                    "serial target did not execute {expected_serial}: {serial_buckets:?}"
+                );
+            } else {
+                assert!(
+                    serial_buckets
+                        .iter()
+                        .all(|(label, _)| !label.starts_with(kernel_prefix)),
+                    "serial target unexpectedly used a multi-row {expected_mvn_qtype:?} kernel: {serial_buckets:?}"
+                );
+            }
+        }
+        if artifact_format == "Q5_K_M" {
             let serial_buckets = mlx_native::pipeline_dispatch_buckets();
             assert!(
-                serial_buckets.iter().all(|(label, _)| !label
-                    .starts_with("kernel_mul_mv_q4_K_f32_mN_")
-                    && !label.starts_with("kernel_mul_mv_ext_q4_K_f32_")),
-                "serial target unexpectedly used a multi-row Q4_K kernel: {serial_buckets:?}"
+                serial_buckets
+                    .iter()
+                    .all(|(label, _)| { !label.starts_with("kernel_fused_gate_up_silu_q5_K_f32") }),
+                "serial Q5_K target used the rejected fused FFN route: {serial_buckets:?}"
             );
         }
 
@@ -1997,26 +2065,30 @@ mod tests {
             )
             .expect("four-position Qwen3.8 target step");
         batched_cache.clear_la_capture();
-        if expect_q4k_mvn {
+        if let Some(kernel_prefix) = expected_mvn_kernel {
             let batched_buckets = mlx_native::pipeline_dispatch_buckets();
+            let expected_label = format!("{kernel_prefix}r1_4");
             assert!(
                 batched_buckets.iter().any(|(label, count)| {
-                    *count > 0 && label.starts_with("kernel_mul_mv_q4_K_f32_mN_r1_4")
+                    *count > 0 && label.starts_with(&expected_label)
                 }),
-                "qL4 target did not execute the Q4_K mvN r1=4 kernel: {batched_buckets:?}"
+                "qL4 target did not execute the selected {expected_mvn_qtype:?} r1=4 kernel: {batched_buckets:?}"
+            );
+            eprintln!(
+                "[QWEN38_DENSE_ROUTE] qtype={} kernel={expected_label}",
+                expected_mvn_qtype
+                    .as_deref()
+                    .expect("mvN kernel expectation has a qtype")
             );
         }
-        if expect_mv_ext {
+        if artifact_format == "Q5_K_M" {
             let batched_buckets = mlx_native::pipeline_dispatch_buckets();
-            for ggml_type in ["q4_K", "q6_K"] {
-                let expected = format!("kernel_mul_mv_ext_{ggml_type}_f32_r1_4");
-                assert!(
-                    batched_buckets
-                        .iter()
-                        .any(|(label, count)| *count > 0 && label.starts_with(&expected)),
-                    "qL4 target did not execute the {ggml_type} mv_ext r1=4 kernel: {batched_buckets:?}"
-                );
-            }
+            assert!(
+                batched_buckets
+                    .iter()
+                    .all(|(label, _)| { !label.starts_with("kernel_fused_gate_up_silu_q5_K_f32") }),
+                "batched Q5_K target used the rejected fused FFN route: {batched_buckets:?}"
+            );
         }
         assert_eq!(
             batched_logits.element_count(),
@@ -2043,6 +2115,7 @@ mod tests {
             .expect("all sequential target cursors");
 
         let mut continuation = *sequential_choices.last().expect("four target choices");
+        let mut continuation_choices = Vec::with_capacity(8);
         for continuation_offset in 0..8 {
             let continuation_position = positions_for_range(
                 (prefix.len() + verifier_tokens.len() + continuation_offset) as i32,
@@ -2077,7 +2150,1005 @@ mod tests {
                 "Qwen3.8 post-qL4 cache handoff diverged at continuation step {continuation_offset}"
             );
             continuation = sequential_choice;
+            continuation_choices.push(sequential_choice);
         }
+        eprintln!(
+            "qwen38_four_position_receipt format={artifact_format} verifier={sequential_choices:?} continuation={continuation_choices:?}"
+        );
+    }
+
+    /// Real Qwen3.6 MoE gate for the family-neutral Q5_K dense route.
+    /// Attention and shared projections must use the selected q4x4 kernels,
+    /// while routed expert stacks remain on the independent mm_id path.
+    #[test]
+    #[ignore = "requires the exact Qwen3.6 APEX Q5_K_M GGUF and Apple Metal"]
+    fn qwen36_real_q5_dense_shared_route_matches_scalar_and_keeps_mm_id() {
+        assert_eq!(
+            std::env::var("HF2Q_Q5K_CANONICAL_Q4X4").as_deref(),
+            Ok("1"),
+            "Qwen3.6 Q5 route gate requires HF2Q_Q5K_CANONICAL_Q4X4=1"
+        );
+        assert!(
+            std::env::var_os("HF2Q_DECODE_MV_EXT").is_none(),
+            "Qwen3.6 Q5 route gate must not use the broad MV_EXT policy"
+        );
+        assert_eq!(
+            std::env::var("MLX_DISP_BUCKET").as_deref(),
+            Ok("1"),
+            "Qwen3.6 Q5 route gate requires MLX_DISP_BUCKET=1"
+        );
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let path = std::env::var_os("HF2Q_TEST_QWEN36_GGUF")
+            .map(std::path::PathBuf::from)
+            .expect("Qwen3.6 route gate requires HF2Q_TEST_QWEN36_GGUF");
+
+        use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+        use crate::inference::models::qwen35::model::Qwen35Model;
+        use crate::serve::header::LoadProgress;
+        use crate::serve::multi_seq_kv::SlotId;
+        use mlx_native::gguf::GgufFile;
+
+        let gguf = GgufFile::open(&path).expect("open Qwen3.6 route GGUF");
+        assert_eq!(
+            gguf.metadata_u32("general.file_type"),
+            Some(17),
+            "Qwen3.6 route gate requires Q5_K_M"
+        );
+        let mut progress = LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .expect("load Qwen3.6 route model");
+        let moe = model.cfg.moe.as_ref().expect("Qwen3.6 gate requires MoE");
+        assert_eq!(moe.num_experts, 256);
+        assert_eq!(moe.num_experts_per_tok, 8);
+        assert!(model.mtp.is_none(), "Qwen3.6 gate must not acquire Qwen3.8 MTP");
+        assert!(
+            model.ggml_routing_policy.dense_q5k_canonical_q4x4,
+            "Qwen3.6 model did not freeze the canonical Q5_K route"
+        );
+        model
+            .ensure_gpu_cache_primed()
+            .expect("prime Qwen3.6 GPU cache");
+
+        const PREFIX_TOKENS: usize = 20;
+        const VERIFY_ROWS: usize = 4;
+        let prefix: Vec<u32> = (1..=PREFIX_TOKENS as u32).collect();
+        let mut sequential_cache = model
+            .with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(&model.cfg, device, 64, 1, true)
+            })
+            .expect("allocate sequential Qwen3.6 cache");
+        let mut batched_cache = model
+            .with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(&model.cfg, device, 64, 1, true)
+            })
+            .expect("allocate batched Qwen3.6 cache");
+        let prefix_positions = positions_for_range(0, PREFIX_TOKENS);
+        let (sequential_prefill, _) = model
+            .forward_gpu_with_nextn_hidden(
+                &prefix,
+                &prefix_positions,
+                &mut sequential_cache,
+                SlotId(0),
+            )
+            .expect("sequential Qwen3.6 prefill");
+        let (batched_prefill, _) = model
+            .forward_gpu_with_nextn_hidden(
+                &prefix,
+                &prefix_positions,
+                &mut batched_cache,
+                SlotId(0),
+            )
+            .expect("batched Qwen3.6 prefill");
+        let sequential_seed = greedy_argmax_slice(
+            last_logits(&sequential_prefill, model.cfg.vocab_size)
+                .expect("sequential Qwen3.6 prefill logits"),
+        );
+        assert_eq!(
+            greedy_argmax_slice(
+                last_logits(&batched_prefill, model.cfg.vocab_size)
+                    .expect("batched Qwen3.6 prefill logits"),
+            ),
+            sequential_seed,
+            "independent Qwen3.6 prefills diverged"
+        );
+        let verifier_tokens = [sequential_seed, 279, 15, 9707];
+        let mut sequential_choices = Vec::with_capacity(VERIFY_ROWS);
+        mlx_native::reset_pipeline_dispatch_buckets();
+        super::super::gpu_ffn::reset_test_moe_id_projection_calls();
+        for (offset, token) in verifier_tokens.iter().copied().enumerate() {
+            let (logits, _) = model
+                .forward_gpu_with_nextn_hidden(
+                    &[token],
+                    &positions_for_range((PREFIX_TOKENS + offset) as i32, 1),
+                    &mut sequential_cache,
+                    SlotId(0),
+                )
+                .expect("sequential Qwen3.6 route step");
+            sequential_choices.push(greedy_argmax_slice(
+                last_logits(&logits, model.cfg.vocab_size)
+                    .expect("sequential Qwen3.6 logits"),
+            ));
+        }
+        let serial_buckets = mlx_native::pipeline_dispatch_buckets();
+        assert!(
+            serial_buckets.iter().any(|(label, count)|
+                *count > 0 && label.starts_with("kernel_mul_mv_ext_q5_K_f32_r1_1")),
+            "Qwen3.6 scalar path did not use canonical Q5_K r1=1: {serial_buckets:?}"
+        );
+        assert!(
+            super::super::gpu_ffn::test_moe_id_projection_calls() > 0,
+            "Qwen3.6 scalar path bypassed expert mm_id"
+        );
+
+        model
+            .with_gpu_cache_mut(|device, _registry| {
+                batched_cache.ensure_la_capture(&model.cfg, device, VERIFY_ROWS as u32)
+            })
+            .expect("allocate Qwen3.6 qL4 capture");
+        mlx_native::reset_pipeline_dispatch_buckets();
+        super::super::gpu_ffn::reset_test_moe_id_projection_calls();
+        let (batched_logits, _) = model
+            .forward_gpu_with_nextn_hidden(
+                &verifier_tokens,
+                &positions_for_range(PREFIX_TOKENS as i32, VERIFY_ROWS),
+                &mut batched_cache,
+                SlotId(0),
+            )
+            .expect("batched Qwen3.6 route step");
+        batched_cache.clear_la_capture();
+        let batched_choices: Vec<u32> = batched_logits
+            .chunks_exact(model.cfg.vocab_size as usize)
+            .map(greedy_argmax_slice)
+            .collect();
+        assert_eq!(
+            batched_choices, sequential_choices,
+            "Qwen3.6 qL4 decisions diverged from scalar replay"
+        );
+        let batched_buckets = mlx_native::pipeline_dispatch_buckets();
+        assert!(
+            batched_buckets.iter().any(|(label, count)|
+                *count > 0 && label.starts_with("kernel_mul_mv_ext_q5_K_f32_r1_4")),
+            "Qwen3.6 qL4 path did not use canonical Q5_K r1=4: {batched_buckets:?}"
+        );
+        let expert_calls = super::super::gpu_ffn::test_moe_id_projection_calls();
+        assert!(expert_calls > 0, "Qwen3.6 qL4 path bypassed expert mm_id");
+        assert!(
+            batched_buckets
+                .iter()
+                .all(|(label, _)| !label.starts_with("kernel_fused_gate_up_silu_q5_K_f32")),
+            "Qwen3.6 shared Q5_K projections used the retired fused route: {batched_buckets:?}"
+        );
+        sequential_cache
+            .validate_sequence_len_for_slot(SlotId(0), PREFIX_TOKENS + VERIFY_ROWS)
+            .expect("sequential Qwen3.6 cursor");
+        batched_cache
+            .validate_sequence_len_for_slot(SlotId(0), PREFIX_TOKENS + VERIFY_ROWS)
+            .expect("batched Qwen3.6 cursor");
+        eprintln!(
+            "[QWEN36_Q5_ROUTE] scalar=kernel_mul_mv_ext_q5_K_f32_r1_1 batched=kernel_mul_mv_ext_q5_K_f32_r1_4 expert_mm_id_calls={expert_calls}"
+        );
+    }
+
+    /// Diagnostic for the production route fork behind exact AUTO decoding.
+    ///
+    /// The short four-position gate above proves one verifier transaction.
+    /// This test instead follows the exact 67-token server prompt that exposed
+    /// the mixed-workload failure and repeatedly compares four ordinary scalar
+    /// target decisions with one four-row verifier transaction. It therefore
+    /// exercises the recurrent-cache handoff over a long generated trajectory,
+    /// while keeping drafting, scheduling, and rectangular prefill out of the
+    /// experiment.
+    #[test]
+    #[ignore = "requires an explicit full Qwen3.8 GGUF and Apple Metal"]
+    fn qwen38_real_repeated_four_row_route_coherence() {
+        let expect_canonical_q5 = match std::env::var("HF2Q_Q5K_CANONICAL_Q4X4").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            Err(std::env::VarError::NotPresent) => true,
+            other => panic!(
+                "repeated route gate requires HF2Q_Q5K_CANONICAL_Q4X4 to be absent, 0, or 1, got {other:?}"
+            ),
+        };
+        assert!(
+            std::env::var_os("HF2Q_DECODE_MVN").is_none(),
+            "repeated route gate must prove the production MVN default"
+        );
+        assert!(
+            std::env::var_os("HF2Q_DECODE_MV_EXT").is_none(),
+            "repeated route gate must prove the production MV_EXT default"
+        );
+        assert_eq!(
+            std::env::var("MLX_DISP_BUCKET").as_deref(),
+            Ok("1"),
+            "repeated route gate requires actual pipeline dispatch receipts"
+        );
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let path = std::env::var_os("HF2Q_TEST_QWEN38_GGUF")
+            .map(std::path::PathBuf::from)
+            .expect("ignored Qwen3.8 route gate requires HF2Q_TEST_QWEN38_GGUF");
+        assert!(
+            path.is_file(),
+            "Qwen3.8 route artifact is absent at {}",
+            path.display()
+        );
+
+        use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+        use crate::inference::models::qwen35::model::Qwen35Model;
+        use crate::serve::api::schema::ChatMessage;
+        use crate::serve::header::LoadProgress;
+        use crate::serve::multi_seq_kv::SlotId;
+        use mlx_native::gguf::GgufFile;
+
+        let gguf = GgufFile::open(&path).expect("open Qwen3.8 route GGUF");
+        assert_eq!(
+            gguf.metadata_u32("general.file_type"),
+            Some(17),
+            "repeated route gate requires the qualified Qwen3.8 Q5_K_M artifact"
+        );
+        let template = gguf
+            .metadata_string("tokenizer.chat_template")
+            .expect("Qwen3.8 route artifact must embed its chat template");
+        let messages: Vec<ChatMessage> = serde_json::from_value(serde_json::json!([
+            {
+                "role": "system",
+                "content": "You are a deterministic streaming scheduler probe. Do not call tools."
+            },
+            {
+                "role": "user",
+                "content": "Trial 2. Begin with STREAM_BEGIN. Write a long numbered list of concise Rust scheduler invariants, one per line, and continue until the token limit. Do not stop early."
+            }
+        ]))
+        .expect("parse exact route messages");
+        let template_kwargs = serde_json::json!({
+            "enable_thinking": false,
+            "preserve_thinking": true
+        });
+        let rendered = crate::serve::api::engine::render_chat_prompt_with_tools_generation_prompt(
+            template,
+            &messages,
+            None,
+            false,
+            template_kwargs.as_object(),
+            true,
+        )
+        .expect("render exact Qwen3.8 route prompt");
+        let stable_rendered =
+            crate::serve::api::engine::render_chat_prompt_with_tools_generation_prompt(
+                template,
+                &messages,
+                None,
+                false,
+                template_kwargs.as_object(),
+                false,
+            )
+            .expect("render exact Qwen3.8 stable prompt boundary");
+        let (tokenizer, _) =
+            crate::serve::api::engine_qwen35::build_qwen35_serving_tokenizer(&gguf)
+                .expect("build GGUF-driven Qwen3.8 tokenizer");
+        let prompt_tokens: Vec<u32> = tokenizer
+            .encode(rendered, false)
+            .expect("tokenize exact Qwen3.8 route prompt")
+            .get_ids()
+            .to_vec();
+        let stable_tokens: Vec<u32> = tokenizer
+            .encode(stable_rendered, false)
+            .expect("tokenize exact Qwen3.8 stable prompt boundary")
+            .get_ids()
+            .to_vec();
+        assert_eq!(
+            prompt_tokens.len(),
+            67,
+            "route diagnostic must retain the exact server prompt"
+        );
+        assert_eq!(
+            stable_tokens.len(),
+            60,
+            "route diagnostic must retain the exact stable boundary"
+        );
+        assert!(
+            prompt_tokens.starts_with(&stable_tokens),
+            "stable prompt must be a strict token prefix"
+        );
+
+        let mut progress = LoadProgress::new(false, 1, 0);
+        let model =
+            Qwen35Model::load_from_gguf(&gguf, &mut progress).expect("load Qwen3.8 route model");
+        assert_eq!(model.cfg.head_dim, 256, "Qwen3.8 route requires D=256");
+        assert!(
+            model.ggml_routing_policy.dense_decode_mvn,
+            "production Qwen route must retain exact-tree multi-row matvec"
+        );
+        assert!(
+            !model.ggml_routing_policy.dense_decode_mv_ext,
+            "production Qwen route must reject non-bit-exact mul_mv_ext"
+        );
+        assert_eq!(
+            model.ggml_routing_policy.dense_q5k_canonical_q4x4, expect_canonical_q5,
+            "Qwen model must freeze the requested Q5_K arithmetic authority"
+        );
+        model
+            .ensure_gpu_cache_primed()
+            .expect("prime Qwen3.8 route GPU cache");
+
+        const COMPLETION_TOKENS: usize = 512;
+        const VERIFY_ROWS: usize = 4;
+        let capacity = u32::try_from(prompt_tokens.len() + COMPLETION_TOKENS + VERIFY_ROWS)
+            .expect("Qwen3.8 route capacity fits u32");
+        let mut scalar_cache = model
+            .with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(&model.cfg, device, capacity, 1, true)
+            })
+            .expect("allocate scalar route cache");
+        let mut verifier_cache = model
+            .with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(&model.cfg, device, capacity, 1, true)
+            })
+            .expect("allocate verifier route cache");
+        let (prefix_tokens, suffix_tokens) = prompt_tokens.split_at(60);
+        let prefix_positions = positions_for_range(0, prefix_tokens.len());
+        let suffix_positions = positions_for_range(60, suffix_tokens.len());
+        let scalar_prefill = model
+            .forward_gpu_stable_boundary_compound(
+                prefix_tokens,
+                &prefix_positions,
+                suffix_tokens,
+                &suffix_positions,
+                None,
+                true,
+                &mut scalar_cache,
+                SlotId(0),
+            )
+            .expect("scalar route prefill");
+        let verifier_prefill = model
+            .forward_gpu_stable_boundary_compound(
+                prefix_tokens,
+                &prefix_positions,
+                suffix_tokens,
+                &suffix_positions,
+                None,
+                true,
+                &mut verifier_cache,
+                SlotId(0),
+            )
+            .expect("verifier route prefill");
+        scalar_cache
+            .validate_speculative_cursors_for_slot(SlotId(0), prompt_tokens.len())
+            .expect("scalar compound target/MTP cursors");
+        verifier_cache
+            .validate_speculative_cursors_for_slot(SlotId(0), prompt_tokens.len())
+            .expect("verifier compound target/MTP cursors");
+        let (scalar_snapshot, verifier_snapshot) = model
+            .with_gpu_cache_mut(|device, _registry| {
+                Ok((
+                    scalar_cache.snapshot_prefix(device, prompt_tokens.len())?,
+                    verifier_cache.snapshot_prefix(device, prompt_tokens.len())?,
+                ))
+            })
+            .expect("snapshot independent compound prefills");
+        let assert_bytes = |label: &str, scalar: &MlxBuffer, verifier: &MlxBuffer| {
+            assert_eq!(
+                scalar.as_slice::<u8>().expect("scalar snapshot bytes"),
+                verifier.as_slice::<u8>().expect("verifier snapshot bytes"),
+                "independent compound {label} bytes"
+            );
+        };
+        assert_eq!(
+            scalar_snapshot.full_attn_current_len, verifier_snapshot.full_attn_current_len,
+            "independent compound full-attention cursors"
+        );
+        for layer in 0..scalar_snapshot.full_attn_tq.len() {
+            match (
+                scalar_snapshot.full_attn_tq[layer].as_ref(),
+                verifier_snapshot.full_attn_tq[layer].as_ref(),
+            ) {
+                (Some(scalar), Some(verifier)) => {
+                    assert_bytes(
+                        &format!("full_attn[{layer}].tq.k_packed"),
+                        &scalar.k_packed,
+                        &verifier.k_packed,
+                    );
+                    assert_bytes(
+                        &format!("full_attn[{layer}].tq.k_norms"),
+                        &scalar.k_norms,
+                        &verifier.k_norms,
+                    );
+                    assert_bytes(
+                        &format!("full_attn[{layer}].tq.v_packed"),
+                        &scalar.v_packed,
+                        &verifier.v_packed,
+                    );
+                    assert_bytes(
+                        &format!("full_attn[{layer}].tq.v_norms"),
+                        &scalar.v_norms,
+                        &verifier.v_norms,
+                    );
+                }
+                (None, None) => {}
+                _ => panic!("independent compound full_attn[{layer}] TQ presence"),
+            }
+        }
+        for layer in 0..scalar_snapshot.linear_conv.len() {
+            assert_bytes(
+                &format!("linear_attn[{layer}].conv"),
+                &scalar_snapshot.linear_conv[layer],
+                &verifier_snapshot.linear_conv[layer],
+            );
+            assert_bytes(
+                &format!("linear_attn[{layer}].recurrent"),
+                &scalar_snapshot.linear_recurrent[layer],
+                &verifier_snapshot.linear_recurrent[layer],
+            );
+        }
+        let scalar_mtp = scalar_snapshot.mtp.as_ref().expect("scalar MTP snapshot");
+        let verifier_mtp = verifier_snapshot
+            .mtp
+            .as_ref()
+            .expect("verifier MTP snapshot");
+        assert_eq!(
+            scalar_mtp.current_len, verifier_mtp.current_len,
+            "independent compound MTP cursors"
+        );
+        match (scalar_mtp.tq.as_ref(), verifier_mtp.tq.as_ref()) {
+            (Some(scalar), Some(verifier)) => {
+                for (label, scalar, verifier) in [
+                    ("k_packed", &scalar.k_packed, &verifier.k_packed),
+                    ("k_norms", &scalar.k_norms, &verifier.k_norms),
+                    ("v_packed", &scalar.v_packed, &verifier.v_packed),
+                    ("v_norms", &scalar.v_norms, &verifier.v_norms),
+                ] {
+                    assert_bytes(&format!("mtp.tq.{label}"), scalar, verifier);
+                }
+            }
+            (None, None) => {}
+            _ => panic!("independent compound MTP TQ presence"),
+        }
+        for (label, scalar, verifier) in [
+            (
+                "prefix",
+                scalar_prefill
+                    .prefix_pending_hidden
+                    .as_ref()
+                    .expect("scalar compound prefix pending row"),
+                verifier_prefill
+                    .prefix_pending_hidden
+                    .as_ref()
+                    .expect("verifier compound prefix pending row"),
+            ),
+            (
+                "suffix",
+                scalar_prefill
+                    .suffix_pending_hidden
+                    .as_ref()
+                    .expect("scalar compound suffix pending row"),
+                verifier_prefill
+                    .suffix_pending_hidden
+                    .as_ref()
+                    .expect("verifier compound suffix pending row"),
+            ),
+        ] {
+            assert_eq!(
+                scalar
+                    .as_slice::<f32>()
+                    .expect("scalar compound pending row"),
+                verifier
+                    .as_slice::<f32>()
+                    .expect("verifier compound pending row"),
+                "independent compound {label} pending rows must be byte-equivalent"
+            );
+        }
+        drop((scalar_snapshot, verifier_snapshot));
+        let mut pending_target_hidden = verifier_prefill
+            .suffix_pending_hidden
+            .as_ref()
+            .expect("verifier compound suffix pending row")
+            .clone();
+        let mut current = greedy_argmax_slice(&scalar_prefill.suffix_logits);
+        assert_eq!(
+            greedy_argmax_slice(&verifier_prefill.suffix_logits),
+            current,
+            "independent compound route prefills must agree"
+        );
+        mlx_native::reset_pipeline_dispatch_buckets();
+        let mut verifier_wall = Vec::with_capacity((COMPLETION_TOKENS - 1) / VERIFY_ROWS);
+
+        let vocab = model.cfg.vocab_size as usize;
+        let mut compared = 0usize;
+        // Prefill already selected completion token zero. The production K=3
+        // route therefore has 127 complete four-decision verifier rounds in a
+        // 512-token response; the final three decisions use ordinary warmup.
+        for round in 0..((COMPLETION_TOKENS - 1) / VERIFY_ROWS) {
+            let mut verifier_input = Vec::with_capacity(VERIFY_ROWS);
+            let mut scalar_choices = Vec::with_capacity(VERIFY_ROWS);
+            let mut input = current;
+            for row in 0..VERIFY_ROWS {
+                verifier_input.push(input);
+                let position = (prompt_tokens.len() + compared + row) as i32;
+                let choice = model
+                    .forward_gpu_greedy(
+                        &[input],
+                        &positions_for_range(position, 1),
+                        &mut scalar_cache,
+                        SlotId(0),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("scalar route round {round} row {row}: {error:#}")
+                    });
+                scalar_choices.push(choice);
+                input = choice;
+            }
+
+            model
+                .with_gpu_cache_mut(|device, _registry| {
+                    verifier_cache.ensure_la_capture(&model.cfg, device, VERIFY_ROWS as u32)
+                })
+                .unwrap_or_else(|error| panic!("verifier capture round {round}: {error:#}"));
+            let positions =
+                positions_for_range((prompt_tokens.len() + compared) as i32, VERIFY_ROWS);
+            let verifier_started = std::time::Instant::now();
+            let verified = model.forward_gpu_with_nextn_hidden_buffer(
+                &verifier_input,
+                &positions,
+                &mut verifier_cache,
+                SlotId(0),
+            );
+            verifier_wall.push(verifier_started.elapsed());
+            verifier_cache.clear_la_capture();
+            let (verifier_logits, verifier_hidden) =
+                verified.unwrap_or_else(|error| panic!("verifier route round {round}: {error:#}"));
+            let shared_embed_rows = model
+                .embed_tokens_gpu(&verifier_input)
+                .unwrap_or_else(|error| panic!("verifier embeddings round {round}: {error:#}"));
+            let mtp = model.mtp.as_ref().expect("Qwen3.8 route MTP weights");
+            model
+                .with_gpu_cache_mut(|device, registry| {
+                    mtp.process_target_batch(
+                        &verifier_input,
+                        Some(&pending_target_hidden),
+                        &verifier_hidden,
+                        &shared_embed_rows,
+                        &mut verifier_cache,
+                        SlotId(0),
+                        &positions,
+                        device,
+                        registry,
+                        &model.cfg,
+                    )
+                })
+                .unwrap_or_else(|error| panic!("verifier MTP catch-up round {round}: {error:#}"));
+            pending_target_hidden = nth_hidden_row(
+                &verifier_hidden,
+                model.cfg.hidden_size,
+                (VERIFY_ROWS - 1) as u64,
+            )
+            .unwrap_or_else(|error| panic!("verifier pending row round {round}: {error:#}"));
+            let verifier_logits = verifier_logits
+                .as_slice::<f32>()
+                .expect("read repeated verifier logits");
+            let verifier_choices: Vec<u32> = verifier_logits
+                .chunks_exact(vocab)
+                .map(greedy_argmax_slice)
+                .collect();
+            if verifier_choices != scalar_choices {
+                let mismatch = verifier_choices
+                    .iter()
+                    .zip(&scalar_choices)
+                    .position(|(verifier, scalar)| verifier != scalar)
+                    .expect("different route choices have a mismatching row");
+                let row = &verifier_logits[mismatch * vocab..(mismatch + 1) * vocab];
+                let mut top = [(0u32, f32::NEG_INFINITY); 2];
+                for (token, &value) in row.iter().enumerate() {
+                    if value > top[0].1 {
+                        top[1] = top[0];
+                        top[0] = (token as u32, value);
+                    } else if value > top[1].1 {
+                        top[1] = (token as u32, value);
+                    }
+                }
+                panic!(
+                    "repeated verifier route diverged at round {round}, generated offset {}, row {mismatch}, inputs={verifier_input:?}, scalar={}, verifier={}, verifier_top1={:?}, verifier_top2={:?}, verifier_margin={}",
+                    compared + mismatch,
+                    scalar_choices[mismatch],
+                    verifier_choices[mismatch],
+                    top[0],
+                    top[1],
+                    top[0].1 - top[1].1,
+                );
+            }
+
+            compared += VERIFY_ROWS;
+            current = *scalar_choices.last().expect("four scalar choices");
+            let expected_len = prompt_tokens.len() + compared;
+            scalar_cache
+                .validate_sequence_len_for_slot(SlotId(0), expected_len)
+                .expect("scalar route cursor");
+            verifier_cache
+                .validate_speculative_cursors_for_slot(SlotId(0), expected_len)
+                .expect("verifier target/MTP route cursors");
+        }
+        let route_buckets = mlx_native::pipeline_dispatch_buckets();
+        let expected_q5_route = if expect_canonical_q5 {
+            "kernel_mul_mv_ext_q5_K_f32_r1_4"
+        } else {
+            "kernel_mul_mv_q5_K_f32_mN_r1_4"
+        };
+        assert!(
+            route_buckets
+                .iter()
+                .any(|(label, count)| *count > 0 && label.starts_with(expected_q5_route)),
+            "repeated verifier never executed the selected Q5_K r1=4 kernel: {route_buckets:?}"
+        );
+        assert!(
+            route_buckets
+                .iter()
+                .all(|(label, _)| { !label.starts_with("kernel_fused_gate_up_silu_q5_K_f32") }),
+            "repeated verifier used the rejected fused Q5_K FFN route: {route_buckets:?}"
+        );
+        eprintln!("[QWEN38_Q5_ROUTE] qtype=Q5_K kernel={expected_q5_route}");
+        verifier_wall.sort_unstable();
+        let verifier_total_ms: f64 = verifier_wall
+            .iter()
+            .map(std::time::Duration::as_secs_f64)
+            .sum::<f64>()
+            * 1_000.0;
+        let verifier_median_ms = verifier_wall[verifier_wall.len() / 2].as_secs_f64() * 1_000.0;
+        eprintln!(
+            "[QWEN38_Q5_VERIFIER_WALL] rounds={} total_ms={verifier_total_ms:.3} median_ms={verifier_median_ms:.3}",
+            verifier_wall.len()
+        );
+        eprintln!(
+            "qwen38_repeated_four_row_route_receipt prompt_tokens={} compared_tokens={compared}",
+            prompt_tokens.len()
+        );
+    }
+
+    /// Same-process, order-balanced verifier timing for the Q5_K arithmetic
+    /// authority. Both models consume identical token batches at identical
+    /// positions; only the frozen Q5_K dense route differs.
+    #[test]
+    #[ignore = "requires an explicit full Qwen3.8 Q5_K_M GGUF and Apple Metal"]
+    fn qwen38_real_q5_canonical_verifier_paired_wall() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let path = std::env::var_os("HF2Q_TEST_QWEN38_GGUF")
+            .map(std::path::PathBuf::from)
+            .expect("paired Q5 verifier gate requires HF2Q_TEST_QWEN38_GGUF");
+
+        use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+        use crate::inference::models::qwen35::model::Qwen35Model;
+        use crate::serve::header::LoadProgress;
+        use crate::serve::multi_seq_kv::SlotId;
+        use mlx_native::gguf::GgufFile;
+
+        let gguf = GgufFile::open(&path).expect("open paired Q5 verifier GGUF");
+        assert_eq!(
+            gguf.metadata_u32("general.file_type"),
+            Some(17),
+            "paired verifier gate requires Q5_K_M"
+        );
+        let mut control_policy = mlx_native::ggml_routing_policy_from_environment();
+        control_policy.dense_q5k_canonical_q4x4 = false;
+        control_policy.dense_decode_mvn = true;
+        control_policy.dense_decode_mv_ext = false;
+        let mut candidate_policy = control_policy;
+        candidate_policy.dense_q5k_canonical_q4x4 = true;
+
+        let mut control_progress = LoadProgress::new(false, 1, 0);
+        let control = Qwen35Model::load_from_gguf_with_routing_policy(
+            &gguf,
+            &mut control_progress,
+            control_policy,
+        )
+        .expect("load control Q5 model");
+        let mut candidate_progress = LoadProgress::new(false, 1, 0);
+        let candidate = Qwen35Model::load_from_gguf_with_routing_policy(
+            &gguf,
+            &mut candidate_progress,
+            candidate_policy,
+        )
+        .expect("load candidate Q5 model");
+        control
+            .ensure_gpu_cache_primed()
+            .expect("prime control Q5 model");
+        candidate
+            .ensure_gpu_cache_primed()
+            .expect("prime candidate Q5 model");
+
+        const PROMPT_TOKENS: usize = 67;
+        const VERIFY_ROWS: usize = 4;
+        const WARMUP_ROUNDS: usize = 4;
+        const TIMED_ROUNDS: usize = 64;
+        let prompt: Vec<u32> = (0..PROMPT_TOKENS)
+            .map(|index| 1_000 + index as u32)
+            .collect();
+        let capacity = (PROMPT_TOKENS + VERIFY_ROWS * (WARMUP_ROUNDS + TIMED_ROUNDS)) as u32;
+        let mut control_cache = control
+            .with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(&control.cfg, device, capacity, 1, true)
+            })
+            .expect("allocate control verifier cache");
+        let mut candidate_cache = candidate
+            .with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(&candidate.cfg, device, capacity, 1, true)
+            })
+            .expect("allocate candidate verifier cache");
+        let (prefix, suffix) = prompt.split_at(60);
+        for (label, model, cache) in [
+            ("control", &control, &mut control_cache),
+            ("candidate", &candidate, &mut candidate_cache),
+        ] {
+            model
+                .forward_gpu_stable_boundary_compound(
+                    prefix,
+                    &positions_for_range(0, prefix.len()),
+                    suffix,
+                    &positions_for_range(prefix.len() as i32, suffix.len()),
+                    None,
+                    true,
+                    cache,
+                    SlotId(0),
+                )
+                .unwrap_or_else(|error| panic!("prefill {label} verifier cache: {error:#}"));
+        }
+
+        let run_verify =
+            |model: &Qwen35Model, cache: &mut HybridKvCache, input: &[u32], positions: &[i32]| {
+                model
+                    .with_gpu_cache_mut(|device, _registry| {
+                        cache.ensure_la_capture(&model.cfg, device, VERIFY_ROWS as u32)
+                    })
+                    .expect("ensure paired verifier capture");
+                let started = std::time::Instant::now();
+                let result =
+                    model.forward_gpu_with_nextn_hidden_buffer(input, positions, cache, SlotId(0));
+                let elapsed = started.elapsed();
+                cache.clear_la_capture();
+                result.expect("paired verifier forward");
+                elapsed
+            };
+
+        mlx_native::reset_pipeline_dispatch_buckets();
+        let mut control_wall = Vec::with_capacity(TIMED_ROUNDS);
+        let mut candidate_wall = Vec::with_capacity(TIMED_ROUNDS);
+        for round in 0..(WARMUP_ROUNDS + TIMED_ROUNDS) {
+            let input: Vec<u32> = (0..VERIFY_ROWS)
+                .map(|row| 5_000 + ((round * VERIFY_ROWS + row) % 1_024) as u32)
+                .collect();
+            let positions =
+                positions_for_range((PROMPT_TOKENS + round * VERIFY_ROWS) as i32, VERIFY_ROWS);
+            let (control_elapsed, candidate_elapsed) = if round % 2 == 0 {
+                (
+                    run_verify(&control, &mut control_cache, &input, &positions),
+                    run_verify(&candidate, &mut candidate_cache, &input, &positions),
+                )
+            } else {
+                let candidate_elapsed =
+                    run_verify(&candidate, &mut candidate_cache, &input, &positions);
+                let control_elapsed = run_verify(&control, &mut control_cache, &input, &positions);
+                (control_elapsed, candidate_elapsed)
+            };
+            if round >= WARMUP_ROUNDS {
+                control_wall.push(control_elapsed);
+                candidate_wall.push(candidate_elapsed);
+            }
+        }
+
+        let expected_len = PROMPT_TOKENS + VERIFY_ROWS * (WARMUP_ROUNDS + TIMED_ROUNDS);
+        control_cache
+            .validate_sequence_len_for_slot(SlotId(0), expected_len)
+            .expect("control paired verifier cursor");
+        candidate_cache
+            .validate_sequence_len_for_slot(SlotId(0), expected_len)
+            .expect("candidate paired verifier cursor");
+        let buckets = mlx_native::pipeline_dispatch_buckets();
+        for kernel in [
+            "kernel_mul_mv_q5_K_f32_mN_r1_4",
+            "kernel_mul_mv_ext_q5_K_f32_r1_4",
+        ] {
+            assert!(
+                buckets
+                    .iter()
+                    .any(|(label, count)| *count > 0 && label.starts_with(kernel)),
+                "paired verifier did not execute {kernel}: {buckets:?}"
+            );
+        }
+
+        control_wall.sort_unstable();
+        candidate_wall.sort_unstable();
+        let total_ms = |samples: &[std::time::Duration]| {
+            samples
+                .iter()
+                .map(std::time::Duration::as_secs_f64)
+                .sum::<f64>()
+                * 1_000.0
+        };
+        let control_total_ms = total_ms(&control_wall);
+        let candidate_total_ms = total_ms(&candidate_wall);
+        let control_median_ms = control_wall[control_wall.len() / 2].as_secs_f64() * 1_000.0;
+        let candidate_median_ms = candidate_wall[candidate_wall.len() / 2].as_secs_f64() * 1_000.0;
+        let improvement_percent =
+            (control_total_ms - candidate_total_ms) * 100.0 / control_total_ms;
+        eprintln!(
+            "[QWEN38_Q5_PAIRED_VERIFIER] rounds={TIMED_ROUNDS} control_total_ms={control_total_ms:.3} candidate_total_ms={candidate_total_ms:.3} control_median_ms={control_median_ms:.3} candidate_median_ms={candidate_median_ms:.3} improvement_percent={improvement_percent:.3}"
+        );
+        assert!(
+            improvement_percent >= 5.0,
+            "canonical Q5_K verifier improvement {improvement_percent:.3}% is below 5%"
+        );
+    }
+
+    /// Teacher-forced fixed-corpus quality comparison between the former Q5_K
+    /// scalar authority and the width-invariant q4x4 authority.
+    #[test]
+    #[ignore = "requires an explicit full Qwen3.8 Q5_K_M GGUF and Apple Metal"]
+    fn qwen38_real_q5_canonical_fixed_corpus_quality() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let path = std::env::var_os("HF2Q_TEST_QWEN38_GGUF")
+            .map(std::path::PathBuf::from)
+            .expect("Q5 quality gate requires HF2Q_TEST_QWEN38_GGUF");
+
+        use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+        use crate::inference::models::qwen35::model::Qwen35Model;
+        use crate::serve::header::LoadProgress;
+        use crate::serve::multi_seq_kv::SlotId;
+        use mlx_native::gguf::GgufFile;
+
+        let gguf = GgufFile::open(&path).expect("open Q5 quality GGUF");
+        assert_eq!(gguf.metadata_u32("general.file_type"), Some(17));
+        let tokenizer = crate::serve::api::engine_qwen35::build_qwen35_serving_tokenizer(&gguf)
+            .expect("build Qwen3.8 quality tokenizer")
+            .0;
+        let encoded = tokenizer
+            .encode(
+                include_str!("../../../../scripts/fixtures/deepseek4-agentic-repo-context.txt"),
+                false,
+            )
+            .expect("tokenize fixed agentic corpus");
+        const CORPUS_TOKENS: usize = 160;
+        const PREFIX_TOKENS: usize = 20;
+        assert!(encoded.len() >= CORPUS_TOKENS);
+        let corpus = &encoded.get_ids()[..CORPUS_TOKENS];
+
+        let mut control_policy = mlx_native::ggml_routing_policy_from_environment();
+        control_policy.dense_q5k_canonical_q4x4 = false;
+        control_policy.dense_decode_mvn = true;
+        control_policy.dense_decode_mv_ext = false;
+        let mut candidate_policy = control_policy;
+        candidate_policy.dense_q5k_canonical_q4x4 = true;
+        let mut control_progress = LoadProgress::new(false, 1, 0);
+        let control = Qwen35Model::load_from_gguf_with_routing_policy(
+            &gguf,
+            &mut control_progress,
+            control_policy,
+        )
+        .expect("load control Q5 quality model");
+        let mut candidate_progress = LoadProgress::new(false, 1, 0);
+        let candidate = Qwen35Model::load_from_gguf_with_routing_policy(
+            &gguf,
+            &mut candidate_progress,
+            candidate_policy,
+        )
+        .expect("load candidate Q5 quality model");
+        control.ensure_gpu_cache_primed().expect("prime control");
+        candidate
+            .ensure_gpu_cache_primed()
+            .expect("prime candidate");
+        let mut control_cache = control
+            .with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(&control.cfg, device, CORPUS_TOKENS as u32, 1, true)
+            })
+            .expect("allocate control quality cache");
+        let mut candidate_cache = candidate
+            .with_gpu_cache_mut(|device, _registry| {
+                HybridKvCache::new_with_options(
+                    &candidate.cfg,
+                    device,
+                    CORPUS_TOKENS as u32,
+                    1,
+                    true,
+                )
+            })
+            .expect("allocate candidate quality cache");
+        let prefix_positions = positions_for_range(0, PREFIX_TOKENS);
+        control
+            .forward_gpu_with_nextn_hidden(
+                &corpus[..PREFIX_TOKENS],
+                &prefix_positions,
+                &mut control_cache,
+                SlotId(0),
+            )
+            .expect("control quality prefill");
+        candidate
+            .forward_gpu_with_nextn_hidden(
+                &corpus[..PREFIX_TOKENS],
+                &prefix_positions,
+                &mut candidate_cache,
+                SlotId(0),
+            )
+            .expect("candidate quality prefill");
+
+        let row_nll = |row: &[f32], target: u32| {
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let log_sum = row
+                .iter()
+                .map(|value| f64::from(*value - max).exp())
+                .sum::<f64>()
+                .ln()
+                + f64::from(max);
+            log_sum - f64::from(row[target as usize])
+        };
+        let mut control_nll = 0.0f64;
+        let mut candidate_nll = 0.0f64;
+        let mut argmax_agree = 0usize;
+        let mut samples = 0usize;
+        for index in PREFIX_TOKENS..CORPUS_TOKENS - 1 {
+            let input = [corpus[index]];
+            let positions = positions_for_range(index as i32, 1);
+            let (control_logits, candidate_logits) = if index % 2 == 0 {
+                let control_logits = control
+                    .forward_gpu_with_nextn_hidden(
+                        &input,
+                        &positions,
+                        &mut control_cache,
+                        SlotId(0),
+                    )
+                    .expect("control quality step")
+                    .0;
+                let candidate_logits = candidate
+                    .forward_gpu_with_nextn_hidden(
+                        &input,
+                        &positions,
+                        &mut candidate_cache,
+                        SlotId(0),
+                    )
+                    .expect("candidate quality step")
+                    .0;
+                (control_logits, candidate_logits)
+            } else {
+                let candidate_logits = candidate
+                    .forward_gpu_with_nextn_hidden(
+                        &input,
+                        &positions,
+                        &mut candidate_cache,
+                        SlotId(0),
+                    )
+                    .expect("candidate quality step")
+                    .0;
+                let control_logits = control
+                    .forward_gpu_with_nextn_hidden(
+                        &input,
+                        &positions,
+                        &mut control_cache,
+                        SlotId(0),
+                    )
+                    .expect("control quality step")
+                    .0;
+                (control_logits, candidate_logits)
+            };
+            let control_row = last_logits(&control_logits, control.cfg.vocab_size)
+                .expect("control quality logits row");
+            let candidate_row = last_logits(&candidate_logits, candidate.cfg.vocab_size)
+                .expect("candidate quality logits row");
+            let target = corpus[index + 1];
+            control_nll += row_nll(control_row, target);
+            candidate_nll += row_nll(candidate_row, target);
+            argmax_agree +=
+                usize::from(greedy_argmax_slice(control_row) == greedy_argmax_slice(candidate_row));
+            samples += 1;
+        }
+        let control_ppl = (control_nll / samples as f64).exp();
+        let candidate_ppl = (candidate_nll / samples as f64).exp();
+        let ppl_delta_percent = (candidate_ppl - control_ppl) * 100.0 / control_ppl;
+        let argmax_agreement = argmax_agree as f64 / samples as f64;
+        eprintln!(
+            "[QWEN38_Q5_FIXED_CORPUS] samples={samples} control_ppl={control_ppl:.6} candidate_ppl={candidate_ppl:.6} ppl_delta_percent={ppl_delta_percent:.6} argmax_agreement={argmax_agreement:.6}"
+        );
+        assert!(
+            ppl_delta_percent <= 0.5,
+            "candidate PPL regression {ppl_delta_percent:.6}% exceeds 0.5%"
+        );
+        assert!(
+            argmax_agreement >= 0.99,
+            "candidate/control argmax agreement {argmax_agreement:.6} is below 0.99"
+        );
     }
 
     #[test]
@@ -2139,6 +3210,44 @@ mod tests {
             .expect("alloc misaligned");
         let err = last_hidden_row(&buf, 4).expect_err("misaligned must error");
         assert!(err.to_string().contains("not a positive multiple"));
+    }
+
+    #[test]
+    fn hidden_row_slicing_rejects_wrong_dtype_and_logical_extent() {
+        let device = MlxDevice::new().expect("MlxDevice for row contract test");
+        let h = 4usize;
+        let bf16 = device
+            .alloc_buffer(2 * h * 2, DType::BF16, vec![2, h])
+            .expect("alloc BF16 row fixture");
+        let dtype_error = last_hidden_row(&bf16, h as u32)
+            .expect_err("BF16 must not be interpreted with an F32 row stride");
+        assert!(dtype_error.to_string().contains("requires F32 storage"));
+
+        let oversized = device
+            .alloc_buffer((2 * h + 1) * 4, DType::F32, vec![2, h])
+            .expect("alloc oversized logical fixture");
+        let extent_error = last_hidden_row(&oversized, h as u32)
+            .expect_err("shape-compatible buffer with extra logical bytes must fail closed");
+        assert!(extent_error.to_string().contains("expected exact F32"));
+    }
+
+    #[test]
+    fn nth_hidden_row_preserves_nonzero_parent_offset_at_every_position() {
+        let device = MlxDevice::new().expect("MlxDevice for nested row view test");
+        let h = 4usize;
+        let parent = device
+            .alloc_buffer(5 * h * 4, DType::F32, vec![5, h])
+            .expect("alloc parent rows");
+        let nested = parent.slice_view((h * 4) as u64, 3 * h);
+        for row in 0..3u64 {
+            let selected = nth_hidden_row(&nested, h as u32, row).expect("select nested row");
+            assert_eq!(
+                selected.byte_offset(),
+                ((1 + row as usize) * h * 4) as u64,
+                "nested first/middle/last row must compose its parent offset"
+            );
+            assert_eq!(selected.data_byte_len(), h * 4);
+        }
     }
 
     #[test]

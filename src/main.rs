@@ -228,10 +228,25 @@ fn run(cli: Cli) -> Result<(), AppError> {
     let log_format = cli.log_format;
     let state_root = cli.state_root;
     match cli.command {
+        Command::BuildInfo => {
+            let git_commit = convert::receipt::require_converter_git_commit()
+                .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+            let build_info = serde_json::json!({
+                "schema": "hf2q.build-info.v1",
+                "version": env!("CARGO_PKG_VERSION"),
+                "git_commit": git_commit,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&build_info).expect("serialize static build provenance")
+            );
+            Ok(())
+        }
         Command::StandaloneInstall(args) => cmd_standalone_install(args),
         Command::FetchHubGguf(args) => cmd_fetch_hub_gguf(args),
         Command::CatalogHubGguf(args) => cmd_catalog_hub_gguf(args),
         Command::VerifyLocalGguf(args) => cmd_verify_local_gguf(args),
+        Command::RecordModelVerification(args) => cmd_record_model_verification(args),
         Command::Update(args) => cmd_update(args),
         Command::Uninstall(args) => cmd_uninstall(args, state_root.as_deref()),
         Command::Setup(args) => setup::run(args, state_root.as_deref()).map_err(|error| {
@@ -314,19 +329,34 @@ fn run(cli: Cli) -> Result<(), AppError> {
 }
 
 fn cmd_fetch_hub_gguf(args: cli::FetchHubGgufArgs) -> Result<(), AppError> {
+    let companion = args.companion;
+    let (quant_hint, role, selectable, unavailable_reason) = if companion {
+        (
+            None,
+            "companion".to_owned(),
+            false,
+            Some("vision projector companion; not a text model".to_owned()),
+        )
+    } else {
+        (Some(args.quant), "text_model".to_owned(), true, None)
+    };
     let artifact = input::hf_download::HubGgufArtifact {
         repository: args.repository,
         revision: args.revision,
         filename: args.artifact,
         bytes: args.bytes,
         sha256: args.sha256,
-        quant_hint: Some(args.quant),
-        role: "text_model".to_owned(),
-        selectable: true,
-        unavailable_reason: None,
+        quant_hint,
+        role,
+        selectable,
+        unavailable_reason,
     };
-    let path = input::hf_download::download_hub_gguf(&artifact)
-        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+    let path = if companion {
+        input::hf_download::download_hub_gguf_companion(&artifact)
+    } else {
+        input::hf_download::download_hub_gguf(&artifact)
+    }
+    .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
     println!("{}", path.display());
     Ok(())
 }
@@ -355,6 +385,16 @@ fn cmd_verify_local_gguf(args: cli::VerifyLocalGgufArgs) -> Result<(), AppError>
         },
     )
     .map_err(AppError::Input)?;
+    serde_json::to_writer(std::io::stdout().lock(), &receipt)
+        .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
+    println!();
+    Ok(())
+}
+
+fn cmd_record_model_verification(args: cli::RecordModelVerificationArgs) -> Result<(), AppError> {
+    let receipt =
+        serve::model_identity_receipt::record_model_verification(&args.artifact, &args.sha256)
+            .map_err(AppError::Input)?;
     serde_json::to_writer(std::io::stdout().lock(), &receipt)
         .map_err(|error| AppError::Conversion(anyhow::Error::from(error)))?;
     println!();

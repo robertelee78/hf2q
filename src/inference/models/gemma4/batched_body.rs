@@ -314,8 +314,9 @@ pub(crate) mod catsplit {
 /// fill the ~8.3ms/step GPU-idle window (wall 35.9 − GPU-busy 27.6). The
 /// existing catsplit/GPU_BUSY timers only see GPU exec time; these capture where
 /// the host blocks/works between the two per-step `commit_and_wait` syncs:
-/// the two GPU waits, the two host readbacks (`to_vec`), the Pass-2 sample loop,
-/// and the pre-forward gather/mount-clear. OFF by default (zero overhead).
+/// the GPU waits, body-hidden readback when head fusion is unavailable, the
+/// logits-only head readback, the Pass-2 sample loop, and the pre-forward
+/// gather/mount-clear. OFF by default (zero overhead).
 pub(crate) mod host_phases {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -324,12 +325,12 @@ pub(crate) mod host_phases {
         BodyWait = 0,          // commit_and_wait on the 30-layer body (host idle on GPU)
         BodyReadback = 1,      // hidden [N,hidden] GPU->host to_vec
         LmheadWait = 2,        // commit_and_wait on lm_head (host idle on GPU)
-        LmheadReadback = 3,    // logits+normed [N,vocab] GPU->host to_vec
+        LmheadReadback = 3,    // logits [N,vocab] GPU->host to_vec
         SampleLoop = 4,        // Pass-2 host: 8x argmax + finalize + detok + scheduler
         GatherMisc = 5,        // pre-forward mount-clear + per-slot token/pos gather
         SchedStep = 6,         // scheduler.step() (worker loop, outside decode_batch)
         Publish = 7,           // publish(scheduler stats) mutex (worker loop)
-        ArgmaxFinalize = 8,    // 8x argmax_f32 + finalize_token_from_logits (critical path)
+        ArgmaxFinalize = 8,    // per-row first-max argmax (critical path)
         DecodeTick = 9, // 8x decode_tick_finalize (detok + EOS + stop + emit + sched-advance)
         DecodeBatchTotal = 10, // whole decode_batch_gemma4 call (setup+gather+body+head+sample)
         WorkerIter = 11, // whole worker-loop iteration (admit+sched.step+decode+publish)
@@ -437,9 +438,9 @@ fn cat_boundary<'a>(
 ///
 /// `dispatch_qmatmul` routes a QUANTIZED weight to `kernel_mul_mv` (per-row
 /// bit-identical to m=1) only while `m <= MM_ROUTING_THRESHOLD`; above it, and
-/// for F32 (router `ffn_gate_inp`) / F16 (`ffn_down`, intermediate=2112) weights
-/// at ANY m>1, it routes to a TILE kernel (`mul_mm` / `dense_matmul_*_tensor` /
-/// `mm_v2_f16`) whose reduction order differs from the m=1 matvec the serial
+/// for dense F32/F16/BF16 weights at ANY m>1, it routes to a TILE kernel
+/// (`mul_mm` / `dense_matmul_*_tensor` / `mm_v2_f16`) whose reduction order
+/// differs from the m=1 matvec the serial
 /// slot-aware reference uses. That tile path is mathematically equal but NOT
 /// byte-identical, so a batched body that used it would diverge from N serial
 /// decodes (the slot_aware_n4 bar). Batch only when the m=N path is the SAME
@@ -447,7 +448,7 @@ fn cat_boundary<'a>(
 /// these are the minority dense projections; the dominant MoE experts batch
 /// bit-identically via `quantized_matmul_id_ggml`).
 #[allow(clippy::too_many_arguments)]
-fn dispatch_dense_rowident(
+pub(super) fn dispatch_dense_rowident(
     session: &mut GraphSession<'_>,
     reg: &mut KernelRegistry,
     dev: &MlxDevice,
@@ -457,8 +458,7 @@ fn dispatch_dense_rowident(
     n: usize,
     in_stride: usize,
     out_stride: usize,
-    tag: &'static str,
-    layer_idx: usize,
+    hint: ImatrixHint<'_>,
 ) -> Result<()> {
     use mlx_native::GgmlType;
     // Measured (ADR-040 M4, 2026-06-24): for F32/F16 weights at decode N≤8 the
@@ -466,22 +466,13 @@ fn dispatch_dense_rowident(
     // tok/s @ N=4) — the 8×8 SIMD tile wastes most rows at small m, while the
     // m=1 matvec is bandwidth-optimal. So the byte-identical per-row loop is also
     // the throughput-optimal choice; no batched F16/F32 matvec kernel is needed.
-    let batched_rowident = !matches!(weight.info.ggml_dtype, GgmlType::F32 | GgmlType::F16)
-        && (n as u32) <= mlx_native::ops::quantized_matmul_ggml::MM_ROUTING_THRESHOLD;
+    let batched_rowident = !matches!(
+        weight.info.ggml_dtype,
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+    ) && (n as u32)
+        <= mlx_native::ops::quantized_matmul_ggml::MM_ROUTING_THRESHOLD;
     if batched_rowident {
-        dispatch_qmatmul(
-            session,
-            reg,
-            dev,
-            input,
-            weight,
-            output,
-            n as u32,
-            ImatrixHint::Layered {
-                tag,
-                layer: layer_idx,
-            },
-        )
+        dispatch_qmatmul(session, reg, dev, input, weight, output, n as u32, hint)
     } else {
         // Measured (ADR-040 M4): amortizing the F16/F32 weight read across rows
         // (dispatch row 0 only) was throughput-NEUTRAL (152.3 vs 151.8 @ N=4) —
@@ -490,19 +481,7 @@ fn dispatch_dense_rowident(
         for i in 0..n {
             let in_i = input.slice_view(row_off(in_stride, i), in_stride);
             let out_i = output.slice_view(row_off(out_stride, i), out_stride);
-            dispatch_qmatmul(
-                session,
-                reg,
-                dev,
-                &in_i,
-                weight,
-                &out_i,
-                1,
-                ImatrixHint::Layered {
-                    tag,
-                    layer: layer_idx,
-                },
-            )?;
+            dispatch_qmatmul(session, reg, dev, &in_i, weight, &out_i, 1, hint)?;
         }
         Ok(())
     }
@@ -595,8 +574,10 @@ impl MlxModelWeights {
             n,
             hs,
             q_stride,
-            "attn_q",
-            layer_idx,
+            ImatrixHint::Layered {
+                tag: "attn_q",
+                layer: layer_idx,
+            },
         )?;
         cat_boundary(session, exec, catsplit::Cat::DenseQ)?;
         dispatch_dense_rowident(
@@ -609,8 +590,10 @@ impl MlxModelWeights {
             n,
             hs,
             k_stride,
-            "attn_k",
-            layer_idx,
+            ImatrixHint::Layered {
+                tag: "attn_k",
+                layer: layer_idx,
+            },
         )?;
         cat_boundary(session, exec, catsplit::Cat::DenseK)?;
         let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
@@ -625,8 +608,10 @@ impl MlxModelWeights {
                 n,
                 hs,
                 v_stride,
-                "attn_v",
-                layer_idx,
+                ImatrixHint::Layered {
+                    tag: "attn_v",
+                    layer: layer_idx,
+                },
             )?;
             cat_boundary(session, exec, catsplit::Cat::DenseV)?;
         }
@@ -1726,8 +1711,10 @@ impl MlxModelWeights {
             n,
             sdpa_stride,
             hs,
-            "attn_output",
-            layer_idx,
+            ImatrixHint::Layered {
+                tag: "attn_output",
+                layer: layer_idx,
+            },
         )?;
         cat_boundary(session, exec, catsplit::Cat::DenseO)?;
 
@@ -1809,8 +1796,10 @@ impl MlxModelWeights {
             n,
             hs,
             interm,
-            "ffn_gate",
-            layer_idx,
+            ImatrixHint::Layered {
+                tag: "ffn_gate",
+                layer: layer_idx,
+            },
         )?;
         dispatch_dense_rowident(
             session,
@@ -1822,8 +1811,10 @@ impl MlxModelWeights {
             n,
             hs,
             interm,
-            "ffn_up",
-            layer_idx,
+            ImatrixHint::Layered {
+                tag: "ffn_up",
+                layer: layer_idx,
+            },
         )?;
         // router_proj is F32 (ffn_gate_inp) → per-row m=1 (tile path not byte-identical).
         dispatch_dense_rowident(
@@ -1836,8 +1827,10 @@ impl MlxModelWeights {
             n,
             hs,
             num_experts,
-            "ffn_gate_inp",
-            layer_idx,
+            ImatrixHint::Layered {
+                tag: "ffn_gate_inp",
+                layer: layer_idx,
+            },
         )?;
         // catsplit: dense MLP gate + up + router projection.
         cat_boundary(session, exec, catsplit::Cat::DenseFfn)?;
@@ -1925,8 +1918,10 @@ impl MlxModelWeights {
             n,
             interm,
             hs,
-            "ffn_down",
-            layer_idx,
+            ImatrixHint::Layered {
+                tag: "ffn_down",
+                layer: layer_idx,
+            },
         )?;
         // catsplit: dense MLP down projection.
         cat_boundary(session, exec, catsplit::Cat::DenseFfn)?;
@@ -1948,10 +1943,10 @@ impl MlxModelWeights {
             .ok_or_else(|| {
                 anyhow::anyhow!("batched body requires fused _id MoE (stacked_down) L{layer_idx}")
             })?;
-        session.barrier_between(
-            &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
-            &[&bufs.moe_gate_up_id_out],
-        );
+        let (gate_up_affine, down_affine) = self.layers[layer_idx]
+            .moe
+            .affine_pair()?
+            .map_or((None, None), |(gate_up, down)| (Some(gate_up), Some(down)));
         let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
             n_tokens: nu,
             top_k: top_k as u32,
@@ -1970,17 +1965,44 @@ impl MlxModelWeights {
         // `mm_id` is a prefill optimization + a measured regression at N≤8, so
         // there is no decode-width cost. gate_up is mv at N≤4 anyway; pinning it
         // keeps the whole MoE byte-identical for any future N.
-        session
-            .quantized_matmul_id_ggml_mv(
-                reg,
-                dev,
-                &bufs.moe_norm_out,
-                stacked_gate_up,
-                &bufs.moe_expert_ids,
-                &bufs.moe_gate_up_id_out,
-                &gu_params,
-            )
-            .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
+        let native_activation_epoch = self.native_activation_epoch()?;
+        if !super::expert_dispatch::dispatch_native_scalar_expert(
+            session,
+            reg,
+            dev,
+            native_activation_epoch,
+            &bufs.moe_norm_out,
+            stacked_gate_up,
+            &bufs.moe_expert_ids,
+            &bufs.moe_gate_up_id_out,
+            gate_up_affine,
+            gu_params.ggml_type,
+            nu,
+            top_k as u32,
+            gu_params.n,
+            gu_params.k,
+            gu_params.n_experts,
+            gu_params.expert_stride,
+            mlx_native::DenseMatmulIdInputLayout::SharedPerToken,
+            super::expert_dispatch::DenseExpertScratchSlot::GateUp,
+            "Gemma batched gate/up",
+        )? {
+            session.barrier_between(
+                &[&bufs.moe_norm_out, &bufs.moe_expert_ids, stacked_gate_up],
+                &[&bufs.moe_gate_up_id_out],
+            );
+            session
+                .quantized_matmul_id_ggml_mv(
+                    reg,
+                    dev,
+                    &bufs.moe_norm_out,
+                    stacked_gate_up,
+                    &bufs.moe_expert_ids,
+                    &bufs.moe_gate_up_id_out,
+                    &gu_params,
+                )
+                .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
+        }
         // catsplit: MoE gate_up `_id` (per-token mv_id) — the big expert read.
         cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
 
@@ -2000,10 +2022,6 @@ impl MlxModelWeights {
         cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
 
         // -- down_id (BATCHED n_tokens=N*top_k) --
-        session.barrier_between(
-            &[&bufs.moe_swiglu_id_out, &bufs.moe_expert_ids, stacked_down],
-            &[&bufs.moe_down_id_out],
-        );
         let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
             n_tokens: (top_k * n) as u32,
             top_k: 1,
@@ -2015,17 +2033,43 @@ impl MlxModelWeights {
         };
         // ADR-040 Phase F `iter-F-moe-mvid`: per-token `mv_id` (byte-identical).
         // This is THE divergence site at N≥5 (`n_tokens = N*top_k > 32`).
-        session
-            .quantized_matmul_id_ggml_mv(
-                reg,
-                dev,
-                &bufs.moe_swiglu_id_out,
-                stacked_down,
-                &bufs.moe_expert_ids,
-                &bufs.moe_down_id_out,
-                &dn_params,
-            )
-            .map_err(|e| anyhow::anyhow!("batched down _id L{layer_idx}: {e}"))?;
+        if !super::expert_dispatch::dispatch_native_scalar_expert(
+            session,
+            reg,
+            dev,
+            native_activation_epoch,
+            &bufs.moe_swiglu_id_out,
+            stacked_down,
+            &bufs.moe_expert_ids,
+            &bufs.moe_down_id_out,
+            down_affine,
+            dn_params.ggml_type,
+            nu,
+            top_k as u32,
+            dn_params.n,
+            dn_params.k,
+            dn_params.n_experts,
+            dn_params.expert_stride,
+            mlx_native::DenseMatmulIdInputLayout::Slotted,
+            super::expert_dispatch::DenseExpertScratchSlot::Down,
+            "Gemma batched down",
+        )? {
+            session.barrier_between(
+                &[&bufs.moe_swiglu_id_out, &bufs.moe_expert_ids, stacked_down],
+                &[&bufs.moe_down_id_out],
+            );
+            session
+                .quantized_matmul_id_ggml_mv(
+                    reg,
+                    dev,
+                    &bufs.moe_swiglu_id_out,
+                    stacked_down,
+                    &bufs.moe_expert_ids,
+                    &bufs.moe_down_id_out,
+                    &dn_params,
+                )
+                .map_err(|e| anyhow::anyhow!("batched down _id L{layer_idx}: {e}"))?;
+        }
         // catsplit: MoE down `_id` (per-token mv_id) — the second big expert read.
         cat_boundary(session, exec, catsplit::Cat::MoeDown)?;
 
@@ -2244,10 +2288,8 @@ impl MlxModelWeights {
 
         let (exec, reg) = gpu.split();
         let dev = exec.device();
-        let metal_dev = dev.metal_device();
 
         let bufs = BatchedDecodeBuffers::new(dev, &self.activations, n)?;
-        let h_stride = bufs.hidden_stride();
 
         // Positions buffer [N] u32 for per-slot RoPE.
         let mut positions_buf = dev
@@ -2274,34 +2316,28 @@ impl MlxModelWeights {
                 s[i] = sid.0;
             }
         }
+        let mut token_id_buf = dev
+            .alloc_buffer(n * 4, DType::U32, vec![n])
+            .map_err(|e| anyhow::anyhow!("body_batched token ids alloc: {e}"))?;
+        token_id_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow::anyhow!("body_batched token ids write: {e}"))?
+            .copy_from_slice(tokens);
 
         let mut s = exec
             .begin()
             .map_err(|e| anyhow::anyhow!("body_batched session begin: {e}"))?;
 
-        // Embed-gather (PER-SLOT): token i -> bufs.hidden row i, scaled sqrt(hs).
-        let scale = (hs as f32).sqrt();
-        for i in 0..n {
-            let h_i = bufs.hidden.slice_view(row_off(h_stride, i), h_stride);
-            mlx_native::ops::elementwise::embedding_gather_scale_f32(
-                s.encoder_mut(),
-                reg,
-                metal_dev,
-                &self.embed_weight,
-                &h_i,
-                tokens[i],
-                hs,
-                scale,
-            )
-            .map_err(|e| anyhow::anyhow!("body_batched embed slot{i}: {e}"))?;
-        }
-        // Register the embed's write to `hidden` in the conflict tracker. The
-        // scalar runs embed in its own finished session (full sync before the
-        // layer sessions); here embed + all layers share ONE session, so the
-        // first layer's pre-attn `barrier_between([hidden,..],[norm_out])` must
-        // see `hidden` as a prior write to emit the RAW barrier. Without this
-        // the pre-attn norm can race the (untracked) embed dispatches.
-        s.track_dispatch(&[&self.embed_weight], &[&bufs.hidden]);
+        crate::inference::models::gemma4::native_matrix::encode_embedding(
+            &mut s,
+            reg,
+            dev,
+            &self.embed_weight,
+            &token_id_buf,
+            &bufs.hidden,
+            n,
+        )
+        .map_err(|e| anyhow::anyhow!("body_batched native embed: {e}"))?;
         // catsplit: embedding gather (per-slot). Boundary commits the embed CB and
         // re-begins so the layer loop's categories start in a clean session. The
         // commit is a full GPU sync, so layer-0's pre-attn RAW vs `hidden` is
@@ -2356,7 +2392,7 @@ impl MlxModelWeights {
         // from cb_chunks>=2 above — re-asserted here for clarity).
         let fuse_lmhead = cb_chunks >= 2
             && std::env::var("HF2Q_FUSE_LMHEAD").as_deref() != Ok("0")
-            && self.lm_head_q6k.is_some()
+            && self.resolved_lm_head().info.ggml_dtype == mlx_native::GgmlType::Q6_K
             && !cksum_on
             && !*catsplit::ENABLED;
 
@@ -2366,12 +2402,7 @@ impl MlxModelWeights {
             // encoders alive until the final wait.
             let mut committed: Vec<mlx_native::CommandEncoder> = Vec::with_capacity(cb_chunks);
             // §25 iter-L: fused lm_head output buffers (read after the final wait).
-            let mut fused_head: Option<(
-                MlxBuffer,
-                MlxBuffer,
-                MlxBuffer,
-                Option<super::batched_head::GpuSampleBuffers>,
-            )> = None;
+            let mut fused_head: Option<(MlxBuffer, MlxBuffer, MlxBuffer)> = None;
             let per = num_layers.div_ceil(cb_chunks);
             let mut layer_idx = 0usize;
             while layer_idx < num_layers {
@@ -2424,60 +2455,20 @@ impl MlxModelWeights {
             }
             drop(committed);
 
-            // §25 iter-L: fused head — read logits/normed after the single wait and
-            // hand them back via head_out; the body returns an empty hidden Vec.
-            if let Some((logits_b, normed_b, _softcap_params_b, gpu_sample_bufs)) = fused_head {
+            // §25 iter-L: fused head — read exact native-head logits after the
+            // single wait. The normed GPU operand is retained through the wait
+            // but no longer copied to the host now that reranking is gone.
+            if let Some((logits_b, _normed_b, _softcap_params_b)) = fused_head {
                 let _hp = std::time::Instant::now();
                 let logits: Vec<f32> = logits_b
                     .as_slice::<f32>()
                     .map_err(|e| anyhow::anyhow!("fused lm_head read logits: {e}"))?
                     .to_vec();
-                let normed: Vec<f32> = normed_b
-                    .as_slice::<f32>()
-                    .map_err(|e| anyhow::anyhow!("fused lm_head read normed: {e}"))?
-                    .to_vec();
-                // §26 iter-M: read back the small GPU-sample buffers (top1 +
-                // threshold candidates), if produced.
-                let gpu_sample = match gpu_sample_bufs {
-                    Some(b) => Some(super::batched_head::GpuSampleOut {
-                        top1_idx: b
-                            .top1_idx
-                            .as_slice::<u32>()
-                            .map_err(|e| anyhow::anyhow!("gpu_sample read top1_idx: {e}"))?
-                            .to_vec(),
-                        top1_val: b
-                            .top1_val
-                            .as_slice::<f32>()
-                            .map_err(|e| anyhow::anyhow!("gpu_sample read top1_val: {e}"))?
-                            .to_vec(),
-                        cand_count: b
-                            .cand_count
-                            .as_slice::<u32>()
-                            .map_err(|e| anyhow::anyhow!("gpu_sample read cand_count: {e}"))?
-                            .to_vec(),
-                        overflow: b
-                            .overflow
-                            .as_slice::<u32>()
-                            .map_err(|e| anyhow::anyhow!("gpu_sample read overflow: {e}"))?
-                            .to_vec(),
-                        cand_ids: b
-                            .cand_ids
-                            .as_slice::<u32>()
-                            .map_err(|e| anyhow::anyhow!("gpu_sample read cand_ids: {e}"))?
-                            .to_vec(),
-                        cap: b.cap,
-                    }),
-                    None => None,
-                };
                 host_phases::add(
                     host_phases::Phase::LmheadReadback,
                     _hp.elapsed().as_nanos() as u64,
                 );
-                *head_out = Some(BatchedHeadOut {
-                    logits,
-                    normed,
-                    gpu_sample,
-                });
+                *head_out = Some(BatchedHeadOut::from_logits(logits)?);
                 return Ok(Vec::new());
             }
         } else {

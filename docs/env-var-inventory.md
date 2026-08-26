@@ -272,7 +272,7 @@ this release:
 | `HF2Q_MLX_PROFILE` | `development-only` | 4 |
 | `HF2Q_MLX_TIMING` | `development-only` | 3 |
 | `HF2Q_MM_ID_ROUTING_THRESHOLD` | `development-only` | 3 |
-| `HF2Q_MTP_PHASE_PROFILE` | `development-only` | 1 |
+| `HF2Q_MTP_PHASE_PROFILE` | `development-only` | 1; prints K3 draft/verify/catch-up phases and verifier submission counters; combine with `HF2Q_GPU_BUSY=1` for GPU-busy versus non-GPU residual |
 | `HF2Q_MTP_PROFILE` | `development-only` | 5 |
 | `HF2Q_MVN_BARRIER_TRACE` | `development-only` | 1 |
 | `HF2Q_MVN_ENCODE_TRACE` | `development-only` | 3 |
@@ -397,7 +397,6 @@ this release:
 | `HF2Q_TEST_DESCENDANT_PID_FILE` | `development-only` | 2 |
 | `HF2Q_TEST_HELPER_PID_FILE` | `development-only` | 4 |
 | `HF2Q_TEST_PROMPT` | `development-only` | 1 |
-| `HF2Q_TEST_QWEN38_EXPECT_MV_EXT` | `development-only` | 2 |
 | `HF2Q_TEST_QWEN38_EXPECT_Q4K_MVN` | `development-only` | 2 |
 | `HF2Q_TEST_QWEN38_EXPECT_Q5_K_M` | `development-only` | 2 |
 | `HF2Q_TEST_QWEN38_GGUF` | `development-only` | 3 |

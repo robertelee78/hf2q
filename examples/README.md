@@ -12,7 +12,6 @@ with macOS 14+.
 | Spin up an OpenAI-API server | [`02-serve-and-curl.sh`](02-serve-and-curl.sh) | `hf2q serve` + a `curl` smoke probe |
 | Drive it from Python | [`03-openai-python-client.py`](03-openai-python-client.py) | Stock OpenAI SDK works as-is |
 | BERT embeddings | [`04-embeddings-bert.sh`](04-embeddings-bert.sh) | `nomic-bert` / `bert-base` via `/v1/embeddings` |
-| Qwen3-VL with an image | [`05-qwen-vision-image.sh`](05-qwen-vision-image.sh) | Vision chat completion |
 
 ## Prerequisites
 

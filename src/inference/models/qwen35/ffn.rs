@@ -145,6 +145,87 @@ pub struct MoeFfnShape {
     pub shared_intermediate_size: u32,
 }
 
+/// Exact pooled-expert call geometry derived from one source-token batch.
+///
+/// Qwen gate/up consume the source rows directly and expand their outputs by
+/// top-k. Down consumes those already-expanded rows as a top-k-one call. Keep
+/// one `n_tokens` value for both the dispatch row count and caller-owned hids
+/// scratch capacity so preflight and production cannot reinterpret them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MoeExpertCallGeometry {
+    pub n_tokens: u32,
+    pub top_k: u32,
+}
+
+/// Checked production geometry shared by Qwen MoE admission and dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MoeExpertGeometry {
+    pub source_rows: u32,
+    pub routed_rows: u32,
+    pub gate_up: MoeExpertCallGeometry,
+    pub down: MoeExpertCallGeometry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MoeExpertGeometryError {
+    ZeroSourceRows,
+    ZeroTopK,
+    SourceRowsExceedU32 { source_rows: usize },
+    RoutedRowsOverflow { source_rows: u32, top_k: u32 },
+}
+
+impl std::fmt::Display for MoeExpertGeometryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroSourceRows => formatter.write_str("source row count must be non-zero"),
+            Self::ZeroTopK => formatter.write_str("configured top-k must be non-zero"),
+            Self::SourceRowsExceedU32 { source_rows } => {
+                write!(formatter, "source row count {source_rows} exceeds u32")
+            }
+            Self::RoutedRowsOverflow { source_rows, top_k } => write!(
+                formatter,
+                "routed row count overflows u32: {source_rows} * {top_k}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MoeExpertGeometryError {}
+
+impl MoeExpertGeometry {
+    pub(super) fn checked(
+        source_rows: usize,
+        configured_top_k: u32,
+    ) -> Result<Self, MoeExpertGeometryError> {
+        if source_rows == 0 {
+            return Err(MoeExpertGeometryError::ZeroSourceRows);
+        }
+        if configured_top_k == 0 {
+            return Err(MoeExpertGeometryError::ZeroTopK);
+        }
+        let source_rows = u32::try_from(source_rows)
+            .map_err(|_| MoeExpertGeometryError::SourceRowsExceedU32 { source_rows })?;
+        let routed_rows = source_rows.checked_mul(configured_top_k).ok_or(
+            MoeExpertGeometryError::RoutedRowsOverflow {
+                source_rows,
+                top_k: configured_top_k,
+            },
+        )?;
+        Ok(Self {
+            source_rows,
+            routed_rows,
+            gate_up: MoeExpertCallGeometry {
+                n_tokens: source_rows,
+                top_k: configured_top_k,
+            },
+            down: MoeExpertCallGeometry {
+                n_tokens: routed_rows,
+                top_k: 1,
+            },
+        })
+    }
+}
+
 /// Pure-Rust MoE FFN forward (ADR-013 Decision 13).
 ///
 /// Spec (per token):
@@ -348,6 +429,60 @@ mod tests {
                 ((*seed as i32 as f32) / (i32::MAX as f32)) * scale
             })
             .collect()
+    }
+
+    #[test]
+    fn moe_expert_geometry_matches_production_rows_and_scratch_capacity() {
+        const TOP_K: u32 = 8;
+        for source_rows in [1usize, 4, 5, 2_048, 4_096] {
+            let geometry = MoeExpertGeometry::checked(source_rows, TOP_K)
+                .expect("APEX serving geometry must be representable");
+            assert_eq!(geometry.source_rows, source_rows as u32);
+            assert_eq!(geometry.routed_rows, source_rows as u32 * TOP_K);
+
+            assert_eq!(geometry.gate_up.n_tokens, source_rows as u32);
+            assert_eq!(geometry.gate_up.top_k, TOP_K);
+
+            assert_eq!(geometry.down.n_tokens, source_rows as u32 * TOP_K);
+            assert_eq!(geometry.down.top_k, 1);
+        }
+
+        let scheduler_max = MoeExpertGeometry::checked(4_096, TOP_K).unwrap();
+        let gate_hids_bytes =
+            u64::from(256 * scheduler_max.gate_up.n_tokens) * u64::from(u32::BITS / 8);
+        let down_hids_bytes =
+            u64::from(256 * scheduler_max.down.n_tokens) * u64::from(u32::BITS / 8);
+        assert_eq!(gate_hids_bytes, 4 * 1_024 * 1_024);
+        assert_eq!(down_hids_bytes, 32 * 1_024 * 1_024);
+    }
+
+    #[test]
+    fn moe_expert_geometry_rejects_zero_and_overflow_before_dispatch() {
+        assert_eq!(
+            MoeExpertGeometry::checked(0, 8),
+            Err(MoeExpertGeometryError::ZeroSourceRows)
+        );
+        assert_eq!(
+            MoeExpertGeometry::checked(1, 0),
+            Err(MoeExpertGeometryError::ZeroTopK)
+        );
+        assert_eq!(
+            MoeExpertGeometry::checked(u32::MAX as usize, 2),
+            Err(MoeExpertGeometryError::RoutedRowsOverflow {
+                source_rows: u32::MAX,
+                top_k: 2,
+            })
+        );
+        if usize::BITS > u32::BITS {
+            let too_many_source_rows =
+                usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit usize");
+            assert_eq!(
+                MoeExpertGeometry::checked(too_many_source_rows, 1),
+                Err(MoeExpertGeometryError::SourceRowsExceedU32 {
+                    source_rows: too_many_source_rows,
+                })
+            );
+        }
     }
 
     // ====================================================

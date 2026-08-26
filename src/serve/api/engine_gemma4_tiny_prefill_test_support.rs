@@ -77,15 +77,13 @@ pub(super) fn gemma4_test_decode_rows(
             .unwrap_or_else(|error| panic!("batched decode head failed ({context}): {error:#}")),
     };
     assert!(
-        head.logits.iter().all(|value| value.is_finite()),
+        head.logits().iter().all(|value| value.is_finite()),
         "batched decode produced non-finite logits ({context})"
     );
     let vocab_size = g.weights.vocab_size;
-    let hidden_size = g.weights.hidden_size;
     for active_idx in 0..width {
-        let logits = &head.logits[active_idx * vocab_size..(active_idx + 1) * vocab_size];
-        let normed = &head.normed[active_idx * hidden_size..(active_idx + 1) * hidden_size];
-        let (top1_idx, top1_val) = logits.iter().copied().enumerate().fold(
+        let logits = &head.logits()[active_idx * vocab_size..(active_idx + 1) * vocab_size];
+        let (top1_idx, _top1_val) = logits.iter().copied().enumerate().fold(
             (0u32, f32::NEG_INFINITY),
             |best, (index, value)| {
                 if value > best.1 {
@@ -95,10 +93,7 @@ pub(super) fn gemma4_test_decode_rows(
                 }
             },
         );
-        feed_tokens[active_idx] = g
-            .weights
-            .finalize_token_from_logits(logits, normed, top1_idx, top1_val)
-            .unwrap_or_else(|error| panic!("decode finalize failed ({context}): {error:#}"));
+        feed_tokens[active_idx] = top1_idx;
         positions[active_idx] += 1;
     }
 }

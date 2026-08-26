@@ -43,7 +43,9 @@ use sha2::{Digest, Sha256};
 use crate::backends::gguf::types::MetaValue;
 use crate::backends::gguf::writer::{GgufWriter, WriterError};
 use crate::core::provenance::tensor_execution::LogicalF32Hasher;
-use crate::quantize::ggml_quants::apex::{ApexError, ApexPolicy};
+use crate::quantize::ggml_quants::apex::{
+    classify_moe_tensor, ApexError, ApexPolicy, MoeTensorRole,
+};
 use crate::quantize::ggml_quants::quantizer::Quantizer;
 use crate::quantize::ggml_quants::standard_policy::{
     tensor_type_fallback, HParams, LlmType, QsState, StandardPolicy, TensorCategory,
@@ -575,16 +577,24 @@ impl ConvertOrchestrator {
                 // (per canonical base.py:875).
                 if mtp_ffn_gate_inp_demote {
                     GgmlType::F16
-                } else if is_f32_keep_tensor(&e.name, e.shape.len())
+                } else if is_f32_keep_tensor_for_arch(self.arch, &e.name, e.shape.len())
                     && !e.name.contains(".patch_embd")
                 {
                     GgmlType::F32
                 } else {
                     GgmlType::F16
                 }
-            } else if is_f32_keep_tensor(&e.name, e.shape.len()) {
+            } else if is_f32_keep_tensor_for_arch(self.arch, &e.name, e.shape.len())
+                && !(self.apex_policy.is_some()
+                    && matches!(
+                        classify_moe_tensor(self.arch, &e.name),
+                        MoeTensorRole::RouterGate
+                    ))
+            {
                 // F32-keep gate — emit the F32 row-major payload as-is.
-                // See `is_f32_keep_tensor` doc for the rule list.
+                // See `is_f32_keep_tensor` doc for the rule list. Apex owns
+                // its router storage decision explicitly, so its Q5_0 route
+                // must reach `ApexPolicy::target_for` below.
                 GgmlType::F32
             } else {
                 let tref = TensorRef {
@@ -1572,6 +1582,16 @@ fn is_f32_keep_tensor(name: &str, n_dims: usize) -> bool {
         || name == "rope_freqs.weight" // (7) Gemma 4 synthesized
 }
 
+/// Architecture roles whose runtime kernels consume exact F32 state even
+/// though the tensors are rank two. They must bypass every quantization
+/// policy so inference never has to dequantize a served GGUF back to F32.
+fn is_f32_keep_tensor_for_arch(arch: ArchName, name: &str, n_dims: usize) -> bool {
+    is_f32_keep_tensor(name, n_dims)
+        || (arch == ArchName::Deepseek4
+            && (name.ends_with(".attn_compressor_ape.weight")
+                || name.ends_with(".indexer_compressor_ape.weight")))
+}
+
 // -----------------------------------------------------------------------------
 // Synthetic-end-to-end driver — usable from integration tests + adhoc probes.
 // -----------------------------------------------------------------------------
@@ -2062,9 +2082,11 @@ mod tests {
             entry("output.weight"),
             entry("token_embd.weight"),
             entry("blk.2.attn_compressor_gate.weight"),
+            entry("blk.2.attn_compressor_ape.weight"),
             entry("blk.2.attn_q_b.weight"),
             entry("blk.2.hc_attn_fn.weight"),
             entry("blk.2.indexer.attn_q_b.weight"),
+            entry("blk.2.indexer_compressor_ape.weight"),
             entry("blk.2.ffn_gate_exps.weight"),
             entry("blk.2.ffn_up_exps.weight"),
             entry("blk.2.ffn_down_exps.weight"),
@@ -2087,10 +2109,57 @@ mod tests {
         ] {
             assert_eq!(planned[name], GgmlType::Q8_0, "{name}");
         }
+        for name in [
+            "blk.2.attn_compressor_ape.weight",
+            "blk.2.indexer_compressor_ape.weight",
+        ] {
+            assert_eq!(planned[name], GgmlType::F32, "{name}");
+        }
         assert_eq!(planned["blk.2.ffn_gate_exps.weight"], GgmlType::Q2_K);
         assert_eq!(planned["blk.2.ffn_up_exps.weight"], GgmlType::Q2_K);
         assert_eq!(planned["blk.2.ffn_down_exps.weight"], GgmlType::Q3_K);
         assert_eq!(planned["blk.2.ffn_down_shexp.weight"], GgmlType::Q3_K);
+    }
+
+    #[test]
+    fn every_deepseek_quant_profile_keeps_rank_two_ape_state_f32() {
+        for ftype in [
+            GgufFtype::MostlyQ4_K_M,
+            GgufFtype::MostlyQ5_K_M,
+            GgufFtype::MostlyQ8_0,
+            GgufFtype::BF16,
+        ] {
+            let mut orch = ConvertOrchestrator::new(
+                ftype,
+                ArchName::Deepseek4,
+                HParams {
+                    n_expert: 256,
+                    n_head: 64,
+                    n_head_kv: 1,
+                    n_layer: 43,
+                    n_mtp_layers: 0,
+                },
+            );
+            orch.plan_tensors(
+                [
+                    "blk.2.attn_compressor_ape.weight",
+                    "blk.2.indexer_compressor_ape.weight",
+                ]
+                .into_iter()
+                .map(|name| PlanEntry {
+                    name: name.to_string(),
+                    shape: vec![64, 4],
+                    source_dtype: SourceDtype::F32,
+                    layer_index: Some(2),
+                })
+                .collect(),
+            )
+            .unwrap();
+            assert!(orch
+                .planned
+                .iter()
+                .all(|tensor| tensor.ggml_type == GgmlType::F32));
+        }
     }
 
     #[test]

@@ -23,6 +23,7 @@
 
 use super::config::DFlashConfig;
 use super::weights::{DFlashWeights, WeightsError};
+use crate::inference::dense_bf16_activation::NativeBf16Matrix;
 use mlx_native::{DType, MlxBuffer, MlxDevice, MlxError};
 use safetensors::tensor::TensorView;
 
@@ -179,6 +180,48 @@ fn upload_bf16_as_f32(
 }
 
 impl DFlashModelTensors {
+    pub(crate) fn native_bf16_matrices(
+        &self,
+        block_size: u32,
+    ) -> anyhow::Result<Vec<NativeBf16Matrix<'_>>> {
+        let max_m = block_size.min(16);
+        anyhow::ensure!(max_m > 0, "DFlash block size must be nonzero");
+        fn push<'a>(
+            out: &mut Vec<NativeBf16Matrix<'a>>,
+            label: &'static str,
+            buffer: &'a MlxBuffer,
+            max_m: u32,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                buffer.dtype() == DType::BF16 && buffer.shape().len() == 2,
+                "{label}: DFlash projection must be rank-two BF16, got {:?} {:?}",
+                buffer.dtype(),
+                buffer.shape()
+            );
+            out.push(NativeBf16Matrix::unbatched_through(
+                label,
+                buffer,
+                u32::try_from(buffer.shape()[0])?,
+                u32::try_from(buffer.shape()[1])?,
+                max_m,
+            )?);
+            Ok(())
+        }
+
+        let mut out = Vec::new();
+        push(&mut out, "DFlash target-state projection", &self.fc, max_m)?;
+        for layer in &self.layers {
+            push(&mut out, "DFlash Q projection", &layer.q_proj, max_m)?;
+            push(&mut out, "DFlash K projection", &layer.k_proj, max_m)?;
+            push(&mut out, "DFlash V projection", &layer.v_proj, max_m)?;
+            push(&mut out, "DFlash attention output", &layer.o_proj, max_m)?;
+            push(&mut out, "DFlash FFN gate", &layer.mlp_gate, max_m)?;
+            push(&mut out, "DFlash FFN up", &layer.mlp_up, max_m)?;
+            push(&mut out, "DFlash FFN down", &layer.mlp_down, max_m)?;
+        }
+        Ok(out)
+    }
+
     /// Upload all 58 drafter tensors to the GPU. The order of upload
     /// matches `DFlashWeights::manifest` (stable). Total upload cost:
     /// 58 × `copy_from_slice` over BF16 bytes (~820 MB for gemma-4-26B-A4B-it).

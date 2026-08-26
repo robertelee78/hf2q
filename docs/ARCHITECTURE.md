@@ -147,7 +147,6 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   ├── models/                per-arch forward graphs
 │   │   ├── gemma4/            dense + MoE 30-layer Gemma 4
 │   │   ├── qwen35/            dense + MoE Qwen 3.5 / 3.6
-│   │   ├── qwen3vl_text/      Qwen 3-VL text tower (vision lives elsewhere)
 │   │   ├── bert/              BERT embedding model
 │   │   └── nomic_bert/        Nomic embedding model
 │   ├── spec_decode/           ADR-029 speculative-decode primitives
@@ -177,7 +176,6 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   │   ├── sse.rs                     SSE encoder
 │   │   ├── engine.rs                  Gemma 4 engine wrapper
 │   │   ├── engine_qwen35.rs           Qwen 3.5 engine wrapper
-│   │   ├── engine_qwen3vl.rs          Qwen 3-VL engine wrapper
 │   │   ├── grammar/                   grammar-constrained sampling
 │   │   ├── kv_spill_descriptor.rs     KV-spill metadata
 │   │   ├── tq_packed_descriptor.rs    TurboQuant packed metadata
@@ -265,7 +263,7 @@ replacement.
 
 | Family | Where it lives | Notes |
 |---|---|---|
-| **Legacy block** (`q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`) | `src/quantize/ggml_quants/q*.rs` | Pure-Rust 32-element block codecs. Converter support does not imply runtime support; ADR-046 Gate 0 tracks the current Q4_1/Q5_0 seam. |
+| **Legacy block** (`q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`) | `src/quantize/ggml_quants/q*.rs` | Pure-Rust 32-element block codecs. Converter support does not imply runtime support; ADR-046 Gate 0 retains Q4_1 as an open seam and tracks native Q5_0 generative execution through its unpublished-dependency and hardware gates. |
 | **K-quant** (`q2_k`…`q6_k`, `q4_k_m`, `q5_k_m`, …) | `src/quantize/ggml_quants/` | 256-element super-block codecs and `StandardPolicy` tensor selection. |
 | **APEX mixed precision** | `src/quantize/ggml_quants/apex/` | Per-tensor GGUF policy; exact tensor encodings still use the codecs above. |
 | **Imatrix input** | `src/quantize/imatrix/` | Corpus/capture and `.imatrix.gguf` producer/consumer for supported families. It is importance evidence, not DWQ. |
@@ -297,8 +295,10 @@ their own loaders and are not evidence of native packed coverage.
    producer fingerprint (`serve/provenance.rs`) against the arch
    registry.
 2. **Arch dispatch** picks an explicit engine wrapper under
-   `serve/api/engine*.rs` (Gemma 4, Qwen 3.5/3.6, Qwen 3-VL,
-   DeepSeek-V4). Unsupported or cross-family shapes fail rather than falling
+   `serve/api/engine*.rs` (Gemma 4, Qwen 3.5/3.6/3.8, and
+   DeepSeek-V4). Shared Qwen conditional-generation vision uses the Qwen
+   text-family engine plus an admitted projector; standalone Qwen3-VL
+   architectures are rejected. Unsupported or cross-family shapes fail rather than falling
    through an approximately compatible graph.
 3. **Weight load** follows the selected architecture's explicit representation
    contract (`inference/models/<arch>/...`). Native packed paths bind admitted
@@ -407,10 +407,9 @@ that lets the drafter ship behind a default flag.
 ### 4.5 Vision
 
 `inference/vision/` loads an mmproj GGUF (emitted by `models/vit/`)
-and runs the vision tower as a Metal kernel chain identical to the
-text tower's primitive set. `inference/models/qwen3vl_text/` consumes
-the projected embeddings via the chat-template's `<|vision_start|>`
-markers.
+and runs the vision tower as a Metal kernel chain. Supported Qwen
+conditional-generation models consume the projected embeddings through the
+shared Qwen35 graph; Gemma 4 uses its family-specific seam.
 
 ---
 
@@ -634,7 +633,6 @@ ADRs under `docs/`. The most architecturally consequential ones:
 | **ADR-018** | Uniform Model-Load UX Across Families — `hf2q serve --model PATH` invariants. |
 | **ADR-019** | mlx-native Encoder Architecture — Per-Stage Fence Design. |
 | **ADR-020** | Historical DWQ + mixed-precision work; superseded by ADR-046. |
-| **ADR-021** | Qwen3VL ViT prelude GPU port — vision tower. |
 | **ADR-022** | Kernel-coverage parity with `llama.cpp`. |
 | **ADR-027** | Qwen3.5 TQ KV cache + persist family. |
 | **ADR-028** | Peer parity, coherence + speed (the perf canonical). |

@@ -1,6 +1,9 @@
 # ADR-017 Per-Family Ship-Gate Status
 
-**Last updated:** 2026-05-06 (post B-tq.7 — 8-bit codebook (production default) GREEN; live R-P5 at 7572× warm speedup on 1127-token prompt; both 4-bit and 8-bit paths support full snapshot/restore + R-C1 byte-identity)
+**Last updated:** 2026-08-22 (ADR-049 Lane C reconciliation: Qwen
+SerialFifo registry/disk hydrate is the restart tier; SlotAware uses a
+separate slot-local anchor store. Model-free anchor invariants are green;
+real-artifact divergence/coherence gates remain pending.)
 **Companion to:** [ADR-017](./ADR-017-persistent-block-prefix-cache.md)
 **Phase D §476 closure doc.**
 
@@ -25,7 +28,7 @@ requirements, §Performance requirements, §Kill-gates.
 | Family | Engine path | R-C1 | R-C3 | R-C4 | R-P4 | K1/K2/K3 | Phase D Status |
 |---|---|---|---|---|---|---|---|
 | Gemma 4 (dense, A4B variant) | `src/serve/kv_persist/families/gemma4_dense.rs` | PASS | PASS | PASS | PASS (ratio=0.000 @ L=32K) | All falsified | **GREEN** (primary; R-P5/R-P6 measured 44,500× / 1.00× post Phase D iter-5/6 + B.5; stress 24h smoke pass at iter-11/12) |
-| Qwen 3.5 / 3.6 (hybrid, MoE+DeltaNet) | `src/serve/api/engine_qwen35.rs::Qwen35LoadedModel::lcp_registry` (Phase E.a B.2-B.5 substrate; no sibling `KvCacheSpill` family hook needed) | PASS (B.2-iso falsifier 0/131072) | n/a (LCP path doesn't use Phase D spiller) | PASS (B.3 stride-aligned + B.5 byte-identity end-to-end) | n/a (LCP-resume measured separately at R-P6 0.79× of 4×cold; bench at `scripts/bench_lcp_resume_speedup.sh`) | n/a (sourdough/dense-only kill-gates don't apply to LCP path) | **GREEN** (Phase E.a B.5 closed 2026-05-05; HF2Q_KV_LCP_RESUME=1 default-on flip operator-controlled post 24h soak) |
+| Qwen 3.5 / 3.6 / 3.8 (hybrid DeltaNet family) | SerialFifo: `engine_qwen35.rs::Qwen35LoadedModel::lcp_registry` + disk hydrate. SlotAware: `engine.rs::Qwen35AnchorStore` (same-process semantic boundaries; registry unused). | PASS for the SerialFifo LCP substrate (B.2-iso falsifier 0/131072); SlotAware anchor byte-identity pending hardware | n/a (neither Qwen reuse path uses the Phase D spiller contract) | PASS for SerialFifo stride-aligned/disk restore; SlotAware divergent-branch byte gate pending hardware | n/a (LCP benchmark and SlotAware TTFT gates are separate) | n/a (dense-only kill-gates do not apply) | **GREEN, SerialFifo persistence**; **MODEL-FREE GREEN / HARDWARE PENDING, SlotAware anchors**. `bench_lcp_resume_speedup.sh` is not the SlotAware gate. |
 | TQ-packed (codec_version=1 + codec_version=2 + bundle codec) | `src/serve/kv_persist/families/tq_packed.rs` (B-tq.1 v1 envelope + B-tq.2 `TqPackedSpill` hook + B-tq.3 v2 engine wiring + B-tq.4 iter-1+2+3 activation factory) + `src/serve/forward_mlx.rs::MlxModelWeights::tq_v2_*` + `src/serve/api/tq_packed_descriptor.rs` + `src/serve/api/engine.rs::tq_packed_v2_*` worker bridge + `src/serve/mod.rs::cmd_serve` single-mode factory registration + `tests/kv_persist_tq_packed_roundtrip.rs` AUTOMATED integration test (uses `tests/common/serve_driver.rs` shared driver via B-tq.5 extraction) | PASS (v1 + v2 round-trip byte-exact = R-C1 unit; cross-process R-C1 automated when `HF2Q_KV_PERSIST_TQ_E2E=1`) | n/a | PASS (D2 byte-exact rebuild → cosine = 1.0 = R-C2 trivially; v2 capture→restore byte-identity on synthetic `[nkv, capacity, hd_packed]` U8 + `[nkv, capacity]` F32 buffers) | n/a (no inference perf bench at substrate level) | n/a | **GREEN** (engine wiring + factory registration + automated integration test landed 2026-05-06 across B-tq.4 iter-1+2+3 + B-tq.5, commits `62bb8b5`+`b346425`+`69b3bc2`+`539e6f7`; live R-C1 measurement on a real GGUF is operator-driven post-merge work — harness drives the full subprocess round-trip when env-gated). NOT blocked on ADR-007 Path C; codec-freeze contract F-7 LANDED 2026-05-05 |
 
 Legend:
@@ -99,27 +102,31 @@ by the factory downcast at
 
 ---
 
-## Qwen 3.5 / 3.6 (hybrid: MoE + DeltaNet) — pending
+## Qwen 3.5 / 3.6 / 3.8 (hybrid DeltaNet family)
 
-**Status:** family hook NOT YET LANDED.
+Qwen does not use the Gemma `KvCacheSpill` hook. Its two live mechanisms
+have different ownership and scheduler contracts:
 
-ADR-017 §B-hybrid sequencing depends on serve-side qwen35 load
-landing under ADR-013 — the trait surface ships family-agnostic, but
-the impl rides the family's serve-side enablement, and the
-DeltaNet-boundary-snapshot integration adds requirements beyond the
-dense Gemma 4 pattern.
+- **SerialFifo restart tier:** `Qwen35LoadedModel::lcp_registry` stores
+  byte-budgeted hybrid snapshots and `hydrate_lcp_registry_from_disk`
+  repopulates them after restart. This remains a supported, permanent tier;
+  it is not an unfinished stub. The registry's effective capacity comes from
+  payload bytes, not a one-entry or fixed-count comment.
+- **SlotAware same-process tier:** `Qwen35AnchorStore` retains up to four
+  committed stable-boundary anchors plus one preflighted pending capture per
+  physical slot. It never probes the SerialFifo registry. Epoch validation,
+  descendant pruning before divergent writes, fail-atomic restore preflight,
+  and full-store invalidation on reset/poison/restore failure protect the one
+  mutable KV lineage.
 
-**Tracking:** ADR-013 (hybrid-architecture serve-side load).
-B-hybrid family hook + per-family parity gate verification will be
-recorded here when it lands.
-
-Until then `src/serve/api/engine.rs:2114` returns `None` for the
-`LoadedModel::Qwen35(_)` arm of the descriptor closure — i.e. the
-KV-spill descriptor is not yet emitted for this family, and the
-spiller short-circuits to the `NoopKvSpiller` path on Qwen35 hot
-sessions. This is the explicit "no stub" semantic per ADR-017's
-mantra: hybrid Qwen3.5 ships when its parity gate is GREEN by
-measurement, not before.
+The model-free proof includes an independent reference state machine, a
+17-injected-mutation invariant battery, the A→B→C rewind regression,
+restore-no-partial-mutation, exact committed+pending accounting, and the
+right-sized speculative hidden-row ownership test. Those results do not
+substitute for the ADR-049 real-artifact gates: Qwen3.6 and Qwen3.8 still need
+the concurrent SlotAware divergence script, cold byte comparison at every
+anchor depth/transaction width, cancellation/failure/spec-state coverage,
+and matched TTFT receipts before the SlotAware milestone is called green.
 
 ---
 
@@ -145,8 +152,9 @@ Update this doc when:
 - a new bench is run on Gemma 4 (e.g. R-P5, R-P6, full matrix, 24h
   stress) — add a row under "Pending operator gates" with the
   bench-output cross-reference and date.
-- B-hybrid lands — flip the Qwen 3.5/3.6 row from PENDING to PASS
-  and link the bench evidence.
+- Qwen SlotAware real-artifact gates run — replace the hardware-pending text
+  with exact commit, artifact, prompt, settings, cached-token, byte-identity,
+  tail-TTFT, and N=4 stability receipts.
 - a new family ships — add a section mirroring the Gemma 4 layout
   (engine path, descriptor closure, R-Cn / R-Pn rows, kill-gate
   status, production fixes, pending operator gates).

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add a fail-closed cross-family generative swap contract that drives Qwen
+  dense, Qwen MoE, Gemma, and DeepSeek through a fixed 13-phase, two-cycle
+  sequence in one long-lived process. It binds semantic canaries, execution
+  generations, cold generation-local cache, eviction, exact replay, and
+  independently recomputed RSS/host-wired bounds. The source gate is present;
+  the four-artifact Apple-Silicon execution remains required.
+
+### Changed
+
+- Pin the next-release candidate to published `mlx-native 0.15.0` from
+  crates.io with checksum
+  `09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822`.
+  The backend's fail-closed exact-source/package/publication workflow passed;
+  no local Cargo path patch participates in the candidate.
+- Preserve Apex's explicit native Q5_0 router storage decision through the
+  conversion planner instead of letting the generic F32-keep predicate
+  silently override it; standard conversion retains its F32 router policy.
+- Treat stored GGUF matrix representation as an inference invariant across
+  the supported generative families: admitted weights execute in their native
+  declared format, tied/shared heads alias the same storage, and unsupported
+  routes fail before model publication instead of silently dequantizing or
+  re-quantizing weights.
+
+### Fixed
+
+- Replace the stale fresh-server cross-family swap proof with an eviction-hub
+  sequence whose every adjacent pair must replace under the fixed pool budget,
+  so co-residency and process restart cannot masquerade as model-swap proof.
+
 ## [0.1.15] — 2026-08-24
 
 ### Added
@@ -146,11 +177,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when the variable is unset (ADR-044, updated 2026-08-21); every admission
   path still fails closed to ordinary target decode, and explicit `off`
   remains the escape hatch.
-- Apply the Qwen3.8-qualified decode route (`HF2Q_DECODE_MVN=0` +
-  `HF2Q_DECODE_MV_EXT=1`) by default when loading a Qwen3.8-identified
-  model, at engine load, without overriding operator-exported values. The
-  route stays Qwen3.8-scoped because `mul_mv_ext` is not bit-exact and no
-  other family carries the qualifying receipt.
+- Keep every Qwen artifact on the shared coherent decode route
+  (`HF2Q_DECODE_MVN=1`, `HF2Q_DECODE_MV_EXT=0` by default). A repeated
+  508-decision Qwen3.8 verifier gate falsified the former model-labelled
+  `mul_mv_ext` exception: it passed a short four-position check but changed a
+  target decision at completion token 206. Routing remains immutable
+  per-model state, the loader never mutates process environment, and A→B→A
+  swaps cannot inherit another artifact's overrides.
 - Rewrite `docs/getting-started.md` as the single first-run journey:
   install, `hf2q setup`, verified pair download, one-line foreground serve,
   `hf2q chat` generation proof, single-request vision proof, OpenCode

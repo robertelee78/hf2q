@@ -432,6 +432,9 @@ fn run_two_regime_decode(
     let cfg = Gemma4Config::from_gguf(&gguf)?;
     let mut progress = header::LoadProgress::new(false, 1, 0);
     let mut mlx_w = MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx, &mut progress)?;
+    mlx_w
+        .activate_native_routes(&mut ctx, &[])
+        .context("activate Gemma native routes for parity quality")?;
 
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Tokenizer: {e}"))?;
@@ -453,8 +456,8 @@ fn run_two_regime_decode(
             min_p: 0.0,
             repetition_penalty: 1.0,
             max_tokens: tokens,
-            mmproj: None,
             image: None,
+            mmproj: None,
             chat_template: None,
             chat_template_file: None,
             benchmark: false,

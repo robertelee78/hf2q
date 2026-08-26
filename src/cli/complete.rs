@@ -283,6 +283,7 @@ mod tests {
             "__fetch-hub-gguf",
             "__catalog-hub-gguf",
             "__verify-local-gguf",
+            "__record-model-verification",
             "source-teacher",
             "source-teacher-reference",
             "source-teacher-acceptance-verify",

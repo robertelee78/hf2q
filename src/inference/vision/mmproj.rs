@@ -24,21 +24,20 @@
 //!   - `clip.projector_type`            → "mlp" | "resampler" | ...
 //!   - `clip.vision.mean[R,G,B]` + `clip.vision.std[R,G,B]` (arrays)
 //!
-//! ## Qwen3-VL extensions (iter-224 Wedge-4b, ADR-005)
+//! ## Qwen conditional-generation projector extensions
 //!
-//! Qwen3-VL ships its mmproj using the `clip.*` namespace too but adds:
+//! Existing Qwen projector artifacts use the `clip.*` namespace and add:
 //!
 //!   - `clip.projector_type = "qwen3vl_merger"`           — selects
-//!     `ProjectorType::Qwen3VlMerger` (`is_supported()=false` until
-//!     Wedge-4c lands the ViT forward).
+//!     `ProjectorType::QwenVisionMerger`.
 //!   - `clip.vision.spatial_merge_size`                   — typically
 //!     `2` (2×2 patch merger → 4× token reduction).
 //!   - `clip.vision.projection_dim`                       — the LM
-//!     hidden size the projector targets (e.g. `2048` for Qwen3-VL-2B).
+//!     hidden size the projector targets.
 //!   - `clip.vision.is_deepstack_layers`                  — `Bool[N]`
 //!     of length `block_count`; `true` for layers whose ViT hidden
-//!     state is fed into the LM as DeepStack augmentation. Qwen3-VL-2B
-//!     sets `[5, 11, 17]`. The convert script encodes the per-layer
+//!     state is fed into the LM as DeepStack augmentation. The convert
+//!     path encodes the per-layer
 //!     bool array; we present it as a sorted `Vec<u32>` of true-indexes
 //!     for consumer-friendliness.
 //!   - Per-flagged-layer `v.deepstack.{N}.{norm,fc1,fc2}.{weight,bias}`
@@ -48,32 +47,22 @@
 //!     plain MLP projector).
 //!
 //! Detection rule (`detect_arch_profile`): for tensor-only callers, the
-//! presence of `v.deepstack.0.fc1.weight` is the canonical Qwen3-VL
-//! marker (DeepStack tensors are unique to the qwen3vl projector
-//! family). For projector-aware callers,
+//! presence of `v.deepstack.0.fc1.weight` selects the Qwen vision
+//! profile. For projector-aware callers,
 //! `detect_arch_profile_with_projector` short-circuits on
-//! `ProjectorType::Qwen3VlMerger` regardless of tensor enumeration.
+//! `ProjectorType::QwenVisionMerger` regardless of tensor enumeration.
 //!
 //! Detection uses `v.deepstack.0.fc1.weight` (a tensor name) rather
 //! than a metadata flag because the peer does NOT define a dedicated
-//! `clip.has_qwen3vl_merger` GGUF key — only the
+//! `clip.has_qwen_vision_merger` GGUF key — only the
 //! projector-type string and the per-layer DeepStack tensors uniquely
-//! identify a Qwen3-VL mmproj. The Worker W audit
+//! identify this projector schema. The historical implementation audit
 //! (`wedge4-qwen35-vision-plan.md`) initially named a
-//! `clip.has_qwen3vl_merger` flag; this implementation drops that
+//! `clip.has_qwen_vision_merger` flag; this implementation drops that
 //! assumption in favor of the peer's actual signal set.
 //!
-//! # What this iter does NOT do
-//!
-//!   - Loading weight tensors into mlx-native buffers (Phase 2c ViT
-//!     forward iter). The parser validates the HEADER only.
-//!   - Quantizing a safetensors vision tower → mmproj GGUF (hf2q convert
-//!     path; separate iter).
-//!   - Running the Qwen3-VL ViT forward pass — Wedge-4c's job; this
-//!     module's `ProjectorType::Qwen3VlMerger.is_supported()` returns
-//!     `false` so listing-without-serving works but `serve --mmproj`
-//!     rejects the file at startup. Wedge-4c flips that bit when the
-//!     `compute_vision_embeddings_gpu_qwen3vl` path lands.
+//! This module validates metadata and tensor inventory. Weight loading,
+//! conversion, and the runtime forward graph live in sibling vision modules.
 
 #![allow(dead_code)]
 
@@ -82,6 +71,13 @@ use mlx_native::gguf::{GgufFile, MetadataValue};
 
 /// GGUF architecture identifier for mmproj files.
 pub const ARCH_CLIP: &str = "clip";
+
+/// Canonical GGUF spelling retained for compatibility with existing Qwen
+/// conditional-generation projector artifacts.
+pub const QWEN_VISION_PROJECTOR_WIRE_TYPE: &str = "qwen3vl_merger";
+
+/// Canonical hf2q GGUF profile spelling retained for existing artifacts.
+pub const QWEN_VISION_PROFILE_WIRE_NAME: &str = "qwen3vl_siglip";
 
 /// Which projector shape the mmproj uses. Determines the final dim of
 /// the ViT hidden → text-embed transform.
@@ -100,21 +96,15 @@ pub enum ProjectorType {
     /// `compute_vision_embeddings_gpu_dispatch` routes here when the
     /// loaded mmproj is `ArchProfile::Gemma4Siglip`.
     Gemma4v,
-    /// Qwen3-VL spatial-merger projector — 2×2 patch merge → 2-layer
+    /// Qwen vision spatial-merger projector — 2×2 patch merge → 2-layer
     /// MLP (`mm.0`/`mm.2`) → optional per-layer DeepStack heads at
     /// `v.deepstack.{N}.{fc1,fc2,norm}`. The peer writes the
     /// projector-type string `"qwen3vl_merger"` for this shape.
     ///
-    /// **Wedge-4b note (iter-224, this iter):** `is_supported()` returns
-    /// `false` while the runtime ViT path is still queued under
-    /// Wedge-4c. The variant exists so that `MmprojConfig::from_gguf`
-    /// + `validate_tensor_set` can already PARSE a Qwen3-VL mmproj
-    /// (listing-without-serving works; tensor-set validation can run
-    /// against the deepstack tensor expectations) without prematurely
-    /// claiming a forward path. Wedge-4c flips
-    /// `is_supported()` true when `compute_vision_embeddings_gpu_qwen3vl`
-    /// lands at `vit_gpu.rs:2412`.
-    Qwen3VlMerger,
+    /// The runtime forward path is implemented by
+    /// `compute_vision_embeddings_gpu_qwen` and consumed by the shared
+    /// Qwen text-family engine.
+    QwenVisionMerger,
     /// Other / unknown projector shape — forward pass cannot run.
     /// Listable via `/v1/models` but rejected by `validate_tensor_set`
     /// at serve startup so the server never advertises a forward path
@@ -132,11 +122,8 @@ impl ProjectorType {
             // hf2q's writer matches via `build_mmproj_metadata`
             // (`backends/gguf.rs:606-610`).
             "gemma4v" => ProjectorType::Gemma4v,
-            // The peer writes the literal string "qwen3vl_merger" for
-            // this projector. iter-224
-            // Wedge-4b: parse-only; the runtime forward path is still
-            // queued under Wedge-4c.
-            "qwen3vl_merger" => ProjectorType::Qwen3VlMerger,
+            // Existing GGUFs use the legacy literal `qwen3vl_merger`.
+            QWEN_VISION_PROJECTOR_WIRE_TYPE => ProjectorType::QwenVisionMerger,
             other => ProjectorType::Other(other.to_string()),
         }
     }
@@ -145,7 +132,7 @@ impl ProjectorType {
             ProjectorType::Mlp => "mlp",
             ProjectorType::Resampler => "resampler",
             ProjectorType::Gemma4v => "gemma4v",
-            ProjectorType::Qwen3VlMerger => "qwen3vl_merger",
+            ProjectorType::QwenVisionMerger => QWEN_VISION_PROJECTOR_WIRE_TYPE,
             ProjectorType::Other(s) => s.as_str(),
         }
     }
@@ -163,9 +150,9 @@ impl ProjectorType {
     /// projector head `Gemma4ClippableLinear` is in
     /// `vit_gpu.rs::gemma4v_apply_full_forward_gpu` (Stage 8).
     ///
-    /// `Qwen3VlMerger` — **YES** (iter-224 Wedge-4c.5 LANDED). The full
-    /// Qwen3-VL ViT forward (`compute_vision_embeddings_gpu_qwen3vl` at
-    /// `vit_gpu_qwen3vl.rs`), the LM-side split-and-add hooks
+    /// `QwenVisionMerger` — **YES** (iter-224 Wedge-4c.5 LANDED). The full
+    /// Qwen3-VL ViT forward (`compute_vision_embeddings_gpu_qwen` at
+    /// `vit_gpu_qwen.rs`), the LM-side split-and-add hooks
     /// (`Qwen35Model::forward_gpu_*_with_soft_tokens`), the
     /// `image_token_residual_add` GPU dispatch, and the mmproj loader's
     /// fused-`attn_qkv` slice-view extension all ship together. The
@@ -174,16 +161,16 @@ impl ProjectorType {
     ///
     /// `Resampler` / `Other(_)` — no (no kernel path).
     pub fn is_supported(&self) -> bool {
-        // iter-224 Wedge-4c.5: `Qwen3VlMerger` LANDED — every leg of
-        // the Qwen3-VL forward path (ViT forward in vit_gpu_qwen3vl.rs,
+        // iter-224 Wedge-4c.5: `QwenVisionMerger` LANDED — every leg of
+        // the Qwen3-VL forward path (ViT forward in vit_gpu_qwen.rs,
         // LM-side hooks at forward_gpu.rs, image_token_residual_add
         // GPU dispatch, fused-attn_qkv loader) is wired before this
         // gate flipped. The matching assertion at
-        // `projector_supported_for_qwen3vl_merger_after_wedge_4c5`
+        // `projector_supported_for_qwen_vision_merger_after_wedge_4c5`
         // (tests below) regression-guards the flip.
         matches!(
             self,
-            ProjectorType::Mlp | ProjectorType::Gemma4v | ProjectorType::Qwen3VlMerger
+            ProjectorType::Mlp | ProjectorType::Gemma4v | ProjectorType::QwenVisionMerger
         )
     }
 }
@@ -219,10 +206,10 @@ pub struct MmprojConfig {
     pub image_min_pixels: Option<u32>,
     /// Optional decoded-image area ceiling carried by the projector artifact.
     pub image_max_pixels: Option<u32>,
-    // ---- Qwen3-VL extensions (iter-224 Wedge-4b) -----------------------
-    /// `clip.vision.spatial_merge_size` — Qwen3-VL spatial-merger
+    // ---- Qwen conditional-generation projector extensions --------------
+    /// `clip.vision.spatial_merge_size` — Qwen spatial-merger
     /// degree (typically `2`, giving 2×2 patch fold + 4× token
-    /// reduction). `None` for non-Qwen3-VL profiles. Source key:
+    /// reduction). `None` for other profiles. Source key:
     /// `KEY_SPATIAL_MERGE_SIZE` at clip-impl.h:49.
     pub spatial_merge_size: Option<u32>,
     /// `clip.vision.projection_dim` — the LM hidden size the projector
@@ -251,7 +238,7 @@ pub struct MmprojConfig {
 /// per the peer's convention) and convert to a
 /// sorted ascending `Vec<u32>` of true-flagged layer indexes.
 ///
-/// Returns `Ok(None)` when the key is absent (non-Qwen3-VL mmproj).
+/// Returns `Ok(None)` when the key is absent.
 /// Returns `Ok(Some(vec))` when present, where `vec` may be empty.
 /// Returns `Err` when:
 ///   - the value is present but not an `Array`,
@@ -501,15 +488,15 @@ pub fn vit_layer_tensor(layer_idx: usize, suffix: &str) -> String {
 }
 
 /// Supported architectural profile for an mmproj GGUF. Different
-/// producers (SigLIP, CLIP, Gemma 4 vision tower, Qwen3-VL) carry
+/// producers (SigLIP, CLIP, Gemma 4, and Qwen vision towers) carry
 /// different tensor-name conventions. The profile is auto-detected
 /// from the actual tensor set at startup; forward-pass dispatch
 /// branches on it.
 ///
 /// Detection rule (order matters — first match wins):
-///   - `Qwen3VlSiglip` — file ships `v.deepstack.0.fc1.weight` (the
-///     unique Qwen3-VL DeepStack head). This wins
-///     over `Gemma4Siglip` because Qwen3-VL inherits Gemma 4's
+///   - `QwenVisionSiglip` — file ships `v.deepstack.0.fc1.weight` (the
+///     unique Qwen DeepStack head). This wins
+///     over `Gemma4Siglip` because the Qwen profile inherits Gemma 4's
 ///     `ln1`/`ln2` per-block layout but adds DeepStack on top.
 ///   - `Gemma4Siglip` — per-block has `ln1.weight`, `ln2.weight`, and
 ///     `ffn_post_norm.weight` (Gemma 4's dual-LN SigLIP variant —
@@ -518,23 +505,19 @@ pub fn vit_layer_tensor(layer_idx: usize, suffix: &str) -> String {
 ///     default CLIP-style writer).
 ///   - `Unknown`      — none matched. Forward pass not supported.
 ///
-/// **iter-224 Wedge-4b**: `Qwen3VlSiglip` is added at parse-time but
-/// `is_supported()` returns `false` until Wedge-4c lands the
-/// runtime forward path at `vit_gpu.rs:2412`. This keeps
-/// listing-without-serving working on Qwen3-VL mmproj while
-/// `serve --mmproj` rejects it cleanly.
+/// `QwenVisionSiglip` is fully supported by the shared Qwen vision path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchProfile {
     Gemma4Siglip,
     ClipClassic,
-    /// Qwen3-VL SigLIP variant — inherits CLIP-classic per-block
+    /// Qwen SigLIP variant — inherits CLIP-classic per-block
     /// `attn_norm` + `ln1`/`ln2` layout but adds per-flagged-layer
     /// `v.deepstack.{N}.{norm,fc1,fc2}.{weight,bias}` heads on top
     /// of the standard `mm.0`/`mm.2` 2-layer MLP projector. Selected
     /// via the DeepStack tensor marker (see `detect_arch_profile`)
-    /// or via `ProjectorType::Qwen3VlMerger` (see
+    /// or via `ProjectorType::QwenVisionMerger` (see
     /// `detect_arch_profile_with_projector`).
-    Qwen3VlSiglip,
+    QwenVisionSiglip,
     Unknown,
 }
 
@@ -543,27 +526,26 @@ impl ArchProfile {
         match self {
             ArchProfile::Gemma4Siglip => "gemma4_siglip",
             ArchProfile::ClipClassic => "clip_classic",
-            ArchProfile::Qwen3VlSiglip => "qwen3vl_siglip",
+            ArchProfile::QwenVisionSiglip => QWEN_VISION_PROFILE_WIRE_NAME,
             ArchProfile::Unknown => "unknown",
         }
     }
     /// Whether hf2q has a runtime forward path for this arch.
     ///
-    /// **iter-224 Wedge-4c.5**: `Qwen3VlSiglip` returns `true` —
-    /// `compute_vision_embeddings_gpu_qwen3vl` (vit_gpu_qwen3vl.rs)
+    /// `QwenVisionSiglip` returns `true` —
+    /// `compute_vision_embeddings_gpu_qwen` (vit_gpu_qwen.rs)
     /// supplies the ViT forward; the LM-side split-and-add hooks at
     /// `Qwen35Model::forward_gpu_*_with_soft_tokens` consume the
     /// augmented embed; mmproj loader handles fused `attn_qkv`. Note
-    /// that the chat-handler-side preprocess routing for Qwen3-VL
+    /// The chat-handler-side preprocess routing
     /// (variable-resolution patch grid + 3D-mRoPE positions +
     /// `<|vision_start|><|image_pad|><|vision_end|>` placeholder
     /// expansion) is Wedge-4d territory — when an image-bearing
-    /// chat request lands, `process_multimodal_content` fails loud
-    /// with a Wedge-4d-pointing message until that lands.
+    /// is wired through `process_multimodal_content`.
     pub fn is_supported(&self) -> bool {
         matches!(
             self,
-            ArchProfile::Gemma4Siglip | ArchProfile::ClipClassic | ArchProfile::Qwen3VlSiglip
+            ArchProfile::Gemma4Siglip | ArchProfile::ClipClassic | ArchProfile::QwenVisionSiglip
         )
     }
 
@@ -581,7 +563,7 @@ impl ArchProfile {
     pub fn vision_family(&self) -> VisionFamily {
         match self {
             ArchProfile::Gemma4Siglip | ArchProfile::ClipClassic => VisionFamily::Gemma,
-            ArchProfile::Qwen3VlSiglip => VisionFamily::Qwen3Vl,
+            ArchProfile::QwenVisionSiglip => VisionFamily::Qwen,
             ArchProfile::Unknown => VisionFamily::Unknown,
         }
     }
@@ -599,12 +581,12 @@ impl ArchProfile {
 /// - `Gemma4Siglip` / `ClipClassic` → `VisionFamily::Gemma` (placeholder
 ///   `<|image|>`, single special-token id resolved via
 ///   `Tokenizer::token_to_id("<|image|>")`).
-/// - `Qwen3VlSiglip` → `VisionFamily::Qwen3Vl` (placeholder marker
+/// - `QwenVisionSiglip` → `VisionFamily::Qwen` (placeholder marker
 ///   `<|vision_start|><|image_pad|><|vision_end|>` rendered into the
 ///   user message; the inner `<|image_pad|>` is the per-token expansion
 ///   target, with id resolved via
 ///   `Tokenizer::token_to_id("<|image_pad|>")` — id 151655 in canonical
-///   Qwen3-VL tokenizers but resolved at runtime so the loader is the
+///   existing Qwen vision tokenizers but resolved at runtime so the loader is the
 ///   single source of truth).
 /// - `Unknown` → `VisionFamily::Unknown` (handler returns 400).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -616,7 +598,7 @@ pub enum VisionFamily {
     /// `n_image_tokens` copies — the start/end markers count as a single
     /// token each in the tokenized prompt, exactly like peer mtmd
     /// emits at `tools/mtmd/mtmd.cpp:317-319`).
-    Qwen3Vl,
+    Qwen,
     /// Unsupported / unknown profile — handler short-circuits to 400.
     Unknown,
 }
@@ -629,13 +611,13 @@ impl VisionFamily {
     ///
     /// For `Gemma`: `<|image|>` (expanded by
     /// `expand_image_placeholders` to N copies).
-    /// For `Qwen3Vl`: `<|image_pad|>` (the inner placeholder of the
+    /// For `QwenVision`: `<|image_pad|>` (the inner placeholder of the
     /// `<|vision_start|>...<|vision_end|>` triplet; the start/end
     /// markers are NOT expanded — they remain as single tokens).
     pub fn placeholder_token_literal(&self) -> Option<&'static str> {
         match self {
             VisionFamily::Gemma => Some("<|image|>"),
-            VisionFamily::Qwen3Vl => Some("<|image_pad|>"),
+            VisionFamily::Qwen => Some("<|image_pad|>"),
             VisionFamily::Unknown => None,
         }
     }
@@ -643,12 +625,12 @@ impl VisionFamily {
     /// Marker triplet (open + close) that wraps the per-image
     /// placeholder in the rewritten user message. `Gemma` returns
     /// `("", "")` because its chat template handles the wrapping itself;
-    /// `Qwen3Vl` returns `("<|vision_start|>", "<|vision_end|>")`
+    /// `QwenVision` returns `("<|vision_start|>", "<|vision_end|>")`
     /// matching peer at `tools/mtmd/mtmd.cpp:317-319`.
     pub fn marker_pair(&self) -> (&'static str, &'static str) {
         match self {
             VisionFamily::Gemma => ("", ""),
-            VisionFamily::Qwen3Vl => ("<|vision_start|>", "<|vision_end|>"),
+            VisionFamily::Qwen => ("<|vision_start|>", "<|vision_end|>"),
             VisionFamily::Unknown => ("", ""),
         }
     }
@@ -688,7 +670,7 @@ pub fn detect_arch_profile(actual_names: &[&str]) -> ArchProfile {
     // ever ships Qwen3-VL with no flagged layer at index 0,
     // detect_arch_profile_with_projector covers that edge.
     if set.contains("v.deepstack.0.fc1.weight") {
-        return ArchProfile::Qwen3VlSiglip;
+        return ArchProfile::QwenVisionSiglip;
     }
 
     let has_ln_pair = set.contains("v.blk.0.ln1.weight") && set.contains("v.blk.0.ln2.weight");
@@ -706,7 +688,7 @@ pub fn detect_arch_profile(actual_names: &[&str]) -> ArchProfile {
 /// Projector-aware variant of `detect_arch_profile`. Use this when
 /// the parsed `MmprojConfig` is available (e.g. inside the serve-side
 /// startup pipeline that just ran `MmprojConfig::from_gguf`). When
-/// `projector == Qwen3VlMerger` the profile is `Qwen3VlSiglip`
+/// `projector == QwenVisionMerger` the profile is `QwenVisionSiglip`
 /// regardless of which tensors are present — the projector_type
 /// string is the most decisive signal because the peer
 /// gates its qwen3vl graph builder on it.
@@ -716,8 +698,8 @@ pub fn detect_arch_profile_with_projector(
     projector: &ProjectorType,
     actual_names: &[&str],
 ) -> ArchProfile {
-    if matches!(projector, ProjectorType::Qwen3VlMerger) {
-        return ArchProfile::Qwen3VlSiglip;
+    if matches!(projector, ProjectorType::QwenVisionMerger) {
+        return ArchProfile::QwenVisionSiglip;
     }
     detect_arch_profile(actual_names)
 }
@@ -735,7 +717,7 @@ pub fn detect_arch_profile_with_projector(
 ///   - at least one of `mm.0.weight` / `mm.2.weight` (the projector head)
 ///   - per `MmprojConfig.num_hidden_layers`, the same QKV+output set for
 ///     every block (catches truncated files)
-///   - per Qwen3-VL `MmprojConfig.deepstack_indexes` (when `Some`), the
+///   - per-Qwen `MmprojConfig.deepstack_indexes` (when `Some`), the
 ///     `v.deepstack.{N}.{norm,fc1,fc2}.weight` trio for every flagged
 ///     index. iter-224 Wedge-4b.
 ///
@@ -743,8 +725,7 @@ pub fn detect_arch_profile_with_projector(
 /// `ln1.weight` — those are detected via `ArchProfile` separately and
 /// drive forward-pass dispatch, not boot validation.
 ///
-/// Unsupported projector types (`Resampler`, `Other(_)`, and currently
-/// `Qwen3VlMerger` until Wedge-4c) still fail the check outright —
+/// Unsupported projector types (`Resampler` and `Other(_)`) fail the check outright —
 /// forward pass can't run regardless of tensor completeness.
 ///
 /// Missing tensors batched into one error listing up to 10 names so a
@@ -770,7 +751,7 @@ pub fn detect_arch_profile_with_projector(
 /// the fused `v.blk.{N}.attn_qkv.weight` (Qwen3-VL HF-source canonical,
 /// emitted by the peer's HF converter) OR the
 /// classic split `attn_q/k/v.weight` trio. Mixing is rejected loud
-/// (producer bug). `Qwen3VlMerger.is_supported()` returns true after
+/// (producer bug). `QwenVisionMerger.is_supported()` returns true after
 /// this iter, so a tensor-complete Qwen3-VL mmproj passes the gate
 /// rather than surfacing the old "not yet supported" reject.
 pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<()> {
@@ -882,7 +863,7 @@ pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<
     // (per `cfg.deepstack_indexes`), require the trio
     // `v.deepstack.{N}.{norm,fc1,fc2}.weight`. iter-224 Wedge-4b: this
     // check runs whenever `deepstack_indexes` is `Some(_)`, regardless
-    // of whether the projector is `Qwen3VlMerger` — a Gemma 4 mmproj
+    // of whether the projector is `QwenVisionMerger` — a Gemma 4 mmproj
     // that somehow shipped a deepstack-indexes key would produce a
     // sensible error here too. When `deepstack_indexes` is `None`
     // (no GGUF metadata key, the universal case), no DeepStack
@@ -923,7 +904,7 @@ pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<
     }
 
     // Tensor-set is complete — final gate is the projector-supported
-    // check. iter-224 Wedge-4b: `Qwen3VlMerger` lands here with a
+    // check. iter-224 Wedge-4b: `QwenVisionMerger` lands here with a
     // tensor-complete file but `is_supported() = false`, producing the
     // canonical "not yet supported" error so the validator's overall
     // verdict stays "reject at serve startup". Wedge-4c flips
@@ -964,11 +945,11 @@ mod tests {
         // iter-224 Wedge-4b: qwen3vl_merger parses to its own variant.
         // Until Wedge-4c lands the runtime forward, `is_supported()` on
         // this variant remains false (regression-guarded by
-        // `qwen3vl_merger_is_supported_returns_false_until_wedge_4c`
-        // in the dedicated tests/mmproj_qwen3vl.rs file).
+        // `qwen_vision_merger_is_supported_returns_false_until_wedge_4c`
+        // in the dedicated tests/mmproj_qwen_vision.rs file).
         assert_eq!(
             ProjectorType::from_str_gguf("qwen3vl_merger"),
-            ProjectorType::Qwen3VlMerger
+            ProjectorType::QwenVisionMerger
         );
         match ProjectorType::from_str_gguf("q-former") {
             ProjectorType::Other(s) => assert_eq!(s, "q-former"),
@@ -981,14 +962,14 @@ mod tests {
         // All three projector heads have a runtime forward path:
         //   - Mlp            → compute_vision_embeddings_gpu (SigLIP-49)
         //   - Gemma4v        → gemma4v_apply_full_forward_gpu via dispatch
-        //   - Qwen3VlMerger  → compute_vision_embeddings_gpu_qwen3vl via
+        //   - QwenVisionMerger  → compute_vision_embeddings_gpu_qwen via
         //                      dispatch (Wedge-4c.5 LANDED)
         assert!(ProjectorType::Mlp.is_supported());
         assert!(ProjectorType::Gemma4v.is_supported());
-        // iter-224 Wedge-4c.5 LANDED: Qwen3VlMerger is now supported —
+        // iter-224 Wedge-4c.5 LANDED: QwenVisionMerger is now supported —
         // the runtime ViT forward + LM-side hooks + fused-attn_qkv
         // loader all shipped in the same iter that flipped this bit.
-        assert!(ProjectorType::Qwen3VlMerger.is_supported());
+        assert!(ProjectorType::QwenVisionMerger.is_supported());
         assert!(!ProjectorType::Resampler.is_supported());
         assert!(!ProjectorType::Other("x".into()).is_supported());
     }
@@ -1000,7 +981,7 @@ mod tests {
         assert_eq!(ProjectorType::Gemma4v.as_str(), "gemma4v");
         // iter-224 Wedge-4b: round-trip through the GGUF string form
         // matches `PROJECTOR_TYPE_NAMES[QWEN3VL]` at clip-impl.h:318.
-        assert_eq!(ProjectorType::Qwen3VlMerger.as_str(), "qwen3vl_merger");
+        assert_eq!(ProjectorType::QwenVisionMerger.as_str(), "qwen3vl_merger");
         assert_eq!(ProjectorType::Other("q-former".into()).as_str(), "q-former");
     }
 
@@ -1295,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_arch_profile_with_projector_qwen3vl_no_layer0_deepstack() {
+    fn detect_arch_profile_with_projector_qwen_vision_no_layer0_deepstack() {
         // Phase-2c regression for Wedge-4c.5 Codex review of 2eb1e36
         // (high-severity finding at src/serve/mod.rs:2703): when a real
         // Qwen3-VL GGUF flags DeepStack only at layer indices > 0
@@ -1332,10 +1313,10 @@ mod tests {
         // ProjectorType, which is sourced from the GGUF metadata's
         // `clip.projector_type` string (independent of layer indices).
         assert_eq!(
-            detect_arch_profile_with_projector(&ProjectorType::Qwen3VlMerger, &names),
-            ArchProfile::Qwen3VlSiglip,
-            "projector-aware detector must return Qwen3VlSiglip when \
-             projector_type is Qwen3VlMerger, regardless of which \
+            detect_arch_profile_with_projector(&ProjectorType::QwenVisionMerger, &names),
+            ArchProfile::QwenVisionSiglip,
+            "projector-aware detector must return QwenVisionSiglip when \
+             projector_type is QwenVisionMerger, regardless of which \
              deepstack layer indices the file flagged"
         );
     }
@@ -1344,7 +1325,7 @@ mod tests {
     fn arch_profile_is_supported_only_for_runtime_paths() {
         // iter-224 Wedge-4c.5: all three arch profiles with a runtime
         // ViT forward report supported — Gemma4Siglip, ClipClassic, and
-        // Qwen3VlSiglip (the latter via compute_vision_embeddings_gpu_qwen3vl).
+        // QwenVisionSiglip (the latter via compute_vision_embeddings_gpu_qwen).
         // Unknown never does. NOTE: image-bearing chat requests for
         // Qwen3-VL still fail loud at preprocess routing in
         // `process_multimodal_content` (handlers.rs) until Wedge-4d
@@ -1353,7 +1334,7 @@ mod tests {
         // only.
         assert!(ArchProfile::Gemma4Siglip.is_supported());
         assert!(ArchProfile::ClipClassic.is_supported());
-        assert!(ArchProfile::Qwen3VlSiglip.is_supported());
+        assert!(ArchProfile::QwenVisionSiglip.is_supported());
         assert!(!ArchProfile::Unknown.is_supported());
     }
 
@@ -1361,18 +1342,18 @@ mod tests {
     fn arch_profile_as_str_is_snake_case() {
         assert_eq!(ArchProfile::Gemma4Siglip.as_str(), "gemma4_siglip");
         assert_eq!(ArchProfile::ClipClassic.as_str(), "clip_classic");
-        assert_eq!(ArchProfile::Qwen3VlSiglip.as_str(), "qwen3vl_siglip");
+        assert_eq!(ArchProfile::QwenVisionSiglip.as_str(), "qwen3vl_siglip");
         assert_eq!(ArchProfile::Unknown.as_str(), "unknown");
     }
 
     // -----------------------------------------------------------------------
     // iter-224 Wedge-4b — Qwen3-VL detect_arch_profile + projector-aware
     // detection inline regression guards (full GGUF round-trip lives in
-    // tests/mmproj_qwen3vl.rs).
+    // tests/mmproj_qwen_vision.rs).
     // -----------------------------------------------------------------------
 
     #[test]
-    fn detect_arch_profile_qwen3vl_from_deepstack_marker() {
+    fn detect_arch_profile_qwen_vision_from_deepstack_marker() {
         // Canonical Qwen3-VL detection: presence of any
         // `v.deepstack.{N}.fc1.weight` tensor (clip-impl.h:118).
         let names: Vec<&str> = vec![
@@ -1384,11 +1365,11 @@ mod tests {
             "v.deepstack.0.fc2.weight",
             "v.deepstack.0.norm.weight",
         ];
-        assert_eq!(detect_arch_profile(&names), ArchProfile::Qwen3VlSiglip);
+        assert_eq!(detect_arch_profile(&names), ArchProfile::QwenVisionSiglip);
     }
 
     #[test]
-    fn detect_arch_profile_qwen3vl_marker_wins_over_gemma4_pattern() {
+    fn detect_arch_profile_qwen_vision_marker_wins_over_gemma4_pattern() {
         // Pathological case: a Qwen3-VL mmproj whose per-block layout
         // overlaps the Gemma 4 ln1/ln2/ffn_post_norm trio. The
         // deepstack tensor is the more specific signal — it's unique
@@ -1401,25 +1382,25 @@ mod tests {
             "v.blk.0.attn_q.weight",
             "v.deepstack.0.fc1.weight",
         ];
-        assert_eq!(detect_arch_profile(&names), ArchProfile::Qwen3VlSiglip);
+        assert_eq!(detect_arch_profile(&names), ArchProfile::QwenVisionSiglip);
     }
 
     #[test]
-    fn detect_arch_profile_with_projector_short_circuits_on_qwen3vl_merger() {
+    fn detect_arch_profile_with_projector_short_circuits_on_qwen_vision_merger() {
         // The projector-aware variant: when the parsed projector is
-        // `Qwen3VlMerger`, the profile is `Qwen3VlSiglip` regardless
+        // `QwenVisionMerger`, the profile is `QwenVisionSiglip` regardless
         // of which tensors are enumerated — the same builder-selection
         // rule the peer applies.
         let names: Vec<&str> = vec!["v.patch_embd.weight"]; // no deepstack marker
         assert_eq!(
-            detect_arch_profile_with_projector(&ProjectorType::Qwen3VlMerger, &names),
-            ArchProfile::Qwen3VlSiglip
+            detect_arch_profile_with_projector(&ProjectorType::QwenVisionMerger, &names),
+            ArchProfile::QwenVisionSiglip
         );
     }
 
     #[test]
-    fn detect_arch_profile_with_projector_falls_through_for_non_qwen3vl() {
-        // For non-Qwen3VlMerger projectors the helper defers to the
+    fn detect_arch_profile_with_projector_falls_through_for_non_qwen_vision() {
+        // For non-QwenVisionMerger projectors the helper defers to the
         // tensor-only detection — proves we don't accidentally
         // mis-route a Gemma4Siglip mmproj just because the helper got
         // touched by Wedge-4b.
@@ -1464,7 +1445,7 @@ mod tests {
         );
     }
 
-    fn qwen3vl_cfg(num_layers: u32, deepstack_indexes: Vec<u32>) -> MmprojConfig {
+    fn qwen_vision_cfg(num_layers: u32, deepstack_indexes: Vec<u32>) -> MmprojConfig {
         MmprojConfig {
             image_size: 768,
             patch_size: 16,
@@ -1474,7 +1455,7 @@ mod tests {
             num_attention_heads: 16,
             num_hidden_layers: num_layers,
             layer_norm_eps: 1e-6,
-            projector: ProjectorType::Qwen3VlMerger,
+            projector: ProjectorType::QwenVisionMerger,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
             image_min_pixels: None,
@@ -1487,7 +1468,7 @@ mod tests {
 
     /// Build a Qwen3-VL minimum tensor set: universal tensors + per-block
     /// QKV+output + mm.0.weight + per-flagged-deepstack-layer trio.
-    fn qwen3vl_minimum_tensor_names(num_layers: u32, flagged: &[u32]) -> Vec<String> {
+    fn qwen_vision_minimum_tensor_names(num_layers: u32, flagged: &[u32]) -> Vec<String> {
         let mut names = vec![
             TENSOR_PATCH_EMBD.to_string(),
             TENSOR_POS_EMBD.to_string(),
@@ -1512,31 +1493,31 @@ mod tests {
     }
 
     #[test]
-    fn validate_qwen3vl_complete_set_passes_after_wedge_4c5() {
+    fn validate_qwen_vision_complete_set_passes_after_wedge_4c5() {
         // iter-224 Wedge-4c.5 LANDED: a tensor-complete Qwen3-VL mmproj
         // must PASS the universal/projector/deepstack checks AND the
-        // final projector-supported gate (now true for Qwen3VlMerger).
+        // final projector-supported gate (now true for QwenVisionMerger).
         // This is the green-flip signal — pre-Wedge-4c.5 this test
         // asserted the gate REJECTED with "not yet supported"; flipping
         // the test polarity here is the regression-guard counterpart
         // to flipping `is_supported()`'s matches!() arm.
-        let cfg = qwen3vl_cfg(24, vec![5, 11, 17]);
-        let names = qwen3vl_minimum_tensor_names(24, &[5, 11, 17]);
+        let cfg = qwen_vision_cfg(24, vec![5, 11, 17]);
+        let names = qwen_vision_minimum_tensor_names(24, &[5, 11, 17]);
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         validate_tensor_set(&cfg, &actual).expect(
             "Wedge-4c.5: tensor-complete Qwen3-VL with split attn_q/k/v must validate cleanly \
-             now that ProjectorType::Qwen3VlMerger.is_supported() returns true",
+             now that ProjectorType::QwenVisionMerger.is_supported() returns true",
         );
     }
 
     #[test]
-    fn validate_qwen3vl_flags_missing_deepstack_trio() {
+    fn validate_qwen_vision_flags_missing_deepstack_trio() {
         // Tensor set complete EXCEPT the deepstack tensors for a
         // flagged layer — must surface the specific missing tensor
         // names.
-        let cfg = qwen3vl_cfg(24, vec![5, 11, 17]);
+        let cfg = qwen_vision_cfg(24, vec![5, 11, 17]);
         // Drop layer-11's deepstack trio (flagged-but-missing).
-        let names = qwen3vl_minimum_tensor_names(24, &[5, 17]);
+        let names = qwen_vision_minimum_tensor_names(24, &[5, 17]);
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         let err = validate_tensor_set(&cfg, &actual)
             .expect_err("missing deepstack trio at layer 11 must fail");
@@ -1547,12 +1528,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_qwen3vl_flags_out_of_range_deepstack_index() {
+    fn validate_qwen_vision_flags_out_of_range_deepstack_index() {
         // A writer that emits is_deepstack_layers with an index >=
         // block_count would panic the loader at runtime; the
         // validator must catch it up front.
-        let cfg = qwen3vl_cfg(4, vec![10]); // 10 >= 4 layers
-        let names = qwen3vl_minimum_tensor_names(4, &[]);
+        let cfg = qwen_vision_cfg(4, vec![10]); // 10 >= 4 layers
+        let names = qwen_vision_minimum_tensor_names(4, &[]);
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         let err = validate_tensor_set(&cfg, &actual)
             .expect_err("deepstack index >= block_count must fail");
@@ -1564,30 +1545,30 @@ mod tests {
     }
 
     #[test]
-    fn validate_qwen3vl_no_deepstack_indexes_is_lenient() {
+    fn validate_qwen_vision_no_deepstack_indexes_is_lenient() {
         // When `deepstack_indexes` is None (no GGUF metadata key —
         // the universal case for non-Qwen3-VL files AND a hypothetical
         // older Qwen3-VL fixture that predates the writer), no
         // DeepStack tensors are required.
-        let mut cfg = qwen3vl_cfg(4, vec![]);
+        let mut cfg = qwen_vision_cfg(4, vec![]);
         cfg.deepstack_indexes = None;
         // Use the Mlp projector to bypass the unsupported-projector
         // gate — this test isolates the deepstack-leniency arm.
         cfg.projector = ProjectorType::Mlp;
-        let names = qwen3vl_minimum_tensor_names(4, &[]);
+        let names = qwen_vision_minimum_tensor_names(4, &[]);
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         validate_tensor_set(&cfg, &actual)
             .expect("None deepstack_indexes + complete universal set must pass");
     }
 
     #[test]
-    fn validate_qwen3vl_empty_deepstack_indexes_requires_no_extras() {
+    fn validate_qwen_vision_empty_deepstack_indexes_requires_no_extras() {
         // Some(vec![]) — the GGUF key is present but no layer is
         // flagged. Validator must accept (no extra tensors required)
         // when the universal set is complete.
-        let mut cfg = qwen3vl_cfg(4, vec![]);
+        let mut cfg = qwen_vision_cfg(4, vec![]);
         cfg.projector = ProjectorType::Mlp; // bypass unsupported gate
-        let names = qwen3vl_minimum_tensor_names(4, &[]);
+        let names = qwen_vision_minimum_tensor_names(4, &[]);
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         validate_tensor_set(&cfg, &actual)
             .expect("empty deepstack_indexes with complete universal set must pass");
@@ -1605,7 +1586,7 @@ mod tests {
     /// Build a Qwen3-VL minimum tensor set with FUSED `attn_qkv`
     /// instead of split `attn_q/k/v`. Used by the Wedge-4c.5 validator
     /// tests below.
-    fn qwen3vl_fused_qkv_tensor_names(num_layers: u32, flagged: &[u32]) -> Vec<String> {
+    fn qwen_vision_fused_qkv_tensor_names(num_layers: u32, flagged: &[u32]) -> Vec<String> {
         let mut names = vec![
             TENSOR_PATCH_EMBD.to_string(),
             TENSOR_POS_EMBD.to_string(),
@@ -1625,13 +1606,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_qwen3vl_fused_attn_qkv_accepted() {
+    fn validate_qwen_vision_fused_attn_qkv_accepted() {
         // Wedge-4c.5: a Qwen3-VL mmproj with fused `attn_qkv.weight`
         // (canonical from the peer's HF converter) must validate
         // cleanly. This is the green-flip companion to the loader's
         // slice-view extension.
-        let cfg = qwen3vl_cfg(24, vec![5, 11, 17]);
-        let names = qwen3vl_fused_qkv_tensor_names(24, &[5, 11, 17]);
+        let cfg = qwen_vision_cfg(24, vec![5, 11, 17]);
+        let names = qwen_vision_fused_qkv_tensor_names(24, &[5, 11, 17]);
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         validate_tensor_set(&cfg, &actual).expect(
             "Wedge-4c.5: tensor-complete Qwen3-VL with FUSED attn_qkv must validate cleanly",
@@ -1639,24 +1620,24 @@ mod tests {
     }
 
     #[test]
-    fn validate_qwen3vl_split_attn_qkv_still_accepted() {
+    fn validate_qwen_vision_split_attn_qkv_still_accepted() {
         // Wedge-4c.5: the split form (legacy, hf2q-converted) must
         // remain accepted — both loader paths are equivalent. This is
         // a regression-guard against accidentally requiring fused.
-        let cfg = qwen3vl_cfg(24, vec![5, 11, 17]);
-        let names = qwen3vl_minimum_tensor_names(24, &[5, 11, 17]);
+        let cfg = qwen_vision_cfg(24, vec![5, 11, 17]);
+        let names = qwen_vision_minimum_tensor_names(24, &[5, 11, 17]);
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         validate_tensor_set(&cfg, &actual)
             .expect("split attn_q/k/v.weight trio must remain a valid Qwen3-VL form");
     }
 
     #[test]
-    fn validate_qwen3vl_mixed_qkv_form_rejected() {
+    fn validate_qwen_vision_mixed_qkv_form_rejected() {
         // Wedge-4c.5: a producer that emits BOTH fused AND split for
         // the same block is a bug — the loader can't deterministically
         // pick which to use. Validator must surface this loud.
-        let cfg = qwen3vl_cfg(4, vec![]);
-        let mut names = qwen3vl_minimum_tensor_names(4, &[]);
+        let cfg = qwen_vision_cfg(4, vec![]);
+        let mut names = qwen_vision_minimum_tensor_names(4, &[]);
         // Add the fused tensor at block 0 — now block 0 has BOTH split
         // attn_q/k/v.weight AND fused attn_qkv.weight.
         names.push(vit_layer_tensor(0, "attn_qkv.weight"));
@@ -1671,13 +1652,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_qwen3vl_missing_qkv_names_fused_alternative() {
+    fn validate_qwen_vision_missing_qkv_names_fused_alternative() {
         // Wedge-4c.5: when QKV is entirely missing (neither fused nor
         // split), the error message must NAME the fused alternative
         // so a producer reading the diagnostic knows both forms are
         // accepted (avoids whack-a-mole adding split tensors when the
         // fused tensor would have been simpler).
-        let cfg = qwen3vl_cfg(2, vec![]);
+        let cfg = qwen_vision_cfg(2, vec![]);
         // Only ship the universals + attn_out + projector head (no
         // QKV in any form).
         let mut names = vec![

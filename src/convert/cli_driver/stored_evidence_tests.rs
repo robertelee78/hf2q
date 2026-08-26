@@ -484,7 +484,19 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                 assert_eq!(logits.len(), prompt_tokens.len() * 32);
                 let next = session.forward_greedy(1, [9, 9, 9, 9]).unwrap();
                 assert!(next < 32);
-                assert_eq!(session.encoded_dispatches().len(), 30);
+                assert_eq!(
+                    session.encoded_dispatches().len(),
+                    28,
+                    "unexpected encoded operations: {:?}",
+                    session
+                        .encoded_dispatches()
+                        .iter()
+                        .map(|observation| (
+                            observation.trace.request.workload,
+                            observation.operation_id.as_str(),
+                        ))
+                        .collect::<Vec<_>>()
+                );
                 let operation_ids = session
                     .encoded_dispatches()
                     .iter()
@@ -540,10 +552,12 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                     ),
                     (
                         "prompt",
-                        "blk.0.ffn_gate.weight",
-                        node("blk.0.ffn_gate.weight"),
+                        "blk.0.ffn_gate_up_silu",
+                        vec![
+                            "executed:blk.0.ffn_gate.weight".into(),
+                            "executed:blk.0.ffn_up.weight".into(),
+                        ],
                     ),
-                    ("prompt", "blk.0.ffn_up.weight", node("blk.0.ffn_up.weight")),
                     (
                         "prompt",
                         "blk.0.ffn_down.weight",
@@ -559,10 +573,12 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                     ),
                     (
                         "prompt",
-                        "blk.1.ffn_gate.weight",
-                        node("blk.1.ffn_gate.weight"),
+                        "blk.1.ffn_gate_up_silu",
+                        vec![
+                            "executed:blk.1.ffn_gate.weight".into(),
+                            "executed:blk.1.ffn_up.weight".into(),
+                        ],
                     ),
-                    ("prompt", "blk.1.ffn_up.weight", node("blk.1.ffn_up.weight")),
                     (
                         "prompt",
                         "blk.1.ffn_down.weight",
@@ -608,10 +624,13 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                     .collect::<std::collections::BTreeSet<_>>();
                 assert_eq!(observed_bindings, expected_bindings);
                 for (index, observation) in session.encoded_dispatches().iter().enumerate() {
-                    assert_eq!(observation.trace.mlx_native_version, "0.11.2");
+                    assert_eq!(
+                        observation.trace.mlx_native_version,
+                        crate::inference::MLX_NATIVE_VERSION
+                    );
                     assert_eq!(
                         observation.trace.request.workload,
-                        if index < 16 {
+                        if index < 14 {
                             mlx_native::GgmlWorkloadClass::Prompt
                         } else {
                             mlx_native::GgmlWorkloadClass::DecodeSingle
@@ -642,8 +661,12 @@ fn dense_qwen_stored_evidence_runs_the_authoritative_conversion_loop() {
                     session.duplicate_observation_fails_sealing(),
                     "duplicate operation/workload evidence must fail closed"
                 );
+                assert!(
+                    session.wrong_backend_version_fails_sealing(),
+                    "substituted backend-version evidence must fail closed"
+                );
                 let encoded_catalog = session.seal_encoded_dispatches().unwrap();
-                assert_eq!(encoded_catalog.observations().len(), 30);
+                assert_eq!(encoded_catalog.observations().len(), 28);
                 assert_eq!(encoded_catalog.catalog_sha256().len(), 64);
                 assert_eq!(
                     encoded_catalog.executed_catalog_sha256(),

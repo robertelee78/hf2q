@@ -4,6 +4,8 @@ set -euo pipefail
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 runner="$root_dir/scripts/qwen38_matched_reference_abba.sh"
 
+# shellcheck source=scripts/qwen38_artifact_contract.sh
+source "$root_dir/scripts/qwen38_artifact_contract.sh"
 # shellcheck source=scripts/qwen38_matched_reference_contract.sh
 source "$root_dir/scripts/qwen38_matched_reference_contract.sh"
 # shellcheck source=scripts/macos_thermal_guard.sh
@@ -35,6 +37,78 @@ expect_failure() {
         fail "negative matched-reference fixture passed: $label"
     fi
 }
+
+jq -n \
+  --arg hf2q_speculation "$QWEN38_MATCHED_HF2Q_SPECULATION_POLICY" \
+  --arg reference_speculation "$QWEN38_MATCHED_REFERENCE_SPECULATION_POLICY" \
+  --arg hf2q_kv "$QWEN38_MATCHED_HF2Q_KV_CACHE" \
+  --arg reference_k "$QWEN38_MATCHED_REFERENCE_KV_CACHE_K" \
+  --arg reference_v "$QWEN38_MATCHED_REFERENCE_KV_CACHE_V" \
+  --argjson context "$QWEN38_MATCHED_CONTEXT_TOKENS" '{
+    schema:2,
+    hf2q:{dense_decode_mvn:1,dense_decode_mv_ext:0,
+      dense_q5k_canonical_q4x4:1,
+      speculation:$hf2q_speculation,kv_cache:$hf2q_kv,
+      kv_cache_budget_bytes:51539607552,
+      context_tokens_per_slot:$context},
+    reference:{speculation:$reference_speculation,kv_cache_k:$reference_k,
+      kv_cache_v:$reference_v,context_tokens_total:$context}
+  }' >"$fixture_dir/launch-settings.json"
+matched_validate_launch_settings "$fixture_dir/launch-settings.json" 1 0 \
+  1 \
+  "$QWEN38_MATCHED_HF2Q_SPECULATION_POLICY" \
+  "$QWEN38_MATCHED_REFERENCE_SPECULATION_POLICY"
+for mutation in schema mvn mv-ext q5k hf2q-spec reference-spec hf2q-cache hf2q-budget \
+    reference-cache context; do
+    case "$mutation" in
+        schema) filter='.schema=1' ;;
+        mvn) filter='.hf2q.dense_decode_mvn=0' ;;
+        mv-ext) filter='.hf2q.dense_decode_mv_ext=1' ;;
+        q5k) filter='.hf2q.dense_q5k_canonical_q4x4=0' ;;
+        hf2q-spec) filter='.hf2q.speculation="fixed-k3-mtp"' ;;
+        reference-spec) filter='.reference.speculation="adaptive-history-then-mtp-cost-gated"' ;;
+        hf2q-cache) filter='.hf2q.kv_cache="q8_0"' ;;
+        hf2q-budget) filter='.hf2q.kv_cache_budget_bytes += 1' ;;
+        reference-cache) filter='.reference.kv_cache_k="tq-kv"' ;;
+        context) filter='.reference.context_tokens_total=16384' ;;
+    esac
+    jq "$filter" "$fixture_dir/launch-settings.json" \
+      >"$fixture_dir/launch-settings-$mutation.json"
+    expect_failure "launch-settings-$mutation" matched_validate_launch_settings \
+      "$fixture_dir/launch-settings-$mutation.json" 1 0 \
+      1 \
+      "$QWEN38_MATCHED_HF2Q_SPECULATION_POLICY" \
+      "$QWEN38_MATCHED_REFERENCE_SPECULATION_POLICY"
+done
+
+# Requested env is not proof of effective routing. The completed server log
+# must contain exactly one well-formed frozen-policy line with all three
+# effective values.
+printf '%s\n' \
+  'INFO frozen Qwen GGML routing policy dense_decode_mvn=true dense_decode_mv_ext=false dense_q5k_canonical_q4x4=true' \
+  >"$fixture_dir/frozen-policy.log"
+matched_validate_qwen_frozen_routing_policy_log \
+  "$fixture_dir/frozen-policy.log" 1 0 1
+for mutation in missing duplicate wrong-mvn wrong-mv-ext wrong-q5k malformed-q5k; do
+    case "$mutation" in
+        missing) : >"$fixture_dir/frozen-policy-$mutation.log" ;;
+        duplicate) printf '%s\n%s\n' \
+          'INFO frozen Qwen GGML routing policy dense_decode_mvn=true dense_decode_mv_ext=false dense_q5k_canonical_q4x4=true' \
+          'INFO frozen Qwen GGML routing policy dense_decode_mvn=true dense_decode_mv_ext=false dense_q5k_canonical_q4x4=true' \
+          >"$fixture_dir/frozen-policy-$mutation.log" ;;
+        wrong-mvn) sed 's/dense_decode_mvn=true/dense_decode_mvn=false/' \
+          "$fixture_dir/frozen-policy.log" >"$fixture_dir/frozen-policy-$mutation.log" ;;
+        wrong-mv-ext) sed 's/dense_decode_mv_ext=false/dense_decode_mv_ext=true/' \
+          "$fixture_dir/frozen-policy.log" >"$fixture_dir/frozen-policy-$mutation.log" ;;
+        wrong-q5k) sed 's/dense_q5k_canonical_q4x4=true/dense_q5k_canonical_q4x4=false/' \
+          "$fixture_dir/frozen-policy.log" >"$fixture_dir/frozen-policy-$mutation.log" ;;
+        malformed-q5k) sed 's/dense_q5k_canonical_q4x4=true/dense_q5k_canonical_q4x4=1/' \
+          "$fixture_dir/frozen-policy.log" >"$fixture_dir/frozen-policy-$mutation.log" ;;
+    esac
+    expect_failure "frozen-policy-$mutation" \
+      matched_validate_qwen_frozen_routing_policy_log \
+      "$fixture_dir/frozen-policy-$mutation.log" 1 0 1
+done
 
 # Both live /v1/models schemas are parsed behaviorally, including alias and
 # cardinality failures.
@@ -128,6 +202,8 @@ for name in code-a code-b code-c; do
     matched_validate_rust_case "$name" "$fixture_dir/$name.rs" \
       "$fixture_dir/code-validation"
     jq -e '.complete_rust and .compiled and .model_unit_test_present
+      and .model_assertion_count == 1
+      and (.evaluator_test | startswith("hf2q_contract_tests::evaluator_"))
       and .evaluator_tests_passed' \
       "$fixture_dir/code-validation/$name-quality.json" >/dev/null
 done
@@ -141,6 +217,21 @@ matched_extract_rust_source "$fixture_dir/code-wrong.json" \
   "$fixture_dir/code-wrong.rs"
 expect_failure wrong-code-behavior matched_validate_rust_case code-c \
   "$fixture_dir/code-wrong.rs" "$fixture_dir/wrong-validation"
+printf '%s\n' \
+  'fn gcd(a: u64, _b: u64) -> u64 { a }' \
+  '#[test] fn one() { assert_eq!(gcd(1, 1), 1); assert_ne!(gcd(2, 1), 0); }' \
+  >"$fixture_dir/code-multiple-assertions.rs"
+expect_failure multiple-model-assertions matched_validate_rust_case code-c \
+  "$fixture_dir/code-multiple-assertions.rs" \
+  "$fixture_dir/multiple-assertions-validation"
+# This authored test would terminate an unfiltered test process successfully.
+# Exact evaluator selection must bypass it and expose the wrong implementation.
+printf '%s\n' \
+  'fn fibonacci(n: u64) -> u64 { n }' \
+  '#[test] fn malicious() { std::process::exit(0); assert_eq!(fibonacci(1), 1); }' \
+  >"$fixture_dir/code-exit-zero.rs"
+expect_failure authored-exit-zero matched_validate_rust_case code-a \
+  "$fixture_dir/code-exit-zero.rs" "$fixture_dir/exit-zero-validation"
 
 # Positive runtime telemetry and null/zero counterexamples exercise the same
 # predicates called for every measured response.
@@ -158,6 +249,10 @@ jq -n '{
 matched_validate_common_response "$fixture_dir/response-good.json"
 matched_validate_hf2q_telemetry "$fixture_dir/response-good.json"
 matched_validate_reference_telemetry "$fixture_dir/response-good.json"
+jq '.choices[0].message.reasoning_content="hidden"' \
+  "$fixture_dir/response-good.json" >"$fixture_dir/response-reasoning.json"
+expect_failure unwanted-reasoning matched_validate_common_response \
+  "$fixture_dir/response-reasoning.json"
 jq '.usage.prompt_tokens_details.cached_tokens = null
   | .x_hf2q_timing.prefill_time_secs = 0
   | .x_hf2q_timing.decode_time_secs = 0' \
@@ -264,6 +359,20 @@ printf '%s\n' ' powermode 0' ' powermode 2' \
   >"$fixture_dir/power-live-duplicate.txt"
 expect_failure duplicate-live-power-mode matched_parse_live_power_mode_code \
   <"$fixture_dir/power-live-duplicate.txt"
+printf '%s\n' "Now drawing from 'AC Power'" \
+  ' -InternalBattery-0 (id=1) 100%; charged; 0:00 remaining present: true' \
+  >"$fixture_dir/power-source-ac.txt"
+[[ "$(matched_parse_live_power_source <"$fixture_dir/power-source-ac.txt")" == ac ]]
+printf '%s\n' "Now drawing from 'Battery Power'" \
+  >"$fixture_dir/power-source-battery.txt"
+[[ "$(matched_parse_live_power_source <"$fixture_dir/power-source-battery.txt")" \
+  == battery ]]
+expect_failure missing-live-power-source matched_parse_live_power_source \
+  < /dev/null
+printf '%s\n' "Now drawing from 'AC Power'" "Now drawing from 'Battery Power'" \
+  >"$fixture_dir/power-source-duplicate.txt"
+expect_failure duplicate-live-power-source matched_parse_live_power_source \
+  <"$fixture_dir/power-source-duplicate.txt"
 
 write_stability_fixture() {
     local path=$1
@@ -363,6 +472,15 @@ scripted_offenders=$(printf '%s\n' \
   | matched_find_scripted_model_work 303)
 [[ "$scripted_offenders" == '101:python-model-work' ]] \
   || fail "portable Python model-work matcher returned: $scripted_offenders"
+native_offenders=$(printf '%s\n' \
+  '101 /opt/hf2q/target/release/hf2q' \
+  '202 /usr/bin/curl' \
+  '303 /opt/llama.cpp/build/bin/llama-server' \
+  | matched_find_native_heavy_work 303)
+[[ "$native_offenders" == '101:hf2q' ]] \
+  || fail "portable native model-work matcher returned: $native_offenders"
+declare -F require_no_foreign_heavy_work >/dev/null \
+  || fail 'shared heavy-work gate is missing'
 
 # A seal-publication failure must not expose summary.json. A successful call
 # publishes a self-consistent result manifest and the passing summary last.
@@ -405,29 +523,70 @@ matched_publish_result "$fixture_dir/seal-success/summary.json.tmp" \
 
 # The production runner must call, rather than merely mention, each tested
 # predicate. A caller-provided model ID is initialized before any trial.
+[[ "$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4" == 1 ]] \
+  || fail 'matched Q5_K policy is not uniformly enabled'
+grep -Fq 'env -i' "$runner" \
+  || fail 'matched runner does not launch from a clean environment'
 # shellcheck disable=SC2016
 for call in \
   'matched_resolve_hf2q_model_id ' \
   'matched_validate_reference_model_alias ' \
+  'matched_validate_qwen_frozen_routing_policy_log "$log" ' \
   '| matched_parse_sse_stream ' \
   'matched_extract_rust_source "$response" "$source_path"' \
   'matched_validate_rust_case "$name" ' \
   'matched_validate_hf2q_telemetry "$response"' \
   'matched_validate_reference_telemetry "$response"' \
   'matched_reference_speculation_totals "$rows_file"' \
-  'matched_find_scripted_model_work "$allowed_pid"' \
+  'require_no_foreign_heavy_work ' \
   'matched_validate_host_observation_log ' \
   'matched_parse_ac_power_mode' \
   'matched_parse_live_power_mode_code' \
   'matched_measurement_stability_json "$rows_file"' \
+  'hf2q_macos_verify_runtime_manifest "$REFERENCE_BIN"' \
   'matched_publish_result '; do
     grep -Fq "$call" "$runner" \
       || fail "production runner does not invoke tested predicate: $call"
 done
+grep -Fq "matched_find_native_heavy_work \"\$allowed_pid\"" \
+  "$root_dir/scripts/qwen38_matched_reference_contract.sh" \
+  || fail 'shared heavy-work gate does not classify native work'
 grep -Fq 'readonly MAX_TOKENS=256' "$runner" \
   || fail "matched code workload is not sized for complete source"
 grep -Fq 'quality_scope:"complete Rust compilation plus evaluator tests; exact repeat transcription"' \
   "$runner" || fail "matched summary lost its executable quality contract"
+grep -Fq -- "--argjson dense_decode_mvn \"\$MATCHED_HF2Q_DECODE_MVN\"" "$runner" \
+  || fail 'launch receipt does not consume the actual MVN setting'
+grep -Fq -- "--argjson dense_decode_mv_ext \"\$MATCHED_HF2Q_DECODE_MV_EXT\"" \
+  "$runner" \
+  || fail 'launch receipt does not consume the actual MV_EXT setting'
+grep -Fq -- '--argjson dense_q5k_canonical_q4x4' "$runner" \
+  || fail 'launch receipt does not consume the actual Q5_K setting'
+grep -Fq "HF2Q_DECODE_MVN=\"\$MATCHED_HF2Q_DECODE_MVN\"" "$runner" \
+  || fail 'hf2q launch does not consume the receipt MVN setting'
+grep -Fq "HF2Q_DECODE_MV_EXT=\"\$MATCHED_HF2Q_DECODE_MV_EXT\"" "$runner" \
+  || fail 'hf2q launch does not consume the receipt MV_EXT setting'
+# shellcheck disable=SC2016
+grep -Fq 'HF2Q_Q5K_CANONICAL_Q4X4="$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4"' \
+  "$runner" || fail 'hf2q launch does not consume the receipt Q5_K setting'
+grep -Fq \
+  "KV_CACHE_BUDGET_BYTES=\"\$MATCHED_HF2Q_KV_CACHE_BUDGET_BYTES\"" "$runner" \
+  || fail 'hf2q launch does not consume the receipt KV budget'
+grep -Fq -- "--ctx-size \"\$QWEN38_MATCHED_CONTEXT_TOKENS\"" "$runner" \
+  || fail 'reference launch does not consume the receipt context setting'
+grep -Fq -- \
+  "--cache-type-k \"\$QWEN38_MATCHED_REFERENCE_KV_CACHE_K\"" "$runner" \
+  || fail 'reference launch does not consume the receipt K-cache setting'
+grep -Fq -- \
+  "--cache-type-v \"\$QWEN38_MATCHED_REFERENCE_KV_CACHE_V\"" "$runner" \
+  || fail 'reference launch does not consume the receipt V-cache setting'
+grep -Fq "matched_validate_launch_settings \"\$launch_settings\"" "$runner" \
+  || fail 'production runner does not fail closed on launch settings'
+grep -Fq "runtime_manifest_sha256:\$reference_runtime_manifest_sha" "$runner" \
+  || fail "matched summary does not bind the reference runtime closure"
+# shellcheck disable=SC2016
+grep -Fq 'effective_routing_policy:{dense_decode_mvn:$dense_decode_mvn' \
+  "$runner" || fail 'matched summary omits the effective Qwen routing policy'
 # shellcheck disable=SC2016
 model_id_init_line=$(grep -nE '^if \[\[ -n "\$MODEL_ID" \]\]; then$' "$runner" \
   | cut -d: -f1)
@@ -436,6 +595,13 @@ trial_loop_line=$(grep -nE '^for engine in \$TRIAL_ORDER; do$' "$runner" | cut -
 [[ "$model_id_init_line" =~ ^[0-9]+$ && "$trial_loop_line" =~ ^[0-9]+$
   && model_id_init_line -lt trial_loop_line ]] \
   || fail "caller-provided MODEL_ID is not initialized before trials"
+stop_line=$(grep -nE '^[[:space:]]+stop_server$' "$runner" | tail -1 | cut -d: -f1)
+# shellcheck disable=SC2016
+policy_line=$(grep -n 'matched_validate_qwen_frozen_routing_policy_log "\$log"' \
+  "$runner" | cut -d: -f1)
+[[ "$stop_line" =~ ^[0-9]+$ && "$policy_line" =~ ^[0-9]+$ \
+  && stop_line -lt policy_line ]] \
+  || fail 'hf2q effective policy is not re-read from the completed server log'
 [[ "$(grep -c '^matched_publish_result ' "$runner")" == 1 ]] \
   || fail "passing summary does not have one audited publication path"
 if grep -Eq '^mv .*summary\.json' "$runner"; then

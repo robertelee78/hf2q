@@ -3,6 +3,74 @@
 # Pure, model-free predicates shared by the matched Qwen3.8 runner and its
 # hosted contract test. The caller owns `set -euo pipefail`.
 
+matched_validate_launch_settings() {
+    local settings_path=$1 expected_mvn=$2 expected_mv_ext=$3 expected_q5k=$4
+    local expected_hf2q_speculation=$5 expected_reference_speculation=$6
+
+    [[ "$expected_mvn" =~ ^[01]$ && "$expected_mv_ext" =~ ^[01]$ \
+      && "$expected_q5k" =~ ^[01]$ ]] || return 1
+    jq -e --argjson expected_mvn "$expected_mvn" \
+      --argjson expected_mv_ext "$expected_mv_ext" \
+      --argjson expected_q5k "$expected_q5k" \
+      --arg hf2q_speculation "$expected_hf2q_speculation" \
+      --arg reference_speculation "$expected_reference_speculation" \
+      --arg hf2q_kv "$QWEN38_MATCHED_HF2Q_KV_CACHE" \
+      --arg reference_k "$QWEN38_MATCHED_REFERENCE_KV_CACHE_K" \
+      --arg reference_v "$QWEN38_MATCHED_REFERENCE_KV_CACHE_V" \
+      --argjson hf2q_kv_budget "$QWEN38_CANONICAL_KV_CACHE_BUDGET_BYTES" \
+      --argjson context_tokens "$QWEN38_MATCHED_CONTEXT_TOKENS" '
+      .schema == 2
+      and .hf2q.dense_decode_mvn == $expected_mvn
+      and .hf2q.dense_decode_mv_ext == $expected_mv_ext
+      and .hf2q.dense_q5k_canonical_q4x4 == $expected_q5k
+      and .hf2q.speculation == $hf2q_speculation
+      and .reference.speculation == $reference_speculation
+      and .hf2q.kv_cache == $hf2q_kv
+      and .reference.kv_cache_k == $reference_k
+      and .reference.kv_cache_v == $reference_v
+      and .hf2q.kv_cache_budget_bytes == $hf2q_kv_budget
+      and .hf2q.context_tokens_per_slot == $context_tokens
+      and .reference.context_tokens_total == $context_tokens
+    ' "$settings_path" >/dev/null
+}
+
+# Re-open a completed hf2q server log and bind the requested dense policy to
+# the model's one frozen effective-policy receipt. Requested environment alone
+# is not authority: missing, duplicate, malformed, or conflicting load lines
+# all fail closed.
+matched_validate_qwen_frozen_routing_policy_log() {
+    local log_path=$1 expected_mvn=$2 expected_mv_ext=$3 expected_q5k=$4
+    local expected_mvn_bool=false expected_mv_ext_bool=false expected_q5k_bool=false
+
+    [[ -f "$log_path" && -r "$log_path" && ! -L "$log_path" \
+      && "$expected_mvn" =~ ^[01]$ && "$expected_mv_ext" =~ ^[01]$ \
+      && "$expected_q5k" =~ ^[01]$ ]] || return 1
+    [[ "$expected_mvn" == 1 ]] && expected_mvn_bool=true
+    [[ "$expected_mv_ext" == 1 ]] && expected_mv_ext_bool=true
+    [[ "$expected_q5k" == 1 ]] && expected_q5k_bool=true
+    EXPECTED_MVN="$expected_mvn_bool" \
+    EXPECTED_MV_EXT="$expected_mv_ext_bool" \
+    EXPECTED_Q5K="$expected_q5k_bool" perl -ne '
+      if (/frozen Qwen GGML routing policy/) {
+        $seen++;
+        @mvn = /\bdense_decode_mvn=(true|false)\b/g;
+        @mv_ext = /\bdense_decode_mv_ext=(true|false)\b/g;
+        @q5k = /\bdense_q5k_canonical_q4x4=(true|false)\b/g;
+        $valid = 0 unless @mvn == 1 && @mv_ext == 1 && @q5k == 1;
+        $actual_mvn = $mvn[0] if @mvn == 1;
+        $actual_mv_ext = $mv_ext[0] if @mv_ext == 1;
+        $actual_q5k = $q5k[0] if @q5k == 1;
+      }
+      BEGIN { $valid = 1 }
+      END {
+        exit 1 unless $valid && $seen == 1
+          && $actual_mvn eq $ENV{EXPECTED_MVN}
+          && $actual_mv_ext eq $ENV{EXPECTED_MV_EXT}
+          && $actual_q5k eq $ENV{EXPECTED_Q5K};
+      }
+    ' "$log_path"
+}
+
 matched_resolve_hf2q_model_id() {
     local models_json=$1
     jq -er '
@@ -90,6 +158,8 @@ matched_validate_common_response() {
       and .choices[0].message.role == "assistant"
       and (.choices[0].message.content | type == "string" and length > 0)
       and ((.choices[0].message.tool_calls // null) == null)
+      and ((.choices[0].message.reasoning_content // null) == null)
+      and ((.choices[0].message.refusal // null) == null)
       and (.choices[0].finish_reason | type == "string" and length > 0)
       and (.usage.prompt_tokens | type == "number" and floor == . and . > 0)
       and (.usage.completion_tokens | type == "number" and floor == . and . > 0)
@@ -137,7 +207,7 @@ matched_validate_rust_case() {
     local test_binary="$validation_dir/$name-test"
     local compile_log="$validation_dir/$name-rustc.log"
     local test_log="$validation_dir/$name-test.log"
-    local authored_test_count
+    local authored_test_count authored_assertion_count evaluator_test
 
     mkdir -p "$validation_dir"
     authored_test_count=$(awk '
@@ -154,9 +224,18 @@ matched_validate_rust_case() {
         echo "$name must contain exactly one model-authored #[test]" >&2
         return 1
     }
+    authored_assertion_count=$(perl -0777 -ne '
+      my $count = () = /\b(?:debug_)?assert(?:_eq|_ne)?\s*!/g;
+      print "$count\n";
+    ' "$source_path") || return 1
+    [[ "$authored_assertion_count" == 1 ]] || {
+        echo "$name must contain exactly one model-authored assertion" >&2
+        return 1
+    }
     cp "$source_path" "$contract_source"
     case "$name" in
         code-a)
+            evaluator_test=hf2q_contract_tests::evaluator_fibonacci_contract
             cat >>"$contract_source" <<'RUST'
 
 #[cfg(test)]
@@ -164,15 +243,16 @@ mod hf2q_contract_tests {
     use super::*;
     #[test]
     fn evaluator_fibonacci_contract() {
-        assert_eq!(fibonacci(0), 0);
-        assert_eq!(fibonacci(1), 1);
-        assert_eq!(fibonacci(2), 1);
-        assert_eq!(fibonacci(10), 55);
+        ::std::assert_eq!(fibonacci(0), 0);
+        ::std::assert_eq!(fibonacci(1), 1);
+        ::std::assert_eq!(fibonacci(2), 1);
+        ::std::assert_eq!(fibonacci(10), 55);
     }
 }
 RUST
             ;;
         code-b)
+            evaluator_test=hf2q_contract_tests::evaluator_binary_search_contract
             cat >>"$contract_source" <<'RUST'
 
 #[cfg(test)]
@@ -181,15 +261,16 @@ mod hf2q_contract_tests {
     #[test]
     fn evaluator_binary_search_contract() {
         let values = [1, 3, 5, 7];
-        assert_eq!(binary_search(&values, 1), Some(0));
-        assert_eq!(binary_search(&values, 5), Some(2));
-        assert_eq!(binary_search(&values, 2), None);
-        assert_eq!(binary_search(&[], 9), None);
+        ::std::assert_eq!(binary_search(&values, 1), Some(0));
+        ::std::assert_eq!(binary_search(&values, 5), Some(2));
+        ::std::assert_eq!(binary_search(&values, 2), None);
+        ::std::assert_eq!(binary_search(&[], 9), None);
     }
 }
 RUST
             ;;
         code-c)
+            evaluator_test=hf2q_contract_tests::evaluator_gcd_contract
             cat >>"$contract_source" <<'RUST'
 
 #[cfg(test)]
@@ -197,10 +278,10 @@ mod hf2q_contract_tests {
     use super::*;
     #[test]
     fn evaluator_gcd_contract() {
-        assert_eq!(gcd(48, 18), 6);
-        assert_eq!(gcd(54, 24), 6);
-        assert_eq!(gcd(0, 7), 7);
-        assert_eq!(gcd(13, 13), 13);
+        ::std::assert_eq!(gcd(48, 18), 6);
+        ::std::assert_eq!(gcd(54, 24), 6);
+        ::std::assert_eq!(gcd(0, 7), 7);
+        ::std::assert_eq!(gcd(13, 13), 13);
     }
 }
 RUST
@@ -216,18 +297,36 @@ RUST
         cat "$compile_log" >&2
         return 1
     fi
-    if ! "$test_binary" --quiet >"$test_log" 2>&1; then
+    # Execute only the evaluator-owned test. A model-authored `#[test]` may be
+    # malformed, hang, or call process::exit(0); none of those may short-circuit
+    # the independent behavioral proof. POSIX alarm state survives exec, giving
+    # this hosted-safe test a portable bound on macOS without GNU `timeout`.
+    if ! perl -e '
+      use strict;
+      use warnings;
+      my $seconds = shift @ARGV;
+      alarm $seconds;
+      exec @ARGV or die "exec evaluator: $!";
+    ' 30 "$test_binary" --quiet --exact "$evaluator_test" \
+      >"$test_log" 2>&1; then
         cat "$test_log" >&2
         rm -f -- "$test_binary"
         return 1
     fi
+    grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$test_log" || {
+        echo "$name evaluator did not report exactly one passing test" >&2
+        cat "$test_log" >&2
+        rm -f -- "$test_binary"
+        return 1
+    }
     rm -f -- "$test_binary"
-    jq -n --arg case "$name" \
+    jq -n --arg case "$name" --arg evaluator_test "$evaluator_test" \
       --arg source_sha256 "$(shasum -a 256 "$source_path" | awk '{print $1}')" \
       '{schema:1,case:$case,complete_rust:true,compiled:true,
-        model_unit_test_present:true,evaluator_tests_passed:true,
+        model_unit_test_present:true,model_assertion_count:1,
+        evaluator_test:$evaluator_test,evaluator_tests_passed:true,
         source_sha256:$source_sha256}' \
-      >"$validation_dir/$name-quality.json"
+          >"$validation_dir/$name-quality.json"
 }
 
 matched_validate_hf2q_telemetry() {
@@ -356,6 +455,21 @@ matched_parse_live_power_mode_code() {
     '
 }
 
+# Parse the public power-source banner from a complete `pmset -g batt`
+# capture. Callers capture the command output before invoking this parser so
+# `set -o pipefail` cannot turn an early-match reader into a producer-SIGPIPE
+# false negative. Unknown or duplicate banners fail closed.
+matched_parse_live_power_source() {
+    awk '
+      /^Now drawing from '\''AC Power'\''$/ { source = "ac"; matches++ }
+      /^Now drawing from '\''Battery Power'\''$/ { source = "battery"; matches++ }
+      END {
+        if (matches != 1) exit 1
+        print source
+      }
+    '
+}
+
 # Read `ps -axo pid=,command=` rows from stdin and report Python processes
 # whose command line identifies model work. Keep this parser in the sourced
 # contract so the macOS awk implementation used by production is exercised by
@@ -373,6 +487,42 @@ matched_find_scripted_model_work() {
         }
       }
     '
+}
+
+# Read `ps -axo pid=,comm=` rows from stdin and identify native heavy work.
+# Keeping classification pure makes the macOS awk expression mutation-testable
+# without racing the live multi-agent host.
+matched_find_native_heavy_work() {
+    local allowed_pid=$1
+    awk -v allowed="$allowed_pid" '
+      {
+        pid = $1
+        $1 = ""
+        sub(/^[[:space:]]+/, "", $0)
+        name = tolower($0)
+        sub(/^.*\//, "", name)
+        if (pid != allowed && name ~ /^(hf2q|llama-server|llama-cli|llama-bench|cargo|rustc|ollama|mlx-lm|mlx_lm|swift-frontend)([0-9.-]|$)/) {
+          print pid ":" name
+        }
+      }
+    '
+}
+
+# Fail closed when calibrated hardware is shared with model, compiler, or
+# another inference process. The current server PID is the sole exception.
+require_no_foreign_heavy_work() {
+    local allowed_pid=$1 offenders scripted_offenders
+    offenders=$(/bin/ps -axo pid=,comm= \
+      | matched_find_native_heavy_work "$allowed_pid") || return 1
+    scripted_offenders=$(/bin/ps -axo pid=,command= \
+      | matched_find_scripted_model_work "$allowed_pid") || return 1
+    if [[ -n "$scripted_offenders" ]]; then
+        offenders=${offenders:+$offenders$'\n'}$scripted_offenders
+    fi
+    [[ -z "$offenders" ]] || {
+        echo "foreign calibrated-host work detected: $offenders" >&2
+        return 1
+    }
 }
 
 matched_validate_calibration_alignment() {

@@ -2,13 +2,15 @@
 set -euo pipefail
 
 # Matched single-user Qwen3.8 comparison on one exact GGUF. This developer
-# harness runs hf2q and a caller-bound clean reference HEAD sequentially; the
-# reference is never a product dependency or conversion pin. Fresh servers run in ABBA order,
+# harness runs hf2q and the clean pinned peer sequentially; the peer is never
+# a product dependency or conversion pin. Fresh servers run in ABBA order,
 # every response is retained, and speed is accepted only after complete-code,
 # exact-transcription, and calibrated-host gates pass.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT_DIR="$ROOT_DIR/scripts"
+# shellcheck source=scripts/qwen38_artifact_contract.sh
+source "$SCRIPT_DIR/qwen38_artifact_contract.sh"
 HF2Q_BIN=${HF2Q_BIN:?HF2Q_BIN is required}
 HF2Q_COMMIT=${HF2Q_COMMIT:?HF2Q_COMMIT is required}
 HF2Q_SHA256=${HF2Q_SHA256:?HF2Q_SHA256 is required}
@@ -18,7 +20,13 @@ REFERENCE_COMMIT=${REFERENCE_COMMIT:?REFERENCE_COMMIT is required}
 REFERENCE_SHA256=${REFERENCE_SHA256:?REFERENCE_SHA256 is required}
 MODEL_PATH=${MODEL_PATH:?MODEL_PATH is required}
 MODEL_SHA256=${MODEL_SHA256:?MODEL_SHA256 is required}
-MODEL_BYTES=${MODEL_BYTES:-19535701568}
+MODEL_FORMAT=${MODEL_FORMAT:?MODEL_FORMAT is required}
+artifact_record=$(qwen38_artifact_record "$MODEL_FORMAT")
+IFS=$'\t' read -r qualified_model_format qualified_model_file \
+  qualified_model_bytes _qualified_model_sha256 qualified_model_file_type \
+  <<<"$artifact_record"
+[[ "$qualified_model_format" == "$MODEL_FORMAT" ]]
+MODEL_BYTES=${MODEL_BYTES:-$qualified_model_bytes}
 OUT_DIR=${OUT_DIR:?OUT_DIR is required and must be fresh}
 PORT=${PORT:-18086}
 MODEL_ID=${MODEL_ID:-}
@@ -31,17 +39,14 @@ readonly SUSTAINED_WARMUP_CASES='warmup-a warmup-b warmup-c'
 readonly MIN_SUSTAINED_WARMUP_TOKENS=512
 readonly MAX_WARMUP_TO_MEASUREMENT_SECONDS=2
 readonly TRIAL_ORDER='hf2q reference reference hf2q'
-readonly EXPECTED_MLX_NATIVE_VERSION='0.11.2'
-readonly EXPECTED_MLX_NATIVE_CHECKSUM='22f4bd6661e77994c6f26a79fdd2c188f3d5252aa7e51616f5feb080b22da8e0'
-readonly QUALIFIED_MODEL_REPOSITORY='jenerallee78/Qwen3.8-27B-Abliterated-SFT'
-readonly QUALIFIED_MODEL_REVISION='0a72776892f98db49381fdf69f4b9982222ec9dc'
-readonly QUALIFIED_MODEL_FILE='gguf/qwen38-abliterated-sft-q5_k_m.gguf'
-readonly QUALIFIED_MODEL_SHA256='4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e'
 readonly THERMAL_SETTLE_SECONDS=120
 readonly THERMAL_SETTLE_TIMEOUT_SECONDS=900
 readonly THERMAL_SAMPLE_SECONDS=2
 readonly MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT=5
 readonly MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT=10
+readonly MATCHED_HF2Q_DECODE_MVN=1
+readonly MATCHED_HF2Q_DECODE_MV_EXT=0
+readonly MATCHED_HF2Q_KV_CACHE_BUDGET_BYTES=$QWEN38_CANONICAL_KV_CACHE_BUDGET_BYTES
 
 if [[ ${HF2Q_THERMAL_SWIFTC_BIN+x} || ${HF2Q_THERMAL_PROBE_BIN+x} \
   || ${HF2Q_THERMAL_PROBE_SOURCE+x} ]]; then
@@ -54,11 +59,13 @@ readonly HF2Q_THERMAL_SWIFTC_BIN=/usr/bin/swiftc
 source "$SCRIPT_DIR/qwen36_watchdog_validate.sh"
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$SCRIPT_DIR/macos_thermal_guard.sh"
+# shellcheck source=scripts/macos_runtime_identity.sh
+source "$SCRIPT_DIR/macos_runtime_identity.sh"
 # shellcheck source=scripts/qwen38_matched_reference_contract.sh
 source "$SCRIPT_DIR/qwen38_matched_reference_contract.sh"
 
 for command in awk basename caffeinate cat cmp cp curl date dirname find git jq kill \
-  lsof mkdir mv perl pmset ps rg rustc sed shasum sort stat sw_vers \
+  lsof mkdir mv otool perl pmset ps realpath rg rustc sed shasum sort stat sw_vers \
   system_profiler sysctl tr uname; do
     command -v "$command" >/dev/null || {
         echo "missing required command: $command" >&2
@@ -75,6 +82,7 @@ for path in "$HF2Q_BIN" "$REFERENCE_BIN"; do
         exit 2
     }
 done
+export HF2Q_MODEL_VERIFICATION_BINARY="$HF2Q_BIN"
 [[ -f "$MODEL_PATH" ]] || {
     echo "Qwen3.8 model is missing: $MODEL_PATH" >&2
     exit 2
@@ -118,10 +126,9 @@ awk -v minimum="$MIN_HF2Q_RATIO" 'BEGIN { exit !(minimum >= 1.0) }' || {
     echo "MIN_HF2Q_RATIO must be >= 1.0" >&2
     exit 2
 }
-[[ "$MODEL_SHA256" == "$QUALIFIED_MODEL_SHA256" ]] || {
-    echo "matched Q5_K_M gate requires the qualified model SHA-256" >&2
-    exit 2
-}
+qwen38_validate_artifact_identity "$MODEL_FORMAT" "$MODEL_SHA256" \
+  "$MODEL_BYTES" "$qualified_model_file_type"
+qwen38_validate_pinned_peer_commit "$REFERENCE_COMMIT"
 if [[ -e "$OUT_DIR" && -n "$(find "$OUT_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
     echo "matched-reference output directory must be fresh: $OUT_DIR" >&2
     exit 2
@@ -191,7 +198,7 @@ file_bytes() {
 }
 
 require_clean_exact_source "$ROOT_DIR" "$HF2Q_COMMIT" hf2q
-require_clean_exact_source "$REFERENCE_SOURCE_DIR" "$REFERENCE_COMMIT" reference
+require_clean_exact_source "$REFERENCE_SOURCE_DIR" "$REFERENCE_COMMIT" pinned-peer
 [[ "$(sha256_file "$HF2Q_BIN")" == "$HF2Q_SHA256" ]] || {
     echo "hf2q binary SHA-256 mismatch" >&2
     exit 2
@@ -213,6 +220,9 @@ reference_version=$("$REFERENCE_BIN" --version 2>&1)
 hf2q_binary_snapshot=$(file_snapshot "$HF2Q_BIN")
 reference_binary_snapshot=$(file_snapshot "$REFERENCE_BIN")
 [[ -n "$hf2q_binary_snapshot" && -n "$reference_binary_snapshot" ]]
+reference_runtime_manifest=$(hf2q_macos_runtime_manifest "$REFERENCE_BIN")
+reference_runtime_manifest_sha=$(printf '%s\n' "$reference_runtime_manifest" \
+  | shasum -a 256 | awk '{print $1}')
 [[ "$(file_bytes "$MODEL_PATH")" == "$MODEL_BYTES" ]] || {
     echo "Qwen3.8 model byte size mismatch" >&2
     exit 2
@@ -238,12 +248,20 @@ lock_identity=$(awk '
   found && /^version = / { version = $3; gsub(/\"/, "", version); next }
   found && /^checksum = / { checksum = $3; gsub(/\"/, "", checksum); print version " " checksum; exit }
 ' "$ROOT_DIR/Cargo.lock")
-[[ "$lock_identity" == "$EXPECTED_MLX_NATIVE_VERSION $EXPECTED_MLX_NATIVE_CHECKSUM" ]] || {
-    echo "Cargo.lock mlx-native identity is not the qualified release" >&2
+IFS=' ' read -r EXPECTED_MLX_NATIVE_VERSION EXPECTED_MLX_NATIVE_CHECKSUM \
+  <<<"$lock_identity"
+manifest_mlx_native_version=$(sed -nE \
+  's/^mlx-native = "=([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' \
+  "$ROOT_DIR/Cargo.toml")
+[[ "$EXPECTED_MLX_NATIVE_VERSION" == "$manifest_mlx_native_version" \
+  && "$EXPECTED_MLX_NATIVE_CHECKSUM" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "Cargo.toml/Cargo.lock mlx-native identity is not an exact registry release" >&2
     exit 2
 }
 
 mkdir -p "$OUT_DIR/requests" "$OUT_DIR/expected" "$OUT_DIR/trials"
+printf '%s\n' "$reference_runtime_manifest" \
+  >"$OUT_DIR/reference-runtime.sha256"
 git -C "$ROOT_DIR" status --porcelain=v2 >"$OUT_DIR/hf2q-status.txt"
 git -C "$REFERENCE_SOURCE_DIR" status --porcelain=v2 >"$OUT_DIR/reference-status.txt"
 printf '%s\n' "$reference_version" >"$OUT_DIR/reference-version.txt"
@@ -264,12 +282,10 @@ if [[ -z "$model_verification_receipt" ]]; then
     model_verification_mode=$(jq -er .run_verification "$model_verification_receipt")
 else
     provided_model_verification_receipt=$model_verification_receipt
-    hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
-      "$provided_model_verification_receipt"
     model_verification_receipt="$OUT_DIR/model-verification.json"
-    jq . "$provided_model_verification_receipt" >"$model_verification_receipt.tmp"
-    mv "$model_verification_receipt.tmp" "$model_verification_receipt"
-    model_verification_mode=provided_receipt
+    hf2q_release_materialize_model_verification "$MODEL_PATH" "$MODEL_SHA256" \
+      "$provided_model_verification_receipt" "$model_verification_receipt"
+    model_verification_mode=$(jq -er .run_verification "$model_verification_receipt")
 fi
 hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
     "$model_verification_receipt"
@@ -378,20 +394,32 @@ write_launch_settings() {
     jq -n --arg model_id "$MODEL_ID" --argjson port "$PORT" \
       --argjson max_tokens "$MAX_TOKENS" \
       --argjson ttft_max_tokens "$TTFT_MAX_TOKENS" \
+      --arg hf2q_speculation "$QWEN38_MATCHED_HF2Q_SPECULATION_POLICY" \
+      --arg reference_speculation "$QWEN38_MATCHED_REFERENCE_SPECULATION_POLICY" \
+      --arg hf2q_kv_cache "$QWEN38_MATCHED_HF2Q_KV_CACHE" \
+      --arg reference_kv_k "$QWEN38_MATCHED_REFERENCE_KV_CACHE_K" \
+      --arg reference_kv_v "$QWEN38_MATCHED_REFERENCE_KV_CACHE_V" \
+      --argjson context_tokens "$QWEN38_MATCHED_CONTEXT_TOKENS" \
+      --argjson dense_decode_mvn "$MATCHED_HF2Q_DECODE_MVN" \
+      --argjson dense_decode_mv_ext "$MATCHED_HF2Q_DECODE_MV_EXT" \
+      --argjson dense_q5k_canonical_q4x4 \
+        "$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4" \
+      --argjson hf2q_kv_budget "$MATCHED_HF2Q_KV_CACHE_BUDGET_BYTES" \
       --argjson thermal_settle_seconds "$THERMAL_SETTLE_SECONDS" '{
-      schema:1,
+      schema:2,
       common:{model_id:$model_id,port:$port,temperature:0,
         repetition_penalty:1.05,thinking:false,seed:null,
         measured_max_tokens:$max_tokens,stream_ttft_max_tokens:$ttft_max_tokens},
-      hf2q:{slots:1,context_tokens:262144,kv_cache:"tq-kv",
-        kv_cache_budget_bytes:51539607552,scheduler:"inflight-batched",
-        speculation:"shipping-auto-history-then-mtp",
-        dense_decode_mvn:0,dense_decode_mv_ext:1,
+      hf2q:{slots:1,context_tokens_per_slot:$context_tokens,kv_cache:$hf2q_kv_cache,
+        kv_cache_budget_bytes:$hf2q_kv_budget,scheduler:"inflight-batched",
+        speculation:$hf2q_speculation,
+        dense_decode_mvn:$dense_decode_mvn,dense_decode_mv_ext:$dense_decode_mv_ext,
+        dense_q5k_canonical_q4x4:$dense_q5k_canonical_q4x4,
         encoder_session:true,ffn_terminal_k_batch:8},
-      reference:{slots:1,context_tokens:262144,batch_tokens:2048,
+      reference:{slots:1,context_tokens_total:$context_tokens,batch_tokens:2048,
         microbatch_tokens:512,gpu_layers:"all",flash_attention:true,
-        kv_cache_k:"q8_0",kv_cache_v:"q8_0",jinja:true,
-        reasoning:false,speculation:"fixed-k3-mtp",
+        kv_cache_k:$reference_kv_k,kv_cache_v:$reference_kv_v,jinja:true,
+        reasoning:false,speculation:$reference_speculation,
         draft_max:3,draft_min:0,draft_probability_minimum:0,
         draft_backend_sampling:true},
       host_calibration:{power:"ac",energy_mode:"automatic-or-high",
@@ -402,6 +430,11 @@ write_launch_settings() {
           "python model-generation/inference workloads"]}
     }' >"$launch_settings.tmp"
     mv "$launch_settings.tmp" "$launch_settings"
+    matched_validate_launch_settings "$launch_settings" \
+      "$MATCHED_HF2Q_DECODE_MVN" "$MATCHED_HF2Q_DECODE_MV_EXT" \
+      "$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4" \
+      "$QWEN38_MATCHED_HF2Q_SPECULATION_POLICY" \
+      "$QWEN38_MATCHED_REFERENCE_SPECULATION_POLICY"
 }
 
 if [[ -n "$MODEL_ID" ]]; then
@@ -534,33 +567,6 @@ on_exit() {
 }
 trap on_exit EXIT
 trap 'exit 1' INT TERM
-
-require_no_foreign_heavy_work() {
-    local allowed_pid=$1
-    local offenders
-    local scripted_offenders
-    offenders=$(/bin/ps -axo pid=,comm= | awk -v allowed="$allowed_pid" '
-      {
-        pid = $1
-        $1 = ""
-        sub(/^[[:space:]]+/, "", $0)
-        name = tolower($0)
-        sub(/^.*\//, "", name)
-        if (pid != allowed && name ~ /^(hf2q|llama-server|llama-cli|llama-bench|cargo|rustc|ollama|mlx-lm|mlx_lm|swift-frontend)([0-9.-]|$)/) {
-          print pid ":" name
-        }
-      }
-    ')
-    scripted_offenders=$(/bin/ps -axo pid=,command= \
-      | matched_find_scripted_model_work "$allowed_pid")
-    if [[ -n "$scripted_offenders" ]]; then
-        offenders=${offenders:+$offenders$'\n'}$scripted_offenders
-    fi
-    [[ -z "$offenders" ]] || {
-        echo "foreign calibrated-host work detected: $offenders" >&2
-        return 1
-    }
-}
 
 record_calibration_observation() {
     local thermal_log=$1
@@ -715,20 +721,30 @@ launch_server() {
       "$hf2q_binary_snapshot"
     verify_executable_identity reference "$REFERENCE_BIN" "$REFERENCE_SHA256" \
       "$reference_binary_snapshot"
+    hf2q_macos_verify_runtime_manifest "$REFERENCE_BIN" \
+      "$reference_runtime_manifest"
     hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
       "$model_verification_receipt"
     if [[ "$engine" == hf2q ]]; then
-        "${clean_env[@]}" HF2Q_BIN="$HF2Q_BIN" MODEL="$MODEL_PATH" PORT="$PORT" \
-          MAX_SLOTS=1 KV_CACHE_BUDGET_BYTES=51539607552 \
+        "${clean_env[@]}" HF2Q_BIN="$HF2Q_BIN" \
+          HF2Q_MODEL_VERIFICATION_RECEIPT="$model_verification_receipt" \
+          MODEL="$MODEL_PATH" PORT="$PORT" \
+          MAX_SLOTS=1 \
+          KV_CACHE_BUDGET_BYTES="$MATCHED_HF2Q_KV_CACHE_BUDGET_BYTES" \
           QWEN38_VISION=off QWEN38_SPECULATION=auto \
           THINKING_TOKEN_BUDGET=0 TOOL_THINKING_TOKEN_BUDGET=0 \
-          REP_PENALTY=1.05 HF2Q_DECODE_MVN=0 HF2Q_DECODE_MV_EXT=1 \
+          REP_PENALTY=1.05 HF2Q_DECODE_MVN="$MATCHED_HF2Q_DECODE_MVN" \
+          HF2Q_DECODE_MV_EXT="$MATCHED_HF2Q_DECODE_MV_EXT" \
+          HF2Q_Q5K_CANONICAL_Q4X4="$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4" \
           "$SCRIPT_DIR/serve_qwen38_opencode.sh" >"$log" 2>&1 &
     else
         "${clean_env[@]}" "$REFERENCE_BIN" --model "$MODEL_PATH" --alias "$MODEL_ID" \
-          --host 127.0.0.1 --port "$PORT" --parallel 1 --ctx-size 262144 \
+          --host 127.0.0.1 --port "$PORT" --parallel 1 \
+          --ctx-size "$QWEN38_MATCHED_CONTEXT_TOKENS" \
           --batch-size 2048 --ubatch-size 512 --gpu-layers all \
-          --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 \
+          --flash-attn on \
+          --cache-type-k "$QWEN38_MATCHED_REFERENCE_KV_CACHE_K" \
+          --cache-type-v "$QWEN38_MATCHED_REFERENCE_KV_CACHE_V" \
           --jinja --reasoning off --metrics --spec-type draft-mtp \
           --spec-draft-n-max 3 --spec-draft-n-min 0 \
           --spec-draft-p-min 0 --spec-draft-backend-sampling \
@@ -972,6 +988,11 @@ run_trial() {
       "$host_measurement_log"
     [[ ! -e "$trial_dir/calibration-failure.txt" ]]
     stop_server
+    if [[ "$engine" == hf2q ]]; then
+        matched_validate_qwen_frozen_routing_policy_log "$log" \
+          "$MATCHED_HF2Q_DECODE_MVN" "$MATCHED_HF2Q_DECODE_MV_EXT" \
+          "$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4"
+    fi
     verify_power_mode_contract
     qwen36_reject_fatal_log "$log"
     for name in code-a code-b code-c; do
@@ -1226,6 +1247,8 @@ verify_executable_identity hf2q "$HF2Q_BIN" "$HF2Q_SHA256" \
   "$hf2q_binary_snapshot"
 verify_executable_identity reference "$REFERENCE_BIN" "$REFERENCE_SHA256" \
   "$reference_binary_snapshot"
+hf2q_macos_verify_runtime_manifest "$REFERENCE_BIN" \
+  "$reference_runtime_manifest"
 final_reference_version=$("$REFERENCE_BIN" --version 2>&1)
 [[ "$final_reference_version" == "$reference_version" ]]
 rustc_version=$(rustc --version)
@@ -1234,13 +1257,15 @@ hf2q_lock_sha=$(sha256_file "$ROOT_DIR/Cargo.lock")
 hf2q_release_verify_model "$MODEL_PATH" "$MODEL_SHA256" \
   "$model_verification_receipt"
 require_clean_exact_source "$ROOT_DIR" "$HF2Q_COMMIT" hf2q
-require_clean_exact_source "$REFERENCE_SOURCE_DIR" "$REFERENCE_COMMIT" reference
+require_clean_exact_source "$REFERENCE_SOURCE_DIR" "$REFERENCE_COMMIT" pinned-peer
 verify_request_manifest
 [[ "$(sha256_file "$launch_settings")" == "$launch_settings_sha" ]]
 
 script_sha=$(sha256_file "$ROOT_DIR/scripts/qwen38_matched_reference_abba.sh")
 contract_sha=$(sha256_file \
   "$ROOT_DIR/scripts/qwen38_matched_reference_contract.sh")
+artifact_contract_sha=$(sha256_file \
+  "$ROOT_DIR/scripts/qwen38_artifact_contract.sh")
 request_manifest_sha=$(sha256_file "$request_manifest")
 measurements_sha=$(sha256_file "$rows_file")
 ttft_rows_sha=$(sha256_file "$ttft_rows_file")
@@ -1267,11 +1292,14 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --arg reference_commit "$REFERENCE_COMMIT" \
   --arg reference_sha "$REFERENCE_SHA256" \
   --arg reference_binary_snapshot "$reference_binary_snapshot" \
+  --arg reference_runtime_manifest_sha "$reference_runtime_manifest_sha" \
   --arg rustc_version "$rustc_version" \
   --arg model_id "$MODEL_ID" --arg model_path "$MODEL_PATH" \
-  --arg model_repository "$QUALIFIED_MODEL_REPOSITORY" \
-  --arg model_revision "$QUALIFIED_MODEL_REVISION" \
-  --arg model_file "$QUALIFIED_MODEL_FILE" \
+  --arg model_format "$MODEL_FORMAT" \
+  --argjson model_file_type "$qualified_model_file_type" \
+  --arg model_repository "$QWEN38_QUALIFIED_MODEL_REPOSITORY" \
+  --arg model_revision "$QWEN38_QUALIFIED_MODEL_REVISION" \
+  --arg model_file "$qualified_model_file" \
   --arg model_sha "$MODEL_SHA256" \
   --arg model_verification "$model_verification_mode" \
   --arg model_file_snapshot "$model_file_snapshot" \
@@ -1285,6 +1313,7 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --arg thermal_probe_binary_sha "$thermal_probe_binary_sha" \
   --arg script_sha "$script_sha" \
   --arg contract_sha "$contract_sha" \
+  --arg artifact_contract_sha "$artifact_contract_sha" \
   --arg request_manifest_sha "$request_manifest_sha" \
   --arg measurements_sha "$measurements_sha" \
   --arg ttft_rows_sha "$ttft_rows_sha" \
@@ -1306,6 +1335,10 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --argjson reference_repeat_seconds "$reference_repeat" \
   --argjson repeat_ratio "$repeat_ratio" \
   --argjson minimum_ratio "$MIN_HF2Q_RATIO" \
+  --argjson dense_decode_mvn "$MATCHED_HF2Q_DECODE_MVN" \
+  --argjson dense_decode_mv_ext "$MATCHED_HF2Q_DECODE_MV_EXT" \
+  --argjson dense_q5k_canonical_q4x4 \
+    "$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4" \
   --argjson hf2q_proposals "$hf2q_proposals" \
   --argjson hf2q_accepted "$hf2q_accepted" \
   --argjson reference_drafted "$reference_drafted" \
@@ -1314,7 +1347,7 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
   --argjson repeat_quality_receipts "$repeat_quality_receipts" \
   --slurpfile launch_settings "$launch_settings" \
   --slurpfile stability "$stability_json" '{
-    schema:4,verdict:$verdict,
+    schema:5,verdict:$verdict,
     workload:{trial_order:$trial_order,cases_per_group_per_engine:6,
       max_tokens:$max_tokens,temperature:0,repetition_penalty:1.05,seed:null,
       chat_template_kwargs:{enable_thinking:false},
@@ -1331,15 +1364,20 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
       source_binding:"embedded exact commit plus clean exact worktree",
       cargo_lock_sha256:$hf2q_lock_sha,
       mlx_native:{version:$mlx_native_version,checksum:$mlx_native_checksum},
-      speculation:"shipping-auto-history-then-mtp",
+      effective_routing_policy:{dense_decode_mvn:$dense_decode_mvn,
+        dense_decode_mv_ext:$dense_decode_mv_ext,
+        dense_q5k_canonical_q4x4:$dense_q5k_canonical_q4x4},
+      speculation:$launch_settings[0].hf2q.speculation,
       proposals:$hf2q_proposals,accepted_draft_tokens:$hf2q_accepted},
     reference:{commit:$reference_commit,binary_sha256:$reference_sha,
       binary_file_snapshot:$reference_binary_snapshot,
-      source_policy:"caller-bound-clean-current-head",
-      speculation:"fixed-k3-mtp",drafted_tokens:$reference_drafted,
-      accepted_draft_tokens:$reference_accepted,
-      kv_cache:"q8_0-k-and-v"},
-    model:{id:$model_id,path:$model_path,repository:$model_repository,
+      runtime_manifest_sha256:$reference_runtime_manifest_sha,
+      source_policy:"clean exact data/llama_cpp_pin.txt commit",
+      speculation:$launch_settings[0].reference.speculation,
+      drafted_tokens:$reference_drafted,
+      accepted_draft_tokens:$reference_accepted},
+    model:{id:$model_id,path:$model_path,format:$model_format,
+      gguf_file_type:$model_file_type,repository:$model_repository,
       revision:$model_revision,file:$model_file,sha256:$model_sha,
       bytes:$model_bytes,verification:$model_verification,
       file_snapshot:$model_file_snapshot},
@@ -1369,14 +1407,16 @@ jq -n --arg verdict pass --arg trial_order "$TRIAL_ORDER" \
       sample_seconds:2,
       trial_logs:16,manifest_sha256:$calibration_manifest_sha},
     evidence:{script_sha256:$script_sha,contract_sha256:$contract_sha,
+      artifact_contract_sha256:$artifact_contract_sha,
       request_manifest_sha256:$request_manifest_sha,
       launch_settings_sha256:$launch_settings_sha,
       measurements_sha256:$measurements_sha,
       ttft_rows_sha256:$ttft_rows_sha,
+      reference_runtime_manifest_sha256:$reference_runtime_manifest_sha,
       evidence_manifest_sha256:$evidence_manifest_sha}
   }' >"$OUT_DIR/summary.json.tmp"
 jq -e '
-  .schema == 4 and .verdict == "pass"
+  .schema == 5 and .verdict == "pass"
   and .quality.code.complete_rust == true
   and .quality.code.compiled == true
   and .quality.code.model_unit_test_present == true
@@ -1386,17 +1426,33 @@ jq -e '
   and .quality.repeat.natural_stop == true
   and .quality.repeat.exact_across_engines == true
   and .quality.repeat.receipts == 12
+  and ((.model.format == "BF16" and .model.gguf_file_type == 32)
+    or (.model.format == "Q4_K_M" and .model.gguf_file_type == 15)
+    or (.model.format == "Q5_K_M" and .model.gguf_file_type == 17)
+    or (.model.format == "Q6_K" and .model.gguf_file_type == 18)
+    or (.model.format == "Q8_0" and .model.gguf_file_type == 7))
   and .code.hf2q_over_reference >= .acceptance.minimum_hf2q_ratio
   and .repeat.hf2q_over_reference >= .acceptance.minimum_hf2q_ratio
   and .stability.stable == true
   and .stability.observed_band_dominance == true
   and .hf2q.proposals > 0 and .hf2q.accepted_draft_tokens > 0
   and .reference.drafted_tokens > 0 and .reference.accepted_draft_tokens > 0
+  and .launch_settings.hf2q.dense_decode_mvn == 1
+  and .launch_settings.hf2q.dense_decode_mv_ext == 0
+  and .launch_settings.hf2q.dense_q5k_canonical_q4x4 == 1
+  and .hf2q.effective_routing_policy == {
+    dense_decode_mvn:1,dense_decode_mv_ext:0,
+    dense_q5k_canonical_q4x4:1}
+  and .hf2q.speculation == .launch_settings.hf2q.speculation
+  and .reference.speculation == .launch_settings.reference.speculation
   and .streamed_semantic_ttft.hf2q.samples == 2
   and .streamed_semantic_ttft.reference.samples == 2
   and .sustained_warmup.pass == true
   and .calibration.trial_logs == 16
   and (.evidence.evidence_manifest_sha256 | test("^[0-9a-f]{64}$"))
+  and .reference.runtime_manifest_sha256
+    == .evidence.reference_runtime_manifest_sha256
+  and (.reference.runtime_manifest_sha256 | test("^[0-9a-f]{64}$"))
 ' "$OUT_DIR/summary.json.tmp" >/dev/null
 matched_publish_result "$OUT_DIR/summary.json.tmp" "$OUT_DIR/summary.json" \
   "$evidence_manifest" "$OUT_DIR/result.sha256"

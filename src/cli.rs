@@ -95,6 +95,10 @@ impl LogLevel {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Emit exact build provenance for release-gate identity binding.
+    #[command(name = "__build-info", hide = true)]
+    BuildInfo,
+
     /// Internal bootstrap used only by the reviewed standalone installer.
     #[command(name = "__standalone-install", hide = true)]
     StandaloneInstall(StandaloneInstallArgs),
@@ -111,6 +115,10 @@ pub enum Command {
     /// Internal cancellable verifier for one server-owned local GGUF.
     #[command(name = "__verify-local-gguf", hide = true)]
     VerifyLocalGguf(VerifyLocalGgufArgs),
+
+    /// Internal producer for the runtime-safe model verification receipt.
+    #[command(name = "__record-model-verification", hide = true)]
+    RecordModelVerification(RecordModelVerificationArgs),
 
     /// Update hf2q through its detected installation channel.
     Update(UpdateArgs),
@@ -209,6 +217,10 @@ pub struct FetchHubGgufArgs {
     pub sha256: String,
     #[arg(long)]
     pub quant: String,
+    /// Internal server authority: fetch a non-selectable projector whose SHA
+    /// was named by an authenticated text GGUF.
+    #[arg(long, default_value_t = false)]
+    pub companion: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -229,6 +241,14 @@ pub struct VerifyLocalGgufArgs {
     pub sha256: String,
     #[arg(long)]
     pub quant: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RecordModelVerificationArgs {
+    #[arg(long)]
+    pub artifact: PathBuf,
+    #[arg(long)]
+    pub sha256: String,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -581,7 +601,7 @@ pub struct ConvertCliArgs {
     /// operator picks via `--output`.
     ///
     /// Currently supported arches include Gemma 4 multimodal and the
-    /// Qwen3.5/Qwen3-VL conditional-generation families.
+    /// supported Qwen conditional-generation families.
     #[arg(long, default_value_t = false, conflicts_with = "text_only")]
     pub mmproj: bool,
 

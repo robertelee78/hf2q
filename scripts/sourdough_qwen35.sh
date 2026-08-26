@@ -94,7 +94,7 @@ done
 [[ -f "$PROMPT_FILE" ]] || err "prompt fixture not found: $PROMPT_FILE"
 [[ -x "$HF2Q_BIN"  ]] || err "hf2q binary not found at $HF2Q_BIN (run: cargo build --release)"
 
-# Prefer our built-from-/opt/llama.cpp binary over any PATH-resolved one
+# Prefer the operator-built peer binary over any PATH-resolved one.
 # (homebrew ships an older llama-cli that lacks -no-cnv / -st; using a
 # non-matching reference would invalidate the byte-parity oracle).
 if [[ -x "/opt/llama.cpp/build/bin/llama-cli" ]]; then

@@ -1,11 +1,16 @@
 # ADR-010: Exact Batched-Kernel Parity with llama.cpp
 
-**Status:** Parity line **Deferred**. Speed line **Shipping** via lm_head Q8+rerank as the new default strategy (see "lm_head Q8 + Rerank" section below).
+**Status:** Numerical batched-kernel investigation remains open. The historical
+Q8+rerank speed strategy is superseded by ADR-046's 2026-08-22 native-matrix
+execution amendment.
 **Date:** 2026-04-16
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-006 (mlx-native GPU backend), ADR-007 (TurboQuant KV cache), ADR-008 (candle divorce), ADR-009 (reference parity and coherence recovery)
 
-> **TL;DR (2026-04-16 landing):** Default hf2q decode now matches the F16 coherence trajectory on the locked prompts while running at ~98% of llama.cpp throughput via Q8 lm_head + CPU threshold-scan exact rerank. Exact batched-kernel parity against llama.cpp's MoE path remains an open numerical sensitivity issue (sliding_wrap ~752/2327 bytes vs llama batched); the investigation is paused, not closed, and a GPU top-K kernel is committed-but-dormant pending a future parallel-phase-2 redesign.
+> **Historical TL;DR (2026-04-16 landing; not current runtime behavior):** The
+> then-default path used a synthesized Q8 head plus CPU rerank. Exact batched
+> MoE trajectory parity remained open. ADR-046 now requires the stored artifact
+> head and removes the synthesized-head controls.
 
 ---
 
@@ -125,15 +130,19 @@ Not strictly a parity concern, but completed alongside the nondeterminism / drif
 - Memory at a 20k decode budget: 7.4 GB → ~2.75 GB dense KV (−4.6 GB, −62%).
 - All gates pass unchanged; 1353-token coherence test produces identical clean-EOS output at 91.5 tok/s.
 
-## lm_head Q8 + Rerank (2026-04-16, related speed work)
+## Historical lm_head Q8 + Rerank (2026-04-16; superseded 2026-08-22)
 
-lm_head quantization + exact rerank became the default speed path after
-this ADR's router-matmul line was closed. Summary:
+This section records the old experiment; it is not a current operator or
+runtime contract. ADR-046 superseded it after code review established that
+load-time head synthesis changed the served artifact's target representation.
+At the time, lm_head quantization + exact rerank became the default speed path
+after this ADR's router-matmul line was closed:
 
 - **Default (auto):** Q8_0 lm_head + CPU threshold-scan rerank when the
   F16 weight exceeds 256 MB and `hidden_size % 32 == 0`.
-- **Escape hatches:** `HF2Q_LMHEAD_Q8=0` forces F16; `HF2Q_LMHEAD_RERANK=0`
-  disables rerank (leaves raw Q8 argmax, unsafe — occasional pad-emit).
+- **Former escape hatches:** two now-removed environment switches selected
+  synthesized F16 or raw Q8 head execution. Neither is accepted by the
+  current runtime.
 - **Rerank mechanism:** after the Q8 matmul writes full-vocab logits, a
   single CPU pass collects tokens with logit ≥ (Q8 top-1) − 0.5 plus
   specials (0/1/2/105/106), then recomputes exact F32 logits from the
@@ -423,8 +432,6 @@ For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is *
   STARTUP breakdown shows mask_sliding=124.9 ms, but this is **first-dispatch cold-start cost** attributed to the first kernel in the per-prefill graph (mask_sliding fires before mask_global which only takes 1.4 ms for the same kernel + same shape). NOT a real kernel-perf issue; just measurement attribution. iter-66 lumped this into STARTUP=125ms; iter-86 breaks it out — same total, just attributed differently to the first per-prefill kernel.
 
   Remaining gap to llama.cpp (0.70× → 1.0× = ~30%): MoE matmul is still the largest (34%); QKV+O+MLP matmuls together are another ~24%; FA is ~14%. No single dominant bottleneck. Closing further requires either kernel-level work across multiple kernels OR algorithmic change (e.g., kernel fusion).
-
-
 
 
 

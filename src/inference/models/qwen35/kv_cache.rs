@@ -41,6 +41,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::{DType, MlxBuffer, MlxDevice};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use super::gqa_q2_policy::Qwen35TqSdpaParams;
 #[allow(unused_imports)]
@@ -48,8 +49,12 @@ pub use mlx_native::ops::gated_delta_net::cpu_reference_f32 as gated_delta_net_c
 
 use super::gqa_q2_policy::use_gqa_q2_tq_sdpa;
 use super::{Qwen35Config, Qwen35LayerKind};
+use tq_arena::TqArenaLayout;
 
 mod source_teacher;
+mod tq_arena;
+
+static NEXT_HYBRID_CACHE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(super) use source_teacher::{
     plan_qwen35_base_text_cache, prepare_qwen35_base_text_cache, PreparedQwen35BaseTextCacheV1,
@@ -124,10 +129,11 @@ pub struct LinearAttnStateSlot {
     /// recurrent buffer (parity-aware, ADR-040 M-QWEN) via
     /// [`HybridKvCache::rollback_la_to`].
     ///
-    /// Memory cost (Qwen 3.5/3.6 D_k=D_v=128, n_v_heads=8, n_seqs=1,
-    /// n_tokens_max=4): 2 MB per LA layer. ~60-90 MB total per forward
-    /// across 30+ LA layers. Allocated once per spec-decode cache
-    /// construction; freed when the cache drops.
+    /// Memory cost at the live SerialFifo recovery width (D_k=D_v=128,
+    /// n_v_heads=32, n_seqs=1, n_tokens_max=32): 64 MiB per LA layer;
+    /// recurrent plus conv capture is about 1.96 GiB across 30 layers.
+    /// Allocated once per spec-decode cache construction and freed when the
+    /// cache drops.
     pub capture_states: Option<MlxBuffer>,
     /// ADR-034 task #90 Step 4c (2026-05-21) — per-position conv1d
     /// state capture buffer for K=N speculative decoding rollback.
@@ -173,6 +179,10 @@ pub struct LinearAttnStateSlot {
     /// [`LinearAttnStateSlot::swap_for_slot`]; never assume the named
     /// field is "current" for a given slot.
     pub pp_flipped: Vec<bool>,
+    /// Monotonic count of completed DeltaNet writes per physical slot.
+    /// Unlike parity, this distinguishes one suffix advance from three or
+    /// any other odd number when validating a segmented prompt boundary.
+    pub write_generation: Vec<u64>,
 }
 
 impl FullAttnKvSlot {
@@ -342,7 +352,7 @@ impl FullAttnKvSlot {
             norms,
             n_kv_heads,
             head_dim,
-            cache_capacity,
+            views.capacity_tokens,
             cache_write_pos_start,
             n_tokens,
             src_tok_offset,
@@ -460,7 +470,7 @@ impl FullAttnKvSlot {
             num_kv_heads: params.num_kv_heads,
             head_dim: params.head_dim,
             kv_seq_len: params.kv_seq_len,
-            kv_capacity: params.kv_capacity,
+            kv_capacity: views.capacity_tokens,
             scale: params.scale,
             mask_type: params.mask_type,
             sliding_window: params.sliding_window,
@@ -649,7 +659,7 @@ impl FullAttnKvSlot {
             &dst,
             n_kv_heads,
             head_dim,
-            cache_capacity,
+            views.capacity_tokens,
             start_pos,
             n_tokens,
             /*scale_factor_d512=*/ 1.0,
@@ -880,6 +890,7 @@ impl LinearAttnStateSlot {
     pub fn swap_for_slot(&mut self, slot: crate::serve::scheduler::SlotId) {
         let i = slot.0 as usize;
         self.pp_flipped[i] = !self.pp_flipped[i];
+        self.write_generation[i] = self.write_generation[i].saturating_add(1);
     }
 }
 
@@ -894,6 +905,8 @@ pub struct HybridKvCache {
     /// Maximum tokens the full-attn K/V buffers can hold per sequence.
     pub max_seq_len: u32,
     pub n_seqs: u32,
+    cache_instance_id: u64,
+    slot_mutation_epoch: Vec<u64>,
     /// Number of DeltaNet conv channels (derived from config; cached here so
     /// tests and update helpers don't need to recompute).
     pub conv_channels: u32,
@@ -993,12 +1006,59 @@ pub struct HybridKvCacheSnapshot {
 /// its per-layer cursors plus the fixed-size DeltaNet state. Keeping the
 /// sequence K/V in place avoids a prompt-length-sized duplicate allocation
 /// for every agent slot.
+#[derive(Debug, PartialEq, Eq)]
 pub struct HybridKvSlotAnchor {
+    cache_instance_id: u64,
+    source_slot: u32,
     prompt_len: usize,
     full_attn_current_len: Vec<u32>,
     mtp_current_len: Option<u32>,
     linear_conv: Vec<Vec<u8>>,
     linear_recurrent: Vec<Vec<u8>>,
+}
+
+/// Lightweight rollback point for one target forward transaction.
+///
+/// A Qwen target forward writes each DeltaNet layer into the inactive
+/// ping-pong buffer exactly once and then flips that slot's parity. The prior
+/// state bytes therefore remain intact until another target forward begins.
+/// Capturing cursors plus the selected buffer for each layer is sufficient to
+/// restore an exact pre-forward boundary without copying the large recurrent
+/// matrices on every decode tick.
+pub(crate) struct HybridKvSlotTransaction {
+    full_attn_current_len: Vec<u32>,
+    mtp_current_len: Option<u32>,
+    linear_pp_flipped: Vec<bool>,
+}
+
+/// Per-layer proof of one prefix boundary inside an exact two-segment target
+/// forward.
+///
+/// Layer-interleaved execution temporarily leaves different transformer
+/// layers at different sequence cursors, so a whole-cache transaction cannot
+/// describe the boundary. The coordinator records each layer immediately
+/// after its prefix segment. After exactly one suffix advance per layer,
+/// full-attention prompt rows remain append-only and each DeltaNet prompt
+/// state remains in the now-inactive ping-pong buffer.
+pub(crate) struct HybridKvSegmentBoundaryReceipt {
+    cache_instance_id: u64,
+    slot: u32,
+    slot_mutation_epoch: u64,
+    entry_len: u32,
+    prompt_len: u32,
+    final_len: u32,
+    full_attn_current_len: Vec<Option<u32>>,
+    linear_pp_flipped: Vec<Option<bool>>,
+    linear_write_generation: Vec<Option<u64>>,
+    mtp_entry_current_len: Option<u32>,
+    mtp_current_len: Option<u32>,
+    mtp_mode: Option<SegmentBoundaryMtpMode>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SegmentBoundaryMtpMode {
+    Synced,
+    IndependentUnchanged,
 }
 
 impl HybridKvSlotAnchor {
@@ -1011,8 +1071,57 @@ impl HybridKvSlotAnchor {
             .sum()
     }
 
+    /// Exact heap capacity retained by this anchor payload, including cursor
+    /// vectors and the nested Vec allocation tables omitted by `total_bytes`.
+    pub fn owned_bytes(&self) -> u64 {
+        let bytes = self
+            .full_attn_current_len
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(
+                self.linear_conv
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<u8>>()),
+            )
+            .saturating_add(
+                self.linear_recurrent
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<u8>>()),
+            )
+            .saturating_add(
+                self.linear_conv
+                    .iter()
+                    .map(|bytes| bytes.capacity())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.linear_recurrent
+                    .iter()
+                    .map(|bytes| bytes.capacity())
+                    .sum::<usize>(),
+            );
+        bytes as u64
+    }
+
     pub fn prompt_len(&self) -> usize {
         self.prompt_len
+    }
+
+    pub(crate) fn source_slot(&self) -> u32 {
+        self.source_slot
+    }
+
+    /// Test-only semantic comparison across independently allocated cache
+    /// instances. Provenance is intentionally excluded: production restore
+    /// must reject a foreign cache or slot even when every checkpoint byte is
+    /// otherwise identical.
+    #[cfg(test)]
+    pub(crate) fn payload_eq(&self, other: &Self) -> bool {
+        self.prompt_len == other.prompt_len
+            && self.full_attn_current_len == other.full_attn_current_len
+            && self.mtp_current_len == other.mtp_current_len
+            && self.linear_conv == other.linear_conv
+            && self.linear_recurrent == other.linear_recurrent
     }
 }
 
@@ -1196,6 +1305,37 @@ fn deep_copy_buffer(device: &MlxDevice, src: &MlxBuffer) -> Result<MlxBuffer> {
     anyhow::ensure!(
         src_bytes.len() == dst_bytes.len(),
         "deep_copy_buffer byte-length mismatch (src={} dst={})",
+        src_bytes.len(),
+        dst_bytes.len()
+    );
+    dst_bytes.copy_from_slice(src_bytes);
+    Ok(dst)
+}
+
+/// Copy only a handle's logical tensor region into a dedicated right-sized
+/// allocation. Unlike `deep_copy_buffer`, this is safe for a slice view whose
+/// backing Metal allocation is a much larger transient parent.
+pub(crate) fn deep_copy_logical_buffer(device: &MlxDevice, src: &MlxBuffer) -> Result<MlxBuffer> {
+    let logical_bytes = src
+        .element_count()
+        .checked_mul(src.dtype().size_of())
+        .ok_or_else(|| anyhow!("deep_copy_logical_buffer byte-length overflow"))?;
+    anyhow::ensure!(
+        logical_bytes > 0,
+        "deep_copy_logical_buffer requires a non-empty tensor"
+    );
+    let mut dst = device
+        .alloc_buffer(logical_bytes, src.dtype(), src.shape().to_vec())
+        .map_err(|e| anyhow!("deep_copy_logical_buffer allocation: {e}"))?;
+    let src_bytes = src
+        .as_logical_slice::<u8>()
+        .map_err(|e| anyhow!("deep_copy_logical_buffer src logical slice: {e}"))?;
+    let dst_bytes = dst
+        .as_logical_mut_slice::<u8>()
+        .map_err(|e| anyhow!("deep_copy_logical_buffer dst logical slice: {e}"))?;
+    anyhow::ensure!(
+        src_bytes.len() == logical_bytes && dst_bytes.len() == logical_bytes,
+        "deep_copy_logical_buffer logical byte mismatch (src={} dst={} expected={logical_bytes})",
         src_bytes.len(),
         dst_bytes.len()
     );
@@ -1404,35 +1544,60 @@ fn copy_slot_region_out(
     Ok(src_bytes[start..start + per_slot].to_vec())
 }
 
-fn copy_slot_region_in(
+fn preflight_slot_region_in(
     src: &[u8],
     dst: &mut MlxBuffer,
     slot_idx: usize,
     n_seqs: usize,
     name: &str,
 ) -> Result<()> {
-    anyhow::ensure!(n_seqs > 0, "copy_slot_region_in ({name}): n_seqs is zero");
+    anyhow::ensure!(
+        n_seqs > 0,
+        "preflight_slot_region_in ({name}): n_seqs is zero"
+    );
     anyhow::ensure!(
         slot_idx < n_seqs,
-        "copy_slot_region_in ({name}): slot {slot_idx} outside n_seqs={n_seqs}"
+        "preflight_slot_region_in ({name}): slot {slot_idx} outside n_seqs={n_seqs}"
+    );
+    anyhow::ensure!(
+        dst.is_cpu_writable(),
+        "preflight_slot_region_in ({name}): destination is not CPU-writable"
     );
     let dst_bytes = dst
         .as_mut_slice::<u8>()
-        .with_context(|| format!("copy_slot_region_in ({name}) as_mut_slice"))?;
+        .with_context(|| format!("preflight_slot_region_in ({name}) as_mut_slice"))?;
     anyhow::ensure!(
         dst_bytes.len() % n_seqs == 0,
-        "copy_slot_region_in ({name}): byte length {} not divisible by n_seqs={n_seqs}",
+        "preflight_slot_region_in ({name}): byte length {} not divisible by n_seqs={n_seqs}",
         dst_bytes.len()
     );
     let per_slot = dst_bytes.len() / n_seqs;
     anyhow::ensure!(
         src.len() == per_slot,
-        "copy_slot_region_in ({name}): checkpoint bytes {} != destination slot bytes {per_slot}",
+        "preflight_slot_region_in ({name}): checkpoint bytes {} != destination slot bytes {per_slot}",
         src.len()
     );
-    let start = slot_idx * per_slot;
-    dst_bytes[start..start + per_slot].copy_from_slice(src);
     Ok(())
+}
+
+/// Mutation half of [`preflight_slot_region_in`]. The restore caller invokes
+/// this only after every layer and cursor has passed preflight, so no
+/// recoverable error remains after the first cursor/state mutation.
+fn copy_slot_region_in_preflighted(
+    src: &[u8],
+    dst: &mut MlxBuffer,
+    slot_idx: usize,
+    n_seqs: usize,
+    name: &str,
+) {
+    let dst_bytes = dst.as_mut_slice::<u8>().unwrap_or_else(|error| {
+        panic!("preflighted slot restore ({name}) lost writability: {error}")
+    });
+    let per_slot = dst_bytes.len() / n_seqs;
+    let start = slot_idx * per_slot;
+    let end = start + per_slot;
+    debug_assert_eq!(src.len(), per_slot);
+    dst_bytes[start..end].copy_from_slice(src);
 }
 
 /// DeltaNet 1D conv kernel width — Qwen3.5 uses 4; kept as a constant here so
@@ -1441,6 +1606,199 @@ fn copy_slot_region_in(
 pub const DELTA_NET_CONV_K: u32 = 4;
 
 impl HybridKvCache {
+    /// Exact-capacity estimate for one future slot anchor before allocating
+    /// its copied DeltaNet payload. Used by serving admission to reserve K+1
+    /// aggregate capacity before the compound GPU transaction starts.
+    pub(crate) fn estimated_slot_anchor_owned_bytes(&self) -> Result<u64> {
+        let n_seqs = self.n_seqs as usize;
+        anyhow::ensure!(n_seqs > 0, "anchor estimate requires n_seqs > 0");
+        let table_bytes = self
+            .linear_attn
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<Vec<u8>>()))
+            .context("anchor estimate vector-table overflow")?;
+        let cursor_bytes = self
+            .full_attn
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .context("anchor estimate cursor overflow")?;
+        let payload_bytes = self.linear_attn.iter().try_fold(0usize, |total, linear| {
+            let conv = linear.conv_state.data_byte_len() / n_seqs;
+            let recurrent = linear.recurrent.data_byte_len() / n_seqs;
+            total
+                .checked_add(conv)
+                .and_then(|bytes| bytes.checked_add(recurrent))
+                .context("anchor estimate linear payload overflow")
+        })?;
+        u64::try_from(
+            table_bytes
+                .checked_add(cursor_bytes)
+                .and_then(|bytes| bytes.checked_add(payload_bytes))
+                .context("anchor estimate total overflow")?,
+        )
+        .context("anchor estimate exceeds u64")
+    }
+
+    fn bump_slot_mutation_epoch(&mut self, slot_idx: usize, operation: &str) -> Result<()> {
+        let n_slots = self.slot_mutation_epoch.len();
+        let epoch = self.slot_mutation_epoch.get_mut(slot_idx).ok_or_else(|| {
+            anyhow!(
+                "{operation}: slot {slot_idx} outside mutation epoch axis {}",
+                n_slots
+            )
+        })?;
+        *epoch = epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("{operation}: slot {slot_idx} mutation epoch overflow"))?;
+        Ok(())
+    }
+
+    /// Capture the exact cursor and DeltaNet buffer-selection boundary before
+    /// at most one target forward mutates this slot.
+    pub(crate) fn begin_slot_transaction(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        target_cursor: u32,
+    ) -> Result<HybridKvSlotTransaction> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "begin_slot_transaction: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        let mut full_attn_current_len = Vec::with_capacity(self.full_attn.len());
+        for (layer_idx, full) in self.full_attn.iter().enumerate() {
+            let cursor = full.current_len.get(slot_idx).copied().ok_or_else(|| {
+                anyhow!("begin_slot_transaction: full_attn[{layer_idx}] cursor missing")
+            })?;
+            anyhow::ensure!(
+                cursor == target_cursor,
+                "begin_slot_transaction: full_attn[{layer_idx}] cursor={cursor} != target_cursor={target_cursor}"
+            );
+            full_attn_current_len.push(cursor);
+        }
+        let mtp_current_len = self
+            .mtp_slot
+            .as_ref()
+            .map(|mtp| {
+                mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
+                    anyhow!(
+                        "begin_slot_transaction: MTP cursor missing for slot {}",
+                        slot.0
+                    )
+                })
+            })
+            .transpose()?;
+        let linear_pp_flipped = self
+            .linear_attn
+            .iter()
+            .enumerate()
+            .map(|(layer_idx, linear)| {
+                linear.pp_flipped.get(slot_idx).copied().ok_or_else(|| {
+                    anyhow!(
+                        "begin_slot_transaction: linear_attn[{layer_idx}] parity missing for slot {}",
+                        slot.0
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(HybridKvSlotTransaction {
+            full_attn_current_len,
+            mtp_current_len,
+            linear_pp_flipped,
+        })
+    }
+
+    /// Restore a transaction captured by [`Self::begin_slot_transaction`].
+    ///
+    /// This must run before another target forward reuses the inactive
+    /// DeltaNet buffers. Appended full-attention/MTP K/V rows are left in
+    /// place and made unobservable by rewinding their cursors.
+    pub(crate) fn rollback_slot_transaction(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        transaction: &HybridKvSlotTransaction,
+    ) -> Result<()> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "rollback_slot_transaction: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(
+            transaction.full_attn_current_len.len() == self.full_attn.len(),
+            "rollback_slot_transaction: full-attention layer count mismatch"
+        );
+        anyhow::ensure!(
+            transaction.linear_pp_flipped.len() == self.linear_attn.len(),
+            "rollback_slot_transaction: linear-attention layer count mismatch"
+        );
+        // Validate the complete rollback point before changing any cursor or
+        // ping-pong selector. A late validation failure must leave the live
+        // slot wholly untouched so the serving layer can safely hard-reset
+        // it instead of inheriting a partially rewound cache.
+        for (layer_idx, (full, &saved)) in self
+            .full_attn
+            .iter()
+            .zip(&transaction.full_attn_current_len)
+            .enumerate()
+        {
+            let live = full.current_len.get(slot_idx).ok_or_else(|| {
+                anyhow!("rollback_slot_transaction: full_attn[{layer_idx}] cursor missing")
+            })?;
+            anyhow::ensure!(
+                *live >= saved,
+                "rollback_slot_transaction: full_attn[{layer_idx}] live cursor {} is behind saved cursor {saved}",
+                *live
+            );
+        }
+        match (self.mtp_slot.as_ref(), transaction.mtp_current_len) {
+            (Some(mtp), Some(saved)) => {
+                let live = mtp.current_len.get(slot_idx).ok_or_else(|| {
+                    anyhow!(
+                        "rollback_slot_transaction: MTP cursor missing for slot {}",
+                        slot.0
+                    )
+                })?;
+                anyhow::ensure!(
+                    *live >= saved,
+                    "rollback_slot_transaction: MTP live cursor {} is behind saved cursor {saved}",
+                    *live
+                );
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("rollback_slot_transaction: MTP presence mismatch"),
+        }
+        for (layer_idx, linear) in self.linear_attn.iter().enumerate() {
+            linear.pp_flipped.get(slot_idx).ok_or_else(|| {
+                anyhow!("rollback_slot_transaction: linear_attn[{layer_idx}] parity missing")
+            })?;
+        }
+
+        self.bump_slot_mutation_epoch(slot_idx, "rollback_slot_transaction")?;
+        for (full, &saved) in self
+            .full_attn
+            .iter_mut()
+            .zip(&transaction.full_attn_current_len)
+        {
+            full.current_len[slot_idx] = saved;
+        }
+        if let (Some(mtp), Some(saved)) = (self.mtp_slot.as_mut(), transaction.mtp_current_len) {
+            mtp.current_len[slot_idx] = saved;
+        }
+        for (linear, &saved) in self
+            .linear_attn
+            .iter_mut()
+            .zip(&transaction.linear_pp_flipped)
+        {
+            linear.pp_flipped[slot_idx] = saved;
+        }
+        Ok(())
+    }
+
     /// Authoritative number of valid full-attention tokens for one physical
     /// agent slot. Bytes at or above this cursor are not observable.
     pub(crate) fn sequence_len_for_slot(
@@ -1529,6 +1887,393 @@ impl HybridKvCache {
         Ok(())
     }
 
+    /// Start the per-layer receipt for one exact prefix/suffix target pair.
+    pub(crate) fn begin_segment_boundary_receipt(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        entry_len: usize,
+        prompt_len: usize,
+        final_len: usize,
+    ) -> Result<HybridKvSegmentBoundaryReceipt> {
+        let slot_idx = slot.0 as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "begin_segment_boundary_receipt: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(
+            entry_len < prompt_len
+                && prompt_len < final_len
+                && final_len <= self.max_seq_len as usize,
+            "begin_segment_boundary_receipt: lengths must satisfy entry={entry_len} < prompt={prompt_len} < final={final_len} <= {}",
+            self.max_seq_len
+        );
+        Ok(HybridKvSegmentBoundaryReceipt {
+            cache_instance_id: self.cache_instance_id,
+            slot: slot.0,
+            slot_mutation_epoch: self.slot_mutation_epoch[slot_idx],
+            entry_len: u32::try_from(entry_len)
+                .context("begin_segment_boundary_receipt: entry_len exceeds u32")?,
+            prompt_len: u32::try_from(prompt_len)
+                .context("begin_segment_boundary_receipt: prompt_len exceeds u32")?,
+            final_len: u32::try_from(final_len)
+                .context("begin_segment_boundary_receipt: final_len exceeds u32")?,
+            full_attn_current_len: vec![None; self.full_attn.len()],
+            linear_pp_flipped: vec![None; self.linear_attn.len()],
+            linear_write_generation: vec![None; self.linear_attn.len()],
+            mtp_entry_current_len: self
+                .mtp_slot
+                .as_ref()
+                .and_then(|mtp| mtp.current_len.get(slot_idx).copied()),
+            mtp_current_len: None,
+            mtp_mode: None,
+        })
+    }
+
+    /// Record the actual cache state immediately after one model layer has
+    /// processed the prefix segment and before that layer processes suffix.
+    pub(crate) fn record_segment_boundary_for_layer(
+        &self,
+        receipt: &mut HybridKvSegmentBoundaryReceipt,
+        model_layer_idx: usize,
+    ) -> Result<()> {
+        let slot_idx = receipt.slot as usize;
+        anyhow::ensure!(
+            slot_idx < self.n_seqs as usize,
+            "record_segment_boundary_for_layer: slot {} outside n_seqs={}",
+            receipt.slot,
+            self.n_seqs
+        );
+        let layer_idx = u32::try_from(model_layer_idx)
+            .context("record_segment_boundary_for_layer: layer index exceeds u32")?;
+        match self.slot_index_for_layer(layer_idx) {
+            Some(LayerSlot::Full(rank)) => {
+                let rank = rank as usize;
+                let cursor = self.full_attn[rank]
+                    .current_len
+                    .get(slot_idx)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "record_segment_boundary_for_layer: full_attn[{rank}] cursor missing"
+                        )
+                    })?;
+                anyhow::ensure!(
+                    cursor == receipt.prompt_len,
+                    "record_segment_boundary_for_layer: full_attn[{rank}] cursor={cursor} != prompt_len={} for model layer {model_layer_idx}",
+                    receipt.prompt_len
+                );
+                anyhow::ensure!(
+                    receipt.full_attn_current_len[rank].replace(cursor).is_none(),
+                    "record_segment_boundary_for_layer: model layer {model_layer_idx} recorded twice"
+                );
+            }
+            Some(LayerSlot::Linear(rank)) => {
+                let rank = rank as usize;
+                let parity = self.linear_attn[rank]
+                    .pp_flipped
+                    .get(slot_idx)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "record_segment_boundary_for_layer: linear_attn[{rank}] parity missing"
+                        )
+                    })?;
+                anyhow::ensure!(
+                    receipt.linear_pp_flipped[rank].replace(parity).is_none(),
+                    "record_segment_boundary_for_layer: model layer {model_layer_idx} recorded twice"
+                );
+                let generation = self.linear_attn[rank]
+                    .write_generation
+                    .get(slot_idx)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "record_segment_boundary_for_layer: linear_attn[{rank}] generation missing"
+                        )
+                    })?;
+                anyhow::ensure!(
+                    receipt.linear_write_generation[rank]
+                        .replace(generation)
+                        .is_none(),
+                    "record_segment_boundary_for_layer: model layer {model_layer_idx} generation recorded twice"
+                );
+            }
+            None => anyhow::bail!(
+                "record_segment_boundary_for_layer: model layer {model_layer_idx} has no cache slot"
+            ),
+        }
+        Ok(())
+    }
+
+    /// Record the optional MTP cursor after its prefix catch-up and before its
+    /// suffix catch-up. Non-MTP artifacts record explicit absence.
+    pub(crate) fn record_mtp_segment_boundary(
+        &self,
+        receipt: &mut HybridKvSegmentBoundaryReceipt,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            receipt.mtp_mode.is_none(),
+            "record_mtp_segment_boundary: boundary recorded twice"
+        );
+        let slot_idx = receipt.slot as usize;
+        receipt.mtp_current_len = self
+            .mtp_slot
+            .as_ref()
+            .map(|mtp| {
+                mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
+                    anyhow!(
+                        "record_mtp_segment_boundary: MTP cursor missing for slot {}",
+                        receipt.slot
+                    )
+                })
+            })
+            .transpose()?;
+        if let Some(cursor) = receipt.mtp_current_len {
+            anyhow::ensure!(
+                cursor == receipt.prompt_len,
+                "record_mtp_segment_boundary: MTP cursor={cursor} != prompt_len={}",
+                receipt.prompt_len
+            );
+        }
+        receipt.mtp_mode = Some(SegmentBoundaryMtpMode::Synced);
+        Ok(())
+    }
+
+    /// Record an MTP cursor that deliberately remains independent while the
+    /// target executes both segments (policy-OFF or request-ineligible MTP).
+    /// Such an anchor is target-reusable but cannot advertise speculative
+    /// semantic state until a later explicit catch-up.
+    pub(crate) fn record_independent_mtp_cursor(
+        &self,
+        receipt: &mut HybridKvSegmentBoundaryReceipt,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            receipt.mtp_mode.is_none(),
+            "record_independent_mtp_cursor: boundary recorded twice"
+        );
+        let slot_idx = receipt.slot as usize;
+        receipt.mtp_current_len = self
+            .mtp_slot
+            .as_ref()
+            .map(|mtp| {
+                mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
+                    anyhow!(
+                        "record_independent_mtp_cursor: MTP cursor missing for slot {}",
+                        receipt.slot
+                    )
+                })
+            })
+            .transpose()?;
+        anyhow::ensure!(
+            receipt.mtp_current_len == receipt.mtp_entry_current_len,
+            "record_independent_mtp_cursor: MTP cursor changed from entry {:?} to {:?}",
+            receipt.mtp_entry_current_len,
+            receipt.mtp_current_len,
+        );
+        receipt.mtp_mode = Some(SegmentBoundaryMtpMode::IndependentUnchanged);
+        Ok(())
+    }
+
+    /// Materialize the prefix anchor after the suffix segment has completed.
+    ///
+    /// The method fails closed unless every target layer was recorded once,
+    /// every append-only cursor reached `final_len`, and every DeltaNet layer
+    /// advanced exactly once beyond its recorded prefix parity.
+    pub(crate) fn snapshot_slot_anchor_from_segment_boundary(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        receipt: HybridKvSegmentBoundaryReceipt,
+    ) -> Result<HybridKvSlotAnchor> {
+        let slot_idx = slot.0 as usize;
+        let n_seqs = self.n_seqs as usize;
+        anyhow::ensure!(
+            receipt.cache_instance_id == self.cache_instance_id,
+            "snapshot_slot_anchor_from_segment_boundary: receipt belongs to cache instance {} not live instance {}",
+            receipt.cache_instance_id,
+            self.cache_instance_id
+        );
+        anyhow::ensure!(
+            receipt.slot == slot.0,
+            "snapshot_slot_anchor_from_segment_boundary: receipt slot {} != requested slot {}",
+            receipt.slot,
+            slot.0
+        );
+        anyhow::ensure!(
+            slot_idx < n_seqs,
+            "snapshot_slot_anchor_from_segment_boundary: slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(
+            self.slot_mutation_epoch[slot_idx] == receipt.slot_mutation_epoch,
+            "snapshot_slot_anchor_from_segment_boundary: slot mutation epoch {} != receipt epoch {}",
+            self.slot_mutation_epoch[slot_idx],
+            receipt.slot_mutation_epoch
+        );
+        let final_len = receipt.final_len;
+        anyhow::ensure!(
+            receipt.entry_len < receipt.prompt_len
+                && receipt.prompt_len < final_len
+                && final_len <= self.max_seq_len,
+            "snapshot_slot_anchor_from_segment_boundary: invalid sealed lengths entry={} prompt={} final={final_len} max={}",
+            receipt.entry_len,
+            receipt.prompt_len,
+            self.max_seq_len,
+        );
+        anyhow::ensure!(
+            receipt.full_attn_current_len.len() == self.full_attn.len()
+                && receipt.linear_pp_flipped.len() == self.linear_attn.len()
+                && receipt.linear_write_generation.len() == self.linear_attn.len(),
+            "snapshot_slot_anchor_from_segment_boundary: receipt layer count mismatch"
+        );
+
+        let mut full_attn_current_len = Vec::with_capacity(self.full_attn.len());
+        for (layer_idx, (full, saved)) in self
+            .full_attn
+            .iter()
+            .zip(&receipt.full_attn_current_len)
+            .enumerate()
+        {
+            let saved = saved.ok_or_else(|| {
+                anyhow!(
+                    "snapshot_slot_anchor_from_segment_boundary: full_attn[{layer_idx}] boundary missing"
+                )
+            })?;
+            anyhow::ensure!(
+                saved == receipt.prompt_len,
+                "snapshot_slot_anchor_from_segment_boundary: full_attn[{layer_idx}] boundary={saved} != prompt_len={}",
+                receipt.prompt_len
+            );
+            let live = full.current_len.get(slot_idx).copied().ok_or_else(|| {
+                anyhow!(
+                    "snapshot_slot_anchor_from_segment_boundary: full_attn[{layer_idx}] cursor missing"
+                )
+            })?;
+            anyhow::ensure!(
+                live == final_len,
+                "snapshot_slot_anchor_from_segment_boundary: full_attn[{layer_idx}] live cursor={live} != final_len={final_len}"
+            );
+            full_attn_current_len.push(saved);
+        }
+
+        anyhow::ensure!(
+            receipt.mtp_mode.is_some(),
+            "snapshot_slot_anchor_from_segment_boundary: MTP boundary was not recorded"
+        );
+        match (
+            receipt.mtp_mode,
+            self.mtp_slot.as_ref(),
+            receipt.mtp_current_len,
+        ) {
+            (Some(SegmentBoundaryMtpMode::Synced), Some(mtp), Some(saved)) => {
+                anyhow::ensure!(
+                    saved == receipt.prompt_len,
+                    "snapshot_slot_anchor_from_segment_boundary: MTP boundary={saved} != prompt_len={}",
+                    receipt.prompt_len
+                );
+                let live = mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
+                    anyhow!(
+                        "snapshot_slot_anchor_from_segment_boundary: MTP cursor missing for slot {}",
+                        slot.0
+                    )
+                })?;
+                anyhow::ensure!(
+                    live == final_len,
+                    "snapshot_slot_anchor_from_segment_boundary: MTP live cursor={live} != final_len={final_len}"
+                );
+            }
+            (Some(SegmentBoundaryMtpMode::Synced), None, None) => {}
+            (Some(SegmentBoundaryMtpMode::IndependentUnchanged), Some(mtp), Some(saved)) => {
+                let live = mtp.current_len.get(slot_idx).copied().ok_or_else(|| {
+                    anyhow!(
+                        "snapshot_slot_anchor_from_segment_boundary: independent MTP cursor missing for slot {}",
+                        slot.0
+                    )
+                })?;
+                anyhow::ensure!(
+                    live == saved,
+                    "snapshot_slot_anchor_from_segment_boundary: independent MTP cursor changed from {saved} to {live}"
+                );
+            }
+            (Some(SegmentBoundaryMtpMode::IndependentUnchanged), None, None) => {}
+            _ => anyhow::bail!("snapshot_slot_anchor_from_segment_boundary: MTP presence mismatch"),
+        }
+
+        let mut linear_conv = Vec::with_capacity(self.linear_attn.len());
+        let mut linear_recurrent = Vec::with_capacity(self.linear_attn.len());
+        for (layer_idx, ((linear, saved_parity), saved_generation)) in self
+            .linear_attn
+            .iter()
+            .zip(&receipt.linear_pp_flipped)
+            .zip(&receipt.linear_write_generation)
+            .enumerate()
+        {
+            let saved_parity = saved_parity.ok_or_else(|| {
+                anyhow!(
+                    "snapshot_slot_anchor_from_segment_boundary: linear_attn[{layer_idx}] boundary missing"
+                )
+            })?;
+            let live_parity = linear.pp_flipped.get(slot_idx).copied().ok_or_else(|| {
+                anyhow!(
+                    "snapshot_slot_anchor_from_segment_boundary: linear_attn[{layer_idx}] parity missing"
+                )
+            })?;
+            anyhow::ensure!(
+                live_parity != saved_parity,
+                "snapshot_slot_anchor_from_segment_boundary: linear_attn[{layer_idx}] did not advance exactly once after boundary"
+            );
+            let saved_generation = saved_generation.ok_or_else(|| {
+                anyhow!(
+                    "snapshot_slot_anchor_from_segment_boundary: linear_attn[{layer_idx}] boundary generation missing"
+                )
+            })?;
+            let expected_generation = saved_generation.checked_add(1).ok_or_else(|| {
+                anyhow!(
+                    "snapshot_slot_anchor_from_segment_boundary: linear_attn[{layer_idx}] boundary generation overflow"
+                )
+            })?;
+            let live_generation = linear
+                .write_generation
+                .get(slot_idx)
+                .copied()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "snapshot_slot_anchor_from_segment_boundary: linear_attn[{layer_idx}] live generation missing"
+                    )
+                })?;
+            anyhow::ensure!(
+                live_generation == expected_generation,
+                "snapshot_slot_anchor_from_segment_boundary: linear_attn[{layer_idx}] live generation={live_generation} != exactly-one-write generation={expected_generation}"
+            );
+            let (_, boundary_conv) = linear.conv_bufs_for_slot(slot);
+            let (_, boundary_recurrent) = linear.recurrent_bufs_for_slot(slot);
+            linear_conv.push(copy_slot_region_out(
+                boundary_conv,
+                slot_idx,
+                n_seqs,
+                &format!("linear_attn[{layer_idx}].boundary_conv"),
+            )?);
+            linear_recurrent.push(copy_slot_region_out(
+                boundary_recurrent,
+                slot_idx,
+                n_seqs,
+                &format!("linear_attn[{layer_idx}].boundary_recurrent"),
+            )?);
+        }
+
+        Ok(HybridKvSlotAnchor {
+            cache_instance_id: self.cache_instance_id,
+            source_slot: receipt.slot,
+            prompt_len: receipt.prompt_len as usize,
+            full_attn_current_len,
+            mtp_current_len: receipt.mtp_current_len,
+            linear_conv,
+            linear_recurrent,
+        })
+    }
+
     /// Capture the prompt boundary for one physical agent slot without
     /// duplicating its append-only full-attention K/V rows.
     pub(crate) fn snapshot_slot_anchor(
@@ -1596,6 +2341,8 @@ impl HybridKvCache {
         }
 
         Ok(HybridKvSlotAnchor {
+            cache_instance_id: self.cache_instance_id,
+            source_slot: slot.0,
             prompt_len,
             full_attn_current_len,
             mtp_current_len,
@@ -1621,8 +2368,20 @@ impl HybridKvCache {
             self.n_seqs
         );
         anyhow::ensure!(
-            anchor.prompt_len <= self.max_seq_len as usize,
-            "restore_slot_anchor: prompt_len={} exceeds max_seq_len={}",
+            anchor.cache_instance_id == self.cache_instance_id,
+            "restore_slot_anchor: anchor cache instance {} != live cache instance {}",
+            anchor.cache_instance_id,
+            self.cache_instance_id
+        );
+        anyhow::ensure!(
+            anchor.source_slot == slot.0,
+            "restore_slot_anchor: anchor source slot {} != restore slot {}",
+            anchor.source_slot,
+            slot.0
+        );
+        anyhow::ensure!(
+            anchor.prompt_len > 0 && anchor.prompt_len <= self.max_seq_len as usize,
+            "restore_slot_anchor: prompt_len={} outside 1..={}",
             anchor.prompt_len,
             self.max_seq_len
         );
@@ -1636,16 +2395,22 @@ impl HybridKvCache {
             "restore_slot_anchor: linear-attn layer count mismatch"
         );
 
-        // The anchor intentionally owns no full-attention K/V copy. Refuse
-        // the rewind unless the live append-only cursor proves those rows
-        // are still populated in this same slot.
+        // Phase 1: validate every cursor and byte destination without
+        // changing the slot. A restore error must leave the caller able to
+        // hard-reset one coherent pre-restore state, never a partially
+        // rewound mixture of cursors and DeltaNet layers.
         for (layer_idx, (full, &saved_cursor)) in self
             .full_attn
-            .iter_mut()
+            .iter()
             .zip(anchor.full_attn_current_len.iter())
             .enumerate()
         {
-            let live_cursor = full.current_len.get_mut(slot_idx).ok_or_else(|| {
+            anyhow::ensure!(
+                saved_cursor as usize == anchor.prompt_len,
+                "restore_slot_anchor: full_attn[{layer_idx}] saved cursor {saved_cursor} != anchor prompt_len={}",
+                anchor.prompt_len
+            );
+            let live_cursor = full.current_len.get(slot_idx).ok_or_else(|| {
                 anyhow!("restore_slot_anchor: full_attn[{layer_idx}] cursor missing")
             })?;
             anyhow::ensure!(
@@ -1653,11 +2418,10 @@ impl HybridKvCache {
                 "restore_slot_anchor: full_attn[{layer_idx}] live cursor {} is behind saved cursor {saved_cursor}; prompt K/V cannot be proven intact",
                 *live_cursor
             );
-            *live_cursor = saved_cursor;
         }
-        match (self.mtp_slot.as_mut(), anchor.mtp_current_len) {
+        match (self.mtp_slot.as_ref(), anchor.mtp_current_len) {
             (Some(mtp), Some(saved_cursor)) => {
-                let live_cursor = mtp.current_len.get_mut(slot_idx).ok_or_else(|| {
+                let live_cursor = mtp.current_len.get(slot_idx).ok_or_else(|| {
                     anyhow!(
                         "restore_slot_anchor: MTP cursor missing for slot {}",
                         slot.0
@@ -1668,27 +2432,62 @@ impl HybridKvCache {
                     "restore_slot_anchor: MTP live cursor {} is behind saved cursor {saved_cursor}",
                     *live_cursor
                 );
-                *live_cursor = saved_cursor;
             }
             (None, None) => {}
             _ => anyhow::bail!("restore_slot_anchor: MTP presence mismatch"),
         }
 
         for (layer_idx, linear) in self.linear_attn.iter_mut().enumerate() {
-            copy_slot_region_in(
+            anyhow::ensure!(
+                linear.pp_flipped.get(slot_idx).is_some(),
+                "restore_slot_anchor: linear_attn[{layer_idx}] parity missing for slot {}",
+                slot.0
+            );
+            preflight_slot_region_in(
                 &anchor.linear_conv[layer_idx],
                 &mut linear.conv_state,
                 slot_idx,
                 n_seqs,
                 &format!("linear_attn[{layer_idx}].conv"),
             )?;
-            copy_slot_region_in(
+            preflight_slot_region_in(
                 &anchor.linear_recurrent[layer_idx],
                 &mut linear.recurrent,
                 slot_idx,
                 n_seqs,
                 &format!("linear_attn[{layer_idx}].recurrent"),
             )?;
+        }
+
+        // Phase 2: all fallible shape/cursor checks passed. The anchor owns no
+        // full-attention K/V copy; rewind only the proven append-only cursors,
+        // then copy every slot-local DeltaNet payload into canonical buffers.
+        self.bump_slot_mutation_epoch(slot_idx, "restore_slot_anchor")?;
+        for (full, &saved_cursor) in self
+            .full_attn
+            .iter_mut()
+            .zip(anchor.full_attn_current_len.iter())
+        {
+            full.current_len[slot_idx] = saved_cursor;
+        }
+        if let (Some(mtp), Some(saved_cursor)) = (self.mtp_slot.as_mut(), anchor.mtp_current_len) {
+            mtp.current_len[slot_idx] = saved_cursor;
+        }
+        for (layer_idx, linear) in self.linear_attn.iter_mut().enumerate() {
+            copy_slot_region_in_preflighted(
+                &anchor.linear_conv[layer_idx],
+                &mut linear.conv_state,
+                slot_idx,
+                n_seqs,
+                &format!("linear_attn[{layer_idx}].conv"),
+            );
+            copy_slot_region_in_preflighted(
+                &anchor.linear_recurrent[layer_idx],
+                &mut linear.recurrent,
+                slot_idx,
+                n_seqs,
+                &format!("linear_attn[{layer_idx}].recurrent"),
+            );
             // The named buffers now hold the restored current state for this
             // slot. Peer parity remains exactly as it was.
             linear.pp_flipped[slot_idx] = false;
@@ -1788,11 +2587,46 @@ impl HybridKvCache {
         n_seqs: u32,
         tq_kv_active: bool,
     ) -> Result<Self> {
-        let mut cache =
-            Self::allocate_with_profile(cfg, device, max_seq_len, n_seqs, tq_kv_active, true)?;
+        let mut cache = Self::allocate_with_profile(
+            cfg,
+            device,
+            max_seq_len,
+            n_seqs,
+            tq_kv_active,
+            true,
+            None,
+        )?;
         // Full-attention storage is intentionally uninitialized: its cursor
         // is zero and every readable position is overwritten before the
         // cursor advances. Recurrent DeltaNet state remains semantic-zero.
+        cache.reset_all_buffers();
+        Ok(cache)
+    }
+
+    /// Construct a multi-sequence cache whose full-attention TQ buffers hold
+    /// only a small physical seed per slot. `max_seq_len` remains the full
+    /// logical context limit; callers must grow a slot before making rows
+    /// beyond its current physical capacity visible.
+    pub fn new_with_growable_tq(
+        cfg: &Qwen35Config,
+        device: &MlxDevice,
+        max_seq_len: u32,
+        n_seqs: u32,
+        initial_capacity_tokens: u32,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            initial_capacity_tokens > 0 && initial_capacity_tokens <= max_seq_len,
+            "growable TQ initial capacity {initial_capacity_tokens} outside logical range 1..={max_seq_len}"
+        );
+        let mut cache = Self::allocate_with_profile(
+            cfg,
+            device,
+            max_seq_len,
+            n_seqs,
+            true,
+            true,
+            Some(initial_capacity_tokens),
+        )?;
         cache.reset_all_buffers();
         Ok(cache)
     }
@@ -1804,6 +2638,7 @@ impl HybridKvCache {
         n_seqs: u32,
         tq_kv_active: bool,
         include_mtp: bool,
+        tq_initial_capacity: Option<u32>,
     ) -> Result<Self> {
         if max_seq_len == 0 {
             return Err(anyhow!("HybridKvCache: max_seq_len must be > 0"));
@@ -1828,8 +2663,9 @@ impl HybridKvCache {
                         alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs, tq_kv_active)
                             .with_context(|| format!("alloc full-attn slot (layer {layer_idx})"))?;
                     if tq_kv_active {
+                        let physical_capacity = tq_initial_capacity.unwrap_or(max_seq_len);
                         slot.tq = Some(
-                            alloc_tq_full_attn_buffers(cfg, device, max_seq_len, n_seqs)
+                            alloc_tq_full_attn_buffers(cfg, device, physical_capacity, n_seqs)
                                 .with_context(|| {
                                     format!("alloc tq full-attn buffers (layer {layer_idx})")
                                 })?,
@@ -1854,8 +2690,9 @@ impl HybridKvCache {
             let mut slot = alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs, tq_kv_active)
                 .context("alloc MTP full-attn slot")?;
             if tq_kv_active {
+                let physical_capacity = tq_initial_capacity.unwrap_or(max_seq_len);
                 slot.tq = Some(
-                    alloc_tq_full_attn_buffers(cfg, device, max_seq_len, n_seqs)
+                    alloc_tq_full_attn_buffers(cfg, device, physical_capacity, n_seqs)
                         .context("alloc tq full-attn buffers (MTP slot)")?,
                 );
             }
@@ -1870,6 +2707,8 @@ impl HybridKvCache {
             linear_attn,
             max_seq_len,
             n_seqs,
+            cache_instance_id: NEXT_HYBRID_CACHE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            slot_mutation_epoch: vec![0; n_seqs as usize],
             conv_channels,
             per_layer_slot,
             tq_kv_active,
@@ -1877,13 +2716,138 @@ impl HybridKvCache {
         })
     }
 
+    /// Ensure one logical slot has enough physical TQ rows for an admitted
+    /// request while preserving every visible row in every peer slot.
+    ///
+    /// Growth is committed one full-attention layer at a time. Each layer is
+    /// itself transactional: allocate a replacement arena, GPU-blit every
+    /// cursor-visible prefix, wait for successful completion, then swap. A
+    /// failure never advances a cursor or exposes a partially copied layer.
+    /// Layers already migrated by an earlier successful transaction remain a
+    /// byte-equivalent physical representation, so the cache stays usable and
+    /// its exact resident bytes can be charged before rejecting admission.
+    pub fn ensure_tq_physical_capacity_for_slot(
+        &mut self,
+        cfg: &Qwen35Config,
+        device: &MlxDevice,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        required_tokens: u32,
+    ) -> Result<u64> {
+        anyhow::ensure!(self.tq_kv_active, "TQ arena growth requires active TQ KV");
+        anyhow::ensure!(
+            slot.0 < self.n_seqs,
+            "TQ arena growth slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(
+            required_tokens > 0 && required_tokens <= self.max_seq_len,
+            "TQ arena growth requires {required_tokens} tokens outside logical range 1..={}",
+            self.max_seq_len
+        );
+
+        for (layer_index, full) in self.full_attn.iter_mut().enumerate() {
+            grow_full_attn_tq_slot(cfg, device, full, slot, required_tokens, self.max_seq_len)
+                .with_context(|| format!("grow TQ full-attention layer {layer_index}"))?;
+        }
+        if let Some(mtp) = self.mtp_slot.as_mut() {
+            grow_full_attn_tq_slot(cfg, device, mtp, slot, required_tokens, self.max_seq_len)
+                .context("grow TQ MTP layer")?;
+        }
+        self.tq_physical_bytes_for_slot(slot)
+    }
+
+    /// Exact currently allocated TQ bytes attributed to one slot across
+    /// target and MTP layers. This is physical-capacity accounting, not a
+    /// cursor estimate; Metal commits an entire buffer when first bound.
+    pub fn tq_physical_bytes_for_slot(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            slot.0 < self.n_seqs,
+            "TQ physical-byte query slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        let mut bytes = 0_u64;
+        for (layer_index, full) in self.full_attn.iter().enumerate() {
+            let tq = full
+                .tq
+                .as_ref()
+                .with_context(|| format!("full-attention layer {layer_index} lacks TQ storage"))?;
+            bytes = bytes
+                .checked_add(tq.physical_bytes_for_slot(slot)?)
+                .ok_or_else(|| anyhow!("TQ physical-byte total overflow"))?;
+        }
+        if let Some(mtp) = self.mtp_slot.as_ref() {
+            let tq = mtp.tq.as_ref().context("MTP layer lacks TQ storage")?;
+            bytes = bytes
+                .checked_add(tq.physical_bytes_for_slot(slot)?)
+                .ok_or_else(|| anyhow!("TQ physical-byte total overflow"))?;
+        }
+        Ok(bytes)
+    }
+
+    /// Additional byte headroom required while growing one TQ slot.
+    ///
+    /// Growth swaps one full-attention layer at a time. While that layer is
+    /// copied, its old arena and replacement arena coexist; every other layer
+    /// is represented once. Admission already reserves the final compact
+    /// arena, so the conservative surcharge is the largest old layer arena
+    /// that will be replaced. A no-op growth needs no surcharge.
+    pub fn tq_growth_transient_extra_bytes_for_slot(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        required_tokens: u32,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            self.tq_kv_active,
+            "TQ growth headroom requires active TQ KV"
+        );
+        anyhow::ensure!(
+            slot.0 < self.n_seqs,
+            "TQ growth headroom slot {} outside n_seqs={}",
+            slot.0,
+            self.n_seqs
+        );
+        anyhow::ensure!(
+            required_tokens > 0 && required_tokens <= self.max_seq_len,
+            "TQ growth headroom requires {required_tokens} tokens outside logical range 1..={}",
+            self.max_seq_len
+        );
+
+        let mut extra = 0_u64;
+        for (layer_index, full) in self.full_attn.iter().enumerate() {
+            let tq = full
+                .tq
+                .as_ref()
+                .with_context(|| format!("full-attention layer {layer_index} lacks TQ storage"))?;
+            if required_tokens > tq.physical_capacity_for_slot(slot)? {
+                extra = extra.max(
+                    u64::try_from(tq.total_bytes())
+                        .context("TQ full-attention transient bytes exceed u64")?,
+                );
+            }
+        }
+        if let Some(mtp) = self.mtp_slot.as_ref() {
+            let tq = mtp.tq.as_ref().context("MTP layer lacks TQ storage")?;
+            if required_tokens > tq.physical_capacity_for_slot(slot)? {
+                extra = extra.max(
+                    u64::try_from(tq.total_bytes()).context("TQ MTP transient bytes exceed u64")?,
+                );
+            }
+        }
+        Ok(extra)
+    }
+
     /// Reset semantic state without touching unread full-attention pages.
     ///
     /// Full K/V is valid only below `current_len`; lowering the cursor makes
-    /// prior bytes unobservable. Zeroing the entire logical capacity here
-    /// would commit every page of every slot and defeat full-context virtual
-    /// reservation. DeltaNet recurrent/conv state is semantic input, so
-    /// [`Self::reset`] still zeros those comparatively small buffers.
+    /// prior bytes unobservable. Zeroing the allocated physical arena here
+    /// would needlessly rewrite every retained high-water page. DeltaNet
+    /// recurrent/conv state is semantic input, so [`Self::reset`] still zeros
+    /// those comparatively small buffers.
     ///
     /// `pub(crate)` because the qwen35 `--benchmark` 5-iter loop in
     /// `src/serve/mod.rs::cmd_generate_qwen35` calls this between
@@ -2670,6 +3634,7 @@ impl HybridKvCache {
         }
         let slot_idx = slot.0 as usize;
         let n_seqs = self.n_seqs as usize;
+        self.bump_slot_mutation_epoch(slot_idx, "reset_for_slot")?;
 
         // 1. full_attn slots — reset per-slot current_len cursor.
         for fa in self.full_attn.iter_mut() {
@@ -2796,6 +3761,7 @@ impl HybridKvCache {
     }
 
     pub fn reset(&mut self) {
+        self.cache_instance_id = NEXT_HYBRID_CACHE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         for slot in self.full_attn.iter_mut() {
             for c in slot.current_len.iter_mut() {
                 *c = 0;
@@ -3270,6 +4236,9 @@ impl HybridKvCache {
             snapshot.full_attn_tq.len(),
             snapshot.full_attn_k.len()
         );
+        for slot_idx in 0..self.n_seqs as usize {
+            self.bump_slot_mutation_epoch(slot_idx, "restore_from")?;
+        }
         for (slot, (k_snap, (v_snap, (tq_snap, len_snap)))) in self.full_attn.iter_mut().zip(
             snapshot.full_attn_k.iter().zip(
                 snapshot.full_attn_v.iter().zip(
@@ -3431,6 +4400,9 @@ impl HybridKvCache {
             snapshot.full_attn_tq.len(),
             snapshot.full_attn_k.len()
         );
+        for slot_idx in 0..self.n_seqs as usize {
+            self.bump_slot_mutation_epoch(slot_idx, "restore_partial")?;
+        }
 
         // Per-slot partial-position copy.  Each slot has shape
         // [n_kv_heads, max_seq_len, head_dim] with F32 elements.  Copy
@@ -3586,40 +4558,87 @@ impl HybridKvCache {
     pub fn total_bytes(&self) -> usize {
         let mut n = 0usize;
         for s in &self.full_attn {
-            // iter-29 (sub-sub-iter 23c-α): Optional K/V — 0 bytes when
-            // None (iter-30 TQ-only mode); element_count×4 when Some.
             if let Some(b) = s.k.as_ref() {
-                n += b.element_count() * 4;
+                n += b.byte_len();
             }
             if let Some(b) = s.v.as_ref() {
-                n += b.element_count() * 4;
+                n += b.byte_len();
+            }
+            if let Some(tq) = s.tq.as_ref() {
+                n += tq.total_bytes();
             }
         }
         if let Some(s) = &self.mtp_slot {
             if let Some(b) = s.k.as_ref() {
-                n += b.element_count() * 4;
+                n += b.byte_len();
             }
             if let Some(b) = s.v.as_ref() {
-                n += b.element_count() * 4;
+                n += b.byte_len();
+            }
+            if let Some(tq) = s.tq.as_ref() {
+                n += tq.total_bytes();
             }
         }
         for s in &self.linear_attn {
-            n += s.conv_state.element_count() * 4
-                + s.conv_state_scratch.element_count() * 4
-                + s.recurrent.element_count() * 4
-                + s.recurrent_scratch.element_count() * 4;
+            n += s.conv_state.byte_len()
+                + s.conv_state_scratch.byte_len()
+                + s.recurrent.byte_len()
+                + s.recurrent_scratch.byte_len();
             // ADR-034 task #90 Step 2 (2026-05-21) — count capture
             // buffer when allocated (None in non-spec mode = 0 bytes).
             if let Some(buf) = s.capture_states.as_ref() {
-                n += buf.element_count() * 4;
+                n += buf.byte_len();
             }
             // ADR-034 task #90 Step 4c (2026-05-21) — count conv capture
             // companion buffer when allocated.
             if let Some(buf) = s.conv_capture_states.as_ref() {
-                n += buf.element_count() * 4;
+                n += buf.byte_len();
             }
         }
         n
+    }
+
+    /// Exact allocation-backed Metal buffers plus host control allocations
+    /// released when this cache's last owner is dropped.
+    pub fn owned_bytes(&self) -> u64 {
+        let mut bytes = self.total_bytes() as u64;
+        bytes = bytes
+            .saturating_add(
+                (self.full_attn.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<FullAttnKvSlot>() as u64),
+            )
+            .saturating_add(
+                (self.linear_attn.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<LinearAttnStateSlot>() as u64),
+            )
+            .saturating_add(
+                (self.slot_mutation_epoch.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<u64>() as u64),
+            )
+            .saturating_add(
+                (self.per_layer_slot.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<LayerSlot>() as u64),
+            );
+        for slot in self.full_attn.iter().chain(self.mtp_slot.iter()) {
+            bytes = bytes
+                .saturating_add(
+                    (slot.current_len.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<u32>() as u64),
+                )
+                .saturating_add(slot.tq.as_ref().map_or(0, |tq| tq.control_owned_bytes()));
+        }
+        for slot in &self.linear_attn {
+            bytes = bytes
+                .saturating_add(
+                    (slot.pp_flipped.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<bool>() as u64),
+                )
+                .saturating_add(
+                    (slot.write_generation.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<u64>() as u64),
+                );
+        }
+        bytes
     }
 }
 
@@ -3765,6 +4784,7 @@ fn alloc_linear_attn_slot(
         // ADR-040 M-QWEN — per-slot ping-pong parity, all canonical
         // (false = named fields are current) at alloc.
         pp_flipped: vec![false; n_seqs as usize],
+        write_generation: vec![0; n_seqs as usize],
     })
 }
 
@@ -3782,11 +4802,10 @@ fn alloc_linear_attn_slot(
 /// slot (qwen35). Holds Hadamard-rotated 8-bit-quantized K/V indices and
 /// per-position F32 norms.
 ///
-/// Shape convention matches the qwen35 F32 cache layout (4D with `n_seqs`
-/// as the outer axis), differing from Gemma's HbKvBuffers shape which is
-/// 3D (no batch axis). The mlx-native `flash_attn_vec_tq_hb` kernel reads
-/// the inner three axes `[n_kv_heads, max_seq_len, head_dim]` per
-/// sequence; the n_seqs outer dimension is consumed at the call site.
+/// Uniform arenas preserve the historical 4D outer-sequence shape. Growable
+/// arenas are compact one-dimensional component buffers whose self-described
+/// segments may have unequal capacities. Scalar calls consume a zero-copy
+/// view of one segment; physical batches pass explicit base/capacity arrays.
 ///
 /// Constructed by [`alloc_tq_full_attn_buffers`] and installed by the
 /// `HybridKvCache` allocator when TQ mode is active.
@@ -3807,54 +4826,259 @@ pub struct TqFullAttnKvBuffers {
     /// 2 for head_dim=512).  Cached so SDPA dispatch (iter-8) doesn't
     /// recompute from `head_dim`.
     pub norms_per_pos: u32,
+    /// Physical KV geometry used by both scalar slot views and banked batched
+    /// dispatch. Keeping it beside the buffers makes variable-capacity
+    /// layouts self-describing instead of reconstructing them from shape.
+    n_kv_heads: u32,
+    head_dim: u32,
+    /// Physical per-slot segment map. Logical context remains on the owning
+    /// `HybridKvCache`; this map records only rows allocated in this arena.
+    layout: TqArenaLayout,
 }
 
-struct TqFullAttnSlotViews {
-    k_packed: MlxBuffer,
-    k_norms: MlxBuffer,
-    v_packed: MlxBuffer,
-    v_norms: MlxBuffer,
+pub(super) struct TqFullAttnSlotViews {
+    pub(super) k_packed: MlxBuffer,
+    pub(super) k_norms: MlxBuffer,
+    pub(super) v_packed: MlxBuffer,
+    pub(super) v_norms: MlxBuffer,
+    pub(super) capacity_tokens: u32,
 }
 
 impl TqFullAttnKvBuffers {
     /// Zero-copy views for one sequence in the outer `n_seqs` axis. The MLX
     /// kernels remain single-sequence kernels; Metal buffer offsets select
     /// the agent slot without changing their math.
-    fn slot_views(
+    pub(super) fn slot_views(
         &self,
         slot_id: crate::serve::multi_seq_kv::SlotId,
         n_kv_heads: u32,
         cache_capacity: u32,
         head_dim: u32,
     ) -> Result<TqFullAttnSlotViews> {
-        let n_seqs = self.k_packed.shape().first().copied().unwrap_or(0);
+        let n_seqs = self.layout.n_seqs();
         anyhow::ensure!(
             (slot_id.0 as usize) < n_seqs,
             "TQ slot {} out of range for n_seqs={n_seqs}",
             slot_id.0
         );
+        let segment = self.layout.segment(slot_id.0 as usize)?;
+        anyhow::ensure!(
+            cache_capacity >= segment.capacity_tokens,
+            "TQ slot {} physical capacity {} exceeds caller logical capacity {}",
+            slot_id.0,
+            segment.capacity_tokens,
+            cache_capacity
+        );
+        anyhow::ensure!(
+            n_kv_heads == self.n_kv_heads && head_dim == self.head_dim,
+            "TQ slot geometry mismatch: caller heads/dim={n_kv_heads}/{head_dim}, arena={}/{}",
+            self.n_kv_heads,
+            self.head_dim
+        );
         let packed_elems = (n_kv_heads as usize)
-            .checked_mul(cache_capacity as usize)
+            .checked_mul(segment.capacity_tokens as usize)
             .and_then(|value| value.checked_mul(head_dim as usize))
             .ok_or_else(|| anyhow!("TQ packed slot extent overflow"))?;
         let norms_elems = (n_kv_heads as usize)
-            .checked_mul(cache_capacity as usize)
+            .checked_mul(segment.capacity_tokens as usize)
             .and_then(|value| value.checked_mul(self.norms_per_pos as usize))
             .ok_or_else(|| anyhow!("TQ norm slot extent overflow"))?;
-        let packed_offset = (slot_id.0 as u64)
-            .checked_mul(packed_elems as u64)
-            .ok_or_else(|| anyhow!("TQ packed slot offset overflow"))?;
-        let norms_offset = (slot_id.0 as u64)
-            .checked_mul(norms_elems as u64)
-            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+        let packed_offset =
+            self.layout
+                .packed_base_elements(slot_id.0 as usize, n_kv_heads, head_dim)?;
+        let norms_offset = self
+            .layout
+            .norms_base_elements(slot_id.0 as usize, n_kv_heads, self.norms_per_pos)?
+            .checked_mul(std::mem::size_of::<f32>() as u64)
             .ok_or_else(|| anyhow!("TQ norm slot offset overflow"))?;
         Ok(TqFullAttnSlotViews {
             k_packed: self.k_packed.slice_view(packed_offset, packed_elems),
             k_norms: self.k_norms.slice_view(norms_offset, norms_elems),
             v_packed: self.v_packed.slice_view(packed_offset, packed_elems),
             v_norms: self.v_norms.slice_view(norms_offset, norms_elems),
+            capacity_tokens: segment.capacity_tokens,
         })
     }
+
+    fn slot_segment(
+        &self,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<tq_arena::TqArenaSegment> {
+        self.layout.segment(slot_id.0 as usize)
+    }
+
+    fn physical_bytes_for_slot(&self, slot_id: crate::serve::multi_seq_kv::SlotId) -> Result<u64> {
+        let capacity = u64::from(self.slot_segment(slot_id)?.capacity_tokens);
+        let packed_per_token = u64::from(self.n_kv_heads)
+            .checked_mul(u64::from(self.head_dim))
+            .ok_or_else(|| anyhow!("TQ packed per-token byte extent overflow"))?;
+        let norms_per_token = u64::from(self.n_kv_heads)
+            .checked_mul(u64::from(self.norms_per_pos))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or_else(|| anyhow!("TQ norm per-token byte extent overflow"))?;
+        capacity
+            .checked_mul(
+                packed_per_token
+                    .checked_add(norms_per_token)
+                    .and_then(|one_side| one_side.checked_mul(2))
+                    .ok_or_else(|| anyhow!("TQ per-token K/V byte extent overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("TQ slot physical byte extent overflow"))
+    }
+
+    pub(super) fn banked_geometry_for_slots(
+        &self,
+        slots: &[crate::serve::multi_seq_kv::SlotId],
+    ) -> Result<(Vec<u32>, Vec<u32>, u32)> {
+        let mut base_token_rows = Vec::with_capacity(slots.len());
+        let mut capacities = Vec::with_capacity(slots.len());
+        for &slot_id in slots {
+            let segment = self.slot_segment(slot_id)?;
+            base_token_rows.push(
+                segment
+                    .base_tokens
+                    .checked_mul(self.n_kv_heads)
+                    .ok_or_else(|| anyhow!("TQ banked base-token-row overflow"))?,
+            );
+            capacities.push(segment.capacity_tokens);
+        }
+        let arena_token_rows = self
+            .layout
+            .total_capacity_tokens()
+            .checked_mul(self.n_kv_heads)
+            .ok_or_else(|| anyhow!("TQ arena token-row extent overflow"))?;
+        Ok((base_token_rows, capacities, arena_token_rows))
+    }
+
+    /// Copy the visible prefix between two physical slot segments on the
+    /// host. This is used only by the legacy `fork_seq` trait surface, after
+    /// admission has already provisioned the destination capacity. Arena
+    /// growth itself uses ordered GPU blits and never maps live KV through the
+    /// CPU.
+    fn copy_slot_prefix_within(
+        &mut self,
+        src: crate::serve::multi_seq_kv::SlotId,
+        dst: crate::serve::multi_seq_kv::SlotId,
+        live_tokens: u32,
+    ) -> Result<()> {
+        let src_segment = self.slot_segment(src)?;
+        let dst_segment = self.slot_segment(dst)?;
+        anyhow::ensure!(
+            live_tokens <= src_segment.capacity_tokens
+                && live_tokens <= dst_segment.capacity_tokens,
+            "TQ fork prefix {live_tokens} exceeds source/destination physical capacity {}/{}",
+            src_segment.capacity_tokens,
+            dst_segment.capacity_tokens
+        );
+        if live_tokens == 0 || src == dst {
+            return Ok(());
+        }
+
+        copy_tq_component_slot_prefix_within(
+            &mut self.k_packed,
+            &self.layout,
+            src,
+            dst,
+            live_tokens,
+            self.n_kv_heads,
+            self.head_dim,
+            1,
+        )?;
+        copy_tq_component_slot_prefix_within(
+            &mut self.v_packed,
+            &self.layout,
+            src,
+            dst,
+            live_tokens,
+            self.n_kv_heads,
+            self.head_dim,
+            1,
+        )?;
+        copy_tq_component_slot_prefix_within(
+            &mut self.k_norms,
+            &self.layout,
+            src,
+            dst,
+            live_tokens,
+            self.n_kv_heads,
+            self.norms_per_pos,
+            std::mem::size_of::<f32>() as u32,
+        )?;
+        copy_tq_component_slot_prefix_within(
+            &mut self.v_norms,
+            &self.layout,
+            src,
+            dst,
+            live_tokens,
+            self.n_kv_heads,
+            self.norms_per_pos,
+            std::mem::size_of::<f32>() as u32,
+        )?;
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_tq_component_slot_prefix_within(
+    buffer: &mut MlxBuffer,
+    layout: &TqArenaLayout,
+    src: crate::serve::multi_seq_kv::SlotId,
+    dst: crate::serve::multi_seq_kv::SlotId,
+    live_tokens: u32,
+    n_kv_heads: u32,
+    elements_per_token: u32,
+    element_bytes: u32,
+) -> Result<()> {
+    let src_segment = layout.segment(src.0 as usize)?;
+    let dst_segment = layout.segment(dst.0 as usize)?;
+    let bytes_per_position = u64::from(elements_per_token)
+        .checked_mul(u64::from(element_bytes))
+        .ok_or_else(|| anyhow!("TQ fork bytes-per-position overflow"))?;
+    let src_slot_base = u64::from(src_segment.base_tokens)
+        .checked_mul(u64::from(n_kv_heads))
+        .and_then(|value| value.checked_mul(bytes_per_position))
+        .ok_or_else(|| anyhow!("TQ fork source base overflow"))?;
+    let dst_slot_base = u64::from(dst_segment.base_tokens)
+        .checked_mul(u64::from(n_kv_heads))
+        .and_then(|value| value.checked_mul(bytes_per_position))
+        .ok_or_else(|| anyhow!("TQ fork destination base overflow"))?;
+    let src_head_stride = u64::from(src_segment.capacity_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ fork source head stride overflow"))?;
+    let dst_head_stride = u64::from(dst_segment.capacity_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ fork destination head stride overflow"))?;
+    let copy_bytes = u64::from(live_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ fork copy extent overflow"))?;
+    let bytes = buffer
+        .as_mut_slice::<u8>()
+        .map_err(|error| anyhow!("TQ fork buffer mapping: {error}"))?;
+    for head in 0..u64::from(n_kv_heads) {
+        let src_start = src_slot_base
+            .checked_add(
+                head.checked_mul(src_head_stride)
+                    .ok_or_else(|| anyhow!("TQ fork source head stride overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("TQ fork source head offset overflow"))?;
+        let dst_start = dst_slot_base
+            .checked_add(
+                head.checked_mul(dst_head_stride)
+                    .ok_or_else(|| anyhow!("TQ fork destination head stride overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("TQ fork destination head offset overflow"))?;
+        let src_start = usize::try_from(src_start).context("TQ fork source offset usize")?;
+        let dst_start = usize::try_from(dst_start).context("TQ fork destination offset usize")?;
+        let copy_bytes = usize::try_from(copy_bytes).context("TQ fork extent usize")?;
+        anyhow::ensure!(
+            src_start.saturating_add(copy_bytes) <= bytes.len()
+                && dst_start.saturating_add(copy_bytes) <= bytes.len(),
+            "TQ fork component range exceeds buffer length {}",
+            bytes.len()
+        );
+        bytes.copy_within(src_start..src_start + copy_bytes, dst_start);
+    }
+    Ok(())
 }
 
 /// Number of F32 norms per (seq, head, position) for a given head_dim.
@@ -3897,35 +5121,56 @@ pub fn alloc_tq_full_attn_buffers(
         return Err(anyhow!("alloc_tq_full_attn_buffers: n_seqs must be > 0"));
     }
 
+    let layout = TqArenaLayout::uniform(n_seqs, max_seq_len)?;
+    alloc_tq_full_attn_buffers_with_layout(cfg, device, layout)
+}
+
+fn alloc_tq_full_attn_buffers_with_layout(
+    cfg: &Qwen35Config,
+    device: &MlxDevice,
+    layout: TqArenaLayout,
+) -> Result<TqFullAttnKvBuffers> {
     let n_kv_heads = cfg.num_key_value_heads as usize;
     let head_dim = cfg.head_dim;
     let norms_per_pos = tq_norms_per_pos_for(head_dim);
+    let total_capacity_tokens = layout.total_capacity_tokens() as usize;
+    let first_capacity = layout.segment(0)?.capacity_tokens as usize;
+    let uniform_capacity = layout
+        .capacities()
+        .all(|capacity| capacity as usize == first_capacity)
+        .then_some(first_capacity);
 
-    // Packed: [n_seqs, n_kv_heads, max_seq_len, head_dim] U8.
+    // Packed arena: concatenated per-slot head-major segments. A static
+    // uniform layout remains byte-identical to the historical outer-axis
+    // allocation; a growable layout may assign different capacities.
     // 1 byte per element (8-bit Lloyd-Max index).
-    let packed_elems =
-        (n_seqs as usize) * n_kv_heads * (max_seq_len as usize) * (head_dim as usize);
+    let packed_elems = total_capacity_tokens
+        .checked_mul(n_kv_heads)
+        .and_then(|value| value.checked_mul(head_dim as usize))
+        .ok_or_else(|| anyhow!("TQ packed arena extent overflow"))?;
     let packed_bytes = packed_elems; // U8 → 1 byte/elem
-    let packed_shape = vec![
-        n_seqs as usize,
-        n_kv_heads,
-        max_seq_len as usize,
-        head_dim as usize,
-    ];
+    let packed_shape = match uniform_capacity {
+        Some(capacity) => vec![layout.n_seqs(), n_kv_heads, capacity, head_dim as usize],
+        None => vec![packed_elems],
+    };
 
-    // Norms: [n_seqs, n_kv_heads, max_seq_len, norms_per_pos] F32.
-    // norms_per_pos=1 collapses to a 3-D view at the kernel level,
-    // but we keep the 4-D shape on the buffer so cfg-shape validation
-    // is unambiguous (every dim is explicit).
-    let norms_elems =
-        (n_seqs as usize) * n_kv_heads * (max_seq_len as usize) * (norms_per_pos as usize);
-    let norms_bytes = norms_elems * std::mem::size_of::<f32>();
-    let norms_shape = vec![
-        n_seqs as usize,
-        n_kv_heads,
-        max_seq_len as usize,
-        norms_per_pos as usize,
-    ];
+    // Norm arena mirrors the packed segment order.
+    let norms_elems = total_capacity_tokens
+        .checked_mul(n_kv_heads)
+        .and_then(|value| value.checked_mul(norms_per_pos as usize))
+        .ok_or_else(|| anyhow!("TQ norm arena extent overflow"))?;
+    let norms_bytes = norms_elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow!("TQ norm arena byte extent overflow"))?;
+    let norms_shape = match uniform_capacity {
+        Some(capacity) => vec![
+            layout.n_seqs(),
+            n_kv_heads,
+            capacity,
+            norms_per_pos as usize,
+        ],
+        None => vec![norms_elems],
+    };
 
     // SAFETY: all TQ attention readers are bounded by the owning slot's
     // `current_len`; encoder writes packed values and norms before advancing
@@ -3949,17 +5194,216 @@ pub fn alloc_tq_full_attn_buffers(
         v_packed,
         v_norms,
         norms_per_pos,
+        n_kv_heads: cfg.num_key_value_heads,
+        head_dim: cfg.head_dim,
+        layout,
     })
+}
+
+fn grow_full_attn_tq_slot(
+    cfg: &Qwen35Config,
+    device: &MlxDevice,
+    slot: &mut FullAttnKvSlot,
+    slot_id: crate::serve::multi_seq_kv::SlotId,
+    required_tokens: u32,
+    logical_max_tokens: u32,
+) -> Result<()> {
+    let old = slot
+        .tq
+        .as_ref()
+        .context("grow_full_attn_tq_slot requires TQ storage")?;
+    anyhow::ensure!(
+        old.n_kv_heads == cfg.num_key_value_heads && old.head_dim == cfg.head_dim,
+        "TQ growth model geometry changed from heads/dim={}/{} to {}/{}",
+        old.n_kv_heads,
+        old.head_dim,
+        cfg.num_key_value_heads,
+        cfg.head_dim
+    );
+    let new_layout =
+        old.layout
+            .grow_slot(slot_id.0 as usize, required_tokens, logical_max_tokens)?;
+    if new_layout == old.layout {
+        return Ok(());
+    }
+    for (peer, &cursor) in slot.current_len.iter().enumerate() {
+        let old_capacity = old.layout.segment(peer)?.capacity_tokens;
+        anyhow::ensure!(
+            cursor <= old_capacity,
+            "TQ layer cursor {cursor} exceeds physical capacity {old_capacity} for slot {peer}"
+        );
+    }
+
+    let replacement = alloc_tq_full_attn_buffers_with_layout(cfg, device, new_layout)
+        .context("allocate replacement TQ arena")?;
+    if slot.current_len.iter().any(|&cursor| cursor > 0) {
+        let mut encoder = device
+            .command_encoder()
+            .context("create TQ arena migration encoder")?;
+        encode_tq_arena_prefix_blits(&mut encoder, old, &replacement, &slot.current_len)
+            .context("encode TQ arena visible-prefix migration")?;
+        encoder
+            .commit_and_wait_labeled("qwen.tq_arena.grow")
+            .context("execute TQ arena visible-prefix migration")?;
+    }
+    slot.tq = Some(replacement);
+    Ok(())
+}
+
+fn encode_tq_arena_prefix_blits(
+    encoder: &mut mlx_native::CommandEncoder,
+    source: &TqFullAttnKvBuffers,
+    destination: &TqFullAttnKvBuffers,
+    visible_tokens: &[u32],
+) -> Result<()> {
+    anyhow::ensure!(
+        source.n_kv_heads == destination.n_kv_heads
+            && source.head_dim == destination.head_dim
+            && source.norms_per_pos == destination.norms_per_pos,
+        "TQ arena migration geometry mismatch"
+    );
+    anyhow::ensure!(
+        visible_tokens.len() == source.layout.n_seqs()
+            && visible_tokens.len() == destination.layout.n_seqs(),
+        "TQ arena migration cursor/layout slot-count mismatch"
+    );
+    for (slot_index, &cursor) in visible_tokens.iter().enumerate() {
+        if cursor == 0 {
+            continue;
+        }
+        let src = source.layout.segment(slot_index)?;
+        let dst = destination.layout.segment(slot_index)?;
+        anyhow::ensure!(
+            cursor <= src.capacity_tokens && cursor <= dst.capacity_tokens,
+            "TQ arena migration cursor {cursor} exceeds source/destination capacity {}/{} for slot {slot_index}",
+            src.capacity_tokens,
+            dst.capacity_tokens
+        );
+        encode_tq_component_prefix_blits(
+            encoder,
+            &source.k_packed,
+            &destination.k_packed,
+            src,
+            dst,
+            cursor,
+            source.n_kv_heads,
+            source.head_dim,
+            1,
+        )?;
+        encode_tq_component_prefix_blits(
+            encoder,
+            &source.v_packed,
+            &destination.v_packed,
+            src,
+            dst,
+            cursor,
+            source.n_kv_heads,
+            source.head_dim,
+            1,
+        )?;
+        encode_tq_component_prefix_blits(
+            encoder,
+            &source.k_norms,
+            &destination.k_norms,
+            src,
+            dst,
+            cursor,
+            source.n_kv_heads,
+            source.norms_per_pos,
+            std::mem::size_of::<f32>() as u32,
+        )?;
+        encode_tq_component_prefix_blits(
+            encoder,
+            &source.v_norms,
+            &destination.v_norms,
+            src,
+            dst,
+            cursor,
+            source.n_kv_heads,
+            source.norms_per_pos,
+            std::mem::size_of::<f32>() as u32,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_tq_component_prefix_blits(
+    encoder: &mut mlx_native::CommandEncoder,
+    source: &MlxBuffer,
+    destination: &MlxBuffer,
+    source_segment: tq_arena::TqArenaSegment,
+    destination_segment: tq_arena::TqArenaSegment,
+    visible_tokens: u32,
+    n_kv_heads: u32,
+    elements_per_token: u32,
+    element_bytes: u32,
+) -> Result<()> {
+    let bytes_per_position = u64::from(elements_per_token)
+        .checked_mul(u64::from(element_bytes))
+        .ok_or_else(|| anyhow!("TQ migration bytes-per-position overflow"))?;
+    let source_slot_base = u64::from(source_segment.base_tokens)
+        .checked_mul(u64::from(n_kv_heads))
+        .and_then(|value| value.checked_mul(bytes_per_position))
+        .ok_or_else(|| anyhow!("TQ migration source base overflow"))?;
+    let destination_slot_base = u64::from(destination_segment.base_tokens)
+        .checked_mul(u64::from(n_kv_heads))
+        .and_then(|value| value.checked_mul(bytes_per_position))
+        .ok_or_else(|| anyhow!("TQ migration destination base overflow"))?;
+    let source_head_stride = u64::from(source_segment.capacity_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ migration source stride overflow"))?;
+    let destination_head_stride = u64::from(destination_segment.capacity_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ migration destination stride overflow"))?;
+    let byte_len = u64::from(visible_tokens)
+        .checked_mul(bytes_per_position)
+        .ok_or_else(|| anyhow!("TQ migration copy extent overflow"))?;
+    for head in 0..u64::from(n_kv_heads) {
+        let source_offset = source_slot_base
+            .checked_add(
+                head.checked_mul(source_head_stride)
+                    .ok_or_else(|| anyhow!("TQ migration source head offset overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("TQ migration source offset overflow"))?;
+        let destination_offset = destination_slot_base
+            .checked_add(
+                head.checked_mul(destination_head_stride)
+                    .ok_or_else(|| anyhow!("TQ migration destination head offset overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("TQ migration destination offset overflow"))?;
+        encoder
+            .blit_copy_bytes(
+                source,
+                source_offset,
+                destination,
+                destination_offset,
+                byte_len,
+            )
+            .map_err(|error| anyhow!("TQ arena byte blit: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Total bytes the TQ-active full-attn slot occupies (sum of all 4
 /// buffers).  Useful for memory accounting + the parity test.
 impl TqFullAttnKvBuffers {
+    pub fn physical_capacity_for_slot(
+        &self,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<u32> {
+        Ok(self.layout.segment(slot_id.0 as usize)?.capacity_tokens)
+    }
+
     pub fn total_bytes(&self) -> usize {
         self.k_packed.byte_len()
             + self.k_norms.byte_len()
             + self.v_packed.byte_len()
             + self.v_norms.byte_len()
+    }
+
+    fn control_owned_bytes(&self) -> u64 {
+        self.layout.control_owned_bytes()
     }
 }
 
@@ -4127,6 +5571,14 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         // Phase A2b — `LinearAttnStateSlot` has no logical cursor and the
         // `rollback_la_to` guard at kv_cache.rs:1567 explicitly rejects
         // n_seqs > 1 until the capture-buffer layout is re-derived.
+        self.bump_slot_mutation_epoch(slot.0 as usize, "append_for_seq")
+            .map_err(
+                |error| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: leak_static_str(format!(
+                        "append_for_seq: mutation epoch update failed ({error})"
+                    )),
+                },
+            )?;
         for slot_data in &mut self.full_attn {
             let cur = &mut slot_data.current_len[slot.0 as usize];
             *cur = cur.saturating_add(n_tokens);
@@ -4163,6 +5615,14 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         // sound for Phase A2a's full-attn-only forward routing because
         // forward paths under multi-seq do not yet dispatch linear-attn
         // (see Phase B iter-3 + dossier §2.10 R2).
+        self.bump_slot_mutation_epoch(slot.0 as usize, "drop_seq")
+            .map_err(
+                |error| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: leak_static_str(format!(
+                        "drop_seq: mutation epoch update failed ({error})"
+                    )),
+                },
+            )?;
         for slot_data in &mut self.full_attn {
             slot_data.current_len[slot.0 as usize] = 0;
         }
@@ -4199,6 +5659,14 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         if src == dst {
             return Ok(());
         }
+        self.bump_slot_mutation_epoch(dst.0 as usize, "fork_seq")
+            .map_err(
+                |error| crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: leak_static_str(format!(
+                        "fork_seq: mutation epoch update failed ({error})"
+                    )),
+                },
+            )?;
         // ──────────────────────────────────────────────────────────────
         // ADR-040 Phase A2c (2026-05-30) — REAL cross-slot fork.
         //
@@ -4214,11 +5682,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         //       — same as `slot_k_v_region_for_full_attn` at
         //       `gpu_full_attn.rs:102-116`.
         //
-        //   * Full-attn TQ packed (U8) + TQ norms (F32):
-        //       packed `[n_seqs, n_kv_heads, max_seq_len, head_dim]`, norms
-        //       `[n_seqs, n_kv_heads, max_seq_len, norms_per_pos]`.  Stride
-        //       formulas match `alloc_tq_full_attn_buffers` at
-        //       `kv_cache.rs:2735-2763`.
+        //   * Full-attn TQ packed (U8) + TQ norms (F32): variable physical
+        //       segments described by the arena layout. Each head's visible
+        //       prefix is copied using the source and destination capacities;
+        //       physical capacity is provisioned before this trait call.
         //
         //   * MTP slot: identical shape to full-attn slot per
         //       `HybridKvCache::new_with_mtp` discipline (the MTP slot
@@ -4268,62 +5735,11 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
                     },
                 )?;
             }
-            // TQ-active shadow buffers (packed U8 + norms F32).
+            // TQ-active native buffers (packed U8 + norms F32).
             if let Some(ref mut tq) = slot.tq {
-                copy_buffer_slot_prefix(
-                    &mut tq.k_packed,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
+                tq.copy_slot_prefix_within(src, dst, cur_src).map_err(|e| {
                     crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: TQ K packed copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.v_packed,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: TQ V packed copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.k_norms,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: TQ K norms copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.v_norms,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: TQ V norms copy failed ({e})"
-                        )),
+                        capability: leak_static_str(format!("fork_seq: TQ copy failed ({e})")),
                     }
                 })?;
             }
@@ -4349,60 +5765,9 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
                 )?;
             }
             if let Some(ref mut tq) = mtp.tq {
-                copy_buffer_slot_prefix(
-                    &mut tq.k_packed,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
+                tq.copy_slot_prefix_within(src, dst, cur_src).map_err(|e| {
                     crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: MTP TQ K packed copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.v_packed,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: MTP TQ V packed copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.k_norms,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: MTP TQ K norms copy failed ({e})"
-                        )),
-                    }
-                })?;
-                copy_buffer_slot_prefix(
-                    &mut tq.v_norms,
-                    src_idx,
-                    dst_idx,
-                    n_seqs,
-                    cur_src as usize,
-                )
-                .map_err(|e| {
-                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                        capability: leak_static_str(format!(
-                            "fork_seq: MTP TQ V norms copy failed ({e})"
-                        )),
+                        capability: leak_static_str(format!("fork_seq: MTP TQ copy failed ({e})")),
                     }
                 })?;
             }
@@ -4476,6 +5841,7 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
             // copied to dst, so dst's (current, scratch) roles must match
             // src's — carry the ping-pong parity across the fork.
             slot.pp_flipped[dst_idx] = slot.pp_flipped[src_idx];
+            slot.write_generation[dst_idx] = slot.write_generation[src_idx];
         }
 
         Ok(())
@@ -8892,6 +10258,282 @@ mod tests {
         }
     }
 
+    #[test]
+    fn growable_tq_constructor_keeps_logical_context_but_seeds_small_physical_arenas() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device for test");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        assert!(HybridKvCache::new_with_growable_tq(&cfg, &device, 4096, 16, 0).is_err());
+        assert!(HybridKvCache::new_with_growable_tq(&cfg, &device, 4096, 16, 4097).is_err());
+        let cache = HybridKvCache::new_with_growable_tq(&cfg, &device, 4096, 16, 1)
+            .expect("growable cache");
+
+        assert_eq!(cache.max_seq_len, 4096, "logical context must not shrink");
+        assert_eq!(cache.n_seqs, 16);
+        for slot in &cache.full_attn {
+            let tq = slot.tq.as_ref().expect("TQ storage");
+            for slot_id in 0..16 {
+                assert_eq!(
+                    tq.physical_capacity_for_slot(crate::serve::multi_seq_kv::SlotId(slot_id))
+                        .unwrap(),
+                    1
+                );
+            }
+            let static_full_context_bytes =
+                16 * 2 * 4096 * 32 * 2 + 16 * 2 * 4096 * tq.norms_per_pos as usize * 4 * 2;
+            assert!(
+                tq.total_bytes() < static_full_context_bytes,
+                "physical seed must not allocate the logical full-context product"
+            );
+        }
+    }
+
+    fn visible_tq_u8_prefix(
+        buffer: &MlxBuffer,
+        capacity: usize,
+        cursor: usize,
+        n_heads: usize,
+        elements_per_token: usize,
+    ) -> Vec<u8> {
+        let values = buffer.as_slice::<u8>().expect("TQ u8 mapping");
+        let mut visible = Vec::with_capacity(n_heads * cursor * elements_per_token);
+        for head in 0..n_heads {
+            let start = head * capacity * elements_per_token;
+            visible.extend_from_slice(&values[start..start + cursor * elements_per_token]);
+        }
+        visible
+    }
+
+    fn visible_tq_f32_prefix_bits(
+        buffer: &MlxBuffer,
+        capacity: usize,
+        cursor: usize,
+        n_heads: usize,
+        elements_per_token: usize,
+    ) -> Vec<u32> {
+        let values = buffer.as_slice::<f32>().expect("TQ f32 mapping");
+        let mut visible = Vec::with_capacity(n_heads * cursor * elements_per_token);
+        for head in 0..n_heads {
+            let start = head * capacity * elements_per_token;
+            visible.extend(
+                values[start..start + cursor * elements_per_token]
+                    .iter()
+                    .map(|value| value.to_bits()),
+            );
+        }
+        visible
+    }
+
+    #[test]
+    fn growable_tq_migration_preserves_every_peer_visible_bit() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device for test");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache =
+            HybridKvCache::new_with_growable_tq(&cfg, &device, 64, 3, 4).expect("growable cache");
+        let cursors = [4_u32, 2, 1];
+        for full in &mut cache.full_attn {
+            full.current_len.copy_from_slice(&cursors);
+            let tq = full.tq.as_mut().expect("TQ storage");
+            for (index, value) in tq
+                .k_packed
+                .as_mut_slice::<u8>()
+                .expect("K packed mapping")
+                .iter_mut()
+                .enumerate()
+            {
+                *value = (index as u8).wrapping_mul(17).wrapping_add(3);
+            }
+            for (index, value) in tq
+                .v_packed
+                .as_mut_slice::<u8>()
+                .expect("V packed mapping")
+                .iter_mut()
+                .enumerate()
+            {
+                *value = (index as u8).wrapping_mul(29).wrapping_add(11);
+            }
+            for (index, value) in tq
+                .k_norms
+                .as_mut_slice::<f32>()
+                .expect("K norm mapping")
+                .iter_mut()
+                .enumerate()
+            {
+                *value = f32::from_bits(0x3f00_0000_u32.wrapping_add(index as u32));
+            }
+            for (index, value) in tq
+                .v_norms
+                .as_mut_slice::<f32>()
+                .expect("V norm mapping")
+                .iter_mut()
+                .enumerate()
+            {
+                *value = f32::from_bits(0x4000_0000_u32.wrapping_add(index as u32));
+            }
+        }
+
+        let mut before = Vec::new();
+        for full in &cache.full_attn {
+            let tq = full.tq.as_ref().unwrap();
+            for (slot_index, &cursor) in cursors.iter().enumerate() {
+                let views = tq
+                    .slot_views(
+                        crate::serve::multi_seq_kv::SlotId(slot_index as u32),
+                        cfg.num_key_value_heads,
+                        cache.max_seq_len,
+                        cfg.head_dim,
+                    )
+                    .unwrap();
+                before.push((
+                    visible_tq_u8_prefix(
+                        &views.k_packed,
+                        4,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        cfg.head_dim as usize,
+                    ),
+                    visible_tq_u8_prefix(
+                        &views.v_packed,
+                        4,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        cfg.head_dim as usize,
+                    ),
+                    visible_tq_f32_prefix_bits(
+                        &views.k_norms,
+                        4,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        1,
+                    ),
+                    visible_tq_f32_prefix_bits(
+                        &views.v_norms,
+                        4,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        1,
+                    ),
+                ));
+            }
+        }
+        let bytes_before = cache
+            .tq_physical_bytes_for_slot(crate::serve::multi_seq_kv::SlotId(1))
+            .unwrap();
+        let old_layer_bytes = cache.full_attn[0]
+            .tq
+            .as_ref()
+            .expect("TQ layer")
+            .total_bytes() as u64;
+        assert_eq!(
+            cache
+                .tq_growth_transient_extra_bytes_for_slot(crate::serve::multi_seq_kv::SlotId(1), 9,)
+                .unwrap(),
+            old_layer_bytes,
+            "layer-transactional growth must reserve one old arena"
+        );
+        let bytes_after = cache
+            .ensure_tq_physical_capacity_for_slot(
+                &cfg,
+                &device,
+                crate::serve::multi_seq_kv::SlotId(1),
+                9,
+            )
+            .expect("grow slot 1");
+        assert!(bytes_after > bytes_before);
+        assert_eq!(
+            cache
+                .tq_growth_transient_extra_bytes_for_slot(crate::serve::multi_seq_kv::SlotId(1), 9,)
+                .unwrap(),
+            0,
+            "an already-provisioned slot needs no migration headroom"
+        );
+
+        let mut record = 0;
+        for full in &cache.full_attn {
+            assert_eq!(full.current_len, cursors, "growth must not move cursors");
+            let tq = full.tq.as_ref().unwrap();
+            assert_eq!(
+                tq.physical_capacity_for_slot(crate::serve::multi_seq_kv::SlotId(0))
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                tq.physical_capacity_for_slot(crate::serve::multi_seq_kv::SlotId(1))
+                    .unwrap(),
+                9
+            );
+            assert_eq!(
+                tq.physical_capacity_for_slot(crate::serve::multi_seq_kv::SlotId(2))
+                    .unwrap(),
+                4
+            );
+            for (slot_index, &cursor) in cursors.iter().enumerate() {
+                let capacity = if slot_index == 1 { 9 } else { 4 };
+                let views = tq
+                    .slot_views(
+                        crate::serve::multi_seq_kv::SlotId(slot_index as u32),
+                        cfg.num_key_value_heads,
+                        cache.max_seq_len,
+                        cfg.head_dim,
+                    )
+                    .unwrap();
+                let after = (
+                    visible_tq_u8_prefix(
+                        &views.k_packed,
+                        capacity,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        cfg.head_dim as usize,
+                    ),
+                    visible_tq_u8_prefix(
+                        &views.v_packed,
+                        capacity,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        cfg.head_dim as usize,
+                    ),
+                    visible_tq_f32_prefix_bits(
+                        &views.k_norms,
+                        capacity,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        1,
+                    ),
+                    visible_tq_f32_prefix_bits(
+                        &views.v_norms,
+                        capacity,
+                        cursor as usize,
+                        cfg.num_key_value_heads as usize,
+                        1,
+                    ),
+                );
+                assert_eq!(after, before[record], "visible prefix record {record}");
+                record += 1;
+            }
+        }
+
+        let capacities_before: Vec<Vec<u32>> = cache
+            .full_attn
+            .iter()
+            .map(|full| full.tq.as_ref().unwrap().layout.capacities().collect())
+            .collect();
+        assert!(cache
+            .ensure_tq_physical_capacity_for_slot(
+                &cfg,
+                &device,
+                crate::serve::multi_seq_kv::SlotId(1),
+                65,
+            )
+            .is_err());
+        let capacities_after: Vec<Vec<u32>> = cache
+            .full_attn
+            .iter()
+            .map(|full| full.tq.as_ref().unwrap().layout.capacities().collect())
+            .collect();
+        assert_eq!(capacities_after, capacities_before);
+    }
+
     /// Dossier §2.8 H1 — falsifies the ADR-040 §1.3 structural claim
     /// ("structural shape supports `n_seqs > 1` with no buffer-layout
     /// change") on the allocator side.
@@ -11823,5 +13465,235 @@ mod tests {
             );
             assert!(linear.pp_flipped[peer.0 as usize], "peer parity changed");
         }
+    }
+
+    #[test]
+    fn slot_anchor_restore_preflights_every_payload_before_mutation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
+        let target = SlotId(1);
+        cache.append_for_seq(target, 9).expect("prompt cursor");
+        let mut anchor = cache
+            .snapshot_slot_anchor(target, 9)
+            .expect("slot-local anchor");
+        cache.append_for_seq(target, 5).expect("decode cursor");
+
+        for linear in &mut cache.linear_attn {
+            let conv_per_slot = linear.conv_state.byte_len() / 2;
+            let rec_per_slot = linear.recurrent.byte_len() / 2;
+            linear.conv_state.as_mut_slice::<u8>().unwrap()[conv_per_slot..].fill(0xA5);
+            linear.recurrent.as_mut_slice::<u8>().unwrap()[rec_per_slot..].fill(0x5A);
+            linear.pp_flipped[target.0 as usize] = false;
+        }
+        let before_cursor = cache.seq_len(target).expect("cursor before failed restore");
+        let before_linear: Vec<(Vec<u8>, Vec<u8>, bool)> = cache
+            .linear_attn
+            .iter()
+            .map(|linear| {
+                (
+                    linear.conv_state.as_slice::<u8>().unwrap().to_vec(),
+                    linear.recurrent.as_slice::<u8>().unwrap().to_vec(),
+                    linear.pp_flipped[target.0 as usize],
+                )
+            })
+            .collect();
+
+        anchor
+            .linear_recurrent
+            .last_mut()
+            .expect("linear layer")
+            .pop();
+        assert!(cache.restore_slot_anchor(target, &anchor).is_err());
+        assert_eq!(
+            cache.seq_len(target).expect("cursor after failed restore"),
+            before_cursor,
+            "validation failure must not rewind any cursor"
+        );
+        for (linear, (conv, recurrent, flipped)) in
+            cache.linear_attn.iter().zip(before_linear.iter())
+        {
+            assert_eq!(linear.conv_state.as_slice::<u8>().unwrap(), conv);
+            assert_eq!(linear.recurrent.as_slice::<u8>().unwrap(), recurrent);
+            assert_eq!(linear.pp_flipped[target.0 as usize], *flipped);
+        }
+    }
+
+    #[test]
+    fn slot_anchor_rejects_foreign_cache_and_source_slot_before_mutation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let source = SlotId(0);
+        let other = SlotId(1);
+        let mut source_cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("source cache");
+        let mut foreign_cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("foreign cache");
+        source_cache
+            .append_for_seq(source, 9)
+            .expect("source cursor");
+        source_cache.append_for_seq(other, 9).expect("other cursor");
+        foreign_cache
+            .append_for_seq(source, 9)
+            .expect("foreign cursor");
+        let anchor = source_cache
+            .snapshot_slot_anchor(source, 9)
+            .expect("source anchor");
+
+        let cache_state = |cache: &HybridKvCache| {
+            (
+                cache
+                    .full_attn
+                    .iter()
+                    .map(|full| full.current_len.clone())
+                    .collect::<Vec<_>>(),
+                cache.mtp_slot.as_ref().map(|mtp| mtp.current_len.clone()),
+                cache
+                    .linear_attn
+                    .iter()
+                    .map(|linear| {
+                        (
+                            linear.conv_state.as_slice::<u8>().unwrap().to_vec(),
+                            linear.conv_state_scratch.as_slice::<u8>().unwrap().to_vec(),
+                            linear.recurrent.as_slice::<u8>().unwrap().to_vec(),
+                            linear.recurrent_scratch.as_slice::<u8>().unwrap().to_vec(),
+                            linear.pp_flipped.clone(),
+                            linear.write_generation.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let foreign_before = cache_state(&foreign_cache);
+        let foreign_error = foreign_cache
+            .restore_slot_anchor(source, &anchor)
+            .expect_err("cross-cache restore must fail");
+        assert!(format!("{foreign_error:#}").contains("cache instance"));
+        assert_eq!(
+            cache_state(&foreign_cache),
+            foreign_before,
+            "foreign-cache rejection mutated live state"
+        );
+
+        let source_before = cache_state(&source_cache);
+        let slot_error = source_cache
+            .restore_slot_anchor(other, &anchor)
+            .expect_err("cross-slot restore must fail");
+        assert!(format!("{slot_error:#}").contains("source slot"));
+        assert_eq!(
+            cache_state(&source_cache),
+            source_before,
+            "cross-slot rejection mutated live state"
+        );
+    }
+
+    #[test]
+    fn slot_anchor_restore_rejects_cursor_payload_inconsistent_with_prompt_depth() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
+        let target = SlotId(1);
+        cache.append_for_seq(target, 9).expect("prompt cursor");
+        let mut anchor = cache
+            .snapshot_slot_anchor(target, 9)
+            .expect("slot-local anchor");
+        cache.append_for_seq(target, 5).expect("decode cursor");
+        anchor.full_attn_current_len[0] = 8;
+
+        assert!(cache.restore_slot_anchor(target, &anchor).is_err());
+        cache
+            .validate_sequence_len_for_slot(target, 14)
+            .expect("corrupt saved cursor must not partially rewind the live slot");
+    }
+
+    #[test]
+    fn logical_buffer_copy_does_not_retain_chunk_sized_parent() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let mut parent = device
+            .alloc_buffer(4096, mlx_native::DType::F32, vec![1024])
+            .expect("parent");
+        for (index, value) in parent
+            .as_mut_slice::<f32>()
+            .expect("parent slice")
+            .iter_mut()
+            .enumerate()
+        {
+            *value = index as f32;
+        }
+        let row = parent.slice_view(512 * 4, 8);
+        let owned = deep_copy_logical_buffer(&device, &row).expect("dedicated row");
+        assert_eq!(row.byte_len(), 4096, "view must expose the retention trap");
+        assert_eq!(owned.byte_offset(), 0);
+        assert_eq!(owned.byte_len(), 8 * 4);
+        assert_eq!(owned.data_byte_len(), 8 * 4);
+        assert_eq!(owned.shape(), row.shape());
+        assert_eq!(
+            owned.as_slice::<f32>().expect("owned values"),
+            &[512.0, 513.0, 514.0, 515.0, 516.0, 517.0, 518.0, 519.0]
+        );
+        drop(parent);
+        assert_eq!(
+            owned.as_slice::<f32>().expect("owned survives parent"),
+            &[512.0, 513.0, 514.0, 515.0, 516.0, 517.0, 518.0, 519.0]
+        );
+    }
+
+    #[test]
+    fn slot_transaction_rollback_validation_is_fail_atomic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc");
+        let slot = SlotId(0);
+        cache.append_for_seq(slot, 5).expect("seed cursor");
+        let mut transaction = cache
+            .begin_slot_transaction(slot, 5)
+            .expect("capture transaction");
+
+        cache
+            .append_for_seq(slot, 2)
+            .expect("simulate target append");
+        for linear in &mut cache.linear_attn {
+            linear.pp_flipped[0] = true;
+        }
+        let cursors_before: Vec<u32> = cache
+            .full_attn
+            .iter()
+            .map(|full| full.current_len[0])
+            .collect();
+        let parities_before: Vec<bool> = cache
+            .linear_attn
+            .iter()
+            .map(|linear| linear.pp_flipped[0])
+            .collect();
+
+        // Make only the second layer invalid. A validate-as-you-mutate
+        // rollback would rewind layer zero before discovering this error.
+        transaction.full_attn_current_len[1] = cursors_before[1] + 1;
+        let error = cache
+            .rollback_slot_transaction(slot, &transaction)
+            .expect_err("late-layer cursor mismatch must fail");
+        assert!(error.to_string().contains("full_attn[1] live cursor"));
+        assert_eq!(
+            cache
+                .full_attn
+                .iter()
+                .map(|full| full.current_len[0])
+                .collect::<Vec<_>>(),
+            cursors_before,
+            "failed rollback partially rewound full-attention cursors"
+        );
+        assert_eq!(
+            cache
+                .linear_attn
+                .iter()
+                .map(|linear| linear.pp_flipped[0])
+                .collect::<Vec<_>>(),
+            parities_before,
+            "failed rollback changed DeltaNet ping-pong selection"
+        );
     }
 }

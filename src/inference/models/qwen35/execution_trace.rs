@@ -1,7 +1,7 @@
 //! Opaque validation of host-side GGML command-encoding observations.
 //!
 //! This catalog binds the exact loaded/executed weight bytes to typed
-//! mlx-native 0.11.2 requests, capability decisions, and resolved Metal
+//! mlx-native 0.15.0 requests, capability decisions, and resolved Metal
 //! dispatches. It proves encoding only. It does not prove command-buffer
 //! submission/completion, numerical correctness, latency, or cost authority.
 
@@ -20,8 +20,6 @@ use super::execution_dispatch::Qwen35EncodedDispatchObservation;
 use super::execution_observation::{
     ExecutedTensorObservation, LoadedTensorCodec, VerifiedExecutedTensorCatalog,
 };
-
-const MLX_NATIVE_TRACE_VERSION: &str = "0.11.2";
 
 pub(crate) struct VerifiedEncodedDispatchCatalog {
     executed_catalog_sha256: String,
@@ -60,8 +58,10 @@ fn codec_ggml_type(codec: &LoadedTensorCodec) -> Result<GgmlType> {
             wire_type_id,
         } => match (type_name.as_str(), *wire_type_id) {
             ("q4_0", 2) => Ok(GgmlType::Q4_0),
+            ("q5_0", 6) => Ok(GgmlType::Q5_0),
             ("q8_0", 8) => Ok(GgmlType::Q8_0),
             ("q4_k", 12) => Ok(GgmlType::Q4_K),
+            ("q5_k", 13) => Ok(GgmlType::Q5_K),
             ("q6_k", 14) => Ok(GgmlType::Q6_K),
             _ => bail!(
                 "GGML codec {type_name}/{wire_type_id} is outside the dense-Qwen trace profile"
@@ -70,6 +70,47 @@ fn codec_ggml_type(codec: &LoadedTensorCodec) -> Result<GgmlType> {
         LoadedTensorCodec::DenseF32 => {
             bail!("dense F32 execution input cannot be bound to a GGML dispatch")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_qwen_trace_codec_catalog_covers_native_q5_k() {
+        assert_eq!(
+            codec_ggml_type(&LoadedTensorCodec::Ggml {
+                type_name: "q5_k".into(),
+                wire_type_id: 13,
+            })
+            .expect("Q5_K is a native dense-Qwen execution type"),
+            GgmlType::Q5_K
+        );
+    }
+
+    #[test]
+    fn dense_qwen_trace_codec_catalog_covers_native_q5_0() {
+        assert_eq!(
+            codec_ggml_type(&LoadedTensorCodec::Ggml {
+                type_name: "q5_0".into(),
+                wire_type_id: 6,
+            })
+            .expect("Q5_0 is a native dense-Qwen execution type"),
+            GgmlType::Q5_0
+        );
+    }
+
+    #[test]
+    fn dense_qwen_trace_codec_catalog_rejects_mismatched_q5_k_wire_id() {
+        let error = codec_ggml_type(&LoadedTensorCodec::Ggml {
+            type_name: "q5_k".into(),
+            wire_type_id: 12,
+        })
+        .expect_err("a Q5_K name with a Q4_K wire ID must fail closed");
+        assert!(error
+            .to_string()
+            .contains("outside the dense-Qwen trace profile"));
     }
 }
 
@@ -204,11 +245,12 @@ pub(super) fn verify_encoded_dispatch_catalog(
         .iter()
         .filter(|observation| {
             matches!(observation.executed_codec, LoadedTensorCodec::Ggml { .. })
-                // Token lookup uses its own typed native gather. This catalog
-                // covers GGML projection dispatches, so the embedding remains
-                // bound in the executed catalog without inventing a matmul
-                // observation for it.
+                // Token lookup and DeltaNet depthwise convolution use typed
+                // native gather/convolution kernels, not GGML projection
+                // matmuls. Keep their exact storage bound in the executed
+                // catalog without inventing a projection-dispatch receipt.
                 && observation.semantic_name != "token_embd.weight"
+                && !observation.semantic_name.ends_with(".ssm_conv1d.weight")
         })
         .flat_map(|observation| {
             [
@@ -223,7 +265,7 @@ pub(super) fn verify_encoded_dispatch_catalog(
     for observation in &observations {
         let trace = &observation.trace;
         if trace.schema_version != GGML_RESOLVED_DISPATCH_TRACE_SCHEMA_VERSION
-            || trace.mlx_native_version != MLX_NATIVE_TRACE_VERSION
+            || trace.mlx_native_version != crate::inference::MLX_NATIVE_VERSION
             || trace.request.schema_version != GGML_CAPABILITY_SCHEMA_VERSION
             || trace.capability.schema_version != GGML_CAPABILITY_SCHEMA_VERSION
             || trace.capability.request != trace.request

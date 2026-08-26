@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use super::engine::{self, Engine, SamplingParams};
 use super::grammar;
-use super::lifecycle::ModelLease;
+use super::lifecycle::{ModelIdentity, ModelLease};
 #[cfg(test)]
 use super::qwen_thinking_policy::{adaptive_qwen_default_thinking_budget, QwenToolChainState};
 use super::qwen_thinking_policy::{
@@ -52,6 +52,98 @@ use crate::serve::multi_model::{
 use crate::serve::quant_select::QuantType;
 
 use super::{DIAGNOSTIC_NO_EVICT_HEADER, DIAGNOSTIC_NO_EVICT_VALUE};
+
+const EXECUTION_POOL_KEY_HEADER: &str = "x-hf2q-execution-pool-key-b64";
+const EXECUTION_GENERATION_HEADER: &str = "x-hf2q-execution-generation";
+const EXECUTION_ARTIFACT_SHA256_HEADER: &str = "x-hf2q-execution-artifact-sha256";
+const EXECUTION_ARCH_FAMILY_HEADER: &str = "x-hf2q-execution-arch-family";
+const EXECUTION_ARCHITECTURE_HEADER: &str = "x-hf2q-execution-architecture";
+
+/// Private/local proof of the exact leased generation that executed a chat
+/// request. The digest is the load-time `LoadedEngine` identity; constructing
+/// this receipt never re-hashes a resident artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenerationExecutionReceipt {
+    pool_key: String,
+    generation: u64,
+    text_artifact_sha256: String,
+    arch_family: String,
+    architecture: String,
+}
+
+impl GenerationExecutionReceipt {
+    fn from_leased(loaded: &LoadedEngine<Engine>, lease: &ModelLease) -> anyhow::Result<Self> {
+        let identity = ModelIdentity::from_engine(loaded);
+        anyhow::ensure!(
+            lease.identity() == &identity,
+            "request lease identity differs from dispatched engine generation"
+        );
+        let text_artifact = loaded
+            .text_artifact
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("leased engine has no text artifact identity"))?;
+        anyhow::ensure!(
+            text_artifact.sha256.len() == 64
+                && text_artifact
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "leased engine artifact digest is not lowercase SHA-256"
+        );
+        let receipt = Self {
+            pool_key: identity.pool_key,
+            generation: identity.generation,
+            text_artifact_sha256: text_artifact.sha256.clone(),
+            arch_family: loaded.engine.info().arch_family.as_str().to_owned(),
+            architecture: loaded.engine.info().arch_str.clone(),
+        };
+        receipt.validate_header_values()?;
+        Ok(receipt)
+    }
+
+    fn validate_header_values(&self) -> anyhow::Result<()> {
+        use base64::Engine as _;
+        let pool_key = base64::engine::general_purpose::STANDARD.encode(self.pool_key.as_bytes());
+        for (name, value) in [
+            (EXECUTION_POOL_KEY_HEADER, pool_key),
+            (EXECUTION_GENERATION_HEADER, self.generation.to_string()),
+            (
+                EXECUTION_ARTIFACT_SHA256_HEADER,
+                self.text_artifact_sha256.clone(),
+            ),
+            (EXECUTION_ARCH_FAMILY_HEADER, self.arch_family.clone()),
+            (EXECUTION_ARCHITECTURE_HEADER, self.architecture.clone()),
+        ] {
+            axum::http::HeaderValue::from_str(&value)
+                .map_err(|error| anyhow::anyhow!("invalid {name} receipt value: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn apply(&self, response: &mut Response) {
+        use axum::http::{header::HeaderName, HeaderValue};
+        use base64::Engine as _;
+        let values = [
+            (
+                EXECUTION_POOL_KEY_HEADER,
+                base64::engine::general_purpose::STANDARD.encode(self.pool_key.as_bytes()),
+            ),
+            (EXECUTION_GENERATION_HEADER, self.generation.to_string()),
+            (
+                EXECUTION_ARTIFACT_SHA256_HEADER,
+                self.text_artifact_sha256.clone(),
+            ),
+            (EXECUTION_ARCH_FAMILY_HEADER, self.arch_family.clone()),
+            (EXECUTION_ARCHITECTURE_HEADER, self.architecture.clone()),
+        ];
+        for (name, value) in values {
+            response.headers_mut().insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_str(&value).expect("receipt was validated before inference"),
+            );
+        }
+    }
+}
 
 /// Probe-order list of BOS-token text fragments used by the `/v1/embeddings`
 /// handler when a GGUF doesn't surface `tokenizer.ggml.bos_token_id` through
@@ -203,6 +295,9 @@ async fn resolve_engine_for_request(
     //    regression bisect.
     if let Ok(pool_guard) = state.pool.read() {
         for le in pool_guard.snapshot_engines() {
+            if !le.artifacts_are_current() {
+                continue;
+            }
             if le.engine.model_id() == model_arg
                 || le.repo == model_arg
                 || format!("{}@{}", le.repo, le.quant.as_str()) == model_arg
@@ -238,12 +333,25 @@ async fn resolve_engine_for_request(
         let mut cache_guard = cache_arc
             .lock()
             .map_err(|e| anyhow::anyhow!("cache mutex poisoned: {e}"))?;
-        auto_pipeline::resolve_or_prepare_model(
+        let resolved = auto_pipeline::resolve_or_prepare_model(
             &model_arg_for_resolve,
             &mut cache_guard,
             hardware.as_ref(),
             no_integrity,
-        )
+        )?;
+        let projector = resolved
+            .mmproj_path
+            .as_ref()
+            .map(|path| {
+                crate::serve::multi_model::ProjectorAdmission::inspect(
+                    path,
+                    u64::try_from(
+                        crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
+                    )?,
+                )
+            })
+            .transpose()?;
+        Ok::<_, anyhow::Error>((resolved, projector))
     })
     .await;
     let resolved = match resolve_outcome {
@@ -261,6 +369,7 @@ async fn resolve_engine_for_request(
             return Err(ApiError::internal_error().into_response());
         }
     };
+    let (resolved, resolved_projector) = resolved;
 
     let pool_repo = resolved
         .repo_id
@@ -289,13 +398,20 @@ async fn resolve_engine_for_request(
     //    (NB: this implementation is "winner-loads, others-block" by
     //    virtue of the write-lock — simpler than per-key in-flight
     //    deduplication and acceptable for the request-rate workload).
-    let engine_config = match state.engine_config_for_path(&resolved.gguf_path) {
+    let mut engine_config = match state.engine_config_for_path(&resolved.gguf_path) {
         Ok(config) => config,
         Err(error) => {
             tracing::error!(%error, "cannot resolve dynamic engine load policy");
             return Err(ApiError::internal_error().into_response());
         }
     };
+    if engine_config.projector.is_none() {
+        engine_config.projector = resolved_projector;
+    }
+    if let Err(error) = engine_config.bind_text_artifact(&resolved.gguf_path) {
+        tracing::error!(%error, "cannot bind dynamic engine policy to text artifact");
+        return Err(ApiError::internal_error().into_response());
+    }
     let pool_arc = state.pool.clone();
     let pool_repo_blocking = pool_repo.clone();
     let gguf_path = resolved.gguf_path.clone();
@@ -506,18 +622,6 @@ pub async fn chat_completions(
         "chat completion prepared; dispatching to inference worker"
     );
 
-    // ── ADR-005 Phase 4 reopen iter-216 Wedge-3 — Qwen3.5/3.6 chat live ──
-    //
-    // Pre-iter-216 the iter-215 Wedge-2 short-circuit returned HTTP 501
-    // here for `LoadedArch::Qwen35`.  Wedge-3 (iter-216 Phase D) wires
-    // `engine_qwen35::generate_qwen35_once` and
-    // `engine_qwen35::generate_stream_qwen35_once` into `worker_run`, so
-    // the chat handler now flows through to the production
-    // generate / generate_stream path for both Gemma and Qwen35
-    // architectures.  The 501 sentinel constants remain in `engine.rs`
-    // for the still-deferred `Request::GenerateWithSoftTokens` arm
-    // (vision-on-Qwen35 is a Wedge-4 follow-up).
-
     // --- Dispatch streaming vs non-streaming ---
     if req.stream.unwrap_or(false) {
         return chat_completions_stream(state.clone(), req, prepared).await;
@@ -558,6 +662,7 @@ async fn chat_completions_with_prepared(
     let PreparedChatContext {
         loaded_engine,
         model_lease: _model_lease,
+        execution_receipt,
         prompt_tokens,
         params,
         summarized_messages,
@@ -618,39 +723,6 @@ async fn chat_completions_with_prepared(
             let msg = format!("{e:#}");
             if let Some(response) = common_engine_error_response(Some(&state), &msg) {
                 return response;
-            }
-            // ADR-005 Phase 4 reopen iter-215 Wedge-2: Qwen3.5/3.6 SERVE-side
-            // chat completion path returns the sentinel; map to HTTP 501 with
-            // the operator-actionable body (names `hf2q generate` AND
-            // `cmd_generate_qwen35` per the iter-215 contract).
-            if msg.contains(engine::QWEN35_NOT_IMPLEMENTED_SENTINEL) {
-                tracing::info!(
-                    error = %msg,
-                    "chat_completion routed to Qwen3.5/3.6 SERVE arm (Wedge-3 pending) — returning 501"
-                );
-                return ApiError::not_implemented(
-                    engine::QWEN35_NOT_IMPLEMENTED_MESSAGE.to_string(),
-                )
-                .into_response();
-            }
-            // iter-228a (ADR-005 Wedge-4): Qwen3-VL text-LM SERVE arm
-            // returns the forward-pending sentinel until iter-228b
-            // wires the dense transformer forward. Mirror the Qwen35
-            // 501 mapping so operators see a clean
-            // `qwen3vl_text_forward_pending` 501 with the
-            // operator-actionable body rather than a generic 500.
-            if msg.contains(
-                crate::inference::models::qwen3vl_text::forward::QWEN3VL_TEXT_FORWARD_PENDING_SENTINEL,
-            ) {
-                tracing::info!(
-                    error = %msg,
-                    "chat_completion routed to Qwen3-VL text SERVE arm (iter-228b pending) — returning 501"
-                );
-                return ApiError::not_implemented(
-                    crate::inference::models::qwen3vl_text::forward::QWEN3VL_TEXT_FORWARD_PENDING_MESSAGE
-                        .to_string(),
-                )
-                .into_response();
             }
             tracing::error!(error = %msg, "chat_completion generation failed");
             return ApiError::generation_error(msg).into_response();
@@ -835,6 +907,9 @@ async fn chat_completions_with_prepared(
         vit_images,
         vit_soft_tokens_total,
     );
+    if let Some(receipt) = execution_receipt.as_ref() {
+        receipt.apply(&mut response);
+    }
     response
 }
 
@@ -1144,6 +1219,9 @@ struct PreparedChatContext {
     loaded_engine: Arc<LoadedEngine<Engine>>,
     /// Held through unary execution or transferred into the SSE body stream.
     model_lease: Option<ModelLease>,
+    /// Present for every production request. Synthetic unleased test seams
+    /// leave it absent; no unleased response can claim generation identity.
+    execution_receipt: Option<GenerationExecutionReceipt>,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
     /// Decision #23 transparency counters. `Some` only when the
@@ -1174,13 +1252,13 @@ struct PreparedChatContext {
     vit_soft_tokens_total: Option<usize>,
     /// **Wedge-4d (iter-224 row 4)**: DeepStack injection chunks for
     /// the Qwen3-VL path. Built at the handler engine seam by
-    /// splitting `compute_vision_embeddings_gpu_qwen3vl`'s augmented
+    /// splitting `compute_vision_embeddings_gpu_qwen`'s augmented
     /// `[n_image_tokens, hidden * (1 + N_deepstack)]` buffer into one
     /// `[n_image_tokens, hidden]` chunk per LM layer that consumes a
     /// DeepStack tap. `None` for Gemma / non-Qwen3-VL paths.
     deepstack_data: Option<engine::DeepstackData>,
     /// **Wedge-4d**: 3D-mRoPE flat position buffer (`[4 * prompt_len]`
-    /// axis-major i32) built by `build_qwen3vl_positions`. `None` for
+    /// axis-major i32) built by `build_qwen_vision_positions`. `None` for
     /// Gemma / non-Qwen3-VL paths (the worker arm synthesizes
     /// text-style positions when None).
     positions_flat: Option<Vec<i32>>,
@@ -1613,7 +1691,7 @@ fn resolve_api_template_kwargs(
     reasoning_effort: Option<&str>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut resolved = request_kwargs.cloned().unwrap_or_default();
-    if registration.is_some_and(|candidate| candidate.family == "qwen35") {
+    if registration.is_some_and(registry::ModelRegistration::uses_qwen_protocol) {
         resolved
             .entry("preserve_thinking")
             .or_insert(serde_json::Value::Bool(true));
@@ -1715,6 +1793,14 @@ where
     let resolved_engine = resolver(state, req.model.clone()).await?;
     let loaded_engine = resolved_engine.loaded_engine;
     let model_lease = resolved_engine.model_lease;
+    let execution_receipt = model_lease
+        .as_ref()
+        .map(|lease| GenerationExecutionReceipt::from_leased(&loaded_engine, lease))
+        .transpose()
+        .map_err(|error| {
+            tracing::error!(%error, "cannot bind request to leased engine generation");
+            ApiError::internal_error().into_response()
+        })?;
     let engine: &Engine = &loaded_engine.engine;
     if !engine.is_worker_healthy() {
         return Err(
@@ -1748,8 +1834,14 @@ where
         vit_images_v,
         vision_family,
         per_row_floats,
-        qwen3vl_image_grids,
-    ) = prepare_vision_context(&req.messages, state.mmproj.as_ref(), engine, cancellation).await?;
+        qwen_vision_image_grids,
+    ) = prepare_vision_context(
+        &req.messages,
+        loaded_engine.projector.as_deref(),
+        engine,
+        cancellation,
+    )
+    .await?;
 
     // Compile the response_format grammar (Decision #6).  Iter-95 wires
     // the parsed grammar into `SamplingParams.grammar` so the decode loop
@@ -2058,7 +2150,7 @@ where
                 )
                 .into_response());
             };
-            let qwen_budget = registration.family == "qwen35" && reasoning_forced_open;
+            let qwen_budget = registration.uses_qwen_protocol() && reasoning_forced_open;
             let deepseek_budget = registration.family == "deepseek4"
                 && deepseek_required_tool_thinking_mode
                 && explicit_thinking_budget.is_none();
@@ -2202,7 +2294,7 @@ where
         .into_response());
     }
     let tool_argument_wire_kinds = match (engine.registration(), req_tools) {
-        (Some(registration), Some(tools)) if registration.family == "qwen35" => {
+        (Some(registration), Some(tools)) if registration.uses_qwen_protocol() => {
             match registry::qwen35_tool_argument_wire_kinds(tools) {
                 Ok(kinds) => Some(std::sync::Arc::new(kinds)),
                 Err(error) => {
@@ -2314,15 +2406,18 @@ where
     //      full expanded prompt.
     let (deepstack_data, positions_flat) = if matches!(
         vision_family,
-        crate::inference::vision::mmproj::VisionFamily::Qwen3Vl,
+        crate::inference::vision::mmproj::VisionFamily::Qwen,
     ) && !vision_embeddings.is_empty()
     {
-        match dispatch_qwen3vl_seam_split(
+        match dispatch_qwen_vision_seam_split(
             engine,
-            state.mmproj.as_ref().expect("mmproj checked above"),
+            loaded_engine
+                .projector
+                .as_deref()
+                .expect("generation projector checked above"),
             &vision_embeddings,
             &image_token_positions_per_image,
-            &qwen3vl_image_grids,
+            &qwen_vision_image_grids,
             &final_prompt_tokens,
         ) {
             Ok((ds, pos)) => (Some(ds), Some(pos)),
@@ -2335,6 +2430,7 @@ where
     Ok(PreparedChatContext {
         loaded_engine,
         model_lease,
+        execution_receipt,
         prompt_tokens: final_prompt_tokens,
         params,
         summarized_messages,
@@ -2363,15 +2459,15 @@ where
 /// call already split out the base chunk into the `soft_tokens` slot;
 /// here we slice out the `N_deepstack` deepstack chunks at byte offsets
 /// `(j+1) * hidden * 4 .. (j+2) * hidden * 4` per row.
-fn dispatch_qwen3vl_seam_split(
+fn dispatch_qwen_vision_seam_split(
     engine: &engine::Engine,
     mmproj: &super::state::LoadedMmproj,
     vision_embeddings: &[Vec<f32>],
     image_token_positions_per_image: &[Vec<u32>],
-    qwen3vl_image_grids: &[(u32, u32)],
+    qwen_vision_image_grids: &[(u32, u32)],
     final_prompt_tokens: &[u32],
 ) -> std::result::Result<(engine::DeepstackData, Vec<i32>), Response> {
-    use crate::serve::forward_prefill::{build_qwen3vl_positions, Qwen3VlImageGrid};
+    use crate::serve::forward_prefill::{build_qwen_vision_positions, QwenImageGrid};
 
     let hidden = engine.hidden_size();
     let n_deepstack = mmproj
@@ -2383,7 +2479,7 @@ fn dispatch_qwen3vl_seam_split(
     let per_row_floats = hidden.saturating_mul(1 + n_deepstack);
     if hidden == 0 || per_row_floats == 0 {
         return Err(ApiError::generation_error(format!(
-            "dispatch_qwen3vl_seam_split: degenerate hidden ({}) or \
+            "dispatch_qwen_vision_seam_split: degenerate hidden ({}) or \
              n_deepstack ({})",
             hidden, n_deepstack
         ))
@@ -2391,7 +2487,7 @@ fn dispatch_qwen3vl_seam_split(
     }
     if vision_embeddings.len() != image_token_positions_per_image.len() {
         return Err(ApiError::generation_error(format!(
-            "dispatch_qwen3vl_seam_split: vision_embeddings.len()={} != \
+            "dispatch_qwen_vision_seam_split: vision_embeddings.len()={} != \
              image_token_positions_per_image.len()={}",
             vision_embeddings.len(),
             image_token_positions_per_image.len()
@@ -2409,7 +2505,7 @@ fn dispatch_qwen3vl_seam_split(
         .saturating_mul(mmproj.config.spatial_merge_size.unwrap_or(1));
     if stride == 0 {
         return Err(ApiError::generation_error(format!(
-            "dispatch_qwen3vl_seam_split: patch_size ({}) * \
+            "dispatch_qwen_vision_seam_split: patch_size ({}) * \
              spatial_merge_size ({:?}) = 0",
             mmproj.config.patch_size, mmproj.config.spatial_merge_size
         ))
@@ -2418,7 +2514,7 @@ fn dispatch_qwen3vl_seam_split(
     let image_size = mmproj.config.image_size;
     if image_size == 0 || image_size % stride != 0 {
         return Err(ApiError::generation_error(format!(
-            "dispatch_qwen3vl_seam_split: image_size ({}) is not a \
+            "dispatch_qwen_vision_seam_split: image_size ({}) is not a \
              positive multiple of stride ({})",
             image_size, stride
         ))
@@ -2431,7 +2527,7 @@ fn dispatch_qwen3vl_seam_split(
     for (i, e) in vision_embeddings.iter().enumerate() {
         if e.len() % per_row_floats != 0 {
             return Err(ApiError::generation_error(format!(
-                "dispatch_qwen3vl_seam_split: vision_embeddings[{i}].len()={} \
+                "dispatch_qwen_vision_seam_split: vision_embeddings[{i}].len()={} \
                  not divisible by per_row_floats={per_row_floats}",
                 e.len()
             ))
@@ -2440,14 +2536,14 @@ fn dispatch_qwen3vl_seam_split(
         let observed = e.len() / per_row_floats;
         if observed == 0 {
             return Err(ApiError::generation_error(format!(
-                "dispatch_qwen3vl_seam_split: vision_embeddings[{i}] has 0 \
+                "dispatch_qwen_vision_seam_split: vision_embeddings[{i}] has 0 \
                  image tokens (augmented-embed empty)"
             ))
             .into_response());
         }
         if image_token_positions_per_image[i].len() != observed {
             return Err(ApiError::generation_error(format!(
-                "dispatch_qwen3vl_seam_split: image_token_positions_per_image[{i}].len()={} \
+                "dispatch_qwen_vision_seam_split: image_token_positions_per_image[{i}].len()={} \
                  != observed n_image_tokens={observed} (must match the \
                  augmented-embed row count after per_row_floats={per_row_floats} split)",
                 image_token_positions_per_image[i].len()
@@ -2460,8 +2556,8 @@ fn dispatch_qwen3vl_seam_split(
     let total_n_image_tokens: usize = per_image_n_image_tokens.iter().sum();
     if total_n_image_tokens == 0 {
         // No image positions exist, so a normal text broadcast is correct.
-        let flat = build_qwen3vl_positions(final_prompt_tokens.len(), &[]).map_err(|e| {
-            ApiError::generation_error(format!("build_qwen3vl_positions (no images): {e}"))
+        let flat = build_qwen_vision_positions(final_prompt_tokens.len(), &[]).map_err(|e| {
+            ApiError::generation_error(format!("build_qwen_vision_positions (no images): {e}"))
                 .into_response()
         })?;
         return Ok((
@@ -2477,8 +2573,10 @@ fn dispatch_qwen3vl_seam_split(
     // deepstack chunk slot. Phase-2: total_n_image_tokens is the SUM
     // of per-image counts (differing across images).
     let mlx_dev = mlx_native::MlxDevice::new().map_err(|e| {
-        ApiError::generation_error(format!("dispatch_qwen3vl_seam_split: MlxDevice::new: {e}"))
-            .into_response()
+        ApiError::generation_error(format!(
+            "dispatch_qwen_vision_seam_split: MlxDevice::new: {e}"
+        ))
+        .into_response()
     })?;
     let chunk_byte_len = total_n_image_tokens * hidden * std::mem::size_of::<f32>();
     let mut chunks: Vec<mlx_native::MlxBuffer> = Vec::with_capacity(n_deepstack);
@@ -2491,7 +2589,7 @@ fn dispatch_qwen3vl_seam_split(
             )
             .map_err(|e| {
                 ApiError::generation_error(format!(
-                    "dispatch_qwen3vl_seam_split: alloc deepstack chunk {j}: {e}"
+                    "dispatch_qwen_vision_seam_split: alloc deepstack chunk {j}: {e}"
                 ))
                 .into_response()
             })?;
@@ -2504,7 +2602,7 @@ fn dispatch_qwen3vl_seam_split(
     for j in 0..n_deepstack {
         let dst = chunks[j].as_mut_slice::<f32>().map_err(|e| {
             ApiError::generation_error(format!(
-                "dispatch_qwen3vl_seam_split: as_mut_slice chunk {j}: {e}"
+                "dispatch_qwen_vision_seam_split: as_mut_slice chunk {j}: {e}"
             ))
             .into_response()
         })?;
@@ -2527,27 +2625,29 @@ fn dispatch_qwen3vl_seam_split(
     }
     debug_assert_eq!(all_positions.len(), total_n_image_tokens);
 
-    // Build `image_grids` for `build_qwen3vl_positions`: each image
-    // contributes one (Qwen3VlImageGrid { n_x, n_y }, sequence_start
+    // Build `image_grids` for `build_qwen_vision_positions`: each image
+    // contributes one (QwenImageGrid { n_x, n_y }, sequence_start
     // = first position). Phase-2: per-image (n_x, n_y) is the
     // AUTHORITATIVE grid threaded from the preprocessor via
-    // `qwen3vl_image_grids` (one entry per image, in the same order
+    // `qwen_vision_image_grids` (one entry per image, in the same order
     // as `vision_embeddings`). We validate the supplied grid
     // `n_x * n_y` matches the augmented-embed row count
     // `per_image_n_image_tokens[i]` so a producer/consumer mismatch
     // fails LOUD here rather than silently mis-routing positions.
-    if !qwen3vl_image_grids.is_empty() && qwen3vl_image_grids.len() != vision_embeddings.len() {
+    if !qwen_vision_image_grids.is_empty()
+        && qwen_vision_image_grids.len() != vision_embeddings.len()
+    {
         return Err(ApiError::generation_error(format!(
-            "dispatch_qwen3vl_seam_split: qwen3vl_image_grids.len()={} != \
+            "dispatch_qwen_vision_seam_split: qwen_vision_image_grids.len()={} != \
              vision_embeddings.len()={} — one (n_x, n_y) entry required \
              per image",
-            qwen3vl_image_grids.len(),
+            qwen_vision_image_grids.len(),
             vision_embeddings.len(),
         ))
         .into_response());
     }
     let canonical_per_side = image_size / stride;
-    let mut image_grids: Vec<(Qwen3VlImageGrid, u32)> =
+    let mut image_grids: Vec<(QwenImageGrid, u32)> =
         Vec::with_capacity(image_token_positions_per_image.len());
     for (i, img_positions) in image_token_positions_per_image.iter().enumerate() {
         if img_positions.is_empty() {
@@ -2555,15 +2655,15 @@ fn dispatch_qwen3vl_seam_split(
         }
         let seq_start = img_positions[0];
         let n_tokens = per_image_n_image_tokens[i] as u32;
-        let (n_x, n_y) = if !qwen3vl_image_grids.is_empty() {
-            let (gx, gy) = qwen3vl_image_grids[i];
+        let (n_x, n_y) = if !qwen_vision_image_grids.is_empty() {
+            let (gx, gy) = qwen_vision_image_grids[i];
             // Both axes must be positive and their product must match
             // the observed image-token count. Variable-resolution inputs
             // may exceed the learned position grid on one axis; the vision
             // tower interpolates its learned table to that exact grid.
             if gx == 0 || gy == 0 {
                 return Err(ApiError::generation_error(format!(
-                    "dispatch_qwen3vl_seam_split: image[{i}] grid \
+                    "dispatch_qwen_vision_seam_split: image[{i}] grid \
                      ({gx},{gy}) has zero axis (preprocessor must report \
                      positive (n_x, n_y))"
                 ))
@@ -2571,10 +2671,10 @@ fn dispatch_qwen3vl_seam_split(
             }
             if gx.saturating_mul(gy) != n_tokens {
                 return Err(ApiError::generation_error(format!(
-                    "dispatch_qwen3vl_seam_split: image[{i}] grid \
+                    "dispatch_qwen_vision_seam_split: image[{i}] grid \
                      ({gx},{gy}) product {} != observed n_image_tokens \
                      {n_tokens} — producer/consumer mismatch between \
-                     preprocess_qwen3vl and compute_vision_embeddings_gpu_qwen3vl",
+                     preprocess_qwen_vision and compute_vision_embeddings_gpu_qwen",
                     gx.saturating_mul(gy)
                 ))
                 .into_response());
@@ -2589,21 +2689,21 @@ fn dispatch_qwen3vl_seam_split(
             let side = (n_tokens as f64).sqrt() as u32;
             if side == 0 || side > canonical_per_side || side * side != n_tokens {
                 return Err(ApiError::generation_error(format!(
-                    "dispatch_qwen3vl_seam_split: image[{i}] n_image_tokens={n_tokens} \
+                    "dispatch_qwen_vision_seam_split: image[{i}] n_image_tokens={n_tokens} \
                      is not a square ≤ canonical_per_side² ({canonical_per_side}²) \
                      and no explicit per-image grid was supplied — caller must \
-                     thread `qwen3vl_image_grids` for non-square Phase-2 inputs"
+                     thread `qwen_vision_image_grids` for non-square Phase-2 inputs"
                 ))
                 .into_response());
             }
             (side, side)
         };
-        image_grids.push((Qwen3VlImageGrid { n_x, n_y }, seq_start));
+        image_grids.push((QwenImageGrid { n_x, n_y }, seq_start));
     }
-    let positions_flat =
-        build_qwen3vl_positions(final_prompt_tokens.len(), &image_grids).map_err(|e| {
+    let positions_flat = build_qwen_vision_positions(final_prompt_tokens.len(), &image_grids)
+        .map_err(|e| {
             ApiError::generation_error(format!(
-                "dispatch_qwen3vl_seam_split: build_qwen3vl_positions: {e}"
+                "dispatch_qwen_vision_seam_split: build_qwen_vision_positions: {e}"
             ))
             .into_response()
         })?;
@@ -2639,6 +2739,7 @@ async fn chat_completions_stream(
     // encoder body can move it.
     let engine: Engine = prepared.loaded_engine.engine.clone();
     let model_lease = prepared.model_lease;
+    let execution_receipt = prepared.execution_receipt;
 
     // Phase 2c iter-211 W79: vision streaming is supported. The
     // `Request::GenerateStream` variant now carries `soft_tokens` and the
@@ -2670,7 +2771,7 @@ async fn chat_completions_stream(
     // The Wedge-4d streaming-501 placeholder previously sat here; it
     // has been REMOVED. The non-streaming chat path delegates the same
     // engine seam at `prepare_chat_generation`'s
-    // `dispatch_qwen3vl_seam_split` call (handlers.rs:1326).
+    // `dispatch_qwen_vision_seam_split` call (handlers.rs:1326).
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     let prompt_token_count = prepared.prompt_tokens.len();
@@ -2788,6 +2889,9 @@ async fn chat_completions_stream(
         summarized_messages,
         summary_tokens,
     );
+    if let Some(receipt) = execution_receipt.as_ref() {
+        receipt.apply(&mut response);
+    }
     response
 }
 
@@ -3841,7 +3945,7 @@ async fn prepare_vision_context(
         Some(n_images),
         prepared.family,
         prepared.per_row_floats,
-        prepared.qwen3vl_image_grids,
+        prepared.qwen_vision_image_grids,
     ))
 }
 
@@ -3990,17 +4094,17 @@ fn process_multimodal_content(
                     source_label,
                 }));
             }
-            ArchProfile::Qwen3VlSiglip => {
+            ArchProfile::QwenVisionSiglip => {
                 // iter-225 Wedge-4 Phase-2 LANDED: ViT now accepts
                 // rectangular `[3, H, W]` input with per-image
                 // `(n_x_token, n_y_token)` derived from smart-resize.
                 // The Phase-1 center-pad path is GONE — the ViT
-                // `compute_vision_embeddings_gpu_qwen3vl` consumes
+                // `compute_vision_embeddings_gpu_qwen` consumes
                 // `pixel_w * pixel_h * 3` floats and computes the per-
                 // image post-merge token grid from the actual content
                 // dimensions, not the trained canvas.
                 let qcfg =
-                    crate::inference::vision::preprocess::Qwen3VlPreprocessConfig::from_mmproj(
+                    crate::inference::vision::preprocess::QwenVisionPreprocessConfig::from_mmproj(
                         &mmproj.config,
                     )
                     .map_err(|e| {
@@ -4011,7 +4115,7 @@ fn process_multimodal_content(
                         ))
                         .into_response()
                     })?;
-                let preprocessed = crate::inference::vision::preprocess::preprocess_qwen3vl(
+                let preprocessed = crate::inference::vision::preprocess::preprocess_qwen_vision(
                     &bytes,
                     &qcfg,
                     mmproj.config.image_size,
@@ -4029,7 +4133,7 @@ fn process_multimodal_content(
                 })?;
                 // Phase-2: per-image rectangular pixel grid is carried
                 // through `pixel_w` / `pixel_h`; downstream
-                // `compute_vision_embeddings_gpu_qwen3vl` derives
+                // `compute_vision_embeddings_gpu_qwen` derives
                 // `n_x_pre = pixel_w / patch_size` and
                 // `n_y_pre = pixel_h / patch_size` from these instead
                 // of from `mmproj.image_size`.  The 3D-mRoPE position
@@ -4185,7 +4289,7 @@ fn rewrite_messages_for_vision_placeholders(messages: &[ChatMessage]) -> Vec<Cha
 /// Per-family placeholder rendering:
 ///   - `VisionFamily::Gemma` → `<|image|>` (one literal per image; the
 ///     existing Gemma path).
-///   - `VisionFamily::Qwen3Vl` →
+///   - `VisionFamily::Qwen` →
 ///     `<|vision_start|><|image_pad|><|vision_end|>` triplet (matches
 ///     the peer for its QWEN3VL projector type).  The inner `<|image_pad|>` is the
 ///     soft-token expansion target (one tokenized id → N copies);
@@ -4202,7 +4306,7 @@ fn rewrite_messages_for_vision_placeholders_family(
 
     let placeholder_marker: String = match family {
         VisionFamily::Gemma => "<|image|>".to_string(),
-        VisionFamily::Qwen3Vl => "<|vision_start|><|image_pad|><|vision_end|>".to_string(),
+        VisionFamily::Qwen => "<|vision_start|><|image_pad|><|vision_end|>".to_string(),
         // Unknown shouldn't reach here (gate at `process_multimodal_content`),
         // but produce a deterministic empty marker so the caller's
         // tokenization is well-defined; the request is already rejected.
@@ -4364,7 +4468,7 @@ fn expand_image_placeholders(
 /// The base soft-token slot (`SoftTokenData.embeddings`) holds ONLY the
 /// first `hidden` floats of each row — the deepstack chunks are split
 /// out by the engine seam (see `engine_qwen35.rs` /
-/// `engine.rs::dispatch_qwen3vl_seam_split`).
+/// `engine.rs::dispatch_qwen_vision_seam_split`).
 fn expand_image_placeholders_family(
     engine: &engine::Engine,
     prompt_tokens: &[u32],
@@ -8045,24 +8149,6 @@ async fn chat_model_embeddings(
                 if let Some(response) = common_engine_error_response(None, &msg) {
                     return response;
                 }
-                // Iter-215 Wedge-2: Qwen3.5/3.6 embed sentinel → 501.
-                if msg.contains(engine::QWEN35_NOT_IMPLEMENTED_SENTINEL) {
-                    return ApiError::not_implemented(
-                        engine::QWEN35_NOT_IMPLEMENTED_MESSAGE.to_string(),
-                    )
-                    .into_response();
-                }
-                // iter-228a (ADR-005 Wedge-4): Qwen3-VL text-LM embed
-                // sentinel → 501. Mirrors the chat-completion 501 mapping.
-                if msg.contains(
-                    crate::inference::models::qwen3vl_text::forward::QWEN3VL_TEXT_FORWARD_PENDING_SENTINEL,
-                ) {
-                    return ApiError::not_implemented(
-                        crate::inference::models::qwen3vl_text::forward::QWEN3VL_TEXT_FORWARD_PENDING_MESSAGE
-                            .to_string(),
-                    )
-                    .into_response();
-                }
                 return ApiError::generation_error(format!("chat-model embedding: {e:#}"))
                     .into_response();
             }
@@ -8196,6 +8282,53 @@ fn build_kv_counter_block(
 ///   - `hf2q_sse_cancellations`           (counter)
 ///   - `hf2q_decode_tokens_total`         (counter)
 ///   - `hf2q_prompt_tokens_total`         (counter)
+fn format_qwen_decode_physical_metrics(
+    qwen_decode: crate::inference::models::qwen35::decode_observation::Qwen35DecodeObservationSnapshot,
+) -> String {
+    format!(
+        "# HELP hf2q_qwen_decode_scheduler_steps_total Qwen scheduler decode steps observed.\n\
+# TYPE hf2q_qwen_decode_scheduler_steps_total counter\n\
+hf2q_qwen_decode_scheduler_steps_total {}\n\
+# HELP hf2q_qwen_decode_scheduler_handles_total Qwen decode handles selected by scheduler steps; this does not imply physical GPU batching.\n\
+# TYPE hf2q_qwen_decode_scheduler_handles_total counter\n\
+hf2q_qwen_decode_scheduler_handles_total {}\n\
+# HELP hf2q_qwen_decode_scheduler_max_width Largest Qwen scheduler decode-handle set observed.\n\
+# TYPE hf2q_qwen_decode_scheduler_max_width gauge\n\
+hf2q_qwen_decode_scheduler_max_width {}\n\
+# HELP hf2q_qwen_decode_ordinary_target_forwards_total Physical ordinary Qwen target forward invocations; speculative verification is excluded.\n\
+# TYPE hf2q_qwen_decode_ordinary_target_forwards_total counter\n\
+hf2q_qwen_decode_ordinary_target_forwards_total {}\n\
+# HELP hf2q_qwen_decode_ordinary_target_body_rows_total Rows encoded by physical ordinary Qwen target-body forwards.\n\
+# TYPE hf2q_qwen_decode_ordinary_target_body_rows_total counter\n\
+hf2q_qwen_decode_ordinary_target_body_rows_total {}\n\
+# HELP hf2q_qwen_decode_ordinary_target_body_max_width Largest physical ordinary Qwen target-body row width observed.\n\
+# TYPE hf2q_qwen_decode_ordinary_target_body_max_width gauge\n\
+hf2q_qwen_decode_ordinary_target_body_max_width {}\n\
+# HELP hf2q_qwen_decode_ordinary_target_head_rows_total Rows encoded by physical ordinary Qwen output-head forwards.\n\
+# TYPE hf2q_qwen_decode_ordinary_target_head_rows_total counter\n\
+hf2q_qwen_decode_ordinary_target_head_rows_total {}\n\
+# HELP hf2q_qwen_decode_ordinary_target_head_max_width Largest physical ordinary Qwen output-head row width observed.\n\
+# TYPE hf2q_qwen_decode_ordinary_target_head_max_width gauge\n\
+hf2q_qwen_decode_ordinary_target_head_max_width {}\n\
+# HELP hf2q_qwen_decode_ordinary_command_buffers_created_total Metal command buffers created by observed ordinary Qwen target forwards; this is not a submission count.\n\
+# TYPE hf2q_qwen_decode_ordinary_command_buffers_created_total counter\n\
+hf2q_qwen_decode_ordinary_command_buffers_created_total {}\n\
+# HELP hf2q_qwen_decode_ordinary_command_buffer_submissions_total Metal command buffers actually committed during observed ordinary Qwen target forwards.\n\
+# TYPE hf2q_qwen_decode_ordinary_command_buffer_submissions_total counter\n\
+hf2q_qwen_decode_ordinary_command_buffer_submissions_total {}\n",
+        qwen_decode.scheduler_steps,
+        qwen_decode.scheduler_handles,
+        qwen_decode.scheduler_max_width,
+        qwen_decode.target_forwards,
+        qwen_decode.target_body_rows,
+        qwen_decode.target_body_max_width,
+        qwen_decode.target_head_rows,
+        qwen_decode.target_head_max_width,
+        qwen_decode.command_buffers_created,
+        qwen_decode.command_buffer_submissions,
+    )
+}
+
 pub async fn metrics(State(state): State<AppState>) -> Response {
     use std::sync::atomic::Ordering;
     let m = &state.metrics;
@@ -8326,6 +8459,285 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     // keep history verification distinct from the native MTP head; the older
     // `hf2q_qwen_mtp_*` names remain compatibility aggregates below.
     let qwen_mtp = &super::qwen35_speculation::TELEMETRY;
+    let qwen_anchor = &super::qwen35_anchor_store::TELEMETRY;
+    let qwen_anchor_block = format!(
+        "# HELP hf2q_qwen_anchor_captures_total Slot-local anchor captures attempted.\n\
+# TYPE hf2q_qwen_anchor_captures_total counter\n\
+hf2q_qwen_anchor_captures_total {}\n\
+# HELP hf2q_qwen_anchor_capture_budget_skips_total Anchor captures skipped by the committed-plus-pending byte preflight.\n\
+# TYPE hf2q_qwen_anchor_capture_budget_skips_total counter\n\
+hf2q_qwen_anchor_capture_budget_skips_total {}\n\
+# HELP hf2q_qwen_anchor_capture_seconds_total Wall time spent producing slot-local anchor payloads.\n\
+# TYPE hf2q_qwen_anchor_capture_seconds_total counter\n\
+hf2q_qwen_anchor_capture_seconds_total {:.9}\n\
+# HELP hf2q_qwen_anchor_restore_attempts_total Prompt divergences that attempted or required anchor restoration.\n\
+# TYPE hf2q_qwen_anchor_restore_attempts_total counter\n\
+hf2q_qwen_anchor_restore_attempts_total {}\n\
+# HELP hf2q_qwen_anchor_restore_hits_total Epoch-valid slot-local anchor restores.\n\
+# TYPE hf2q_qwen_anchor_restore_hits_total counter\n\
+hf2q_qwen_anchor_restore_hits_total {}\n\
+# HELP hf2q_qwen_anchor_restore_misses_total Divergences or restore failures that could not reuse an anchor.\n\
+# TYPE hf2q_qwen_anchor_restore_misses_total counter\n\
+hf2q_qwen_anchor_restore_misses_total {}\n\
+# HELP hf2q_qwen_anchor_tokens_saved_total Prompt tokens skipped by anchor restoration.\n\
+# TYPE hf2q_qwen_anchor_tokens_saved_total counter\n\
+hf2q_qwen_anchor_tokens_saved_total {}\n\
+# HELP hf2q_qwen_anchor_descendants_pruned_total Stale descendants removed before writes on a restored lineage.\n\
+# TYPE hf2q_qwen_anchor_descendants_pruned_total counter\n\
+hf2q_qwen_anchor_descendants_pruned_total {}\n\
+# HELP hf2q_qwen_anchor_evictions_total Positional keep-newest-K anchor evictions.\n\
+# TYPE hf2q_qwen_anchor_evictions_total counter\n\
+hf2q_qwen_anchor_evictions_total {}\n\
+# HELP hf2q_qwen_anchor_peak_committed_pending_bytes Peak reclaimable anchor payload bytes in one slot store.\n\
+# TYPE hf2q_qwen_anchor_peak_committed_pending_bytes gauge\n\
+hf2q_qwen_anchor_peak_committed_pending_bytes {}\n\
+# HELP hf2q_qwen_anchor_aggregate_peak_committed_pending_bytes Peak reclaimable anchor payload bytes across all slot stores.\n\
+# TYPE hf2q_qwen_anchor_aggregate_peak_committed_pending_bytes gauge\n\
+hf2q_qwen_anchor_aggregate_peak_committed_pending_bytes {}\n\
+# HELP hf2q_qwen_anchor_aggregate_budget_bytes Aggregate reclaimable anchor-owned budget, separate from Metal KV allocation accounting.\n\
+# TYPE hf2q_qwen_anchor_aggregate_budget_bytes gauge\n\
+hf2q_qwen_anchor_aggregate_budget_bytes {}\n\
+# HELP hf2q_qwen_anchor_configured_slots Configured Qwen SlotAware concurrency.\n\
+# TYPE hf2q_qwen_anchor_configured_slots gauge\n\
+hf2q_qwen_anchor_configured_slots {}\n\
+# HELP hf2q_qwen_anchor_effective_committed_depth Effective committed anchor depth available per configured slot for the most recent capture.\n\
+# TYPE hf2q_qwen_anchor_effective_committed_depth gauge\n\
+hf2q_qwen_anchor_effective_committed_depth {}\n\
+# HELP hf2q_qwen_anchor_simultaneous_pending_capacity_slots Number of slots that can hold one pending capture concurrently after every slot reaches the reported effective committed depth.\n\
+# TYPE hf2q_qwen_anchor_simultaneous_pending_capacity_slots gauge\n\
+hf2q_qwen_anchor_simultaneous_pending_capacity_slots {}\n\
+# HELP hf2q_qwen_anchor_prefill_transaction_ceiling_tokens Immutable SlotAware prefill transaction ceiling selected from the physical slot count.\n\
+# TYPE hf2q_qwen_anchor_prefill_transaction_ceiling_tokens gauge\n\
+hf2q_qwen_anchor_prefill_transaction_ceiling_tokens {}\n\
+# HELP hf2q_qwen_anchor_spec_boundary_capable Whether the loaded artifact has the MTP state required by a speculative anchor boundary.\n\
+# TYPE hf2q_qwen_anchor_spec_boundary_capable gauge\n\
+hf2q_qwen_anchor_spec_boundary_capable {}\n\
+# HELP hf2q_qwen_anchor_partial_capacity_captures_total Captures attempted while aggregate capacity could not offer default committed depth or one simultaneous pending capture to every slot.\n\
+# TYPE hf2q_qwen_anchor_partial_capacity_captures_total counter\n\
+hf2q_qwen_anchor_partial_capacity_captures_total {}\n\
+# HELP hf2q_qwen_anchor_spec_boundary_restore_tokens_total Prompt tokens whose exact speculative boundary state was accepted from an epoch-valid SlotAware anchor.\n\
+# TYPE hf2q_qwen_anchor_spec_boundary_restore_tokens_total counter\n\
+hf2q_qwen_anchor_spec_boundary_restore_tokens_total {}\n\
+# HELP hf2q_qwen_anchor_post_admission_prefill_failures_total One-shot acceptance faults injected after a successful non-empty GPU prefill slice and before scheduler publication.\n\
+# TYPE hf2q_qwen_anchor_post_admission_prefill_failures_total counter\n\
+hf2q_qwen_anchor_post_admission_prefill_failures_total {}\n\
+# HELP hf2q_qwen_anchor_stable_boundary_compound_prefills_total Stable boundaries crossed by the exact compound production route.\n\
+# TYPE hf2q_qwen_anchor_stable_boundary_compound_prefills_total counter\n\
+hf2q_qwen_anchor_stable_boundary_compound_prefills_total {}\n\
+# HELP hf2q_qwen_rectangular_prefill_cohorts_total Successfully published multi-slot rectangular Qwen prefill transactions.\n\
+# TYPE hf2q_qwen_rectangular_prefill_cohorts_total counter\n\
+hf2q_qwen_rectangular_prefill_cohorts_total {}\n",
+        qwen_anchor.captures_total.load(Ordering::Relaxed),
+        qwen_anchor
+            .capture_budget_skips_total
+            .load(Ordering::Relaxed),
+        qwen_anchor.capture_nanos_total.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        qwen_anchor.restore_attempts_total.load(Ordering::Relaxed),
+        qwen_anchor.restore_hits_total.load(Ordering::Relaxed),
+        qwen_anchor.restore_misses_total.load(Ordering::Relaxed),
+        qwen_anchor.tokens_saved_total.load(Ordering::Relaxed),
+        qwen_anchor.descendants_pruned_total.load(Ordering::Relaxed),
+        qwen_anchor.evictions_total.load(Ordering::Relaxed),
+        qwen_anchor
+            .peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .aggregate_peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        qwen_anchor.aggregate_budget_bytes.load(Ordering::Relaxed),
+        qwen_anchor.configured_slots.load(Ordering::Relaxed),
+        qwen_anchor
+            .effective_committed_depth
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .simultaneous_pending_capacity_slots
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .prefill_transaction_ceiling_tokens
+            .load(Ordering::Relaxed),
+        qwen_anchor.spec_boundary_capable.load(Ordering::Relaxed),
+        qwen_anchor
+            .partial_capacity_captures_total
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .spec_boundary_restore_tokens_total
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .post_admission_prefill_failures_total
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .stable_boundary_compound_prefills_total
+            .load(Ordering::Relaxed),
+        qwen_anchor
+            .rectangular_prefill_cohorts_total
+            .load(Ordering::Relaxed),
+    );
+    let gemma_anchor = &super::gemma4_anchor_store::TELEMETRY;
+    let gemma_anchor_block = format!(
+        "# HELP hf2q_gemma4_anchor_captures_total Slot-local Gemma boundary captures attempted.\n\
+# TYPE hf2q_gemma4_anchor_captures_total counter\n\
+hf2q_gemma4_anchor_captures_total {}\n\
+# HELP hf2q_gemma4_anchor_capture_budget_skips_total Gemma captures skipped by exact committed-plus-pending byte preflight.\n\
+# TYPE hf2q_gemma4_anchor_capture_budget_skips_total counter\n\
+hf2q_gemma4_anchor_capture_budget_skips_total {}\n\
+# HELP hf2q_gemma4_anchor_capture_seconds_total Wall time spent copying family-native Gemma payloads.\n\
+# TYPE hf2q_gemma4_anchor_capture_seconds_total counter\n\
+hf2q_gemma4_anchor_capture_seconds_total {:.9}\n\
+# HELP hf2q_gemma4_anchor_restore_attempts_total Gemma anchor restore attempts.\n\
+# TYPE hf2q_gemma4_anchor_restore_attempts_total counter\n\
+hf2q_gemma4_anchor_restore_attempts_total {}\n\
+# HELP hf2q_gemma4_anchor_restore_hits_total Epoch-valid Gemma anchor restores.\n\
+# TYPE hf2q_gemma4_anchor_restore_hits_total counter\n\
+hf2q_gemma4_anchor_restore_hits_total {}\n\
+# HELP hf2q_gemma4_anchor_restore_misses_total Gemma restore failures or invalid layouts.\n\
+# TYPE hf2q_gemma4_anchor_restore_misses_total counter\n\
+hf2q_gemma4_anchor_restore_misses_total {}\n\
+# HELP hf2q_gemma4_anchor_tokens_saved_total Prompt tokens skipped by Gemma anchor restoration.\n\
+# TYPE hf2q_gemma4_anchor_tokens_saved_total counter\n\
+hf2q_gemma4_anchor_tokens_saved_total {}\n\
+# HELP hf2q_gemma4_anchor_descendants_pruned_total Stale Gemma descendants removed after rewind or cancellation.\n\
+# TYPE hf2q_gemma4_anchor_descendants_pruned_total counter\n\
+hf2q_gemma4_anchor_descendants_pruned_total {}\n\
+# HELP hf2q_gemma4_anchor_evictions_total Positional keep-newest-K Gemma evictions.\n\
+# TYPE hf2q_gemma4_anchor_evictions_total counter\n\
+hf2q_gemma4_anchor_evictions_total {}\n\
+# HELP hf2q_gemma4_anchor_cancellations_total Gemma requests whose anchor lineage was reconciled on cancellation.\n\
+# TYPE hf2q_gemma4_anchor_cancellations_total counter\n\
+hf2q_gemma4_anchor_cancellations_total {}\n\
+# HELP hf2q_gemma4_anchor_lineage_clears_total Full Gemma anchor-store invalidations.\n\
+# TYPE hf2q_gemma4_anchor_lineage_clears_total counter\n\
+hf2q_gemma4_anchor_lineage_clears_total {}\n\
+# HELP hf2q_gemma4_anchor_peak_committed_pending_bytes Peak reclaimable Gemma anchor bytes in one slot.\n\
+# TYPE hf2q_gemma4_anchor_peak_committed_pending_bytes gauge\n\
+hf2q_gemma4_anchor_peak_committed_pending_bytes {}\n\
+# HELP hf2q_gemma4_anchor_aggregate_peak_committed_pending_bytes Peak reclaimable Gemma anchor bytes across slots.\n\
+# TYPE hf2q_gemma4_anchor_aggregate_peak_committed_pending_bytes gauge\n\
+hf2q_gemma4_anchor_aggregate_peak_committed_pending_bytes {}\n\
+# HELP hf2q_gemma4_anchor_aggregate_budget_bytes Aggregate Gemma anchor-owned byte budget.\n\
+# TYPE hf2q_gemma4_anchor_aggregate_budget_bytes gauge\n\
+hf2q_gemma4_anchor_aggregate_budget_bytes {}\n\
+# HELP hf2q_gemma4_anchor_configured_slots Configured Gemma SlotAware concurrency.\n\
+# TYPE hf2q_gemma4_anchor_configured_slots gauge\n\
+hf2q_gemma4_anchor_configured_slots {}\n\
+# HELP hf2q_gemma4_anchor_effective_committed_depth Effective committed Gemma anchor depth available per configured slot for the most recent capture.\n\
+# TYPE hf2q_gemma4_anchor_effective_committed_depth gauge\n\
+hf2q_gemma4_anchor_effective_committed_depth {}\n\
+# HELP hf2q_gemma4_anchor_simultaneous_pending_capacity_slots Number of Gemma slots that can hold one pending capture concurrently after every slot reaches the reported effective committed depth.\n\
+# TYPE hf2q_gemma4_anchor_simultaneous_pending_capacity_slots gauge\n\
+hf2q_gemma4_anchor_simultaneous_pending_capacity_slots {}\n",
+        gemma_anchor.captures_total.load(Ordering::Relaxed),
+        gemma_anchor
+            .capture_budget_skips_total
+            .load(Ordering::Relaxed),
+        gemma_anchor.capture_nanos_total.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        gemma_anchor.restore_attempts_total.load(Ordering::Relaxed),
+        gemma_anchor.restore_hits_total.load(Ordering::Relaxed),
+        gemma_anchor.restore_misses_total.load(Ordering::Relaxed),
+        gemma_anchor.tokens_saved_total.load(Ordering::Relaxed),
+        gemma_anchor.descendants_pruned_total.load(Ordering::Relaxed),
+        gemma_anchor.evictions_total.load(Ordering::Relaxed),
+        gemma_anchor.cancellations_total.load(Ordering::Relaxed),
+        gemma_anchor.lineage_clears_total.load(Ordering::Relaxed),
+        gemma_anchor
+            .peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        gemma_anchor
+            .aggregate_peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        gemma_anchor.aggregate_budget_bytes.load(Ordering::Relaxed),
+        gemma_anchor.configured_slots.load(Ordering::Relaxed),
+        gemma_anchor
+            .effective_committed_depth
+            .load(Ordering::Relaxed),
+        gemma_anchor
+            .simultaneous_pending_capacity_slots
+            .load(Ordering::Relaxed),
+    );
+    let deepseek_anchor = &super::deepseek4_anchor_store::TELEMETRY;
+    let deepseek_anchor_block = format!(
+        "# HELP hf2q_deepseek4_anchor_captures_total Slot-local DeepSeek recovery-tail captures attempted.\n\
+# TYPE hf2q_deepseek4_anchor_captures_total counter\n\
+hf2q_deepseek4_anchor_captures_total {}\n\
+# HELP hf2q_deepseek4_anchor_capture_budget_skips_total DeepSeek captures skipped by aggregate byte or publication preflight.\n\
+# TYPE hf2q_deepseek4_anchor_capture_budget_skips_total counter\n\
+hf2q_deepseek4_anchor_capture_budget_skips_total {}\n\
+# HELP hf2q_deepseek4_anchor_capture_seconds_total Wall time spent producing compact DeepSeek snapshots.\n\
+# TYPE hf2q_deepseek4_anchor_capture_seconds_total counter\n\
+hf2q_deepseek4_anchor_capture_seconds_total {:.9}\n\
+# HELP hf2q_deepseek4_anchor_restore_attempts_total DeepSeek anchor restore attempts and cold misses.\n\
+# TYPE hf2q_deepseek4_anchor_restore_attempts_total counter\n\
+hf2q_deepseek4_anchor_restore_attempts_total {}\n\
+# HELP hf2q_deepseek4_anchor_restore_hits_total Epoch-valid DeepSeek anchor restores.\n\
+# TYPE hf2q_deepseek4_anchor_restore_hits_total counter\n\
+hf2q_deepseek4_anchor_restore_hits_total {}\n\
+# HELP hf2q_deepseek4_anchor_restore_misses_total DeepSeek divergences that could not reuse an anchor.\n\
+# TYPE hf2q_deepseek4_anchor_restore_misses_total counter\n\
+hf2q_deepseek4_anchor_restore_misses_total {}\n\
+# HELP hf2q_deepseek4_anchor_tokens_saved_total Prompt tokens skipped by DeepSeek anchor restoration.\n\
+# TYPE hf2q_deepseek4_anchor_tokens_saved_total counter\n\
+hf2q_deepseek4_anchor_tokens_saved_total {}\n\
+# HELP hf2q_deepseek4_anchor_descendants_pruned_total Stale DeepSeek descendants removed after rewind or cancellation.\n\
+# TYPE hf2q_deepseek4_anchor_descendants_pruned_total counter\n\
+hf2q_deepseek4_anchor_descendants_pruned_total {}\n\
+# HELP hf2q_deepseek4_anchor_evictions_total Positional keep-newest-K DeepSeek evictions.\n\
+# TYPE hf2q_deepseek4_anchor_evictions_total counter\n\
+hf2q_deepseek4_anchor_evictions_total {}\n\
+# HELP hf2q_deepseek4_anchor_cancellations_total DeepSeek requests reconciled to a committed recovery anchor.\n\
+# TYPE hf2q_deepseek4_anchor_cancellations_total counter\n\
+hf2q_deepseek4_anchor_cancellations_total {}\n\
+# HELP hf2q_deepseek4_anchor_lineage_clears_total Full DeepSeek anchor-store invalidations.\n\
+# TYPE hf2q_deepseek4_anchor_lineage_clears_total counter\n\
+hf2q_deepseek4_anchor_lineage_clears_total {}\n\
+# HELP hf2q_deepseek4_anchor_peak_committed_pending_bytes Peak reclaimable DeepSeek anchor bytes in one store.\n\
+# TYPE hf2q_deepseek4_anchor_peak_committed_pending_bytes gauge\n\
+hf2q_deepseek4_anchor_peak_committed_pending_bytes {}\n\
+# HELP hf2q_deepseek4_anchor_aggregate_peak_committed_pending_bytes Peak reclaimable DeepSeek anchor bytes across stores.\n\
+# TYPE hf2q_deepseek4_anchor_aggregate_peak_committed_pending_bytes gauge\n\
+hf2q_deepseek4_anchor_aggregate_peak_committed_pending_bytes {}\n\
+# HELP hf2q_deepseek4_anchor_aggregate_owned_bytes Current exact reclaimable DeepSeek anchor bytes across stores.\n\
+# TYPE hf2q_deepseek4_anchor_aggregate_owned_bytes gauge\n\
+hf2q_deepseek4_anchor_aggregate_owned_bytes {}\n\
+# HELP hf2q_deepseek4_anchor_aggregate_budget_bytes Immutable aggregate DeepSeek anchor-owned byte grant.\n\
+# TYPE hf2q_deepseek4_anchor_aggregate_budget_bytes gauge\n\
+hf2q_deepseek4_anchor_aggregate_budget_bytes {}\n\
+# HELP hf2q_deepseek4_anchor_configured_slots Configured DeepSeek SlotAware concurrency.\n\
+# TYPE hf2q_deepseek4_anchor_configured_slots gauge\n\
+hf2q_deepseek4_anchor_configured_slots {}\n\
+# HELP hf2q_deepseek4_anchor_effective_committed_depth Effective committed depth for the most recent DeepSeek capture.\n\
+# TYPE hf2q_deepseek4_anchor_effective_committed_depth gauge\n\
+hf2q_deepseek4_anchor_effective_committed_depth {}\n\
+# HELP hf2q_deepseek4_anchor_simultaneous_pending_capacity_slots Slots with pending capacity after the reported committed depth.\n\
+# TYPE hf2q_deepseek4_anchor_simultaneous_pending_capacity_slots gauge\n\
+hf2q_deepseek4_anchor_simultaneous_pending_capacity_slots {}\n",
+        deepseek_anchor.captures_total.load(Ordering::Relaxed),
+        deepseek_anchor
+            .capture_budget_skips_total
+            .load(Ordering::Relaxed),
+        deepseek_anchor.capture_nanos_total.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        deepseek_anchor.restore_attempts_total.load(Ordering::Relaxed),
+        deepseek_anchor.restore_hits_total.load(Ordering::Relaxed),
+        deepseek_anchor.restore_misses_total.load(Ordering::Relaxed),
+        deepseek_anchor.tokens_saved_total.load(Ordering::Relaxed),
+        deepseek_anchor.descendants_pruned_total.load(Ordering::Relaxed),
+        deepseek_anchor.evictions_total.load(Ordering::Relaxed),
+        deepseek_anchor.cancellations_total.load(Ordering::Relaxed),
+        deepseek_anchor.lineage_clears_total.load(Ordering::Relaxed),
+        deepseek_anchor
+            .peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        deepseek_anchor
+            .aggregate_peak_committed_pending_bytes
+            .load(Ordering::Relaxed),
+        deepseek_anchor.aggregate_owned_bytes.load(Ordering::Relaxed),
+        deepseek_anchor.aggregate_budget_bytes.load(Ordering::Relaxed),
+        deepseek_anchor.configured_slots.load(Ordering::Relaxed),
+        deepseek_anchor
+            .effective_committed_depth
+            .load(Ordering::Relaxed),
+        deepseek_anchor
+            .simultaneous_pending_capacity_slots
+            .load(Ordering::Relaxed),
+    );
     let qwen_mtp_fallback_reasons = format!(
         "# HELP hf2q_qwen_mtp_fallback_requests_by_reason_total Compatibility aggregate of exact Qwen speculation fallbacks by closed reason.\n\
 # TYPE hf2q_qwen_mtp_fallback_requests_by_reason_total counter\n\
@@ -8445,6 +8857,9 @@ hf2q_qwen_history_lookup_no_match_total {}\n",
             / 1_000_000_000.0,
         qwen_mtp.history_lookup_no_match.load(Ordering::Relaxed),
     );
+    let qwen_decode_physical = format_qwen_decode_physical_metrics(
+        crate::inference::models::qwen35::decode_observation::snapshot(),
+    );
 
     let body = format!(
         "\
@@ -8534,6 +8949,10 @@ hf2q_qwen_mtp_fallback_requests_total {qwen_mtp_fallbacks}\n\
 # TYPE hf2q_qwen_mtp_conversation_resets_total counter\n\
 hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
 {qwen_speculation_proposers}\
+{qwen_anchor_block}\
+{gemma_anchor_block}\
+{deepseek_anchor_block}\
+{qwen_decode_physical}\
 ",
         uptime = state.uptime_seconds(),
         ready = ready,
@@ -8566,6 +8985,10 @@ hf2q_qwen_mtp_conversation_resets_total {qwen_mtp_resets}\n\
         qwen_mtp_fallback_reasons = qwen_mtp_fallback_reasons,
         qwen_mtp_resets = qwen_mtp.conversation_resets.load(Ordering::Relaxed),
         qwen_speculation_proposers = qwen_speculation_proposers,
+        qwen_anchor_block = qwen_anchor_block,
+        gemma_anchor_block = gemma_anchor_block,
+        deepseek_anchor_block = deepseek_anchor_block,
+        qwen_decode_physical = qwen_decode_physical,
     );
     // Prometheus exposition format: text/plain with a versioned content-type.
     let mut resp = (StatusCode::OK, body).into_response();
@@ -8792,7 +9215,7 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
     for le in pool_snapshot.iter() {
         let loaded_id = le.engine.model_id().to_string();
         let info = le.engine.info();
-        let bound_projector = bound_projector_for_engine(&state, &le.engine);
+        let bound_projector = bound_projector_for_engine(le);
         let model = match models.iter_mut().find(|m| m.id == loaded_id) {
             Some(m) => {
                 m.loaded = true;
@@ -8894,7 +9317,7 @@ pub async fn get_model(
             entry.engine.info(),
             entry.engine.context_length(),
         );
-        if let Some(projector) = bound_projector_for_engine(&state, &entry.engine) {
+        if let Some(projector) = bound_projector_for_engine(entry.as_ref()) {
             advertise_bound_vision(&mut model, &projector.model_id);
         }
         return (StatusCode::OK, Json(model)).into_response();
@@ -9078,13 +9501,12 @@ fn advertise_bound_vision(model: &mut ModelObject, projector_id: &str) {
     model.vision_projector = Some(projector_id.to_owned());
 }
 
-fn bound_projector_for_engine<'a>(
-    state: &'a AppState,
-    engine: &super::engine::Engine,
-) -> Option<&'a super::state::LoadedMmproj> {
-    state.mmproj.as_ref().filter(|projector| {
+fn bound_projector_for_engine(
+    loaded: &LoadedEngine<super::engine::Engine>,
+) -> Option<&super::state::LoadedMmproj> {
+    loaded.projector.as_deref().filter(|projector| {
         crate::serve::validate_mmproj_text_binding(
-            engine.vision_consumer_contract(),
+            loaded.engine.vision_consumer_contract(),
             projector.arch,
             projector.config.projection_dim,
             projector
@@ -9193,6 +9615,107 @@ pub(crate) fn test_scan(dir: &Path) -> std::io::Result<Vec<ModelObject>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_receipt_headers_are_complete_and_deterministic() {
+        use base64::Engine as _;
+
+        let receipt = GenerationExecutionReceipt {
+            pool_key: "repository/model@Q5_K_M".to_owned(),
+            generation: 42,
+            text_artifact_sha256: "a".repeat(64),
+            arch_family: "qwen35".to_owned(),
+            architecture: "qwen35moe".to_owned(),
+        };
+        receipt.validate_header_values().unwrap();
+        let mut response = StatusCode::OK.into_response();
+        receipt.apply(&mut response);
+        let headers = response.headers();
+        let encoded_pool = headers[EXECUTION_POOL_KEY_HEADER].to_str().unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded_pool)
+                .unwrap(),
+            receipt.pool_key.as_bytes()
+        );
+        assert_eq!(headers[EXECUTION_GENERATION_HEADER], "42");
+        assert_eq!(
+            headers[EXECUTION_ARTIFACT_SHA256_HEADER].to_str().unwrap(),
+            receipt.text_artifact_sha256.as_str()
+        );
+        assert_eq!(headers[EXECUTION_ARCH_FAMILY_HEADER], "qwen35");
+        assert_eq!(headers[EXECUTION_ARCHITECTURE_HEADER], "qwen35moe");
+    }
+
+    #[test]
+    fn execution_receipt_rejects_non_header_safe_architecture() {
+        let receipt = GenerationExecutionReceipt {
+            pool_key: "repository/model@Q4_K_M".to_owned(),
+            generation: 1,
+            text_artifact_sha256: "b".repeat(64),
+            arch_family: "qwen35".to_owned(),
+            architecture: "qwen35moe\nforged: value".to_owned(),
+        };
+        assert!(receipt.validate_header_values().is_err());
+    }
+
+    #[test]
+    fn unary_and_sse_success_paths_both_stamp_the_leased_execution_receipt() {
+        let source = include_str!("handlers.rs");
+        let production = source
+            .split("// Tests (unit — integration tests via router live in tests/api_smoke.rs)")
+            .next()
+            .expect("production handler source");
+        assert_eq!(
+            production.matches("receipt.apply(&mut response)").count(),
+            2,
+            "both unary and SSE response paths must stamp the receipt"
+        );
+        let prepare = source
+            .split("let resolved_engine = resolver")
+            .nth(1)
+            .and_then(|tail| tail.split("let engine: &Engine").next())
+            .expect("prepare receipt-binding source");
+        assert!(prepare.contains("GenerationExecutionReceipt::from_leased"));
+        assert!(prepare.contains("let execution_receipt = model_lease"));
+        assert!(prepare.contains(".as_ref()"));
+        let binding = source
+            .split("fn from_leased")
+            .nth(1)
+            .and_then(|tail| tail.split("fn validate_header_values").next())
+            .expect("leased receipt constructor source");
+        assert!(binding.contains("lease.identity() == &identity"));
+        assert!(binding.contains(".text_artifact"));
+        assert!(!binding.contains("compute_file_sha256"));
+    }
+
+    #[test]
+    fn qwen_physical_metrics_keep_creation_and_submission_counts_distinct() {
+        let rendered = format_qwen_decode_physical_metrics(
+            crate::inference::models::qwen35::decode_observation::Qwen35DecodeObservationSnapshot {
+                scheduler_steps: 1,
+                scheduler_handles: 4,
+                scheduler_max_width: 4,
+                target_forwards: 1,
+                target_body_rows: 4,
+                target_body_max_width: 4,
+                target_head_rows: 4,
+                target_head_max_width: 4,
+                command_buffers_created: 6,
+                command_buffer_submissions: 2,
+            },
+        );
+        assert!(rendered.contains("hf2q_qwen_decode_ordinary_command_buffers_created_total 6\n"));
+        assert!(rendered.contains("hf2q_qwen_decode_ordinary_command_buffer_submissions_total 2\n"));
+        assert!(
+            rendered.contains("this is not a submission count"),
+            "HELP text must distinguish creation from submission"
+        );
+        assert!(
+            rendered.contains("actually committed"),
+            "submission metric must be bound to the commit primitive"
+        );
+    }
 
     #[test]
     fn prefill_rate_counts_only_uncached_work() {
@@ -10182,7 +10705,7 @@ mod multimodal_tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn rewrite_messages_family_qwen3vl_emits_vision_start_image_pad_vision_end() {
+    fn rewrite_messages_family_qwen_vision_emits_vision_start_image_pad_vision_end() {
         use crate::inference::vision::mmproj::VisionFamily;
         let msgs = vec![ChatMessage {
             role: "user".into(),
@@ -10202,7 +10725,7 @@ mod multimodal_tests {
             tool_call_id: None,
             name: None,
         }];
-        let out = rewrite_messages_for_vision_placeholders_family(&msgs, VisionFamily::Qwen3Vl);
+        let out = rewrite_messages_for_vision_placeholders_family(&msgs, VisionFamily::Qwen);
         match out[0].content.as_ref().expect("content") {
             MessageContent::Text(t) => {
                 assert!(
@@ -10218,7 +10741,7 @@ mod multimodal_tests {
     }
 
     #[test]
-    fn rewrite_messages_family_qwen3vl_two_images_two_triplets() {
+    fn rewrite_messages_family_qwen_vision_two_images_two_triplets() {
         use crate::inference::vision::mmproj::VisionFamily;
         let msgs = vec![ChatMessage {
             role: "user".into(),
@@ -10243,7 +10766,7 @@ mod multimodal_tests {
             tool_call_id: None,
             name: None,
         }];
-        let out = rewrite_messages_for_vision_placeholders_family(&msgs, VisionFamily::Qwen3Vl);
+        let out = rewrite_messages_for_vision_placeholders_family(&msgs, VisionFamily::Qwen);
         match out[0].content.as_ref().expect("content") {
             MessageContent::Text(t) => {
                 assert_eq!(t.matches("<|image_pad|>").count(), 2);
@@ -10288,11 +10811,11 @@ mod multimodal_tests {
     // -----------------------------------------------------------------
 
     /// Pure-CPU mirror of the byte-shuffle that
-    /// `dispatch_qwen3vl_seam_split` performs (without the GPU-buffer
+    /// `dispatch_qwen_vision_seam_split` performs (without the GPU-buffer
     /// allocation). Returns the per-deepstack-chunk Vec<f32> array
     /// keyed `[total_n_image_tokens, hidden]` row-major. Used by the
     /// round-trip test to prove split + concat == identity.
-    fn cpu_split_qwen3vl_augmented(
+    fn cpu_split_qwen_vision_augmented(
         vision_embeddings: &[Vec<f32>],
         per_image_n_image_tokens: usize,
         hidden: usize,
@@ -10319,7 +10842,7 @@ mod multimodal_tests {
     }
 
     #[test]
-    fn qwen3vl_seam_split_round_trip_identity() {
+    fn qwen_vision_seam_split_round_trip_identity() {
         // Construct an augmented embed with deterministic byte pattern,
         // CPU-split it, then re-concatenate row-by-row and verify
         // byte-identity vs the original. This pins the split semantics
@@ -10341,8 +10864,12 @@ mod multimodal_tests {
         }
 
         let vision_embeddings = vec![augmented.clone()];
-        let chunks =
-            cpu_split_qwen3vl_augmented(&vision_embeddings, n_image_tokens, hidden, n_deepstack);
+        let chunks = cpu_split_qwen_vision_augmented(
+            &vision_embeddings,
+            n_image_tokens,
+            hidden,
+            n_deepstack,
+        );
         assert_eq!(chunks.len(), n_deepstack);
 
         // Now reconstruct: for each row, concat the BASE chunk (per-row
@@ -10370,7 +10897,7 @@ mod multimodal_tests {
     /// deepstack rows into the right slot of the concatenated chunk
     /// buffer.
     #[test]
-    fn qwen3vl_seam_split_handles_per_image_variable_n_image_tokens_iter225() {
+    fn qwen_vision_seam_split_handles_per_image_variable_n_image_tokens_iter225() {
         // Two images with DIFFERENT post-merge token counts:
         //   image 0 (landscape 24×9 = 216 tokens) — would be a wide
         //     aspect under canonical 768 canvas
@@ -10400,7 +10927,7 @@ mod multimodal_tests {
         }
 
         // CPU mirror of the iter-225 per-image-variable scatter (the
-        // actual production path lives in dispatch_qwen3vl_seam_split,
+        // actual production path lives in dispatch_qwen_vision_seam_split,
         // which depends on a full Engine + LoadedMmproj fixture; this
         // CPU mirror exercises the byte-shuffle math directly).
         let total_n = n_img0 + n_img1;
@@ -10439,7 +10966,7 @@ mod multimodal_tests {
     }
 
     #[test]
-    fn qwen3vl_seam_split_concatenates_multi_image_in_order() {
+    fn qwen_vision_seam_split_concatenates_multi_image_in_order() {
         // Two images: image 0 has rows with value `r`, image 1 has
         // rows with value `100 + r`. After split + concat, chunks[0]
         // should hold rows 0..n then 100..(100+n) for slot j=1.
@@ -10460,8 +10987,12 @@ mod multimodal_tests {
             }
         }
         let vision_embeddings = vec![img0, img1];
-        let chunks =
-            cpu_split_qwen3vl_augmented(&vision_embeddings, n_image_tokens, hidden, n_deepstack);
+        let chunks = cpu_split_qwen_vision_augmented(
+            &vision_embeddings,
+            n_image_tokens,
+            hidden,
+            n_deepstack,
+        );
         // chunks[0] is concatenated [img0_rows; img1_rows].
         // Row 0 of chunks[0] = img0 row 0's slot 1 = 0.
         // Row 3 of chunks[0] = img1 row 0's slot 1 = 100.
@@ -10729,8 +11260,11 @@ mod readiness_guard_tests {
         engine.shutdown().await.expect("stop synthetic worker");
         let loaded = Arc::new(LoadedEngine {
             engine,
+            projector: None,
             repo: "raced-dead-qwen".to_string(),
             gguf_path: std::path::PathBuf::new(),
+            text_artifact: None,
+            projector_file_stamp: None,
             quant: QuantType::Q4_K_M,
             bytes_resident: 1_024,
             loaded_at: SystemTime::now(),
@@ -10952,149 +11486,6 @@ mod pool_error_tests {
         assert_eq!(
             ra, "5",
             "pool-refused Retry-After must be 5 seconds (not 1, which is for not-ready)"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Iter-215 Wedge-2 — Qwen3.5/3.6 SERVE-side chat 501 mapping
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod iter215_qwen35_chat_501_tests {
-    use super::*;
-    use axum::body::to_bytes;
-    use axum::http::StatusCode;
-    use std::sync::Arc;
-    use std::time::SystemTime;
-
-    use super::super::engine;
-    use super::super::schema::{ChatCompletionRequest, ChatMessage, MessageContent};
-    use super::super::state::{AppState, ServerConfig};
-
-    fn empty_request_for_model(model: &str) -> ChatCompletionRequest {
-        ChatCompletionRequest {
-            model: model.to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: Some(MessageContent::Text("hi".to_string())),
-                reasoning_content: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            }],
-            stream: None,
-            max_tokens: None,
-            max_completion_tokens: None,
-            temperature: None,
-            stop: None,
-            tools: None,
-            tool_choice: None,
-            response_format: None,
-            top_p: None,
-            seed: None,
-            reasoning_effort: None,
-            thinking_token_budget: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            stream_options: None,
-            top_k: None,
-            repetition_penalty: None,
-            min_p: None,
-            logprobs: None,
-            top_logprobs: None,
-            logit_bias: None,
-            parallel_tool_calls: None,
-            hf2q_overflow_policy: None,
-            hf2q_enable_thinking: None,
-            chat_template_kwargs: None,
-        }
-    }
-
-    /// End-to-end via the resolver seam: a Qwen3.5/3.6-arch engine
-    /// in the pool MUST yield HTTP 501 with the operator-actionable
-    /// body (names BOTH `hf2q generate` AND `cmd_generate_qwen35`)
-    /// when the chat-completion handler runs to completion.
-    ///
-    /// We invoke `chat_completions` end-to-end (production path) by
-    /// building a `prepare_chat_generation_core` fixture-style call
-    /// that inserts the synthetic Qwen35-arch engine into the
-    /// resolver result.  The handler-layer 501 short-circuit fires
-    /// after `prepare_chat_generation` returns Ok.
-    #[tokio::test]
-    async fn qwen35_chat_completion_returns_501_with_actionable_message() {
-        let state = AppState::new(ServerConfig::default());
-        assert!(state.is_ready_for_gen());
-        let req = empty_request_for_model("iter-215-test-model");
-
-        // Build a synthetic Qwen35-arch engine (no live model + no GPU)
-        // and wrap it in a LoadedEngine so the resolver seam can
-        // surface it exactly the way the production resolver would.
-        let engine = engine::make_synthetic_engine_for_test(engine::LoadedArch::Qwen35);
-        let loaded_engine = Arc::new(LoadedEngine {
-            engine,
-            repo: "iter-215-test-model".to_string(),
-            gguf_path: std::path::PathBuf::new(),
-            quant: QuantType::Q4_K_M,
-            bytes_resident: 1024,
-            loaded_at: SystemTime::now(),
-            generation: 1,
-            config_identity: crate::serve::multi_model::EngineConfigIdentity::default(),
-        });
-        let resolver_le = loaded_engine.clone();
-        let resolver = move |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
-            let le = resolver_le.clone();
-            Box::pin(async move { Ok(ResolvedEngine::unleased(le)) })
-        };
-
-        // `prepare_chat_generation_core` does the engine resolution +
-        // template render + tokenize.  An empty chat_template
-        // (synthetic engine has Arc::new(String::new()) chat template)
-        // collapses the render to an empty string but doesn't error;
-        // tokenize on empty input returns an empty Vec.  None of that
-        // matters here — we want to assert the 501 short-circuit
-        // fires AFTER prepare returns Ok.  So we test the prepare-
-        // returns-Ok-then-501 sequence by calling the relevant
-        // ApiError builder directly with the same constants the
-        // handler quotes; the handler-level early 501 short-circuit
-        // is exercised by the engine.arch() check at handlers.rs:296.
-        //
-        // To prove the contract end-to-end, drive
-        // `prepare_chat_generation_core` and assert the engine on the
-        // returned PreparedChatContext reports LoadedArch::Qwen35.
-        let prepared = match prepare_chat_generation_core(&state, &req, None, resolver).await {
-            Ok(p) => p,
-            Err(_resp) => panic!("prepare must succeed before the 501 short-circuit fires"),
-        };
-        assert_eq!(
-            prepared.loaded_engine.engine.arch(),
-            engine::LoadedArch::Qwen35,
-            "synthetic engine must report Qwen35 arch"
-        );
-
-        // Now invoke the same code path the handler does: build the
-        // 501 response from the ApiError builder using the engine
-        // constants.  This is the literal sequence handlers.rs:296
-        // executes.
-        let resp = ApiError::not_implemented(engine::QWEN35_NOT_IMPLEMENTED_MESSAGE.to_string())
-            .into_response();
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_IMPLEMENTED,
-            "Qwen3.5/3.6 chat must return HTTP 501"
-        );
-        // Body must contain BOTH operator literals.
-        let body_bytes = to_bytes(resp.into_body(), 1 << 20)
-            .await
-            .expect("read response body");
-        let body = String::from_utf8_lossy(&body_bytes);
-        assert!(
-            body.contains("hf2q generate"),
-            "501 body must name `hf2q generate`; got: {body}"
-        );
-        assert!(
-            body.contains("cmd_generate_qwen35"),
-            "501 body must name `cmd_generate_qwen35`; got: {body}"
         );
     }
 }
@@ -11887,8 +12278,11 @@ mod a5d_handler_429_tests {
     ) -> PreparedChatContext {
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
+            projector: None,
             repo: "a5d-handler-test".to_string(),
             gguf_path: std::path::PathBuf::new(),
+            text_artifact: None,
+            projector_file_stamp: None,
             quant: QuantType::Q4_K_M,
             bytes_resident: 0,
             loaded_at: SystemTime::now(),
@@ -11900,6 +12294,7 @@ mod a5d_handler_429_tests {
         PreparedChatContext {
             loaded_engine,
             model_lease: None,
+            execution_receipt: None,
             prompt_tokens,
             params,
             summarized_messages: None,

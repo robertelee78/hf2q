@@ -784,15 +784,16 @@ fn convert_unsupported_arch_errors_typed() {
 /// noted in `synthesize_tiny_llama3_no_norms` above).
 ///
 /// **Router gate omitted**: `mlp.gate.weight` maps to
-/// `blk.<i>.ffn_gate_inp.weight` which ApexPolicy routes to Q5_0.
-/// mlx-native's GgufFile reader does NOT recognize the Q5_0 wire code
-/// (only Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, F32, F16, I16, IQ4_NL).
-/// Including the router gate would cause the reader to error at parse
-/// time — orthogonal to what this test asserts (ApexPolicy correctly
-/// dispatches Q6_K for the EDGE-region tensors). Coverage for the
-/// router gate's Q5_0 pick lives in the ApexPolicy unit tests at
-/// `src/quantize/ggml_quants/apex/policy.rs::apex_policy_router_gate_q5_0`.
+/// `blk.<i>.ffn_gate_inp.weight`, which ApexPolicy routes to Q5_0. The fixture
+/// predates native Q5_0 GGUF execution and omits router tensors so its existing
+/// tensor-count assertions remain stable. Q5_0 reader and execution coverage
+/// now lives in the architecture preflight and native-route suites; this
+/// conversion fixture is not evidence that the runtime format is unsupported.
 fn synthesize_tiny_qwen35moe_for_apex(dir: &Path) {
+    synthesize_tiny_qwen35moe_for_apex_with_router(dir, false);
+}
+
+fn synthesize_tiny_qwen35moe_for_apex_with_router(dir: &Path, include_router: bool) {
     const HIDDEN: usize = 256;
     const MOE_FFN: usize = 256;
     const VOCAB: usize = 256;
@@ -833,6 +834,14 @@ fn synthesize_tiny_qwen35moe_for_apex(dir: &Path) {
                 format!("model.layers.{li}.self_attn.{suffix}.weight"),
                 vec![HIDDEN, HIDDEN],
                 mk_f32_bytes(HIDDEN * HIDDEN, s + 10 + idx as u32),
+            ));
+        }
+
+        if include_router {
+            tensors.push((
+                format!("model.layers.{li}.mlp.gate.weight"),
+                vec![N_EXPERTS, HIDDEN],
+                mk_f32_bytes(N_EXPERTS * HIDDEN, s + 90),
             ));
         }
 
@@ -1013,6 +1022,42 @@ fn convert_apex_balanced_tiny_qwen35moe_round_trip() {
             info.ggml_type
         );
         // ALIGNMENT round-trip — every offset must be 32-aligned per spec.
+        assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
+    }
+}
+
+#[test]
+fn convert_apex_q5_0_router_reopens_with_exact_block_geometry() {
+    let model_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_qwen35moe_for_apex_with_router(model_dir.path(), true);
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("apex-balanced")
+        .arg("-o")
+        .arg(out.path())
+        .assert()
+        .success();
+
+    let gguf = mlx_native::gguf::GgufFile::open(out.path())
+        .expect("the native GGUF reader must reopen Q5_0 router tensors");
+    assert_eq!(
+        gguf.tensor_count(),
+        18,
+        "two router tensors join the base 16"
+    );
+    let expected_bytes = 4 * (256 / 32) * 22;
+    for layer in 0..2 {
+        let name = format!("blk.{layer}.ffn_gate_inp.weight");
+        let info = gguf
+            .tensor_info(&name)
+            .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
+        assert_eq!(info.ggml_type, mlx_native::GgmlType::Q5_0);
+        assert_eq!(info.byte_len, expected_bytes);
         assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
     }
 }
@@ -1376,10 +1421,9 @@ fn convert_q4_0_tiny_qwen35moe_round_trip() {
 }
 
 /// CLI-subprocess sibling — exercises Q5_1 via `--quant q5_1`.
-/// Q5_1 is the 5-bit legacy quant with per-block `m` (min) term in
-/// addition to scale `d`. mlx_native::ops::quantized_matmul_ggml::GgmlType
-/// includes Q5_1 (per ADR-022 Phase 1) so the output GGUF can be parsed
-/// by mlx-native (unlike Q5_0, which is unsupported by its reader).
+/// Q5_1 is the 5-bit legacy quant with per-block `m` (min) term in addition to
+/// scale `d`. This fixture covers Q5_1 conversion and GGUF reopen specifically;
+/// Q5_0 has its own native reader and generative execution contract.
 #[test]
 fn convert_q5_1_tiny_qwen35moe_round_trip() {
     let model_dir = tempfile::tempdir().unwrap();

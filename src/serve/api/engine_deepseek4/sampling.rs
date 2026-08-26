@@ -116,6 +116,7 @@ pub(super) fn sample(
         .as_slice::<f32>()
         .context("read DeepSeek-V4 logits")?
         .to_vec();
+    crate::inference::argmax::validate_finite_logits(&values, "DeepSeek-V4 full-logit readback")?;
     for (&token, &bias) in &params.logit_bias {
         if let Some(logit) = values.get_mut(token as usize) {
             *logit += bias;
@@ -274,7 +275,7 @@ pub(in crate::serve::api) fn generate_once(
     }
 
     let (text, reasoning_text) = split_reasoning(&raw, registration, params.reasoning_forced_open);
-    loaded.commit_request_anchor();
+    loaded.commit_request_anchor()?;
     progress.complete(finish_reason, generated.len(), None);
     scratch_guard.complete();
     Ok(GenerationResult {

@@ -118,7 +118,10 @@ Phase B writes TQ-encoded full-attn buffers in the snapshot's `full_attn_k`/`ful
 
 - **TQ on linear-attn DeltaNet state.** Already SSM-compressed; further quantization is out of scope for ADR-027.
 - **Continuous batching / paged KV.** ADR-005 territory; this ADR is single-request scope.
-- **TQ on Qwen3-VL text LM.** Qwen3VlText forward path lives behind iter-228b (`cmd_generate_qwen35` returns `qwen3vl_text_forward_pending` 501 today); will inherit ADR-027 once iter-228b lands.
+- **Standalone Qwen3-VL text LM.** The former incomplete engine was retired on
+  2026-08-23. Qwen-family image input now reuses the admitted Qwen text-family
+  engine with an explicitly paired projector, so it inherits that engine's KV
+  contract directly instead of maintaining a parallel cache implementation.
 - **HF2Q_F16_KV qwen35 path.** Gemma 4 has it as a low-cost middle option; qwen35's path goes straight from F32 dense → TQ 8-bit (no intermediate F16 step). Operator-approved scope simplification.
 
 ## 4. Architecture Decisions

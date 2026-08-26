@@ -1,10 +1,231 @@
 # ADR-049: Agentic state reuse (multi-anchor) and Mixed-phase cooperative prefill
 
-- Status: Proposed
+- Status: Accepted; execution in progress (qwen35-family, Gemma4, and
+  DeepSeek4 Lane A proof plus the DeepSeek4 B.1 candidate are documented
+  through rev 64; Qwen3.6, Qwen3.8, Gemma4, and DeepSeek4 lineage/failure
+  gates are green and Lane A family coverage is complete,
+  selected-boundary acceleration and scheduler coalescing were falsified, and
+  the exact block-segmented replacement has passed its deciding spike, and
+  the Qwen rectangular operator-lifecycle correction has exact native-Q5
+  state proof, a completed Q5 fused-route falsifier, and a codec-wide exact
+  Q4x4 implementation with Qwen3.8 quality/lifecycle and Qwen3.6 route proof;
+  its published dependency is pinned while multi-slot, swap, and
+  matched-reference acceptance remain open;
+  the DeepSeek B.1 and Gemma/Qwen B.2 fail-closed hardware authorities are
+  now checked in and model-free green, while their real-artifact cells remain
+  open)
 - Date: 2026-08-22
-- Updated: 2026-08-22 (rev 3, merged) — executor-audit corrections incorporated (payload-ownership rule for `pending_target_hidden` parent-allocation retention; per-model budgets + K-excludes-pending semantics; full-store invalidation on reset/poison/failed-restore; preflight-all-then-mutate restore contract; A.5 rewritten around the LIVE slot-aware MTP/target transactional rollback while H38 still pins `rollback_la_to`; B.0 publisher corrected to `publish_prefill_cohort_after_gate`; registry wording narrowed). Robert's framings integrated: the cross-family benefit directive governs ALL lanes (Lane A parity phases + Lane B §B.2 generalization + future families at bring-up), and every non-committed item is framed as FALSIFIED-with-evidence or OPEN HYPOTHESIS with a named deciding spike — never silently parked scope. Rebased onto `242882e8`.
+- Updated: 2026-08-25 (rev 65, width-invariant Q5 backend published and pinned)
+  — the Qwen implementation lineage begins at `95d618c8`, based on main
+  `32181b61`: explicit per-slot AnchorStore,
+  linear-lineage pruning, fail-atomic restore preflight, exact payload
+  ownership/accounting, terminal publication, A.8 logs/metrics, idle audit,
+  independent reference-model + 17-mutation battery, and Lane C corrections.
+  Qwen3.8 now has BF16 and Q4_K_M width-four SlotAware lineage/cancellation/
+  failure-injection receipts. Rev 20 corrects the Q4 gate's transport fixture:
+  the former 2.7 MiB body was rejected by Axum before model admission, while
+  the token-dense replacement reaches hf2q and returns the exact HTTP 400
+  `context_length_exceeded` contract. The selected-boundary performance sweep remains
+  useful falsification evidence, but source-route review invalidated the
+  candidate's universal equality claim and its runtime integration was
+  removed. Rev 21 adds the required Qwen3.6 shape. Rev 22 adds the distinct
+  Gemma4 hardware proof. Rev 23 adds the distinct DeepSeek4 hardware proof and
+  closes Lane A family coverage. Codec/physical-width coherence is a separate native-format
+  gate; the semantic anchor gate is not multiplied into a codec-by-width
+  Cartesian product. See the execution ledger below. Gemma4 parity in this revision is based on main
+  `2c6bcb61`: the model-neutral state machine is extracted into
+  `src/serve/api/anchor_store.rs`; Gemma retains its family-native sliding-KV
+  payload, image fingerprint matching, independent byte policy, and telemetry.
+  Its model-free gates prove fail-atomic all-layer restore preflight, terminal
+  pending publication, cancellation, lineage rewind, exact owned bytes, and
+  native equality hits. The rev-11 audit also closed a single-request Gemma
+  failure path that reset physical KV after rollback-checkpoint capture failed
+  but retained committed anchor authority; reset now clears retained tokens,
+  committed anchors, and pending capture together, with a model-free
+  regression. The real-artifact Gemma gate is now green at `c0be27fd`; its
+  exact receipt is recorded in §A.6. DeepSeek4
+  parity in rev 8 is based on the generic AnchorStore checkpoint `234fb394`:
+  recovery-tail snapshots are capacity-portable across cache growth, every
+  committed and pending payload is preflighted before the live cache migrates
+  once, and strict-prefix-only anchor matching preserves the family-native
+  live-logit equality path. Its real-artifact receipt is now green and recorded
+  in §A.6.
+  The model-free B.0 Mixed-step spike also passed both cooperative-prefill
+  commit and poison paths without changing any concurrently decoding peer
+  cursor or cache/compressor byte; the exact ownership ledger and test names
+  are recorded in §B.0. B.1 now attempts a FIFO-prefix cooperative prefill
+  capped at 128 rows per lane while retaining the two-window serial fallback
+  and recovery-tail priority. Its model-free cap/workload gates and
+  production-event latency receipts are recorded in §B.1; hardware latency,
+  artifact parity/performance, thermal, and memory acceptance remain open.
+  Rev 18 closes the A.8 model-free observability gap with one fixed-schema,
+  per-attempt outcome event shared by Qwen, Gemma, and DeepSeek. Publication
+  disposition is stamped only when a pending anchor is actually published;
+  transient rollback anchors remain explicitly unpublished. Qwen and Gemma
+  cancellation now prune restored descendants before reuse, all Gemma stable-
+  batch lanes are reset and classified independently after cohort failure,
+  and restore errors are distinguished from cleanup errors. The event reports
+  a slot identifier where the engine owns one, matched-old-tail divergence,
+  actual per-slot peak committed+pending bytes, final pending discard, capture
+  time, and prune disposition. Rev 18's focused model-free tests are green; it
+  made no new real-artifact or speed claim.
+  Rev 19 corrects four source-audit defects in that contract: lifetime peak
+  bytes now live on each `AnchorStore` instead of being read from a family-wide
+  maximum; DeepSeek SlotAware identity follows the slot through its shared
+  execution swap; DeepSeek cancellation retains the pre-restore pending-discard
+  fact and emits one terminal event on restore and reset paths; and a Gemma
+  stable-cohort failure retains prune/discard facts from lanes that completed
+  pruning before a peer failed. Production-callsite regressions cover event
+  cardinality and values. The focused AnchorStore and family restore-failure
+  tests are green after integration; whole-tree and remaining hardware gates
+  stay tied to the final landing commit.
+  Rev 22 also closes a canonical Gemma startup blocker found by the hardware
+  gate: the activation allocator created `argmax_params` as two F32 values,
+  while the loader wrote one U32 and the native operator correctly rejected
+  the mismatched buffer. Production now allocates exactly one U32, a Metal
+  canary pins that contract, and synchronous warmup logs retain the complete
+  error chain. The corrected server mapped every ordinary matrix from the
+  artifact without anonymous matrix storage and completed the full four-slot
+  lineage, cancellation, injected-restore-failure, cold-recovery, and rebuilt-
+  reuse gate. The gate's cancellation expectation is deliberately slot-local:
+  one queued sibling inherits the cancelled owner's checkpoint while siblings
+  admitted to other free slots may prefill cold. Cross-slot checkpoint sharing
+  is the separate A.7 hypothesis, not a hidden Lane A requirement.
+  Rev 23 also closes two canonical DeepSeek artifact-load regressions exposed
+  by that gate. The loader had assumed hash-routed expert IDs might repeat and
+  therefore rejected Q2_K's grouped expert route before reading the artifact;
+  the loaded `tid2eid` payload is now the authority, with a duplicate-safe
+  MV/flattened-down fallback and out-of-range rejection. The served artifact's
+  387,840 hash rows were all unique and in range. Separately, a universal
+  native-storage refactor had accidentally included elementwise F32-consumer
+  state in the zero-copy matrix arm, contradicting the loader's own contract
+  and rejecting Q8_0 compressor APE tensors. Native matrices remain untouched;
+  only quantized elementwise-only state expands once to F32, with no
+  requantization. Complete loader error chains are now preserved at the
+  hot-swap boundary.
+  Rev 24 records the source-coherent worker half of FreeToken-inspired elastic
+  parking: drained Qwen/Gemma/DeepSeek workers can release a checked registered
+  mutable-runtime set while retaining immutable mapped weights, reject work
+  until cold reactivation, and require full eviction when a park reply is
+  indeterminate. This is not yet pool credit or a swap-speed claim: family-
+  helper proof, separately charged manager reservations, fresh-generation
+  publication, and A→B→A hardware comparison remain open. Rev 24 also records
+  the first Qwen B.2 hardware falsifier: the gate correctly rejected its own
+  uncalibrated 128-row sample and buffered trace log before any performance
+  decision. The corrected gate subtracts the measured 36-token rendered
+  envelope and proves a live one-transaction trace before thermal settling.
+  Rev 25 records the resulting valid seven-trial measurement without promoting
+  it: the point estimate supports the opportunity, but its lower fixed-share
+  confidence bound misses the pre-registered confirmation threshold by one
+  percentage point. The only permitted precision extension is now fixed at 21
+  trials per width with identical widths, ordering, settings, and decision
+  thresholds.
+  Rev 26 records that extension as terminal confirmation. Qwen35-family
+  implementation therefore opens at a rectangular, slot-aware target batch:
+  compatible equal-row lanes retain one aggregate activation matrix through
+  dense/MoE projections (including one `mm_id` dispatch), while attention,
+  DeltaNet state, rollback, checkpoint publication, and final logits remain
+  explicitly lane-mapped. Layer-level batched-vs-scalar state/output parity is
+  the next falsifier and precedes scheduler publication.
+  Rev 27 records the first layer spike rather than promoting it. Rectangular
+  recurrent DeltaNet executed four 128-row sequences through the native
+  `n_tokens × n_seqs` axes and matched four scalar forwards' output, recurrent
+  state, and convolution state bit-for-bit. The sparse reordered physical-slot
+  fixture left an unselected warm peer unchanged, and the new path rejects the
+  unsafe chunk-scan experiment before mutation because that would change the
+  scalar route. The first full-attention draft
+  was falsified by source-route review before scheduler integration: it widened
+  the byte-packed TQ decode-vector dispatcher, while a production 128-row
+  scalar prefill uses the BF16 tiled prefill dispatcher over freshly projected
+  K/V. That draft was removed. The revised spike preserves the tiled route:
+  aggregate projections remain one row matrix, existing per-lane permutations
+  stage `[batch, heads, rows, head_dim]`, one native tiled dispatch uses its
+  existing batch axis, and banked TQ writes remain explicit. Resumed cohorts
+  additionally require a shared cursor, K length, capacity, and scalar route;
+  incompatible lanes retain the scalar path rather than changing arithmetic
+  or leaking cache state. The replacement tiled-attention bridge passed the
+  measured-shape `2 × 128` gate with every F32 output bit identical to two
+  scalar tiled forwards.
+  Rev 28 closes the full-attention layer falsifier at widths two and four,
+  both with 128 distinct rows per lane and sparse reordered physical slots.
+  Aggregate RMSNorm/Q/K/V/gate/output projections, one native tiled-attention
+  batch, and banked TQ writes produced bit-identical scalar outputs, packed K/V
+  bytes, norm bits, and cursors; unselected slots remained unchanged. Duplicate,
+  out-of-range, warm, and under-capacity cohorts reject before any dispatch,
+  commit, cursor update, or cache-byte mutation. The next gate moves one level
+  up: complete dense and MoE target forwards, output-head/MTP state, and the
+  all-lane transaction/publication contract.
+  Rev 29 closes the complete model-free target falsifier. A dedicated fresh,
+  text-only rectangular entry keeps embeddings, residuals, dense/MoE FFNs,
+  and native artifact-weight representations on one sequence-major
+  `batch × 128` row matrix, while only the proven full-attention and DeltaNet
+  helpers map lane state. Widths two and four matched independent scalar dense
+  forwards bit-for-bit for final logits, every normalized `h_nextn` row,
+  complete cursor-visible cache snapshots, and one subsequent ordinary decode
+  token. The width-four quantized-MoE fixture passed the same comparison and
+  retained exactly three aggregate ID-routed projection calls per layer—not
+  per lane or expert. Sparse reordered slots and a warm unselected fifth slot
+  remained exact. Every selected slot is captured before GPU work; any target
+  or output-head error rewinds the whole cohort's cursors and DeltaNet parity.
+  Admission rejects recovery capture, the single-sequence chunk-scan
+  experiment, non-TQ full-attention state, and host-loop F32 MoE before cache
+  mutation. This is correctness evidence, not a shipped scheduler or speed
+  claim. The next gate is worker admission plus Qwen3.8 lane-local MTP,
+  all-lane publication/failure injection, and exact-artifact performance.
+  Rev 30 corrects the admitted row shape from one synthetic 128-row point to
+  the scalar tiled-prefill range `16..=128`. The deciding production trace has
+  a 121-token stable prefix followed by a seven-token tail inside the 128-row
+  scheduler allowance; admitting only 128 rows would therefore miss the
+  measured agentic workload. Four sparse, reordered 121-row lanes now match
+  independent scalar target forwards bit-for-bit for logits, every normalized
+  `h_nextn` row, all live-prefix cache bytes, and one-token continuation. Rows
+  below 16 remain scalar because the authoritative D256 fresh-attention route
+  changes below that threshold. The scheduler must end a cohort at the common
+  stable boundary, publish its checkpoint transactionally, and leave the
+  residual tail to the ordinary scalar route.
+  Rev 31 lands that worker-owned transaction as a model-free implementation
+  candidate. The immutable worker-lifetime `HF2Q_CROSS_SLOT_ADMIT` policy now
+  admits the largest already-runnable compatible FIFO prefix at widths four,
+  three, then two; it never waits for another lane or skips an incompatible
+  earlier request. Admission is limited to cold text lanes with the same
+  `16..=128` stable boundary, identical target/MTP route, cold target and MTP
+  cursors, and all-lane K+1 checkpoint reservations that fit the aggregate
+  anchor budget before mutation. One rectangular target transaction retains
+  aggregate dense/MoE projections; Qwen3.8 AUTO performs the existing exact
+  MTP catch-up lane by lane under the same supervisor lease. A catch-up failure
+  rewinds every target and MTP slot, marks every retry state speculation-
+  unavailable, and replays one ordinary target cohort without hidden capture.
+  The worker validates every checkpoint, stages every pending anchor, rechecks
+  cancellation and FIFO ownership, and only then commits physical state and
+  advances scheduler ledgers. Any validation, staging, cancellation, or
+  injected post-checkpoint failure discards the complete pending set and rolls
+  every selected slot back. A cancellation terminates only closed lanes and
+  reinstalls open peers cold without ledger advance; validation, staging, and
+  injected failures fail closed after reset. The canonical Qwen3.6 launcher
+  enables the policy by default and the Qwen3.8 launcher inherits it; setting
+  the switch to zero before worker startup is the matched serial-control path.
+
+  Focused source gates at this revision are green: 38 bounded-prefill/
+  watchdog tests, 17 tests selected by the rectangular filter (one separate
+  vision hardware test ignored), seven direct cohort-transaction tests, the
+  declared-failpoint wiring test, locked
+  `cargo check`, launcher syntax validation, and `git diff --check`. The
+  synthetic D256 state executor proves exact two-lane 121-row checkpoints,
+  all-lane retry rollback, an untouched unselected peer, capture-disabled
+  Qwen3.6 parity, and rollback after the post-checkpoint failpoint. Its native
+  D256 MTP fixture also proves that a recoverable catch-up failure rewinds both
+  lanes and performs exactly one ordinary replay matching the ordinary target,
+  while a nested typed command-buffer failure preserves its cause, rewinds all
+  lanes, performs zero replay, and fans out every owned cohort reply once. The
+  published event distinguishes `NotRequested`, `Succeeded`, and
+  `OrdinaryReplay`, and the FIFO canary prevents skipping an incompatible or
+  closed middle lane. These are model-free correctness receipts, not an exact-
+  artifact, serving-quality, or performance claim. Direct Qwen3.6/Qwen3.8
+  OFF/ON hardware gates remain the next falsifier.
 - Owners: hf2q serving engine (execution: the active qwen35/qwen38 serving-lane session; plan authored by the FreeToken research session)
-- Code pins: hf2q `242882e8` (= origin/main at this revision), mlx-native `0.11.2`. Anchors were authored at `815bd48d`; every correction-touched anchor was re-verified at `242882e8`. Re-verify anchors after any pull before editing.
+- Code pins: planning review at hf2q `242882e8`; rev-6 execution based on
+  merged main `32181b61`; current execution pins mlx-native `0.15.0`. Anchors were authored at
+  `815bd48d`; every correction-touched anchor was re-verified before editing.
 - Provenance: full paper+code study of FreeToken (arXiv 2608.16157, "FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution") mapped onto hf2q/mlx-native by a nine-agent research swarm, then adversarially reviewed by two independent external models (Kimi K3 via opencode; gpt-5.6-sol via codex, 516k-token source-grounded review). Both reviews' MUST-FIX items are incorporated; the gpt-5.6-sol review found and this ADR closes a stale-KV lineage coherence bug in the original draft (§A.2).
 
 ## Context
@@ -14,7 +235,12 @@ FreeToken serves frontier MoE models on consumer discrete-GPU PCs by treating ho
 Most of FreeToken's bandwidth machinery does not transfer to Apple Silicon unified memory (§Rejections). What does transfer lands exactly on hf2q's two open sore spots:
 
 1. **Same-slot context edits go cold.** Agent harnesses (opencode, Claude Code) rewrite context mid-conversation — strip thinking blocks, collapse tool output. hf2q keeps exactly one anchor per slot (`prompt_anchors[slot] = Some(...)`, install at src/serve/api/engine.rs:16925), so any divergence inside retained tokens that predates the single anchor recomputes the whole prefix. hf2q's *matching* is already ahead of FreeToken's (template-aware cue-less re-render, strict-token-prefix acceptance, src/serve/api/handlers.rs:1905-1938, vision-aware via `expand_stable_prompt_boundary`); its checkpoint *depth* is 1.
-2. **DeepSeek4 Mixed-phase prefill never aggregates rows.** The landed cooperative prefill cohort (protected runs 1.2537×/1.2816×) is bypassed whenever a decode is runnable: `max_prefill_windows: has_runnable_decode.then_some(DEEPSEEK4_INTERACTIVE_PREFILL_WINDOWS /* = 2 */)` (src/serve/api/engine.rs:7857, 7885) and any `Some` cap skips cohort planning (engine.rs:9716-9731). The 35 s tool-result wave failures accrue in exactly this Mixed phase, where each serial 256-token slice re-pays the fixed cost F ≈ 1.05–1.4 s (one full expert-weight stream, ~96 GiB at ~90–98 GB/s effective mm_id rate; marginal cost c ≈ 1.17 ms/row).
+2. **DeepSeek4 Mixed-phase prefill did not aggregate rows before B.1.** The
+   prior path bypassed the landed cooperative cohort whenever decode was
+   runnable, so each serial 256-token slice re-paid the measured fixed cost.
+   B.1 now runs decode first and then attempts a FIFO-prefix cooperative cohort
+   capped at 128 rows per lane; its real-artifact speed, parity, SSE-tail,
+   thermal, and memory contracts remain open.
 
 Key enabling facts at HEAD:
 - The per-slot anchor payload `HybridKvSlotAnchor` (src/inference/models/qwen35/kv_cache.rs:996-1002) is cursors + DeltaNet state only — **zero KV bytes copied** (full-attn K/V is append-only; the slot's own KV is the pin). Snapshot and restore are **already slot-indexed** (`snapshot_slot_anchor` kv_cache.rs:1532, `restore_slot_anchor` :1607) with the cursor proof `live_cursor >= saved_cursor` (:1651-1656) and per-slot ping-pong parity re-canonicalization (:1694).
@@ -26,13 +252,13 @@ Key enabling facts at HEAD:
 
 Three lanes, in this order. Lane A is the primary value; Lane B is gated on a coherence spike; Lane C ships with Lane A's first PR.
 
-**Scope directive (Robert, 2026-08-22): every lever this ADR ships is a cross-family benefit — all supported models, all supported families share it. Single-model or single-family shipments are milestones, never the deliverable, and the ADR is not complete while any supported family lacks a shipped lever it can benefit from.** For Lane A: the first implementation lands on the qwen35-family engine (one engine serving both Qwen3.6-35B-A3B and Qwen3.8-27B); gemma4 and deepseek4 parity are REQUIRED phases, not optional follow-ons; per-family gates run on the artifact each lane actually serves. For Lane B: deepseek4 is the first implementation and §B.2 carries the required family-generalization evaluation. The directive also binds future families: any family gaining serve support later (e.g. Qwen3-VL if/when ADR-041's engine seam lands) must adopt these levers as part of its engine bring-up, not as a deferred extra.
+**Scope directive (Robert, 2026-08-22): every lever this ADR ships is a cross-family benefit — all supported models, all supported families share it. Single-model or single-family shipments are milestones, never the deliverable, and the ADR is not complete while any supported family lacks a shipped lever it can benefit from.** For Lane A: the first implementation lands on the qwen35-family engine (one engine serving both Qwen3.6-35B-A3B and Qwen3.8-27B); gemma4 and deepseek4 parity are REQUIRED phases, not optional follow-ons; per-family gates run on the artifact each lane actually serves. For Lane B: deepseek4 is the first implementation and §B.2 carries the required family-generalization evaluation. The directive also binds future families: any family gaining serve support later must adopt these levers as part of its engine bring-up, not as a deferred extra.
 
 **Not in committed scope, but an OPEN HYPOTHESIS with a deciding spike** (framing per Robert 2026-08-22: these are questions needing data, not parked scope): raising `MAX_COOPERATIVE_PREFILL_ROWS` (the "Lane 2b" of the draft). Hypothesis: a larger aggregate row budget still pays in pure-prefill waves without breaching the memory envelope. Data against so far: ADR-042 records a 4,096-row OOM (ADR-042:59, :503) and a later 4,096/cold-cooperative failure (:2069); projected gain ~1.15× confined to the pure-prefill wave; receipt verifiers/artifact tests encode the exact 2,048-row shapes. Deciding spike: Lane B's wave-phase profiling (does F-dominance survive in pure-prefill waves once Mixed cohorts land?) plus a fresh transient high-water measurement at 4,096 beside the 100 GiB artifact under the current single-layer-CB cooperative structure. Outcome: implement, or falsify and record.
 
 ### Lane A — Multi-anchor slot-local checkpoints (qwen35 first)
 
-**Contract (per gpt-5.6-sol M3, smaller than the draft's):** one validated current-turn boundary per *successfully committed* request, accumulated over observed turns into a per-slot anchor store. No sorted-boundary-set machinery, no seeding of historical turns from a cold transcript (that would require handler/template work to render and validate multiple message prefixes — explicitly out of scope). The handler already computes exactly one boundary per request (handlers.rs:1905-1938 → `SamplingParams` → `Qwen35PrefillState`); the engine change is to *accumulate* instead of overwrite. Default-on: the workload is 100% agentic, capture is ~2–4 ms at a natural stop, and depth-4 at shipping `max_slots=4` costs ≈ 1.0 GiB (ceiling: 2.0 GiB at 8 slots) against ~25 GiB headroom in the 48 GiB KV grant.
+**Contract (per gpt-5.6-sol M3, smaller than the draft's):** one validated current-turn boundary per *successfully committed* request, accumulated over observed turns into a per-slot anchor store. No sorted-boundary-set machinery, no seeding of historical turns from a cold transcript (that would require handler/template work to render and validate multiple message prefixes — explicitly out of scope). The handler already computes exactly one boundary per request (handlers.rs:1905-1938 → `SamplingParams` → `Qwen35PrefillState`); the engine change is to *accumulate* instead of overwrite. Default-on: the workload is 100% agentic, host capture is a few milliseconds, selected-row capture removes the extra internal stop when route equivalence is proven, and the immutable aggregate grant derives actual depth from the artifact-and-slot costs in A.4 instead of assuming one universal byte figure.
 
 **A.1 — AnchorStore.** Replace the single `Option<Qwen35PromptAnchor>` (struct at engine.rs:16865-16871) with an explicit per-slot store, not a raw Vec:
 
@@ -58,23 +284,180 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 **A.4 — Eviction & budget.**
 - Eviction: positional keep-newest-K (K default 4; anchors form a nested prefix chain, so LRU-by-restore is actively wrong — a twice-edited turn would evict the deeper anchor about to be needed; both reviewers concurred). Descendant invalidation (A.2) runs before any eviction policy matters. One refinement permitted later, telemetry-first: reserve slot 0 of the list for the oldest/system boundary, K−1 for newest.
 - **Payload ownership rule (executor-audit finding):** every element of an anchor's payload must be host-owned or a dedicated right-sized allocation — NEVER a view/clone retaining a larger transient allocation. Today `pending_target_hidden` is an `MlxBuffer` captured by cloning a view whose parent is the prefill residual allocation (engine_qwen35.rs:3406, capture sites :3972/:4759): the logical row is ~20 KiB, but the clone retains the ~40 MiB (2,048-row) / ~80 MiB (4,096-row) parent Metal allocation — one per anchor. Capture must copy the row into a dedicated `[1, H]` allocation or host memory. Required regression: after capture, assert no chunk-sized parent allocation remains retained by any anchor (allocation-accounting check).
-- Budget: `HybridKvSlotAnchor::total_bytes()` (kv_cache.rs:1004) undercounts — it omits prompt tokens, the vocab-sized `prefill_logits`, and the spec hidden row owned by `Qwen35PromptAnchor` (engine.rs:16865-16871, spec boundary struct engine_qwen35.rs:3404-3407). Account **all owned payload** as a separate reclaimable `anchor_owned_bytes` line surfaced to admission — NOT added to scheduler high-water, which is deliberately monotonic because Metal pages are never reclaimed (src/serve/scheduler.rs:1047, :1218); host-owned evictable bytes charged there would never return. **K counts committed anchors only; the preflight charges K committed + 1 pending.** Preflight fail-closed: a capture that would exceed the anchor budget is skipped (documented scope gap), never partially taken.
-- Per-model anchor cost (budget is byte-denominated; `K_effective = min(4, floor(slot_anchor_budget / anchor_bytes(model)))` — computed from allocation code, never doc comments):
+- Budget: `HybridKvSlotAnchor::total_bytes()` (kv_cache.rs:1004) undercounts — it omits prompt tokens, the vocab-sized `prefill_logits`, the spec hidden row owned by `Qwen35PromptAnchor` (engine.rs:16865-16871, spec boundary struct engine_qwen35.rs:3404-3407), and the store's retained `Vec` control allocation. Account **all owned bytes** as a separate reclaimable `anchor_owned_bytes` line surfaced to admission — NOT added to scheduler high-water, which is deliberately monotonic allocation accounting and is not proof that overwrite-backed Metal pages are demand-resident. Host-owned evictable bytes charged there would never return. **K counts committed anchors only; every capture preflight charges the slot's committed payload plus one pending payload against the live aggregate.** Preflight fail-closed: a capture that would exceed the immutable worker-lifetime anchor grant is skipped, never partially taken.
+- The budget is aggregate across all slots, not `N × a per-slot constant`. `K_effective = min(4, floor(aggregate_budget / (N × anchor_bytes(model))))` is committed-depth capacity. The separate `simultaneous_pending_capacity_slots = floor((aggregate_budget - N × K_effective × anchor_bytes) / anchor_bytes)` makes concurrent pending availability explicit. If that value is below N, later simultaneous captures may skip fail-closed even though every slot can retain K committed anchors. Both values, N, aggregate owned bytes, peak bytes, skips, and the immutable grant are production telemetry; no N=16 receipt may claim full depth or full pending concurrency without those gauges proving it.
+- Per-model anchor cost (computed from allocation code, never doc comments):
 
-  | Model | recurrent+conv state | ≈ total w/ logits+tokens+hidden | K=4 × 4 slots | K=4 × 8 slots |
-  |---|---|---|---|---|
-  | Qwen3.6-35B-A3B (30 DeltaNet layers) | 62.8 MiB | ≈63.5 MiB | ≈1.02 GiB | ≈2.03 GiB |
-  | Qwen3.8-27B (48 layers) | 149.6 MiB | ≈150.3 MiB | ≈2.35 GiB | ≈4.70 GiB |
+  | Model | recurrent+conv state | ≈ total w/ logits+tokens+hidden | K=4 × 4 slots | K=4 × 8 slots | K=4 × 16 slots |
+  |---|---|---|---|---|---|
+  | Qwen3.6-35B-A3B (30 DeltaNet layers) | 62.8 MiB | ≈63.5 MiB | ≈1.02 GiB | ≈2.03 GiB | ≈4.06 GiB |
+  | Qwen3.8-27B (48 layers) | 149.6 MiB | ≈150.3 MiB | ≈2.35 GiB | ≈4.70 GiB | ≈9.39 GiB |
 
-  Gemma4/DeepSeek4 rows are computed the same way when their parity phases open.
-- Idle conservation invariant (strict equality, deliberately stricter than FreeToken's own `<=` on its GDN pool): at scheduler idle, per slot and in aggregate, `live cursor bytes + retained prefix accounting + anchor_owned_bytes + free = grant`. Run it in the same idle hook style FreeToken audits use; it is the audit that would have caught the repo's stale `n_v_heads=8` byte-math comments years early.
+  DeepSeek4's mature-boundary snapshot owns 49,299,456 bytes (47.015625 MiB)
+  before token identity and small control allocations: 43 × 128 × 512 BF16
+  circular-window rows, 21 ratio-4 layers of main+indexer F32 compressor state,
+  and 20 ratio-128 layers of main F32 compressor state. Prompt identity adds
+  exactly `4 × token_count` bytes per anchor. Thus K=4 base snapshot payload is
+  ≈0.735/1.469/2.938 GiB at N=4/8/16; at a 100K-token boundary those become
+  ≈0.741/1.481/2.962 GiB. Gemma4 uses the same exact family-owned accounting
+  discipline rather than this DeepSeek-specific formula.
+- Idle conservation invariant: at scheduler idle, first prove every physical target cursor equals its retained ledger and every retained spec boundary has matching target+MTP cursors. Then audit the scheduler-accounted cursor bytes, monotonic allocation slack, KV free bytes, exact host-owned anchor bytes, and anchor free bytes against their two grants. The equalities are not substitutes for the cursor comparisons.
 
-**A.5 — Speculation interplay (LIVE requirements — corrected after the executor audit; verified at `242882e8`).** Slot-aware speculative rollback is live on main via its own transactional functions — `rollback_slot_mtp_transaction` (engine_qwen35.rs:4142) and `rollback_slot_target_transaction` (:4173), with fail-closed slot reset if a rollback itself fails (:4197-4226). H38 (engine.rs:44835-44897) still pins `rollback_la_to` — and with it the per-token DeltaNet capture arena — out of the slot-aware worker. The rules below bind NOW and are co-designed with the speculation lane:
+**A.5 — Speculation interplay (LIVE requirements — corrected after the executor audit and selected-boundary spike).** Slot-aware speculative rollback is live via its own transactional functions — `rollback_slot_mtp_transaction` and `rollback_slot_target_transaction`, with fail-closed slot reset if rollback itself fails. H38 still pins `rollback_la_to` out of the slot-aware worker; that does not prohibit a separately proven stable-boundary capture using the same grow-only storage. The rules below bind NOW and are co-designed with the speculation lane:
 1. Anchor capture and restore must be sequenced strictly outside an open MTP/target rollback transaction — never observe mid-transaction cursors. Prefill-time anchors copy bytes OUT of live buffers and are safe once that sequencing holds.
-2. After any restore, consumers must re-validate that target AND MTP cursors both equal the anchor's `token_count` — the coherence marker documented on `Qwen35SpecPrefixBoundary` itself (engine_qwen35.rs:3401-3402).
-3. A decode-time anchor (not in this ADR's scope) may only snapshot after accept/rollback settles — never from optimistic post-verify state; any capture sharing the LA arena must extract its rows before `clear_la_capture`/re-arm. The arena's true size is ≈1.96 GiB at the 32-token SerialFifo window (30 layers × 67 MiB), 4× the stale in-code comment — Lane A does NOT use this arena (boundary capture reads live state) and MUST NOT replicate it per slot.
+2. After any restore, the target cursor must equal the anchor's `token_count`.
+   If the restored anchor carries `Qwen35SpecPrefixBoundary`, the MTP cursor
+   must also equal that token count before speculation can resume. A
+   target-only anchor may retain an independent MTP cursor only while
+   speculation is disabled until exact catch-up or reset; target/MTP equality
+   is not an unconditional property of every anchor.
+3. A decode-time anchor (not in this ADR's scope) may only snapshot after accept/rollback settles — never from optimistic post-verify state; any capture sharing the LA storage must extract its rows before `clear_la_capture`/re-arm.
+4. A stable prompt boundary inside a larger scheduler slice must preserve the
+   two authoritative segments' exact operator shapes, cache representations,
+   route selectors, output-head rows, and MTP batches. One enclosing forward
+   is rejected: source review produced concrete counterexamples at prefix/
+   suffix widths 33/1 and 33/8, cold TQ cache, recurrent/chunk DeltaNet width
+   65/128, and MoE width 33/4 with `top_k=8`. A sampled output-hash sweep cannot
+   prove equality when those operation routes differ. The smaller scheduler-
+   coalescing spike invoked the two existing exact forwards within one bounded
+   advance and was falsified on hardware: 15/15 normalized responses matched,
+   while OFF-to-ON medians at suffix widths 0/2/4/8/12 changed by
+   +0.18%/+1.18%/+0.69%/-0.18%/-0.57%. It did not touch meaningful cost and
+   its runtime code was removed. The active hypothesis is a block-segmented
+   per-layer API with separate prefix/suffix state and terminal boundary-state
+   copies; every operator must still receive its control-path shape and cache
+   representation. It may not land without byte-level state, logits,
+   next-token, failure-atomicity, multi-slot, and performance gates.
+
+The full 32-token SerialFifo capture window is ≈1.96 GiB for the documented
+Qwen3.6 shape (30 layers × ≈67 MiB), four times the deleted stale comment.
+Lane A does not allocate that window per slot: the authoritative split forward
+already ends at the stable boundary and snapshots its terminal state. A future
+segmented implementation may use a one-row terminal-copy buffer, but the
+falsified enclosing-forward path cannot justify it. Physical storage may
+remain larger after an earlier legitimate use; provenance and active depth,
+not allocation capacity, define snapshot authority.
 
 **A.6 — Family parity (REQUIRED phases per the scope directive, same invariants):** gemma4 (`Gemma4PromptAnchor` is structurally identical; retire serial-path `live_prefix_tokens` special-casing where subsumed), then deepseek4 (its two-anchor pending/committed pair generalizes to the store; wire `Deepseek4CacheSnapshot::resident_bytes()` — currently zero callers — into the same accounting). The ADR does not reach Implemented until every supported serving family carries the anchor store.
+
+Gemma4 model-free milestone (rev 7): COMPLETE. The single
+`Option<Gemma4PromptAnchor>` is replaced by `AnchorStore<Gemma4PromptAnchor>`
+without changing Gemma's existing dense/MoE execution or mixed-prefill row
+aggregation. Checkpoints remain the family-native `GemmaHybridSlotAnchor` plus
+the rendered token prefix and vision fingerprint. Restore now preflights every
+layer, optional buffer, destination span, and cursor before the first write;
+single- and multi-slot failures clear the whole store and hard-reset rather
+than trying a shallower checkpoint. Captures stage at the stable boundary but
+remain invisible until terminal retained-token publication; cancellation
+discards pending state while preserving only physically reachable committed
+ancestors. Production metrics expose capture cost/skips, hit/miss/tokens saved,
+descendant pruning, eviction/cancellation/lineage clears, per-slot and aggregate
+peak bytes, configured slots, and the immutable aggregate grant.
+
+Proof at base `2c6bcb61` (model-free/synthetic, no model artifact):
+`cargo check --locked --bin hf2q --no-default-features`; 24/24 focused generic
+and Qwen wrapper tests via `cargo test --locked --bin hf2q anchor_store
+--no-default-features`; and 5/5 Gemma tests via `cargo test --locked --bin hf2q
+gemma_anchor --no-default-features`. The battery includes A→B→C rewind and old
+descendant rejection, request cancellation with an unchanged committed set,
+failed-restore full-store invalidation, exact family-owned byte conservation,
+pending invisibility until terminal publication, image-fingerprint equality,
+and a two-layer late-layout fault proving no earlier byte or cursor mutates
+before all-layer preflight succeeds.
+
+Gemma4 real-model milestone (rev 22): COMPLETE. The canonical four-slot server
+ran the 20,576,631,488-byte
+`gemma4-ara-2pass-APEX-Q5_K_M.gguf` on an M5 Max from the source tree committed
+as `c0be27fd`. The artifact is the 30-layer, 128-expert/8-active MoE shape and
+reports a Q6_K tied embedding/output head. Every ordinary matrix remained
+file-backed (20,560,475,768 bytes, zero ordinary anonymous matrix bytes); the
+only named anonymous state was 337,920 bytes of derived router data. The
+canonical server reached synchronous warmup in 711 ms after the argmax-params
+dtype correction described in the revision ledger above.
+
+The reusable family-neutral gate
+`scripts/test_family_slot_anchor_lineage.sh` passed A→B→C, native equality,
+rewind to X, stale-C rejection, four overlapping clients, semantic SSE
+cancellation, one-shot failed restore (HTTP 500), hard-reset cold recovery,
+and rebuilt semantic-equal reuse. It recorded 10 restore hits, one classified
+restore miss, four descendant prunes, one cancellation, 0 cached tokens after
+the fault, and 58 cached tokens after rebuilding. Effective committed depth,
+simultaneous pending capacity, and configured slots were all four; the exact
+1,265,327,240-byte aggregate peak stayed within the 8-GiB grant. One sibling
+inherited the cancelled owner's slot-local boundary and two independently
+admitted siblings completed cold, matching Lane A's slot-local contract. The
+summary is
+`/opt/hf2q-evidence/gemma4-anchor-rev22-spike-v2/summary.json` (SHA-256
+`428df87be50816cffbd5d0d755ca1964d9f27940269039bc11cd4f33f61da2b3`).
+Dense/MoE execution variants share this state engine and payload contract;
+their model-free coverage remains authoritative rather than multiplying the
+semantic gate into another artifact Cartesian product.
+
+DeepSeek4 model-free milestone (rev 8): COMPLETE. Its previous single
+committed plus single pending recovery pair is now the same model-neutral
+`AnchorStore<Deepseek4PromptAnchor>` state machine, while the payload and match
+rules remain family-native. Anchors own compact circular-window tails and
+recurrent compressor state, deliberately do not own logits, and therefore
+match only strict prompt prefixes; exact live-prompt equality still uses the
+live ledger and live logits without replay. Selection is deepest-surviving
+linear lineage. Restoring A prunes every deeper anchor before divergent writes.
+Cold reset, poison, or any failed restore clears the entire store before a hard
+reset; restore itself validates every layer, shape, dtype, destination span,
+and cursor before the first copy or cursor mutation.
+
+Cache growth no longer rewrites one privileged snapshot. Every committed and
+pending snapshot is preflighted against the source and destination plans, the
+live cache migrates once, and immutable snapshots from any prefix-compatible
+growth ancestor remain restorable. This avoids both stale anchors and an
+O(anchor-count) device-copy tax during session growth. Exact aggregate
+accounting charges the preallocated store controls, every committed and pending
+snapshot allocation, cloned cache-plan controls, and `4 × prompt_tokens`; an
+immutable worker grant covers all configured stores and reports effective K
+plus simultaneous-pending capacity. DeepSeek4 has no live speculative-prefix
+payload at this revision, so the family adds no parallel speculative boundary
+state; any future DeepSeek speculation must extend this same anchor payload.
+
+Proof on base `234fb394` (model-free/synthetic, no model artifact): 20/20
+DeepSeek cache tests, including a late-layer restore fault that leaves every
+earlier byte and cursor unchanged and multi-anchor capacity growth; 19/19
+DeepSeek serving tests, including A→B→C rewind, pending invisibility,
+cancellation, reset/poison invalidation, failed-restore hard-reset+clear,
+two-slot family isolation, native equality, and aggregate-byte conservation;
+and `cargo check --locked --all-targets --no-default-features`.
+
+DeepSeek4 real-model milestone (rev 23): COMPLETE. The canonical four-slot
+server ran the 107,431,343,168-byte
+`DeepSeek-V4-Flash-0731-agentic-q2.gguf` (SHA-256
+`936a97e68fe1a04185df149fcb833c3e1462ca5923fbf4ef3e7296bd78c7ad0d`)
+on an M5 Max. The artifact is the
+43-layer, 256-expert/6-active DeepSeek-V4-Flash-0731 shape. All 387,840 rows
+across its three `tid2eid` tables contained six distinct, in-range expert IDs,
+so the validated Q2_K grouped expert route was used; repeat-bearing tables
+remain exact through the MV/flattened-down fallback. Weight residency was
+107,430,170,972 logical bytes: 107,424,498,012 file-backed bytes and only
+5,672,960 anonymous bytes for quantized elementwise F32-consumer state, across
+two mapped segments. Matrix weights were neither dequantized nor requantized.
+After the independently tracked identity scan, residency setup took 141 ms and
+synchronous warmup took 15.147 s.
+
+The family-neutral product gate passed unary/SSE strict-prefix reuse, native
+equality, A→B→C and rewind, stale-descendant rejection, four simultaneous
+clients, semantic cancellation, injected restore failure with HTTP 500,
+hard-reset cold recovery, and rebuilt semantic-equal reuse. It recorded 426
+cached tokens from A to B, 441 on equality, 12 restore hits, four classified
+misses, four descendant prunes, one cancellation, zero cached tokens after the
+fault, and 37 after rebuilding. Configured slots, effective committed depth,
+and simultaneous pending capacity were all four; the 89,380,036-byte aggregate
+peak stayed within the 4,458,690,969-byte grant. The cold 434-token prompt
+prefilled at 342.17 tokens/s and decoded at 34.60 tokens/s on this exact
+artifact and run. The summary is
+`/opt/hf2q-evidence/deepseek4-anchor-rev23-spike/summary.json` (SHA-256
+`429b9b4088fe124b1299d016128802fcbce495e6b10328da6c8299d9ca44e276`);
+the runtime binary SHA-256 was
+`787729306ac15ee4bc29660aa4e17cbd02325a46876f7521d0091d02123f1aa2`.
+This closes Lane A's supported-family hardware cell. DeepSeek cache-growth
+capacity remains covered by its separate cache gate rather than multiplying
+this semantic-state receipt.
 
 **A.7 — Open hypotheses: the spikes that decide them** (not "deferred" — each is a live question whose data collection is already scheduled or cheap):
 - *Cross-slot / restart-surviving registry tier*. Hypothesis: foreign-slot landings and restart warm-up are frequent enough on the real workload to justify a shared CoW prefix store. Deciding data: A.8 telemetry — slot-affinity foreign-landing counts and restart-cold counts over production use. If confirmed → its own ADR (needs a slot-parameterized `restore_partial` — the current one is copy-owning and rewrites every sequence cursor, kv_cache.rs:3435, :3493 — plus an ownership answer to the `b44b92ed` tenant-isolation pin; FreeToken's donate-not-copy/CoW/dual-currency eviction is that ADR's design vocabulary). Meanwhile the SerialFifo `LcpRegistry` + disk hydrate remains the restart-hydrate tier.
@@ -82,13 +465,44 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 - *Decode-time anchors*. Hypothesis: divergence points inside generated spans (not just prompt boundaries) carry meaningful reuse. Deciding data: the same histograms, split by prompt-span vs generated-span divergence. If confirmed → A.5 rule 3 already defines the safe capture point.
 - *SerialFifo recovery-arena reclaim* (~1.96 GiB). Hypothesis: once the anchor store lands, the 32-token recovery-capture path is redundant for boundary edits. Deciding data: post-Phase-2 recovery-capture hit rate vs anchor coverage. If confirmed → cap or retire the arena in a follow-on.
 
-**A.8 — Telemetry before policy** (ships with A.1): per restore attempt — hit depth, divergence distance, tokens saved, descendant-prune count, eviction reason, capture ms, peak committed+pending bytes. This data decides every deferred refinement above.
+**A.8 — Telemetry before policy** (ships with A.1): per restore attempt —
+family, slot when applicable, cause, terminal outcome, attempted/hit depth,
+matched-old-tail divergence position and distance, tokens saved, descendant-
+prune count, whether pending state was actually discarded, publication/eviction
+disposition, capture ms, and true per-slot peak committed+pending bytes. One
+event is emitted only after restore+prune succeeds or fail-closed cleanup
+finishes. A stable Gemma cohort emits one independently classified event per
+attempted lane; one lane's reset failure cannot relabel or suppress its peers.
+No-match and unpublished transient-rollback cases use explicit non-applicable
+fields instead of inventing a publication disposition. This data decides every
+open policy refinement above.
 
 **Lane A gates (all fail-closed):**
-1. Byte-identity: anchor-restore-plus-suffix-prefill output vs cold full prefill, at every anchor depth, at both transaction widths {2,048 multi-slot, 4,096 single-slot}, boundary at slice edge and mid-slice-clamped.
+1. Byte-identity: the model-free battery compares anchor-restore-plus-suffix
+   prefill with cold full prefill at every anchor depth and at slice-edge plus
+   mid-slice boundaries. Real-model gates exercise each distinct transaction
+   route once; codecs and slot widths that share that state route are covered
+   by the native-format/physical-width matrix rather than duplicated here.
 2. The A.2 lineage regression (A→B→C / rewind / old-C-must-not-restore).
 3. Cancellation: cancel mid-prefill after ≥2 anchors installed; committed list must equal the pre-request list.
-4. A **new** SlotAware divergence gate script: explicit `--scheduler inflight-batched --max-slots 4`, truly concurrent clients, covering equality hits, divergent rewrites, cancellation, failed prefill, speculative-state carry, stale-descendant rejection — and it must exit non-zero on any miss. (`bench_lcp_resume_speedup.sh` is NOT a gate for this feature: it drives the stride registry, issues its "4-worker" load sequentially, does not select the slot-aware scheduler, and exits 0 on a failed speedup — bench_lcp_resume_speedup.sh:303, :442. `test_agentic_cache_lifecycle.sh` covers cancellation/isolation, not multi-depth lineage; keep it, extend nothing into it.)
+4. `scripts/test_qwen35_slot_anchor_divergence.sh`: explicit
+   `--scheduler inflight-batched` plus an exact configurable `--max-slots`,
+   truly concurrent clients, equality hits, divergent rewrites, cancellation,
+   admission isolation, speculative-state carry, aggregate-capacity receipts,
+   stale-descendant rejection, and a one-shot post-admission failure after a
+   successful non-empty GPU prefill slice. That fault is centrally parsed,
+   requires `HF2Q_UNSAFE_EXPERIMENTS=1`, fires before scheduler publication,
+   and the gate requires its 5xx plus exact counter delta, worker readiness,
+   cold retry of the affected unique boundary, and reuse after rebuilding it.
+   An oversized pre-admission 4xx remains admission-isolation evidence only.
+   The script exits nonzero
+   on every miss and refuses to run when the listener process arguments do not
+   prove the required scheduler shape. (`bench_lcp_resume_speedup.sh` is NOT a
+   gate for this feature: it drives the stride registry, issues its "4-worker"
+   load sequentially, does not select the slot-aware scheduler, and exits 0 on
+   a failed speedup — bench_lcp_resume_speedup.sh:303, :442.
+   `test_agentic_cache_lifecycle.sh` covers cancellation/isolation, not
+   multi-depth lineage; keep it, extend nothing into it.)
 5. Perf acceptance: on the divergent-edit scenario, TTFT strictly better than cold; on append-only scenarios, byte-stable and within noise of today. Quiet box, receipts.
 6. `cargo test --bin hf2q` (never `--lib`), 40-module GPU lock intact.
 
@@ -96,12 +510,1096 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 
 **B.0 — Coherence spike, first, in its own branch (Kimi M1 — this gate decides the lane).** Mixed cooperative execution has never run: cohort commit/poison concurrent with live decode cursors on peer slots. Before any policy work: enumerate exactly which per-slot state the cooperative transaction touches (`Deepseek4CooperativePrefillPlan` path, all-or-poison commit via `publish_prefill_cohort_after_gate` — verifier_forward.rs:76, the cooperative-PREFILL publisher; `publish_verifier_cohort_after_gate` in decode_cohort.rs:12 is the DECODE publisher, which a prior draft misnamed here; direct session-cache borrow engine_deepseek4.rs:649-683). The spike must exercise BOTH the commit and poison paths of the prefill publisher, and their interplay with the decode publisher during a Mixed step, prove decode-lane KV append cursors and compressor accumulators are untouched by commit AND by poison, and land a byte-identity test shaped *cohort-prefill + concurrent decode step* (not cohort-prefill alone). **Abort criterion:** if the spike shows cohort commit touches decode-lane state, the `engine.rs:9716-9731` bypass is load-bearing for correctness, Lane B becomes a scheduler redesign, and it exits this ADR to its own.
 
-**B.1 — Mixed cohort policy (only after B.0 passes).** Treat this as a new scheduler policy, not the removal of one bypass: cohort planning under a runnable decode must honor a per-lane row cap AND the aggregate cap while preserving FIFO-prefix compatibility, identical-plan/reply-class requirements, and recovery-tail behavior (planner engine.rs:9601-9687; lane clamp slots.rs:224-242; `MIN_MATRIX_APPEND_TOKENS = 33`, verifier_forward.rs:25; recovery tail engine_deepseek4.rs:48).
-- Rows-per-lane parameterized ∈ {128, 256}; **default 4×128** (halves F payments per aggregate progress while keeping GPU occupancy nearest today's serial Mixed slice); promote to 4×256 only on hardware measurement with contract margin. Projected walls for the canonical four ~3,520-token warm-suffix workload: serial Mixed ≈ 75 s of aggregate prefill work; 4×256 ≈ 31 s; 4×128 ≈ 46 s with near-serial per-slice occupancy.
+**B.0 deciding-spike verdict (2026-08-22): PASS; B.1 may proceed.** The source-grounded ownership ledger is:
+
+- Planning is read-only. `plan_deepseek4_prefill_cohort` selects only FIFO handles whose installed work is `Prefill`; `prepare_cooperative_prefill` validates the selected cache cursor/token ledger/live-logit state and reserves selected token-ledger capacity without publishing tokens.
+- `supervised_verifier_prefill_cohort` forms mutable cache references from only the sorted selected slot indices. The uncommitted transaction can write those selected caches' circular/compressed attention storage, indexer rows, and the four F32 compressor accumulators (`main_kv_state`, `main_score_state`, `indexer_kv_state`, `indexer_score_state`). Its combined row state, attention buffer, FFN state, and `mm_id` scratch are transaction-local model buffers, not slot state.
+- `publish_prefill_cohort_after_gate` prevalidates and then advances only the selected caches' `next_position`. A prevalidation or supervisor-gate failure sets `poisoned` only on those selected caches; physical writes are deliberately not rolled back and remain invisible because a poisoned cache must reset/replay. It does not receive a peer decode cache reference.
+- After a successful cache publication, serving mutates only each selected prefill lane's pending recovery anchor (when the boundary is crossed), committed-token ledger, `Deepseek4PrefillState` cursor/progress, and scheduler prefill accounting. Final logits remain on the serial completion path. The decode publisher independently validates and advances only its four selected decode cursors.
+
+The executable proof is `mixed_prefill_commit_preserves_decode_lane_cursor_and_cache_bytes` plus `mixed_prefill_poison_preserves_decode_lane_cursor_and_cache_bytes` in `src/inference/models/deepseek4/mixed_coherence_tests.rs`. Both build six independent warm caches (two aligned prefill lanes and four live decode lanes), execute the real decode publisher first to mirror a Mixed step, then execute cooperative-prefill publication. The first accepts the prefill commit; the second rejects its supervisor gate and poisons the two prefill caches. Both byte-compare every decode lane's complete attention/KV backing, indexer storage, and all four compressor accumulators, and require its cursor to remain exactly at the one position published by its own decode step. Result: 2 passed, 0 failed. The bypass is not load-bearing for cache-state isolation; B.1 remains responsible for scheduler/SSE latency and product-performance contracts.
+
+**B.1 — Mixed cohort policy (only after B.0 passes).** Treat this as a new scheduler policy, not the removal of one bypass: cohort planning under a runnable decode must honor a per-lane row cap AND the aggregate cap while preserving FIFO-prefix compatibility, identical-plan/reply-class requirements, and recovery-tail behavior (`plan_deepseek4_prefill_cohort`; `Deepseek4PrefillState::plan_cooperative_prefill`; `MIN_MATRIX_APPEND_TOKENS`; `RECOVERY_TAIL_TOKENS`).
+- Production is fixed at **4×128** (halves F payments per aggregate progress
+  while keeping GPU occupancy nearest today's serial Mixed slice). The pure
+  helper accepts 256 for a deciding experiment, but there is no live 4×256
+  selector; promoting it requires a measured policy implementation and the
+  same contracts. Projected walls for the canonical four ~3,520-token warm-
+  suffix workload remain serial ≈75 s, 4×256 ≈31 s, and 4×128 ≈46 s until
+  hardware replaces the projection.
 - Dual latency contract, both fail-closed: (i) scheduler decode-visit gap bound; (ii) client-visible **semantic SSE gap** bound per active decoder. Numbers to be fixed in the spike branch from measured baselines, recorded in this ADR at execution time.
 - New required workload test: four prefills + active streaming decoders, measuring decoder starvation behind Mixed prefill — the existing B4 artifact proof is a pure 132-step decode comparison after prefixes are installed (real_artifact_decode_cohort_tests.rs:309) and does not cover this.
 
-**B.2 — Family generalization (scope directive).** Row-aggregation economics are not DeepSeek-specific: every MoE family pays a per-slice fixed cost ≈ one full expert-weight read. DeepSeek4 already carries the aggregation machinery — it is Lane B's first implementation, not an omission from this list — while cross-slot aggregation is deepseek4-only machinery at HEAD (`src/serve/forward_prefill_batched.rs` batches within one sequence; its own doc records the slot-aware N/A at :400-426). Hypothesis: qwen35-family and gemma4 MoE slot-aware prefill show the same F-dominance and would benefit from cooperative suffix aggregation. Deciding spike: measure per-slice fixed cost vs rows on those families' slot-aware prefill using the ADR-042 receipt methodology. If confirmed, cooperative aggregation for those families becomes a REQUIRED phase under this ADR (new code — qwen35 is the in-repo per-slot-KV reference for concurrency-correct forwards); if refuted (e.g. smaller expert pools make F negligible there), record the falsification here with the measurements.
+**B.1 implementation-candidate evidence (2026-08-22; hardware acceptance still OPEN).** `deepseek4_mixed_work_budget` now supplies two independent Mixed limits whenever decode is runnable: the existing two-window serial limit and a 128-row cooperative per-lane limit. `advance_deepseek4_prefill_quantum` attempts the cooperative plan even when the serial fallback is bounded; `plan_deepseek4_prefill_cohort` intersects the per-lane limit with the unchanged `MAX_COOPERATIVE_PREFILL_ROWS = 2_048` aggregate ceiling and accepts only the registered `{128, 256}` policy values. The scheduler-selected oldest prefill remains the cooperative primary, so the existing FIFO-prefix, identical-plan, reply-class, cold-wave-width, and client-open checks remain authoritative. The round-robin choice is only the serial fallback. A selected recovery tail still suppresses decode for its bounded replay and bypasses cohort execution, preserving the established cursor-alignment rule.
+
+The execution still makes one `supervised_verifier_prefill_cohort` call over the combined row set and uses the existing `forward_ffn_rows`/`mm_id` path; B.1 adds no per-expert loop or dispatch. Pure-prefill calls pass no lane cap and therefore retain their previous aggregate-cap row allocation. No product ceiling or `MAX_COOPERATIVE_PREFILL_ROWS` changed.
+
+Two receipts are now bound to production events for every successful SlotAware DeepSeek request: `scheduler_decode_max_gap_ms` is observed once at actual decode-batch entry (the first gap begins when decode becomes runnable), while `semantic_sse_max_gap_ms` is observed only after an actual content/reasoning/tool delta is accepted by the SSE channel. Empty role frames and token-generation proxies cannot satisfy the semantic receipt. Both carry observation counts and first-event timestamps under the same request id; the model-free bound verifier rejects missing observations, a gap above its bound, or a non-monotonic trace. The hardware spike must set the numeric bounds from quiet-box baselines and apply the same fail-closed rules before either latency contract can be accepted.
+
+Model-free proof at this candidate: `deepseek_mixed_cohort_rows_fail_closed_on_lane_and_aggregate_caps` pins the 2,048 aggregate ceiling, shipping 4×128 shape, optional 4×256 shape, pure-prefill allocation, and rejection of sub-window/unregistered caps. `deepseek4_four_prefills_and_live_decoders_visit_every_mixed_turn` drives an eight-slot scheduler for five Mixed turns and proves the same four decoders are visited every turn in stable FIFO order while the same four-prefill FIFO prefix advances by exactly 128 rows/lane (512 aggregate). `latency_gap_receipt_is_measurable_and_fails_closed` proves missing-observation, over-bound, and non-monotonic traces reject; `semantic_sse_receipt_records_first_event_and_maximum_gap` proves the actual semantic send path records every event and the exact maximum gap. Focused result: 138 passed, 0 failed, 8 artifact/hardware tests ignored. This is implementation evidence, not the required real-artifact performance/parity, semantic-SSE ceiling, thermal, or peak-RSS evidence.
+
+**B.2 — Family generalization (scope directive).** The earlier claim that
+cross-slot aggregation was DeepSeek-only drifted from code. Gemma SlotAware
+already aggregates compatible installed lanes in
+`advance_gemma4_prefill_quantum` through
+`forward_prefill_batched_multi_seq{,_live}` under the canonical
+`HF2Q_CROSS_SLOT_ADMIT=1` launcher policy; ADR-040 records that shipment.
+Qwen MoE is the actual missing family. The deciding spike therefore measures
+Qwen's fixed-cost opportunity and revalidates Gemma's shipped policy rather
+than treating Gemma as unimplemented. The checked-in Qwen curve harness uses
+cold, single-transaction HTTP requests at controlled row widths, exact
+binary/model/process/request/response/thermal/contention receipts, two warmups,
+an initial seven alternating sweeps, and a deterministic bootstrap fit of
+`t(R)=F+cR`. A valid but inconclusive initial result permits exactly 21 sweeps
+with every other contract unchanged.
+Qwen opens implementation only when the lower 95% bound shows fixed-cost share
+above 50% at 128 rows and projected four-lane gain above 1.10×; it is falsified
+only when the upper bound is at most 25% or projected gain at most 1.05×.
+Intermediate evidence is inconclusive and triggers more measurement. Gemma's
+existing policy remains accepted only if direct OFF/ON order-balanced trials
+retain exact per-lane results and the lower 95% speedup bound exceeds 1.05×.
+The sequential curve harness cannot satisfy that distinct Gemma four-lane
+OFF/ON contract.
+
+Rev 24 Qwen gate calibration (not performance evidence): the first exact
+Qwen3.6-35B-A3B run at `54ba51df` produced 45 cold, single-transaction
+responses, but the verifier rejected sample one. The nominal 128-word payload
+rendered to 164/165 prompt rows because the generator ignored the 36–37-token
+ChatML envelope; an attached `script(1)` capture also buffered the server log,
+so per-request trace slices were empty even though the final log contained all
+events. Raw evidence remains at
+`/opt/hf2q-evidence/adr049-b2-qwen35-moe-54ba51df-rev1`. The revised harness
+subtracts the 36-token lower envelope, treats response/trace work rows as final
+authority, strips optional ANSI from trace fields, and sends a cold 128-row
+preflight canary that requires exactly one live production transaction before
+the 60-second thermal settle.
+
+The corrected seven-trial receipt is valid at `e7f69c36` (binary SHA-256
+`0227de0c2229dc75a791e6c246f0e1d0f5e9872c5d85c4727eb9cfaed2eba164`,
+model SHA-256
+`f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`):
+`F=82.989 ms`, `c=0.5881 ms/row`, `R²=0.99946`, fixed share at 128 rows
+52.44% with 95% CI `[49.00%,55.55%]`, and projected 4×128 gain 1.648× with
+95% CI `[1.581×,1.714×]`. The fixed-share lower bound is below the strict
+`>50%` confirmation rule, while neither falsification rule holds, so the
+terminal result is **inconclusive**, not a win. Immutable receipt:
+`/opt/hf2q-evidence/adr049-b2-qwen35-moe-e7f69c36-rev2/summary.json`
+(SHA-256
+`ce16c84affe37e35314e080306b8c87fa4ecda9dbd53975526673be8c949a47e`).
+The pre-registered precision extension is exactly 21 trials per width; it does
+not change widths, alternating order, bootstrap seed, fit validity, or terminal
+thresholds. That extension passed at `65495b4d` (binary SHA-256
+`1a273fce7ebf1a31595d4c7ea41a92301f9d963b621e484202d7c4a0730418d8`):
+`F=85.268 ms`, `c=0.5642 ms/row`, `R²=0.99948`, fixed share at 128 rows
+54.14% with 95% CI `[52.58%,55.13%]`, and projected 4×128 gain 1.684×
+with 95% CI `[1.651×,1.705×]`. Both strict lower-bound rules pass, so the
+Qwen opportunity is **confirmed** and implementation is required. Immutable
+receipt:
+`/opt/hf2q-evidence/adr049-b2-qwen35-moe-65495b4d-rev3/summary.json`
+(SHA-256
+`19571ce1dc44fc5d5cd52f669f885253a370442bc69731e494da14b497160709`).
+
+The implementation hypothesis is a rectangular physical batch of two through
+four compatible lanes with equal row count. Sequence-major rows stay
+contiguous so existing dense and MoE projections see one aggregate matrix and
+`mm_id` remains one dispatch, not an expert or lane loop. DeltaNet uses its
+native `n_tokens × n_seqs` axes with gathered current state and parity-correct
+scatter. Full attention must preserve the scalar operator class: production
+128-row fresh prefill stages the aggregate rows as an isolated native batch
+and invokes the BF16 tiled dispatcher once; explicit row-to-slot and absolute-
+position maps write each lane's freshly projected K/V into its own banked TQ
+cache. A resumed batch is compatible only when every lane shares cursor, K
+length, physical capacity, and scalar route, allowing the same tiled-resume
+dispatcher with its native batch axis; otherwise the scheduler keeps those
+lanes scalar. The rejected alternative widened the TQ decode-vector kernel for
+128-row prefill. It changed the attention arithmetic/cache representation
+relative to the scalar tiled route and was removed before publication. Stable
+boundaries become explicit cohort ends so checkpoint capture does not require
+intermediate-state reconstruction. Any target, MTP, supervision, validation,
+or publication failure rolls every selected lane back before any scheduler
+cursor advances. The DeltaNet layer spike is green at four sequences by 128
+rows with bit-identical output/recurrent/conv state and an untouched unselected
+peer. The tiled full-attention bridge and the complete full-attention layer are
+green at widths two and four by 128 rows with bit-identical output and complete
+banked TQ state. Invalid slot/cursor/capacity shapes reject before mutation. The
+complete target gate is now green for native dense and quantized-MoE fixtures
+at widths two/four, including exact final logits, normalized MTP input rows,
+live-prefix cache bytes, an unselected warm peer, and one-token continuation.
+The MoE gate retains one aggregate gate/up/down ID projection per layer. The
+worker-owned all-lane target+MTP transaction and failure/publication contract
+are now model-free green at rev 31. The remaining deciding gate is exact
+Qwen3.6/Qwen3.8 hardware parity and direct OFF/ON performance, including
+Qwen3.8 AUTO MTP, cancellation/retry, unary/SSE/tool-result continuation, and
+a live decoder in Mixed.
+
+Rev 32 closes an operational reachability defect found before that hardware
+gate. Qwen enabled `HF2Q_CROSS_SLOT_ADMIT=1`, but unlike Gemma its worker did
+not collect the first idle burst: if four HTTP handlers arrived across more
+than one channel poll, lane zero entered scalar prefill before its peers were
+installed and the rectangular transaction could never form. The kernel path
+was therefore correct but timing-luck-dependent. Qwen now uses the same
+bounded worker-lifetime `HF2Q_ADMIT_COALESCE_US` policy as Gemma, and the
+canonical Qwen launcher supplies the existing 25 ms maximum. Collection is
+limited to a compatible FIFO prefix of cold text requests whose stable
+boundary is already in the exact 16–128-row rectangular shape. Response-cache
+hits, reusable retained/anchor prefixes, controls, warmup, embedding, vision,
+active-work admission, and policy-OFF runs do not wait. The target is bounded
+by the physical slot count, channel capacity, and the route's four-lane
+maximum; an incompatible arrival or priority control ends collection instead
+of consuming the rest of the window. Invalid direct-runtime values warn and
+disable collection. This is implementation reachability evidence, not a
+performance claim; the exact OFF/ON hardware gate below must prove both that
+normal concurrent HTTP traffic forms the cohort and that the bounded
+collection cost is repaid.
+
+Rev 33 records the first exact-artifact performance falsifier, its source-
+grounded reformulation, and the corrected implementation candidate. On an M5
+Max, four concurrent 96-row Qwen3.8 Q5_K_M lanes formed a real width-four
+cohort and returned the same semantic/token hashes as the serial control, but
+the first rectangular implementation took 5.62–6.29 seconds after warmup
+versus 1.83–1.97 seconds for scalar admission. Disabling MTP still took 6.07
+seconds, falsifying speculation as the cause. Instrumented target time was
+5.46 seconds: 4.60 seconds in dense quantized FFN, 0.70 seconds in recurrent
+DeltaNet, 0.15 seconds in full attention, and 0.01 seconds in the output head.
+A layer-local decode-pool reset reduced little. Disabling the pooled helper's
+fused gate/up route reduced the whole wave to 1.61 seconds, but splitting the
+same fused operation into exact per-lane calls still took 5.72 seconds. Those
+spikes falsified both aggregate row count alone and MTP as explanations.
+
+Source review found the actual operator-identity defect. Scalar prefill calls
+the arena-backed DenseQ helper, whose gate/up projections execute native
+quantized matrix-matrix operations. Rectangular prefill called the pooled,
+decode-oriented helper, which selected a fused mat-vector route for the same
+aggregate prompt rows. The candidate now allocates one aggregate
+`DenseFfnArena` and output ring and invokes the same arena-backed helper as
+scalar prefill. It also drains and drops every pool-owned layer local before a
+per-layer pool reset; resetting while `attn_out` remained live would have
+created a future buffer-alias footgun. GGUF buffers stay in their artifact
+representation throughout. No tensor is dequantized and requantized, and the
+Qwen3.6 MoE `mm_id` route remains one aggregate projection dispatch rather
+than a lane or expert loop.
+
+The first full-model exact gate is green on the 19,535,701,568-byte Qwen3.8
+Q5_K_M artifact SHA-256
+`4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e`.
+It asserts native Q5_K embedding and native Q6_K shared output head with no
+expanded CPU copies, then compares four scalar lanes with one rectangular
+transaction at 96 rows: final logits, every MTP input-hidden byte, complete
+hybrid cache snapshot, and a subsequent ordinary token are exact. The gate is
+generalized into the qualified BF16/Q4_K_M/Q5_K_M/Q6_K/Q8_0 artifact matrix;
+all five cells must pass before acceptance.
+
+The corrected dirty-tree spike produced exact OFF/ON response hashes and
+provisional median four-client walls of 1.373 versus 1.838 seconds on that
+Qwen3.8 Q5_K_M artifact (25.3% lower), with AUTO MTP succeeding in every ON
+process. The distinct 25,043,007,488-byte Qwen3.6 35B-A3B MoE Q5_K_M artifact
+SHA-256
+`f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`
+produced 0.417 versus 0.623 seconds (33.1% lower) with exact response hashes.
+These are hypothesis-confirming spike receipts, not landing claims: the source
+tree was intentionally dirty while operator variants were isolated. Final
+acceptance requires a clean exact-commit, same-binary OFF/ON ABBA runner,
+every qualified Qwen3.8 native format, Qwen3.8 dense and Qwen3.6 MoE shape proof,
+normal HTTP width-four publication, Qwen3.8 AUTO-MTP success, single-user
+coalescing ceiling, live-decode plus four-prefill workload, cancellation/
+retry/rollback joins, unary/SSE/tool-result continuation, and matched pinned-
+reference measurements. A speed result that omits those cells cannot close
+B.2.
+
+Rev 34 turns that acceptance list into fail-closed executable authority before
+running the clean-commit measurement. The same-binary Qwen runner freezes the performance policy before the landing
+measurement: five measured trials in each fresh OFF-A/ON-A/ON-B/OFF-B
+process, two route warmups per process, 60 continuous seconds of nominal and
+quiet settle, Fair-or-better plus quiet measurement sampled every two seconds
+with no gap above five seconds, cold unique requests, a start barrier, launch
+skew at most 100 ms, and actual four-client overlap. Both ON processes must
+beat their neighboring OFF process and the pooled four-client median must be
+at least 1.01× faster. The single-user ceiling is end-to-end client wall time,
+not the server's internal TTFT field: admission coalescing happens before that
+server clock starts. Pooled ON median wall may exceed OFF by at most 50 ms,
+twice the immutable 25 ms worker window. This ceiling applies to the worst
+matched OFF/ON request overhead across both process pairs; pooled median is
+diagnostic only, consistent with Lane C's tail-latency rule. Request bytes and canonical semantic/
+token response projections must be exact across paired arms. Thermal,
+contention, sampled RSS, request/response/wall, per-wave log, and metric files
+are sealed into each process evidence manifest. These thresholds are not
+environment-tunable by the gate. Every process also proves the exact loaded
+architecture from `/v1/models` and the worker-resolved admission, coalescing,
+AUTO-speculation, and MTP-capability policy from one startup event; this keeps
+the gate from repeating the dead-configuration failure class. AC source and
+power mode are rechecked before launch, after route warmup, at both measurement
+boundaries, and after shutdown. The top receipt is reopened by an independent
+verifier that recomputes raw manifests, all hashes, exact requests and canonical
+responses, timing and metric deltas, launch overlap, sample counts,
+thermal/contention/power contracts, medians, sampled peak RSS, tail, neighbor
+ratios, and verdict. Eight injected receipt/raw-evidence mutations—including
+fully rebound raw timing and metric changes—must be rejected for each cell.
+
+Every measured server and lifecycle client starts under `env -i` with the
+complete runtime/workload contract pinned. The actual startup events must prove
+the 48 GiB KV budget, persistence disabled, AUTO speculation, exact
+cross-slot/coalescing arm, and artifact MTP capability; the earlier
+`HF2Q_KV_PERSIST=0` claim was deleted because `serve` never read it. A long-run
+owned caffeinate assertion is stopped before receipt sealing, its power-event
+delta is independently reconstructed, and the owned thermal probe is cleaned
+on every exit path. Qwen3.8 dense/MTP and Qwen3.6 MoE/no-MTP each also run a
+fresh exact-artifact agentic lifecycle process outside the timed arms. That
+join reopens the canonical required-tool call, tool-result continuation,
+semantic SSE cancellation, queued exact-retry reuse, isolation, execution
+headers, raw evidence manifest, PID/binary/model binding, shutdown, and fatal
+logs. A fully rebound lifecycle-summary mutation must be rejected from the raw
+responses. These are acceptance-contract changes, not new performance results;
+the clean-commit matrix remains the deciding measurement.
+
+The first clean-commit server attempt at `85ab77cc` failed before model load:
+both new direct runners still supplied the removed `serve --no-vision` flag.
+Current CLI source has no such option; text-only operation is selected by not
+supplying `--mmproj`. The failed invocation produced no performance sample.
+The runners now use the live CLI contract, and the deciding matrix moves to the
+post-correction commit rather than relabeling the failed attempt.
+
+The next attempt at `98782fff` proved the corrected serve plan but also stopped
+before model load: `HOME=/var/empty` correctly scrubbed ambient configuration,
+while the live server still needs a writable model-listing cache even for a
+local GGUF. The gate keeps the scrubbed home and now supplies an explicit
+evidence-local `--cache-dir`; the actual PID command line and every cache file
+are sealed and independently checked, including absence of `--kv-persist`.
+
+Rev 35 records the third fail-closed clean-commit falsifier and its product
+correction. At exact commit `0df8a389`, Qwen3.8 loaded with AUTO speculation
+and live MTP weights, and normal concurrent HTTP traffic published a genuine
+four-lane rectangular cohort. The gate nevertheless stopped after the first
+measured ON wave because the publication reported
+`mtp_prefill=false mtp_outcome=NotRequested`. The request fixture supplied
+`temperature:0, seed:42`; source inspection showed that both the ordinary
+GPU-greedy predicate and the server-complete MTP predicate rejected every
+explicit seed even though `sampler_pure::sample_token` returns argmax before
+consulting the RNG whenever temperature is zero. The harness had therefore
+disabled the path it required, but deleting the seed from the harness would
+have hidden the same reachability defect for real clients.
+
+The corrected contract treats a seed as inert under the already-required
+temperature-zero/top-k-zero/top-p-one semantics. Seeded sampling remains
+outside exact MTP eligibility whenever the stochastic fields select it. A
+red/green server predicate regression proves seeded-greedy admission for both
+ordinary GPU argmax and Qwen speculation, while an independent sampler test
+proves identical token selection for no seed, seed zero, and the maximum
+`u64`. The deciding ABBA fixture intentionally retains `seed:42`; Qwen3.8 must
+now complete actual MTP catch-up rather than pass by fixture omission. The
+failed `0df8a389` root remains falsification evidence and makes no performance
+claim.
+
+Rev 36 records two proof-environment failures after the seeded-greedy
+correction reached hardware. The first `4c88641c` retry completed three Qwen3.8
+processes but correctly rejected OFF-B when an unrelated hermetic hf2q release
+smoke started during the calibrated measurement window; this was real host
+contention, not a false positive, and the root makes no performance claim. A
+fresh uncontended retry completed all four Qwen3.8 arms with exact semantic
+equality and real MTP success, but its independent verifier stopped before
+judging the receipt because BSD awk rejects a continuation line whose first
+token is `||`. The same script had passed `bash -n` and shellcheck because
+neither parses embedded awk programs.
+
+The verifier now keeps each awk continuation operator on the preceding line.
+Its power-log predicate is one shared function used by production verification
+and a directly executable `--self-test`; the contract suite runs that self-test
+and proves both a valid five-phase log and a corrupt phase. The second affected
+timing-shape predicate uses the same portable form. Because verifier and runner
+hashes are receipt authority, the complete clean-commit matrix must run again
+at the post-correction commit; the measured `4c88641c` values remain
+provisional evidence only. Reopening that completed receipt through the fixed
+verifier then exposed a second schema defect before another model load: the
+runner derived and supplied `latest_start` and `earliest_finish` to `jq` but
+did not include either in the emitted wave object, while the independent
+verifier correctly required both raw boundaries. The wave schema now stores
+them and the contract pins both fields. A diagnostically rebound copy of the
+old raw receipt was rebound diagnostically to drive the corrected verifier to
+its terminal verdict before the next exact hardware run. That rebound exposed BSD awk's
+string-typed substring comparison: an extracted `"84"` compared lexically as
+greater than numeric 128. Row-shape validation is now also one shared
+production/self-test function, explicitly coerces both parsed fields to
+numbers, accepts 4×84/336, and rejects 4×84/335. After that correction the
+diagnostic shadow at
+`/opt/hf2q-evidence/qwen35-rectangular-verifier-shadow.DxIKJH` reached the
+terminal VERIFIED verdict and rejected all eight fully rebound receipt/raw
+mutations. It proves the verifier, not a clean-commit performance result; the
+next exact matrix remains authoritative.
+
+Rev 37 records the next clean-matrix environment failure without discarding
+its valid cells. At exact commit `2cdb3f0c`, Qwen3.8 completed and independently
+verified: pooled four-client wall improved from 1.82005 seconds to 1.36293
+seconds (1.3354×), both neighboring process ratios exceeded 1.32×, exact
+semantic/token equality held, seeded AUTO MTP succeeded in every ON cohort,
+and worst matched single-request overhead was 37.75 ms under the immutable
+50 ms ceiling. Qwen3.6 OFF-A/ON-A then measured 0.64894 versus 0.442748
+seconds, and ON-B completed all five coherent MoE/no-MTP waves. After clean
+shutdown, however, the fifth power-contract row was absent and the runner
+stopped before sealing that process. Four earlier identical checks succeeded,
+the sampled mode/code remained automatic/zero, and the same commands succeeded
+immediately afterward. This localizes the failure to transient acquisition
+from `system_profiler` or `pmset`, not a measured power drift; the incomplete
+Qwen3.6 cell and top matrix make no acceptance claim.
+
+Power-mode acquisition now retries parser/command acquisition at most three
+fixed attempts with one-second spacing. AC loss or any successfully observed
+mode/code drift still fails immediately, and an unresolved probe now emits an
+explicit phase-specific error rather than returning silently. The retry count
+is immutable and source-contract tested. Because the runner hash and embedded
+source commit are receipt authority, the complete matrix reruns at the
+post-correction commit.
+
+Rev 38 checks in the remaining cross-family acceptance authorities before the
+next model load. DeepSeek B.1 now has an immutable worker-lifetime
+`HF2Q_DEEPSEEK_MIXED_COHORT` policy: default/explicit ON retains the accepted
+128-row-per-lane Mixed cohort, explicit OFF skips only the Mixed cooperative
+plan, and an invalid direct-runtime value fails safe to the serial Mixed path
+with its resolved selection in the startup event. The canonical launcher
+rejects invalid values before model load. Its exact same-binary HTTP gate runs
+fresh OFF-A/ON-A/ON-B/OFF-B processes with five measured waves each, eight
+physical slots, four semantic SSE decoders plus four cold 128-row prefills,
+strict pooled and neighboring-process wins, exact canonical response parity,
+15-second scheduler and semantic-SSE ceilings, a 60-second prefill ceiling,
+the 116 GiB memory ceiling, and continuous power/thermal/contention evidence.
+An independent raw-evidence verifier and ten injected mutations guard the
+receipt.
+
+Qwen B.2 now joins an exact live-decoder/four-prefill cell for both the
+Qwen3.8 dense/MTP and Qwen3.6 MoE/no-MTP artifacts to the existing rectangular
+ABBA and agentic-lifecycle matrix. Gemma B.2 now has eight order-balanced
+OFF/ON pairs across 128/256/512-row four-lane waves, exact request/result
+parity, a deterministic 10,000-sample order-stratified bootstrap, and the
+pre-registered lower-95%-speedup bound above 1.05×. Both have independent
+verifiers and mutation batteries. All three new model-free contract suites are
+green at this revision. These are executable acceptance contracts, not new
+hardware or performance results; the unchecked acceptance items below remain
+unchecked until their exact clean-commit receipts pass.
+
+Rev 39 records the first rev-38 hardware attempt without relabeling its
+incomplete top matrix. At exact commit `57bd51b4`, the Qwen3.8 Q5_K_M ABBA
+cell passed independent verification: pooled four-client wall improved from
+1.791365 seconds to 1.351285 seconds (1.325675×), both neighboring ratios
+exceeded 1.328×, exact semantic/token equality held, seeded AUTO MTP executed,
+and worst matched single-user overhead was 33.885 ms under the 50 ms ceiling.
+Its immutable receipt remains valid at
+`/opt/hf2q-evidence/qwen35-rectangular-policy-57bd51b4/qwen38-dense/receipt.json`.
+
+The distinct Qwen3.6 OFF-A process then completed five clean measured waves,
+30 nominal settle samples, quiet contention evidence, and four identical
+AC/automatic/zero phase observations, but stopped after shutdown before the
+fifth power row and before sealing a process summary. This is the second
+occurrence of that boundary-acquisition failure; the Qwen3.6 cell and top
+matrix make no claim. The earlier correction retried Energy Mode and numeric
+mode-code acquisition but left the live AC-source command as a one-shot
+early-match pipeline. The cross-family gates now capture the complete
+`pmset -g batt` output, parse exactly one public AC-or-battery banner, and
+retry unresolved command/parser acquisition at most three times while still
+rejecting an observed battery source immediately. The shared parser has AC,
+battery, missing, and duplicate-banner canaries; the Qwen rectangular/Mixed,
+Gemma B.2, and DeepSeek B.1 contracts forbid the former early-match probe.
+Because source and runner hashes are receipt authority, the complete matrix
+reruns at the post-correction commit.
+
+Rev 40 records the next exact attempt and closes a separate hermetic-client
+defect. At `fa2f33ee`, both post-power-correction throughput cells passed:
+Qwen3.8 improved from 1.800775 seconds to 1.358030 seconds (1.326020×;
+neighbor ratios 1.3215×/1.3264×; 35.320 ms worst single-user overhead), and
+Qwen3.6 MoE improved from 0.632006 seconds to 0.438724 seconds (1.440555×;
+neighbor ratios 1.4473×/1.4344×; 31.205 ms worst single-user overhead).
+Both independent verifiers proved exact semantic/token equality, all process
+power rows, quiet thermal/contention contracts, and the intended MTP-capable
+versus no-MTP architecture behavior.
+
+The joined matrix then stopped before its first lifecycle request. The
+lifecycle runner correctly scrubbed the client environment to
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin`, while the shared client still required
+Homebrew `rg` for three simple fixed/anchored line checks. The model loaded and
+shut down cleanly, but the client exited 2 with `missing required command: rg`;
+there is no lifecycle or top-matrix claim. Those checks now use system
+`grep`, the command contract no longer names `rg`, and a direct scrubbed-PATH
+canary proves command preflight reaches the intended HTTP failure instead of a
+missing-tool failure. The complete joined matrix reruns because lifecycle,
+matrix, source, and binary identities are one receipt contract.
+
+Rev 41 records the exact `822312b6` rerun and reformulates its lifecycle
+failure from the hardware evidence. Both throughput cells passed again:
+Qwen3.8 measured 1.324851× (neighbor ratios 1.3231×/1.3250×, 33.155 ms
+worst matched single-user overhead), and Qwen3.6 MoE measured 1.445822×
+(neighbor ratios 1.4353×/1.4511×, 32.187 ms worst matched single-user
+overhead), with exact semantic/token equality. Their independently reopened
+receipts are under
+`/opt/hf2q-evidence/qwen35-rectangular-policy-822312b6/`.
+
+The Qwen3.8 lifecycle base then completed a 137,589-token cold prompt and a
+valid required tool call. Its seed continuation hit the retained anchor,
+reported 137,584 cached tokens, and prefetched only the 171-token suffix, but
+the request spent its unbounded 64-token completion entirely in native
+reasoning and therefore failed the exact `CACHE_SEED_READY` assertion. This
+was a request-contract defect, not a state-reuse or model-coherence defect:
+the launcher value `--default-thinking-token-budget 0` removes the configured
+ceiling; it does not disable a thinking-capable template. Required Qwen tool
+calls synthesize a safe answer reserve, while ordinary `auto` calls do not.
+
+Two real-artifact spikes decided the replacement contract. An explicit
+request-local `thinking_token_budget=16` produced the exact seed and isolation
+answers with a tokenizer-derived forced close, and the same ceiling preserved
+a valid required `lifecycle_probe` call. The shared lifecycle fixture therefore
+keeps the base request on the distinct synthesized required-tool reserve and
+accepts an opt-in continuation budget for seed, active SSE, inherited sibling,
+and isolation requests. Qwen3.6/Qwen3.8 callers pin 16; Gemma4 and DeepSeek4
+leave the option absent because their family-native reasoning contracts differ.
+The summary, raw-request verifier, and mutations bind that distinction. The
+complete joined matrix reruns at the post-correction exact source/binary
+identity; the incomplete lifecycle and top matrix still make no acceptance
+claim.
+
+Rev 42 records the next exact-candidate attempt without promoting its partial
+evidence. At `2a764246`, the Qwen3.8 throughput cell passed independent
+verification at 1.332332× pooled four-client speedup (neighbor ratios
+1.3401×/1.3166×), exact semantic/token equality, and 40.435 ms worst matched
+single-user overhead. The Qwen3.6 OFF-A process then completed all five single
+and five four-slot measurements with nominal thermals, quiet contention, and
+the complete through-measurement power record, but exited before publishing
+the after-shutdown row or process summary. As required, neither that Qwen3.6
+arm nor the joined matrix makes an acceptance claim.
+
+An exact-source traced OFF-A reproduction against the same binary and Qwen3.6
+artifact passed every measurement, post-measurement identity/fatal-log/process
+binding check, graceful shutdown, after-shutdown power observation, evidence
+manifest, and process-summary publication. That spike falsifies a persistent
+runtime or harness defect; the unsealed exit is retained as transient rejected
+evidence rather than rationalized into a result or a speculative code change.
+The complete joined matrix reruns from a fresh evidence root at the next exact
+source/binary identity.
+
+Rev 43 records the full exact `6ba4c37b` attempt and its deciding correction.
+Both rectangular throughput cells passed independent verification with exact
+semantic/token equality: Qwen3.8 measured 1.332338× pooled four-client
+speedup (neighbor ratios 1.3273×/1.3361×; 31.364 ms worst matched single-user
+overhead), while Qwen3.6 measured 1.452518× (neighbor ratios
+1.4637×/1.4433×; 29.161 ms worst matched overhead). Qwen3.8 then passed the
+complete lifecycle gate: its 134,787-token cold base emitted the required
+tool call, the seed reused 134,782 tokens, cancellation emitted no false SSE
+terminal, the queued retry reused 134,947 tokens, and isolation stayed cold
+and returned exact `ISOLATION_OK`.
+
+Qwen3.6 passed the same base, seed, active-SSE, cancellation, and queued-retry
+sequence. Its seed reused 134,744 tokens and its retry reused 134,909. The
+unrelated request was correctly cold (`cached_tokens=0`) and leaked no prior
+sentinel, but the budget-16 forced close exposed a 41-token visible meta-answer
+prefix and exhausted `max_tokens=64` with `finish_reason=length` instead of
+returning exact `ISOLATION_OK`. Widening the completion or reasoning budget is
+falsified: neither can remove an already-invalid visible prefix, and forced-
+close coverage remains live in the passing seed and sibling responses, both
+of which recorded 23 reasoning tokens.
+
+Fresh exact-artifact spikes against both Qwen3.6 and Qwen3.8 decided the
+replacement: isolation alone sets `hf2q_enable_thinking=false`, carries no
+reasoning budget, and carries no `chat_template_kwargs` that could override
+the top-level flag. Both shapes returned exact `ISOLATION_OK`,
+`finish_reason=stop`, no reasoning trace, and zero cold cached tokens. The
+seed, active, and inherited sibling retain the request-local continuation
+budget of 16; the base still exercises the distinct synthesized required-tool
+reserve. The lifecycle summary advances to schema 3 so the renamed
+`continuation_thinking_token_budget` and unrelated-conversation thinking mode
+cannot be confused with the superseded all-continuations contract. Independent
+raw-request/response checks and sixteen rebound mutations bind the new shape.
+Gemma4 and DeepSeek4 keep their family-native fixture defaults. The Qwen3.6
+lifecycle and joined matrix remain unaccepted until one fresh exact candidate
+passes both lifecycle cells and the Mixed cells.
+
+Rev 44 records the fresh exact `25f498c5` joined attempt and the deciding
+Qwen3.8 Mixed-coherence falsifier without promoting its rejected top matrix.
+Both rectangular throughput cells again passed independent verification with
+exact OFF/ON response parity: Qwen3.8 measured 1.326704× pooled speedup
+(neighbor ratios 1.3248×/1.3310×; 34.874 ms worst matched single-request
+overhead) and Qwen3.6 measured 1.445323× (neighbor ratios
+1.4505×/1.4365×; 33.447 ms worst overhead). Both strengthened lifecycle
+cells passed from the same binary. Qwen3.8 and Qwen3.6 each completed the
+137k-token cold base, reused nearly the complete stable prefix on seed and
+queued retry, retained forced-close coverage on continuation requests, kept
+the unrelated request cold, and returned exact non-thinking `ISOLATION_OK`.
+
+The Qwen3.8 Mixed ABBA then correctly failed before sealing a receipt because
+its 512-token open-ended decoder was not byte-identical between paired AUTO
+arms. All twenty short prefill responses remained exact `OK`; only the long
+decoder forked, first after 1,150 joined output bytes in replica A. The
+provisional prefill direction was beneficial but is not accepted performance
+evidence: pooled OFF/ON medians were 2,208.16/1,928.62 ms (1.144943×), with
+both neighboring ratios above one.
+
+Same-policy evidence rejects rectangular prefill as the causal label for that
+failure. OFF-A and OFF-B also differed on the identical seeded trial-2
+request; ON-A and ON-B differed on trials 4 and 5. A four-cold-process,
+no-sibling AUTO spike reproduced the baseline route instability: three full
+512-token outputs were byte-identical and the fourth forked at byte 1,088.
+The production receipts explain why timing matters: one OFF trial-2 process
+cost-disabled both proposers and issued 408 ordinary target forwards, while
+its replica kept MTP/history speculation live and issued zero ordinary
+forwards. Exact decoding must remain route-equivalent despite that adaptive
+choice; the failing gate is therefore retained, not relaxed.
+
+The deciding fixed-route spike forced speculation OFF while preserving one
+live 256-token decoder plus four simultaneous cold prefills, two fresh OFF
+processes and two fresh ON processes. All four decoder responses were
+byte-identical (content SHA-256
+`e54a3f5221d9da568a40d1eb37566665cf472ff1f2931f2c05b5576ed70ff14a`),
+all sixteen prefill responses were exact cold `OK`, OFF published no
+rectangular cohort, and each ON process published one real width-four cohort.
+Evidence is under
+`/opt/hf2q-evidence/qwen38-mixed-fixed-route-25f498c5`. This proves the
+rectangular transaction is coherent at the reproduced fork and reformulates
+the blocker as AUTO target-route equivalence: production scalar
+`forward_gpu_greedy` versus the four-row full-logit verifier at the observed
+long prefix.
+
+Rev 45 closes that deciding spike without weakening the gate. First, the
+exact 512-token request was run with speculation OFF through both ordinary
+decision surfaces: the fused scalar greedy route and the full-logit CPU
+sampler route produced the same 2,534-byte content, SHA-256
+`cf783007305a9a02c4b56e5c5d511c2aa6d0b28977d01a3b607fd02478ae04f8`.
+That rejects ordinary argmax/readback as the fork.
+
+The real-artifact repeated-verifier test then reproduced the production
+shape from source rather than a synthetic prefix. It rendered and tokenized
+the exact request into 67 tokens, proved the stable boundary is the strict
+60-token prefix, ran independent byte-identical `60 + 7` compound target/MTP
+prefills, and compared the production scalar target trajectory against 127
+successive full-accept four-row target/MTP transactions. The target routes
+diverged at verifier round 51, post-seed decision offset 205 (completion token
+206), row 1, with inputs `[381, 17083, 440, 16866]`: scalar selected token
+`440`, while the four-row verifier selected `18546`. The verifier logits were
+near a real decision boundary: top one `(18546, 22.945137)`, top two
+`(440, 22.900723)`, margin `0.04441452`. The first hardware invocation carried
+an extra non-production `MLX_UNRETAINED_REFS=1` and failed pre-comparison with
+Metal invalid-resource; the valid production-environment rerun omitted it and
+reproduced the same round-51 fork twice, including after byte-proving the two
+compound prefill snapshots. The checked-in test is
+`qwen38_real_repeated_four_row_route_coherence`; the artifact is the exact
+Qwen3.8 Q5_K_M file with SHA-256
+`4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e`.
+
+Rev 46 identifies and falsifies the route defect. Source inspection found that
+the Qwen3.8 loader changed the shared native routing policy from byte-exact
+Q6_K multi-row matvec/default-off `mul_mv_ext` to `dense_decode_mvn=false` and
+`dense_decode_mv_ext=true`. Scalar target decode therefore used the ordinary
+Q5_K/Q6_K matvec reduction, while the four-row verifier used `mul_mv_ext`,
+whose implementation and earlier ADR already document a different reduction
+tree. The earlier four-position gate was too short to expose accumulated drift.
+
+The deciding real-artifact rerun preserved the same 67-token prompt, 127
+four-row verifier rounds, TQ cache, compound target/MTP prefill, and every
+target comparison; it changed only the two routing overrides to
+`HF2Q_DECODE_MV_EXT=0` and `HF2Q_DECODE_MVN=1`. All 508 post-seed decisions
+were then exact in 39.16 seconds. This exonerates scheduler order, rectangular
+prefill, history lookup, ordinary argmax, compound prefill, full-attention
+routing, and recurrent DeltaNet for this incident. The Qwen3.8-local routing
+exception is removed. Qwen returns to the shared coherent native defaults:
+Q6_K uses the already byte-proven multi-row kernel and Q5_K temporarily uses
+the row-independent ordinary matvec at width four.
+
+The performance follow-through is universal rather than model-labelled: add a
+Q5_K multi-row kernel that literally preserves the scalar Q5_K accumulator and
+reduction order while amortizing each weight read across columns, then admit it
+through the shared `dense_decode_mvn` capability for every applicable family.
+A guessed logit-margin epsilon and the non-bit-exact `mul_mv_ext` route are not
+accepted fixes. After the shared kernel lands, AUTO must re-pass same-policy
+identity before OFF/ON identity and speed acceptance. Qwen3.6 Mixed remains
+unrun because the joined matrix stopped at the first coherence failure.
+
+The corrected hf2q loader and every production Qwen matrix now use the shared
+policy rather than the artifact-name exception. The permanent ignored gate
+asserts both routing variables are absent before load and asserts the resolved
+model policy is exactly `dense_decode_mvn=true` and
+`dense_decode_mv_ext=false`. On the same Q5_K_M artifact and 67-token prompt,
+that production-default gate passed all 127 rounds / 508 post-seed decisions in
+38.03 seconds. Shell syntax, the Qwen3.8 artifact-matrix contract, the
+cross-family MTP artifact contract, and the shipping-contract suite also pass.
+This accepts the coherent route correction; it does not yet accept the open
+Q5_K speed replacement or restore universal AUTO performance authority.
+
+Rev 48 closes the remaining DenseQ function-identity gap found during that
+route audit. Scalar/pooled DenseQ used a fused gate/up/SILU entrypoint for
+native IQ4_NL, Q4_K, Q5_K, Q6_K, and Q8_0 weights, while the arena-backed
+multi-row verifier always used separate gate, up, and SILU dispatches. The
+native tolerance tests cannot establish greedy-trajectory equivalence here:
+the Q5_K fused kernel's different FMA grouping produces small nonzero changes.
+A focused hf2q Metal regression reproduced the defect before implementation
+at width four (`-3.235553158e-4` versus `-3.235536860e-4` in the first output
+element). Eligibility and codec dispatch now live in one helper used by both
+pooled and arena-backed execution; the down-projection barrier and projection
+route are unchanged. The strengthened regression compares every output bit for
+each row at widths two through eight across all five eligible codecs and passes
+35/35 codec-width cells. This is exact synthetic operator evidence, not a
+full-artifact speed claim. The exact Qwen3.8 Q5_K_M repeated-verifier/AUTO gate
+and matched OFF/ON performance measurement remain required on the landing
+commit; a prior rejected custom cross-row fusion spike is not evidence against
+this row-independent production kernel reuse.
+
+Rev 49 makes the pending exact-Q5 proof non-vacuous before changing the pinned
+backend. The full-model artifact contract now binds each qualified width-four
+format to its required native multi-row kernel label: Q4_K_M to Q4_K, Q5_K_M
+to Q5_K, and Q6_K to Q6_K; BF16 and Q8_0 correctly require no K-family label.
+The repeated-verifier gate additionally requires the served artifact to report
+GGUF file type 17 (Q5_K_M), resets dispatch telemetry immediately before the
+127-round comparison, and accepts only an observed Q5_K `r1=4` route after all
+508 scalar-versus-four-row decisions agree. The model-free contract and two
+mutations (missing Q4 evidence and a substituted Q5 route) pass.
+
+The deciding pre-pin falsifier used the then-current published `mlx-native 0.13.0`,
+the exact Qwen3.8 Q5_K_M artifact and production-default route with
+`MLX_DISP_BUCKET=1`. It deliberately failed only at the new final canary after
+42.50 seconds: all 508 decisions agreed, scalar Q5_K executed 193,294 times,
+Q6_K `r1=4` executed 8,382 times (proving telemetry was live), and Q5_K
+`r1=4` executed zero times. Therefore the gate is capable of distinguishing
+the old row-independent fallback from the exact shared-weight Q5_K kernel; a
+passing result is reserved for the published, checksum-pinned backend that
+actually dispatches that kernel. No speed or release claim is made by this
+falsifier.
+
+Rev 50 closes that coherence and dependency-publication hypothesis without
+claiming the still-unmeasured application speedup. `mlx-native 0.14.0` was
+published from merged main commit
+`32f076c7502151e7ca9cb20c06d0f3fe5e1d5641`; protected workflow run
+`32873363483` passed exact-source and packed-crate all-feature tests, crates.io
+publication and byte verification, a downloaded-registry test, tag/release
+creation, and GitHub release byte verification. Independent downloads of both
+registry and GitHub assets produced the exact crate SHA-256
+`c7b359aa9ea2603f58b49151ba54e37ed1aac10e76faf530865ea30a95f051b4`, and
+tag `v0.14.0` resolves to that exact commit. hf2q now has one exact crates.io
+lock record for that version and checksum; full locked metadata, dependency
+provenance, shipping, artifact-matrix, and generative-swap contracts pass.
+
+The same 67-token Qwen3.8 Q5_K_M repeated-verifier gate then passed all 127
+rounds / 508 post-seed decisions in 42.81 seconds and emitted the observed
+`kernel_mul_mv_q5_K_f32_mN_r1_4` route canary. The stored-execution evidence
+fixture exposed and corrected one stale expectation from rev 48: prompt and
+decode now each record 14 operations because both layers use the shared fused
+gate/up/SILU identity, for 28 total rather than the former 30-operation mix of
+separate prompt and fused decode paths. The exact binding set, catalog seal,
+and substituted-backend-version mutation pass. The historical ViT arithmetic
+pin is unchanged. These are dependency, route, and trajectory receipts; the
+clean release-binary OFF/ON ABBA remains the speed authority.
+
+Rev 51 rejects the assumption that a single-dispatch fused Q5_K gate/up/SILU
+kernel is faster than the exact separate route merely because it encodes fewer
+GPU dispatches. On the exact `54898f06c9f9d3ee1c345cb4ed02aa34fd5faed7`
+hf2q source and binary SHA-256
+`4d99f0c3c1f9f6de748ebabbb632f28a4dd6f03047ddca2699cb75c3dc47aa85`,
+the five-width physical gate ran the hash-bound 19,535,701,568-byte Qwen3.8
+Q5_K_M artifact with speculation off and exact scalar replay per lane. The
+unfused receipt is
+`/opt/hf2q-evidence/qwen38-q5-fusion-off-54898f06/summary.json`; the immediate
+fused confirmation receipt is
+`/opt/hf2q-evidence/qwen38-q5-fusion-on-recheck-54898f06/summary.json`. Both
+passed all widths. Completed-wave throughput for unfused versus fused was
+22.582/11.637, 30.845/14.491, 34.158/17.388, 29.903/16.574, and
+24.161/16.955 tokens/s at widths 1/2/4/8/16: respective speedups of 1.940x,
+2.129x, 1.964x, 1.804x, and 1.425x. Command-buffer submissions were unchanged
+at every width, falsifying submission count as the explanation. Worst TTFT
+also improved at every width.
+
+The resulting product decision is smaller than a new kernel: Q5_K is removed
+from hf2q fused-FFN eligibility and uses the already exact separate gate/up
+route for scalar and rectangular execution. hf2q's unused Q5 fused wrapper and
+trace surface are removed; qualified IQ4_NL, Q4_K, Q6_K, and Q8_0 fused routes
+remain unchanged. A future weight-sharing fused Q5 kernel is an open
+hypothesis, not a dependency: it may replace the separate route only after
+bit-exact scalar authority and a matched physical ABBA beat this measured
+default. The production-default clean-binary rerun remains the landing proof.
+
+The first BF16 matched-peer ABBA at the same source commit is retained only as
+falsification evidence. hf2q's median internal decode rate was 28.411 tokens/s
+versus 27.333 for the pinned peer, but the calibrated code and repeat speed
+bands overlapped; the gate correctly returned `inconclusive, not parity` and
+published no summary. Independent review also found that its sealed launch
+receipt inverted the actual MVN/MV_EXT settings, and that related matched-
+physical contracts used a non-causal speculation window, engine-specific
+token counters as a cross-engine code unit, and ambiguous per-engine cache and
+speculation labels. Those proof contracts must derive and validate actual
+launch policy, bracket only timed waves, use common task-wall/request units,
+and bind each engine's cache/speculation configuration before any matched-peer
+speed result can be accepted.
+
+Rev 52 records the clean production-default proof after the Q5 decision
+landed. Runtime commit `e260fade641933d7453ddb5b42b7214f9a9bd725` combines
+the exact Q5 route correction with causal matched-reference receipt
+contracts. Its
+release binary SHA-256 is
+`770e9e7f050459d0922fe2766684127fe612b8807a293d0c4387d86f4156626a`.
+With no `HF2Q_FUSED_GATE_UP_SILU` override, receipt
+`/opt/hf2q-evidence/qwen38-q5-production-e260fade/summary.json` passed exact
+scalar replay at physical widths 1, 2, 4, 8, and 16. Completed-wave throughput
+was 22.125, 29.716, 33.781, 34.110, and 41.964 tokens/s. Relative to the
+immediate fused confirmation in rev 51, those results are 1.901x, 2.051x,
+1.943x, 2.058x, and 2.475x faster; internal aggregate decode throughput also
+improved at all five widths. Model-free policy, five-codec exact-operator,
+four-position real-artifact, and repeated 508-decision gates are green. The
+real-artifact gates require the native Q5 multi-row route canary and reject the
+retired fused-Q5 route canary. This proves the production default and its
+format/width coherence; it does not substitute for the still-open causal
+matched-reference and full agentic-lifecycle authorities.
+
+Rev 53 records the deciding causal comparison and reformulates the next
+hypothesis from measured phase data. Exact commit
+`634d638c1c5ffd3b7d5183e905ff7a7411c9156f`, binary SHA-256
+`e6b5900860a12b9f084ff6af1a2f9c51516aa489238e229a7949df6aeca00880`,
+and the rev-52 Q5 artifact completed a stable four-leg hf2q/reference/
+reference/hf2q run at
+`/opt/hf2q-evidence/qwen38-q5-matched-peer-634d638c`. Quality and thermal
+checks passed, but the speed gate correctly refused a summary: hf2q's worst
+code/repetition end-to-end rates were 30.675/26.474 tokens/s versus the
+reference's best 38.877/33.941. Speculation acceptance was not the cause:
+hf2q accepted about 95.2% of measured draft tokens versus about 94.5%, with
+161 versus 165 target-verification rounds.
+
+The follow-up phase receipt
+`/opt/hf2q-evidence/qwen38-q5-mtp-phase-634d638c-v2/server.log` captured 36
+exact K=3 rounds. Mean target verification was 90.99 ms. The instrumented
+GPU-busy bucket reported 5.49 ms, but this is only a lower bound because it
+records blocking submissions and excludes asynchronous GPU execution; the
+remaining 85.51 ms is therefore unattributed residual, not CPU time. Every four-row verifier emitted
+exactly 163 command buffers/submissions, 18 host synchronizations, and 1,347
+dispatches. Source inspection then found a narrower live predicate than the
+documented GPU-only contract: resumed short full-attention ops1-4 treats
+`gpu_only_prefill_resume` as non-blocking, but ops6-7 ignores the same proven
+condition and executes a blocking wait once per full-attention layer. The
+first deciding spike therefore adds that existing predicate to the ops6-7
+non-blocking branch. It is accepted only if four-row/scalar trajectory and
+cache handoff remain exact, synchronization count falls from 18 to the
+structural terminal floor, and normal-mode verifier wall improves. If the
+remaining 163 submissions still dominate, the next measured hypothesis is
+to compose the existing TQ write, direct packed-KV attention, and ops6-7
+dispatches into the caller-owned layer encoder without changing arithmetic.
+
+Rev 54 closes that first hypothesis as falsified. Exact spike commit
+`c6172f8f98ea93199201f29e7ce0484a904ad2fc` and release-binary SHA-256
+`4e6862fd8c650aa1beec842832c52a35d08ffec9f67f22591b4d2a503127293c`
+passed Q5 four-row/scalar trajectory, native-route, and cache-continuation
+proof. Its matching 36-round receipt at
+`/opt/hf2q-evidence/qwen38-q5-mtp-phase-c6172f8f/server.log` reduced every
+verifier from 18 synchronizations to 2 while preserving 163 command buffers,
+163 submissions, and 1,347 dispatches. Mean verifier wall moved only from
+90.99 ms to 90.34 ms (0.7%, below the noise/acceptance floor), and output
+content was byte-identical. The wait-only code change is therefore removed
+from the landing diff. The deciding next hypothesis is submission
+composition, specifically a caller-encoded resumed TQ full-attention stage;
+its falsifier must reduce actual submissions, preserve all dispatches and
+exact trajectory/cache state, and beat the 90.99 ms baseline in normal mode.
+
+Rev 55 closes submission composition as falsified. Exact spike commit
+`ebc1105205a6881b0ebfbbc6b07cdf03a14d4428` and release-binary SHA-256
+`8670a60826453f0ac5490635dfeb8c197555173a5ceebc8b15e46e14ecea0707`
+passed the native Q5 four-position, segmented-boundary, rectangular-state,
+cache-continuation, and caller-encoded direct-TQ equivalence gates. Its
+36-round receipt at
+`/opt/hf2q-evidence/qwen38-q5-mtp-phase-ebc11052/server.log` reduced every
+verifier from 163 to 115 command buffers/submissions and from 18 to 2 host
+synchronizations while preserving all 1,347 dispatches. Generated content
+remained byte-identical (SHA-256
+`8bfc5303550444ed92150d1375a07d2f2d9d57ab64a3a86ac401630ed86acd2b`).
+Mean verifier wall improved only from 90.99 ms to 89.45 ms (1.7%), and request
+decode rate from 37.10 to 37.90 tokens/s (2.2%); both miss the pre-registered
+5% acceptance floor. The composition code is removed from the landing diff.
+The next deciding measurement must attribute asynchronous GPU execution by
+kernel on the unmodified production graph. A following optimization is
+admitted only when it targets measured dominant kernel work or increases
+useful accepted tokens per target verification; submission-count reduction
+alone is no longer a sufficient hypothesis.
+
+Rev 56 corrects the first asynchronous GPU attribution before admitting the
+next spike. The clean Metal trace is
+`/opt/hf2q-evidence/qwen38-q5-metal-trace-8d707c3a/metal-clean.trace`;
+its exported encoder and GPU-interval tables contain no inherited process
+environment. A direct grouping by command-buffer label assigned 2,083.922 ms
+to `layer.gdn.stage_a` and 700.013 ms to `layer.full_attn.ops1-4`, but those
+names are termination boundaries rather than exclusive operator ranges when
+`HF2Q_ENCODER_SESSION=1`. Every nonterminal DenseQ FFN ends with
+`carry_into_next_stage`, whose sessioned arm emits only a memory barrier. The
+next attention fence therefore commits the still-open command buffer and owns
+the trace label for both the preceding layer's residual/FFN work and current
+attention Stage A. The trace independently fits that source fact: interval
+counts are 1,946:647 (3.008x, the model's 48:16 linear/full-attention layer
+ratio) while mean interval GPU times are nearly equal at 1.0709 and 1.0819 ms.
+The trace does **not** prove DeltaNet Stage A consumes 52% of verification;
+that interpretation is rejected. A future phase receipt must either terminate
+at exclusive operator boundaries or enable per-kernel shader attribution.
+
+The next admitted hypothesis is narrower and independently measured. On clean
+`mlx-native` main `32f076c`, the checked-in single-tenant Q5_K width-four test
+at `M=4, N=K=5120` measured scalar-tree 98.486 us, current exact mN 79.683 us,
+and the inexact reduction route 46.929 us (medians of five 100-call GPU-timed
+samples). The faster route is not admissible because it changes the reduction
+tree and already failed whole-model trajectory equality. H3 instead pairs two
+output rows per SIMD group in the exact mN kernel and reuses each activation
+tile across the pair, while retaining each row/column's scalar block walk,
+accumulation order, and `simd_sum` tree. This is the Q5 analogue of the existing
+exact Q6 NR2+mN structure and is codec-wide rather than Qwen-specific.
+
+H3's smallest spike uses the served artifact's real Q5 shapes (`K=5120`,
+`N=10240` QKV and `N=6144` gate), plus odd/tail shapes and physical widths
+2 through 8. It must be bit-identical to the scalar authority for every output
+and improve the median GPU time of both real shapes by at least 15% over the
+current exact mN kernel before production routing changes. A promoted candidate
+must then preserve the Qwen3.8 four-position and repeated-verifier trajectory,
+cache continuation, all-format/physical-width matrix, and improve normal-mode
+mean verifier wall by at least 5% against the 90.99 ms rev-53 baseline. Missing
+either speed floor falsifies H3: remove the routing/kernel candidate, retain
+only the measured conclusion, and reformulate from exclusive kernel evidence.
+
+Rev 57 closes H3 and its two narrower reformulations as falsified. The first
+paired-row implementation reused each activation tile across two output rows.
+The existing width-2-through-8 byte gate stopped it before performance: at
+width 2, row 1 changed from `5.674408` to `5.674407` (two F32 ULPs). The
+activation-sharing form is therefore incoherent and removed. A geometry-only
+pair then ran the original mN body independently for each row. It passed exact
+parity at every production width, but improved the 5120x5120, 6144x5120, and
+10240x5120 kernels by only 0.9%, 1.0%, and 1.2%, respectively; it misses the
+15% kernel floor and is removed.
+
+The second reformulation explicitly loaded each block's 24 packed Q5 bytes
+once before the four-column loop, without moving a floating-point operation.
+It remained bit-identical but regressed all five measured shapes: current
+exact mN versus packed-hoist GPU medians were 79.689/80.591 us (5120x5120),
+95.671/96.785 us (6144x5120), 159.621/161.514 us (10240x5120),
+272.662/275.264 us (17408x5120), and 285.957/287.441 us
+(5120x17408). The compiler's existing packed-load plan is better; that code
+is removed. Finally, a four-SIMD-group scheduling spike exceeded this heavy
+kernel's executable threadgroup shape and left guarded output rows unwritten,
+so it did not reach a timing gate. The original two-group geometry is restored.
+
+No Q5 production kernel or route changes survive rev 57. The useful benchmark
+extension retains the real QKV, gate, FFN gate/up, and FFN down shapes. The
+next optimization may not infer a hot kernel from compound command-buffer
+labels: it must first obtain exclusive per-kernel shader timing or add
+operator-exclusive measurement boundaries, then pre-register a lever against
+the measured winner. The 46.9-us inexact route remains a headroom indicator,
+not an admissible implementation.
+
+Rev 58 admits the next measurement, not an optimization. A diagnostic-only
+`HF2Q_QWEN_EXCLUSIVE_PROFILE=1` spike must fail closed unless encoder-session
+composition is disabled, then use mlx-native's existing
+`CommandEncoder::profile_stage_boundary` to terminate and GPU-time Qwen
+verifier operator groups. It separates dense FFN gate+up, SiLU, and down;
+DeltaNet pre-norm, QKV projection, gate projection, convolution/capture, and
+split; and the recurrent branch's norm/projection/recurrent/output groups.
+With the preceding FFN no longer carried into the next layer's command buffer,
+the existing full-attention stage labels also become attributable apart from
+their small residual-add predecessor. Profile-mode request wall is not a speed
+claim: synchronous boundaries deliberately destroy production overlap. The
+deciding receipt is the GPU-time ordering and reachable share of those groups,
+cross-checked against the clean production trace and model-free operator
+microbenchmarks. The spike selects exactly one next performance hypothesis;
+its instrumentation is removed from the landing diff unless a focused test
+proves the opt-in diagnostic itself remains useful and default-off.
+
+Rev 59 closes that measurement and rejects both attention and submission
+overhead as the next primary target. The diagnostic source was based on exact
+commit `cabbf44e8c169c42031daefb5b00a239cb9279f4`; its release binary SHA-256
+was `444e258c4b06406d31798118672cba31ad83abe5bcc935621d8c19643c606cab`.
+It served the same 19,535,701,568-byte Qwen3.8 Q5_K_M artifact, prompt,
+temperature-zero settings, single physical slot, TQ KV, and AUTO speculation
+as revs 52-55. The 256-token request reproduced the exact accepted Rust
+completion from the production trace. A second 32-token request reused 59
+cached prompt tokens and supplied eight width-four verifier forwards for the
+deciding aggregate.
+
+Those eight forwards measured a 102.625 ms median total under the deliberately
+serialized diagnostic boundaries. Dense FFN gate+up was 42.640 ms median and
+down was 20.590 ms: 61.6% of measured GPU time together. The next largest
+groups were DeltaNet QKV projection at 8.555 ms, the post-recurrent/out
+projection range at 6.700 ms, DeltaNet gate projection at 6.610 ms, and the
+MTP shared head/argmax at 5.740 ms. Full-attention ops1-4 and ops6-7 together
+were 7.100 ms (6.9%). A width-seven verifier sample independently assigned
+66.5% to the same dense FFN projections. The synchronous profile wall is not
+compared to the 90.99 ms production wall; only operator ordering and reachable
+share are authoritative.
+
+The diagnostic boundaries are removed from the landing diff. The next
+hypothesis must target the exact native Q5 dense FFN projection route while
+preserving weight bytes, per-output arithmetic/reduction order, and target
+trajectory. It may not repeat the already falsified fused-Q5, shared-
+activation NR2, geometry-only row pairing, packed-byte hoist, or four-
+SIMD-group scheduling spikes. Its smallest gate is model-free byte equality
+at the served 5120x17408 gate/up and 17408x5120 down shapes, followed by a
+matched real-artifact verifier test. Production admission still requires at
+least 5% lower normal-mode verifier wall with identical output/cache state;
+otherwise the candidate is removed and the measured conclusion retained.
+
+Rev 60 admits the first source-bounded reformulation from that profile. The
+exact Q5 mN kernel currently executes two independent SIMD groups per
+threadgroup, one output row per group. A four-group expansion already failed
+the executable heavy-kernel shape in rev 57, but the opposite occupancy
+hypothesis remains untested: one SIMD group per threadgroup may permit more
+resident groups or avoid threadgroup-level register pressure while leaving the
+packed-weight walk and every floating-point operation unchanged. H5 therefore
+duplicates only the dispatch geometry and row mapping, not the arithmetic
+body. It must first match scalar authority bit-for-bit for physical widths
+2 through 8, including odd/tail rows. It proceeds only if the weighted median
+GPU time across the served FFN gate/up (`5120x17408`) and down
+(`17408x5120`) shapes improves by at least 10% over the current exact mN
+route. A miss removes the candidate and records the result; a pass advances
+to the rev-59 whole-model 5% verifier gate.
+
+H5 was bit-identical to scalar authority at every physical width, but failed
+the performance gate and is removed. Current two-group versus one-group GPU
+medians were 79.745/80.213 us (`5120x5120`), 95.759/96.179 us
+(`5120x6144`), 160.956/161.643 us (`5120x10240`), 274.953/278.031 us
+(`5120x17408`), and 288.274/289.209 us (`17408x5120`). Every shape
+regressed by 0.3-1.1%; the gate/up/up/down FFN-weighted result regressed 0.85%.
+The production kernel, dispatcher, and dispatch-trace contract were restored
+exactly. Only the real-shape benchmark extension remains as reusable evidence.
+
+Rev 61 admits H6 from a fresh source audit. In the exact Q5 mN shader, `R1`
+is compile-time but `nb = K / 256` remains runtime. The served gate/up shape
+always has `K=5120`, hence exactly 20 blocks and five `i += 4` iterations per
+lane. H6 adds one function constant for that block count and binds it only on
+the exact Q5 `K=5120` route; every other K retains the generic runtime value.
+It changes no buffer layout, dispatch geometry, weight bytes, per-column
+loads, floating-point operation, or reduction order, and creates no converted
+or repacked model state. The parity gate covers odd N, poisoned output, and
+physical widths 2 through 8 against scalar `to_bits`, plus generic fallback
+at other K. Performance uses paired warmed medians on the real
+`5120x17408` gate/up shape. A stable projection win of at least 2% advances
+to the exact whole-model verifier gate; landing still requires a reproducible
+positive normal-mode verifier delta with identical output/cache state. A miss
+removes the function constant and records the conclusion.
+
+H6 remained bit-identical at every specialized physical width, but missed its
+speed floor and is removed. Candidate commit `502b3d0` and restored-control
+commit `84863cb` used the same extended real-shape benchmark. Across three
+warmed runs per state, the real `5120x17408` gate/up GPU-time medians were
+269.903/269.772/269.751 us specialized versus
+274.949/274.821/274.765 us restored, a 1.84% median time reduction rather
+than the required 2%. The other K=5120 shapes reduced median time by
+1.5%, 1.7%, and 2.8%; the unspecialized K=17408 down projection was
+unchanged within noise. Because gate/up is 41.5% of the measured verifier,
+the observed candidate reaches only about 0.8% of verifier wall before other
+overheads. No whole-model claim is made. FC703, its route binding, and its
+dispatch-trace surface are absent from the restored source; the reusable
+real-shape benchmark remains.
+
+Rev 62 admits H7, an exact input-traffic hypothesis with enough measured reach
+to clear the product floor. The current Q5 mN threadgroup runs two independent
+SIMD groups for two output rows; both groups load the same F32 activation
+values while walking different packed-weight rows. H7 leaves those row-local
+weight, scale, accumulator, and `simd_sum` operations untouched, but has the
+first group stage each activation tile once in threadgroup memory for both
+groups. This is not the rejected NR2 sharing form (one group never owns two
+row accumulators), not a cross-projection/fused FFN kernel, and not a weight
+repack. The kernel retains two groups and native GGUF views. Uniform barriers
+require the packed block count to be divisible by four; other shapes retain
+the current kernel. Odd output rows must remain bounds-safe without allowing
+one group to skip a threadgroup barrier.
+
+The smallest gate compares scalar `to_bits` at physical widths 2 through 8,
+odd N, poisoned output, and nonzero logical views, then GPU-times the served
+`5120x17408` gate/up and `17408x5120` down shapes. H7 proceeds only if the
+gate/up/up/down weighted median improves by at least 10%. A passing primitive
+then requires the Qwen four-position, repeated-verifier, cache-continuation,
+all-format/width, and normal-mode whole-model gates, including at least 5%
+lower verifier wall with byte-identical generated content and cache state.
+The primitive is codec-generic across dense Q5 projections; family graphs do
+not get separate implementations.
+
+H7 passed scalar byte parity at every production width, including the odd-row
+barrier case, but regressed far before the 10% speed gate and is removed.
+Candidate commit `933df9a` measured 519.427 us on the real gate/up shape and
+524.277 us on down, versus the restored controls' approximately 274.8 and
+288.3 us. The gate/up/up/down weighted projection cost rose about 86.5%.
+Ten uniform barriers per K=5120 walk plus 16 KiB of threadgroup storage at
+width four cost much more than the duplicate activation reads; cache already
+serves those reads cheaply. Restore commit `a6ebf5a` removes the staged kernel,
+registry names, shared-memory dispatch, and trace contract exactly. The result
+also rejects the more complex cross-projection staged variant: it would pay
+the same storage/barrier cost while additionally replacing two already-
+concurrent dispatches.
+
+Rev 63 admits H8, a deliberate arithmetic-authority spike rather than another
+attempt to preserve the slower scalar tree. The existing Q5 q4x4 route is
+about 41% faster at width four, but it cannot be used only by the verifier:
+ordinary one-row target decode would then follow a different reduction tree
+and exact speculative verification would be impossible. H8 therefore adds a
+Q5-only q4x4 `R1=1` kernel and fixes `nxpsg=8` for Q5 at every physical width
+1 through 8. Every column of R1=2/3/4/5 must match an independent R1=1
+dispatch bit-for-bit. Q4 and Q6 retain their current authorities. Native Q5
+GGUF bytes are read directly and dequantized inside the kernel; no stored
+dequantization, requantization, interleaving, or model-state rewrite is
+permitted.
+
+The gate sequence is fail-closed. First, model-free tests cover distinct Q5
+bytes and inputs, odd N, poisoned outputs, logical views, K=5120 plus a second
+valid K, tail widths, and runtime/precompiled pipelines. Second, paired GPU
+timing covers both M=1 and M=4 at the served gate/up and down shapes; a faster
+verifier path is rejected if ordinary M=1 erases the end-to-end gain. Only
+then may a codec-specific frozen routing policy precede current Q5 mN. The
+candidate policy must pass 127-round one-row/four-row decision and cache-state
+equality, speculation OFF/AUTO exact target trajectory, fixed-corpus quality,
+agentic tool semantics, and at least 5% lower normal verifier wall. Equality
+to the former scalar-tree trajectory is not claimed; former-versus-candidate
+is a quality comparison. The policy is codec-wide for native dense/shared Q5
+projections across applicable families, while routed expert kernels remain
+separate.
+
+Rev 64 accepts H8's deciding spike and promotes it to a release candidate.
+The initial mlx-native candidate `e87a63d` passed model-free `to_bits`
+equality for packaged and runtime-compiled Metal, widths one through eight,
+odd output rows, distinct inputs, nonzero logical views, and buffer canaries.
+The specialized implementation remains internal to the validated canonical
+matmul dispatcher; model weights stay in their native Q5_K GGUF blocks. The
+codec-wide default is enabled independently of model labels, with an explicit
+diagnostic opt-out. The obsolete fused Q5 gate/up operator is removed because
+its width-invariance did not make it numerically coherent with this canonical
+projection authority; hf2q had already stopped routing Q5 through it.
+
+On the exact 19,535,701,568-byte Qwen3.8 artifact (SHA-256
+`4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e`),
+127 verifier rounds produced 508 identical target decisions and cache state.
+A paired same-process verifier measurement reduced total wall from 6,105.525
+ms to 4,527.208 ms (25.851%), with round medians of 94.818 ms and 70.389 ms.
+The fixed 139-sample corpus retained 1.0 argmax agreement; perplexity moved
+from 1.514567 to 1.513641. The server OFF/AUTO gate retained all 24 exact
+target choices while the two accepted workloads improved by 83.36% and
+127.54%. A four-slot agentic lifecycle additionally passed tool-call and
+tool-result continuation, cancellation, queued exact retry, prefix-cache
+reuse, isolation, and execution-identity checks.
+
+The separate 25,043,007,488-byte Qwen3.6 Q5_K_M artifact proved the same
+canonical route at one and four rows while its 120 observed expert calls
+remained on `mm_id`; this closes the dense/shared applicability question
+without rerouting MoE experts. The staged Gemma4 and DeepSeek4 artifacts
+contain no Q5_K tensors, so their applicable proof is the codec-level
+model-free battery plus unchanged family gates, not a fabricated Q5 execution
+claim. The fresh-process ABBA timing was rejected because order/thermal spread
+dominated the candidate delta; only the paired same-process verifier result is
+admitted above.
+
+Rev 65 publishes that backend from merged mlx-native main commit
+`25b4eab6cd2de0d790c34d046473febf798543c4`. Protected release run
+`32917226470` passed immutable identity, minimum Rust, semver, audit, exact-
+source and packed-archive all-feature tests, crates.io publication and byte
+verification, downloaded-registry tests, tag/release creation, and GitHub
+release byte verification. Independent crates.io and GitHub downloads both
+hash to `09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822`,
+and tag `v0.15.0` resolves to the merged commit. hf2q now requires exactly
+`mlx-native = "=0.15.0"` and its sole lock record names the registry source and
+that checksum; the temporary local Cargo patch is absent.
+
+The first registry-pin falsifier also caught two integration defects before
+hardware qualification. The generic F32-keep predicate preempted Apex's
+explicit Q5_0 router policy, so an end-to-end converted router reopened as F32;
+planner precedence now preserves Apex Q5_0 while leaving standard conversion
+at F32, and the complete 18-test conversion integration suite passes (17 pass,
+one pre-existing ignored RSS fixture). A GPU lock-discipline test initially
+stopped at a missing acquisition, then exposed an existing acquisition that
+was not the first statement; both proof defects are fixed. The complete binary
+suite now passes 5,121 tests with 66 explicit ignores and zero failures.
+
+This is not the final hf2q release claim. Clean-source all-format four-
+position, physical multi-slot, model-swap, full agentic lifecycle, and matched-
+reference gates remain required. Those harnesses must reopen the actual frozen
+process-policy log, and the Q5 artifact must additionally join a real `r1=4`
+dispatch canary; an environment value or receipt field alone is not execution
+proof.
 
 **Lane B gates:** B.0 byte-identity (cohort+concurrent-decode); cooperative receipt regime (≥5 alternating serial/cooperative pairs, sustained median faster, peak RSS recorded, independent receipt verification); thermal contract (Nominal start, continuous Fair-or-better, no gap >5 s, fail-closed); memory H3 (≤116 GiB peak beside the 100 GiB artifact); product ceilings unchanged (60 s cold / 15 s cached-automatic-SSE / 35 s tool-result — never widened); B4 decode-cohort gate re-pass; the two B.1 latency contracts.
 
@@ -111,6 +1609,259 @@ Mandatory regression (must exist before any restore path merges): build lineage 
 2. Document (not fix, this ADR) the two budget hazards: two independent 5%-of-RAM LCP budgets (engine.rs:3595-3597, engine_qwen35.rs:523-525 — same `default_lcp_byte_budget()` instantiated twice); `HF2Q_KV_PERSIST` carries THREE meanings (path — serve/mod.rs:974; `"0"` disable — :4457-4485; `"1"`/`"on"` enable — kv_persist/families/gemma4_dense.rs:21, kv_persist/index.rs:9). State the registry end-state: the SerialFifo registry + disk hydrate is the *permanent restart-hydrate tier* until the A.7 follow-on ADR replaces it — documented scope, not a stub.
 3. Import FreeToken's evaluation discipline into release evidence: report worst-case (tail) TTFT against client watchdog ceilings, not just means; an agentic-stability criterion (decode rate within a fixed % of single-turn under the N=4 workload); the A.4 strict-equality idle conservation audit; a reference-model invariant battery over the AnchorStore state machine (injected-mutation style — FreeToken's equivalent suite caught 17/17).
 
+### Qwen execution ledger — rev 18
+
+Model-free evidence from the implementation lineage beginning at `95d618c8`
+and its rev-6 gate-hardening checkpoint:
+
+- `qwen35_anchor_store` has an independent reference state machine and fourteen
+  focused tests. The mutation battery rejects 17/17 injected corruptions;
+  A→B→C/rewind removes B and C before branch X can write; pending state is
+  affinity-invisible; eviction is positional keep-newest-K; accounting charges
+  four committed payloads plus one pending payload exactly.
+- `slot_anchor_restore_preflights_every_payload_before_mutation` was added as
+  a falsifier before the restore refactor and failed against the interleaved
+  implementation: an invalid final recurrent payload left the cursor rewound
+  from 14 to 9. After the two-phase preflight/mutate refactor, the same test
+  proves all cursors, recurrent bytes, conv bytes, and parity remain unchanged
+  on validation failure.
+- `logical_buffer_copy_does_not_retain_chunk_sized_parent` proves the
+  speculative hidden row owns a fresh logical-size allocation after the
+  chunk-sized parent drops. Store accounting includes token/logit capacities,
+  every nested recurrent/conv allocation, cursor tables, and the detached
+  hidden row.
+- The SlotAware worker now stages captures as pending, publishes only after
+  the retained cache/ledger commit, selects the deepest epoch-valid match,
+  prunes descendants before the first divergent write, and clears the full
+  store before hard reset after failed restore, poison, or cold reset. A.8
+  fields emit in structured logs and Prometheus counters.
+- The initial per-slot 768 MiB envelope was falsified by the Qwen3.8 N=16
+  target: depth-4 is about 9.4 GiB while a default grant may be about 4.5 GiB.
+  The worker now resolves one immutable aggregate anchor-owned grant at startup,
+  derives artifact-and-N-specific committed depth, applies a live aggregate
+  pending preflight, and reports partial pending availability explicitly.
+  Qwen3.8 N=16 therefore remains a supported serving shape without memory
+  overcommit, but its receipt must report observed depth and pending-capacity
+  slots rather than imply depth-4/full-pending coverage.
+- Independent review found and this revision fixes five proof/accounting
+  defects: idle audit now binds physical target/MTP cursors to retained
+  ledgers; scheduler fixed bytes no longer double-charge the former single
+  anchor; invalid spec metadata no longer mutates store payload behind byte
+  accounting; the gate requires old C to restore only cold/A and uses a
+  SlotAware-specific spec counter; store control allocations are included in
+  exact owned bytes. Pending capture never grows committed control storage;
+  publication evicts before its push, and a deliberately tiny grant selects
+  zero control capacity instead of allocating then idle-failing. The rejected
+  oversized request is correctly classified as admission isolation. The
+  real-artifact script separately arms a one-shot failure only after a
+  successful non-empty GPU prefill slice and requires full-store invalidation,
+  hard-reset recovery, a cold unique-boundary retry, and reuse after rebuilding.
+  Its Qwen3.6/Qwen3.8 hardware receipts were open at rev 11.
+
+Rev 12 tested a selected-boundary one-forward hypothesis on the
+54,657,734,208-byte Qwen3.8 BF16 artifact SHA-256
+`f30d9a6ea40ca3c5265d0996a460ad1474173c40c8e7f04c0b03caf6084c2cee`.
+The timings below are retained as measured evidence of the available cost, not
+as an accepted implementation:
+
+- A 33-pair OFF/ON split-boundary sweep produced identical sampled normalized
+  responses. Median TTFT improved 25.86% at 66 prompt tokens, 35.40% at 70,
+  35.36% at 74, 34.68% at 82, 34.11% at 90, 28.80% at 97, then tapered to
+  6.80%/5.47%/3.55%/2.33%/0.40% at 193/321/577/1,089/2,113 tokens. This is the
+  measured effect of removing an internal duplicate forward, not a decode
+  claim or a universal equality proof.
+- A matched four-slot spec-OFF wave preserved all four output hashes and
+  physical scheduler/body/head width four. Wall time fell from 10.307992 to
+  8.78 seconds (14.8% less); summed decode throughput rose from 29.7958 to
+  34.7756 tok/s (16.7%).
+- The historical width-four AUTO lineage gate passed A→B→C, rewind to branch X,
+  rejection of stale old C, three live siblings, cancellation, transport-body
+  isolation (HTTP 413; not a model-context proof), injected post-admission GPU-slice failure
+  (HTTP 500), cold recovery, rebuilt reuse, and active speculative anchor
+  traffic. It reported configured slots 4, effective committed depth 4,
+  simultaneous pending capacity 4, aggregate grant 5,221,833,932 bytes, peak
+  owned bytes 473,856,856, 15 restore hits, 5 descendants pruned, and 145,466
+  slot-aware speculative anchor tokens.
+- The over-context arm now derives the live model context from `/v1/models`
+  and rejects a supposedly overflowing fixture unless its requested size is
+  actually greater. This closes the earlier vacuous 140,000-word attempt
+  against a 262,144-token model, which was valid input rather than admission
+  isolation.
+
+Rev 13 source-route review falsified the one-forward equality hypothesis even
+though those sampled responses matched. The candidate changes `M`, cache
+representation, or route selection relative to split execution for dense and
+quantized projections, fresh versus resumed full attention, recurrent versus
+chunked DeltaNet, MoE gate/up/down, output-head projection, and MTP. The
+runtime integration was removed. The associated native selected-state
+primitive was kept only on its experiment branch; it has no independently
+justified production consumer and was not published.
+
+Rev 13 also falsified the exact scheduler-coalescing spike from A.5. The ON
+logs prove both authoritative forwards executed before checkpoint staging;
+the OFF logs prove staging occurred between them. All 15 normalized responses
+matched. Median total-time deltas for suffix widths 0/2/4/8/12 were
++0.18%/+1.18%/+0.69%/-0.18%/-0.57%, respectively: noise to small regression,
+not a speedup. Independent review additionally bounded its cost with delayed
+cancellation and a live but not-yet-budgeted pending payload. The spike and
+its environment switch were removed. Native selected-capture work was not
+published: its only hf2q consumer belonged to the falsified enclosing-forward
+path, so backend PR #40 was closed with the branch retained as experiment
+evidence.
+
+Rev 14 executed that deciding block-segmented spike. Six focused model tests
+pass: the two-layer cold-TQ 33/8 route, a nine-layer K=8 interleave, warm peer
+isolation, exact write-generation rejection after a third suffix advance, a
+queued layer-4 projection failure canary, and warm nonzero MTP plus policy-OFF
+independent-cursor behavior. They compare exact logits, detached semantic
+rows, target/MTP cache bytes, boundary anchors, cursor/parity receipts, and
+actual dispatch-route tuples. Native ignored gates also pass on the exact
+Qwen3.8 Q4_K_M artifact below and Qwen3.6 APEX Q5_K_M SHA-256
+`f2c702182a4661d2cef573b388ff23336ce65aabb112762d1c1a24d4ba0cbc25`.
+
+The first independent production-route A/B used the checked-in
+`bench_qwen35_compound_boundary_ab.sh` harness on an M5 Max with the exact
+19.5-GB Qwen3.8 Q4_K_M artifact SHA-256
+`1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a`,
+speculation OFF, TQ KV ON, terminal K=8, four physical slots, temperature 0,
+and identical 2,113-token prompts split as 2,048 then stable-prefix 58 plus
+generation tail 7. Across three single requests and three four-client waves,
+all 15 candidate requests emitted the actual compound-route receipt and the
+main/candidate semantic plus token-count receipt SHA-256 was identical
+(`27f37665fefe092c42bc4d5a40ebfceff306cba905610ef05787373c1ab0f829`).
+Median single-request TTFT changed from 5,325.031 to 4,953.463 ms (7.50%
+faster), total wall from 5.375298 to 5.004268 s (7.41% faster), and the
+four-slot wave from 19.3892 to 19.0030 s (2.03% faster). This is the deciding
+spike, not the landing claim.
+
+The measured result accepts the block-segmented hypothesis for implementation
+and reformulates the remaining fail-closed gates. Before landing: reserve the
+full retained payload plus the compound route's incremental owned-buffer peak
+before any compound-specific allocation (the ordinary per-window Metal arenas
+are already bounded and admitted identically for either route);
+bind final anchors to their cache instance and source slot; validate token,
+KV, logits, and speculative payload shape before staging; inject failures
+after prefix-MTP mutation and at the engine publication boundary; compare
+ordinary production output independently with main; and prove native codec
+plus physical-width coverage in the dedicated matrix gate rather than
+rerunning the full semantic workload per encoding.
+Only after those gates pass does a larger matched run become publishable
+performance evidence.
+
+Rev 15 closed a proof-integrity defect exposed by that larger run before it
+could publish a result. Exact main `6655f965` predates the scheduler/body/head
+physical-width counters, but the first landing runner required those
+candidate-era metrics from both arms. The run therefore stopped on baseline
+trial one before producing an A/B verdict; this is instrumentation failure,
+not performance or model evidence. The executable contract now requires both
+arms to complete the same four concurrent client requests, records an old
+baseline's complete absence of all eight required counter/gauge samples as
+`physical_instrumentation: "unavailable"`, and rejects partial or duplicate
+telemetry.
+
+Rev 16 then falsified the assumption that this one-token prefill/TTFT workload
+should itself reach physical decode width four. All four candidate clients
+returned exact `READY`, but each prompt became decode-ready one at a time; its
+single useful token plus stop completed before the next 65-token tail. The
+honest counters were scheduler/body/head maximum width one, four scheduler
+steps, four handles, four target forwards, and four rows. Requiring width four
+would optimize the fixture by delaying a semantic first token, not prove the
+compound-prefill benefit. This gate therefore records candidate physical
+instrumentation and observed width without claiming decode batching; the
+separate long-output physical multi-slot matrix remains the authority for that
+property.
+
+The same review found three more proof hazards and the runner closes all of
+them: acceptance minima are immutable and recorded (1.01× single TTFT, 1.0×
+single wall, 1.0× four-client wall); existing or nonempty evidence directories
+are rejected and the schema-3 pass receipt is atomically published without
+overwrite; and four fresh processes run in baseline/candidate/candidate/
+baseline order with every raw timing sample retained. The executable fixture
+is blocking CI. Both failed evidence directories remain retained, and neither
+contains a publishable speed verdict.
+
+Rev 17 ran the corrected schema-3 gate at exact candidate `d9370ca5` against
+exact main `6655f965`, using the qualified Q4_K_M artifact above and two fresh
+processes per arm in baseline/candidate/candidate/baseline order. Ten raw
+samples per arm produced medians of 5,641.102 versus 5,218.499 ms for single
+TTFT (7.49% lower candidate latency), 5.692077 versus 5.275830 seconds for
+single wall (7.31% lower), and 24.019550 versus 21.783300 seconds for the
+four-client wave (9.31% lower wall, or 10.27% higher wave throughput). The
+semantic SHA-256 `498fe0ab70c4fb14f5825105cb076114eb2e064668855c8a1fa132342de9b36f`
+matched across all 100 responses; the candidate emitted exactly 50 compound-
+route receipts. All ten candidate waves honestly reported scheduler/body/head
+maximum width one for the one-token response, so this result claims compound-
+prefill latency and concurrent-client wall improvement, not physical decode
+batching. The immutable receipt is
+`/opt/hf2q-evidence/qwen38-compound-d9370ca5/receipt.json`; cross-codec,
+cross-family, and matched current-reference gates remain independently
+required.
+
+Rev 20 ran the full SlotAware semantic-state gate on an M5 Max at exact
+runtime commit `0da66164`, using the 19.5-GB Qwen3.8 Q4_K_M artifact above,
+four physical slots, speculation AUTO, and a fresh 20,576-token opening
+prompt. The immutable summary is
+`/opt/hf2q-evidence/qwen38-anchor-0da66164-proof/summary.json` (SHA-256
+`3c17ae0fadbb073b9b9811478b88a411a3876abbc880dcaed03c92a0b4789982`).
+The gate passed A→B→C, rewind to branch X, stale-old-C rejection, four
+concurrent clients, cancellation with three live siblings, exact model-level
+context rejection (HTTP 400 at 300,052 tokens), and a one-shot failure after a
+successful non-empty GPU prefill slice (HTTP 500). The failure cleared the
+store and forced the unique boundary cold (`cached_tokens=0`); after rebuilding,
+the same lineage reused 20,696 tokens. Across the run there were 12 restore
+hits, five descendant prunes, and 226,958 speculative-boundary tokens restored.
+Configured slots, effective committed depth, and simultaneous pending capacity
+were all four; the 4,229,595,955-byte aggregate grant held a measured
+631,971,868-byte peak. The earlier default 4,096-line fixture produced 163,936
+prompt tokens and timed out after partially processing 151,552 tokens; it is
+falsification evidence for that gate default, not an anchor failure. The
+reproducible default is now 512 lines, and the overflow fixture stays below
+one MiB so transport admission cannot masquerade as model-context proof.
+The orthogonal native-format/physical-width matrix at exact commit `4d66f9bc`
+passed Qwen3.8 BF16, Q4_K_M, Q5_K_M, Q6_K, and Q8_0 at physical widths
+1/2/4/8/16 with exact scalar replay per lane; its receipt is
+`/opt/hf2q-evidence/qwen38-physical-multislot-4d66f9bc/matrix.json`. This is
+why rev 20 removes codec-by-width duplication from the semantic-state gate,
+not why codec coverage is omitted.
+
+Rev 21 ran the same product gate on the 25,043,007,488-byte Qwen3.6
+35B-A3B APEX Q5_K_M artifact at exact runtime commit `0da66164`. This is the
+40-layer, 256-expert/8-active MoE shape and is materially different from the
+dense 48-layer Qwen3.8 cell. The first spike completed the ordinary lineage
+work (12 restore hits, 247,133 tokens saved) but correctly falsified the gate's
+assumption that every artifact carries speculative boundary state: the live
+capability gauge was zero. The gate now requires positive speculative carry
+only when `hf2q_qwen_anchor_spec_boundary_capable == 1`, and requires an exact
+zero delta otherwise. The fresh corrected run passed the full four-slot
+lineage/cancellation/context-rejection/post-GPU-failure sequence, reused 20,658
+tokens after rebuilding from the forced cold recovery, pruned five stale
+descendants, and reported full committed depth plus pending capacity at four
+slots. Its summary is
+`/opt/hf2q-evidence/qwen36-anchor-0da66164-proof-v2/summary.json` (SHA-256
+`53d7a81b40be7264b88cbcfe5cadb8174a6ce04d6942168163f7bf1e80be3e99`).
+The server mapped 25,031,311,360 native matrix bytes directly from the GGUF,
+allocated zero anonymous matrix bytes, retained the conversion-time Q8_0
+output head, and reported a 0.09-second load wall plus 19 ms warmup. The Qwen
+family's real-model Lane A proof is therefore complete; Gemma4 and DeepSeek4
+remain distinct state-engine proofs rather than Qwen gate variants.
+
+Rev 22 then ran the family-neutral product gate on Gemma4. The full receipt,
+native-storage accounting, corrected canonical warmup, and cancellation
+reformulation are recorded in §A.6. This closes the Gemma state-engine cell
+without claiming cross-slot checkpoint sharing or duplicating the state test
+across behaviorally identical quant encodings.
+
+Rev 23 ran the same product gate on the 100.05-GiB DeepSeek4 Q2 artifact. The
+full state-engine receipt, native-storage accounting, validated hash-route
+classification, and elementwise-state loader correction are recorded in §A.6.
+This closes Lane A across every supported generative serving family.
+
+Open proof work is now Lane B-specific: finish the tail-TTFT and append-only
+no-regression receipts and execute Lane B's measured family-generalization
+workload. Native GGUF codec and physical slot-width coverage stays in the
+dedicated matrix gate, so the state-machine proof is not repeated for
+behaviorally identical weight encodings.
+
 ## Falsified findings and open hypotheses (studied, decided, documented)
 
 Framing (Robert): items below are either FALSIFIED with evidence in hand, or OPEN HYPOTHESES whose deciding spike is named — never silently parked scope.
@@ -119,7 +1870,7 @@ Framing (Robert): items below are either FALSIFIED with evidence in hand, or OPE
 |---|---|---|---|
 | q\* CPU–GPU co-execution | FALSIFIED (for this hardware) | One memory controller: CPU matmul adds no aggregate bandwidth to a BW-bound decode and cannot be bit-identical to Metal kernels (coherence gate). FreeToken's own degenerate limit (B_H→B_P ⇒ q\*→m) is this hardware's whole regime. | None on unified memory; the *method* (measured contended-pair bench → closed-form policy) stays reusable for genuinely disjoint domains. |
 | Global LRU expert cache + elastic expert↔KV pools | OPEN HYPOTHESIS | Target models fit wired in 128 GiB today; no capacity misses exist. SSD-as-PCIe analog is ~5–7 GB/s vs their 25–53 — a harsher regime that the hypothesis must survive. | Spike: serve an artifact (or synthetic constraint) exceeding RAM through the deepseek4 mmap/residency seam (residency.rs:75-120) and measure page-in behavior + decode floor. Runs when a >DRAM model is targeted. |
-| Elastic pool rebuild control plane | OPEN HYPOTHESIS (honestly NOT covered in hf2q's idiom today — scheduler high-water is monotonic by design, scheduler.rs:1051) | Not justified by current single-grant serving. | Spike: telemetry on pool-pressure / hot-swap contention events. If a KV-grant resize is built, crib FreeToken's *ordering* (fit-check before destructive free; rollback on failure), not its mechanism. |
+| Elastic pool rebuild control plane | PARTIAL SPIKE: the worker primitive is source-coherent; manager policy and performance remain OPEN | A drained worker can release checked KV/prefix/scratch/capture ownership while retaining mapped weights. Receipts are not capacity credit because the current pool never charged those bytes. An indeterminate park acknowledgement permits only shutdown/full eviction. | Next: separately charge a nonzero configured mutable reservation, active-only lookup, reserve-before-reactivate, fresh generation publication, and full-eviction rollback for projector/KV-persist or non-cofitting entries; then matched A→B→A hardware proof. |
 | bf16 chunk-pipeline state capture | FALSIFIED (for production capture) | The experimental FLA-style chunk path materializes per-chunk states like FreeToken's, but in bf16 — restore is not byte-identical (bf16 accumulation already failed the W-5b.3 walk-bar at pp4096). | An exact-F32 side channel is a legitimate new hypothesis, under its own ADR. |
 | Dense 64-token stride anchors | OPEN HYPOTHESIS | See A.7. FreeToken itself only keeps the deepest crossed boundary per forward. | A.8 divergence-position histograms; decision ladder in A.7. |
 | FTW weight format / graph capture | Not needed | hf2q already loads role-aware zero-copy GGUF into Metal buffers; mm_id grids are routing-independent so recorded-CB replay is routing-safe. | — |
@@ -132,33 +1883,55 @@ Framing (Robert): items below are either FALSIFIED with evidence in hand, or OPE
   - HIGH — the engine_qwen35.rs prefill-chunker region (`qwen35_next_prefill_end` :3635-3648, emission :3966-3985) and the engine.rs transaction-ceiling logic (16729-16749): `35e42b28` already widened single-slot to 4,096; the Lane A invariant *transaction end == stable boundary* must survive every further widening. Co-review any change to either.
   - MEDIUM-HIGH — anchor payload carries `spec`/`mtp_current_len`; `HF2Q_QWEN_SPECULATION` defaults to `auto` at HEAD (qwen35_speculation.rs:13-14, :55-57). Payload-shape changes co-review with the speculation lane.
   - MEDIUM (registry tier only) / LOW (anchor store) — KV-packing/quant changes: state-only anchors are packing-independent (cursors + F32 DeltaNet state).
-  - Safe in parallel: kv_persist/*, handlers.rs boundary oracle, load_info.rs accounting; Lane A touches no forward/spec/MTP kernel code.
+  - HIGH — any future segmented-boundary path touches `forward_gpu.rs`,
+    recurrent DeltaNet/convolution state, native output-head projection, and
+    the MTP pending-hidden payload. Changes there must preserve per-segment
+    route identity, terminal-state provenance, and whole-operation rollback;
+    the split-forward path remains the authority.
+  - Safe in parallel: kv_persist/* and unrelated artifact/accounting work that
+    does not alter anchor payload ownership or admission grants.
 - Order: Lane C + Lane A.1–A.4 (one branch, spike-first per the kata) → Lane A gates → A.6 parity branches → Lane B.0 spike branch (may run concurrently with A.6) → B.1 only after B.0 passes. Release-scope window for the first merge: next open minor after 0.1.10 (confirm with `hf2q/release/status`).
 
 ## Acceptance (the ADR is DONE when)
 
-- [ ] A.1–A.4 landed for the qwen35-family engine with all six Lane A gates green on the artifacts the lane actually serves — both Qwen3.6-35B-A3B and Qwen3.8-27B (receipts linked here).
-- [ ] Family coverage complete per the scope directive: gemma4 and deepseek4 anchor stores landed under the same invariants and gates.
-- [ ] B.2 family-generalization spike executed for qwen35-family and gemma4 MoE prefill, with either the required aggregation phases opened or the falsification recorded with measurements.
-- [ ] Payload-ownership regression (no retained parent allocations) and the preflight-then-mutate `restore_slot_anchor` refactor landed.
-- [ ] A.2 lineage regression and the new SlotAware divergence gate exist in `scripts/` and fail closed.
-- [ ] Telemetry (A.8) emitting in production logs.
-- [ ] Lane C doc corrections merged; budget hazards + registry end-state documented in operating-kv-cache.md; ADR-017-per-family-status row updated.
-- [ ] B.0 spike verdict recorded here (pass → B.1 executed with contracts; fail → linked successor ADR).
+- [x] A.1–A.4 landed for the qwen35-family engine with the model-free battery
+  and one real-artifact product proof for each served Qwen architecture shape
+  (Qwen3.6-35B-A3B and Qwen3.8-27B; Qwen3.8 receipt linked above). Codec and
+  physical-width coverage belongs to the separate native-format matrix rather
+  than a duplicate semantic-state Cartesian product.
+- [x] Family coverage complete per the scope directive: Qwen3.6/Qwen3.8,
+  Gemma4, and DeepSeek4 are hardware-proven through rev 23.
+- [ ] B.1 DeepSeek four-prefill-plus-live-decoders hardware gate passes
+  parity, semantic-SSE/scheduler-tail, thermal, memory, and speed contracts.
+- [ ] B.2 Qwen fixed-cost curve reaches a terminal decision and, if confirmed,
+  the beneficial aggregation lever ships; Gemma four-lane OFF/ON exact-result
+  trials retain a lower 95% speedup bound above 1.05×.
+- [x] Payload-ownership regression (no retained parent allocations) and the preflight-then-mutate `restore_slot_anchor` refactor landed.
+- [x] A.2 lineage regression and the new SlotAware divergence gate exist in `scripts/` and fail closed.
+- [x] Telemetry (A.8) emits one fixed-schema terminal outcome per restore attempt across Qwen, Gemma, and DeepSeek production paths; real-artifact telemetry receipts remain part of the family gates above.
+- [x] Lane C doc corrections merged; budget hazards + registry end-state documented in operating-kv-cache.md; ADR-017-per-family-status row updated.
+- [x] B.0 spike verdict recorded here (PASS; B.1 implementation candidate executed, hardware contracts still open).
 - [ ] This ADR's Status flipped to Implemented (or Superseded-in-part with links), with Updated stamps at each landing.
 
 ## Consequences
 
 ### Positive
-- Same-slot context edits stop going cold: restore from the deepest surviving anchor at ~63 MiB/anchor and ~2–4 ms capture, no kernel changes, no new GPU memory class.
+- Same-slot context edits stop going cold: restore from the deepest surviving
+  family-native anchor, with one-row kernel capture reusing the existing
+  linear-state storage class and no new weight representation.
 - The Mixed-phase F-payment reduction attacks the measured 35 s tool-result failure mode at its actual location (projected 75 s → 31–46 s aggregate prefill work), instead of optimizing the already-working pure-prefill wave.
 - The lineage/publication state machine, exact reclaimable accounting, and strict conservation audits raise the whole cache subsystem's verifiability — mutation-testable at AnchorStore scale before any shared-store ambitions.
 - Falsified paths carry their evidence and open hypotheses carry their named deciding spikes, so future sessions extend the data instead of re-litigating from scratch.
 
 ### Negative
-- Up to ~1 GiB (shipping config) / ~2 GiB (8-slot ceiling) of host RAM held in anchors; bounded and reclaimable, but real.
+- An immutable aggregate host-RAM grant is available to anchors; actual depth
+  varies with artifact and slot count. Qwen3.8 depth-4 is ~2.35 GiB at N=4,
+  ~4.70 GiB at N=8, and ~9.39 GiB at N=16, so wider shapes may expose partial
+  depth or pending-capture availability rather than overcommit.
 - Anchor lifecycle adds state-machine complexity to the slot worker (three-state publication, epoch checks, descendant pruning) — the price of multi-depth reuse on a mutable KV log.
-- Lane B carries genuine schedule risk: if B.0 fails, the Mixed-phase win needs a scheduler redesign (separate ADR), and the tool-result failure mode keeps its current mitigation only.
+- Lane B carries genuine schedule risk even though B.0 passed: cache isolation
+  is proven, but the real Mixed workload may still miss its scheduler/SSE tail,
+  memory, parity, or speed contracts and require policy reformulation.
 
 ### Neutral
 - FreeToken's remaining machinery stays un-imported; this ADR records why, which is itself a decision.

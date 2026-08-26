@@ -90,6 +90,7 @@ pub enum LifecycleError {
         actual_revision: u64,
     },
     VictimPlanChanged,
+    CandidatePreflightFailed(PublicLoadDiagnostic),
     PrepareFailed(PreparedEvictionError),
     ShutdownFailed(String),
     LoadFailed(PublicLoadDiagnostic),
@@ -123,6 +124,9 @@ impl std::fmt::Display for LifecycleError {
                 "confirmed pool revision is stale: expected {expected_revision}, actual {actual_revision}"
             ),
             Self::VictimPlanChanged => write!(f, "confirmed eviction victim plan changed"),
+            Self::CandidatePreflightFailed(error) => {
+                write!(f, "replacement model preflight failed: {error}")
+            }
             Self::PrepareFailed(error) => write!(f, "eviction preparation failed: {error}"),
             Self::ShutdownFailed(error) => write!(f, "victim worker shutdown failed: {error}"),
             Self::LoadFailed(error) => write!(f, "replacement model load failed: {error}"),
@@ -266,16 +270,19 @@ impl ModelLifecycleCoordinator {
     /// Execute ADR-047's explicit, revision-bound switch. The exclusive
     /// admission guard is held for the state transition, but request execution
     /// is represented only by leases and therefore drains without deadlock.
-    pub async fn switch<E, Shutdown, ShutdownFuture, Load, LoadFuture>(
+    pub async fn switch<E, Preflight, PreflightFuture, Shutdown, ShutdownFuture, Load, LoadFuture>(
         &self,
         pool: Arc<std::sync::RwLock<HotSwapManager<E>>>,
         confirmation: SwitchConfirmation,
         drain_timeout: Duration,
+        preflight: Preflight,
         shutdown: Shutdown,
         load: Load,
     ) -> Result<NonEvictingLoad<E>, LifecycleError>
     where
         E: Send + Sync + 'static,
+        Preflight: FnOnce() -> PreflightFuture,
+        PreflightFuture: std::future::Future<Output = Result<(), HotSwapError>>,
         Shutdown: Fn(Arc<LoadedEngine<E>>) -> ShutdownFuture,
         ShutdownFuture: std::future::Future<Output = anyhow::Result<()>>,
         Load: FnOnce(Arc<std::sync::RwLock<HotSwapManager<E>>>) -> LoadFuture,
@@ -283,6 +290,15 @@ impl ModelLifecycleCoordinator {
     {
         let _admission_guard = self.write_admission().await;
         self.validate_switch_confirmation(&pool, &confirmation)?;
+        preflight().await.map_err(|error| {
+            tracing::error!(
+                error = %crate::serve::load_diagnostic::private_hotswap_diagnostic(&error),
+                "explicit model switch candidate preflight failed before drain"
+            );
+            LifecycleError::CandidatePreflightFailed(
+                crate::serve::load_diagnostic::public_hotswap_diagnostic(&error),
+            )
+        })?;
 
         let drains = self.begin_drain(&confirmation.victims)?;
         self.wait_for_zero(&drains, drain_timeout).await?;
@@ -294,21 +310,36 @@ impl ModelLifecycleCoordinator {
                 .map_err(LifecycleError::PrepareFailed)?
         };
 
+        // Calling shutdown is the destructive boundary: a worker that
+        // returns an error may already be dead. Continue through every
+        // confirmed victim, then remove the complete prepared set before
+        // surfacing a restart-required error. The pool must never advertise
+        // a generation whose shutdown was attempted.
+        let mut shutdown_errors = Vec::new();
         for engine in prepared.engines().cloned().collect::<Vec<_>>() {
-            shutdown(engine)
-                .await
-                .map_err(|error| LifecycleError::ShutdownFailed(format!("{error:#}")))?;
+            if let Err(error) = shutdown(engine).await {
+                shutdown_errors.push(format!("{error:#}"));
+            }
         }
 
         {
-            let mut manager = pool.write().map_err(|_| LifecycleError::PoolPoisoned)?;
-            manager
-                .commit_prepared(prepared)
-                .map_err(LifecycleError::PrepareFailed)?;
+            let mut manager = pool.write().map_err(|_| {
+                LifecycleError::PostCommitFailed(
+                    "pool lock failed after victim shutdown began".to_owned(),
+                )
+            })?;
+            manager.commit_prepared(prepared).map_err(|error| {
+                LifecycleError::PostCommitFailed(format!(
+                    "cannot commit victim removal after shutdown began: {error}"
+                ))
+            })?;
         }
         self.finish_removal(&drains).map_err(|error| {
             LifecycleError::PostCommitFailed(format!("activity cleanup failed: {error}"))
         })?;
+        if !shutdown_errors.is_empty() {
+            return Err(LifecycleError::ShutdownFailed(shutdown_errors.join("; ")));
+        }
 
         match load(Arc::clone(&pool)).await.map_err(|error| {
             tracing::error!(
@@ -389,6 +420,15 @@ pub struct SwitchConfirmation {
 pub struct ModelLease {
     activity: Arc<ModelActivity>,
     coordinator: Weak<LifecycleInner>,
+}
+
+impl ModelLease {
+    /// Exact pool generation this request keeps alive. Response execution
+    /// receipts compare this lease identity with the `LoadedEngine` actually
+    /// dispatched, so a stale request/config label cannot certify execution.
+    pub(crate) fn identity(&self) -> &ModelIdentity {
+        &self.activity.identity
+    }
 }
 
 impl Drop for ModelLease {
@@ -624,6 +664,7 @@ mod tests {
                 Arc::clone(&pool),
                 confirmation,
                 Duration::from_secs(1),
+                || async { Ok(()) },
                 move |_engine| {
                     let events = Arc::clone(&shutdown_events);
                     async move {
@@ -659,15 +700,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_failure_keeps_victim_and_never_loads_replacement() {
+    async fn shutdown_failure_removes_potentially_dead_victim_and_never_loads_replacement() {
         let coordinator = ModelLifecycleCoordinator::default();
-        let (pool, loader, _events, _current_file, current, confirmation) = switch_fixture();
+        let (pool, loader, _events, _current_file, _current, confirmation) = switch_fixture();
         let target_file = fixture_file(500);
         let err = coordinator
             .switch(
                 Arc::clone(&pool),
                 confirmation,
                 Duration::from_secs(1),
+                || async { Ok(()) },
                 |_engine| async move { anyhow::bail!("synthetic shutdown failure") },
                 move |pool| async move {
                     pool.write()
@@ -687,15 +729,197 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LifecycleError::ShutdownFailed(_)));
+        assert!(err.requires_restart());
         assert_eq!(loader.calls.load(Ordering::SeqCst), 1);
         let manager = pool.read().unwrap();
-        assert!(manager.try_get("a/1", QuantType::Q4_K_M).is_some());
+        assert!(manager.try_get("a/1", QuantType::Q4_K_M).is_none());
         assert!(manager.try_get("b/2", QuantType::Q4_K_M).is_none());
-        drop(manager);
-        assert!(matches!(
-            coordinator.acquire(&current),
-            Err(LifecycleError::Draining(_))
-        ));
+    }
+
+    #[tokio::test]
+    async fn missing_required_tensor_preflight_preserves_callable_victim() {
+        let coordinator = ModelLifecycleCoordinator::default();
+        let (pool, loader, events, _current_file, current, confirmation) = switch_fixture();
+        let shutdown_calls = Arc::new(AtomicUsize::new(0));
+        let shutdown_calls_for_closure = Arc::clone(&shutdown_calls);
+        let error = coordinator
+            .switch(
+                Arc::clone(&pool),
+                confirmation,
+                Duration::from_secs(1),
+                || async {
+                    Err(HotSwapError::LoaderFailed(anyhow::Error::new(
+                        crate::serve::load_diagnostic::MissingGgufTensor::new("output.weight"),
+                    )))
+                },
+                move |_engine| {
+                    shutdown_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(()) }
+                },
+                |_pool| async {
+                    Err(HotSwapError::LoaderFailed(anyhow::anyhow!(
+                        "replacement load must not run after failed preflight"
+                    )))
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            LifecycleError::CandidatePreflightFailed(PublicLoadDiagnostic::MissingRequiredTensor(
+                "output.weight".to_owned()
+            ))
+        );
+        assert!(!error.requires_restart());
+        assert_eq!(shutdown_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(loader.calls.load(Ordering::SeqCst), 1);
+        assert!(events.lock().unwrap().is_empty());
+        assert!(pool
+            .read()
+            .unwrap()
+            .try_get("a/1", QuantType::Q4_K_M)
+            .is_some());
+        let _callable = coordinator
+            .acquire(&current)
+            .expect("preflight failure must leave A callable");
+    }
+
+    #[tokio::test]
+    async fn wrong_native_type_preflight_preserves_callable_victim() {
+        let coordinator = ModelLifecycleCoordinator::default();
+        let (pool, loader, events, _current_file, current, confirmation) = switch_fixture();
+        let shutdown_calls = Arc::new(AtomicUsize::new(0));
+        let shutdown_calls_for_closure = Arc::clone(&shutdown_calls);
+        let error = coordinator
+            .switch(
+                Arc::clone(&pool),
+                confirmation,
+                Duration::from_secs(1),
+                || async {
+                    Err(HotSwapError::LoaderFailed(anyhow::anyhow!(
+                        "tensor output_norm.weight requires exact F32 storage, got Q8_0"
+                    )))
+                },
+                move |_engine| {
+                    shutdown_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(()) }
+                },
+                |_pool| async {
+                    Err(HotSwapError::LoaderFailed(anyhow::anyhow!(
+                        "replacement load must not run after failed preflight"
+                    )))
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            LifecycleError::CandidatePreflightFailed(PublicLoadDiagnostic::LoaderRejected)
+        );
+        assert!(!error.requires_restart());
+        assert_eq!(shutdown_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(loader.calls.load(Ordering::SeqCst), 1);
+        assert!(events.lock().unwrap().is_empty());
+        assert!(pool
+            .read()
+            .unwrap()
+            .try_get("a/1", QuantType::Q4_K_M)
+            .is_some());
+        let _callable = coordinator
+            .acquire(&current)
+            .expect("native-type preflight failure must leave A callable");
+    }
+
+    #[tokio::test]
+    async fn second_shutdown_error_removes_first_dead_and_second_victim_before_returning() {
+        let coordinator = ModelLifecycleCoordinator::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let loader = Arc::new(TestLoader {
+            calls: AtomicUsize::new(0),
+            events: Arc::clone(&events),
+        });
+        let spiller = Arc::new(TestSpiller {
+            events: Arc::clone(&events),
+        });
+        let mut manager = HotSwapManager::new_with_spiller(
+            LoadedPool::with_capacity_and_budget(2, 800),
+            loader.clone(),
+            spiller,
+        );
+        let first_file = fixture_file(300);
+        let second_file = fixture_file(300);
+        manager
+            .load_or_get(
+                "a/1",
+                QuantType::Q4_K_M,
+                first_file.path(),
+                &EngineConfig::default(),
+            )
+            .unwrap();
+        manager
+            .load_or_get(
+                "c/3",
+                QuantType::Q4_K_M,
+                second_file.path(),
+                &EngineConfig::default(),
+            )
+            .unwrap();
+        let confirmation = SwitchConfirmation {
+            candidate_repo: "b/2".into(),
+            candidate_quant: QuantType::Q4_K_M,
+            candidate_bytes: 700,
+            expected_revision: manager.pool_stats().revision,
+            victims: manager.iter_loaded().collect(),
+        };
+        let pool = Arc::new(std::sync::RwLock::new(manager));
+        let shutdown_calls = Arc::new(AtomicUsize::new(0));
+        let shutdown_calls_for_closure = Arc::clone(&shutdown_calls);
+        let target_file = fixture_file(700);
+
+        let error = coordinator
+            .switch(
+                Arc::clone(&pool),
+                confirmation,
+                Duration::from_secs(1),
+                || async { Ok(()) },
+                move |_engine| {
+                    let call = shutdown_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if call == 1 {
+                            anyhow::bail!("second victim failed after first worker died")
+                        }
+                        Ok(())
+                    }
+                },
+                move |pool| async move {
+                    pool.write()
+                        .map_err(|error| {
+                            HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                "pool rwlock poisoned: {error}"
+                            ))
+                        })?
+                        .load_or_get_non_evicting(
+                            "b/2",
+                            QuantType::Q4_K_M,
+                            target_file.path(),
+                            &EngineConfig::default(),
+                        )
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, LifecycleError::ShutdownFailed(_)));
+        assert!(error.requires_restart());
+        assert_eq!(shutdown_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(loader.calls.load(Ordering::SeqCst), 2);
+        let manager = pool.read().unwrap();
+        assert_eq!(manager.pool_stats().loaded_count, 0);
+        assert!(manager.try_get("a/1", QuantType::Q4_K_M).is_none());
+        assert!(manager.try_get("c/3", QuantType::Q4_K_M).is_none());
+        assert!(manager.try_get("b/2", QuantType::Q4_K_M).is_none());
     }
 
     #[tokio::test]
@@ -712,6 +936,7 @@ mod tests {
                 Arc::clone(&pool),
                 confirmation,
                 Duration::from_secs(1),
+                || async { Ok(()) },
                 |_engine| async move { Ok(()) },
                 move |pool| async move {
                     pool.write()
@@ -748,6 +973,7 @@ mod tests {
                 Arc::clone(&pool),
                 confirmation,
                 Duration::from_secs(1),
+                || async { Ok(()) },
                 |_engine| async move { Ok(()) },
                 |_pool| async move {
                     let source = anyhow::Error::new(
@@ -788,6 +1014,7 @@ mod tests {
                 Arc::clone(&pool),
                 confirmation,
                 Duration::from_millis(1),
+                || async { Ok(()) },
                 |_engine| async move { Ok(()) },
                 move |pool| async move {
                     pool.write()
@@ -842,6 +1069,7 @@ mod tests {
                     switch_pool,
                     confirmation,
                     Duration::from_secs(1),
+                    || async { Ok(()) },
                     |_engine| async move { Ok(()) },
                     move |pool| async move {
                         pool.write()

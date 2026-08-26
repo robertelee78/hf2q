@@ -92,7 +92,7 @@ done
 [[ -x "$HF2Q_BIN"  ]] || err "hf2q binary not found at $HF2Q_BIN (run: cargo build --release)"
 
 if [[ $SKIP_LLAMA -eq 0 ]]; then
-  # Prefer our built-from-/opt/llama.cpp binary over homebrew's older one.
+  # Prefer the operator-built peer binary over Homebrew's older one.
   if [[ -x "/opt/llama.cpp/build/bin/llama-bench" ]]; then
     LLAMA_BIN="/opt/llama.cpp/build/bin/llama-bench"
   elif command -v llama-bench >/dev/null 2>&1; then

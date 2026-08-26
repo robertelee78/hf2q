@@ -6,6 +6,7 @@ fn public_filter_removes_every_internal_command_and_argument_record() {
         "__fetch-hub-gguf",
         "__catalog-hub-gguf",
         "__verify-local-gguf",
+        "__record-model-verification",
         "source-teacher",
         "source-teacher-reference",
         "source-teacher-acceptance-verify",

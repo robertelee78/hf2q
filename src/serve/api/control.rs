@@ -18,11 +18,14 @@ use super::handlers::map_hotswap_error_to_response;
 use super::lifecycle::{LifecycleError, SwitchConfirmation};
 use super::middleware::RequestCancellation;
 use super::schema::ApiError;
-use super::state::AppState;
+use super::state::{AppState, EngineConfigOverride};
 use super::{DIAGNOSTIC_NO_EVICT_HEADER, DIAGNOSTIC_NO_EVICT_VALUE};
 use crate::serve::auto_pipeline;
 use crate::serve::multi_model::{
     AdmissionOutcome, EngineConfig, HotSwapError, LoadedSummary, NonEvictingLoad,
+};
+use crate::serve::process_policy::{
+    q5_canonical_route_dispatches, ServingProcessPolicy, Q5_CANONICAL_ROUTE,
 };
 use crate::serve::quant_select::QuantType;
 
@@ -33,6 +36,11 @@ const HF2Q_ACTIVATION_SCHEMA: &str = "hf2q.model-activation.v2";
 #[serde(deny_unknown_fields)]
 pub struct ModelActivationRequest {
     pub model: String,
+    /// Optional exact local projector GGUF to admit atomically with the text
+    /// model. The server hashes, validates, budgets, loads, and publishes the
+    /// pair as one generation.
+    #[serde(default)]
+    pub projector: Option<String>,
     /// Opaque server-issued id for an exact revision/size/SHA artifact.
     #[serde(default)]
     pub candidate_id: Option<String>,
@@ -41,6 +49,93 @@ pub struct ModelActivationRequest {
     pub expected_revision: Option<u64>,
     #[serde(default)]
     pub victims: Vec<ModelActivationVictim>,
+}
+
+async fn requested_projector_admission(
+    value: Option<&str>,
+    supervisor: super::cancellation::PreparationSupervisor,
+) -> std::result::Result<Option<crate::serve::multi_model::ProjectorAdmission>, Response> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ApiError::invalid_request(
+            "projector must be a non-empty local GGUF path",
+            Some("projector".into()),
+        )
+        .into_response());
+    }
+    let path = std::path::PathBuf::from(value);
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        return Err(ApiError::invalid_request(
+            "projector must be a local GGUF file",
+            Some("projector".into()),
+        )
+        .into_response());
+    }
+    let cache_budget =
+        u64::try_from(crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES)
+            .map_err(|_| ApiError::internal_error().into_response())?;
+    let admission = run_consistent_result_task(
+        supervisor,
+        async move {
+            tokio::task::spawn_blocking(move || {
+                crate::serve::multi_model::ProjectorAdmission::inspect(&path, cache_budget)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("projector admission task failed: {error}"))?
+        },
+        |_| false,
+    )
+    .await
+    .map_err(|error| {
+        ApiError::generation_error(format!("projector admission transaction failed: {error}"))
+            .into_response()
+    })?
+    .map_err(|error| {
+        ApiError::invalid_request(
+            format!("projector admission failed: {error}"),
+            Some("projector".into()),
+        )
+        .into_response()
+    })?;
+    Ok(Some(admission))
+}
+
+fn loaded_matches_requested_projector(
+    engine: &crate::serve::multi_model::LoadedEngine<crate::serve::api::engine::Engine>,
+    requested: Option<&crate::serve::multi_model::ProjectorAdmission>,
+) -> bool {
+    requested.is_none_or(|requested| {
+        engine.projector.as_ref().is_some_and(|loaded| {
+            loaded.gguf_path == requested.path
+                && loaded.artifact_sha256 == requested.artifact_sha256
+                && loaded.arch == requested.profile
+        })
+    })
+}
+
+fn generation_candidate_bytes(
+    text_bytes: u64,
+    projector: Option<&crate::serve::multi_model::ProjectorAdmission>,
+) -> std::result::Result<u64, Response> {
+    let projector_bytes = projector
+        .map(crate::serve::multi_model::ProjectorAdmission::reserved_bytes)
+        .transpose()
+        .map_err(|_| ApiError::internal_error().into_response())?
+        .unwrap_or(0);
+    text_bytes.checked_add(projector_bytes).ok_or_else(|| {
+        ApiError::invalid_request(
+            "text + projector generation byte count overflow",
+            Some("projector".into()),
+        )
+        .into_response()
+    })
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -163,6 +258,12 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
         .metrics
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let process_policy = ServingProcessPolicy::resolve(&state.engine_config_template);
+    let process_policy_sha256 = match process_policy.sha256() {
+        Ok(sha256) => sha256,
+        Err(_) => return ApiError::internal_error().into_response(),
+    };
+    let q5_canonical_dispatches = q5_canonical_route_dispatches();
     let manager = match state.pool.read() {
         Ok(manager) => manager,
         Err(_) => return ApiError::internal_error().into_response(),
@@ -186,6 +287,12 @@ pub async fn hf2q_runtime(State(state): State<AppState>) -> Response {
         Json(serde_json::json!({
             "schema_version": HF2Q_RUNTIME_SCHEMA,
             "backend": "mlx-native",
+            "process_policy": process_policy,
+            "process_policy_sha256": process_policy_sha256,
+            "routing_observation": {
+                "q5_canonical_route": Q5_CANONICAL_ROUTE,
+                "q5_canonical_route_dispatches": q5_canonical_dispatches,
+            },
             "capabilities": {
                 "model_activation": HF2Q_ACTIVATION_SCHEMA,
                 "artifact_resolution": ARTIFACT_CATALOG_SCHEMA,
@@ -370,10 +477,38 @@ fn activation_engine_config(
     })
 }
 
+fn bind_activation_text_artifact(
+    config: &mut EngineConfig,
+    materialized_identity: Option<crate::serve::multi_model::TextArtifactIdentity>,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    if let Some(identity) = materialized_identity.or_else(|| config.verified_text_artifact.clone())
+    {
+        config.bind_verified_text_artifact(identity)
+    } else {
+        config.bind_text_artifact(path)
+    }
+}
+
+fn restore_engine_config_or_restart(
+    state: &AppState,
+    path: &std::path::Path,
+    previous: Option<EngineConfigOverride>,
+) -> std::result::Result<(), Response> {
+    state
+        .restore_engine_config_for_path(path, previous)
+        .map_err(|error| {
+            tracing::error!(%error, "activation policy rollback failed");
+            lifecycle_error_response(LifecycleError::PostCommitFailed(format!(
+                "activation policy rollback failed: {error}"
+            )))
+        })
+}
+
 enum ActivationPayload {
     ExplicitLocal(std::path::PathBuf),
     VerifiedLocal(super::local_artifacts::LocalGgufArtifact),
-    Hosted(crate::input::hf_download::HubGgufArtifact),
+    Hosted(super::artifact_catalog::HostedArtifactSelection),
 }
 
 const fn diagnostic_gguf_file_type(quant: QuantType) -> u32 {
@@ -399,6 +534,14 @@ impl ActivationTarget {
             _ => None,
         }
     }
+
+    fn known_local_path(&self) -> Option<&std::path::Path> {
+        match &self.payload {
+            ActivationPayload::ExplicitLocal(path) => Some(path),
+            ActivationPayload::VerifiedLocal(artifact) => Some(&artifact.path),
+            ActivationPayload::Hosted(_) => None,
+        }
+    }
 }
 
 impl ActivationTarget {
@@ -407,9 +550,26 @@ impl ActivationTarget {
         cancellation: super::cancellation::CancellationSignal,
         supervisor: super::cancellation::PreparationSupervisor,
         catalog: &ArtifactCatalogCoordinator,
-    ) -> std::result::Result<(String, QuantType, std::path::PathBuf, u64, String), Response> {
-        let (path, validate_catalog_type) = match self.payload {
-            ActivationPayload::ExplicitLocal(path) => (path, false),
+    ) -> std::result::Result<
+        (
+            String,
+            QuantType,
+            std::path::PathBuf,
+            u64,
+            String,
+            Option<std::path::PathBuf>,
+            Option<crate::serve::multi_model::TextArtifactIdentity>,
+        ),
+        Response,
+    > {
+        let (
+            path,
+            validate_catalog_type,
+            hosted_companions,
+            local_projector_path,
+            verified_text_artifact,
+        ) = match self.payload {
+            ActivationPayload::ExplicitLocal(path) => (path, false, None, None, None),
             ActivationPayload::VerifiedLocal(artifact) => {
                 let permit = catalog.try_local_verify_slot().map_err(|error| match error {
                     CatalogError::LocalVerifyBusy => (
@@ -420,13 +580,22 @@ impl ActivationTarget {
                         .into_response(),
                     _ => ApiError::internal_error().into_response(),
                 })?;
+                let (path, verified_text_artifact) = verify_local_gguf_cancellable(
+                    &artifact,
+                    cancellation.clone(),
+                    supervisor.clone(),
+                    permit,
+                )
+                .await?;
                 (
-                    verify_local_gguf_cancellable(&artifact, cancellation, supervisor, permit)
-                        .await?,
+                    path,
                     false,
+                    None,
+                    artifact.projector_path.clone(),
+                    verified_text_artifact,
                 )
             }
-            ActivationPayload::Hosted(artifact) => {
+            ActivationPayload::Hosted(selection) => {
                 let permit = catalog.try_transfer_slot().map_err(|error| match error {
                     CatalogError::TransferBusy => (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -436,14 +605,27 @@ impl ActivationTarget {
                         .into_response(),
                     _ => ApiError::internal_error().into_response(),
                 })?;
-                (
-                    fetch_hub_gguf_cancellable(&artifact, cancellation, supervisor, permit).await?,
-                    true,
+                let path = fetch_hub_gguf_cancellable(
+                    &selection.text,
+                    cancellation.clone(),
+                    supervisor.clone(),
+                    permit,
+                    false,
                 )
+                .await?;
+                (path, true, Some(selection.companions), None, None)
             }
         };
         if !validate_catalog_type {
-            return Ok((self.repo, self.quant, path, self.bytes, self.request_model));
+            return Ok((
+                self.repo,
+                self.quant,
+                path,
+                self.bytes,
+                self.request_model,
+                local_projector_path,
+                verified_text_artifact,
+            ));
         }
         let actual = mlx_native::gguf::GgufFile::open(&path).map_err(|error| {
             ApiError::invalid_request(
@@ -464,7 +646,56 @@ impl ActivationTarget {
             )
             .into_response());
         }
-        Ok((self.repo, self.quant, path, self.bytes, self.request_model))
+        let expected_projector =
+            crate::core::provenance::projector_sha256(&actual).map_err(|error| {
+                ApiError::invalid_request(
+                    format!("selected text GGUF has an invalid projector binding: {error}"),
+                    Some("artifact".into()),
+                )
+                .into_response()
+            })?;
+        drop(actual);
+        let projector_path = if let Some(expected_projector) = expected_projector {
+            let matches = hosted_companions
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|companion| companion.sha256.eq_ignore_ascii_case(&expected_projector))
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
+                return Err(ApiError::invalid_request(
+                    format!(
+                        "selected text GGUF requires projector {expected_projector}, but the exact revision exposes {} matching companions",
+                        matches.len()
+                    ),
+                    Some("artifact".into()),
+                )
+                .into_response());
+            }
+            let permit = catalog.try_transfer_slot().map_err(|error| match error {
+                CatalogError::TransferBusy => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, "1")],
+                    Json(serde_json::json!({"error":{"message":error.to_string(),"type":"server_busy","code":"artifact_transfer_busy"}})),
+                )
+                    .into_response(),
+                _ => ApiError::internal_error().into_response(),
+            })?;
+            Some(
+                fetch_hub_gguf_cancellable(&matches[0], cancellation, supervisor, permit, true)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        Ok((
+            self.repo,
+            self.quant,
+            path,
+            self.bytes,
+            self.request_model,
+            projector_path,
+            None,
+        ))
     }
 }
 
@@ -473,7 +704,13 @@ async fn verify_local_gguf_cancellable(
     cancellation: super::cancellation::CancellationSignal,
     supervisor: super::cancellation::PreparationSupervisor,
     permit: tokio::sync::OwnedSemaphorePermit,
-) -> std::result::Result<std::path::PathBuf, Response> {
+) -> std::result::Result<
+    (
+        std::path::PathBuf,
+        Option<crate::serve::multi_model::TextArtifactIdentity>,
+    ),
+    Response,
+> {
     let executable =
         std::env::current_exe().map_err(|_| ApiError::internal_error().into_response())?;
     let quant = artifact.quant.ok_or_else(|| {
@@ -531,7 +768,16 @@ async fn verify_local_gguf_cancellable(
         )
         .into_response());
     }
-    Ok(receipt.path)
+    if !receipt.sha256.eq_ignore_ascii_case(&artifact.sha256)
+        || !receipt.file_stamp.matches_path(&receipt.path)
+    {
+        return Err(ApiError::generation_error(
+            "local GGUF verifier returned stale or mismatched identity evidence",
+        )
+        .into_response());
+    }
+    let identity = receipt.text_identity();
+    Ok((receipt.path, Some(identity)))
 }
 
 async fn fetch_hub_gguf_cancellable(
@@ -539,13 +785,18 @@ async fn fetch_hub_gguf_cancellable(
     cancellation: super::cancellation::CancellationSignal,
     supervisor: super::cancellation::PreparationSupervisor,
     permit: tokio::sync::OwnedSemaphorePermit,
+    companion: bool,
 ) -> std::result::Result<std::path::PathBuf, Response> {
     let executable =
         std::env::current_exe().map_err(|_| ApiError::internal_error().into_response())?;
-    let quant = artifact.quant_hint.as_deref().ok_or_else(|| {
-        ApiError::invalid_request("selected artifact has no quant", Some("artifact".into()))
-            .into_response()
-    })?;
+    let quant = if companion {
+        "COMPANION"
+    } else {
+        artifact.quant_hint.as_deref().ok_or_else(|| {
+            ApiError::invalid_request("selected artifact has no quant", Some("artifact".into()))
+                .into_response()
+        })?
+    };
     let mut command = tokio::process::Command::new(executable);
     command.args([
         "__fetch-hub-gguf",
@@ -562,6 +813,9 @@ async fn fetch_hub_gguf_cancellable(
         "--quant",
         quant,
     ]);
+    if companion {
+        command.arg("--companion");
+    }
     let output = run_preparation_command(
         command,
         cancellation,
@@ -627,7 +881,8 @@ async fn resolve_activation_target(
                 .into_response()
         })?;
         return match artifact {
-            StoredArtifact::Hosted(artifact) => {
+            StoredArtifact::Hosted(selection) => {
+                let artifact = &selection.text;
                 if hub_repository.as_deref() != Some(artifact.repository.as_str()) {
                     return Err(ApiError::invalid_request(
                         "artifact selection does not belong to requested model",
@@ -646,7 +901,7 @@ async fn resolve_activation_target(
                     quant,
                     bytes: artifact.bytes,
                     request_model: artifact.request_model(),
-                    payload: ActivationPayload::Hosted(artifact),
+                    payload: ActivationPayload::Hosted(selection),
                 })
             }
             StoredArtifact::Local(artifact) => {
@@ -773,6 +1028,11 @@ fn lifecycle_error_response(error: LifecycleError) -> Response {
         LifecycleError::StalePlan { .. } | LifecycleError::VictimPlanChanged => {
             (StatusCode::CONFLICT, "stale_activation_plan", false)
         }
+        LifecycleError::CandidatePreflightFailed(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "candidate_preflight_failed",
+            false,
+        ),
         LifecycleError::DrainTimeout { .. }
         | LifecycleError::PrepareFailed(_)
         | LifecycleError::ShutdownFailed(_)
@@ -806,6 +1066,15 @@ pub async fn activate_model(
         .metrics
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let requested_projector = match requested_projector_admission(
+        request.projector.as_deref(),
+        state.preparations.clone(),
+    )
+    .await
+    {
+        Ok(projector) => projector,
+        Err(response) => return response,
+    };
 
     let normalized_hub = match normalize_hub_repository(&request.model) {
         Ok(repository) => repository,
@@ -822,11 +1091,14 @@ pub async fn activate_model(
                 .snapshot_engines()
                 .into_iter()
                 .filter(|engine| {
-                    resident_model == engine.engine.model_id()
-                        || resident_model == engine.repo
-                        || resident_model == format!("{}@{}", engine.repo, engine.quant.as_str())
-                        || engine.repo.starts_with(&hosted_prefix)
-                        || engine.repo.starts_with(&local_prefix)
+                    engine.artifacts_are_current()
+                        && loaded_matches_requested_projector(engine, requested_projector.as_ref())
+                        && (resident_model == engine.engine.model_id()
+                            || resident_model == engine.repo
+                            || resident_model
+                                == format!("{}@{}", engine.repo, engine.quant.as_str())
+                            || engine.repo.starts_with(&hosted_prefix)
+                            || engine.repo.starts_with(&local_prefix))
                 })
                 .collect::<Vec<_>>();
             if matches.len() > 1 {
@@ -889,14 +1161,27 @@ pub async fn activate_model(
         };
     let repo = target.repo.clone();
     let quant = target.quant;
-    let bytes = target.bytes;
+    let mut effective_projector = requested_projector.clone();
+    if effective_projector.is_none() {
+        if let Some(path) = target.known_local_path() {
+            effective_projector = match activation_engine_config(&state, path) {
+                Ok(config) => config.projector,
+                Err(response) => return response,
+            };
+        }
+    }
+    let bytes = match generation_candidate_bytes(target.bytes, effective_projector.as_ref()) {
+        Ok(bytes) => bytes,
+        Err(response) => return response,
+    };
     if let Some(local_path) = target.verified_local_path() {
         if let Ok(manager) = state.pool.read() {
-            if let Some(engine) = manager
-                .snapshot_engines()
-                .into_iter()
-                .find(|engine| engine.quant == quant && engine.gguf_path == local_path)
-            {
+            if let Some(engine) = manager.snapshot_engines().into_iter().find(|engine| {
+                engine.artifacts_are_current()
+                    && loaded_matches_requested_projector(engine, effective_projector.as_ref())
+                    && engine.quant == quant
+                    && engine.gguf_path == local_path
+            }) {
                 let revision = manager.pool_stats().revision;
                 return (
                     StatusCode::OK,
@@ -913,11 +1198,12 @@ pub async fn activate_model(
     }
 
     if let Ok(manager) = state.pool.read() {
-        if let Some(engine) = manager
-            .snapshot_engines()
-            .into_iter()
-            .find(|engine| engine.repo == repo && engine.quant == quant)
-        {
+        if let Some(engine) = manager.snapshot_engines().into_iter().find(|engine| {
+            engine.artifacts_are_current()
+                && loaded_matches_requested_projector(engine, effective_projector.as_ref())
+                && engine.repo == repo
+                && engine.quant == quant
+        }) {
             let revision = manager.pool_stats().revision;
             return (
                 StatusCode::OK,
@@ -988,7 +1274,15 @@ pub async fn activate_model(
                     _ => plan,
                 }
             };
-            let (repo, quant, gguf_path, bytes, request_model) = match target
+            let (
+                repo,
+                quant,
+                gguf_path,
+                text_bytes,
+                request_model,
+                discovered_projector_path,
+                verified_text_artifact,
+            ) = match target
                 .materialize(
                     cancellation.0.clone(),
                     state.preparations.clone(),
@@ -999,10 +1293,57 @@ pub async fn activate_model(
                 Ok(materialized) => materialized,
                 Err(response) => return response,
             };
-            let engine_config = match activation_engine_config(&state, &gguf_path) {
+            let mut engine_config = match activation_engine_config(&state, &gguf_path) {
                 Ok(config) => config,
                 Err(response) => return response,
             };
+            if effective_projector.is_none() {
+                effective_projector = engine_config.projector.clone();
+            }
+            if effective_projector.is_none() {
+                if let Some(projector_path) = discovered_projector_path.as_ref() {
+                    let projector_value = projector_path.to_string_lossy().into_owned();
+                    effective_projector = match requested_projector_admission(
+                        Some(&projector_value),
+                        state.preparations.clone(),
+                    )
+                    .await
+                    {
+                        Ok(projector) => projector,
+                        Err(response) => return response,
+                    };
+                }
+            }
+            engine_config.projector = effective_projector.clone();
+            let bind_result = bind_activation_text_artifact(
+                &mut engine_config,
+                verified_text_artifact,
+                &gguf_path,
+            );
+            if let Err(error) = bind_result {
+                tracing::error!(%error, "cannot bind activation policy to text artifact");
+                return ApiError::internal_error().into_response();
+            }
+            let bytes = match generation_candidate_bytes(text_bytes, effective_projector.as_ref()) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let actual_bytes = match crate::serve::multi_model::configured_resident_bytes(
+                &gguf_path,
+                &engine_config,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => return map_hotswap_error_to_response(error),
+            };
+            if actual_bytes != bytes {
+                return ApiError::invalid_request(
+                    "activation artifact size changed after planning; probe again",
+                    Some("model".into()),
+                )
+                .into_response();
+            }
+            let registry_config = engine_config.clone();
+            let registry_path = gguf_path.clone();
             // The pool may have changed during preparation. Re-plan under the
             // exclusive gate and publish only if admission is still
             // non-evicting.
@@ -1012,7 +1353,10 @@ pub async fn activate_model(
                     Ok(manager) => manager,
                     Err(_) => return ApiError::internal_error().into_response(),
                 };
-                let plan = manager.admission_plan(&repo, quant, bytes);
+                let plan = match manager.plan_path(&repo, quant, &gguf_path, &engine_config) {
+                    Ok(plan) => plan,
+                    Err(error) => return map_hotswap_error_to_response(error),
+                };
                 match &plan.outcome {
                     AdmissionOutcome::WouldEvict {
                         victims,
@@ -1054,6 +1398,14 @@ pub async fn activate_model(
                     _ => plan,
                 }
             };
+            let previous_registry_config =
+                match state.replace_engine_config_for_path(&registry_path, registry_config) {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        tracing::error!(%error, "cannot stage generation policy");
+                        return ApiError::internal_error().into_response();
+                    }
+                };
             let pool = Arc::clone(&state.pool);
             let repo_for_load = repo.clone();
             let load = run_consistent_result_task(
@@ -1115,13 +1467,38 @@ pub async fn activate_model(
                         .into_response()
                 }
                 Ok(Ok(NonEvictingLoad::Conflict(_))) => {
+                    if let Err(response) = restore_engine_config_or_restart(
+                        &state,
+                        &registry_path,
+                        previous_registry_config,
+                    ) {
+                        return response;
+                    }
                     lifecycle_error_response(LifecycleError::VictimPlanChanged)
                 }
-                Ok(Err(error)) => map_hotswap_error_to_response(error),
-                Err(error) => ApiError::generation_error(format!(
-                    "model activation transaction failed: {error}"
-                ))
-                .into_response(),
+                Ok(Err(error)) => {
+                    if let Err(response) = restore_engine_config_or_restart(
+                        &state,
+                        &registry_path,
+                        previous_registry_config,
+                    ) {
+                        return response;
+                    }
+                    map_hotswap_error_to_response(error)
+                }
+                Err(error) => {
+                    if let Err(response) = restore_engine_config_or_restart(
+                        &state,
+                        &registry_path,
+                        previous_registry_config,
+                    ) {
+                        return response;
+                    }
+                    ApiError::generation_error(format!(
+                        "model activation transaction failed: {error}"
+                    ))
+                    .into_response()
+                }
             }
         }
         ModelActivationAction::Switch => {
@@ -1157,7 +1534,15 @@ pub async fn activate_model(
                     return lifecycle_error_response(error);
                 }
             }
-            let (repo, quant, gguf_path, bytes, request_model) = match target
+            let (
+                repo,
+                quant,
+                gguf_path,
+                text_bytes,
+                request_model,
+                discovered_projector_path,
+                verified_text_artifact,
+            ) = match target
                 .materialize(
                     cancellation.0,
                     state.preparations.clone(),
@@ -1168,10 +1553,57 @@ pub async fn activate_model(
                 Ok(materialized) => materialized,
                 Err(response) => return response,
             };
-            let engine_config = match activation_engine_config(&state, &gguf_path) {
+            let mut engine_config = match activation_engine_config(&state, &gguf_path) {
                 Ok(config) => config,
                 Err(response) => return response,
             };
+            if effective_projector.is_none() {
+                effective_projector = engine_config.projector.clone();
+            }
+            if effective_projector.is_none() {
+                if let Some(projector_path) = discovered_projector_path.as_ref() {
+                    let projector_value = projector_path.to_string_lossy().into_owned();
+                    effective_projector = match requested_projector_admission(
+                        Some(&projector_value),
+                        state.preparations.clone(),
+                    )
+                    .await
+                    {
+                        Ok(projector) => projector,
+                        Err(response) => return response,
+                    };
+                }
+            }
+            engine_config.projector = effective_projector.clone();
+            let bind_result = bind_activation_text_artifact(
+                &mut engine_config,
+                verified_text_artifact,
+                &gguf_path,
+            );
+            if let Err(error) = bind_result {
+                tracing::error!(%error, "cannot bind switch policy to text artifact");
+                return ApiError::internal_error().into_response();
+            }
+            let bytes = match generation_candidate_bytes(text_bytes, effective_projector.as_ref()) {
+                Ok(bytes) => bytes,
+                Err(response) => return response,
+            };
+            let actual_bytes = match crate::serve::multi_model::configured_resident_bytes(
+                &gguf_path,
+                &engine_config,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => return map_hotswap_error_to_response(error),
+            };
+            if actual_bytes != bytes {
+                return ApiError::invalid_request(
+                    "switch artifact size changed after planning; probe again",
+                    Some("model".into()),
+                )
+                .into_response();
+            }
+            let registry_config = engine_config.clone();
+            let registry_path = gguf_path.clone();
             let confirmation = SwitchConfirmation {
                 candidate_repo: repo.clone(),
                 candidate_quant: quant,
@@ -1180,8 +1612,18 @@ pub async fn activate_model(
                 victims: confirmation.victims,
             };
             let target_repo = repo.clone();
+            let preflight_path = gguf_path.clone();
+            let preflight_config = engine_config.clone();
             let lifecycle = Arc::clone(&state.model_lifecycle);
             let switch_pool = Arc::clone(&state.pool);
+            let previous_registry_config =
+                match state.replace_engine_config_for_path(&registry_path, registry_config) {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        tracing::error!(%error, "cannot stage switched generation policy");
+                        return ApiError::internal_error().into_response();
+                    }
+                };
             let result = run_consistent_result_task(
                 state.preparations.clone(),
                 async move {
@@ -1190,6 +1632,22 @@ pub async fn activate_model(
                             switch_pool,
                             confirmation,
                             std::time::Duration::from_secs(60),
+                            move || async move {
+                                tokio::task::spawn_blocking(move || {
+                                    crate::serve::preflight_engine_candidate(
+                                        &preflight_path,
+                                        quant,
+                                        &preflight_config,
+                                    )
+                                    .map_err(HotSwapError::LoaderFailed)
+                                })
+                                .await
+                                .map_err(|error| {
+                                    HotSwapError::LoaderFailed(anyhow::anyhow!(
+                                        "candidate preflight task failed: {error}"
+                                    ))
+                                })?
+                            },
                             |loaded| async move { loaded.engine.shutdown().await },
                             move |pool| async move {
                                 tokio::task::spawn_blocking(move || {
@@ -1240,10 +1698,33 @@ pub async fn activate_model(
                         .into_response()
                 }
                 Ok(Ok(NonEvictingLoad::Conflict(_))) => {
+                    if let Err(response) = restore_engine_config_or_restart(
+                        &state,
+                        &registry_path,
+                        previous_registry_config,
+                    ) {
+                        return response;
+                    }
                     lifecycle_error_response(LifecycleError::VictimPlanChanged)
                 }
-                Ok(Err(error)) => lifecycle_error_response(error),
+                Ok(Err(error)) => {
+                    if let Err(response) = restore_engine_config_or_restart(
+                        &state,
+                        &registry_path,
+                        previous_registry_config,
+                    ) {
+                        return response;
+                    }
+                    lifecycle_error_response(error)
+                }
                 Err(error) => {
+                    if let Err(response) = restore_engine_config_or_restart(
+                        &state,
+                        &registry_path,
+                        previous_registry_config,
+                    ) {
+                        return response;
+                    }
                     ApiError::generation_error(format!("model switch transaction failed: {error}"))
                         .into_response()
                 }
@@ -1284,6 +1765,52 @@ mod tests {
         assert_eq!(diagnostic_quant_from_file_type(0), None);
     }
 
+    #[test]
+    fn activation_candidate_bytes_reserve_the_complete_projector_generation() {
+        let projector = tempfile::NamedTempFile::new().unwrap();
+        let admission = crate::serve::multi_model::ProjectorAdmission {
+            path: projector.path().to_path_buf(),
+            artifact_sha256: "a".repeat(64),
+            profile: crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip,
+            mapped_weight_bytes: 100,
+            mapped_weight_segment_bytes: vec![100],
+            cache_budget_bytes: 200,
+            file_stamp: crate::serve::multi_model::ArtifactFileStamp::inspect(projector.path())
+                .unwrap(),
+        };
+        assert_eq!(
+            generation_candidate_bytes(400, Some(&admission)).unwrap(),
+            700
+        );
+    }
+
+    #[test]
+    fn explicit_local_activation_preserves_preverified_registry_identity() {
+        let model = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(model.path(), b"preverified-model").unwrap();
+        let identity =
+            crate::serve::multi_model::TextArtifactIdentity::inspect(model.path()).unwrap();
+        let mut config = EngineConfig::default();
+        config
+            .bind_verified_text_artifact(identity.clone())
+            .unwrap();
+
+        bind_activation_text_artifact(&mut config, None, model.path()).unwrap();
+
+        assert_eq!(config.verified_text_artifact, Some(identity));
+    }
+
+    #[tokio::test]
+    async fn invalid_projector_surface_fails_before_any_artifact_work() {
+        let response = requested_projector_admission(
+            Some("/private/not-a-projector.bin"),
+            super::super::cancellation::PreparationSupervisor::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn post_commit_load_failure_requires_restart() {
         let response = lifecycle_error_response(LifecycleError::LoadFailed(
@@ -1294,6 +1821,18 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["code"], "restart_required");
         assert_eq!(json["restart_required"], true);
+    }
+
+    #[tokio::test]
+    async fn candidate_preflight_failure_is_precommit_and_does_not_require_restart() {
+        let response = lifecycle_error_response(LifecycleError::CandidatePreflightFailed(
+            crate::serve::load_diagnostic::PublicLoadDiagnostic::LoaderRejected,
+        ));
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "candidate_preflight_failed");
+        assert_eq!(json["restart_required"], false);
     }
 
     #[tokio::test]
@@ -1311,6 +1850,7 @@ mod tests {
                     filename: "model.gguf".into(),
                     root: root.path().to_path_buf(),
                     path: path.clone(),
+                    projector_path: None,
                     bytes: 12,
                     sha256: "b".repeat(64),
                     quant_hint: "Q4_K_M".into(),

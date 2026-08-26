@@ -43,7 +43,7 @@ pub struct VisionPipelineOutput {
     /// Qwen3-VL the per-row stride includes DeepStack residuals so each
     /// tensor has length `n_image_tokens * hidden * (1 + N_deepstack)`.
     pub embeddings: Arc<Vec<Vec<f32>>>,
-    /// Vision family tag (Gemma vs Qwen3Vl vs Unknown) — drives prompt
+    /// Vision family tag (Gemma vs QwenVision vs Unknown) — drives prompt
     /// placeholder syntax + token-id lookup.
     pub family: VisionFamily,
     /// Per-image-token stride in `f32` units. Always a positive divisor
@@ -51,7 +51,7 @@ pub struct VisionPipelineOutput {
     pub per_row_floats: usize,
     /// Per-image post-merge token grid `(n_x_tokens, n_y_tokens)`. Empty
     /// for non-Qwen3-VL families (Gemma routes through patch grid only).
-    pub qwen3vl_image_grids: Vec<(u32, u32)>,
+    pub qwen_vision_image_grids: Vec<(u32, u32)>,
     /// Wall-clock ms spent inside the GPU dispatch.
     pub forward_ms: u64,
 }
@@ -92,6 +92,18 @@ impl VisionEmbeddingCache {
             state: Mutex::new(VisionEmbeddingCacheState::default()),
             wake: Condvar::new(),
         }
+    }
+
+    pub fn budget_bytes(&self) -> usize {
+        self.byte_budget
+    }
+
+    pub fn resident_bytes(&self) -> Result<usize> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("vision embedding cache lock poisoned"))?
+            .resident_bytes)
     }
 
     fn reserve_or_hit(
@@ -191,14 +203,6 @@ impl VisionEmbeddingCache {
         state.in_flight = None;
         self.wake.notify_all();
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn resident_bytes(&self) -> usize {
-        self.state
-            .lock()
-            .expect("vision cache test lock")
-            .resident_bytes
     }
 }
 
@@ -301,7 +305,7 @@ pub fn run_vit_forward_cancellable(
             embeddings: Arc::new(Vec::new()),
             family: mmproj.arch.vision_family(),
             per_row_floats: hidden_size,
-            qwen3vl_image_grids: Vec::new(),
+            qwen_vision_image_grids: Vec::new(),
             forward_ms: 0,
         });
     }
@@ -343,7 +347,7 @@ pub fn run_vit_forward_cancellable(
             .unwrap_or(0);
         let per_row_floats = match family {
             VisionFamily::Gemma => hidden_size,
-            VisionFamily::Qwen3Vl => hidden_size.saturating_mul(1 + n_deepstack),
+            VisionFamily::Qwen => hidden_size.saturating_mul(1 + n_deepstack),
             VisionFamily::Unknown => hidden_size,
         };
 
@@ -358,7 +362,7 @@ pub fn run_vit_forward_cancellable(
             }
         }
 
-        let qwen3vl_image_grids: Vec<(u32, u32)> = if matches!(family, VisionFamily::Qwen3Vl) {
+        let qwen_vision_image_grids: Vec<(u32, u32)> = if matches!(family, VisionFamily::Qwen) {
             let stride = mmproj
                 .config
                 .patch_size
@@ -394,7 +398,7 @@ pub fn run_vit_forward_cancellable(
             embeddings: Arc::new(embeddings),
             family,
             per_row_floats,
-            qwen3vl_image_grids,
+            qwen_vision_image_grids,
             forward_ms,
         })
     })();
@@ -624,7 +628,7 @@ mod tests {
             embeddings: Arc::new(vec![values]),
             family: VisionFamily::Gemma,
             per_row_floats: 1,
-            qwen3vl_image_grids: Vec::new(),
+            qwen_vision_image_grids: Vec::new(),
             forward_ms: 17,
         }
     }
@@ -636,7 +640,7 @@ mod tests {
         assert!(cache.reserve_or_hit(key, None).expect("reserve").is_none());
         let output = cached_output(key, vec![1.0, 2.0, 3.0, 4.0]);
         cache.complete(key, Some(&output)).expect("complete");
-        assert_eq!(cache.resident_bytes(), 16);
+        assert_eq!(cache.resident_bytes().expect("resident bytes"), 16);
         let hit = cache
             .reserve_or_hit(key, None)
             .expect("lookup")
@@ -652,7 +656,7 @@ mod tests {
         assert!(cache.reserve_or_hit(key, None).expect("reserve").is_none());
         let output = cached_output(key, vec![1.0, 2.0]);
         cache.complete(key, Some(&output)).expect("complete");
-        assert_eq!(cache.resident_bytes(), 0);
+        assert_eq!(cache.resident_bytes().expect("resident bytes"), 0);
         assert!(cache
             .reserve_or_hit(key, None)
             .expect("reserve after oversize")
@@ -671,7 +675,7 @@ mod tests {
                 .complete(key, Some(&cached_output(key, vec![1.0, 2.0])))
                 .unwrap();
         }
-        assert_eq!(cache.resident_bytes(), 16);
+        assert_eq!(cache.resident_bytes().expect("resident bytes"), 16);
         assert!(cache.reserve_or_hit([1; 32], None).unwrap().is_some());
 
         assert!(cache.reserve_or_hit([3; 32], None).unwrap().is_none());

@@ -1465,41 +1465,6 @@ fn iter8_streaming_path_byte_identity() {
     );
 }
 
-/// Iter-7 deferral marker (always-pass). Documents the Qwen3.5 / Qwen3-VL
-/// hybrid deferral structurally enforced at the worker-thread Request
-/// dispatch (engine.rs:3144-3161, 3194-3211) and the field placement
-/// (lcp_registry on GemmaLoadedModel only at engine.rs:1102).
-///
-/// FUTURE LIFT INSTRUCTIONS: when Phase B-hybrid follow-up adds Qwen3.5
-/// hybrid LCP support:
-///   1. Add `lcp_registry` field to Qwen35LoadedModel.
-///   2. Add Qwen35 worker arm dispatch for KvSnapshot/KvRestore (today
-///      returns Err at engine.rs:3152).
-///   3. Add Qwen35-specific probe sites mirroring engine.rs:3863-3940.
-///   4. RENAME this test to assert the hybrid LCP path now works (do
-///      NOT silently delete — make the lift visible in the diff).
-#[test]
-fn iter7_qwen35_hybrid_lcp_deferred_marker() {
-    // Compile-time deferral marker: this test always passes and serves
-    // as a grep target. The structural deferral lives in:
-    //   - engine.rs:1102 (lcp_registry field on Gemma only)
-    //   - engine.rs:3152 (Qwen35 kv_restore returns Err)
-    //   - engine.rs:3205 (Qwen35 prompt_cache_restore returns Err)
-    //   - dossier §R5 (risk register hybrid divergence)
-    //
-    // Asserting `true` is intentional. The TEST'S VALUE is that the
-    // documentation in this test header is searchable via:
-    //   grep -rn "iter7_qwen35_hybrid_lcp_deferred_marker"
-    // which surfaces the deferral rationale and the FUTURE LIFT
-    // INSTRUCTIONS.
-    assert!(
-        true,
-        "Phase E.a v1 deferral marker — see test header for rationale. \
-         If Phase B-hybrid follow-up lifts the deferral, RENAME this \
-         test rather than deleting it so the lift surfaces in the diff."
-    );
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Iter-3.6 — long-prompt LCP partial-prefill RESUME byte-identity falsifier.
 //

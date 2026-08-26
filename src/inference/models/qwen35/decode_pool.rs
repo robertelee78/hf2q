@@ -46,7 +46,9 @@
 use std::cell::RefCell;
 
 use mlx_native::ops::quantized_matmul_id_ggml::IdMmScratch;
-use mlx_native::{DType, MlxBuffer, MlxBufferPool, MlxDevice};
+use mlx_native::{DType, DenseMatmulIdScratch, MlxBuffer, MlxBufferPool, MlxDevice};
+
+use crate::inference::dense_expert_activation::DenseExpertScratchCache;
 
 thread_local! {
     /// Per-thread arena pool.  Initialized lazily by the first
@@ -67,9 +69,89 @@ thread_local! {
     /// × 3 scratches); every subsequent FFN call (47 layers × 3 calls
     /// = 141 calls) reuses them.  Net: 286 of 288 per-prefill device
     /// allocs eliminated, matching the W-5b.23 audit's recovery target.
-    static MM_ID_SCRATCH_GATE: RefCell<Option<IdMmScratch>> = const { RefCell::new(None) };
-    static MM_ID_SCRATCH_UP: RefCell<Option<IdMmScratch>> = const { RefCell::new(None) };
-    static MM_ID_SCRATCH_DOWN: RefCell<Option<IdMmScratch>> = const { RefCell::new(None) };
+    static MM_ID_SCRATCH_GATE: RefCell<LegacyExpertScratchCache> = RefCell::new(LegacyExpertScratchCache::default());
+    static MM_ID_SCRATCH_UP: RefCell<LegacyExpertScratchCache> = RefCell::new(LegacyExpertScratchCache::default());
+    static MM_ID_SCRATCH_DOWN: RefCell<LegacyExpertScratchCache> = RefCell::new(LegacyExpertScratchCache::default());
+    static DENSE_ID_SCRATCH_GATE: RefCell<DenseExpertScratchCache> = RefCell::new(DenseExpertScratchCache::default());
+    static DENSE_ID_SCRATCH_UP: RefCell<DenseExpertScratchCache> = RefCell::new(DenseExpertScratchCache::default());
+    static DENSE_ID_SCRATCH_DOWN: RefCell<DenseExpertScratchCache> = RefCell::new(DenseExpertScratchCache::default());
+}
+
+struct LegacyExpertScratchEntry {
+    activation_epoch: u64,
+    device_registry_id: u64,
+    scratch: IdMmScratch,
+}
+
+/// Model-bound cache for the legacy quantized expert-ID map scratch.
+///
+/// Capacity alone cannot authorize reuse: model swaps construct a fresh
+/// `MlxDevice`/residency set even when the next artifact has identical expert
+/// geometry. Retaining the old scratch would keep allocation-backed Metal
+/// state alive and route the new generation through the prior residency
+/// owner.
+#[derive(Default)]
+struct LegacyExpertScratchCache {
+    entry: Option<LegacyExpertScratchEntry>,
+    #[cfg(test)]
+    allocation_generation: u64,
+}
+
+impl LegacyExpertScratchCache {
+    fn owned_bytes(&self) -> u64 {
+        self.entry.as_ref().map_or(0, |entry| {
+            (entry.scratch.htpe.byte_len() + entry.scratch.hids.byte_len()) as u64
+        })
+    }
+
+    fn with<R>(
+        &mut self,
+        activation_epoch: u64,
+        device: &MlxDevice,
+        n_experts: u32,
+        max_n_tokens: u32,
+        f: impl FnOnce(&mut IdMmScratch) -> std::result::Result<R, mlx_native::MlxError>,
+    ) -> std::result::Result<R, mlx_native::MlxError> {
+        if activation_epoch == 0 {
+            return Err(mlx_native::MlxError::InvalidArgument(
+                "legacy expert scratch activation epoch must be nonzero".into(),
+            ));
+        }
+        let device_registry_id = device.registry_id();
+        let must_allocate = self.entry.as_ref().is_none_or(|entry| {
+            let cap_n_experts = entry.scratch.htpe.element_count() as u32;
+            let cap_total = entry.scratch.hids.element_count() as u64;
+            let cap_n_tokens = if cap_n_experts == 0 {
+                0
+            } else {
+                (cap_total / u64::from(cap_n_experts)) as u32
+            };
+            entry.activation_epoch != activation_epoch
+                || entry.device_registry_id != device_registry_id
+                || n_experts > cap_n_experts
+                || max_n_tokens > cap_n_tokens
+        });
+        if must_allocate {
+            // Drop the prior activation/device owner before asking Metal for
+            // replacement storage. A failed allocation therefore leaves no
+            // stale scratch that a retry could accidentally reuse.
+            self.entry.take();
+            self.entry = Some(LegacyExpertScratchEntry {
+                activation_epoch,
+                device_registry_id,
+                scratch: IdMmScratch::alloc(device, n_experts, max_n_tokens)?,
+            });
+            #[cfg(test)]
+            {
+                self.allocation_generation += 1;
+            }
+        }
+        f(&mut self
+            .entry
+            .as_mut()
+            .expect("legacy expert scratch cache allocated")
+            .scratch)
+    }
 }
 
 /// Allocate from the thread-local decode pool.
@@ -136,6 +218,99 @@ pub fn reset_for_prefill_chunk() {
     DECODE_POOL.with(|cell| cell.borrow_mut().reset());
 }
 
+/// Drop every allocation-backed thread-local resource before another model
+/// activation is materialized on this thread.
+///
+/// This is deliberately stronger than the per-token reset: `reset` retains
+/// power-of-two scratch buckets for reuse, while an A→B transition must not
+/// preserve A's device/residency ownership or high-water allocation. The
+/// caller must have already dropped the stale model-bound GPU cache and must
+/// invoke this before allocating the replacement cache.
+pub(super) fn clear_for_model_activation() {
+    DECODE_POOL.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        // `MlxBufferPool::clear` releases its free buffers but deliberately
+        // retains the residency-set owner.  An activation boundary must drop
+        // that owner too: the replacement model receives a fresh
+        // residency-enabled `MlxDevice`, and retaining A's empty pool would
+        // make B's first allocation fail closed as a mixed-device request.
+        // Replacing the arena drops buffers, registrations, and owner as one
+        // unit before the next activation allocates anything.
+        *pool = MlxBufferPool::new();
+    });
+    drop_id_mm_scratch();
+}
+
+/// Release allocation-backed decode and expert scratch at a drained worker
+/// boundary, returning the exact bytes owned by the registered buffers.
+pub(super) fn idle_runtime_owned_bytes() -> std::result::Result<u64, &'static str> {
+    let pool_bytes = DECODE_POOL.with(|cell| {
+        let pool = cell.borrow();
+        if pool.in_use_count() != 0 {
+            return Err("Qwen decode pool still has in-use buffers");
+        }
+        Ok(pool.free_bytes() as u64)
+    })?;
+    let mut scratch_bytes = 0u64;
+    for cell in [&MM_ID_SCRATCH_GATE, &MM_ID_SCRATCH_UP, &MM_ID_SCRATCH_DOWN] {
+        cell.with(|cell| {
+            scratch_bytes = scratch_bytes.saturating_add(cell.borrow().owned_bytes());
+        });
+    }
+    for cell in [
+        &DENSE_ID_SCRATCH_GATE,
+        &DENSE_ID_SCRATCH_UP,
+        &DENSE_ID_SCRATCH_DOWN,
+    ] {
+        cell.with(|cell| {
+            scratch_bytes = scratch_bytes.saturating_add(cell.borrow().owned_bytes());
+        });
+    }
+    pool_bytes
+        .checked_add(scratch_bytes)
+        .ok_or("Qwen idle scratch byte total overflow")
+}
+
+/// Release allocation-backed decode and expert scratch at a drained worker
+/// boundary, returning the exact bytes owned by the registered buffers.
+pub(super) fn release_idle_runtime_state() -> std::result::Result<u64, &'static str> {
+    let expected = idle_runtime_owned_bytes()?;
+    let pool_bytes = DECODE_POOL.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        if pool.in_use_count() != 0 {
+            return Err("Qwen decode pool still has in-use buffers");
+        }
+        let bytes = pool.free_bytes() as u64;
+        // Keep the pool's model-bound residency set, but use its explicit
+        // clear path so every free allocation is removed and committed
+        // before the worker authenticates the park receipt.
+        pool.clear();
+        Ok(bytes)
+    })?;
+    let mut scratch_bytes = 0u64;
+    for cell in [&MM_ID_SCRATCH_GATE, &MM_ID_SCRATCH_UP, &MM_ID_SCRATCH_DOWN] {
+        cell.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            scratch_bytes = scratch_bytes.saturating_add(cache.owned_bytes());
+            *cache = LegacyExpertScratchCache::default();
+        });
+    }
+    for cell in [
+        &DENSE_ID_SCRATCH_GATE,
+        &DENSE_ID_SCRATCH_UP,
+        &DENSE_ID_SCRATCH_DOWN,
+    ] {
+        cell.with(|cell| {
+            scratch_bytes = scratch_bytes.saturating_add(cell.borrow_mut().release_owned_bytes());
+        });
+    }
+    let released = pool_bytes
+        .checked_add(scratch_bytes)
+        .ok_or("Qwen idle scratch byte total overflow")?;
+    debug_assert_eq!(released, expected);
+    Ok(released)
+}
+
 /// Diagnostic accessor: number of buffers currently in-use (alloc'd but
 /// not yet reset).  Surfaced for the `HF2Q_DECODE_PROFILE` instrumentation.
 #[allow(dead_code)]
@@ -149,6 +324,20 @@ pub fn decode_pool_free_count() -> usize {
     DECODE_POOL.with(|cell| cell.borrow().free_count())
 }
 
+#[cfg(test)]
+pub(super) fn cached_legacy_id_scratch_count() -> usize {
+    MM_ID_SCRATCH_GATE.with(|cell| usize::from(cell.borrow().entry.is_some()))
+        + MM_ID_SCRATCH_UP.with(|cell| usize::from(cell.borrow().entry.is_some()))
+        + MM_ID_SCRATCH_DOWN.with(|cell| usize::from(cell.borrow().entry.is_some()))
+}
+
+#[cfg(test)]
+pub(super) fn cached_dense_id_scratch_count() -> usize {
+    DENSE_ID_SCRATCH_GATE.with(|cell| usize::from(cell.borrow().has_entry_for_test()))
+        + DENSE_ID_SCRATCH_UP.with(|cell| usize::from(cell.borrow().has_entry_for_test()))
+        + DENSE_ID_SCRATCH_DOWN.with(|cell| usize::from(cell.borrow().has_entry_for_test()))
+}
+
 /// Slot identifier for the three MoE FFN `quantized_matmul_id_ggml` call
 /// sites: gate, up, and down.  Each slot gets its own thread-local
 /// `IdMmScratch` so concurrent dispatches (gate+up in Phase C) do not
@@ -158,6 +347,30 @@ pub enum MmIdSlot {
     Gate,
     Up,
     Down,
+}
+
+/// Borrow one artifact-native scalar expert scratch. Gate/up/down have
+/// distinct storage because their map stages may coexist in one encoder.
+pub fn with_dense_id_scratch<F, R>(
+    slot: MmIdSlot,
+    activation_epoch: u64,
+    device: &MlxDevice,
+    n_experts: u32,
+    max_n_tokens: u32,
+    f: F,
+) -> std::result::Result<R, mlx_native::MlxError>
+where
+    F: FnOnce(&DenseMatmulIdScratch) -> std::result::Result<R, mlx_native::MlxError>,
+{
+    let cell = match slot {
+        MmIdSlot::Gate => &DENSE_ID_SCRATCH_GATE,
+        MmIdSlot::Up => &DENSE_ID_SCRATCH_UP,
+        MmIdSlot::Down => &DENSE_ID_SCRATCH_DOWN,
+    };
+    cell.with(|cell| {
+        cell.borrow_mut()
+            .with(activation_epoch, device, n_experts, max_n_tokens, f)
+    })
 }
 
 /// Run a closure with a mutable reference to the slot's thread-local
@@ -177,6 +390,7 @@ pub enum MmIdSlot {
 /// Returns `MlxError` if `IdMmScratch::alloc` fails on cache miss.
 pub fn with_id_mm_scratch<F, R>(
     slot: MmIdSlot,
+    activation_epoch: u64,
     device: &MlxDevice,
     n_experts: u32,
     max_n_tokens: u32,
@@ -191,38 +405,8 @@ where
         MmIdSlot::Down => &MM_ID_SCRATCH_DOWN,
     };
     cell.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        // Capacity check: the inner scratch's caps are private, so we
-        // proxy via `IdMmScratch::alloc`'s error-returning check_capacity
-        // path indirectly — easier to just track the caps we requested
-        // and grow when we exceed them.  Using the option's None state
-        // for first-time allocation, plus a stored cap pair on Some.
-        //
-        // We tag the cap pair onto a side-table of static AtomicU32s
-        // keyed off slot — but a simpler approach: stash the caps in
-        // adjacent thread_local cells.  Inline that via the helper
-        // closure here: any check_capacity error reallocates.
-        let needs_realloc = match guard.as_ref() {
-            None => true,
-            Some(scratch) => {
-                // Probe the public api: scratch.htpe.element_count is
-                // the n_experts cap; scratch.hids.element_count() ==
-                // n_experts_cap × n_tokens_cap.  Both fields pub.
-                let cap_n_experts = scratch.htpe.element_count() as u32;
-                let cap_total = scratch.hids.element_count() as u64;
-                let cap_n_tokens = if cap_n_experts == 0 {
-                    0
-                } else {
-                    (cap_total / cap_n_experts as u64) as u32
-                };
-                n_experts > cap_n_experts || max_n_tokens > cap_n_tokens
-            }
-        };
-        if needs_realloc {
-            *guard = Some(IdMmScratch::alloc(device, n_experts, max_n_tokens)?);
-        }
-        let scratch = guard.as_mut().expect("just allocated");
-        f(scratch)
+        cell.borrow_mut()
+            .with(activation_epoch, device, n_experts, max_n_tokens, f)
     })
 }
 
@@ -235,9 +419,12 @@ where
 /// per-allocation cost amortising to zero.
 #[allow(dead_code)]
 pub fn drop_id_mm_scratch() {
-    MM_ID_SCRATCH_GATE.with(|cell| *cell.borrow_mut() = None);
-    MM_ID_SCRATCH_UP.with(|cell| *cell.borrow_mut() = None);
-    MM_ID_SCRATCH_DOWN.with(|cell| *cell.borrow_mut() = None);
+    MM_ID_SCRATCH_GATE.with(|cell| *cell.borrow_mut() = LegacyExpertScratchCache::default());
+    MM_ID_SCRATCH_UP.with(|cell| *cell.borrow_mut() = LegacyExpertScratchCache::default());
+    MM_ID_SCRATCH_DOWN.with(|cell| *cell.borrow_mut() = LegacyExpertScratchCache::default());
+    DENSE_ID_SCRATCH_GATE.with(|cell| *cell.borrow_mut() = DenseExpertScratchCache::default());
+    DENSE_ID_SCRATCH_UP.with(|cell| *cell.borrow_mut() = DenseExpertScratchCache::default());
+    DENSE_ID_SCRATCH_DOWN.with(|cell| *cell.borrow_mut() = DenseExpertScratchCache::default());
 }
 
 #[cfg(test)]
@@ -275,5 +462,62 @@ mod tests {
         );
 
         reset_decode_pool();
+    }
+
+    #[test]
+    fn activation_clear_releases_decode_high_water_and_expert_scratch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device_a = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        clear_for_model_activation();
+
+        let pooled = pooled_alloc_buffer(&device_a, 1024, DType::F32, vec![256])
+            .expect("allocate activation-A decode scratch");
+        drop(pooled);
+        reset_decode_pool();
+        assert!(decode_pool_free_count() >= 1);
+
+        with_id_mm_scratch(MmIdSlot::Gate, 11, &device_a, 3, 2, |_| Ok(()))
+            .expect("allocate activation-A expert scratch");
+        with_dense_id_scratch(MmIdSlot::Up, 11, &device_a, 3, 2, |_| Ok(()))
+            .expect("allocate activation-A scalar expert scratch");
+        assert_eq!(cached_legacy_id_scratch_count(), 1);
+        assert_eq!(cached_dense_id_scratch_count(), 1);
+
+        clear_for_model_activation();
+        assert_eq!(decode_pool_in_use_count(), 0);
+        assert_eq!(decode_pool_free_count(), 0);
+        assert_eq!(cached_legacy_id_scratch_count(), 0);
+        assert_eq!(cached_dense_id_scratch_count(), 0);
+
+        let device_b = MlxDevice::new().expect("create activation-B device");
+        let pooled_b = pooled_alloc_buffer(&device_b, 1024, DType::F32, vec![256])
+            .expect("activation clear must release the residency owner before B allocates");
+        drop(pooled_b);
+        clear_for_model_activation();
+    }
+
+    #[test]
+    fn legacy_expert_scratch_rebinds_across_a_b_a_epochs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device_a = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let device_b = MlxDevice::new().expect("create activation-B device");
+        let mut cache = LegacyExpertScratchCache::default();
+        for (epoch, device, expected_generation) in [
+            (11, &device_a, 1),
+            (11, &device_a, 1),
+            (22, &device_b, 2),
+            (33, &device_a, 3),
+        ] {
+            cache
+                .with(epoch, device, 3, 2, |_| Ok(()))
+                .expect("allocate epoch-bound legacy expert scratch");
+            assert_eq!(cache.allocation_generation, expected_generation);
+        }
     }
 }

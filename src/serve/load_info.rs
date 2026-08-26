@@ -146,11 +146,6 @@ pub enum ArchFamily {
     /// Qwen3.5 / Qwen3.6 (DeltaNet linear-attn + periodic full-attn,
     /// dense or MoE).
     Qwen35,
-    /// Qwen3-VL **text** LM (plain dense GQA + per-head Q/K RMSNorm +
-    /// 3D-mRoPE + DeepStack-residual injection). The vision side is a
-    /// separate ViT (Wedge-4c) that produces image-token embeddings the
-    /// text LM consumes. ADR-005 Wedge-4 / iter-228a.
-    Qwen3VlText,
     /// DeepSeek-V4-Flash verifier with compressed/indexed sparse attention.
     Deepseek4,
     /// Reserved — Llama4 (placeholder; the dispatcher errors at the
@@ -165,7 +160,6 @@ impl ArchFamily {
         match self {
             ArchFamily::Gemma4 => "gemma4",
             ArchFamily::Qwen35 => "qwen35",
-            ArchFamily::Qwen3VlText => "qwen3vl-text",
             ArchFamily::Deepseek4 => "deepseek4",
             ArchFamily::Llama4Reserved => "llama4",
         }
@@ -174,9 +168,9 @@ impl ArchFamily {
     /// `true` iff this architecture supports a separate mmproj GGUF for
     /// vision (so the banner should distinguish "mmproj-required (none
     /// loaded)" from "n/a (text-only arch)").  Gemma4 ships as
-    /// text+mmproj pairs; Qwen3-VL text LM has a companion ViT. Qwen35 is a
-    /// mixed registry family, so its serve banner is upgraded from the loaded
-    /// projector rather than inferring a requirement for every checkpoint.
+    /// text+mmproj pairs. Qwen35 is a mixed registry family, so its serve
+    /// banner is upgraded from the loaded projector rather than inferring a
+    /// requirement for every checkpoint.
     pub fn supports_mmproj(&self) -> bool {
         matches!(self, ArchFamily::Gemma4)
     }
@@ -580,11 +574,11 @@ pub fn qwen35_fixed_kv_bytes_per_slot(cfg: &crate::inference::models::qwen35::Qw
         .saturating_mul(4)
         .saturating_mul(2);
     let live_scaffold = linear_layers.saturating_mul(conv.saturating_add(recurrent));
-    // Each prompt anchor owns one copy of the current (not scratch) conv and
-    // recurrent state. Anchor replacement briefly retains old + new, which is
-    // exactly another full live-scaffold equivalent. Round to a 16 MiB page /
-    // metadata boundary; the canonical Qwen3.6 artifact becomes 256 MiB.
-    round_up_bytes(live_scaffold.saturating_mul(2), 16 * 1024 * 1024)
+    // This scheduler charge covers only the live ping-pong DeltaNet scaffold.
+    // Reclaimable prompt anchors have an independent aggregate anchor-owned byte
+    // budget and must not inflate the scheduler's monotonic Metal allocation
+    // high-water. Round the live allocation to a 16 MiB metadata boundary.
+    round_up_bytes(live_scaffold, 16 * 1024 * 1024)
 }
 
 /// Fixed DeepSeek-V4 window/compressor state plus the compact recovery anchor.
@@ -945,7 +939,8 @@ pub fn emit_tracing(info: &LoadInfo) {
 /// that metadata is absent or outside the runtime pool's supported profile
 /// set, preserving observability for legacy and custom artifacts.
 ///
-/// Returns `None` for pure-fp GGUFs (every tensor is `F32` or `F16`) and
+/// Returns `None` for pure-fp GGUFs (every tensor is `F32`, `F16`, or
+/// `BF16`) and
 /// for empty GGUFs.
 ///
 /// # Why this lives here
@@ -977,13 +972,18 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
         let Some(info) = gguf.tensor_info(name) else {
             continue;
         };
-        if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
+        if matches!(
+            info.ggml_type,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+        ) {
             continue;
         }
         let label = match info.ggml_type {
             GgmlType::F32 => "F32",
             GgmlType::F16 => "F16",
+            GgmlType::BF16 => "BF16",
             GgmlType::Q4_0 => "Q4_0",
+            GgmlType::Q5_0 => "Q5_0",
             GgmlType::Q8_0 => "Q8_0",
             GgmlType::Q2_K => "Q2_K",
             GgmlType::Q3_K => "Q3_K",
@@ -995,6 +995,7 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
             GgmlType::Q5_1 => "Q5_1",
             GgmlType::IQ4_NL => "IQ4_NL",
             GgmlType::IQ4_XS => "IQ4_XS",
+            _ => continue,
         };
         *histogram.entry(label).or_insert(0) += 1;
     }
@@ -1009,7 +1010,7 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
 ///
 /// # Algorithm
 ///
-/// For each tensor whose `ggml_type` is *not* `F32` or `F16`:
+/// For each tensor whose `ggml_type` is *not* `F32`, `F16`, or `BF16`:
 ///   1. `n_elements = shape.iter().product::<usize>()` — total elements
 ///      stored.
 ///   2. `block_count = n_elements / block_values` — must be exact (GGUF
@@ -1038,6 +1039,7 @@ pub fn infer_quant_label(gguf: &mlx_native::gguf::GgufFile) -> Option<String> {
 ///   * Q4_K → 144 × 8 / 256 = 4.5 bpw exactly
 ///   * Q6_K → 210 × 8 / 256 = 6.5625 bpw exactly
 ///   * Q4_0 → 18 × 8 / 32 = 4.5 bpw
+///   * Q5_0 → 22 × 8 / 32 = 5.5 bpw
 ///   * Q8_0 → 34 × 8 / 32 = 8.5 bpw
 pub fn compute_bpw(gguf: &mlx_native::gguf::GgufFile) -> Option<f32> {
     use mlx_native::GgmlType;
@@ -1049,7 +1051,10 @@ pub fn compute_bpw(gguf: &mlx_native::gguf::GgufFile) -> Option<f32> {
         let Some(info) = gguf.tensor_info(name) else {
             continue;
         };
-        if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
+        if matches!(
+            info.ggml_type,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+        ) {
             continue;
         }
 
@@ -1109,6 +1114,7 @@ mod tests {
     // GGML type IDs (must match `mlx_native::gguf::GGML_TYPE_*`).
     const GGML_TYPE_F32: u32 = 0;
     const GGML_TYPE_F16: u32 = 1;
+    const GGML_TYPE_BF16: u32 = 30;
     const GGML_TYPE_Q4_K: u32 = 12;
     const GGML_TYPE_Q5_K: u32 = 13;
     const GGML_TYPE_Q6_K: u32 = 14;
@@ -1339,6 +1345,12 @@ mod tests {
                 ggml_type_id: GGML_TYPE_F16,
                 byte_len: 64 * 2,
             },
+            TensorSpec {
+                name: "token_embd.weight",
+                shape: vec![64],
+                ggml_type_id: GGML_TYPE_BF16,
+                byte_len: 64 * 2,
+            },
         ];
         write_synthetic_gguf(&path, &tensors);
 
@@ -1369,13 +1381,18 @@ mod tests {
                 let Some(info) = gguf.tensor_info(name) else {
                     continue;
                 };
-                if matches!(info.ggml_type, GgmlType::F32 | GgmlType::F16) {
+                if matches!(
+                    info.ggml_type,
+                    GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+                ) {
                     continue;
                 }
                 let label = match info.ggml_type {
                     GgmlType::F32 => "F32",
                     GgmlType::F16 => "F16",
+                    GgmlType::BF16 => "BF16",
                     GgmlType::Q4_0 => "Q4_0",
+                    GgmlType::Q5_0 => "Q5_0",
                     GgmlType::Q8_0 => "Q8_0",
                     GgmlType::Q2_K => "Q2_K",
                     GgmlType::Q3_K => "Q3_K",
@@ -1387,6 +1404,7 @@ mod tests {
                     GgmlType::Q5_1 => "Q5_1",
                     GgmlType::IQ4_NL => "IQ4_NL",
                     GgmlType::IQ4_XS => "IQ4_XS",
+                    _ => continue,
                 };
                 *histogram.entry(label).or_insert(0) += 1;
             }
@@ -1543,6 +1561,12 @@ mod tests {
                 name: "embd.weight",
                 shape: vec![32, 4],
                 ggml_type_id: GGML_TYPE_F16,
+                byte_len: 128 * 2,
+            },
+            TensorSpec {
+                name: "bf16.weight",
+                shape: vec![32, 4],
+                ggml_type_id: GGML_TYPE_BF16,
                 byte_len: 128 * 2,
             },
         ];
@@ -2124,7 +2148,9 @@ mod tests {
         }
     }
 
-    fn canonical_qwen36_27b_config() -> crate::inference::models::qwen35::Qwen35Config {
+    /// Qwen3.8-27B fixture includes its appended MTP full-attention layer.
+    /// Omitting it understates token-linear admission by 1/16 (6.25%).
+    fn canonical_qwen38_27b_config() -> crate::inference::models::qwen35::Qwen35Config {
         use crate::inference::models::qwen35::{default_layer_types, Qwen35Config, Qwen35Variant};
         Qwen35Config {
             variant: Qwen35Variant::Dense,
@@ -2149,7 +2175,7 @@ mod tests {
             max_position_embeddings: 262_144,
             vocab_size: 248_320,
             attn_output_gate: true,
-            mtp_num_hidden_layers: 0,
+            mtp_num_hidden_layers: 1,
             mtp_use_dedicated_embeddings: false,
             intermediate_size: Some(17_408),
             moe: None,
@@ -2199,12 +2225,12 @@ mod tests {
     }
 
     #[test]
-    fn qwen36_slot_kv_bytes_per_token_counts_only_full_attention_tq_rows() {
-        let cfg = canonical_qwen36_27b_config();
-        // 16 full layers. Per layer: two packed U8 tensors of 4*256 bytes
+    fn qwen38_slot_kv_bytes_per_token_counts_full_attention_and_mtp_tq_rows() {
+        let cfg = canonical_qwen38_27b_config();
+        // 16 target full layers plus one MTP layer. Per layer: two packed U8 tensors of 4*256 bytes
         // plus two F32 norm tensors of 4*1 elements = 2,080 bytes/token.
-        assert_eq!(super::qwen35_slot_kv_bytes_per_token(&cfg, true), 33_280);
-        assert_eq!(super::qwen35_slot_kv_bytes_per_token(&cfg, false), 131_072);
+        assert_eq!(super::qwen35_slot_kv_bytes_per_token(&cfg, true), 35_360);
+        assert_eq!(super::qwen35_slot_kv_bytes_per_token(&cfg, false), 139_264);
         assert!(
             (cfg.max_position_embeddings as u64 + 8_192)
                 * super::qwen35_slot_kv_bytes_per_token(&cfg, true)
@@ -2222,8 +2248,8 @@ mod tests {
             fixed.saturating_add(u64::from(cfg.max_position_embeddings).saturating_mul(linear));
         let budget = 48 * 1024 * 1024 * 1024_u64;
         assert_eq!(linear, 10_400);
-        assert_eq!(fixed, 256 * 1024 * 1024);
-        assert_eq!(full_slot, 2_994_733_056);
+        assert_eq!(fixed, 128 * 1024 * 1024);
+        assert_eq!(full_slot, 2_860_515_328);
         assert!(full_slot.saturating_mul(4) < budget);
         assert!(full_slot.saturating_mul(8) < budget);
     }

@@ -113,14 +113,7 @@ fn inspect(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("GGUF is missing required `general.architecture`"))?
         .to_owned();
-    if !matches!(
-        architecture.as_str(),
-        "gemma4" | "qwen35" | "qwen35moe" | "deepseek4" | "qwen3_vl" | "qwen3vl" | "qwen3vlmoe"
-    ) {
-        anyhow::bail!(
-            "unsupported GGUF general.architecture={architecture:?}; supported serve runtimes are gemma4, qwen35, qwen35moe, and deepseek4"
-        );
-    }
+    super::api::engine::LoadedModel::validate_architecture_for_load(&architecture, &args.model)?;
     let requested = operator_settings::requested_context(args.planning.ctx, operator_defaults)
         .map_err(anyhow::Error::msg)?;
     let context = operator_settings::resolve_context_for_gguf(&gguf, requested)
@@ -131,7 +124,8 @@ fn inspect(
     let scheduler_support = match engine_mode {
         EngineMode::SerialFifo => Ok("ready"),
         EngineMode::SlotAware { max_slots } => {
-            super::api::engine::Engine::validate_slot_aware_capacity(max_slots)
+            let is_qwen35 = matches!(architecture.as_str(), "qwen35" | "qwen35moe");
+            super::api::engine::Engine::validate_slot_aware_capacity(max_slots, is_qwen35)
                 .map(|()| "ready")
                 .map_err(|error| error.to_string())
         }
@@ -206,7 +200,7 @@ fn inspect(
                 .then(|| {
                     vision_contract(
                         &gguf,
-                        ArchProfile::Qwen3VlSiglip,
+                        ArchProfile::QwenVisionSiglip,
                         cfg.hidden_size,
                         gguf.metadata_u32("hf2q.vision.deepstack_output_count"),
                     )
@@ -233,18 +227,6 @@ fn inspect(
                 super::load_info::deepseek4_fixed_kv_bytes_per_slot(&cfg, 6_880),
                 None,
             )
-        }
-        "qwen3_vl" | "qwen3vl" => {
-            support = Err(format!(
-                    "Qwen3-VL architecture {architecture:?} is recognized, but the serve engine seam is not wired (ADR-041 iter-9b); serving would reject this model before tensor loading"
-                ));
-            ("Qwen 3 VL", 0, 0, None)
-        }
-        "qwen3_vl_moe" | "qwen3vlmoe" => {
-            support = Err(format!(
-                    "Qwen3-VL MoE architecture {architecture:?} is recognized, but no supported hf2q serve pipeline can consume it"
-                ));
-            ("Qwen 3 VL MoE", 0, 0, None)
         }
         other => {
             support = Err(format!(

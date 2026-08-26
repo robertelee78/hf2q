@@ -81,12 +81,21 @@ impl Deepseek4Model {
                 .context("plan DeepSeek-V4 B=4 decode cache transaction")?;
         }
 
+        self.begin_moe_transaction()?;
         begin_decode_pool_token();
         let (result, submitted_any) =
             self.forward_verifier_decode_cohort_uncommitted(&token_ids, caches);
         end_decode_pool_token();
         match result {
             Ok(state) => {
+                if let Err(error) = self.ensure_moe_transaction_clean() {
+                    for cache in caches.iter_mut() {
+                        cache.poison();
+                    }
+                    return Err(error).context(
+                        "DeepSeek-V4 B=4 decode produced invalid MoE state; caches poisoned",
+                    );
+                }
                 publish_verifier_cohort_after_gate(caches, positions, commit_gate)?;
                 Ok(state)
             }

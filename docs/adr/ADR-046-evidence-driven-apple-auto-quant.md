@@ -3,15 +3,44 @@
 - Status: Accepted; measured-selector foundation implemented, artifact
   generation and CLI activation remain gated by the phases below
 - Date: 2026-08-18
-- Updated: 2026-08-21 — the current release boundary pins exact published
-  `mlx-native = 0.11.1`, including direct execution of packed Q5_K/Q6_K
-  embedding rows; the first official source-teacher gate below remains
-  historical evidence from exact `0.10.16`. The backend-independent
+- Updated: 2026-08-25 — the current release boundary pins exact published
+  `mlx-native = 0.14.0` (registry SHA-256
+  `c7b359aa9ea2603f58b49151ba54e37ed1aac10e76faf530865ea30a95f051b4`),
+  including direct execution of packed Q4_0/Q5_K/Q6_K embedding rows and
+  mapped GGUF tensor ownership plus exact width-amortized Q4_K/Q5_K/Q6_K
+  decode; the first official source-teacher gate below
+  remains historical evidence from exact `0.10.16`. The backend-independent
   exact-teacher target storage and model-free allocation binding cannot invoke
   the proposer without authenticated source-precision completion,
   sensitivity, measurement, and quality evidence
 - Owners: hf2q product pipeline; mlx-native model-agnostic execution primitives
 - Supersedes: ADR-020's proposed DWQ architecture and performance claims
+
+### 2026-08-25 published dependency boundary
+
+`mlx-native 0.14.0` was published from exact source commit
+`32f076c7502151e7ca9cb20c06d0f3fe5e1d5641`. Fail-closed workflow run
+`32873363483` verified the source, packed crate, registry archive, crates.io
+bytes, tag, and GitHub release bytes before succeeding. The exact crate
+SHA-256 is
+`c7b359aa9ea2603f58b49151ba54e37ed1aac10e76faf530865ea30a95f051b4`.
+This boundary adds exact logical-width Q4_K/Q5_K/Q6_K multi-row execution and
+does not alter the historical source-teacher evidence below.
+
+### 2026-08-23 published dependency boundary
+
+`mlx-native 0.13.0` was published from exact source commit
+`1d9073a5d31565bee79bf99a516b8781cab0a284`. Fail-closed workflow run
+`32685066084` verified the source, packed crate, registry archive, crates.io
+bytes, tag, and GitHub release bytes before succeeding. hf2q commit
+`1b1f3811` then replaced the unpublished/local dependency seam with one exact
+crates.io requirement and checksum-bearing lock entry. No ignored Cargo path
+patch participated in that 2026-08-23 candidate.
+
+That boundary closed the runtime-dependency publication prerequisite only. It did not
+mint auto-quant selector authority, replace the source-teacher or quality
+receipts below, or turn any pending full-model parity/performance gate into a
+passing result.
 
 ### 2026-08-20 compilation boundary clarification
 
@@ -44,6 +73,426 @@ selector/autoquant activation, and replay remain outside the production
 boundary. The crate-wide warning denial remains unchanged, and unused
 compatibility helpers stay `cfg(test)` rather than crossing the release
 boundary or acquiring warning allowances.
+
+### 2026-08-22 Gemma native-matrix execution amendment
+
+Conversion owns quantization from authenticated source weights. Production
+inference does not get a second, implicit opportunity to change a served
+artifact's matrix representation. Gemma therefore applies these invariants:
+
+- Before creating any Metal model storage, the family loader validates tensor
+  rank, shape, payload length, and the intersection of the embedding-gather,
+  dense projection, and expert execution capabilities required by that exact
+  stored GGUF type. Dense admission covers scalar decode, every continuous
+  width from 2 through 8, and prompt routing. Expert admission separately
+  exercises gate/up and down through serial auto-dispatch, forced row-identical
+  multi-slot dispatch, and pooled prompt paths below and above the grouped-MM
+  threshold. Unsupported or malformed matrices fail closed.
+- Admitted embedding, output-head, dense-projection, and expert tensors remain
+  file-backed views of their declared GGUF payload. The loader neither
+  dequantizes them into a dense shadow nor re-quantizes them into a different
+  block format. An explicitly declared affine safetensors overlay remains an
+  opt-in representation with its own metadata and dispatch contract. The
+  head-major BF16 flash-output fast path is used only when the stored
+  O-projection has a native permuted-input kernel; other admitted codecs
+  permute the activation to seq-major F32 and execute the ordinary native
+  stored-weight route. Activation layout conversion is not weight conversion.
+- Required and optional elementwise model state has the same representation
+  boundary. The loader catalogs every F32 norm, scalar, router scale, expert
+  scale, and optional RoPE table; validates exact `F32` type, logical shape,
+  and byte extent before mapping; then retains each present value as a view of
+  the model-scoped GGUF mapping. Anonymous model-state storage is limited to
+  the explicitly derived router-combined vector and named one-F32 placeholders
+  for structurally absent optional state. Hosted mutation canaries reject both
+  a quantized required norm and a present non-F32 optional tensor; the Metal
+  loader receipt independently requires zero anonymous bytes across all
+  retained ordinary artifact matrices and state.
+- When `output.weight` is absent, the output head resolves to the same
+  `MlxQWeight` object as `token_embd.weight`; it does not allocate or derive a
+  second head. An explicit output tensor retains its own declared format.
+- Batched output-head execution preserves the scalar row reduction order for
+  every admitted representation. Quantized row-identical routes remain
+  batched; dense F32/F16/BF16 heads execute scalar row views because their tile
+  reductions differ. Once reranking was removed, the post-norm hidden operand
+  also stopped crossing back to the CPU; multi-slot finalization reads only the
+  exact native-head logits and applies the same first-max rule as scalar decode.
+- `MlxQWeight::from_mapped_gguf_tensor` and the raw rank-3 mapped-view helper
+  are shared, path-independent ownership primitives. Family-specific
+  capability admission stays in the family loader. Dropping a model releases
+  its views; a later A→B→A load derives each generation solely from the newly
+  opened artifact and cannot reuse a transformed or process-global shadow.
+
+This corrects the former Gemma load path that decoded the stored output matrix
+and synthesized Q8/F16 heads, and the former prompt path that manufactured F16
+projection shadows. The correction is semantic, not merely a load-time
+optimization: target logits must come from the model representation the
+operator selected. The old head-format, rerank, comparison, and F16-shadow
+environment controls are removed rather than retained as alternate production
+semantics.
+
+The focused proof includes allocation-free admission tests for every currently
+executable embedding, dense, and expert codec; malformed/unsupported rejection;
+pointer-identical tied-head resolution; mapped-page ownership after the backing
+pathname is unlinked; and a one-resident A→B→A replay. Real-model acceptance
+also requires matched prompt-token counts, greedy continuation equality,
+single-user decode medians, long-prefill medians, and the shipping Gemma gates
+on the exact artifact and pinned runtime dependency.
+
+### 2026-08-22 Qwen native-matrix execution amendment
+
+The same representation boundary applies to every production Qwen3.5-family
+loader, not only to the dense Qwen3.8 output head. A smallest production-loader
+spike on exact base `168d144c` proved that rank-2 projections preserved codec,
+shape, and byte length but copied their payload into anonymous Metal storage.
+The file-backed assertion was the sole failure. The reformulated contract is:
+
+- `Qwen35Model::load_from_gguf` performs complete header/capability preflight,
+  creates one model-scoped GGUF tensor mapping, and derives all production
+  matrix views from it. Attention, DeltaNet projections, dense FFNs, token
+  embeddings, explicit or tied output heads, and MTP use rank-2 native views.
+  MoE router/shared-expert matrices use those same views except for the schema's
+  shared-expert sigmoid gate, whose exact rank-1 `[hidden]` payload is admitted
+  explicitly as a logical `[1, hidden]` zero-copy row view. Rank-2 storage may
+  not enter that exception, and ordinary matrices may not be squeezed. Rank-3
+  expert stacks use exact slices of the same mapping. The rank-2
+  `ssm_conv1d.weight` tensor is a matrix and retains one exact mapped F32 view;
+  it is not copied through an intermediate host vector. Norms, biases, state
+  vectors, and other genuinely elementwise inputs are the only tensors
+  materialized as F32.
+- Admission covers decode M=1, continuous widths 2/3/4/8, and prompt widths
+  9/16/17 for every dense matrix. Expert stacks prove those source widths plus
+  the active routing policy's last-matvec/first-`mm_id` boundary and the exact
+  2,048-token multi-slot and 4,096-token single-slot scheduler maxima. Boundary
+  probes are capped at the scheduler maximum, so a high operator threshold
+  that deliberately keeps all served work on matvec cannot create impossible
+  admission shapes. Gate/up consume one shared input row per source token with
+  configured top-k, but each projection retains and dispatches its own declared
+  codec, payload geometry, expert stride, and capability result. Sharing an
+  activation or shape never authorizes sharing weight-format metadata. Fused
+  gate/up execution is eligible only when the two stored representations meet
+  the fused kernel's exact compatibility contract. Down uses the already-routed
+  rows as `M = source_tokens * top_k`, runtime top-k 1, and the shared-row entry
+  point.
+  The latter selects matvec through its inclusive threshold and `mm_id` only
+  above it; it is not the slotted-only entry point. Shape, routed-row overflow,
+  maximum scratch geometry, payload-block geometry, per-expert stride
+  divisibility, unsupported codecs, and missing MTP/tied-head partners fail
+  before model allocation.
+- Tied output and shared-MTP heads retain one exact matrix range. A dedicated
+  head is a different range under the same scoped mapping owner. Explicit
+  affine overlays keep their declared buffers and dispatch; base GGUF matrices
+  are never dequantized or re-encoded to accommodate an overlay.
+- The runtime matrix ledger de-duplicates aliases by Metal allocation and
+  logical byte range, then compares its unique-view count and exact byte total
+  against the independently derived pre-allocation GGUF receipt. Any omitted
+  production role, partial byte coverage, or anonymous matrix allocation fails
+  model load. This prevents a manually incomplete visitor from proving only
+  the subset it happened to observe.
+- Mapping ownership is model-local and path-independent. Dropping one model
+  releases its view owners; reloading A after B opens the current A artifact
+  and cannot reuse an anonymous or transformed process-global shadow. The
+  representation-sensitive A→B→A shipping gate classifies each resident from
+  OS mapping evidence, requires the evicted mapping to disappear, exact A
+  replay, fresh generations, bounded peaks, and endpoint reclaim.
+
+A subsequent real Qwen3.6 APEX header gate falsified the first expert-layout
+description: `ffn_down_exps` Q6_K was rejected at source M=1 because preflight
+declared the slotted pooled entry point. Source inspection of both production
+decode and prefill paths showed that no Qwen down call uses that ABI; both
+flatten routed rows and call the shared pooled dispatcher with top-k 1. The
+corrected model-free gate proves the exact M=1 transform (eight routed rows for
+top-k 8), Q6_K down source M=4/M=5 as runtime M=32 matvec/M=40 `mm_id`,
+Q5_K gate/up source M=32/M=33 as matvec/`mm_id`, both scheduler maxima, the
+retained rejection of an actually slotted small-M request, checked row-count
+overflow, and a high-threshold canary whose source widths remain bounded by
+4,096.
+
+The red projection spike is green with exact file backing. Focused model-free
+and tiny-Metal gates cover stored-width admission, tied and dedicated owner
+ranges, omission/partial-byte/anonymous ledger canaries, mapped A→B→A
+path-independence, dense and MoE FFN parity, MTP sharing, and the QMoE verifier.
+Exact Q5_K/Q6_K full-model coherence, load/reclaim, and serving performance
+remain hardware acceptance gates; this amendment makes no full-model speed
+claim before those receipts exist.
+
+#### 2026-08-23 mixed-codec and convolution correction in validation
+
+A source audit found that the implementation still violated two parts of the
+representation boundary even though the broader mapped-storage receipt was
+green. Dense and expert FFNs carried one shared gate/up GGML type, rejecting or
+misdescribing an artifact whose sibling projections used different native
+codecs. The convolution weight also took an exact F32 GGUF payload through a
+host `Vec<f32>` and a new Metal allocation instead of retaining the mapped
+matrix view. This is the same anti-pattern at two scales: inferring a matrix's
+execution representation from a sibling role or rebuilding it merely because
+the rebuilt values are numerically identical.
+
+The correction under validation carries gate, up, and down codec/stride
+metadata independently through preflight, loading, byte-ledger verification,
+and dispatch. Dense and MoE fusion is fail-closed unless the exact stored
+representations are compatible. It also maps `ssm_conv1d.weight` directly and
+includes it in matrix ownership accounting. Dense scalar/block sibling
+mixtures were proved possible and now use the same per-projection native
+dispatcher as uniform-codec dense layers; declared GGUF type and physical
+buffer storage must agree before encoder mutation. Native BF16 matrices from
+the target, MTP, and multimodal text graph are inventoried before model
+publication, calibrated over every physically reachable short row width, and
+frozen into one activation-epoch route plan. A later model generation cannot
+reuse that authority.
+
+The initial scalar expert-ID activation hypothesis required a separate proof
+for every weight address and value. Source-derived Qwen declarations falsified
+that as a universal policy: 2,368 authorities would require 9,472 proof command
+buffers, above the fail-closed 6,145-submission ceiling before timing. The
+reformulated hypothesis may factor authority only across properties proven
+weight-independent by source and adversarial data: pipeline fingerprint,
+shape, exact scalar widening, indexing, multiply-add order, and reduction
+order. It must retain fail-closed activation and fresh independent review; the
+budget may not simply be raised and the proof may not be skipped.
+
+Model-free source tests must prove every advertised native codec, mixed sibling
+codecs, byte/stride disagreement rejection, and absence of an implicit
+transform. Activation requires locked build/test gates, tiny real-GPU
+mixed-codec dispatches, all-family physical widths and multi-slot workloads,
+A→B→A reclamation, exact model coherence, and matched performance receipts.
+Until those receipts exist this subsection is a reformulated implementation
+contract, not a universal support or speed claim.
+
+The tiny real-GPU mixed-codec dispatch gate is green. Qwen executed Q4_0 gate,
+Q8_0 up, and Q5_1 down expert stacks with three distinct per-expert strides at
+M=1 and M=33; M=33 also passed through the separate prefill-arena path. Each
+path invoked all three production expert projections and matched independently
+dequantized CPU weights without a zero-output skip. DeepSeek executed the same
+three codecs independently through its mixed-pair fallback at decode and
+matrix widths and matched the same oracle discipline. These focused results
+close execution-path correctness for mixed block siblings; they do not replace
+full-artifact coherence, multi-slot, swap, or performance gates.
+
+#### 2026-08-23 universal generative served-format correction (in execution)
+
+The stored-representation rule is a serving invariant, not a text-decoder
+optimization. A source audit of every served matrix consumer confirmed that
+Qwen, Gemma, and DeepSeek text matrices now retain their admitted GGUF
+representation, but falsified the broader generative product claim in the
+multimodal sidecar surface: the projector loader expanded every non-F16
+tensor, including block-quantized
+  matrices, to F32, while the vision linear helper casts those matrices again
+  for execution. Canonical projector evidence contains quantized weights, so
+these are real matrix paths rather than harmless state-tensor exceptions.
+
+BERT and Nomic are embedding-only workloads and are not used in the heavy
+agentic serving contract. Their exact-matrix migration is a separate product
+lane: it must satisfy the same no-implicit-transform invariant before claiming
+native stored-format execution, but it neither blocks nor contributes evidence
+to the generative Qwen/Gemma/DeepSeek acceptance matrix in this section.
+
+Those transformations are no longer accepted architecture-specific compute
+shadows. For every served family and sidecar, conversion owns any requested
+weight quantization from source safetensors; inference must either execute the
+artifact's exact admitted codec or reject it before publishing a model. Norms,
+biases, and other elementwise state may be materialized in their explicitly
+required compute dtype. Activation conversion is allowed. Matrix
+dequantization followed by an implicit runtime cast or re-quantization is not.
+
+The implementation sequence is fail-closed and has no permanent fallback:
+
+1. Move matrix admission and dispatch behind shared native-matrix primitives
+   keyed by exact logical range, declared codec, shape, physical dtype, and
+   activation epoch. Keep synthetic F32 fixtures explicit and test-only.
+2. Migrate projector/vision projections in the same way. Fused QKV validation
+   uses packed byte geometry rather than scalar element-size arithmetic.
+   Unsupported codecs fail projector admission rather than passing through an
+   F32/BF16 shadow.
+3. Delete the old per-request casts and load-time matrix shadows after the
+   native paths pass. The storage ledger must report zero anonymous bytes for
+   artifact-backed matrices and count aliases once by backing allocation,
+   byte offset, and logical byte length.
+4. Prove each surface with malformed-range and wrong-codec canaries, physical
+   widths 1, 2 through 8, 9, 32, 33, and 129 where reachable, embedding or
+   vision quality parity, single- and multi-slot serving, and A→B→A model and
+   projector swaps. A route plan is generation-local; no pointer-only cache or
+   prior model generation may authorize a later resident.
+
+#### 2026-08-23 native Q5_0 generative execution correction (in execution)
+
+The converter has long emitted Q5_0 both as an explicit selector result and as
+a shape fallback, while the runtime boundary rejected or incompletely routed
+that stored type. Treating Q5_0 as a reason to expand a matrix or rebuild it in
+another codec is forbidden. The deciding source/kernel spike proved that the
+22-byte, 32-value Q5_0 block can retain mapped U8 storage and execute through
+the ordinary dense, batched, permuted-input, embedding, and expert families.
+
+The integration candidate therefore admits Q5_0 only where those exact native
+routes exist across Qwen, Gemma, DeepSeek, Eagle target embeddings, and the
+applicable vision/projector graph. Q4_0-only fused optimizations remain
+representation-specific: a Q5_0 tensor bypasses them and executes through the
+ordinary native Q5_0 path; it is never converted merely to enter a fused
+kernel. Test-only diagnostic dequantization supplies independent numeric
+oracles and is not a production load or inference path.
+
+The same correction promotes Gemma's complete ordinary matrix/state residency
+inventory from a test-only helper into its production load transaction. A
+successful load must retain at least one scoped GGUF view and exactly zero
+anonymous ordinary matrix/state bytes; only the explicitly named derived
+router value and one-F32 structural placeholders live outside that ledger.
+Qwen and DeepSeek keep their existing production mapped-storage checks. Thus
+the no-rewrite invariant is enforced when each generative family loads, not
+inferred later from a benchmark that happened to remain coherent.
+
+This is not accepted runtime support until the reviewed backend revision is
+published and pinned, locked host tests pass, mapped-storage and wrong-codec
+canaries pass, all reachable physical widths and expert routes execute on
+Metal, and real generative artifacts pass coherence, multi-slot, A→B→A swap,
+agentic serving, and matched-performance gates.
+
+The source-only family proof candidate replaces zero-filled or source-substring
+claims with mutation-sensitive numeric contracts for the remaining gaps:
+Gemma dense Q5_0 executes physical widths 1, 2, 4, 8, and 16 and both its
+direct head-major and activation-only-permute projection routes; Gemma's
+family expert seam must decline the scalar path without graph mutation and
+then execute nonzero shared gate/up and slotted down Q5_0 through the native
+block expert API; vision Q5_0 executes the same short physical widths with an
+odd output width; and Eagle retains pointer identity to the borrowed target
+Q5_0 embedding while gathering a nonzero row. Each execution compares against
+an independently dequantized CPU oracle and poisons caller-owned outputs where
+the API exposes them. The broader admitted-codec loops remain explicitly named
+zero smokes rather than numeric coverage. These tests are authored but not yet
+executed while the hardware/build baton is held elsewhere; their presence is
+not runtime evidence until the locked focused and real-artifact gates run.
+
+Independent review found that device-side NaN poisoning alone was memory-safe
+but not an end-to-end fail-stop: the legacy argmax reduction could ignore NaNs
+and return index zero with a non-finite winning value. The corrected contract
+is two-sided. The backend reduction propagates any non-finite input through its
+value result, and every generative consumer reads and validates that value at
+the already-required index readback. This covers Qwen scalar/batched decode,
+speculation and MTP; Gemma scalar/batched/per-position decode; and DeepSeek
+greedy selection without adding a command-buffer wait or logits transfer.
+Gemma's host-logit batched head instead constructs an opaque, finite-validated
+payload before selection, including the fused-head producer. NaN, either
+infinity, an empty device result, or an out-of-vocabulary index is an inference
+error and cannot be emitted as a token. DeepSeek's deliberate safe-index bridge
+cannot rely on NaN propagation because later official graph stages sanitize
+non-finite activations. Its safe-index bridge, SwiGLU activation, and weighted
+reduction therefore atomically record any invalid route or non-finite dynamic
+value in one sticky device word shared by the whole verifier transaction; the
+host checks that receipt after the transaction's existing wait and before KV
+publication, and checks it again at output-head completion. Invalid routes may
+use expert zero for memory-safe pointer arithmetic and invalid rows may be
+zeroed for containment, but neither may publish cache state or a token. The
+backend mutation tests and locked consumer/status tests
+remain pending until the hardware/build baton transfers, so this paragraph
+records the corrected source contract rather than acceptance.
+
+### 2026-08-23 native projector storage boundary
+
+The source candidate for step 3 keeps every admitted projector matrix in its
+stored F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, or Q6_K representation and
+dispatches it through the shared native matrix path at the request's physical
+row count. Elementwise state remains exact F32. Fused QKV and rank-greater-than
+two patch matrices are aliases over codec-aligned source ranges; they do not
+create transformed matrix storage.
+
+Projector admission is based on the same pointer-free, page-rounded segment
+planner that mapping consumes. The descriptor records both the total and the
+ordered per-resource physical byte lengths before text loading or pool
+publication. The realized loader must reproduce that exact topology; a total
+or segment mismatch discards the candidate and leaves the current generation
+unchanged. Pool charge is text-file bytes plus projector mapped physical bytes
+plus the complete vision-cache budget. This preserves fail-before-load
+admission and makes A→B→A model swaps generation-exact without retaining mapped
+buffers in configuration state.
+
+This remains a source candidate, not runtime acceptance, until the providing
+`mlx-native` planner revision is published and pinned and the focused, full,
+Metal, real-projector quality, multi-slot, and model-swap gates below pass.
+
+The same audit found narrower Qwen proof defects even though the production
+target/MTP caller currently supplies the correct native head. Scalar
+F32/F16/BF16 expert stacks were executable but rejected by role preflight; a
+supplied shared MTP head was accepted from any same-shape anonymous buffer;
+dispatch evidence keyed an entire mapped allocation rather than a tensor
+range; fixed F32 row slicing did not validate dtype and exact logical bytes;
+and expert stride arithmetic lacked overflow and exact-extent checks. The
+integration under validation corrects those contracts and includes negative
+canaries. These source changes are not accepted until locked tests and the
+real-artifact gates above pass.
+
+#### Native-matrix availability and performance evidence
+
+The 2026-08-22 Apple run used an M5 Max and exact artifact
+`gemma4-ara-2pass-APEX-Q5_K_M.gguf` (20,576,631,488 bytes, SHA-256
+`82beae39cdee643824dde5bc3fb1a3d6e2e4f8701572930163b0d703298bcf82`).
+The exact pp4109 rendered prompt had SHA-256
+`d21a065d3b24985a739beba59296b680fd8a8eaa7a21e98f428aca4039adb9dd`;
+all runs were greedy, generated one token, consumed 4,109 prompt tokens, and
+selected token 2,021.
+
+Five alternating fresh-process native runs reached mapped-model ready at a
+0.24-second median and reached the first generated token at a 2.04-second
+median. The
+exact pre-change tree at `32181b61`, which built dense and requantized matrix
+representations during load, required 4.77 seconds median to the same token.
+The matched `/usr/bin/time -lp` peak resident sizes were approximately 6.20 GB
+and 33.01 GB respectively. These are complete load-plus-prefill availability
+measurements, not claims derived from the mapped-load boundary alone.
+
+Production serving still performs its synchronous one-token prefill and decode
+before publication. Two observed native starts spent 220–265 ms reaching the
+load boundary and 204–210 ms in that warmup. After publication, four distinct
+uncached pp4109 requests reported 1.653–1.666 seconds to the first token; their
+4,096-row transaction bodies were stable at 1.339–1.350 seconds. A measured
+first-use profile attributed only 13.106 ms total to 43 pipelines, all resolved
+from the embedded metallib, so eager pipeline compilation cannot explain the
+cold-prefill remainder.
+
+Mapped-page readahead was tested and rejected. Advising all 20.56 GB of mapped
+tensor segments took a 514 ms median, raised maximum resident size from roughly
+6.20 GB to 26.76 GB, and worsened total first-token availability from
+2.08–2.11 seconds to a 2.62-second median while saving only noise-level prefill
+time. It is absent from production. The existing real forward warmup is the
+measured winner because it primes only through the same execution graph that
+serving must validate, without manufacturing a second weight representation.
+
+The initial real A→B→A lifecycle spike also falsified the old gate's
+`artifact-size delta => directional RSS drop` assumption. Native-mapped Gemma A
+settled at 2.94 GB process RSS while the smaller, copied-storage Qwen B settled
+at 22.03 GB, so a required A→B RSS drop measured representation choice rather
+than stale-model ownership. The gate now preserves caller A/B identity and
+proves the lifecycle directly: exactly one pool generation, exact logical byte
+accounting, live `lsof`/`vmmap -wide` ownership for a file-backed resident,
+absence of each evicted artifact, bounded transition peaks, fresh generations,
+successful inference for every resident, exact A output/config replay, and A2
+RSS/physical-footprint/process-wired/host-wired bounds. A copied resident is
+classified explicitly from absent file-map evidence and must still have fresh
+generation, inference, pool-byte, RSS, and physical-footprint evidence; if that
+family later adopts file-backed matrices, the same gate automatically observes
+and then requires its mapping to disappear after eviction.
+
+The 2026-08-23 source-only proof-integrity revision closes two residual alias
+paths without changing native-matrix execution. Model-local tokenizer, config,
+DWQ, and projector overrides are now bound to canonical path plus the current
+filesystem stamp; same-path replacement falls back to sidecar-free process
+policy. Successful chat responses identify the actual leased pool generation,
+load-time artifact SHA-256, family, and exact GGUF architecture in private
+headers. The A→B→A gate consumes that receipt, so a valid response from a
+stale route cannot certify the newly sampled resident. The new checked-in
+matrix requires Qwen dense, Qwen MoE, Gemma, and DeepSeek coverage; its hardware
+rows remain pending and no universal runtime pass is claimed here.
+
+On the exact artifacts above and Qwen B
+`Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf` (16,810,714,944 bytes, SHA-256
+`1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a`), the
+corrected gate passed with synchronous switch-and-warm publication at 2.282 s
+for A→B and 0.922 s for B→A. The server-reported semantic TTFT was
+0.558/0.920/0.550 s for A1/B/A2, making total switch-request-to-first-semantic
+3.202 s for B and 1.472 s for reloaded A. The full 16-token unary requests took
+0.644/1.541/0.634 s; those are completion walls and remain labeled separately.
+A1/B/A2 RSS was 2.938/22.027/3.110 GB and physical footprint was
+19.053/59.031/19.224 GB. Gemma's artifact was visible through both OS ownership
+views at A1, absent at B, and visible again at A2; the B artifact was classified
+`anonymous_accounted` and absent after eviction. This final run used the
+published registry package and exact lock checksum above.
 
 ## Context
 
@@ -494,9 +943,11 @@ This phase changes no conversion format and makes no new speed claim.
   policy, and GGML capability schema are the current source-to-stored/runtime
   seam. Keep a candidate ineligible unless every required tensor and regime is
   executable.
-- Reject or implement Q4_1, Q5_0, BF16, MXFP4, and every internal shape
-  fallback consistently; test every accepted selector through exact-runtime
-  GGUF reopen and the regimes it advertises.
+- Reject or implement Q4_1, BF16, MXFP4, and every internal shape fallback
+  consistently; test every accepted selector through exact-runtime GGUF
+  reopen and the regimes it advertises. Q5_0 moves from this unresolved list
+  only when the native candidate described above is published, pinned, and
+  passes its generative cross-family hardware gates.
 - Replace the disconnected statistical-quality stubs with a receipt-producing
   source-vs-candidate logit harness. A missing real-model fixture must be a
   recorded non-pass, never a green quality result.

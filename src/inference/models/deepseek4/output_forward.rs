@@ -188,6 +188,8 @@ impl Deepseek4Model {
         session
             .finish()
             .context("execute DeepSeek-V4 output head")?;
+        self.ensure_moe_transaction_clean()
+            .context("validate DeepSeek-V4 output-head MoE receipt")?;
         Ok(logits)
     }
 
@@ -226,7 +228,11 @@ impl Deepseek4Model {
         session
             .finish()
             .context("execute DeepSeek-V4 greedy argmax")?;
-        let token = out_index.as_slice::<u32>()?[0];
-        Ok(token)
+        crate::inference::argmax::read_finite_argmax_one(
+            &out_index,
+            &out_value,
+            vocab_u32,
+            "DeepSeek-V4 greedy output head",
+        )
     }
 }

@@ -1,6 +1,7 @@
 # ADR-040 — Continuous batching: reopen the ADR-005 carve-out
 
-> Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
+> Terminology: "the peer" is the pinned upstream GGUF reference named in
+> `NOTICE` and `data/llama_cpp_pin.txt`.
 
 - **Status**: 🟢 **FULL-CONTEXT THREE-FAMILY WORKLOAD SERVED (2026-08-08)** — every configured agent slot receives the complete logical model context; aggregate physical KV is governed by one shared high-water budget. Gemma 4, Qwen 3.6, and DeepSeek-V4 passed real four-agent OpenCode gates with native templates, tools, SSE, tool-result continuation, and retained prefix state. The historical 2026-07-01 8×32K result remains below as provenance for the fused batching work.
 >   - **Operator surface corrected (2026-08-23).** [ADR-050](ADR-050-operator-context-and-static-info.md)
@@ -8,12 +9,22 @@
 >     `--kv-cache-budget`. Omitted `--ctx` uses the GGUF-declared maximum;
 >     every admitted slot sees that same logical limit, never a quotient of
 >     the slot count.
+>   - **Standalone Qwen3-VL runtime retired (2026-08-23).** The former
+>     architecture dispatch and text-engine seam were removed rather than left
+>     as an unservable compatibility claim. Historical Qwen3-VL witnesses below
+>     are provenance only. Qwen-family image input remains supported through an
+>     admitted Qwen text-family GGUF plus its explicitly paired projector.
 >   - **Qwen3.6 public-fixture insertion-order calibration repaired (2026-08-18).** Exact-main release-gate run `32163242804` stopped before model load because the 347-tool fixture still asserted its historical key-sorted padding count after `serde_json/preserve_order` became the production wire contract in `d4874792`. Preserving each tool's three-property schema adds exactly 28 rendered tokens per tool (`28 × 347 = 9,716`), so the deterministic one-token padding is recalibrated from 56,122 to 46,406 and the canonical request SHA-256 is rebound to `3558d4f4b251ed833ee7da1b037fa3f241a4309590d45930b525b690f543a31e`. The accepted 87,972-token target, 87,965-token stable boundary, template digest, and short 552-token lane are unchanged. The failed run is not release authority; a new exact-main packed cross-family run remains mandatory.
 >   - **Gemma N=8 tiny-prefill containment pending exact packed proof (2026-08-14, §6.1.65).** Exact-main run `31823149737` reached Gemma's release-profile N=8 parity test after every preceding DeepSeek and Gemma hardware gate had passed, then exposed an intermittent all-non-finite logit row after batched decode followed by a 2–5-token cold slot-mounted prefill. Cold text work below 32 tokens now uses the linear slot-aware path; tiny retained-prefix suffixes append through the one-token primitive; initial, installed, and stable cross-slot admission cannot bypass that boundary. The fallback also exposed a separate pinned-`mlx-native` dense-vector tail-read defect: physical linear KV capacity now rounds through each final 32-row tile, and a one-token budget terminates at the prefill seed. The original tiny batched-prefill cause is not claimed solved, and a new exact-packed run remains mandatory.
 >   - **Decode: campaign CLOSED at practical floor (2026-06-30).** 255 t/s aggregate N=8 short-ctx = **1.14× peer**; GPU-busy at parity; §21–§26 + iter-I/J/K/L/M levers landed; iter-O refuted the residual host gap.
 >   - **Long context: historical 32k/slot × 8 proof retained; full-context contract corrected in §0.0 (2026-08-08).** The O(seq²) `pf_kq` wall was closed and 32k×8 was proven coherent in 2026-07-01. The operator contract is now stronger: every slot has the full configured logical context, while one shared physical high-water budget governs aggregate residency. The three-family real-model gate below decides whether that stronger contract ships.
 >   - **Historical coherence milestone met; current tiny-prefill proof pending.** Byte-identity to serial reference at N=8 (`n4`/`n8` parity gates), per-stream determinism, and concurrency-invariance at 8k/12k/16k/32k were established for the accepted graph. The 2026-08-14 2–5-token fault above reopens the exact packed N=8 parity proof for the containment candidate. Standing rule (operator, 2026-07-01): **coherence > speed** — no lever ships without the ladder. (Known non-blocking residual: 2×-process GPU-contention decode non-determinism — not the deployment shape; tracked low-severity in the §0.19 history.)
->   - **qwen35moe: cross-slot proof LANDED (M-QWEN, 2026-07-01, §0.12; TQ/full-context correction 2026-08-08, §0.0)** — the earlier proof found four real bugs. The 2026-08-08 correction removes the `HF2Q_TQ_KV=0` restriction: packed and norms allocations already had an outer sequence axis, and zero-copy slot views now route TQ encode, attention, and resume through the requested slot. Full logical context is no longer divided by slot count.
+>   - **qwen35-family: cross-slot proof LANDED (M-QWEN, 2026-07-01, §0.12; growable-TQ correction in execution 2026-08-22, §0.0)** — the earlier proof found four real bugs. The 2026-08-08 correction removed the `HF2Q_TQ_KV=0` restriction and preserved full logical context, but its fixed full-capacity outer-axis allocation was falsified at N=16: first GPU use wires the complete Metal buffer. The 2026-08-22 implementation replaces that physical layout with unequal-capacity banked arenas while retaining scalar slot views and one physical batched dispatch. Exact-main real-artifact gates remain the deciding proof.
+>   - **qwen35moe ordinary physical decode admitted (2026-08-22).** The width-N Qwen body already had a native `MoeQ` arm; a stale capability predicate rejected every MoE configuration before it could run. The predicate now admits only family-consistent native `MoeQ` storage and keeps synthetic F32 MoE on its scalar parity path. The model-free GPU gate covers N=1 unchanged plus physical N=2/4/8/16, exact stable greedy choices, lowest-index equal-logit routing, dequantized TQ full-attention state within `1e-2`, DeltaNet live state within `5e-3`, and exactly three ID-routed expert projection calls per layer independent of width. Expert kernel selection remains owned by mlx-native; hf2q does not add a per-expert or per-slot fallback. This entry records correctness and dispatch structure only; it makes no real-artifact throughput claim.
+>   - **qwen35-family natural cohort widths admitted (candidate, 2026-08-22; §7.QWEN-PHYSICAL).** The scheduler can produce every decode-ready cohort width from 2 through 16 while requests enter and leave a wave. Restricting the physical body to powers of two scalarized those ordinary ramps. The candidate admits the complete supported interval while retaining exact N=1 scalar behavior. The exact-source all-format N=1/2/4/8/16 real-artifact gate remains mandatory before this candidate becomes accepted evidence.
+>   - **Dense Q5_K command-buffer policy corrected (candidate, 2026-08-23; §7.QWEN-Q5-CHAIN).** The supported Qwen dense Q5_K path was missing from the explicit partial-chain table and therefore submitted one command buffer per layer. Exact Qwen3.8 hardware spikes prove that chain N=2 preserves scalar output at physical widths 1/2/4/8/16, reduces the 64-layer body from 66 to 34 submissions per target forward, and removes the width-8 throughput collapse. The final all-format matrix must be rebuilt from the candidate binary before this becomes accepted release evidence.
+>   - **Dense Q6_K/Q8_0 command-buffer policy measured and made explicit (candidate, 2026-08-23; §7.QWEN-Q6-Q8-CHAIN).** Both supported formats also inherited the catch-all chain value. Exact physical-width spikes falsified a universal N=2 or N=4 promotion: Q6 loses about 5% at width one, while Q8 N=2 loses width 16 and N=4 loses widths 8 and 16. Both now have explicit N=1 policy cells, and a source canary enumerates every codec admitted by Qwen GGUF preflight so another supported format cannot silently inherit an unmeasured policy.
+>   - **Artifact-native scalar Dense policy separated and measured (candidate, 2026-08-24; §7.QWEN-NATIVE-CHAIN).** BF16 was incorrectly represented by the quantized-Dense policy arm even though it executes through artifact-native scalar buffers. Policy now reads the CPU tensor metadata, requires a uniform gate/up/down scalar codec across every layer, and fails closed on mixed storage. Exact BF16 N=1/2/4 matrices preserve scalar output but reject deeper chaining on throughput: N=2 loses every width, while N=4 falls 27.0% at width eight. BF16 therefore remains explicitly N=1, and the temporary hardware-spike escape hatch is removed.
 >   - **OPEN (speed, tracked = M-SPEED-LC):** N=8 long-context decode remains a matched-reference gate. The full-context/TQ correction changes capacity and isolation, not the rule that coherence must pass before a throughput result is accepted.
 >
 >   **Original reopen rationale (2026-06-23, now superseded by the Phase F progress above; preserved for provenance):** 🔴 REOPENED — empirical bench (Gemma-4 Ara `Q5_K_M`, M5 Max, `--scheduler inflight-batched --max-slots 4`): 4 concurrent decodes = **8.1 s** vs 4 sequential = **6.9 s** → **0.85×**. Triangulated (codex code-trace + adversarially-verified web research, see §0) to the SlotAware path running **N independent `batch=1` forward passes that time-slice one GPU** instead of a fused `batch=N` decode — the §1.4 / §3.1 "zero new Metal kernels / SeparateSlots reuses every existing kernel" assumption was the defect. **The fix is specified in §0 (Correction & Phase F)** and is what the Phase F milestones above deliver. Production default stays `EngineMode::SerialFifo` — existing users see no change; the reopening is purely additive.
@@ -25,6 +36,7 @@
 
 </details>
 - **Date**: 2026-05-23
+- **Updated**: 2026-08-23
 - **Supersedes**: nothing. Amends ADR-005 §"Concurrent-deployment scaling (deferred, future ADR)" (line 1097) and Resolved Question "Phase 2 scope refinement" Decision #1 (line 6652) by activating the deferred-ADR slot.
 - **Related**: ADR-005 (Phase 2 FIFO contract — Decision #2, Decision #19), ADR-007 (TurboQuant KV — single-seq scope), ADR-017 (persistent block prefix cache — single-seq, per-model spill), ADR-027 (Qwen35 TQ KV + persist — single-seq), ADR-013 (Qwen35 inference), ADR-034 (spec-decode end-to-end — intra-request batching only).
 - **Author note**: Per `feedback_multiweek_always_in_scope_2026_05_23.md` mantra — "no shortcuts, just pure excellence". Iter 1 of this ADR is the design pass + Phase A/B/C/D scaffolding stubs landing in parallel; subsequent iters implement.
@@ -62,27 +74,42 @@ configuration axes. The earlier comparison to the peer's non-unified
 each sequence the full context, while vLLM likewise keeps `max_model_len`,
 `max_num_seqs`, and KV-cache capacity separate.
 
-#### M5 Max allocation spike
+#### M5 Max allocation spike — corrected 2026-08-22
 
-The smallest Metal spike on the target 128 GiB M5 Max established a practical
-fixed-stride implementation that preserves the existing fused multi-slot
-kernels:
+The 2026-08-08 spike proved that an overwrite allocation is cheap before GPU
+use, but drew the wrong conclusion about first binding. A mutation-sensitive
+follow-up on the same 128 GiB M5 Max showed that Metal wires the complete
+`MTLBuffer` when a command first binds it, even when the kernel writes only a
+tiny prefix:
 
-| stage | logical buffer | physical footprint |
-|---|---:|---:|
-| before allocation | 0 | 4.0 MiB |
-| uninitialized shared allocation | 8 GiB | 4.0 MiB |
-| empty command-buffer commit, resource excluded from residency set | 8 GiB | 4.3 MiB |
-| after touching 256 MiB of pages | 8 GiB | 260.3 MiB |
+| declared buffer and GPU write | free-memory delta | wired-memory delta | process RSS delta |
+|---|---:|---:|---:|
+| 4 GiB buffer, one 16 KiB write | -4,229.250 MiB | +4,227.484 MiB | +4.078 MiB |
+| 8 GiB buffer, one 1 MiB write | -8,510 MiB | same whole-buffer behavior | not the deciding metric |
 
-Registering the same virtual buffer with the Metal residency set was a
-falsifier: the next empty command-buffer commit raised physical footprint to
-8.0 GiB. Full-context KV arenas must therefore use mlx-native's explicit
-overwrite allocation contract, skip eager zero-fill, and remain outside the
-residency set. Recurrent state and scratch that may be read before a complete
-write remain initialized and residency-managed. Code may never read or copy
-an overwrite-backed tail beyond the family cache cursor; snapshots, growth,
-and slot forks are therefore cursor-bounded.
+This falsifies fixed maximum-context buffers as a demand-paged physical
+reservation. Excluding them from a residency set and skipping eager zero-fill
+does not make first GPU use sparse. Logical context remains full-sized, but
+the allocated Metal resources themselves must be bounded by current physical
+capacity.
+
+For full-TQ Qwen caches, the accepted representation is one compact arena per
+layer with an explicit `(base_token_rows, capacity_tokens)` descriptor for
+each slot. Admission grows only the selected slot. A layer transaction
+allocates the replacement arena, GPU-blits every cursor-visible prefix for
+all peer slots, waits for success, and swaps that layer. This preserves packed
+bits, norms, cursors, physical batching, and limits transient duplication to
+one layer. Before mutation, admission must prove that the steady-state
+reservation plus the largest old layer arena fits the shared KV budget; a
+request that lacks this unavoidable migration headroom fails before SSE with
+`slot_budget_exceeded` and exact steady/transient byte evidence. The same
+bounded-allocation contract applies to every supported family where
+context-growing KV is resident; each family must use its native KV
+representation and cannot inherit Qwen state or kernels approximately.
+
+Recurrent state and scratch that may be read before a complete write remain
+initialized. Code may never read or copy an overwrite-backed tail beyond the
+family cache cursor; snapshots, growth, and slot forks are cursor-bounded.
 
 Touched Metal pages do not immediately decommit while the resource remains
 alive. Shared-budget accounting must therefore charge each slot's physical
@@ -254,12 +281,16 @@ Weight amortization — the entire source of the throughput win — happens in t
 cover every storage route that the locked mlx-native runtime admits for the
 tensor role using it. mlx-native 0.11.2 includes Q2_K and Q3_K projection and
 routed-expert matmul routes; the earlier statement that both ftypes had no
-inference matmul is obsolete. End-to-end admission remains role-specific: for
-example, the direct embedding-gather set is narrower, so a Q3_K embedding is
-rejected even when Q3_K projections are executable. **There is no per-slot
-"fallback" tier:** an artifact is servable only when every tensor role has a
-complete route, and every admitted decode route must receive the fused path.
-Converter support by itself still does not imply end-to-end inference support.
+inference matmul is obsolete. The 2026-08-23 integration candidate also adds
+native `Q5_0` MV, arbitrary-row MM, batched MV, strided MM, and expert routes.
+End-to-end admission remains role-specific: for example, the direct
+embedding-gather set is narrower, so a Q3_K embedding is rejected even when
+Q3_K projections are executable. **There is no per-slot "fallback" tier:** an
+artifact is servable only when every tensor role has a complete route, and
+every admitted decode route must receive the fused path. Converter support by
+itself still does not imply end-to-end inference support. Q5_0 becomes an
+admitted generative codec only after the candidate dependency is published,
+pinned, and its cross-family hardware gates pass.
 
 ### 0.6 Repo boundary — target state + existing debt
 
@@ -447,7 +478,7 @@ Peer setup = `/opt/gemma4/serve.sh` (`-fa auto -ctk q8_0 -ctv q8_0`, peer build 
 | 4 | 163 | 199.6 | 0.82× |
 | 8 | 189 | **242.6** | 0.78× |
 
-The gap WIDENS with N (0.82×→0.78×) — the fingerprint of the root cause. **ROOT CAUSE = dispatch-count scaling**, confirmed by 3 source-cited reads of `/opt/llama.cpp/ggml/src/ggml-metal`: the peer's decode dispatch count is CONSTANT in N — N is always a Metal *grid dimension*, never a host-side loop (one dispatch per ggml node, ~18–24/layer at N=1 AND N=8; `ggml-metal-context.m:707`, all `ggml_metal_op_*` `return 1` node with `ne11`/`ne01`/`ne21`=N only as grid extents). Attention = ONE flash-vec dispatch (grid.x=token, grid.y=head) with unified-KV + KQ −INF mask + block-skip (`ggml-metal.metal:6782`,`:6913`) — NOT KV-amortized (impossible, distinct KV/seq), the win is dispatch fusion + occupancy. MoE at N<32 is the same non-amortized gemv for BOTH (`ggml-metal-ops.cpp:2321` ne21_mm_id_min=32) — so MoE bandwidth is NOT the gap. **We** still run per-slot HOST-SIDE loops: KV-encode (2N) + FWHT-undo (N) + MoE routing (N) + weighted-sum (N) + F16/F32 dense (2N) ≈ 5–7N dispatches/layer×30 — the scaling penalty. PROOF it's the lever: N=1 dead-even, and fusing JUST the flash (N→1, M4) bought +8.6%@N4 / +14.5%@N8 (bigger at higher N, exactly as the dispatch theory predicts).
+The gap WIDENS with N (0.82×→0.78×) — the fingerprint of the root cause. **ROOT CAUSE = dispatch-count scaling**, confirmed by three source-cited reads of the pinned reference's Metal backend: its decode dispatch count is CONSTANT in N — N is always a Metal *grid dimension*, never a host-side loop (one dispatch per graph node, ~18–24/layer at N=1 AND N=8; `ggml-metal-context.m:707`, all Metal operation planners return one node with `ne11`/`ne01`/`ne21`=N only as grid extents). Attention = ONE flash-vec dispatch (grid.x=token, grid.y=head) with unified-KV + KQ −INF mask + block-skip (`ggml-metal.metal:6782`,`:6913`) — NOT KV-amortized (impossible, distinct KV/seq), the win is dispatch fusion + occupancy. MoE at N<32 is the same non-amortized gemv for BOTH (`ggml-metal-ops.cpp:2321` ne21_mm_id_min=32) — so MoE bandwidth is NOT the gap. **We** still run per-slot HOST-SIDE loops: KV-encode (2N) + FWHT-undo (N) + MoE routing (N) + weighted-sum (N) + F16/F32 dense (2N) ≈ 5–7N dispatches/layer×30 — the scaling penalty. PROOF it's the lever: N=1 dead-even, and fusing JUST the flash (N→1, M4) bought +8.6%@N4 / +14.5%@N8 (bigger at higher N, exactly as the dispatch theory predicts).
 
 **PLAN (borrow the peer's "N-as-grid-dim, constant-dispatch" structure — not copy verbatim):** fuse each remaining per-slot loop into ONE grid-dim-N batched mlx-native kernel, per-row math untouched ⇒ bit-identical (gated, `slot_aware_n1`/`n4` byte-identity verified): (1) batched KV-encode 2N→2, (2) batched FWHT-undo N→1, (3) batched MoE routing N→1, (4) batched weighted-sum N→1, (5) batched F16/F32 dense gemv 2N→2 (grid.z=N, mul_mv-style — distinct from the lane-wasting tile we refuted; cuts dispatches without compute waste). Then the ~186→200 non-attention residual (MoE/dense scaling) is a separate lever.
 
@@ -492,7 +523,7 @@ Attention is now ONE batched dispatch per op (no per-slot loops) — **N=8 202 e
 
 **MoE-kernel quick fixes REFUTED by clean measurement (2026-06-24).** The down-path `n_tokens=top_k·N=64` crosses the `mm_id` threshold into the MM path, and our NSG=4 `_nr2` Q8_0 variant is default-OFF — both looked like the lever. Clean back-to-back N=8: forcing the down to the mv path (`HF2Q_MM_ID_ROUTING_THRESHOLD=128`) = NEUTRAL (201→199); flipping `HF2Q_Q8_0_ID_MV_NR2=1`+`HF2Q_Q6K_ID_MV_NR2=1` = NEUTRAL (201.7/201.1 vs 202.0/200.9) and byte-identical. So the MoE kernel-VARIANT choice is not the 2.3× — the cost is the inherent 64 expert-gemvs (8 tok × top_k=8) each streaming a full expert weight (bandwidth, same as the peer). Caveat on the 2.3× inference: it assumed our non-MoE ≈ the peer's non-MoE; if the peer's non-MoE is faster, the gap splits and the MoE share is smaller. Remaining MoE levers (fuse SwiGLU into the gate_up mv_id to kill a device round-trip + barrier; thread-axis `(32,nsg,1)` re-bench at N=8) are deeper kernel work with now-uncertain payoff — NOT to be built speculatively after the variant tweaks came up flat. **The verified, shipped deliverable is the ATTENTION batching (+15–22%, byte-identical, N=8 202 > the peer's N=4 200); the MoE residual to 243@N8 is a scoped, separate kernel-optimization phase.**
 
-**ONLINE-RESEARCH CORROBORATION (2026-06-24, cited).** (1) Dispatch-count IS the Metal-specific lever: measured Metal dispatch overhead ≈31.7–71µs EACH; on Metal "cutting dispatch count (not kernel quality) is the actionable optimization target" and per-slot loops are the named anti-pattern (arxiv 2604.02344). (2) **200 is BEATABLE, not a ceiling** — the peer's UNIFIED KV computes "cross-sequence attention" over the ENTIRE cache then masks, which its own maintainers call suboptimal for many sequences (ggml-org/llama.cpp#4130); **our per-slot `slot_id`-indexed KV avoids that waste**, so post-fusion we can EXCEED the peer's 200/243. (3) The ~186→200 non-attention residual = MoE: sort tokens by expert + grouped-GEMM so each expert's weights are read once per step (PyTorch grouped-GEMM blog; arxiv 2501.16103) — bandwidth-bound ⇒ matters more on Apple Silicon. (4) Roofline: at N=4 we're BEFORE bandwidth saturation (M5 Max 460–614 GB/s; arxiv 2601.19139 vllm-mlx 2.6×@16 on an 8B before saturating) ⇒ the gap is amortization/dispatch, not bandwidth. Target: **≥ the peer, ideally beat it** (our KV architecture is structurally favorable).
+**ONLINE-RESEARCH CORROBORATION (2026-06-24, cited).** (1) Dispatch-count IS the Metal-specific lever: measured Metal dispatch overhead ≈31.7–71µs EACH; on Metal "cutting dispatch count (not kernel quality) is the actionable optimization target" and per-slot loops are the named anti-pattern (arxiv 2604.02344). (2) **200 is BEATABLE, not a ceiling** — the pinned reference's unified KV computes cross-sequence attention over the entire cache and masks it, a behavior its maintainers describe as suboptimal for many sequences (upstream issue #4130); **our per-slot `slot_id`-indexed KV avoids that waste**, so post-fusion we can exceed 200/243. (3) The ~186→200 non-attention residual = MoE: sort tokens by expert + grouped-GEMM so each expert's weights are read once per step (PyTorch grouped-GEMM blog; arxiv 2501.16103) — bandwidth-bound ⇒ matters more on Apple Silicon. (4) Roofline: at N=4 we're BEFORE bandwidth saturation (M5 Max 460–614 GB/s; arxiv 2601.19139 vllm-mlx 2.6×@16 on an 8B before saturating) ⇒ the gap is amortization/dispatch, not bandwidth. Target: **at least pinned-reference parity, ideally faster** (our KV architecture is structurally favorable).
 
 **COHERENCE METHODOLOGY (mandatory gate, ADR-015 `coherence_and_speed_regression.sh`): coherence FIRST, then peer-parity speed.** Every kernel lands only when (a) `slot_aware_n1`/`n4` stay BYTE-IDENTICAL to the serial slot-aware path (batched ≡ serial ⇒ cannot be less coherent than the golden baseline) AND (b) the coherence gate is green (`coherence_smoke` = serial decode non-degenerate on real prompts vs the peer; `coherence-harness/coherence_bench.sh` = side-by-side hf2q-vs-peer) — THEN a peer-parity speed number (`tests/perf_baseline.json` ratio floors). The bar: **≥ the peer on BOTH coherence and speed** at N up to 8 / 32k-ctx-per-slot (8×32k=256k ≤ the model's 262k; `max_slots≤4` A4 threshold is env-configurable via `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS`, to be raised to 8 after the KV-memory math is validated). "Speed without coherence == junk."
 
@@ -1048,7 +1079,7 @@ All five original operator questions are now answered; this section is kept for 
 2. ~~**Slot count default**~~ → **RESOLVED:** `max_slots = 4` (§3.4), unchanged.
 3. ~~**Scheduler port reference**~~ → **RESOLVED:** the peer's `-cb`-style admission-during-decode (§3.3); not vLLM's PagedAttention-coupled scheduler. `vllm-mlx` confirms continuous batching on Apple Silicon without paging (§0.3).
 4. ~~**Phase E gating model (≥1.5× @ N=4)**~~ → **RESOLVED (§0.5):** the bar is now **match-or-beat peers on this M5 Max**; the old ≥1.5× becomes a *floor*, not the target.
-5. ~~**Spec-decode interaction**~~ → **RESOLVED:** spec-decode under continuous batching is **out of scope for Phase F** and gated off above the spec-decode slot threshold (already enforced: `SpecDecodeMaxSlotsAboveBatchedThreshold`, `engine.rs:3749`). Continuous batching and spec-decode are not required to compose in v1; if both are wanted later it is its own ADR, not a hidden Phase-F TODO.
+5. ~~**Spec-decode interaction**~~ → **RESOLVED:** server capacity and proposer policy are independent. Continuous batching admits the selected family's qualified physical width; request-time speculation may decline work and use ordinary exact target decoding when its measured cost gate is unfavorable. A disabled or unprofitable proposer never blocks server startup (§7.QWEN-PHYSICAL).
 
 ---
 
@@ -1332,6 +1363,215 @@ by vLLM's automatic prefix cache rather than attaching a request-global media
 hash to every earlier text block. A future cache-layout revision may encode a
 chained text/media event identity directly. The present correction deliberately
 does not broaden reuse beyond the observed first-image-after-text failure.
+
+## 7.QWEN-PHYSICAL — natural scheduler widths and non-vacuous scalar proof (2026-08-22)
+
+The physical Qwen decode body accepts any width from 2 through 16. The serving
+layer nevertheless admitted only widths 2, 4, 8, and 16. That was not a kernel
+constraint: during a concurrent admission ramp the scheduler naturally formed
+a seven-lane ready cohort, the serving predicate rejected it, and all seven
+lanes ran through the scalar path. Physical-batch admission must therefore
+cover the model's complete supported interval, while width one remains the
+explicit scalar contract. Model-free trajectory tests include odd ramp widths
+as well as the public N=1/2/4/8/16 steady-state gate widths.
+
+The first real-artifact gate revision attempted to prevent terminal-response
+cache replay by adding `seed: 0` to each request. In the OpenAI request
+contract, a present seed selects the sampling path even when temperature is
+zero. Those requests were consequently ineligible for the ordinary exact
+greedy physical batch, so the resulting N>1 scalarization did not measure the
+intended path. This hypothesis was falsified and that revision is not evidence.
+
+The corrected gate leaves both the concurrent wave and the scalar reference
+greedy and seed-free. After taking the physical-width telemetry snapshot, it
+sends one distinct deterministic cache-replacement request through every
+configured slot, validates every replacement response, and only then replays
+each measured request alone. The replay must report nonzero decode time and
+match its concurrent response exactly. Cache replacement occurs after the
+metrics snapshot, so it cannot inflate the claimed physical cohort width or
+throughput.
+
+On exact source `7f6955b9`, before widening serving admission, the corrected
+BF16 spike proved exact scalar parity and observed physical widths N=1, N=2,
+and N=4. At requested N=8 it observed scheduler width 7 but physical body width
+4, directly isolating the stale serving predicate. The candidate widens that
+predicate to every width 2 through 16 and adds odd-width dense and native-MoE
+trajectory/call-count canaries. This section does not promote the candidate:
+the final authority remains a rebuilt exact-source release binary passing the
+unchanged 64-token BF16/Q4_K_M/Q5_K_M/Q6_K/Q8_0 matrix at requested physical
+N=1/2/4/8/16, followed by matched-reference quality and throughput gates.
+
+The next exact-source BF16 spike passed N=1/2/4/8 but stopped before N=16
+model readiness. The failure was a known historical over-fire recorded in this
+ADR's history: the continuous-batching spawn gate reused a speculative-decoding
+safe-zone error and override even when the launcher had explicitly selected
+speculation off. That couples server capacity to a disabled optimization and is
+not a valid safety boundary.
+
+The corrected contract separates the two decisions. Qwen35-family continuous
+batching supports a qualified ceiling of 16; Gemma, Qwen-VL, and DeepSeek retain
+their prior ceiling of 8 until their own wider proofs land. The effective limit
+is the lower of the operator's configured capacity and the family-qualified
+capacity, so an environment override cannot silently broaden another family.
+Speculative policy variables cannot lower, raise, or bypass that limit. A
+proposer may independently decline high-concurrency work without preventing
+ordinary target decoding. The final Qwen N=16 real-artifact proof remains the
+acceptance authority for this correction.
+
+## 7.QWEN-Q5-CHAIN — explicit dense-Q5 command-buffer policy (2026-08-23)
+
+The Qwen layer composer had an explicit command-buffer chain policy for dense
+Q4_K and for MoE Q5_K, but no dense Q5_K cell. Dense Q5_K therefore inherited
+the catch-all value one even though it is a supported native generative codec.
+On the exact 64-layer Qwen3.8 Q5_K_M artifact, that meant one embedding
+submission, 64 layer submissions, and one output-head submission for every
+target forward: 66 total. The Q4_K control used chain four and submitted 18.
+The physical-width receipts matched that accounting exactly at every width;
+created and submitted counters were equal, so this was real GPU work rather
+than an allocation-only counter.
+
+The deciding spike kept source `fa2556c25fb154a19ea4563412b6932686296e46`,
+binary SHA-256
+`6fc721a092e1d6a39dfd95ddbd2b1845c2748668e7ddc4bd3ade3ac495822dd2`,
+artifact SHA-256
+`4b19f41c391d962882e459be3315d4e3c54079892db2848f66b78815b185156e`,
+the 64-token deterministic prompts, speculation-off target graph, scalar replay,
+and physical widths 1/2/4/8/16 unchanged. Only
+`HF2Q_PARTIAL_CHAIN_N` varied. Local receipt roots are
+`/opt/hf2q-evidence/qwen38-q5-{physical,chain2,chain4,chain8}-fa2556c2`.
+
+| physical width | N=1 t/s | N=2 t/s | N=4 t/s | N=8 t/s | selected |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 27.026 | 27.195 | 27.216 | 24.566 | 2 |
+| 2 | 37.545 | 37.587 | 37.530 | 37.393 | 2 |
+| 4 | 46.580 | 47.437 | 47.105 | 47.194 | 2 |
+| 8 | 23.850 | 48.817 | 48.645 | 48.230 | 2 |
+| 16 | 35.466 | 41.298 | 41.909 | 39.212 | 2 |
+
+Every cell passed exact scalar replay. N=2 reduced the command-buffer count to
+34 per target forward; N=4 reduced it to 18; N=8 reduced it to 10. N=2 is the
+candidate despite N=4's narrow width-1 and width-16 leads: those sub-2%
+single-run differences are not sufficient evidence for a more complex
+width-dependent policy, while N=2 is non-regressing across the complete public
+width matrix and more conservative about long command buffers. N=8 is rejected:
+it won no measured width and the later runs showed enough thermal drift that
+its scalar delta cannot be promoted as an independent claim.
+
+A separate diagnostic disabled the qualified Q5 width route while retaining
+N=2. That run's width-one control shifted from 27.195 to 24.932 t/s, proving a
+thermal/temporal mismatch, so it is not a promotion receipt. It nevertheless
+provided no evidence to replace the current route: widths four and eight fell
+to 39.884 and 39.193 t/s. The candidate therefore changes only the outer
+command-buffer chain policy; native Q5_K bytes, kernels, and routing remain
+unchanged.
+
+This section authorizes the source change and focused tests, not release
+acceptance. Acceptance still requires a rebuilt exact-source binary passing the
+sealed BF16/Q4_K_M/Q5_K_M/Q6_K/Q8_0 physical matrix, exact cross-format model
+swaps, and matched-reference coherence and throughput gates.
+
+## 7.QWEN-Q6-Q8-CHAIN — explicit dense-Q6/Q8 policy (2026-08-23)
+
+Q6_K and Q8_0 were the other published Qwen3.8 formats whose dense FFN chain
+policy fell through the generic default. The follow-up spikes used the same
+source and binary as §7.QWEN-Q5-CHAIN, exact scalar replay, speculation-off
+target graph, 64-token deterministic prompts, and physical widths
+1/2/4/8/16. Q6_K artifact SHA-256 was
+`78f62a87ef851443d4e0c74c4e1eb1dfe73e3bf0ded3cf320ec80f763020ddb3`;
+Q8_0 was
+`53c076e5117be1391e76a9746998fbe2040e6b69a73aa47d1c1b0ca97a8a2c99`.
+Receipt roots are `/opt/hf2q-evidence/qwen38-q6-chain{1,2,4}-fa2556c2`
+and `/opt/hf2q-evidence/qwen38-q8-chain{1,2,4}-fa2556c2`.
+
+| format | width | N=1 t/s | N=2 t/s | N=4 t/s | selected |
+|:---|---:|---:|---:|---:|---:|
+| Q6_K | 1 | 23.567 | 22.297 | 22.334 | 1 |
+| Q6_K | 2 | 36.733 | 36.892 | 36.855 | 1 |
+| Q6_K | 4 | 46.484 | 47.038 | 46.884 | 1 |
+| Q6_K | 8 | 49.383 | 49.574 | 49.269 | 1 |
+| Q6_K | 16 | 41.785 | 40.692 | 42.031 | 1 |
+| Q8_0 | 1 | 19.223 | 19.240 | 19.290 | 1 |
+| Q8_0 | 2 | 33.551 | 33.690 | 33.834 | 1 |
+| Q8_0 | 4 | 50.291 | 50.536 | 50.588 | 1 |
+| Q8_0 | 8 | 60.171 | 60.415 | 59.233 | 1 |
+| Q8_0 | 16 | 48.978 | 48.735 | 48.344 | 1 |
+
+Every cell passed exact scalar replay, and submitted command-buffer counters
+equaled created counters. Chaining therefore changes real submissions: N=1
+uses 66 per target forward, N=2 uses 34, and N=4 uses 18. Submission reduction
+alone is not the acceptance metric. For Q6, both alternatives lose roughly 5%
+at width one and N=2 also loses 2.6% at width 16. For Q8, the small N=2 gains
+through width eight reverse at width 16; N=4 reverses at widths eight and 16.
+The non-monotonic matrices falsify a universal promotion, so both formats keep
+N=1 as an explicit measured policy. N=8 was not run because the smallest two
+candidate depths already exposed the deciding regression and Q5's measured N=8
+curve supplied no contrary monotonicity evidence.
+
+The implementation also replaces the supported-codec catch-all with an
+explicit table over every FFN codec admitted by Qwen GGUF preflight. Unmeasured
+admitted codecs retain an explicit conservative value one. Metadata-only
+I16/I32, synthetic arms, and arm/config mismatches alone use the defensive
+outer fallback. Artifact-native scalar Dense has a distinct policy described
+in §7.QWEN-NATIVE-CHAIN. A unit canary enumerates the admission set; adding
+another artifact codec without a chain decision must now fail that gate.
+As with the Q5 candidate, final acceptance belongs to the rebuilt all-format
+physical, model-swap, and matched-reference matrices.
+
+## 7.QWEN-NATIVE-CHAIN — artifact-native scalar Dense policy (2026-08-24)
+
+The Qwen command-buffer policy previously classified only GPU `DenseQ` and
+`MoeQ` storage. Artifact-native F32/F16/BF16 Dense layers therefore reached an
+undifferentiated fallback, and policy inspection could incorrectly describe
+BF16 as a quantized Dense arm. That is a representation error even when both
+paths happen to choose N=1: BF16 is loaded and executed in its artifact-native
+scalar format and must never inherit a quantized policy or a dequant/requant
+route.
+
+The corrected policy reads `DenseFfnWeightsNative` CPU metadata before GPU
+upload erases that distinction. It admits an artifact-native scalar policy only
+when gate, up, and down use the same F32, F16, or BF16 codec in every layer and
+all layers agree. Mixed projections, mixed layers, architecture-arm mismatch,
+and empty/synthetic models fail closed to N=1. Native Dense remains protected
+by a hard runtime rejection of `HF2Q_PARTIAL_CHAIN_N>1`; the temporary
+`HF2Q_NATIVE_DENSE_CHAIN_SPIKE` escape hatch used to collect the deciding
+hardware evidence is not part of the shipping source.
+
+The exact BF16 spike used artifact SHA-256
+`f30d9a6ea40ca3c5265d0996a460ad1474173c40c8e7f04c0b03caf6084c2cee`,
+64-token deterministic prompts, speculation off, exact scalar replay at each
+physical width, routing `HF2Q_DECODE_MVN=0` / `HF2Q_DECODE_MV_EXT=1`, and widths
+1/2/4/8/16. That historical route receipt does not authorize exact
+speculation: ADR-044's later 508-decision gate found a target fork and restored
+the shared `MVN=1` / `MV_EXT=0` defaults. N=1 used source
+`fa2556c25fb154a19ea4563412b6932686296e46`
+and binary SHA-256
+`6fc721a092e1d6a39dfd95ddbd2b1845c2748668e7ddc4bd3ade3ac495822dd2`.
+N=2 and N=4 used the source candidate plus the temporary spike gate, binary
+SHA-256
+`fd7cd18a00b5f3e811fc814335588385c6ae36113b0a9ae2662f0f17907a4e4b`.
+Local receipt roots are
+`/opt/hf2q-evidence/qwen38-bf16-chain{1,2,4}-{fa2556c2,fd7cd18a}`.
+
+| physical width | N=1 t/s | N=2 t/s | N=4 t/s | selected |
+|---:|---:|---:|---:|---:|
+| 1 | 10.682 | 10.663 | 10.689 | 1 |
+| 2 | 20.221 | 20.037 | 20.240 | 1 |
+| 4 | 33.504 | 32.414 | 32.937 | 1 |
+| 8 | 38.196 | 37.476 | 27.885 | 1 |
+| 16 | 36.433 | 35.837 | 35.422 | 1 |
+
+Every cell passed exact scalar replay. N=1 submitted 66 command buffers per
+target forward, N=2 submitted 34, and N=4 submitted 18. The reduced submission
+count did not reduce elapsed time: N=2 lost at all five widths; N=4 was within
+noise at widths one and two, lost at widths four and 16, and regressed 27.0% at
+width eight. This falsifies submission-count reduction as a BF16 optimization
+and selects explicit N=1. N=8 is unnecessary: N=2 already loses universally,
+and N=4 demonstrates that increasing the chain depth can amplify rather than
+reverse the high-width regression.
+
+This spike decides the artifact-native chain policy only. It does not accept
+BF16 performance against the matched reference; the frozen-candidate all-format
+physical, exact-swap, and matched-reference matrices remain mandatory.
 
 ## 7.GEMMA-PREFILL — candidate resumable text transactions (2026-08-08)
 

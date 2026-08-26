@@ -395,6 +395,15 @@ where
             )
         })
     }
+
+    fn load_projector(
+        &self,
+        text_path: &Path,
+        engine: &E,
+        admission: &crate::serve::multi_model::ProjectorAdmission,
+    ) -> Result<Arc<crate::serve::api::state::LoadedMmproj>> {
+        self.inner.load_projector(text_path, engine, admission)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +523,8 @@ mod tests {
         (
             std::path::PathBuf::from("/dev/null/synthetic.gguf"),
             EngineConfig {
+                expected_text_artifact_stamp: None,
+                verified_text_artifact: None,
                 operator_model_path: None,
                 tokenizer_path: None,
                 config_path: None,
@@ -521,6 +532,7 @@ mod tests {
                 warmup_synchronously: false,
                 kv_metrics_sink: None,
                 dwq_overlay_path: None,
+                projector: None,
                 // ADR-040 Phase C iter-4 (C4) — test fixture uses
                 // SerialFifo (ADR-005 byte-equivalent path).
                 engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,

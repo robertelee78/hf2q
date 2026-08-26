@@ -2468,14 +2468,11 @@ impl MlxModelWeights {
             }
 
             let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
-            session.barrier_between(
-                &[
-                    &self.activations.moe_norm_out,
-                    &self.activations.moe_expert_ids,
-                    self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                ],
-                &[&self.activations.moe_gate_up_id_out],
-            );
+            let native_activation_epoch = self.native_activation_epoch()?;
+            let (gate_up_affine, down_affine) = self.layers[layer_idx]
+                .moe
+                .affine_pair()?
+                .map_or((None, None), |(gate_up, down)| (Some(gate_up), Some(down)));
             let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
                 n_tokens: 1,
                 top_k: top_k as u32,
@@ -2504,6 +2501,7 @@ impl MlxModelWeights {
                             gu_params.n,
                             gu_params.k,
                             gu_params.top_k,
+                            gu_params.n_experts,
                             gu_params.expert_stride,
                         )
                         .ok()
@@ -2517,28 +2515,59 @@ impl MlxModelWeights {
             // gate_up_id + swiglu + down_id dispatches.  Produces
             // garbage moe_down_id_out (stale buffer).
             if !INVESTIGATION_ENV.skip_moe_experts {
-                if let Some(rec) = q6k_id_record_opt {
-                    session.encoder_mut().dispatch_record(
-                        rec,
+                let gate_up_weight = self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap();
+                if !super::expert_dispatch::dispatch_native_scalar_expert(
+                    session,
+                    reg,
+                    dev,
+                    native_activation_epoch,
+                    &self.activations.moe_norm_out,
+                    gate_up_weight,
+                    &self.activations.moe_expert_ids,
+                    &self.activations.moe_gate_up_id_out,
+                    gate_up_affine,
+                    ggml_type_gu,
+                    1,
+                    top_k as u32,
+                    gu_params.n,
+                    gu_params.k,
+                    gu_params.n_experts,
+                    gu_params.expert_stride,
+                    mlx_native::DenseMatmulIdInputLayout::SharedPerToken,
+                    super::expert_dispatch::DenseExpertScratchSlot::GateUp,
+                    "Gemma decode gate/up",
+                )? {
+                    session.barrier_between(
                         &[
-                            self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
                             &self.activations.moe_norm_out,
-                            &self.activations.moe_gate_up_id_out,
                             &self.activations.moe_expert_ids,
+                            gate_up_weight,
                         ],
+                        &[&self.activations.moe_gate_up_id_out],
                     );
-                } else {
-                    session
-                        .quantized_matmul_id_ggml(
-                            reg,
-                            dev,
-                            &self.activations.moe_norm_out,
-                            self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                            &self.activations.moe_expert_ids,
-                            &self.activations.moe_gate_up_id_out,
-                            &gu_params,
-                        )
-                        .map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+                    if let Some(rec) = q6k_id_record_opt {
+                        session.encoder_mut().dispatch_record(
+                            rec,
+                            &[
+                                gate_up_weight,
+                                &self.activations.moe_norm_out,
+                                &self.activations.moe_gate_up_id_out,
+                                &self.activations.moe_expert_ids,
+                            ],
+                        );
+                    } else {
+                        session
+                            .quantized_matmul_id_ggml(
+                                reg,
+                                dev,
+                                &self.activations.moe_norm_out,
+                                gate_up_weight,
+                                &self.activations.moe_expert_ids,
+                                &self.activations.moe_gate_up_id_out,
+                                &gu_params,
+                            )
+                            .map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+                    }
                 }
                 *total_dispatches += 1;
 
@@ -2569,14 +2598,6 @@ impl MlxModelWeights {
             // down_id reads moe_swiglu_id_out (from B12). post-FF norm1 reads
             // mlp_down (from B11). Disjoint writes.
             let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
-            session.barrier_between(
-                &[
-                    &self.activations.moe_swiglu_id_out,
-                    &self.activations.moe_expert_ids,
-                    self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                ],
-                &[&self.activations.moe_down_id_out],
-            );
             let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
                 n_tokens: top_k as u32,
                 top_k: 1,
@@ -2603,6 +2624,7 @@ impl MlxModelWeights {
                             dn_params.n,
                             dn_params.k,
                             dn_params.n_tokens, // = real_top_k for the down dispatch
+                            dn_params.n_experts,
                             dn_params.expert_stride,
                         )
                         .ok()
@@ -2613,28 +2635,59 @@ impl MlxModelWeights {
                 None
             };
             if !INVESTIGATION_ENV.skip_moe_experts {
-                if let Some(rec) = q8_0_id_record_opt {
-                    session.encoder_mut().dispatch_record(
-                        rec,
+                let down_weight = self.layers[layer_idx].moe.stacked_down.as_ref().unwrap();
+                if !super::expert_dispatch::dispatch_native_scalar_expert(
+                    session,
+                    reg,
+                    dev,
+                    native_activation_epoch,
+                    &self.activations.moe_swiglu_id_out,
+                    down_weight,
+                    &self.activations.moe_expert_ids,
+                    &self.activations.moe_down_id_out,
+                    down_affine,
+                    ggml_type_dn,
+                    1,
+                    top_k as u32,
+                    dn_params.n,
+                    dn_params.k,
+                    dn_params.n_experts,
+                    dn_params.expert_stride,
+                    mlx_native::DenseMatmulIdInputLayout::Slotted,
+                    super::expert_dispatch::DenseExpertScratchSlot::Down,
+                    "Gemma decode down",
+                )? {
+                    session.barrier_between(
                         &[
-                            self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
                             &self.activations.moe_swiglu_id_out,
-                            &self.activations.moe_down_id_out,
                             &self.activations.moe_expert_ids,
+                            down_weight,
                         ],
+                        &[&self.activations.moe_down_id_out],
                     );
-                } else {
-                    session
-                        .quantized_matmul_id_ggml(
-                            reg,
-                            dev,
-                            &self.activations.moe_swiglu_id_out,
-                            self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                            &self.activations.moe_expert_ids,
-                            &self.activations.moe_down_id_out,
-                            &dn_params,
-                        )
-                        .map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+                    if let Some(rec) = q8_0_id_record_opt {
+                        session.encoder_mut().dispatch_record(
+                            rec,
+                            &[
+                                down_weight,
+                                &self.activations.moe_swiglu_id_out,
+                                &self.activations.moe_down_id_out,
+                                &self.activations.moe_expert_ids,
+                            ],
+                        );
+                    } else {
+                        session
+                            .quantized_matmul_id_ggml(
+                                reg,
+                                dev,
+                                &self.activations.moe_swiglu_id_out,
+                                down_weight,
+                                &self.activations.moe_expert_ids,
+                                &self.activations.moe_down_id_out,
+                                &dn_params,
+                            )
+                            .map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+                    }
                 }
                 *total_dispatches += 1;
             }
@@ -4217,7 +4270,6 @@ mod g4_cfa_tests {
                 cols,
             },
             affine: None,
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         }
     }
@@ -5144,7 +5196,6 @@ mod g4_cfa_tests {
                 cols,
             },
             affine: None,
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         }
     }
@@ -5486,7 +5537,6 @@ mod g4_cfa_tests {
                 cols,
             },
             affine: None,
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         }
     }

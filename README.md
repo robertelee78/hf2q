@@ -30,7 +30,7 @@ Metal kernels we own end-to-end.
 | **Rust** | 1.88+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | hf2q 0.1.17 is the release line described by this checkout and resolves published, checksum-pinned `mlx-native 0.11.2`. Public availability is authoritative only when the `v0.1.17` tag, GitHub artifact, and crates.io bytes match the exact main-branch release SHA. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | The published hf2q release is 0.1.17 and resolves published, checksum-pinned `mlx-native 0.11.2`. This checkout is the next-release source candidate and pins published, checksum-pinned `mlx-native 0.15.0` from crates.io at SHA-256 `09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822`; that backend release passed the fail-closed exact-source/package/publication workflow in run `32917226470`. The checkout is not a published hf2q release until its own tag, GitHub artifact, crates.io bytes, and exact main-branch release SHA agree. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
@@ -72,11 +72,8 @@ hf2q chat jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M
 Native generation and chat serving support **Gemma 4 (dense + MoE)**,
 **Qwen 3.5 / 3.6 (`qwen35` / `qwen35moe`)**, **Qwen 3.8-27B through the
 `qwen35` graph**, and **DeepSeek-V4-Flash-0731**. **BERT / Nomic-BERT** are
-embedding-only. Conversion additionally supports legacy `qwen3moe`, dense
-Qwen3-VL, Llama 3, and MiniMax M2.7 artifacts.
-Standalone Qwen3-VL generation and serving fail closed before model load
-pending ADR-041; it must not be confused with the qualified Qwen3.8
-text/projector pair. The
+embedding-only. Conversion additionally supports legacy `qwen3moe`, Llama 3,
+and MiniMax M2.7 artifacts. The
 operation-specific source of truth is
 [`docs/shipping-contract.md`](docs/shipping-contract.md).
 
@@ -506,8 +503,22 @@ tool-result continuation, same-image single-flight/cache reuse, disconnect
 isolation, and the official 4,096 by 4,096 processor maximum. Vision is not yet
 performance-accepted—the official-maximum cold path remains materially slower
 than desired—so those results are candidate evidence, not a release-wide speed
-claim. Speculative MTP decode remains disabled and outside the accepted server
-surface.
+claim. Qwen SlotAware speculation defaults to `auto`: fixed-K3 MTP and
+request-history lookup are independently cost-gated, target-verified, and
+fail closed to ordinary decode when their semantics or measured cost are not
+acceptable. Explicit `QWEN38_SPECULATION=off` remains the operator escape
+hatch.
+
+First-class model switching is likewise a current source contract, not yet a
+universal hardware result. The generative-family gate drives Qwen dense,
+Qwen MoE, Gemma, and DeepSeek through a fixed 13-phase, two-cycle sequence in
+one long-lived process, with DeepSeek as the eviction hub. It requires fresh
+generation identity, semantic family canaries, cold generation-local cache,
+exact replay, mapping disappearance, and bounded RSS/host-wired peaks at every
+transition. The source and mutation gates are checked in; the complete
+Apple-Silicon artifact run remains required before this can be called runtime
+acceptance or a performance result. BERT and Nomic keep their separate
+embedding-model lifecycle contract.
 
 Foreground launchers use the live operator dashboard automatically when
 stderr is an interactive terminal. Runtime work stays in place instead of
@@ -568,8 +579,7 @@ The canonical Qwen launcher also bounds a still-open reasoning span at 2,048
 tokens and continues decoding the answer. For smaller `max_tokens` values the
 default adapts to retain answer capacity. Set `THINKING_TOKEN_BUDGET=0` to
 disable this policy, or send the vLLM-compatible `thinking_token_budget` field
-per request. Qwen3-VL remains a distinct model family rather than an
-approximate fallback through another Qwen text family.
+per request.
 
 Long Gemma 4 text prefills use 4,096-token transactions and split at
 the stable-prefix boundary. Decode runs before each `Mixed` prefill step, and
@@ -670,7 +680,8 @@ to the eight-token/two-window interactive budget above.
 
 Large DeepSeek MoE prefills also pair the routed expert gate and up
 projections through the family-neutral schedule primitive introduced in
-`mlx-native 0.10.9` and retained by the pinned `mlx-native 0.11.2`.
+`mlx-native 0.10.9` and retained by the current candidate's pinned
+`mlx-native 0.15.0`.
 That primitive constructs the expert routing schedule once, then encodes the
 two existing quantized projections; it is not a new approximate arithmetic
 kernel. Decode-sized work, forced matvec/slotted diagnostics, calls without
@@ -711,7 +722,7 @@ The Qwen watchdog acceptance scripts are reproducible operator gates, not
 startup defaults. Existing receipts are causal local dependency-spike evidence;
 they are not final hf2q distribution authority. Changes to those model or
 serving paths require rerunning the applicable gates from a clean hf2q package
-resolving published `mlx-native 0.11.2`:
+resolving the checkout's published, checksum-pinned `mlx-native 0.15.0`:
 
 - `scripts/test_qwen36_prefill_watchdog.sh` enqueues the deterministic
   552-token SSE lane immediately before the public 87,972-token/347-tool lane,

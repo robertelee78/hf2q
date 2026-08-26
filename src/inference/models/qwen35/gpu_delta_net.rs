@@ -48,11 +48,11 @@
 //! runtime layout into the kernel's expected layout. This mirrors P7b's
 //! approach for the SDPA permute.
 //!
-//! # Kernel_w transpose
+//! # Convolution matrix layout
 //!
-//! The GGUF/CPU ref stores `ssm_conv1d` as `[K, channels]` (K outermost). The
-//! ssm_conv kernel expects `[channels, K]` (K innermost). We transpose once at
-//! upload time via `DeltaNetWeightsGpu::from_cpu` so the hot path pays no cost.
+//! The ssm_conv kernel consumes `[channels, K]` (K innermost). Production GGUF
+//! already stores that exact rank-two layout and remains mapped. Synthetic CPU
+//! fixtures use `[K, channels]` and transpose only in `from_cpu`.
 //!
 //! # ADR status
 //!
@@ -64,8 +64,7 @@ use mlx_native::ops::chunk_gated_delta_rule::{
     ChunkGatedDeltaRuleParams, ChunkInternalArena, FIXED_BT,
 };
 use mlx_native::ops::compute_g_beta::dispatch_compute_g_beta;
-use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
-use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::copy::dispatch_copy_f32;
 use mlx_native::ops::elementwise::{cast, scalar_mul_f32, CastDirection};
 use mlx_native::ops::gated_delta_net::{
     build_gated_delta_net_params, dispatch_gated_delta_net, GatedDeltaNetParams,
@@ -89,7 +88,7 @@ use mlx_native::ops::gated_delta_net::{
 use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode;
 use mlx_native::ops::l2_norm::dispatch_l2_norm;
 use mlx_native::ops::qkv_split::{dispatch_qkv_split_f32, QkvSplitParams};
-use mlx_native::ops::quantized_matmul_ggml::{GgmlQuantizedMatmulParams, GgmlType};
+use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::ops::repeat_tiled::{dispatch_repeat_tiled_f32, RepeatTiledParams};
 use mlx_native::ops::rms_norm;
 use mlx_native::ops::ssm_conv::{dispatch_ssm_conv, dispatch_ssm_conv_with_capture, SsmConvParams};
@@ -101,8 +100,8 @@ use mlx_native::{metal, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
 use super::encoder_stage::LayerEncoder;
-use super::execution_dispatch::quantized_matmul_ggml;
 use super::gpu_full_attn::{download_f32, upload_f32, upload_f32_weight, upload_q4_0_from_f32};
+use super::kv_cache::LinearAttnStateSlot;
 use crate::debug::INVESTIGATION_ENV;
 use crate::serve::multi_seq_kv::SlotId;
 
@@ -191,6 +190,15 @@ fn chunk_path_eligible(seq_len: u32, d_k: u32) -> bool {
         && (d_k == mlx_native::ops::chunk_gated_delta_rule::MAX_K // 128
             || d_k == mlx_native::ops::chunk_gated_delta_rule_bank_split::BANK_SPLIT_K)
     // 256
+}
+
+/// Whether rectangular prefill preserves the scalar DeltaNet operator route.
+///
+/// The experimental chunk-scan implementation is single-sequence. A cohort
+/// must therefore fall back before any cache mutation whenever scalar prefill
+/// would select it.
+pub(crate) fn rectangular_prefill_route_compatible(n_tokens: u32, d_k: u32) -> bool {
+    !chunk_path_eligible(n_tokens, d_k)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -456,13 +464,13 @@ fn qkv_channels_for(n_k_heads: u32, n_v_heads: u32, d_k: u32, d_v: u32) -> u32 {
 
 /// GPU-side weight handles for a single Qwen3.5 Gated DeltaNet layer.
 ///
-/// Large projection weights (attn_qkv, attn_gate, ssm_alpha, ssm_beta,
-/// ssm_out) are pre-cast to BF16 at load time to avoid per-inference
-/// F32→BF16 casts in `apply_proj` (previously ~69ms per token across
-/// 30 delta-net layers). Small weights (norms, conv, dt_bias, ssm_a)
-/// stay F32 because they are consumed by custom kernels that require F32.
-/// `ssm_conv1d_gpu` is stored transposed relative to the CPU/GGUF format
-/// (see module-level layout notes).
+/// Production GGUF projection weights (attn_qkv, attn_gate, ssm_alpha,
+/// ssm_beta, ssm_out) retain their exact mapped artifact representation.
+/// Explicit synthetic constructors own their declared replacement buffers.
+/// Small weights (norms, conv, dt_bias, ssm_a) stay F32 because custom
+/// elementwise/state kernels require F32.
+/// `ssm_conv1d` is always `[qkv_channels, K]`; production GGUF maps that exact
+/// layout while synthetic CPU fixtures transpose during construction.
 #[derive(Clone)]
 pub struct DeltaNetWeightsGpu {
     pub attn_norm: MlxBuffer,
@@ -475,7 +483,7 @@ pub struct DeltaNetWeightsGpu {
     /// Z-gate projection `[nv*dv, hidden_size]`.
     pub attn_gate: MlxBuffer,
     pub attn_gate_ggml_type: GgmlType,
-    /// SSM conv1d kernel, transposed to `[qkv_channels, K]` for the GPU kernel.
+    /// SSM conv1d kernel in exact runtime layout `[qkv_channels, K]`.
     pub ssm_conv1d: MlxBuffer,
     /// Alpha logit projection `[nv, hidden_size]`.
     pub ssm_alpha: MlxBuffer,
@@ -503,7 +511,7 @@ pub struct DeltaNetWeightsGpu {
 impl DeltaNetWeightsGpu {
     /// Upload [`DeltaNetLayerWeights`] (CPU f32) to Metal buffers.
     ///
-    /// Transposes `ssm_conv1d` from `[K, channels]` (CPU/GGUF) to
+    /// Transposes synthetic `ssm_conv1d` from `[K, channels]` (CPU fixture) to
     /// `[channels, K]` (kernel layout) at upload time.
     pub fn from_cpu(
         weights: &DeltaNetLayerWeights,
@@ -545,17 +553,15 @@ impl DeltaNetWeightsGpu {
     }
 
     /// Test-only upload variant: keeps **all** projection weights as raw F32
-    /// (no Q4_0 quantization).  Used by the GPU↔CPU kernel-pipeline parity
-    /// tests so quantization noise (~1e-2 per Q4_0 projection × 5 stacking)
-    /// does not mask kernel correctness regressions at the 2e-3 tolerance
-    /// the parity gate enforces.  Production decode always uses
-    /// [`Self::from_cpu`] (Q4_0).
+    /// (no Q4_0 quantization). Used by synthetic GPU/CPU kernel-pipeline tests
+    /// so quantization noise (~1e-2 per Q4_0 projection × 5 stacking) does not
+    /// mask kernel correctness regressions at the 2e-3 tolerance the test
+    /// enforces. GGUF production models use their mapped native matrices and
+    /// never pass through this constructor.
     ///
-    /// At projection time, `apply_proj` (→ `apply_linear_projection_f32`)
-    /// takes the F32 branch which casts weights to BF16 on the GPU and
-    /// dispatches the MMA tiled matmul — the original numeric path the
-    /// P11 parity gate was written against, before commit 554a351 +
-    /// fad4263 introduced pre-cast BF16 / Q4_0 storage.
+    /// At projection time, `apply_proj` consumes these F32 test weights
+    /// directly. Production mapped scalar matrices use the same exact-storage
+    /// dispatch contract; only synthetic fixture construction is special here.
     #[cfg(test)]
     pub fn from_cpu_f32(
         weights: &DeltaNetLayerWeights,
@@ -688,34 +694,12 @@ pub fn apply_pre_norm(
     Ok(out)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Bf16ProjectionRoute {
-    Gemv,
-    TensorMm,
-}
-
-/// Select the source-BF16 projection route without inspecting process state.
-///
-/// The published mlx-native v0.11.1 GEMV kernel processes two output rows
-/// per threadgroup and forms both row pointers before guarding the second
-/// write. Until the native odd-width path is hardened, keep odd `N` on the
-/// tensor-MM route. All Qwen3.8 DeltaNet projection widths are even.
-fn bf16_projection_route(seq_len: u32, out_features: u32) -> Bf16ProjectionRoute {
-    if seq_len == 1 && out_features % 2 == 0 {
-        Bf16ProjectionRoute::Gemv
-    } else {
-        Bf16ProjectionRoute::TensorMm
-    }
-}
-
 /// Apply a single linear projection: `output = input @ weight^T`.
 ///
 /// Dispatches based on weight dtype:
 /// - **U8** (Q4_0 GGML blocks): `quantized_matmul_ggml` (dispatch_mv for M=1 decode,
 ///   dispatch_mm for M>8 prefill). 3.56× less bandwidth than BF16; deterministic.
-/// - **BF16**: paired-row GEMV for M=1 decode with even output width, otherwise
-///   `dense_matmul_bf16_f32_tensor` (MMA tensor-core tiled GEMM).
-/// - **F32**: inline cast to BF16 then MMA GEMM (legacy path).
+/// - **F32/F16/BF16**: dispatches the exact stored scalar matrix directly.
 ///
 /// Requires `in_features >= 32`.
 pub fn apply_proj(
@@ -728,17 +712,34 @@ pub fn apply_proj(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
+    let ggml_type = legacy_projection_ggml_type(weight)?;
     apply_proj_with_ggml_type(
         encoder,
         registry,
         device,
         input,
         weight,
-        GgmlType::Q4_0,
+        ggml_type,
         seq_len,
         in_features,
         out_features,
     )
+}
+
+/// Recover the representation contract of the legacy buffer-only helper.
+/// Native GGUF/source paths use the explicit `_with_ggml_type` entrypoints;
+/// this wrapper remains for synthetic fixtures where scalar dtype is exact
+/// and U8 historically means Q4_0.
+fn legacy_projection_ggml_type(weight: &MlxBuffer) -> Result<GgmlType> {
+    match weight.dtype() {
+        DType::F32 => Ok(GgmlType::F32),
+        DType::F16 => Ok(GgmlType::F16),
+        DType::BF16 => Ok(GgmlType::BF16),
+        DType::U8 => Ok(GgmlType::Q4_0),
+        dtype => anyhow::bail!(
+            "legacy DeltaNet projection has unsupported physical storage {dtype}; native artifacts must pass an explicit GGML type"
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -762,100 +763,19 @@ pub fn apply_proj_with_ggml_type(
     )
     .map_err(|e| anyhow!("alloc proj out: {e}"))?;
 
-    match weight.dtype() {
-        DType::U8 => {
-            // Native GGML block path — storage type is part of the weight
-            // contract and must never be guessed from DType::U8.
-            let params = GgmlQuantizedMatmulParams {
-                m: seq_len,
-                n: out_features,
-                k: in_features,
-                ggml_type,
-            };
-            quantized_matmul_ggml(encoder, registry, device, input, weight, &mut dst, &params)
-                .with_context(|| format!("quantized_matmul_ggml {ggml_type:?}"))?;
-        }
-        DType::BF16 => {
-            if input.dtype() != DType::F32 || dst.dtype() != DType::F32 {
-                return Err(anyhow!(
-                    "apply_proj BF16 requires F32 input/output, got input={:?} output={:?}",
-                    input.dtype(),
-                    dst.dtype()
-                ));
-            }
-            let params = DenseMmBf16F32Params {
-                m: seq_len,
-                n: out_features,
-                k: in_features,
-                src0_batch: 1,
-                src1_batch: 1,
-            };
-            match bf16_projection_route(seq_len, out_features) {
-                Bf16ProjectionRoute::Gemv => {
-                    dense_gemv_bf16_f32(
-                        encoder, registry, device, weight, input, &mut dst, &params,
-                    )
-                    .context("dense_gemv_bf16_f32 proj M=1")?;
-                }
-                Bf16ProjectionRoute::TensorMm => {
-                    dense_matmul_bf16_f32_tensor(
-                        encoder, registry, device, weight, input, &mut dst, &params,
-                    )
-                    .context("dense_matmul_bf16_f32_tensor proj")?;
-                }
-            }
-        }
-        DType::F32 => {
-            // Legacy inline cast path.
-            //
-            // ADR-015 iter14: lift `weight_bf16` cast scratch to the
-            // per-decode-token pool — function-local scratch consumed by the
-            // matmul dispatch in the SAME encoder; encoder is not committed
-            // here (caller commits).  Pool ARC anchor required under
-            // unretained refs; safe and a no-op under retained refs.
-            // Branch unused on Qwen3.6 dwq46 (Q4_0 takes the U8 path) but
-            // lifted for hygiene.
-            let n_w = (out_features * in_features) as usize;
-            let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
-                device,
-                n_w * 2,
-                DType::BF16,
-                vec![out_features as usize, in_features as usize],
-            )
-            .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
-            cast(
-                encoder,
-                registry,
-                device.metal_device(),
-                weight,
-                &weight_bf16,
-                n_w,
-                CastDirection::F32ToBF16,
-            )
-            .context("cast weight F32→BF16")?;
-            encoder.memory_barrier();
-            let params = DenseMmBf16F32Params {
-                m: seq_len,
-                n: out_features,
-                k: in_features,
-                src0_batch: 1,
-                src1_batch: 1,
-            };
-            dense_matmul_bf16_f32_tensor(
-                encoder,
-                registry,
-                device,
-                &weight_bf16,
-                input,
-                &mut dst,
-                &params,
-            )
-            .context("dense_matmul_bf16_f32_tensor proj (F32 legacy)")?;
-        }
-        other => {
-            return Err(anyhow!("apply_proj: unsupported weight dtype {:?}", other));
-        }
-    }
+    super::gpu_full_attn::apply_linear_projection_f32_into_with_ggml_type(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ggml_type,
+        &mut dst,
+        seq_len,
+        in_features,
+        out_features,
+    )
+    .context("DeltaNet artifact-native projection")?;
     Ok(dst)
 }
 
@@ -1114,13 +1034,14 @@ pub fn apply_proj_into(
     in_features: u32,
     out_features: u32,
 ) -> Result<()> {
+    let ggml_type = legacy_projection_ggml_type(weight)?;
     apply_proj_into_with_ggml_type(
         encoder,
         registry,
         device,
         input,
         weight,
-        GgmlType::Q4_0,
+        ggml_type,
         dst,
         seq_len,
         in_features,
@@ -1141,96 +1062,19 @@ pub fn apply_proj_into_with_ggml_type(
     in_features: u32,
     out_features: u32,
 ) -> Result<()> {
-    match weight.dtype() {
-        DType::U8 => {
-            let params = GgmlQuantizedMatmulParams {
-                m: seq_len,
-                n: out_features,
-                k: in_features,
-                ggml_type,
-            };
-            quantized_matmul_ggml(encoder, registry, device, input, weight, dst, &params)
-                .with_context(|| format!("quantized_matmul_ggml {ggml_type:?} (arena)"))?;
-        }
-        DType::BF16 => {
-            if input.dtype() != DType::F32 || dst.dtype() != DType::F32 {
-                return Err(anyhow!(
-                    "apply_proj_into BF16 requires F32 input/output, got input={:?} output={:?}",
-                    input.dtype(),
-                    dst.dtype()
-                ));
-            }
-            let params = DenseMmBf16F32Params {
-                m: seq_len,
-                n: out_features,
-                k: in_features,
-                src0_batch: 1,
-                src1_batch: 1,
-            };
-            match bf16_projection_route(seq_len, out_features) {
-                Bf16ProjectionRoute::Gemv => {
-                    dense_gemv_bf16_f32(encoder, registry, device, weight, input, dst, &params)
-                        .context("dense_gemv_bf16_f32 proj (arena M=1)")?;
-                }
-                Bf16ProjectionRoute::TensorMm => {
-                    dense_matmul_bf16_f32_tensor(
-                        encoder, registry, device, weight, input, dst, &params,
-                    )
-                    .context("dense_matmul_bf16_f32_tensor proj (arena)")?;
-                }
-            }
-        }
-        DType::F32 => {
-            // Legacy inline cast path — same as `apply_proj`. The
-            // `weight_bf16` scratch is per-layer per-call, and lifting it
-            // into the arena is impractical (one slot per F32 weight tensor
-            // would multiply slot count by 5). The F32 branch is unused on
-            // Qwen3.6 dwq46 (Q4_0 takes the U8 path); pooled is fine here.
-            let n_w = (out_features * in_features) as usize;
-            let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
-                device,
-                n_w * 2,
-                DType::BF16,
-                vec![out_features as usize, in_features as usize],
-            )
-            .map_err(|e| anyhow!("alloc weight_bf16 (pooled, arena F32 fallback): {e}"))?;
-            cast(
-                encoder,
-                registry,
-                device.metal_device(),
-                weight,
-                &weight_bf16,
-                n_w,
-                CastDirection::F32ToBF16,
-            )
-            .context("cast weight F32→BF16 (arena F32 fallback)")?;
-            encoder.memory_barrier();
-            let params = DenseMmBf16F32Params {
-                m: seq_len,
-                n: out_features,
-                k: in_features,
-                src0_batch: 1,
-                src1_batch: 1,
-            };
-            dense_matmul_bf16_f32_tensor(
-                encoder,
-                registry,
-                device,
-                &weight_bf16,
-                input,
-                dst,
-                &params,
-            )
-            .context("dense_matmul_bf16_f32_tensor proj (arena F32 fallback)")?;
-        }
-        other => {
-            return Err(anyhow!(
-                "apply_proj_into: unsupported weight dtype {:?}",
-                other
-            ));
-        }
-    }
-    Ok(())
+    super::gpu_full_attn::apply_linear_projection_f32_into_with_ggml_type(
+        encoder,
+        registry,
+        device,
+        input,
+        weight,
+        ggml_type,
+        dst,
+        seq_len,
+        in_features,
+        out_features,
+    )
+    .context("DeltaNet artifact-native projection into caller buffer")
 }
 
 /// Caller-allocated variant of [`apply_l2_norm_per_head`].
@@ -3118,6 +2962,18 @@ pub fn build_delta_net_layer(
         // ALL OTHER PATHS (autoregressive, decode seq=1) keep their iter-4
         // contract verbatim.
         let chunk_route = chunk_path_eligible(seq_len, d_k);
+        #[cfg(test)]
+        super::forward_gpu::segmented_route_trace::record(
+            if chunk_route {
+                super::forward_gpu::segmented_route_trace::OperatorRoute::DeltaChunk
+            } else {
+                super::forward_gpu::segmented_route_trace::OperatorRoute::DeltaRecurrent
+            },
+            seq_len,
+            n_v_heads * d_v,
+            d_k,
+            0,
+        );
 
         // Wave 5b.3 walk-bar observability — log the routing decision exactly
         // once per process so external validators can confirm the chunk path
@@ -3956,6 +3812,18 @@ pub fn build_delta_net_layer_with_arena(
 
     // ---- ops 5-9 prefill (chunk OR autoregressive) ----
     let chunk_route = chunk_path_eligible(seq_len, d_k);
+    #[cfg(test)]
+    super::forward_gpu::segmented_route_trace::record(
+        if chunk_route {
+            super::forward_gpu::segmented_route_trace::OperatorRoute::DeltaChunk
+        } else {
+            super::forward_gpu::segmented_route_trace::OperatorRoute::DeltaRecurrent
+        },
+        seq_len,
+        n_v_heads * d_v,
+        d_k,
+        0,
+    );
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static CHUNK_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -4785,6 +4653,454 @@ pub fn build_delta_net_layer_decode_into(
     Ok(output)
 }
 
+/// Decode one independent token per physical slot through a single DeltaNet
+/// layer invocation.
+///
+/// The fused recurrent kernel already has an `n_seqs` axis, but serving slots
+/// may be sparse and each slot has independent ping-pong parity. This wrapper
+/// gathers the selected CURRENT state rows into contiguous `[N, ...]` scratch,
+/// executes one `n_tokens=1, n_seqs=N` convolution and recurrent dispatch, and
+/// scatters the resulting rows into each slot's parity-correct WRITE target.
+/// The caller flips exactly those slots only after this function succeeds.
+#[allow(clippy::too_many_arguments)]
+pub fn build_delta_net_layer_decode_batched_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DeltaNetWeightsGpu,
+    state_slot: &LinearAttnStateSlot,
+    slot_ids: &[SlotId],
+    hidden_size: u32,
+    n_k_heads: u32,
+    n_v_heads: u32,
+    d_k: u32,
+    d_v: u32,
+    k_width: u32,
+    rms_norm_eps: f32,
+) -> Result<MlxBuffer> {
+    build_delta_net_layer_prefill_batched_into(
+        enc,
+        device,
+        registry,
+        x,
+        weights,
+        state_slot,
+        slot_ids,
+        1,
+        hidden_size,
+        n_k_heads,
+        n_v_heads,
+        d_k,
+        d_v,
+        k_width,
+        rms_norm_eps,
+    )
+}
+
+/// Advance an equal-width rectangular prefill cohort through one DeltaNet
+/// layer. Rows are sequence-major: all `n_tokens` rows for slot 0, then slot
+/// 1, and so on. Projection and MoE callers therefore retain one aggregate
+/// `[n_seqs * n_tokens, hidden]` matrix while the recurrent kernels consume
+/// their native `n_tokens × n_seqs` axes.
+#[allow(clippy::too_many_arguments)]
+pub fn build_delta_net_layer_prefill_batched_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &DeltaNetWeightsGpu,
+    state_slot: &LinearAttnStateSlot,
+    slot_ids: &[SlotId],
+    n_tokens: u32,
+    hidden_size: u32,
+    n_k_heads: u32,
+    n_v_heads: u32,
+    d_k: u32,
+    d_v: u32,
+    k_width: u32,
+    rms_norm_eps: f32,
+) -> Result<MlxBuffer> {
+    let n_seqs = u32::try_from(slot_ids.len()).context("Qwen batched DeltaNet width overflow")?;
+    anyhow::ensure!(
+        n_seqs >= 2,
+        "Qwen batched DeltaNet requires at least two slots"
+    );
+    anyhow::ensure!(
+        n_tokens > 0,
+        "Qwen batched DeltaNet requires at least one token per slot"
+    );
+    let seq_len = n_seqs
+        .checked_mul(n_tokens)
+        .context("Qwen batched DeltaNet aggregate row overflow")?;
+    anyhow::ensure!(
+        !chunk_path_eligible(n_tokens, d_k),
+        "Qwen rectangular DeltaNet cannot replace the enabled scalar chunk-scan route"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for slot_id in slot_ids {
+        anyhow::ensure!(
+            (slot_id.0 as usize) < state_slot.pp_flipped.len(),
+            "Qwen batched DeltaNet slot {} outside parity axis {}",
+            slot_id.0,
+            state_slot.pp_flipped.len()
+        );
+        anyhow::ensure!(
+            seen.insert(slot_id.0),
+            "Qwen batched DeltaNet received duplicate slot {}",
+            slot_id.0
+        );
+    }
+
+    let qkv_channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
+    let z_channels = n_v_heads * d_v;
+    let q_span = n_k_heads * d_k;
+    let k_span = n_k_heads * d_k;
+    let nv = n_v_heads as usize;
+    let dk = d_k as usize;
+    let dv = d_v as usize;
+    let q_sp = q_span as usize;
+    let k_sp = k_span as usize;
+    let v_sp = nv * dv;
+    let conv_per_seq = (qkv_channels as usize) * ((k_width - 1) as usize);
+    let recurrent_per_seq = dk * dv * nv;
+
+    let alloc_f32 = |elements: usize, label: &str| -> Result<MlxBuffer> {
+        super::decode_pool::pooled_alloc_buffer(
+            device,
+            elements * std::mem::size_of::<f32>(),
+            DType::F32,
+            vec![elements],
+        )
+        .map_err(|error| anyhow!("Qwen batched DeltaNet {label} allocation: {error}"))
+    };
+    let batch_conv_in = alloc_f32(slot_ids.len() * conv_per_seq, "conv input")?;
+    let batch_conv_out = alloc_f32(slot_ids.len() * conv_per_seq, "conv output")?;
+    let batch_recurrent_in = alloc_f32(slot_ids.len() * recurrent_per_seq, "recurrent input")?;
+    let batch_recurrent_out = alloc_f32(slot_ids.len() * recurrent_per_seq, "recurrent output")?;
+
+    for (row, slot_id) in slot_ids.iter().copied().enumerate() {
+        let (conv_current, _) = state_slot.conv_bufs_for_slot(slot_id);
+        let (recurrent_current, _) = state_slot.recurrent_bufs_for_slot(slot_id);
+        let (conv_offset, conv_elements) =
+            slot_conv_state_region(slot_id, qkv_channels, k_width - 1);
+        let (recurrent_offset, recurrent_elements) =
+            slot_recurrent_region(slot_id, d_k, d_v, n_v_heads);
+        let conv_view = conv_current.slice_view(conv_offset, conv_elements);
+        let recurrent_view = recurrent_current.slice_view(recurrent_offset, recurrent_elements);
+        dispatch_copy_f32(
+            enc,
+            registry,
+            device.metal_device(),
+            &conv_view,
+            &batch_conv_in,
+            0,
+            row * conv_per_seq,
+            conv_per_seq,
+        )
+        .context("gather Qwen batched DeltaNet conv state")?;
+        dispatch_copy_f32(
+            enc,
+            registry,
+            device.metal_device(),
+            &recurrent_view,
+            &batch_recurrent_in,
+            0,
+            row * recurrent_per_seq,
+            recurrent_per_seq,
+        )
+        .context("gather Qwen batched DeltaNet recurrent state")?;
+    }
+    enc.memory_barrier();
+
+    let qkv_conv = alloc_f32(seq_len as usize * qkv_channels as usize, "QKV conv")?;
+    let q_gpu = alloc_f32(seq_len as usize * q_sp, "Q split")?;
+    let k_gpu = alloc_f32(seq_len as usize * k_sp, "K split")?;
+    let v_gpu = alloc_f32(seq_len as usize * v_sp, "V split")?;
+    let mut ssm_params_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        4 * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![4],
+    )
+    .map_err(|error| anyhow!("Qwen batched DeltaNet SSM params allocation: {error}"))?;
+    ssm_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched DeltaNet SSM params: {error}"))?
+        .copy_from_slice(&[qkv_channels, n_tokens, n_seqs, k_width]);
+    let ssm_conv_params = SsmConvParams {
+        channels: qkv_channels,
+        n_tokens,
+        n_seqs,
+        k_width,
+    };
+
+    let x_norm = apply_pre_norm(
+        enc,
+        registry,
+        device,
+        x,
+        &weights.attn_norm,
+        seq_len,
+        hidden_size,
+        rms_norm_eps,
+    )?;
+    enc.memory_barrier();
+    let qkv_raw = apply_proj_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.attn_qkv,
+        weights.attn_qkv_ggml_type,
+        seq_len,
+        hidden_size,
+        qkv_channels,
+    )?;
+    let z = apply_proj_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.attn_gate,
+        weights.attn_gate_ggml_type,
+        seq_len,
+        hidden_size,
+        z_channels,
+    )?;
+    enc.memory_barrier();
+    dispatch_ssm_conv(
+        enc,
+        registry,
+        device.metal_device(),
+        &qkv_raw,
+        &weights.ssm_conv1d,
+        &batch_conv_in,
+        &batch_conv_out,
+        &qkv_conv,
+        &ssm_params_buf,
+        ssm_conv_params,
+    )
+    .context("Qwen batched DeltaNet convolution")?;
+    enc.memory_barrier();
+    dispatch_qkv_split_f32(
+        enc,
+        registry,
+        device.metal_device(),
+        &qkv_conv,
+        &q_gpu,
+        &k_gpu,
+        &v_gpu,
+        &QkvSplitParams {
+            seq: seq_len,
+            q_sp: q_span,
+            k_sp: k_span,
+            v_sp: v_sp as u32,
+        },
+    )
+    .map_err(|error| anyhow!("Qwen batched DeltaNet QKV split: {error}"))?;
+    for (row, slot_id) in slot_ids.iter().copied().enumerate() {
+        let (_, conv_write) = state_slot.conv_bufs_for_slot(slot_id);
+        let (conv_offset, conv_elements) =
+            slot_conv_state_region(slot_id, qkv_channels, k_width - 1);
+        let conv_write = conv_write.slice_view(conv_offset, conv_elements);
+        dispatch_copy_f32(
+            enc,
+            registry,
+            device.metal_device(),
+            &batch_conv_out,
+            &conv_write,
+            row * conv_per_seq,
+            0,
+            conv_per_seq,
+        )
+        .context("scatter Qwen batched DeltaNet conv state")?;
+    }
+    enc.memory_barrier();
+
+    let q_l2 = apply_l2_norm_per_head(
+        enc,
+        registry,
+        device,
+        &q_gpu,
+        seq_len,
+        n_k_heads,
+        d_k,
+        rms_norm_eps,
+    )?;
+    let k_normed = apply_l2_norm_per_head(
+        enc,
+        registry,
+        device,
+        &k_gpu,
+        seq_len,
+        n_k_heads,
+        d_k,
+        rms_norm_eps,
+    )?;
+    let alpha_logit_buf = apply_proj_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.ssm_alpha,
+        weights.ssm_alpha_ggml_type,
+        seq_len,
+        hidden_size,
+        n_v_heads,
+    )?;
+    let beta_logit_buf = apply_proj_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &x_norm,
+        &weights.ssm_beta,
+        weights.ssm_beta_ggml_type,
+        seq_len,
+        hidden_size,
+        n_v_heads,
+    )?;
+    enc.memory_barrier();
+
+    let n_q_elems = (seq_len * n_k_heads * d_k) as usize;
+    let q_scaled = alloc_f32(n_q_elems, "scaled Q")?;
+    let g_n = (seq_len * n_v_heads) as usize;
+    let g_buf = alloc_f32(g_n, "g")?;
+    let beta_buf = alloc_f32(g_n, "beta")?;
+    let mut g_params_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        2 * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![2],
+    )
+    .map_err(|error| anyhow!("Qwen batched DeltaNet g/beta params allocation: {error}"))?;
+    g_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched DeltaNet g/beta params: {error}"))?
+        .copy_from_slice(&[n_v_heads, seq_len]);
+    scalar_mul_f32(
+        enc,
+        registry,
+        device.metal_device(),
+        &q_l2,
+        &q_scaled,
+        n_q_elems,
+        1.0 / (dk as f32).sqrt(),
+    )
+    .context("Qwen batched DeltaNet Q scale")?;
+    dispatch_compute_g_beta(
+        enc,
+        registry,
+        device.metal_device(),
+        &alpha_logit_buf,
+        &beta_logit_buf,
+        &weights.ssm_dt_bias,
+        &weights.ssm_a,
+        &g_buf,
+        &beta_buf,
+        &g_params_buf,
+        seq_len,
+        n_v_heads,
+    )
+    .context("Qwen batched DeltaNet g/beta")?;
+    enc.memory_barrier();
+
+    let attn_out_buf = alloc_f32(seq_len as usize * v_sp, "recurrent output activations")?;
+    let gdn_params = GatedDeltaNetParams {
+        d_k,
+        d_v,
+        n_k_heads,
+        n_v_heads,
+        n_tokens,
+        n_seqs,
+    };
+    let mut gdn_params_buf = super::decode_pool::pooled_alloc_buffer(
+        device,
+        9 * std::mem::size_of::<u32>(),
+        DType::U32,
+        vec![9],
+    )
+    .map_err(|error| anyhow!("Qwen batched DeltaNet recurrent params allocation: {error}"))?;
+    gdn_params_buf
+        .as_mut_slice::<u32>()
+        .map_err(|error| anyhow!("Qwen batched DeltaNet recurrent params: {error}"))?
+        .copy_from_slice(&[d_k, d_v, n_k_heads, n_v_heads, n_tokens, n_seqs, 0, 0, 0]);
+    dispatch_gated_delta_net_decode(
+        enc,
+        registry,
+        device.metal_device(),
+        &q_scaled,
+        &k_normed,
+        &v_gpu,
+        &g_buf,
+        &beta_buf,
+        &batch_recurrent_in,
+        &attn_out_buf,
+        &batch_recurrent_out,
+        &gdn_params_buf,
+        gdn_params,
+    )
+    .context("Qwen batched DeltaNet recurrent update")?;
+    enc.memory_barrier();
+    for (row, slot_id) in slot_ids.iter().copied().enumerate() {
+        let (_, recurrent_write) = state_slot.recurrent_bufs_for_slot(slot_id);
+        let (recurrent_offset, recurrent_elements) =
+            slot_recurrent_region(slot_id, d_k, d_v, n_v_heads);
+        let recurrent_write = recurrent_write.slice_view(recurrent_offset, recurrent_elements);
+        dispatch_copy_f32(
+            enc,
+            registry,
+            device.metal_device(),
+            &batch_recurrent_out,
+            &recurrent_write,
+            row * recurrent_per_seq,
+            0,
+            recurrent_per_seq,
+        )
+        .context("scatter Qwen batched DeltaNet recurrent state")?;
+    }
+    enc.memory_barrier();
+
+    let rows_op8 = seq_len * n_v_heads;
+    let gated_buf = alloc_f32((rows_op8 * d_v) as usize, "gated output")?;
+    let mut op8_params = super::decode_pool::pooled_alloc_buffer(
+        device,
+        2 * std::mem::size_of::<f32>(),
+        DType::F32,
+        vec![2],
+    )
+    .map_err(|error| anyhow!("Qwen batched DeltaNet norm/gate params allocation: {error}"))?;
+    op8_params
+        .as_mut_slice::<f32>()
+        .map_err(|error| anyhow!("Qwen batched DeltaNet norm/gate params: {error}"))?
+        .copy_from_slice(&[rms_norm_eps, d_v as f32]);
+    dispatch_ssm_norm_gate(
+        enc,
+        registry,
+        device.metal_device(),
+        &attn_out_buf,
+        &weights.ssm_norm,
+        &z,
+        &gated_buf,
+        &op8_params,
+        rows_op8,
+        d_v,
+    )
+    .context("Qwen batched DeltaNet norm/gate")?;
+    enc.memory_barrier();
+    apply_proj_with_ggml_type(
+        enc,
+        registry,
+        device,
+        &gated_buf,
+        &weights.ssm_out,
+        weights.ssm_out_ggml_type,
+        seq_len,
+        z_channels,
+        hidden_size,
+    )
+}
+
 // ================================================================
 // Tests
 // ================================================================
@@ -4820,6 +5136,237 @@ mod tests {
             conv_kernel: 4,
             rms_norm_eps: 1e-6,
         }
+    }
+
+    #[test]
+    fn physical_batch_slot_regions_are_disjoint_and_byte_addressed() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let qkv_channels = 128_u32;
+        let k_minus_one = 3_u32;
+        let d_k = 32_u32;
+        let d_v = 64_u32;
+        let n_v_heads = 4_u32;
+        let conv_elements = (qkv_channels * k_minus_one) as usize;
+        let recurrent_elements = (d_k * d_v * n_v_heads) as usize;
+
+        for slot in [0_u32, 3, 15] {
+            let (conv_offset, conv_len) =
+                slot_conv_state_region(SlotId(slot), qkv_channels, k_minus_one);
+            assert_eq!(conv_len, conv_elements);
+            assert_eq!(
+                conv_offset,
+                slot as u64 * conv_elements as u64 * std::mem::size_of::<f32>() as u64
+            );
+
+            let (recurrent_offset, recurrent_len) =
+                slot_recurrent_region(SlotId(slot), d_k, d_v, n_v_heads);
+            assert_eq!(recurrent_len, recurrent_elements);
+            assert_eq!(
+                recurrent_offset,
+                slot as u64 * recurrent_elements as u64 * std::mem::size_of::<f32>() as u64
+            );
+        }
+    }
+
+    #[test]
+    fn rectangular_prefill_batch_matches_scalar_outputs_and_state() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let shape = DeltaNetLayerShape {
+            hidden_size: 256,
+            n_k_heads: 2,
+            n_v_heads: 2,
+            d_k: 128,
+            d_v: 128,
+            conv_kernel: 4,
+            rms_norm_eps: 1e-6,
+        };
+        let weights_cpu = synthetic_weights(shape, 0xA049_B201);
+        let qkv_channels = shape.qkv_channels();
+        let weights = DeltaNetWeightsGpu::from_cpu_f32(
+            &weights_cpu,
+            &device,
+            shape.conv_kernel as usize,
+            qkv_channels as usize,
+        )
+        .expect("upload weights");
+        let physical_slots = 5_usize;
+        let selected = [SlotId(3), SlotId(1), SlotId(4), SlotId(0)];
+        let n_seqs = selected.len();
+        let n_tokens = 128_u32;
+        let rows = n_seqs * n_tokens as usize;
+        let hidden = shape.hidden_size as usize;
+        let recurrent_per_seq = (shape.d_k * shape.d_v * shape.n_v_heads) as usize;
+        let conv_per_seq = (qkv_channels * (shape.conv_kernel - 1)) as usize;
+        let mut seed = 0xA049_B202;
+        let input = mk_rand(&mut seed, rows * hidden, 0.05);
+        let recurrent_initial = mk_rand(&mut seed, physical_slots * recurrent_per_seq, 0.01);
+        let conv_initial = mk_rand(&mut seed, physical_slots * conv_per_seq, 0.01);
+        let recurrent_write_initial = mk_rand(&mut seed, physical_slots * recurrent_per_seq, 0.02);
+        let conv_write_initial = mk_rand(&mut seed, physical_slots * conv_per_seq, 0.02);
+        let mut batch_state = LinearAttnStateSlot {
+            conv_state: upload_f32(&conv_initial, &device).expect("batch conv current"),
+            conv_state_scratch: upload_f32(&conv_write_initial, &device)
+                .expect("batch conv write initial"),
+            recurrent: upload_f32(&recurrent_initial, &device).expect("batch recurrent current"),
+            recurrent_scratch: upload_f32(&recurrent_write_initial, &device)
+                .expect("batch recurrent write initial"),
+            capture_states: None,
+            conv_capture_states: None,
+            pp_flipped: vec![false; physical_slots],
+            write_generation: vec![0; physical_slots],
+        };
+        let input_gpu = upload_f32(&input, &device).expect("batch input");
+        let mut enc = device.command_encoder().expect("batch encoder");
+        let batch_output = build_delta_net_layer_prefill_batched_into(
+            &mut enc,
+            &device,
+            &mut registry,
+            &input_gpu,
+            &weights,
+            &batch_state,
+            &selected,
+            n_tokens,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
+            shape.conv_kernel,
+            shape.rms_norm_eps,
+        )
+        .expect("rectangular batch");
+        enc.commit_and_wait_labeled("test.qwen.rectangular_delta")
+            .expect("wait rectangular batch");
+        let batch_output = download_f32(&batch_output).expect("download batch output");
+        let batch_recurrent_all =
+            download_f32(&batch_state.recurrent_scratch).expect("download batch recurrent");
+        let batch_conv_all =
+            download_f32(&batch_state.conv_state_scratch).expect("download batch conv");
+        let mut batch_recurrent = Vec::with_capacity(n_seqs * recurrent_per_seq);
+        let mut batch_conv = Vec::with_capacity(n_seqs * conv_per_seq);
+        for slot in selected {
+            let recurrent_start = slot.0 as usize * recurrent_per_seq;
+            batch_recurrent.extend_from_slice(
+                &batch_recurrent_all[recurrent_start..recurrent_start + recurrent_per_seq],
+            );
+            let conv_start = slot.0 as usize * conv_per_seq;
+            batch_conv.extend_from_slice(&batch_conv_all[conv_start..conv_start + conv_per_seq]);
+        }
+        let peer = SlotId(2);
+        let peer_recurrent_start = peer.0 as usize * recurrent_per_seq;
+        let peer_conv_start = peer.0 as usize * conv_per_seq;
+        assert_eq!(
+            batch_recurrent_all[peer_recurrent_start..peer_recurrent_start + recurrent_per_seq]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            recurrent_write_initial[peer_recurrent_start..peer_recurrent_start + recurrent_per_seq]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "unselected peer recurrent write state changed"
+        );
+        assert_eq!(
+            batch_conv_all[peer_conv_start..peer_conv_start + conv_per_seq]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            conv_write_initial[peer_conv_start..peer_conv_start + conv_per_seq]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "unselected peer convolution write state changed"
+        );
+
+        let mut scalar_output = Vec::with_capacity(rows * hidden);
+        let mut scalar_recurrent = Vec::with_capacity(n_seqs * recurrent_per_seq);
+        let mut scalar_conv = Vec::with_capacity(n_seqs * conv_per_seq);
+        for (sequence, slot) in selected.iter().copied().enumerate() {
+            let row_start = sequence * n_tokens as usize * hidden;
+            let row_end = row_start + n_tokens as usize * hidden;
+            let recurrent_start = slot.0 as usize * recurrent_per_seq;
+            let conv_start = slot.0 as usize * conv_per_seq;
+            let scalar_input =
+                upload_f32(&input[row_start..row_end], &device).expect("scalar input");
+            let recurrent_in = upload_f32(
+                &recurrent_initial[recurrent_start..recurrent_start + recurrent_per_seq],
+                &device,
+            )
+            .expect("scalar recurrent current");
+            let recurrent_out =
+                upload_f32(&vec![0.0; recurrent_per_seq], &device).expect("scalar recurrent write");
+            let conv_in = upload_f32(
+                &conv_initial[conv_start..conv_start + conv_per_seq],
+                &device,
+            )
+            .expect("scalar conv current");
+            let conv_out =
+                upload_f32(&vec![0.0; conv_per_seq], &device).expect("scalar conv write");
+            let output = build_delta_net_layer(
+                &device,
+                &mut registry,
+                &scalar_input,
+                &weights,
+                &conv_in,
+                &conv_out,
+                &recurrent_in,
+                &recurrent_out,
+                n_tokens,
+                shape.hidden_size,
+                shape.n_k_heads,
+                shape.n_v_heads,
+                shape.d_k,
+                shape.d_v,
+                shape.conv_kernel,
+                shape.rms_norm_eps,
+                None,
+                None,
+                SlotId(0),
+            )
+            .expect("scalar prefill");
+            device
+                .command_encoder()
+                .expect("scalar wait encoder")
+                .commit_and_wait()
+                .expect("wait scalar prefill");
+            scalar_output.extend(download_f32(&output).expect("download scalar output"));
+            scalar_recurrent
+                .extend(download_f32(&recurrent_out).expect("download scalar recurrent"));
+            scalar_conv.extend(download_f32(&conv_out).expect("download scalar conv"));
+        }
+
+        let assert_exact = |actual: &[f32], expected: &[f32], label: &str| {
+            assert_eq!(actual.len(), expected.len(), "{label} length");
+            let bit_differences = actual
+                .iter()
+                .zip(expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let max_error = actual
+                .iter()
+                .zip(expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert_eq!(
+                bit_differences, 0,
+                "{label} rectangular-vs-scalar bit_differences={bit_differences}, \
+                 max_abs_err={max_error:.3e}"
+            );
+        };
+        assert_exact(&batch_output, &scalar_output, "DeltaNet output");
+        assert_exact(
+            &batch_recurrent,
+            &scalar_recurrent,
+            "DeltaNet recurrent state",
+        );
+        assert_exact(&batch_conv, &scalar_conv, "DeltaNet convolution state");
+
+        for slot in selected {
+            batch_state.swap_for_slot(slot);
+        }
+        assert_eq!(batch_state.pp_flipped, vec![true, true, false, true, true]);
     }
 
     #[test]

@@ -317,10 +317,21 @@ impl Deepseek4Model {
                     .context("plan DeepSeek-V4 cooperative prefill transaction")
             })
             .collect::<Result<Vec<_>>>()?;
+        self.begin_moe_transaction()?;
         let (states, submitted_any) =
             self.forward_verifier_prefill_cohort_uncommitted(token_batches, caches, &spans, layout);
         let states = match states {
-            Ok(states) => states,
+            Ok(states) => {
+                if let Err(error) = self.ensure_moe_transaction_clean() {
+                    for cache in caches.iter_mut() {
+                        cache.poison();
+                    }
+                    return Err(error).context(
+                        "DeepSeek-V4 cooperative prefill produced invalid MoE state; caches poisoned",
+                    );
+                }
+                states
+            }
             Err(error) => {
                 if submitted_any {
                     for cache in caches.iter_mut() {
@@ -367,6 +378,7 @@ impl Deepseek4Model {
         if profile_stages {
             mlx_native::kernel_profile::reset();
         }
+        self.begin_moe_transaction()?;
         let result = self.forward_verifier_prefill_uncommitted(token_ids, cache, &span);
         if profile_stages {
             eprintln!(
@@ -385,6 +397,11 @@ impl Deepseek4Model {
         }
         match result {
             Ok(state) => {
+                if let Err(error) = self.ensure_moe_transaction_clean() {
+                    cache.poison();
+                    return Err(error)
+                        .context("DeepSeek-V4 prefill produced invalid MoE state; cache poisoned");
+                }
                 publish_prefill_cache_after_gate(
                     cache,
                     span.start_position,
@@ -961,9 +978,16 @@ impl Deepseek4Model {
         commit_gate: impl FnOnce() -> Result<()>,
     ) -> Result<MlxBuffer> {
         let position = cache.position();
+        self.begin_moe_transaction()?;
         let result = self.forward_verifier_one_uncommitted(token_id, cache);
         match result {
             Ok(state) => {
+                if let Err(error) = self.ensure_moe_transaction_clean() {
+                    cache.poison();
+                    return Err(error).context(
+                        "DeepSeek-V4 verifier token produced invalid MoE state; cache poisoned",
+                    );
+                }
                 publish_verifier_cache_after_gate(cache, position, commit_gate)?;
                 Ok(state)
             }

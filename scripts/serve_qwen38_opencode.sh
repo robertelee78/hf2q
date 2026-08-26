@@ -13,17 +13,19 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/hf2q_q5_policy.sh
+source "$script_dir/hf2q_q5_policy.sh"
+hf2q_resolve_q5k_canonical_policy
 
 export MODEL="${MODEL:-/opt/hf2q/models/qwen3.8/Qwen3.8-27B-Abliterated-SFT-Q4_K_M.gguf}"
 export MMPROJ="${MMPROJ:-${MODEL%.gguf}-mmproj.gguf}"
 export VISION_MODE="${QWEN38_VISION:-required}"
 export HF2Q_QWEN_SPECULATION="${QWEN38_SPECULATION:-auto}"
-# Qwen3.8 K=3 verifies four target positions at once. The native qL4
-# decision/cache gate and matched ABBA receipt qualify the weight-amortized
-# K-quant width-four route here. Process-wide mlx-native defaults remain
-# unchanged outside this family launcher.
-export HF2Q_DECODE_MVN="${HF2Q_DECODE_MVN:-0}"
-export HF2Q_DECODE_MV_EXT="${HF2Q_DECODE_MV_EXT:-1}"
+# Qwen3.8 K=3 verifies four target positions at once. The verifier uses the
+# shared coherent K-quant routing policy; a model label must not select a
+# width-dependent reduction tree. The canonical Q5 policy is resolved and
+# exported above so this launcher and every later model swap share one value.
+# Nonzero MV_EXT remains an explicit experimental/inexact override.
 
 case "$HF2Q_QWEN_SPECULATION" in
     off|auto) ;;
@@ -32,15 +34,20 @@ case "$HF2Q_QWEN_SPECULATION" in
         exit 3
         ;;
 esac
-case "$HF2Q_DECODE_MVN:$HF2Q_DECODE_MV_EXT" in
-    0:1|0:0|1:0|1:1) ;;
-    *)
-        echo "HF2Q_DECODE_MVN and HF2Q_DECODE_MV_EXT must each be 0 or 1" >&2
+for route_var in HF2Q_DECODE_MVN HF2Q_DECODE_MV_EXT; do
+    route_value=${!route_var-}
+    if [[ -n "$route_value" && "$route_value" != 0 && "$route_value" != 1 ]]; then
+        echo "$route_var must be 0 or 1 when explicitly set" >&2
         exit 3
-        ;;
-esac
+    fi
+done
+if [[ "$HF2Q_QWEN_SPECULATION" == auto && "${HF2Q_DECODE_MV_EXT:-0}" == 1 ]]; then
+    echo "HF2Q_DECODE_MV_EXT=1 is not exact across scalar and width-four target routes; set QWEN38_SPECULATION=off for that experiment" >&2
+    exit 3
+fi
 
 echo "Qwen3.8 exact speculation policy: $HF2Q_QWEN_SPECULATION" >&2
-echo "Qwen3.8 K-quant width routing: mvN=$HF2Q_DECODE_MVN mv_ext=$HF2Q_DECODE_MV_EXT" >&2
+echo "Qwen3.8 K-quant routing: q5_canonical=$HF2Q_Q5K_CANONICAL_Q4X4 mvN=${HF2Q_DECODE_MVN:-native-default} mv_ext=${HF2Q_DECODE_MV_EXT:-native-default}" >&2
 
-exec "$script_dir/serve_qwen36_opencode.sh"
+exec env HF2Q_Q5K_CANONICAL_Q4X4="$HF2Q_Q5K_CANONICAL_Q4X4" \
+    "$script_dir/serve_qwen36_opencode.sh"

@@ -27,8 +27,20 @@ setup_thermal="$tmp_dir/loaded-setup-thermal.log"
 setup_contention="$tmp_dir/loaded-setup-contention.log"
 setup_memory="$tmp_dir/loaded-setup-memory.log"
 loaded_idle_memory="$tmp_dir/loaded-idle-memory.log"
+dependency_receipt="$tmp_dir/dependency-provenance.json"
 
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+mlx_native_version=9.8.7
+jq -n --arg version "$mlx_native_version" '{
+  schema_version:1,status:"pass",
+  package:{source:"packed-crate",crate_sha256:("c" * 64)},
+  build:{cargo_target_checkout_disjoint:true,
+    rust_build_override_env_cleared:true},
+  dependency:{name:"mlx-native",version:$version,requirement:("=" + $version),
+    source:"registry+https://github.com/rust-lang/crates.io-index",
+    checksum:("d" * 64)}
+}' >"$dependency_receipt"
+dependency_receipt_sha=$(sha256_file "$dependency_receipt")
 thermal_probe_source_sha=$(sha256_file "$ROOT_DIR/scripts/macos_thermal_probe.swift")
 thermal_probe_compiler_sha=abababababababababababababababababababababababababababababababab
 thermal_probe_binary_sha=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
@@ -238,11 +250,13 @@ write_summary() {
     --argjson setup_duration "$setup_duration" \
     --argjson setup_fair "$setup_fair" --argjson setup_gaps "$setup_gaps" \
     --argjson setup_nominal_tail "$setup_nominal_tail" \
+    --arg mlx_native_version "$mlx_native_version" \
     --argjson setup_memory_json "$setup_memory_json" \
     --argjson loaded_idle_memory_json "$loaded_idle_memory_json" \
     --argjson measurement_memory_json "$measurement_memory_json" '
     . + {schema_version:6,source_sha:$source_sha,model_sha256:$model_sha256,
-      mlx_native_version:"0.11.2",producer_exit_code:0,raw_sha256:$raw_sha256,
+      mlx_native_version:$mlx_native_version,producer_exit_code:0,
+      raw_sha256:$raw_sha256,
       test_log_sha256:$test_log_sha256,
       phase_evidence:{policy:"fsynced-run-bound-markers-v1",run_uuid:$run_uuid,
         producer_pid:$producer_pid,test_spawned_at:1940,log_sha256:$phase_log_sha256},
@@ -301,7 +315,8 @@ verify() {
     "$measurement_path" "$settle" "$source_sha" "$model_sha" \
     "$contention_measurement" "$contention_settle" "$memory_path" \
     "$phase_path" "$setup_thermal_path" "$setup_contention" \
-    "$setup_memory_path" "$loaded_idle_memory_path"
+    "$setup_memory_path" "$loaded_idle_memory_path" "$dependency_receipt" \
+    "$dependency_receipt_sha"
 }
 
 write_summary "$summary"
@@ -324,6 +339,7 @@ expect_reject() {
 for mutation in \
   '.schema_version = 5' \
   '.benchmark.speedup = 1' \
+  '.mlx_native_version = "9.8.6"' \
   '.producer_exit_code = 1' \
   '.measurement_samples += 1' \
   '.raw_sha256 = ("0" * 64)' \
@@ -555,7 +571,7 @@ if bash "$VERIFY" "$tmp_dir/delayed-summary.json" "$raw" "$test_log" \
     "$model_sha" "$tmp_dir/delayed-contention.log" \
     "$contention_settle" "$tmp_dir/delayed-memory.log" "$phase_log" \
     "$setup_thermal" "$setup_contention" "$setup_memory" \
-    "$loaded_idle_memory" \
+    "$loaded_idle_memory" "$dependency_receipt" "$dependency_receipt_sha" \
     >/dev/null 2>&1; then
   echo "decode-cohort verifier accepted a detached loaded nominal tail" >&2
   exit 1
@@ -640,8 +656,21 @@ if bash "$VERIFY" "$tmp_dir/contended-summary.json" "$raw" "$test_log" \
     "$measurement" "$settle" "$source_sha" "$model_sha" \
     "$tmp_dir/contended.log" "$contention_settle" "$memory_log" "$phase_log" \
     "$setup_thermal" "$setup_contention" "$setup_memory" \
-    "$loaded_idle_memory" >/dev/null 2>&1; then
+    "$loaded_idle_memory" "$dependency_receipt" "$dependency_receipt_sha" \
+    >/dev/null 2>&1; then
   echo "decode-cohort verifier accepted host contention" >&2
+  exit 1
+fi
+
+jq '.dependency.version = "9.8.6" | .dependency.requirement = "=9.8.6"' \
+  "$dependency_receipt" >"$tmp_dir/mutated-dependency.json"
+if bash "$VERIFY" "$summary" "$raw" "$test_log" "$measurement" "$settle" \
+    "$source_sha" "$model_sha" "$contention_measurement" \
+    "$contention_settle" "$memory_log" "$phase_log" "$setup_thermal" \
+    "$setup_contention" "$setup_memory" "$loaded_idle_memory" \
+    "$tmp_dir/mutated-dependency.json" "$dependency_receipt_sha" \
+    >/dev/null 2>&1; then
+  echo "decode-cohort verifier accepted a mutated verified dependency receipt" >&2
   exit 1
 fi
 

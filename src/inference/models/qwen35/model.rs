@@ -10,19 +10,22 @@
 //! - Global tensors: `token_embd`, `output_weight`, `output_norm`.
 
 use anyhow::{anyhow, ensure, Context, Result};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
 use super::gpu_delta_net::DeltaNetWeightsGpu;
-use super::gpu_full_attn::FullAttnWeightsGpu;
-use super::mtp::{load_mtp_weights_if_present_with_shared_head, MtpWeights};
-use super::weight_loader::{DenseFfnWeightsQ, MoeFfnWeightsQ};
+use super::gpu_full_attn::{FullAttnQGateWeightsGpu, FullAttnWeightsGpu};
+use super::mtp::{
+    load_mtp_weights_if_present_with_shared_head, MtpFfnWeightsGpu, MtpQGateWeightsGpu, MtpWeights,
+};
+use super::weight_loader::{DenseFfnWeightsNative, DenseFfnWeightsQ, MoeFfnWeightsQ};
 use super::{weight_loader, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
 use crate::serve::forward_mlx_shared::MlxQWeight;
 
 use mlx_native::gguf::GgufFile;
-use mlx_native::MlxDevice;
+use mlx_native::MlxBuffer;
 
 // ================================================================
 // Layer weight enums
@@ -33,6 +36,8 @@ use mlx_native::MlxDevice;
 /// expert. Exactly one variant is populated per layer per model.
 pub enum Qwen35FfnWeights {
     Dense(DenseFfnWeights),
+    /// Production dense SwiGLU with F32/F16/BF16 GGUF storage retained.
+    DenseNative(DenseFfnWeightsNative),
     /// Quantized dense SwiGLU weights loaded directly from GGUF (production path).
     /// Gate/up/down tensors stay in GGML block format on the Metal device;
     /// no F32 expansion occurs during load. Used for 27B dense DWQ GGUFs.
@@ -49,6 +54,7 @@ impl Qwen35FfnWeights {
     pub fn variant(&self) -> &'static str {
         match self {
             Qwen35FfnWeights::Dense(_) => "dense",
+            Qwen35FfnWeights::DenseNative(_) => "dense-native",
             Qwen35FfnWeights::DenseQ(_) => "dense-q",
             Qwen35FfnWeights::Moe(_) => "moe",
             Qwen35FfnWeights::MoeQ(_) => "moe-q",
@@ -129,6 +135,17 @@ impl Qwen35LayerWeights {
 /// or [`Qwen35Model::empty_from_cfg`] for tests that construct zero-weight
 /// models of a given shape.
 pub struct Qwen35Model {
+    /// Monotonic identity for every loaded/constructed model instance. GPU
+    /// caches and immutable activation plans use this instead of trusting a
+    /// potentially-reused heap address across A→B→A model swaps.
+    pub(super) activation_epoch: u64,
+    /// Set only after the complete dense/expert route union has frozen. An
+    /// overlay changes representation identity and therefore cannot be
+    /// applied after this point without constructing a new model instance.
+    pub(super) native_routes_activated: AtomicBool,
+    /// Routing choices resolved once for this model lifetime. Every registry
+    /// serving this instance is bound to this exact value before dispatch.
+    pub(super) ggml_routing_policy: mlx_native::GgmlRoutingPolicy,
     pub cfg: Qwen35Config,
     /// Per-layer weight bundles. `len() == cfg.num_hidden_layers`.
     pub layers: Vec<Qwen35LayerWeights>,
@@ -157,6 +174,10 @@ pub struct Qwen35Model {
     pub tied_word_embeddings: bool,
     /// Final-layer RMSNorm weight, shape `[hidden_size]`.
     pub output_norm: Vec<f32>,
+    /// Exact file-backed F32 view of `output_norm.weight` for production GGUF
+    /// inference. Synthetic/source-tensor constructors retain `output_norm`
+    /// alone and leave this absent.
+    pub output_norm_native: Option<MlxBuffer>,
     /// Optional MTP draft block. Executed only by speculative decoding, never
     /// by the verifier's main layer loop.
     pub mtp: Option<MtpWeights>,
@@ -164,6 +185,170 @@ pub struct Qwen35Model {
     /// loading remains behaviorally unchanged until it opts into that path.
     #[cfg(test)]
     pub(super) loaded_candidate_identity: Option<Qwen35LoadedCandidateIdentity>,
+}
+
+fn push_native_weight<'a>(weight: &'a MlxQWeight, buffers: &mut Vec<&'a MlxBuffer>) {
+    buffers.push(&weight.buffer);
+    if let Some(affine) = weight.affine.as_ref() {
+        buffers.push(&affine.scales);
+        buffers.push(&affine.biases);
+    }
+}
+
+fn push_q_gate<'a>(q_gate: &'a FullAttnQGateWeightsGpu, buffers: &mut Vec<&'a MlxBuffer>) {
+    match q_gate {
+        FullAttnQGateWeightsGpu::Split { wq, w_gate, .. } => {
+            buffers.push(wq);
+            buffers.push(w_gate);
+        }
+        FullAttnQGateWeightsGpu::Fused { weight, .. } => buffers.push(weight),
+    }
+}
+
+fn push_native_moe<'a>(weights: &'a MoeFfnWeightsQ, buffers: &mut Vec<&'a MlxBuffer>) {
+    push_native_weight(&weights.router, buffers);
+    buffers.extend([
+        &weights.expert_gate_q,
+        &weights.expert_up_q,
+        &weights.expert_down_q,
+    ]);
+    push_native_weight(&weights.shared_gate_logit, buffers);
+    push_native_weight(&weights.shared_gate, buffers);
+    push_native_weight(&weights.shared_up, buffers);
+    push_native_weight(&weights.shared_down, buffers);
+    for affine in [
+        weights.expert_gate_affine.as_ref(),
+        weights.expert_up_affine.as_ref(),
+        weights.expert_down_affine.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        buffers.extend([&affine.weight, &affine.scales, &affine.biases]);
+    }
+}
+
+fn push_gpu_moe<'a>(
+    weights: &'a super::gpu_ffn::MoeFfnWeightsGpuQ,
+    buffers: &mut Vec<&'a MlxBuffer>,
+) {
+    push_native_weight(&weights.router, buffers);
+    buffers.extend([
+        &weights.expert_gate_q,
+        &weights.expert_up_q,
+        &weights.expert_down_q,
+    ]);
+    push_native_weight(&weights.shared_gate_inp, buffers);
+    push_native_weight(&weights.shared_gate, buffers);
+    push_native_weight(&weights.shared_up, buffers);
+    push_native_weight(&weights.shared_down, buffers);
+    for affine in [
+        weights.expert_gate_affine.as_ref(),
+        weights.expert_up_affine.as_ref(),
+        weights.expert_down_affine.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        buffers.extend([&affine.weight, &affine.scales, &affine.biases]);
+    }
+}
+
+fn push_native_ffn<'a>(weights: &'a Qwen35FfnWeights, buffers: &mut Vec<&'a MlxBuffer>) {
+    match weights {
+        Qwen35FfnWeights::DenseNative(weights) => {
+            buffers.extend([&weights.gate, &weights.up, &weights.down]);
+        }
+        Qwen35FfnWeights::DenseQ(weights) => {
+            buffers.extend([&weights.gate_q, &weights.up_q, &weights.down_q]);
+        }
+        Qwen35FfnWeights::MoeQ(weights) => push_native_moe(weights, buffers),
+        Qwen35FfnWeights::Dense(_) | Qwen35FfnWeights::Moe(_) => {}
+    }
+}
+
+fn push_mtp_matrices<'a>(mtp: &'a MtpWeights, buffers: &mut Vec<&'a MlxBuffer>) {
+    buffers.push(&mtp.eh_proj);
+    if let Some(embed_tokens) = mtp.embed_tokens.as_ref() {
+        push_native_weight(embed_tokens, buffers);
+    }
+    buffers.push(&mtp.shared_head_head);
+    match &mtp.attn.q_gate {
+        MtpQGateWeightsGpu::Ungated { wq, .. } => buffers.push(wq),
+        MtpQGateWeightsGpu::Gated(q_gate) => push_q_gate(q_gate, buffers),
+    }
+    buffers.extend([&mtp.attn.wk, &mtp.attn.wv, &mtp.attn.wo]);
+    match &mtp.ffn {
+        MtpFfnWeightsGpu::Dense { weights, .. } => {
+            buffers.extend([&weights.gate, &weights.up, &weights.down]);
+        }
+        MtpFfnWeightsGpu::DenseQ { weights } => {
+            buffers.extend([&weights.gate_q, &weights.up_q, &weights.down_q]);
+        }
+        MtpFfnWeightsGpu::Moe { weights, .. } => push_gpu_moe(weights, buffers),
+    }
+}
+
+fn push_mtp_f32_state<'a>(mtp: &'a MtpWeights, buffers: &mut Vec<&'a MlxBuffer>) {
+    buffers.extend([
+        &mtp.enorm,
+        &mtp.hnorm,
+        &mtp.shared_head_norm,
+        &mtp.attn.attn_norm,
+        &mtp.attn.post_attn_norm,
+        &mtp.attn.attn_q_norm,
+        &mtp.attn.attn_k_norm,
+    ]);
+}
+
+fn verify_native_matrix_storage(
+    storage: crate::serve::forward_mlx_shared::NativeMatrixStorageSummary,
+    expected_tensor_count: usize,
+    expected_bytes: u64,
+) -> Result<()> {
+    ensure!(
+        storage.unique_matrix_views == expected_tensor_count,
+        "production Qwen matrix visitor covered {} unique views, but preflight requires {} tensors",
+        storage.unique_matrix_views,
+        expected_tensor_count
+    );
+    ensure!(
+        storage.resident_bytes() == expected_bytes,
+        "production Qwen matrix visitor accounted {} bytes, but preflight requires {}",
+        storage.resident_bytes(),
+        expected_bytes
+    );
+    ensure!(
+        storage.anonymous_bytes == 0,
+        "production Qwen load created {} anonymous matrix bytes",
+        storage.anonymous_bytes
+    );
+    Ok(())
+}
+
+fn verify_native_f32_state_storage(
+    storage: crate::serve::forward_mlx_shared::NativeMatrixStorageSummary,
+    expected_tensor_count: usize,
+    expected_bytes: u64,
+) -> Result<()> {
+    ensure!(
+        storage.unique_matrix_views == expected_tensor_count,
+        "production Qwen F32-state visitor covered {} unique views, but preflight requires {} tensors",
+        storage.unique_matrix_views,
+        expected_tensor_count
+    );
+    ensure!(
+        storage.resident_bytes() == expected_bytes,
+        "production Qwen F32-state visitor accounted {} bytes, but preflight requires {}",
+        storage.resident_bytes(),
+        expected_bytes
+    );
+    ensure!(
+        storage.anonymous_bytes == 0,
+        "production Qwen load created {} anonymous source-state bytes",
+        storage.anonymous_bytes
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -174,10 +359,29 @@ pub(super) struct Qwen35LoadedCandidateIdentity {
 }
 
 impl Qwen35Model {
+    pub(super) fn next_activation_epoch() -> u64 {
+        static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+        let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(epoch, 0, "Qwen activation epoch exhausted");
+        epoch
+    }
+
+    pub(super) fn activation_epoch(&self) -> u64 {
+        self.activation_epoch
+    }
+
     /// Parse only the [`Qwen35Config`] from a GGUF without allocating
     /// weights. Cheap — useful for introspection (e.g. `hf2q info`).
     pub fn load_config_only(gguf: &GgufFile) -> Result<Qwen35Config> {
         Qwen35Config::from_gguf(gguf).context("Qwen35Config::from_gguf")
+    }
+
+    /// Validate the complete GGUF tensor schema and every native execution
+    /// route without creating a Metal device or reading tensor payloads.
+    pub fn preflight_gguf(gguf: &GgufFile, cfg: &Qwen35Config) -> Result<()> {
+        super::gguf_preflight::preflight_qwen35_gguf(gguf, cfg)
+            .context("Qwen35 GGUF tensor/native-route preflight")?;
+        Ok(())
     }
 
     /// Construct a zero-weighted model of the shape prescribed by `cfg`.
@@ -206,6 +410,9 @@ impl Qwen35Model {
         }
 
         Self {
+            activation_epoch: Self::next_activation_epoch(),
+            native_routes_activated: AtomicBool::new(false),
+            ggml_routing_policy: mlx_native::ggml_routing_policy_from_environment(),
             layers,
             token_embd: vec![0.0f32; vocab * h],
             token_embd_native: None,
@@ -213,6 +420,7 @@ impl Qwen35Model {
             output_weight_native: None,
             tied_word_embeddings: false,
             output_norm: vec![1.0f32; h],
+            output_norm_native: None,
             mtp: None,
             #[cfg(test)]
             loaded_candidate_identity: None,
@@ -276,6 +484,79 @@ impl Qwen35Model {
             .map(|output| (output, "output.weight")))
     }
 
+    /// Exact logical-byte accounting for production matrix storage. Tied
+    /// heads and MTP aliases are de-duplicated by Metal allocation range;
+    /// elementwise norms/state are intentionally outside this matrix ledger.
+    pub fn native_matrix_storage_summary(
+        &self,
+    ) -> Result<crate::serve::forward_mlx_shared::NativeMatrixStorageSummary> {
+        let mut buffers = Vec::new();
+        if let Some(token_embedding) = self.token_embd_native.as_ref() {
+            push_native_weight(token_embedding, &mut buffers);
+        }
+        if let Some(output) = self.output_weight_native.as_ref() {
+            push_native_weight(output, &mut buffers);
+        }
+        for layer in &self.layers {
+            match layer {
+                Qwen35LayerWeights::NativeFullAttn { attn, .. } => {
+                    push_q_gate(&attn.q_gate, &mut buffers);
+                    buffers.extend([&attn.wk, &attn.wv, &attn.wo]);
+                }
+                Qwen35LayerWeights::NativeLinearAttn { attn, .. } => {
+                    buffers.extend([
+                        &attn.attn_qkv,
+                        &attn.attn_gate,
+                        &attn.ssm_conv1d,
+                        &attn.ssm_alpha,
+                        &attn.ssm_beta,
+                        &attn.ssm_out,
+                    ]);
+                }
+                Qwen35LayerWeights::FullAttn { .. } | Qwen35LayerWeights::LinearAttn { .. } => {}
+            }
+            push_native_ffn(layer.ffn(), &mut buffers);
+        }
+        if let Some(mtp) = self.mtp.as_ref() {
+            push_mtp_matrices(mtp, &mut buffers);
+        }
+        crate::serve::forward_mlx_shared::summarize_native_matrix_storage(buffers)
+    }
+
+    /// Exact logical-byte accounting for source F32 state retained by a
+    /// production GGUF model. CPU mirrors used by recurrent reference math
+    /// are deliberately outside this GPU-storage ledger.
+    pub fn native_f32_state_storage_summary(
+        &self,
+    ) -> Result<crate::serve::forward_mlx_shared::NativeMatrixStorageSummary> {
+        let mut buffers = Vec::new();
+        if let Some(output_norm) = self.output_norm_native.as_ref() {
+            buffers.push(output_norm);
+        }
+        for layer in &self.layers {
+            match layer {
+                Qwen35LayerWeights::NativeFullAttn { attn, .. } => buffers.extend([
+                    &attn.attn_norm,
+                    &attn.post_attn_norm,
+                    &attn.attn_q_norm,
+                    &attn.attn_k_norm,
+                ]),
+                Qwen35LayerWeights::NativeLinearAttn { attn, .. } => buffers.extend([
+                    &attn.attn_norm,
+                    &attn.post_attn_norm,
+                    &attn.ssm_dt_bias,
+                    &attn.ssm_a,
+                    &attn.ssm_norm,
+                ]),
+                Qwen35LayerWeights::FullAttn { .. } | Qwen35LayerWeights::LinearAttn { .. } => {}
+            }
+        }
+        if let Some(mtp) = self.mtp.as_ref() {
+            push_mtp_f32_state(mtp, &mut buffers);
+        }
+        crate::serve::forward_mlx_shared::summarize_native_matrix_storage(buffers)
+    }
+
     #[cfg(test)]
     pub(crate) fn loaded_candidate_cache_identity(&self) -> Option<(&str, &str, &str)> {
         let identity = self.loaded_candidate_identity.as_ref()?;
@@ -324,14 +605,43 @@ impl Qwen35Model {
         gguf: &GgufFile,
         progress: &mut crate::serve::header::LoadProgress,
     ) -> Result<Self> {
+        let routing = super::ggml_routing_policy_for_gguf(gguf);
+        Self::load_from_gguf_with_routing_policy(gguf, progress, routing)
+    }
+
+    /// Load with the exact routing policy already resolved for this artifact.
+    /// The same value governs header-only capability admission, every model
+    /// registry, cache identity, and dispatch trace for the model lifetime.
+    pub(crate) fn load_from_gguf_with_routing_policy(
+        gguf: &GgufFile,
+        progress: &mut crate::serve::header::LoadProgress,
+        routing: mlx_native::GgmlRoutingPolicy,
+    ) -> Result<Self> {
         let mut cfg = Self::load_config_only(gguf)?;
 
-        let device =
-            MlxDevice::new().map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
+        // Admission is tensor- and operation-specific for dense and MoE.
+        // Run it before Metal device creation so malformed geometry or an
+        // unsupported codec cannot partially allocate a model or trigger a
+        // storage substitution later in the load.
+        let preflight =
+            super::gguf_preflight::preflight_qwen35_gguf_with_routing(gguf, &cfg, routing)
+                .context("preflight Qwen GGUF execution")?;
+
+        // This is the first allocation-backed operation in the loader. The
+        // helper tears down any Qwen activation previously cached on this
+        // thread before B's mapped weights/device can coexist with A's
+        // forward weights or scratch. Separate server generations use
+        // separate worker threads, but direct/test/reusable-worker entry
+        // points require this explicit same-thread boundary.
+        let device = super::forward_gpu::new_model_load_device()
+            .map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
+        let mapped = gguf
+            .map_tensor_data(&device)
+            .context("map Qwen GGUF tensor data once for model-scoped native views")?;
 
         let token_embd = Vec::new();
         let token_embd_native =
-            crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "token_embd.weight", &device)
+            crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, &mapped, "token_embd.weight")
                 .context("load native token_embd.weight")?;
         super::forward_gpu::ensure_native_embedding_admitted(&token_embd_native)
             .context("admit native token_embd.weight execution")?;
@@ -343,14 +653,26 @@ impl Qwen35Model {
             &token_embd_native.buffer,
         )?;
         let output_weight = Vec::new();
-        let output_norm = weight_loader::load_f32_tensor(gguf, "output_norm.weight", &device)
-            .context("load output_norm.weight")?;
+        let output_norm_native = weight_loader::map_f32_state_with_residency(
+            gguf,
+            &mapped,
+            "output_norm.weight",
+            &device,
+        )
+        .context("load exact output_norm.weight")?;
+        // The CPU mirror is retained for explicit CPU/reference consumers and
+        // execution evidence. GPU inference binds `output_norm_native`
+        // directly and never uploads a second anonymous weight buffer.
+        let output_norm = output_norm_native
+            .as_slice::<f32>()
+            .map_err(|error| anyhow!("read mapped output_norm.weight: {error}"))?
+            .to_vec();
         let tied_word_embeddings = gguf.tensor_info("output.weight").is_none();
         let output_weight_native = if tied_word_embeddings {
             None
         } else {
             let output =
-                crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, "output.weight", &device)
+                crate::serve::forward_mlx_shared::load_gguf_qweight(gguf, &mapped, "output.weight")
                     .context("load native output.weight")?;
             super::weight_pool::register_weight_buffer(&device, &output.buffer)
                 .context("register native output.weight")?;
@@ -391,26 +713,23 @@ impl Qwen35Model {
             cfg.vocab_size = output_head.info.rows as u32;
         }
 
-        let mtp =
-            load_mtp_weights_if_present_with_shared_head(gguf, &cfg, &device, Some(output_head))
-                .context("load_mtp_weights_if_present")?;
-
-        // MoE experts must retain their GGUF-quantized representation. An
-        // F16/F32 expert artifact would require a different native execution
-        // path; silently expanding it during load is not admitted.
-        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
-        if cfg.variant == Qwen35Variant::Moe {
-            if let Some(info) = gguf.tensor_info("blk.0.ffn_gate_exps.weight") {
-                if matches!(info.ggml_type, GgmlType::F16 | GgmlType::F32) {
-                    return Err(anyhow!(
-                        "qwen35moe load: MoE expert tensor 'blk.0.ffn_gate_exps.weight' \
-                         is dtype {:?}; native ggml-block quantization (Q4_0, Q5_K, Q6_K, Q8_0) \
-                         is required. Re-emit the GGUF with quantized MoE experts — no \
-                         F32-expansion fallback is permitted by the native-storage contract.",
-                        info.ggml_type
-                    ));
-                }
-            }
+        let activation_epoch = Self::next_activation_epoch();
+        let mut mtp = load_mtp_weights_if_present_with_shared_head(
+            gguf,
+            &mapped,
+            &cfg,
+            &device,
+            Some(output_head),
+        )
+        .context("load_mtp_weights_if_present")?;
+        if let Some(MtpWeights {
+            ffn: MtpFfnWeightsGpu::Moe { weights, .. },
+            ..
+        }) = mtp.as_mut()
+        {
+            weights
+                .bind_activation_epoch(activation_epoch)
+                .context("bind Qwen MTP MoE activation")?;
         }
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers as usize);
@@ -427,17 +746,21 @@ impl Qwen35Model {
                 .get(i as usize)
                 .copied()
                 .ok_or_else(|| anyhow!("layer_idx {i} out of range"))?;
-            let ffn = weight_loader::load_ffn(gguf, &cfg, i, &device)
+            let ffn = weight_loader::load_ffn(gguf, &mapped, &cfg, i, &device)
                 .with_context(|| format!("load native FFN layer {i}"))?;
             let layer = match kind {
                 Qwen35LayerKind::FullAttention => Qwen35LayerWeights::NativeFullAttn {
-                    attn: weight_loader::load_full_attn_layer_native(gguf, &cfg, i, &device)
-                        .with_context(|| format!("load native full-attention layer {i}"))?,
+                    attn: weight_loader::load_full_attn_layer_native(
+                        gguf, &mapped, &cfg, i, &device,
+                    )
+                    .with_context(|| format!("load native full-attention layer {i}"))?,
                     ffn,
                 },
                 Qwen35LayerKind::LinearAttention => Qwen35LayerWeights::NativeLinearAttn {
-                    attn: weight_loader::load_delta_net_layer_native(gguf, &cfg, i, &device)
-                        .with_context(|| format!("load native DeltaNet layer {i}"))?,
+                    attn: weight_loader::load_delta_net_layer_native(
+                        gguf, &mapped, &cfg, i, &device,
+                    )
+                    .with_context(|| format!("load native DeltaNet layer {i}"))?,
                     ffn,
                 },
             };
@@ -449,7 +772,10 @@ impl Qwen35Model {
         // row. Mirrors the Gemma path's terminal-side hygiene.
         progress.finish();
 
-        Ok(Self {
+        let model = Self {
+            activation_epoch,
+            native_routes_activated: AtomicBool::new(false),
+            ggml_routing_policy: routing,
             cfg,
             layers,
             token_embd,
@@ -458,10 +784,43 @@ impl Qwen35Model {
             output_weight_native,
             tied_word_embeddings,
             output_norm,
+            output_norm_native: Some(output_norm_native),
             mtp,
             #[cfg(test)]
             loaded_candidate_identity: None,
-        })
+        };
+        let storage = model
+            .native_matrix_storage_summary()
+            .context("account Qwen native matrix storage")?;
+        verify_native_matrix_storage(
+            storage,
+            preflight.matrix_tensor_count,
+            preflight.matrix_bytes,
+        )?;
+        let state_storage = model
+            .native_f32_state_storage_summary()
+            .context("account Qwen native F32 state storage")?;
+        verify_native_f32_state_storage(
+            state_storage,
+            preflight.f32_state_tensor_count,
+            preflight.f32_state_bytes,
+        )?;
+        tracing::info!(
+            native_matrix_views = storage.unique_matrix_views,
+            native_matrix_file_backed_bytes = storage.file_backed_bytes,
+            native_matrix_anonymous_bytes = storage.anonymous_bytes,
+            native_f32_state_views = state_storage.unique_matrix_views,
+            native_f32_state_file_backed_bytes = state_storage.file_backed_bytes,
+            native_f32_state_anonymous_bytes = state_storage.anonymous_bytes,
+            "Qwen matrices retain exact scoped GGUF storage"
+        );
+        tracing::info!(
+            dense_decode_mvn = model.ggml_routing_policy.dense_decode_mvn,
+            dense_decode_mv_ext = model.ggml_routing_policy.dense_decode_mv_ext,
+            dense_q5k_canonical_q4x4 = model.ggml_routing_policy.dense_q5k_canonical_q4x4,
+            "frozen Qwen GGML routing policy"
+        );
+        Ok(model)
     }
 
     /// Report the active FFN variant (Dense or Moe) determined by config.
@@ -524,6 +883,10 @@ impl Qwen35Model {
         device: &mlx_native::MlxDevice,
         path: &std::path::Path,
     ) -> anyhow::Result<usize> {
+        ensure!(
+            !self.native_routes_activated.load(Ordering::Acquire),
+            "qwen35 DWQ overlay cannot mutate weights after native routes are activated; reload the model with the overlay"
+        );
         use crate::core::mlx_safetensors_loader::MlxAffineLinear;
         use crate::serve::forward_mlx_shared::{
             parse_dwq_moe_expert_role, parse_dwq_overlay_metadata, MlxAffineMoeStack, MoeBaseRole,
@@ -1098,7 +1461,8 @@ fn overwrite_dense_ffn_q4_0_linear(
     };
     // Native ggml type gate: trainer validated against Q4_0 only.
     let native_t = match role {
-        DenseFfnRole::Gate | DenseFfnRole::Up => dq.ggml_type_gate_up,
+        DenseFfnRole::Gate => dq.ggml_type_gate,
+        DenseFfnRole::Up => dq.ggml_type_up,
         DenseFfnRole::Down => dq.ggml_type_down,
     };
     if native_t != GgmlType::Q4_0 {
@@ -1275,6 +1639,47 @@ mod tests {
     use crate::inference::models::qwen35::{
         default_layer_types, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant,
     };
+    use mlx_native::MlxDevice;
+
+    #[test]
+    fn production_gguf_state_loaders_bind_exact_mapped_f32_views() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let loader = include_str!("weight_loader.rs");
+        let native = loader
+            .split_once("pub fn load_full_attn_layer_native")
+            .expect("native Qwen layer loader")
+            .1
+            .split_once("pub fn load_global_tensors")
+            .expect("CPU-reference loader boundary")
+            .0;
+        assert!(native.contains("map_f32_state_with_residency"));
+        assert!(!native.contains("load_f32_tensor"));
+        assert!(!native.contains("upload_f32_weight"));
+
+        let mtp = include_str!("mtp_weights_load.rs");
+        assert!(mtp.contains("map_f32_state_with_residency"));
+        assert!(!mtp.contains("load_f32_tensor"));
+        assert!(!mtp.contains("upload_f32_weight"));
+
+        let mapped_helper = loader
+            .split_once("pub(super) fn map_f32_state_with_residency")
+            .expect("mapped F32-state helper")
+            .1
+            .split_once("fn map_tensor_with_residency")
+            .expect("mapped state helper boundary")
+            .0;
+        for required in [
+            "GgmlType::F32",
+            "map_native_gguf_tensor_view",
+            "buffer.is_file_backed()",
+            "register_weight_buffer",
+        ] {
+            assert!(
+                mapped_helper.contains(required),
+                "missing state invariant {required}"
+            );
+        }
+    }
 
     fn moe_cfg_40() -> Qwen35Config {
         Qwen35Config {
@@ -1335,18 +1740,16 @@ mod tests {
         use crate::serve::gpu::QuantWeightInfo;
         use mlx_native::DType;
 
-        let (dtype, bytes) = if kind == mlx_native::GgmlType::F32 {
-            (DType::F32, rows * cols * std::mem::size_of::<f32>())
-        } else {
-            (
-                DType::U8,
-                usize::try_from(
-                    mlx_native::ggml_matrix_bytes(kind, rows as u32, cols as u32)
-                        .expect("derive exact test GGUF bytes"),
-                )
-                .expect("test GGUF bytes fit usize"),
-            )
+        let dtype = match kind {
+            mlx_native::GgmlType::F32 => DType::F32,
+            mlx_native::GgmlType::F16 => DType::F16,
+            mlx_native::GgmlType::BF16 => DType::BF16,
+            _ => DType::U8,
         };
+        let bytes = crate::inference::models::qwen35::forward_gpu::native_matrix_storage_bytes(
+            kind, rows, cols,
+        )
+        .expect("derive exact test GGUF bytes");
         MlxQWeight {
             buffer: device
                 .alloc_buffer(bytes, dtype, vec![bytes / dtype.size_of()])
@@ -1357,7 +1760,6 @@ mod tests {
                 cols,
             },
             affine: None,
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         }
     }
@@ -1375,6 +1777,8 @@ mod tests {
             mlx_native::GgmlType::Q6_K,
             mlx_native::GgmlType::Q8_0,
             mlx_native::GgmlType::F32,
+            mlx_native::GgmlType::F16,
+            mlx_native::GgmlType::BF16,
         ] {
             let weight = native_test_qweight_for_type(&device, 256, 256, kind);
             crate::inference::models::qwen35::forward_gpu::ensure_native_embedding_admitted(
@@ -1382,16 +1786,48 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{kind:?} must be admitted: {error:#}"));
         }
-        let mut weight = native_test_qweight(&device, 256, 256);
-        weight.info.ggml_dtype = mlx_native::GgmlType::F16;
-        let error =
-            crate::inference::models::qwen35::forward_gpu::ensure_native_embedding_admitted(
-                &weight,
-            )
-            .expect_err("F16 has no native embedding route");
-        assert!(error
-            .to_string()
-            .contains("unsupported direct-gather type F16"));
+    }
+
+    #[test]
+    fn native_matrix_storage_gate_rejects_omitted_and_anonymous_roles() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use crate::serve::forward_mlx_shared::NativeMatrixStorageSummary;
+
+        let omitted = verify_native_matrix_storage(
+            NativeMatrixStorageSummary {
+                unique_matrix_views: 1,
+                file_backed_bytes: 100,
+                anonymous_bytes: 0,
+            },
+            2,
+            200,
+        )
+        .expect_err("an omitted production matrix role must fail closed");
+        assert!(omitted.to_string().contains("covered 1 unique views"));
+
+        let wrong_bytes = verify_native_matrix_storage(
+            NativeMatrixStorageSummary {
+                unique_matrix_views: 2,
+                file_backed_bytes: 100,
+                anonymous_bytes: 0,
+            },
+            2,
+            200,
+        )
+        .expect_err("partial matrix byte coverage must fail closed");
+        assert!(wrong_bytes.to_string().contains("accounted 100 bytes"));
+
+        let anonymous = verify_native_matrix_storage(
+            NativeMatrixStorageSummary {
+                unique_matrix_views: 2,
+                file_backed_bytes: 100,
+                anonymous_bytes: 100,
+            },
+            2,
+            200,
+        )
+        .expect_err("implicit anonymous matrix storage must fail closed");
+        assert!(anonymous.to_string().contains("100 anonymous matrix bytes"));
     }
 
     fn zero_layer_native_gguf(output_rows: Option<usize>) -> tempfile::NamedTempFile {
@@ -1504,6 +1940,10 @@ mod tests {
         assert_eq!(head.buffer.contents_ptr(), token.buffer.contents_ptr());
         assert_eq!(head.info.ggml_dtype, mlx_native::GgmlType::Q8_0);
         assert_eq!(model.cfg.vocab_size, 64);
+        let storage = model.native_matrix_storage_summary().unwrap();
+        assert_eq!(storage.unique_matrix_views, 1);
+        assert_eq!(storage.file_backed_bytes, 64 * 34);
+        assert_eq!(storage.anonymous_bytes, 0);
     }
 
     #[test]
@@ -1529,8 +1969,17 @@ mod tests {
         assert_eq!(source, "output.weight");
         assert_eq!(token.info.rows, 64);
         assert_eq!(head.info.rows, 48);
-        assert_ne!(head.buffer.contents_ptr(), token.buffer.contents_ptr());
+        assert_eq!(
+            head.buffer.contents_ptr(),
+            token.buffer.contents_ptr(),
+            "all Qwen matrix views share one scoped GGUF mapping owner"
+        );
+        assert_ne!(head.buffer.byte_offset(), token.buffer.byte_offset());
         assert_eq!(model.cfg.vocab_size, 48);
+        let storage = model.native_matrix_storage_summary().unwrap();
+        assert_eq!(storage.unique_matrix_views, 2);
+        assert_eq!(storage.file_backed_bytes, (64 + 48) * 34);
+        assert_eq!(storage.anonymous_bytes, 0);
     }
 
     #[test]
@@ -2113,6 +2562,44 @@ mod tests {
                 .contents_ptr(),
             before
         );
+    }
+
+    #[test]
+    fn late_dwq_overlay_after_activation_fails_without_mutation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("[late_dwq_overlay] SKIP: no Metal device: {error}");
+                return;
+            }
+        };
+        let mut model = Qwen35Model::empty_from_cfg(dense_cfg_12());
+        let before = model.output_weight.clone();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let overlay = directory.path().join("late-output-overlay.safetensors");
+        write_synthetic_overlay(
+            &overlay,
+            &[(
+                "output".to_owned(),
+                synth_attn_linear(
+                    model.cfg.vocab_size as usize,
+                    model.cfg.hidden_size as usize,
+                ),
+            )],
+            4,
+            32,
+        );
+        model.native_routes_activated.store(true, Ordering::Release);
+
+        let error = model
+            .apply_dwq_overlay(&device, &overlay)
+            .expect_err("late overlay must fail before reading or mutating weights");
+        assert!(error
+            .to_string()
+            .contains("after native routes are activated"));
+        assert_eq!(model.output_weight, before);
+        assert!(model.native_routes_activated.load(Ordering::Acquire));
     }
 
     #[test]

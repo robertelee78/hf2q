@@ -28,6 +28,27 @@ fn write_q4_k_m_gguf(path: &Path) {
     write_quant_gguf(path, 15);
 }
 
+fn write_bound_q4_k_m_gguf(path: &Path, projector_sha256: &str) {
+    let mut gguf = Vec::new();
+    gguf.extend_from_slice(b"GGUF");
+    gguf.extend_from_slice(&3_u32.to_le_bytes());
+    gguf.extend_from_slice(&0_u64.to_le_bytes());
+    gguf.extend_from_slice(&2_u64.to_le_bytes());
+    let file_type = b"general.file_type";
+    gguf.extend_from_slice(&(file_type.len() as u64).to_le_bytes());
+    gguf.extend_from_slice(file_type);
+    gguf.extend_from_slice(&4_u32.to_le_bytes());
+    gguf.extend_from_slice(&15_u32.to_le_bytes());
+    let projector_key = b"hf2q.mmproj_sha256";
+    gguf.extend_from_slice(&(projector_key.len() as u64).to_le_bytes());
+    gguf.extend_from_slice(projector_key);
+    gguf.extend_from_slice(&8_u32.to_le_bytes());
+    gguf.extend_from_slice(&(projector_sha256.len() as u64).to_le_bytes());
+    gguf.extend_from_slice(projector_sha256.as_bytes());
+    gguf.resize(256, 0);
+    fs::write(path, gguf).unwrap();
+}
+
 fn receipt_for(artifact: &Path, repository: &str) -> ConversionReceipt {
     ConversionReceipt {
         schema_version: CONVERSION_RECEIPT_SCHEMA_VERSION,
@@ -91,6 +112,38 @@ fn schema_v3_receipt_discovers_nested_local_gguf_for_exact_repository() {
 }
 
 #[test]
+fn paired_receipts_bind_the_exact_projector_to_the_text_candidate() {
+    let root = tempfile::tempdir().unwrap();
+    let text = root.path().join("model-q4_k_m.gguf");
+    let projector = root.path().join("model-mmproj.gguf");
+    fs::write(&projector, b"projector receipt fixture").unwrap();
+    let projector_sha256 = compute_file_sha256(&projector).unwrap();
+    write_bound_q4_k_m_gguf(&text, &projector_sha256);
+    write_receipt(&text, &receipt_for(&text, "owner/model"));
+    let mut projector_receipt = receipt_for(&projector, "owner/model");
+    projector_receipt.quant_selector = "f16-mmproj".into();
+    write_receipt(&projector, &projector_receipt);
+
+    let catalog = LocalArtifactInventory::for_test(vec![root.path().to_path_buf()])
+        .discover(Some("owner/model"), None);
+    let selected = catalog
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.selectable)
+        .expect("paired text candidate");
+    assert_eq!(selected.path, text.canonicalize().unwrap());
+    assert_eq!(
+        selected.projector_path,
+        Some(projector.canonicalize().unwrap())
+    );
+    assert!(catalog.artifacts.iter().any(|artifact| {
+        !artifact.selectable
+            && artifact.sha256 == projector_sha256
+            && artifact.quant_hint == "F16-MMPROJ"
+    }));
+}
+
+#[test]
 fn qwen38_q5_k_m_receipt_is_selectable_with_exact_header_identity() {
     let root = tempfile::tempdir().unwrap();
     let artifact = root.path().join("model-q5_k_m.gguf");
@@ -103,6 +156,22 @@ fn qwen38_q5_k_m_receipt_is_selectable_with_exact_header_identity() {
         .discover(Some("owner/model"), None);
     assert_eq!(catalog.artifacts.len(), 1);
     assert_eq!(catalog.artifacts[0].quant, Some(QuantType::Q5_K_M));
+    assert!(catalog.artifacts[0].selectable);
+}
+
+#[test]
+fn qwen38_bf16_receipt_is_selectable_with_exact_header_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let artifact = root.path().join("model-bf16.gguf");
+    write_quant_gguf(&artifact, 32);
+    let mut receipt = receipt_for(&artifact, "owner/model");
+    receipt.quant_selector = "bf16".into();
+    write_receipt(&artifact, &receipt);
+
+    let catalog = LocalArtifactInventory::for_test(vec![root.path().to_path_buf()])
+        .discover(Some("owner/model"), None);
+    assert_eq!(catalog.artifacts.len(), 1);
+    assert_eq!(catalog.artifacts[0].quant, Some(QuantType::BF16));
     assert!(catalog.artifacts[0].selectable);
 }
 
@@ -152,17 +221,17 @@ fn recorded_output_path_is_never_dereferenced() {
 #[test]
 fn unsupported_receipt_quant_is_visible_but_not_selectable() {
     let root = tempfile::tempdir().unwrap();
-    let artifact = root.path().join("model-bf16.gguf");
+    let artifact = root.path().join("model-iq3_xxs.gguf");
     write_q4_k_m_gguf(&artifact);
     let mut receipt = receipt_for(&artifact, "owner/model");
-    receipt.quant_selector = "bf16".into();
+    receipt.quant_selector = "iq3_xxs".into();
     write_receipt(&artifact, &receipt);
 
     let catalog = LocalArtifactInventory::for_test(vec![root.path().to_path_buf()])
         .discover(Some("owner/model"), None);
     assert_eq!(catalog.artifacts.len(), 1);
     assert!(!catalog.artifacts[0].selectable);
-    assert_eq!(catalog.artifacts[0].quant_hint, "BF16");
+    assert_eq!(catalog.artifacts[0].quant_hint, "IQ3_XXS");
     assert!(catalog.artifacts[0]
         .unavailable_reason
         .as_deref()
@@ -216,7 +285,7 @@ fn verifier_rejects_post_catalog_digest_and_quant_changes() {
     write_q4_k_m_gguf(&artifact);
     let sha = compute_file_sha256(&artifact).unwrap();
     let bytes = fs::metadata(&artifact).unwrap().len();
-    verify_local_artifact(LocalVerificationRequest {
+    let verified = verify_local_artifact(LocalVerificationRequest {
         root: root.path(),
         artifact: &artifact,
         bytes,
@@ -224,6 +293,10 @@ fn verifier_rejects_post_catalog_digest_and_quant_changes() {
         quant: QuantType::Q4_K_M,
     })
     .unwrap();
+    assert_eq!(verified.path, artifact.canonicalize().unwrap());
+    assert_eq!(verified.sha256, sha);
+    assert!(verified.file_stamp.matches_path(&verified.path));
+    assert_eq!(verified.text_identity().sha256, sha);
 
     fs::OpenOptions::new()
         .write(true)
@@ -367,21 +440,31 @@ fn canonical_managed_cache_artifact_is_selectable() {
         QuantType::Q4_K_M,
     );
     fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-    write_q4_k_m_gguf(&legacy);
+    let legacy_projector = legacy.parent().unwrap().join("mmproj.gguf");
+    fs::write(&legacy_projector, b"legacy projector fixture").unwrap();
+    write_bound_q4_k_m_gguf(&legacy, &compute_file_sha256(&legacy_projector).unwrap());
     let mut legacy_manifest = manifest.clone();
-    let legacy_entry = legacy_manifest
+    let mut legacy_entry = legacy_manifest
+        .models
+        .get("owner/model")
+        .unwrap()
+        .quantizations
+        .get("Q4_K_M")
+        .unwrap()
+        .clone();
+    legacy_entry.gguf_path = legacy.clone();
+    legacy_entry.mmproj_path = Some(legacy_projector.clone());
+    legacy_entry.bytes = fs::metadata(&legacy).unwrap().len();
+    legacy_entry.sha256 = compute_file_sha256(&legacy).unwrap();
+    legacy_manifest
         .models
         .get_mut("owner/model")
         .unwrap()
         .quantizations
-        .get_mut("Q4_K_M")
-        .unwrap();
-    legacy_entry.gguf_path = legacy.clone();
-    legacy_entry.bytes = fs::metadata(&legacy).unwrap().len();
-    legacy_entry.sha256 = compute_file_sha256(&legacy).unwrap();
+        .insert("Q4_K_M".into(), legacy_entry.clone());
     fs::write(
         legacy.parent().unwrap().join("manifest.json"),
-        serde_json::to_vec_pretty(legacy_entry).unwrap(),
+        serde_json::to_vec_pretty(&legacy_entry).unwrap(),
     )
     .unwrap();
     let legacy_model = legacy_manifest.models.get("owner/model").unwrap();
@@ -403,7 +486,59 @@ fn canonical_managed_cache_artifact_is_selectable() {
     );
     assert_eq!(
         catalog.artifacts.len(),
-        1,
-        "manifest-bound legacy cache bytes remain discoverable"
+        2,
+        "manifest-bound legacy text and projector bytes remain discoverable"
+    );
+    let selected = catalog
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.selectable)
+        .expect("legacy text remains selectable with its authority-bound sibling");
+    assert_eq!(
+        selected.projector_path,
+        Some(legacy_projector.canonicalize().unwrap())
+    );
+
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    fs::write(outside.path(), b"forged out-of-directory projector").unwrap();
+    let forged_sha = compute_file_sha256(outside.path()).unwrap();
+    write_bound_q4_k_m_gguf(&legacy, &forged_sha);
+    legacy_entry.mmproj_path = Some(outside.path().to_path_buf());
+    legacy_entry.bytes = fs::metadata(&legacy).unwrap().len();
+    legacy_entry.sha256 = compute_file_sha256(&legacy).unwrap();
+    legacy_manifest
+        .models
+        .get_mut("owner/model")
+        .unwrap()
+        .quantizations
+        .insert("Q4_K_M".into(), legacy_entry.clone());
+    let forged_model = legacy_manifest.models.get("owner/model").unwrap();
+    fs::write(
+        legacy.parent().unwrap().join("manifest.json"),
+        serde_json::to_vec_pretty(&legacy_entry).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        legacy
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("repo_meta.json"),
+        serde_json::to_vec_pretty(forged_model).unwrap(),
+    )
+    .unwrap();
+    let forged_catalog = LocalArtifactInventory::default().discover(
+        Some("owner/model"),
+        Some((legacy_root.path(), &legacy_manifest)),
+    );
+    assert!(
+        forged_catalog
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.path != outside.path()),
+        "an authority entry cannot move a legacy projector outside its quant directory"
     );
 }

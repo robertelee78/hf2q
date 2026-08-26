@@ -496,9 +496,21 @@ jobs:
             scripts/qwen38_speculation_ab.sh \
             scripts/qwen38_matched_reference_contract.sh \
             scripts/qwen38_matched_reference_abba.sh \
+            scripts/qwen35_compound_wave_contract.sh \
+            scripts/bench_qwen35_compound_boundary_ab.sh \
+            scripts/test_qwen35_compound_boundary_ab_contract.sh \
             scripts/verify_qwen38_long_decode_receipt.sh \
             scripts/test_qwen38_long_decode_receipt_contract.sh \
             scripts/test_qwen38_artifact_binding_contract.sh \
+            scripts/test_qwen38_artifact_matrix_contract.sh \
+            scripts/verify_qwen38_agentic_lifecycle_receipt.sh \
+            scripts/test_qwen38_agentic_lifecycle_release_contract.sh \
+            scripts/test_qwen38_physical_multislot_gate_contract.sh \
+            scripts/test_qwen38_matched_physical_contract.sh \
+            scripts/test_generative_swap_matrix_contract.sh \
+            scripts/run_qwen38_exact_swap_matrix.sh \
+            scripts/verify_qwen38_exact_swap_release_receipt.sh \
+            scripts/test_qwen38_exact_swap_matrix_contract.sh \
             scripts/test_qwen38_matched_reference_contract.sh \
             scripts/test_macos_thermal_guard_contract.sh \
             scripts/test_gemma4_wave_thermal_contract.sh \
@@ -534,7 +546,14 @@ jobs:
           bash scripts/test_gemma4_eight_slot_receipt_contract.sh
           bash scripts/test_qwen38_long_decode_receipt_contract.sh
           bash scripts/test_qwen38_artifact_binding_contract.sh
+          bash scripts/test_qwen38_artifact_matrix_contract.sh
+          bash scripts/test_qwen38_agentic_lifecycle_release_contract.sh
+          bash scripts/test_qwen38_physical_multislot_gate_contract.sh
+          bash scripts/test_qwen38_matched_physical_contract.sh
+          bash scripts/test_generative_swap_matrix_contract.sh
+          bash scripts/test_qwen38_exact_swap_matrix_contract.sh
           bash scripts/test_qwen38_matched_reference_contract.sh
+          bash scripts/test_qwen35_compound_boundary_ab_contract.sh
           bash scripts/test_release_binary_seal_contract.sh
           bash scripts/test_standalone_release_signing_contract.sh
           bash scripts/test_release_dependency_provenance_contract.sh

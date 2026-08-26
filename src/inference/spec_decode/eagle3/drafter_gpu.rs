@@ -29,9 +29,9 @@
 //!
 //! ## Embed lookup
 //!
-//! Fixtures may provide an F32 table. Production Qwen shares the target's
-//! conversion-emitted native Q4_K table and gathers only the selected row;
-//! the drafter never expands or re-quantizes that table.
+//! Fixtures may provide an F32 table. Production Qwen borrows the target's
+//! exact native embedding table and gathers only the selected row; the
+//! drafter never expands or re-quantizes that table.
 
 use super::config::Eagle3DrafterConfig;
 use super::drafter::{extract_top_k_from_row_logits, DraftCandidate, Drafter, TreeContextView};
@@ -44,7 +44,7 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 enum DrafterEmbedding<'a> {
     F32(&'a [f32]),
-    NativeQ4K(&'a MlxQWeight),
+    Native(&'a MlxQWeight),
 }
 
 /// GPU drafter implementing Phase E4a's [`Drafter`] trait by running
@@ -144,10 +144,9 @@ impl<'a> GpuDrafter<'a> {
     ) -> Result<Self> {
         ensure!(
             embed_weight.affine.is_none()
-                && embed_weight.info.ggml_dtype == GgmlType::Q4_K
                 && embed_weight.info.rows == cfg.vocab_size
                 && embed_weight.info.cols == cfg.hidden_size,
-            "GpuDrafter::new_with_native_embedding: expected exact Q4_K [{}, {}], got {:?} [{}, {}]",
+            "GpuDrafter::new_with_native_embedding: expected native [{}, {}], got {:?} [{}, {}]",
             cfg.vocab_size,
             cfg.hidden_size,
             embed_weight.info.ggml_dtype,
@@ -160,7 +159,7 @@ impl<'a> GpuDrafter<'a> {
             device,
             registry,
             target_aux,
-            DrafterEmbedding::NativeQ4K(embed_weight),
+            DrafterEmbedding::Native(embed_weight),
             base_pos,
         )
     }
@@ -397,7 +396,7 @@ impl<'a> GpuDrafter<'a> {
                     .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: map output: {e}"))?
                     .copy_from_slice(&embed_table[start..end]);
             }
-            DrafterEmbedding::NativeQ4K(weight) => {
+            DrafterEmbedding::Native(weight) => {
                 let mut ids = self
                     .device
                     .alloc_buffer(4, DType::U32, vec![1])
@@ -409,21 +408,117 @@ impl<'a> GpuDrafter<'a> {
                     .device
                     .command_encoder()
                     .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: encoder: {e}"))?;
-                mlx_native::ops::embedding_q4_k::register(self.registry);
-                mlx_native::embedding_gather_q4_k(
-                    &mut enc,
-                    self.registry,
-                    self.device,
-                    &weight.buffer,
-                    &ids,
-                    &output,
-                    &mlx_native::EmbeddingQ4KParams {
-                        vocab_size: weight.info.rows,
-                        embed_dim: weight.info.cols,
-                        n_tokens: 1,
-                    },
-                )
-                .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: Q4_K gather: {e}"))?;
+                match weight.info.ggml_dtype {
+                    GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
+                        mlx_native::embedding_gather_dense(
+                            &mut enc,
+                            self.registry,
+                            self.device,
+                            &weight.buffer,
+                            &ids,
+                            &output,
+                            &mlx_native::EmbeddingDenseParams {
+                                vocab_size: weight.info.rows,
+                                embed_dim: weight.info.cols,
+                                n_tokens: 1,
+                            },
+                        )?
+                    }
+                    GgmlType::Q4_0 => mlx_native::ops::embedding_q4_0::embedding_gather_q4_0(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::ops::embedding_q4_0::EmbeddingQ4_0Params {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    GgmlType::Q5_0 => mlx_native::embedding_gather_q5_0(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::EmbeddingQ5_0Params {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    GgmlType::Q2_K => mlx_native::embedding_gather_q2_k(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::EmbeddingQ2KParams {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    GgmlType::Q4_K => mlx_native::embedding_gather_q4_k(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::EmbeddingQ4KParams {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    GgmlType::Q5_K => mlx_native::embedding_gather_q5_k(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::EmbeddingQ5KParams {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    GgmlType::Q6_K => mlx_native::embedding_gather_q6_k(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::EmbeddingQ6KParams {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    GgmlType::Q8_0 => mlx_native::embedding_gather_q8_0(
+                        &mut enc,
+                        self.registry,
+                        self.device,
+                        &weight.buffer,
+                        &ids,
+                        &output,
+                        &mlx_native::EmbeddingQ8_0Params {
+                            vocab_size: weight.info.rows,
+                            embed_dim: weight.info.cols,
+                            n_tokens: 1,
+                        },
+                    )?,
+                    other => anyhow::bail!(
+                        "GpuDrafter::lookup_embedding_gpu: unadmitted native type {other:?}"
+                    ),
+                }
                 enc.commit_and_wait_labeled("eagle3.embedding.native")
                     .map_err(|e| anyhow!("GpuDrafter::lookup_embedding_gpu: completion: {e}"))?;
             }
@@ -778,6 +873,92 @@ mod tests {
     }
 
     #[test]
+    fn eagle_borrows_target_q5_0_embedding_and_gathers_nonzero_row() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let mut registry = eagle3_test_kernel_registry();
+        let cfg = cfg_for_drafter_test();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_test_blob(&manifest);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load drafter fixture");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload drafter fixture");
+        let mut target_aux = device
+            .alloc_buffer(
+                cfg.fc_input_size() * std::mem::size_of::<f32>(),
+                DType::F32,
+                vec![1, cfg.fc_input_size()],
+            )
+            .expect("allocate target aux");
+        target_aux
+            .as_mut_slice::<f32>()
+            .expect("map target aux")
+            .fill(0.0);
+
+        let source = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|index| ((index * 29 % 97) as f32 - 48.0) / 53.0)
+            .collect::<Vec<_>>();
+        let packed = crate::quantize::ggml_quants::q5_0::quantize(&source, cfg.hidden_size, None);
+        let mut dequantized = vec![0.0_f32; source.len()];
+        mlx_native::gguf::test_only_dequantize(&packed, GgmlType::Q5_0, &mut dequantized)
+            .expect("dequantize Eagle target Q5_0 oracle");
+        let mut target_buffer = device
+            .alloc_buffer(packed.len(), DType::U8, vec![packed.len()])
+            .expect("allocate Eagle target Q5_0 embedding");
+        target_buffer
+            .as_mut_slice::<u8>()
+            .expect("map Eagle target Q5_0 embedding")
+            .copy_from_slice(&packed);
+        let target_embedding = MlxQWeight::from_test_buffer(
+            target_buffer,
+            GgmlType::Q5_0,
+            cfg.vocab_size,
+            cfg.hidden_size,
+        );
+        let target_ptr = target_embedding.buffer.contents_ptr();
+        let mut drafter = GpuDrafter::new_with_native_embedding(
+            &cfg,
+            &tensors,
+            &device,
+            &mut registry,
+            &target_aux,
+            &target_embedding,
+            0,
+        )
+        .expect("construct Eagle with borrowed target Q5_0 embedding");
+        match &drafter.embedding {
+            DrafterEmbedding::Native(borrowed) => {
+                assert!(std::ptr::eq(*borrowed, &target_embedding));
+                assert_eq!(borrowed.buffer.contents_ptr(), target_ptr);
+                assert_eq!(borrowed.info.ggml_dtype, GgmlType::Q5_0);
+            }
+            DrafterEmbedding::F32(_) => panic!("Eagle replaced borrowed Q5_0 with F32 shadow"),
+        }
+
+        let token = 137usize;
+        let output = drafter
+            .lookup_embedding_gpu(token as u32)
+            .expect("gather Eagle target Q5_0 embedding row");
+        let actual = output
+            .as_slice::<f32>()
+            .expect("read Eagle target Q5_0 embedding row");
+        let expected = &dequantized[token * cfg.hidden_size..(token + 1) * cfg.hidden_size];
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+            let tolerance = 2.0e-3 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tolerance,
+                "Eagle target Q5_0 row value {index}: {got} vs {want} (tolerance {tolerance})"
+            );
+        }
+        assert!(actual.iter().any(|value| *value != 0.0));
+        assert_eq!(target_embedding.buffer.contents_ptr(), target_ptr);
+    }
+
+    #[test]
     fn adr_037_e4b10b3_gpu_drafter_end_to_end_with_expand_dynamic_tree_2026_05_22() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         // INTEGRATION TEST: GpuDrafter is consumed by Phase E4a's
@@ -794,6 +975,9 @@ mod tests {
         let blob = build_test_blob(&manifest);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
 
         // Target aux: synthetic [1, num_aux*hidden].
         let mut target_aux_data = vec![0.0f32; cfg.fc_input_size()];
@@ -1165,6 +1349,9 @@ mod tests {
                 Some(t) => t,
                 None => return,
             };
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let mut drafter = GpuDrafter::new(
             &cfg,
             &tensors,
@@ -1206,6 +1393,9 @@ mod tests {
                 Some(t) => t,
                 None => return,
             };
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let mut drafter = GpuDrafter::new(
             &cfg,
             &tensors,
@@ -1298,6 +1488,9 @@ mod tests {
                 Some(t) => t,
                 None => return,
             };
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let mut drafter = GpuDrafter::new(
             &cfg,
             &tensors,
@@ -1335,6 +1528,9 @@ mod tests {
                 Some(t) => t,
                 None => return,
             };
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let mut drafter = GpuDrafter::new(
             &cfg,
             &tensors,
@@ -1390,6 +1586,9 @@ mod tests {
                 Some(t) => t,
                 None => return,
             };
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let mut drafter = GpuDrafter::new(
             &cfg,
             &tensors,
@@ -1700,6 +1899,9 @@ mod tests {
                 Some(t) => t,
                 None => return,
             };
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let mut drafter = GpuDrafter::new(
             &cfg,
             &tensors,
@@ -1838,10 +2040,16 @@ mod tests {
         let weights_false = Eagle3Weights::load(&blob, &cfg_false).expect("load false");
         let tensors_false = Eagle3DrafterTensors::upload(&device, &cfg_false, &weights_false)
             .expect("upload false");
+        tensors_false
+            .activate_test_bf16_routes(&device, &mut registry_false)
+            .expect("activate false EAGLE BF16 routes");
 
         let weights_true = Eagle3Weights::load(&blob, &cfg_true).expect("load true");
         let tensors_true =
             Eagle3DrafterTensors::upload(&device, &cfg_true, &weights_true).expect("upload true");
+        tensors_true
+            .activate_test_bf16_routes(&device, &mut registry_true)
+            .expect("activate true EAGLE BF16 routes");
 
         // Target aux: deterministic non-zero content so norm changes the scale.
         let mut target_aux_data = vec![0.0f32; cfg_false.fc_input_size()];

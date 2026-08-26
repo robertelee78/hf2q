@@ -32,7 +32,7 @@ pub(crate) fn validate_family_context_floor(
     Ok(())
 }
 
-pub(super) fn validate_tensor_headers(gguf: &GgufFile, path: &Path) -> Result<u64> {
+pub(crate) fn validate_tensor_headers(gguf: &GgufFile, path: &Path) -> Result<u64> {
     anyhow::ensure!(gguf.tensor_count() > 0, "GGUF tensor directory is empty");
     let file_bytes = std::fs::metadata(path)
         .with_context(|| format!("read GGUF size for {}", path.display()))?

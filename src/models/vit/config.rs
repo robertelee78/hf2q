@@ -34,6 +34,11 @@ pub enum VisionConfigError {
 
     #[error("vision_config.{field}: invalid value {value}")]
     InvalidField { field: &'static str, value: String },
+
+    #[error(
+        "standalone Qwen vision architecture {model_type:?} is not supported; use a supported Qwen conditional-generation model"
+    )]
+    UnsupportedQwenVisionFamily { model_type: String },
 }
 
 /// Parsed ViT configuration.
@@ -139,18 +144,53 @@ impl VisionConfig {
                 .unwrap_or(default)
         };
 
-        let is_qwen_conditional = root
+        let has_qwen_conditional_architecture = root
             .get("architectures")
             .and_then(Value::as_array)
             .is_some_and(|architectures| {
                 architectures.iter().any(|architecture| {
-                    matches!(
-                        architecture.as_str(),
-                        Some("Qwen3_5ForConditionalGeneration")
-                            | Some("Qwen3_5MoeForConditionalGeneration")
-                    )
+                    architecture.as_str().is_some_and(|name| {
+                        matches!(
+                            name,
+                            "Qwen3_5ForConditionalGeneration"
+                                | "Qwen3_5MoeForConditionalGeneration"
+                        )
+                    })
                 })
             });
+        let qwen_text_model_type = root
+            .get("model_type")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                root.get("text_config")
+                    .and_then(|text| text.get("model_type"))
+                    .and_then(Value::as_str)
+            })
+            .is_some_and(|model_type| {
+                matches!(
+                    model_type,
+                    "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text"
+                )
+            });
+        let is_qwen_conditional = has_qwen_conditional_architecture && qwen_text_model_type;
+        let qwen_layout_marker = vc
+            .get("model_type")
+            .and_then(Value::as_str)
+            .is_some_and(|model_type| model_type == "qwen3_vl")
+            || vc.get("deepstack_visual_indexes").is_some()
+            || vc
+                .get("projector_type")
+                .and_then(Value::as_str)
+                .is_some_and(|projector| projector == "qwen3vl_merger");
+        if qwen_layout_marker && !is_qwen_conditional {
+            let model_type = root
+                .get("model_type")
+                .and_then(Value::as_str)
+                .or_else(|| vc.get("model_type").and_then(Value::as_str))
+                .unwrap_or("unidentified-qwen-vision")
+                .to_string();
+            return Err(VisionConfigError::UnsupportedQwenVisionFamily { model_type });
+        }
         let str_def = |k: &str, default: &str| -> String {
             vc.get(k)
                 .and_then(|v| v.as_str())
@@ -316,23 +356,13 @@ impl VisionConfig {
         //   (a) vision_config.model_type == "qwen3_vl" (canonical HF
         //       Qwen3-VL), or
         //   (b) deepstack_visual_indexes presence (the unique-to-Qwen3-VL
-        //       config key — same fallback used by `is_qwen3vl()`).
+        //       config key — same fallback used by `is_qwen_vision()`).
         // When either fires, force projector_type to "qwen3vl_merger"
         // (the canonical GGUF projector_type string) regardless of
         // whether the HF config carries a (different) projector_type
         // string.
-        let model_type = vc
-            .get("model_type")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
         let raw_projector_type = str_def("projector_type", "mlp");
-        let is_qwen3vl_via_model_type = model_type
-            .as_deref()
-            .map(|s| s == "qwen3_vl")
-            .unwrap_or(false);
-        let is_qwen3vl_via_deepstack = deepstack_visual_indexes.is_some();
-        let is_qwen_vision =
-            is_qwen3vl_via_model_type || is_qwen3vl_via_deepstack || is_qwen_conditional;
+        let is_qwen_vision = is_qwen_conditional;
         let projector_type = if is_qwen_vision {
             "qwen3vl_merger".to_string()
         } else {
@@ -435,7 +465,7 @@ impl VisionConfig {
     /// The `OR` accommodates HF configs that omit `projector_type` but
     /// carry the deepstack marker (verified for the 2026-04 snapshot of
     /// `Qwen/Qwen3-VL-2B-Instruct/config.json`'s `vision_config`).
-    pub fn is_qwen3vl(&self) -> bool {
+    pub fn is_qwen_vision(&self) -> bool {
         self.projector_type == "qwen3vl_merger" || self.deepstack_visual_indexes.is_some()
     }
 
@@ -489,6 +519,11 @@ mod tests {
                 "projector_type": "mlp"
             }
         })
+    }
+
+    fn admit_supported_qwen_conditional(root: &mut Value) {
+        root["model_type"] = serde_json::json!("qwen3_5");
+        root["architectures"] = serde_json::json!(["Qwen3_5ForConditionalGeneration"]);
     }
 
     #[test]
@@ -549,13 +584,27 @@ mod tests {
     }
 
     #[test]
-    fn native_qwen_vision_without_deepstack_emits_explicit_empty_set() {
+    fn standalone_qwen_vision_marker_is_rejected_without_supported_wrapper() {
         let mut root = valid_config();
         root["vision_config"]["model_type"] = serde_json::json!("qwen3_vl");
-        let cfg = VisionConfig::from_hf_config(&root).expect("native Qwen vision config");
-        assert_eq!(cfg.projector_type, "qwen3vl_merger");
-        assert_eq!(cfg.deepstack_visual_indexes, Some(Vec::new()));
-        assert_eq!(cfg.build_is_deepstack_layers(), Some(vec![false; 4]));
+        let err = VisionConfig::from_hf_config(&root).unwrap_err();
+        assert!(matches!(
+            err,
+            VisionConfigError::UnsupportedQwenVisionFamily { .. }
+        ));
+    }
+
+    #[test]
+    fn unproven_qwen37_wrapper_cannot_enter_shared_vision_path() {
+        let mut root = valid_config();
+        root["model_type"] = serde_json::json!("qwen3_7");
+        root["architectures"] = serde_json::json!(["Qwen3_7ForConditionalGeneration"]);
+        root["vision_config"]["model_type"] = serde_json::json!("qwen3_vl");
+        let err = VisionConfig::from_hf_config(&root).unwrap_err();
+        assert!(matches!(
+            err,
+            VisionConfigError::UnsupportedQwenVisionFamily { .. }
+        ));
     }
 
     #[test]
@@ -670,9 +719,9 @@ mod tests {
     // ----- Wedge-4f (iter-224 row 6) — Qwen3-VL extension fields -----
 
     #[test]
-    fn parses_qwen3vl_extension_fields() {
+    fn parses_qwen_vision_extension_fields() {
         // Mirrors a real Qwen3-VL-2B-Instruct vision_config snippet.
-        let root = serde_json::json!({
+        let mut root = serde_json::json!({
             "vision_config": {
                 "hidden_size": 384,
                 "depth": 24,
@@ -686,12 +735,13 @@ mod tests {
                 "projector_type": "qwen3vl_merger"
             }
         });
+        admit_supported_qwen_conditional(&mut root);
         let vc = VisionConfig::from_hf_config(&root).unwrap();
         assert_eq!(vc.spatial_merge_size, Some(2));
         assert_eq!(vc.temporal_patch_size, Some(2));
         assert_eq!(vc.deepstack_visual_indexes, Some(vec![5, 11, 17]));
         assert_eq!(vc.projector_type, "qwen3vl_merger");
-        assert!(vc.is_qwen3vl());
+        assert!(vc.is_qwen_vision());
     }
 
     #[test]
@@ -705,7 +755,7 @@ mod tests {
         // landing-time wrong (latent because Qwen3-VL-2B [5, 11, 17]
         // happens to be sorted, but nothing in HF config schema
         // requires it). This test now pins the corrected behavior.
-        let root = serde_json::json!({
+        let mut root = serde_json::json!({
             "vision_config": {
                 "hidden_size": 64,
                 "num_hidden_layers": 24,
@@ -716,6 +766,7 @@ mod tests {
                 "deepstack_visual_indexes": [17, 5, 11]
             }
         });
+        admit_supported_qwen_conditional(&mut root);
         let vc = VisionConfig::from_hf_config(&root).unwrap();
         assert_eq!(
             vc.deepstack_visual_indexes,
@@ -731,7 +782,7 @@ mod tests {
         // Defense in depth — reject invalid index now so we don't
         // emit a length-mismatched is_deepstack_layers GGUF array
         // that the loader would reject anyway.
-        let root = serde_json::json!({
+        let mut root = serde_json::json!({
             "vision_config": {
                 "hidden_size": 64,
                 "num_hidden_layers": 4,
@@ -742,6 +793,7 @@ mod tests {
                 "deepstack_visual_indexes": [2, 5]   // 5 >= 4
             }
         });
+        admit_supported_qwen_conditional(&mut root);
         let err = VisionConfig::from_hf_config(&root).unwrap_err();
         match err {
             VisionConfigError::InvalidField { field, value } => {
@@ -805,13 +857,13 @@ mod tests {
             temporal_patch_size: None,
         };
         assert!(vc.build_is_deepstack_layers().is_none());
-        assert!(!vc.is_qwen3vl());
+        assert!(!vc.is_qwen_vision());
     }
 
     #[test]
-    fn is_qwen3vl_detects_via_projector_type() {
+    fn is_qwen_vision_detects_via_projector_type() {
         // Family detection via projector_type alone (no deepstack).
-        let root = serde_json::json!({
+        let mut root = serde_json::json!({
             "vision_config": {
                 "hidden_size": 64,
                 "num_hidden_layers": 2,
@@ -822,15 +874,16 @@ mod tests {
                 "projector_type": "qwen3vl_merger"
             }
         });
+        admit_supported_qwen_conditional(&mut root);
         let vc = VisionConfig::from_hf_config(&root).unwrap();
-        assert!(vc.is_qwen3vl());
+        assert!(vc.is_qwen_vision());
     }
 
     #[test]
-    fn is_qwen3vl_detects_via_deepstack_indexes_alone() {
+    fn is_qwen_vision_detects_via_deepstack_indexes_alone() {
         // A vision_config that omits projector_type but ships
         // deepstack_visual_indexes is unambiguously Qwen3-VL.
-        let root = serde_json::json!({
+        let mut root = serde_json::json!({
             "vision_config": {
                 "hidden_size": 64,
                 "num_hidden_layers": 8,
@@ -841,12 +894,13 @@ mod tests {
                 "deepstack_visual_indexes": [3, 5]
             }
         });
+        admit_supported_qwen_conditional(&mut root);
         let vc = VisionConfig::from_hf_config(&root).unwrap();
-        assert!(vc.is_qwen3vl());
+        assert!(vc.is_qwen_vision());
     }
 
     #[test]
-    fn from_hf_config_canonical_qwen3vl_no_projector_type_with_out_hidden_size() {
+    fn from_hf_config_canonical_qwen_vision_no_projector_type_with_out_hidden_size() {
         // Phase-2c regression for Codex Phase-2b finding #1 BLOCKER on
         // Wedge-4f 9e9e262: real Qwen3-VL HF configs (verified against
         // Qwen/Qwen3-VL-2B-Instruct/config.json 2026-04 snapshot) carry
@@ -860,7 +914,7 @@ mod tests {
         //       OR via deepstack_visual_indexes presence;
         //   (b) projection_dim populated from out_hidden_size when
         //       projection_dim is absent.
-        let root = serde_json::json!({
+        let mut root = serde_json::json!({
             "text_config": {"hidden_size": 1024},  // present but not consulted because vc has out_hidden_size
             "vision_config": {
                 "model_type": "qwen3_vl",
@@ -877,6 +931,7 @@ mod tests {
                 // NOTE: NO projector_type, NO projection_dim
             }
         });
+        admit_supported_qwen_conditional(&mut root);
         let vc = VisionConfig::from_hf_config(&root).unwrap();
         // Pin (a): projector_type forced to canonical Qwen3-VL string.
         assert_eq!(
@@ -886,7 +941,7 @@ mod tests {
              OR deepstack_visual_indexes presence. Got '{}'",
             vc.projector_type
         );
-        assert!(vc.is_qwen3vl());
+        assert!(vc.is_qwen_vision());
         // Pin (b): projection_dim derived from out_hidden_size (NOT
         // text_config.hidden_size — out_hidden_size has higher priority).
         assert_eq!(
@@ -899,13 +954,13 @@ mod tests {
     }
 
     #[test]
-    fn from_hf_config_qwen3vl_falls_back_to_text_config_hidden_size_when_no_out_hidden_size() {
+    fn from_hf_config_qwen_vision_falls_back_to_text_config_hidden_size_when_no_out_hidden_size() {
         // Edge case: vision_config has NEITHER projection_dim NOR
         // out_hidden_size; converter must fall back to
         // text_config.hidden_size (the LM input embedding dim — the
         // projection MUST match it for the augmented embed contract
         // to land at the right shape per Wedge-4c.5 contract).
-        let root = serde_json::json!({
+        let mut root = serde_json::json!({
             "text_config": {"hidden_size": 1536},
             "vision_config": {
                 "model_type": "qwen3_vl",
@@ -919,6 +974,7 @@ mod tests {
                 // NO out_hidden_size, NO projection_dim
             }
         });
+        admit_supported_qwen_conditional(&mut root);
         let vc = VisionConfig::from_hf_config(&root).unwrap();
         assert_eq!(vc.projector_type, "qwen3vl_merger");
         assert_eq!(
@@ -935,7 +991,7 @@ mod tests {
         // deepstack_visual_indexes was being sort_unstable()'d which
         // would silently mis-attach DeepStack heads for any unsorted
         // producer config (peer impls preserve HF order).
-        let root = serde_json::json!({
+        let mut root = serde_json::json!({
             "vision_config": {
                 "model_type": "qwen3_vl",
                 "hidden_size": 64,
@@ -950,6 +1006,7 @@ mod tests {
                 "deepstack_visual_indexes": [11, 3, 7]
             }
         });
+        admit_supported_qwen_conditional(&mut root);
         let vc = VisionConfig::from_hf_config(&root).unwrap();
         assert_eq!(
             vc.deepstack_visual_indexes,

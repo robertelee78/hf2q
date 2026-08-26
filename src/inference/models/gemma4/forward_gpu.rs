@@ -10,8 +10,6 @@
 //! Moved from `src/serve/forward_mlx.rs` by ADR-038 Step 3.
 
 use anyhow::{Context, Result};
-use mlx_native::ops::dense_gemm::DenseGemmF16Params;
-use mlx_native::ops::elementwise::CastDirection;
 use mlx_native::KernelRegistry;
 use std::time::Instant;
 
@@ -350,10 +348,10 @@ impl MlxModelWeights {
     /// ADR-040 S1c — body-capture decode for batched lm_head. Runs the SAME body
     /// (embed + layer loop) as [`Self::forward_decode`], leaving the final hidden
     /// state (pre-final-norm) in `self.activations.hidden`, then returns WITHOUT
-    /// running the per-slot head (final-norm + lm_head + softcap + argmax +
-    /// rerank). The SlotAware worker gathers each slot's captured hidden, runs
+    /// running the per-slot head (final-norm + lm_head + softcap + argmax).
+    /// The SlotAware worker gathers each slot's captured hidden, runs
     /// ONE [`Self::lm_head_batched`] across all slots, and finalizes per row —
-    /// amortizing the 605 MB lm_head weight read. Read the captured hidden with
+    /// amortizing the artifact-native output-head read. Read the captured hidden with
     /// `self.activations.hidden.as_slice::<f32>()` immediately after this returns
     /// (it is GPU-synced). KV bookkeeping is identical to a full decode (the KV
     /// write happens in the body), so a captured step advances state exactly like
@@ -703,8 +701,8 @@ impl MlxModelWeights {
             // embedding dispatch reads embed_weight and writes hidden.
             if use_graph_opt {
                 let read_ranges = vec![{
-                    let s_ptr = self.embed_weight.contents_ptr() as usize;
-                    (s_ptr, s_ptr + self.embed_weight.byte_len())
+                    let s_ptr = self.embed_weight.buffer.contents_ptr() as usize;
+                    (s_ptr, s_ptr + self.embed_weight.buffer.byte_len())
                 }];
                 let write_ranges = vec![{
                     let s_ptr = self.activations.hidden.contents_ptr() as usize;
@@ -713,19 +711,21 @@ impl MlxModelWeights {
                 s.encoder_mut()
                     .set_pending_buffer_ranges(read_ranges, write_ranges);
             }
-            mlx_native::ops::elementwise::embedding_gather_scale_f32(
-                s.encoder_mut(),
+            self.activations
+                .embedding_token_id
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow::anyhow!("embedding token id write: {e}"))?[0] = input_token;
+            crate::inference::models::gemma4::native_matrix::encode_embedding(
+                &mut s,
                 reg,
-                metal_dev,
+                dev,
                 &self.embed_weight,
+                &self.activations.embedding_token_id,
                 &self.activations.hidden,
-                input_token,
-                hs,
-                (hs as f32).sqrt(),
+                1,
             )
-            .map_err(|e| anyhow::anyhow!("embedding_gather_scale: {e}"))?;
-            total_dispatches += 1;
-            s.track_dispatch(&[&self.embed_weight], &[&self.activations.hidden]);
+            .map_err(|e| anyhow::anyhow!("native embedding gather: {e}"))?;
+            total_dispatches += 2;
 
             // --- Dual command buffer: split encoding at a layer boundary ---
             // Default: split after layer 3 (~10% of dispatches committed early so
@@ -982,67 +982,22 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("dump boundary re-begin: {e}"))?;
             }
 
-            // GPU lm_head: prefer Q6_K-native (HF2Q_LMHEAD_Q6K=1, ADR-028
-            // iter-188), then Q8_0 (HF2Q_LMHEAD_Q8 auto for large vocab),
-            // then F16 dense.
-            if let Some(ref q6k) = self.lm_head_q6k {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q6k.buffer],
-                    &[&self.activations.logits],
-                );
-                dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q6k,
-                    &self.activations.logits,
-                    1,
-                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                )?;
-                total_dispatches += 1;
-            } else if let Some(ref q8) = self.lm_head_q8 {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q8.buffer],
-                    &[&self.activations.logits],
-                );
-                dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q8,
-                    &self.activations.logits,
-                    1,
-                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                )?;
-                total_dispatches += 1;
-            } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-                // Mixed-precision mat-vec (F32 input × F16 weights → F32 output).
-                // Single dispatch replaces the old 3-dispatch path (cast + gemm + cast).
-                s.barrier_between(
-                    &[&self.activations.norm_out, lm_head_f16],
-                    &[&self.activations.logits],
-                );
-                let gemm_params = DenseGemmF16Params {
-                    m: 1,
-                    n: vocab_size as u32,
-                    k: hs as u32,
-                };
-                mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &self.activations.norm_out, // F32 input (no cast needed)
-                    lm_head_f16,                // F16 weights
-                    &self.activations.logits,   // F32 output (no cast needed)
-                    &gemm_params,
-                )
-                .map_err(|e| anyhow::anyhow!("lm_head mixed-precision: {e}"))?;
-                total_dispatches += 1;
-            } else {
-                anyhow::bail!("Single-session forward requires GPU lm_head (F16 weight)");
-            }
+            let lm_head = self.resolved_lm_head();
+            s.barrier_between(
+                &[&self.activations.norm_out, &lm_head.buffer],
+                &[&self.activations.logits],
+            );
+            dispatch_qmatmul(
+                &mut s,
+                reg,
+                dev,
+                &self.activations.norm_out,
+                lm_head,
+                &self.activations.logits,
+                1,
+                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+            )?;
+            total_dispatches += 1;
 
             // GPU softcap (if configured)
             if let Some(cap) = self.final_logit_softcapping {
@@ -1157,7 +1112,8 @@ impl MlxModelWeights {
         // always rejoins GpuContext, eliminating the prior leak on encode-Err
         // paths.
         if let Some(wreg) = returned_worker_reg {
-            gpu.put_worker_registry(wreg);
+            gpu.put_worker_registry(wreg)
+                .context("restore Gemma parallel worker registry")?;
         }
         // Propagate any error from the IIFE AFTER the registry has been
         // safely restored.  See INV-4 / load-bearing recv comment in
@@ -1201,71 +1157,19 @@ impl MlxModelWeights {
             }
         }
 
-        // Read the Q8 GPU argmax result (8 bytes: 1 u32 index + 1 f32 value).
-        let gpu_top1: u32 = {
-            let idx: &[u32] = self
-                .activations
-                .argmax_index
-                .as_slice()
-                .map_err(|e| anyhow::anyhow!("argmax read: {e}"))?;
-            idx[0]
-        };
+        // The GPU argmax is final: logits came directly from the artifact's
+        // declared head representation, with no synthesized dense oracle. The
+        // winning value is checked alongside its index so poisoned non-finite
+        // output cannot silently become token zero.
+        let token_id = crate::inference::argmax::read_finite_argmax_one(
+            &self.activations.argmax_index,
+            &self.activations.argmax_value,
+            vocab_size as u32,
+            "Gemma greedy output head",
+        )?;
 
-        // Q8 coarse → F32 exact rerank.
-        //
-        // Data shows Q8_0 lm_head adds ~2.5–5e-3 logit noise. Any token within
-        // that envelope of top-1 has non-trivial chance of flipping. The pad
-        // case is the most visible symptom; the mechanism is symmetric.
-        //
-        // Fix: keep Q8 for coarse scoring, but for the small set of tokens
-        // plausibly eligible to win, recompute exact F32 logits from the F32
-        // `embed_weight` (already resident) and take argmax on those.
-        //
-        // Candidate set (O(~100) tokens):
-        //   - top-K Q8 tokens (K=64)
-        //   - all tokens within delta=0.01 of Q8 top-1
-        //   - special tokens: 0 <pad>, 1 <eos>, 2 <bos>, 105 <|turn>, 106 <turn|>
-        //
-        // Rerank is skipped when lm_head is already F16 (no coarse noise to
-        // correct) or when HF2Q_LMHEAD_RERANK=0.
-        // ADR-028 iter-188: Q6_K-direct lm_head also has quantization noise
-        // and benefits from rerank against the F16 oracle (when in compare
-        // mode).  Rerank fires for any quantized lm_head path.
-        let rerank_active = (self.lm_head_q8.is_some() || self.lm_head_q6k.is_some())
-            && !INVESTIGATION_ENV.lmhead_rerank_disabled;
-        // ADR-040 S1b: the argmax→rerank→token logic is extracted to the shared
-        // `finalize_token_from_logits` (batched_head.rs) so the scalar and
-        // batched-lm_head decode paths produce BIT-IDENTICAL tokens by
-        // construction. `top1_val` is read unconditionally now (a harmless extra
-        // buffer read when rerank is inactive); `norm_out` is the post-final-norm
-        // hidden used as the exact-F32 rerank operand. This block is byte-for-byte
-        // equivalent to the prior inline rerank — pinned by the slot_aware_* +
-        // engine_serial_fifo_* byte-equivalence suite.
-        let top1_val: f32 = {
-            let v: &[f32] = self
-                .activations
-                .argmax_value
-                .as_slice()
-                .map_err(|e| anyhow::anyhow!("argmax_value read: {e}"))?;
-            v[0]
-        };
-        let token_id: u32 = {
-            let logits: &[f32] = self
-                .activations
-                .logits
-                .as_slice()
-                .map_err(|e| anyhow::anyhow!("finalize logits read: {e}"))?;
-            let normed: &[f32] = self
-                .activations
-                .norm_out
-                .as_slice()
-                .map_err(|e| anyhow::anyhow!("finalize norm_out read: {e}"))?;
-            self.finalize_token_from_logits(logits, normed, gpu_top1, top1_val)?
-        };
-
-        // Diagnostic: when <pad> (id 0) still wins AFTER rerank (or when
-        // rerank is off and <pad> wins raw), dump top-10 Q8 logits so we
-        // see whether pad is near-tie or a genuine model preference.
+        // Diagnostic: when <pad> (id 0) wins, dump the native-head logits so
+        // we can distinguish a near tie from a genuine model preference.
         if token_id == 0 {
             let logits: &[f32] = self
                 .activations
@@ -1298,9 +1202,8 @@ impl MlxModelWeights {
                 );
             }
             eprintln!(
-                "\n[PAD-DIAG] <pad> won at seq_pos={} (rerank={}). Top 10 Q8 logits:",
+                "\n[PAD-DIAG] <pad> won at seq_pos={}. Top 10 native-head logits:",
                 seq_pos,
-                if rerank_active { "on" } else { "off" }
             );
             for (tok_id, logit) in indexed.iter().take(10) {
                 eprintln!("  tok={tok_id:>6} logit={logit:>10.6}");
@@ -1345,7 +1248,7 @@ impl MlxModelWeights {
         // Three coupled hooks, gated by env vars cached at process start:
         //
         //   HF2Q_DECODE_INPUT_TOKENS  → replay fixed tokens (override pick).
-        //                               The argmax + Q8 rerank above already
+        //                               The native-head argmax above already
         //                               ran, so cosine/NLL captures see live
         //                               logits — only the *picked* token is
         //                               replaced.  Falls through to the
@@ -1564,21 +1467,23 @@ impl MlxModelWeights {
         {
             let (exec, reg) = gpu.split();
             let dev = exec.device();
-            let metal_dev = dev.metal_device();
             let mut s = exec
                 .begin()
                 .map_err(|e| anyhow::anyhow!("embed begin: {e}"))?;
-            mlx_native::ops::elementwise::embedding_gather_scale_f32(
-                s.encoder_mut(),
+            self.activations
+                .embedding_token_id
+                .as_mut_slice::<u32>()
+                .map_err(|e| anyhow::anyhow!("embedding token id write: {e}"))?[0] = input_token;
+            crate::inference::models::gemma4::native_matrix::encode_embedding(
+                &mut s,
                 reg,
-                metal_dev,
+                dev,
                 &self.embed_weight,
+                &self.activations.embedding_token_id,
                 &self.activations.hidden,
-                input_token,
-                hs,
-                (hs as f32).sqrt(),
+                1,
             )
-            .map_err(|e| anyhow::anyhow!("embedding: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("native embedding: {e}"))?;
             s.finish()
                 .map_err(|e| anyhow::anyhow!("embed finish: {e}"))?;
             // Embedding time intentionally not reported: trivial cost relative
@@ -2133,11 +2038,18 @@ impl MlxModelWeights {
                 let use_fused_id = self.layers[layer_idx].moe.stacked_gate_up.is_some()
                     && self.layers[layer_idx].moe.stacked_down.is_some();
                 if !use_fused_id {
-                    anyhow::bail!("Kernel profile requires fused _id path (stacked weights). Layer {layer_idx} missing.");
+                    anyhow::bail!(
+                        "Kernel profile requires fused _id path (stacked weights). Layer {layer_idx} missing."
+                    );
                 }
 
                 let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
                 let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
+                let native_activation_epoch = self.native_activation_epoch()?;
+                let (gate_up_affine, down_affine) = self.layers[layer_idx]
+                    .moe
+                    .affine_pair()?
+                    .map_or((None, None), |(gate_up, down)| (Some(gate_up), Some(down)));
 
                 // gate_up _id
                 let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
@@ -2149,16 +2061,39 @@ impl MlxModelWeights {
                     expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
                     ggml_type: ggml_type_gu,
                 };
-                s.quantized_matmul_id_ggml(
+                let gate_up_weight = self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap();
+                if !super::expert_dispatch::dispatch_native_scalar_expert(
+                    &mut s,
                     reg,
                     dev,
+                    native_activation_epoch,
                     &self.activations.moe_norm_out,
-                    self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                    gate_up_weight,
                     &self.activations.moe_expert_ids,
                     &self.activations.moe_gate_up_id_out,
-                    &gu_params,
-                )
-                .map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+                    gate_up_affine,
+                    ggml_type_gu,
+                    1,
+                    top_k as u32,
+                    (2 * moe_int) as u32,
+                    hs as u32,
+                    num_experts as u32,
+                    self.layers[layer_idx].moe.gate_up_expert_stride,
+                    mlx_native::DenseMatmulIdInputLayout::SharedPerToken,
+                    super::expert_dispatch::DenseExpertScratchSlot::GateUp,
+                    "Gemma profile gate/up",
+                )? {
+                    s.quantized_matmul_id_ggml(
+                        reg,
+                        dev,
+                        &self.activations.moe_norm_out,
+                        gate_up_weight,
+                        &self.activations.moe_expert_ids,
+                        &self.activations.moe_gate_up_id_out,
+                        &gu_params,
+                    )
+                    .map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+                }
 
                 // Batched SwiGLU
                 mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
@@ -2182,16 +2117,39 @@ impl MlxModelWeights {
                     expert_stride: self.layers[layer_idx].moe.down_expert_stride,
                     ggml_type: ggml_type_dn,
                 };
-                s.quantized_matmul_id_ggml(
+                let down_weight = self.layers[layer_idx].moe.stacked_down.as_ref().unwrap();
+                if !super::expert_dispatch::dispatch_native_scalar_expert(
+                    &mut s,
                     reg,
                     dev,
+                    native_activation_epoch,
                     &self.activations.moe_swiglu_id_out,
-                    self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                    down_weight,
                     &self.activations.moe_expert_ids,
                     &self.activations.moe_down_id_out,
-                    &dn_params,
-                )
-                .map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+                    down_affine,
+                    ggml_type_dn,
+                    1,
+                    top_k as u32,
+                    hs as u32,
+                    moe_int as u32,
+                    num_experts as u32,
+                    self.layers[layer_idx].moe.down_expert_stride,
+                    mlx_native::DenseMatmulIdInputLayout::Slotted,
+                    super::expert_dispatch::DenseExpertScratchSlot::Down,
+                    "Gemma profile down",
+                )? {
+                    s.quantized_matmul_id_ggml(
+                        reg,
+                        dev,
+                        &self.activations.moe_swiglu_id_out,
+                        down_weight,
+                        &self.activations.moe_expert_ids,
+                        &self.activations.moe_down_id_out,
+                        &dn_params,
+                    )
+                    .map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+                }
 
                 // Weighted sum
                 mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
@@ -2287,86 +2245,21 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("final norm: {e}"))?;
 
-            // ADR-029 §Decision item 3: kernel-profile lm_head — mirror
-            // production single-session path at ~4818: prefer Q6_K-native
-            // (HF2Q_LMHEAD_Q6K=1, ADR-028 iter-188/345, default-on when
-            // token_embd.weight is Q6_K on-disk), then Q8_0 (auto for
-            // big-vocab models like gemma4 262144), then F16 dense.
-            //
-            // Pre-ADR-029 this path only checked Q8_0/F16 and hard-failed
-            // on gemma4-APEX-Q5_K_M (Q6_K token_embd) — blocking all
-            // per-kernel-type buckets needed for MoE-1/-2/-3 audits.
-            if let Some(ref q6k) = self.lm_head_q6k {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q6k.buffer],
-                    &[&self.activations.logits],
-                );
-                dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q6k,
-                    &self.activations.logits,
-                    1,
-                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                )?;
-            } else if let Some(ref q8) = self.lm_head_q8 {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q8.buffer],
-                    &[&self.activations.logits],
-                );
-                dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q8,
-                    &self.activations.logits,
-                    1,
-                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-                )?;
-            } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-                mlx_native::ops::elementwise::cast(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &self.activations.norm_out,
-                    &self.activations.hidden_f16,
-                    hs,
-                    CastDirection::F32ToF16,
-                )
-                .map_err(|e| anyhow::anyhow!("cast F32->F16: {e}"))?;
-
-                let gemm_params = DenseGemmF16Params {
-                    m: 1,
-                    n: vocab_size as u32,
-                    k: hs as u32,
-                };
-                mlx_native::ops::dense_gemm::dispatch_dense_gemm_f16(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &self.activations.hidden_f16,
-                    lm_head_f16,
-                    &self.activations.logits_f16,
-                    &gemm_params,
-                )
-                .map_err(|e| anyhow::anyhow!("dense_gemm_f16: {e}"))?;
-
-                mlx_native::ops::elementwise::cast(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &self.activations.logits_f16,
-                    &self.activations.logits,
-                    vocab_size,
-                    CastDirection::F16ToF32,
-                )
-                .map_err(|e| anyhow::anyhow!("cast F16->F32: {e}"))?;
-            } else {
-                anyhow::bail!("Kernel profile requires GPU lm_head (Q6_K, Q8_0, or F16 weight)");
-            }
+            let lm_head = self.resolved_lm_head();
+            s.barrier_between(
+                &[&self.activations.norm_out, &lm_head.buffer],
+                &[&self.activations.logits],
+            );
+            dispatch_qmatmul(
+                &mut s,
+                reg,
+                dev,
+                &self.activations.norm_out,
+                lm_head,
+                &self.activations.logits,
+                1,
+                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+            )?;
 
             // Softcap (params pre-initialized at model load time)
             if let Some(cap) = self.final_logit_softcapping {
@@ -2401,15 +2294,12 @@ impl MlxModelWeights {
             kp.lm_head_us = gpu_ns as f64 / 1000.0;
         }
 
-        // Read argmax result
-        let token_id: u32 = {
-            let idx: &[u32] = self
-                .activations
-                .argmax_index
-                .as_slice()
-                .map_err(|e| anyhow::anyhow!("argmax read: {e}"))?;
-            idx[0]
-        };
+        let token_id = crate::inference::argmax::read_finite_argmax_one(
+            &self.activations.argmax_index,
+            &self.activations.argmax_value,
+            vocab_size as u32,
+            "Gemma profiled greedy output head",
+        )?;
 
         Ok((token_id, kp))
     }
@@ -2589,36 +2479,43 @@ impl MlxModelWeights {
         // --- Step 1: Embed tokens [tree_seq_len, hidden_size] F32 ---
         // Gemma 4 scales embeddings by sqrt(hidden_size).
         let hs_bytes = tree_seq_len * h * std::mem::size_of::<f32>();
-        let mut hidden = {
-            let scale = (h as f32).sqrt();
-            let embed_f32: &[f32] = self
-                .embed_weight
-                .as_slice()
-                .map_err(|e| anyhow!("forward_tree_verify_gpu: embed_weight slice: {e}"))?;
-            let vocab_in_buf = embed_f32.len() / h;
-            let mut cpu = vec![0.0f32; tree_seq_len * h];
-            for (i, &tok) in tree_tokens.iter().enumerate() {
-                ensure!(
-                    (tok as usize) < vocab_in_buf,
-                    "forward_tree_verify_gpu: token {} out of vocab {}",
-                    tok,
-                    vocab_in_buf
-                );
-                let src = (tok as usize) * h;
-                let dst = i * h;
-                cpu[dst..dst + h].copy_from_slice(&embed_f32[src..src + h]);
-            }
-            for v in cpu.iter_mut() {
-                *v *= scale;
-            }
-            let mut buf = device
-                .alloc_buffer(hs_bytes, DType::F32, vec![tree_seq_len, h])
-                .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc embed: {e}"))?;
-            buf.as_mut_slice::<f32>()
-                .map_err(|e| anyhow!("forward_tree_verify_gpu: embed slice: {e}"))?
-                .copy_from_slice(&cpu);
-            buf
-        };
+        for &token in tree_tokens {
+            ensure!(
+                (token as usize) < self.embed_weight.info.rows,
+                "forward_tree_verify_gpu: token {} out of vocab {}",
+                token,
+                self.embed_weight.info.rows
+            );
+        }
+        let mut tree_token_ids = device
+            .alloc_buffer(
+                tree_seq_len * std::mem::size_of::<u32>(),
+                DType::U32,
+                vec![tree_seq_len],
+            )
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc token ids: {e}"))?;
+        tree_token_ids
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: token id slice: {e}"))?
+            .copy_from_slice(tree_tokens);
+        let mut hidden = device
+            .alloc_buffer(hs_bytes, DType::F32, vec![tree_seq_len, h])
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc embed: {e}"))?;
+        let mut embed_session = exec
+            .begin()
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: begin embed: {e}"))?;
+        crate::inference::models::gemma4::native_matrix::encode_embedding(
+            &mut embed_session,
+            registry,
+            device,
+            &self.embed_weight,
+            &tree_token_ids,
+            &hidden,
+            tree_seq_len,
+        )?;
+        embed_session
+            .finish()
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: finish embed: {e}"))?;
 
         // --- Step 2: Upload tree_mask and tree_positions to GPU ---
         let mask_bytes = tree_seq_len * mask_stride * std::mem::size_of::<f32>();
@@ -2768,8 +2665,14 @@ impl MlxModelWeights {
                         .fold(0.0f32, |acc, x| acc.max(x.abs()));
                     eprintln!(
                         "[g4-nan-debug] post-layer-{layer_idx} ({:?}): finite={} nan={} inf={} max_abs={:.3e} pos0_first5={:?} last_max_abs={:.3e} last_first5={:?}",
-                        lw.layer_type, n_finite, n_nan, n_inf, max_abs,
-                        pos0_first5, last_max_abs, last_first5,
+                        lw.layer_type,
+                        n_finite,
+                        n_nan,
+                        n_inf,
+                        max_abs,
+                        pos0_first5,
+                        last_max_abs,
+                        last_first5,
                     );
                 }
             }
@@ -2820,104 +2723,27 @@ impl MlxModelWeights {
         .context("forward_tree_verify_gpu: final rms_norm")?;
         enc_head.memory_barrier();
 
-        // lm_head projection: prefer quantized, fallback to F16 GEMM.
-        if let Some(ref q6k) = self.lm_head_q6k {
-            let mut s = exec
-                .begin()
-                .map_err(|e| anyhow!("forward_tree_verify_gpu: begin session q6k: {e}"))?;
-            // Commit the norm encoder first.
-            enc_head
-                .commit_and_wait()
-                .context("forward_tree_verify_gpu: enc_head commit (q6k path)")?;
-            dispatch_qmatmul(
-                &mut s,
-                registry,
-                device,
-                &normed,
-                q6k,
-                &logits,
-                tree_seq_len as u32,
-                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-            )
-            .context("forward_tree_verify_gpu: lm_head q6k")?;
-            s.finish()
-                .map_err(|e| anyhow!("forward_tree_verify_gpu: finish q6k session: {e}"))?;
-        } else if let Some(ref q8) = self.lm_head_q8 {
-            enc_head
-                .commit_and_wait()
-                .context("forward_tree_verify_gpu: enc_head commit (q8 path)")?;
-            let mut s = exec
-                .begin()
-                .map_err(|e| anyhow!("forward_tree_verify_gpu: begin session q8: {e}"))?;
-            dispatch_qmatmul(
-                &mut s,
-                registry,
-                device,
-                &normed,
-                q8,
-                &logits,
-                tree_seq_len as u32,
-                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
-            )
-            .context("forward_tree_verify_gpu: lm_head q8")?;
-            s.finish()
-                .map_err(|e| anyhow!("forward_tree_verify_gpu: finish q8 session: {e}"))?;
-        } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-            // Multi-row F16 lm_head: cast F32→F16, then GEMM, then cast F16→F32.
-            let normed_f16_bytes = tree_seq_len * h * 2; // 2 bytes per f16
-            let normed_f16 = device
-                .alloc_buffer(normed_f16_bytes, DType::F16, vec![tree_seq_len, h])
-                .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc normed_f16: {e}"))?;
-            let logits_f16_bytes = tree_seq_len * vocab_size * 2;
-            let logits_f16 = device
-                .alloc_buffer(logits_f16_bytes, DType::F16, vec![tree_seq_len, vocab_size])
-                .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc logits_f16: {e}"))?;
-
-            mlx_native::ops::elementwise::cast(
-                &mut enc_head,
-                registry,
-                metal_dev,
-                &normed,
-                &normed_f16,
-                tree_seq_len * h,
-                CastDirection::F32ToF16,
-            )
-            .map_err(|e| anyhow!("forward_tree_verify_gpu: cast F32→F16: {e}"))?;
-            enc_head.memory_barrier();
-            let gemm_params = DenseGemmF16Params {
-                m: tree_seq_len as u32,
-                n: vocab_size as u32,
-                k: h as u32,
-            };
-            mlx_native::ops::dense_gemm::dispatch_dense_gemm_f16(
-                &mut enc_head,
-                registry,
-                metal_dev,
-                &normed_f16,
-                lm_head_f16,
-                &logits_f16,
-                &gemm_params,
-            )
-            .map_err(|e| anyhow!("forward_tree_verify_gpu: dense_gemm_f16: {e}"))?;
-            enc_head.memory_barrier();
-            mlx_native::ops::elementwise::cast(
-                &mut enc_head,
-                registry,
-                metal_dev,
-                &logits_f16,
-                &logits,
-                tree_seq_len * vocab_size,
-                CastDirection::F16ToF32,
-            )
-            .map_err(|e| anyhow!("forward_tree_verify_gpu: cast F16→F32: {e}"))?;
-            enc_head
-                .commit_and_wait()
-                .context("forward_tree_verify_gpu: enc_head commit (f16 path)")?;
-        } else {
-            return Err(anyhow!(
-                "forward_tree_verify_gpu: no lm_head weight available (need q6k, q8, or f16)"
-            ));
-        }
+        enc_head
+            .commit_and_wait()
+            .context("forward_tree_verify_gpu: final norm commit")?;
+        let lm_head = self.resolved_lm_head();
+        let mut head_session = exec
+            .begin()
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: begin head session: {e}"))?;
+        dispatch_qmatmul(
+            &mut head_session,
+            registry,
+            device,
+            &normed,
+            lm_head,
+            &logits,
+            tree_seq_len as u32,
+            crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+        )
+        .context("forward_tree_verify_gpu: native lm_head")?;
+        head_session
+            .finish()
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: finish head session: {e}"))?;
 
         // Optional final_logit_softcapping.
         if let Some(cap) = self.final_logit_softcapping {
@@ -2956,6 +2782,10 @@ impl MlxModelWeights {
             .as_slice::<f32>()
             .map_err(|e| anyhow!("forward_tree_verify_gpu: download logits: {e}"))?
             .to_vec();
+        crate::inference::argmax::validate_finite_logits(
+            &logits_data,
+            "Gemma tree verifier readback",
+        )?;
         Ok(logits_data)
     }
 
@@ -3009,7 +2839,8 @@ mod g4_cfa3_tests {
     };
     use crate::inference::spec_decode::eagle3::multi_layer_hidden::Eagle3HiddenCollector;
     use crate::serve::config::LayerType;
-    use crate::serve::gpu::GpuContext;
+    use crate::serve::forward_mlx_shared::MlxQWeight;
+    use crate::serve::gpu::{GpuContext, QuantWeightInfo};
     use mlx_native::{DType, MlxDevice};
 
     fn try_device() -> Option<MlxDevice> {
@@ -3067,7 +2898,6 @@ mod g4_cfa3_tests {
                 cols,
             },
             affine: None,
-            f16_shadow: None,
             decode_record_q6k_m1: std::sync::OnceLock::new(),
         }
     }
@@ -3157,20 +2987,19 @@ mod g4_cfa3_tests {
     ) -> MlxModelWeights {
         // embed_weight: [vocab, hidden] F32 with small random values.
         let embed_data = mk_rand_g4(seed, vocab * hidden, 0.01);
-        let embed_weight = alloc_f32_g4(&embed_data, device);
+        let embed_weight = MlxQWeight {
+            buffer: alloc_f32_g4(&embed_data, device),
+            info: QuantWeightInfo {
+                ggml_dtype: mlx_native::GgmlType::F32,
+                rows: vocab,
+                cols: hidden,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        };
 
         // final_norm: [hidden] F32 ones.
         let final_norm = alloc_f32_g4(&vec![1.0f32; hidden], device);
-
-        // lm_head_f16: [vocab, hidden] F16 zero-initialized (test only).
-        // Actual F32→F16 conversion requires a Metal kernel; zeros still
-        // produce finite logits after the rms_norm.
-        let lm_head_f16 = {
-            let bytes = vocab * hidden * 2;
-            device
-                .alloc_buffer(bytes, DType::F16, vec![vocab, hidden])
-                .expect("lm_head_f16")
-        };
 
         // Build layer weights (all sliding).
         let layers: Vec<MlxDecoderLayerWeights> = (0..n_layers)
@@ -3186,6 +3015,7 @@ mod g4_cfa3_tests {
         // forward_tree_verify_gpu (for Full/global layers, which we don't have).
         // All other fields are placeholder 1-element buffers.
         let activations = MlxActivationBuffers {
+            embedding_token_id: alloc_placeholder_u32(device),
             hidden: alloc_placeholder_f32(device),
             attn_q: alloc_placeholder_f32(device),
             attn_k: alloc_placeholder_f32(device),
@@ -3214,12 +3044,6 @@ mod g4_cfa3_tests {
             moe_gate_up_id_out: alloc_placeholder_f32(device),
             moe_down_id_out: alloc_placeholder_f32(device),
             moe_swiglu_id_out: alloc_placeholder_f32(device),
-            hidden_f16: device
-                .alloc_buffer(2, DType::F16, vec![1])
-                .expect("hidden_f16"),
-            logits_f16: device
-                .alloc_buffer(2, DType::F16, vec![1])
-                .expect("logits_f16"),
             norm_params_sliding_hd: alloc_placeholder_f32(device),
             norm_params_global_hd: alloc_placeholder_f32(device),
             // rope_freq_factors_gpu: only accessed for Full (global) layers.
@@ -3232,12 +3056,11 @@ mod g4_cfa3_tests {
         };
 
         MlxModelWeights {
+            native_activation_epoch: std::sync::atomic::AtomicU64::new(0),
             embed_weight,
             layers,
             final_norm,
-            lm_head_f16: Some(lm_head_f16),
-            lm_head_q8: None,
-            lm_head_q6k: None,
+            lm_head: None,
             hidden_size: hidden,
             vocab_size: vocab,
             num_attention_heads: nq,
@@ -3267,6 +3090,118 @@ mod g4_cfa3_tests {
             decode_record_rms_norm_f32_hs: std::sync::OnceLock::new(),
             multi_seq_prefill: None,
         }
+    }
+
+    #[test]
+    fn partial_affine_overlay_fails_before_any_native_plan_is_frozen() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut gpu = GpuContext::new().expect("GPU context");
+        let device = gpu.device().clone();
+        let mut seed = 0x51A7_u32;
+        let mut model = mk_tiny_g4_model(1, 256, 1, 1, 256, 256, 256, &mut seed, &device);
+
+        let q_buffer = device
+            .alloc_buffer(256 * 256 * 2, DType::BF16, vec![256, 256])
+            .expect("native BF16 Q matrix");
+        model.layers[0].attn.q_proj = MlxQWeight {
+            buffer: q_buffer,
+            info: QuantWeightInfo {
+                ggml_dtype: mlx_native::GgmlType::BF16,
+                rows: 256,
+                cols: 256,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        };
+        let alloc = |elements: usize, dtype: DType| {
+            device
+                .alloc_buffer(elements * dtype.size_of(), dtype, vec![elements])
+                .expect("affine fixture buffer")
+        };
+        model.layers[0].moe.gate_up_affine =
+            Some(crate::serve::forward_mlx_shared::MlxAffineMoeStack {
+                weight: alloc(4 * 32 * 4, DType::U32),
+                scales: alloc(4 * 32, DType::BF16),
+                biases: alloc(4 * 32, DType::BF16),
+                n: 32,
+                k: 32,
+                bits: 4,
+                group_size: 32,
+                num_experts: 4,
+            });
+
+        let error = model
+            .activate_native_routes(&mut gpu, &[])
+            .expect_err("partial affine overlay must fail preflight");
+        assert!(error
+            .to_string()
+            .contains("must replace gate/up and down together"));
+        assert!(gpu.registry.dense_bf16_plan().is_none());
+        assert!(gpu.registry.dense_matmul_id_plan().is_none());
+    }
+
+    #[test]
+    fn malformed_complete_affine_overlay_fails_before_any_route_activation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut gpu = GpuContext::new().expect("GPU context");
+        let device = gpu.device().clone();
+        let mut seed = 0xA661_u32;
+        let mut model = mk_tiny_g4_model(1, 256, 1, 1, 256, 256, 256, &mut seed, &device);
+        let alloc = |elements: usize, dtype: DType| {
+            device
+                .alloc_buffer(elements * dtype.size_of(), dtype, vec![elements])
+                .expect("affine fixture buffer")
+        };
+        let malformed = crate::serve::forward_mlx_shared::MlxAffineMoeStack {
+            weight: alloc(4 * 32 * 4, DType::U32),
+            scales: alloc(4 * 32, DType::BF16),
+            biases: alloc(4 * 32, DType::BF16),
+            n: 32,
+            k: 32,
+            bits: 4,
+            group_size: 32,
+            num_experts: 4,
+        };
+        model.layers[0].moe.gate_up_affine = Some(malformed.clone());
+        model.layers[0].moe.down_affine = Some(malformed);
+
+        let error = model
+            .activate_native_routes(&mut gpu, &[])
+            .expect_err("complete malformed affine overlay must fail preflight");
+        assert!(error.to_string().contains("affine shape"));
+        assert!(gpu.registry.dense_bf16_plan().is_none());
+        assert!(gpu.registry.dense_matmul_id_plan().is_none());
+        assert_eq!(
+            model
+                .native_activation_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn late_dwq_overlay_after_activation_fails_without_mutation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("Metal device");
+        let mut seed = 0x1A7E_u32;
+        let mut model = mk_tiny_g4_model(1, 256, 1, 1, 256, 256, 256, &mut seed, &device);
+        let before = model.layers[0].attn.q_proj.buffer.contents_ptr();
+        model
+            .native_activation_epoch
+            .store(7, std::sync::atomic::Ordering::Release);
+        let error = model
+            .apply_dwq_overlay(&device, std::path::Path::new("does-not-need-to-exist"))
+            .expect_err("late overlay must fail before file access or mutation");
+        assert!(error
+            .to_string()
+            .contains("after native routes are activated"));
+        assert_eq!(model.layers[0].attn.q_proj.buffer.contents_ptr(), before);
+        assert_eq!(
+            model
+                .native_activation_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            7
+        );
     }
 
     /// Build a causal tree mask [tree_seq_len, mask_stride] where each query
@@ -3533,11 +3468,17 @@ mod g4_cfa3_tests {
         };
 
         let embed_data = mk_rand_g4(&mut seed, vocab * hidden, 0.01);
-        let embed_weight = alloc_f32_g4(&embed_data, &device);
+        let embed_weight = MlxQWeight {
+            buffer: alloc_f32_g4(&embed_data, &device),
+            info: QuantWeightInfo {
+                ggml_dtype: mlx_native::GgmlType::F32,
+                rows: vocab,
+                cols: hidden,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        };
         let final_norm = alloc_f32_g4(&vec![1.0f32; hidden], &device);
-        let lm_head_f16 = device
-            .alloc_buffer(vocab * hidden * 2, DType::F16, vec![vocab, hidden])
-            .expect("lm_head_f16");
 
         let kv_caches = vec![
             mk_placeholder_kv_cache(&device),
@@ -3548,6 +3489,7 @@ mod g4_cfa3_tests {
         let freq_factors = alloc_f32_g4(&vec![1.0f32; global_head_dim_half], &device);
 
         let activations = MlxActivationBuffers {
+            embedding_token_id: alloc_placeholder_u32(&device),
             hidden: alloc_placeholder_f32(&device),
             attn_q: alloc_placeholder_f32(&device),
             attn_k: alloc_placeholder_f32(&device),
@@ -3576,12 +3518,6 @@ mod g4_cfa3_tests {
             moe_gate_up_id_out: alloc_placeholder_f32(&device),
             moe_down_id_out: alloc_placeholder_f32(&device),
             moe_swiglu_id_out: alloc_placeholder_f32(&device),
-            hidden_f16: device
-                .alloc_buffer(2, DType::F16, vec![1])
-                .expect("hidden_f16"),
-            logits_f16: device
-                .alloc_buffer(2, DType::F16, vec![1])
-                .expect("logits_f16"),
             norm_params_sliding_hd: alloc_placeholder_f32(&device),
             norm_params_global_hd: alloc_placeholder_f32(&device),
             rope_freq_factors_gpu: freq_factors,
@@ -3592,12 +3528,11 @@ mod g4_cfa3_tests {
         };
 
         let model = MlxModelWeights {
+            native_activation_epoch: std::sync::atomic::AtomicU64::new(0),
             embed_weight,
             layers: vec![sliding_layer, global_layer],
             final_norm,
-            lm_head_f16: Some(lm_head_f16),
-            lm_head_q8: None,
-            lm_head_q6k: None,
+            lm_head: None,
             hidden_size: hidden,
             vocab_size: vocab,
             num_attention_heads: nq_sliding, // nq_sliding == nq_global == 1

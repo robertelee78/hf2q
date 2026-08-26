@@ -655,9 +655,9 @@ pub fn build_tokenizer_metadata(
         }
     } else if matches!(
         arch,
-        ArchName::Qwen3VlText | ArchName::Qwen35 | ArchName::Qwen35Moe | ArchName::Qwen35MoeFull
+        ArchName::Qwen35 | ArchName::Qwen35Moe | ArchName::Qwen35MoeFull
     ) {
-        // Qwen3-VL Text decoder emit order — canonical
+        // Qwen decoder emit order.
         // `Qwen2Model.set_vocab` calls `_set_vocab_gpt2` (base.py:1603-1611):
         //   model = 'gpt2'
         //   pre = 'qwen2'  ← right after model
@@ -677,7 +677,7 @@ pub fn build_tokenizer_metadata(
         // No `scores` (BPE doesn't call add_token_scores).
         // No `add_space_prefix`.
         // No `unknown_token_id` / `seperator_token_id` / `mask_token_id`
-        //   (not present in tokenizer_config for Qwen3-VL).
+        //   (not present in every Qwen tokenizer config).
         kv.push((
             "tokenizer.ggml.model".into(),
             MetaValue::String(tokenizer_model_name),
@@ -711,7 +711,7 @@ pub fn build_tokenizer_metadata(
             kv.push(("tokenizer.ggml.padding_token_id".into(), MetaValue::U32(id)));
         }
         // bos_id from config.json's `bos_token_id` (NOT
-        // tokenizer_config's `bos_token` which is null for Qwen3-VL).
+        // tokenizer_config's `bos_token`, which may be null).
         // Read directly from config.json via the helper below.
         let bos_from_config = read_bos_token_id_from_config(model_dir);
         if let Some(id) = bos_from_config.or(bos_id) {
@@ -1052,9 +1052,8 @@ pub fn build_tokenizer_metadata(
 /// (matches canonical `bert.py:233` —
 /// `self.hparams.get("type_vocab_size", 1)`).
 /// Read `bos_token_id` from `<dir>/config.json` (NOT
-/// tokenizer_config.json). Used by Qwen3-VL tokenizer branch
-/// since its tokenizer_config has `bos_token: null` but its
-/// config.json carries an explicit `bos_token_id: 151643`.
+/// tokenizer_config.json). Some Qwen tokenizer configs carry the
+/// explicit value only in config.json.
 ///
 /// Mirrors canonical's `SpecialVocab._try_load_from_config_json`
 /// (vocab.py:316-328) which iterates special_token_types and reads
@@ -1101,7 +1100,7 @@ fn extract_precompiled_charsmap(tokenizer_json: &serde_json::Value) -> Option<Ve
 }
 
 /// Read the model's full `vocab_size` from `config.json`, preferring
-/// `text_config.vocab_size` (Gemma 4 / Qwen3-VL multimodal-wrapper
+/// `text_config.vocab_size` (multimodal-wrapper
 /// style) before the top-level key. Same precedence as the legacy
 /// reader at `gguf.rs:2717`.
 fn read_full_vocab_size_from_config(dir: &Path) -> Option<u64> {
@@ -1233,9 +1232,6 @@ fn determine_pre_tokenizer_type(arch: ArchName) -> String {
         // Both the older qwen3moe variant AND the new qwen35moe
         // (linear-attn + MTP) use the same pre-tokenizer rules.
         ArchName::Qwen35 | ArchName::Qwen35Moe | ArchName::Qwen35MoeFull => "qwen35".into(),
-        // Qwen2-family pre-tokenizer also used
-        // by Qwen3-VL text-side decoders.
-        ArchName::Qwen3VlText => "qwen2".into(),
         // Gemma 4 (and Gemma 3 → same bucket).
         ArchName::Gemma4 | ArchName::Gemma4Mmproj | ArchName::Gemma4VisionMmproj => "gemma4".into(),
         // LLaMA 3 BPE family.

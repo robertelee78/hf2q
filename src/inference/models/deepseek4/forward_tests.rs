@@ -1,5 +1,5 @@
 use super::model::Deepseek4Model;
-use super::residency_tests::{open_fixture, tiny_config};
+use super::residency_tests::{open_fixture, open_fixture_with_embedding_type, tiny_config};
 use mlx_native::{DType, GgmlType};
 
 #[test]
@@ -34,6 +34,111 @@ fn embedding_forward_rejects_empty_input() {
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let mut model = Deepseek4Model::load_from_gguf(&gguf).unwrap();
     assert!(model.embed_hyper_state(&[]).is_err());
+    let error = model
+        .embed_hyper_state(&[cfg.vocab_size])
+        .expect_err("out-of-vocabulary token must fail before encoding");
+    assert!(error.to_string().contains("exceeds vocabulary"));
+}
+
+#[test]
+fn native_bf16_embeddings_are_gathered_from_the_artifact_representation() {
+    let cfg = tiny_config();
+    let (_directory, gguf) = open_fixture(&cfg, false, false);
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut model = Deepseek4Model::load_from_gguf(&gguf).unwrap();
+    let vocab = cfg.vocab_size as usize;
+    let hidden = cfg.hidden_size as usize;
+    let values: Vec<half::bf16> = (0..vocab * hidden)
+        .map(|index| half::bf16::from_f32(((index % 43) as f32 - 21.0) / 8.0))
+        .collect();
+    let mut weight = model
+        .ctx
+        .device()
+        .alloc_buffer(
+            values.len() * DType::BF16.size_of(),
+            DType::BF16,
+            vec![vocab, hidden],
+        )
+        .unwrap();
+    weight
+        .as_mut_slice::<half::bf16>()
+        .unwrap()
+        .copy_from_slice(&values);
+    let arena = model.prepare_embedding_arena(&[3, 1]).unwrap();
+    let (executor, registry) = model.ctx.split();
+    let mut session = executor.begin().unwrap();
+    Deepseek4Model::encode_embedding_hyper_state(
+        &mut session,
+        registry,
+        executor.device(),
+        &weight,
+        GgmlType::BF16,
+        &[vocab, hidden],
+        &arena,
+        2,
+        vocab,
+        hidden,
+        cfg.hyper_connection_count,
+    )
+    .unwrap();
+    session.finish().unwrap();
+
+    let actual = arena.state.as_slice::<f32>().unwrap();
+    for (token_slot, token_id) in [3usize, 1].into_iter().enumerate() {
+        let expected: Vec<f32> = values[token_id * hidden..(token_id + 1) * hidden]
+            .iter()
+            .map(|value| value.to_f32())
+            .collect();
+        for lane in 0..cfg.hyper_connection_count as usize {
+            let offset = (token_slot * cfg.hyper_connection_count as usize + lane) * hidden;
+            assert_eq!(&actual[offset..offset + hidden], expected);
+        }
+    }
+    assert_eq!(weight.dtype(), DType::BF16);
+    assert_eq!(weight.data_byte_len(), values.len() * 2);
+}
+
+#[test]
+fn q5_embeddings_run_directly_from_their_gguf_blocks() {
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    for (fixture_type, native_type) in [
+        (crate::quantize::ggml_quants::GgmlType::Q5_0, GgmlType::Q5_0),
+        (crate::quantize::ggml_quants::GgmlType::Q5_K, GgmlType::Q5_K),
+    ] {
+        let cfg = tiny_config();
+        let (_directory, gguf) =
+            open_fixture_with_embedding_type(&cfg, false, false, Some(fixture_type));
+        let mut model = Deepseek4Model::load_from_gguf(&gguf).unwrap();
+        let embedding = model.weights.raw_matrix_ref("token_embd.weight").unwrap();
+        assert_eq!(embedding.ggml_type, native_type);
+        assert_eq!(embedding.buffer.dtype(), DType::U8);
+        assert!(embedding.buffer.is_file_backed());
+
+        let expected_table = gguf
+            .load_tensor_f32("token_embd.weight", model.ctx.device())
+            .unwrap();
+        let expected_table = expected_table.as_slice::<f32>().unwrap();
+        let actual = model.embed_hyper_state(&[2, 0]).unwrap();
+        let actual = actual.as_slice::<f32>().unwrap();
+        let hidden = cfg.hidden_size as usize;
+        for (token_slot, token_id) in [2usize, 0].into_iter().enumerate() {
+            let expected = &expected_table[token_id * hidden..(token_id + 1) * hidden];
+            assert!(expected.iter().any(|value| *value != 0.0));
+            for lane in 0..cfg.hyper_connection_count as usize {
+                let offset = (token_slot * cfg.hyper_connection_count as usize + lane) * hidden;
+                for (column, (actual, expected)) in actual[offset..offset + hidden]
+                    .iter()
+                    .zip(expected)
+                    .enumerate()
+                {
+                    assert!(
+                        (actual - expected).abs() <= 1e-6,
+                        "{native_type:?} embedding column {column}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

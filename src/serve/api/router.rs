@@ -419,6 +419,7 @@ mod tests {
             "hf2q_requests_total",
             "hf2q_chat_completions_started",
             "hf2q_decode_tokens_total",
+            "hf2q_deepseek4_anchor_aggregate_owned_bytes",
             "# HELP",
             "# TYPE",
         ] {
@@ -1484,6 +1485,19 @@ mod tests {
         assert_eq!(runtime.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_str(&body_string(runtime).await).unwrap();
         assert_eq!(body["schema_version"], "hf2q.runtime.v1");
+        assert_eq!(body["process_policy"]["schema_version"], 1);
+        assert_eq!(
+            body["process_policy"]["ggml_routing"]["dense_q5k_canonical_q4x4"],
+            mlx_native::GgmlRoutingPolicy::default().dense_q5k_canonical_q4x4
+        );
+        assert!(body["process_policy_sha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64));
+        assert_eq!(
+            body["routing_observation"]["q5_canonical_route"],
+            "dense_q5k_canonical_q4x4"
+        );
+        assert!(body["routing_observation"]["q5_canonical_route_dispatches"].is_u64());
         assert_eq!(body["capabilities"]["non_evicting_load"], true);
         assert_eq!(
             body["capabilities"]["artifact_resolution"],
@@ -1804,11 +1818,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_switch_loads_off_runtime_and_returns_the_new_resident() {
+    async fn explicit_switch_rejects_unloadable_candidate_before_victim_or_loader() {
         use crate::serve::quant_select::QuantType;
         use std::sync::atomic::Ordering;
 
-        let (state, _victim_engine, loader_calls) =
+        let (state, victim_engine, loader_calls) =
             single_capacity_state_with_runtime_warmup_loader();
         let target = activation_target(500);
         let victim = state.pool.read().unwrap().iter_loaded().next().unwrap();
@@ -1836,32 +1850,27 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let receipt: serde_json::Value =
-            serde_json::from_str(&body_string(response).await).unwrap();
-        assert_eq!(receipt["status"], "switched");
-        assert!(receipt["pool_revision"].as_u64().unwrap() > expected_revision);
-        assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
-
-        let candidate_repo = receipt["candidate"]["repo"].as_str().unwrap();
-        let replacement = {
+        let status = response.status();
+        let response_body = body_string(response).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid candidate must fail preflight: {response_body}"
+        );
+        let receipt: serde_json::Value = serde_json::from_str(&response_body).unwrap();
+        assert_eq!(receipt["code"], "candidate_preflight_failed");
+        assert_eq!(receipt["restart_required"], false);
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 0);
+        {
             let manager = state.pool.read().unwrap();
             assert!(manager
                 .try_get("resident/model", QuantType::Q4_K_M)
-                .is_none());
-            manager
-                .try_get(candidate_repo, QuantType::Q4_K_M)
-                .expect("replacement must be resident")
-        };
-        assert_eq!(
-            replacement.config_identity.engine_mode,
-            super::super::engine::EngineMode::SlotAware { max_slots: 7 }
-        );
-        assert_eq!(
-            replacement.config_identity.kv_cache_budget_bytes,
-            Some(777_777)
-        );
-        replacement.engine.shutdown().await.unwrap();
+                .is_some());
+            assert_eq!(manager.pool_stats().revision, expected_revision);
+            assert_eq!(manager.pool_stats().loaded_count, 1);
+        }
+        assert!(victim_engine.is_worker_healthy());
+        victim_engine.shutdown().await.unwrap();
     }
 
     // ────────────────────────────────────────────────────────────────

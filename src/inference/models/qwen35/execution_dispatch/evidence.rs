@@ -11,7 +11,6 @@ use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use mlx_native::metal::foreign_types::ForeignType;
 use mlx_native::ops::quantized_matmul_ggml::{
     quantized_matmul_ggml as legacy_quantized_matmul_ggml, quantized_matmul_ggml_with_policy,
     quantized_matmul_ggml_with_policy_and_trace, GgmlQuantizedMatmulParams,
@@ -36,7 +35,7 @@ thread_local! {
 }
 
 struct TraceCaptureState {
-    weight_slots: BTreeMap<usize, Qwen35TraceWeightSlot>,
+    weight_slots: BTreeMap<Qwen35TraceWeightKey, Qwen35TraceWeightSlot>,
     workload: GgmlWorkloadClass,
     observations: Vec<Qwen35EncodedDispatchObservation>,
 }
@@ -61,6 +60,8 @@ pub(crate) struct Qwen35TraceWeightSlot {
     pub operation_id: String,
     pub executed_tensor_node_id: String,
 }
+
+pub(crate) type Qwen35TraceWeightKey = (usize, u64, usize);
 
 struct ActiveExecutionGuard;
 
@@ -121,7 +122,7 @@ pub(in crate::inference::models::qwen35) fn source_teacher_scope_active() -> boo
 
 pub(super) fn with_execution_trace_capture<T>(
     configuration: &Qwen35ExecutionConfiguration,
-    weight_slots: BTreeMap<usize, Qwen35TraceWeightSlot>,
+    weight_slots: BTreeMap<Qwen35TraceWeightKey, Qwen35TraceWeightSlot>,
     workload: GgmlWorkloadClass,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<(T, Vec<Qwen35EncodedDispatchObservation>)> {
@@ -154,8 +155,12 @@ pub(super) fn with_execution_trace_capture<T>(
     Ok((value, observations))
 }
 
-fn buffer_key(buffer: &MlxBuffer) -> usize {
-    buffer.metal_buffer().as_ptr() as usize
+fn buffer_key(buffer: &MlxBuffer) -> Qwen35TraceWeightKey {
+    (
+        buffer.contents_ptr() as usize,
+        buffer.byte_offset(),
+        buffer.data_byte_len(),
+    )
 }
 
 fn fused_gate_up_operation_id(
@@ -272,12 +277,6 @@ define_fused_gate_up_wrapper!(
     mlx_native::ops::fused_gate_up_silu_q4_K::dispatch_fused_gate_up_silu_q4_K,
     mlx_native::ops::fused_gate_up_silu_q4_K::dispatch_fused_gate_up_silu_q4_K_with_trace,
     mlx_native::ops::fused_gate_up_silu_q4_K::FusedGateUpSiluQ4_KArgs
-);
-define_fused_gate_up_wrapper!(
-    dispatch_fused_gate_up_silu_q5_k,
-    mlx_native::ops::fused_gate_up_silu_q5_K::dispatch_fused_gate_up_silu_q5_K,
-    mlx_native::ops::fused_gate_up_silu_q5_K::dispatch_fused_gate_up_silu_q5_K_with_trace,
-    mlx_native::ops::fused_gate_up_silu_q5_K::FusedGateUpSiluQ5_KArgs
 );
 define_fused_gate_up_wrapper!(
     dispatch_fused_gate_up_silu_q6_k,
@@ -449,7 +448,20 @@ pub(super) fn fused_stage_ab_vec_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_native::GgmlRoutingPolicy;
+    use mlx_native::{DType, GgmlRoutingPolicy, MlxDevice};
+
+    #[test]
+    fn trace_weight_identity_distinguishes_views_and_collapses_clones() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        let parent = device
+            .alloc_buffer(64, DType::U8, vec![64])
+            .expect("allocate trace identity fixture");
+        let first = parent.slice_view(0, 32);
+        let second = parent.slice_view(32, 32);
+        assert_ne!(buffer_key(&first), buffer_key(&second));
+        assert_eq!(buffer_key(&first), buffer_key(&first.clone()));
+    }
 
     #[test]
     fn scoped_graph_switches_are_canonical_and_environment_independent() {

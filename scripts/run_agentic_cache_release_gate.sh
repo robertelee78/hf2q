@@ -4,14 +4,15 @@ set -euo pipefail
 # Exact-artifact, one-model-at-a-time cache lifecycle release authority.
 # This wrapper is intentionally macOS/Apple-Silicon only. It continuously
 # requires AC power, holds a caffeinate assertion, runs the same user-shaped
-# lifecycle fixture for DeepSeek, Gemma, and Qwen, and binds all receipts to
-# one packed crate and release binary.
+# lifecycle fixture for DeepSeek, Gemma, Qwen3.6, and Qwen3.8, and binds all
+# receipts to one packed crate and release binary.
 
 EXPECTED_SHA=${EXPECTED_SHA:?EXPECTED_SHA is required}
 CRATE_SHA256=${CRATE_SHA256:?CRATE_SHA256 is required}
 DEPENDENCY_PROVENANCE_DIR=${DEPENDENCY_PROVENANCE_DIR:?DEPENDENCY_PROVENANCE_DIR is required}
 HF2Q_BIN=${HF2Q_BIN:?HF2Q_BIN is required}
 EXPECTED_BINARY_SHA256=${EXPECTED_BINARY_SHA256:?EXPECTED_BINARY_SHA256 is required}
+HF2Q_SOURCE_ROOT=${HF2Q_SOURCE_ROOT:?HF2Q_SOURCE_ROOT is required}
 DEEPSEEK_MODEL=${DEEPSEEK_MODEL:?DEEPSEEK_MODEL is required}
 GEMMA_MODEL=${GEMMA_MODEL:?GEMMA_MODEL is required}
 QWEN_MODEL=${QWEN_MODEL:?QWEN_MODEL is required}
@@ -27,6 +28,8 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/qwen36_watchdog_validate.sh"
 # shellcheck source=scripts/macos_thermal_guard.sh
 source "$script_dir/macos_thermal_guard.sh"
+# shellcheck source=scripts/agentic_cache_lifecycle_contract.sh
+source "$script_dir/agentic_cache_lifecycle_contract.sh"
 
 if [[ ${MLX_NATIVE_SKIP_METALLIB+x} ]]; then
   echo "MLX_NATIVE_SKIP_METALLIB is forbidden for exact-artifact release builds" >&2
@@ -56,11 +59,18 @@ done
   echo "EXPECTED_SHA must be a full Git SHA" >&2
   exit 2
 }
+[[ "$HF2Q_SOURCE_ROOT" == /* \
+  && "$(git -C "$HF2Q_SOURCE_ROOT" rev-parse HEAD)" == "$EXPECTED_SHA" \
+  && -z "$(git -C "$HF2Q_SOURCE_ROOT" status --porcelain --untracked-files=all)" ]] || {
+  echo "HF2Q_SOURCE_ROOT must be the clean exact release checkout" >&2
+  exit 2
+}
 [[ "$CRATE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
   echo "CRATE_SHA256 must be a SHA-256 digest" >&2
   exit 2
 }
 [[ -x "$HF2Q_BIN" ]] || { echo "hf2q binary not executable: $HF2Q_BIN" >&2; exit 2; }
+export HF2Q_MODEL_VERIFICATION_BINARY="$HF2Q_BIN"
 [[ "$EXPECTED_BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
   echo "EXPECTED_BINARY_SHA256 must be a lowercase 64-character digest" >&2
   exit 2
@@ -93,6 +103,8 @@ bash "$script_dir/verify_release_dependency_provenance.sh" verify \
 dependency_provenance_receipt="$dependency_provenance_evidence/receipt.json"
 dependency_provenance_receipt_sha=$(shasum -a 256 \
   "$dependency_provenance_receipt" | awk '{print $1}')
+mlx_native_version=$(jq -er '.dependency.version' \
+  "$dependency_provenance_receipt")
 parent_pid=$$
 server_pid=""
 power_pid=""
@@ -254,6 +266,7 @@ require_no_model_runtime() {
 
 verify_sha256_sidecar() {
   local receipt=$1
+  local receipt_dir sidecar_name
   [[ -s "$receipt" ]] || {
     echo "receipt is missing or empty: $receipt" >&2
     return 1
@@ -262,7 +275,13 @@ verify_sha256_sidecar() {
     echo "receipt checksum sidecar is missing or empty: $receipt.sha256" >&2
     return 1
   }
-  shasum -a 256 -c "$receipt.sha256" >/dev/null
+  [[ ! -L "$receipt" && ! -L "$receipt.sha256" ]] || {
+    echo "receipt or checksum sidecar is linked: $receipt" >&2
+    return 1
+  }
+  receipt_dir=$(cd "$(dirname "$receipt")" && pwd) || return 1
+  sidecar_name=$(basename "$receipt.sha256")
+  (cd "$receipt_dir" && shasum -a 256 -c "$sidecar_name" >/dev/null)
 }
 
 verify_model() {
@@ -310,6 +329,10 @@ start_server() {
       model_sha256=$QWEN_MODEL_SHA256
       model_verification_receipt="$OUT_ROOT/qwen/model-verification.json"
       ;;
+    qwen38)
+      model_sha256=$QWEN38_MODEL_SHA256
+      model_verification_receipt="$OUT_ROOT/qwen38/model-verification.json"
+      ;;
     *)
       echo "unknown release model family: $family" >&2
       return 1
@@ -325,12 +348,20 @@ start_server() {
     echo "release gate port already in use: $port" >&2
     return 1
   fi
-  launcher_env=(MODEL="$model" PORT="$port" HF2Q_BIN="$HF2Q_BIN" MAX_SLOTS="$max_slots")
+  launcher_env=(MODEL="$model" PORT="$port" HF2Q_BIN="$HF2Q_BIN" MAX_SLOTS="$max_slots" \
+    HF2Q_MODEL_VERIFICATION_RECEIPT="$OUT_ROOT/$family/model-verification.json")
   [[ -z "$kv_budget" ]] || launcher_env+=(KV_CACHE_BUDGET_BYTES="$kv_budget")
   if [[ "$family" == gemma ]]; then
     local disabled_mmproj="$current_dir/mmproj-disabled"
     [[ ! -e "$disabled_mmproj" ]] || return 1
     launcher_env+=(MMPROJ="$disabled_mmproj")
+  fi
+  if [[ "$family" == qwen38 ]]; then
+    # This lifecycle is intentionally text-only. The paired projector has its
+    # own multimodal gates; cache rollback/isolation must execute the exact
+    # qualified text artifact without making projector presence an implicit
+    # prerequisite.
+    launcher_env+=(QWEN38_VISION=off)
   fi
   if [[ -n "$context_len" ]]; then
     env "${launcher_env[@]}" "$launcher" --ctx "$context_len" >"$current_log" 2>&1 &
@@ -361,18 +392,59 @@ finish_server_phase() {
 run_lifecycle() {
   local family=$1
   local context_lines=$2
+  local expected_artifact_sha256=${3:-}
+  local expected_arch_family=${4:-}
+  local expected_architecture=${5:-}
   local out="$OUT_ROOT/$family/lifecycle"
+  local run_id="release-${EXPECTED_SHA:0:12}-$family"
+  local continuation_thinking_token_budget=null
+  local unrelated_conversation_thinking_enabled=true
+  local -a lifecycle_env
   mkdir -p "$out"
-  BASE_URL="$current_url" \
-  OUT_DIR="$out" \
-  RUN_ID="release-${EXPECTED_SHA:0:12}-$family" \
-  CONTEXT_LINES="$context_lines" \
-  CURL_MAX_TIME_SECONDS=1800 \
-  SEMANTIC_WAIT_SECONDS=300 \
-    scripts/test_agentic_cache_lifecycle.sh \
+  lifecycle_env=(BASE_URL="$current_url" OUT_DIR="$out" RUN_ID="$run_id"
+    CONTEXT_LINES="$context_lines" CURL_MAX_TIME_SECONDS=1800
+    SEMANTIC_WAIT_SECONDS=300)
+  if [[ "$family" == qwen || "$family" == qwen38 ]]; then
+    continuation_thinking_token_budget=16
+    unrelated_conversation_thinking_enabled=false
+    lifecycle_env+=(
+      CONTINUATION_THINKING_TOKEN_BUDGET="$continuation_thinking_token_budget"
+      ISOLATION_THINKING_DISABLED=true)
+  fi
+  if [[ -n "$expected_artifact_sha256" || -n "$expected_arch_family" \
+    || -n "$expected_architecture" ]]; then
+    [[ "$expected_artifact_sha256" =~ ^[0-9a-f]{64}$ \
+      && -n "$expected_arch_family" && -n "$expected_architecture" ]] || {
+      echo "incomplete lifecycle execution-identity contract for $family" >&2
+      return 1
+    }
+    lifecycle_env+=(
+      EXPECTED_EXECUTION_ARTIFACT_SHA256="$expected_artifact_sha256"
+      EXPECTED_EXECUTION_ARCH_FAMILY="$expected_arch_family"
+      EXPECTED_EXECUTION_ARCHITECTURE="$expected_architecture")
+  fi
+  env "${lifecycle_env[@]}" scripts/test_agentic_cache_lifecycle.sh \
       >"$out/stdout.log" 2>"$out/stderr.log"
-  jq -e '.status == "pass"' "$out/summary.json" >/dev/null
-  sha256_file "$out/summary.json" >"$out/summary.json.sha256"
+  if [[ -n "$expected_artifact_sha256" ]]; then
+    agentic_lifecycle_validate_summary "$out/summary.json" "$run_id" \
+      "$context_lines" "$expected_artifact_sha256" \
+      "$expected_arch_family" "$expected_architecture" \
+      "$continuation_thinking_token_budget" \
+      "$unrelated_conversation_thinking_enabled"
+  else
+    jq -e \
+      --argjson continuation_thinking_token_budget "$continuation_thinking_token_budget" \
+      --argjson unrelated_conversation_thinking_enabled "$unrelated_conversation_thinking_enabled" \
+      '.schema_version == 3 and .status == "pass"
+        and .continuation_thinking_token_budget
+          == $continuation_thinking_token_budget
+        and .unrelated_conversation_thinking_enabled
+          == $unrelated_conversation_thinking_enabled' \
+      "$out/summary.json" >/dev/null
+  fi
+  printf '%s  summary.json\n' "$(sha256_file "$out/summary.json")" \
+    >"$out/summary.json.sha256"
+  verify_sha256_sidecar "$out/summary.json"
 }
 
 binary_sha=$EXPECTED_BINARY_SHA256
@@ -581,7 +653,7 @@ jq -e '
 ' "$cooperative_raw" >/dev/null
 jq --arg source_sha "$EXPECTED_SHA" \
   --arg model_sha256 "$DEEPSEEK_MODEL_SHA256" \
-  --arg mlx_native_version "0.11.2" \
+  --arg mlx_native_version "$mlx_native_version" \
   --arg raw_sha256 "$(sha256_file "$cooperative_raw")" \
   --arg test_log_sha256 "$(sha256_file "$cooperative_log")" \
   --arg measurement_log_sha256 "$(sha256_file "$cooperative_thermal_log")" \
@@ -652,7 +724,8 @@ bash scripts/verify_deepseek4_cooperative_prefill_receipt.sh \
   "$cooperative_dir/summary.json" "$cooperative_raw" "$cooperative_log" \
   "$cooperative_thermal_log" "$cooperative_settle_log" \
   "$EXPECTED_SHA" "$DEEPSEEK_MODEL_SHA256" \
-  "$cooperative_contention_log" "$cooperative_settle_contention_log"
+  "$cooperative_contention_log" "$cooperative_settle_contention_log" \
+  "$dependency_provenance_receipt" "$dependency_provenance_receipt_sha"
 sha256_file "$cooperative_dir/summary.json" \
   >"$cooperative_dir/summary.json.sha256"
 ensure_guard_health
@@ -664,7 +737,8 @@ require_no_model_runtime
 bash scripts/run_deepseek4_decode_cohort_gate.sh \
   "$cooperative_test_binary" "$DEEPSEEK_MODEL" \
   "$OUT_ROOT/deepseek/decode-cohort" "$EXPECTED_SHA" \
-  "$DEEPSEEK_MODEL_SHA256"
+  "$DEEPSEEK_MODEL_SHA256" "$dependency_provenance_receipt" \
+  "$dependency_provenance_receipt_sha"
 ensure_guard_health
 
 HF2Q_QWEN36_WATCHDOG_FIXTURE_MODEL="$QWEN_MODEL" \
@@ -1045,6 +1119,43 @@ run_qwen_release_gates() {
   qwen36_validate_cancellation_transaction_counts \
     "$OUT_ROOT/qwen/cancellation/cancellation-summary.json"
   finish_server_phase
+}
+
+run_qwen38_agentic_lifecycle_release_gate() {
+  start_server qwen38 agentic-lifecycle scripts/serve_qwen38_opencode.sh \
+    "$QWEN38_MODEL" 18083 4
+  run_lifecycle qwen38 2800 "$QWEN38_MODEL_SHA256" qwen35 qwen35
+  finish_server_phase
+}
+
+run_qwen38_exact_swap_release_gate() {
+  local model_root expected_q4 exact_out
+
+  require_no_model_runtime
+  model_root=$(cd "$(dirname "$QWEN38_MODEL")/.." && pwd -P)
+  expected_q4=$(jq -er '
+    .artifacts[] | select(.format == "Q4_K_M") | .file
+  ' "$HF2Q_SOURCE_ROOT/data/qwen38_exact_swap_matrix.v1.json")
+  [[ "$(cd "$(dirname "$model_root/$expected_q4")" \
+      && pwd -P)/$(basename "$model_root/$expected_q4")" \
+    == "$(cd "$(dirname "$QWEN38_MODEL")" && pwd -P)/$(basename "$QWEN38_MODEL")" ]] || {
+    echo "QWEN38_MODEL is not the qualified Q4_K_M member of the exact swap catalog" >&2
+    return 1
+  }
+  exact_out="$OUT_ROOT/qwen38/exact-swap"
+  MODEL_ROOT="$model_root" OUT_DIR="$exact_out" \
+    HF2Q_EXACT_SWAP_BINARY="$HF2Q_BIN" \
+    "$HF2Q_SOURCE_ROOT/scripts/run_qwen38_exact_swap_matrix.sh" \
+      >"$OUT_ROOT/qwen38/exact-swap.stdout" \
+      2>"$OUT_ROOT/qwen38/exact-swap.stderr"
+  require_no_model_runtime
+  # The runner seals and validates its own exact-source receipt. Revalidate it
+  # here before it is allowed into the protected aggregate manifest.
+  # shellcheck source=scripts/qwen38_artifact_contract.sh
+  source "$HF2Q_SOURCE_ROOT/scripts/qwen38_artifact_contract.sh"
+  # shellcheck source=scripts/qwen38_exact_swap_matrix_contract.sh
+  source "$HF2Q_SOURCE_ROOT/scripts/qwen38_exact_swap_matrix_contract.sh"
+  qwen38_validate_exact_swap_seal "$exact_out/matrix.json" "$HF2Q_SOURCE_ROOT"
 }
 
 run_qwen38_long_decode_release_gate() {
@@ -1507,7 +1618,9 @@ run_gemma_release_gates() {
 run_deepseek_release_gates
 run_gemma_release_gates
 run_qwen_release_gates
+run_qwen38_agentic_lifecycle_release_gate
 run_qwen38_long_decode_release_gate
+run_qwen38_exact_swap_release_gate
 
 hf2q_release_verify_model "$DEEPSEEK_MODEL" "$DEEPSEEK_MODEL_SHA256" \
   "$OUT_ROOT/deepseek/model-verification.json"
@@ -1581,7 +1694,9 @@ jq -n \
   --arg qwen_lifecycle_sha "$(sha256_file "$OUT_ROOT/qwen/lifecycle/summary.json")" \
   --arg qwen_cumulative_sha "$(sha256_file "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json")" \
   --arg qwen_cancellation_sha "$(sha256_file "$OUT_ROOT/qwen/cancellation/cancellation-summary.json")" \
+  --arg qwen38_lifecycle_sha "$(sha256_file "$OUT_ROOT/qwen38/lifecycle/summary.json")" \
   --arg qwen38_long_decode_sha "$(sha256_file "$OUT_ROOT/qwen38/long-decode/receipt.json")" \
+  --arg qwen38_exact_swap_sha "$(sha256_file "$OUT_ROOT/qwen38/exact-swap/matrix.json")" \
   --argjson power_guarded_ac "$power_guarded_ac" \
   --argjson deepseek_bytes "$deepseek_bytes" \
   --argjson gemma_bytes "$gemma_bytes" \
@@ -1607,7 +1722,9 @@ jq -n \
   --slurpfile qwen_lifecycle "$OUT_ROOT/qwen/lifecycle/summary.json" \
   --slurpfile qwen_cumulative "$OUT_ROOT/qwen/cumulative/cumulative-release-summary.json" \
   --slurpfile qwen_cancellation "$OUT_ROOT/qwen/cancellation/cancellation-summary.json" \
+  --slurpfile qwen38_lifecycle "$OUT_ROOT/qwen38/lifecycle/summary.json" \
   --slurpfile qwen38_long_decode "$OUT_ROOT/qwen38/long-decode/receipt.json" \
+  --slurpfile qwen38_exact_swap "$OUT_ROOT/qwen38/exact-swap/matrix.json" \
   --slurpfile dependency_provenance "$dependency_provenance_receipt" \
   'if ($qwen_cancellation | length) != 1 then
     error("Qwen cancellation receipt must contain exactly one JSON document")
@@ -1637,21 +1754,25 @@ jq -n \
       deepseek:{lifecycle:$deepseek_lifecycle_sha,interactive:$deepseek_interactive_sha,cached_suffix:$deepseek_cached_sha,cooperative_prefill:$deepseek_cooperative_sha,decode_cohort:$deepseek_decode_cohort_sha,wave1:$deepseek_wave1_sha,wave2:$deepseek_wave2_sha,wave1_thermal:$deepseek_wave1_thermal_sha,wave2_thermal:$deepseek_wave2_thermal_sha,prompt_provenance:$deepseek_prompt_provenance_sha},
       gemma:{lifecycle:$gemma_lifecycle_sha,overlap:$gemma_overlap_sha,wave1:$gemma_wave1_sha,wave2:$gemma_wave2_sha,wave1_thermal:$gemma_wave1_thermal_sha,wave2_thermal:$gemma_wave2_thermal_sha,eight_slots:$gemma_wave8_sha,eight_slots_thermal:$gemma_wave8_thermal_sha,transactions4:$gemma_transactions4_sha,transactions8:$gemma_transactions8_sha,parity:$gemma_parity_sha,heap:$gemma_heap_sha},
       qwen:{lifecycle:$qwen_lifecycle_sha,cumulative:$qwen_cumulative_sha,cancellation:$qwen_cancellation_sha},
-      qwen38:{long_decode:$qwen38_long_decode_sha},
+      qwen38:{lifecycle:$qwen38_lifecycle_sha,long_decode:$qwen38_long_decode_sha,
+        exact_swap:$qwen38_exact_swap_sha},
       provenance:{dependency:$dependency_provenance_receipt_sha}
     },
     families: {
       deepseek: {status:"pass",prompt_provenance:$deepseek_prompt_provenance[0],cooperative_prefill:$deepseek_cooperative[0],decode_cohort:$deepseek_decode_cohort[0],lifecycle:$deepseek_lifecycle[0],interactive_overlap:$deepseek_interactive[0],cached_suffix:$deepseek_cached[0],full_context_waves:[$deepseek_wave1[0],$deepseek_wave2[0]]},
       gemma: {status:"pass",lifecycle:$gemma_lifecycle[0],overlap_and_cancellation:$gemma_overlap[0],agent_waves:[$gemma_wave1[0],$gemma_wave2[0],$gemma_wave8[0]],transactions:[$gemma_transactions4[0],$gemma_transactions8[0]],parity:$gemma_parity[0],heap:$gemma_heap[0]},
       qwen: {status:"pass",lifecycle:$qwen_lifecycle[0],cumulative:$qwen_cumulative[0],cancellation:$qwen_cancellation[0]},
-      qwen38: {status:"pass",long_decode:$qwen38_long_decode[0]}
+      qwen38: {status:"pass",lifecycle:$qwen38_lifecycle[0],
+        long_decode:$qwen38_long_decode[0],exact_swap:$qwen38_exact_swap[0]}
     }
   } end' > "$OUT_ROOT/manifest.json.tmp"
 mv "$OUT_ROOT/manifest.json.tmp" "$OUT_ROOT/manifest.json"
-shasum -a 256 "$OUT_ROOT/manifest.json" >"$OUT_ROOT/manifest.json.sha256"
-jq -e '
+printf '%s  manifest.json\n' "$(sha256_file "$OUT_ROOT/manifest.json")" \
+  >"$OUT_ROOT/manifest.json.sha256"
+jq -e --slurpfile dependency_provenance "$dependency_provenance_receipt" '
   (.power_event_snapshots_sha256 | test("^[0-9a-f]{64}$"))
   and all(.receipt_sha256[][]; test("^[0-9a-f]{64}$"))
+  and .dependency_provenance == $dependency_provenance[0]
   and .dependency_provenance.schema_version == 1
   and .dependency_provenance.status == "pass"
   and .dependency_provenance.package.source == "packed-crate"
@@ -1659,10 +1780,27 @@ jq -e '
   and .dependency_provenance.build.cargo_target_checkout_disjoint == true
   and .dependency_provenance.build.rust_build_override_env_cleared == true
   and .dependency_provenance.dependency.name == "mlx-native"
-  and .dependency_provenance.dependency.version == "0.11.2"
+  and (.dependency_provenance.dependency.version
+    | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+  and .dependency_provenance.dependency.requirement
+    == ("=" + .dependency_provenance.dependency.version)
   and .dependency_provenance.dependency.source
     == "registry+https://github.com/rust-lang/crates.io-index"
-  and .dependency_provenance.dependency.checksum
-    == "22f4bd6661e77994c6f26a79fdd2c188f3d5252aa7e51616f5feb080b22da8e0"
+  and (.dependency_provenance.dependency.checksum | test("^[0-9a-f]{64}$"))
 ' "$OUT_ROOT/manifest.json" >/dev/null
+bash scripts/verify_qwen38_agentic_lifecycle_receipt.sh \
+  "$OUT_ROOT/manifest.json" "$OUT_ROOT/manifest.json.sha256" \
+  "$OUT_ROOT/qwen38/lifecycle/summary.json" \
+  "$OUT_ROOT/qwen38/lifecycle/summary.json.sha256" \
+  "$dependency_provenance_receipt" "$dependency_provenance_receipt_sha" \
+  "$OUT_ROOT/qwen38/model-verification.json" \
+  "$EXPECTED_SHA" "$CRATE_SHA256" \
+  "$HF2Q_BIN" "$binary_sha" "$QWEN38_MODEL" "$QWEN38_MODEL_SHA256"
+bash "$HF2Q_SOURCE_ROOT/scripts/verify_qwen38_exact_swap_release_receipt.sh" \
+  "$OUT_ROOT/manifest.json" "$OUT_ROOT/manifest.json.sha256" \
+  "$OUT_ROOT/qwen38/exact-swap/matrix.json" "$EXPECTED_SHA" "$binary_sha" \
+  "$(jq -er '.dependency.version' "$dependency_provenance_receipt")" \
+  "$(jq -er '.dependency.source' "$dependency_provenance_receipt")" \
+  "$(jq -er '.dependency.checksum' "$dependency_provenance_receipt")" \
+  "$HF2Q_SOURCE_ROOT"
 jq . "$OUT_ROOT/manifest.json"

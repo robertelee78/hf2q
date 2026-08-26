@@ -223,7 +223,6 @@ const BGE_LARGE_EN: &str = "/opt/hf2q/models/BAAI-bge-large-en-v1.5";
 const NOMIC_EMBED: &str = "/opt/hf2q/models/nomic-ai-nomic-embed-text-v1.5";
 const LLAMA3_8B: &str = "/opt/hf2q/models/meta-llama-Meta-Llama-3-8B";
 const MINIMAX_M2: &str = "/opt/hf2q/models/MiniMaxAI-MiniMax-M2";
-const QWEN3VL_TEXT: &str = "/opt/hf2q/models/Qwen-Qwen3-VL";
 
 // Gemma 4 26B-A4B-IT — full 8-quant matrix
 byte_cmp_test!(byte_cmp_gemma4_26b_q4_0, GEMMA4_26B, "q4_0");
@@ -274,9 +273,3 @@ byte_cmp_test!(byte_cmp_minimax_m2_q4_k_m, MINIMAX_M2, "q4_k_m");
 byte_cmp_test!(byte_cmp_minimax_m2_q5_k_m, MINIMAX_M2, "q5_k_m");
 byte_cmp_test!(byte_cmp_minimax_m2_q6_k, MINIMAX_M2, "q6_k");
 byte_cmp_test!(byte_cmp_minimax_m2_q8_0, MINIMAX_M2, "q8_0");
-
-// Qwen 3 VL Text
-byte_cmp_test!(byte_cmp_qwen3vl_text_q4_k_m, QWEN3VL_TEXT, "q4_k_m");
-byte_cmp_test!(byte_cmp_qwen3vl_text_q5_k_m, QWEN3VL_TEXT, "q5_k_m");
-byte_cmp_test!(byte_cmp_qwen3vl_text_q6_k, QWEN3VL_TEXT, "q6_k");
-byte_cmp_test!(byte_cmp_qwen3vl_text_q8_0, QWEN3VL_TEXT, "q8_0");

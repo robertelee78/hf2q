@@ -1,0 +1,10 @@
+diff --git a/src/inference/models/qwen35/forward_gpu.rs b/src/inference/models/qwen35/forward_gpu.rs
+--- a/src/inference/models/qwen35/forward_gpu.rs
++++ b/src/inference/models/qwen35/forward_gpu.rs
+@@ -83,3 +83,6 @@
+ use mlx_native::ops::argmax::dispatch_argmax_f32;
+ use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
++#[cfg(test)]
++mod ordinary_byte_identity_probe;
++
+ use mlx_native::ops::rms_norm;

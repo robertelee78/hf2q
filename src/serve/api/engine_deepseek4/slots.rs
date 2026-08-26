@@ -20,7 +20,7 @@ use crate::serve::api::registry::ModelRegistration;
 use crate::serve::api::sse::GenerationEvent;
 use crate::serve::sampler_pure;
 
-use super::progress::RequestProgress;
+use super::progress::{LatencyGapReceipt, RequestProgress};
 use super::sampling::{
     accept_forced_token, accepted_single_tool_call_is_terminal, decode_token_limit,
     grammar_runtime, sample, sampler_config, split_reasoning,
@@ -395,6 +395,7 @@ pub(crate) struct Deepseek4SlotState {
     decode_started: Instant,
     cached_tokens: usize,
     stream_router: Option<StreamRouter>,
+    scheduler_decode: LatencyGapReceipt,
     progress: RequestProgress,
     scratch_guard: Option<RequestScratchGuard>,
 }
@@ -524,6 +525,7 @@ impl Deepseek4SlotState {
         let stream_router = stream.then(|| {
             StreamRouter::new(registration, params.reasoning_forced_open, request_started)
         });
+        let decode_started = Instant::now();
         Ok(Self {
             prompt_tokens,
             params,
@@ -542,9 +544,10 @@ impl Deepseek4SlotState {
             finished: false,
             request_started,
             prefill_duration,
-            decode_started: Instant::now(),
+            decode_started,
             cached_tokens,
             stream_router,
+            scheduler_decode: LatencyGapReceipt::with_origin(),
             progress,
             scratch_guard: Some(scratch_guard),
         })
@@ -691,6 +694,10 @@ impl Deepseek4SlotState {
         self.progress.id()
     }
 
+    pub(crate) fn begin_scheduler_decode_visit(&mut self) -> Result<()> {
+        self.scheduler_decode.observe(self.decode_started.elapsed())
+    }
+
     pub(crate) fn finish(
         mut self,
         registration: Option<&ModelRegistration>,
@@ -707,6 +714,11 @@ impl Deepseek4SlotState {
             .as_ref()
             .and_then(StreamRouter::first_visible_at)
             .unwrap_or_else(|| self.request_started.elapsed());
+        let semantic_sse = self
+            .stream_router
+            .as_ref()
+            .map(StreamRouter::semantic_sse_receipt)
+            .unwrap_or_default();
         let (text, reasoning_text) = split_reasoning(
             &self.decoded_running,
             registration,
@@ -718,6 +730,8 @@ impl Deepseek4SlotState {
             self.generated.len(),
             self.stream_router.as_ref().map(|_| semantic_ttft),
         );
+        self.progress
+            .mixed_latency_receipt(self.scheduler_decode, semantic_sse);
         if let Some(guard) = self.scratch_guard.take() {
             guard.complete();
         }

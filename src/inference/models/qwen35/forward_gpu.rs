@@ -38,11 +38,11 @@
 //! ≈8 projections across the 4-layer stack).
 
 use anyhow::{anyhow, ensure, Context, Result};
-#[cfg(test)]
-use mlx_native::metal::foreign_types::ForeignType;
 use mlx_native::ops::copy::dispatch_copy_f32;
 use mlx_native::ops::elementwise::elementwise_add;
-use mlx_native::{DType, GgmlType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{
+    DType, DenseBf16CalibrationBatchReceipt, GgmlType, KernelRegistry, MlxBuffer, MlxDevice,
+};
 use std::sync::OnceLock;
 
 use super::delta_net::DeltaNetLayerShape;
@@ -50,23 +50,26 @@ use super::encoder_stage::LayerEncoder;
 use super::ffn::{DenseFfnShape, MoeFfnShape};
 use super::full_attn::FullAttnShape;
 use super::gpu_delta_net::{
-    build_delta_net_layer, build_delta_net_layer_decode_into, build_delta_net_layer_with_arena,
-    DeltaNetWeightsGpu,
+    build_delta_net_layer, build_delta_net_layer_decode_batched_into,
+    build_delta_net_layer_decode_into, build_delta_net_layer_prefill_batched_into,
+    build_delta_net_layer_with_arena, rectangular_prefill_route_compatible, DeltaNetWeightsGpu,
 };
 use super::gpu_ffn::{
-    build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q_into,
+    build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_into, build_dense_ffn_layer_gpu_q_into,
     build_dense_ffn_layer_gpu_q_into_with_arena, build_dense_ffn_layer_gpu_q_split_profile,
     build_moe_ffn_layer_gpu, build_moe_ffn_layer_gpu_q_into,
     build_moe_ffn_layer_gpu_q_into_with_arena, DenseFfnWeightsGpu, DenseFfnWeightsGpuQ,
     MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
-    apply_gated_attn_layer_decode_into, apply_linear_projection_f32_into_with_ggml_type,
-    apply_linear_projection_f32_with_ggml_type, build_gated_attn_layer, download_f32, upload_f32,
-    upload_f32_into, upload_f32_weight, FullAttnWeightsGpu,
+    apply_gated_attn_layer_decode_batched_into, apply_gated_attn_layer_decode_into,
+    apply_gated_attn_layer_fresh_prefill_batched_into,
+    apply_linear_projection_f32_into_with_ggml_type, apply_linear_projection_f32_with_ggml_type,
+    build_gated_attn_layer, download_f32, upload_f32, upload_f32_into, upload_f32_weight,
+    FullAttnWeightsGpu,
 };
 use super::io_heads::embed_tokens;
-use super::kv_cache::HybridKvCache;
+use super::kv_cache::{HybridKvCache, HybridKvSegmentBoundaryReceipt, HybridKvSlotAnchor};
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
 use super::Qwen35Config;
 use crate::core::traits::activation_capture::LayerActivations;
@@ -75,11 +78,207 @@ use crate::core::traits::activation_capture::LayerActivations;
 // equivalence with the pre-ADR-040 single-seq path; `SlotId(N>0)`
 // rebases CPU cursor reads/writes to `current_len[N]` and is
 // bounds-checked against `kv_cache.n_seqs` at the public entry.
+use crate::inference::dense_bf16_activation::{activate_native_bf16_dense, NativeBf16Matrix};
+use crate::inference::dense_expert_activation::{
+    activate_native_scalar_experts, NativeScalarExpertMatrix,
+};
 use crate::serve::forward_mlx_shared::MlxQWeight;
 use crate::serve::multi_seq_kv::SlotId;
 use mlx_native::ops::argmax::dispatch_argmax_f32;
 use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::ops::rms_norm;
+
+#[cfg(test)]
+pub(super) mod segmented_route_trace {
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Segment {
+        Prefix,
+        Suffix,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum OperatorRoute {
+        DeltaDispatch,
+        DeltaRecurrent,
+        DeltaChunk,
+        FullDispatch,
+        FullFreshTiled,
+        FullTqDirectResume,
+        DenseFfnGateUp,
+        DenseFfnDown,
+        MoeRouter,
+        MoeExpertGateUp,
+        MoeExpertDown,
+        MtpProcessTarget,
+        OutputHead,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum CompoundSemanticFault {
+        AfterPrefixMtp,
+        AfterSuffixMtp,
+        BeforeSnapshot,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Event {
+        pub(crate) segment: Segment,
+        pub(crate) layer: usize,
+        pub(crate) terminal_k_batch: usize,
+        pub(crate) route: OperatorRoute,
+        pub(crate) m: u32,
+        pub(crate) n: u32,
+        pub(crate) k: u32,
+        pub(crate) entry_cursor: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Context {
+        segment: Segment,
+        layer: Option<usize>,
+        terminal_k_batch: usize,
+    }
+
+    pub(crate) struct ContextGuard(Option<Context>);
+
+    impl Drop for ContextGuard {
+        fn drop(&mut self) {
+            CONTEXT.with(|context| context.set(self.0));
+        }
+    }
+
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        static EVENTS: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
+        static CONTEXT: Cell<Option<Context>> = const { Cell::new(None) };
+        static ROW_FAULT: Cell<Option<(Segment, usize, OperatorRoute, u32)>> = const { Cell::new(None) };
+        static SEMANTIC_FAULT: Cell<Option<CompoundSemanticFault>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn begin() {
+        EVENTS.with(|events| events.borrow_mut().clear());
+        CONTEXT.with(|context| context.set(None));
+        ROW_FAULT.with(|fault| fault.set(None));
+        SEMANTIC_FAULT.with(|fault| fault.set(None));
+        ACTIVE.with(|active| active.set(true));
+    }
+
+    pub(crate) fn enter_segment(segment: Segment, terminal_k_batch: usize) -> ContextGuard {
+        if !ACTIVE.with(Cell::get) {
+            return ContextGuard(None);
+        }
+        let previous = CONTEXT.with(|context| {
+            context.replace(Some(Context {
+                segment,
+                layer: None,
+                terminal_k_batch,
+            }))
+        });
+        ContextGuard(previous)
+    }
+
+    pub(crate) fn enter_layer(layer: usize) -> ContextGuard {
+        if !ACTIVE.with(Cell::get) {
+            return ContextGuard(None);
+        }
+        let previous = CONTEXT.with(|context| {
+            let previous = context.get();
+            let segment = previous
+                .expect("segmented trace layer without segment")
+                .segment;
+            context.set(Some(Context {
+                segment,
+                layer: Some(layer),
+                terminal_k_batch: previous
+                    .expect("segmented trace layer without segment")
+                    .terminal_k_batch,
+            }));
+            previous
+        });
+        ContextGuard(previous)
+    }
+
+    pub(crate) fn record(route: OperatorRoute, m: u32, n: u32, k: u32, entry_cursor: u32) {
+        if !ACTIVE.with(Cell::get) {
+            return;
+        }
+        let context = CONTEXT
+            .with(Cell::get)
+            .expect("segmented trace event without segment context");
+        let layer = context
+            .layer
+            .expect("segmented trace event without layer context");
+        EVENTS.with(|events| {
+            events.borrow_mut().push(Event {
+                segment: context.segment,
+                layer,
+                terminal_k_batch: context.terminal_k_batch,
+                route,
+                m,
+                n,
+                k,
+                entry_cursor,
+            })
+        });
+    }
+
+    pub(crate) fn validate_rows(route: OperatorRoute, actual: u32) -> Result<(), anyhow::Error> {
+        if !ACTIVE.with(Cell::get) {
+            return Ok(());
+        }
+        let Some(context) = CONTEXT.with(Cell::get) else {
+            return Ok(());
+        };
+        let Some(layer) = context.layer else {
+            return Ok(());
+        };
+        if let Some((_, _, _, invalid_rows)) =
+            ROW_FAULT
+                .with(Cell::get)
+                .filter(|&(segment, fault_layer, fault_route, _)| {
+                    segment == context.segment && fault_layer == layer && fault_route == route
+                })
+        {
+            anyhow::ensure!(
+                invalid_rows == actual,
+                "segmented dispatch width mismatch: physical M={actual}, attempted enclosing M={invalid_rows}"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn inject_row_fault(
+        segment: Segment,
+        layer: usize,
+        route: OperatorRoute,
+        rows: u32,
+    ) {
+        ROW_FAULT.with(|fault| fault.set(Some((segment, layer, route, rows))));
+    }
+
+    pub(crate) fn inject_semantic_fault(fault: CompoundSemanticFault) {
+        SEMANTIC_FAULT.with(|slot| slot.set(Some(fault)));
+    }
+
+    pub(crate) fn fail_if_semantic_fault(
+        point: CompoundSemanticFault,
+    ) -> Result<(), anyhow::Error> {
+        if SEMANTIC_FAULT.with(Cell::get) == Some(point) {
+            anyhow::bail!("injected stable-boundary compound semantic failure at {point:?}");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish() -> Vec<Event> {
+        ACTIVE.with(|active| active.set(false));
+        CONTEXT.with(|context| context.set(None));
+        ROW_FAULT.with(|fault| fault.set(None));
+        SEMANTIC_FAULT.with(|fault| fault.set(None));
+        EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+    }
+}
 
 /// Large Qwen prefills are intentionally drained at every layer boundary.
 /// K>1 is a decode/short-row throughput optimization; on a substantial
@@ -91,6 +290,60 @@ fn effective_ffn_terminal_k_batch(seq_len: u32, configured: usize) -> usize {
         1
     } else {
         configured.max(1)
+    }
+}
+
+fn configured_ffn_terminal_k_batch() -> usize {
+    std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&k| k >= 1)
+        .unwrap_or(8)
+}
+
+fn common_ffn_terminal_k_batch(prefix_rows: u32, suffix_rows: u32) -> usize {
+    let configured = configured_ffn_terminal_k_batch();
+    let prefix = effective_ffn_terminal_k_batch(prefix_rows, configured);
+    let suffix = effective_ffn_terminal_k_batch(suffix_rows, configured);
+    let gcd = |mut a: usize, mut b: usize| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    prefix / gcd(prefix, suffix) * suffix
+}
+
+struct GpuFailureDrainGuard<'a> {
+    device: &'a MlxDevice,
+    armed: bool,
+}
+
+impl<'a> GpuFailureDrainGuard<'a> {
+    fn new(device: &'a MlxDevice) -> Self {
+        Self {
+            device,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GpuFailureDrainGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let result = self
+            .device
+            .command_encoder()
+            .and_then(|mut encoder| encoder.commit_and_wait_labeled("forward_gpu.failure_drain"));
+        if let Err(error) = result {
+            eprintln!("hf2q: fail-closed GPU drain failed: {error:#}");
+        }
     }
 }
 
@@ -279,17 +532,87 @@ enum OutputHeadMode {
     },
 }
 
-/// Pre-allocated decode buffers for `forward_gpu_greedy` (seq_len == 1).
+/// Internal layer-window execution state used to falsify and then build the
+/// exact two-segment prefill schedule. Ordinary callers always execute the
+/// full layer range from a fresh embedding and emit the output head.
+struct ForwardGpuLayerWindow {
+    start_layer: usize,
+    end_layer: usize,
+    hidden_in: Option<MlxBuffer>,
+    emit_output_head: bool,
+    terminal_k_batch_override: Option<usize>,
+}
+
+struct TwoSegmentTargetOutput {
+    pub(crate) prefix_logits: Vec<f32>,
+    pub(crate) prefix_nextn_hidden: MlxBuffer,
+    pub(crate) suffix_logits: Vec<f32>,
+    pub(crate) suffix_nextn_hidden: MlxBuffer,
+    pub(crate) boundary_receipt: HybridKvSegmentBoundaryReceipt,
+}
+
+#[derive(Debug)]
+pub(crate) struct StableBoundaryCompoundOutput {
+    pub(crate) prefix_logits: Vec<f32>,
+    pub(crate) suffix_logits: Vec<f32>,
+    pub(crate) prefix_pending_hidden: Option<MlxBuffer>,
+    pub(crate) suffix_pending_hidden: Option<MlxBuffer>,
+    pub(crate) prefix_anchor: HybridKvSlotAnchor,
+    /// Peak returned-buffer ownership added by the compound route beyond the
+    /// ordinary per-window Metal arenas admitted for either prefill path.
+    pub(crate) incremental_owned_peak_bytes: u64,
+}
+
+/// Per-lane result from one equality-preserving rectangular target prefill.
 ///
-/// All buffers have fixed shape `[1, hidden_size]` for single-token decode.
-/// Reusing these across decode tokens eliminates ~80 Metal `newBuffer` calls
-/// per token (2 per layer × 40 layers), saving ~1ms/token CPU overhead.
+/// The output head remains lane-local so this path does not silently replace
+/// the scalar one-row projection with a different matrix geometry. The
+/// optional normalized rows are the ordinary target `h_nextn` representation
+/// consumed by Qwen3.8 MTP.
+pub(crate) struct RectangularPrefillLaneOutput {
+    pub(crate) logits: Vec<f32>,
+    pub(crate) nextn_hidden: Option<MlxBuffer>,
+}
+
+#[cfg(test)]
+static RECTANGULAR_TARGET_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_test_rectangular_target_calls() {
+    RECTANGULAR_TARGET_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn test_rectangular_target_calls() -> u64 {
+    RECTANGULAR_TARGET_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+impl ForwardGpuLayerWindow {
+    fn full(n_layers: usize) -> Self {
+        Self {
+            start_layer: 0,
+            end_layer: n_layers,
+            hidden_in: None,
+            emit_output_head: true,
+            terminal_k_batch_override: None,
+        }
+    }
+}
+
+/// Pre-allocated decode buffers for one physical greedy target width.
+///
+/// The cache is rebuilt only when the active physical width changes. Reusing
+/// it at a stable width eliminates the per-step Metal allocations for both the
+/// scalar path and the width-N ordinary-decode path.
 struct DecodeBuffers {
-    /// Token embedding scratch: `[1, hidden_size]` F32 (CPU gather → upload here).
+    /// Exact physical row width represented by every row-shaped buffer.
+    width: usize,
+    /// Token embedding scratch: `[width, hidden_size]` F32.
     /// Avoids one Metal `newBuffer` + `memcpy` per decode token for embedding.
     embed_buf: MlxBuffer,
     /// Per-layer scratch pair (ffn_input_buf, ffn_residual_buf).
-    /// One pair per layer: `layer_scratch[i] = ([1,H], [1,H])`.
+    /// One pair per layer: `layer_scratch[i] = ([width,H], [width,H])`.
     /// These are safe to pre-allocate per-layer because each layer's
     /// fused_norm writes into layer_scratch[i].0/.1, then FFN reads
     /// only from layer_scratch[i].0 (and adds layer_scratch[i].1 as
@@ -297,19 +620,39 @@ struct DecodeBuffers {
     /// writes into layer_scratch[i+1].0/.1 while layer i's FFN is
     /// still executing — these are DIFFERENT buffers, so no conflict.
     layer_scratch: Vec<(MlxBuffer, MlxBuffer)>,
-    /// Output-head normed: `[1, hidden_size]` F32.
+    /// Output-head normed: `[width, hidden_size]` F32.
     norm_out_buf: MlxBuffer,
-    /// Argmax output index: `[1]` U32.
+    /// Argmax output index: `[width]` U32.
     argmax_index_buf: MlxBuffer,
-    /// Argmax output value: `[1]` F32.
+    /// Argmax output value: `[width]` F32.
     argmax_value_buf: MlxBuffer,
     /// Argmax params: `[1]` U32 (holds vocab_size).
     argmax_params_buf: MlxBuffer,
     /// Output norm params: `[2]` F32 (eps, hidden_size_f32).
     norm_params_buf: MlxBuffer,
-    /// Logits scratch: `[1, vocab_size]` F32 — lm_head output.
+    /// Logits scratch: `[width, vocab_size]` F32 — lm_head output.
     /// Pre-allocated to avoid ~600KB Metal `newBuffer` per decode token.
     logits_buf: MlxBuffer,
+}
+
+impl DecodeBuffers {
+    fn owned_bytes(&self) -> u64 {
+        let mut bytes = self.embed_buf.byte_len() as u64
+            + self.norm_out_buf.byte_len() as u64
+            + self.argmax_index_buf.byte_len() as u64
+            + self.argmax_value_buf.byte_len() as u64
+            + self.argmax_params_buf.byte_len() as u64
+            + self.norm_params_buf.byte_len() as u64
+            + self.logits_buf.byte_len() as u64
+            + (self.layer_scratch.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<(MlxBuffer, MlxBuffer)>() as u64);
+        for (input, residual) in &self.layer_scratch {
+            bytes = bytes
+                .saturating_add(input.byte_len() as u64)
+                .saturating_add(residual.byte_len() as u64);
+        }
+        bytes
+    }
 }
 
 /// Cached GPU state for a single forward session (one generate call).
@@ -324,6 +667,8 @@ struct DecodeBuffers {
 struct ForwardGpuCache {
     /// Raw pointer of the model whose weights are cached.
     model_ptr: *const (),
+    /// Monotonic model identity closes raw-address reuse during model swaps.
+    activation_epoch: u64,
     /// Exact evidence authority whose weights/configuration produced this
     /// cache. `None` preserves the legacy non-evidence path.
     #[cfg(test)]
@@ -334,14 +679,31 @@ struct ForwardGpuCache {
     executed_catalog:
         Option<std::sync::Arc<super::execution_observation::VerifiedExecutedTensorCatalog>>,
     #[cfg(test)]
-    trace_weight_slots:
-        Option<std::collections::BTreeMap<usize, super::execution_dispatch::Qwen35TraceWeightSlot>>,
+    trace_weight_slots: Option<
+        std::collections::BTreeMap<
+            super::execution_dispatch::Qwen35TraceWeightKey,
+            super::execution_dispatch::Qwen35TraceWeightSlot,
+        >,
+    >,
     device: MlxDevice,
     registry: KernelRegistry,
     layer_weights: Vec<LayerWeightsGpu>,
     output_head: OutputHeadGpu,
+    dense_bf16_activated: bool,
+    dense_bf16_shapes: Vec<(u32, u32, u32, u32, u32)>,
+    dense_bf16_provider: Option<QwenDenseBf16Provider>,
+    dense_bf16_receipt: Option<DenseBf16CalibrationBatchReceipt>,
+    dense_expert_activated: bool,
+    dense_expert_receipt: Option<mlx_native::DenseMatmulIdCalibrationBatchReceipt>,
     /// Pre-allocated decode buffers (reused every decode token).
     decode_bufs: Option<DecodeBuffers>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QwenDenseBf16Provider {
+    TargetMtp,
+    DFlash,
+    Eagle3,
 }
 
 // SAFETY: the thread_local cache is only accessed on the thread that owns it.
@@ -361,17 +723,104 @@ fn gpu_cache_matches_model(cache: &ForwardGpuCache, model: &Qwen35Model) -> bool
         }
         _ => false,
     };
-    cache.model_ptr == model_ptr && authority_matches
+    cache.model_ptr == model_ptr
+        && cache.activation_epoch == model.activation_epoch()
+        && cache.registry.ggml_routing_policy() == Some(&model.ggml_routing_policy)
+        && authority_matches
 }
 
 #[cfg(not(test))]
 fn gpu_cache_matches_model(cache: &ForwardGpuCache, model: &Qwen35Model) -> bool {
     cache.model_ptr == model as *const _ as *const ()
+        && cache.activation_epoch == model.activation_epoch()
+        && cache.registry.ggml_routing_policy() == Some(&model.ggml_routing_policy)
 }
 
 thread_local! {
     static GPU_CACHE: std::cell::RefCell<Option<ForwardGpuCache>> =
         std::cell::RefCell::new(None);
+}
+
+/// Tear down one stale Qwen activation before allocating its replacement.
+///
+/// Ordering is part of the model-swap contract: the old weight/cache owner is
+/// dropped first, then allocation-backed decode/expert scratch and the
+/// residency-only weight pool are cleared. Only after this function returns
+/// may the caller create the next model's device or upload weights. This
+/// avoids an otherwise hidden A+new-B overlap on same-thread activation and
+/// prevents B from inheriting A's scratch/residency owner.
+fn clear_stale_gpu_activation(cache: &mut Option<ForwardGpuCache>) {
+    cache.take();
+    super::decode_pool::clear_for_model_activation();
+    super::weight_pool::clear_for_model_activation();
+}
+
+/// Reclaim only mutable per-request arenas while retaining the model-bound
+/// mapped weights, registry, and compiled pipelines in `GPU_CACHE`.
+pub(crate) fn idle_runtime_owned_bytes() -> Result<u64> {
+    let decode_bytes = GPU_CACHE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|cache| cache.decode_bufs.as_ref())
+            .map_or(0, DecodeBuffers::owned_bytes)
+    });
+    let scratch_bytes = super::decode_pool::idle_runtime_owned_bytes()
+        .map_err(|message| anyhow::anyhow!(message))?;
+    decode_bytes
+        .checked_add(scratch_bytes)
+        .ok_or_else(|| anyhow::anyhow!("Qwen idle runtime byte total overflow"))
+}
+
+/// Create the commit boundary that will flush deferred residency removals
+/// after a drained worker drops its mutable buffers. Construct it before any
+/// ownership mutation so encoder creation failure leaves the worker active.
+pub(crate) fn idle_runtime_release_encoder() -> Result<mlx_native::CommandEncoder> {
+    GPU_CACHE.with(|cell| {
+        let cache = cell.borrow();
+        let cache = cache
+            .as_ref()
+            .context("Qwen GPU activation is absent at idle park")?;
+        cache
+            .device
+            .command_encoder()
+            .context("create Qwen idle-release residency commit")
+    })
+}
+
+/// Reclaim only mutable per-request arenas while retaining the model-bound
+/// mapped weights, registry, and compiled pipelines in `GPU_CACHE`.
+pub(crate) fn release_idle_runtime_state() -> Result<u64> {
+    let expected = idle_runtime_owned_bytes()?;
+    let decode_bytes = GPU_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        cache
+            .as_mut()
+            .and_then(|cache| cache.decode_bufs.take())
+            .map_or(0, |buffers| buffers.owned_bytes())
+    });
+    let scratch_bytes = super::decode_pool::release_idle_runtime_state()
+        .map_err(|message| anyhow::anyhow!(message))?;
+    let released = decode_bytes
+        .checked_add(scratch_bytes)
+        .ok_or_else(|| anyhow::anyhow!("Qwen idle runtime byte total overflow"))?;
+    debug_assert_eq!(released, expected);
+    Ok(released)
+}
+
+/// Create the mapped-weight loader's device only after any Qwen activation
+/// previously resident on this thread has been torn down.
+///
+/// This is the earliest allocation boundary in `Qwen35Model::load_from_gguf`.
+/// Keeping cleanup and device creation in one function makes it impossible
+/// for that loader to allocate B while A's forward weights or scratch remain
+/// alive in thread-local caches. A failed device creation leaves the thread
+/// clean; a caller may safely retry A or load another generation.
+pub(super) fn new_model_load_device() -> std::result::Result<MlxDevice, mlx_native::MlxError> {
+    GPU_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        clear_stale_gpu_activation(&mut *cache);
+    });
+    MlxDevice::new()
 }
 
 // ================================================================
@@ -407,33 +856,54 @@ fn observe_dense_ffn_cache(
     loaded: &Qwen35FfnWeights,
     executed: &FfnWeightsGpu,
 ) -> Result<()> {
-    let (Qwen35FfnWeights::DenseQ(loaded), FfnWeightsGpu::DenseQ(executed)) = (loaded, executed)
-    else {
-        anyhow::bail!("evidence profile requires native-GGML dense FFN weights in every layer");
+    let add = |builder: &mut super::execution_observation::ExecutedTensorCatalogBuilder<'_>,
+               suffix: &str,
+               buffer: &MlxBuffer|
+     -> Result<()> {
+        let tensor_name = format!("{prefix}.{suffix}");
+        builder.add_direct_ggml(&tensor_name, &tensor_name, buffer)
     };
-    builder.add_direct_ggml(
-        &format!("{prefix}.ffn_gate.weight"),
-        &format!("{prefix}.ffn_gate.weight"),
-        &executed.gate_q,
-    )?;
-    builder.add_direct_ggml(
-        &format!("{prefix}.ffn_up.weight"),
-        &format!("{prefix}.ffn_up.weight"),
-        &executed.up_q,
-    )?;
-    builder.add_direct_ggml(
-        &format!("{prefix}.ffn_down.weight"),
-        &format!("{prefix}.ffn_down.weight"),
-        &executed.down_q,
-    )?;
-    anyhow::ensure!(
-        loaded.ggml_type_gate_up == executed.ggml_type_gate_up
-            && loaded.ggml_type_down == executed.ggml_type_down
-            && loaded.hidden_size == executed.hidden_size
-            && loaded.intermediate_size == executed.intermediate_size,
-        "loaded and executed dense FFN metadata differs"
-    );
-    Ok(())
+    match (loaded, executed) {
+        (Qwen35FfnWeights::DenseQ(loaded), FfnWeightsGpu::DenseQ(executed)) => {
+            add(builder, "ffn_gate.weight", &executed.gate_q)?;
+            add(builder, "ffn_up.weight", &executed.up_q)?;
+            add(builder, "ffn_down.weight", &executed.down_q)?;
+            anyhow::ensure!(
+                loaded.ggml_type_gate == executed.ggml_type_gate
+                    && loaded.ggml_type_up == executed.ggml_type_up
+                    && loaded.ggml_type_down == executed.ggml_type_down
+                    && loaded.hidden_size == executed.hidden_size
+                    && loaded.intermediate_size == executed.intermediate_size,
+                "loaded and executed quantized dense FFN metadata differs"
+            );
+            Ok(())
+        }
+        (Qwen35FfnWeights::DenseNative(loaded), FfnWeightsGpu::Dense(executed)) => {
+            let dtype_for = |kind: GgmlType| -> Result<DType> {
+                match kind {
+                    GgmlType::F32 => Ok(DType::F32),
+                    GgmlType::F16 => Ok(DType::F16),
+                    GgmlType::BF16 => Ok(DType::BF16),
+                    other => anyhow::bail!(
+                        "native scalar dense FFN evidence received unsupported {other:?}"
+                    ),
+                }
+            };
+            anyhow::ensure!(
+                executed.gate.dtype() == dtype_for(loaded.gate_type)?
+                    && executed.up.dtype() == dtype_for(loaded.up_type)?
+                    && executed.down.dtype() == dtype_for(loaded.down_type)?,
+                "loaded and executed native scalar dense FFN dtypes differ"
+            );
+            add(builder, "ffn_gate.weight", &executed.gate)?;
+            add(builder, "ffn_up.weight", &executed.up)?;
+            add(builder, "ffn_down.weight", &executed.down)?;
+            Ok(())
+        }
+        _ => {
+            anyhow::bail!("loaded and executed dense FFN storage differs from the evidence profile")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -556,8 +1026,9 @@ fn observe_native_delta_cache(
         let tensor_name = format!("{prefix}.{suffix}");
         builder.add_direct_ggml(&tensor_name, &tensor_name, buffer)?;
     }
+    let conv_name = format!("{prefix}.ssm_conv1d.weight");
+    builder.add_direct_ggml(&conv_name, &conv_name, &executed.ssm_conv1d)?;
     for (suffix, buffer) in [
-        ("ssm_conv1d.weight", &executed.ssm_conv1d),
         ("ssm_dt.bias", &executed.ssm_dt_bias),
         ("ssm_a", &executed.ssm_a),
         ("ssm_norm.weight", &executed.ssm_norm),
@@ -576,9 +1047,11 @@ fn observe_native_delta_cache(
 enum FfnQuantArm {
     /// Quantized dense FFN (DenseQ).
     DenseQ,
+    /// Artifact-native scalar dense FFN (F32/F16/BF16).
+    DenseNative,
     /// Quantized MoE FFN (MoeQ).
     MoeQ,
-    /// Non-quantized arm (Dense F32, F32-MoE, BF16) or empty model.
+    /// Synthetic/non-composable arm or empty model.
     Other,
 }
 
@@ -590,11 +1063,14 @@ enum FfnQuantArm {
 ///
 ///   - DenseQ + Q4_K (any K-quant Q4_K subtype):       cn = 4
 ///   - DenseQ + Q4_0 (27b-dwq46 dense blocks):         cn = 4  (iter51)
+///   - DenseQ + Q5_K:                                  cn = 2  (Qwen3.8 physical matrix)
+///   - DenseQ + Q6_K/Q8_0:                             cn = 1  (Qwen3.8 physical matrices)
+///   - DenseNative + F32/F16/BF16:                     cn = 1  (explicit native policy)
 ///   - MoeQ   + Q4_K:                                  cn = 2
 ///   - MoeQ   + Q4_0 (DWQ46/DWQ48 production blocks):  cn = 2  (iter45-RESUMED)
 ///   - MoeQ   + Q5_K (apex MoE):                       cn = 2  (iter51)
 ///   - MoeQ   + Q6_K (super-block):                    cn = 1  (apex flat-negative)
-///   - any other (F32/BF16/F16/Q8_0/I16, etc.):        cn = 1
+///   - every other admitted artifact codec:            cn = 1  (explicit below)
 ///
 /// **iter45-RESUMED (2026-04-29) Q4_0 MoE arm rationale.**  iter47 surfaced
 /// that DWQ46 / DWQ48 fixtures store expert/projection blocks as Q4_0 —
@@ -610,30 +1086,79 @@ enum FfnQuantArm {
 /// `cfg_is_moe` is the cross-check from `cfg.moe.is_some()` — if it
 /// disagrees with `arm`, fall through to cn=1 (defensive against
 /// mid-loaded mismatched configs).
+fn explicit_chain_n_for(
+    arm: FfnQuantArm,
+    quant: Option<mlx_native::ops::quantized_matmul_ggml::GgmlType>,
+    cfg_is_moe: bool,
+) -> Option<usize> {
+    use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+    let quant = quant?;
+    match arm {
+        FfnQuantArm::DenseQ if !cfg_is_moe => Some(match quant {
+            GgmlType::Q4_K | GgmlType::Q4_0 => 4,
+            // ADR-040 §7.QWEN-Q5-CHAIN: exact Qwen3.8 Q5_K_M widths
+            // 1/2/4/8/16 selected cn=2 over {1,2,4,8}. It preserves scalar
+            // replay and reduces a 64-layer target forward from 66 to 34
+            // command-buffer submissions.
+            GgmlType::Q5_K => 2,
+            // ADR-040 §7.QWEN-Q6-Q8-CHAIN: Q6_K N={2,4} and Q8_0 N={2,4}
+            // were exact but non-universal speed tradeoffs, so N=1 remains
+            // the measured policy for both codecs.
+            GgmlType::Q6_K | GgmlType::Q8_0 => 1,
+            // These artifact codecs are admitted by Qwen GGUF preflight.
+            // They remain explicit N=1 cells until an exact physical matrix
+            // proves a non-regressing alternative.
+            GgmlType::Q2_K
+            | GgmlType::Q3_K
+            | GgmlType::Q5_0
+            | GgmlType::Q5_1
+            | GgmlType::IQ4_NL
+            | GgmlType::IQ4_XS => 1,
+            // I16/I32 are metadata/state types, never FFN matrix codecs.
+            GgmlType::I16 | GgmlType::I32 => return None,
+            // The backend enum is non-exhaustive. A newly published backend
+            // codec stays unadmitted until Qwen preflight and the canary below
+            // are extended together.
+            _ => return None,
+        }),
+        FfnQuantArm::DenseNative if !cfg_is_moe => Some(match quant {
+            // Native scalar storage is a different execution arm from
+            // DenseQ. The BF16 N={2,4} hardware matrices in
+            // ADR-040 §7.QWEN-NATIVE-CHAIN select one; F32/F16 remain
+            // conservative until separately measured.
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => 1,
+            _ => return None,
+        }),
+        FfnQuantArm::MoeQ if cfg_is_moe => Some(match quant {
+            GgmlType::Q4_K | GgmlType::Q4_0 | GgmlType::Q5_K => 2,
+            GgmlType::F32
+            | GgmlType::F16
+            | GgmlType::BF16
+            | GgmlType::Q2_K
+            | GgmlType::Q3_K
+            | GgmlType::Q5_0
+            | GgmlType::Q5_1
+            | GgmlType::Q6_K
+            | GgmlType::Q8_0
+            | GgmlType::IQ4_NL
+            | GgmlType::IQ4_XS => 1,
+            GgmlType::I16 | GgmlType::I32 => return None,
+            _ => return None,
+        }),
+        // Synthetic test arms and arm/config mismatches intentionally use the
+        // conservative outer fallback in chain_n_for.
+        FfnQuantArm::DenseQ | FfnQuantArm::DenseNative | FfnQuantArm::MoeQ | FfnQuantArm::Other => {
+            None
+        }
+    }
+}
+
 fn chain_n_for(
     arm: FfnQuantArm,
     quant: Option<mlx_native::ops::quantized_matmul_ggml::GgmlType>,
     cfg_is_moe: bool,
 ) -> usize {
-    use mlx_native::ops::quantized_matmul_ggml::GgmlType;
-    match (arm, quant) {
-        (FfnQuantArm::DenseQ, Some(GgmlType::Q4_K)) if !cfg_is_moe => 4,
-        // iter51: 27b-dwq46 stores dense Q4_0; iter45-RESUMED N-curve cn=4 wins
-        // (+0.70pp vs cn=1 catch-all; ties cn=8).  Promoted in iter51 (small
-        // deferred chain_n promotion) once gemma fix at iter50 cleared all 4
-        // fixtures past the parity gate; remaining lever is "maximize lead".
-        (FfnQuantArm::DenseQ, Some(GgmlType::Q4_0)) if !cfg_is_moe => 4,
-        (FfnQuantArm::MoeQ, Some(GgmlType::Q4_K)) if cfg_is_moe => 2,
-        // iter45-RESUMED: DWQ46/DWQ48 store as Q4_0; cn=2 measured optimum (+6.75pp on dwq46).
-        (FfnQuantArm::MoeQ, Some(GgmlType::Q4_0)) if cfg_is_moe => 2,
-        // iter51: apex Q5_K MoE — iter45-RESUMED N-curve cn=2 wins (+1.47pp vs
-        // cn=1).  Sister-fixture deferral lifted in iter51 once all 4 fixtures
-        // pass parity gate; remaining lever is "maximize lead".
-        (FfnQuantArm::MoeQ, Some(GgmlType::Q5_K)) if cfg_is_moe => 2,
-        (FfnQuantArm::MoeQ, Some(GgmlType::Q6_K)) if cfg_is_moe => 1,
-        // Any other quant class, F32-arm, or arm/cfg mismatch → conservative cn=1.
-        _ => 1,
-    }
+    explicit_chain_n_for(arm, quant, cfg_is_moe).unwrap_or(1)
 }
 
 /// Lookup table for the autodefault `HF2Q_PARTIAL_CHAIN_N` value when the
@@ -641,23 +1166,68 @@ fn chain_n_for(
 ///
 /// HF2Q_PARTIAL_CHAIN_N (any N≥1) overrides this table.  HF2Q_PARTIAL_CHAIN_LEGACY=1
 /// forces cn=1 unconditionally (forensic A/B).
-fn default_chain_n(cfg: &Qwen35Config, layer_weights_gpu: &[LayerWeightsGpu]) -> usize {
-    // Find the first layer with a quantized FFN — this fixture's quant class.
-    // Mixed-arch (e.g. some layers MoeQ, others DenseQ) is not a production
-    // shape on Qwen3.5/3.6; if encountered, layer 0 wins and the rest follow.
-    let first_quant_ffn = layer_weights_gpu.iter().find_map(|lg| {
-        let ffn = match lg {
+fn uniform_native_scalar_codec(
+    projections: impl IntoIterator<Item = Option<(GgmlType, GgmlType, GgmlType)>>,
+) -> Option<GgmlType> {
+    let mut selected = None;
+    for projection in projections {
+        let (gate, up, down) = projection?;
+        if gate != up
+            || gate != down
+            || !matches!(gate, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
+        {
+            return None;
+        }
+        if selected.is_some_and(|prior| prior != gate) {
+            return None;
+        }
+        selected = Some(gate);
+    }
+    selected
+}
+
+fn native_dense_codec_for_policy(layer_weights: &[Qwen35LayerWeights]) -> Option<GgmlType> {
+    uniform_native_scalar_codec(layer_weights.iter().map(|layer| match layer.ffn() {
+        Qwen35FfnWeights::DenseNative(weights) => {
+            Some((weights.gate_type, weights.up_type, weights.down_type))
+        }
+        _ => None,
+    }))
+}
+
+fn uniform_quantized_ffn_policy(
+    layer_weights_gpu: &[LayerWeightsGpu],
+) -> Option<(FfnQuantArm, GgmlType)> {
+    let mut selected = None;
+    for layer in layer_weights_gpu {
+        let ffn = match layer {
             LayerWeightsGpu::FullAttn { ffn, .. } | LayerWeightsGpu::LinearAttn { ffn, .. } => ffn,
         };
-        match ffn {
-            FfnWeightsGpu::DenseQ(w) => Some((FfnQuantArm::DenseQ, Some(w.ggml_type_gate_up))),
-            FfnWeightsGpu::MoeQ(w) => Some((FfnQuantArm::MoeQ, Some(w.ggml_type_gate_up))),
-            _ => None,
+        let current = match ffn {
+            FfnWeightsGpu::DenseQ(weights) => (FfnQuantArm::DenseQ, weights.ggml_type_gate),
+            FfnWeightsGpu::MoeQ(weights) => (FfnQuantArm::MoeQ, weights.ggml_type_gate),
+            _ => return None,
+        };
+        if selected.is_some_and(|prior| prior != current) {
+            return None;
         }
-    });
+        selected = Some(current);
+    }
+    selected
+}
 
-    let (arm, quant) = first_quant_ffn.unwrap_or((FfnQuantArm::Other, None));
-    chain_n_for(arm, quant, cfg.moe.is_some())
+fn default_chain_n(
+    cfg: &Qwen35Config,
+    layer_weights_gpu: &[LayerWeightsGpu],
+    layer_weights: &[Qwen35LayerWeights],
+) -> usize {
+    if let Some((arm, quant)) = uniform_quantized_ffn_policy(layer_weights_gpu) {
+        return chain_n_for(arm, Some(quant), cfg.moe.is_some());
+    }
+    if let Some(quant) = native_dense_codec_for_policy(layer_weights) {
+        return chain_n_for(FfnQuantArm::DenseNative, Some(quant), cfg.moe.is_some());
+    }
+    chain_n_for(FfnQuantArm::Other, None, cfg.moe.is_some())
 }
 
 // ================================================================
@@ -675,6 +1245,495 @@ struct OutputHeadGpu {
     lm_head_ggml_type: GgmlType,
 }
 
+fn push_native_bf16_matrix<'a>(
+    matrices: &mut Vec<NativeBf16Matrix<'a>>,
+    label: &'static str,
+    buffer: &'a MlxBuffer,
+) -> Result<()> {
+    if buffer.dtype() != DType::BF16 {
+        return Ok(());
+    }
+    ensure!(
+        buffer.shape().len() == 2,
+        "{label}: native BF16 dense weight must be rank two, got {:?}",
+        buffer.shape()
+    );
+    let n = u32::try_from(buffer.shape()[0]).context("BF16 dense rows exceed u32")?;
+    let k = u32::try_from(buffer.shape()[1]).context("BF16 dense columns exceed u32")?;
+    matrices.push(NativeBf16Matrix::unbatched(label, buffer, n, k));
+    Ok(())
+}
+
+fn push_flat_native_bf16_matrix<'a>(
+    matrices: &mut Vec<NativeBf16Matrix<'a>>,
+    label: &'static str,
+    buffer: &'a MlxBuffer,
+    n: u32,
+    k: u32,
+) -> Result<()> {
+    ensure!(
+        buffer.dtype() == DType::BF16,
+        "{label}: flat native dense weight must use BF16 storage, got {}",
+        buffer.dtype()
+    );
+    let expected = usize::try_from(n)
+        .ok()
+        .and_then(|n| usize::try_from(k).ok().and_then(|k| n.checked_mul(k)))
+        .ok_or_else(|| anyhow!("{label}: flat native dense shape [{n}, {k}] overflows"))?;
+    ensure!(
+        buffer.element_count() == expected,
+        "{label}: flat native dense weight has {} elements, expected {expected} for [{n}, {k}]",
+        buffer.element_count()
+    );
+    matrices.push(NativeBf16Matrix::unbatched(label, buffer, n, k));
+    Ok(())
+}
+
+fn push_native_bf16_qweight<'a>(
+    matrices: &mut Vec<NativeBf16Matrix<'a>>,
+    label: &'static str,
+    weight: &'a MlxQWeight,
+) -> Result<()> {
+    if weight.affine.is_some() {
+        return Ok(());
+    }
+    push_declared_native_bf16_matrix(matrices, label, &weight.buffer, weight.info.ggml_dtype)
+}
+
+fn push_declared_native_bf16_matrix<'a>(
+    matrices: &mut Vec<NativeBf16Matrix<'a>>,
+    label: &'static str,
+    buffer: &'a MlxBuffer,
+    declared_type: GgmlType,
+) -> Result<()> {
+    ensure!(
+        (buffer.dtype() == DType::BF16) == (declared_type == GgmlType::BF16),
+        "{label}: buffer storage {} disagrees with declared GGUF type {:?}",
+        buffer.dtype(),
+        declared_type
+    );
+    push_native_bf16_matrix(matrices, label, buffer)
+}
+
+fn push_dense_q_bf16_matrices<'a>(
+    matrices: &mut Vec<NativeBf16Matrix<'a>>,
+    labels: [&'static str; 3],
+    weights: &'a DenseFfnWeightsGpuQ,
+) -> Result<()> {
+    for (label, buffer, declared_type) in [
+        (labels[0], &weights.gate_q, weights.ggml_type_gate),
+        (labels[1], &weights.up_q, weights.ggml_type_up),
+        (labels[2], &weights.down_q, weights.ggml_type_down),
+    ] {
+        push_declared_native_bf16_matrix(matrices, label, buffer, declared_type)?;
+    }
+    Ok(())
+}
+
+fn qwen_native_bf16_matrices<'a>(
+    layer_weights: &'a [LayerWeightsGpu],
+    output_head: &'a OutputHeadGpu,
+    mtp: Option<&'a super::mtp::MtpWeights>,
+) -> Result<Vec<NativeBf16Matrix<'a>>> {
+    let mut matrices = Vec::new();
+    for layer in layer_weights {
+        let (attention, ffn) = match layer {
+            LayerWeightsGpu::FullAttn { attn, ffn } => (Some(attn), ffn),
+            LayerWeightsGpu::LinearAttn { attn, ffn } => {
+                push_declared_native_bf16_matrix(
+                    &mut matrices,
+                    "Qwen DeltaNet QKV projection",
+                    &attn.attn_qkv,
+                    attn.attn_qkv_ggml_type,
+                )?;
+                push_declared_native_bf16_matrix(
+                    &mut matrices,
+                    "Qwen DeltaNet gate projection",
+                    &attn.attn_gate,
+                    attn.attn_gate_ggml_type,
+                )?;
+                push_declared_native_bf16_matrix(
+                    &mut matrices,
+                    "Qwen DeltaNet alpha projection",
+                    &attn.ssm_alpha,
+                    attn.ssm_alpha_ggml_type,
+                )?;
+                push_declared_native_bf16_matrix(
+                    &mut matrices,
+                    "Qwen DeltaNet beta projection",
+                    &attn.ssm_beta,
+                    attn.ssm_beta_ggml_type,
+                )?;
+                push_declared_native_bf16_matrix(
+                    &mut matrices,
+                    "Qwen DeltaNet output projection",
+                    &attn.ssm_out,
+                    attn.ssm_out_ggml_type,
+                )?;
+                (None, ffn)
+            }
+        };
+        if let Some(attn) = attention {
+            match &attn.q_gate {
+                super::gpu_full_attn::FullAttnQGateWeightsGpu::Split {
+                    wq,
+                    wq_ggml_type,
+                    w_gate,
+                    w_gate_ggml_type,
+                } => {
+                    push_declared_native_bf16_matrix(
+                        &mut matrices,
+                        "Qwen attention Q projection",
+                        wq,
+                        *wq_ggml_type,
+                    )?;
+                    push_declared_native_bf16_matrix(
+                        &mut matrices,
+                        "Qwen attention gate projection",
+                        w_gate,
+                        *w_gate_ggml_type,
+                    )?;
+                }
+                super::gpu_full_attn::FullAttnQGateWeightsGpu::Fused { weight, ggml_type } => {
+                    push_declared_native_bf16_matrix(
+                        &mut matrices,
+                        "Qwen fused Q/gate projection",
+                        weight,
+                        *ggml_type,
+                    )?;
+                }
+            }
+            push_declared_native_bf16_matrix(
+                &mut matrices,
+                "Qwen attention K projection",
+                &attn.wk,
+                attn.wk_ggml_type,
+            )?;
+            push_declared_native_bf16_matrix(
+                &mut matrices,
+                "Qwen attention V projection",
+                &attn.wv,
+                attn.wv_ggml_type,
+            )?;
+            push_declared_native_bf16_matrix(
+                &mut matrices,
+                "Qwen attention output projection",
+                &attn.wo,
+                attn.wo_ggml_type,
+            )?;
+        }
+        match ffn {
+            FfnWeightsGpu::Dense(weights) => {
+                push_native_bf16_matrix(&mut matrices, "Qwen FFN gate", &weights.gate)?;
+                push_native_bf16_matrix(&mut matrices, "Qwen FFN up", &weights.up)?;
+                push_native_bf16_matrix(&mut matrices, "Qwen FFN down", &weights.down)?;
+            }
+            FfnWeightsGpu::DenseQ(weights) => {
+                push_dense_q_bf16_matrices(
+                    &mut matrices,
+                    ["Qwen FFN gate", "Qwen FFN up", "Qwen FFN down"],
+                    weights,
+                )?;
+            }
+            FfnWeightsGpu::MoeQ(weights) => {
+                push_native_bf16_qweight(&mut matrices, "Qwen MoE router", &weights.router)?;
+                push_native_bf16_qweight(
+                    &mut matrices,
+                    "Qwen MoE shared gate logit",
+                    &weights.shared_gate_inp,
+                )?;
+                push_native_bf16_qweight(
+                    &mut matrices,
+                    "Qwen MoE shared gate",
+                    &weights.shared_gate,
+                )?;
+                push_native_bf16_qweight(&mut matrices, "Qwen MoE shared up", &weights.shared_up)?;
+                push_native_bf16_qweight(
+                    &mut matrices,
+                    "Qwen MoE shared down",
+                    &weights.shared_down,
+                )?;
+            }
+            FfnWeightsGpu::Moe(weights) => {
+                // Synthetic/source-F32 fixtures upload the dense router and
+                // shared-expert projections as BF16. They execute through
+                // the same auto router as GGUF-backed matrices and therefore
+                // belong in the model-lifetime plan too. The stacked expert
+                // buffers are not included: this legacy path slices the CPU
+                // oracle and uploads each selected expert as F32.
+                let hidden = u32::try_from(weights.shared_gate_inp.element_count())
+                    .context("Qwen synthetic MoE hidden size exceeds u32")?;
+                ensure!(hidden > 0, "Qwen synthetic MoE hidden size is zero");
+                let rows = |label: &'static str, weight: &MlxBuffer, k: u32| -> Result<u32> {
+                    let k = usize::try_from(k)?;
+                    ensure!(
+                        weight.element_count() % k == 0,
+                        "{label}: {} flat elements are not divisible by input width {k}",
+                        weight.element_count()
+                    );
+                    u32::try_from(weight.element_count() / k)
+                        .with_context(|| format!("{label}: row count exceeds u32"))
+                };
+                let experts = rows("Qwen synthetic MoE router", &weights.router, hidden)?;
+                let shared = rows(
+                    "Qwen synthetic MoE shared gate",
+                    &weights.shared_gate,
+                    hidden,
+                )?;
+                push_flat_native_bf16_matrix(
+                    &mut matrices,
+                    "Qwen synthetic MoE router",
+                    &weights.router,
+                    experts,
+                    hidden,
+                )?;
+                push_flat_native_bf16_matrix(
+                    &mut matrices,
+                    "Qwen synthetic MoE shared gate logit",
+                    &weights.shared_gate_inp,
+                    1,
+                    hidden,
+                )?;
+                push_flat_native_bf16_matrix(
+                    &mut matrices,
+                    "Qwen synthetic MoE shared gate",
+                    &weights.shared_gate,
+                    shared,
+                    hidden,
+                )?;
+                push_flat_native_bf16_matrix(
+                    &mut matrices,
+                    "Qwen synthetic MoE shared up",
+                    &weights.shared_up,
+                    shared,
+                    hidden,
+                )?;
+                push_flat_native_bf16_matrix(
+                    &mut matrices,
+                    "Qwen synthetic MoE shared down",
+                    &weights.shared_down,
+                    hidden,
+                    shared,
+                )?;
+            }
+        }
+    }
+    push_declared_native_bf16_matrix(
+        &mut matrices,
+        "Qwen output head",
+        &output_head.lm_head,
+        output_head.lm_head_ggml_type,
+    )?;
+
+    if let Some(mtp) = mtp {
+        push_declared_native_bf16_matrix(
+            &mut matrices,
+            "Qwen MTP EH projection",
+            &mtp.eh_proj,
+            mtp.eh_proj_ggml_type,
+        )?;
+        push_declared_native_bf16_matrix(
+            &mut matrices,
+            "Qwen MTP shared output head",
+            &mtp.shared_head_head,
+            mtp.shared_head_head_ggml_type,
+        )?;
+        match &mtp.attn.q_gate {
+            super::mtp::MtpQGateWeightsGpu::Ungated { wq, wq_ggml_type } => {
+                push_declared_native_bf16_matrix(
+                    &mut matrices,
+                    "Qwen MTP Q projection",
+                    wq,
+                    *wq_ggml_type,
+                )?;
+            }
+            super::mtp::MtpQGateWeightsGpu::Gated(q_gate) => match q_gate {
+                super::gpu_full_attn::FullAttnQGateWeightsGpu::Split {
+                    wq,
+                    wq_ggml_type,
+                    w_gate,
+                    w_gate_ggml_type,
+                } => {
+                    push_declared_native_bf16_matrix(
+                        &mut matrices,
+                        "Qwen MTP Q projection",
+                        wq,
+                        *wq_ggml_type,
+                    )?;
+                    push_declared_native_bf16_matrix(
+                        &mut matrices,
+                        "Qwen MTP gate projection",
+                        w_gate,
+                        *w_gate_ggml_type,
+                    )?;
+                }
+                super::gpu_full_attn::FullAttnQGateWeightsGpu::Fused { weight, ggml_type } => {
+                    push_declared_native_bf16_matrix(
+                        &mut matrices,
+                        "Qwen MTP fused Q/gate projection",
+                        weight,
+                        *ggml_type,
+                    )?;
+                }
+            },
+        }
+        push_declared_native_bf16_matrix(
+            &mut matrices,
+            "Qwen MTP K projection",
+            &mtp.attn.wk,
+            mtp.attn.wk_ggml_type,
+        )?;
+        push_declared_native_bf16_matrix(
+            &mut matrices,
+            "Qwen MTP V projection",
+            &mtp.attn.wv,
+            mtp.attn.wv_ggml_type,
+        )?;
+        push_declared_native_bf16_matrix(
+            &mut matrices,
+            "Qwen MTP attention output projection",
+            &mtp.attn.wo,
+            mtp.attn.wo_ggml_type,
+        )?;
+        match &mtp.ffn {
+            super::mtp::MtpFfnWeightsGpu::Dense { weights, .. } => {
+                push_native_bf16_matrix(&mut matrices, "Qwen MTP FFN gate", &weights.gate)?;
+                push_native_bf16_matrix(&mut matrices, "Qwen MTP FFN up", &weights.up)?;
+                push_native_bf16_matrix(&mut matrices, "Qwen MTP FFN down", &weights.down)?;
+            }
+            super::mtp::MtpFfnWeightsGpu::DenseQ { weights } => {
+                push_dense_q_bf16_matrices(
+                    &mut matrices,
+                    ["Qwen MTP FFN gate", "Qwen MTP FFN up", "Qwen MTP FFN down"],
+                    weights,
+                )?;
+            }
+            super::mtp::MtpFfnWeightsGpu::Moe { .. } => {}
+        }
+    }
+    Ok(matrices)
+}
+
+fn qwen_native_scalar_expert_matrices<'a>(
+    layer_weights: &'a [LayerWeightsGpu],
+    mtp: Option<&'a super::mtp::MtpWeights>,
+    cfg: &Qwen35Config,
+    activation_epoch: u64,
+) -> Result<Vec<NativeScalarExpertMatrix<'a>>> {
+    use mlx_native::{DenseMatmulIdInputLayout, DenseMatmulIdMultiplicity};
+
+    let Some(moe) = cfg.moe.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let source_widths = super::gguf_preflight::scalar_expert_activation_widths();
+    let mut matrices = Vec::new();
+    let mut push_weights = |weights: &'a MoeFfnWeightsGpuQ,
+                            shape: super::ffn::MoeFfnShape,
+                            calibrated_m: &[u32],
+                            label_prefix: &'static str|
+     -> Result<()> {
+        ensure!(
+            weights.activation_epoch == activation_epoch,
+            "{label_prefix} weights are bound to epoch {}, expected {activation_epoch}",
+            weights.activation_epoch
+        );
+        for (role, weight, affine, ggml_type, n, k) in [
+            (
+                "gate",
+                &weights.expert_gate_q,
+                weights.expert_gate_affine.as_ref(),
+                weights.ggml_type_gate,
+                shape.moe_intermediate_size,
+                shape.hidden_size,
+            ),
+            (
+                "up",
+                &weights.expert_up_q,
+                weights.expert_up_affine.as_ref(),
+                weights.ggml_type_up,
+                shape.moe_intermediate_size,
+                shape.hidden_size,
+            ),
+            (
+                "down",
+                &weights.expert_down_q,
+                weights.expert_down_affine.as_ref(),
+                weights.ggml_type_down,
+                shape.hidden_size,
+                shape.moe_intermediate_size,
+            ),
+        ] {
+            if let Some(stack) = affine {
+                stack.validate_geometry(
+                    &format!("{label_prefix} {role}"),
+                    n as usize,
+                    k as usize,
+                    moe.num_experts as usize,
+                )?;
+                continue;
+            }
+            if !matches!(ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+                continue;
+            }
+            let expected_dtype = match ggml_type {
+                GgmlType::F32 => DType::F32,
+                GgmlType::F16 => DType::F16,
+                GgmlType::BF16 => DType::BF16,
+                _ => unreachable!(),
+            };
+            ensure!(
+                weight.dtype() == expected_dtype,
+                "{label_prefix} {role}: declared scalar type {ggml_type:?} disagrees with storage {}",
+                weight.dtype()
+            );
+            let expert_stride_bytes = u64::from(n)
+                .checked_mul(u64::from(k))
+                .and_then(|elements| elements.checked_mul(expected_dtype.size_of() as u64))
+                .context("Qwen scalar expert stride overflow")?;
+            matrices.push(NativeScalarExpertMatrix {
+                label: label_prefix,
+                weight,
+                n,
+                k,
+                top_k: shape.num_experts_per_tok,
+                n_experts: weights.num_experts,
+                expert_stride_bytes,
+                input_layout: if role == "down" {
+                    DenseMatmulIdInputLayout::Slotted
+                } else {
+                    DenseMatmulIdInputLayout::SharedPerToken
+                },
+                id_multiplicity: DenseMatmulIdMultiplicity::DistinctPerToken,
+                calibrated_m: calibrated_m.to_vec(),
+            });
+        }
+        Ok(())
+    };
+    let target_shape = super::ffn::MoeFfnShape {
+        hidden_size: cfg.hidden_size,
+        num_experts: moe.num_experts,
+        num_experts_per_tok: moe.num_experts_per_tok,
+        moe_intermediate_size: moe.moe_intermediate_size,
+        shared_intermediate_size: moe.shared_expert_intermediate_size,
+    };
+    for layer in layer_weights {
+        let ffn = match layer {
+            LayerWeightsGpu::FullAttn { ffn, .. } | LayerWeightsGpu::LinearAttn { ffn, .. } => ffn,
+        };
+        if let FfnWeightsGpu::MoeQ(weights) = ffn {
+            push_weights(weights, target_shape, &source_widths, "Qwen target expert")?;
+        }
+    }
+    if let Some(super::mtp::MtpWeights {
+        ffn: super::mtp::MtpFfnWeightsGpu::Moe { weights, shape },
+        ..
+    }) = mtp
+    {
+        push_weights(weights, *shape, &[1], "Qwen MTP expert")?;
+    }
+    Ok(matrices)
+}
+
 // ================================================================
 // GPU embedding + output-head helpers
 // ================================================================
@@ -687,22 +1746,30 @@ struct OutputHeadGpu {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeEmbeddingRoute {
     Q2K,
+    Q4_0,
+    Q5_0,
     Q4K,
     Q5K,
     Q6K,
     Q8_0,
     F32,
+    F16,
+    BF16,
 }
 
 impl NativeEmbeddingRoute {
     fn for_type(kind: GgmlType) -> Result<Self> {
         match kind {
             GgmlType::Q2_K => Ok(Self::Q2K),
+            GgmlType::Q4_0 => Ok(Self::Q4_0),
+            GgmlType::Q5_0 => Ok(Self::Q5_0),
             GgmlType::Q4_K => Ok(Self::Q4K),
             GgmlType::Q5_K => Ok(Self::Q5K),
             GgmlType::Q6_K => Ok(Self::Q6K),
             GgmlType::Q8_0 => Ok(Self::Q8_0),
             GgmlType::F32 => Ok(Self::F32),
+            GgmlType::F16 => Ok(Self::F16),
+            GgmlType::BF16 => Ok(Self::BF16),
             other => Err(anyhow!(
                 "native token_embd.weight uses unsupported direct-gather type {other:?}; \
                  inference refuses to dequantize and substitute another format"
@@ -713,11 +1780,15 @@ impl NativeEmbeddingRoute {
     const fn capability_route(self) -> Option<mlx_native::GgmlKernelRoute> {
         match self {
             Self::Q2K => Some(mlx_native::GgmlKernelRoute::EmbeddingQ2K),
+            Self::Q4_0 => Some(mlx_native::GgmlKernelRoute::EmbeddingQ4_0),
+            Self::Q5_0 => Some(mlx_native::GgmlKernelRoute::EmbeddingQ5_0),
             Self::Q4K => Some(mlx_native::GgmlKernelRoute::EmbeddingQ4K),
             Self::Q5K => Some(mlx_native::GgmlKernelRoute::EmbeddingQ5K),
             Self::Q6K => Some(mlx_native::GgmlKernelRoute::EmbeddingQ6K),
             Self::Q8_0 => Some(mlx_native::GgmlKernelRoute::EmbeddingQ8_0),
-            Self::F32 => None,
+            Self::F32 => Some(mlx_native::GgmlKernelRoute::EmbeddingF32),
+            Self::F16 => Some(mlx_native::GgmlKernelRoute::EmbeddingF16),
+            Self::BF16 => Some(mlx_native::GgmlKernelRoute::EmbeddingBF16),
         }
     }
 }
@@ -740,24 +1811,8 @@ pub(crate) fn validate_native_embedding_descriptor(
             "native {name} uses unsupported direct-gather type {kind:?}; inference refuses to dequantize and substitute another format"
         )
     })?;
-    let expected_bytes = match route {
-        NativeEmbeddingRoute::F32 => rows
-            .checked_mul(cols)
-            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
-            .with_context(|| format!("native F32 {name} byte length overflow"))?,
-        _ => usize::try_from(
-            mlx_native::ggml_matrix_bytes(
-                kind,
-                u32::try_from(rows)
-                    .with_context(|| format!("native {name} row count exceeds packed geometry"))?,
-                u32::try_from(cols).with_context(|| {
-                    format!("native {name} column count exceeds packed geometry")
-                })?,
-            )
-            .with_context(|| format!("derive native {name} packed byte extent"))?,
-        )
-        .with_context(|| format!("native {name} packed byte extent exceeds usize"))?,
-    };
+    let expected_bytes = native_matrix_storage_bytes(kind, rows, cols)
+        .with_context(|| format!("derive native {name} stored byte extent"))?;
     ensure!(
         byte_len == expected_bytes,
         "native {name} type {:?} shape [{rows}, {cols}] requires exactly {expected_bytes} logical bytes, got {byte_len}",
@@ -797,7 +1852,26 @@ pub(crate) fn validate_native_embedding_descriptor(
     Ok(())
 }
 
-pub(super) fn ensure_native_embedding_admitted(native: &MlxQWeight) -> Result<()> {
+pub(super) fn native_matrix_storage_bytes(
+    kind: GgmlType,
+    rows: usize,
+    cols: usize,
+) -> Result<usize> {
+    ensure!(
+        rows > 0 && cols > 0,
+        "native GGUF matrix dimensions must be positive"
+    );
+    let block_values = kind.block_values() as usize;
+    ensure!(
+        cols % block_values == 0,
+        "native GGUF matrix width {cols} is not aligned to {kind:?}'s {block_values}-value blocks"
+    );
+    rows.checked_mul(cols / block_values)
+        .and_then(|blocks| blocks.checked_mul(kind.block_bytes() as usize))
+        .context("native GGUF matrix byte extent overflow")
+}
+
+pub(crate) fn ensure_native_embedding_admitted(native: &MlxQWeight) -> Result<()> {
     let route = NativeEmbeddingRoute::for_type(native.info.ggml_dtype)?;
     ensure!(
         native.affine.is_none(),
@@ -810,10 +1884,11 @@ pub(super) fn ensure_native_embedding_admitted(native: &MlxQWeight) -> Result<()
         native.info.cols,
         native.buffer.data_byte_len(),
     )?;
-    let expected_dtype = if route == NativeEmbeddingRoute::F32 {
-        DType::F32
-    } else {
-        DType::U8
+    let expected_dtype = match route {
+        NativeEmbeddingRoute::F32 => DType::F32,
+        NativeEmbeddingRoute::F16 => DType::F16,
+        NativeEmbeddingRoute::BF16 => DType::BF16,
+        _ => DType::U8,
     };
     ensure!(
         native.buffer.dtype() == expected_dtype,
@@ -885,6 +1960,40 @@ pub(super) fn embed_tokens_gpu_into(
                 )
                 .context("native Q2_K embedding gather")?;
             }
+            NativeEmbeddingRoute::Q4_0 => {
+                mlx_native::ops::embedding_q4_0::register(registry);
+                mlx_native::embedding_gather_q4_0(
+                    &mut enc,
+                    registry,
+                    device,
+                    &native.buffer,
+                    &ids,
+                    output,
+                    &mlx_native::EmbeddingQ4_0Params {
+                        vocab_size: native.info.rows,
+                        embed_dim: hidden,
+                        n_tokens: tokens.len(),
+                    },
+                )
+                .context("native Q4_0 embedding gather")?;
+            }
+            NativeEmbeddingRoute::Q5_0 => {
+                mlx_native::ops::embedding_q5_0::register(registry);
+                mlx_native::embedding_gather_q5_0(
+                    &mut enc,
+                    registry,
+                    device,
+                    &native.buffer,
+                    &ids,
+                    output,
+                    &mlx_native::EmbeddingQ5_0Params {
+                        vocab_size: native.info.rows,
+                        embed_dim: hidden,
+                        n_tokens: tokens.len(),
+                    },
+                )
+                .context("native Q5_0 embedding gather")?;
+            }
             NativeEmbeddingRoute::Q4K => {
                 mlx_native::ops::embedding_q4_k::register(registry);
                 mlx_native::embedding_gather_q4_k(
@@ -953,14 +2062,21 @@ pub(super) fn embed_tokens_gpu_into(
                 )
                 .context("native Q8_0 embedding gather")?;
             }
-            NativeEmbeddingRoute::F32 => {
-                let table = native
-                    .buffer
-                    .as_slice::<f32>()
-                    .map_err(|e| anyhow!("map native F32 token embedding: {e}"))?;
-                let rows = embed_tokens(tokens, table, native.info.rows as u32, hidden_size);
-                return upload_f32_into(&rows, output)
-                    .context("upload selected native F32 embedding rows");
+            NativeEmbeddingRoute::F32 | NativeEmbeddingRoute::F16 | NativeEmbeddingRoute::BF16 => {
+                mlx_native::embedding_gather_dense(
+                    &mut enc,
+                    registry,
+                    device,
+                    &native.buffer,
+                    &ids,
+                    output,
+                    &mlx_native::EmbeddingDenseParams {
+                        vocab_size: native.info.rows,
+                        embed_dim: hidden,
+                        n_tokens: tokens.len(),
+                    },
+                )
+                .context("native scalar embedding gather")?;
             }
         }
         // The consuming Qwen/MTP forward is submitted to the same Metal
@@ -1036,23 +2152,18 @@ fn embed_tokens_gpu(
 
 /// Soft-token-aware variant of [`embed_tokens_gpu`].
 ///
-/// ADR-005 Phase 4 Wedge-4a (2026-05-01).  Performs the standard CPU
-/// gather + upload like `embed_tokens_gpu`, but for any prompt position
+/// ADR-005 Phase 4 Wedge-4a (2026-05-01). Performs the standard native
+/// GPU gather like `embed_tokens_gpu`, but for any prompt position
 /// `p` that lies within a `SoftTokenInjection.range`, the per-token row
 /// is OVERWRITTEN by the corresponding row of the override `MlxBuffer`
-/// before upload.  The placeholder token id at `tokens[p]` is ignored at
+/// in the gathered output. The placeholder token id at `tokens[p]` is ignored at
 /// those positions — the override fully replaces the embedding-table
 /// lookup, mirroring the Gemma path's contract documented at
 /// `crate::serve::forward_prefill::SoftTokenInjection`.
 ///
-/// Override rows are read from the supplied `embeddings` buffer via
-/// `MlxBuffer::as_slice::<f32>()`; this is a CPU-side read of the
-/// override-row bytes, then a single `upload_f32` once the full
-/// `[seq_len, hidden_size]` row matrix is materialized.  The Gemma
-/// path uses an on-GPU `dispatch_copy_f32` because its embed step runs
-/// in the per-token GPU session loop; the qwen35 forward does the
-/// embed CPU-side as a single batch upload, so the override is most
-/// natural to apply at the CPU stage too.
+/// Override rows stay on device: `dispatch_copy_f32` replaces the selected
+/// rows after the embedding gather. Neither the native table nor the override
+/// matrix is downloaded or re-uploaded by this path.
 ///
 /// **Pre-scaling contract.** Qwen3.5/3.6 does NOT scale the embedding-
 /// table lookup by `sqrt(hidden_size)` (only Gemma does — see
@@ -1067,7 +2178,7 @@ fn embed_tokens_gpu(
 ///   `range.len() * hidden_size * 4`.
 /// * The override buffer is not F32 (caller contract — overrides come
 ///   from a vision projector that already emits F32 rows).
-fn embed_tokens_gpu_with_soft_tokens(
+pub(crate) fn embed_tokens_gpu_with_soft_tokens(
     tokens: &[u32],
     token_embd: &[f32],
     token_embd_native: Option<&MlxQWeight>,
@@ -1554,8 +2665,13 @@ fn apply_output_head_gpu_last(
     eps: f32,
 ) -> Result<Vec<f32>> {
     anyhow::ensure!(seq_len > 0, "apply_output_head_gpu_last: empty sequence");
-    let byte_offset = ((seq_len as u64 - 1) * hidden_size as u64) * 4;
-    let last_hidden = hidden.slice_view(byte_offset, hidden_size as usize);
+    let last_hidden = crate::serve::forward_mlx_shared::exact_f32_row_view(
+        hidden,
+        seq_len as usize,
+        hidden_size as usize,
+        seq_len as usize - 1,
+        "apply_output_head_gpu_last",
+    )?;
     apply_output_head_gpu_into(
         caller_enc,
         device,
@@ -1633,8 +2749,13 @@ fn apply_output_head_gpu_last_with_nextn_hidden(
     .context("dispatch_rms_norm nextn hidden")?;
     enc.memory_barrier();
 
-    let byte_offset = ((seq_len as u64 - 1) * hidden_size as u64) * 4;
-    let last_normed = normed.slice_view(byte_offset, hidden_size as usize);
+    let last_normed = crate::serve::forward_mlx_shared::exact_f32_row_view(
+        &normed,
+        seq_len as usize,
+        hidden_size as usize,
+        seq_len as usize - 1,
+        "apply_output_head_gpu_nextn_last",
+    )?;
     let logits = apply_linear_projection_f32_with_ggml_type(
         &mut enc,
         registry,
@@ -1791,6 +2912,12 @@ fn apply_output_head_gpu_into_topk(
         .as_slice::<f32>()
         .map_err(|e| anyhow!("read top_k out_values: {e}"))?
         .to_vec();
+    crate::inference::argmax::validate_finite_logits(&top_values, "Qwen GPU top-K readback")?;
+    anyhow::ensure!(
+        top_indices.len() == top_values.len()
+            && top_indices.iter().all(|&token| token < vocab_size),
+        "Qwen GPU top-K returned invalid token indices for vocabulary {vocab_size}"
+    );
     Ok((top_indices, top_values))
 }
 
@@ -1812,8 +2939,13 @@ fn apply_output_head_gpu_last_topk(
         seq_len > 0,
         "apply_output_head_gpu_last_topk: empty sequence"
     );
-    let byte_offset = ((seq_len as u64 - 1) * hidden_size as u64) * 4;
-    let last_hidden = hidden.slice_view(byte_offset, hidden_size as usize);
+    let last_hidden = crate::serve::forward_mlx_shared::exact_f32_row_view(
+        hidden,
+        seq_len as usize,
+        hidden_size as usize,
+        seq_len as usize - 1,
+        "apply_output_head_gpu_last_topk",
+    )?;
     apply_output_head_gpu_into_topk(
         caller_enc,
         device,
@@ -1855,8 +2987,13 @@ fn apply_output_norm_only_last(
     eps: f32,
 ) -> Result<Vec<f32>> {
     anyhow::ensure!(seq_len > 0, "apply_output_norm_only_last: empty sequence");
-    let byte_offset = ((seq_len as u64 - 1) * hidden_size as u64) * 4;
-    let last_hidden = hidden.slice_view(byte_offset, hidden_size as usize);
+    let last_hidden = crate::serve::forward_mlx_shared::exact_f32_row_view(
+        hidden,
+        seq_len as usize,
+        hidden_size as usize,
+        seq_len as usize - 1,
+        "apply_output_norm_only_last",
+    )?;
 
     // RMSNorm into a fresh `[1, hidden_size]` F32 buffer, then download.
     // The pooled allocator's lifetime hook keeps the transient anchored
@@ -1913,9 +3050,10 @@ fn logits_buf_mut(bufs: &DecodeBuffers) -> &mut MlxBuffer {
 
 /// Decode-only greedy variant of `apply_output_head_gpu`.
 ///
-/// Runs RMSNorm → lm_head GEMM → GPU argmax, then downloads 4 bytes
-/// (one u32 token ID) instead of `vocab_size * 4` bytes (~600KB for
-/// vocab_size=151936).  75× less data transferred per decode step.
+/// Runs RMSNorm → lm_head GEMM → GPU argmax, then reads 8 bytes
+/// (one u32 token ID plus its f32 value) instead of `vocab_size * 4` bytes
+/// (~600KB for vocab_size=151936). The value is required to reject poisoned
+/// non-finite output instead of silently accepting token zero.
 ///
 /// Only correct for seq_len=1 greedy decoding (temperature=0).
 /// Accepts pre-allocated `DecodeBuffers` to avoid per-call Metal allocation.
@@ -1942,9 +3080,9 @@ fn apply_output_head_gpu_greedy(
     // ADR-015 P3 Stage 1 (S1): collapse the legacy 3-encoder output head
     // (norm + lm_head + argmax) into ONE encoder with two intra-CB
     // barriers between RAW dependencies.  Single terminal
-    // `commit_and_wait_labeled` drains the GPU before the 4-byte
-    // host read of `out_index` (the only fuse_safe=NO row in the P1
-    // audit, which must remain a real wait).
+    // `commit_and_wait_labeled` drains the GPU before the 8-byte
+    // host read of `out_index` plus `out_value` (the only fuse_safe=NO
+    // row in the P1 audit, which must remain a real wait).
     apply_output_head_gpu_greedy_into(
         None, // no caller-supplied encoder; we open + commit our own
         device,
@@ -1953,6 +3091,7 @@ fn apply_output_head_gpu_greedy(
         head,
         hidden_size,
         vocab_size,
+        1,
         normed,
         norm_params,
         &out_index,
@@ -1984,11 +3123,49 @@ fn apply_output_head_gpu_greedy(
         );
     }
 
-    // Download only 4 bytes (the winning token ID).
-    let token_id = out_index
-        .as_slice::<u32>()
-        .map_err(|e| anyhow!("out_index as_slice: {e}"))?[0];
-    Ok(token_id)
+    crate::inference::argmax::read_finite_argmax_one(
+        out_index,
+        out_value,
+        vocab_size,
+        "Qwen greedy output head",
+    )
+}
+
+fn apply_output_head_gpu_greedy_batched(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    hidden_size: u32,
+    vocab_size: u32,
+    bufs: &DecodeBuffers,
+) -> Result<Vec<u32>> {
+    let width = u32::try_from(bufs.width).context("Qwen batched output-head width overflow")?;
+    anyhow::ensure!(width >= 2, "Qwen batched output head requires width >= 2");
+    let logits_buf = logits_buf_mut(bufs);
+    apply_output_head_gpu_greedy_into(
+        None,
+        device,
+        registry,
+        hidden,
+        head,
+        hidden_size,
+        vocab_size,
+        width,
+        &bufs.norm_out_buf,
+        &bufs.norm_params_buf,
+        &bufs.argmax_index_buf,
+        &bufs.argmax_value_buf,
+        &bufs.argmax_params_buf,
+        logits_buf,
+    )?;
+    crate::inference::argmax::read_finite_argmax_batch(
+        &bufs.argmax_index_buf,
+        &bufs.argmax_value_buf,
+        bufs.width,
+        vocab_size,
+        "Qwen batched greedy output head",
+    )
 }
 
 /// Caller-driven single-CB output head (norm + lm_head + argmax).
@@ -2004,7 +3181,7 @@ fn apply_output_head_gpu_greedy(
 ///   - lm_head → barrier → argmax (RAW: argmax reads `logits_buf`)
 ///
 /// The terminal `commit_and_wait` is the only fuse_safe=NO row in the
-/// P1 audit (host read of `out_index` 4-byte token id) and remains a
+/// P1 audit (host read of the 8-byte index/value pair) and remains a
 /// real wait per ADR-015 invariant.
 #[allow(clippy::too_many_arguments)]
 fn apply_output_head_gpu_greedy_into(
@@ -2015,6 +3192,7 @@ fn apply_output_head_gpu_greedy_into(
     head: &OutputHeadGpu,
     hidden_size: u32,
     vocab_size: u32,
+    seq_len: u32,
     normed: &MlxBuffer,
     norm_params: &MlxBuffer,
     out_index: &MlxBuffer,
@@ -2022,8 +3200,6 @@ fn apply_output_head_gpu_greedy_into(
     argmax_params: &MlxBuffer,
     logits_buf: &mut MlxBuffer,
 ) -> Result<()> {
-    let seq_len = 1u32;
-
     // Helper: encode the 3-stage output head into a given encoder.
     fn encode_into(
         enc: &mut mlx_native::CommandEncoder,
@@ -2076,18 +3252,28 @@ fn apply_output_head_gpu_greedy_into(
         // legacy CB boundary at forward_gpu.rs:410→:413.
         enc.memory_barrier();
 
-        // Stage 3: argmax → out_index, out_value.
-        dispatch_argmax_f32(
-            enc,
-            registry,
-            device.metal_device(),
-            logits_buf,
-            out_index,
-            out_value,
-            argmax_params,
-            vocab_size,
-        )
-        .context("dispatch_argmax_f32 greedy (single-CB)")?;
+        // Stage 3: one independent argmax per physical row. The output-head
+        // projection above remains one true `m=seq_len` operation; these tiny
+        // reductions preserve the scalar kernel's exact tie-break.
+        for row in 0..seq_len as usize {
+            let logits_row = logits_buf.slice_view(
+                (row * vocab_size as usize * std::mem::size_of::<f32>()) as u64,
+                vocab_size as usize,
+            );
+            let index_row = out_index.slice_view((row * std::mem::size_of::<u32>()) as u64, 1);
+            let value_row = out_value.slice_view((row * std::mem::size_of::<f32>()) as u64, 1);
+            dispatch_argmax_f32(
+                enc,
+                registry,
+                device.metal_device(),
+                &logits_row,
+                &index_row,
+                &value_row,
+                argmax_params,
+                vocab_size,
+            )
+            .context("dispatch_argmax_f32 greedy row")?;
+        }
         Ok(())
     }
 
@@ -2211,10 +3397,12 @@ fn apply_output_head_gpu_greedy_legacy(
         .commit_and_wait_labeled("output_head.argmax")
         .context("commit argmax legacy")?;
 
-    let token_id = out_index
-        .as_slice::<u32>()
-        .map_err(|e| anyhow!("out_index as_slice: {e}"))?[0];
-    Ok(token_id)
+    crate::inference::argmax::read_finite_argmax_one(
+        out_index,
+        out_value,
+        vocab_size,
+        "Qwen legacy greedy output head",
+    )
 }
 
 // ================================================================
@@ -2274,14 +3462,23 @@ impl Qwen35Model {
         layer_weights: &[LayerWeightsGpu],
         output_head: &OutputHeadGpu,
     ) -> Result<
-        Option<std::collections::BTreeMap<usize, super::execution_dispatch::Qwen35TraceWeightSlot>>,
+        Option<
+            std::collections::BTreeMap<
+                super::execution_dispatch::Qwen35TraceWeightKey,
+                super::execution_dispatch::Qwen35TraceWeightSlot,
+            >,
+        >,
     > {
         if self.loaded_candidate_tensor_catalog().is_none() {
             return Ok(None);
         }
         let mut slots = std::collections::BTreeMap::new();
         let mut insert = |buffer: &MlxBuffer, operation_id: String| -> Result<()> {
-            let key = buffer.metal_buffer().as_ptr() as usize;
+            let key = (
+                buffer.contents_ptr() as usize,
+                buffer.byte_offset(),
+                buffer.data_byte_len(),
+            );
             let executed_tensor_node_id = format!("executed:{operation_id}");
             if slots
                 .insert(
@@ -2327,12 +3524,21 @@ impl Qwen35Model {
                     ffn
                 }
             };
-            let FfnWeightsGpu::DenseQ(ffn) = ffn else {
-                anyhow::bail!("Qwen evidence profile encountered a non-dense FFN cache");
-            };
-            insert(&ffn.gate_q, format!("{prefix}.ffn_gate.weight"))?;
-            insert(&ffn.up_q, format!("{prefix}.ffn_up.weight"))?;
-            insert(&ffn.down_q, format!("{prefix}.ffn_down.weight"))?;
+            match ffn {
+                FfnWeightsGpu::DenseQ(ffn) => {
+                    insert(&ffn.gate_q, format!("{prefix}.ffn_gate.weight"))?;
+                    insert(&ffn.up_q, format!("{prefix}.ffn_up.weight"))?;
+                    insert(&ffn.down_q, format!("{prefix}.ffn_down.weight"))?;
+                }
+                FfnWeightsGpu::Dense(ffn) => {
+                    insert(&ffn.gate, format!("{prefix}.ffn_gate.weight"))?;
+                    insert(&ffn.up, format!("{prefix}.ffn_up.weight"))?;
+                    insert(&ffn.down, format!("{prefix}.ffn_down.weight"))?;
+                }
+                FfnWeightsGpu::Moe(_) | FfnWeightsGpu::MoeQ(_) => {
+                    anyhow::bail!("Qwen evidence profile encountered an MoE FFN cache")
+                }
+            }
         }
         Ok(Some(slots))
     }
@@ -2353,12 +3559,20 @@ impl Qwen35Model {
         } else {
             builder.add_cpu_f32("token_embd.weight", "token_embd.weight", &self.token_embd)?;
         }
-        builder.add_gpu_f32(
-            "output_norm.weight",
-            "output_norm.weight",
-            &self.output_norm,
-            &output_head.norm_w,
-        )?;
+        if self.output_norm_native.is_some() {
+            builder.add_direct_f32(
+                "output_norm.weight",
+                "output_norm.weight",
+                &output_head.norm_w,
+            )?;
+        } else {
+            builder.add_gpu_f32(
+                "output_norm.weight",
+                "output_norm.weight",
+                &self.output_norm,
+                &output_head.norm_w,
+            )?;
+        }
         if let Some((_native, source)) = self.resolved_native_output_head()? {
             builder.add_direct_ggml(source, "output.weight", &output_head.lm_head)?;
         } else {
@@ -2738,6 +3952,1046 @@ impl Qwen35Model {
         Ok((logits, hidden))
     }
 
+    /// Preflight the exact cold scalar route before scheduler admission.
+    pub(crate) fn validate_gpu_rectangular_prefill(
+        &self,
+        kv_cache: &HybridKvCache,
+        slot_ids: &[SlotId],
+        tokens_per_lane: usize,
+    ) -> Result<()> {
+        ensure!(
+            (2..=4).contains(&slot_ids.len()),
+            "rectangular Qwen prefill width must be in 2..=4"
+        );
+        ensure!(
+            (16..=128).contains(&tokens_per_lane),
+            "rectangular Qwen prefill requires 16..=128 tiled rows per lane, got {tokens_per_lane}"
+        );
+        ensure!(
+            self.cfg.head_dim == 256,
+            "rectangular Qwen prefill requires the production D=256 full-attention route"
+        );
+        ensure!(
+            !kv_cache.la_capture_active(),
+            "rectangular Qwen prefill cannot replace the scalar recovery-capture route"
+        );
+        ensure!(
+            rectangular_prefill_route_compatible(
+                tokens_per_lane as u32,
+                self.cfg.linear_key_head_dim
+            ),
+            "rectangular Qwen prefill cannot replace the enabled scalar chunk-scan route"
+        );
+        ensure!(
+            kv_cache.full_attn.iter().all(|slot| slot.tq.is_some()),
+            "rectangular Qwen prefill requires the canonical TQ cache on every full-attention layer"
+        );
+        ensure!(
+            self.layers
+                .iter()
+                .all(|layer| !matches!(layer.ffn(), Qwen35FfnWeights::Moe(_))),
+            "rectangular Qwen prefill does not admit the host-loop F32 MoE parity route"
+        );
+
+        let mut seen = std::collections::BTreeSet::new();
+        for slot_id in slot_ids {
+            ensure!(
+                slot_id.0 < kv_cache.n_seqs,
+                "rectangular Qwen prefill slot {} outside n_seqs {}",
+                slot_id.0,
+                kv_cache.n_seqs
+            );
+            ensure!(
+                seen.insert(slot_id.0),
+                "rectangular Qwen prefill received duplicate slot {}",
+                slot_id.0
+            );
+            kv_cache
+                .begin_slot_transaction(*slot_id, 0)
+                .with_context(|| {
+                    format!(
+                        "rectangular Qwen prefill slot {} is not at the cold transaction boundary",
+                        slot_id.0
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Advance two to four cold, equal-width text lanes through one aggregate
+    /// target forward without changing the scalar operator representations.
+    ///
+    /// Rows remain sequence-major (`[lane0; lane1; ...]`) through embedding,
+    /// projections, residuals, and FFNs. Full attention uses its native batch
+    /// axis and DeltaNet gathers/scatters each selected slot's recurrent state.
+    /// The vocabulary head is deliberately applied one lane at a time to the
+    /// same final-row view used by [`Self::forward_gpu_last_logits`].
+    ///
+    /// This entry point owns the cache transaction: every selected lane is
+    /// captured before GPU work and rewound together if any layer or output
+    /// head fails. Appended TQ bytes and inactive DeltaNet scratch may remain
+    /// overwritten after rollback, but are unreachable through the restored
+    /// cursors/parity selectors.
+    pub(crate) fn forward_gpu_rectangular_prefill_last_logits(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        slot_ids: &[SlotId],
+        capture_nextn_hidden: bool,
+    ) -> Result<Vec<RectangularPrefillLaneOutput>> {
+        ensure!(
+            !slot_ids.is_empty(),
+            "rectangular Qwen prefill has no lanes"
+        );
+        ensure!(
+            tokens.len() % slot_ids.len() == 0,
+            "rectangular Qwen prefill rows {} are not divisible by {} lanes",
+            tokens.len(),
+            slot_ids.len()
+        );
+        let tokens_per_lane = tokens.len() / slot_ids.len();
+        self.validate_gpu_rectangular_prefill(kv_cache, slot_ids, tokens_per_lane)?;
+        #[cfg(test)]
+        RECTANGULAR_TARGET_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let expected_rows = slot_ids
+            .len()
+            .checked_mul(tokens_per_lane)
+            .context("rectangular Qwen prefill row overflow")?;
+        ensure!(
+            positions_flat.len() == 4 * expected_rows,
+            "rectangular Qwen prefill positions {} != 4 * aggregate rows {}",
+            positions_flat.len(),
+            expected_rows
+        );
+        // Capture every lane before the first GPU allocation or cache write.
+        // begin_slot_transaction also proves a common cold full-attention
+        // cursor and complete DeltaNet parity axes.
+        let transactions = slot_ids
+            .iter()
+            .copied()
+            .map(|slot_id| {
+                kv_cache
+                    .begin_slot_transaction(slot_id, 0)
+                    .map(|transaction| (slot_id, transaction))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        match self.forward_gpu_rectangular_prefill_last_logits_inner(
+            tokens,
+            positions_flat,
+            kv_cache,
+            slot_ids,
+            tokens_per_lane as u32,
+            capture_nextn_hidden,
+        ) {
+            Ok(outputs) => Ok(outputs),
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+                for (slot_id, transaction) in transactions.iter().rev() {
+                    if let Err(rollback_error) =
+                        kv_cache.rollback_slot_transaction(*slot_id, transaction)
+                    {
+                        rollback_errors.push(format!("slot {}: {rollback_error:#}", slot_id.0));
+                    }
+                }
+                if rollback_errors.is_empty() {
+                    Err(error.context("rectangular Qwen prefill rolled back every selected lane"))
+                } else {
+                    Err(error.context(format!(
+                        "rectangular Qwen prefill failed and rollback was incomplete: {}",
+                        rollback_errors.join("; ")
+                    )))
+                }
+            }
+        }
+    }
+
+    fn forward_gpu_rectangular_prefill_last_logits_inner(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        slot_ids: &[SlotId],
+        tokens_per_lane: u32,
+        capture_nextn_hidden: bool,
+    ) -> Result<Vec<RectangularPrefillLaneOutput>> {
+        super::decode_pool::reset_decode_pool();
+        self.ensure_gpu_cache_primed()?;
+
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let rows = u32::try_from(tokens.len()).context("rectangular Qwen row count overflow")?;
+        let (pos_buf, layer_weights_gpu, device_ref, registry_ref, output_head_ref) = GPU_CACHE
+            .with(|cell| -> Result<_> {
+                let cache = cell.borrow();
+                let cache = cache
+                    .as_ref()
+                    .context("rectangular Qwen prefill GPU cache is absent")?;
+                ensure!(
+                    gpu_cache_matches_model(cache, self),
+                    "rectangular Qwen prefill GPU cache belongs to another model"
+                );
+                let mut pos_buf = cache
+                    .device
+                    .alloc_buffer(
+                        positions_flat.len() * std::mem::size_of::<i32>(),
+                        DType::I32,
+                        vec![positions_flat.len()],
+                    )
+                    .map_err(|error| anyhow!("allocate rectangular Qwen positions: {error}"))?;
+                pos_buf
+                    .as_mut_slice::<i32>()
+                    .map_err(|error| anyhow!("map rectangular Qwen positions: {error}"))?
+                    .copy_from_slice(positions_flat);
+                Ok((
+                    pos_buf,
+                    &cache.layer_weights as *const Vec<LayerWeightsGpu>,
+                    &cache.device as *const MlxDevice,
+                    &cache.registry as *const KernelRegistry as *mut KernelRegistry,
+                    &cache.output_head as *const OutputHeadGpu,
+                ))
+            })?;
+        // SAFETY: the thread-local activation is not invalidated during this
+        // call. This is the same cache-borrow discipline as the scalar and
+        // physical-decode entry points above.
+        let layer_weights_gpu = unsafe { &*layer_weights_gpu };
+        let device = unsafe { &*device_ref };
+        let registry = unsafe { &mut *registry_ref };
+        let output_head = unsafe { &*output_head_ref };
+
+        let mut hidden = embed_tokens_gpu(
+            tokens,
+            &self.token_embd,
+            self.token_embd_native.as_ref(),
+            cfg.vocab_size,
+            h,
+            device,
+            registry,
+        )
+        .context("rectangular Qwen token embedding")?;
+
+        let mut fa_arena = if layer_weights_gpu
+            .iter()
+            .any(|layer| matches!(layer, LayerWeightsGpu::FullAttn { .. }))
+        {
+            let shape = FullAttnShape::from_config(cfg);
+            Some(
+                super::FaPrefillArena::new(device, rows, shape.n_head, shape.n_kv, shape.head_dim)
+                    .context("allocate rectangular Qwen full-attention arena")?,
+            )
+        } else {
+            None
+        };
+        let has_dense_q = layer_weights_gpu.iter().any(|layer| {
+            matches!(
+                layer,
+                LayerWeightsGpu::FullAttn {
+                    ffn: FfnWeightsGpu::DenseQ(_),
+                    ..
+                } | LayerWeightsGpu::LinearAttn {
+                    ffn: FfnWeightsGpu::DenseQ(_),
+                    ..
+                }
+            )
+        });
+        let mut dense_ffn_arena = if has_dense_q {
+            let intermediate_size = cfg.intermediate_size.context(
+                "rectangular Qwen DenseQ layers require an intermediate size",
+            )?;
+            Some(
+                super::DenseFfnArena::new(device, rows, h, intermediate_size)
+                    .context("allocate rectangular Qwen DenseFfnArena")?,
+            )
+        } else {
+            None
+        };
+        let mut dense_ffn_output_ring = if has_dense_q {
+            Some(
+                super::DenseFfnOutputRingBuffer::new(device, rows, h)
+                    .context("allocate rectangular Qwen DenseQ output ring")?,
+            )
+        } else {
+            None
+        };
+
+        for (layer_idx, (layer_gpu, layer_cpu)) in
+            layer_weights_gpu.iter().zip(self.layers.iter()).enumerate()
+        {
+            let (post_norm_w, ffn_weights_gpu) = match layer_gpu {
+                LayerWeightsGpu::FullAttn { attn, ffn } => (&attn.post_attn_norm, ffn),
+                LayerWeightsGpu::LinearAttn { attn, ffn } => (&attn.post_attn_norm, ffn),
+            };
+
+            let attn_out = match layer_gpu {
+                LayerWeightsGpu::FullAttn { attn, .. } => {
+                    let shape = FullAttnShape::from_config(cfg);
+                    let full_rank = match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                        Some(super::kv_cache::LayerSlot::Full(rank)) => rank as usize,
+                        other => anyhow::bail!(
+                            "rectangular Qwen layer {layer_idx}: expected full-attention slot, got {other:?}"
+                        ),
+                    };
+                    let arena = fa_arena.as_mut().ok_or_else(|| {
+                        anyhow!("rectangular Qwen full-attention arena is absent")
+                    })?;
+                    let mut enc = device.command_encoder().with_context(|| {
+                        format!("rectangular Qwen full-attention encoder layer {layer_idx}")
+                    })?;
+                    let out = apply_gated_attn_layer_fresh_prefill_batched_into(
+                        &mut enc,
+                        device,
+                        registry,
+                        &hidden,
+                        &pos_buf,
+                        attn,
+                        &mut kv_cache.full_attn[full_rank],
+                        slot_ids,
+                        tokens_per_lane,
+                        shape.hidden_size,
+                        shape.n_head,
+                        shape.n_kv,
+                        shape.head_dim,
+                        shape.rotary_dim,
+                        shape.rope_theta,
+                        shape.mrope_section,
+                        shape.rms_norm_eps,
+                        arena,
+                    )
+                    .with_context(|| {
+                        format!("rectangular Qwen full attention layer {layer_idx}")
+                    })?;
+                    enc.commit_and_wait_labeled("qwen.rectangular_prefill.full_attention")
+                        .with_context(|| {
+                            format!("commit rectangular full attention layer {layer_idx}")
+                        })?;
+                    out
+                }
+                LayerWeightsGpu::LinearAttn { attn, .. } => {
+                    let shape = DeltaNetLayerShape::from_config(cfg);
+                    let linear_rank = match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                        Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                        other => anyhow::bail!(
+                            "rectangular Qwen layer {layer_idx}: expected DeltaNet slot, got {other:?}"
+                        ),
+                    };
+                    let mut enc = device.command_encoder().with_context(|| {
+                        format!("rectangular Qwen DeltaNet encoder layer {layer_idx}")
+                    })?;
+                    let slot = &mut kv_cache.linear_attn[linear_rank];
+                    let out = build_delta_net_layer_prefill_batched_into(
+                        &mut enc,
+                        device,
+                        registry,
+                        &hidden,
+                        attn,
+                        slot,
+                        slot_ids,
+                        tokens_per_lane,
+                        shape.hidden_size,
+                        shape.n_k_heads,
+                        shape.n_v_heads,
+                        shape.d_k,
+                        shape.d_v,
+                        shape.conv_kernel,
+                        shape.rms_norm_eps,
+                    )
+                    .with_context(|| format!("rectangular Qwen DeltaNet layer {layer_idx}"))?;
+                    enc.commit_and_wait_labeled("qwen.rectangular_prefill.delta_net")
+                        .with_context(|| {
+                            format!("commit rectangular DeltaNet layer {layer_idx}")
+                        })?;
+                    for slot_id in slot_ids.iter().copied() {
+                        slot.swap_for_slot(slot_id);
+                    }
+                    out
+                }
+            };
+
+            let ffn_input = device
+                .alloc_buffer(
+                    rows as usize * h as usize * std::mem::size_of::<f32>(),
+                    DType::F32,
+                    vec![rows as usize, h as usize],
+                )
+                .map_err(|error| anyhow!("allocate rectangular Qwen FFN input: {error}"))?;
+            let ffn_residual = device
+                .alloc_buffer(
+                    rows as usize * h as usize * std::mem::size_of::<f32>(),
+                    DType::F32,
+                    vec![rows as usize, h as usize],
+                )
+                .map_err(|error| anyhow!("allocate rectangular Qwen FFN residual: {error}"))?;
+            let mut enc = device
+                .command_encoder()
+                .with_context(|| format!("rectangular Qwen FFN encoder layer {layer_idx}"))?;
+            dispatch_fused_residual_norm_f32(
+                &mut enc,
+                registry,
+                device.metal_device(),
+                &hidden,
+                &attn_out,
+                post_norm_w,
+                &ffn_input,
+                Some(&ffn_residual),
+                rows,
+                h,
+                cfg.rms_norm_eps,
+            )
+            .with_context(|| format!("rectangular Qwen post-attention norm layer {layer_idx}"))?;
+            enc.memory_barrier();
+
+            hidden = match ffn_weights_gpu {
+                FfnWeightsGpu::Dense(weights) => {
+                    let intermediate_size = cfg.intermediate_size.ok_or_else(|| {
+                        anyhow!("rectangular Qwen dense layer {layer_idx} has no intermediate size")
+                    })?;
+                    let out = build_dense_ffn_layer_gpu_into(
+                        &mut enc,
+                        device,
+                        registry,
+                        &ffn_input,
+                        weights,
+                        DenseFfnShape {
+                            hidden_size: h,
+                            intermediate_size,
+                        },
+                        Some(&ffn_residual),
+                    )
+                    .with_context(|| {
+                        format!("rectangular Qwen native dense FFN layer {layer_idx}")
+                    })?;
+                    enc.commit_and_wait_labeled("qwen.rectangular_prefill.dense_ffn")
+                        .with_context(|| {
+                            format!("commit rectangular native dense FFN layer {layer_idx}")
+                        })?;
+                    out
+                }
+                FfnWeightsGpu::DenseQ(weights) => {
+                    // Use the same prefill operator and allocation lifecycle
+                    // as the scalar authority. In particular, the arena path
+                    // keeps gate/up on native quantized MM; the pooled helper
+                    // is a decode-oriented path whose fused mat-vector route
+                    // scales poorly when unrelated prompt lanes are flattened
+                    // into one large row extent.
+                    let arena = dense_ffn_arena.as_mut().ok_or_else(|| {
+                        anyhow!("rectangular Qwen DenseQ arena is absent at layer {layer_idx}")
+                    })?;
+                    let output_ring = dense_ffn_output_ring.as_mut().ok_or_else(|| {
+                        anyhow!(
+                            "rectangular Qwen DenseQ output ring is absent at layer {layer_idx}"
+                        )
+                    })?;
+                    let out = build_dense_ffn_layer_gpu_q_into_with_arena(
+                        &mut enc,
+                        device,
+                        registry,
+                        &ffn_input,
+                        weights,
+                        Some(&ffn_residual),
+                        arena,
+                        output_ring.slot_mut(layer_idx as u32),
+                    )
+                    .with_context(|| {
+                        format!("rectangular Qwen arena DenseQ FFN layer {layer_idx}")
+                    })?;
+                    enc.commit_and_wait_labeled("qwen.rectangular_prefill.denseq_ffn")
+                        .with_context(|| {
+                            format!("commit rectangular DenseQ FFN layer {layer_idx}")
+                        })?;
+                    out
+                }
+                FfnWeightsGpu::MoeQ(weights) => {
+                    let moe = cfg.moe.as_ref().ok_or_else(|| {
+                        anyhow!("rectangular Qwen MoE layer {layer_idx} has no MoE config")
+                    })?;
+                    let out = build_moe_ffn_layer_gpu_q_into(
+                        &mut enc,
+                        device,
+                        registry,
+                        &ffn_input,
+                        weights,
+                        MoeFfnShape {
+                            hidden_size: h,
+                            num_experts: moe.num_experts,
+                            num_experts_per_tok: moe.num_experts_per_tok,
+                            moe_intermediate_size: moe.moe_intermediate_size,
+                            shared_intermediate_size: moe.shared_expert_intermediate_size,
+                        },
+                        Some(&ffn_residual),
+                        layer_idx,
+                    )
+                    .with_context(|| {
+                        format!("rectangular Qwen quantized MoE FFN layer {layer_idx}")
+                    })?;
+                    enc.commit_and_wait_labeled("qwen.rectangular_prefill.moeq_ffn")
+                        .with_context(|| {
+                            format!("commit rectangular MoeQ FFN layer {layer_idx}")
+                        })?;
+                    out
+                }
+                FfnWeightsGpu::Moe(weights_gpu) => {
+                    enc.commit_and_wait_labeled("qwen.rectangular_prefill.moe_norm")
+                        .with_context(|| {
+                            format!("commit rectangular F32-MoE norm layer {layer_idx}")
+                        })?;
+                    let moe = cfg.moe.as_ref().ok_or_else(|| {
+                        anyhow!("rectangular Qwen MoE layer {layer_idx} has no MoE config")
+                    })?;
+                    let weights_cpu = match layer_cpu.ffn() {
+                        Qwen35FfnWeights::Moe(weights) => weights,
+                        _ => anyhow::bail!(
+                            "rectangular Qwen layer {layer_idx} GPU/CPU MoE variants differ"
+                        ),
+                    };
+                    let out = build_moe_ffn_layer_gpu(
+                        device,
+                        registry,
+                        &ffn_input,
+                        weights_gpu,
+                        weights_cpu,
+                        MoeFfnShape {
+                            hidden_size: h,
+                            num_experts: moe.num_experts,
+                            num_experts_per_tok: moe.num_experts_per_tok,
+                            moe_intermediate_size: moe.moe_intermediate_size,
+                            shared_intermediate_size: moe.shared_expert_intermediate_size,
+                        },
+                    )
+                    .with_context(|| format!("rectangular Qwen F32 MoE FFN layer {layer_idx}"))?;
+                    residual_add_gpu(&ffn_residual, &out, device, registry).with_context(|| {
+                        format!("rectangular Qwen F32 MoE residual layer {layer_idx}")
+                    })?
+                }
+            };
+
+            // Attention and non-DenseQ FFN helpers retain layer-local buffers
+            // in the thread-local pool. The FFN terminal wait above has
+            // drained every use, and the cross-layer `hidden` result is
+            // device/arena-owned, so recycle those scratches at the same
+            // lifecycle boundary as scalar prefill. Without this reset a
+            // rectangular transaction retains one aggregate scratch set per
+            // layer until the whole model finishes, creating avoidable
+            // residency pressure.
+            drop(ffn_input);
+            drop(ffn_residual);
+            drop(attn_out);
+            super::decode_pool::reset_for_prefill_chunk();
+        }
+
+        let lane_elements = tokens_per_lane as usize * h as usize;
+        let mut outputs = Vec::with_capacity(slot_ids.len());
+        for lane in 0..slot_ids.len() {
+            let lane_hidden = hidden.slice_view(
+                (lane * lane_elements * std::mem::size_of::<f32>()) as u64,
+                lane_elements,
+            );
+            let (logits, nextn_hidden) = if capture_nextn_hidden {
+                let (logits, nextn_hidden) = apply_output_head_gpu_last_with_nextn_hidden(
+                    None,
+                    device,
+                    registry,
+                    &lane_hidden,
+                    output_head,
+                    tokens_per_lane,
+                    h,
+                    cfg.vocab_size,
+                    cfg.rms_norm_eps,
+                )
+                .with_context(|| format!("rectangular Qwen output head lane {lane}"))?;
+                (logits, Some(nextn_hidden))
+            } else {
+                (
+                    apply_output_head_gpu_last(
+                        None,
+                        device,
+                        registry,
+                        &lane_hidden,
+                        output_head,
+                        tokens_per_lane,
+                        h,
+                        cfg.vocab_size,
+                        cfg.rms_norm_eps,
+                    )
+                    .with_context(|| format!("rectangular Qwen output head lane {lane}"))?,
+                    None,
+                )
+            };
+            outputs.push(RectangularPrefillLaneOutput {
+                logits,
+                nextn_hidden,
+            });
+        }
+        Ok(outputs)
+    }
+
+    /// Execute two exact prompt segments in layer blocks while preserving the
+    /// operator width, cache route, output head, and hidden state of each
+    /// authoritative forward.
+    ///
+    /// Non-terminal windows are derived from both segments' production
+    /// terminal-K cadence. Production Qwen prefills use K=1 above 32 rows;
+    /// short suffixes use K=8, so eight layers is the usual common boundary.
+    /// Failures drain queued GPU work and hard-reset the affected slot;
+    /// parity-only rollback is invalid after two DeltaNet writes.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gpu_two_segment_last_logits_with_hidden(
+        &self,
+        prefix_tokens: &[u32],
+        prefix_positions_flat: &[i32],
+        suffix_tokens: &[u32],
+        suffix_positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
+    ) -> Result<TwoSegmentTargetOutput> {
+        let block_layers =
+            common_ffn_terminal_k_batch(prefix_tokens.len() as u32, suffix_tokens.len() as u32);
+        self.forward_gpu_two_segment_last_logits_with_hidden_guarded(
+            prefix_tokens,
+            prefix_positions_flat,
+            suffix_tokens,
+            suffix_positions_flat,
+            kv_cache,
+            slot_id,
+            block_layers,
+            None,
+            |_| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gpu_two_segment_last_logits_with_hidden_guarded(
+        &self,
+        prefix_tokens: &[u32],
+        prefix_positions_flat: &[i32],
+        suffix_tokens: &[u32],
+        suffix_positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
+        block_layers: usize,
+        terminal_k_batch_override: Option<usize>,
+        after_suffix_block: impl FnMut(usize) -> Result<()>,
+    ) -> Result<TwoSegmentTargetOutput> {
+        let result = self.forward_gpu_two_segment_last_logits_with_hidden_checked(
+            prefix_tokens,
+            prefix_positions_flat,
+            suffix_tokens,
+            suffix_positions_flat,
+            kv_cache,
+            slot_id,
+            block_layers,
+            terminal_k_batch_override,
+            after_suffix_block,
+        );
+        match result {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                let drain = self.with_gpu_cache_mut(|device, _registry| {
+                    let mut encoder = device
+                        .command_encoder()
+                        .context("two-segment failure GPU drain encoder")?;
+                    encoder
+                        .commit_and_wait_labeled("two_segment.failure_drain")
+                        .context("two-segment failure GPU drain")
+                });
+                if let Err(drain) = drain {
+                    return Err(anyhow!(
+                        "two-segment target failed and queued GPU work could not be drained; affected slot must be poisoned: target={error:#}; drain={drain:#}"
+                    ));
+                }
+                match kv_cache.reset_for_slot(slot_id) {
+                Ok(()) => Err(error.context(
+                    "two-segment target failed after possible cache mutation; GPU drained and affected slot hard-reset",
+                )),
+                Err(reset) => Err(anyhow!(
+                    "two-segment target failed and affected slot hard-reset also failed: target={error:#}; reset={reset:#}"
+                )),
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gpu_two_segment_last_logits_with_hidden_checked(
+        &self,
+        prefix_tokens: &[u32],
+        prefix_positions_flat: &[i32],
+        suffix_tokens: &[u32],
+        suffix_positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
+        block_layers: usize,
+        terminal_k_batch_override: Option<usize>,
+        mut after_suffix_block: impl FnMut(usize) -> Result<()>,
+    ) -> Result<TwoSegmentTargetOutput> {
+        anyhow::ensure!(
+            !prefix_tokens.is_empty() && !suffix_tokens.is_empty(),
+            "two-segment target requires non-empty prefix and suffix"
+        );
+        anyhow::ensure!(block_layers > 0, "two-segment block size must be > 0");
+        let entry_len = kv_cache
+            .sequence_len_for_slot(slot_id)
+            .context("two-segment target entry cursor")? as usize;
+        kv_cache
+            .validate_sequence_len_for_slot(slot_id, entry_len)
+            .context("two-segment target all-layer entry cursor equality")?;
+        let prefix_end = entry_len
+            .checked_add(prefix_tokens.len())
+            .context("two-segment target prefix length overflow")?;
+        let final_end = prefix_end
+            .checked_add(suffix_tokens.len())
+            .context("two-segment target final length overflow")?;
+        let mut boundary_receipt =
+            kv_cache.begin_segment_boundary_receipt(slot_id, entry_len, prefix_end, final_end)?;
+        let mut prefix_hidden = None;
+        let mut suffix_hidden = None;
+        let mut prefix_logits = None;
+        let mut prefix_nextn_hidden = None;
+        let mut suffix_logits = None;
+        let mut suffix_nextn_hidden = None;
+
+        for start_layer in (0..self.layers.len()).step_by(block_layers) {
+            let end_layer = start_layer
+                .saturating_add(block_layers)
+                .min(self.layers.len());
+            let terminal = end_layer == self.layers.len();
+
+            let mut next_prefix_hidden = None;
+            let mut next_prefix_nextn = None;
+            #[cfg(test)]
+            let prefix_k = terminal_k_batch_override.unwrap_or_else(|| {
+                effective_ffn_terminal_k_batch(
+                    prefix_tokens.len() as u32,
+                    configured_ffn_terminal_k_batch(),
+                )
+            });
+            #[cfg(test)]
+            let _prefix_segment_trace = segmented_route_trace::enter_segment(
+                segmented_route_trace::Segment::Prefix,
+                prefix_k,
+            );
+            let logits = self.forward_gpu_impl_window(
+                prefix_tokens,
+                prefix_positions_flat,
+                kv_cache,
+                None,
+                (!terminal).then_some(&mut next_prefix_hidden),
+                OutputHeadMode::Last,
+                &[],
+                None,
+                None,
+                terminal.then_some(&mut next_prefix_nextn),
+                None,
+                slot_id,
+                ForwardGpuLayerWindow {
+                    start_layer,
+                    end_layer,
+                    hidden_in: prefix_hidden.take(),
+                    emit_output_head: terminal,
+                    terminal_k_batch_override,
+                },
+            )?;
+            if terminal {
+                prefix_logits = Some(logits);
+                prefix_nextn_hidden = next_prefix_nextn;
+            } else {
+                prefix_hidden = next_prefix_hidden;
+            }
+            for layer_idx in start_layer..end_layer {
+                kv_cache.record_segment_boundary_for_layer(&mut boundary_receipt, layer_idx)?;
+            }
+
+            let mut next_suffix_hidden = None;
+            let mut next_suffix_nextn = None;
+            #[cfg(test)]
+            let suffix_k = terminal_k_batch_override.unwrap_or_else(|| {
+                effective_ffn_terminal_k_batch(
+                    suffix_tokens.len() as u32,
+                    configured_ffn_terminal_k_batch(),
+                )
+            });
+            #[cfg(test)]
+            let _suffix_segment_trace = segmented_route_trace::enter_segment(
+                segmented_route_trace::Segment::Suffix,
+                suffix_k,
+            );
+            let logits = self.forward_gpu_impl_window(
+                suffix_tokens,
+                suffix_positions_flat,
+                kv_cache,
+                None,
+                (!terminal).then_some(&mut next_suffix_hidden),
+                OutputHeadMode::Last,
+                &[],
+                None,
+                None,
+                terminal.then_some(&mut next_suffix_nextn),
+                None,
+                slot_id,
+                ForwardGpuLayerWindow {
+                    start_layer,
+                    end_layer,
+                    hidden_in: suffix_hidden.take(),
+                    emit_output_head: terminal,
+                    terminal_k_batch_override,
+                },
+            )?;
+            if terminal {
+                suffix_logits = Some(logits);
+                suffix_nextn_hidden = next_suffix_nextn;
+            } else {
+                suffix_hidden = next_suffix_hidden;
+            }
+            after_suffix_block(end_layer)?;
+        }
+
+        Ok(TwoSegmentTargetOutput {
+            prefix_logits: prefix_logits.context("two-segment prefix logits missing")?,
+            prefix_nextn_hidden: prefix_nextn_hidden
+                .context("two-segment prefix normalized hidden missing")?,
+            suffix_logits: suffix_logits.context("two-segment suffix logits missing")?,
+            suffix_nextn_hidden: suffix_nextn_hidden
+                .context("two-segment suffix normalized hidden missing")?,
+            boundary_receipt,
+        })
+    }
+
+    /// Execute and seal a stable-boundary prefix plus its following suffix.
+    /// Target state, optional MTP state, the prefix anchor, and both semantic
+    /// hidden rows are produced from the same token slices in one call; no
+    /// receipt or partially paired state escapes to the serving layer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_gpu_stable_boundary_compound(
+        &self,
+        prefix_tokens: &[u32],
+        prefix_positions_flat: &[i32],
+        suffix_tokens: &[u32],
+        suffix_positions_flat: &[i32],
+        pending_target_hidden: Option<&MlxBuffer>,
+        mtp_enabled: bool,
+        kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
+    ) -> Result<StableBoundaryCompoundOutput> {
+        let entry_len = kv_cache.sequence_len_for_slot(slot_id)? as usize;
+        if mtp_enabled {
+            anyhow::ensure!(
+                self.mtp.is_some() && kv_cache.mtp_slot.is_some(),
+                "stable-boundary compound cannot enable MTP without model weights and cache state"
+            );
+            kv_cache
+                .validate_speculative_cursors_for_slot(slot_id, entry_len)
+                .context("stable-boundary compound entry target/MTP cursor equality")?;
+            anyhow::ensure!(
+                (entry_len == 0) == pending_target_hidden.is_none(),
+                "stable-boundary compound pending target hidden presence must match warm entry (entry_len={entry_len}, pending={})",
+                pending_target_hidden.is_some(),
+            );
+        } else {
+            anyhow::ensure!(
+                pending_target_hidden.is_none(),
+                "stable-boundary compound without MTP cannot accept pending target hidden"
+            );
+        }
+        let mut target = self.forward_gpu_two_segment_last_logits_with_hidden(
+            prefix_tokens,
+            prefix_positions_flat,
+            suffix_tokens,
+            suffix_positions_flat,
+            kv_cache,
+            slot_id,
+        )?;
+
+        let semantic = (|| -> Result<(
+            Option<MlxBuffer>,
+            Option<MlxBuffer>,
+            HybridKvSlotAnchor,
+            u64,
+        )> {
+            let (prefix_pending_hidden, suffix_pending_hidden, mtp_embed_owned_bytes) = if mtp_enabled {
+                let mtp = self
+                    .mtp
+                    .as_ref()
+                    .context("stable-boundary compound MTP weights missing")?;
+                anyhow::ensure!(
+                    kv_cache.mtp_slot.is_some(),
+                    "stable-boundary compound MTP cache slot missing"
+                );
+                let prefix_embed = self.embed_tokens_gpu(prefix_tokens)?;
+                let prefix_embed_bytes = u64::try_from(prefix_embed.data_byte_len())?;
+                #[cfg(test)]
+                let _mtp_prefix_segment = segmented_route_trace::enter_segment(
+                    segmented_route_trace::Segment::Prefix,
+                    effective_ffn_terminal_k_batch(
+                        prefix_tokens.len() as u32,
+                        configured_ffn_terminal_k_batch(),
+                    ),
+                );
+                #[cfg(test)]
+                let _mtp_prefix_layer = segmented_route_trace::enter_layer(self.layers.len());
+                #[cfg(test)]
+                segmented_route_trace::record(
+                    segmented_route_trace::OperatorRoute::MtpProcessTarget,
+                    prefix_tokens.len() as u32,
+                    self.cfg.num_key_value_heads * self.cfg.head_dim,
+                    self.cfg.hidden_size,
+                    entry_len as u32,
+                );
+                self.with_gpu_cache_mut(|device, registry| {
+                    mtp.process_target_batch(
+                        prefix_tokens,
+                        pending_target_hidden,
+                        &target.prefix_nextn_hidden,
+                        &prefix_embed,
+                        kv_cache,
+                        slot_id,
+                        prefix_positions_flat,
+                        device,
+                        registry,
+                        &self.cfg,
+                    )
+                })?;
+                #[cfg(test)]
+                segmented_route_trace::fail_if_semantic_fault(
+                    segmented_route_trace::CompoundSemanticFault::AfterPrefixMtp,
+                )?;
+                kv_cache.record_mtp_segment_boundary(&mut target.boundary_receipt)?;
+                let prefix_pending_view =
+                    super::spec_decode::last_hidden_row(&target.prefix_nextn_hidden, self.cfg.hidden_size)?;
+                let prefix_pending = self.copy_logical_buffer_owned(&prefix_pending_view)?;
+
+                let suffix_embed = self.embed_tokens_gpu(suffix_tokens)?;
+                let suffix_embed_bytes = u64::try_from(suffix_embed.data_byte_len())?;
+                #[cfg(test)]
+                let _mtp_suffix_segment = segmented_route_trace::enter_segment(
+                    segmented_route_trace::Segment::Suffix,
+                    effective_ffn_terminal_k_batch(
+                        suffix_tokens.len() as u32,
+                        configured_ffn_terminal_k_batch(),
+                    ),
+                );
+                #[cfg(test)]
+                let _mtp_suffix_layer = segmented_route_trace::enter_layer(self.layers.len());
+                #[cfg(test)]
+                segmented_route_trace::record(
+                    segmented_route_trace::OperatorRoute::MtpProcessTarget,
+                    suffix_tokens.len() as u32,
+                    self.cfg.num_key_value_heads * self.cfg.head_dim,
+                    self.cfg.hidden_size,
+                    (entry_len + prefix_tokens.len()) as u32,
+                );
+                self.with_gpu_cache_mut(|device, registry| {
+                    mtp.process_target_batch(
+                        suffix_tokens,
+                        Some(&prefix_pending),
+                        &target.suffix_nextn_hidden,
+                        &suffix_embed,
+                        kv_cache,
+                        slot_id,
+                        suffix_positions_flat,
+                        device,
+                        registry,
+                        &self.cfg,
+                    )
+                })?;
+                #[cfg(test)]
+                segmented_route_trace::fail_if_semantic_fault(
+                    segmented_route_trace::CompoundSemanticFault::AfterSuffixMtp,
+                )?;
+                let suffix_pending_view =
+                    super::spec_decode::last_hidden_row(&target.suffix_nextn_hidden, self.cfg.hidden_size)?;
+                let suffix_pending = self.copy_logical_buffer_owned(&suffix_pending_view)?;
+                for (label, row) in [
+                    ("prefix", &prefix_pending),
+                    ("suffix", &suffix_pending),
+                ] {
+                    anyhow::ensure!(
+                        row.byte_offset() == 0
+                            && row.data_byte_len() == self.cfg.hidden_size as usize * 4,
+                        "stable-boundary compound {label} hidden row retained a parent allocation"
+                    );
+                }
+                (
+                    Some(prefix_pending),
+                    Some(suffix_pending),
+                    prefix_embed_bytes
+                        .checked_add(suffix_embed_bytes)
+                        .context("stable-boundary compound MTP embedding byte overflow")?,
+                )
+            } else {
+                kv_cache.record_independent_mtp_cursor(&mut target.boundary_receipt)?;
+                (None, None, 0)
+            };
+            #[cfg(test)]
+            segmented_route_trace::fail_if_semantic_fault(
+                segmented_route_trace::CompoundSemanticFault::BeforeSnapshot,
+            )?;
+            let prefix_anchor = kv_cache.snapshot_slot_anchor_from_segment_boundary(
+                slot_id,
+                target.boundary_receipt,
+            )?;
+            Ok((
+                prefix_pending_hidden,
+                suffix_pending_hidden,
+                prefix_anchor,
+                mtp_embed_owned_bytes,
+            ))
+        })();
+
+        let (prefix_pending_hidden, suffix_pending_hidden, prefix_anchor, mtp_embed_owned_bytes) =
+            match semantic {
+                Ok(output) => output,
+                Err(error) => {
+                    let drain = self.with_gpu_cache_mut(|device, _registry| {
+                        let mut encoder = device
+                            .command_encoder()
+                            .context("stable-boundary compound failure drain encoder")?;
+                        encoder
+                            .commit_and_wait_labeled("stable_boundary.failure_drain")
+                            .context("stable-boundary compound failure drain")
+                    });
+                    if let Err(drain) = drain {
+                        return Err(anyhow!(
+                        "stable-boundary compound failed and GPU drain failed; slot must be poisoned: operation={error:#}; drain={drain:#}"
+                    ));
+                    }
+                    kv_cache.reset_for_slot(slot_id).with_context(|| {
+                        format!(
+                        "stable-boundary compound failed and slot reset failed after: {error:#}"
+                    )
+                    })?;
+                    return Err(error.context(
+                        "stable-boundary compound failed; GPU drained and affected slot hard-reset",
+                    ));
+                }
+            };
+
+        let word = u64::try_from(std::mem::size_of::<f32>())?;
+        let suffix_logits_bytes = u64::try_from(target.suffix_logits.capacity())?
+            .checked_mul(word)
+            .context("stable-boundary compound suffix-logit byte overflow")?;
+        let suffix_pending_bytes = suffix_pending_hidden
+            .as_ref()
+            .map(|hidden| u64::try_from(hidden.data_byte_len()))
+            .transpose()?
+            .unwrap_or(0);
+        let incremental_owned_peak_bytes =
+            u64::try_from(target.prefix_nextn_hidden.data_byte_len())?
+                .checked_add(u64::try_from(target.suffix_nextn_hidden.data_byte_len())?)
+                .and_then(|bytes| bytes.checked_add(mtp_embed_owned_bytes))
+                .and_then(|bytes| bytes.checked_add(suffix_logits_bytes))
+                .and_then(|bytes| bytes.checked_add(suffix_pending_bytes))
+                .context("stable-boundary compound transient-owned byte overflow")?;
+
+        Ok(StableBoundaryCompoundOutput {
+            prefix_logits: target.prefix_logits,
+            suffix_logits: target.suffix_logits,
+            prefix_pending_hidden,
+            suffix_pending_hidden,
+            prefix_anchor,
+            incremental_owned_peak_bytes,
+        })
+    }
+
     /// Top-K variant of [`Self::forward_gpu_last_logits`].
     ///
     /// ADR-005 iter-25 — GPU top-K sampling. Same forward pass as
@@ -2808,10 +5062,8 @@ impl Qwen35Model {
 
     /// Soft-token-aware variant of [`Self::forward_gpu_last_logits`].
     ///
-    /// ADR-005 Phase 4 Wedge-4a (2026-05-01).  Closes the last
-    /// `qwen35_not_implemented_err()` arm in
-    /// `crate::serve::api::engine::worker_run`.  Identical semantics to
-    /// `forward_gpu_last_logits` except: for any prompt position `p`
+    /// Identical semantics to `forward_gpu_last_logits` except: for any
+    /// prompt position `p`
     /// that lies within a [`SoftTokenInjection`] range, the standard
     /// embedding-table lookup at the embed step is REPLACED by the
     /// corresponding row of the supplied override `MlxBuffer`.  Every
@@ -3125,6 +5377,12 @@ impl Qwen35Model {
         let logits = logits_buffer_out.ok_or_else(|| {
             anyhow!("forward_gpu_with_nextn_hidden_buffer: logits buffer was not captured")
         })?;
+        crate::inference::argmax::validate_finite_logits(
+            logits
+                .as_slice::<f32>()
+                .map_err(|error| anyhow!("read verifier logits: {error}"))?,
+            "Qwen verifier full-logit readback",
+        )?;
         let hidden = nextn_hidden_out.ok_or_else(|| {
             anyhow!("forward_gpu_with_nextn_hidden_buffer: nextn hidden buffer was not captured")
         })?;
@@ -3369,28 +5627,11 @@ impl Qwen35Model {
     }
 
     /// ADR-034 task #78 Step 3c.A.3 (2026-05-21) — apply target's
-    /// `lm_head` (in its recorded GGML representation) to a pre-normed
-    /// host-side hidden buffer and return per-position argmaxes.
-    ///
-    /// Use case: the DFlash drafter produces `h_final` (already passed
-    /// through the drafter's own final_norm). The orchestrator needs
-    /// to convert each row of `h_final` to a target-vocab argmax by
-    /// running ONLY the target's lm_head (skipping target's final_norm,
-    /// which would double-norm). This matches
-    /// `MlxModelWeights::per_position_argmax_from_hidden_opt(_,
-    /// apply_final_norm=false, _)`.
-    ///
-    /// Layout:
-    ///   * `host` is `[n_pos, hidden_size]` row-major F32.
-    ///   * Returns `Vec<u32>` length `n_pos` — one argmax per row.
-    ///
-    /// Errors:
-    ///   * `host.len() != n_pos * hidden_size`.
-    ///   * `n_pos == 0`.
-    ///   * Any GPU dispatch / download failure.
+    /// `lm_head` (in its recorded GGML representation) to pre-normalized
+    /// host-side hidden rows and return one argmax per position.
     ///
     /// The math is equivalent to taking `forward_gpu_with_hidden`'s logits for
-    /// the same hidden row because both paths dispatch the same native output
+    /// each hidden row because both paths dispatch the same native output
     /// projection with the same recorded GGML type and inputs.
     pub fn per_position_argmax_from_normed_hidden(
         &self,
@@ -3472,6 +5713,10 @@ impl Qwen35Model {
             );
             Ok(logits)
         })?;
+        crate::inference::argmax::validate_finite_logits(
+            &logits_f32,
+            "Qwen per-position drafter head readback",
+        )?;
         // CPU argmax per row. Single-pass linear scan; matches the
         // semantics used in Qwen35DFlashTarget::forward_decode_verify_batched
         // and MlxModelWeights' per-position argmax path.
@@ -3499,7 +5744,7 @@ impl Qwen35Model {
     /// Idempotent: returns immediately if the cache already belongs to
     /// this model. Performs the same one-time weight upload that
     /// `forward_gpu_impl` does on its first call.
-    pub fn ensure_gpu_cache_primed(&self) -> Result<()> {
+    pub(crate) fn prime_gpu_cache_unactivated(&self) -> Result<()> {
         let self_ptr = self as *const _ as *const ();
         #[cfg(test)]
         let loaded_candidate_identity =
@@ -3513,8 +5758,12 @@ impl Qwen35Model {
                 .as_ref()
                 .map_or(true, |cache| !gpu_cache_matches_model(cache, self))
             {
-                let device = MlxDevice::new().context("ensure_gpu_cache_primed: MlxDevice::new")?;
+                clear_stale_gpu_activation(&mut *cache);
+                let device = MlxDevice::new().context("prime_gpu_cache_unactivated: MlxDevice::new")?;
                 let mut registry = KernelRegistry::new();
+                registry
+                    .freeze_ggml_routing_policy(self.ggml_routing_policy)
+                    .context("bind Qwen model routing policy")?;
                 mlx_native::ops::flash_attn_prefill::register(&mut registry);
                 // Register flash_attn_vec for decode-path SDPA instead of the
                 // single-threadgroup serial kernel previously used here.
@@ -3537,12 +5786,14 @@ impl Qwen35Model {
                 let (lm_head, lm_head_ggml_type) =
                     self.materialize_output_head_weight(&device)?;
                 let output_head = OutputHeadGpu {
-                    norm_w: upload_f32_weight(&self.output_norm, &device)
-                        .context("upload output_norm")?,
+                    norm_w: match self.output_norm_native.as_ref() {
+                        Some(mapped) => mapped.clone(),
+                        None => upload_f32_weight(&self.output_norm, &device)
+                            .context("upload synthetic output_norm")?,
+                    },
                     lm_head,
                     lm_head_ggml_type,
                 };
-
                 // ADR-033 §Pi Task #20 iter 11 (2026-05-23) — prewarm hot
                 // Metal pipelines.  Moves first-call JIT/PSO-creation cost
                 // (~40ms × first FA layer + ~40ms × first FFN layer = ~80ms
@@ -3701,6 +5952,7 @@ impl Qwen35Model {
                     self.loaded_candidate_trace_weight_slots(&layer_weights, &output_head)?;
                 *cache = Some(ForwardGpuCache {
                     model_ptr: self_ptr,
+                    activation_epoch: self.activation_epoch(),
                     #[cfg(test)]
                     loaded_candidate_identity,
                     #[cfg(test)]
@@ -3711,11 +5963,160 @@ impl Qwen35Model {
                     registry,
                     layer_weights,
                     output_head,
+                    dense_bf16_activated: false,
+                    dense_bf16_shapes: Vec::new(),
+                    dense_bf16_provider: None,
+                    dense_bf16_receipt: None,
+                    dense_expert_activated: false,
+                    dense_expert_receipt: None,
                     decode_bufs: None,
                 });
             }
             Ok(())
         })
+    }
+
+    /// Make the ordinary target/MTP engine ready for projection dispatch.
+    /// Speculative engine builders use `prime_gpu_cache_unactivated`, upload
+    /// their selected drafter, and activate the complete union explicitly.
+    pub fn ensure_gpu_cache_primed(&self) -> Result<()> {
+        self.prime_gpu_cache_unactivated()?;
+        self.activate_gpu_dense_routes(QwenDenseBf16Provider::TargetMtp, &[])
+    }
+
+    /// Freeze the exact target + MTP + selected-drafter BF16 route union.
+    /// A later request may reuse the same or a narrower union, but cannot add
+    /// a missing shape after the immutable plan has become live.
+    pub(crate) fn activate_gpu_dense_routes(
+        &self,
+        provider: QwenDenseBf16Provider,
+        extra_matrices: &[NativeBf16Matrix<'_>],
+    ) -> Result<()> {
+        self.prime_gpu_cache_unactivated()?;
+        let mut mutation_started = false;
+        let activation_result = GPU_CACHE.with(|cell| -> Result<()> {
+            let mut guard = cell.borrow_mut();
+            let cache = guard.as_mut().ok_or_else(|| {
+                anyhow!("activate_gpu_dense_routes: GPU cache was not primed")
+            })?;
+            ensure!(
+                gpu_cache_matches_model(cache, self),
+                "activate_gpu_dense_routes: GPU cache belongs to a different Qwen model"
+            );
+
+            let mut matrices =
+                qwen_native_bf16_matrices(&cache.layer_weights, &cache.output_head, self.mtp.as_ref())?;
+            matrices.extend_from_slice(extra_matrices);
+            let mut requested_shapes: Vec<_> = matrices
+                .iter()
+                .flat_map(|matrix| {
+                    (1..=16).filter_map(move |m| {
+                        (matrix.reachable_row_mask & (1u16 << (m - 1)) != 0).then_some((
+                            m,
+                            matrix.n,
+                            matrix.k,
+                            matrix.src0_batch,
+                            matrix.src1_batch,
+                        ))
+                    })
+                })
+                .collect();
+            requested_shapes.sort_unstable();
+            requested_shapes.dedup();
+
+            if cache.dense_bf16_activated {
+                ensure!(
+                    provider == QwenDenseBf16Provider::TargetMtp
+                        || cache.dense_bf16_provider == Some(provider),
+                    "Qwen BF16 route plan is already bound to {:?}, cannot attach {:?}",
+                    cache.dense_bf16_provider,
+                    provider
+                );
+                let missing: Vec<_> = requested_shapes
+                    .iter()
+                    .copied()
+                    .filter(|shape| cache.dense_bf16_shapes.binary_search(shape).is_err())
+                    .collect();
+                ensure!(
+                    missing.is_empty(),
+                    "Qwen BF16 route plan was frozen before active drafter shapes {:?} were declared",
+                    missing
+                );
+                ensure!(
+                    cache.dense_expert_activated,
+                    "Qwen scalar expert activation did not complete with dense activation"
+                );
+                return Ok(());
+            }
+
+            // From this point either activation helper may freeze immutable
+            // registry state. Validation failures above leave the already
+            // activated cache untouched; failures below require discarding
+            // the entire model-bound cache.
+            mutation_started = true;
+            let activation = activate_native_bf16_dense(
+                &mut cache.registry,
+                &cache.device,
+                self.activation_epoch(),
+                &matrices,
+            )?;
+            if let Some(activation) = activation.as_ref() {
+                ensure!(
+                    activation.plan.activation_epoch() == self.activation_epoch(),
+                    "Qwen BF16 plan activation epoch mismatch"
+                );
+                debug_assert_eq!(
+                    activation.receipt.plan_id,
+                    activation.plan.plan_id()
+                );
+            }
+            cache.dense_bf16_shapes = requested_shapes;
+            cache.dense_bf16_provider = Some(provider);
+            cache.dense_bf16_receipt = activation.map(|activation| activation.receipt);
+            cache.dense_bf16_activated = true;
+
+            let scalar_experts = qwen_native_scalar_expert_matrices(
+                &cache.layer_weights,
+                self.mtp.as_ref(),
+                &self.cfg,
+                self.activation_epoch(),
+            )?;
+            let expert_activation = activate_native_scalar_experts(
+                &mut cache.registry,
+                None,
+                &cache.device,
+                self.activation_epoch(),
+                &scalar_experts,
+            )?;
+            if let Some(activation) = expert_activation.as_ref() {
+                ensure!(
+                    activation.plan.activation_epoch() == self.activation_epoch(),
+                    "Qwen scalar expert plan activation epoch mismatch"
+                );
+            }
+            cache.dense_expert_receipt =
+                expert_activation.map(|activation| activation.receipt);
+            cache.dense_expert_activated = true;
+            self.native_routes_activated
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        if activation_result.is_err() && mutation_started {
+            // Either immutable plan may already have mutated the registry.
+            // Tear down the whole activation so a retry cannot observe a
+            // half-activated dense/scalar union or retain its residency and
+            // scratch owners after returning the error.
+            GPU_CACHE.with(|cell| {
+                let mut cache = cell.borrow_mut();
+                if cache
+                    .as_ref()
+                    .is_some_and(|cache| gpu_cache_matches_model(cache, self))
+                {
+                    clear_stale_gpu_activation(&mut *cache);
+                }
+            });
+        }
+        activation_result
     }
 
     /// Run a closure with mutable access to the verifier's cached GPU
@@ -3731,16 +6132,36 @@ impl Qwen35Model {
         &self,
         f: impl FnOnce(&MlxDevice, &mut KernelRegistry) -> Result<R>,
     ) -> Result<R> {
+        self.activate_gpu_dense_routes(QwenDenseBf16Provider::TargetMtp, &[])?;
+        self.with_unactivated_gpu_cache_mut(f)
+    }
+
+    /// Upload-only access used while assembling a speculative engine. The
+    /// caller must activate the target+drafter union before any projection.
+    pub(crate) fn with_unactivated_gpu_cache_mut<R>(
+        &self,
+        f: impl FnOnce(&MlxDevice, &mut KernelRegistry) -> Result<R>,
+    ) -> Result<R> {
         GPU_CACHE.with(|cell| -> Result<R> {
             let mut guard = cell.borrow_mut();
             let cache = guard
                 .as_mut()
-                .ok_or_else(|| anyhow!("with_gpu_cache_mut: GPU_CACHE not initialized; call ensure_gpu_cache_primed first"))?;
+                .ok_or_else(|| anyhow!("with_unactivated_gpu_cache_mut: GPU_CACHE not initialized; call ensure_gpu_cache_primed first"))?;
             ensure!(
                 gpu_cache_matches_model(cache, self),
-                "with_gpu_cache_mut: GPU_CACHE belongs to a different Qwen35Model"
+                "with_unactivated_gpu_cache_mut: GPU_CACHE belongs to a different Qwen35Model"
             );
             f(&cache.device, &mut cache.registry)
+        })
+    }
+
+    /// Detach a logical tensor view from any larger transient parent
+    /// allocation while keeping it on the verifier's residency-enabled
+    /// device. Stable prompt anchors use this for the one-row MTP boundary.
+    pub(crate) fn copy_logical_buffer_owned(&self, src: &MlxBuffer) -> Result<MlxBuffer> {
+        self.ensure_gpu_cache_primed()?;
+        self.with_gpu_cache_mut(|device, _registry| {
+            super::kv_cache::deep_copy_logical_buffer(device, src)
         })
     }
 
@@ -3766,7 +6187,12 @@ impl Qwen35Model {
     pub(super) fn loaded_candidate_trace_slots(
         &self,
     ) -> Result<
-        Option<std::collections::BTreeMap<usize, super::execution_dispatch::Qwen35TraceWeightSlot>>,
+        Option<
+            std::collections::BTreeMap<
+                super::execution_dispatch::Qwen35TraceWeightKey,
+                super::execution_dispatch::Qwen35TraceWeightSlot,
+            >,
+        >,
     > {
         GPU_CACHE.with(|cell| -> Result<_> {
             let guard = cell.borrow();
@@ -3824,14 +6250,14 @@ impl Qwen35Model {
         tokens: &[u32],
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
-        mut capture: Option<&mut LayerActivations>,
-        mut hidden_out: Option<&mut Option<MlxBuffer>>,
+        capture: Option<&mut LayerActivations>,
+        hidden_out: Option<&mut Option<MlxBuffer>>,
         output_head_mode: OutputHeadMode,
         soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
         deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
         topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>,
-        mut nextn_hidden_out: Option<&mut Option<MlxBuffer>>,
-        mut logits_buffer_out: Option<&mut Option<MlxBuffer>>,
+        nextn_hidden_out: Option<&mut Option<MlxBuffer>>,
+        logits_buffer_out: Option<&mut Option<MlxBuffer>>,
         // ADR-040 Phase B4a (2026-05-23): multi-seq KV slot identity.
         // `SlotId(0)` reads/writes `current_len[0]` and is byte-identical
         // to the pre-ADR-040 single-seq path; `SlotId(N>0)` rebases the
@@ -3845,9 +6271,54 @@ impl Qwen35Model {
         // SlotOutOfRange diagnostic.
         slot_id: SlotId,
     ) -> Result<Vec<f32>> {
+        self.forward_gpu_impl_window(
+            tokens,
+            positions_flat,
+            kv_cache,
+            capture,
+            hidden_out,
+            output_head_mode,
+            soft_tokens,
+            deepstack,
+            topk_out,
+            nextn_hidden_out,
+            logits_buffer_out,
+            slot_id,
+            ForwardGpuLayerWindow::full(self.layers.len()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gpu_impl_window(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        mut capture: Option<&mut LayerActivations>,
+        mut hidden_out: Option<&mut Option<MlxBuffer>>,
+        output_head_mode: OutputHeadMode,
+        soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+        deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
+        topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>,
+        mut nextn_hidden_out: Option<&mut Option<MlxBuffer>>,
+        mut logits_buffer_out: Option<&mut Option<MlxBuffer>>,
+        slot_id: SlotId,
+        window: ForwardGpuLayerWindow,
+    ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
         }
+        anyhow::ensure!(
+            window.start_layer < window.end_layer && window.end_layer <= self.layers.len(),
+            "forward_gpu: invalid layer window {}..{} for {} layers",
+            window.start_layer,
+            window.end_layer,
+            self.layers.len()
+        );
+        anyhow::ensure!(
+            window.emit_output_head || hidden_out.is_some(),
+            "forward_gpu: a non-terminal layer window must return its hidden state"
+        );
         anyhow::ensure!(
             logits_buffer_out.is_none()
                 || (matches!(output_head_mode, OutputHeadMode::All)
@@ -3913,6 +6384,9 @@ impl Qwen35Model {
         // call's reset moves them all to the free list as expected.
         super::decode_pool::reset_decode_pool();
         let seq_len = tokens.len() as u32;
+        let legacy_per_layer_cb = std::env::var_os("HF2Q_LEGACY_PER_LAYER_CB")
+            .map(|value| value == "1")
+            .unwrap_or(false);
         // ---- ADR-019 Phase 2 iter91 Worker B (H2 production CB-count probe) ----
         //
         // When `HF2Q_DUMP_CB_COUNT=1` is set, capture the process-global
@@ -4051,29 +6525,49 @@ impl Qwen35Model {
         // slice → byte-identical to the standard `embed_tokens_gpu`
         // path (text-only requests pay zero overhead — the empty-slice
         // branch is a single `is_empty()` check).
-        let mut hidden = if soft_tokens.is_empty() {
-            embed_tokens_gpu(
-                tokens,
-                &self.token_embd,
-                self.token_embd_native.as_ref(),
-                cfg.vocab_size,
-                h,
-                &device,
-                &mut registry,
-            )
-            .context("embed_tokens_gpu")?
+        let mut hidden = if let Some(hidden) = window.hidden_in {
+            anyhow::ensure!(
+                window.start_layer > 0,
+                "forward_gpu: layer-zero window cannot replace token embedding"
+            );
+            anyhow::ensure!(
+                hidden.dtype() == DType::F32
+                    && hidden.element_count() == seq_len as usize * h as usize,
+                "forward_gpu: layer-window hidden must be F32 [{} x {}]",
+                seq_len,
+                h
+            );
+            hidden
         } else {
-            embed_tokens_gpu_with_soft_tokens(
-                tokens,
-                &self.token_embd,
-                self.token_embd_native.as_ref(),
-                cfg.vocab_size,
-                h,
-                soft_tokens,
-                &device,
-                &mut registry,
-            )
-            .context("embed_tokens_gpu_with_soft_tokens")?
+            anyhow::ensure!(
+                window.start_layer == 0,
+                "forward_gpu: layer window starting at {} requires hidden input",
+                window.start_layer
+            );
+            if soft_tokens.is_empty() {
+                embed_tokens_gpu(
+                    tokens,
+                    &self.token_embd,
+                    self.token_embd_native.as_ref(),
+                    cfg.vocab_size,
+                    h,
+                    &device,
+                    &mut registry,
+                )
+                .context("embed_tokens_gpu")?
+            } else {
+                embed_tokens_gpu_with_soft_tokens(
+                    tokens,
+                    &self.token_embd,
+                    self.token_embd_native.as_ref(),
+                    cfg.vocab_size,
+                    h,
+                    soft_tokens,
+                    &device,
+                    &mut registry,
+                )
+                .context("embed_tokens_gpu_with_soft_tokens")?
+            }
         };
 
         if dump_layer_n().is_some() {
@@ -4318,11 +6812,9 @@ impl Qwen35Model {
             && seq_len <= 8
             && matches!(output_head_mode, OutputHeadMode::All)
             && nextn_hidden_out.is_some();
-        let configured_ffn_terminal_k_batch = std::env::var("HF2Q_FFN_TERMINAL_K_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&k| k >= 1)
-            .unwrap_or(8);
+        let configured_ffn_terminal_k_batch = window
+            .terminal_k_batch_override
+            .unwrap_or_else(configured_ffn_terminal_k_batch);
         let ffn_terminal_k_batch = if small_nextn_verifier {
             // Exact speculative verification is a fixed, short graph whose
             // scratch buffers are retained until the output-head drain. One
@@ -4332,6 +6824,20 @@ impl Qwen35Model {
         } else {
             effective_ffn_terminal_k_batch(seq_len, configured_ffn_terminal_k_batch)
         };
+        let window_ends_at_k_boundary = seq_len == 1
+            || ffn_terminal_k_batch <= 1
+            || window.end_layer % ffn_terminal_k_batch == 0
+            || window.end_layer == layer_weights_gpu.len();
+        anyhow::ensure!(
+            window.emit_output_head == (window.end_layer == layer_weights_gpu.len()),
+            "forward_gpu: output head must be emitted exactly by the terminal layer window"
+        );
+        anyhow::ensure!(
+            window.emit_output_head || window_ends_at_k_boundary,
+            "forward_gpu: non-terminal window ending at layer {} cuts terminal-K batch {}",
+            window.end_layer,
+            ffn_terminal_k_batch
+        );
 
         let mut dense_ffn_output_ring: Option<super::DenseFfnOutputRingBuffer> =
             if seq_len > 1 && cfg.intermediate_size.is_some() {
@@ -4595,7 +7101,9 @@ impl Qwen35Model {
         // fences" direction. Better to leave a small per-prefill perf nick
         // on the env=1 path than entangle iter90's scope. See
         // `/opt/hf2q/.cfa-archive/iter90/operator_decisions.md` OQ2.
-        let phase1_fusion_env_eligible = seq_len > 1
+        let phase1_fusion_env_eligible = window.emit_output_head
+            && window.end_layer == n_layers
+            && seq_len > 1
             && !LayerEncoder::env_enabled()
             && matches!(output_head_mode, OutputHeadMode::Last)
             && capture.is_none()
@@ -4710,8 +7218,20 @@ impl Qwen35Model {
             }
         }
 
+        // Declared after every arena and K-window ARC hold so its failure
+        // drain runs before those owners are released on an early return.
+        // This closes the unretained-reference race where a submitted
+        // intra-K command buffer could outlive the buffers it references.
+        let mut failure_drain = GpuFailureDrainGuard::new(device);
         let mut session_carry_pending = false;
-        for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
+        for (layer_idx, layer_gpu) in layer_weights_gpu
+            .iter()
+            .enumerate()
+            .skip(window.start_layer)
+            .take(window.end_layer - window.start_layer)
+        {
+            #[cfg(test)]
+            let _segment_trace_layer = segmented_route_trace::enter_layer(layer_idx);
             // K-boundary: last layer in the window OR final layer overall.
             // At K=1 every layer is a boundary (= current behaviour).
             let is_k_boundary = seq_len == 1
@@ -4796,6 +7316,19 @@ impl Qwen35Model {
                         }
                     };
                     let max_seq = kv_cache.max_seq_len;
+                    #[cfg(test)]
+                    segmented_route_trace::validate_rows(
+                        segmented_route_trace::OperatorRoute::FullDispatch,
+                        seq_len,
+                    )?;
+                    #[cfg(test)]
+                    segmented_route_trace::record(
+                        segmented_route_trace::OperatorRoute::FullDispatch,
+                        seq_len,
+                        shape.n_head * shape.head_dim,
+                        shape.hidden_size,
+                        kv_cache.full_attn[full_attn_rank].current_len[slot_id.0 as usize],
+                    );
                     let slot = &mut kv_cache.full_attn[full_attn_rank];
                     build_gated_attn_layer(
                         &device,
@@ -4845,6 +7378,19 @@ impl Qwen35Model {
                 }
                 LayerWeightsGpu::LinearAttn { attn, .. } => {
                     let shape = DeltaNetLayerShape::from_config(cfg);
+                    #[cfg(test)]
+                    segmented_route_trace::validate_rows(
+                        segmented_route_trace::OperatorRoute::DeltaDispatch,
+                        seq_len,
+                    )?;
+                    #[cfg(test)]
+                    segmented_route_trace::record(
+                        segmented_route_trace::OperatorRoute::DeltaDispatch,
+                        seq_len,
+                        shape.n_v_heads * shape.d_v,
+                        shape.hidden_size,
+                        0,
+                    );
                     let km1 = (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
                     let qkv_channels = shape.qkv_channels() as usize;
                     let rec_size = (cfg.linear_key_head_dim
@@ -5134,7 +7680,9 @@ impl Qwen35Model {
             // after a 30/30 cross-path parity audit at PP4106; DenseQ now
             // unconditionally takes the fused path.
             //
-            // ADR-015 iter57: extend the fused-encoder pattern to MoeQ.
+            // ADR-015 iter57 extended the fused-encoder pattern to MoeQ;
+            // the 2026-08-22 qualification extends it to native Dense while
+            // keeping the source-precision teacher on its synchronous wrapper.
             // The existing `build_moe_ffn_layer_gpu_q_into` already takes
             // `&mut CommandEncoder` and does NOT commit (added in iter40
             // territory).  At prefill (seq_len > 1), MoeQ's out_buf is
@@ -5144,9 +7692,14 @@ impl Qwen35Model {
             // Saves 1 commit_and_wait per MoE layer × N MoE layers per
             // prefill chunk (e.g. 30 DN-MoE + 10 FA-MoE = 40 saved per
             // pp4096 chunk on apex 35B-A3B-MoE).
+            let native_dense_fused_eligible =
+                matches!(ffn_weights_gpu_peek, FfnWeightsGpu::Dense(_))
+                    && !legacy_per_layer_cb
+                    && !super::execution_dispatch::source_teacher_scope_active();
             let denseq_fused_eligible = matches!(ffn_weights_gpu_peek, FfnWeightsGpu::DenseQ(_));
             let moeq_fused_eligible = matches!(ffn_weights_gpu_peek, FfnWeightsGpu::MoeQ(_));
-            let any_fused_eligible = denseq_fused_eligible || moeq_fused_eligible;
+            let any_fused_eligible =
+                native_dense_fused_eligible || denseq_fused_eligible || moeq_fused_eligible;
 
             // ADR-019 Phase 2 iter90b H4b: lift `ffn_input_buf` and
             // `ffn_residual_buf` to a per-prefill arena (closes Codex
@@ -5230,7 +7783,8 @@ impl Qwen35Model {
                     enc.encoder().memory_barrier();
                     (ffn_residual_buf, ffn_input_buf, Some(enc))
                 } else {
-                    // Legacy 2-encoder path for Dense (F32) / Moe (F32-MoE).
+                    // Legacy 2-encoder path for F32-MoE and for native Dense
+                    // when the explicit control arm or source teacher is active.
                     // commit() without wait — Metal serial queue guarantees
                     // ordering; the FFN commit_and_wait() provides the
                     // eventual sync. Decode-path classification per spec
@@ -5284,9 +7838,65 @@ impl Qwen35Model {
                 LayerWeightsGpu::FullAttn { .. } => None,
             };
             let ffn_weights_gpu = ffn_weights_gpu_peek;
+            #[cfg(test)]
+            match ffn_weights_gpu {
+                FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => {
+                    let intermediate = cfg.intermediate_size.ok_or_else(|| {
+                        anyhow!("dense FFN missing intermediate_size (layer {layer_idx})")
+                    })?;
+                    segmented_route_trace::validate_rows(
+                        segmented_route_trace::OperatorRoute::DenseFfnGateUp,
+                        seq_len,
+                    )?;
+                    segmented_route_trace::record(
+                        segmented_route_trace::OperatorRoute::DenseFfnGateUp,
+                        seq_len,
+                        intermediate,
+                        h,
+                        0,
+                    );
+                    segmented_route_trace::record(
+                        segmented_route_trace::OperatorRoute::DenseFfnDown,
+                        seq_len,
+                        h,
+                        intermediate,
+                        0,
+                    );
+                }
+                FfnWeightsGpu::Moe(_) | FfnWeightsGpu::MoeQ(_) => {
+                    let moe = cfg
+                        .moe
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("MoE FFN missing config (layer {layer_idx})"))?;
+                    segmented_route_trace::validate_rows(
+                        segmented_route_trace::OperatorRoute::MoeRouter,
+                        seq_len,
+                    )?;
+                    segmented_route_trace::record(
+                        segmented_route_trace::OperatorRoute::MoeRouter,
+                        seq_len,
+                        moe.num_experts,
+                        h,
+                        0,
+                    );
+                    segmented_route_trace::record(
+                        segmented_route_trace::OperatorRoute::MoeExpertGateUp,
+                        seq_len * moe.num_experts_per_tok,
+                        moe.moe_intermediate_size,
+                        h,
+                        0,
+                    );
+                    segmented_route_trace::record(
+                        segmented_route_trace::OperatorRoute::MoeExpertDown,
+                        seq_len * moe.num_experts_per_tok,
+                        h,
+                        moe.moe_intermediate_size,
+                        0,
+                    );
+                }
+            }
             let ffn_out = match ffn_weights_gpu {
                 FfnWeightsGpu::Dense(w) => {
-                    debug_assert!(fused_enc.is_none(), "Dense path uses 2-encoder");
                     let m = cfg.intermediate_size.ok_or_else(|| {
                         anyhow!("dense FFN missing intermediate_size (layer {layer_idx})")
                     })?;
@@ -5294,18 +7904,55 @@ impl Qwen35Model {
                         hidden_size: h,
                         intermediate_size: m,
                     };
-                    // Fold the post-FFN residual add into the dense FFN command buffer,
-                    // saving 1 commit_and_wait per dense layer (30 layers × 1 = 30 fewer
-                    // GPU syncs per decode token).
-                    build_dense_ffn_layer_gpu(
-                        &device,
-                        &mut registry,
-                        &ffn_input,
-                        w,
-                        shape,
-                        Some(&ffn_residual),
-                    )
-                    .with_context(|| format!("dense_ffn layer {layer_idx}"))?
+                    if native_dense_fused_eligible {
+                        let mut enc = fused_enc.take().ok_or_else(|| {
+                            anyhow!(
+                                "native Dense fused encoder missing at layer {layer_idx} \
+                                 (native_dense_fused_eligible invariant violated)"
+                            )
+                        })?;
+                        let out = build_dense_ffn_layer_gpu_into(
+                            enc.encoder(),
+                            &device,
+                            &mut registry,
+                            &ffn_input,
+                            w,
+                            shape,
+                            Some(&ffn_residual),
+                        )
+                        .with_context(|| format!("native dense_ffn_into layer {layer_idx}"))?;
+                        if seq_len == 1 {
+                            enc.commit_unlabeled().with_context(|| {
+                                format!("commit fused native-Dense decode layer {layer_idx}")
+                            })?;
+                        } else if is_k_boundary {
+                            let commit = if (layer_idx + 1) == n_layers {
+                                enc.commit_and_wait_labeled_terminal("layer.native_dense_ffn")
+                            } else {
+                                enc.commit_and_wait_labeled("layer.native_dense_ffn")
+                            };
+                            commit.with_context(|| {
+                                format!("commit fused native-Dense layer {layer_idx}")
+                            })?;
+                        } else {
+                            enc.carry_into_next_stage("layer.native_dense_ffn")
+                                .with_context(|| {
+                                    format!("carry native-Dense intra-K layer {layer_idx}")
+                                })?;
+                        }
+                        out
+                    } else {
+                        debug_assert!(fused_enc.is_none(), "legacy Dense path uses 2 encoders");
+                        build_dense_ffn_layer_gpu(
+                            &device,
+                            &mut registry,
+                            &ffn_input,
+                            w,
+                            shape,
+                            Some(&ffn_residual),
+                        )
+                        .with_context(|| format!("dense_ffn layer {layer_idx}"))?
+                    }
                 }
                 FfnWeightsGpu::DenseQ(w) => {
                     // Quantized dense path (production 27B DWQ GGUFs): weights stay as
@@ -5941,6 +8588,14 @@ impl Qwen35Model {
             **out = Some(hidden.clone());
         }
 
+        if !window.emit_output_head {
+            debug_assert!(last_layer_held_enc.is_none());
+            failure_drain.disarm();
+            drop(attn_out_holds);
+            drop(hidden_holds);
+            return Ok(Vec::new());
+        }
+
         // ---- Step 3: final output head → logits ----
         let t_output_head = if decode_profile {
             Some(std::time::Instant::now())
@@ -5968,6 +8623,22 @@ impl Qwen35Model {
                 enc.commit_and_wait_labeled("layer.last.fusion_fallback")
                     .context("commit fallback for held last-layer encoder")?;
             }
+        }
+        #[cfg(test)]
+        let _segment_trace_output_layer = segmented_route_trace::enter_layer(n_layers - 1);
+        #[cfg(test)]
+        if matches!(output_head_mode, OutputHeadMode::Last) {
+            segmented_route_trace::validate_rows(
+                segmented_route_trace::OperatorRoute::OutputHead,
+                1,
+            )?;
+            segmented_route_trace::record(
+                segmented_route_trace::OperatorRoute::OutputHead,
+                1,
+                cfg.vocab_size,
+                h,
+                0,
+            );
         }
         let logits = match output_head_mode {
             OutputHeadMode::All => {
@@ -6101,6 +8772,9 @@ impl Qwen35Model {
                 t.elapsed().as_micros() as f64 / 1000.0
             );
         }
+        if matches!(output_head_mode, OutputHeadMode::All | OutputHeadMode::Last) {
+            crate::inference::argmax::validate_finite_logits(&logits, "Qwen full-logit readback")?;
+        }
         // ADR-019 Phase 2 iter92 — final drain of attn_out hold-vec.
         //
         // The output-head's terminal `commit_and_wait_labeled` (above)
@@ -6134,6 +8808,7 @@ impl Qwen35Model {
                 seq_len,
             );
         }
+        failure_drain.disarm();
         Ok(logits)
     }
 
@@ -6141,7 +8816,7 @@ impl Qwen35Model {
     ///
     /// Identical to `forward_gpu` for the layer loop, but replaces the final
     /// `apply_output_head_gpu` (which downloads `vocab_size * 4` ≈ 600 KB) with
-    /// `apply_output_head_gpu_greedy` (GPU argmax → downloads 4 bytes).
+    /// `apply_output_head_gpu_greedy` (GPU argmax → reads 8 bytes).
     ///
     /// Only valid for `tokens.len() == 1` (single-step decode, temperature=0).
     /// ADR-040 Phase B4d (2026-05-30) — greedy decode entry with
@@ -6158,24 +8833,143 @@ impl Qwen35Model {
     /// callsites receive `slot_id` verbatim; the kernel-dispatcher
     /// bounds check inherited from B4a-cont fires BEFORE any GPU
     /// allocation runs.
+    /// Side-effect-free admission gate for the first physical multi-slot
+    /// target path. Unsupported cohorts must remain on independent scalar
+    /// forwards; in particular this path never widens capture/speculative
+    /// state or non-native cache/FFN variants implicitly.
+    pub fn can_forward_gpu_greedy_multi_slot(
+        &self,
+        kv_cache: &HybridKvCache,
+        slot_ids: &[SlotId],
+    ) -> bool {
+        let ffn_storage_matches_family = self.layers.iter().all(|layer| {
+            matches!(
+                (self.cfg.moe.is_some(), layer.ffn()),
+                (true, Qwen35FfnWeights::MoeQ(_))
+                    | (false, Qwen35FfnWeights::DenseQ(_))
+                    | (false, Qwen35FfnWeights::DenseNative(_))
+                    | (false, Qwen35FfnWeights::Dense(_))
+            )
+        });
+        if !(2..=16).contains(&slot_ids.len())
+            || kv_cache.la_capture_active()
+            || !matches!(self.cfg.head_dim, 256 | 512)
+            || !ffn_storage_matches_family
+            || kv_cache.full_attn.is_empty()
+            || kv_cache.full_attn.iter().any(|slot| slot.tq.is_none())
+        {
+            return false;
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut slot_cursors = vec![None; slot_ids.len()];
+        let mut common_bucket = None;
+        for (row, slot_id) in slot_ids.iter().enumerate() {
+            let slot_idx = slot_id.0 as usize;
+            if slot_id.0 >= kv_cache.n_seqs || !seen.insert(slot_id.0) {
+                return false;
+            }
+            for full in &kv_cache.full_attn {
+                let Some(&cursor) = full.current_len.get(slot_idx) else {
+                    return false;
+                };
+                if cursor >= kv_cache.max_seq_len {
+                    return false;
+                }
+                match slot_cursors[row] {
+                    None => slot_cursors[row] = Some(cursor),
+                    Some(expected) if expected == cursor => {}
+                    Some(_) => return false,
+                }
+            }
+            let Some(kv_seq_len) = slot_cursors[row].and_then(|cursor| cursor.checked_add(1))
+            else {
+                return false;
+            };
+            let bucket = super::gpu_full_attn::tq_decode_execution_bucket(kv_seq_len);
+            match common_bucket {
+                None => common_bucket = Some(bucket),
+                Some(expected) if expected == bucket => {}
+                Some(_) => return false,
+            }
+        }
+        true
+    }
+
     pub fn forward_gpu_greedy(
         &self,
         tokens: &[u32],
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
         // ADR-040 Phase B4d (2026-05-30) — see B4b §6.1.20 for the
-        // `slot_id` contract on the decode-entry surface; the
-        // greedy-fast-path siblings (FA at :5293 + :5612 + DN at
-        // :5380 + :5716) now receive `slot_id` verbatim.
+        // `slot_id` contract on the decode-entry surface. The scalar entry
+        // delegates to the row-mapped physical-batch body with this exact slot.
         slot_id: SlotId,
     ) -> Result<u32> {
-        debug_assert_eq!(
-            tokens.len(),
-            1,
-            "forward_gpu_greedy: tokens must be length 1"
+        let mut output = self.forward_gpu_greedy_multi_slot(
+            tokens,
+            positions_flat,
+            kv_cache,
+            std::slice::from_ref(&slot_id),
+        )?;
+        anyhow::ensure!(
+            output.len() == 1,
+            "Qwen scalar greedy forward returned {} tokens",
+            output.len()
         );
+        Ok(output.remove(0))
+    }
+
+    /// One ordinary greedy target invocation over independent physical slots.
+    ///
+    /// Width one is exactly the established scalar path. Widths two through
+    /// sixteen use one `[N, hidden]` body and one `[N, vocab]` output projection.
+    /// Full-attention and DeltaNet state are selected by the explicit
+    /// `slot_ids` row map; unsupported cache/FFN/cursor shapes return before
+    /// any GPU allocation or cache mutation so the server can fall back to
+    /// scalar decode.
+    pub fn forward_gpu_greedy_multi_slot(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        slot_ids: &[SlotId],
+    ) -> Result<Vec<u32>> {
         if tokens.is_empty() {
-            return Err(anyhow!("forward_gpu_greedy: tokens must be non-empty"));
+            return Err(anyhow!(
+                "forward_gpu_greedy_multi_slot: tokens must be non-empty"
+            ));
+        }
+        anyhow::ensure!(
+            tokens.len() == slot_ids.len(),
+            "forward_gpu_greedy_multi_slot: tokens {} != slot_ids {}",
+            tokens.len(),
+            slot_ids.len()
+        );
+        anyhow::ensure!(
+            tokens.len() <= 16,
+            "forward_gpu_greedy_multi_slot: width {} exceeds proven maximum 16",
+            tokens.len()
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for slot_id in slot_ids {
+            anyhow::ensure!(
+                slot_id.0 < kv_cache.n_seqs,
+                "forward_gpu_greedy_multi_slot: slot {} outside n_seqs {}",
+                slot_id.0,
+                kv_cache.n_seqs
+            );
+            anyhow::ensure!(
+                seen.insert(slot_id.0),
+                "forward_gpu_greedy_multi_slot: duplicate slot {}",
+                slot_id.0
+            );
+        }
+        if tokens.len() > 1 {
+            anyhow::ensure!(
+                self.can_forward_gpu_greedy_multi_slot(kv_cache, slot_ids),
+                "forward_gpu_greedy_multi_slot: physical batch preconditions not met"
+            );
         }
         // Reset the thread-local arena pool at the top of every decode token.
         // Layer dispatch helpers (build_delta_net_layer, build_moe_ffn_layer_gpu_q,
@@ -6189,7 +8983,7 @@ impl Qwen35Model {
         let expected_pos_len = 4 * seq_len as usize;
         if positions_flat.len() != expected_pos_len {
             return Err(anyhow!(
-                "forward_gpu_greedy: positions_flat.len() = {} != 4 * seq_len = {}",
+                "forward_gpu_greedy_multi_slot: positions_flat.len() = {} != 4 * seq_len = {}",
                 positions_flat.len(),
                 expected_pos_len
             ));
@@ -6198,100 +8992,46 @@ impl Qwen35Model {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
-        let self_ptr = self as *const _ as *const ();
-        #[cfg(test)]
-        let loaded_candidate_identity =
-            self.loaded_candidate_cache_identity()
-                .map(|(receipt, graph, routing)| {
-                    (receipt.to_owned(), graph.to_owned(), routing.to_owned())
-                });
+        self.ensure_gpu_cache_primed()?;
 
-        // Populate GPU cache (same as forward_gpu).
-        GPU_CACHE.with(|cell| -> Result<()> {
-            let mut cache = cell.borrow_mut();
-            if cache
-                .as_ref()
-                .map_or(true, |cache| !gpu_cache_matches_model(cache, self))
-            {
-                let device = MlxDevice::new().context("forward_gpu_greedy: MlxDevice::new")?;
-                let mut registry = KernelRegistry::new();
-                // Wave 5b.10: register flash_attn_prefill kernel family for
-                // the Qwen3.5 FA prefill path (replaces legacy `sdpa`).
-                mlx_native::ops::flash_attn_prefill::register(&mut registry);
-                // Register flash_attn_vec for decode-path SDPA; see the sister
-                // registration above. This closes the long-context decode gap.
-                mlx_native::ops::flash_attn_vec::register(&mut registry);
-                // Wedge-4c.5: register the LM-side image-token residual
-                // add shader (idempotent; gated by deepstack=Some).
-                crate::inference::vision::image_token_residual_add
-                    ::register_image_token_residual_add_shader(&mut registry);
-                let layer_weights = self.upload_layer_weights_gpu(&device)?;
-                // W-5b.7 iter 2: residency-aware uploads for lm_head and norm.
-                let (lm_head, lm_head_ggml_type) = self.materialize_output_head_weight(&device)?;
-                let output_head = OutputHeadGpu {
-                    norm_w: upload_f32_weight(&self.output_norm, &device)
-                        .context("upload output_norm")?,
-                    lm_head,
-                    lm_head_ggml_type,
-                };
-                #[cfg(test)]
-                let executed_catalog =
-                    self.observe_loaded_candidate_cache(&layer_weights, &output_head)?;
-                #[cfg(test)]
-                let trace_weight_slots =
-                    self.loaded_candidate_trace_weight_slots(&layer_weights, &output_head)?;
-                *cache = Some(ForwardGpuCache {
-                    model_ptr: self_ptr,
-                    #[cfg(test)]
-                    loaded_candidate_identity,
-                    #[cfg(test)]
-                    executed_catalog,
-                    #[cfg(test)]
-                    trace_weight_slots,
-                    device,
-                    registry,
-                    layer_weights,
-                    output_head,
-                    decode_bufs: None, // initialized lazily on first call
-                });
-            }
-            Ok(())
-        })?;
-
-        // ---- Lazy-init decode buffer pool (first greedy call only) ----
-        // Pre-allocates fixed-shape buffers reused every decode token:
+        // ---- Lazy-init decode buffer pool (first call at this width) ----
+        // Pre-allocates fixed-shape buffers reused while physical width is stable:
         //   embed_buf, ffn_input_buf, ffn_residual_buf, norm_out_buf,
         //   argmax_index, argmax_value, argmax_params, norm_params.
         // Eliminates ~80 Metal newBuffer calls per token (~1ms CPU overhead).
         GPU_CACHE.with(|cell| -> Result<()> {
             let mut cache = cell.borrow_mut();
             let c = cache.as_mut().unwrap();
-            if c.decode_bufs.is_none() {
+            let width = tokens.len();
+            if c.decode_bufs.as_ref().map(|bufs| bufs.width) != Some(width) {
                 let h = cfg.hidden_size as usize;
                 let vocab_size = cfg.vocab_size as u32;
                 let n_layers = self.layers.len();
+                let rows_h = width
+                    .checked_mul(h)
+                    .ok_or_else(|| anyhow!("decode buffer width overflow"))?;
                 let alloc4 =
                     |dev: &MlxDevice, elem: usize, shape: Vec<usize>| -> Result<MlxBuffer> {
                         dev.alloc_buffer(elem * 4, DType::F32, shape)
                             .map_err(|e| anyhow!("alloc decode buf: {e}"))
                     };
                 // Embedding scratch: CPU gather writes here each decode token.
-                let embed_buf = alloc4(&c.device, h, vec![1, h])?;
+                let embed_buf = alloc4(&c.device, rows_h, vec![width, h])?;
                 // Per-layer scratch: one (ffn_input, ffn_residual) pair per layer.
                 let mut layer_scratch = Vec::with_capacity(n_layers);
                 for _ in 0..n_layers {
-                    let fi = alloc4(&c.device, h, vec![1, h])?;
-                    let fr = alloc4(&c.device, h, vec![1, h])?;
+                    let fi = alloc4(&c.device, rows_h, vec![width, h])?;
+                    let fr = alloc4(&c.device, rows_h, vec![width, h])?;
                     layer_scratch.push((fi, fr));
                 }
-                let norm_out_buf = alloc4(&c.device, h, vec![1, h])?;
+                let norm_out_buf = alloc4(&c.device, rows_h, vec![width, h])?;
                 let argmax_index_buf = c
                     .device
-                    .alloc_buffer(4, DType::U32, vec![1])
+                    .alloc_buffer(width * 4, DType::U32, vec![width])
                     .map_err(|e| anyhow!("alloc argmax_index: {e}"))?;
                 let argmax_value_buf = c
                     .device
-                    .alloc_buffer(4, DType::F32, vec![1])
+                    .alloc_buffer(width * 4, DType::F32, vec![width])
                     .map_err(|e| anyhow!("alloc argmax_value: {e}"))?;
                 let mut argmax_params_buf = c
                     .device
@@ -6312,9 +9052,13 @@ impl Qwen35Model {
                     s[1] = cfg.hidden_size as f32;
                 }
                 // Logits scratch: pre-allocate once to avoid ~600KB newBuffer per decode token.
-                let logits_buf =
-                    alloc4(&c.device, vocab_size as usize, vec![1, vocab_size as usize])?;
+                let logits_buf = alloc4(
+                    &c.device,
+                    width * vocab_size as usize,
+                    vec![width, vocab_size as usize],
+                )?;
                 c.decode_bufs = Some(DecodeBuffers {
+                    width,
                     embed_buf,
                     layer_scratch,
                     norm_out_buf,
@@ -6437,10 +9181,9 @@ impl Qwen35Model {
         // the output head (norm + lm_head + argmax with intra-CB
         // barriers, single terminal commit_and_wait_labeled).
         //
-        // Legacy non-fused arms (Dense F32, F32-MoE) keep their original
-        // 2-encoder structure regardless of this env gate — they are not
-        // on the dwq46 production hot path and Stage 1 does not refactor
-        // them.
+        // F32-MoE remains non-composable. Native Dense uses the same explicit
+        // gate as the quantized arms so OFF/ON proof exercises the real layer
+        // boundary rather than a separate test-only route.
         let legacy_per_layer_cb = std::env::var_os("HF2Q_LEGACY_PER_LAYER_CB")
             .map(|v| v == "1")
             .unwrap_or(false);
@@ -6482,9 +9225,12 @@ impl Qwen35Model {
         //   | arch  | quant     | best cn | iter26 Δpp |
         //   |-------|-----------|--------:|-----------:|
         //   | dense | Q4_K_*    |       4 |     +3.91  | 27B-DWQ46
+        //   | dense | Q5_K_*    |       2 | +104.7@N8 | Qwen3.8 exact width matrix
+        //   | dense | Q6_K/Q8_0 |       1 | non-universal | Qwen3.8 exact width matrices
         //   | MoE   | Q4_K_*    |       2 |     +1.27  | 35B-DWQ46
-        //   | MoE   | Q5_K_*/Q6_K |     1 |     -3.47  | 35B-apex (cn≥2 regressed)
-        //   | (any other path)  |       1 |       n/a  | safe fallback
+        //   | MoE   | Q5_K_*    |       2 |     +1.47  | 35B-apex
+        //   | MoE   | Q6_K_*    |       1 | flat-negative | 35B-apex
+        //   | admitted codecs   | explicit|       n/a  | compile/test canary below
         //
         // Gemma is on a different forward path (qwen35::forward_gpu_greedy
         // is not invoked); its `Defect B` -16.25pp gap is iter31+ territory.
@@ -6505,9 +9251,26 @@ impl Qwen35Model {
                 .filter(|&n| n >= 1)
             {
                 Some(n) => n,
-                None => default_chain_n(cfg, layer_weights_gpu),
+                None => default_chain_n(cfg, layer_weights_gpu, &self.layers),
             }
         };
+        let native_dense_layers_present = layer_weights_gpu.iter().any(|layer| {
+            matches!(
+                layer,
+                LayerWeightsGpu::FullAttn {
+                    ffn: FfnWeightsGpu::Dense(_),
+                    ..
+                } | LayerWeightsGpu::LinearAttn {
+                    ffn: FfnWeightsGpu::Dense(_),
+                    ..
+                }
+            )
+        });
+        anyhow::ensure!(
+            legacy_per_layer_cb || chain_n == 1 || !native_dense_layers_present,
+            "HF2Q_PARTIAL_CHAIN_N>1 is not admitted for native Dense weights; \
+             use the explicit artifact-native scalar policy"
+        );
         let partial_chain_enabled = chain_n > 1 && !legacy_per_layer_cb;
 
         // Persistent partial-chain encoder.  None when partial_chain_enabled
@@ -6567,17 +9330,15 @@ impl Qwen35Model {
             // The new path opens ONE encoder spanning {attn → fused_res_norm →
             // MoE/Dense FFN} for a single layer.  Eligibility:
             //   - !legacy_per_layer_cb (env gate off)
-            //   - FFN arm is MoeQ or DenseQ (the pre-existing fused-CB arms;
-            //     legacy F32-Dense / F32-MoE arms keep their original 2-encoder
-            //     structure since they are not on the dwq46 production path
-            //     and Stage 1 is decode-only).
+            //   - FFN arm is MoeQ, DenseQ, or native Dense. F32-MoE keeps its
+            //     original multi-encoder structure.
             //   - For FullAttn layers: head_dim % 32 == 0 (SIMD path required
             //     by `apply_sdpa_with_kv_cache_decode_into` / `dispatch_sdpa_decode`).
             //     Production qwen3.6 uses head_dim=256 so this is always
             //     satisfied; the gate is a safety net.
             let single_cb_eligible_ffn = matches!(
                 ffn_weights_gpu,
-                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::DenseQ(_)
+                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::DenseQ(_) | FfnWeightsGpu::Dense(_)
             );
             let single_cb_eligible_attn = match layer_gpu {
                 LayerWeightsGpu::FullAttn { .. } => {
@@ -6661,129 +9422,157 @@ impl Qwen35Model {
                         };
                         let max_seq = kv_cache.max_seq_len;
                         let slot = &mut kv_cache.full_attn[full_attn_rank];
-                        apply_gated_attn_layer_decode_into(
-                            enc,
-                            &device,
-                            &mut registry,
-                            &hidden,
-                            &pos_buf,
-                            attn,
-                            slot,
-                            max_seq,
-                            seq_len,
-                            shape.hidden_size,
-                            shape.n_head,
-                            shape.n_kv,
-                            shape.head_dim,
-                            shape.rotary_dim,
-                            shape.rope_theta,
-                            shape.mrope_section,
-                            shape.rms_norm_eps,
-                            // ADR-040 Phase B4d (2026-05-30, this iter)
-                            // — greedy decode-entry FA dispatch now
-                            // routes through `slot_id` (was hard-coded
-                            // SlotId(0) per B4a-cont/B4b deferral).
-                            // `SlotId(0)` is byte-identical to pre-B4d
-                            // (pinned by H168); `SlotId(N>0)` rebases
-                            // the per-layer K/V slot via the
-                            // B4a-cont's `slice_view` discipline at
-                            // `gpu_full_attn.rs::slot_k_v_region_for_full_attn`.
-                            slot_id,
-                        )
-                        .with_context(|| format!("full_attn single-cb layer {layer_idx}"))?
+                        if seq_len == 1 {
+                            apply_gated_attn_layer_decode_into(
+                                enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                &pos_buf,
+                                attn,
+                                slot,
+                                max_seq,
+                                seq_len,
+                                shape.hidden_size,
+                                shape.n_head,
+                                shape.n_kv,
+                                shape.head_dim,
+                                shape.rotary_dim,
+                                shape.rope_theta,
+                                shape.mrope_section,
+                                shape.rms_norm_eps,
+                                slot_ids[0],
+                            )
+                            .with_context(|| format!("full_attn single-cb layer {layer_idx}"))?
+                        } else {
+                            apply_gated_attn_layer_decode_batched_into(
+                                enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                &pos_buf,
+                                attn,
+                                slot,
+                                max_seq,
+                                slot_ids,
+                                shape.hidden_size,
+                                shape.n_head,
+                                shape.n_kv,
+                                shape.head_dim,
+                                shape.rotary_dim,
+                                shape.rope_theta,
+                                shape.mrope_section,
+                                shape.rms_norm_eps,
+                            )
+                            .with_context(|| {
+                                format!("full_attn physical batch layer {layer_idx}")
+                            })?
+                        }
                     }
                     LayerWeightsGpu::LinearAttn { attn, .. } => {
                         let shape = DeltaNetLayerShape::from_config(cfg);
-                        let km1 = (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
-                        let qkv_channels = shape.qkv_channels() as usize;
-                        let rec_size = (cfg.linear_key_head_dim
-                            * cfg.linear_value_head_dim
-                            * cfg.linear_num_value_heads)
-                            as usize;
-
-                        let linear_slot_idx = match kv_cache.slot_index_for_layer(layer_idx as u32)
-                        {
-                            Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
-                            _ => usize::MAX,
-                        };
-
-                        let zero_conv_in: MlxBuffer;
-                        let zero_conv_out: MlxBuffer;
-                        let zero_rec_buf_in: MlxBuffer;
-                        let zero_rec_buf_out: MlxBuffer;
-                        let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref): (
-                            &MlxBuffer,
-                            &MlxBuffer,
-                            &MlxBuffer,
-                            &MlxBuffer,
-                        ) = if linear_slot_idx != usize::MAX {
-                            let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            // ADR-040 M-QWEN: parity-aware per-slot
-                            // (current, scratch) selection — the named
-                            // fields are NOT necessarily "current" for
-                            // this slot.
-                            let (conv_cur, conv_scr) = slot.conv_bufs_for_slot(slot_id);
-                            let (rec_cur, rec_scr) = slot.recurrent_bufs_for_slot(slot_id);
-                            (conv_cur, conv_scr, rec_cur, rec_scr)
-                        } else {
-                            let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
-                            let zero_rec_cpu = vec![0.0f32; rec_size];
-                            zero_conv_in = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_in")?;
-                            zero_conv_out = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_out")?;
-                            zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_in")?;
-                            zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_out")?;
-                            (
-                                &zero_conv_in,
-                                &zero_conv_out,
-                                &zero_rec_buf_in,
-                                &zero_rec_buf_out,
+                        if seq_len == 1 {
+                            let slot_id = slot_ids[0];
+                            let km1 =
+                                (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
+                            let qkv_channels = shape.qkv_channels() as usize;
+                            let rec_size = (cfg.linear_key_head_dim
+                                * cfg.linear_value_head_dim
+                                * cfg.linear_num_value_heads)
+                                as usize;
+                            let linear_slot_idx =
+                                match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                                    Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                                    _ => usize::MAX,
+                                };
+                            let zero_conv_in: MlxBuffer;
+                            let zero_conv_out: MlxBuffer;
+                            let zero_rec_buf_in: MlxBuffer;
+                            let zero_rec_buf_out: MlxBuffer;
+                            let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref) =
+                                if linear_slot_idx != usize::MAX {
+                                    let slot = &kv_cache.linear_attn[linear_slot_idx];
+                                    let (conv_cur, conv_scr) = slot.conv_bufs_for_slot(slot_id);
+                                    let (rec_cur, rec_scr) = slot.recurrent_bufs_for_slot(slot_id);
+                                    (conv_cur, conv_scr, rec_cur, rec_scr)
+                                } else {
+                                    let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
+                                    let zero_rec_cpu = vec![0.0f32; rec_size];
+                                    zero_conv_in = upload_f32(&zero_conv_cpu, &device)
+                                        .context("alloc zero conv state_in")?;
+                                    zero_conv_out = upload_f32(&zero_conv_cpu, &device)
+                                        .context("alloc zero conv state_out")?;
+                                    zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
+                                        .context("alloc zero recurrent state_in")?;
+                                    zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
+                                        .context("alloc zero recurrent state_out")?;
+                                    (
+                                        &zero_conv_in,
+                                        &zero_conv_out,
+                                        &zero_rec_buf_in,
+                                        &zero_rec_buf_out,
+                                    )
+                                };
+                            let out = build_delta_net_layer_decode_into(
+                                enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                attn,
+                                conv_in_ref,
+                                conv_out_ref,
+                                state_in_ref,
+                                state_out_ref,
+                                seq_len,
+                                shape.hidden_size,
+                                shape.n_k_heads,
+                                shape.n_v_heads,
+                                shape.d_k,
+                                shape.d_v,
+                                shape.conv_kernel,
+                                shape.rms_norm_eps,
+                                slot_id,
                             )
-                        };
-                        let out = build_delta_net_layer_decode_into(
-                            enc,
-                            &device,
-                            &mut registry,
-                            &hidden,
-                            attn,
-                            conv_in_ref,
-                            conv_out_ref,
-                            state_in_ref,
-                            state_out_ref,
-                            seq_len,
-                            shape.hidden_size,
-                            shape.n_k_heads,
-                            shape.n_v_heads,
-                            shape.d_k,
-                            shape.d_v,
-                            shape.conv_kernel,
-                            shape.rms_norm_eps,
-                            // ADR-040 Phase B4d (2026-05-30, this iter)
-                            // — greedy decode-entry DN dispatch now
-                            // routes through `slot_id` (was hard-coded
-                            // SlotId(0) per A2b-cont/B4d deferral).
-                            // `SlotId(0)` is byte-identical to pre-B4d
-                            // via A2b-cont's `narrow_la_ping_pong_to_slot`
-                            // helper (zero-copy `slice_view` at
-                            // offset 0 for slot 0); `SlotId(N>0)`
-                            // rebases the recurrent + conv_state
-                            // regions to slot N's per-slot byte offset.
-                            slot_id,
-                        )
-                        .with_context(|| format!("delta_net single-cb layer {layer_idx}"))?;
-
-                        if linear_slot_idx != usize::MAX {
+                            .with_context(|| format!("delta_net single-cb layer {layer_idx}"))?;
+                            if linear_slot_idx != usize::MAX {
+                                kv_cache.linear_attn[linear_slot_idx].swap_for_slot(slot_id);
+                            }
+                            out
+                        } else {
+                            let linear_slot_idx =
+                                match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                                    Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                                    _ => usize::MAX,
+                                };
+                            anyhow::ensure!(
+                                linear_slot_idx != usize::MAX,
+                                "physical Qwen decode requires a DeltaNet cache slot for layer {layer_idx}"
+                            );
                             let slot = &mut kv_cache.linear_attn[linear_slot_idx];
-                            // ADR-040 M-QWEN: per-slot parity flip (was a whole-buffer swap
-
-                            // that corrupted every OTHER active slot at N>=2 concurrent).
-
-                            slot.swap_for_slot(slot_id);
+                            let out = build_delta_net_layer_decode_batched_into(
+                                enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                attn,
+                                slot,
+                                slot_ids,
+                                shape.hidden_size,
+                                shape.n_k_heads,
+                                shape.n_v_heads,
+                                shape.d_k,
+                                shape.d_v,
+                                shape.conv_kernel,
+                                shape.rms_norm_eps,
+                            )
+                            .with_context(|| {
+                                format!("delta_net physical batch layer {layer_idx}")
+                            })?;
+                            for slot_id in slot_ids.iter().copied() {
+                                slot.swap_for_slot(slot_id);
+                            }
+                            out
                         }
-                        out
                     }
                 };
 
@@ -6884,8 +9673,51 @@ impl Qwen35Model {
                         .with_context(|| format!("dense_ffn_q_into single-cb layer {layer_idx}"))?;
                         out
                     }
+                    FfnWeightsGpu::Dense(w) => {
+                        let m = cfg.intermediate_size.ok_or_else(|| {
+                            anyhow!(
+                                "native dense FFN missing intermediate_size greedy (layer {layer_idx})"
+                            )
+                        })?;
+                        let shape = DenseFfnShape {
+                            hidden_size: h,
+                            intermediate_size: m,
+                        };
+                        dispatch_fused_residual_norm_f32(
+                            enc,
+                            &mut registry,
+                            device.metal_device(),
+                            &hidden,
+                            &attn_out,
+                            post_norm_w,
+                            ffn_input_buf_ref,
+                            Some(ffn_residual_buf_ref),
+                            seq_len,
+                            h,
+                            eps,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "dispatch_fused_residual_norm_f32 single-cb native Dense layer {layer_idx}"
+                            )
+                        })?;
+                        enc.memory_barrier();
+                        let out = build_dense_ffn_layer_gpu_into(
+                            enc,
+                            &device,
+                            &mut registry,
+                            ffn_input_buf_ref,
+                            w,
+                            shape,
+                            Some(ffn_residual_buf_ref),
+                        )
+                        .with_context(|| {
+                            format!("native dense_ffn_into single-cb layer {layer_idx}")
+                        })?;
+                        out
+                    }
                     _ => unreachable!(
-                        "single-cb path eligibility check filtered to MoeQ/DenseQ only"
+                        "single-cb path eligibility check filtered unsupported FFN variants"
                     ),
                 };
 
@@ -6912,6 +9744,7 @@ impl Qwen35Model {
                 let ffn_family_label: &str = match ffn_weights_gpu {
                     FfnWeightsGpu::MoeQ(_) => "moe_ffn",
                     FfnWeightsGpu::DenseQ(_) => "dense_ffn",
+                    FfnWeightsGpu::Dense(_) => "native_dense_ffn",
                     _ => unreachable!("filtered above"),
                 };
                 if partial_chain_enabled {
@@ -6945,6 +9778,7 @@ impl Qwen35Model {
                     let label = match ffn_weights_gpu {
                         FfnWeightsGpu::MoeQ(_) => "layer.attn_moe_ffn",
                         FfnWeightsGpu::DenseQ(_) => "layer.attn_dense_ffn",
+                        FfnWeightsGpu::Dense(_) => "layer.attn_native_dense_ffn",
                         _ => unreachable!("filtered above"),
                     };
                     // Drop the &mut borrow before consuming owned_enc.
@@ -6961,8 +9795,7 @@ impl Qwen35Model {
                 // Verbatim pre-Stage-1 structure: each FullAttn / DeltaNet
                 // helper opens + commits its own encoder, then the FFN
                 // helper opens + commits its own encoder.  Activated by
-                // HF2Q_LEGACY_PER_LAYER_CB=1 OR by non-MoeQ/non-DenseQ FFN
-                // arms (Dense F32, F32-MoE — non-production paths).
+                // HF2Q_LEGACY_PER_LAYER_CB=1 OR by a non-composable FFN arm.
                 //
                 // ADR-015 iter17: if a partial-chain encoder is open from a
                 // previous eligible layer, commit it before opening any
@@ -6988,151 +9821,210 @@ impl Qwen35Model {
                         };
                         let max_seq = kv_cache.max_seq_len;
                         let slot = &mut kv_cache.full_attn[full_attn_rank];
-                        build_gated_attn_layer(
-                            &device,
-                            &mut registry,
-                            &hidden,
-                            &pos_buf,
-                            attn,
-                            Some(slot),
-                            max_seq,
-                            seq_len,
-                            shape.hidden_size,
-                            shape.n_head,
-                            shape.n_kv,
-                            shape.head_dim,
-                            shape.rotary_dim,
-                            shape.rope_theta,
-                            shape.mrope_section,
-                            shape.rms_norm_eps,
-                            None,
-                            None,
-                            // iter92: decode path doesn't need K-batch
-                            // hold-vec (per-token GPU sync; no in-flight CB
-                            // spans the function-return boundary).
-                            None,
-                            // iter91: forward_gpu_greedy is the decode path
-                            // (seq_len == 1) and never engages the multi-layer
-                            // borrowed-session chain.  Pass None to take the
-                            // Plain CommandEncoder shape — byte-identical to
-                            // pre-iter91 behavior.
-                            None,
-                            // ADR-040 Phase B4d (2026-05-30, this iter)
-                            // — greedy legacy-FA dispatch now routes
-                            // through `slot_id` (was hard-coded
-                            // SlotId(0) per B4a-cont/B4d deferral).
-                            // Same `slice_view` discipline as the
-                            // single-CB FA path at :5302.
-                            slot_id,
-                        )
-                        .with_context(|| format!("full_attn legacy greedy layer {layer_idx}"))?
+                        if seq_len == 1 {
+                            build_gated_attn_layer(
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                &pos_buf,
+                                attn,
+                                Some(slot),
+                                max_seq,
+                                seq_len,
+                                shape.hidden_size,
+                                shape.n_head,
+                                shape.n_kv,
+                                shape.head_dim,
+                                shape.rotary_dim,
+                                shape.rope_theta,
+                                shape.mrope_section,
+                                shape.rms_norm_eps,
+                                None,
+                                None,
+                                None,
+                                None,
+                                slot_ids[0],
+                            )
+                            .with_context(|| format!("full_attn legacy greedy layer {layer_idx}"))?
+                        } else {
+                            let mut enc = device.command_encoder().with_context(|| {
+                                format!("enc full_attn physical batch layer {layer_idx}")
+                            })?;
+                            let out = apply_gated_attn_layer_decode_batched_into(
+                                &mut enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                &pos_buf,
+                                attn,
+                                slot,
+                                max_seq,
+                                slot_ids,
+                                shape.hidden_size,
+                                shape.n_head,
+                                shape.n_kv,
+                                shape.head_dim,
+                                shape.rotary_dim,
+                                shape.rope_theta,
+                                shape.mrope_section,
+                                shape.rms_norm_eps,
+                            )
+                            .with_context(|| {
+                                format!("full_attn physical batch layer {layer_idx}")
+                            })?;
+                            enc.commit_labeled("layer.full_attn.physical_batch");
+                            out
+                        }
                     }
                     LayerWeightsGpu::LinearAttn { attn, .. } => {
                         let shape = DeltaNetLayerShape::from_config(cfg);
-                        let km1 = (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
-                        let qkv_channels = shape.qkv_channels() as usize;
-                        let rec_size = (cfg.linear_key_head_dim
-                            * cfg.linear_value_head_dim
-                            * cfg.linear_num_value_heads)
-                            as usize;
-
-                        let linear_slot_idx = match kv_cache.slot_index_for_layer(layer_idx as u32)
-                        {
-                            Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
-                            _ => usize::MAX,
-                        };
-
-                        let zero_conv_in: MlxBuffer;
-                        let zero_conv_out: MlxBuffer;
-                        let zero_rec_buf_in: MlxBuffer;
-                        let zero_rec_buf_out: MlxBuffer;
-                        let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref): (
-                            &MlxBuffer,
-                            &MlxBuffer,
-                            &MlxBuffer,
-                            &MlxBuffer,
-                        ) = if linear_slot_idx != usize::MAX {
-                            let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            // ADR-040 M-QWEN: parity-aware per-slot
-                            // (current, scratch) selection — the named
-                            // fields are NOT necessarily "current" for
-                            // this slot.
-                            let (conv_cur, conv_scr) = slot.conv_bufs_for_slot(slot_id);
-                            let (rec_cur, rec_scr) = slot.recurrent_bufs_for_slot(slot_id);
-                            (conv_cur, conv_scr, rec_cur, rec_scr)
-                        } else {
-                            let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
-                            let zero_rec_cpu = vec![0.0f32; rec_size];
-                            zero_conv_in = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_in")?;
-                            zero_conv_out = upload_f32(&zero_conv_cpu, &device)
-                                .context("alloc zero conv state_out")?;
-                            zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_in")?;
-                            zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
-                                .context("alloc zero recurrent state_out")?;
-                            (
-                                &zero_conv_in,
-                                &zero_conv_out,
-                                &zero_rec_buf_in,
-                                &zero_rec_buf_out,
-                            )
-                        };
-                        // ADR-034 task #90 Step 3+4c — same capture wire
-                        // as the main decode path above.
-                        let (state_capture_view, conv_capture_view): (
-                            Option<MlxBuffer>,
-                            Option<MlxBuffer>,
-                        ) = if linear_slot_idx != usize::MAX && kv_cache.la_capture_active() {
-                            let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            (
-                                slot.capture_states.clone(),
-                                slot.conv_capture_states.clone(),
-                            )
-                        } else {
-                            (None, None)
-                        };
-                        let state_capture_ref = state_capture_view.as_ref();
-                        let conv_capture_ref = conv_capture_view.as_ref();
-                        let out = build_delta_net_layer(
-                            &device,
-                            &mut registry,
-                            &hidden,
-                            attn,
-                            conv_in_ref,
-                            conv_out_ref,
-                            state_in_ref,
-                            state_out_ref,
-                            seq_len,
-                            shape.hidden_size,
-                            shape.n_k_heads,
-                            shape.n_v_heads,
-                            shape.d_k,
-                            shape.d_v,
-                            shape.conv_kernel,
-                            shape.rms_norm_eps,
-                            state_capture_ref,
-                            conv_capture_ref,
-                            // ADR-040 Phase B4d (2026-05-30, this iter)
-                            // — greedy legacy-DN dispatch now routes
-                            // through `slot_id` (was hard-coded
-                            // SlotId(0) per A2b-cont/B4d deferral).
-                            // Same `narrow_la_ping_pong_to_slot`
-                            // discipline as the single-CB DN path at
-                            // :5380.
-                            slot_id,
-                        )
-                        .with_context(|| format!("delta_net legacy greedy layer {layer_idx}"))?;
-
-                        if linear_slot_idx != usize::MAX {
+                        if seq_len > 1 {
+                            let linear_slot_idx =
+                                match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                                    Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                                    other => {
+                                        return Err(anyhow!(
+                                        "layer {layer_idx}: expected DeltaNet slot, got {other:?}"
+                                    ))
+                                    }
+                                };
                             let slot = &mut kv_cache.linear_attn[linear_slot_idx];
-                            // ADR-040 M-QWEN: per-slot parity flip (was a whole-buffer swap
+                            let mut enc = device.command_encoder().with_context(|| {
+                                format!("enc delta_net physical batch layer {layer_idx}")
+                            })?;
+                            let out = build_delta_net_layer_decode_batched_into(
+                                &mut enc,
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                attn,
+                                slot,
+                                slot_ids,
+                                shape.hidden_size,
+                                shape.n_k_heads,
+                                shape.n_v_heads,
+                                shape.d_k,
+                                shape.d_v,
+                                shape.conv_kernel,
+                                shape.rms_norm_eps,
+                            )
+                            .with_context(|| {
+                                format!("delta_net physical batch layer {layer_idx}")
+                            })?;
+                            enc.commit_labeled("layer.delta_net.physical_batch");
+                            for slot_id in slot_ids.iter().copied() {
+                                slot.swap_for_slot(slot_id);
+                            }
+                            out
+                        } else {
+                            let km1 =
+                                (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
+                            let qkv_channels = shape.qkv_channels() as usize;
+                            let rec_size = (cfg.linear_key_head_dim
+                                * cfg.linear_value_head_dim
+                                * cfg.linear_num_value_heads)
+                                as usize;
 
-                            // that corrupted every OTHER active slot at N>=2 concurrent).
+                            let linear_slot_idx =
+                                match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                                    Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                                    _ => usize::MAX,
+                                };
 
-                            slot.swap_for_slot(slot_id);
+                            let zero_conv_in: MlxBuffer;
+                            let zero_conv_out: MlxBuffer;
+                            let zero_rec_buf_in: MlxBuffer;
+                            let zero_rec_buf_out: MlxBuffer;
+                            let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref): (
+                                &MlxBuffer,
+                                &MlxBuffer,
+                                &MlxBuffer,
+                                &MlxBuffer,
+                            ) = if linear_slot_idx != usize::MAX {
+                                let slot = &kv_cache.linear_attn[linear_slot_idx];
+                                // ADR-040 M-QWEN: parity-aware per-slot
+                                // (current, scratch) selection — the named
+                                // fields are NOT necessarily "current" for
+                                // this slot.
+                                let (conv_cur, conv_scr) = slot.conv_bufs_for_slot(slot_ids[0]);
+                                let (rec_cur, rec_scr) = slot.recurrent_bufs_for_slot(slot_ids[0]);
+                                (conv_cur, conv_scr, rec_cur, rec_scr)
+                            } else {
+                                let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
+                                let zero_rec_cpu = vec![0.0f32; rec_size];
+                                zero_conv_in = upload_f32(&zero_conv_cpu, &device)
+                                    .context("alloc zero conv state_in")?;
+                                zero_conv_out = upload_f32(&zero_conv_cpu, &device)
+                                    .context("alloc zero conv state_out")?;
+                                zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
+                                    .context("alloc zero recurrent state_in")?;
+                                zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
+                                    .context("alloc zero recurrent state_out")?;
+                                (
+                                    &zero_conv_in,
+                                    &zero_conv_out,
+                                    &zero_rec_buf_in,
+                                    &zero_rec_buf_out,
+                                )
+                            };
+                            // ADR-034 task #90 Step 3+4c — same capture wire
+                            // as the main decode path above.
+                            let (state_capture_view, conv_capture_view): (
+                                Option<MlxBuffer>,
+                                Option<MlxBuffer>,
+                            ) = if linear_slot_idx != usize::MAX && kv_cache.la_capture_active() {
+                                let slot = &kv_cache.linear_attn[linear_slot_idx];
+                                (
+                                    slot.capture_states.clone(),
+                                    slot.conv_capture_states.clone(),
+                                )
+                            } else {
+                                (None, None)
+                            };
+                            let state_capture_ref = state_capture_view.as_ref();
+                            let conv_capture_ref = conv_capture_view.as_ref();
+                            let out = build_delta_net_layer(
+                                &device,
+                                &mut registry,
+                                &hidden,
+                                attn,
+                                conv_in_ref,
+                                conv_out_ref,
+                                state_in_ref,
+                                state_out_ref,
+                                seq_len,
+                                shape.hidden_size,
+                                shape.n_k_heads,
+                                shape.n_v_heads,
+                                shape.d_k,
+                                shape.d_v,
+                                shape.conv_kernel,
+                                shape.rms_norm_eps,
+                                state_capture_ref,
+                                conv_capture_ref,
+                                // ADR-040 Phase B4d (2026-05-30, this iter)
+                                // — greedy legacy-DN dispatch now routes
+                                // through `slot_id` (was hard-coded
+                                // SlotId(0) per A2b-cont/B4d deferral).
+                                // Same `narrow_la_ping_pong_to_slot`
+                                // discipline as the single-CB DN path at
+                                // :5380.
+                                slot_ids[0],
+                            )
+                            .with_context(|| {
+                                format!("delta_net legacy greedy layer {layer_idx}")
+                            })?;
+
+                            if linear_slot_idx != usize::MAX {
+                                let slot = &mut kv_cache.linear_attn[linear_slot_idx];
+                                // ADR-040 M-QWEN: per-slot parity flip (was a whole-buffer swap
+
+                                // that corrupted every OTHER active slot at N>=2 concurrent).
+
+                                slot.swap_for_slot(slot_ids[0]);
+                            }
+                            out
                         }
-                        out
                     }
                 };
 
@@ -7245,9 +10137,9 @@ impl Qwen35Model {
                         out
                     }
                     _ => {
-                        // Legacy 2-encoder path for Dense (F32) / Moe-unquantized.
-                        // DenseQ + MoeQ are caught by their dedicated fused-CB
-                        // arms above and never reach this fall-through.
+                        // Legacy 2-encoder path for unquantized MoE. Native
+                        // Dense reaches this arm only under the explicit
+                        // legacy control; DenseQ/MoeQ never reach it.
                         // W-5b.16 sunset: the DenseQ legacy sub-arm (the only
                         // arm that fired under `HF2Q_DENSE_Q_LEGACY=1`) was
                         // removed alongside the env gate itself.
@@ -7403,7 +10295,7 @@ impl Qwen35Model {
             c.commit_labeled("layer.partial_chain.flush_post_loop");
         }
 
-        // ---- Output head: GPU argmax → 4-byte download ----
+        // ---- Output head: GPU argmax → 8-byte index/value readback ----
         //
         // ADR-015 P3 Stage 1 (S1): when HF2Q_LEGACY_PER_LAYER_CB=1, use
         // the legacy 3-encoder output head (norm, lm_head, argmax — each
@@ -7415,8 +10307,19 @@ impl Qwen35Model {
         } else {
             None
         };
-        let token_id = if legacy_per_layer_cb {
-            apply_output_head_gpu_greedy_legacy(
+        let token_ids = if seq_len > 1 {
+            apply_output_head_gpu_greedy_batched(
+                &device,
+                &mut registry,
+                &hidden,
+                &output_head,
+                h,
+                cfg.vocab_size,
+                &decode_bufs,
+            )
+            .context("apply_output_head_gpu_greedy_batched")?
+        } else if legacy_per_layer_cb {
+            vec![apply_output_head_gpu_greedy_legacy(
                 &device,
                 &mut registry,
                 &hidden,
@@ -7426,9 +10329,9 @@ impl Qwen35Model {
                 eps,
                 &decode_bufs,
             )
-            .context("apply_output_head_gpu_greedy_legacy")?
+            .context("apply_output_head_gpu_greedy_legacy")?]
         } else {
-            apply_output_head_gpu_greedy(
+            vec![apply_output_head_gpu_greedy(
                 &device,
                 &mut registry,
                 &hidden,
@@ -7438,7 +10341,7 @@ impl Qwen35Model {
                 eps,
                 &decode_bufs,
             )
-            .context("apply_output_head_gpu_greedy")?
+            .context("apply_output_head_gpu_greedy")?]
         };
         if let Some(t) = t_output_head {
             eprintln!(
@@ -7451,7 +10354,7 @@ impl Qwen35Model {
         // Profile mode is slow because labeled async commits become syncs.
         print_and_reset_cb_profile("forward_gpu_greedy");
 
-        Ok(token_id)
+        Ok(token_ids)
     }
 
     /// Upload all per-layer weights to GPU once, returning the GPU bundle vec.
@@ -7469,6 +10372,9 @@ impl Qwen35Model {
                     DenseFfnWeightsGpu::from_cpu(w, device)
                         .with_context(|| format!("upload dense_ffn layer {i}"))?,
                 ),
+                Qwen35FfnWeights::DenseNative(w) => {
+                    FfnWeightsGpu::Dense(DenseFfnWeightsGpu::from_native(w))
+                }
                 Qwen35FfnWeights::DenseQ(w) => {
                     // Projection buffers already on Metal device (ARC retain, no data copy).
                     FfnWeightsGpu::DenseQ(DenseFfnWeightsGpuQ::from_quantized(w))
@@ -7478,30 +10384,22 @@ impl Qwen35Model {
                         .with_context(|| format!("upload moe_ffn layer {i}"))?,
                 ),
                 Qwen35FfnWeights::MoeQ(w) => {
-                    // Expert buffers already on Metal device; only router and
-                    // shared-expert F32 vecs need uploading.
+                    // Every production matrix is already an artifact-native
+                    // mapped view; construction only retains handles.
                     let moe_cfg = cfg
                         .moe
                         .as_ref()
                         .ok_or_else(|| anyhow!("layer {i}: MoeQ but no moe config"))?;
                     let mut moe_gpu = MoeFfnWeightsGpuQ::from_quantized(
-                        // Clone the Metal buffer handle (ARC retain — no data copy).
-                        w.expert_gate_q.clone(),
-                        w.expert_up_q.clone(),
-                        w.expert_down_q.clone(),
-                        w.ggml_type_gate_up,
-                        w.ggml_type_down,
+                        w,
                         moe_cfg.num_experts,
                         moe_cfg.moe_intermediate_size,
                         cfg.hidden_size,
-                        &w.router,
-                        &w.shared_gate_logit,
-                        &w.shared_gate,
-                        &w.shared_up,
-                        &w.shared_down,
-                        device,
                     )
-                    .with_context(|| format!("upload moe_ffn_q layer {i}"))?;
+                    .with_context(|| format!("retain moe_ffn_q layer {i}"))?;
+                    moe_gpu
+                        .bind_activation_epoch(self.activation_epoch())
+                        .with_context(|| format!("bind moe_ffn_q layer {i} activation"))?;
                     // ADR-020 AC#5 Iter C2.4 #4 — propagate DWQ overlay
                     // affine stacks from MoeFfnWeightsQ into the GPU
                     // bundle.  Cheap clone (Arc-wrapped MlxBuffer).
@@ -7745,7 +10643,7 @@ impl Qwen35Model {
                 "forward_tree_verify_gpu: hidden collector incomplete after {} layers",
                 cache.layer_weights.len()
             );
-            apply_output_head_gpu(
+            let logits = apply_output_head_gpu(
                 device,
                 registry,
                 &hidden,
@@ -7755,7 +10653,12 @@ impl Qwen35Model {
                 cfg.vocab_size,
                 cfg.rms_norm_eps,
             )
-            .context("forward_tree_verify_gpu: output head")
+            .context("forward_tree_verify_gpu: output head")?;
+            crate::inference::argmax::validate_finite_logits(
+                &logits,
+                "Qwen EAGLE tree verifier readback",
+            )?;
+            Ok(logits)
         })
     }
 }
@@ -7799,14 +10702,326 @@ fn upload_tree_i32_pooled(
 // ================================================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::inference::models::qwen35::forward_cpu::text_positions;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
     use crate::inference::models::qwen35::{
-        default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant,
+        default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant,
     };
+    use crate::serve::multi_seq_kv::MultiSeqKvCache;
     use mlx_native::MlxDevice;
+
+    #[test]
+    fn qwen_gpu_cache_rebinds_same_address_across_a_b_a_epochs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        GPU_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            clear_stale_gpu_activation(&mut *cache);
+        });
+        let mut model = Qwen35Model::empty_from_cfg(tiny_dense_full_attn_cfg_4layer_for_b4a());
+        model
+            .prime_gpu_cache_unactivated()
+            .expect("prime first model generation");
+        let first_device_registry_id = GPU_CACHE.with(|cell| {
+            let guard = cell.borrow();
+            let cache = guard.as_ref().expect("first generation cache");
+            let pooled = super::super::decode_pool::pooled_alloc_buffer(
+                &cache.device,
+                1024,
+                DType::F32,
+                vec![256],
+            )
+            .expect("allocate activation-A decode scratch");
+            drop(pooled);
+            super::super::decode_pool::reset_decode_pool();
+            super::super::decode_pool::with_id_mm_scratch(
+                super::super::decode_pool::MmIdSlot::Gate,
+                model.activation_epoch(),
+                &cache.device,
+                3,
+                2,
+                |_| Ok(()),
+            )
+            .expect("allocate activation-A expert scratch");
+            cache.device.registry_id()
+        });
+        assert!(super::super::decode_pool::decode_pool_free_count() > 0);
+        assert_eq!(
+            super::super::decode_pool::cached_legacy_id_scratch_count(),
+            1
+        );
+        GPU_CACHE.with(|cell| {
+            let guard = cell.borrow();
+            let cache = guard.as_ref().expect("first generation cache");
+            assert!(gpu_cache_matches_model(cache, &model));
+        });
+        let before_replacement_weight_pool_clear =
+            super::super::weight_pool::activation_clear_generation();
+
+        let first_epoch = model.activation_epoch;
+        let first_policy = model.ggml_routing_policy;
+        model.activation_epoch = Qwen35Model::next_activation_epoch();
+        model.ggml_routing_policy.dense_decode_mvn = !model.ggml_routing_policy.dense_decode_mvn;
+        assert_ne!(model.activation_epoch, first_epoch);
+        GPU_CACHE.with(|cell| {
+            let guard = cell.borrow();
+            let cache = guard.as_ref().expect("stale cache remains allocated");
+            assert!(
+                !gpu_cache_matches_model(cache, &model),
+                "pointer equality must not authorize a prior model generation"
+            );
+        });
+
+        let replacement_load_device =
+            new_model_load_device().expect("create replacement model-load device after teardown");
+        assert_eq!(
+            replacement_load_device.registry_id(),
+            first_device_registry_id,
+            "a fresh residency owner still targets the same physical Metal device"
+        );
+        GPU_CACHE.with(|cell| {
+            assert!(
+                cell.borrow().is_none(),
+                "A's forward cache must be gone before B's first load allocation"
+            );
+        });
+        assert_eq!(super::super::decode_pool::decode_pool_in_use_count(), 0);
+        assert_eq!(super::super::decode_pool::decode_pool_free_count(), 0);
+        assert_eq!(
+            super::super::decode_pool::cached_legacy_id_scratch_count(),
+            0
+        );
+        assert_eq!(
+            super::super::weight_pool::activation_clear_generation(),
+            before_replacement_weight_pool_clear + 1,
+            "A's residency-only owner must be released before B's load device exists"
+        );
+        drop(replacement_load_device);
+
+        model
+            .prime_gpu_cache_unactivated()
+            .expect("replace stale generation cache");
+        let b_device_registry_id = GPU_CACHE.with(|cell| {
+            let guard = cell.borrow();
+            let cache = guard.as_ref().expect("replacement cache");
+            assert!(gpu_cache_matches_model(cache, &model));
+            assert_eq!(cache.activation_epoch, model.activation_epoch);
+            assert_eq!(cache.device.registry_id(), first_device_registry_id);
+            assert_eq!(
+                cache.registry.ggml_routing_policy(),
+                Some(&model.ggml_routing_policy),
+                "replacement registry must freeze the current model policy"
+            );
+            cache.device.registry_id()
+        });
+        assert_eq!(super::super::decode_pool::decode_pool_in_use_count(), 0);
+        assert_eq!(super::super::decode_pool::decode_pool_free_count(), 0);
+        assert_eq!(
+            super::super::decode_pool::cached_legacy_id_scratch_count(),
+            0
+        );
+
+        GPU_CACHE.with(|cell| {
+            let guard = cell.borrow();
+            let cache = guard.as_ref().expect("B generation cache");
+            let pooled = super::super::decode_pool::pooled_alloc_buffer(
+                &cache.device,
+                2048,
+                DType::F32,
+                vec![512],
+            )
+            .expect("allocate activation-B decode scratch");
+            drop(pooled);
+            super::super::decode_pool::reset_decode_pool();
+            super::super::decode_pool::with_id_mm_scratch(
+                super::super::decode_pool::MmIdSlot::Up,
+                model.activation_epoch(),
+                &cache.device,
+                3,
+                2,
+                |_| Ok(()),
+            )
+            .expect("allocate activation-B expert scratch");
+        });
+        let before_a2_weight_pool_clear = super::super::weight_pool::activation_clear_generation();
+        let b_epoch = model.activation_epoch;
+        model.activation_epoch = Qwen35Model::next_activation_epoch();
+        model.ggml_routing_policy = first_policy;
+        assert_ne!(model.activation_epoch, b_epoch);
+
+        let a2_load_device =
+            new_model_load_device().expect("create A2 model-load device after B teardown");
+        assert_eq!(a2_load_device.registry_id(), b_device_registry_id);
+        GPU_CACHE.with(|cell| assert!(cell.borrow().is_none()));
+        assert_eq!(super::super::decode_pool::decode_pool_in_use_count(), 0);
+        assert_eq!(super::super::decode_pool::decode_pool_free_count(), 0);
+        assert_eq!(
+            super::super::decode_pool::cached_legacy_id_scratch_count(),
+            0
+        );
+        assert_eq!(
+            super::super::weight_pool::activation_clear_generation(),
+            before_a2_weight_pool_clear + 1,
+            "B's residency-only owner must be released before A2's load device exists"
+        );
+        drop(a2_load_device);
+
+        model
+            .prime_gpu_cache_unactivated()
+            .expect("prime A2 generation cache");
+        GPU_CACHE.with(|cell| {
+            let guard = cell.borrow();
+            let cache = guard.as_ref().expect("A2 generation cache");
+            assert!(gpu_cache_matches_model(cache, &model));
+            assert_eq!(cache.device.registry_id(), b_device_registry_id);
+            assert_eq!(
+                cache.registry.ggml_routing_policy(),
+                Some(&first_policy),
+                "A2 must restore A's policy through a fresh epoch-bound registry"
+            );
+        });
+        GPU_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            clear_stale_gpu_activation(&mut *cache);
+        });
+    }
+
+    #[test]
+    fn mixed_dense_q_bf16_collector_covers_target_and_mtp_containers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else { return };
+        let gate_q = device
+            .alloc_buffer(64, DType::U8, vec![64])
+            .expect("allocate synthetic quantized gate");
+        let up_q = device
+            .alloc_buffer(64 * 32 * 2, DType::BF16, vec![64, 32])
+            .expect("allocate synthetic BF16 up");
+        let down_q = device
+            .alloc_buffer(32 * 64 * 2, DType::F16, vec![32, 64])
+            .expect("allocate synthetic F16 down");
+        let weights = DenseFfnWeightsGpuQ {
+            gate_q,
+            up_q,
+            down_q,
+            ggml_type_gate: GgmlType::Q4_0,
+            ggml_type_up: GgmlType::BF16,
+            ggml_type_down: GgmlType::F16,
+            intermediate_size: 64,
+            hidden_size: 32,
+        };
+
+        for labels in [
+            [
+                "Qwen dense gate projection",
+                "Qwen dense up projection",
+                "Qwen dense down projection",
+            ],
+            [
+                "Qwen MTP dense gate projection",
+                "Qwen MTP dense up projection",
+                "Qwen MTP dense down projection",
+            ],
+        ] {
+            let mut matrices = Vec::new();
+            push_dense_q_bf16_matrices(&mut matrices, labels, &weights)
+                .expect("collect mixed native BF16 sibling");
+            assert_eq!(matrices.len(), 1, "only the BF16 sibling is calibrated");
+            assert_eq!(matrices[0].label, labels[1]);
+            assert_eq!((matrices[0].n, matrices[0].k), (64, 32));
+            assert_eq!(matrices[0].reachable_row_mask, u16::MAX);
+        }
+    }
+
+    #[test]
+    fn qwen_drafter_union_freezes_once_and_rejects_late_widths() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let model = Qwen35Model::empty_from_cfg(tiny_dense_full_attn_cfg_4layer_for_b4a());
+        model
+            .prime_gpu_cache_unactivated()
+            .expect("prime allocation-only cache");
+        let mut drafter = model
+            .with_unactivated_gpu_cache_mut(|device, _| {
+                device
+                    .alloc_buffer(32 * 32 * 2, DType::BF16, vec![32, 32])
+                    .map_err(anyhow::Error::from)
+            })
+            .expect("allocate synthetic drafter projection");
+        drafter
+            .as_mut_slice::<u16>()
+            .expect("drafter BF16 slice")
+            .fill(0x3f80);
+
+        let exact = [NativeBf16Matrix::unbatched_single_row(
+            "synthetic DFlash",
+            &drafter,
+            32,
+            32,
+        )];
+        model
+            .activate_gpu_dense_routes(QwenDenseBf16Provider::DFlash, &exact)
+            .expect("freeze target + DFlash union");
+        model
+            .activate_gpu_dense_routes(QwenDenseBf16Provider::DFlash, &exact)
+            .expect("same union is idempotent");
+
+        GPU_CACHE.with(|cell| {
+            let guard = cell.borrow();
+            let cache = guard.as_ref().expect("activated cache");
+            assert_eq!(
+                cache.dense_bf16_provider,
+                Some(QwenDenseBf16Provider::DFlash)
+            );
+            assert_eq!(cache.dense_bf16_shapes, vec![(1, 32, 32, 1, 1)]);
+            let receipt = cache
+                .dense_bf16_receipt
+                .as_ref()
+                .expect("union activation receipt");
+            assert_eq!(receipt.activation_epoch, model.activation_epoch());
+            assert_eq!(receipt.declared_shapes, 1);
+            assert_eq!(receipt.decisions.len(), 1);
+            assert_eq!(
+                cache
+                    .registry
+                    .dense_bf16_plan()
+                    .expect("frozen route plan")
+                    .decision_count(),
+                1
+            );
+        });
+
+        let wider = [
+            NativeBf16Matrix::unbatched_through("late wider DFlash", &drafter, 32, 32, 2)
+                .expect("wider declaration"),
+        ];
+        let error = model
+            .activate_gpu_dense_routes(QwenDenseBf16Provider::DFlash, &wider)
+            .expect_err("a late physical row width must fail closed");
+        assert!(
+            format!("{error:#}").contains("frozen before active drafter shapes"),
+            "unexpected late-width error: {error:#}"
+        );
+        let error = model
+            .activate_gpu_dense_routes(QwenDenseBf16Provider::Eagle3, &exact)
+            .expect_err("a frozen DFlash cache must reject another drafter provider");
+        assert!(
+            format!("{error:#}").contains("cannot attach"),
+            "unexpected provider error: {error:#}"
+        );
+
+        drop(drafter);
+        GPU_CACHE.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            assert!(
+                guard
+                    .as_ref()
+                    .and_then(|cache| cache.dense_bf16_receipt.as_ref())
+                    .is_some(),
+                "route metadata must outlive the borrowed calibration matrix"
+            );
+            *guard = None;
+        });
+    }
 
     #[test]
     fn qwen38_native_embedding_route_table_is_the_dispatch_and_admission_authority() {
@@ -7816,6 +11031,16 @@ mod tests {
                 GgmlType::Q2_K,
                 NativeEmbeddingRoute::Q2K,
                 Some(mlx_native::GgmlKernelRoute::EmbeddingQ2K),
+            ),
+            (
+                GgmlType::Q4_0,
+                NativeEmbeddingRoute::Q4_0,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingQ4_0),
+            ),
+            (
+                GgmlType::Q5_0,
+                NativeEmbeddingRoute::Q5_0,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingQ5_0),
             ),
             (
                 GgmlType::Q4_K,
@@ -7837,15 +11062,192 @@ mod tests {
                 NativeEmbeddingRoute::Q8_0,
                 Some(mlx_native::GgmlKernelRoute::EmbeddingQ8_0),
             ),
-            (GgmlType::F32, NativeEmbeddingRoute::F32, None),
+            (
+                GgmlType::F32,
+                NativeEmbeddingRoute::F32,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingF32),
+            ),
+            (
+                GgmlType::F16,
+                NativeEmbeddingRoute::F16,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingF16),
+            ),
+            (
+                GgmlType::BF16,
+                NativeEmbeddingRoute::BF16,
+                Some(mlx_native::GgmlKernelRoute::EmbeddingBF16),
+            ),
         ] {
             assert_eq!(NativeEmbeddingRoute::for_type(kind).unwrap(), route);
             assert_eq!(route.capability_route(), capability_route);
         }
+    }
 
-        let error = NativeEmbeddingRoute::for_type(GgmlType::F16)
-            .expect_err("F16 has no direct embedding route");
-        assert!(error.to_string().contains("refuses to dequantize"));
+    #[test]
+    fn native_scalar_embedding_extent_is_exact_and_never_enters_block_quant_geometry() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let rows = 7usize;
+        let cols = 32usize;
+        for (kind, bytes_per_value) in [
+            (GgmlType::F32, 4usize),
+            (GgmlType::F16, 2usize),
+            (GgmlType::BF16, 2usize),
+        ] {
+            let expected = rows * cols * bytes_per_value;
+            assert_eq!(
+                native_matrix_storage_bytes(kind, rows, cols).expect("scalar storage extent"),
+                expected
+            );
+            validate_native_embedding_descriptor("token_embd.weight", kind, rows, cols, expected)
+                .unwrap_or_else(|error| panic!("{kind:?} exact descriptor must pass: {error:#}"));
+            let error = validate_native_embedding_descriptor(
+                "token_embd.weight",
+                kind,
+                rows,
+                cols,
+                expected - 1,
+            )
+            .expect_err("one missing scalar byte must fail closed");
+            assert!(
+                error.to_string().contains("requires exactly"),
+                "unexpected {kind:?} extent error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen38_width_q8_0_native_embedding_gather_is_bit_exact() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use crate::serve::gpu::QuantWeightInfo;
+        use half::f16;
+
+        const HIDDEN: usize = 5_120;
+        const VOCAB: usize = 3;
+        const QK8_0: usize = 32;
+        const BLOCK_BYTES: usize = 34;
+
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let blocks_per_row = HIDDEN / QK8_0;
+        let row_bytes = blocks_per_row * BLOCK_BYTES;
+        let mut packed = vec![0_u8; VOCAB * row_bytes];
+        for row in 0..VOCAB {
+            for block in 0..blocks_per_row {
+                let offset = row * row_bytes + block * BLOCK_BYTES;
+                let scale = 2.0_f32.powi(-((block % 8) as i32 + 2));
+                packed[offset..offset + 2]
+                    .copy_from_slice(&f16::from_f32(scale).to_bits().to_le_bytes());
+                for lane in 0..QK8_0 {
+                    let quant = ((row * 41 + block * 17 + lane * 7) % 255) as i16 - 127;
+                    packed[offset + 2 + lane] = (quant as i8) as u8;
+                }
+            }
+        }
+
+        let mut weight = device
+            .alloc_buffer(packed.len(), DType::U8, vec![packed.len()])
+            .expect("packed Q8_0 embedding table");
+        weight
+            .as_mut_slice::<u8>()
+            .expect("packed Q8_0 embedding bytes")
+            .copy_from_slice(&packed);
+        let native = MlxQWeight {
+            buffer: weight,
+            info: QuantWeightInfo {
+                ggml_dtype: GgmlType::Q8_0,
+                rows: VOCAB,
+                cols: HIDDEN,
+            },
+            affine: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        };
+        ensure_native_embedding_admitted(&native).expect("admit exact Q8_0 storage");
+
+        let token_ids = [2_u32, 0, 1, 2];
+        let mut output = device
+            .alloc_buffer(
+                token_ids.len() * HIDDEN * DType::F32.size_of(),
+                DType::F32,
+                vec![token_ids.len(), HIDDEN],
+            )
+            .expect("Q8_0 embedding output");
+        let mut registry = KernelRegistry::new();
+        embed_tokens_gpu_into(
+            &token_ids,
+            &[],
+            Some(&native),
+            VOCAB as u32,
+            HIDDEN as u32,
+            &device,
+            &mut registry,
+            &mut output,
+        )
+        .expect("production Q8_0 embedding route");
+        device
+            .command_encoder()
+            .expect("queue fence")
+            .commit_and_wait_labeled("test.qwen38.embedding.q8_0")
+            .expect("Q8_0 embedding completion");
+
+        let expected_rows: Vec<Vec<f32>> = (0..VOCAB)
+            .map(|row| {
+                let mut values = vec![0.0_f32; HIDDEN];
+                mlx_native::gguf::test_only_dequantize(
+                    &packed[row * row_bytes..(row + 1) * row_bytes],
+                    GgmlType::Q8_0,
+                    &mut values,
+                )
+                .expect("independent CPU Q8_0 dequantization");
+                values
+            })
+            .collect();
+        for (token_index, (actual, &row)) in output
+            .as_slice::<f32>()
+            .expect("Q8_0 embedding result")
+            .chunks_exact(HIDDEN)
+            .zip(token_ids.iter())
+            .enumerate()
+        {
+            for (column, (&got, &want)) in actual
+                .iter()
+                .zip(expected_rows[row as usize].iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "Q8_0 token {token_index}, row {row}, column {column}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_short_d256_prefill_executes_without_non_finite_logits() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let mut cfg = tiny_dense_full_attn_cfg_4layer_for_b4a();
+        cfg.num_attention_heads = 1;
+        cfg.num_key_value_heads = 1;
+        cfg.head_dim = 256;
+        cfg.rotary_dim = 64;
+        cfg.mrope_section = [16, 16, 0, 0];
+        let model = Qwen35Model::empty_from_cfg(cfg.clone());
+        let mut cache = HybridKvCache::new(&cfg, &device, 32, 1).expect("small D=256 cache");
+        let tokens = vec![1_u32; 8];
+        let positions = positions_to_flat(&text_positions(tokens.len() as u32));
+
+        let logits = model
+            .forward_gpu(&tokens, &positions, &mut cache, SlotId(0))
+            .expect("fresh short D=256 prefill must have an executable route");
+        assert!(logits.iter().all(|value| value.is_finite()));
+        assert!(cache
+            .full_attn
+            .iter()
+            .all(|slot| slot.current_len == vec![tokens.len() as u32]));
     }
 
     #[test]
@@ -7895,6 +11297,81 @@ mod tests {
     }
 
     #[test]
+    fn chain_n_for_dense_q5_k_returns_2() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        // ADR-040 §7.QWEN-Q5-CHAIN: exact Qwen3.8 Q5_K_M physical widths
+        // 1/2/4/8/16 selected cn=2.  The former catch-all cn=1 created 66
+        // submissions per target forward and collapsed width-8 throughput.
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        assert_eq!(
+            chain_n_for(FfnQuantArm::DenseQ, Some(GgmlType::Q5_K), false),
+            2
+        );
+    }
+
+    #[test]
+    fn chain_n_for_dense_q6_k_and_q8_0_return_measured_1() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        assert_eq!(
+            explicit_chain_n_for(FfnQuantArm::DenseQ, Some(GgmlType::Q6_K), false),
+            Some(1)
+        );
+        assert_eq!(
+            explicit_chain_n_for(FfnQuantArm::DenseQ, Some(GgmlType::Q8_0), false),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn every_admitted_qwen_ffn_codec_has_an_explicit_chain_policy() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        for &quant in super::super::gguf_preflight::admitted_matrix_codecs() {
+            if matches!(quant, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+                assert!(
+                    explicit_chain_n_for(FfnQuantArm::DenseNative, Some(quant), false).is_some(),
+                    "native dense {quant:?} silently fell through the chain policy"
+                );
+                assert_eq!(
+                    explicit_chain_n_for(FfnQuantArm::DenseQ, Some(quant), false),
+                    None,
+                    "scalar {quant:?} must not masquerade as DenseQ"
+                );
+            } else {
+                assert!(
+                    explicit_chain_n_for(FfnQuantArm::DenseQ, Some(quant), false).is_some(),
+                    "quantized dense {quant:?} silently fell through the chain policy"
+                );
+            }
+            assert!(
+                explicit_chain_n_for(FfnQuantArm::MoeQ, Some(quant), true).is_some(),
+                "MoE {quant:?} silently fell through the chain policy"
+            );
+        }
+    }
+
+    #[test]
+    fn native_dense_scalar_policy_is_uniform_and_fail_closed() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let bf16 = Some((GgmlType::BF16, GgmlType::BF16, GgmlType::BF16));
+        let f16 = Some((GgmlType::F16, GgmlType::F16, GgmlType::F16));
+        assert_eq!(
+            uniform_native_scalar_codec([bf16, bf16]),
+            Some(GgmlType::BF16)
+        );
+        assert_eq!(uniform_native_scalar_codec([bf16, f16]), None);
+        assert_eq!(
+            uniform_native_scalar_codec([Some((GgmlType::BF16, GgmlType::F16, GgmlType::BF16))]),
+            None
+        );
+        assert_eq!(uniform_native_scalar_codec([bf16, None]), None);
+        assert_eq!(
+            explicit_chain_n_for(FfnQuantArm::DenseNative, Some(GgmlType::BF16), false),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn chain_n_for_dwq46_moe_q4km_returns_2() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 35B-DWQ46 (Qwen3.5/3.6 MoE Q4_K_M): cn=2 (+1.27pp), monotone-down beyond.
@@ -7932,9 +11409,10 @@ mod tests {
     }
 
     #[test]
-    fn chain_n_for_unknown_quant_returns_1() {
+    fn chain_n_for_explicit_q8_policy_returns_1() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
-        // Q8_0, F32, F16: conservative cn=1 (no measured win).
+        // Dense Q8_0 is a measured cn=1 cell; MoE Q8_0 is an explicit
+        // conservative cell rather than a catch-all.
         // Q4_0 has fixture-specific arms (DenseQ Q4_0 → cn=4 per iter51,
         // MoeQ Q4_0 → cn=2 per iter45-RESUMED N-curve evidence).  See dedicated
         // tests below.
@@ -8057,7 +11535,10 @@ mod tests {
 
     /// Build a tiny model with deterministic non-zero weights.
     fn tiny_hybrid_model_nonzero() -> Qwen35Model {
-        let cfg = tiny_hybrid_cfg();
+        deterministic_dense_model(tiny_hybrid_cfg())
+    }
+
+    pub(crate) fn deterministic_dense_model(cfg: Qwen35Config) -> Qwen35Model {
         let mut m = Qwen35Model::empty_from_cfg(cfg.clone());
 
         let mut seed = 0x1A2B_u32;
@@ -8103,13 +11584,30 @@ mod tests {
                             w.up = mk_rand(&mut seed, m_size * h, 0.02);
                             w.down = mk_rand(&mut seed, h * m_size, 0.02);
                         }
+                        Qwen35FfnWeights::Moe(w) => {
+                            let moe = cfg.moe.as_ref().expect("MoE config");
+                            let ne = moe.num_experts as usize;
+                            let m_moe = moe.moe_intermediate_size as usize;
+                            let m_shared = moe.shared_expert_intermediate_size as usize;
+                            // Equal router rows exercise the production lowest-index
+                            // tie rule while the expert/shared projections remain
+                            // non-zero, so scalar-vs-batched parity is meaningful.
+                            w.router.fill(0.0);
+                            w.expert_gate = mk_rand(&mut seed, ne * m_moe * h, 0.02);
+                            w.expert_up = mk_rand(&mut seed, ne * m_moe * h, 0.02);
+                            w.expert_down = mk_rand(&mut seed, ne * h * m_moe, 0.02);
+                            w.shared_gate_logit = mk_rand(&mut seed, h, 0.02);
+                            w.shared_gate = mk_rand(&mut seed, m_shared * h, 0.02);
+                            w.shared_up = mk_rand(&mut seed, m_shared * h, 0.02);
+                            w.shared_down = mk_rand(&mut seed, h * m_shared, 0.02);
+                        }
                         // DenseQ cannot be mutated in tests (Metal buffers are immutable);
                         // test models always use Dense (F32) weights via empty_from_cfg.
-                        Qwen35FfnWeights::DenseQ(_) => {
-                            panic!("unexpected DenseQ in test fixture — use Dense variant");
+                        Qwen35FfnWeights::DenseNative(_) | Qwen35FfnWeights::DenseQ(_) => {
+                            panic!("unexpected native dense FFN in mutable test fixture");
                         }
-                        Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_) => {
-                            panic!("unexpected MoE in dense cfg");
+                        Qwen35FfnWeights::MoeQ(_) => {
+                            panic!("unexpected quantized MoE in mutable test fixture");
                         }
                     }
                 }
@@ -8142,11 +11640,25 @@ mod tests {
                             w.up = mk_rand(&mut seed, m_size * h, 0.02);
                             w.down = mk_rand(&mut seed, h * m_size, 0.02);
                         }
-                        Qwen35FfnWeights::DenseQ(_) => {
-                            panic!("unexpected DenseQ in test fixture — use Dense variant");
+                        Qwen35FfnWeights::Moe(w) => {
+                            let moe = cfg.moe.as_ref().expect("MoE config");
+                            let ne = moe.num_experts as usize;
+                            let m_moe = moe.moe_intermediate_size as usize;
+                            let m_shared = moe.shared_expert_intermediate_size as usize;
+                            w.router.fill(0.0);
+                            w.expert_gate = mk_rand(&mut seed, ne * m_moe * h, 0.02);
+                            w.expert_up = mk_rand(&mut seed, ne * m_moe * h, 0.02);
+                            w.expert_down = mk_rand(&mut seed, ne * h * m_moe, 0.02);
+                            w.shared_gate_logit = mk_rand(&mut seed, h, 0.02);
+                            w.shared_gate = mk_rand(&mut seed, m_shared * h, 0.02);
+                            w.shared_up = mk_rand(&mut seed, m_shared * h, 0.02);
+                            w.shared_down = mk_rand(&mut seed, h * m_shared, 0.02);
                         }
-                        Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_) => {
-                            panic!("unexpected MoE in dense cfg");
+                        Qwen35FfnWeights::DenseNative(_) | Qwen35FfnWeights::DenseQ(_) => {
+                            panic!("unexpected native dense FFN in mutable test fixture");
+                        }
+                        Qwen35FfnWeights::MoeQ(_) => {
+                            panic!("unexpected quantized MoE in mutable test fixture");
                         }
                     }
                 }
@@ -8172,6 +11684,2540 @@ mod tests {
             }
         }
         flat
+    }
+
+    pub(crate) fn physical_batch_hybrid_cfg() -> Qwen35Config {
+        Qwen35Config {
+            variant: Qwen35Variant::Dense,
+            hidden_size: 256,
+            num_hidden_layers: 2,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 256,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            layer_types: vec![
+                Qwen35LayerKind::LinearAttention,
+                Qwen35LayerKind::FullAttention,
+            ],
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            rotary_dim: 64,
+            mrope_section: [16, 8, 8, 0],
+            mrope_interleaved: true,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 128,
+            vocab_size: 128,
+            attn_output_gate: true,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: true,
+            intermediate_size: Some(64),
+            moe: None,
+        }
+    }
+
+    fn physical_batch_hybrid_nine_layer_cfg() -> Qwen35Config {
+        let mut cfg = physical_batch_hybrid_cfg();
+        cfg.num_hidden_layers = 9;
+        cfg.full_attention_interval = 2;
+        cfg.layer_types = default_layer_types(9, 2);
+        cfg
+    }
+
+    fn run_rectangular_target_prefill_case(
+        slot_ids: &[SlotId],
+        rows_per_lane: usize,
+        quantized_moe: bool,
+        capture_nextn_hidden: bool,
+    ) {
+        let mut cfg = if quantized_moe {
+            physical_batch_hybrid_moe_cfg()
+        } else {
+            physical_batch_hybrid_cfg()
+        };
+        cfg.max_position_embeddings = 256;
+        let device = MlxDevice::new().expect("rectangular target device");
+        let model = if quantized_moe {
+            quantize_test_moe_experts_to_q8_0(deterministic_dense_model(cfg.clone()), &device)
+        } else {
+            deterministic_dense_model(cfg.clone())
+        };
+        let n_seqs = 5;
+        let mut scalar_cache = HybridKvCache::new_with_options(&cfg, &device, 256, n_seqs, true)
+            .expect("scalar rectangular target cache");
+        let mut rectangular_cache =
+            HybridKvCache::new_with_options(&cfg, &device, 256, n_seqs, true)
+                .expect("rectangular target cache");
+
+        // Keep a fifth slot live throughout the comparison. Exact snapshots
+        // below fail if the rectangular path mutates this unselected peer.
+        let peer_token = [cfg.vocab_size - 2];
+        let peer_position = [0_i32; 4];
+        model
+            .forward_gpu_last_logits(&peer_token, &peer_position, &mut scalar_cache, SlotId(2))
+            .expect("warm scalar peer");
+        model
+            .forward_gpu_last_logits(
+                &peer_token,
+                &peer_position,
+                &mut rectangular_cache,
+                SlotId(2),
+            )
+            .expect("warm rectangular peer");
+
+        let aggregate_rows = slot_ids.len() * rows_per_lane;
+        let mut tokens = Vec::with_capacity(aggregate_rows);
+        let mut positions = vec![0_i32; 4 * aggregate_rows];
+        let scalar_positions = positions_to_flat(&text_positions(rows_per_lane as u32));
+        let mut scalar_outputs = Vec::with_capacity(slot_ids.len());
+        for (lane, slot_id) in slot_ids.iter().copied().enumerate() {
+            let lane_tokens: Vec<u32> = (0..rows_per_lane)
+                .map(|token| 3 + ((lane * 29 + token * 7) as u32 % (cfg.vocab_size - 3)))
+                .collect();
+            for axis in 0..4 {
+                for token in 0..rows_per_lane {
+                    positions[axis * aggregate_rows + lane * rows_per_lane + token] = token as i32;
+                }
+            }
+            let output = if capture_nextn_hidden {
+                let (logits, hidden) = model
+                    .forward_gpu_last_logits_with_hidden(
+                        &lane_tokens,
+                        &scalar_positions,
+                        &mut scalar_cache,
+                        slot_id,
+                    )
+                    .expect("scalar rectangular target lane with hidden capture");
+                (logits, Some(hidden))
+            } else {
+                (
+                    model
+                        .forward_gpu_last_logits(
+                            &lane_tokens,
+                            &scalar_positions,
+                            &mut scalar_cache,
+                            slot_id,
+                        )
+                        .expect("scalar rectangular target lane"),
+                    None,
+                )
+            };
+            scalar_outputs.push(output);
+            tokens.extend_from_slice(&lane_tokens);
+        }
+
+        super::super::gpu_ffn::reset_test_moe_id_projection_calls();
+        let rectangular_outputs = model
+            .forward_gpu_rectangular_prefill_last_logits(
+                &tokens,
+                &positions,
+                &mut rectangular_cache,
+                slot_ids,
+                capture_nextn_hidden,
+            )
+            .expect("rectangular target prefill");
+        if quantized_moe {
+            assert_eq!(
+                super::super::gpu_ffn::test_moe_id_projection_calls(),
+                3 * cfg.num_hidden_layers as u64,
+                "rectangular target introduced per-lane or per-expert MoE ID dispatches"
+            );
+        }
+        assert_eq!(rectangular_outputs.len(), scalar_outputs.len());
+        for (lane, (rectangular, (scalar_logits, scalar_hidden))) in rectangular_outputs
+            .iter()
+            .zip(scalar_outputs.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                rectangular.logits.as_slice(),
+                scalar_logits.as_slice(),
+                "rectangular target lane {lane} final logits differ"
+            );
+            match (rectangular.nextn_hidden.as_ref(), scalar_hidden.as_ref()) {
+                (Some(rectangular), Some(scalar)) => assert_buffer_bytes_eq(
+                    &format!("rectangular target lane {lane} nextn hidden"),
+                    rectangular,
+                    scalar,
+                ),
+                (None, None) => {}
+                _ => panic!("rectangular target lane {lane} hidden-capture shape differs"),
+            }
+        }
+        let scalar_snapshot = scalar_cache
+            .snapshot_prefix(&device, rows_per_lane)
+            .expect("snapshot scalar rectangular target cache");
+        let rectangular_snapshot = rectangular_cache
+            .snapshot_prefix(&device, rows_per_lane)
+            .expect("snapshot rectangular target cache");
+        assert_hybrid_snapshot_bytes_eq(&rectangular_snapshot, &scalar_snapshot);
+
+        // A coherent prefill must also leave every selected lane on the exact
+        // ordinary decode trajectory, not merely return matching prompt logits.
+        for (lane, slot_id) in slot_ids.iter().copied().enumerate() {
+            let token = 11 + lane as u32;
+            let positions = [rows_per_lane as i32; 4];
+            let scalar = model
+                .forward_gpu_last_logits(&[token], &positions, &mut scalar_cache, slot_id)
+                .expect("scalar continuation after rectangular target prefill");
+            let rectangular = model
+                .forward_gpu_last_logits(&[token], &positions, &mut rectangular_cache, slot_id)
+                .expect("rectangular continuation after target prefill");
+            assert_eq!(
+                rectangular, scalar,
+                "rectangular target lane {lane} continuation logits differ"
+            );
+        }
+        let scalar_snapshot = scalar_cache
+            .snapshot_prefix(&device, rows_per_lane + 1)
+            .expect("snapshot scalar continuation cache");
+        let rectangular_snapshot = rectangular_cache
+            .snapshot_prefix(&device, rows_per_lane + 1)
+            .expect("snapshot rectangular continuation cache");
+        assert_hybrid_snapshot_bytes_eq(&rectangular_snapshot, &scalar_snapshot);
+    }
+
+    #[test]
+    fn rectangular_target_prefill_dense_width_two_is_exact_through_continuation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        run_rectangular_target_prefill_case(&[SlotId(3), SlotId(1)], 128, false, true);
+    }
+
+    #[test]
+    fn rectangular_target_prefill_dense_width_four_is_exact_through_continuation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        run_rectangular_target_prefill_case(
+            &[SlotId(4), SlotId(1), SlotId(3), SlotId(0)],
+            128,
+            false,
+            true,
+        );
+    }
+
+    #[test]
+    fn rectangular_target_prefill_dense_width_four_stable_boundary_121_is_exact() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        run_rectangular_target_prefill_case(
+            &[SlotId(4), SlotId(1), SlotId(3), SlotId(0)],
+            121,
+            false,
+            true,
+        );
+    }
+
+    #[test]
+    fn rectangular_target_prefill_quantized_moe_width_four_is_exact_and_aggregate() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        run_rectangular_target_prefill_case(
+            &[SlotId(4), SlotId(1), SlotId(3), SlotId(0)],
+            128,
+            true,
+            true,
+        );
+    }
+
+    #[test]
+    fn rectangular_target_prefill_capture_disabled_is_exact() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        run_rectangular_target_prefill_case(
+            &[SlotId(4), SlotId(1), SlotId(3), SlotId(0)],
+            121,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a pinned native Qwen3.8 GGUF and exclusive Apple Metal"]
+    fn rectangular_target_native_qwen38_format_matches_scalar_state_and_continuation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let artifact_format = std::env::var("HF2Q_TEST_QWEN38_FORMAT")
+            .expect("HF2Q_TEST_QWEN38_FORMAT is required");
+        let path = std::path::PathBuf::from(
+            std::env::var_os("HF2Q_TEST_QWEN38_GGUF")
+                .expect("HF2Q_TEST_QWEN38_GGUF is required"),
+        );
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open Qwen3.8 artifact");
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        let (expected_file_type, expected_primary_type, expected_output_type) =
+            match artifact_format.as_str() {
+                "BF16" => (32, GgmlType::BF16, GgmlType::BF16),
+                "Q4_K_M" => (15, GgmlType::Q4_K, GgmlType::Q6_K),
+                "Q5_K_M" => (17, GgmlType::Q5_K, GgmlType::Q6_K),
+                "Q6_K" => (18, GgmlType::Q6_K, GgmlType::Q6_K),
+                "Q8_0" => (7, GgmlType::Q8_0, GgmlType::Q8_0),
+                other => panic!(
+                    "unsupported HF2Q_TEST_QWEN38_FORMAT={other}; expected BF16, Q4_K_M, Q5_K_M, Q6_K, or Q8_0"
+                ),
+            };
+        assert_eq!(
+            gguf.metadata_u32("general.file_type"),
+            Some(expected_file_type),
+            "rectangular gate loaded the wrong {artifact_format} GGUF file type"
+        );
+        let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .expect("load native Qwen3.8 artifact");
+        assert!(model.token_embd.is_empty(), "native embedding was expanded");
+        assert!(
+            model.output_weight.is_empty(),
+            "native output head was expanded"
+        );
+        assert_eq!(
+            model
+                .token_embd_native
+                .as_ref()
+                .expect("native token embedding")
+                .info
+                .ggml_dtype,
+            expected_primary_type,
+        );
+        assert_eq!(
+            model
+                .output_weight_native
+                .as_ref()
+                .expect("native output head")
+                .info
+                .ggml_dtype,
+            expected_output_type,
+            "{artifact_format} rectangular prefill must execute the artifact's native output head",
+        );
+        model.ensure_gpu_cache_primed().expect("prime Qwen3.8 artifact");
+
+        let rows_per_lane = 96usize;
+        let slot_ids = [SlotId(4), SlotId(1), SlotId(3), SlotId(0)];
+        let n_seqs = 5;
+        let (mut scalar_cache, mut rectangular_cache) = model
+            .with_gpu_cache_mut(|device, _registry| {
+                Ok((
+                    HybridKvCache::new_with_options(
+                        &model.cfg,
+                        device,
+                        256,
+                        n_seqs,
+                        true,
+                    )?,
+                    HybridKvCache::new_with_options(
+                        &model.cfg,
+                        device,
+                        256,
+                        n_seqs,
+                        true,
+                    )?,
+                ))
+            })
+            .expect("native Qwen3.8 rectangular caches");
+        let aggregate_rows = slot_ids.len() * rows_per_lane;
+        let scalar_positions = positions_to_flat(&text_positions(rows_per_lane as u32));
+        let mut positions = vec![0_i32; 4 * aggregate_rows];
+        let seed = [151_643_u32, 9707, 374, 279, 15, 220, 198];
+        let mut tokens = Vec::with_capacity(aggregate_rows);
+        let mut scalar_outputs = Vec::with_capacity(slot_ids.len());
+        for (lane, slot_id) in slot_ids.iter().copied().enumerate() {
+            let lane_tokens = (0..rows_per_lane)
+                .map(|row| seed[(row + lane * 3) % seed.len()])
+                .collect::<Vec<_>>();
+            for axis in 0..4 {
+                for row in 0..rows_per_lane {
+                    positions[axis * aggregate_rows + lane * rows_per_lane + row] = row as i32;
+                }
+            }
+            scalar_outputs.push(
+                model
+                    .forward_gpu_last_logits_with_hidden(
+                        &lane_tokens,
+                        &scalar_positions,
+                        &mut scalar_cache,
+                        slot_id,
+                    )
+                    .expect("native scalar lane"),
+            );
+            tokens.extend_from_slice(&lane_tokens);
+        }
+
+        let rectangular_outputs = model
+            .forward_gpu_rectangular_prefill_last_logits(
+                &tokens,
+                &positions,
+                &mut rectangular_cache,
+                &slot_ids,
+                true,
+            )
+            .expect("native rectangular target");
+        for (lane, (rectangular, (scalar_logits, scalar_hidden))) in rectangular_outputs
+            .iter()
+            .zip(scalar_outputs.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                &rectangular.logits, scalar_logits,
+                "native {artifact_format} rectangular lane {lane} logits"
+            );
+            assert_buffer_bytes_eq(
+                &format!("native {artifact_format} rectangular lane {lane} hidden"),
+                rectangular.nextn_hidden.as_ref().expect("rectangular hidden"),
+                scalar_hidden,
+            );
+        }
+        let (scalar_snapshot, rectangular_snapshot) = model
+            .with_gpu_cache_mut(|device, _registry| {
+                Ok((
+                    scalar_cache.snapshot_prefix(device, rows_per_lane)?,
+                    rectangular_cache.snapshot_prefix(device, rows_per_lane)?,
+                ))
+            })
+            .expect("native rectangular snapshot pair");
+        assert_hybrid_snapshot_bytes_eq(&rectangular_snapshot, &scalar_snapshot);
+
+        for (lane, slot_id) in slot_ids.iter().copied().enumerate() {
+            let token = seed[(lane + 2) % seed.len()];
+            let continuation_positions = [rows_per_lane as i32; 4];
+            let scalar = model
+                .forward_gpu_last_logits(
+                    &[token],
+                    &continuation_positions,
+                    &mut scalar_cache,
+                    slot_id,
+                )
+                .expect("native scalar continuation");
+            let rectangular = model
+                .forward_gpu_last_logits(
+                    &[token],
+                    &continuation_positions,
+                    &mut rectangular_cache,
+                    slot_id,
+                )
+                .expect("native rectangular continuation");
+            assert_eq!(
+                rectangular, scalar,
+                "native {artifact_format} rectangular lane {lane} continuation"
+            );
+        }
+    }
+
+    fn assert_buffer_bytes_eq(label: &str, actual: &MlxBuffer, expected: &MlxBuffer) {
+        let actual = actual
+            .as_slice::<u8>()
+            .unwrap_or_else(|error| panic!("{label}: actual bytes unavailable: {error}"));
+        let expected = expected
+            .as_slice::<u8>()
+            .unwrap_or_else(|error| panic!("{label}: expected bytes unavailable: {error}"));
+        assert_eq!(actual, expected, "{label}: first byte-level divergence");
+    }
+
+    fn assert_tq_snapshot_bytes_eq(
+        label: &str,
+        actual: &crate::inference::models::qwen35::kv_cache::TqKvSnapshot,
+        expected: &crate::inference::models::qwen35::kv_cache::TqKvSnapshot,
+    ) {
+        assert_eq!(
+            actual.norms_per_pos, expected.norms_per_pos,
+            "{label}: norms_per_pos"
+        );
+        assert_buffer_bytes_eq(
+            &format!("{label}.k_packed"),
+            &actual.k_packed,
+            &expected.k_packed,
+        );
+        assert_buffer_bytes_eq(
+            &format!("{label}.k_norms"),
+            &actual.k_norms,
+            &expected.k_norms,
+        );
+        assert_buffer_bytes_eq(
+            &format!("{label}.v_packed"),
+            &actual.v_packed,
+            &expected.v_packed,
+        );
+        assert_buffer_bytes_eq(
+            &format!("{label}.v_norms"),
+            &actual.v_norms,
+            &expected.v_norms,
+        );
+    }
+
+    fn assert_hybrid_snapshot_bytes_eq(
+        actual: &crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot,
+        expected: &crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot,
+    ) {
+        assert_eq!(
+            actual.full_attn_current_len, expected.full_attn_current_len,
+            "full-attention cursors"
+        );
+        assert_eq!(
+            actual.full_attn_k.len(),
+            expected.full_attn_k.len(),
+            "full-attention K layer count"
+        );
+        for layer_idx in 0..actual.full_attn_k.len() {
+            match (
+                actual.full_attn_k[layer_idx].as_ref(),
+                expected.full_attn_k[layer_idx].as_ref(),
+            ) {
+                (Some(actual), Some(expected)) => {
+                    assert_buffer_bytes_eq(&format!("full_attn[{layer_idx}].k"), actual, expected)
+                }
+                (None, None) => {}
+                _ => panic!("full_attn[{layer_idx}].k presence mismatch"),
+            }
+            match (
+                actual.full_attn_v[layer_idx].as_ref(),
+                expected.full_attn_v[layer_idx].as_ref(),
+            ) {
+                (Some(actual), Some(expected)) => {
+                    assert_buffer_bytes_eq(&format!("full_attn[{layer_idx}].v"), actual, expected)
+                }
+                (None, None) => {}
+                _ => panic!("full_attn[{layer_idx}].v presence mismatch"),
+            }
+            match (
+                actual.full_attn_tq[layer_idx].as_ref(),
+                expected.full_attn_tq[layer_idx].as_ref(),
+            ) {
+                (Some(actual), Some(expected)) => assert_tq_snapshot_bytes_eq(
+                    &format!("full_attn[{layer_idx}].tq"),
+                    actual,
+                    expected,
+                ),
+                (None, None) => {}
+                _ => panic!("full_attn[{layer_idx}].tq presence mismatch"),
+            }
+        }
+        assert_eq!(
+            actual.linear_conv.len(),
+            expected.linear_conv.len(),
+            "linear-attention layer count"
+        );
+        for layer_idx in 0..actual.linear_conv.len() {
+            assert_buffer_bytes_eq(
+                &format!("linear_attn[{layer_idx}].conv"),
+                &actual.linear_conv[layer_idx],
+                &expected.linear_conv[layer_idx],
+            );
+            assert_buffer_bytes_eq(
+                &format!("linear_attn[{layer_idx}].recurrent"),
+                &actual.linear_recurrent[layer_idx],
+                &expected.linear_recurrent[layer_idx],
+            );
+        }
+        match (&actual.mtp, &expected.mtp) {
+            (None, None) => {}
+            (Some(actual), Some(expected)) => {
+                assert_eq!(actual.current_len, expected.current_len, "MTP cursor");
+                match (&actual.k, &expected.k) {
+                    (Some(actual), Some(expected)) => {
+                        assert_buffer_bytes_eq("mtp.k", actual, expected)
+                    }
+                    (None, None) => {}
+                    _ => panic!("MTP K presence mismatch"),
+                }
+                match (&actual.v, &expected.v) {
+                    (Some(actual), Some(expected)) => {
+                        assert_buffer_bytes_eq("mtp.v", actual, expected)
+                    }
+                    (None, None) => {}
+                    _ => panic!("MTP V presence mismatch"),
+                }
+                match (&actual.tq, &expected.tq) {
+                    (Some(actual), Some(expected)) => {
+                        assert_tq_snapshot_bytes_eq("mtp.tq", actual, expected)
+                    }
+                    (None, None) => {}
+                    _ => panic!("MTP TQ presence mismatch"),
+                }
+            }
+            _ => panic!("MTP presence mismatch"),
+        }
+    }
+
+    fn validate_segment_attention_trace(
+        actual: &[segmented_route_trace::Event],
+        expected: &[segmented_route_trace::Event],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            actual.len() == expected.len(),
+            "segmented attention trace length {} != expected {}",
+            actual.len(),
+            expected.len()
+        );
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            anyhow::ensure!(
+                actual == expected,
+                "segmented attention trace[{index}] actual={actual:?} expected={expected:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct PhysicalSlotBytes {
+        full_cursors: Vec<u32>,
+        mtp_cursor: Option<u32>,
+        linear_parity: Vec<bool>,
+        linear_write_generation: Vec<u64>,
+        buffers: Vec<Vec<u8>>,
+    }
+
+    fn physical_slot_bytes(cache: &HybridKvCache, slot: SlotId) -> PhysicalSlotBytes {
+        let slot_idx = slot.0 as usize;
+        let n_seqs = cache.n_seqs as usize;
+        let copy_region = |buffer: &MlxBuffer| {
+            let bytes = buffer.as_slice::<u8>().expect("physical slot bytes");
+            assert_eq!(bytes.len() % n_seqs, 0, "slot-axis byte divisibility");
+            let per_slot = bytes.len() / n_seqs;
+            bytes[slot_idx * per_slot..(slot_idx + 1) * per_slot].to_vec()
+        };
+        let mut buffers = Vec::new();
+        let mut full_cursors = Vec::new();
+        for full in &cache.full_attn {
+            full_cursors.push(full.current_len[slot_idx]);
+            if let Some(k) = &full.k {
+                buffers.push(copy_region(k));
+            }
+            if let Some(v) = &full.v {
+                buffers.push(copy_region(v));
+            }
+            if let Some(tq) = &full.tq {
+                buffers.push(copy_region(&tq.k_packed));
+                buffers.push(copy_region(&tq.k_norms));
+                buffers.push(copy_region(&tq.v_packed));
+                buffers.push(copy_region(&tq.v_norms));
+            }
+        }
+        let mtp_cursor = cache.mtp_slot.as_ref().map(|mtp| {
+            if let Some(k) = &mtp.k {
+                buffers.push(copy_region(k));
+            }
+            if let Some(v) = &mtp.v {
+                buffers.push(copy_region(v));
+            }
+            if let Some(tq) = &mtp.tq {
+                buffers.push(copy_region(&tq.k_packed));
+                buffers.push(copy_region(&tq.k_norms));
+                buffers.push(copy_region(&tq.v_packed));
+                buffers.push(copy_region(&tq.v_norms));
+            }
+            mtp.current_len[slot_idx]
+        });
+        let mut linear_parity = Vec::new();
+        let mut linear_write_generation = Vec::new();
+        for linear in &cache.linear_attn {
+            linear_parity.push(linear.pp_flipped[slot_idx]);
+            linear_write_generation.push(linear.write_generation[slot_idx]);
+            buffers.push(copy_region(&linear.conv_state));
+            buffers.push(copy_region(&linear.conv_state_scratch));
+            buffers.push(copy_region(&linear.recurrent));
+            buffers.push(copy_region(&linear.recurrent_scratch));
+        }
+        PhysicalSlotBytes {
+            full_cursors,
+            mtp_cursor,
+            linear_parity,
+            linear_write_generation,
+            buffers,
+        }
+    }
+
+    fn process_test_mtp_batch(
+        model: &Qwen35Model,
+        tokens: &[u32],
+        pending: Option<&MlxBuffer>,
+        target_nextn: &MlxBuffer,
+        positions: &[i32],
+        cache: &mut HybridKvCache,
+        slot: SlotId,
+    ) -> MlxBuffer {
+        let shared_embed = model
+            .embed_tokens_gpu(tokens)
+            .expect("test MTP shared embedding");
+        let mtp = model.mtp.as_ref().expect("test MTP weights");
+        model
+            .with_gpu_cache_mut(|device, registry| {
+                mtp.process_target_batch(
+                    tokens,
+                    pending,
+                    target_nextn,
+                    &shared_embed,
+                    cache,
+                    slot,
+                    positions,
+                    device,
+                    registry,
+                    &model.cfg,
+                )
+            })
+            .expect("test MTP target batch");
+        let row = super::super::spec_decode::last_hidden_row(target_nextn, model.cfg.hidden_size)
+            .expect("test MTP pending row");
+        model
+            .copy_logical_buffer_owned(&row)
+            .expect("own test MTP pending row")
+    }
+
+    #[test]
+    fn block_segmented_target_matches_two_authoritative_forwards_cold_tq() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let cfg = physical_batch_hybrid_cfg();
+        let model = deterministic_dense_model(cfg.clone());
+        let device = MlxDevice::new().expect("Metal device");
+        let tokens: Vec<u32> = (0..41).map(|index| (index % 127 + 1) as u32).collect();
+        let prefix_tokens = &tokens[..33];
+        let suffix_tokens = &tokens[33..];
+        let prefix_positions = positions_to_flat(&text_positions(33));
+        let suffix_positions = positions_to_flat(
+            &(33..41)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+
+        let mut control = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
+            .expect("control cold-TQ cache");
+        let (control_prefix_logits, control_prefix_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                prefix_tokens,
+                &prefix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("authoritative prefix");
+        let control_prefix_anchor = control
+            .snapshot_slot_anchor(SlotId(0), 33)
+            .expect("authoritative prefix anchor");
+        let (control_suffix_logits, control_suffix_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                suffix_tokens,
+                &suffix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("authoritative suffix");
+        let control_snapshot = control.snapshot(&device).expect("control final snapshot");
+
+        let mut segmented = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
+            .expect("segmented cold-TQ cache");
+        segmented_route_trace::begin();
+        let segmented_output = model
+            .forward_gpu_two_segment_last_logits_with_hidden(
+                prefix_tokens,
+                &prefix_positions,
+                suffix_tokens,
+                &suffix_positions,
+                &mut segmented,
+                SlotId(0),
+            )
+            .expect("segmented target");
+        let route_trace = segmented_route_trace::finish();
+        use segmented_route_trace::{Event, OperatorRoute as Route, Segment};
+        let event = |segment, layer, terminal_k_batch, route, m, n, k, entry_cursor| Event {
+            segment,
+            layer,
+            terminal_k_batch,
+            route,
+            m,
+            n,
+            k,
+            entry_cursor,
+        };
+        let expected_trace = [
+            event(Segment::Prefix, 0, 1, Route::DeltaDispatch, 33, 32, 256, 0),
+            event(Segment::Prefix, 0, 1, Route::DeltaRecurrent, 33, 32, 32, 0),
+            event(Segment::Prefix, 0, 1, Route::DenseFfnGateUp, 33, 64, 256, 0),
+            event(Segment::Prefix, 0, 1, Route::DenseFfnDown, 33, 256, 64, 0),
+            event(Segment::Prefix, 1, 1, Route::FullDispatch, 33, 256, 256, 0),
+            event(
+                Segment::Prefix,
+                1,
+                1,
+                Route::FullFreshTiled,
+                33,
+                256,
+                256,
+                0,
+            ),
+            event(Segment::Prefix, 1, 1, Route::DenseFfnGateUp, 33, 64, 256, 0),
+            event(Segment::Prefix, 1, 1, Route::DenseFfnDown, 33, 256, 64, 0),
+            event(Segment::Prefix, 1, 1, Route::OutputHead, 1, 128, 256, 0),
+            event(Segment::Suffix, 0, 8, Route::DeltaDispatch, 8, 32, 256, 0),
+            event(Segment::Suffix, 0, 8, Route::DeltaRecurrent, 8, 32, 32, 0),
+            event(Segment::Suffix, 0, 8, Route::DenseFfnGateUp, 8, 64, 256, 0),
+            event(Segment::Suffix, 0, 8, Route::DenseFfnDown, 8, 256, 64, 0),
+            event(Segment::Suffix, 1, 8, Route::FullDispatch, 8, 256, 256, 33),
+            event(
+                Segment::Suffix,
+                1,
+                8,
+                Route::FullTqDirectResume,
+                8,
+                256,
+                256,
+                33,
+            ),
+            event(Segment::Suffix, 1, 8, Route::DenseFfnGateUp, 8, 64, 256, 0),
+            event(Segment::Suffix, 1, 8, Route::DenseFfnDown, 8, 256, 64, 0),
+            event(Segment::Suffix, 1, 8, Route::OutputHead, 1, 128, 256, 0),
+        ];
+        validate_segment_attention_trace(&route_trace, &expected_trace)
+            .expect("actual segmented attention route trace");
+        let mut boundary_receipt = segmented_output.boundary_receipt;
+        segmented
+            .record_mtp_segment_boundary(&mut boundary_receipt)
+            .expect("record explicit non-MTP boundary");
+        let segmented_prefix_anchor = segmented
+            .snapshot_slot_anchor_from_segment_boundary(SlotId(0), boundary_receipt)
+            .expect("materialize segmented prefix anchor");
+        let segmented_snapshot = segmented
+            .snapshot(&device)
+            .expect("segmented final snapshot");
+
+        assert_eq!(
+            segmented_output.prefix_logits, control_prefix_logits,
+            "prefix logits"
+        );
+        assert_eq!(
+            segmented_output.suffix_logits, control_suffix_logits,
+            "suffix logits"
+        );
+        assert_buffer_bytes_eq(
+            "prefix nextn hidden",
+            &segmented_output.prefix_nextn_hidden,
+            &control_prefix_hidden,
+        );
+        assert_buffer_bytes_eq(
+            "suffix nextn hidden",
+            &segmented_output.suffix_nextn_hidden,
+            &control_suffix_hidden,
+        );
+        assert!(
+            segmented_prefix_anchor.payload_eq(&control_prefix_anchor),
+            "prefix boundary anchor payload"
+        );
+        assert_hybrid_snapshot_bytes_eq(&segmented_snapshot, &control_snapshot);
+    }
+
+    #[test]
+    fn block_segmented_default_k8_crosses_real_intra_k_boundary_exactly() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let cfg = physical_batch_hybrid_nine_layer_cfg();
+        let model = deterministic_dense_model(cfg.clone());
+        let device = MlxDevice::new().expect("Metal device");
+        let tokens: Vec<u32> = (0..41).map(|index| (index % 127 + 1) as u32).collect();
+        let prefix_positions = positions_to_flat(&text_positions(33));
+        let suffix_positions = positions_to_flat(
+            &(33..41)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+
+        let mut control = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
+            .expect("control cold-TQ cache");
+        let (control_prefix_logits, control_prefix_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                &tokens[..33],
+                &prefix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("authoritative prefix");
+        let control_prefix_anchor = control
+            .snapshot_slot_anchor(SlotId(0), 33)
+            .expect("authoritative prefix anchor");
+        let (control_suffix_logits, control_suffix_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                &tokens[33..],
+                &suffix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("authoritative suffix");
+        let control_snapshot = control.snapshot(&device).expect("control final snapshot");
+
+        let mut segmented = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
+            .expect("segmented cold-TQ cache");
+        segmented_route_trace::begin();
+        let mut output = model
+            .forward_gpu_two_segment_last_logits_with_hidden(
+                &tokens[..33],
+                &prefix_positions,
+                &tokens[33..],
+                &suffix_positions,
+                &mut segmented,
+                SlotId(0),
+            )
+            .expect("default-K segmented target");
+        let trace = segmented_route_trace::finish();
+        segmented
+            .record_mtp_segment_boundary(&mut output.boundary_receipt)
+            .expect("explicit non-MTP boundary");
+        let prefix_anchor = segmented
+            .snapshot_slot_anchor_from_segment_boundary(SlotId(0), output.boundary_receipt)
+            .expect("materialize default-K boundary anchor");
+        let snapshot = segmented
+            .snapshot(&device)
+            .expect("segmented final snapshot");
+
+        let suffix_layer_zero = trace
+            .iter()
+            .position(|event| {
+                event.segment == segmented_route_trace::Segment::Suffix && event.layer == 0
+            })
+            .expect("suffix block starts");
+        let prefix_layer_eight = trace
+            .iter()
+            .position(|event| {
+                event.segment == segmented_route_trace::Segment::Prefix && event.layer == 8
+            })
+            .expect("prefix tail block starts");
+        assert!(
+            suffix_layer_zero < prefix_layer_eight,
+            "default K=8 must execute suffix layers 0..7 before prefix layer 8"
+        );
+        for event in &trace {
+            let (rows, terminal_k) = match event.segment {
+                segmented_route_trace::Segment::Prefix => (33, 1),
+                segmented_route_trace::Segment::Suffix => (8, 8),
+            };
+            assert_eq!(event.terminal_k_batch, terminal_k, "{event:?}");
+            if !matches!(
+                event.route,
+                segmented_route_trace::OperatorRoute::OutputHead
+            ) {
+                assert_eq!(event.m, rows, "physical segment width drift: {event:?}");
+            }
+        }
+        assert_eq!(output.prefix_logits, control_prefix_logits, "prefix logits");
+        assert_eq!(output.suffix_logits, control_suffix_logits, "suffix logits");
+        assert_buffer_bytes_eq(
+            "prefix nextn hidden",
+            &output.prefix_nextn_hidden,
+            &control_prefix_hidden,
+        );
+        assert_buffer_bytes_eq(
+            "suffix nextn hidden",
+            &output.suffix_nextn_hidden,
+            &control_suffix_hidden,
+        );
+        assert!(
+            prefix_anchor.payload_eq(&control_prefix_anchor),
+            "prefix boundary anchor payload"
+        );
+        assert_hybrid_snapshot_bytes_eq(&snapshot, &control_snapshot);
+    }
+
+    #[test]
+    fn block_segmented_seals_warm_mtp_anchor_and_preserves_peer() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let cfg = super::super::mtp::tests::tiny_nonzero_mtp_cfg();
+        let mut model = deterministic_dense_model(cfg.clone());
+        model.ensure_gpu_cache_primed().expect("prime target cache");
+        let (_, mtp) = model
+            .with_gpu_cache_mut(|device, _registry| {
+                Ok(super::super::mtp::tests::load_tiny_nonzero_mtp_fixture(
+                    device,
+                ))
+            })
+            .expect("load nonzero MTP fixture on target device");
+        model.mtp = Some(mtp);
+        let (mut control, mut segmented) = model
+            .with_gpu_cache_mut(|device, _registry| {
+                Ok((
+                    HybridKvCache::new_with_options(&cfg, device, 96, 2, false)?,
+                    HybridKvCache::new_with_options(&cfg, device, 96, 2, false)?,
+                ))
+            })
+            .expect("two MTP caches");
+
+        let entry_tokens = [3_u32, 5, 7];
+        let entry_positions = positions_to_flat(&text_positions(entry_tokens.len() as u32));
+        let (_, control_entry_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                &entry_tokens,
+                &entry_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("control warm target");
+        let control_pending = process_test_mtp_batch(
+            &model,
+            &entry_tokens,
+            None,
+            &control_entry_hidden,
+            &entry_positions,
+            &mut control,
+            SlotId(0),
+        );
+        let (_, segmented_entry_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                &entry_tokens,
+                &entry_positions,
+                &mut segmented,
+                SlotId(0),
+            )
+            .expect("segmented warm target");
+        let segmented_pending = process_test_mtp_batch(
+            &model,
+            &entry_tokens,
+            None,
+            &segmented_entry_hidden,
+            &entry_positions,
+            &mut segmented,
+            SlotId(0),
+        );
+
+        let peer_tokens = [11_u32, 13, 17];
+        let peer_positions = positions_to_flat(&text_positions(peer_tokens.len() as u32));
+        let (_, peer_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                &peer_tokens,
+                &peer_positions,
+                &mut segmented,
+                SlotId(1),
+            )
+            .expect("warm peer target");
+        let _peer_pending = process_test_mtp_batch(
+            &model,
+            &peer_tokens,
+            None,
+            &peer_hidden,
+            &peer_positions,
+            &mut segmented,
+            SlotId(1),
+        );
+        let peer_before = physical_slot_bytes(&segmented, SlotId(1));
+
+        let tokens: Vec<u32> = (0..41).map(|index| (index % 31 + 19) as u32).collect();
+        let prefix_positions = positions_to_flat(
+            &(3..36)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+        let suffix_positions = positions_to_flat(
+            &(36..44)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+        let (control_prefix_logits, control_prefix_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                &tokens[..33],
+                &prefix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("control prefix target");
+        let control_prefix_pending = process_test_mtp_batch(
+            &model,
+            &tokens[..33],
+            Some(&control_pending),
+            &control_prefix_hidden,
+            &prefix_positions,
+            &mut control,
+            SlotId(0),
+        );
+        let control_anchor = control
+            .snapshot_slot_anchor(SlotId(0), 36)
+            .expect("control prefix anchor");
+        let (control_suffix_logits, control_suffix_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                &tokens[33..],
+                &suffix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("control suffix target");
+        let control_suffix_pending = process_test_mtp_batch(
+            &model,
+            &tokens[33..],
+            Some(&control_prefix_pending),
+            &control_suffix_hidden,
+            &suffix_positions,
+            &mut control,
+            SlotId(0),
+        );
+
+        segmented_route_trace::begin();
+        let output = model
+            .forward_gpu_stable_boundary_compound(
+                &tokens[..33],
+                &prefix_positions,
+                &tokens[33..],
+                &suffix_positions,
+                Some(&segmented_pending),
+                true,
+                &mut segmented,
+                SlotId(0),
+            )
+            .expect("sealed warm MTP compound");
+        let trace = segmented_route_trace::finish();
+
+        let planned_transient = (tokens.len() * 2 * cfg.hidden_size as usize
+            + cfg.vocab_size as usize
+            + cfg.hidden_size as usize)
+            * std::mem::size_of::<f32>();
+        assert!(
+            output.incremental_owned_peak_bytes <= planned_transient as u64,
+            "measured compound incremental owned peak {} exceeded checked shape plan {planned_transient}",
+            output.incremental_owned_peak_bytes,
+        );
+
+        assert_eq!(output.prefix_logits, control_prefix_logits, "prefix logits");
+        assert_eq!(output.suffix_logits, control_suffix_logits, "suffix logits");
+        assert_buffer_bytes_eq(
+            "prefix pending hidden",
+            output
+                .prefix_pending_hidden
+                .as_ref()
+                .expect("prefix pending"),
+            &control_prefix_pending,
+        );
+        assert_buffer_bytes_eq(
+            "suffix pending hidden",
+            output
+                .suffix_pending_hidden
+                .as_ref()
+                .expect("suffix pending"),
+            &control_suffix_pending,
+        );
+        assert!(
+            output.prefix_anchor.payload_eq(&control_anchor),
+            "sealed prefix anchor payload"
+        );
+        assert_eq!(
+            physical_slot_bytes(&segmented, SlotId(0)),
+            physical_slot_bytes(&control, SlotId(0)),
+            "sealed target+MTP final state",
+        );
+        assert_eq!(
+            physical_slot_bytes(&segmented, SlotId(1)),
+            peer_before,
+            "sealed compound changed warm peer bytes",
+        );
+        segmented
+            .validate_speculative_cursors_for_slot(SlotId(0), 44)
+            .expect("sealed target/MTP final cursor equality");
+        let mtp = control.mtp_slot.as_ref().expect("control MTP slot");
+        let mtp_k = mtp
+            .k
+            .as_ref()
+            .expect("F32 MTP K")
+            .as_slice::<f32>()
+            .expect("MTP K bytes");
+        let per_slot = mtp_k.len() / control.n_seqs as usize;
+        assert!(
+            mtp_k[..per_slot].iter().any(|value| value.abs() > 1e-8),
+            "nonzero MTP fixture must write nonzero K payload"
+        );
+        let mtp_v = mtp
+            .v
+            .as_ref()
+            .expect("F32 MTP V")
+            .as_slice::<f32>()
+            .expect("MTP V bytes");
+        assert!(
+            mtp_v[..per_slot].iter().any(|value| value.abs() > 1e-8),
+            "nonzero MTP fixture must write nonzero V payload"
+        );
+        let mtp_events: Vec<_> = trace
+            .iter()
+            .filter(|event| event.route == segmented_route_trace::OperatorRoute::MtpProcessTarget)
+            .copied()
+            .collect();
+        assert_eq!(mtp_events.len(), 2, "prefix+suffix MTP dispatch receipts");
+        assert_eq!(
+            (
+                mtp_events[0].segment,
+                mtp_events[0].m,
+                mtp_events[0].entry_cursor
+            ),
+            (segmented_route_trace::Segment::Prefix, 33, 3)
+        );
+        assert_eq!(
+            (
+                mtp_events[1].segment,
+                mtp_events[1].m,
+                mtp_events[1].entry_cursor
+            ),
+            (segmented_route_trace::Segment::Suffix, 8, 36)
+        );
+
+        // Policy-OFF on an MTP-capable artifact advances only target state.
+        // The independent MTP cursor must remain byte-for-byte unchanged and
+        // the returned checkpoint must carry no speculative semantic row.
+        let off_tokens = [41_u32, 43, 47, 53, 59, 61, 63];
+        let off_prefix_positions = positions_to_flat(
+            &(44..49)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+        let off_suffix_positions = positions_to_flat(
+            &(49..51)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+        let (off_control_prefix_logits, _) = model
+            .forward_gpu_last_logits_with_hidden(
+                &off_tokens[..5],
+                &off_prefix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("policy-OFF control prefix");
+        let off_control_anchor = control
+            .snapshot_slot_anchor(SlotId(0), 49)
+            .expect("policy-OFF control anchor");
+        let (off_control_suffix_logits, _) = model
+            .forward_gpu_last_logits_with_hidden(
+                &off_tokens[5..],
+                &off_suffix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("policy-OFF control suffix");
+        let off_output = model
+            .forward_gpu_stable_boundary_compound(
+                &off_tokens[..5],
+                &off_prefix_positions,
+                &off_tokens[5..],
+                &off_suffix_positions,
+                None,
+                false,
+                &mut segmented,
+                SlotId(0),
+            )
+            .expect("policy-OFF compound");
+        assert_eq!(off_output.prefix_logits, off_control_prefix_logits);
+        assert_eq!(off_output.suffix_logits, off_control_suffix_logits);
+        assert!(off_output.prefix_pending_hidden.is_none());
+        assert!(off_output.suffix_pending_hidden.is_none());
+        assert!(off_output.prefix_anchor.payload_eq(&off_control_anchor));
+        assert_eq!(
+            physical_slot_bytes(&segmented, SlotId(0)),
+            physical_slot_bytes(&control, SlotId(0)),
+            "policy-OFF target final state and unchanged MTP state",
+        );
+        assert_eq!(
+            segmented.mtp_slot.as_ref().expect("MTP slot").current_len[0],
+            44,
+            "policy-OFF compound must not advance independent MTP cursor",
+        );
+        assert_eq!(
+            physical_slot_bytes(&segmented, SlotId(1)),
+            peer_before,
+            "policy-OFF compound changed warm peer bytes",
+        );
+    }
+
+    #[test]
+    fn block_segmented_public_compound_failpoints_reset_target_and_preserve_peer() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use segmented_route_trace::CompoundSemanticFault;
+
+        let cfg = super::super::mtp::tests::tiny_nonzero_mtp_cfg();
+        let mut model = deterministic_dense_model(cfg.clone());
+        model.ensure_gpu_cache_primed().expect("prime target cache");
+        let (_, mtp) = model
+            .with_gpu_cache_mut(|device, _registry| {
+                Ok(super::super::mtp::tests::load_tiny_nonzero_mtp_fixture(
+                    device,
+                ))
+            })
+            .expect("load nonzero MTP fixture");
+        model.mtp = Some(mtp);
+
+        for fault in [
+            CompoundSemanticFault::AfterPrefixMtp,
+            CompoundSemanticFault::AfterSuffixMtp,
+            CompoundSemanticFault::BeforeSnapshot,
+        ] {
+            let mut cache = model
+                .with_gpu_cache_mut(|device, _registry| {
+                    HybridKvCache::new_with_options(&cfg, device, 64, 2, false)
+                })
+                .expect("two-slot cache");
+            let peer_tokens = [11_u32, 13, 17];
+            let peer_positions = positions_to_flat(&text_positions(peer_tokens.len() as u32));
+            let (_, peer_hidden) = model
+                .forward_gpu_last_logits_with_hidden(
+                    &peer_tokens,
+                    &peer_positions,
+                    &mut cache,
+                    SlotId(1),
+                )
+                .expect("peer target");
+            let _peer_pending = process_test_mtp_batch(
+                &model,
+                &peer_tokens,
+                None,
+                &peer_hidden,
+                &peer_positions,
+                &mut cache,
+                SlotId(1),
+            );
+            let peer_before = physical_slot_bytes(&cache, SlotId(1));
+
+            let tokens = [19_u32, 23, 29, 31, 37, 41, 43];
+            let prefix_positions = positions_to_flat(&text_positions(5));
+            let suffix_positions = positions_to_flat(
+                &(5..7)
+                    .map(|position| [position, position, position, position])
+                    .collect::<Vec<_>>(),
+            );
+            segmented_route_trace::begin();
+            segmented_route_trace::inject_semantic_fault(fault);
+            let error = model
+                .forward_gpu_stable_boundary_compound(
+                    &tokens[..5],
+                    &prefix_positions,
+                    &tokens[5..],
+                    &suffix_positions,
+                    None,
+                    true,
+                    &mut cache,
+                    SlotId(0),
+                )
+                .expect_err("public compound semantic fault must surface");
+            let _trace = segmented_route_trace::finish();
+            assert!(format!("{error:#}").contains("injected stable-boundary"));
+            assert_eq!(cache.seq_len(SlotId(0)).expect("target cursor"), 0);
+            assert_eq!(
+                cache.mtp_slot.as_ref().expect("MTP slot").current_len[0],
+                0,
+                "MTP cursor survived {fault:?}"
+            );
+            assert_eq!(
+                physical_slot_bytes(&cache, SlotId(1)),
+                peer_before,
+                "peer bytes changed after {fault:?}"
+            );
+            for linear in &cache.linear_attn {
+                for buffer in [
+                    &linear.conv_state,
+                    &linear.conv_state_scratch,
+                    &linear.recurrent,
+                    &linear.recurrent_scratch,
+                ] {
+                    let bytes = buffer.as_slice::<u8>().expect("linear state bytes");
+                    let per_slot = bytes.len() / cache.n_seqs as usize;
+                    assert!(
+                        bytes[..per_slot].iter().all(|byte| *byte == 0),
+                        "target recurrent state survived {fault:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires HF2Q_TEST_QWEN38_GGUF and an exclusive Apple-Silicon model gate"]
+    fn block_segmented_native_qwen38_artifact_matches_sequential_control() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let artifact_format =
+            std::env::var("HF2Q_TEST_QWEN38_FORMAT").expect("HF2Q_TEST_QWEN38_FORMAT is required");
+        let path = std::path::PathBuf::from(
+            std::env::var_os("HF2Q_TEST_QWEN38_GGUF").expect("HF2Q_TEST_QWEN38_GGUF is required"),
+        );
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open Qwen3.8 artifact");
+        let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .expect("load native Qwen3.8 artifact");
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        let (expected_file_type, expected_primary_type, expected_output_type) =
+            match artifact_format.as_str() {
+                "BF16" => (32, GgmlType::BF16, GgmlType::BF16),
+                "Q4_K_M" => (15, GgmlType::Q4_K, GgmlType::Q6_K),
+                "Q5_K_M" => (17, GgmlType::Q5_K, GgmlType::Q6_K),
+                "Q6_K" => (18, GgmlType::Q6_K, GgmlType::Q6_K),
+                "Q8_0" => (7, GgmlType::Q8_0, GgmlType::Q8_0),
+                other => panic!(
+                    "unsupported HF2Q_TEST_QWEN38_FORMAT={other}; expected BF16, Q4_K_M, Q5_K_M, Q6_K, or Q8_0"
+                ),
+            };
+        assert_eq!(
+            gguf.metadata_u32("general.file_type"),
+            Some(expected_file_type),
+            "segmented gate loaded the wrong {artifact_format} GGUF file type",
+        );
+        assert!(model.token_embd.is_empty(), "native embedding was expanded");
+        assert!(
+            model.output_weight.is_empty(),
+            "native output head was expanded"
+        );
+        assert_eq!(
+            model
+                .token_embd_native
+                .as_ref()
+                .expect("native token embedding")
+                .info
+                .ggml_dtype,
+            expected_primary_type,
+        );
+        assert_eq!(
+            model
+                .output_weight_native
+                .as_ref()
+                .expect("native output head")
+                .info
+                .ggml_dtype,
+            expected_output_type,
+            "{artifact_format} compound must execute the artifact's native output head",
+        );
+        assert!(model.mtp.is_some(), "Qwen3.8 artifact requires native MTP");
+        model.ensure_gpu_cache_primed().expect("prime native model");
+        let (mut control, mut segmented) = model
+            .with_gpu_cache_mut(|device, _registry| {
+                Ok((
+                    HybridKvCache::new_with_options(&model.cfg, device, 64, 2, true)?,
+                    HybridKvCache::new_with_options(&model.cfg, device, 64, 2, true)?,
+                ))
+            })
+            .expect("native Qwen3.8 caches");
+        let seed = [151_643_u32, 9707, 374, 279, 15];
+        let tokens: Vec<u32> = (0..41).map(|index| seed[index % seed.len()]).collect();
+        let prefix_positions = positions_to_flat(&text_positions(33));
+        let suffix_positions = positions_to_flat(
+            &(33..41)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+
+        let (control_prefix_logits, control_prefix_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                &tokens[..33],
+                &prefix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("native control prefix");
+        let control_prefix_pending = process_test_mtp_batch(
+            &model,
+            &tokens[..33],
+            None,
+            &control_prefix_hidden,
+            &prefix_positions,
+            &mut control,
+            SlotId(0),
+        );
+        let control_anchor = control
+            .snapshot_slot_anchor(SlotId(0), 33)
+            .expect("native control anchor");
+        let (control_suffix_logits, control_suffix_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                &tokens[33..],
+                &suffix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("native control suffix");
+        let control_suffix_pending = process_test_mtp_batch(
+            &model,
+            &tokens[33..],
+            Some(&control_prefix_pending),
+            &control_suffix_hidden,
+            &suffix_positions,
+            &mut control,
+            SlotId(0),
+        );
+
+        mlx_native::reset_pipeline_dispatch_buckets();
+        let output = model
+            .forward_gpu_stable_boundary_compound(
+                &tokens[..33],
+                &prefix_positions,
+                &tokens[33..],
+                &suffix_positions,
+                None,
+                true,
+                &mut segmented,
+                SlotId(0),
+            )
+            .expect("native Qwen3.8 compound");
+        let buckets = mlx_native::pipeline_dispatch_buckets();
+        if artifact_format != "BF16" {
+            let expected_labels: &[&str] = match artifact_format.as_str() {
+                "Q4_K_M" => &["q4_K", "q6_K"],
+                "Q5_K_M" => &["q5_K", "q6_K"],
+                "Q6_K" => &["q6_K"],
+                "Q8_0" => &["q8_0"],
+                _ => unreachable!(),
+            };
+            assert!(
+                buckets.iter().any(|(label, count)| {
+                    *count > 0 && expected_labels.iter().any(|kind| label.contains(kind))
+                }),
+                "native {artifact_format} compound did not execute its quantized projection kernels: {buckets:?}",
+            );
+        }
+        assert_eq!(output.prefix_logits, control_prefix_logits);
+        assert_eq!(output.suffix_logits, control_suffix_logits);
+        assert_buffer_bytes_eq(
+            "native prefix MTP pending",
+            output
+                .prefix_pending_hidden
+                .as_ref()
+                .expect("prefix pending"),
+            &control_prefix_pending,
+        );
+        assert_buffer_bytes_eq(
+            "native suffix MTP pending",
+            output
+                .suffix_pending_hidden
+                .as_ref()
+                .expect("suffix pending"),
+            &control_suffix_pending,
+        );
+        assert!(output.prefix_anchor.payload_eq(&control_anchor));
+        assert_eq!(
+            physical_slot_bytes(&segmented, SlotId(0)),
+            physical_slot_bytes(&control, SlotId(0)),
+            "native target+MTP final physical bytes",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an exact HF2Q_TEST_QWEN_FAMILY_GGUF and exclusive Apple-Silicon model gate"]
+    fn block_segmented_native_qwen_family_mtp_artifact_matches_sequential_control() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let cell = std::env::var("HF2Q_TEST_QWEN_FAMILY_CELL")
+            .expect("HF2Q_TEST_QWEN_FAMILY_CELL is required");
+        let path = std::path::PathBuf::from(
+            std::env::var_os("HF2Q_TEST_QWEN_FAMILY_GGUF")
+                .expect("HF2Q_TEST_QWEN_FAMILY_GGUF is required"),
+        );
+        let (expected_arch, expected_variant, expected_target_layers, expected_total_blocks) =
+            match cell.as_str() {
+                "qwen35-dense" => ("qwen35", Qwen35Variant::Dense, 32, 33),
+                "qwen36-dense" => ("qwen35", Qwen35Variant::Dense, 64, 65),
+                "qwen36-moe" => ("qwen35moe", Qwen35Variant::Moe, 40, 41),
+                other => panic!(
+                    "unsupported HF2Q_TEST_QWEN_FAMILY_CELL={other}; expected qwen35-dense, qwen36-dense, or qwen36-moe"
+                ),
+            };
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open Qwen family artifact");
+        assert_eq!(
+            gguf.metadata_string("general.architecture"),
+            Some(expected_arch),
+            "family cell loaded the wrong architecture",
+        );
+        assert_eq!(
+            gguf.metadata_u32("general.file_type"),
+            Some(15),
+            "family cell requires exact MOSTLY_Q4_K_M storage",
+        );
+        let cfg = Qwen35Model::load_config_only(&gguf).expect("parse family config only");
+        assert_eq!(cfg.variant, expected_variant);
+        assert_eq!(cfg.num_hidden_layers, expected_target_layers);
+        assert_eq!(cfg.mtp_num_hidden_layers, 1);
+        assert_eq!(
+            gguf.metadata_u32(&format!("{expected_arch}.block_count")),
+            Some(expected_total_blocks),
+        );
+        assert!(
+            !cfg.mtp_use_dedicated_embeddings,
+            "qualified family MTP cells share the verifier embedding/head"
+        );
+        Qwen35Model::preflight_gguf(&gguf, &cfg)
+            .expect("metadata-only family schema/native-route preflight");
+
+        let mtp_layer = cfg.num_hidden_layers;
+        let nextn = format!("blk.{mtp_layer}.nextn");
+        for name in [
+            format!("{nextn}.eh_proj.weight"),
+            format!("{nextn}.enorm.weight"),
+            format!("{nextn}.hnorm.weight"),
+            format!("{nextn}.shared_head_norm.weight"),
+            format!("blk.{mtp_layer}.attn_norm.weight"),
+            format!("blk.{mtp_layer}.post_attention_norm.weight"),
+            format!("blk.{mtp_layer}.attn_q.weight"),
+            format!("blk.{mtp_layer}.attn_k.weight"),
+            format!("blk.{mtp_layer}.attn_v.weight"),
+            format!("blk.{mtp_layer}.attn_output.weight"),
+        ] {
+            assert!(gguf.tensor_info(&name).is_some(), "missing required {name}");
+        }
+        assert!(
+            gguf.tensor_info(&format!("{nextn}.embed_tokens.weight"))
+                .is_none(),
+            "shared family cell unexpectedly carries a dedicated MTP embedding"
+        );
+        assert!(
+            gguf.tensor_info(&format!("{nextn}.shared_head_head.weight"))
+                .is_none(),
+            "shared family cell unexpectedly carries a dedicated MTP head"
+        );
+        let ffn_names: &[&str] = match expected_variant {
+            Qwen35Variant::Dense => &["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"],
+            Qwen35Variant::Moe => &[
+                "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+                "ffn_gate_inp_shexp.weight",
+                "ffn_gate_shexp.weight",
+                "ffn_up_shexp.weight",
+                "ffn_down_shexp.weight",
+            ],
+        };
+        for suffix in ffn_names {
+            let name = format!("blk.{mtp_layer}.{suffix}");
+            assert!(gguf.tensor_info(&name).is_some(), "missing required {name}");
+        }
+
+        let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .expect("load native Qwen family MTP artifact");
+        assert!(model.token_embd.is_empty(), "native embedding was expanded");
+        assert!(
+            model.output_weight.is_empty(),
+            "native output head was expanded"
+        );
+        let (main_head, main_head_source) = model
+            .resolved_native_output_head()
+            .expect("resolve native family output head")
+            .expect("native family output head");
+        assert!(
+            matches!(main_head_source, "token_embd.weight" | "output.weight"),
+            "family output head resolved from unexpected source {main_head_source}",
+        );
+        let mtp = model.mtp.as_ref().expect("native family MTP block");
+        assert!(
+            mtp.embed_tokens.is_none(),
+            "family MTP must use the shared embedding"
+        );
+        assert_eq!(mtp.shared_head_head_ggml_type, main_head.info.ggml_dtype);
+        use mlx_native::metal::foreign_types::ForeignType;
+        assert_eq!(
+            mtp.shared_head_head.metal_buffer().as_ptr(),
+            main_head.buffer.metal_buffer().as_ptr(),
+            "family MTP must borrow the exact main output-head allocation",
+        );
+        assert_eq!(
+            mtp.shared_head_head.byte_offset(),
+            main_head.buffer.byte_offset(),
+            "family MTP must borrow the exact main output-head view",
+        );
+        match expected_variant {
+            Qwen35Variant::Dense => {
+                assert!(model
+                    .layers
+                    .iter()
+                    .all(|layer| matches!(layer.ffn(), Qwen35FfnWeights::DenseQ(_))));
+                assert!(matches!(
+                    &mtp.ffn,
+                    super::super::mtp::MtpFfnWeightsGpu::DenseQ { .. }
+                ));
+            }
+            Qwen35Variant::Moe => {
+                assert!(model
+                    .layers
+                    .iter()
+                    .all(|layer| matches!(layer.ffn(), Qwen35FfnWeights::MoeQ(_))));
+                assert!(matches!(
+                    &mtp.ffn,
+                    super::super::mtp::MtpFfnWeightsGpu::Moe { .. }
+                ));
+            }
+        }
+
+        model.ensure_gpu_cache_primed().expect("prime family model");
+        let (mut control, mut segmented) = model
+            .with_gpu_cache_mut(|device, _registry| {
+                Ok((
+                    HybridKvCache::new_with_options(&model.cfg, device, 64, 2, true)?,
+                    HybridKvCache::new_with_options(&model.cfg, device, 64, 2, true)?,
+                ))
+            })
+            .expect("native family caches");
+        let seed = [151_643_u32, 9707, 374, 279, 15];
+        let tokens: Vec<u32> = (0..41).map(|index| seed[index % seed.len()]).collect();
+        let prefix_positions = positions_to_flat(&text_positions(33));
+        let suffix_positions = positions_to_flat(
+            &(33..41)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+        let (control_prefix_logits, control_prefix_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                &tokens[..33],
+                &prefix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("family control prefix");
+        let control_prefix_pending = process_test_mtp_batch(
+            &model,
+            &tokens[..33],
+            None,
+            &control_prefix_hidden,
+            &prefix_positions,
+            &mut control,
+            SlotId(0),
+        );
+        let control_anchor = control
+            .snapshot_slot_anchor(SlotId(0), 33)
+            .expect("family control anchor");
+        let (control_suffix_logits, control_suffix_hidden) = model
+            .forward_gpu_last_logits_with_hidden(
+                &tokens[33..],
+                &suffix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("family control suffix");
+        let control_suffix_pending = process_test_mtp_batch(
+            &model,
+            &tokens[33..],
+            Some(&control_prefix_pending),
+            &control_suffix_hidden,
+            &suffix_positions,
+            &mut control,
+            SlotId(0),
+        );
+
+        mlx_native::reset_pipeline_dispatch_buckets();
+        let output = model
+            .forward_gpu_stable_boundary_compound(
+                &tokens[..33],
+                &prefix_positions,
+                &tokens[33..],
+                &suffix_positions,
+                None,
+                true,
+                &mut segmented,
+                SlotId(0),
+            )
+            .expect("native family compound");
+        let buckets = mlx_native::pipeline_dispatch_buckets();
+        assert!(
+            buckets.iter().any(|(label, count)| {
+                *count > 0 && (label.contains("q4_K") || label.contains("q6_K"))
+            }),
+            "native family compound did not execute Q4_K_M projections: {buckets:?}",
+        );
+        assert_eq!(output.prefix_logits, control_prefix_logits);
+        assert_eq!(output.suffix_logits, control_suffix_logits);
+        assert_buffer_bytes_eq(
+            "family prefix MTP pending",
+            output
+                .prefix_pending_hidden
+                .as_ref()
+                .expect("prefix pending"),
+            &control_prefix_pending,
+        );
+        assert_buffer_bytes_eq(
+            "family suffix MTP pending",
+            output
+                .suffix_pending_hidden
+                .as_ref()
+                .expect("suffix pending"),
+            &control_suffix_pending,
+        );
+        assert!(output.prefix_anchor.payload_eq(&control_anchor));
+        assert_eq!(
+            physical_slot_bytes(&segmented, SlotId(0)),
+            physical_slot_bytes(&control, SlotId(0)),
+            "native family target+MTP final physical bytes",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires HF2Q_TEST_QWEN36_GGUF and an exclusive Apple-Silicon model gate"]
+    fn block_segmented_native_qwen36_moe_artifact_matches_sequential_control() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let path = std::path::PathBuf::from(
+            std::env::var_os("HF2Q_TEST_QWEN36_GGUF").expect("HF2Q_TEST_QWEN36_GGUF is required"),
+        );
+        let gguf = mlx_native::gguf::GgufFile::open(&path).expect("open Qwen3.6 artifact");
+        let mut progress = crate::serve::header::LoadProgress::new(false, 1, 0);
+        let model = Qwen35Model::load_from_gguf(&gguf, &mut progress)
+            .expect("load native Qwen3.6 artifact");
+        assert_eq!(model.cfg.variant, Qwen35Variant::Moe);
+        assert!(
+            model.mtp.is_none(),
+            "qualified Qwen3.6 artifact has no MTP block"
+        );
+        assert!(
+            model
+                .layers
+                .iter()
+                .all(|layer| matches!(layer.ffn(), Qwen35FfnWeights::MoeQ(_))),
+            "Qwen3.6 proof requires native quantized MoE FFNs",
+        );
+        model.ensure_gpu_cache_primed().expect("prime native model");
+        let (mut control, mut segmented) = model
+            .with_gpu_cache_mut(|device, _registry| {
+                Ok((
+                    HybridKvCache::new_with_options(&model.cfg, device, 64, 2, true)?,
+                    HybridKvCache::new_with_options(&model.cfg, device, 64, 2, true)?,
+                ))
+            })
+            .expect("native Qwen3.6 caches");
+        let seed = [151_643_u32, 9707, 374, 279, 15];
+        let tokens: Vec<u32> = (0..41).map(|index| seed[index % seed.len()]).collect();
+        let prefix_positions = positions_to_flat(&text_positions(33));
+        let suffix_positions = positions_to_flat(
+            &(33..41)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+        let (control_prefix_logits, _) = model
+            .forward_gpu_last_logits_with_hidden(
+                &tokens[..33],
+                &prefix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("native Qwen3.6 control prefix");
+        let control_anchor = control
+            .snapshot_slot_anchor(SlotId(0), 33)
+            .expect("native Qwen3.6 control anchor");
+        let (control_suffix_logits, _) = model
+            .forward_gpu_last_logits_with_hidden(
+                &tokens[33..],
+                &suffix_positions,
+                &mut control,
+                SlotId(0),
+            )
+            .expect("native Qwen3.6 control suffix");
+        mlx_native::reset_pipeline_dispatch_buckets();
+        let output = model
+            .forward_gpu_stable_boundary_compound(
+                &tokens[..33],
+                &prefix_positions,
+                &tokens[33..],
+                &suffix_positions,
+                None,
+                false,
+                &mut segmented,
+                SlotId(0),
+            )
+            .expect("native Qwen3.6 compound");
+        let buckets = mlx_native::pipeline_dispatch_buckets();
+        assert!(
+            buckets.iter().any(|(label, count)| {
+                *count > 0 && (label.contains("q5_K") || label.contains("q6_K"))
+            }),
+            "native Qwen3.6 compound did not execute K-quant projections: {buckets:?}",
+        );
+        assert_eq!(output.prefix_logits, control_prefix_logits);
+        assert_eq!(output.suffix_logits, control_suffix_logits);
+        assert!(output.prefix_pending_hidden.is_none());
+        assert!(output.suffix_pending_hidden.is_none());
+        assert!(output.prefix_anchor.payload_eq(&control_anchor));
+        assert_eq!(
+            physical_slot_bytes(&segmented, SlotId(0)),
+            physical_slot_bytes(&control, SlotId(0)),
+            "native Qwen3.6 target final physical bytes",
+        );
+    }
+
+    #[test]
+    fn block_segmented_target_preserves_warm_peer_slot_bytes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let cfg = physical_batch_hybrid_cfg();
+        let model = deterministic_dense_model(cfg.clone());
+        let device = MlxDevice::new().expect("Metal device");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, 64, 2, true)
+            .expect("two-slot cold-TQ cache");
+
+        let peer_tokens = [91_u32, 92, 93];
+        let peer_positions = positions_to_flat(&text_positions(peer_tokens.len() as u32));
+        model
+            .forward_gpu_last_logits(&peer_tokens, &peer_positions, &mut cache, SlotId(1))
+            .expect("warm peer slot");
+        let peer_before = physical_slot_bytes(&cache, SlotId(1));
+
+        let tokens: Vec<u32> = (0..41).map(|index| (index % 127 + 1) as u32).collect();
+        let prefix_positions = positions_to_flat(&text_positions(33));
+        let suffix_positions = positions_to_flat(
+            &(33..41)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+        let mut output = model
+            .forward_gpu_two_segment_last_logits_with_hidden(
+                &tokens[..33],
+                &prefix_positions,
+                &tokens[33..],
+                &suffix_positions,
+                &mut cache,
+                SlotId(0),
+            )
+            .expect("two-slot segmented target");
+        cache
+            .record_mtp_segment_boundary(&mut output.boundary_receipt)
+            .expect("explicit non-MTP boundary");
+        cache
+            .snapshot_slot_anchor_from_segment_boundary(SlotId(0), output.boundary_receipt)
+            .expect("slot-zero segmented anchor");
+
+        assert_eq!(
+            physical_slot_bytes(&cache, SlotId(1)),
+            peer_before,
+            "segmented slot-zero execution changed warm peer physical bytes"
+        );
+        assert_eq!(cache.full_attn[0].current_len, vec![41, 3]);
+    }
+
+    #[test]
+    fn block_segmented_dispatch_width_canary_hard_resets_only_target_slot() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let cfg = physical_batch_hybrid_nine_layer_cfg();
+        let model = deterministic_dense_model(cfg.clone());
+        let device = MlxDevice::new().expect("Metal device");
+        let mut cache = HybridKvCache::new_with_options(&cfg, &device, 64, 2, true)
+            .expect("two-slot cold-TQ cache");
+
+        let peer_tokens = [101_u32, 102, 103];
+        let peer_positions = positions_to_flat(&text_positions(peer_tokens.len() as u32));
+        model
+            .forward_gpu_last_logits(&peer_tokens, &peer_positions, &mut cache, SlotId(1))
+            .expect("warm peer slot");
+        let peer_before = physical_slot_bytes(&cache, SlotId(1));
+
+        let tokens: Vec<u32> = (0..41).map(|index| (index % 127 + 1) as u32).collect();
+        let prefix_positions = positions_to_flat(&text_positions(33));
+        let suffix_positions = positions_to_flat(
+            &(33..41)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+        segmented_route_trace::begin();
+        segmented_route_trace::inject_row_fault(
+            segmented_route_trace::Segment::Suffix,
+            4,
+            segmented_route_trace::OperatorRoute::DenseFfnGateUp,
+            41,
+        );
+        let result = model.forward_gpu_two_segment_last_logits_with_hidden(
+            &tokens[..33],
+            &prefix_positions,
+            &tokens[33..],
+            &suffix_positions,
+            &mut cache,
+            SlotId(0),
+        );
+        let _trace = segmented_route_trace::finish();
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("compound target must surface injected mid-stack failure"),
+        };
+        assert!(
+            format!("{error:#}").contains("physical M=8, attempted enclosing M=41"),
+            "width canary must fail before unsafe dispatch: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("affected slot hard-reset"),
+            "compound failure must prove its internal fail-closed reset: {error:#}"
+        );
+
+        assert_eq!(
+            physical_slot_bytes(&cache, SlotId(1)),
+            peer_before,
+            "target failure/reset changed warm peer physical bytes"
+        );
+        for full in &cache.full_attn {
+            assert_eq!(full.current_len, vec![0, 3]);
+        }
+        for linear in &cache.linear_attn {
+            assert!(!linear.pp_flipped[0], "target parity must be canonical");
+            for buffer in [
+                &linear.conv_state,
+                &linear.conv_state_scratch,
+                &linear.recurrent,
+                &linear.recurrent_scratch,
+            ] {
+                let bytes = buffer.as_slice::<u8>().expect("linear state bytes");
+                let per_slot = bytes.len() / cache.n_seqs as usize;
+                assert!(
+                    bytes[..per_slot].iter().all(|byte| *byte == 0),
+                    "target linear state must be zero after hard reset"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn block_segmented_anchor_rejects_three_suffix_advances() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let cfg = physical_batch_hybrid_cfg();
+        let model = deterministic_dense_model(cfg.clone());
+        let device = MlxDevice::new().expect("Metal device");
+        let mut cache =
+            HybridKvCache::new_with_options(&cfg, &device, 64, 1, true).expect("cold-TQ cache");
+        let tokens: Vec<u32> = (0..41).map(|index| (index % 127 + 1) as u32).collect();
+        let prefix_positions = positions_to_flat(&text_positions(33));
+        let suffix_positions = positions_to_flat(
+            &(33..41)
+                .map(|position| [position, position, position, position])
+                .collect::<Vec<_>>(),
+        );
+        let mut output = model
+            .forward_gpu_two_segment_last_logits_with_hidden(
+                &tokens[..33],
+                &prefix_positions,
+                &tokens[33..],
+                &suffix_positions,
+                &mut cache,
+                SlotId(0),
+            )
+            .expect("segmented target");
+        cache
+            .record_mtp_segment_boundary(&mut output.boundary_receipt)
+            .expect("explicit non-MTP boundary");
+
+        // Two additional completed-write transitions preserve the same odd
+        // parity delta as one suffix write. Generation is the non-vacuous
+        // proof that the inactive buffer still owns the prefix boundary.
+        for linear in &mut cache.linear_attn {
+            linear.swap_for_slot(SlotId(0));
+            linear.swap_for_slot(SlotId(0));
+        }
+        let error = cache
+            .snapshot_slot_anchor_from_segment_boundary(SlotId(0), output.boundary_receipt)
+            .expect_err("three suffix advances must invalidate the boundary receipt");
+        assert!(
+            format!("{error:#}").contains("exactly-one-write generation"),
+            "generation canary must name the failed invariant: {error:#}"
+        );
+    }
+
+    fn physical_batch_hybrid_moe_cfg() -> Qwen35Config {
+        let mut cfg = physical_batch_hybrid_cfg();
+        cfg.variant = Qwen35Variant::Moe;
+        cfg.intermediate_size = None;
+        cfg.moe = Some(Qwen35MoeConfig {
+            moe_intermediate_size: 32,
+            num_experts: 16,
+            num_experts_per_tok: 8,
+            shared_expert_intermediate_size: 32,
+        });
+        cfg
+    }
+
+    /// Build a small native-GGML MoE fixture for this GPU test only.
+    /// Production inference loads the artifact's declared expert buffers
+    /// unchanged; it never enters this synthetic helper.
+    fn quantize_test_moe_experts_to_q8_0(
+        mut model: Qwen35Model,
+        device: &MlxDevice,
+    ) -> Qwen35Model {
+        use super::super::in_memory_loader::quantize_f32_to_q8_0_buffer;
+        use super::super::weight_loader::MoeFfnWeightsQ;
+
+        let cfg = model.cfg.clone();
+        let moe = cfg.moe.as_ref().expect("MoE config");
+        let ne = moe.num_experts as usize;
+        let m = moe.moe_intermediate_size as usize;
+        let m_shared = moe.shared_expert_intermediate_size as usize;
+        let h = cfg.hidden_size as usize;
+        let owned_f32 = |values: &[f32], rows: usize, cols: usize| {
+            crate::serve::forward_mlx_shared::MlxQWeight::from_test_buffer(
+                upload_f32(values, device).expect("upload synthetic MoE matrix"),
+                GgmlType::F32,
+                rows,
+                cols,
+            )
+        };
+        for layer in &mut model.layers {
+            let quantized = match layer.ffn() {
+                Qwen35FfnWeights::Moe(weights) => MoeFfnWeightsQ {
+                    router: owned_f32(&weights.router, ne, h),
+                    expert_gate_q: quantize_f32_to_q8_0_buffer(
+                        &weights.expert_gate,
+                        vec![ne, m, h],
+                        device,
+                    )
+                    .expect("quantize test expert gate"),
+                    expert_up_q: quantize_f32_to_q8_0_buffer(
+                        &weights.expert_up,
+                        vec![ne, m, h],
+                        device,
+                    )
+                    .expect("quantize test expert up"),
+                    expert_down_q: quantize_f32_to_q8_0_buffer(
+                        &weights.expert_down,
+                        vec![ne, h, m],
+                        device,
+                    )
+                    .expect("quantize test expert down"),
+                    ggml_type_gate: GgmlType::Q8_0,
+                    ggml_type_up: GgmlType::Q8_0,
+                    ggml_type_down: GgmlType::Q8_0,
+                    shared_gate_logit: owned_f32(&weights.shared_gate_logit, 1, h),
+                    shared_gate: owned_f32(&weights.shared_gate, m_shared, h),
+                    shared_up: owned_f32(&weights.shared_up, m_shared, h),
+                    shared_down: owned_f32(&weights.shared_down, h, m_shared),
+                    expert_gate_affine: None,
+                    expert_up_affine: None,
+                    expert_down_affine: None,
+                },
+                other => panic!(
+                    "expected synthetic F32 MoE weights, got {}",
+                    other.variant()
+                ),
+            };
+            *layer.ffn_mut() = Qwen35FfnWeights::MoeQ(quantized);
+        }
+        model
+    }
+
+    #[test]
+    fn qwen35moe_router_ties_choose_lowest_experts_for_every_batch_row() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        use mlx_native::ops::moe_softmax_topk::{dispatch_moe_softmax_topk, register};
+
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        const N_TOKENS: usize = 4;
+        const N_EXPERTS: usize = 16;
+        const TOP_K: usize = 8;
+        let logits =
+            upload_f32(&vec![0.0; N_TOKENS * N_EXPERTS], &device).expect("equal router logits");
+        let ids = device
+            .alloc_buffer(
+                N_TOKENS * TOP_K * std::mem::size_of::<u32>(),
+                DType::U32,
+                vec![N_TOKENS, TOP_K],
+            )
+            .expect("router ids");
+        let weights = device
+            .alloc_buffer(
+                N_TOKENS * TOP_K * std::mem::size_of::<f32>(),
+                DType::F32,
+                vec![N_TOKENS, TOP_K],
+            )
+            .expect("router weights");
+        let mut registry = KernelRegistry::new();
+        register(&mut registry);
+        let mut enc = device.command_encoder().expect("router encoder");
+        dispatch_moe_softmax_topk(
+            &mut enc,
+            &mut registry,
+            &device,
+            &logits,
+            &ids,
+            &weights,
+            N_TOKENS as u32,
+            N_EXPERTS as u32,
+            TOP_K as u32,
+        )
+        .expect("router dispatch");
+        enc.commit_and_wait_labeled("test.qwen35moe.lowest-index-ties")
+            .expect("router completion");
+
+        let ids = ids.as_slice::<u32>().expect("router ids readable");
+        let weights = weights.as_slice::<f32>().expect("router weights readable");
+        for row in 0..N_TOKENS {
+            assert_eq!(
+                &ids[row * TOP_K..(row + 1) * TOP_K],
+                &(0..TOP_K as u32).collect::<Vec<_>>(),
+                "router tie order changed in row {row}"
+            );
+            for &weight in &weights[row * TOP_K..(row + 1) * TOP_K] {
+                assert!((weight - 1.0 / TOP_K as f32).abs() <= f32::EPSILON);
+            }
+        }
+    }
+
+    #[test]
+    fn qwen35moe_physical_widths_match_scalar_and_keep_three_id_projections_per_layer() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let Ok(device) = MlxDevice::new() else {
+            return;
+        };
+        let cfg = physical_batch_hybrid_moe_cfg();
+        let unquantized = deterministic_dense_model(cfg.clone());
+        let admission_cache =
+            HybridKvCache::new_with_options(&cfg, &device, 32, 2, true).expect("admission cache");
+        assert!(
+            !unquantized
+                .can_forward_gpu_greedy_multi_slot(&admission_cache, &[SlotId(0), SlotId(1)]),
+            "synthetic F32 MoE must remain on its parity-only scalar path"
+        );
+        let mut model = quantize_test_moe_experts_to_q8_0(unquantized, &device);
+        // Keep the greedy head deliberately margin-stable so the test proves
+        // the physical body through its live cache state instead of turning a
+        // one-ULP logit near-tie into a spurious token mismatch. Equal logits
+        // have the same lowest-index contract as the router test above.
+        model.output_weight.fill(0.0);
+
+        // N=1 pins the established scalar contract. Every physical width pins
+        // scheduler admission ramps, including the M=8→9 projection boundary;
+        // the call-count assertion fails if any width regresses to a loop.
+        for width in 1_usize..=16 {
+            let slot_ids: Vec<SlotId> = (0..width as u32).map(SlotId).collect();
+            let initial: Vec<u32> = (0..width as u32)
+                .map(|row| 3 + (row * 7) % (cfg.vocab_size - 3))
+                .collect();
+            let mut scalar_cache =
+                HybridKvCache::new_with_options(&cfg, &device, 32, width as u32, true)
+                    .expect("scalar MoE TQ cache");
+            let mut scalar_inputs = initial.clone();
+            let mut scalar_steps = Vec::new();
+            for position in 0..2_i32 {
+                let mut predicted = Vec::with_capacity(width);
+                for row in 0..width {
+                    predicted.push(
+                        model
+                            .forward_gpu_greedy(
+                                &[scalar_inputs[row]],
+                                &[position; 4],
+                                &mut scalar_cache,
+                                slot_ids[row],
+                            )
+                            .expect("independent scalar MoE target"),
+                    );
+                }
+                scalar_inputs.clone_from(&predicted);
+                scalar_steps.push(predicted);
+            }
+
+            let mut batch_cache =
+                HybridKvCache::new_with_options(&cfg, &device, 32, width as u32, true)
+                    .expect("physical MoE TQ cache");
+            if width > 1 {
+                assert!(model.can_forward_gpu_greedy_multi_slot(&batch_cache, &slot_ids));
+            }
+            let mut batch_inputs = initial;
+            for position in 0..2_i32 {
+                let positions = vec![position; 4 * width];
+                super::super::gpu_ffn::reset_test_moe_id_projection_calls();
+                let predicted = model
+                    .forward_gpu_greedy_multi_slot(
+                        &batch_inputs,
+                        &positions,
+                        &mut batch_cache,
+                        &slot_ids,
+                    )
+                    .expect("physical width-N MoE target");
+                assert_eq!(
+                    predicted, scalar_steps[position as usize],
+                    "physical MoE width {width} diverged at decode position {position}"
+                );
+                assert!(
+                    predicted.iter().all(|&token| token == 0),
+                    "equal output logits must choose the lowest token index"
+                );
+                assert_eq!(
+                    super::super::gpu_ffn::test_moe_id_projection_calls(),
+                    3 * cfg.num_hidden_layers as u64,
+                    "physical MoE width {width} introduced per-expert host dispatches"
+                );
+                batch_inputs = predicted;
+            }
+
+            for (scalar, physical) in scalar_cache.full_attn.iter().zip(&batch_cache.full_attn) {
+                assert_eq!(scalar.current_len, physical.current_len);
+            }
+            let mut registry = KernelRegistry::new();
+            for (layer, (scalar, physical)) in scalar_cache
+                .full_attn
+                .iter()
+                .zip(&batch_cache.full_attn)
+                .enumerate()
+            {
+                for slot_id in slot_ids.iter().copied() {
+                    for (label, is_k) in [("K", true), ("V", false)] {
+                        let mut enc = device.command_encoder().expect("TQ compare encoder");
+                        let scalar_values = scalar
+                            .dequant_seq_to_temp_f32_unrotated_for_slot(
+                                is_k,
+                                2,
+                                0,
+                                scalar_cache.max_seq_len,
+                                cfg.num_key_value_heads,
+                                cfg.head_dim,
+                                slot_id,
+                                &mut enc,
+                                &mut registry,
+                                &device,
+                            )
+                            .expect("dequant scalar TQ cache");
+                        let physical_values = physical
+                            .dequant_seq_to_temp_f32_unrotated_for_slot(
+                                is_k,
+                                2,
+                                0,
+                                batch_cache.max_seq_len,
+                                cfg.num_key_value_heads,
+                                cfg.head_dim,
+                                slot_id,
+                                &mut enc,
+                                &mut registry,
+                                &device,
+                            )
+                            .expect("dequant physical TQ cache");
+                        enc.commit_and_wait_labeled("test.qwen35moe.tq-state-parity")
+                            .expect("TQ compare completion");
+                        let scalar_values = scalar_values
+                            .as_slice::<f32>()
+                            .expect("scalar dequantized TQ values");
+                        let physical_values = physical_values
+                            .as_slice::<f32>()
+                            .expect("physical dequantized TQ values");
+                        let max_abs = scalar_values
+                            .iter()
+                            .zip(physical_values)
+                            .map(|(left, right)| (left - right).abs())
+                            .fold(0.0_f32, f32::max);
+                        assert!(
+                            max_abs <= 1e-2,
+                            "physical MoE width {width} slot {} full-attn layer {layer} {label} state drift {max_abs}",
+                            slot_id.0
+                        );
+                    }
+                }
+            }
+            for (scalar, physical) in scalar_cache
+                .linear_attn
+                .iter()
+                .zip(&batch_cache.linear_attn)
+            {
+                assert_eq!(scalar.pp_flipped, physical.pp_flipped);
+                let qkv_channels = 2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
+                    + cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+                let conv_per_slot =
+                    (qkv_channels * cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
+                let recurrent_per_slot = (cfg.linear_key_head_dim
+                    * cfg.linear_value_head_dim
+                    * cfg.linear_num_value_heads) as usize;
+                for slot_id in slot_ids.iter().copied() {
+                    let compare_current =
+                        |label: &str,
+                         scalar_buf: &MlxBuffer,
+                         physical_buf: &MlxBuffer,
+                         elements: usize| {
+                            let offset = slot_id.0 as u64
+                                * elements as u64
+                                * std::mem::size_of::<f32>() as u64;
+                            let scalar_view = scalar_buf.slice_view(offset, elements);
+                            let scalar_values =
+                                scalar_view.as_slice::<f32>().expect("scalar state view");
+                            let physical_view = physical_buf.slice_view(offset, elements);
+                            let physical_values = physical_view
+                                .as_slice::<f32>()
+                                .expect("physical state view");
+                            let max_abs = scalar_values
+                                .iter()
+                                .zip(physical_values)
+                                .map(|(left, right)| (left - right).abs())
+                                .fold(0.0_f32, f32::max);
+                            assert!(
+                                max_abs <= 5e-3,
+                                "physical MoE width {width} slot {} {label} state drift {max_abs}",
+                                slot_id.0
+                            );
+                        };
+                    let (scalar_conv, _) = scalar.conv_bufs_for_slot(slot_id);
+                    let (physical_conv, _) = physical.conv_bufs_for_slot(slot_id);
+                    compare_current("convolution", scalar_conv, physical_conv, conv_per_slot);
+                    let (scalar_recurrent, _) = scalar.recurrent_bufs_for_slot(slot_id);
+                    let (physical_recurrent, _) = physical.recurrent_bufs_for_slot(slot_id);
+                    compare_current(
+                        "recurrent",
+                        scalar_recurrent,
+                        physical_recurrent,
+                        recurrent_per_slot,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_physical_widths_match_independent_scalar_token_trajectories() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let cfg = physical_batch_hybrid_cfg();
+        let model = deterministic_dense_model(cfg.clone());
+
+        let mut slot_id_sets: Vec<Vec<SlotId>> = (2_usize..=16)
+            .map(|width| (0..width as u32).map(SlotId).collect())
+            .collect();
+        slot_id_sets.push(vec![SlotId(0), SlotId(2), SlotId(5), SlotId(9), SlotId(15)]);
+
+        for slot_ids in slot_id_sets {
+            let width = slot_ids.len();
+            let n_seqs = slot_ids
+                .iter()
+                .map(|slot_id| slot_id.0)
+                .max()
+                .expect("nonempty slot set")
+                + 1;
+            let initial: Vec<u32> = (0..width as u32)
+                .map(|row| 3 + (row * 7) % (cfg.vocab_size - 3))
+                .collect();
+            let mut scalar_cache = HybridKvCache::new_with_options(&cfg, &device, 32, n_seqs, true)
+                .expect("scalar TQ cache");
+            let mut scalar_inputs = initial.clone();
+            let mut scalar_steps = Vec::new();
+            for position in 0..3_i32 {
+                let mut predicted = Vec::with_capacity(width);
+                for row in 0..width {
+                    predicted.push(
+                        model
+                            .forward_gpu_greedy(
+                                &[scalar_inputs[row]],
+                                &[position; 4],
+                                &mut scalar_cache,
+                                slot_ids[row],
+                            )
+                            .expect("independent scalar target"),
+                    );
+                }
+                scalar_inputs.clone_from(&predicted);
+                scalar_steps.push(predicted);
+            }
+
+            let mut batch_cache = HybridKvCache::new_with_options(&cfg, &device, 32, n_seqs, true)
+                .expect("physical TQ cache");
+            assert!(model.can_forward_gpu_greedy_multi_slot(&batch_cache, &slot_ids));
+            let mut batch_inputs = initial;
+            for position in 0..3_i32 {
+                let positions = vec![position; 4 * width];
+                let predicted = model
+                    .forward_gpu_greedy_multi_slot(
+                        &batch_inputs,
+                        &positions,
+                        &mut batch_cache,
+                        &slot_ids,
+                    )
+                    .expect("physical width-N target");
+                assert_eq!(
+                    predicted, scalar_steps[position as usize],
+                    "physical width {width} diverged at decode position {position}"
+                );
+                batch_inputs = predicted;
+            }
+
+            for (scalar, physical) in scalar_cache.full_attn.iter().zip(&batch_cache.full_attn) {
+                assert_eq!(scalar.current_len, physical.current_len);
+            }
+            for (scalar, physical) in scalar_cache
+                .linear_attn
+                .iter()
+                .zip(&batch_cache.linear_attn)
+            {
+                assert_eq!(scalar.pp_flipped, physical.pp_flipped);
+                let qkv_channels = 2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
+                    + cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+                let conv_per_slot =
+                    (qkv_channels * cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
+                let recurrent_per_slot = (cfg.linear_key_head_dim
+                    * cfg.linear_value_head_dim
+                    * cfg.linear_num_value_heads) as usize;
+                for slot_id in slot_ids.iter().copied() {
+                    let compare_current =
+                        |label: &str,
+                         scalar_buf: &MlxBuffer,
+                         physical_buf: &MlxBuffer,
+                         elements: usize| {
+                            let offset = slot_id.0 as u64
+                                * elements as u64
+                                * std::mem::size_of::<f32>() as u64;
+                            let scalar_view = scalar_buf.slice_view(offset, elements);
+                            let scalar_values =
+                                scalar_view.as_slice::<f32>().expect("scalar state view");
+                            let physical_view = physical_buf.slice_view(offset, elements);
+                            let physical_values = physical_view
+                                .as_slice::<f32>()
+                                .expect("physical state view");
+                            let max_abs = scalar_values
+                                .iter()
+                                .zip(physical_values)
+                                .map(|(left, right)| (left - right).abs())
+                                .fold(0.0_f32, f32::max);
+                            assert!(
+                                max_abs <= 5e-3,
+                                "physical width {width} slot {} {label} state drift {max_abs}",
+                                slot_id.0
+                            );
+                        };
+                    let (scalar_conv, _) = scalar.conv_bufs_for_slot(slot_id);
+                    let (physical_conv, _) = physical.conv_bufs_for_slot(slot_id);
+                    compare_current("convolution", scalar_conv, physical_conv, conv_per_slot);
+                    let (scalar_recurrent, _) = scalar.recurrent_bufs_for_slot(slot_id);
+                    let (physical_recurrent, _) = physical.recurrent_bufs_for_slot(slot_id);
+                    compare_current(
+                        "recurrent",
+                        scalar_recurrent,
+                        physical_recurrent,
+                        recurrent_per_slot,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_physical_batch_preserves_staggered_slot_trajectories() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = match MlxDevice::new() {
+            Ok(device) => device,
+            Err(_) => return,
+        };
+        let cfg = physical_batch_hybrid_cfg();
+        let model = deterministic_dense_model(cfg.clone());
+        let slot_ids = [SlotId(0), SlotId(1), SlotId(2), SlotId(3)];
+        let cursors = [1_u32, 3, 5, 7];
+        let mut scalar_cache =
+            HybridKvCache::new_with_options(&cfg, &device, 32, 4, true).expect("scalar cache");
+        let mut batch_cache =
+            HybridKvCache::new_with_options(&cfg, &device, 32, 4, true).expect("batch cache");
+
+        // Establish byte-equal but differently-sized prefixes in both caches.
+        for (row, (&slot_id, &cursor)) in slot_ids.iter().zip(&cursors).enumerate() {
+            for position in 0..cursor {
+                let token = 3 + ((row as u32 * 11 + position) % (cfg.vocab_size - 3));
+                let positions = [position as i32; 4];
+                model
+                    .forward_gpu_greedy(&[token], &positions, &mut scalar_cache, slot_id)
+                    .expect("prime scalar cache");
+                model
+                    .forward_gpu_greedy(&[token], &positions, &mut batch_cache, slot_id)
+                    .expect("prime batch cache");
+            }
+        }
+        assert!(model.can_forward_gpu_greedy_multi_slot(&batch_cache, &slot_ids));
+
+        let inputs: Vec<u32> = (0..4).map(|row| 67 + row as u32).collect();
+        let mut expected = Vec::with_capacity(4);
+        for row in 0..4 {
+            expected.push(
+                model
+                    .forward_gpu_greedy(
+                        &[inputs[row]],
+                        &[cursors[row] as i32; 4],
+                        &mut scalar_cache,
+                        slot_ids[row],
+                    )
+                    .expect("staggered scalar target"),
+            );
+        }
+        let mut positions = Vec::with_capacity(16);
+        for _axis in 0..4 {
+            positions.extend(cursors.iter().map(|&cursor| cursor as i32));
+        }
+        let actual = model
+            .forward_gpu_greedy_multi_slot(&inputs, &positions, &mut batch_cache, &slot_ids)
+            .expect("staggered physical target");
+        assert_eq!(actual, expected, "staggered physical tokens diverged");
+        for (scalar, physical) in scalar_cache.full_attn.iter().zip(&batch_cache.full_attn) {
+            assert_eq!(scalar.current_len, physical.current_len);
+        }
+        for (scalar, physical) in scalar_cache
+            .linear_attn
+            .iter()
+            .zip(&batch_cache.linear_attn)
+        {
+            assert_eq!(scalar.pp_flipped, physical.pp_flipped);
+        }
     }
 
     /// Zero-model smoke: `forward_gpu` returns the correct logits shape and
@@ -8640,10 +14686,8 @@ mod tests {
 
         let device = MlxDevice::new().expect("device");
 
-        // Step 1: a WELL-FORMED request must succeed (Ok), NOT return
-        // a "not implemented" error.  This is the literal check that
-        // the engine arm at `engine.rs:2398` no longer routes to
-        // `qwen35_not_implemented_err()`.
+        // Step 1: a well-formed request must execute the native soft-token
+        // forward and return finite logits.
         let override_data = synthetic_override_rows(1, h, 0xDEADBEEF);
         let override_buf = upload_f32(&override_data, &device).expect("upload override");
         let injection = crate::serve::forward_prefill::SoftTokenInjection {
@@ -8705,14 +14749,6 @@ mod tests {
             "malformed range error must name the violation; got: {err_msg}"
         );
 
-        // Step 3: explicit guarantee that the returned-Ok path's error
-        // surface NEVER contains the qwen35_not_implemented sentinel.
-        // Belt-and-suspenders against accidental future regressions
-        // that re-introduce the sentinel.
-        assert!(
-            !err_msg.contains("qwen35_not_implemented"),
-            "soft-token error path must never contain the legacy 501 sentinel"
-        );
     }
 
     // ============================================================
@@ -9521,17 +15557,38 @@ mod tests {
         let cfg = raw_model.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
         let positions = positions_to_flat(&text_positions(tokens.len() as u32));
-        let device = MlxDevice::new().expect("device");
-        let mut raw_kv = HybridKvCache::new(&cfg, &device, 64, 1).expect("raw kv");
-        let mut nextn_kv = HybridKvCache::new(&cfg, &device, 64, 1).expect("nextn kv");
-
+        raw_model
+            .prime_gpu_cache_unactivated()
+            .expect("prime raw-model cache");
+        let raw_device = GPU_CACHE.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .expect("raw-model cache")
+                .device
+                .clone()
+        });
+        let mut raw_kv = HybridKvCache::new(&cfg, &raw_device, 64, 1).expect("raw kv");
         let (_raw_logits, raw_hidden) = raw_model
             .forward_gpu_with_hidden(&tokens, &positions, &mut raw_kv, SlotId(0))
             .expect("raw verifier hidden");
+        let raw = download_f32(&raw_hidden).expect("download raw hidden");
+        drop(raw_hidden);
+        drop(raw_kv);
+
+        nextn_model
+            .prime_gpu_cache_unactivated()
+            .expect("prime nextn-model cache");
+        let nextn_device = GPU_CACHE.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .expect("nextn-model cache")
+                .device
+                .clone()
+        });
+        let mut nextn_kv = HybridKvCache::new(&cfg, &nextn_device, 64, 1).expect("nextn kv");
         let (_nextn_logits, nextn_hidden) = nextn_model
             .forward_gpu_with_nextn_hidden(&tokens, &positions, &mut nextn_kv, SlotId(0))
             .expect("normalized verifier hidden");
-        let raw = download_f32(&raw_hidden).expect("download raw hidden");
         let actual = download_f32(&nextn_hidden).expect("download nextn hidden");
         assert_eq!(raw.len(), actual.len());
 
@@ -11234,31 +17291,28 @@ mod tests {
         );
     }
 
-    /// H143 — Gemma 4 + Qwen3VL forward paths UNCHANGED by A2b-cont.
+    /// H143 — Gemma 4 forward paths UNCHANGED by A2b-cont.
     ///
     /// The lift surface is strictly `gpu_delta_net.rs` (Qwen35 linear-
     /// attn). Neither Gemma 4's `MlxModelWeights` forward path
-    /// (`src/serve/forward_prefill.rs`) nor any `qwen3vl_text` code
-    /// touches `build_delta_net_layer*` — they have their own
-    /// independent dispatch surfaces. This test source-greps to pin
-    /// that contract.
+    /// (`src/serve/forward_prefill.rs`) does not touch
+    /// `build_delta_net_layer*`. This test source-greps that contract.
     ///
     /// Falsifier: the `gpu_delta_net.rs` lift accidentally drags
-    /// `build_delta_net_layer*` calls into Gemma 4 or Qwen3VL code.
+    /// `build_delta_net_layer*` calls into Gemma 4 code.
     // ──────────────────────────────────────────────────────────────────
     // ADR-040 Phase B4d (2026-05-30) — spec-decode slot_id threading.
     //
     // Lifts the typed deferrals stamped at §6.1.20 (B4b) +
     // §6.1.40 (A2b-cont sub-deferral "iter-A2b-cont-forward-gpu-greedy"):
-    //   * `forward_gpu_greedy(.., slot_id: SlotId)` (NEW signature)
+    //   * `forward_gpu_greedy(.., slot_id: SlotId)` (scalar wrapper)
     //   * `forward_gpu_with_hidden_dflash(.., slot_id: SlotId)` (NEW)
     //   * `SpecDecode::with_slot_id` / `new_with_eos_set_and_slot`
     //   * `Qwen35DFlashTarget::new_with_slot` + `with_slot_id`
     //   * `HybridKvCache::truncate_full_attn_to_for_slot` / `truncate_mtp_to_for_slot`
     //
-    // H167: source-grep — production-side `forward_gpu_greedy` body now
-    //       routes `slot_id` to all 4 internal dispatch sites
-    //       (FA decode/legacy + DN decode/legacy).
+    // H167: source-grep — `forward_gpu_greedy` routes the caller's slot into
+    //       the physical-batch row map without a slot-zero substitution.
     // H168: functional — `forward_gpu_greedy(.., SlotId(0))` at `n_seqs=4`
     //       is BIT-IDENTICAL to the same call at `n_seqs=1` on the
     //       FA-only fixture (SerialFifo byte-equivalence pin).
@@ -11273,32 +17327,28 @@ mod tests {
     //       routes `self.slot_id` into `forward_gpu_with_hidden_dflash`;
     //       `rollback_kv` routes `self.slot_id` into `truncate_*_for_slot`
     //       + `rollback_la_to`.
-    // H173: sibling discipline — Gemma 4 + Qwen3VL forward paths
-    //       untouched by B4d (source-grep against forward_prefill.rs +
-    //       qwen3vl_text/).
+    // H173: sibling discipline — Gemma 4 forward paths untouched by B4d.
     // ──────────────────────────────────────────────────────────────────
 
     /// ADR-040 Phase B4d H167 — `forward_gpu_greedy` body source-grep.
     ///
-    /// Pin the 4 internal dispatch sites (FA decode + DN decode + FA
-    /// legacy + DN legacy) now route through `slot_id` (not
-    /// `SlotId(0)` hard-codes).  Falsifier: any of the 4 sites
-    /// silently regressing to `SlotId(0)`.
+    /// Pin the scalar compatibility entry point to the physical-batch
+    /// implementation with the caller's slot, never a `SlotId(0)` hard-code.
+    /// The four historical scalar dispatch sites no longer exist: full
+    /// attention and DeltaNet are selected inside the row-mapped batched body.
     #[test]
-    fn h167_forward_gpu_greedy_threads_slot_id_to_all_4_internal_sites_2026_05_30() {
+    fn h167_forward_gpu_greedy_preserves_slot_through_physical_batch_2026_05_30() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let body = std::fs::read_to_string("src/inference/models/qwen35/forward_gpu.rs")
             .expect("read forward_gpu.rs");
-        // Locate the `pub fn forward_gpu_greedy(` declaration + walk
-        // forward to the function end.  We approximate by grabbing
-        // ~60K chars starting at the declaration — covers the full
-        // FA + DN dispatch bodies + their epilogue (function is
-        // ~1300 lines).
+        // Isolate the scalar wrapper from the following physical-batch body.
         let decl_idx = body
             .find("pub fn forward_gpu_greedy(")
             .expect("H167: forward_gpu_greedy declaration not found");
         let body_window = &body[decl_idx..];
-        let end_window = (body_window.len()).min(70_000);
+        let end_window = body_window
+            .find("pub fn forward_gpu_greedy_multi_slot(")
+            .expect("H167: physical-batch implementation not found");
         let window = &body_window[..end_window];
 
         // The new signature MUST carry `slot_id: SlotId` as a param.
@@ -11326,22 +17376,14 @@ mod tests {
         assert_eq!(
             slot_id_zero_count, 0,
             "H167 FALSIFIED: forward_gpu_greedy body contains {} \
-             code-side `SlotId(0)` literal(s) (comments stripped).  The 4 \
-             internal dispatch sites (FA at :5293 + :5612, DN at :5380 + \
-             :5716) MUST route through `slot_id`, not the literal.",
+             code-side `SlotId(0)` literal(s) (comments stripped). The scalar \
+             wrapper must preserve the caller's slot.",
             slot_id_zero_count
         );
-        // Spot-check that the threaded literal `slot_id,` appears at
-        // ≥4 dispatch-site routings.  Doc comments mention `slot_id`
-        // (no trailing comma) so the comma constraint isolates the
-        // call-site positional-arg occurrences.
-        let threaded = code_only.matches("slot_id,").count();
         assert!(
-            threaded >= 4,
-            "H167 FALSIFIED: `slot_id,` appears only {} time(s) in \
-             forward_gpu_greedy code body — expected ≥4 dispatch-site \
-             routings (FA decode + DN decode + FA legacy + DN legacy)",
-            threaded
+            code_only.contains("std::slice::from_ref(&slot_id)"),
+            "H167 FALSIFIED: scalar greedy no longer routes the caller's slot \
+             through the physical-batch row map"
         );
     }
 
@@ -11549,20 +17591,19 @@ mod tests {
         );
     }
 
-    /// ADR-040 Phase B4d H173 — Gemma 4 + Qwen3VL forward paths
+    /// ADR-040 Phase B4d H173 — Gemma 4 forward paths
     /// UNCHANGED by the spec-decode slot threading.
     ///
     /// The B4d lift surface is strictly the Qwen35 spec-decode +
     /// `forward_gpu_greedy` + `forward_gpu_with_hidden_dflash` +
     /// `Qwen35DFlashTarget` siblings.  Gemma 4's `forward_prefill.rs`
-    /// + the Gemma 4 `MlxModelWeights::DFlashTarget` impl + any
-    /// `qwen3vl_text/` forward code must remain untouched.
+    /// + the Gemma 4 `MlxModelWeights::DFlashTarget` impl must remain untouched.
     ///
-    /// Falsifier: any Gemma 4 or Qwen3VL source contains a reference
+    /// Falsifier: any Gemma 4 source contains a reference
     /// to `forward_gpu_greedy`, `forward_gpu_with_hidden_dflash`, or
     /// `Qwen35DFlashTarget::new_with_slot`.
     #[test]
-    fn h173_gemma4_and_qwen3vl_unchanged_by_b4d_2026_05_30() {
+    fn h173_gemma4_unchanged_by_b4d_2026_05_30() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Gemma 4 forward path body source-grep — must not reference
         // the Qwen35-scoped B4d symbols.
@@ -11593,36 +17634,10 @@ mod tests {
              `slot_id: SlotId` parameter — B4d must NOT touch the shared \
              trait signature (would break Gemma 4 + sibling discipline)"
         );
-
-        // Qwen3VL spot-check (the dir may not exist — absence is the
-        // strongest H173 pass).
-        if std::path::Path::new("src/inference/models/qwen3vl_text").exists() {
-            for entry in std::fs::read_dir("src/inference/models/qwen3vl_text")
-                .expect("read qwen3vl_text dir")
-            {
-                let entry = entry.expect("dir entry");
-                let p = entry.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("rs") {
-                    let body = std::fs::read_to_string(&p).unwrap_or_else(|_| String::new());
-                    assert!(
-                        !body.contains("forward_gpu_greedy"),
-                        "H173 FALSIFIED: qwen3vl_text/{:?} references \
-                         forward_gpu_greedy — B4d leaked",
-                        p.file_name()
-                    );
-                    assert!(
-                        !body.contains("forward_gpu_with_hidden_dflash"),
-                        "H173 FALSIFIED: qwen3vl_text/{:?} references \
-                         forward_gpu_with_hidden_dflash — B4d leaked",
-                        p.file_name()
-                    );
-                }
-            }
-        }
     }
 
     #[test]
-    fn h143_gemma4_and_qwen3vl_forward_paths_unchanged_2026_05_30() {
+    fn h143_gemma4_forward_path_unchanged_2026_05_30() {
         let _gpu = crate::inference::hf2q_gpu_test_lock();
         let gemma4 = std::fs::read_to_string("src/serve/forward_prefill.rs")
             .expect("read forward_prefill.rs");
@@ -11633,26 +17648,6 @@ mod tests {
              forward_prefill.rs.  The lift surface MUST stay scoped to \
              Qwen35 gpu_delta_net.rs."
         );
-        // Spot-check the qwen3vl text module if it exists; if it
-        // doesn't, the absence is the strongest possible H143 pass.
-        if std::path::Path::new("src/inference/models/qwen3vl_text").exists() {
-            // Walk the directory and check for accidental references.
-            for entry in std::fs::read_dir("src/inference/models/qwen3vl_text")
-                .expect("read qwen3vl_text dir")
-            {
-                let entry = entry.expect("dir entry");
-                let p = entry.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("rs") {
-                    let body = std::fs::read_to_string(&p).unwrap_or_else(|_| String::new());
-                    assert!(
-                        !body.contains("build_delta_net_layer"),
-                        "H143 FALSIFIED: qwen3vl_text/{:?} references \
-                         build_delta_net_layer — A2b-cont lift leaked.",
-                        p.file_name()
-                    );
-                }
-            }
-        }
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -12041,7 +18036,7 @@ mod tests {
         );
 
         // Sibling discipline: §6.1.51 must NOT have leaked any
-        // changes into Gemma 4 forward_prefill.rs or qwen3vl_text/.
+        // changes into Gemma 4 forward_prefill.rs.
         // Mirror of H143 + H173 at the cleanup-iter closure.
         let gemma4 = std::fs::read_to_string("src/serve/forward_prefill.rs")
             .expect("read forward_prefill.rs");

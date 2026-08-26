@@ -32,8 +32,8 @@ use crate::inference::vision::mmproj::{ArchProfile, MmprojConfig};
 use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
 use crate::serve::cache::ModelCache;
 use crate::serve::multi_model::{
-    DefaultModelLoader, EngineConfig, HotSwapManager, LoadedPool, RestoreErrorKind, RestoreOutcome,
-    SpillErrorKind, SpillOutcome,
+    ArtifactFileStamp, DefaultModelLoader, EngineConfig, HotSwapManager, LoadedPool,
+    RestoreErrorKind, RestoreOutcome, SpillErrorKind, SpillOutcome,
 };
 use crate::serve::quant_select::QuantType;
 
@@ -586,10 +586,11 @@ pub struct AppState {
     /// paths are deliberately absent here; scheduler, queue, KV budget, and
     /// metrics wiring must survive model swaps unchanged.
     pub engine_config_template: EngineConfig,
-    /// Exact canonical GGUF path -> model-local load configuration. Startup
-    /// sidecars and explicit overlays belong only to the artifact they were
-    /// supplied for and are restored when that same artifact is reloaded.
-    pub engine_config_overrides: Arc<std::sync::RwLock<HashMap<PathBuf, EngineConfig>>>,
+    /// Exact canonical GGUF path + filesystem stamp -> model-local load
+    /// configuration. A file replaced at the same pathname cannot inherit
+    /// tokenizer/config/DWQ/projector policy from the prior physical bytes.
+    pub(crate) engine_config_overrides:
+        Arc<std::sync::RwLock<HashMap<PathBuf, EngineConfigOverride>>>,
     /// `--model` argument from CLI startup, if any.  Used as the fallback
     /// "default model" when a request omits the OpenAI `model:` field
     /// (or sends an empty string).  Stored as the original argument
@@ -609,12 +610,6 @@ pub struct AppState {
     /// (kept registry per-request → recompiled every shader; HTTP-path
     /// hit ~190 ms vs in-process ~8 ms forward floor).
     pub embedding_registry: Option<Arc<std::sync::Mutex<mlx_native::KernelRegistry>>>,
-    /// Multimodal projector (mmproj GGUF) loaded at startup from
-    /// `--mmproj <path>`. When `Some`, the chat handler accepts
-    /// `image_url` content parts and routes them through the vision
-    /// preprocessor + ViT forward pass that this mmproj describes.
-    /// `None` means the server is text-only.
-    pub mmproj: Option<LoadedMmproj>,
     /// Process-wide metric counters surfaced via `/metrics`.
     pub metrics: Arc<ServerMetrics>,
     /// KV-spill / KV-restore telemetry counters surfaced via `/metrics`
@@ -658,6 +653,16 @@ pub struct AppState {
     pub kv_spiller: Option<
         Arc<crate::serve::kv_persist::BlockPrefixCacheSpiller<crate::serve::api::engine::Engine>>,
     >,
+}
+
+/// Transaction value for one physical artifact's model-local load policy.
+/// The metadata-only stamp is cheap enough for resident request lookup; the
+/// model's SHA-256 is computed once by the loader and retained on
+/// `LoadedEngine`, never recomputed here.
+#[derive(Debug, Clone)]
+pub(crate) struct EngineConfigOverride {
+    stamp: ArtifactFileStamp,
+    config: EngineConfig,
 }
 
 /// BERT embedding model, discovered from `--embedding-model <path>` at
@@ -793,6 +798,22 @@ pub struct LoadedMmproj {
     pub vision_cache: Arc<crate::inference::vision::pipeline::VisionEmbeddingCache>,
 }
 
+impl LoadedMmproj {
+    pub fn physical_resident_bytes(&self) -> anyhow::Result<u64> {
+        self.weights
+            .owned_bytes()
+            .checked_add(u64::try_from(self.vision_cache.resident_bytes()?)?)
+            .ok_or_else(|| anyhow::anyhow!("projector physical resident-byte count overflow"))
+    }
+
+    pub fn committed_resident_bytes(&self) -> anyhow::Result<u64> {
+        self.weights
+            .owned_bytes()
+            .checked_add(u64::try_from(self.vision_cache.budget_bytes())?)
+            .ok_or_else(|| anyhow::anyhow!("projector committed resident-byte count overflow"))
+    }
+}
+
 impl AppState {
     /// Construct `AppState` for production use — opens (or creates) the
     /// on-disk cache, detects hardware once, and constructs an empty
@@ -825,6 +846,8 @@ impl AppState {
         let mut manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
         manager.set_kv_counters(Arc::clone(&kv_spill_counters));
         let engine_config_template = EngineConfig {
+            expected_text_artifact_stamp: None,
+            verified_text_artifact: None,
             operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
@@ -833,6 +856,7 @@ impl AppState {
             kv_metrics_sink: Some(Arc::clone(&kv_spill_counters)
                 as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
             dwq_overlay_path: None,
+            projector: None,
             engine_mode: super::engine::EngineMode::SerialFifo,
             requested_context: None,
             kv_cache_budget_bytes: None,
@@ -862,7 +886,6 @@ impl AppState {
             default_model,
             embedding_config: None,
             embedding_registry: None,
-            mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
             kv_spill_counters,
             // ADR-017 §R-F7: gauge source wired post-construction by
@@ -898,6 +921,8 @@ impl AppState {
         let mut manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
         manager.set_kv_counters(Arc::clone(&kv_spill_counters_test));
         let engine_config_template = EngineConfig {
+            expected_text_artifact_stamp: None,
+            verified_text_artifact: None,
             operator_model_path: None,
             tokenizer_path: None,
             config_path: None,
@@ -906,6 +931,7 @@ impl AppState {
             kv_metrics_sink: Some(Arc::clone(&kv_spill_counters_test)
                 as Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
             dwq_overlay_path: None,
+            projector: None,
             engine_mode: super::engine::EngineMode::SerialFifo,
             requested_context: None,
             kv_cache_budget_bytes: None,
@@ -914,7 +940,7 @@ impl AppState {
         };
         // Synthetic cache root in a per-process tempdir.  Tests that need
         // a specific cache state should construct via `new_for_serve` or
-        // hand-build an `AppState` (every field is `pub`).
+        // use the focused AppState builders.
         let cache = ModelCache::open_at(synthetic_cache_root())
             .expect("open synthetic cache for AppState::new (test path)");
         // Synthetic hardware (16 GiB) — tests don't depend on the value;
@@ -948,7 +974,6 @@ impl AppState {
             default_model: None,
             embedding_config: None,
             embedding_registry: None,
-            mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
             kv_spill_counters: kv_spill_counters_test,
             // ADR-017 §R-F7: tests hand-wire this when they want to
@@ -973,10 +998,13 @@ impl AppState {
     /// this template and are registered separately by exact artifact path.
     pub fn with_engine_config_template(mut self, config: EngineConfig) -> Self {
         assert!(
-            config.tokenizer_path.is_none()
+            config.expected_text_artifact_stamp.is_none()
+                && config.verified_text_artifact.is_none()
+                && config.tokenizer_path.is_none()
                 && config.config_path.is_none()
-                && config.dwq_overlay_path.is_none(),
-            "process-wide engine template cannot contain model-local sidecar or overlay paths"
+                && config.dwq_overlay_path.is_none()
+                && config.projector.is_none(),
+            "process-wide engine template cannot contain model-local sidecar, overlay, or projector identity"
         );
         self.engine_queue_capacity = config.queue_capacity;
         self.engine_config_template = config;
@@ -989,22 +1017,80 @@ impl AppState {
         path: &std::path::Path,
         config: EngineConfig,
     ) -> anyhow::Result<()> {
+        self.replace_engine_config_for_path(path, config)
+            .map(|_| ())
+    }
+
+    /// Install an artifact-local generation policy and return the previous
+    /// value so an activation transaction can roll back if loading fails.
+    /// Callers perform this before pool publication; successful publication
+    /// commits the replacement by retaining it.
+    pub(crate) fn replace_engine_config_for_path(
+        &self,
+        path: &std::path::Path,
+        mut config: EngineConfig,
+    ) -> anyhow::Result<Option<EngineConfigOverride>> {
         let key = std::fs::canonicalize(path).map_err(|error| {
             anyhow::anyhow!(
                 "cannot canonicalize engine-config artifact {}: {error}",
                 path.display()
             )
         })?;
-        self.engine_config_overrides
+        let stamp = ArtifactFileStamp::inspect(&key).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot stamp engine-config artifact {}: {error}",
+                key.display()
+            )
+        })?;
+        if let Some(expected) = config.expected_text_artifact_stamp.as_ref() {
+            anyhow::ensure!(
+                expected == &stamp,
+                "engine-config artifact changed while staging model-local policy"
+            );
+        }
+        if let Some(verified) = config.verified_text_artifact.as_ref() {
+            anyhow::ensure!(
+                verified.stamp == stamp,
+                "verified text artifact changed while staging model-local policy"
+            );
+        }
+        config.expected_text_artifact_stamp = Some(stamp.clone());
+        let previous = self
+            .engine_config_overrides
             .write()
             .map_err(|_| anyhow::anyhow!("engine-config registry poisoned"))?
-            .insert(key, config);
+            .insert(key, EngineConfigOverride { stamp, config });
+        Ok(previous)
+    }
+
+    /// Restore the exact registry state returned by
+    /// [`Self::replace_engine_config_for_path`].
+    pub(crate) fn restore_engine_config_for_path(
+        &self,
+        path: &std::path::Path,
+        previous: Option<EngineConfigOverride>,
+    ) -> anyhow::Result<()> {
+        let key = std::fs::canonicalize(path).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot canonicalize engine-config artifact {} during rollback: {error}",
+                path.display()
+            )
+        })?;
+        let mut overrides = self
+            .engine_config_overrides
+            .write()
+            .map_err(|_| anyhow::anyhow!("engine-config registry poisoned during rollback"))?;
+        if let Some(previous) = previous {
+            overrides.insert(key, previous);
+        } else {
+            overrides.remove(&key);
+        }
         Ok(())
     }
 
-    /// Resolve the exact configuration for one physical artifact. Unknown
-    /// artifacts inherit only the process-wide template; a previously loaded
-    /// startup artifact recovers its model-local sidecars and overlay.
+    /// Resolve the exact configuration for one physical artifact. Unknown or
+    /// same-path-replaced artifacts inherit only process-wide policy. The
+    /// lookup uses `stat(2)` identity rather than hashing a multi-GB GGUF.
     pub fn engine_config_for_path(&self, path: &std::path::Path) -> anyhow::Result<EngineConfig> {
         let key = std::fs::canonicalize(path).map_err(|error| {
             anyhow::anyhow!(
@@ -1012,13 +1098,31 @@ impl AppState {
                 path.display()
             )
         })?;
-        Ok(self
+        let current_stamp = ArtifactFileStamp::inspect(&key).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot stamp engine-config artifact {}: {error}",
+                key.display()
+            )
+        })?;
+        let exact = self
             .engine_config_overrides
             .read()
             .map_err(|_| anyhow::anyhow!("engine-config registry poisoned"))?
             .get(&key)
-            .cloned()
-            .unwrap_or_else(|| self.engine_config_template.clone()))
+            .filter(|entry| entry.stamp == current_stamp)
+            .map(|entry| (entry.stamp.clone(), entry.config.clone()));
+        if let Some((stamp, mut config)) = exact {
+            config.expected_text_artifact_stamp = Some(stamp);
+            return Ok(config);
+        }
+        let mut fallback = self.engine_config_template.clone();
+        fallback.expected_text_artifact_stamp = None;
+        fallback.verified_text_artifact = None;
+        fallback.tokenizer_path = None;
+        fallback.config_path = None;
+        fallback.dwq_overlay_path = None;
+        fallback.projector = None;
+        Ok(fallback)
     }
 
     pub fn with_local_artifacts(
@@ -1080,14 +1184,6 @@ impl AppState {
         registry: Arc<std::sync::Mutex<mlx_native::KernelRegistry>>,
     ) -> Self {
         self.embedding_registry = Some(registry);
-        self
-    }
-
-    /// Attach an mmproj descriptor. Called by `cmd_serve` after validating
-    /// the supplied mmproj GGUF header. The ViT forward pass that consumes
-    /// this lands in ADR-005 Phase 2c Task #15.
-    pub fn with_mmproj(mut self, m: LoadedMmproj) -> Self {
-        self.mmproj = Some(m);
         self
     }
 
@@ -1228,60 +1324,6 @@ mod tests {
         assert!(ids.contains(&5), "expected 'world'=5 in {:?}", ids);
     }
 
-    #[test]
-    fn with_mmproj_attaches_descriptor_to_state() {
-        // Verifies the `with_mmproj` builder — iter 25 multimodal wiring.
-        // Exercises the typed plumbing (field presence, model_id, path
-        // round-trip) without touching a real GGUF; parsing is covered by
-        // `inference::vision::mmproj::tests`.
-        use crate::inference::vision::mmproj::{MmprojConfig, ProjectorType};
-        let cfg = MmprojConfig {
-            image_size: 896,
-            patch_size: 14,
-            num_patches_side: 64,
-            hidden_size: 1152,
-            intermediate_size: 4304,
-            num_attention_heads: 16,
-            num_hidden_layers: 27,
-            layer_norm_eps: 1e-6,
-            projector: ProjectorType::Mlp,
-            image_mean: [0.5, 0.5, 0.5],
-            image_std: [0.5, 0.5, 0.5],
-            image_min_pixels: None,
-            image_max_pixels: None,
-            // iter-224 Wedge-4b: Qwen3-VL-only fields default to None on
-            // non-Qwen3-VL fixtures.
-            spatial_merge_size: None,
-            projection_dim: None,
-            deepstack_indexes: None,
-        };
-        let device = mlx_native::MlxDevice::new().expect("create device");
-        let m = LoadedMmproj {
-            gguf_path: "/tmp/synthetic-mmproj.gguf".into(),
-            config: cfg.clone(),
-            arch: ArchProfile::Gemma4Siglip,
-            weights: Arc::new(LoadedMmprojWeights::empty(device)),
-            model_id: "synthetic-mmproj".into(),
-            artifact_sha256: "0".repeat(64),
-            source_sha256: None,
-            vision_cache: Arc::new(
-                crate::inference::vision::pipeline::VisionEmbeddingCache::new(
-                    crate::inference::vision::pipeline::DEFAULT_VISION_EMBEDDING_CACHE_BYTES,
-                ),
-            ),
-        };
-        let state = AppState::new(ServerConfig::default()).with_mmproj(m);
-        let attached = state.mmproj.as_ref().expect("mmproj should be Some");
-        assert_eq!(attached.model_id, "synthetic-mmproj");
-        assert_eq!(
-            attached.gguf_path.file_name().unwrap(),
-            "synthetic-mmproj.gguf"
-        );
-        assert_eq!(attached.config, cfg);
-        assert_eq!(attached.arch, ArchProfile::Gemma4Siglip);
-        assert!(attached.config.projector.is_supported());
-    }
-
     // ─────────────────────────────────────────────────────────────────────
     // ADR-017 Phase E option (a) iter-2 — `record_lcp_probe` counter tests
     // ─────────────────────────────────────────────────────────────────────
@@ -1372,5 +1414,185 @@ mod tests {
         assert!(unrelated_b.tokenizer_path.is_none());
         assert!(unrelated_b.config_path.is_none());
         assert!(unrelated_b.dwq_overlay_path.is_none());
+    }
+
+    #[test]
+    fn engine_config_registry_transaction_restores_the_previous_generation_policy() {
+        let state = AppState::new(ServerConfig::default());
+        let model = tempfile::NamedTempFile::new().unwrap();
+        let mut original = state.engine_config_template.clone();
+        original.queue_capacity = 3;
+        state
+            .register_engine_config_for_path(model.path(), original.clone())
+            .unwrap();
+        let mut replacement = original.clone();
+        replacement.queue_capacity = 9;
+
+        let previous = state
+            .replace_engine_config_for_path(model.path(), replacement.clone())
+            .unwrap();
+        assert_eq!(
+            previous.as_ref().map(|entry| entry.config.queue_capacity),
+            Some(3)
+        );
+        assert_eq!(
+            state
+                .engine_config_for_path(model.path())
+                .unwrap()
+                .queue_capacity,
+            9
+        );
+        state
+            .restore_engine_config_for_path(model.path(), previous)
+            .unwrap();
+        assert_eq!(
+            state
+                .engine_config_for_path(model.path())
+                .unwrap()
+                .queue_capacity,
+            original.queue_capacity
+        );
+    }
+
+    #[test]
+    fn same_path_replacement_cannot_inherit_model_local_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        let replacement = dir.path().join("replacement.gguf");
+        let projector = dir.path().join("projector.gguf");
+        std::fs::write(&model, b"physical-model-a").unwrap();
+        std::fs::write(&projector, b"physical-projector-a").unwrap();
+
+        let mut process = AppState::new(ServerConfig::default()).engine_config_template;
+        process.queue_capacity = 17;
+        let state =
+            AppState::new(ServerConfig::default()).with_engine_config_template(process.clone());
+        let mut local = process.clone();
+        local.tokenizer_path = Some(dir.path().join("tokenizer.json"));
+        local.config_path = Some(dir.path().join("config.json"));
+        local.dwq_overlay_path = Some(dir.path().join("overlay.safetensors"));
+        local.projector = Some(crate::serve::multi_model::ProjectorAdmission {
+            path: projector.clone(),
+            artifact_sha256: "a".repeat(64),
+            profile: crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip,
+            mapped_weight_bytes: 64,
+            mapped_weight_segment_bytes: vec![64],
+            cache_budget_bytes: 0,
+            file_stamp: ArtifactFileStamp::inspect(&projector).unwrap(),
+        });
+        state
+            .register_engine_config_for_path(&model, local.clone())
+            .unwrap();
+        assert_eq!(
+            state.engine_config_for_path(&model).unwrap().tokenizer_path,
+            local.tokenizer_path
+        );
+
+        // Rename changes the physical inode while preserving the canonical
+        // pathname. Path-only registries incorrectly returned `local` here.
+        std::fs::write(&replacement, b"physical-model-b").unwrap();
+        std::fs::rename(&replacement, &model).unwrap();
+        let resolved = state.engine_config_for_path(&model).unwrap();
+        assert_eq!(resolved.queue_capacity, process.queue_capacity);
+        assert!(resolved.tokenizer_path.is_none());
+        assert!(resolved.config_path.is_none());
+        assert!(resolved.dwq_overlay_path.is_none());
+        assert!(resolved.projector.is_none());
+    }
+
+    #[test]
+    fn engine_config_registry_preserves_only_current_verified_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        let replacement = dir.path().join("replacement.gguf");
+        std::fs::write(&model, b"physical-model-a").unwrap();
+        let identity = crate::serve::multi_model::TextArtifactIdentity::inspect(&model).unwrap();
+        let state = AppState::new(ServerConfig::default());
+        let mut exact = state.engine_config_template.clone();
+        exact.bind_verified_text_artifact(identity.clone()).unwrap();
+        state
+            .register_engine_config_for_path(&model, exact)
+            .unwrap();
+
+        let resolved = state.engine_config_for_path(&model).unwrap();
+        assert_eq!(resolved.verified_text_artifact, Some(identity));
+
+        std::fs::write(&replacement, b"physical-model-b").unwrap();
+        std::fs::rename(&replacement, &model).unwrap();
+        let replaced = state.engine_config_for_path(&model).unwrap();
+        assert!(replaced.verified_text_artifact.is_none());
+        assert!(replaced.expected_text_artifact_stamp.is_none());
+    }
+
+    #[test]
+    fn rollback_restores_the_old_stamp_without_rebinding_old_bytes_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        let replacement = dir.path().join("replacement.gguf");
+        std::fs::write(&model, b"physical-model-a").unwrap();
+        let state = AppState::new(ServerConfig::default());
+        let mut original = state.engine_config_template.clone();
+        original.tokenizer_path = Some(dir.path().join("a-tokenizer.json"));
+        state
+            .register_engine_config_for_path(&model, original)
+            .unwrap();
+        let mut staged = state.engine_config_template.clone();
+        staged.tokenizer_path = Some(dir.path().join("staged-tokenizer.json"));
+        let previous = state
+            .replace_engine_config_for_path(&model, staged)
+            .unwrap();
+
+        std::fs::write(&replacement, b"physical-model-b").unwrap();
+        std::fs::rename(&replacement, &model).unwrap();
+        state
+            .restore_engine_config_for_path(&model, previous)
+            .unwrap();
+        assert!(
+            state
+                .engine_config_for_path(&model)
+                .unwrap()
+                .tokenizer_path
+                .is_none(),
+            "rollback must restore the old physical stamp, not bind old policy to new bytes"
+        );
+    }
+
+    #[test]
+    fn staging_rejects_replacement_after_policy_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        let replacement = dir.path().join("replacement.gguf");
+        std::fs::write(&model, b"physical-model-a").unwrap();
+        let state = AppState::new(ServerConfig::default());
+        let mut local = state.engine_config_template.clone();
+        local.tokenizer_path = Some(dir.path().join("a-tokenizer.json"));
+        local.bind_text_artifact(&model).unwrap();
+
+        std::fs::write(&replacement, b"physical-model-b").unwrap();
+        std::fs::rename(&replacement, &model).unwrap();
+        let error = state
+            .replace_engine_config_for_path(&model, local)
+            .expect_err("stale bound policy must not be staged for replacement bytes");
+        assert!(error
+            .to_string()
+            .contains("changed while staging model-local policy"));
+        assert!(state
+            .engine_config_for_path(&model)
+            .unwrap()
+            .tokenizer_path
+            .is_none());
+    }
+
+    #[test]
+    fn resident_engine_config_lookup_is_metadata_only() {
+        let source = include_str!("state.rs");
+        let body = source
+            .split("pub fn engine_config_for_path")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn with_local_artifacts").next())
+            .expect("engine_config_for_path source body");
+        assert!(body.contains("ArtifactFileStamp::inspect"));
+        assert!(!body.contains("compute_file_sha256"));
+        assert!(!body.contains("TextArtifactIdentity::inspect"));
     }
 }

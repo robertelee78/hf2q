@@ -62,3 +62,86 @@ fn official_artifact_executes_native_verifier_and_logits() {
         greedy
     );
 }
+
+#[test]
+#[ignore = "loads the locally converted 89.65 GiB official checkpoint onto Metal"]
+fn invalid_moe_receipt_poison_prevents_publish_and_fresh_transaction_recovers() {
+    let (path, gguf) = official_artifact();
+    let _gpu = crate::inference::hf2q_gpu_test_lock();
+    let mut model = Deepseek4Model::load_from_gguf(&gguf)
+        .unwrap_or_else(|error| panic!("load official artifact {}: {error:#}", path.display()));
+    let mut rejected = model.allocate_cache(128).expect("allocate rejected cache");
+    model.force_invalid_moe_status_once_for_test();
+    let error = model
+        .forward_verifier_one(0, &mut rejected)
+        .err()
+        .expect("injected invalid MoE receipt must reject the verifier transaction");
+    assert!(error.to_string().contains("invalid MoE state"));
+    assert_eq!(rejected.position(), 0, "rejected token must not publish");
+    assert!(
+        rejected.is_poisoned(),
+        "rejected transaction must poison cache"
+    );
+
+    let mut fresh = model.allocate_cache(128).expect("allocate fresh cache");
+    model
+        .seed_invalid_moe_status_for_test()
+        .expect("seed prior sticky status");
+    model
+        .forward_verifier_one(0, &mut fresh)
+        .expect("fresh transaction must clear prior sticky status");
+    assert_eq!(fresh.position(), 1);
+    assert!(!fresh.is_poisoned());
+
+    let mut rejected_prefill = model
+        .allocate_cache(128)
+        .expect("allocate rejected prefill cache");
+    model.force_invalid_moe_status_once_for_test();
+    let error = model
+        .forward_verifier_prefill(&[0, 1], &mut rejected_prefill)
+        .err()
+        .expect("injected invalid MoE receipt must reject single prefill");
+    assert!(error.to_string().contains("invalid MoE state"));
+    assert_eq!(rejected_prefill.position(), 0);
+    assert!(rejected_prefill.is_poisoned());
+
+    let mut first = model
+        .allocate_cache(128)
+        .expect("allocate first cohort cache");
+    let mut second = model
+        .allocate_cache(128)
+        .expect("allocate second cohort cache");
+    let mut cohort = [&mut first, &mut second];
+    let first_tokens = [0_u32];
+    let second_tokens = [1_u32];
+    let token_batches = [first_tokens.as_slice(), second_tokens.as_slice()];
+    model.force_invalid_moe_status_once_for_test();
+    let error = model
+        .forward_verifier_prefill_cohort(&token_batches, &mut cohort)
+        .err()
+        .expect("injected invalid MoE receipt must reject the cohort transaction");
+    assert!(error.to_string().contains("invalid MoE state"));
+    for cache in cohort {
+        assert_eq!(cache.position(), 0, "rejected cohort must not publish");
+        assert!(
+            cache.is_poisoned(),
+            "rejected cohort must poison every lane"
+        );
+    }
+
+    let mut lane0 = model.allocate_cache(128).expect("allocate B4 lane 0");
+    let mut lane1 = model.allocate_cache(128).expect("allocate B4 lane 1");
+    let mut lane2 = model.allocate_cache(128).expect("allocate B4 lane 2");
+    let mut lane3 = model.allocate_cache(128).expect("allocate B4 lane 3");
+    let mut lanes = [&mut lane0, &mut lane1, &mut lane2, &mut lane3];
+    model.force_invalid_moe_status_once_for_test();
+    let error = model
+        .forward_verifier_decode_cohort([0, 1, 2, 3], &mut lanes)
+        .err()
+        .expect("injected invalid MoE receipt must reject B4 decode");
+    assert!(error.to_string().contains("invalid MoE state"));
+    for cache in lanes {
+        assert_eq!(cache.position(), 0, "rejected B4 lane must not publish");
+        assert!(cache.is_poisoned(), "rejected B4 must poison every lane");
+    }
+}

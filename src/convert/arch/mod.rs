@@ -2,7 +2,7 @@
 //!
 //! ADR-033 §P0 "Per-arch convert-side mapping at `src/convert/arch/<arch>.rs`".
 //! v1 ships only `llama3` (dense decoder test fixture for the convert
-//! matrix); extending to `{gemma4, qwen35moe, qwen3vl, gemma4_mmproj,
+//! matrix); extending to `{gemma4, qwen35moe, gemma4_mmproj,
 //! bert, nomic_bert, minimax_m2}` is iter-23+ work per the ADR.
 //!
 //! Per [[feedback-no-backwards-compat-2026-05-18]]: no compat shims, no
@@ -26,7 +26,6 @@ pub mod nomic_bert;
 pub mod qwen35_dense;
 pub mod qwen35moe;
 pub mod qwen35moe_full;
-pub mod qwen3vl_text;
 
 /// Per-arch "source-tensor drop list" lookup.
 ///

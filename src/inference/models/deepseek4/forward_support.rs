@@ -13,7 +13,13 @@ use mlx_native::ops::quantized_matmul_ggml::{
 };
 use mlx_native::ops::quantized_matmul_id_ggml::{GgmlQuantizedMatmulIdParams, IdMmScratch};
 use mlx_native::ops::transpose::permute_021_f32;
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxBufferPool, MlxDevice};
+use mlx_native::{
+    DType, DenseMatmulIdInputLayout, DenseMatmulIdMultiplicity, DenseMatmulIdParams,
+    DenseMatmulIdRoute, DenseMatmulIdScratch, DenseMmBf16F32Params, KernelRegistry, MlxBuffer,
+    MlxBufferPool, MlxDevice,
+};
+
+use crate::inference::dense_expert_activation::DenseExpertScratchCache;
 
 use super::residency::RawMatrixRef;
 
@@ -44,6 +50,35 @@ thread_local! {
     static PREFILL_SUBMISSION_INPUTS_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static DECODE_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
     static TRANSIENT_POOL_PHASE: Cell<TransientPoolPhase> = const { Cell::new(TransientPoolPhase::Inactive) };
+    static DENSE_ID_SCRATCH_GATE: RefCell<DenseExpertScratchCache> = RefCell::new(DenseExpertScratchCache::default());
+    static DENSE_ID_SCRATCH_UP: RefCell<DenseExpertScratchCache> = RefCell::new(DenseExpertScratchCache::default());
+    static DENSE_ID_SCRATCH_DOWN: RefCell<DenseExpertScratchCache> = RefCell::new(DenseExpertScratchCache::default());
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DenseExpertScratchSlot {
+    Gate,
+    Up,
+    Down,
+}
+
+fn with_dense_expert_scratch<R>(
+    slot: DenseExpertScratchSlot,
+    activation_epoch: u64,
+    device: &MlxDevice,
+    n_experts: u32,
+    max_tokens: u32,
+    f: impl FnOnce(&DenseMatmulIdScratch) -> mlx_native::Result<R>,
+) -> mlx_native::Result<R> {
+    let cell = match slot {
+        DenseExpertScratchSlot::Gate => &DENSE_ID_SCRATCH_GATE,
+        DenseExpertScratchSlot::Up => &DENSE_ID_SCRATCH_UP,
+        DenseExpertScratchSlot::Down => &DENSE_ID_SCRATCH_DOWN,
+    };
+    cell.with(|cell| {
+        cell.borrow_mut()
+            .with(activation_epoch, device, n_experts, max_tokens, f)
+    })
 }
 
 pub(super) fn begin_prefill_pool_layer() {
@@ -181,6 +216,61 @@ pub(crate) fn release_decode_scratch() -> TransientScratchStats {
         "cannot release DeepSeek-V4 decode scratch during a graph"
     );
     DECODE_POOL.with(release_pool)
+}
+
+pub(crate) fn idle_runtime_scratch_bytes() -> Result<u64> {
+    anyhow::ensure!(
+        TRANSIENT_POOL_PHASE.with(Cell::get) == TransientPoolPhase::Inactive,
+        "DeepSeek-V4 transient scratch is active"
+    );
+    anyhow::ensure!(
+        !PREFILL_SUBMISSION_INPUTS_ACTIVE.with(Cell::get),
+        "DeepSeek-V4 prefill submission inputs are active"
+    );
+    let mut bytes = 0u64;
+    for pool in [&PREFILL_POOL, &PREFILL_SUBMISSION_INPUT_POOL, &DECODE_POOL] {
+        pool.with(|pool| {
+            let pool = pool.borrow();
+            anyhow::ensure!(
+                pool.in_use_count() == 0,
+                "DeepSeek-V4 transient scratch still has in-use buffers"
+            );
+            bytes = bytes
+                .checked_add(pool.free_bytes() as u64)
+                .ok_or_else(|| anyhow::anyhow!("DeepSeek-V4 scratch byte total overflow"))?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+    }
+    for scratch in [
+        &DENSE_ID_SCRATCH_GATE,
+        &DENSE_ID_SCRATCH_UP,
+        &DENSE_ID_SCRATCH_DOWN,
+    ] {
+        scratch.with(|scratch| {
+            bytes = bytes
+                .checked_add(scratch.borrow().owned_bytes())
+                .ok_or_else(|| anyhow::anyhow!("DeepSeek-V4 expert scratch byte overflow"))?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn release_idle_runtime_scratch() -> Result<u64> {
+    let expected = idle_runtime_scratch_bytes()?;
+    for pool in [&PREFILL_POOL, &PREFILL_SUBMISSION_INPUT_POOL, &DECODE_POOL] {
+        pool.with(|pool| pool.borrow_mut().clear());
+    }
+    for scratch in [
+        &DENSE_ID_SCRATCH_GATE,
+        &DENSE_ID_SCRATCH_UP,
+        &DENSE_ID_SCRATCH_DOWN,
+    ] {
+        scratch.with(|scratch| {
+            scratch.borrow_mut().release_owned_bytes();
+        });
+    }
+    Ok(expected)
 }
 
 pub(super) fn alloc(
@@ -345,6 +435,22 @@ pub(super) fn raw_matmul(
                 src1_batch: 1,
             },
         ),
+        GgmlType::BF16 => mlx_native::dense_matmul_bf16_f32_auto(
+            session.encoder_mut(),
+            registry,
+            device,
+            weight.buffer,
+            input,
+            output,
+            &DenseMmBf16F32Params {
+                m: u32::try_from(m).context("DeepSeek-V4 matmul rows exceed u32")?,
+                n: u32::try_from(n).context("DeepSeek-V4 matmul outputs exceed u32")?,
+                k: u32::try_from(k).context("DeepSeek-V4 matmul input exceeds u32")?,
+                src0_batch: 1,
+                src1_batch: 1,
+            },
+        )
+        .map(|_| ()),
         GgmlType::I16 | GgmlType::I32 => Err(mlx_native::MlxError::InvalidArgument(format!(
             "DeepSeek-V4 {label} cannot use integer-only matrix storage {:?}",
             weight.ggml_type
@@ -392,6 +498,65 @@ pub(super) fn grouped_output_a(
             weight.shape
         );
     }
+    if matches!(
+        weight.ggml_type,
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+    ) {
+        let params = DenseMmBf16F32Params {
+            m: 1,
+            n: u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?,
+            k: u32::try_from(group_width)
+                .context("DeepSeek-V4 output-A group width exceeds u32")?,
+            src0_batch: u32::try_from(groups).context("DeepSeek-V4 output-A groups exceed u32")?,
+            src1_batch: u32::try_from(groups).context("DeepSeek-V4 output-A groups exceed u32")?,
+        };
+        session.barrier_between(&[input, weight.buffer], &[output]);
+        match weight.ggml_type {
+            GgmlType::F32 => dense_matmul_f32_f32_tensor(
+                session.encoder_mut(),
+                registry,
+                device,
+                weight.buffer,
+                input,
+                output,
+                &DenseMmF32F32Params {
+                    m: params.m,
+                    n: params.n,
+                    k: params.k,
+                    src0_batch: params.src0_batch,
+                    src1_batch: params.src1_batch,
+                },
+            ),
+            GgmlType::F16 => dense_matmul_f16_f32_tensor(
+                session.encoder_mut(),
+                registry,
+                device,
+                weight.buffer,
+                input,
+                output,
+                &DenseMmF16F32Params {
+                    m: params.m,
+                    n: params.n,
+                    k: params.k,
+                    src0_batch: params.src0_batch,
+                    src1_batch: params.src1_batch,
+                },
+            ),
+            GgmlType::BF16 => mlx_native::dense_matmul_bf16_f32_auto(
+                session.encoder_mut(),
+                registry,
+                device,
+                weight.buffer,
+                input,
+                output,
+                &params,
+            )
+            .map(|_| ()),
+            _ => unreachable!(),
+        }
+        .context("encode native-scalar batched DeepSeek-V4 output-A projection")?;
+        return Ok(());
+    }
     if weight.buffer.dtype() != DType::U8 {
         bail!("DeepSeek-V4 output-A grouped projection requires block-quantized storage");
     }
@@ -403,7 +568,10 @@ pub(super) fn grouped_output_a(
         .checked_div(block)
         .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
         .context("DeepSeek-V4 output-A row-byte overflow")?;
-    if matches!(weight.ggml_type, GgmlType::Q2_K | GgmlType::Q8_0) {
+    if matches!(
+        weight.ggml_type,
+        GgmlType::Q2_K | GgmlType::Q5_0 | GgmlType::Q8_0
+    ) {
         session.barrier_between(&[input, weight.buffer], &[output]);
         return quantized_matmul_ggml_batched_mv(
             session.encoder_mut(),
@@ -493,8 +661,9 @@ impl BatchedGroupedOutputArena {
 }
 
 /// Apply independently-quantized output-A groups with a true `m=rows`
-/// matrix dispatch. Q8_0 consumes token-major attention through explicit
-/// input strides; other formats retain the group-major input permutation.
+/// matrix dispatch. Formats with a native strided-input kernel consume
+/// token-major attention directly; other formats retain the group-major
+/// input permutation.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn grouped_output_a_batched(
     session: &mut GraphSession<'_>,
@@ -523,6 +692,93 @@ pub(super) fn grouped_output_a_batched(
             weight.shape
         );
     }
+    if matches!(
+        weight.ggml_type,
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+    ) {
+        session.barrier_between(&[input], &[&arena.input_group_major]);
+        permute_021_f32(
+            session.encoder_mut(),
+            registry,
+            device.metal_device(),
+            input,
+            &arena.input_group_major,
+            rows,
+            groups,
+            group_width,
+        )?;
+        session.barrier_between(
+            &[&arena.input_group_major, weight.buffer],
+            &[&arena.output_group_major],
+        );
+        let m = u32::try_from(rows).context("DeepSeek-V4 output-A rows exceed u32")?;
+        let n = u32::try_from(rank).context("DeepSeek-V4 output-A rank exceeds u32")?;
+        let k =
+            u32::try_from(group_width).context("DeepSeek-V4 output-A group width exceeds u32")?;
+        let batches = u32::try_from(groups).context("DeepSeek-V4 output-A groups exceed u32")?;
+        match weight.ggml_type {
+            GgmlType::F32 => dense_matmul_f32_f32_tensor(
+                session.encoder_mut(),
+                registry,
+                device,
+                weight.buffer,
+                &arena.input_group_major,
+                &arena.output_group_major,
+                &DenseMmF32F32Params {
+                    m,
+                    n,
+                    k,
+                    src0_batch: batches,
+                    src1_batch: batches,
+                },
+            ),
+            GgmlType::F16 => dense_matmul_f16_f32_tensor(
+                session.encoder_mut(),
+                registry,
+                device,
+                weight.buffer,
+                &arena.input_group_major,
+                &arena.output_group_major,
+                &DenseMmF16F32Params {
+                    m,
+                    n,
+                    k,
+                    src0_batch: batches,
+                    src1_batch: batches,
+                },
+            ),
+            GgmlType::BF16 => mlx_native::dense_matmul_bf16_f32_auto(
+                session.encoder_mut(),
+                registry,
+                device,
+                weight.buffer,
+                &arena.input_group_major,
+                &arena.output_group_major,
+                &DenseMmBf16F32Params {
+                    m,
+                    n,
+                    k,
+                    src0_batch: batches,
+                    src1_batch: batches,
+                },
+            )
+            .map(|_| ()),
+            _ => unreachable!(),
+        }
+        .context("encode native-scalar batched DeepSeek-V4 output-A prefill")?;
+        session.barrier_between(&[&arena.output_group_major], &[output]);
+        permute_021_f32(
+            session.encoder_mut(),
+            registry,
+            device.metal_device(),
+            &arena.output_group_major,
+            output,
+            groups,
+            rows,
+            rank,
+        )?;
+        return Ok(());
+    }
     if weight.buffer.dtype() != DType::U8 {
         bail!("DeepSeek-V4 output-A grouped projection requires block-quantized storage");
     }
@@ -535,7 +791,9 @@ pub(super) fn grouped_output_a_batched(
         .and_then(|blocks| blocks.checked_mul(weight.ggml_type.block_bytes() as usize))
         .context("DeepSeek-V4 output-A row-byte overflow")?;
 
-    if weight.ggml_type == GgmlType::Q8_0 && rows > MM_ROUTING_THRESHOLD as usize {
+    if matches!(weight.ggml_type, GgmlType::Q5_0 | GgmlType::Q8_0)
+        && rows > MM_ROUTING_THRESHOLD as usize
+    {
         let input_row_bytes = groups
             .checked_mul(group_width)
             .and_then(|elements| elements.checked_mul(DType::F32.size_of()))
@@ -567,7 +825,12 @@ pub(super) fn grouped_output_a_batched(
                     batch_bytes: input_group_bytes,
                 },
             )
-            .context("encode strided native-batched DeepSeek-V4 Q8_0 output-A projection")?;
+            .with_context(|| {
+                format!(
+                    "encode strided native-batched DeepSeek-V4 {:?} output-A projection",
+                    weight.ggml_type
+                )
+            })?;
     } else {
         session.barrier_between(&[input], &[&arena.input_group_major]);
         permute_021_f32(
@@ -733,6 +996,9 @@ pub(super) fn expert_matmul(
     k: usize,
     route: ExpertMatmulRoute,
     scratch: Option<&mut IdMmScratch>,
+    activation_epoch: u64,
+    id_multiplicity: DenseMatmulIdMultiplicity,
+    dense_scratch_slot: DenseExpertScratchSlot,
     label: &str,
 ) -> Result<()> {
     if weight.shape != [experts, n, k] {
@@ -743,6 +1009,72 @@ pub(super) fn expert_matmul(
     }
     if safe_ids.dtype() != DType::U32 {
         bail!("DeepSeek-V4 {label} expert IDs must be sanitized U32");
+    }
+    if matches!(
+        weight.ggml_type,
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+    ) {
+        let expected_dtype = match weight.ggml_type {
+            GgmlType::F32 => DType::F32,
+            GgmlType::F16 => DType::F16,
+            GgmlType::BF16 => DType::BF16,
+            _ => unreachable!(),
+        };
+        anyhow::ensure!(
+            weight.buffer.dtype() == expected_dtype,
+            "DeepSeek-V4 {label} declared {:?} but maps as {}",
+            weight.ggml_type,
+            weight.buffer.dtype()
+        );
+        let n_tokens =
+            u32::try_from(n_tokens).context("DeepSeek-V4 scalar expert token count exceeds u32")?;
+        let top_k = u32::try_from(top_k).context("DeepSeek-V4 scalar expert top-k exceeds u32")?;
+        let n = u32::try_from(n).context("DeepSeek-V4 scalar expert output width exceeds u32")?;
+        let k = u32::try_from(k).context("DeepSeek-V4 scalar expert input width exceeds u32")?;
+        let n_experts =
+            u32::try_from(experts).context("DeepSeek-V4 scalar expert count exceeds u32")?;
+        let expert_stride_bytes = u64::from(n)
+            .checked_mul(u64::from(k))
+            .and_then(|elements| elements.checked_mul(expected_dtype.size_of() as u64))
+            .context("DeepSeek-V4 scalar expert stride overflow")?;
+        let params = DenseMatmulIdParams {
+            m: n_tokens,
+            n,
+            k,
+            top_k,
+            n_experts,
+            expert_stride_bytes,
+            input_layout: if route == ExpertMatmulRoute::SlottedMm {
+                DenseMatmulIdInputLayout::Slotted
+            } else {
+                DenseMatmulIdInputLayout::SharedPerToken
+            },
+            id_multiplicity,
+            route: DenseMatmulIdRoute::Direct,
+        };
+        return with_dense_expert_scratch(
+            dense_scratch_slot,
+            activation_epoch,
+            device,
+            n_experts,
+            n_tokens,
+            |dense_scratch| {
+                session
+                    .dense_matmul_id_auto(
+                        registry,
+                        device,
+                        activation_epoch,
+                        weight.buffer,
+                        input,
+                        safe_ids,
+                        output,
+                        Some(dense_scratch),
+                        &params,
+                    )
+                    .map(|_| ())
+            },
+        )
+        .with_context(|| format!("encode DeepSeek-V4 {label} native scalar expert"));
     }
     let block = weight.ggml_type.block_values() as usize;
     if k % block != 0 {
@@ -819,7 +1151,85 @@ pub(super) fn expert_matmul(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::dense_bf16_activation::NativeBf16Matrix;
     use crate::serve::gpu::GpuContext;
+
+    fn encode_expert_test_matrix(values: &[f32], row_width: usize, ggml_type: GgmlType) -> Vec<u8> {
+        match ggml_type {
+            GgmlType::Q4_0 => crate::quantize::ggml_quants::q4_0::quantize(values, row_width, None),
+            GgmlType::Q5_0 => crate::quantize::ggml_quants::q5_0::quantize(values, row_width, None),
+            GgmlType::Q5_1 => crate::quantize::ggml_quants::q5_1::quantize(values, row_width, None),
+            GgmlType::Q8_0 => crate::quantize::ggml_quants::q8_0::quantize(values, row_width, None),
+            other => panic!("unsupported DeepSeek mixed expert test codec {other:?}"),
+        }
+    }
+
+    fn upload_expert_test_matrix(
+        device: &MlxDevice,
+        bytes: &[u8],
+        ggml_type: GgmlType,
+        shape: &[usize; 3],
+    ) -> MlxBuffer {
+        let mut buffer = alloc(
+            device,
+            DType::U8,
+            vec![bytes.len()],
+            "mixed expert test matrix",
+        )
+        .unwrap();
+        buffer.as_mut_slice::<u8>().unwrap().copy_from_slice(bytes);
+        let expected = shape[0]
+            * shape[1]
+            * (shape[2] / ggml_type.block_values() as usize)
+            * ggml_type.block_bytes() as usize;
+        assert_eq!(bytes.len(), expected);
+        buffer
+    }
+
+    fn expert_test_oracle(
+        input: &[f32],
+        ids: &[u32],
+        packed: &[u8],
+        ggml_type: GgmlType,
+        experts: usize,
+        rows: usize,
+        n: usize,
+        k: usize,
+    ) -> Vec<f32> {
+        let mut weights = vec![0.0_f32; experts * n * k];
+        mlx_native::gguf::test_only_dequantize(packed, ggml_type, &mut weights)
+            .expect("dequantize DeepSeek mixed expert oracle");
+        let mut output = vec![0.0_f32; rows * n];
+        for row in 0..rows {
+            let expert = ids[row] as usize;
+            for column in 0..n {
+                output[row * n + column] = (0..k)
+                    .map(|inner| {
+                        input[row * k + inner] * weights[(expert * n + column) * k + inner]
+                    })
+                    .sum();
+            }
+        }
+        output
+    }
+
+    fn assert_expert_test_output(label: &str, actual: &[f32], expected: &[f32]) {
+        assert!(actual.iter().all(|value| value.is_finite()));
+        assert!(actual.iter().any(|value| *value != 0.0));
+        let (index, max_error) = actual
+            .iter()
+            .zip(expected)
+            .enumerate()
+            .map(|(index, (&actual, &expected))| (index, (actual - expected).abs()))
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+            .unwrap();
+        assert!(
+            max_error < 2e-3,
+            "{label} max error {max_error:.3e} at {index}: actual={} expected={}",
+            actual[index],
+            expected[index]
+        );
+    }
 
     #[test]
     fn raw_matmul_accepts_quality_sensitive_f32_weights() {
@@ -861,6 +1271,515 @@ mod tests {
             output.as_slice::<f32>().unwrap(),
             input.as_slice::<f32>().unwrap()
         );
+    }
+
+    #[test]
+    fn mixed_expert_codecs_execute_independently_at_decode_and_mm_widths() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut ctx = GpuContext::new().unwrap();
+        let device = ctx.device().clone();
+        let (experts, n, k) = (3_usize, 32_usize, 32_usize);
+        let shape = [experts, n, k];
+        let codecs = [
+            GgmlType::Q4_0,
+            GgmlType::Q5_0,
+            GgmlType::Q8_0,
+            GgmlType::Q5_1,
+        ];
+        let mut seed = 0x4453_4D58_u32;
+        let mut random = |count: usize, scale: f32| {
+            (0..count)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed as i32 as f32 / i32::MAX as f32) * scale
+                })
+                .collect::<Vec<_>>()
+        };
+        let source_weights = codecs
+            .iter()
+            .map(|_| random(experts * n * k, 0.08))
+            .collect::<Vec<_>>();
+        let packed = codecs
+            .iter()
+            .zip(&source_weights)
+            .map(|(&codec, values)| encode_expert_test_matrix(values, k, codec))
+            .collect::<Vec<_>>();
+        let buffers = codecs
+            .iter()
+            .zip(&packed)
+            .map(|(&codec, bytes)| upload_expert_test_matrix(&device, bytes, codec, &shape))
+            .collect::<Vec<_>>();
+        let strides = codecs
+            .iter()
+            .map(|codec| n * (k / codec.block_values() as usize) * codec.block_bytes() as usize)
+            .collect::<Vec<_>>();
+        assert_ne!(strides[0], strides[1]);
+        assert_ne!(strides[0], strides[2]);
+        assert_ne!(strides[1], strides[2]);
+
+        for rows in [1_usize, 33] {
+            let input_values = random(rows * k, 0.3);
+            let ids_values = (0..rows)
+                .map(|row| (row % experts) as u32)
+                .collect::<Vec<_>>();
+            let mut input =
+                alloc(&device, DType::F32, vec![rows, k], "mixed expert input").unwrap();
+            input
+                .as_mut_slice::<f32>()
+                .unwrap()
+                .copy_from_slice(&input_values);
+            let mut ids = alloc(&device, DType::U32, vec![rows], "mixed expert IDs").unwrap();
+            ids.as_mut_slice::<u32>()
+                .unwrap()
+                .copy_from_slice(&ids_values);
+            let outputs = codecs
+                .iter()
+                .map(|_| alloc(&device, DType::F32, vec![rows, n], "mixed expert output").unwrap())
+                .collect::<Vec<_>>();
+
+            let activation_epoch = ctx.activation_epoch();
+            let (executor, registry) = ctx.split();
+            let mut session = executor.begin().unwrap();
+            for index in 0..codecs.len() {
+                let weight = RawMatrixRef {
+                    buffer: &buffers[index],
+                    ggml_type: codecs[index],
+                    shape: &shape,
+                };
+                expert_matmul(
+                    &mut session,
+                    registry,
+                    &device,
+                    &input,
+                    &weight,
+                    &ids,
+                    &outputs[index],
+                    rows,
+                    1,
+                    experts,
+                    n,
+                    k,
+                    if rows == 1 {
+                        ExpertMatmulRoute::ForceMv
+                    } else {
+                        ExpertMatmulRoute::Auto
+                    },
+                    None,
+                    activation_epoch,
+                    DenseMatmulIdMultiplicity::DistinctPerToken,
+                    match index {
+                        0 => DenseExpertScratchSlot::Gate,
+                        1 => DenseExpertScratchSlot::Up,
+                        _ => DenseExpertScratchSlot::Down,
+                    },
+                    "mixed-codec fallback projection",
+                )
+                .unwrap();
+            }
+            session.finish().unwrap();
+
+            for index in 0..codecs.len() {
+                let expected = expert_test_oracle(
+                    &input_values,
+                    &ids_values,
+                    &packed[index],
+                    codecs[index],
+                    experts,
+                    rows,
+                    n,
+                    k,
+                );
+                let actual = outputs[index].as_slice::<f32>().unwrap();
+                assert_expert_test_output(
+                    &format!("DeepSeek {:?} M={rows}", codecs[index]),
+                    actual,
+                    &expected,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_matmul_consumes_native_bf16_without_a_shadow_weight() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut ctx = GpuContext::new().unwrap();
+        let device = ctx.device().clone();
+        let mut input = alloc(&device, DType::F32, vec![2, 4], "BF16 test input").unwrap();
+        input
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&[0.5, -1.0, 2.0, 0.25, -2.0, 0.75, 1.5, -0.5]);
+        let mut weight = alloc(&device, DType::BF16, vec![3, 4], "BF16 test weight").unwrap();
+        let weights = [
+            1.0, 0.5, -0.25, 2.0, -1.5, 0.25, 1.0, 0.5, 0.125, -2.0, 0.75, 1.0,
+        ];
+        for (dst, value) in weight
+            .as_mut_slice::<half::bf16>()
+            .unwrap()
+            .iter_mut()
+            .zip(weights)
+        {
+            *dst = half::bf16::from_f32(value);
+        }
+        let output = alloc(&device, DType::F32, vec![2, 3], "BF16 test output").unwrap();
+        ctx.activate_native_bf16_dense(&[NativeBf16Matrix::unbatched_through(
+            "DeepSeek BF16 test projection",
+            &weight,
+            3,
+            4,
+            2,
+        )
+        .unwrap()])
+            .unwrap();
+        let shape = [3, 4];
+        let weight_ref = RawMatrixRef {
+            buffer: &weight,
+            ggml_type: GgmlType::BF16,
+            shape: &shape,
+        };
+        let (executor, registry) = ctx.split();
+        let mut session = executor.begin().unwrap();
+        raw_matmul(
+            &mut session,
+            registry,
+            &device,
+            &input,
+            &weight_ref,
+            &output,
+            2,
+            3,
+            4,
+            "native BF16",
+        )
+        .unwrap();
+        session.finish().unwrap();
+
+        let expected: Vec<f32> = input
+            .as_slice::<f32>()
+            .unwrap()
+            .chunks_exact(4)
+            .flat_map(|row| {
+                weights
+                    .chunks_exact(4)
+                    .map(move |w| row.iter().zip(w).map(|(x, y)| x * y).sum::<f32>())
+            })
+            .collect();
+        let actual = output.as_slice::<f32>().unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "native BF16 output[{index}]={actual}, expected {expected}"
+            );
+        }
+        assert_eq!(weight.dtype(), DType::BF16);
+        assert_eq!(
+            weight.data_byte_len(),
+            weights.len() * DType::BF16.size_of()
+        );
+    }
+
+    #[test]
+    fn grouped_output_a_native_bf16_matches_independent_groups_for_decode_and_prefill() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut ctx = GpuContext::new().unwrap();
+        let device = ctx.device().clone();
+        let groups = 2usize;
+        let rank = 3usize;
+        let heads = 2usize;
+        let head_dim = 4usize;
+        let group_width = heads * head_dim / groups;
+        let rows = 3usize;
+        let weight_values = [
+            1.0, 0.5, -0.25, 2.0, -1.5, 0.25, 1.0, 0.5, 0.125, -2.0, 0.75, 1.0, -0.5, 1.25, 0.5,
+            -1.0, 2.0, -0.25, 0.75, 0.5, 1.0, 1.5, -0.5, 0.25,
+        ];
+        let mut weight = alloc(
+            &device,
+            DType::BF16,
+            vec![groups * rank, group_width],
+            "grouped BF16 test weight",
+        )
+        .unwrap();
+        for (dst, value) in weight
+            .as_mut_slice::<half::bf16>()
+            .unwrap()
+            .iter_mut()
+            .zip(weight_values)
+        {
+            *dst = half::bf16::from_f32(value);
+        }
+        let matrix = NativeBf16Matrix {
+            label: "DeepSeek grouped BF16 test projection",
+            weight: &weight,
+            n: rank as u32,
+            k: group_width as u32,
+            src0_batch: groups as u32,
+            src1_batch: groups as u32,
+            reachable_row_mask: 1 | (1 << (rows - 1)),
+        };
+        ctx.activate_native_bf16_dense(&[matrix]).unwrap();
+        let shape = [groups * rank, group_width];
+        let weight_ref = RawMatrixRef {
+            buffer: &weight,
+            ggml_type: GgmlType::BF16,
+            shape: &shape,
+        };
+
+        let input_values = [
+            0.5, -1.0, 2.0, 0.25, -2.0, 0.75, 1.5, -0.5, 1.0, 0.25, -0.75, 2.0, 0.5, 1.25, -1.5,
+            0.75, -0.25, 2.0, 0.5, -1.0, 1.5, -0.5, 0.25, 1.0,
+        ];
+        let reference = |row: usize| -> Vec<f32> {
+            (0..groups)
+                .flat_map(|group| {
+                    (0..rank).map(move |out| {
+                        let input_base = (row * groups + group) * group_width;
+                        let weight_base = (group * rank + out) * group_width;
+                        (0..group_width)
+                            .map(|column| {
+                                input_values[input_base + column]
+                                    * weight_values[weight_base + column]
+                            })
+                            .sum::<f32>()
+                    })
+                })
+                .collect()
+        };
+
+        let mut decode_input = alloc(
+            &device,
+            DType::F32,
+            vec![1, groups, group_width],
+            "grouped BF16 decode input",
+        )
+        .unwrap();
+        decode_input
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&input_values[..groups * group_width]);
+        let decode_output = alloc(
+            &device,
+            DType::F32,
+            vec![1, groups, rank],
+            "grouped BF16 decode output",
+        )
+        .unwrap();
+        {
+            let (executor, registry) = ctx.split();
+            let mut session = executor.begin().unwrap();
+            grouped_output_a(
+                &mut session,
+                registry,
+                &device,
+                &decode_input,
+                &weight_ref,
+                &decode_output,
+                groups,
+                rank,
+                heads,
+                head_dim,
+            )
+            .unwrap();
+            session.finish().unwrap();
+        }
+        assert_eq!(decode_output.as_slice::<f32>().unwrap(), reference(0));
+
+        let mut prefill_input = alloc(
+            &device,
+            DType::F32,
+            vec![rows, groups, group_width],
+            "grouped BF16 prefill input",
+        )
+        .unwrap();
+        prefill_input
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&input_values);
+        let prefill_output = alloc(
+            &device,
+            DType::F32,
+            vec![rows, groups, rank],
+            "grouped BF16 prefill output",
+        )
+        .unwrap();
+        let arena =
+            BatchedGroupedOutputArena::new(&device, rows, groups, group_width, rank).unwrap();
+        {
+            let (executor, registry) = ctx.split();
+            let mut session = executor.begin().unwrap();
+            grouped_output_a_batched(
+                &mut session,
+                registry,
+                &device,
+                &prefill_input,
+                &weight_ref,
+                &prefill_output,
+                &arena,
+                rows,
+                groups,
+                rank,
+                heads,
+                head_dim,
+            )
+            .unwrap();
+            session.finish().unwrap();
+        }
+        let expected: Vec<_> = (0..rows).flat_map(reference).collect();
+        assert_eq!(prefill_output.as_slice::<f32>().unwrap(), expected);
+        assert_eq!(weight.dtype(), DType::BF16);
+    }
+
+    #[test]
+    fn grouped_output_a_native_q5_0_matches_dequantized_oracle_for_mv_and_strided_mm() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let mut ctx = GpuContext::new().unwrap();
+        let device = ctx.device().clone();
+        let groups = 2usize;
+        let rank = 3usize;
+        let group_width = 32usize;
+        let heads = groups;
+        let head_dim = group_width;
+        let rows = MM_ROUTING_THRESHOLD as usize + 1;
+        let source_weight = (0..groups * rank * group_width)
+            .map(|index| ((index * 29 % 97) as f32 - 48.0) / 53.0)
+            .collect::<Vec<_>>();
+        let packed =
+            crate::quantize::ggml_quants::q5_0::quantize(&source_weight, group_width, None);
+        let mut dequantized = vec![0.0_f32; source_weight.len()];
+        mlx_native::gguf::test_only_dequantize(&packed, GgmlType::Q5_0, &mut dequantized).unwrap();
+        let mut weight = alloc(
+            &device,
+            DType::U8,
+            vec![packed.len()],
+            "grouped Q5_0 test weight",
+        )
+        .unwrap();
+        weight
+            .as_mut_slice::<u8>()
+            .unwrap()
+            .copy_from_slice(&packed);
+        let shape = [groups * rank, group_width];
+        let weight_ref = RawMatrixRef {
+            buffer: &weight,
+            ggml_type: GgmlType::Q5_0,
+            shape: &shape,
+        };
+        let input_values = (0..rows * groups * group_width)
+            .map(|index| ((index * 17 % 71) as f32 - 35.0) / 41.0)
+            .collect::<Vec<_>>();
+        let reference = |row: usize| -> Vec<f32> {
+            (0..groups)
+                .flat_map(|group| {
+                    (0..rank).map({
+                        let input_values = &input_values;
+                        let dequantized = &dequantized;
+                        move |out| {
+                            let input_base = (row * groups + group) * group_width;
+                            let weight_base = (group * rank + out) * group_width;
+                            (0..group_width)
+                                .map(|column| {
+                                    input_values[input_base + column]
+                                        * dequantized[weight_base + column]
+                                })
+                                .sum::<f32>()
+                        }
+                    })
+                })
+                .collect()
+        };
+        let assert_close = |actual: &[f32], expected: &[f32]| {
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 5e-3,
+                    "native Q5_0 output[{index}]={actual}, expected {expected}"
+                );
+            }
+        };
+
+        let mut decode_input = alloc(
+            &device,
+            DType::F32,
+            vec![1, groups, group_width],
+            "grouped Q5_0 decode input",
+        )
+        .unwrap();
+        decode_input
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&input_values[..groups * group_width]);
+        let decode_output = alloc(
+            &device,
+            DType::F32,
+            vec![1, groups, rank],
+            "grouped Q5_0 decode output",
+        )
+        .unwrap();
+        {
+            let (executor, registry) = ctx.split();
+            let mut session = executor.begin().unwrap();
+            grouped_output_a(
+                &mut session,
+                registry,
+                &device,
+                &decode_input,
+                &weight_ref,
+                &decode_output,
+                groups,
+                rank,
+                heads,
+                head_dim,
+            )
+            .unwrap();
+            session.finish().unwrap();
+        }
+        assert_close(decode_output.as_slice::<f32>().unwrap(), &reference(0));
+
+        let mut prefill_input = alloc(
+            &device,
+            DType::F32,
+            vec![rows, groups, group_width],
+            "grouped Q5_0 prefill input",
+        )
+        .unwrap();
+        prefill_input
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&input_values);
+        let prefill_output = alloc(
+            &device,
+            DType::F32,
+            vec![rows, groups, rank],
+            "grouped Q5_0 prefill output",
+        )
+        .unwrap();
+        let arena =
+            BatchedGroupedOutputArena::new(&device, rows, groups, group_width, rank).unwrap();
+        {
+            let (executor, registry) = ctx.split();
+            let mut session = executor.begin().unwrap();
+            grouped_output_a_batched(
+                &mut session,
+                registry,
+                &device,
+                &prefill_input,
+                &weight_ref,
+                &prefill_output,
+                &arena,
+                rows,
+                groups,
+                rank,
+                heads,
+                head_dim,
+            )
+            .unwrap();
+            session.finish().unwrap();
+        }
+        let expected = (0..rows).flat_map(reference).collect::<Vec<_>>();
+        assert_close(prefill_output.as_slice::<f32>().unwrap(), &expected);
+        assert_eq!(weight.dtype(), DType::U8);
+        assert_eq!(weight.data_byte_len(), packed.len());
     }
 
     #[test]

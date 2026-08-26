@@ -56,8 +56,9 @@ pub struct MtpWeights {
     /// `None` when the MTP block shares the main verifier's `token_embd.weight`
     /// (Qwen3.6 27B + 35B-A3B convention; HF flag `False`). At draft time the
     /// caller of `forward_draft` already supplies the embedding (`embed_t`); the
-    /// verifier embedding table itself lives on `Qwen35Model::token_embd` and is
-    /// reused via the hot embed_tokens lookup path — no buffer duplication.
+    /// verifier embedding table itself lives in
+    /// `Qwen35Model::token_embd_native` and is reused through its exact mapped
+    /// buffer owner — no table or output-head duplication.
     #[allow(dead_code)]
     pub(super) embed_tokens: Option<MlxQWeight>,
     pub(super) shared_head_norm: MlxBuffer,
@@ -1132,9 +1133,12 @@ impl MtpWeights {
         .context("MTP fused greedy argmax")?;
         enc.commit_and_wait_labeled("mtp.shared_head_argmax")
             .context("MTP commit fused shared-head argmax")?;
-        let token = out_index
-            .as_slice::<u32>()
-            .map_err(|error| anyhow!("MTP greedy argmax index slice: {error}"))?[0];
+        let token = crate::inference::argmax::read_finite_argmax_one(
+            &out_index,
+            &out_value,
+            self.vocab_size,
+            "Qwen MTP shared head",
+        )?;
         Ok((token, normed))
     }
 }
@@ -1222,7 +1226,7 @@ fn rms_norm_with_weight(
 
 #[cfg(test)]
 #[path = "mtp_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 fn upload_i32(data: &[i32], device: &MlxDevice) -> Result<MlxBuffer> {
     let mut buf = device

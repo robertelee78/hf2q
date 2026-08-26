@@ -36,11 +36,10 @@
 //!   loaded via `gguf.load_tensor(...)`) **as before**, then registered
 //!   via [`register_weight_buffer`] before being stored in
 //!   `ForwardGpuCache`.
-//! * The pool lives for the lifetime of the thread (`thread_local!`).
-//!   Because forward passes run on a single owning thread (per
-//!   `feedback_oom_prevention`: one model-loading inference at a time),
-//!   the pool effectively spans every forward call — the residency hint
-//!   stays in place across all dispatches.
+//! * The pool spans every forward call in one model activation. At an
+//!   A→B boundary [`clear_for_model_activation`] replaces it before B's GPU
+//!   cache is materialized, so A's residency owner and any legacy registered
+//!   allocation clones cannot survive into B.
 //! * On thread teardown, the pool's `Drop` runs `remove_all_residency_allocations`;
 //!   the underlying `metal::Buffer` ARCs are still held by the caller's
 //!   `MlxBuffer` handles and are not freed.
@@ -55,13 +54,13 @@
 //!
 //! # Soundness contract
 //!
-//! No `MlxBuffer` whose underlying `metal::Buffer` was registered via
-//! [`register_weight_buffer`] may be dropped before the
-//! `ForwardGpuCache`'s pool reference goes away.  In practice this is
-//! trivial: both the buffers and the pool live for the program lifetime
-//! (the cache is rebuilt only on model swap, and mlx-native's pool `Drop`
-//! correctly cleans up residency-set membership before the device is
-//! dropped).
+//! Within an activation, no legacy `MlxBuffer` whose underlying
+//! `metal::Buffer` was registered via [`register_weight_buffer`] may be
+//! dropped before the pool is replaced. At activation replacement the GPU
+//! cache is dropped before this independent thread-local pool, so mlx-native
+//! removes legacy residency-set membership while the exact device owner is
+//! still unambiguous. Modern buffers own residency membership directly and
+//! do not add an allocation clone to this pool.
 
 use std::cell::RefCell;
 
@@ -71,6 +70,27 @@ thread_local! {
     /// Per-thread long-lived pool for static weight residency-set membership.
     /// Initialized lazily on the first [`register_weight_buffer`] call.
     static WEIGHT_POOL: RefCell<MlxBufferPool> = RefCell::new(MlxBufferPool::new());
+    #[cfg(test)]
+    static ACTIVATION_CLEAR_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Release this thread's residency-only registration owner at a model
+/// activation boundary.
+///
+/// Modern `MlxBuffer`s own their residency membership directly, so replacing
+/// this pool does not unregister live model buffers. It does release any
+/// legacy externally-registered allocation clones and, critically, prevents
+/// a prior model's residency-set owner from becoming the implicit authority
+/// for a later model loaded on the same thread.
+pub(super) fn clear_for_model_activation() {
+    WEIGHT_POOL.with(|cell| *cell.borrow_mut() = MlxBufferPool::new());
+    #[cfg(test)]
+    ACTIVATION_CLEAR_GENERATION.with(|generation| generation.set(generation.get() + 1));
+}
+
+#[cfg(test)]
+pub(super) fn activation_clear_generation() -> u64 {
+    ACTIVATION_CLEAR_GENERATION.with(std::cell::Cell::get)
 }
 
 /// Register `buffer`'s underlying Metal allocation with the thread-local

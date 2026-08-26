@@ -398,9 +398,7 @@ fn generation_events_stream_with_metrics(
                     // BEFORE the finish_reason chunk. Pre-Phase-2c the
                     // streaming path discarded the diagnostic — clients
                     // only saw a chunk with finish_reason='error' followed
-                    // by [DONE], with no actionable message (e.g. the
-                    // qwen3vl_text_forward_pending sentinel from iter-228a's
-                    // engine seam was effectively invisible). Emitting the
+                    // by [DONE], with no actionable message. Emitting the
                     // message as content matches what real OpenAI clients
                     // surface to users (Continue, OpenWebUI, etc. render
                     // delta.content even when finish_reason='error').

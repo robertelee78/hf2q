@@ -2770,6 +2770,9 @@ mod tests {
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
         let tensors =
             Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload tensors");
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, fc_in]);
 
         let mut enc = device.command_encoder().expect("encoder");
@@ -2836,6 +2839,9 @@ mod tests {
         let blob = build_blob_with_fc_weight(&manifest, &weight_bf16_bytes);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![1, fc_in]);
 
         let mut enc = device.command_encoder().expect("encoder");
@@ -3347,6 +3353,9 @@ mod tests {
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, cfg).expect("weights load");
         let tensors = Eagle3DrafterTensors::upload(device, cfg, &weights).expect("upload");
+        tensors
+            .activate_test_bf16_routes(device, registry)
+            .expect("activate EAGLE BF16 routes");
         let input_gpu = upload_f32_to_gpu(
             device,
             input_data,
@@ -3488,6 +3497,9 @@ mod tests {
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
 
         let seq_len = 3_u32;
         let input_data = vec![0.0f32; (seq_len as usize) * cfg.qkv_input_width()];
@@ -3530,6 +3542,9 @@ mod tests {
         let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
 
         let seq_len = 3_u32;
         let input_data = vec![0.0f32; (seq_len as usize) * cfg.qkv_input_width()];
@@ -4533,6 +4548,9 @@ mod tests {
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let input_gpu =
             upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, in_features]);
 
@@ -4758,6 +4776,9 @@ mod tests {
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, hidden]);
 
         let mut enc = device.command_encoder().expect("encoder");
@@ -5005,6 +5026,9 @@ mod tests {
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let input_gpu = upload_f32_to_gpu(&device, &input_data, vec![seq_len as usize, hidden]);
 
         let mut enc = device.command_encoder().expect("encoder");
@@ -5464,6 +5488,9 @@ mod tests {
         let blob = build_blob_with_overrides(&manifest, &overrides);
         let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
 
         // Inputs: deterministic VARYING target_aux_hidden + embeds.
         // (Constant inputs make RMSNorm act trivially since variance
@@ -5908,6 +5935,9 @@ mod tests {
             Some(t) => t,
             None => return,
         };
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let mut cache =
             DrafterKvCache::new(&device, cfg.num_kv_heads, 1, cfg.head_dim).expect("alloc cache");
         assert_eq!(cache.len(), 0);
@@ -6043,6 +6073,9 @@ mod tests {
             Some(t) => t,
             None => return,
         };
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         // capacity=1, populate once, then call again to overflow.
         let mut cache =
             DrafterKvCache::new(&device, cfg.num_kv_heads, 1, cfg.head_dim).expect("alloc cache");
@@ -6100,6 +6133,9 @@ mod tests {
             Some(t) => t,
             None => return,
         };
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         // Ordinary suites execute once. Release verification can run a
         // substantial same-process soak without paying cargo/test-process
         // startup for every repetition.
@@ -6179,6 +6215,9 @@ mod tests {
             Some(t) => t,
             None => return,
         };
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
         let mut cache =
             DrafterKvCache::new(&device, cfg.num_kv_heads, 2, cfg.head_dim).expect("cache");
         let logits1 = dispatch_eagle3_drafter_forward_with_kv_cache(
@@ -6233,6 +6272,9 @@ mod tests {
         );
         let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        tensors
+            .activate_test_bf16_routes(&device, &mut registry)
+            .expect("activate EAGLE BF16 routes");
 
         let seq_len = 8_u32;
         let input_data = vec![0.0f32; (seq_len as usize) * cfg.fc_input_size()];

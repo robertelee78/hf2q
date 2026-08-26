@@ -3,6 +3,15 @@
 - **Status**: ✅ SHIPPED (split + EAGLE-3 enablement) — Steps 1+2+3 SHIPPED (monolith deleted; `forward_mlx.rs` 10142 LOC → split into `forward_mlx_shared.rs` + `inference/models/gemma4/{model,forward_gpu,gpu_full_attn,gpu_ffn,kv_cache,kv_persist,io_heads,profile,tokenizer}.rs`) + Step 4 G4-CFA-1 through G4-CFA-5f SHIPPED + Layer B ≥50-token coherence assertion SATISFIED (latest hf2q `e2e157e1`). **ROOT CAUSE of CFA-5e** identified via llama-eval-callback diff (peer tokenized 7 tokens, hf2q tokenized 6 — missing BOS=2): bundled HF `tokenizer.json` has legacy post_processor template that silently drops BOS. Fixed in 4 phases (commits `b0423671` inline + `e2e157e1` permanent consolidation): new `src/core/tokenizer_adapter.rs` shared module mirrors llama.cpp's `common_tokenize` semantics; 3 EAGLE-3 sites route through helper; 2 unit tests lock in the bug class; new `hf2q tokenizer fix-bos` CLI subcommand patches HF tokenizer.json in place. CFA-6 (SOTA bench) technically unblocked but requires trained EAGLE-3 drafter (E2 multi-week H100 work, scoped separately from ADR-038). **Discovery arc**: hf2q has never run dense Gemma 4 31B end-to-end before this session — 16 commits surfaced + fixed 6 sequential dense-Gemma-4 production gaps: 5b loader, 5c persistent KV, 5d Q4_K/Q5_K/Q6_K projection dispatch, 5e/step1 GELU activation, 5e/step2-3 diagnostic narrowing, 5e ROOT-CAUSE BOS tokenization, 5f production prefill MoE-gating.
 - **Date**: 2026-05-22
 
+> **Code-truth update (2026-08-22):** The source inventories and phase rows
+> below describe the split when it landed. Current shared matrix ownership is
+> `MlxQWeight::from_mapped_gguf_tensor` plus
+> `map_native_gguf_tensor_view`; Gemma's capability policy lives in
+> `inference/models/gemma4/native_matrix.rs`. The legacy shadow-population
+> helper and shadow field were removed.
+> Production Gemma execution retains admitted artifact bytes instead of
+> synthesizing a dense prompt shadow.
+
 ## Phase status
 
 | Step | Status | Commit | Notes |
@@ -172,7 +181,7 @@ src/inference/spec_decode/eagle3_orchestrator.rs
 | `parse_dwq_moe_expert_role` | 1511–1527 | 17 | `qwen35/model.rs:411` |
 | `cosine_pairwise_f32` | 8458–8478 | 21 | `parity_quality.rs:58` |
 | `load_gguf_qweight` | 9359–9389 | 31 | None direct; logically shared (qwen35 re-implements; consolidate) |
-| `populate_f16_shadow_if_enabled` | 9406–9455 | 50 | None direct; logically shared |
+| legacy F16 shadow-population helper (removed) | 9406–9455 | 50 | Historical extraction inventory only |
 | `RmsNormPerHeadArgs<'a>` | 9467–9480 | 14 | `forward_prefill.rs:317` |
 | `dispatch_rms_norm_unit_perhead` | 9493–9534 | 42 | `forward_prefill.rs:317`; sites at `forward_mlx.rs:3466, 3482` |
 | `dispatch_rms_norm_unit_perhead_dual_perm` | 9554–9591 | 38 | `forward_prefill_batched.rs:33` |
@@ -186,7 +195,7 @@ src/inference/spec_decode/eagle3_orchestrator.rs
 #### 3.1.2 Dependency order (topological clusters)
 
 **Cluster 1** — Quantized weight types (atomic):
-1. `MlxAffineExtra` → 2. `MlxQWeight` + impl → 3. `MlxAffineMoeStack` → 4. `load_gguf_qweight` → 5. `populate_f16_shadow_if_enabled` → 6. `dispatch_qmatmul`
+1. `MlxAffineExtra` → 2. `MlxQWeight` + impl → 3. `MlxAffineMoeStack` → 4. `load_gguf_qweight` → 5. legacy shadow population (since removed) → 6. `dispatch_qmatmul`
 
 **Cluster 2** — DWQ overlay parsing (atomic):
 7. `DwqOverlayRole` → 8. `parse_dwq_overlay_metadata` → 9. `parse_dwq_overlay_role` → 10. `MoeBaseRole` → 11. `parse_dwq_moe_expert_role`
@@ -210,9 +219,7 @@ pub use forward_mlx_shared::{
     parse_dwq_overlay_metadata, parse_dwq_overlay_role, DwqOverlayRole,
     MlxAffineExtra, MlxAffineMoeStack, MlxQWeight, MoeBaseRole, RmsNormPerHeadArgs,
 };
-pub(crate) use forward_mlx_shared::{
-    load_gguf_qweight, populate_f16_shadow_if_enabled, rms_norm_f32_hs_cached,
-};
+pub(crate) use forward_mlx_shared::{load_gguf_qweight, rms_norm_f32_hs_cached};
 ```
 
 #### 3.1.4 Test movement

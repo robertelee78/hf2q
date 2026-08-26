@@ -23,6 +23,7 @@
 
 use super::config::Eagle3DrafterConfig;
 use super::weights::{Eagle3Weights, Eagle3WeightsError};
+use crate::inference::dense_bf16_activation::NativeBf16Matrix;
 use mlx_native::{DType, MlxBuffer, MlxDevice, MlxError};
 use safetensors::tensor::TensorView;
 
@@ -192,6 +193,56 @@ fn fetch<'a, 'b>(
 }
 
 impl Eagle3DrafterTensors {
+    pub(crate) fn native_bf16_matrices(&self) -> anyhow::Result<Vec<NativeBf16Matrix<'_>>> {
+        fn push<'a>(
+            out: &mut Vec<NativeBf16Matrix<'a>>,
+            label: &'static str,
+            buffer: &'a MlxBuffer,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                buffer.dtype() == DType::BF16 && buffer.shape().len() == 2,
+                "{label}: EAGLE-3 projection must be rank-two BF16, got {:?} {:?}",
+                buffer.dtype(),
+                buffer.shape()
+            );
+            out.push(NativeBf16Matrix::unbatched_single_row(
+                label,
+                buffer,
+                u32::try_from(buffer.shape()[0])?,
+                u32::try_from(buffer.shape()[1])?,
+            ));
+            Ok(())
+        }
+
+        let mut out = Vec::new();
+        push(&mut out, "EAGLE-3 target-state projection", &self.fc)?;
+        push(&mut out, "EAGLE-3 Q projection", &self.q_proj)?;
+        push(&mut out, "EAGLE-3 K projection", &self.k_proj)?;
+        push(&mut out, "EAGLE-3 V projection", &self.v_proj)?;
+        push(&mut out, "EAGLE-3 attention output", &self.o_proj)?;
+        push(&mut out, "EAGLE-3 FFN gate", &self.mlp_gate)?;
+        push(&mut out, "EAGLE-3 FFN up", &self.mlp_up)?;
+        push(&mut out, "EAGLE-3 FFN down", &self.mlp_down)?;
+        if let Some(head) = self.lm_head.as_ref().or(self.embed_tokens.as_ref()) {
+            push(&mut out, "EAGLE-3 output head", head)?;
+        }
+        Ok(out)
+    }
+
+    /// Give a focused low-level EAGLE test the same calibrated route contract
+    /// that the production orchestrator installs for the target/drafter union.
+    #[cfg(test)]
+    pub(crate) fn activate_test_bf16_routes(
+        &self,
+        device: &MlxDevice,
+        registry: &mut mlx_native::KernelRegistry,
+    ) -> anyhow::Result<()> {
+        let matrices = self.native_bf16_matrices()?;
+        crate::inference::dense_bf16_activation::activate_native_bf16_test_plan(
+            registry, device, &matrices,
+        )
+    }
+
     /// Upload validated EAGLE-3 weights to GPU.
     ///
     /// Pre-conditions: `weights` was loaded against the SAME `cfg`

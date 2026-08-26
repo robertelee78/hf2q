@@ -89,10 +89,137 @@
 //! - Plan: line 5354 (Phase 4 audit + iter-by-iter plan, iter 206 row).
 
 use std::collections::HashMap;
+use std::io::Seek;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::core::hardware::HardwareProfile;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArtifactFileStamp {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl ArtifactFileStamp {
+    pub fn inspect(path: &Path) -> anyhow::Result<Self> {
+        // Inspect the opened payload, not the pathname's virtual filesystem
+        // entry. On macOS, `stat(/dev/fd/N)` reports the devfs device even
+        // though opening that path duplicates the retained regular-file
+        // descriptor. `File::metadata` is `fstat` and therefore preserves the
+        // underlying artifact identity across logical and activation paths.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|error| anyhow::anyhow!("open artifact '{}': {error}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| anyhow::anyhow!("inspect artifact '{}': {error}", path.display()))?;
+        anyhow::ensure!(metadata.is_file(), "artifact is not a regular file");
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    pub fn matches_path(&self, path: &Path) -> bool {
+        Self::inspect(path).is_ok_and(|current| current == *self)
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Stable, portable subset used by the shell gate receipt.  Runtime reuse
+    /// always checks the complete nanosecond stamp above; this is only so a
+    /// gate can reject a changed file without hashing it a second time.
+    pub fn shell_snapshot(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.device, self.inode, self.bytes, self.modified_seconds, self.changed_seconds
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextArtifactIdentity {
+    pub sha256: String,
+    pub stamp: ArtifactFileStamp,
+}
+
+/// Exact filesystem identity for a model-local sidecar. The runtime endpoint
+/// reports only presence booleans; the private path and inode/timestamp stamp
+/// stay server-side and participate in generation reuse decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarArtifactIdentity {
+    path: PathBuf,
+    stamp: Option<ArtifactFileStamp>,
+}
+
+impl SidecarArtifactIdentity {
+    fn inspect_optional(path: Option<&PathBuf>) -> Option<Self> {
+        path.map(|path| Self {
+            path: path.clone(),
+            stamp: ArtifactFileStamp::inspect(path).ok(),
+        })
+    }
+
+    fn is_current(&self) -> bool {
+        self.stamp
+            .as_ref()
+            .is_some_and(|stamp| stamp.matches_path(&self.path))
+    }
+}
+
+impl TextArtifactIdentity {
+    pub(crate) fn inspect(path: &Path) -> anyhow::Result<Self> {
+        let before = ArtifactFileStamp::inspect(path)?;
+        let sha256 = crate::core::sha256::compute_file_sha256(path)
+            .map_err(|error| anyhow::anyhow!("hash text artifact '{}': {error}", path.display()))?;
+        // macOS opens `/dev/fd/N` by duplicating the same open-file
+        // description. Hashing therefore advances the retained authority's
+        // shared cursor; reset it before the GGUF loader receives the same
+        // activation path.
+        let mut cursor = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|error| {
+                anyhow::anyhow!("reopen text artifact '{}' after hash: {error}", path.display())
+            })?;
+        cursor.rewind().map_err(|error| {
+            anyhow::anyhow!("rewind text artifact '{}' after hash: {error}", path.display())
+        })?;
+        let after = ArtifactFileStamp::inspect(path)?;
+        anyhow::ensure!(before == after, "text artifact changed while hashing");
+        Ok(Self {
+            sha256,
+            stamp: after,
+        })
+    }
+
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.sha256.len() == 64
+                && self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !self.sha256.bytes().any(|byte| byte.is_ascii_uppercase()),
+            "verified text artifact digest is not a lowercase SHA-256"
+        );
+        Ok(())
+    }
+}
 
 /// Configuration consumed by [`crate::serve::load_engine`] (and by extension
 /// the [`ModelLoader`] trait that the [`HotSwapManager`] dispatches against).
@@ -108,8 +235,149 @@ use crate::core::hardware::HardwareProfile;
 /// once per load (no hot-path concern with cloning).  The `PathBuf` fields
 /// are `Option<_>` because `--tokenizer` / `--config` default to a
 /// next-to-the-GGUF lookup performed inside `LoadedModel::load`.
+/// Pointer-free projector generation contract. The descriptor can live in
+/// configuration registries without retaining Metal allocations; the loaded
+/// projector is owned only by [`LoadedEngine`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectorAdmission {
+    pub path: PathBuf,
+    pub artifact_sha256: String,
+    pub profile: crate::inference::vision::mmproj::ArchProfile,
+    /// Exact page-rounded physical bytes planned for the projector's shared
+    /// file-backed Metal mappings.
+    pub mapped_weight_bytes: u64,
+    /// Exact per-resource topology from the same planner used by mapping.
+    /// Retaining the topology makes a total-preserving segment mutation fail
+    /// before generation publication.
+    pub mapped_weight_segment_bytes: Vec<u64>,
+    /// Full cache budget reserved for this generation, not current occupancy.
+    pub cache_budget_bytes: u64,
+    pub file_stamp: ArtifactFileStamp,
+}
+
+impl ProjectorAdmission {
+    pub fn inspect(path: &Path, cache_budget_bytes: u64) -> anyhow::Result<Self> {
+        let before = ArtifactFileStamp::inspect(path)?;
+        let artifact_sha256 = crate::core::sha256::compute_file_sha256(path)
+            .map_err(|error| anyhow::anyhow!("hash projector '{}': {error}", path.display()))?;
+        let gguf = mlx_native::gguf::GgufFile::open(path)
+            .map_err(|error| anyhow::anyhow!("projector header preflight failed: {error}"))?;
+        let config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&gguf)
+            .map_err(|error| anyhow::anyhow!("projector config preflight failed: {error}"))?;
+        let names = gguf.tensor_names();
+        crate::inference::vision::mmproj::validate_tensor_set(&config, &names)
+            .map_err(|error| anyhow::anyhow!("projector tensor preflight failed: {error}"))?;
+        crate::inference::vision::mmproj_weights::LoadedMmprojWeights::validate_native_storage(
+            &gguf,
+        )
+        .map_err(|error| anyhow::anyhow!("projector native-storage preflight failed: {error}"))?;
+        let profile = crate::inference::vision::mmproj::detect_arch_profile_with_projector(
+            &config.projector,
+            &names,
+        );
+        let metal_device = mlx_native::metal::Device::system_default()
+            .ok_or_else(|| anyhow::anyhow!("no default Metal device for projector admission"))?;
+        let mapped_plan = gguf
+            .mapped_tensor_storage_plan(&metal_device)
+            .map_err(|error| anyhow::anyhow!("projector mapped-storage plan failed: {error}"))?;
+        let mapped_weight_segment_bytes = mapped_plan
+            .segment_physical_byte_lens()
+            .iter()
+            .map(|&bytes| u64::try_from(bytes).map_err(anyhow::Error::from))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mapped_weight_bytes = u64::try_from(mapped_plan.physical_byte_len())?;
+        drop(gguf);
+        let after = ArtifactFileStamp::inspect(path)?;
+        anyhow::ensure!(
+            before == after,
+            "projector changed during admission preflight"
+        );
+        let admission = Self {
+            path: path.to_path_buf(),
+            artifact_sha256,
+            profile,
+            mapped_weight_bytes,
+            mapped_weight_segment_bytes,
+            cache_budget_bytes,
+            file_stamp: after,
+        };
+        admission.validate()?;
+        Ok(admission)
+    }
+
+    pub fn reserved_bytes(&self) -> anyhow::Result<u64> {
+        self.mapped_weight_bytes
+            .checked_add(self.cache_budget_bytes)
+            .ok_or_else(|| anyhow::anyhow!("projector admission byte count overflow"))
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.path.is_file(), "projector is not a regular file");
+        anyhow::ensure!(
+            self.file_stamp.matches_path(&self.path),
+            "projector changed after admission preflight"
+        );
+        anyhow::ensure!(
+            self.artifact_sha256.len() == 64
+                && self
+                    .artifact_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "projector admission digest is not a SHA-256 hex string"
+        );
+        anyhow::ensure!(
+            self.profile.is_supported(),
+            "projector profile is unsupported"
+        );
+        let segment_total =
+            self.mapped_weight_segment_bytes
+                .iter()
+                .try_fold(0u64, |total, &bytes| {
+                    anyhow::ensure!(bytes > 0, "projector mapped segment must be non-empty");
+                    total
+                        .checked_add(bytes)
+                        .ok_or_else(|| anyhow::anyhow!("projector mapped segment total overflow"))
+                })?;
+        anyhow::ensure!(
+            segment_total == self.mapped_weight_bytes && self.mapped_weight_bytes > 0,
+            "projector mapped-storage total/topology mismatch"
+        );
+        Ok(())
+    }
+
+    pub fn validate_realized_weights(
+        &self,
+        weights: &crate::inference::vision::mmproj_weights::LoadedMmprojWeights,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            weights.owned_bytes() == self.mapped_weight_bytes
+                && weights.mapped_segment_physical_bytes()
+                    == self.mapped_weight_segment_bytes.as_slice(),
+            "projector realized mapped storage differs from admission: planned total/segments={}/{:?}, realized={}/{:?}",
+            self.mapped_weight_bytes,
+            self.mapped_weight_segment_bytes,
+            weights.owned_bytes(),
+            weights.mapped_segment_physical_bytes()
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct EngineConfig {
+    /// Filesystem identity that authorized any model-local paths below.
+    /// `None` for process templates and ordinary path-free loads. AppState
+    /// stamps artifact-local overrides at lookup; the pool compares it with
+    /// the identity captured by the one load-time SHA pass before allocating.
+    pub expected_text_artifact_stamp: Option<ArtifactFileStamp>,
+    /// A content digest plus full filesystem stamp that was authenticated
+    /// immediately before this load.  This is evidence, not model policy:
+    /// it is deliberately excluded from [`EngineConfigIdentity`] so a new
+    /// receipt for the same physical bytes cannot force a generation swap.
+    ///
+    /// Callers must use [`Self::bind_verified_text_artifact`].  A stale or
+    /// malformed identity fails closed; it never falls back to a fresh hash.
+    pub verified_text_artifact: Option<TextArtifactIdentity>,
     /// Stable operator-facing path for a model opened through a retained
     /// descriptor such as `/dev/fd/N`. The loader uses the descriptor for
     /// bytes while load telemetry continues to name this logical path.
@@ -145,6 +413,10 @@ pub struct EngineConfig {
     /// `cmd_serve` from `args.dwq_overlay`.
     pub dwq_overlay_path: Option<PathBuf>,
 
+    /// Exact pointer-free projector artifact paired with this text generation.
+    /// Loaded GPU state belongs only to the resulting `LoadedEngine`.
+    pub projector: Option<ProjectorAdmission>,
+
     /// ADR-040 Phase C iter-4 (C4) — scheduler-policy selection for the
     /// engine spawned from this config.
     ///
@@ -173,9 +445,41 @@ pub struct EngineConfig {
     pub kv_persist_budget_bytes: u64,
 }
 
+impl EngineConfig {
+    /// Bind any model-local policy in this configuration to the physical text
+    /// artifact currently at `path`. The pool validates the same stamp
+    /// against its one load-time digest identity before calling the loader.
+    pub fn bind_text_artifact(&mut self, path: &Path) -> anyhow::Result<()> {
+        self.expected_text_artifact_stamp = Some(ArtifactFileStamp::inspect(path)?);
+        self.verified_text_artifact = None;
+        Ok(())
+    }
+
+    /// Bind a just-authenticated text identity to this load.  The caller has
+    /// already checked its path authority; this method preserves the exact
+    /// stamp through policy registration and the load transaction.
+    pub fn bind_verified_text_artifact(
+        &mut self,
+        identity: TextArtifactIdentity,
+    ) -> anyhow::Result<()> {
+        identity.validate()?;
+        self.expected_text_artifact_stamp = Some(identity.stamp.clone());
+        self.verified_text_artifact = Some(identity);
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for EngineConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EngineConfig")
+            .field(
+                "expected_text_artifact_stamp_present",
+                &self.expected_text_artifact_stamp.is_some(),
+            )
+            .field(
+                "verified_text_artifact_present",
+                &self.verified_text_artifact.is_some(),
+            )
             .field("operator_model_path", &self.operator_model_path)
             .field("tokenizer_path", &self.tokenizer_path)
             .field("config_path", &self.config_path)
@@ -183,6 +487,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("warmup_synchronously", &self.warmup_synchronously)
             .field("kv_metrics_sink_present", &self.kv_metrics_sink.is_some())
             .field("dwq_overlay_path", &self.dwq_overlay_path)
+            .field("projector", &self.projector)
             // ADR-040 Phase C iter-4 (C4) — surface the parsed
             // scheduler-policy selection so operator log greps + test
             // assertions see what mode the engine spawn will request.
@@ -193,6 +498,42 @@ impl std::fmt::Debug for EngineConfig {
             .field("kv_persist_budget_bytes", &self.kv_persist_budget_bytes)
             .finish()
     }
+}
+
+fn validate_expected_text_artifact_stamp(
+    config: &EngineConfig,
+    identity: &TextArtifactIdentity,
+) -> anyhow::Result<()> {
+    if let Some(expected) = config.expected_text_artifact_stamp.as_ref() {
+        anyhow::ensure!(
+            expected == &identity.stamp,
+            "text artifact changed after model-local policy resolution"
+        );
+    }
+    Ok(())
+}
+
+/// Select the one identity that will be published with a generation.  A
+/// verified identity can skip the duplicate content scan only while its full
+/// filesystem stamp is still current; a replacement is an error, never a
+/// fallback to a different set of bytes.
+fn resolve_text_artifact_identity(
+    path: &Path,
+    config: &EngineConfig,
+) -> anyhow::Result<TextArtifactIdentity> {
+    let identity = match config.verified_text_artifact.as_ref() {
+        Some(verified) => {
+            verified.validate()?;
+            anyhow::ensure!(
+                verified.stamp.matches_path(path),
+                "text artifact changed after verified identity was issued"
+            );
+            verified.clone()
+        }
+        None => TextArtifactIdentity::inspect(path)?,
+    };
+    validate_expected_text_artifact_stamp(config, &identity)?;
+    Ok(identity)
 }
 
 /// Path-free identity of the configuration that produced one engine
@@ -212,6 +553,16 @@ pub struct EngineConfigIdentity {
     pub explicit_tokenizer: bool,
     pub explicit_config: bool,
     pub dwq_overlay: bool,
+    pub tokenizer_artifact: Option<SidecarArtifactIdentity>,
+    pub config_artifact: Option<SidecarArtifactIdentity>,
+    pub dwq_overlay_artifact: Option<SidecarArtifactIdentity>,
+    pub projector_path: Option<PathBuf>,
+    pub projector_file_stamp: Option<ArtifactFileStamp>,
+    pub projector_artifact_sha256: Option<String>,
+    pub projector_profile: Option<String>,
+    pub projector_mapped_weight_bytes: Option<u64>,
+    pub projector_mapped_weight_segment_bytes: Option<Vec<u64>>,
+    pub projector_cache_budget_bytes: Option<u64>,
 }
 
 impl Default for EngineConfigIdentity {
@@ -234,7 +585,58 @@ impl From<&EngineConfig> for EngineConfigIdentity {
             explicit_tokenizer: config.tokenizer_path.is_some(),
             explicit_config: config.config_path.is_some(),
             dwq_overlay: config.dwq_overlay_path.is_some(),
+            tokenizer_artifact: SidecarArtifactIdentity::inspect_optional(
+                config.tokenizer_path.as_ref(),
+            ),
+            config_artifact: SidecarArtifactIdentity::inspect_optional(config.config_path.as_ref()),
+            dwq_overlay_artifact: SidecarArtifactIdentity::inspect_optional(
+                config.dwq_overlay_path.as_ref(),
+            ),
+            projector_path: config
+                .projector
+                .as_ref()
+                .map(|projector| projector.path.clone()),
+            projector_file_stamp: config
+                .projector
+                .as_ref()
+                .map(|projector| projector.file_stamp.clone()),
+            projector_artifact_sha256: config
+                .projector
+                .as_ref()
+                .map(|projector| projector.artifact_sha256.clone()),
+            projector_profile: config
+                .projector
+                .as_ref()
+                .map(|projector| projector.profile.as_str().to_owned()),
+            projector_mapped_weight_bytes: config
+                .projector
+                .as_ref()
+                .map(|projector| projector.mapped_weight_bytes),
+            projector_mapped_weight_segment_bytes: config
+                .projector
+                .as_ref()
+                .map(|projector| projector.mapped_weight_segment_bytes.clone()),
+            projector_cache_budget_bytes: config
+                .projector
+                .as_ref()
+                .map(|projector| projector.cache_budget_bytes),
         }
+    }
+}
+
+impl EngineConfigIdentity {
+    fn sidecars_are_current(&self) -> bool {
+        self.tokenizer_artifact
+            .as_ref()
+            .is_none_or(SidecarArtifactIdentity::is_current)
+            && self
+                .config_artifact
+                .as_ref()
+                .is_none_or(SidecarArtifactIdentity::is_current)
+            && self
+                .dwq_overlay_artifact
+                .as_ref()
+                .is_none_or(SidecarArtifactIdentity::is_current)
     }
 }
 
@@ -759,11 +1161,20 @@ pub struct LoadedEngine<E> {
     /// [`crate::serve::api::engine::Engine`] (owns the worker thread,
     /// model weights, KV caches).
     pub engine: E,
+    /// Projector owned by this exact text-engine generation. Handler leases
+    /// clone the enclosing `Arc<LoadedEngine<_>>`, so text and projector can
+    /// neither swap nor reclaim independently while a request is in flight.
+    pub projector: Option<Arc<crate::serve::api::state::LoadedMmproj>>,
     /// HuggingFace repo id (or path stem) — same key the pool uses.
     pub repo: String,
     /// Canonical or loader-supplied GGUF path for exact local-artifact
     /// resident matching. Empty only in synthetic tests.
     pub gguf_path: PathBuf,
+    /// Digest + filesystem identity of the exact text bytes loaded into this
+    /// generation. A same-path replacement cannot hit the resident fast path.
+    pub text_artifact: Option<TextArtifactIdentity>,
+    /// Filesystem identity of the paired projector at admission time.
+    pub projector_file_stamp: Option<ArtifactFileStamp>,
     /// Quantization variant resident on this engine.
     pub quant: QuantType,
     /// On-GPU resident-bytes estimate (typically GGUF file size; the
@@ -778,6 +1189,21 @@ pub struct LoadedEngine<E> {
     pub generation: u64,
     /// Path-free identity of the exact load policy used for this generation.
     pub config_identity: EngineConfigIdentity,
+}
+
+impl<E> LoadedEngine<E> {
+    pub fn artifacts_are_current(&self) -> bool {
+        let text_current = self
+            .text_artifact
+            .as_ref()
+            .is_none_or(|identity| identity.stamp.matches_path(&self.gguf_path));
+        let projector_current = match (&self.projector, &self.projector_file_stamp) {
+            (None, None) => true,
+            (Some(projector), Some(stamp)) => stamp.matches_path(&projector.gguf_path),
+            _ => false,
+        };
+        text_current && projector_current && self.config_identity.sidecars_are_current()
+    }
 }
 
 /// Trait for loading a GGUF into a live engine of type `E`.
@@ -799,6 +1225,20 @@ pub trait ModelLoader<E>: Send + Sync {
     /// chat-template resolution, or warmup; the manager treats any error
     /// as a load-failure and does NOT admit a partial entry.
     fn load(&self, path: &Path, config: &EngineConfig) -> anyhow::Result<E>;
+
+    /// Load and validate the projector paired with `engine`. Called before
+    /// the manager publishes either member of the generation.
+    fn load_projector(
+        &self,
+        _text_path: &Path,
+        _engine: &E,
+        admission: &ProjectorAdmission,
+    ) -> anyhow::Result<Arc<crate::serve::api::state::LoadedMmproj>> {
+        anyhow::bail!(
+            "model loader does not support projector admission for '{}'",
+            admission.path.display()
+        )
+    }
 }
 
 /// Production [`ModelLoader`] — delegates to
@@ -813,6 +1253,15 @@ impl ModelLoader<Engine> for DefaultModelLoader {
             Some(logical) => engine.with_operator_model_path(logical),
             None => engine,
         })
+    }
+
+    fn load_projector(
+        &self,
+        text_path: &Path,
+        engine: &Engine,
+        admission: &ProjectorAdmission,
+    ) -> anyhow::Result<Arc<crate::serve::api::state::LoadedMmproj>> {
+        crate::serve::load_projector_for_engine(text_path, engine, admission)
     }
 }
 
@@ -1108,7 +1557,7 @@ impl std::fmt::Display for HotSwapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PoolRefused(e) => write!(f, "hot-swap pool refused entry: {e}"),
-            Self::LoaderFailed(e) => write!(f, "hot-swap loader failed: {e}"),
+            Self::LoaderFailed(e) => write!(f, "hot-swap loader failed: {e:#}"),
             Self::FileSize { path, source } => write!(
                 f,
                 "hot-swap failed to read GGUF file size for {}: {source}",
@@ -1133,6 +1582,30 @@ impl std::error::Error for HotSwapError {
 /// disambiguate by appending the canonical quant name.
 fn pool_key(repo: &str, quant: QuantType) -> String {
     format!("{repo}@{}", quant.as_str())
+}
+
+pub fn configured_resident_bytes(
+    gguf_path: &Path,
+    config: &EngineConfig,
+) -> Result<u64, HotSwapError> {
+    let text_bytes = std::fs::metadata(gguf_path)
+        .map_err(|source| HotSwapError::FileSize {
+            path: gguf_path.to_path_buf(),
+            source,
+        })?
+        .len();
+    let projector_bytes = config
+        .projector
+        .as_ref()
+        .map(ProjectorAdmission::reserved_bytes)
+        .transpose()
+        .map_err(HotSwapError::LoaderFailed)?
+        .unwrap_or(0);
+    text_bytes.checked_add(projector_bytes).ok_or_else(|| {
+        HotSwapError::LoaderFailed(anyhow::anyhow!(
+            "text + projector resident-byte accounting overflow"
+        ))
+    })
 }
 
 /// Inverse of [`pool_key`] for the iter-213 telemetry path.  Given a
@@ -1307,8 +1780,11 @@ impl<E> HotSwapManager<E> {
         let k = pool_key(repo, quant);
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
+            projector: None,
             repo: repo.to_string(),
             gguf_path: PathBuf::new(),
+            text_artifact: None,
+            projector_file_stamp: None,
             quant,
             bytes_resident,
             loaded_at: SystemTime::now(),
@@ -1382,6 +1858,46 @@ impl<E> HotSwapManager<E> {
         generation
     }
 
+    fn load_configured_projector(
+        &self,
+        text_path: &Path,
+        engine: &E,
+        config: &EngineConfig,
+    ) -> Result<Option<Arc<crate::serve::api::state::LoadedMmproj>>, HotSwapError> {
+        let Some(admission) = config.projector.as_ref() else {
+            return Ok(None);
+        };
+        admission.validate().map_err(HotSwapError::LoaderFailed)?;
+        let projector = self
+            .loader
+            .load_projector(text_path, engine, admission)
+            .map_err(HotSwapError::LoaderFailed)?;
+        let committed = projector
+            .committed_resident_bytes()
+            .map_err(HotSwapError::LoaderFailed)?;
+        let reserved = admission
+            .reserved_bytes()
+            .map_err(HotSwapError::LoaderFailed)?;
+        if projector.gguf_path != admission.path
+            || projector.artifact_sha256 != admission.artifact_sha256
+            || projector.arch != admission.profile
+            || committed != reserved
+        {
+            return Err(HotSwapError::LoaderFailed(anyhow::anyhow!(
+                "loaded projector differs from its admission descriptor"
+            )));
+        }
+        admission
+            .validate_realized_weights(&projector.weights)
+            .map_err(HotSwapError::LoaderFailed)?;
+        if !admission.file_stamp.matches_path(&admission.path) {
+            return Err(HotSwapError::LoaderFailed(anyhow::anyhow!(
+                "projector changed between admission and generation publication"
+            )));
+        }
+        Ok(Some(projector))
+    }
+
     /// Pure admission plan for a candidate whose byte estimate is already
     /// known. This does not touch LRU state and does not invoke the loader.
     pub fn admission_plan(
@@ -1398,19 +1914,18 @@ impl<E> HotSwapManager<E> {
         })
     }
 
-    /// Read the GGUF-size estimate and calculate admission without loading.
+    /// Read the complete configured generation's artifact-size estimate and
+    /// calculate admission without loading. A vision projector is owned by
+    /// the same generation as its text model, so its bytes participate in
+    /// the same fail-closed pool decision.
     pub fn plan_path(
         &self,
         repo: &str,
         quant: QuantType,
         gguf_path: &Path,
+        config: &EngineConfig,
     ) -> Result<AdmissionPlan, HotSwapError> {
-        let bytes_resident = std::fs::metadata(gguf_path)
-            .map_err(|source| HotSwapError::FileSize {
-                path: gguf_path.to_path_buf(),
-                source,
-            })?
-            .len();
+        let bytes_resident = configured_resident_bytes(gguf_path, config)?;
         Ok(self.admission_plan(repo, quant, bytes_resident))
     }
 
@@ -1554,29 +2069,43 @@ impl<E> HotSwapManager<E> {
     ) -> Result<NonEvictingLoad<E>, HotSwapError> {
         let k = pool_key(repo, quant);
         if let Some(existing) = self.engines.get(&k).cloned() {
-            self.pool.touch(&k);
-            return Ok(NonEvictingLoad::Resident(existing));
+            if existing.gguf_path == gguf_path
+                && existing.config_identity == EngineConfigIdentity::from(config)
+                && existing.artifacts_are_current()
+            {
+                self.pool.touch(&k);
+                return Ok(NonEvictingLoad::Resident(existing));
+            }
         }
 
-        let bytes_resident = std::fs::metadata(gguf_path)
-            .map_err(|source| HotSwapError::FileSize {
-                path: gguf_path.to_path_buf(),
-                source,
-            })?
-            .len();
+        let bytes_resident = configured_resident_bytes(gguf_path, config)?;
         let plan = self.admission_plan(repo, quant, bytes_resident);
         if !matches!(plan.outcome, AdmissionOutcome::FitsAlongside { .. }) {
             return Ok(NonEvictingLoad::Conflict(plan));
         }
 
+        let text_artifact = resolve_text_artifact_identity(gguf_path, config)
+            .map_err(HotSwapError::LoaderFailed)?;
         let engine = self
             .loader
             .load(gguf_path, config)
             .map_err(HotSwapError::LoaderFailed)?;
+        let projector = self.load_configured_projector(gguf_path, &engine, config)?;
+        if !text_artifact.stamp.matches_path(gguf_path) {
+            return Err(HotSwapError::LoaderFailed(anyhow::anyhow!(
+                "text artifact changed between admission and publication"
+            )));
+        }
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
+            projector,
             repo: repo.to_string(),
             gguf_path: gguf_path.to_path_buf(),
+            text_artifact: Some(text_artifact),
+            projector_file_stamp: config
+                .projector
+                .as_ref()
+                .map(|projector| projector.file_stamp.clone()),
             quant,
             bytes_resident,
             loaded_at: SystemTime::now(),
@@ -1654,22 +2183,37 @@ impl<E> HotSwapManager<E> {
     ) -> Result<Arc<LoadedEngine<E>>, HotSwapError> {
         let k = pool_key(repo, quant);
 
-        // Fast path: already loaded.  Touch the LRU and clone the Arc.
-        if let Some(existing) = self.engines.get(&k).cloned() {
-            self.pool.touch(&k);
-            return Ok(existing);
+        // Fast path: already loaded. Touch the LRU and clone the Arc. An
+        // identity mismatch is staged as a replacement below; the current
+        // generation remains published until the complete candidate has
+        // loaded and passed every text/projector validation.
+        let replacing = self.engines.get(&k).cloned();
+        if let Some(existing) = replacing.as_ref() {
+            if existing.gguf_path == gguf_path
+                && existing.config_identity == EngineConfigIdentity::from(config)
+                && existing.artifacts_are_current()
+            {
+                self.pool.touch(&k);
+                return Ok(Arc::clone(existing));
+            }
         }
 
         // Slow path: load.  Read the file size FIRST so a missing GGUF
         // fails fast without driving the loader (which would itself
         // bail at header-open time, but a clean upfront error is
         // better tracing).
-        let bytes_resident = std::fs::metadata(activation_path)
-            .map_err(|source| HotSwapError::FileSize {
-                path: gguf_path.to_path_buf(),
-                source,
-            })?
-            .len();
+        let bytes_resident = configured_resident_bytes(activation_path, config).map_err(|error| {
+            match error {
+                HotSwapError::FileSize { source, .. } => HotSwapError::FileSize {
+                    path: gguf_path.to_path_buf(),
+                    source,
+                },
+                other => other,
+            }
+        })?;
+
+        let text_artifact = resolve_text_artifact_identity(activation_path, config)
+            .map_err(HotSwapError::LoaderFailed)?;
 
         let mut loader_config = config.clone();
         if activation_path != gguf_path {
@@ -1688,11 +2232,25 @@ impl<E> HotSwapManager<E> {
             .loader
             .load(activation_path, &loader_config)
             .map_err(HotSwapError::LoaderFailed)?;
+        let projector = self.load_configured_projector(gguf_path, &engine, config)?;
+        if !text_artifact.stamp.matches_path(activation_path)
+            || !text_artifact.stamp.matches_path(gguf_path)
+        {
+            return Err(HotSwapError::LoaderFailed(anyhow::anyhow!(
+                "text artifact changed between admission and publication"
+            )));
+        }
 
         let loaded_engine = Arc::new(LoadedEngine {
             engine,
+            projector,
             repo: repo.to_string(),
             gguf_path: gguf_path.to_path_buf(),
+            text_artifact: Some(text_artifact),
+            projector_file_stamp: config
+                .projector
+                .as_ref()
+                .map(|projector| projector.file_stamp.clone()),
             quant,
             bytes_resident,
             loaded_at: SystemTime::now(),
@@ -1709,6 +2267,7 @@ impl<E> HotSwapManager<E> {
             loaded_at: loaded_engine.loaded_at,
             bytes_resident,
         };
+        let replaced_handle = replacing.as_ref().and_then(|_| self.pool.get(&k).cloned());
 
         let evicted = match self.pool.insert(handle) {
             Ok(evicted) => evicted,
@@ -1720,6 +2279,18 @@ impl<E> HotSwapManager<E> {
                 return Err(HotSwapError::PoolRefused(e));
             }
         };
+
+        // Same-key replacement is not reported as an LRU victim by
+        // LoadedPool::insert. Snapshot the old generation only after the
+        // candidate is complete and the pool has accepted the replacement,
+        // then publish the new Arc below. Do not drop the family hook here:
+        // the loader may already have rebound it to the new generation.
+        if let (Some(old_handle), Some(old_engine)) = (replaced_handle, replacing.as_ref()) {
+            let outcome = self.spiller.pre_evict(&old_handle, old_engine);
+            if let Some(counters) = self.kv_counters.as_ref() {
+                counters.record_spill(repo, quant, outcome);
+            }
+        }
 
         for victim in evicted {
             // Eviction-hook trigger (iter-212 / AC 5471).  Fire
@@ -2186,24 +2757,42 @@ mod tests {
     /// observe distinct engine instances across calls.
     struct MockLoader {
         calls: std::sync::atomic::AtomicU64,
+        projector_calls: std::sync::atomic::AtomicU64,
         fail_on_call: Option<u64>, // 1-indexed; None = never fail
+        mutate_text_on_load: Option<PathBuf>,
     }
 
     impl MockLoader {
         fn new() -> Self {
             Self {
                 calls: std::sync::atomic::AtomicU64::new(0),
+                projector_calls: std::sync::atomic::AtomicU64::new(0),
                 fail_on_call: None,
+                mutate_text_on_load: None,
             }
         }
         fn fail_on(call_num: u64) -> Self {
             Self {
                 calls: std::sync::atomic::AtomicU64::new(0),
+                projector_calls: std::sync::atomic::AtomicU64::new(0),
                 fail_on_call: Some(call_num),
+                mutate_text_on_load: None,
+            }
+        }
+        fn mutate_text_on_load(path: PathBuf) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicU64::new(0),
+                projector_calls: std::sync::atomic::AtomicU64::new(0),
+                fail_on_call: None,
+                mutate_text_on_load: Some(path),
             }
         }
         fn call_count(&self) -> u64 {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn projector_call_count(&self) -> u64 {
+            self.projector_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -2213,7 +2802,83 @@ mod tests {
             if self.fail_on_call == Some(n) {
                 anyhow::bail!("MockLoader synthetic failure on call {n}");
             }
+            if let Some(path) = self.mutate_text_on_load.as_ref() {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)?
+                    .write_all(&[0xEE])?;
+            }
             Ok(MockEngine { load_serial: n })
+        }
+
+        fn load_projector(
+            &self,
+            _text_path: &Path,
+            _engine: &MockEngine,
+            admission: &ProjectorAdmission,
+        ) -> anyhow::Result<Arc<crate::serve::api::state::LoadedMmproj>> {
+            use crate::inference::vision::mmproj::{MmprojConfig, ProjectorType};
+            self.projector_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if admission.artifact_sha256.starts_with('f') {
+                anyhow::bail!("MockLoader synthetic projector failure");
+            }
+            if admission.artifact_sha256.starts_with('e') {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&admission.path)?
+                    .write_all(&[0xEE])?;
+            }
+            let realized_segments = if admission.artifact_sha256.starts_with('d') {
+                anyhow::ensure!(
+                    admission.mapped_weight_bytes >= 2,
+                    "synthetic topology mismatch requires at least two bytes"
+                );
+                vec![1, admission.mapped_weight_bytes - 1]
+            } else {
+                admission.mapped_weight_segment_bytes.clone()
+            };
+            let device = mlx_native::MlxDevice::new()?;
+            Ok(Arc::new(crate::serve::api::state::LoadedMmproj {
+                gguf_path: admission.path.clone(),
+                config: MmprojConfig {
+                    image_size: 28,
+                    patch_size: 14,
+                    num_patches_side: 2,
+                    hidden_size: 8,
+                    intermediate_size: 16,
+                    num_attention_heads: 2,
+                    num_hidden_layers: 1,
+                    layer_norm_eps: 1e-6,
+                    projector: ProjectorType::Mlp,
+                    image_mean: [0.5; 3],
+                    image_std: [0.5; 3],
+                    image_min_pixels: None,
+                    image_max_pixels: None,
+                    spatial_merge_size: None,
+                    projection_dim: Some(8),
+                    deepstack_indexes: None,
+                },
+                arch: admission.profile,
+                weights: Arc::new(crate::inference::vision::mmproj_weights::LoadedMmprojWeights::empty_with_mapped_storage_for_test(
+                    device,
+                    realized_segments,
+                )),
+                model_id: admission
+                    .path
+                    .file_stem()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "projector".to_owned()),
+                artifact_sha256: admission.artifact_sha256.clone(),
+                source_sha256: None,
+                vision_cache: Arc::new(
+                    crate::inference::vision::pipeline::VisionEmbeddingCache::new(usize::try_from(
+                        admission.cache_budget_bytes,
+                    )?),
+                ),
+            }))
         }
     }
 
@@ -2242,6 +2907,76 @@ mod tests {
         EngineConfig::default()
     }
 
+    fn synthetic_projector(
+        path: &Path,
+        digest_byte: char,
+        model_id: &str,
+    ) -> Arc<crate::serve::api::state::LoadedMmproj> {
+        synthetic_projector_with_segments(path, digest_byte, model_id, vec![64])
+    }
+
+    fn synthetic_projector_with_segments(
+        path: &Path,
+        digest_byte: char,
+        model_id: &str,
+        mapped_segment_physical_bytes: Vec<u64>,
+    ) -> Arc<crate::serve::api::state::LoadedMmproj> {
+        use crate::inference::vision::mmproj::{ArchProfile, MmprojConfig, ProjectorType};
+        let device = mlx_native::MlxDevice::new().expect("Metal device");
+        Arc::new(crate::serve::api::state::LoadedMmproj {
+            gguf_path: path.to_path_buf(),
+            config: MmprojConfig {
+                image_size: 28,
+                patch_size: 14,
+                num_patches_side: 2,
+                hidden_size: 8,
+                intermediate_size: 16,
+                num_attention_heads: 2,
+                num_hidden_layers: 1,
+                layer_norm_eps: 1e-6,
+                projector: ProjectorType::Mlp,
+                image_mean: [0.5; 3],
+                image_std: [0.5; 3],
+                image_min_pixels: None,
+                image_max_pixels: None,
+                spatial_merge_size: None,
+                projection_dim: Some(8),
+                deepstack_indexes: None,
+            },
+            arch: ArchProfile::Gemma4Siglip,
+            weights: Arc::new(crate::inference::vision::mmproj_weights::LoadedMmprojWeights::empty_with_mapped_storage_for_test(
+                device,
+                mapped_segment_physical_bytes,
+            )),
+            model_id: model_id.to_owned(),
+            artifact_sha256: digest_byte.to_string().repeat(64),
+            source_sha256: None,
+            vision_cache: Arc::new(
+                crate::inference::vision::pipeline::VisionEmbeddingCache::new(1024),
+            ),
+        })
+    }
+
+    fn config_with_projector(
+        projector: Arc<crate::serve::api::state::LoadedMmproj>,
+    ) -> EngineConfig {
+        EngineConfig {
+            projector: Some(ProjectorAdmission {
+                path: projector.gguf_path.clone(),
+                artifact_sha256: projector.artifact_sha256.clone(),
+                profile: projector.arch,
+                mapped_weight_bytes: projector.weights.owned_bytes(),
+                mapped_weight_segment_bytes: projector
+                    .weights
+                    .mapped_segment_physical_bytes()
+                    .to_vec(),
+                cache_budget_bytes: u64::try_from(projector.vision_cache.budget_bytes()).unwrap(),
+                file_stamp: ArtifactFileStamp::inspect(&projector.gguf_path).unwrap(),
+            }),
+            ..EngineConfig::default()
+        }
+    }
+
     #[test]
     fn non_evicting_conflict_never_calls_loader() {
         let loader = Arc::new(MockLoader::new());
@@ -2260,6 +2995,175 @@ mod tests {
         assert_eq!(loader.call_count(), 1, "conflict must precede loader");
         assert!(mgr.try_get("a/1", QuantType::Q4_K_M).is_some());
         assert!(mgr.try_get("b/2", QuantType::Q4_K_M).is_none());
+    }
+
+    #[test]
+    fn artifact_replaced_after_policy_lookup_fails_before_loader() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        let replacement = dir.path().join("replacement.gguf");
+        std::fs::write(&model, vec![0u8; 400]).unwrap();
+        let config = EngineConfig {
+            expected_text_artifact_stamp: Some(ArtifactFileStamp::inspect(&model).unwrap()),
+            ..EngineConfig::default()
+        };
+
+        // Models the race between AppState lookup and pool load. The one
+        // load-time identity sees B and must reject A's sidecar authority.
+        std::fs::write(&replacement, vec![1u8; 400]).unwrap();
+        std::fs::rename(&replacement, &model).unwrap();
+        let error = manager
+            .load_or_get_non_evicting("model/replaced", QuantType::Q4_K_M, &model, &config)
+            .expect_err("same-path replacement must fail closed");
+        assert!(format!("{error:#}").contains("changed after model-local policy resolution"));
+        assert_eq!(
+            loader.call_count(),
+            0,
+            "rejected bytes must not reach loader"
+        );
+        assert_eq!(manager.pool_stats().loaded_count, 0);
+    }
+
+    #[test]
+    fn verified_identity_skips_the_duplicate_hash_and_is_published() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let model = synthetic_gguf(400);
+        let mut config = EngineConfig::default();
+        let supplied_digest = "a".repeat(64);
+        config
+            .bind_verified_text_artifact(TextArtifactIdentity {
+                // Deliberately differs from the fixture digest: if this path
+                // regresses to `inspect`, the assertion below catches it.
+                sha256: supplied_digest.clone(),
+                stamp: ArtifactFileStamp::inspect(model.path()).unwrap(),
+            })
+            .unwrap();
+
+        let loaded = manager
+            .load_or_get("model/verified", QuantType::Q4_K_M, model.path(), &config)
+            .unwrap();
+        assert_eq!(loader.call_count(), 1);
+        assert_eq!(
+            loaded.text_artifact.as_ref().unwrap().sha256,
+            supplied_digest,
+            "a valid verified identity must be reused instead of rehashed"
+        );
+    }
+
+    #[test]
+    fn stale_verified_identity_fails_before_loader_without_hash_fallback() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        let replacement = dir.path().join("replacement.gguf");
+        std::fs::write(&model, vec![0u8; 400]).unwrap();
+        let mut config = EngineConfig::default();
+        config
+            .bind_verified_text_artifact(TextArtifactIdentity {
+                sha256: "a".repeat(64),
+                stamp: ArtifactFileStamp::inspect(&model).unwrap(),
+            })
+            .unwrap();
+        std::fs::write(&replacement, vec![1u8; 400]).unwrap();
+        std::fs::rename(&replacement, &model).unwrap();
+
+        let error = manager
+            .load_or_get_non_evicting("model/stale", QuantType::Q4_K_M, &model, &config)
+            .expect_err("replacement must invalidate verified identity");
+        assert!(format!("{error:#}").contains("changed after verified identity"));
+        assert_eq!(loader.call_count(), 0);
+    }
+
+    #[test]
+    fn text_changed_during_verified_load_is_not_published() {
+        let model = synthetic_gguf(400);
+        let loader = Arc::new(MockLoader::mutate_text_on_load(model.path().to_path_buf()));
+        let pool = LoadedPool::with_capacity_and_budget(1, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let mut config = EngineConfig::default();
+        config
+            .bind_verified_text_artifact(TextArtifactIdentity {
+                sha256: "a".repeat(64),
+                stamp: ArtifactFileStamp::inspect(model.path()).unwrap(),
+            })
+            .unwrap();
+
+        let error = manager
+            .load_or_get("model/race", QuantType::Q4_K_M, model.path(), &config)
+            .expect_err("post-load mutation must reject publication");
+        assert!(format!("{error:#}").contains("changed between admission and publication"));
+        assert_eq!(loader.call_count(), 1);
+        assert!(manager.try_get("model/race", QuantType::Q4_K_M).is_none());
+    }
+
+    #[test]
+    fn page_rounded_projector_charge_refuses_before_any_loader_call() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 1_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let text = synthetic_gguf(400);
+        let projector_file = synthetic_gguf(100);
+        let config = EngineConfig {
+            projector: Some(ProjectorAdmission {
+                path: projector_file.path().to_path_buf(),
+                artifact_sha256: "a".repeat(64),
+                profile: crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip,
+                // A logical-tensor sum would admit 400 + 100. The exact
+                // page-rounded mapping makes the generation too large.
+                mapped_weight_bytes: 4_096,
+                mapped_weight_segment_bytes: vec![4_096],
+                cache_budget_bytes: 0,
+                file_stamp: ArtifactFileStamp::inspect(projector_file.path()).unwrap(),
+            }),
+            ..EngineConfig::default()
+        };
+
+        let result = manager
+            .load_or_get_non_evicting(
+                "model/page-rounded",
+                QuantType::Q4_K_M,
+                text.path(),
+                &config,
+            )
+            .expect("pure non-evicting decision");
+        assert!(matches!(result, NonEvictingLoad::Conflict(_)));
+        assert_eq!(loader.call_count(), 0, "text loader must not run");
+        assert_eq!(
+            loader.projector_call_count(),
+            0,
+            "projector loader must not run"
+        );
+        assert_eq!(manager.pool_stats().loaded_count, 0);
+    }
+
+    #[test]
+    fn projector_admission_uses_shared_physical_plan_and_realized_topology_canary() {
+        let source = include_str!("multi_model.rs");
+        let admission = source
+            .split_once("impl ProjectorAdmission")
+            .expect("ProjectorAdmission implementation")
+            .1
+            .split_once("pub struct EngineConfig")
+            .expect("EngineConfig boundary")
+            .0;
+        for token in [
+            "validate_native_storage",
+            "mapped_tensor_storage_plan",
+            "segment_physical_byte_lens",
+            "physical_byte_len",
+            "validate_realized_weights",
+            "mapped_segment_physical_bytes",
+        ] {
+            assert!(admission.contains(token), "missing admission token {token}");
+        }
+        assert!(!admission.contains("estimate_owned_bytes"));
     }
 
     #[test]
@@ -2317,6 +3221,11 @@ mod tests {
         struct PathLoader(std::sync::Mutex<Option<(PathBuf, Option<PathBuf>)>>);
         impl ModelLoader<MockEngine> for PathLoader {
             fn load(&self, path: &Path, config: &EngineConfig) -> anyhow::Result<MockEngine> {
+                let mut activation = std::fs::File::open(path)?;
+                anyhow::ensure!(
+                    activation.stream_position()? == 0,
+                    "retained activation cursor was not rewound after identity hashing"
+                );
                 *self.0.lock().unwrap() =
                     Some((path.to_path_buf(), config.operator_model_path.clone()));
                 Ok(MockEngine { load_serial: 1 })
@@ -2348,6 +3257,13 @@ mod tests {
         );
         assert_eq!(loaded.gguf_path, logical.path());
         assert_eq!(loaded.bytes_resident, 1_000);
+        assert!(
+            loaded
+                .text_artifact
+                .as_ref()
+                .is_some_and(|identity| identity.stamp.matches_path(logical.path())),
+            "published identity must remain current at the operator path"
+        );
 
         let display_engine = crate::serve::api::engine::make_synthetic_engine_for_test(
             crate::serve::api::engine::LoadedArch::Gemma,
@@ -2359,7 +3275,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn retained_activation_size_drives_budget_when_public_symlink_is_swapped_and_restored() {
+    fn retained_activation_rejects_public_symlink_swap_before_publication() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
@@ -2376,6 +3292,17 @@ mod tests {
         std::fs::remove_file(&logical).unwrap();
         symlink(small.path(), &logical).unwrap();
 
+        assert_eq!(
+            configured_resident_bytes(&activation, &empty_config()).unwrap(),
+            1_000,
+            "retained activation accounting must use retained bytes"
+        );
+        assert_eq!(
+            configured_resident_bytes(&logical, &empty_config()).unwrap(),
+            100,
+            "the swapped public name demonstrates why it is not load authority"
+        );
+
         let loader = Arc::new(MockLoader::new());
         let pool = LoadedPool::with_capacity_and_budget(1, 500);
         let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
@@ -2387,19 +3314,18 @@ mod tests {
                 &activation,
                 &empty_config(),
             )
-            .expect_err("retained 1,000-byte model must exceed the 500-byte budget");
+            .expect_err("public-name drift must prevent retained generation publication");
 
         std::fs::remove_file(&logical).unwrap();
         symlink(large.path(), &logical).unwrap();
 
-        assert!(matches!(
-            error,
-            HotSwapError::PoolRefused(PoolError::OversizedHandle {
-                handle_bytes: 1_000,
-                budget_bytes: 500,
-                ..
-            })
-        ));
+        assert!(matches!(&error, HotSwapError::LoaderFailed(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("text artifact changed between admission and publication"),
+            "public-name drift must fail closed before publication: {error}"
+        );
         assert_eq!(loader.call_count(), 1);
         assert_eq!(manager.pool_stats().loaded_count, 0);
         assert_eq!(manager.pool_stats().total_resident_bytes, 0);
@@ -2428,6 +3354,336 @@ mod tests {
         assert!(Arc::ptr_eq(&e1, &e2), "second call must return same Arc");
         // Loader called exactly once.
         assert_eq!(loader.call_count(), 1);
+    }
+
+    #[test]
+    fn accepted_generation_charges_text_mapped_physical_and_full_cache_budget() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(2, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let text = synthetic_gguf(500);
+        let projector_file = synthetic_gguf(125);
+        let mut config = empty_config();
+        config.projector = Some(ProjectorAdmission {
+            path: projector_file.path().to_path_buf(),
+            artifact_sha256: "a".repeat(64),
+            profile: crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip,
+            mapped_weight_bytes: 64,
+            mapped_weight_segment_bytes: vec![64],
+            cache_budget_bytes: 125,
+            file_stamp: ArtifactFileStamp::inspect(projector_file.path()).unwrap(),
+        });
+
+        let first = manager
+            .load_or_get("model/a", QuantType::Q4_K_M, text.path(), &config)
+            .expect("first generation");
+        assert_eq!(
+            configured_resident_bytes(text.path(), &config).unwrap(),
+            500 + 64 + 125
+        );
+        assert_eq!(first.bytes_resident, 689);
+        assert_eq!(manager.pool_stats().total_resident_bytes, 689);
+        let reused = manager
+            .load_or_get("model/a", QuantType::Q4_K_M, text.path(), &config)
+            .expect("identical generation reuse");
+        assert!(Arc::ptr_eq(&first, &reused));
+
+        config.projector.as_mut().unwrap().artifact_sha256 = "b".repeat(64);
+        let replaced = manager
+            .load_or_get("model/a", QuantType::Q4_K_M, text.path(), &config)
+            .expect("changed projector identity reloads");
+        assert!(!Arc::ptr_eq(&first, &replaced));
+        assert_ne!(first.generation, replaced.generation);
+        assert_eq!(replaced.engine.load_serial, 2);
+        assert_eq!(loader.call_count(), 2);
+    }
+
+    #[test]
+    fn byte_identical_projectors_at_different_paths_are_distinct_generation_identities() {
+        let first_file = synthetic_gguf(64);
+        let second_file = synthetic_gguf(64);
+        let descriptor = |path: &Path| ProjectorAdmission {
+            path: path.to_path_buf(),
+            artifact_sha256: "a".repeat(64),
+            profile: crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip,
+            mapped_weight_bytes: 32,
+            mapped_weight_segment_bytes: vec![32],
+            cache_budget_bytes: 128,
+            file_stamp: ArtifactFileStamp::inspect(path).unwrap(),
+        };
+        let first = EngineConfig {
+            projector: Some(descriptor(first_file.path())),
+            ..EngineConfig::default()
+        };
+        let second = EngineConfig {
+            projector: Some(descriptor(second_file.path())),
+            ..EngineConfig::default()
+        };
+        assert_ne!(
+            EngineConfigIdentity::from(&first),
+            EngineConfigIdentity::from(&second)
+        );
+    }
+
+    #[test]
+    fn projector_swap_a_b_a_preserves_each_exact_physical_charge() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 20_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let text = synthetic_gguf(400);
+        // Equal logical file lengths model equal tensor payload sums. Different
+        // paths and mapped topologies model alignment-sensitive generations.
+        let file_a = synthetic_gguf(70);
+        let file_b = synthetic_gguf(70);
+        let config_a = config_with_projector(synthetic_projector_with_segments(
+            file_a.path(),
+            'a',
+            "projector-a",
+            vec![4_096],
+        ));
+        let config_b = config_with_projector(synthetic_projector_with_segments(
+            file_b.path(),
+            'a',
+            "projector-b",
+            vec![8_192],
+        ));
+
+        let a1 = manager
+            .load_or_get("model/swap", QuantType::Q4_K_M, text.path(), &config_a)
+            .expect("A generation");
+        assert_eq!(a1.bytes_resident, 400 + 4_096 + 1_024);
+        let b = manager
+            .load_or_get("model/swap", QuantType::Q4_K_M, text.path(), &config_b)
+            .expect("B generation");
+        assert_eq!(b.bytes_resident, 400 + 8_192 + 1_024);
+        let a2 = manager
+            .load_or_get("model/swap", QuantType::Q4_K_M, text.path(), &config_a)
+            .expect("A generation reloaded");
+        assert_eq!(a2.bytes_resident, 400 + 4_096 + 1_024);
+        assert_ne!(a1.generation, b.generation);
+        assert_ne!(b.generation, a2.generation);
+        assert_eq!(manager.pool_stats().total_resident_bytes, a2.bytes_resident);
+        assert_eq!(loader.call_count(), 3);
+        assert_eq!(loader.projector_call_count(), 3);
+    }
+
+    #[test]
+    fn projector_admission_publishes_text_and_projector_atomically() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader);
+        let text = synthetic_gguf(400);
+        let projector_file = synthetic_gguf(75);
+        let projector = synthetic_projector(projector_file.path(), 'a', "projector-a");
+        let admitted_config = config_with_projector(Arc::clone(&projector));
+        let text_only_prepublication = manager
+            .load_or_get("model/a", QuantType::Q4_K_M, text.path(), &admitted_config)
+            .expect("atomic text + projector generation");
+        assert!(text_only_prepublication.projector.is_some());
+        assert_eq!(text_only_prepublication.bytes_resident, 1488);
+        assert!(manager
+            .try_get("model/a", QuantType::Q4_K_M)
+            .is_some_and(|resident| Arc::ptr_eq(&resident, &text_only_prepublication)));
+    }
+
+    #[test]
+    fn projector_failure_never_publishes_text_only_generation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader);
+        let text = synthetic_gguf(400);
+        let projector_file = synthetic_gguf(75);
+        let projector = synthetic_projector(projector_file.path(), 'f', "projector-fail");
+        let config = config_with_projector(projector);
+
+        assert!(manager
+            .load_or_get("model/fail", QuantType::Q4_K_M, text.path(), &config)
+            .is_err());
+        assert!(manager.try_get("model/fail", QuantType::Q4_K_M).is_none());
+        assert_eq!(manager.pool_stats().loaded_count, 0);
+        assert_eq!(manager.pool_stats().total_resident_bytes, 0);
+    }
+
+    #[test]
+    fn failed_same_key_text_replacement_preserves_the_current_generation() {
+        let loader = Arc::new(MockLoader::fail_on(2));
+        let pool = LoadedPool::with_capacity_and_budget(1, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let text_a = synthetic_gguf(400);
+        let text_b = synthetic_gguf(500);
+        let current = manager
+            .load_or_get("model/a", QuantType::Q4_K_M, text_a.path(), &empty_config())
+            .expect("initial generation");
+
+        assert!(manager
+            .load_or_get("model/a", QuantType::Q4_K_M, text_b.path(), &empty_config(),)
+            .is_err());
+
+        let still_current = manager
+            .try_get("model/a", QuantType::Q4_K_M)
+            .expect("failed replacement must retain current generation");
+        assert!(Arc::ptr_eq(&current, &still_current));
+        assert_eq!(manager.pool_stats().loaded_count, 1);
+        assert_eq!(manager.pool_stats().total_resident_bytes, 400);
+        assert_eq!(loader.call_count(), 2);
+    }
+
+    #[test]
+    fn failed_same_key_projector_replacement_preserves_the_current_pair() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader);
+        let text = synthetic_gguf(400);
+        let projector_a_file = synthetic_gguf(75);
+        let projector_f_file = synthetic_gguf(75);
+        let projector_a = synthetic_projector(projector_a_file.path(), 'a', "projector-a");
+        let projector_f = synthetic_projector(projector_f_file.path(), 'f', "projector-fail");
+        let current_config = config_with_projector(projector_a);
+        let failing_config = config_with_projector(projector_f);
+        let current = manager
+            .load_or_get("model/a", QuantType::Q4_K_M, text.path(), &current_config)
+            .expect("initial pair");
+
+        assert!(manager
+            .load_or_get("model/a", QuantType::Q4_K_M, text.path(), &failing_config,)
+            .is_err());
+
+        let still_current = manager
+            .try_get("model/a", QuantType::Q4_K_M)
+            .expect("failed pair replacement must retain current pair");
+        assert!(Arc::ptr_eq(&current, &still_current));
+        assert_eq!(
+            still_current
+                .projector
+                .as_ref()
+                .map(|projector| projector.artifact_sha256.as_str()),
+            Some(
+                current_config
+                    .projector
+                    .as_ref()
+                    .unwrap()
+                    .artifact_sha256
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn projector_stamp_change_during_load_prevents_generation_publication() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader);
+        let text = synthetic_gguf(400);
+        let projector_file = synthetic_gguf(75);
+        let projector = synthetic_projector(projector_file.path(), 'e', "projector-mutates");
+        let config = config_with_projector(projector);
+
+        assert!(manager
+            .load_or_get("model/mutates", QuantType::Q4_K_M, text.path(), &config,)
+            .is_err());
+        assert!(manager
+            .try_get("model/mutates", QuantType::Q4_K_M)
+            .is_none());
+        assert_eq!(manager.pool_stats().loaded_count, 0);
+    }
+
+    #[test]
+    fn projector_realized_mapping_mismatch_preserves_current_generation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let text = synthetic_gguf(400);
+        let current_file = synthetic_gguf(75);
+        let mismatch_file = synthetic_gguf(75);
+        let current_config =
+            config_with_projector(synthetic_projector(current_file.path(), 'a', "projector-a"));
+        let mismatch_config = config_with_projector(synthetic_projector(
+            mismatch_file.path(),
+            'd',
+            "projector-realized-mismatch",
+        ));
+        let current = manager
+            .load_or_get(
+                "model/mismatch",
+                QuantType::Q4_K_M,
+                text.path(),
+                &current_config,
+            )
+            .expect("publish current pair");
+
+        assert!(manager
+            .load_or_get(
+                "model/mismatch",
+                QuantType::Q4_K_M,
+                text.path(),
+                &mismatch_config,
+            )
+            .is_err());
+        let retained = manager
+            .try_get("model/mismatch", QuantType::Q4_K_M)
+            .expect("current pair must survive failed replacement");
+        assert!(Arc::ptr_eq(&current, &retained));
+        assert_eq!(manager.pool_stats().loaded_count, 1);
+        assert_eq!(loader.call_count(), 2);
+        assert_eq!(loader.projector_call_count(), 2);
+    }
+
+    #[test]
+    fn projector_generation_swap_a_b_c_a_never_cross_pairs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 10_000);
+        let mut manager = HotSwapManager::<MockEngine>::new(pool, loader);
+        let text_a = synthetic_gguf(400);
+        let text_b = synthetic_gguf(410);
+        let text_c = synthetic_gguf(420);
+        let file_a = synthetic_gguf(70);
+        let file_c = synthetic_gguf(90);
+        let projector_a = synthetic_projector(file_a.path(), 'a', "projector-a");
+        let projector_c = synthetic_projector(file_c.path(), 'c', "projector-c");
+        let config_a = config_with_projector(projector_a);
+        let config_b = empty_config();
+        let config_c = config_with_projector(projector_c);
+
+        let a1 = manager
+            .load_or_get("A", QuantType::Q4_K_M, text_a.path(), &config_a)
+            .expect("A/P_A");
+        assert_eq!(
+            a1.projector.as_ref().unwrap().artifact_sha256,
+            "a".repeat(64)
+        );
+        let b = manager
+            .load_or_get("B", QuantType::Q4_K_M, text_b.path(), &config_b)
+            .expect("B text-only");
+        assert!(b.projector.is_none());
+        assert_eq!(
+            a1.projector.as_ref().unwrap().artifact_sha256,
+            "a".repeat(64)
+        );
+        let c = manager
+            .load_or_get("C", QuantType::Q4_K_M, text_c.path(), &config_c)
+            .expect("C/P_C");
+        assert_eq!(
+            c.projector.as_ref().unwrap().artifact_sha256,
+            "c".repeat(64)
+        );
+        let a2 = manager
+            .load_or_get("A", QuantType::Q4_K_M, text_a.path(), &config_a)
+            .expect("A/P_A reload");
+        assert_eq!(
+            a2.projector.as_ref().unwrap().artifact_sha256,
+            "a".repeat(64)
+        );
+        assert_ne!(a1.generation, a2.generation);
+        assert_ne!(a1.engine.load_serial, a2.engine.load_serial);
+        assert_eq!(manager.pool_stats().loaded_count, 1);
+        assert_eq!(manager.pool_stats().total_resident_bytes, 1488);
     }
 
     #[test]
@@ -2662,6 +3918,19 @@ mod tests {
         // No state mutation — the entry was never admitted.
         assert_eq!(mgr.pool_stats().loaded_count, 0);
         assert!(mgr.try_get("acme/m1", QuantType::Q4_K_M).is_none());
+    }
+
+    #[test]
+    fn hotswap_loader_error_display_preserves_the_complete_cause_chain() {
+        let error = anyhow::anyhow!("invalid tensor storage")
+            .context("Deepseek4Weights::load_from_gguf")
+            .context("load native DeepSeek-V4 model");
+        let rendered = HotSwapError::LoaderFailed(error).to_string();
+        assert_eq!(
+            rendered,
+            "hot-swap loader failed: load native DeepSeek-V4 model: \
+             Deepseek4Weights::load_from_gguf: invalid tensor storage"
+        );
     }
 
     #[test]
