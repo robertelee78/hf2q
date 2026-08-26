@@ -11,8 +11,10 @@
   Q4x4 implementation with Qwen3.8 quality/lifecycle and Qwen3.6 route proof;
   its published dependency is pinned, the exact five-format scalar/storage
   matrix is green, and universal four-family two-cycle swap is hardware-sealed;
-  the current exact-head physical matrix is reopened after its Q4_K_M
-  16-slot cell exposed an optional-checkpoint admission defect, while
+  the `b5f60441` exact-head physical matrix passed all 25 format/width cells
+  after the rectangular admission correction, but the current exact-head
+  seal is reopened after that run exposed a distinct scalar K=0 capture
+  defect, while
   matched-reference acceptance remains open;
   the DeepSeek B.1 and Gemma/Qwen B.2 fail-closed hardware authorities are
   now checked in and model-free green; Gemma and Qwen B.2 implementation and
@@ -20,7 +22,42 @@
   reopened under the v2 contention authority, while the DeepSeek and Qwen
   current-head real-artifact cells remain open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 97 closes the family-wide checkpoint-admission
+- Updated: 2026-08-26 (rev 98 records the first complete post-rev-96 hardware
+  spike and reformulates the remaining Qwen admission hypothesis instead of
+  accepting a correctness-only result as final. At exact source `b5f60441`,
+  the native-storage/four-position matrix passed BF16, Q4_K_M, Q5_K_M, Q6_K,
+  and Q8_0 (receipt
+  `/opt/hf2q-evidence/qwen38-four-position-b5f60441/matrix.json`, SHA-256
+  `f9df0255352525546bc178d5d2fa4ae38b5a7ea53028138b8b96dbf70f2efac8`).
+  The exact release binary SHA-256
+  `20c9ca1115693d7fd0f355eddfe20db512f15188d5714ac23caab4f26365351f`
+  then passed all 25 native-format by physical-width cells at widths
+  1/2/4/8/16 with exact per-lane scalar replay and requested
+  scheduler/body/head width (receipt
+  `/opt/hf2q-evidence/qwen38-physical-b5f60441/matrix.json`, SHA-256
+  `74b9569b082830e7175ebe36fcdf0914d1e7512ad4a9410639a76d16d26ed1ac`).
+  This closes the rev-96 Q4_K_M width-16 HTTP 500 falsifier, but its scalar
+  replays exposed a second cost bug: Q4_K_M, Q5_K_M, Q6_K, and Q8_0 each ran
+  17 stable-boundary compound captures at width 16 and only afterward
+  rejected all 17 optional checkpoints as `NoCommittedCapacity`. The scalar
+  path proved only that one retained payload plus its incremental peak fit;
+  unlike the rectangular path, it did not first compute effective committed
+  depth across all 16 configured stores. The logged 1.1--1.45-second
+  `capture_ms` values include the complete compound target/MTP operation, so
+  they are falsification evidence for discarded work, not a claimed pure
+  copy-time speedup. Commit `ed6b2321` shares the effective-K admission rule
+  between scalar and rectangular prefill. K=0 now passes no compound
+  reservation and selects the ordinary boundary split before Metal work, so
+  the prefix and suffix execute as separate ordinary slices without anchor
+  materialization; K>=1 retains the compound state-reuse route. Planned skip
+  telemetry is published only after successful target and
+  scheduler publication. The exact N=16 hardware tuple, capacity-present
+  control, all 43 bounded-prefill tests, and locked binary check are green.
+  Commit `dda60bb5` also removes an undeclared `rg` dependency from the
+  matched-physical model-free contract after hosted CI proved its scrubbed
+  PATH could not execute that assertion block. Post-fix exact-artifact and
+  matched-current-peer hardware receipts remain open; rev 98 admits no final
+  speed claim. Rev 97 closes the family-wide checkpoint-admission
   audit opened by rev 96 without admitting a new hardware or speed claim.
   Gemma4 and DeepSeek4 now compute the exact prospective family payload before
   any snapshot allocation or copy; zero capacity suppresses only optional
