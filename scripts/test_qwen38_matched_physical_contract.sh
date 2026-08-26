@@ -636,50 +636,50 @@ grep -Fq 'does not own an isolated process group' "$marked_error" \
 matrix_runner="$ROOT_DIR/scripts/qwen38_matched_physical_matrix.sh"
 [[ "$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4" == 1 ]] \
   || fail 'matched physical Q5_K policy is not uniformly enabled'
-rg -F 'env -i' "$runner" >/dev/null \
+grep -F 'env -i' "$runner" >/dev/null \
   || fail 'matched physical runner does not launch from a clean environment'
-run_wave_line=$(rg -n '^run_wave\(\)' "$runner" | cut -d: -f1)
-before_line=$(rg -n '"\$speculation_before"$' "$runner" | head -1 | cut -d: -f1)
-release_line=$(rg -n '^[[:space:]]+: >"\$start_file"' "$runner" | tail -1 | cut -d: -f1)
-after_line=$(rg -n '"\$speculation_after"$' "$runner" | tail -1 | cut -d: -f1)
-spec_validate_line=$(rg -n 'matched_physical_validate_wave_speculation ' "$runner" \
+run_wave_line=$(grep -nE '^run_wave\(\)' "$runner" | cut -d: -f1)
+before_line=$(grep -nE '"\$speculation_before"$' "$runner" | head -1 | cut -d: -f1)
+release_line=$(grep -nE '^[[:space:]]+: >"\$start_file"' "$runner" | tail -1 | cut -d: -f1)
+after_line=$(grep -nE '"\$speculation_after"$' "$runner" | tail -1 | cut -d: -f1)
+spec_validate_line=$(grep -nF 'matched_physical_validate_wave_speculation ' "$runner" \
   | cut -d: -f1)
-cache_replay_line=$(rg -n 'run_cache_replacement "\$width"' "$runner" | cut -d: -f1)
-next_function_line=$(rg -n '^validate_trial_code_quality\(\)' "$runner" | cut -d: -f1)
-stop_line=$(rg -n '^[[:space:]]+stop_server$' "$runner" | tail -1 | cut -d: -f1)
-quality_line=$(rg -n '^[[:space:]]+validate_trial_code_quality ' "$runner" \
+cache_replay_line=$(grep -nF 'run_cache_replacement "$width"' "$runner" | cut -d: -f1)
+next_function_line=$(grep -nE '^validate_trial_code_quality\(\)' "$runner" | cut -d: -f1)
+stop_line=$(grep -nE '^[[:space:]]+stop_server$' "$runner" | tail -1 | cut -d: -f1)
+quality_line=$(grep -nE '^[[:space:]]+validate_trial_code_quality ' "$runner" \
   | tail -1 | cut -d: -f1)
 ((run_wave_line < before_line && before_line < release_line \
   && release_line < after_line && after_line < spec_validate_line \
   && spec_validate_line < cache_replay_line && cache_replay_line < next_function_line \
   && stop_line < quality_line))
-if rg -q 'matched_physical_validate_trial_speculation|trial_dir/speculation.json' \
+if grep -Eq 'matched_physical_validate_trial_speculation|trial_dir/speculation.json' \
   "$runner"; then
     fail 'trial-wide speculation proof survived'
 fi
-rg -F 'QWEN38_MATCHED_HF2Q_SPECULATION_POLICY' "$runner" >/dev/null
-rg -F 'QWEN38_MATCHED_REFERENCE_SPECULATION_POLICY' "$runner" >/dev/null
-rg -F 'HF2Q_DECODE_MVN="$QWEN38_PHYSICAL_DECODE_MVN"' "$runner" >/dev/null
-rg -F 'HF2Q_DECODE_MV_EXT="$QWEN38_PHYSICAL_DECODE_MV_EXT"' "$runner" >/dev/null
-rg -F 'HF2Q_Q5K_CANONICAL_Q4X4="$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4"' \
+grep -F 'QWEN38_MATCHED_HF2Q_SPECULATION_POLICY' "$runner" >/dev/null
+grep -F 'QWEN38_MATCHED_REFERENCE_SPECULATION_POLICY' "$runner" >/dev/null
+grep -F 'HF2Q_DECODE_MVN="$QWEN38_PHYSICAL_DECODE_MVN"' "$runner" >/dev/null
+grep -F 'HF2Q_DECODE_MV_EXT="$QWEN38_PHYSICAL_DECODE_MV_EXT"' "$runner" >/dev/null
+grep -F 'HF2Q_Q5K_CANONICAL_Q4X4="$QWEN38_MATCHED_HF2Q_Q5K_CANONICAL_Q4X4"' \
   "$runner" >/dev/null
-rg -F 'matched_validate_qwen_frozen_routing_policy_log "$log"' \
+grep -F 'matched_validate_qwen_frozen_routing_policy_log "$log"' \
   "$runner" >/dev/null
-rg -F -- '--ctx-size "$QWEN38_MATCHED_CONTEXT_TOKENS"' "$runner" >/dev/null
-rg -F -- '--cache-type-k "$QWEN38_MATCHED_REFERENCE_KV_CACHE_K"' \
+grep -F -- '--ctx-size "$QWEN38_MATCHED_CONTEXT_TOKENS"' "$runner" >/dev/null
+grep -F -- '--cache-type-k "$QWEN38_MATCHED_REFERENCE_KV_CACHE_K"' \
   "$runner" >/dev/null
-rg -F -- '--cache-type-v "$QWEN38_MATCHED_REFERENCE_KV_CACHE_V"' \
+grep -F -- '--cache-type-v "$QWEN38_MATCHED_REFERENCE_KV_CACHE_V"' \
   "$runner" >/dev/null
-if rg -q 'speculation:"shipping-auto"|policy:"shipping-auto"' "$runner" \
+if grep -Eq 'speculation:"shipping-auto"|policy:"shipping-auto"' "$runner" \
   "$ROOT_DIR/scripts/qwen38_matched_physical_contract.sh"; then
     fail 'undifferentiated speculation policy survived'
 fi
-rg -F 'matched_physical_validate_client_overlap' "$runner" >/dev/null
-rg -F 'HOST_CONTENTION_GATE_OWNER_PID' "$runner" >/dev/null \
+grep -F 'matched_physical_validate_client_overlap' "$runner" >/dev/null
+grep -F 'HOST_CONTENTION_GATE_OWNER_PID' "$runner" >/dev/null \
   || fail 'matched physical runner does not use one stable process-group owner'
-rg -F 'matched_physical_validate_reopened_child "$OUT_DIR"' "$runner" >/dev/null \
+grep -F 'matched_physical_validate_reopened_child "$OUT_DIR"' "$runner" >/dev/null \
   || fail 'matched physical runner does not semantically reopen its evidence'
-rg -F '[[ -d "$matrix_dir/artifacts" && ! -L "$matrix_dir/artifacts" ]]' \
+grep -F '[[ -d "$matrix_dir/artifacts" && ! -L "$matrix_dir/artifacts" ]]' \
   "$ROOT_DIR/scripts/qwen38_matched_physical_contract.sh" >/dev/null \
   || fail 'matched physical matrix reopener follows a symlinked artifact root'
 for contention_call in \
@@ -688,69 +688,69 @@ for contention_call in \
   'host_contention_validate_settle_log ' \
   'host_contention_validate_measurement_log ' \
   'host_contention_validate_thermal_alignment '; do
-    rg -F "$contention_call" "$runner" >/dev/null \
+    grep -F "$contention_call" "$runner" >/dev/null \
       || fail "matched physical runner omits v2 contention authority: $contention_call"
 done
-rg -F 'matched_record_calibration_observation "$1" "$2" "$3" "$4"' \
+grep -F 'matched_record_calibration_observation "$1" "$2" "$3" "$4"' \
   "$runner" >/dev/null \
   || fail 'matched physical runner bypasses the shared calibration predicate'
-rg -F '"$THERMAL_SAMPLED_AT" "$owned_server_pid"' \
+grep -F '"$THERMAL_SAMPLED_AT" "$owned_server_pid"' \
   "$ROOT_DIR/scripts/qwen38_matched_reference_contract.sh" >/dev/null \
   || fail 'shared calibration predicate does not narrowly exempt its owned server PID'
-if rg -Fq 'require_no_foreign_heavy_work ' "$runner"; then
+if grep -Fq 'require_no_foreign_heavy_work ' "$runner"; then
     fail 'matched physical runner still uses the name-only contention predicate'
 fi
-rg -F 'hf2q_macos_verify_runtime_manifest "$REFERENCE_BIN"' "$runner" \
+grep -F 'hf2q_macos_verify_runtime_manifest "$REFERENCE_BIN"' "$runner" \
   >/dev/null
-rg -F 'runtime_manifest_sha256:$reference_runtime_manifest_sha' "$runner" \
+grep -F 'runtime_manifest_sha256:$reference_runtime_manifest_sha' "$runner" \
   >/dev/null
-rg -F 'HF2Q_SOURCE_DIR=${HF2Q_SOURCE_DIR:?HF2Q_SOURCE_DIR is required}' \
+grep -F 'HF2Q_SOURCE_DIR=${HF2Q_SOURCE_DIR:?HF2Q_SOURCE_DIR is required}' \
   "$runner" >/dev/null
 for source_runner in "$runner" "$matrix_runner"; do
-    rg -F 'REFERENCE_RUNTIME_MANIFEST_SHA256=${REFERENCE_RUNTIME_MANIFEST_SHA256:?REFERENCE_RUNTIME_MANIFEST_SHA256 is required}' \
+    grep -F 'REFERENCE_RUNTIME_MANIFEST_SHA256=${REFERENCE_RUNTIME_MANIFEST_SHA256:?REFERENCE_RUNTIME_MANIFEST_SHA256 is required}' \
       "$source_runner" >/dev/null
 done
-rg -F '"$HF2Q_SOURCE_DIR/scripts/serve_qwen38_opencode.sh"' "$runner" \
+grep -F '"$HF2Q_SOURCE_DIR/scripts/serve_qwen38_opencode.sh"' "$runner" \
   >/dev/null
-rg -F 'HF2Q_SOURCE_DIR="$HF2Q_SOURCE_DIR"' "$matrix_runner" >/dev/null
-rg -F 'REFERENCE_RUNTIME_MANIFEST_SHA256="$REFERENCE_RUNTIME_MANIFEST_SHA256"' \
+grep -F 'HF2Q_SOURCE_DIR="$HF2Q_SOURCE_DIR"' "$matrix_runner" >/dev/null
+grep -F 'REFERENCE_RUNTIME_MANIFEST_SHA256="$REFERENCE_RUNTIME_MANIFEST_SHA256"' \
   "$matrix_runner" >/dev/null
-closure_line=$(rg -n 'reference runtime closure mismatch:' "$runner" \
+closure_line=$(grep -nF 'reference runtime closure mismatch:' "$runner" \
   | head -1 | cut -d: -f1)
-output_line=$(rg -n 'mkdir -p "\$OUT_DIR/requests/code"' "$runner" \
+output_line=$(grep -nF 'mkdir -p "$OUT_DIR/requests/code"' "$runner" \
   | head -1 | cut -d: -f1)
 ((closure_line < output_line))
-matrix_closure_line=$(rg -n 'reference runtime closure mismatch:' \
+matrix_closure_line=$(grep -nF 'reference runtime closure mismatch:' \
   "$matrix_runner" | head -1 | cut -d: -f1)
-matrix_output_line=$(rg -n 'mkdir -p "\$OUT_DIR/artifacts"' "$matrix_runner" \
+matrix_output_line=$(grep -nF 'mkdir -p "$OUT_DIR/artifacts"' "$matrix_runner" \
   | head -1 | cut -d: -f1)
 ((matrix_closure_line < matrix_output_line))
-rg -F 'reference_runtime_manifest_final_sha=' "$runner" "$matrix_runner" \
+grep -F 'reference_runtime_manifest_final_sha=' "$runner" "$matrix_runner" \
   >/dev/null
-if rg -q 'git ls-remote|require_current_reference' "$runner"; then
+if grep -Eq 'git ls-remote|require_current_reference' "$runner"; then
     fail 'matched physical runner still races a moving remote branch'
 fi
-rg -F 'pin_policy:"observed-current-then-frozen"' "$runner" >/dev/null
-rg -F 'qwen38_validate_physical_matrix_seal "$PHYSICAL_MATRIX_RECEIPT"' \
+grep -F 'pin_policy:"observed-current-then-frozen"' "$runner" >/dev/null
+grep -F 'qwen38_validate_physical_matrix_seal "$PHYSICAL_MATRIX_RECEIPT"' \
   "$runner" >/dev/null
-rg -F 'qwen38_copy_physical_matrix_seal' \
+grep -F 'qwen38_copy_physical_matrix_seal' \
   "$matrix_runner" >/dev/null
-rg -F 'matched_physical_record_semantic_repeat_tokens' "$runner" >/dev/null
-rg -F 'HF2Q_DEBUG_TOKENIZE_NO_SPECIAL_TOKENS' \
+grep -F 'matched_physical_record_semantic_repeat_tokens' "$runner" >/dev/null
+grep -F 'HF2Q_DEBUG_TOKENIZE_NO_SPECIAL_TOKENS' \
   "$ROOT_DIR/src/serve/mod.rs" >/dev/null
-if rg -n 'event_count' "$runner" "$ROOT_DIR/scripts/qwen38_matched_physical_contract.sh" \
-  | rg -q 'total_semantic_completion_tokens|comparison_units_per_second'; then
+if grep -n 'event_count' "$runner" "$ROOT_DIR/scripts/qwen38_matched_physical_contract.sh" \
+  | grep -Eq 'total_semantic_completion_tokens|comparison_units_per_second'; then
     fail 'SSE event count leaked into semantic-token measurement'
 fi
-cohort_line=$(rg -n '^matched_physical_validate_matrix_reference_cohort ' \
+cohort_line=$(grep -nE '^matched_physical_validate_matrix_reference_cohort ' \
   "$matrix_runner" | tail -1 | cut -d: -f1)
-publish_line=$(rg -n '^matched_publish_result ' "$matrix_runner" \
+publish_line=$(grep -nE '^matched_publish_result ' "$matrix_runner" \
   | tail -1 | cut -d: -f1)
 ((cohort_line < publish_line))
-policy_line=$(rg -n 'matched_validate_qwen_frozen_routing_policy_log "\$log"' \
+policy_line=$(grep -nF 'matched_validate_qwen_frozen_routing_policy_log "$log"' \
   "$runner" | cut -d: -f1)
 ((stop_line < policy_line && policy_line < quality_line))
-[[ "$(rg -c 'matched_physical_validate_reopened_(child|matrix) "\$OUT_DIR"' \
+[[ "$(grep -Ec 'matched_physical_validate_reopened_(child|matrix) "\$OUT_DIR"' \
   "$ROOT_DIR/scripts/qwen38_matched_physical"*.sh \
   | awk -F: '{sum += $2} END {print sum}')" == 2 ]]
 
