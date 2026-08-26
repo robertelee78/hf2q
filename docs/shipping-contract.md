@@ -5,11 +5,11 @@
 Current published release: `v0.1.17`. Public availability is authoritative
 only after exact-artifact release proof completes.
 
-The next-release source candidate pins published `mlx-native = 0.14.0` from
+The next-release source candidate pins published `mlx-native = 0.15.0` from
 crates.io at SHA-256
-`c7b359aa9ea2603f58b49151ba54e37ed1aac10e76faf530865ea30a95f051b4`.
+`09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822`.
 The backend's fail-closed exact-source/package/publication workflow run
-`32873363483` passed. This dependency publication does not by itself publish
+`32917226470` passed. This dependency publication does not by itself publish
 or qualify a new hf2q release.
 
 This document defines the public hf2q product surface for `v0.1.17` and the
@@ -154,7 +154,7 @@ without Hub traffic or full-payload hashing.
   The 0.1.7 release also pairs large automatic MoE gate/up
   projections through the routing-schedule primitive introduced in
   `mlx-native 0.10.10` and retained by the current candidate's pinned
-  `mlx-native 0.14.0`.
+  `mlx-native 0.15.0`.
   Decode-sized and forced diagnostic routes remain independent;
   native microbenchmarks do not replace the exact packed hf2q hardware gates.
 - A typed fatal Metal command-buffer/watchdog/ignored-submission error, or an
@@ -219,7 +219,7 @@ checkout-disjoint `CARGO_HOME` and target directory, clears Rust toolchain,
 compiler, documentation, flags, wrapper, target, and profile override
 variables, and rejects Cargo config anywhere in the packed root's ancestry.
 Its dependency receipt binds the packed `Cargo.lock` and raw `cargo metadata`
-bytes, including the exact `mlx-native 0.14.0` crates.io source and checksum.
+bytes, including the exact `mlx-native 0.15.0` crates.io source and checksum.
 The protected release workflow rehashes and revalidates those downloaded raw
 files, then requires its newly packed `Cargo.lock` to be byte-identical before
 publishing.
