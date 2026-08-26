@@ -16,7 +16,12 @@
   now checked in and model-free green, while their real-artifact cells remain
   open)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 84 records the second fail-closed Gemma product
+- Updated: 2026-08-26 (rev 85 records the completed eight-pair Gemma product
+  falsifier and the resulting serving policy: nominal 128/192 cells passed the
+  immutable 1.05 lower-confidence speed gate, while nominal 256 did not. The
+  serving planner therefore caps stable rectangular boundary work at 192 rows
+  and retains the equality-proven scalar path above it; the next product rerun
+  must prove both the profitable rectangles and the 256-row fallback. Rev 84 recorded the second fail-closed Gemma product
   calibration: one payload word rendered 105 uncached rows; combined with rev
   83's 24-word/151-row receipt, the exact relation is 103 fixed tool-envelope
   tokens plus two tokens per payload word. Nominal 128/192/256 cells therefore
@@ -1926,6 +1931,34 @@ target nominal 128/192/256 cells using 12/44/76 words, which render
 model-free contract passes and rejects 29/29 mutations. A fresh exact-lineage
 product A/B is required; no speed claim is inferred from either rejected
 spike.
+
+Rev 85 completes that exact-lineage A/B at source `d05d3d3f` and rejects the
+former all-width policy without weakening its predeclared gate. All 48 waves
+were semantically and operationally valid: eight order-balanced OFF/ON pairs,
+four distinct long-history conversations per wave, two unary plus two SSE
+continuations, 1,320 cached tokens per lane, equal realized suffix widths
+127/191/255, zero OFF rectangles, exactly one B4 ON rectangle, canonical tool
+results, quiet host, AC power, and Fair-or-better thermal state. Nominal 128
+had median speedup 1.105686 with order-stratified 95% CI
+`[1.097205,1.133760]`; nominal 192 had median 1.114093 with CI
+`[1.097664,1.152047]`. Both clear the immutable lower bound `>1.05`. Nominal
+256 had median 1.034930 with CI `[1.013205,1.070982]` and therefore fails.
+The independent summary is
+`/opt/hf2q-evidence/adr049-gemma-stable-d05d3d3f-20260826T130900Z/summary.json`
+(SHA-256 `9018e6a2e0dfb6c9900fcdb8ff9a16d79d1aa1602d425277ac731197d8f4cf96`);
+the manifest SHA-256 is
+`136547742b2eee0dcd5531e372e7f2dc225e74de9a0a0e34834cd4f57a65ce96`.
+
+Phase attribution explains the crossover. At nominal 256, the ON rectangular
+boundary median was about 1,435 ms, while the four OFF scalar prefills summed
+to about 1,422 ms: the physical rectangle no longer reduces prefill work.
+Nominal 128/192 retain roughly 10–12% product-wave benefit. The reformulated
+production policy caps stable rectangular boundary rows at 192 while keeping
+the low-level 32..=256 primitive available as coherence authority. Wider
+stable suffixes use the canonical scalar route. The next product gate keeps
+the 128/192 `>1.05` confidence requirement and turns nominal 256 into an
+explicit zero-rectangle semantic/no-regression fallback cell. Until that rerun
+passes, rev 85 is decisive policy evidence, not final product acceptance.
 
 The shared-weight native quantized-matmul hypothesis is falsified for this
 Gemma B.2 route. The primitive was published as `mlx-native 0.15.1` from exact

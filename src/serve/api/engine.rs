@@ -6407,6 +6407,8 @@ where
 /// calls changes quantized reduction geometry and is not coherent. A caller
 /// that cannot form one equal-start/equal-width B2/B4 transaction retains the
 /// canonical scalar route for the boundary and native cue.
+const GEMMA4_MAX_PROFITABLE_STABLE_RECTANGULAR_ROWS_PER_LANE: usize = 192;
+
 fn gemma4_stable_rectangular_slice_len(cursors: &[usize], boundaries: &[usize]) -> Option<usize> {
     if !matches!(cursors.len(), 2 | 4) || boundaries.len() != cursors.len() {
         return None;
@@ -6420,6 +6422,9 @@ fn gemma4_stable_rectangular_slice_len(cursors: &[usize], boundaries: &[usize]) 
         return None;
     }
     let rows = boundary.checked_sub(start)?;
+    if rows > GEMMA4_MAX_PROFITABLE_STABLE_RECTANGULAR_ROWS_PER_LANE {
+        return None;
+    }
     crate::inference::models::gemma4::rectangular_prefill::is_proven_rectangular_shape(
         cursors.len(),
         rows,
@@ -46392,6 +46397,16 @@ mod gemma4_bounded_prefill_tests {
             gemma4_stable_rectangular_slice_len(&[200_000; 4], &[200_128; 4]),
             Some(128),
             "long histories with a proven small suffix remain rectangular"
+        );
+        assert_eq!(
+            gemma4_stable_rectangular_slice_len(&[64; 4], &[256; 4]),
+            Some(192),
+            "the measured profitable stable boundary ceiling remains rectangular"
+        );
+        assert_eq!(
+            gemma4_stable_rectangular_slice_len(&[64; 4], &[257; 4]),
+            None,
+            "a stable boundary above the measured profitable ceiling stays scalar"
         );
         assert_eq!(
             gemma4_stable_rectangular_slice_len(&[96, 96, 96, 96], &[121, 121, 121, 121]),

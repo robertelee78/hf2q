@@ -90,9 +90,11 @@ pub(crate) fn validate_rectangular_prefill_layout(
 /// Classify a live multi-sequence descriptor without weakening validation.
 ///
 /// B2/B4 rectangles retain each lane's complete scalar operator width through
-/// the measured 32..=256 scheduling domain and the existing 4,096-row
-/// transaction ceiling. Other lane counts, widths, unequal lane widths, or
-/// unequal logical starts retain the existing route.
+/// the equality-proven 32..=256 primitive domain and the existing 4,096-row
+/// transaction ceiling. The serving planner applies its narrower measured
+/// profitability ceiling before calling this primitive. Other lane counts,
+/// widths, unequal lane widths, or unequal logical starts retain the existing
+/// route.
 /// Once a descriptor claims rectangular eligibility, every remaining
 /// structural invariant is mandatory: malformed offsets, descriptor extents,
 /// or duplicate slots are propagated as errors instead of silently falling
