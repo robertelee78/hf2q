@@ -105,6 +105,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
+binding_root="$test_dir/exact-source-binding"
+binding_binary="$test_dir/hf2q-source-bound"
+missing_commit_binary="$test_dir/hf2q-missing-source"
+mkdir -p "$binding_root"
+git -C "$binding_root" init -q
+printf '%s\n' source >"$binding_root/source.txt"
+git -C "$binding_root" add source.txt
+GIT_AUTHOR_NAME=hf2q GIT_AUTHOR_EMAIL=hf2q@example.invalid \
+GIT_COMMITTER_NAME=hf2q GIT_COMMITTER_EMAIL=hf2q@example.invalid \
+    git -C "$binding_root" commit -qm source
+binding_commit=$(git -C "$binding_root" rev-parse HEAD)
+printf '#!/bin/sh\n# source commit: %s\nexit 0\n' "$binding_commit" \
+    >"$binding_binary"
+chmod +x "$binding_binary"
+binding_binary_sha=$(shasum -a 256 "$binding_binary" | awk '{print $1}')
+qwen38_validate_exact_source_binary_binding \
+    "$binding_root" "$binding_binary" "$binding_commit" "$binding_binary_sha"
+expect_failure exact-binding-wrong-source \
+    qwen38_validate_exact_source_binary_binding \
+    "$binding_root" "$binding_binary" "$(printf '6%.0s' {1..40})" \
+    "$binding_binary_sha"
+printf '#!/bin/sh\nexit 0\n' >"$missing_commit_binary"
+chmod +x "$missing_commit_binary"
+missing_commit_sha=$(shasum -a 256 "$missing_commit_binary" | awk '{print $1}')
+expect_failure exact-binding-missing-embedded-source \
+    qwen38_validate_exact_source_binary_binding \
+    "$binding_root" "$missing_commit_binary" "$binding_commit" \
+    "$missing_commit_sha"
+printf '%s\n' dirty >>"$binding_root/source.txt"
+expect_failure exact-binding-dirty-source \
+    qwen38_validate_exact_source_binary_binding \
+    "$binding_root" "$binding_binary" "$binding_commit" "$binding_binary_sha"
+git -C "$binding_root" restore source.txt
+
 dependency_root="$test_dir/dependency-valid"
 test_cargo_home="$test_dir/cargo-home"
 mkdir -p "$dependency_root" "$test_cargo_home"
@@ -472,7 +506,9 @@ qwen38_copy_four_position_matrix_seal \
 jq -s --arg repository "$QWEN38_QUALIFIED_MODEL_REPOSITORY" \
     --arg revision "$QWEN38_QUALIFIED_MODEL_REVISION" \
     --arg four_matrix_sha "$four_matrix_sha" '{
-      schema:2,verdict:"pass",gate:"qwen38-artifact-physical-width-matrix",
+      schema:3,verdict:"pass",gate:"qwen38-artifact-physical-width-matrix",
+      binding:{source_commit:("5" * 40),binary_sha256:("2" * 64),
+        binary_git_commit:("5" * 40)},
       repository:$repository,revision:$revision,
       formats:["BF16","Q4_K_M","Q5_K_M","Q6_K","Q8_0"],
       widths:[1,2,4,8,16],
@@ -699,6 +735,20 @@ jq '.results[0].model.sha256 = ("0" * 64)' \
     "$test_dir/physical.json" >"$test_dir/physical-wrong-artifact.json"
 expect_failure physical-wrong-artifact qwen38_validate_physical_matrix_receipt \
     "$test_dir/physical-wrong-artifact.json"
+jq '.binding.source_commit = ("6" * 40)' \
+    "$test_dir/physical.json" >"$test_dir/physical-wrong-source.json"
+expect_failure physical-wrong-source qwen38_validate_physical_matrix_receipt \
+    "$test_dir/physical-wrong-source.json"
+jq '.binding.binary_git_commit = ("6" * 40)' \
+    "$test_dir/physical.json" >"$test_dir/physical-wrong-binary-commit.json"
+expect_failure physical-wrong-binary-commit \
+    qwen38_validate_physical_matrix_receipt \
+    "$test_dir/physical-wrong-binary-commit.json"
+jq '.binding.binary_sha256 = ("6" * 64)' \
+    "$test_dir/physical.json" >"$test_dir/physical-wrong-binary-sha.json"
+expect_failure physical-wrong-binary-sha \
+    qwen38_validate_physical_matrix_receipt \
+    "$test_dir/physical-wrong-binary-sha.json"
 jq '.results[].workload.max_tokens = 63' \
     "$test_dir/physical.json" >"$test_dir/physical-noncanonical-max-tokens.json"
 expect_failure physical-noncanonical-max-tokens \
@@ -922,7 +972,7 @@ for index in "${!expected_formats[@]}"; do
         --arg pin "$pin" --arg physical_sha "$physical_sha" \
         --argjson cells "$cells" '{
           schema:2,verdict:"pass",gate:"qwen38-matched-physical-abba",
-          hf2q:{commit:("3"*40),binary_sha256:("2"*64),
+          hf2q:{commit:("5"*40),binary_sha256:("2"*64),
             effective_routing_policy:{dense_decode_mvn:1,
               dense_decode_mv_ext:0,dense_q5k_canonical_q4x4:1}},
           reference:{commit:$pin,binary_sha256:("6"*64)},
@@ -991,7 +1041,8 @@ jq -n --arg repository "$QWEN38_QUALIFIED_MODEL_REPOSITORY" \
       acceptance:{maximum_launch_skew_seconds:0.1},
       physical_matrix:{sha256:$physical_sha,seal_validated:true,
         self_contained_path:"physical-proof/matrix.json",
-        gate:"qwen38-artifact-physical-width-matrix",binary_sha256:$binary},
+        gate:"qwen38-artifact-physical-width-matrix",
+        source_commit:("5"*40),binary_sha256:$binary},
       evidence:{script_sha256:("7"*64),contract_sha256:("8"*64),
         artifact_contract_sha256:("9"*64),child_results_sealed:true,
         children:$children},results:$results}' >"$matched_root/summary.json.tmp"
@@ -1211,9 +1262,17 @@ grep -Fq 'FOUR_POSITION_MATRIX_RECEIPT=${FOUR_POSITION_MATRIX_RECEIPT:?' \
 grep -Fq 'qwen38_copy_four_position_matrix_seal' \
     "$script_dir/qwen38_physical_multislot_matrix.sh" \
     || fail 'physical matrix does not join the sealed four-position route proof'
-grep -Fq "qwen38_validate_physical_matrix_seal \"\$OUT_DIR/matrix.json\"" \
+grep -Fq 'qwen38_validate_exact_source_binary_binding' \
     "$script_dir/qwen38_physical_multislot_matrix.sh" \
-    || fail 'physical matrix does not reopen its final seal'
+    || fail 'physical matrix does not bind the binary to its source commit'
+# shellcheck disable=SC2016
+grep -Fq 'four_position_source_commit" == "$source_commit' \
+    "$script_dir/qwen38_physical_multislot_matrix.sh" \
+    || fail 'physical matrix does not bind four-position proof to its source commit'
+# shellcheck disable=SC2016
+grep -Fq '"$OUT_DIR/matrix.json" "$root_dir" "$BINARY_PATH"' \
+    "$script_dir/qwen38_physical_multislot_matrix.sh" \
+    || fail 'physical matrix does not reopen its final seal against source and binary'
 grep -Fq "qwen38_validate_matched_physical_matrix_receipt \"\$OUT_DIR/summary.json.tmp\"" \
     "$script_dir/qwen38_matched_physical_matrix.sh" \
     || fail 'matched physical matrix does not execute its receipt validator'

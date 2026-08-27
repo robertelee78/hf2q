@@ -116,7 +116,8 @@ reference_runtime_manifest_sha=$(printf '%s\n' "$reference_runtime_manifest" \
 }
 export HF2Q_MODEL_VERIFICATION_BINARY="$HF2Q_BIN"
 qwen38_validate_pinned_peer_commit "$REFERENCE_COMMIT"
-qwen38_validate_physical_matrix_seal "$PHYSICAL_MATRIX_RECEIPT"
+qwen38_validate_physical_matrix_seal \
+  "$PHYSICAL_MATRIX_RECEIPT" "$HF2Q_SOURCE_DIR" "$HF2Q_BIN"
 
 mkdir -p "$OUT_DIR/artifacts" "$OUT_DIR/preflight"
 qwen38_copy_physical_matrix_seal "$PHYSICAL_MATRIX_RECEIPT" \
@@ -125,8 +126,14 @@ physical_receipt="$OUT_DIR/physical-proof/matrix.json"
 physical_matrix_sha=$(shasum -a 256 "$physical_receipt" | awk '{print $1}')
 physical_binary_sha=$(jq -er '.results[0].binary.sha256' \
   "$physical_receipt")
+physical_source_commit=$(jq -er '.binding.source_commit' \
+  "$physical_receipt")
 [[ "$physical_binary_sha" == "$HF2Q_SHA256" ]] || {
     echo "physical matrix and matched binary identities differ" >&2
+    exit 2
+}
+[[ "$physical_source_commit" == "$HF2Q_COMMIT" ]] || {
+    echo "physical matrix and matched source commits differ" >&2
     exit 2
 }
 
@@ -242,6 +249,7 @@ jq -n --arg repository "$QWEN38_QUALIFIED_MODEL_REPOSITORY" \
     "$REFERENCE_RUNTIME_MANIFEST_SHA256" \
   --arg physical_sha "$physical_matrix_sha" \
   --arg physical_binary_sha "$physical_binary_sha" \
+  --arg physical_source_commit "$physical_source_commit" \
   --arg script_sha "$script_sha" --arg contract_sha "$contract_sha" \
   --arg artifact_contract_sha "$artifact_contract_sha" \
   --arg hf2q_speculation "$QWEN38_MATCHED_HF2Q_SPECULATION_POLICY" \
@@ -278,6 +286,7 @@ jq -n --arg repository "$QWEN38_QUALIFIED_MODEL_REPOSITORY" \
     physical_matrix:{sha256:$physical_sha,seal_validated:true,
       self_contained_path:"physical-proof/matrix.json",
       gate:"qwen38-artifact-physical-width-matrix",
+      source_commit:$physical_source_commit,
       binary_sha256:$physical_binary_sha},
     evidence:{script_sha256:$script_sha,contract_sha256:$contract_sha,
       artifact_contract_sha256:$artifact_contract_sha,

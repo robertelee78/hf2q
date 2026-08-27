@@ -17,7 +17,7 @@ source "$script_dir/qwen38_artifact_contract.sh"
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 
-for command in awk find jq ps shasum stat tr; do
+for command in awk find git grep jq ps shasum stat tr; do
     command -v "$command" >/dev/null || {
         echo "missing required command: $command" >&2
         exit 2
@@ -29,6 +29,13 @@ done
 }
 [[ -x "$BINARY_PATH" ]] || {
     echo "hf2q binary is missing or non-executable: $BINARY_PATH" >&2
+    exit 2
+}
+source_commit=$(git -C "$root_dir" rev-parse HEAD)
+binary_sha256=$(shasum -a 256 "$BINARY_PATH" | awk '{print $1}')
+qwen38_validate_exact_source_binary_binding \
+    "$root_dir" "$BINARY_PATH" "$source_commit" "$binary_sha256" || {
+    echo "physical artifact matrix requires a clean exact source-bound binary" >&2
     exit 2
 }
 export HF2Q_MODEL_VERIFICATION_BINARY="$BINARY_PATH"
@@ -44,6 +51,12 @@ export HF2Q_MODEL_VERIFICATION_BINARY="$BINARY_PATH"
 qwen38_validate_four_position_matrix_seal \
     "$FOUR_POSITION_MATRIX_RECEIPT" "$root_dir" || {
     echo "four-position route proof is invalid" >&2
+    exit 2
+}
+four_position_source_commit=$(jq -er '.source_commit' \
+    "$FOUR_POSITION_MATRIX_RECEIPT")
+[[ "$four_position_source_commit" == "$source_commit" ]] || {
+    echo "four-position and physical source commits differ" >&2
     exit 2
 }
 
@@ -161,6 +174,8 @@ artifact_contract_sha=$(shasum -a 256 "$script_dir/qwen38_artifact_contract.sh" 
     | awk '{print $1}')
 
 jq -n \
+    --arg source_commit "$source_commit" \
+    --arg binary_sha256 "$binary_sha256" \
     --arg repository "$QWEN38_QUALIFIED_MODEL_REPOSITORY" \
     --arg revision "$QWEN38_QUALIFIED_MODEL_REVISION" \
     --arg matrix_runner_sha "$matrix_runner_sha" \
@@ -173,7 +188,9 @@ jq -n \
     --argjson decode_mv_ext "$QWEN38_PHYSICAL_DECODE_MV_EXT" \
     --arg four_position_matrix_sha "$four_position_matrix_sha" \
     --argjson results "$matrix_results" '{
-      schema:2,verdict:"pass",gate:"qwen38-artifact-physical-width-matrix",
+      schema:3,verdict:"pass",gate:"qwen38-artifact-physical-width-matrix",
+      binding:{source_commit:$source_commit,binary_sha256:$binary_sha256,
+        binary_git_commit:$source_commit},
       repository:$repository,revision:$revision,
       formats:["BF16","Q4_K_M","Q5_K_M","Q6_K","Q8_0"],
       widths:[1,2,4,8,16],
@@ -211,7 +228,8 @@ printf '%s  matrix.json\n%s  evidence.sha256\n' "$matrix_sha" "$evidence_sha" \
     >"$OUT_DIR/result.sha256.tmp"
 mv "$OUT_DIR/result.sha256.tmp" "$OUT_DIR/result.sha256"
 mv "$OUT_DIR/matrix.json.tmp" "$OUT_DIR/matrix.json"
-if ! qwen38_validate_physical_matrix_seal "$OUT_DIR/matrix.json"; then
+if ! qwen38_validate_physical_matrix_seal \
+    "$OUT_DIR/matrix.json" "$root_dir" "$BINARY_PATH"; then
     mv "$OUT_DIR/matrix.json" "$OUT_DIR/matrix.json.unsealed"
     exit 1
 fi

@@ -536,6 +536,7 @@ qwen38_copy_four_position_matrix_seal() {
 
 qwen38_validate_physical_matrix_receipt() {
     local receipt_path=$1 receipt_dir four_position_receipt expected_four_sha
+    local expected_source_commit four_position_source_commit
     [[ -f "$receipt_path" ]] || return 1
     receipt_dir=$(cd "$(dirname "$receipt_path")" && pwd) || return 1
     four_position_receipt="$receipt_dir/four-position/matrix.json"
@@ -546,8 +547,11 @@ qwen38_validate_physical_matrix_receipt() {
         --argjson kv_budget "$QWEN38_CANONICAL_KV_CACHE_BUDGET_BYTES" \
         --argjson decode_mvn "$QWEN38_PHYSICAL_DECODE_MVN" \
         --argjson decode_mv_ext "$QWEN38_PHYSICAL_DECODE_MV_EXT" '
-      .schema == 2 and .verdict == "pass"
+      .schema == 3 and .verdict == "pass"
       and .gate == "qwen38-artifact-physical-width-matrix"
+      and (.binding.source_commit | test("^[0-9a-f]{40}$"))
+      and (.binding.binary_sha256 | test("^[0-9a-f]{64}$"))
+      and .binding.binary_git_commit == .binding.source_commit
       and .repository == $repository and .revision == $revision
       and .formats == ["BF16","Q4_K_M","Q5_K_M","Q6_K","Q8_0"]
       and .widths == [1,2,4,8,16]
@@ -563,8 +567,8 @@ qwen38_validate_physical_matrix_receipt() {
       and (.evidence.physical_contract_sha256 | test("^[0-9a-f]{64}$"))
       and (.evidence.artifact_contract_sha256 | test("^[0-9a-f]{64}$"))
       and (.results | map(.model.format)) == .formats
-      and ([.results[].binary.sha256] | unique | length) == 1
-      and (.results[0].binary.sha256 | test("^[0-9a-f]{64}$"))
+      and ([.results[].binary.sha256] | unique) ==
+        [.binding.binary_sha256]
       and all(.results[];
         .schema == 2 and .verdict == "pass"
         and .model.repository == $repository and .model.revision == $revision
@@ -596,6 +600,14 @@ qwen38_validate_physical_matrix_receipt() {
     ' "$receipt_path" >/dev/null || return 1
     qwen38_validate_four_position_matrix_seal "$four_position_receipt" \
       || return 1
+    expected_source_commit=$(jq -er '.binding.source_commit' \
+      "$receipt_path") || return 1
+    four_position_source_commit=$(jq -er '.source_commit' \
+      "$four_position_receipt") || return 1
+    [[ "$expected_source_commit" == "$four_position_source_commit" ]] || {
+        echo "physical and four-position source commits differ" >&2
+        return 1
+    }
     expected_four_sha=$(jq -er '.route_proof.four_position_matrix_sha256' \
       "$receipt_path") || return 1
     [[ "$expected_four_sha" == \
@@ -625,10 +637,35 @@ qwen38_validate_evidence_manifest_paths() {
     ' "$manifest"
 }
 
+qwen38_validate_exact_source_binary_binding() {
+    local source_root=$1 binary_path=$2 source_commit=$3 binary_sha=$4
+    [[ "$source_commit" =~ ^[0-9a-f]{40}$ \
+      && "$binary_sha" =~ ^[0-9a-f]{64}$ \
+      && ( -d "$source_root/.git" || -f "$source_root/.git" ) \
+      && -x "$binary_path" ]] || return 1
+    [[ "$(git -C "$source_root" rev-parse HEAD)" == "$source_commit" \
+      && -z "$(git -C "$source_root" status \
+        --porcelain --untracked-files=all)" ]] || {
+        echo "physical matrix source identity differs from receipt" >&2
+        return 1
+    }
+    [[ "$(shasum -a 256 "$binary_path" | awk '{print $1}')" == \
+      "$binary_sha" ]] || {
+        echo "physical matrix binary identity differs from receipt" >&2
+        return 1
+    }
+    grep -aFq "$source_commit" "$binary_path" || {
+        echo "physical matrix binary lacks its recorded source commit" >&2
+        return 1
+    }
+}
+
 qwen38_validate_physical_matrix_seal() {
     local receipt_path=$1
+    local source_root=${2:-} binary_path=${3:-}
     local receipt_dir receipt_name evidence_path result_path
     local matrix_sha evidence_sha format slug width log_path
+    local expected_source_commit expected_binary_sha
 
     [[ -f "$receipt_path" && -r "$receipt_path" && ! -L "$receipt_path" ]] \
       || return 1
@@ -646,6 +683,16 @@ qwen38_validate_physical_matrix_seal() {
         return 1
     }
     qwen38_validate_physical_matrix_receipt "$receipt_path" || return 1
+    expected_source_commit=$(jq -er '.binding.source_commit' \
+      "$receipt_path") || return 1
+    expected_binary_sha=$(jq -er '.binding.binary_sha256' \
+      "$receipt_path") || return 1
+    if [[ -n "$source_root" || -n "$binary_path" ]]; then
+        [[ -n "$source_root" && -n "$binary_path" ]] || return 1
+        qwen38_validate_exact_source_binary_binding \
+          "$source_root" "$binary_path" "$expected_source_commit" \
+          "$expected_binary_sha" || return 1
+    fi
     qwen38_validate_evidence_manifest_paths "$evidence_path" || return 1
     for format in $(qwen38_artifact_formats); do
         slug=$(printf '%s' "$format" | tr '[:upper:]' '[:lower:]')
@@ -866,6 +913,7 @@ qwen38_validate_matched_physical_matrix_receipt() {
       and .physical_matrix.gate == "qwen38-artifact-physical-width-matrix"
       and .physical_matrix.seal_validated == true
       and .physical_matrix.self_contained_path == "physical-proof/matrix.json"
+      and (.physical_matrix.source_commit | test("^[0-9a-f]{40}$"))
       and (.physical_matrix.binary_sha256 | test("^[0-9a-f]{64}$"))
       and .evidence.child_results_sealed == true
       and (.evidence.script_sha256 | test("^[0-9a-f]{64}$"))
@@ -883,6 +931,8 @@ qwen38_validate_matched_physical_matrix_receipt() {
       and (.results | map(.model.format)) == .formats
       and ([.results[].hf2q.commit] | unique | length) == 1
       and (.results[0].hf2q.commit | test("^[0-9a-f]{40}$"))
+      and ([.results[].hf2q.commit] | unique) ==
+        [.physical_matrix.source_commit]
       and ([.results[].hf2q.binary_sha256] | unique) ==
         [.physical_matrix.binary_sha256]
       and ([.results[].reference.commit] | unique) == [$reference_commit]
@@ -987,6 +1037,9 @@ qwen38_validate_matched_physical_matrix_receipt() {
     qwen38_validate_physical_matrix_seal "$physical_path" || return 1
     [[ "$(shasum -a 256 "$physical_path" | awk '{print $1}')" == \
       "$(jq -er '.physical_matrix.sha256' "$receipt_path")" ]] || return 1
+    [[ "$(jq -er '.binding.source_commit' "$physical_path")" == \
+      "$(jq -er '.physical_matrix.source_commit' "$receipt_path")" ]] \
+      || return 1
     for format in $(qwen38_artifact_formats); do
         for width in 1 2 4 8 16; do
             expected_proof=$(jq -Sce --arg format "$format" \

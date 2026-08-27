@@ -80,6 +80,16 @@
   MVN-on/MV_EXT-off workload in every format, and seal the matched matrix's
   exact 48-GiB KV budget plus 100-ms launch-skew ceiling in both child and
   outer receipts. Ambient or cross-format weakening fails validation.
+  A subsequent proof audit found that the physical matrix retained the binary
+  SHA-256 but dropped the source-commit join already present in its
+  four-position parent and matched-performance consumer. Physical schema 3
+  now records one source/binary binding, requires every child binary digest and
+  the copied four-position source commit to match it, proves the executable
+  embeds that commit against a clean exact worktree at start and final reopen,
+  and carries the same source commit into the matched matrix. Wrong-commit,
+  missing-embedded-commit, dirty-source, and binary-digest mutations fail. All
+  schema-2 physical receipts remain useful historical measurements but cannot
+  authorize a current exact-source matched run.
   ADR-049 revs 66 and 72 subsequently sealed the corrected historical
   Qwen3.6 MoE and BF16 replay cells, so those two admission defects are no
   longer hardware-pending. A final current-head five-format/physical-width
@@ -695,6 +705,15 @@ require the exact values and reject cross-format drift. The four-position
 runner reopens and compares every catalog artifact's hash-bound portable
 snapshot after all five cells, so an early artifact cannot change while later
 formats run and still contribute to a sealed matrix.
+
+The physical matrix uses schema 3. Its top-level binding contains the clean
+source commit, executable SHA-256, and embedded executable commit. The
+validator requires those identities to agree, requires all five child receipts
+to name that executable digest, and requires the sealed four-position matrix to
+name that source commit. Generation and final sealing additionally reopen the
+live source tree and executable. The matched matrix repeats the source and
+binary joins before it may consume the physical seal; copying and rehashing an
+older or mismatched receipt cannot manufacture exact-head authority.
 
 ### Repeat work-unit correction (2026-08-24)
 
