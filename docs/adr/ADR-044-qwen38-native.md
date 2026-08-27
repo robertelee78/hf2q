@@ -4,7 +4,7 @@
   speculation re-opened after a longitudinal verifier-coherence failure;
   vision candidate is under exact-artifact acceptance
 - Date: 2026-08-16
-- Updated: 2026-08-26 — the canonical server owns fixed-K3 MTP and
+- Updated: 2026-08-27 — the canonical server owns fixed-K3 MTP and
   request-history speculation with per-proposer measured cost gates. GGUF
   inference preserves the artifact's declared weight encodings. A 508-decision
   scalar-versus-width-four real-artifact gate found that the Qwen3.8-local
@@ -97,6 +97,12 @@
   longer hardware-pending. A final current-head five-format/physical-width
   rerun remains required for exact binary lineage and matched-peer authority;
   it is not a claim that the historical corrected cells never passed.
+  ADR-049 rev 99 additionally records accepted process-group-cpu-v2 native-Q5
+  rectangular ABBA results for Qwen3.8 dense/MTP and Qwen3.6 MoE/no-MTP, plus
+  both agentic lifecycle cells, from one exact ancestor binary. Those results
+  establish the shared Q5 route's multi-client product value without closing
+  this ADR's still-open exact-head one-slot speculation or five-format matched-
+  current-peer authorities.
 - Owners: hf2q conversion, quantization, inference, and serving
 
 ## Context

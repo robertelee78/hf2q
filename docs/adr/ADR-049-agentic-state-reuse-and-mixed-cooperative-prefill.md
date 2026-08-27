@@ -1,28 +1,65 @@
 # ADR-049: Agentic state reuse (multi-anchor) and Mixed-phase cooperative prefill
 
-- Status: Accepted; execution in progress (qwen35-family, Gemma4, and
-  DeepSeek4 Lane A proof plus the DeepSeek4 B.1 candidate are documented
-  through rev 64; Qwen3.6, Qwen3.8, Gemma4, and DeepSeek4 lineage/failure
-  gates are green and Lane A family coverage is complete,
-  selected-boundary acceleration and scheduler coalescing were falsified, and
-  the exact block-segmented replacement has passed its deciding spike, and
-  the Qwen rectangular operator-lifecycle correction has exact native-Q5
-  state proof, a completed Q5 fused-route falsifier, and a codec-wide exact
-  Q4x4 implementation with Qwen3.8 quality/lifecycle and Qwen3.6 route proof;
-  its published dependency is pinned, the exact five-format scalar/storage
-  matrix is green, and universal four-family two-cycle swap is hardware-sealed;
-  the `b5f60441` exact-head physical matrix passed all 25 format/width cells
-  after the rectangular admission correction, but the current exact-head
-  seal is reopened after that run exposed a distinct scalar K=0 capture
-  defect, while
-  matched-reference acceptance remains open;
-  the DeepSeek B.1 and Gemma/Qwen B.2 fail-closed hardware authorities are
-  now checked in and model-free green; Gemma and Qwen B.2 implementation and
-  coherence are accepted but all affected final performance receipts are
-  reopened under the v2 contention authority, while the DeepSeek and Qwen
-  current-head real-artifact cells remain open)
+- Status: Accepted; execution in progress (Lane A is hardware-complete across
+  Qwen3.6, Qwen3.8, Gemma4, and DeepSeek4. Gemma and Qwen B.2 implementation
+  and coherence are accepted. Exact process-group-cpu-v2 Qwen3.8 dense/MTP
+  and Qwen3.6 MoE/no-MTP rectangular ABBA cells now pass, as do both Qwen
+  lifecycle cells. The joined Qwen product seal remains open on a clean,
+  uninstrumented Mixed cell; current-head five-format/physical and matched-
+  current-peer performance also remain open. Gemma's v2 product-speed replay
+  and DeepSeek B.1 hardware acceptance remain open.)
 - Date: 2026-08-22
-- Updated: 2026-08-26 (rev 98 records the first complete post-rev-96 hardware
+- Updated: 2026-08-27 (rev 99 records the first accepted post-rev-98 Qwen
+  performance and lifecycle cells without promoting diagnostic timing. At
+  exact source `ebb8be50ea6689963c349c38275fbe19383bd204` and release binary
+  SHA-256
+  `f34eebfa40b1f4e67be4bccb89f6b7dcc8f81ced7e22db86972b5e777f041f86`,
+  the process-group-cpu-v2 same-binary ABBA gate passed exact semantic/token
+  equality for both supported Qwen architecture shapes. The Qwen3.8 Q5_K_M
+  dense/MTP four-client wave improved by 1.320829x, with 26.462 ms median and
+  30.451 ms worst matched single-request overhead. The distinct Qwen3.6
+  Q5_K_M MoE/no-MTP wave improved by 1.454573x, with 28.126 ms median and
+  31.890 ms worst matched overhead. Receipt SHA-256 values are respectively
+  `e957c5a0a054a5ae24aaa059a03b78386f04810943a5da33c32e91b52b1c534b`
+  and
+  `00392ca33afb235633e1cfcb00f809f4ff50a9a35c6128ff84e0d762195507d4`.
+  Both exact-artifact lifecycle cells also passed required tool use,
+  tool-result continuation, retained-prefix reuse, semantic SSE cancellation,
+  queued exact retry, and unrelated-conversation isolation; their receipt
+  SHA-256 values are
+  `f9f5fe840f4aa6d545886dfe9bf1d533791dc16fe3140266e692e43338147069`
+  for Qwen3.8 and
+  `588cf134f0c46dcfe6ff748252f719a42ceb225db1076ae152366eee89491c32`
+  for Qwen3.6.
+
+  That invocation did not seal the joined matrix because the Qwen3.8 Mixed
+  cell encountered foreign CPU contention. A later diagnostic run completed
+  all four Mixed arms, preserved exact canonical output SHA-256
+  `9f8cb2525af8720942f8e6b2281b907a8d378289d3129b4151353bc894585181`,
+  and reopened successfully through the corrected verifier, but a continuous
+  one-second process sampler was active. Its 1.20792x point estimate is
+  therefore timing-ineligible and is not accepted performance evidence.
+  Source review of that diagnostic closed three proof-path defects without
+  changing model arithmetic: the rectangular runners now consume the current
+  checkpoint-publication event, the lifecycle receipt serializes the native
+  Q5 routing policy as a boolean, and commit `e32dabc2` preserves the checked
+  decoder object instead of replacing it with jq's boolean predicate result.
+  A fresh uninstrumented exact-head joined matrix remains required.
+
+  Exact ancestor `9aff231bc5ea108f6a0747d946269c4fec7843d9` also closes
+  the rev-98 K=0 correctness replay: all five qualified formats passed the
+  native-storage/four-position matrix (SHA-256
+  `1488272911e8bdc3cbf9156a933e80d6aa65ff1016c3032c71d58e31d890172f`),
+  and all 25 format-by-width cells passed exact scalar replay at physical
+  widths 1/2/4/8/16 (SHA-256
+  `f669a0424cc664ee81941e3a7361ac6fedcdf9b799f4f5ce321c051c191904ea`).
+  The physical receipt binds release binary SHA-256
+  `04d0a6254fb49321ceb0a7feb1b42a62dc93e48a62219701f2826c47f56815bb`
+  and observes the native Q5 width-four route
+  `kernel_mul_mv_ext_q5_K_f32_r1_4`. Those exact ancestor receipts remain
+  correctness evidence; the final exact-head replay and matched-current-peer
+  performance authority remain open. Rev 98
+  records the first complete post-rev-96 hardware
   spike and reformulates the remaining Qwen admission hypothesis instead of
   accepting a correctness-only result as final. At exact source `b5f60441`,
   the native-storage/four-position matrix passed BF16, Q4_K_M, Q5_K_M, Q6_K,
@@ -2595,16 +2632,18 @@ Framing (Robert): items below are either FALSIFIED with evidence in hand, or OPE
   parity, semantic-SSE/scheduler-tail, thermal, memory, and speed contracts.
 - [x] B.2 Qwen aggregation and Gemma 128/192 aggregation plus 256 scalar
   fallback shipped with exact-result/coherence proof.
-- [ ] Qwen's fixed-cost curve, rectangular speed bounds, Q5 timing cells, and
-  matched-peer performance are reproduced under process-group-cpu-v2; the
-  affected v1 timing receipts are historical evidence, not final uncontended
-  authority.
+- [ ] Qwen's fixed-cost curve and matched-peer performance are reproduced
+  under process-group-cpu-v2. The native-Q5 Qwen3.8 and Qwen3.6 rectangular
+  ABBA timing/speed bounds are reproduced at rev 99; the remaining v1 timing
+  receipts are historical evidence, not final uncontended authority.
 - [ ] Gemma's accepted 128/192 product-speed bounds and 256 scalar fallback
   are reproduced under process-group-cpu-v2; the older v1 timing receipt is
   historical evidence, not final uncontended authority.
 - [ ] The joined current-head Qwen product matrix seals Qwen3.8 dense/MTP and
   Qwen3.6 MoE/no-MTP rectangular ABBA, lifecycle/cache reuse, and live-decoder
-  plus four-prefill Mixed cells from one exact binary.
+  plus four-prefill Mixed cells from one exact binary. Rev 99 closes both
+  rectangular and both lifecycle child cells at one exact ancestor binary;
+  the uninstrumented Mixed child and final joined seal remain open.
 - [x] Payload-ownership regression (no retained parent allocations) and the preflight-then-mutate `restore_slot_anchor` refactor landed.
 - [x] A.2 lineage regression and the new SlotAware divergence gate exist in `scripts/` and fail closed.
 - [x] Telemetry (A.8) emits one fixed-schema terminal outcome per restore attempt across Qwen, Gemma, and DeepSeek production paths; real-artifact telemetry receipts remain part of the family gates above.
