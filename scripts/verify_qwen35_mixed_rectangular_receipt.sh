@@ -11,6 +11,18 @@ source "$script_dir/qwen35_mixed_rectangular_contract.sh"
 # shellcheck source=scripts/qwen36_watchdog_validate.sh
 source "$script_dir/qwen36_watchdog_validate.sh"
 
+qwen35_mixed_checked_decoder_canonical_json() {
+  jq -e '
+    select(
+      (.message.content | type) == "string" and (.message.content | length) > 0
+      and .message.tool_calls == []
+      and (.finish_reason == "stop" or .finish_reason == "length")
+      and (.usage.prompt_tokens | numbers) > 0
+      and ((.usage.prompt_tokens_details.cached_tokens // 0) | numbers) >= 0
+    )
+  '
+}
+
 if [[ ${1:-} == --self-test ]]; then
   tmp=$(mktemp -d "${TMPDIR:-/var/tmp}/qwen-mixed-self-test.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT
@@ -49,6 +61,20 @@ EOF
   if printf '%s\n' "${valid_power/on-a-measurement-end/on-a-wrong}" \
     | qwen35_mixed_validate_power_log high on-a; then
     echo "mixed verifier self-test accepted a corrupt power phase" >&2
+    exit 1
+  fi
+  jq -n '{message:{content:"decoder",tool_calls:[]},finish_reason:"stop",
+    usage:{prompt_tokens:10,prompt_tokens_details:{cached_tokens:0}}}' \
+    >"$tmp/decoder-canonical.json"
+  qwen35_mixed_checked_decoder_canonical_json \
+    <"$tmp/decoder-canonical.json" >"$tmp/decoder-checked.json"
+  jq -e 'type == "object" and .message.content == "decoder"' \
+    "$tmp/decoder-checked.json" >/dev/null
+  jq '.usage.prompt_tokens = 0' "$tmp/decoder-canonical.json" \
+    >"$tmp/decoder-invalid.json"
+  if qwen35_mixed_checked_decoder_canonical_json \
+    <"$tmp/decoder-invalid.json" >"$tmp/decoder-invalid-checked.json"; then
+    echo "mixed verifier self-test accepted a zero-token decoder" >&2
     exit 1
   fi
   echo "Qwen mixed rectangular verifier self-test: PASS"
@@ -368,13 +394,8 @@ for label in off-a on-a on-b off-b; do
         >>"$tmp/$label-prefill-$trial.rows"
     done
     qwen35_mixed_canonical_sse_json "$events" \
-      | jq -e '
-          (.message.content | type) == "string" and (.message.content | length) > 0
-          and .message.tool_calls == []
-          and (.finish_reason == "stop" or .finish_reason == "length")
-          and (.usage.prompt_tokens | numbers) > 0
-          and ((.usage.prompt_tokens_details.cached_tokens // 0) | numbers) >= 0
-        ' >"$tmp/$label-decoder-$trial-canonical.json" \
+      | qwen35_mixed_checked_decoder_canonical_json \
+        >"$tmp/$label-decoder-$trial-canonical.json" \
       || fail "$label trial $trial decoder-canonical"
     jq -c --argjson trial "$trial" '. + {kind:"decoder",trial:$trial}' \
       "$tmp/$label-decoder-$trial-canonical.json" >>"$tmp/$label-canonical.jsonl"
