@@ -100,7 +100,7 @@ hf2q (one binary `hf2q`, one narrow [lib] facade for tests)
 │   ├── config_parser.rs HF config.json → ModelMetadata
 │   ├── safetensors.rs   streaming mmap shard reader → TensorMap
 │   ├── hf_reference.rs  bounded canonical Hub ID/URL + immutable identity
-│   ├── hf_download.rs   exact-revision native Hub source-plan/download
+│   ├── hf_download.rs   exact-revision native-Xet Hub plan/download + digest gate
 │   ├── hf_download/     bounded repository resolution
 │   └── integrity.rs     bounded index + LFS/Git byte verification
 │

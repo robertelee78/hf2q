@@ -2,7 +2,7 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
-Current published release: `v0.1.17`. Public availability is authoritative
+Current published release: `v0.1.18`. Public availability is authoritative
 only after exact-artifact release proof completes.
 
 The next-release source candidate pins published `mlx-native = 0.15.0` from
@@ -12,7 +12,7 @@ The backend's fail-closed exact-source/package/publication workflow run
 `32917226470` passed. This dependency publication does not by itself publish
 or qualify a new hf2q release.
 
-This document defines the public hf2q product surface for `v0.1.17` and the
+This document defines the public hf2q product surface for `v0.1.18` and the
 **next-release candidate** where explicitly marked. It also defines
 the policy each environment variable is classified under. Per-variable
 effects live in `docs/operator-env-vars.md`; this document sits one level above
@@ -49,7 +49,7 @@ cache, or forward graph.
 
 ### Repository model operands and managed local artifacts
 
-hf2q `v0.1.17` accepts `owner/repository[:QUANT]` as the common
+hf2q `v0.1.18` accepts `owner/repository[:QUANT]` as the common
 model operand for `convert`, `serve`, and `chat`, as governed by ADR-051.
 `serve` and model-targeted `chat` prefer hf2q-bound local authority, then a
 unique compatible structural match among manually downloaded or canonical

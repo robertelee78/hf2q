@@ -4,8 +4,8 @@
 //! v0.1.0 workspace split (B1.3).  The HTTP-bound pieces
 //! (`fetch_repo_shard_metadata`, `verify_repo`, the local-snapshot
 //! walker) stay in `src/input/integrity.rs` because they depend on
-//! `hf-hub`'s `ApiBuilder` — that's an HF-download concern that lives
-//! on the convert side of the workspace split.
+//! the exact-origin Hub metadata client — that's an HF-download concern
+//! that lives on the convert side of the workspace split.
 //!
 //! What lives here (post-B1.3):
 //!
@@ -24,8 +24,8 @@
 //!
 //! What stays in `src/input/integrity.rs`:
 //!
-//! - `fetch_repo_shard_metadata` — issues HEAD to HF Hub via
-//!   `hf-hub::Api::metadata`.
+//! - `fetch_repo_shard_metadata` — issues exact-origin, no-redirect HEAD
+//!   requests to the Hub and preserves commit plus Git/LFS identity headers.
 //! - `verify_repo` — convenience wrapper that calls fetch then
 //!   `verify_shard` for every record.  Lives next to fetch because
 //!   the two share the HTTP / token-resolution stack.

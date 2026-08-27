@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/robertelee78/hf2q/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/robertelee78/hf2q/actions/workflows/ci.yml)
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
-[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey.svg)](#install)
 [![Backend: mlx-native](https://img.shields.io/badge/backend-mlx--native-purple.svg)](https://crates.io/crates/mlx-native)
 
@@ -27,10 +27,10 @@ Metal kernels we own end-to-end.
 | | |
 |---|---|
 | **License** | Apache-2.0 OR MIT (dual); third-party attribution in [`NOTICE`](NOTICE) |
-| **Rust** | 1.88+ |
+| **Rust** | 1.89+ |
 | **Inference backend** | Exact [`mlx-native`](https://crates.io/crates/mlx-native) registry pin in `Cargo.toml` (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (loads in any stock GGUF consumer), mlx-lm safetensors |
-| **Status** | The published hf2q release is 0.1.17 and resolves published, checksum-pinned `mlx-native 0.11.2`. This checkout is the next-release source candidate and pins published, checksum-pinned `mlx-native 0.15.0` from crates.io at SHA-256 `09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822`; that backend release passed the fail-closed exact-source/package/publication workflow in run `32917226470`. The checkout is not a published hf2q release until its own tag, GitHub artifact, crates.io bytes, and exact main-branch release SHA agree. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
+| **Status** | The published hf2q release line is 0.1.18 and resolves published, checksum-pinned `mlx-native 0.11.2`. This checkout is the next-release source candidate and pins published, checksum-pinned `mlx-native 0.15.0` from crates.io at SHA-256 `09d3decffbf66811bac728abd51697c89cd699e031bc1b4295470108f235b822`; that backend release passed the fail-closed exact-source/package/publication workflow in run `32917226470`. The checkout is not a published hf2q release until its own tag, GitHub artifact, crates.io bytes, and exact main-branch release SHA agree. Support is family- and scheduler-specific; see `docs/shipping-contract.md`. |
 
 ```bash
 curl -fsSL https://hf2q.us/install.sh | sh
@@ -152,7 +152,7 @@ to a sibling checkout.
 
 - macOS with Metal Performance Shaders (M1 or newer).
 - A working Rust toolchain at the version pinned in `Cargo.toml`
-  (`rust-version = "1.88.0"`).
+  (`rust-version = "1.89.0"`).
 - Per-arch disk floor for convert (`src/arch/entries/`): **100 GB** for
   Qwen 3.5 dense, **150 GB** for Qwen 3.5 MoE. Smoke preflight refuses
   to start below `disk_floor_gb + 10`.
@@ -760,7 +760,7 @@ are recorded in `docs/adr/ADR-019-mlx-native-encoder-architecture.md`,
 `docs/adr/ADR-027-qwen35-tq-kv-cache-and-persist-family.md`, and
 `docs/adr/ADR-040-continuous-batching-reopen.md`.
 
-#### Test the 0.1.17 serving release
+#### Test the 0.1.18 serving release
 
 Build and verify the exact checkout before loading a model:
 

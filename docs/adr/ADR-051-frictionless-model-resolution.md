@@ -1,8 +1,8 @@
 # ADR-051: Frictionless local-first model resolution
 
-- **Status:** Accepted; v0.1.17 corrective release under final validation,
-  stable-channel activation pending
-- **Date:** 2026-08-23
+- **Status:** Accepted; v0.1.17 shipped and the v0.1.18 native-Xet transport
+  amendment is under exact-artifact release validation
+- **Date:** 2026-08-23; native-Xet transfer amendment 2026-08-26
 - **Related:** ADR-005, ADR-018, ADR-033, ADR-045, ADR-046, ADR-047
 - **Supersedes in part:** ADR-045's statement that onboarding does not create a
   no-options model workflow; ADR-045's installation and distribution decisions
@@ -61,6 +61,24 @@ This ADR changes that product policy without weakening ADR-047's authority
 checks.
 
 ## Decision
+
+### 0. Native Xet is the default remote payload transport
+
+The local-first order is unchanged. When a hosted GGUF or native source weight
+is genuinely absent, hf2q uses pinned `hf-hub 1.0.0` and its native Xet client
+instead of the former synchronous single-stream `hf-hub 0.5` path. A hosted
+artifact is one exact-revision Xet-aware file request. Native source weights
+are one bounded snapshot operation containing only the authenticated index's
+glob-escaped literal shard paths, with eight file workers. Large model payloads
+must advertise Xet; there is no production downgrade to the legacy large-file
+HTTP transport. Xet's adaptive concurrency is the one default policy.
+
+Transport success grants no serving or conversion authority. Exact revision,
+selected filename, linked size, strong LFS SHA-256, exact snapshot parent, and
+the full local digest pass remain mandatory. Complete standard Hub cache blobs
+are reused; incomplete objects are never published as cache hits. See
+`docs/research/hf-download-rca-2026-08-26.md` for the source-bound RCA and the
+checked-in 16.81 GB cold-cache native-Xet benchmark contract.
 
 ### 1. One model operand grammar
 

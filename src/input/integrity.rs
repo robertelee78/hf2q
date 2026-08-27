@@ -3,8 +3,8 @@
 //! What lives here (post-B1.3, 2026-05-16):
 //!
 //! - [`fetch_repo_shard_metadata`] — issues HEAD requests to HF Hub via
-//!   `hf-hub::Api::metadata`, parses `x-linked-etag` (LFS SHA-256) /
-//!   plain `etag` (Git blob SHA-1) for each local file.
+//!   hf2q's exact-origin no-redirect Hub metadata client, preserving the
+//!   resolved commit plus LFS SHA-256 / Git blob identity for each local file.
 //! - [`verify_repo`] — convenience wrapper that calls fetch then
 //!   `core::integrity::verify_shard` for every record.
 //! - `enumerate_local_files` / `walk_dir` — snapshot-directory walker.
@@ -31,16 +31,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path};
 
-use hf_hub::api::sync::ApiBuilder;
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::core::integrity::{verify_shard, IntegrityError, ShardIntegrity};
 
-const CANONICAL_HF_ENDPOINT: &str = "https://huggingface.co";
 const MAX_VERIFIED_SOURCE_FILES: usize = 4096;
 pub(super) const MAX_HF_SAFETENSORS_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const MAX_HF_SAFETENSORS_INDEX_ENTRIES: usize = 262_144;
@@ -463,8 +461,6 @@ fn fetch_selected_repo_metadata(
     revision: &str,
     selected_files: &[String],
 ) -> Result<Vec<ShardIntegrity>, IntegrityError> {
-    use hf_hub::{Repo, RepoType};
-
     if selected_files.is_empty() || selected_files.len() > MAX_VERIFIED_SOURCE_FILES {
         return Err(IntegrityError::InvalidSourceManifest {
             reason: format!(
@@ -482,42 +478,13 @@ fn fetch_selected_repo_metadata(
         }
     }
 
-    let api = ApiBuilder::new()
-        .with_endpoint(CANONICAL_HF_ENDPOINT.to_owned())
-        .with_token(crate::input::hf_download::resolve_auth_token())
-        .build()
-        .map_err(|error| IntegrityError::MetadataFetchFailed {
+    crate::input::hf_download::fetch_selected_hub_integrity(repo, revision, selected_files).map_err(
+        |error| IntegrityError::MetadataFetchFailed {
             repo: repo.to_owned(),
             revision: revision.to_owned(),
-            reason: format!("Failed to build hf-hub API client: {error}"),
-        })?;
-
-    // Use Repo::with_revision so the URLs use the pinned revision when one
-    // is supplied; this matches the snapshot layout `snapshots/<rev>/`.
-    let repo_handle = api.repo(Repo::with_revision(
-        repo.to_string(),
-        RepoType::Model,
-        revision.to_string(),
-    ));
-
-    let mut out = Vec::with_capacity(selected_files.len());
-    for filename in selected_files {
-        let url = repo_handle.url(filename);
-        debug!(repo, revision, filename, "Fetching HF metadata for shard");
-        let metadata = api
-            .metadata(&url)
-            .map_err(|e| IntegrityError::MetadataFetchFailed {
-                repo: repo.to_string(),
-                revision: revision.to_string(),
-                reason: format!("HEAD {url}: {e}"),
-            })?;
-        out.push(ShardIntegrity::from_metadata(
-            filename,
-            metadata.etag(),
-            metadata.size() as u64,
-        ));
-    }
-    Ok(out)
+            reason: error.to_string(),
+        },
+    )
 }
 
 /// Enumerate files in a local snapshot directory, ignoring hidden files
@@ -923,21 +890,13 @@ mod tests {
             eprintln!("skipping network test (set HF2Q_NETWORK_TESTS=1 to run)");
             return;
         }
-        let api = ApiBuilder::new()
-            .with_endpoint(CANONICAL_HF_ENDPOINT.to_owned())
-            .build()
-            .expect("build exact-origin Hub client");
-        use hf_hub::Repo;
-        let repo = api.repo(Repo::with_revision(
-            "hf-internal-testing/tiny-random-bert".into(),
-            hf_hub::RepoType::Model,
-            "main".into(),
-        ));
-        let url = repo.url("config.json");
-        let metadata = api.metadata(&url).expect("fetch config metadata");
-        assert!(metadata.size() > 0);
-        let s =
-            ShardIntegrity::from_metadata("config.json", metadata.etag(), metadata.size() as u64);
+        let records = fetch_selected_repo_metadata(
+            "hf-internal-testing/tiny-random-bert",
+            "main",
+            &["config.json".to_owned()],
+        )
+        .expect("fetch config metadata");
+        let s = &records[0];
         // config.json is a small Git-managed file, not LFS.
         assert!(!s.is_lfs);
         assert_eq!(s.hf_etag.len(), 40);

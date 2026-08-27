@@ -734,6 +734,13 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqDrafterKvCache {
 /// constructed from runtime context.  Sibling of Gemma 4 A3c's
 /// `gemma4_leak_static_str` at `gemma4/kv_cache.rs:575+`.
 #[inline]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Rust 1.89 does not mark helpers reached only by the dormant MultiSeqKvCache::fork_seq production seam as live"
+    )
+)]
 fn drafter_leak_static_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
@@ -747,6 +754,13 @@ fn drafter_leak_static_str(s: String) -> &'static str {
 /// n_seqs-outermost invariant is identical (the alloc helper above emits
 /// shape `[n_seqs, ...]` with n_seqs as leading dim ⇒ per-slot region is
 /// contiguous of size `total_bytes / n_seqs`).
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Rust 1.89 does not mark helpers reached only by the dormant MultiSeqKvCache::fork_seq production seam as live"
+    )
+)]
 fn drafter_copy_buffer_slot_region(
     buf: &mut MlxBuffer,
     src_idx: usize,

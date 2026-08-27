@@ -5857,6 +5857,13 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
 /// per-slot byte-offset formulas preclude by construction at the
 /// MultiSeqKvCache impl level), so the leak is bounded.
 #[inline]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Rust 1.89 does not mark helpers reached only by the dormant MultiSeqKvCache::fork_seq production seam as live"
+    )
+)]
 fn leak_static_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
@@ -5889,6 +5896,13 @@ fn leak_static_str(s: String) -> &'static str {
 /// outermost; conv_capture row-major n_seqs outermost) per-slot byte
 /// stride collapses to `total_bytes / n_seqs` by the same outermost-
 /// in-memory invariant.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Rust 1.89 does not mark helpers reached only by the dormant MultiSeqKvCache::fork_seq production seam as live"
+    )
+)]
 fn copy_buffer_slot_prefix(
     buf: &mut MlxBuffer,
     src_idx: usize,
@@ -5935,6 +5949,13 @@ fn copy_buffer_slot_prefix(
     Ok(())
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Rust 1.89 does not mark helpers reached only by the dormant MultiSeqKvCache::fork_seq production seam as live"
+    )
+)]
 fn copy_buffer_slot_region(
     buf: &mut MlxBuffer,
     src_idx: usize,
