@@ -810,6 +810,18 @@ mod tests {
         peer.send(&frame).unwrap();
         assert_eq!(process.poll_startup_event(), Some(expected));
 
+        let expected = crate::serve::startup_progress::StartupEvent::HostedDownloadProgress {
+            filename: "model-q4_k_m.gguf".into(),
+            completed_bytes: 25,
+            total_bytes: 100,
+            bytes_per_second: Some(10),
+            elapsed_ms: 2_500,
+        };
+        let mut frame = crate::serve::CHAT_STARTUP_PROGRESS_PREFIX.to_vec();
+        frame.extend(serde_json::to_vec(&expected).unwrap());
+        peer.send(&frame).unwrap();
+        assert_eq!(process.poll_startup_event(), Some(expected));
+
         process.force_stop().unwrap();
     }
 

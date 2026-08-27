@@ -50,9 +50,12 @@ is not hashed before serving. This includes a final file symlink such as a
 GGUF linked from another local model library: hf2q retains the target and
 revalidates both link and target identities without traversing linked
 directories. If none exists, hf2q resolves the repository to one immutable
-commit, checks disk space, downloads and verifies the exact hosted GGUF, and
-stores it below
-`$HOME/.local/share/hf2q/models/v2-<hex(owner/repo)>/<commit>/`.
+commit, checks disk space, and downloads and verifies the exact hosted GGUF in
+the Hugging Face cache. It then publishes a final-leaf symlink below the
+readable managed path
+`$HOME/.local/share/hf2q/models/<owner>/<repo>/<commit>/<artifact>`.
+The payload is not copied or moved. Legacy `v2-<hex>` directories remain
+readable but are never created by a new download.
 
 For this multimodal model, hf2q also reuses or downloads the one matching
 `mmproj`, verifies the pair, and loads it automatically. If a valid projector

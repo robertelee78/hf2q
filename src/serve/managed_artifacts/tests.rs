@@ -752,12 +752,29 @@ fn fresh_hosted_projector_snapshot_is_retained_from_its_exact_blob() {
         &catalog,
         &mut |event| events.push(event),
         |_| None,
-        |_| Ok(snapshot.clone()),
+        |_, progress| {
+            progress(StartupEvent::HostedDownloadProgress {
+                filename: "mmproj-model-f16.gguf".into(),
+                completed_bytes: projector_bytes.len() as u64,
+                total_bytes: projector_bytes.len() as u64,
+                bytes_per_second: Some(projector_bytes.len() as u64),
+                elapsed_ms: 1_000,
+            });
+            Ok(snapshot.clone())
+        },
     )
     .unwrap()
     .expect("fresh snapshot must authenticate into its retained blob");
 
     assert_eq!(prepared, blob.canonicalize().unwrap());
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StartupEvent::HostedDownloadProgress {
+            completed_bytes,
+            total_bytes,
+            ..
+        } if completed_bytes == total_bytes
+    )));
     assert!(!fs::symlink_metadata(&prepared)
         .unwrap()
         .file_type()
@@ -2731,7 +2748,7 @@ fn prepared_existing_projector_rejects_same_inode_mutation_before_activation() {
         sidecar: None,
         receipt_target_identity: None,
     };
-    let error = materialize_prepared_projector(plan, &mut candidate, &mut Vec::new())
+    let error = materialize_prepared_projector(plan, &mut candidate, &mut Vec::new(), &mut |_| {})
         .unwrap_err()
         .to_string();
     assert!(error.contains("changed before activation"));
@@ -3157,7 +3174,7 @@ fn retained_exact_destination_replacement_after_preflight_refuses_activation() {
 }
 
 #[test]
-fn hub_cache_symlink_source_materializes_as_a_regular_file() {
+fn generic_preverified_symlink_adoption_remains_an_independent_regular_file() {
     use std::os::unix::fs::symlink;
 
     let directory = tempfile::tempdir().unwrap();
@@ -3180,6 +3197,166 @@ fn hub_cache_symlink_source_materializes_as_a_regular_file() {
         .file_type()
         .is_symlink());
     assert_eq!(std::fs::read(destination).unwrap(), b"hub blob bytes");
+}
+
+#[test]
+fn legacy_v2_managed_binding_remains_read_compatible() {
+    let root = tempfile::tempdir().unwrap();
+    let revision = "a".repeat(40);
+    let directory = root
+        .path()
+        .join("v2-6f776e65722f6d6f64656c")
+        .join(&revision);
+    fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("model.gguf");
+    fs::write(&artifact, b"legacy managed bytes").unwrap();
+    let binding = ManagedBinding {
+        schema_version: SCHEMA_VERSION,
+        repository: "owner/model".into(),
+        revision,
+        quant: "Q4_K_M".into(),
+        origin: "hosted_download".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 0,
+        artifact: ArtifactBinding {
+            local_filename: "model.gguf".into(),
+            hub_filename: "model-q4_k_m.gguf".into(),
+            bytes: fs::metadata(&artifact).unwrap().len(),
+            sha256: crate::core::sha256::compute_file_sha256(&artifact).unwrap(),
+        },
+        projector: None,
+    };
+    write_binding(&sidecar_path(&artifact), &binding).unwrap();
+
+    let candidates = scan_bindings(&[root.path().to_path_buf()], Some("owner/model")).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].path, artifact);
+}
+
+#[test]
+fn authenticated_hub_blob_is_published_and_reused_as_a_managed_symlink() {
+    use sha2::Digest;
+    use std::os::unix::fs::{symlink, MetadataExt};
+
+    let cache = tempfile::tempdir().unwrap();
+    let managed = tempfile::tempdir().unwrap();
+    let revision = "a".repeat(40);
+    let filename = "model-q4_k_m.gguf";
+    let payload = b"authenticated hub blob bytes";
+    let sha256 = hex::encode(sha2::Sha256::digest(payload));
+    let repository_root = cache.path().join("models--owner--model");
+    let blob_root = repository_root.join("blobs");
+    let blob = blob_root.join(&sha256);
+    let snapshot = repository_root
+        .join("snapshots")
+        .join(&revision)
+        .join(filename);
+    fs::create_dir_all(&blob_root).unwrap();
+    fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+    fs::write(&blob, payload).unwrap();
+    symlink(&blob, &snapshot).unwrap();
+
+    let retained = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        &snapshot,
+        payload.len() as u64,
+    )
+    .unwrap()
+    .unwrap();
+    let destination = managed.path().join(filename);
+    materialize_hub_cache_symlink(
+        DownloadedHubArtifact {
+            snapshot_path: snapshot.clone(),
+            blob_path: blob.canonicalize().unwrap(),
+            retained,
+        },
+        &destination,
+        payload.len() as u64,
+        &sha256,
+    )
+    .unwrap();
+
+    assert!(fs::symlink_metadata(&destination)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        fs::metadata(&destination).unwrap().ino(),
+        fs::metadata(&blob).unwrap().ino()
+    );
+    assert_eq!(fs::read(&destination).unwrap(), payload);
+    let retained = crate::core::bounded_file::StableRegularFile::open_operator_path_exact(
+        &snapshot,
+        payload.len() as u64,
+    )
+    .unwrap()
+    .unwrap();
+    materialize_hub_cache_symlink(
+        DownloadedHubArtifact {
+            snapshot_path: snapshot.clone(),
+            blob_path: blob.canonicalize().unwrap(),
+            retained,
+        },
+        &destination,
+        payload.len() as u64,
+        &sha256,
+    )
+    .unwrap();
+
+    let binding = ManagedBinding {
+        schema_version: SCHEMA_VERSION,
+        repository: "owner/model".into(),
+        revision: revision.clone(),
+        quant: "Q4_K_M".into(),
+        origin: "hosted_download".into(),
+        materialized_at_secs: 1,
+        last_used_at_secs: 0,
+        artifact: ArtifactBinding {
+            local_filename: filename.into(),
+            hub_filename: filename.into(),
+            bytes: payload.len() as u64,
+            sha256: sha256.clone(),
+        },
+        projector: None,
+    };
+    let candidate = candidate_from_binding_in(
+        cache.path(),
+        binding.clone(),
+        destination.clone(),
+        sidecar_path(&destination),
+    )
+    .unwrap();
+    assert!(candidate.receipt_target_identity.is_some());
+
+    fs::remove_file(&snapshot).unwrap();
+    fs::remove_file(&blob).unwrap();
+    assert!(managed_hub_cache_link_is_expected_dangling_in(
+        cache.path(),
+        &destination,
+        "owner/model",
+        &sha256,
+    )
+    .unwrap());
+    fs::write(&blob, payload).unwrap();
+    symlink(&blob, &snapshot).unwrap();
+    assert!(candidate_from_binding_in(
+        cache.path(),
+        binding.clone(),
+        destination.clone(),
+        sidecar_path(&destination),
+    )
+    .is_ok());
+
+    fs::remove_file(&snapshot).unwrap();
+    let replacement = blob_root.join("f".repeat(64));
+    fs::write(&replacement, payload).unwrap();
+    symlink(&replacement, &snapshot).unwrap();
+    assert!(candidate_from_binding_in(
+        cache.path(),
+        binding,
+        destination,
+        PathBuf::from("unused.hf2q.json"),
+    )
+    .is_err());
 }
 
 #[test]
@@ -3830,7 +4007,7 @@ fn hub_cache_loose_projector_selection_uses_retained_text_through_swap_restore()
         &catalog,
         &mut |_| {},
         |_| None,
-        |artifact| {
+        |artifact, _| {
             selected = Some(artifact.filename.clone());
             bail!("stop after retained selection")
         },

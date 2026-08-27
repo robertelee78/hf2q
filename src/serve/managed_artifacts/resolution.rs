@@ -28,7 +28,9 @@ fn prepare_cached_projector_in_place(
         catalog,
         progress,
         cached_hub_gguf_path,
-        |artifact| Ok(download_hub_companion(artifact)?),
+        |artifact, progress| {
+            Ok(projector::download_projector_with_progress(artifact, progress)?.snapshot_path)
+        },
     )
 }
 
@@ -38,7 +40,7 @@ pub(super) fn prepare_cached_projector_in_place_with_sources(
     catalog: &HubGgufCatalog,
     progress: &mut StartupProgress<'_>,
     mut cached: impl FnMut(&HubGgufArtifact) -> Option<PathBuf>,
-    mut download: impl FnMut(&HubGgufArtifact) -> Result<PathBuf>,
+    mut download: impl FnMut(&HubGgufArtifact, &mut StartupProgress<'_>) -> Result<PathBuf>,
 ) -> Result<Option<PathBuf>> {
     let expected = retained_expected_projector_sha256(text_authority)?;
     let companions = catalog
@@ -64,7 +66,7 @@ pub(super) fn prepare_cached_projector_in_place_with_sources(
     // repository blob store before O_NOFOLLOW retained activation.
     let snapshot = match cached(&projector) {
         Some(snapshot) => snapshot,
-        None => download(&projector)?,
+        None => download(&projector, progress)?,
     };
     let path = retain_cached_projector_at(&projector, &snapshot)?.path;
     candidate.projector = Some((path.clone(), projector.bytes, projector.sha256.clone()));
@@ -194,13 +196,14 @@ pub(super) fn best_effort_manual_projector_with_catalog(
         Err(error) => Some(error),
     };
     run_before_manual_hosted_projector_fallback();
-    let hosted = projector::best_effort_projector_with_catalog_expected(
+    let hosted = best_effort_projector_with_catalog_expected_with_progress(
         candidate,
         model_dirs,
         catalog,
         true,
         expected.as_deref(),
         warnings,
+        progress,
     );
     if exact_companion.is_none() && hosted.is_some() {
         if let Some((bound, bytes, _)) = candidate.projector.as_ref() {
@@ -753,7 +756,7 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
         let projector_plan = match projector_plan {
             Ok(Some(plan)) => {
                 let pair_preflight = match &plan.source {
-                    PreparedProjectorSource::Existing(_) => {
+                    PreparedProjectorSource::Existing(_) | PreparedProjectorSource::HubCache(_) => {
                         check_local_artifact_pair_plan_with_authorities(
                             &artifact.repository,
                             text_plan.source_device_id(),
@@ -892,7 +895,7 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
     } else if let Some(artifact) = selected {
         let destination = hosted_destination(&artifact, explicit_output)?;
         let text_destination_exact =
-            verify_or_refuse_existing_destination(&destination, artifact.bytes, &artifact.sha256)?;
+            verify_or_refuse_existing_hosted_destination(&destination, &artifact)?;
         let projector_required = prepare_projector
             && hosted_pair_requires_projector(
                 catalog.requires_projector,
@@ -915,6 +918,14 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
                             &destination,
                             text_destination_exact,
                             None,
+                        )
+                    }
+                    PreparedProjectorSource::HubCache(_) => {
+                        check_hub_artifact_pair_plan_from_state(
+                            &artifact,
+                            &destination,
+                            text_destination_exact,
+                            Some((&plan.artifact, &plan.destination, true)),
                         )
                     }
                     PreparedProjectorSource::Local(source) => {
@@ -984,8 +995,17 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
                 filename: display_filename(Path::new(&artifact.filename)),
                 bytes: artifact.bytes,
             });
-            let cached = download_hub_gguf(&artifact)?;
-            materialize_hosted(&cached, &artifact, explicit_output, "hosted_download")?
+            let progress_filename = display_filename(Path::new(&artifact.filename));
+            let cached = download_hub_gguf_with_progress(&artifact, &mut |update| {
+                progress(StartupEvent::HostedDownloadProgress {
+                    filename: progress_filename.clone(),
+                    completed_bytes: update.completed_bytes,
+                    total_bytes: update.total_bytes,
+                    bytes_per_second: update.bytes_per_second,
+                    elapsed_ms: update.elapsed_ms,
+                });
+            })?;
+            materialize_hosted(cached, &artifact, explicit_output, "hosted_download")?
         };
         prepared_projector = projector_plan;
         (candidate, !text_destination_exact)
@@ -1003,7 +1023,7 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
     candidate = prepared;
     suppress_automatic_projector |= local_suppress_projector;
     let mmproj = if let Some(plan) = prepared_projector {
-        match materialize_prepared_projector(plan, &mut candidate, &mut warnings) {
+        match materialize_prepared_projector(plan, &mut candidate, &mut warnings, progress) {
             Ok(path) => Some(path),
             Err(error) => {
                 warnings.push(format!(
@@ -1015,7 +1035,7 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
     } else {
         (prepare_projector && !suppress_automatic_projector)
             .then(|| {
-                best_effort_projector_with_catalog(
+                best_effort_projector_with_catalog_with_progress(
                     &mut candidate,
                     model_dirs,
                     &catalog,
@@ -1024,6 +1044,7 @@ pub(super) fn resolve_repository_with_progress_and_catalog(
                         selected_requires_projector,
                     ),
                     &mut warnings,
+                    progress,
                 )
             })
             .flatten()
@@ -1334,7 +1355,7 @@ pub(super) fn prepare_local_candidate_with_catalog_resolver(
                 bytes: plan.artifact.bytes,
             });
             let pair_preflight = match &plan.source {
-                PreparedProjectorSource::Existing(_) => {
+                PreparedProjectorSource::Existing(_) | PreparedProjectorSource::HubCache(_) => {
                     check_local_artifact_pair_plan_with_authorities(
                         &candidate.repository,
                         text_plan.source_device_id(),
@@ -1435,15 +1456,17 @@ pub(super) fn prepare_local_candidate_with_catalog_resolver(
         candidate.receipt_target_identity = None;
     }
     let projector = match projector_plan {
-        Some(plan) => match materialize_prepared_projector(plan, &mut candidate, warnings) {
-            Ok(path) => Some(path),
-            Err(error) => {
-                warnings.push(format!(
-                    "automatic mmproj preparation failed; serving text-only: {error}"
-                ));
-                None
+        Some(plan) => {
+            match materialize_prepared_projector(plan, &mut candidate, warnings, progress) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    warnings.push(format!(
+                        "automatic mmproj preparation failed; serving text-only: {error}"
+                    ));
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
     let (candidate, _) = prepare_selected_local_decision(candidate, None, warnings)?;
@@ -1669,19 +1692,13 @@ pub(super) fn automatic_artifact_admissible(
 }
 
 fn materialize_hosted(
-    source: &Path,
+    source: DownloadedHubArtifact,
     artifact: &HubGgufArtifact,
     explicit_output: Option<&Path>,
     origin: &str,
 ) -> Result<Candidate> {
     let destination = hosted_destination(artifact, explicit_output)?;
-    materialize_preverified_exact(
-        source,
-        &destination,
-        &artifact.repository,
-        artifact.bytes,
-        &artifact.sha256,
-    )?;
+    materialize_hub_cache_symlink(source, &destination, artifact.bytes, &artifact.sha256)?;
     bind_hosted_destination(&destination, artifact, origin)
 }
 
@@ -1735,6 +1752,47 @@ fn hosted_destination(
     )?
     .join(basename);
     resolve_output_path(explicit_output, default)
+}
+
+/// Admit either a legacy materialized regular file or the current managed
+/// Hugging Face cache link for this exact immutable hosted artifact. A link
+/// only wins when its retained target is the active repository's digest-named
+/// blob and the exact-revision snapshot still resolves to that same inode.
+pub(super) fn verify_or_refuse_existing_hosted_destination(
+    destination: &Path,
+    artifact: &HubGgufArtifact,
+) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        if retain_managed_hub_cache_link(
+            destination,
+            &artifact.repository,
+            &artifact.revision,
+            &artifact.filename,
+            artifact.bytes,
+            &artifact.sha256,
+        )?
+        .is_some()
+        {
+            return Ok(true);
+        }
+        if managed_hub_cache_link_is_expected_dangling(
+            destination,
+            &artifact.repository,
+            &artifact.sha256,
+        )? {
+            return Ok(false);
+        }
+        bail!(
+            "destination conflicts with the selected immutable hosted artifact: {}",
+            destination.display()
+        );
+    }
+    verify_or_refuse_existing_destination(destination, artifact.bytes, &artifact.sha256)
 }
 
 fn prepare_selected_local_decision(

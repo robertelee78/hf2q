@@ -1,9 +1,14 @@
 # ADR-051: Frictionless local-first model resolution
 
-- **Status:** Accepted; v0.1.17 shipped and the v0.1.18 native-Xet transport
-  amendment is under exact-artifact release validation
-- **Date:** 2026-08-23; native-Xet transfer amendment 2026-08-26
+- **Status:** Accepted; v0.1.17 and the v0.1.18 native-Xet transport
+  amendment shipped; the v0.1.19 observable-transfer and cache-link amendment
+  is implemented with exact-artifact publication validation pending
+- **Date:** 2026-08-23; native-Xet transfer amendment 2026-08-26; observable
+  transfer/cache-link amendment 2026-08-26; qualified-host Xet policy accepted
+  2026-08-27
 - **Related:** ADR-005, ADR-018, ADR-033, ADR-045, ADR-046, ADR-047
+- **Research:** `docs/research/hf-download-sota-2026-08-26.md` and
+  `docs/research/hf-download-ux-rca-2026-08-26.md`
 - **Supersedes in part:** ADR-045's statement that onboarding does not create a
   no-options model workflow; ADR-045's installation and distribution decisions
   are unchanged
@@ -71,7 +76,15 @@ artifact is one exact-revision Xet-aware file request. Native source weights
 are one bounded snapshot operation containing only the authenticated index's
 glob-escaped literal shard paths, with eight file workers. Large model payloads
 must advertise Xet; there is no production downgrade to the legacy large-file
-HTTP transport. Xet's adaptive concurrency is the one default policy.
+HTTP transport.
+
+hf2q selects one resource-qualified policy before the first Xet session. On
+Apple Silicon with at least 64 GiB physical unified memory, and only when the
+operator has not set either `HF_XET_HIGH_PERFORMANCE` or `HF_XET_HP`, hf2q
+enables upstream Xet high-performance mode. Smaller or non-Apple hosts retain
+upstream adaptive defaults. Either explicit upstream variable remains
+authoritative, including an explicit opt-out. This is one native-Xet transport,
+not a second downloader or an hf2q tuning matrix.
 
 Transport success grants no serving or conversion authority. Exact revision,
 selected filename, linked size, strong LFS SHA-256, exact snapshot parent, and
@@ -111,7 +124,7 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models
 Repository artifacts live under:
 
 ```text
-<root>/v2-<lowercase-hex(owner/repository)>/<immutable-revision>/<artifact>
+<root>/<owner>/<repository>/<immutable-revision>/<artifact>
 ```
 
 Each adopted, downloaded, or converted artifact has bounded sidecar authority
@@ -120,14 +133,22 @@ quant identity, origin, materialization time, and last successful use. A
 projector binding additionally records its own immutable filename, bytes, and
 SHA-256. Schema-v3 conversion receipts and the existing canonical `ModelCache`
 remain valid authorities and are merged into the same inventory.
-The v2 slug is injective and stable under case-folding filesystems. Legacy
+The readable components use the same bounded Hugging Face owner/repository
+grammar as the public operand. Legacy `v2-<hex(owner/repository)>` and
 `owner__repository` directories remain read-compatible only when bounded
-receipt/manifest authority proves the exact repository and revision; writes
-always use v2. Resolution locks both legacy and v2 lock names in sorted order
-so old and new binaries cannot publish the same quant concurrently.
-Inventory admits a sidecar row only while its text artifact remains a
-non-symlink regular file of the recorded size; projector availability uses the
-same cheap physical check. Listing does not hash payloads.
+receipt/manifest authority proves the exact repository and revision; new
+managed artifact writes always use the readable hierarchy. Internal cache
+lock names remain injective and case-fold stable, and old/new lock aliases are
+acquired in sorted order so binaries from different layout eras cannot publish
+the same quant concurrently.
+
+Inventory admits a regular managed artifact while its sidecar and exact size
+remain valid. It admits a managed final-leaf symlink only when the regular
+sidecar binds an hf2q-authenticated hosted artifact and the retained target is
+the digest-named blob in the active standard Hugging Face repository cache;
+the exact-revision snapshot must still resolve to that same inode. Projector
+links use the same rule. Arbitrary sidecar-authorized symlinks remain rejected.
+Repeat discovery performs no model-sized hash.
 
 `--output FILE` keeps its exact-file meaning. `--output DIR` places the derived
 artifact name in that directory. Without `--output`, `convert` writes the
@@ -221,11 +242,15 @@ writes immutable authority only after exact size/SHA-256 proof agrees. A
 conflicting destination fails closed and is never overwritten implicitly.
 
 Hosted disk preflight models the actual materialization plan. Hub cache and an
-APFS managed destination on one filesystem require one model-sized allocation
-plus a CoW clone; cross-filesystem placement preflights the second allocation
-before payload transfer. A clone-unsupported filesystem falls back only after
-a fresh exact copy preflight. An already cached exact artifact does not fail a
-new-download space check merely because the cache is now relatively full.
+managed destination require exactly the uncached Hub payload extent. After
+full size/digest authentication, hf2q atomically publishes a tiny absolute
+symlink from the managed artifact name to the digest-named Hub blob. It does
+not clone, copy, hard-link, move, or rehash the payload during managed
+publication, including when the managed root is on another filesystem. An
+already cached exact artifact therefore requires no model-sized destination
+extent. Local operator adoption and native-conversion outputs retain their
+independent clone/copy publication contracts; they are not reclassified as
+Hub-cache links.
 
 Compatibility means the current runtime supports the GGUF architecture and
 file type, the bounded header/tensor directory and tokenizer/chat contracts
@@ -353,15 +378,24 @@ listener on a private inherited Unix socket. DNS-SD PID/TXT hints never
 receive credentials or endpoint authority. Chat renders the server's typed
 preparation events as one scrollback-safe live row plus durable phase
 milestones. It distinguishes local discovery, bounded local GGUF inspection,
-Hub metadata, hosted payload verification/transfer, native conversion,
-text load/warmup, projector
-load/warmup, and authenticated endpoint readiness. A local hit says explicitly
-that no model download is needed. Indeterminate work uses a spinner and elapsed
-time; a byte bar is used only when the producer has real completed and total
-byte counts. A bounded line-oriented form carries the same events for non-TTY
-output. The TUI does not create a second downloader or converter and never
-treats an empty SSE role event or an unauthenticated child message as
-readiness.
+Hub metadata, hosted payload verification/transfer, native conversion, text
+load/warmup, projector load/warmup, and authenticated endpoint readiness. A
+local hit says explicitly that no model download is needed. Indeterminate work
+uses a spinner and elapsed time. Every native-Xet hosted payload publishes
+bounded completed bytes, total bytes, measured bytes/second when available,
+and elapsed time through the private child/parent startup channel. Interactive
+chat and direct serve render bytes, percentage, rate, and ETA in one live byte
+bar. Non-TTY output prints the same facts on the first update, each
+five-percentage-point milestone, every 30 seconds without a milestone, and
+completion, avoiding both silence and roughly 10 Hz log spam. The TUI does not
+create a second downloader or converter and never treats an empty SSE role
+event or an unauthenticated child message as readiness.
+
+The native-Xet worker callback never writes the terminal or startup socket. It
+updates output-agnostic atomics; the synchronous foreground owner samples and
+coalesces them at 100 ms before invoking the renderer or nonblocking datagram
+publisher. This preserves hf-hub/Xet concurrency and prevents a slow terminal
+or backpressured parent from throttling payload workers.
 
 ### 7. Global operator presentation and exact brand asset
 
@@ -504,13 +538,18 @@ inode that actually loaded; a concurrently replaced same-quant entry cannot
 inherit another artifact's recency. Shared
 projector publication rechecks an exact destination after a concurrent
 `EEXIST` winner. Every expensive path rechecks after acquiring its lock.
-Downloads and copies use same-directory temporary files and atomic rename.
-Disk space is checked before transfer using the exact hosted byte count or the
-exact aggregate native source/product plan. Native conversion publishes with
-no-clobber semantics under an exclusive intent, then a durable journal covers
-text, projector, receipts, and pair binding. Retry recovers a crash before
-journal creation and terminal committed or rolled-back journal state.
-Interrupted work leaves no authoritative partial artifact. Zero-byte,
+hf-hub/Xet owns partial download state in the standard cache. Managed hosted
+publication stages only a same-directory temporary symlink, validates that it
+resolves to the retained authenticated blob, and atomically renames it with
+`NOREPLACE`; no managed artifact or even its revision directory is created
+before payload authentication completes. Local copies retain their existing
+same-directory temporary files and atomic rename. Disk space is checked before
+transfer using the exact uncached hosted cache extent or exact aggregate native
+source/product plan. Native conversion publishes with no-clobber semantics
+under an exclusive intent, then a durable journal covers text, projector,
+receipts, and pair binding. Retry recovers a crash before journal creation and
+terminal committed or rolled-back journal state. Interrupted work leaves no
+authoritative partial artifact. Zero-byte,
 non-regular, unstable/retargeted symlink, structurally ambiguous,
 stale-revision, or unsupported candidates never win resolution; hf2q-owned
 downloads and published copies additionally fail on digest mismatch.
@@ -531,9 +570,12 @@ the first pair write.
 - Pure resolver tests prove exact-quant selection, use/materialization recency,
   local-over-hosted precedence, ambiguity, and nearest-lower hosted fallback.
 - Filesystem tests prove bounded descriptor-relative discovery, exact digest
-  adoption, independent-inode CoW/copy publication, source-hardlink mutation
-  isolation, clone-unsupported copy fallback, Hub-ancestor replacement
-  exclusion, retained cross-device pair accounting, exact-destination and
+  adoption, independent-inode CoW/copy publication for local artifacts,
+  authenticated digest-named Hub-cache symlink publication for hosted
+  artifacts, idempotent link reuse, snapshot/blob retarget rejection, readable
+  new-write paths, legacy v2-layout reads, source-hardlink mutation isolation,
+  clone-unsupported local copy fallback, Hub-ancestor replacement exclusion,
+  retained cross-device pair accounting, exact-destination and
   destination-parent replacement refusal, atomic sidecars,
   conflicting-destination refusal, and interrupted-partial exclusion.
 - Download tests prove immutable metadata revalidation, exact quant, disk
@@ -565,11 +607,18 @@ the first pair write.
   Unicode bidirectional controls/isolates before it reaches a terminal.
 - Operator-UI tests prove the embedded SVG's exact source digest, deterministic
   nonempty rasterization, Kitty, iTerm2, cmux, Alacritty, Apple Terminal, and
-  ANSI paths, global suppression rules, line-oriented non-TTY startup
+  ANSI paths, global suppression rules, native-Xet aggregate progress
+  monotonicity, child/parent progress-wire admission, interactive
+  bytes/percentage/rate/ETA rendering, bounded line-oriented non-TTY startup
   telemetry, and exact-installed-binary PTY lifecycle behavior: banner-only
   invocations never enter the alternate screen, direct dashboard startup
   enters/restores it exactly once across SIGINT, and owned-chat preparation
   never enters it.
+- The exact 16,810,714,944-byte cold-cache Xet A/B runs three trials per arm,
+  alternates arm order, verifies the same SHA-256 after every run, and records
+  wall time, throughput, CPU, and peak RSS. High-performance mode is accepted
+  for the >=64 GiB qualified host only when its median improves over adaptive;
+  a favorable single trial is not evidence.
 - Locked focused tests, all-target check, release build, full hosted-safe test
   suite, and nonzero Rust coverage evidence at the exact branch head.
   Agentic-QE complexity/audit output is advisory because the installed tool
@@ -630,6 +679,56 @@ that the operator already owned exact Q5, Q6, and Q8 text bytes plus a matching
 projector. It proved the identity/adoption hypothesis and preserved those
 artifacts, but an earlier release-binary chat attempt did not complete a valid
 new runtime proof; this ADR does not count that attempt as acceptance evidence.
+
+The v0.1.18 release then shipped the native-Xet transport but did not satisfy
+the observable-transfer or managed-publication experience. A real operator run
+of `hf2q chat jenerallee78/Qwen3.8-27B-Abliterated-SFT:Q4_K_M` selected a
+15.7 GiB hosted artifact and displayed only a spinner plus elapsed time for
+more than five minutes. During transfer the managed root exposed an empty
+opaque `v2-<hex>` revision directory, while the actual partial bytes lived in
+the standard Hugging Face cache. Source tracing proved that hf-hub emitted
+aggregate completed/total/rate events, but the owned server rendered them into
+its hidden stderr log; the private startup protocol carried only a one-shot
+`HostedDownload` event, and the parent therefore intentionally selected its
+indeterminate spinner. The release benchmark redirected helper stdout/stderr,
+the progress unit test used a hidden bar, and the packed PTY smoke never ran a
+cold hosted download. Those gates proved transport throughput and integrity,
+not the user-visible contract above. The terminated operator process is not
+counted as an hf2q defect because another development agent sent that signal.
+The complete source-bound analysis is
+`docs/research/hf-download-ux-rca-2026-08-26.md`.
+
+The observable-transfer/cache-link amendment must produce fresh exact-head
+evidence. Passing v0.1.18 gates are historical context and do not prove this
+amendment. Until the focused progress, path, symlink, retarget, disk-plan,
+packed non-TTY, and cold-download PTY gates pass, its status remains under
+validation and no speed or UX claim may be published from source inspection
+alone.
+
+The resource-policy A/B completed on 2026-08-27 with candidate binary SHA-256
+`069e3f3cb0fdb79ead4cfe3cc98e747cf33d02fd444b0be909904380ff352d07`
+on arm64 macOS 26.5.2. All six cold outputs matched 16,810,714,944 bytes and
+SHA-256 `1ee55c653644d6f645c6b2f39fc56a3ce28093620fd34dd43678875f348f2e1a`.
+Adaptive median was 251.23 seconds (63.814 MiB/s) at 3,301,113,856 bytes RSS;
+high-performance median was 225.99 seconds (70.941 MiB/s) at 10,223,222,784
+bytes RSS, a 10.05% median wall-time improvement with about 6.92 GB additional
+median RSS. One HP trial took 260.04 seconds, so the decision claims a median
+improvement, not elimination of network variance. This evidence accepts the
+>=64 GiB policy floor; it does not waive the remaining packed UX and release
+gates.
+
+The cold end-to-end product journey then ran the actual `hf2q chat` command
+against a fresh Hugging Face cache and a fresh managed root. The exact 15.7 GiB
+Q4_K_M artifact completed in 4 minutes 24 seconds, passed its pinned byte count
+and SHA-256 checks, loaded, reached the interactive prompt, and exited cleanly
+through `/quit`. The final readable managed path was
+`jenerallee78/Qwen3.8-27B-Abliterated-SFT/<revision>/<artifact>.gguf`; its leaf
+was a symlink to the authenticated Hugging Face digest blob and both resolved
+to inode `131573324`, proving that the journey did not create a second payload
+extent. A deterministic recording-terminal test separately proves that the
+interactive frame renders cache-to-managed-link context, completed and total
+bytes, percentage, transfer rate, and ETA; this avoids treating a PTY capture
+tool's suppression of in-place redraw frames as product evidence.
 
 The current branch has blocking focused tests for operand parsing,
 setup/exact/live quant precedence, exact/nearest-lower selection including Q2,

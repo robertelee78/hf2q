@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::serve::auto_pipeline::looks_like_hf_repo_id;
-use crate::serve::cache::slug_repo_id;
 use crate::serve::quant_select::QuantType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +100,16 @@ pub(crate) fn managed_revision_dir(
     if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("managed model revision must be an exact 40-hex commit, got {revision:?}");
     }
-    Ok(root.join(slug_repo_id(repository)?).join(revision))
+    if !looks_like_hf_repo_id(repository)
+        || repository.contains("..")
+        || repository.len() > crate::input::hf_reference::MAX_HF_REPO_ID_BYTES
+    {
+        bail!("managed model repository must be a bounded safe owner/repository identity");
+    }
+    let (owner, name) = repository
+        .split_once('/')
+        .context("managed model repository has no owner")?;
+    Ok(root.join(owner).join(name).join(revision))
 }
 
 pub(crate) fn default_convert_output(
@@ -192,7 +200,7 @@ mod tests {
         assert_eq!(
             default,
             root.path().join(format!(
-                "v2-6f776e65722f4d792d4d6f64656c/{REVISION}/My-Model-hf2q-q4_k_m.gguf"
+                "owner/My-Model/{REVISION}/My-Model-hf2q-q4_k_m.gguf"
             ))
         );
         let destination = tempfile::tempdir().unwrap();
@@ -204,5 +212,19 @@ mod tests {
             resolve_output_path(Some(Path::new("/tmp/exact.bin")), default).unwrap(),
             PathBuf::from("/tmp/exact.bin")
         );
+    }
+
+    #[test]
+    fn managed_revision_path_is_readable_and_traversal_safe() {
+        let root = Path::new("/models");
+        assert_eq!(
+            managed_revision_dir(root, "jenerallee78/Qwen3.8-27B-Abliterated-SFT", REVISION)
+                .unwrap(),
+            root.join("jenerallee78/Qwen3.8-27B-Abliterated-SFT")
+                .join(REVISION)
+        );
+        assert!(managed_revision_dir(root, "owner/..", REVISION).is_err());
+        assert!(managed_revision_dir(root, "../model", REVISION).is_err());
+        assert!(managed_revision_dir(root, "owner/model/extra", REVISION).is_err());
     }
 }

@@ -50,6 +50,92 @@ const EXIT_SUCCESS: u8 = 0;
 const EXIT_CONVERSION_ERROR: u8 = 1;
 const EXIT_INPUT_ERROR: u8 = 3;
 
+/// Hugging Face documents Xet high-performance mode for high-bandwidth hosts
+/// with at least 64 GiB physical memory for its larger reconstruction buffers. hf2q
+/// is Apple-Silicon-only in production, so physical unified memory is the
+/// stable resource qualification we can establish before the first Xet
+/// session. ADR-051 accepts this threshold from the exact-artifact interleaved
+/// A/B while preserving explicit upstream configuration.
+const XET_HIGH_PERFORMANCE_MEMORY_FLOOR: u64 = 64 * 1024 * 1024 * 1024;
+
+fn should_auto_enable_xet_high_performance(
+    is_apple_silicon: bool,
+    total_memory: u64,
+    primary_is_explicit: bool,
+    alias_is_explicit: bool,
+) -> bool {
+    is_apple_silicon
+        && total_memory >= XET_HIGH_PERFORMANCE_MEMORY_FLOOR
+        && !primary_is_explicit
+        && !alias_is_explicit
+}
+
+/// Select the single native-Xet resource policy before any library-owned
+/// runtime or background worker exists. `xet-runtime` snapshots these variables
+/// when it lazily constructs the first session; mutating them later would be
+/// both ineffective and unsafe in a multithreaded process.
+fn configure_native_xet_performance_policy() {
+    let primary_is_explicit = std::env::var_os("HF_XET_HIGH_PERFORMANCE").is_some();
+    let alias_is_explicit = std::env::var_os("HF_XET_HP").is_some();
+    if primary_is_explicit || alias_is_explicit {
+        return;
+    }
+
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    if should_auto_enable_xet_high_performance(
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        system.total_memory(),
+        primary_is_explicit,
+        alias_is_explicit,
+    ) {
+        std::env::set_var("HF_XET_HIGH_PERFORMANCE", "1");
+    }
+}
+
+#[cfg(test)]
+mod xet_transfer_policy_tests {
+    use super::{should_auto_enable_xet_high_performance, XET_HIGH_PERFORMANCE_MEMORY_FLOOR};
+
+    #[test]
+    fn high_performance_requires_apple_silicon_and_documented_memory_floor() {
+        assert!(!should_auto_enable_xet_high_performance(
+            false,
+            XET_HIGH_PERFORMANCE_MEMORY_FLOOR,
+            false,
+            false,
+        ));
+        assert!(!should_auto_enable_xet_high_performance(
+            true,
+            XET_HIGH_PERFORMANCE_MEMORY_FLOOR - 1,
+            false,
+            false,
+        ));
+        assert!(should_auto_enable_xet_high_performance(
+            true,
+            XET_HIGH_PERFORMANCE_MEMORY_FLOOR,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn either_explicit_upstream_setting_wins() {
+        assert!(!should_auto_enable_xet_high_performance(
+            true,
+            XET_HIGH_PERFORMANCE_MEMORY_FLOOR,
+            true,
+            false,
+        ));
+        assert!(!should_auto_enable_xet_high_performance(
+            true,
+            XET_HIGH_PERFORMANCE_MEMORY_FLOOR,
+            false,
+            true,
+        ));
+    }
+}
+
 /// Error types for exit code classification.
 #[derive(Debug)]
 enum AppError {
@@ -119,6 +205,12 @@ fn main() -> ExitCode {
         }
     };
 
+    if matches!(
+        &cli.command,
+        Command::FetchHubGguf(_) | Command::Chat(_) | Command::Serve(_) | Command::Convert(_)
+    ) {
+        configure_native_xet_performance_policy();
+    }
     // Proven standalone/Cargo release installations keep their owned Bash,
     // Zsh, and Fish adapters synchronized with this exact binary. Reconcile
     // only after Clap accepts a real command: --help/--version/error exits

@@ -41,6 +41,8 @@ pub(crate) struct StartupUi<'a, W: Write> {
     use_color: bool,
     current_phase: String,
     started: std::time::Instant,
+    last_download_line_percent: Option<u64>,
+    last_download_line_at: Option<std::time::Instant>,
 }
 
 impl<'a, W: Write> StartupUi<'a, W> {
@@ -63,6 +65,23 @@ impl<'a, W: Write> StartupUi<'a, W> {
             use_color,
             current_phase: "waiting for the owned server's first preparation event".into(),
             started: std::time::Instant::now(),
+            last_download_line_percent: None,
+            last_download_line_at: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_draw_target(output: &'a mut W, draw_target: ProgressDrawTarget) -> Self {
+        let bar = ProgressBar::with_draw_target(None, draw_target);
+        bar.set_style(spinner_style(false));
+        Self {
+            output,
+            bar: Some(bar),
+            use_color: false,
+            current_phase: "waiting for the owned server's first preparation event".into(),
+            started: std::time::Instant::now(),
+            last_download_line_percent: None,
+            last_download_line_at: None,
         }
     }
 
@@ -108,6 +127,29 @@ impl<'a, W: Write> StartupUi<'a, W> {
     pub(crate) fn event(&mut self, event: StartupEvent) -> Result<()> {
         self.current_phase = event.heartbeat_label();
         let Some(bar) = self.bar.as_ref() else {
+            if let StartupEvent::HostedDownloadProgress {
+                completed_bytes,
+                total_bytes,
+                ..
+            } = &event
+            {
+                let percent = completed_bytes.saturating_mul(100) / total_bytes;
+                let now = std::time::Instant::now();
+                let advanced_milestone = self
+                    .last_download_line_percent
+                    .is_none_or(|previous| percent >= previous.saturating_add(5));
+                let heartbeat_due = self
+                    .last_download_line_at
+                    .is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(30));
+                if percent < 100 && !advanced_milestone && !heartbeat_due {
+                    return Ok(());
+                }
+                self.last_download_line_percent = Some(percent);
+                self.last_download_line_at = Some(now);
+            } else {
+                self.last_download_line_percent = None;
+                self.last_download_line_at = None;
+            }
             writeln!(self.output, "{}", event.render())?;
             self.output.flush()?;
             return Ok(());
@@ -223,7 +265,7 @@ impl<'a, W: Write> StartupUi<'a, W> {
                 history(
                     bar,
                     format!(
-                        "selected hosted `{}` • {} • destination: managed model store",
+                        "selected hosted `{}` • {} • transfer: Hugging Face cache • final: managed-store symlink",
                         clean(&filename),
                         human_bytes(bytes)
                     ),
@@ -239,6 +281,17 @@ impl<'a, W: Write> StartupUi<'a, W> {
                         human_bytes(bytes)
                     ),
                 );
+            }
+            StartupEvent::HostedDownloadProgress {
+                filename,
+                completed_bytes,
+                total_bytes,
+                ..
+            } => {
+                bar.set_length(total_bytes);
+                bar.set_position(completed_bytes);
+                bar.set_style(bytes_style(self.use_color));
+                bar.set_message(format!("Downloading `{}`", clean(&filename)));
             }
             StartupEvent::ProjectorPrepare { filename, bytes } => {
                 history(
@@ -444,9 +497,9 @@ fn spinner_style(use_color: bool) -> ProgressStyle {
 
 fn bytes_style(use_color: bool) -> ProgressStyle {
     ProgressStyle::with_template(if use_color {
-        "  {spinner:.yellow} {msg:.42} {wide_bar:.blue/dim} {bytes:>9}/{total_bytes:<9} {bytes_per_sec:>10} ETA {eta}"
+        "  {spinner:.yellow} {msg:.42} {wide_bar:.blue/dim} {bytes:>9}/{total_bytes:<9} {percent:>3}% {bytes_per_sec:>10} ETA {eta}"
     } else {
-        "  {spinner} {msg:.42} {wide_bar} {bytes:>9}/{total_bytes:<9} {bytes_per_sec:>10} ETA {eta}"
+        "  {spinner} {msg:.42} {wide_bar} {bytes:>9}/{total_bytes:<9} {percent:>3}% {bytes_per_sec:>10} ETA {eta}"
     })
     .expect("static startup byte template")
     .progress_chars("━╸─")
@@ -499,6 +552,65 @@ fn styled(value: &str, style: BrandStyle, enabled: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indicatif::TermLike;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingTerm {
+        writes: Arc<Mutex<String>>,
+    }
+
+    impl RecordingTerm {
+        fn contents(&self) -> String {
+            self.writes.lock().unwrap().clone()
+        }
+
+        fn record(&self, value: &str) {
+            self.writes.lock().unwrap().push_str(value);
+        }
+    }
+
+    impl TermLike for RecordingTerm {
+        fn width(&self) -> u16 {
+            160
+        }
+
+        fn move_cursor_up(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_down(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_right(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn move_cursor_left(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn write_line(&self, value: &str) -> std::io::Result<()> {
+            self.record(value);
+            self.record("\n");
+            Ok(())
+        }
+
+        fn write_str(&self, value: &str) -> std::io::Result<()> {
+            self.record(value);
+            Ok(())
+        }
+
+        fn clear_line(&self) -> std::io::Result<()> {
+            self.record("\n");
+            Ok(())
+        }
+
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn plain_startup_remains_stable_line_oriented_text() {
@@ -518,6 +630,74 @@ mod tests {
         assert!(!rendered.contains('\u{1b}'));
         assert!(rendered.contains("no model download or full-file hash needed"));
         assert!(rendered.contains("ready: verified hf2q endpoint"));
+    }
+
+    #[test]
+    fn plain_download_progress_is_bounded_and_actionable() {
+        let mut output = Vec::new();
+        {
+            let mut ui = StartupUi::new(&mut output, false, StartupOutput::Stdout);
+            ui.event(StartupEvent::HostedDownload {
+                filename: "model-q4_k_m.gguf".into(),
+                bytes: 100,
+            })
+            .unwrap();
+            for completed in 0..=100 {
+                ui.event(StartupEvent::HostedDownloadProgress {
+                    filename: "model-q4_k_m.gguf".into(),
+                    completed_bytes: completed,
+                    total_bytes: 100,
+                    bytes_per_second: Some(10),
+                    elapsed_ms: completed * 100,
+                })
+                .unwrap();
+            }
+        }
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(
+            rendered.contains("into the Hugging Face cache"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("managed-store symlink"), "{rendered}");
+        assert!(rendered.contains("5%"), "{rendered}");
+        assert!(rendered.contains("100%"), "{rendered}");
+        assert!(rendered.contains("ETA"), "{rendered}");
+        assert!(rendered.lines().count() <= 23, "{rendered}");
+    }
+
+    #[test]
+    fn interactive_download_renderer_shows_cache_link_bytes_rate_and_eta() {
+        let terminal = RecordingTerm::default();
+        let mut output = Vec::new();
+        let mut ui = StartupUi::with_test_draw_target(
+            &mut output,
+            ProgressDrawTarget::term_like(Box::new(terminal.clone())),
+        );
+        ui.event(StartupEvent::HostedDownload {
+            filename: "model-q4_k_m.gguf".into(),
+            bytes: 10 * 1024 * 1024,
+        })
+        .unwrap();
+        ui.event(StartupEvent::HostedDownloadProgress {
+            filename: "model-q4_k_m.gguf".into(),
+            completed_bytes: 5 * 1024 * 1024,
+            total_bytes: 10 * 1024 * 1024,
+            bytes_per_second: Some(5 * 1024 * 1024),
+            elapsed_ms: 1_000,
+        })
+        .unwrap();
+
+        let rendered = terminal.contents();
+        assert!(rendered.contains("Hugging Face cache"), "{rendered}");
+        assert!(rendered.contains("managed-store symlink"), "{rendered}");
+        assert!(rendered.contains("model-q4_k_m.gguf"), "{rendered}");
+        assert!(rendered.contains("5.00 MiB/10.00 MiB"), "{rendered}");
+        assert!(rendered.contains("50%"), "{rendered}");
+        assert!(rendered.contains("/s"), "{rendered}");
+        assert!(rendered.contains("ETA"), "{rendered}");
+        drop(ui);
+        assert!(output.is_empty());
     }
 
     #[test]

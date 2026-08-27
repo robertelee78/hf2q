@@ -2,10 +2,10 @@
 
 > Terminology: "the peer" = llama.cpp, the pinned upstream GGUF engine (see NOTICE, data/llama_cpp_pin.txt).
 
-Current published release: `v0.1.18`. Public availability is authoritative
+Current published release: `v0.1.19`. Public availability is authoritative
 only after exact-artifact release proof completes.
 
-This document defines the public hf2q product surface for `v0.1.18`. It also defines
+This document defines the public hf2q product surface for `v0.1.19`. It also defines
 the policy each environment variable is classified under. Per-variable
 effects live in `docs/operator-env-vars.md`; this document sits one level above
 and defines *what is supported*.
@@ -42,7 +42,7 @@ cache, or forward graph.
 
 ### Repository model operands and managed local artifacts
 
-hf2q `v0.1.18` accepts `owner/repository[:QUANT]` as the common
+hf2q `v0.1.19` accepts `owner/repository[:QUANT]` as the common
 model operand for `convert`, `serve`, and `chat`, as governed by ADR-051.
 `serve` and model-targeted `chat` prefer hf2q-bound local authority, then a
 unique compatible structural match among manually downloaded or canonical
@@ -59,12 +59,25 @@ hosted tier.
 `convert` never uses a hosted pre-quantized GGUF as its result: it downloads
 source weights and executes hf2q's native conversion and quantization. Without
 `--output`, remote conversion writes beneath
-`${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models/v2-<hex(UTF-8 repository)>/<immutable-revision>/`.
-The injective encoded directory is the only new-write layout;
-`<owner>__<repository>` remains read-only legacy compatibility.
+`${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models/<owner>/<repository>/<immutable-revision>/`.
+The readable owner/repository hierarchy is the only new-write layout;
+`v2-<hex(UTF-8 repository)>` and `<owner>__<repository>` remain read-only
+legacy compatibility.
 The quant suffix and `--quant` are equivalent and conflicting values fail
 before payload transfer. A matching receipt-verified hf2q conversion is an idempotent
 success.
+
+Hosted GGUF and hosted projector payloads remain in the authenticated standard
+Hugging Face cache. After complete size/SHA-256 verification, hf2q publishes a
+managed final-leaf symlink to the digest-named cache blob; it does not copy,
+clone, hard-link, or move that payload into the managed root. A managed cache
+link is reusable only while its sidecar, digest-named repository blob, and
+exact-revision snapshot still resolve to the same retained inode. Native-Xet
+downloads expose measured completed/total bytes, percentage, transfer rate,
+and ETA in interactive startup UI, with bounded stable progress lines for
+non-TTY output. Before the first Xet session, Apple Silicon hosts with at least
+64 GiB physical memory select upstream high-performance mode unless either
+upstream mode variable is explicit; all other hosts retain adaptive defaults.
 
 For a selected supported multimodal text artifact, `serve` and model-targeted
 `chat` automatically reuse or retrieve one unambiguous revision-matched

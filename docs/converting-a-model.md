@@ -24,7 +24,7 @@ hf2q convert google/gemma-4-26b-a4b-it:Q4_K_M
 
 The setup-selected quant is used when present; otherwise hf2q selects from
 live hardware. The output defaults to
-`${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models/v2-<hex(owner/repo)>/<commit>/`.
+`${XDG_DATA_HOME:-$HOME/.local/share}/hf2q/models/<owner>/<repo>/<commit>/`.
 Use `--output FILE_OR_EXISTING_DIR` to override it.
 
 Convert an existing local directory by using an existing path or explicit

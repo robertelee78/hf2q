@@ -203,7 +203,9 @@ jobs:
           cargo test --locked --bin hf2q --all-features serve::cache::tests::concurrent_cross_quant_touches_merge_stale_snapshots_under_manifest_lock -- --exact
           cargo test --locked --bin hf2q --all-features input::hf_download::tests::complete_qwen_mtp_prefix_admits_the_same_one_layer_topology_as_runtime -- --exact
           cargo test --locked --bin hf2q --all-features input::hf_download::tests::mtp_hosted_admission_rejects_shape_correct_non_executable_storage -- --exact
-          cargo test --locked --bin hf2q --all-features input::hf_download::tests::hosted_multimodal_pair_is_admitted_as_one_pretransfer_extent -- --exact
+          cargo test --locked --bin hf2q --all-features input::hf_download::tests::hosted_multimodal_pair_only_reserves_hub_cache_payload_bytes -- --exact
+          cargo test --locked --bin hf2q --all-features progress::hub_download_progress_tests::mixed_hub_progress_never_regresses_or_double_counts -- --exact
+          cargo test --locked --bin hf2q --all-features xet_transfer_policy_tests::
           cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::actual_local_selection_prefers_successful_use_and_exact_quant_ignores_low_memory -- --exact
           cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::production_manual_structural_admission_never_hashes_the_text_payload -- --exact
           cargo test --locked --bin hf2q --all-features serve::managed_artifacts::tests::production_structural_admission_rejects_same_quant_size_ambiguity_even_on_filename_match -- --exact
@@ -404,7 +406,13 @@ jobs:
             input::hf_download::tests::qwen_admission_rejects_embedding_tables_smaller_than_selected_heads \
             input::hf_download::tests::mtp_hosted_admission_rejects_shape_correct_non_executable_storage \
             input::hf_download::tests::exact_revision_hub_cache_lookup_reuses_an_existing_quant_without_transfer \
-            input::hf_download::tests::hosted_multimodal_pair_is_admitted_as_one_pretransfer_extent \
+            input::hf_download::tests::hosted_multimodal_pair_only_reserves_hub_cache_payload_bytes \
+            input::hf_download::tests::mixed_local_and_hosted_extents_charge_only_real_payload_allocations \
+            progress::hub_download_progress_tests::mixed_hub_progress_never_regresses_or_double_counts \
+            xet_transfer_policy_tests::high_performance_requires_apple_silicon_and_documented_memory_floor \
+            xet_transfer_policy_tests::either_explicit_upstream_setting_wins \
+            serve::managed_artifacts::tests::legacy_v2_managed_binding_remains_read_compatible \
+            serve::managed_artifacts::tests::authenticated_hub_blob_is_published_and_reused_as_a_managed_symlink \
             input::hf_download::tests::native_projector_planning_fails_closed_when_exact_config_inspection_fails \
             input::hf_download::tests::native_output_bound_covers_kept_f32_fp16_fp8_and_mxfp4_sources \
             input::hf_download::tests::exact_local_text_projector_destinations_require_zero_new_extent \
@@ -419,7 +427,6 @@ jobs:
             input::hf_download::tests::native_source_and_output_are_admitted_as_one_shared_filesystem_extent \
             input::hf_download::tests::native_metadata_stage_preflights_before_first_cache_write \
             input::hf_download::tests::authenticated_sparse_source_fetches_only_safetensors_headers \
-            input::hf_download::tests::mixed_local_text_hosted_projector_extents_are_aggregated_by_filesystem \
             core::paired_artifact::tests::conversion_operation_locks_serialize_a_shared_explicit_projector \
             models::vit::gguf_emit::tests::planned_mmproj_bytes_match_real_nonempty_aligned_output \
             serve::managed_artifacts::tests::native_multimodal_disk_plan_includes_the_f16_projector_before_transfer \
