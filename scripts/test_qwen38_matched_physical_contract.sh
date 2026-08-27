@@ -731,8 +731,9 @@ if grep -Eq 'git ls-remote|require_current_reference' "$runner"; then
     fail 'matched physical runner still races a moving remote branch'
 fi
 grep -F 'pin_policy:"observed-current-then-frozen"' "$runner" >/dev/null
-grep -F 'qwen38_validate_physical_matrix_seal "$PHYSICAL_MATRIX_RECEIPT"' \
-  "$runner" >/dev/null
+# shellcheck disable=SC2016
+[[ "$(grep -Fc '"$PHYSICAL_MATRIX_RECEIPT" "$HF2Q_SOURCE_DIR" "$HF2Q_BIN"' \
+  "$runner")" == 2 ]]
 grep -F 'qwen38_copy_physical_matrix_seal' \
   "$matrix_runner" >/dev/null
 grep -F 'matched_physical_record_semantic_repeat_tokens' "$runner" >/dev/null

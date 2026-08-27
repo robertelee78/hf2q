@@ -132,7 +132,8 @@ qwen38_validate_artifact_identity "$MODEL_FORMAT" "$MODEL_SHA256" \
   "$MODEL_BYTES" "$qualified_file_type"
 [[ "$MODEL_SHA256" == "$qualified_sha" && "$MODEL_BYTES" == "$qualified_bytes" ]]
 qwen38_validate_pinned_peer_commit "$REFERENCE_COMMIT"
-qwen38_validate_physical_matrix_seal "$PHYSICAL_MATRIX_RECEIPT"
+qwen38_validate_physical_matrix_seal \
+  "$PHYSICAL_MATRIX_RECEIPT" "$HF2Q_SOURCE_DIR" "$HF2Q_BIN"
 [[ "$(shasum -a 256 "$PHYSICAL_MATRIX_RECEIPT" | awk '{print $1}')" \
   == "$PHYSICAL_MATRIX_SHA256" ]] || {
     echo "physical matrix SHA-256 mismatch" >&2
@@ -1041,7 +1042,8 @@ matched_physical_validate_semantic_repeat_tokens "$semantic_repeat_receipt" \
   "$MODEL_PATH" "$MODEL_SHA256" "$model_file_snapshot" "$HF2Q_SHA256" \
   "$HF2Q_COMMIT" "$semantic_repeat_expected"
 verify_request_manifest
-qwen38_validate_physical_matrix_seal "$PHYSICAL_MATRIX_RECEIPT"
+qwen38_validate_physical_matrix_seal \
+  "$PHYSICAL_MATRIX_RECEIPT" "$HF2Q_SOURCE_DIR" "$HF2Q_BIN"
 [[ "$(sha256_file "$PHYSICAL_MATRIX_RECEIPT")" == "$PHYSICAL_MATRIX_SHA256" ]]
 
 script_sha=$(sha256_file "$SCRIPT_DIR/qwen38_matched_physical_abba.sh")
