@@ -56,26 +56,27 @@ impl ResolvedModelRepository {
 pub(super) fn resolve_repository_info(
     reference: HfModelReference,
     requested_revision: &str,
-    info: &hf_hub::api::RepoInfo,
+    returned_sha: &str,
+    filenames: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<ResolvedModelRepository, DownloadError> {
     let requested_exact = requested_revision.len() == 40
         && requested_revision
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit());
-    if requested_exact && !requested_revision.eq_ignore_ascii_case(&info.sha) {
+    if requested_exact && !requested_revision.eq_ignore_ascii_case(returned_sha) {
         return Err(DownloadError::InvalidRepositoryInventory {
             reason: format!(
                 "repository lookup returned commit `{}` instead of explicitly requested `{requested_revision}`",
-                info.sha
+                returned_sha
             ),
         });
     }
-    let resolved = reference.resolve(&info.sha)?;
-    let inventory = validate_repo_inventory(
-        info.siblings
-            .iter()
-            .map(|sibling| sibling.rfilename.as_str()),
-    )?;
+    let resolved = reference.resolve(returned_sha)?;
+    let filenames = filenames
+        .into_iter()
+        .map(|filename| filename.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    let inventory = validate_repo_inventory(filenames.iter().map(String::as_str))?;
     Ok(ResolvedModelRepository::new(resolved, inventory))
 }
 
@@ -83,7 +84,13 @@ pub(super) fn resolve_repository_info(
 pub(in crate::input) fn resolve_repository_info_for_test(
     reference: HfModelReference,
     requested_revision: &str,
-    info: &hf_hub::api::RepoInfo,
+    returned_sha: &str,
+    filenames: &[&str],
 ) -> Result<ResolvedModelRepository, DownloadError> {
-    resolve_repository_info(reference, requested_revision, info)
+    resolve_repository_info(
+        reference,
+        requested_revision,
+        returned_sha,
+        filenames.iter(),
+    )
 }

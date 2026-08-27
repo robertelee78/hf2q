@@ -605,6 +605,13 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHbKvBuffers {
 /// constructed from runtime context.  Sibling of Qwen35 A2c's
 /// `leak_static_str` at `qwen35/kv_cache.rs`.
 #[inline]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Rust 1.89 does not mark helpers reached only by the dormant MultiSeqKvCache::fork_seq production seam as live"
+    )
+)]
 fn gemma4_leak_static_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
@@ -622,6 +629,13 @@ fn gemma4_leak_static_str(s: String) -> &'static str {
 /// `alloc_multi_seq_dense_kv_for_layer` / `alloc_multi_seq_mlx_kv_for_layer`
 /// all emit shape `[n, ...]` with n=`n_seqs` as the leading dim ⇒
 /// per-slot region is contiguous of size `total_bytes / n_seqs`.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Rust 1.89 does not mark helpers reached only by the dormant MultiSeqKvCache::fork_seq production seam as live"
+    )
+)]
 fn gemma4_copy_buffer_slot_region(
     buf: &mut MlxBuffer,
     src_idx: usize,
@@ -657,6 +671,13 @@ fn gemma4_copy_buffer_slot_region(
 /// Buffer shape is `[n_seqs, heads, capacity, inner]` or
 /// `[n_seqs, heads, capacity]`; each head's live prefix is contiguous but
 /// heads are separated by the full capacity stride.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Rust 1.89 does not mark helpers reached only by the dormant MultiSeqKvCache::fork_seq production seam as live"
+    )
+)]
 fn gemma4_copy_buffer_slot_prefix(
     buf: &mut MlxBuffer,
     src_idx: usize,

@@ -1,8 +1,8 @@
 [package]
 name = "hf2q"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
-rust-version = "1.88.0"
+rust-version = "1.89.0"
 build = "src/build_script.rs"
 authors = ["Robert E. Lee <robert@agidreams.us>"]
 description = "Pure Rust CLI for converting HuggingFace models to hardware-optimized formats and serving them over an OpenAI-compatible API on Apple Silicon"
@@ -80,7 +80,19 @@ half = "2.4"
 bytemuck = "1.25"
 
 # HuggingFace integration
-hf-hub = "0.5"
+# Pin the first stable native-Xet client release. The blocking facade keeps
+# hf2q's synchronous conversion pipeline while Xet runs its concurrent range
+# reconstruction on the library-owned runtime.
+hf-hub = { version = "=1.0.0", features = ["blocking"] }
+# hf-hub 1.0 publishes caret Xet edges. Pin the coherent family here as well
+# as in Cargo.lock so `cargo install` without --locked cannot select the
+# currently stable-toolchain-incompatible 1.6 family independently.
+hf-xet = "=1.5.3"
+xet-client = "=1.5.3"
+xet-core-structures = "=1.5.3"
+xet-data = "=1.5.3"
+xet-runtime = "=1.5.3"
+globset = "0.4"
 # ADR-045 canonical model-reference boundary. Keep these direct because the
 # parser consumes both APIs instead of relying on incidental transitive pins.
 percent-encoding = "=2.3.2"
@@ -258,8 +270,8 @@ resvg = { version = "=0.47.0", default-features = false }
 # ADR-051 compiles the exact hf2q.us SVG into deterministic native-protocol
 # and ANSI raster assets. Keeping resvg out of the runtime path avoids adding
 # logo rendering latency to every interactive hf2q invocation. The logo has
-# paths only, so text/fonts and embedded raster formats remain disabled. 0.47
-# supports the crate's Rust 1.88 floor (0.48 requires 1.89).
+# paths only, so text/fonts and embedded raster formats remain disabled. Keep
+# the proven 0.47 renderer pin independent of the Rust 1.89 floor.
 resvg = { version = "=0.47.0", default-features = false }
 base64 = "0.22"
 

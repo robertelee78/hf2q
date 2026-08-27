@@ -11,18 +11,9 @@ use super::hf_reference::HfModelReference;
 #[test]
 fn repository_info_seals_a_mutable_request_to_the_returned_exact_commit() {
     let reference = HfModelReference::parse("org/model", Some("main")).unwrap();
-    let info = hf_hub::api::RepoInfo {
-        sha: "ABCDEF0123456789ABCDEF0123456789ABCDEF01".to_owned(),
-        siblings: vec![
-            hf_hub::api::Siblings {
-                rfilename: "config.json".to_owned(),
-            },
-            hf_hub::api::Siblings {
-                rfilename: "model.safetensors".to_owned(),
-            },
-        ],
-    };
-    let resolved = resolve_repository_info_for_test(reference, "main", &info).unwrap();
+    let sha = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+    let filenames = ["config.json", "model.safetensors"];
+    let resolved = resolve_repository_info_for_test(reference, "main", sha, &filenames).unwrap();
     assert_eq!(
         resolved.reference().revision(),
         "abcdef0123456789abcdef0123456789abcdef01"
@@ -32,14 +23,11 @@ fn repository_info_seals_a_mutable_request_to_the_returned_exact_commit() {
     assert!(!debug.contains("model.safetensors"));
     assert!(debug.contains("inventory_len: 2"));
 
-    let invalid = hf_hub::api::RepoInfo {
-        sha: "main".to_owned(),
-        siblings: info.siblings.clone(),
-    };
     assert!(resolve_repository_info_for_test(
         HfModelReference::parse("org/model", None).unwrap(),
         "main",
-        &invalid,
+        "main",
+        &filenames,
     )
     .is_err());
 
@@ -51,7 +39,8 @@ fn repository_info_seals_a_mutable_request_to_the_returned_exact_commit() {
     assert!(resolve_repository_info_for_test(
         wrong_exact,
         "1111111111111111111111111111111111111111",
-        &info
+        sha,
+        &filenames,
     )
     .is_err());
 }

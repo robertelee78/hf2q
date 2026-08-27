@@ -10,8 +10,10 @@
 //! 3. ~/.cache/huggingface/token file (hf-hub default)
 //! 4. ~/.huggingface/token file (legacy path)
 //!
-//! Cache: Uses standard hf-hub cache directory. Subsequent runs with
-//! the same repo skip re-download (hf-hub's built-in LFS resumption).
+//! Cache: Uses the standard hf-hub cache directory. Subsequent runs with
+//! the same exact revision reuse verified blobs. `hf-hub` 1.x transparently
+//! selects native Xet range reconstruction for Xet-backed Hub objects and
+//! concurrent file transfers for bounded snapshots.
 //!
 //! # Disk preflight (Decision 14)
 //!
@@ -29,14 +31,10 @@
 //!
 //! # Shard resumption
 //!
-//! hf-hub's `repo.get(filename)` skips re-downloading files that are
-//! already present in the cache directory. Interrupted downloads leave
-//! partial files; on re-invocation the partially-downloaded shard is
-//! re-fetched from the beginning (hf-hub does not do byte-range
-//! resumption at the shard level). Fully-completed shards are NOT
-//! re-downloaded. This means a Ctrl+C during a 40-shard download
-//! followed by re-invoke will re-download only the in-flight shard;
-//! all completed shards are reused.
+//! Completed blobs are not re-downloaded. Transfers write to `.incomplete`
+//! paths and publish cache blobs atomically only after the native Xet or HTTP
+//! operation succeeds. After interruption, completed blobs are reused and
+//! incomplete work is reconstructed safely by the selected transport.
 //!
 //! Manual test protocol: `Ctrl+C` mid-download → observe partial shard
 //! in `~/.cache/huggingface/hub/models--*/snapshots/*/` → re-invoke
@@ -55,6 +53,20 @@ use crate::core::integrity::{verify_shard, IntegrityError, ShardIntegrity};
 use crate::input::hf_reference::{HfModelReference, HfReferenceError, ResolvedHfModelReference};
 use crate::progress::ProgressReporter;
 
+type HubRepo = hf_hub::HFRepositorySync<hf_hub::RepoTypeModel>;
+
+struct HubApi {
+    client: hf_hub::HFClientSync,
+    metadata: reqwest::blocking::Client,
+}
+
+struct HubFileMetadata {
+    commit_hash: String,
+    etag: String,
+    file_size: u64,
+    xet_hash: Option<String>,
+}
+
 mod gguf_probe;
 mod resolution;
 
@@ -67,6 +79,7 @@ const CANONICAL_HF_ENDPOINT: &str = "https://huggingface.co";
 const DEFAULT_HF_REVISION: &str = "main";
 const QWEN38_REPOSITORY_ID: &str = "Qwen/Qwen3.8-27B";
 const QWEN38_ACCEPTED_REVISION: &str = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0";
+const HF_SNAPSHOT_MAX_WORKERS: usize = 8;
 pub(super) const MAX_HF_REPO_FILES: usize = 4096;
 pub(super) const MAX_HF_SMALL_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const MAX_HF_TOKENIZER_BYTES: u64 = 512 * 1024 * 1024;
@@ -336,12 +349,7 @@ pub(crate) fn prepare_native_planning_source(
     let model_dir = workspace.path().join("source");
     fs::create_dir(&model_dir).map_err(download_failed)?;
 
-    let repo_spec = hf_hub::Repo::with_revision(
-        source_plan.repository.clone(),
-        hf_hub::RepoType::Model,
-        source_plan.revision.clone(),
-    );
-    let repo_root = cache_dir.join(repo_spec.folder_name());
+    let repo_root = cache_dir.join(hub_model_cache_folder(&source_plan.repository));
     let blob_root = repo_root
         .join("blobs")
         .canonicalize()
@@ -626,8 +634,8 @@ fn get_available_space_for_path(path: &std::path::Path) -> Option<u64> {
 ///
 /// Returns the path to the local directory containing the downloaded model files.
 /// Uses hf-hub crate cache — subsequent calls with the same repo skip re-download.
-/// Completed shards are not re-fetched on re-invocation; only in-flight shards
-/// are restarted (hf-hub file-level skip, not byte-range resumption).
+/// Completed blobs are not re-fetched on re-invocation. Interrupted Xet work
+/// may reuse CAS/chunk state, but only completed blobs become snapshot entries.
 pub fn download_model(
     repo_id: &str,
     progress: &ProgressReporter,
@@ -661,8 +669,7 @@ pub fn download_model_reference(
             None,
         )?;
     }
-    let pinned = HfModelReference::parse(&plan.repository, Some(&plan.revision))?;
-    download_via_hf_hub(pinned, &cache_dir, progress)
+    download_via_hf_hub(plan, &cache_dir, progress)
 }
 
 /// Resolve one parsed model reference to an exact commit and bounded
@@ -690,11 +697,7 @@ pub fn resolve_hub_gguf_catalog(
     let cache_dir = resolve_hf_cache_dir();
     let api = build_hub_api(&cache_dir, false)?;
     let (resolved, inventory) = resolve_with_api(&api, reference)?.into_download_parts();
-    let repo = api.repo(hf_hub::Repo::with_revision(
-        resolved.repo_id().to_owned(),
-        hf_hub::RepoType::Model,
-        resolved.revision().to_owned(),
-    ));
+    let repo = hub_model_repo(&api, resolved.repo_id());
     let requires_projector =
         resolve_repository_projector_requirement_best_effort(&api, &repo, &resolved, &inventory);
     let mut artifacts = Vec::new();
@@ -753,11 +756,7 @@ pub fn resolve_native_source_plan(
     let cache_dir = resolve_hf_cache_dir();
     let api = build_hub_api(&cache_dir, false)?;
     let (resolved, inventory) = resolve_with_api(&api, reference)?.into_download_parts();
-    let repo = api.repo(hf_hub::Repo::with_revision(
-        resolved.repo_id().to_owned(),
-        hf_hub::RepoType::Model,
-        resolved.revision().to_owned(),
-    ));
+    let repo = hub_model_repo(&api, resolved.repo_id());
     // Metadata is a bounded first stage: establish every exact extent and
     // admit the aggregate before the first cache write. Once staged it is
     // intentionally not counted again in the weight/output preflight; the
@@ -813,8 +812,8 @@ pub fn resolve_native_source_plan(
 }
 
 fn resolve_source_metadata_records(
-    api: &hf_hub::api::sync::Api,
-    repo: &hf_hub::api::sync::ApiRepo,
+    api: &HubApi,
+    repo: &HubRepo,
     resolved: &ResolvedHfModelReference,
     inventory: &BTreeSet<String>,
     cache_dir: &Path,
@@ -836,12 +835,18 @@ fn resolve_source_metadata_records(
 }
 
 fn stage_native_source_metadata(
-    repo: &hf_hub::api::sync::ApiRepo,
+    repo: &HubRepo,
     resolved: &ResolvedHfModelReference,
     records: &[(String, ShardIntegrity, bool)],
 ) -> Result<(), DownloadError> {
     for (filename, record, _) in records {
-        let path = download_file(repo, resolved.repo_id(), filename)?;
+        let path = download_file(
+            repo,
+            resolved.repo_id(),
+            resolved.revision(),
+            filename,
+            None,
+        )?;
         verify_shard(resolved.repo_id(), resolved.revision(), &path, record)?;
     }
     Ok(())
@@ -896,8 +901,8 @@ fn checked_inventory_extents(
 }
 
 fn resolve_source_weight_records(
-    api: &hf_hub::api::sync::Api,
-    repo: &hf_hub::api::sync::ApiRepo,
+    api: &HubApi,
+    repo: &HubRepo,
     resolved: &ResolvedHfModelReference,
     inventory: &BTreeSet<String>,
     cache_dir: &Path,
@@ -907,7 +912,7 @@ fn resolve_source_weight_records(
 
     let required = if inventory.contains(INDEX) {
         let record = fetch_expected_file_metadata(api, repo, resolved, INDEX)?;
-        let path = download_file(repo, resolved.repo_id(), INDEX)?;
+        let path = download_file(repo, resolved.repo_id(), resolved.revision(), INDEX, None)?;
         verify_shard(resolved.repo_id(), resolved.revision(), &path, &record)?;
         let bytes = fs::read(&path)?;
         crate::input::integrity::required_weight_shards_from_bytes(&bytes, &path).map_err(
@@ -945,15 +950,15 @@ fn resolve_source_weight_records(
 }
 
 fn inspect_repository_config(
-    api: &hf_hub::api::sync::Api,
-    repo: &hf_hub::api::sync::ApiRepo,
+    api: &HubApi,
+    repo: &HubRepo,
     resolved: &ResolvedHfModelReference,
     inventory: &BTreeSet<String>,
 ) -> Result<serde_json::Value, DownloadError> {
     const CONFIG: &str = "config.json";
     inspect_repository_config_with(inventory.contains(CONFIG), || {
         let record = fetch_expected_file_metadata(api, repo, resolved, CONFIG)?;
-        let path = download_file(repo, resolved.repo_id(), CONFIG)?;
+        let path = download_file(repo, resolved.repo_id(), resolved.revision(), CONFIG, None)?;
         verify_shard(resolved.repo_id(), resolved.revision(), &path, &record)?;
         let bytes = fs::read(&path)?;
         serde_json::from_slice(&bytes).map_err(|error| DownloadError::InvalidRepositoryInventory {
@@ -975,8 +980,8 @@ fn inspect_repository_config_with(
 }
 
 fn resolve_repository_projector_requirement_best_effort(
-    api: &hf_hub::api::sync::Api,
-    repo: &hf_hub::api::sync::ApiRepo,
+    api: &HubApi,
+    repo: &HubRepo,
     resolved: &ResolvedHfModelReference,
     inventory: &BTreeSet<String>,
 ) -> bool {
@@ -1885,11 +1890,7 @@ fn download_hub_artifact(
     }
     let cache_dir = resolve_hf_cache_dir();
     let api = build_hub_api(&cache_dir, true)?;
-    let repo = api.repo(hf_hub::Repo::with_revision(
-        artifact.repository.clone(),
-        hf_hub::RepoType::Model,
-        artifact.revision.clone(),
-    ));
+    let repo = hub_model_repo(&api, &artifact.repository);
     let resolved = HfModelReference::parse(&artifact.repository, Some(&artifact.revision))?
         .resolve(&artifact.revision)?;
     let record = fetch_expected_file_metadata(&api, &repo, &resolved, &artifact.filename)?;
@@ -1907,7 +1908,14 @@ fn download_hub_artifact(
         return Ok(path);
     }
     check_artifact_disk_preflight(&artifact.repository, &cache_dir, artifact.bytes)?;
-    let path = download_file(&repo, &artifact.repository, &artifact.filename)?;
+    let transfer_progress = ProgressReporter::new();
+    let path = download_file(
+        &repo,
+        &artifact.repository,
+        &artifact.revision,
+        &artifact.filename,
+        Some(transfer_progress.hub_download("Downloading hosted GGUF")),
+    )?;
     verify_shard(&artifact.repository, &artifact.revision, &path, &record)?;
     Ok(path)
 }
@@ -1950,23 +1958,17 @@ fn cached_hub_file_path(
     {
         return None;
     }
-    let repo_spec = hf_hub::Repo::with_revision(
-        repository.to_owned(),
-        hf_hub::RepoType::Model,
-        revision.to_owned(),
-    );
     let direct_snapshot = (revision.len() == 40
         && revision.bytes().all(|byte| byte.is_ascii_hexdigit()))
     .then(|| {
         cache_dir
-            .join(repo_spec.folder_name())
+            .join(hub_model_cache_folder(repository))
             .join("snapshots")
             .join(revision)
             .join(filename)
     })
     .filter(|path| path.exists());
-    let cache = hf_hub::Cache::new(cache_dir.to_path_buf());
-    let path = direct_snapshot.or_else(|| cache.repo(repo_spec).get(filename))?;
+    let path = direct_snapshot?;
     let metadata = path.metadata().ok()?;
     (metadata.is_file() && metadata.len() == bytes).then_some(path)
 }
@@ -2827,78 +2829,92 @@ fn check_exact_disk_capacity(
 
 /// Download model files using the hf-hub crate.
 fn download_via_hf_hub(
-    reference: HfModelReference,
+    plan: NativeSourcePlan,
     cache_dir: &Path,
     progress: &ProgressReporter,
 ) -> Result<DownloadedModel, DownloadError> {
-    use hf_hub::{Repo, RepoType};
-
     let api = build_hub_api(cache_dir, true)?;
-    let (resolved, inventory) = resolve_with_api(&api, reference)?.into_download_parts();
-    let repo = api.repo(Repo::with_revision(
-        resolved.repo_id().to_owned(),
-        RepoType::Model,
-        resolved.revision().to_owned(),
-    ));
+    let resolved =
+        HfModelReference::parse(&plan.repository, Some(&plan.revision))?.resolve(&plan.revision)?;
+    let repo = hub_model_repo(&api, resolved.repo_id());
 
     debug!(
-        file_count = inventory.len(),
+        metadata_files = plan.metadata_records.len(),
+        weight_files = plan.weight_records.len(),
         revision = resolved.revision(),
-        "Repository file listing retrieved"
+        max_workers = HF_SNAPSHOT_MAX_WORKERS,
+        "Downloading bounded exact-revision model snapshot through native Xet"
     );
-    let initial_files = initial_download_files(&inventory)?;
     let mut downloaded_path = None;
-    let mut manifest = Vec::with_capacity(initial_files.len());
-    for filename in &initial_files {
-        let record = fetch_expected_file_metadata(&api, &repo, &resolved, filename)?;
-        let local = download_file(&repo, resolved.repo_id(), filename)?;
-        bind_snapshot_parent(&mut downloaded_path, &local, filename, resolved.revision())?;
-        verify_shard(resolved.repo_id(), resolved.revision(), &local, &record)?;
-        manifest.push(record);
+    let mut manifest = Vec::with_capacity(plan.metadata_records.len() + plan.weight_records.len());
+    for record in &plan.metadata_records {
+        let local = cached_hub_file_path(
+            cache_dir,
+            resolved.repo_id(),
+            resolved.revision(),
+            &record.filename,
+            record.bytes,
+        )
+        .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "staged native metadata `{}` disappeared before payload transfer",
+                record.filename
+            ),
+        })?;
+        bind_snapshot_parent(
+            &mut downloaded_path,
+            &local,
+            &record.filename,
+            resolved.revision(),
+        )?;
+        verify_shard(resolved.repo_id(), resolved.revision(), &local, record)?;
+        manifest.push(record.clone());
     }
     let model_dir = downloaded_path
         .clone()
         .ok_or_else(|| DownloadError::DownloadFailed {
             reason: "No model metadata files were downloaded".to_owned(),
         })?;
-    let required_shards =
-        crate::input::integrity::required_weight_shards(&model_dir).map_err(|error| {
-            DownloadError::InvalidRepositoryInventory {
-                reason: error.to_string(),
-            }
-        })?;
-    let files_to_download = complete_download_files(&inventory, &initial_files, &required_shards)?;
-
-    let additional_files = files_to_download
+    let weight_filenames = plan
+        .weight_records
         .iter()
-        .filter(|filename| !initial_files.contains(filename))
+        .map(|record| record.filename.clone())
         .collect::<Vec<_>>();
-    let pb = progress.bar(additional_files.len() as u64, "Downloading model weights");
+    download_selected_snapshot(
+        &repo,
+        resolved.repo_id(),
+        resolved.revision(),
+        &weight_filenames,
+        progress,
+    )?;
 
-    for filename in additional_files {
-        debug!(file = %filename, "Downloading");
-        let record = fetch_expected_file_metadata(&api, &repo, &resolved, filename)?;
-        let local_path = download_file(&repo, resolved.repo_id(), filename)?;
+    let pb = progress.bar(plan.weight_records.len() as u64, "Verifying model weights");
+    for record in &plan.weight_records {
+        let local_path = cached_hub_file_path(
+            cache_dir,
+            resolved.repo_id(),
+            resolved.revision(),
+            &record.filename,
+            record.bytes,
+        )
+        .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "selected snapshot omitted required weight `{}`",
+                record.filename
+            ),
+        })?;
         bind_snapshot_parent(
             &mut downloaded_path,
             &local_path,
-            filename,
+            &record.filename,
             resolved.revision(),
         )?;
-        verify_shard(
-            resolved.repo_id(),
-            resolved.revision(),
-            &local_path,
-            &record,
-        )?;
-        manifest.push(record);
+        verify_shard(resolved.repo_id(), resolved.revision(), &local_path, record)?;
+        manifest.push(record.clone());
         pb.inc(1);
     }
 
-    pb.finish_with_message(format!(
-        "Selected {} exact source files",
-        files_to_download.len()
-    ));
+    pb.finish_with_message(format!("Selected {} exact source files", manifest.len()));
 
     info!(path = %model_dir.display(), "Model downloaded to cache");
 
@@ -2910,36 +2926,125 @@ fn download_via_hf_hub(
     })
 }
 
-fn build_hub_api(
-    cache_dir: &Path,
-    progress: bool,
-) -> Result<hf_hub::api::sync::Api, DownloadError> {
-    use hf_hub::api::sync::ApiBuilder;
+fn download_selected_snapshot(
+    repo: &HubRepo,
+    repo_id: &str,
+    revision: &str,
+    filenames: &[String],
+    progress: &ProgressReporter,
+) -> Result<PathBuf, DownloadError> {
+    if filenames.is_empty() {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: "bounded snapshot selected no model payload files".to_owned(),
+        });
+    }
+    let allow_patterns = exact_hub_allow_patterns(filenames)?;
+    info!(
+        repo = repo_id,
+        revision,
+        selected_files = filenames.len(),
+        max_workers = HF_SNAPSHOT_MAX_WORKERS,
+        "Starting concurrent Hugging Face snapshot download through native Xet"
+    );
+    let snapshot = repo
+        .snapshot_download()
+        .revision(revision.to_owned())
+        .allow_patterns(allow_patterns)
+        .max_workers(HF_SNAPSHOT_MAX_WORKERS)
+        .progress(progress.hub_download("Downloading model weights"))
+        .send()
+        .map_err(|error| map_hub_download_error(error, repo_id, "selected snapshot"))?;
+    if snapshot.file_name().and_then(|name| name.to_str()) != Some(revision) {
+        return Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "selected snapshot resolved to `{}` instead of exact commit `{revision}`",
+                snapshot.display()
+            ),
+        });
+    }
+    Ok(snapshot)
+}
 
+fn exact_hub_allow_patterns(filenames: &[String]) -> Result<Vec<String>, DownloadError> {
+    let mut patterns = Vec::with_capacity(filenames.len());
+    for filename in filenames {
+        validate_repo_filename(filename)?;
+        patterns.push(globset::escape(filename));
+    }
+    Ok(patterns)
+}
+
+fn hub_model_repo(api: &HubApi, repo_id: &str) -> HubRepo {
+    let (owner, name) = hf_hub::split_id(repo_id);
+    api.client.model(owner.to_owned(), name.to_owned())
+}
+
+fn hub_model_cache_folder(repo_id: &str) -> String {
+    format!("models--{}", repo_id.replace('/', "--"))
+}
+
+fn map_hub_repository_error(error: hf_hub::HFError, repo_id: &str) -> DownloadError {
+    match error {
+        hf_hub::HFError::AuthRequired { .. } | hf_hub::HFError::Forbidden { .. } => {
+            DownloadError::AuthError {
+                repo: repo_id.to_owned(),
+            }
+        }
+        hf_hub::HFError::RepoNotFound { .. } | hf_hub::HFError::RevisionNotFound { .. } => {
+            DownloadError::RepoNotFound {
+                repo: repo_id.to_owned(),
+            }
+        }
+        error => DownloadError::DownloadFailed {
+            reason: format!("Failed to get repository info: {error}"),
+        },
+    }
+}
+
+fn map_hub_download_error(error: hf_hub::HFError, repo_id: &str, operation: &str) -> DownloadError {
+    match error {
+        hf_hub::HFError::AuthRequired { .. } | hf_hub::HFError::Forbidden { .. } => {
+            DownloadError::AuthError {
+                repo: repo_id.to_owned(),
+            }
+        }
+        error => DownloadError::DownloadFailed {
+            reason: format!("Failed to download {operation}: {error}"),
+        },
+    }
+}
+
+fn build_hub_api(cache_dir: &Path, _progress: bool) -> Result<HubApi, DownloadError> {
     let token = resolve_auth_token();
     debug!(has_token = token.is_some(), "Auth token resolution");
 
     // Pin the official endpoint even when HF_ENDPOINT is set in the process.
-    let mut builder = ApiBuilder::new()
-        .with_endpoint(CANONICAL_HF_ENDPOINT.to_owned())
-        .with_cache_dir(cache_dir.to_path_buf())
-        .with_progress(progress);
+    let mut builder = hf_hub::HFClient::builder()
+        .endpoint(CANONICAL_HF_ENDPOINT)
+        .cache_dir(cache_dir)
+        .user_agent(concat!("hf2q/", env!("CARGO_PKG_VERSION")));
     if let Some(token) = token {
-        builder = builder.with_token(Some(token));
+        builder = builder.token(token);
     }
-    builder
-        .build()
+    let client = builder
+        .build_sync()
         .map_err(|error| DownloadError::DownloadFailed {
             reason: format!("Failed to initialize Hugging Face API client: {error}"),
-        })
+        })?;
+    let metadata = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(60))
+        .user_agent(concat!("hf2q/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(download_failed)?;
+    Ok(HubApi { client, metadata })
 }
 
 fn resolve_with_api(
-    api: &hf_hub::api::sync::Api,
+    api: &HubApi,
     reference: HfModelReference,
 ) -> Result<ResolvedModelRepository, DownloadError> {
-    use hf_hub::{Repo, RepoType};
-
     if reference.filename().is_some() {
         return Err(DownloadError::FileReferenceUnsupported);
     }
@@ -2947,48 +3052,180 @@ fn resolve_with_api(
         .requested_revision()
         .unwrap_or_else(|| default_revision_for(reference.repo_id()))
         .to_owned();
-    let lookup_repo = api.repo(Repo::with_revision(
-        reference.repo_id().to_owned(),
-        RepoType::Model,
-        requested_revision.clone(),
-    ));
-    let repo_info = lookup_repo.info().map_err(|error| {
-        let message = error.to_string();
-        if message.contains("401") || message.contains("403") || message.contains("auth") {
-            DownloadError::AuthError {
-                repo: reference.repo_id().to_owned(),
-            }
-        } else if message.contains("404") || message.contains("not found") {
-            DownloadError::RepoNotFound {
-                repo: reference.repo_id().to_owned(),
-            }
-        } else {
-            DownloadError::DownloadFailed {
-                reason: format!("Failed to get repository info: {error}"),
-            }
-        }
-    })?;
-    resolve_repository_info(reference, &requested_revision, &repo_info)
+    let lookup_repo = hub_model_repo(api, reference.repo_id());
+    let repo_info = lookup_repo
+        .info()
+        .revision(requested_revision.clone())
+        .send()
+        .map_err(|error| map_hub_repository_error(error, reference.repo_id()))?;
+    let returned_sha = repo_info
+        .sha
+        .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+            reason: "repository lookup omitted its resolved commit".to_owned(),
+        })?;
+    let siblings = repo_info
+        .siblings
+        .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+            reason: "repository lookup omitted its file inventory".to_owned(),
+        })?;
+    resolve_repository_info(
+        reference,
+        &requested_revision,
+        &returned_sha,
+        siblings.iter().map(|sibling| sibling.rfilename.as_str()),
+    )
 }
 
 fn fetch_expected_file_metadata(
-    api: &hf_hub::api::sync::Api,
-    repo: &hf_hub::api::sync::ApiRepo,
+    api: &HubApi,
+    _repo: &HubRepo,
     resolved: &ResolvedHfModelReference,
     filename: &str,
 ) -> Result<ShardIntegrity, DownloadError> {
-    let metadata =
-        api.metadata(&repo.url(filename))
-            .map_err(|error| DownloadError::DownloadFailed {
-                reason: format!("Failed to fetch immutable metadata for `{filename}`: {error}"),
-            })?;
+    let metadata = fetch_hub_file_metadata(api, resolved, filename)?;
+    require_native_xet_payload(filename, metadata.xet_hash.as_deref())?;
+    debug!(
+        repo = resolved.repo_id(),
+        revision = resolved.revision(),
+        filename,
+        transport = if metadata.xet_hash.is_some() {
+            "xet"
+        } else {
+            "http"
+        },
+        "Authenticated immutable Hugging Face file metadata"
+    );
     validate_file_metadata(
         filename,
         resolved.revision(),
-        metadata.commit_hash(),
-        metadata.etag(),
-        metadata.size() as u64,
+        &metadata.commit_hash,
+        &metadata.etag,
+        metadata.file_size,
     )
+}
+
+fn require_native_xet_payload(filename: &str, xet_hash: Option<&str>) -> Result<(), DownloadError> {
+    if !filename.ends_with(".safetensors") && !filename.ends_with(".gguf") {
+        return Ok(());
+    }
+    let valid_xet_hash = xet_hash
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if valid_xet_hash {
+        Ok(())
+    } else {
+        Err(DownloadError::InvalidRepositoryInventory {
+            reason: format!(
+                "model payload `{filename}` is not available through native Hugging Face Xet"
+            ),
+        })
+    }
+}
+
+pub(crate) fn fetch_selected_hub_integrity(
+    repo_id: &str,
+    revision: &str,
+    filenames: &[String],
+) -> Result<Vec<ShardIntegrity>, DownloadError> {
+    let reference = HfModelReference::parse(repo_id, Some(revision))?;
+    let api = build_hub_api(&resolve_hf_cache_dir(), false)?;
+    let (resolved, _) = resolve_with_api(&api, reference)?.into_download_parts();
+    let repo = hub_model_repo(&api, repo_id);
+    filenames
+        .iter()
+        .map(|filename| fetch_expected_file_metadata(&api, &repo, &resolved, filename))
+        .collect()
+}
+
+fn fetch_hub_file_metadata(
+    api: &HubApi,
+    resolved: &ResolvedHfModelReference,
+    filename: &str,
+) -> Result<HubFileMetadata, DownloadError> {
+    use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, ETAG};
+
+    validate_repo_filename(filename)?;
+    let mut url = reqwest::Url::parse(CANONICAL_HF_ENDPOINT).map_err(download_failed)?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| DownloadError::DownloadFailed {
+                reason: "canonical Hugging Face endpoint cannot accept path segments".into(),
+            })?;
+        segments.pop_if_empty();
+        segments.extend(resolved.repo_id().split('/'));
+        segments.push("resolve");
+        segments.push(resolved.revision());
+        segments.extend(filename.split('/'));
+    }
+    let mut request = api.metadata.head(url.clone());
+    if let Some(token) = resolve_auth_token() {
+        request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let response = request
+        .send()
+        .map_err(|error| DownloadError::DownloadFailed {
+            reason: format!("Failed to fetch immutable metadata for `{filename}`: {error}"),
+        })?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(DownloadError::AuthError {
+            repo: resolved.repo_id().to_owned(),
+        });
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(DownloadError::RepoNotFound {
+            repo: resolved.repo_id().to_owned(),
+        });
+    }
+    if !status.is_success() && !status.is_redirection() {
+        return Err(DownloadError::DownloadFailed {
+            reason: format!(
+                "Failed to fetch immutable metadata for `{filename}`: HTTP {status} at {url}"
+            ),
+        });
+    }
+    let headers = response.headers();
+    let text = |name: &'static str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+                reason: format!("metadata for `{filename}` omitted `{name}`"),
+            })
+    };
+    let commit_hash = text("x-repo-commit")?.to_owned();
+    let etag = headers
+        .get("x-linked-etag")
+        .or_else(|| headers.get(ETAG))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .trim()
+                .trim_start_matches("W/")
+                .trim_matches('"')
+                .to_owned()
+        })
+        .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+            reason: format!("metadata for `{filename}` omitted its immutable ETag"),
+        })?;
+    let file_size = headers
+        .get("x-linked-size")
+        .or_else(|| headers.get(CONTENT_LENGTH))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| DownloadError::InvalidRepositoryInventory {
+            reason: format!("metadata for `{filename}` omitted its byte length"),
+        })?;
+    let xet_hash = headers
+        .get("x-xet-hash")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    Ok(HubFileMetadata {
+        commit_hash,
+        etag,
+        file_size,
+        xet_hash,
+    })
 }
 
 pub(super) fn validate_file_metadata(
@@ -3136,6 +3373,7 @@ pub(super) fn initial_download_files(
     Ok(files)
 }
 
+#[cfg(test)]
 pub(super) fn complete_download_files(
     inventory: &BTreeSet<String>,
     initial_files: &[String],
@@ -3160,22 +3398,21 @@ pub(super) fn complete_download_files(
 }
 
 fn download_file(
-    repo: &hf_hub::api::sync::ApiRepo,
+    repo: &HubRepo,
     repo_id: &str,
+    revision: &str,
     filename: &str,
+    progress: Option<hf_hub::progress::Progress>,
 ) -> Result<PathBuf, DownloadError> {
-    repo.get(filename).map_err(|error| {
-        let rendered = error.to_string();
-        if rendered.contains("401") || rendered.contains("403") {
-            DownloadError::AuthError {
-                repo: repo_id.to_owned(),
-            }
-        } else {
-            DownloadError::DownloadFailed {
-                reason: format!("Failed to download `{filename}`: {error}"),
-            }
-        }
-    })
+    let request = repo
+        .download_file()
+        .filename(filename.to_owned())
+        .revision(revision.to_owned());
+    let result = match progress {
+        Some(progress) => request.progress(progress).send(),
+        None => request.send(),
+    };
+    result.map_err(|error| map_hub_download_error(error, repo_id, &format!("`{filename}`")))
 }
 
 pub(super) fn bind_snapshot_parent(
@@ -3372,6 +3609,33 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn selected_snapshot_patterns_are_literal_and_do_not_broaden_inventory() {
+        let selected = vec!["weights/model[01]*?.safetensors".to_owned()];
+        let patterns = exact_hub_allow_patterns(&selected).unwrap();
+        let matcher = globset::Glob::new(&patterns[0]).unwrap().compile_matcher();
+        assert!(matcher.is_match(&selected[0]));
+        assert!(!matcher.is_match("weights/model0-extra.safetensors"));
+        assert!(!matcher.is_match("weights/model1.safetensors"));
+    }
+
+    #[test]
+    fn model_cache_folder_matches_the_standard_hub_layout() {
+        assert_eq!(
+            hub_model_cache_folder("owner/model"),
+            "models--owner--model"
+        );
+    }
+
+    #[test]
+    fn model_payloads_require_native_xet_while_git_metadata_does_not() {
+        let xet_hash = "a".repeat(64);
+        assert!(require_native_xet_payload("model.safetensors", Some(&xet_hash)).is_ok());
+        assert!(require_native_xet_payload("model.gguf", None).is_err());
+        assert!(require_native_xet_payload("model.gguf", Some("not-a-xet-hash")).is_err());
+        assert!(require_native_xet_payload("config.json", None).is_ok());
+    }
 
     fn write_test_gguf(path: &Path, arch: &str, file_type: u32) -> u64 {
         fn string(bytes: &mut Vec<u8>, value: &str) {
@@ -4869,36 +5133,79 @@ pub(crate) mod tests {
             eprintln!("skipping network test (set HF2Q_NETWORK_TESTS=1 to run)");
             return;
         }
-        use hf_hub::api::sync::ApiBuilder;
-        use hf_hub::{Repo, RepoType};
-
-        let api = ApiBuilder::new()
-            .with_endpoint(CANONICAL_HF_ENDPOINT.to_owned())
-            .with_progress(false)
-            .build()
-            .expect("build exact-origin Hub client");
-        let info = api
-            .repo(Repo::with_revision(
-                QWEN38_REPOSITORY_ID.to_owned(),
-                RepoType::Model,
-                QWEN38_ACCEPTED_REVISION.to_owned(),
-            ))
+        let api =
+            build_hub_api(&resolve_hf_cache_dir(), false).expect("build exact-origin Hub client");
+        let exact_repo = hub_model_repo(&api, QWEN38_REPOSITORY_ID);
+        let info = exact_repo
             .info()
+            .revision(QWEN38_ACCEPTED_REVISION)
+            .send()
             .expect("fetch Qwen3.8 repository info");
         let reference = HfModelReference::parse(QWEN38_REPOSITORY_ID, None).unwrap();
-        let resolved = resolve_repository_info(reference, QWEN38_ACCEPTED_REVISION, &info).unwrap();
+        let sha = info.sha.expect("resolved commit");
+        let siblings = info.siblings.expect("repository inventory");
+        let resolved = resolve_repository_info(
+            reference,
+            QWEN38_ACCEPTED_REVISION,
+            &sha,
+            siblings.iter().map(|sibling| sibling.rfilename.as_str()),
+        )
+        .unwrap();
         assert_eq!(resolved.reference().revision(), QWEN38_ACCEPTED_REVISION);
         assert!(resolved.contains("config.json"));
         assert!(resolved.contains("model.safetensors.index.json"));
-        let exact_repo = api.repo(Repo::with_revision(
-            QWEN38_REPOSITORY_ID.to_owned(),
-            RepoType::Model,
-            QWEN38_ACCEPTED_REVISION.to_owned(),
-        ));
         let config =
             fetch_expected_file_metadata(&api, &exact_repo, resolved.reference(), "config.json")
                 .expect("authenticate bounded Qwen3.8 config metadata");
         assert_eq!(config.filename, "config.json");
         assert!(config.bytes > 0 && config.bytes <= MAX_HF_SMALL_METADATA_BYTES);
+    }
+
+    /// Opt-in end-to-end proof that the production snapshot path selects the
+    /// native Xet transport while retaining exact-file and SHA-256 contracts.
+    #[test]
+    fn live_xet_snapshot_preserves_exact_selection_and_integrity() {
+        if std::env::var("HF2Q_NETWORK_TESTS").ok().as_deref() != Some("1") {
+            eprintln!("skipping network test (set HF2Q_NETWORK_TESTS=1 to run)");
+            return;
+        }
+        const REPO: &str = "hf-internal-testing/tiny-random-bert";
+        const REVISION: &str = "f171d7baecaf37b5da5a3616d8833b9969753535";
+        const FILE: &str = "pytorch_model.bin";
+
+        let cache = tempfile::tempdir().unwrap();
+        let api = build_hub_api(cache.path(), true).unwrap();
+        let repo = hub_model_repo(&api, REPO);
+        let resolved = HfModelReference::parse(REPO, Some(REVISION))
+            .unwrap()
+            .resolve(REVISION)
+            .unwrap();
+        let metadata = fetch_hub_file_metadata(&api, &resolved, FILE).expect("fetch Xet metadata");
+        assert!(
+            metadata.xet_hash.is_some(),
+            "fixture must remain Xet-backed"
+        );
+        require_native_xet_payload("fixture.safetensors", metadata.xet_hash.as_deref())
+            .expect("live Xet identity must satisfy the production payload contract");
+        let record = validate_file_metadata(
+            FILE,
+            REVISION,
+            &metadata.commit_hash,
+            &metadata.etag,
+            metadata.file_size,
+        )
+        .unwrap();
+        let snapshot = download_selected_snapshot(
+            &repo,
+            REPO,
+            REVISION,
+            &[FILE.to_owned()],
+            &ProgressReporter::new(),
+        )
+        .expect("download selected Xet snapshot");
+        let path = snapshot.join(FILE);
+        assert!(path.is_file());
+        assert!(!snapshot.join("config.json").exists());
+        verify_shard(REPO, REVISION, &path, &record).unwrap();
     }
 }
