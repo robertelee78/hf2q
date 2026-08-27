@@ -1639,10 +1639,24 @@ pub(super) fn select_hosted(
     let mut tiers = if exact.is_some() {
         vec![desired]
     } else {
-        quality_descending()
+        let quality_order = quality_descending();
+        let mut tiers = quality_order
             .into_iter()
             .filter(|quant| quant_quality(*quant) <= quant_quality(desired))
-            .collect()
+            .collect::<Vec<_>>();
+        // The caller has already removed artifacts that do not fit automatic
+        // runtime admission. Prefer the recommendation and smaller tiers, but
+        // if none exists, use the nearest admitted higher tier before an
+        // expensive native conversion fallback. This keeps a bare repository
+        // operand useful when the publisher offers only (for example) Q5 for
+        // a configured Q4 preference.
+        tiers.extend(
+            quality_order
+                .into_iter()
+                .rev()
+                .filter(|quant| quant_quality(*quant) > quant_quality(desired)),
+        );
+        tiers
     };
     if tiers.is_empty() {
         tiers.push(desired);

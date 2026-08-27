@@ -2,9 +2,12 @@
 
 - **Status:** Accepted; v0.1.17 and the v0.1.18 native-Xet transport
   amendment shipped; the v0.1.19 observable-transfer and cache-link amendment
-  is implemented with exact-artifact publication validation pending
+  shipped; the v0.1.20 same-origin Git-metadata redirect and canonical Qwen
+  shared-expert admission corrections are implemented with exact-artifact
+  publication validation pending
 - **Date:** 2026-08-23; native-Xet transfer amendment 2026-08-26; observable
   transfer/cache-link amendment 2026-08-26; qualified-host Xet policy accepted
+  2026-08-27; Git-metadata redirect and canonical Qwen admission corrections
   2026-08-27
 - **Related:** ADR-005, ADR-018, ADR-033, ADR-045, ADR-046, ADR-047
 - **Research:** `docs/research/hf-download-sota-2026-08-26.md` and
@@ -77,6 +80,17 @@ are one bounded snapshot operation containing only the authenticated index's
 glob-escaped literal shard paths, with eight file workers. Large model payloads
 must advertise Xet; there is no production downgrade to the legacy large-file
 HTTP transport.
+
+Small Git-backed metadata can return a 307 whose `Content-Length` describes
+only the redirect response body. When that response does not provide
+`x-linked-size`, hf2q follows at most four HTTPS redirects on the exact
+`huggingface.co` origin and uses only the final successful representation's
+length. Every hop must preserve the immutable commit and ETag (and Xet identity
+when present); loops, cross-origin targets, embedded credentials, malformed
+locations, or identity changes fail closed. Bearer credentials therefore never
+cross an origin boundary. Xet/LFS responses that provide `x-linked-size` keep
+the existing single-request fast path and do not follow their signed payload
+redirects.
 
 hf2q selects one resource-qualified policy before the first Xet session. On
 Apple Silicon with at least 64 GiB physical unified memory, and only when the
@@ -227,8 +241,11 @@ Resolution is deterministic:
 4. If no local candidate wins, query hosted metadata. An exact quant downloads
    exactly that supported quant after disk preflight. An unqualified request
    chooses the setup/live hardware recommendation, then the nearest lower
-   supported hosted tier. Unsupported or ambiguous hosted choices fail with
-   the available exact options.
+   supported hosted tier. If no recommended-or-lower artifact exists, it uses
+   the nearest higher tier that already passed the automatic runtime memory
+   and pool-budget admission check before attempting native conversion. An
+   exact quant never steps tiers. Unsupported or ambiguous hosted choices fail
+   with the available exact options.
 5. If no supported hosted GGUF exists, `serve` and owned local `chat` fall back
    to hf2q native source conversion. `convert` always uses this source path.
 
@@ -267,6 +284,13 @@ native conversion until they gain their own complete hosted admission
 contract. A semantic incompatibility tries the next compatible hosted tier and
 ultimately native source conversion; transport or immutable-identity failures
 remain fatal.
+
+The Qwen3.5/3.6 shared-expert router follows hf2q's conversion and runtime
+contract: Hugging Face `[1, hidden]` is squeezed to canonical GGUF `[hidden]`
+so the small router remains F32 and is consumed as one length-`hidden` dot
+product. Main-stack and MTP hosted admission validate that same one-dimensional
+shape; requiring the pre-conversion `[1, hidden]` form would reject hf2q's own
+canonical output and compatible published GGUFs.
 
 ### 4. Quant defaults and idempotent conversion
 
@@ -568,7 +592,8 @@ the first pair write.
 - CLI tests prove all approved operands, compatibility spellings, conflict
   failures, and no-output conversion parsing.
 - Pure resolver tests prove exact-quant selection, use/materialization recency,
-  local-over-hosted precedence, ambiguity, and nearest-lower hosted fallback.
+  local-over-hosted precedence, ambiguity, nearest-lower hosted preference,
+  and resource-admitted nearest-higher fallback before native conversion.
 - Filesystem tests prove bounded descriptor-relative discovery, exact digest
   adoption, independent-inode CoW/copy publication for local artifacts,
   authenticated digest-named Hub-cache symlink publication for hosted
@@ -578,9 +603,14 @@ the first pair write.
   retained cross-device pair accounting, exact-destination and
   destination-parent replacement refusal, atomic sidecars,
   conflicting-destination refusal, and interrupted-partial exclusion.
-- Download tests prove immutable metadata revalidation, exact quant, disk
-  preflight, full SHA-256, and unique companion selection without payload on
-  ambiguous or declined paths.
+- Download tests prove immutable metadata revalidation, final-representation
+  sizing across bounded same-origin Git-metadata redirects, cross-origin and
+  identity-change rejection, unchanged `x-linked-size` fast-path behavior,
+  exact quant, disk preflight, full SHA-256, and unique companion selection
+  without payload on ambiguous or declined paths.
+- Qwen admission tests pin the canonical one-dimensional shared-expert router
+  shape across main-stack and MTP validation, and an opt-in exact-revision live
+  gate proves that the repository's admitted Q5 wins before native conversion.
 - Conversion tests prove setup/live quant precedence, suffix/flag conflict,
   conditional pair-lock planning, managed revision output, receipt-backed
   no-op, and that hosted GGUF never satisfies convert.
@@ -767,3 +797,21 @@ suite passed. The full suite included 51 library tests, 4,875 binary tests with
 55 explicitly ignored, the 36-test persistent-KV harness, the standalone
 installer fixture, completion/rollback lifecycle tests, getting-started and
 shipping-contract scripts, and the release-binary frictionless journey.
+
+The 2026-08-27 v0.1.20 candidate correction proof used
+`jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated` at immutable revision
+`afde6ca7c35272a4b5eefb3b97576fdac0f74ba0`. The Hub's initial `config.json`
+HEAD returned a 307 with a 348-byte redirect body; the final same-origin
+representation was 2,317 bytes. The focused synthetic redirect/security tests
+and exact live metadata test passed. The live catalog/header gate then selected
+the sole 25,043,007,488-byte Q5_K_M artifact for an automatically admitted
+128-GiB host instead of the unsupported native-conversion path. A patched debug
+binary using the repository operand and an isolated test port structurally
+reused the exact local Q5 bytes, validated 733 tensors, loaded and warmed text
+plus projector through `mlx-native`, and reached confirmed HTTP health.
+A strict OpenAI-compatible test produced the required `lookup_key` tool call,
+continued from its tool result with `ACK`, reused 2,837 of 2,898 prompt tokens,
+and emitted semantic SSE content plus one usage event and `[DONE]`. SIGINT
+drained the worker and removed the listener cleanly. This is candidate-branch
+evidence; the protected exact-artifact workflow remains release publication
+authority.

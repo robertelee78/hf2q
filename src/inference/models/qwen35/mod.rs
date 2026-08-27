@@ -82,6 +82,15 @@ pub const ARCH_QWEN35: &str = "qwen35";
 /// `general.architecture` value for the MoE variant.
 pub const ARCH_QWEN35MOE: &str = "qwen35moe";
 
+/// Canonical GGUF shape for the sigmoid shared-expert router.
+///
+/// Hugging Face stores this linear weight as `[1, hidden]`; Qwen conversion
+/// squeezes the singleton output dimension so the F32 GGUF tensor is the
+/// length-`hidden` vector consumed by the runtime dot product.
+pub(crate) fn shared_expert_gate_shape(hidden: usize) -> [usize; 1] {
+    [hidden]
+}
+
 /// `general.architecture` value emitted by hf2q's Wedge-4f convert pipeline
 /// for **Qwen3-VL text** models (`Qwen/Qwen3-VL-2B-Instruct`,
 /// `Qwen/Qwen3-VL-4B-Instruct`, etc.).
@@ -628,6 +637,11 @@ pub fn is_qwen36_gguf(gguf: &mlx_native::gguf::GgufFile) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_expert_gate_uses_the_canonical_squeezed_gguf_shape() {
+        assert_eq!(shared_expert_gate_shape(2_048), [2_048]);
+    }
 
     #[test]
     fn variant_from_arch() {
