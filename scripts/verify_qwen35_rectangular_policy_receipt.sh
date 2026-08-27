@@ -27,7 +27,7 @@ validate_qwen35_rectangular_power_log() {
 validate_qwen35_rectangular_publication_shape() {
     local publication=$1
     awk -v line="$publication" 'BEGIN {
-      if (line !~ /lanes=4/) exit 1
+      if (line !~ /Qwen rectangular prefill published/ || line !~ /lanes=4/ || line !~ /checkpoint_at_end=true/) exit 1
       rows=line; sub(/^.*rows_per_lane=/,"",rows); sub(/ .*/,"",rows); rows += 0
       aggregate=line; sub(/^.*aggregate_rows=/,"",aggregate); sub(/ .*/,"",aggregate); aggregate += 0
       exit !(rows >= 16 && rows <= 128 && aggregate == 4 * rows)
@@ -45,7 +45,7 @@ if [[ ${1:-} == --self-test ]]; then
         echo "rectangular policy verifier self-test accepted corrupt power evidence" >&2
         exit 1
     }
-    valid_publication='Qwen rectangular stable-boundary prefill published lanes=4 rows_per_lane=84 aggregate_rows=336 mtp_prefill=true mtp_outcome=Succeeded'
+    valid_publication='Qwen rectangular prefill published lanes=4 rows_per_lane=84 aggregate_rows=336 mtp_prefill=true checkpoint_at_end=true mtp_outcome=Succeeded'
     validate_qwen35_rectangular_publication_shape "$valid_publication" || {
         echo "rectangular policy verifier self-test rejected valid row shape" >&2
         exit 1
@@ -53,6 +53,11 @@ if [[ ${1:-} == --self-test ]]; then
     validate_qwen35_rectangular_publication_shape \
         "${valid_publication/aggregate_rows=336/aggregate_rows=335}" && {
         echo "rectangular policy verifier self-test accepted corrupt row shape" >&2
+        exit 1
+    }
+    validate_qwen35_rectangular_publication_shape \
+        "${valid_publication/checkpoint_at_end=true/checkpoint_at_end=false}" && {
+        echo "rectangular policy verifier self-test accepted an unpublished checkpoint" >&2
         exit 1
     }
     echo "Qwen rectangular policy verifier self-test: PASS"
@@ -353,7 +358,7 @@ for label in off-a on-a on-b off-b; do
                 && "$(jq -er '.usage.prompt_tokens_details.cached_tokens' "$lane_response")" == 0 ]] \
                 || fail "$label trial $trial lane $lane eligibility"
         done
-        publication=$(rg 'Qwen rectangular stable-boundary prefill published' \
+        publication=$(rg 'Qwen rectangular prefill published' \
             "$wave_log" || true)
         if [[ "$arm" == on ]]; then
             [[ "$(printf '%s\n' "$publication" | awk 'NF {n++} END {print n+0}')" == 1 \
@@ -363,10 +368,10 @@ for label in off-a on-a on-b off-b; do
             validate_qwen35_rectangular_publication_shape "$publication" \
                 || fail "$label trial $trial row shape"
             if [[ "$expected_mtp" == succeeded ]]; then
-                [[ "$publication" == *"mtp_prefill=true mtp_outcome=Succeeded"* ]] \
+                [[ "$publication" == *"mtp_prefill=true checkpoint_at_end=true mtp_outcome=Succeeded"* ]] \
                     || fail "$label trial $trial MTP outcome"
             else
-                [[ "$publication" == *"mtp_prefill=false mtp_outcome=NotRequested"* ]] \
+                [[ "$publication" == *"mtp_prefill=false checkpoint_at_end=true mtp_outcome=NotRequested"* ]] \
                     || fail "$label trial $trial no-MTP outcome"
             fi
         else

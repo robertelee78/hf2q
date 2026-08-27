@@ -422,7 +422,7 @@ run_measurements() {
             || stat -c '%s' "$engine_dir/server.stderr")
         tail -c "+$((log_start + 1))" "$engine_dir/server.stderr" \
             | head -c "$((log_end - log_start))" >"$engine_dir/waves/$trial.log"
-        publication_line=$(rg 'Qwen rectangular stable-boundary prefill published' \
+        publication_line=$(rg 'Qwen rectangular prefill published' \
             "$engine_dir/waves/$trial.log" || true)
         published=$(printf '%s\n' "$publication_line" | awk 'NF {count++} END {print count+0}')
         published=${published:-0}
@@ -432,7 +432,8 @@ run_measurements() {
                 return 1
             }
             perl -ne '
-              if (/Qwen rectangular stable-boundary prefill published/ && /lanes=4/) {
+              if (/Qwen rectangular prefill published/ && /lanes=4/
+                  && /checkpoint_at_end=true/) {
                 $rows = $1 if /rows_per_lane=([0-9]+)/;
                 $aggregate = $1 if /aggregate_rows=([0-9]+)/;
                 $found++;
@@ -445,12 +446,12 @@ run_measurements() {
                 return 1
             }
             if [[ "$expected_mtp" == succeeded ]]; then
-                [[ "$publication_line" == *"mtp_prefill=true mtp_outcome=Succeeded"* ]] || {
+                [[ "$publication_line" == *"mtp_prefill=true checkpoint_at_end=true mtp_outcome=Succeeded"* ]] || {
                     echo "$label trial $trial did not complete Qwen3.8 MTP catch-up" >&2
                     return 1
                 }
             else
-                [[ "$publication_line" == *"mtp_prefill=false mtp_outcome=NotRequested"* ]] || {
+                [[ "$publication_line" == *"mtp_prefill=false checkpoint_at_end=true mtp_outcome=NotRequested"* ]] || {
                     echo "$label trial $trial unexpectedly requested Qwen3.6 MTP" >&2
                     return 1
                 }

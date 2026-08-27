@@ -470,7 +470,7 @@ run_measurements() {
       || stat -c '%s' "$engine_dir/server.stderr")
     tail -c "+$((log_start + 1))" "$engine_dir/server.stderr" \
       | head -c "$((log_end - log_start))" >"$engine_dir/waves/$trial.log"
-    publication=$(rg 'Qwen rectangular stable-boundary prefill published' \
+    publication=$(rg 'Qwen rectangular prefill published' \
       "$engine_dir/waves/$trial.log" || true)
     if [[ "$arm" == on ]]; then
       [[ "$(printf '%s\n' "$publication" | awk 'NF {n++} END {print n+0}')" == 1 ]] \

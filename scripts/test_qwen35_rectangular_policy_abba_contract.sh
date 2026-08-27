@@ -85,11 +85,13 @@ require_text 'HF2Q_FFN_TERMINAL_K_BATCH=8' \
     || fail 'runner contains the removed serve --no-vision option'
 require_text 'hf2q_qwen_rectangular_prefill_cohorts_total' \
     'rectangular publication metric is not checked'
-require_text 'Qwen rectangular stable-boundary prefill published' \
+require_text 'Qwen rectangular prefill published' \
     'rectangular production event is not checked'
-require_text 'mtp_prefill=true mtp_outcome=Succeeded' \
+require_text 'checkpoint_at_end=true' \
+    'stable-boundary checkpoint publication is not required'
+require_text 'mtp_prefill=true checkpoint_at_end=true mtp_outcome=Succeeded' \
     'Qwen3.8 MTP success is not required'
-require_text 'mtp_prefill=false mtp_outcome=NotRequested' \
+require_text 'mtp_prefill=false checkpoint_at_end=true mtp_outcome=NotRequested' \
     'Qwen3.6 no-MTP capability is not required'
 require_text 'skew <= 0.100 && latest < earliest' \
     'launch skew and actual overlap are not fail-closed'

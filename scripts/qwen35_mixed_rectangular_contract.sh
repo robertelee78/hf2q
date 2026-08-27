@@ -16,8 +16,9 @@ qwen35_mixed_metric_value() {
 qwen35_mixed_validate_publication() {
   local publication=$1 expected_mtp=$2
   awk -v line="$publication" -v expected_mtp="$expected_mtp" 'BEGIN {
-    if (line !~ /Qwen rectangular stable-boundary prefill published/) exit 1
+    if (line !~ /Qwen rectangular prefill published/) exit 1
     if (line !~ /lanes=4/) exit 1
+    if (line !~ /checkpoint_at_end=true/) exit 1
     rows=line; sub(/^.*rows_per_lane=/,"",rows); sub(/ .*/,"",rows); rows += 0
     aggregate=line; sub(/^.*aggregate_rows=/,"",aggregate); sub(/ .*/,"",aggregate); aggregate += 0
     if (rows < 16 || rows > 128 || aggregate != 4 * rows) exit 1

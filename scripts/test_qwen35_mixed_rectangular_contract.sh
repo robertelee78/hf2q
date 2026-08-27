@@ -64,12 +64,18 @@ jq -e '
 ' "$tmp/canonical.json" >/dev/null
 
 qwen35_mixed_validate_publication \
-  'Qwen rectangular stable-boundary prefill published lanes=4 rows_per_lane=96 aggregate_rows=384 mtp_prefill=false mtp_outcome=NotRequested' \
+  'Qwen rectangular prefill published lanes=4 rows_per_lane=96 aggregate_rows=384 mtp_prefill=false checkpoint_at_end=true mtp_outcome=NotRequested' \
   not-requested
 if qwen35_mixed_validate_publication \
-  'Qwen rectangular stable-boundary prefill published lanes=4 rows_per_lane=96 aggregate_rows=384 mtp_prefill=false mtp_outcome=NotRequested' \
+  'Qwen rectangular prefill published lanes=4 rows_per_lane=96 aggregate_rows=384 mtp_prefill=false checkpoint_at_end=true mtp_outcome=NotRequested' \
   succeeded; then
   echo "mixed contract accepted the Qwen3.6 no-MTP outcome for Qwen3.8" >&2
+  exit 1
+fi
+if qwen35_mixed_validate_publication \
+  'Qwen rectangular prefill published lanes=4 rows_per_lane=96 aggregate_rows=384 mtp_prefill=false checkpoint_at_end=false mtp_outcome=NotRequested' \
+  not-requested; then
+  echo "mixed contract accepted an unpublished stable-boundary checkpoint" >&2
   exit 1
 fi
 

@@ -32,11 +32,16 @@ EOF
     echo "mixed verifier self-test accepted a decoder with no post-wave event" >&2
     exit 1
   fi
-  valid_publication='Qwen rectangular stable-boundary prefill published lanes=4 rows_per_lane=84 aggregate_rows=336 mtp_prefill=true mtp_outcome=Succeeded'
+  valid_publication='Qwen rectangular prefill published lanes=4 rows_per_lane=84 aggregate_rows=336 mtp_prefill=true checkpoint_at_end=true mtp_outcome=Succeeded'
   qwen35_mixed_validate_publication "$valid_publication" succeeded
   if qwen35_mixed_validate_publication \
     "${valid_publication/aggregate_rows=336/aggregate_rows=335}" succeeded; then
     echo "mixed verifier self-test accepted a corrupt rectangular shape" >&2
+    exit 1
+  fi
+  if qwen35_mixed_validate_publication \
+    "${valid_publication/checkpoint_at_end=true/checkpoint_at_end=false}" succeeded; then
+    echo "mixed verifier self-test accepted an unpublished checkpoint" >&2
     exit 1
   fi
   valid_power=$(printf '1\tac\thigh\t2\ton-a-before-launch\n2\tac\thigh\t2\ton-a-loaded-warm\n3\tac\thigh\t2\ton-a-measurement-start\n4\tac\thigh\t2\ton-a-measurement-end\n5\tac\thigh\t2\ton-a-after-shutdown\n')
@@ -319,7 +324,7 @@ for label in off-a on-a on-b off-b; do
       and ($launch_skew * 1000) <= 100 and $latest_start < $earliest_finish
       and $tail <= 60000
     ' "$process/waves/$trial.json" >/dev/null || fail "$label trial $trial wave-derivation"
-    publication=$(rg 'Qwen rectangular stable-boundary prefill published' \
+    publication=$(rg 'Qwen rectangular prefill published' \
       "$process/waves/$trial.log" || true)
     if [[ "$arm" == on ]]; then
       [[ "$delta" == 1 \
