@@ -63,7 +63,7 @@ readonly MAX_WITHIN_ENGINE_GROUP_SPREAD_PERCENT=5
 readonly MAX_WITHIN_ENGINE_CASE_SPREAD_PERCENT=10
 readonly HF2Q_THERMAL_SWIFTC_BIN=/usr/bin/swiftc
 
-for command in awk basename caffeinate cmp cp curl date dirname find git jq \
+for command in awk basename caffeinate cmp cp curl date dirname find git grep jq \
   lsof mkdir mv otool perl pmset ps realpath rg rustc sed shasum sort stat sw_vers \
   system_profiler sysctl uname; do
     command -v "$command" >/dev/null || {

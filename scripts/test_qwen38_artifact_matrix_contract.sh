@@ -1086,7 +1086,8 @@ cp "$test_dir/q5-child-result.good" "$contention_child/result.sha256"
 
 for mutation in old-matrix-schema old-child-schema old-cell-schema \
     unsealed-physical wrong-physical-path lane-zero fake-cost-disable \
-    physical-join child-digest child-embedding weak-threshold raw-api-scope \
+    physical-source coherent-physical-source physical-join child-digest \
+    child-embedding weak-threshold raw-api-scope \
     cross-engine-raw-scope semantic-scope semantic-tokenization outer-kv-budget \
     outer-reference-policy outer-reference-cache outer-launch-skew \
     child-kv-budget child-reference-policy child-launch-skew \
@@ -1097,6 +1098,9 @@ for mutation in old-matrix-schema old-child-schema old-cell-schema \
       old-cell-schema) filter='.results[2].results[3].schema=1' ;;
       unsealed-physical) filter='.physical_matrix.seal_validated=false' ;;
       wrong-physical-path) filter='.physical_matrix.self_contained_path="matrix.json"' ;;
+      physical-source) filter='.physical_matrix.source_commit=("6"*40)' ;;
+      coherent-physical-source) filter='.physical_matrix.source_commit=("6"*40)
+        | .results[].hf2q.commit=("6"*40)' ;;
       lane-zero) filter='.results[2].results[3].physical_proof.clients[0].lane=0' ;;
       fake-cost-disable) filter='.results[2].results[3].speculation.waves[7]
         .measured_round_seconds=0' ;;
